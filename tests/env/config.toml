@@ -1,0 +1,25 @@
+# Default test environment topology.
+#
+# Three kind clusters with llm-d-inference-sim and
+# four mock provider servers in Docker.
+
+[clusters]
+names = ["cluster-a", "cluster-b", "cluster-c"]
+
+[clusters.cluster-a]
+models = ["granite-3.3-8b", "mistral-7b"]
+role = "provider"
+
+[clusters.cluster-b]
+models = ["llama-3.2-8b"]
+role = "provider"
+
+[clusters.cluster-c]
+models = []
+role = "consumer"
+
+[providers]
+openai = { port = 10001 }
+anthropic = { port = 10002 }
+bedrock = { port = 10003, region = "us-east-1" }
+vertex = { port = 10004, project = "test-project" }
