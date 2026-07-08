@@ -1,5 +1,6 @@
 //! Multi-cluster test environment management.
 
+pub(crate) mod certs;
 pub(crate) mod config;
 pub(crate) mod kind;
 pub(crate) mod providers;
@@ -76,7 +77,8 @@ fn env_up(config: &Path) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     providers::start_all(&cfg.providers)?;
-    eprintln!("env up: clusters and providers ready");
+    certs::generate_all(&cfg.clusters.names)?;
+    eprintln!("env up: clusters, providers, and certs ready");
     Ok(())
 }
 
@@ -89,7 +91,8 @@ fn env_down(config: &Path) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     providers::stop_all()?;
-    eprintln!("env down: clusters and providers removed");
+    certs::cleanup()?;
+    eprintln!("env down: clusters, providers, and certs removed");
     Ok(())
 }
 
