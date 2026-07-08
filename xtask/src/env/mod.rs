@@ -2,6 +2,7 @@
 
 pub(crate) mod config;
 pub(crate) mod kind;
+pub(crate) mod providers;
 
 use std::path::{Path, PathBuf};
 
@@ -74,8 +75,8 @@ fn env_up(config: &Path) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    eprintln!("env up: clusters ready");
-    eprintln!("(mock providers not yet implemented)");
+    providers::start_all(&cfg.providers)?;
+    eprintln!("env up: clusters and providers ready");
     Ok(())
 }
 
@@ -87,8 +88,8 @@ fn env_down(config: &Path) -> Result<(), Box<dyn std::error::Error>> {
         kind::delete_cluster(name)?;
     }
 
-    eprintln!("env down: clusters removed");
-    eprintln!("(mock providers not yet implemented)");
+    providers::stop_all()?;
+    eprintln!("env down: clusters and providers removed");
     Ok(())
 }
 
@@ -102,7 +103,11 @@ fn env_status(config: &Path) -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("  cluster grid-{name}: {status}");
     }
 
-    eprintln!("(mock provider status not yet implemented)");
+    for provider in &["openai", "anthropic", "bedrock", "vertex"] {
+        let running = providers::is_running(provider);
+        let status = if running { "running" } else { "stopped" };
+        eprintln!("  mock-{provider}: {status}");
+    }
     Ok(())
 }
 
