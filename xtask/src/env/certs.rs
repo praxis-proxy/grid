@@ -59,6 +59,11 @@ pub(crate) fn cleanup() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Check whether the certificates directory exists and has a CA cert.
+pub(crate) fn certs_exist() -> bool {
+    Path::new(CERTS_DIR).join("ca.pem").exists()
+}
+
 // ---------------------------------------------------------------------------
 // Private helpers
 // ---------------------------------------------------------------------------

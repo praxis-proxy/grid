@@ -99,19 +99,41 @@ fn env_down(config: &Path) -> Result<(), Box<dyn std::error::Error>> {
 /// Report the status of all environment components.
 fn env_status(config: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let cfg = EnvConfig::from_file(config)?;
+    let mut all_ok = true;
 
+    eprintln!("clusters:");
     for name in &cfg.clusters.names {
-        let running = kind::is_cluster_running(name);
-        let status = if running { "running" } else { "stopped" };
-        eprintln!("  cluster grid-{name}: {status}");
+        let ok = kind::is_cluster_running(name);
+        all_ok = all_ok && ok;
+        let label = status_label(ok);
+        eprintln!("  grid-{name}: {label}");
     }
 
+    eprintln!("providers:");
     for provider in &["openai", "anthropic", "bedrock", "vertex"] {
-        let running = providers::is_running(provider);
-        let status = if running { "running" } else { "stopped" };
-        eprintln!("  mock-{provider}: {status}");
+        let ok = providers::is_running(provider);
+        all_ok = all_ok && ok;
+        let label = status_label(ok);
+        eprintln!("  mock-{provider}: {label}");
     }
+
+    eprintln!("certificates:");
+    let certs_ok = certs::certs_exist();
+    all_ok = all_ok && certs_ok;
+    eprintln!("  CA + site certs: {}", status_label(certs_ok));
+
+    if all_ok {
+        eprintln!("status: all components healthy");
+    } else {
+        eprintln!("status: some components not ready");
+    }
+
     Ok(())
+}
+
+/// Format a status label.
+fn status_label(ok: bool) -> &'static str {
+    if ok { "ready" } else { "not ready" }
 }
 
 /// Print the configured topology summary.
