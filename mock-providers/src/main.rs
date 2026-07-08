@@ -14,6 +14,7 @@ mod anthropic;
 mod bedrock;
 mod common;
 mod openai;
+mod vertex;
 
 use clap::Parser;
 
@@ -45,6 +46,9 @@ enum ProviderKind {
 
     /// AWS `Bedrock` Converse API.
     Bedrock,
+
+    /// Google `Vertex` AI `generateContent` API.
+    Vertex,
 }
 
 // ---------------------------------------------------------------------------
@@ -60,6 +64,7 @@ async fn main() {
         ProviderKind::Openai => openai::router(),
         ProviderKind::Anthropic => anthropic::router(),
         ProviderKind::Bedrock => bedrock::router(),
+        ProviderKind::Vertex => vertex::router(),
     };
 
     let addr = format!("0.0.0.0:{}", cli.port);
