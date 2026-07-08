@@ -11,6 +11,7 @@
 )]
 
 mod anthropic;
+mod bedrock;
 mod common;
 mod openai;
 
@@ -41,6 +42,9 @@ enum ProviderKind {
 
     /// `Anthropic` Messages API.
     Anthropic,
+
+    /// AWS `Bedrock` Converse API.
+    Bedrock,
 }
 
 // ---------------------------------------------------------------------------
@@ -55,6 +59,7 @@ async fn main() {
     let router = match cli.provider {
         ProviderKind::Openai => openai::router(),
         ProviderKind::Anthropic => anthropic::router(),
+        ProviderKind::Bedrock => bedrock::router(),
     };
 
     let addr = format!("0.0.0.0:{}", cli.port);
