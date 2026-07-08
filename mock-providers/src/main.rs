@@ -10,6 +10,7 @@
     reason = "CLI binary that prints to the terminal"
 )]
 
+mod anthropic;
 mod common;
 mod openai;
 
@@ -37,6 +38,9 @@ struct Cli {
 enum ProviderKind {
     /// `OpenAI` chat completions API.
     Openai,
+
+    /// `Anthropic` Messages API.
+    Anthropic,
 }
 
 // ---------------------------------------------------------------------------
@@ -50,6 +54,7 @@ async fn main() {
     let cli = Cli::parse();
     let router = match cli.provider {
         ProviderKind::Openai => openai::router(),
+        ProviderKind::Anthropic => anthropic::router(),
     };
 
     let addr = format!("0.0.0.0:{}", cli.port);
