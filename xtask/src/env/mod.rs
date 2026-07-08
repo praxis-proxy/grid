@@ -1,6 +1,7 @@
 //! Multi-cluster test environment management.
 
 pub(crate) mod config;
+pub(crate) mod kind;
 
 use std::path::{Path, PathBuf};
 
@@ -66,26 +67,42 @@ pub(crate) fn run(action: &Action) -> Result<(), Box<dyn std::error::Error>> {
 fn env_up(config: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let cfg = EnvConfig::from_file(config)?;
     print_topology(&cfg);
-    eprintln!("(not yet implemented)");
+
+    for name in &cfg.clusters.names {
+        if let Some(def) = cfg.clusters.definitions.get(name) {
+            kind::create_cluster(name, def)?;
+        }
+    }
+
+    eprintln!("env up: clusters ready");
+    eprintln!("(mock providers not yet implemented)");
     Ok(())
 }
 
 /// Tear down the test environment.
 fn env_down(config: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let cfg = EnvConfig::from_file(config)?;
-    eprintln!(
-        "env down: tearing down {} clusters + providers",
-        cfg.clusters.names.len(),
-    );
-    eprintln!("(not yet implemented)");
+
+    for name in &cfg.clusters.names {
+        kind::delete_cluster(name)?;
+    }
+
+    eprintln!("env down: clusters removed");
+    eprintln!("(mock providers not yet implemented)");
     Ok(())
 }
 
 /// Report the status of all environment components.
 fn env_status(config: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let cfg = EnvConfig::from_file(config)?;
-    eprintln!("env status: checking {} clusters + providers", cfg.clusters.names.len(),);
-    eprintln!("(not yet implemented)");
+
+    for name in &cfg.clusters.names {
+        let running = kind::is_cluster_running(name);
+        let status = if running { "running" } else { "stopped" };
+        eprintln!("  cluster grid-{name}: {status}");
+    }
+
+    eprintln!("(mock provider status not yet implemented)");
     Ok(())
 }
 
