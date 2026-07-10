@@ -1,0 +1,26 @@
+[package]
+name = "grid-operator"
+description = "AI Grid Kubernetes operator for multi-site inference orchestration"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+futures = { workspace = true }
+grid-certs = { path = "../grid-certs" }
+grid-core = { path = "../grid-core" }
+k8s-openapi = { workspace = true }
+kube = { workspace = true }
+schemars = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+
+[lints]
+workspace = true

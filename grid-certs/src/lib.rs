@@ -8,5 +8,5 @@
 mod generate;
 mod provider;
 
-pub use generate::{GenerateError, generate_ca, generate_site_cert};
+pub use generate::{CaCert, GenerateError, SiteCertOutput, generate_ca, generate_site_cert};
 pub use provider::{CertificateProvider, ProviderError, SiteCertificate, StaticFileProvider, TrustBundle};
