@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "grid-certs",
     "grid-core",
+    "grid-crdt",
     "grid-operator",
     "grid-swim",
     "mock-providers",
