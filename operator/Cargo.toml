@@ -1,5 +1,5 @@
 [package]
-name = "grid-operator"
+name = "operator"
 description = "AI Grid Kubernetes operator for multi-site inference orchestration"
 version.workspace = true
 edition.workspace = true
@@ -8,9 +8,9 @@ license.workspace = true
 publish = false
 
 [dependencies]
+certs = { path = "../certs" }
 futures = { workspace = true }
-grid-certs = { path = "../grid-certs" }
-grid-core = { path = "../grid-core" }
+scoring = { path = "../scoring" }
 k8s-openapi = { workspace = true }
 kube = { workspace = true }
 schemars = { workspace = true }

@@ -8,7 +8,7 @@ publish = false
 
 [dependencies]
 clap = { workspace = true }
-grid-certs = { path = "../grid-certs" }
+certs = { path = "../certs" }
 serde = { workspace = true }
 toml = { workspace = true }
 thiserror = { workspace = true }

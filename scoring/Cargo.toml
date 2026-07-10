@@ -1,5 +1,6 @@
 [package]
-name = "grid-certs"
+name = "scoring"
+description = "Scoring engine and backend types for the AI Grid"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -7,8 +8,11 @@ license.workspace = true
 publish = false
 
 [dependencies]
-rcgen = { workspace = true }
+serde = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

@@ -1,5 +1,5 @@
 [package]
-name = "grid-swim"
+name = "swim"
 description = "SWIM membership protocol wrapper for the AI Grid"
 version.workspace = true
 edition.workspace = true

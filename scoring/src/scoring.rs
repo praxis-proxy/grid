@@ -38,7 +38,7 @@ const DEFAULT_SIGNAL_SCORE: f64 = 0.5;
 /// selection.
 ///
 /// ```
-/// use grid_core::ScoringWeights;
+/// use scoring::ScoringWeights;
 ///
 /// let w = ScoringWeights::default();
 /// assert!((w.locality - 3.0).abs() < f64::EPSILON);
@@ -125,8 +125,8 @@ impl ScoredBackend {
 /// with default latency.
 ///
 /// ```
-/// # fn main() -> Result<(), grid_core::CoreError> {
-/// use grid_core::{
+/// # fn main() -> Result<(), scoring::CoreError> {
+/// use scoring::{
 ///     BackendConfig, BackendKind, GridState, ProviderKind, ScoringWeights, score_backends,
 /// };
 ///

@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 /// item being present (add wins).
 ///
 /// ```
-/// use grid_crdt::OrSet;
+/// use crdt::OrSet;
 ///
 /// let mut set = OrSet::new("site-a".to_owned());
 /// set.add("model-x".to_owned());

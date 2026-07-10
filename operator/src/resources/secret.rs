@@ -23,7 +23,7 @@ pub fn build(name: &str, namespace: &str, data: BTreeMap<String, ByteString>) ->
 }
 
 /// Build Secret data for a grid CA certificate.
-pub fn ca_secret_data(ca: &grid_certs::CaCert) -> BTreeMap<String, ByteString> {
+pub fn ca_secret_data(ca: &certs::CaCert) -> BTreeMap<String, ByteString> {
     let mut data = BTreeMap::new();
     data.insert("ca.crt".to_owned(), ByteString(ca.cert_pem.as_bytes().to_vec()));
     data.insert("ca.key".to_owned(), ByteString(ca.key_pem.as_bytes().to_vec()));
@@ -31,7 +31,7 @@ pub fn ca_secret_data(ca: &grid_certs::CaCert) -> BTreeMap<String, ByteString> {
 }
 
 /// Build Secret data for a site certificate.
-pub fn site_cert_secret_data(site: &grid_certs::SiteCertOutput) -> BTreeMap<String, ByteString> {
+pub fn site_cert_secret_data(site: &certs::SiteCertOutput) -> BTreeMap<String, ByteString> {
     let mut data = BTreeMap::new();
     data.insert("tls.crt".to_owned(), ByteString(site.cert_pem.as_bytes().to_vec()));
     data.insert("tls.key".to_owned(), ByteString(site.key_pem.as_bytes().to_vec()));
@@ -63,7 +63,7 @@ mod tests {
 
     #[test]
     fn ca_secret_data_has_expected_keys() {
-        let ca = grid_certs::generate_ca("test-ca").unwrap_or_else(|_| std::process::abort());
+        let ca = certs::generate_ca("test-ca").unwrap_or_else(|_| std::process::abort());
         let data = ca_secret_data(&ca);
         assert!(data.contains_key("ca.crt"), "should have ca.crt");
         assert!(data.contains_key("ca.key"), "should have ca.key");
@@ -71,8 +71,8 @@ mod tests {
 
     #[test]
     fn site_cert_data_has_expected_keys() {
-        let ca = grid_certs::generate_ca("test-ca").unwrap_or_else(|_| std::process::abort());
-        let site = grid_certs::generate_site_cert(&ca, "test-site").unwrap_or_else(|_| std::process::abort());
+        let ca = certs::generate_ca("test-ca").unwrap_or_else(|_| std::process::abort());
+        let site = certs::generate_site_cert(&ca, "test-site").unwrap_or_else(|_| std::process::abort());
         let data = site_cert_secret_data(&site);
         assert!(data.contains_key("tls.crt"), "should have tls.crt");
         assert!(data.contains_key("tls.key"), "should have tls.key");

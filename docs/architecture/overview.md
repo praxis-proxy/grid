@@ -48,25 +48,25 @@ Responsibilities:
 
 | Crate | Purpose |
 |-------|---------|
-| `grid-core` | Scoring engine, backend types, grid state |
-| `grid-certs` | CA and site cert generation, provider trait |
-| `grid-crdt` | Delta CRDTs: LWW Register, OR-Set, G-Counter |
-| `grid-operator` | K8s controllers, CRDs, operator binary |
-| `grid-swim` | SWIM membership wrapper around `foca` |
+| `scoring` | Scoring engine, backend types, grid state |
+| `certs` | CA and site cert generation, provider trait |
+| `crdt` | Delta CRDTs: LWW Register, OR-Set, G-Counter |
+| `operator` | K8s controllers, CRDs, operator binary |
+| `swim` | SWIM membership wrapper around `foca` |
 | `mock-providers` | Mock servers for OpenAI, Anthropic, Bedrock, Vertex |
 | `xtask` | Dev task runner for multi-cluster test environments |
 
 Dependency graph:
 
 ```text
-grid-operator ──→ grid-core (scoring)
-              ──→ grid-certs (TLS)
-              ──→ grid-swim (SWIM runtime)
-              ──→ grid-crdt (state propagation)
+operator ──→ scoring (scoring)
+              ──→ certs (TLS)
+              ──→ swim (SWIM runtime)
+              ──→ crdt (state propagation)
 
-grid-swim ──→ foca (SWIM protocol)
+swim ──→ foca (SWIM protocol)
 
-grid-crdt, grid-core, grid-certs: standalone
+crdt, scoring, certs: standalone
 ```
 
 ## Backend Categories

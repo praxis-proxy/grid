@@ -82,7 +82,7 @@ scoring:
 
 ## Where Scoring Runs
 
-The scoring engine lives in the `grid-core` crate.
+The scoring engine lives in the `scoring` crate.
 For production routing, the scoring logic is compiled
 into a Praxis filter (`grid_scorer`) that reads the
 overlay config and scores backends per-request.

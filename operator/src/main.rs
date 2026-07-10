@@ -4,21 +4,21 @@
 //! [`GridSite`] resources. In future phases, also runs the
 //! SWIM runtime for peer-to-peer mesh formation.
 //!
-//! [`GridNetwork`]: grid_operator::crd::grid_network::GridNetwork
-//! [`GridSite`]: grid_operator::crd::grid_site::GridSite
+//! [`GridNetwork`]: operator::crd::grid_network::GridNetwork
+//! [`GridSite`]: operator::crd::grid_site::GridSite
 
 #![deny(unsafe_code)]
 
 use std::sync::Arc;
 
 use futures::StreamExt as _;
-use grid_operator::{
-    controller::{grid_network, grid_site},
-    crd::{grid_network::GridNetwork, grid_site::GridSite},
-};
 use kube::{
     Api, Client,
     runtime::{controller::Controller, watcher},
+};
+use operator::{
+    controller::{grid_network, grid_site},
+    crd::{grid_network::GridNetwork, grid_site::GridSite},
 };
 
 // ---------------------------------------------------------------------------

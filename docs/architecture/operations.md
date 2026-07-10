@@ -11,7 +11,7 @@ until a `GridNetwork` resource exists.
 
 ```console
 kubectl apply -f grid-crds.yaml
-kubectl apply -f grid-operator.yaml
+kubectl apply -f operator.yaml
 ```
 
 The operator runs as a single binary with multiple
@@ -40,7 +40,7 @@ spec:
 ```
 
 The GridNetwork controller:
-1. Generates a grid CA via `grid-certs`
+1. Generates a grid CA via `certs`
 2. Generates this site's certificate (DNS SAN:
    `{site-name}.grid.internal`, dual EKU for mTLS)
 3. Stores both in Kubernetes Secrets

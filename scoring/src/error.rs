@@ -1,6 +1,6 @@
-//! Error types for grid-core operations.
+//! Error types for scoring operations.
 
-/// Errors produced by grid-core operations.
+/// Errors produced by scoring operations.
 #[derive(Debug, thiserror::Error)]
 pub enum CoreError {
     /// A backend with this name already exists in the [`GridState`].

@@ -94,8 +94,8 @@ async fn ensure_tls_secrets(network: &GridNetwork, client: &Client) -> Result<()
     }
 
     let site_name = network_site_name(network);
-    let ca = grid_certs::generate_ca("grid-ca")?;
-    let site_cert = grid_certs::generate_site_cert(&ca, &site_name)?;
+    let ca = certs::generate_ca("grid-ca")?;
+    let site_cert = certs::generate_site_cert(&ca, &site_name)?;
 
     apply_ca_secret(&ca_api, ca_ref, &ca).await?;
     apply_site_secret(&site_api, site_ref, &site_cert).await?;
@@ -108,7 +108,7 @@ async fn ensure_tls_secrets(network: &GridNetwork, client: &Client) -> Result<()
 async fn apply_ca_secret(
     api: &Api<k8s_openapi::api::core::v1::Secret>,
     ca_ref: &crate::crd::grid_network::SecretRef,
-    ca: &grid_certs::CaCert,
+    ca: &certs::CaCert,
 ) -> Result<(), OperatorError> {
     let data = secret::ca_secret_data(ca);
     let s = secret::build(&ca_ref.name, &ca_ref.namespace, data);
@@ -125,7 +125,7 @@ async fn apply_ca_secret(
 async fn apply_site_secret(
     api: &Api<k8s_openapi::api::core::v1::Secret>,
     site_ref: &crate::crd::grid_network::SecretRef,
-    site_cert: &grid_certs::SiteCertOutput,
+    site_cert: &certs::SiteCertOutput,
 ) -> Result<(), OperatorError> {
     let data = secret::site_cert_secret_data(site_cert);
     let s = secret::build(&site_ref.name, &site_ref.namespace, data);

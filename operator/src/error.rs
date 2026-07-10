@@ -9,7 +9,7 @@
 pub enum OperatorError {
     /// Certificate generation failed.
     #[error("certificate error: {0}")]
-    Certificate(#[from] grid_certs::GenerateError),
+    Certificate(#[from] certs::GenerateError),
 
     /// Kubernetes API error.
     #[error("kube error: {0}")]

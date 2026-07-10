@@ -62,7 +62,7 @@ make all            # build + fmt + lint + test + audit
 Single-test and single-crate commands:
 
 ```console
-cargo test -p grid-core            # one crate
+cargo test -p scoring            # one crate
 cargo test -p mock-providers       # one crate
 cargo test test_name               # one test by name
 ```
@@ -79,12 +79,12 @@ cargo xtask env status   # health of all components
 
 | Crate | Purpose |
 |-------|---------|
-| `grid-core` | Scoring engine, backend types, grid state |
-| `grid-certs` | Certificate generation and provider trait for mTLS |
+| `scoring` | Scoring engine, backend types, grid state |
+| `certs` | Certificate generation and provider trait for mTLS |
 | `mock-providers` | Single binary mocking OpenAI, Anthropic, Bedrock, Vertex APIs |
 | `xtask` | Dev task runner for multi-cluster test environments |
 
-### grid-core
+### scoring
 
 Six-signal scoring engine:
 
@@ -101,7 +101,7 @@ Locality: Local=1.0, same-region Remote=0.7,
 cross-region Remote=0.4, CloudManaged=0.2,
 ApiProvider=0.1.
 
-### grid-certs
+### certs
 
 `CertificateProvider` trait with `StaticFileProvider`
 (current) and planned `SpiffeProvider` (production).
@@ -122,9 +122,9 @@ Four provider modules each exposing `router()` →
 
 | Crate | Purpose |
 |-------|---------|
-| `grid-operator` | K8s controllers, CRDs, operator binary |
-| `grid-swim` | foca wrapper, SWIM runtime, encryption |
-| `grid-crdt` | Delta CRDT types (LWW, OR-Set, G-Counter) |
+| `operator` | K8s controllers, CRDs, operator binary |
+| `swim` | foca wrapper, SWIM runtime, encryption |
+| `crdt` | Delta CRDT types (LWW, OR-Set, G-Counter) |
 
 ## Key Conventions
 

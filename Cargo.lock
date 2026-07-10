@@ -288,6 +288,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "certs"
+version = "0.1.0"
+dependencies = [
+ "rcgen",
+ "thiserror",
+]
+
+[[package]]
 name = "cfg-if"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -363,6 +371,13 @@ name = "core-foundation-sys"
 version = "0.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
+
+[[package]]
+name = "crdt"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "crossbeam-utils"
@@ -746,60 +761,6 @@ dependencies = [
  "futures-core",
  "js-sys",
  "wasm-bindgen",
-]
-
-[[package]]
-name = "grid-certs"
-version = "0.1.0"
-dependencies = [
- "rcgen",
- "thiserror",
-]
-
-[[package]]
-name = "grid-core"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "thiserror",
-]
-
-[[package]]
-name = "grid-crdt"
-version = "0.1.0"
-dependencies = [
- "serde",
-]
-
-[[package]]
-name = "grid-operator"
-version = "0.1.0"
-dependencies = [
- "futures",
- "grid-certs",
- "grid-core",
- "k8s-openapi",
- "kube",
- "schemars",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
-name = "grid-swim"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "foca",
- "serde",
- "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -1337,6 +1298,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
+name = "operator"
+version = "0.1.0"
+dependencies = [
+ "certs",
+ "futures",
+ "k8s-openapi",
+ "kube",
+ "schemars",
+ "scoring",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "ordered-float"
 version = "2.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1728,6 +1708,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
+name = "scoring"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "secrecy"
 version = "0.10.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1932,6 +1921,17 @@ name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
+
+[[package]]
+name = "swim"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "foca",
+ "serde",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "syn"
@@ -2493,8 +2493,8 @@ dependencies = [
 name = "xtask"
 version = "0.1.0"
 dependencies = [
+ "certs",
  "clap",
- "grid-certs",
  "serde",
  "thiserror",
  "toml",

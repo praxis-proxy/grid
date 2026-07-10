@@ -6,7 +6,7 @@
 //! controllers via channels.
 //!
 //! ```
-//! use grid_swim::NodeId;
+//! use swim::NodeId;
 //!
 //! let id = NodeId::new("cluster-a".to_owned(), "10.0.0.1:7946".parse().unwrap());
 //! assert_eq!(id.site_name(), "cluster-a");

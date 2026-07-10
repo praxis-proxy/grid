@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 /// with bounded error under partition.
 ///
 /// ```
-/// use grid_crdt::GCounter;
+/// use crdt::GCounter;
 ///
 /// let mut c = GCounter::new("site-a".to_owned());
 /// c.increment(10);

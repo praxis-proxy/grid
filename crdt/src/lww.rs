@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 /// (deterministic tie-break).
 ///
 /// ```
-/// use grid_crdt::LwwRegister;
+/// use crdt::LwwRegister;
 ///
 /// let mut r = LwwRegister::new(42.0, 1);
 /// r.merge(&LwwRegister::new(99.0, 2));

@@ -5,8 +5,8 @@
 //! by locality, cost, and latency.
 //!
 //! ```
-//! # fn main() -> Result<(), grid_core::CoreError> {
-//! use grid_core::{
+//! # fn main() -> Result<(), scoring::CoreError> {
+//! use scoring::{
 //!     BackendConfig, BackendKind, GridState, ProviderKind, ScoringWeights, score_backends,
 //! };
 //!

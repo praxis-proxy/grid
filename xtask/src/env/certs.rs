@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use grid_certs::{generate_ca, generate_site_cert};
+use certs::{generate_ca, generate_site_cert};
 
 // ---------------------------------------------------------------------------
 // Constants

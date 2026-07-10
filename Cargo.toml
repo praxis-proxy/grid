@@ -1,12 +1,12 @@
 [workspace]
 resolver = "3"
 members = [
-    "grid-certs",
-    "grid-core",
-    "grid-crdt",
-    "grid-operator",
-    "grid-swim",
+    "certs",
+    "crdt",
     "mock-providers",
+    "operator",
+    "scoring",
+    "swim",
     "xtask",
 ]
 

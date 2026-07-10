@@ -36,7 +36,7 @@ spec:
       name: grid-site-cert
       namespace: praxis-system
     swimKeyRef:
-      name: grid-swim-key
+      name: swim-key
       namespace: praxis-system
 ```
 
