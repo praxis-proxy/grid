@@ -20,7 +20,7 @@
 //!     ProviderKind::OpenAi,
 //!     None,
 //! ))?;
-//! let ranked = score_backends(&state, &ScoringWeights::default());
+//! let ranked = score_backends(&state, &ScoringWeights::default(), None);
 //! assert_eq!(ranked.len(), 1);
 //! # Ok(())
 //! # }

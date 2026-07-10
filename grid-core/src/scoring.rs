@@ -24,8 +24,8 @@ const MAX_COST: f64 = 0.1;
 /// Maximum P99 latency for normalization (milliseconds).
 const MAX_LATENCY: f64 = 5000.0;
 
-/// Default latency score when no metrics are available.
-const DEFAULT_LATENCY_SCORE: f64 = 0.5;
+/// Default score for signals with no metrics available.
+const DEFAULT_SIGNAL_SCORE: f64 = 0.5;
 
 // ---------------------------------------------------------------------------
 // Scoring Weights
@@ -33,9 +33,9 @@ const DEFAULT_LATENCY_SCORE: f64 = 0.5;
 
 /// Configurable weights for the scoring formula.
 ///
-/// Higher weight means the signal has more influence on
-/// backend selection. Defaults: locality 3.0, latency 2.0,
-/// cost 1.0.
+/// Six signals, each with a configurable weight. Higher
+/// weight means the signal has more influence on backend
+/// selection.
 ///
 /// ```
 /// use grid_core::ScoringWeights;
@@ -49,31 +49,31 @@ pub struct ScoringWeights {
     /// Weight for the cost signal.
     pub cost: f64,
 
+    /// Weight for KV cache utilization signal.
+    pub kv_cache: f64,
+
     /// Weight for the latency signal.
     pub latency: f64,
 
     /// Weight for the locality signal.
     pub locality: f64,
-}
 
-impl ScoringWeights {
-    /// Creates scoring weights with explicit values.
-    #[must_use]
-    pub fn new(cost: f64, latency: f64, locality: f64) -> Self {
-        Self {
-            cost,
-            latency,
-            locality,
-        }
-    }
+    /// Weight for prefix cache hit ratio signal.
+    pub prefix_cache: f64,
+
+    /// Weight for queue depth signal.
+    pub queue_depth: f64,
 }
 
 impl Default for ScoringWeights {
     fn default() -> Self {
         Self {
             cost: 1.0,
+            kv_cache: 2.0,
             latency: 2.0,
             locality: 3.0,
+            prefix_cache: 2.0,
+            queue_depth: 3.0,
         }
     }
 }
@@ -140,30 +140,33 @@ impl ScoredBackend {
 ///     ProviderKind::OpenAi,
 ///     None,
 /// ))?;
-/// let ranked = score_backends(&state, &ScoringWeights::default());
+/// let ranked = score_backends(&state, &ScoringWeights::default(), Some("us-east-1"));
 /// assert_eq!(ranked.len(), 1);
 /// # Ok(())
 /// # }
 /// ```
 #[must_use]
-pub fn score_backends(state: &GridState, weights: &ScoringWeights) -> Vec<ScoredBackend> {
+pub fn score_backends(state: &GridState, weights: &ScoringWeights, local_region: Option<&str>) -> Vec<ScoredBackend> {
     let mut scored: Vec<ScoredBackend> = state
         .backends()
         .iter()
         .filter(|b| is_healthy(state, b))
-        .map(|b| score_one(b, state.metrics(&b.name), weights))
+        .map(|b| score_one(b, state.metrics(&b.name), weights, local_region))
         .collect();
     scored.sort_by(|a, b| b.score.total_cmp(&a.score));
     scored
 }
 
-/// Returns the locality score for a backend kind.
+/// Returns the locality score for a backend.
 ///
 /// Values range from 0.0 to 1.0 where higher means
-/// closer/preferred.
+/// closer/preferred. For [`Remote`] backends, the score
+/// differs based on whether the backend is in the same
+/// region as the local site.
 ///
 /// - [`Local`] = 1.0
-/// - [`Remote`] = 0.7
+/// - [`Remote`] same region = 0.7
+/// - [`Remote`] cross region = 0.4
 /// - [`CloudManaged`] = 0.2
 /// - [`ApiProvider`] = 0.1
 ///
@@ -172,12 +175,21 @@ pub fn score_backends(state: &GridState, weights: &ScoringWeights) -> Vec<Scored
 /// [`CloudManaged`]: BackendKind::CloudManaged
 /// [`ApiProvider`]: BackendKind::ApiProvider
 #[must_use]
-pub fn locality_score(kind: BackendKind) -> f64 {
+pub fn locality_score(kind: BackendKind, backend_region: Option<&str>, local_region: Option<&str>) -> f64 {
     match kind {
         BackendKind::Local => 1.0,
-        BackendKind::Remote => 0.7,
+        BackendKind::Remote => remote_locality(backend_region, local_region),
         BackendKind::CloudManaged => 0.2,
         BackendKind::ApiProvider => 0.1,
+    }
+}
+
+/// Computes remote locality based on region comparison.
+fn remote_locality(backend_region: Option<&str>, local_region: Option<&str>) -> f64 {
+    match (backend_region, local_region) {
+        (Some(b), Some(l)) if b == l => 0.7,
+        (Some(_), Some(_)) => 0.4,
+        _ => 0.5,
     }
 }
 
@@ -190,16 +202,25 @@ fn is_healthy(state: &GridState, backend: &BackendConfig) -> bool {
     state.metrics(&backend.name).is_none_or(|m| m.healthy)
 }
 
-/// Scores a single backend.
-fn score_one(backend: &BackendConfig, metrics: Option<&BackendMetrics>, weights: &ScoringWeights) -> ScoredBackend {
-    let loc = weights.locality * locality_score(backend.kind);
+/// Scores a single backend using all six signals.
+fn score_one(
+    backend: &BackendConfig,
+    metrics: Option<&BackendMetrics>,
+    weights: &ScoringWeights,
+    local_region: Option<&str>,
+) -> ScoredBackend {
+    let loc = weights.locality * locality_score(backend.kind, backend.region.as_deref(), local_region);
     let cost = weights.cost * cost_score(backend.cost_per_1k_input);
     let lat = weights.latency * latency_score(metrics);
+    let queue = weights.queue_depth * queue_score(metrics);
+    let kv = weights.kv_cache * kv_cache_score(metrics);
+    let prefix = weights.prefix_cache * prefix_cache_score(metrics);
+
     ScoredBackend::new(
         backend.name.clone(),
         backend.endpoint.clone(),
         backend.provider,
-        loc + cost + lat,
+        loc + cost + lat + queue + kv + prefix,
     )
 }
 
@@ -213,9 +234,24 @@ fn cost_score(cost_per_1k: f64) -> f64 {
 
 /// Computes latency score (0.0 to 1.0, higher = faster).
 fn latency_score(metrics: Option<&BackendMetrics>) -> f64 {
-    metrics.map_or(DEFAULT_LATENCY_SCORE, |m| {
+    metrics.map_or(DEFAULT_SIGNAL_SCORE, |m| {
         (1.0 - m.latency_p99_ms / MAX_LATENCY).max(0.0)
     })
+}
+
+/// Computes queue depth score (0.0 to 1.0, higher = emptier).
+fn queue_score(metrics: Option<&BackendMetrics>) -> f64 {
+    metrics.map_or(DEFAULT_SIGNAL_SCORE, |m| 1.0 - m.queue_depth)
+}
+
+/// Computes KV cache score (0.0 to 1.0, higher = more available).
+fn kv_cache_score(metrics: Option<&BackendMetrics>) -> f64 {
+    metrics.map_or(DEFAULT_SIGNAL_SCORE, |m| 1.0 - m.kv_cache_utilization)
+}
+
+/// Computes prefix cache score (0.0 to 1.0, higher = warmer).
+fn prefix_cache_score(metrics: Option<&BackendMetrics>) -> f64 {
+    metrics.map_or(DEFAULT_SIGNAL_SCORE, |m| m.prefix_cache_hit_ratio)
 }
 
 // ---------------------------------------------------------------------------
@@ -227,18 +263,38 @@ mod tests {
     use super::*;
 
     #[test]
-    fn locality_score_values() {
-        assert_eq!(locality_score(BackendKind::Local), 1.0, "local");
-        assert_eq!(locality_score(BackendKind::Remote), 0.7, "remote");
-        assert_eq!(locality_score(BackendKind::CloudManaged), 0.2, "cloud");
-        assert_eq!(locality_score(BackendKind::ApiProvider), 0.1, "api");
+    fn locality_local() {
+        assert_eq!(locality_score(BackendKind::Local, None, None), 1.0, "local");
+    }
+
+    #[test]
+    fn locality_remote_same_region() {
+        let score = locality_score(BackendKind::Remote, Some("us-east-1"), Some("us-east-1"));
+        assert_eq!(score, 0.7, "same-region remote");
+    }
+
+    #[test]
+    fn locality_remote_cross_region() {
+        let score = locality_score(BackendKind::Remote, Some("eu-west-1"), Some("us-east-1"));
+        assert_eq!(score, 0.4, "cross-region remote");
+    }
+
+    #[test]
+    fn locality_remote_unknown_region() {
+        let score = locality_score(BackendKind::Remote, None, Some("us-east-1"));
+        assert_eq!(score, 0.5, "unknown region remote");
+    }
+
+    #[test]
+    fn locality_cloud_and_api() {
+        assert_eq!(locality_score(BackendKind::CloudManaged, None, None), 0.2, "cloud");
+        assert_eq!(locality_score(BackendKind::ApiProvider, None, None), 0.1, "api");
     }
 
     #[test]
     fn score_empty_backends() {
         let state = GridState::new();
-        let weights = ScoringWeights::default();
-        let result = score_backends(&state, &weights);
+        let result = score_backends(&state, &ScoringWeights::default(), None);
         assert!(result.is_empty(), "empty state should yield no results");
     }
 
@@ -246,7 +302,7 @@ mod tests {
     fn score_single_backend() {
         let mut state = GridState::new();
         add(&mut state, "a", BackendKind::Local, 0.01);
-        let result = score_backends(&state, &ScoringWeights::default());
+        let result = score_backends(&state, &ScoringWeights::default(), None);
         assert_eq!(result.len(), 1, "should score single backend");
     }
 
@@ -255,7 +311,7 @@ mod tests {
         let mut state = GridState::new();
         add(&mut state, "local", BackendKind::Local, 0.01);
         add(&mut state, "api", BackendKind::ApiProvider, 0.01);
-        let result = score_backends(&state, &ScoringWeights::default());
+        let result = score_backends(&state, &ScoringWeights::default(), None);
         assert_eq!(
             result.first().map(|b| b.name.as_str()),
             Some("local"),
@@ -265,11 +321,18 @@ mod tests {
 
     #[test]
     fn score_prefers_cheaper() {
-        let weights = ScoringWeights::new(10.0, 0.0, 0.0);
         let mut state = GridState::new();
         add(&mut state, "expensive", BackendKind::Local, 0.08);
         add(&mut state, "cheap", BackendKind::Local, 0.01);
-        let result = score_backends(&state, &weights);
+        let w = ScoringWeights {
+            cost: 10.0,
+            kv_cache: 0.0,
+            latency: 0.0,
+            locality: 0.0,
+            prefix_cache: 0.0,
+            queue_depth: 0.0,
+        };
+        let result = score_backends(&state, &w, None);
         assert_eq!(
             result.first().map(|b| b.name.as_str()),
             Some("cheap"),
@@ -281,8 +344,8 @@ mod tests {
     fn score_excludes_unhealthy() {
         let mut state = GridState::new();
         add(&mut state, "sick", BackendKind::Local, 0.01);
-        state.set_metrics("sick".to_owned(), BackendMetrics::new(0.5, false, 100.0));
-        let result = score_backends(&state, &ScoringWeights::default());
+        state.set_metrics("sick".to_owned(), BackendMetrics::new(0.5, false, 0.0, 100.0, 0.0, 0.0));
+        let result = score_backends(&state, &ScoringWeights::default(), None);
         assert!(result.is_empty(), "unhealthy backend should be excluded");
     }
 
@@ -292,7 +355,7 @@ mod tests {
         add(&mut state, "low", BackendKind::ApiProvider, 0.05);
         add(&mut state, "high", BackendKind::Local, 0.01);
         add(&mut state, "mid", BackendKind::Remote, 0.03);
-        let result = score_backends(&state, &ScoringWeights::default());
+        let result = score_backends(&state, &ScoringWeights::default(), None);
         let scores: Vec<f64> = result.iter().map(|b| b.score).collect();
         for pair in scores.windows(2) {
             assert!(
@@ -300,6 +363,51 @@ mod tests {
                 "scores should be in descending order"
             );
         }
+    }
+
+    #[test]
+    fn queue_depth_affects_score() {
+        let mut state = GridState::new();
+        add(&mut state, "busy", BackendKind::Local, 0.01);
+        add(&mut state, "idle", BackendKind::Local, 0.01);
+        state.set_metrics("busy".to_owned(), BackendMetrics::new(0.0, true, 0.0, 0.0, 0.0, 0.9));
+        state.set_metrics("idle".to_owned(), BackendMetrics::new(0.0, true, 0.0, 0.0, 0.0, 0.1));
+        let result = score_backends(&state, &ScoringWeights::default(), None);
+        assert_eq!(
+            result.first().map(|b| b.name.as_str()),
+            Some("idle"),
+            "idle backend should rank first"
+        );
+    }
+
+    #[test]
+    fn kv_cache_affects_score() {
+        let mut state = GridState::new();
+        add(&mut state, "full", BackendKind::Local, 0.01);
+        add(&mut state, "avail", BackendKind::Local, 0.01);
+        state.set_metrics("full".to_owned(), BackendMetrics::new(0.0, true, 0.9, 0.0, 0.0, 0.0));
+        state.set_metrics("avail".to_owned(), BackendMetrics::new(0.0, true, 0.1, 0.0, 0.0, 0.0));
+        let result = score_backends(&state, &ScoringWeights::default(), None);
+        assert_eq!(
+            result.first().map(|b| b.name.as_str()),
+            Some("avail"),
+            "backend with more KV cache available should rank first"
+        );
+    }
+
+    #[test]
+    fn prefix_cache_affects_score() {
+        let mut state = GridState::new();
+        add(&mut state, "cold", BackendKind::Local, 0.01);
+        add(&mut state, "warm", BackendKind::Local, 0.01);
+        state.set_metrics("cold".to_owned(), BackendMetrics::new(0.0, true, 0.0, 0.0, 0.1, 0.0));
+        state.set_metrics("warm".to_owned(), BackendMetrics::new(0.0, true, 0.0, 0.0, 0.9, 0.0));
+        let result = score_backends(&state, &ScoringWeights::default(), None);
+        assert_eq!(
+            result.first().map(|b| b.name.as_str()),
+            Some("warm"),
+            "backend with warm prefix cache should rank first"
+        );
     }
 
     #[test]
