@@ -1,0 +1,18 @@
+[package]
+name = "grid-swim"
+description = "SWIM membership protocol wrapper for the AI Grid"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+bytes = { workspace = true }
+foca = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
+tracing = { workspace = true }
+
+[lints]
+workspace = true
