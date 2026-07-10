@@ -20,7 +20,7 @@ use crate::common;
 // ---------------------------------------------------------------------------
 
 /// Build the `Bedrock` mock router.
-pub(crate) fn router() -> Router {
+pub fn router() -> Router {
     Router::new()
         .route("/model/{model_id}/converse", post(converse))
         .route("/model/{model_id}/converse-stream", post(converse_stream))

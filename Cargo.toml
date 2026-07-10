@@ -1,6 +1,11 @@
 [workspace]
 resolver = "3"
-members = ["grid-certs", "mock-providers", "xtask"]
+members = [
+    "grid-certs",
+    "grid-core",
+    "mock-providers",
+    "xtask",
+]
 
 [workspace.package]
 version = "0.1.0"

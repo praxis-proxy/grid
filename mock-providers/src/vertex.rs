@@ -25,7 +25,7 @@ use crate::common;
 /// Uses a wildcard route because axum does not allow colons in
 /// path parameters (`{model}:generateContent` is invalid). The
 /// handler inspects the path suffix to dispatch.
-pub(crate) fn router() -> Router {
+pub fn router() -> Router {
     Router::new()
         .route(
             "/v1/projects/{project}/locations/{location}/publishers/google/models/{*rest}",

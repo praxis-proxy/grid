@@ -19,7 +19,7 @@ use crate::common;
 // ---------------------------------------------------------------------------
 
 /// Build the `Anthropic` mock router.
-pub(crate) fn router() -> Router {
+pub fn router() -> Router {
     Router::new()
         .route("/v1/messages", post(messages))
         .route("/health", get(common::health_ok))

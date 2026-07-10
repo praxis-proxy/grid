@@ -10,13 +10,8 @@
     reason = "CLI binary that prints to the terminal"
 )]
 
-mod anthropic;
-mod bedrock;
-mod common;
-mod openai;
-mod vertex;
-
 use clap::Parser;
+use mock_providers::{anthropic, bedrock, openai, vertex};
 
 // ---------------------------------------------------------------------------
 // CLI

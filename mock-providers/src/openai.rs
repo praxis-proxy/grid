@@ -19,7 +19,7 @@ use crate::common;
 // ---------------------------------------------------------------------------
 
 /// Build the `OpenAI` mock router.
-pub(crate) fn router() -> Router {
+pub fn router() -> Router {
     Router::new()
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/models", get(list_models))
