@@ -305,6 +305,12 @@ Signed-off commits (`Signed-off-by:`) are required and
 represent your assertion that you have reviewed and fully
 understand the changes you are submitting.
 
+**Commit attribution**: Commits are attributed to people,
+never to tools. Do not add `Co-Authored-By` lines for
+development tools (e.g. linters, generators, formatters).
+The human who reviews, understands, and submits the code
+is the author.
+
 PRs from a bot or tool (with the exception of
 GitHub-specific ones like `dependabot`) will not be
 accepted.

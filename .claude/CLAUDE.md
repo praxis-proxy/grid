@@ -9,7 +9,29 @@ repository.
 The AI Grid: a decentralized, peer-to-peer network
 for AI inference routing and agentic networking
 across clusters, cloud providers, and third-party
-APIs. Built on Praxis as the gateway data plane.
+APIs. The Grid Operator orchestrates mesh formation,
+trust, capability discovery, and routing — while
+Praxis AI (from `../ai/`) handles all data-plane
+traffic as the gateway.
+
+## Architecture
+
+The Grid Operator is an orchestration daemon, NOT a
+proxy. It manages:
+- SWIM membership via `foca` (peer discovery)
+- mTLS certificate lifecycle (trust establishment)
+- CRDT state propagation (capabilities, metrics)
+- Praxis overlay config generation (routing decisions)
+
+Praxis AI handles:
+- Request proxying, API translation, credentials
+- Filter pipeline execution
+- TLS termination, health checks, connection pooling
+
+See `.docs/operator/architecture.md` for the full
+design: CRDs, controllers, operational walkthrough,
+scoring model, and auth framework. See
+`docs/conventions.md` for coding style and policies.
 
 ## Requirements
 
@@ -40,10 +62,9 @@ make all            # build + fmt + lint + test + audit
 Single-test and single-crate commands:
 
 ```console
-cargo test -p grid-certs           # one crate
+cargo test -p grid-core            # one crate
 cargo test -p mock-providers       # one crate
 cargo test test_name               # one test by name
-cargo test -p grid-certs test_name # one test in one crate
 ```
 
 Test environment (requires Docker + kind):
@@ -52,84 +73,58 @@ Test environment (requires Docker + kind):
 cargo xtask env up       # create clusters, providers, certs
 cargo xtask env down     # tear down everything
 cargo xtask env status   # health of all components
-cargo xtask env up -c tests/env/config.toml  # custom config
 ```
 
 ## Workspace Crates
 
 | Crate | Purpose |
 |-------|---------|
-| `grid-certs` | Certificate generation and provider trait for site-to-site mTLS |
-| `mock-providers` | Single binary mocking OpenAI, Anthropic, Bedrock, and Vertex AI APIs |
-| `xtask` | Dev task runner for multi-cluster test environments (invoked via `cargo xtask`) |
+| `grid-core` | Scoring engine, backend types, grid state |
+| `grid-certs` | Certificate generation and provider trait for mTLS |
+| `mock-providers` | Single binary mocking OpenAI, Anthropic, Bedrock, Vertex APIs |
+| `xtask` | Dev task runner for multi-cluster test environments |
+
+### grid-core
+
+Six-signal scoring engine:
+
+| Signal | Weight | Source |
+|--------|--------|--------|
+| locality | 3.0 | config (region-aware) |
+| queue_depth | 3.0 | Prometheus / CRDT |
+| kv_cache | 2.0 | Prometheus / CRDT |
+| prefix_cache | 2.0 | Prometheus / CRDT |
+| latency | 2.0 | local measurement |
+| cost | 1.0 | config |
+
+Locality: Local=1.0, same-region Remote=0.7,
+cross-region Remote=0.4, CloudManaged=0.2,
+ApiProvider=0.1.
 
 ### grid-certs
 
-Key abstraction: `CertificateProvider` trait with
-`site_certificate()` and `trust_bundle()`. Designed
-for swappable implementations:
-
-- `StaticFileProvider` — loads certs from disk
-  (current, for POC/testing)
-- Future `SpiffeProvider` — SPIRE workload API
-  (production)
-
+`CertificateProvider` trait with `StaticFileProvider`
+(current) and planned `SpiffeProvider` (production).
 `generate_ca()` and `generate_site_cert()` produce
-mTLS certs with SANs like
-`{site_name}.grid.internal` and both `ServerAuth`
-and `ClientAuth` extended key usage.
+mTLS certs with DNS SANs and dual EKU.
 
 ### mock-providers
 
 Four provider modules each exposing `router()` →
-`axum::Router`. Shared utilities in `common.rs`.
+`axum::Router`:
 
-- `openai` — `POST /v1/chat/completions`, bearer
-  token auth, SSE streaming
-- `anthropic` — `POST /v1/messages`, `x-api-key`
-  header auth, Anthropic-specific SSE events
-- `bedrock` — `POST /model/{id}/converse`, SigV4
-  prefix auth, binary event stream (not SSE)
-- `vertex` — `POST /v1/projects/.../models/{*rest}`,
-  OAuth2 bearer auth (wildcard route because axum
-  disallows colons in path params)
+- `openai` — Bearer token auth, SSE streaming
+- `anthropic` — `x-api-key` auth, Anthropic SSE events
+- `bedrock` — SigV4 prefix auth, binary event stream
+- `vertex` — OAuth2 bearer auth, wildcard route
 
-### xtask
+## Planned Crates
 
-Single subcommand `env` with `up`/`down`/`status`.
-Default config: `tests/env/config.toml`. The `up`
-flow: parse TOML → create kind clusters (with
-`grid-` prefix) → deploy inference simulators on
-provider-role clusters → start mock provider Docker
-containers → generate CA + per-cluster certs.
-
-## Architecture
-
-Crate dependency graph is shallow:
-- `xtask` → `grid-certs` (cert generation)
-- `mock-providers` is standalone
-- `grid-certs` is standalone
-
-`.docs/` contains architecture docs for four planned
-subsystems (not yet implemented in code):
-
-- **Orchestration** — SWIM membership via `foca`,
-  delta CRDTs (LWW Registers, OR-Sets, G-Counters)
-  piggybacked on SWIM probes, capability discovery,
-  topology-aware gossip
-- **Networking** — gateway-to-gateway mTLS,
-  gateway-to-API credential injection, AES-256-GCM
-  SWIM encryption, connection pooling
-- **Inference** — 7-stage routing pipeline: signal
-  extraction → semantic classification (Candle
-  embeddings) → backend scoring (weighted
-  multi-signal) → policy enforcement → API
-  translation → credential injection → resilience
-  (circuit breaker with fallback chain)
-- **Agentic** — zero-trust agent networking, MCP
-  tool federation via CRDTs, A2A capability
-  discovery, OpenShell sandbox integration,
-  three-layer defense model
+| Crate | Purpose |
+|-------|---------|
+| `grid-operator` | K8s controllers, CRDs, operator binary |
+| `grid-swim` | foca wrapper, SWIM runtime, encryption |
+| `grid-crdt` | Delta CRDT types (LWW, OR-Set, G-Counter) |
 
 ## Key Conventions
 
@@ -143,59 +138,41 @@ Notable denials: `unwrap_used`, `expect_used`,
 `missing_docs`, `missing_docs_in_private_items`.
 Any `#[allow(...)]` requires `reason = "..."`.
 
-`clippy.toml`: `too-many-lines-threshold = 30`,
-`too-many-arguments-threshold = 5`. Disallows
-`std::thread::sleep` and `std::io::stdin`.
-
 ### Error Handling
 
-`unwrap_used` and `expect_used` are denied. Use `?`
-propagation, match, or `unwrap_or_else`. In tests,
-use `unwrap_or_else(|_| std::process::abort())` or
-return `Result`.
-
-### Type Design
-
-Make invalid states unrepresentable. Enums over
-strings, structs over maps,
-`#[serde(deny_unknown_fields)]` by default,
-`#[serde(try_from)]` for constrained numerics.
+Use `?` propagation, match, or `unwrap_or_else`. In
+tests, use `unwrap_or_else(|_| std::process::abort())`
+or return `Result`.
 
 ### Test Organization
 
 - Inline `#[cfg(test)] mod tests` blocks
-- Order: imports → test functions → test utilities
-  (with `// Test Utilities` separator, not "Helpers")
-- One full-width separator marks where tests begin;
-  no per-test separators
+- Order: imports → tests → test utilities
+  (with `// Test Utilities` separator)
 - No comments in test bodies — use assertion messages
-  or `tracing` calls instead
-- No doc comments on test functions (exception: RFC
-  conformance citing RFC number and section)
 - Async tests: `#[tokio::test]`
-- Mock provider tests: `tower::ServiceExt::oneshot()`
 
 ### Separator Comments
 
-Full-width only (77 dashes):
-
-```rust
-// -----------------------------------------------------------
-// Section Name
-// -----------------------------------------------------------
-```
+Full-width only (77 dashes).
 
 ### Documentation
 
-All items (public and private) need `///` doc
-comments. Prose covers intent and interface only.
-Prefer ample doctests. Use reference-style rustdoc
-links.
+All items need `///` doc comments. Prose covers intent
+and interface only. Prefer ample doctests. Use
+reference-style rustdoc links.
+
+### Commit Attribution
+
+Commits are attributed to people, never to tools. Do
+not add `Co-Authored-By` lines for development tools
+(e.g. linters, generators, formatters). The human who
+reviews and submits the code is the author.
 
 ## Related Repositories
 
 | Project | Purpose |
 |---------|---------|
-| `praxis` | Gateway data plane |
+| `ai` | AI-enabled Praxis proxy (data plane) |
+| `praxis` | Gateway framework |
 | `operator` | Kubernetes Gateway API operator |
-| `conventions` | Shared lint/config template |
