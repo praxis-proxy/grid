@@ -7,6 +7,14 @@ use rcgen::{
     BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose,
 };
 
+/// X.509 organization set on all generated site certificates.
+///
+/// Used by the Praxis `grid_ingress_trust` filter to match
+/// verified peer identity via the `organization` field.
+/// Production deployments should use cert digest pinning or
+/// SAN/SPIFFE identity instead.
+pub const DEMO_ORGANIZATION: &str = "ai-grid";
+
 // ---------------------------------------------------------------------------
 // Error
 // ---------------------------------------------------------------------------
@@ -75,6 +83,9 @@ pub struct SiteCertOutput {
     /// PEM-encoded site private key.
     pub key_pem: String,
 
+    /// X.509 subject organization (`O=` field).
+    pub organization: String,
+
     /// Subject Alternative Names on this certificate.
     pub sans: Vec<String>,
 }
@@ -82,21 +93,16 @@ pub struct SiteCertOutput {
 /// Generate a site certificate signed by the given CA.
 ///
 /// The certificate includes DNS SANs for the site name
-/// (e.g., `cluster-a.grid.internal`).
+/// (e.g., `cluster-a.grid.internal`) and sets X.509
+/// `OrganizationName` to [`DEMO_ORGANIZATION`] so the
+/// Praxis `grid_ingress_trust` filter can match on it.
 ///
 /// # Errors
 ///
 /// Returns [`GenerateError`] if key generation or signing fails.
 pub fn generate_site_cert(ca: &CaCert, site_name: &str) -> Result<SiteCertOutput, GenerateError> {
     let dns_san = format!("{site_name}.grid.internal");
-
-    let mut params = CertificateParams::default();
-    params.distinguished_name.push(DnType::CommonName, site_name);
-    params
-        .subject_alt_names
-        .push(rcgen::SanType::DnsName(dns_san.clone().try_into()?));
-    params.extended_key_usages.push(ExtendedKeyUsagePurpose::ServerAuth);
-    params.extended_key_usages.push(ExtendedKeyUsagePurpose::ClientAuth);
+    let params = build_site_params(site_name, &dns_san)?;
 
     let site_key = KeyPair::generate()?;
     let issuer = Issuer::new(ca.params.clone(), &ca.key_pair);
@@ -105,8 +111,61 @@ pub fn generate_site_cert(ca: &CaCert, site_name: &str) -> Result<SiteCertOutput
     Ok(SiteCertOutput {
         cert_pem: cert.pem(),
         key_pem: site_key.serialize_pem(),
+        organization: DEMO_ORGANIZATION.to_owned(),
         sans: vec![dns_san],
     })
+}
+
+/// Generate a certificate signed by the given CA with a specific organization.
+///
+/// Identical to [`generate_site_cert`] except `OrganizationName` is set to
+/// `org` rather than [`DEMO_ORGANIZATION`].  Use this to create test certs
+/// that will fail `grid_ingress_trust` org matching despite being signed by
+/// the trusted demo CA (TLS handshake succeeds; filter rejects).
+///
+/// # Errors
+///
+/// Returns [`GenerateError`] if key generation or signing fails.
+pub fn generate_cert_with_org(ca: &CaCert, site_name: &str, org: &str) -> Result<SiteCertOutput, GenerateError> {
+    let dns_san = format!("{site_name}.grid.internal");
+    let params = build_site_params_with_org(site_name, &dns_san, org)?;
+
+    let site_key = KeyPair::generate()?;
+    let issuer = Issuer::new(ca.params.clone(), &ca.key_pair);
+    let cert = params.signed_by(&site_key, &issuer)?;
+
+    Ok(SiteCertOutput {
+        cert_pem: cert.pem(),
+        key_pem: site_key.serialize_pem(),
+        organization: org.to_owned(),
+        sans: vec![dns_san],
+    })
+}
+
+/// Build the certificate parameters for a site certificate.
+///
+/// Separated from [`generate_site_cert`] so tests can verify
+/// the distinguished name entries without generating a full
+/// signed certificate.
+fn build_site_params(site_name: &str, dns_san: &str) -> Result<CertificateParams, GenerateError> {
+    build_site_params_with_org(site_name, dns_san, DEMO_ORGANIZATION)
+}
+
+/// Build certificate parameters for a site certificate with a specific org.
+fn build_site_params_with_org(
+    site_name: &str,
+    dns_san: &str,
+    organization: &str,
+) -> Result<CertificateParams, GenerateError> {
+    let mut params = CertificateParams::default();
+    params.distinguished_name.push(DnType::CommonName, site_name);
+    params.distinguished_name.push(DnType::OrganizationName, organization);
+    params
+        .subject_alt_names
+        .push(rcgen::SanType::DnsName(dns_san.to_owned().try_into()?));
+    params.extended_key_usages.push(ExtendedKeyUsagePurpose::ServerAuth);
+    params.extended_key_usages.push(ExtendedKeyUsagePurpose::ClientAuth);
+    Ok(params)
 }
 
 // ---------------------------------------------------------------------------
@@ -139,6 +198,61 @@ mod tests {
             site.sans.first().map(String::as_str),
             Some("cluster-a.grid.internal"),
             "SAN should match site name"
+        );
+    }
+
+    #[test]
+    fn generate_site_cert_has_organization() {
+        let ca = generate_ca("Test CA").unwrap_or_else(|_| std::process::abort());
+        let site = generate_site_cert(&ca, "cluster-a").unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            site.organization, DEMO_ORGANIZATION,
+            "site cert output should carry the demo organization"
+        );
+    }
+
+    #[test]
+    fn site_params_contain_correct_distinguished_name() {
+        let params =
+            build_site_params("cluster-a", "cluster-a.grid.internal").unwrap_or_else(|_| std::process::abort());
+        let dn = &params.distinguished_name;
+
+        let cn = dn.get(&DnType::CommonName);
+        assert_eq!(
+            cn,
+            Some(&rcgen::DnValue::Utf8String("cluster-a".to_owned())),
+            "CommonName should be the site name"
+        );
+
+        let org = dn.get(&DnType::OrganizationName);
+        assert_eq!(
+            org,
+            Some(&rcgen::DnValue::Utf8String(DEMO_ORGANIZATION.to_owned())),
+            "OrganizationName should be DEMO_ORGANIZATION"
+        );
+    }
+
+    #[test]
+    fn generate_cert_with_org_uses_requested_organization() {
+        let ca = generate_ca("Test CA").unwrap_or_else(|_| std::process::abort());
+        let site = generate_cert_with_org(&ca, "cluster-a", "not-ai-grid").unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            site.organization, "not-ai-grid",
+            "site cert output should carry the requested organization"
+        );
+    }
+
+    #[test]
+    fn custom_site_params_contain_requested_organization() {
+        let params = build_site_params_with_org("cluster-a", "cluster-a.grid.internal", "not-ai-grid")
+            .unwrap_or_else(|_| std::process::abort());
+        let dn = &params.distinguished_name;
+
+        let org = dn.get(&DnType::OrganizationName);
+        assert_eq!(
+            org,
+            Some(&rcgen::DnValue::Utf8String("not-ai-grid".to_owned())),
+            "OrganizationName should match the requested organization"
         );
     }
 
