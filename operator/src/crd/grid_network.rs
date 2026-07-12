@@ -202,7 +202,20 @@ impl Default for SwimConfig {
 
 #[cfg(test)]
 mod tests {
+    use kube::CustomResourceExt as _;
+
     use super::*;
+
+    fn crd_json() -> serde_json::Value {
+        serde_json::to_value(GridNetwork::crd()).unwrap_or_else(|_| std::process::abort())
+    }
+
+    fn crd_spec<'a>(crd: &'a serde_json::Value, field: &str) -> &'a str {
+        crd.get("spec")
+            .and_then(|spec| spec.get(field))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_else(|| std::process::abort())
+    }
 
     #[test]
     fn default_swim_config() {
@@ -262,6 +275,43 @@ mod tests {
         assert!(
             gw.local_site_name.is_none(),
             "absent localSiteName must default to None"
+        );
+    }
+
+    #[test]
+    fn grid_network_crd_has_correct_group_and_plural() {
+        let crd = crd_json();
+        assert_eq!(crd_spec(&crd, "group"), "grid.praxis-proxy.io", "wrong CRD group");
+        assert_eq!(
+            crd.get("spec")
+                .and_then(|spec| spec.get("names"))
+                .and_then(|names| names.get("plural"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_else(|| std::process::abort()),
+            "gridnetworks",
+            "wrong plural name"
+        );
+        assert_eq!(
+            crd.get("spec")
+                .and_then(|spec| spec.get("names"))
+                .and_then(|names| names.get("kind"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_else(|| std::process::abort()),
+            "GridNetwork",
+            "wrong kind name"
+        );
+    }
+
+    #[test]
+    fn grid_network_crd_has_gateway_ref_local_site_name() {
+        let crd = crd_json();
+        let gateway_ref_properties = crd
+            .pointer("/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties/gatewayRefs/items/properties")
+            .and_then(serde_json::Value::as_object)
+            .unwrap_or_else(|| std::process::abort());
+        assert!(
+            gateway_ref_properties.contains_key("localSiteName"),
+            "CRD schema must include localSiteName field on GatewayRef"
         );
     }
 }

@@ -168,7 +168,13 @@ fn default_tls_mode() -> String {
 
 #[cfg(test)]
 mod tests {
+    use kube::CustomResourceExt as _;
+
     use super::*;
+
+    fn crd_json() -> serde_json::Value {
+        serde_json::to_value(GridSite::crd()).unwrap_or_else(|_| std::process::abort())
+    }
 
     #[test]
     fn default_site_phase() {
@@ -208,5 +214,49 @@ mod tests {
         let status = GridSiteStatus::default();
         assert_eq!(status.phase, GridSitePhase::Pending, "default phase");
         assert!(!status.capabilities.has_any(), "no default capabilities");
+    }
+
+    #[test]
+    fn grid_site_crd_has_correct_group_and_plural() {
+        let crd = crd_json();
+        assert_eq!(
+            crd.get("spec")
+                .and_then(|spec| spec.get("group"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_else(|| std::process::abort()),
+            "grid.praxis-proxy.io",
+            "wrong CRD group"
+        );
+        assert_eq!(
+            crd.get("spec")
+                .and_then(|spec| spec.get("names"))
+                .and_then(|names| names.get("plural"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_else(|| std::process::abort()),
+            "gridsites",
+            "wrong plural name"
+        );
+        assert_eq!(
+            crd.get("spec")
+                .and_then(|spec| spec.get("names"))
+                .and_then(|names| names.get("kind"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_else(|| std::process::abort()),
+            "GridSite",
+            "wrong kind name"
+        );
+    }
+
+    #[test]
+    fn grid_site_crd_has_grid_network_ref() {
+        let crd = crd_json();
+        let spec_properties = crd
+            .pointer("/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties")
+            .and_then(serde_json::Value::as_object)
+            .unwrap_or_else(|| std::process::abort());
+        assert!(
+            spec_properties.contains_key("gridNetworkRef"),
+            "CRD schema must include gridNetworkRef field"
+        );
     }
 }

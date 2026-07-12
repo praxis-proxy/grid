@@ -150,7 +150,13 @@ pub enum ProviderPhase {
 
 #[cfg(test)]
 mod tests {
+    use kube::CustomResourceExt as _;
+
     use super::*;
+
+    fn crd_json() -> serde_json::Value {
+        serde_json::to_value(InferenceProvider::crd()).unwrap_or_else(|_| std::process::abort())
+    }
 
     #[test]
     fn default_phase() {
@@ -170,5 +176,58 @@ mod tests {
         let spec: InferenceProviderSpec = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
         assert_eq!(spec.provider_kind, "anthropic", "provider kind");
         assert_eq!(spec.models.len(), 1, "model count");
+    }
+
+    #[test]
+    fn inference_provider_crd_has_correct_group_and_plural() {
+        let crd = crd_json();
+        assert_eq!(
+            crd.get("spec")
+                .and_then(|spec| spec.get("group"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_else(|| std::process::abort()),
+            "grid.praxis-proxy.io",
+            "wrong CRD group"
+        );
+        assert_eq!(
+            crd.get("spec")
+                .and_then(|spec| spec.get("names"))
+                .and_then(|names| names.get("plural"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_else(|| std::process::abort()),
+            "inferenceproviders",
+            "wrong plural name"
+        );
+        assert_eq!(
+            crd.get("spec")
+                .and_then(|spec| spec.get("names"))
+                .and_then(|names| names.get("kind"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_else(|| std::process::abort()),
+            "InferenceProvider",
+            "wrong kind name"
+        );
+    }
+
+    #[test]
+    fn inference_provider_crd_has_status_subresource() {
+        let crd = crd_json();
+        assert!(
+            crd.pointer("/spec/versions/0/subresources/status").is_some(),
+            "CRD must declare a status subresource"
+        );
+    }
+
+    #[test]
+    fn inference_provider_crd_has_site_selector_field() {
+        let crd = crd_json();
+        let spec_properties = crd
+            .pointer("/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties")
+            .and_then(serde_json::Value::as_object)
+            .unwrap_or_else(|| std::process::abort());
+        assert!(
+            spec_properties.contains_key("siteSelector"),
+            "CRD schema must include siteSelector field"
+        );
     }
 }
