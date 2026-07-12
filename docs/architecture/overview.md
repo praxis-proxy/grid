@@ -120,9 +120,9 @@ the `grid-config.json` key.
 rendered on each `GridNetwork` reconciliation. One
 `ConfigMap` per `gatewayRef`.
 
-**OP-03 (blocked):** Gateway annotation patching
-(`grid.praxis-proxy.io/overlay-config`) is not yet
-implemented.  The target Kubernetes object type, API
-group/version, and annotation consumer are not yet
-determined.  This will be revisited once Gateway API
-adoption is confirmed.
+**OP-03 (planned follow-up):** Gateway annotation
+patching (`grid.praxis-proxy.io/overlay-config`) is
+not yet implemented. Once Gateway API adoption is
+confirmed, the operator will patch the annotation so
+the Praxis Operator picks up the overlay `ConfigMap`
+automatically.
