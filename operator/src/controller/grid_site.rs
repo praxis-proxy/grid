@@ -118,3 +118,60 @@ async fn update_status(site: &GridSite, client: &Client, phase: &GridSitePhase) 
 
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn determine_phase_preserves_pending() {
+        let result = determine_phase(&GridSitePhase::Pending);
+        assert_eq!(result, GridSitePhase::Pending, "Pending must stay Pending in Phase 1");
+    }
+
+    #[test]
+    fn determine_phase_preserves_discovered() {
+        let result = determine_phase(&GridSitePhase::Discovered);
+        assert_eq!(
+            result,
+            GridSitePhase::Discovered,
+            "Discovered must stay Discovered in Phase 1"
+        );
+    }
+
+    #[test]
+    fn determine_phase_preserves_connecting() {
+        let result = determine_phase(&GridSitePhase::Connecting);
+        assert_eq!(
+            result,
+            GridSitePhase::Connecting,
+            "Connecting must stay Connecting in Phase 1"
+        );
+    }
+
+    #[test]
+    fn determine_phase_preserves_active() {
+        let result = determine_phase(&GridSitePhase::Active);
+        assert_eq!(result, GridSitePhase::Active, "Active must stay Active in Phase 1");
+    }
+
+    #[test]
+    fn determine_phase_preserves_unreachable() {
+        let result = determine_phase(&GridSitePhase::Unreachable);
+        assert_eq!(
+            result,
+            GridSitePhase::Unreachable,
+            "Unreachable must stay Unreachable in Phase 1"
+        );
+    }
+
+    #[test]
+    fn determine_phase_preserves_left() {
+        let result = determine_phase(&GridSitePhase::Left);
+        assert_eq!(result, GridSitePhase::Left, "Left must stay Left in Phase 1");
+    }
+}

@@ -252,6 +252,15 @@ mod tests {
     }
 
     #[test]
+    fn blank_network_returns_error() {
+        let json = r#"{"network":"  ","local_site":"consumer-site","candidates":[]}"#;
+        assert!(
+            parse_grid_config_json(json).is_err(),
+            "blank network must return an error"
+        );
+    }
+
+    #[test]
     fn blank_local_site_returns_error() {
         let json = r#"{"network":"n","local_site":"  ","candidates":[]}"#;
         assert!(

@@ -41,17 +41,51 @@ const GATEWAY_FEATURES: &str = "llmd-ext-proc";
 ///
 /// # Errors
 ///
-/// Returns an error if Docker/Podman or the build fails.
+/// Returns an error if Docker/Podman or the build fails, or if required
+/// source files are absent from the AI repository checkout.
 pub(crate) fn build_all(ai_repo: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    verify_ai_repo_source_files(ai_repo)?;
     let engine = docker_engine();
     let build_ctx = ai_repo.parent().ok_or("AI repo path has no parent directory")?;
-
     eprintln!("  build context: {}", build_ctx.display());
     eprintln!("  AI repo:       {}", ai_repo.display());
-
     build_gateway_image(&engine, build_ctx, ai_repo)?;
     build_mock_epp_image(&engine, build_ctx, ai_repo)?;
+    Ok(())
+}
 
+/// Verify that the required source files exist in the AI repository checkout.
+///
+/// Both files may be untracked or uncommitted in a given AI repo branch.
+/// This fails early with a clear diagnostic rather than letting a Docker
+/// build fail deep in the invocation chain.
+fn verify_ai_repo_source_files(ai_repo: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let composed = ai_repo.join("Containerfile.composed");
+    if !composed.exists() {
+        return Err(format!(
+            "AI repo is missing Containerfile.composed at {path}\n\
+             This file is required to build {image}.\n\
+             It may be untracked or uncommitted in the AI repo checkout.\n\
+             Confirm the AI checkout at {repo} has this file before running build-gateway-images.",
+            path = composed.display(),
+            image = GATEWAY_IMAGE,
+            repo = ai_repo.display(),
+        )
+        .into());
+    }
+    let mock_epp_cf = ai_repo.join("integrations/llmd/mock-epp/Containerfile");
+    if !mock_epp_cf.exists() {
+        return Err(format!(
+            "AI repo is missing integrations/llmd/mock-epp/Containerfile at {path}\n\
+             This file is required to build {image}.\n\
+             It may be untracked or uncommitted in the AI repo checkout.\n\
+             Confirm the AI checkout at {repo} has this directory before running build-gateway-images.",
+            path = mock_epp_cf.display(),
+            image = MOCK_EPP_IMAGE,
+            repo = ai_repo.display(),
+        )
+        .into());
+    }
     Ok(())
 }
 
@@ -221,5 +255,31 @@ mod tests {
         let missing = Path::new("/nonexistent/path/that/does/not/exist");
         let result = resolve_ai_repo_path(Some(missing));
         assert!(result.is_err(), "missing path should return error");
+    }
+
+    #[test]
+    fn build_all_fails_fast_when_containerfile_composed_missing() {
+        // verify_ai_repo_source_files must fail before any Docker invocation
+        // when Containerfile.composed is absent from the AI repo checkout.
+        let dir = tempfile::tempdir().unwrap_or_else(|_| std::process::abort());
+        let result = build_all(dir.path());
+        assert!(
+            result.is_err(),
+            "build_all must fail when Containerfile.composed is absent"
+        );
+    }
+
+    #[test]
+    fn build_all_fails_fast_when_mock_epp_containerfile_missing() {
+        // verify_ai_repo_source_files must fail before any Docker invocation
+        // when the mock-epp Containerfile is absent from the AI repo checkout.
+        let dir = tempfile::tempdir().unwrap_or_else(|_| std::process::abort());
+        std::fs::write(dir.path().join("Containerfile.composed"), "FROM scratch")
+            .unwrap_or_else(|_| std::process::abort());
+        let result = build_all(dir.path());
+        assert!(
+            result.is_err(),
+            "build_all must fail when mock-epp Containerfile is absent"
+        );
     }
 }
