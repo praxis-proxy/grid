@@ -241,12 +241,12 @@ fn latency_score(metrics: Option<&BackendMetrics>) -> f64 {
 
 /// Computes queue depth score (0.0 to 1.0, higher = emptier).
 fn queue_score(metrics: Option<&BackendMetrics>) -> f64 {
-    metrics.map_or(DEFAULT_SIGNAL_SCORE, |m| 1.0 - m.queue_depth)
+    metrics.map_or(DEFAULT_SIGNAL_SCORE, |m| (1.0 - m.queue_depth).max(0.0))
 }
 
 /// Computes KV cache score (0.0 to 1.0, higher = more available).
 fn kv_cache_score(metrics: Option<&BackendMetrics>) -> f64 {
-    metrics.map_or(DEFAULT_SIGNAL_SCORE, |m| 1.0 - m.kv_cache_utilization)
+    metrics.map_or(DEFAULT_SIGNAL_SCORE, |m| (1.0 - m.kv_cache_utilization).max(0.0))
 }
 
 /// Computes prefix cache score (0.0 to 1.0, higher = warmer).
@@ -392,6 +392,29 @@ mod tests {
             result.first().map(|b| b.name.as_str()),
             Some("avail"),
             "backend with more KV cache available should rank first"
+        );
+    }
+
+    #[test]
+    fn queue_score_clamped_when_above_one() {
+        // queue_depth > 1.0 must not produce a negative contribution.
+        // Before the .max(0.0) fix, this would return -1.0 and corrupt ranking.
+        let metrics = BackendMetrics::new(0.0, true, 0.0, 0.0, 0.0, 2.0);
+        assert_eq!(
+            queue_score(Some(&metrics)),
+            0.0,
+            "saturated queue_depth must yield 0.0, not negative"
+        );
+    }
+
+    #[test]
+    fn kv_cache_score_clamped_when_above_one() {
+        // kv_cache_utilization > 1.0 must not produce a negative contribution.
+        let metrics = BackendMetrics::new(0.0, true, 1.5, 0.0, 0.0, 0.0);
+        assert_eq!(
+            kv_cache_score(Some(&metrics)),
+            0.0,
+            "saturated kv_cache_utilization must yield 0.0, not negative"
         );
     }
 
