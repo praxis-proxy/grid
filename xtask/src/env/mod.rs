@@ -52,7 +52,7 @@ pub(crate) enum Action {
         config: PathBuf,
     },
 
-    /// Verify provider inference-sim endpoints are reachable.
+    /// Verify provider inference endpoints are reachable.
     VerifyProviders {
         /// Path to the environment config file.
         #[arg(short, long, default_value = DEFAULT_CONFIG_PATH)]
@@ -256,7 +256,7 @@ fn report_cert_status(mut all_ok: bool) -> bool {
     all_ok
 }
 
-/// Verify provider inference-sim endpoints.
+/// Verify provider inference endpoints.
 fn env_verify_providers(config: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let cfg = EnvConfig::from_file(config)?;
     verify::verify_providers(&cfg)

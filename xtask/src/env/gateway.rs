@@ -79,7 +79,7 @@ pub(crate) fn deploy_all(cfg: &EnvConfig) -> Result<(), Box<dyn std::error::Erro
 
 /// Verify provider gateways for all provider clusters.
 ///
-/// Asserts the full `ext_proc → mock EPP → endpoint_selector → inference-sim` path.
+/// Asserts the full `ext_proc → mock EPP → endpoint_selector → provider backend` path.
 ///
 /// # Errors
 ///
@@ -478,9 +478,16 @@ fn verify_provider(
     }
     tally.pass(name, "provider gateway reachable via port-forward");
 
-    // Test each configured model.
+    // Test each configured model via Chat Completions.
     for model in &def.models {
         verify_model(name, &ctx, port, model, name, consumer_site, tally);
+    }
+
+    // For mock-openai backend, also verify the Responses API path.
+    if def.backend == ProviderBackend::MockOpenai {
+        for model in &def.models {
+            verify_responses_model(name, &ctx, port, model, name, consumer_site, tally);
+        }
     }
 
     // Test unknown model → 503.
@@ -524,7 +531,7 @@ fn check_deployment_ready(cluster: &str, context: &str, deployment: &str, tally:
     }
 }
 
-/// Verify a valid model routes to inference-sim and returns 200.
+/// Verify a valid model routes to the configured provider backend and returns 200.
 #[expect(
     clippy::too_many_arguments,
     reason = "cluster, context, port, model, site, tally all distinct"
@@ -621,7 +628,7 @@ fn verify_spoof_ignored(
     }
 }
 
-/// Validate JSON response shape.
+/// Validate Chat Completions JSON response shape.
 fn validate_body(cluster: &str, context: &str, model: &str, body: &str, tally: &mut Tally) {
     match serde_json::from_str::<serde_json::Value>(body) {
         Ok(json) if json.get("choices").is_some_and(serde_json::Value::is_array) => {
@@ -643,6 +650,85 @@ fn validate_body(cluster: &str, context: &str, model: &str, body: &str, tally: &
     }
 }
 
+/// Validate Responses API JSON response shape.
+///
+/// Checks that the body has `object = "response"`, `status = "completed"`,
+/// and a non-empty `output` array.  Rejects anything containing a Chat
+/// Completions `choices` field.
+pub(crate) fn validate_responses_body(cluster: &str, context: &str, model: &str, body: &str, tally: &mut Tally) {
+    match serde_json::from_str::<serde_json::Value>(body) {
+        Ok(json) => {
+            let is_response_obj = json.get("object").and_then(serde_json::Value::as_str) == Some("response");
+            let is_completed = json.get("status").and_then(serde_json::Value::as_str) == Some("completed");
+            let has_output = json
+                .get("output")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|output| !output.is_empty());
+            let has_choices = json.get("choices").is_some();
+
+            if is_response_obj && is_completed && has_output && !has_choices {
+                tally.pass(cluster, &format!("model {model} response is valid Responses API JSON"));
+            } else {
+                tally.fail(
+                    cluster,
+                    &format!(
+                        "model {model} Responses body invalid \
+                         (object={is_response_obj}, status={is_completed}, output={has_output}, choices={has_choices})"
+                    ),
+                    context,
+                );
+            }
+        },
+        Err(e) => {
+            tally.fail(
+                cluster,
+                &format!("model {model} Responses body not valid JSON: {e}"),
+                context,
+            );
+        },
+    }
+}
+
+/// Verify that a model returns a valid Responses API response.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "cluster/context/port/model/site/consumer_site/tally all distinct"
+)]
+fn verify_responses_model(
+    cluster: &str,
+    context: &str,
+    port: u16,
+    model: &str,
+    site: &str,
+    consumer_site: &str,
+    tally: &mut Tally,
+) {
+    match send_responses_request(port, model, site, consumer_site) {
+        Ok(resp) if resp.status == 200 => {
+            tally.pass(cluster, &format!("model {model} returns 200 via Responses API path"));
+            validate_responses_body(cluster, context, model, &resp.body, tally);
+        },
+        Ok(resp) => {
+            let excerpt = safe_truncate(&resp.body, 200);
+            tally.fail(
+                cluster,
+                &format!(
+                    "model {model} Responses request returned {} (expected 200)\n         body: {excerpt}",
+                    resp.status
+                ),
+                context,
+            );
+        },
+        Err(e) => {
+            tally.fail(
+                cluster,
+                &format!("model {model} Responses request failed: {e}"),
+                context,
+            );
+        },
+    }
+}
+
 // ---------------------------------------------------------------------------
 // HTTP helpers
 // ---------------------------------------------------------------------------
@@ -650,7 +736,9 @@ fn validate_body(cluster: &str, context: &str, model: &str, body: &str, tally: &
 /// Send a Chat Completions request to the provider gateway (mTLS).
 ///
 /// Presents the configured consumer client cert and uses `--resolve` to map
-/// the server's SAN hostname to the port-forward address.
+/// the server's SAN hostname to the port-forward address.  Includes a Bearer
+/// token required by the `mock-openai` backend; the `inference-sim` backend
+/// ignores it.
 fn send_chat_request(
     port: u16,
     model: &str,
@@ -679,16 +767,36 @@ fn send_chat_request_with_spoof(
     curl_post_mtls(&url, &body, Some(spoof), &resolve, consumer_site)
 }
 
+/// Send a Responses API request to the provider gateway (mTLS).
+///
+/// Used when the provider cluster is configured with the `mock-openai` backend,
+/// which serves `POST /v1/responses` in addition to Chat Completions.
+pub(crate) fn send_responses_request(
+    port: u16,
+    model: &str,
+    site: &str,
+    consumer_site: &str,
+) -> Result<HttpResponse, Box<dyn std::error::Error>> {
+    let sni = format!("{site}.grid.internal");
+    let url = format!("https://{sni}:{port}/v1/responses");
+    let resolve = format!("{sni}:{port}:127.0.0.1");
+    let body = format!(r#"{{"model":"{model}"}}"#);
+    curl_post_mtls(&url, &body, None, &resolve, consumer_site)
+}
+
 /// HTTP POST via curl with mTLS and `--resolve` for hostname mapping.
 ///
 /// Uses the configured consumer client cert to satisfy `client_cert_mode:
 /// require`. The `resolve` argument maps the provider's SAN hostname to the
 /// port-forward loopback address so rustls hostname verification passes.
+///
+/// A Bearer token is always included.  The `mock-openai` backend requires it;
+/// the `inference-sim` backend ignores unknown headers.
 #[expect(
     clippy::too_many_lines,
     reason = "curl arg list for mTLS with optional spoofed header"
 )]
-fn curl_post_mtls(
+pub(crate) fn curl_post_mtls(
     url: &str,
     body: &str,
     spoof_header: Option<&str>,
@@ -715,6 +823,8 @@ fn curl_post_mtls(
         &client_key,
         "-X",
         "POST",
+        "-H",
+        "Authorization: Bearer dummy-key",
         "-H",
         "Content-Type: application/json",
     ];
@@ -786,5 +896,65 @@ mod tests {
             !args.contains("inference-sim"),
             "mock-openai mode must not reference inference-sim services"
         );
+    }
+
+    #[test]
+    fn validate_responses_body_accepts_valid_shape() {
+        let mut tally = Tally::default();
+        let body = r#"{
+            "id": "resp-001",
+            "object": "response",
+            "model": "model-a",
+            "status": "completed",
+            "output": [{"id": "msg-001", "type": "message"}],
+            "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+        }"#;
+        validate_responses_body("prov", "ctx", "model-a", body, &mut tally);
+        let summary = tally.print_summary();
+        assert!(summary.is_ok(), "valid Responses body must pass");
+    }
+
+    #[test]
+    fn validate_responses_body_rejects_chat_completions_shape() {
+        let mut tally = Tally::default();
+        let body = r#"{"choices": [{"message": {"content": "hi"}}]}"#;
+        validate_responses_body("prov", "ctx", "model-a", body, &mut tally);
+        let summary = tally.print_summary();
+        assert!(summary.is_err(), "Chat Completions body must fail Responses validation");
+    }
+
+    #[test]
+    fn validate_responses_body_rejects_missing_status() {
+        let mut tally = Tally::default();
+        let body = r#"{"object": "response", "output": [], "model": "m"}"#;
+        validate_responses_body("prov", "ctx", "model-a", body, &mut tally);
+        let summary = tally.print_summary();
+        assert!(summary.is_err(), "missing status must fail Responses validation");
+    }
+
+    #[test]
+    fn validate_responses_body_rejects_missing_output() {
+        let mut tally = Tally::default();
+        let body = r#"{"object": "response", "status": "completed", "model": "m"}"#;
+        validate_responses_body("prov", "ctx", "model-a", body, &mut tally);
+        let summary = tally.print_summary();
+        assert!(summary.is_err(), "missing output must fail Responses validation");
+    }
+
+    #[test]
+    fn validate_responses_body_rejects_empty_output() {
+        let mut tally = Tally::default();
+        let body = r#"{"object": "response", "status": "completed", "output": [], "model": "m"}"#;
+        validate_responses_body("prov", "ctx", "model-a", body, &mut tally);
+        let summary = tally.print_summary();
+        assert!(summary.is_err(), "empty output must fail Responses validation");
+    }
+
+    #[test]
+    fn validate_responses_body_rejects_invalid_json() {
+        let mut tally = Tally::default();
+        validate_responses_body("prov", "ctx", "model-a", "{not valid", &mut tally);
+        let summary = tally.print_summary();
+        assert!(summary.is_err(), "invalid JSON must fail Responses validation");
     }
 }

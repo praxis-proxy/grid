@@ -3,7 +3,7 @@
 //! Builds the composed Praxis AI gateway image and the mock EPP image
 //! from the AI repository, then loads them into all kind clusters.
 //!
-//! When a cluster is configured with [`ProviderBackend::MockOpenai`], the
+//! When a cluster is configured with `backend = "mock-openai"`, the
 //! `grid-mock-providers` image ([`kind::MOCK_PROVIDER_IMAGE`]) is also
 //! loaded into that cluster.
 
@@ -55,13 +55,11 @@ pub(crate) fn build_all(ai_repo: &Path) -> Result<(), Box<dyn std::error::Error>
     Ok(())
 }
 
-/// Load both images into all kind clusters.
-///
 /// Load gateway images into all kind clusters.
 ///
 /// Always loads [`GATEWAY_IMAGE`] and [`MOCK_EPP_IMAGE`] into every cluster.
 ///
-/// For clusters configured with [`ProviderBackend::MockOpenai`], also loads
+/// For clusters configured with `backend = "mock-openai"`, also loads
 /// [`kind::MOCK_PROVIDER_IMAGE`]. This image must exist locally as
 /// `grid-mock-providers:latest` before running `load-gateway-images`.
 ///
