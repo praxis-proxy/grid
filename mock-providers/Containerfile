@@ -1,0 +1,34 @@
+# Multi-stage build for mock AI provider servers.
+# Produces a single binary that serves any provider via --provider flag.
+#
+# Usage:
+#   docker build -t grid-mock-providers:latest -f mock-providers/Containerfile .
+#   docker run --rm -p 10001:8080 grid-mock-providers:latest --provider openai
+
+FROM rust:1.96-alpine AS builder
+RUN apk add --no-cache musl-dev
+WORKDIR /build
+COPY Cargo.toml Cargo.lock clippy.toml rustfmt.toml deny.toml ./
+COPY .cargo .cargo
+# Copy Cargo.toml for every workspace member so cargo can resolve the workspace.
+# Only mock-providers and xtask need full source; the others are manifest-only stubs.
+COPY certs/Cargo.toml certs/Cargo.toml
+COPY crdt/Cargo.toml crdt/Cargo.toml
+COPY operator/Cargo.toml operator/Cargo.toml
+COPY scoring/Cargo.toml scoring/Cargo.toml
+COPY swim/Cargo.toml swim/Cargo.toml
+# Create stub source files so cargo can validate each workspace member manifest
+# without compiling them. Only mock-providers is actually built.
+RUN mkdir -p certs/src crdt/src operator/src scoring/src swim/src && \
+    touch certs/src/lib.rs crdt/src/lib.rs operator/src/lib.rs \
+          scoring/src/lib.rs swim/src/lib.rs
+COPY mock-providers mock-providers
+COPY xtask xtask
+RUN cargo build --release --package mock-providers
+
+FROM alpine:3.22
+RUN adduser -D -u 1000 app
+COPY --from=builder /build/target/release/mock-providers /usr/local/bin/
+USER app
+EXPOSE 8080
+ENTRYPOINT ["mock-providers"]

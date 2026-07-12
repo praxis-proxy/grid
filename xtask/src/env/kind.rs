@@ -251,9 +251,29 @@ fn cluster_exists(full_name: &str) -> bool {
 /// Deploy a single `grid-mock-providers` (openai backend) instance and wait
 /// for readiness.
 ///
+/// Loads [`MOCK_PROVIDER_IMAGE`] into the kind cluster before deploying because
+/// the Deployment uses `imagePullPolicy: Never`.  The image must already be
+/// present in the local Docker daemon (built via
+/// `docker build -t grid-mock-providers:latest -f mock-providers/Containerfile .`).
+///
 /// A single Deployment and Service handles all models for this cluster.
 /// The mock EPP routes all model requests to this one service.
 fn deploy_mock_openai(full_name: &str, site_name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    // Load the image into the cluster before deploying; imagePullPolicy: Never
+    // requires the image to be present in the kind node before the Pod starts.
+    eprintln!("  loading {MOCK_PROVIDER_IMAGE} into {full_name}...");
+    run_cmd(
+        "kind",
+        &["load", "docker-image", MOCK_PROVIDER_IMAGE, "--name", full_name],
+    )
+    .map_err(|e| {
+        format!(
+            "{e}\n\
+             hint: build the image first with:\n\
+             \x20 docker build -t {MOCK_PROVIDER_IMAGE} -f mock-providers/Containerfile ."
+        )
+    })?;
+
     let ctx = format!("kind-{full_name}");
     eprintln!("  deploying {MOCK_OPENAI_SVC} to {full_name}...");
     apply_manifest(&ctx, &mock_openai_deployment_yaml(site_name))?;
