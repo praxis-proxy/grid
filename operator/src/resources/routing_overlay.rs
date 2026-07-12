@@ -1008,4 +1008,46 @@ mod tests {
         assert_eq!(c.get("cluster").and_then(serde_json::Value::as_str), Some("prov-a"));
         assert_eq!(c.get("fresh").and_then(serde_json::Value::as_bool), Some(true));
     }
+
+    // -----------------------------------------------------------------------
+    // Error paths — missing names (items 14–15 per coverage policy)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn missing_network_name_returns_error() {
+        // GridNetwork with no metadata.name must produce an error.
+        let network: GridNetwork = serde_json::from_value(serde_json::json!({
+            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "kind": "GridNetwork",
+            "metadata": {},
+            "spec": { "seeds": [] }
+        }))
+        .unwrap_or_else(|_| std::process::abort());
+        let result = render_routing_overlay(&network, &[], &[], "local");
+        assert!(result.is_err(), "network without metadata.name must return an error");
+    }
+
+    #[test]
+    fn missing_provider_name_returns_error() {
+        // InferenceProvider with no metadata.name must produce an error.
+        let network = test_network("net");
+        let provider: InferenceProvider = serde_json::from_value(serde_json::json!({
+            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "kind": "InferenceProvider",
+            "metadata": {},
+            "spec": {
+                "gridNetworkRef": "net",
+                "providerKind": "self_hosted",
+                "backendKind": "local",
+                "endpoint": "http://localhost:8000",
+                "models": [{"name": "model"}]
+            }
+        }))
+        .unwrap_or_else(|_| std::process::abort());
+        let result = render_routing_overlay(&network, &[], &[provider], "local");
+        assert!(
+            result.is_err(),
+            "InferenceProvider without metadata.name must return an error"
+        );
+    }
 }

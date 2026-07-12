@@ -1,11 +1,12 @@
 //! AI Grid operator binary.
 //!
-//! Runs Kubernetes controllers for [`GridNetwork`] and
-//! [`GridSite`] resources. In future phases, also runs the
+//! Runs Kubernetes controllers for [`GridNetwork`], [`GridSite`], and
+//! [`InferenceProvider`] resources.  In future phases, also runs the
 //! SWIM runtime for peer-to-peer mesh formation.
 //!
 //! [`GridNetwork`]: operator::crd::grid_network::GridNetwork
 //! [`GridSite`]: operator::crd::grid_site::GridSite
+//! [`InferenceProvider`]: operator::crd::inference_provider::InferenceProvider
 
 #![deny(unsafe_code)]
 
@@ -17,8 +18,8 @@ use kube::{
     runtime::{controller::Controller, watcher},
 };
 use operator::{
-    controller::{grid_network, grid_site},
-    crd::{grid_network::GridNetwork, grid_site::GridSite},
+    controller::{grid_network, grid_site, inference_provider},
+    crd::{grid_network::GridNetwork, grid_site::GridSite, inference_provider::InferenceProvider},
 };
 
 // ---------------------------------------------------------------------------
@@ -26,6 +27,7 @@ use operator::{
 // ---------------------------------------------------------------------------
 
 #[tokio::main]
+#[expect(clippy::large_stack_frames, reason = "top-level binary with tokio runtime")]
 async fn main() {
     tracing_subscriber::fmt::init();
     tracing::info!("starting grid-operator");
@@ -41,6 +43,7 @@ async fn main() {
     let result = tokio::try_join!(
         run_network_controller(client.clone()),
         run_site_controller(client.clone()),
+        run_provider_controller(client.clone()),
     );
 
     if let Err(e) = result {
@@ -79,6 +82,29 @@ async fn run_site_controller(client: Client) -> Result<(), Box<dyn std::error::E
             match result {
                 Ok((obj, _action)) => tracing::info!(%obj, "reconciled GridSite"),
                 Err(e) => tracing::error!(error = ?e, "GridSite watch error"),
+            }
+        })
+        .await;
+
+    Ok(())
+}
+
+/// Run the [`InferenceProvider`] controller (OP-02).
+///
+/// [`InferenceProvider`]: operator::crd::inference_provider::InferenceProvider
+async fn run_provider_controller(client: Client) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let api = Api::<InferenceProvider>::all(client.clone());
+
+    Controller::new(api, watcher::Config::default())
+        .run(
+            inference_provider::reconcile,
+            inference_provider::error_policy,
+            Arc::new(client),
+        )
+        .for_each(|result| async {
+            match result {
+                Ok((obj, _action)) => tracing::info!(%obj, "reconciled InferenceProvider"),
+                Err(e) => tracing::error!(error = ?e, "InferenceProvider watch error"),
             }
         })
         .await;

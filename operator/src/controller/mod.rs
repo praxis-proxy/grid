@@ -9,3 +9,8 @@ pub mod grid_network;
 ///
 /// [`GridSite`]: crate::crd::grid_site::GridSite
 pub mod grid_site;
+
+/// [`InferenceProvider`] controller (OP-02).
+///
+/// [`InferenceProvider`]: crate::crd::inference_provider::InferenceProvider
+pub mod inference_provider;
