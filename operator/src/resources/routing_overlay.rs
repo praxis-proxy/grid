@@ -394,6 +394,7 @@ fn candidates_from_provider(
         SiteResolution::Known(names) => names.iter().map(String::as_str).collect(),
     };
 
+    let fresh = is_candidate_fresh(provider);
     let mut candidates = Vec::new();
     for model in &provider.spec.models {
         for site in &sites {
@@ -402,7 +403,7 @@ fn candidates_from_provider(
                 name: model.name.clone(),
                 site: (*site).to_owned(),
                 cluster: provider_name.to_owned(),
-                fresh: true,
+                fresh,
             });
         }
     }
@@ -425,6 +426,37 @@ fn is_explicitly_unavailable(provider: &InferenceProvider) -> bool {
         .status
         .as_ref()
         .is_some_and(|s| s.phase == ProviderPhase::Unavailable)
+}
+
+/// Returns `true` when this provider's candidate data is considered fresh.
+///
+/// Freshness is derived from `status.phase`:
+///
+/// | Phase | Included | `fresh` |
+/// |-------|----------|---------|
+/// | `Available` | yes | `true` |
+/// | `Pending` | yes | `true` |
+/// | absent status | yes | `true` |
+/// | `Degraded` | yes | **`false`** |
+/// | `Unavailable` | no | — (excluded before this is called) |
+///
+/// `Degraded` means the provider is reachable but partially unhealthy
+/// (e.g. high error rate, endpoint returning errors). Including it with
+/// `fresh: false` lets Praxis keep the candidate in its selection pool
+/// while signalling that its metrics are stale or unreliable.
+///
+/// Absent status uses `true` as the conservative default so that
+/// providers are visible before OP-02 has populated their status.
+///
+/// `Unavailable` providers never reach this function — they are excluded
+/// by [`is_explicitly_unavailable`] before candidates are generated.
+///
+/// [`InferenceProvider`]: crate::crd::inference_provider::InferenceProvider
+pub(crate) fn is_candidate_fresh(provider: &InferenceProvider) -> bool {
+    provider
+        .status
+        .as_ref()
+        .is_none_or(|s| s.phase != ProviderPhase::Degraded)
 }
 
 // ---------------------------------------------------------------------------
@@ -1026,7 +1058,44 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Provider status filtering
+    // is_candidate_fresh — pure freshness decision function
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn available_phase_is_fresh() {
+        let provider = test_provider_with_phase("prov", "net", &["model"], "Available");
+        assert!(is_candidate_fresh(&provider), "Available must be fresh");
+    }
+
+    #[test]
+    fn pending_phase_is_fresh() {
+        let provider = test_provider_with_phase("prov", "net", &["model"], "Pending");
+        assert!(is_candidate_fresh(&provider), "Pending must be fresh");
+    }
+
+    #[test]
+    fn absent_status_is_fresh() {
+        let provider = test_provider("prov", "net", &["model"]);
+        assert!(
+            is_candidate_fresh(&provider),
+            "absent status must be fresh (conservative default before OP-02 runs)"
+        );
+    }
+
+    #[test]
+    fn degraded_phase_is_not_fresh() {
+        let provider = test_provider_with_phase("prov", "net", &["model"], "Degraded");
+        assert!(
+            !is_candidate_fresh(&provider),
+            "Degraded must NOT be fresh (provider included but data is stale)"
+        );
+    }
+
+    // Unavailable is excluded before is_candidate_fresh is called — no test
+    // for Unavailable freshness, as it never reaches this function.
+
+    // -----------------------------------------------------------------------
+    // Provider status filtering — inclusion and fresh flag
     // -----------------------------------------------------------------------
 
     #[test]
@@ -1039,16 +1108,20 @@ mod tests {
     }
 
     #[test]
-    fn available_provider_is_included() {
+    fn available_provider_is_included_with_fresh_true() {
         let network = test_network("net");
         let provider = test_provider_with_phase("prov", "net", &["model-1"], "Available");
         let overlay =
             render_routing_overlay(&network, &[], &[provider], "test-site").unwrap_or_else(|_| std::process::abort());
         assert_eq!(overlay.candidates.len(), 1, "Available provider must be included");
+        assert!(
+            overlay.candidates.first().is_some_and(|c| c.fresh),
+            "Available provider candidate must have fresh=true"
+        );
     }
 
     #[test]
-    fn pending_provider_is_included() {
+    fn pending_provider_is_included_with_fresh_true() {
         let network = test_network("net");
         let provider = test_provider_with_phase("prov", "net", &["model-1"], "Pending");
         let overlay =
@@ -1058,10 +1131,14 @@ mod tests {
             1,
             "Pending provider must be included (default pre-OP-02 state)"
         );
+        assert!(
+            overlay.candidates.first().is_some_and(|c| c.fresh),
+            "Pending provider candidate must have fresh=true"
+        );
     }
 
     #[test]
-    fn provider_with_absent_status_is_included() {
+    fn provider_with_absent_status_is_included_with_fresh_true() {
         let network = test_network("net");
         let provider = test_provider("prov", "net", &["model-1"]);
         let overlay =
@@ -1070,6 +1147,102 @@ mod tests {
             overlay.candidates.len(),
             1,
             "Provider with absent status must be included"
+        );
+        assert!(
+            overlay.candidates.first().is_some_and(|c| c.fresh),
+            "Provider with absent status must have fresh=true"
+        );
+    }
+
+    #[test]
+    fn degraded_provider_is_included_with_fresh_false() {
+        let network = test_network("net");
+        let provider = test_provider_with_phase("prov", "net", &["model-1"], "Degraded");
+        let overlay =
+            render_routing_overlay(&network, &[], &[provider], "test-site").unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            overlay.candidates.len(),
+            1,
+            "Degraded provider must remain in overlay (kept for selection with staleness hint)"
+        );
+        assert!(
+            overlay.candidates.first().is_some_and(|c| !c.fresh),
+            "Degraded provider candidate must have fresh=false"
+        );
+    }
+
+    #[test]
+    fn degraded_provider_all_models_fresh_false() {
+        // All models from a Degraded provider inherit fresh=false.
+        let network = test_network("net");
+        let provider = test_provider_with_phase("prov", "net", &["model-a", "model-b"], "Degraded");
+        let overlay =
+            render_routing_overlay(&network, &[], &[provider], "test-site").unwrap_or_else(|_| std::process::abort());
+        assert_eq!(overlay.candidates.len(), 2, "both models must be present");
+        assert!(
+            overlay.candidates.iter().all(|c| !c.fresh),
+            "all candidates from a Degraded provider must have fresh=false"
+        );
+    }
+
+    #[test]
+    fn mixed_phases_produce_correct_fresh_values() {
+        // Available + Degraded in the same network — each candidate's fresh
+        // reflects its provider's phase independently.
+        let network = test_network("net");
+        let available = test_provider_with_phase("avail-prov", "net", &["model-a"], "Available");
+        let degraded = test_provider_with_phase("degr-prov", "net", &["model-a"], "Degraded");
+        let overlay = render_routing_overlay(&network, &[], &[available, degraded], "test-site")
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(overlay.candidates.len(), 2, "both providers must contribute candidates");
+        let avail_candidate = overlay
+            .candidates
+            .iter()
+            .find(|c| c.cluster == "avail-prov")
+            .unwrap_or_else(|| std::process::abort());
+        let degr_candidate = overlay
+            .candidates
+            .iter()
+            .find(|c| c.cluster == "degr-prov")
+            .unwrap_or_else(|| std::process::abort());
+        assert!(avail_candidate.fresh, "Available provider candidate must be fresh");
+        assert!(!degr_candidate.fresh, "Degraded provider candidate must not be fresh");
+    }
+
+    #[test]
+    fn degraded_fresh_false_appears_in_json_output() {
+        // End-to-end: Degraded → fresh=false must survive JSON serialisation
+        // in the ConfigMap and be readable by the overlay consumer.
+        let network = test_network("net");
+        let provider = test_provider_with_phase("prov", "net", &["model-1"], "Degraded");
+        let overlay =
+            render_routing_overlay(&network, &[], &[provider], "test-site").unwrap_or_else(|_| std::process::abort());
+        let cm = build_cm(&overlay, "net", "gw");
+        let json = overlay_json_from_cm(&cm);
+        let fresh = json
+            .get("candidates")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|a| a.first())
+            .and_then(|c| c.get("fresh"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or_else(|| std::process::abort());
+        assert!(!fresh, "Degraded provider must produce fresh=false in ConfigMap JSON");
+    }
+
+    #[test]
+    fn degraded_with_sites_all_site_candidates_fresh_false() {
+        // When a Degraded provider matches multiple sites, all resulting
+        // (model, site) candidates must have fresh=false.
+        let network = test_network("net");
+        let site_a = test_site("site-a", "net");
+        let site_b = test_site("site-b", "net");
+        let provider = test_provider_with_phase("prov", "net", &["model-a"], "Degraded");
+        let overlay = render_routing_overlay(&network, &[site_a, site_b], &[provider], "test-site")
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(overlay.candidates.len(), 2, "one candidate per matched site");
+        assert!(
+            overlay.candidates.iter().all(|c| !c.fresh),
+            "every (model, site) candidate from a Degraded provider must have fresh=false"
         );
     }
 
