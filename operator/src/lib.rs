@@ -12,5 +12,7 @@ pub mod controller;
 pub mod crd;
 /// Operator error types.
 pub mod error;
+/// Pure Prometheus text-format parser for inference backend metrics.
+pub mod metrics_parser;
 /// Kubernetes resource builders.
 pub mod resources;

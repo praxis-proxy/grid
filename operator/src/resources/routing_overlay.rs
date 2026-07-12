@@ -86,10 +86,6 @@ const DEFAULT_LOCALITY: f64 = 0.5;
 /// (`None, None`).  Unrecognised kinds default to
 /// [`DEFAULT_LOCALITY`] (0.5).
 ///
-/// This is used to sort overlay candidates so that lower-latency /
-/// higher-priority backends appear first, giving Praxis a
-/// locality-ordered candidate list without live metrics.
-///
 /// | `backend_kind` | Score |
 /// |----------------|-------|
 /// | `"local"` | 1.0 |
@@ -103,6 +99,148 @@ pub(crate) fn backend_locality_score(backend_kind: &str) -> f64 {
     let kind: Option<scoring::BackendKind> =
         serde_json::from_value(serde_json::Value::String(backend_kind.to_owned())).ok();
     kind.map_or(DEFAULT_LOCALITY, |k| scoring::locality_score(k, None, None))
+}
+
+/// Map an [`InferenceProvider`] to a [`scoring::BackendConfig`] for use with
+/// [`scoring::score_backends`].
+///
+/// Returns `None` when:
+/// - The provider has no `metadata.name`.
+/// - `spec.backendKind` does not match any [`scoring::BackendKind`] variant (locality is the primary scoring signal;
+///   unknown kinds cannot be ranked).
+///
+/// `spec.providerKind` is stored as metadata in [`scoring::BackendConfig`] but
+/// is not used by the scoring formula.  Unknown values (including `"self_hosted"`
+/// for vLLM / llm-d servers, which serve the OpenAI-compatible API) default to
+/// [`scoring::ProviderKind::OpenAi`] so that self-hosted providers are not
+/// excluded from scoring.
+///
+/// Cost is converted from per-million-tokens (CRD unit) to per-1k-tokens
+/// (scoring-crate unit) by dividing by 1 000.  Missing cost is treated as 0.0
+/// (free), which yields the maximum cost score of 1.0.
+///
+/// Provider region is always `None` in this implementation: the
+/// [`InferenceProvider`] CRD carries no region field.  Pass the network's own
+/// region as `local_region` to [`scoring::score_backends`] to benefit from
+/// same-region preference for remote providers if per-provider regions become
+/// available in a future CRD revision.
+///
+/// [`InferenceProvider`]: crate::crd::inference_provider::InferenceProvider
+pub(crate) fn provider_to_backend_config(provider: &InferenceProvider) -> Option<scoring::BackendConfig> {
+    let name = provider.metadata.name.as_deref()?.to_owned();
+    let kind: scoring::BackendKind =
+        serde_json::from_value(serde_json::Value::String(provider.spec.backend_kind.clone())).ok()?;
+    let provider_kind: scoring::ProviderKind =
+        serde_json::from_value(serde_json::Value::String(provider.spec.provider_kind.clone()))
+            .unwrap_or(scoring::ProviderKind::OpenAi);
+    let cost_per_1k_input = provider
+        .spec
+        .cost
+        .as_ref()
+        .map_or(0.0, |c| c.per_million_input_tokens / 1_000.0);
+    let cost_per_1k_output = provider
+        .spec
+        .cost
+        .as_ref()
+        .map_or(0.0, |c| c.per_million_output_tokens / 1_000.0);
+    Some(scoring::BackendConfig::new(
+        name,
+        cost_per_1k_input,
+        cost_per_1k_output,
+        provider.spec.endpoint.clone(),
+        kind,
+        provider_kind,
+        None, // provider region: not in CRD; see doc for future work note
+    ))
+}
+
+/// Neutral signal score when no live metrics are available; matches
+/// `scoring::DEFAULT_SIGNAL_SCORE` which is not exported from the scoring crate.
+const UNMAPPED_NEUTRAL_SIGNAL: f64 = 0.5;
+
+/// Compute the score equivalent to what [`scoring::score_backends`] would
+/// assign to a provider whose `backend_kind` cannot be parsed.
+///
+/// Applies [`scoring::ScoringWeights::default`] with neutral runtime signals
+/// (0.5, the scoring crate's default for missing metrics) and no cost (treated
+/// as free → cost signal = 1.0).  This places unmapped providers on the same
+/// numeric scale as scored providers so they can be sorted in a single pass.
+fn unmapped_provider_score(backend_kind: &str) -> f64 {
+    let w = scoring::ScoringWeights::default();
+    // 1.0: cost_score(0.0) — providers with no cost data are treated as free.
+    w.locality * backend_locality_score(backend_kind)
+        + w.cost * 1.0
+        + (w.queue_depth + w.kv_cache + w.latency + w.prefix_cache) * UNMAPPED_NEUTRAL_SIGNAL
+}
+
+/// Compute per-provider ordering scores for overlay candidate sorting.
+///
+/// For each provider in `network_name` that can be mapped to a
+/// [`scoring::BackendConfig`], the score is produced by
+/// [`scoring::score_backends`] using [`scoring::ScoringWeights::default`]
+/// and the network's `local_region`.  Providers whose `backend_kind` cannot
+/// be parsed fall back to [`unmapped_provider_score`], which is on the same
+/// numeric scale.
+///
+/// `Unavailable` providers are excluded (they are never emitted as candidates).
+/// All other phases — `Pending`, `Available`, `Degraded`, and absent status —
+/// are scored and included.  The `fresh` flag is set separately per candidate
+/// by [`is_candidate_fresh`].
+///
+/// Returns a map from provider name to score, borrowing names from `providers`.
+fn provider_ordering_scores<'a>(
+    network_name: &str,
+    providers: &'a [InferenceProvider],
+    local_region: Option<&str>,
+    metrics: Option<&HashMap<&str, scoring::BackendMetrics>>,
+) -> HashMap<&'a str, f64> {
+    let state = build_grid_state_with_metrics(network_name, providers, metrics);
+    let scored = scoring::score_backends(&state, &scoring::ScoringWeights::default(), local_region);
+    // `scored` owns its Strings so we use an intermediate owned-key map.
+    let from_engine: HashMap<String, f64> = scored.into_iter().map(|sb| (sb.name, sb.score)).collect();
+    providers
+        .iter()
+        .filter_map(|p| {
+            let name = p.metadata.name.as_deref()?;
+            let score = from_engine
+                .get(name)
+                .copied()
+                .unwrap_or_else(|| unmapped_provider_score(&p.spec.backend_kind));
+            Some((name, score))
+        })
+        .collect()
+}
+
+/// Build a [`scoring::GridState`] from mappable providers, optionally populated
+/// with scraped metrics.
+///
+/// Providers that are explicitly [`ProviderPhase::Unavailable`] or that belong
+/// to a different network are skipped.  Duplicate provider names (a CRD-level
+/// invariant violation) are silently ignored.
+///
+/// When `metrics` is `Some`, each provider whose name appears in the map
+/// receives live [`scoring::BackendMetrics`] via
+/// [`scoring::GridState::set_metrics`].  This is the integration seam for
+/// Prometheus-scraped data — pass `None` for static-only scoring.
+pub(crate) fn build_grid_state_with_metrics(
+    network_name: &str,
+    providers: &[InferenceProvider],
+    metrics: Option<&HashMap<&str, scoring::BackendMetrics>>,
+) -> scoring::GridState {
+    let mut state = scoring::GridState::new();
+    for provider in providers {
+        if provider.spec.grid_network_ref != network_name || is_explicitly_unavailable(provider) {
+            continue;
+        }
+        if let Some(config) = provider_to_backend_config(provider) {
+            let name = config.name.clone();
+            drop(state.add_backend(config));
+            if let Some(m) = metrics.and_then(|map| map.get(name.as_str())).copied() {
+                state.set_metrics(name, m);
+            }
+        }
+    }
+    state
 }
 
 // ---------------------------------------------------------------------------
@@ -211,8 +349,8 @@ pub struct RoutingOverlay {
     /// higher than remote candidates.
     pub local_site: String,
 
-    /// Routing candidates, sorted deterministically by locality score and
-    /// then by site, name, and cluster.
+    /// Routing candidates, sorted by scoring-engine score (descending) then
+    /// deterministically by site, name, and cluster.
     pub candidates: Vec<RoutingCandidate>,
 }
 
@@ -235,11 +373,17 @@ pub struct RoutingOverlay {
 /// local_site = gw_ref.local_site_name.as_deref().unwrap_or(network_name)
 /// ```
 ///
-/// Candidates are sorted deterministically by locality score (descending)
-/// then `(site, name, cluster)` for ties.  Locality score is derived from
-/// `spec.backendKind` via `backend_locality_score`:
+/// Candidates are sorted by the scoring engine (descending score) then
+/// `(site, name, cluster)` for ties.  Scores are computed by
+/// [`scoring::score_backends`] using [`scoring::ScoringWeights::default`]
+/// and the network's `spec.region` as the locality context.  With no live
+/// metrics, the ordering reduces to locality (from `spec.backendKind`) and
+/// cost (from `spec.cost`):
 /// `local` (1.0) → `remote` (0.5) → `cloud_managed` (0.2) → `api_provider` (0.1).
-/// This gives Praxis a priority-ordered candidate list without live metrics.
+/// Providers with lower-cost configurations rank ahead of equal-locality
+/// peers that have higher cost.  Providers whose `backend_kind` cannot be
+/// parsed fall back to an equivalent same-scale locality estimate.
+///
 /// Exact duplicates — same `(kind, name, site, cluster)` — are removed.
 /// Two providers that serve the same model on the same site but with
 /// different cluster identifiers are **not** deduplicated.
@@ -264,22 +408,13 @@ pub fn render_routing_overlay(
         .as_deref()
         .ok_or_else(|| "GridNetwork has no name".to_owned())?;
 
-    // Build a locality score lookup: provider name (= cluster) → score.
-    // The lookup avoids re-deriving the kind string for every candidate pair
-    // during sorting.  Unknown providers default to DEFAULT_LOCALITY (0.5).
-    let locality: HashMap<&str, f64> = providers
-        .iter()
-        .filter_map(|p| {
-            let name = p.metadata.name.as_deref()?;
-            Some((name, backend_locality_score(&p.spec.backend_kind)))
-        })
-        .collect();
+    let ordering = provider_ordering_scores(network_name, providers, network.spec.region.as_deref(), None);
 
     let mut candidates = collect_candidates(network_name, sites, providers)?;
     candidates.sort_by(|a, b| {
-        let score_a = locality.get(a.cluster.as_str()).copied().unwrap_or(DEFAULT_LOCALITY);
-        let score_b = locality.get(b.cluster.as_str()).copied().unwrap_or(DEFAULT_LOCALITY);
-        // Higher locality score first (descending), then alphabetical tiebreak.
+        let score_a = ordering.get(a.cluster.as_str()).copied().unwrap_or(DEFAULT_LOCALITY);
+        let score_b = ordering.get(b.cluster.as_str()).copied().unwrap_or(DEFAULT_LOCALITY);
+        // Higher score first (descending), then stable alphabetical tiebreak.
         score_b
             .total_cmp(&score_a)
             .then(a.site.cmp(&b.site))
@@ -699,6 +834,589 @@ mod tests {
             }
         }))
         .unwrap_or_else(|_| std::process::abort())
+    }
+
+    fn test_provider_with_cost(name: &str, network: &str, per_million_input: f64) -> InferenceProvider {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "kind": "InferenceProvider",
+            "metadata": { "name": name },
+            "spec": {
+                "gridNetworkRef": network,
+                "providerKind": "open_ai",
+                "backendKind": "local",
+                "endpoint": "http://localhost:8000",
+                "models": [{ "name": "model-a" }],
+                "cost": { "perMillionInputTokens": per_million_input, "perMillionOutputTokens": 0.0 }
+            }
+        }))
+        .unwrap_or_else(|_| std::process::abort())
+    }
+
+    fn test_network_with_region(name: &str, region: &str) -> GridNetwork {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "kind": "GridNetwork",
+            "metadata": { "name": name },
+            "spec": { "seeds": [], "region": region }
+        }))
+        .unwrap_or_else(|_| std::process::abort())
+    }
+
+    // -----------------------------------------------------------------------
+    // provider_to_backend_config — mapping function
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn provider_to_backend_config_maps_local_backend_kind() {
+        let p = test_provider_with_backend_kind("prov-a", "net", "local");
+        let cfg = provider_to_backend_config(&p).unwrap_or_else(|| std::process::abort());
+        assert_eq!(cfg.name, "prov-a", "name must match metadata.name");
+        assert_eq!(
+            cfg.kind,
+            scoring::BackendKind::Local,
+            "local must map to BackendKind::Local"
+        );
+    }
+
+    #[test]
+    fn provider_to_backend_config_maps_remote_backend_kind() {
+        let p = test_provider_with_backend_kind("prov-b", "net", "remote");
+        let cfg = provider_to_backend_config(&p).unwrap_or_else(|| std::process::abort());
+        assert_eq!(
+            cfg.kind,
+            scoring::BackendKind::Remote,
+            "remote must map to BackendKind::Remote"
+        );
+    }
+
+    #[test]
+    fn provider_to_backend_config_maps_cloud_managed_backend_kind() {
+        let p = test_provider_with_backend_kind("prov-c", "net", "cloud_managed");
+        let cfg = provider_to_backend_config(&p).unwrap_or_else(|| std::process::abort());
+        assert_eq!(
+            cfg.kind,
+            scoring::BackendKind::CloudManaged,
+            "cloud_managed must map correctly"
+        );
+    }
+
+    #[test]
+    fn provider_to_backend_config_maps_api_provider_backend_kind() {
+        let p = test_provider_with_backend_kind("prov-d", "net", "api_provider");
+        let cfg = provider_to_backend_config(&p).unwrap_or_else(|| std::process::abort());
+        assert_eq!(
+            cfg.kind,
+            scoring::BackendKind::ApiProvider,
+            "api_provider must map correctly"
+        );
+    }
+
+    #[test]
+    fn provider_to_backend_config_unknown_backend_kind_returns_none() {
+        let p = test_provider_with_backend_kind("prov-x", "net", "nonexistent_kind");
+        assert!(
+            provider_to_backend_config(&p).is_none(),
+            "unknown backend_kind must return None"
+        );
+    }
+
+    #[test]
+    fn provider_to_backend_config_empty_backend_kind_returns_none() {
+        let p = test_provider_with_backend_kind("prov-e", "net", "");
+        assert!(
+            provider_to_backend_config(&p).is_none(),
+            "empty backend_kind must return None"
+        );
+    }
+
+    #[test]
+    fn provider_to_backend_config_unknown_provider_kind_defaults_to_open_ai() {
+        // "self_hosted" is not a scoring::ProviderKind variant; must default to OpenAi.
+        // provider_kind is metadata only and does not affect the scoring formula.
+        let p = test_provider_with_backend_kind("prov-f", "net", "local");
+        let cfg = provider_to_backend_config(&p).unwrap_or_else(|| std::process::abort());
+        assert_eq!(
+            cfg.provider,
+            scoring::ProviderKind::OpenAi,
+            "self_hosted provider_kind must default to OpenAi"
+        );
+    }
+
+    #[test]
+    fn provider_to_backend_config_known_provider_kind_is_preserved() {
+        let p: InferenceProvider = serde_json::from_value(serde_json::json!({
+            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "kind": "InferenceProvider",
+            "metadata": { "name": "prov-g" },
+            "spec": {
+                "gridNetworkRef": "net",
+                "providerKind": "anthropic",
+                "backendKind": "api_provider",
+                "endpoint": "https://api.anthropic.com",
+                "models": [{ "name": "claude" }]
+            }
+        }))
+        .unwrap_or_else(|_| std::process::abort());
+        let cfg = provider_to_backend_config(&p).unwrap_or_else(|| std::process::abort());
+        assert_eq!(
+            cfg.provider,
+            scoring::ProviderKind::Anthropic,
+            "anthropic must be preserved"
+        );
+    }
+
+    #[test]
+    fn provider_to_backend_config_cost_converted_per_million_to_per_1k() {
+        // 1.0 per million input tokens = 0.001 per 1k input tokens
+        let p = test_provider_with_cost("prov-h", "net", 1.0);
+        let cfg = provider_to_backend_config(&p).unwrap_or_else(|| std::process::abort());
+        assert!(
+            (cfg.cost_per_1k_input - 0.001_f64).abs() < f64::EPSILON,
+            "1.0/million must convert to 0.001/1k, got {}",
+            cfg.cost_per_1k_input
+        );
+    }
+
+    #[test]
+    fn provider_to_backend_config_absent_cost_is_zero() {
+        let p = test_provider_with_backend_kind("prov-i", "net", "local");
+        let cfg = provider_to_backend_config(&p).unwrap_or_else(|| std::process::abort());
+        assert_eq!(cfg.cost_per_1k_input, 0.0, "absent cost must be 0.0");
+        assert_eq!(cfg.cost_per_1k_output, 0.0, "absent output cost must be 0.0");
+    }
+
+    #[test]
+    fn provider_to_backend_config_missing_metadata_name_returns_none() {
+        let p: InferenceProvider = serde_json::from_value(serde_json::json!({
+            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "kind": "InferenceProvider",
+            "metadata": {},
+            "spec": {
+                "gridNetworkRef": "net",
+                "providerKind": "self_hosted",
+                "backendKind": "local",
+                "endpoint": "http://localhost:8000",
+                "models": [{ "name": "m" }]
+            }
+        }))
+        .unwrap_or_else(|_| std::process::abort());
+        assert!(
+            provider_to_backend_config(&p).is_none(),
+            "provider with no metadata.name must return None"
+        );
+    }
+
+    #[test]
+    fn provider_to_backend_config_provider_region_is_none() {
+        // InferenceProvider carries no region; BackendConfig.region must be None.
+        // Region-aware scoring (0.7 same-region) requires per-provider region data
+        // which is not yet in the CRD.
+        let p = test_provider_with_backend_kind("prov-j", "net", "remote");
+        let cfg = provider_to_backend_config(&p).unwrap_or_else(|| std::process::abort());
+        assert!(cfg.region.is_none(), "provider region must always be None (not in CRD)");
+    }
+
+    // -----------------------------------------------------------------------
+    // Scoring-engine-backed ordering (OP-05c-a)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn score_ordered_local_ranks_before_api_provider() {
+        // Regression-safe: full scoring engine must preserve local > api ordering.
+        let network = test_network("net");
+        let local_prov = test_provider_with_backend_kind("local-prov", "net", "local");
+        let api_prov = test_provider_with_backend_kind("api-prov", "net", "api_provider");
+        let overlay = render_routing_overlay(&network, &[], &[api_prov, local_prov], "test-site")
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            overlay.candidates.first().map(|c| c.cluster.as_str()),
+            Some("local-prov"),
+            "local provider must rank before api_provider regardless of input order"
+        );
+    }
+
+    #[test]
+    fn score_ordered_cost_differentiates_equal_locality_providers() {
+        // Two local providers with different costs: lower cost must rank first.
+        // Score difference: cost_score(0.0) - cost_score(0.001) = 1.0 - 0.99 = 0.01;
+        // multiplied by weight 1.0 → free provider wins.
+        let network = test_network("net");
+        let free_prov = test_provider_with_cost("free-prov", "net", 0.0);
+        let costly_prov = test_provider_with_cost("costly-prov", "net", 50.0); // 50/million = 0.05/1k
+        let overlay = render_routing_overlay(&network, &[], &[costly_prov, free_prov], "test-site")
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            overlay.candidates.first().map(|c| c.cluster.as_str()),
+            Some("free-prov"),
+            "lower-cost provider must rank first when locality is equal"
+        );
+    }
+
+    #[test]
+    fn score_ordered_deterministic_for_equal_scores() {
+        // Two identical providers (same kind, same cost) → alphabetical tiebreak.
+        let network = test_network("net");
+        let p_z = test_provider_with_backend_kind("z-local", "net", "local");
+        let p_a = test_provider_with_backend_kind("a-local", "net", "local");
+        let overlay =
+            render_routing_overlay(&network, &[], &[p_z, p_a], "test-site").unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            overlay.candidates.first().map(|c| c.cluster.as_str()),
+            Some("a-local"),
+            "equal scores must fall back to alphabetical cluster ordering"
+        );
+    }
+
+    #[test]
+    fn score_ordered_unknown_backend_kind_uses_same_scale_fallback() {
+        // Providers with unknown backend_kind fall back to unmapped_provider_score,
+        // which is on the same numeric scale as score_backends output.
+        // unknown kind → locality 0.5 → same scale score ≈ 7.0
+        // cloud_managed → locality 0.2 → score ≈ 6.1
+        // unknown (7.0) must rank before cloud_managed (6.1).
+        let network = test_network("net");
+        let cloud = test_provider_with_backend_kind("cloud-prov", "net", "cloud_managed");
+        let unknown = test_provider_with_backend_kind("unknown-prov", "net", "nonexistent_kind");
+        let overlay = render_routing_overlay(&network, &[], &[cloud, unknown], "test-site")
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            overlay.candidates.first().map(|c| c.cluster.as_str()),
+            Some("unknown-prov"),
+            "unmapped-kind provider (same scale as remote, ≈7.0) must rank before cloud_managed (≈6.1)"
+        );
+    }
+
+    #[test]
+    fn score_ordered_self_hosted_provider_kind_is_included() {
+        // "self_hosted" provider_kind (vLLM / llm-d) defaults to ProviderKind::OpenAi.
+        // The provider must appear in the overlay with correct ordering.
+        let network = test_network("net");
+        let self_hosted = test_provider_with_backend_kind("vllm-prov", "net", "local");
+        let api = test_provider_with_backend_kind("api-prov", "net", "api_provider");
+        let overlay = render_routing_overlay(&network, &[], &[api, self_hosted], "test-site")
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(overlay.candidates.len(), 2, "both providers must appear");
+        assert_eq!(
+            overlay.candidates.first().map(|c| c.cluster.as_str()),
+            Some("vllm-prov"),
+            "self_hosted local provider must rank before api_provider"
+        );
+    }
+
+    #[test]
+    fn score_ordered_input_order_does_not_affect_output() {
+        // Scoring must be deterministic regardless of which slice order providers arrive in.
+        let network = test_network("net");
+        let local = test_provider_with_backend_kind("local-prov", "net", "local");
+        let api = test_provider_with_backend_kind("api-prov", "net", "api_provider");
+        let fwd = render_routing_overlay(&network, &[], &[local.clone(), api.clone()], "test-site")
+            .unwrap_or_else(|_| std::process::abort());
+        let rev =
+            render_routing_overlay(&network, &[], &[api, local], "test-site").unwrap_or_else(|_| std::process::abort());
+        let fwd_clusters: Vec<&str> = fwd.candidates.iter().map(|c| c.cluster.as_str()).collect();
+        let rev_clusters: Vec<&str> = rev.candidates.iter().map(|c| c.cluster.as_str()).collect();
+        assert_eq!(
+            fwd_clusters, rev_clusters,
+            "scoring output must be deterministic regardless of input order"
+        );
+    }
+
+    #[test]
+    fn score_ordered_with_network_region_does_not_break() {
+        // Network region is threaded into score_backends. With provider regions always
+        // None (not in CRD), remote providers still score 0.5 regardless — but the
+        // call must not panic or produce wrong results.
+        let network = test_network_with_region("net", "eu-west-1");
+        let local = test_provider_with_backend_kind("local-prov", "net", "local");
+        let remote = test_provider_with_backend_kind("remote-prov", "net", "remote");
+        let overlay = render_routing_overlay(&network, &[], &[remote, local], "test-site")
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            overlay.candidates.first().map(|c| c.cluster.as_str()),
+            Some("local-prov"),
+            "local must still rank first even when network.region is set"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Cross-site routing and API fallback cases
+    //
+    // These tests validate the static overlay shapes needed for multi-provider
+    // configurations: local + remote cross-site routing, unavailable/degraded
+    // local with API fallback, and the full four-kind candidate set.
+    //
+    // Praxis `grid_route` candidate contract (current wire format):
+    //   kind     — always "inference_model" for inference providers
+    //   name     — model name (used for model-based routing)
+    //   site     — site identifier (= provider name in Phase 1 no-site mode)
+    //   cluster  — Praxis load_balancer cluster name (= provider name)
+    //   fresh    — false when provider is Degraded; Praxis applies staleness penalty
+    //
+    // Note: `endpoint` is NOT part of the candidate struct.  The cluster name is
+    // the reference Praxis uses to look up the backend endpoint in its cluster
+    // config.  Adding endpoint to RoutingCandidate would require a coordinated
+    // Praxis schema change (CM3 cross-repo mismatch documented in review).
+    // -----------------------------------------------------------------------
+
+    /// Build a provider with an explicit backend kind AND a status phase.
+    fn test_provider_with_backend_kind_and_phase(
+        name: &str,
+        network: &str,
+        backend_kind: &str,
+        phase: &str,
+    ) -> InferenceProvider {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "kind": "InferenceProvider",
+            "metadata": { "name": name },
+            "spec": {
+                "gridNetworkRef": network,
+                "providerKind": "self_hosted",
+                "backendKind": backend_kind,
+                "endpoint": "http://localhost:8000",
+                "models": [{ "name": "shared-model" }]
+            },
+            "status": {
+                "phase": phase,
+                "matchingSites": [],
+                "observedGeneration": 0
+            }
+        }))
+        .unwrap_or_else(|_| std::process::abort())
+    }
+
+    #[test]
+    fn cross_site_overlay_local_then_remote_candidate_order() {
+        // Static shape: two providers, one local and one remote, both offering
+        // the same model. Overlay must contain both candidates and order local
+        // before remote. Phase-1 no-site mode: site = provider name.
+        let network = test_network("mesh-net");
+        let local_prov = test_provider_with_backend_kind("provider-self-hosted", "mesh-net", "local");
+        let remote_prov = test_provider_with_backend_kind("provider-remote", "mesh-net", "remote");
+        let overlay = render_routing_overlay(&network, &[], &[remote_prov, local_prov], "site-a")
+            .unwrap_or_else(|_| std::process::abort());
+
+        assert_eq!(overlay.candidates.len(), 2, "both local and remote must appear");
+        // Local must rank first (higher locality/score).
+        assert_eq!(
+            overlay.candidates.first().map(|c| c.cluster.as_str()),
+            Some("provider-self-hosted"),
+            "local provider must rank before remote"
+        );
+        // Both fresh (neither is Degraded).
+        assert!(
+            overlay.candidates.iter().all(|c| c.fresh),
+            "all Available/absent-status candidates must be fresh"
+        );
+        // Candidate fields are correctly populated.
+        let c0 = overlay.candidates.first().unwrap_or_else(|| std::process::abort());
+        assert_eq!(c0.kind, "inference_model", "kind must be inference_model");
+        assert_eq!(
+            c0.site, "provider-self-hosted",
+            "site equals provider name (Phase 1 fallback)"
+        );
+        assert_eq!(c0.cluster, "provider-self-hosted", "cluster equals provider name");
+    }
+
+    #[test]
+    fn unavailable_local_leaves_api_as_only_candidate() {
+        // Local/self-hosted is down (Unavailable), API provider remains
+        // accessible. Overlay must exclude the unavailable provider and keep
+        // only the API candidate.
+        let network = test_network("fallback-net");
+        let local_down =
+            test_provider_with_backend_kind_and_phase("provider-local", "fallback-net", "local", "Unavailable");
+        let api_fallback = test_provider_with_backend_kind("provider-api", "fallback-net", "api_provider");
+        let overlay = render_routing_overlay(&network, &[], &[local_down, api_fallback], "site-a")
+            .unwrap_or_else(|_| std::process::abort());
+
+        assert_eq!(
+            overlay.candidates.len(),
+            1,
+            "Unavailable local must be excluded; only API provider remains"
+        );
+        assert_eq!(
+            overlay.candidates.first().map(|c| c.cluster.as_str()),
+            Some("provider-api"),
+            "API provider must be the sole candidate"
+        );
+        assert!(
+            overlay.candidates.first().is_some_and(|c| c.fresh),
+            "API provider with absent status must be fresh"
+        );
+    }
+
+    #[test]
+    fn degraded_local_and_api_both_included_with_correct_freshness() {
+        // Local is Degraded (probe returning non-2xx or high error rate). It
+        // remains in the overlay so Praxis can still select it if the API
+        // provider is also unavailable, but its fresh=false signals that its
+        // metrics are stale.
+        //
+        // Ordering: Degraded local (locality ≈8.5) still outscores API provider
+        // (≈5.8) under default weights.  Praxis may deprioritise the stale local
+        // candidate via its own freshness penalty, but the overlay carries both.
+        let network = test_network("fallback-net");
+        let local_degraded =
+            test_provider_with_backend_kind_and_phase("provider-local", "fallback-net", "local", "Degraded");
+        let api_ok = test_provider_with_backend_kind("provider-api", "fallback-net", "api_provider");
+        let overlay = render_routing_overlay(&network, &[], &[api_ok, local_degraded], "site-a")
+            .unwrap_or_else(|_| std::process::abort());
+
+        assert_eq!(
+            overlay.candidates.len(),
+            2,
+            "Degraded local must remain in overlay alongside API provider"
+        );
+        let local_c = overlay
+            .candidates
+            .iter()
+            .find(|c| c.cluster == "provider-local")
+            .unwrap_or_else(|| std::process::abort());
+        let api_c = overlay
+            .candidates
+            .iter()
+            .find(|c| c.cluster == "provider-api")
+            .unwrap_or_else(|| std::process::abort());
+        assert!(!local_c.fresh, "Degraded local candidate must have fresh=false");
+        assert!(api_c.fresh, "API provider with absent status must have fresh=true");
+        // Degraded local still outranks API provider by locality score.
+        assert_eq!(
+            overlay.candidates.first().map(|c| c.cluster.as_str()),
+            Some("provider-local"),
+            "Degraded local (high locality) must still rank before API provider"
+        );
+    }
+
+    #[test]
+    fn all_four_backend_kinds_in_overlay_with_correct_order() {
+        // A network with one provider of each backend kind. No live metrics —
+        // ordering is driven entirely by locality score through the scoring
+        // engine. Validates the full four-kind candidate set shape.
+        let network = test_network("full-net");
+        let self_hosted = test_provider_with_backend_kind("prov-local", "full-net", "local");
+        let remote = test_provider_with_backend_kind("prov-remote", "full-net", "remote");
+        let cloud = test_provider_with_backend_kind("prov-cloud", "full-net", "cloud_managed");
+        let api = test_provider_with_backend_kind("prov-api", "full-net", "api_provider");
+        let overlay = render_routing_overlay(&network, &[], &[api, cloud, remote, self_hosted], "site-a")
+            .unwrap_or_else(|_| std::process::abort());
+
+        assert_eq!(overlay.candidates.len(), 4, "all four backend kinds must be present");
+        let clusters: Vec<&str> = overlay.candidates.iter().map(|c| c.cluster.as_str()).collect();
+        assert_eq!(
+            clusters,
+            ["prov-local", "prov-remote", "prov-cloud", "prov-api"],
+            "ordering must be local > remote > cloud_managed > api_provider"
+        );
+        // All candidates are fresh (no Degraded providers in this case).
+        assert!(
+            overlay.candidates.iter().all(|c| c.fresh),
+            "all candidates must be fresh"
+        );
+    }
+
+    #[test]
+    fn local_provider_recovers_from_unavailable_to_available() {
+        // Health-check transition: when a local provider's status moves from
+        // Unavailable to Available, it reappears in the overlay.  Each render
+        // call is pure and stateless; this test simulates two consecutive
+        // reconcile cycles.
+        let network = test_network("recovery-net");
+        let api_always_available = test_provider_with_backend_kind("prov-api", "recovery-net", "api_provider");
+
+        // Cycle 1: local is down — only API candidate.
+        let local_down =
+            test_provider_with_backend_kind_and_phase("prov-local", "recovery-net", "local", "Unavailable");
+        let overlay1 = render_routing_overlay(&network, &[], &[local_down, api_always_available.clone()], "site-a")
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            overlay1.candidates.len(),
+            1,
+            "unavailable local must not appear (cycle 1)"
+        );
+        assert_eq!(
+            overlay1.candidates.first().map(|c| c.cluster.as_str()),
+            Some("prov-api"),
+            "API must be the only candidate when local is down"
+        );
+
+        // Cycle 2: local is back — both candidates, local ranks first.
+        let local_up = test_provider_with_backend_kind_and_phase("prov-local", "recovery-net", "local", "Available");
+        let overlay2 = render_routing_overlay(&network, &[], &[local_up, api_always_available], "site-a")
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(overlay2.candidates.len(), 2, "recovered local must reappear (cycle 2)");
+        assert_eq!(
+            overlay2.candidates.first().map(|c| c.cluster.as_str()),
+            Some("prov-local"),
+            "recovered local must rank first"
+        );
+        assert!(
+            overlay2.candidates.first().is_some_and(|c| c.fresh),
+            "recovered local must be fresh"
+        );
+    }
+
+    #[test]
+    fn all_providers_unavailable_produces_empty_overlay() {
+        // If every provider in the network is Unavailable, the renderer produces
+        // an empty candidate list without returning an error.  The reconcile-loop
+        // guard (in grid_network controller) skips applying an empty overlay to
+        // prevent Praxis hot-reload errors — that guard is covered at the
+        // controller integration level.  This test covers the renderer contract.
+        let network = test_network("empty-net");
+        let p1 = test_provider_with_phase("prov-a", "empty-net", &["model-a"], "Unavailable");
+        let p2 = test_provider_with_phase("prov-b", "empty-net", &["model-b"], "Unavailable");
+        let overlay =
+            render_routing_overlay(&network, &[], &[p1, p2], "site-a").unwrap_or_else(|_| std::process::abort());
+
+        assert!(
+            overlay.candidates.is_empty(),
+            "all-Unavailable overlay must have zero candidates (no error)"
+        );
+    }
+
+    #[test]
+    fn cross_site_candidate_json_has_required_praxis_fields() {
+        // Validate that the ConfigMap JSON payload exposes all fields the Praxis
+        // `grid_route` filter reads from each candidate entry.
+        //
+        // Current candidate wire format: kind, name, site, cluster, fresh.
+        // `endpoint` is NOT in the candidate — Praxis looks up the backend
+        // endpoint via the `cluster` name in its own load_balancer config.
+        let network = test_network("json-net");
+        let local_prov = test_provider_with_backend_kind("prov-a", "json-net", "local");
+        let api_prov = test_provider_with_backend_kind("prov-b", "json-net", "api_provider");
+        let overlay = render_routing_overlay(&network, &[], &[local_prov, api_prov], "site-a")
+            .unwrap_or_else(|_| std::process::abort());
+        let cm = build_cm(&overlay, "json-net", "gw");
+        let json = overlay_json_from_cm(&cm);
+        let candidates = json
+            .get("candidates")
+            .and_then(serde_json::Value::as_array)
+            .unwrap_or_else(|| std::process::abort());
+        assert_eq!(candidates.len(), 2, "both providers must appear in JSON");
+        for c in candidates {
+            assert!(c.get("kind").is_some(), "candidate must have 'kind'");
+            assert!(c.get("name").is_some(), "candidate must have 'name'");
+            assert!(c.get("site").is_some(), "candidate must have 'site'");
+            assert!(c.get("cluster").is_some(), "candidate must have 'cluster'");
+            assert!(c.get("fresh").is_some(), "candidate must have 'fresh'");
+            assert_eq!(
+                c.get("kind").and_then(serde_json::Value::as_str),
+                Some("inference_model"),
+                "kind must be inference_model"
+            );
+        }
+        // local must appear first in JSON (higher score).
+        assert_eq!(
+            candidates
+                .first()
+                .and_then(|c| c.get("cluster"))
+                .and_then(serde_json::Value::as_str),
+            Some("prov-a"),
+            "local provider must appear first in candidate JSON"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1451,6 +2169,77 @@ mod tests {
         assert!(
             result.is_err(),
             "InferenceProvider without metadata.name must return an error"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // build_grid_state_with_metrics — integration seam for live metrics
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn live_metrics_queue_depth_affects_ordering() {
+        // Two local providers with equal locality and no cost difference.
+        // Without metrics they are tied and fall back to alphabetical order.
+        // With metrics the high-queue provider scores lower and yields the lead.
+        let provider_busy = test_provider_with_backend_kind("provider-busy", "net", "local");
+        let provider_idle = test_provider_with_backend_kind("provider-idle", "net", "local");
+
+        let mut metrics: HashMap<&str, scoring::BackendMetrics> = HashMap::new();
+        metrics.insert(
+            "provider-busy",
+            scoring::BackendMetrics::new(0.0, true, 0.0, 0.0, 0.0, 0.9),
+        );
+        metrics.insert(
+            "provider-idle",
+            scoring::BackendMetrics::new(0.0, true, 0.0, 0.0, 0.0, 0.1),
+        );
+
+        let providers_for_ordering = [provider_busy, provider_idle];
+        let ordering = provider_ordering_scores("net", &providers_for_ordering, None, Some(&metrics));
+
+        let busy_score = ordering["provider-busy"];
+        let idle_score = ordering["provider-idle"];
+        assert!(
+            idle_score > busy_score,
+            "idle provider (queue 0.1) must score higher than busy provider (queue 0.9), \
+             got idle={idle_score}, busy={busy_score}"
+        );
+    }
+
+    #[test]
+    fn no_metrics_map_preserves_static_ordering() {
+        // Passing None for metrics must produce the same result as the current
+        // static-only path (locality and cost only).
+        let local = test_provider_with_backend_kind("prov-local", "net", "local");
+        let api = test_provider_with_backend_kind("prov-api", "net", "api_provider");
+        let ps_static = [local.clone(), api.clone()];
+        let ordering_static = provider_ordering_scores("net", &ps_static, None, None);
+        let ps_empty = [local, api];
+        let ordering_no_metrics = provider_ordering_scores("net", &ps_empty, None, Some(&HashMap::new()));
+        assert_eq!(
+            ordering_static["prov-local"], ordering_no_metrics["prov-local"],
+            "empty metrics map must yield same score as None"
+        );
+        assert_eq!(
+            ordering_static["prov-api"], ordering_no_metrics["prov-api"],
+            "empty metrics map must yield same score as None"
+        );
+    }
+
+    #[test]
+    fn build_grid_state_with_metrics_attaches_metrics_to_correct_provider() {
+        let providers = vec![
+            test_provider_with_backend_kind("prov-a", "net", "local"),
+            test_provider_with_backend_kind("prov-b", "net", "local"),
+        ];
+        let mut metrics: HashMap<&str, scoring::BackendMetrics> = HashMap::new();
+        metrics.insert("prov-a", scoring::BackendMetrics::new(0.0, true, 0.0, 0.0, 0.0, 0.8));
+
+        let state = build_grid_state_with_metrics("net", &providers, Some(&metrics));
+        assert!(state.metrics("prov-a").is_some(), "prov-a must have metrics attached");
+        assert!(
+            state.metrics("prov-b").is_none(),
+            "prov-b must have no metrics (not in map)"
         );
     }
 }
