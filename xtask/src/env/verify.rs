@@ -1,7 +1,8 @@
 //! Provider inference baseline verification.
 //!
-//! Verifies that each provider cluster's inference-sim deployments
-//! are reachable and serve the correct models via Chat Completions.
+//! Verifies that each provider cluster's configured backend is reachable
+//! and serves the correct models via Chat Completions.  Supports both the
+//! `inference-sim` and `mock-openai` provider backends.
 //! Uses `kubectl port-forward` for host access and `curl` for HTTP.
 
 use std::{

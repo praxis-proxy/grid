@@ -26,7 +26,7 @@ pub(crate) const MOCK_OPENAI_SVC: &str = "mock-openai-provider";
 /// Port used by the `openai` mock-providers HTTP server.
 pub(crate) const MOCK_OPENAI_PORT: u16 = 8080;
 
-/// Kubernetes namespace for inference sim deployments.
+/// Kubernetes namespace for provider backend deployments.
 const NAMESPACE: &str = "default";
 
 /// Timeout for deployment rollout readiness in seconds.

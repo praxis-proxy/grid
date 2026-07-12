@@ -221,10 +221,10 @@ Available commands:
 
 | Command | What it does |
 |---|---|
-| `cargo xtask env up` | Creates kind clusters, deploys inference simulators, generates local test certificates |
+| `cargo xtask env up` | Creates kind clusters, deploys the configured provider backend, generates local test certificates |
 | `cargo xtask env down` | Tears down kind clusters and removes generated certs |
 | `cargo xtask env status` | Reports cluster, provider, and cert readiness |
-| `cargo xtask env verify-providers` | Probes inference-sim Chat Completions endpoints in all provider clusters |
+| `cargo xtask env verify-providers` | Probes Chat Completions endpoints against the configured provider backend in all provider clusters |
 | `cargo xtask env build-gateway-images` | Builds the Praxis AI gateway and mock EPP container images |
 | `cargo xtask env load-gateway-images` | Loads locally-built images into kind cluster nodes |
 | `cargo xtask env deploy-provider-gateways` | Applies generated Praxis AI gateway resources to provider clusters |

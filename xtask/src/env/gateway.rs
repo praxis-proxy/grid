@@ -1,7 +1,7 @@
 //! Provider gateway deployment and verification.
 //!
 //! Deploys mock EPP and Praxis AI gateway into provider clusters,
-//! then verifies the full llm-d-style request path.
+//! then verifies the provider backend request path through the gateway.
 //!
 //! Provider gateways terminate mTLS: they require a client certificate
 //! signed by the generated test CA and run `grid_ingress_trust` to validate the

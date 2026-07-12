@@ -80,7 +80,7 @@ pub(crate) enum Action {
         config: PathBuf,
     },
 
-    /// Verify provider gateways and the full llm-d-style request path.
+    /// Verify provider gateways through the configured provider backend request path.
     VerifyProviderGateways {
         /// Path to the environment config file.
         #[arg(short, long, default_value = DEFAULT_CONFIG_PATH)]
