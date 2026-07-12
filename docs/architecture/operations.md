@@ -234,6 +234,25 @@ Available commands:
 | `cargo xtask env verify-gateway-e2e` | Verifies consumer-to-provider routing end-to-end |
 | `cargo xtask env verify-mtls-trust` | Verifies provider gateway mTLS enforcement (positive + negative cases) |
 
+### Required local images
+
+Before running `load-gateway-images`, the following
+images must exist in the local container daemon:
+
+| Image | Built from | Required for |
+|---|---|---|
+| `localhost/praxis-ai:llmd-ext-proc` | AI repository external checkout | All provider and consumer gateways |
+| `localhost/praxis-ai-mock-epp:latest` | AI repository external checkout | All provider gateways |
+| `grid-mock-providers:latest` | This repository, `mock-providers/Containerfile` | Provider clusters with `backend = "mock-openai"` only |
+
+Use `build-gateway-images --ai-repo <path>` to build the first two images from
+the AI repository source tree. Build `grid-mock-providers:latest` separately
+from this repository:
+
+```bash
+docker build -t grid-mock-providers:latest -f mock-providers/Containerfile .
+```
+
 ### What `xtask env` does NOT do
 
 `xtask env` is not the production operator:
