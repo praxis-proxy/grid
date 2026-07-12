@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use certs::{generate_ca, generate_site_cert};
+use certs::{DEFAULT_ORGANIZATION, generate_ca, generate_cert_with_org, generate_site_cert};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -13,6 +13,16 @@ const CERTS_DIR: &str = "tests/env/certs";
 
 /// CA common name.
 const CA_CN: &str = "AI Grid Test CA";
+
+/// Organization used in the wrong-org negative trust test.
+///
+/// A cert signed by the generated test CA with this org is used to prove
+/// that `grid_ingress_trust` enforces organization matching at the filter
+/// layer (TLS handshake succeeds; filter rejects with HTTP 403).
+pub(crate) const WRONG_ORG: &str = "not-ai-grid";
+
+/// File name stem for the wrong-org client cert (cert + key).
+const WRONG_ORG_CERT_NAME: &str = "wrong-org-client";
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -41,6 +51,22 @@ pub(crate) fn generate_all(cluster_names: &[String]) -> Result<PathBuf, Box<dyn 
         write_pem(&dir.join(format!("{name}-key.pem")), &site.key_pem)?;
         eprintln!("  generated cert for {name} (SAN: {})", site.sans.join(", "));
     }
+
+    // Generate a wrong-org client cert signed by the same CA.
+    // Used by verify-mtls-trust to prove that grid_ingress_trust enforces
+    // organization matching at the filter level: TLS succeeds (same CA),
+    // but the filter rejects with HTTP 403.
+    let first_cluster = cluster_names.first().map_or("cluster-a", String::as_str);
+    let wrong_org_cert = generate_cert_with_org(&ca, first_cluster, WRONG_ORG)?;
+    write_pem(
+        &dir.join(format!("{WRONG_ORG_CERT_NAME}-cert.pem")),
+        &wrong_org_cert.cert_pem,
+    )?;
+    write_pem(
+        &dir.join(format!("{WRONG_ORG_CERT_NAME}-key.pem")),
+        &wrong_org_cert.key_pem,
+    )?;
+    eprintln!("  generated wrong-org cert (org={WRONG_ORG}, expected={DEFAULT_ORGANIZATION})");
 
     Ok(dir)
 }

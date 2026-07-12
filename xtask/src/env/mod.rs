@@ -7,6 +7,7 @@ pub(crate) mod gateway;
 pub(crate) mod images;
 pub(crate) mod kind;
 pub(crate) mod providers;
+pub(crate) mod trust;
 pub(crate) mod verify;
 
 use std::path::{Path, PathBuf};
@@ -105,6 +106,13 @@ pub(crate) enum Action {
         #[arg(short, long, default_value = DEFAULT_CONFIG_PATH)]
         config: PathBuf,
     },
+
+    /// Verify gateway-to-gateway mTLS trust (positive + negative cases).
+    VerifyMtlsTrust {
+        /// Path to the environment config file.
+        #[arg(short, long, default_value = DEFAULT_CONFIG_PATH)]
+        config: PathBuf,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -130,6 +138,7 @@ pub(crate) fn run(action: &Action) -> Result<(), Box<dyn std::error::Error>> {
         Action::ProbeGatewayNetwork { config } => env_probe_gateway_network(config),
         Action::DeployConsumerGateway { config } => env_deploy_consumer_gateway(config),
         Action::VerifyGatewayE2e { config } => env_verify_gateway_e2e(config),
+        Action::VerifyMtlsTrust { config } => env_verify_mtls_trust(config),
     }
 }
 
@@ -286,6 +295,12 @@ fn env_deploy_consumer_gateway(config: &Path) -> Result<(), Box<dyn std::error::
 fn env_verify_gateway_e2e(config: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let cfg = EnvConfig::from_file(config)?;
     consumer::verify_e2e(&cfg)
+}
+
+/// Verify gateway-to-gateway mTLS trust (positive + negative cases).
+fn env_verify_mtls_trust(config: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let cfg = EnvConfig::from_file(config)?;
+    trust::verify_mtls_trust(&cfg)
 }
 
 /// Format a status label.

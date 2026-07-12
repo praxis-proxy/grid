@@ -37,12 +37,6 @@ const CERT_MOUNT_PATH: &str = "/etc/praxis/tls";
 /// Host-side CA cert path (relative to grid repo root).
 pub(crate) const HOST_CA_CERT: &str = "tests/env/certs/ca.pem";
 
-/// Host-side client cert path for the consumer cluster.
-pub(crate) const HOST_CLIENT_CERT: &str = "tests/env/certs/cluster-c-cert.pem";
-
-/// Host-side client key path for the consumer cluster.
-pub(crate) const HOST_CLIENT_KEY: &str = "tests/env/certs/cluster-c-key.pem";
-
 /// Host-side cert directory.
 const HOST_CERTS_DIR: &str = "tests/env/certs";
 
@@ -92,6 +86,7 @@ pub(crate) fn deploy_all(cfg: &EnvConfig) -> Result<(), Box<dyn std::error::Erro
 /// Returns an error if any verification command fails unexpectedly or
 /// if any assertion fails.
 pub(crate) fn verify_all(cfg: &EnvConfig) -> Result<(), Box<dyn std::error::Error>> {
+    let consumer_site = consumer_cluster_name(cfg)?;
     let mut tally = Tally::default();
     let mut found = false;
 
@@ -103,7 +98,7 @@ pub(crate) fn verify_all(cfg: &EnvConfig) -> Result<(), Box<dyn std::error::Erro
             continue;
         }
         found = true;
-        verify_provider(name, def, &mut tally)?;
+        verify_provider(name, def, consumer_site, &mut tally)?;
     }
 
     if !found {
@@ -111,6 +106,21 @@ pub(crate) fn verify_all(cfg: &EnvConfig) -> Result<(), Box<dyn std::error::Erro
     }
 
     tally.print_summary()
+}
+
+/// Resolve the consumer cluster name from the environment config.
+fn consumer_cluster_name(cfg: &EnvConfig) -> Result<&str, Box<dyn std::error::Error>> {
+    cfg.clusters
+        .names
+        .iter()
+        .find(|name| {
+            cfg.clusters
+                .definitions
+                .get(*name)
+                .is_some_and(|d| d.role == ClusterRole::Consumer)
+        })
+        .map(String::as_str)
+        .ok_or_else(|| "no consumer cluster configured in environment config".into())
 }
 
 // ---------------------------------------------------------------------------
@@ -436,7 +446,12 @@ fn apply_manifest(context: &str, yaml: &str) -> Result<(), Box<dyn std::error::E
 // ---------------------------------------------------------------------------
 
 /// Verify provider gateway for one cluster.
-fn verify_provider(name: &str, def: &ClusterDef, tally: &mut Tally) -> Result<(), Box<dyn std::error::Error>> {
+fn verify_provider(
+    name: &str,
+    def: &ClusterDef,
+    consumer_site: &str,
+    tally: &mut Tally,
+) -> Result<(), Box<dyn std::error::Error>> {
     let ctx = kind::kubectl_context(name);
 
     // Check deployments ready.
@@ -456,15 +471,15 @@ fn verify_provider(name: &str, def: &ClusterDef, tally: &mut Tally) -> Result<()
 
     // Test each configured model.
     for model in &def.models {
-        verify_model(name, &ctx, port, model, name, tally);
+        verify_model(name, &ctx, port, model, name, consumer_site, tally);
     }
 
     // Test unknown model → 503.
-    verify_unknown_model(name, &ctx, port, name, tally);
+    verify_unknown_model(name, &ctx, port, name, consumer_site, tally);
 
     // Test spoofed header is ignored (valid model still succeeds).
     if let Some(model) = def.models.first() {
-        verify_spoof_ignored(name, &ctx, port, model, name, tally);
+        verify_spoof_ignored(name, &ctx, port, model, name, consumer_site, tally);
     }
 
     pf.stop();
@@ -505,8 +520,16 @@ fn check_deployment_ready(cluster: &str, context: &str, deployment: &str, tally:
     clippy::too_many_arguments,
     reason = "cluster, context, port, model, site, tally all distinct"
 )]
-fn verify_model(cluster: &str, context: &str, port: u16, model: &str, site: &str, tally: &mut Tally) {
-    match send_chat_request(port, model, site) {
+fn verify_model(
+    cluster: &str,
+    context: &str,
+    port: u16,
+    model: &str,
+    site: &str,
+    consumer_site: &str,
+    tally: &mut Tally,
+) {
+    match send_chat_request(port, model, site, consumer_site) {
         Ok(resp) if resp.status == 200 => {
             tally.pass(cluster, &format!("model {model} returns 200 via ext_proc path"));
             validate_body(cluster, context, model, &resp.body, tally);
@@ -529,8 +552,12 @@ fn verify_model(cluster: &str, context: &str, port: u16, model: &str, site: &str
 }
 
 /// Verify an unknown model fails closed with 503.
-fn verify_unknown_model(cluster: &str, context: &str, port: u16, site: &str, tally: &mut Tally) {
-    match send_chat_request(port, "unknown-model-xyz", site) {
+#[expect(
+    clippy::too_many_arguments,
+    reason = "cluster, context, port, site, consumer_site, tally all distinct"
+)]
+fn verify_unknown_model(cluster: &str, context: &str, port: u16, site: &str, consumer_site: &str, tally: &mut Tally) {
+    match send_chat_request(port, "unknown-model-xyz", site, consumer_site) {
         Ok(resp) if resp.status == 503 => {
             tally.pass(cluster, "unknown model fails closed with 503");
         },
@@ -556,8 +583,16 @@ fn verify_unknown_model(cluster: &str, context: &str, port: u16, site: &str, tal
     clippy::too_many_arguments,
     reason = "cluster, context, port, model, site, tally all distinct"
 )]
-fn verify_spoof_ignored(cluster: &str, context: &str, port: u16, model: &str, site: &str, tally: &mut Tally) {
-    match send_chat_request_with_spoof(port, model, "10.99.99.99:9999", site) {
+fn verify_spoof_ignored(
+    cluster: &str,
+    context: &str,
+    port: u16,
+    model: &str,
+    site: &str,
+    consumer_site: &str,
+    tally: &mut Tally,
+) {
+    match send_chat_request_with_spoof(port, model, "10.99.99.99:9999", site, consumer_site) {
         Ok(resp) if resp.status == 200 => {
             tally.pass(
                 cluster,
@@ -605,15 +640,19 @@ fn validate_body(cluster: &str, context: &str, model: &str, body: &str, tally: &
 
 /// Send a Chat Completions request to the provider gateway (mTLS).
 ///
-/// Presents the cluster-c client cert and uses `--resolve` to map the
-/// server's SAN hostname to the port-forward address.  The `site` name
-/// (e.g. `"cluster-a"`) is used to construct SNI `cluster-a.grid.internal`.
-fn send_chat_request(port: u16, model: &str, site: &str) -> Result<HttpResponse, Box<dyn std::error::Error>> {
+/// Presents the configured consumer client cert and uses `--resolve` to map
+/// the server's SAN hostname to the port-forward address.
+fn send_chat_request(
+    port: u16,
+    model: &str,
+    site: &str,
+    consumer_site: &str,
+) -> Result<HttpResponse, Box<dyn std::error::Error>> {
     let sni = format!("{site}.grid.internal");
     let url = format!("https://{sni}:{port}/v1/chat/completions");
     let resolve = format!("{sni}:{port}:127.0.0.1");
     let body = format!(r#"{{"model":"{model}","messages":[{{"role":"user","content":"hello"}}],"max_tokens":1}}"#);
-    curl_post_mtls(&url, &body, None, &resolve)
+    curl_post_mtls(&url, &body, None, &resolve, consumer_site)
 }
 
 /// Send a Chat Completions request with a spoofed destination header (mTLS).
@@ -622,29 +661,33 @@ fn send_chat_request_with_spoof(
     model: &str,
     spoof: &str,
     site: &str,
+    consumer_site: &str,
 ) -> Result<HttpResponse, Box<dyn std::error::Error>> {
     let sni = format!("{site}.grid.internal");
     let url = format!("https://{sni}:{port}/v1/chat/completions");
     let resolve = format!("{sni}:{port}:127.0.0.1");
     let body = format!(r#"{{"model":"{model}","messages":[{{"role":"user","content":"hello"}}],"max_tokens":1}}"#);
-    curl_post_mtls(&url, &body, Some(spoof), &resolve)
+    curl_post_mtls(&url, &body, Some(spoof), &resolve, consumer_site)
 }
 
 /// HTTP POST via curl with mTLS and `--resolve` for hostname mapping.
 ///
-/// Uses the consumer (cluster-c) client cert to satisfy `client_cert_mode:
-/// require`.  The `resolve` argument maps the provider's SAN hostname to the
+/// Uses the configured consumer client cert to satisfy `client_cert_mode:
+/// require`. The `resolve` argument maps the provider's SAN hostname to the
 /// port-forward loopback address so rustls hostname verification passes.
 #[expect(
     clippy::too_many_lines,
     reason = "curl arg list for mTLS with optional spoofed header"
 )]
-pub(crate) fn curl_post_mtls(
+fn curl_post_mtls(
     url: &str,
     body: &str,
     spoof_header: Option<&str>,
     resolve: &str,
+    consumer_site: &str,
 ) -> Result<HttpResponse, Box<dyn std::error::Error>> {
+    let client_cert = format!("{HOST_CERTS_DIR}/{consumer_site}-cert.pem");
+    let client_key = format!("{HOST_CERTS_DIR}/{consumer_site}-key.pem");
     let mut args = vec![
         "-s",
         "-w",
@@ -658,9 +701,9 @@ pub(crate) fn curl_post_mtls(
         "--cacert",
         HOST_CA_CERT,
         "--cert",
-        HOST_CLIENT_CERT,
+        &client_cert,
         "--key",
-        HOST_CLIENT_KEY,
+        &client_key,
         "-X",
         "POST",
         "-H",
