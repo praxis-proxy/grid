@@ -2,6 +2,8 @@
 
 pub(crate) mod certs;
 pub(crate) mod config;
+pub(crate) mod gateway;
+pub(crate) mod images;
 pub(crate) mod kind;
 pub(crate) mod providers;
 pub(crate) mod verify;
@@ -53,6 +55,34 @@ pub(crate) enum Action {
         #[arg(short, long, default_value = DEFAULT_CONFIG_PATH)]
         config: PathBuf,
     },
+
+    /// Build gateway images from the AI repository.
+    BuildGatewayImages {
+        /// Path to the AI repository. Can also be provided via `AI_REPO_PATH`.
+        #[arg(long)]
+        ai_repo: Option<PathBuf>,
+    },
+
+    /// Load gateway images into all kind clusters.
+    LoadGatewayImages {
+        /// Path to the environment config file.
+        #[arg(short, long, default_value = DEFAULT_CONFIG_PATH)]
+        config: PathBuf,
+    },
+
+    /// Deploy provider gateways into provider clusters.
+    DeployProviderGateways {
+        /// Path to the environment config file.
+        #[arg(short, long, default_value = DEFAULT_CONFIG_PATH)]
+        config: PathBuf,
+    },
+
+    /// Verify provider gateways and the full llm-d-style request path.
+    VerifyProviderGateways {
+        /// Path to the environment config file.
+        #[arg(short, long, default_value = DEFAULT_CONFIG_PATH)]
+        config: PathBuf,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -71,6 +101,10 @@ pub(crate) fn run(action: &Action) -> Result<(), Box<dyn std::error::Error>> {
         Action::Down { config } => env_down(config),
         Action::Status { config } => env_status(config),
         Action::VerifyProviders { config } => env_verify_providers(config),
+        Action::BuildGatewayImages { ai_repo } => env_build_gateway_images(ai_repo.as_deref()),
+        Action::LoadGatewayImages { config } => env_load_gateway_images(config),
+        Action::DeployProviderGateways { config } => env_deploy_provider_gateways(config),
+        Action::VerifyProviderGateways { config } => env_verify_provider_gateways(config),
     }
 }
 
@@ -175,6 +209,39 @@ fn report_cert_status(mut all_ok: bool) -> bool {
 fn env_verify_providers(config: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let cfg = EnvConfig::from_file(config)?;
     verify::verify_providers(&cfg)
+}
+
+/// Build gateway images from the AI repository.
+fn env_build_gateway_images(ai_repo: Option<&Path>) -> Result<(), Box<dyn std::error::Error>> {
+    let resolved = images::resolve_ai_repo_path(ai_repo)?;
+    eprintln!("building gateway images from {}...", resolved.display());
+    images::build_all(&resolved)?;
+    eprintln!("env build-gateway-images: done");
+    Ok(())
+}
+
+/// Load gateway images into all kind clusters.
+fn env_load_gateway_images(config: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let cfg = EnvConfig::from_file(config)?;
+    eprintln!("loading gateway images into kind clusters...");
+    images::load_all(&cfg.clusters.names)?;
+    eprintln!("env load-gateway-images: done");
+    Ok(())
+}
+
+/// Deploy provider gateways into provider clusters.
+fn env_deploy_provider_gateways(config: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let cfg = EnvConfig::from_file(config)?;
+    eprintln!("deploying provider gateways...");
+    gateway::deploy_all(&cfg)?;
+    eprintln!("env deploy-provider-gateways: done");
+    Ok(())
+}
+
+/// Verify provider gateways.
+fn env_verify_provider_gateways(config: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let cfg = EnvConfig::from_file(config)?;
+    gateway::verify_all(&cfg)
 }
 
 /// Format a status label.

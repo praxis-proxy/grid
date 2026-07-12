@@ -1,0 +1,710 @@
+//! Provider gateway deployment and verification.
+//!
+//! Deploys mock EPP and Praxis AI gateway into provider clusters,
+//! then verifies the full llm-d-style request path.
+//!
+//! Provider gateways terminate mTLS: they require a client certificate
+//! signed by the generated test CA and run `grid_ingress_trust` to validate the
+//! peer organization before allowing requests into the `ext_proc` path.
+
+use std::{path::PathBuf, process::Command};
+
+use crate::env::{
+    config::{ClusterDef, ClusterRole, EnvConfig},
+    images, kind,
+    verify::{HttpResponse, PortForwardGuard, Tally, find_free_port, parse_curl_output, safe_truncate, wait_for_port},
+};
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/// Kubernetes namespace for gateway deployments.
+const NAMESPACE: &str = "default";
+
+/// Name of the mock EPP Kubernetes Deployment and Service.
+const MOCK_EPP_NAME: &str = "mock-epp";
+
+/// Port the mock EPP gRPC server binds on.
+const MOCK_EPP_PORT: u16 = 50051;
+
+/// K8s Secret name holding TLS certs for provider gateway pods.
+const TLS_SECRET_NAME: &str = "praxis-tls";
+
+/// Path inside the provider pod where TLS certs are mounted.
+const CERT_MOUNT_PATH: &str = "/etc/praxis/tls";
+
+/// Host-side CA cert path (relative to grid repo root).
+pub(crate) const HOST_CA_CERT: &str = "tests/env/certs/ca.pem";
+
+/// Host-side client cert path for the consumer cluster.
+pub(crate) const HOST_CLIENT_CERT: &str = "tests/env/certs/cluster-c-cert.pem";
+
+/// Host-side client key path for the consumer cluster.
+pub(crate) const HOST_CLIENT_KEY: &str = "tests/env/certs/cluster-c-key.pem";
+
+/// Host-side cert directory.
+const HOST_CERTS_DIR: &str = "tests/env/certs";
+
+/// Name of the Praxis AI provider gateway Deployment.
+const GATEWAY_DEPLOYMENT: &str = "praxis-provider";
+
+/// Name of the Praxis AI provider gateway Service.
+const GATEWAY_SERVICE: &str = "praxis-provider";
+
+/// Name of the `ConfigMap` holding the provider gateway config.
+const GATEWAY_CONFIGMAP: &str = "praxis-provider-config";
+
+/// HTTP port for the provider gateway.
+const GATEWAY_HTTP_PORT: u16 = 8080;
+
+/// Rollout timeout in seconds.
+const ROLLOUT_TIMEOUT_SECS: u32 = 120;
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+/// Deploy mock EPP and provider gateway into all provider clusters.
+///
+/// # Errors
+///
+/// Returns an error if any `kubectl` command fails.
+pub(crate) fn deploy_all(cfg: &EnvConfig) -> Result<(), Box<dyn std::error::Error>> {
+    for name in &cfg.clusters.names {
+        let Some(def) = cfg.clusters.definitions.get(name) else {
+            continue;
+        };
+        if def.role != ClusterRole::Provider || def.models.is_empty() {
+            continue;
+        }
+        deploy_provider(name, def)?;
+    }
+    Ok(())
+}
+
+/// Verify provider gateways for all provider clusters.
+///
+/// Asserts the full `ext_proc → mock EPP → endpoint_selector → inference-sim` path.
+///
+/// # Errors
+///
+/// Returns an error if any verification command fails unexpectedly or
+/// if any assertion fails.
+pub(crate) fn verify_all(cfg: &EnvConfig) -> Result<(), Box<dyn std::error::Error>> {
+    let mut tally = Tally::default();
+    let mut found = false;
+
+    for name in &cfg.clusters.names {
+        let Some(def) = cfg.clusters.definitions.get(name) else {
+            continue;
+        };
+        if def.role != ClusterRole::Provider || def.models.is_empty() {
+            continue;
+        }
+        found = true;
+        verify_provider(name, def, &mut tally)?;
+    }
+
+    if !found {
+        return Err("no provider clusters with models found".into());
+    }
+
+    tally.print_summary()
+}
+
+// ---------------------------------------------------------------------------
+// Per-provider deployment
+// ---------------------------------------------------------------------------
+
+/// Deploy mock EPP and provider gateway into one cluster.
+fn deploy_provider(name: &str, def: &ClusterDef) -> Result<(), Box<dyn std::error::Error>> {
+    let ctx = kind::kubectl_context(name);
+    eprintln!("  deploying provider gateway to {ctx}...");
+
+    create_provider_tls_secret(&ctx, name)?;
+    apply_mock_epp(&ctx, name, def)?;
+    apply_gateway_config(&ctx, def)?;
+    apply_gateway_deployment(&ctx)?;
+
+    wait_for_rollout(&ctx, MOCK_EPP_NAME, name)?;
+    wait_for_rollout(&ctx, GATEWAY_DEPLOYMENT, name)?;
+
+    eprintln!("  [PASS] provider gateway ready in {ctx}");
+    Ok(())
+}
+
+/// Create (or update) the TLS secret in a provider cluster.
+///
+/// The secret contains the site cert/key and the CA cert so the provider
+/// gateway can terminate mTLS and validate client certificates.
+fn create_provider_tls_secret(context: &str, site_name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let certs_dir = PathBuf::from(HOST_CERTS_DIR);
+    let cert = certs_dir.join(format!("{site_name}-cert.pem"));
+    let key = certs_dir.join(format!("{site_name}-key.pem"));
+    let ca = certs_dir.join("ca.pem");
+
+    eprintln!("  creating TLS secret in {context}...");
+    apply_tls_secret(context, &cert, &key, &ca)
+}
+
+/// Create the K8s Secret for TLS certs using kubectl create secret --dry-run.
+fn apply_tls_secret(
+    context: &str,
+    cert: &std::path::Path,
+    key: &std::path::Path,
+    ca: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let output = Command::new("kubectl")
+        .args([
+            "create",
+            "secret",
+            "generic",
+            TLS_SECRET_NAME,
+            &format!("--from-file=tls.crt={}", cert.display()),
+            &format!("--from-file=tls.key={}", key.display()),
+            &format!("--from-file=ca.crt={}", ca.display()),
+            "--namespace",
+            NAMESPACE,
+            "--dry-run=client",
+            "-o",
+            "yaml",
+        ])
+        .output()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("kubectl create secret failed: {stderr}").into());
+    }
+
+    let yaml = String::from_utf8(output.stdout)?;
+    apply_manifest(context, &yaml)
+}
+
+/// Apply mock EPP Deployment + Service.
+#[expect(clippy::too_many_lines, reason = "K8s manifest generation")]
+fn apply_mock_epp(context: &str, site_name: &str, def: &ClusterDef) -> Result<(), Box<dyn std::error::Error>> {
+    let route_args = mock_epp_route_args(def);
+    let yaml = format!(
+        "apiVersion: apps/v1\n\
+         kind: Deployment\n\
+         metadata:\n\
+         \x20 name: {MOCK_EPP_NAME}\n\
+         \x20 namespace: {NAMESPACE}\n\
+         \x20 labels:\n\
+         \x20   app: {MOCK_EPP_NAME}\n\
+         \x20   grid-site: {site_name}\n\
+         spec:\n\
+         \x20 replicas: 1\n\
+         \x20 selector:\n\
+         \x20   matchLabels:\n\
+         \x20     app: {MOCK_EPP_NAME}\n\
+         \x20 template:\n\
+         \x20   metadata:\n\
+         \x20     labels:\n\
+         \x20       app: {MOCK_EPP_NAME}\n\
+         \x20   spec:\n\
+         \x20     containers:\n\
+         \x20       - name: {MOCK_EPP_NAME}\n\
+         \x20         image: {}\n\
+         \x20         imagePullPolicy: Never\n\
+         \x20         ports:\n\
+         \x20           - containerPort: {MOCK_EPP_PORT}\n\
+         \x20         args:\n\
+         {route_args}\n\
+         ---\n\
+         apiVersion: v1\n\
+         kind: Service\n\
+         metadata:\n\
+         \x20 name: {MOCK_EPP_NAME}\n\
+         \x20 namespace: {NAMESPACE}\n\
+         spec:\n\
+         \x20 selector:\n\
+         \x20   app: {MOCK_EPP_NAME}\n\
+         \x20 ports:\n\
+         \x20   - port: {MOCK_EPP_PORT}\n\
+         \x20     targetPort: {MOCK_EPP_PORT}\n",
+        images::MOCK_EPP_IMAGE,
+    );
+    apply_manifest(context, &yaml)
+}
+
+/// Format mock EPP route args from model definitions.
+///
+/// Each model maps to its per-model inference-sim service DNS name.
+/// Format: `inference-sim-{sanitized-model}.default.svc:8000`.
+fn mock_epp_route_args(def: &ClusterDef) -> String {
+    def.models
+        .iter()
+        .map(|m| {
+            let svc = kind::service_name(m);
+            format!(
+                "            - \"--route={m}={svc}.{NAMESPACE}.svc:{PORT}\"",
+                PORT = 8000
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Apply the gateway `ConfigMap`.
+fn apply_gateway_config(context: &str, _def: &ClusterDef) -> Result<(), Box<dyn std::error::Error>> {
+    let config_yaml = provider_gateway_config();
+    let yaml = format!(
+        "apiVersion: v1\n\
+         kind: ConfigMap\n\
+         metadata:\n\
+         \x20 name: {GATEWAY_CONFIGMAP}\n\
+         \x20 namespace: {NAMESPACE}\n\
+         data:\n\
+         \x20 praxis.yaml: |\n\
+         {}\n",
+        indent_yaml(&config_yaml, 4)
+    );
+    apply_manifest(context, &yaml)
+}
+
+/// Provider gateway Praxis config.
+///
+/// Listener terminates mTLS: requires client certs signed by the generated test CA.
+/// `grid_ingress_trust` enforces `organization: ai-grid` at the filter level,
+/// matched against the X.509 O= field set by `certs::generate_site_cert`.
+///
+/// The `ext_proc` filter uses `StreamBuffer` body mode. The fix in
+/// `context.rs` (cloning `peer_identity` instead of taking it) ensures
+/// `grid_ingress_trust` sees the peer identity even when `pre_read_body`
+/// runs first. SAN/SPIFFE matching remains future work.
+#[expect(clippy::too_many_lines, reason = "provider Praxis config YAML generation")]
+fn provider_gateway_config() -> String {
+    format!(
+        "listeners:\n\
+         \x20 - name: provider\n\
+         \x20   address: \"0.0.0.0:{GATEWAY_HTTP_PORT}\"\n\
+         \x20   filter_chains:\n\
+         \x20     - provider-chain\n\
+         \x20   tls:\n\
+         \x20     certificates:\n\
+         \x20       - cert_path: {CERT_MOUNT_PATH}/tls.crt\n\
+         \x20         key_path: {CERT_MOUNT_PATH}/tls.key\n\
+         \x20     client_ca:\n\
+         \x20       ca_path: {CERT_MOUNT_PATH}/ca.crt\n\
+         \x20     client_cert_mode: require\n\
+         \x20     hot_reload: false\n\
+         filter_chains:\n\
+         \x20 - name: provider-chain\n\
+         \x20   filters:\n\
+         \x20     - filter: grid_ingress_trust\n\
+         \x20       trusted_peers:\n\
+         \x20         - organization: ai-grid\n\
+         \x20     - filter: ext_proc\n\
+         \x20       target: \"http://{MOCK_EPP_NAME}:{MOCK_EPP_PORT}\"\n\
+         \x20       processing_mode:\n\
+         \x20         request_body_mode: full_duplex_streamed\n\
+         \x20         response_header_mode: skip\n\
+         \x20       message_timeout_ms: 5000\n\
+         \x20       lifecycle_timeout_ms: 10000\n\
+         \x20       status_on_error: 503\n\
+         \x20     - filter: endpoint_selector\n\
+         \x20       source_header: x-gateway-destination-endpoint\n\
+         \x20       required: true\n\
+         \x20       status_on_required_failure: 503\n\
+         \x20       strip_header: true\n\
+         admin:\n\
+         \x20 address: \"127.0.0.1:9901\"\n\
+         shutdown_timeout_secs: 5\n"
+    )
+}
+
+/// Indent each line of YAML by `spaces` spaces.
+fn indent_yaml(yaml: &str, spaces: usize) -> String {
+    let prefix = " ".repeat(spaces);
+    yaml.lines()
+        .map(|l| {
+            if l.is_empty() {
+                String::new()
+            } else {
+                format!("{prefix}{l}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Apply the gateway Deployment + Service.
+#[expect(clippy::too_many_lines, reason = "K8s manifest generation")]
+fn apply_gateway_deployment(context: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let yaml = format!(
+        "apiVersion: apps/v1\n\
+         kind: Deployment\n\
+         metadata:\n\
+         \x20 name: {GATEWAY_DEPLOYMENT}\n\
+         \x20 namespace: {NAMESPACE}\n\
+         spec:\n\
+         \x20 replicas: 1\n\
+         \x20 selector:\n\
+         \x20   matchLabels:\n\
+         \x20     app: {GATEWAY_DEPLOYMENT}\n\
+         \x20 template:\n\
+         \x20   metadata:\n\
+         \x20     labels:\n\
+         \x20       app: {GATEWAY_DEPLOYMENT}\n\
+         \x20   spec:\n\
+         \x20     containers:\n\
+         \x20       - name: praxis-ai\n\
+         \x20         image: {image}\n\
+         \x20         imagePullPolicy: Never\n\
+         \x20         ports:\n\
+         \x20           - containerPort: {GATEWAY_HTTP_PORT}\n\
+         \x20         args:\n\
+         \x20           - \"--config\"\n\
+         \x20           - \"/etc/praxis/praxis.yaml\"\n\
+         \x20         volumeMounts:\n\
+         \x20           - name: config\n\
+         \x20             mountPath: /etc/praxis\n\
+         \x20             readOnly: true\n\
+         \x20           - name: tls-certs\n\
+         \x20             mountPath: {CERT_MOUNT_PATH}\n\
+         \x20             readOnly: true\n\
+         \x20     volumes:\n\
+         \x20       - name: config\n\
+         \x20         configMap:\n\
+         \x20           name: {GATEWAY_CONFIGMAP}\n\
+         \x20       - name: tls-certs\n\
+         \x20         secret:\n\
+         \x20           secretName: {TLS_SECRET_NAME}\n\
+         ---\n\
+         apiVersion: v1\n\
+         kind: Service\n\
+         metadata:\n\
+         \x20 name: {GATEWAY_SERVICE}\n\
+         \x20 namespace: {NAMESPACE}\n\
+         spec:\n\
+         \x20 selector:\n\
+         \x20   app: {GATEWAY_DEPLOYMENT}\n\
+         \x20 ports:\n\
+         \x20   - name: http\n\
+         \x20     port: {GATEWAY_HTTP_PORT}\n\
+         \x20     targetPort: {GATEWAY_HTTP_PORT}\n",
+        image = images::GATEWAY_IMAGE,
+    );
+    apply_manifest(context, &yaml)
+}
+
+/// Wait for a deployment to roll out.
+fn wait_for_rollout(context: &str, deployment: &str, cluster: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let timeout = format!("{ROLLOUT_TIMEOUT_SECS}s");
+    let resource = format!("deployment/{deployment}");
+    eprintln!("  waiting for {deployment} in {cluster}...");
+    let status = Command::new("kubectl")
+        .args([
+            "--context",
+            context,
+            "-n",
+            NAMESPACE,
+            "rollout",
+            "status",
+            &resource,
+            "--timeout",
+            &timeout,
+        ])
+        .status()?;
+    if !status.success() {
+        return Err(format!("{deployment} rollout timed out in {cluster}").into());
+    }
+    Ok(())
+}
+
+/// Apply a YAML manifest via kubectl.
+fn apply_manifest(context: &str, yaml: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let mut child = Command::new("kubectl")
+        .args(["--context", context, "apply", "-f", "-"])
+        .stdin(std::process::Stdio::piped())
+        .spawn()?;
+
+    if let Some(stdin) = child.stdin.as_mut() {
+        std::io::Write::write_all(stdin, yaml.as_bytes())?;
+    }
+    let status = child.wait()?;
+    if !status.success() {
+        return Err(format!("kubectl apply failed: {status}").into());
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Per-provider verification
+// ---------------------------------------------------------------------------
+
+/// Verify provider gateway for one cluster.
+fn verify_provider(name: &str, def: &ClusterDef, tally: &mut Tally) -> Result<(), Box<dyn std::error::Error>> {
+    let ctx = kind::kubectl_context(name);
+
+    // Check deployments ready.
+    check_deployment_ready(name, &ctx, MOCK_EPP_NAME, tally);
+    check_deployment_ready(name, &ctx, GATEWAY_DEPLOYMENT, tally);
+
+    // Port-forward to provider gateway.
+    let port = find_free_port()?;
+    let mut pf = PortForwardGuard::start(&ctx, GATEWAY_SERVICE, port, GATEWAY_HTTP_PORT)?;
+
+    if !wait_for_port(port) {
+        tally.fail(name, "provider gateway reachable via port-forward", &ctx);
+        pf.stop();
+        return Ok(());
+    }
+    tally.pass(name, "provider gateway reachable via port-forward");
+
+    // Test each configured model.
+    for model in &def.models {
+        verify_model(name, &ctx, port, model, name, tally);
+    }
+
+    // Test unknown model → 503.
+    verify_unknown_model(name, &ctx, port, name, tally);
+
+    // Test spoofed header is ignored (valid model still succeeds).
+    if let Some(model) = def.models.first() {
+        verify_spoof_ignored(name, &ctx, port, model, name, tally);
+    }
+
+    pf.stop();
+    Ok(())
+}
+
+/// Check a Kubernetes deployment has available replicas.
+fn check_deployment_ready(cluster: &str, context: &str, deployment: &str, tally: &mut Tally) {
+    let available = Command::new("kubectl")
+        .args([
+            "--context",
+            context,
+            "-n",
+            NAMESPACE,
+            "get",
+            "deployment",
+            deployment,
+            "-o",
+            "jsonpath={.status.availableReplicas}",
+        ])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .is_some_and(|s| {
+            let t = s.trim();
+            !t.is_empty() && t != "0"
+        });
+
+    if available {
+        tally.pass(cluster, &format!("{deployment} deployment available"));
+    } else {
+        tally.fail(cluster, &format!("{deployment} deployment not available"), context);
+    }
+}
+
+/// Verify a valid model routes to inference-sim and returns 200.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "cluster, context, port, model, site, tally all distinct"
+)]
+fn verify_model(cluster: &str, context: &str, port: u16, model: &str, site: &str, tally: &mut Tally) {
+    match send_chat_request(port, model, site) {
+        Ok(resp) if resp.status == 200 => {
+            tally.pass(cluster, &format!("model {model} returns 200 via ext_proc path"));
+            validate_body(cluster, context, model, &resp.body, tally);
+        },
+        Ok(resp) => {
+            let excerpt = safe_truncate(&resp.body, 200);
+            tally.fail(
+                cluster,
+                &format!(
+                    "model {model} returned {} (expected 200)\n         body: {excerpt}",
+                    resp.status
+                ),
+                context,
+            );
+        },
+        Err(e) => {
+            tally.fail(cluster, &format!("model {model} request failed: {e}"), context);
+        },
+    }
+}
+
+/// Verify an unknown model fails closed with 503.
+fn verify_unknown_model(cluster: &str, context: &str, port: u16, site: &str, tally: &mut Tally) {
+    match send_chat_request(port, "unknown-model-xyz", site) {
+        Ok(resp) if resp.status == 503 => {
+            tally.pass(cluster, "unknown model fails closed with 503");
+        },
+        Ok(resp) => {
+            tally.fail(
+                cluster,
+                &format!("unknown model returned {} (expected 503)", resp.status),
+                context,
+            );
+        },
+        Err(e) => {
+            tally.fail(cluster, &format!("unknown model request failed: {e}"), context);
+        },
+    }
+}
+
+/// Verify that a spoofed destination header is ignored.
+///
+/// Sends a valid model request with a client-supplied destination header
+/// pointing at an unreachable endpoint. The mock EPP processor-set
+/// endpoint must win and the request must still succeed.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "cluster, context, port, model, site, tally all distinct"
+)]
+fn verify_spoof_ignored(cluster: &str, context: &str, port: u16, model: &str, site: &str, tally: &mut Tally) {
+    match send_chat_request_with_spoof(port, model, "10.99.99.99:9999", site) {
+        Ok(resp) if resp.status == 200 => {
+            tally.pass(
+                cluster,
+                "spoofed destination header ignored; processor-selected endpoint wins",
+            );
+        },
+        Ok(resp) => {
+            tally.fail(
+                cluster,
+                &format!("spoofed header test returned {} (expected 200)", resp.status),
+                context,
+            );
+        },
+        Err(e) => {
+            tally.fail(cluster, &format!("spoofed header test failed: {e}"), context);
+        },
+    }
+}
+
+/// Validate JSON response shape.
+fn validate_body(cluster: &str, context: &str, model: &str, body: &str, tally: &mut Tally) {
+    match serde_json::from_str::<serde_json::Value>(body) {
+        Ok(json) if json.get("choices").is_some_and(serde_json::Value::is_array) => {
+            tally.pass(
+                cluster,
+                &format!("model {model} response is valid Chat Completions JSON"),
+            );
+        },
+        Ok(_) => {
+            tally.fail(
+                cluster,
+                &format!("model {model} response missing choices array"),
+                context,
+            );
+        },
+        Err(e) => {
+            tally.fail(cluster, &format!("model {model} response not valid JSON: {e}"), context);
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HTTP helpers
+// ---------------------------------------------------------------------------
+
+/// Send a Chat Completions request to the provider gateway (mTLS).
+///
+/// Presents the cluster-c client cert and uses `--resolve` to map the
+/// server's SAN hostname to the port-forward address.  The `site` name
+/// (e.g. `"cluster-a"`) is used to construct SNI `cluster-a.grid.internal`.
+fn send_chat_request(port: u16, model: &str, site: &str) -> Result<HttpResponse, Box<dyn std::error::Error>> {
+    let sni = format!("{site}.grid.internal");
+    let url = format!("https://{sni}:{port}/v1/chat/completions");
+    let resolve = format!("{sni}:{port}:127.0.0.1");
+    let body = format!(r#"{{"model":"{model}","messages":[{{"role":"user","content":"hello"}}],"max_tokens":1}}"#);
+    curl_post_mtls(&url, &body, None, &resolve)
+}
+
+/// Send a Chat Completions request with a spoofed destination header (mTLS).
+fn send_chat_request_with_spoof(
+    port: u16,
+    model: &str,
+    spoof: &str,
+    site: &str,
+) -> Result<HttpResponse, Box<dyn std::error::Error>> {
+    let sni = format!("{site}.grid.internal");
+    let url = format!("https://{sni}:{port}/v1/chat/completions");
+    let resolve = format!("{sni}:{port}:127.0.0.1");
+    let body = format!(r#"{{"model":"{model}","messages":[{{"role":"user","content":"hello"}}],"max_tokens":1}}"#);
+    curl_post_mtls(&url, &body, Some(spoof), &resolve)
+}
+
+/// HTTP POST via curl with mTLS and `--resolve` for hostname mapping.
+///
+/// Uses the consumer (cluster-c) client cert to satisfy `client_cert_mode:
+/// require`.  The `resolve` argument maps the provider's SAN hostname to the
+/// port-forward loopback address so rustls hostname verification passes.
+#[expect(
+    clippy::too_many_lines,
+    reason = "curl arg list for mTLS with optional spoofed header"
+)]
+pub(crate) fn curl_post_mtls(
+    url: &str,
+    body: &str,
+    spoof_header: Option<&str>,
+    resolve: &str,
+) -> Result<HttpResponse, Box<dyn std::error::Error>> {
+    let mut args = vec![
+        "-s",
+        "-w",
+        "\n%{http_code}",
+        "--connect-timeout",
+        "5",
+        "--max-time",
+        "15",
+        "--resolve",
+        resolve,
+        "--cacert",
+        HOST_CA_CERT,
+        "--cert",
+        HOST_CLIENT_CERT,
+        "--key",
+        HOST_CLIENT_KEY,
+        "-X",
+        "POST",
+        "-H",
+        "Content-Type: application/json",
+    ];
+    let spoof_hdr;
+    if let Some(s) = spoof_header {
+        spoof_hdr = format!("x-gateway-destination-endpoint: {s}");
+        args.push("-H");
+        args.push(&spoof_hdr);
+    }
+    args.extend(["-d", body, url]);
+
+    let output = Command::new("curl").args(&args).output()?;
+    let raw = String::from_utf8(output.stdout)?;
+    parse_curl_output(&raw)
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn indent_yaml_adds_prefix() {
+        let yaml = "key: value\nnested:\n  inner: 1";
+        let indented = indent_yaml(yaml, 2);
+        assert!(indented.starts_with("  key: value"), "should indent first line");
+        assert!(indented.contains("\n  nested:"), "should indent subsequent lines");
+    }
+
+    #[test]
+    fn mock_epp_route_args_format() {
+        use crate::env::config::{ClusterDef, ClusterRole};
+        let def = ClusterDef {
+            models: vec!["granite-3.3-8b".to_owned(), "mistral-7b".to_owned()],
+            role: ClusterRole::Provider,
+        };
+        let args = mock_epp_route_args(&def);
+        assert!(args.contains("--route=granite-3.3-8b="), "should include granite route");
+        assert!(args.contains("--route=mistral-7b="), "should include mistral route");
+        assert!(args.contains(".default.svc:8000"), "should use cluster DNS");
+    }
+}

@@ -121,6 +121,11 @@ pub(crate) fn kubectl_context(name: &str) -> String {
     format!("kind-{}", cluster_name(name))
 }
 
+/// Build the full kind cluster name from a config site name.
+pub(crate) fn cluster_name_from_config(name: &str) -> String {
+    cluster_name(name)
+}
+
 // ---------------------------------------------------------------------------
 // Kubernetes manifests
 // ---------------------------------------------------------------------------

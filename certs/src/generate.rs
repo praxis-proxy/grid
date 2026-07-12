@@ -13,7 +13,7 @@ use rcgen::{
 /// verified peer identity via the `organization` field.
 /// Production deployments should use cert digest pinning or
 /// SAN/SPIFFE identity instead.
-pub const DEMO_ORGANIZATION: &str = "ai-grid";
+pub const DEFAULT_ORGANIZATION: &str = "ai-grid";
 
 // ---------------------------------------------------------------------------
 // Error
@@ -94,7 +94,7 @@ pub struct SiteCertOutput {
 ///
 /// The certificate includes DNS SANs for the site name
 /// (e.g., `cluster-a.grid.internal`) and sets X.509
-/// `OrganizationName` to [`DEMO_ORGANIZATION`] so the
+/// `OrganizationName` to [`DEFAULT_ORGANIZATION`] so the
 /// Praxis `grid_ingress_trust` filter can match on it.
 ///
 /// # Errors
@@ -111,7 +111,7 @@ pub fn generate_site_cert(ca: &CaCert, site_name: &str) -> Result<SiteCertOutput
     Ok(SiteCertOutput {
         cert_pem: cert.pem(),
         key_pem: site_key.serialize_pem(),
-        organization: DEMO_ORGANIZATION.to_owned(),
+        organization: DEFAULT_ORGANIZATION.to_owned(),
         sans: vec![dns_san],
     })
 }
@@ -119,9 +119,9 @@ pub fn generate_site_cert(ca: &CaCert, site_name: &str) -> Result<SiteCertOutput
 /// Generate a certificate signed by the given CA with a specific organization.
 ///
 /// Identical to [`generate_site_cert`] except `OrganizationName` is set to
-/// `org` rather than [`DEMO_ORGANIZATION`].  Use this to create test certs
+/// `org` rather than [`DEFAULT_ORGANIZATION`]. Use this to create test certs
 /// that will fail `grid_ingress_trust` org matching despite being signed by
-/// the trusted demo CA (TLS handshake succeeds; filter rejects).
+/// the same trusted CA (TLS handshake succeeds; filter rejects).
 ///
 /// # Errors
 ///
@@ -148,7 +148,7 @@ pub fn generate_cert_with_org(ca: &CaCert, site_name: &str, org: &str) -> Result
 /// the distinguished name entries without generating a full
 /// signed certificate.
 fn build_site_params(site_name: &str, dns_san: &str) -> Result<CertificateParams, GenerateError> {
-    build_site_params_with_org(site_name, dns_san, DEMO_ORGANIZATION)
+    build_site_params_with_org(site_name, dns_san, DEFAULT_ORGANIZATION)
 }
 
 /// Build certificate parameters for a site certificate with a specific org.
@@ -206,8 +206,8 @@ mod tests {
         let ca = generate_ca("Test CA").unwrap_or_else(|_| std::process::abort());
         let site = generate_site_cert(&ca, "cluster-a").unwrap_or_else(|_| std::process::abort());
         assert_eq!(
-            site.organization, DEMO_ORGANIZATION,
-            "site cert output should carry the demo organization"
+            site.organization, DEFAULT_ORGANIZATION,
+            "site cert output should carry the default organization"
         );
     }
 
@@ -227,8 +227,8 @@ mod tests {
         let org = dn.get(&DnType::OrganizationName);
         assert_eq!(
             org,
-            Some(&rcgen::DnValue::Utf8String(DEMO_ORGANIZATION.to_owned())),
-            "OrganizationName should be DEMO_ORGANIZATION"
+            Some(&rcgen::DnValue::Utf8String(DEFAULT_ORGANIZATION.to_owned())),
+            "OrganizationName should be DEFAULT_ORGANIZATION"
         );
     }
 

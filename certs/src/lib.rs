@@ -9,6 +9,7 @@ mod generate;
 mod provider;
 
 pub use generate::{
-    CaCert, DEMO_ORGANIZATION, GenerateError, SiteCertOutput, generate_ca, generate_cert_with_org, generate_site_cert,
+    CaCert, DEFAULT_ORGANIZATION, GenerateError, SiteCertOutput, generate_ca, generate_cert_with_org,
+    generate_site_cert,
 };
 pub use provider::{CertificateProvider, ProviderError, SiteCertificate, StaticFileProvider, TrustBundle};
