@@ -196,3 +196,120 @@ If no refutation, declared dead. `GridSite` status:
    with each peer
 6. Once Active, the new site's providers are visible
    to all other sites
+
+## Local kind environment orchestration
+
+The `xtask env` commands provide a local development
+and integration-validation path using `kind` clusters.
+They are **not** the production reconciliation model.
+
+This path is intended for:
+
+- Local development iteration against a multi-cluster
+  topology
+- Integration validation before pushing to a real cluster
+- CI pipelines that require a running kind environment
+
+### What `xtask env` does
+
+`xtask env` commands are imperative and config-driven.
+They operate from `tests/env/config.toml` (or a supplied
+`--config` path), which declares clusters, their roles,
+and the models each provider cluster exposes.
+
+Available commands:
+
+| Command | What it does |
+|---|---|
+| `cargo xtask env up` | Creates kind clusters, deploys inference simulators, generates local test certificates |
+| `cargo xtask env down` | Tears down kind clusters and removes generated certs |
+| `cargo xtask env status` | Reports cluster, provider, and cert readiness |
+| `cargo xtask env verify-providers` | Probes inference-sim Chat Completions endpoints in all provider clusters |
+| `cargo xtask env build-gateway-images` | Builds the Praxis AI gateway and mock EPP container images |
+| `cargo xtask env load-gateway-images` | Loads locally-built images into kind cluster nodes |
+| `cargo xtask env deploy-provider-gateways` | Applies generated Praxis AI gateway resources to provider clusters |
+| `cargo xtask env verify-provider-gateways` | Runs end-to-end probes through the provider gateway request path |
+| `cargo xtask env deploy-consumer-gateway` | Deploys a consumer Praxis AI gateway with a generated static `grid_route` config |
+| `cargo xtask env deploy-consumer-gateway --overlay-config <path>` | Deploys the consumer gateway using a `grid-config.json` routing overlay file |
+| `cargo xtask env verify-gateway-e2e` | Verifies consumer-to-provider routing end-to-end |
+| `cargo xtask env verify-mtls-trust` | Verifies provider gateway mTLS enforcement (positive + negative cases) |
+
+### What `xtask env` does NOT do
+
+`xtask env` is not the production operator:
+
+- It does not reconcile Kubernetes resources
+  continuously
+- It does not run SWIM membership or CRDT propagation
+- It does not manage `GridNetwork`, `GridSite`, or
+  `InferenceProvider` CRDs
+- It does not perform live config hot-reload against
+  a running gateway
+
+In the production architecture, the above are
+responsibilities of the Grid Operator and its
+controllers. Implementation is staged; `xtask env` is
+not a substitute for those controllers.
+
+### Routing overlay file input
+
+`deploy-consumer-gateway --overlay-config <path>`
+accepts a `grid-config.json` routing overlay file. This
+allows local validation of the overlay wire format and
+consumer gateway config generation without running a
+full production operator reconcile loop. The overlay
+file format is:
+
+```json
+{
+  "network": "<grid-network-name>",
+  "local_site": "<consumer-site-name>",
+  "candidates": [
+    {
+      "kind": "inference_model",
+      "name": "<model-name>",
+      "site": "<provider-site-name>",
+      "cluster": "<overlay-cluster-name>",
+      "fresh": true
+    }
+  ]
+}
+```
+
+When an overlay is supplied, `grid_route.local_site`
+and candidates come from the overlay.  The
+`load_balancer` section is still generated from the
+provider endpoints in the environment config.
+
+### Separation from production reconciliation
+
+The production architecture is operator-driven. The
+Grid Operator reconciliation path owns long-lived
+management of:
+
+- `GridNetwork`, `GridSite`, and `InferenceProvider`
+  CRD reconciliation
+- SWIM mesh formation and certificate lifecycle
+- Routing overlay ConfigMap generation and application
+
+`xtask env` is a development convenience layer that
+uses the same config and cert infrastructure, not a
+production orchestrator. It should not be treated as
+evidence that the corresponding operator reconciliation
+loop is complete.
+
+### Opinionated walkthroughs and topology fixtures
+
+Scripts, static manifests, and walkthrough
+documentation for specific gateway-to-gateway
+topologies are maintained outside this repository
+at:
+
+```
+nerdalert/praxis-research-spikes/demo/ai-grid-gateway-to-gateway/
+```
+
+Grid keeps generic, config-driven, reusable commands.
+Topology-specific fixtures, static manifests, and
+presentation walkthroughs belong in the
+research-spikes repository.

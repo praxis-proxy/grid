@@ -63,6 +63,43 @@ complete.
 Prefer more doctests when in doubt. Duplicative coverage
 between doctests and unit/integration tests is fine.
 
+#### Coverage expectations
+
+The target goal is approximately 95% coverage for new
+production-quality and reusable logic.  If that goal is
+not practical for a specific change, the PR description
+must identify what coverage exists instead and explain
+why full coverage is impractical.
+
+This is a goal, not a CI-enforced policy.  The repository
+does not currently run automated coverage measurement.
+Do not claim measured coverage unless tooling to measure
+it is in place.
+
+**`xtask` commands that generate Kubernetes or Praxis
+config** should include unit tests asserting the shape
+of the generated config — for example, that
+`grid_route.local_site` is set correctly, that
+`load_balancer` cluster names match the expected
+convention, or that required filters are present.  Full
+kind cluster runs complement these tests but are not a
+substitute for focused config-shape assertions.
+
+**Operator reconciliation logic** should prefer pure
+render and decision functions tested without a live
+Kubernetes cluster.  Controller reconcile tests that
+require a live cluster are valuable but should be layered
+on top of pure unit tests, not used as the only coverage.
+
+**Topology-specific or presentation-only behavior** is
+not a substitute for tests in this repository.  If code
+is intended only for a specific external walkthrough,
+it should live in
+`nerdalert/praxis-research-spikes/demo/ai-grid-gateway-to-gateway/`,
+not here.  Generic, config-driven, reusable commands
+belong in Grid and require the test coverage described
+above.
+
 Prefer assertion messages over inline comments. Put the
 explanation in the assertion's message argument so it
 prints on failure:
