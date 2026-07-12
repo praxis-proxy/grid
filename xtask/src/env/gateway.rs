@@ -10,7 +10,7 @@
 use std::{path::PathBuf, process::Command};
 
 use crate::env::{
-    config::{ClusterDef, ClusterRole, EnvConfig},
+    config::{ClusterDef, ClusterRole, EnvConfig, ProviderBackend},
     images, kind,
     verify::{HttpResponse, PortForwardGuard, Tally, find_free_port, parse_curl_output, safe_truncate, wait_for_port},
 };
@@ -241,17 +241,26 @@ fn apply_mock_epp(context: &str, site_name: &str, def: &ClusterDef) -> Result<()
 
 /// Format mock EPP route args from model definitions.
 ///
-/// Each model maps to its per-model inference-sim service DNS name.
-/// Format: `inference-sim-{sanitized-model}.default.svc:8000`.
-fn mock_epp_route_args(def: &ClusterDef) -> String {
+/// The target service depends on the cluster's [`ProviderBackend`]:
+///
+/// - [`ProviderBackend::InferenceSim`]: each model routes to its own per-model inference-sim service
+///   (`inference-sim-{model}.{ns}.svc:8000`).
+/// - [`ProviderBackend::MockOpenai`]: all models route to a single `mock-openai-provider` service
+///   (`mock-openai-provider.{ns}.svc:{port}`).
+pub(crate) fn mock_epp_route_args(def: &ClusterDef) -> String {
     def.models
         .iter()
         .map(|m| {
-            let svc = kind::service_name(m);
-            format!(
-                "            - \"--route={m}={svc}.{NAMESPACE}.svc:{PORT}\"",
-                PORT = 8000
-            )
+            let target = match def.backend {
+                ProviderBackend::InferenceSim => {
+                    let svc = kind::service_name(m);
+                    format!("{svc}.{NAMESPACE}.svc:8000")
+                },
+                ProviderBackend::MockOpenai => {
+                    format!("{}.{}.svc:{}", kind::MOCK_OPENAI_SVC, NAMESPACE, kind::MOCK_OPENAI_PORT)
+                },
+            };
+            format!("            - \"--route={m}={target}\"")
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -739,15 +748,43 @@ mod tests {
     }
 
     #[test]
-    fn mock_epp_route_args_format() {
-        use crate::env::config::{ClusterDef, ClusterRole};
+    fn mock_epp_route_args_inference_sim_per_model() {
+        use crate::env::config::{ClusterDef, ClusterRole, ProviderBackend};
         let def = ClusterDef {
             models: vec!["granite-3.3-8b".to_owned(), "mistral-7b".to_owned()],
             role: ClusterRole::Provider,
+            backend: ProviderBackend::InferenceSim,
         };
         let args = mock_epp_route_args(&def);
-        assert!(args.contains("--route=granite-3.3-8b="), "should include granite route");
-        assert!(args.contains("--route=mistral-7b="), "should include mistral route");
-        assert!(args.contains(".default.svc:8000"), "should use cluster DNS");
+        assert!(args.contains("--route=granite-3.3-8b="), "must include granite route");
+        assert!(args.contains("--route=mistral-7b="), "must include mistral route");
+        assert!(args.contains(".default.svc:8000"), "must route to inference-sim port");
+        assert!(
+            !args.contains(kind::MOCK_OPENAI_SVC),
+            "inference-sim mode must not reference mock-openai service"
+        );
+    }
+
+    #[test]
+    fn mock_epp_route_args_mock_openai_all_to_one_service() {
+        use crate::env::config::{ClusterDef, ClusterRole, ProviderBackend};
+        let def = ClusterDef {
+            models: vec!["model-a".to_owned(), "model-b".to_owned()],
+            role: ClusterRole::Provider,
+            backend: ProviderBackend::MockOpenai,
+        };
+        let args = mock_epp_route_args(&def);
+        assert!(args.contains("--route=model-a="), "must include model-a route");
+        assert!(args.contains("--route=model-b="), "must include model-b route");
+        assert!(
+            args.contains(kind::MOCK_OPENAI_SVC),
+            "mock-openai mode must route to mock-openai-provider service"
+        );
+        let target = format!("{}.default.svc:{}", kind::MOCK_OPENAI_SVC, kind::MOCK_OPENAI_PORT);
+        assert!(args.contains(&target), "mock-openai target must include port");
+        assert!(
+            !args.contains("inference-sim"),
+            "mock-openai mode must not reference inference-sim services"
+        );
     }
 }

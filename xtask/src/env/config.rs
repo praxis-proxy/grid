@@ -58,11 +58,40 @@ pub(crate) struct ClusterConfig {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ClusterDef {
-    /// Models to deploy via llm-d-inference-sim.
+    /// Models served by this cluster's provider backend.
     pub models: Vec<String>,
 
     /// Cluster role in the grid.
     pub role: ClusterRole,
+
+    /// Provider backend deployed inside this cluster.
+    ///
+    /// Determines which inference backend is deployed when `role = "provider"`.
+    /// Defaults to [`ProviderBackend::InferenceSim`] (llm-d-inference-sim).
+    #[serde(default)]
+    pub backend: ProviderBackend,
+}
+
+/// Provider backend deployed inside a provider cluster.
+///
+/// Controls which inference backend service receives requests routed
+/// by the mock EPP.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum ProviderBackend {
+    /// Deploy `llm-d-inference-sim` per model.  Default.
+    ///
+    /// One Deployment and Service per model.  Routes via
+    /// `inference-sim-{model}.{namespace}.svc:8000`.
+    #[default]
+    InferenceSim,
+
+    /// Deploy `grid-mock-providers` with the `openai` provider.
+    ///
+    /// A single Deployment and Service serves all models in the cluster.
+    /// Routes all models via `mock-openai-provider.{namespace}.svc:8080`.
+    /// Supports Chat Completions and `/v1/responses`.
+    MockOpenai,
 }
 
 /// Role of a cluster in the test topology.
@@ -316,5 +345,157 @@ role = "consumer"
     fn file_not_found() {
         let result = EnvConfig::from_file(Path::new("/nonexistent/config.toml"));
         assert!(result.is_err(), "should fail on missing file");
+    }
+
+    #[test]
+    fn default_backend_is_inference_sim() {
+        let toml = r#"
+[clusters]
+names = ["provider"]
+
+[clusters.provider]
+models = ["model-x"]
+role = "provider"
+
+[providers]
+openai = { port = 10001 }
+anthropic = { port = 10002 }
+bedrock = { port = 10003, region = "us-east-1" }
+vertex = { port = 10004, project = "test-project" }
+"#;
+        let cfg = EnvConfig::from_str(toml).unwrap_or_else(|_| std::process::abort());
+        let def = cfg
+            .clusters
+            .definitions
+            .get("provider")
+            .unwrap_or_else(|| std::process::abort());
+        assert_eq!(
+            def.backend,
+            ProviderBackend::InferenceSim,
+            "default backend must be InferenceSim when not specified"
+        );
+    }
+
+    #[test]
+    fn explicit_inference_sim_backend_parses() {
+        let toml = r#"
+[clusters]
+names = ["provider"]
+
+[clusters.provider]
+models = ["model-x"]
+role = "provider"
+backend = "inference-sim"
+
+[providers]
+openai = { port = 10001 }
+anthropic = { port = 10002 }
+bedrock = { port = 10003, region = "us-east-1" }
+vertex = { port = 10004, project = "test-project" }
+"#;
+        let cfg = EnvConfig::from_str(toml).unwrap_or_else(|_| std::process::abort());
+        let def = cfg
+            .clusters
+            .definitions
+            .get("provider")
+            .unwrap_or_else(|| std::process::abort());
+        assert_eq!(
+            def.backend,
+            ProviderBackend::InferenceSim,
+            "explicit inference-sim must parse correctly"
+        );
+    }
+
+    #[test]
+    fn mock_openai_backend_parses() {
+        let toml = r#"
+[clusters]
+names = ["provider"]
+
+[clusters.provider]
+models = ["model-x"]
+role = "provider"
+backend = "mock-openai"
+
+[providers]
+openai = { port = 10001 }
+anthropic = { port = 10002 }
+bedrock = { port = 10003, region = "us-east-1" }
+vertex = { port = 10004, project = "test-project" }
+"#;
+        let cfg = EnvConfig::from_str(toml).unwrap_or_else(|_| std::process::abort());
+        let def = cfg
+            .clusters
+            .definitions
+            .get("provider")
+            .unwrap_or_else(|| std::process::abort());
+        assert_eq!(
+            def.backend,
+            ProviderBackend::MockOpenai,
+            "mock-openai backend must parse correctly"
+        );
+    }
+
+    #[test]
+    fn invalid_backend_rejected() {
+        let toml = r#"
+[clusters]
+names = ["provider"]
+
+[clusters.provider]
+models = ["model-x"]
+role = "provider"
+backend = "not-a-backend"
+
+[providers]
+openai = { port = 10001 }
+anthropic = { port = 10002 }
+bedrock = { port = 10003, region = "us-east-1" }
+vertex = { port = 10004, project = "test-project" }
+"#;
+        let result = EnvConfig::from_str(toml);
+        assert!(result.is_err(), "invalid backend value must be rejected");
+    }
+
+    #[test]
+    #[expect(clippy::too_many_lines, reason = "test exercises multiple cluster definitions")]
+    fn mixed_backends_per_cluster() {
+        let toml = r#"
+[clusters]
+names = ["prov-a", "prov-b"]
+
+[clusters.prov-a]
+models = ["model-a"]
+role = "provider"
+backend = "inference-sim"
+
+[clusters.prov-b]
+models = ["model-b"]
+role = "provider"
+backend = "mock-openai"
+
+[providers]
+openai = { port = 10001 }
+anthropic = { port = 10002 }
+bedrock = { port = 10003, region = "us-east-1" }
+vertex = { port = 10004, project = "test-project" }
+"#;
+        let cfg = EnvConfig::from_str(toml).unwrap_or_else(|_| std::process::abort());
+        let a = cfg
+            .clusters
+            .definitions
+            .get("prov-a")
+            .unwrap_or_else(|| std::process::abort());
+        let b = cfg
+            .clusters
+            .definitions
+            .get("prov-b")
+            .unwrap_or_else(|| std::process::abort());
+        assert_eq!(
+            a.backend,
+            ProviderBackend::InferenceSim,
+            "prov-a must use inference-sim"
+        );
+        assert_eq!(b.backend, ProviderBackend::MockOpenai, "prov-b must use mock-openai");
     }
 }

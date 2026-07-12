@@ -227,12 +227,10 @@ fn report_cluster_status(cfg: &EnvConfig, mut all_ok: bool) -> bool {
             && let Some(def) = cfg.clusters.definitions.get(name)
             && def.role == config::ClusterRole::Provider
         {
-            for model in &def.models {
-                let deploy_ok = kind::is_model_deployment_ready(name, model);
-                all_ok = all_ok && deploy_ok;
-                let deploy = kind::deployment_name(model);
-                eprintln!("    {deploy}: {}", status_label(deploy_ok));
-            }
+            let deploy_ok = kind::is_provider_backend_ready(name, def);
+            all_ok = all_ok && deploy_ok;
+            let deploy = kind::provider_backend_deployment_name(def);
+            eprintln!("    {deploy}: {}", status_label(deploy_ok));
         }
     }
     all_ok
@@ -277,7 +275,7 @@ fn env_build_gateway_images(ai_repo: Option<&Path>) -> Result<(), Box<dyn std::e
 fn env_load_gateway_images(config: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let cfg = EnvConfig::from_file(config)?;
     eprintln!("loading gateway images into kind clusters...");
-    images::load_all(&cfg.clusters.names)?;
+    images::load_all(&cfg)?;
     eprintln!("env load-gateway-images: done");
     Ok(())
 }

@@ -2,6 +2,10 @@
 //!
 //! Builds the composed Praxis AI gateway image and the mock EPP image
 //! from the AI repository, then loads them into all kind clusters.
+//!
+//! When a cluster is configured with [`ProviderBackend::MockOpenai`], the
+//! `grid-mock-providers` image ([`kind::MOCK_PROVIDER_IMAGE`]) is also
+//! loaded into that cluster.
 
 use std::{
     env,
@@ -9,7 +13,7 @@ use std::{
     process::Command,
 };
 
-use crate::env::kind;
+use crate::env::{config::EnvConfig, kind};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -53,15 +57,38 @@ pub(crate) fn build_all(ai_repo: &Path) -> Result<(), Box<dyn std::error::Error>
 
 /// Load both images into all kind clusters.
 ///
+/// Load gateway images into all kind clusters.
+///
+/// Always loads [`GATEWAY_IMAGE`] and [`MOCK_EPP_IMAGE`] into every cluster.
+///
+/// For clusters configured with [`ProviderBackend::MockOpenai`], also loads
+/// [`kind::MOCK_PROVIDER_IMAGE`]. This image must exist locally as
+/// `grid-mock-providers:latest` before running `load-gateway-images`.
+///
 /// # Errors
 ///
-/// Returns an error if `kind load` fails.
-pub(crate) fn load_all(cluster_names: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    for image in &[GATEWAY_IMAGE, MOCK_EPP_IMAGE] {
-        for name in cluster_names {
-            let full = kind::cluster_name_from_config(name);
+/// Returns an error if `kind load docker-image` fails.
+pub(crate) fn load_all(cfg: &EnvConfig) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::env::config::ProviderBackend;
+
+    for name in &cfg.clusters.names {
+        let full = kind::cluster_name_from_config(name);
+        for image in &[GATEWAY_IMAGE, MOCK_EPP_IMAGE] {
             eprintln!("  loading {image} into {full}...");
             run_cmd("kind", &["load", "docker-image", image, "--name", &full])?;
+        }
+        // Load mock-provider image only when a cluster needs it.
+        if cfg
+            .clusters
+            .definitions
+            .get(name)
+            .is_some_and(|d| d.backend == ProviderBackend::MockOpenai)
+        {
+            eprintln!("  loading {} into {full}...", kind::MOCK_PROVIDER_IMAGE);
+            run_cmd(
+                "kind",
+                &["load", "docker-image", kind::MOCK_PROVIDER_IMAGE, "--name", &full],
+            )?;
         }
     }
     Ok(())

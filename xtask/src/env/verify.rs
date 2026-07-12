@@ -11,7 +11,7 @@ use std::{
 };
 
 use crate::env::{
-    config::{ClusterDef, ClusterRole, EnvConfig},
+    config::{ClusterDef, ClusterRole, EnvConfig, ProviderBackend},
     kind,
 };
 
@@ -32,7 +32,7 @@ const PORT_FORWARD_SETTLE: Duration = Duration::from_secs(5);
 const NAMESPACE: &str = "default";
 
 /// Inference-sim service port inside the cluster.
-const SERVICE_PORT: u16 = 8000;
+const INFERENCE_SIM_PORT: u16 = 8000;
 
 /// `curl` connect timeout in seconds.
 const CURL_CONNECT_TIMEOUT: u32 = 5;
@@ -125,36 +125,87 @@ fn verify_one_provider(name: &str, def: &ClusterDef, tally: &mut Tally) -> Resul
     let ctx = kind::kubectl_context(name);
 
     for model in &def.models {
-        verify_one_model(name, &ctx, model, tally)?;
+        verify_one_model(name, &ctx, def, model, tally)?;
     }
     Ok(())
 }
 
 /// Verify one model's deployment, service, and Chat Completions.
-fn verify_one_model(name: &str, ctx: &str, model: &str, tally: &mut Tally) -> Result<(), Box<dyn std::error::Error>> {
-    let svc = kind::service_name(model);
+fn verify_one_model(
+    name: &str,
+    ctx: &str,
+    def: &ClusterDef,
+    model: &str,
+    tally: &mut Tally,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let endpoint = backend_endpoint(def, model);
 
-    if !kind::is_model_deployment_ready(name, model) {
-        tally.fail(name, &format!("{svc} deployment available"), ctx);
+    if !backend_ready(name, def, model) {
+        tally.fail(name, &format!("{} deployment available", endpoint.deployment), ctx);
         return Ok(());
     }
-    tally.pass(name, &format!("{svc} deployment available"));
+    tally.pass(name, &format!("{} deployment available", endpoint.deployment));
 
     let local_port = find_free_port()?;
-    let mut pf = PortForwardGuard::start(ctx, &svc, local_port, SERVICE_PORT)?;
+    let mut pf = PortForwardGuard::start(ctx, &endpoint.service, local_port, endpoint.port)?;
 
     if !wait_for_port(local_port) {
-        tally.fail(name, &format!("{svc} reachable via port-forward"), ctx);
+        tally.fail(name, &format!("{} reachable via port-forward", endpoint.service), ctx);
         pf.stop();
         return Ok(());
     }
-    tally.pass(name, &format!("{svc} reachable via port-forward"));
+    tally.pass(name, &format!("{} reachable via port-forward", endpoint.service));
 
-    check_model_listed(name, ctx, model, local_port, tally);
+    if endpoint.requires_model_listing {
+        check_model_listed(name, ctx, model, local_port, tally);
+    } else {
+        check_models_endpoint_reachable(name, ctx, local_port, tally);
+    }
     check_chat_completions(name, ctx, model, local_port, tally);
 
     pf.stop();
     Ok(())
+}
+
+/// Endpoint details for a configured provider backend.
+struct BackendEndpoint {
+    /// Deployment name to check for readiness.
+    deployment: String,
+    /// Service name to port-forward.
+    service: String,
+    /// Service port to target.
+    port: u16,
+    /// Whether `/v1/models` must include the configured model.
+    requires_model_listing: bool,
+}
+
+/// Return backend endpoint details for one configured model.
+fn backend_endpoint(def: &ClusterDef, model: &str) -> BackendEndpoint {
+    match def.backend {
+        ProviderBackend::InferenceSim => {
+            let service = kind::service_name(model);
+            BackendEndpoint {
+                deployment: service.clone(),
+                service,
+                port: INFERENCE_SIM_PORT,
+                requires_model_listing: true,
+            }
+        },
+        ProviderBackend::MockOpenai => BackendEndpoint {
+            deployment: kind::MOCK_OPENAI_SVC.to_owned(),
+            service: kind::MOCK_OPENAI_SVC.to_owned(),
+            port: kind::MOCK_OPENAI_PORT,
+            requires_model_listing: false,
+        },
+    }
+}
+
+/// Check backend readiness according to backend type.
+fn backend_ready(name: &str, def: &ClusterDef, model: &str) -> bool {
+    match def.backend {
+        ProviderBackend::InferenceSim => kind::is_model_deployment_ready(name, model),
+        ProviderBackend::MockOpenai => kind::is_provider_backend_ready(name, def),
+    }
 }
 
 /// Verify the model appears in `/v1/models`.
@@ -166,6 +217,21 @@ fn check_model_listed(name: &str, ctx: &str, model: &str, port: u16, tally: &mut
         Ok(models) => {
             let listed = models.join(", ");
             tally.fail(name, &format!("model {model} not in /v1/models (found: {listed})"), ctx);
+        },
+        Err(e) => {
+            tally.fail(name, &format!("/v1/models query failed: {e}"), ctx);
+        },
+    }
+}
+
+/// Verify `/v1/models` is reachable without requiring configured-model listing.
+fn check_models_endpoint_reachable(name: &str, ctx: &str, port: u16, tally: &mut Tally) {
+    match query_models(port) {
+        Ok(models) if !models.is_empty() => {
+            tally.pass(name, "/v1/models returned model metadata");
+        },
+        Ok(_) => {
+            tally.fail(name, "/v1/models returned no model metadata", ctx);
         },
         Err(e) => {
             tally.fail(name, &format!("/v1/models query failed: {e}"), ctx);
@@ -521,6 +587,55 @@ mod tests {
         assert!(
             !is_chat_completions_shaped(&json),
             "should reject responses without choices array"
+        );
+    }
+
+    #[test]
+    fn backend_endpoint_for_inference_sim_uses_model_service() {
+        let def = ClusterDef {
+            models: vec!["model-a".to_owned()],
+            role: ClusterRole::Provider,
+            backend: ProviderBackend::InferenceSim,
+        };
+
+        let endpoint = backend_endpoint(&def, "model-a");
+
+        assert_eq!(
+            endpoint.deployment, "inference-sim-model-a",
+            "deployment should be per-model"
+        );
+        assert_eq!(endpoint.service, "inference-sim-model-a", "service should be per-model");
+        assert_eq!(endpoint.port, INFERENCE_SIM_PORT, "port should be inference-sim port");
+        assert!(
+            endpoint.requires_model_listing,
+            "inference-sim should prove the configured model is listed"
+        );
+    }
+
+    #[test]
+    fn backend_endpoint_for_mock_openai_uses_shared_service() {
+        let def = ClusterDef {
+            models: vec!["model-a".to_owned()],
+            role: ClusterRole::Provider,
+            backend: ProviderBackend::MockOpenai,
+        };
+
+        let endpoint = backend_endpoint(&def, "model-a");
+
+        assert_eq!(
+            endpoint.deployment,
+            kind::MOCK_OPENAI_SVC,
+            "deployment should be shared mock-openai service"
+        );
+        assert_eq!(
+            endpoint.service,
+            kind::MOCK_OPENAI_SVC,
+            "service should be shared mock-openai service"
+        );
+        assert_eq!(endpoint.port, kind::MOCK_OPENAI_PORT, "port should be mock-openai port");
+        assert!(
+            !endpoint.requires_model_listing,
+            "mock-openai accepts arbitrary requested models"
         );
     }
 }
