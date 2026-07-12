@@ -16,3 +16,7 @@ tracing = { workspace = true }
 
 [lints]
 workspace = true
+
+[package.metadata.cargo-machete]
+# bytes and tracing are used by the SWIM runtime; not yet referenced in stub code
+ignored = ["bytes", "tracing"]

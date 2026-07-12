@@ -3,6 +3,7 @@
 # -------------------------------------------------------------------
 
 V ?=
+NIGHTLY_RUSTFMT   ?= nightly-2026-03-28
 KIND_CLUSTER_NAME ?= praxis-dev
 PROJECT_IMAGE    ?= project:dev
 KUBECTL          ?= kubectl --context kind-$(KIND_CLUSTER_NAME)
@@ -12,7 +13,7 @@ ifneq ($(V),)
 endif
 
 .PHONY: all build release check clean \
-	test lint fmt doc audit \
+	test test-unit lint fmt doc audit \
 	coverage coverage-check \
 	images container kind-up kind-down \
 	dev-env dev-push dev-integration \
@@ -44,7 +45,9 @@ clean:
 # Test
 # -------------------------------------------------------------------
 
-test:
+test: test-unit
+
+test-unit:
 	cargo test --workspace $(_NOCAPTURE)
 
 # -------------------------------------------------------------------
@@ -53,11 +56,11 @@ test:
 
 lint:
 	cargo clippy --workspace --all-targets -- -D warnings
-	cargo +nightly fmt --all -- --check
+	cargo +$(NIGHTLY_RUSTFMT) fmt --all -- --check
 	cargo machete
 
 fmt:
-	cargo +nightly fmt --all
+	cargo +$(NIGHTLY_RUSTFMT) fmt --all
 
 doc:
 	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --document-private-items
@@ -132,7 +135,8 @@ help:
 	@echo "  clean            cargo clean"
 	@echo ""
 	@echo "Test:"
-	@echo "  test             run all tests"
+	@echo "  test             run all tests (alias for test-unit)"
+	@echo "  test-unit        cargo test --workspace"
 	@echo ""
 	@echo "Quality:"
 	@echo "  lint             clippy + rustfmt check"
