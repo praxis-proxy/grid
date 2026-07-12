@@ -152,4 +152,39 @@ mod tests {
         c.increment(1);
         assert_eq!(c.total(), u64::MAX, "should saturate");
     }
+
+    #[test]
+    fn merge_is_associative() {
+        let mut a = GCounter::new("a".to_owned());
+        let mut b = GCounter::new("b".to_owned());
+        let mut c = GCounter::new("c".to_owned());
+        a.increment(10);
+        b.increment(20);
+        c.increment(30);
+
+        let mut ab_then_c = a.clone();
+        ab_then_c.merge(&b);
+        ab_then_c.merge(&c);
+
+        let mut bc = b.clone();
+        bc.merge(&c);
+        let mut a_then_bc = a.clone();
+        a_then_bc.merge(&bc);
+
+        assert_eq!(
+            ab_then_c.total(),
+            a_then_bc.total(),
+            "(a merge b) merge c == a merge (b merge c)"
+        );
+    }
+
+    #[test]
+    fn gcounter_serde_round_trip() {
+        let mut c = GCounter::new("site-x".to_owned());
+        c.increment(42);
+        let json = serde_json::to_string(&c).unwrap_or_else(|_| std::process::abort());
+        let restored: GCounter = serde_json::from_str(&json).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(restored.total(), 42, "serde round-trip must preserve total");
+        assert_eq!(restored.local(), 42, "serde round-trip must preserve local");
+    }
 }

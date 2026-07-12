@@ -139,4 +139,36 @@ mod tests {
         r.merge(&LwwRegister::new("new".to_owned(), 2));
         assert_eq!(r.value_ref(), "new", "string merge");
     }
+
+    #[test]
+    fn set_ignores_equal_timestamp() {
+        let mut r = LwwRegister::new(1.0, 5);
+        r.set(99.0, 5);
+        assert_eq!(r.value(), 1.0, "set with equal timestamp must not change value");
+        assert_eq!(r.timestamp(), 5, "set with equal timestamp must not change timestamp");
+    }
+
+    #[test]
+    fn merge_equal_timestamps_is_not_commutative() {
+        // Equal-timestamp merge keeps self — this is intentional and non-commutative.
+        // Pinning this behavior so future changes are deliberate.
+        let mut a = LwwRegister::new(1.0, 1);
+        let b = LwwRegister::new(2.0, 1);
+        a.merge(&b);
+        assert_eq!(a.value(), 1.0, "a keeps its own value on equal timestamps");
+
+        let mut b2 = LwwRegister::new(2.0, 1);
+        let a2 = LwwRegister::new(1.0, 1);
+        b2.merge(&a2);
+        assert_eq!(b2.value(), 2.0, "b keeps its own value on equal timestamps");
+    }
+
+    #[test]
+    fn lww_register_serde_round_trip() {
+        let r = LwwRegister::new(42.5_f64, 100);
+        let json = serde_json::to_string(&r).unwrap_or_else(|_| std::process::abort());
+        let restored: LwwRegister<f64> = serde_json::from_str(&json).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(restored.value(), 42.5, "serde round-trip must preserve value");
+        assert_eq!(restored.timestamp(), 100, "serde round-trip must preserve timestamp");
+    }
 }

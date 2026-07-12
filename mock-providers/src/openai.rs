@@ -430,6 +430,11 @@ mod tests {
         );
         assert!(json.get("output").is_some(), "should have output array");
         assert!(json.get("usage").is_some(), "should have usage");
+        assert_eq!(
+            json.get("status").and_then(Value::as_str),
+            Some("completed"),
+            "non-streaming response must carry status=completed"
+        );
     }
 
     #[tokio::test]

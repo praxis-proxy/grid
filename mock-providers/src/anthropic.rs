@@ -282,4 +282,18 @@ mod tests {
         let resp = send(req).await;
         assert_eq!(resp.status(), StatusCode::OK, "health should return 200");
     }
+
+    #[tokio::test]
+    async fn invalid_json_body_returns_400() {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("x-api-key", "test-key")
+            .body(Body::from("not valid json"))
+            .unwrap_or_default();
+
+        let resp = send(req).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "malformed JSON must return 400");
+    }
 }

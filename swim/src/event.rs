@@ -60,4 +60,19 @@ mod tests {
         let cloned = event.clone();
         assert!(matches!(cloned, MemberEvent::Left { .. }), "should clone correctly");
     }
+
+    #[test]
+    fn suspect_event_debug_format() {
+        let event = MemberEvent::Suspect {
+            site_name: "site-x".to_owned(),
+        };
+        let debug = format!("{event:?}");
+        assert!(debug.contains("site-x"), "Suspect debug must contain site name");
+        assert!(debug.contains("Suspect"), "Suspect debug must contain variant name");
+        let cloned = event.clone();
+        assert!(
+            matches!(cloned, MemberEvent::Suspect { .. }),
+            "Suspect must clone correctly"
+        );
+    }
 }

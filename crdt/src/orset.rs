@@ -213,4 +213,91 @@ mod tests {
         let set: OrSet<String> = OrSet::new("a".to_owned());
         assert!(set.is_empty(), "new set should be empty");
     }
+
+    #[test]
+    fn add_same_item_twice_counts_once() {
+        let mut set = OrSet::new("a".to_owned());
+        set.add("x".to_owned());
+        set.add("x".to_owned());
+        assert_eq!(set.len(), 1, "duplicate adds must count as one item");
+        assert!(set.contains(&"x".to_owned()), "item must still be present");
+    }
+
+    #[test]
+    fn merge_is_commutative() {
+        let mut a = OrSet::new("a".to_owned());
+        let mut b = OrSet::new("b".to_owned());
+        a.add("x".to_owned());
+        b.add("y".to_owned());
+
+        let mut ab = a.clone();
+        ab.merge(&b);
+
+        let mut ba = b.clone();
+        ba.merge(&a);
+
+        assert_eq!(ab.len(), ba.len(), "merge must be commutative");
+        assert_eq!(
+            ab.contains(&"x".to_owned()),
+            ba.contains(&"x".to_owned()),
+            "x present in both"
+        );
+        assert_eq!(
+            ab.contains(&"y".to_owned()),
+            ba.contains(&"y".to_owned()),
+            "y present in both"
+        );
+    }
+
+    #[test]
+    fn merge_is_idempotent() {
+        let mut a = OrSet::new("a".to_owned());
+        a.add("x".to_owned());
+        let snapshot = a.clone();
+        a.merge(&snapshot);
+        assert_eq!(a.len(), 1, "merge with self must be idempotent");
+    }
+
+    #[test]
+    fn merge_is_associative() {
+        let mut a = OrSet::new("a".to_owned());
+        let mut b = OrSet::new("b".to_owned());
+        let mut c = OrSet::new("c".to_owned());
+        a.add("x".to_owned());
+        b.add("y".to_owned());
+        c.add("z".to_owned());
+
+        let mut ab_then_c = a.clone();
+        ab_then_c.merge(&b);
+        ab_then_c.merge(&c);
+
+        let mut bc = b.clone();
+        bc.merge(&c);
+        let mut a_then_bc = a.clone();
+        a_then_bc.merge(&bc);
+
+        assert_eq!(
+            ab_then_c.len(),
+            a_then_bc.len(),
+            "(a merge b) merge c == a merge (b merge c)"
+        );
+    }
+
+    #[test]
+    fn orset_serde_round_trip() {
+        let mut set = OrSet::new("site-x".to_owned());
+        set.add("model-a".to_owned());
+        set.add("model-b".to_owned());
+        let json = serde_json::to_string(&set).unwrap_or_else(|_| std::process::abort());
+        let restored: OrSet<String> = serde_json::from_str(&json).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(restored.len(), 2, "serde round-trip must preserve item count");
+        assert!(
+            restored.contains(&"model-a".to_owned()),
+            "model-a must survive round-trip"
+        );
+        assert!(
+            restored.contains(&"model-b".to_owned()),
+            "model-b must survive round-trip"
+        );
+    }
 }

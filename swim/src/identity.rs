@@ -130,4 +130,36 @@ mod tests {
         let id = NodeId::new("site".to_owned(), addr);
         assert_eq!(id.addr(), addr, "addr mismatch");
     }
+
+    #[test]
+    fn renew_wraps_at_u16_max() {
+        let addr: SocketAddr = "127.0.0.1:7946".parse().unwrap_or_else(|_| std::process::abort());
+        let id = NodeId {
+            generation: u16::MAX,
+            site_name: "site".to_owned(),
+            addr,
+        };
+        let renewed = id.renew().unwrap_or_else(|| std::process::abort());
+        assert_eq!(renewed.generation, 0, "generation must wrap to 0 at u16::MAX");
+        assert_eq!(renewed.site_name(), "site", "site name must be preserved through wrap");
+        assert!(
+            !renewed.win_addr_conflict(&id),
+            "generation 0 must not beat generation u16::MAX in conflict"
+        );
+    }
+
+    #[test]
+    fn node_id_serde_round_trip() {
+        let addr: SocketAddr = "10.0.0.1:7946".parse().unwrap_or_else(|_| std::process::abort());
+        let id = NodeId::new("my-site".to_owned(), addr);
+        let json = serde_json::to_string(&id).unwrap_or_else(|_| std::process::abort());
+        let restored: NodeId = serde_json::from_str(&json).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            restored.site_name(),
+            "my-site",
+            "serde round-trip must preserve site_name"
+        );
+        assert_eq!(restored.addr(), addr, "serde round-trip must preserve addr");
+        assert_eq!(restored.generation, 0, "serde round-trip must preserve generation");
+    }
 }
