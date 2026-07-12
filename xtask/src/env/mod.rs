@@ -2,6 +2,7 @@
 
 pub(crate) mod certs;
 pub(crate) mod config;
+pub(crate) mod consumer;
 pub(crate) mod gateway;
 pub(crate) mod images;
 pub(crate) mod kind;
@@ -83,6 +84,27 @@ pub(crate) enum Action {
         #[arg(short, long, default_value = DEFAULT_CONFIG_PATH)]
         config: PathBuf,
     },
+
+    /// Probe cross-kind network connectivity from consumer to providers.
+    ProbeGatewayNetwork {
+        /// Path to the environment config file.
+        #[arg(short, long, default_value = DEFAULT_CONFIG_PATH)]
+        config: PathBuf,
+    },
+
+    /// Deploy the consumer gateway with static `grid_route` config.
+    DeployConsumerGateway {
+        /// Path to the environment config file.
+        #[arg(short, long, default_value = DEFAULT_CONFIG_PATH)]
+        config: PathBuf,
+    },
+
+    /// Verify consumer-to-provider gateway routing end-to-end.
+    VerifyGatewayE2e {
+        /// Path to the environment config file.
+        #[arg(short, long, default_value = DEFAULT_CONFIG_PATH)]
+        config: PathBuf,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -105,6 +127,9 @@ pub(crate) fn run(action: &Action) -> Result<(), Box<dyn std::error::Error>> {
         Action::LoadGatewayImages { config } => env_load_gateway_images(config),
         Action::DeployProviderGateways { config } => env_deploy_provider_gateways(config),
         Action::VerifyProviderGateways { config } => env_verify_provider_gateways(config),
+        Action::ProbeGatewayNetwork { config } => env_probe_gateway_network(config),
+        Action::DeployConsumerGateway { config } => env_deploy_consumer_gateway(config),
+        Action::VerifyGatewayE2e { config } => env_verify_gateway_e2e(config),
     }
 }
 
@@ -242,6 +267,25 @@ fn env_deploy_provider_gateways(config: &Path) -> Result<(), Box<dyn std::error:
 fn env_verify_provider_gateways(config: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let cfg = EnvConfig::from_file(config)?;
     gateway::verify_all(&cfg)
+}
+
+/// Probe cross-kind network connectivity from the consumer cluster to all
+/// provider gateways.
+fn env_probe_gateway_network(config: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let cfg = EnvConfig::from_file(config)?;
+    consumer::probe_network(&cfg)
+}
+
+/// Deploy the consumer gateway with static `grid_route` config.
+fn env_deploy_consumer_gateway(config: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let cfg = EnvConfig::from_file(config)?;
+    consumer::deploy_consumer(&cfg)
+}
+
+/// Verify consumer-to-provider gateway routing end-to-end.
+fn env_verify_gateway_e2e(config: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let cfg = EnvConfig::from_file(config)?;
+    consumer::verify_e2e(&cfg)
 }
 
 /// Format a status label.
