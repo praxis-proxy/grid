@@ -10,6 +10,7 @@ publish = false
 clap = { workspace = true }
 certs = { path = "../certs" }
 serde = { workspace = true }
+serde_json = { workspace = true }
 toml = { workspace = true }
 thiserror = { workspace = true }
 

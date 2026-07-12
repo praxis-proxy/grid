@@ -4,6 +4,7 @@ pub(crate) mod certs;
 pub(crate) mod config;
 pub(crate) mod kind;
 pub(crate) mod providers;
+pub(crate) mod verify;
 
 use std::path::{Path, PathBuf};
 
@@ -45,6 +46,13 @@ pub(crate) enum Action {
         #[arg(short, long, default_value = DEFAULT_CONFIG_PATH)]
         config: PathBuf,
     },
+
+    /// Verify provider inference-sim endpoints are reachable.
+    VerifyProviders {
+        /// Path to the environment config file.
+        #[arg(short, long, default_value = DEFAULT_CONFIG_PATH)]
+        config: PathBuf,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -62,6 +70,7 @@ pub(crate) fn run(action: &Action) -> Result<(), Box<dyn std::error::Error>> {
         Action::Up { config } => env_up(config),
         Action::Down { config } => env_down(config),
         Action::Status { config } => env_status(config),
+        Action::VerifyProviders { config } => env_verify_providers(config),
     }
 }
 
@@ -76,9 +85,15 @@ fn env_up(config: &Path) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    providers::start_all(&cfg.providers)?;
     certs::generate_all(&cfg.clusters.names)?;
-    eprintln!("env up: clusters, providers, and certs ready");
+
+    if let Err(e) = providers::start_all(&cfg.providers) {
+        eprintln!("warning: mock providers failed to start: {e}");
+        eprintln!("         (build the grid-mock-providers image first if needed)");
+        eprintln!("         provider inference baseline does not require mock providers");
+    }
+
+    eprintln!("env up: clusters and certs ready");
     Ok(())
 }
 
@@ -101,34 +116,65 @@ fn env_status(config: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let cfg = EnvConfig::from_file(config)?;
     let mut all_ok = true;
 
+    all_ok = report_cluster_status(&cfg, all_ok);
+    all_ok = report_provider_status(all_ok);
+    all_ok = report_cert_status(all_ok);
+
+    let summary = if all_ok {
+        "all components healthy"
+    } else {
+        "some components not ready"
+    };
+    eprintln!("status: {summary}");
+    Ok(())
+}
+
+/// Report cluster and deployment status.
+fn report_cluster_status(cfg: &EnvConfig, mut all_ok: bool) -> bool {
     eprintln!("clusters:");
     for name in &cfg.clusters.names {
         let ok = kind::is_cluster_running(name);
         all_ok = all_ok && ok;
-        let label = status_label(ok);
-        eprintln!("  grid-{name}: {label}");
+        eprintln!("  grid-{name}: {}", status_label(ok));
+        if ok
+            && let Some(def) = cfg.clusters.definitions.get(name)
+            && def.role == config::ClusterRole::Provider
+        {
+            for model in &def.models {
+                let deploy_ok = kind::is_model_deployment_ready(name, model);
+                all_ok = all_ok && deploy_ok;
+                let deploy = kind::deployment_name(model);
+                eprintln!("    {deploy}: {}", status_label(deploy_ok));
+            }
+        }
     }
+    all_ok
+}
 
+/// Report mock provider container status.
+fn report_provider_status(mut all_ok: bool) -> bool {
     eprintln!("providers:");
     for provider in &["openai", "anthropic", "bedrock", "vertex"] {
         let ok = providers::is_running(provider);
         all_ok = all_ok && ok;
-        let label = status_label(ok);
-        eprintln!("  mock-{provider}: {label}");
+        eprintln!("  mock-{provider}: {}", status_label(ok));
     }
+    all_ok
+}
 
+/// Report certificate status.
+fn report_cert_status(mut all_ok: bool) -> bool {
     eprintln!("certificates:");
-    let certs_ok = certs::certs_exist();
-    all_ok = all_ok && certs_ok;
-    eprintln!("  CA + site certs: {}", status_label(certs_ok));
+    let ok = certs::certs_exist();
+    all_ok = all_ok && ok;
+    eprintln!("  CA + site certs: {}", status_label(ok));
+    all_ok
+}
 
-    if all_ok {
-        eprintln!("status: all components healthy");
-    } else {
-        eprintln!("status: some components not ready");
-    }
-
-    Ok(())
+/// Verify provider inference-sim endpoints.
+fn env_verify_providers(config: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let cfg = EnvConfig::from_file(config)?;
+    verify::verify_providers(&cfg)
 }
 
 /// Format a status label.

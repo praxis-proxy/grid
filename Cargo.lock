@@ -2496,6 +2496,7 @@ dependencies = [
  "certs",
  "clap",
  "serde",
+ "serde_json",
  "thiserror",
  "toml",
 ]
