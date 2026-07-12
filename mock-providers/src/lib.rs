@@ -11,7 +11,7 @@ pub mod anthropic;
 pub mod bedrock;
 /// Shared HTTP response utilities.
 mod common;
-/// Mock `OpenAI` chat completions API.
+/// Mock `OpenAI` chat completions and Responses API.
 pub mod openai;
 /// Mock Google Vertex AI `generateContent` API.
 pub mod vertex;
