@@ -175,16 +175,30 @@ The overlay shape is compatible with the Praxis
 }
 ```
 
-**Future phases:**
-- OP-02: `InferenceProvider` status reconciliation
-- OP-03: Gateway annotation patching (planned) — not
-  yet implemented; see OP-03 in OPERATOR_STATUS.md
-- OP-04: Local validation harness reads operator-produced
-  `ConfigMap` via `xtask env deploy-consumer-gateway --overlay-config`
-- OP-05: Metrics-to-snapshot freshness updates set
-  `fresh: false` when metrics are stale
-- OP-06: SWIM/CRDT membership and capability
-  propagation populates cross-site candidates
+**OP-02 (implemented):** The `InferenceProvider`
+controller reconciles each `InferenceProvider`
+resource, sets `status.phase` (`Unavailable`,
+`Pending`, or `Available`), and populates
+`status.matchingSites` from `spec.siteSelector`.
+
+**OP-04 (implemented):** The `to_grid_route_value`
+bridge converts an operator-produced `RoutingOverlay`
+into a Praxis `grid_route` filter stanza.  The local
+validation harness reads the overlay `ConfigMap` via
+`xtask env deploy-consumer-gateway --overlay-config`.
+
+**Remaining / future phases:**
+- OP-03: Gateway annotation patching — **blocked**;
+  the target Kubernetes object type, API group/version,
+  and annotation consumer are not yet determined.
+- OP-05: Metrics-to-snapshot freshness — the `fresh`
+  field in each candidate is currently always `true`.
+  When the metrics loop (Prometheus client + vLLM
+  source) is implemented, stale candidates will set
+  `fresh: false` to lower their routing priority.
+- OP-06: SWIM/CRDT cross-site membership and
+  capability propagation populates remote-site
+  candidates once the gossip runtime is wired.
 
 ## 9. Workloads Consume Providers
 
