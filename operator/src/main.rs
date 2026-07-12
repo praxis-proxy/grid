@@ -56,10 +56,28 @@ async fn main() {
 // ---------------------------------------------------------------------------
 
 /// Run the [`GridNetwork`] controller.
+///
+/// In addition to watching `GridNetwork` resources, this controller watches
+/// `InferenceProvider` and `GridSite` resources.  Changes to either trigger
+/// reconciliation of the owning [`GridNetwork`] (identified by
+/// `spec.gridNetworkRef`), keeping routing overlay `ConfigMap`s consistent
+/// with provider availability and site membership.
 async fn run_network_controller(client: Client) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let api = Api::<GridNetwork>::all(client.clone());
+    let provider_api = Api::<InferenceProvider>::all(client.clone());
+    let site_api = Api::<GridSite>::all(client.clone());
 
     Controller::new(api, watcher::Config::default())
+        .watches(
+            provider_api,
+            watcher::Config::default(),
+            grid_network::network_refs_from_inference_provider,
+        )
+        .watches(
+            site_api,
+            watcher::Config::default(),
+            grid_network::network_refs_from_grid_site,
+        )
         .run(grid_network::reconcile, grid_network::error_policy, Arc::new(client))
         .for_each(|result| async {
             match result {

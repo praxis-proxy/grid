@@ -13,7 +13,7 @@ use k8s_openapi::api::core::v1::ConfigMap;
 use kube::{
     Client,
     api::{Api, ListParams, Patch, PatchParams},
-    runtime::controller::Action,
+    runtime::{controller::Action, reflector::ObjectRef},
 };
 use tokio::time::Duration;
 use tracing::info;
@@ -21,6 +21,7 @@ use tracing::info;
 use crate::{
     crd::{
         grid_network::{GatewayRef, GridNetwork, GridNetworkPhase, GridNetworkStatus},
+        grid_site::GridSite,
         inference_provider::InferenceProvider,
     },
     error::OperatorError,
@@ -36,6 +37,46 @@ const REQUEUE_INTERVAL: Duration = Duration::from_secs(300);
 
 /// Field manager name for server-side apply.
 const FIELD_MANAGER: &str = "grid-operator";
+
+// ---------------------------------------------------------------------------
+// Cross-resource watch mappers
+// ---------------------------------------------------------------------------
+
+/// Map an [`InferenceProvider`] change to the [`GridNetwork`] it belongs to.
+///
+/// Returns `Some(ObjectRef)` for the `GridNetwork` named by
+/// `spec.gridNetworkRef`, or `None` when the field is blank (which would
+/// indicate a malformed resource — we silently skip rather than panic or
+/// trigger spurious reconciles).
+///
+/// Used by the [`GridNetwork`] controller's cross-resource watch so that
+/// changes to any `InferenceProvider` trigger immediate overlay refresh of
+/// the owning `GridNetwork`.
+pub fn network_refs_from_inference_provider(ip: InferenceProvider) -> Option<ObjectRef<GridNetwork>> {
+    let name = ip.spec.grid_network_ref;
+    if name.trim().is_empty() {
+        None
+    } else {
+        Some(ObjectRef::new(&name))
+    }
+}
+
+/// Map a [`GridSite`] change to the [`GridNetwork`] it belongs to.
+///
+/// Returns `Some(ObjectRef)` for the `GridNetwork` named by
+/// `spec.gridNetworkRef`, or `None` when the field is blank.
+///
+/// Used by the [`GridNetwork`] controller's cross-resource watch so that
+/// changes to any `GridSite` (e.g. label updates affecting site selector
+/// matching) trigger immediate overlay refresh of the owning `GridNetwork`.
+pub fn network_refs_from_grid_site(site: GridSite) -> Option<ObjectRef<GridNetwork>> {
+    let name = site.spec.grid_network_ref;
+    if name.trim().is_empty() {
+        None
+    } else {
+        Some(ObjectRef::new(&name))
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Reconcile
@@ -157,11 +198,12 @@ async fn apply_site_secret(
 /// multi-gateway network each gateway's overlay identifies the correct local
 /// site.  A network with no `gatewayRefs` is a no-op.
 ///
-/// **Watch limitation:** [`InferenceProvider`] and [`GridSite`] changes do
-/// not currently trigger a [`GridNetwork`] reconcile.  Overlays are only
-/// refreshed when the [`GridNetwork`] itself changes.  Adding cross-resource
-/// watch/index from [`InferenceProvider`] and [`GridSite`] to their owning
-/// [`GridNetwork`] is future work.
+/// Changes to [`InferenceProvider`] and [`GridSite`] resources trigger a
+/// [`GridNetwork`] reconcile via cross-resource watches in the controller
+/// (see [`network_refs_from_inference_provider`] and
+/// [`network_refs_from_grid_site`]).  Overlays stay consistent with provider
+/// availability and site membership without waiting for the next periodic
+/// requeue.
 ///
 /// [`GridSite`]: crate::crd::grid_site::GridSite
 #[expect(
@@ -199,8 +241,8 @@ async fn list_all_inference_providers(client: &Client) -> Result<Vec<InferencePr
 /// List all [`GridSite`] resources cluster-wide.
 ///
 /// [`GridSite`]: crate::crd::grid_site::GridSite
-async fn list_all_grid_sites(client: &Client) -> Result<Vec<crate::crd::grid_site::GridSite>, OperatorError> {
-    let api: Api<crate::crd::grid_site::GridSite> = Api::all(client.clone());
+async fn list_all_grid_sites(client: &Client) -> Result<Vec<GridSite>, OperatorError> {
+    let api: Api<GridSite> = Api::all(client.clone());
     let list = api.list(&ListParams::default()).await?;
     Ok(list.items)
 }
@@ -309,4 +351,123 @@ fn network_site_name(network: &GridNetwork) -> String {
         .name
         .clone()
         .unwrap_or_else(|| "unknown-site".to_owned())
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_inference_provider(name: &str, network_ref: &str) -> InferenceProvider {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "kind": "InferenceProvider",
+            "metadata": { "name": name },
+            "spec": {
+                "gridNetworkRef": network_ref,
+                "providerKind": "self_hosted",
+                "backendKind": "local",
+                "endpoint": "http://localhost:8000",
+                "models": []
+            }
+        }))
+        .unwrap_or_else(|_| std::process::abort())
+    }
+
+    fn make_grid_site(name: &str, network_ref: &str) -> GridSite {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "kind": "GridSite",
+            "metadata": { "name": name },
+            "spec": { "gridNetworkRef": network_ref }
+        }))
+        .unwrap_or_else(|_| std::process::abort())
+    }
+
+    fn ref_name(refs: Option<ObjectRef<GridNetwork>>) -> String {
+        refs.unwrap_or_else(|| std::process::abort()).name
+    }
+
+    // -----------------------------------------------------------------------
+    // network_refs_from_inference_provider
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn inference_provider_maps_to_owning_grid_network() {
+        let ip = make_inference_provider("provider-a", "net-a");
+        let name = ref_name(network_refs_from_inference_provider(ip));
+        assert_eq!(name, "net-a", "ObjectRef name must match gridNetworkRef");
+    }
+
+    #[test]
+    fn inference_provider_blank_network_ref_returns_none() {
+        let ip = make_inference_provider("provider-blank", "");
+        let refs = network_refs_from_inference_provider(ip);
+        assert!(
+            refs.is_none(),
+            "blank gridNetworkRef must return None (no spurious reconcile)"
+        );
+    }
+
+    #[test]
+    fn inference_provider_whitespace_network_ref_returns_none() {
+        let mut ip = make_inference_provider("provider-ws", "net-a");
+        ip.spec.grid_network_ref = "   ".to_owned();
+        let refs = network_refs_from_inference_provider(ip);
+        assert!(refs.is_none(), "whitespace-only gridNetworkRef must return None");
+    }
+
+    #[test]
+    fn inference_provider_different_networks_map_correctly() {
+        let ip_a = make_inference_provider("prov-1", "net-x");
+        let ip_b = make_inference_provider("prov-2", "net-y");
+        let name_a = ref_name(network_refs_from_inference_provider(ip_a));
+        let name_b = ref_name(network_refs_from_inference_provider(ip_b));
+        assert_ne!(name_a, name_b, "different providers must map to different networks");
+        assert_eq!(name_a, "net-x", "first provider maps to net-x");
+        assert_eq!(name_b, "net-y", "second provider maps to net-y");
+    }
+
+    // -----------------------------------------------------------------------
+    // network_refs_from_grid_site
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn grid_site_maps_to_owning_grid_network() {
+        let site = make_grid_site("site-a", "net-a");
+        let name = ref_name(network_refs_from_grid_site(site));
+        assert_eq!(name, "net-a", "ObjectRef name must match gridNetworkRef");
+    }
+
+    #[test]
+    fn grid_site_blank_network_ref_returns_none() {
+        let site = make_grid_site("site-blank", "");
+        let refs = network_refs_from_grid_site(site);
+        assert!(
+            refs.is_none(),
+            "blank gridNetworkRef must return None (no spurious reconcile)"
+        );
+    }
+
+    #[test]
+    fn grid_site_whitespace_network_ref_returns_none() {
+        let mut site = make_grid_site("site-ws", "net-a");
+        site.spec.grid_network_ref = "  ".to_owned();
+        let refs = network_refs_from_grid_site(site);
+        assert!(refs.is_none(), "whitespace-only gridNetworkRef must return None");
+    }
+
+    #[test]
+    fn grid_site_different_networks_map_correctly() {
+        let site_a = make_grid_site("site-1", "net-x");
+        let site_b = make_grid_site("site-2", "net-y");
+        let name_a = ref_name(network_refs_from_grid_site(site_a));
+        let name_b = ref_name(network_refs_from_grid_site(site_b));
+        assert_ne!(name_a, name_b, "different sites must map to different networks");
+        assert_eq!(name_a, "net-x", "first site maps to net-x");
+        assert_eq!(name_b, "net-y", "second site maps to net-y");
+    }
 }
