@@ -10,11 +10,16 @@ configures Praxis to inject credentials transparently.
 |----------|--------|-----------|---------|
 | `bearer_token` | `Authorization: Bearer X` | Static from Secret | OpenAI, Mistral |
 | `api_key` | Custom (e.g. `x-api-key`) | Static from Secret | Anthropic |
-| `sigv4` | `Authorization: AWS4-HMAC-SHA256...` | Per-request compute | Bedrock |
-| `oauth2` | `Authorization: Bearer <token>` | Refresh on expiry | Vertex, Azure |
+| `sigv4` | `Authorization: AWS4-HMAC-SHA256...` | Per-request compute *(planned)* | Bedrock |
+| `oauth2` | `Authorization: Bearer <token>` | Refresh on expiry *(planned)* | Vertex, Azure |
 | `mtls_only` | None (cert-based) | Grid cert lifecycle | Grid-internal |
 | `service_account` | `Authorization: Bearer <SA>` | K8s SA token | In-cluster |
 | `custom` | User-configured | Static from Secret | Fallback |
+
+> **Implementation note:** Static strategies (`bearer_token`, `api_key`, `custom`,
+> `service_account`) are current.  `sigv4` per-request signature computation and
+> `oauth2` token refresh are planned and not yet wired into the operator or
+> Praxis filter pipeline.
 
 ### Manual Override
 
@@ -29,11 +34,12 @@ For static strategies (`bearer_token`, `api_key`,
 Kubernetes Secret at config generation time.
 
 For dynamic strategies (`sigv4`, `oauth2`), the Grid
-Operator manages the credential lifecycle:
+Operator will manage the credential lifecycle once
+these are implemented (currently planned):
 - `sigv4`: SigV4 signature computed per-request by
-  Praxis using AWS credentials from a Secret
+  Praxis using AWS credentials from a Secret *(planned)*
 - `oauth2`: Token refreshed before expiry by the
-  operator, cached, and injected by Praxis
+  operator, cached, and injected by Praxis *(planned)*
 
 ## Access Policy
 
@@ -124,6 +130,26 @@ GET /v1/grid/providers
 
 Returns all accessible providers filtered by the
 workload's identity and access policies.
+
+## Grid mTLS Identity
+
+Grid-generated site certificates set
+`OrganizationName = "ai-grid"` (see
+`certs::DEFAULT_ORGANIZATION`).  The Praxis
+`grid_ingress_trust` filter matches incoming peer
+certificates on `organization: ai-grid` by default.
+
+Any certificate signed by the Grid CA but with a
+different organization value will pass TLS handshake
+and fail at the filter, producing an HTTP 403.  This
+is the intended fail-closed behaviour for cert-based
+bootstrap authentication.
+
+Production deployments should switch to cert-digest
+pinning (`cert_digest` field on `trusted_peers`) once
+cert identities are stable, as organization matching
+is weaker — any cert signed by a trusted CA with the
+correct `O=` value is accepted.
 
 ## Separation of Concerns
 

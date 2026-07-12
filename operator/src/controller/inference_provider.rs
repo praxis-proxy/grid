@@ -72,7 +72,7 @@ use crate::{
 // Constants
 // ---------------------------------------------------------------------------
 
-/// Requeue interval after a successful reconciliation.
+/// Requeue interval after a successful reconciliation when no `healthCheck.interval` is set.
 const REQUEUE_INTERVAL: Duration = Duration::from_secs(300);
 
 /// Field manager name for server-side apply.
@@ -109,7 +109,7 @@ pub async fn reconcile(provider: Arc<InferenceProvider>, client: Arc<Client>) ->
     let generation = provider.metadata.generation.unwrap_or(0);
     update_status(&provider, &client, phase, matching_sites, generation).await?;
 
-    Ok(Action::requeue(REQUEUE_INTERVAL))
+    Ok(Action::requeue(requeue_interval_for_provider(&provider.spec)))
 }
 
 /// Error policy for the [`InferenceProvider`] controller.
@@ -306,6 +306,28 @@ fn parse_duration_str(s: &str) -> Option<Duration> {
     } else {
         None
     }
+}
+
+/// Derive the reconcile requeue interval for an [`InferenceProvider`].
+///
+/// When `spec.healthCheck.interval` is configured and parseable, the
+/// provider is requeued after that duration so that health probes run
+/// at approximately the requested cadence.  Falls back to
+/// [`REQUEUE_INTERVAL`] (300s) when the field is absent or unparseable.
+///
+/// The interval controls **reconcile frequency**, not a separate timer
+/// loop.  The probe runs at the start of each reconcile, so the actual
+/// check cadence equals the requeue interval plus reconcile processing
+/// time.  `healthCheck.timeout` does not affect the requeue interval;
+/// the two fields are orthogonal.
+///
+/// [`InferenceProvider`]: crate::crd::inference_provider::InferenceProvider
+pub(crate) fn requeue_interval_for_provider(spec: &InferenceProviderSpec) -> Duration {
+    spec.health_check
+        .as_ref()
+        .and_then(|hc| hc.interval.as_deref())
+        .and_then(parse_duration_str)
+        .unwrap_or(REQUEUE_INTERVAL)
 }
 
 /// Probe an `http://` or `https://` endpoint and return a [`ProbeOutcome`].
@@ -939,6 +961,16 @@ mod tests {
     }
 
     #[test]
+    fn http_199_yields_degraded() {
+        // 199 is below the 2xx range and must be treated as Degraded.
+        assert_eq!(
+            ProbeOutcome::from_http_status(199),
+            ProbeOutcome::Degraded,
+            "HTTP 199 is below 2xx range and must yield Degraded"
+        );
+    }
+
+    #[test]
     fn static_config_failure_precedes_probe_result() {
         // Static config validation short-circuits before phase_from_probe is
         // called.  When validate_provider_config returns Some(_), the caller
@@ -1095,6 +1127,29 @@ mod tests {
         assert!(matching.is_empty(), "missing selector key on site must not match");
     }
 
+    #[test]
+    fn empty_selector_with_no_sites_returns_empty() {
+        let provider: InferenceProvider = serde_json::from_value(serde_json::json!({
+            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "kind": "InferenceProvider",
+            "metadata": {"name": "p"},
+            "spec": {
+                "gridNetworkRef": "net",
+                "backendKind": "local",
+                "endpoint": "http://vllm:8000",
+                "providerKind": "self_hosted",
+                "models": []
+            }
+        }))
+        .unwrap_or_else(|_| std::process::abort());
+
+        let matching = sites_matching_selector(&provider, &[]);
+        assert!(
+            matching.is_empty(),
+            "passing an empty sites slice must return an empty result"
+        );
+    }
+
     // Item 13: update_status and reconcile require a live Kubernetes client.
     // They are covered at the integration level.  The pure decision logic
     // (validate_provider_config, phase_from_matching, sites_matching_selector)
@@ -1182,6 +1237,128 @@ mod tests {
             parse_probe_timeout(Some(&hc)),
             DEFAULT_PROBE_TIMEOUT,
             "unparseable timeout must fall back to default"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // requeue_interval_for_provider — pure interval derivation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn requeue_uses_default_when_no_health_check() {
+        let spec = make_spec("http://vllm:8000", None, None);
+        assert_eq!(
+            requeue_interval_for_provider(&spec),
+            REQUEUE_INTERVAL,
+            "absent health_check must yield the default requeue interval (300s)"
+        );
+    }
+
+    #[test]
+    fn requeue_uses_default_when_interval_field_absent() {
+        let spec = make_spec_with_health_check("http://vllm:8000", None, None);
+        assert_eq!(
+            requeue_interval_for_provider(&spec),
+            REQUEUE_INTERVAL,
+            "health_check without interval must yield default requeue interval"
+        );
+    }
+
+    #[test]
+    fn requeue_uses_configured_seconds_interval() {
+        let hc = HealthCheckConfig {
+            interval: Some("30s".to_owned()),
+            path: None,
+            timeout: None,
+        };
+        let spec = make_spec_with_health_check_config("http://vllm:8000", Some(hc));
+        assert_eq!(
+            requeue_interval_for_provider(&spec),
+            Duration::from_secs(30),
+            "healthCheck.interval \"30s\" must requeue after 30 seconds"
+        );
+    }
+
+    #[test]
+    fn requeue_uses_configured_milliseconds_interval() {
+        let hc = HealthCheckConfig {
+            interval: Some("500ms".to_owned()),
+            path: None,
+            timeout: None,
+        };
+        let spec = make_spec_with_health_check_config("http://vllm:8000", Some(hc));
+        assert_eq!(
+            requeue_interval_for_provider(&spec),
+            Duration::from_millis(500),
+            "healthCheck.interval \"500ms\" must requeue after 500ms"
+        );
+    }
+
+    #[test]
+    fn requeue_uses_default_for_invalid_interval_format() {
+        let hc = HealthCheckConfig {
+            interval: Some("5m".to_owned()),
+            path: None,
+            timeout: None,
+        };
+        let spec = make_spec_with_health_check_config("http://vllm:8000", Some(hc));
+        assert_eq!(
+            requeue_interval_for_provider(&spec),
+            REQUEUE_INTERVAL,
+            "unparseable interval (\"5m\") must fall back to default 300s"
+        );
+    }
+
+    #[test]
+    fn requeue_uses_default_for_bare_number_interval() {
+        let hc = HealthCheckConfig {
+            interval: Some("30".to_owned()),
+            path: None,
+            timeout: None,
+        };
+        let spec = make_spec_with_health_check_config("http://vllm:8000", Some(hc));
+        assert_eq!(
+            requeue_interval_for_provider(&spec),
+            REQUEUE_INTERVAL,
+            "bare number without suffix (\"30\") must fall back to default"
+        );
+    }
+
+    #[test]
+    fn requeue_interval_and_probe_timeout_are_independent() {
+        // interval controls reconcile cadence; timeout controls HTTP probe wait.
+        // Changing one must not affect the other.
+        let hc = HealthCheckConfig {
+            interval: Some("60s".to_owned()),
+            path: Some("/health".to_owned()),
+            timeout: Some("3s".to_owned()),
+        };
+        let spec = make_spec_with_health_check_config("http://vllm:8000", Some(hc));
+        assert_eq!(
+            requeue_interval_for_provider(&spec),
+            Duration::from_secs(60),
+            "requeue interval must use the interval field"
+        );
+        assert_eq!(
+            parse_probe_timeout(spec.health_check.as_ref()),
+            Duration::from_secs(3),
+            "probe timeout must use the timeout field"
+        );
+    }
+
+    #[test]
+    fn requeue_interval_does_not_use_timeout_field() {
+        // A spec with timeout but no interval must use the default requeue.
+        let hc = HealthCheckConfig {
+            interval: None,
+            path: None,
+            timeout: Some("10s".to_owned()),
+        };
+        let spec = make_spec_with_health_check_config("http://vllm:8000", Some(hc));
+        assert_eq!(
+            requeue_interval_for_provider(&spec),
+            REQUEUE_INTERVAL,
+            "timeout field must not affect the requeue interval"
         );
     }
 
@@ -1569,5 +1746,31 @@ mod tests {
             }
         }))
         .unwrap_or_else(|_| std::process::abort())
+    }
+
+    /// Build a spec with a fully specified [`HealthCheckConfig`].
+    ///
+    /// Used by interval tests that need to control all three `HealthCheckConfig`
+    /// fields independently without going through the JSON shorthand helpers.
+    fn make_spec_with_health_check_config(
+        endpoint: &str,
+        health_check: Option<HealthCheckConfig>,
+    ) -> InferenceProviderSpec {
+        InferenceProviderSpec {
+            grid_network_ref: "net".to_owned(),
+            access_policy: crate::crd::auth::AccessPolicy::default(),
+            auth: None,
+            backend_kind: "local".to_owned(),
+            cost: None,
+            endpoint: endpoint.to_owned(),
+            health_check,
+            models: vec![crate::crd::inference_provider::ModelInfo {
+                name: "model-a".to_owned(),
+                capabilities: Vec::new(),
+                context_window: None,
+            }],
+            provider_kind: "self_hosted".to_owned(),
+            site_selector: crate::crd::auth::SelectorConfig::default(),
+        }
     }
 }

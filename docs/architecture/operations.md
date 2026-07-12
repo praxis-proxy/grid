@@ -48,6 +48,14 @@ The GridNetwork controller:
 5. Starts the SWIM runtime with seed peers
 6. Sets `status.phase: Initializing`
 
+**Phase progression note:** `GridNetwork Active` and
+`Degraded` phases are not yet implemented.  The
+controller emits `Initializing` once TLS secrets are
+configured; `Active` progression is deferred until
+SWIM mesh integration (OP-06).  The `connected_sites`
+status field is hardcoded to `0` until OP-06.  Do not
+use `phase: Active` as a readiness signal.
+
 ## 3. Sites Discover Each Other
 
 When the SWIM runtime contacts a seed peer:
@@ -174,6 +182,18 @@ The overlay shape is compatible with the Praxis
   ]
 }
 ```
+
+**Production cluster naming:** `candidate.cluster`
+equals the `InferenceProvider` metadata name (the
+Kubernetes resource name, not its endpoint).  The
+Praxis `load_balancer` cluster serving that provider
+must use the same name.
+
+Local development with `xtask env` substitutes
+`gateway-{site}` as the cluster name and generates
+matching `load_balancer` entries — see
+`xtask/src/env/operator_overlay.rs`.  The xtask path
+does not validate the production naming contract.
 
 **Future phases:**
 - OP-02: `InferenceProvider` status reconciliation

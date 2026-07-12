@@ -1,10 +1,70 @@
 # Backend Scoring Model
 
-The grid scoring engine ranks all healthy backends
-for each request using a weighted multi-signal formula.
-The highest-scoring backend is selected.
+## Current Scoring (OP-01)
 
-## Six Signals
+Scoring is performed by the Praxis `grid_route` filter
+reading a static candidate list rendered by the Grid
+Operator. No per-request metrics are used.
+
+**Two signals are active:**
+
+| Signal | Effect |
+|--------|--------|
+| Stale candidate (`fresh: false`) | −100 penalty |
+| Candidate site equals `local_site` | +10 bonus |
+
+The highest-scored candidate wins. Equal scores break
+by config order (first candidate wins). A stale
+candidate can still win if it is the only match for
+a model, or if it is on the local site and all remote
+candidates are also stale.
+
+### Freshness
+
+The operator sets `fresh` per `InferenceProvider`
+status phase when rendering the overlay:
+
+| Phase | Included in overlay | `fresh` |
+|-------|---------------------|---------|
+| `Available` | yes | `true` |
+| `Pending` | yes | `true` |
+| absent status | yes | `true` |
+| `Degraded` | yes | **`false`** |
+| `Unavailable` | **no** | — |
+
+### Locality ordering
+
+The operator sorts overlay candidates by `backendKind`
+so that higher-priority backends appear first:
+
+| `backendKind` | Locality score |
+|---------------|---------------|
+| `local` | 1.0 |
+| `remote` | 0.5 (no region context) |
+| `cloud_managed` | 0.2 |
+| `api_provider` | 0.1 |
+
+Because Praxis `grid_route` breaks ties by config
+order, a locally-ordered candidate list naturally
+prefers local backends without requiring per-request
+scoring logic.
+
+## Unhealthy Backend Exclusion
+
+`InferenceProvider` resources with `phase: Unavailable`
+are excluded from the overlay entirely.  The Praxis
+circuit breaker independently excludes backends that
+have exceeded their failure threshold.
+
+---
+
+## Target Design (OP-05+): Six-Signal Weighted Scoring
+
+The sections below describe the intended scoring model
+once CRDT-propagated metrics are wired into the
+overlay pipeline.  **None of this is active today.**
+
+### Six Signals (planned)
 
 | Signal | Default Weight | Source | CRDT Type |
 |--------|---------------|--------|-----------|
@@ -15,7 +75,7 @@ The highest-scoring backend is selected.
 | P99 latency | 2.0 | local measurement | — |
 | Cost per token | 1.0 | config (static) | — |
 
-## Scoring Formula
+### Scoring Formula (planned)
 
 ```text
 score(backend) =
@@ -27,13 +87,12 @@ score(backend) =
   + w_cost  × (1 - cost_per_token / max_cost)
 ```
 
-All signals are normalized to 0.0-1.0 where higher is
-better. Backends with no metrics use a default score
-of 0.5 for missing signals.
+All signals are normalized to 0.0–1.0 where higher is
+better. Backends with no metrics default to 0.5.
 
-## Locality Scoring
+### Locality Scoring (planned)
 
-Locality is region-aware:
+Region-aware locality table:
 
 | Backend Type | Same Region | Cross Region |
 |-------------|-------------|--------------|
@@ -48,26 +107,20 @@ Locality is a scoring signal, not a hard constraint.
 A remote cluster with dramatically better metrics can
 outscore a congested local cluster.
 
-## Unhealthy Backend Exclusion
+### Metric Staleness (planned)
 
-Backends with `healthy: false` in their metrics are
-excluded from scoring entirely. The circuit breaker
-independently excludes backends that have exceeded
-the failure threshold.
+When CRDT-propagated metrics have not been updated
+within a threshold (assuming 5 s SWIM probe interval):
 
-## Metric Staleness
+- **3 gossip intervals** (15 s): staleness penalty
+  applied to the site's scores.
+- **10 gossip intervals** (50 s): site treated as
+  unknown capacity (default 0.5 for all signals).
 
-When metrics propagated via CRDT have not been updated
-within a threshold:
-- **3 gossip intervals** (15s): staleness penalty
-  applied to the site's scores
-- **10 gossip intervals** (50s): site treated as
-  unknown capacity (default 0.5 for all signals)
+### Weight Customization (planned)
 
-## Weight Customization
-
-Weights are configured per `GridNetwork` and passed
-to the Praxis overlay `ConfigMap`:
+Weights will be configured per `GridNetwork` and
+passed to the Praxis overlay `ConfigMap`:
 
 ```yaml
 scoring:
@@ -80,26 +133,14 @@ scoring:
     cost: 1.0
 ```
 
-## Where Scoring Runs
+### Implementation path
 
-The scoring engine lives in the `scoring` crate.
+**OP-05 (planned):** The metrics-to-snapshot freshness
+loop will fold CRDT-propagated metrics (queue depth,
+KV cache, latency) into the overlay, enabling richer
+backend selection in `grid_route`.
 
-**Current (OP-01):** The Grid Operator generates a
-`grid_route`-compatible routing overlay `ConfigMap`
-with static candidate lists (no per-request metrics).
-Praxis reads the `grid-config.json` key and selects
-backends from the candidates list.
-
-**Future/planned (`grid_scorer` filter):** A
-per-request scoring filter that reads the overlay
-config and applies the six-signal scoring formula is
-planned but not yet implemented in the Praxis PR
-stack. The `grid_scorer` references in this doc
-describe the target state. The current Praxis
-integration uses `grid_route` with static candidates.
-
-**OP-05 (planned):** When the metrics-to-snapshot
-freshness loop is implemented, CRDT-propagated
-metrics (queue depth, KV cache, latency) will be
-folded into the overlay, enabling richer backend
-selection in `grid_route`.
+**`grid_scorer` filter (planned):** A per-request
+scoring filter in Praxis applying the full weighted
+formula is a follow-on to OP-05 and is not yet
+implemented in the Praxis PR stack.

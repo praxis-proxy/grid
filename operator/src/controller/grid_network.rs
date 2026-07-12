@@ -226,6 +226,20 @@ async fn reconcile_routing_overlay(network: &GridNetwork, client: &Client) -> Re
         let local_site = gw_ref.local_site_name.as_deref().unwrap_or(network_name);
         let overlay = routing_overlay::render_routing_overlay(network, &sites, &providers, local_site)
             .map_err(OperatorError::OverlayRender)?;
+        // Praxis grid_route rejects an empty candidates list at config load
+        // time, which would cause a hot-reload error rather than a clean
+        // "no routes" state.  Skip the apply and warn so the previous
+        // (non-empty) ConfigMap remains in place until a provider becomes
+        // available again.
+        if overlay.candidates.is_empty() {
+            tracing::warn!(
+                network = network_name,
+                gateway = %gw_ref.name,
+                "routing overlay has no candidates; skipping ConfigMap apply \
+                 to prevent invalid Praxis grid_route config"
+            );
+            continue;
+        }
         apply_overlay_for_gateway(&overlay, network, gw_ref, client).await?;
     }
     Ok(())
