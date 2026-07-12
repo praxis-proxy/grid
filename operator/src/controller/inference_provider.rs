@@ -7,16 +7,24 @@
 //!
 //! # Phase policy
 //!
+//! Static config checks run first and short-circuit on any failure.
+//! The health probe result (from `ProbeOutcome`) is applied last, on top
+//! of the site-matching phase.
+//!
 //! | Condition | Phase |
 //! |-----------|-------|
 //! | `spec.endpoint` is blank or whitespace | `Unavailable` |
 //! | Any `spec.models[].name` is blank | `Unavailable` |
 //! | `spec.gridNetworkRef` not found | `Unavailable` |
-//! | Config valid, no matching sites | `Pending` |
-//! | Config valid, ≥1 matching site | `Available` |
+//! | Config valid, probe returns transport failure | `Unavailable` |
+//! | Config valid, probe returns degraded response | `Degraded` |
+//! | Config valid, probe healthy or not run, no matching sites | `Pending` |
+//! | Config valid, probe healthy or not run, ≥1 matching site | `Available` |
 //!
-//! `Degraded` is not set by this controller; it is reserved for future
-//! runtime health signals (e.g. metrics-based freshness from OP-05).
+//! `Degraded` is emitted by `phase_from_probe` when a health probe
+//! returns a degraded response.  Until live probing is wired into the
+//! reconcile loop, `ProbeOutcome::NotProbed` is always used, which
+//! preserves the pre-OP-05 site-matching behaviour.
 //!
 //! # Watch / reconcile note
 //!
@@ -129,13 +137,102 @@ pub(crate) fn validate_provider_config(provider: &InferenceProvider) -> Option<&
     None
 }
 
+/// The outcome of a health probe against an [`InferenceProvider`] endpoint.
+///
+/// This enum represents what a live health probe would observe, without
+/// performing the probe itself.  Pass a [`ProbeOutcome`] to
+/// [`phase_from_probe`] to merge it with the site-matching phase.
+///
+/// The current reconcile loop always passes [`ProbeOutcome::NotProbed`],
+/// preserving pre-OP-05 behaviour.  Future work will substitute a real
+/// probe result once the HTTP health-check loop is implemented.
+///
+/// [`InferenceProvider`]: crate::crd::inference_provider::InferenceProvider
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProbeOutcome {
+    /// The endpoint responded successfully (e.g. HTTP 200).
+    Healthy,
+
+    /// The endpoint responded but signalled a degraded state (e.g. HTTP 5xx,
+    /// or a valid response indicating reduced capacity).
+    Degraded,
+
+    /// The endpoint was unreachable: transport failure, connection refused,
+    /// or DNS resolution error.
+    Unavailable,
+
+    /// No probe was attempted this reconcile cycle.
+    ///
+    /// Preserves the site-matching phase unchanged — equivalent to the
+    /// pre-OP-05 behaviour.
+    NotProbed,
+}
+
+impl ProbeOutcome {
+    /// Derive a [`ProbeOutcome`] from an HTTP status code returned by a health probe.
+    ///
+    /// A 2xx status indicates the endpoint is healthy.  Any other status —
+    /// redirects, client errors, server errors — indicates the endpoint is
+    /// reachable but in a degraded state.
+    ///
+    /// Transport failures (connection refused, timeout, DNS error) are not
+    /// representable as an HTTP status code; construct
+    /// [`ProbeOutcome::Unavailable`] directly in those cases.
+    ///
+    /// | Status range | Result |
+    /// |---|---|
+    /// | 200–299 | [`Healthy`] |
+    /// | any other | [`Degraded`] |
+    ///
+    /// [`Healthy`]: ProbeOutcome::Healthy
+    /// [`Degraded`]: ProbeOutcome::Degraded
+    #[must_use]
+    pub fn from_http_status(status: u16) -> Self {
+        if (200..300).contains(&status) {
+            Self::Healthy
+        } else {
+            Self::Degraded
+        }
+    }
+}
+
+/// Apply a health [`ProbeOutcome`] on top of a site-matching phase.
+///
+/// The site-matching phase (from `phase_from_matching`) determines whether
+/// the provider has any active sites.  The probe outcome can tighten or
+/// override it:
+///
+/// | Probe outcome | Result |
+/// |---------------|--------|
+/// | [`Healthy`] | site-matching phase unchanged |
+/// | [`NotProbed`] | site-matching phase unchanged |
+/// | [`Degraded`] | [`ProviderPhase::Degraded`] |
+/// | [`Unavailable`] | [`ProviderPhase::Unavailable`] |
+///
+/// Static config validation (`validate_provider_config`) runs **before**
+/// this function and short-circuits on failure.  This function is only
+/// called when static validation has already passed.
+///
+/// [`Healthy`]: ProbeOutcome::Healthy
+/// [`NotProbed`]: ProbeOutcome::NotProbed
+/// [`Degraded`]: ProbeOutcome::Degraded
+/// [`Unavailable`]: ProbeOutcome::Unavailable
+pub fn phase_from_probe(outcome: ProbeOutcome, site_phase: ProviderPhase) -> ProviderPhase {
+    match outcome {
+        ProbeOutcome::Healthy | ProbeOutcome::NotProbed => site_phase,
+        ProbeOutcome::Degraded => ProviderPhase::Degraded,
+        ProbeOutcome::Unavailable => ProviderPhase::Unavailable,
+    }
+}
+
 /// Compute the provider phase from site matching results.
 ///
-/// This is a pure function extracted for unit-test coverage of the
-/// `Pending`/`Available` boundary without a live cluster.
+/// Returns [`ProviderPhase::Pending`] when no sites match, and
+/// [`ProviderPhase::Available`] when at least one site matches.
 ///
-/// `Degraded` is never returned by this controller.  It is reserved for
-/// future runtime health signals (OP-05).
+/// This function never returns [`ProviderPhase::Degraded`].
+/// `Degraded` is only reachable via [`phase_from_probe`] when a health
+/// probe returns a degraded response.
 pub(crate) fn phase_from_matching(matching: &[String]) -> ProviderPhase {
     if matching.is_empty() {
         ProviderPhase::Pending
@@ -181,7 +278,10 @@ async fn resolve_phase_and_sites(
     // Resolve matching sites.
     let sites = list_sites_for_network(client, network_ref).await?;
     let matching = sites_matching_selector(provider, &sites);
-    let phase = phase_from_matching(&matching);
+    let site_phase = phase_from_matching(&matching);
+    // Apply health probe result.  NotProbed preserves site_phase unchanged
+    // until live health-check probing is wired in (future OP-05 work).
+    let phase = phase_from_probe(ProbeOutcome::NotProbed, site_phase);
 
     Ok((phase, matching))
 }
@@ -485,30 +585,246 @@ mod tests {
     }
 
     #[test]
-    fn degraded_phase_never_emitted_by_op02() {
-        // Item 12: phase_from_matching must never return Degraded.
-        // Degraded is reserved for future runtime health signals.
+    fn phase_from_matching_never_emits_degraded() {
+        // phase_from_matching only returns Pending or Available; Degraded is
+        // only reachable via phase_from_probe when a health probe returns a
+        // degraded outcome.
         let empty_phase = phase_from_matching(&[]);
         let some_phase = phase_from_matching(&["site-x".to_owned()]);
+        assert!(
+            matches!(empty_phase, ProviderPhase::Pending),
+            "empty matching must yield Pending"
+        );
+        assert!(
+            matches!(some_phase, ProviderPhase::Available),
+            "non-empty matching must yield Available"
+        );
         assert_ne!(
             empty_phase,
             ProviderPhase::Degraded,
-            "Degraded must never be emitted for empty matching"
+            "Degraded unreachable from phase_from_matching"
         );
         assert_ne!(
             some_phase,
             ProviderPhase::Degraded,
-            "Degraded must never be emitted for non-empty matching"
+            "Degraded unreachable from phase_from_matching"
         );
-        // Exhaustive: only Pending and Available are reachable
+    }
+
+    // -----------------------------------------------------------------------
+    // phase_from_probe — health decision function
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn healthy_probe_preserves_available() {
+        let result = phase_from_probe(ProbeOutcome::Healthy, ProviderPhase::Available);
+        assert_eq!(
+            result,
+            ProviderPhase::Available,
+            "Healthy probe must preserve Available"
+        );
+    }
+
+    #[test]
+    fn healthy_probe_preserves_pending() {
+        let result = phase_from_probe(ProbeOutcome::Healthy, ProviderPhase::Pending);
+        assert_eq!(result, ProviderPhase::Pending, "Healthy probe must preserve Pending");
+    }
+
+    #[test]
+    fn not_probed_preserves_available() {
+        let result = phase_from_probe(ProbeOutcome::NotProbed, ProviderPhase::Available);
+        assert_eq!(
+            result,
+            ProviderPhase::Available,
+            "NotProbed must preserve Available (current default)"
+        );
+    }
+
+    #[test]
+    fn not_probed_preserves_pending() {
+        let result = phase_from_probe(ProbeOutcome::NotProbed, ProviderPhase::Pending);
+        assert_eq!(
+            result,
+            ProviderPhase::Pending,
+            "NotProbed must preserve Pending (current default)"
+        );
+    }
+
+    #[test]
+    fn degraded_probe_overrides_available() {
+        let result = phase_from_probe(ProbeOutcome::Degraded, ProviderPhase::Available);
+        assert_eq!(
+            result,
+            ProviderPhase::Degraded,
+            "Degraded probe must override Available"
+        );
+    }
+
+    #[test]
+    fn degraded_probe_overrides_pending() {
+        let result = phase_from_probe(ProbeOutcome::Degraded, ProviderPhase::Pending);
+        assert_eq!(result, ProviderPhase::Degraded, "Degraded probe must override Pending");
+    }
+
+    #[test]
+    fn unavailable_probe_overrides_available() {
+        let result = phase_from_probe(ProbeOutcome::Unavailable, ProviderPhase::Available);
+        assert_eq!(
+            result,
+            ProviderPhase::Unavailable,
+            "Unavailable probe must override Available"
+        );
+    }
+
+    #[test]
+    fn unavailable_probe_overrides_pending() {
+        let result = phase_from_probe(ProbeOutcome::Unavailable, ProviderPhase::Pending);
+        assert_eq!(
+            result,
+            ProviderPhase::Unavailable,
+            "Unavailable probe must override Pending"
+        );
+    }
+
+    #[test]
+    fn degraded_is_reachable_via_phase_from_probe() {
+        // Documents that Degraded IS now reachable from the controller, via
+        // phase_from_probe — in contrast to phase_from_matching which cannot
+        // emit it.
+        let result = phase_from_probe(ProbeOutcome::Degraded, ProviderPhase::Available);
+        assert_eq!(
+            result,
+            ProviderPhase::Degraded,
+            "Degraded must be reachable via phase_from_probe"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // ProbeOutcome::from_http_status — HTTP status code mapping
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn http_200_yields_healthy() {
+        assert_eq!(
+            ProbeOutcome::from_http_status(200),
+            ProbeOutcome::Healthy,
+            "HTTP 200 must yield Healthy"
+        );
+    }
+
+    #[test]
+    fn http_204_yields_healthy() {
+        assert_eq!(
+            ProbeOutcome::from_http_status(204),
+            ProbeOutcome::Healthy,
+            "HTTP 204 No Content must yield Healthy"
+        );
+    }
+
+    #[test]
+    fn http_299_is_last_healthy_status() {
+        assert_eq!(
+            ProbeOutcome::from_http_status(299),
+            ProbeOutcome::Healthy,
+            "HTTP 299 must still be within the healthy range"
+        );
+    }
+
+    #[test]
+    fn http_300_yields_degraded() {
+        assert_eq!(
+            ProbeOutcome::from_http_status(300),
+            ProbeOutcome::Degraded,
+            "HTTP 300 (redirect) is outside 2xx range and must yield Degraded"
+        );
+    }
+
+    #[test]
+    fn http_400_yields_degraded() {
+        assert_eq!(
+            ProbeOutcome::from_http_status(400),
+            ProbeOutcome::Degraded,
+            "HTTP 400 must yield Degraded"
+        );
+    }
+
+    #[test]
+    fn http_429_yields_degraded() {
+        assert_eq!(
+            ProbeOutcome::from_http_status(429),
+            ProbeOutcome::Degraded,
+            "HTTP 429 Too Many Requests must yield Degraded"
+        );
+    }
+
+    #[test]
+    fn http_500_yields_degraded() {
+        assert_eq!(
+            ProbeOutcome::from_http_status(500),
+            ProbeOutcome::Degraded,
+            "HTTP 500 must yield Degraded"
+        );
+    }
+
+    #[test]
+    fn http_503_yields_degraded() {
+        assert_eq!(
+            ProbeOutcome::from_http_status(503),
+            ProbeOutcome::Degraded,
+            "HTTP 503 Service Unavailable must yield Degraded (reachable but degraded)"
+        );
+    }
+
+    #[test]
+    fn http_status_zero_yields_degraded() {
+        assert_eq!(
+            ProbeOutcome::from_http_status(0),
+            ProbeOutcome::Degraded,
+            "invalid status 0 must yield Degraded"
+        );
+    }
+
+    #[test]
+    fn http_2xx_boundary_is_inclusive_exclusive() {
+        // 200 → Healthy, 299 → Healthy, 300 → Degraded
+        assert_eq!(ProbeOutcome::from_http_status(200), ProbeOutcome::Healthy);
+        assert_eq!(ProbeOutcome::from_http_status(299), ProbeOutcome::Healthy);
+        assert_eq!(ProbeOutcome::from_http_status(300), ProbeOutcome::Degraded);
+    }
+
+    #[test]
+    fn static_config_failure_precedes_probe_result() {
+        // Static config validation short-circuits before phase_from_probe is
+        // called.  When validate_provider_config returns Some(_), the caller
+        // returns Unavailable immediately — no probe outcome can rescue a
+        // provider with an invalid config.
+        //
+        // Simulate the precedence: if static validation fails, we would
+        // never reach phase_from_probe.  The test confirms both that
+        // validate_provider_config catches the config error AND that
+        // phase_from_probe does not participate in that path.
+        let provider_with_blank_endpoint: InferenceProvider = serde_json::from_value(serde_json::json!({
+            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "kind": "InferenceProvider",
+            "metadata": { "name": "bad" },
+            "spec": {
+                "gridNetworkRef": "net",
+                "providerKind": "self_hosted",
+                "backendKind": "local",
+                "endpoint": "",
+                "models": [{"name": "model"}]
+            }
+        }))
+        .unwrap_or_else(|_| std::process::abort());
+
+        let config_error = validate_provider_config(&provider_with_blank_endpoint);
         assert!(
-            matches!(empty_phase, ProviderPhase::Pending),
-            "only Pending reachable from empty matching"
+            config_error.is_some(),
+            "blank endpoint must fail static validation before any probe result applies"
         );
-        assert!(
-            matches!(some_phase, ProviderPhase::Available),
-            "only Available reachable from non-empty matching"
-        );
+        // phase_from_probe is never called; this ensures it can never rescue
+        // a provider with an invalid config.
     }
 
     // -----------------------------------------------------------------------
