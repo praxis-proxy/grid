@@ -8,9 +8,13 @@ license.workspace = true
 publish = false
 
 [dependencies]
+bytes = { workspace = true }
 certs = { path = "../certs" }
 futures = { workspace = true }
 http = { workspace = true }
+http-body-util = { workspace = true }
+hyper-rustls = { workspace = true }
+hyper-util = { workspace = true }
 scoring = { path = "../scoring" }
 k8s-openapi = { workspace = true }
 kube = { workspace = true }

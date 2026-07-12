@@ -47,14 +47,13 @@
 
 use std::{sync::Arc, time::Duration};
 
+use bytes::Bytes;
+use http_body_util::Empty;
+use hyper_util::{client::legacy::Client as HyperClient, rt::TokioExecutor};
 use kube::{
     Client,
     api::{Api, ListParams, Patch, PatchParams},
     runtime::controller::Action,
-};
-use tokio::{
-    io::{AsyncReadExt as _, AsyncWriteExt as _},
-    net::TcpStream,
 };
 use tracing::info;
 
@@ -85,8 +84,6 @@ const DEFAULT_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Default health-check path when `spec.healthCheck.path` is absent.
 const DEFAULT_HEALTH_PATH: &str = "/health";
 
-/// Maximum response bytes to buffer when reading a probe response.
-const MAX_RESPONSE_BYTES: usize = 1024;
 
 // ---------------------------------------------------------------------------
 // Reconcile
@@ -311,98 +308,69 @@ fn parse_duration_str(s: &str) -> Option<Duration> {
     }
 }
 
-/// Probe a single `http://` endpoint and return a [`ProbeOutcome`].
+/// Probe an `http://` or `https://` endpoint and return a [`ProbeOutcome`].
 ///
-/// Opens a plain TCP connection to the host and port from `url`, sends a
-/// minimal HTTP/1.0 `GET` request, and maps the response status code to
-/// a [`ProbeOutcome`] via [`ProbeOutcome::from_http_status`].
-///
-/// # Limitations — v1
-///
-/// Only `http://` URLs are supported.  `https://` endpoints immediately
-/// return [`ProbeOutcome::Unavailable`].  TLS probing is deferred to a
-/// follow-up commit once an HTTP client dependency has been agreed on.
-///
-/// Most self-hosted inference backends (llm-d, vLLM) use plain HTTP
-/// within the cluster, so this covers the primary use case.
+/// Uses a [`hyper_util`] HTTP/1.1 client with native-root TLS via
+/// [`hyper_rustls`], covering both plain HTTP and HTTPS endpoints in a single
+/// code path.  Only the response status code is inspected; the body is not
+/// buffered.
 ///
 /// # Timeout
 ///
-/// The entire operation (connect + write + read) is wrapped in `timeout`.
-/// A timeout maps to [`ProbeOutcome::Unavailable`].
+/// The entire request — including TLS handshake for `https://` — is wrapped
+/// in `timeout`.  Exceeding the timeout returns [`ProbeOutcome::Unavailable`].
 ///
 /// # Failure policy
 ///
 /// | Outcome | [`ProbeOutcome`] |
 /// |---------|-----------------|
-/// | Response 2xx | [`Healthy`] |
-/// | Response non-2xx | [`Degraded`] |
-/// | Transport error or malformed response | [`Unavailable`] |
+/// | 2xx response | [`Healthy`] |
+/// | non-2xx response | [`Degraded`] |
+/// | Transport / TLS / DNS error | [`Unavailable`] |
 /// | Timeout | [`Unavailable`] |
-/// | `https://` URL | [`Unavailable`] |
+/// | Unsupported URL scheme (not `http` or `https`) | [`Unavailable`] |
 /// | Unparseable URL | [`Unavailable`] |
+/// | Native root certificate load failure | [`Unavailable`] |
 ///
 /// [`Healthy`]: ProbeOutcome::Healthy
 /// [`Degraded`]: ProbeOutcome::Degraded
 /// [`Unavailable`]: ProbeOutcome::Unavailable
-#[expect(clippy::too_many_lines, reason = "async probe with connect+write+read+parse steps")]
 pub(crate) async fn probe_endpoint(url: &str, timeout: Duration) -> ProbeOutcome {
     let Ok(uri) = url.parse::<http::Uri>() else {
         return ProbeOutcome::Unavailable;
     };
 
-    if uri.scheme_str() != Some("http") {
-        return ProbeOutcome::Unavailable;
+    // Only http and https are supported.
+    match uri.scheme_str() {
+        Some("http" | "https") => {},
+        _ => return ProbeOutcome::Unavailable,
     }
 
-    let host = uri.host().unwrap_or("");
-    let port = uri.port_u16().unwrap_or(80);
-    let path = uri.path_and_query().map_or("/", |pq| pq.as_str());
+    // Build an HTTPS-capable connector backed by native root certificates.
+    // Falls back to Unavailable if native roots cannot be loaded (rare on
+    // Linux/macOS; should not happen in a standard Kubernetes environment).
+    let Ok(tls_builder) = hyper_rustls::HttpsConnectorBuilder::new().with_native_roots() else {
+        return ProbeOutcome::Unavailable;
+    };
+    let connector = tls_builder.https_or_http().enable_http1().build();
 
-    let addr = format!("{host}:{port}");
-    let request = format!("GET {path} HTTP/1.0\r\nHost: {host}\r\n\r\n");
+    let client: HyperClient<_, Empty<Bytes>> = HyperClient::builder(TokioExecutor::new()).build(connector);
 
-    let result = tokio::time::timeout(timeout, async {
-        let mut stream = TcpStream::connect(&addr).await?;
-        stream.write_all(request.as_bytes()).await?;
+    let Ok(req) = http::Request::builder()
+        .method(http::Method::GET)
+        .uri(uri)
+        .body(Empty::<Bytes>::new())
+    else {
+        return ProbeOutcome::Unavailable;
+    };
 
-        let mut buf = Vec::with_capacity(MAX_RESPONSE_BYTES);
-        let mut chunk = [0_u8; 512];
-        loop {
-            let n = stream.read(&mut chunk).await?;
-            if n == 0 {
-                break;
-            }
-            buf.extend(chunk.iter().copied().take(n));
-            if buf.len() >= MAX_RESPONSE_BYTES {
-                break;
-            }
-        }
-        Ok::<Vec<u8>, std::io::Error>(buf)
-    })
-    .await;
+    let result = tokio::time::timeout(timeout, client.request(req)).await;
 
     match result {
         Err(_timeout) => ProbeOutcome::Unavailable,
-        Ok(Err(_io)) => ProbeOutcome::Unavailable,
-        Ok(Ok(bytes)) => parse_http_status_from_response(&bytes),
+        Ok(Err(_transport)) => ProbeOutcome::Unavailable,
+        Ok(Ok(response)) => ProbeOutcome::from_http_status(response.status().as_u16()),
     }
-}
-
-/// Extract a [`ProbeOutcome`] from the raw bytes of an HTTP response.
-///
-/// Parses the HTTP status code from the first response line
-/// (`HTTP/1.x <code> <reason>`) and delegates to
-/// [`ProbeOutcome::from_http_status`].  Returns [`ProbeOutcome::Unavailable`]
-/// for malformed or empty responses.
-fn parse_http_status_from_response(bytes: &[u8]) -> ProbeOutcome {
-    let text = std::str::from_utf8(bytes).unwrap_or("");
-    let status_line = text.lines().next().unwrap_or("");
-    let code = status_line
-        .split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse::<u16>().ok());
-    code.map_or(ProbeOutcome::Unavailable, ProbeOutcome::from_http_status)
 }
 
 /// Determine the provider phase and matching sites.
@@ -1281,83 +1249,17 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // parse_http_status_from_response — pure status parsing
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn status_200_from_response_bytes() {
-        let bytes = b"HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n";
-        assert_eq!(
-            parse_http_status_from_response(bytes),
-            ProbeOutcome::Healthy,
-            "HTTP 200 must yield Healthy"
-        );
-    }
-
-    #[test]
-    fn status_500_from_response_bytes() {
-        let bytes = b"HTTP/1.1 500 Internal Server Error\r\n\r\n";
-        assert_eq!(
-            parse_http_status_from_response(bytes),
-            ProbeOutcome::Degraded,
-            "HTTP 500 must yield Degraded"
-        );
-    }
-
-    #[test]
-    fn status_503_from_response_bytes() {
-        let bytes = b"HTTP/1.1 503 Service Unavailable\r\n\r\n";
-        assert_eq!(
-            parse_http_status_from_response(bytes),
-            ProbeOutcome::Degraded,
-            "HTTP 503 must yield Degraded (reachable, not healthy)"
-        );
-    }
-
-    #[test]
-    fn status_404_from_response_bytes() {
-        let bytes = b"HTTP/1.0 404 Not Found\r\n\r\n";
-        assert_eq!(
-            parse_http_status_from_response(bytes),
-            ProbeOutcome::Degraded,
-            "HTTP 404 must yield Degraded"
-        );
-    }
-
-    #[test]
-    fn status_301_from_response_bytes() {
-        let bytes = b"HTTP/1.1 301 Moved Permanently\r\n\r\n";
-        assert_eq!(
-            parse_http_status_from_response(bytes),
-            ProbeOutcome::Degraded,
-            "HTTP 301 must yield Degraded (not 2xx)"
-        );
-    }
-
-    #[test]
-    fn empty_response_yields_unavailable() {
-        assert_eq!(
-            parse_http_status_from_response(b""),
-            ProbeOutcome::Unavailable,
-            "empty response must yield Unavailable"
-        );
-    }
-
-    #[test]
-    fn malformed_response_yields_unavailable() {
-        assert_eq!(
-            parse_http_status_from_response(b"garbage not HTTP"),
-            ProbeOutcome::Unavailable,
-            "malformed response must yield Unavailable"
-        );
-    }
-
-    // -----------------------------------------------------------------------
     // probe_endpoint — async, local TcpListener (no external network)
     // -----------------------------------------------------------------------
 
     /// Start a local HTTP server on a random port that returns one canned response.
+    ///
+    /// The server accepts one connection, reads the request, writes `response`,
+    /// then closes.  Works for both the old raw-TCP path and the new hyper path
+    /// because hyper parses the HTTP/1.0 status line correctly.
     async fn start_test_server(response: &'static [u8]) -> String {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .unwrap_or_else(|_| std::process::abort());
@@ -1433,13 +1335,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn probe_https_url_yields_unavailable() {
-        // HTTPS is not supported in v1; must return Unavailable immediately.
-        let result = probe_endpoint("https://127.0.0.1:443", Duration::from_secs(1)).await;
+    async fn probe_https_tls_handshake_failure_yields_unavailable() {
+        // A plain (non-TLS) TCP server immediately closes each accepted
+        // connection.  hyper-rustls will attempt a TLS handshake, receive
+        // EOF, and return a transport error → Unavailable.
+        // This proves HTTPS is now *attempted* (not short-circuited) and
+        // that TLS errors map correctly to Unavailable.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap_or_else(|_| std::process::abort());
+        let port = listener.local_addr().unwrap_or_else(|_| std::process::abort()).port();
+        tokio::spawn(async move {
+            // Accept the connection then drop the stream immediately.
+            // The client receives EOF during the TLS handshake.
+            if let Ok((_stream, _)) = listener.accept().await {}
+        });
+        let url = format!("https://127.0.0.1:{port}");
+        let result = probe_endpoint(&url, Duration::from_secs(5)).await;
         assert_eq!(
             result,
             ProbeOutcome::Unavailable,
-            "https:// URLs must yield Unavailable (TLS not supported in v1)"
+            "TLS handshake failure against a plain-TCP server must yield Unavailable"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_unsupported_scheme_ftp_yields_unavailable() {
+        // ftp:// is not http or https — must be rejected immediately without
+        // attempting a connection.
+        let result = probe_endpoint("ftp://example.com/file", Duration::from_secs(1)).await;
+        assert_eq!(result, ProbeOutcome::Unavailable, "ftp:// must yield Unavailable");
+    }
+
+    #[tokio::test]
+    async fn probe_unsupported_scheme_file_yields_unavailable() {
+        let result = probe_endpoint("file:///etc/passwd", Duration::from_secs(1)).await;
+        assert_eq!(result, ProbeOutcome::Unavailable, "file:// must yield Unavailable");
+    }
+
+    #[tokio::test]
+    async fn probe_no_scheme_yields_unavailable() {
+        // A path-only URL has no scheme — URL parse may succeed but scheme is None.
+        let result = probe_endpoint("/just/a/path", Duration::from_secs(1)).await;
+        assert_eq!(
+            result,
+            ProbeOutcome::Unavailable,
+            "no-scheme URL must yield Unavailable"
         );
     }
 
@@ -1455,6 +1396,7 @@ mod tests {
 
     #[tokio::test]
     async fn probe_timeout_yields_unavailable() {
+        use tokio::io::AsyncReadExt as _;
         // Server accepts connection and reads the request but never responds.
         // The probe must time out and return Unavailable.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -1473,6 +1415,75 @@ mod tests {
         let url = format!("http://127.0.0.1:{port}");
         let result = probe_endpoint(&url, Duration::from_millis(100)).await;
         assert_eq!(result, ProbeOutcome::Unavailable, "timeout must yield Unavailable");
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_duration_str — edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_duration_str_whitespace_in_numeric_part_is_trimmed() {
+        // The numeric part is trimmed via `.trim()` before parsing,
+        // so surrounding whitespace on the number is accepted.
+        assert_eq!(
+            parse_duration_str("  5s"),
+            Some(Duration::from_secs(5)),
+            "leading whitespace before number must be trimmed"
+        );
+        assert_eq!(
+            parse_duration_str("100  ms"),
+            Some(Duration::from_millis(100)),
+            "whitespace between number and suffix is trimmed from the numeric part"
+        );
+        assert_eq!(
+            parse_duration_str("  500  ms"),
+            Some(Duration::from_millis(500)),
+            "whitespace on both sides of number must be trimmed"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // probe_endpoint — sequential / state isolation
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn probe_http_two_sequential_probes_use_independent_state() {
+        // Each probe_endpoint call creates a fresh hyper Client (no shared
+        // connection pool).  Calling it twice must not corrupt state or leave
+        // dangling connections.
+        let url1 = start_test_server(b"HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n").await;
+        let url2 = start_test_server(b"HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n").await;
+        let r1 = probe_endpoint(&url1, Duration::from_secs(5)).await;
+        let r2 = probe_endpoint(&url2, Duration::from_secs(5)).await;
+        assert_eq!(r1, ProbeOutcome::Healthy, "first sequential probe must yield Healthy");
+        assert_eq!(r2, ProbeOutcome::Healthy, "second sequential probe must yield Healthy");
+    }
+
+    #[tokio::test]
+    async fn probe_http_then_https_failure_are_independent() {
+        // A successful HTTP probe followed by an HTTPS failure must not
+        // interfere with each other.
+        let http_url = start_test_server(b"HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n").await;
+        let http_result = probe_endpoint(&http_url, Duration::from_secs(5)).await;
+
+        // HTTPS probe against a non-TLS server → Unavailable (TLS error).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap_or_else(|_| std::process::abort());
+        let port = listener.local_addr().unwrap_or_else(|_| std::process::abort()).port();
+        tokio::spawn(async move { if let Ok((_stream, _)) = listener.accept().await {} });
+        let https_result = probe_endpoint(&format!("https://127.0.0.1:{port}"), Duration::from_secs(5)).await;
+
+        assert_eq!(
+            http_result,
+            ProbeOutcome::Healthy,
+            "HTTP probe must succeed independently"
+        );
+        assert_eq!(
+            https_result,
+            ProbeOutcome::Unavailable,
+            "HTTPS TLS error must yield Unavailable independently"
+        );
     }
 
     // -----------------------------------------------------------------------
