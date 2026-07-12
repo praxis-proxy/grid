@@ -59,12 +59,29 @@ pub struct GridNetworkSpec {
 
 /// Reference to a Praxis Gateway that participates in this grid.
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GatewayRef {
     /// Gateway name.
     pub name: String,
 
     /// Gateway namespace.
     pub namespace: String,
+
+    /// Local site name for the `grid_route` overlay generated for this gateway.
+    ///
+    /// Identifies which [`GridSite`] this gateway's cluster represents.
+    /// Praxis uses `local_site` to score candidates running on the same site
+    /// higher than remote candidates.
+    ///
+    /// When absent, the [`GridNetwork`] metadata name is used as a fallback.
+    /// This is correct for single-site networks where the network name and
+    /// site name are the same.  Multi-site networks should set this to the
+    /// [`GridSite`] name for the cluster hosting this gateway.
+    ///
+    /// [`GridSite`]: crate::crd::grid_site::GridSite
+    /// [`GridNetwork`]: crate::crd::grid_network::GridNetwork
+    #[serde(default)]
+    pub local_site_name: Option<String>,
 }
 
 /// SWIM protocol tuning parameters.
@@ -221,5 +238,30 @@ mod tests {
         let spec: GridNetworkSpec = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
         assert_eq!(spec.seeds.len(), 1, "should have 1 seed");
         assert_eq!(spec.swim.probe_interval, "3s", "custom probe interval");
+    }
+
+    #[test]
+    fn gateway_ref_local_site_name_round_trips() {
+        let json = serde_json::json!({
+            "name": "gw-east",
+            "namespace": "grid-system",
+            "localSiteName": "cluster-east"
+        });
+        let gw: GatewayRef = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            gw.local_site_name.as_deref(),
+            Some("cluster-east"),
+            "localSiteName must round-trip on GatewayRef"
+        );
+    }
+
+    #[test]
+    fn gateway_ref_local_site_name_defaults_to_none() {
+        let json = serde_json::json!({"name": "gw", "namespace": "ns"});
+        let gw: GatewayRef = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
+        assert!(
+            gw.local_site_name.is_none(),
+            "absent localSiteName must default to None"
+        );
     }
 }

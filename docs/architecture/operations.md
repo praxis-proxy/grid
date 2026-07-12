@@ -146,21 +146,45 @@ spec:
 
 ## 8. Routing Configuration
 
-The `PraxisConfig` controller watches all Active
-`GridSites` and Available providers. For each Gateway
-referenced by the `GridNetwork`, it generates an
-overlay `ConfigMap` containing:
+**OP-01 (implemented):** The `GridNetwork` controller
+renders routing overlay `ConfigMap`s from static CRD
+data. For each `gatewayRef` in the `GridNetwork`, it
+server-side applies a `ConfigMap` named
+`grid-overlay-{network}-{gateway}` containing:
 
-- **Cluster definitions**: one per remote site (with
-  mTLS: CA, client cert, SNI), one per API/cloud
-  provider
-- **Grid scoring filter config**: backend list with
-  kinds, costs, weights, provider types
-- **Auth injection config**: per-cluster credential
-  strategy and Secret references
+- **`grid-config.json`**: JSON-serialised
+  `RoutingOverlay` with one `RoutingCandidate` per
+  model per `InferenceProvider` in the network.
 
-The overlay `ConfigMap` is mounted into the Praxis
-Deployment. Praxis hot-reloads its configuration.
+The overlay shape is compatible with the Praxis
+`grid_route` filter:
+
+```json
+{
+  "network": "production",
+  "local_site": "production",
+  "candidates": [
+    {
+      "kind": "inference_model",
+      "name": "granite-3.3-8b",
+      "site": "local-vllm",
+      "cluster": "local-vllm",
+      "fresh": true
+    }
+  ]
+}
+```
+
+**Future phases:**
+- OP-02: `InferenceProvider` status reconciliation
+- OP-03: Gateway annotation patching (planned) — not
+  yet implemented; see OP-03 in OPERATOR_STATUS.md
+- OP-04: Local validation harness reads operator-produced
+  `ConfigMap` via `xtask env deploy-consumer-gateway --overlay-config`
+- OP-05: Metrics-to-snapshot freshness updates set
+  `fresh: false` when metrics are stale
+- OP-06: SWIM/CRDT membership and capability
+  propagation populates cross-site candidates
 
 ## 9. Workloads Consume Providers
 

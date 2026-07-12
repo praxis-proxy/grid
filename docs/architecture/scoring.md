@@ -83,11 +83,23 @@ scoring:
 ## Where Scoring Runs
 
 The scoring engine lives in the `scoring` crate.
-For production routing, the scoring logic is compiled
-into a Praxis filter (`grid_scorer`) that reads the
-overlay config and scores backends per-request.
 
-The Grid Operator generates the overlay config
-(backend list, weights, metrics). Praxis reads the
-config and executes the scoring formula in the
-request-phase filter pipeline.
+**Current (OP-01):** The Grid Operator generates a
+`grid_route`-compatible routing overlay `ConfigMap`
+with static candidate lists (no per-request metrics).
+Praxis reads the `grid-config.json` key and selects
+backends from the candidates list.
+
+**Future/planned (`grid_scorer` filter):** A
+per-request scoring filter that reads the overlay
+config and applies the six-signal scoring formula is
+planned but not yet implemented in the Praxis PR
+stack. The `grid_scorer` references in this doc
+describe the target state. The current Praxis
+integration uses `grid_route` with static candidates.
+
+**OP-05 (planned):** When the metrics-to-snapshot
+freshness loop is implemented, CRDT-propagated
+metrics (queue depth, KV cache, latency) will be
+folded into the overlay, enabling richer backend
+selection in `grid_route`.

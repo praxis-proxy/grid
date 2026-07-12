@@ -22,4 +22,8 @@ pub enum OperatorError {
     /// A required resource was not found.
     #[error("not found: {0}")]
     NotFound(String),
+
+    /// Routing overlay rendering failed.
+    #[error("overlay render: {0}")]
+    OverlayRender(String),
 }

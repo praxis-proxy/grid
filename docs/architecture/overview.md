@@ -110,7 +110,19 @@ both configure Praxis, but own different concerns:
 | Overlay volume mount | Grid Operator (SSA) |
 | Grid TLS Secrets | Grid Operator |
 
-The Grid Operator patches the Gateway with annotation
-`grid.praxis-proxy.io/overlay-config` which the
-Praxis Operator reads during reconciliation to
-include the overlay `ConfigMap`.
+The Grid Operator renders routing overlay `ConfigMap`s
+from `GridNetwork` + `InferenceProvider` CRDs. Each
+`ConfigMap` encodes `grid_route` routing candidates
+(model name, site, cluster, fresh flag) as JSON under
+the `grid-config.json` key.
+
+**OP-01 (implemented):** Static provider/model overlay
+rendered on each `GridNetwork` reconciliation. One
+`ConfigMap` per `gatewayRef`.
+
+**OP-03 (planned follow-up):** Gateway annotation
+patching (`grid.praxis-proxy.io/overlay-config`) is
+not yet implemented. Once Gateway API adoption is
+confirmed, the operator will patch the annotation so
+the Praxis Operator picks up the overlay `ConfigMap`
+automatically.

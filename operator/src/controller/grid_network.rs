@@ -2,24 +2,29 @@
 //!
 //! Reconciles [`GridNetwork`] resources: generates the grid CA
 //! and site certificate, manages TLS secrets, generates the
-//! grid ID, and signals the SWIM runtime to start.
+//! grid ID, signals the SWIM runtime to start, and renders
+//! routing overlay ConfigMaps for each gateway reference.
 //!
 //! [`GridNetwork`]: crate::crd::grid_network::GridNetwork
 
 use std::sync::Arc;
 
+use k8s_openapi::api::core::v1::ConfigMap;
 use kube::{
     Client,
-    api::{Api, Patch, PatchParams},
+    api::{Api, ListParams, Patch, PatchParams},
     runtime::controller::Action,
 };
 use tokio::time::Duration;
 use tracing::info;
 
 use crate::{
-    crd::grid_network::{GridNetwork, GridNetworkPhase, GridNetworkStatus},
+    crd::{
+        grid_network::{GatewayRef, GridNetwork, GridNetworkPhase, GridNetworkStatus},
+        inference_provider::InferenceProvider,
+    },
     error::OperatorError,
-    resources::secret,
+    resources::{routing_overlay, secret},
 };
 
 // ---------------------------------------------------------------------------
@@ -53,6 +58,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, client: Arc<Client>) -> Result
     info!(name, "reconciling GridNetwork");
 
     ensure_tls_secrets(&network, &client).await?;
+    reconcile_routing_overlay(&network, &client).await?;
 
     let grid_id = resolve_grid_id(&network);
     let phase = determine_phase(&network, &grid_id);
@@ -135,6 +141,92 @@ async fn apply_site_secret(
         &Patch::Apply(&s),
     )
     .await?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Routing Overlay
+// ---------------------------------------------------------------------------
+
+/// Reconcile routing overlay `ConfigMap`s for a [`GridNetwork`].
+///
+/// Lists all [`InferenceProvider`]s and [`GridSite`]s cluster-wide, then
+/// renders one overlay `ConfigMap` per `gatewayRef`.  Each gateway may
+/// declare its own `localSiteName` — the `local_site` in the overlay for
+/// gateway G is `G.localSiteName ?? network_name`.  This ensures that in a
+/// multi-gateway network each gateway's overlay identifies the correct local
+/// site.  A network with no `gatewayRefs` is a no-op.
+///
+/// **Watch limitation:** [`InferenceProvider`] and [`GridSite`] changes do
+/// not currently trigger a [`GridNetwork`] reconcile.  Overlays are only
+/// refreshed when the [`GridNetwork`] itself changes.  Adding cross-resource
+/// watch/index from [`InferenceProvider`] and [`GridSite`] to their owning
+/// [`GridNetwork`] is future work.
+///
+/// [`GridSite`]: crate::crd::grid_site::GridSite
+#[expect(
+    clippy::large_stack_frames,
+    reason = "async future with kube API types and overlay data"
+)]
+async fn reconcile_routing_overlay(network: &GridNetwork, client: &Client) -> Result<(), OperatorError> {
+    let network_name = network
+        .metadata
+        .name
+        .as_deref()
+        .unwrap_or_else(|| std::process::abort());
+
+    let providers = list_all_inference_providers(client).await?;
+    let sites = list_all_grid_sites(client).await?;
+
+    for gw_ref in &network.spec.gateway_refs {
+        // Each gateway identifies its own local site.  Fall back to the
+        // network name for single-site deployments where the two are equal.
+        let local_site = gw_ref.local_site_name.as_deref().unwrap_or(network_name);
+        let overlay = routing_overlay::render_routing_overlay(network, &sites, &providers, local_site)
+            .map_err(OperatorError::OverlayRender)?;
+        apply_overlay_for_gateway(&overlay, network, gw_ref, client).await?;
+    }
+    Ok(())
+}
+
+/// List all [`InferenceProvider`] resources cluster-wide.
+async fn list_all_inference_providers(client: &Client) -> Result<Vec<InferenceProvider>, OperatorError> {
+    let api: Api<InferenceProvider> = Api::all(client.clone());
+    let list = api.list(&ListParams::default()).await?;
+    Ok(list.items)
+}
+
+/// List all [`GridSite`] resources cluster-wide.
+///
+/// [`GridSite`]: crate::crd::grid_site::GridSite
+async fn list_all_grid_sites(client: &Client) -> Result<Vec<crate::crd::grid_site::GridSite>, OperatorError> {
+    let api: Api<crate::crd::grid_site::GridSite> = Api::all(client.clone());
+    let list = api.list(&ListParams::default()).await?;
+    Ok(list.items)
+}
+
+/// Server-side apply one routing overlay `ConfigMap` for a single gateway.
+async fn apply_overlay_for_gateway(
+    overlay: &routing_overlay::RoutingOverlay,
+    network: &GridNetwork,
+    gw_ref: &GatewayRef,
+    client: &Client,
+) -> Result<(), OperatorError> {
+    let network_name = network
+        .metadata
+        .name
+        .as_deref()
+        .unwrap_or_else(|| std::process::abort());
+
+    let cm = routing_overlay::build_overlay_configmap(overlay, network_name, &gw_ref.name, &gw_ref.namespace)
+        .map_err(OperatorError::Json)?;
+    let cm_name = cm.metadata.name.as_deref().unwrap_or_else(|| std::process::abort());
+
+    let api: Api<ConfigMap> = Api::namespaced(client.clone(), &gw_ref.namespace);
+    api.patch(cm_name, &PatchParams::apply(FIELD_MANAGER).force(), &Patch::Apply(&cm))
+        .await?;
+
+    info!(cm_name, "applied routing overlay ConfigMap");
     Ok(())
 }
 

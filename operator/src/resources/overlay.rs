@@ -144,13 +144,15 @@ impl Default for OverlayScoringWeights {
 
 /// Build a grid overlay `ConfigMap` from the given config.
 ///
-/// The overlay is serialized as YAML under the
-/// `grid-config.yaml` data key.
+/// The overlay is serialized as JSON under the `grid-config.json` data key.
+/// Serialization failure silently falls back to an empty string; use
+/// [`crate::resources::routing_overlay::build_overlay_configmap`] for
+/// production use where failures must propagate.
 pub fn build_overlay_configmap(name: &str, namespace: &str, overlay: &GridOverlay) -> ConfigMap {
-    let yaml = serde_json::to_string_pretty(overlay).unwrap_or_default();
+    let json = serde_json::to_string_pretty(overlay).unwrap_or_default();
 
     let mut data = BTreeMap::new();
-    data.insert("grid-config.json".to_owned(), yaml);
+    data.insert("grid-config.json".to_owned(), json);
 
     ConfigMap {
         metadata: kube::api::ObjectMeta {
