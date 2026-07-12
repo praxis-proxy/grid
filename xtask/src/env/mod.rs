@@ -6,6 +6,7 @@ pub(crate) mod consumer;
 pub(crate) mod gateway;
 pub(crate) mod images;
 pub(crate) mod kind;
+pub(crate) mod operator_overlay;
 pub(crate) mod providers;
 pub(crate) mod trust;
 pub(crate) mod verify;
@@ -93,11 +94,27 @@ pub(crate) enum Action {
         config: PathBuf,
     },
 
-    /// Deploy the consumer gateway with static `grid_route` config.
+    /// Deploy the consumer gateway.
+    ///
+    /// Without `--overlay-config`, generates a static `grid_route` config from
+    /// provider sites declared in the environment config file.
+    ///
+    /// With `--overlay-config`, reads a routing overlay `grid-config.json`
+    /// from the given path. The overlay `local_site` and candidates
+    /// drive the `grid_route` stanza; the `load_balancer` section is still
+    /// generated from provider endpoints in the environment config.
     DeployConsumerGateway {
         /// Path to the environment config file.
         #[arg(short, long, default_value = DEFAULT_CONFIG_PATH)]
         config: PathBuf,
+
+        /// Path to a `grid-config.json` routing overlay.
+        ///
+        /// When provided, `grid_route.local_site` and candidates are taken
+        /// from the overlay file.  When absent, the static config derived from
+        /// `config.toml` provider sites is used.
+        #[arg(long)]
+        overlay_config: Option<PathBuf>,
     },
 
     /// Verify consumer-to-provider gateway routing end-to-end.
@@ -136,7 +153,9 @@ pub(crate) fn run(action: &Action) -> Result<(), Box<dyn std::error::Error>> {
         Action::DeployProviderGateways { config } => env_deploy_provider_gateways(config),
         Action::VerifyProviderGateways { config } => env_verify_provider_gateways(config),
         Action::ProbeGatewayNetwork { config } => env_probe_gateway_network(config),
-        Action::DeployConsumerGateway { config } => env_deploy_consumer_gateway(config),
+        Action::DeployConsumerGateway { config, overlay_config } => {
+            env_deploy_consumer_gateway(config, overlay_config.as_deref())
+        },
         Action::VerifyGatewayE2e { config } => env_verify_gateway_e2e(config),
         Action::VerifyMtlsTrust { config } => env_verify_mtls_trust(config),
     }
@@ -285,10 +304,15 @@ fn env_probe_gateway_network(config: &Path) -> Result<(), Box<dyn std::error::Er
     consumer::probe_network(&cfg)
 }
 
-/// Deploy the consumer gateway with static `grid_route` config.
-fn env_deploy_consumer_gateway(config: &Path) -> Result<(), Box<dyn std::error::Error>> {
+/// Deploy the consumer gateway.
+///
+/// When `overlay_config` is `Some`, reads a routing overlay `grid-config.json`
+/// and uses it to drive the `grid_route` stanza.
+/// When `overlay_config` is `None`, generates a static config from the
+/// environment config provider sites (existing behaviour).
+fn env_deploy_consumer_gateway(config: &Path, overlay_config: Option<&Path>) -> Result<(), Box<dyn std::error::Error>> {
     let cfg = EnvConfig::from_file(config)?;
-    consumer::deploy_consumer(&cfg)
+    consumer::deploy_consumer(&cfg, overlay_config)
 }
 
 /// Verify consumer-to-provider gateway routing end-to-end.
