@@ -45,21 +45,26 @@
 //! [`GridNetwork`]: crate::crd::grid_network::GridNetwork
 //! [`GridSite`]: crate::crd::grid_site::GridSite
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use kube::{
     Client,
     api::{Api, ListParams, Patch, PatchParams},
     runtime::controller::Action,
 };
-use tokio::time::Duration;
+use tokio::{
+    io::{AsyncReadExt as _, AsyncWriteExt as _},
+    net::TcpStream,
+};
 use tracing::info;
 
 use crate::{
     crd::{
         grid_network::GridNetwork,
         grid_site::GridSite,
-        inference_provider::{InferenceProvider, InferenceProviderStatus, ProviderPhase},
+        inference_provider::{
+            HealthCheckConfig, InferenceProvider, InferenceProviderSpec, InferenceProviderStatus, ProviderPhase,
+        },
     },
     error::OperatorError,
 };
@@ -73,6 +78,15 @@ const REQUEUE_INTERVAL: Duration = Duration::from_secs(300);
 
 /// Field manager name for server-side apply.
 const FIELD_MANAGER: &str = "grid-operator";
+
+/// Default probe timeout when `spec.healthCheck.timeout` is absent.
+const DEFAULT_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Default health-check path when `spec.healthCheck.path` is absent.
+const DEFAULT_HEALTH_PATH: &str = "/health";
+
+/// Maximum response bytes to buffer when reading a probe response.
+const MAX_RESPONSE_BYTES: usize = 1024;
 
 // ---------------------------------------------------------------------------
 // Reconcile
@@ -241,6 +255,156 @@ pub(crate) fn phase_from_matching(matching: &[String]) -> ProviderPhase {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Health probe helpers
+// ---------------------------------------------------------------------------
+
+/// Build the URL to probe for a provider's health check.
+///
+/// Returns `None` when no [`HealthCheckConfig`] is present — the provider
+/// will not be probed and [`ProbeOutcome::NotProbed`] is used instead.
+///
+/// When health check is configured:
+/// - `path` defaults to `"/health"` when absent from the config.
+/// - The endpoint's trailing slash is stripped before appending the path.
+///
+/// This helper only constructs the URL.  Scheme support is handled by
+/// [`probe_endpoint`], which currently accepts `http://` and returns
+/// [`ProbeOutcome::Unavailable`] for `https://`.
+///
+/// [`HealthCheckConfig`]: crate::crd::inference_provider::HealthCheckConfig
+pub(crate) fn probe_url_for_provider(spec: &InferenceProviderSpec) -> Option<String> {
+    let hc = spec.health_check.as_ref()?;
+    let path = hc.path.as_deref().unwrap_or(DEFAULT_HEALTH_PATH);
+    let endpoint = spec.endpoint.trim_end_matches('/');
+    let separator = if path.starts_with('/') { "" } else { "/" };
+    Some(format!("{endpoint}{separator}{path}"))
+}
+
+/// Derive the probe timeout from [`HealthCheckConfig`].
+///
+/// Parses `spec.healthCheck.timeout` as `"<n>s"` (seconds) or
+/// `"<n>ms"` (milliseconds).  Returns [`DEFAULT_PROBE_TIMEOUT`] (5s)
+/// when the field is absent, `None`, or unparseable.
+///
+/// [`HealthCheckConfig`]: crate::crd::inference_provider::HealthCheckConfig
+pub(crate) fn parse_probe_timeout(hc: Option<&HealthCheckConfig>) -> Duration {
+    hc.and_then(|h| h.timeout.as_deref())
+        .and_then(parse_duration_str)
+        .unwrap_or(DEFAULT_PROBE_TIMEOUT)
+}
+
+/// Parse a human-readable duration string into a [`Duration`].
+///
+/// Accepted suffixes:
+/// - `"ms"` → milliseconds
+/// - `"s"` → seconds
+///
+/// Returns `None` for any other format.
+fn parse_duration_str(s: &str) -> Option<Duration> {
+    if let Some(n) = s.strip_suffix("ms") {
+        n.trim().parse::<u64>().ok().map(Duration::from_millis)
+    } else if let Some(n) = s.strip_suffix('s') {
+        n.trim().parse::<u64>().ok().map(Duration::from_secs)
+    } else {
+        None
+    }
+}
+
+/// Probe a single `http://` endpoint and return a [`ProbeOutcome`].
+///
+/// Opens a plain TCP connection to the host and port from `url`, sends a
+/// minimal HTTP/1.0 `GET` request, and maps the response status code to
+/// a [`ProbeOutcome`] via [`ProbeOutcome::from_http_status`].
+///
+/// # Limitations — v1
+///
+/// Only `http://` URLs are supported.  `https://` endpoints immediately
+/// return [`ProbeOutcome::Unavailable`].  TLS probing is deferred to a
+/// follow-up commit once an HTTP client dependency has been agreed on.
+///
+/// Most self-hosted inference backends (llm-d, vLLM) use plain HTTP
+/// within the cluster, so this covers the primary use case.
+///
+/// # Timeout
+///
+/// The entire operation (connect + write + read) is wrapped in `timeout`.
+/// A timeout maps to [`ProbeOutcome::Unavailable`].
+///
+/// # Failure policy
+///
+/// | Outcome | [`ProbeOutcome`] |
+/// |---------|-----------------|
+/// | Response 2xx | [`Healthy`] |
+/// | Response non-2xx | [`Degraded`] |
+/// | Transport error or malformed response | [`Unavailable`] |
+/// | Timeout | [`Unavailable`] |
+/// | `https://` URL | [`Unavailable`] |
+/// | Unparseable URL | [`Unavailable`] |
+///
+/// [`Healthy`]: ProbeOutcome::Healthy
+/// [`Degraded`]: ProbeOutcome::Degraded
+/// [`Unavailable`]: ProbeOutcome::Unavailable
+#[expect(clippy::too_many_lines, reason = "async probe with connect+write+read+parse steps")]
+pub(crate) async fn probe_endpoint(url: &str, timeout: Duration) -> ProbeOutcome {
+    let Ok(uri) = url.parse::<http::Uri>() else {
+        return ProbeOutcome::Unavailable;
+    };
+
+    if uri.scheme_str() != Some("http") {
+        return ProbeOutcome::Unavailable;
+    }
+
+    let host = uri.host().unwrap_or("");
+    let port = uri.port_u16().unwrap_or(80);
+    let path = uri.path_and_query().map_or("/", |pq| pq.as_str());
+
+    let addr = format!("{host}:{port}");
+    let request = format!("GET {path} HTTP/1.0\r\nHost: {host}\r\n\r\n");
+
+    let result = tokio::time::timeout(timeout, async {
+        let mut stream = TcpStream::connect(&addr).await?;
+        stream.write_all(request.as_bytes()).await?;
+
+        let mut buf = Vec::with_capacity(MAX_RESPONSE_BYTES);
+        let mut chunk = [0_u8; 512];
+        loop {
+            let n = stream.read(&mut chunk).await?;
+            if n == 0 {
+                break;
+            }
+            buf.extend(chunk.iter().copied().take(n));
+            if buf.len() >= MAX_RESPONSE_BYTES {
+                break;
+            }
+        }
+        Ok::<Vec<u8>, std::io::Error>(buf)
+    })
+    .await;
+
+    match result {
+        Err(_timeout) => ProbeOutcome::Unavailable,
+        Ok(Err(_io)) => ProbeOutcome::Unavailable,
+        Ok(Ok(bytes)) => parse_http_status_from_response(&bytes),
+    }
+}
+
+/// Extract a [`ProbeOutcome`] from the raw bytes of an HTTP response.
+///
+/// Parses the HTTP status code from the first response line
+/// (`HTTP/1.x <code> <reason>`) and delegates to
+/// [`ProbeOutcome::from_http_status`].  Returns [`ProbeOutcome::Unavailable`]
+/// for malformed or empty responses.
+fn parse_http_status_from_response(bytes: &[u8]) -> ProbeOutcome {
+    let text = std::str::from_utf8(bytes).unwrap_or("");
+    let status_line = text.lines().next().unwrap_or("");
+    let code = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse::<u16>().ok());
+    code.map_or(ProbeOutcome::Unavailable, ProbeOutcome::from_http_status)
+}
+
 /// Determine the provider phase and matching sites.
 ///
 /// Returns `(ProviderPhase, sorted_matching_site_names)`.
@@ -249,6 +413,10 @@ pub(crate) fn phase_from_matching(matching: &[String]) -> ProviderPhase {
 ///
 /// Returns [`OperatorError`] on Kubernetes API failures.
 #[expect(clippy::large_stack_frames, reason = "async future with kube API types")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "reconcile: static checks, site matching, probe, and phase merge"
+)]
 async fn resolve_phase_and_sites(
     provider: &InferenceProvider,
     client: &Client,
@@ -279,9 +447,18 @@ async fn resolve_phase_and_sites(
     let sites = list_sites_for_network(client, network_ref).await?;
     let matching = sites_matching_selector(provider, &sites);
     let site_phase = phase_from_matching(&matching);
-    // Apply health probe result.  NotProbed preserves site_phase unchanged
-    // until live health-check probing is wired in (future OP-05 work).
-    let phase = phase_from_probe(ProbeOutcome::NotProbed, site_phase);
+
+    // Run a live health probe when the spec opts in via `health_check`.
+    // Providers without health_check config receive NotProbed, which
+    // preserves the site-matching phase unchanged.
+    let probe_result = match probe_url_for_provider(&provider.spec) {
+        Some(url) => {
+            let timeout = parse_probe_timeout(provider.spec.health_check.as_ref());
+            probe_endpoint(&url, timeout).await
+        },
+        None => ProbeOutcome::NotProbed,
+    };
+    let phase = phase_from_probe(probe_result, site_phase);
 
     Ok((phase, matching))
 }
@@ -954,4 +1131,432 @@ mod tests {
     // They are covered at the integration level.  The pure decision logic
     // (validate_provider_config, phase_from_matching, sites_matching_selector)
     // is fully unit-tested above.
+
+    // -----------------------------------------------------------------------
+    // parse_duration_str — pure duration parsing
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn duration_seconds_parses() {
+        assert_eq!(parse_duration_str("5s"), Some(Duration::from_secs(5)));
+        assert_eq!(parse_duration_str("30s"), Some(Duration::from_secs(30)));
+        assert_eq!(parse_duration_str("1s"), Some(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn duration_milliseconds_parses() {
+        assert_eq!(parse_duration_str("500ms"), Some(Duration::from_millis(500)));
+        assert_eq!(parse_duration_str("100ms"), Some(Duration::from_millis(100)));
+    }
+
+    #[test]
+    fn duration_unrecognised_suffix_returns_none() {
+        assert_eq!(parse_duration_str("5m"), None, "minutes not supported");
+        assert_eq!(parse_duration_str("5"), None, "bare number not supported");
+        assert_eq!(parse_duration_str(""), None, "empty string not supported");
+    }
+
+    #[test]
+    fn duration_non_numeric_returns_none() {
+        assert_eq!(parse_duration_str("fives"), None, "non-numeric seconds");
+        assert_eq!(parse_duration_str("abcms"), None, "non-numeric milliseconds");
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_probe_timeout — pure timeout derivation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn timeout_from_health_check_config() {
+        let hc = HealthCheckConfig {
+            interval: None,
+            path: None,
+            timeout: Some("10s".to_owned()),
+        };
+        assert_eq!(
+            parse_probe_timeout(Some(&hc)),
+            Duration::from_secs(10),
+            "must respect configured timeout"
+        );
+    }
+
+    #[test]
+    fn timeout_defaults_when_absent() {
+        assert_eq!(
+            parse_probe_timeout(None),
+            DEFAULT_PROBE_TIMEOUT,
+            "absent health_check must use default timeout"
+        );
+    }
+
+    #[test]
+    fn timeout_defaults_when_field_absent() {
+        let hc = HealthCheckConfig {
+            interval: None,
+            path: None,
+            timeout: None,
+        };
+        assert_eq!(
+            parse_probe_timeout(Some(&hc)),
+            DEFAULT_PROBE_TIMEOUT,
+            "absent timeout field must use default"
+        );
+    }
+
+    #[test]
+    fn timeout_defaults_on_unparseable_value() {
+        let hc = HealthCheckConfig {
+            interval: None,
+            path: None,
+            timeout: Some("invalid".to_owned()),
+        };
+        assert_eq!(
+            parse_probe_timeout(Some(&hc)),
+            DEFAULT_PROBE_TIMEOUT,
+            "unparseable timeout must fall back to default"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // probe_url_for_provider — pure URL construction
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn probe_url_absent_health_check_returns_none() {
+        let spec = make_spec("http://vllm:8000", None, None);
+        assert!(
+            probe_url_for_provider(&spec).is_none(),
+            "no health_check config must yield None (NotProbed)"
+        );
+    }
+
+    #[test]
+    fn probe_url_uses_default_path() {
+        let spec = make_spec_with_health_check("http://vllm:8000", None, None);
+        assert_eq!(
+            probe_url_for_provider(&spec).as_deref(),
+            Some("http://vllm:8000/health"),
+            "must append default /health when path is absent"
+        );
+    }
+
+    #[test]
+    fn probe_url_uses_custom_path() {
+        let spec = make_spec("http://vllm:8000", Some("/v1/models"), None);
+        assert_eq!(
+            probe_url_for_provider(&spec).as_deref(),
+            Some("http://vllm:8000/v1/models"),
+            "custom path must be used verbatim"
+        );
+    }
+
+    #[test]
+    fn probe_url_adds_leading_slash_to_custom_path() {
+        let spec = make_spec("http://vllm:8000", Some("ready"), None);
+        assert_eq!(
+            probe_url_for_provider(&spec).as_deref(),
+            Some("http://vllm:8000/ready"),
+            "custom path without leading slash must be normalized"
+        );
+    }
+
+    #[test]
+    fn probe_url_strips_trailing_slash_from_endpoint() {
+        let spec = make_spec("http://vllm:8000/", Some("/health"), None);
+        assert_eq!(
+            probe_url_for_provider(&spec).as_deref(),
+            Some("http://vllm:8000/health"),
+            "trailing slash on endpoint must be stripped before appending path"
+        );
+    }
+
+    #[test]
+    fn probe_url_passes_https_through() {
+        // HTTPS URLs are returned as-is; probe_endpoint rejects them.
+        let spec = make_spec("https://api.example.com", Some("/health"), None);
+        assert!(
+            probe_url_for_provider(&spec).is_some(),
+            "https URL is returned; probe_endpoint will reject it"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_http_status_from_response — pure status parsing
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn status_200_from_response_bytes() {
+        let bytes = b"HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n";
+        assert_eq!(
+            parse_http_status_from_response(bytes),
+            ProbeOutcome::Healthy,
+            "HTTP 200 must yield Healthy"
+        );
+    }
+
+    #[test]
+    fn status_500_from_response_bytes() {
+        let bytes = b"HTTP/1.1 500 Internal Server Error\r\n\r\n";
+        assert_eq!(
+            parse_http_status_from_response(bytes),
+            ProbeOutcome::Degraded,
+            "HTTP 500 must yield Degraded"
+        );
+    }
+
+    #[test]
+    fn status_503_from_response_bytes() {
+        let bytes = b"HTTP/1.1 503 Service Unavailable\r\n\r\n";
+        assert_eq!(
+            parse_http_status_from_response(bytes),
+            ProbeOutcome::Degraded,
+            "HTTP 503 must yield Degraded (reachable, not healthy)"
+        );
+    }
+
+    #[test]
+    fn status_404_from_response_bytes() {
+        let bytes = b"HTTP/1.0 404 Not Found\r\n\r\n";
+        assert_eq!(
+            parse_http_status_from_response(bytes),
+            ProbeOutcome::Degraded,
+            "HTTP 404 must yield Degraded"
+        );
+    }
+
+    #[test]
+    fn status_301_from_response_bytes() {
+        let bytes = b"HTTP/1.1 301 Moved Permanently\r\n\r\n";
+        assert_eq!(
+            parse_http_status_from_response(bytes),
+            ProbeOutcome::Degraded,
+            "HTTP 301 must yield Degraded (not 2xx)"
+        );
+    }
+
+    #[test]
+    fn empty_response_yields_unavailable() {
+        assert_eq!(
+            parse_http_status_from_response(b""),
+            ProbeOutcome::Unavailable,
+            "empty response must yield Unavailable"
+        );
+    }
+
+    #[test]
+    fn malformed_response_yields_unavailable() {
+        assert_eq!(
+            parse_http_status_from_response(b"garbage not HTTP"),
+            ProbeOutcome::Unavailable,
+            "malformed response must yield Unavailable"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // probe_endpoint — async, local TcpListener (no external network)
+    // -----------------------------------------------------------------------
+
+    /// Start a local HTTP server on a random port that returns one canned response.
+    async fn start_test_server(response: &'static [u8]) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap_or_else(|_| std::process::abort());
+        let port = listener.local_addr().unwrap_or_else(|_| std::process::abort()).port();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                // Read and discard the request.
+                let mut buf = [0_u8; 4096];
+                drop(stream.read(&mut buf).await);
+                // Write the canned response.
+                drop(stream.write_all(response).await);
+                // stream drops here, closing the connection.
+            }
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    #[tokio::test]
+    async fn probe_http_200_yields_healthy() {
+        let url = start_test_server(b"HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n").await;
+        let result = probe_endpoint(&url, Duration::from_secs(5)).await;
+        assert_eq!(result, ProbeOutcome::Healthy, "HTTP 200 response must yield Healthy");
+    }
+
+    #[tokio::test]
+    async fn probe_http_204_yields_healthy() {
+        let url = start_test_server(b"HTTP/1.0 204 No Content\r\n\r\n").await;
+        let result = probe_endpoint(&url, Duration::from_secs(5)).await;
+        assert_eq!(result, ProbeOutcome::Healthy, "HTTP 204 response must yield Healthy");
+    }
+
+    #[tokio::test]
+    async fn probe_http_500_yields_degraded() {
+        let url = start_test_server(b"HTTP/1.0 500 Internal Server Error\r\n\r\n").await;
+        let result = probe_endpoint(&url, Duration::from_secs(5)).await;
+        assert_eq!(result, ProbeOutcome::Degraded, "HTTP 500 response must yield Degraded");
+    }
+
+    #[tokio::test]
+    async fn probe_http_503_yields_degraded() {
+        let url = start_test_server(b"HTTP/1.0 503 Service Unavailable\r\n\r\n").await;
+        let result = probe_endpoint(&url, Duration::from_secs(5)).await;
+        assert_eq!(result, ProbeOutcome::Degraded, "HTTP 503 must yield Degraded");
+    }
+
+    #[tokio::test]
+    async fn probe_http_404_yields_degraded() {
+        let url = start_test_server(b"HTTP/1.0 404 Not Found\r\n\r\n").await;
+        let result = probe_endpoint(&url, Duration::from_secs(5)).await;
+        assert_eq!(result, ProbeOutcome::Degraded, "HTTP 404 must yield Degraded");
+    }
+
+    #[tokio::test]
+    async fn probe_http_301_yields_degraded() {
+        let url = start_test_server(b"HTTP/1.0 301 Moved Permanently\r\n\r\n").await;
+        let result = probe_endpoint(&url, Duration::from_secs(5)).await;
+        assert_eq!(
+            result,
+            ProbeOutcome::Degraded,
+            "HTTP 301 (redirect) must yield Degraded"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_unreachable_endpoint_yields_unavailable() {
+        // Nothing is listening on this port; connection must fail.
+        let result = probe_endpoint("http://127.0.0.1:1", Duration::from_secs(5)).await;
+        assert_eq!(
+            result,
+            ProbeOutcome::Unavailable,
+            "connection refused must yield Unavailable"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_https_url_yields_unavailable() {
+        // HTTPS is not supported in v1; must return Unavailable immediately.
+        let result = probe_endpoint("https://127.0.0.1:443", Duration::from_secs(1)).await;
+        assert_eq!(
+            result,
+            ProbeOutcome::Unavailable,
+            "https:// URLs must yield Unavailable (TLS not supported in v1)"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_unparseable_url_yields_unavailable() {
+        let result = probe_endpoint("not-a-url", Duration::from_secs(1)).await;
+        assert_eq!(
+            result,
+            ProbeOutcome::Unavailable,
+            "unparseable URL must yield Unavailable"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_timeout_yields_unavailable() {
+        // Server accepts connection and reads the request but never responds.
+        // The probe must time out and return Unavailable.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap_or_else(|_| std::process::abort());
+        let port = listener.local_addr().unwrap_or_else(|_| std::process::abort()).port();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0_u8; 4096];
+                drop(stream.read(&mut buf).await);
+                // Intentionally never write a response.
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                drop(stream);
+            }
+        });
+        let url = format!("http://127.0.0.1:{port}");
+        let result = probe_endpoint(&url, Duration::from_millis(100)).await;
+        assert_eq!(result, ProbeOutcome::Unavailable, "timeout must yield Unavailable");
+    }
+
+    // -----------------------------------------------------------------------
+    // Integration: static config still short-circuits before probe
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn blank_endpoint_short_circuits_before_probe() {
+        // validate_provider_config catches blank endpoint immediately;
+        // probe_url_for_provider would also return None for a blank endpoint,
+        // but the static validation check runs first in resolve_phase_and_sites.
+        let provider: InferenceProvider = serde_json::from_value(serde_json::json!({
+            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "kind": "InferenceProvider",
+            "metadata": { "name": "bad" },
+            "spec": {
+                "gridNetworkRef": "net",
+                "providerKind": "self_hosted",
+                "backendKind": "local",
+                "endpoint": "",
+                "models": [{"name": "model"}],
+                "healthCheck": { "path": "/health" }
+            }
+        }))
+        .unwrap_or_else(|_| std::process::abort());
+        let err = validate_provider_config(&provider);
+        assert!(
+            err.is_some(),
+            "blank endpoint must fail static validation before probe runs"
+        );
+    }
+
+    #[test]
+    fn no_health_check_config_means_not_probed() {
+        // probe_url_for_provider returns None → ProbeOutcome::NotProbed
+        // → phase_from_probe preserves site_phase unchanged.
+        let spec = make_spec("http://vllm:8000", None, None);
+        assert!(
+            probe_url_for_provider(&spec).is_none(),
+            "absent health_check must yield NotProbed path"
+        );
+        let phase = phase_from_probe(ProbeOutcome::NotProbed, ProviderPhase::Available);
+        assert_eq!(phase, ProviderPhase::Available, "NotProbed must preserve Available");
+    }
+
+    // -----------------------------------------------------------------------
+    // Test Utilities
+    // -----------------------------------------------------------------------
+
+    fn make_spec(endpoint: &str, health_path: Option<&str>, timeout: Option<&str>) -> InferenceProviderSpec {
+        serde_json::from_value(serde_json::json!({
+            "gridNetworkRef": "net",
+            "providerKind": "self_hosted",
+            "backendKind": "local",
+            "endpoint": endpoint,
+            "models": [{"name": "model-a"}],
+            "healthCheck": if health_path.is_some() || timeout.is_some() {
+                serde_json::json!({
+                    "path": health_path,
+                    "timeout": timeout
+                })
+            } else {
+                serde_json::Value::Null
+            }
+        }))
+        .unwrap_or_else(|_| std::process::abort())
+    }
+
+    fn make_spec_with_health_check(
+        endpoint: &str,
+        health_path: Option<&str>,
+        timeout: Option<&str>,
+    ) -> InferenceProviderSpec {
+        serde_json::from_value(serde_json::json!({
+            "gridNetworkRef": "net",
+            "providerKind": "self_hosted",
+            "backendKind": "local",
+            "endpoint": endpoint,
+            "models": [{"name": "model-a"}],
+            "healthCheck": {
+                "path": health_path,
+                "timeout": timeout
+            }
+        }))
+        .unwrap_or_else(|_| std::process::abort())
+    }
 }

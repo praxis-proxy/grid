@@ -10,6 +10,7 @@ publish = false
 [dependencies]
 certs = { path = "../certs" }
 futures = { workspace = true }
+http = { workspace = true }
 scoring = { path = "../scoring" }
 k8s-openapi = { workspace = true }
 kube = { workspace = true }
