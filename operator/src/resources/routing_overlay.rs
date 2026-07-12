@@ -44,7 +44,7 @@
 //! [`GridSite`]: crate::crd::grid_site::GridSite
 //! [`InferenceProvider`]: crate::crd::inference_provider::InferenceProvider
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use k8s_openapi::api::core::v1::ConfigMap;
 use serde::{Deserialize, Serialize};
@@ -67,6 +67,43 @@ const MAX_COMPONENT_PREFIX: usize = 20;
 
 /// Candidate kind identifier for inference model entries.
 const CANDIDATE_KIND: &str = "inference_model";
+
+/// Fallback locality score when `backend_kind` is absent or unrecognised.
+///
+/// Matches `scoring::DEFAULT_SIGNAL_SCORE` (0.5) to keep the default
+/// consistent with the scoring crate's unknown-metric handling.
+const DEFAULT_LOCALITY: f64 = 0.5;
+
+// ---------------------------------------------------------------------------
+// Locality scoring
+// ---------------------------------------------------------------------------
+
+/// Derive the locality score for an [`InferenceProvider`] from its
+/// `spec.backendKind` string.
+///
+/// Parses the `backend_kind` value as a [`scoring::BackendKind`] and
+/// delegates to [`scoring::locality_score`] with no region context
+/// (`None, None`).  Unrecognised kinds default to
+/// [`DEFAULT_LOCALITY`] (0.5).
+///
+/// This is used to sort overlay candidates so that lower-latency /
+/// higher-priority backends appear first, giving Praxis a
+/// locality-ordered candidate list without live metrics.
+///
+/// | `backend_kind` | Score |
+/// |----------------|-------|
+/// | `"local"` | 1.0 |
+/// | `"remote"` | 0.5 (no region context) |
+/// | `"cloud_managed"` | 0.2 |
+/// | `"api_provider"` | 0.1 |
+/// | unknown | 0.5 |
+///
+/// [`InferenceProvider`]: crate::crd::inference_provider::InferenceProvider
+pub(crate) fn backend_locality_score(backend_kind: &str) -> f64 {
+    let kind: Option<scoring::BackendKind> =
+        serde_json::from_value(serde_json::Value::String(backend_kind.to_owned())).ok();
+    kind.map_or(DEFAULT_LOCALITY, |k| scoring::locality_score(k, None, None))
+}
 
 // ---------------------------------------------------------------------------
 // Site resolution
@@ -174,7 +211,8 @@ pub struct RoutingOverlay {
     /// higher than remote candidates.
     pub local_site: String,
 
-    /// Routing candidates, sorted deterministically by site then name.
+    /// Routing candidates, sorted deterministically by locality score and
+    /// then by site, name, and cluster.
     pub candidates: Vec<RoutingCandidate>,
 }
 
@@ -197,7 +235,11 @@ pub struct RoutingOverlay {
 /// local_site = gw_ref.local_site_name.as_deref().unwrap_or(network_name)
 /// ```
 ///
-/// Candidates are sorted deterministically by `(site, name, cluster)`.
+/// Candidates are sorted deterministically by locality score (descending)
+/// then `(site, name, cluster)` for ties.  Locality score is derived from
+/// `spec.backendKind` via `backend_locality_score`:
+/// `local` (1.0) → `remote` (0.5) → `cloud_managed` (0.2) → `api_provider` (0.1).
+/// This gives Praxis a priority-ordered candidate list without live metrics.
 /// Exact duplicates — same `(kind, name, site, cluster)` — are removed.
 /// Two providers that serve the same model on the same site but with
 /// different cluster identifiers are **not** deduplicated.
@@ -222,10 +264,25 @@ pub fn render_routing_overlay(
         .as_deref()
         .ok_or_else(|| "GridNetwork has no name".to_owned())?;
 
+    // Build a locality score lookup: provider name (= cluster) → score.
+    // The lookup avoids re-deriving the kind string for every candidate pair
+    // during sorting.  Unknown providers default to DEFAULT_LOCALITY (0.5).
+    let locality: HashMap<&str, f64> = providers
+        .iter()
+        .filter_map(|p| {
+            let name = p.metadata.name.as_deref()?;
+            Some((name, backend_locality_score(&p.spec.backend_kind)))
+        })
+        .collect();
+
     let mut candidates = collect_candidates(network_name, sites, providers)?;
     candidates.sort_by(|a, b| {
-        a.site
-            .cmp(&b.site)
+        let score_a = locality.get(a.cluster.as_str()).copied().unwrap_or(DEFAULT_LOCALITY);
+        let score_b = locality.get(b.cluster.as_str()).copied().unwrap_or(DEFAULT_LOCALITY);
+        // Higher locality score first (descending), then alphabetical tiebreak.
+        score_b
+            .total_cmp(&score_a)
+            .then(a.site.cmp(&b.site))
             .then(a.name.cmp(&b.name))
             .then(a.cluster.cmp(&b.cluster))
     });
@@ -594,6 +651,179 @@ mod tests {
 
     fn build_cm(overlay: &RoutingOverlay, net: &str, gw: &str) -> ConfigMap {
         build_overlay_configmap(overlay, net, gw, "ns").unwrap_or_else(|_| std::process::abort())
+    }
+
+    fn test_provider_with_backend_kind(name: &str, network: &str, backend_kind: &str) -> InferenceProvider {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "kind": "InferenceProvider",
+            "metadata": { "name": name },
+            "spec": {
+                "gridNetworkRef": network,
+                "providerKind": "self_hosted",
+                "backendKind": backend_kind,
+                "endpoint": "http://localhost:8000",
+                "models": [{ "name": "model-a" }]
+            }
+        }))
+        .unwrap_or_else(|_| std::process::abort())
+    }
+
+    // -----------------------------------------------------------------------
+    // backend_locality_score — pure mapping function
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn local_backend_kind_scores_highest() {
+        let score = backend_locality_score("local");
+        assert!((score - 1.0).abs() < f64::EPSILON, "local must score 1.0, got {score}");
+    }
+
+    #[test]
+    fn remote_backend_kind_scores_half() {
+        // No region context → remote falls back to 0.5.
+        let score = backend_locality_score("remote");
+        assert!(
+            (score - 0.5).abs() < f64::EPSILON,
+            "remote (no region) must score 0.5, got {score}"
+        );
+    }
+
+    #[test]
+    fn cloud_managed_backend_kind_scores_low() {
+        let score = backend_locality_score("cloud_managed");
+        assert!(
+            (score - 0.2).abs() < f64::EPSILON,
+            "cloud_managed must score 0.2, got {score}"
+        );
+    }
+
+    #[test]
+    fn api_provider_backend_kind_scores_lowest() {
+        let score = backend_locality_score("api_provider");
+        assert!(
+            (score - 0.1).abs() < f64::EPSILON,
+            "api_provider must score 0.1, got {score}"
+        );
+    }
+
+    #[test]
+    fn unknown_backend_kind_defaults_to_half() {
+        let score = backend_locality_score("unknown_kind_xyz");
+        assert!(
+            (score - DEFAULT_LOCALITY).abs() < f64::EPSILON,
+            "unknown kind must default to {DEFAULT_LOCALITY}, got {score}"
+        );
+    }
+
+    #[test]
+    fn empty_backend_kind_defaults_to_half() {
+        let score = backend_locality_score("");
+        assert!(
+            (score - DEFAULT_LOCALITY).abs() < f64::EPSILON,
+            "empty kind must default to {DEFAULT_LOCALITY}, got {score}"
+        );
+    }
+
+    #[test]
+    fn locality_scores_are_strictly_ordered() {
+        let local = backend_locality_score("local");
+        let remote = backend_locality_score("remote");
+        let cloud = backend_locality_score("cloud_managed");
+        let api = backend_locality_score("api_provider");
+        assert!(local > remote, "local ({local}) must outscore remote ({remote})");
+        assert!(
+            remote > cloud,
+            "remote ({remote}) must outscore cloud_managed ({cloud})"
+        );
+        assert!(
+            cloud > api,
+            "cloud_managed ({cloud}) must outscore api_provider ({api})"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Locality-ordered candidate sort
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn local_provider_ranks_before_api_provider() {
+        let network = test_network("net");
+        let local_prov = test_provider_with_backend_kind("local-prov", "net", "local");
+        let api_prov = test_provider_with_backend_kind("api-prov", "net", "api_provider");
+        let overlay = render_routing_overlay(&network, &[], &[api_prov, local_prov], "test-site")
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            overlay.candidates.first().map(|c| c.cluster.as_str()),
+            Some("local-prov"),
+            "local provider must appear before api_provider regardless of input order"
+        );
+    }
+
+    #[test]
+    fn all_four_backend_kinds_order_correctly() {
+        let network = test_network("net");
+        // Deliberately supply in reverse priority order.
+        let api = test_provider_with_backend_kind("z-api", "net", "api_provider");
+        let cloud = test_provider_with_backend_kind("z-cloud", "net", "cloud_managed");
+        let remote = test_provider_with_backend_kind("z-remote", "net", "remote");
+        let local = test_provider_with_backend_kind("z-local", "net", "local");
+        let overlay = render_routing_overlay(&network, &[], &[api, cloud, remote, local], "test-site")
+            .unwrap_or_else(|_| std::process::abort());
+        let clusters: Vec<&str> = overlay.candidates.iter().map(|c| c.cluster.as_str()).collect();
+        // local (1.0) → remote (0.5) → cloud_managed (0.2) → api_provider (0.1)
+        assert_eq!(
+            clusters,
+            ["z-local", "z-remote", "z-cloud", "z-api"],
+            "candidates must be ordered by locality: local > remote > cloud_managed > api_provider"
+        );
+    }
+
+    #[test]
+    fn same_locality_kind_falls_back_to_alphabetical() {
+        let network = test_network("net");
+        let p_z = test_provider_with_backend_kind("z-api", "net", "api_provider");
+        let p_a = test_provider_with_backend_kind("a-api", "net", "api_provider");
+        let overlay =
+            render_routing_overlay(&network, &[], &[p_z, p_a], "test-site").unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            overlay.candidates.first().map(|c| c.cluster.as_str()),
+            Some("a-api"),
+            "equal locality must fall back to alphabetical by cluster"
+        );
+    }
+
+    #[test]
+    fn locality_ordering_is_deterministic_regardless_of_input_order() {
+        let network = test_network("net");
+        let local = test_provider_with_backend_kind("prov-local", "net", "local");
+        let api = test_provider_with_backend_kind("prov-api", "net", "api_provider");
+        let fwd = render_routing_overlay(&network, &[], &[local.clone(), api.clone()], "test-site")
+            .unwrap_or_else(|_| std::process::abort());
+        let rev =
+            render_routing_overlay(&network, &[], &[api, local], "test-site").unwrap_or_else(|_| std::process::abort());
+        let fwd_clusters: Vec<&str> = fwd.candidates.iter().map(|c| c.cluster.as_str()).collect();
+        let rev_clusters: Vec<&str> = rev.candidates.iter().map(|c| c.cluster.as_str()).collect();
+        assert_eq!(
+            fwd_clusters, rev_clusters,
+            "locality ordering must be deterministic regardless of input order"
+        );
+    }
+
+    #[test]
+    fn unknown_backend_kind_sorts_with_remote() {
+        // Unknown kind defaults to 0.5 (same as remote with no region).
+        // Both should sort before cloud_managed (0.2) and api_provider (0.1).
+        let network = test_network("net");
+        let cloud = test_provider_with_backend_kind("cloud-prov", "net", "cloud_managed");
+        let unknown = test_provider_with_backend_kind("unknown-prov", "net", "nonexistent_kind");
+        let overlay = render_routing_overlay(&network, &[], &[cloud, unknown], "test-site")
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            overlay.candidates.first().map(|c| c.cluster.as_str()),
+            Some("unknown-prov"),
+            "unknown kind (0.5) must rank before cloud_managed (0.2)"
+        );
     }
 
     // -----------------------------------------------------------------------

@@ -24,7 +24,3 @@ uuid = { workspace = true }
 
 [lints]
 workspace = true
-
-[package.metadata.cargo-machete]
-# scoring is consumed via the operator overlay config; not yet referenced in stub code
-ignored = ["scoring"]
