@@ -210,6 +210,33 @@ pub(crate) enum Action {
         #[arg(long)]
         site: Option<String>,
     },
+
+    /// Prove live SWIM membership reaches `GridNetwork` status.
+    ///
+    /// Starts two out-of-cluster operator processes each with a distinct SWIM
+    /// identity, has the secondary announce to the primary, waits for gossip
+    /// convergence, then applies a `GridNetwork` resource and polls until:
+    ///
+    /// - `status.phase = Active` (derived from live `MembershipSnapshot`)
+    /// - `status.connectedSites ≥ 1` (one SWIM peer confirmed alive)
+    ///
+    /// Uses available localhost UDP ports selected at runtime. Both operators
+    /// connect to the same kind cluster (context resolved from `config` via
+    /// `--site`). Safe to rerun: the `GridNetwork` fixture is deleted before
+    /// and after the run.
+    ///
+    /// Requires a kind cluster with Grid CRDs installable (`env up` +
+    /// `env load-gateway-images` are **not** required — this command installs
+    /// the CRDs itself).
+    VerifySwimMembership {
+        /// Path to the environment config file.
+        #[arg(short, long, default_value = "tests/env/operator-routing.toml")]
+        config: PathBuf,
+
+        /// Kind cluster context to run against (first provider site by default).
+        #[arg(long)]
+        site: Option<String>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -241,6 +268,7 @@ pub(crate) fn run(action: &Action) -> Result<(), Box<dyn std::error::Error>> {
         Action::InstallGridCrds { config, site } => env_install_grid_crds(config, site.as_deref()),
         Action::VerifyOperatorReconcile { config, site } => env_verify_operator_reconcile(config, site.as_deref()),
         Action::ValidateOperatorRouting { config, site } => env_validate_operator_routing(config, site.as_deref()),
+        Action::VerifySwimMembership { config, site } => env_verify_swim_membership(config, site.as_deref()),
     }
 }
 
@@ -635,4 +663,79 @@ fn env_validate_operator_routing(config: &Path, site: Option<&str>) -> Result<()
 
     eprintln!("validate-operator-routing: PASS");
     Ok(())
+}
+
+/// Prove that live SWIM membership reaches `GridNetwork` status.
+///
+/// Starts two SWIM-enabled operator processes, waits for gossip convergence,
+/// applies a `GridNetwork` fixture, then polls until `phase = Active` and
+/// `connectedSites ≥ 1`.
+///
+/// Both operators connect to the same kind cluster (the first provider site from
+/// `config`). They bind on available localhost UDP ports chosen at runtime.
+fn env_verify_swim_membership(config: &Path, site: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    use operator::{
+        SWIM_CONVERGENCE_WAIT, SWIM_NODE_PRIMARY_NAME, SWIM_NODE_SECONDARY_NAME, SWIM_STATUS_POLL_TIMEOUT,
+        SWIM_TEST_NETWORK,
+    };
+
+    let cfg = EnvConfig::from_file(config)?;
+    let context = resolve_operator_context(&cfg, site)?;
+    eprintln!("verify-swim-membership: context={context}");
+
+    // Step 1: install Grid CRDs and remove any stale SWIM test resources.
+    operator::install_grid_crds(&context)?;
+    operator::cleanup_swim_test_resources(&context)?;
+
+    let (bind1, bind2) = reserve_swim_bind_addrs()?;
+
+    // Step 2: start the primary SWIM operator (no seeds — it is the first member).
+    let op1 = operator::spawn_operator_with_swim(&context, &bind1, &bind1, SWIM_NODE_PRIMARY_NAME, "")?;
+    let mut op1_guard = ProcGuard(Some(op1), "operator-primary");
+
+    // Step 3: start the secondary operator with the primary as its seed.
+    // spawn_operator_with_swim includes a 3-second post-spawn settle sleep, so
+    // the primary's SWIM listener is ready before the secondary announces.
+    let op2 = operator::spawn_operator_with_swim(&context, &bind2, &bind2, SWIM_NODE_SECONDARY_NAME, &bind1)?;
+    let mut op2_guard = ProcGuard(Some(op2), "operator-secondary");
+
+    // Step 4: wait for SWIM gossip to converge (both nodes see each other as Alive).
+    operator::wait_for_swim_convergence(SWIM_CONVERGENCE_WAIT);
+
+    // Step 5: apply the GridNetwork fixture.
+    // Both SWIM-enabled operators are watching for GridNetwork resources.
+    // The watch event from the new resource triggers an immediate reconcile in
+    // both operators; by this point SWIM has converged, so each operator's live
+    // MembershipSnapshot already contains the other as an Alive peer.
+    operator::apply_swim_test_network(&context)?;
+    eprintln!("  GridNetwork {SWIM_TEST_NETWORK} applied; awaiting Active status from live SWIM snapshot...");
+
+    // Step 6: poll until the GridNetwork status reflects the SWIM membership.
+    let result = operator::wait_for_gridnetwork_active(&context, SWIM_TEST_NETWORK, SWIM_STATUS_POLL_TIMEOUT);
+
+    // Always stop both operators before propagating errors.
+    if let Some(c) = op1_guard.0.take() {
+        operator::kill_operator(c);
+    }
+    if let Some(c) = op2_guard.0.take() {
+        operator::kill_operator(c);
+    }
+    operator::cleanup_swim_test_resources(&context)?;
+
+    // Step 7: verify the result.
+    let connected_sites = result?;
+    operator::verify_swim_status("Active", connected_sites)?;
+
+    eprintln!("verify-swim-membership: PASS (connectedSites={connected_sites})");
+    Ok(())
+}
+
+/// Reserve two distinct localhost UDP addresses for the SWIM membership check.
+fn reserve_swim_bind_addrs() -> Result<(String, String), Box<dyn std::error::Error>> {
+    let bind1 = operator::reserve_local_udp_addr()?.to_string();
+    let mut bind2 = operator::reserve_local_udp_addr()?.to_string();
+    while bind2 == bind1 {
+        bind2 = operator::reserve_local_udp_addr()?.to_string();
+    }
+    Ok((bind1, bind2))
 }

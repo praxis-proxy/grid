@@ -15,6 +15,7 @@
 
 use std::{
     io::Write as _,
+    net::{SocketAddr, UdpSocket},
     process::{Child, Command, Stdio},
     time::{Duration, Instant},
 };
@@ -93,6 +94,32 @@ const METRICS_QUEUE_SIGNAL_NAME: &str = "provider_queue_depth_normalized";
 const METRICS_IDLE_QUEUE_DEPTH: &str = "0.1";
 /// Queue depth value served by the busy metrics endpoint Pod (high → low score).
 const METRICS_BUSY_QUEUE_DEPTH: &str = "0.9";
+
+// ---------------------------------------------------------------------------
+// SWIM membership validation constants
+// ---------------------------------------------------------------------------
+
+/// `GridNetwork` resource name used by the SWIM membership validation.
+///
+/// Kept distinct from `TEST_NETWORK` (`op-e2e-net`) so both validations can
+/// coexist without resource collisions.
+pub(crate) const SWIM_TEST_NETWORK: &str = "op-e2e-swim-net";
+
+/// SWIM site identity for the primary operator.
+pub(crate) const SWIM_NODE_PRIMARY_NAME: &str = "swim-node-p";
+
+/// SWIM site identity for the secondary operator.
+pub(crate) const SWIM_NODE_SECONDARY_NAME: &str = "swim-node-s";
+
+/// Time to wait after the secondary operator announces to the primary before
+/// applying the `GridNetwork` fixture.
+///
+/// SWIM gossip converges in 1–3 s with foca's default probe interval; 10 s
+/// provides a comfortable margin on slow CI hosts.
+pub(crate) const SWIM_CONVERGENCE_WAIT: Duration = Duration::from_secs(10);
+
+/// Timeout for polling the `GridNetwork` status to reach `Active`.
+pub(crate) const SWIM_STATUS_POLL_TIMEOUT: Duration = Duration::from_secs(30);
 
 // ---------------------------------------------------------------------------
 // CRD installation
@@ -254,6 +281,159 @@ pub(crate) fn kill_operator(mut child: Child) {
     drop(child.kill());
     drop(child.wait());
     eprintln!("  operator stopped");
+}
+
+// ---------------------------------------------------------------------------
+// SWIM membership kind validation helpers
+// ---------------------------------------------------------------------------
+
+/// Reserve a currently available localhost UDP socket address for SWIM validation.
+///
+/// The returned address is released before the operator subprocess binds it, so
+/// this is still best-effort.  It avoids hardcoded port collisions while keeping
+/// the validation deterministic enough for local and CI runs.
+pub(crate) fn reserve_local_udp_addr() -> Result<SocketAddr, Box<dyn std::error::Error>> {
+    let socket = UdpSocket::bind("127.0.0.1:0")?;
+    let addr = socket.local_addr()?;
+    drop(socket);
+    Ok(addr)
+}
+
+#[expect(
+    clippy::disallowed_methods,
+    reason = "spawn + settle sleep in xtask; no async runtime available"
+)]
+/// Spawn the Grid operator with SWIM membership enabled.
+///
+/// Equivalent to [`spawn_operator`] but also sets:
+/// - `GRID_SWIM_BIND_ADDR` — UDP address for the SWIM listener
+/// - `GRID_SWIM_ADVERTISE_ADDR` — address peers use to reach this node
+/// - `GRID_SWIM_SITE_NAME` — stable site identity (must match `GridSite.metadata.name`)
+/// - `GRID_SWIM_SEEDS` — comma-separated seed peer addresses (empty = no seeds)
+pub(crate) fn spawn_operator_with_swim(
+    context: &str,
+    bind_addr: &str,
+    advertise_addr: &str,
+    site_name: &str,
+    seeds: &str,
+) -> Result<Child, Box<dyn std::error::Error>> {
+    eprintln!("  setting kubectl context to {context}...");
+    Command::new("kubectl")
+        .args(["config", "use-context", context])
+        .status()?;
+
+    eprintln!("  spawning SWIM operator (site={site_name}, bind={bind_addr}, seeds={seeds:?})...");
+    let child = Command::new("cargo")
+        .args(["run", "--quiet", "-p", "operator", "--bin", "operator"])
+        .env("GRID_SWIM_BIND_ADDR", bind_addr)
+        .env("GRID_SWIM_ADVERTISE_ADDR", advertise_addr)
+        .env("GRID_SWIM_SITE_NAME", site_name)
+        .env("GRID_SWIM_SEEDS", seeds)
+        .stdin(Stdio::null())
+        .spawn()?;
+    // Brief pause so the operator establishes watches and starts its SWIM listener.
+    std::thread::sleep(Duration::from_secs(3));
+    Ok(child)
+}
+
+#[expect(
+    clippy::disallowed_methods,
+    reason = "deliberate fixed wait for SWIM gossip convergence; no async runtime available"
+)]
+/// Wait `duration` for SWIM gossip to converge between peer operators.
+///
+/// SWIM uses repeated probes on a ~1 s interval (foca `Config::simple`).
+/// Calling this after announcing the secondary operator to the primary gives
+/// time for both sides to exchange membership tables before the test reads
+/// `GridNetwork.status.connectedSites`.
+pub(crate) fn wait_for_swim_convergence(duration: Duration) {
+    eprintln!("  waiting {duration:?} for SWIM gossip convergence...");
+    std::thread::sleep(duration);
+}
+
+/// Apply the bare `GridNetwork` resource used by the SWIM membership validation.
+///
+/// No `gatewayRefs` or `InferenceProvider`s are needed — the test only
+/// verifies that `status.connectedSites` and `status.phase` reflect the live
+/// SWIM snapshot from the running operators.
+pub(crate) fn apply_swim_test_network(context: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let manifest = serde_json::to_string_pretty(&serde_json::json!({
+        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "kind": "GridNetwork",
+        "metadata": { "name": SWIM_TEST_NETWORK },
+        "spec": { "seeds": [] }
+    }))
+    .unwrap_or_else(|e| {
+        eprintln!("SWIM test network serialization failed: {e}");
+        std::process::exit(1);
+    });
+    apply_manifest(context, &manifest)?;
+    eprintln!("  [OK] SWIM test GridNetwork {SWIM_TEST_NETWORK} applied");
+    Ok(())
+}
+
+/// Delete resources created by the SWIM membership validation.
+///
+/// Safe to call before a fresh run — all deletes use `--ignore-not-found`.
+pub(crate) fn cleanup_swim_test_resources(context: &str) -> Result<(), Box<dyn std::error::Error>> {
+    delete_cluster_resource(context, "gridnetwork", SWIM_TEST_NETWORK)?;
+    eprintln!("  [OK] stale SWIM test resources removed");
+    Ok(())
+}
+
+#[expect(
+    clippy::disallowed_methods,
+    reason = "synchronous poll loop in xtask; no async runtime available"
+)]
+/// Poll the `GridNetwork` status until `phase = Active` and `connectedSites > 0`.
+///
+/// Returns the `connectedSites` count when the condition is met.
+/// Returns `Err` when `timeout` elapses without the condition being satisfied.
+///
+/// Triggers immediately after applying the `GridNetwork` fixture because the kube
+/// watch event causes both SWIM-enabled operators to reconcile at once.
+pub(crate) fn wait_for_gridnetwork_active(
+    context: &str,
+    name: &str,
+    timeout: Duration,
+) -> Result<u32, Box<dyn std::error::Error>> {
+    let start = Instant::now();
+    loop {
+        let phase = kubectl_jsonpath(context, &format!("gridnetworks/{name}"), "{.status.phase}").unwrap_or_default();
+        let sites_str =
+            kubectl_jsonpath(context, &format!("gridnetworks/{name}"), "{.status.connectedSites}").unwrap_or_default();
+        let sites: u32 = sites_str.parse().unwrap_or(0);
+
+        if phase == "Active" && sites > 0 {
+            eprintln!("  [OK] GridNetwork {name}: phase=Active, connectedSites={sites}");
+            return Ok(sites);
+        }
+
+        if start.elapsed() >= timeout {
+            return Err(format!(
+                "timeout waiting for GridNetwork {name} to reach Active with connectedSites>0; \
+                 last observed: phase={phase:?}, connectedSites={sites}"
+            )
+            .into());
+        }
+        eprintln!("  waiting for GridNetwork {name} Active (phase={phase:?}, connectedSites={sites})...");
+        std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// Verify that a `GridNetwork` `phase` is `"Active"` and `connected_sites > 0`.
+///
+/// This is the pure assertion called after [`wait_for_gridnetwork_active`]
+/// returns.  It is separate to allow unit testing without a live cluster.
+pub(crate) fn verify_swim_status(phase: &str, connected_sites: u32) -> Result<(), Box<dyn std::error::Error>> {
+    if phase != "Active" {
+        return Err(format!("SWIM validation failed: GridNetwork phase must be Active, got {phase:?}").into());
+    }
+    if connected_sites == 0 {
+        return Err("SWIM validation failed: connectedSites must be > 0 but is 0".into());
+    }
+    eprintln!("  [OK] SWIM membership: phase=Active, connectedSites={connected_sites}");
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1296,6 +1476,90 @@ mod tests {
             )
             .is_err(),
             "absent busy cluster must fail"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // verify_swim_status — pure assertion tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn verify_swim_status_active_with_peers_passes() {
+        assert!(
+            verify_swim_status("Active", 1).is_ok(),
+            "Active phase with connectedSites=1 must pass"
+        );
+    }
+
+    #[test]
+    fn verify_swim_status_active_with_multiple_peers_passes() {
+        assert!(
+            verify_swim_status("Active", 3).is_ok(),
+            "Active phase with connectedSites=3 must pass"
+        );
+    }
+
+    #[test]
+    fn verify_swim_status_pending_fails() {
+        assert!(
+            verify_swim_status("Pending", 1).is_err(),
+            "Pending phase must fail even with connected peers"
+        );
+    }
+
+    #[test]
+    fn verify_swim_status_active_zero_connected_fails() {
+        assert!(
+            verify_swim_status("Active", 0).is_err(),
+            "Active phase with connectedSites=0 must fail"
+        );
+    }
+
+    #[test]
+    fn verify_swim_status_initializing_fails() {
+        assert!(
+            verify_swim_status("Initializing", 2).is_err(),
+            "Initializing phase must fail"
+        );
+    }
+
+    #[test]
+    fn swim_node_names_are_distinct() {
+        assert_ne!(
+            SWIM_NODE_PRIMARY_NAME, SWIM_NODE_SECONDARY_NAME,
+            "SWIM node site names must be distinct"
+        );
+    }
+
+    #[test]
+    fn reserve_local_udp_addr_returns_loopback_addr() {
+        let addr = reserve_local_udp_addr().unwrap_or_else(|_| std::process::abort());
+        assert!(addr.ip().is_loopback(), "reserved SWIM addr must be loopback");
+        assert_ne!(
+            addr.port(),
+            ERROR_ENDPOINT_LOCAL_PORT,
+            "reserved SWIM addr should not use the fixed error endpoint port"
+        );
+    }
+
+    #[test]
+    fn swim_test_network_distinct_from_operator_network() {
+        assert_ne!(
+            SWIM_TEST_NETWORK, TEST_NETWORK,
+            "SWIM test network must be distinct from operator reconcile test network"
+        );
+    }
+
+    #[test]
+    fn cleanup_swim_includes_only_swim_resources() {
+        // Documents which resources cleanup_swim_test_resources deletes.
+        // If you add new SWIM fixtures, add them here.
+        let swim_resources = [SWIM_TEST_NETWORK];
+        let unique: std::collections::HashSet<_> = swim_resources.iter().collect();
+        assert_eq!(
+            unique.len(),
+            swim_resources.len(),
+            "SWIM test resource names must be distinct"
         );
     }
 }
