@@ -45,6 +45,21 @@ pub(crate) const TEST_PROVIDER_DEGRADED: &str = "op-e2e-degraded";
 /// Used to verify scoring-backed candidate ordering: `api_provider` (score ≈ 5.8) must
 /// appear after local providers (score ≈ 7.0) regardless of input order.
 pub(crate) const TEST_PROVIDER_API: &str = "op-e2e-api-fallback";
+
+/// The `routingClusterRef` set on the healthy provider fixture.
+///
+/// Matches the xtask topology site name `site-a` so that the operator-generated
+/// overlay candidate has `site: "site-a"` and `cluster: "site-a"`.  The xtask
+/// consumer gateway builder generates `load_balancer` cluster entries named
+/// `gateway-{site}`, so `gateway-site-a` routes to the site-a provider gateway.
+pub(crate) const TEST_HEALTHY_ROUTING_CLUSTER: &str = "site-a";
+
+/// The `routingClusterRef` set on the degraded provider fixture.
+///
+/// Routes through the same site-a provider gateway as the healthy fixture.
+/// The degraded candidate appears in the overlay with `fresh: false`; Praxis
+/// applies its own freshness scoring but the route is still established.
+pub(crate) const TEST_DEGRADED_ROUTING_CLUSTER: &str = "site-a";
 /// Name of the in-cluster Pod and Service that serves HTTP 503 for the degraded provider probe.
 pub(crate) const ERROR_ENDPOINT_NAME: &str = "op-e2e-error-endpoint";
 /// Local port used when port-forwarding the error-endpoint Pod to the operator host.
@@ -117,8 +132,13 @@ fn generate_crd_json() -> Result<String, Box<dyn std::error::Error>> {
 /// - `InferenceProvider` `op-e2e-invalid` — blank endpoint → reconciles to `Unavailable`
 pub(crate) fn apply_test_fixtures(context: &str, provider_endpoint: &str) -> Result<(), Box<dyn std::error::Error>> {
     let network = network_fixture_json(TEST_NETWORK, TEST_GATEWAY_NAME, TEST_GATEWAY_NS);
-    let healthy = provider_fixture_json(TEST_PROVIDER_HEALTHY, TEST_NETWORK, provider_endpoint);
-    let invalid = provider_fixture_json(TEST_PROVIDER_INVALID, TEST_NETWORK, "");
+    let healthy = provider_fixture_json(
+        TEST_PROVIDER_HEALTHY,
+        TEST_NETWORK,
+        provider_endpoint,
+        Some(TEST_HEALTHY_ROUTING_CLUSTER),
+    );
+    let invalid = provider_fixture_json(TEST_PROVIDER_INVALID, TEST_NETWORK, "", None);
     apply_manifest(context, &network)?;
     apply_manifest(context, &healthy)?;
     apply_manifest(context, &invalid)?;
@@ -144,18 +164,27 @@ fn network_fixture_json(name: &str, gw_name: &str, gw_ns: &str) -> String {
 }
 
 /// Build an `InferenceProvider` JSON fixture.
-fn provider_fixture_json(name: &str, network_ref: &str, endpoint: &str) -> String {
+///
+/// When `routing_cluster_ref` is `Some(name)`, sets `spec.routingClusterRef`
+/// so that overlay candidates use `name` as both `site` and `cluster` (Phase 1).
+fn provider_fixture_json(name: &str, network_ref: &str, endpoint: &str, routing_cluster_ref: Option<&str>) -> String {
+    let mut spec = serde_json::json!({
+        "gridNetworkRef": network_ref,
+        "providerKind": "open_ai",
+        "backendKind": "local",
+        "endpoint": endpoint,
+        "models": [{ "name": "model-x" }]
+    });
+    if let Some(r) = routing_cluster_ref
+        && let Some(s) = spec.as_object_mut()
+    {
+        s.insert("routingClusterRef".to_owned(), serde_json::Value::String(r.to_owned()));
+    }
     serde_json::to_string_pretty(&serde_json::json!({
         "apiVersion": "grid.praxis-proxy.io/v1alpha1",
         "kind": "InferenceProvider",
         "metadata": { "name": name },
-        "spec": {
-            "gridNetworkRef": network_ref,
-            "providerKind": "open_ai",
-            "backendKind": "local",
-            "endpoint": endpoint,
-            "models": [{ "name": "model-x" }]
-        }
+        "spec": spec
     }))
     .unwrap_or_else(|e| {
         eprintln!("fixture serialization failed: {e}");
@@ -313,18 +342,19 @@ pub(crate) fn verify_overlay(
         .as_array()
         .ok_or("overlay missing candidates array")?;
 
-    let healthy = candidates
+    // A site may have multiple candidates (e.g. healthy + degraded providers both at
+    // site-a with routingClusterRef="site-a").  We require that at least one has fresh=true.
+    let has_fresh = candidates
         .iter()
-        .find(|c| c["cluster"].as_str() == Some(healthy_cluster));
-    let Some(healthy) = healthy else {
+        .any(|c| c["cluster"].as_str() == Some(healthy_cluster) && c["fresh"].as_bool() == Some(true));
+    let has_cluster = candidates
+        .iter()
+        .any(|c| c["cluster"].as_str() == Some(healthy_cluster));
+    if !has_cluster {
         return Err(format!("expected {healthy_cluster} in candidates, not found").into());
-    };
-
-    let fresh = healthy["fresh"]
-        .as_bool()
-        .ok_or_else(|| format!("{healthy_cluster} candidate missing 'fresh' field"))?;
-    if !fresh {
-        return Err(format!("{healthy_cluster} candidate must have fresh=true").into());
+    }
+    if !has_fresh {
+        return Err(format!("{healthy_cluster} must have at least one fresh=true candidate").into());
     }
 
     let found_excluded = candidates
@@ -474,6 +504,7 @@ pub(crate) fn apply_degraded_provider_fixture(context: &str, endpoint: &str) -> 
             "backendKind": "local",
             "endpoint": endpoint,
             "healthCheck": { "path": "/health", "timeout": "5s" },
+            "routingClusterRef": TEST_DEGRADED_ROUTING_CLUSTER,
             "models": [{ "name": "model-y" }]
         }
     }))
@@ -569,6 +600,11 @@ pub(crate) fn export_overlay_to_file(
 
 /// Verify that `degraded_cluster` appears in overlay candidates with `fresh: false`.
 ///
+/// A site may have multiple candidates (e.g. both healthy and degraded providers sharing
+/// `routingClusterRef`).  We require that at least one candidate with `cluster =
+/// degraded_cluster` carries `fresh = false`, confirming the Degraded provider is
+/// represented as stale in the overlay.
+///
 /// Also verifies that all candidates carry the required Praxis wire-format fields.
 pub(crate) fn verify_degraded_candidate(
     overlay: &serde_json::Value,
@@ -578,21 +614,26 @@ pub(crate) fn verify_degraded_candidate(
         .as_array()
         .ok_or("overlay missing candidates array")?;
 
+    let has_cluster = candidates
+        .iter()
+        .any(|c| c["cluster"].as_str() == Some(degraded_cluster));
+    if !has_cluster {
+        return Err(format!("{degraded_cluster} must be in overlay but is absent").into());
+    }
+
+    // Find the specific fresh=false candidate that proves the Degraded provider is stale.
     let degraded = candidates
         .iter()
-        .find(|c| c["cluster"].as_str() == Some(degraded_cluster))
-        .ok_or_else(|| format!("{degraded_cluster} must be in overlay but is absent"))?;
-
-    let fresh = degraded["fresh"]
-        .as_bool()
-        .ok_or_else(|| format!("{degraded_cluster} candidate missing 'fresh' field"))?;
-    if fresh {
-        return Err(format!("{degraded_cluster} candidate must have fresh=false (Degraded), got fresh=true").into());
-    }
+        .find(|c| c["cluster"].as_str() == Some(degraded_cluster) && c["fresh"].as_bool() == Some(false))
+        .ok_or_else(|| {
+            format!(
+                "{degraded_cluster} has no fresh=false candidate — Degraded provider must appear as stale in overlay"
+            )
+        })?;
 
     for field in &["kind", "name", "site", "cluster", "fresh"] {
         if degraded.get(field).is_none() {
-            return Err(format!("{degraded_cluster} candidate missing required field '{field}'").into());
+            return Err(format!("{degraded_cluster} degraded candidate missing required field '{field}'").into());
         }
     }
     eprintln!("  [OK] {degraded_cluster} present with fresh=false");
@@ -783,6 +824,30 @@ mod tests {
         assert!(
             verify_degraded_candidate(&overlay, "prov-degraded").is_err(),
             "candidate with fresh=true must fail degraded verification"
+        );
+    }
+
+    #[test]
+    fn verify_degraded_candidate_accepts_when_shared_site_has_fresh_false() {
+        // Two candidates at the same site — healthy (fresh=true) and degraded (fresh=false).
+        // Two providers sharing routingClusterRef="site-a" produces two candidates at the same
+        // site: one healthy (fresh=true) and one degraded (fresh=false).  The degraded check must find the fresh=false
+        // one.
+        let overlay = make_overlay(&[("site-a", true), ("site-a", false)]);
+        assert!(
+            verify_degraded_candidate(&overlay, "site-a").is_ok(),
+            "shared site with a fresh=false candidate must pass degraded verification"
+        );
+    }
+
+    #[test]
+    fn verify_overlay_accepts_when_shared_site_has_fresh_true() {
+        // Two candidates at the same site — healthy (fresh=true) and degraded (fresh=false).
+        // The overlay check must pass because at least one candidate is fresh=true.
+        let overlay = make_overlay(&[("site-a", true), ("site-a", false)]);
+        assert!(
+            verify_overlay(&overlay, "site-a", "excluded").is_ok(),
+            "shared site with a fresh=true candidate must pass overlay verification"
         );
     }
 

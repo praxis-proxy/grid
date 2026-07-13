@@ -40,7 +40,7 @@ use thiserror::Error;
 /// This struct mirrors the operator `RoutingOverlay` type but is defined here
 /// independently to avoid a path dependency on the `operator` crate.  JSON
 /// field names must match exactly.
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub(crate) struct RoutingOverlay {
     /// Name of the `GridNetwork` this overlay belongs to.
     ///
@@ -59,7 +59,7 @@ pub(crate) struct RoutingOverlay {
 }
 
 /// A single routing candidate from the routing overlay.
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub(crate) struct RoutingCandidate {
     /// Candidate kind.  Must be `"inference_model"` for this xtask module.
     pub(crate) kind: String,

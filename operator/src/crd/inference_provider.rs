@@ -60,6 +60,22 @@ pub struct InferenceProviderSpec {
     /// Inference provider type.
     pub provider_kind: String,
 
+    /// Optional routing identity used in overlay candidate `site` and `cluster` fields.
+    ///
+    /// When set, routing overlay candidates produced for this provider use this value
+    /// instead of `metadata.name`:
+    ///
+    /// - In Phase 1 (no [`GridSite`] inventory), both `candidate.site` and `candidate.cluster` are set to this value.
+    /// - When [`GridSite`] resources are present, only `candidate.cluster` is overridden; `candidate.site` is derived
+    ///   from the matched `GridSite`.
+    ///
+    /// Use this to align the provider's routing identity with an upstream cluster
+    /// name already configured in the consumer gateway, such as a Praxis
+    /// `load_balancer` cluster entry.  When absent, `metadata.name` is used.
+    ///
+    /// [`GridSite`]: crate::crd::grid_site::GridSite
+    pub routing_cluster_ref: Option<String>,
+
     /// Which sites host this provider.
     #[serde(default)]
     pub site_selector: super::auth::SelectorConfig,

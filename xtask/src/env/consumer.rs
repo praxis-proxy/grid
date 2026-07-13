@@ -296,12 +296,24 @@ pub(crate) fn deploy_consumer(
         return Err("no provider gateway endpoints found".into());
     }
 
-    if let Some(o) = &overlay {
-        validate_overlay_sites_supported(o, &provider_endpoints)?;
-    }
+    // When an overlay is provided, filter out candidates whose site has no
+    // matching local provider.  This handles overlays produced by the Grid
+    // operator that may include remote/API-provider candidates (e.g. external
+    // API providers) that cannot be routed through the local kind environment.
+    // At least one routeable candidate must remain after filtering.
+    let filtered_overlay = if let Some(o) = &overlay {
+        Some(filter_overlay_for_local_providers(o, &provider_endpoints)?)
+    } else {
+        None
+    };
 
     create_consumer_tls_secret(&consumer_ctx, consumer_site)?;
-    apply_consumer_config(&consumer_ctx, consumer_site, &provider_endpoints, overlay.as_ref())?;
+    apply_consumer_config(
+        &consumer_ctx,
+        consumer_site,
+        &provider_endpoints,
+        filtered_overlay.as_ref().or(overlay.as_ref()),
+    )?;
     apply_consumer_deployment(&consumer_ctx)?;
 
     wait_for_rollout(&consumer_ctx, "praxis-consumer", consumer_site)?;
@@ -321,16 +333,72 @@ fn read_overlay_file(path: &Path) -> Result<RoutingOverlay, Box<dyn std::error::
     Ok(operator_overlay::parse_grid_config_json(&json)?)
 }
 
+/// Filter an operator-generated overlay to only candidates routable locally.
+///
+/// Retains candidates whose `site` field matches a configured provider site.
+/// Candidates referencing remote or external-API sites (e.g. sites only
+/// reachable via SWIM discovery or external network) are logged and dropped.
+///
+/// # Errors
+///
+/// Returns an error when all candidates are filtered out — no locally-routable
+/// route would remain, making the consumer gateway deployment useless.
+#[expect(
+    clippy::too_many_lines,
+    reason = "per-candidate filtering loop with diagnostic output for each excluded candidate"
+)]
+fn filter_overlay_for_local_providers(
+    overlay: &RoutingOverlay,
+    providers: &[ProviderEndpoint],
+) -> Result<RoutingOverlay, Box<dyn std::error::Error>> {
+    let known_sites: Vec<&str> = providers.iter().map(|p| p.site.as_str()).collect();
+    let mut kept = Vec::new();
+    for c in &overlay.candidates {
+        if known_sites.contains(&c.site.as_str()) {
+            kept.push(c.clone());
+        } else {
+            eprintln!(
+                "  [INFO] overlay candidate model=\"{}\" site=\"{}\" cluster=\"{}\" \
+                 has no local provider endpoint (known: [{}]); excluded from consumer gateway config",
+                c.name,
+                c.site,
+                c.cluster,
+                known_sites.join(", ")
+            );
+        }
+    }
+    if kept.is_empty() {
+        return Err(format!(
+            "no overlay candidates have a matching local provider endpoint; \
+             known provider sites: [{}]; \
+             hint: set spec.routingClusterRef on InferenceProvider resources \
+             to match a local provider site name",
+            known_sites.join(", ")
+        )
+        .into());
+    }
+    Ok(RoutingOverlay {
+        network: overlay.network.clone(),
+        local_site: overlay.local_site.clone(),
+        candidates: kept,
+    })
+}
+
 /// Verify that every overlay candidate site has a matching provider endpoint.
 ///
 /// The `load_balancer` section uses `gateway-{provider.site}` as cluster
 /// names.  The `grid_route` candidates use `gateway-{candidate.site}`.  For
 /// Praxis to route successfully, both sides must reference the same sites.
 ///
+/// This function is used in unit tests to validate individual candidate
+/// sets.  Production deployment uses [`filter_overlay_for_local_providers`]
+/// instead, which skips un-routable candidates rather than failing.
+///
 /// # Errors
 ///
 /// Returns an error if any `candidate.site` is absent from the provider list,
 /// including the model name, the unknown site, and the known provider sites.
+#[cfg(test)]
 fn validate_overlay_sites_supported(
     overlay: &RoutingOverlay,
     providers: &[ProviderEndpoint],
@@ -339,10 +407,14 @@ fn validate_overlay_sites_supported(
     for c in &overlay.candidates {
         if !known_sites.contains(&c.site.as_str()) {
             return Err(format!(
-                "overlay candidate model \"{}\" references site \"{}\" which has no matching \
-                 provider endpoint; known sites: [{}]",
+                "overlay candidate model=\"{}\" site=\"{}\" cluster=\"{}\" \
+                 has no matching local provider endpoint\n\
+                 known provider sites: [{}]\n\
+                 hint: set spec.routingClusterRef on the InferenceProvider \
+                 to a site name from the environment config",
                 c.name,
                 c.site,
+                c.cluster,
                 known_sites.join(", ")
             )
             .into());
@@ -786,6 +858,8 @@ fn verify_consumer_model(
 }
 
 /// Send a Chat Completions request to the consumer gateway.
+///
+/// The `Authorization: Bearer` header is required by the `mock-openai` provider backend.
 fn send_consumer_request(port: u16, model: &str) -> Result<HttpResponse, Box<dyn std::error::Error>> {
     let url = format!("http://127.0.0.1:{port}/v1/chat/completions");
     let body = format!(r#"{{"model":"{model}","messages":[{{"role":"user","content":"hello"}}],"max_tokens":1}}"#);
@@ -800,6 +874,8 @@ fn send_consumer_request(port: u16, model: &str) -> Result<HttpResponse, Box<dyn
             "15",
             "-X",
             "POST",
+            "-H",
+            "Authorization: Bearer dummy-key",
             "-H",
             "Content-Type: application/json",
             "-d",

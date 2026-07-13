@@ -414,8 +414,8 @@ fn env_install_grid_crds(config: &Path, site: Option<&str>) -> Result<(), Box<dy
 fn env_verify_operator_reconcile(config: &Path, site: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     use operator::{
         CONFIGMAP_POLL_TIMEOUT, ERROR_ENDPOINT_LOCAL_PORT, ERROR_ENDPOINT_NAME, POD_READY_TIMEOUT, STATUS_POLL_TIMEOUT,
-        TEST_GATEWAY_NAME, TEST_GATEWAY_NS, TEST_NETWORK, TEST_PROVIDER_API, TEST_PROVIDER_DEGRADED,
-        TEST_PROVIDER_HEALTHY, TEST_PROVIDER_INVALID,
+        TEST_DEGRADED_ROUTING_CLUSTER, TEST_GATEWAY_NAME, TEST_GATEWAY_NS, TEST_HEALTHY_ROUTING_CLUSTER, TEST_NETWORK,
+        TEST_PROVIDER_API, TEST_PROVIDER_DEGRADED, TEST_PROVIDER_HEALTHY, TEST_PROVIDER_INVALID,
     };
 
     // Guard that kills a process on drop, even on early return.
@@ -481,11 +481,16 @@ fn env_verify_operator_reconcile(config: &Path, site: Option<&str>) -> Result<()
         )?;
 
         // Step 7: verify overlay contents.
+        // NOTE: candidate cluster/site values use routingClusterRef when set.
+        // - op-e2e-healthy has routingClusterRef="site-a" → candidate.cluster="site-a"
+        // - op-e2e-degraded has routingClusterRef="site-a" → candidate.cluster="site-a"
+        // - op-e2e-invalid (blank endpoint) → excluded (Unavailable)
+        // - op-e2e-api-fallback (no routingClusterRef) → cluster="op-e2e-api-fallback"
         let overlay = operator::read_overlay_configmap(&context, TEST_NETWORK, TEST_GATEWAY_NAME, TEST_GATEWAY_NS)?;
-        operator::verify_overlay(&overlay, TEST_PROVIDER_HEALTHY, TEST_PROVIDER_INVALID)?;
-        operator::verify_degraded_candidate(&overlay, TEST_PROVIDER_DEGRADED)?;
-        // Verify scoring order: local candidates before api_provider candidate.
-        operator::verify_scoring_order(&overlay, TEST_PROVIDER_HEALTHY, TEST_PROVIDER_API)?;
+        operator::verify_overlay(&overlay, TEST_HEALTHY_ROUTING_CLUSTER, TEST_PROVIDER_INVALID)?;
+        operator::verify_degraded_candidate(&overlay, TEST_DEGRADED_ROUTING_CLUSTER)?;
+        // Verify scoring order: local (site-a) before api_provider.
+        operator::verify_scoring_order(&overlay, TEST_HEALTHY_ROUTING_CLUSTER, TEST_PROVIDER_API)?;
 
         // Step 8: export overlay for Praxis handoff attempt.
         let overlay_path =
