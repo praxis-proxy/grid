@@ -16,7 +16,27 @@ use std::path::{Path, PathBuf};
 
 use clap::Subcommand;
 
-use self::config::EnvConfig;
+use self::config::{ClusterRole, EnvConfig};
+
+// ---------------------------------------------------------------------------
+// Shared infrastructure helpers
+// ---------------------------------------------------------------------------
+
+/// RAII guard that kills a subprocess on drop.
+///
+/// Used to ensure the operator and port-forward processes are always stopped
+/// when the reconcile function returns, even on error.
+struct ProcGuard(Option<std::process::Child>, &'static str);
+
+impl Drop for ProcGuard {
+    fn drop(&mut self) {
+        if let Some(mut c) = self.0.take() {
+            drop(c.kill());
+            drop(c.wait());
+            eprintln!("  {} stopped", self.1);
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -160,6 +180,36 @@ pub(crate) enum Action {
         #[arg(long)]
         site: Option<String>,
     },
+
+    /// Validate the full operator-to-consumer routing flow in kind.
+    ///
+    /// Orchestrates in one command:
+    ///
+    /// 1. Deploy provider gateways (idempotent).
+    /// 2. Install Grid CRDs and apply `InferenceProvider` fixtures.
+    /// 3. Run the Grid operator out-of-cluster (spawned via `cargo run`).
+    /// 4. Wait for provider reconciliation:
+    ///    - healthy → `Pending`
+    ///    - invalid → `Unavailable`
+    ///    - degraded → `Degraded`
+    ///    - api fallback → `Pending`
+    /// 5. Verify the overlay `ConfigMap` (healthy present, unavailable excluded, scoring order).
+    /// 6. Export the overlay to a temp file.
+    /// 7. Deploy the consumer gateway from the operator-exported overlay.
+    /// 8. Verify end-to-end routing: locally routable model returns 200, unknown model fails cleanly.
+    ///
+    /// Requires kind clusters and gateway images to be ready.  Run `env up` and
+    /// `env load-gateway-images` first.  Safe to rerun: owned test resources are
+    /// deleted at the start of each run.
+    ValidateOperatorRouting {
+        /// Path to the environment config file.
+        #[arg(short, long, default_value = "tests/env/operator-routing.toml")]
+        config: PathBuf,
+
+        /// Site name from the config to run the operator against (first provider site by default).
+        #[arg(long)]
+        site: Option<String>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -190,6 +240,7 @@ pub(crate) fn run(action: &Action) -> Result<(), Box<dyn std::error::Error>> {
         Action::VerifyMtlsTrust { config } => env_verify_mtls_trust(config),
         Action::InstallGridCrds { config, site } => env_install_grid_crds(config, site.as_deref()),
         Action::VerifyOperatorReconcile { config, site } => env_verify_operator_reconcile(config, site.as_deref()),
+        Action::ValidateOperatorRouting { config, site } => env_validate_operator_routing(config, site.as_deref()),
     }
 }
 
@@ -257,7 +308,7 @@ fn report_cluster_status(cfg: &EnvConfig, mut all_ok: bool) -> bool {
         eprintln!("  grid-{name}: {}", status_label(ok));
         if ok
             && let Some(def) = cfg.clusters.definitions.get(name)
-            && def.role == config::ClusterRole::Provider
+            && def.role == ClusterRole::Provider
         {
             let deploy_ok = kind::is_provider_backend_ready(name, def);
             all_ok = all_ok && deploy_ok;
@@ -390,9 +441,21 @@ fn print_topology(cfg: &EnvConfig) {
 ///
 /// Uses the first provider site in the config when `site` is `None`.
 fn resolve_operator_context(cfg: &EnvConfig, site: Option<&str>) -> Result<String, Box<dyn std::error::Error>> {
-    let name = site
-        .or_else(|| cfg.clusters.names.first().map(String::as_str))
-        .ok_or("no sites in config")?;
+    let name = if let Some(site) = site {
+        site
+    } else {
+        cfg.clusters
+            .names
+            .iter()
+            .find(|name| {
+                cfg.clusters
+                    .definitions
+                    .get(*name)
+                    .is_some_and(|d| d.role == ClusterRole::Provider)
+            })
+            .map(String::as_str)
+            .ok_or("no provider site in config")?
+    };
     Ok(kind::kubectl_context(name))
 }
 
@@ -406,100 +469,88 @@ fn env_install_grid_crds(config: &Path, site: Option<&str>) -> Result<(), Box<dy
     Ok(())
 }
 
-/// Run the full Grid operator reconciliation validation.
+/// Install CRDs, apply operator test fixtures, run the operator, verify the overlay,
+/// and export it to a temp file.
+///
+/// Returns the path of the exported `grid-config.json` overlay file.
+/// The caller is responsible for killing the operator and port-forward processes
+/// before this function returns — both are wrapped in [`ProcGuard`] so they are
+/// stopped on drop even on early return.
+///
+/// This is the shared core of both [`env_verify_operator_reconcile`] and
+/// [`env_validate_operator_routing`].
 #[expect(
     clippy::too_many_lines,
-    reason = "sequential E2E steps: CRD install, fixtures, operator spawn, poll, verify, cleanup"
+    reason = "sequential reconcile steps: CRD install, fixtures, operator spawn, poll, verify, export"
 )]
-fn env_verify_operator_reconcile(config: &Path, site: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+fn run_operator_reconcile(context: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
     use operator::{
         CONFIGMAP_POLL_TIMEOUT, ERROR_ENDPOINT_LOCAL_PORT, ERROR_ENDPOINT_NAME, POD_READY_TIMEOUT, STATUS_POLL_TIMEOUT,
         TEST_DEGRADED_ROUTING_CLUSTER, TEST_GATEWAY_NAME, TEST_GATEWAY_NS, TEST_HEALTHY_ROUTING_CLUSTER, TEST_NETWORK,
         TEST_PROVIDER_API, TEST_PROVIDER_DEGRADED, TEST_PROVIDER_HEALTHY, TEST_PROVIDER_INVALID,
     };
 
-    // Guard that kills a process on drop, even on early return.
-    struct ProcGuard(Option<std::process::Child>, &'static str);
-    impl Drop for ProcGuard {
-        fn drop(&mut self) {
-            if let Some(mut c) = self.0.take() {
-                drop(c.kill());
-                drop(c.wait());
-                eprintln!("  {} stopped", self.1);
-            }
-        }
-    }
+    // Step 1: install Grid CRDs and remove stale owned resources.
+    operator::install_grid_crds(context)?;
+    operator::cleanup_validation_resources(context)?;
 
-    let cfg = EnvConfig::from_file(config)?;
-    let context = resolve_operator_context(&cfg, site)?;
-    eprintln!("verify-operator-reconcile: context={context}");
+    // Step 2: deploy the HTTP 503 error-endpoint Pod.
+    // The operator health probe reaches this endpoint to classify the provider as Degraded.
+    operator::apply_error_endpoint_fixture(context)?;
+    operator::wait_for_error_endpoint_ready(context, POD_READY_TIMEOUT)?;
 
-    // Step 1: install Grid CRDs.
-    operator::install_grid_crds(&context)?;
-    operator::cleanup_validation_resources(&context)?;
-
-    // Step 2: deploy the HTTP 503 error-endpoint Pod and wait for it to be ready.
-    // This provides the health probe target for the Degraded provider.
-    operator::apply_error_endpoint_fixture(&context)?;
-    operator::wait_for_error_endpoint_ready(&context, POD_READY_TIMEOUT)?;
-
-    // Step 3: port-forward the error endpoint to the operator host so the
-    // out-of-cluster operator can reach it at 127.0.0.1:18503.
-    let pf_child = operator::start_error_endpoint_port_forward(&context)?;
+    // Step 3: port-forward so the out-of-cluster operator can reach the error endpoint.
+    let pf_child = operator::start_error_endpoint_port_forward(context)?;
     let mut pf_guard = ProcGuard(Some(pf_child), ERROR_ENDPOINT_NAME);
 
     // Step 4: spawn the operator out-of-cluster.
-    let op_child = operator::spawn_operator(&context)?;
+    let op_child = operator::spawn_operator(context)?;
     eprintln!("  operator spawned (PID {})", op_child.id());
     let mut op_guard = ProcGuard(Some(op_child), "operator");
 
     let degraded_endpoint = format!("http://127.0.0.1:{ERROR_ENDPOINT_LOCAL_PORT}");
 
-    // Step 5: apply provider fixtures.
-    // GridNetwork is created first (inside apply_test_fixtures); all providers are
-    // applied after the network so the operator can resolve gridNetworkRef immediately.
-    // api_provider is applied last to prove scoring order is score-driven, not input-order.
+    // Step 5: apply InferenceProvider fixtures.
+    // GridNetwork is created first; providers are applied after so the operator resolves
+    // gridNetworkRef immediately.  api_provider is last to prove scoring is score-driven.
+    //
+    // routingClusterRef controls the overlay candidate site/cluster identity:
+    // - op-e2e-healthy:     routingClusterRef="site-a" → candidate.site="site-a"
+    // - op-e2e-degraded:    routingClusterRef="site-a" → candidate.site="site-a", fresh=false
+    // - op-e2e-invalid:     blank endpoint → Unavailable, excluded from overlay
+    // - op-e2e-api-fallback: no routingClusterRef  → cluster="op-e2e-api-fallback"
     let healthy_endpoint = "http://mock-openai-provider.default.svc:8080";
-    let api_endpoint = "https://api.anthropic.com"; // static, not probed (no healthCheck)
-    operator::apply_test_fixtures(&context, healthy_endpoint)?;
-    operator::apply_degraded_provider_fixture(&context, &degraded_endpoint)?;
-    operator::apply_api_provider_fixture(&context, api_endpoint)?;
+    let api_endpoint = "https://api.anthropic.com";
+    operator::apply_test_fixtures(context, healthy_endpoint)?;
+    operator::apply_degraded_provider_fixture(context, &degraded_endpoint)?;
+    operator::apply_api_provider_fixture(context, api_endpoint)?;
 
-    // Step 6: wait for all providers to reconcile.
-    let result = (|| -> Result<(), Box<dyn std::error::Error>> {
-        operator::wait_for_provider_phase(&context, TEST_PROVIDER_INVALID, "Unavailable", STATUS_POLL_TIMEOUT)?;
-        operator::wait_for_provider_phase(&context, TEST_PROVIDER_HEALTHY, "Pending", STATUS_POLL_TIMEOUT)?;
-        operator::wait_for_provider_phase(&context, TEST_PROVIDER_DEGRADED, "Degraded", STATUS_POLL_TIMEOUT)?;
-        // api provider has no healthCheck and no matching sites → Pending
-        operator::wait_for_provider_phase(&context, TEST_PROVIDER_API, "Pending", STATUS_POLL_TIMEOUT)?;
+    // Step 6–7: wait for reconciliation and verify overlay.
+    let result = (|| -> Result<PathBuf, Box<dyn std::error::Error>> {
+        operator::wait_for_provider_phase(context, TEST_PROVIDER_INVALID, "Unavailable", STATUS_POLL_TIMEOUT)?;
+        operator::wait_for_provider_phase(context, TEST_PROVIDER_HEALTHY, "Pending", STATUS_POLL_TIMEOUT)?;
+        operator::wait_for_provider_phase(context, TEST_PROVIDER_DEGRADED, "Degraded", STATUS_POLL_TIMEOUT)?;
+        operator::wait_for_provider_phase(context, TEST_PROVIDER_API, "Pending", STATUS_POLL_TIMEOUT)?;
         operator::wait_for_overlay_configmap(
-            &context,
+            context,
             TEST_NETWORK,
             TEST_GATEWAY_NAME,
             TEST_GATEWAY_NS,
             CONFIGMAP_POLL_TIMEOUT,
         )?;
 
-        // Step 7: verify overlay contents.
-        // NOTE: candidate cluster/site values use routingClusterRef when set.
-        // - op-e2e-healthy has routingClusterRef="site-a" → candidate.cluster="site-a"
-        // - op-e2e-degraded has routingClusterRef="site-a" → candidate.cluster="site-a"
-        // - op-e2e-invalid (blank endpoint) → excluded (Unavailable)
-        // - op-e2e-api-fallback (no routingClusterRef) → cluster="op-e2e-api-fallback"
-        let overlay = operator::read_overlay_configmap(&context, TEST_NETWORK, TEST_GATEWAY_NAME, TEST_GATEWAY_NS)?;
+        let overlay = operator::read_overlay_configmap(context, TEST_NETWORK, TEST_GATEWAY_NAME, TEST_GATEWAY_NS)?;
         operator::verify_overlay(&overlay, TEST_HEALTHY_ROUTING_CLUSTER, TEST_PROVIDER_INVALID)?;
         operator::verify_degraded_candidate(&overlay, TEST_DEGRADED_ROUTING_CLUSTER)?;
-        // Verify scoring order: local (site-a) before api_provider.
         operator::verify_scoring_order(&overlay, TEST_HEALTHY_ROUTING_CLUSTER, TEST_PROVIDER_API)?;
 
-        // Step 8: export overlay for Praxis handoff attempt.
-        let overlay_path =
-            operator::export_overlay_to_file(&context, TEST_NETWORK, TEST_GATEWAY_NAME, TEST_GATEWAY_NS)?;
-        eprintln!("  overlay exported: {}", overlay_path.display());
-        Ok(())
+        // Step 8: export overlay for consumer gateway handoff.
+        let path = operator::export_overlay_to_file(context, TEST_NETWORK, TEST_GATEWAY_NAME, TEST_GATEWAY_NS)?;
+        eprintln!("  overlay exported: {}", path.display());
+        Ok(path)
     })();
 
-    // Step 8: stop port-forward and operator before returning.
+    // Always stop the operator and port-forward, even on error.
     if let Some(c) = op_guard.0.take() {
         operator::kill_operator(c);
     }
@@ -508,7 +559,41 @@ fn env_verify_operator_reconcile(config: &Path, site: Option<&str>) -> Result<()
         drop(c.wait());
     }
 
-    result?;
+    result
+}
+
+/// Verify Grid operator reconciliation only (CRD install → overlay export).
+fn env_verify_operator_reconcile(config: &Path, site: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    let cfg = EnvConfig::from_file(config)?;
+    let context = resolve_operator_context(&cfg, site)?;
+    eprintln!("verify-operator-reconcile: context={context}");
+    run_operator_reconcile(&context)?;
     eprintln!("verify-operator-reconcile: PASS");
+    Ok(())
+}
+
+/// Run the full operator-to-consumer routing validation in kind.
+///
+/// Orchestrates provider gateway deployment, operator reconcile + overlay export,
+/// consumer gateway deployment from the operator overlay, and end-to-end routing
+/// verification in a single idempotent command.
+fn env_validate_operator_routing(config: &Path, site: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    let cfg = EnvConfig::from_file(config)?;
+    let context = resolve_operator_context(&cfg, site)?;
+    eprintln!("validate-operator-routing: context={context}");
+
+    eprintln!("validate-operator-routing: [1/4] deploying provider gateways...");
+    gateway::deploy_all(&cfg)?;
+
+    eprintln!("validate-operator-routing: [2/4] operator reconcile + overlay export...");
+    let overlay_path = run_operator_reconcile(&context)?;
+
+    eprintln!("validate-operator-routing: [3/4] deploying consumer gateway from operator overlay...");
+    consumer::deploy_consumer(&cfg, Some(&overlay_path))?;
+
+    eprintln!("validate-operator-routing: [4/4] verifying end-to-end routing...");
+    consumer::verify_e2e(&cfg)?;
+
+    eprintln!("validate-operator-routing: PASS");
     Ok(())
 }

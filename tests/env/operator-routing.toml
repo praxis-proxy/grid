@@ -1,0 +1,32 @@
+# Topology for the operator-to-consumer routing validation.
+#
+# site-a: provider cluster.  InferenceProvider fixtures set routingClusterRef="site-a"
+#         so operator-generated overlay candidates carry site="site-a" and
+#         cluster="site-a".  The consumer gateway load_balancer maps this to the
+#         gateway-site-a upstream cluster.
+#
+# consumer: receives the operator-exported overlay and routes model requests to site-a
+#           using the gateway-site-a upstream cluster.
+#
+# Usage:
+#   cargo xtask env up -c tests/env/operator-routing.toml
+#   cargo xtask env load-gateway-images -c tests/env/operator-routing.toml
+#   cargo xtask env validate-operator-routing -c tests/env/operator-routing.toml
+
+[clusters]
+names = ["site-a", "consumer"]
+
+[clusters.site-a]
+models = ["model-x"]
+role = "provider"
+backend = "mock-openai"
+
+[clusters.consumer]
+models = []
+role = "consumer"
+
+[providers]
+openai     = { port = 10001 }
+anthropic  = { port = 10002 }
+bedrock    = { port = 10003, region = "us-east-1" }
+vertex     = { port = 10004, project = "test-project" }
