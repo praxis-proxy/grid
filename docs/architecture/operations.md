@@ -48,13 +48,18 @@ The GridNetwork controller:
 5. Starts the SWIM runtime with seed peers
 6. Sets `status.phase: Initializing`
 
-**Phase progression note:** `GridNetwork Active` and
-`Degraded` phases are not yet implemented.  The
-controller emits `Initializing` once TLS secrets are
-configured; `Active` progression is deferred until
-SWIM mesh integration (OP-06).  The `connected_sites`
-status field is hardcoded to `0` until OP-06.  Do not
-use `phase: Active` as a readiness signal.
+**Phase progression:** `GridNetwork Active` is set when
+the SWIM runtime reports at least one `Alive` peer in
+its `MembershipSnapshot`.  `Degraded` is set when peers
+are known but all are `Suspect` or `Dead`.
+`connectedSites` reflects the live SWIM `Alive` peer
+count; `distributedProviderCount` reflects remote
+`InferenceProvider` records received via SWIM CRDT
+broadcast.
+
+Both fields are `0` and the phase remains `Pending` or
+`Initializing` when SWIM is disabled (i.e. the operator
+is started without `GRID_SWIM_BIND_ADDR`).
 
 ## 3. Sites Discover Each Other
 
@@ -96,8 +101,9 @@ The operator verifies three conditions:
 | `DataPlaneHealthy` | HTTP ping through Praxis |
 
 A `connectivityPolicy` field on `GridNetwork`
-(default: `requireAll: true`) leaves room for future
-tolerance (partial connectivity, ignoring site types).
+(default: `requireAll: true`) controls how strictly the
+operator evaluates partial connectivity and site-type
+specific checks.
 
 ## 6. Capability Negotiation
 
@@ -154,11 +160,10 @@ spec:
 
 ## 8. Routing Configuration
 
-**OP-01 (implemented):** The `GridNetwork` controller
-renders routing overlay `ConfigMap`s from static CRD
-data. For each `gatewayRef` in the `GridNetwork`, it
-server-side applies a `ConfigMap` named
-`grid-overlay-{network}-{gateway}` containing:
+The `GridNetwork` controller renders routing overlay
+`ConfigMap`s from CRD data. For each `gatewayRef` in the
+`GridNetwork`, it server-side applies a `ConfigMap`
+named `grid-overlay-{network}-{gateway}` containing:
 
 - **`grid-config.json`**: JSON-serialised
   `RoutingOverlay` with one `RoutingCandidate` per
@@ -183,28 +188,15 @@ The overlay shape is compatible with the Praxis
 }
 ```
 
-**Production cluster naming:** `candidate.cluster`
-equals the `InferenceProvider` metadata name (the
-Kubernetes resource name, not its endpoint).  The
-Praxis `load_balancer` cluster serving that provider
-must use the same name.
+**Cluster naming:** `candidate.cluster` uses
+`spec.routingClusterRef` when set, otherwise the
+`InferenceProvider` metadata name.  The Praxis
+`load_balancer` cluster serving that provider must use
+the same identity.
 
-Local development with `xtask env` substitutes
-`gateway-{site}` as the cluster name and generates
-matching `load_balancer` entries — see
-`xtask/src/env/operator_overlay.rs`.  The xtask path
-does not validate the production naming contract.
-
-**Future phases:**
-- OP-02: `InferenceProvider` status reconciliation
-- OP-03: Gateway annotation patching (planned) — not
-  yet implemented; see OP-03 in OPERATOR_STATUS.md
-- OP-04: Local validation harness reads operator-produced
-  `ConfigMap` via `xtask env deploy-consumer-gateway --overlay-config`
-- OP-05: Metrics-to-snapshot freshness updates set
-  `fresh: false` when metrics are stale
-- OP-06: SWIM/CRDT membership and capability
-  propagation populates cross-site candidates
+Local development with `xtask env` maps overlay site
+identities to generated `gateway-{site}` load-balancer
+entries; see `xtask/src/env/operator_overlay.rs`.
 
 ## 9. Workloads Consume Providers
 
@@ -278,6 +270,93 @@ Available commands:
 | `cargo xtask env verify-gateway-e2e` | Verifies consumer-to-provider routing end-to-end |
 | `cargo xtask env verify-mtls-trust` | Verifies provider gateway mTLS enforcement (positive + negative cases) |
 
+### Operator and SWIM local validation
+
+The operator is **not** running inside kind; it connects
+to the kind cluster via the local kubeconfig.  SWIM
+runtimes use localhost UDP sockets between local operator
+processes.  This avoids requiring an operator container
+image or in-cluster RBAC for local validation.
+
+#### Setup (one-time per machine)
+
+```console
+cargo xtask env up -c tests/env/operator-routing.toml
+cargo xtask env load-gateway-images -c tests/env/operator-routing.toml
+```
+
+Creates `grid-site-a` (provider, mock-openai backend)
+and `grid-consumer` kind clusters, generates local mTLS
+certificates, and loads Praxis AI gateway images.
+
+#### Routing validation
+
+```console
+cargo xtask env validate-operator-routing -c tests/env/operator-routing.toml
+```
+
+This command deploys the Praxis provider gateway, spawns
+the operator out of cluster, applies `GridNetwork` and
+`InferenceProvider` fixtures, waits for reconciliation,
+exports the operator overlay, deploys the consumer
+gateway from that overlay, and sends live HTTP requests
+through the consumer gateway.
+
+The validation covers provider health classification,
+candidate ordering, metrics-aware ordering,
+`routingClusterRef` identity mapping, overlay export,
+consumer gateway deployment, successful routing for a
+known model, and clean failure for an unknown model.
+
+#### SWIM membership
+
+```console
+cargo xtask env verify-swim-membership -c tests/env/operator-routing.toml
+```
+
+This command starts two out-of-cluster operator
+processes with distinct localhost UDP ports. The
+secondary seeds on the primary. After a convergence
+window, the command applies a `GridNetwork` fixture and
+polls `GridNetwork.status` for SWIM-derived membership
+state.
+
+#### CRDT-over-SWIM state
+
+```console
+cargo xtask env verify-swim-state -c tests/env/operator-routing.toml
+```
+
+This command starts two SWIM-enabled operator processes,
+waits for gossip convergence, then applies a
+`GridNetwork` and an `InferenceProvider`. Each operator
+maps the `InferenceProvider` CRD to a
+`crdt::ProviderState` and publishes it as a
+`StateBroadcast` over foca's custom-broadcast path. The
+receiver merges the `GridStateSnapshot`, and subsequent
+status reconciliation reflects remote provider state in
+`GridNetwork.status.distributedProviderCount`.
+
+**Provider fields propagated over SWIM:**
+
+| CRDT field | Source |
+|---|---|
+| `network_id` | owning `GridNetwork.metadata.name` |
+| `site_id` | local SWIM site identity |
+| `provider_id` | `metadata.name` |
+| `routing_cluster` | `spec.routingClusterRef` or `metadata.name` |
+| `models` | `spec.models[*].name` |
+| `backend_kind` | `spec.backendKind` |
+| `phase` | `status.phase` (including `Unavailable`) |
+| `metrics` | `metricsConfig` scrape results, or defaults |
+| `revision` | `metadata.resourceVersion`, falling back to `metadata.generation` |
+| `writer_id` | local SWIM site identity |
+
+`distributedProviderCount` in `GridNetworkStatus`
+reflects received remote provider records for the
+current `GridNetwork`; local records and records from
+other `GridNetwork`s are excluded.
+
 ### Required local images
 
 Before running `load-gateway-images`, the following
@@ -299,20 +378,26 @@ docker build -t grid-mock-providers:latest -f mock-providers/Containerfile .
 
 ### What `xtask env` does NOT do
 
-`xtask env` is not the production operator:
+The `xtask env up/down/status/deploy-*` commands are
+not the production operator:
 
-- It does not reconcile Kubernetes resources
+- They do not reconcile Kubernetes resources
   continuously
-- It does not run SWIM membership or CRDT propagation
-- It does not manage `GridNetwork`, `GridSite`, or
-  `InferenceProvider` CRDs
-- It does not perform live config hot-reload against
+- They do not manage `GridNetwork`, `GridSite`, or
+  `InferenceProvider` CRDs in a watch loop
+- They do not perform live config hot-reload against
   a running gateway
 
-In the production architecture, the above are
-responsibilities of the Grid Operator and its
-controllers. Implementation is staged; `xtask env` is
-not a substitute for those controllers.
+The `verify-swim-membership` and `verify-swim-state`
+commands do spawn out-of-cluster operator processes that
+run real SWIM and CRDT reconciliation, but they use
+localhost UDP sockets and ephemeral fixtures — they are
+not a substitute for in-cluster production deployment.
+
+In the production architecture, continuous reconciliation
+is the responsibility of the Grid Operator and its
+controllers. `xtask env` commands are a validation
+convenience layer, not a production orchestrator.
 
 ### Routing overlay file input
 
@@ -357,9 +442,9 @@ management of:
 
 `xtask env` is a development convenience layer that
 uses the same config and cert infrastructure, not a
-production orchestrator. It should not be treated as
-evidence that the corresponding operator reconciliation
-loop is complete.
+production orchestrator. Production reconciliation
+semantics are defined by the Grid Operator controllers,
+not by the imperative `xtask env` command flow.
 
 ### Opinionated walkthroughs and topology fixtures
 

@@ -113,6 +113,10 @@ pub fn network_refs_from_grid_site(site: GridSite) -> Option<ObjectRef<GridNetwo
 /// Returns [`OperatorError`] on Kubernetes API or certificate
 /// generation failures.
 #[expect(clippy::large_stack_frames, reason = "async future with kube API types")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "sequential reconcile steps: TLS, providers fetch, overlay, CRDT broadcast, status update"
+)]
 pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Result<Action, OperatorError> {
     let name = network
         .metadata
@@ -124,7 +128,12 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
 
     let client = &ctx.client;
     ensure_tls_secrets(&network, client).await?;
-    reconcile_routing_overlay(&network, client).await?;
+
+    // List providers once; share between routing overlay rendering and CRDT publishing.
+    let providers = list_all_inference_providers(client).await?;
+    let raw_metrics = provider_metrics::collect_provider_metrics(name, &providers).await;
+
+    reconcile_routing_overlay_inner(&network, client, &providers, &raw_metrics).await?;
 
     let grid_id = resolve_grid_id(&network);
     // Obtain a live membership snapshot from the SWIM runtime when available.
@@ -132,11 +141,10 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
     let membership = ctx.swim.as_ref().map(|h| h.snapshot());
     let phase = determine_phase(&network, &grid_id, membership.as_ref());
 
-    // Publish a CRDT state broadcast advertising this site so peers learn we exist.
-    // The snapshot is intentionally minimal; provider details are wired in a later pass.
+    // Publish real InferenceProvider-derived CRDT state so peers learn this site's providers.
     let distributed_provider_count = if let Some(swim) = ctx.swim.as_ref() {
-        publish_site_presence(swim, &grid_id);
-        count_remote_provider_records(swim)
+        publish_real_provider_state(swim, name, &providers, &raw_metrics);
+        count_remote_provider_records(swim, name)
     } else {
         0
     };
@@ -260,19 +268,24 @@ async fn apply_site_secret(
     clippy::too_many_lines,
     reason = "sequential reconcile steps: metrics collection, overlay render, ConfigMap apply"
 )]
-async fn reconcile_routing_overlay(network: &GridNetwork, client: &Client) -> Result<(), OperatorError> {
+/// Reconcile routing overlay `ConfigMap`s using pre-fetched provider and metrics data.
+///
+/// Receives the provider list and metrics map from [`reconcile`] so both the
+/// routing overlay and the CRDT state broadcast share a single kube API fetch.
+async fn reconcile_routing_overlay_inner(
+    network: &GridNetwork,
+    client: &Client,
+    providers: &[InferenceProvider],
+    raw_metrics: &HashMap<String, scoring::BackendMetrics>,
+) -> Result<(), OperatorError> {
     let network_name = network
         .metadata
         .name
         .as_deref()
         .unwrap_or_else(|| std::process::abort());
 
-    let providers = list_all_inference_providers(client).await?;
     let sites = list_all_grid_sites(client).await?;
 
-    // Scrape live metrics from providers that have spec.metricsConfig.
-    // Failures are non-fatal — providers without metrics receive neutral scoring.
-    let raw_metrics = provider_metrics::collect_provider_metrics(network_name, &providers).await;
     let metrics_by_str: HashMap<&str, scoring::BackendMetrics> =
         raw_metrics.iter().map(|(k, v)| (k.as_str(), *v)).collect();
     let metrics_arg = if metrics_by_str.is_empty() {
@@ -285,7 +298,7 @@ async fn reconcile_routing_overlay(network: &GridNetwork, client: &Client) -> Re
         // Each gateway identifies its own local site.  Fall back to the
         // network name for single-site deployments where the two are equal.
         let local_site = gw_ref.local_site_name.as_deref().unwrap_or(network_name);
-        let overlay = routing_overlay::render_routing_overlay(network, &sites, &providers, local_site, metrics_arg)
+        let overlay = routing_overlay::render_routing_overlay(network, &sites, providers, local_site, metrics_arg)
             .map_err(OperatorError::OverlayRender)?;
         // Praxis grid_route rejects an empty candidates list at config load
         // time, which would cause a hot-reload error rather than a clean
@@ -404,50 +417,163 @@ fn determine_phase(network: &GridNetwork, grid_id: &str, membership: Option<&Mem
 // Status Update
 // ---------------------------------------------------------------------------
 
-/// Publish a minimal CRDT state broadcast advertising this site's presence.
+// ---------------------------------------------------------------------------
+// Provider → CRDT state mapping
+// ---------------------------------------------------------------------------
+
+/// Map a Kubernetes `ProviderPhase` to the CRDT `ProviderPhase`.
 ///
-/// Peers merge this broadcast into their local `GridStateSnapshot` and surface
-/// it via `status.distributedProviderCount`.  The snapshot carries a single
-/// "site-presence" provider record so the count becomes detectable.
+/// All variants are preserved so remote sites know about unavailable providers
+/// and can avoid routing to them.  Absent status (not yet reconciled) maps to
+/// `Pending`.
+fn crdt_phase_from_provider(
+    status_phase: Option<&crate::crd::inference_provider::ProviderPhase>,
+) -> crdt::ProviderPhase {
+    use crate::crd::inference_provider::ProviderPhase as Op;
+    match status_phase {
+        Some(Op::Available) => crdt::ProviderPhase::Available,
+        Some(Op::Degraded) => crdt::ProviderPhase::Degraded,
+        Some(Op::Unavailable) => crdt::ProviderPhase::Unavailable,
+        Some(Op::Pending) | None => crdt::ProviderPhase::Pending,
+    }
+}
+
+/// Convert a [`scoring::BackendMetrics`] to a CRDT [`crdt::ProviderMetricsSnapshot`].
 ///
-/// This is the minimal wiring step; full provider detail propagation happens
-/// once `InferenceProvider` CRD state is threaded into the CRDT layer.
-fn publish_site_presence(swim: &SwimHandle, grid_id: &str) {
-    use crdt::{Capability, GridStateSnapshot, ProviderMetricsSnapshot, ProviderPhase, ProviderState};
+/// When `metrics` is `None` (no live scrape configured or scrape failed) all
+/// fields default to `None` so remote sites apply neutral scoring.
+fn metrics_to_crdt(metrics: Option<scoring::BackendMetrics>) -> crdt::ProviderMetricsSnapshot {
+    metrics.map_or_else(crdt::ProviderMetricsSnapshot::default, |m| {
+        crdt::ProviderMetricsSnapshot {
+            queue_depth: Some(m.queue_depth),
+            kv_cache_utilization: Some(m.kv_cache_utilization),
+            latency_p99_ms: Some(m.latency_p99_ms),
+            prefix_cache_hit_ratio: Some(m.prefix_cache_hit_ratio),
+            error_rate: Some(m.error_rate),
+            healthy: Some(m.healthy),
+        }
+    })
+}
+
+/// Map one Kubernetes [`InferenceProvider`] to a CRDT [`crdt::ProviderState`].
+///
+/// Returns `None` when the provider has no metadata name (invalid resource).
+///
+/// **Revision strategy**: prefers Kubernetes `metadata.resourceVersion`, which
+/// advances on spec and status writes, and falls back to `metadata.generation`
+/// when no parseable resource version is present.  Equal revisions break ties
+/// via `writer_id`, which is the advertising SWIM site identity.
+fn provider_state_from_kube(
+    provider: &InferenceProvider,
+    network_id: &str,
+    site_id: &str,
+    metrics: Option<scoring::BackendMetrics>,
+) -> Option<crdt::ProviderState> {
+    let provider_id = provider.metadata.name.as_deref()?;
+    let routing_cluster = routing_overlay::routing_identity(provider)?.to_owned();
+    let models = provider.spec.models.iter().map(|m| m.name.clone()).collect();
+    let phase = crdt_phase_from_provider(provider.status.as_ref().map(|s| &s.phase));
+    let revision = provider_revision(provider);
+
+    Some(crdt::ProviderState {
+        network_id: network_id.to_owned(),
+        site_id: site_id.to_owned(),
+        provider_id: provider_id.to_owned(),
+        routing_cluster,
+        models,
+        backend_kind: provider.spec.backend_kind.clone(),
+        phase,
+        metrics: metrics_to_crdt(metrics),
+        revision,
+        writer_id: site_id.to_owned(),
+    })
+}
+
+/// Return the monotonic-ish Kubernetes revision used for CRDT provider records.
+///
+/// `resourceVersion` is preferred because it advances for status changes and
+/// metrics-bearing reconciles, not only spec changes.  Unit tests and malformed
+/// fixtures may lack a parseable resource version, so fall back to generation.
+fn provider_revision(provider: &InferenceProvider) -> u64 {
+    provider
+        .metadata
+        .resource_version
+        .as_deref()
+        .and_then(|rv| rv.parse::<u64>().ok())
+        .or_else(|| provider.metadata.generation.and_then(|g| u64::try_from(g).ok()))
+        .unwrap_or(0)
+}
+
+/// Publish real [`InferenceProvider`] records as a CRDT state broadcast over SWIM.
+///
+/// Builds a [`crdt::GridStateSnapshot`] from all providers belonging to
+/// `network_name`, attaches live metrics where configured, and sends the
+/// snapshot to SWIM peers via [`SwimHandle::publish_state_broadcast`].
+///
+/// Providers are included regardless of their phase (even `Unavailable`) so
+/// remote sites can learn which providers exist and avoid routing to unhealthy
+/// ones.  The routing overlay layer already filters `Unavailable` providers
+/// from local routing decisions.
+fn publish_real_provider_state(
+    swim: &SwimHandle,
+    network_name: &str,
+    providers: &[InferenceProvider],
+    raw_metrics: &HashMap<String, scoring::BackendMetrics>,
+) {
+    use crdt::{Capability, GridStateSnapshot};
     use swim::StateBroadcast;
 
     let site_name = swim.site_name();
     let mut snap = GridStateSnapshot::new(site_name.to_owned());
-    snap.add_capability(Capability::Model(format!("site:{site_name}")));
-    snap.upsert_provider(ProviderState {
-        site_id: site_name.to_owned(),
-        provider_id: "site-presence".to_owned(),
-        routing_cluster: site_name.to_owned(),
-        models: vec![format!("site:{site_name}")],
-        backend_kind: "local".to_owned(),
-        phase: ProviderPhase::Available,
-        metrics: ProviderMetricsSnapshot::default(),
-        revision: 1,
-        writer_id: grid_id.to_owned(),
-    });
+    let mut max_revision: u64 = 0;
 
-    let bc = StateBroadcast::new(site_name.to_owned(), 1, snap);
+    for provider in providers {
+        if provider.spec.grid_network_ref != network_name {
+            continue;
+        }
+        // Key by routing identity so the metrics map lookup matches.
+        let routing_id = routing_overlay::routing_identity(provider).unwrap_or("");
+        let metrics = raw_metrics.get(routing_id).copied();
+        if let Some(state) = provider_state_from_kube(provider, network_name, site_name, metrics) {
+            max_revision = max_revision.max(state.revision);
+            for model in &state.models {
+                if !model.is_empty() {
+                    snap.add_capability(Capability::Model(model.clone()));
+                }
+            }
+            snap.upsert_provider(state);
+        }
+    }
+
+    if snap.providers.is_empty() {
+        // No providers in this network — nothing to broadcast.
+        return;
+    }
+
+    // Use the highest provider revision as this origin's broadcast revision.
+    // Duplicate unchanged broadcasts are idempotent; newer Kubernetes writes
+    // advance resourceVersion and therefore advance the broadcast revision.
+    let bc = StateBroadcast::new(site_name.to_owned(), max_revision, snap);
     if let Err(e) = swim.publish_state_broadcast(bc) {
         tracing::debug!(error = %e, "CRDT broadcast channel unavailable — runtime not yet receiving");
     }
 }
 
 /// Count provider records learned from remote sites through distributed state.
-fn count_remote_provider_records(swim: &SwimHandle) -> u32 {
-    count_remote_provider_records_in_snapshot(swim.site_name(), &swim.state_snapshot())
+fn count_remote_provider_records(swim: &SwimHandle, network_name: &str) -> u32 {
+    count_remote_provider_records_in_snapshot(swim.site_name(), network_name, &swim.state_snapshot())
 }
 
 /// Count provider records whose owner differs from the local site.
-fn count_remote_provider_records_in_snapshot(local_site: &str, snapshot: &crdt::GridStateSnapshot) -> u32 {
+fn count_remote_provider_records_in_snapshot(
+    local_site: &str,
+    network_name: &str,
+    snapshot: &crdt::GridStateSnapshot,
+) -> u32 {
     let count = snapshot
         .providers
         .values()
-        .filter(|provider| provider.site_id != local_site)
+        .filter(|provider| provider.network_id == network_name && provider.site_id != local_site)
         .count();
     u32::try_from(count).unwrap_or(u32::MAX)
 }
@@ -755,6 +881,7 @@ mod tests {
 
     fn provider_state(site_id: &str, provider_id: &str) -> crdt::ProviderState {
         crdt::ProviderState {
+            network_id: "net".to_owned(),
             site_id: site_id.to_owned(),
             provider_id: provider_id.to_owned(),
             routing_cluster: site_id.to_owned(),
@@ -771,7 +898,7 @@ mod tests {
     fn distributed_provider_count_ignores_local_records() {
         let mut snap = crdt::GridStateSnapshot::new("site-local".to_owned());
         snap.upsert_provider(provider_state("site-local", "local-provider"));
-        let count = count_remote_provider_records_in_snapshot("site-local", &snap);
+        let count = count_remote_provider_records_in_snapshot("site-local", "net", &snap);
         assert_eq!(
             count, 0,
             "local self-published records must not count as distributed state"
@@ -783,7 +910,236 @@ mod tests {
         let mut snap = crdt::GridStateSnapshot::new("site-local".to_owned());
         snap.upsert_provider(provider_state("site-local", "local-provider"));
         snap.upsert_provider(provider_state("site-remote", "remote-provider"));
-        let count = count_remote_provider_records_in_snapshot("site-local", &snap);
+        let count = count_remote_provider_records_in_snapshot("site-local", "net", &snap);
         assert_eq!(count, 1, "only remote provider records count as distributed state");
+    }
+
+    #[test]
+    fn distributed_provider_count_ignores_other_network_records() {
+        let mut snap = crdt::GridStateSnapshot::new("site-local".to_owned());
+        let mut remote_other_network = provider_state("site-remote", "remote-provider");
+        remote_other_network.network_id = "other-net".to_owned();
+        snap.upsert_provider(remote_other_network);
+        let count = count_remote_provider_records_in_snapshot("site-local", "net", &snap);
+        assert_eq!(
+            count, 0,
+            "distributedProviderCount for one GridNetwork must not include records from another GridNetwork"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // InferenceProvider → crdt::ProviderState mapping
+    // -----------------------------------------------------------------------
+
+    fn make_provider(name: &str, network: &str, backend_kind: &str, generation: i64) -> InferenceProvider {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "kind": "InferenceProvider",
+            "metadata": { "name": name, "generation": generation },
+            "spec": {
+                "gridNetworkRef": network,
+                "providerKind": "self_hosted",
+                "backendKind": backend_kind,
+                "endpoint": "http://localhost:8080",
+                "models": [{ "name": "model-a" }, { "name": "model-b" }]
+            }
+        }))
+        .unwrap_or_else(|_| std::process::abort())
+    }
+
+    fn make_provider_with_routing_ref(name: &str, network: &str, routing_ref: &str) -> InferenceProvider {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "kind": "InferenceProvider",
+            "metadata": { "name": name },
+            "spec": {
+                "gridNetworkRef": network,
+                "providerKind": "self_hosted",
+                "backendKind": "local",
+                "endpoint": "http://localhost:8080",
+                "models": [{ "name": "model-x" }],
+                "routingClusterRef": routing_ref
+            }
+        }))
+        .unwrap_or_else(|_| std::process::abort())
+    }
+
+    fn make_provider_with_status(name: &str, network: &str, phase: &str) -> InferenceProvider {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "kind": "InferenceProvider",
+            "metadata": { "name": name },
+            "spec": {
+                "gridNetworkRef": network,
+                "providerKind": "self_hosted",
+                "backendKind": "local",
+                "endpoint": "http://localhost:8080",
+                "models": [{ "name": "model-x" }]
+            },
+            "status": { "phase": phase }
+        }))
+        .unwrap_or_else(|_| std::process::abort())
+    }
+
+    #[test]
+    fn provider_state_from_kube_maps_basic_fields() {
+        let p = make_provider("my-provider", "net", "local", 3);
+        let state = provider_state_from_kube(&p, "net", "site-a", None);
+        let state = state.unwrap_or_else(|| std::process::abort());
+        assert_eq!(state.network_id, "net", "network_id from owning GridNetwork");
+        assert_eq!(state.provider_id, "my-provider", "provider_id from metadata.name");
+        assert_eq!(state.site_id, "site-a", "site_id from swim site name");
+        assert_eq!(state.writer_id, "site-a", "writer_id from SWIM site name");
+        assert_eq!(state.backend_kind, "local", "backend_kind from spec");
+        assert_eq!(state.models, vec!["model-a", "model-b"], "models from spec");
+        assert_eq!(state.revision, 3, "revision from generation");
+    }
+
+    #[test]
+    fn provider_state_from_kube_uses_metadata_name_as_routing_cluster_by_default() {
+        let p = make_provider("prov-a", "net", "api_provider", 0);
+        let state = provider_state_from_kube(&p, "net", "site-a", None).unwrap_or_else(|| std::process::abort());
+        assert_eq!(
+            state.routing_cluster, "prov-a",
+            "routing_cluster defaults to metadata.name"
+        );
+    }
+
+    #[test]
+    fn provider_state_from_kube_uses_routing_cluster_ref_when_set() {
+        let p = make_provider_with_routing_ref("prov-x", "net", "site-override");
+        let state = provider_state_from_kube(&p, "net", "site-a", None).unwrap_or_else(|| std::process::abort());
+        assert_eq!(
+            state.routing_cluster, "site-override",
+            "routingClusterRef must override metadata.name"
+        );
+    }
+
+    #[test]
+    fn provider_state_from_kube_returns_none_for_missing_name() {
+        let p: InferenceProvider = serde_json::from_value(serde_json::json!({
+            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "kind": "InferenceProvider",
+            "metadata": {},
+            "spec": {
+                "gridNetworkRef": "net",
+                "providerKind": "self_hosted",
+                "backendKind": "local",
+                "endpoint": "http://localhost:8080",
+                "models": []
+            }
+        }))
+        .unwrap_or_else(|_| std::process::abort());
+        assert!(
+            provider_state_from_kube(&p, "net", "site-a", None).is_none(),
+            "provider with no metadata.name must yield None"
+        );
+    }
+
+    #[test]
+    fn crdt_phase_from_provider_maps_all_variants() {
+        use crate::crd::inference_provider::ProviderPhase as Op;
+
+        assert_eq!(
+            crdt_phase_from_provider(None),
+            crdt::ProviderPhase::Pending,
+            "absent status → Pending"
+        );
+        assert_eq!(
+            crdt_phase_from_provider(Some(&Op::Pending)),
+            crdt::ProviderPhase::Pending
+        );
+        assert_eq!(
+            crdt_phase_from_provider(Some(&Op::Available)),
+            crdt::ProviderPhase::Available
+        );
+        assert_eq!(
+            crdt_phase_from_provider(Some(&Op::Degraded)),
+            crdt::ProviderPhase::Degraded
+        );
+        assert_eq!(
+            crdt_phase_from_provider(Some(&Op::Unavailable)),
+            crdt::ProviderPhase::Unavailable
+        );
+    }
+
+    #[test]
+    fn provider_state_from_kube_propagates_provider_phase_via_status() {
+        let p = make_provider_with_status("prov-a", "net", "Degraded");
+        let state = provider_state_from_kube(&p, "net", "s", None).unwrap_or_else(|| std::process::abort());
+        assert_eq!(
+            state.phase,
+            crdt::ProviderPhase::Degraded,
+            "Degraded must propagate to CRDT phase"
+        );
+    }
+
+    #[test]
+    fn provider_state_from_kube_unavailable_is_included_not_skipped() {
+        let p = make_provider_with_status("prov-a", "net", "Unavailable");
+        let state = provider_state_from_kube(&p, "net", "s", None);
+        assert!(
+            state.is_some(),
+            "Unavailable providers must be published so remote sites know to avoid them"
+        );
+        let state = state.unwrap_or_else(|| std::process::abort());
+        assert_eq!(state.phase, crdt::ProviderPhase::Unavailable);
+    }
+
+    #[test]
+    fn metrics_to_crdt_maps_all_signals() {
+        let bm = scoring::BackendMetrics::new(0.1, true, 0.4, 120.0, 0.7, 0.3);
+        let m = metrics_to_crdt(Some(bm));
+        assert_eq!(m.error_rate, Some(0.1), "error_rate");
+        assert_eq!(m.healthy, Some(true), "healthy");
+        assert_eq!(m.kv_cache_utilization, Some(0.4), "kv_cache");
+        assert_eq!(m.latency_p99_ms, Some(120.0), "latency_p99_ms");
+        assert_eq!(m.prefix_cache_hit_ratio, Some(0.7), "prefix_cache");
+        assert_eq!(m.queue_depth, Some(0.3), "queue_depth");
+    }
+
+    #[test]
+    fn metrics_to_crdt_returns_all_none_when_no_metrics() {
+        let m = metrics_to_crdt(None);
+        assert!(m.error_rate.is_none(), "no metrics → error_rate=None");
+        assert!(m.queue_depth.is_none(), "no metrics → queue_depth=None");
+        assert!(m.healthy.is_none(), "no metrics → healthy=None");
+    }
+
+    #[test]
+    fn revision_falls_back_to_generation_field() {
+        let p = make_provider("prov-g", "net", "local", 42);
+        let state = provider_state_from_kube(&p, "net", "s", None).unwrap_or_else(|| std::process::abort());
+        assert_eq!(state.revision, 42, "revision must fall back to Kubernetes generation");
+    }
+
+    #[test]
+    fn revision_prefers_resource_version_over_generation() {
+        let mut p = make_provider("prov-rv", "net", "local", 42);
+        p.metadata.resource_version = Some("99".to_owned());
+        let state = provider_state_from_kube(&p, "net", "s", None).unwrap_or_else(|| std::process::abort());
+        assert_eq!(
+            state.revision, 99,
+            "resourceVersion advances on status writes and must win over generation"
+        );
+    }
+
+    #[test]
+    fn revision_defaults_to_zero_when_no_generation() {
+        let p: InferenceProvider = serde_json::from_value(serde_json::json!({
+            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "kind": "InferenceProvider",
+            "metadata": { "name": "prov-no-gen" },
+            "spec": {
+                "gridNetworkRef": "net",
+                "providerKind": "self_hosted",
+                "backendKind": "local",
+                "endpoint": "http://localhost:8080",
+                "models": []
+            }
+        }))
+        .unwrap_or_else(|_| std::process::abort());
+        let state = provider_state_from_kube(&p, "net", "s", None).unwrap_or_else(|| std::process::abort());
+        assert_eq!(state.revision, 0, "missing generation must default to revision=0");
     }
 }

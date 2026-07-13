@@ -211,6 +211,7 @@ mod tests {
         let mut snap = GridStateSnapshot::new(site.to_owned());
         snap.add_capability(Capability::Model("model-x".to_owned()));
         snap.upsert_provider(ProviderState {
+            network_id: "net".to_owned(),
             site_id: site.to_owned(),
             provider_id: "provider-1".to_owned(),
             routing_cluster: site.to_owned(),
@@ -362,11 +363,11 @@ mod tests {
         // Step 5: verify B has A's CRDT state.
         let b_snap = node_b.state_snapshot();
         assert!(
-            b_snap.provider("site-a", "provider-1").is_some(),
+            b_snap.provider("net", "site-a", "provider-1").is_some(),
             "B must receive A's provider state via SWIM custom gossip broadcast"
         );
         let received = b_snap
-            .provider("site-a", "provider-1")
+            .provider("net", "site-a", "provider-1")
             .unwrap_or_else(|| std::process::abort());
         assert_eq!(
             received.metrics.queue_depth,
@@ -407,7 +408,7 @@ mod tests {
         assert_eq!(
             node_b
                 .state_snapshot()
-                .provider("site-a", "provider-1")
+                .provider("net", "site-a", "provider-1")
                 .map(|p| p.metrics.queue_depth),
             Some(Some(0.1)),
             "B should have queue_depth=0.1 from rev=2"
@@ -429,7 +430,7 @@ mod tests {
         assert_eq!(
             node_b
                 .state_snapshot()
-                .provider("site-a", "provider-1")
+                .provider("net", "site-a", "provider-1")
                 .map(|p| p.metrics.queue_depth),
             Some(Some(0.1)),
             "stale rev=1 must not overwrite newer rev=2 state"
@@ -517,11 +518,11 @@ mod tests {
 
         let c_snap = node_c.state_snapshot();
         assert!(
-            c_snap.provider("site-a", "provider-1").is_some(),
+            c_snap.provider("net", "site-a", "provider-1").is_some(),
             "C must have received A's state via SWIM gossip broadcast"
         );
         assert!(
-            c_snap.provider("site-b", "provider-1").is_some(),
+            c_snap.provider("net", "site-b", "provider-1").is_some(),
             "C must have received B's state via SWIM gossip broadcast"
         );
     }

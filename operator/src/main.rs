@@ -11,8 +11,9 @@
 //! directly reachable by peers, and set `GRID_SWIM_SEEDS` to a comma-separated
 //! list of seed peer socket addresses. When `GRID_SWIM_BIND_ADDR` is absent
 //! the operator runs in static mode (`membership = None`);
-//! `GridNetwork.status.connected_sites` remains 0 and the phase stays
-//! `Pending`/`Initializing` based on TLS configuration only.
+//! `GridNetwork.status.connectedSites` and `distributedProviderCount` remain
+//! 0, and the phase stays `Pending`/`Initializing` based on TLS configuration
+//! only.
 //!
 //! [`GridNetwork`]: operator::crd::grid_network::GridNetwork
 //! [`GridSite`]: operator::crd::grid_site::GridSite

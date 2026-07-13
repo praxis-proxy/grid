@@ -631,6 +631,7 @@ mod tests {
 
         let mut snap = GridStateSnapshot::new("site-a".to_owned());
         snap.upsert_provider(crdt::ProviderState {
+            network_id: "net".to_owned(),
             site_id: "site-a".to_owned(),
             provider_id: "p1".to_owned(),
             routing_cluster: "site-a".to_owned(),
@@ -645,7 +646,7 @@ mod tests {
 
         let state = handle.state_snapshot();
         assert!(
-            state.provider("site-a", "p1").is_some(),
+            state.provider("net", "site-a", "p1").is_some(),
             "CRDT state handle must reflect published provider"
         );
     }

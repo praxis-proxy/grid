@@ -16,8 +16,8 @@ Responsibilities:
   peer-to-peer discovery
 - **Trust**: CA generation, site certificate lifecycle,
   mTLS certificate exchange, trust bundle distribution
-- **State propagation**: Delta CRDTs (capabilities,
-  metrics, budget) piggybacked on SWIM probes
+- **State propagation**: CRDT provider and capability
+  snapshots piggybacked on SWIM probes
 - **Routing config**: Generates Praxis overlay config
   (clusters, scoring filter, auth injection) as a
   Kubernetes `ConfigMap`
@@ -114,15 +114,19 @@ The Grid Operator renders routing overlay `ConfigMap`s
 from `GridNetwork` + `InferenceProvider` CRDs. Each
 `ConfigMap` encodes `grid_route` routing candidates
 (model name, site, cluster, fresh flag) as JSON under
-the `grid-config.json` key.
+the `grid-config.json` key.  Provider health determines
+candidate freshness, provider metrics influence
+candidate ordering, and `routingClusterRef` provides the
+Praxis cluster identity used by generated load-balancer
+configuration.
 
-**OP-01 (implemented):** Static provider/model overlay
-rendered on each `GridNetwork` reconciliation. One
-`ConfigMap` per `gatewayRef`.
-
-**OP-03 (planned follow-up):** Gateway annotation
-patching (`grid.praxis-proxy.io/overlay-config`) is
-not yet implemented. Once Gateway API adoption is
-confirmed, the operator will patch the annotation so
-the Praxis Operator picks up the overlay `ConfigMap`
-automatically.
+The Grid Operator also participates in the peer-to-peer
+control plane.  SWIM membership supplies liveness
+signals for peer sites, while CRDT state broadcasts
+carry provider snapshots between sites.  A provider
+snapshot includes the network, advertising site,
+provider identity, routing cluster, model list, backend
+kind, lifecycle phase, optional metrics, and revision
+metadata.  Praxis remains the data plane: it consumes
+the rendered overlay and handles request routing,
+filter execution, mTLS, and backend proxying.

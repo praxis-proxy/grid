@@ -241,9 +241,9 @@ pub(crate) enum Action {
     /// Prove live CRDT state propagation over SWIM.
     ///
     /// Starts two SWIM-enabled operator processes against the same kind
-    /// cluster.  Each operator publishes its own site-presence as a CRDT
-    /// `GridStateSnapshot` on every `GridNetwork` reconcile.  After SWIM
-    /// gossip convergence the remote operator's broadcast arrives and
+    /// cluster.  Each operator publishes real `InferenceProvider`-derived state
+    /// as a CRDT `GridStateSnapshot` on `GridNetwork` reconcile.  After SWIM
+    /// gossip convergence the remote operator's provider-state broadcast arrives and
     /// `GridNetwork.status.distributedProviderCount` becomes ≥ 1.
     ///
     /// Proves that:
@@ -252,7 +252,8 @@ pub(crate) enum Action {
     /// - `GridNetworkStatus.distributedProviderCount` reflects the merged state.
     ///
     /// Requires a kind cluster.  Run `env up` + `env load-gateway-images` first.
-    /// Safe to rerun: the `GridNetwork` fixture is deleted at the start of each run.
+    /// Safe to rerun: the `GridNetwork` and `InferenceProvider` fixtures are
+    /// deleted at the start of each run.
     VerifySwimState {
         /// Path to the environment config file.
         #[arg(short, long, default_value = "tests/env/operator-routing.toml")]
@@ -758,13 +759,16 @@ fn env_verify_swim_membership(config: &Path, site: Option<&str>) -> Result<(), B
 
 /// Prove that live CRDT state propagates between two SWIM-enabled operators via foca broadcast.
 ///
-/// Both operators publish their own site-presence as a `GridStateSnapshot` on each reconcile.
-/// After SWIM gossip convergence, each operator's `state_snapshot()` includes the remote site's
-/// provider entry, and `GridNetworkStatus.distributedProviderCount` becomes ≥ 1.
+/// Proves real `InferenceProvider`-derived CRDT state propagates over SWIM gossip.
+/// After convergence each operator's `distributedProviderCount` reflects remote provider records.
+#[expect(
+    clippy::too_many_lines,
+    reason = "sequential SWIM state kind steps: CRD install, two operator spawns, fixture apply, convergence wait, poll, cleanup"
+)]
 fn env_verify_swim_state(config: &Path, site: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     use operator::{
         SWIM_CONVERGENCE_WAIT, SWIM_NODE_PRIMARY_NAME, SWIM_NODE_SECONDARY_NAME, SWIM_STATUS_POLL_TIMEOUT,
-        SWIM_TEST_NETWORK,
+        SWIM_TEST_NETWORK, SWIM_TEST_PROVIDER, SWIM_TEST_PROVIDER_MODEL,
     };
 
     let cfg = EnvConfig::from_file(config)?;
@@ -786,13 +790,20 @@ fn env_verify_swim_state(config: &Path, site: Option<&str>) -> Result<(), Box<dy
     // Wait for SWIM convergence.
     operator::wait_for_swim_convergence(SWIM_CONVERGENCE_WAIT);
 
-    // Apply the GridNetwork fixture; both operators reconcile immediately.
-    // Each operator publishes a site-presence StateBroadcast and gossips to its peer.
-    // After convergence, each operator has the other's provider in its merged state.
+    // Apply the GridNetwork fixture and a real InferenceProvider.
+    // Both operators reconcile immediately (via watch).  Each reconcile calls
+    // publish_real_provider_state which publishes the real provider record as
+    // a crdt::ProviderState (provider_id=SWIM_TEST_PROVIDER, models=[SWIM_TEST_PROVIDER_MODEL])
+    // over SWIM gossip.  The remote operator receives and merges it, raising
+    // distributedProviderCount >= 1.
     operator::apply_swim_test_network(&context)?;
-    eprintln!("  GridNetwork {SWIM_TEST_NETWORK} applied; operators will reconcile and exchange CRDT state...");
+    operator::apply_swim_test_provider(&context)?;
+    eprintln!(
+        "  GridNetwork {SWIM_TEST_NETWORK} + InferenceProvider {SWIM_TEST_PROVIDER} (model={SWIM_TEST_PROVIDER_MODEL}) applied;"
+    );
+    eprintln!("  awaiting real provider state propagation via SWIM custom broadcast...");
 
-    // Poll for distributedProviderCount > 0 (proves real distributed state arrived via SWIM broadcast).
+    // Poll for distributedProviderCount > 0 (proves real InferenceProvider-derived state arrived).
     let distributed_result =
         operator::wait_for_gridnetwork_distributed_state(&context, SWIM_TEST_NETWORK, SWIM_STATUS_POLL_TIMEOUT);
 
@@ -808,7 +819,11 @@ fn env_verify_swim_state(config: &Path, site: Option<&str>) -> Result<(), Box<dy
     let distributed_count = distributed_result?;
     operator::verify_distributed_state_received(distributed_count)?;
 
-    eprintln!("verify-swim-state: PASS (distributedProviderCount={distributed_count})");
+    eprintln!(
+        "verify-swim-state: PASS — real InferenceProvider state propagated via SWIM \
+         (provider={SWIM_TEST_PROVIDER}, model={SWIM_TEST_PROVIDER_MODEL}, \
+         distributedProviderCount={distributed_count})"
+    );
     Ok(())
 }
 

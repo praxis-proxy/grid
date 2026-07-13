@@ -202,6 +202,7 @@ mod tests {
         let mut snap = GridStateSnapshot::new(site.to_owned());
         snap.add_capability(Capability::Model("model-x".to_owned()));
         snap.upsert_provider(ProviderState {
+            network_id: "net".to_owned(),
             site_id: site.to_owned(),
             provider_id: "provider".to_owned(),
             routing_cluster: site.to_owned(),
@@ -233,7 +234,7 @@ mod tests {
         let decoded = StateBroadcast::decode(&bytes).unwrap_or_else(|_| std::process::abort());
         let provider = decoded
             .snapshot
-            .provider("site-p", "provider")
+            .provider("net", "site-p", "provider")
             .unwrap_or_else(|| std::process::abort());
         assert_eq!(decoded.version, STATE_BROADCAST_VERSION, "version");
         assert_eq!(provider.metrics.queue_depth, Some(0.1), "metric value");
@@ -292,7 +293,7 @@ mod tests {
         local.merge(&decoded.snapshot);
 
         let provider = local
-            .provider("site-p", "provider")
+            .provider("net", "site-p", "provider")
             .unwrap_or_else(|| std::process::abort());
         assert_eq!(provider.revision, 2, "newer broadcast snapshot must win");
         assert_eq!(provider.metrics.queue_depth, Some(0.1), "newer metric must win");
@@ -311,7 +312,7 @@ mod tests {
         assert!(key.is_some(), "new broadcast must be disseminated");
         let snap = handler.snapshot();
         let provider = snap
-            .provider("site-p", "provider")
+            .provider("net", "site-p", "provider")
             .unwrap_or_else(|| std::process::abort());
         assert_eq!(provider.metrics.queue_depth, Some(0.2), "snapshot must merge");
     }
@@ -362,7 +363,7 @@ mod tests {
         );
         let snap = handler.snapshot();
         let provider = snap
-            .provider("site-p", "provider")
+            .provider("net", "site-p", "provider")
             .unwrap_or_else(|| std::process::abort());
         assert_eq!(provider.metrics.queue_depth, Some(0.1), "newer state must remain");
     }

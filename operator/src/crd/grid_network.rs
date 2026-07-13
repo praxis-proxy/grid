@@ -137,11 +137,12 @@ pub struct GridNetworkStatus {
     #[serde(default)]
     pub connected_sites: u32,
 
-    /// Number of provider records received from peers via CRDT state broadcasts.
+    /// Number of remote provider records received for this network via CRDT state broadcasts.
     ///
-    /// Incremented each time a remote site's `GridStateSnapshot` is merged
-    /// into the local SWIM runtime's CRDT state.  Zero when SWIM is disabled
-    /// or no remote state has been received yet.
+    /// Counts remote provider records from the local SWIM runtime's merged
+    /// CRDT state.  Local provider records and records for other `GridNetwork`s
+    /// are excluded.  Zero when SWIM is disabled or no remote state has been
+    /// received yet.
     #[serde(default)]
     pub distributed_provider_count: u32,
 

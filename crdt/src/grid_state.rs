@@ -77,6 +77,9 @@ pub struct ProviderMetricsSnapshot {
 /// One provider record advertised by a site.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct ProviderState {
+    /// Grid network this provider belongs to.
+    pub network_id: String,
+
     /// Site that produced this record.
     pub site_id: String,
 
@@ -126,7 +129,7 @@ pub struct GridStateSnapshot {
     /// Add-wins capability catalog.
     pub capabilities: OrSet<Capability>,
 
-    /// Provider records keyed by a stable `site_id/provider_id` string.
+    /// Provider records keyed by a stable `network_id/site_id/provider_id` string.
     pub providers: BTreeMap<String, ProviderState>,
 }
 
@@ -148,7 +151,7 @@ impl GridStateSnapshot {
 
     /// Upsert one provider record.
     pub fn upsert_provider(&mut self, provider: ProviderState) {
-        let key = provider_key(&provider.site_id, &provider.provider_id);
+        let key = provider_key(&provider.network_id, &provider.site_id, &provider.provider_id);
         match self.providers.get(&key) {
             Some(existing) if !provider.supersedes(existing) => {},
             _ => {
@@ -165,16 +168,16 @@ impl GridStateSnapshot {
         }
     }
 
-    /// Return a provider by site/provider identity.
+    /// Return a provider by network/site/provider identity.
     #[must_use]
-    pub fn provider(&self, site_id: &str, provider_id: &str) -> Option<&ProviderState> {
-        self.providers.get(&provider_key(site_id, provider_id))
+    pub fn provider(&self, network_id: &str, site_id: &str, provider_id: &str) -> Option<&ProviderState> {
+        self.providers.get(&provider_key(network_id, site_id, provider_id))
     }
 }
 
 /// Build a stable provider map key.
-fn provider_key(site_id: &str, provider_id: &str) -> String {
-    format!("{site_id}/{provider_id}")
+fn provider_key(network_id: &str, site_id: &str, provider_id: &str) -> String {
+    format!("{network_id}/{site_id}/{provider_id}")
 }
 
 // ---------------------------------------------------------------------------
@@ -187,6 +190,7 @@ mod tests {
 
     fn provider(site: &str, provider_id: &str, revision: u64, queue_depth: f64) -> ProviderState {
         ProviderState {
+            network_id: "net".to_owned(),
             site_id: site.to_owned(),
             provider_id: provider_id.to_owned(),
             routing_cluster: site.to_owned(),
@@ -208,7 +212,7 @@ mod tests {
         snap.upsert_provider(provider("site-p", "provider", 1, 0.9));
         snap.upsert_provider(provider("site-p", "provider", 2, 0.1));
         let got = snap
-            .provider("site-p", "provider")
+            .provider("net", "site-p", "provider")
             .unwrap_or_else(|| std::process::abort());
         assert_eq!(got.revision, 2, "newer revision must win");
         assert_eq!(got.metrics.queue_depth, Some(0.1), "newer metrics must win");
@@ -220,7 +224,7 @@ mod tests {
         snap.upsert_provider(provider("site-p", "provider", 2, 0.1));
         snap.upsert_provider(provider("site-p", "provider", 1, 0.9));
         let got = snap
-            .provider("site-p", "provider")
+            .provider("net", "site-p", "provider")
             .unwrap_or_else(|| std::process::abort());
         assert_eq!(got.revision, 2, "older revision must not replace newer state");
         assert_eq!(got.metrics.queue_depth, Some(0.1), "newer metrics must remain");
@@ -238,7 +242,7 @@ mod tests {
         snap.upsert_provider(right);
 
         let got = snap
-            .provider("site-p", "provider")
+            .provider("net", "site-p", "provider")
             .unwrap_or_else(|| std::process::abort());
         assert_eq!(got.writer_id, "writer-b", "lexicographically larger writer wins tie");
     }
@@ -277,10 +281,10 @@ mod tests {
             "capability merge must converge"
         );
         let ab_provider = ab
-            .provider("site-p", "provider")
+            .provider("net", "site-p", "provider")
             .unwrap_or_else(|| std::process::abort());
         let ba_provider = ba
-            .provider("site-p", "provider")
+            .provider("net", "site-p", "provider")
             .unwrap_or_else(|| std::process::abort());
         assert_eq!(
             ab_provider.revision, ba_provider.revision,
@@ -311,10 +315,10 @@ mod tests {
         a_then_bc.merge(&bc);
 
         let left = ab_then_c
-            .provider("site-p", "provider")
+            .provider("net", "site-p", "provider")
             .unwrap_or_else(|| std::process::abort());
         let right = a_then_bc
-            .provider("site-p", "provider")
+            .provider("net", "site-p", "provider")
             .unwrap_or_else(|| std::process::abort());
         assert_eq!(
             left.revision, right.revision,
@@ -340,7 +344,7 @@ mod tests {
 
         assert_eq!(restored.capabilities.len(), 1, "capabilities must survive serde");
         assert!(
-            restored.provider("site-p", "provider").is_some(),
+            restored.provider("net", "site-p", "provider").is_some(),
             "provider must survive serde"
         );
     }

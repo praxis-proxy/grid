@@ -1,17 +1,29 @@
-# Topology for the operator-to-consumer routing validation.
+# Topology for out-of-cluster operator and SWIM E2E validation.
 #
-# site-a: provider cluster.  InferenceProvider fixtures set routingClusterRef="site-a"
-#         so operator-generated overlay candidates carry site="site-a" and
-#         cluster="site-a".  The consumer gateway load_balancer maps this to the
-#         gateway-site-a upstream cluster.
+# Two kind clusters:
+#   site-a    — provider cluster; runs mock-openai backend and Praxis provider gateway.
+#               InferenceProvider fixtures set routingClusterRef="site-a" so operator-
+#               generated overlay candidates carry site="site-a" and cluster="site-a".
+#               The consumer gateway load_balancer maps gateway-site-a to this cluster.
+#   consumer  — receives the operator-exported overlay and routes model requests to
+#               site-a using the gateway-site-a upstream cluster.
 #
-# consumer: receives the operator-exported overlay and routes model requests to site-a
-#           using the gateway-site-a upstream cluster.
+# The operator runs OUT OF CLUSTER as a local process for all three validation commands
+# below.  SWIM runtimes (verify-swim-*) use localhost UDP sockets between local operator
+# processes — no in-cluster pod networking is required.
 #
-# Usage:
+# Setup (one-time):
 #   cargo xtask env up -c tests/env/operator-routing.toml
 #   cargo xtask env load-gateway-images -c tests/env/operator-routing.toml
+#
+# Operator routing E2E (overlay generation, live metrics, consumer routing):
 #   cargo xtask env validate-operator-routing -c tests/env/operator-routing.toml
+#
+# SWIM membership (real gossip drives phase=Active, connectedSites=1):
+#   cargo xtask env verify-swim-membership -c tests/env/operator-routing.toml
+#
+# CRDT-over-SWIM state (real InferenceProvider state propagates, distributedProviderCount≥1):
+#   cargo xtask env verify-swim-state -c tests/env/operator-routing.toml
 
 [clusters]
 names = ["site-a", "consumer"]

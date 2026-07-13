@@ -105,6 +105,15 @@ const METRICS_BUSY_QUEUE_DEPTH: &str = "0.9";
 /// coexist without resource collisions.
 pub(crate) const SWIM_TEST_NETWORK: &str = "op-e2e-swim-net";
 
+/// Name of the `InferenceProvider` applied during SWIM state validation.
+///
+/// Applied to the kind cluster so both operators publish real provider-derived
+/// CRDT state (not a synthetic site-presence record) after reconciliation.
+pub(crate) const SWIM_TEST_PROVIDER: &str = "op-e2e-swim-prov";
+
+/// Model served by the SWIM state test provider fixture.
+pub(crate) const SWIM_TEST_PROVIDER_MODEL: &str = "model-swim-proof";
+
 /// SWIM site identity for the primary operator.
 pub(crate) const SWIM_NODE_PRIMARY_NAME: &str = "swim-node-p";
 
@@ -372,10 +381,39 @@ pub(crate) fn apply_swim_test_network(context: &str) -> Result<(), Box<dyn std::
     Ok(())
 }
 
-/// Delete resources created by the SWIM membership validation.
+/// Apply the `InferenceProvider` fixture used by the SWIM state validation.
+///
+/// The provider belongs to [`SWIM_TEST_NETWORK`] and serves
+/// [`SWIM_TEST_PROVIDER_MODEL`].  Both operators will publish this provider's
+/// real `InferenceProvider`-derived CRDT state via SWIM gossip after
+/// reconciling the owning `GridNetwork`.
+pub(crate) fn apply_swim_test_provider(context: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let manifest = serde_json::to_string_pretty(&serde_json::json!({
+        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "kind": "InferenceProvider",
+        "metadata": { "name": SWIM_TEST_PROVIDER },
+        "spec": {
+            "gridNetworkRef": SWIM_TEST_NETWORK,
+            "providerKind": "self_hosted",
+            "backendKind": "local",
+            "endpoint": "http://mock-provider.default.svc:8080",
+            "models": [{ "name": SWIM_TEST_PROVIDER_MODEL }]
+        }
+    }))
+    .unwrap_or_else(|e| {
+        eprintln!("SWIM test provider serialization failed: {e}");
+        std::process::exit(1);
+    });
+    apply_manifest(context, &manifest)?;
+    eprintln!("  [OK] SWIM test InferenceProvider {SWIM_TEST_PROVIDER} applied (model={SWIM_TEST_PROVIDER_MODEL})");
+    Ok(())
+}
+
+/// Delete resources created by the SWIM validation.
 ///
 /// Safe to call before a fresh run — all deletes use `--ignore-not-found`.
 pub(crate) fn cleanup_swim_test_resources(context: &str) -> Result<(), Box<dyn std::error::Error>> {
+    delete_cluster_resource(context, "inferenceprovider", SWIM_TEST_PROVIDER)?;
     delete_cluster_resource(context, "gridnetwork", SWIM_TEST_NETWORK)?;
     eprintln!("  [OK] stale SWIM test resources removed");
     Ok(())
@@ -446,9 +484,10 @@ pub(crate) fn verify_swim_status(phase: &str, connected_sites: u32) -> Result<()
 )]
 /// Poll the `GridNetwork` status until `distributedProviderCount > 0`.
 ///
-/// Each SWIM-enabled operator publishes its own site-presence as a CRDT
-/// `GridStateSnapshot` on every reconcile.  After SWIM gossip convergence the
-/// remote operator's broadcast arrives and `distributedProviderCount` becomes ≥ 1.
+/// Each SWIM-enabled operator publishes real `InferenceProvider`-derived state
+/// as a CRDT `GridStateSnapshot` on reconcile.  After SWIM gossip convergence
+/// the remote operator's broadcast arrives and `distributedProviderCount`
+/// becomes ≥ 1.
 ///
 /// Returns the observed count on success or `Err` on timeout.
 pub(crate) fn wait_for_gridnetwork_distributed_state(
@@ -482,7 +521,7 @@ pub(crate) fn wait_for_gridnetwork_distributed_state(
     }
 }
 
-/// Verify that `distributed_provider_count > 0`, proving distributed state arrived via SWIM.
+/// Verify that `distributedProviderCount > 0`, proving distributed state arrived via SWIM.
 pub(crate) fn verify_distributed_state_received(
     distributed_provider_count: u32,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1613,7 +1652,7 @@ mod tests {
     fn cleanup_swim_includes_only_swim_resources() {
         // Documents which resources cleanup_swim_test_resources deletes.
         // If you add new SWIM fixtures, add them here.
-        let swim_resources = [SWIM_TEST_NETWORK];
+        let swim_resources = [SWIM_TEST_NETWORK, SWIM_TEST_PROVIDER];
         let unique: std::collections::HashSet<_> = swim_resources.iter().collect();
         assert_eq!(
             unique.len(),
