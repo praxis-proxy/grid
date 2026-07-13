@@ -1771,6 +1771,7 @@ mod tests {
             }],
             provider_kind: "self_hosted".to_owned(),
             routing_cluster_ref: None,
+            metrics_config: None,
             site_selector: crate::crd::auth::SelectorConfig::default(),
         }
     }

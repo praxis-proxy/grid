@@ -7,7 +7,7 @@
 //!
 //! [`GridNetwork`]: crate::crd::grid_network::GridNetwork
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use k8s_openapi::api::core::v1::ConfigMap;
 use kube::{
@@ -25,7 +25,7 @@ use crate::{
         inference_provider::InferenceProvider,
     },
     error::OperatorError,
-    resources::{routing_overlay, secret},
+    resources::{provider_metrics, routing_overlay, secret},
 };
 
 // ---------------------------------------------------------------------------
@@ -210,6 +210,10 @@ async fn apply_site_secret(
     clippy::large_stack_frames,
     reason = "async future with kube API types and overlay data"
 )]
+#[expect(
+    clippy::too_many_lines,
+    reason = "sequential reconcile steps: metrics collection, overlay render, ConfigMap apply"
+)]
 async fn reconcile_routing_overlay(network: &GridNetwork, client: &Client) -> Result<(), OperatorError> {
     let network_name = network
         .metadata
@@ -220,11 +224,22 @@ async fn reconcile_routing_overlay(network: &GridNetwork, client: &Client) -> Re
     let providers = list_all_inference_providers(client).await?;
     let sites = list_all_grid_sites(client).await?;
 
+    // Scrape live metrics from providers that have spec.metricsConfig.
+    // Failures are non-fatal — providers without metrics receive neutral scoring.
+    let raw_metrics = provider_metrics::collect_provider_metrics(network_name, &providers).await;
+    let metrics_by_str: HashMap<&str, scoring::BackendMetrics> =
+        raw_metrics.iter().map(|(k, v)| (k.as_str(), *v)).collect();
+    let metrics_arg = if metrics_by_str.is_empty() {
+        None
+    } else {
+        Some(&metrics_by_str)
+    };
+
     for gw_ref in &network.spec.gateway_refs {
         // Each gateway identifies its own local site.  Fall back to the
         // network name for single-site deployments where the two are equal.
         let local_site = gw_ref.local_site_name.as_deref().unwrap_or(network_name);
-        let overlay = routing_overlay::render_routing_overlay(network, &sites, &providers, local_site)
+        let overlay = routing_overlay::render_routing_overlay(network, &sites, &providers, local_site, metrics_arg)
             .map_err(OperatorError::OverlayRender)?;
         // Praxis grid_route rejects an empty candidates list at config load
         // time, which would cause a hot-reload error rather than a clean
