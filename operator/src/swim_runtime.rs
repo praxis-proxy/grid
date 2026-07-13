@@ -29,10 +29,14 @@
 
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
+use crdt::GridStateSnapshot;
 use swim::{MemberEvent, NodeId, SwimNode, runtime::TimerEvent};
 use tokio::{
     net::UdpSocket,
-    sync::{mpsc, watch},
+    sync::{
+        mpsc::{self, error::TrySendError},
+        watch,
+    },
 };
 
 use crate::swim::{MemberRecord, MemberStatus, MembershipSnapshot};
@@ -75,6 +79,13 @@ struct RuntimeChannels {
 
     /// Receives due foca timer callbacks.
     timer_rx: mpsc::Receiver<TimerEvent>,
+
+    /// Receives CRDT state broadcasts to publish over SWIM.
+    ///
+    /// When a `StateBroadcast` is received here the runtime calls
+    /// `SwimNode::publish_state_broadcast` and immediately gossips so that
+    /// peers receive the broadcast on the next outbound message.
+    broadcast_rx: mpsc::Receiver<swim::StateBroadcast>,
 }
 
 // ---------------------------------------------------------------------------
@@ -107,23 +118,81 @@ pub enum SwimRuntimeError {
 // Handle
 // ---------------------------------------------------------------------------
 
+/// Error returned when a CRDT state broadcast cannot be queued.
+#[derive(Debug, thiserror::Error)]
+pub enum BroadcastError {
+    /// The runtime broadcast queue is full.
+    #[error("SWIM runtime broadcast channel full")]
+    ChannelFull,
+
+    /// The runtime task has exited and the channel is closed.
+    #[error("SWIM runtime broadcast channel closed")]
+    ChannelClosed,
+}
+
 /// A handle to the live SWIM runtime.
 ///
 /// Returned by `start`; shared across all `GridNetwork` reconciles via
-/// `OperatorCtx`.  Produces a [`MembershipSnapshot`] on each call to
-/// [`SwimHandle::snapshot`] by cloning the most recent watch value — no blocking.
+/// `OperatorCtx`.  Produces snapshots on each call to [`SwimHandle::snapshot`]
+/// and [`SwimHandle::state_snapshot`] by cloning the most recent watch value
+/// without blocking.
 pub struct SwimHandle {
-    /// Watch channel receiver for membership snapshots.
+    /// Stable local site identity advertised by this SWIM runtime.
+    site_name: String,
+
+    /// Watch channel receiver for SWIM membership snapshots.
     snapshot_rx: watch::Receiver<MembershipSnapshot>,
+
+    /// Watch channel receiver for the merged CRDT grid-state snapshot.
+    ///
+    /// Updated whenever a peer delivers a `swim::StateBroadcast` over SWIM
+    /// custom broadcasts.
+    state_rx: watch::Receiver<GridStateSnapshot>,
+
+    /// Channel for sending CRDT state broadcasts to the runtime loop.
+    broadcast_tx: mpsc::Sender<swim::StateBroadcast>,
 }
 
 impl SwimHandle {
+    /// Return the local site identity advertised to SWIM peers.
+    #[must_use]
+    pub fn site_name(&self) -> &str {
+        &self.site_name
+    }
+
     /// Clone the most recently published [`MembershipSnapshot`].
     ///
-    /// Returns the snapshot without blocking.  The snapshot reflects
-    /// all membership events processed since the runtime started.
+    /// Returns the snapshot without blocking.
     pub fn snapshot(&self) -> MembershipSnapshot {
         self.snapshot_rx.borrow().clone()
+    }
+
+    /// Clone the most recently merged CRDT [`GridStateSnapshot`].
+    ///
+    /// Updated by the `swim::StateBroadcastHandler` as peers deliver state
+    /// broadcasts over SWIM gossip.  Returns the last-known value without
+    /// blocking; callers should tolerate a brief lag after startup while the
+    /// first broadcasts arrive.
+    pub fn state_snapshot(&self) -> GridStateSnapshot {
+        self.state_rx.borrow().clone()
+    }
+
+    /// Queue a CRDT state broadcast for delivery to SWIM peers.
+    ///
+    /// The runtime task encodes the broadcast and calls
+    /// `SwimNode::publish_state_broadcast` followed immediately by a gossip
+    /// round so peers receive the data on the next outbound message.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BroadcastError::ChannelFull`] if the bounded runtime queue is
+    /// currently full, or [`BroadcastError::ChannelClosed`] if the runtime task
+    /// has exited.
+    pub fn publish_state_broadcast(&self, broadcast: swim::StateBroadcast) -> Result<(), BroadcastError> {
+        self.broadcast_tx.try_send(broadcast).map_err(|e| match e {
+            TrySendError::Full(_) => BroadcastError::ChannelFull,
+            TrySendError::Closed(_) => BroadcastError::ChannelClosed,
+        })
     }
 }
 
@@ -143,6 +212,10 @@ impl SwimHandle {
 /// # Errors
 ///
 /// Returns [`SwimRuntimeError::Bind`] if the socket cannot be bound.
+#[expect(
+    clippy::too_many_lines,
+    reason = "channel setup, socket bind, runtime spawn — linear startup sequence"
+)]
 pub async fn start(config: SwimConfig) -> Result<Arc<SwimHandle>, SwimRuntimeError> {
     let socket = UdpSocket::bind(config.bind_addr)
         .await
@@ -155,12 +228,16 @@ pub async fn start(config: SwimConfig) -> Result<Arc<SwimHandle>, SwimRuntimeErr
         .map_err(|source| SwimRuntimeError::LocalAddr { source })?;
     let advertise_addr = config.advertise_addr.unwrap_or(local_addr);
 
+    let site_name = config.site_name.clone();
     let (snapshot_tx, snapshot_rx) = watch::channel(MembershipSnapshot::default());
+    let (state_tx, state_rx) = watch::channel(GridStateSnapshot::new(site_name.clone()));
     let (timer_tx, timer_rx) = mpsc::channel::<TimerEvent>(256);
+    let (broadcast_tx, broadcast_rx) = mpsc::channel::<swim::StateBroadcast>(32);
     let channels = RuntimeChannels {
         snapshot_tx,
         timer_tx,
         timer_rx,
+        broadcast_rx,
     };
 
     tracing::info!(
@@ -171,9 +248,14 @@ pub async fn start(config: SwimConfig) -> Result<Arc<SwimHandle>, SwimRuntimeErr
         "SWIM runtime starting"
     );
 
-    tokio::spawn(run_loop(Arc::new(socket), config, advertise_addr, channels));
+    tokio::spawn(run_loop(Arc::new(socket), config, advertise_addr, channels, state_tx));
 
-    Ok(Arc::new(SwimHandle { snapshot_rx }))
+    Ok(Arc::new(SwimHandle {
+        site_name,
+        snapshot_rx,
+        state_rx,
+        broadcast_tx,
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -187,11 +269,17 @@ pub async fn start(config: SwimConfig) -> Result<Arc<SwimHandle>, SwimRuntimeErr
     clippy::too_many_lines,
     reason = "sequential startup steps (seed announces) + select! event loop; splitting would obscure the data flow"
 )]
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "select! with four arms plus nested drain_output; extracting arms would hide the I/O ownership pattern"
+)]
+#[expect(clippy::large_stack_frames, reason = "async future over UDP socket + foca node")]
 async fn run_loop(
     socket: Arc<UdpSocket>,
     config: SwimConfig,
     advertise_addr: SocketAddr,
     mut channels: RuntimeChannels,
+    state_tx: watch::Sender<GridStateSnapshot>,
 ) {
     let identity = NodeId::new(config.site_name, advertise_addr);
     let (event_tx, _event_rx) = mpsc::channel(1);
@@ -222,6 +310,10 @@ async fn run_loop(
                             &channels.snapshot_tx,
                         )
                         .await;
+                        // Publish updated CRDT state after every incoming UDP packet.
+                        // Broadcasts are received inside handle_data, so the snapshot
+                        // may have advanced.
+                        drop(state_tx.send(node.state_snapshot()));
                     }
                     Err(e) => tracing::warn!(error = %e, "SWIM UDP recv error"),
                 }
@@ -236,6 +328,24 @@ async fn run_loop(
                     &channels.snapshot_tx,
                 )
                 .await;
+            }
+            Some(bc) = channels.broadcast_rx.recv() => {
+                // Publish the broadcast then immediately gossip so peers
+                // receive it on the next outbound message.
+                if let Err(e) = node.publish_state_broadcast(&bc) {
+                    tracing::warn!(error = %e, "failed to encode state broadcast");
+                } else {
+                    let gossip_out = node.gossip();
+                    drain_output(
+                        gossip_out,
+                        &socket,
+                        &channels.timer_tx,
+                        &mut members,
+                        &channels.snapshot_tx,
+                    )
+                    .await;
+                }
+                drop(state_tx.send(node.state_snapshot()));
             }
         }
     }
@@ -464,10 +574,26 @@ mod tests {
     // SwimHandle
     // -----------------------------------------------------------------------
 
+    fn make_test_handle() -> (
+        SwimHandle,
+        watch::Sender<MembershipSnapshot>,
+        watch::Sender<GridStateSnapshot>,
+    ) {
+        let (snapshot_tx, snapshot_rx) = watch::channel(MembershipSnapshot::default());
+        let (state_tx, state_rx) = watch::channel(GridStateSnapshot::new("test".to_owned()));
+        let (broadcast_tx, _broadcast_rx) = mpsc::channel(1);
+        let handle = SwimHandle {
+            site_name: "test".to_owned(),
+            snapshot_rx,
+            state_rx,
+            broadcast_tx,
+        };
+        (handle, snapshot_tx, state_tx)
+    }
+
     #[test]
     fn handle_snapshot_starts_empty() {
-        let (snapshot_tx, snapshot_rx) = watch::channel(MembershipSnapshot::default());
-        let handle = SwimHandle { snapshot_rx };
+        let (handle, snapshot_tx, _state_tx) = make_test_handle();
         let snap = handle.snapshot();
         assert!(snap.members.is_empty(), "initial snapshot must be empty");
         drop(snapshot_tx);
@@ -475,8 +601,7 @@ mod tests {
 
     #[test]
     fn handle_snapshot_reflects_published_update() {
-        let (snapshot_tx, snapshot_rx) = watch::channel(MembershipSnapshot::default());
-        let handle = SwimHandle { snapshot_rx };
+        let (handle, snapshot_tx, _state_tx) = make_test_handle();
 
         let snap_with_member = MembershipSnapshot {
             members: vec![MemberRecord {
@@ -491,6 +616,38 @@ mod tests {
 
         let snap = handle.snapshot();
         assert_eq!(snap.connected_count(), 1, "snapshot must reflect published member");
+    }
+
+    #[test]
+    fn handle_state_snapshot_starts_empty() {
+        let (handle, _snap_tx, _state_tx) = make_test_handle();
+        let state = handle.state_snapshot();
+        assert!(state.providers.is_empty(), "initial CRDT state must have no providers");
+    }
+
+    #[test]
+    fn handle_state_snapshot_reflects_published_update() {
+        let (handle, _snap_tx, state_tx) = make_test_handle();
+
+        let mut snap = GridStateSnapshot::new("site-a".to_owned());
+        snap.upsert_provider(crdt::ProviderState {
+            site_id: "site-a".to_owned(),
+            provider_id: "p1".to_owned(),
+            routing_cluster: "site-a".to_owned(),
+            models: vec!["model-x".to_owned()],
+            backend_kind: "local".to_owned(),
+            phase: crdt::ProviderPhase::Available,
+            metrics: crdt::ProviderMetricsSnapshot::default(),
+            revision: 1,
+            writer_id: "site-a".to_owned(),
+        });
+        drop(state_tx.send(snap));
+
+        let state = handle.state_snapshot();
+        assert!(
+            state.provider("site-a", "p1").is_some(),
+            "CRDT state handle must reflect published provider"
+        );
     }
 
     #[test]

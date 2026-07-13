@@ -131,7 +131,25 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
     // When swim is None (runtime not configured), falls through to static phase logic.
     let membership = ctx.swim.as_ref().map(|h| h.snapshot());
     let phase = determine_phase(&network, &grid_id, membership.as_ref());
-    update_status(&network, client, &grid_id, &phase, membership.as_ref()).await?;
+
+    // Publish a CRDT state broadcast advertising this site so peers learn we exist.
+    // The snapshot is intentionally minimal; provider details are wired in a later pass.
+    let distributed_provider_count = if let Some(swim) = ctx.swim.as_ref() {
+        publish_site_presence(swim, &grid_id);
+        count_remote_provider_records(swim)
+    } else {
+        0
+    };
+
+    update_status(
+        &network,
+        client,
+        &grid_id,
+        &phase,
+        membership.as_ref(),
+        distributed_provider_count,
+    )
+    .await?;
 
     Ok(Action::requeue(REQUEUE_INTERVAL))
 }
@@ -386,18 +404,72 @@ fn determine_phase(network: &GridNetwork, grid_id: &str, membership: Option<&Mem
 // Status Update
 // ---------------------------------------------------------------------------
 
+/// Publish a minimal CRDT state broadcast advertising this site's presence.
+///
+/// Peers merge this broadcast into their local `GridStateSnapshot` and surface
+/// it via `status.distributedProviderCount`.  The snapshot carries a single
+/// "site-presence" provider record so the count becomes detectable.
+///
+/// This is the minimal wiring step; full provider detail propagation happens
+/// once `InferenceProvider` CRD state is threaded into the CRDT layer.
+fn publish_site_presence(swim: &SwimHandle, grid_id: &str) {
+    use crdt::{Capability, GridStateSnapshot, ProviderMetricsSnapshot, ProviderPhase, ProviderState};
+    use swim::StateBroadcast;
+
+    let site_name = swim.site_name();
+    let mut snap = GridStateSnapshot::new(site_name.to_owned());
+    snap.add_capability(Capability::Model(format!("site:{site_name}")));
+    snap.upsert_provider(ProviderState {
+        site_id: site_name.to_owned(),
+        provider_id: "site-presence".to_owned(),
+        routing_cluster: site_name.to_owned(),
+        models: vec![format!("site:{site_name}")],
+        backend_kind: "local".to_owned(),
+        phase: ProviderPhase::Available,
+        metrics: ProviderMetricsSnapshot::default(),
+        revision: 1,
+        writer_id: grid_id.to_owned(),
+    });
+
+    let bc = StateBroadcast::new(site_name.to_owned(), 1, snap);
+    if let Err(e) = swim.publish_state_broadcast(bc) {
+        tracing::debug!(error = %e, "CRDT broadcast channel unavailable — runtime not yet receiving");
+    }
+}
+
+/// Count provider records learned from remote sites through distributed state.
+fn count_remote_provider_records(swim: &SwimHandle) -> u32 {
+    count_remote_provider_records_in_snapshot(swim.site_name(), &swim.state_snapshot())
+}
+
+/// Count provider records whose owner differs from the local site.
+fn count_remote_provider_records_in_snapshot(local_site: &str, snapshot: &crdt::GridStateSnapshot) -> u32 {
+    let count = snapshot
+        .providers
+        .values()
+        .filter(|provider| provider.site_id != local_site)
+        .count();
+    u32::try_from(count).unwrap_or(u32::MAX)
+}
+
 /// Patch the `GridNetwork` status subresource.
 ///
-/// `connected_sites` is derived from `membership` when available: the count
-/// of peers with [`Alive`] status.  When `membership` is `None`, it is `0`.
+/// `connected_sites` is derived from `membership`: count of peers with
+/// [`Alive`] status.  `distributed_provider_count` reflects providers received via
+/// CRDT state broadcasts.  Both are `0` when SWIM is disabled.
 ///
 /// [`Alive`]: crate::swim::MemberStatus::Alive
+#[expect(
+    clippy::too_many_arguments,
+    reason = "all six arguments are distinct status fields; a wrapper struct would obscure the data flow"
+)]
 async fn update_status(
     network: &GridNetwork,
     client: &Client,
     grid_id: &str,
     phase: &GridNetworkPhase,
     membership: Option<&MembershipSnapshot>,
+    distributed_provider_count: u32,
 ) -> Result<(), OperatorError> {
     let name = network
         .metadata
@@ -410,6 +482,7 @@ async fn update_status(
     let api: Api<GridNetwork> = Api::all(client.clone());
     let status = GridNetworkStatus {
         connected_sites,
+        distributed_provider_count,
         grid_id: grid_id.to_owned(),
         observed_generation: network.metadata.generation.unwrap_or(0),
         phase: phase.clone(),
@@ -678,5 +751,39 @@ mod tests {
         let snap = alive_snapshot(3);
         let count = snap.connected_count();
         assert_eq!(count, 3, "three Alive members must give connected_sites=3");
+    }
+
+    fn provider_state(site_id: &str, provider_id: &str) -> crdt::ProviderState {
+        crdt::ProviderState {
+            site_id: site_id.to_owned(),
+            provider_id: provider_id.to_owned(),
+            routing_cluster: site_id.to_owned(),
+            models: vec!["model-x".to_owned()],
+            backend_kind: "local".to_owned(),
+            phase: crdt::ProviderPhase::Available,
+            metrics: crdt::ProviderMetricsSnapshot::default(),
+            revision: 1,
+            writer_id: site_id.to_owned(),
+        }
+    }
+
+    #[test]
+    fn distributed_provider_count_ignores_local_records() {
+        let mut snap = crdt::GridStateSnapshot::new("site-local".to_owned());
+        snap.upsert_provider(provider_state("site-local", "local-provider"));
+        let count = count_remote_provider_records_in_snapshot("site-local", &snap);
+        assert_eq!(
+            count, 0,
+            "local self-published records must not count as distributed state"
+        );
+    }
+
+    #[test]
+    fn distributed_provider_count_counts_remote_records() {
+        let mut snap = crdt::GridStateSnapshot::new("site-local".to_owned());
+        snap.upsert_provider(provider_state("site-local", "local-provider"));
+        snap.upsert_provider(provider_state("site-remote", "remote-provider"));
+        let count = count_remote_provider_records_in_snapshot("site-local", &snap);
+        assert_eq!(count, 1, "only remote provider records count as distributed state");
     }
 }

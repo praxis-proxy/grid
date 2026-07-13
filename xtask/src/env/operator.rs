@@ -437,6 +437,65 @@ pub(crate) fn verify_swim_status(phase: &str, connected_sites: u32) -> Result<()
 }
 
 // ---------------------------------------------------------------------------
+// distributed state validation helpers
+// ---------------------------------------------------------------------------
+
+#[expect(
+    clippy::disallowed_methods,
+    reason = "synchronous poll loop in xtask; no async runtime available"
+)]
+/// Poll the `GridNetwork` status until `distributedProviderCount > 0`.
+///
+/// Each SWIM-enabled operator publishes its own site-presence as a CRDT
+/// `GridStateSnapshot` on every reconcile.  After SWIM gossip convergence the
+/// remote operator's broadcast arrives and `distributedProviderCount` becomes ≥ 1.
+///
+/// Returns the observed count on success or `Err` on timeout.
+pub(crate) fn wait_for_gridnetwork_distributed_state(
+    context: &str,
+    name: &str,
+    timeout: Duration,
+) -> Result<u32, Box<dyn std::error::Error>> {
+    let start = Instant::now();
+    loop {
+        let count_str = kubectl_jsonpath(
+            context,
+            &format!("gridnetworks/{name}"),
+            "{.status.distributedProviderCount}",
+        )
+        .unwrap_or_default();
+        let count: u32 = count_str.parse().unwrap_or(0);
+
+        if count > 0 {
+            eprintln!("  [OK] GridNetwork {name}: distributedProviderCount={count}");
+            return Ok(count);
+        }
+
+        if start.elapsed() >= timeout {
+            return Err(format!(
+                "timeout waiting for GridNetwork {name} distributedProviderCount>0; last observed: {count}"
+            )
+            .into());
+        }
+        eprintln!("  waiting for GridNetwork {name} distributedProviderCount>0 (observed={count})...");
+        std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// Verify that `distributed_provider_count > 0`, proving distributed state arrived via SWIM.
+pub(crate) fn verify_distributed_state_received(
+    distributed_provider_count: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if distributed_provider_count == 0 {
+        return Err("distributed state validation failed: distributedProviderCount must be > 0".into());
+    }
+    eprintln!(
+        "  [OK] distributed state received via SWIM broadcast: distributedProviderCount={distributed_provider_count}"
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Status polling
 // ---------------------------------------------------------------------------
 

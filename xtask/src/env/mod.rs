@@ -237,6 +237,31 @@ pub(crate) enum Action {
         #[arg(long)]
         site: Option<String>,
     },
+
+    /// Prove live CRDT state propagation over SWIM.
+    ///
+    /// Starts two SWIM-enabled operator processes against the same kind
+    /// cluster.  Each operator publishes its own site-presence as a CRDT
+    /// `GridStateSnapshot` on every `GridNetwork` reconcile.  After SWIM
+    /// gossip convergence the remote operator's broadcast arrives and
+    /// `GridNetwork.status.distributedProviderCount` becomes ≥ 1.
+    ///
+    /// Proves that:
+    /// - Operators use real foca UDP custom broadcasts (not direct injection).
+    /// - The `StateBroadcastHandler` receives and merges remote state.
+    /// - `GridNetworkStatus.distributedProviderCount` reflects the merged state.
+    ///
+    /// Requires a kind cluster.  Run `env up` + `env load-gateway-images` first.
+    /// Safe to rerun: the `GridNetwork` fixture is deleted at the start of each run.
+    VerifySwimState {
+        /// Path to the environment config file.
+        #[arg(short, long, default_value = "tests/env/operator-routing.toml")]
+        config: PathBuf,
+
+        /// Kind cluster context to run against (first provider site by default).
+        #[arg(long)]
+        site: Option<String>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -269,6 +294,7 @@ pub(crate) fn run(action: &Action) -> Result<(), Box<dyn std::error::Error>> {
         Action::VerifyOperatorReconcile { config, site } => env_verify_operator_reconcile(config, site.as_deref()),
         Action::ValidateOperatorRouting { config, site } => env_validate_operator_routing(config, site.as_deref()),
         Action::VerifySwimMembership { config, site } => env_verify_swim_membership(config, site.as_deref()),
+        Action::VerifySwimState { config, site } => env_verify_swim_state(config, site.as_deref()),
     }
 }
 
@@ -727,6 +753,62 @@ fn env_verify_swim_membership(config: &Path, site: Option<&str>) -> Result<(), B
     operator::verify_swim_status("Active", connected_sites)?;
 
     eprintln!("verify-swim-membership: PASS (connectedSites={connected_sites})");
+    Ok(())
+}
+
+/// Prove that live CRDT state propagates between two SWIM-enabled operators via foca broadcast.
+///
+/// Both operators publish their own site-presence as a `GridStateSnapshot` on each reconcile.
+/// After SWIM gossip convergence, each operator's `state_snapshot()` includes the remote site's
+/// provider entry, and `GridNetworkStatus.distributedProviderCount` becomes ≥ 1.
+fn env_verify_swim_state(config: &Path, site: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    use operator::{
+        SWIM_CONVERGENCE_WAIT, SWIM_NODE_PRIMARY_NAME, SWIM_NODE_SECONDARY_NAME, SWIM_STATUS_POLL_TIMEOUT,
+        SWIM_TEST_NETWORK,
+    };
+
+    let cfg = EnvConfig::from_file(config)?;
+    let context = resolve_operator_context(&cfg, site)?;
+    eprintln!("verify-swim-state: context={context}");
+
+    operator::install_grid_crds(&context)?;
+    operator::cleanup_swim_test_resources(&context)?;
+
+    // Start primary operator (no seeds).
+    let (bind1, bind2) = reserve_swim_bind_addrs()?;
+    let op1 = operator::spawn_operator_with_swim(&context, &bind1, &bind1, SWIM_NODE_PRIMARY_NAME, "")?;
+    let mut op1_guard = ProcGuard(Some(op1), "operator-primary");
+
+    // Start secondary operator; seeds point to primary.
+    let op2 = operator::spawn_operator_with_swim(&context, &bind2, &bind2, SWIM_NODE_SECONDARY_NAME, &bind1)?;
+    let mut op2_guard = ProcGuard(Some(op2), "operator-secondary");
+
+    // Wait for SWIM convergence.
+    operator::wait_for_swim_convergence(SWIM_CONVERGENCE_WAIT);
+
+    // Apply the GridNetwork fixture; both operators reconcile immediately.
+    // Each operator publishes a site-presence StateBroadcast and gossips to its peer.
+    // After convergence, each operator has the other's provider in its merged state.
+    operator::apply_swim_test_network(&context)?;
+    eprintln!("  GridNetwork {SWIM_TEST_NETWORK} applied; operators will reconcile and exchange CRDT state...");
+
+    // Poll for distributedProviderCount > 0 (proves real distributed state arrived via SWIM broadcast).
+    let distributed_result =
+        operator::wait_for_gridnetwork_distributed_state(&context, SWIM_TEST_NETWORK, SWIM_STATUS_POLL_TIMEOUT);
+
+    // Cleanup.
+    if let Some(c) = op1_guard.0.take() {
+        operator::kill_operator(c);
+    }
+    if let Some(c) = op2_guard.0.take() {
+        operator::kill_operator(c);
+    }
+    operator::cleanup_swim_test_resources(&context)?;
+
+    let distributed_count = distributed_result?;
+    operator::verify_distributed_state_received(distributed_count)?;
+
+    eprintln!("verify-swim-state: PASS (distributedProviderCount={distributed_count})");
     Ok(())
 }
 

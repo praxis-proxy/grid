@@ -10,6 +10,7 @@ publish = false
 [dependencies]
 bytes = { workspace = true }
 certs = { path = "../certs" }
+crdt = { path = "../crdt" }
 swim = { path = "../swim" }
 futures = { workspace = true }
 http = { workspace = true }

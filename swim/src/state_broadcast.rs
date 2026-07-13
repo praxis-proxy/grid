@@ -1,13 +1,15 @@
-//! State snapshot payloads suitable for SWIM custom broadcasts.
+//! State snapshot payloads carried by SWIM custom broadcasts.
 //!
-//! This module defines the envelope that will be carried by foca custom
-//! broadcasts.  It does not wire the envelope into the live runtime yet; it
-//! keeps encoding, decoding, and invalidation semantics isolated and tested.
+//! Defines the wire envelope, the foca [`BroadcastHandler`] implementation,
+//! and helper types for CRDT grid-state propagation over SWIM gossip.
+//!
+//! [`BroadcastHandler`]: foca::BroadcastHandler
 
 use std::collections::BTreeMap;
 
 use crdt::GridStateSnapshot;
 use serde::{Deserialize, Serialize};
+use tokio::sync::watch;
 
 use crate::NodeId;
 
@@ -114,10 +116,13 @@ pub enum StateBroadcastError {
 }
 
 /// foca custom broadcast handler for CRDT grid-state snapshots.
-#[derive(Debug)]
+///
+/// Merges incoming [`StateBroadcast`] payloads into a shared
+/// [`GridStateSnapshot`] that callers can observe via the watch receiver
+/// returned by [`StateBroadcastHandler::subscribe`].
 pub struct StateBroadcastHandler {
-    /// Locally merged distributed state.
-    snapshot: GridStateSnapshot,
+    /// Shared merged state — written here, read by all subscribers.
+    state_tx: watch::Sender<GridStateSnapshot>,
 
     /// Highest revision received from each origin.
     latest_by_origin: BTreeMap<String, u64>,
@@ -125,18 +130,32 @@ pub struct StateBroadcastHandler {
 
 impl StateBroadcastHandler {
     /// Create a handler with an empty local state snapshot.
+    ///
+    /// Call [`subscribe`] before moving `self` into foca to obtain a
+    /// [`watch::Receiver`] for reading the merged state.
+    ///
+    /// [`subscribe`]: StateBroadcastHandler::subscribe
     #[must_use]
     pub fn new(site_id: String) -> Self {
+        let (tx, _) = watch::channel(GridStateSnapshot::new(site_id));
         Self {
-            snapshot: GridStateSnapshot::new(site_id),
+            state_tx: tx,
             latest_by_origin: BTreeMap::new(),
         }
     }
 
-    /// Return the currently merged grid-state snapshot.
+    /// Return a receiver for the live merged grid-state snapshot.
+    ///
+    /// Create the receiver **before** moving `self` into foca.  Multiple
+    /// receivers share the same underlying channel; each sees all updates.
+    pub fn subscribe(&self) -> watch::Receiver<GridStateSnapshot> {
+        self.state_tx.subscribe()
+    }
+
+    /// Clone and return the currently merged grid-state snapshot.
     #[must_use]
-    pub fn snapshot(&self) -> &GridStateSnapshot {
-        &self.snapshot
+    pub fn snapshot(&self) -> GridStateSnapshot {
+        self.state_tx.borrow().clone()
     }
 }
 
@@ -161,7 +180,7 @@ impl foca::BroadcastHandler<NodeId> for StateBroadcastHandler {
             return Ok(None);
         }
 
-        self.snapshot.merge(&broadcast.snapshot);
+        self.state_tx.send_modify(|snap| snap.merge(&broadcast.snapshot));
         self.latest_by_origin
             .insert(broadcast.origin_site.clone(), broadcast.revision);
         Ok(Some(broadcast.key()))
@@ -290,8 +309,8 @@ mod tests {
             .unwrap_or_else(|_| std::process::abort());
 
         assert!(key.is_some(), "new broadcast must be disseminated");
-        let provider = handler
-            .snapshot()
+        let snap = handler.snapshot();
+        let provider = snap
             .provider("site-p", "provider")
             .unwrap_or_else(|| std::process::abort());
         assert_eq!(provider.metrics.queue_depth, Some(0.2), "snapshot must merge");
@@ -341,8 +360,8 @@ mod tests {
                 .is_none(),
             "older broadcast is stale"
         );
-        let provider = handler
-            .snapshot()
+        let snap = handler.snapshot();
+        let provider = snap
             .provider("site-p", "provider")
             .unwrap_or_else(|| std::process::abort());
         assert_eq!(provider.metrics.queue_depth, Some(0.1), "newer state must remain");

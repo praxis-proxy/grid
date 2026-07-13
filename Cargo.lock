@@ -1311,6 +1311,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "certs",
+ "crdt",
  "futures",
  "http",
  "http-body-util",
