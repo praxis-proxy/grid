@@ -8,8 +8,10 @@ license.workspace = true
 publish = false
 
 [dependencies]
+bincode = { workspace = true }
 bytes = { workspace = true }
 foca = { workspace = true }
+rand = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
 tracing = { workspace = true }

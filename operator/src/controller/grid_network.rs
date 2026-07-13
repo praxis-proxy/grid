@@ -26,7 +26,31 @@ use crate::{
     },
     error::OperatorError,
     resources::{provider_metrics, routing_overlay, secret},
+    swim::MembershipSnapshot,
+    swim_runtime::SwimHandle,
 };
+
+// ---------------------------------------------------------------------------
+// Operator context
+// ---------------------------------------------------------------------------
+
+/// Shared context passed to the [`GridNetwork`] controller's reconcile loop.
+///
+/// Bundles the Kubernetes client with an optional live SWIM handle.
+/// When `swim` is `Some`, each reconcile obtains a fresh
+/// [`MembershipSnapshot`] to feed into `determine_phase` and
+/// `update_status`.  When `swim` is `None`, the controller falls back
+/// to its existing static phase logic.
+pub struct OperatorCtx {
+    /// Kubernetes API client.
+    pub client: Client,
+
+    /// Optional handle to the live SWIM membership runtime.
+    ///
+    /// `None` when the operator is started without a SWIM bind address
+    /// configured (e.g. in single-node or test environments).
+    pub swim: Option<Arc<SwimHandle>>,
+}
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -89,7 +113,7 @@ pub fn network_refs_from_grid_site(site: GridSite) -> Option<ObjectRef<GridNetwo
 /// Returns [`OperatorError`] on Kubernetes API or certificate
 /// generation failures.
 #[expect(clippy::large_stack_frames, reason = "async future with kube API types")]
-pub async fn reconcile(network: Arc<GridNetwork>, client: Arc<Client>) -> Result<Action, OperatorError> {
+pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Result<Action, OperatorError> {
     let name = network
         .metadata
         .name
@@ -98,18 +122,22 @@ pub async fn reconcile(network: Arc<GridNetwork>, client: Arc<Client>) -> Result
 
     info!(name, "reconciling GridNetwork");
 
-    ensure_tls_secrets(&network, &client).await?;
-    reconcile_routing_overlay(&network, &client).await?;
+    let client = &ctx.client;
+    ensure_tls_secrets(&network, client).await?;
+    reconcile_routing_overlay(&network, client).await?;
 
     let grid_id = resolve_grid_id(&network);
-    let phase = determine_phase(&network, &grid_id);
-    update_status(&network, client.as_ref(), &grid_id, &phase).await?;
+    // Obtain a live membership snapshot from the SWIM runtime when available.
+    // When swim is None (runtime not configured), falls through to static phase logic.
+    let membership = ctx.swim.as_ref().map(|h| h.snapshot());
+    let phase = determine_phase(&network, &grid_id, membership.as_ref());
+    update_status(&network, client, &grid_id, &phase, membership.as_ref()).await?;
 
     Ok(Action::requeue(REQUEUE_INTERVAL))
 }
 
 /// Error policy for the [`GridNetwork`] controller.
-pub fn error_policy(_network: Arc<GridNetwork>, error: &OperatorError, _ctx: Arc<Client>) -> Action {
+pub fn error_policy(_network: Arc<GridNetwork>, error: &OperatorError, _ctx: Arc<OperatorCtx>) -> Action {
     tracing::error!(%error, "GridNetwork reconciliation failed");
     Action::requeue(Duration::from_secs(30))
 }
@@ -320,10 +348,32 @@ fn resolve_grid_id(network: &GridNetwork) -> String {
 }
 
 /// Determine the lifecycle phase.
-fn determine_phase(network: &GridNetwork, grid_id: &str) -> GridNetworkPhase {
+///
+/// When a [`MembershipSnapshot`] is provided, the live membership state takes
+/// precedence:
+/// - ≥1 [`Alive`] member → [`Active`].
+/// - Members present but all [`Suspect`]/[`Dead`] → [`Degraded`].
+/// - Empty snapshot → falls through to the existing TLS-based logic.
+///
+/// When `membership` is `None` (no SWIM runtime wired yet), the existing
+/// `Pending`/`Initializing` logic is unchanged.
+///
+/// [`Alive`]: crate::swim::MemberStatus::Alive
+/// [`Suspect`]: crate::swim::MemberStatus::Suspect
+/// [`Dead`]: crate::swim::MemberStatus::Dead
+/// [`Active`]: GridNetworkPhase::Active
+/// [`Degraded`]: GridNetworkPhase::Degraded
+fn determine_phase(network: &GridNetwork, grid_id: &str, membership: Option<&MembershipSnapshot>) -> GridNetworkPhase {
     if grid_id.is_empty() {
         return GridNetworkPhase::Pending;
     }
+    // Live membership takes precedence when available and non-empty.
+    if let Some(snap) = membership
+        && let Some(hint) = snap.phase_hint()
+    {
+        return hint;
+    }
+    // Existing static phase logic (no live membership yet).
     let has_tls = network.spec.tls.ca_secret_ref.is_some();
     if has_tls {
         GridNetworkPhase::Initializing
@@ -337,11 +387,17 @@ fn determine_phase(network: &GridNetwork, grid_id: &str) -> GridNetworkPhase {
 // ---------------------------------------------------------------------------
 
 /// Patch the `GridNetwork` status subresource.
+///
+/// `connected_sites` is derived from `membership` when available: the count
+/// of peers with [`Alive`] status.  When `membership` is `None`, it is `0`.
+///
+/// [`Alive`]: crate::swim::MemberStatus::Alive
 async fn update_status(
     network: &GridNetwork,
     client: &Client,
     grid_id: &str,
     phase: &GridNetworkPhase,
+    membership: Option<&MembershipSnapshot>,
 ) -> Result<(), OperatorError> {
     let name = network
         .metadata
@@ -349,9 +405,11 @@ async fn update_status(
         .as_deref()
         .unwrap_or_else(|| std::process::abort());
 
+    let connected_sites = membership.map_or(0, MembershipSnapshot::connected_count);
+
     let api: Api<GridNetwork> = Api::all(client.clone());
     let status = GridNetworkStatus {
-        connected_sites: 0,
+        connected_sites,
         grid_id: grid_id.to_owned(),
         observed_generation: network.metadata.generation.unwrap_or(0),
         phase: phase.clone(),
@@ -498,5 +556,127 @@ mod tests {
         assert_ne!(name_a, name_b, "different sites must map to different networks");
         assert_eq!(name_a, "net-x", "first site maps to net-x");
         assert_eq!(name_b, "net-y", "second site maps to net-y");
+    }
+
+    // -----------------------------------------------------------------------
+    // determine_phase with membership seam
+    // -----------------------------------------------------------------------
+
+    fn base_network() -> GridNetwork {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "kind": "GridNetwork",
+            "metadata": { "name": "net" },
+            "spec": { "seeds": [], "gridId": "test-id" }
+        }))
+        .unwrap_or_else(|_| std::process::abort())
+    }
+
+    fn alive_snapshot(count: usize) -> MembershipSnapshot {
+        MembershipSnapshot {
+            members: (0..count)
+                .map(|i| crate::swim::MemberRecord {
+                    site_id: format!("site-{i}"),
+                    endpoint: format!("10.0.0.{i}:7946"),
+                    incarnation: 1,
+                    status: crate::swim::MemberStatus::Alive,
+                    age_secs: 0,
+                })
+                .collect(),
+        }
+    }
+
+    fn suspect_snapshot() -> MembershipSnapshot {
+        MembershipSnapshot {
+            members: vec![crate::swim::MemberRecord {
+                site_id: "site-suspect".to_owned(),
+                endpoint: "10.0.0.1:7946".to_owned(),
+                incarnation: 1,
+                status: crate::swim::MemberStatus::Suspect,
+                age_secs: 5,
+            }],
+        }
+    }
+
+    #[test]
+    fn determine_phase_none_membership_preserves_tls_logic() {
+        let network = base_network();
+        // Without TLS config, phase is Pending regardless of grid_id.
+        let phase = determine_phase(&network, "some-id", None);
+        assert_eq!(
+            phase,
+            GridNetworkPhase::Pending,
+            "None membership and no TLS must yield Pending"
+        );
+    }
+
+    #[test]
+    fn determine_phase_empty_snapshot_preserves_tls_logic() {
+        let network = base_network();
+        let empty = MembershipSnapshot::default();
+        let phase = determine_phase(&network, "some-id", Some(&empty));
+        assert_eq!(
+            phase,
+            GridNetworkPhase::Pending,
+            "empty snapshot must fall through to existing phase logic"
+        );
+    }
+
+    #[test]
+    fn determine_phase_with_alive_member_is_active() {
+        let network = base_network();
+        let snap = alive_snapshot(2);
+        let phase = determine_phase(&network, "some-id", Some(&snap));
+        assert_eq!(
+            phase,
+            GridNetworkPhase::Active,
+            "Alive members must produce Active phase"
+        );
+    }
+
+    #[test]
+    fn determine_phase_with_suspect_only_is_degraded() {
+        let network = base_network();
+        let snap = suspect_snapshot();
+        let phase = determine_phase(&network, "some-id", Some(&snap));
+        assert_eq!(
+            phase,
+            GridNetworkPhase::Degraded,
+            "all-Suspect members must produce Degraded phase"
+        );
+    }
+
+    #[test]
+    fn determine_phase_active_overrides_tls_initializing() {
+        // When TLS would make the phase Initializing, an Alive membership still
+        // promotes to Active because live peers are the authoritative signal.
+        let mut network = base_network();
+        network.spec.tls.ca_secret_ref = Some(crate::crd::grid_network::SecretRef {
+            name: "ca".to_owned(),
+            namespace: "default".to_owned(),
+        });
+        let snap = alive_snapshot(1);
+        let phase = determine_phase(&network, "some-id", Some(&snap));
+        assert_eq!(
+            phase,
+            GridNetworkPhase::Active,
+            "Alive membership must override TLS-Initializing phase"
+        );
+    }
+
+    #[test]
+    fn connected_sites_is_zero_without_membership() {
+        // Verify the update_status path: no membership → connected_sites = 0.
+        let count = None::<MembershipSnapshot>
+            .as_ref()
+            .map_or(0, MembershipSnapshot::connected_count);
+        assert_eq!(count, 0, "None membership must produce connected_sites=0");
+    }
+
+    #[test]
+    fn connected_sites_counts_alive_members_from_snapshot() {
+        let snap = alive_snapshot(3);
+        let count = snap.connected_count();
+        assert_eq!(count, 3, "three Alive members must give connected_sites=3");
     }
 }

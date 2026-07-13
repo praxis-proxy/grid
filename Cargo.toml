@@ -20,6 +20,7 @@ license = "MIT"
 axum = "0.8.9"
 bytes = "1.12.1"
 clap = { version = "4.6.1", features = ["derive"] }
+bincode = { version = "2", default-features = false, features = ["std", "serde"] }
 foca = { version = "1.0.0", features = ["std", "tracing", "bincode-codec"] }
 futures = "0.3.32"
 http = "1.4.2"
@@ -38,6 +39,7 @@ tokio = { version = "1.52.3", features = ["macros", "rt", "rt-multi-thread", "si
 toml = "0.8.23"
 tower = "0.5.3"
 tracing = "0.1.44"
+rand = { version = "0.9", features = ["small_rng"] }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 uuid = { version = "1.23.4", features = ["v4"] }
 

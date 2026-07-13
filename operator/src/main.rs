@@ -1,8 +1,18 @@
 //! AI Grid operator binary.
 //!
 //! Runs Kubernetes controllers for [`GridNetwork`], [`GridSite`], and
-//! [`InferenceProvider`] resources.  In future phases, also runs the
-//! SWIM runtime for peer-to-peer mesh formation.
+//! [`InferenceProvider`] resources, and optionally starts a live SWIM
+//! membership runtime for peer-to-peer mesh formation.
+//!
+//! # SWIM configuration
+//!
+//! Set `GRID_SWIM_BIND_ADDR` (e.g. `"0.0.0.0:7946"`) to enable the SWIM
+//! runtime. Set `GRID_SWIM_ADVERTISE_ADDR` when the bind address is not
+//! directly reachable by peers, and set `GRID_SWIM_SEEDS` to a comma-separated
+//! list of seed peer socket addresses. When `GRID_SWIM_BIND_ADDR` is absent
+//! the operator runs in static mode (`membership = None`);
+//! `GridNetwork.status.connected_sites` remains 0 and the phase stays
+//! `Pending`/`Initializing` based on TLS configuration only.
 //!
 //! [`GridNetwork`]: operator::crd::grid_network::GridNetwork
 //! [`GridSite`]: operator::crd::grid_site::GridSite
@@ -10,7 +20,7 @@
 
 #![deny(unsafe_code)]
 
-use std::sync::Arc;
+use std::{net::SocketAddr, sync::Arc};
 
 use futures::StreamExt as _;
 use kube::{
@@ -18,8 +28,12 @@ use kube::{
     runtime::{controller::Controller, watcher},
 };
 use operator::{
-    controller::{grid_network, grid_site, inference_provider},
+    controller::{
+        grid_network::{self, OperatorCtx},
+        grid_site, inference_provider,
+    },
     crd::{grid_network::GridNetwork, grid_site::GridSite, inference_provider::InferenceProvider},
+    swim_runtime::{self, SwimConfig},
 };
 
 // ---------------------------------------------------------------------------
@@ -40,8 +54,18 @@ async fn main() {
         },
     };
 
+    // Start the SWIM runtime if GRID_SWIM_BIND_ADDR is set.
+    // The runtime runs in the background; failures are logged and the
+    // operator continues in static mode.
+    let swim = maybe_start_swim().await;
+
+    let ctx = Arc::new(OperatorCtx {
+        client: client.clone(),
+        swim,
+    });
+
     let result = tokio::try_join!(
-        run_network_controller(client.clone()),
+        run_network_controller(client.clone(), Arc::clone(&ctx)),
         run_site_controller(client.clone()),
         run_provider_controller(client.clone()),
     );
@@ -49,6 +73,90 @@ async fn main() {
     if let Err(e) = result {
         tracing::error!(error = %e, "controller error");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Hostname helper
+// ---------------------------------------------------------------------------
+
+/// Optionally start the SWIM runtime from environment variables.
+///
+/// Returns `Some(handle)` if `GRID_SWIM_BIND_ADDR` is set and the runtime
+/// starts successfully.  Returns `None` when the variable is absent,
+/// unparseable, or the bind fails (all logged at error level).
+async fn maybe_start_swim() -> Option<Arc<swim_runtime::SwimHandle>> {
+    let addr_str = std::env::var("GRID_SWIM_BIND_ADDR").ok()?;
+    let bind_addr = match addr_str.parse() {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::error!(addr = %addr_str, error = %e, "GRID_SWIM_BIND_ADDR not a valid socket address");
+            return None;
+        },
+    };
+    let advertise_addr = parse_optional_socket_addr_env("GRID_SWIM_ADVERTISE_ADDR");
+    let seeds = parse_socket_addr_list_env("GRID_SWIM_SEEDS");
+    let site_name = std::env::var("GRID_SWIM_SITE_NAME").unwrap_or_else(|_| hostname_or_default());
+    let cfg = SwimConfig {
+        bind_addr,
+        advertise_addr,
+        site_name,
+        seeds,
+    };
+    match swim_runtime::start(cfg).await {
+        Ok(handle) => {
+            tracing::info!(addr = %addr_str, "SWIM runtime started");
+            Some(handle)
+        },
+        Err(e) => {
+            tracing::error!(error = %e, "SWIM runtime failed to start; running in static mode");
+            None
+        },
+    }
+}
+
+/// Parse an optional socket address environment variable.
+fn parse_optional_socket_addr_env(name: &str) -> Option<SocketAddr> {
+    let value = std::env::var(name).ok()?;
+    match value.parse() {
+        Ok(addr) => Some(addr),
+        Err(e) => {
+            tracing::error!(env = name, value = %value, error = %e, "SWIM socket address env var is invalid");
+            None
+        },
+    }
+}
+
+/// Parse a comma-separated socket address environment variable.
+fn parse_socket_addr_list_env(name: &str) -> Vec<SocketAddr> {
+    let Ok(value) = std::env::var(name) else {
+        return Vec::new();
+    };
+
+    value
+        .split(',')
+        .filter_map(|raw| {
+            let item = raw.trim();
+            if item.is_empty() {
+                return None;
+            }
+            match item.parse() {
+                Ok(addr) => Some(addr),
+                Err(e) => {
+                    tracing::error!(env = name, value = %item, error = %e, "SWIM seed address is invalid");
+                    None
+                },
+            }
+        })
+        .collect()
+}
+
+/// Return the machine hostname or a safe fallback.
+fn hostname_or_default() -> String {
+    std::fs::read_to_string("/etc/hostname")
+        .ok()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "grid-operator".to_owned())
 }
 
 // ---------------------------------------------------------------------------
@@ -62,7 +170,10 @@ async fn main() {
 /// reconciliation of the owning [`GridNetwork`] (identified by
 /// `spec.gridNetworkRef`), keeping routing overlay `ConfigMap`s consistent
 /// with provider availability and site membership.
-async fn run_network_controller(client: Client) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn run_network_controller(
+    client: Client,
+    ctx: Arc<OperatorCtx>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let api = Api::<GridNetwork>::all(client.clone());
     let provider_api = Api::<InferenceProvider>::all(client.clone());
     let site_api = Api::<GridSite>::all(client.clone());
@@ -78,7 +189,7 @@ async fn run_network_controller(client: Client) -> Result<(), Box<dyn std::error
             watcher::Config::default(),
             grid_network::network_refs_from_grid_site,
         )
-        .run(grid_network::reconcile, grid_network::error_policy, Arc::new(client))
+        .run(grid_network::reconcile, grid_network::error_policy, ctx)
         .for_each(|result| async {
             match result {
                 Ok((obj, _action)) => tracing::info!(%obj, "reconciled GridNetwork"),

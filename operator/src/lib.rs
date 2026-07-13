@@ -18,3 +18,15 @@ pub mod metrics_parser;
 pub mod metrics_scraper;
 /// Kubernetes resource builders.
 pub mod resources;
+/// SWIM membership data model and status summarization.
+///
+/// Pure data layer for peer discovery; the live UDP runtime is implemented in
+/// [`swim_runtime`].
+pub mod swim;
+/// Live SWIM membership runtime (foca-backed UDP event loop).
+///
+/// Produces [`swim::MembershipSnapshot`]s consumed by the [`GridNetwork`]
+/// controller via [`controller::grid_network::OperatorCtx`].
+///
+/// [`GridNetwork`]: crate::crd::grid_network::GridNetwork
+pub mod swim_runtime;

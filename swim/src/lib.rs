@@ -20,9 +20,12 @@
 pub mod event;
 /// SWIM node identity for the AI Grid.
 pub mod identity;
+/// High-level SWIM node wrapping a foca Foca instance.
+pub mod node;
 /// Foca runtime adapter with accumulated output.
 pub mod runtime;
 
 pub use event::MemberEvent;
 pub use identity::NodeId;
+pub use node::SwimNode;
 pub use runtime::{AccumulatedOutput, GridRuntime};
