@@ -70,6 +70,31 @@ const ERROR_ENDPOINT_CONTAINER_PORT: u16 = 8080;
 pub(crate) const POD_READY_TIMEOUT: Duration = Duration::from_secs(60);
 
 // ---------------------------------------------------------------------------
+// Metrics ordering fixture constants
+// ---------------------------------------------------------------------------
+
+/// Name of the `InferenceProvider` fixture with a low (idle) queue depth metric.
+pub(crate) const TEST_METRICS_IDLE_PROVIDER: &str = "op-e2e-metrics-idle";
+/// Name of the `InferenceProvider` fixture with a high (busy) queue depth metric.
+pub(crate) const TEST_METRICS_BUSY_PROVIDER: &str = "op-e2e-metrics-busy";
+/// `routingClusterRef` of the idle metrics provider; becomes `candidate.cluster` in the overlay.
+pub(crate) const TEST_METRICS_IDLE_ROUTING_CLUSTER: &str = "site-metrics-idle";
+/// `routingClusterRef` of the busy metrics provider; becomes `candidate.cluster` in the overlay.
+pub(crate) const TEST_METRICS_BUSY_ROUTING_CLUSTER: &str = "site-metrics-busy";
+/// Local port used when port-forwarding the idle metrics endpoint Pod to the operator host.
+pub(crate) const METRICS_IDLE_LOCAL_PORT: u16 = 18_501;
+/// Local port used when port-forwarding the busy metrics endpoint Pod to the operator host.
+pub(crate) const METRICS_BUSY_LOCAL_PORT: u16 = 18_502;
+/// Prometheus metric name served by the metrics endpoint Pods.
+///
+/// The operator's `spec.metricsConfig.signalNames.queueDepth` is set to this name.
+const METRICS_QUEUE_SIGNAL_NAME: &str = "provider_queue_depth_normalized";
+/// Queue depth value served by the idle metrics endpoint Pod (low → high score).
+const METRICS_IDLE_QUEUE_DEPTH: &str = "0.1";
+/// Queue depth value served by the busy metrics endpoint Pod (high → low score).
+const METRICS_BUSY_QUEUE_DEPTH: &str = "0.9";
+
+// ---------------------------------------------------------------------------
 // CRD installation
 // ---------------------------------------------------------------------------
 
@@ -100,10 +125,14 @@ pub(crate) fn cleanup_validation_resources(context: &str) -> Result<(), Box<dyn 
     )?;
     delete_namespaced_resource(context, TEST_GATEWAY_NS, "service", ERROR_ENDPOINT_NAME)?;
     force_delete_pod(context, TEST_GATEWAY_NS, ERROR_ENDPOINT_NAME)?;
+    force_delete_pod(context, TEST_GATEWAY_NS, TEST_METRICS_IDLE_PROVIDER)?;
+    force_delete_pod(context, TEST_GATEWAY_NS, TEST_METRICS_BUSY_PROVIDER)?;
     delete_cluster_resource(context, "inferenceprovider", TEST_PROVIDER_HEALTHY)?;
     delete_cluster_resource(context, "inferenceprovider", TEST_PROVIDER_INVALID)?;
     delete_cluster_resource(context, "inferenceprovider", TEST_PROVIDER_DEGRADED)?;
     delete_cluster_resource(context, "inferenceprovider", TEST_PROVIDER_API)?;
+    delete_cluster_resource(context, "inferenceprovider", TEST_METRICS_IDLE_PROVIDER)?;
+    delete_cluster_resource(context, "inferenceprovider", TEST_METRICS_BUSY_PROVIDER)?;
     delete_cluster_resource(context, "gridnetwork", TEST_NETWORK)?;
     eprintln!("  [OK] stale validation resources removed");
     Ok(())
@@ -486,6 +515,243 @@ pub(crate) fn start_error_endpoint_port_forward(context: &str) -> Result<Child, 
     std::thread::sleep(Duration::from_secs(2));
     eprintln!("  [OK] port-forward {local_port} → {ERROR_ENDPOINT_NAME}:{pod_port}");
     Ok(child)
+}
+
+// ---------------------------------------------------------------------------
+// Metrics endpoint fixtures
+// ---------------------------------------------------------------------------
+
+/// Build the Python HTTP server script that serves a single Prometheus gauge line.
+///
+/// The server responds to any GET request with a `200 OK` body containing:
+/// `{METRICS_QUEUE_SIGNAL_NAME} {queue_depth}\n`
+///
+/// This is used to simulate a provider's `/metrics` endpoint in kind, returning
+/// a fixed normalised queue depth for the operator to scrape.
+fn metrics_server_script(queue_depth: &str) -> String {
+    let body_stmt = format!("b=b'{METRICS_QUEUE_SIGNAL_NAME} {queue_depth}\\n'");
+    format!(
+        "import http.server,socketserver\n\
+         class H(http.server.BaseHTTPRequestHandler):\n \
+         def do_GET(s):\n  \
+         {body_stmt};s.send_response(200);\
+         s.send_header('Content-Type','text/plain');\
+         s.send_header('Content-Length',str(len(b)));\
+         s.end_headers();s.wfile.write(b)\n \
+         def log_message(s,*a):pass\n\
+         with socketserver.TCPServer(('',8080),H) as srv:srv.serve_forever()"
+    )
+}
+
+/// Deploy an in-cluster Pod that serves a fixed Prometheus queue depth metric.
+///
+/// The Pod listens on port 8080 and responds to any GET with:
+/// `provider_queue_depth_normalized {queue_depth}`
+///
+/// After the Pod is created, call [`wait_for_named_pod_ready`] before starting
+/// the port-forward.
+pub(crate) fn apply_metrics_endpoint_pod(
+    context: &str,
+    name: &str,
+    queue_depth: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let python_server = metrics_server_script(queue_depth);
+    let pod = serde_json::to_string_pretty(&serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": { "name": name, "labels": { "app": name } },
+        "spec": {
+            "containers": [{
+                "name": "server",
+                "image": "python:3-alpine",
+                "imagePullPolicy": "IfNotPresent",
+                "command": ["python3", "-c", python_server],
+                "ports": [{ "containerPort": ERROR_ENDPOINT_CONTAINER_PORT }]
+            }]
+        }
+    }))
+    .unwrap_or_else(|e| {
+        eprintln!("metrics endpoint Pod serialization failed: {e}");
+        std::process::exit(1);
+    });
+    apply_manifest(context, &pod)?;
+    eprintln!("  [OK] metrics endpoint Pod {name} applied");
+    Ok(())
+}
+
+#[expect(
+    clippy::disallowed_methods,
+    reason = "synchronous poll loop in xtask; no async runtime available"
+)]
+/// Poll until the named Pod in `namespace` is Ready in `context`.
+pub(crate) fn wait_for_named_pod_ready(
+    context: &str,
+    name: &str,
+    timeout: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let start = Instant::now();
+    loop {
+        let ready = kubectl_jsonpath(
+            context,
+            &format!("pod/{name}"),
+            "{.status.conditions[?(@.type=='Ready')].status}",
+        )
+        .unwrap_or_default();
+        if ready == "True" {
+            eprintln!("  [OK] {name} Pod ready");
+            return Ok(());
+        }
+        if start.elapsed() >= timeout {
+            return Err(format!("timeout waiting for {name} Pod ready; status={ready:?}").into());
+        }
+        eprintln!("  waiting for {name} Pod ready (status={ready:?})...");
+        std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+#[expect(
+    clippy::disallowed_methods,
+    reason = "port-forward settle sleep in xtask; no async runtime available"
+)]
+/// Start a `kubectl port-forward` for a named Pod and return the child process.
+///
+/// Forwards `local_port` on the host to port 8080 on the Pod.
+/// The caller is responsible for killing the returned [`Child`].
+pub(crate) fn start_named_pod_port_forward(
+    context: &str,
+    name: &str,
+    local_port: u16,
+) -> Result<Child, Box<dyn std::error::Error>> {
+    let lp = local_port.to_string();
+    let cp = ERROR_ENDPOINT_CONTAINER_PORT.to_string();
+    let child = Command::new("kubectl")
+        .args([
+            "--context",
+            context,
+            "port-forward",
+            &format!("pod/{name}"),
+            &format!("{lp}:{cp}"),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    // Brief pause for the port-forward tunnel to establish.
+    std::thread::sleep(Duration::from_secs(2));
+    eprintln!("  [OK] port-forward {local_port} → {name}:{cp}");
+    Ok(child)
+}
+
+/// Deploy both metrics endpoint Pods (idle and busy) and wait for each to be ready.
+///
+/// Thin wrapper around [`apply_metrics_endpoint_pod`] that encapsulates the
+/// fixture-specific queue depth values so callers need not depend on private constants.
+pub(crate) fn apply_and_wait_for_metrics_pods(
+    context: &str,
+    timeout: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    apply_metrics_endpoint_pod(context, TEST_METRICS_IDLE_PROVIDER, METRICS_IDLE_QUEUE_DEPTH)?;
+    apply_metrics_endpoint_pod(context, TEST_METRICS_BUSY_PROVIDER, METRICS_BUSY_QUEUE_DEPTH)?;
+    wait_for_named_pod_ready(context, TEST_METRICS_IDLE_PROVIDER, timeout)?;
+    wait_for_named_pod_ready(context, TEST_METRICS_BUSY_PROVIDER, timeout)?;
+    Ok(())
+}
+
+/// Apply two equal-locality `InferenceProvider` fixtures with `metricsConfig`.
+///
+/// Both providers have `backendKind = "local"` so their baseline locality score is
+/// equal.  The operator scrapes their configured endpoints:
+/// - `idle_endpoint/metrics` → `{METRICS_QUEUE_SIGNAL_NAME} 0.1` (low queue → high score)
+/// - `busy_endpoint/metrics` → `{METRICS_QUEUE_SIGNAL_NAME} 0.9` (high queue → low score)
+///
+/// After reconciliation, the overlay must order the idle provider before the busy
+/// provider.  Verified by [`verify_metrics_ordering`].
+#[expect(
+    clippy::too_many_lines,
+    reason = "two InferenceProvider JSON manifests with nested metricsConfig; cannot shorten without losing clarity"
+)]
+pub(crate) fn apply_metrics_provider_fixtures(
+    context: &str,
+    idle_endpoint: &str,
+    busy_endpoint: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for (name, routing_cluster, endpoint) in [
+        (
+            TEST_METRICS_IDLE_PROVIDER,
+            TEST_METRICS_IDLE_ROUTING_CLUSTER,
+            idle_endpoint,
+        ),
+        (
+            TEST_METRICS_BUSY_PROVIDER,
+            TEST_METRICS_BUSY_ROUTING_CLUSTER,
+            busy_endpoint,
+        ),
+    ] {
+        let manifest = serde_json::to_string_pretty(&serde_json::json!({
+            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "kind": "InferenceProvider",
+            "metadata": { "name": name },
+            "spec": {
+                "gridNetworkRef": TEST_NETWORK,
+                "providerKind": "self_hosted",
+                "backendKind": "local",
+                "endpoint": endpoint,
+                "models": [{ "name": "model-metrics" }],
+                "routingClusterRef": routing_cluster,
+                "metricsConfig": {
+                    "path": "/metrics",
+                    "timeout": "2s",
+                    "signalNames": {
+                        "queueDepth": METRICS_QUEUE_SIGNAL_NAME
+                    }
+                }
+            }
+        }))
+        .unwrap_or_else(|e| {
+            eprintln!("metrics provider fixture serialization failed: {e}");
+            std::process::exit(1);
+        });
+        apply_manifest(context, &manifest)?;
+    }
+    eprintln!("  [OK] metrics provider fixtures applied");
+    Ok(())
+}
+
+/// Verify that the idle (low-queue) metrics provider appears before the busy
+/// (high-queue) metrics provider in the overlay candidates.
+///
+/// Checks that live metrics have successfully shifted scoring: the provider with
+/// queue depth 0.1 must rank above the provider with queue depth 0.9 even though
+/// both have the same locality score.
+pub(crate) fn verify_metrics_ordering(
+    overlay: &serde_json::Value,
+    idle_cluster: &str,
+    busy_cluster: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let candidates = overlay
+        .get("candidates")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("overlay missing candidates array")?;
+
+    let idle_pos = candidates
+        .iter()
+        .position(|c| c.get("cluster").and_then(serde_json::Value::as_str) == Some(idle_cluster))
+        .ok_or_else(|| format!("{idle_cluster} not found in overlay candidates"))?;
+
+    let busy_pos = candidates
+        .iter()
+        .position(|c| c.get("cluster").and_then(serde_json::Value::as_str) == Some(busy_cluster))
+        .ok_or_else(|| format!("{busy_cluster} not found in overlay candidates"))?;
+
+    if idle_pos >= busy_pos {
+        return Err(format!(
+            "metrics ordering check failed: {idle_cluster} (pos {idle_pos}) must appear before \
+             {busy_cluster} (pos {busy_pos}); expected idle (low queue) to score higher than busy"
+        )
+        .into());
+    }
+    eprintln!("  [OK] metrics ordering: {idle_cluster} (pos {idle_pos}) before {busy_cluster} (pos {busy_pos})");
+    Ok(())
 }
 
 /// Apply the degraded `InferenceProvider` fixture with a health check configured.
@@ -955,6 +1221,8 @@ mod tests {
             TEST_PROVIDER_INVALID,
             TEST_PROVIDER_DEGRADED,
             TEST_PROVIDER_API,
+            TEST_METRICS_IDLE_PROVIDER,
+            TEST_METRICS_BUSY_PROVIDER,
         ];
         // Each must be distinct (no duplicate delete).
         let unique: std::collections::HashSet<_> = all_providers.iter().collect();
@@ -962,6 +1230,72 @@ mod tests {
             unique.len(),
             all_providers.len(),
             "all provider fixture names must be distinct"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // verify_metrics_ordering
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn verify_metrics_ordering_accepts_idle_before_busy() {
+        let overlay = make_overlay(&[
+            (TEST_METRICS_IDLE_ROUTING_CLUSTER, true),
+            (TEST_METRICS_BUSY_ROUTING_CLUSTER, true),
+        ]);
+        assert!(
+            verify_metrics_ordering(
+                &overlay,
+                TEST_METRICS_IDLE_ROUTING_CLUSTER,
+                TEST_METRICS_BUSY_ROUTING_CLUSTER
+            )
+            .is_ok(),
+            "idle before busy must pass"
+        );
+    }
+
+    #[test]
+    fn verify_metrics_ordering_rejects_busy_before_idle() {
+        let overlay = make_overlay(&[
+            (TEST_METRICS_BUSY_ROUTING_CLUSTER, true),
+            (TEST_METRICS_IDLE_ROUTING_CLUSTER, true),
+        ]);
+        assert!(
+            verify_metrics_ordering(
+                &overlay,
+                TEST_METRICS_IDLE_ROUTING_CLUSTER,
+                TEST_METRICS_BUSY_ROUTING_CLUSTER
+            )
+            .is_err(),
+            "busy before idle must fail"
+        );
+    }
+
+    #[test]
+    fn verify_metrics_ordering_rejects_missing_idle() {
+        let overlay = make_overlay(&[(TEST_METRICS_BUSY_ROUTING_CLUSTER, true)]);
+        assert!(
+            verify_metrics_ordering(
+                &overlay,
+                TEST_METRICS_IDLE_ROUTING_CLUSTER,
+                TEST_METRICS_BUSY_ROUTING_CLUSTER
+            )
+            .is_err(),
+            "absent idle cluster must fail"
+        );
+    }
+
+    #[test]
+    fn verify_metrics_ordering_rejects_missing_busy() {
+        let overlay = make_overlay(&[(TEST_METRICS_IDLE_ROUTING_CLUSTER, true)]);
+        assert!(
+            verify_metrics_ordering(
+                &overlay,
+                TEST_METRICS_IDLE_ROUTING_CLUSTER,
+                TEST_METRICS_BUSY_ROUTING_CLUSTER
+            )
+            .is_err(),
+            "absent busy cluster must fail"
         );
     }
 }

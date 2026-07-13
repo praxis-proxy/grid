@@ -485,8 +485,10 @@ fn env_install_grid_crds(config: &Path, site: Option<&str>) -> Result<(), Box<dy
 )]
 fn run_operator_reconcile(context: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
     use operator::{
-        CONFIGMAP_POLL_TIMEOUT, ERROR_ENDPOINT_LOCAL_PORT, ERROR_ENDPOINT_NAME, POD_READY_TIMEOUT, STATUS_POLL_TIMEOUT,
-        TEST_DEGRADED_ROUTING_CLUSTER, TEST_GATEWAY_NAME, TEST_GATEWAY_NS, TEST_HEALTHY_ROUTING_CLUSTER, TEST_NETWORK,
+        CONFIGMAP_POLL_TIMEOUT, ERROR_ENDPOINT_LOCAL_PORT, ERROR_ENDPOINT_NAME, METRICS_BUSY_LOCAL_PORT,
+        METRICS_IDLE_LOCAL_PORT, POD_READY_TIMEOUT, STATUS_POLL_TIMEOUT, TEST_DEGRADED_ROUTING_CLUSTER,
+        TEST_GATEWAY_NAME, TEST_GATEWAY_NS, TEST_HEALTHY_ROUTING_CLUSTER, TEST_METRICS_BUSY_PROVIDER,
+        TEST_METRICS_BUSY_ROUTING_CLUSTER, TEST_METRICS_IDLE_PROVIDER, TEST_METRICS_IDLE_ROUTING_CLUSTER, TEST_NETWORK,
         TEST_PROVIDER_API, TEST_PROVIDER_DEGRADED, TEST_PROVIDER_HEALTHY, TEST_PROVIDER_INVALID,
     };
 
@@ -499,9 +501,24 @@ fn run_operator_reconcile(context: &str) -> Result<PathBuf, Box<dyn std::error::
     operator::apply_error_endpoint_fixture(context)?;
     operator::wait_for_error_endpoint_ready(context, POD_READY_TIMEOUT)?;
 
-    // Step 3: port-forward so the out-of-cluster operator can reach the error endpoint.
+    // Step 2b: deploy metrics endpoint Pods.
+    // Each Pod serves a fixed Prometheus gauge for queue depth.  They are deployed
+    // before spawning the operator so they are ready when the first reconcile fires.
+    // - idle Pod → provider_queue_depth_normalized 0.1 (low queue → high score)
+    // - busy Pod → provider_queue_depth_normalized 0.9 (high queue → low score)
+    operator::apply_and_wait_for_metrics_pods(context, POD_READY_TIMEOUT)?;
+
+    // Step 3: port-forward all endpoints so the out-of-cluster operator can reach them.
     let pf_child = operator::start_error_endpoint_port_forward(context)?;
     let mut pf_guard = ProcGuard(Some(pf_child), ERROR_ENDPOINT_NAME);
+
+    let pf_idle_child =
+        operator::start_named_pod_port_forward(context, TEST_METRICS_IDLE_PROVIDER, METRICS_IDLE_LOCAL_PORT)?;
+    let mut pf_idle_guard = ProcGuard(Some(pf_idle_child), TEST_METRICS_IDLE_PROVIDER);
+
+    let pf_busy_child =
+        operator::start_named_pod_port_forward(context, TEST_METRICS_BUSY_PROVIDER, METRICS_BUSY_LOCAL_PORT)?;
+    let mut pf_busy_guard = ProcGuard(Some(pf_busy_child), TEST_METRICS_BUSY_PROVIDER);
 
     // Step 4: spawn the operator out-of-cluster.
     let op_child = operator::spawn_operator(context)?;
@@ -509,21 +526,26 @@ fn run_operator_reconcile(context: &str) -> Result<PathBuf, Box<dyn std::error::
     let mut op_guard = ProcGuard(Some(op_child), "operator");
 
     let degraded_endpoint = format!("http://127.0.0.1:{ERROR_ENDPOINT_LOCAL_PORT}");
+    let metrics_idle_endpoint = format!("http://127.0.0.1:{METRICS_IDLE_LOCAL_PORT}");
+    let metrics_busy_endpoint = format!("http://127.0.0.1:{METRICS_BUSY_LOCAL_PORT}");
 
     // Step 5: apply InferenceProvider fixtures.
-    // GridNetwork is created first; providers are applied after so the operator resolves
-    // gridNetworkRef immediately.  api_provider is last to prove scoring is score-driven.
+    // GridNetwork is created first; providers follow so the operator resolves gridNetworkRef immediately.
+    // api_provider is last to prove scoring is score-driven, not input-order-driven.
     //
-    // routingClusterRef controls the overlay candidate site/cluster identity:
-    // - op-e2e-healthy:     routingClusterRef="site-a" → candidate.site="site-a"
-    // - op-e2e-degraded:    routingClusterRef="site-a" → candidate.site="site-a", fresh=false
-    // - op-e2e-invalid:     blank endpoint → Unavailable, excluded from overlay
-    // - op-e2e-api-fallback: no routingClusterRef  → cluster="op-e2e-api-fallback"
+    // routingClusterRef controls overlay candidate identity:
+    // - op-e2e-healthy:       routingClusterRef="site-a"           → candidate.site="site-a"
+    // - op-e2e-degraded:      routingClusterRef="site-a"           → fresh=false
+    // - op-e2e-invalid:       blank endpoint                       → Unavailable, excluded
+    // - op-e2e-api-fallback:  no routingClusterRef                 → cluster="op-e2e-api-fallback"
+    // - op-e2e-metrics-idle:  routingClusterRef="site-metrics-idle" → metrics scraped (queue=0.1)
+    // - op-e2e-metrics-busy:  routingClusterRef="site-metrics-busy" → metrics scraped (queue=0.9)
     let healthy_endpoint = "http://mock-openai-provider.default.svc:8080";
     let api_endpoint = "https://api.anthropic.com";
     operator::apply_test_fixtures(context, healthy_endpoint)?;
     operator::apply_degraded_provider_fixture(context, &degraded_endpoint)?;
     operator::apply_api_provider_fixture(context, api_endpoint)?;
+    operator::apply_metrics_provider_fixtures(context, &metrics_idle_endpoint, &metrics_busy_endpoint)?;
 
     // Step 6–7: wait for reconciliation and verify overlay.
     let result = (|| -> Result<PathBuf, Box<dyn std::error::Error>> {
@@ -531,6 +553,8 @@ fn run_operator_reconcile(context: &str) -> Result<PathBuf, Box<dyn std::error::
         operator::wait_for_provider_phase(context, TEST_PROVIDER_HEALTHY, "Pending", STATUS_POLL_TIMEOUT)?;
         operator::wait_for_provider_phase(context, TEST_PROVIDER_DEGRADED, "Degraded", STATUS_POLL_TIMEOUT)?;
         operator::wait_for_provider_phase(context, TEST_PROVIDER_API, "Pending", STATUS_POLL_TIMEOUT)?;
+        operator::wait_for_provider_phase(context, TEST_METRICS_IDLE_PROVIDER, "Pending", STATUS_POLL_TIMEOUT)?;
+        operator::wait_for_provider_phase(context, TEST_METRICS_BUSY_PROVIDER, "Pending", STATUS_POLL_TIMEOUT)?;
         operator::wait_for_overlay_configmap(
             context,
             TEST_NETWORK,
@@ -543,6 +567,13 @@ fn run_operator_reconcile(context: &str) -> Result<PathBuf, Box<dyn std::error::
         operator::verify_overlay(&overlay, TEST_HEALTHY_ROUTING_CLUSTER, TEST_PROVIDER_INVALID)?;
         operator::verify_degraded_candidate(&overlay, TEST_DEGRADED_ROUTING_CLUSTER)?;
         operator::verify_scoring_order(&overlay, TEST_HEALTHY_ROUTING_CLUSTER, TEST_PROVIDER_API)?;
+        // Verify that live scraped metrics reordered the equal-locality providers:
+        // idle (queue=0.1, high score) must appear before busy (queue=0.9, low score).
+        operator::verify_metrics_ordering(
+            &overlay,
+            TEST_METRICS_IDLE_ROUTING_CLUSTER,
+            TEST_METRICS_BUSY_ROUTING_CLUSTER,
+        )?;
 
         // Step 8: export overlay for consumer gateway handoff.
         let path = operator::export_overlay_to_file(context, TEST_NETWORK, TEST_GATEWAY_NAME, TEST_GATEWAY_NS)?;
@@ -550,11 +581,19 @@ fn run_operator_reconcile(context: &str) -> Result<PathBuf, Box<dyn std::error::
         Ok(path)
     })();
 
-    // Always stop the operator and port-forward, even on error.
+    // Always stop the operator and all port-forwards before returning.
     if let Some(c) = op_guard.0.take() {
         operator::kill_operator(c);
     }
     if let Some(mut c) = pf_guard.0.take() {
+        drop(c.kill());
+        drop(c.wait());
+    }
+    if let Some(mut c) = pf_idle_guard.0.take() {
+        drop(c.kill());
+        drop(c.wait());
+    }
+    if let Some(mut c) = pf_busy_guard.0.take() {
         drop(c.kill());
         drop(c.wait());
     }
