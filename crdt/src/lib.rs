@@ -15,11 +15,14 @@
 
 /// Grow-only counter for budget tracking.
 pub mod gcounter;
+/// Mergeable grid state snapshots.
+pub mod grid_state;
 /// Last-Writer-Wins register for metrics.
 pub mod lww;
 /// Observed-Remove Set for capabilities.
 pub mod orset;
 
 pub use gcounter::GCounter;
+pub use grid_state::{Capability, GridStateSnapshot, ProviderMetricsSnapshot, ProviderPhase, ProviderState};
 pub use lww::LwwRegister;
 pub use orset::OrSet;

@@ -24,8 +24,13 @@ pub mod identity;
 pub mod node;
 /// Foca runtime adapter with accumulated output.
 pub mod runtime;
+/// State snapshot payloads for SWIM custom broadcasts.
+pub mod state_broadcast;
 
 pub use event::MemberEvent;
 pub use identity::NodeId;
 pub use node::SwimNode;
 pub use runtime::{AccumulatedOutput, GridRuntime};
+pub use state_broadcast::{
+    STATE_BROADCAST_VERSION, StateBroadcast, StateBroadcastError, StateBroadcastHandler, StateBroadcastKey,
+};

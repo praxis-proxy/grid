@@ -10,9 +10,11 @@ publish = false
 [dependencies]
 bincode = { workspace = true }
 bytes = { workspace = true }
+crdt = { path = "../crdt" }
 foca = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true }
+thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
 tracing = { workspace = true }
 
