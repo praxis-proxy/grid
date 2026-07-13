@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use certs::{DEFAULT_ORGANIZATION, generate_ca, generate_cert_with_org, generate_site_cert};
+use certs::{DEFAULT_ORGANIZATION, generate_ca, generate_cert_with_org, generate_site_cert, load_ca};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -33,6 +33,12 @@ const WRONG_ORG_CERT_NAME: &str = "wrong-org-client";
 /// Writes PEM files to `{certs_dir}/ca.pem`, `{certs_dir}/ca-key.pem`,
 /// and per-cluster `{certs_dir}/{name}-cert.pem`, `{certs_dir}/{name}-key.pem`.
 ///
+/// If `ca.pem` and `ca-key.pem` already exist they are reused, so that
+/// running `env up` for a second topology (e.g., adding clusters) does not
+/// invalidate certificates already distributed to existing clusters.  The CA
+/// is only regenerated when neither file is present (fresh environment) or
+/// when `env down` has cleaned the directory.
+///
 /// # Errors
 ///
 /// Returns an error if certificate generation or file writes fail.
@@ -40,10 +46,7 @@ pub(crate) fn generate_all(cluster_names: &[String]) -> Result<PathBuf, Box<dyn 
     let dir = PathBuf::from(CERTS_DIR);
     std::fs::create_dir_all(&dir)?;
 
-    let ca = generate_ca(CA_CN)?;
-    write_pem(&dir.join("ca.pem"), &ca.cert_pem)?;
-    write_pem(&dir.join("ca-key.pem"), &ca.key_pem)?;
-    eprintln!("  generated CA certificate");
+    let ca = load_or_generate_ca(&dir)?;
 
     for name in cluster_names {
         let site = generate_site_cert(&ca, name)?;
@@ -52,11 +55,7 @@ pub(crate) fn generate_all(cluster_names: &[String]) -> Result<PathBuf, Box<dyn 
         eprintln!("  generated cert for {name} (SAN: {})", site.sans.join(", "));
     }
 
-    // Generate a wrong-org client cert signed by the same CA.
-    // Used by verify-mtls-trust to prove that grid_ingress_trust enforces
-    // organization matching at the filter level: TLS succeeds (same CA),
-    // but the filter rejects with HTTP 403.
-    let first_cluster = cluster_names.first().map_or("cluster-a", String::as_str);
+    let first_cluster = cluster_names.first().map_or("consumer", String::as_str);
     let wrong_org_cert = generate_cert_with_org(&ca, first_cluster, WRONG_ORG)?;
     write_pem(
         &dir.join(format!("{WRONG_ORG_CERT_NAME}-cert.pem")),
@@ -98,6 +97,25 @@ pub(crate) fn certs_exist() -> bool {
 fn write_pem(path: &Path, content: &str) -> Result<(), Box<dyn std::error::Error>> {
     std::fs::write(path, content)?;
     Ok(())
+}
+
+/// Load the existing CA from disk, or generate and write a new one.
+fn load_or_generate_ca(dir: &Path) -> Result<certs::CaCert, Box<dyn std::error::Error>> {
+    let ca_cert_path = dir.join("ca.pem");
+    let ca_key_path = dir.join("ca-key.pem");
+
+    if ca_cert_path.exists() && ca_key_path.exists() {
+        let cert_pem = std::fs::read_to_string(&ca_cert_path)?;
+        let key_pem = std::fs::read_to_string(&ca_key_path)?;
+        eprintln!("  reusing existing CA certificate");
+        Ok(load_ca(CA_CN, &key_pem, &cert_pem)?)
+    } else {
+        let ca = generate_ca(CA_CN)?;
+        write_pem(&ca_cert_path, &ca.cert_pem)?;
+        write_pem(&ca_key_path, &ca.key_pem)?;
+        eprintln!("  generated CA certificate");
+        Ok(ca)
+    }
 }
 
 // ---------------------------------------------------------------------------

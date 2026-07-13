@@ -1,0 +1,43 @@
+# Two-provider-site topology for cross-cluster routing validation.
+#
+# site-east: provider cluster A (model-east served by mock-openai).
+# site-west: provider cluster B (model-west served by mock-openai).
+# consumer:  consumer cluster (routes to both providers).
+#
+# Both providers use routingClusterRef so overlay candidates carry site names
+# that the consumer gateway load_balancer can map to distinct gateway clusters.
+#
+# Setup:
+#   cargo xtask env up -c tests/env/operator-routing-two-provider.toml
+#   cargo xtask env load-gateway-images -c tests/env/operator-routing-two-provider.toml
+#
+# Operator routing validation (two-provider, model-east → site-east, model-west → site-west):
+#   cargo xtask env validate-operator-routing -c tests/env/operator-routing-two-provider.toml
+#
+# Gateway E2E (static consumer routing without operator):
+#   cargo xtask env deploy-provider-gateways -c tests/env/operator-routing-two-provider.toml
+#   cargo xtask env deploy-consumer-gateway   -c tests/env/operator-routing-two-provider.toml
+#   cargo xtask env verify-gateway-e2e        -c tests/env/operator-routing-two-provider.toml
+
+[clusters]
+names = ["site-east", "site-west", "consumer"]
+
+[clusters.site-east]
+models = ["model-east"]
+role = "provider"
+backend = "mock-openai"
+
+[clusters.site-west]
+models = ["model-west"]
+role = "provider"
+backend = "mock-openai"
+
+[clusters.consumer]
+models = []
+role = "consumer"
+
+[providers]
+openai     = { port = 10011 }
+anthropic  = { port = 10012 }
+bedrock    = { port = 10013, region = "us-east-1" }
+vertex     = { port = 10014, project = "test-project" }

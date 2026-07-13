@@ -22,7 +22,7 @@
 # SWIM membership (real gossip drives phase=Active, connectedSites=1):
 #   cargo xtask env verify-swim-membership -c tests/env/operator-routing.toml
 #
-# CRDT-over-SWIM state (real InferenceProvider state propagates, distributedProviderCount≥1):
+# CRDT-over-SWIM state (real InferenceProvider state propagates, distributedProviderCount=1):
 #   cargo xtask env verify-swim-state -c tests/env/operator-routing.toml
 
 [clusters]

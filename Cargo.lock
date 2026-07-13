@@ -291,6 +291,7 @@ dependencies = [
 name = "certs"
 version = "0.1.0"
 dependencies = [
+ "pem",
  "rcgen",
  "thiserror",
 ]

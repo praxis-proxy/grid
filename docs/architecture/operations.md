@@ -269,6 +269,8 @@ Available commands:
 | `cargo xtask env deploy-consumer-gateway --overlay-config <path>` | Deploys the consumer gateway using a `grid-config.json` routing overlay file |
 | `cargo xtask env verify-gateway-e2e` | Verifies consumer-to-provider routing end-to-end |
 | `cargo xtask env verify-mtls-trust` | Verifies provider gateway mTLS enforcement (positive + negative cases) |
+| `cargo xtask env verify-crd-schema` | Verifies required generated CRD schema fields without requiring kind clusters |
+| `cargo xtask env validate-all` | Runs the local validation suite and prints a Markdown result table |
 
 ### Operator and SWIM local validation
 
@@ -288,6 +290,17 @@ cargo xtask env load-gateway-images -c tests/env/operator-routing.toml
 Creates `grid-site-a` (provider, mock-openai backend)
 and `grid-consumer` kind clusters, generates local mTLS
 certificates, and loads Praxis AI gateway images.
+
+#### CRD schema validation
+
+```console
+cargo xtask env verify-crd-schema
+```
+
+This command runs the CRD generator and verifies the
+generated schema contains required Grid status and
+InferenceProvider routing and metrics fields. It does
+not require kind clusters.
 
 #### Routing validation
 
@@ -355,7 +368,24 @@ status reconciliation reflects remote provider state in
 `distributedProviderCount` in `GridNetworkStatus`
 reflects received remote provider records for the
 current `GridNetwork`; local records and records from
-other `GridNetwork`s are excluded.
+other `GridNetwork`s are excluded. The local validation
+fixture expects exactly one remote provider record; zero
+means state did not arrive, and more than one indicates
+cross-network leakage or stale test state.
+
+#### Full local validation suite
+
+```console
+cargo xtask env validate-all -c tests/env/operator-routing.toml
+```
+
+This command runs the local status check, operator
+routing validation, SWIM membership validation,
+CRDT-over-SWIM state validation, and mTLS trust
+validation in sequence. It continues after individual
+step failures and prints a Markdown summary table at the
+end so CI logs and manual runs show the complete state
+of the environment.
 
 ### Required local images
 

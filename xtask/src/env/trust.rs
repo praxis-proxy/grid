@@ -123,13 +123,18 @@ fn verify_provider_trust(
     test_no_client_cert(cluster, &ctx, port, tally);
     test_wrong_ca_cert(cluster, &ctx, port, tally)?;
 
-    // Re-verify port readiness before the filter-layer test.  Prior negative
-    // tests cause TLS-rejected connections; re-checking ensures we have a
-    // clean path before testing filter-level enforcement.
+    // Re-verify port readiness before the filter-layer test. Prior negative
+    // tests can leave the local kubectl port-forward unhealthy after
+    // TLS-rejected connections. Restart the port-forward once instead of
+    // failing the trust check on a harness transport issue.
     if !wait_for_port(port) {
-        tally.fail(cluster, "port-forward unavailable before wrong-org test", &ctx);
         pf.stop();
-        return Ok(());
+        pf = PortForwardGuard::start(&ctx, "praxis-provider", port, GATEWAY_PORT)?;
+        if !wait_for_port(port) {
+            tally.fail(cluster, "port-forward unavailable before wrong-org test", &ctx);
+            pf.stop();
+            return Ok(());
+        }
     }
     test_wrong_org_cert(cluster, &ctx, port, model, tally);
 
@@ -176,6 +181,11 @@ fn test_valid_cert(cluster: &str, ctx: &str, port: u16, consumer_site: &str, mod
 }
 
 /// HTTP POST via curl with mTLS using explicit client cert paths.
+///
+/// Includes `Authorization: Bearer dummy-key` because the mock-openai backend
+/// requires a bearer token to return 200.  The mTLS layer does not inspect
+/// this header; it is only needed to reach the backend and confirm the
+/// positive trust path end-to-end.
 fn curl_post_mtls_with_cert(
     url: &str,
     body: &str,
@@ -183,34 +193,46 @@ fn curl_post_mtls_with_cert(
     cert: &Path,
     key: &Path,
 ) -> Result<HttpResponse, Box<dyn std::error::Error>> {
-    let output = Command::new("curl")
-        .args([
-            "-s",
-            "-w",
-            "\n%{http_code}",
-            "--connect-timeout",
-            "5",
-            "--max-time",
-            "15",
-            "--resolve",
-            resolve,
-            "--cacert",
-            HOST_CA_CERT,
-            "--cert",
-            cert.to_str().ok_or("client cert path is not UTF-8")?,
-            "--key",
-            key.to_str().ok_or("client key path is not UTF-8")?,
-            "-X",
-            "POST",
-            "-H",
-            "Content-Type: application/json",
-            "-d",
-            body,
-            url,
-        ])
-        .output()?;
+    let args = curl_post_mtls_args(url, body, resolve, cert, key)?;
+    let output = Command::new("curl").args(args).output()?;
     let raw = String::from_utf8(output.stdout)?;
     parse_curl_output(&raw)
+}
+
+/// Build curl args for a positive mTLS POST request.
+fn curl_post_mtls_args(
+    url: &str,
+    body: &str,
+    resolve: &str,
+    cert: &Path,
+    key: &Path,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    Ok(vec![
+        "-s".to_owned(),
+        "-w".to_owned(),
+        "\n%{http_code}".to_owned(),
+        "--connect-timeout".to_owned(),
+        "5".to_owned(),
+        "--max-time".to_owned(),
+        "15".to_owned(),
+        "--resolve".to_owned(),
+        resolve.to_owned(),
+        "--cacert".to_owned(),
+        HOST_CA_CERT.to_owned(),
+        "--cert".to_owned(),
+        cert.to_str().ok_or("client cert path is not UTF-8")?.to_owned(),
+        "--key".to_owned(),
+        key.to_str().ok_or("client key path is not UTF-8")?.to_owned(),
+        "-X".to_owned(),
+        "POST".to_owned(),
+        "-H".to_owned(),
+        "Authorization: Bearer dummy-key".to_owned(),
+        "-H".to_owned(),
+        "Content-Type: application/json".to_owned(),
+        "-d".to_owned(),
+        body.to_owned(),
+        url.to_owned(),
+    ])
 }
 
 /// Negative: no client cert → TLS handshake failure (`curl` exits non-zero).
@@ -448,6 +470,34 @@ mod tests {
             WRONG_ORG,
             certs::DEFAULT_ORGANIZATION,
             "WRONG_ORG must differ from DEFAULT_ORGANIZATION"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // curl arg correctness — verify the bearer token is included in the
+    // valid-cert positive test so the mock-openai backend returns 200
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn valid_cert_request_includes_bearer_token() {
+        let args = curl_post_mtls_args(
+            "https://site-a.grid.internal:9999/v1/chat/completions",
+            r#"{"model":"m"}"#,
+            "site-a.grid.internal:9999:127.0.0.1",
+            Path::new("/tmp/cert.pem"),
+            Path::new("/tmp/key.pem"),
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        assert!(
+            args.iter().any(|a| a == "Authorization: Bearer dummy-key"),
+            "valid-cert positive request must include bearer token so mock-openai returns 200"
+        );
+        // The bearer header must appear before Content-Type.
+        let bearer_pos = args.iter().position(|a| a == "Authorization: Bearer dummy-key");
+        let content_type_pos = args.iter().position(|a| a == "Content-Type: application/json");
+        assert!(
+            bearer_pos < content_type_pos,
+            "bearer header should precede Content-Type for consistent ordering"
         );
     }
 }

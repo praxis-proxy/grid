@@ -44,6 +44,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+use crdt;
 use k8s_openapi::api::core::v1::ConfigMap;
 use serde::{Deserialize, Serialize};
 
@@ -175,6 +176,96 @@ pub(crate) fn provider_to_backend_config(provider: &InferenceProvider) -> Option
     ))
 }
 
+/// Map a remote [`crdt::ProviderPhase`] to an overlay `fresh` flag.
+///
+/// Returns `None` when the provider should be excluded from the overlay
+/// ([`crdt::ProviderPhase::Unavailable`]); `Some(false)` for
+/// [`crdt::ProviderPhase::Degraded`]; `Some(true)` for all other phases
+/// ([`crdt::ProviderPhase::Available`], [`crdt::ProviderPhase::Pending`]).
+pub(crate) fn crdt_phase_to_fresh(phase: &crdt::ProviderPhase) -> Option<bool> {
+    match phase {
+        crdt::ProviderPhase::Unavailable => None,
+        crdt::ProviderPhase::Degraded => Some(false),
+        crdt::ProviderPhase::Available | crdt::ProviderPhase::Pending => Some(true),
+    }
+}
+
+/// Convert a [`crdt::ProviderMetricsSnapshot`] to [`scoring::BackendMetrics`].
+///
+/// Fields that are `None` in the CRDT record default to neutral values so
+/// the remote provider is treated the same as a local provider with no
+/// Prometheus metrics configured (neutral 0.5 signal score).  The only
+/// exception is `error_rate`, which defaults to `0.0` (no errors) so
+/// providers with unknown health are not penalised on error rate.
+pub(crate) fn crdt_metrics_to_backend(m: &crdt::ProviderMetricsSnapshot) -> scoring::BackendMetrics {
+    scoring::BackendMetrics {
+        error_rate: m.error_rate.unwrap_or(0.0),
+        healthy: m.healthy.unwrap_or(true),
+        kv_cache_utilization: m.kv_cache_utilization.unwrap_or(UNMAPPED_NEUTRAL_SIGNAL),
+        latency_p99_ms: m.latency_p99_ms.unwrap_or(UNMAPPED_NEUTRAL_SIGNAL),
+        prefix_cache_hit_ratio: m.prefix_cache_hit_ratio.unwrap_or(UNMAPPED_NEUTRAL_SIGNAL),
+        queue_depth: m.queue_depth.unwrap_or(UNMAPPED_NEUTRAL_SIGNAL),
+    }
+}
+
+/// Convert one remote CRDT provider record to [`RoutingCandidate`]s, one per model.
+///
+/// Returns an empty `Vec` when the provider phase is
+/// [`crdt::ProviderPhase::Unavailable`] (excluded from routing) or when
+/// the provider has no models configured.
+///
+/// The `site` and `cluster` fields are taken directly from the CRDT record:
+/// `site_id` → `candidate.site`; `routing_cluster` → `candidate.cluster`.
+pub(crate) fn remote_crdt_provider_to_candidates(provider: &crdt::ProviderState) -> Vec<RoutingCandidate> {
+    let Some(fresh) = crdt_phase_to_fresh(&provider.phase) else {
+        return Vec::new();
+    };
+    provider
+        .models
+        .iter()
+        .map(|model| RoutingCandidate {
+            kind: CANDIDATE_KIND.to_owned(),
+            name: model.clone(),
+            site: provider.site_id.clone(),
+            cluster: provider.routing_cluster.clone(),
+            fresh,
+        })
+        .collect()
+}
+
+/// Convert a remote CRDT provider to a [`scoring::BackendConfig`] for overlay scoring.
+///
+/// Returns `None` for [`crdt::ProviderPhase::Unavailable`] phase.  The
+/// `backend_kind` is mapped with locality-aware semantics: `"local"` and
+/// `"remote"` both become [`scoring::BackendKind::Remote`] because a
+/// locally-deployed provider at a remote site is still remote from this
+/// operator's perspective.  `"cloud_managed"` and `"api_provider"` are
+/// preserved since their access patterns are provider-type properties,
+/// not site-local ones.
+///
+/// The `endpoint` field is empty for remote CRDT providers — only the
+/// scoring locality and metrics matter; the consumer gateway uses
+/// `routing_cluster` for connection, not the endpoint in the scoring record.
+pub(crate) fn remote_crdt_provider_to_backend_config(provider: &crdt::ProviderState) -> Option<scoring::BackendConfig> {
+    if provider.phase == crdt::ProviderPhase::Unavailable {
+        return None;
+    }
+    let kind = match provider.backend_kind.as_str() {
+        "cloud_managed" => scoring::BackendKind::CloudManaged,
+        "api_provider" => scoring::BackendKind::ApiProvider,
+        _ => scoring::BackendKind::Remote,
+    };
+    Some(scoring::BackendConfig::new(
+        provider.routing_cluster.clone(),
+        0.0, // cost unknown; treated as free → max cost score
+        0.0,
+        String::new(), // endpoint not used for scoring
+        kind,
+        scoring::ProviderKind::OpenAi, // unknown; default matches self-hosted convention
+        None,                          // region: not available from CRDT record
+    ))
+}
+
 /// Neutral signal score when no live metrics are available; matches
 /// `scoring::DEFAULT_SIGNAL_SCORE` which is not exported from the scoring crate.
 const UNMAPPED_NEUTRAL_SIGNAL: f64 = 0.5;
@@ -196,57 +287,82 @@ fn unmapped_provider_score(backend_kind: &str) -> f64 {
 
 /// Compute per-provider ordering scores for overlay candidate sorting.
 ///
-/// For each provider in `network_name` that can be mapped to a
-/// [`scoring::BackendConfig`], the score is produced by
+/// For each local [`InferenceProvider`] in `network_name` that can be mapped
+/// to a [`scoring::BackendConfig`], the score is produced by
 /// [`scoring::score_backends`] using [`scoring::ScoringWeights::default`]
 /// and the network's `local_region`.  Providers whose `backend_kind` cannot
 /// be parsed fall back to [`unmapped_provider_score`], which is on the same
 /// numeric scale.
 ///
+/// Remote CRDT providers are also scored and included in the result map.
+/// Their scores are derived from [`scoring::score_backends`] via
+/// [`remote_crdt_provider_to_backend_config`].  Remote providers whose
+/// `routing_cluster` already appears in the local map (collision) are
+/// skipped.
+///
 /// `Unavailable` providers are excluded (they are never emitted as candidates).
 /// All other phases — `Pending`, `Available`, `Degraded`, and absent status —
 /// are scored and included.  The `fresh` flag is set separately per candidate
-/// by [`is_candidate_fresh`].
+/// by [`is_candidate_fresh`] (local) or [`crdt_phase_to_fresh`] (remote).
 ///
-/// Returns a map from provider name to score, borrowing names from `providers`.
-fn provider_ordering_scores<'a>(
+/// Returns a map from routing cluster name to score.
+fn provider_ordering_scores(
     network_name: &str,
-    providers: &'a [InferenceProvider],
+    providers: &[InferenceProvider],
+    remote_crdt_providers: &[crdt::ProviderState],
     local_region: Option<&str>,
     metrics: Option<&HashMap<&str, scoring::BackendMetrics>>,
-) -> HashMap<&'a str, f64> {
-    let state = build_grid_state_with_metrics(network_name, providers, metrics);
+) -> HashMap<String, f64> {
+    let state = build_grid_state_with_metrics(network_name, providers, remote_crdt_providers, metrics);
     let scored = scoring::score_backends(&state, &scoring::ScoringWeights::default(), local_region);
     // `from_engine` is keyed by routing_identity (BackendConfig.name), which matches candidate.cluster.
     let from_engine: HashMap<String, f64> = scored.into_iter().map(|sb| (sb.name, sb.score)).collect();
-    providers
+
+    let mut result: HashMap<String, f64> = providers
         .iter()
         .filter_map(|p| {
             // Use routing_identity so the key matches candidate.cluster in the sort.
-            let cluster = routing_identity(p)?;
+            let cluster = routing_identity(p)?.to_owned();
             let score = from_engine
-                .get(cluster)
+                .get(cluster.as_str())
                 .copied()
                 .unwrap_or_else(|| unmapped_provider_score(&p.spec.backend_kind));
             Some((cluster, score))
         })
-        .collect()
+        .collect();
+
+    for provider in remote_crdt_providers {
+        result.entry(provider.routing_cluster.clone()).or_insert_with(|| {
+            from_engine
+                .get(provider.routing_cluster.as_str())
+                .copied()
+                .unwrap_or_else(|| unmapped_provider_score(&provider.backend_kind))
+        });
+    }
+
+    result
 }
 
-/// Build a [`scoring::GridState`] from mappable providers, optionally populated
-/// with scraped metrics.
+/// Build a [`scoring::GridState`] from local and remote CRDT providers,
+/// optionally populated with scraped metrics.
 ///
-/// Providers that are explicitly [`ProviderPhase::Unavailable`] or that belong
-/// to a different network are skipped.  Duplicate provider names (a CRD-level
-/// invariant violation) are silently ignored.
+/// Local providers that are explicitly [`ProviderPhase::Unavailable`] or that
+/// belong to a different network are skipped.  Remote CRDT providers with
+/// [`crdt::ProviderPhase::Unavailable`] phase are also excluded.  Duplicate
+/// provider names (a CRD-level invariant violation) are silently ignored.
 ///
-/// When `metrics` is `Some`, each provider whose name appears in the map
+/// When `metrics` is `Some`, each local provider whose name appears in the map
 /// receives live [`scoring::BackendMetrics`] via
 /// [`scoring::GridState::set_metrics`].  This is the integration seam for
 /// Prometheus-scraped data — pass `None` for static-only scoring.
+///
+/// Remote CRDT providers receive their metrics from
+/// [`crdt_metrics_to_backend`], which applies neutral defaults for `None`
+/// fields.
 pub(crate) fn build_grid_state_with_metrics(
     network_name: &str,
     providers: &[InferenceProvider],
+    remote_crdt_providers: &[crdt::ProviderState],
     metrics: Option<&HashMap<&str, scoring::BackendMetrics>>,
 ) -> scoring::GridState {
     let mut state = scoring::GridState::new();
@@ -260,6 +376,13 @@ pub(crate) fn build_grid_state_with_metrics(
             if let Some(m) = metrics.and_then(|map| map.get(name.as_str())).copied() {
                 state.set_metrics(name, m);
             }
+        }
+    }
+    for provider in remote_crdt_providers {
+        if let Some(config) = remote_crdt_provider_to_backend_config(provider) {
+            let name = config.name.clone();
+            drop(state.add_backend(config));
+            state.set_metrics(name, crdt_metrics_to_backend(&provider.metrics));
         }
     }
     state
@@ -434,10 +557,19 @@ pub struct RoutingOverlay {
 /// - Any model name in an eligible provider is blank or whitespace-only.
 ///
 /// [`InferenceProvider`]: crate::crd::inference_provider::InferenceProvider
+#[expect(
+    clippy::too_many_arguments,
+    reason = "all six parameters represent distinct overlay inputs; a wrapper struct would obscure the data flow"
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "sequential render steps: ordering, collect local, extend remote, sort, dedup; splitting would hide the pipeline"
+)]
 pub fn render_routing_overlay(
     network: &GridNetwork,
     sites: &[GridSite],
     providers: &[InferenceProvider],
+    remote_crdt_providers: &[crdt::ProviderState],
     local_site: &str,
     metrics: Option<&HashMap<&str, scoring::BackendMetrics>>,
 ) -> Result<RoutingOverlay, String> {
@@ -447,9 +579,18 @@ pub fn render_routing_overlay(
         .as_deref()
         .ok_or_else(|| "GridNetwork has no name".to_owned())?;
 
-    let ordering = provider_ordering_scores(network_name, providers, network.spec.region.as_deref(), metrics);
+    let ordering = provider_ordering_scores(
+        network_name,
+        providers,
+        remote_crdt_providers,
+        network.spec.region.as_deref(),
+        metrics,
+    );
 
     let mut candidates = collect_candidates(network_name, sites, providers)?;
+    for provider in remote_crdt_providers {
+        candidates.extend(remote_crdt_provider_to_candidates(provider));
+    }
     candidates.sort_by(|a, b| {
         let score_a = ordering.get(a.cluster.as_str()).copied().unwrap_or(DEFAULT_LOCALITY);
         let score_b = ordering.get(b.cluster.as_str()).copied().unwrap_or(DEFAULT_LOCALITY);
@@ -1072,7 +1213,7 @@ mod tests {
         let network = test_network("net");
         let local_prov = test_provider_with_backend_kind("local-prov", "net", "local");
         let api_prov = test_provider_with_backend_kind("api-prov", "net", "api_provider");
-        let overlay = render_routing_overlay(&network, &[], &[api_prov, local_prov], "test-site", None)
+        let overlay = render_routing_overlay(&network, &[], &[api_prov, local_prov], &[], "test-site", None)
             .unwrap_or_else(|_| std::process::abort());
         assert_eq!(
             overlay.candidates.first().map(|c| c.cluster.as_str()),
@@ -1089,7 +1230,7 @@ mod tests {
         let network = test_network("net");
         let free_prov = test_provider_with_cost("free-prov", "net", 0.0);
         let costly_prov = test_provider_with_cost("costly-prov", "net", 50.0); // 50/million = 0.05/1k
-        let overlay = render_routing_overlay(&network, &[], &[costly_prov, free_prov], "test-site", None)
+        let overlay = render_routing_overlay(&network, &[], &[costly_prov, free_prov], &[], "test-site", None)
             .unwrap_or_else(|_| std::process::abort());
         assert_eq!(
             overlay.candidates.first().map(|c| c.cluster.as_str()),
@@ -1104,7 +1245,7 @@ mod tests {
         let network = test_network("net");
         let p_z = test_provider_with_backend_kind("z-local", "net", "local");
         let p_a = test_provider_with_backend_kind("a-local", "net", "local");
-        let overlay = render_routing_overlay(&network, &[], &[p_z, p_a], "test-site", None)
+        let overlay = render_routing_overlay(&network, &[], &[p_z, p_a], &[], "test-site", None)
             .unwrap_or_else(|_| std::process::abort());
         assert_eq!(
             overlay.candidates.first().map(|c| c.cluster.as_str()),
@@ -1123,7 +1264,7 @@ mod tests {
         let network = test_network("net");
         let cloud = test_provider_with_backend_kind("cloud-prov", "net", "cloud_managed");
         let unknown = test_provider_with_backend_kind("unknown-prov", "net", "nonexistent_kind");
-        let overlay = render_routing_overlay(&network, &[], &[cloud, unknown], "test-site", None)
+        let overlay = render_routing_overlay(&network, &[], &[cloud, unknown], &[], "test-site", None)
             .unwrap_or_else(|_| std::process::abort());
         assert_eq!(
             overlay.candidates.first().map(|c| c.cluster.as_str()),
@@ -1139,7 +1280,7 @@ mod tests {
         let network = test_network("net");
         let self_hosted = test_provider_with_backend_kind("vllm-prov", "net", "local");
         let api = test_provider_with_backend_kind("api-prov", "net", "api_provider");
-        let overlay = render_routing_overlay(&network, &[], &[api, self_hosted], "test-site", None)
+        let overlay = render_routing_overlay(&network, &[], &[api, self_hosted], &[], "test-site", None)
             .unwrap_or_else(|_| std::process::abort());
         assert_eq!(overlay.candidates.len(), 2, "both providers must appear");
         assert_eq!(
@@ -1155,9 +1296,9 @@ mod tests {
         let network = test_network("net");
         let local = test_provider_with_backend_kind("local-prov", "net", "local");
         let api = test_provider_with_backend_kind("api-prov", "net", "api_provider");
-        let fwd = render_routing_overlay(&network, &[], &[local.clone(), api.clone()], "test-site", None)
+        let fwd = render_routing_overlay(&network, &[], &[local.clone(), api.clone()], &[], "test-site", None)
             .unwrap_or_else(|_| std::process::abort());
-        let rev = render_routing_overlay(&network, &[], &[api, local], "test-site", None)
+        let rev = render_routing_overlay(&network, &[], &[api, local], &[], "test-site", None)
             .unwrap_or_else(|_| std::process::abort());
         let fwd_clusters: Vec<&str> = fwd.candidates.iter().map(|c| c.cluster.as_str()).collect();
         let rev_clusters: Vec<&str> = rev.candidates.iter().map(|c| c.cluster.as_str()).collect();
@@ -1175,7 +1316,7 @@ mod tests {
         let network = test_network_with_region("net", "eu-west-1");
         let local = test_provider_with_backend_kind("local-prov", "net", "local");
         let remote = test_provider_with_backend_kind("remote-prov", "net", "remote");
-        let overlay = render_routing_overlay(&network, &[], &[remote, local], "test-site", None)
+        let overlay = render_routing_overlay(&network, &[], &[remote, local], &[], "test-site", None)
             .unwrap_or_else(|_| std::process::abort());
         assert_eq!(
             overlay.candidates.first().map(|c| c.cluster.as_str()),
@@ -1239,7 +1380,7 @@ mod tests {
         let network = test_network("mesh-net");
         let local_prov = test_provider_with_backend_kind("provider-self-hosted", "mesh-net", "local");
         let remote_prov = test_provider_with_backend_kind("provider-remote", "mesh-net", "remote");
-        let overlay = render_routing_overlay(&network, &[], &[remote_prov, local_prov], "site-a", None)
+        let overlay = render_routing_overlay(&network, &[], &[remote_prov, local_prov], &[], "site-a", None)
             .unwrap_or_else(|_| std::process::abort());
 
         assert_eq!(overlay.candidates.len(), 2, "both local and remote must appear");
@@ -1273,7 +1414,7 @@ mod tests {
         let local_down =
             test_provider_with_backend_kind_and_phase("provider-local", "fallback-net", "local", "Unavailable");
         let api_fallback = test_provider_with_backend_kind("provider-api", "fallback-net", "api_provider");
-        let overlay = render_routing_overlay(&network, &[], &[local_down, api_fallback], "site-a", None)
+        let overlay = render_routing_overlay(&network, &[], &[local_down, api_fallback], &[], "site-a", None)
             .unwrap_or_else(|_| std::process::abort());
 
         assert_eq!(
@@ -1306,7 +1447,7 @@ mod tests {
         let local_degraded =
             test_provider_with_backend_kind_and_phase("provider-local", "fallback-net", "local", "Degraded");
         let api_ok = test_provider_with_backend_kind("provider-api", "fallback-net", "api_provider");
-        let overlay = render_routing_overlay(&network, &[], &[api_ok, local_degraded], "site-a", None)
+        let overlay = render_routing_overlay(&network, &[], &[api_ok, local_degraded], &[], "site-a", None)
             .unwrap_or_else(|_| std::process::abort());
 
         assert_eq!(
@@ -1344,7 +1485,7 @@ mod tests {
         let remote = test_provider_with_backend_kind("prov-remote", "full-net", "remote");
         let cloud = test_provider_with_backend_kind("prov-cloud", "full-net", "cloud_managed");
         let api = test_provider_with_backend_kind("prov-api", "full-net", "api_provider");
-        let overlay = render_routing_overlay(&network, &[], &[api, cloud, remote, self_hosted], "site-a", None)
+        let overlay = render_routing_overlay(&network, &[], &[api, cloud, remote, self_hosted], &[], "site-a", None)
             .unwrap_or_else(|_| std::process::abort());
 
         assert_eq!(overlay.candidates.len(), 4, "all four backend kinds must be present");
@@ -1377,6 +1518,7 @@ mod tests {
             &network,
             &[],
             &[local_down, api_always_available.clone()],
+            &[],
             "site-a",
             None,
         )
@@ -1394,7 +1536,7 @@ mod tests {
 
         // Cycle 2: local is back — both candidates, local ranks first.
         let local_up = test_provider_with_backend_kind_and_phase("prov-local", "recovery-net", "local", "Available");
-        let overlay2 = render_routing_overlay(&network, &[], &[local_up, api_always_available], "site-a", None)
+        let overlay2 = render_routing_overlay(&network, &[], &[local_up, api_always_available], &[], "site-a", None)
             .unwrap_or_else(|_| std::process::abort());
         assert_eq!(overlay2.candidates.len(), 2, "recovered local must reappear (cycle 2)");
         assert_eq!(
@@ -1418,8 +1560,8 @@ mod tests {
         let network = test_network("empty-net");
         let p1 = test_provider_with_phase("prov-a", "empty-net", &["model-a"], "Unavailable");
         let p2 = test_provider_with_phase("prov-b", "empty-net", &["model-b"], "Unavailable");
-        let overlay =
-            render_routing_overlay(&network, &[], &[p1, p2], "site-a", None).unwrap_or_else(|_| std::process::abort());
+        let overlay = render_routing_overlay(&network, &[], &[p1, p2], &[], "site-a", None)
+            .unwrap_or_else(|_| std::process::abort());
 
         assert!(
             overlay.candidates.is_empty(),
@@ -1438,7 +1580,7 @@ mod tests {
         let network = test_network("json-net");
         let local_prov = test_provider_with_backend_kind("prov-a", "json-net", "local");
         let api_prov = test_provider_with_backend_kind("prov-b", "json-net", "api_provider");
-        let overlay = render_routing_overlay(&network, &[], &[local_prov, api_prov], "site-a", None)
+        let overlay = render_routing_overlay(&network, &[], &[local_prov, api_prov], &[], "site-a", None)
             .unwrap_or_else(|_| std::process::abort());
         let cm = build_cm(&overlay, "json-net", "gw");
         let json = overlay_json_from_cm(&cm);
@@ -1552,7 +1694,7 @@ mod tests {
         let network = test_network("net");
         let local_prov = test_provider_with_backend_kind("local-prov", "net", "local");
         let api_prov = test_provider_with_backend_kind("api-prov", "net", "api_provider");
-        let overlay = render_routing_overlay(&network, &[], &[api_prov, local_prov], "test-site", None)
+        let overlay = render_routing_overlay(&network, &[], &[api_prov, local_prov], &[], "test-site", None)
             .unwrap_or_else(|_| std::process::abort());
         assert_eq!(
             overlay.candidates.first().map(|c| c.cluster.as_str()),
@@ -1569,7 +1711,7 @@ mod tests {
         let cloud = test_provider_with_backend_kind("z-cloud", "net", "cloud_managed");
         let remote = test_provider_with_backend_kind("z-remote", "net", "remote");
         let local = test_provider_with_backend_kind("z-local", "net", "local");
-        let overlay = render_routing_overlay(&network, &[], &[api, cloud, remote, local], "test-site", None)
+        let overlay = render_routing_overlay(&network, &[], &[api, cloud, remote, local], &[], "test-site", None)
             .unwrap_or_else(|_| std::process::abort());
         let clusters: Vec<&str> = overlay.candidates.iter().map(|c| c.cluster.as_str()).collect();
         // local (1.0) → remote (0.5) → cloud_managed (0.2) → api_provider (0.1)
@@ -1585,7 +1727,7 @@ mod tests {
         let network = test_network("net");
         let p_z = test_provider_with_backend_kind("z-api", "net", "api_provider");
         let p_a = test_provider_with_backend_kind("a-api", "net", "api_provider");
-        let overlay = render_routing_overlay(&network, &[], &[p_z, p_a], "test-site", None)
+        let overlay = render_routing_overlay(&network, &[], &[p_z, p_a], &[], "test-site", None)
             .unwrap_or_else(|_| std::process::abort());
         assert_eq!(
             overlay.candidates.first().map(|c| c.cluster.as_str()),
@@ -1599,9 +1741,9 @@ mod tests {
         let network = test_network("net");
         let local = test_provider_with_backend_kind("prov-local", "net", "local");
         let api = test_provider_with_backend_kind("prov-api", "net", "api_provider");
-        let fwd = render_routing_overlay(&network, &[], &[local.clone(), api.clone()], "test-site", None)
+        let fwd = render_routing_overlay(&network, &[], &[local.clone(), api.clone()], &[], "test-site", None)
             .unwrap_or_else(|_| std::process::abort());
-        let rev = render_routing_overlay(&network, &[], &[api, local], "test-site", None)
+        let rev = render_routing_overlay(&network, &[], &[api, local], &[], "test-site", None)
             .unwrap_or_else(|_| std::process::abort());
         let fwd_clusters: Vec<&str> = fwd.candidates.iter().map(|c| c.cluster.as_str()).collect();
         let rev_clusters: Vec<&str> = rev.candidates.iter().map(|c| c.cluster.as_str()).collect();
@@ -1618,7 +1760,7 @@ mod tests {
         let network = test_network("net");
         let cloud = test_provider_with_backend_kind("cloud-prov", "net", "cloud_managed");
         let unknown = test_provider_with_backend_kind("unknown-prov", "net", "nonexistent_kind");
-        let overlay = render_routing_overlay(&network, &[], &[cloud, unknown], "test-site", None)
+        let overlay = render_routing_overlay(&network, &[], &[cloud, unknown], &[], "test-site", None)
             .unwrap_or_else(|_| std::process::abort());
         assert_eq!(
             overlay.candidates.first().map(|c| c.cluster.as_str()),
@@ -1634,8 +1776,8 @@ mod tests {
     #[test]
     fn empty_network_renders_empty_candidates() {
         let network = test_network("my-net");
-        let overlay =
-            render_routing_overlay(&network, &[], &[], "test-site", None).unwrap_or_else(|_| std::process::abort());
+        let overlay = render_routing_overlay(&network, &[], &[], &[], "test-site", None)
+            .unwrap_or_else(|_| std::process::abort());
         assert!(overlay.candidates.is_empty(), "no providers should yield no candidates");
     }
 
@@ -1643,7 +1785,7 @@ mod tests {
     fn provider_in_different_network_is_excluded() {
         let network = test_network("net-a");
         let provider = test_provider("prov", "net-b", &["model-1"]);
-        let overlay = render_routing_overlay(&network, &[], &[provider], "test-site", None)
+        let overlay = render_routing_overlay(&network, &[], &[provider], &[], "test-site", None)
             .unwrap_or_else(|_| std::process::abort());
         assert!(
             overlay.candidates.is_empty(),
@@ -1655,7 +1797,7 @@ mod tests {
     fn provider_with_two_models_renders_two_candidates() {
         let network = test_network("net-a");
         let provider = test_provider("prov", "net-a", &["model-1", "model-2"]);
-        let overlay = render_routing_overlay(&network, &[], &[provider], "test-site", None)
+        let overlay = render_routing_overlay(&network, &[], &[provider], &[], "test-site", None)
             .unwrap_or_else(|_| std::process::abort());
         assert_eq!(overlay.candidates.len(), 2, "two models must produce two candidates");
     }
@@ -1665,7 +1807,7 @@ mod tests {
         let network = test_network("net");
         let p1 = test_provider("prov-a", "net", &["llama-3"]);
         let p2 = test_provider("prov-b", "net", &["llama-3"]);
-        let overlay = render_routing_overlay(&network, &[], &[p1, p2], "test-site", None)
+        let overlay = render_routing_overlay(&network, &[], &[p1, p2], &[], "test-site", None)
             .unwrap_or_else(|_| std::process::abort());
         assert_eq!(
             overlay.candidates.len(),
@@ -1682,7 +1824,7 @@ mod tests {
         let network = test_network("net");
         let p1 = test_provider("site-b", "net", &["z-model", "a-model"]);
         let p2 = test_provider("site-a", "net", &["c-model"]);
-        let overlay = render_routing_overlay(&network, &[], &[p1, p2], "test-site", None)
+        let overlay = render_routing_overlay(&network, &[], &[p1, p2], &[], "test-site", None)
             .unwrap_or_else(|_| std::process::abort());
         let names: Vec<&str> = overlay.candidates.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(
@@ -1697,9 +1839,9 @@ mod tests {
         let network = test_network("net");
         let p1 = test_provider("z-site", "net", &["z-model"]);
         let p2 = test_provider("a-site", "net", &["a-model"]);
-        let fwd = render_routing_overlay(&network, &[], &[p1.clone(), p2.clone()], "test-site", None)
+        let fwd = render_routing_overlay(&network, &[], &[p1.clone(), p2.clone()], &[], "test-site", None)
             .unwrap_or_else(|_| std::process::abort());
-        let rev = render_routing_overlay(&network, &[], &[p2, p1], "test-site", None)
+        let rev = render_routing_overlay(&network, &[], &[p2, p1], &[], "test-site", None)
             .unwrap_or_else(|_| std::process::abort());
         let fwd_names: Vec<&str> = fwd.candidates.iter().map(|c| c.name.as_str()).collect();
         let rev_names: Vec<&str> = rev.candidates.iter().map(|c| c.name.as_str()).collect();
@@ -1713,7 +1855,7 @@ mod tests {
     fn blank_model_name_returns_error() {
         let network = test_network("net");
         let provider = test_provider("prov", "net", &[""]);
-        let result = render_routing_overlay(&network, &[], &[provider], "test-site", None);
+        let result = render_routing_overlay(&network, &[], &[provider], &[], "test-site", None);
         assert!(result.is_err(), "blank model name must return an error");
     }
 
@@ -1727,7 +1869,7 @@ mod tests {
         let site_a = test_site("site-a", "net");
         let site_b = test_site("site-b", "net");
         let provider = test_provider("prov", "net", &["model"]);
-        let overlay = render_routing_overlay(&network, &[site_a, site_b], &[provider], "test-site", None)
+        let overlay = render_routing_overlay(&network, &[site_a, site_b], &[provider], &[], "test-site", None)
             .unwrap_or_else(|_| std::process::abort());
         assert_eq!(
             overlay.candidates.len(),
@@ -1745,7 +1887,7 @@ mod tests {
         let site_gpu = test_site_with_labels("gpu-site", "net", &[("hw", "gpu")]);
         let site_cpu = test_site_with_labels("cpu-site", "net", &[("hw", "cpu")]);
         let provider = test_provider_with_selector("prov", "net", &["model"], &[("hw", "gpu")]);
-        let overlay = render_routing_overlay(&network, &[site_gpu, site_cpu], &[provider], "test-site", None)
+        let overlay = render_routing_overlay(&network, &[site_gpu, site_cpu], &[provider], &[], "test-site", None)
             .unwrap_or_else(|_| std::process::abort());
         assert_eq!(
             overlay.candidates.len(),
@@ -1763,7 +1905,7 @@ mod tests {
         let network = test_network("net-a");
         let site_other = test_site("site-other", "net-b");
         let provider = test_provider("prov", "net-a", &["model"]);
-        let overlay = render_routing_overlay(&network, &[site_other], &[provider], "test-site", None)
+        let overlay = render_routing_overlay(&network, &[site_other], &[provider], &[], "test-site", None)
             .unwrap_or_else(|_| std::process::abort());
         assert_eq!(
             overlay.candidates.len(),
@@ -1785,7 +1927,7 @@ mod tests {
         let network = test_network("net");
         let site_cpu = test_site_with_labels("cpu-site", "net", &[("hw", "cpu")]);
         let provider = test_provider_with_selector("prov", "net", &["model"], &[("hw", "gpu")]);
-        let overlay = render_routing_overlay(&network, &[site_cpu], &[provider], "test-site", None)
+        let overlay = render_routing_overlay(&network, &[site_cpu], &[provider], &[], "test-site", None)
             .unwrap_or_else(|_| std::process::abort());
         assert!(
             overlay.candidates.is_empty(),
@@ -1801,7 +1943,7 @@ mod tests {
         let site = test_site("site-a", "net");
         let p1 = test_provider("prov-a", "net", &["shared-model"]);
         let p2 = test_provider("prov-b", "net", &["shared-model"]);
-        let overlay = render_routing_overlay(&network, &[site], &[p1, p2], "test-site", None)
+        let overlay = render_routing_overlay(&network, &[site], &[p1, p2], &[], "test-site", None)
             .unwrap_or_else(|_| std::process::abort());
         assert_eq!(
             overlay.candidates.len(),
@@ -1818,7 +1960,7 @@ mod tests {
         let network = test_network("net");
         let site = test_site("site-a", "net");
         let provider = test_provider("my-provider", "net", &["model"]);
-        let overlay = render_routing_overlay(&network, &[site], &[provider], "test-site", None)
+        let overlay = render_routing_overlay(&network, &[site], &[provider], &[], "test-site", None)
             .unwrap_or_else(|_| std::process::abort());
         assert_eq!(
             overlay.candidates[0].cluster, "my-provider",
@@ -1872,7 +2014,7 @@ mod tests {
     fn unavailable_provider_is_excluded() {
         let network = test_network("net");
         let provider = test_provider_with_phase("prov", "net", &["model-1"], "Unavailable");
-        let overlay = render_routing_overlay(&network, &[], &[provider], "test-site", None)
+        let overlay = render_routing_overlay(&network, &[], &[provider], &[], "test-site", None)
             .unwrap_or_else(|_| std::process::abort());
         assert!(overlay.candidates.is_empty(), "Unavailable provider must be excluded");
     }
@@ -1881,7 +2023,7 @@ mod tests {
     fn available_provider_is_included_with_fresh_true() {
         let network = test_network("net");
         let provider = test_provider_with_phase("prov", "net", &["model-1"], "Available");
-        let overlay = render_routing_overlay(&network, &[], &[provider], "test-site", None)
+        let overlay = render_routing_overlay(&network, &[], &[provider], &[], "test-site", None)
             .unwrap_or_else(|_| std::process::abort());
         assert_eq!(overlay.candidates.len(), 1, "Available provider must be included");
         assert!(
@@ -1894,7 +2036,7 @@ mod tests {
     fn pending_provider_is_included_with_fresh_true() {
         let network = test_network("net");
         let provider = test_provider_with_phase("prov", "net", &["model-1"], "Pending");
-        let overlay = render_routing_overlay(&network, &[], &[provider], "test-site", None)
+        let overlay = render_routing_overlay(&network, &[], &[provider], &[], "test-site", None)
             .unwrap_or_else(|_| std::process::abort());
         assert_eq!(
             overlay.candidates.len(),
@@ -1911,7 +2053,7 @@ mod tests {
     fn provider_with_absent_status_is_included_with_fresh_true() {
         let network = test_network("net");
         let provider = test_provider("prov", "net", &["model-1"]);
-        let overlay = render_routing_overlay(&network, &[], &[provider], "test-site", None)
+        let overlay = render_routing_overlay(&network, &[], &[provider], &[], "test-site", None)
             .unwrap_or_else(|_| std::process::abort());
         assert_eq!(
             overlay.candidates.len(),
@@ -1928,7 +2070,7 @@ mod tests {
     fn degraded_provider_is_included_with_fresh_false() {
         let network = test_network("net");
         let provider = test_provider_with_phase("prov", "net", &["model-1"], "Degraded");
-        let overlay = render_routing_overlay(&network, &[], &[provider], "test-site", None)
+        let overlay = render_routing_overlay(&network, &[], &[provider], &[], "test-site", None)
             .unwrap_or_else(|_| std::process::abort());
         assert_eq!(
             overlay.candidates.len(),
@@ -1946,7 +2088,7 @@ mod tests {
         // All models from a Degraded provider inherit fresh=false.
         let network = test_network("net");
         let provider = test_provider_with_phase("prov", "net", &["model-a", "model-b"], "Degraded");
-        let overlay = render_routing_overlay(&network, &[], &[provider], "test-site", None)
+        let overlay = render_routing_overlay(&network, &[], &[provider], &[], "test-site", None)
             .unwrap_or_else(|_| std::process::abort());
         assert_eq!(overlay.candidates.len(), 2, "both models must be present");
         assert!(
@@ -1962,7 +2104,7 @@ mod tests {
         let network = test_network("net");
         let available = test_provider_with_phase("avail-prov", "net", &["model-a"], "Available");
         let degraded = test_provider_with_phase("degr-prov", "net", &["model-a"], "Degraded");
-        let overlay = render_routing_overlay(&network, &[], &[available, degraded], "test-site", None)
+        let overlay = render_routing_overlay(&network, &[], &[available, degraded], &[], "test-site", None)
             .unwrap_or_else(|_| std::process::abort());
         assert_eq!(overlay.candidates.len(), 2, "both providers must contribute candidates");
         let avail_candidate = overlay
@@ -1985,7 +2127,7 @@ mod tests {
         // in the ConfigMap and be readable by the overlay consumer.
         let network = test_network("net");
         let provider = test_provider_with_phase("prov", "net", &["model-1"], "Degraded");
-        let overlay = render_routing_overlay(&network, &[], &[provider], "test-site", None)
+        let overlay = render_routing_overlay(&network, &[], &[provider], &[], "test-site", None)
             .unwrap_or_else(|_| std::process::abort());
         let cm = build_cm(&overlay, "net", "gw");
         let json = overlay_json_from_cm(&cm);
@@ -2007,7 +2149,7 @@ mod tests {
         let site_a = test_site("site-a", "net");
         let site_b = test_site("site-b", "net");
         let provider = test_provider_with_phase("prov", "net", &["model-a"], "Degraded");
-        let overlay = render_routing_overlay(&network, &[site_a, site_b], &[provider], "test-site", None)
+        let overlay = render_routing_overlay(&network, &[site_a, site_b], &[provider], &[], "test-site", None)
             .unwrap_or_else(|_| std::process::abort());
         assert_eq!(overlay.candidates.len(), 2, "one candidate per matched site");
         assert!(
@@ -2023,8 +2165,8 @@ mod tests {
     #[test]
     fn configmap_name_matches_pattern() {
         let network = test_network("my-net");
-        let overlay =
-            render_routing_overlay(&network, &[], &[], "test-site", None).unwrap_or_else(|_| std::process::abort());
+        let overlay = render_routing_overlay(&network, &[], &[], &[], "test-site", None)
+            .unwrap_or_else(|_| std::process::abort());
         let cm = build_cm(&overlay, "my-net", "gw");
         assert_eq!(
             cm.metadata.name.as_deref(),
@@ -2036,8 +2178,8 @@ mod tests {
     #[test]
     fn configmap_has_correct_labels() {
         let network = test_network("net");
-        let overlay =
-            render_routing_overlay(&network, &[], &[], "test-site", None).unwrap_or_else(|_| std::process::abort());
+        let overlay = render_routing_overlay(&network, &[], &[], &[], "test-site", None)
+            .unwrap_or_else(|_| std::process::abort());
         let cm = build_cm(&overlay, "net", "gw");
         let labels = cm.metadata.labels.as_ref().unwrap_or_else(|| std::process::abort());
         assert_eq!(
@@ -2057,8 +2199,8 @@ mod tests {
     #[test]
     fn configmap_data_key_is_grid_config_json() {
         let network = test_network("net");
-        let overlay =
-            render_routing_overlay(&network, &[], &[], "test-site", None).unwrap_or_else(|_| std::process::abort());
+        let overlay = render_routing_overlay(&network, &[], &[], &[], "test-site", None)
+            .unwrap_or_else(|_| std::process::abort());
         let cm = build_cm(&overlay, "net", "gw");
         assert!(
             cm.data.as_ref().is_some_and(|d| d.contains_key("grid-config.json")),
@@ -2072,8 +2214,8 @@ mod tests {
         // Serialization of RoutingOverlay cannot currently fail (all fields
         // are plain Strings / booleans), so we just verify the Ok path.
         let network = test_network("net");
-        let overlay =
-            render_routing_overlay(&network, &[], &[], "test-site", None).unwrap_or_else(|_| std::process::abort());
+        let overlay = render_routing_overlay(&network, &[], &[], &[], "test-site", None)
+            .unwrap_or_else(|_| std::process::abort());
         let result = build_overlay_configmap(&overlay, "net", "gw", "ns");
         assert!(result.is_ok(), "well-formed overlay must serialize without error");
     }
@@ -2127,7 +2269,7 @@ mod tests {
     fn json_overlay_has_correct_top_level_fields() {
         let network = test_network("my-net");
         let overlay =
-            render_routing_overlay(&network, &[], &[], "site-a", None).unwrap_or_else(|_| std::process::abort());
+            render_routing_overlay(&network, &[], &[], &[], "site-a", None).unwrap_or_else(|_| std::process::abort());
         let value = overlay_json_from_cm(&build_cm(&overlay, "my-net", "gw"));
         assert_eq!(value.get("network").and_then(serde_json::Value::as_str), Some("my-net"));
         assert_eq!(
@@ -2141,7 +2283,7 @@ mod tests {
     fn local_site_parameter_flows_to_overlay() {
         let network = test_network("my-net");
         let overlay =
-            render_routing_overlay(&network, &[], &[], "site-a", None).unwrap_or_else(|_| std::process::abort());
+            render_routing_overlay(&network, &[], &[], &[], "site-a", None).unwrap_or_else(|_| std::process::abort());
         assert_eq!(
             overlay.local_site, "site-a",
             "local_site parameter must appear verbatim in the overlay"
@@ -2154,9 +2296,9 @@ mod tests {
         // Simulates two gateways in the same network declaring different local sites.
         let network = test_network("my-net");
         let overlay_a =
-            render_routing_overlay(&network, &[], &[], "site-a", None).unwrap_or_else(|_| std::process::abort());
+            render_routing_overlay(&network, &[], &[], &[], "site-a", None).unwrap_or_else(|_| std::process::abort());
         let overlay_b =
-            render_routing_overlay(&network, &[], &[], "site-b", None).unwrap_or_else(|_| std::process::abort());
+            render_routing_overlay(&network, &[], &[], &[], "site-b", None).unwrap_or_else(|_| std::process::abort());
         assert_eq!(overlay_a.local_site, "site-a", "gateway A must identify site-a");
         assert_eq!(overlay_b.local_site, "site-b", "gateway B must identify site-b");
         assert_eq!(
@@ -2169,7 +2311,7 @@ mod tests {
     fn json_candidate_has_correct_fields() {
         let network = test_network("my-net");
         let provider = test_provider("prov-a", "my-net", &["granite-3.3-8b"]);
-        let overlay = render_routing_overlay(&network, &[], &[provider], "test-site", None)
+        let overlay = render_routing_overlay(&network, &[], &[provider], &[], "test-site", None)
             .unwrap_or_else(|_| std::process::abort());
         let value = overlay_json_from_cm(&build_cm(&overlay, "my-net", "gw"));
         let c = value
@@ -2204,7 +2346,7 @@ mod tests {
             "spec": { "seeds": [] }
         }))
         .unwrap_or_else(|_| std::process::abort());
-        let result = render_routing_overlay(&network, &[], &[], "local", None);
+        let result = render_routing_overlay(&network, &[], &[], &[], "local", None);
         assert!(result.is_err(), "network without metadata.name must return an error");
     }
 
@@ -2225,7 +2367,7 @@ mod tests {
             }
         }))
         .unwrap_or_else(|_| std::process::abort());
-        let result = render_routing_overlay(&network, &[], &[provider], "local", None);
+        let result = render_routing_overlay(&network, &[], &[provider], &[], "local", None);
         assert!(
             result.is_err(),
             "InferenceProvider without metadata.name must return an error"
@@ -2255,7 +2397,7 @@ mod tests {
         );
 
         let providers_for_ordering = [provider_busy, provider_idle];
-        let ordering = provider_ordering_scores("net", &providers_for_ordering, None, Some(&metrics));
+        let ordering = provider_ordering_scores("net", &providers_for_ordering, &[], None, Some(&metrics));
 
         let busy_score = ordering["provider-busy"];
         let idle_score = ordering["provider-idle"];
@@ -2273,9 +2415,9 @@ mod tests {
         let local = test_provider_with_backend_kind("prov-local", "net", "local");
         let api = test_provider_with_backend_kind("prov-api", "net", "api_provider");
         let ps_static = [local.clone(), api.clone()];
-        let ordering_static = provider_ordering_scores("net", &ps_static, None, None);
+        let ordering_static = provider_ordering_scores("net", &ps_static, &[], None, None);
         let ps_empty = [local, api];
-        let ordering_no_metrics = provider_ordering_scores("net", &ps_empty, None, Some(&HashMap::new()));
+        let ordering_no_metrics = provider_ordering_scores("net", &ps_empty, &[], None, Some(&HashMap::new()));
         assert_eq!(
             ordering_static["prov-local"], ordering_no_metrics["prov-local"],
             "empty metrics map must yield same score as None"
@@ -2310,7 +2452,7 @@ mod tests {
             scoring::BackendMetrics::new(0.0, true, 0.0, 0.0, 0.0, 0.1),
         );
 
-        let overlay = render_routing_overlay(&network, &[], &[busy, idle], "local-gw", Some(&metrics))
+        let overlay = render_routing_overlay(&network, &[], &[busy, idle], &[], "local-gw", Some(&metrics))
             .unwrap_or_else(|_| std::process::abort());
 
         // idle (queue_depth=0.1) must rank before busy (queue_depth=0.9).
@@ -2331,10 +2473,10 @@ mod tests {
         let api = test_provider_with_backend_kind("prov-api", "net", "api_provider");
         let network = test_network("net");
 
-        let overlay_none = render_routing_overlay(&network, &[], &[api.clone(), local.clone()], "gw", None)
+        let overlay_none = render_routing_overlay(&network, &[], &[api.clone(), local.clone()], &[], "gw", None)
             .unwrap_or_else(|_| std::process::abort());
 
-        let overlay_empty = render_routing_overlay(&network, &[], &[api, local], "gw", Some(&HashMap::new()))
+        let overlay_empty = render_routing_overlay(&network, &[], &[api, local], &[], "gw", Some(&HashMap::new()))
             .unwrap_or_else(|_| std::process::abort());
 
         assert_eq!(
@@ -2364,7 +2506,7 @@ mod tests {
         );
         // "unmapped-prov" intentionally absent from the metrics map.
 
-        let overlay = render_routing_overlay(&network, &[], &[known, unmapped], "gw", Some(&metrics))
+        let overlay = render_routing_overlay(&network, &[], &[known, unmapped], &[], "gw", Some(&metrics))
             .unwrap_or_else(|_| std::process::abort());
 
         assert_eq!(
@@ -2477,7 +2619,7 @@ mod tests {
     fn routing_cluster_ref_appears_in_candidate_cluster() {
         let network = test_network("net");
         let provider = test_provider_with_routing_cluster_ref("prov-a", "net", Some("gateway-site-x"));
-        let overlay = render_routing_overlay(&network, &[], &[provider], "test-site", None)
+        let overlay = render_routing_overlay(&network, &[], &[provider], &[], "test-site", None)
             .unwrap_or_else(|_| std::process::abort());
         assert_eq!(overlay.candidates.len(), 1, "one candidate");
         assert_eq!(
@@ -2492,7 +2634,7 @@ mod tests {
         // In Phase 1 (no GridSites), site = routingClusterRef.
         let network = test_network("net");
         let provider = test_provider_with_routing_cluster_ref("prov-a", "net", Some("site-x"));
-        let overlay = render_routing_overlay(&network, &[], &[provider], "test-site", None)
+        let overlay = render_routing_overlay(&network, &[], &[provider], &[], "test-site", None)
             .unwrap_or_else(|_| std::process::abort());
         assert_eq!(
             overlay.candidates.first().map(|c| c.site.as_str()),
@@ -2518,7 +2660,7 @@ mod tests {
             }
         }))
         .unwrap_or_else(|_| std::process::abort());
-        let overlay = render_routing_overlay(&network, &[], &[provider], "test-site", None)
+        let overlay = render_routing_overlay(&network, &[], &[provider], &[], "test-site", None)
             .unwrap_or_else(|_| std::process::abort());
         assert_eq!(overlay.candidates.len(), 2, "two model candidates");
         assert!(
@@ -2535,7 +2677,7 @@ mod tests {
         let p2 = test_provider_with_routing_cluster_ref("prov-b", "net", Some("site-x"));
         // Both produce (kind=inference_model, name=model-x, site=site-x, cluster=site-x)
         // They share the same cluster and site, so after dedup there should be ONE entry.
-        let overlay = render_routing_overlay(&network, &[], &[p1, p2], "test-site", None)
+        let overlay = render_routing_overlay(&network, &[], &[p1, p2], &[], "test-site", None)
             .unwrap_or_else(|_| std::process::abort());
         assert_eq!(
             overlay.candidates.len(),
@@ -2562,7 +2704,7 @@ mod tests {
             "status": { "phase": "Unavailable", "matchingSites": [], "observedGeneration": 0 }
         }))
         .unwrap_or_else(|_| std::process::abort());
-        let overlay = render_routing_overlay(&network, &[], &[provider], "test-site", None)
+        let overlay = render_routing_overlay(&network, &[], &[provider], &[], "test-site", None)
             .unwrap_or_else(|_| std::process::abort());
         assert!(
             overlay.candidates.is_empty(),
@@ -2588,7 +2730,7 @@ mod tests {
             "status": { "phase": "Degraded", "matchingSites": [], "observedGeneration": 0 }
         }))
         .unwrap_or_else(|_| std::process::abort());
-        let overlay = render_routing_overlay(&network, &[], &[provider], "test-site", None)
+        let overlay = render_routing_overlay(&network, &[], &[provider], &[], "test-site", None)
             .unwrap_or_else(|_| std::process::abort());
         assert_eq!(overlay.candidates.len(), 1, "Degraded must be included");
         assert!(
@@ -2620,7 +2762,7 @@ mod tests {
             }
         }))
         .unwrap_or_else(|_| std::process::abort());
-        let overlay = render_routing_overlay(&network, &[], &[api_provider, local_with_ref], "test-site", None)
+        let overlay = render_routing_overlay(&network, &[], &[api_provider, local_with_ref], &[], "test-site", None)
             .unwrap_or_else(|_| std::process::abort());
         assert_eq!(overlay.candidates.len(), 2, "two candidates");
         // Local (cluster=site-x via ref) must rank before api_provider.
@@ -2640,11 +2782,272 @@ mod tests {
         let mut metrics: HashMap<&str, scoring::BackendMetrics> = HashMap::new();
         metrics.insert("prov-a", scoring::BackendMetrics::new(0.0, true, 0.0, 0.0, 0.0, 0.8));
 
-        let state = build_grid_state_with_metrics("net", &providers, Some(&metrics));
+        let state = build_grid_state_with_metrics("net", &providers, &[], Some(&metrics));
         assert!(state.metrics("prov-a").is_some(), "prov-a must have metrics attached");
         assert!(
             state.metrics("prov-b").is_none(),
             "prov-b must have no metrics (not in map)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // crdt_phase_to_fresh — pure mapping function
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn crdt_phase_unavailable_produces_no_candidates() {
+        assert!(
+            crdt_phase_to_fresh(&crdt::ProviderPhase::Unavailable).is_none(),
+            "Unavailable phase must yield None (excluded from overlay)"
+        );
+    }
+
+    #[test]
+    fn crdt_phase_degraded_produces_fresh_false() {
+        assert_eq!(
+            crdt_phase_to_fresh(&crdt::ProviderPhase::Degraded),
+            Some(false),
+            "Degraded phase must yield Some(false)"
+        );
+    }
+
+    #[test]
+    fn crdt_phase_available_produces_fresh_true() {
+        assert_eq!(
+            crdt_phase_to_fresh(&crdt::ProviderPhase::Available),
+            Some(true),
+            "Available phase must yield Some(true)"
+        );
+    }
+
+    #[test]
+    fn crdt_phase_pending_produces_fresh_true() {
+        assert_eq!(
+            crdt_phase_to_fresh(&crdt::ProviderPhase::Pending),
+            Some(true),
+            "Pending phase must yield Some(true)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // remote_crdt_provider_to_candidates — candidate generation
+    // -----------------------------------------------------------------------
+
+    fn make_crdt_provider(
+        site_id: &str,
+        routing_cluster: &str,
+        phase: crdt::ProviderPhase,
+        models: &[&str],
+    ) -> crdt::ProviderState {
+        crdt::ProviderState {
+            network_id: "net".to_owned(),
+            site_id: site_id.to_owned(),
+            provider_id: "prov-1".to_owned(),
+            routing_cluster: routing_cluster.to_owned(),
+            models: models.iter().map(|m| (*m).to_owned()).collect(),
+            backend_kind: "local".to_owned(),
+            phase,
+            metrics: crdt::ProviderMetricsSnapshot::default(),
+            revision: 1,
+            writer_id: site_id.to_owned(),
+        }
+    }
+
+    #[test]
+    fn remote_provider_two_models_produces_two_candidates() {
+        let provider = make_crdt_provider(
+            "remote-site",
+            "cluster-1",
+            crdt::ProviderPhase::Available,
+            &["model-a", "model-b"],
+        );
+        let candidates = remote_crdt_provider_to_candidates(&provider);
+        assert_eq!(candidates.len(), 2, "two models must produce two candidates");
+    }
+
+    #[test]
+    fn remote_provider_site_and_cluster_preserved_in_candidates() {
+        let provider = make_crdt_provider("remote-site", "cluster-1", crdt::ProviderPhase::Available, &["model-a"]);
+        let candidates = remote_crdt_provider_to_candidates(&provider);
+        assert_eq!(candidates.len(), 1, "one model produces one candidate");
+        let c = candidates.first().unwrap_or_else(|| std::process::abort());
+        assert_eq!(c.site, "remote-site", "site must be taken from site_id");
+        assert_eq!(c.cluster, "cluster-1", "cluster must be taken from routing_cluster");
+        assert!(c.fresh, "Available phase must produce fresh=true");
+    }
+
+    #[test]
+    fn remote_provider_unavailable_produces_empty_candidates() {
+        let provider = make_crdt_provider(
+            "remote-site",
+            "cluster-1",
+            crdt::ProviderPhase::Unavailable,
+            &["model-a"],
+        );
+        let candidates = remote_crdt_provider_to_candidates(&provider);
+        assert!(candidates.is_empty(), "Unavailable phase must produce empty candidates");
+    }
+
+    // -----------------------------------------------------------------------
+    // remote_crdt_provider_to_backend_config — BackendConfig generation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn remote_provider_local_backend_kind_mapped_to_remote() {
+        let provider = make_crdt_provider("remote-site", "cluster-1", crdt::ProviderPhase::Available, &["model-a"]);
+        let config = remote_crdt_provider_to_backend_config(&provider).unwrap_or_else(|| std::process::abort());
+        assert_eq!(
+            config.kind,
+            scoring::BackendKind::Remote,
+            "local backend_kind from remote site must map to BackendKind::Remote"
+        );
+    }
+
+    #[test]
+    fn remote_provider_cloud_managed_preserved() {
+        let mut provider = make_crdt_provider("remote-site", "cluster-1", crdt::ProviderPhase::Available, &["model-a"]);
+        provider.backend_kind = "cloud_managed".to_owned();
+        let config = remote_crdt_provider_to_backend_config(&provider).unwrap_or_else(|| std::process::abort());
+        assert_eq!(
+            config.kind,
+            scoring::BackendKind::CloudManaged,
+            "cloud_managed must be preserved for remote CRDT providers"
+        );
+    }
+
+    #[test]
+    fn remote_provider_api_provider_preserved() {
+        let mut provider = make_crdt_provider("remote-site", "cluster-1", crdt::ProviderPhase::Available, &["model-a"]);
+        provider.backend_kind = "api_provider".to_owned();
+        let config = remote_crdt_provider_to_backend_config(&provider).unwrap_or_else(|| std::process::abort());
+        assert_eq!(
+            config.kind,
+            scoring::BackendKind::ApiProvider,
+            "api_provider must be preserved for remote CRDT providers"
+        );
+    }
+
+    #[test]
+    fn remote_provider_unavailable_returns_none_from_backend_config() {
+        let provider = make_crdt_provider(
+            "remote-site",
+            "cluster-1",
+            crdt::ProviderPhase::Unavailable,
+            &["model-a"],
+        );
+        assert!(
+            remote_crdt_provider_to_backend_config(&provider).is_none(),
+            "Unavailable phase must return None from backend config"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // crdt_metrics_to_backend — metrics mapping
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn crdt_metrics_all_some_maps_correctly() {
+        let m = crdt::ProviderMetricsSnapshot {
+            queue_depth: Some(0.3),
+            kv_cache_utilization: Some(0.4),
+            latency_p99_ms: Some(120.0),
+            prefix_cache_hit_ratio: Some(0.7),
+            error_rate: Some(0.1),
+            healthy: Some(true),
+        };
+        let bm = crdt_metrics_to_backend(&m);
+        assert!((bm.queue_depth - 0.3).abs() < f64::EPSILON, "queue_depth must map");
+        assert!(
+            (bm.kv_cache_utilization - 0.4).abs() < f64::EPSILON,
+            "kv_cache must map"
+        );
+        assert!((bm.latency_p99_ms - 120.0).abs() < f64::EPSILON, "latency must map");
+        assert!(
+            (bm.prefix_cache_hit_ratio - 0.7).abs() < f64::EPSILON,
+            "prefix_cache must map"
+        );
+        assert!((bm.error_rate - 0.1).abs() < f64::EPSILON, "error_rate must map");
+        assert!(bm.healthy, "healthy must map");
+    }
+
+    #[test]
+    fn crdt_metrics_all_none_uses_neutral_defaults() {
+        let m = crdt::ProviderMetricsSnapshot::default();
+        let bm = crdt_metrics_to_backend(&m);
+        assert!(
+            (bm.queue_depth - UNMAPPED_NEUTRAL_SIGNAL).abs() < f64::EPSILON,
+            "queue_depth must default to neutral 0.5"
+        );
+        assert!(
+            (bm.kv_cache_utilization - UNMAPPED_NEUTRAL_SIGNAL).abs() < f64::EPSILON,
+            "kv_cache must default to neutral 0.5"
+        );
+        assert!(bm.error_rate.abs() < f64::EPSILON, "error_rate must default to 0.0");
+        assert!(bm.healthy, "healthy must default to true");
+    }
+
+    // -----------------------------------------------------------------------
+    // render_routing_overlay integration — remote CRDT providers
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn render_overlay_includes_remote_crdt_candidates() {
+        let network = test_network("net");
+        let remote = make_crdt_provider(
+            "remote-site",
+            "remote-cluster",
+            crdt::ProviderPhase::Available,
+            &["model-remote"],
+        );
+        let overlay = render_routing_overlay(&network, &[], &[], &[remote], "local-site", None)
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            overlay.candidates.len(),
+            1,
+            "remote CRDT provider must produce a candidate"
+        );
+        let c = overlay.candidates.first().unwrap_or_else(|| std::process::abort());
+        assert_eq!(c.site, "remote-site", "site must come from CRDT site_id");
+        assert_eq!(
+            c.cluster, "remote-cluster",
+            "cluster must come from CRDT routing_cluster"
+        );
+        assert_eq!(c.name, "model-remote", "name must match CRDT model");
+        assert!(c.fresh, "Available CRDT provider must be fresh");
+    }
+
+    #[test]
+    fn render_overlay_excludes_unavailable_crdt_providers() {
+        let network = test_network("net");
+        let unavailable = make_crdt_provider(
+            "remote-site",
+            "remote-cluster",
+            crdt::ProviderPhase::Unavailable,
+            &["model-remote"],
+        );
+        let overlay = render_routing_overlay(&network, &[], &[], &[unavailable], "local-site", None)
+            .unwrap_or_else(|_| std::process::abort());
+        assert!(
+            overlay.candidates.is_empty(),
+            "Unavailable CRDT provider must be excluded from overlay"
+        );
+    }
+
+    #[test]
+    fn render_overlay_local_providers_unchanged_with_empty_remote() {
+        let network = test_network("net");
+        let local_prov = test_provider_with_backend_kind("prov-local", "net", "local");
+        let overlay = render_routing_overlay(&network, &[], &[local_prov], &[], "local-site", None)
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            overlay.candidates.len(),
+            1,
+            "local provider must appear with no remote providers"
+        );
+        assert_eq!(
+            overlay.candidates.first().map(|c| c.cluster.as_str()),
+            Some("prov-local"),
+            "local provider must be the sole candidate when remote CRDT providers is empty"
         );
     }
 }

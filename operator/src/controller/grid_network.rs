@@ -133,7 +133,13 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
     let providers = list_all_inference_providers(client).await?;
     let raw_metrics = provider_metrics::collect_provider_metrics(name, &providers).await;
 
-    reconcile_routing_overlay_inner(&network, client, &providers, &raw_metrics).await?;
+    let remote_crdt_providers: Vec<crdt::ProviderState> = ctx
+        .swim
+        .as_ref()
+        .map(|swim| collect_remote_crdt_providers(swim, name))
+        .unwrap_or_default();
+
+    reconcile_routing_overlay_inner(&network, client, &providers, &remote_crdt_providers, &raw_metrics).await?;
 
     let grid_id = resolve_grid_id(&network);
     // Obtain a live membership snapshot from the SWIM runtime when available.
@@ -270,12 +276,16 @@ async fn apply_site_secret(
 )]
 /// Reconcile routing overlay `ConfigMap`s using pre-fetched provider and metrics data.
 ///
-/// Receives the provider list and metrics map from [`reconcile`] so both the
-/// routing overlay and the CRDT state broadcast share a single kube API fetch.
+/// Receives the provider list, remote CRDT providers, and metrics map from
+/// [`reconcile`] so both the routing overlay and the CRDT state broadcast share
+/// a single kube API fetch.  Remote CRDT providers are passed through to
+/// [`routing_overlay::render_routing_overlay`] so cross-site candidates appear
+/// in the overlay.
 async fn reconcile_routing_overlay_inner(
     network: &GridNetwork,
     client: &Client,
     providers: &[InferenceProvider],
+    remote_crdt_providers: &[crdt::ProviderState],
     raw_metrics: &HashMap<String, scoring::BackendMetrics>,
 ) -> Result<(), OperatorError> {
     let network_name = network
@@ -298,8 +308,15 @@ async fn reconcile_routing_overlay_inner(
         // Each gateway identifies its own local site.  Fall back to the
         // network name for single-site deployments where the two are equal.
         let local_site = gw_ref.local_site_name.as_deref().unwrap_or(network_name);
-        let overlay = routing_overlay::render_routing_overlay(network, &sites, providers, local_site, metrics_arg)
-            .map_err(OperatorError::OverlayRender)?;
+        let overlay = routing_overlay::render_routing_overlay(
+            network,
+            &sites,
+            providers,
+            remote_crdt_providers,
+            local_site,
+            metrics_arg,
+        )
+        .map_err(OperatorError::OverlayRender)?;
         // Praxis grid_route rejects an empty candidates list at config load
         // time, which would cause a hot-reload error rather than a clean
         // "no routes" state.  Skip the apply and warn so the previous
@@ -562,6 +579,41 @@ fn publish_real_provider_state(
 /// Count provider records learned from remote sites through distributed state.
 fn count_remote_provider_records(swim: &SwimHandle, network_name: &str) -> u32 {
     count_remote_provider_records_in_snapshot(swim.site_name(), network_name, &swim.state_snapshot())
+}
+
+/// Collect remote CRDT provider records from the SWIM state snapshot.
+///
+/// Filters to providers that:
+/// - have `network_id == network_name` (belong to this [`GridNetwork`]);
+/// - have `site_id != swim.site_name()` (originate from a remote site).
+///
+/// [`crdt::ProviderPhase::Unavailable`] providers are retained here —
+/// [`routing_overlay::crdt_phase_to_fresh`] applies phase-based exclusion
+/// during candidate generation, keeping the boundary clear between collection
+/// and rendering.
+///
+/// [`GridNetwork`]: crate::crd::grid_network::GridNetwork
+pub(crate) fn collect_remote_crdt_providers(swim: &SwimHandle, network_name: &str) -> Vec<crdt::ProviderState> {
+    collect_remote_providers_from_snapshot(swim.site_name(), network_name, &swim.state_snapshot())
+}
+
+/// Pure filtering logic for remote CRDT provider records.
+///
+/// Extracts [`crdt::ProviderState`] entries from `snapshot` whose
+/// `network_id` matches `network_name` and `site_id` differs from
+/// `local_site`.  Designed as a separately-testable inner function
+/// following the same pattern as [`count_remote_provider_records_in_snapshot`].
+fn collect_remote_providers_from_snapshot(
+    local_site: &str,
+    network_name: &str,
+    snapshot: &crdt::GridStateSnapshot,
+) -> Vec<crdt::ProviderState> {
+    snapshot
+        .providers
+        .values()
+        .filter(|p| p.network_id == network_name && p.site_id != local_site)
+        .cloned()
+        .collect()
 }
 
 /// Count provider records whose owner differs from the local site.
@@ -892,6 +944,106 @@ mod tests {
             revision: 1,
             writer_id: site_id.to_owned(),
         }
+    }
+
+    fn remote_provider_state_with_phase(
+        site_id: &str,
+        provider_id: &str,
+        phase: crdt::ProviderPhase,
+    ) -> crdt::ProviderState {
+        crdt::ProviderState {
+            network_id: "net".to_owned(),
+            site_id: site_id.to_owned(),
+            provider_id: provider_id.to_owned(),
+            routing_cluster: site_id.to_owned(),
+            models: vec!["model-x".to_owned()],
+            backend_kind: "local".to_owned(),
+            phase,
+            metrics: crdt::ProviderMetricsSnapshot::default(),
+            revision: 1,
+            writer_id: site_id.to_owned(),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // collect_remote_crdt_providers (via collect_remote_providers_from_snapshot)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn collect_remote_crdt_providers_excludes_local_site() {
+        let mut snap = crdt::GridStateSnapshot::new("site-local".to_owned());
+        snap.upsert_provider(remote_provider_state_with_phase(
+            "site-local",
+            "local-prov",
+            crdt::ProviderPhase::Available,
+        ));
+        snap.upsert_provider(remote_provider_state_with_phase(
+            "site-remote",
+            "remote-prov",
+            crdt::ProviderPhase::Available,
+        ));
+        let result = collect_remote_providers_from_snapshot("site-local", "net", &snap);
+        assert_eq!(result.len(), 1, "only remote site records must be collected");
+        assert_eq!(
+            result.first().unwrap_or_else(|| std::process::abort()).site_id,
+            "site-remote",
+            "collected record must be from remote site"
+        );
+    }
+
+    #[test]
+    fn collect_remote_crdt_providers_excludes_wrong_network() {
+        let mut snap = crdt::GridStateSnapshot::new("site-local".to_owned());
+        let mut other_net =
+            remote_provider_state_with_phase("site-remote", "remote-prov", crdt::ProviderPhase::Available);
+        other_net.network_id = "other-net".to_owned();
+        snap.upsert_provider(other_net);
+        let result = collect_remote_providers_from_snapshot("site-local", "net", &snap);
+        assert!(
+            result.is_empty(),
+            "providers from a different GridNetwork must be excluded"
+        );
+    }
+
+    #[test]
+    fn collect_remote_crdt_providers_includes_degraded() {
+        let mut snap = crdt::GridStateSnapshot::new("site-local".to_owned());
+        snap.upsert_provider(remote_provider_state_with_phase(
+            "site-remote",
+            "remote-prov",
+            crdt::ProviderPhase::Degraded,
+        ));
+        let result = collect_remote_providers_from_snapshot("site-local", "net", &snap);
+        assert_eq!(result.len(), 1, "Degraded remote providers must be collected");
+        assert_eq!(
+            result.first().unwrap_or_else(|| std::process::abort()).phase,
+            crdt::ProviderPhase::Degraded,
+            "Degraded phase must be preserved in collected record"
+        );
+    }
+
+    #[test]
+    fn collect_remote_crdt_providers_retains_unavailable_for_phase_filter() {
+        // Unavailable providers are collected here; crdt_phase_to_fresh excludes them
+        // during overlay candidate generation.  This test proves collection does not filter
+        // by phase so the rendering layer has full control over inclusion decisions.
+        let mut snap = crdt::GridStateSnapshot::new("site-local".to_owned());
+        snap.upsert_provider(remote_provider_state_with_phase(
+            "site-remote",
+            "remote-prov",
+            crdt::ProviderPhase::Unavailable,
+        ));
+        let result = collect_remote_providers_from_snapshot("site-local", "net", &snap);
+        assert_eq!(
+            result.len(),
+            1,
+            "Unavailable remote providers must be retained by collection; rendering layer applies phase filter"
+        );
+        assert_eq!(
+            result.first().unwrap_or_else(|| std::process::abort()).phase,
+            crdt::ProviderPhase::Unavailable,
+            "phase must be preserved so rendering layer can apply crdt_phase_to_fresh"
+        );
     }
 
     #[test]

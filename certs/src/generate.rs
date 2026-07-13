@@ -25,6 +25,24 @@ pub enum GenerateError {
     /// `rcgen` certificate generation failed.
     #[error("certificate generation failed: {0}")]
     Rcgen(#[from] rcgen::Error),
+
+    /// CA certificate PEM could not be decoded.
+    ///
+    /// Returned by [`load_ca`] when `ca_cert_pem` is not valid PEM.
+    #[error("CA certificate PEM could not be parsed")]
+    InvalidCaCert,
+
+    /// CA certificate and private key do not correspond to the same key pair.
+    ///
+    /// Detected by [`load_ca`] by checking that the key's public bytes appear
+    /// in the certificate DER body.  Pass matching `ca_cert_pem` and
+    /// `ca_key_pem` (both written by [`generate_ca`] in the same call), or
+    /// run `cargo xtask env down && cargo xtask env up` to regenerate all
+    /// certificates from a fresh CA.
+    #[error(
+        "CA certificate and private key do not match: regenerate with `cargo xtask env down && cargo xtask env up`"
+    )]
+    CaCertKeyMismatch,
 }
 
 // ---------------------------------------------------------------------------
@@ -139,6 +157,51 @@ pub fn generate_cert_with_org(ca: &CaCert, site_name: &str, org: &str) -> Result
         key_pem: site_key.serialize_pem(),
         organization: org.to_owned(),
         sans: vec![dns_san],
+    })
+}
+
+/// Load an existing CA from PEM files and reconstruct a [`CaCert`] for signing.
+///
+/// Use this to reuse a CA that was previously generated and written to disk
+/// rather than calling [`generate_ca`] again.  The `common_name` must match
+/// what was used in the original [`generate_ca`] call so that the issuer `DN`
+/// in newly-signed site certificates is correct.
+///
+/// The cert and key are validated to confirm they correspond to the same key
+/// pair: the key's public bytes must appear in the certificate DER body.  This
+/// catches the most common failure mode (mixed-up files after a partial
+/// regeneration) and fails with a clear error before any signing attempt.
+///
+/// # Errors
+///
+/// Returns [`GenerateError::Rcgen`] if the key PEM is malformed.
+/// Returns [`GenerateError::InvalidCaCert`] if the cert PEM cannot be decoded.
+/// Returns [`GenerateError::CaCertKeyMismatch`] if cert and key do not match.
+pub fn load_ca(common_name: &str, ca_key_pem: &str, ca_cert_pem: &str) -> Result<CaCert, GenerateError> {
+    let key_pair = KeyPair::from_pem(ca_key_pem)?;
+
+    // Validate that the cert corresponds to this key by checking that the
+    // key's raw public bytes (uncompressed SEC1 point for ECDSA P-256:
+    // `04 || X || Y`) appear as a subsequence in the certificate DER.  This
+    // uses only the `pem` crate — already a transitive dep of `rcgen` — to
+    // parse the PEM to DER without requiring the `x509-parser` feature.
+    let cert_der = pem::parse(ca_cert_pem).map_err(|_pem_err| GenerateError::InvalidCaCert)?;
+    let key_bytes = key_pair.public_key_raw();
+    if !cert_der.contents().windows(key_bytes.len()).any(|w| w == key_bytes) {
+        return Err(GenerateError::CaCertKeyMismatch);
+    }
+
+    let mut params = CertificateParams::default();
+    params.distinguished_name.push(DnType::CommonName, common_name);
+    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    params.key_usages.push(KeyUsagePurpose::KeyCertSign);
+    params.key_usages.push(KeyUsagePurpose::CrlSign);
+
+    Ok(CaCert {
+        cert_pem: ca_cert_pem.to_owned(),
+        key_pem: ca_key_pem.to_owned(),
+        params,
+        key_pair,
     })
 }
 
@@ -271,5 +334,30 @@ mod tests {
         let site = generate_site_cert(&ca, "cluster-a").unwrap_or_else(|_| std::process::abort());
         assert_ne!(ca.cert_pem, site.cert_pem, "CA and site certs should differ");
         assert_ne!(ca.key_pem, site.key_pem, "CA and site keys should differ");
+    }
+
+    #[test]
+    fn load_ca_with_matching_pair_succeeds() {
+        let ca = generate_ca("Test CA").unwrap_or_else(|_| std::process::abort());
+        let loaded = load_ca("Test CA", &ca.key_pem, &ca.cert_pem);
+        assert!(loaded.is_ok(), "load_ca must succeed when cert and key match");
+    }
+
+    #[test]
+    fn load_ca_with_malformed_key_pem_fails() {
+        let ca = generate_ca("Test CA").unwrap_or_else(|_| std::process::abort());
+        let result = load_ca("Test CA", "not a valid pem key", &ca.cert_pem);
+        assert!(result.is_err(), "load_ca must fail when key PEM is malformed");
+    }
+
+    #[test]
+    fn load_ca_with_mismatched_cert_and_key_fails() {
+        let ca_a = generate_ca("CA-A").unwrap_or_else(|_| std::process::abort());
+        let ca_b = generate_ca("CA-B").unwrap_or_else(|_| std::process::abort());
+        let result = load_ca("CA-A", &ca_b.key_pem, &ca_a.cert_pem);
+        assert!(
+            matches!(result, Err(GenerateError::CaCertKeyMismatch)),
+            "load_ca must return CaCertKeyMismatch when cert and key are from different CA pairs"
+        );
     }
 }

@@ -315,6 +315,7 @@ pub(crate) fn deploy_consumer(
         filtered_overlay.as_ref().or(overlay.as_ref()),
     )?;
     apply_consumer_deployment(&consumer_ctx)?;
+    rollout_restart(&consumer_ctx, "praxis-consumer")?;
 
     wait_for_rollout(&consumer_ctx, "praxis-consumer", consumer_site)?;
 
@@ -570,13 +571,16 @@ fn apply_consumer_config(
 
 /// Build the consumer Praxis config YAML.
 ///
-/// When `overlay` is `Some`, `grid_route.local_site` and candidates are taken
-/// from the overlay; the `load_balancer` section is still generated from
-/// `providers` so that mTLS endpoint config is preserved.
+/// When `overlay` is `Some`, candidates are taken from the overlay;
+/// the `load_balancer` section is still generated from `providers` so that
+/// mTLS endpoint config is preserved.
 ///
 /// When `overlay` is `None`, generates a static `grid_route` stanza from
-/// `consumer_site` (used as `local_site`) and `providers` (one candidate per
-/// model per site).
+/// `providers` (one candidate per model per site).
+///
+/// `grid_route.local_site` is always `consumer_site` — the consumer's own
+/// cluster identity.  The overlay's `local_site` field identifies the
+/// `GridNetwork`, not the consumer site, and must not be used here.
 ///
 /// A `load_balancer` section provides mTLS cluster definitions for each
 /// provider.  A catch-all `router` route falls through to the first provider
@@ -590,11 +594,12 @@ fn consumer_gateway_config(
     providers: &[ProviderEndpoint],
     overlay: Option<&RoutingOverlay>,
 ) -> String {
-    let (candidates, local_site) = if let Some(o) = overlay {
-        (operator_overlay::candidates_yaml(o), o.local_site.as_str())
+    let candidates = if let Some(o) = overlay {
+        operator_overlay::candidates_yaml(o)
     } else {
-        (build_grid_route_candidates(providers), consumer_site)
+        build_grid_route_candidates(providers)
     };
+    let local_site = consumer_site;
     let clusters = build_clusters(providers);
     let fallback = providers
         .first()
@@ -907,6 +912,43 @@ fn apply_manifest(context: &str, yaml: &str) -> Result<(), Box<dyn std::error::E
     Ok(())
 }
 
+/// Build the `kubectl rollout restart` argument list.
+///
+/// Separated from [`rollout_restart`] so tests can verify the argument
+/// structure without spawning a process.
+fn rollout_restart_args(context: &str, deployment: &str) -> Vec<String> {
+    vec![
+        "--context".to_owned(),
+        context.to_owned(),
+        "-n".to_owned(),
+        NAMESPACE.to_owned(),
+        "rollout".to_owned(),
+        "restart".to_owned(),
+        format!("deployment/{deployment}"),
+    ]
+}
+
+/// Trigger a `rollout restart` so the `Deployment` picks up `ConfigMap` changes.
+///
+/// `kubectl apply` updates a `ConfigMap` but does not restart the pod.  Calling
+/// this after applying the consumer config ensures the pod reloads with the
+/// new configuration before [`wait_for_rollout`] declares it ready.
+///
+/// **xtask validation concern only.**  In production, Praxis detects
+/// `ConfigMap` mount changes via a file-watch and reloads without a pod
+/// restart.  The forced restart here is needed only because the file-watch
+/// propagation window is indeterminate during xtask E2E validation — without
+/// it, the verify step can race against a Praxis reload that hasn't finished.
+fn rollout_restart(context: &str, deployment: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let status = Command::new("kubectl")
+        .args(rollout_restart_args(context, deployment))
+        .status()?;
+    if !status.success() {
+        return Err(format!("kubectl rollout restart {deployment} failed: {status}").into());
+    }
+    Ok(())
+}
+
 /// Wait for a Deployment rollout to complete.
 fn wait_for_rollout(context: &str, deployment: &str, cluster: &str) -> Result<(), Box<dyn std::error::Error>> {
     let timeout = format!("{ROLLOUT_TIMEOUT_SECS}s");
@@ -1095,19 +1137,23 @@ mod tests {
     }
 
     #[test]
-    fn overlay_mode_uses_overlay_local_site() {
+    fn overlay_mode_uses_consumer_site_as_local_site() {
         let providers = vec![make_provider("site-a", &["model"])];
         let overlay = parse_overlay(
             r#"{
                 "network": "test-network",
-                "local_site": "my-consumer",
+                "local_site": "network-name",
                 "candidates": [{"kind":"inference_model","name":"model","site":"site-a","cluster":"prov-a","fresh":true}]
             }"#,
         );
         let config = consumer_gateway_config("consumer", &providers, Some(&overlay));
         assert!(
-            config.contains("local_site: my-consumer"),
-            "overlay mode must use overlay.local_site, not the consumer_site arg"
+            config.contains("local_site: consumer"),
+            "overlay mode must use consumer_site, not overlay.local_site (which is a GridNetwork name)"
+        );
+        assert!(
+            !config.contains("local_site: network-name"),
+            "GridNetwork name must not appear as grid_route local_site"
         );
     }
 
@@ -1219,6 +1265,36 @@ mod tests {
         assert!(
             overlay_config.contains("filter: grid_route"),
             "overlay mode must include grid_route"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // rollout_restart_args
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn rollout_restart_args_correct_structure() {
+        let args = rollout_restart_args("kind-grid-consumer", "praxis-consumer");
+        assert_eq!(
+            args.first().map(String::as_str),
+            Some("--context"),
+            "--context must be first arg"
+        );
+        assert!(
+            args.contains(&"kind-grid-consumer".to_owned()),
+            "context name must appear in args"
+        );
+        assert!(
+            args.contains(&"rollout".to_owned()),
+            "rollout subcommand must be present"
+        );
+        assert!(
+            args.contains(&"restart".to_owned()),
+            "restart subcommand must be present"
+        );
+        assert!(
+            args.contains(&"deployment/praxis-consumer".to_owned()),
+            "resource must use deployment/ prefix"
         );
     }
 }

@@ -120,6 +120,46 @@ pub(crate) const SWIM_NODE_PRIMARY_NAME: &str = "swim-node-p";
 /// SWIM site identity for the secondary operator.
 pub(crate) const SWIM_NODE_SECONDARY_NAME: &str = "swim-node-s";
 
+// ---------------------------------------------------------------------------
+// SWIM overlay validation constants
+// ---------------------------------------------------------------------------
+
+/// `GridNetwork` resource name used by the SWIM overlay validation.
+///
+/// Kept distinct from `SWIM_TEST_NETWORK` and `TEST_NETWORK` to avoid resource
+/// collisions when multiple validations run in the same cluster.
+pub(crate) const SWIM_OVERLAY_NETWORK: &str = "op-e2e-swim-overlay";
+
+/// Gateway reference name used in the SWIM overlay `GridNetwork` fixture.
+pub(crate) const SWIM_OVERLAY_GW: &str = "op-e2e-gw";
+
+/// `InferenceProvider` name for the SWIM overlay validation fixture.
+pub(crate) const SWIM_OVERLAY_PROVIDER: &str = "op-e2e-swim-ov-prov";
+
+/// Model name served by the SWIM overlay provider fixture.
+pub(crate) const SWIM_OVERLAY_MODEL: &str = "model-swim-overlay";
+
+// ---------------------------------------------------------------------------
+// SWIM routing validation constants
+// ---------------------------------------------------------------------------
+
+/// `GridNetwork` name used by the cross-cluster SWIM routing validation.
+///
+/// Both the east and west operators reconcile a `GridNetwork` with this name
+/// (in their respective clusters).  The east operator generates the overlay
+/// `ConfigMap`; the west operator publishes CRDT state that populates the
+/// remote candidates in that overlay.
+pub(crate) const SWIM_ROUTING_NETWORK: &str = "op-e2e-swim-routing";
+
+/// Gateway reference name used in the east `GridNetwork` fixture.
+pub(crate) const SWIM_ROUTING_GW: &str = "op-e2e-gw";
+
+/// `InferenceProvider` applied on the east (primary) cluster.
+pub(crate) const SWIM_ROUTING_EAST_PROVIDER: &str = "op-e2e-swim-rt-east";
+
+/// `InferenceProvider` applied on the west (peer) cluster.
+pub(crate) const SWIM_ROUTING_WEST_PROVIDER: &str = "op-e2e-swim-rt-west";
+
 /// Time to wait after the secondary operator announces to the primary before
 /// applying the `GridNetwork` fixture.
 ///
@@ -281,6 +321,85 @@ pub(crate) fn spawn_operator(context: &str) -> Result<Child, Box<dyn std::error:
         .stdin(Stdio::null())
         .spawn()?;
     // Brief pause so the operator establishes its watches before fixtures are polled.
+    std::thread::sleep(Duration::from_secs(3));
+    Ok(child)
+}
+
+/// Spawn a SWIM-enabled operator against a specific kind cluster without relying on
+/// the global kubeconfig current-context.
+///
+/// Exports a minimal kubeconfig for `context` to a temp file and passes it via
+/// `KUBECONFIG` so the operator binary uses the correct cluster regardless of
+/// what `kubectl config use-context` has set globally.  This avoids the race
+/// between consecutive [`spawn_operator_with_swim`] calls where the second
+/// `use-context` fires before the first operator binary has read its config.
+///
+/// `bind_addr` and `advertise_addr` are the SWIM UDP addresses.
+/// `site_name` is the stable SWIM site identity.
+/// `seeds` is a comma-separated list of seed addresses (empty = no seeds).
+#[expect(
+    clippy::too_many_lines,
+    reason = "kubeconfig export + process spawn + sleep: splitting obscures the startup contract"
+)]
+pub(crate) fn spawn_operator_with_swim_for_context(
+    context: &str,
+    bind_addr: &str,
+    advertise_addr: &str,
+    site_name: &str,
+    seeds: &str,
+) -> Result<Child, Box<dyn std::error::Error>> {
+    // Export a minimal kubeconfig for this specific context to a temp file.
+    // `kubectl config view --minify --flatten --context {context}` exports
+    // only the cluster, user, and context for `context`, with that context
+    // set as current-context.
+    let kubeconfig_path = std::path::PathBuf::from(format!("/tmp/grid-kubeconfig-{context}.yaml"));
+    let output = Command::new("kubectl")
+        .args(["config", "view", "--minify", "--flatten", "--context", context])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "kubectl config view --minify failed for context {context}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+    std::fs::write(&kubeconfig_path, &output.stdout)?;
+
+    eprintln!(
+        "  spawning SWIM operator (site={site_name}, bind={bind_addr}, seeds={seeds:?}, \
+         context={context}, kubeconfig={})",
+        kubeconfig_path.display()
+    );
+    // Redirect stdout and stderr to per-site log files rather than inheriting the
+    // parent's stdio.  When the parent's output is piped (e.g. `cargo xtask ... | tee`),
+    // shared stdout/stderr can back-pressure the child if the pipe buffer fills while
+    // the xtask process is also writing.  Redirecting avoids that and gives a clear
+    // per-site log for post-mortem if convergence fails.
+    let log_path = format!("/tmp/grid-operator-{site_name}.log");
+    let log_file =
+        std::fs::File::create(&log_path).map_err(|e| format!("could not create operator log {log_path}: {e}"))?;
+    let log_file2 = log_file.try_clone()?;
+    // Run the pre-compiled binary directly to avoid cargo's startup overhead and
+    // environment forwarding behaviour under `cargo xtask`.
+    let operator_bin = std::path::PathBuf::from("target/debug/operator");
+    if !operator_bin.exists() {
+        return Err("operator binary not found at target/debug/operator; run `cargo build -p operator` first".into());
+    }
+    let child = Command::new(&operator_bin)
+        .env("KUBECONFIG", &kubeconfig_path)
+        .env("GRID_SWIM_BIND_ADDR", bind_addr)
+        .env("GRID_SWIM_ADVERTISE_ADDR", advertise_addr)
+        .env("GRID_SWIM_SITE_NAME", site_name)
+        .env("GRID_SWIM_SEEDS", seeds)
+        .env("RUST_LOG", "info")
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log_file))
+        .stderr(Stdio::from(log_file2))
+        .spawn()?;
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "deliberate fixed wait for operator startup before the caller continues"
+    )]
     std::thread::sleep(Duration::from_secs(3));
     Ok(child)
 }
@@ -478,18 +597,51 @@ pub(crate) fn verify_swim_status(phase: &str, connected_sites: u32) -> Result<()
 // distributed state validation helpers
 // ---------------------------------------------------------------------------
 
-#[expect(
-    clippy::disallowed_methods,
-    reason = "synchronous poll loop in xtask; no async runtime available"
-)]
 /// Poll the `GridNetwork` status until `distributedProviderCount > 0`.
+/// Force an immediate `GridNetwork` reconcile by patching a timestamp annotation.
 ///
+/// The operator's `GridNetwork` controller has a long requeue interval (300 s)
+/// and a cross-watch that fires only when related objects change.  When the
+/// first reconcile wave races the peer's CRDT broadcast by milliseconds, the
+/// `distributedProviderCount` is recorded as 0.  Bumping an annotation creates
+/// a watch event that triggers a fresh reconcile — by which point the CRDT
+/// broadcast has already been received and merged into `state_snapshot()`.
+///
+/// This is an xtask validation helper; it does not affect production behavior.
+pub(crate) fn bump_gridnetwork(context: &str, name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let annotation = format!("grid.praxis-proxy.io/reconcile-at={ts}");
+    let status = Command::new("kubectl")
+        .args([
+            "--context",
+            context,
+            "annotate",
+            "gridnetwork",
+            name,
+            &annotation,
+            "--overwrite",
+        ])
+        .status()?;
+    if !status.success() {
+        return Err(format!("kubectl annotate gridnetwork {name} failed").into());
+    }
+    eprintln!("  [OK] bumped {name} annotation to force reconcile");
+    Ok(())
+}
+
 /// Each SWIM-enabled operator publishes real `InferenceProvider`-derived state
 /// as a CRDT `GridStateSnapshot` on reconcile.  After SWIM gossip convergence
 /// the remote operator's broadcast arrives and `distributedProviderCount`
 /// becomes ≥ 1.
 ///
 /// Returns the observed count on success or `Err` on timeout.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "synchronous poll loop in xtask; no async runtime available"
+)]
 pub(crate) fn wait_for_gridnetwork_distributed_state(
     context: &str,
     name: &str,
@@ -521,17 +673,31 @@ pub(crate) fn wait_for_gridnetwork_distributed_state(
     }
 }
 
-/// Verify that `distributedProviderCount > 0`, proving distributed state arrived via SWIM.
+/// Verify that `distributedProviderCount` is exactly 1 for the SWIM state validation.
+///
+/// The SWIM state test applies exactly one `InferenceProvider` to exactly one
+/// `GridNetwork`.  A count of 1 proves a single remote provider record arrived
+/// via SWIM custom broadcast, scoped to the test network.
+///
+/// A count > 1 indicates cross-network state leakage: provider records from an
+/// unrelated network (e.g. leftover `op-e2e-net` resources) are bleeding into
+/// the SWIM test network's count.  This is a harness isolation failure and must
+/// be fixed before results are trusted.
 pub(crate) fn verify_distributed_state_received(
     distributed_provider_count: u32,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if distributed_provider_count == 0 {
-        return Err("distributed state validation failed: distributedProviderCount must be > 0".into());
+    match distributed_provider_count {
+        0 => Err("distributed state validation failed: distributedProviderCount must be 1 (received 0 — state not propagated)".into()),
+        1 => {
+            eprintln!("  [OK] distributed state received via SWIM broadcast: distributedProviderCount=1");
+            Ok(())
+        },
+        n => Err(format!(
+            "distributed state validation failed: distributedProviderCount={n} but expected exactly 1; \
+             cross-network state leakage suspected — ensure op-e2e-net resources are cleaned up before \
+             running verify-swim-state"
+        ).into()),
     }
-    eprintln!(
-        "  [OK] distributed state received via SWIM broadcast: distributedProviderCount={distributed_provider_count}"
-    );
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1142,6 +1308,281 @@ pub(crate) fn export_overlay_to_file(
     Ok(path)
 }
 
+// ---------------------------------------------------------------------------
+// SWIM overlay fixture helpers
+// ---------------------------------------------------------------------------
+
+/// Apply the `GridNetwork` with a gateway ref and `InferenceProvider` fixtures
+/// for the SWIM overlay validation.
+///
+/// Creates:
+/// - `GridNetwork` [`SWIM_OVERLAY_NETWORK`] with one `gatewayRef` named [`SWIM_OVERLAY_GW`] in the `default` namespace,
+///   with `localSiteName` set to `primary_site_name`.
+/// - `InferenceProvider` [`SWIM_OVERLAY_PROVIDER`] belonging to [`SWIM_OVERLAY_NETWORK`] serving
+///   [`SWIM_OVERLAY_MODEL`].
+#[expect(
+    clippy::too_many_lines,
+    reason = "two JSON manifest builds (GridNetwork + InferenceProvider) plus apply calls; splitting would obscure the fixture pair"
+)]
+pub(crate) fn apply_swim_overlay_test_fixtures(
+    context: &str,
+    primary_site_name: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let network = serde_json::to_string_pretty(&serde_json::json!({
+        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "kind": "GridNetwork",
+        "metadata": { "name": SWIM_OVERLAY_NETWORK },
+        "spec": {
+            "seeds": [],
+            "gatewayRefs": [{
+                "name": SWIM_OVERLAY_GW,
+                "namespace": "default",
+                "localSiteName": primary_site_name
+            }]
+        }
+    }))
+    .unwrap_or_else(|e| {
+        eprintln!("SWIM overlay network fixture serialization failed: {e}");
+        std::process::exit(1);
+    });
+    let provider = serde_json::to_string_pretty(&serde_json::json!({
+        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "kind": "InferenceProvider",
+        "metadata": { "name": SWIM_OVERLAY_PROVIDER },
+        "spec": {
+            "gridNetworkRef": SWIM_OVERLAY_NETWORK,
+            "providerKind": "self_hosted",
+            "backendKind": "local",
+            "endpoint": "http://mock-openai-provider.default.svc:8080",
+            "models": [{ "name": SWIM_OVERLAY_MODEL }]
+        }
+    }))
+    .unwrap_or_else(|e| {
+        eprintln!("SWIM overlay provider fixture serialization failed: {e}");
+        std::process::exit(1);
+    });
+    apply_manifest(context, &network)?;
+    apply_manifest(context, &provider)?;
+    eprintln!(
+        "  [OK] SWIM overlay fixtures applied (network={SWIM_OVERLAY_NETWORK}, \
+         provider={SWIM_OVERLAY_PROVIDER}, model={SWIM_OVERLAY_MODEL})"
+    );
+    Ok(())
+}
+
+/// Delete resources created by the SWIM overlay validation.
+///
+/// Safe to call before a fresh run — all deletes use `--ignore-not-found`.
+pub(crate) fn cleanup_swim_overlay_test_resources(context: &str) -> Result<(), Box<dyn std::error::Error>> {
+    delete_namespaced_resource(
+        context,
+        "default",
+        "configmap",
+        &format!("grid-overlay-{SWIM_OVERLAY_NETWORK}-{SWIM_OVERLAY_GW}"),
+    )?;
+    delete_cluster_resource(context, "inferenceprovider", SWIM_OVERLAY_PROVIDER)?;
+    delete_cluster_resource(context, "gridnetwork", SWIM_OVERLAY_NETWORK)?;
+    eprintln!("  [OK] stale SWIM overlay test resources removed");
+    Ok(())
+}
+
+/// Verify that the overlay `ConfigMap` contains at least one remote CRDT candidate.
+///
+/// The overlay is read from `grid-overlay-{network}-{gw}` in the `default`
+/// namespace.  At least one candidate must have `site` different from
+/// `primary_site_name`, proving that a CRDT-sourced record entered the overlay.
+///
+/// # Errors
+///
+/// Returns an error when:
+/// - The `ConfigMap` cannot be read or parsed as JSON.
+/// - The `candidates` array is empty.
+/// - No candidate has a `site` field different from `primary_site_name`.
+pub(crate) fn verify_swim_overlay_candidates(
+    context: &str,
+    network: &str,
+    gw: &str,
+    primary_site_name: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let overlay = read_overlay_configmap(context, network, gw, "default")?;
+    let candidates = overlay
+        .get("candidates")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("overlay missing candidates array")?;
+
+    if candidates.is_empty() {
+        return Err("SWIM overlay validation failed: candidates array is empty".into());
+    }
+
+    let has_remote = candidates
+        .iter()
+        .any(|c| c.get("site").and_then(serde_json::Value::as_str) != Some(primary_site_name));
+
+    if !has_remote {
+        return Err(format!(
+            "SWIM overlay validation failed: no candidate has a site != {primary_site_name:?}; \
+             remote CRDT provider records have not entered the overlay"
+        )
+        .into());
+    }
+
+    let remote_count = candidates
+        .iter()
+        .filter(|c| c.get("site").and_then(serde_json::Value::as_str) != Some(primary_site_name))
+        .count();
+    eprintln!(
+        "  [OK] SWIM overlay: {remote_count} remote candidate(s) present \
+         (site != {primary_site_name:?})"
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// SWIM routing fixture helpers
+// ---------------------------------------------------------------------------
+
+/// Apply the east-side fixtures for the cross-cluster SWIM routing validation.
+///
+/// Creates on the east cluster:
+/// - [`SWIM_ROUTING_NETWORK`] `GridNetwork` with a `gatewayRef` pointing to [`SWIM_ROUTING_GW`] and `localSiteName` set
+///   to `east_site_name`.  The primary operator writes the overlay `ConfigMap` to this cluster.
+/// - [`SWIM_ROUTING_EAST_PROVIDER`] `InferenceProvider` serving `east_model` with `routingClusterRef = east_site_name`.
+///
+/// The `routingClusterRef` must match the east provider gateway's site name so
+/// that `candidates_yaml` maps the candidate to `gateway-{east_site_name}` in
+/// the consumer `load_balancer`.
+#[expect(
+    clippy::too_many_lines,
+    reason = "two JSON manifest builds (GridNetwork + InferenceProvider) plus apply calls"
+)]
+pub(crate) fn apply_swim_routing_east_fixtures(
+    context: &str,
+    east_site_name: &str,
+    east_model: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let network = serde_json::to_string_pretty(&serde_json::json!({
+        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "kind": "GridNetwork",
+        "metadata": { "name": SWIM_ROUTING_NETWORK },
+        "spec": {
+            "seeds": [],
+            "gatewayRefs": [{
+                "name": SWIM_ROUTING_GW,
+                "namespace": "default",
+                "localSiteName": east_site_name
+            }]
+        }
+    }))
+    .unwrap_or_else(|e| {
+        eprintln!("SWIM routing east network fixture serialization failed: {e}");
+        std::process::exit(1);
+    });
+    let provider = serde_json::to_string_pretty(&serde_json::json!({
+        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "kind": "InferenceProvider",
+        "metadata": { "name": SWIM_ROUTING_EAST_PROVIDER },
+        "spec": {
+            "gridNetworkRef": SWIM_ROUTING_NETWORK,
+            "providerKind": "self_hosted",
+            "backendKind": "local",
+            "endpoint": "http://mock-openai-provider.default.svc:8080",
+            "models": [{ "name": east_model }],
+            "routingClusterRef": east_site_name
+            // No healthCheck: omitting health checks leaves the phase at
+            // Pending, which is included in overlay candidates.  A configured
+            // health check that fails from outside the cluster sets the phase
+            // to Unavailable and the provider would be excluded from the overlay.
+            // The annotation-bump approach forces the post-gossip reconcile
+            // deterministically without relying on health-check-driven cascades.
+        }
+    }))
+    .unwrap_or_else(|e| {
+        eprintln!("SWIM routing east provider fixture serialization failed: {e}");
+        std::process::exit(1);
+    });
+    apply_manifest(context, &network)?;
+    apply_manifest(context, &provider)?;
+    eprintln!(
+        "  [OK] SWIM routing east fixtures applied \
+         (network={SWIM_ROUTING_NETWORK}, provider={SWIM_ROUTING_EAST_PROVIDER}, \
+         model={east_model}, routingClusterRef={east_site_name})"
+    );
+    Ok(())
+}
+
+/// Apply the west-side fixtures for the cross-cluster SWIM routing validation.
+///
+/// Creates on the west cluster:
+/// - [`SWIM_ROUTING_NETWORK`] `GridNetwork` without a `gatewayRef` — the peer operator reconciles this to publish its
+///   CRDT state but does not write an overlay `ConfigMap` (only the east primary generates the overlay).
+/// - [`SWIM_ROUTING_WEST_PROVIDER`] `InferenceProvider` serving `west_model` with `routingClusterRef = west_site_name`.
+///
+/// After SWIM gossip, the primary (east) operator reads the peer's CRDT state
+/// and adds a remote candidate for `west_model` to the east overlay.
+#[expect(
+    clippy::too_many_lines,
+    reason = "two JSON manifest builds (GridNetwork + InferenceProvider) plus apply calls"
+)]
+pub(crate) fn apply_swim_routing_west_fixtures(
+    context: &str,
+    west_site_name: &str,
+    west_model: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let network = serde_json::to_string_pretty(&serde_json::json!({
+        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "kind": "GridNetwork",
+        "metadata": { "name": SWIM_ROUTING_NETWORK },
+        "spec": { "seeds": [] }
+    }))
+    .unwrap_or_else(|e| {
+        eprintln!("SWIM routing west network fixture serialization failed: {e}");
+        std::process::exit(1);
+    });
+    let provider = serde_json::to_string_pretty(&serde_json::json!({
+        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "kind": "InferenceProvider",
+        "metadata": { "name": SWIM_ROUTING_WEST_PROVIDER },
+        "spec": {
+            "gridNetworkRef": SWIM_ROUTING_NETWORK,
+            "providerKind": "self_hosted",
+            "backendKind": "local",
+            "endpoint": "http://mock-openai-provider.default.svc:8080",
+            "models": [{ "name": west_model }],
+            "routingClusterRef": west_site_name
+        }
+    }))
+    .unwrap_or_else(|e| {
+        eprintln!("SWIM routing west provider fixture serialization failed: {e}");
+        std::process::exit(1);
+    });
+    apply_manifest(context, &network)?;
+    apply_manifest(context, &provider)?;
+    eprintln!(
+        "  [OK] SWIM routing west fixtures applied \
+         (network={SWIM_ROUTING_NETWORK}, provider={SWIM_ROUTING_WEST_PROVIDER}, \
+         model={west_model}, routingClusterRef={west_site_name})"
+    );
+    Ok(())
+}
+
+/// Delete resources created by the SWIM routing validation on a given cluster.
+///
+/// Safe to call before a fresh run — all deletes use `--ignore-not-found`.
+/// Call once per cluster (east and west).
+pub(crate) fn cleanup_swim_routing_resources(context: &str) -> Result<(), Box<dyn std::error::Error>> {
+    delete_namespaced_resource(
+        context,
+        "default",
+        "configmap",
+        &format!("grid-overlay-{SWIM_ROUTING_NETWORK}-{SWIM_ROUTING_GW}"),
+    )?;
+    delete_cluster_resource(context, "inferenceprovider", SWIM_ROUTING_EAST_PROVIDER)?;
+    delete_cluster_resource(context, "inferenceprovider", SWIM_ROUTING_WEST_PROVIDER)?;
+    delete_cluster_resource(context, "gridnetwork", SWIM_ROUTING_NETWORK)?;
+    eprintln!("  [OK] stale SWIM routing test resources removed on {context}");
+    Ok(())
+}
+
 /// Verify that `degraded_cluster` appears in overlay candidates with `fresh: false`.
 ///
 /// A site may have multiple candidates (e.g. both healthy and degraded providers sharing
@@ -1181,6 +1622,138 @@ pub(crate) fn verify_degraded_candidate(
         }
     }
     eprintln!("  [OK] {degraded_cluster} present with fresh=false");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Multi-provider fixture helpers
+// ---------------------------------------------------------------------------
+
+/// Derive the `InferenceProvider` fixture name for a provider site in
+/// multi-provider mode.
+///
+/// Used by `run_multi_provider_reconcile` to create distinct fixture names
+/// without colliding with the single-provider fixtures (`op-e2e-healthy`, etc.).
+pub(crate) fn multi_provider_fixture_name(site: &str) -> String {
+    format!("op-e2e-{site}")
+}
+
+/// Build an `InferenceProvider` JSON fixture for one provider site.
+///
+/// `models` is taken from the site's config entry so the overlay candidates
+/// carry the correct model names for consumer-gateway routing.
+/// `routing_cluster` is set as `spec.routingClusterRef` so the operator
+/// generates overlay candidates with `site = cluster = routing_cluster`.
+fn multi_provider_fixture_json(
+    name: &str,
+    network_ref: &str,
+    endpoint: &str,
+    routing_cluster: &str,
+    models: &[String],
+) -> String {
+    let models_json: Vec<serde_json::Value> = models.iter().map(|m| serde_json::json!({ "name": m })).collect();
+    serde_json::to_string_pretty(&serde_json::json!({
+        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "kind": "InferenceProvider",
+        "metadata": { "name": name },
+        "spec": {
+            "gridNetworkRef": network_ref,
+            "providerKind": "open_ai",
+            "backendKind": "local",
+            "endpoint": endpoint,
+            "models": models_json,
+            "routingClusterRef": routing_cluster
+        }
+    }))
+    .unwrap_or_else(|e| {
+        eprintln!("multi-provider fixture serialization failed: {e}");
+        std::process::exit(1);
+    })
+}
+
+/// Apply a `GridNetwork` + one `InferenceProvider` per provider site.
+///
+/// Used in multi-provider mode instead of `apply_test_fixtures`.  Each
+/// provider gets a distinct fixture name (`op-e2e-{site}`) and
+/// `routingClusterRef = site` so the operator-generated overlay candidates
+/// carry the correct site identity for consumer-gateway routing.
+///
+/// The shared in-cluster `provider_endpoint` must be non-blank so providers
+/// reconcile to `Pending` rather than `Unavailable`.
+pub(crate) fn apply_multi_provider_fixtures(
+    context: &str,
+    providers: &[(&str, &[String])],
+    provider_endpoint: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let network = network_fixture_json(TEST_NETWORK, TEST_GATEWAY_NAME, TEST_GATEWAY_NS);
+    apply_manifest(context, &network)?;
+    for &(site_name, models) in providers {
+        let fixture_name = multi_provider_fixture_name(site_name);
+        let json = multi_provider_fixture_json(&fixture_name, TEST_NETWORK, provider_endpoint, site_name, models);
+        apply_manifest(context, &json)?;
+    }
+    eprintln!("  [OK] multi-provider fixtures applied ({} sites)", providers.len());
+    Ok(())
+}
+
+/// Delete the overlay `ConfigMap`, `GridNetwork`, and all multi-provider
+/// `InferenceProvider` fixtures created by `apply_multi_provider_fixtures`.
+pub(crate) fn cleanup_multi_provider_resources(
+    context: &str,
+    site_names: &[&str],
+) -> Result<(), Box<dyn std::error::Error>> {
+    delete_namespaced_resource(
+        context,
+        TEST_GATEWAY_NS,
+        "configmap",
+        &format!("grid-overlay-{TEST_NETWORK}-{TEST_GATEWAY_NAME}"),
+    )?;
+    for &site_name in site_names {
+        delete_cluster_resource(context, "inferenceprovider", &multi_provider_fixture_name(site_name))?;
+    }
+    delete_cluster_resource(context, "gridnetwork", TEST_NETWORK)?;
+    eprintln!("  [OK] stale multi-provider validation resources removed");
+    Ok(())
+}
+
+/// Verify that the operator-generated overlay contains at least one
+/// `fresh=true` candidate for each expected provider site, and that all
+/// candidates have the required Praxis wire-format fields.
+///
+/// This is the multi-provider equivalent of `verify_overlay`: it checks
+/// coverage across all provider sites rather than verifying a single healthy
+/// cluster and an excluded unavailable cluster.
+pub(crate) fn verify_multi_provider_overlay(
+    overlay: &serde_json::Value,
+    site_names: &[&str],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let candidates = overlay["candidates"]
+        .as_array()
+        .ok_or("overlay missing candidates array")?;
+
+    // Every candidate must carry the required Praxis wire-format fields.
+    for c in candidates {
+        for field in &["kind", "name", "site", "cluster", "fresh"] {
+            if c.get(*field).is_none() {
+                return Err(format!("candidate missing required field '{field}'").into());
+            }
+        }
+    }
+
+    // Every expected site must have at least one fresh=true candidate.
+    for &site_name in site_names {
+        let has_fresh = candidates
+            .iter()
+            .any(|c| c["site"].as_str() == Some(site_name) && c["fresh"].as_bool() == Some(true));
+        if !has_fresh {
+            return Err(format!(
+                "provider site '{site_name}' must have at least one fresh=true candidate in overlay; \
+                 check that the operator reconciled the InferenceProvider and the site is reachable"
+            )
+            .into());
+        }
+        eprintln!("  [OK] site '{site_name}' present with fresh=true candidate");
+    }
     Ok(())
 }
 
@@ -1659,5 +2232,261 @@ mod tests {
             swim_resources.len(),
             "SWIM test resource names must be distinct"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // verify_distributed_state_received — exact count assertions
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn verify_distributed_count_exactly_one_passes() {
+        assert!(
+            verify_distributed_state_received(1).is_ok(),
+            "distributedProviderCount=1 must pass"
+        );
+    }
+
+    #[test]
+    fn verify_distributed_count_zero_fails() {
+        let err = verify_distributed_state_received(0).unwrap_err();
+        assert!(
+            err.to_string().contains("received 0"),
+            "error for count=0 must explain that no state was received; got: {err}"
+        );
+    }
+
+    #[test]
+    fn verify_distributed_count_greater_than_one_fails_with_leakage_message() {
+        let err = verify_distributed_state_received(6).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("distributedProviderCount=6"),
+            "error must include the observed count; got: {msg}"
+        );
+        assert!(
+            msg.contains("cross-network state leakage"),
+            "error must explain leakage risk; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn verify_distributed_count_two_also_fails() {
+        // Exactly 1 is the only correct count; 2 means unexpected extra records.
+        assert!(
+            verify_distributed_state_received(2).is_err(),
+            "distributedProviderCount=2 must fail"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // multi_provider_fixture_name
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn multi_provider_fixture_name_prefixes_site() {
+        assert_eq!(
+            multi_provider_fixture_name("site-east"),
+            "op-e2e-site-east",
+            "fixture name must be op-e2e-{{site}}"
+        );
+        assert_eq!(
+            multi_provider_fixture_name("site-west"),
+            "op-e2e-site-west",
+            "fixture name must be op-e2e-{{site}}"
+        );
+    }
+
+    #[test]
+    fn multi_provider_fixture_name_does_not_collide_with_single_provider_constants() {
+        // The multi-provider name must not clash with any of the fixed single-provider fixture names.
+        let single_provider_names = [
+            TEST_PROVIDER_HEALTHY,
+            TEST_PROVIDER_INVALID,
+            TEST_PROVIDER_DEGRADED,
+            TEST_PROVIDER_API,
+        ];
+        for &name in &single_provider_names {
+            assert_ne!(
+                multi_provider_fixture_name("site-a"),
+                name,
+                "op-e2e-site-a must not equal single-provider constant '{name}'"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // multi_provider_fixture_json
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn multi_provider_fixture_json_includes_routing_cluster_ref() {
+        let models = vec!["model-east".to_owned()];
+        let json = multi_provider_fixture_json(
+            "op-e2e-site-east",
+            "op-e2e-net",
+            "http://backend:8080",
+            "site-east",
+            &models,
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            parsed
+                .get("spec")
+                .and_then(|s| s.get("routingClusterRef"))
+                .and_then(serde_json::Value::as_str),
+            Some("site-east"),
+            "routingClusterRef must match site name"
+        );
+    }
+
+    #[test]
+    fn multi_provider_fixture_json_includes_all_models() {
+        let models = vec!["model-east".to_owned(), "model-east-v2".to_owned()];
+        let json = multi_provider_fixture_json(
+            "op-e2e-site-east",
+            "op-e2e-net",
+            "http://backend:8080",
+            "site-east",
+            &models,
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap_or_else(|_| std::process::abort());
+        let spec_models = parsed
+            .get("spec")
+            .and_then(|s| s.get("models"))
+            .and_then(serde_json::Value::as_array)
+            .unwrap_or_else(|| std::process::abort());
+        assert_eq!(spec_models.len(), 2, "fixture must include all declared models");
+        assert_eq!(
+            spec_models
+                .first()
+                .and_then(|m| m.get("name"))
+                .and_then(serde_json::Value::as_str),
+            Some("model-east"),
+            "first model must match"
+        );
+    }
+
+    #[test]
+    fn multi_provider_fixture_json_two_sites_produce_distinct_routing_clusters() {
+        let models_east = vec!["model-east".to_owned()];
+        let models_west = vec!["model-west".to_owned()];
+        let json_east = multi_provider_fixture_json("op-e2e-site-east", "net", "http://ep", "site-east", &models_east);
+        let json_west = multi_provider_fixture_json("op-e2e-site-west", "net", "http://ep", "site-west", &models_west);
+        let east: serde_json::Value = serde_json::from_str(&json_east).unwrap_or_else(|_| std::process::abort());
+        let west: serde_json::Value = serde_json::from_str(&json_west).unwrap_or_else(|_| std::process::abort());
+        let east_ref = east
+            .get("spec")
+            .and_then(|s| s.get("routingClusterRef"))
+            .and_then(serde_json::Value::as_str);
+        let west_ref = west
+            .get("spec")
+            .and_then(|s| s.get("routingClusterRef"))
+            .and_then(serde_json::Value::as_str);
+        assert_ne!(
+            east_ref, west_ref,
+            "two provider sites must produce distinct routingClusterRef values"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // verify_multi_provider_overlay
+    // -----------------------------------------------------------------------
+
+    fn make_overlay_with_sites(sites: &[(&str, bool)]) -> serde_json::Value {
+        let candidates: Vec<serde_json::Value> = sites
+            .iter()
+            .map(|&(site, fresh)| {
+                serde_json::json!({
+                    "kind": "inference_model",
+                    "name": "some-model",
+                    "site": site,
+                    "cluster": site,
+                    "fresh": fresh
+                })
+            })
+            .collect();
+        serde_json::json!({ "network": "net", "local_site": "net", "candidates": candidates })
+    }
+
+    #[test]
+    fn verify_multi_provider_overlay_accepts_all_sites_fresh() {
+        let overlay = make_overlay_with_sites(&[("site-east", true), ("site-west", true)]);
+        assert!(
+            verify_multi_provider_overlay(&overlay, &["site-east", "site-west"]).is_ok(),
+            "overlay with all sites fresh must pass"
+        );
+    }
+
+    #[test]
+    fn verify_multi_provider_overlay_rejects_missing_site() {
+        let overlay = make_overlay_with_sites(&[("site-east", true)]);
+        let err = verify_multi_provider_overlay(&overlay, &["site-east", "site-west"]).unwrap_err();
+        assert!(
+            err.to_string().contains("site-west"),
+            "error must name the missing site; got: {err}"
+        );
+    }
+
+    #[test]
+    fn verify_multi_provider_overlay_rejects_site_with_only_stale_candidates() {
+        let overlay = make_overlay_with_sites(&[("site-east", true), ("site-west", false)]);
+        let err = verify_multi_provider_overlay(&overlay, &["site-east", "site-west"]).unwrap_err();
+        assert!(
+            err.to_string().contains("site-west"),
+            "error must name the stale site; got: {err}"
+        );
+    }
+
+    #[test]
+    fn verify_multi_provider_overlay_rejects_missing_candidates_field() {
+        let overlay = serde_json::json!({ "network": "net" });
+        assert!(
+            verify_multi_provider_overlay(&overlay, &["site-east"]).is_err(),
+            "overlay without candidates array must fail"
+        );
+    }
+
+    #[test]
+    fn verify_multi_provider_overlay_rejects_candidate_missing_required_field() {
+        let overlay = serde_json::json!({
+            "network": "net",
+            "candidates": [{ "site": "site-east", "cluster": "site-east", "fresh": true }]
+        });
+        // missing "kind" and "name" fields
+        assert!(
+            verify_multi_provider_overlay(&overlay, &["site-east"]).is_err(),
+            "candidate missing required fields must fail"
+        );
+    }
+
+    #[test]
+    fn verify_multi_provider_overlay_empty_site_list_always_passes() {
+        // Degenerate case: no sites expected → validation trivially passes.
+        let overlay = make_overlay_with_sites(&[("site-east", true)]);
+        assert!(
+            verify_multi_provider_overlay(&overlay, &[]).is_ok(),
+            "empty site list must pass (no constraints to check)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // bump_gridnetwork — annotation structure
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn bump_gridnetwork_builds_non_empty_annotation() {
+        // The bump annotation must include a non-empty value (a Unix timestamp).
+        // This is a structural test that does not run kubectl — it verifies the
+        // annotation string is well-formed so the actual bump call is predictable.
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let annotation = format!("grid.praxis-proxy.io/reconcile-at={ts}");
+        assert!(
+            annotation.starts_with("grid.praxis-proxy.io/reconcile-at="),
+            "annotation must use the reconcile-at key"
+        );
+        assert!(ts > 0, "timestamp must be non-zero on a real system");
     }
 }

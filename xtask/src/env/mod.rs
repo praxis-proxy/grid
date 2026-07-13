@@ -12,7 +12,10 @@ pub(crate) mod providers;
 pub(crate) mod trust;
 pub(crate) mod verify;
 
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use clap::Subcommand;
 
@@ -263,6 +266,94 @@ pub(crate) enum Action {
         #[arg(long)]
         site: Option<String>,
     },
+
+    /// Run all validations in sequence and print a Markdown summary table.
+    ///
+    /// Runs, in order:
+    ///
+    /// 1. `status` — confirm clusters and certs are ready.
+    /// 2. `validate-operator-routing` — overlay generation and Praxis routing.
+    /// 3. `verify-swim-membership` — SWIM gossip drives `phase=Active`.
+    /// 4. `verify-swim-state` — real CRDT state propagates over SWIM.
+    /// 5. `verify-mtls-trust` — mTLS positive + negative cases.
+    ///
+    /// Each step is run even if previous steps fail; all results are collected
+    /// and the table is printed at the end.  Exit code is non-zero when any
+    /// step has `FAIL` status.  `BLOCKED` results (due to missing
+    /// prerequisites) are noted but do **not** cause a non-zero exit on their
+    /// own.
+    ///
+    /// Requires kind clusters and gateway images to be ready.  Run `env up`
+    /// and `env load-gateway-images` first.
+    ValidateAll {
+        /// Path to the environment config file.
+        #[arg(short, long, default_value = "tests/env/operator-routing.toml")]
+        config: PathBuf,
+
+        /// Kind cluster context (first provider site by default).
+        #[arg(long)]
+        site: Option<String>,
+    },
+
+    /// Validate generated CRD schema fields.
+    ///
+    /// Runs `generate_crds`, parses the output JSON, and asserts that all
+    /// required fields are present in the generated schemas.  Exits non-zero
+    /// if any field is missing.
+    ///
+    /// Does **not** require kind clusters — it runs against the binary output
+    /// of `cargo run -p operator --bin generate_crds`.
+    VerifyCrdSchema,
+
+    /// Prove that CRDT/SWIM-distributed provider records appear in the
+    /// operator-generated routing overlay.
+    ///
+    /// Starts two SWIM-enabled operator processes against the same kind
+    /// cluster.  Applies a `GridNetwork` with a `gatewayRef` and an
+    /// `InferenceProvider` so both operators publish real CRDT state.  After
+    /// gossip convergence and `distributedProviderCount > 0`, reads the
+    /// generated overlay `ConfigMap` and asserts that at least one candidate
+    /// has a `site` value from the remote operator (not the primary site).
+    ///
+    /// Proves that remote CRDT provider records flow from SWIM into the overlay
+    /// rendering pipeline end-to-end.
+    ///
+    /// Requires a kind cluster.  Run `env up` first.  Safe to rerun: fixtures
+    /// are deleted at the start of each run.
+    VerifySwimOverlay {
+        /// Path to the environment config file.
+        #[arg(short, long, default_value = "tests/env/operator-routing.toml")]
+        config: PathBuf,
+
+        /// Kind cluster context to run against (first provider site by default).
+        #[arg(long)]
+        site: Option<String>,
+    },
+
+    /// Prove end-to-end distributed model routing via CRDT/SWIM discovery.
+    ///
+    /// Runs two SWIM-enabled operator processes against separate kind clusters
+    /// (east and west provider sites).  Each cluster has its own `InferenceProvider`:
+    /// model-east on the east cluster, model-west on the west cluster.  After
+    /// SWIM gossip, the east operator's overlay includes model-west as a remote
+    /// CRDT-sourced candidate.  A consumer gateway is deployed from that overlay
+    /// and routes requests for both models — model-east via the local east gateway
+    /// and model-west via the CRDT-discovered west gateway — asserting HTTP 200
+    /// for both.
+    ///
+    /// This is the minimal deterministic kind proof of:
+    ///   `InferenceProvider (west k8s) → CRDT over SWIM → overlay candidate →
+    ///    consumer grid_route → provider gateway → HTTP 200`
+    ///
+    /// Requires the two-provider kind environment.  Run
+    /// `env up -c tests/env/operator-routing-two-provider.toml` and
+    /// `env load-gateway-images -c tests/env/operator-routing-two-provider.toml`
+    /// first.  Safe to rerun: fixtures are deleted at the start of each run.
+    VerifySwimRouting {
+        /// Path to the two-provider environment config file.
+        #[arg(short, long, default_value = "tests/env/operator-routing-two-provider.toml")]
+        config: PathBuf,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -296,6 +387,10 @@ pub(crate) fn run(action: &Action) -> Result<(), Box<dyn std::error::Error>> {
         Action::ValidateOperatorRouting { config, site } => env_validate_operator_routing(config, site.as_deref()),
         Action::VerifySwimMembership { config, site } => env_verify_swim_membership(config, site.as_deref()),
         Action::VerifySwimState { config, site } => env_verify_swim_state(config, site.as_deref()),
+        Action::ValidateAll { config, site } => env_validate_all(config, site.as_deref()),
+        Action::VerifyCrdSchema => env_verify_crd_schema(),
+        Action::VerifySwimOverlay { config, site } => env_verify_swim_overlay(config, site.as_deref()),
+        Action::VerifySwimRouting { config } => env_verify_swim_routing(config),
     }
 }
 
@@ -492,6 +587,31 @@ fn print_topology(cfg: &EnvConfig) {
 // Grid operator commands
 // ---------------------------------------------------------------------------
 
+/// Collect `(name, models)` for each provider cluster that declares at least
+/// one model.  Order matches `cfg.clusters.names`.
+fn provider_clusters_from_config(cfg: &EnvConfig) -> Vec<(String, Vec<String>)> {
+    cfg.clusters
+        .names
+        .iter()
+        .filter_map(|name| {
+            cfg.clusters.definitions.get(name).and_then(|def| {
+                (def.role == ClusterRole::Provider && !def.models.is_empty())
+                    .then(|| (name.clone(), def.models.clone()))
+            })
+        })
+        .collect()
+}
+
+/// Return `true` when the config has more than one provider cluster that
+/// declares models.
+///
+/// Used to select between the single-provider (`site-a` + full health/metrics
+/// fixture suite) and the multi-provider (per-site minimal fixtures) reconcile
+/// paths in `env_validate_operator_routing`.
+fn is_multi_provider_config(cfg: &EnvConfig) -> bool {
+    provider_clusters_from_config(cfg).len() > 1
+}
+
 /// Resolve the kubectl context for the target site.
 ///
 /// Uses the first provider site in the config when `site` is `None`.
@@ -666,11 +786,89 @@ fn env_verify_operator_reconcile(config: &Path, site: Option<&str>) -> Result<()
     Ok(())
 }
 
+/// Install CRDs, apply one `InferenceProvider` fixture per provider site, run
+/// the operator, verify the overlay covers all sites, and export the overlay.
+///
+/// This is the multi-provider counterpart of `run_operator_reconcile`.  It
+/// skips the degraded/API-fallback/metrics fixtures because those are
+/// specific to the single-provider health-and-scoring validation.  The focus
+/// is on proving that the operator generates correct overlay candidates for
+/// every provider site and that the consumer can route to all of them.
+///
+/// # Invariants
+/// - `providers` must contain at least two entries (caller's responsibility).
+/// - Each `(site_name, models)` pair becomes one `InferenceProvider` with `routingClusterRef = site_name` and the given
+///   model list.
+#[expect(
+    clippy::too_many_lines,
+    reason = "sequential reconcile steps: CRD install, fixtures, operator spawn, poll, verify, export"
+)]
+fn run_multi_provider_reconcile(
+    context: &str,
+    providers: &[(&str, &[String])],
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    use operator::{CONFIGMAP_POLL_TIMEOUT, STATUS_POLL_TIMEOUT, TEST_GATEWAY_NAME, TEST_GATEWAY_NS, TEST_NETWORK};
+
+    // Step 1: install CRDs and remove stale resources.
+    operator::install_grid_crds(context)?;
+    let site_names: Vec<&str> = providers.iter().map(|&(s, _)| s).collect();
+    operator::cleanup_multi_provider_resources(context, &site_names)?;
+
+    // Step 2: spawn the operator out-of-cluster.
+    let op_child = operator::spawn_operator(context)?;
+    eprintln!("  operator spawned (PID {})", op_child.id());
+    let mut op_guard = ProcGuard(Some(op_child), "operator");
+
+    // Step 3: apply GridNetwork + one InferenceProvider per provider site.
+    //
+    // The mock-openai-provider service is deployed in-cluster by `env up`.
+    // Using its in-cluster DNS name means providers reconcile to `Pending`
+    // (non-blank endpoint, no health check configured) without requiring a
+    // live inference backend to be reachable from outside the cluster.
+    let healthy_endpoint = "http://mock-openai-provider.default.svc:8080";
+    operator::apply_multi_provider_fixtures(context, providers, healthy_endpoint)?;
+
+    // Step 4: wait for reconciliation and verify the overlay.
+    let result = (|| -> Result<PathBuf, Box<dyn std::error::Error>> {
+        for &(site_name, _) in providers {
+            let fixture_name = operator::multi_provider_fixture_name(site_name);
+            operator::wait_for_provider_phase(context, &fixture_name, "Pending", STATUS_POLL_TIMEOUT)?;
+        }
+        operator::wait_for_overlay_configmap(
+            context,
+            TEST_NETWORK,
+            TEST_GATEWAY_NAME,
+            TEST_GATEWAY_NS,
+            CONFIGMAP_POLL_TIMEOUT,
+        )?;
+
+        let overlay = operator::read_overlay_configmap(context, TEST_NETWORK, TEST_GATEWAY_NAME, TEST_GATEWAY_NS)?;
+        operator::verify_multi_provider_overlay(&overlay, &site_names)?;
+
+        let path = operator::export_overlay_to_file(context, TEST_NETWORK, TEST_GATEWAY_NAME, TEST_GATEWAY_NS)?;
+        eprintln!("  overlay exported: {}", path.display());
+        Ok(path)
+    })();
+
+    if let Some(c) = op_guard.0.take() {
+        operator::kill_operator(c);
+    }
+
+    result
+}
+
 /// Run the full operator-to-consumer routing validation in kind.
 ///
 /// Orchestrates provider gateway deployment, operator reconcile + overlay export,
 /// consumer gateway deployment from the operator overlay, and end-to-end routing
 /// verification in a single idempotent command.
+///
+/// **Single-provider config (`site-a`):** runs the full fixture suite including
+/// health phases, degraded/API-fallback providers, and live metrics ordering.
+///
+/// **Multi-provider config (≥2 provider sites):** runs a focused fixture suite
+/// that proves the operator generates correct overlay candidates for every
+/// provider site and that the consumer can route to all declared models.
 fn env_validate_operator_routing(config: &Path, site: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     let cfg = EnvConfig::from_file(config)?;
     let context = resolve_operator_context(&cfg, site)?;
@@ -680,7 +878,21 @@ fn env_validate_operator_routing(config: &Path, site: Option<&str>) -> Result<()
     gateway::deploy_all(&cfg)?;
 
     eprintln!("validate-operator-routing: [2/4] operator reconcile + overlay export...");
-    let overlay_path = run_operator_reconcile(&context)?;
+    let overlay_path = if is_multi_provider_config(&cfg) {
+        let providers_owned = provider_clusters_from_config(&cfg);
+        let providers: Vec<(&str, &[String])> = providers_owned
+            .iter()
+            .map(|(s, m)| (s.as_str(), m.as_slice()))
+            .collect();
+        eprintln!(
+            "  multi-provider mode: {} provider sites ({})",
+            providers.len(),
+            providers.iter().map(|&(s, _)| s).collect::<Vec<_>>().join(", ")
+        );
+        run_multi_provider_reconcile(&context, &providers)?
+    } else {
+        run_operator_reconcile(&context)?
+    };
 
     eprintln!("validate-operator-routing: [3/4] deploying consumer gateway from operator overlay...");
     consumer::deploy_consumer(&cfg, Some(&overlay_path))?;
@@ -827,6 +1039,270 @@ fn env_verify_swim_state(config: &Path, site: Option<&str>) -> Result<(), Box<dy
     Ok(())
 }
 
+/// Prove that CRDT/SWIM-distributed provider records appear in the routing overlay.
+///
+/// Starts two SWIM-enabled operator processes, applies a `GridNetwork` with a
+/// `gatewayRef` and one `InferenceProvider`, waits for SWIM convergence and
+/// distributed state propagation, then reads the overlay `ConfigMap` and asserts
+/// that at least one candidate has a `site` value originating from the remote
+/// operator (not the primary site).
+#[expect(
+    clippy::too_many_lines,
+    reason = "sequential SWIM overlay steps: CRD install, two operator spawns, fixture apply, convergence wait, poll, overlay verify, cleanup"
+)]
+fn env_verify_swim_overlay(config: &Path, site: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    use operator::{
+        CONFIGMAP_POLL_TIMEOUT, SWIM_CONVERGENCE_WAIT, SWIM_NODE_PRIMARY_NAME, SWIM_NODE_SECONDARY_NAME,
+        SWIM_OVERLAY_GW, SWIM_OVERLAY_NETWORK, SWIM_OVERLAY_PROVIDER, SWIM_STATUS_POLL_TIMEOUT,
+    };
+
+    let cfg = EnvConfig::from_file(config)?;
+    let context = resolve_operator_context(&cfg, site)?;
+    eprintln!("verify-swim-overlay: context={context}");
+
+    // Step 1: install CRDs and remove any stale overlay test resources.
+    operator::install_grid_crds(&context)?;
+    operator::cleanup_swim_overlay_test_resources(&context)?;
+
+    let (bind1, bind2) = reserve_swim_bind_addrs()?;
+
+    // Step 2: start the primary SWIM operator (no seeds).
+    let op1 = operator::spawn_operator_with_swim(&context, &bind1, &bind1, SWIM_NODE_PRIMARY_NAME, "")?;
+    let mut op1_guard = ProcGuard(Some(op1), "operator-primary");
+
+    // Step 3: start the secondary operator with the primary as its seed.
+    let op2 = operator::spawn_operator_with_swim(&context, &bind2, &bind2, SWIM_NODE_SECONDARY_NAME, &bind1)?;
+    let mut op2_guard = ProcGuard(Some(op2), "operator-secondary");
+
+    // Step 4: wait for SWIM gossip to converge.
+    operator::wait_for_swim_convergence(SWIM_CONVERGENCE_WAIT);
+
+    // Step 5: apply the GridNetwork with a gatewayRef and one InferenceProvider.
+    // Both operators reconcile on watch; each publishes the InferenceProvider
+    // as CRDT state.  After convergence each operator's state_snapshot contains
+    // the remote peer's provider record.
+    operator::apply_swim_overlay_test_fixtures(&context, SWIM_NODE_PRIMARY_NAME)?;
+    eprintln!(
+        "  GridNetwork {SWIM_OVERLAY_NETWORK} + InferenceProvider {SWIM_OVERLAY_PROVIDER} applied; \
+         waiting for distributed state propagation..."
+    );
+
+    // Step 6: poll for distributedProviderCount > 0 (proves remote state arrived).
+    let distributed_result =
+        operator::wait_for_gridnetwork_distributed_state(&context, SWIM_OVERLAY_NETWORK, SWIM_STATUS_POLL_TIMEOUT);
+
+    // Step 7: wait for the overlay ConfigMap to be generated.
+    let cm_result = distributed_result.and_then(|_| {
+        operator::wait_for_overlay_configmap(
+            &context,
+            SWIM_OVERLAY_NETWORK,
+            SWIM_OVERLAY_GW,
+            "default",
+            CONFIGMAP_POLL_TIMEOUT,
+        )
+    });
+
+    // Step 8: verify the overlay contains a remote candidate.
+    let verify_result = cm_result.and_then(|()| {
+        operator::verify_swim_overlay_candidates(
+            &context,
+            SWIM_OVERLAY_NETWORK,
+            SWIM_OVERLAY_GW,
+            SWIM_NODE_PRIMARY_NAME,
+        )
+    });
+
+    // Cleanup — always stop operators and remove fixtures.
+    if let Some(c) = op1_guard.0.take() {
+        operator::kill_operator(c);
+    }
+    if let Some(c) = op2_guard.0.take() {
+        operator::kill_operator(c);
+    }
+    operator::cleanup_swim_overlay_test_resources(&context)?;
+    // Also clean up the SWIM provider that may have been created during convergence
+    // wait to avoid contaminating subsequent verify-swim-state runs.
+    operator::cleanup_swim_test_resources(&context).unwrap_or_else(|e| {
+        eprintln!("  warning: SWIM test resource cleanup failed: {e}");
+    });
+
+    verify_result?;
+
+    eprintln!(
+        "verify-swim-overlay: PASS — CRDT provider record from {SWIM_NODE_SECONDARY_NAME:?} \
+         appeared in overlay for {SWIM_OVERLAY_NETWORK}/{SWIM_OVERLAY_GW}"
+    );
+    Ok(())
+}
+
+/// Prove end-to-end distributed model routing via CRDT/SWIM discovery.
+///
+/// Uses a two-provider kind environment.  The east operator runs against the
+/// east cluster (model-east is a local `InferenceProvider`); the west operator
+/// runs against the west cluster (model-west is a local `InferenceProvider`).
+/// After SWIM gossip, the east operator's overlay includes model-west as a
+/// remote CRDT candidate.  A consumer gateway is deployed from that overlay
+/// and routes requests for both models.
+#[expect(
+    clippy::too_many_lines,
+    reason = "sequential steps: CRDs, fixtures, operators, wait, overlay, consumer deploy, E2E verify, cleanup"
+)]
+fn env_verify_swim_routing(config: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    use operator::{
+        CONFIGMAP_POLL_TIMEOUT, SWIM_CONVERGENCE_WAIT, SWIM_ROUTING_GW, SWIM_ROUTING_NETWORK, SWIM_STATUS_POLL_TIMEOUT,
+    };
+
+    let cfg = EnvConfig::from_file(config)?;
+    eprintln!("verify-swim-routing: loading two-provider config...");
+
+    // Derive site names and models from the config.  Expect exactly two providers.
+    let providers = provider_clusters_from_config(&cfg);
+    if providers.len() != 2 {
+        return Err(format!(
+            "verify-swim-routing requires exactly 2 provider clusters; got {}",
+            providers.len()
+        )
+        .into());
+    }
+    let Some((east_site, east_models)) = providers.first() else {
+        return Err("verify-swim-routing: no provider clusters found in config".into());
+    };
+    let Some((west_site, west_models)) = providers.get(1) else {
+        return Err("verify-swim-routing: second provider cluster not found in config".into());
+    };
+    let east_model = east_models.first().ok_or("east provider has no models")?.clone();
+    let west_model = west_models.first().ok_or("west provider has no models")?.clone();
+    let east_ctx = kind::kubectl_context(east_site);
+    let west_ctx = kind::kubectl_context(west_site);
+
+    eprintln!("verify-swim-routing: east={east_site} ({east_ctx}), west={west_site} ({west_ctx})");
+    eprintln!("  east model: {east_model}, west model: {west_model}");
+
+    // Pre-build the operator binary so `cargo run` in the background processes
+    // does not spend compilation time while we poll for distributedProviderCount.
+    // Without this, the operator may still be compiling when fixtures are applied
+    // and the poll window closes before the first reconcile runs.
+    eprintln!("verify-swim-routing: pre-building operator binary...");
+    let build_status = std::process::Command::new("cargo")
+        .args(["build", "--quiet", "-p", "operator", "--bin", "operator"])
+        .status()
+        .map_err(|e| format!("cargo build -p operator failed to spawn: {e}"))?;
+    if !build_status.success() {
+        return Err("cargo build -p operator --bin operator failed".into());
+    }
+    eprintln!("  [OK] operator binary ready");
+
+    // Step 1: deploy provider gateways on both clusters.
+    eprintln!("verify-swim-routing: [1/6] deploying provider gateways...");
+    gateway::deploy_all(&cfg)?;
+
+    // Step 2: install Grid CRDs and clean up stale routing fixtures on both clusters.
+    eprintln!("verify-swim-routing: [2/6] installing CRDs and removing stale fixtures...");
+    operator::install_grid_crds(&east_ctx)?;
+    operator::install_grid_crds(&west_ctx)?;
+    operator::cleanup_swim_routing_resources(&east_ctx)?;
+    operator::cleanup_swim_routing_resources(&west_ctx)?;
+
+    // Step 3: start SWIM-enabled operators before applying fixtures.
+    //         Primary runs against east k8s (generates overlay ConfigMap).
+    //         Peer runs against west k8s (publishes model-west as CRDT state).
+    //
+    //         Each operator receives a cluster-specific kubeconfig via KUBECONFIG
+    //         env var (not via kubectl config use-context) to avoid the race where
+    //         the second use-context fires before the first operator binary reads
+    //         its kubeconfig.  Both operators start with the correct cluster.
+    //
+    //         Operators are started BEFORE fixtures so that when fixture watch
+    //         events trigger the first reconcile, SWIM gossip has already converged
+    //         and the reconcile immediately observes the peer's CRDT state.
+    eprintln!("verify-swim-routing: [3/6] starting SWIM operators...");
+    let (bind1, bind2) = reserve_swim_bind_addrs()?;
+    let op1 = operator::spawn_operator_with_swim_for_context(&east_ctx, &bind1, &bind1, east_site, "")?;
+    let mut op1_guard = ProcGuard(Some(op1), "operator-east");
+    let op2 = operator::spawn_operator_with_swim_for_context(&west_ctx, &bind2, &bind2, west_site, &bind1)?;
+    let mut op2_guard = ProcGuard(Some(op2), "operator-west");
+
+    // Step 4: wait for SWIM gossip to converge, then apply fixtures.
+    //         After convergence, fixture creation triggers an immediate reconcile
+    //         on each operator.  That reconcile publishes CRDT state over the
+    //         already-converged SWIM mesh, and the subsequent reconcile (triggered
+    //         by InferenceProvider status updates) sees the remote provider record.
+    eprintln!("verify-swim-routing: [4/6] waiting for SWIM convergence then applying fixtures...");
+    operator::wait_for_swim_convergence(SWIM_CONVERGENCE_WAIT);
+
+    // Apply east fixtures (GridNetwork with gatewayRef + east InferenceProvider).
+    // Apply west fixtures (GridNetwork without gatewayRef + west InferenceProvider).
+    operator::apply_swim_routing_east_fixtures(&east_ctx, east_site, &east_model)?;
+    operator::apply_swim_routing_west_fixtures(&west_ctx, west_site, &west_model)?;
+
+    // Step 5: settle, then bump east GridNetwork to force a reconcile after CRDT lands.
+    //
+    // The first reconcile wave (triggered by fixture application) races the west
+    // operator's CRDT broadcast by tens of milliseconds: east often reconciles
+    // before west's broadcast arrives, recording distributedProviderCount=0.
+    // After the settle period both operators have exchanged CRDT state via SWIM
+    // gossip.  Patching a timestamp annotation on the east GridNetwork forces a
+    // fresh reconcile that reads the updated state_snapshot() and records the
+    // correct distributedProviderCount.
+    eprintln!("verify-swim-routing: [5/6] settling CRDT then bumping east GridNetwork...");
+    operator::wait_for_swim_convergence(Duration::from_secs(5)); // settle for CRDT exchange
+    operator::bump_gridnetwork(&east_ctx, SWIM_ROUTING_NETWORK)?;
+
+    // Poll for distributedProviderCount > 0 on the east cluster: proves that
+    // the west operator's model-west CRDT broadcast arrived at the east operator.
+    let distributed_result =
+        operator::wait_for_gridnetwork_distributed_state(&east_ctx, SWIM_ROUTING_NETWORK, SWIM_STATUS_POLL_TIMEOUT);
+
+    // Wait for the overlay ConfigMap to contain the remote CRDT candidate.
+    let cm_result = distributed_result.and_then(|_| {
+        operator::wait_for_overlay_configmap(
+            &east_ctx,
+            SWIM_ROUTING_NETWORK,
+            SWIM_ROUTING_GW,
+            "default",
+            CONFIGMAP_POLL_TIMEOUT,
+        )
+    });
+
+    // Verify overlay has a remote candidate (site != east_site).
+    let overlay_result = cm_result.and_then(|()| {
+        operator::verify_swim_overlay_candidates(&east_ctx, SWIM_ROUTING_NETWORK, SWIM_ROUTING_GW, east_site)
+    });
+
+    // Export overlay to file for consumer deploy.
+    let overlay_path_result = overlay_result
+        .and_then(|()| operator::export_overlay_to_file(&east_ctx, SWIM_ROUTING_NETWORK, SWIM_ROUTING_GW, "default"));
+
+    // Kill operators before deploying consumer (operators keep kubeconfig context).
+    if let Some(c) = op1_guard.0.take() {
+        operator::kill_operator(c);
+    }
+    if let Some(c) = op2_guard.0.take() {
+        operator::kill_operator(c);
+    }
+
+    let overlay_path = overlay_path_result?;
+
+    // Step 6: deploy consumer from CRDT overlay and verify routing.
+    eprintln!("verify-swim-routing: [6/6] deploying consumer and verifying routing...");
+    consumer::deploy_consumer(&cfg, Some(&overlay_path))?;
+    consumer::verify_e2e(&cfg)?;
+
+    // Cleanup.
+    operator::cleanup_swim_routing_resources(&east_ctx).unwrap_or_else(|e| {
+        eprintln!("  warning: east cleanup failed: {e}");
+    });
+    operator::cleanup_swim_routing_resources(&west_ctx).unwrap_or_else(|e| {
+        eprintln!("  warning: west cleanup failed: {e}");
+    });
+
+    eprintln!(
+        "verify-swim-routing: PASS — {west_model} from {west_site:?} entered overlay via \
+         CRDT/SWIM and routed to HTTP 200 via consumer gateway"
+    );
+    Ok(())
+}
+
 /// Reserve two distinct localhost UDP addresses for the SWIM membership check.
 fn reserve_swim_bind_addrs() -> Result<(String, String), Box<dyn std::error::Error>> {
     let bind1 = operator::reserve_local_udp_addr()?.to_string();
@@ -835,4 +1311,507 @@ fn reserve_swim_bind_addrs() -> Result<(String, String), Box<dyn std::error::Err
         bind2 = operator::reserve_local_udp_addr()?.to_string();
     }
     Ok((bind1, bind2))
+}
+
+// ---------------------------------------------------------------------------
+// validate-all aggregator
+// ---------------------------------------------------------------------------
+
+/// Outcome of a single `validate-all` step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StepStatus {
+    /// Step completed successfully.
+    Pass,
+    /// Step produced a fatal error.
+    Fail,
+    /// Step is known to be incomplete due to missing prerequisites.
+    Blocked,
+}
+
+impl StepStatus {
+    /// Return true when this status should contribute to a non-zero exit code.
+    fn is_failure(&self) -> bool {
+        *self == Self::Fail
+    }
+
+    /// Return the display label for this status.
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Pass => "PASS",
+            Self::Fail => "FAIL",
+            Self::Blocked => "BLOCKED",
+        }
+    }
+}
+
+/// One row of the `validate-all` summary table.
+struct StepResult {
+    /// Short description of what this step validates.
+    label: &'static str,
+    /// Outcome.
+    status: StepStatus,
+    /// One-line evidence or error summary (truncated).
+    evidence: String,
+}
+
+impl StepResult {
+    /// Construct a passing result.
+    fn pass(label: &'static str, evidence: impl Into<String>) -> Self {
+        Self {
+            label,
+            status: StepStatus::Pass,
+            evidence: evidence.into(),
+        }
+    }
+
+    /// Construct a failing result from an error.
+    fn fail(label: &'static str, err: &dyn std::error::Error) -> Self {
+        Self {
+            label,
+            status: StepStatus::Fail,
+            evidence: safe_truncate_str(&err.to_string(), 120),
+        }
+    }
+
+    /// Construct a blocked result with a human-readable reason.
+    fn blocked(label: &'static str, reason: impl Into<String>) -> Self {
+        Self {
+            label,
+            status: StepStatus::Blocked,
+            evidence: reason.into(),
+        }
+    }
+}
+
+/// Truncate a string to `max` chars, appending "…" if truncated.
+fn safe_truncate_str(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_owned()
+    } else {
+        format!("{}…", s.chars().take(max).collect::<String>())
+    }
+}
+
+/// Print a Markdown summary table of all step results.
+fn print_validate_all_table(results: &[StepResult]) {
+    eprintln!();
+    eprintln!("| Step | Result | Evidence |");
+    eprintln!("|---|---|---|");
+    for r in results {
+        eprintln!("| {} | **{}** | {} |", r.label, r.status.label(), r.evidence);
+    }
+    eprintln!();
+}
+
+/// Run all validations in sequence and report a Markdown summary.
+///
+/// Continues past individual step failures so the full picture is visible.
+/// Exit code is non-zero when any step has `FAIL` status.
+#[expect(
+    clippy::too_many_lines,
+    reason = "sequential step list: each step is one match arm; no abstraction saves lines without hiding intent"
+)]
+fn env_validate_all(config: &Path, site: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    let mut results: Vec<StepResult> = Vec::new();
+
+    // Step 1: env status (non-fatal — clusters may still be partially ready)
+    eprintln!("validate-all: [1/5] env status...");
+    match env_status(config) {
+        Ok(()) => results.push(StepResult::pass("env status", "status summary printed above")),
+        Err(e) => {
+            // Status is informational; mark blocked rather than fail.
+            results.push(StepResult::blocked("env status", e.to_string()));
+        },
+    }
+
+    // Step 2: validate-operator-routing
+    eprintln!("validate-all: [2/5] validate-operator-routing...");
+    match env_validate_operator_routing(config, site) {
+        Ok(()) => results.push(StepResult::pass("validate-operator-routing", "PASS")),
+        Err(e) => results.push(StepResult::fail("validate-operator-routing", e.as_ref())),
+    }
+
+    // Step 3: verify-swim-membership
+    eprintln!("validate-all: [3/5] verify-swim-membership...");
+    match env_verify_swim_membership(config, site) {
+        Ok(()) => results.push(StepResult::pass(
+            "verify-swim-membership",
+            "phase=Active connectedSites=1",
+        )),
+        Err(e) => results.push(StepResult::fail("verify-swim-membership", e.as_ref())),
+    }
+
+    // Step 4: verify-swim-state
+    eprintln!("validate-all: [4/5] verify-swim-state...");
+    match env_verify_swim_state(config, site) {
+        Ok(()) => results.push(StepResult::pass("verify-swim-state", "distributedProviderCount=1")),
+        Err(e) => results.push(StepResult::fail("verify-swim-state", e.as_ref())),
+    }
+
+    // Step 5: verify-mtls-trust
+    eprintln!("validate-all: [5/5] verify-mtls-trust...");
+    match env_verify_mtls_trust(config) {
+        Ok(()) => results.push(StepResult::pass("verify-mtls-trust", "all trust cases pass")),
+        Err(e) => results.push(StepResult::fail("verify-mtls-trust", e.as_ref())),
+    }
+
+    print_validate_all_table(&results);
+
+    let any_fail = results.iter().any(|r| r.status.is_failure());
+    if any_fail {
+        Err("validate-all: one or more steps FAILED — see table above".into())
+    } else {
+        eprintln!("validate-all: all steps PASS or BLOCKED");
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CRD schema validation
+// ---------------------------------------------------------------------------
+
+/// Required fields validated by `verify-crd-schema`.
+///
+/// Each entry is `(crd_partial_name, json_pointer)` where the pointer is
+/// evaluated against the CRD JSON and must point to a non-null value.
+const REQUIRED_CRD_FIELDS: &[(&str, &str)] = &[
+    // GridNetwork status fields
+    (
+        "gridnetworks",
+        "/spec/versions/0/schema/openAPIV3Schema/properties/status/properties/connectedSites",
+    ),
+    (
+        "gridnetworks",
+        "/spec/versions/0/schema/openAPIV3Schema/properties/status/properties/distributedProviderCount",
+    ),
+    // InferenceProvider spec fields
+    (
+        "inferenceproviders",
+        "/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties/routingClusterRef",
+    ),
+    (
+        "inferenceproviders",
+        "/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties/metricsConfig",
+    ),
+    (
+        "inferenceproviders",
+        "/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties/metricsConfig/properties/path",
+    ),
+    (
+        "inferenceproviders",
+        "/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties/metricsConfig/properties/timeout",
+    ),
+    (
+        "inferenceproviders",
+        "/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties/metricsConfig/properties/signalNames/properties/queueDepth",
+    ),
+    (
+        "inferenceproviders",
+        "/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties/metricsConfig/properties/signalNames/properties/kvCacheUtilization",
+    ),
+    (
+        "inferenceproviders",
+        "/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties/metricsConfig/properties/signalNames/properties/latencyP99Ms",
+    ),
+    (
+        "inferenceproviders",
+        "/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties/metricsConfig/properties/signalNames/properties/prefixCacheHitRatio",
+    ),
+    (
+        "inferenceproviders",
+        "/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties/metricsConfig/properties/signalNames/properties/errorRate",
+    ),
+    (
+        "inferenceproviders",
+        "/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties/metricsConfig/properties/signalNames/properties/healthy",
+    ),
+    // InferenceProvider status subresource
+    ("inferenceproviders", "/spec/versions/0/subresources/status"),
+    // GridSite spec
+    (
+        "gridsites",
+        "/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties/gridNetworkRef",
+    ),
+];
+
+/// Verify required fields are present in the generated CRD JSON.
+///
+/// Returns a list of missing field paths.
+pub(crate) fn check_crd_fields(crd_json: &serde_json::Value) -> Vec<String> {
+    let Some(items) = crd_json.get("items").and_then(serde_json::Value::as_array) else {
+        return vec!["JSON is not a CRD List (missing 'items' array)".to_owned()];
+    };
+
+    let mut missing = Vec::new();
+    for &(name_part, ptr) in REQUIRED_CRD_FIELDS {
+        let found = items.iter().any(|crd| {
+            let crd_name = crd
+                .get("metadata")
+                .and_then(|m| m.get("name"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            if !crd_name.contains(name_part) {
+                return false;
+            }
+            crd.pointer(ptr).is_some()
+        });
+        if !found {
+            missing.push(format!("{name_part}: {ptr}"));
+        }
+    }
+    missing
+}
+
+/// Run `generate_crds`, parse the output, and validate required schema fields.
+fn env_verify_crd_schema() -> Result<(), Box<dyn std::error::Error>> {
+    eprintln!("verify-crd-schema: generating CRDs...");
+    let output = std::process::Command::new("cargo")
+        .args(["run", "--quiet", "-p", "operator", "--bin", "generate_crds"])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!("generate_crds failed: {}", String::from_utf8_lossy(&output.stderr)).into());
+    }
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    let missing = check_crd_fields(&json);
+    if missing.is_empty() {
+        eprintln!(
+            "verify-crd-schema: all {} required fields present",
+            REQUIRED_CRD_FIELDS.len()
+        );
+        Ok(())
+    } else {
+        eprintln!("verify-crd-schema: {} field(s) missing:", missing.len());
+        for m in &missing {
+            eprintln!("  MISSING: {m}");
+        }
+        Err(format!("verify-crd-schema: {} required CRD field(s) missing", missing.len()).into())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// validate-all tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic,
+    reason = "tests"
+)]
+mod multi_provider_tests {
+    use super::*;
+
+    fn make_config(clusters: &[(&str, ClusterRole, Vec<String>)]) -> EnvConfig {
+        use std::collections::BTreeMap;
+
+        use config::{BedrockDef, ClusterConfig, ProviderConfig, ProviderDef, VertexDef};
+        let mut definitions = BTreeMap::new();
+        let mut names = Vec::new();
+        for (name, role, models) in clusters {
+            names.push((*name).to_owned());
+            definitions.insert(
+                (*name).to_owned(),
+                config::ClusterDef {
+                    models: models.clone(),
+                    role: *role,
+                    backend: config::ProviderBackend::default(),
+                },
+            );
+        }
+        EnvConfig {
+            clusters: ClusterConfig { names, definitions },
+            providers: ProviderConfig {
+                openai: ProviderDef { port: 10001 },
+                anthropic: ProviderDef { port: 10002 },
+                bedrock: BedrockDef {
+                    port: 10003,
+                    region: "us-east-1".to_owned(),
+                },
+                vertex: VertexDef {
+                    port: 10004,
+                    project: "p".to_owned(),
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn provider_clusters_from_config_single_provider() {
+        let cfg = make_config(&[
+            ("site-a", ClusterRole::Provider, vec!["model-x".to_owned()]),
+            ("consumer", ClusterRole::Consumer, vec![]),
+        ]);
+        let providers = provider_clusters_from_config(&cfg);
+        assert_eq!(providers.len(), 1, "single provider cluster");
+        assert_eq!(providers[0].0, "site-a");
+        assert_eq!(providers[0].1, vec!["model-x"]);
+    }
+
+    #[test]
+    fn provider_clusters_from_config_two_providers() {
+        let cfg = make_config(&[
+            ("site-east", ClusterRole::Provider, vec!["model-east".to_owned()]),
+            ("site-west", ClusterRole::Provider, vec!["model-west".to_owned()]),
+            ("consumer", ClusterRole::Consumer, vec![]),
+        ]);
+        let providers = provider_clusters_from_config(&cfg);
+        assert_eq!(providers.len(), 2, "two provider clusters");
+        assert_eq!(providers[0].0, "site-east");
+        assert_eq!(providers[1].0, "site-west");
+    }
+
+    #[test]
+    fn provider_clusters_from_config_excludes_empty_model_providers() {
+        let cfg = make_config(&[
+            ("site-a", ClusterRole::Provider, vec![]),
+            ("consumer", ClusterRole::Consumer, vec![]),
+        ]);
+        let providers = provider_clusters_from_config(&cfg);
+        assert!(providers.is_empty(), "provider with no models must be excluded");
+    }
+
+    #[test]
+    fn provider_clusters_from_config_excludes_consumer_clusters() {
+        let cfg = make_config(&[("consumer", ClusterRole::Consumer, vec!["x".to_owned()])]);
+        let providers = provider_clusters_from_config(&cfg);
+        assert!(providers.is_empty(), "consumer clusters must not appear as providers");
+    }
+
+    #[test]
+    fn is_multi_provider_config_false_for_single_provider() {
+        let cfg = make_config(&[
+            ("site-a", ClusterRole::Provider, vec!["model-x".to_owned()]),
+            ("consumer", ClusterRole::Consumer, vec![]),
+        ]);
+        assert!(!is_multi_provider_config(&cfg), "single provider must return false");
+    }
+
+    #[test]
+    fn is_multi_provider_config_true_for_two_providers() {
+        let cfg = make_config(&[
+            ("site-east", ClusterRole::Provider, vec!["model-east".to_owned()]),
+            ("site-west", ClusterRole::Provider, vec!["model-west".to_owned()]),
+            ("consumer", ClusterRole::Consumer, vec![]),
+        ]);
+        assert!(is_multi_provider_config(&cfg), "two providers must return true");
+    }
+
+    #[test]
+    fn is_multi_provider_config_false_for_no_providers() {
+        let cfg = make_config(&[("consumer", ClusterRole::Consumer, vec![])]);
+        assert!(!is_multi_provider_config(&cfg), "no providers must return false");
+    }
+
+    #[test]
+    fn provider_clusters_preserves_config_order() {
+        let cfg = make_config(&[
+            ("site-east", ClusterRole::Provider, vec!["model-east".to_owned()]),
+            ("site-west", ClusterRole::Provider, vec!["model-west".to_owned()]),
+            ("consumer", ClusterRole::Consumer, vec![]),
+        ]);
+        let providers = provider_clusters_from_config(&cfg);
+        assert_eq!(providers[0].0, "site-east", "first provider must be site-east");
+        assert_eq!(providers[1].0, "site-west", "second provider must be site-west");
+    }
+
+    #[test]
+    fn provider_clusters_include_multi_model_sites() {
+        let cfg = make_config(&[
+            (
+                "site-east",
+                ClusterRole::Provider,
+                vec!["model-east".to_owned(), "model-east-v2".to_owned()],
+            ),
+            ("consumer", ClusterRole::Consumer, vec![]),
+        ]);
+        let providers = provider_clusters_from_config(&cfg);
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].1.len(), 2, "all models must be included");
+    }
+}
+
+#[cfg(test)]
+mod validate_all_tests {
+    use super::*;
+
+    #[test]
+    fn step_status_pass_is_not_failure() {
+        assert!(!StepStatus::Pass.is_failure());
+    }
+
+    #[test]
+    fn step_status_fail_is_failure() {
+        assert!(StepStatus::Fail.is_failure());
+    }
+
+    #[test]
+    fn step_status_blocked_is_not_failure() {
+        assert!(!StepStatus::Blocked.is_failure());
+    }
+
+    #[test]
+    fn step_result_pass_has_correct_label() {
+        let r = StepResult::pass("my-step", "ok");
+        assert_eq!(r.status.label(), "PASS");
+        assert_eq!(r.label, "my-step");
+    }
+
+    #[test]
+    fn env_status_summary_evidence_does_not_claim_readiness() {
+        let r = StepResult::pass("env status", "status summary printed above");
+        assert_eq!(
+            r.evidence, "status summary printed above",
+            "env_status returns success after printing its own readiness summary; validate-all must not claim all components are ready"
+        );
+    }
+
+    #[test]
+    fn step_result_fail_truncates_long_evidence() {
+        let long_msg = "x".repeat(200);
+        let err: Box<dyn std::error::Error> = long_msg.clone().into();
+        let r = StepResult::fail("step", err.as_ref());
+        assert!(r.evidence.len() < 200, "evidence should be truncated");
+        assert!(r.evidence.ends_with('…'), "truncated evidence should end with ellipsis");
+    }
+
+    #[test]
+    fn any_fail_drives_error_exit() {
+        // Simulate results where one step fails.
+        let results = [
+            StepResult::pass("step-a", "ok"),
+            StepResult {
+                label: "step-b",
+                status: StepStatus::Fail,
+                evidence: "oops".to_owned(),
+            },
+            StepResult::pass("step-c", "ok"),
+        ];
+        let any_fail = results.iter().any(|r| r.status.is_failure());
+        assert!(any_fail, "any_fail must be true when at least one step is FAIL");
+    }
+
+    #[test]
+    fn blocked_only_does_not_drive_error_exit() {
+        let results = [
+            StepResult::pass("step-a", "ok"),
+            StepResult::blocked("step-b", "missing prereq"),
+        ];
+        let any_fail = results.iter().any(|r| r.status.is_failure());
+        assert!(!any_fail, "BLOCKED alone must not produce a non-zero exit");
+    }
+
+    #[test]
+    fn safe_truncate_str_leaves_short_strings_unchanged() {
+        assert_eq!(safe_truncate_str("hello", 10), "hello");
+    }
+
+    #[test]
+    fn safe_truncate_str_truncates_long_strings() {
+        let s = "a".repeat(200);
+        let t = safe_truncate_str(&s, 10);
+        assert_eq!(t, "aaaaaaaaaa…");
+    }
 }
