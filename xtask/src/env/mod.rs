@@ -6,6 +6,7 @@ pub(crate) mod consumer;
 pub(crate) mod gateway;
 pub(crate) mod images;
 pub(crate) mod kind;
+pub(crate) mod operator;
 pub(crate) mod operator_overlay;
 pub(crate) mod providers;
 pub(crate) mod trust;
@@ -130,6 +131,35 @@ pub(crate) enum Action {
         #[arg(short, long, default_value = DEFAULT_CONFIG_PATH)]
         config: PathBuf,
     },
+
+    /// Install Grid CRDs (`GridNetwork`, `GridSite`, `InferenceProvider`) into a cluster.
+    ///
+    /// Generates CRD manifests from the Rust type definitions and applies them
+    /// via `kubectl apply`.  Run after `env up` and before `verify-operator-reconcile`.
+    InstallGridCrds {
+        /// Path to the environment config file.
+        #[arg(short, long, default_value = DEFAULT_CONFIG_PATH)]
+        config: PathBuf,
+
+        /// Site name from the config to install CRDs into (first provider site by default).
+        #[arg(long)]
+        site: Option<String>,
+    },
+
+    /// Validate Grid operator reconciliation: install CRDs, apply test fixtures,
+    /// run the operator locally, and verify health-aware overlay generation.
+    ///
+    /// Runs the operator binary **out-of-cluster** using the current kubeconfig.
+    /// The operator must be compiled (`cargo build -p operator`) before this command.
+    VerifyOperatorReconcile {
+        /// Path to the environment config file.
+        #[arg(short, long, default_value = DEFAULT_CONFIG_PATH)]
+        config: PathBuf,
+
+        /// Site name from the config to run the validation against.
+        #[arg(long)]
+        site: Option<String>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -158,6 +188,8 @@ pub(crate) fn run(action: &Action) -> Result<(), Box<dyn std::error::Error>> {
         },
         Action::VerifyGatewayE2e { config } => env_verify_gateway_e2e(config),
         Action::VerifyMtlsTrust { config } => env_verify_mtls_trust(config),
+        Action::InstallGridCrds { config, site } => env_install_grid_crds(config, site.as_deref()),
+        Action::VerifyOperatorReconcile { config, site } => env_verify_operator_reconcile(config, site.as_deref()),
     }
 }
 
@@ -348,4 +380,130 @@ fn print_topology(cfg: &EnvConfig) {
         "  vertex:    port {} ({})",
         cfg.providers.vertex.port, cfg.providers.vertex.project,
     );
+}
+
+// ---------------------------------------------------------------------------
+// Grid operator commands
+// ---------------------------------------------------------------------------
+
+/// Resolve the kubectl context for the target site.
+///
+/// Uses the first provider site in the config when `site` is `None`.
+fn resolve_operator_context(cfg: &EnvConfig, site: Option<&str>) -> Result<String, Box<dyn std::error::Error>> {
+    let name = site
+        .or_else(|| cfg.clusters.names.first().map(String::as_str))
+        .ok_or("no sites in config")?;
+    Ok(kind::kubectl_context(name))
+}
+
+/// Install Grid CRDs into the selected kind cluster.
+fn env_install_grid_crds(config: &Path, site: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    let cfg = EnvConfig::from_file(config)?;
+    let context = resolve_operator_context(&cfg, site)?;
+    eprintln!("install-grid-crds: context={context}");
+    operator::install_grid_crds(&context)?;
+    eprintln!("install-grid-crds: done");
+    Ok(())
+}
+
+/// Run the full Grid operator reconciliation validation.
+#[expect(
+    clippy::too_many_lines,
+    reason = "sequential E2E steps: CRD install, fixtures, operator spawn, poll, verify, cleanup"
+)]
+fn env_verify_operator_reconcile(config: &Path, site: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    use operator::{
+        CONFIGMAP_POLL_TIMEOUT, ERROR_ENDPOINT_LOCAL_PORT, ERROR_ENDPOINT_NAME, POD_READY_TIMEOUT, STATUS_POLL_TIMEOUT,
+        TEST_GATEWAY_NAME, TEST_GATEWAY_NS, TEST_NETWORK, TEST_PROVIDER_API, TEST_PROVIDER_DEGRADED,
+        TEST_PROVIDER_HEALTHY, TEST_PROVIDER_INVALID,
+    };
+
+    // Guard that kills a process on drop, even on early return.
+    struct ProcGuard(Option<std::process::Child>, &'static str);
+    impl Drop for ProcGuard {
+        fn drop(&mut self) {
+            if let Some(mut c) = self.0.take() {
+                drop(c.kill());
+                drop(c.wait());
+                eprintln!("  {} stopped", self.1);
+            }
+        }
+    }
+
+    let cfg = EnvConfig::from_file(config)?;
+    let context = resolve_operator_context(&cfg, site)?;
+    eprintln!("verify-operator-reconcile: context={context}");
+
+    // Step 1: install Grid CRDs.
+    operator::install_grid_crds(&context)?;
+    operator::cleanup_validation_resources(&context)?;
+
+    // Step 2: deploy the HTTP 503 error-endpoint Pod and wait for it to be ready.
+    // This provides the health probe target for the Degraded provider.
+    operator::apply_error_endpoint_fixture(&context)?;
+    operator::wait_for_error_endpoint_ready(&context, POD_READY_TIMEOUT)?;
+
+    // Step 3: port-forward the error endpoint to the operator host so the
+    // out-of-cluster operator can reach it at 127.0.0.1:18503.
+    let pf_child = operator::start_error_endpoint_port_forward(&context)?;
+    let mut pf_guard = ProcGuard(Some(pf_child), ERROR_ENDPOINT_NAME);
+
+    // Step 4: spawn the operator out-of-cluster.
+    let op_child = operator::spawn_operator(&context)?;
+    eprintln!("  operator spawned (PID {})", op_child.id());
+    let mut op_guard = ProcGuard(Some(op_child), "operator");
+
+    let degraded_endpoint = format!("http://127.0.0.1:{ERROR_ENDPOINT_LOCAL_PORT}");
+
+    // Step 5: apply provider fixtures.
+    // GridNetwork is created first (inside apply_test_fixtures); all providers are
+    // applied after the network so the operator can resolve gridNetworkRef immediately.
+    // api_provider is applied last to prove scoring order is score-driven, not input-order.
+    let healthy_endpoint = "http://mock-openai-provider.default.svc:8080";
+    let api_endpoint = "https://api.anthropic.com"; // static, not probed (no healthCheck)
+    operator::apply_test_fixtures(&context, healthy_endpoint)?;
+    operator::apply_degraded_provider_fixture(&context, &degraded_endpoint)?;
+    operator::apply_api_provider_fixture(&context, api_endpoint)?;
+
+    // Step 6: wait for all providers to reconcile.
+    let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        operator::wait_for_provider_phase(&context, TEST_PROVIDER_INVALID, "Unavailable", STATUS_POLL_TIMEOUT)?;
+        operator::wait_for_provider_phase(&context, TEST_PROVIDER_HEALTHY, "Pending", STATUS_POLL_TIMEOUT)?;
+        operator::wait_for_provider_phase(&context, TEST_PROVIDER_DEGRADED, "Degraded", STATUS_POLL_TIMEOUT)?;
+        // api provider has no healthCheck and no matching sites → Pending
+        operator::wait_for_provider_phase(&context, TEST_PROVIDER_API, "Pending", STATUS_POLL_TIMEOUT)?;
+        operator::wait_for_overlay_configmap(
+            &context,
+            TEST_NETWORK,
+            TEST_GATEWAY_NAME,
+            TEST_GATEWAY_NS,
+            CONFIGMAP_POLL_TIMEOUT,
+        )?;
+
+        // Step 7: verify overlay contents.
+        let overlay = operator::read_overlay_configmap(&context, TEST_NETWORK, TEST_GATEWAY_NAME, TEST_GATEWAY_NS)?;
+        operator::verify_overlay(&overlay, TEST_PROVIDER_HEALTHY, TEST_PROVIDER_INVALID)?;
+        operator::verify_degraded_candidate(&overlay, TEST_PROVIDER_DEGRADED)?;
+        // Verify scoring order: local candidates before api_provider candidate.
+        operator::verify_scoring_order(&overlay, TEST_PROVIDER_HEALTHY, TEST_PROVIDER_API)?;
+
+        // Step 8: export overlay for Praxis handoff attempt.
+        let overlay_path =
+            operator::export_overlay_to_file(&context, TEST_NETWORK, TEST_GATEWAY_NAME, TEST_GATEWAY_NS)?;
+        eprintln!("  overlay exported: {}", overlay_path.display());
+        Ok(())
+    })();
+
+    // Step 8: stop port-forward and operator before returning.
+    if let Some(c) = op_guard.0.take() {
+        operator::kill_operator(c);
+    }
+    if let Some(mut c) = pf_guard.0.take() {
+        drop(c.kill());
+        drop(c.wait());
+    }
+
+    result?;
+    eprintln!("verify-operator-reconcile: PASS");
+    Ok(())
 }

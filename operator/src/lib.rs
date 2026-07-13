@@ -14,5 +14,7 @@ pub mod crd;
 pub mod error;
 /// Pure Prometheus text-format parser for inference backend metrics.
 pub mod metrics_parser;
+/// Async HTTP scraper for Prometheus `/metrics` endpoints.
+pub mod metrics_scraper;
 /// Kubernetes resource builders.
 pub mod resources;
