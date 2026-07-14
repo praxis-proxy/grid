@@ -953,6 +953,7 @@ mod tests {
         network.spec.tls.ca_secret_ref = Some(crate::crd::grid_network::SecretRef {
             name: "ca".to_owned(),
             namespace: "default".to_owned(),
+            key: None,
         });
         let snap = alive_snapshot(1);
         let phase = determine_phase(&network, "some-id", Some(&snap));

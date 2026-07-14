@@ -123,6 +123,14 @@ pub struct SecretRef {
 
     /// Secret namespace.
     pub namespace: String,
+
+    /// Key within the Secret's `data` map.
+    ///
+    /// Required when the Secret holds multiple keys (e.g. credential references
+    /// in `InferenceProvider.spec.auth.secretRef`).  Omit only when the entire
+    /// Secret is consumed (e.g. TLS `ca_secret_ref`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
 }
 
 // ---------------------------------------------------------------------------

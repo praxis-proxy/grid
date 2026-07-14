@@ -34,17 +34,15 @@ use crate::env::{
 /// Kubernetes namespace for consumer deployments.
 const NAMESPACE: &str = "default";
 
-/// Bearer token the consumer gateway injects for API-provider upstream requests.
+/// Bearer token stored in the API-provider credential Secret for xtask validation.
 ///
-/// The consumer Praxis config uses `filter: headers` / `request_set` to set this
-/// value in the `Authorization` header before forwarding requests to the API-provider
-/// cluster.  The client does **not** supply this token — it is managed entirely by
-/// the grid infrastructure configuration, demonstrating transparent credential
-/// injection.
+/// This value is written to a Kubernetes Secret by the xtask validation harness
+/// and then read back via the Secret-projection flow to build the Praxis consumer
+/// config.  It is never logged, and the generated YAML receives the value from
+/// the resolved Secret rather than embedding this compile-time constant directly.
 ///
-/// This is xtask validation configuration, not production credential lifecycle.
-/// Production should project credentials from `InferenceProvider.spec.auth.secretRef`
-/// into Praxis configuration rather than baking a static token into generated YAML.
+/// The validation proves the Secret-backed CRD → Praxis-config flow, not
+/// production credential management.
 pub(crate) const API_PROVIDER_INJECTED_TOKEN: &str = "grid-api-fallback-secret";
 
 /// Gateway HTTP port.
@@ -780,9 +778,18 @@ fn apply_consumer_deployment(context: &str) -> Result<(), Box<dyn std::error::Er
 /// Credential injection here is gateway-config-level proof using Praxis
 /// `headers` / `request_set`. It does not prove the future operator path that
 /// reads an `InferenceProvider` Secret reference and manages credential rotation.
+///
+/// **Caveat:** the bearer token is necessarily present in the generated Praxis
+/// consumer `ConfigMap` (`praxis-consumer-config`).  For the xtask validation
+/// harness this is acceptable; production deployments should use mounted Secret
+/// volumes or a native Praxis secret-reference mechanism.
 #[expect(
     clippy::too_many_lines,
     reason = "Praxis YAML generation with mTLS and plain-HTTP clusters"
+)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "six distinct config parameters: site, providers, overlay, cluster name, endpoint, token"
 )]
 fn build_api_fallback_consumer_config(
     consumer_site: &str,
@@ -790,6 +797,7 @@ fn build_api_fallback_consumer_config(
     overlay: &RoutingOverlay,
     api_cluster_name: &str,
     api_provider_endpoint: &str,
+    api_provider_token: &str,
 ) -> String {
     let candidates = operator_overlay::candidates_yaml(overlay);
     let local_site = consumer_site;
@@ -797,45 +805,45 @@ fn build_api_fallback_consumer_config(
     let fallback = local_providers
         .first()
         .map_or_else(|| std::process::abort(), |ep| format!("gateway-{}", ep.site));
-    // 9 spaces for the list item, 11 for the nested key (matching build_clusters indent).
     let api_cluster_yaml = format!(
-        "         - name: gateway-{api_cluster_name}\n\
-         \x20\x20         endpoints:\n\
-         \x20\x20           - \"{api_provider_endpoint}\""
+        r#"         - name: gateway-{api_cluster_name}
+           endpoints:
+             - "{api_provider_endpoint}""#
     );
 
     format!(
-        "listeners:\n\
-         \x20 - name: public\n\
-         \x20   address: \"0.0.0.0:{GATEWAY_HTTP_PORT}\"\n\
-         \x20   filter_chains:\n\
-         \x20     - consumer-chain\n\
-         filter_chains:\n\
-         \x20 - name: consumer-chain\n\
-         \x20   filters:\n\
-         \x20     - filter: json_body_field\n\
-         \x20       field: model\n\
-         \x20       header: X-Model\n\
-         \x20     - filter: grid_route\n\
-         \x20       local_site: {local_site}\n\
-         \x20       model_header: X-Model\n\
-         \x20       candidates:\n\
-         {candidates}\n\
-         \x20     - filter: headers\n\
-         \x20       request_set:\n\
-         \x20         - name: \"Authorization\"\n\
-         \x20           value: \"Bearer {API_PROVIDER_INJECTED_TOKEN}\"\n\
-         \x20     - filter: router\n\
-         \x20       routes:\n\
-         \x20         - path_prefix: \"/\"\n\
-         \x20           cluster: {fallback}\n\
-         \x20     - filter: load_balancer\n\
-         \x20       clusters:\n\
-         {mtls_clusters}\n\
-         {api_cluster_yaml}\n\
-         admin:\n\
-         \x20 address: \"127.0.0.1:9901\"\n\
-         shutdown_timeout_secs: 5\n"
+        r#"listeners:
+  - name: public
+    address: "0.0.0.0:{GATEWAY_HTTP_PORT}"
+    filter_chains:
+      - consumer-chain
+filter_chains:
+  - name: consumer-chain
+    filters:
+      - filter: json_body_field
+        field: model
+        header: X-Model
+      - filter: grid_route
+        local_site: {local_site}
+        model_header: X-Model
+        candidates:
+{candidates}
+      - filter: headers
+        request_set:
+          - name: "Authorization"
+            value: "Bearer {api_provider_token}"
+      - filter: router
+        routes:
+          - path_prefix: "/"
+            cluster: {fallback}
+      - filter: load_balancer
+        clusters:
+{mtls_clusters}
+{api_cluster_yaml}
+admin:
+  address: "127.0.0.1:9901"
+shutdown_timeout_secs: 5
+"#
     )
 }
 
@@ -854,6 +862,7 @@ pub(crate) fn deploy_consumer_for_api_fallback(
     overlay: &RoutingOverlay,
     api_cluster_name: &str,
     api_provider_endpoint: &str,
+    api_provider_token: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let consumer_site = consumer_cluster_name(cfg)?;
     let consumer_ctx = kubectl_context(consumer_site);
@@ -870,6 +879,7 @@ pub(crate) fn deploy_consumer_for_api_fallback(
         overlay,
         api_cluster_name,
         api_provider_endpoint,
+        api_provider_token,
     );
 
     create_consumer_tls_secret(&consumer_ctx, consumer_site)?;
@@ -915,8 +925,11 @@ pub(crate) fn deploy_consumer_for_api_fallback(
 /// such as `SigV4`, `OAuth2`, or real external API calls.
 ///
 /// API credentials are injected with Praxis `headers` / `request_set` for the
-/// validation. Production Secret projection from `InferenceProvider.spec.auth`
-/// is a separate operator responsibility.
+/// validation.  **Caveat:** the bearer token is necessarily present in the
+/// generated Praxis consumer `ConfigMap` (`praxis-consumer-config`).  For the
+/// xtask validation harness this is acceptable; production deployments should
+/// move to mounted Secret volumes or a native Praxis secret-reference
+/// mechanism when available rather than embedding credentials in a `ConfigMap`.
 #[expect(clippy::too_many_lines, reason = "Praxis YAML generation for all four cluster types")]
 #[expect(
     clippy::too_many_arguments,
@@ -930,6 +943,7 @@ fn build_full_grid_consumer_config(
     cloud_endpoint: &str,
     api_cluster_name: &str,
     api_endpoint: &str,
+    api_provider_token: &str,
 ) -> String {
     let candidates = operator_overlay::candidates_yaml(overlay);
     let local_site = consumer_site;
@@ -937,53 +951,53 @@ fn build_full_grid_consumer_config(
     let fallback = mtls_providers
         .first()
         .map_or_else(|| std::process::abort(), |ep| format!("gateway-{}", ep.site));
-    // Plain-HTTP cluster for cloud-managed mock (no TLS — cloud APIs use HTTPS
-    // in production, but the kind mock uses plain HTTP for simplicity).
+    // Plain-HTTP clusters for cloud-managed and api-provider mocks.
+    // Cloud APIs use HTTPS in production; the kind mocks use plain HTTP for simplicity.
     let cloud_cluster_yaml = format!(
-        "         - name: gateway-{cloud_cluster_name}\n\
-         \x20\x20         endpoints:\n\
-         \x20\x20           - \"{cloud_endpoint}\""
+        r#"         - name: gateway-{cloud_cluster_name}
+           endpoints:
+             - "{cloud_endpoint}""#
     );
-    // Plain-HTTP cluster for api-provider mock.
     let api_cluster_yaml = format!(
-        "         - name: gateway-{api_cluster_name}\n\
-         \x20\x20         endpoints:\n\
-         \x20\x20           - \"{api_endpoint}\""
+        r#"         - name: gateway-{api_cluster_name}
+           endpoints:
+             - "{api_endpoint}""#
     );
 
     format!(
-        "listeners:\n\
-         \x20 - name: public\n\
-         \x20   address: \"0.0.0.0:{GATEWAY_HTTP_PORT}\"\n\
-         \x20   filter_chains:\n\
-         \x20     - consumer-chain\n\
-         filter_chains:\n\
-         \x20 - name: consumer-chain\n\
-         \x20   filters:\n\
-         \x20     - filter: json_body_field\n\
-         \x20       field: model\n\
-         \x20       header: X-Model\n\
-         \x20     - filter: grid_route\n\
-         \x20       local_site: {local_site}\n\
-         \x20       model_header: X-Model\n\
-         \x20       candidates:\n\
-         {candidates}\n\
-         \x20     - filter: headers\n\
-         \x20       request_set:\n\
-         \x20         - name: \"Authorization\"\n\
-         \x20           value: \"Bearer {API_PROVIDER_INJECTED_TOKEN}\"\n\
-         \x20     - filter: router\n\
-         \x20       routes:\n\
-         \x20         - path_prefix: \"/\"\n\
-         \x20           cluster: {fallback}\n\
-         \x20     - filter: load_balancer\n\
-         \x20       clusters:\n\
-         {mtls_clusters}\n\
-         {cloud_cluster_yaml}\n\
-         {api_cluster_yaml}\n\
-         admin:\n\
-         \x20 address: \"127.0.0.1:9901\"\n\
-         shutdown_timeout_secs: 5\n"
+        r#"listeners:
+  - name: public
+    address: "0.0.0.0:{GATEWAY_HTTP_PORT}"
+    filter_chains:
+      - consumer-chain
+filter_chains:
+  - name: consumer-chain
+    filters:
+      - filter: json_body_field
+        field: model
+        header: X-Model
+      - filter: grid_route
+        local_site: {local_site}
+        model_header: X-Model
+        candidates:
+{candidates}
+      - filter: headers
+        request_set:
+          - name: "Authorization"
+            value: "Bearer {api_provider_token}"
+      - filter: router
+        routes:
+          - path_prefix: "/"
+            cluster: {fallback}
+      - filter: load_balancer
+        clusters:
+{mtls_clusters}
+{cloud_cluster_yaml}
+{api_cluster_yaml}
+admin:
+  address: "127.0.0.1:9901"
+shutdown_timeout_secs: 5
+"#
     )
 }
 
@@ -1003,6 +1017,7 @@ pub(crate) fn deploy_consumer_for_full_grid(
     cloud_endpoint: &str,
     api_cluster_name: &str,
     api_endpoint: &str,
+    api_provider_token: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let consumer_site = consumer_cluster_name(cfg)?;
     let consumer_ctx = kubectl_context(consumer_site);
@@ -1021,6 +1036,7 @@ pub(crate) fn deploy_consumer_for_full_grid(
         cloud_endpoint,
         api_cluster_name,
         api_endpoint,
+        api_provider_token,
     );
 
     create_consumer_tls_secret(&consumer_ctx, consumer_site)?;
@@ -1196,6 +1212,7 @@ pub(crate) fn verify_api_fallback_e2e(
     local_model: &str,
     api_model: &str,
     mock_api_port: Option<u16>,
+    api_provider_secret: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let consumer_site = consumer_cluster_name(cfg)?;
     let mut tally = Tally::default();
@@ -1236,7 +1253,7 @@ pub(crate) fn verify_api_fallback_e2e(
     // Negative: direct request to mock WITHOUT auth → 401.
     // Positive: request via consumer gateway WITHOUT client auth → 200 (gateway injects credential).
     if let Some(mock_port) = mock_api_port {
-        verify_credential_injection(&ctx, port, api_model, mock_port, &mut tally);
+        verify_credential_injection(&ctx, port, api_model, mock_port, api_provider_secret, &mut tally);
     }
 
     // Assertion 4: unknown model fails cleanly.
@@ -1454,11 +1471,16 @@ fn send_request_without_auth(port: u16, model: &str) -> Result<HttpResponse, Box
     clippy::too_many_lines,
     reason = "two-phase credential injection proof: negative then positive"
 )]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "six distinct parameters: context, two ports, model, secret name, tally"
+)]
 pub(crate) fn verify_credential_injection(
     context: &str,
     consumer_port: u16,
     api_model: &str,
     mock_api_port: u16,
+    api_provider_secret: &str,
     tally: &mut Tally,
 ) {
     let consumer_site = "consumer";
@@ -1500,7 +1522,7 @@ pub(crate) fn verify_credential_injection(
                 &format!(
                     "credential injection positive proof: consumer gateway request for \
                      {api_model:?} without client Authorization returns 200 \
-                     (gateway injected Bearer {API_PROVIDER_INJECTED_TOKEN:?})"
+                     (gateway injected bearer token from Secret {api_provider_secret:?})"
                 ),
             );
             if serde_json::from_str::<serde_json::Value>(&resp.body)
@@ -1946,6 +1968,113 @@ mod tests {
         assert!(
             args.contains(&"deployment/praxis-consumer".to_owned()),
             "resource must use deployment/ prefix"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // API-provider credential injection
+    // -----------------------------------------------------------------------
+
+    fn make_test_overlay() -> RoutingOverlay {
+        RoutingOverlay {
+            network: "test-net".to_owned(),
+            local_site: "site-a".to_owned(),
+            candidates: vec![],
+        }
+    }
+
+    fn make_test_providers() -> Vec<ProviderEndpoint> {
+        vec![ProviderEndpoint {
+            site: "site-a".to_owned(),
+            address: "172.18.0.4:30080".to_owned(),
+            models: vec!["model-x".to_owned()],
+            sni: "site-a".to_owned(),
+        }]
+    }
+
+    #[test]
+    fn bearer_token_injection_uses_provided_token() {
+        let overlay = make_test_overlay();
+        let providers = make_test_providers();
+        let token = "test-bearer-secret-value";
+        let config = build_api_fallback_consumer_config(
+            "consumer",
+            &providers,
+            &overlay,
+            "op-e2e-api-fallback",
+            "mock-api-provider.default.svc:8080",
+            token,
+        );
+        assert!(
+            config.contains(&format!("Bearer {token}")),
+            "consumer config must inject the provided token"
+        );
+    }
+
+    #[test]
+    fn bearer_token_injection_does_not_hardcode_constant() {
+        let overlay = make_test_overlay();
+        let providers = make_test_providers();
+        let token = "secret-from-kubernetes-object";
+        let config = build_api_fallback_consumer_config(
+            "consumer",
+            &providers,
+            &overlay,
+            "op-e2e-api-fallback",
+            "mock-api-provider.default.svc:8080",
+            token,
+        );
+        // Must use the passed token, not any hardcoded value.
+        assert!(config.contains(token), "consumer config must use the token parameter");
+        assert!(
+            !config.contains(API_PROVIDER_INJECTED_TOKEN),
+            "consumer config must not embed the compile-time constant token"
+        );
+    }
+
+    #[test]
+    fn full_grid_bearer_token_uses_provided_token() {
+        let overlay = make_test_overlay();
+        let providers = make_test_providers();
+        let token = "full-grid-test-token";
+        let config = build_full_grid_consumer_config(
+            "consumer",
+            &providers,
+            &overlay,
+            "op-e2e-fg-cloud",
+            "mock-cloud-provider.default.svc:8080",
+            "op-e2e-fg-api",
+            "mock-api-provider.default.svc:8080",
+            token,
+        );
+        assert!(
+            config.contains(&format!("Bearer {token}")),
+            "full-grid consumer config must inject the provided token"
+        );
+    }
+
+    #[test]
+    fn bearer_token_absent_from_overlay_candidate() {
+        // Prove that RoutingCandidate JSON has no token/credential/Authorization fields.
+        // Credentials live in the consumer Praxis config, not in the overlay.
+        let candidate_json = serde_json::json!({
+            "kind": "inference_model",
+            "name": "model-z",
+            "site": "op-e2e-api-fallback",
+            "cluster": "op-e2e-api-fallback",
+            "fresh": true
+        });
+        assert!(
+            candidate_json.get("token").is_none(),
+            "overlay candidate must not carry a token field"
+        );
+        assert!(
+            candidate_json.get("credential").is_none(),
+            "overlay candidate must not carry a credential field"
+        );
+        assert!(
+            candidate_json.get("Authorization").is_none(),
+            "overlay candidate must not carry an Authorization field"
         );
     }
 }

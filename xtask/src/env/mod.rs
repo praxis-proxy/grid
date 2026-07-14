@@ -716,8 +716,9 @@ fn env_verify_gateway_e2e(config: &Path) -> Result<(), Box<dyn std::error::Error
 #[expect(clippy::too_many_lines, reason = "multi-step E2E orchestration")]
 fn env_verify_api_fallback(config: &Path, site: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     use operator::{
-        API_FALLBACK_MODEL, CONFIGMAP_POLL_TIMEOUT, STATUS_POLL_TIMEOUT, TEST_GATEWAY_NAME, TEST_GATEWAY_NS,
-        TEST_HEALTHY_ROUTING_CLUSTER, TEST_NETWORK, TEST_PROVIDER_API, TEST_PROVIDER_HEALTHY,
+        API_FALLBACK_MODEL, API_PROVIDER_SECRET_KEY, API_PROVIDER_SECRET_NAME, API_PROVIDER_SECRET_NS,
+        CONFIGMAP_POLL_TIMEOUT, STATUS_POLL_TIMEOUT, TEST_GATEWAY_NAME, TEST_GATEWAY_NS, TEST_HEALTHY_ROUTING_CLUSTER,
+        TEST_NETWORK, TEST_PROVIDER_API, TEST_PROVIDER_HEALTHY,
     };
 
     let cfg = EnvConfig::from_file(config)?;
@@ -753,10 +754,23 @@ fn env_verify_api_fallback(config: &Path, site: Option<&str>) -> Result<(), Box<
     eprintln!("verify-api-fallback: [3/5] operator reconcile + overlay export...");
     operator::install_grid_crds(&context)?;
     operator::cleanup_validation_resources(&context)?;
+    // Clean up any stale credential Secret from a previous run.
+    operator::delete_api_credential_secret(&context, API_PROVIDER_SECRET_NS)
+        .unwrap_or_else(|e| eprintln!("  note: credential Secret cleanup: {e}"));
+
+    // Create the credential Secret before applying the InferenceProvider so that the
+    // provider's spec.auth.secretRef is resolvable immediately after apply.
+    operator::create_api_credential_secret(
+        &context,
+        API_PROVIDER_SECRET_NAME,
+        API_PROVIDER_SECRET_NS,
+        API_PROVIDER_SECRET_KEY,
+        consumer::API_PROVIDER_INJECTED_TOKEN,
+    )?;
 
     let healthy_endpoint = "http://mock-openai-provider.default.svc:8080";
     // Apply the GridNetwork + healthy local provider (model-x) + invalid (excluded by
-    // operator) + api_provider (model-z, api_provider backendKind).
+    // operator) + api_provider (model-z, api_provider backendKind, auth.secretRef set).
     // The degraded and metrics fixtures are omitted — this validation focuses on the
     // local-vs-api_provider routing path, not on health/metrics signal ordering.
     // The spec.endpoint on the api_provider fixture is not used for routing; the xtask
@@ -803,7 +817,11 @@ fn env_verify_api_fallback(config: &Path, site: Option<&str>) -> Result<(), Box<
     let overlay_json = std::fs::read_to_string(&overlay_path)?;
     let overlay = operator_overlay::parse_grid_config_json(&overlay_json)?;
 
-    consumer::deploy_consumer_for_api_fallback(&cfg, &overlay, TEST_PROVIDER_API, &api_provider_endpoint)?;
+    // Read the credential from the provider's referenced Secret.
+    // This proves the InferenceProvider spec.auth.secretRef → Secret → Praxis config flow.
+    let api_token = operator::read_provider_api_credential(&context, TEST_PROVIDER_API)?;
+
+    consumer::deploy_consumer_for_api_fallback(&cfg, &overlay, TEST_PROVIDER_API, &api_provider_endpoint, &api_token)?;
 
     // ── Step 5: verify routing + credential injection ─────────────────────────
     eprintln!("verify-api-fallback: [5/5] verifying API-provider fallback routing and credential injection...");
@@ -819,7 +837,13 @@ fn env_verify_api_fallback(config: &Path, site: Option<&str>) -> Result<(), Box<
         verify::PortForwardGuard::start(&consumer_ctx, kind::MOCK_API_SVC, mock_port, kind::MOCK_API_PORT)?;
     let mock_pf_ready = verify::wait_for_port(mock_port);
 
-    consumer::verify_api_fallback_e2e(&cfg, "model-x", API_FALLBACK_MODEL, mock_pf_ready.then_some(mock_port))?;
+    consumer::verify_api_fallback_e2e(
+        &cfg,
+        "model-x",
+        API_FALLBACK_MODEL,
+        mock_pf_ready.then_some(mock_port),
+        API_PROVIDER_SECRET_NAME,
+    )?;
 
     mock_pf.stop();
 
@@ -1920,8 +1944,9 @@ fn env_verify_demo1_llmd_routing(config: &Path) -> Result<(), Box<dyn std::error
 )]
 fn env_verify_full_grid_routing(config: &Path) -> Result<(), Box<dyn std::error::Error>> {
     use operator::{
-        CONFIGMAP_POLL_TIMEOUT, FULL_GRID_GW, FULL_GRID_MODEL_API, FULL_GRID_MODEL_CLOUD, FULL_GRID_MODEL_EAST,
-        FULL_GRID_MODEL_WEST, FULL_GRID_NETWORK, FULL_GRID_PROVIDER_API, FULL_GRID_PROVIDER_CLOUD, STATUS_POLL_TIMEOUT,
+        API_PROVIDER_SECRET_KEY, API_PROVIDER_SECRET_NAME, API_PROVIDER_SECRET_NS, CONFIGMAP_POLL_TIMEOUT,
+        FULL_GRID_GW, FULL_GRID_MODEL_API, FULL_GRID_MODEL_CLOUD, FULL_GRID_MODEL_EAST, FULL_GRID_MODEL_WEST,
+        FULL_GRID_NETWORK, FULL_GRID_PROVIDER_API, FULL_GRID_PROVIDER_CLOUD, STATUS_POLL_TIMEOUT,
     };
 
     let cfg = EnvConfig::from_file(config)?;
@@ -1980,6 +2005,16 @@ fn env_verify_full_grid_routing(config: &Path) -> Result<(), Box<dyn std::error:
     eprintln!("verify-full-grid-routing: [3/6] operator reconcile + overlay export...");
     operator::install_grid_crds(&east_ctx)?;
     operator::cleanup_full_grid_resources(&east_ctx)?;
+    // Create credential Secret before applying the InferenceProvider fixture.
+    operator::delete_api_credential_secret(&east_ctx, API_PROVIDER_SECRET_NS)
+        .unwrap_or_else(|e| eprintln!("  note: credential Secret cleanup: {e}"));
+    operator::create_api_credential_secret(
+        &east_ctx,
+        API_PROVIDER_SECRET_NAME,
+        API_PROVIDER_SECRET_NS,
+        API_PROVIDER_SECRET_KEY,
+        consumer::API_PROVIDER_INJECTED_TOKEN,
+    )?;
     operator::apply_full_grid_fixtures(
         &east_ctx,
         east_site,
@@ -2030,6 +2065,10 @@ fn env_verify_full_grid_routing(config: &Path) -> Result<(), Box<dyn std::error:
     let overlay_json = std::fs::read_to_string(&overlay_path)?;
     let overlay = operator_overlay::parse_grid_config_json(&overlay_json)?;
 
+    // Read credential from the provider's referenced Secret — proves the
+    // InferenceProvider spec.auth.secretRef → Secret → Praxis config flow.
+    let api_token = operator::read_provider_api_credential(&east_ctx, FULL_GRID_PROVIDER_API)?;
+
     consumer::deploy_consumer_for_full_grid(
         &cfg,
         &overlay,
@@ -2037,6 +2076,7 @@ fn env_verify_full_grid_routing(config: &Path) -> Result<(), Box<dyn std::error:
         &cloud_endpoint,
         FULL_GRID_PROVIDER_API,
         &api_endpoint,
+        &api_token,
     )?;
 
     // ── Step 5: verify routing for all four models ───────────────────────────

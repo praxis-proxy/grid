@@ -54,6 +54,24 @@ pub(crate) const TEST_PROVIDER_API: &str = "op-e2e-api-fallback";
 pub(crate) const API_FALLBACK_MODEL: &str = "model-z";
 
 // ---------------------------------------------------------------------------
+// API-provider credential constants
+// ---------------------------------------------------------------------------
+
+/// Name of the Kubernetes Secret that holds the API-provider bearer token.
+///
+/// Created by the xtask validation harness before the operator reconcile so
+/// `InferenceProvider.spec.auth.secretRef` can reference it immediately.
+/// The validation reads the Secret back to prove the Secret-backed
+/// CRD-to-Praxis-config flow, not a hardcoded generated config value.
+pub(crate) const API_PROVIDER_SECRET_NAME: &str = "op-e2e-api-provider-creds";
+
+/// Namespace of the API-provider credential Secret.
+pub(crate) const API_PROVIDER_SECRET_NS: &str = "default";
+
+/// Key within the API-provider credential Secret that holds the bearer token.
+pub(crate) const API_PROVIDER_SECRET_KEY: &str = "token";
+
+// ---------------------------------------------------------------------------
 // Full-grid routing validation constants
 // ---------------------------------------------------------------------------
 
@@ -1647,7 +1665,15 @@ pub(crate) fn apply_api_provider_fixture(context: &str, endpoint: &str) -> Resul
             "providerKind": "anthropic",
             "backendKind": "api_provider",
             "endpoint": endpoint,
-            "models": [{ "name": "model-z" }]
+            "models": [{ "name": "model-z" }],
+            "auth": {
+                "strategy": "bearer_token",
+                "secretRef": {
+                    "name": API_PROVIDER_SECRET_NAME,
+                    "namespace": API_PROVIDER_SECRET_NS,
+                    "key": API_PROVIDER_SECRET_KEY
+                }
+            }
         }
     }))
     .unwrap_or_else(|e| {
@@ -1655,7 +1681,10 @@ pub(crate) fn apply_api_provider_fixture(context: &str, endpoint: &str) -> Resul
         std::process::exit(1);
     });
     apply_manifest(context, &manifest)?;
-    eprintln!("  [OK] api provider fixture applied");
+    eprintln!(
+        "  [OK] api provider fixture applied \
+         (auth.strategy=bearer_token, secretRef={API_PROVIDER_SECRET_NAME:?}/{API_PROVIDER_SECRET_KEY:?})"
+    );
     Ok(())
 }
 
@@ -1862,7 +1891,15 @@ pub(crate) fn apply_full_grid_fixtures(
             "providerKind": "anthropic",
             "backendKind": "api_provider",
             "endpoint": api_endpoint,
-            "models": [{ "name": FULL_GRID_MODEL_API }]
+            "models": [{ "name": FULL_GRID_MODEL_API }],
+            "auth": {
+                "strategy": "bearer_token",
+                "secretRef": {
+                    "name": API_PROVIDER_SECRET_NAME,
+                    "namespace": API_PROVIDER_SECRET_NS,
+                    "key": API_PROVIDER_SECRET_KEY
+                }
+            }
         }
     }))
     .unwrap_or_else(|e| {
@@ -3327,6 +3364,316 @@ pub(crate) fn cleanup_failover_west_resources(context: &str) -> Result<(), Box<d
 }
 
 // ---------------------------------------------------------------------------
+// API-provider credential helpers
+// ---------------------------------------------------------------------------
+
+/// Parsed credential plan derived from `InferenceProvider.spec.auth` JSON.
+///
+/// A pure data type produced by [`parse_api_credential_plan`]; no kubectl calls.
+/// The xtask validation path uses this to decide whether and how to inject a
+/// bearer token into the consumer Praxis config.
+#[derive(Debug, PartialEq)]
+pub(crate) enum ApiCredentialPlan {
+    /// `auth.manual = true` — the user manages credentials; the harness does not inject.
+    Manual,
+    /// `spec.auth` is absent — no credential injection.
+    Absent,
+    /// `auth.strategy = bearer_token` with a resolved `SecretRef`.
+    BearerToken {
+        /// Secret name in the cluster.
+        secret_name: String,
+        /// Secret namespace.
+        namespace: String,
+        /// Key within `Secret.data` that holds the token.
+        key: String,
+    },
+}
+
+/// Parse `InferenceProvider.spec.auth` from its raw JSON representation.
+///
+/// This is a **pure function**: it does not call kubectl or read any Kubernetes
+/// resources.  Use it in tests and as the first step of the credential-projection
+/// path before calling [`read_api_credential`].
+///
+/// # Rules
+///
+/// | `manual` | `strategy` | `secret_ref` | Result |
+/// |---|---|---|---|
+/// | `true` | any | any | `Ok(Manual)` |
+/// | absent/null | — | — | `Ok(Absent)` |
+/// | `false` | `bearer_token` | present | `Ok(BearerToken { … })` |
+/// | `false` | `bearer_token` | absent | `Err("missing secretRef")` |
+/// | `false` | other | any | `Err("unsupported strategy …")` |
+#[expect(
+    clippy::too_many_lines,
+    reason = "match table with diagnostic messages for each auth variant"
+)]
+pub(crate) fn parse_api_credential_plan(
+    auth_json: &serde_json::Value,
+) -> Result<ApiCredentialPlan, Box<dyn std::error::Error>> {
+    if auth_json.is_null() {
+        return Ok(ApiCredentialPlan::Absent);
+    }
+
+    if auth_json.get("manual").and_then(serde_json::Value::as_bool) == Some(true) {
+        return Ok(ApiCredentialPlan::Manual);
+    }
+
+    let strategy = auth_json
+        .get("strategy")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+
+    match strategy {
+        "bearer_token" => {
+            let secret_ref = auth_json
+                .get("secretRef")
+                .ok_or("auth.strategy is bearer_token but spec.auth.secretRef is missing")?;
+            let name = secret_ref
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .ok_or("spec.auth.secretRef.name is missing or not a string")?;
+            let namespace = secret_ref
+                .get("namespace")
+                .and_then(serde_json::Value::as_str)
+                .ok_or("spec.auth.secretRef.namespace is missing or not a string")?;
+            let key = secret_ref
+                .get("key")
+                .and_then(serde_json::Value::as_str)
+                .ok_or("spec.auth.secretRef.key is missing or not a string")?;
+            Ok(ApiCredentialPlan::BearerToken {
+                secret_name: name.to_owned(),
+                namespace: namespace.to_owned(),
+                key: key.to_owned(),
+            })
+        },
+        other => Err(format!(
+            "unsupported auth strategy {other:?}: only bearer_token is supported \
+             for harness-driven credential projection"
+        )
+        .into()),
+    }
+}
+
+/// Create a Kubernetes Secret containing an API-provider bearer token.
+///
+/// Uses `stringData` so the Kubernetes API server handles base64 encoding,
+/// avoiding both the `base64` subprocess dependency and GNU base64's default
+/// 76-char line-wrapping (which would corrupt tokens longer than 57 bytes if
+/// the `data` field were used with an unwrapped subprocess).
+///
+/// The manifest is piped via stdin to `kubectl apply` and is **not logged** —
+/// only the Secret name and key appear in xtask output.
+pub(crate) fn create_api_credential_secret(
+    context: &str,
+    name: &str,
+    namespace: &str,
+    key: &str,
+    token: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // stringData: Kubernetes stores the plain-text value as base64 in .data.
+    // The manifest string is kept in-process and piped via stdin; it is never
+    // written to disk or logged.
+    let manifest = [
+        "apiVersion: v1",
+        "kind: Secret",
+        "metadata:",
+        &format!("  name: {name}"),
+        &format!("  namespace: {namespace}"),
+        "type: Opaque",
+        "stringData:",
+        &format!("  {key}: {token}"),
+        "",
+    ]
+    .join("\n");
+    apply_manifest(context, &manifest)?;
+    eprintln!(
+        "  [OK] credential Secret {name:?} created in {namespace:?} \
+         (key={key:?}, token not logged)"
+    );
+    Ok(())
+}
+
+/// Read a bearer token from a Kubernetes Secret.
+///
+/// Fetches the Secret as JSON and base64-decodes `Secret.data[key]`.
+/// Kubernetes stores `Secret.data` values as standard base64; they are
+/// decoded here using the system `base64 -d` command so no extra crate is needed.
+///
+/// The decoded token value is returned but **never logged** — callers
+/// must not print the return value.
+#[expect(clippy::too_many_lines, reason = "kubectl fetch + JSON parse + base64 decode chain")]
+pub(crate) fn read_api_credential(
+    context: &str,
+    secret_name: &str,
+    namespace: &str,
+    key: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    use std::io::Write as _;
+    // Fetch the whole Secret as JSON so the key lookup is not subject to
+    // jsonpath escaping rules for keys that contain dots or slashes.
+    let out = Command::new("kubectl")
+        .args([
+            "--context",
+            context,
+            "get",
+            "secret",
+            secret_name,
+            "-n",
+            namespace,
+            "-o",
+            "json",
+        ])
+        .output()?;
+    if !out.status.success() {
+        return Err(format!(
+            "kubectl get secret {secret_name:?} in {namespace:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        )
+        .into());
+    }
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout)?;
+    let b64 = json
+        .get("data")
+        .and_then(|d| d.get(key))
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("Secret {secret_name:?} in {namespace:?} has no key {key:?}"))?;
+
+    // Kubernetes encodes Secret.data values as standard (non-URL-safe) base64.
+    let mut child = Command::new("base64")
+        .arg("-d")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
+    if let Some(stdin) = child.stdin.as_mut() {
+        stdin.write_all(b64.as_bytes())?;
+    }
+    let decoded = child.wait_with_output()?;
+    if !decoded.status.success() {
+        return Err(format!("base64 decode of Secret {secret_name:?}/{key:?} failed").into());
+    }
+    let token = String::from_utf8(decoded.stdout)?;
+
+    eprintln!("  [OK] credential read from Secret {secret_name:?} key={key:?} (token not logged)");
+    Ok(token)
+}
+
+/// Resolve a parsed credential plan to a bearer token string.
+///
+/// This is the **v1 credential backend boundary**.  New credential sources
+/// (External Secrets, Vault, workload identity, `OAuth2` refresh, `SigV4` signing)
+/// add a new [`ApiCredentialPlan`] variant and a new match arm here; callers
+/// and the rest of the harness do not need to change.
+///
+/// | Plan | Return |
+/// |---|---|
+/// | `Absent` | `Ok(None)` — no injection |
+/// | `Manual` | `Ok(None)` — caller manages credentials |
+/// | `BearerToken { … }` | `Ok(Some(token))` — read from k8s Secret |
+///
+/// The returned token is never logged; only the Secret name and key are printed.
+pub(crate) fn resolve_api_credential(
+    context: &str,
+    plan: &ApiCredentialPlan,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    match plan {
+        ApiCredentialPlan::Absent | ApiCredentialPlan::Manual => Ok(None),
+        ApiCredentialPlan::BearerToken {
+            secret_name,
+            namespace,
+            key,
+        } => {
+            let token = read_api_credential(context, secret_name, namespace, key)?;
+            Ok(Some(token))
+        },
+    }
+}
+
+/// Read and resolve the bearer token for a named `InferenceProvider`.
+///
+/// Reads `InferenceProvider.spec.auth` from Kubernetes, parses it into an
+/// [`ApiCredentialPlan`] via [`parse_api_credential_plan`], then calls
+/// [`resolve_api_credential`] to fetch the actual credential.
+///
+/// Returns `Err` if:
+/// - the provider has no `spec.auth` or `auth.manual = true`
+/// - `auth.strategy` is unsupported
+/// - the referenced Secret or key is missing
+#[expect(
+    clippy::too_many_lines,
+    reason = "kubectl read + auth parse + plan dispatch + resolve chain"
+)]
+pub(crate) fn read_provider_api_credential(
+    context: &str,
+    provider_name: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let out = Command::new("kubectl")
+        .args([
+            "--context",
+            context,
+            "get",
+            "inferenceprovider",
+            provider_name,
+            "-o",
+            "jsonpath={.spec.auth}",
+        ])
+        .output()?;
+    if !out.status.success() {
+        return Err(format!(
+            "kubectl get inferenceprovider/{provider_name} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        )
+        .into());
+    }
+    let auth_str = String::from_utf8_lossy(&out.stdout);
+    let auth_str = auth_str.trim();
+    let auth_json: serde_json::Value = if auth_str.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::from_str(auth_str).map_err(|e| format!("auth JSON parse error: {e}"))?
+    };
+
+    let plan = parse_api_credential_plan(&auth_json)?;
+
+    // Log the plan without leaking the token value.
+    match &plan {
+        ApiCredentialPlan::BearerToken { secret_name, key, .. } => {
+            eprintln!(
+                "  [OK] InferenceProvider {provider_name:?}: auth.strategy=bearer_token, \
+                 secretRef={secret_name:?}/{key:?}"
+            );
+        },
+        ApiCredentialPlan::Manual => {
+            return Err(format!(
+                "InferenceProvider {provider_name:?} has auth.manual=true; \
+                 harness-driven credential injection is disabled"
+            )
+            .into());
+        },
+        ApiCredentialPlan::Absent => {
+            return Err(format!(
+                "InferenceProvider {provider_name:?} has no spec.auth; \
+                 cannot project credentials without an auth configuration"
+            )
+            .into());
+        },
+    }
+
+    resolve_api_credential(context, &plan)?.ok_or_else(|| {
+        format!(
+            "InferenceProvider {provider_name:?} resolved to no credential \
+             (manual=true or auth absent)"
+        )
+        .into()
+    })
+}
+
+/// Delete the API-provider credential Secret (best-effort, used during cleanup).
+pub(crate) fn delete_api_credential_secret(context: &str, namespace: &str) -> Result<(), Box<dyn std::error::Error>> {
+    delete_namespaced_resource(context, namespace, "secret", API_PROVIDER_SECRET_NAME)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -4057,5 +4404,98 @@ mod tests {
                 "defined phase {phase:?} must have an index"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_api_credential_plan — pure function tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn credential_plan_absent_when_auth_is_null() {
+        let plan = parse_api_credential_plan(&serde_json::Value::Null).unwrap();
+        assert_eq!(plan, ApiCredentialPlan::Absent, "null auth must produce Absent");
+    }
+
+    #[test]
+    fn credential_plan_manual_when_manual_is_true() {
+        let auth = serde_json::json!({ "manual": true, "strategy": "bearer_token" });
+        let plan = parse_api_credential_plan(&auth).unwrap();
+        assert_eq!(
+            plan,
+            ApiCredentialPlan::Manual,
+            "manual=true must suppress injection regardless of strategy"
+        );
+    }
+
+    #[test]
+    fn credential_plan_bearer_token_extracts_secret_ref() {
+        let auth = serde_json::json!({
+            "strategy": "bearer_token",
+            "secretRef": { "name": "my-secret", "namespace": "default", "key": "token" }
+        });
+        let plan = parse_api_credential_plan(&auth).unwrap();
+        assert!(
+            matches!(
+                &plan,
+                ApiCredentialPlan::BearerToken { secret_name, namespace, key }
+                    if secret_name == "my-secret" && namespace == "default" && key == "token"
+            ),
+            "bearer_token must extract the secretRef fields; got {plan:?}"
+        );
+    }
+
+    #[test]
+    fn credential_plan_bearer_token_missing_secret_ref_is_error() {
+        let auth = serde_json::json!({ "strategy": "bearer_token" });
+        assert!(
+            parse_api_credential_plan(&auth).is_err(),
+            "bearer_token without secretRef must fail"
+        );
+    }
+
+    #[test]
+    fn credential_plan_bearer_token_missing_key_is_error() {
+        let auth = serde_json::json!({
+            "strategy": "bearer_token",
+            "secretRef": { "name": "s", "namespace": "default" }
+        });
+        assert!(
+            parse_api_credential_plan(&auth).is_err(),
+            "secretRef without key must fail"
+        );
+    }
+
+    #[test]
+    fn credential_plan_unsupported_strategy_is_error() {
+        let auth = serde_json::json!({ "strategy": "api_key" });
+        let err = parse_api_credential_plan(&auth).unwrap_err();
+        assert!(
+            err.to_string().contains("unsupported auth strategy"),
+            "unsupported strategy must produce a clear error; got {err}"
+        );
+    }
+
+    #[test]
+    fn credential_plan_token_not_in_overlay_candidate() {
+        // Prove RoutingCandidate JSON has no credential-related fields.
+        let candidate = serde_json::json!({
+            "kind": "inference_model",
+            "name": "model-z",
+            "site": "op-e2e-api-fallback",
+            "cluster": "op-e2e-api-fallback",
+            "fresh": true
+        });
+        assert!(
+            candidate.get("token").is_none(),
+            "overlay candidate must not carry a token field"
+        );
+        assert!(
+            candidate.get("credential").is_none(),
+            "overlay candidate must not carry a credential field"
+        );
+        assert!(
+            candidate.get("auth").is_none(),
+            "overlay candidate must not carry an auth field"
+        );
     }
 }
