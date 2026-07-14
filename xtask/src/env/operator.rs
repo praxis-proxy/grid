@@ -307,6 +307,38 @@ pub(crate) const SITE_JOIN_JOINING_EGRESS: &str = "172.18.0.5:8443";
 pub(crate) const SITE_JOIN_PHASE_POLL_TIMEOUT: Duration = Duration::from_secs(30);
 
 // ---------------------------------------------------------------------------
+// Failover / lost-peer validation constants
+// ---------------------------------------------------------------------------
+
+/// `GridNetwork` name used by the failover-under-lost-peer validation.
+pub(crate) const FAILOVER_NETWORK: &str = "op-e2e-failover-net";
+
+/// Gateway reference name used in the failover `GridNetwork`.
+pub(crate) const FAILOVER_GW: &str = "op-e2e-failover-gw";
+
+/// `InferenceProvider` name for the east (local/primary) site.
+pub(crate) const FAILOVER_EAST_PROVIDER: &str = "op-e2e-failover-east";
+
+/// `InferenceProvider` name for the west (remote/joining) site.
+pub(crate) const FAILOVER_WEST_PROVIDER: &str = "op-e2e-failover-west";
+
+/// Model name served by the local east provider.
+pub(crate) const FAILOVER_LOCAL_MODEL: &str = "model-failover-local";
+
+/// Model name served by the remote west provider.
+pub(crate) const FAILOVER_REMOTE_MODEL: &str = "model-failover-remote";
+
+/// Time to wait after killing the west operator before triggering a reconcile.
+///
+/// With `foca::Config::simple()` the probe period is 1.5 s and
+/// `suspect_to_down_after` is 3 s, so a killed process is declared `Dead`
+/// within ~6 s.  20 s provides a safe margin on loaded CI hosts.
+pub(crate) const SWIM_DEAD_MEMBER_WAIT: Duration = Duration::from_secs(20);
+
+/// Timeout for polling the overlay until a remote candidate becomes `fresh=false`.
+pub(crate) const FAILOVER_STALE_POLL_TIMEOUT: Duration = Duration::from_secs(30);
+
+// ---------------------------------------------------------------------------
 // CRD installation
 // ---------------------------------------------------------------------------
 
@@ -3069,6 +3101,229 @@ pub(crate) fn gridsites_in_network<'a>(sites: &'a [serde_json::Value], network: 
 pub(crate) fn gridsite_phase_index(phase: &str) -> Option<usize> {
     const PHASES: &[&str] = &["Pending", "Discovered", "Connecting", "Active", "Unreachable", "Left"];
     PHASES.iter().position(|p| *p == phase)
+}
+
+// ---------------------------------------------------------------------------
+// Failover / lost-peer helpers
+// ---------------------------------------------------------------------------
+
+/// Apply east-cluster fixtures for the failover validation.
+///
+/// Creates `GridNetwork` [`FAILOVER_NETWORK`] with a `gatewayRef` pointing at
+/// [`FAILOVER_GW`] (the overlay is generated on the east/primary cluster) and
+/// `InferenceProvider` [`FAILOVER_EAST_PROVIDER`] with `backendKind: "local"`.
+#[expect(clippy::too_many_lines, reason = "two JSON manifests with full K8s structure")]
+pub(crate) fn apply_failover_east_fixtures(
+    context: &str,
+    east_site: &str,
+    model: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let network = serde_json::to_string_pretty(&serde_json::json!({
+        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "kind": "GridNetwork",
+        "metadata": { "name": FAILOVER_NETWORK },
+        "spec": {
+            "seeds": [],
+            "gatewayRefs": [{
+                "name": FAILOVER_GW,
+                "namespace": "default",
+                "localSiteName": east_site
+            }]
+        }
+    }))
+    .unwrap_or_else(|e| {
+        eprintln!("failover east GridNetwork serialization failed: {e}");
+        std::process::exit(1);
+    });
+    let provider = serde_json::to_string_pretty(&serde_json::json!({
+        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "kind": "InferenceProvider",
+        "metadata": { "name": FAILOVER_EAST_PROVIDER },
+        "spec": {
+            "gridNetworkRef": FAILOVER_NETWORK,
+            "providerKind": "self_hosted",
+            "backendKind": "local",
+            "endpoint": "http://mock-openai-provider.default.svc:8080",
+            "models": [{ "name": model }],
+            "routingClusterRef": east_site
+        }
+    }))
+    .unwrap_or_else(|e| {
+        eprintln!("failover east provider serialization failed: {e}");
+        std::process::exit(1);
+    });
+    apply_manifest(context, &network)?;
+    apply_manifest(context, &provider)?;
+    eprintln!(
+        "  [OK] failover east fixtures applied \
+         ({FAILOVER_EAST_PROVIDER}, model={model:?}, routingClusterRef={east_site:?})"
+    );
+    Ok(())
+}
+
+/// Apply west-cluster fixtures for the failover validation.
+///
+/// Creates `GridNetwork` [`FAILOVER_NETWORK`] with no `gatewayRefs` (the west
+/// operator participates in SWIM but does not generate an overlay) and
+/// `InferenceProvider` [`FAILOVER_WEST_PROVIDER`] with `backendKind: "remote"`.
+#[expect(clippy::too_many_lines, reason = "two JSON manifests with full K8s structure")]
+pub(crate) fn apply_failover_west_fixtures(
+    context: &str,
+    west_site: &str,
+    model: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let network = serde_json::to_string_pretty(&serde_json::json!({
+        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "kind": "GridNetwork",
+        "metadata": { "name": FAILOVER_NETWORK },
+        "spec": { "seeds": [] }
+    }))
+    .unwrap_or_else(|e| {
+        eprintln!("failover west GridNetwork serialization failed: {e}");
+        std::process::exit(1);
+    });
+    let provider = serde_json::to_string_pretty(&serde_json::json!({
+        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "kind": "InferenceProvider",
+        "metadata": { "name": FAILOVER_WEST_PROVIDER },
+        "spec": {
+            "gridNetworkRef": FAILOVER_NETWORK,
+            "providerKind": "self_hosted",
+            "backendKind": "remote",
+            "endpoint": "http://mock-openai-provider.default.svc:8080",
+            "models": [{ "name": model }],
+            "routingClusterRef": west_site
+        }
+    }))
+    .unwrap_or_else(|e| {
+        eprintln!("failover west provider serialization failed: {e}");
+        std::process::exit(1);
+    });
+    apply_manifest(context, &network)?;
+    apply_manifest(context, &provider)?;
+    eprintln!(
+        "  [OK] failover west fixtures applied \
+         ({FAILOVER_WEST_PROVIDER}, model={model:?}, routingClusterRef={west_site:?})"
+    );
+    Ok(())
+}
+
+/// Poll the overlay until the candidate for `remote_cluster` has `fresh=false`.
+///
+/// This proves that the grid-network controller's `apply_swim_staleness_override` fired
+/// during the operator reconcile triggered after the remote SWIM member was declared Dead.
+pub(crate) fn wait_for_remote_candidate_stale(
+    context: &str,
+    network: &str,
+    gw: &str,
+    remote_cluster: &str,
+    timeout: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Ok(overlay) = read_overlay_configmap(context, network, gw, "default") {
+            let stale = overlay
+                .get("candidates")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|cands| {
+                    cands.iter().any(|c| {
+                        c.get("cluster").and_then(serde_json::Value::as_str) == Some(remote_cluster)
+                            && c.get("fresh").and_then(serde_json::Value::as_bool) == Some(false)
+                    })
+                });
+            if stale {
+                eprintln!("  [OK] overlay: remote candidate {remote_cluster:?} is now fresh=false");
+                return Ok(());
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(
+                format!("timeout waiting for remote candidate {remote_cluster:?} to become fresh=false").into(),
+            );
+        }
+        #[expect(clippy::disallowed_methods, reason = "polling wait between overlay reads")]
+        std::thread::sleep(Duration::from_secs(2));
+    }
+}
+
+/// Verify the failover overlay state: local candidate fresh, remote candidate reflects expected freshness.
+///
+/// When `expect_remote_stale = true`, uses [`verify_degraded_candidate`] to assert `fresh=false`.
+/// When `expect_remote_stale = false`, asserts the remote candidate is present with `fresh=true`.
+#[expect(clippy::too_many_lines, reason = "two candidate assertions with diagnostic messages")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "local and remote each need cluster + model + stale flag: 8 params total"
+)]
+pub(crate) fn verify_failover_overlay(
+    context: &str,
+    network: &str,
+    gw: &str,
+    local_cluster: &str,
+    local_model: &str,
+    remote_cluster: &str,
+    remote_model: &str,
+    expect_remote_stale: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let overlay = read_overlay_configmap(context, network, gw, "default")?;
+    let candidates = overlay
+        .get("candidates")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("overlay missing candidates array")?;
+
+    // Local candidate must be present and fresh.
+    let local_ok = candidates.iter().any(|c| {
+        c.get("cluster").and_then(serde_json::Value::as_str) == Some(local_cluster)
+            && c.get("name").and_then(serde_json::Value::as_str) == Some(local_model)
+            && c.get("fresh").and_then(serde_json::Value::as_bool) == Some(true)
+    });
+    if !local_ok {
+        return Err(
+            format!("local candidate {local_cluster:?}/{local_model:?} not found or not fresh in overlay").into(),
+        );
+    }
+    eprintln!("  [PASS] overlay: local candidate {local_cluster:?} fresh=true");
+
+    if expect_remote_stale {
+        verify_degraded_candidate(&overlay, remote_cluster)?;
+        eprintln!("  [PASS] overlay: remote candidate {remote_cluster:?} fresh=false (stale after partition)");
+    } else {
+        let remote_ok = candidates.iter().any(|c| {
+            c.get("cluster").and_then(serde_json::Value::as_str) == Some(remote_cluster)
+                && c.get("name").and_then(serde_json::Value::as_str) == Some(remote_model)
+                && c.get("fresh").and_then(serde_json::Value::as_bool) == Some(true)
+        });
+        if !remote_ok {
+            return Err(format!(
+                "remote candidate {remote_cluster:?}/{remote_model:?} not found or not fresh in overlay"
+            )
+            .into());
+        }
+        eprintln!("  [PASS] overlay: remote candidate {remote_cluster:?} fresh=true (before partition)");
+    }
+    Ok(())
+}
+
+/// Delete all east-cluster resources created by the failover validation.
+pub(crate) fn cleanup_failover_east_resources(context: &str) -> Result<(), Box<dyn std::error::Error>> {
+    delete_namespaced_resource(
+        context,
+        "default",
+        "configmap",
+        &format!("grid-overlay-{FAILOVER_NETWORK}-{FAILOVER_GW}"),
+    )?;
+    delete_cluster_resource(context, "inferenceprovider", FAILOVER_EAST_PROVIDER)?;
+    delete_cluster_resource(context, "gridnetwork", FAILOVER_NETWORK)?;
+    eprintln!("  [OK] stale failover east resources removed from {context}");
+    Ok(())
+}
+
+/// Delete all west-cluster resources created by the failover validation.
+pub(crate) fn cleanup_failover_west_resources(context: &str) -> Result<(), Box<dyn std::error::Error>> {
+    delete_cluster_resource(context, "inferenceprovider", FAILOVER_WEST_PROVIDER)?;
+    delete_cluster_resource(context, "gridnetwork", FAILOVER_NETWORK)?;
+    eprintln!("  [OK] stale failover west resources removed from {context}");
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

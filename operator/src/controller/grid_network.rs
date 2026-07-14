@@ -139,12 +139,19 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
         .map(|swim| collect_remote_crdt_providers(swim, name))
         .unwrap_or_default();
 
+    // Obtain a live membership snapshot here - used both for staleness override below
+    // and for phase determination after the overlay step.
+    // When swim is None (runtime not configured), falls through to static phase logic.
+    let membership = ctx.swim.as_ref().map(|h| h.snapshot());
+
+    // Downgrade providers from Dead/Suspect SWIM members to Degraded so the overlay
+    // emits fresh=false for their candidates.  The record is kept (not excluded) so
+    // Praxis can observe the stale-but-known state while preferring healthy fallbacks.
+    let remote_crdt_providers = apply_swim_staleness_override(&remote_crdt_providers, membership.as_ref());
+
     reconcile_routing_overlay_inner(&network, client, &providers, &remote_crdt_providers, &raw_metrics).await?;
 
     let grid_id = resolve_grid_id(&network);
-    // Obtain a live membership snapshot from the SWIM runtime when available.
-    // When swim is None (runtime not configured), falls through to static phase logic.
-    let membership = ctx.swim.as_ref().map(|h| h.snapshot());
     let phase = determine_phase(&network, &grid_id, membership.as_ref());
 
     // Publish real InferenceProvider-derived CRDT state so peers learn this site's providers.
@@ -628,6 +635,47 @@ fn count_remote_provider_records_in_snapshot(
         .filter(|provider| provider.network_id == network_name && provider.site_id != local_site)
         .count();
     u32::try_from(count).unwrap_or(u32::MAX)
+}
+
+/// Override CRDT provider phases based on current SWIM membership status.
+///
+/// Providers from `Dead` or `Suspect` SWIM members are downgraded to
+/// [`crdt::ProviderPhase::Degraded`] so the routing overlay emits them with
+/// `fresh = false`.  The record is kept rather than excluded so the data plane
+/// can observe the stale-but-known state and prefer a healthy fallback candidate
+/// when one exists.
+///
+/// Providers from `Alive` members, or from sites absent from the membership
+/// snapshot (e.g. seed-only peers not yet tracked), are returned unchanged.
+/// When `membership` is `None` (SWIM not configured), all providers are returned
+/// unchanged.
+pub(crate) fn apply_swim_staleness_override(
+    providers: &[crdt::ProviderState],
+    membership: Option<&MembershipSnapshot>,
+) -> Vec<crdt::ProviderState> {
+    let Some(snapshot) = membership else {
+        return providers.to_vec();
+    };
+    providers
+        .iter()
+        .map(|p| {
+            let is_degraded = snapshot.members.iter().any(|m| {
+                m.site_id == p.site_id
+                    && matches!(
+                        m.status,
+                        crate::swim::MemberStatus::Dead | crate::swim::MemberStatus::Suspect
+                    )
+            });
+            if is_degraded {
+                crdt::ProviderState {
+                    phase: crdt::ProviderPhase::Degraded,
+                    ..p.clone()
+                }
+            } else {
+                p.clone()
+            }
+        })
+        .collect()
 }
 
 /// Patch the `GridNetwork` status subresource.
@@ -1293,5 +1341,95 @@ mod tests {
         .unwrap_or_else(|_| std::process::abort());
         let state = provider_state_from_kube(&p, "net", "s", None).unwrap_or_else(|| std::process::abort());
         assert_eq!(state.revision, 0, "missing generation must default to revision=0");
+    }
+
+    // -----------------------------------------------------------------------
+    // apply_swim_staleness_override - pure function tests
+    // -----------------------------------------------------------------------
+
+    fn make_crdt_provider(site_id: &str, phase: crdt::ProviderPhase) -> crdt::ProviderState {
+        crdt::ProviderState {
+            network_id: "test-net".to_owned(),
+            site_id: site_id.to_owned(),
+            provider_id: "prov-1".to_owned(),
+            routing_cluster: site_id.to_owned(),
+            models: vec!["model-x".to_owned()],
+            backend_kind: "remote".to_owned(),
+            phase,
+            metrics: crdt::ProviderMetricsSnapshot::default(),
+            revision: 1,
+            writer_id: "writer-1".to_owned(),
+        }
+    }
+
+    fn make_swim_membership(site_id: &str, status: crate::swim::MemberStatus) -> MembershipSnapshot {
+        MembershipSnapshot {
+            members: vec![crate::swim::MemberRecord {
+                site_id: site_id.to_owned(),
+                endpoint: "127.0.0.1:7946".to_owned(),
+                incarnation: 0,
+                status,
+                age_secs: 0,
+            }],
+        }
+    }
+
+    #[test]
+    fn staleness_override_dead_site_becomes_degraded() {
+        let provider = make_crdt_provider("site-west", crdt::ProviderPhase::Available);
+        let membership = make_swim_membership("site-west", crate::swim::MemberStatus::Dead);
+        let result = apply_swim_staleness_override(&[provider], Some(&membership));
+        assert_eq!(
+            result.first().map(|p| &p.phase),
+            Some(&crdt::ProviderPhase::Degraded),
+            "Dead SWIM member must cause provider phase to become Degraded"
+        );
+    }
+
+    #[test]
+    fn staleness_override_suspect_site_becomes_degraded() {
+        let provider = make_crdt_provider("site-west", crdt::ProviderPhase::Available);
+        let membership = make_swim_membership("site-west", crate::swim::MemberStatus::Suspect);
+        let result = apply_swim_staleness_override(&[provider], Some(&membership));
+        assert_eq!(
+            result.first().map(|p| &p.phase),
+            Some(&crdt::ProviderPhase::Degraded),
+            "Suspect SWIM member must cause provider phase to become Degraded"
+        );
+    }
+
+    #[test]
+    fn staleness_override_alive_site_unchanged() {
+        let provider = make_crdt_provider("site-west", crdt::ProviderPhase::Available);
+        let membership = make_swim_membership("site-west", crate::swim::MemberStatus::Alive);
+        let result = apply_swim_staleness_override(&[provider], Some(&membership));
+        assert_eq!(
+            result.first().map(|p| &p.phase),
+            Some(&crdt::ProviderPhase::Available),
+            "Alive SWIM member must not degrade provider phase"
+        );
+    }
+
+    #[test]
+    fn staleness_override_unknown_site_unchanged() {
+        let provider = make_crdt_provider("site-unknown", crdt::ProviderPhase::Available);
+        let membership = make_swim_membership("site-west", crate::swim::MemberStatus::Dead);
+        let result = apply_swim_staleness_override(&[provider], Some(&membership));
+        assert_eq!(
+            result.first().map(|p| &p.phase),
+            Some(&crdt::ProviderPhase::Available),
+            "Provider from a site not in SWIM snapshot must not be degraded"
+        );
+    }
+
+    #[test]
+    fn staleness_override_no_swim_unchanged() {
+        let provider = make_crdt_provider("site-west", crdt::ProviderPhase::Available);
+        let result = apply_swim_staleness_override(&[provider], None);
+        assert_eq!(
+            result.first().map(|p| &p.phase),
+            Some(&crdt::ProviderPhase::Available),
+            "No SWIM configured (membership=None) must preserve all provider phases"
+        );
     }
 }

@@ -475,6 +475,26 @@ pub(crate) enum Action {
         #[arg(short, long, default_value = "tests/env/operator-routing-two-provider.toml")]
         config: PathBuf,
     },
+
+    /// Verify Demo 9 v1: remote provider marked stale when SWIM peer is killed.
+    ///
+    /// Starts a primary (east) and a joining (west) SWIM operator, publishes a
+    /// local east provider and a remote west provider, verifies both appear in
+    /// the overlay with `fresh=true`, then kills the west operator and waits for
+    /// the east operator to mark the remote provider as `fresh=false`.
+    ///
+    /// Proves that `apply_swim_staleness_override` correctly translates a `Dead`
+    /// SWIM membership entry into a `Degraded` CRDT provider phase, which the
+    /// overlay renderer emits as `fresh=false`.  The local east candidate remains
+    /// `fresh=true` throughout, giving the data plane a clear preference signal.
+    ///
+    /// This is a simulated partition (process kill) - real network-level isolation
+    /// is not required.  Requires the two-provider kind environment.  Safe to rerun.
+    VerifyFailoverUnderLostPeer {
+        /// Path to the two-provider environment config file.
+        #[arg(short, long, default_value = "tests/env/operator-routing-two-provider.toml")]
+        config: PathBuf,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -487,6 +507,10 @@ pub(crate) enum Action {
 ///
 /// Returns an error if the configuration cannot be loaded or the
 /// action fails.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one arm per CLI action - splitting adds no clarity"
+)]
 pub(crate) fn run(action: &Action) -> Result<(), Box<dyn std::error::Error>> {
     match action {
         Action::Up { config } => env_up(config),
@@ -517,6 +541,7 @@ pub(crate) fn run(action: &Action) -> Result<(), Box<dyn std::error::Error>> {
         Action::VerifyFullGridRouting { config } => env_verify_full_grid_routing(config),
         Action::VerifyMetricsRouting { config } => env_verify_metrics_routing(config),
         Action::VerifySiteJoinDiscovery { config } => env_verify_site_join_discovery(config),
+        Action::VerifyFailoverUnderLostPeer { config } => env_verify_failover_under_lost_peer(config),
     }
 }
 
@@ -2581,6 +2606,187 @@ fn env_verify_site_join_discovery(config: &Path) -> Result<(), Box<dyn std::erro
         "verify-site-join-discovery: PASS - joining site progressed \
          Pending -> Discovered -> Connecting -> Active; routing data complete; \
          cross-network isolation confirmed"
+    );
+    Ok(())
+}
+
+/// Verify Demo 9 v1: remote provider is marked `fresh=false` after the remote SWIM operator is killed.
+///
+/// **Before partition:** both the local east provider and the CRDT-sourced remote west provider
+/// appear in the overlay with `fresh=true`.
+///
+/// **After killing the west operator:** the east operator's SWIM runtime detects the dead peer,
+/// `apply_swim_staleness_override` downgrades the west provider's CRDT phase to `Degraded`, and
+/// the overlay emits the west candidate with `fresh=false`.  The east local candidate remains
+/// `fresh=true`.
+///
+/// The partition is simulated by killing the west operator process - real network-level isolation
+/// (iptables/tc) is not required.  Timing relies on `foca::Config::simple()`: probe period 1.5 s,
+/// suspect-to-down 3 s; detection takes <= 6 s, and the harness waits
+/// `SWIM_DEAD_MEMBER_WAIT` (20 s) before forcing a reconcile via annotation bump.
+#[expect(
+    clippy::too_many_lines,
+    reason = "sequential 7-step failover proof: start operators, establish routing, partition, assert stale overlay"
+)]
+fn env_verify_failover_under_lost_peer(config: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    use operator::{
+        CONFIGMAP_POLL_TIMEOUT, FAILOVER_EAST_PROVIDER, FAILOVER_GW, FAILOVER_LOCAL_MODEL, FAILOVER_NETWORK,
+        FAILOVER_REMOTE_MODEL, FAILOVER_STALE_POLL_TIMEOUT, FAILOVER_WEST_PROVIDER, SWIM_CONVERGENCE_WAIT,
+        SWIM_DEAD_MEMBER_WAIT, SWIM_STATUS_POLL_TIMEOUT,
+    };
+
+    let cfg = EnvConfig::from_file(config)?;
+    eprintln!("verify-failover-under-lost-peer: loading two-provider config...");
+
+    let providers = provider_clusters_from_config(&cfg);
+    if providers.len() < 2 {
+        return Err(format!(
+            "verify-failover-under-lost-peer requires >= 2 provider clusters; got {}",
+            providers.len()
+        )
+        .into());
+    }
+    let Some((east_site, _)) = providers.first() else {
+        return Err("verify-failover-under-lost-peer: east provider cluster not found".into());
+    };
+    let Some((west_site, _)) = providers.get(1) else {
+        return Err("verify-failover-under-lost-peer: west provider cluster not found".into());
+    };
+    let east_ctx = kind::kubectl_context(east_site);
+    let west_ctx = kind::kubectl_context(west_site);
+    eprintln!("  primary={east_site} ({east_ctx}), remote={west_site} ({west_ctx})");
+
+    // Step 1: Preflight.
+    eprintln!("verify-failover-under-lost-peer: [1/7] preflight - CRDs, cleanup, operator binary...");
+    let build_ok = std::process::Command::new("cargo")
+        .args(["build", "--quiet", "-p", "operator", "--bin", "operator"])
+        .status()
+        .map_err(|e| format!("cargo build -p operator failed: {e}"))?;
+    if !build_ok.success() {
+        return Err("cargo build -p operator --bin operator failed".into());
+    }
+    eprintln!("  [OK] operator binary ready");
+    operator::install_grid_crds(&east_ctx)?;
+    operator::install_grid_crds(&west_ctx)?;
+    operator::cleanup_failover_east_resources(&east_ctx).unwrap_or_else(|e| eprintln!("  note: east cleanup: {e}"));
+    operator::cleanup_failover_west_resources(&west_ctx).unwrap_or_else(|e| eprintln!("  note: west cleanup: {e}"));
+
+    // Step 2: Start SWIM operators.
+    eprintln!("verify-failover-under-lost-peer: [2/7] starting SWIM operators...");
+    let (bind_east, bind_west) = reserve_swim_bind_addrs()?;
+    let op_east = operator::spawn_operator_with_swim_for_context(&east_ctx, &bind_east, &bind_east, east_site, "")?;
+    let mut op_east_guard = ProcGuard(Some(op_east), "operator-east");
+    let op_west =
+        operator::spawn_operator_with_swim_for_context(&west_ctx, &bind_west, &bind_west, west_site, &bind_east)?;
+    let mut op_west_guard = ProcGuard(Some(op_west), "operator-west");
+    eprintln!("  [OK] east (primary) and west (remote) operators started");
+
+    // Step 3: SWIM convergence + fixtures.
+    eprintln!("verify-failover-under-lost-peer: [3/7] waiting for SWIM convergence and applying fixtures...");
+    operator::wait_for_swim_convergence(SWIM_CONVERGENCE_WAIT);
+    operator::apply_failover_east_fixtures(&east_ctx, east_site, FAILOVER_LOCAL_MODEL)?;
+    operator::apply_failover_west_fixtures(&west_ctx, west_site, FAILOVER_REMOTE_MODEL)?;
+
+    // Allow extra time for west operator to reconcile and publish its CRDT state,
+    // then bump the east GridNetwork annotation to force a reconcile that reads the
+    // latest CRDT state snapshot.  Same pattern as verify-swim-routing.
+    operator::wait_for_swim_convergence(Duration::from_secs(5));
+    operator::bump_gridnetwork(&east_ctx, FAILOVER_NETWORK)?;
+    eprintln!("  [OK] bumped {FAILOVER_NETWORK:?} to force CRDT state read");
+
+    // Poll east overlay network until west CRDT provider arrives.
+    let dist = operator::wait_for_gridnetwork_distributed_state(&east_ctx, FAILOVER_NETWORK, SWIM_STATUS_POLL_TIMEOUT)?;
+    eprintln!(
+        "  [OK] east GridNetwork {FAILOVER_NETWORK:?}: distributedProviderCount={dist} \
+         (west CRDT provider arrived)"
+    );
+
+    // Step 4: Verify initial overlay - both candidates fresh=true.
+    eprintln!("verify-failover-under-lost-peer: [4/7] verifying initial overlay (both candidates fresh=true)...");
+    // Bump to ensure the overlay ConfigMap is generated from the current CRDT state.
+    operator::bump_gridnetwork(&east_ctx, FAILOVER_NETWORK)?;
+    operator::wait_for_overlay_configmap(
+        &east_ctx,
+        FAILOVER_NETWORK,
+        FAILOVER_GW,
+        "default",
+        CONFIGMAP_POLL_TIMEOUT,
+    )?;
+    operator::verify_failover_overlay(
+        &east_ctx,
+        FAILOVER_NETWORK,
+        FAILOVER_GW,
+        east_site,
+        FAILOVER_LOCAL_MODEL,
+        west_site,
+        FAILOVER_REMOTE_MODEL,
+        false, // expect_remote_stale = false (west is still alive)
+    )?;
+    eprintln!(
+        "  [PASS] initial overlay: {FAILOVER_EAST_PROVIDER} fresh=true, \
+         {FAILOVER_WEST_PROVIDER} fresh=true"
+    );
+
+    // Step 5: Kill west operator.
+    eprintln!("verify-failover-under-lost-peer: [5/7] killing west operator - simulating partition...");
+    if let Some(c) = op_west_guard.0.take() {
+        operator::kill_operator(c);
+    }
+    eprintln!(
+        "  [OK] west operator killed; waiting {}s for SWIM to declare peer Dead...",
+        SWIM_DEAD_MEMBER_WAIT.as_secs()
+    );
+    // foca::Config::simple(): probe_period=1.5s, suspect_to_down=3s -> Dead in <=6s.
+    // This wait is xtask validation synchronization - not a production mechanism.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "bounded wait for SWIM dead detection after operator kill"
+    )]
+    std::thread::sleep(SWIM_DEAD_MEMBER_WAIT);
+
+    // Step 6: Verify stale overlay - remote candidate fresh=false.
+    eprintln!("verify-failover-under-lost-peer: [6/7] verifying stale overlay (remote fresh=false)...");
+    // Force a reconcile so the east operator reads the updated SWIM membership
+    // (west = Dead) and applies apply_swim_staleness_override.
+    operator::bump_gridnetwork(&east_ctx, FAILOVER_NETWORK)?;
+    eprintln!("  [OK] bumped {FAILOVER_NETWORK:?} to force post-partition reconcile");
+
+    operator::wait_for_remote_candidate_stale(
+        &east_ctx,
+        FAILOVER_NETWORK,
+        FAILOVER_GW,
+        west_site,
+        FAILOVER_STALE_POLL_TIMEOUT,
+    )?;
+
+    operator::verify_failover_overlay(
+        &east_ctx,
+        FAILOVER_NETWORK,
+        FAILOVER_GW,
+        east_site,
+        FAILOVER_LOCAL_MODEL,
+        west_site,
+        FAILOVER_REMOTE_MODEL,
+        true, // expect_remote_stale = true (west is Dead -> Degraded -> fresh=false)
+    )?;
+    eprintln!(
+        "  [PASS] stale overlay: {FAILOVER_EAST_PROVIDER} fresh=true, \
+         {FAILOVER_WEST_PROVIDER} fresh=false"
+    );
+
+    // Step 7: Cleanup.
+    eprintln!("verify-failover-under-lost-peer: [7/7] cleanup...");
+    if let Some(c) = op_east_guard.0.take() {
+        operator::kill_operator(c);
+    }
+    operator::cleanup_failover_east_resources(&east_ctx)
+        .unwrap_or_else(|e| eprintln!("  warning: east cleanup failed: {e}"));
+    operator::cleanup_failover_west_resources(&west_ctx)
+        .unwrap_or_else(|e| eprintln!("  warning: west cleanup failed: {e}"));
+
+    eprintln!(
+        "verify-failover-under-lost-peer: PASS - remote provider marked fresh=false \
+         after west operator killed; local provider remains fresh=true"
     );
     Ok(())
 }
