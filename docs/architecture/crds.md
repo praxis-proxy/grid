@@ -116,9 +116,51 @@ spec:
   healthCheck:
     interval: 30s
     path: /v1/messages
+  metricsConfig:
+    path: /metrics
+    timeout: 2s
+    signalNames:
+      queueDepth: provider_queue_depth_normalized
+      kvCacheUtilization: provider_kv_cache_utilization
+      latencyP99Ms: provider_latency_p99_ms
+      prefixCacheHitRatio: provider_prefix_cache_hit_ratio
+      errorRate: provider_error_rate
+      healthy: provider_healthy
 ```
 
 **Phases**: Pending → Available → Degraded → Unavailable
+
+### Metrics configuration
+
+`spec.metricsConfig` configures the operator-side Prometheus scrape used during
+`GridNetwork` reconciliation. When present, the operator scrapes
+`{spec.endpoint}{metricsConfig.path}`, parses the configured signal names, and
+feeds the resulting `BackendMetrics` into overlay scoring.
+
+| Field | Default | Meaning |
+|-------|---------|---------|
+| `path` | `/metrics` | HTTP path, relative to `spec.endpoint`. |
+| `timeout` | `2s` | Scrape timeout. `s` and `ms` suffixes are recognized. |
+| `signalNames` | all unset | Mapping from scoring signals to Prometheus metric names. |
+
+Providers without `metricsConfig`, providers with failed scrapes, and signals
+without configured metric names use neutral metric scores.
+
+#### Signal names
+
+| Field | Expected value |
+|-------|----------------|
+| `queueDepth` | Normalized queue depth from `0.0` to `1.0`. |
+| `kvCacheUtilization` | KV-cache utilization from `0.0` to `1.0`. |
+| `latencyP99Ms` | P99 request latency in milliseconds. |
+| `prefixCacheHitRatio` | Prefix-cache hit ratio from `0.0` to `1.0`. |
+| `errorRate` | Error rate from `0.0` to `1.0`. |
+| `healthy` | Health gauge interpreted by the metrics parser. |
+
+#### Queue depth normalization
+
+Grid does not normalize raw queue counts. Exporters should publish
+`queueDepth` as a normalized `0.0`–`1.0` gauge before the operator scrapes it.
 
 ## AgentToolProvider
 
