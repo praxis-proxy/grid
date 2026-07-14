@@ -70,10 +70,16 @@ audit:
 	cargo deny check
 
 coverage:
-	cargo llvm-cov --workspace --html --output-dir target/coverage
+	cargo llvm-cov --workspace --html --output-dir target/coverage \
+		--exclude xtask \
+		--ignore-filename-regex '(target/|tests/)'
 
 coverage-check:
-	cargo llvm-cov --workspace --fail-under-lines 80
+	cargo llvm-cov --workspace --json \
+		--exclude xtask \
+		--ignore-filename-regex '(target/|tests/)' \
+		--fail-under-lines 80 \
+		--output-path coverage.json
 
 # -------------------------------------------------------------------
 # Container
