@@ -366,7 +366,12 @@ fn filter_overlay_for_local_providers(
     let known_sites: Vec<&str> = providers.iter().map(|p| p.site.as_str()).collect();
     let mut kept = Vec::new();
     for c in &overlay.candidates {
-        if known_sites.contains(&c.site.as_str()) {
+        // Accept the candidate when either the `site` field or the `cluster` field matches a
+        // known local provider.  The `cluster` field (derived from `routingClusterRef`) is the
+        // stable routing identity; `site` may differ when auto-discovered `GridSite` resources
+        // are present, causing the overlay renderer to use the `GridSite` name as the site field
+        // instead of `routingClusterRef`.
+        if known_sites.contains(&c.site.as_str()) || known_sites.contains(&c.cluster.as_str()) {
             kept.push(c.clone());
         } else {
             eprintln!(

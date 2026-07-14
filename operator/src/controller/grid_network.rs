@@ -26,7 +26,7 @@ use crate::{
     },
     error::OperatorError,
     resources::{provider_metrics, routing_overlay, secret},
-    swim::MembershipSnapshot,
+    swim::{MemberStatus, MembershipSnapshot},
     swim_runtime::SwimHandle,
 };
 
@@ -171,6 +171,13 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
         distributed_provider_count,
     )
     .await?;
+
+    // Auto-create or update GridSite records for remote Alive SWIM members.
+    // Phase 1: creates a GridSite with phase=Discovered from SWIM Alive membership.
+    // Phase 2 will add mTLS cert exchange, capability negotiation, and Active transition.
+    if let (Some(swim), Some(snapshot)) = (ctx.swim.as_ref(), membership.as_ref()) {
+        reconcile_discovered_sites(name, swim.site_name(), snapshot, client).await?;
+    }
 
     Ok(Action::requeue(REQUEUE_INTERVAL))
 }
@@ -413,9 +420,9 @@ fn resolve_grid_id(network: &GridNetwork) -> String {
 /// When `membership` is `None` (no SWIM runtime wired yet), the existing
 /// `Pending`/`Initializing` logic is unchanged.
 ///
-/// [`Alive`]: crate::swim::MemberStatus::Alive
-/// [`Suspect`]: crate::swim::MemberStatus::Suspect
-/// [`Dead`]: crate::swim::MemberStatus::Dead
+/// [`Alive`]: MemberStatus::Alive
+/// [`Suspect`]: MemberStatus::Suspect
+/// [`Dead`]: MemberStatus::Dead
 /// [`Active`]: GridNetworkPhase::Active
 /// [`Degraded`]: GridNetworkPhase::Degraded
 fn determine_phase(network: &GridNetwork, grid_id: &str, membership: Option<&MembershipSnapshot>) -> GridNetworkPhase {
@@ -659,13 +666,10 @@ pub(crate) fn apply_swim_staleness_override(
     providers
         .iter()
         .map(|p| {
-            let is_degraded = snapshot.members.iter().any(|m| {
-                m.site_id == p.site_id
-                    && matches!(
-                        m.status,
-                        crate::swim::MemberStatus::Dead | crate::swim::MemberStatus::Suspect
-                    )
-            });
+            let is_degraded = snapshot
+                .members
+                .iter()
+                .any(|m| m.site_id == p.site_id && matches!(m.status, MemberStatus::Dead | MemberStatus::Suspect));
             if is_degraded {
                 crdt::ProviderState {
                     phase: crdt::ProviderPhase::Degraded,
@@ -684,7 +688,7 @@ pub(crate) fn apply_swim_staleness_override(
 /// [`Alive`] status.  `distributed_provider_count` reflects providers received via
 /// CRDT state broadcasts.  Both are `0` when SWIM is disabled.
 ///
-/// [`Alive`]: crate::swim::MemberStatus::Alive
+/// [`Alive`]: MemberStatus::Alive
 #[expect(
     clippy::too_many_arguments,
     reason = "all six arguments are distinct status fields; a wrapper struct would obscure the data flow"
@@ -740,12 +744,188 @@ fn network_site_name(network: &GridNetwork) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Automatic GridSite discovery
+// ---------------------------------------------------------------------------
+
+/// A [`GridSite`] that the operator should auto-create or update from SWIM membership.
+///
+/// Produced by [`discovered_sites_from_swim`] and consumed by
+/// [`reconcile_discovered_sites`].  Using a named struct instead of a tuple
+/// makes unit tests and the reconcile loop unambiguous.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DiscoveredSite {
+    /// Kubernetes resource name derived deterministically from the SWIM `site_id`.
+    pub name: String,
+    /// The `GridNetwork` this site belongs to.
+    pub grid_network_ref: String,
+    /// Egress address for data-plane connectivity, sourced from the SWIM advertised address.
+    pub egress_address: String,
+}
+
+/// Derive the set of remote [`GridSite`]s the operator should maintain from the SWIM snapshot.
+///
+/// Returns one [`DiscoveredSite`] per remote Alive SWIM member.  The local site
+/// and non-Alive (Suspect, Dead) members are excluded — only confirmed Alive
+/// peers should produce a `Discovered` record.
+///
+/// Name derivation is deterministic: the SWIM `site_id` is sanitised to a valid
+/// Kubernetes resource name.
+///
+/// This is a **pure function** — no Kubernetes API calls — and is
+/// suitable for unit testing in isolation.
+pub(crate) fn discovered_sites_from_swim(
+    network_name: &str,
+    local_site: &str,
+    snapshot: &MembershipSnapshot,
+) -> Vec<DiscoveredSite> {
+    snapshot
+        .members
+        .iter()
+        .filter(|m| m.status == MemberStatus::Alive && m.site_id != local_site)
+        .filter(|m| !m.site_id.trim().is_empty())
+        .map(|m| DiscoveredSite {
+            name: discovered_site_k8s_name(network_name, &m.site_id),
+            grid_network_ref: network_name.to_owned(),
+            egress_address: m.endpoint.clone(),
+        })
+        .collect()
+}
+
+/// Derive a Kubernetes resource name for an auto-discovered `GridSite`.
+///
+/// The name is `"{network}-{site_id}"` (both sanitised).  Using the composite
+/// `(network, site_id)` key avoids name collisions when the same SWIM peer
+/// appears as a member across multiple `GridNetwork` objects.  Each
+/// `(network, site)` pair gets its own distinct `GridSite` resource.
+///
+/// Rules: lowercase, non-alphanumeric characters replaced with `-`,
+/// leading/trailing hyphens stripped, truncated at 253 characters.
+pub(crate) fn discovered_site_k8s_name(network_name: &str, site_id: &str) -> String {
+    let sanitise = |s: &str| -> String {
+        let raw: String = s
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() {
+                    c.to_ascii_lowercase()
+                } else {
+                    '-'
+                }
+            })
+            .collect();
+        raw.trim_matches('-').to_owned()
+    };
+
+    let net = sanitise(network_name);
+    let site = sanitise(site_id);
+
+    let candidate = match (net.is_empty(), site.is_empty()) {
+        (false, false) => format!("{net}-{site}"),
+        (false, true) => net,
+        (true, false) => site,
+        (true, true) => "discovered-site".to_owned(),
+    };
+    candidate.chars().take(253).collect()
+}
+
+/// Create or update `GridSite` resources for remote Alive SWIM members.
+///
+/// Uses server-side apply, so the call is idempotent: applying an already-existing
+/// `GridSite` with the same spec is a no-op.  After the spec is applied, the
+/// `status.phase` is set to `Discovered` to reflect that the member is observed
+/// Alive via SWIM.
+///
+/// The `GridSite` controller's `determine_phase` is an identity function (Phase 1),
+/// so subsequent `GridSite` reconciles preserve the `Discovered` phase.
+///
+/// # Phase 2 follow-up
+///
+/// This creates a site record at `Discovered`.  Advancing to `Active` (which
+/// requires mTLS cert exchange, capability negotiation, and a data-plane ping)
+/// is out of scope for Phase 1.
+#[expect(
+    clippy::too_many_lines,
+    reason = "sequential spec-apply + status-patch per discovered site; splitting would hide the per-site K8s transaction"
+)]
+#[expect(
+    clippy::large_stack_frames,
+    reason = "async future over Kubernetes API types with serde_json values"
+)]
+async fn reconcile_discovered_sites(
+    network_name: &str,
+    local_site: &str,
+    snapshot: &MembershipSnapshot,
+    client: &Client,
+) -> Result<(), OperatorError> {
+    let sites = discovered_sites_from_swim(network_name, local_site, snapshot);
+    if sites.is_empty() {
+        return Ok(());
+    }
+
+    let api: Api<GridSite> = Api::all(client.clone());
+
+    for site in &sites {
+        // Server-side apply the spec.  Creating on first call; updating on subsequent
+        // calls is a no-op when the spec has not changed.
+        let spec_doc = serde_json::json!({
+            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "kind": "GridSite",
+            "metadata": {
+                "name": site.name,
+                "labels": {
+                    "grid.praxis-proxy.io/network": network_name,
+                    "grid.praxis-proxy.io/auto-discovered": "true"
+                }
+            },
+            "spec": {
+                "gridNetworkRef": site.grid_network_ref,
+                "egress": {
+                    "address": site.egress_address,
+                    "tls": { "mode": "Mutual" }
+                }
+            }
+        });
+
+        api.patch(
+            &site.name,
+            &PatchParams::apply(FIELD_MANAGER).force(),
+            &Patch::Apply(&spec_doc),
+        )
+        .await?;
+
+        // Set status.phase = Discovered.  The GridSite controller's determine_phase
+        // is an identity function, so it will preserve this on subsequent reconciles.
+        let status_doc = serde_json::json!({
+            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "kind": "GridSite",
+            "status": { "phase": "Discovered" }
+        });
+
+        api.patch_status(
+            &site.name,
+            &PatchParams::apply(FIELD_MANAGER).force(),
+            &Patch::Apply(&status_doc),
+        )
+        .await?;
+
+        tracing::info!(
+            name = %site.name,
+            network = %network_name,
+            egress = %site.egress_address,
+            "reconciled auto-discovered GridSite from SWIM Alive member"
+        );
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::swim::MemberRecord;
 
     fn make_inference_provider(name: &str, network_ref: &str) -> InferenceProvider {
         serde_json::from_value(serde_json::json!({
@@ -874,11 +1054,11 @@ mod tests {
     fn alive_snapshot(count: usize) -> MembershipSnapshot {
         MembershipSnapshot {
             members: (0..count)
-                .map(|i| crate::swim::MemberRecord {
+                .map(|i| MemberRecord {
                     site_id: format!("site-{i}"),
                     endpoint: format!("10.0.0.{i}:7946"),
                     incarnation: 1,
-                    status: crate::swim::MemberStatus::Alive,
+                    status: MemberStatus::Alive,
                     age_secs: 0,
                 })
                 .collect(),
@@ -887,11 +1067,11 @@ mod tests {
 
     fn suspect_snapshot() -> MembershipSnapshot {
         MembershipSnapshot {
-            members: vec![crate::swim::MemberRecord {
+            members: vec![MemberRecord {
                 site_id: "site-suspect".to_owned(),
                 endpoint: "10.0.0.1:7946".to_owned(),
                 incarnation: 1,
-                status: crate::swim::MemberStatus::Suspect,
+                status: MemberStatus::Suspect,
                 age_secs: 5,
             }],
         }
@@ -1363,9 +1543,9 @@ mod tests {
         }
     }
 
-    fn make_swim_membership(site_id: &str, status: crate::swim::MemberStatus) -> MembershipSnapshot {
+    fn make_swim_membership(site_id: &str, status: MemberStatus) -> MembershipSnapshot {
         MembershipSnapshot {
-            members: vec![crate::swim::MemberRecord {
+            members: vec![MemberRecord {
                 site_id: site_id.to_owned(),
                 endpoint: "127.0.0.1:7946".to_owned(),
                 incarnation: 0,
@@ -1378,7 +1558,7 @@ mod tests {
     #[test]
     fn staleness_override_dead_site_becomes_degraded() {
         let provider = make_crdt_provider("site-west", crdt::ProviderPhase::Available);
-        let membership = make_swim_membership("site-west", crate::swim::MemberStatus::Dead);
+        let membership = make_swim_membership("site-west", MemberStatus::Dead);
         let result = apply_swim_staleness_override(&[provider], Some(&membership));
         assert_eq!(
             result.first().map(|p| &p.phase),
@@ -1390,7 +1570,7 @@ mod tests {
     #[test]
     fn staleness_override_suspect_site_becomes_degraded() {
         let provider = make_crdt_provider("site-west", crdt::ProviderPhase::Available);
-        let membership = make_swim_membership("site-west", crate::swim::MemberStatus::Suspect);
+        let membership = make_swim_membership("site-west", MemberStatus::Suspect);
         let result = apply_swim_staleness_override(&[provider], Some(&membership));
         assert_eq!(
             result.first().map(|p| &p.phase),
@@ -1402,7 +1582,7 @@ mod tests {
     #[test]
     fn staleness_override_alive_site_unchanged() {
         let provider = make_crdt_provider("site-west", crdt::ProviderPhase::Available);
-        let membership = make_swim_membership("site-west", crate::swim::MemberStatus::Alive);
+        let membership = make_swim_membership("site-west", MemberStatus::Alive);
         let result = apply_swim_staleness_override(&[provider], Some(&membership));
         assert_eq!(
             result.first().map(|p| &p.phase),
@@ -1414,7 +1594,7 @@ mod tests {
     #[test]
     fn staleness_override_unknown_site_unchanged() {
         let provider = make_crdt_provider("site-unknown", crdt::ProviderPhase::Available);
-        let membership = make_swim_membership("site-west", crate::swim::MemberStatus::Dead);
+        let membership = make_swim_membership("site-west", MemberStatus::Dead);
         let result = apply_swim_staleness_override(&[provider], Some(&membership));
         assert_eq!(
             result.first().map(|p| &p.phase),
@@ -1431,6 +1611,197 @@ mod tests {
             result.first().map(|p| &p.phase),
             Some(&crdt::ProviderPhase::Available),
             "No SWIM configured (membership=None) must preserve all provider phases"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_grid_id — pure ID resolution (three branches)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn resolve_grid_id_prefers_spec_grid_id() {
+        let network = base_network();
+        let id = resolve_grid_id(&network);
+        assert_eq!(
+            id, "test-id",
+            "spec.gridId must be returned verbatim when non-empty, with no status lookup or UUID generation"
+        );
+    }
+
+    #[test]
+    fn resolve_grid_id_falls_back_to_status_grid_id_when_spec_is_empty() {
+        let mut network = base_network();
+        network.spec.grid_id = String::new();
+        network.status = Some(GridNetworkStatus {
+            grid_id: "persisted-id".to_owned(),
+            ..Default::default()
+        });
+        let id = resolve_grid_id(&network);
+        assert_eq!(
+            id, "persisted-id",
+            "status.gridId must be returned when spec.gridId is empty, \
+             preserving a previously negotiated ID across operator restarts"
+        );
+    }
+
+    #[test]
+    fn resolve_grid_id_generates_uuid_when_both_spec_and_status_are_empty() {
+        let mut network = base_network();
+        network.spec.grid_id = String::new();
+        network.status = None;
+        let id = resolve_grid_id(&network);
+        assert!(!id.is_empty(), "a freshly generated grid ID must not be empty");
+        assert!(
+            uuid::Uuid::parse_str(&id).is_ok(),
+            "generated grid ID must be a valid UUID, got: {id}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // network_site_name — fallback helper
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn network_site_name_returns_metadata_name_when_present() {
+        let network = base_network();
+        let name = network_site_name(&network);
+        assert_eq!(name, "net", "metadata.name must be returned verbatim when present");
+    }
+
+    #[test]
+    fn network_site_name_falls_back_to_unknown_site_when_metadata_name_absent() {
+        let network: GridNetwork = serde_json::from_value(serde_json::json!({
+            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "kind": "GridNetwork",
+            "metadata": {},
+            "spec": { "seeds": [] }
+        }))
+        .unwrap_or_else(|_| std::process::abort());
+        let name = network_site_name(&network);
+        assert_eq!(
+            name, "unknown-site",
+            "absent metadata.name must yield the safe fallback site name to prevent panics in TLS secret generation"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // discovered_sites_from_swim — pure helper
+    // -----------------------------------------------------------------------
+
+    fn make_member(site_id: &str, endpoint: &str, status: MemberStatus) -> MemberRecord {
+        MemberRecord {
+            site_id: site_id.to_owned(),
+            endpoint: endpoint.to_owned(),
+            incarnation: 0,
+            status,
+            age_secs: 0,
+        }
+    }
+
+    fn make_snapshot(members: Vec<MemberRecord>) -> MembershipSnapshot {
+        MembershipSnapshot { members }
+    }
+
+    #[test]
+    fn discovered_sites_includes_alive_remote_member() {
+        let snap = make_snapshot(vec![
+            make_member("local", "127.0.0.1:7946", MemberStatus::Alive),
+            make_member("remote", "10.0.0.2:7946", MemberStatus::Alive),
+        ]);
+        let sites = discovered_sites_from_swim("net", "local", &snap);
+        assert_eq!(sites.len(), 1, "exactly one remote Alive member");
+        let site = sites.first().unwrap_or_else(|| std::process::abort());
+        assert_eq!(
+            site.name, "net-remote",
+            "site name must be composite network-site to avoid collisions across networks"
+        );
+        assert_eq!(
+            site.grid_network_ref, "net",
+            "grid_network_ref must match the network name"
+        );
+        assert_eq!(
+            site.egress_address, "10.0.0.2:7946",
+            "egress_address must match the SWIM advertised address"
+        );
+    }
+
+    #[test]
+    fn discovered_sites_excludes_local_site() {
+        let snap = make_snapshot(vec![make_member("local", "127.0.0.1:7946", MemberStatus::Alive)]);
+        let sites = discovered_sites_from_swim("net", "local", &snap);
+        assert!(sites.is_empty(), "local site must never produce a DiscoveredSite");
+    }
+
+    #[test]
+    fn discovered_sites_excludes_suspect_members() {
+        let snap = make_snapshot(vec![make_member("remote", "10.0.0.3:7946", MemberStatus::Suspect)]);
+        let sites = discovered_sites_from_swim("net", "local", &snap);
+        assert!(sites.is_empty(), "Suspect member must not produce a DiscoveredSite");
+    }
+
+    #[test]
+    fn discovered_sites_excludes_dead_members() {
+        let snap = make_snapshot(vec![make_member("remote", "10.0.0.4:7946", MemberStatus::Dead)]);
+        let sites = discovered_sites_from_swim("net", "local", &snap);
+        assert!(sites.is_empty(), "Dead member must not produce a DiscoveredSite");
+    }
+
+    #[test]
+    fn discovered_sites_empty_snapshot_returns_empty() {
+        let sites = discovered_sites_from_swim("net", "local", &make_snapshot(vec![]));
+        assert!(sites.is_empty(), "empty snapshot must produce no sites");
+    }
+
+    #[test]
+    fn discovered_sites_name_is_deterministic() {
+        let snap = make_snapshot(vec![make_member("site-west", "127.0.0.1:9999", MemberStatus::Alive)]);
+        let a = discovered_sites_from_swim("net", "local", &snap);
+        let b = discovered_sites_from_swim("net", "local", &snap);
+        let a_name = a.first().unwrap_or_else(|| std::process::abort()).name.as_str();
+        let b_name = b.first().unwrap_or_else(|| std::process::abort()).name.as_str();
+        assert_eq!(a_name, b_name, "name must be deterministic across calls");
+    }
+
+    #[test]
+    fn discovered_site_k8s_name_lowercases_and_sanitises_underscores() {
+        assert_eq!(discovered_site_k8s_name("net", "Site_West"), "net-site-west");
+        assert_eq!(discovered_site_k8s_name("net", "SITE.EAST"), "net-site-east");
+    }
+
+    #[test]
+    fn discovered_site_k8s_name_strips_leading_trailing_hyphens() {
+        assert_eq!(discovered_site_k8s_name("net", "--valid--"), "net-valid");
+    }
+
+    #[test]
+    fn discovered_site_k8s_name_both_empty_yields_fallback() {
+        assert_eq!(
+            discovered_site_k8s_name("", ""),
+            "discovered-site",
+            "both empty must produce the safe fallback name"
+        );
+        assert_eq!(
+            discovered_site_k8s_name("---", "---"),
+            "discovered-site",
+            "all-hyphen input must produce the safe fallback name"
+        );
+    }
+
+    #[test]
+    fn discovered_site_k8s_name_truncates_at_253_chars() {
+        let long_net = "n".repeat(150);
+        let long_site = "s".repeat(150);
+        let result = discovered_site_k8s_name(&long_net, &long_site);
+        assert_eq!(result.len(), 253, "composite name must be truncated to 253 chars");
+    }
+
+    #[test]
+    fn discovered_site_k8s_name_is_unique_per_network() {
+        let name_net1 = discovered_site_k8s_name("network-a", "site-west");
+        let name_net2 = discovered_site_k8s_name("network-b", "site-west");
+        assert_ne!(
+            name_net1, name_net2,
+            "same site_id in different networks must produce different names"
         );
     }
 }

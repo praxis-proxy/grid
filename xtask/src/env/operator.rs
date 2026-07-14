@@ -3066,6 +3066,154 @@ pub(crate) fn verify_site_join_overlay(
     Ok(())
 }
 
+/// Derive the Kubernetes resource name for an auto-discovered `GridSite`.
+///
+/// Mirrors the logic in `operator::controller::grid_network::discovered_site_k8s_name`.
+/// Both must stay in sync: the operator uses this to name the resource; the xtask uses
+/// it to look up and verify the created resource.
+pub(crate) fn auto_discovered_gridsite_name(network_name: &str, site_id: &str) -> String {
+    let sanitise = |s: &str| -> String {
+        let raw: String = s
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() {
+                    c.to_ascii_lowercase()
+                } else {
+                    '-'
+                }
+            })
+            .collect();
+        raw.trim_matches('-').to_owned()
+    };
+    let net = sanitise(network_name);
+    let site = sanitise(site_id);
+    let candidate = match (net.is_empty(), site.is_empty()) {
+        (false, false) => format!("{net}-{site}"),
+        (false, true) => net,
+        (true, false) => site,
+        (true, true) => "discovered-site".to_owned(),
+    };
+    candidate.chars().take(253).collect()
+}
+
+/// Poll until a `GridSite` named `site_name` exists and has `spec.gridNetworkRef = expected_network`.
+///
+/// Used by the auto-discovery validation to confirm that the primary operator created a
+/// `GridSite` for a remote SWIM Alive member without any harness-assisted `kubectl apply`.
+#[expect(
+    clippy::too_many_lines,
+    reason = "polling loop with per-iteration kubectl + deadline + sleep"
+)]
+pub(crate) fn wait_for_auto_gridsite(
+    context: &str,
+    site_name: &str,
+    expected_network: &str,
+    timeout: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let out = Command::new("kubectl")
+            .args([
+                "--context",
+                context,
+                "get",
+                "gridsites",
+                site_name,
+                "-o",
+                "jsonpath={.spec.gridNetworkRef}",
+                "--ignore-not-found",
+            ])
+            .output()
+            .unwrap_or_else(|_| std::process::abort());
+        let network = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+        if network == expected_network {
+            eprintln!(
+                "  [OK] GridSite {site_name:?} auto-created by operator \
+                 (gridNetworkRef={expected_network:?})"
+            );
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "timeout waiting for auto-discovered GridSite {site_name:?} \
+                 in network {expected_network:?}; last observed network: {network:?}"
+            )
+            .into());
+        }
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "polling wait for operator-auto-created GridSite"
+        )]
+        std::thread::sleep(Duration::from_secs(2));
+    }
+}
+
+/// Verify spec and status fields of an auto-discovered `GridSite`.
+///
+/// Checks `spec.gridNetworkRef`, `spec.egress.address`, and `status.phase`.
+/// The phase is expected to be `Discovered` since the operator sets it from
+/// the SWIM Alive membership signal.
+#[expect(
+    clippy::too_many_lines,
+    reason = "kubectl fetch + three field validations + diagnostic messages"
+)]
+pub(crate) fn verify_auto_gridsite_fields(
+    context: &str,
+    site_name: &str,
+    expected_network: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let out = Command::new("kubectl")
+        .args([
+            "--context",
+            context,
+            "get",
+            "gridsites",
+            site_name,
+            "-o",
+            "jsonpath={.spec.gridNetworkRef}/{.spec.egress.address}/{.status.phase}",
+        ])
+        .output()?;
+    if !out.status.success() {
+        return Err(format!(
+            "kubectl get gridsites/{site_name} for auto-discovery fields failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        )
+        .into());
+    }
+    let raw = String::from_utf8_lossy(&out.stdout);
+    let fields: Vec<&str> = raw.trim().splitn(3, '/').collect();
+    let network = fields.first().copied().unwrap_or("");
+    let egress = fields.get(1).copied().unwrap_or("");
+    let phase = fields.get(2).copied().unwrap_or("");
+
+    if network != expected_network {
+        return Err(format!(
+            "auto-discovered GridSite {site_name:?}: gridNetworkRef={network:?} \
+             (expected {expected_network:?})"
+        )
+        .into());
+    }
+    if egress.is_empty() {
+        return Err(format!(
+            "auto-discovered GridSite {site_name:?}: spec.egress.address is empty; \
+             expected the SWIM advertised address"
+        )
+        .into());
+    }
+    if phase != "Discovered" {
+        return Err(format!(
+            "auto-discovered GridSite {site_name:?}: status.phase={phase:?} \
+             (expected \"Discovered\")"
+        )
+        .into());
+    }
+    eprintln!(
+        "  [PASS] auto-discovered GridSite {site_name:?}: \
+         gridNetworkRef={network:?}, egress={egress:?}, phase={phase:?}"
+    );
+    Ok(())
+}
+
 /// Delete all resources created by the site-join-discovery validation on `context`.
 ///
 /// Safe to call before a fresh run — all deletes use `--ignore-not-found`.
@@ -3085,6 +3233,19 @@ pub(crate) fn cleanup_site_join_resources(context: &str) -> Result<(), Box<dyn s
     delete_cluster_resource(context, "gridnetwork", SITE_JOIN_NETWORK)?;
     delete_cluster_resource(context, "gridnetwork", SITE_JOIN_WRONG_NETWORK)?;
     eprintln!("  [OK] stale site-join-discovery resources removed from {context}");
+    Ok(())
+}
+
+/// Delete a `GridSite` that was auto-discovered and created by the operator.
+///
+/// Wraps `delete_cluster_resource` with `--ignore-not-found` so cleanup is
+/// idempotent even when the site was never created (e.g. SWIM did not converge).
+pub(crate) fn cleanup_auto_discovered_gridsite(
+    context: &str,
+    site_name: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    delete_cluster_resource(context, "gridsite", site_name)?;
+    eprintln!("  [OK] auto-discovered GridSite {site_name:?} removed from {context}");
     Ok(())
 }
 

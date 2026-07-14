@@ -2424,9 +2424,18 @@ fn env_verify_metrics_routing(config: &Path) -> Result<(), Box<dyn std::error::E
 ///
 /// **Cross-network isolation:** a wrong-network `GridSite` and `InferenceProvider` are applied
 /// and their absence from the correct-network overlay is asserted by reading the overlay `ConfigMap`.
+///
+/// **Auto-discovery proof (step 3):** after SWIM convergence, the primary operator creates
+/// a `GridSite` for the joining SWIM member without any harness-assisted `kubectl apply`.
+/// The created `GridSite` is named after the SWIM `site_id` and has `spec.gridNetworkRef` and
+/// `spec.egress.address` populated from the SWIM membership record.
+///
+/// **Lifecycle proof (step 5):** a separate harness-created `GridSite` is advanced through
+/// `Pending → Discovered → Connecting → Active` via status patches to prove the controller
+/// preserves each phase (Phase 1 identity `determine_phase`).
 #[expect(
     clippy::too_many_lines,
-    reason = "sequential 7-step lifecycle + overlay + isolation validation with port-forward lifecycle"
+    reason = "sequential 8-step proof: auto-discovery + harness lifecycle + overlay isolation"
 )]
 fn env_verify_site_join_discovery(config: &Path) -> Result<(), Box<dyn std::error::Error>> {
     use operator::{
@@ -2458,7 +2467,7 @@ fn env_verify_site_join_discovery(config: &Path) -> Result<(), Box<dyn std::erro
     eprintln!("  primary={east_site} ({east_ctx}), joining={west_site} ({west_ctx})");
 
     // ── Step 1: Preflight ─────────────────────────────────────────────────────
-    eprintln!("verify-site-join-discovery: [1/7] preflight — CRDs, cleanup, operator binary...");
+    eprintln!("verify-site-join-discovery: [1/8] preflight — CRDs, cleanup, operator binary...");
     // Build operator binary once so both spawns use the same pre-compiled binary.
     let build_ok = std::process::Command::new("cargo")
         .args(["build", "--quiet", "-p", "operator", "--bin", "operator"])
@@ -2473,7 +2482,7 @@ fn env_verify_site_join_discovery(config: &Path) -> Result<(), Box<dyn std::erro
     operator::cleanup_site_join_resources(&east_ctx)?;
 
     // ── Step 2: Start SWIM operators ──────────────────────────────────────────
-    eprintln!("verify-site-join-discovery: [2/7] starting SWIM operators...");
+    eprintln!("verify-site-join-discovery: [2/8] starting SWIM operators...");
     let (bind_primary, bind_joining) = reserve_swim_bind_addrs()?;
     // Primary operator: east cluster, no seeds.
     let op_primary =
@@ -2490,16 +2499,46 @@ fn env_verify_site_join_discovery(config: &Path) -> Result<(), Box<dyn std::erro
     let mut op_joining_guard = ProcGuard(Some(op_joining), "operator-joining");
     eprintln!("  [OK] primary operator ({east_site}) and joining operator ({west_site}) started");
 
-    // ── Step 3: SWIM convergence + GridNetworks + GridSites ───────────────────
-    eprintln!("verify-site-join-discovery: [3/7] waiting for SWIM membership formation...");
+    // ── Step 3: SWIM convergence + GridNetworks + auto-discovery proof ────────
+    eprintln!("verify-site-join-discovery: [3/8] SWIM convergence + auto-discovery proof...");
     // Wait for gossip to propagate before applying fixtures.
     operator::wait_for_swim_convergence(SWIM_CONVERGENCE_WAIT);
 
-    // Apply GridNetworks first — the GridSite controller validates gridNetworkRef.
+    // Apply GridNetworks ONLY — no GridSites yet.
+    // The auto-discovery proof asserts that the primary operator creates the joining
+    // GridSite by itself, without harness assistance.
     operator::apply_site_join_network(&east_ctx, east_site)?;
     operator::apply_site_join_wrong_network(&east_ctx)?;
 
-    // Apply GridSites: primary and joining on the correct network; wrong on isolation network.
+    // Poll GridNetwork Active: proves SWIM membership is reflected.
+    let connected = operator::wait_for_gridnetwork_active(&east_ctx, SITE_JOIN_NETWORK, SWIM_STATUS_POLL_TIMEOUT)?;
+    eprintln!(
+        "  [OK] GridNetwork {SITE_JOIN_NETWORK:?} Active \
+         (connectedSites={connected}) - SWIM membership formed"
+    );
+
+    // Assert the primary operator auto-created a GridSite for the joining SWIM member.
+    // The name is {network}-{site_id} — composite to avoid collisions when the operator
+    // reconciles multiple GridNetworks and the same SWIM peer appears in all of them.
+    let auto_site_name = operator::auto_discovered_gridsite_name(SITE_JOIN_NETWORK, west_site);
+    operator::bump_gridnetwork(&east_ctx, SITE_JOIN_NETWORK)?;
+    operator::wait_for_auto_gridsite(
+        &east_ctx,
+        &auto_site_name,
+        SITE_JOIN_NETWORK,
+        SITE_JOIN_PHASE_POLL_TIMEOUT,
+    )?;
+    operator::verify_auto_gridsite_fields(&east_ctx, &auto_site_name, SITE_JOIN_NETWORK)?;
+    eprintln!(
+        "  [PASS] GridSite {auto_site_name:?} auto-created by primary operator \
+         from SWIM Alive membership (no harness kubectl apply)"
+    );
+
+    // ── Step 4: Apply harness GridSites + wait for membership ────────────────
+    eprintln!("verify-site-join-discovery: [4/8] applying harness GridSites for lifecycle proof...");
+
+    // Apply primary GridSite (represents the local site's own record — harness-created for
+    // the overlay and isolation proof).
     operator::apply_gridsite(
         &east_ctx,
         SITE_JOIN_PRIMARY_SITE,
@@ -2507,6 +2546,8 @@ fn env_verify_site_join_discovery(config: &Path) -> Result<(), Box<dyn std::erro
         SITE_JOIN_PRIMARY_EGRESS,
         "primary",
     )?;
+    // Apply joining GridSite with the harness name + labels used in the lifecycle and overlay proofs.
+    // This is a SEPARATE site from the auto-created one (different name, same network).
     operator::apply_gridsite(
         &east_ctx,
         SITE_JOIN_JOINING_SITE,
@@ -2522,15 +2563,8 @@ fn env_verify_site_join_discovery(config: &Path) -> Result<(), Box<dyn std::erro
         "wrong",
     )?;
 
-    // Poll GridNetwork Active: proves at least one SWIM peer is reflected in status.
-    let connected = operator::wait_for_gridnetwork_active(&east_ctx, SITE_JOIN_NETWORK, SWIM_STATUS_POLL_TIMEOUT)?;
-    eprintln!(
-        "  [OK] GridNetwork {SITE_JOIN_NETWORK:?} Active \
-         (connectedSites={connected}) - SWIM membership formed"
-    );
-
-    // Step 4: GridSite lifecycle (Pending -> Discovered -> Connecting -> Active).
-    eprintln!("verify-site-join-discovery: [4/7] verifying GridSite lifecycle...");
+    // Step 5: GridSite lifecycle (Pending -> Discovered -> Connecting -> Active).
+    eprintln!("verify-site-join-discovery: [5/8] verifying GridSite lifecycle...");
 
     // Confirm operator reconciled the joining site to Pending before any join.
     operator::wait_for_gridsite_phase(
@@ -2576,7 +2610,7 @@ fn env_verify_site_join_discovery(config: &Path) -> Result<(), Box<dyn std::erro
     eprintln!("  [OK] joining site: Active (operator preserved phase — join complete)");
 
     // ── Step 5: Routing readiness ─────────────────────────────────────────────
-    eprintln!("verify-site-join-discovery: [5/7] verifying join routing readiness...");
+    eprintln!("verify-site-join-discovery: [6/8] verifying join routing readiness...");
     operator::verify_gridsite_routing_data(
         &east_ctx,
         SITE_JOIN_JOINING_SITE,
@@ -2585,7 +2619,7 @@ fn env_verify_site_join_discovery(config: &Path) -> Result<(), Box<dyn std::erro
     )?;
 
     // ── Step 6: Overlay + cross-network isolation ─────────────────────────────
-    eprintln!("verify-site-join-discovery: [6/7] verifying overlay and cross-network isolation...");
+    eprintln!("verify-site-join-discovery: [7/8] verifying overlay and cross-network isolation...");
 
     // Cross-network isolation via GridSite inventory: the wrong site must not appear in sjd-net.
     let net_sites = operator::list_gridsites_for_network(&east_ctx, SITE_JOIN_NETWORK)?;
@@ -2629,8 +2663,8 @@ fn env_verify_site_join_discovery(config: &Path) -> Result<(), Box<dyn std::erro
         SITE_JOIN_WRONG_SITE,
     );
 
-    // ── Step 7: Cleanup ───────────────────────────────────────────────────────
-    eprintln!("verify-site-join-discovery: [7/7] cleanup...");
+    // ── Step 8: Cleanup ───────────────────────────────────────────────────────
+    eprintln!("verify-site-join-discovery: [8/8] cleanup...");
     if let Some(c) = op_primary_guard.0.take() {
         operator::kill_operator(c);
     }
@@ -2638,14 +2672,17 @@ fn env_verify_site_join_discovery(config: &Path) -> Result<(), Box<dyn std::erro
         operator::kill_operator(c);
     }
     operator::cleanup_site_join_resources(&east_ctx).unwrap_or_else(|e| eprintln!("  warning: cleanup failed: {e}"));
+    // Also remove the auto-created GridSite ({network}-{site_id} naming).
+    operator::cleanup_auto_discovered_gridsite(&east_ctx, &auto_site_name)
+        .unwrap_or_else(|e| eprintln!("  warning: auto-discovered GridSite cleanup: {e}"));
 
     // Propagate overlay result after cleanup so resources are always removed.
     overlay_result?;
 
     eprintln!(
-        "verify-site-join-discovery: PASS - joining site progressed \
-         Pending -> Discovered -> Connecting -> Active; routing data complete; \
-         cross-network isolation confirmed"
+        "verify-site-join-discovery: PASS - auto-discovered GridSite created by operator \
+         from SWIM Alive member; joining site progressed Pending -> Discovered -> Connecting -> Active; \
+         routing data complete; cross-network isolation confirmed"
     );
     Ok(())
 }
