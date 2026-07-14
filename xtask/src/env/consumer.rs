@@ -34,6 +34,19 @@ use crate::env::{
 /// Kubernetes namespace for consumer deployments.
 const NAMESPACE: &str = "default";
 
+/// Bearer token the consumer gateway injects for API-provider upstream requests.
+///
+/// The consumer Praxis config uses `filter: headers` / `request_set` to set this
+/// value in the `Authorization` header before forwarding requests to the API-provider
+/// cluster.  The client does **not** supply this token — it is managed entirely by
+/// the grid infrastructure configuration, demonstrating transparent credential
+/// injection.
+///
+/// This is xtask validation configuration, not production credential lifecycle.
+/// Production should project credentials from `InferenceProvider.spec.auth.secretRef`
+/// into Praxis configuration rather than baking a static token into generated YAML.
+pub(crate) const API_PROVIDER_INJECTED_TOKEN: &str = "grid-api-fallback-secret";
+
 /// Gateway HTTP port.
 const GATEWAY_HTTP_PORT: u16 = 8080;
 
@@ -745,6 +758,509 @@ fn apply_consumer_deployment(context: &str) -> Result<(), Box<dyn std::error::Er
 }
 
 // ---------------------------------------------------------------------------
+// API provider fallback consumer deployment
+// ---------------------------------------------------------------------------
+
+/// Build the Praxis consumer config for the API-provider fallback validation.
+///
+/// Generates a `grid_route` section from the overlay (which must include both
+/// the local provider and the `api_provider` candidate), and a `load_balancer`
+/// section with:
+///
+/// - mTLS clusters for each local provider (identical to the standard path).
+/// - A **plain-HTTP** cluster for `gateway-{api_cluster}` pointing to the in-cluster mock API-provider service.  No TLS
+///   is used for this cluster because the mock represents a direct API endpoint, not a Grid provider gateway.  In
+///   production the gateway would reach the provider over HTTPS using credentials managed by the operator; the kind
+///   mock uses HTTP for simplicity.
+///
+/// The caller passes the raw overlay (all candidates intact — no
+/// `filter_overlay_for_local_providers` is applied) so that the API-provider
+/// candidate survives into the `grid_route` stanza.
+///
+/// Credential injection here is gateway-config-level proof using Praxis
+/// `headers` / `request_set`. It does not prove the future operator path that
+/// reads an `InferenceProvider` Secret reference and manages credential rotation.
+#[expect(
+    clippy::too_many_lines,
+    reason = "Praxis YAML generation with mTLS and plain-HTTP clusters"
+)]
+fn build_api_fallback_consumer_config(
+    consumer_site: &str,
+    local_providers: &[ProviderEndpoint],
+    overlay: &RoutingOverlay,
+    api_cluster_name: &str,
+    api_provider_endpoint: &str,
+) -> String {
+    let candidates = operator_overlay::candidates_yaml(overlay);
+    let local_site = consumer_site;
+    let mtls_clusters = build_clusters(local_providers);
+    let fallback = local_providers
+        .first()
+        .map_or_else(|| std::process::abort(), |ep| format!("gateway-{}", ep.site));
+    // 9 spaces for the list item, 11 for the nested key (matching build_clusters indent).
+    let api_cluster_yaml = format!(
+        "         - name: gateway-{api_cluster_name}\n\
+         \x20\x20         endpoints:\n\
+         \x20\x20           - \"{api_provider_endpoint}\""
+    );
+
+    format!(
+        "listeners:\n\
+         \x20 - name: public\n\
+         \x20   address: \"0.0.0.0:{GATEWAY_HTTP_PORT}\"\n\
+         \x20   filter_chains:\n\
+         \x20     - consumer-chain\n\
+         filter_chains:\n\
+         \x20 - name: consumer-chain\n\
+         \x20   filters:\n\
+         \x20     - filter: json_body_field\n\
+         \x20       field: model\n\
+         \x20       header: X-Model\n\
+         \x20     - filter: grid_route\n\
+         \x20       local_site: {local_site}\n\
+         \x20       model_header: X-Model\n\
+         \x20       candidates:\n\
+         {candidates}\n\
+         \x20     - filter: headers\n\
+         \x20       request_set:\n\
+         \x20         - name: \"Authorization\"\n\
+         \x20           value: \"Bearer {API_PROVIDER_INJECTED_TOKEN}\"\n\
+         \x20     - filter: router\n\
+         \x20       routes:\n\
+         \x20         - path_prefix: \"/\"\n\
+         \x20           cluster: {fallback}\n\
+         \x20     - filter: load_balancer\n\
+         \x20       clusters:\n\
+         {mtls_clusters}\n\
+         {api_cluster_yaml}\n\
+         admin:\n\
+         \x20 address: \"127.0.0.1:9901\"\n\
+         shutdown_timeout_secs: 5\n"
+    )
+}
+
+/// Deploy the consumer gateway configured for API-provider fallback routing.
+///
+/// Unlike [`deploy_consumer`], this function does **not** filter the overlay for
+/// local providers — the API-provider candidate must survive into the generated
+/// Praxis config.  The `api_provider_endpoint` is the in-cluster address of the
+/// mock API-provider service (e.g. `mock-api-provider.default.svc:8080`).
+#[expect(
+    clippy::too_many_lines,
+    reason = "sequential deploy steps: secret, config, deployment, rollout"
+)]
+pub(crate) fn deploy_consumer_for_api_fallback(
+    cfg: &EnvConfig,
+    overlay: &RoutingOverlay,
+    api_cluster_name: &str,
+    api_provider_endpoint: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let consumer_site = consumer_cluster_name(cfg)?;
+    let consumer_ctx = kubectl_context(consumer_site);
+    eprintln!("  deploying api-fallback consumer gateway to {consumer_ctx}...");
+
+    let provider_endpoints = collect_provider_endpoints(cfg)?;
+    if provider_endpoints.is_empty() {
+        return Err("no provider gateway endpoints found in config".into());
+    }
+
+    let config = build_api_fallback_consumer_config(
+        consumer_site,
+        &provider_endpoints,
+        overlay,
+        api_cluster_name,
+        api_provider_endpoint,
+    );
+
+    create_consumer_tls_secret(&consumer_ctx, consumer_site)?;
+
+    let yaml = format!(
+        "apiVersion: v1\n\
+         kind: ConfigMap\n\
+         metadata:\n\
+         \x20 name: praxis-consumer-config\n\
+         \x20 namespace: {NAMESPACE}\n\
+         data:\n\
+         \x20 praxis.yaml: |\n\
+         {}\n",
+        indent_yaml(&config, 4)
+    );
+    apply_manifest(&consumer_ctx, &yaml)?;
+
+    apply_consumer_deployment(&consumer_ctx)?;
+    rollout_restart(&consumer_ctx, "praxis-consumer")?;
+    wait_for_rollout(&consumer_ctx, "praxis-consumer", consumer_site)?;
+
+    eprintln!("  [PASS] api-fallback consumer gateway ready in {consumer_ctx}");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Full-grid consumer deployment and verification
+// ---------------------------------------------------------------------------
+
+/// Build the consumer Praxis config for the full-grid routing validation.
+///
+/// Generates a config with:
+/// - mTLS clusters for each local provider site (site-east, site-west)
+/// - A plain-HTTP cluster for the cloud-managed mock
+/// - A plain-HTTP cluster for the API-provider mock
+/// - `filter: headers` / `request_set` injecting the provider credential
+///
+/// All four backend clusters are included so the `grid_route` candidates from
+/// the operator overlay can be routed without filtering.
+///
+/// The cloud/API clusters are local OpenAI-compatible mocks. They validate Grid
+/// backend-kind routing and scoring categories, not provider-specific protocols
+/// such as `SigV4`, `OAuth2`, or real external API calls.
+///
+/// API credentials are injected with Praxis `headers` / `request_set` for the
+/// validation. Production Secret projection from `InferenceProvider.spec.auth`
+/// is a separate operator responsibility.
+#[expect(clippy::too_many_lines, reason = "Praxis YAML generation for all four cluster types")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "distinct argument per backend kind — grouping would obscure the intended topology"
+)]
+fn build_full_grid_consumer_config(
+    consumer_site: &str,
+    mtls_providers: &[ProviderEndpoint],
+    overlay: &RoutingOverlay,
+    cloud_cluster_name: &str,
+    cloud_endpoint: &str,
+    api_cluster_name: &str,
+    api_endpoint: &str,
+) -> String {
+    let candidates = operator_overlay::candidates_yaml(overlay);
+    let local_site = consumer_site;
+    let mtls_clusters = build_clusters(mtls_providers);
+    let fallback = mtls_providers
+        .first()
+        .map_or_else(|| std::process::abort(), |ep| format!("gateway-{}", ep.site));
+    // Plain-HTTP cluster for cloud-managed mock (no TLS — cloud APIs use HTTPS
+    // in production, but the kind mock uses plain HTTP for simplicity).
+    let cloud_cluster_yaml = format!(
+        "         - name: gateway-{cloud_cluster_name}\n\
+         \x20\x20         endpoints:\n\
+         \x20\x20           - \"{cloud_endpoint}\""
+    );
+    // Plain-HTTP cluster for api-provider mock.
+    let api_cluster_yaml = format!(
+        "         - name: gateway-{api_cluster_name}\n\
+         \x20\x20         endpoints:\n\
+         \x20\x20           - \"{api_endpoint}\""
+    );
+
+    format!(
+        "listeners:\n\
+         \x20 - name: public\n\
+         \x20   address: \"0.0.0.0:{GATEWAY_HTTP_PORT}\"\n\
+         \x20   filter_chains:\n\
+         \x20     - consumer-chain\n\
+         filter_chains:\n\
+         \x20 - name: consumer-chain\n\
+         \x20   filters:\n\
+         \x20     - filter: json_body_field\n\
+         \x20       field: model\n\
+         \x20       header: X-Model\n\
+         \x20     - filter: grid_route\n\
+         \x20       local_site: {local_site}\n\
+         \x20       model_header: X-Model\n\
+         \x20       candidates:\n\
+         {candidates}\n\
+         \x20     - filter: headers\n\
+         \x20       request_set:\n\
+         \x20         - name: \"Authorization\"\n\
+         \x20           value: \"Bearer {API_PROVIDER_INJECTED_TOKEN}\"\n\
+         \x20     - filter: router\n\
+         \x20       routes:\n\
+         \x20         - path_prefix: \"/\"\n\
+         \x20           cluster: {fallback}\n\
+         \x20     - filter: load_balancer\n\
+         \x20       clusters:\n\
+         {mtls_clusters}\n\
+         {cloud_cluster_yaml}\n\
+         {api_cluster_yaml}\n\
+         admin:\n\
+         \x20 address: \"127.0.0.1:9901\"\n\
+         shutdown_timeout_secs: 5\n"
+    )
+}
+
+/// Deploy the consumer gateway for the full-grid routing validation.
+///
+/// Does **not** apply [`filter_overlay_for_local_providers`] — all four candidates
+/// (local, remote, cloud, `api_provider`) must survive into the Praxis config.
+#[expect(clippy::too_many_arguments, reason = "one endpoint per backend cluster type")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "sequential deploy steps: secret, config, deployment, rollout"
+)]
+pub(crate) fn deploy_consumer_for_full_grid(
+    cfg: &EnvConfig,
+    overlay: &RoutingOverlay,
+    cloud_cluster_name: &str,
+    cloud_endpoint: &str,
+    api_cluster_name: &str,
+    api_endpoint: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let consumer_site = consumer_cluster_name(cfg)?;
+    let consumer_ctx = kubectl_context(consumer_site);
+    eprintln!("  deploying full-grid consumer gateway to {consumer_ctx}...");
+
+    let provider_endpoints = collect_provider_endpoints(cfg)?;
+    if provider_endpoints.is_empty() {
+        return Err("no provider gateway endpoints found in config".into());
+    }
+
+    let config = build_full_grid_consumer_config(
+        consumer_site,
+        &provider_endpoints,
+        overlay,
+        cloud_cluster_name,
+        cloud_endpoint,
+        api_cluster_name,
+        api_endpoint,
+    );
+
+    create_consumer_tls_secret(&consumer_ctx, consumer_site)?;
+
+    let yaml = format!(
+        "apiVersion: v1\n\
+         kind: ConfigMap\n\
+         metadata:\n\
+         \x20 name: praxis-consumer-config\n\
+         \x20 namespace: {NAMESPACE}\n\
+         data:\n\
+         \x20 praxis.yaml: |\n\
+         {}\n",
+        indent_yaml(&config, 4)
+    );
+    apply_manifest(&consumer_ctx, &yaml)?;
+    apply_consumer_deployment(&consumer_ctx)?;
+    rollout_restart(&consumer_ctx, "praxis-consumer")?;
+    wait_for_rollout(&consumer_ctx, "praxis-consumer", consumer_site)?;
+
+    eprintln!("  [PASS] full-grid consumer gateway ready in {consumer_ctx}");
+    Ok(())
+}
+
+/// Verify the full-grid routing end-to-end.
+///
+/// Asserts HTTP 200 + valid Chat Completions JSON for all four backend kinds,
+/// verifies the response model field echoes the requested model name (proving
+/// the correct backend handled the request), and asserts an unknown model fails
+/// cleanly.
+#[expect(clippy::too_many_lines, reason = "multi-backend E2E assertion chain")]
+pub(crate) fn verify_full_grid_e2e(
+    cfg: &EnvConfig,
+    east_model: &str,
+    west_model: &str,
+    cloud_model: &str,
+    api_model: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let consumer_site = consumer_cluster_name(cfg)?;
+    let mut tally = Tally::default();
+    let ctx = kubectl_context(consumer_site);
+
+    let port = find_free_port()?;
+    let mut pf = PortForwardGuard::start(&ctx, "praxis-consumer", port, GATEWAY_HTTP_PORT)?;
+
+    if !wait_for_port(port) {
+        tally.fail(consumer_site, "consumer gateway reachable via port-forward", &ctx);
+        pf.stop();
+        return tally.print_summary();
+    }
+    tally.pass(consumer_site, "consumer gateway reachable via port-forward");
+
+    // Verify each of the four backend models.
+    for (model, backend_label) in [
+        (east_model, "local/site-east provider gateway"),
+        (west_model, "remote/site-west provider gateway"),
+        (cloud_model, "cloud-managed mock"),
+        (api_model, "api-provider mock (injected credential)"),
+    ] {
+        verify_full_grid_model(&ctx, port, model, backend_label, consumer_site, &mut tally);
+    }
+
+    // Unknown model must fail cleanly.
+    match send_consumer_request(port, "nonexistent-model-xyz") {
+        Ok(resp) if resp.status == 404 || resp.status == 503 => {
+            tally.pass(consumer_site, "unknown model fails cleanly via consumer gateway");
+        },
+        Ok(resp) => {
+            tally.fail(
+                consumer_site,
+                &format!("unknown model returned {} (expected 404 or 503)", resp.status),
+                &ctx,
+            );
+        },
+        Err(e) => {
+            tally.fail(consumer_site, &format!("unknown model request failed: {e}"), &ctx);
+        },
+    }
+
+    pf.stop();
+    tally.print_summary()
+}
+
+/// Assert one model returns HTTP 200, valid Chat Completions JSON, and that the
+/// response `model` field equals the requested model name.
+#[expect(clippy::too_many_arguments, reason = "all args are distinct per-backend identifiers")]
+#[expect(clippy::too_many_lines, reason = "JSON parse + model field check + tally chain")]
+fn verify_full_grid_model(
+    context: &str,
+    port: u16,
+    model: &str,
+    backend_label: &str,
+    consumer_site: &str,
+    tally: &mut Tally,
+) {
+    match send_consumer_request(port, model) {
+        Ok(resp) if resp.status == 200 => {
+            tally.pass(
+                consumer_site,
+                &format!("model {model:?} ({backend_label}) returns 200 via consumer gateway"),
+            );
+            match serde_json::from_str::<serde_json::Value>(&resp.body) {
+                Ok(json) if json.get("choices").and_then(serde_json::Value::as_array).is_some() => {
+                    tally.pass(
+                        consumer_site,
+                        &format!("model {model:?} response is valid Chat Completions JSON"),
+                    );
+                    // Check response model field echoes the requested model (backend evidence).
+                    if let Some(resp_model) = json.get("model").and_then(serde_json::Value::as_str) {
+                        if resp_model == model {
+                            tally.pass(
+                                consumer_site,
+                                &format!(
+                                    "model {model:?} response model field matches request \
+                                     (selected-backend evidence: {backend_label})"
+                                ),
+                            );
+                        } else {
+                            tally.fail(
+                                consumer_site,
+                                &format!(
+                                    "model {model:?} response model field {resp_model:?} != \
+                                     requested {model:?}"
+                                ),
+                                context,
+                            );
+                        }
+                    }
+                },
+                _ => {
+                    let excerpt = safe_truncate(&resp.body, 200);
+                    tally.fail(
+                        consumer_site,
+                        &format!("model {model:?} response missing choices array\n         body: {excerpt}"),
+                        context,
+                    );
+                },
+            }
+        },
+        Ok(resp) => {
+            let excerpt = safe_truncate(&resp.body, 200);
+            tally.fail(
+                consumer_site,
+                &format!(
+                    "model {model:?} returned {} (expected 200)\n         body: {excerpt}",
+                    resp.status
+                ),
+                context,
+            );
+        },
+        Err(e) => {
+            tally.fail(consumer_site, &format!("model {model:?} request failed: {e}"), context);
+        },
+    }
+}
+
+/// Verify the API-provider fallback routing end-to-end.
+///
+/// Performs a sequence of assertions that together prove the full Demo 2 chain:
+///
+/// 1. **Consumer reachable**: port-forward to the consumer gateway succeeds.
+/// 2. **Local model routes correctly**: `local_model` returns HTTP 200 with valid Chat Completions JSON (proves the
+///    normal self-hosted path still works).
+/// 3. **API-fallback model routes correctly**: `api_model` returns HTTP 200 with valid Chat Completions JSON routed
+///    through the mock API-provider.
+/// 4. **Credential proof**: the request for `api_model` uses only a consumer-level credential (`Authorization:
+///    Bearer`); the grid consumer gateway handles routing to the API endpoint.  The mock API-provider requires a Bearer
+///    token, and the request succeeds, proving the infrastructure manages endpoint access — not the client.
+/// 5. **Unknown model fails cleanly**: a request for a non-existent model returns 404 or 503.
+#[expect(clippy::too_many_lines, reason = "multi-assertion E2E verification chain")]
+pub(crate) fn verify_api_fallback_e2e(
+    cfg: &EnvConfig,
+    local_model: &str,
+    api_model: &str,
+    mock_api_port: Option<u16>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let consumer_site = consumer_cluster_name(cfg)?;
+    let mut tally = Tally::default();
+    let ctx = kubectl_context(consumer_site);
+
+    let port = find_free_port()?;
+    let mut pf = PortForwardGuard::start(&ctx, "praxis-consumer", port, GATEWAY_HTTP_PORT)?;
+
+    if !wait_for_port(port) {
+        tally.fail(consumer_site, "consumer gateway reachable via port-forward", &ctx);
+        pf.stop();
+        return tally.print_summary();
+    }
+    tally.pass(consumer_site, "consumer gateway reachable via port-forward");
+
+    // Assertion 1: local self-hosted model routes to the local provider gateway.
+    verify_consumer_model(
+        &ctx,
+        port,
+        "site-a (local provider)",
+        local_model,
+        consumer_site,
+        &mut tally,
+    );
+
+    // Assertion 2: api_provider model routes to the mock API-provider.
+    // Uses the standard request path (includes Authorization: Bearer dummy-key).
+    verify_consumer_model(
+        &ctx,
+        port,
+        "api-provider mock (api fallback)",
+        api_model,
+        consumer_site,
+        &mut tally,
+    );
+
+    // Assertion 3: credential injection proof (if mock port-forward is available).
+    // Negative: direct request to mock WITHOUT auth → 401.
+    // Positive: request via consumer gateway WITHOUT client auth → 200 (gateway injects credential).
+    if let Some(mock_port) = mock_api_port {
+        verify_credential_injection(&ctx, port, api_model, mock_port, &mut tally);
+    }
+
+    // Assertion 4: unknown model fails cleanly.
+    match send_consumer_request(port, "nonexistent-model-xyz") {
+        Ok(resp) if resp.status == 404 || resp.status == 503 => {
+            tally.pass(consumer_site, "unknown model fails cleanly via consumer gateway");
+        },
+        Ok(resp) => {
+            tally.fail(
+                consumer_site,
+                &format!("unknown model returned {} (expected 404 or 503)", resp.status),
+                &ctx,
+            );
+        },
+        Err(e) => {
+            tally.fail(consumer_site, &format!("unknown model request failed: {e}"), &ctx);
+        },
+    }
+
+    pf.stop();
+    tally.print_summary()
+}
+
+// ---------------------------------------------------------------------------
 // E2E verification
 // ---------------------------------------------------------------------------
 
@@ -865,7 +1381,7 @@ fn verify_consumer_model(
 /// Send a Chat Completions request to the consumer gateway.
 ///
 /// The `Authorization: Bearer` header is required by the `mock-openai` provider backend.
-fn send_consumer_request(port: u16, model: &str) -> Result<HttpResponse, Box<dyn std::error::Error>> {
+pub(crate) fn send_consumer_request(port: u16, model: &str) -> Result<HttpResponse, Box<dyn std::error::Error>> {
     let url = format!("http://127.0.0.1:{port}/v1/chat/completions");
     let body = format!(r#"{{"model":"{model}","messages":[{{"role":"user","content":"hello"}}],"max_tokens":1}}"#);
     let output = Command::new("curl")
@@ -889,6 +1405,141 @@ fn send_consumer_request(port: u16, model: &str) -> Result<HttpResponse, Box<dyn
         ])
         .output()?;
     parse_curl_output(&String::from_utf8(output.stdout)?)
+}
+
+/// Send a Chat Completions request without any `Authorization` header.
+///
+/// Used in the credential-injection proof to show that when the client does
+/// not provide an `Authorization: Bearer` header, a request that goes
+/// **directly** to the mock API-provider returns `401 Unauthorized`, while a
+/// request that goes **through the consumer gateway** (which uses
+/// `filter: headers` / `request_set` to inject
+/// `Authorization: Bearer grid-api-fallback-secret`) returns `200 OK`.
+fn send_request_without_auth(port: u16, model: &str) -> Result<HttpResponse, Box<dyn std::error::Error>> {
+    let url = format!("http://127.0.0.1:{port}/v1/chat/completions");
+    let body = format!(r#"{{"model":"{model}","messages":[{{"role":"user","content":"hello"}}],"max_tokens":1}}"#);
+    let output = Command::new("curl")
+        .args([
+            "-s",
+            "-w",
+            "\n%{http_code}",
+            "--connect-timeout",
+            "5",
+            "--max-time",
+            "15",
+            "-X",
+            "POST",
+            "-H",
+            "Content-Type: application/json",
+            "-d",
+            &body,
+            &url,
+        ])
+        .output()?;
+    parse_curl_output(&String::from_utf8(output.stdout)?)
+}
+
+/// Verify gateway-level credential injection for the API-provider fallback.
+///
+/// Proves that:
+/// 1. The mock API-provider rejects requests with no `Authorization` header (status 401). This establishes that the
+///    credential is genuinely required by the backend.
+/// 2. A request routed through the consumer gateway — which injects `Authorization: Bearer grid-api-fallback-secret`
+///    via `filter: headers / request_set` — succeeds with status 200. The client request carries **no** `Authorization`
+///    header; only the gateway config knows the provider credential.
+///
+/// Together these two assertions prove transparent provider credential injection:
+/// the client is unaware of the provider API key; the grid infrastructure manages it.
+#[expect(
+    clippy::too_many_lines,
+    reason = "two-phase credential injection proof: negative then positive"
+)]
+pub(crate) fn verify_credential_injection(
+    context: &str,
+    consumer_port: u16,
+    api_model: &str,
+    mock_api_port: u16,
+    tally: &mut Tally,
+) {
+    let consumer_site = "consumer";
+
+    // ── Negative proof: direct mock request without auth returns 401 ──────────
+    match send_request_without_auth(mock_api_port, api_model) {
+        Ok(resp) if resp.status == 401 => {
+            tally.pass(
+                consumer_site,
+                "credential injection negative proof: direct request to mock api-provider \
+                 without Authorization returns 401 (mock requires credential)",
+            );
+        },
+        Ok(resp) => {
+            tally.fail(
+                consumer_site,
+                &format!(
+                    "credential injection negative proof failed: direct mock request returned {} \
+                     (expected 401 — mock should reject unauthenticated requests)",
+                    resp.status
+                ),
+                context,
+            );
+        },
+        Err(e) => {
+            tally.fail(
+                consumer_site,
+                &format!("credential injection negative proof failed: direct mock request error: {e}"),
+                context,
+            );
+        },
+    }
+
+    // ── Positive proof: consumer gateway injects credential → 200 ──────────────
+    match send_request_without_auth(consumer_port, api_model) {
+        Ok(resp) if resp.status == 200 => {
+            tally.pass(
+                consumer_site,
+                &format!(
+                    "credential injection positive proof: consumer gateway request for \
+                     {api_model:?} without client Authorization returns 200 \
+                     (gateway injected Bearer {API_PROVIDER_INJECTED_TOKEN:?})"
+                ),
+            );
+            if serde_json::from_str::<serde_json::Value>(&resp.body)
+                .ok()
+                .and_then(|j| {
+                    j.get("choices")
+                        .and_then(serde_json::Value::as_array)
+                        .map(|a| !a.is_empty())
+                })
+                .unwrap_or(false)
+            {
+                tally.pass(
+                    consumer_site,
+                    "injected credential: api-provider response is valid Chat Completions JSON",
+                );
+            }
+        },
+        Ok(resp) => {
+            let excerpt = safe_truncate(&resp.body, 200);
+            tally.fail(
+                consumer_site,
+                &format!(
+                    "credential injection positive proof failed: consumer gateway returned {} \
+                     (expected 200 — filter: headers / request_set may not be supported by \
+                     this Praxis build, or the config was not applied correctly)\n\
+                     body: {excerpt}",
+                    resp.status
+                ),
+                context,
+            );
+        },
+        Err(e) => {
+            tally.fail(
+                consumer_site,
+                &format!("credential injection positive proof failed: consumer gateway error: {e}"),
+                context,
+            );
+        },
+    }
 }
 
 // ---------------------------------------------------------------------------

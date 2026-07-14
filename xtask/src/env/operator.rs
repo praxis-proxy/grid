@@ -47,6 +47,46 @@ pub(crate) const TEST_PROVIDER_DEGRADED: &str = "op-e2e-degraded";
 /// appear after local providers (score ≈ 7.0) regardless of input order.
 pub(crate) const TEST_PROVIDER_API: &str = "op-e2e-api-fallback";
 
+/// The model name served by the API-provider fallback fixture.
+///
+/// Distinct from the self-hosted models so the consumer `grid_route` can route
+/// it to the API-provider cluster without ambiguity.
+pub(crate) const API_FALLBACK_MODEL: &str = "model-z";
+
+// ---------------------------------------------------------------------------
+// Full-grid routing validation constants
+// ---------------------------------------------------------------------------
+
+/// `GridNetwork` name used by the full-grid routing validation.
+pub(crate) const FULL_GRID_NETWORK: &str = "op-e2e-full-grid-net";
+
+/// Gateway reference name inside the full-grid `GridNetwork`.
+pub(crate) const FULL_GRID_GW: &str = "op-e2e-gw";
+
+/// `InferenceProvider` name for the local/self-hosted east provider in full-grid.
+pub(crate) const FULL_GRID_PROVIDER_EAST: &str = "op-e2e-fg-east";
+
+/// `InferenceProvider` name for the remote/self-hosted west provider in full-grid.
+pub(crate) const FULL_GRID_PROVIDER_WEST: &str = "op-e2e-fg-west";
+
+/// `InferenceProvider` name for the cloud-managed provider in full-grid.
+pub(crate) const FULL_GRID_PROVIDER_CLOUD: &str = "op-e2e-fg-cloud";
+
+/// `InferenceProvider` name for the API-provider in full-grid.
+pub(crate) const FULL_GRID_PROVIDER_API: &str = "op-e2e-fg-api";
+
+/// Model served by the local/east provider in full-grid.  Distinct per backend kind.
+pub(crate) const FULL_GRID_MODEL_EAST: &str = "model-east";
+
+/// Model served by the remote/west provider in full-grid.
+pub(crate) const FULL_GRID_MODEL_WEST: &str = "model-west";
+
+/// Model served by the cloud-managed provider in full-grid.
+pub(crate) const FULL_GRID_MODEL_CLOUD: &str = "model-cloud";
+
+/// Model served by the API-provider in full-grid.
+pub(crate) const FULL_GRID_MODEL_API: &str = "model-api";
+
 /// The `routingClusterRef` set on the healthy provider fixture.
 ///
 /// Matches the xtask topology site name `site-a` so that the operator-generated
@@ -1286,6 +1326,299 @@ pub(crate) fn verify_scoring_order(
         .into());
     }
     eprintln!("  [OK] scoring order: {local_cluster} (pos {local_pos}) before {api_cluster} (pos {api_pos})");
+    Ok(())
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "multi-assertion overlay check: presence, freshness, and scoring order"
+)]
+/// Verify the API-provider fallback candidate is present in the overlay.
+///
+/// Asserts that:
+/// 1. A candidate for `api_model` at `api_cluster` exists.
+/// 2. The candidate has `fresh = true` (the API provider is not marked Degraded).
+/// 3. A candidate for the local model at `local_cluster` also exists and sorts before the API one.
+///
+/// This proves the overlay contains both routing paths and that the scoring
+/// engine placed the API-provider candidate at lower priority than the local one.
+pub(crate) fn verify_api_fallback_overlay(
+    overlay: &serde_json::Value,
+    local_cluster: &str,
+    api_cluster: &str,
+    api_model: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let candidates = overlay["candidates"]
+        .as_array()
+        .ok_or("overlay missing candidates array")?;
+
+    // API-provider candidate must be present and fresh.
+    let api_candidate = candidates
+        .iter()
+        .find(|c| c["cluster"].as_str() == Some(api_cluster) && c["name"].as_str() == Some(api_model))
+        .ok_or_else(|| {
+            format!("api_provider candidate for model={api_model:?} at cluster={api_cluster:?} not found in overlay")
+        })?;
+
+    if api_candidate["fresh"].as_bool() != Some(true) {
+        return Err(format!("api_provider candidate for {api_model:?} has fresh=false; expected fresh=true (api_provider is not degraded)").into());
+    }
+    eprintln!("  [OK] api_provider candidate: model={api_model:?} cluster={api_cluster:?} fresh=true");
+
+    // Local candidate must sort before API-provider.
+    let local_pos = candidates
+        .iter()
+        .position(|c| c["cluster"].as_str() == Some(local_cluster))
+        .ok_or_else(|| format!("{local_cluster} not found in overlay candidates"))?;
+    let api_pos = candidates
+        .iter()
+        .position(|c| c["cluster"].as_str() == Some(api_cluster))
+        .ok_or_else(|| format!("{api_cluster} not found in overlay candidates"))?;
+
+    if api_pos <= local_pos {
+        return Err(format!(
+            "api fallback scoring: {api_cluster} (pos {api_pos}) must appear after \
+             {local_cluster} (pos {local_pos}); local provider should have higher priority"
+        )
+        .into());
+    }
+    eprintln!(
+        "  [OK] overlay scoring order: local={local_cluster} (pos {local_pos}) before api={api_cluster} (pos {api_pos})"
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Full-grid routing fixture helpers
+// ---------------------------------------------------------------------------
+
+/// Apply the full-grid `GridNetwork` and all four `InferenceProvider` fixtures.
+///
+/// Creates four providers in one `GridNetwork` [`FULL_GRID_NETWORK`]:
+/// - Local/self-hosted east: `backendKind = "local"`, `routingClusterRef = east_site`
+/// - Remote/self-hosted west: `backendKind = "remote"`, `routingClusterRef = west_site`
+/// - Cloud-managed: `backendKind = "cloud_managed"`, no `routingClusterRef`
+/// - API-provider: `backendKind = "api_provider"`, no `routingClusterRef`
+///
+/// Without a `routingClusterRef`, the cloud and api candidates use the provider
+/// name (`op-e2e-fg-cloud`, `op-e2e-fg-api`) as both `site` and `cluster` in
+/// the Phase 1 fallback.
+///
+/// The cloud/API fixtures use local OpenAI-compatible mocks. They prove that
+/// Grid can model, score, and route the `cloud_managed` and `api_provider`
+/// backend categories in one overlay; they do not prove real Bedrock, Vertex,
+/// `OpenAI`, or Anthropic provider authentication.
+#[expect(clippy::too_many_arguments, reason = "one endpoint argument per backend kind")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "four JSON manifest builds (GridNetwork + 4 InferenceProviders) plus apply calls"
+)]
+pub(crate) fn apply_full_grid_fixtures(
+    context: &str,
+    east_site: &str,
+    west_site: &str,
+    east_endpoint: &str,
+    west_endpoint: &str,
+    cloud_endpoint: &str,
+    api_endpoint: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let network = serde_json::to_string_pretty(&serde_json::json!({
+        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "kind": "GridNetwork",
+        "metadata": { "name": FULL_GRID_NETWORK },
+        "spec": {
+            "seeds": [],
+            "gatewayRefs": [{ "name": FULL_GRID_GW, "namespace": "default" }]
+        }
+    }))
+    .unwrap_or_else(|e| {
+        eprintln!("full-grid network fixture serialization failed: {e}");
+        std::process::exit(1)
+    });
+
+    let east = serde_json::to_string_pretty(&serde_json::json!({
+        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "kind": "InferenceProvider",
+        "metadata": { "name": FULL_GRID_PROVIDER_EAST },
+        "spec": {
+            "gridNetworkRef": FULL_GRID_NETWORK,
+            "providerKind": "open_ai",
+            "backendKind": "local",
+            "endpoint": east_endpoint,
+            "models": [{ "name": FULL_GRID_MODEL_EAST }],
+            "routingClusterRef": east_site
+        }
+    }))
+    .unwrap_or_else(|e| {
+        eprintln!("full-grid east fixture serialization failed: {e}");
+        std::process::exit(1)
+    });
+
+    let west = serde_json::to_string_pretty(&serde_json::json!({
+        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "kind": "InferenceProvider",
+        "metadata": { "name": FULL_GRID_PROVIDER_WEST },
+        "spec": {
+            "gridNetworkRef": FULL_GRID_NETWORK,
+            "providerKind": "open_ai",
+            "backendKind": "remote",
+            "endpoint": west_endpoint,
+            "models": [{ "name": FULL_GRID_MODEL_WEST }],
+            "routingClusterRef": west_site
+        }
+    }))
+    .unwrap_or_else(|e| {
+        eprintln!("full-grid west fixture serialization failed: {e}");
+        std::process::exit(1)
+    });
+
+    let cloud = serde_json::to_string_pretty(&serde_json::json!({
+        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "kind": "InferenceProvider",
+        "metadata": { "name": FULL_GRID_PROVIDER_CLOUD },
+        "spec": {
+            "gridNetworkRef": FULL_GRID_NETWORK,
+            "providerKind": "open_ai",
+            "backendKind": "cloud_managed",
+            "endpoint": cloud_endpoint,
+            "models": [{ "name": FULL_GRID_MODEL_CLOUD }]
+        }
+    }))
+    .unwrap_or_else(|e| {
+        eprintln!("full-grid cloud fixture serialization failed: {e}");
+        std::process::exit(1)
+    });
+
+    let api = serde_json::to_string_pretty(&serde_json::json!({
+        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "kind": "InferenceProvider",
+        "metadata": { "name": FULL_GRID_PROVIDER_API },
+        "spec": {
+            "gridNetworkRef": FULL_GRID_NETWORK,
+            "providerKind": "anthropic",
+            "backendKind": "api_provider",
+            "endpoint": api_endpoint,
+            "models": [{ "name": FULL_GRID_MODEL_API }]
+        }
+    }))
+    .unwrap_or_else(|e| {
+        eprintln!("full-grid api fixture serialization failed: {e}");
+        std::process::exit(1)
+    });
+
+    apply_manifest(context, &network)?;
+    apply_manifest(context, &east)?;
+    apply_manifest(context, &west)?;
+    apply_manifest(context, &cloud)?;
+    apply_manifest(context, &api)?;
+    eprintln!(
+        "  [OK] full-grid fixtures applied (east={east_site}/{FULL_GRID_MODEL_EAST}, \
+         west={west_site}/{FULL_GRID_MODEL_WEST}, cloud/{FULL_GRID_MODEL_CLOUD}, \
+         api/{FULL_GRID_MODEL_API})"
+    );
+    Ok(())
+}
+
+/// Delete all resources created by the full-grid routing validation.
+///
+/// Safe to call before a fresh run — all deletes use `--ignore-not-found`.
+pub(crate) fn cleanup_full_grid_resources(context: &str) -> Result<(), Box<dyn std::error::Error>> {
+    delete_namespaced_resource(
+        context,
+        "default",
+        "configmap",
+        &format!("grid-overlay-{FULL_GRID_NETWORK}-{FULL_GRID_GW}"),
+    )?;
+    delete_cluster_resource(context, "inferenceprovider", FULL_GRID_PROVIDER_EAST)?;
+    delete_cluster_resource(context, "inferenceprovider", FULL_GRID_PROVIDER_WEST)?;
+    delete_cluster_resource(context, "inferenceprovider", FULL_GRID_PROVIDER_CLOUD)?;
+    delete_cluster_resource(context, "inferenceprovider", FULL_GRID_PROVIDER_API)?;
+    delete_cluster_resource(context, "gridnetwork", FULL_GRID_NETWORK)?;
+    eprintln!("  [OK] stale full-grid resources removed");
+    Ok(())
+}
+
+/// Verify the full-grid overlay contains all four backend-kind candidates.
+///
+/// Asserts:
+/// - `model-east` candidate at `east_site` (local backend, `fresh=true`)
+/// - `model-west` candidate at `west_site` (remote backend, `fresh=true`)
+/// - `model-cloud` candidate at cloud cluster identity (`fresh=true`)
+/// - `model-api` candidate at api cluster identity (`fresh=true`)
+/// - Scoring order respects locality: `local` > `remote` > `cloud_managed` > `api_provider`
+#[expect(
+    clippy::too_many_lines,
+    reason = "four candidate assertions plus scoring order check"
+)]
+pub(crate) fn verify_full_grid_overlay(
+    overlay: &serde_json::Value,
+    east_site: &str,
+    west_site: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let candidates = overlay["candidates"]
+        .as_array()
+        .ok_or("overlay missing candidates array")?;
+
+    for (model, site_or_cluster, label) in [
+        (FULL_GRID_MODEL_EAST, east_site, "local east"),
+        (FULL_GRID_MODEL_WEST, west_site, "remote west"),
+        (FULL_GRID_MODEL_CLOUD, FULL_GRID_PROVIDER_CLOUD, "cloud_managed"),
+        (FULL_GRID_MODEL_API, FULL_GRID_PROVIDER_API, "api_provider"),
+    ] {
+        let found = candidates
+            .iter()
+            .find(|c| c["name"].as_str() == Some(model) && c["site"].as_str() == Some(site_or_cluster));
+        match found {
+            Some(c) if c["fresh"].as_bool() == Some(true) => {
+                eprintln!(
+                    "  [OK] full-grid overlay: {label} candidate model={model:?} \
+                     site={site_or_cluster:?} fresh=true"
+                );
+            },
+            Some(_) => {
+                return Err(format!(
+                    "full-grid overlay: {label} candidate model={model:?} at site={site_or_cluster:?} \
+                     has fresh=false (expected fresh=true)"
+                )
+                .into());
+            },
+            None => {
+                return Err(format!(
+                    "full-grid overlay: {label} candidate model={model:?} at site={site_or_cluster:?} \
+                     not found in overlay"
+                )
+                .into());
+            },
+        }
+    }
+
+    // Verify scoring order: local (east) ≻ remote (west) ≻ cloud ≻ api_provider.
+    // Each model is unique, so positions are determined by scoring, not routing ties.
+    let pos = |model: &str, site: &str| -> Option<usize> {
+        candidates
+            .iter()
+            .position(|c| c["name"].as_str() == Some(model) && c["site"].as_str() == Some(site))
+    };
+
+    let east_pos = pos(FULL_GRID_MODEL_EAST, east_site).unwrap_or(usize::MAX);
+    let west_pos = pos(FULL_GRID_MODEL_WEST, west_site).unwrap_or(usize::MAX);
+    let cloud_pos = pos(FULL_GRID_MODEL_CLOUD, FULL_GRID_PROVIDER_CLOUD).unwrap_or(usize::MAX);
+    let api_pos = pos(FULL_GRID_MODEL_API, FULL_GRID_PROVIDER_API).unwrap_or(usize::MAX);
+
+    if east_pos < west_pos && west_pos < cloud_pos && cloud_pos < api_pos {
+        eprintln!(
+            "  [OK] full-grid overlay scoring order: local(pos {east_pos}) < \
+             remote(pos {west_pos}) < cloud(pos {cloud_pos}) < api(pos {api_pos})"
+        );
+    } else {
+        return Err(format!(
+            "full-grid overlay scoring order unexpected: \
+             east={east_pos} west={west_pos} cloud={cloud_pos} api={api_pos}; \
+             expected local < remote < cloud_managed < api_provider"
+        )
+        .into());
+    }
+
     Ok(())
 }
 

@@ -295,6 +295,35 @@ pub(crate) enum Action {
         site: Option<String>,
     },
 
+    /// Prove the API-provider fallback routing path end-to-end.
+    ///
+    /// Applies a local self-hosted `InferenceProvider` for `model-x` (served by
+    /// the site-a mock provider gateway) and an `api_provider` `InferenceProvider`
+    /// for `model-z` (served by a mock OpenAI-compatible API endpoint in the
+    /// consumer cluster).  Runs the Grid operator to generate an overlay, then
+    /// deploys a consumer gateway whose config includes both the mTLS cluster for
+    /// the local provider and a plain-HTTP cluster for the API-provider mock.
+    ///
+    /// Asserts:
+    /// - The overlay contains both candidates with the `api_provider` sorted last.
+    /// - `model-x` requests return HTTP 200 from the local provider gateway.
+    /// - `model-z` requests return HTTP 200 from the mock API-provider endpoint.
+    /// - The client sends only a consumer-level credential, not a provider API key.
+    /// - An unknown model returns 404 or 503.
+    ///
+    /// Requires: kind clusters (`grid-site-a` and `grid-consumer`) and gateway
+    /// images to be ready.  Run `env up` and `env load-gateway-images` first.
+    /// Safe to rerun: all owned resources are cleaned at the start.
+    VerifyApiFallback {
+        /// Path to the environment config file.
+        #[arg(short, long, default_value = "tests/env/operator-routing.toml")]
+        config: PathBuf,
+
+        /// Kind cluster context (first provider site by default).
+        #[arg(long)]
+        site: Option<String>,
+    },
+
     /// Validate generated CRD schema fields.
     ///
     /// Runs `generate_crds`, parses the output JSON, and asserts that all
@@ -354,6 +383,50 @@ pub(crate) enum Action {
         #[arg(short, long, default_value = "tests/env/operator-routing-two-provider.toml")]
         config: PathBuf,
     },
+
+    /// Verify the Demo 1 llm-d-style two-provider model routing topology.
+    ///
+    /// Proves the full llm-d routing path end-to-end in kind:
+    ///
+    /// 1. Deploy provider gateways with mock EPP + ext\_proc + endpoint\_selector.
+    /// 2. Run the multi-provider operator reconcile and export the routing overlay.
+    /// 3. Verify the provider-side llm-d path directly on each provider gateway.
+    /// 4. Deploy the consumer gateway from the operator-exported overlay.
+    /// 5. Verify consumer routing: each model returns HTTP 200, unknown model fails cleanly.
+    /// 6. Verify Chat Completions response bodies include the requested model name.
+    /// 7. Assert no unexpected pod restarts during the test.
+    ///
+    /// Requires the two-provider kind environment.  Run
+    /// `env up -c tests/env/operator-routing-two-provider.toml` and
+    /// `env load-gateway-images -c tests/env/operator-routing-two-provider.toml`
+    /// first.
+    VerifyDemo1LlmdRouting {
+        /// Path to the two-provider environment config file.
+        #[arg(short, long, default_value = "tests/env/operator-routing-two-provider.toml")]
+        config: PathBuf,
+    },
+
+    /// Prove the full-grid routing path across all four backend kinds.
+    ///
+    /// Validates one consumer gateway routing across:
+    /// - `model-east` via site-east local/self-hosted provider (mTLS provider gateway)
+    /// - `model-west` via site-west remote/self-hosted provider (mTLS provider gateway)
+    /// - `model-cloud` via cloud-managed mock (plain HTTP, in consumer cluster)
+    /// - `model-api` via API-provider mock (plain HTTP, gateway-injected credential)
+    ///
+    /// The Grid operator generates the routing overlay for all four backends.
+    /// The consumer config is extended to include non-mTLS clusters for the
+    /// cloud and API mocks alongside the standard mTLS clusters for site-east
+    /// and site-west.
+    ///
+    /// Requires: two-provider kind environment.  Run `env up` and
+    /// `env load-gateway-images` with the two-provider config first.
+    /// Safe to rerun: all owned resources are cleaned at the start.
+    VerifyFullGridRouting {
+        /// Path to the two-provider environment config file.
+        #[arg(short, long, default_value = "tests/env/operator-routing-two-provider.toml")]
+        config: PathBuf,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -388,9 +461,12 @@ pub(crate) fn run(action: &Action) -> Result<(), Box<dyn std::error::Error>> {
         Action::VerifySwimMembership { config, site } => env_verify_swim_membership(config, site.as_deref()),
         Action::VerifySwimState { config, site } => env_verify_swim_state(config, site.as_deref()),
         Action::ValidateAll { config, site } => env_validate_all(config, site.as_deref()),
+        Action::VerifyApiFallback { config, site } => env_verify_api_fallback(config, site.as_deref()),
         Action::VerifyCrdSchema => env_verify_crd_schema(),
         Action::VerifySwimOverlay { config, site } => env_verify_swim_overlay(config, site.as_deref()),
         Action::VerifySwimRouting { config } => env_verify_swim_routing(config),
+        Action::VerifyDemo1LlmdRouting { config } => env_verify_demo1_llmd_routing(config),
+        Action::VerifyFullGridRouting { config } => env_verify_full_grid_routing(config),
     }
 }
 
@@ -550,6 +626,133 @@ fn env_deploy_consumer_gateway(config: &Path, overlay_config: Option<&Path>) -> 
 fn env_verify_gateway_e2e(config: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let cfg = EnvConfig::from_file(config)?;
     consumer::verify_e2e(&cfg)
+}
+
+/// Prove the API-provider fallback routing path end-to-end.
+///
+/// Orchestrates:
+/// 1. Deploy provider gateways (site-a) and load gateway images.
+/// 2. Deploy `mock-api-provider` in the consumer cluster.
+/// 3. Run the Grid operator to generate an overlay with both local and `api_provider` candidates.
+/// 4. Deploy the consumer gateway with a plain-HTTP cluster for the API-provider mock in addition to the standard mTLS
+///    clusters for local providers.
+/// 5. Verify: `model-x` → local provider gateway (HTTP 200), `model-z` → mock API-provider (HTTP 200), unknown model →
+///    404.
+#[expect(clippy::too_many_lines, reason = "multi-step E2E orchestration")]
+fn env_verify_api_fallback(config: &Path, site: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    use operator::{
+        API_FALLBACK_MODEL, CONFIGMAP_POLL_TIMEOUT, STATUS_POLL_TIMEOUT, TEST_GATEWAY_NAME, TEST_GATEWAY_NS,
+        TEST_HEALTHY_ROUTING_CLUSTER, TEST_NETWORK, TEST_PROVIDER_API, TEST_PROVIDER_HEALTHY,
+    };
+
+    let cfg = EnvConfig::from_file(config)?;
+    let context = resolve_operator_context(&cfg, site)?;
+    eprintln!("verify-api-fallback: context={context}");
+
+    let consumer_site = cfg
+        .clusters
+        .names
+        .iter()
+        .find(|n| {
+            cfg.clusters
+                .definitions
+                .get(*n)
+                .is_some_and(|d| d.role == ClusterRole::Consumer)
+        })
+        .map(String::as_str)
+        .ok_or("no consumer cluster in config")?;
+    let consumer_ctx = kind::kubectl_context(consumer_site);
+
+    // ── Step 1: deploy provider gateways ────────────────────────────────────
+    eprintln!("verify-api-fallback: [1/5] deploying provider gateways...");
+    gateway::deploy_all(&cfg)?;
+
+    // ── Step 2: deploy mock-api-provider in consumer cluster ─────────────────
+    eprintln!("verify-api-fallback: [2/5] deploying mock-api-provider in consumer cluster...");
+    let consumer_cluster_name = format!("grid-{consumer_site}");
+    kind::deploy_mock_api_provider(&consumer_ctx, &consumer_cluster_name)?;
+    let api_provider_endpoint = format!("{}.default.svc:{}", kind::MOCK_API_SVC, kind::MOCK_API_PORT);
+    eprintln!("  api_provider endpoint: {api_provider_endpoint}");
+
+    // ── Step 3: operator reconcile → overlay with local + api_provider ────────
+    eprintln!("verify-api-fallback: [3/5] operator reconcile + overlay export...");
+    operator::install_grid_crds(&context)?;
+    operator::cleanup_validation_resources(&context)?;
+
+    let healthy_endpoint = "http://mock-openai-provider.default.svc:8080";
+    // Apply the GridNetwork + healthy local provider (model-x) + invalid (excluded by
+    // operator) + api_provider (model-z, api_provider backendKind).
+    // The degraded and metrics fixtures are omitted — this validation focuses on the
+    // local-vs-api_provider routing path, not on health/metrics signal ordering.
+    // The spec.endpoint on the api_provider fixture is not used for routing; the xtask
+    // builds the consumer cluster endpoint directly from the in-cluster mock service.
+    operator::apply_test_fixtures(&context, healthy_endpoint)?;
+    operator::apply_api_provider_fixture(&context, healthy_endpoint)?;
+
+    let op = operator::spawn_operator(&context)?;
+    let mut op_guard = ProcGuard(Some(op), "operator");
+
+    let result: Result<PathBuf, Box<dyn std::error::Error>> = (|| {
+        operator::wait_for_provider_phase(&context, TEST_PROVIDER_HEALTHY, "Pending", STATUS_POLL_TIMEOUT)?;
+        operator::wait_for_provider_phase(&context, TEST_PROVIDER_API, "Pending", STATUS_POLL_TIMEOUT)?;
+
+        operator::wait_for_overlay_configmap(
+            &context,
+            TEST_NETWORK,
+            TEST_GATEWAY_NAME,
+            TEST_GATEWAY_NS,
+            CONFIGMAP_POLL_TIMEOUT,
+        )?;
+
+        let overlay = operator::read_overlay_configmap(&context, TEST_NETWORK, TEST_GATEWAY_NAME, TEST_GATEWAY_NS)?;
+        operator::verify_api_fallback_overlay(
+            &overlay,
+            TEST_HEALTHY_ROUTING_CLUSTER,
+            TEST_PROVIDER_API,
+            API_FALLBACK_MODEL,
+        )?;
+        eprintln!("  [OK] overlay contains api_provider candidate with correct scoring order");
+
+        let path = operator::export_overlay_to_file(&context, TEST_NETWORK, TEST_GATEWAY_NAME, TEST_GATEWAY_NS)?;
+        eprintln!("  overlay exported: {}", path.display());
+        Ok(path)
+    })();
+
+    if let Some(c) = op_guard.0.take() {
+        operator::kill_operator(c);
+    }
+    let overlay_path = result?;
+
+    // ── Step 4: deploy consumer with api_provider cluster ────────────────────
+    eprintln!("verify-api-fallback: [4/5] deploying consumer gateway with api-provider cluster...");
+    let overlay_json = std::fs::read_to_string(&overlay_path)?;
+    let overlay = operator_overlay::parse_grid_config_json(&overlay_json)?;
+
+    consumer::deploy_consumer_for_api_fallback(&cfg, &overlay, TEST_PROVIDER_API, &api_provider_endpoint)?;
+
+    // ── Step 5: verify routing + credential injection ─────────────────────────
+    eprintln!("verify-api-fallback: [5/5] verifying API-provider fallback routing and credential injection...");
+    eprintln!("  local model ({TEST_HEALTHY_ROUTING_CLUSTER}) → model-x via site-a provider gateway");
+    eprintln!(
+        "  api fallback ({TEST_PROVIDER_API}) → {API_FALLBACK_MODEL} via mock api-provider (injected credential)"
+    );
+
+    // Port-forward directly to the mock-api-provider (not through consumer gateway)
+    // for the negative credential proof — direct access without auth → 401.
+    let mock_port = verify::find_free_port()?;
+    let mut mock_pf =
+        verify::PortForwardGuard::start(&consumer_ctx, kind::MOCK_API_SVC, mock_port, kind::MOCK_API_PORT)?;
+    let mock_pf_ready = verify::wait_for_port(mock_port);
+
+    consumer::verify_api_fallback_e2e(&cfg, "model-x", API_FALLBACK_MODEL, mock_pf_ready.then_some(mock_port))?;
+
+    mock_pf.stop();
+
+    // Cleanup mock-api-provider (best-effort — does not block PASS).
+    kind::delete_mock_api_provider(&consumer_ctx);
+
+    eprintln!("verify-api-fallback: PASS");
+    Ok(())
 }
 
 /// Verify gateway-to-gateway mTLS trust (positive + negative cases).
@@ -1314,6 +1517,479 @@ fn reserve_swim_bind_addrs() -> Result<(String, String), Box<dyn std::error::Err
 }
 
 // ---------------------------------------------------------------------------
+// Demo 1 llm-d routing proof
+// ---------------------------------------------------------------------------
+
+/// Resolve the first consumer-role cluster name from the environment config.
+fn resolve_consumer_site(cfg: &EnvConfig) -> Result<&str, Box<dyn std::error::Error>> {
+    cfg.clusters
+        .names
+        .iter()
+        .find(|name| {
+            cfg.clusters
+                .definitions
+                .get(*name)
+                .is_some_and(|d| d.role == ClusterRole::Consumer)
+        })
+        .map(String::as_str)
+        .ok_or_else(|| "no consumer cluster in config".into())
+}
+
+/// Verify that a Chat Completions JSON response includes the expected model.
+///
+/// Returns `Ok(())` when the `model` field matches `expected_model`.
+/// Returns `Err` with a diagnostic message on mismatch or parse failure.
+fn verify_response_model_field(body: &str, expected_model: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let json: serde_json::Value = serde_json::from_str(body).map_err(|e| format!("response is not valid JSON: {e}"))?;
+    let model = json.get("model").and_then(serde_json::Value::as_str).unwrap_or("");
+    if model == expected_model {
+        Ok(())
+    } else {
+        Err(format!("response model field: expected {expected_model:?}, got {model:?}").into())
+    }
+}
+
+/// Parse `kubectl` restart count output into `(pod_name, restart_count)` pairs.
+///
+/// Expects lines of the form `<pod-name> <restart-count>`.  Only pods with
+/// `restart_count > 0` are included in the result.  Lines with non-numeric
+/// counts (e.g. `<none>`) are silently skipped.
+fn parse_pod_restart_lines(output: &str) -> Vec<(String, u32)> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let name = parts.next()?;
+            let count: u32 = parts.next()?.parse().ok()?;
+            (count > 0).then(|| (name.to_owned(), count))
+        })
+        .collect()
+}
+
+/// Shorthand for the pod restart count list returned by
+/// [`collect_pod_restart_counts`].
+/// Pod name plus its container restart count.
+type PodRestartCounts = Vec<(String, u32)>;
+
+/// Query pod restart counts in `namespace` within `context`.
+///
+/// Returns a list of `(pod_name, restart_count)` for pods with non-zero
+/// restart counts.
+fn collect_pod_restart_counts(context: &str, namespace: &str) -> Result<PodRestartCounts, Box<dyn std::error::Error>> {
+    let output = std::process::Command::new("kubectl")
+        .args([
+            "--context",
+            context,
+            "-n",
+            namespace,
+            "get",
+            "pods",
+            "-o",
+            "custom-columns=NAME:.metadata.name,RESTARTS:.status.containerStatuses[0].restartCount",
+            "--no-headers",
+        ])
+        .output()?;
+    let stdout = String::from_utf8(output.stdout)?;
+    Ok(parse_pod_restart_lines(&stdout))
+}
+
+/// Record a Demo 1 step result, returning whether it passed.
+fn demo1_record_step(
+    label: &'static str,
+    results: &mut Vec<StepResult>,
+    f: impl FnOnce() -> Result<String, Box<dyn std::error::Error>>,
+) -> bool {
+    match f() {
+        Ok(evidence) => {
+            results.push(StepResult::pass(label, evidence));
+            true
+        },
+        Err(e) => {
+            results.push(StepResult::fail(label, e.as_ref()));
+            false
+        },
+    }
+}
+
+/// Verify consumer routing and response model name fields.
+///
+/// Runs the standard consumer E2E check (HTTP 200 per model, unknown model
+/// returns 404/503) and then verifies that each response body includes the
+/// correct `model` field.
+fn verify_demo1_routing(cfg: &EnvConfig, results: &mut Vec<StepResult>) -> Result<(), Box<dyn std::error::Error>> {
+    match consumer::verify_e2e(cfg) {
+        Ok(()) => results.push(StepResult::pass(
+            "consumer routing",
+            "all models routed correctly, unknown model fails cleanly",
+        )),
+        Err(e) => {
+            results.push(StepResult::fail("consumer routing", e.as_ref()));
+            return Ok(());
+        },
+    }
+    verify_demo1_model_fields(cfg, results)
+}
+
+/// Check Chat Completions response `model` fields via consumer gateway.
+///
+/// Port-forwards to the consumer gateway and sends a request per configured
+/// model.  Asserts the response JSON `model` field matches the request.
+fn verify_demo1_model_fields(cfg: &EnvConfig, results: &mut Vec<StepResult>) -> Result<(), Box<dyn std::error::Error>> {
+    let consumer_site = resolve_consumer_site(cfg)?;
+    let ctx = kind::kubectl_context(consumer_site);
+    let port = verify::find_free_port()?;
+    let mut pf = verify::PortForwardGuard::start(&ctx, "praxis-consumer", port, 8080)?;
+    if !verify::wait_for_port(port) {
+        pf.stop();
+        results.push(StepResult::blocked("response model field", "consumer not reachable"));
+        return Ok(());
+    }
+    let result = demo1_check_all_model_fields(cfg, port);
+    pf.stop();
+    results.push(result);
+    Ok(())
+}
+
+/// Check model field in response for all provider models.
+fn demo1_check_all_model_fields(cfg: &EnvConfig, port: u16) -> StepResult {
+    let mut verified = Vec::new();
+    let mut failed = Vec::new();
+    for name in &cfg.clusters.names {
+        let Some(def) = cfg.clusters.definitions.get(name) else {
+            continue;
+        };
+        if def.role != ClusterRole::Provider {
+            continue;
+        }
+        for model in &def.models {
+            match demo1_check_one_model_field(port, model) {
+                Ok(()) => verified.push(model.clone()),
+                Err(e) => failed.push(format!("{model}: {e}")),
+            }
+        }
+    }
+    if failed.is_empty() {
+        StepResult::pass("response model field", verified.join(", "))
+    } else {
+        StepResult {
+            label: "response model field",
+            status: StepStatus::Fail,
+            evidence: safe_truncate_str(&failed.join("; "), 120),
+        }
+    }
+}
+
+/// Send a consumer request and verify the response model field.
+fn demo1_check_one_model_field(port: u16, model: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let resp = consumer::send_consumer_request(port, model)?;
+    if resp.status != 200 {
+        return Err(format!("HTTP {}, expected 200", resp.status).into());
+    }
+    verify_response_model_field(&resp.body, model)
+}
+
+/// Assert no pods restarted during the Demo 1 test run.
+///
+/// Queries every cluster in the topology for pods with non-zero restart
+/// counts in the `default` namespace.
+fn verify_demo1_pod_restarts(cfg: &EnvConfig, results: &mut Vec<StepResult>) -> Result<(), Box<dyn std::error::Error>> {
+    let mut total_restarts: Vec<String> = Vec::new();
+    for name in &cfg.clusters.names {
+        let ctx = kind::kubectl_context(name);
+        let restarts = collect_pod_restart_counts(&ctx, "default")?;
+        for (pod, count) in &restarts {
+            total_restarts.push(format!("{name}/{pod}: {count}"));
+        }
+    }
+    if total_restarts.is_empty() {
+        results.push(StepResult::pass("pod restarts", "0 restarts across all clusters"));
+    } else {
+        results.push(StepResult {
+            label: "pod restarts",
+            status: StepStatus::Fail,
+            evidence: safe_truncate_str(&total_restarts.join(", "), 120),
+        });
+    }
+    Ok(())
+}
+
+/// Run the Demo 1 llm-d routing proof.
+///
+/// Orchestrates the full two-provider llm-d routing proof:
+/// 1. Deploy provider gateways.
+/// 2. Operator reconcile + overlay export.
+/// 3. Verify provider-side llm-d path.
+/// 4. Deploy consumer gateway from overlay.
+/// 5. Verify consumer routing with model name checks.
+/// 6. Assert no unexpected pod restarts.
+#[expect(
+    clippy::too_many_lines,
+    reason = "sequential demo proof steps: each step depends on the previous; splitting obscures the proof flow"
+)]
+fn env_verify_demo1_llmd_routing(config: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let cfg = EnvConfig::from_file(config)?;
+    let providers = provider_clusters_from_config(&cfg);
+    if providers.len() < 2 {
+        return Err(format!("demo1 requires >= 2 provider clusters; got {}", providers.len()).into());
+    }
+    let mut results: Vec<StepResult> = Vec::new();
+
+    // Step 1: Deploy provider gateways.
+    eprintln!("demo1: [1/6] deploying provider gateways...");
+    let gw_ok = demo1_record_step("provider gateways", &mut results, || {
+        gateway::deploy_all(&cfg)?;
+        Ok(format!("{} sites deployed", providers.len()))
+    });
+    if !gw_ok {
+        print_validate_all_table(&results);
+        return Err("demo1: provider gateway deployment failed".into());
+    }
+
+    // Step 2: Operator reconcile + overlay export.
+    eprintln!("demo1: [2/6] operator reconcile + overlay export...");
+    let context = resolve_operator_context(&cfg, None)?;
+    let providers_ref: Vec<(&str, &[String])> = providers.iter().map(|(s, m)| (s.as_str(), m.as_slice())).collect();
+    let overlay_path = match run_multi_provider_reconcile(&context, &providers_ref) {
+        Ok(path) => {
+            results.push(StepResult::pass(
+                "operator reconcile",
+                format!("overlay for {} sites", providers.len()),
+            ));
+            path
+        },
+        Err(e) => {
+            results.push(StepResult::fail("operator reconcile", e.as_ref()));
+            print_validate_all_table(&results);
+            return Err("demo1: operator reconcile failed".into());
+        },
+    };
+
+    // Step 3: Verify provider-side llm-d path.
+    eprintln!("demo1: [3/6] verifying provider-side llm-d path...");
+    demo1_record_step("provider llm-d path", &mut results, || {
+        gateway::verify_all(&cfg)?;
+        Ok("ext_proc + mock EPP + endpoint_selector verified".to_owned())
+    });
+
+    // Step 4: Deploy consumer gateway from overlay.
+    eprintln!("demo1: [4/6] deploying consumer gateway from overlay...");
+    let consumer_ok = demo1_record_step("consumer deploy", &mut results, || {
+        consumer::deploy_consumer(&cfg, Some(&overlay_path))?;
+        Ok("deployed from operator overlay".to_owned())
+    });
+    if !consumer_ok {
+        print_validate_all_table(&results);
+        return Err("demo1: consumer deploy failed".into());
+    }
+
+    // Step 5: Verify consumer routing + model names.
+    eprintln!("demo1: [5/6] verifying consumer routing + model names...");
+    verify_demo1_routing(&cfg, &mut results)?;
+
+    // Step 6: Pod restart check.
+    eprintln!("demo1: [6/6] checking for unexpected pod restarts...");
+    verify_demo1_pod_restarts(&cfg, &mut results)?;
+
+    eprintln!();
+    eprintln!("## Demo 1 llm-d Routing Proof");
+    print_validate_all_table(&results);
+    if results.iter().any(|r| r.status.is_failure()) {
+        Err("demo1: one or more proof points FAILED".into())
+    } else {
+        eprintln!("demo1: ALL proof points PASS");
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Full-grid routing validation
+// ---------------------------------------------------------------------------
+
+/// Validate full-grid routing across local, remote, cloud-managed, and
+/// API-provider backend kinds.
+///
+/// Orchestrates:
+/// 1. Deploy provider gateways (site-east, site-west).
+/// 2. Deploy cloud-managed and API-provider mocks in the consumer cluster.
+/// 3. Run the Grid operator to generate an overlay with all four candidates.
+/// 4. Deploy consumer gateway with four-cluster config (mTLS + plain-HTTP).
+/// 5. Verify routing for all four models + unknown model failure.
+/// 6. Check no unexpected pod restarts.
+#[expect(
+    clippy::too_many_lines,
+    reason = "six sequential validation steps with multi-cluster setup and cleanup"
+)]
+fn env_verify_full_grid_routing(config: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    use operator::{
+        CONFIGMAP_POLL_TIMEOUT, FULL_GRID_GW, FULL_GRID_MODEL_API, FULL_GRID_MODEL_CLOUD, FULL_GRID_MODEL_EAST,
+        FULL_GRID_MODEL_WEST, FULL_GRID_NETWORK, FULL_GRID_PROVIDER_API, FULL_GRID_PROVIDER_CLOUD, STATUS_POLL_TIMEOUT,
+    };
+
+    let cfg = EnvConfig::from_file(config)?;
+    eprintln!("verify-full-grid-routing: loading two-provider config...");
+
+    // Resolve consumer cluster and context.
+    let consumer_site = cfg
+        .clusters
+        .names
+        .iter()
+        .find(|n| {
+            cfg.clusters
+                .definitions
+                .get(*n)
+                .is_some_and(|d| d.role == ClusterRole::Consumer)
+        })
+        .map(String::as_str)
+        .ok_or("no consumer cluster in config")?;
+    let consumer_ctx = kind::kubectl_context(consumer_site);
+
+    // Resolve the two provider sites (east = first, west = second).
+    let providers = provider_clusters_from_config(&cfg);
+    if providers.len() < 2 {
+        return Err(format!(
+            "verify-full-grid-routing requires at least 2 provider clusters; got {}",
+            providers.len()
+        )
+        .into());
+    }
+    let Some((east_site, _east_models)) = providers.first() else {
+        return Err("first provider cluster not found in config".into());
+    };
+    let Some((west_site, _west_models)) = providers.get(1) else {
+        return Err("second provider cluster not found in config".into());
+    };
+    let east_ctx = kind::kubectl_context(east_site);
+    eprintln!("  east={east_site} ({east_ctx}), west={west_site}");
+
+    // In-cluster service endpoints (reachable from consumer Praxis pod).
+    let cloud_endpoint = format!("{}.default.svc:{}", kind::MOCK_CLOUD_SVC, kind::MOCK_CLOUD_PORT);
+    let api_endpoint = format!("{}.default.svc:{}", kind::MOCK_API_SVC, kind::MOCK_API_PORT);
+    let provider_endpoint = "http://mock-openai-provider.default.svc:8080";
+
+    // ── Step 1: deploy provider gateways ─────────────────────────────────────
+    eprintln!("verify-full-grid-routing: [1/6] deploying provider gateways...");
+    gateway::deploy_all(&cfg)?;
+
+    // ── Step 2: deploy cloud + API mocks in consumer cluster ─────────────────
+    eprintln!("verify-full-grid-routing: [2/6] deploying cloud and API mocks in consumer cluster...");
+    kind::deploy_mock_cloud_provider(&consumer_ctx, &format!("grid-{consumer_site}"))?;
+    kind::deploy_mock_api_provider(&consumer_ctx, &format!("grid-{consumer_site}"))?;
+    eprintln!("  cloud endpoint: {cloud_endpoint}");
+    eprintln!("  api endpoint:   {api_endpoint}");
+
+    // ── Step 3: operator reconcile + overlay export ───────────────────────────
+    eprintln!("verify-full-grid-routing: [3/6] operator reconcile + overlay export...");
+    operator::install_grid_crds(&east_ctx)?;
+    operator::cleanup_full_grid_resources(&east_ctx)?;
+    operator::apply_full_grid_fixtures(
+        &east_ctx,
+        east_site,
+        west_site,
+        provider_endpoint,
+        provider_endpoint,
+        &cloud_endpoint,
+        &api_endpoint,
+    )?;
+
+    let op = operator::spawn_operator(&east_ctx)?;
+    let mut op_guard = ProcGuard(Some(op), "operator");
+
+    let result: Result<PathBuf, Box<dyn std::error::Error>> = (|| {
+        for name in [
+            operator::FULL_GRID_PROVIDER_EAST,
+            operator::FULL_GRID_PROVIDER_WEST,
+            FULL_GRID_PROVIDER_CLOUD,
+            FULL_GRID_PROVIDER_API,
+        ] {
+            operator::wait_for_provider_phase(&east_ctx, name, "Pending", STATUS_POLL_TIMEOUT)?;
+        }
+
+        operator::wait_for_overlay_configmap(
+            &east_ctx,
+            FULL_GRID_NETWORK,
+            FULL_GRID_GW,
+            "default",
+            CONFIGMAP_POLL_TIMEOUT,
+        )?;
+
+        let overlay = operator::read_overlay_configmap(&east_ctx, FULL_GRID_NETWORK, FULL_GRID_GW, "default")?;
+        operator::verify_full_grid_overlay(&overlay, east_site, west_site)?;
+        eprintln!("  [OK] full-grid overlay has all four backend-kind candidates");
+
+        let path = operator::export_overlay_to_file(&east_ctx, FULL_GRID_NETWORK, FULL_GRID_GW, "default")?;
+        eprintln!("  overlay exported: {}", path.display());
+        Ok(path)
+    })();
+
+    if let Some(c) = op_guard.0.take() {
+        operator::kill_operator(c);
+    }
+    let overlay_path = result?;
+
+    // ── Step 4: deploy consumer gateway with four-cluster config ─────────────
+    eprintln!("verify-full-grid-routing: [4/6] deploying full-grid consumer gateway...");
+    let overlay_json = std::fs::read_to_string(&overlay_path)?;
+    let overlay = operator_overlay::parse_grid_config_json(&overlay_json)?;
+
+    consumer::deploy_consumer_for_full_grid(
+        &cfg,
+        &overlay,
+        FULL_GRID_PROVIDER_CLOUD,
+        &cloud_endpoint,
+        FULL_GRID_PROVIDER_API,
+        &api_endpoint,
+    )?;
+
+    // ── Step 5: verify routing for all four models ───────────────────────────
+    eprintln!("verify-full-grid-routing: [5/6] verifying full-grid routing...");
+    eprintln!("  {FULL_GRID_MODEL_EAST} → site-east (local/self-hosted)");
+    eprintln!("  {FULL_GRID_MODEL_WEST} → site-west (remote/self-hosted)");
+    eprintln!("  {FULL_GRID_MODEL_CLOUD} → cloud mock ({FULL_GRID_PROVIDER_CLOUD})");
+    eprintln!("  {FULL_GRID_MODEL_API} → api mock ({FULL_GRID_PROVIDER_API}, injected credential)");
+    consumer::verify_full_grid_e2e(
+        &cfg,
+        FULL_GRID_MODEL_EAST,
+        FULL_GRID_MODEL_WEST,
+        FULL_GRID_MODEL_CLOUD,
+        FULL_GRID_MODEL_API,
+    )?;
+
+    // ── Step 6: pod restart check ─────────────────────────────────────────────
+    eprintln!("verify-full-grid-routing: [6/6] checking for unexpected pod restarts...");
+    for (site, _) in &providers {
+        let ctx = kind::kubectl_context(site);
+        let restarts = collect_pod_restart_counts(&ctx, "default")?;
+        if restarts.is_empty() {
+            eprintln!("  [OK] {site}: no pod restarts");
+        } else {
+            for (pod, count) in &restarts {
+                eprintln!("  [WARN] {site}: pod {pod} has {count} restart(s)");
+            }
+        }
+    }
+    {
+        let restarts = collect_pod_restart_counts(&consumer_ctx, "default")?;
+        if restarts.is_empty() {
+            eprintln!("  [OK] {consumer_site}: no pod restarts");
+        } else {
+            for (pod, count) in &restarts {
+                eprintln!("  [WARN] {consumer_site}: pod {pod} has {count} restart(s)");
+            }
+        }
+    }
+
+    // Cleanup mocks (best-effort).
+    kind::delete_mock_cloud_provider(&consumer_ctx);
+    kind::delete_mock_api_provider(&consumer_ctx);
+
+    eprintln!(
+        "verify-full-grid-routing: PASS — all four backend kinds \
+         (local, remote, cloud_managed, api_provider) routed via consumer gateway"
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // validate-all aggregator
 // ---------------------------------------------------------------------------
 
@@ -1813,5 +2489,203 @@ mod validate_all_tests {
         let s = "a".repeat(200);
         let t = safe_truncate_str(&s, 10);
         assert_eq!(t, "aaaaaaaaaa…");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Demo 1 llm-d routing tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod demo1_tests {
+    use super::*;
+
+    #[test]
+    fn verify_response_model_field_accepts_matching_model() {
+        let body = r#"{"model":"model-east","choices":[{"message":{"content":"hi"}}]}"#;
+        assert!(
+            verify_response_model_field(body, "model-east").is_ok(),
+            "matching model must pass"
+        );
+    }
+
+    #[test]
+    fn verify_response_model_field_rejects_mismatched_model() {
+        let body = r#"{"model":"model-west","choices":[{"message":{"content":"hi"}}]}"#;
+        assert!(
+            verify_response_model_field(body, "model-east").is_err(),
+            "mismatched model must fail"
+        );
+    }
+
+    #[test]
+    fn verify_response_model_field_rejects_missing_model() {
+        let body = r#"{"choices":[{"message":{"content":"hi"}}]}"#;
+        assert!(
+            verify_response_model_field(body, "model-east").is_err(),
+            "missing model field must fail"
+        );
+    }
+
+    #[test]
+    fn verify_response_model_field_rejects_invalid_json() {
+        assert!(
+            verify_response_model_field("not json", "model-east").is_err(),
+            "invalid JSON must fail"
+        );
+    }
+
+    #[test]
+    fn verify_response_model_field_rejects_null_model() {
+        let body = r#"{"model":null,"choices":[]}"#;
+        assert!(
+            verify_response_model_field(body, "model-east").is_err(),
+            "null model field must fail"
+        );
+    }
+
+    #[test]
+    fn verify_response_model_field_rejects_empty_model() {
+        let body = r#"{"model":"","choices":[]}"#;
+        assert!(
+            verify_response_model_field(body, "model-east").is_err(),
+            "empty model field must fail"
+        );
+    }
+
+    #[test]
+    fn parse_pod_restart_lines_extracts_non_zero() {
+        let output = "pod-a 0\npod-b 2\npod-c 0\npod-d 1\n";
+        let restarts = parse_pod_restart_lines(output);
+        assert_eq!(restarts.len(), 2, "should find 2 pods with restarts");
+        assert_eq!(
+            restarts.first().map(|(n, c)| (n.as_str(), *c)),
+            Some(("pod-b", 2)),
+            "first restarted pod must be pod-b with count 2"
+        );
+        assert_eq!(
+            restarts.get(1).map(|(n, c)| (n.as_str(), *c)),
+            Some(("pod-d", 1)),
+            "second restarted pod must be pod-d with count 1"
+        );
+    }
+
+    #[test]
+    fn parse_pod_restart_lines_handles_empty_output() {
+        assert!(
+            parse_pod_restart_lines("").is_empty(),
+            "empty output must return empty list"
+        );
+    }
+
+    #[test]
+    fn parse_pod_restart_lines_handles_none_values() {
+        let output = "pod-a <none>\npod-b 0\n";
+        let restarts = parse_pod_restart_lines(output);
+        assert!(restarts.is_empty(), "<none> and 0 must both be excluded");
+    }
+
+    #[test]
+    fn parse_pod_restart_lines_all_zero() {
+        let output = "pod-a 0\npod-b 0\n";
+        assert!(
+            parse_pod_restart_lines(output).is_empty(),
+            "all-zero restarts must produce empty list"
+        );
+    }
+
+    #[test]
+    fn parse_pod_restart_lines_single_restarted() {
+        let output = "gateway-pod 5\n";
+        let restarts = parse_pod_restart_lines(output);
+        assert_eq!(restarts.len(), 1, "should find 1 pod with restarts");
+        assert_eq!(
+            restarts.first().map(|(n, c)| (n.as_str(), *c)),
+            Some(("gateway-pod", 5)),
+            "restarted pod must be gateway-pod with count 5"
+        );
+    }
+
+    #[test]
+    fn demo1_record_step_pass_returns_true() {
+        let mut results = Vec::new();
+        let ok = demo1_record_step("test-step", &mut results, || Ok("evidence".to_owned()));
+        assert!(ok, "passing step must return true");
+        assert_eq!(results.len(), 1, "one result must be recorded");
+        assert_eq!(
+            results.first().map(|r| r.status.label()),
+            Some("PASS"),
+            "status must be PASS"
+        );
+    }
+
+    #[test]
+    fn demo1_record_step_fail_returns_false() {
+        let mut results = Vec::new();
+        let ok = demo1_record_step("test-step", &mut results, || Err("boom".into()));
+        assert!(!ok, "failing step must return false");
+        assert_eq!(results.len(), 1, "one result must be recorded");
+        assert_eq!(
+            results.first().map(|r| r.status.label()),
+            Some("FAIL"),
+            "status must be FAIL"
+        );
+    }
+
+    /// Build a minimal [`EnvConfig`] for unit tests.
+    fn make_demo1_config(clusters: &[(&str, ClusterRole, Vec<String>)]) -> EnvConfig {
+        use std::collections::BTreeMap;
+
+        use config::{BedrockDef, ClusterConfig, ProviderConfig, ProviderDef, VertexDef};
+        let mut definitions = BTreeMap::new();
+        let mut names = Vec::new();
+        for (name, role, models) in clusters {
+            names.push((*name).to_owned());
+            definitions.insert(
+                (*name).to_owned(),
+                config::ClusterDef {
+                    models: models.clone(),
+                    role: *role,
+                    backend: config::ProviderBackend::default(),
+                },
+            );
+        }
+        EnvConfig {
+            clusters: ClusterConfig { names, definitions },
+            providers: ProviderConfig {
+                openai: ProviderDef { port: 10001 },
+                anthropic: ProviderDef { port: 10002 },
+                bedrock: BedrockDef {
+                    port: 10003,
+                    region: "us-east-1".to_owned(),
+                },
+                vertex: VertexDef {
+                    port: 10004,
+                    project: "p".to_owned(),
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn resolve_consumer_site_finds_consumer() {
+        let cfg = make_demo1_config(&[
+            ("site-east", ClusterRole::Provider, vec!["model-east".to_owned()]),
+            ("consumer", ClusterRole::Consumer, vec![]),
+        ]);
+        assert_eq!(
+            resolve_consumer_site(&cfg).ok(),
+            Some("consumer"),
+            "must find the consumer cluster"
+        );
+    }
+
+    #[test]
+    fn resolve_consumer_site_errors_when_missing() {
+        let cfg = make_demo1_config(&[("site-east", ClusterRole::Provider, vec!["model-east".to_owned()])]);
+        assert!(
+            resolve_consumer_site(&cfg).is_err(),
+            "must error when no consumer cluster exists"
+        );
     }
 }

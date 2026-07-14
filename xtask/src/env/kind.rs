@@ -26,6 +26,29 @@ pub(crate) const MOCK_OPENAI_SVC: &str = "mock-openai-provider";
 /// Port used by the `openai` mock-providers HTTP server.
 pub(crate) const MOCK_OPENAI_PORT: u16 = 8080;
 
+/// Kubernetes Deployment and Service name for the standalone API-provider mock.
+///
+/// Deployed in the consumer cluster as the target for `api_provider` overlay
+/// candidates.  Distinct from [`MOCK_OPENAI_SVC`] (which runs in provider
+/// clusters behind the provider gateway mTLS chain) so that the two paths are
+/// clearly separate in the consumer Praxis config.
+pub(crate) const MOCK_API_SVC: &str = "mock-api-provider";
+
+/// Port used by the mock API-provider HTTP server.
+pub(crate) const MOCK_API_PORT: u16 = 8080;
+
+/// Kubernetes Deployment and Service name for the cloud-managed mock.
+///
+/// Represents an OpenAI-compatible cloud-managed API endpoint in the
+/// full-grid routing validation.  Deployed in the consumer cluster so the
+/// consumer Praxis gateway can reach it over plain HTTP.  Distinct from
+/// [`MOCK_API_SVC`] so the two roles are clearly separate in the consumer
+/// Praxis config.
+pub(crate) const MOCK_CLOUD_SVC: &str = "mock-cloud-provider";
+
+/// Port used by the mock cloud-provider HTTP server.
+pub(crate) const MOCK_CLOUD_PORT: u16 = 8080;
+
 /// Kubernetes namespace for provider backend deployments.
 const NAMESPACE: &str = "default";
 
@@ -246,6 +269,234 @@ fn cluster_exists(full_name: &str) -> bool {
         .ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .is_some_and(|out| out.lines().any(|l| l.trim() == full_name))
+}
+
+/// Deploy the standalone mock API-provider into a cluster and wait for readiness.
+///
+/// The mock API-provider represents an OpenAI-compatible external API endpoint
+/// in the API fallback validation.  It runs in the **consumer** cluster so that
+/// the consumer Praxis gateway can reach it directly over plain HTTP via
+/// in-cluster DNS (`mock-api-provider.default.svc:8080`), without mTLS.
+///
+/// The same `grid-mock-providers` binary is used as for the provider-side mock,
+/// but it is deployed independently under a different name so the two roles are
+/// clearly distinct in the Praxis consumer config.
+pub(crate) fn deploy_mock_api_provider(context: &str, cluster_name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    eprintln!("  loading {MOCK_PROVIDER_IMAGE} into {cluster_name}...");
+    run_cmd(
+        "kind",
+        &["load", "docker-image", MOCK_PROVIDER_IMAGE, "--name", cluster_name],
+    )
+    .map_err(|e| {
+        format!(
+            "{e}\n\
+             hint: build the image first with:\n\
+             \x20 docker build -t {MOCK_PROVIDER_IMAGE} -f mock-providers/Containerfile ."
+        )
+    })?;
+    eprintln!("  deploying {MOCK_API_SVC} to {cluster_name}...");
+    apply_manifest(context, &mock_api_provider_deployment_yaml())?;
+    apply_manifest(context, &mock_api_provider_service_yaml())?;
+    wait_for_rollout(context, cluster_name, MOCK_API_SVC)?;
+    Ok(())
+}
+
+/// Delete the mock API-provider Deployment and Service if they exist.
+///
+/// Best-effort: errors are ignored (both `--ignore-not-found` and command
+/// failures) because cleanup is non-critical.
+pub(crate) fn delete_mock_api_provider(context: &str) {
+    let _d = Command::new("kubectl")
+        .args([
+            "--context",
+            context,
+            "-n",
+            NAMESPACE,
+            "delete",
+            "deployment",
+            MOCK_API_SVC,
+            "--ignore-not-found",
+        ])
+        .status();
+    let _s = Command::new("kubectl")
+        .args([
+            "--context",
+            context,
+            "-n",
+            NAMESPACE,
+            "delete",
+            "service",
+            MOCK_API_SVC,
+            "--ignore-not-found",
+        ])
+        .status();
+}
+
+/// Generate the Deployment YAML for the standalone mock API-provider.
+#[expect(clippy::too_many_lines, reason = "readable multiline Kubernetes Deployment YAML")]
+pub(crate) fn mock_api_provider_deployment_yaml() -> String {
+    format!(
+        r#"apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {MOCK_API_SVC}
+  namespace: {NAMESPACE}
+  labels:
+    app: {MOCK_API_SVC}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: {MOCK_API_SVC}
+  template:
+    metadata:
+      labels:
+        app: {MOCK_API_SVC}
+    spec:
+      containers:
+        - name: mock-api
+          image: {MOCK_PROVIDER_IMAGE}
+          imagePullPolicy: Never
+          args:
+            - "--provider"
+            - "openai"
+            - "--port"
+            - "{MOCK_API_PORT}"
+          ports:
+            - containerPort: {MOCK_API_PORT}
+"#
+    )
+}
+
+/// Generate the Service YAML for the standalone mock API-provider.
+pub(crate) fn mock_api_provider_service_yaml() -> String {
+    format!(
+        "apiVersion: v1
+kind: Service
+metadata:
+  name: {MOCK_API_SVC}
+  namespace: {NAMESPACE}
+spec:
+  selector:
+    app: {MOCK_API_SVC}
+  ports:
+    - port: {MOCK_API_PORT}
+      targetPort: {MOCK_API_PORT}
+"
+    )
+}
+
+/// Deploy the cloud-managed mock provider into a cluster and wait for readiness.
+///
+/// Represents a `cloud_managed` API endpoint in the full-grid routing validation.
+/// Deployed in the consumer cluster so the consumer Praxis gateway can reach it
+/// over plain HTTP via in-cluster DNS (`mock-cloud-provider.default.svc:8080`).
+///
+/// This mock validates the Grid `backendKind = "cloud_managed"` overlay,
+/// scoring, and routing path. It intentionally does not exercise real cloud
+/// provider auth or protocols such as AWS `SigV4`, Google `OAuth2`, or Azure AAD.
+pub(crate) fn deploy_mock_cloud_provider(context: &str, cluster_name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    eprintln!("  loading {MOCK_PROVIDER_IMAGE} into {cluster_name}...");
+    run_cmd(
+        "kind",
+        &["load", "docker-image", MOCK_PROVIDER_IMAGE, "--name", cluster_name],
+    )
+    .map_err(|e| {
+        format!(
+            "{e}\n\
+             hint: build the image first with:\n\
+             \x20 docker build -t {MOCK_PROVIDER_IMAGE} -f mock-providers/Containerfile ."
+        )
+    })?;
+    eprintln!("  deploying {MOCK_CLOUD_SVC} to {cluster_name}...");
+    apply_manifest(context, &mock_cloud_provider_deployment_yaml())?;
+    apply_manifest(context, &mock_cloud_provider_service_yaml())?;
+    wait_for_rollout(context, cluster_name, MOCK_CLOUD_SVC)?;
+    Ok(())
+}
+
+/// Delete the cloud-managed mock provider Deployment and Service if they exist.
+///
+/// Best-effort: errors are ignored.
+pub(crate) fn delete_mock_cloud_provider(context: &str) {
+    let _d = Command::new("kubectl")
+        .args([
+            "--context",
+            context,
+            "-n",
+            NAMESPACE,
+            "delete",
+            "deployment",
+            MOCK_CLOUD_SVC,
+            "--ignore-not-found",
+        ])
+        .status();
+    let _s = Command::new("kubectl")
+        .args([
+            "--context",
+            context,
+            "-n",
+            NAMESPACE,
+            "delete",
+            "service",
+            MOCK_CLOUD_SVC,
+            "--ignore-not-found",
+        ])
+        .status();
+}
+
+/// Generate the Deployment YAML for the cloud-managed mock provider.
+#[expect(clippy::too_many_lines, reason = "readable multiline Kubernetes Deployment YAML")]
+pub(crate) fn mock_cloud_provider_deployment_yaml() -> String {
+    format!(
+        r#"apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {MOCK_CLOUD_SVC}
+  namespace: {NAMESPACE}
+  labels:
+    app: {MOCK_CLOUD_SVC}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: {MOCK_CLOUD_SVC}
+  template:
+    metadata:
+      labels:
+        app: {MOCK_CLOUD_SVC}
+    spec:
+      containers:
+        - name: mock-cloud
+          image: {MOCK_PROVIDER_IMAGE}
+          imagePullPolicy: Never
+          args:
+            - "--provider"
+            - "openai"
+            - "--port"
+            - "{MOCK_CLOUD_PORT}"
+          ports:
+            - containerPort: {MOCK_CLOUD_PORT}
+"#
+    )
+}
+
+/// Generate the Service YAML for the cloud-managed mock provider.
+pub(crate) fn mock_cloud_provider_service_yaml() -> String {
+    format!(
+        "apiVersion: v1
+kind: Service
+metadata:
+  name: {MOCK_CLOUD_SVC}
+  namespace: {NAMESPACE}
+spec:
+  selector:
+    app: {MOCK_CLOUD_SVC}
+  ports:
+    - port: {MOCK_CLOUD_PORT}
+      targetPort: {MOCK_CLOUD_PORT}
+"
+    )
 }
 
 /// Deploy a single `grid-mock-providers` (openai backend) instance and wait

@@ -20,11 +20,17 @@ credential handling, and backend proxying.
 ## Getting started
 
 ```sh
-cargo +nightly-2026-03-28 fmt --all -- --check
-make check
-make test
-make lint
+# Validate the operator routing path in kind
 cargo xtask env validate-operator-routing -c tests/env/operator-routing.toml
+
+# Validate two-provider model routing in kind
+cargo xtask env validate-operator-routing -c tests/env/operator-routing-two-provider.toml
+
+# Validate SWIM membership in kind
+cargo xtask env verify-swim-membership -c tests/env/operator-routing.toml
+
+# Validate CRDT provider-state propagation over SWIM
+cargo xtask env verify-swim-state -c tests/env/operator-routing.toml
 ```
 
 ## Documentation
