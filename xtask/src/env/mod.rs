@@ -453,6 +453,28 @@ pub(crate) enum Action {
         #[arg(short, long, default_value = "tests/env/operator-routing-two-provider.toml")]
         config: PathBuf,
     },
+
+    /// Verify Demo 7: site join and discovery lifecycle.
+    ///
+    /// Starts a primary SWIM operator and a joining SWIM operator, waits for
+    /// membership formation, then advances the joining `GridSite`'s lifecycle
+    /// through `Pending → Discovered → Connecting → Active` via harness-assisted
+    /// status patches.  The operator preserves each phase through reconciliation,
+    /// proving that the lifecycle type system is end-to-end functional.
+    ///
+    /// Also verifies:
+    /// - the joined site has routing-relevant spec fields (egress, network, identity)
+    /// - an overlay generated for the correct network contains both primary and joining site candidates
+    /// - a wrong-network `GridSite` is absent from the correct-network overlay
+    ///
+    /// Attribution is structural: harness-assisted phase transitions simulate
+    /// the SWIM discovery and mTLS exchange steps that will be automatic in
+    /// Phase 2.  Requires the two-provider kind environment.  Safe to rerun.
+    VerifySiteJoinDiscovery {
+        /// Path to the two-provider environment config file.
+        #[arg(short, long, default_value = "tests/env/operator-routing-two-provider.toml")]
+        config: PathBuf,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -494,6 +516,7 @@ pub(crate) fn run(action: &Action) -> Result<(), Box<dyn std::error::Error>> {
         Action::VerifyDemo1LlmdRouting { config } => env_verify_demo1_llmd_routing(config),
         Action::VerifyFullGridRouting { config } => env_verify_full_grid_routing(config),
         Action::VerifyMetricsRouting { config } => env_verify_metrics_routing(config),
+        Action::VerifySiteJoinDiscovery { config } => env_verify_site_join_discovery(config),
     }
 }
 
@@ -2325,6 +2348,243 @@ fn env_verify_metrics_routing(config: &Path) -> Result<(), Box<dyn std::error::E
     Ok(())
 }
 
+/// Verify Demo 7: site join and discovery lifecycle, routing readiness, and cross-network isolation.
+///
+/// **Design:** the operator's `determine_phase()` returns the current phase unchanged in Phase 1
+/// (manual lifecycle).  The harness advances the joining site through the state machine via
+/// `kubectl patch --subresource=status` and polls to confirm the controller preserved each phase
+/// through at least one reconcile.  This proves the lifecycle type system is functional end-to-end.
+/// SWIM membership formation (two operators, east primary + west joining) provides the real
+/// distributed-system event that triggers the `Pending → Discovered` transition in production.
+///
+/// **Cross-network isolation:** a wrong-network `GridSite` and `InferenceProvider` are applied
+/// and their absence from the correct-network overlay is asserted by reading the overlay `ConfigMap`.
+#[expect(
+    clippy::too_many_lines,
+    reason = "sequential 7-step lifecycle + overlay + isolation validation with port-forward lifecycle"
+)]
+fn env_verify_site_join_discovery(config: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    use operator::{
+        CONFIGMAP_POLL_TIMEOUT, SITE_JOIN_GW, SITE_JOIN_JOINING_EGRESS, SITE_JOIN_JOINING_MODEL,
+        SITE_JOIN_JOINING_SITE, SITE_JOIN_NETWORK, SITE_JOIN_PHASE_POLL_TIMEOUT, SITE_JOIN_PRIMARY_EGRESS,
+        SITE_JOIN_PRIMARY_MODEL, SITE_JOIN_PRIMARY_SITE, SITE_JOIN_WRONG_NETWORK, SITE_JOIN_WRONG_SITE,
+        SWIM_CONVERGENCE_WAIT, SWIM_STATUS_POLL_TIMEOUT,
+    };
+
+    let cfg = EnvConfig::from_file(config)?;
+    eprintln!("verify-site-join-discovery: loading two-provider config...");
+
+    let providers = provider_clusters_from_config(&cfg);
+    if providers.len() < 2 {
+        return Err(format!(
+            "verify-site-join-discovery requires ≥ 2 provider clusters; got {}",
+            providers.len()
+        )
+        .into());
+    }
+    let Some((east_site, _)) = providers.first() else {
+        return Err("verify-site-join-discovery: no east provider cluster".into());
+    };
+    let Some((west_site, _)) = providers.get(1) else {
+        return Err("verify-site-join-discovery: no west provider cluster".into());
+    };
+    let east_ctx = kind::kubectl_context(east_site);
+    let west_ctx = kind::kubectl_context(west_site);
+    eprintln!("  primary={east_site} ({east_ctx}), joining={west_site} ({west_ctx})");
+
+    // ── Step 1: Preflight ─────────────────────────────────────────────────────
+    eprintln!("verify-site-join-discovery: [1/7] preflight — CRDs, cleanup, operator binary...");
+    // Build operator binary once so both spawns use the same pre-compiled binary.
+    let build_ok = std::process::Command::new("cargo")
+        .args(["build", "--quiet", "-p", "operator", "--bin", "operator"])
+        .status()
+        .map_err(|e| format!("cargo build -p operator failed to spawn: {e}"))?;
+    if !build_ok.success() {
+        return Err("cargo build -p operator --bin operator failed".into());
+    }
+    eprintln!("  [OK] operator binary ready");
+    operator::install_grid_crds(&east_ctx)?;
+    operator::install_grid_crds(&west_ctx)?;
+    operator::cleanup_site_join_resources(&east_ctx)?;
+
+    // ── Step 2: Start SWIM operators ──────────────────────────────────────────
+    eprintln!("verify-site-join-discovery: [2/7] starting SWIM operators...");
+    let (bind_primary, bind_joining) = reserve_swim_bind_addrs()?;
+    // Primary operator: east cluster, no seeds.
+    let op_primary =
+        operator::spawn_operator_with_swim_for_context(&east_ctx, &bind_primary, &bind_primary, east_site, "")?;
+    let mut op_primary_guard = ProcGuard(Some(op_primary), "operator-primary");
+    // Joining operator: west cluster, seeds = primary bind addr.
+    let op_joining = operator::spawn_operator_with_swim_for_context(
+        &west_ctx,
+        &bind_joining,
+        &bind_joining,
+        west_site,
+        &bind_primary,
+    )?;
+    let mut op_joining_guard = ProcGuard(Some(op_joining), "operator-joining");
+    eprintln!("  [OK] primary operator ({east_site}) and joining operator ({west_site}) started");
+
+    // ── Step 3: SWIM convergence + GridNetworks + GridSites ───────────────────
+    eprintln!("verify-site-join-discovery: [3/7] waiting for SWIM membership formation...");
+    // Wait for gossip to propagate before applying fixtures.
+    operator::wait_for_swim_convergence(SWIM_CONVERGENCE_WAIT);
+
+    // Apply GridNetworks first — the GridSite controller validates gridNetworkRef.
+    operator::apply_site_join_network(&east_ctx, east_site)?;
+    operator::apply_site_join_wrong_network(&east_ctx)?;
+
+    // Apply GridSites: primary and joining on the correct network; wrong on isolation network.
+    operator::apply_gridsite(
+        &east_ctx,
+        SITE_JOIN_PRIMARY_SITE,
+        SITE_JOIN_NETWORK,
+        SITE_JOIN_PRIMARY_EGRESS,
+        "primary",
+    )?;
+    operator::apply_gridsite(
+        &east_ctx,
+        SITE_JOIN_JOINING_SITE,
+        SITE_JOIN_NETWORK,
+        SITE_JOIN_JOINING_EGRESS,
+        "joining",
+    )?;
+    operator::apply_gridsite(
+        &east_ctx,
+        SITE_JOIN_WRONG_SITE,
+        SITE_JOIN_WRONG_NETWORK,
+        "172.18.0.99:8443",
+        "wrong",
+    )?;
+
+    // Poll GridNetwork Active: proves at least one SWIM peer is reflected in status.
+    let connected = operator::wait_for_gridnetwork_active(&east_ctx, SITE_JOIN_NETWORK, SWIM_STATUS_POLL_TIMEOUT)?;
+    eprintln!(
+        "  [OK] GridNetwork {SITE_JOIN_NETWORK:?} Active \
+         (connectedSites={connected}) - SWIM membership formed"
+    );
+
+    // Step 4: GridSite lifecycle (Pending -> Discovered -> Connecting -> Active).
+    eprintln!("verify-site-join-discovery: [4/7] verifying GridSite lifecycle...");
+
+    // Confirm operator reconciled the joining site to Pending before any join.
+    operator::wait_for_gridsite_phase(
+        &east_ctx,
+        SITE_JOIN_JOINING_SITE,
+        "Pending",
+        SITE_JOIN_PHASE_POLL_TIMEOUT,
+    )?;
+    eprintln!("  [OK] joining site: Pending (absent/unjoined state confirmed before SWIM event)");
+
+    // Advance joining site to Discovered: simulates SWIM membership event.
+    // In Phase 2 this transition is automatic; here it is harness-assisted.
+    operator::patch_gridsite_phase(&east_ctx, SITE_JOIN_JOINING_SITE, "Discovered")?;
+    operator::bump_gridsite(&east_ctx, SITE_JOIN_JOINING_SITE)?;
+    operator::wait_for_gridsite_phase(
+        &east_ctx,
+        SITE_JOIN_JOINING_SITE,
+        "Discovered",
+        SITE_JOIN_PHASE_POLL_TIMEOUT,
+    )?;
+    eprintln!("  [OK] joining site: Discovered (operator preserved phase — SWIM event simulated)");
+
+    // Advance to Connecting: simulates mTLS certificate exchange initiation.
+    operator::patch_gridsite_phase(&east_ctx, SITE_JOIN_JOINING_SITE, "Connecting")?;
+    operator::bump_gridsite(&east_ctx, SITE_JOIN_JOINING_SITE)?;
+    operator::wait_for_gridsite_phase(
+        &east_ctx,
+        SITE_JOIN_JOINING_SITE,
+        "Connecting",
+        SITE_JOIN_PHASE_POLL_TIMEOUT,
+    )?;
+    eprintln!("  [OK] joining site: Connecting (operator preserved phase — mTLS initiation simulated)");
+
+    // Advance to Active: simulates mTLS success + capability exchange + data-plane ping.
+    operator::patch_gridsite_phase(&east_ctx, SITE_JOIN_JOINING_SITE, "Active")?;
+    operator::bump_gridsite(&east_ctx, SITE_JOIN_JOINING_SITE)?;
+    operator::wait_for_gridsite_phase(
+        &east_ctx,
+        SITE_JOIN_JOINING_SITE,
+        "Active",
+        SITE_JOIN_PHASE_POLL_TIMEOUT,
+    )?;
+    eprintln!("  [OK] joining site: Active (operator preserved phase — join complete)");
+
+    // ── Step 5: Routing readiness ─────────────────────────────────────────────
+    eprintln!("verify-site-join-discovery: [5/7] verifying join routing readiness...");
+    operator::verify_gridsite_routing_data(
+        &east_ctx,
+        SITE_JOIN_JOINING_SITE,
+        SITE_JOIN_NETWORK,
+        SITE_JOIN_JOINING_EGRESS,
+    )?;
+
+    // ── Step 6: Overlay + cross-network isolation ─────────────────────────────
+    eprintln!("verify-site-join-discovery: [6/7] verifying overlay and cross-network isolation...");
+
+    // Cross-network isolation via GridSite inventory: the wrong site must not appear in sjd-net.
+    let net_sites = operator::list_gridsites_for_network(&east_ctx, SITE_JOIN_NETWORK)?;
+    if net_sites.iter().any(|s| s == SITE_JOIN_WRONG_SITE) {
+        return Err(format!(
+            "cross-network leakage: {SITE_JOIN_WRONG_SITE:?} appears in \
+             {SITE_JOIN_NETWORK:?} GridSite inventory"
+        )
+        .into());
+    }
+    eprintln!(
+        "  [PASS] GridSite inventory isolation: {SITE_JOIN_WRONG_SITE:?} absent \
+         from {SITE_JOIN_NETWORK:?} (found {} site(s))",
+        net_sites.len()
+    );
+
+    // Cross-network isolation via overlay: apply InferenceProviders and verify overlay.
+    operator::apply_site_join_primary_provider(&east_ctx, SITE_JOIN_PRIMARY_SITE, SITE_JOIN_PRIMARY_MODEL)?;
+    operator::apply_site_join_joining_provider(&east_ctx, SITE_JOIN_JOINING_SITE, SITE_JOIN_JOINING_MODEL)?;
+    operator::apply_site_join_wrong_provider(&east_ctx)?;
+
+    // Bump annotation to force overlay reconcile after new providers land.
+    // This is xtask validation synchronization — not a production mechanism.
+    operator::bump_gridnetwork(&east_ctx, SITE_JOIN_NETWORK)?;
+    eprintln!("  [OK] bumped {SITE_JOIN_NETWORK:?} annotation to force overlay reconcile");
+
+    operator::wait_for_overlay_configmap(
+        &east_ctx,
+        SITE_JOIN_NETWORK,
+        SITE_JOIN_GW,
+        "default",
+        CONFIGMAP_POLL_TIMEOUT,
+    )?;
+
+    let overlay_result = operator::verify_site_join_overlay(
+        &east_ctx,
+        SITE_JOIN_PRIMARY_SITE,
+        SITE_JOIN_PRIMARY_MODEL,
+        SITE_JOIN_JOINING_SITE,
+        SITE_JOIN_JOINING_MODEL,
+        SITE_JOIN_WRONG_SITE,
+    );
+
+    // ── Step 7: Cleanup ───────────────────────────────────────────────────────
+    eprintln!("verify-site-join-discovery: [7/7] cleanup...");
+    if let Some(c) = op_primary_guard.0.take() {
+        operator::kill_operator(c);
+    }
+    if let Some(c) = op_joining_guard.0.take() {
+        operator::kill_operator(c);
+    }
+    operator::cleanup_site_join_resources(&east_ctx).unwrap_or_else(|e| eprintln!("  warning: cleanup failed: {e}"));
+
+    // Propagate overlay result after cleanup so resources are always removed.
+    overlay_result?;
+
+    eprintln!(
+        "verify-site-join-discovery: PASS - joining site progressed \
+         Pending -> Discovered -> Connecting -> Active; routing data complete; \
+         cross-network isolation confirmed"
+    );
+    Ok(())
+}
+
 /// Verify a single metrics-routing phase: overlay order, shared model routing, unknown model rejection.
 ///
 /// This is the inner verification loop called for both phase 1 and phase 2.
@@ -2379,7 +2639,7 @@ fn verify_metrics_routing_phase(
         Ok(r) if r.status == 200 => {
             eprintln!(
                 "  [PASS] {METRICS_ROUTING_MODEL:?} returns 200 \
-                 (attributed to {expected_first_site:?} — overlay position 0)"
+                 (attributed to {expected_first_site:?} - overlay position 0)"
             );
         },
         Ok(r) => {

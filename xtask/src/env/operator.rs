@@ -252,6 +252,61 @@ pub(crate) const SWIM_CONVERGENCE_WAIT: Duration = Duration::from_secs(10);
 pub(crate) const SWIM_STATUS_POLL_TIMEOUT: Duration = Duration::from_secs(30);
 
 // ---------------------------------------------------------------------------
+// Site join / discovery validation constants
+// ---------------------------------------------------------------------------
+
+/// `GridNetwork` name used by the site-join-discovery validation.
+pub(crate) const SITE_JOIN_NETWORK: &str = "op-e2e-sjd-net";
+
+/// `GridNetwork` name used for the cross-network isolation check.
+pub(crate) const SITE_JOIN_WRONG_NETWORK: &str = "op-e2e-sjd-wrong-net";
+
+/// Gateway reference name used in the site-join-discovery `GridNetwork`.
+pub(crate) const SITE_JOIN_GW: &str = "op-e2e-sjd-gw";
+
+/// `GridSite` name for the primary (already-established) site.
+pub(crate) const SITE_JOIN_PRIMARY_SITE: &str = "op-e2e-sjd-primary";
+
+/// `GridSite` name for the joining (new) site.
+pub(crate) const SITE_JOIN_JOINING_SITE: &str = "op-e2e-sjd-joining";
+
+/// `GridSite` name used for the cross-network isolation check.
+pub(crate) const SITE_JOIN_WRONG_SITE: &str = "op-e2e-sjd-wrong";
+
+/// `InferenceProvider` name for the primary site's local provider.
+pub(crate) const SITE_JOIN_PRIMARY_PROVIDER: &str = "op-e2e-sjd-prov";
+
+/// `InferenceProvider` name for the joining site's local provider.
+pub(crate) const SITE_JOIN_JOINING_PROVIDER: &str = "op-e2e-sjd-prov-joining";
+
+/// `InferenceProvider` name for the wrong-network isolation test.
+pub(crate) const SITE_JOIN_WRONG_PROVIDER: &str = "op-e2e-sjd-prov-wrong";
+
+/// Model name served by the primary site's provider.
+pub(crate) const SITE_JOIN_PRIMARY_MODEL: &str = "model-sjd-primary";
+
+/// Model name served by the joining site's provider.
+pub(crate) const SITE_JOIN_JOINING_MODEL: &str = "model-sjd-joining";
+
+/// Metadata label key used in `GridSite` objects to enable per-site `siteSelector` matching.
+///
+/// The value is the site role string (e.g. `"primary"`, `"joining"`, `"wrong"`).
+/// Harness-only: production site labels are not required to follow this pattern.
+pub(crate) const SITE_JOIN_LABEL_KEY: &str = "grid.praxis-proxy.io/sjd-site";
+
+/// Egress address for the primary site (Kind east-cluster node IP + TLS port).
+///
+/// This is metadata used to populate `GridSite.spec.egress.address` in the
+/// validation harness.  It is not connected to during the test.
+pub(crate) const SITE_JOIN_PRIMARY_EGRESS: &str = "172.18.0.4:8443";
+
+/// Egress address for the joining site (Kind west-cluster node IP + TLS port).
+pub(crate) const SITE_JOIN_JOINING_EGRESS: &str = "172.18.0.5:8443";
+
+/// Timeout for polling `GridSite` phase transitions.
+pub(crate) const SITE_JOIN_PHASE_POLL_TIMEOUT: Duration = Duration::from_secs(30);
+
+// ---------------------------------------------------------------------------
 // CRD installation
 // ---------------------------------------------------------------------------
 
@@ -713,6 +768,37 @@ pub(crate) fn bump_gridnetwork(context: &str, name: &str) -> Result<(), Box<dyn 
     Ok(())
 }
 
+/// Force an immediate `GridSite` reconcile by patching a timestamp annotation.
+///
+/// This is used by the site-join-discovery validation after each harness
+/// `status.phase` patch.  The status patch proves Kubernetes accepted the
+/// lifecycle phase; the annotation bump creates a separate watch event so the
+/// controller reconciles after that patch, and the subsequent phase poll proves
+/// the controller preserved the phase.
+pub(crate) fn bump_gridsite(context: &str, name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let annotation = format!("grid.praxis-proxy.io/reconcile-at={ts}");
+    let status = Command::new("kubectl")
+        .args([
+            "--context",
+            context,
+            "annotate",
+            "gridsite",
+            name,
+            &annotation,
+            "--overwrite",
+        ])
+        .status()?;
+    if !status.success() {
+        return Err(format!("kubectl annotate gridsite {name} failed").into());
+    }
+    eprintln!("  [OK] bumped GridSite {name:?} annotation to force reconcile");
+    Ok(())
+}
+
 /// Each SWIM-enabled operator publishes real `InferenceProvider`-derived state
 /// as a CRDT `GridStateSnapshot` on reconcile.  After SWIM gossip convergence
 /// the remote operator's broadcast arrives and `distributedProviderCount`
@@ -768,14 +854,14 @@ pub(crate) fn verify_distributed_state_received(
     distributed_provider_count: u32,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match distributed_provider_count {
-        0 => Err("distributed state validation failed: distributedProviderCount must be 1 (received 0 — state not propagated)".into()),
+        0 => Err("distributed state validation failed: distributedProviderCount must be 1 (received 0 - state not propagated)".into()),
         1 => {
             eprintln!("  [OK] distributed state received via SWIM broadcast: distributedProviderCount=1");
             Ok(())
         },
         n => Err(format!(
             "distributed state validation failed: distributedProviderCount={n} but expected exactly 1; \
-             cross-network state leakage suspected — ensure op-e2e-net resources are cleaned up before \
+             cross-network state leakage suspected - ensure op-e2e-net resources are cleaned up before \
              running verify-swim-state"
         ).into()),
     }
@@ -2471,6 +2557,521 @@ fn delete_resource(
 }
 
 // ---------------------------------------------------------------------------
+// Site join / discovery helpers
+// ---------------------------------------------------------------------------
+
+/// Apply the `GridNetwork` for the site-join-discovery validation.
+///
+/// Creates `GridNetwork` [`SITE_JOIN_NETWORK`] on `context` with a single
+/// `gatewayRef` pointing at [`SITE_JOIN_GW`].  `local_site_name` is the
+/// `localSiteName` entry used by the operator to locate its own overlay slot.
+pub(crate) fn apply_site_join_network(context: &str, local_site_name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let manifest = serde_json::to_string_pretty(&serde_json::json!({
+        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "kind": "GridNetwork",
+        "metadata": { "name": SITE_JOIN_NETWORK },
+        "spec": {
+            "seeds": [],
+            "gatewayRefs": [{
+                "name": SITE_JOIN_GW,
+                "namespace": "default",
+                "localSiteName": local_site_name
+            }]
+        }
+    }))
+    .unwrap_or_else(|e| {
+        eprintln!("site-join GridNetwork serialization failed: {e}");
+        std::process::exit(1);
+    });
+    apply_manifest(context, &manifest)?;
+    eprintln!("  [OK] GridNetwork {SITE_JOIN_NETWORK:?} applied (localSiteName={local_site_name:?})");
+    Ok(())
+}
+
+/// Apply the wrong-network `GridNetwork` used for cross-network isolation testing.
+///
+/// Creates `GridNetwork` [`SITE_JOIN_WRONG_NETWORK`] on `context` with no
+/// gateway refs.  The operator reconciles this as a valid network; resources
+/// referencing it stay isolated from [`SITE_JOIN_NETWORK`].
+pub(crate) fn apply_site_join_wrong_network(context: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let manifest = serde_json::to_string_pretty(&serde_json::json!({
+        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "kind": "GridNetwork",
+        "metadata": { "name": SITE_JOIN_WRONG_NETWORK },
+        "spec": { "seeds": [] }
+    }))
+    .unwrap_or_else(|e| {
+        eprintln!("site-join wrong GridNetwork serialization failed: {e}");
+        std::process::exit(1);
+    });
+    apply_manifest(context, &manifest)?;
+    eprintln!("  [OK] GridNetwork {SITE_JOIN_WRONG_NETWORK:?} applied (isolation target)");
+    Ok(())
+}
+
+/// Apply a `GridSite` resource with an egress address and a harness label.
+///
+/// The `label_value` is set on [`SITE_JOIN_LABEL_KEY`] so the site can be
+/// selected by `InferenceProvider.spec.siteSelector.matchLabels` in the
+/// overlay rendering step.
+///
+/// The site controller validates that `network_ref` exists as a `GridNetwork`
+/// on the same cluster.  Apply the `GridNetwork` before this call.
+pub(crate) fn apply_gridsite(
+    context: &str,
+    site_name: &str,
+    network_ref: &str,
+    egress_addr: &str,
+    label_value: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let manifest = serde_json::to_string_pretty(&serde_json::json!({
+        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "kind": "GridSite",
+        "metadata": {
+            "name": site_name,
+            "labels": { SITE_JOIN_LABEL_KEY: label_value }
+        },
+        "spec": {
+            "gridNetworkRef": network_ref,
+            "egress": {
+                "address": egress_addr,
+                "tls": { "mode": "Mutual" }
+            }
+        }
+    }))
+    .unwrap_or_else(|e| {
+        eprintln!("GridSite {site_name} serialization failed: {e}");
+        std::process::exit(1);
+    });
+    apply_manifest(context, &manifest)?;
+    eprintln!(
+        "  [OK] GridSite {site_name:?} applied \
+         (network={network_ref:?}, egress={egress_addr:?}, label={label_value:?})"
+    );
+    Ok(())
+}
+
+/// Patch the `GridSite` status subresource to set `phase`.
+///
+/// The site controller preserves the patched phase through subsequent
+/// reconciles because the grid-site controller's `determine_phase()` returns the
+/// current phase unchanged in Phase 1 (manual lifecycle).  Polling with
+/// [`wait_for_gridsite_phase`] after this call confirms preservation.
+///
+/// This is xtask validation infrastructure — it simulates the transitions
+/// that SWIM discovery and mTLS exchange would trigger automatically in
+/// Phase 2.
+pub(crate) fn patch_gridsite_phase(
+    context: &str,
+    site_name: &str,
+    phase: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let patch = serde_json::to_string(&serde_json::json!({"status": {"phase": phase}})).unwrap_or_else(|e| {
+        eprintln!("gridsite phase patch serialization failed: {e}");
+        std::process::exit(1);
+    });
+    let out = Command::new("kubectl")
+        .args([
+            "--context",
+            context,
+            "patch",
+            "gridsites",
+            site_name,
+            "--subresource=status",
+            "--type=merge",
+            "-p",
+            &patch,
+        ])
+        .output()?;
+    if !out.status.success() {
+        return Err(format!(
+            "kubectl patch gridsites/{site_name} status failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        )
+        .into());
+    }
+    eprintln!("  [OK] GridSite {site_name:?}: status.phase patched to {phase:?}");
+    Ok(())
+}
+
+/// Read the current `status.phase` of a `GridSite`.
+fn read_gridsite_phase(context: &str, site_name: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let out = Command::new("kubectl")
+        .args([
+            "--context",
+            context,
+            "get",
+            "gridsites",
+            site_name,
+            "-o",
+            "jsonpath={.status.phase}",
+        ])
+        .output()?;
+    if !out.status.success() {
+        return Err(format!(
+            "kubectl get gridsites/{site_name} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        )
+        .into());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
+}
+
+/// Poll until `GridSite` `site_name` reaches `expected_phase`, or return `Err` on timeout.
+///
+/// The polling interval is 2 seconds, matching the pattern used by
+/// [`wait_for_gridnetwork_active`] and other xtask polling helpers.
+///
+/// A successful poll confirms that the site controller preserved the phase
+/// through at least one reconcile cycle after a [`patch_gridsite_phase`] call.
+///
+/// Returns `Err` immediately if `expected_phase` is not a recognised lifecycle
+/// phase (as defined by [`gridsite_phase_index`]).
+pub(crate) fn wait_for_gridsite_phase(
+    context: &str,
+    site_name: &str,
+    expected_phase: &str,
+    timeout: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Guard: reject unknown phase names before starting the poll loop.
+    if gridsite_phase_index(expected_phase).is_none() {
+        return Err(format!("wait_for_gridsite_phase: {expected_phase:?} is not a recognised GridSite phase").into());
+    }
+    let deadline = Instant::now() + timeout;
+    let mut last_phase = String::new();
+    loop {
+        let phase = read_gridsite_phase(context, site_name).unwrap_or_default();
+        if phase == expected_phase {
+            eprintln!("  [OK] GridSite {site_name:?}: phase={expected_phase:?} (confirmed)");
+            return Ok(());
+        }
+        last_phase.clone_from(&phase);
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "timeout waiting for GridSite {site_name} phase={expected_phase:?}; \
+                 last observed: {last_phase:?}"
+            )
+            .into());
+        }
+        #[expect(clippy::disallowed_methods, reason = "polling wait between GridSite status reads")]
+        std::thread::sleep(Duration::from_secs(2));
+    }
+}
+
+/// Verify that a `GridSite` has the expected routing-relevant spec fields set.
+///
+/// Checks `spec.gridNetworkRef` and `spec.egress.address`, which together
+/// provide the network identity and data-plane endpoint needed for routing.
+/// The `status.phase` value is reported but not asserted here — call
+/// [`wait_for_gridsite_phase`] separately to assert the lifecycle state.
+#[expect(
+    clippy::too_many_lines,
+    reason = "jsonpath field split + two field assertions + diagnostic messages"
+)]
+pub(crate) fn verify_gridsite_routing_data(
+    context: &str,
+    site_name: &str,
+    expected_network: &str,
+    expected_egress: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let out = Command::new("kubectl")
+        .args([
+            "--context",
+            context,
+            "get",
+            "gridsites",
+            site_name,
+            "-o",
+            "jsonpath={.spec.gridNetworkRef}/{.spec.egress.address}/{.status.phase}",
+        ])
+        .output()?;
+    if !out.status.success() {
+        return Err(format!(
+            "kubectl get gridsites/{site_name} for routing data failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        )
+        .into());
+    }
+    let fields: Vec<&str> = std::str::from_utf8(&out.stdout)
+        .unwrap_or("")
+        .trim()
+        .splitn(3, '/')
+        .collect();
+    let network = fields.first().copied().unwrap_or("");
+    let egress = fields.get(1).copied().unwrap_or("");
+    let phase = fields.get(2).copied().unwrap_or("");
+
+    if network != expected_network {
+        return Err(format!("GridSite {site_name}: gridNetworkRef={network:?} (expected {expected_network:?})").into());
+    }
+    if egress != expected_egress {
+        return Err(format!("GridSite {site_name}: egress.address={egress:?} (expected {expected_egress:?})").into());
+    }
+    eprintln!(
+        "  [PASS] GridSite {site_name:?}: routing data complete \
+         (network={expected_network:?}, egress={expected_egress:?}, phase={phase:?})"
+    );
+    Ok(())
+}
+
+/// Apply the primary site's `InferenceProvider` for the overlay generation step.
+///
+/// Uses `siteSelector.matchLabels` to restrict candidates to the primary
+/// `GridSite` only, so the overlay contains exactly one candidate per model.
+pub(crate) fn apply_site_join_primary_provider(
+    context: &str,
+    local_site_name: &str,
+    model: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let manifest = serde_json::to_string_pretty(&serde_json::json!({
+        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "kind": "InferenceProvider",
+        "metadata": { "name": SITE_JOIN_PRIMARY_PROVIDER },
+        "spec": {
+            "gridNetworkRef": SITE_JOIN_NETWORK,
+            "providerKind": "self_hosted",
+            "backendKind": "local",
+            "endpoint": "http://mock-openai-provider.default.svc:8080",
+            "models": [{ "name": model }],
+            "routingClusterRef": local_site_name,
+            "siteSelector": {
+                "matchLabels": { SITE_JOIN_LABEL_KEY: "primary" }
+            }
+        }
+    }))
+    .unwrap_or_else(|e| {
+        eprintln!("site-join primary provider serialization failed: {e}");
+        std::process::exit(1);
+    });
+    apply_manifest(context, &manifest)?;
+    eprintln!(
+        "  [OK] InferenceProvider {SITE_JOIN_PRIMARY_PROVIDER:?} applied \
+         (model={model:?}, siteSelector=primary)"
+    );
+    Ok(())
+}
+
+/// Apply the joining site's `InferenceProvider` for the overlay generation step.
+///
+/// Uses `siteSelector.matchLabels` to restrict candidates to the joining
+/// `GridSite` only.  After the joining site reaches `Active` phase, this
+/// provider's model appears in the overlay under the joining site's identity.
+pub(crate) fn apply_site_join_joining_provider(
+    context: &str,
+    joining_site_name: &str,
+    model: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let manifest = serde_json::to_string_pretty(&serde_json::json!({
+        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "kind": "InferenceProvider",
+        "metadata": { "name": SITE_JOIN_JOINING_PROVIDER },
+        "spec": {
+            "gridNetworkRef": SITE_JOIN_NETWORK,
+            "providerKind": "self_hosted",
+            "backendKind": "remote",
+            "endpoint": "http://mock-openai-provider.default.svc:8080",
+            "models": [{ "name": model }],
+            "routingClusterRef": joining_site_name,
+            "siteSelector": {
+                "matchLabels": { SITE_JOIN_LABEL_KEY: "joining" }
+            }
+        }
+    }))
+    .unwrap_or_else(|e| {
+        eprintln!("site-join joining provider serialization failed: {e}");
+        std::process::exit(1);
+    });
+    apply_manifest(context, &manifest)?;
+    eprintln!(
+        "  [OK] InferenceProvider {SITE_JOIN_JOINING_PROVIDER:?} applied \
+         (model={model:?}, siteSelector=joining)"
+    );
+    Ok(())
+}
+
+/// Apply a wrong-network `InferenceProvider` for the cross-network isolation step.
+///
+/// This provider references [`SITE_JOIN_WRONG_NETWORK`] and must NOT appear
+/// as a candidate in the overlay for [`SITE_JOIN_NETWORK`].
+pub(crate) fn apply_site_join_wrong_provider(context: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let manifest = serde_json::to_string_pretty(&serde_json::json!({
+        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "kind": "InferenceProvider",
+        "metadata": { "name": SITE_JOIN_WRONG_PROVIDER },
+        "spec": {
+            "gridNetworkRef": SITE_JOIN_WRONG_NETWORK,
+            "providerKind": "self_hosted",
+            "backendKind": "local",
+            "endpoint": "http://mock-openai-provider.default.svc:8080",
+            "models": [{ "name": "model-sjd-wrong" }],
+            "routingClusterRef": SITE_JOIN_WRONG_SITE
+        }
+    }))
+    .unwrap_or_else(|e| {
+        eprintln!("site-join wrong provider serialization failed: {e}");
+        std::process::exit(1);
+    });
+    apply_manifest(context, &manifest)?;
+    eprintln!(
+        "  [OK] InferenceProvider {SITE_JOIN_WRONG_PROVIDER:?} applied \
+         (wrong network, must be absent from {SITE_JOIN_NETWORK:?} overlay)"
+    );
+    Ok(())
+}
+
+/// Verify the site-join overlay contains the expected candidates and excludes wrong-network sites.
+///
+/// Reads the overlay `ConfigMap` generated for [`SITE_JOIN_NETWORK`] and
+/// asserts:
+/// - `primary_model` appears as a candidate attributed to `primary_site`
+/// - `joining_model` appears as a candidate attributed to `joining_site`
+/// - No candidate has `site == wrong_site` (cross-network isolation)
+///
+/// Returns `Ok(())` when all three assertions pass.
+#[expect(
+    clippy::too_many_lines,
+    reason = "three candidate assertions with diagnostic messages"
+)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "six distinct check parameters: primary/joining/wrong each need site and model"
+)]
+pub(crate) fn verify_site_join_overlay(
+    context: &str,
+    primary_site: &str,
+    primary_model: &str,
+    joining_site: &str,
+    joining_model: &str,
+    wrong_site: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let overlay = read_overlay_configmap(context, SITE_JOIN_NETWORK, SITE_JOIN_GW, "default")?;
+    let candidates = overlay
+        .get("candidates")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("overlay missing candidates array")?;
+
+    let has_primary = candidates.iter().any(|c| {
+        c.get("site").and_then(serde_json::Value::as_str) == Some(primary_site)
+            && c.get("name").and_then(serde_json::Value::as_str) == Some(primary_model)
+    });
+    if !has_primary {
+        return Err(
+            format!("overlay missing primary candidate: model={primary_model:?} at site={primary_site:?}").into(),
+        );
+    }
+    eprintln!("  [PASS] overlay: primary model {primary_model:?} -> site {primary_site:?}");
+
+    let has_joining = candidates.iter().any(|c| {
+        c.get("site").and_then(serde_json::Value::as_str) == Some(joining_site)
+            && c.get("name").and_then(serde_json::Value::as_str) == Some(joining_model)
+    });
+    if !has_joining {
+        return Err(
+            format!("overlay missing joining candidate: model={joining_model:?} at site={joining_site:?}").into(),
+        );
+    }
+    eprintln!("  [PASS] overlay: joining model {joining_model:?} -> site {joining_site:?}");
+
+    let has_wrong = candidates
+        .iter()
+        .any(|c| c.get("site").and_then(serde_json::Value::as_str) == Some(wrong_site));
+    if has_wrong {
+        return Err(format!(
+            "cross-network leakage: wrong-site {wrong_site:?} appears in \
+             {SITE_JOIN_NETWORK:?} overlay"
+        )
+        .into());
+    }
+    eprintln!("  [PASS] overlay: wrong-network site {wrong_site:?} absent from {SITE_JOIN_NETWORK:?}");
+
+    Ok(())
+}
+
+/// Delete all resources created by the site-join-discovery validation on `context`.
+///
+/// Safe to call before a fresh run — all deletes use `--ignore-not-found`.
+pub(crate) fn cleanup_site_join_resources(context: &str) -> Result<(), Box<dyn std::error::Error>> {
+    delete_namespaced_resource(
+        context,
+        "default",
+        "configmap",
+        &format!("grid-overlay-{SITE_JOIN_NETWORK}-{SITE_JOIN_GW}"),
+    )?;
+    delete_cluster_resource(context, "inferenceprovider", SITE_JOIN_PRIMARY_PROVIDER)?;
+    delete_cluster_resource(context, "inferenceprovider", SITE_JOIN_JOINING_PROVIDER)?;
+    delete_cluster_resource(context, "inferenceprovider", SITE_JOIN_WRONG_PROVIDER)?;
+    delete_cluster_resource(context, "gridsite", SITE_JOIN_PRIMARY_SITE)?;
+    delete_cluster_resource(context, "gridsite", SITE_JOIN_JOINING_SITE)?;
+    delete_cluster_resource(context, "gridsite", SITE_JOIN_WRONG_SITE)?;
+    delete_cluster_resource(context, "gridnetwork", SITE_JOIN_NETWORK)?;
+    delete_cluster_resource(context, "gridnetwork", SITE_JOIN_WRONG_NETWORK)?;
+    eprintln!("  [OK] stale site-join-discovery resources removed from {context}");
+    Ok(())
+}
+
+/// List `GridSite` names on `context` whose `spec.gridNetworkRef` matches `network`.
+///
+/// Runs `kubectl get gridsites -o json` and delegates filtering to the pure
+/// [`gridsites_in_network`] helper.  Returns an empty `Vec` if no sites exist
+/// for the network, which the caller can use to assert isolation.
+pub(crate) fn list_gridsites_for_network(
+    context: &str,
+    network: &str,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let out = Command::new("kubectl")
+        .args(["--context", context, "get", "gridsites", "-o", "json"])
+        .output()?;
+    if !out.status.success() {
+        return Err(format!("kubectl get gridsites failed: {}", String::from_utf8_lossy(&out.stderr)).into());
+    }
+    let all: serde_json::Value = serde_json::from_slice(&out.stdout)?;
+    let items = all
+        .get("items")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("gridsites list missing items array")?;
+    let names = gridsites_in_network(items, network)
+        .into_iter()
+        .map(String::from)
+        .collect();
+    Ok(names)
+}
+
+/// Filter site names from a JSON list of `GridSite` objects by `network`.
+///
+/// Used in the cross-network isolation check: given all `GridSite` objects
+/// on a cluster, returns only the names whose `spec.gridNetworkRef` matches
+/// `network`.
+///
+/// This is a pure function, suitable for unit testing without kubectl.
+pub(crate) fn gridsites_in_network<'a>(sites: &'a [serde_json::Value], network: &str) -> Vec<&'a str> {
+    sites
+        .iter()
+        .filter_map(|s| {
+            let site_network = s.pointer("/spec/gridNetworkRef").and_then(serde_json::Value::as_str)?;
+            if site_network == network {
+                s.pointer("/metadata/name").and_then(serde_json::Value::as_str)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Return the ordinal position of a `GridSite` lifecycle phase string.
+///
+/// Lower values are earlier in the join lifecycle:
+/// `Pending(0) -> Discovered(1) -> Connecting(2) -> Active(3) -> Unreachable(4) -> Left(5)`.
+///
+/// Returns `None` for unrecognised phase strings, enabling assertion helpers
+/// to reject unknown values rather than accepting them silently.
+///
+/// This is a pure function, suitable for unit testing without kubectl.
+pub(crate) fn gridsite_phase_index(phase: &str) -> Option<usize> {
+    const PHASES: &[&str] = &["Pending", "Discovered", "Connecting", "Active", "Unreachable", "Left"];
+    PHASES.iter().position(|p| *p == phase)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -3123,5 +3724,83 @@ mod tests {
             "annotation must use the reconcile-at key"
         );
         assert!(ts > 0, "timestamp must be non-zero on a real system");
+    }
+
+    // -----------------------------------------------------------------------
+    // site join / discovery — pure helper tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn gridsites_in_network_returns_matching_sites() {
+        let sites = vec![
+            serde_json::json!({"metadata": {"name": "sjd-primary"}, "spec": {"gridNetworkRef": "sjd-net"}}),
+            serde_json::json!({"metadata": {"name": "sjd-joining"}, "spec": {"gridNetworkRef": "sjd-net"}}),
+            serde_json::json!({"metadata": {"name": "sjd-wrong"}, "spec": {"gridNetworkRef": "wrong-net"}}),
+        ];
+        let in_net = gridsites_in_network(&sites, "sjd-net");
+        assert_eq!(in_net.len(), 2, "two sites belong to sjd-net");
+        assert!(in_net.contains(&"sjd-primary"), "primary must be present");
+        assert!(in_net.contains(&"sjd-joining"), "joining must be present");
+        assert!(!in_net.contains(&"sjd-wrong"), "wrong-network site must be absent");
+    }
+
+    #[test]
+    fn gridsites_in_network_excludes_wrong_network_site() {
+        let sites =
+            vec![serde_json::json!({"metadata": {"name": "sjd-wrong"}, "spec": {"gridNetworkRef": "wrong-net"}})];
+        let in_net = gridsites_in_network(&sites, "sjd-net");
+        assert!(
+            in_net.is_empty(),
+            "wrong-network-only list must return empty for the correct network"
+        );
+    }
+
+    #[test]
+    fn gridsites_in_network_empty_list_returns_empty() {
+        let in_net = gridsites_in_network(&[], "sjd-net");
+        assert!(in_net.is_empty(), "empty input must return empty");
+    }
+
+    #[test]
+    fn gridsite_phase_index_lifecycle_order() {
+        let pending = gridsite_phase_index("Pending").unwrap();
+        let discovered = gridsite_phase_index("Discovered").unwrap();
+        let connecting = gridsite_phase_index("Connecting").unwrap();
+        let active = gridsite_phase_index("Active").unwrap();
+        assert!(pending < discovered, "Pending must precede Discovered");
+        assert!(discovered < connecting, "Discovered must precede Connecting");
+        assert!(connecting < active, "Connecting must precede Active");
+    }
+
+    #[test]
+    fn gridsite_phase_index_join_sequence_is_monotone() {
+        let sequence = ["Pending", "Discovered", "Connecting", "Active"];
+        let indices: Vec<usize> = sequence.iter().map(|p| gridsite_phase_index(p).unwrap()).collect();
+        let is_strictly_increasing = indices.windows(2).all(|w| matches!(w, [a, b] if a < b));
+        assert!(
+            is_strictly_increasing,
+            "join lifecycle must be a strictly increasing sequence"
+        );
+    }
+
+    #[test]
+    fn gridsite_phase_index_unknown_is_none() {
+        assert!(
+            gridsite_phase_index("Unknown").is_none(),
+            "unknown phase must return None"
+        );
+        assert!(gridsite_phase_index("").is_none(), "empty string must return None");
+        assert!(gridsite_phase_index("pending").is_none(), "lowercase must not match");
+    }
+
+    #[test]
+    fn gridsite_phase_index_covers_all_defined_phases() {
+        let defined = ["Pending", "Discovered", "Connecting", "Active", "Unreachable", "Left"];
+        for phase in defined {
+            assert!(
+                gridsite_phase_index(phase).is_some(),
+                "defined phase {phase:?} must have an index"
+            );
+        }
     }
 }
