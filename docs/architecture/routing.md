@@ -92,6 +92,79 @@ scores.
 At request time, `grid_route` selects from this pre-sorted candidate list rather
 than recomputing the full scoring formula.
 
+## Backend kinds
+
+`InferenceProvider.spec.backendKind` is a placement and policy category. It is
+not strictly a wire-protocol choice, and it does not by itself mean a route does
+or does not use a Praxis gateway.
+
+| `backendKind` | Meaning | Typical path | Placement intent |
+|----------------|---------|--------------|------------------|
+| `local` | Self-hosted capacity in the local site. | Consumer Praxis directly to local/provider-side Praxis or local backend cluster. | Prefer first when healthy. |
+| `remote` | Self-hosted capacity in another Grid site. | Gateway-to-gateway mTLS to a remote Praxis provider gateway. | Prefer after local Grid-owned capacity. |
+| `cloud_managed` | Managed model capacity under the operator's cloud account. | Praxis gateway, provider adapter, or direct managed-service endpoint depending on deployment. | Prefer after Grid-owned capacity and before generic SaaS fallback. |
+| `api_provider` | Third-party API/SaaS provider fallback. | Praxis injects configured provider credential and forwards to the API endpoint. | Last-resort or explicit fallback tier. |
+
+`cloud_managed` is distinct because Grid should apply different cost,
+credential, observability, and placement assumptions than it applies to
+self-hosted sites. A deployment may still place Praxis in front of a
+cloud-managed backend; the category describes the operational boundary, not a
+requirement to bypass Praxis.
+
+## Multi-cluster model routing
+
+Multi-cluster model routing is the baseline Grid data-plane behavior:
+
+1. Each provider site declares the models it can serve through
+   `InferenceProvider.spec.models`.
+2. `spec.routingClusterRef` names the Praxis upstream cluster that can reach
+   that provider site.
+3. The operator renders one overlay candidate per routable model/provider pair.
+4. The consumer Praxis gateway extracts the requested model and selects the
+   first matching candidate from the ordered overlay.
+5. For remote sites, traffic goes gateway-to-gateway over mTLS before reaching
+   provider-local filters and serving infrastructure.
+
+Example overlay shape:
+
+```json
+{
+  "kind": "inference_model",
+  "name": "model-west",
+  "site": "site-west",
+  "cluster": "gateway-site-west",
+  "fresh": true
+}
+```
+
+In that example, a request for `model-west` selects the `gateway-site-west`
+Praxis cluster. The concrete pod or endpoint inside `site-west` is still chosen
+by the provider-side serving stack, such as llm-d/EPP endpoint selection.
+
+## API-provider fallback
+
+API-provider fallback uses the same overlay mechanism as self-hosted routing.
+The difference is the backend category and credential boundary:
+
+1. An `InferenceProvider` declares `backendKind: api_provider`.
+2. The operator includes the API provider as a candidate when it is available.
+3. Scoring normally places self-hosted candidates ahead of API-provider
+   candidates, so API providers are used as fallback or explicit lower-priority
+   routes.
+4. Praxis applies configured credential injection before forwarding the request
+   to the provider endpoint.
+5. If no self-hosted candidate is available for a model, the API-provider
+   candidate can become the selected route.
+
+The fallback decision is therefore still local to the consumer gateway at
+request time: `grid_route` selects from the pre-rendered candidate list, and the
+Praxis filter chain handles credential injection and upstream forwarding.
+
+Current local validation uses mock API-provider endpoints. That proves the Grid
+overlay and Praxis routing/credential-injection mechanics. It does not prove a
+real external provider protocol such as OpenAI, Anthropic, Bedrock SigV4, or
+Vertex OAuth2.
+
 ## Consumer gateway selection
 
 The Praxis consumer gateway extracts request facts such as the requested model

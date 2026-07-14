@@ -239,6 +239,71 @@ fn apply_mock_epp(context: &str, site_name: &str, def: &ClusterDef) -> Result<()
     apply_manifest(context, &yaml)
 }
 
+/// Update the mock EPP in a provider cluster to also handle `extra_model`.
+///
+/// Applies a replacement mock-EPP Deployment that routes both the site's
+/// original models (from `original_models`) and `extra_model` to
+/// `mock-openai-provider.default.svc:8080`.  All models route to the same
+/// backend regardless of name; the original route entries preserve the EPP's
+/// existing behavior for the site-specific models, while `extra_model` adds
+/// the shared model needed for metrics-routing competition.
+///
+/// This is xtask validation infrastructure: the update is idempotent and
+/// `kubectl apply` leaves the mock-EPP Service unchanged.
+#[expect(
+    clippy::too_many_lines,
+    reason = "K8s Deployment YAML generation with per-route args"
+)]
+pub(crate) fn apply_mock_epp_with_extra_model(
+    context: &str,
+    site_name: &str,
+    original_models: &[String],
+    extra_model: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let target = format!("{}.{}.svc:{}", kind::MOCK_OPENAI_SVC, NAMESPACE, kind::MOCK_OPENAI_PORT);
+    let mut routes: Vec<String> = original_models
+        .iter()
+        .map(|m| format!("            - \"--route={m}={target}\""))
+        .collect();
+    routes.push(format!("            - \"--route={extra_model}={target}\""));
+    let route_args = routes.join("\n");
+
+    // Raw string: imagePullPolicy: "Never" contains a literal `"` which justifies r#"..."#.
+    let yaml = format!(
+        r#"apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {MOCK_EPP_NAME}
+  namespace: {NAMESPACE}
+  labels:
+    app: {MOCK_EPP_NAME}
+    grid-site: {site_name}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: {MOCK_EPP_NAME}
+  template:
+    metadata:
+      labels:
+        app: {MOCK_EPP_NAME}
+    spec:
+      containers:
+        - name: {MOCK_EPP_NAME}
+          image: {image}
+          imagePullPolicy: "Never"
+          ports:
+            - containerPort: {MOCK_EPP_PORT}
+          args:
+{route_args}
+"#,
+        image = images::MOCK_EPP_IMAGE,
+    );
+    apply_manifest(context, &yaml)?;
+    eprintln!("  [OK] mock-epp patched in {site_name} to also serve {extra_model:?}");
+    Ok(())
+}
+
 /// Format mock EPP route args from model definitions.
 ///
 /// The target service depends on the cluster's [`ProviderBackend`]:

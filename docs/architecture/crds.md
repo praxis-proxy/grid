@@ -130,6 +130,21 @@ spec:
 
 **Phases**: Pending → Available → Degraded → Unavailable
 
+### Backend kind
+
+`spec.backendKind` describes the provider's placement and policy category:
+
+| Value | Meaning |
+|-------|---------|
+| `local` | Self-hosted capacity in the local site. |
+| `remote` | Self-hosted capacity in another Grid site. |
+| `cloud_managed` | Managed cloud capacity controlled by the operator's cloud account. |
+| `api_provider` | External API/SaaS provider used as fallback or explicit API route. |
+
+The value influences scoring and routing policy. It does not require a specific
+transport implementation; for example, a `cloud_managed` backend can still be
+fronted by Praxis.
+
 ### Metrics configuration
 
 `spec.metricsConfig` configures the operator-side Prometheus scrape used during

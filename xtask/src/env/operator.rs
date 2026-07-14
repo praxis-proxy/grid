@@ -136,6 +136,47 @@ const METRICS_IDLE_QUEUE_DEPTH: &str = "0.1";
 const METRICS_BUSY_QUEUE_DEPTH: &str = "0.9";
 
 // ---------------------------------------------------------------------------
+// Metrics-driven routing validation constants
+// ---------------------------------------------------------------------------
+
+/// `GridNetwork` name for the metrics-driven routing validation.
+///
+/// Separate from [`TEST_NETWORK`] and [`SWIM_TEST_NETWORK`] to avoid resource
+/// collisions when the single-provider validation and metrics-routing validation
+/// run against the same cluster.
+pub(crate) const METRICS_ROUTING_NETWORK: &str = "op-e2e-metrics-routing-net";
+
+/// Gateway reference name inside the metrics-routing `GridNetwork`.
+pub(crate) const METRICS_ROUTING_GW: &str = "op-e2e-gw";
+
+/// `InferenceProvider` for the east/low-queue site in metrics-routing.
+pub(crate) const METRICS_ROUTING_EAST_PROVIDER: &str = "op-e2e-mr-east";
+
+/// `InferenceProvider` for the west/high-queue site in metrics-routing.
+pub(crate) const METRICS_ROUTING_WEST_PROVIDER: &str = "op-e2e-mr-west";
+
+/// Model name shared by both east and west providers in metrics-routing.
+///
+/// Both sites serve this model so only the scoring signal (queue depth) determines
+/// which overlay candidate appears first and which provider handles the request.
+pub(crate) const METRICS_ROUTING_MODEL: &str = "model-metrics-shared";
+
+/// Pod name for the east-site metrics HTTP server.
+pub(crate) const METRICS_ROUTING_EAST_POD: &str = "op-e2e-mr-metrics-east";
+
+/// Pod name for the west-site metrics HTTP server.
+pub(crate) const METRICS_ROUTING_WEST_POD: &str = "op-e2e-mr-metrics-west";
+
+/// Host-side port for the east-site metrics pod port-forward.
+///
+/// Chosen to avoid conflicts with the single-provider metrics ports
+/// (`18501`, `18502`) used by `run_operator_reconcile`.
+pub(crate) const METRICS_ROUTING_EAST_PORT: u16 = 18_611;
+
+/// Host-side port for the west-site metrics pod port-forward.
+pub(crate) const METRICS_ROUTING_WEST_PORT: u16 = 18_612;
+
+// ---------------------------------------------------------------------------
 // SWIM membership validation constants
 // ---------------------------------------------------------------------------
 
@@ -1235,6 +1276,211 @@ pub(crate) fn verify_metrics_ordering(
         .into());
     }
     eprintln!("  [OK] metrics ordering: {idle_cluster} (pos {idle_pos}) before {busy_cluster} (pos {busy_pos})");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Metrics-driven routing fixture helpers
+// ---------------------------------------------------------------------------
+
+/// Apply the `GridNetwork` and two `InferenceProvider` fixtures for metrics-routing.
+///
+/// Both providers serve [`METRICS_ROUTING_MODEL`] so only the scraped queue-depth
+/// metric distinguishes them in overlay scoring.  `routingClusterRef` is set to the
+/// real provider site so the overlay candidate routes to the actual provider gateway.
+///
+/// `spec.endpoint` for each provider is `http://127.0.0.1:{east_port}` /
+/// `http://127.0.0.1:{west_port}` — the host-side port-forwards to the Python
+/// metrics pods.  The operator scrapes `{endpoint}/metrics` and uses the result in
+/// scoring.  This follows the same pattern as the single-provider metrics test.
+#[expect(clippy::too_many_lines, reason = "GridNetwork + 2 InferenceProvider JSON manifests")]
+pub(crate) fn apply_metrics_routing_fixtures(
+    context: &str,
+    east_site: &str,
+    west_site: &str,
+    east_metrics_port: u16,
+    west_metrics_port: u16,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let network = serde_json::to_string_pretty(&serde_json::json!({
+        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "kind": "GridNetwork",
+        "metadata": { "name": METRICS_ROUTING_NETWORK },
+        "spec": {
+            "seeds": [],
+            "gatewayRefs": [{ "name": METRICS_ROUTING_GW, "namespace": "default" }]
+        }
+    }))
+    .unwrap_or_else(|e| {
+        eprintln!("metrics-routing network serialization failed: {e}");
+        std::process::exit(1)
+    });
+
+    for (name, site, port) in [
+        (METRICS_ROUTING_EAST_PROVIDER, east_site, east_metrics_port),
+        (METRICS_ROUTING_WEST_PROVIDER, west_site, west_metrics_port),
+    ] {
+        let endpoint = format!("http://127.0.0.1:{port}");
+        let manifest = serde_json::to_string_pretty(&serde_json::json!({
+            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "kind": "InferenceProvider",
+            "metadata": { "name": name },
+            "spec": {
+                "gridNetworkRef": METRICS_ROUTING_NETWORK,
+                "providerKind": "self_hosted",
+                "backendKind": "local",
+                "endpoint": endpoint,
+                "models": [{ "name": METRICS_ROUTING_MODEL }],
+                "routingClusterRef": site,
+                "metricsConfig": {
+                    "path": "/metrics",
+                    "timeout": "2s",
+                    "signalNames": {
+                        "queueDepth": METRICS_QUEUE_SIGNAL_NAME
+                    }
+                }
+            }
+        }))
+        .unwrap_or_else(|e| {
+            eprintln!("metrics-routing provider serialization failed: {e}");
+            std::process::exit(1)
+        });
+        apply_manifest(context, &manifest)?;
+    }
+
+    apply_manifest(context, &network)?;
+    eprintln!(
+        "  [OK] metrics-routing fixtures applied \
+         ({METRICS_ROUTING_EAST_PROVIDER}@{east_site}/{east_metrics_port}, \
+          {METRICS_ROUTING_WEST_PROVIDER}@{west_site}/{west_metrics_port})"
+    );
+    Ok(())
+}
+
+/// Deploy two Python metrics server Pods for the metrics-routing validation.
+///
+/// Each pod serves a single Prometheus gauge line at `GET /metrics`.  The pods
+/// are named [`METRICS_ROUTING_EAST_POD`] and [`METRICS_ROUTING_WEST_POD`] and
+/// are deployed in the given context cluster (the primary provider cluster).
+///
+/// The caller is responsible for port-forwarding to the host before the operator
+/// scrapes them, and for deleting the pods after the validation phase completes.
+pub(crate) fn apply_metrics_routing_pods(
+    context: &str,
+    east_queue: &str,
+    west_queue: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    apply_metrics_endpoint_pod(context, METRICS_ROUTING_EAST_POD, east_queue)?;
+    apply_metrics_endpoint_pod(context, METRICS_ROUTING_WEST_POD, west_queue)?;
+    eprintln!(
+        "  [OK] metrics-routing pods applied \
+         ({METRICS_ROUTING_EAST_POD}: queue={east_queue}, \
+          {METRICS_ROUTING_WEST_POD}: queue={west_queue})"
+    );
+    Ok(())
+}
+
+/// Delete the metrics-routing Python pods.
+///
+/// Best-effort: uses `--force --grace-period=0` so the next phase can redeploy
+/// immediately.  The caller must restart any active port-forwards after deletion.
+pub(crate) fn delete_metrics_routing_pods(context: &str) {
+    for pod in [METRICS_ROUTING_EAST_POD, METRICS_ROUTING_WEST_POD] {
+        let _s = Command::new("kubectl")
+            .args([
+                "--context",
+                context,
+                "-n",
+                "default",
+                "delete",
+                "pod",
+                pod,
+                "--ignore-not-found",
+                "--force",
+                "--grace-period=0",
+            ])
+            .status();
+    }
+    eprintln!("  [OK] metrics-routing pods deleted");
+}
+
+/// Delete all resources created by the metrics-routing validation.
+///
+/// Idempotent: all deletes use `--ignore-not-found`.
+pub(crate) fn cleanup_metrics_routing_resources(context: &str) -> Result<(), Box<dyn std::error::Error>> {
+    delete_namespaced_resource(
+        context,
+        "default",
+        "configmap",
+        &format!("grid-overlay-{METRICS_ROUTING_NETWORK}-{METRICS_ROUTING_GW}"),
+    )?;
+    delete_cluster_resource(context, "inferenceprovider", METRICS_ROUTING_EAST_PROVIDER)?;
+    delete_cluster_resource(context, "inferenceprovider", METRICS_ROUTING_WEST_PROVIDER)?;
+    delete_cluster_resource(context, "gridnetwork", METRICS_ROUTING_NETWORK)?;
+    delete_metrics_routing_pods(context);
+    eprintln!("  [OK] stale metrics-routing resources removed");
+    Ok(())
+}
+
+/// Verify the metrics-routing overlay positions the expected low-queue site first.
+///
+/// Both east and west providers serve [`METRICS_ROUTING_MODEL`] with `backendKind =
+/// "local"` (equal locality).  After metrics scraping, the provider with a lower
+/// `queueDepth` signal receives a higher score and appears at a smaller index in the
+/// `candidates` array.
+///
+/// Returns `Ok(())` when ordering is correct; returns `Err` with a diagnostic
+/// message if any expected candidate is missing or the ordering is wrong.
+#[expect(
+    clippy::too_many_lines,
+    reason = "two candidate position lookups with diagnostic messages"
+)]
+pub(crate) fn verify_metrics_routing_overlay(
+    overlay: &serde_json::Value,
+    expected_first_site: &str,
+    expected_second_site: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let candidates = overlay["candidates"]
+        .as_array()
+        .ok_or("overlay missing candidates array")?;
+
+    // The raw overlay JSON uses the `routingClusterRef` value as the cluster field
+    // (e.g. "site-east"), not the consumer-config cluster name ("gateway-site-east").
+    // The gateway-{site} prefix is added later by `candidates_yaml` when the xtask
+    // generates the Praxis consumer config.
+    let first_pos = candidates
+        .iter()
+        .position(|c| {
+            c.get("site").and_then(serde_json::Value::as_str) == Some(expected_first_site)
+                && c.get("name").and_then(serde_json::Value::as_str) == Some(METRICS_ROUTING_MODEL)
+        })
+        .ok_or_else(|| {
+            format!("overlay candidate for model={METRICS_ROUTING_MODEL:?} at site={expected_first_site:?} not found")
+        })?;
+
+    let second_pos = candidates
+        .iter()
+        .position(|c| {
+            c.get("site").and_then(serde_json::Value::as_str) == Some(expected_second_site)
+                && c.get("name").and_then(serde_json::Value::as_str) == Some(METRICS_ROUTING_MODEL)
+        })
+        .ok_or_else(|| {
+            format!("overlay candidate for model={METRICS_ROUTING_MODEL:?} at site={expected_second_site:?} not found")
+        })?;
+
+    if first_pos >= second_pos {
+        return Err(format!(
+            "metrics-routing overlay order unexpected: \
+             {expected_first_site} (pos {first_pos}) must appear before \
+             {expected_second_site} (pos {second_pos}); \
+             check that the low-queue provider is scraping correctly"
+        )
+        .into());
+    }
+
+    eprintln!(
+        "  [OK] metrics-routing overlay order: {expected_first_site} (pos {first_pos}, lower queue) \
+         before {expected_second_site} (pos {second_pos}, higher queue)"
+    );
     Ok(())
 }
 
@@ -2799,6 +3045,62 @@ mod tests {
         assert!(
             verify_multi_provider_overlay(&overlay, &[]).is_ok(),
             "empty site list must pass (no constraints to check)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // verify_metrics_routing_overlay — ordering assertions
+    // -----------------------------------------------------------------------
+
+    fn make_metrics_overlay(site_order: &[&str]) -> serde_json::Value {
+        let candidates: Vec<serde_json::Value> = site_order
+            .iter()
+            .map(|site| {
+                serde_json::json!({
+                    "kind": "inference_model",
+                    "name": METRICS_ROUTING_MODEL,
+                    "site": site,
+                    "cluster": site,
+                    "fresh": true
+                })
+            })
+            .collect();
+        serde_json::json!({ "network": "net", "local_site": "net", "candidates": candidates })
+    }
+
+    #[test]
+    fn verify_metrics_routing_overlay_correct_order_passes() {
+        let overlay = make_metrics_overlay(&["site-east", "site-west"]);
+        assert!(
+            verify_metrics_routing_overlay(&overlay, "site-east", "site-west").is_ok(),
+            "east before west with lower queue depth must pass"
+        );
+    }
+
+    #[test]
+    fn verify_metrics_routing_overlay_reversed_order_fails() {
+        let overlay = make_metrics_overlay(&["site-west", "site-east"]);
+        assert!(
+            verify_metrics_routing_overlay(&overlay, "site-east", "site-west").is_err(),
+            "east after west must fail when east is expected first"
+        );
+    }
+
+    #[test]
+    fn verify_metrics_routing_overlay_missing_first_candidate_fails() {
+        let overlay = make_metrics_overlay(&["site-west"]);
+        assert!(
+            verify_metrics_routing_overlay(&overlay, "site-east", "site-west").is_err(),
+            "absent expected-first candidate must fail"
+        );
+    }
+
+    #[test]
+    fn verify_metrics_routing_overlay_missing_second_candidate_fails() {
+        let overlay = make_metrics_overlay(&["site-east"]);
+        assert!(
+            verify_metrics_routing_overlay(&overlay, "site-east", "site-west").is_err(),
+            "absent expected-second candidate must fail"
         );
     }
 

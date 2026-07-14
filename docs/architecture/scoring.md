@@ -43,6 +43,24 @@ The scoring engine combines six normalized signals:
 Signals without live values use the neutral score `0.5`. Providers with metrics
 that report `healthy = false` are excluded by the scoring engine.
 
+## Backend-kind locality
+
+The locality signal uses `backendKind` as an input. The intent is to prefer
+capacity that is closer, Grid-owned, and cheaper to operate before falling back
+to external services.
+
+| `backendKind` | Locality intent |
+|---------------|-----------------|
+| `local` | Self-hosted capacity in the local site. Highest locality preference. |
+| `remote` | Self-hosted capacity in another Grid site. Preferred after local capacity. |
+| `cloud_managed` | Managed cloud model capacity under the operator's cloud account. Lower than Grid-owned capacity, higher than generic API fallback. |
+| `api_provider` | Third-party API/SaaS provider. Lowest default locality preference. |
+
+These categories affect ordering, but they do not fully describe the transport
+path. For example, a `cloud_managed` provider may still be reached through
+Praxis if the deployment uses Praxis to perform auth, policy, or protocol
+adaptation.
+
 ## Metrics input
 
 `InferenceProvider.spec.metricsConfig` enables the operator to scrape a

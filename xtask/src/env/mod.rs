@@ -19,7 +19,7 @@ use std::{
 
 use clap::Subcommand;
 
-use self::config::{ClusterRole, EnvConfig};
+use self::config::{ClusterRole, EnvConfig, ProviderBackend};
 
 // ---------------------------------------------------------------------------
 // Shared infrastructure helpers
@@ -427,6 +427,32 @@ pub(crate) enum Action {
         #[arg(short, long, default_value = "tests/env/operator-routing-two-provider.toml")]
         config: PathBuf,
     },
+
+    /// Prove that live metrics change the backend selected by consumer requests.
+    ///
+    /// Runs in two phases:
+    ///
+    /// **Phase 1 (east low, west high):** Site-east reports `queue_depth = 0.1`
+    /// and site-west reports `0.9`.  The operator generates an overlay where
+    /// site-east appears first for `model-metrics-shared`.  A consumer request
+    /// for that model routes to site-east.
+    ///
+    /// **Phase 2 (flipped):** Metrics are updated so site-east reports `0.9`
+    /// and site-west reports `0.1`.  The operator re-reconciles; the overlay
+    /// flips so site-west appears first.  The consumer request now routes to
+    /// site-west.
+    ///
+    /// Attribution is structural: both providers echo the same model name,
+    /// so the overlay position is the primary evidence.
+    ///
+    /// Requires the two-provider kind environment.  Run `env up` and
+    /// `env load-gateway-images` with the two-provider config first.
+    /// Safe to rerun: all owned resources are cleaned at the start.
+    VerifyMetricsRouting {
+        /// Path to the two-provider environment config file.
+        #[arg(short, long, default_value = "tests/env/operator-routing-two-provider.toml")]
+        config: PathBuf,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -467,6 +493,7 @@ pub(crate) fn run(action: &Action) -> Result<(), Box<dyn std::error::Error>> {
         Action::VerifySwimRouting { config } => env_verify_swim_routing(config),
         Action::VerifyDemo1LlmdRouting { config } => env_verify_demo1_llmd_routing(config),
         Action::VerifyFullGridRouting { config } => env_verify_full_grid_routing(config),
+        Action::VerifyMetricsRouting { config } => env_verify_metrics_routing(config),
     }
 }
 
@@ -803,6 +830,30 @@ fn provider_clusters_from_config(cfg: &EnvConfig) -> Vec<(String, Vec<String>)> 
             })
         })
         .collect()
+}
+
+/// Require the named provider clusters to use the `mock-openai` backend.
+///
+/// The metrics-routing harness patches `mock-epp` routes to the shared
+/// `mock-openai-provider` service. Running it against an `inference-sim`
+/// topology would patch routes to a service that does not exist, so fail before
+/// any cluster mutation.
+fn require_mock_openai_backends(cfg: &EnvConfig, sites: &[&str]) -> Result<(), Box<dyn std::error::Error>> {
+    for site in sites {
+        let def = cfg
+            .clusters
+            .definitions
+            .get(*site)
+            .ok_or_else(|| format!("provider cluster {site:?} not found in config"))?;
+        if def.backend != ProviderBackend::MockOpenai {
+            return Err(format!(
+                "verify-metrics-routing requires provider {site:?} to use backend = \"mock-openai\"; got {:?}",
+                def.backend
+            )
+            .into());
+        }
+    }
+    Ok(())
 }
 
 /// Return `true` when the config has more than one provider cluster that
@@ -1990,6 +2041,377 @@ fn env_verify_full_grid_routing(config: &Path) -> Result<(), Box<dyn std::error:
 }
 
 // ---------------------------------------------------------------------------
+// Metrics-driven routing validation
+// ---------------------------------------------------------------------------
+
+/// Prove that live scraped metrics change which backend a consumer request routes to.
+///
+/// Two provider sites (east, west) both serve `model-metrics-shared`.  Python
+/// pods expose Prometheus gauge values for `queue_depth`; port-forwards expose
+/// them to the out-of-cluster operator.  After two reconcile phases with
+/// swapped metrics values the overlay order flips and consumer routing follows.
+///
+/// **Attribution note**: because both mock providers return the same response
+/// body, the selected backend is evidenced by the overlay position (structural
+/// proof) alone.  The annotation-bump trigger is xtask validation
+/// synchronization — not a production mechanism.
+#[expect(
+    clippy::too_many_lines,
+    reason = "sequential two-phase metrics validation with port-forward lifecycle"
+)]
+fn env_verify_metrics_routing(config: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    use operator::{
+        CONFIGMAP_POLL_TIMEOUT, METRICS_ROUTING_EAST_POD, METRICS_ROUTING_EAST_PORT, METRICS_ROUTING_EAST_PROVIDER,
+        METRICS_ROUTING_GW, METRICS_ROUTING_MODEL, METRICS_ROUTING_NETWORK, METRICS_ROUTING_WEST_POD,
+        METRICS_ROUTING_WEST_PORT, METRICS_ROUTING_WEST_PROVIDER, STATUS_POLL_TIMEOUT,
+    };
+
+    let cfg = EnvConfig::from_file(config)?;
+    eprintln!("verify-metrics-routing: loading two-provider config...");
+
+    // Resolve east and west provider sites.
+    let providers = provider_clusters_from_config(&cfg);
+    if providers.len() < 2 {
+        return Err(format!(
+            "verify-metrics-routing requires at least 2 provider clusters; got {}",
+            providers.len()
+        )
+        .into());
+    }
+    let Some((east_site, east_models)) = providers.first() else {
+        return Err("east provider not found".into());
+    };
+    let Some((west_site, west_models)) = providers.get(1) else {
+        return Err("west provider not found".into());
+    };
+    require_mock_openai_backends(&cfg, &[east_site.as_str(), west_site.as_str()])?;
+    let east_model = east_models.first().ok_or("east provider has no models")?.clone();
+    let west_model = west_models.first().ok_or("west provider has no models")?.clone();
+    let east_ctx = kind::kubectl_context(east_site);
+    let west_ctx = kind::kubectl_context(west_site);
+    let consumer_site = cfg
+        .clusters
+        .names
+        .iter()
+        .find(|n| {
+            cfg.clusters
+                .definitions
+                .get(*n)
+                .is_some_and(|d| d.role == ClusterRole::Consumer)
+        })
+        .map(String::as_str)
+        .ok_or("no consumer cluster in config")?;
+
+    eprintln!(
+        "  east={east_site} ({east_model}), west={west_site} ({west_model}), \
+         shared={METRICS_ROUTING_MODEL}"
+    );
+    eprintln!("  [OK] metrics-routing preflight: {east_site} and {west_site} use backend = \"mock-openai\"");
+
+    // ── Step 1: Deploy provider gateways ──────────────────────────────────────
+    eprintln!("verify-metrics-routing: [1/7] deploying provider gateways...");
+    gateway::deploy_all(&cfg)?;
+
+    // Patch mock-epps to also serve model-metrics-shared.
+    // Both sites need the shared model so the consumer can route it to either.
+    gateway::apply_mock_epp_with_extra_model(&east_ctx, east_site, east_models, METRICS_ROUTING_MODEL)?;
+    gateway::apply_mock_epp_with_extra_model(&west_ctx, west_site, west_models, METRICS_ROUTING_MODEL)?;
+    // Wait for both mock-epps to roll out with the new routes.
+    {
+        use std::process::Command;
+        for (ctx, site) in [(&east_ctx, east_site), (&west_ctx, west_site)] {
+            let status = Command::new("kubectl")
+                .args([
+                    "--context",
+                    ctx,
+                    "-n",
+                    "default",
+                    "rollout",
+                    "restart",
+                    "deployment/mock-epp",
+                ])
+                .status()?;
+            if !status.success() {
+                return Err(format!("mock-epp restart failed in {site}").into());
+            }
+            let status = Command::new("kubectl")
+                .args([
+                    "--context",
+                    ctx,
+                    "-n",
+                    "default",
+                    "rollout",
+                    "status",
+                    "deployment/mock-epp",
+                    "--timeout",
+                    "60s",
+                ])
+                .status()?;
+            if !status.success() {
+                return Err(format!("mock-epp rollout timed out in {site}").into());
+            }
+            eprintln!("  [OK] {site} mock-epp ready with shared model route");
+        }
+    }
+
+    // ── Step 2: Install CRDs and cleanup stale resources ─────────────────────
+    eprintln!("verify-metrics-routing: [2/7] installing CRDs and cleaning stale resources...");
+    operator::install_grid_crds(&east_ctx)?;
+    operator::cleanup_metrics_routing_resources(&east_ctx)?;
+
+    // ── Phase 1: east=low queue (0.1), west=high queue (0.9) ─────────────────
+    eprintln!("verify-metrics-routing: [3/7] phase 1 — east=0.1, west=0.9...");
+    operator::apply_metrics_routing_pods(&east_ctx, "0.1", "0.9")?;
+    operator::wait_for_named_pod_ready(&east_ctx, METRICS_ROUTING_EAST_POD, STATUS_POLL_TIMEOUT)?;
+    operator::wait_for_named_pod_ready(&east_ctx, METRICS_ROUTING_WEST_POD, STATUS_POLL_TIMEOUT)?;
+
+    let pf_east =
+        operator::start_named_pod_port_forward(&east_ctx, METRICS_ROUTING_EAST_POD, METRICS_ROUTING_EAST_PORT)?;
+    let mut pf_east_guard = ProcGuard(Some(pf_east), "metrics-pod-east-pf");
+    let pf_west =
+        operator::start_named_pod_port_forward(&east_ctx, METRICS_ROUTING_WEST_POD, METRICS_ROUTING_WEST_PORT)?;
+    let mut pf_west_guard = ProcGuard(Some(pf_west), "metrics-pod-west-pf");
+
+    operator::apply_metrics_routing_fixtures(
+        &east_ctx,
+        east_site,
+        west_site,
+        METRICS_ROUTING_EAST_PORT,
+        METRICS_ROUTING_WEST_PORT,
+    )?;
+
+    let op1 = operator::spawn_operator(&east_ctx)?;
+    let mut op1_guard = ProcGuard(Some(op1), "operator-phase1");
+
+    let phase1_result: Result<PathBuf, Box<dyn std::error::Error>> = (|| {
+        operator::wait_for_provider_phase(&east_ctx, METRICS_ROUTING_EAST_PROVIDER, "Pending", STATUS_POLL_TIMEOUT)?;
+        operator::wait_for_provider_phase(&east_ctx, METRICS_ROUTING_WEST_PROVIDER, "Pending", STATUS_POLL_TIMEOUT)?;
+        operator::wait_for_overlay_configmap(
+            &east_ctx,
+            METRICS_ROUTING_NETWORK,
+            METRICS_ROUTING_GW,
+            "default",
+            CONFIGMAP_POLL_TIMEOUT,
+        )?;
+        let overlay =
+            operator::read_overlay_configmap(&east_ctx, METRICS_ROUTING_NETWORK, METRICS_ROUTING_GW, "default")?;
+        operator::verify_metrics_routing_overlay(&overlay, east_site, west_site)?;
+        eprintln!("  [OK] phase 1 overlay: {east_site} (low queue) before {west_site} (high queue)");
+        operator::export_overlay_to_file(&east_ctx, METRICS_ROUTING_NETWORK, METRICS_ROUTING_GW, "default")
+    })();
+
+    if let Some(c) = op1_guard.0.take() {
+        operator::kill_operator(c);
+    }
+
+    let phase1_overlay = phase1_result?;
+
+    // Phase 1 consumer deployment and verification.
+    let phase1_overlay_json = std::fs::read_to_string(&phase1_overlay)?;
+    let phase1_overlay_parsed = operator_overlay::parse_grid_config_json(&phase1_overlay_json)?;
+    consumer::deploy_consumer(&cfg, Some(&phase1_overlay))?;
+
+    let phase1_verify = verify_metrics_routing_phase(
+        consumer_site,
+        &phase1_overlay_parsed,
+        east_site, // expected first
+    );
+
+    // ── Phase 2: flip metrics — east=high (0.9), west=low (0.1) ──────────────
+    eprintln!("verify-metrics-routing: [4/7] flipping metrics — east=0.9, west=0.1...");
+    if let Some(mut c) = pf_east_guard.0.take() {
+        drop(c.kill());
+        drop(c.wait());
+    }
+    if let Some(mut c) = pf_west_guard.0.take() {
+        drop(c.kill());
+        drop(c.wait());
+    }
+    operator::delete_metrics_routing_pods(&east_ctx);
+    // Brief wait for pod deletion to propagate before recreating.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "brief post-deletion wait before pod recreation"
+    )]
+    std::thread::sleep(Duration::from_secs(3));
+
+    operator::apply_metrics_routing_pods(&east_ctx, "0.9", "0.1")?;
+    operator::wait_for_named_pod_ready(&east_ctx, METRICS_ROUTING_EAST_POD, STATUS_POLL_TIMEOUT)?;
+    operator::wait_for_named_pod_ready(&east_ctx, METRICS_ROUTING_WEST_POD, STATUS_POLL_TIMEOUT)?;
+
+    let pf_east2 =
+        operator::start_named_pod_port_forward(&east_ctx, METRICS_ROUTING_EAST_POD, METRICS_ROUTING_EAST_PORT)?;
+    let mut pf_east2_guard = ProcGuard(Some(pf_east2), "metrics-pod-east-pf2");
+    let pf_west2 =
+        operator::start_named_pod_port_forward(&east_ctx, METRICS_ROUTING_WEST_POD, METRICS_ROUTING_WEST_PORT)?;
+    let mut pf_west2_guard = ProcGuard(Some(pf_west2), "metrics-pod-west-pf2");
+
+    let op2 = operator::spawn_operator(&east_ctx)?;
+    let mut op2_guard = ProcGuard(Some(op2), "operator-phase2");
+
+    let phase2_result: Result<PathBuf, Box<dyn std::error::Error>> = (|| {
+        // Bump GridNetwork annotation to force reconcile after metrics changed.
+        // This is xtask validation synchronization — not a production mechanism.
+        operator::bump_gridnetwork(&east_ctx, METRICS_ROUTING_NETWORK)?;
+        operator::wait_for_overlay_configmap(
+            &east_ctx,
+            METRICS_ROUTING_NETWORK,
+            METRICS_ROUTING_GW,
+            "default",
+            CONFIGMAP_POLL_TIMEOUT,
+        )?;
+        // Brief settle so the operator has time to rescrape the new metrics values.
+        #[expect(clippy::disallowed_methods, reason = "settle after metrics flip before overlay read")]
+        std::thread::sleep(Duration::from_secs(5));
+        // Re-read overlay after settle.
+        let overlay =
+            operator::read_overlay_configmap(&east_ctx, METRICS_ROUTING_NETWORK, METRICS_ROUTING_GW, "default")?;
+        operator::verify_metrics_routing_overlay(&overlay, west_site, east_site)?;
+        eprintln!("  [OK] phase 2 overlay: {west_site} (now low queue) before {east_site} (now high queue)");
+        operator::export_overlay_to_file(&east_ctx, METRICS_ROUTING_NETWORK, METRICS_ROUTING_GW, "default")
+    })();
+
+    if let Some(c) = op2_guard.0.take() {
+        operator::kill_operator(c);
+    }
+    if let Some(mut c) = pf_east2_guard.0.take() {
+        drop(c.kill());
+        drop(c.wait());
+    }
+    if let Some(mut c) = pf_west2_guard.0.take() {
+        drop(c.kill());
+        drop(c.wait());
+    }
+
+    let phase2_overlay = phase2_result?;
+    let phase2_overlay_json = std::fs::read_to_string(&phase2_overlay)?;
+    let phase2_overlay_parsed = operator_overlay::parse_grid_config_json(&phase2_overlay_json)?;
+    consumer::deploy_consumer(&cfg, Some(&phase2_overlay))?;
+
+    let phase2_verify = verify_metrics_routing_phase(
+        consumer_site,
+        &phase2_overlay_parsed,
+        west_site, // expected first after flip
+    );
+
+    // ── Step 5: Cleanup ───────────────────────────────────────────────────────
+    eprintln!("verify-metrics-routing: [5/7] cleaning up...");
+    operator::cleanup_metrics_routing_resources(&east_ctx)
+        .unwrap_or_else(|e| eprintln!("  warning: cleanup failed: {e}"));
+
+    // ── Step 6: Pod restart check ─────────────────────────────────────────────
+    eprintln!("verify-metrics-routing: [6/7] checking for unexpected pod restarts...");
+    for (site, ctx) in [(east_site, &east_ctx), (west_site, &west_ctx)] {
+        let restarts = collect_pod_restart_counts(ctx, "default")?;
+        if restarts.is_empty() {
+            eprintln!("  [OK] {site}: no pod restarts");
+        } else {
+            for (pod, count) in &restarts {
+                eprintln!("  [FAIL] {site}: pod {pod} has {count} unexpected restart(s)");
+            }
+            return Err(format!("{site}: unexpected pod restarts detected").into());
+        }
+    }
+
+    // ── Step 7: Report ────────────────────────────────────────────────────────
+    eprintln!("verify-metrics-routing: [7/7] summarising results...");
+    phase1_verify?;
+    phase2_verify?;
+
+    eprintln!(
+        "verify-metrics-routing: PASS — overlay order and routing flipped correctly \
+         when metrics values were swapped"
+    );
+    Ok(())
+}
+
+/// Verify a single metrics-routing phase: overlay order, shared model routing, unknown model rejection.
+///
+/// This is the inner verification loop called for both phase 1 and phase 2.
+/// `expected_first_site` is the site that should appear first in the overlay after
+/// the current metrics values are applied.  The consumer config is generated solely
+/// from the metrics-routing overlay (which only advertises the shared model), so
+/// dedicated-model alive checks are not performed here.
+#[expect(
+    clippy::too_many_lines,
+    reason = "overlay check + port-forward + shared model + unknown model assertions"
+)]
+fn verify_metrics_routing_phase(
+    consumer_site: &str,
+    overlay: &operator_overlay::RoutingOverlay,
+    expected_first_site: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use operator::METRICS_ROUTING_MODEL;
+
+    // Confirm overlay position of the shared model's first candidate.
+    let first_candidate_site = overlay
+        .candidates
+        .iter()
+        .find(|c| c.name == METRICS_ROUTING_MODEL)
+        .map(|c| c.site.as_str())
+        .ok_or_else(|| format!("{METRICS_ROUTING_MODEL} not found in overlay candidates"))?;
+
+    if first_candidate_site != expected_first_site {
+        return Err(format!(
+            "metrics-routing overlay: first candidate for {METRICS_ROUTING_MODEL:?} is \
+             site={first_candidate_site:?}, expected site={expected_first_site:?}"
+        )
+        .into());
+    }
+    eprintln!(
+        "  [OK] overlay first candidate for {METRICS_ROUTING_MODEL:?}: \
+         site={expected_first_site:?} (expected)"
+    );
+
+    // Port-forward to the consumer gateway and verify all models.
+    let consumer_ctx = kind::kubectl_context(consumer_site);
+    let port = verify::find_free_port()?;
+    let mut pf = verify::PortForwardGuard::start(&consumer_ctx, "praxis-consumer", port, 8080)?;
+
+    if !verify::wait_for_port(port) {
+        pf.stop();
+        return Err("consumer gateway not reachable via port-forward".into());
+    }
+    eprintln!("  [PASS] consumer gateway reachable via port-forward");
+
+    // Shared model routes to the overlay-position-0 provider.
+    match consumer::send_consumer_request(port, METRICS_ROUTING_MODEL) {
+        Ok(r) if r.status == 200 => {
+            eprintln!(
+                "  [PASS] {METRICS_ROUTING_MODEL:?} returns 200 \
+                 (attributed to {expected_first_site:?} — overlay position 0)"
+            );
+        },
+        Ok(r) => {
+            pf.stop();
+            return Err(format!("{METRICS_ROUTING_MODEL:?} returned {} (expected 200)", r.status).into());
+        },
+        Err(e) => {
+            pf.stop();
+            return Err(format!("{METRICS_ROUTING_MODEL:?} request failed: {e}").into());
+        },
+    }
+
+    // Unknown model must fail cleanly.
+    match consumer::send_consumer_request(port, "nonexistent-model-xyz") {
+        Ok(r) if r.status == 404 || r.status == 503 => {
+            eprintln!("  [PASS] unknown model fails cleanly");
+        },
+        Ok(r) => {
+            pf.stop();
+            return Err(format!("unknown model returned {} (expected 404 or 503)", r.status).into());
+        },
+        Err(e) => {
+            pf.stop();
+            return Err(format!("unknown model request failed: {e}").into());
+        },
+    }
+
+    pf.stop();
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // validate-all aggregator
 // ---------------------------------------------------------------------------
 
@@ -2293,7 +2715,7 @@ mod multi_provider_tests {
                 config::ClusterDef {
                     models: models.clone(),
                     role: *role,
-                    backend: config::ProviderBackend::default(),
+                    backend: ProviderBackend::default(),
                 },
             );
         }
@@ -2354,6 +2776,42 @@ mod multi_provider_tests {
         let cfg = make_config(&[("consumer", ClusterRole::Consumer, vec!["x".to_owned()])]);
         let providers = provider_clusters_from_config(&cfg);
         assert!(providers.is_empty(), "consumer clusters must not appear as providers");
+    }
+
+    #[test]
+    fn require_mock_openai_backends_accepts_mock_openai_providers() {
+        let mut cfg = make_config(&[
+            ("site-east", ClusterRole::Provider, vec!["model-east".to_owned()]),
+            ("site-west", ClusterRole::Provider, vec!["model-west".to_owned()]),
+            ("consumer", ClusterRole::Consumer, vec![]),
+        ]);
+        for site in ["site-east", "site-west"] {
+            cfg.clusters
+                .definitions
+                .get_mut(site)
+                .unwrap_or_else(|| std::process::abort())
+                .backend = ProviderBackend::MockOpenai;
+        }
+
+        assert!(
+            require_mock_openai_backends(&cfg, &["site-east", "site-west"]).is_ok(),
+            "metrics-routing preflight must accept mock-openai provider backends"
+        );
+    }
+
+    #[test]
+    fn require_mock_openai_backends_rejects_inference_sim_provider() {
+        let cfg = make_config(&[
+            ("site-east", ClusterRole::Provider, vec!["model-east".to_owned()]),
+            ("site-west", ClusterRole::Provider, vec!["model-west".to_owned()]),
+            ("consumer", ClusterRole::Consumer, vec![]),
+        ]);
+
+        let err = require_mock_openai_backends(&cfg, &["site-east", "site-west"]).unwrap_err();
+        assert!(
+            err.to_string().contains("backend = \"mock-openai\""),
+            "preflight error must explain the required backend; got: {err}"
+        );
     }
 
     #[test]
@@ -2646,7 +3104,7 @@ mod demo1_tests {
                 config::ClusterDef {
                     models: models.clone(),
                     role: *role,
-                    backend: config::ProviderBackend::default(),
+                    backend: ProviderBackend::default(),
                 },
             );
         }
