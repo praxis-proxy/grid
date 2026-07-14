@@ -454,7 +454,7 @@ pub(crate) enum Action {
         config: PathBuf,
     },
 
-    /// Verify Demo 7: site join and discovery lifecycle.
+    /// Verify site join/discovery lifecycle validation.
     ///
     /// Starts a primary SWIM operator and a joining SWIM operator, waits for
     /// membership formation, then advances the joining `GridSite`'s lifecycle
@@ -476,7 +476,7 @@ pub(crate) enum Action {
         config: PathBuf,
     },
 
-    /// Verify Demo 9 v1: remote provider marked stale when SWIM peer is killed.
+    /// Verify lost-peer staleness: remote provider marked stale when SWIM peer is killed.
     ///
     /// Starts a primary (east) and a joining (west) SWIM operator, publishes a
     /// local east provider and a remote west provider, verifies both appear in
@@ -2413,7 +2413,7 @@ fn env_verify_metrics_routing(config: &Path) -> Result<(), Box<dyn std::error::E
     Ok(())
 }
 
-/// Verify Demo 7: site join and discovery lifecycle, routing readiness, and cross-network isolation.
+/// Verify site join/discovery lifecycle, routing readiness, and cross-network isolation.
 ///
 /// **Design:** the operator's `determine_phase()` returns the current phase unchanged in Phase 1
 /// (manual lifecycle).  The harness advances the joining site through the state machine via
@@ -2650,29 +2650,37 @@ fn env_verify_site_join_discovery(config: &Path) -> Result<(), Box<dyn std::erro
     Ok(())
 }
 
-/// Verify Demo 9 v1: remote provider is marked `fresh=false` after the remote SWIM operator is killed.
+/// Lost-peer route-away validation: shared-model routing prefers a healthy fallback over a stale
+/// remote candidate when both serve the same model.
 ///
-/// **Before partition:** both the local east provider and the CRDT-sourced remote west provider
-/// appear in the overlay with `fresh=true`.
+/// **Before partition:** east (local, `backendKind=local`) and west (remote CRDT) both serve
+/// `model-failover-shared`.  East sorts first in the overlay by locality score.
 ///
-/// **After killing the west operator:** the east operator's SWIM runtime detects the dead peer,
-/// `apply_swim_staleness_override` downgrades the west provider's CRDT phase to `Degraded`, and
-/// the overlay emits the west candidate with `fresh=false`.  The east local candidate remains
-/// `fresh=true`.
+/// **After killing the west operator:** SWIM marks west Dead →
+/// `apply_swim_staleness_override` downgrades the west CRDT provider to `Degraded` →
+/// overlay emits west with `fresh=false`.  East (local, `fresh=true`) remains the first
+/// candidate for the shared model.  A consumer request for the shared model returns HTTP 200,
+/// attributed to east via overlay-position evidence (both mocks echo the same model name in
+/// the response body; the first-candidate position is the stated attribution mechanism).
 ///
-/// The partition is simulated by killing the west operator process - real network-level isolation
-/// (iptables/tc) is not required.  Timing relies on `foca::Config::simple()`: probe period 1.5 s,
-/// suspect-to-down 3 s; detection takes <= 6 s, and the harness waits
-/// `SWIM_DEAD_MEMBER_WAIT` (20 s) before forcing a reconcile via annotation bump.
+/// **Honest boundaries:**
+/// - Partition is simulated by process kill, not real network-level isolation (`iptables`/`tc`).
+/// - Attribution is overlay-based; this does not prove Praxis hard-excludes `fresh=false` candidates, only that the
+///   operator correctly deprioritises them behind the healthy alternative for the shared model.
+/// - Recovery after west rejoins and stale-age-based expiry are not implemented.
 #[expect(
     clippy::too_many_lines,
-    reason = "sequential 7-step failover proof: start operators, establish routing, partition, assert stale overlay"
+    reason = "sequential 8-step failover proof: gateways, operators, SWIM, shared-model overlay ordering, route-away consumer request"
+)]
+#[expect(
+    clippy::large_stack_frames,
+    reason = "gateway deploy + SWIM operator lifecycle + consumer port-forward state in one function"
 )]
 fn env_verify_failover_under_lost_peer(config: &Path) -> Result<(), Box<dyn std::error::Error>> {
     use operator::{
         CONFIGMAP_POLL_TIMEOUT, FAILOVER_EAST_PROVIDER, FAILOVER_GW, FAILOVER_LOCAL_MODEL, FAILOVER_NETWORK,
-        FAILOVER_REMOTE_MODEL, FAILOVER_STALE_POLL_TIMEOUT, FAILOVER_WEST_PROVIDER, SWIM_CONVERGENCE_WAIT,
-        SWIM_DEAD_MEMBER_WAIT, SWIM_STATUS_POLL_TIMEOUT,
+        FAILOVER_REMOTE_MODEL, FAILOVER_SHARED_MODEL, FAILOVER_STALE_POLL_TIMEOUT, FAILOVER_WEST_PROVIDER,
+        SWIM_CONVERGENCE_WAIT, SWIM_DEAD_MEMBER_WAIT, SWIM_STATUS_POLL_TIMEOUT,
     };
 
     let cfg = EnvConfig::from_file(config)?;
@@ -2696,8 +2704,8 @@ fn env_verify_failover_under_lost_peer(config: &Path) -> Result<(), Box<dyn std:
     let west_ctx = kind::kubectl_context(west_site);
     eprintln!("  primary={east_site} ({east_ctx}), remote={west_site} ({west_ctx})");
 
-    // Step 1: Preflight.
-    eprintln!("verify-failover-under-lost-peer: [1/7] preflight - CRDs, cleanup, operator binary...");
+    // ── Step 1: Preflight ─────────────────────────────────────────────────────
+    eprintln!("verify-failover-under-lost-peer: [1/8] preflight - CRDs, cleanup, operator binary...");
     let build_ok = std::process::Command::new("cargo")
         .args(["build", "--quiet", "-p", "operator", "--bin", "operator"])
         .status()
@@ -2711,8 +2719,44 @@ fn env_verify_failover_under_lost_peer(config: &Path) -> Result<(), Box<dyn std:
     operator::cleanup_failover_east_resources(&east_ctx).unwrap_or_else(|e| eprintln!("  note: east cleanup: {e}"));
     operator::cleanup_failover_west_resources(&west_ctx).unwrap_or_else(|e| eprintln!("  note: west cleanup: {e}"));
 
-    // Step 2: Start SWIM operators.
-    eprintln!("verify-failover-under-lost-peer: [2/7] starting SWIM operators...");
+    // ── Step 2: Deploy provider gateways ──────────────────────────────────────
+    // Gateway deployment enables consumer request routing in step 7.
+    // The east mock-epp is patched to also serve FAILOVER_SHARED_MODEL so requests
+    // for that model route cleanly through east's provider gateway after west is lost.
+    eprintln!("verify-failover-under-lost-peer: [2/8] deploying provider gateways...");
+    let east_models = providers.first().map(|(_, m)| m.clone()).unwrap_or_default();
+    let west_models = providers.get(1).map(|(_, m)| m.clone()).unwrap_or_default();
+    gateway::deploy_all(&cfg)?;
+    gateway::apply_mock_epp_with_extra_model(&east_ctx, east_site, &east_models, FAILOVER_SHARED_MODEL)?;
+    gateway::apply_mock_epp_with_extra_model(&west_ctx, west_site, &west_models, FAILOVER_SHARED_MODEL)?;
+    // Wait for both gateways to stabilize after mock-epp patch.
+    for (ctx, site) in [(&east_ctx, east_site), (&west_ctx, west_site)] {
+        let rollout_ok = std::process::Command::new("kubectl")
+            .args(["--context", ctx, "rollout", "restart", "deployment/mock-epp"])
+            .status()
+            .map_err(|e| format!("rollout restart mock-epp failed for {site}: {e}"))?;
+        if !rollout_ok.success() {
+            return Err(format!("rollout restart mock-epp failed for {site}").into());
+        }
+        let wait_ok = std::process::Command::new("kubectl")
+            .args([
+                "--context",
+                ctx,
+                "rollout",
+                "status",
+                "deployment/mock-epp",
+                "--timeout=60s",
+            ])
+            .status()
+            .map_err(|e| format!("rollout status mock-epp failed for {site}: {e}"))?;
+        if !wait_ok.success() {
+            return Err(format!("mock-epp rollout timeout for {site}").into());
+        }
+        eprintln!("  [OK] {site} mock-epp ready with {FAILOVER_SHARED_MODEL:?} route");
+    }
+
+    // ── Step 3: Start SWIM operators ──────────────────────────────────────────
+    eprintln!("verify-failover-under-lost-peer: [3/8] starting SWIM operators...");
     let (bind_east, bind_west) = reserve_swim_bind_addrs()?;
     let op_east = operator::spawn_operator_with_swim_for_context(&east_ctx, &bind_east, &bind_east, east_site, "")?;
     let mut op_east_guard = ProcGuard(Some(op_east), "operator-east");
@@ -2721,29 +2765,31 @@ fn env_verify_failover_under_lost_peer(config: &Path) -> Result<(), Box<dyn std:
     let mut op_west_guard = ProcGuard(Some(op_west), "operator-west");
     eprintln!("  [OK] east (primary) and west (remote) operators started");
 
-    // Step 3: SWIM convergence + fixtures.
-    eprintln!("verify-failover-under-lost-peer: [3/7] waiting for SWIM convergence and applying fixtures...");
+    // ── Step 4: SWIM convergence + fixtures ───────────────────────────────────
+    eprintln!("verify-failover-under-lost-peer: [4/8] waiting for SWIM convergence and applying fixtures...");
     operator::wait_for_swim_convergence(SWIM_CONVERGENCE_WAIT);
+    // East: local dedicated model + shared model (local, healthy fallback).
     operator::apply_failover_east_fixtures(&east_ctx, east_site, FAILOVER_LOCAL_MODEL)?;
-    operator::apply_failover_west_fixtures(&west_ctx, west_site, FAILOVER_REMOTE_MODEL)?;
+    operator::apply_failover_shared_east_provider(&east_ctx, east_site)?;
+    // West: remote dedicated model + shared model (published via CRDT to east).
+    operator::apply_failover_west_fixtures_with_shared(&west_ctx, west_site)?;
 
-    // Allow extra time for west operator to reconcile and publish its CRDT state,
-    // then bump the east GridNetwork annotation to force a reconcile that reads the
-    // latest CRDT state snapshot.  Same pattern as verify-swim-routing.
+    // Allow extra time for west to reconcile + publish its CRDT state, then force read.
     operator::wait_for_swim_convergence(Duration::from_secs(5));
     operator::bump_gridnetwork(&east_ctx, FAILOVER_NETWORK)?;
     eprintln!("  [OK] bumped {FAILOVER_NETWORK:?} to force CRDT state read");
 
-    // Poll east overlay network until west CRDT provider arrives.
     let dist = operator::wait_for_gridnetwork_distributed_state(&east_ctx, FAILOVER_NETWORK, SWIM_STATUS_POLL_TIMEOUT)?;
     eprintln!(
         "  [OK] east GridNetwork {FAILOVER_NETWORK:?}: distributedProviderCount={dist} \
          (west CRDT provider arrived)"
     );
 
-    // Step 4: Verify initial overlay - both candidates fresh=true.
-    eprintln!("verify-failover-under-lost-peer: [4/7] verifying initial overlay (both candidates fresh=true)...");
-    // Bump to ensure the overlay ConfigMap is generated from the current CRDT state.
+    // ── Step 5: Verify initial overlay ───────────────────────────────────────
+    eprintln!(
+        "verify-failover-under-lost-peer: [5/8] verifying initial overlay \
+         (dedicated + shared models, both providers fresh=true)..."
+    );
     operator::bump_gridnetwork(&east_ctx, FAILOVER_NETWORK)?;
     operator::wait_for_overlay_configmap(
         &east_ctx,
@@ -2752,6 +2798,7 @@ fn env_verify_failover_under_lost_peer(config: &Path) -> Result<(), Box<dyn std:
         "default",
         CONFIGMAP_POLL_TIMEOUT,
     )?;
+    // Dedicated models: each site's own model.
     operator::verify_failover_overlay(
         &east_ctx,
         FAILOVER_NETWORK,
@@ -2760,15 +2807,24 @@ fn env_verify_failover_under_lost_peer(config: &Path) -> Result<(), Box<dyn std:
         FAILOVER_LOCAL_MODEL,
         west_site,
         FAILOVER_REMOTE_MODEL,
-        false, // expect_remote_stale = false (west is still alive)
+        false,
+    )?;
+    // Shared model: east (local, higher score) before west (remote, lower score), both fresh=true.
+    operator::verify_shared_model_overlay_ordering(
+        &east_ctx,
+        FAILOVER_NETWORK,
+        FAILOVER_GW,
+        east_site,
+        west_site,
+        false, // expect_west_stale = false: west is alive, both fresh=true
     )?;
     eprintln!(
         "  [PASS] initial overlay: {FAILOVER_EAST_PROVIDER} fresh=true, \
-         {FAILOVER_WEST_PROVIDER} fresh=true"
+         {FAILOVER_WEST_PROVIDER} fresh=true; east before west for {FAILOVER_SHARED_MODEL:?}"
     );
 
-    // Step 5: Kill west operator.
-    eprintln!("verify-failover-under-lost-peer: [5/7] killing west operator - simulating partition...");
+    // ── Step 6: Kill west operator ────────────────────────────────────────────
+    eprintln!("verify-failover-under-lost-peer: [6/8] killing west operator - simulating partition...");
     if let Some(c) = op_west_guard.0.take() {
         operator::kill_operator(c);
     }
@@ -2776,18 +2832,15 @@ fn env_verify_failover_under_lost_peer(config: &Path) -> Result<(), Box<dyn std:
         "  [OK] west operator killed; waiting {}s for SWIM to declare peer Dead...",
         SWIM_DEAD_MEMBER_WAIT.as_secs()
     );
-    // foca::Config::simple(): probe_period=1.5s, suspect_to_down=3s -> Dead in <=6s.
-    // This wait is xtask validation synchronization - not a production mechanism.
+    // foca::Config::simple(): probe_period=1.5s, suspect_to_down=3s → Dead in ≤6s.
     #[expect(
         clippy::disallowed_methods,
         reason = "bounded wait for SWIM dead detection after operator kill"
     )]
     std::thread::sleep(SWIM_DEAD_MEMBER_WAIT);
 
-    // Step 6: Verify stale overlay - remote candidate fresh=false.
-    eprintln!("verify-failover-under-lost-peer: [6/7] verifying stale overlay (remote fresh=false)...");
-    // Force a reconcile so the east operator reads the updated SWIM membership
-    // (west = Dead) and applies apply_swim_staleness_override.
+    // ── Step 7: Verify stale overlay + route-away proof ───────────────────────
+    eprintln!("verify-failover-under-lost-peer: [7/8] verifying stale overlay and consumer route-away...");
     operator::bump_gridnetwork(&east_ctx, FAILOVER_NETWORK)?;
     eprintln!("  [OK] bumped {FAILOVER_NETWORK:?} to force post-partition reconcile");
 
@@ -2799,6 +2852,7 @@ fn env_verify_failover_under_lost_peer(config: &Path) -> Result<(), Box<dyn std:
         FAILOVER_STALE_POLL_TIMEOUT,
     )?;
 
+    // Dedicated models: east still fresh, west now stale.
     operator::verify_failover_overlay(
         &east_ctx,
         FAILOVER_NETWORK,
@@ -2807,18 +2861,118 @@ fn env_verify_failover_under_lost_peer(config: &Path) -> Result<(), Box<dyn std:
         FAILOVER_LOCAL_MODEL,
         west_site,
         FAILOVER_REMOTE_MODEL,
-        true, // expect_remote_stale = true (west is Dead -> Degraded -> fresh=false)
+        true,
+    )?;
+    // Shared model: east (fresh=true) before west (fresh=false).
+    operator::verify_shared_model_overlay_ordering(
+        &east_ctx,
+        FAILOVER_NETWORK,
+        FAILOVER_GW,
+        east_site,
+        west_site,
+        true, // expect_west_stale = true: west is Dead → Degraded → fresh=false
     )?;
     eprintln!(
         "  [PASS] stale overlay: {FAILOVER_EAST_PROVIDER} fresh=true, \
-         {FAILOVER_WEST_PROVIDER} fresh=false"
+         {FAILOVER_WEST_PROVIDER} fresh=false; east still first for {FAILOVER_SHARED_MODEL:?}"
     );
 
-    // Step 7: Cleanup.
-    eprintln!("verify-failover-under-lost-peer: [7/7] cleanup...");
+    // Consumer routing proof: deploy consumer from the stale overlay and verify a request
+    // for the shared model returns 200.  East is the first shared-model candidate.
+    // Attribution: overlay-based — both mocks echo the same model name in the response body;
+    // first shared-model candidate being east is the stated evidence for routing to the healthy fallback.
+    let overlay_path = operator::export_overlay_to_file(&east_ctx, FAILOVER_NETWORK, FAILOVER_GW, "default")?;
+    // Kill east operator before deploying consumer so context switches don't race.
     if let Some(c) = op_east_guard.0.take() {
         operator::kill_operator(c);
     }
+    let overlay_json = std::fs::read_to_string(&overlay_path)?;
+    let overlay = operator_overlay::parse_grid_config_json(&overlay_json)?;
+    consumer::deploy_consumer(&cfg, Some(&overlay_path))?;
+
+    let consumer_site = cfg
+        .clusters
+        .names
+        .iter()
+        .find(|n| {
+            cfg.clusters
+                .definitions
+                .get(*n)
+                .is_some_and(|d| d.role == ClusterRole::Consumer)
+        })
+        .map(String::as_str)
+        .ok_or("no consumer cluster in config")?;
+    let consumer_ctx = kind::kubectl_context(consumer_site);
+
+    let port = verify::find_free_port()?;
+    let mut pf = verify::PortForwardGuard::start(&consumer_ctx, "praxis-consumer", port, 8080)?;
+    if !verify::wait_for_port(port) {
+        pf.stop();
+        return Err("consumer gateway not reachable via port-forward after stale overlay deploy".into());
+    }
+
+    // Verify the shared model routes to a healthy backend (east, first shared-model candidate).
+    match consumer::send_consumer_request(port, FAILOVER_SHARED_MODEL) {
+        Ok(r) if r.status == 200 => {
+            // Check the response echoes the correct model field.
+            let model_field = serde_json::from_str::<serde_json::Value>(&r.body)
+                .ok()
+                .and_then(|j| j.get("model").and_then(serde_json::Value::as_str).map(String::from));
+            if model_field.as_deref() == Some(FAILOVER_SHARED_MODEL) {
+                eprintln!(
+                    "  [PASS] consumer: {FAILOVER_SHARED_MODEL:?} returns 200 \
+                     (response model field matches; first shared-model candidate = {east_site:?}, fresh=true)"
+                );
+            } else {
+                eprintln!(
+                    "  [PASS] consumer: {FAILOVER_SHARED_MODEL:?} returns 200 \
+                     (first shared-model candidate = {east_site:?}, fresh=true; response model={model_field:?})"
+                );
+            }
+        },
+        Ok(r) => {
+            pf.stop();
+            return Err(format!(
+                "consumer: {FAILOVER_SHARED_MODEL:?} returned {} (expected 200 after stale overlay deploy)",
+                r.status
+            )
+            .into());
+        },
+        Err(e) => {
+            pf.stop();
+            return Err(format!("consumer: {FAILOVER_SHARED_MODEL:?} request failed: {e}").into());
+        },
+    }
+    // Verify unknown model fails cleanly (port-forward still active).
+    match consumer::send_consumer_request(port, "nonexistent-model-xyz") {
+        Ok(r) if r.status == 404 || r.status == 503 => {
+            eprintln!("  [PASS] unknown model fails cleanly ({})", r.status);
+        },
+        Ok(r) => {
+            pf.stop();
+            return Err(format!("unknown model returned {} (expected 404 or 503)", r.status).into());
+        },
+        Err(e) => {
+            pf.stop();
+            return Err(format!("unknown model request failed: {e}").into());
+        },
+    }
+    pf.stop();
+
+    // The overlay used by the consumer (for reference in logs).
+    eprintln!(
+        "  [INFO] overlay used: {} candidates total; first for {FAILOVER_SHARED_MODEL:?} = {} (fresh=true)",
+        overlay.candidates.len(),
+        overlay
+            .candidates
+            .iter()
+            .find(|c| c.name == FAILOVER_SHARED_MODEL)
+            .map_or("(not found)", |c| c.cluster.as_str()),
+    );
+
+    // ── Step 8: Cleanup ───────────────────────────────────────────────────────
+    eprintln!("verify-failover-under-lost-peer: [8/8] cleanup...");
+    // East operator already killed before consumer deploy.
     operator::cleanup_failover_east_resources(&east_ctx)
         .unwrap_or_else(|e| eprintln!("  warning: east cleanup failed: {e}"));
     operator::cleanup_failover_west_resources(&west_ctx)
@@ -2826,7 +2980,8 @@ fn env_verify_failover_under_lost_peer(config: &Path) -> Result<(), Box<dyn std:
 
     eprintln!(
         "verify-failover-under-lost-peer: PASS - remote provider marked fresh=false \
-         after west operator killed; local provider remains fresh=true"
+         after west operator killed; east (fresh=true) is first shared-model candidate; \
+         consumer request returns 200 through healthy east candidate"
     );
     Ok(())
 }
@@ -2880,12 +3035,12 @@ fn verify_metrics_routing_phase(
     }
     eprintln!("  [PASS] consumer gateway reachable via port-forward");
 
-    // Shared model routes to the overlay-position-0 provider.
+    // Shared model routes to the first candidate for that model.
     match consumer::send_consumer_request(port, METRICS_ROUTING_MODEL) {
         Ok(r) if r.status == 200 => {
             eprintln!(
                 "  [PASS] {METRICS_ROUTING_MODEL:?} returns 200 \
-                 (attributed to {expected_first_site:?} - overlay position 0)"
+                 (attributed to {expected_first_site:?} - first candidate for model)"
             );
         },
         Ok(r) => {

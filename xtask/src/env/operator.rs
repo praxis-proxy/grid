@@ -346,6 +346,16 @@ pub(crate) const FAILOVER_LOCAL_MODEL: &str = "model-failover-local";
 /// Model name served by the remote west provider.
 pub(crate) const FAILOVER_REMOTE_MODEL: &str = "model-failover-remote";
 
+/// Shared model served by BOTH east (local, healthy fallback) and west (remote, stale after loss).
+///
+/// Used in the Packet 2 routing-away proof: before west dies both candidates are fresh=true;
+/// after west dies east (fresh=true, higher score) sorts before west (fresh=false) for this model,
+/// and a consumer request routes to the healthy east candidate.
+pub(crate) const FAILOVER_SHARED_MODEL: &str = "model-failover-shared";
+
+/// `InferenceProvider` name for the east healthy-fallback provider that serves `FAILOVER_SHARED_MODEL`.
+pub(crate) const FAILOVER_SHARED_EAST_PROVIDER: &str = "op-e2e-failover-shared-east";
+
 /// Time to wait after killing the west operator before triggering a reconcile.
 ///
 /// With `foca::Config::simple()` the probe period is 1.5 s and
@@ -3198,53 +3208,6 @@ pub(crate) fn apply_failover_east_fixtures(
     Ok(())
 }
 
-/// Apply west-cluster fixtures for the failover validation.
-///
-/// Creates `GridNetwork` [`FAILOVER_NETWORK`] with no `gatewayRefs` (the west
-/// operator participates in SWIM but does not generate an overlay) and
-/// `InferenceProvider` [`FAILOVER_WEST_PROVIDER`] with `backendKind: "remote"`.
-#[expect(clippy::too_many_lines, reason = "two JSON manifests with full K8s structure")]
-pub(crate) fn apply_failover_west_fixtures(
-    context: &str,
-    west_site: &str,
-    model: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let network = serde_json::to_string_pretty(&serde_json::json!({
-        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
-        "kind": "GridNetwork",
-        "metadata": { "name": FAILOVER_NETWORK },
-        "spec": { "seeds": [] }
-    }))
-    .unwrap_or_else(|e| {
-        eprintln!("failover west GridNetwork serialization failed: {e}");
-        std::process::exit(1);
-    });
-    let provider = serde_json::to_string_pretty(&serde_json::json!({
-        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
-        "kind": "InferenceProvider",
-        "metadata": { "name": FAILOVER_WEST_PROVIDER },
-        "spec": {
-            "gridNetworkRef": FAILOVER_NETWORK,
-            "providerKind": "self_hosted",
-            "backendKind": "remote",
-            "endpoint": "http://mock-openai-provider.default.svc:8080",
-            "models": [{ "name": model }],
-            "routingClusterRef": west_site
-        }
-    }))
-    .unwrap_or_else(|e| {
-        eprintln!("failover west provider serialization failed: {e}");
-        std::process::exit(1);
-    });
-    apply_manifest(context, &network)?;
-    apply_manifest(context, &provider)?;
-    eprintln!(
-        "  [OK] failover west fixtures applied \
-         ({FAILOVER_WEST_PROVIDER}, model={model:?}, routingClusterRef={west_site:?})"
-    );
-    Ok(())
-}
-
 /// Poll the overlay until the candidate for `remote_cluster` has `fresh=false`.
 ///
 /// This proves that the grid-network controller's `apply_swim_staleness_override` fired
@@ -3341,6 +3304,181 @@ pub(crate) fn verify_failover_overlay(
     Ok(())
 }
 
+/// Apply the east healthy-fallback `InferenceProvider` for the shared model.
+///
+/// This provider serves [`FAILOVER_SHARED_MODEL`] from the east cluster as a
+/// `backendKind: "local"` provider.  It is the healthy alternative that should
+/// rank first among shared-model candidates after west is lost, proving request-level route-away.
+pub(crate) fn apply_failover_shared_east_provider(
+    context: &str,
+    east_site: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let manifest = serde_json::to_string_pretty(&serde_json::json!({
+        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "kind": "InferenceProvider",
+        "metadata": { "name": FAILOVER_SHARED_EAST_PROVIDER },
+        "spec": {
+            "gridNetworkRef": FAILOVER_NETWORK,
+            "providerKind": "self_hosted",
+            "backendKind": "local",
+            "endpoint": "http://mock-openai-provider.default.svc:8080",
+            "models": [{ "name": FAILOVER_SHARED_MODEL }],
+            "routingClusterRef": east_site
+        }
+    }))
+    .unwrap_or_else(|e| {
+        eprintln!("failover shared-east provider serialization failed: {e}");
+        std::process::exit(1);
+    });
+    apply_manifest(context, &manifest)?;
+    eprintln!(
+        "  [OK] {FAILOVER_SHARED_EAST_PROVIDER:?} applied \
+         (backendKind=local, model={FAILOVER_SHARED_MODEL:?}, routingClusterRef={east_site:?})"
+    );
+    Ok(())
+}
+
+/// Apply west fixtures that include both the dedicated remote model and the shared model.
+///
+/// The west CRDT provider publishes both [`FAILOVER_REMOTE_MODEL`] and
+/// [`FAILOVER_SHARED_MODEL`], allowing the east overlay to contain a remote stale
+/// candidate for the shared model after west is lost.
+#[expect(clippy::too_many_lines, reason = "two JSON manifests with full K8s structure")]
+pub(crate) fn apply_failover_west_fixtures_with_shared(
+    context: &str,
+    west_site: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let network = serde_json::to_string_pretty(&serde_json::json!({
+        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "kind": "GridNetwork",
+        "metadata": { "name": FAILOVER_NETWORK },
+        "spec": { "seeds": [] }
+    }))
+    .unwrap_or_else(|e| {
+        eprintln!("failover west GridNetwork (with-shared) serialization failed: {e}");
+        std::process::exit(1);
+    });
+    let provider = serde_json::to_string_pretty(&serde_json::json!({
+        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "kind": "InferenceProvider",
+        "metadata": { "name": FAILOVER_WEST_PROVIDER },
+        "spec": {
+            "gridNetworkRef": FAILOVER_NETWORK,
+            "providerKind": "self_hosted",
+            "backendKind": "remote",
+            "endpoint": "http://mock-openai-provider.default.svc:8080",
+            "models": [
+                { "name": FAILOVER_REMOTE_MODEL },
+                { "name": FAILOVER_SHARED_MODEL }
+            ],
+            "routingClusterRef": west_site
+        }
+    }))
+    .unwrap_or_else(|e| {
+        eprintln!("failover west provider (with-shared) serialization failed: {e}");
+        std::process::exit(1);
+    });
+    apply_manifest(context, &network)?;
+    apply_manifest(context, &provider)?;
+    eprintln!(
+        "  [OK] failover west fixtures (with-shared) applied \
+         ({FAILOVER_WEST_PROVIDER}, models=[{FAILOVER_REMOTE_MODEL:?}, {FAILOVER_SHARED_MODEL:?}], \
+         routingClusterRef={west_site:?})"
+    );
+    Ok(())
+}
+
+/// Assert the shared-model overlay ordering: local (east, fresh=true) before remote (west, stale).
+///
+/// When `expect_west_stale = false` (before partition): both candidates fresh=true, east first.
+/// When `expect_west_stale = true` (after partition): west is fresh=false, east still first.
+///
+/// Attribution is overlay-based: the same mock backend echoes the model name in both cases,
+/// so response body cannot distinguish east from west.  The shared-model ordering proof
+/// (east first among candidates for that model) is the stated evidence for routing preference.
+#[expect(
+    clippy::too_many_lines,
+    reason = "two candidate position lookups with diagnostic messages"
+)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "six distinct check parameters: context, network, gw, two clusters, stale flag"
+)]
+pub(crate) fn verify_shared_model_overlay_ordering(
+    context: &str,
+    network: &str,
+    gw: &str,
+    east_cluster: &str,
+    west_cluster: &str,
+    expect_west_stale: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let overlay = read_overlay_configmap(context, network, gw, "default")?;
+    let candidates = overlay
+        .get("candidates")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("overlay missing candidates array")?;
+
+    // Find east and west positions for the shared model.
+    let east_pos = candidates
+        .iter()
+        .position(|c| {
+            c.get("cluster").and_then(serde_json::Value::as_str) == Some(east_cluster)
+                && c.get("name").and_then(serde_json::Value::as_str) == Some(FAILOVER_SHARED_MODEL)
+        })
+        .ok_or_else(|| format!("east shared-model candidate ({east_cluster:?}) not found in overlay"))?;
+
+    let west_pos = candidates
+        .iter()
+        .position(|c| {
+            c.get("cluster").and_then(serde_json::Value::as_str) == Some(west_cluster)
+                && c.get("name").and_then(serde_json::Value::as_str) == Some(FAILOVER_SHARED_MODEL)
+        })
+        .ok_or_else(|| format!("west shared-model candidate ({west_cluster:?}) not found in overlay"))?;
+
+    if east_pos >= west_pos {
+        return Err(format!(
+            "shared model overlay ordering wrong: east ({east_cluster:?}, pos {east_pos}) \
+             must appear before west ({west_cluster:?}, pos {west_pos})"
+        )
+        .into());
+    }
+
+    let east_fresh = candidates
+        .get(east_pos)
+        .and_then(|c| c.get("fresh"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let west_fresh = candidates
+        .get(west_pos)
+        .and_then(|c| c.get("fresh"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
+
+    if !east_fresh {
+        return Err(
+            format!("east candidate ({east_cluster:?}) for {FAILOVER_SHARED_MODEL:?} must be fresh=true").into(),
+        );
+    }
+    if expect_west_stale && west_fresh {
+        return Err(format!(
+            "west candidate ({west_cluster:?}) for {FAILOVER_SHARED_MODEL:?} must be fresh=false \
+             after partition"
+        )
+        .into());
+    }
+
+    let stale_tag = if expect_west_stale {
+        "fresh=false (stale)"
+    } else {
+        "fresh=true"
+    };
+    eprintln!(
+        "  [PASS] shared model {FAILOVER_SHARED_MODEL:?}: east ({east_cluster:?}) \
+         pos={east_pos} fresh=true → west ({west_cluster:?}) pos={west_pos} {stale_tag}"
+    );
+    Ok(())
+}
+
 /// Delete all east-cluster resources created by the failover validation.
 pub(crate) fn cleanup_failover_east_resources(context: &str) -> Result<(), Box<dyn std::error::Error>> {
     delete_namespaced_resource(
@@ -3350,6 +3488,7 @@ pub(crate) fn cleanup_failover_east_resources(context: &str) -> Result<(), Box<d
         &format!("grid-overlay-{FAILOVER_NETWORK}-{FAILOVER_GW}"),
     )?;
     delete_cluster_resource(context, "inferenceprovider", FAILOVER_EAST_PROVIDER)?;
+    delete_cluster_resource(context, "inferenceprovider", FAILOVER_SHARED_EAST_PROVIDER)?;
     delete_cluster_resource(context, "gridnetwork", FAILOVER_NETWORK)?;
     eprintln!("  [OK] stale failover east resources removed from {context}");
     Ok(())

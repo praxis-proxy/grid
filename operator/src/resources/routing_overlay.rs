@@ -594,9 +594,15 @@ pub fn render_routing_overlay(
     candidates.sort_by(|a, b| {
         let score_a = ordering.get(a.cluster.as_str()).copied().unwrap_or(DEFAULT_LOCALITY);
         let score_b = ordering.get(b.cluster.as_str()).copied().unwrap_or(DEFAULT_LOCALITY);
-        // Higher score first (descending), then stable alphabetical tiebreak.
+        // Primary: higher score first (descending).
+        // Secondary: fresh=true (1) before fresh=false (0) among equal-scored candidates.
+        //   This ensures healthy candidates are preferred over stale ones when scoring
+        //   does not already distinguish them — e.g. two remote providers with identical
+        //   locality, metrics, and cost but one degraded by SWIM staleness override.
+        // Tertiary: stable alphabetical tiebreak.
         score_b
             .total_cmp(&score_a)
+            .then(b.fresh.cmp(&a.fresh))
             .then(a.site.cmp(&b.site))
             .then(a.name.cmp(&b.name))
             .then(a.cluster.cmp(&b.cluster))
@@ -2155,6 +2161,110 @@ mod tests {
         assert!(
             overlay.candidates.iter().all(|c| !c.fresh),
             "every (model, site) candidate from a Degraded provider must have fresh=false"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Stale-candidate ordering — fresh=true before fresh=false
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn fresh_true_sorts_before_fresh_false_same_score_same_model() {
+        // Two providers with the same backend kind (equal locality score, no metrics)
+        // serving the same model — one healthy (Available), one stale (Degraded).
+        // The fresh=true candidate must appear before the fresh=false one.
+        let network = test_network("net");
+        // test_provider uses backendKind=local for both → equal locality scores.
+        // Stale provider is given Degraded status so is_candidate_fresh returns false.
+        let healthy = test_provider("healthy-prov", "net", &["shared-model"]);
+        let stale = test_provider_with_phase("stale-prov", "net", &["shared-model"], "Degraded");
+        let overlay = render_routing_overlay(&network, &[], &[stale, healthy], &[], "test-site", None)
+            .unwrap_or_else(|_| std::process::abort());
+
+        assert_eq!(overlay.candidates.len(), 2, "both candidates must be present");
+        let first = overlay.candidates.first().unwrap_or_else(|| std::process::abort());
+        let second = overlay.candidates.get(1).unwrap_or_else(|| std::process::abort());
+        assert!(
+            first.fresh,
+            "fresh=true candidate must sort before fresh=false when scores are equal; \
+             got first={:?} fresh={}",
+            first.cluster, first.fresh
+        );
+        assert!(
+            !second.fresh,
+            "fresh=false candidate must be second; got second={:?} fresh={}",
+            second.cluster, second.fresh
+        );
+    }
+
+    #[test]
+    fn stale_candidate_retained_not_excluded_by_sort() {
+        // Degraded provider (fresh=false) must remain in the overlay — it is kept for
+        // observability and as a last-resort fallback when no healthy alternative exists.
+        let network = test_network("net");
+        let stale = test_provider_with_phase("stale-prov", "net", &["model-x"], "Degraded");
+        let overlay = render_routing_overlay(&network, &[], &[stale], &[], "test-site", None)
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(overlay.candidates.len(), 1, "stale candidate must not be dropped");
+        assert!(
+            overlay.candidates.first().is_some_and(|c| !c.fresh),
+            "retained stale candidate must have fresh=false"
+        );
+    }
+
+    #[test]
+    fn healthy_local_sorts_before_stale_crdt_remote_same_model() {
+        // Local provider (fresh=true, backendKind=local, high locality score) vs stale
+        // CRDT remote (fresh=false, lower locality score).  Local must appear first
+        // due to higher score; freshness tiebreaker reinforces this for equal-score edge cases.
+        let network = test_network("net");
+        let local_healthy = test_provider("local-prov", "net", &["shared-model"]);
+        let remote_stale = make_crdt_provider(
+            "remote-site",
+            "remote-cluster",
+            crdt::ProviderPhase::Degraded,
+            &["shared-model"],
+        );
+        let overlay = render_routing_overlay(&network, &[], &[local_healthy], &[remote_stale], "test-site", None)
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(overlay.candidates.len(), 2, "both local and remote candidates present");
+        let first = overlay.candidates.first().unwrap_or_else(|| std::process::abort());
+        assert_eq!(first.cluster, "local-prov", "local provider must rank first");
+        assert!(first.fresh, "first candidate (local) must be fresh=true");
+        let second = overlay.candidates.get(1).unwrap_or_else(|| std::process::abort());
+        assert!(!second.fresh, "stale remote must be second with fresh=false");
+    }
+
+    #[test]
+    fn stale_fresh_sort_order_input_order_independent() {
+        // Ordering must be deterministic regardless of input order.
+        // Stale candidate submitted first → healthy candidate still wins.
+        let network = test_network("net");
+        let healthy = test_provider("healthy-prov", "net", &["shared-model"]);
+        let stale = test_provider_with_phase("stale-prov", "net", &["shared-model"], "Degraded");
+        // Submit stale first, then healthy.
+        let overlay_stale_first =
+            render_routing_overlay(&network, &[], &[stale.clone(), healthy.clone()], &[], "test-site", None)
+                .unwrap_or_else(|_| std::process::abort());
+        // Submit healthy first, then stale.
+        let overlay_healthy_first = render_routing_overlay(&network, &[], &[healthy, stale], &[], "test-site", None)
+            .unwrap_or_else(|_| std::process::abort());
+
+        let first_stale_first = overlay_stale_first
+            .candidates
+            .first()
+            .unwrap_or_else(|| std::process::abort());
+        let first_healthy_first = overlay_healthy_first
+            .candidates
+            .first()
+            .unwrap_or_else(|| std::process::abort());
+        assert!(
+            first_stale_first.fresh,
+            "healthy candidate must win regardless of input order (stale submitted first)"
+        );
+        assert_eq!(
+            first_stale_first.cluster, first_healthy_first.cluster,
+            "overlay first candidate must be identical regardless of input order"
         );
     }
 
