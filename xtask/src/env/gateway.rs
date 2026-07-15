@@ -4,8 +4,9 @@
 //! then verifies the provider backend request path through the gateway.
 //!
 //! Provider gateways terminate mTLS: they require a client certificate
-//! signed by the generated test CA and run `grid_ingress_trust` to validate the
-//! peer organization before allowing requests into the `ext_proc` path.
+//! signed by the generated test CA. Once the Praxis image includes
+//! `peer_identity_trust`, provider gateways should also validate the captured
+//! downstream peer identity before allowing requests into the `ext_proc` path.
 
 use std::{path::PathBuf, process::Command};
 
@@ -351,13 +352,21 @@ fn apply_gateway_config(context: &str, _def: &ClusterDef) -> Result<(), Box<dyn 
 /// Provider gateway Praxis config.
 ///
 /// Listener terminates mTLS: requires client certs signed by the generated test CA.
-/// `grid_ingress_trust` enforces `organization: ai-grid` at the filter level,
-/// matched against the X.509 O= field set by `certs::generate_site_cert`.
+/// The TLS layer verifies CA trust only; it does not enforce the certificate
+/// organization. Organization/digest/serial policy belongs in
+/// `peer_identity_trust` once the Praxis image includes that filter.
 ///
-/// The `ext_proc` filter uses `StreamBuffer` body mode. The fix in
-/// `context.rs` (cloning `peer_identity` instead of taking it) ensures
-/// `grid_ingress_trust` sees the peer identity even when `pre_read_body`
-/// runs first. SAN/SPIFFE matching remains future work.
+/// NOTE: `peer_identity_trust` (filter-level peer identity enforcement) is
+/// intentionally omitted here until the AI/Praxis image used by the Kind
+/// environment includes the filter. When the Praxis pin/image is bumped, re-add:
+///
+/// ```text
+/// - filter: peer_identity_trust
+///   trusted_peers:
+///     - organization: ai-grid
+/// ```
+///
+/// The `ext_proc` filter uses `StreamBuffer` body mode.
 #[expect(clippy::too_many_lines, reason = "provider Praxis config YAML generation")]
 fn provider_gateway_config() -> String {
     format!(
@@ -377,9 +386,6 @@ fn provider_gateway_config() -> String {
          filter_chains:\n\
          \x20 - name: provider-chain\n\
          \x20   filters:\n\
-         \x20     - filter: grid_ingress_trust\n\
-         \x20       trusted_peers:\n\
-         \x20         - organization: ai-grid\n\
          \x20     - filter: ext_proc\n\
          \x20       target: \"http://{MOCK_EPP_NAME}:{MOCK_EPP_PORT}\"\n\
          \x20       processing_mode:\n\

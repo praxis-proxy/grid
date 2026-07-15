@@ -177,10 +177,11 @@ an unrelated backend.
 
 ## Provider gateway trust
 
-Provider gateways terminate mTLS and run `grid_ingress_trust` before forwarding
-traffic to local inference infrastructure. The filter checks the verified peer
-identity from the downstream client certificate and rejects untrusted peers with
-HTTP 403.
+Provider gateways terminate mTLS before forwarding traffic to local inference
+infrastructure. Once the AI/Praxis image includes `peer_identity_trust`, provider
+gateways also run that filter before local handoff. The filter checks the
+verified peer identity from the downstream client certificate and rejects
+untrusted peers with HTTP 403.
 
 The current development trust policy matches the peer certificate organization.
 Production policies should prefer stronger identity binding such as certificate

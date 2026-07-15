@@ -817,9 +817,16 @@ fn env_verify_api_fallback(config: &Path, site: Option<&str>) -> Result<(), Box<
     let overlay_json = std::fs::read_to_string(&overlay_path)?;
     let overlay = operator_overlay::parse_grid_config_json(&overlay_json)?;
 
-    // Read the credential from the provider's referenced Secret.
-    // This proves the InferenceProvider spec.auth.secretRef → Secret → Praxis config flow.
-    let api_token = operator::read_provider_api_credential(&context, TEST_PROVIDER_API)?;
+    // Read the credential reference from the operator-projected overlay.
+    // The operator embeds a SecretRef (name/namespace/key) in the overlay candidate;
+    // the xtask resolves the token from that Secret — this is the harness bridge.
+    // In production, Praxis will consume the credential reference natively.
+    let cred_plan = operator::api_credential_plan_from_overlay(&overlay, TEST_PROVIDER_API).ok_or(
+        "no bearer-token credential reference found in overlay; \
+         verify InferenceProvider spec.auth.secretRef is set and operator reconciled",
+    )?;
+    let api_token = operator::resolve_api_credential(&context, &cred_plan)?
+        .ok_or("credential plan resolved to no token (manual or absent auth)")?;
 
     consumer::deploy_consumer_for_api_fallback(&cfg, &overlay, TEST_PROVIDER_API, &api_provider_endpoint, &api_token)?;
 
@@ -2065,9 +2072,14 @@ fn env_verify_full_grid_routing(config: &Path) -> Result<(), Box<dyn std::error:
     let overlay_json = std::fs::read_to_string(&overlay_path)?;
     let overlay = operator_overlay::parse_grid_config_json(&overlay_json)?;
 
-    // Read credential from the provider's referenced Secret — proves the
-    // InferenceProvider spec.auth.secretRef → Secret → Praxis config flow.
-    let api_token = operator::read_provider_api_credential(&east_ctx, FULL_GRID_PROVIDER_API)?;
+    // Read the credential reference from the operator-projected overlay.
+    // The xtask resolves the token from that Secret as the local harness bridge.
+    let cred_plan = operator::api_credential_plan_from_overlay(&overlay, FULL_GRID_PROVIDER_API).ok_or(
+        "no bearer-token credential reference found in full-grid overlay; \
+         verify InferenceProvider spec.auth.secretRef is set and operator reconciled",
+    )?;
+    let api_token = operator::resolve_api_credential(&east_ctx, &cred_plan)?
+        .ok_or("credential plan resolved to no token (manual or absent auth)")?;
 
     consumer::deploy_consumer_for_full_grid(
         &cfg,

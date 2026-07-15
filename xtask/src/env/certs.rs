@@ -17,7 +17,7 @@ const CA_CN: &str = "AI Grid Test CA";
 /// Organization used in the wrong-org negative trust test.
 ///
 /// A cert signed by the generated test CA with this org is used to prove
-/// that `grid_ingress_trust` enforces organization matching at the filter
+/// that `peer_identity_trust` enforces organization matching at the filter
 /// layer (TLS handshake succeeds; filter rejects with HTTP 403).
 pub(crate) const WRONG_ORG: &str = "not-ai-grid";
 

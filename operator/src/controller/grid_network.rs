@@ -62,6 +62,17 @@ const REQUEUE_INTERVAL: Duration = Duration::from_secs(300);
 /// Field manager name for server-side apply.
 const FIELD_MANAGER: &str = "grid-operator";
 
+/// Label key that opts a `GridNetwork` into automatic `GridSite` discovery.
+///
+/// When this label is present with value `"true"`, the `GridNetwork` controller
+/// creates `GridSite` resources for remote Alive SWIM members automatically.
+/// Networks without this label are unaffected — their overlay generation uses
+/// the existing `routingClusterRef`-based (Phase 1) fallback.
+///
+/// This opt-in gate prevents auto-discovery from changing the overlay generation
+/// semantics for networks that were not designed with it in mind.
+pub const LABEL_AUTO_DISCOVER_SITES: &str = "grid.praxis-proxy.io/auto-discover-sites";
+
 // ---------------------------------------------------------------------------
 // Cross-resource watch mappers
 // ---------------------------------------------------------------------------
@@ -173,9 +184,16 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
     .await?;
 
     // Auto-create or update GridSite records for remote Alive SWIM members.
-    // Phase 1: creates a GridSite with phase=Discovered from SWIM Alive membership.
-    // Phase 2 will add mTLS cert exchange, capability negotiation, and Active transition.
-    if let (Some(swim), Some(snapshot)) = (ctx.swim.as_ref(), membership.as_ref()) {
+    // Only runs when the GridNetwork explicitly opts in via LABEL_AUTO_DISCOVER_SITES.
+    // This gate prevents auto-discovery from changing overlay generation semantics
+    // for networks that use the existing routingClusterRef-based (Phase 1) path.
+    let auto_discover_enabled = network
+        .metadata
+        .labels
+        .as_ref()
+        .and_then(|l| l.get(LABEL_AUTO_DISCOVER_SITES))
+        .is_some_and(|v| v == "true");
+    if auto_discover_enabled && let (Some(swim), Some(snapshot)) = (ctx.swim.as_ref(), membership.as_ref()) {
         reconcile_discovered_sites(name, swim.site_name(), snapshot, client).await?;
     }
 

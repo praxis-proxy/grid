@@ -9,7 +9,7 @@ use rcgen::{
 
 /// X.509 organization set on all generated site certificates.
 ///
-/// Used by the Praxis `grid_ingress_trust` filter to match
+/// Used by the Praxis `peer_identity_trust` filter to match
 /// verified peer identity via the `organization` field.
 /// Production deployments should use cert digest pinning or
 /// SAN/SPIFFE identity instead.
@@ -113,7 +113,7 @@ pub struct SiteCertOutput {
 /// The certificate includes DNS SANs for the site name
 /// (e.g., `cluster-a.grid.internal`) and sets X.509
 /// `OrganizationName` to [`DEFAULT_ORGANIZATION`] so the
-/// Praxis `grid_ingress_trust` filter can match on it.
+/// Praxis `peer_identity_trust` filter can match on it.
 ///
 /// # Errors
 ///
@@ -138,7 +138,7 @@ pub fn generate_site_cert(ca: &CaCert, site_name: &str) -> Result<SiteCertOutput
 ///
 /// Identical to [`generate_site_cert`] except `OrganizationName` is set to
 /// `org` rather than [`DEFAULT_ORGANIZATION`]. Use this to create test certs
-/// that will fail `grid_ingress_trust` org matching despite being signed by
+/// that will fail `peer_identity_trust` org matching despite being signed by
 /// the same trusted CA (TLS handshake succeeds; filter rejects).
 ///
 /// # Errors

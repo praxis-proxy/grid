@@ -88,6 +88,7 @@ mod tests {
                     site: site.to_owned(),
                     cluster: cluster.to_owned(),
                     fresh: true,
+                    credential: None,
                 })
                 .collect(),
         }

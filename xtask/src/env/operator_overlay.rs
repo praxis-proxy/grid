@@ -58,6 +58,35 @@ pub(crate) struct RoutingOverlay {
     pub(crate) candidates: Vec<RoutingCandidate>,
 }
 
+/// A reference to a Kubernetes Secret holding a credential value.
+///
+/// Mirrors `operator::resources::routing_overlay::ProjectedCredentialRef`.
+/// Contains only the Secret locating information — never the token value.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ProjectedCredentialRef {
+    /// Kubernetes Secret name.
+    pub(crate) name: String,
+    /// Kubernetes namespace containing the Secret.
+    pub(crate) namespace: String,
+    /// Key within `Secret.data` that holds the credential bytes.
+    pub(crate) key: String,
+}
+
+/// A credential reference projected by the operator alongside a routing candidate.
+///
+/// Mirrors `operator::resources::routing_overlay::ProjectedCredential`.
+/// The xtask resolves the actual token from the referenced Secret via
+/// [`super::operator::resolve_api_credential`].
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ProjectedCredential {
+    /// Authentication strategy (e.g. `"bearer_token"`).
+    pub(crate) strategy: String,
+    /// Reference to the Kubernetes Secret holding the credential.
+    pub(crate) secret_ref: ProjectedCredentialRef,
+}
+
 /// A single routing candidate from the routing overlay.
 #[derive(Clone, Debug, Deserialize)]
 pub(crate) struct RoutingCandidate {
@@ -79,6 +108,14 @@ pub(crate) struct RoutingCandidate {
 
     /// Whether this candidate's metrics data is considered fresh.
     pub(crate) fresh: bool,
+
+    /// Credential reference projected by the operator, if any.
+    ///
+    /// Present when the provider's `spec.auth` declares a `bearer_token` strategy.
+    /// Absent (`None`) for no-auth, manual, or unsupported-strategy providers.
+    /// The xtask uses this to resolve the token from the referenced Secret.
+    #[serde(default)]
+    pub(crate) credential: Option<ProjectedCredential>,
 }
 
 // ---------------------------------------------------------------------------

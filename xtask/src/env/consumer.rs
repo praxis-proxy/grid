@@ -617,10 +617,6 @@ fn consumer_gateway_config(
     };
     let local_site = consumer_site;
     let clusters = build_clusters(providers);
-    let fallback = providers
-        .first()
-        .map_or_else(|| std::process::abort(), |ep| format!("gateway-{}", ep.site));
-
     format!(
         "listeners:\n\
          \x20 - name: public\n\
@@ -638,10 +634,6 @@ fn consumer_gateway_config(
          \x20       model_header: X-Model\n\
          \x20       candidates:\n\
          {candidates}\n\
-         \x20     - filter: router\n\
-         \x20       routes:\n\
-         \x20         - path_prefix: \"/\"\n\
-         \x20           cluster: {fallback}\n\
          \x20     - filter: load_balancer\n\
          \x20       clusters:\n\
          {clusters}\n\
@@ -807,9 +799,6 @@ fn build_api_fallback_consumer_config(
     let candidates = operator_overlay::candidates_yaml(overlay);
     let local_site = consumer_site;
     let mtls_clusters = build_clusters(local_providers);
-    let fallback = local_providers
-        .first()
-        .map_or_else(|| std::process::abort(), |ep| format!("gateway-{}", ep.site));
     let api_cluster_yaml = format!(
         r#"         - name: gateway-{api_cluster_name}
            endpoints:
@@ -837,10 +826,6 @@ filter_chains:
         request_set:
           - name: "Authorization"
             value: "Bearer {api_provider_token}"
-      - filter: router
-        routes:
-          - path_prefix: "/"
-            cluster: {fallback}
       - filter: load_balancer
         clusters:
 {mtls_clusters}
@@ -953,9 +938,6 @@ fn build_full_grid_consumer_config(
     let candidates = operator_overlay::candidates_yaml(overlay);
     let local_site = consumer_site;
     let mtls_clusters = build_clusters(mtls_providers);
-    let fallback = mtls_providers
-        .first()
-        .map_or_else(|| std::process::abort(), |ep| format!("gateway-{}", ep.site));
     // Plain-HTTP clusters for cloud-managed and api-provider mocks.
     // Cloud APIs use HTTPS in production; the kind mocks use plain HTTP for simplicity.
     let cloud_cluster_yaml = format!(
@@ -990,10 +972,6 @@ filter_chains:
         request_set:
           - name: "Authorization"
             value: "Bearer {api_provider_token}"
-      - filter: router
-        routes:
-          - path_prefix: "/"
-            cluster: {fallback}
       - filter: load_balancer
         clusters:
 {mtls_clusters}

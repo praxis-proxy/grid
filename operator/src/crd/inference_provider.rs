@@ -218,6 +218,18 @@ pub struct InferenceProviderStatus {
     /// Current phase.
     #[serde(default)]
     pub phase: ProviderPhase,
+
+    /// Machine-readable reason for the current phase when not `Available`.
+    ///
+    /// Set when the provider cannot reach `Available` due to a configuration
+    /// or credential error.  `None` when the provider is `Available`, `Pending`,
+    /// or the reason is unknown.
+    ///
+    /// Stable reason values: `UnsupportedAuthStrategy`, `CredentialSecretRefInvalid`,
+    /// `CredentialSecretMissing`, `CredentialSecretKeyMissing`,
+    /// `CredentialSecretValueInvalid`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// Lifecycle phase of a provider resource.

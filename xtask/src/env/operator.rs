@@ -406,6 +406,8 @@ pub(crate) fn cleanup_validation_resources(context: &str) -> Result<(), Box<dyn 
     delete_cluster_resource(context, "inferenceprovider", TEST_METRICS_IDLE_PROVIDER)?;
     delete_cluster_resource(context, "inferenceprovider", TEST_METRICS_BUSY_PROVIDER)?;
     delete_cluster_resource(context, "gridnetwork", TEST_NETWORK)?;
+    // Remove auto-discovered GridSites created during previous validation runs.
+    cleanup_auto_discovered_gridsites_for_network(context, TEST_NETWORK);
     eprintln!("  [OK] stale validation resources removed");
     Ok(())
 }
@@ -730,6 +732,8 @@ pub(crate) fn apply_swim_test_provider(context: &str) -> Result<(), Box<dyn std:
 pub(crate) fn cleanup_swim_test_resources(context: &str) -> Result<(), Box<dyn std::error::Error>> {
     delete_cluster_resource(context, "inferenceprovider", SWIM_TEST_PROVIDER)?;
     delete_cluster_resource(context, "gridnetwork", SWIM_TEST_NETWORK)?;
+    // Remove auto-discovered GridSites created by reconcile_discovered_sites during SWIM tests.
+    cleanup_auto_discovered_gridsites_for_network(context, SWIM_TEST_NETWORK);
     eprintln!("  [OK] stale SWIM test resources removed");
     Ok(())
 }
@@ -2126,6 +2130,7 @@ pub(crate) fn cleanup_swim_overlay_test_resources(context: &str) -> Result<(), B
     )?;
     delete_cluster_resource(context, "inferenceprovider", SWIM_OVERLAY_PROVIDER)?;
     delete_cluster_resource(context, "gridnetwork", SWIM_OVERLAY_NETWORK)?;
+    cleanup_auto_discovered_gridsites_for_network(context, SWIM_OVERLAY_NETWORK);
     eprintln!("  [OK] stale SWIM overlay test resources removed");
     Ok(())
 }
@@ -2323,8 +2328,32 @@ pub(crate) fn cleanup_swim_routing_resources(context: &str) -> Result<(), Box<dy
     delete_cluster_resource(context, "inferenceprovider", SWIM_ROUTING_EAST_PROVIDER)?;
     delete_cluster_resource(context, "inferenceprovider", SWIM_ROUTING_WEST_PROVIDER)?;
     delete_cluster_resource(context, "gridnetwork", SWIM_ROUTING_NETWORK)?;
+    // Also delete any auto-discovered GridSites for this network.
+    // These are created by reconcile_discovered_sites when the network has the opt-in
+    // label; cleanup must remove them even if the label was later removed or the test
+    // runs mixed between opt-in and non-opt-in states.
+    cleanup_auto_discovered_gridsites_for_network(context, SWIM_ROUTING_NETWORK);
     eprintln!("  [OK] stale SWIM routing test resources removed on {context}");
     Ok(())
+}
+
+/// Delete all `GridSite` resources whose `spec.gridNetworkRef` matches `network_name`.
+///
+/// Used during cleanup to remove auto-discovered `GridSite` records that were created
+/// by `reconcile_discovered_sites` when the network had the opt-in label.  Deletion is
+/// best-effort; individual failures are logged but do not abort the cleanup.
+pub(crate) fn cleanup_auto_discovered_gridsites_for_network(context: &str, network_name: &str) {
+    let names = list_gridsites_for_network(context, network_name).unwrap_or_default();
+    for name in &names {
+        delete_cluster_resource(context, "gridsite", name)
+            .unwrap_or_else(|e| eprintln!("  note: failed to delete GridSite {name:?}: {e}"));
+    }
+    if !names.is_empty() {
+        eprintln!(
+            "  [OK] deleted {} auto-discovered GridSite(s) for network {network_name:?}",
+            names.len()
+        );
+    }
 }
 
 /// Verify that `degraded_cluster` appears in overlay candidates with `fresh: false`.
@@ -2648,7 +2677,12 @@ pub(crate) fn apply_site_join_network(context: &str, local_site_name: &str) -> R
     let manifest = serde_json::to_string_pretty(&serde_json::json!({
         "apiVersion": "grid.praxis-proxy.io/v1alpha1",
         "kind": "GridNetwork",
-        "metadata": { "name": SITE_JOIN_NETWORK },
+        "metadata": {
+            "name": SITE_JOIN_NETWORK,
+            // Opt-in label: enables automatic GridSite discovery for Alive SWIM members.
+            // Only networks with this label run reconcile_discovered_sites in the controller.
+            "labels": { "grid.praxis-proxy.io/auto-discover-sites": "true" }
+        },
         "spec": {
             "seeds": [],
             "gatewayRefs": [{
@@ -3669,14 +3703,28 @@ pub(crate) fn cleanup_failover_west_resources(context: &str) -> Result<(), Box<d
 
 /// Parsed credential plan derived from `InferenceProvider.spec.auth` JSON.
 ///
-/// A pure data type produced by [`parse_api_credential_plan`]; no kubectl calls.
-/// The xtask validation path uses this to decide whether and how to inject a
-/// bearer token into the consumer Praxis config.
+/// A pure data type used by the xtask credential path; no kubectl calls.
+/// Produced by `parse_api_credential_plan` (test-only) or by
+/// [`api_credential_plan_from_overlay`] (production path).
 #[derive(Debug, PartialEq)]
 pub(crate) enum ApiCredentialPlan {
     /// `auth.manual = true` — the user manages credentials; the harness does not inject.
+    ///
+    /// Constructed by `parse_api_credential_plan` (test-only); kept as a
+    /// valid arm in [`resolve_api_credential`] for defensive completeness.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "constructed only by test-only parse_api_credential_plan")
+    )]
     Manual,
     /// `spec.auth` is absent — no credential injection.
+    ///
+    /// Constructed by `parse_api_credential_plan` (test-only); kept as a
+    /// valid arm in [`resolve_api_credential`] for defensive completeness.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "constructed only by test-only parse_api_credential_plan")
+    )]
     Absent,
     /// `auth.strategy = bearer_token` with a resolved `SecretRef`.
     BearerToken {
@@ -3704,6 +3752,7 @@ pub(crate) enum ApiCredentialPlan {
 /// | `false` | `bearer_token` | present | `Ok(BearerToken { … })` |
 /// | `false` | `bearer_token` | absent | `Err("missing secretRef")` |
 /// | `false` | other | any | `Err("unsupported strategy …")` |
+#[cfg(test)]
 #[expect(
     clippy::too_many_lines,
     reason = "match table with diagnostic messages for each auth variant"
@@ -3889,82 +3938,35 @@ pub(crate) fn resolve_api_credential(
     }
 }
 
-/// Read and resolve the bearer token for a named `InferenceProvider`.
+/// Extract a bearer-token [`ApiCredentialPlan`] for a cluster from an operator-produced overlay.
 ///
-/// Reads `InferenceProvider.spec.auth` from Kubernetes, parses it into an
-/// [`ApiCredentialPlan`] via [`parse_api_credential_plan`], then calls
-/// [`resolve_api_credential`] to fetch the actual credential.
+/// Scans the overlay candidates for a credential reference with
+/// `strategy = "bearer_token"` and matching `cluster`, then converts it
+/// to an [`ApiCredentialPlan`].
 ///
-/// Returns `Err` if:
-/// - the provider has no `spec.auth` or `auth.manual = true`
-/// - `auth.strategy` is unsupported
-/// - the referenced Secret or key is missing
-#[expect(
-    clippy::too_many_lines,
-    reason = "kubectl read + auth parse + plan dispatch + resolve chain"
-)]
-pub(crate) fn read_provider_api_credential(
-    context: &str,
-    provider_name: &str,
-) -> Result<String, Box<dyn std::error::Error>> {
-    let out = Command::new("kubectl")
-        .args([
-            "--context",
-            context,
-            "get",
-            "inferenceprovider",
-            provider_name,
-            "-o",
-            "jsonpath={.spec.auth}",
-        ])
-        .output()?;
-    if !out.status.success() {
-        return Err(format!(
-            "kubectl get inferenceprovider/{provider_name} failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        )
-        .into());
-    }
-    let auth_str = String::from_utf8_lossy(&out.stdout);
-    let auth_str = auth_str.trim();
-    let auth_json: serde_json::Value = if auth_str.is_empty() {
-        serde_json::Value::Null
-    } else {
-        serde_json::from_str(auth_str).map_err(|e| format!("auth JSON parse error: {e}"))?
-    };
-
-    let plan = parse_api_credential_plan(&auth_json)?;
-
-    // Log the plan without leaking the token value.
-    match &plan {
-        ApiCredentialPlan::BearerToken { secret_name, key, .. } => {
-            eprintln!(
-                "  [OK] InferenceProvider {provider_name:?}: auth.strategy=bearer_token, \
-                 secretRef={secret_name:?}/{key:?}"
-            );
-        },
-        ApiCredentialPlan::Manual => {
-            return Err(format!(
-                "InferenceProvider {provider_name:?} has auth.manual=true; \
-                 harness-driven credential injection is disabled"
-            )
-            .into());
-        },
-        ApiCredentialPlan::Absent => {
-            return Err(format!(
-                "InferenceProvider {provider_name:?} has no spec.auth; \
-                 cannot project credentials without an auth configuration"
-            )
-            .into());
-        },
-    }
-
-    resolve_api_credential(context, &plan)?.ok_or_else(|| {
-        format!(
-            "InferenceProvider {provider_name:?} resolved to no credential \
-             (manual=true or auth absent)"
-        )
-        .into()
+/// This is the **xtask harness bridge**: instead of reading `spec.auth` directly
+/// from the `InferenceProvider` resource, the harness reads what the operator
+/// already projected into the overlay `ConfigMap`.  When Praxis supports native
+/// Secret-ref consumption, the data-plane will read the same `credential` field.
+///
+/// Returns `None` if no candidate for `cluster` carries a bearer-token credential.
+pub(crate) fn api_credential_plan_from_overlay(
+    overlay: &crate::env::operator_overlay::RoutingOverlay,
+    cluster: &str,
+) -> Option<ApiCredentialPlan> {
+    overlay.candidates.iter().find_map(|c| {
+        if c.cluster != cluster {
+            return None;
+        }
+        let cred = c.credential.as_ref()?;
+        if cred.strategy != "bearer_token" {
+            return None;
+        }
+        Some(ApiCredentialPlan::BearerToken {
+            secret_name: cred.secret_ref.name.clone(),
+            namespace: cred.secret_ref.namespace.clone(),
+            key: cred.secret_ref.key.clone(),
+        })
     })
 }
 
@@ -3979,7 +3981,7 @@ pub(crate) fn delete_api_credential_secret(context: &str, namespace: &str) -> Re
 
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
-#[allow(clippy::unwrap_used, reason = "tests")]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, reason = "tests")]
 mod tests {
     use super::*;
 
@@ -4796,6 +4798,104 @@ mod tests {
         assert!(
             candidate.get("auth").is_none(),
             "overlay candidate must not carry an auth field"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // api_credential_plan_from_overlay — overlay credential extraction
+    // -----------------------------------------------------------------------
+
+    fn parse_overlay(json: &serde_json::Value) -> crate::env::operator_overlay::RoutingOverlay {
+        let s = serde_json::to_string(json).unwrap_or_else(|_| std::process::abort());
+        crate::env::operator_overlay::parse_grid_config_json(&s).unwrap_or_else(|_| std::process::abort())
+    }
+
+    fn make_overlay_with_credential(cluster: &str) -> serde_json::Value {
+        serde_json::json!({
+            "network": "net",
+            "local_site": "site-a",
+            "candidates": [{
+                "kind": "inference_model",
+                "name": "model-z",
+                "site": cluster,
+                "cluster": cluster,
+                "fresh": true,
+                "credential": {
+                    "strategy": "bearer_token",
+                    "secretRef": {
+                        "name": "my-secret",
+                        "namespace": "default",
+                        "key": "token"
+                    }
+                }
+            }]
+        })
+    }
+
+    #[test]
+    fn api_credential_plan_from_overlay_finds_bearer_ref_for_cluster() {
+        let json = make_overlay_with_credential("api-cluster");
+        let overlay = parse_overlay(&json);
+        let plan = api_credential_plan_from_overlay(&overlay, "api-cluster").expect("must find bearer plan");
+        match plan {
+            ApiCredentialPlan::BearerToken {
+                secret_name,
+                namespace,
+                key,
+            } => {
+                assert_eq!(secret_name, "my-secret");
+                assert_eq!(namespace, "default");
+                assert_eq!(key, "token");
+            },
+            _ => panic!("expected BearerToken plan"),
+        }
+    }
+
+    #[test]
+    fn api_credential_plan_from_overlay_absent_for_no_credential() {
+        let json = make_overlay(&[("api-cluster", true)]);
+        let overlay = parse_overlay(&json);
+        assert!(
+            api_credential_plan_from_overlay(&overlay, "api-cluster").is_none(),
+            "overlay with no credential field must return None"
+        );
+    }
+
+    #[test]
+    fn api_credential_plan_from_overlay_absent_for_different_cluster() {
+        let json = make_overlay_with_credential("api-cluster");
+        let overlay = parse_overlay(&json);
+        assert!(
+            api_credential_plan_from_overlay(&overlay, "other-cluster").is_none(),
+            "credential extraction must be scoped to the requested cluster"
+        );
+    }
+
+    #[test]
+    fn api_credential_plan_from_overlay_skips_non_bearer_strategy() {
+        let json = serde_json::json!({
+            "network": "net",
+            "local_site": "site-a",
+            "candidates": [{
+                "kind": "inference_model",
+                "name": "model-z",
+                "site": "api-cluster",
+                "cluster": "api-cluster",
+                "fresh": true,
+                "credential": {
+                    "strategy": "sigv4",
+                    "secretRef": {
+                        "name": "aws-secret",
+                        "namespace": "default",
+                        "key": "key"
+                    }
+                }
+            }]
+        });
+        let overlay = parse_overlay(&json);
+        assert!(
+            api_credential_plan_from_overlay(&overlay, "api-cluster").is_none(),
+            "non-bearer strategy must not produce a plan"
         );
     }
 }

@@ -49,6 +49,7 @@ use k8s_openapi::api::core::v1::ConfigMap;
 use serde::{Deserialize, Serialize};
 
 use crate::crd::{
+    auth::AuthStrategy,
     grid_network::GridNetwork,
     grid_site::GridSite,
     inference_provider::{InferenceProvider, ProviderPhase},
@@ -216,6 +217,10 @@ pub(crate) fn crdt_metrics_to_backend(m: &crdt::ProviderMetricsSnapshot) -> scor
 ///
 /// The `site` and `cluster` fields are taken directly from the CRDT record:
 /// `site_id` → `candidate.site`; `routing_cluster` → `candidate.cluster`.
+///
+/// Remote CRDT providers do not carry credential references; `credential` is
+/// always `None`.  Credentials are a local-operator concern derived from
+/// `InferenceProvider.spec.auth`.
 pub(crate) fn remote_crdt_provider_to_candidates(provider: &crdt::ProviderState) -> Vec<RoutingCandidate> {
     let Some(fresh) = crdt_phase_to_fresh(&provider.phase) else {
         return Vec::new();
@@ -229,8 +234,43 @@ pub(crate) fn remote_crdt_provider_to_candidates(provider: &crdt::ProviderState)
             site: provider.site_id.clone(),
             cluster: provider.routing_cluster.clone(),
             fresh,
+            credential: None,
         })
         .collect()
+}
+
+/// Derive a [`ProjectedCredential`] from a provider's `spec.auth`.
+///
+/// Returns `Some` only when all of the following hold:
+/// - `auth.manual` is `false`
+/// - `auth.strategy` is [`AuthStrategy::BearerToken`]
+/// - `auth.secretRef` is present with non-blank `name`, `namespace`, and `key`
+///
+/// Returns `None` for absent auth, `manual = true`, unsupported strategies, or
+/// an incomplete `secretRef`.  Incomplete refs are silently ignored here because
+/// [`crate::resources::credentials::credential_plan_from_auth`] drives the
+/// `Unavailable` phase for validation failures; this function only emits a
+/// reference when the ref is fully usable.
+pub(crate) fn projected_credential_from_provider(provider: &InferenceProvider) -> Option<ProjectedCredential> {
+    let auth = provider.spec.auth.as_ref()?;
+    if auth.manual || auth.strategy != AuthStrategy::BearerToken {
+        return None;
+    }
+    let secret_ref = auth.secret_ref.as_ref()?;
+    let name = secret_ref.name.trim();
+    let namespace = secret_ref.namespace.trim();
+    let key = secret_ref.key.as_deref().unwrap_or("").trim();
+    if name.is_empty() || namespace.is_empty() || key.is_empty() {
+        return None;
+    }
+    Some(ProjectedCredential {
+        strategy: "bearer_token".to_owned(),
+        secret_ref: ProjectedCredentialRef {
+            name: name.to_owned(),
+            namespace: namespace.to_owned(),
+            key: key.to_owned(),
+        },
+    })
 }
 
 /// Convert a remote CRDT provider to a [`scoring::BackendConfig`] for overlay scoring.
@@ -427,6 +467,45 @@ enum SiteResolution {
 // Types
 // ---------------------------------------------------------------------------
 
+/// A reference to a Kubernetes Secret holding a credential value.
+///
+/// Contains only locating information — **never** the credential value itself.
+/// Safe to persist in a `ConfigMap`.  The xtask harness resolves the token
+/// from the referenced Secret; Praxis will eventually do this natively once
+/// native Secret-ref support lands in the `grid_route` filter.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectedCredentialRef {
+    /// Secret name in the cluster.
+    pub name: String,
+
+    /// Secret namespace.
+    pub namespace: String,
+
+    /// Key within `Secret.data` that holds the credential bytes.
+    pub key: String,
+}
+
+/// A credential reference projected alongside a routing candidate.
+///
+/// Carries the authentication strategy and a [`ProjectedCredentialRef`].
+/// Never contains the credential value.
+///
+/// # Security
+///
+/// The token value is **never** stored here.  The operator writes only the
+/// Secret reference into the `ConfigMap`; callers resolve the actual token
+/// from the Secret at use time.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectedCredential {
+    /// Authentication strategy.  Currently only `"bearer_token"` is emitted.
+    pub strategy: String,
+
+    /// Reference to the Secret holding the credential.
+    pub secret_ref: ProjectedCredentialRef,
+}
+
 /// A single routing candidate for the Praxis `grid_route` filter.
 ///
 /// Each candidate represents one (model, site) pair offered by a provider.
@@ -461,11 +540,23 @@ pub struct RoutingCandidate {
     /// [`InferenceProvider`]: crate::crd::inference_provider::InferenceProvider
     pub cluster: String,
 
-    /// Whether this candidate's data is considered fresh.
+    /// Whether this candidate should be treated as fresh by the data plane.
     ///
-    /// Always `true` for the static overlay.  Freshness updates arrive
-    /// in OP-05 (metrics-to-snapshot loop).
+    /// Local candidates are `false` only when the provider status is
+    /// explicitly `Degraded`. Remote CRDT candidates derive this from their
+    /// CRDT provider phase; `Degraded` maps to `false`.
     pub fresh: bool,
+
+    /// Credential reference projected by the operator, when `spec.auth`
+    /// declares a bearer-token strategy.
+    ///
+    /// Contains only the Secret reference — **never** the token value.
+    /// The xtask harness resolves the token from the Secret at config-generation
+    /// time.  Praxis will eventually consume this reference natively.
+    ///
+    /// `None` for providers with `manual`, absent, or unsupported-strategy auth.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential: Option<ProjectedCredential>,
 }
 
 /// The full routing overlay for a single [`GridNetwork`].
@@ -690,6 +781,10 @@ fn resolve_sites(provider: &InferenceProvider, network_sites: &[&GridSite]) -> S
 ///
 /// Returns an error if the provider has no metadata name or any model
 /// name is blank or whitespace-only.
+#[expect(
+    clippy::too_many_lines,
+    reason = "sequential steps: name extraction, model validation, site resolution, credential projection, and candidate construction"
+)]
 fn candidates_from_provider(
     provider: &InferenceProvider,
     site_resolution: &SiteResolution,
@@ -722,6 +817,7 @@ fn candidates_from_provider(
     };
 
     let fresh = is_candidate_fresh(provider);
+    let credential = projected_credential_from_provider(provider);
     let mut candidates = Vec::new();
     for model in &provider.spec.models {
         for site in &sites {
@@ -731,6 +827,7 @@ fn candidates_from_provider(
                 site: (*site).to_owned(),
                 cluster: cluster.to_owned(),
                 fresh,
+                credential: credential.clone(),
             });
         }
     }
@@ -3140,6 +3237,187 @@ mod tests {
         assert!(
             overlay.candidates.is_empty(),
             "Unavailable CRDT provider must be excluded from overlay"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Credential projection — projected_credential_from_provider
+    // -----------------------------------------------------------------------
+
+    fn test_provider_with_bearer_auth(name: &str, network: &str) -> InferenceProvider {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "kind": "InferenceProvider",
+            "metadata": { "name": name },
+            "spec": {
+                "gridNetworkRef": network,
+                "providerKind": "open_ai",
+                "backendKind": "api_provider",
+                "endpoint": "https://api.openai.com",
+                "models": [{ "name": "gpt-4" }],
+                "auth": {
+                    "strategy": "bearer_token",
+                    "secretRef": {
+                        "name": "my-secret",
+                        "namespace": "default",
+                        "key": "token"
+                    }
+                }
+            }
+        }))
+        .unwrap_or_else(|_| std::process::abort())
+    }
+
+    fn test_provider_with_manual_auth(name: &str, network: &str) -> InferenceProvider {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "kind": "InferenceProvider",
+            "metadata": { "name": name },
+            "spec": {
+                "gridNetworkRef": network,
+                "providerKind": "open_ai",
+                "backendKind": "api_provider",
+                "endpoint": "https://api.openai.com",
+                "models": [{ "name": "gpt-4" }],
+                "auth": { "manual": true, "strategy": "bearer_token" }
+            }
+        }))
+        .unwrap_or_else(|_| std::process::abort())
+    }
+
+    #[test]
+    fn bearer_token_provider_produces_credential_ref() {
+        let provider = test_provider_with_bearer_auth("api-prov", "net");
+        let cred = projected_credential_from_provider(&provider);
+        let cred = cred.expect("bearer_token provider must produce a credential ref");
+        assert_eq!(cred.strategy, "bearer_token");
+        assert_eq!(cred.secret_ref.name, "my-secret");
+        assert_eq!(cred.secret_ref.namespace, "default");
+        assert_eq!(cred.secret_ref.key, "token");
+    }
+
+    #[test]
+    fn manual_auth_produces_no_credential_ref() {
+        let provider = test_provider_with_manual_auth("api-prov", "net");
+        assert!(
+            projected_credential_from_provider(&provider).is_none(),
+            "manual auth must produce no credential ref"
+        );
+    }
+
+    #[test]
+    fn absent_auth_produces_no_credential_ref() {
+        let provider = test_provider("no-auth-prov", "net", &["model-a"]);
+        assert!(
+            projected_credential_from_provider(&provider).is_none(),
+            "absent auth must produce no credential ref"
+        );
+    }
+
+    #[test]
+    fn unsupported_auth_strategy_produces_no_credential_ref() {
+        let provider: InferenceProvider = serde_json::from_value(serde_json::json!({
+            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "kind": "InferenceProvider",
+            "metadata": { "name": "sigv4-prov" },
+            "spec": {
+                "gridNetworkRef": "net",
+                "providerKind": "bedrock",
+                "backendKind": "api_provider",
+                "endpoint": "https://bedrock.us-east-1.amazonaws.com",
+                "models": [{ "name": "claude" }],
+                "auth": { "strategy": "sigv4" }
+            }
+        }))
+        .unwrap_or_else(|_| std::process::abort());
+        assert!(
+            projected_credential_from_provider(&provider).is_none(),
+            "sigv4 strategy must produce no credential ref"
+        );
+    }
+
+    #[test]
+    fn bearer_token_candidate_carries_credential_ref() {
+        let network = test_network("net");
+        let provider = test_provider_with_bearer_auth("api-prov", "net");
+        let overlay = render_routing_overlay(&network, &[], &[provider], &[], "site-a", None)
+            .unwrap_or_else(|_| std::process::abort());
+        let cred = overlay
+            .candidates
+            .first()
+            .and_then(|c| c.credential.as_ref())
+            .expect("api_provider with bearer_token must carry credential ref");
+        assert_eq!(cred.strategy, "bearer_token", "strategy must be bearer_token");
+        assert_eq!(cred.secret_ref.name, "my-secret", "secret name must propagate");
+        assert_eq!(cred.secret_ref.namespace, "default", "namespace must propagate");
+        assert_eq!(cred.secret_ref.key, "token", "key must propagate");
+    }
+
+    #[test]
+    fn credential_ref_in_configmap_json_contains_secret_ref_not_token_value() {
+        let network = test_network("net");
+        let provider = test_provider_with_bearer_auth("api-prov", "net");
+        let overlay = render_routing_overlay(&network, &[], &[provider], &[], "site-a", None)
+            .unwrap_or_else(|_| std::process::abort());
+        let cm = build_cm(&overlay, "net", "gw");
+        let json = overlay_json_from_cm(&cm);
+        let candidate = json
+            .get("candidates")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|a| a.first())
+            .expect("must have at least one candidate");
+        let cred_json = candidate.get("credential").expect("credential must be in JSON");
+        // secretRef must be present with name/namespace/key
+        let secret_ref = cred_json.get("secretRef").expect("secretRef must be present");
+        assert_eq!(
+            secret_ref.get("name").and_then(serde_json::Value::as_str),
+            Some("my-secret")
+        );
+        assert_eq!(
+            secret_ref.get("namespace").and_then(serde_json::Value::as_str),
+            Some("default")
+        );
+        assert_eq!(secret_ref.get("key").and_then(serde_json::Value::as_str), Some("token"));
+        // The JSON must NOT contain any token-value field
+        assert!(cred_json.get("token").is_none(), "token value must not appear in JSON");
+        assert!(cred_json.get("value").is_none(), "token value must not appear in JSON");
+    }
+
+    #[test]
+    fn no_auth_candidate_has_no_credential_field_in_json() {
+        let network = test_network("net");
+        let provider = test_provider("no-auth", "net", &["model-a"]);
+        let overlay = render_routing_overlay(&network, &[], &[provider], &[], "site-a", None)
+            .unwrap_or_else(|_| std::process::abort());
+        let cm = build_cm(&overlay, "net", "gw");
+        let json = overlay_json_from_cm(&cm);
+        let candidate = json
+            .get("candidates")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|a| a.first())
+            .expect("must have candidate");
+        assert!(
+            candidate.get("credential").is_none(),
+            "absent auth must produce no 'credential' field in JSON"
+        );
+    }
+
+    #[test]
+    fn manual_auth_candidate_has_no_credential_field_in_json() {
+        let network = test_network("net");
+        let provider = test_provider_with_manual_auth("manual-prov", "net");
+        let overlay = render_routing_overlay(&network, &[], &[provider], &[], "site-a", None)
+            .unwrap_or_else(|_| std::process::abort());
+        let cm = build_cm(&overlay, "net", "gw");
+        let json = overlay_json_from_cm(&cm);
+        let candidate = json
+            .get("candidates")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|a| a.first())
+            .expect("must have candidate");
+        assert!(
+            candidate.get("credential").is_none(),
+            "manual auth must produce no 'credential' field in JSON"
         );
     }
 

@@ -2,12 +2,13 @@
 //!
 //! Reconciles [`InferenceProvider`] resources: validates referenced
 //! [`GridNetwork`], resolves matching [`GridSite`]s via the site selector,
-//! and sets `status.phase`, `status.matchingSites`, and
-//! `status.observedGeneration`.
+//! verifies API-provider credentials, and sets `status.phase`,
+//! `status.matchingSites`, and `status.observedGeneration`.
 //!
 //! # Phase policy
 //!
 //! Static config checks run first and short-circuit on any failure.
+//! Credential verification runs after static checks and before site matching.
 //! The health probe result (from `ProbeOutcome`) is applied last, on top
 //! of the site-matching phase.
 //!
@@ -15,6 +16,11 @@
 //! |-----------|-------|
 //! | `spec.endpoint` is blank or whitespace | `Unavailable` |
 //! | Any `spec.models[].name` is blank | `Unavailable` |
+//! | `spec.auth` specifies an unsupported strategy | `Unavailable` |
+//! | `auth.strategy = bearer_token` but `secretRef` is absent or invalid | `Unavailable` |
+//! | `auth.secretRef` Secret does not exist in the cluster | `Unavailable` |
+//! | `auth.secretRef` key missing from the Secret | `Unavailable` |
+//! | `auth.secretRef` key value is not valid UTF-8 | `Unavailable` |
 //! | `spec.gridNetworkRef` not found | `Unavailable` |
 //! | Config valid, probe returns transport failure | `Unavailable` |
 //! | Config valid, probe returns degraded response | `Degraded` |
@@ -66,6 +72,7 @@ use crate::{
         },
     },
     error::OperatorError,
+    resources::credentials,
 };
 
 // ---------------------------------------------------------------------------
@@ -105,9 +112,9 @@ pub async fn reconcile(provider: Arc<InferenceProvider>, client: Arc<Client>) ->
 
     info!(name, "reconciling InferenceProvider");
 
-    let (phase, matching_sites) = resolve_phase_and_sites(&provider, &client).await?;
+    let (phase, matching_sites, reason) = resolve_phase_and_sites(&provider, &client).await?;
     let generation = provider.metadata.generation.unwrap_or(0);
-    update_status(&provider, &client, phase, matching_sites, generation).await?;
+    update_status(&provider, &client, phase, matching_sites, generation, reason).await?;
 
     Ok(Action::requeue(requeue_interval_for_provider(&provider.spec)))
 }
@@ -395,9 +402,9 @@ pub(crate) async fn probe_endpoint(url: &str, timeout: Duration) -> ProbeOutcome
     }
 }
 
-/// Determine the provider phase and matching sites.
+/// Determine the provider phase, matching sites, and optional failure reason.
 ///
-/// Returns `(ProviderPhase, sorted_matching_site_names)`.
+/// Returns `(ProviderPhase, sorted_matching_site_names, Option<status_reason>)`.
 ///
 /// # Errors
 ///
@@ -405,32 +412,53 @@ pub(crate) async fn probe_endpoint(url: &str, timeout: Duration) -> ProbeOutcome
 #[expect(clippy::large_stack_frames, reason = "async future with kube API types")]
 #[expect(
     clippy::too_many_lines,
-    reason = "reconcile: static checks, site matching, probe, and phase merge"
+    reason = "reconcile: static checks, credential verification, site matching, probe, and phase merge"
+)]
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "sequential reconcile steps with early returns"
 )]
 async fn resolve_phase_and_sites(
     provider: &InferenceProvider,
     client: &Client,
-) -> Result<(ProviderPhase, Vec<String>), OperatorError> {
+) -> Result<(ProviderPhase, Vec<String>, Option<String>), OperatorError> {
+    let name = provider.metadata.name.as_deref().unwrap_or("?");
+
     // Static validation: config errors map immediately to Unavailable.
-    if let Some(reason) = validate_provider_config(provider) {
+    if let Some(config_error) = validate_provider_config(provider) {
+        tracing::warn!(name, reason = config_error, "InferenceProvider config invalid");
+        return Ok((ProviderPhase::Unavailable, Vec::new(), None));
+    }
+
+    // Credential plan validation: parse spec.auth without I/O.
+    // Runs before network/site lookups so auth errors surface first.
+    let plan = match credentials::credential_plan_from_auth(provider.spec.auth.as_ref()) {
+        Err(e) => {
+            let cr = credentials::credential_failure_reason_for_auth(provider.spec.auth.as_ref());
+            tracing::warn!(name, error = %e, reason = cr.as_str(), "InferenceProvider auth config invalid");
+            return Ok((ProviderPhase::Unavailable, Vec::new(), Some(cr.as_str().to_owned())));
+        },
+        Ok(plan) => plan,
+    };
+
+    // Credential accessibility: verify Secret exists, key present, value is UTF-8.
+    // Kubernetes API errors propagate as Err (requeue); credential failures return
+    // Ok(Some(reason)) and mark the provider Unavailable with status.reason.
+    if let Some(cr) = credentials::verify_credential_accessible(client, &plan).await? {
         tracing::warn!(
-            name = provider.metadata.name.as_deref().unwrap_or("?"),
-            reason,
-            "InferenceProvider config invalid"
+            name,
+            reason = cr.as_str(),
+            "InferenceProvider credential Secret inaccessible"
         );
-        return Ok((ProviderPhase::Unavailable, Vec::new()));
+        return Ok((ProviderPhase::Unavailable, Vec::new(), Some(cr.as_str().to_owned())));
     }
 
     // Validate: referenced GridNetwork must exist.
     let network_ref = &provider.spec.grid_network_ref;
     let network_api: Api<GridNetwork> = Api::all(client.clone());
     if network_api.get_opt(network_ref).await?.is_none() {
-        tracing::warn!(
-            name = provider.metadata.name.as_deref().unwrap_or("?"),
-            network = %network_ref,
-            "referenced GridNetwork not found"
-        );
-        return Ok((ProviderPhase::Unavailable, Vec::new()));
+        tracing::warn!(name, network = %network_ref, "referenced GridNetwork not found");
+        return Ok((ProviderPhase::Unavailable, Vec::new(), None));
     }
 
     // Resolve matching sites.
@@ -450,7 +478,7 @@ async fn resolve_phase_and_sites(
     };
     let phase = phase_from_probe(probe_result, site_phase);
 
-    Ok((phase, matching))
+    Ok((phase, matching, None))
 }
 
 /// List all [`GridSite`]s whose `spec.gridNetworkRef` matches `network_ref`.
@@ -506,12 +534,17 @@ pub(crate) fn sites_matching_selector(provider: &InferenceProvider, sites: &[Gri
 /// Returns [`OperatorError`] on Kubernetes API errors.
 ///
 /// [`InferenceProvider`]: crate::crd::inference_provider::InferenceProvider
+#[expect(
+    clippy::too_many_arguments,
+    reason = "all parameters are distinct reconcile outputs; no logical grouping reduces them"
+)]
 async fn update_status(
     provider: &InferenceProvider,
     client: &Client,
     phase: ProviderPhase,
     matching_sites: Vec<String>,
     observed_generation: i64,
+    reason: Option<String>,
 ) -> Result<(), OperatorError> {
     let name = provider
         .metadata
@@ -524,6 +557,7 @@ async fn update_status(
         matching_sites,
         observed_generation,
         phase,
+        reason,
     };
 
     let patch = serde_json::json!({
