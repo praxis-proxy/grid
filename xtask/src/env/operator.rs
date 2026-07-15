@@ -504,6 +504,51 @@ fn provider_fixture_json(name: &str, network_ref: &str, endpoint: &str, routing_
 }
 
 // ---------------------------------------------------------------------------
+// Operator binary freshness
+// ---------------------------------------------------------------------------
+
+/// Path to the pre-compiled operator binary used by direct-spawn helpers.
+///
+/// This is the path that `spawn_operator_with_swim_for_context` executes.
+/// It differs from the `cargo run` path used by `spawn_operator` and
+/// `spawn_operator_with_swim`: those paths let cargo decide whether to
+/// recompile, while this path bypasses cargo entirely.
+#[must_use]
+pub(crate) fn operator_binary_path() -> std::path::PathBuf {
+    std::path::PathBuf::from("target/debug/operator")
+}
+
+/// Cargo arguments to build the operator binary in debug mode.
+#[must_use]
+pub(crate) fn operator_build_args() -> &'static [&'static str] {
+    &["build", "-p", "operator", "--bin", "operator"]
+}
+
+/// Ensure the operator binary is built and up-to-date before spawning it directly.
+///
+/// Runs `cargo build -p operator --bin operator` synchronously.  The build is
+/// incremental so this is fast when sources are already current; it rebuilds
+/// only when source or dependency changes are detected.
+///
+/// Call this before any code path that executes [`operator_binary_path()`]
+/// directly rather than going through `cargo run`.  This prevents false
+/// validation failures caused by a stale binary that reflects an earlier
+/// commit or in-progress working-tree state.
+///
+/// # Errors
+///
+/// Returns an error if `cargo build` fails (compilation error or process
+/// spawn failure).
+pub(crate) fn ensure_operator_binary_built() -> Result<(), Box<dyn std::error::Error>> {
+    eprintln!("  building operator binary for spawned SWIM validation...");
+    let status = Command::new("cargo").args(operator_build_args()).status()?;
+    if !status.success() {
+        return Err("cargo build -p operator --bin operator failed".into());
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Operator subprocess
 // ---------------------------------------------------------------------------
 
@@ -554,6 +599,12 @@ pub(crate) fn spawn_operator_with_swim_for_context(
     site_name: &str,
     seeds: &str,
 ) -> Result<Child, Box<dyn std::error::Error>> {
+    // Ensure the operator binary is current before executing it directly.
+    // This call is incremental (cargo skips recompilation if sources are
+    // unchanged) so it is fast in the common case and prevents false failures
+    // from a stale binary that reflects an earlier commit.
+    ensure_operator_binary_built()?;
+
     // Export a minimal kubeconfig for this specific context to a temp file.
     // `kubectl config view --minify --flatten --context {context}` exports
     // only the cluster, user, and context for `context`, with that context
@@ -587,10 +638,8 @@ pub(crate) fn spawn_operator_with_swim_for_context(
     let log_file2 = log_file.try_clone()?;
     // Run the pre-compiled binary directly to avoid cargo's startup overhead and
     // environment forwarding behaviour under `cargo xtask`.
-    let operator_bin = std::path::PathBuf::from("target/debug/operator");
-    if !operator_bin.exists() {
-        return Err("operator binary not found at target/debug/operator; run `cargo build -p operator` first".into());
-    }
+    // ensure_operator_binary_built() above guarantees the binary exists and is current.
+    let operator_bin = operator_binary_path();
     let child = Command::new(&operator_bin)
         .env("KUBECONFIG", &kubeconfig_path)
         .env("GRID_SWIM_BIND_ADDR", bind_addr)
@@ -4938,6 +4987,49 @@ mod tests {
         assert!(
             api_credential_plan_from_overlay(&overlay, "api-cluster").is_none(),
             "non-bearer strategy must not produce a plan"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // operator_binary_path / operator_build_args
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn operator_binary_path_ends_with_debug_operator() {
+        let path = operator_binary_path();
+        assert!(
+            path.ends_with("target/debug/operator"),
+            "binary path must point to target/debug/operator, got {path:?}"
+        );
+    }
+
+    #[test]
+    fn operator_binary_path_is_relative() {
+        let path = operator_binary_path();
+        assert!(
+            path.is_relative(),
+            "binary path must be relative so it resolves from the workspace root"
+        );
+    }
+
+    #[test]
+    fn operator_build_args_contains_required_flags() {
+        let args = operator_build_args();
+        assert!(args.contains(&"build"), "args must include 'build'");
+        assert!(args.contains(&"-p"), "args must include '-p'");
+        assert!(args.contains(&"operator"), "args must include 'operator'");
+        assert!(args.contains(&"--bin"), "args must include '--bin'");
+    }
+
+    #[test]
+    fn operator_build_args_targets_correct_binary() {
+        let args = operator_build_args();
+        // "--bin" must be immediately followed by "operator"
+        let bin_pos = args.iter().position(|&a| a == "--bin").expect("--bin must be present");
+        assert_eq!(
+            args.get(bin_pos + 1).copied(),
+            Some("operator"),
+            "--bin must be followed by 'operator'"
         );
     }
 }

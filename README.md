@@ -20,14 +20,23 @@ credential handling, and backend proxying.
 ## Getting started
 
 ```sh
-# Validate the operator routing path in kind
+# Validate operator routing overlay generation in kind
 cargo xtask env validate-operator-routing -c tests/env/operator-routing.toml
 
-# Validate two-provider model routing in kind
-cargo xtask env validate-operator-routing -c tests/env/operator-routing-two-provider.toml
+# Validate two-provider llm-d-style model routing in kind
+cargo xtask env verify-demo1-llmd-routing -c tests/env/operator-routing-two-provider.toml
 
-# Validate SWIM membership in kind
+# Validate full-grid routing across local, remote, cloud mock, and API mock
+cargo xtask env verify-full-grid-routing -c tests/env/operator-routing-two-provider.toml
+
+# Validate API-provider fallback and Secret-backed credential projection
+cargo xtask env verify-api-fallback -c tests/env/operator-routing.toml
+
+# Validate SWIM membership from env-var startup seeds
 cargo xtask env verify-swim-membership -c tests/env/operator-routing.toml
+
+# Validate SWIM membership from GridNetwork.spec.seeds
+cargo xtask env verify-swim-crd-seeds -c tests/env/operator-routing.toml
 
 # Validate CRDT provider-state propagation over SWIM
 cargo xtask env verify-swim-state -c tests/env/operator-routing.toml

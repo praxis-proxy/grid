@@ -1614,18 +1614,12 @@ fn env_verify_swim_routing(config: &Path) -> Result<(), Box<dyn std::error::Erro
     eprintln!("verify-swim-routing: east={east_site} ({east_ctx}), west={west_site} ({west_ctx})");
     eprintln!("  east model: {east_model}, west model: {west_model}");
 
-    // Pre-build the operator binary so `cargo run` in the background processes
-    // does not spend compilation time while we poll for distributedProviderCount.
-    // Without this, the operator may still be compiling when fixtures are applied
-    // and the poll window closes before the first reconcile runs.
+    // Pre-build the operator binary so spawn_operator_with_swim_for_context
+    // does not compile during the poll window (each spawn also calls
+    // ensure_operator_binary_built, but the first call here is shared so
+    // subsequent per-spawn calls are fast incremental no-ops).
     eprintln!("verify-swim-routing: pre-building operator binary...");
-    let build_status = std::process::Command::new("cargo")
-        .args(["build", "--quiet", "-p", "operator", "--bin", "operator"])
-        .status()
-        .map_err(|e| format!("cargo build -p operator failed to spawn: {e}"))?;
-    if !build_status.success() {
-        return Err("cargo build -p operator --bin operator failed".into());
-    }
+    operator::ensure_operator_binary_built()?;
     eprintln!("  [OK] operator binary ready");
 
     // Step 1: deploy provider gateways on both clusters.
