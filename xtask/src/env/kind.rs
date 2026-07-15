@@ -2,7 +2,10 @@
 
 use std::process::Command;
 
-use crate::env::config::{ClusterDef, ClusterRole, ProviderBackend};
+use crate::env::{
+    config::{ClusterDef, ClusterRole, ProviderBackend},
+    kubectl,
+};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -51,9 +54,6 @@ pub(crate) const MOCK_CLOUD_PORT: u16 = 8080;
 
 /// Kubernetes namespace for provider backend deployments.
 const NAMESPACE: &str = "default";
-
-/// Timeout for deployment rollout readiness in seconds.
-const ROLLOUT_TIMEOUT_SECS: u32 = 120;
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -295,9 +295,9 @@ pub(crate) fn deploy_mock_api_provider(context: &str, cluster_name: &str) -> Res
         )
     })?;
     eprintln!("  deploying {MOCK_API_SVC} to {cluster_name}...");
-    apply_manifest(context, &mock_api_provider_deployment_yaml())?;
-    apply_manifest(context, &mock_api_provider_service_yaml())?;
-    wait_for_rollout(context, cluster_name, MOCK_API_SVC)?;
+    kubectl::apply_manifest(context, &mock_api_provider_deployment_yaml())?;
+    kubectl::apply_manifest(context, &mock_api_provider_service_yaml())?;
+    kubectl::wait_for_rollout(context, MOCK_API_SVC, cluster_name)?;
     Ok(())
 }
 
@@ -409,9 +409,9 @@ pub(crate) fn deploy_mock_cloud_provider(context: &str, cluster_name: &str) -> R
         )
     })?;
     eprintln!("  deploying {MOCK_CLOUD_SVC} to {cluster_name}...");
-    apply_manifest(context, &mock_cloud_provider_deployment_yaml())?;
-    apply_manifest(context, &mock_cloud_provider_service_yaml())?;
-    wait_for_rollout(context, cluster_name, MOCK_CLOUD_SVC)?;
+    kubectl::apply_manifest(context, &mock_cloud_provider_deployment_yaml())?;
+    kubectl::apply_manifest(context, &mock_cloud_provider_service_yaml())?;
+    kubectl::wait_for_rollout(context, MOCK_CLOUD_SVC, cluster_name)?;
     Ok(())
 }
 
@@ -527,9 +527,9 @@ fn deploy_mock_openai(full_name: &str, site_name: &str) -> Result<(), Box<dyn st
 
     let ctx = format!("kind-{full_name}");
     eprintln!("  deploying {MOCK_OPENAI_SVC} to {full_name}...");
-    apply_manifest(&ctx, &mock_openai_deployment_yaml(site_name))?;
-    apply_manifest(&ctx, &mock_openai_service_yaml(site_name))?;
-    wait_for_rollout(&ctx, full_name, MOCK_OPENAI_SVC)?;
+    kubectl::apply_manifest(&ctx, &mock_openai_deployment_yaml(site_name))?;
+    kubectl::apply_manifest(&ctx, &mock_openai_service_yaml(site_name))?;
+    kubectl::wait_for_rollout(&ctx, MOCK_OPENAI_SVC, full_name)?;
     Ok(())
 }
 
@@ -598,51 +598,9 @@ fn deploy_inference_sim(full_name: &str, site_name: &str, def: &ClusterDef) -> R
     for model in &def.models {
         let deploy = deployment_name(model);
         eprintln!("  deploying {deploy} to {full_name}...");
-        apply_manifest(&ctx, &model_deployment_yaml(site_name, model))?;
-        apply_manifest(&ctx, &model_service_yaml(site_name, model))?;
-        wait_for_rollout(&ctx, full_name, &deploy)?;
-    }
-    Ok(())
-}
-
-/// Wait for a deployment to become available.
-fn wait_for_rollout(context: &str, full_name: &str, deploy: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let timeout = format!("{ROLLOUT_TIMEOUT_SECS}s");
-    let resource = format!("deployment/{deploy}");
-    eprintln!("  waiting for {deploy} rollout in {full_name} (timeout {timeout})...");
-    let status = Command::new("kubectl")
-        .args([
-            "--context",
-            context,
-            "-n",
-            NAMESPACE,
-            "rollout",
-            "status",
-            &resource,
-            "--timeout",
-            &timeout,
-        ])
-        .status()?;
-    if !status.success() {
-        return Err(format!("{deploy} rollout timed out in {full_name}").into());
-    }
-    Ok(())
-}
-
-/// Apply a YAML manifest via kubectl.
-fn apply_manifest(context: &str, yaml: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let mut child = Command::new("kubectl")
-        .args(["--context", context, "apply", "-f", "-"])
-        .stdin(std::process::Stdio::piped())
-        .spawn()?;
-
-    if let Some(stdin) = child.stdin.as_mut() {
-        std::io::Write::write_all(stdin, yaml.as_bytes())?;
-    }
-
-    let status = child.wait()?;
-    if !status.success() {
-        return Err(format!("kubectl apply failed: {status}").into());
+        kubectl::apply_manifest(&ctx, &model_deployment_yaml(site_name, model))?;
+        kubectl::apply_manifest(&ctx, &model_service_yaml(site_name, model))?;
+        kubectl::wait_for_rollout(&ctx, &deploy, full_name)?;
     }
     Ok(())
 }

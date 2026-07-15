@@ -12,7 +12,7 @@ use std::{path::PathBuf, process::Command};
 
 use crate::env::{
     config::{ClusterDef, ClusterRole, EnvConfig, ProviderBackend},
-    images, kind,
+    images, kind, kubectl,
     verify::{HttpResponse, PortForwardGuard, Tally, find_free_port, parse_curl_output, safe_truncate, wait_for_port},
 };
 
@@ -53,9 +53,6 @@ const GATEWAY_CONFIGMAP: &str = "praxis-provider-config";
 /// HTTP port for the provider gateway.
 const GATEWAY_HTTP_PORT: u16 = 8080;
 
-/// Rollout timeout in seconds.
-const ROLLOUT_TIMEOUT_SECS: u32 = 120;
-
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -87,7 +84,9 @@ pub(crate) fn deploy_all(cfg: &EnvConfig) -> Result<(), Box<dyn std::error::Erro
 /// Returns an error if any verification command fails unexpectedly or
 /// if any assertion fails.
 pub(crate) fn verify_all(cfg: &EnvConfig) -> Result<(), Box<dyn std::error::Error>> {
-    let consumer_site = consumer_cluster_name(cfg)?;
+    let consumer_site = cfg
+        .consumer_cluster_name()
+        .ok_or("no consumer cluster configured in environment config")?;
     let mut tally = Tally::default();
     let mut found = false;
 
@@ -109,21 +108,6 @@ pub(crate) fn verify_all(cfg: &EnvConfig) -> Result<(), Box<dyn std::error::Erro
     tally.print_summary()
 }
 
-/// Resolve the consumer cluster name from the environment config.
-fn consumer_cluster_name(cfg: &EnvConfig) -> Result<&str, Box<dyn std::error::Error>> {
-    cfg.clusters
-        .names
-        .iter()
-        .find(|name| {
-            cfg.clusters
-                .definitions
-                .get(*name)
-                .is_some_and(|d| d.role == ClusterRole::Consumer)
-        })
-        .map(String::as_str)
-        .ok_or_else(|| "no consumer cluster configured in environment config".into())
-}
-
 // ---------------------------------------------------------------------------
 // Per-provider deployment
 // ---------------------------------------------------------------------------
@@ -138,8 +122,8 @@ fn deploy_provider(name: &str, def: &ClusterDef) -> Result<(), Box<dyn std::erro
     apply_gateway_config(&ctx, def)?;
     apply_gateway_deployment(&ctx)?;
 
-    wait_for_rollout(&ctx, MOCK_EPP_NAME, name)?;
-    wait_for_rollout(&ctx, GATEWAY_DEPLOYMENT, name)?;
+    kubectl::wait_for_rollout(&ctx, MOCK_EPP_NAME, name)?;
+    kubectl::wait_for_rollout(&ctx, GATEWAY_DEPLOYMENT, name)?;
 
     eprintln!("  [PASS] provider gateway ready in {ctx}");
     Ok(())
@@ -189,7 +173,7 @@ fn apply_tls_secret(
     }
 
     let yaml = String::from_utf8(output.stdout)?;
-    apply_manifest(context, &yaml)
+    kubectl::apply_manifest(context, &yaml)
 }
 
 /// Apply mock EPP Deployment + Service.
@@ -237,7 +221,7 @@ fn apply_mock_epp(context: &str, site_name: &str, def: &ClusterDef) -> Result<()
          \x20     targetPort: {MOCK_EPP_PORT}\n",
         images::MOCK_EPP_IMAGE,
     );
-    apply_manifest(context, &yaml)
+    kubectl::apply_manifest(context, &yaml)
 }
 
 /// Update the mock EPP in a provider cluster to also handle `extra_model`.
@@ -300,7 +284,7 @@ spec:
 "#,
         image = images::MOCK_EPP_IMAGE,
     );
-    apply_manifest(context, &yaml)?;
+    kubectl::apply_manifest(context, &yaml)?;
     eprintln!("  [OK] mock-epp patched in {site_name} to also serve {extra_model:?}");
     Ok(())
 }
@@ -346,7 +330,7 @@ fn apply_gateway_config(context: &str, _def: &ClusterDef) -> Result<(), Box<dyn 
          {}\n",
         indent_yaml(&config_yaml, 4)
     );
-    apply_manifest(context, &yaml)
+    kubectl::apply_manifest(context, &yaml)
 }
 
 /// Provider gateway Praxis config.
@@ -477,48 +461,7 @@ fn apply_gateway_deployment(context: &str) -> Result<(), Box<dyn std::error::Err
          \x20     targetPort: {GATEWAY_HTTP_PORT}\n",
         image = images::GATEWAY_IMAGE,
     );
-    apply_manifest(context, &yaml)
-}
-
-/// Wait for a deployment to roll out.
-fn wait_for_rollout(context: &str, deployment: &str, cluster: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let timeout = format!("{ROLLOUT_TIMEOUT_SECS}s");
-    let resource = format!("deployment/{deployment}");
-    eprintln!("  waiting for {deployment} in {cluster}...");
-    let status = Command::new("kubectl")
-        .args([
-            "--context",
-            context,
-            "-n",
-            NAMESPACE,
-            "rollout",
-            "status",
-            &resource,
-            "--timeout",
-            &timeout,
-        ])
-        .status()?;
-    if !status.success() {
-        return Err(format!("{deployment} rollout timed out in {cluster}").into());
-    }
-    Ok(())
-}
-
-/// Apply a YAML manifest via kubectl.
-fn apply_manifest(context: &str, yaml: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let mut child = Command::new("kubectl")
-        .args(["--context", context, "apply", "-f", "-"])
-        .stdin(std::process::Stdio::piped())
-        .spawn()?;
-
-    if let Some(stdin) = child.stdin.as_mut() {
-        std::io::Write::write_all(stdin, yaml.as_bytes())?;
-    }
-    let status = child.wait()?;
-    if !status.success() {
-        return Err(format!("kubectl apply failed: {status}").into());
-    }
-    Ok(())
+    kubectl::apply_manifest(context, &yaml)
 }
 
 // ---------------------------------------------------------------------------

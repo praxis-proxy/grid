@@ -26,7 +26,7 @@ metadata:
   name: production
 spec:
   seeds:
-    - grid.cluster-b.example.com:7946
+    - "10.0.0.5:7946"
   gatewayRefs:
     - name: inference-gw
       namespace: praxis-system
@@ -47,6 +47,40 @@ The GridNetwork controller:
 4. Generates a SWIM encryption key
 5. Starts the SWIM runtime with seed peers
 6. Sets `status.phase: Initializing`
+
+### CRD-driven seeds
+
+`spec.seeds` is now **operator-consumed**: on every `GridNetwork` reconcile the
+controller parses the seed list, filters invalid addresses (logged at `warn`,
+no reconcile failure), removes the local advertise address to prevent self-
+announce noise, deduplicates, and calls `SwimHandle::announce_seeds` to deliver
+the batch to the running SWIM event loop.  Re-announcing to already-connected
+peers is idempotent — foca ignores redundant joins.
+
+Startup seeds from `GRID_SWIM_SEEDS` (env var, set by `xtask`) and CRD seeds
+are additive.  The env var seeds run once at startup; CRD seeds run on every
+reconcile so dynamically added addresses take effect without an operator restart.
+
+**Global-runtime semantics**
+
+The SWIM runtime is process-global — one UDP listener per operator process,
+shared across all `GridNetwork` reconciles.  Seeds from any
+`GridNetwork.spec.seeds` are announced to the same SWIM membership node.
+This is site-membership bootstrap, not per-network membership isolation.
+CRDT provider records remain network-scoped separately.
+
+**Channel-full retry**
+
+If the seed announce channel is full (capacity 16 batches), the announce is
+skipped for the current reconcile and retried on the next
+(`REQUEUE_INTERVAL = 300 s`).  Seeds are not guaranteed to be applied
+immediately under heavy broadcast load.
+
+**Limitations**
+- Seed removal is not tracked: removing an address from `spec.seeds` stops
+  re-announcing to it but does not evict an already-connected peer.
+- Seeds must be `IP:port` socket addresses; DNS names are not resolved.
+  Example valid value: `10.0.0.2:7946`.
 
 **Phase progression:** `GridNetwork Active` is set when
 the SWIM runtime reports at least one `Alive` peer in

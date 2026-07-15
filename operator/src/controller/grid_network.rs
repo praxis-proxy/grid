@@ -7,7 +7,11 @@
 //!
 //! [`GridNetwork`]: crate::crd::grid_network::GridNetwork
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{BTreeSet, HashMap},
+    net::SocketAddr,
+    sync::Arc,
+};
 
 use k8s_openapi::api::core::v1::ConfigMap;
 use kube::{
@@ -140,6 +144,13 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
     let client = &ctx.client;
     ensure_tls_secrets(&network, client).await?;
 
+    // Announce CRD-declared seeds to the SWIM runtime so peers can be reached
+    // without requiring the GRID_SWIM_SEEDS environment variable.
+    // Re-announcing on each reconcile is idempotent (foca ignores existing members).
+    if let Some(swim) = ctx.swim.as_ref() {
+        announce_crd_seeds(&network, swim);
+    }
+
     // List providers once; share between routing overlay rendering and CRDT publishing.
     let providers = list_all_inference_providers(client).await?;
     let raw_metrics = provider_metrics::collect_provider_metrics(name, &providers).await;
@@ -204,6 +215,85 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
 pub fn error_policy(_network: Arc<GridNetwork>, error: &OperatorError, _ctx: Arc<OperatorCtx>) -> Action {
     tracing::error!(%error, "GridNetwork reconciliation failed");
     Action::requeue(Duration::from_secs(30))
+}
+
+// ---------------------------------------------------------------------------
+// CRD-driven SWIM seeds
+// ---------------------------------------------------------------------------
+
+/// Parse and normalize SWIM seed addresses from `GridNetwork.spec.seeds`.
+///
+/// Each string is trimmed and parsed as a [`SocketAddr`].  Invalid entries
+/// are logged at `warn` level and skipped; they do not fail the reconcile.
+/// If `local_addr` is `Some`, any address equal to it is removed (self-seed).
+/// Duplicates are removed; the result is deterministically sorted.
+///
+/// Returns an empty `Vec` when `raw` is empty or all entries fail to parse.
+pub(crate) fn parse_crd_seeds(raw: &[String], local_addr: Option<SocketAddr>) -> Vec<SocketAddr> {
+    let mut seen = BTreeSet::new();
+    for s in raw {
+        let trimmed = s.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        match trimmed.parse::<SocketAddr>() {
+            Ok(addr) => {
+                if local_addr.is_some_and(|local| addr == local) {
+                    tracing::debug!(addr = %addr, "GridNetwork spec.seeds: skipping self-address");
+                    continue;
+                }
+                seen.insert(addr);
+            },
+            Err(e) => {
+                tracing::warn!(
+                    seed = trimmed,
+                    error = %e,
+                    "GridNetwork spec.seeds contains invalid socket address, skipping"
+                );
+            },
+        }
+    }
+    seen.into_iter().collect()
+}
+
+/// Announce `network.spec.seeds` to the live SWIM runtime.
+///
+/// Called once per reconcile.  Re-announcing to existing members is
+/// idempotent — foca ignores redundant joins.
+///
+/// # Global-runtime semantics
+///
+/// The SWIM runtime is **process-global**: one UDP listener per operator
+/// process, shared by all `GridNetwork` reconciles in that process.  Seeds
+/// from any `GridNetwork.spec.seeds` are announced to the same SWIM node.
+/// This makes `spec.seeds` a site-membership bootstrap mechanism, not a
+/// per-network membership isolation control.  CRDT provider records remain
+/// network-scoped separately (filtered by `network_id` in `collect_remote_crdt_providers`).
+///
+/// # Channel-full behavior
+///
+/// If the SWIM runtime seed channel is full (capacity 16 batches), the
+/// announce is skipped for this reconcile cycle and retried on the next
+/// reconcile (default interval 300 s).  This means CRD seeds are not
+/// guaranteed to be announced immediately when the runtime is under heavy
+/// broadcast load, but they will be applied on the next reconcile.
+///
+/// Channel errors are logged at `warn` level and do not fail the reconcile.
+fn announce_crd_seeds(network: &GridNetwork, swim: &SwimHandle) {
+    if network.spec.seeds.is_empty() {
+        return;
+    }
+    let seeds = parse_crd_seeds(&network.spec.seeds, Some(swim.local_addr()));
+    if seeds.is_empty() {
+        return;
+    }
+    let name = network.metadata.name.as_deref().unwrap_or("?");
+    tracing::info!(name, seeds = seeds.len(), "announcing CRD seeds to SWIM runtime");
+    if let Err(e) = swim.announce_seeds(seeds) {
+        // Channel-full or closed: log and continue. Seeds will be re-queued on
+        // the next reconcile cycle (REQUEUE_INTERVAL = 300 s by default).
+        tracing::warn!(name, error = %e, "failed to queue CRD seeds for SWIM announcement; will retry on next reconcile");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1821,5 +1911,100 @@ mod tests {
             name_net1, name_net2,
             "same site_id in different networks must produce different names"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_crd_seeds — pure seed normalization
+    // -----------------------------------------------------------------------
+
+    fn addr(s: &str) -> SocketAddr {
+        s.parse().unwrap_or_else(|_| std::process::abort())
+    }
+
+    #[test]
+    fn parse_crd_seeds_empty_input_returns_empty() {
+        let result = parse_crd_seeds(&[], None);
+        assert!(result.is_empty(), "empty input must produce empty output");
+    }
+
+    #[test]
+    fn parse_crd_seeds_valid_address_parsed() {
+        let raw = vec!["10.0.0.1:7946".to_owned()];
+        let result = parse_crd_seeds(&raw, None);
+        assert_eq!(result, vec![addr("10.0.0.1:7946")], "valid address must be included");
+    }
+
+    #[test]
+    fn parse_crd_seeds_invalid_address_skipped() {
+        let raw = vec!["not-an-address".to_owned()];
+        let result = parse_crd_seeds(&raw, None);
+        assert!(result.is_empty(), "invalid address must be skipped without panic");
+    }
+
+    #[test]
+    fn parse_crd_seeds_mixed_valid_and_invalid() {
+        let raw = vec![
+            "10.0.0.1:7946".to_owned(),
+            "bad-addr".to_owned(),
+            "10.0.0.2:7946".to_owned(),
+        ];
+        let result = parse_crd_seeds(&raw, None);
+        assert_eq!(result.len(), 2, "only valid addresses must appear");
+        assert!(result.contains(&addr("10.0.0.1:7946")));
+        assert!(result.contains(&addr("10.0.0.2:7946")));
+    }
+
+    #[test]
+    fn parse_crd_seeds_deduplicates() {
+        let raw = vec!["10.0.0.1:7946".to_owned(), "10.0.0.1:7946".to_owned()];
+        let result = parse_crd_seeds(&raw, None);
+        assert_eq!(result.len(), 1, "duplicates must be removed");
+    }
+
+    #[test]
+    fn parse_crd_seeds_filters_self_addr() {
+        let local = addr("10.0.0.1:7946");
+        let raw = vec!["10.0.0.1:7946".to_owned(), "10.0.0.2:7946".to_owned()];
+        let result = parse_crd_seeds(&raw, Some(local));
+        assert_eq!(result.len(), 1, "self-address must be filtered out");
+        assert_eq!(
+            result.first().copied(),
+            Some(addr("10.0.0.2:7946")),
+            "non-self address must remain"
+        );
+    }
+
+    #[test]
+    fn parse_crd_seeds_no_local_filter_when_none() {
+        let raw = vec!["10.0.0.1:7946".to_owned()];
+        let result = parse_crd_seeds(&raw, None);
+        assert_eq!(result.len(), 1, "without local filter all valid addresses are kept");
+    }
+
+    #[test]
+    fn parse_crd_seeds_whitespace_trimmed() {
+        let raw = vec!["  10.0.0.1:7946  ".to_owned()];
+        let result = parse_crd_seeds(&raw, None);
+        assert_eq!(
+            result,
+            vec![addr("10.0.0.1:7946")],
+            "leading/trailing whitespace must be trimmed"
+        );
+    }
+
+    #[test]
+    fn parse_crd_seeds_empty_string_skipped() {
+        let raw = vec![String::new(), "  ".to_owned()];
+        let result = parse_crd_seeds(&raw, None);
+        assert!(result.is_empty(), "blank strings must be skipped");
+    }
+
+    #[test]
+    fn parse_crd_seeds_result_is_sorted() {
+        let raw = vec!["10.0.0.2:7946".to_owned(), "10.0.0.1:7946".to_owned()];
+        let result = parse_crd_seeds(&raw, None);
+        let mut expected = result.clone();
+        expected.sort();
+        assert_eq!(result, expected, "result must be sorted for deterministic ordering");
     }
 }

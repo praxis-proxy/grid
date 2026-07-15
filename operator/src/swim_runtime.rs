@@ -86,6 +86,12 @@ struct RuntimeChannels {
     /// `SwimNode::publish_state_broadcast` and immediately gossips so that
     /// peers receive the broadcast on the next outbound message.
     broadcast_rx: mpsc::Receiver<swim::StateBroadcast>,
+
+    /// Receives batches of seed addresses to announce at runtime.
+    ///
+    /// Populated by [`SwimHandle::announce_seeds`].  Each batch is
+    /// announced via [`SwimNode::announce`] on the next event loop turn.
+    seed_rx: mpsc::Receiver<Vec<SocketAddr>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -130,6 +136,18 @@ pub enum BroadcastError {
     ChannelClosed,
 }
 
+/// Error returned when seed addresses cannot be queued for announcement.
+#[derive(Debug, thiserror::Error)]
+pub enum SeedAnnounceError {
+    /// The runtime seed queue is full; the caller should retry later.
+    #[error("SWIM runtime seed channel full")]
+    ChannelFull,
+
+    /// The runtime task has exited and the channel is closed.
+    #[error("SWIM runtime seed channel closed")]
+    ChannelClosed,
+}
+
 /// A handle to the live SWIM runtime.
 ///
 /// Returned by `start`; shared across all `GridNetwork` reconciles via
@@ -139,6 +157,12 @@ pub enum BroadcastError {
 pub struct SwimHandle {
     /// Stable local site identity advertised by this SWIM runtime.
     site_name: String,
+
+    /// Address this runtime advertises to SWIM peers.
+    ///
+    /// Callers may use this to filter the local address from `spec.seeds`
+    /// before calling [`SwimHandle::announce_seeds`].
+    advertise_addr: SocketAddr,
 
     /// Watch channel receiver for SWIM membership snapshots.
     snapshot_rx: watch::Receiver<MembershipSnapshot>,
@@ -151,6 +175,9 @@ pub struct SwimHandle {
 
     /// Channel for sending CRDT state broadcasts to the runtime loop.
     broadcast_tx: mpsc::Sender<swim::StateBroadcast>,
+
+    /// Channel for queuing seed addresses to announce at runtime.
+    seed_tx: mpsc::Sender<Vec<SocketAddr>>,
 }
 
 impl SwimHandle {
@@ -158,6 +185,39 @@ impl SwimHandle {
     #[must_use]
     pub fn site_name(&self) -> &str {
         &self.site_name
+    }
+
+    /// Return the address this runtime advertises to SWIM peers.
+    ///
+    /// Use this to filter the local address from `spec.seeds` before
+    /// calling [`SwimHandle::announce_seeds`] — announcing to self is harmless but
+    /// generates unnecessary noise.
+    #[must_use]
+    pub fn local_addr(&self) -> SocketAddr {
+        self.advertise_addr
+    }
+
+    /// Queue seed addresses for announcement to the SWIM runtime.
+    ///
+    /// Each address in `seeds` is announced as a new SWIM peer on the next
+    /// event loop turn via [`SwimNode::announce`].  Announcing to a peer that
+    /// is already a live member is idempotent — foca ignores redundant joins.
+    ///
+    /// An empty `seeds` slice is a no-op and always returns `Ok(())`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SeedAnnounceError::ChannelFull`] if the bounded runtime queue
+    /// is full (capacity 16 batches), or [`SeedAnnounceError::ChannelClosed`]
+    /// if the runtime task has exited.
+    pub fn announce_seeds(&self, seeds: Vec<SocketAddr>) -> Result<(), SeedAnnounceError> {
+        if seeds.is_empty() {
+            return Ok(());
+        }
+        self.seed_tx.try_send(seeds).map_err(|e| match e {
+            TrySendError::Full(_) => SeedAnnounceError::ChannelFull,
+            TrySendError::Closed(_) => SeedAnnounceError::ChannelClosed,
+        })
     }
 
     /// Clone the most recently published [`MembershipSnapshot`].
@@ -233,11 +293,13 @@ pub async fn start(config: SwimConfig) -> Result<Arc<SwimHandle>, SwimRuntimeErr
     let (state_tx, state_rx) = watch::channel(GridStateSnapshot::new(site_name.clone()));
     let (timer_tx, timer_rx) = mpsc::channel::<TimerEvent>(256);
     let (broadcast_tx, broadcast_rx) = mpsc::channel::<swim::StateBroadcast>(32);
+    let (seed_tx, seed_rx) = mpsc::channel::<Vec<SocketAddr>>(16);
     let channels = RuntimeChannels {
         snapshot_tx,
         timer_tx,
         timer_rx,
         broadcast_rx,
+        seed_rx,
     };
 
     tracing::info!(
@@ -252,9 +314,11 @@ pub async fn start(config: SwimConfig) -> Result<Arc<SwimHandle>, SwimRuntimeErr
 
     Ok(Arc::new(SwimHandle {
         site_name,
+        advertise_addr,
         snapshot_rx,
         state_rx,
         broadcast_tx,
+        seed_tx,
     }))
 }
 
@@ -346,6 +410,22 @@ async fn run_loop(
                     .await;
                 }
                 drop(state_tx.send(node.state_snapshot()));
+            }
+            Some(seeds) = channels.seed_rx.recv() => {
+                // Announce to CRD-declared seed peers at runtime.
+                // Re-announcing to existing members is idempotent (foca ignores them).
+                for addr in seeds {
+                    let seed_id = NodeId::new(format!("seed-{addr}"), addr);
+                    let output = node.announce(seed_id);
+                    drain_output(
+                        output,
+                        &socket,
+                        &channels.timer_tx,
+                        &mut members,
+                        &channels.snapshot_tx,
+                    )
+                    .await;
+                }
             }
         }
     }
@@ -582,11 +662,14 @@ mod tests {
         let (snapshot_tx, snapshot_rx) = watch::channel(MembershipSnapshot::default());
         let (state_tx, state_rx) = watch::channel(GridStateSnapshot::new("test".to_owned()));
         let (broadcast_tx, _broadcast_rx) = mpsc::channel(1);
+        let (seed_tx, _seed_rx) = mpsc::channel(16);
         let handle = SwimHandle {
             site_name: "test".to_owned(),
+            advertise_addr: "127.0.0.1:7946".parse().unwrap_or_else(|_| std::process::abort()),
             snapshot_rx,
             state_rx,
             broadcast_tx,
+            seed_tx,
         };
         (handle, snapshot_tx, state_tx)
     }
@@ -656,6 +739,77 @@ mod tests {
         let no_swim: Option<Arc<SwimHandle>> = None;
         let count = no_swim.as_ref().map_or(0, |h| h.snapshot().connected_count());
         assert_eq!(count, 0, "None swim handle must give zero connected_sites");
+    }
+
+    // -----------------------------------------------------------------------
+    // SwimHandle::local_addr and announce_seeds
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn local_addr_returns_advertise_addr() {
+        let (handle, _snap_tx, _state_tx) = make_test_handle();
+        let addr: SocketAddr = "127.0.0.1:7946".parse().unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            handle.local_addr(),
+            addr,
+            "local_addr must return the configured advertise_addr"
+        );
+    }
+
+    #[test]
+    fn announce_seeds_empty_is_noop() {
+        let (handle, _snap_tx, _state_tx) = make_test_handle();
+        let result = handle.announce_seeds(Vec::new());
+        assert!(result.is_ok(), "announce_seeds with empty vec must return Ok");
+    }
+
+    #[test]
+    fn announce_seeds_sends_to_channel() {
+        let (snapshot_tx, snapshot_rx) = watch::channel(MembershipSnapshot::default());
+        let (state_tx, state_rx) = watch::channel(GridStateSnapshot::new("test".to_owned()));
+        let (broadcast_tx, _broadcast_rx) = mpsc::channel(1);
+        let (seed_tx, mut seed_rx) = mpsc::channel(16);
+        let handle = SwimHandle {
+            site_name: "test".to_owned(),
+            advertise_addr: "127.0.0.1:7946".parse().unwrap_or_else(|_| std::process::abort()),
+            snapshot_rx,
+            state_rx,
+            broadcast_tx,
+            seed_tx,
+        };
+        drop((snapshot_tx, state_tx));
+
+        let addr: SocketAddr = "10.0.0.2:7946".parse().unwrap_or_else(|_| std::process::abort());
+        let result = handle.announce_seeds(vec![addr]);
+        assert!(result.is_ok(), "announce_seeds must succeed when channel has capacity");
+        // Verify the seeds were sent to the channel.
+        let received = seed_rx.try_recv().unwrap_or_else(|_| std::process::abort());
+        assert_eq!(received, vec![addr], "seed batch must arrive at runtime channel");
+    }
+
+    #[test]
+    fn announce_seeds_returns_closed_when_receiver_dropped() {
+        let (_snapshot_tx, snapshot_rx) = watch::channel(MembershipSnapshot::default());
+        let (_state_tx, state_rx) = watch::channel(GridStateSnapshot::new("test".to_owned()));
+        let (broadcast_tx, _broadcast_rx) = mpsc::channel(1);
+        let (seed_tx, seed_rx) = mpsc::channel::<Vec<SocketAddr>>(16);
+        let handle = SwimHandle {
+            site_name: "test".to_owned(),
+            advertise_addr: "127.0.0.1:7946".parse().unwrap_or_else(|_| std::process::abort()),
+            snapshot_rx,
+            state_rx,
+            broadcast_tx,
+            seed_tx,
+        };
+        // Drop the receiver to simulate the runtime loop having exited.
+        drop(seed_rx);
+
+        let addr: SocketAddr = "10.0.0.2:7946".parse().unwrap_or_else(|_| std::process::abort());
+        let result = handle.announce_seeds(vec![addr]);
+        assert!(
+            matches!(result, Err(SeedAnnounceError::ChannelClosed)),
+            "announce_seeds must return ChannelClosed when receiver is dropped"
+        );
     }
 
     // -----------------------------------------------------------------------

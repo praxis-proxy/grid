@@ -18,7 +18,7 @@ metadata:
 spec:
   gridId: ""                    # auto-generated on first join
   seeds:
-    - grid.cluster-b.example.com:7946
+    - "10.0.0.5:7946"
   gatewayRefs:
     - name: inference-gw
       namespace: praxis-system

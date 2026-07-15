@@ -57,7 +57,9 @@ const HOST_CERTS_DIR: &str = "tests/env/certs";
 /// Returns an error if no provider clusters with models are found, or if any
 /// ephemeral cert generation fails.
 pub(crate) fn verify_mtls_trust(cfg: &EnvConfig) -> Result<(), Box<dyn std::error::Error>> {
-    let consumer_site = consumer_cluster_name(cfg)?;
+    let consumer_site = cfg
+        .consumer_cluster_name()
+        .ok_or("no consumer cluster configured in environment config")?;
     let mut tally = Tally::default();
     let mut found = false;
 
@@ -78,21 +80,6 @@ pub(crate) fn verify_mtls_trust(cfg: &EnvConfig) -> Result<(), Box<dyn std::erro
     }
 
     tally.print_summary()
-}
-
-/// Resolve the consumer cluster name from the environment config.
-fn consumer_cluster_name(cfg: &EnvConfig) -> Result<&str, Box<dyn std::error::Error>> {
-    cfg.clusters
-        .names
-        .iter()
-        .find(|name| {
-            cfg.clusters
-                .definitions
-                .get(*name)
-                .is_some_and(|d| d.role == ClusterRole::Consumer)
-        })
-        .map(String::as_str)
-        .ok_or_else(|| "no consumer cluster configured in environment config".into())
 }
 
 // ---------------------------------------------------------------------------

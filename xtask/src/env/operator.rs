@@ -14,11 +14,12 @@
 //! 6. Kill the operator process.
 
 use std::{
-    io::Write as _,
     net::{SocketAddr, UdpSocket},
     process::{Child, Command, Stdio},
     time::{Duration, Instant},
 };
+
+use super::kubectl;
 
 /// Time allowed for the operator to reconcile a provider's status.
 pub(crate) const STATUS_POLL_TIMEOUT: Duration = Duration::from_secs(60);
@@ -219,6 +220,13 @@ pub(crate) const SWIM_NODE_PRIMARY_NAME: &str = "swim-node-p";
 /// SWIM site identity for the secondary operator.
 pub(crate) const SWIM_NODE_SECONDARY_NAME: &str = "swim-node-s";
 
+/// `GridNetwork` resource name used by the CRD-seed SWIM validation.
+///
+/// Kept distinct from [`SWIM_TEST_NETWORK`] so both validations can coexist.
+/// The CRD-seed test uses `spec.seeds` instead of `GRID_SWIM_SEEDS` to drive
+/// peer discovery, proving the CRD path rather than the env-var path.
+pub(crate) const CRD_SEEDS_TEST_NETWORK: &str = "op-e2e-swim-crd-seeds-net";
+
 // ---------------------------------------------------------------------------
 // SWIM overlay validation constants
 // ---------------------------------------------------------------------------
@@ -378,7 +386,7 @@ pub(crate) fn install_grid_crds(context: &str) -> Result<(), Box<dyn std::error:
     eprintln!("  generating Grid CRDs...");
     let crd_json = generate_crd_json()?;
     eprintln!("  installing Grid CRDs in {context}...");
-    apply_manifest(context, &crd_json)?;
+    kubectl::apply_manifest(context, &crd_json)?;
     eprintln!("  [OK] Grid CRDs installed");
     Ok(())
 }
@@ -442,9 +450,9 @@ pub(crate) fn apply_test_fixtures(context: &str, provider_endpoint: &str) -> Res
         Some(TEST_HEALTHY_ROUTING_CLUSTER),
     );
     let invalid = provider_fixture_json(TEST_PROVIDER_INVALID, TEST_NETWORK, "", None);
-    apply_manifest(context, &network)?;
-    apply_manifest(context, &healthy)?;
-    apply_manifest(context, &invalid)?;
+    kubectl::apply_manifest(context, &network)?;
+    kubectl::apply_manifest(context, &healthy)?;
+    kubectl::apply_manifest(context, &invalid)?;
     eprintln!("  [OK] test fixtures applied");
     Ok(())
 }
@@ -693,8 +701,58 @@ pub(crate) fn apply_swim_test_network(context: &str) -> Result<(), Box<dyn std::
         eprintln!("SWIM test network serialization failed: {e}");
         std::process::exit(1);
     });
-    apply_manifest(context, &manifest)?;
+    kubectl::apply_manifest(context, &manifest)?;
     eprintln!("  [OK] SWIM test GridNetwork {SWIM_TEST_NETWORK} applied");
+    Ok(())
+}
+
+/// Apply the `GridNetwork` fixture for the CRD-seed SWIM validation.
+///
+/// Unlike [`apply_swim_test_network`], this fixture sets `spec.seeds` to the
+/// supplied list of socket addresses so the operator reconcile loop can announce
+/// those peers via `SwimHandle::announce_seeds` without any `GRID_SWIM_SEEDS`
+/// env var.
+///
+/// # Why this proves CRD-driven seeds
+///
+/// Both operators are started with `GRID_SWIM_SEEDS=""`.  The secondary operator
+/// has no peer at startup.  After this fixture is applied, the secondary's
+/// `GridNetwork` reconcile calls `parse_crd_seeds(spec.seeds, local_addr)`
+/// which filters out the primary address only if it matches the secondary's
+/// own `local_addr`; since it does not, the secondary announces to the primary
+/// via the SWIM runtime channel.  SWIM gossip then converges and the `GridNetwork`
+/// reaches `Active`.
+///
+/// # Errors
+///
+/// Returns an error if the manifest cannot be serialised or `kubectl apply` fails.
+pub(crate) fn apply_swim_test_network_with_seeds(
+    context: &str,
+    seeds: &[SocketAddr],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let seeds_json: Vec<String> = seeds.iter().map(SocketAddr::to_string).collect();
+    let manifest = serde_json::to_string_pretty(&serde_json::json!({
+        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "kind": "GridNetwork",
+        "metadata": { "name": CRD_SEEDS_TEST_NETWORK },
+        "spec": { "seeds": seeds_json }
+    }))
+    .unwrap_or_else(|e| {
+        eprintln!("CRD-seeds test network serialization failed: {e}");
+        std::process::exit(1);
+    });
+    kubectl::apply_manifest(context, &manifest)?;
+    eprintln!("  [OK] CRD-seed GridNetwork {CRD_SEEDS_TEST_NETWORK} applied (seeds={seeds:?})");
+    Ok(())
+}
+
+/// Delete resources created by the CRD-seed SWIM validation.
+///
+/// Safe to call before a fresh run — all deletes use `--ignore-not-found`.
+pub(crate) fn cleanup_swim_crd_seeds_test_resources(context: &str) -> Result<(), Box<dyn std::error::Error>> {
+    delete_cluster_resource(context, "gridnetwork", CRD_SEEDS_TEST_NETWORK)?;
+    cleanup_auto_discovered_gridsites_for_network(context, CRD_SEEDS_TEST_NETWORK);
+    eprintln!("  [OK] stale CRD-seed SWIM test resources removed");
     Ok(())
 }
 
@@ -721,7 +779,7 @@ pub(crate) fn apply_swim_test_provider(context: &str) -> Result<(), Box<dyn std:
         eprintln!("SWIM test provider serialization failed: {e}");
         std::process::exit(1);
     });
-    apply_manifest(context, &manifest)?;
+    kubectl::apply_manifest(context, &manifest)?;
     eprintln!("  [OK] SWIM test InferenceProvider {SWIM_TEST_PROVIDER} applied (model={SWIM_TEST_PROVIDER_MODEL})");
     Ok(())
 }
@@ -1128,8 +1186,8 @@ pub(crate) fn apply_error_endpoint_fixture(context: &str) -> Result<(), Box<dyn 
         eprintln!("error endpoint Service serialization failed: {e}");
         std::process::exit(1);
     });
-    apply_manifest(context, &pod)?;
-    apply_manifest(context, &svc)?;
+    kubectl::apply_manifest(context, &pod)?;
+    kubectl::apply_manifest(context, &svc)?;
     eprintln!("  [OK] error endpoint applied (Pod + Service)");
     Ok(())
 }
@@ -1249,7 +1307,7 @@ pub(crate) fn apply_metrics_endpoint_pod(
         eprintln!("metrics endpoint Pod serialization failed: {e}");
         std::process::exit(1);
     });
-    apply_manifest(context, &pod)?;
+    kubectl::apply_manifest(context, &pod)?;
     eprintln!("  [OK] metrics endpoint Pod {name} applied");
     Ok(())
 }
@@ -1386,7 +1444,7 @@ pub(crate) fn apply_metrics_provider_fixtures(
             eprintln!("metrics provider fixture serialization failed: {e}");
             std::process::exit(1);
         });
-        apply_manifest(context, &manifest)?;
+        kubectl::apply_manifest(context, &manifest)?;
     }
     eprintln!("  [OK] metrics provider fixtures applied");
     Ok(())
@@ -1494,10 +1552,10 @@ pub(crate) fn apply_metrics_routing_fixtures(
             eprintln!("metrics-routing provider serialization failed: {e}");
             std::process::exit(1)
         });
-        apply_manifest(context, &manifest)?;
+        kubectl::apply_manifest(context, &manifest)?;
     }
 
-    apply_manifest(context, &network)?;
+    kubectl::apply_manifest(context, &network)?;
     eprintln!(
         "  [OK] metrics-routing fixtures applied \
          ({METRICS_ROUTING_EAST_PROVIDER}@{east_site}/{east_metrics_port}, \
@@ -1658,7 +1716,7 @@ pub(crate) fn apply_degraded_provider_fixture(context: &str, endpoint: &str) -> 
         eprintln!("degraded provider fixture serialization failed: {e}");
         std::process::exit(1);
     });
-    apply_manifest(context, &manifest)?;
+    kubectl::apply_manifest(context, &manifest)?;
     eprintln!("  [OK] degraded provider fixture applied");
     Ok(())
 }
@@ -1694,7 +1752,7 @@ pub(crate) fn apply_api_provider_fixture(context: &str, endpoint: &str) -> Resul
         eprintln!("api provider fixture serialization failed: {e}");
         std::process::exit(1);
     });
-    apply_manifest(context, &manifest)?;
+    kubectl::apply_manifest(context, &manifest)?;
     eprintln!(
         "  [OK] api provider fixture applied \
          (auth.strategy=bearer_token, secretRef={API_PROVIDER_SECRET_NAME:?}/{API_PROVIDER_SECRET_KEY:?})"
@@ -1921,11 +1979,11 @@ pub(crate) fn apply_full_grid_fixtures(
         std::process::exit(1)
     });
 
-    apply_manifest(context, &network)?;
-    apply_manifest(context, &east)?;
-    apply_manifest(context, &west)?;
-    apply_manifest(context, &cloud)?;
-    apply_manifest(context, &api)?;
+    kubectl::apply_manifest(context, &network)?;
+    kubectl::apply_manifest(context, &east)?;
+    kubectl::apply_manifest(context, &west)?;
+    kubectl::apply_manifest(context, &cloud)?;
+    kubectl::apply_manifest(context, &api)?;
     eprintln!(
         "  [OK] full-grid fixtures applied (east={east_site}/{FULL_GRID_MODEL_EAST}, \
          west={west_site}/{FULL_GRID_MODEL_WEST}, cloud/{FULL_GRID_MODEL_CLOUD}, \
@@ -2109,8 +2167,8 @@ pub(crate) fn apply_swim_overlay_test_fixtures(
         eprintln!("SWIM overlay provider fixture serialization failed: {e}");
         std::process::exit(1);
     });
-    apply_manifest(context, &network)?;
-    apply_manifest(context, &provider)?;
+    kubectl::apply_manifest(context, &network)?;
+    kubectl::apply_manifest(context, &provider)?;
     eprintln!(
         "  [OK] SWIM overlay fixtures applied (network={SWIM_OVERLAY_NETWORK}, \
          provider={SWIM_OVERLAY_PROVIDER}, model={SWIM_OVERLAY_MODEL})"
@@ -2249,8 +2307,8 @@ pub(crate) fn apply_swim_routing_east_fixtures(
         eprintln!("SWIM routing east provider fixture serialization failed: {e}");
         std::process::exit(1);
     });
-    apply_manifest(context, &network)?;
-    apply_manifest(context, &provider)?;
+    kubectl::apply_manifest(context, &network)?;
+    kubectl::apply_manifest(context, &provider)?;
     eprintln!(
         "  [OK] SWIM routing east fixtures applied \
          (network={SWIM_ROUTING_NETWORK}, provider={SWIM_ROUTING_EAST_PROVIDER}, \
@@ -2304,8 +2362,8 @@ pub(crate) fn apply_swim_routing_west_fixtures(
         eprintln!("SWIM routing west provider fixture serialization failed: {e}");
         std::process::exit(1);
     });
-    apply_manifest(context, &network)?;
-    apply_manifest(context, &provider)?;
+    kubectl::apply_manifest(context, &network)?;
+    kubectl::apply_manifest(context, &provider)?;
     eprintln!(
         "  [OK] SWIM routing west fixtures applied \
          (network={SWIM_ROUTING_NETWORK}, provider={SWIM_ROUTING_WEST_PROVIDER}, \
@@ -2459,11 +2517,11 @@ pub(crate) fn apply_multi_provider_fixtures(
     provider_endpoint: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let network = network_fixture_json(TEST_NETWORK, TEST_GATEWAY_NAME, TEST_GATEWAY_NS);
-    apply_manifest(context, &network)?;
+    kubectl::apply_manifest(context, &network)?;
     for &(site_name, models) in providers {
         let fixture_name = multi_provider_fixture_name(site_name);
         let json = multi_provider_fixture_json(&fixture_name, TEST_NETWORK, provider_endpoint, site_name, models);
-        apply_manifest(context, &json)?;
+        kubectl::apply_manifest(context, &json)?;
     }
     eprintln!("  [OK] multi-provider fixtures applied ({} sites)", providers.len());
     Ok(())
@@ -2569,22 +2627,6 @@ fn kubectl_jsonpath_ns(
         ])
         .output()?;
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
-}
-
-/// Apply a manifest string to `context` via `kubectl apply -f -`.
-pub(crate) fn apply_manifest(context: &str, manifest: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let mut child = Command::new("kubectl")
-        .args(["--context", context, "apply", "-f", "-"])
-        .stdin(Stdio::piped())
-        .spawn()?;
-    if let Some(stdin) = child.stdin.as_mut() {
-        stdin.write_all(manifest.as_bytes())?;
-    }
-    let status = child.wait()?;
-    if !status.success() {
-        return Err(format!("kubectl apply failed: {status}").into());
-    }
-    Ok(())
 }
 
 /// Force-delete a Pod immediately, bypassing graceful termination.
@@ -2696,7 +2738,7 @@ pub(crate) fn apply_site_join_network(context: &str, local_site_name: &str) -> R
         eprintln!("site-join GridNetwork serialization failed: {e}");
         std::process::exit(1);
     });
-    apply_manifest(context, &manifest)?;
+    kubectl::apply_manifest(context, &manifest)?;
     eprintln!("  [OK] GridNetwork {SITE_JOIN_NETWORK:?} applied (localSiteName={local_site_name:?})");
     Ok(())
 }
@@ -2717,7 +2759,7 @@ pub(crate) fn apply_site_join_wrong_network(context: &str) -> Result<(), Box<dyn
         eprintln!("site-join wrong GridNetwork serialization failed: {e}");
         std::process::exit(1);
     });
-    apply_manifest(context, &manifest)?;
+    kubectl::apply_manifest(context, &manifest)?;
     eprintln!("  [OK] GridNetwork {SITE_JOIN_WRONG_NETWORK:?} applied (isolation target)");
     Ok(())
 }
@@ -2756,7 +2798,7 @@ pub(crate) fn apply_gridsite(
         eprintln!("GridSite {site_name} serialization failed: {e}");
         std::process::exit(1);
     });
-    apply_manifest(context, &manifest)?;
+    kubectl::apply_manifest(context, &manifest)?;
     eprintln!(
         "  [OK] GridSite {site_name:?} applied \
          (network={network_ref:?}, egress={egress_addr:?}, label={label_value:?})"
@@ -2956,7 +2998,7 @@ pub(crate) fn apply_site_join_primary_provider(
         eprintln!("site-join primary provider serialization failed: {e}");
         std::process::exit(1);
     });
-    apply_manifest(context, &manifest)?;
+    kubectl::apply_manifest(context, &manifest)?;
     eprintln!(
         "  [OK] InferenceProvider {SITE_JOIN_PRIMARY_PROVIDER:?} applied \
          (model={model:?}, siteSelector=primary)"
@@ -2994,7 +3036,7 @@ pub(crate) fn apply_site_join_joining_provider(
         eprintln!("site-join joining provider serialization failed: {e}");
         std::process::exit(1);
     });
-    apply_manifest(context, &manifest)?;
+    kubectl::apply_manifest(context, &manifest)?;
     eprintln!(
         "  [OK] InferenceProvider {SITE_JOIN_JOINING_PROVIDER:?} applied \
          (model={model:?}, siteSelector=joining)"
@@ -3024,7 +3066,7 @@ pub(crate) fn apply_site_join_wrong_provider(context: &str) -> Result<(), Box<dy
         eprintln!("site-join wrong provider serialization failed: {e}");
         std::process::exit(1);
     });
-    apply_manifest(context, &manifest)?;
+    kubectl::apply_manifest(context, &manifest)?;
     eprintln!(
         "  [OK] InferenceProvider {SITE_JOIN_WRONG_PROVIDER:?} applied \
          (wrong network, must be absent from {SITE_JOIN_NETWORK:?} overlay)"
@@ -3394,8 +3436,8 @@ pub(crate) fn apply_failover_east_fixtures(
         eprintln!("failover east provider serialization failed: {e}");
         std::process::exit(1);
     });
-    apply_manifest(context, &network)?;
-    apply_manifest(context, &provider)?;
+    kubectl::apply_manifest(context, &network)?;
+    kubectl::apply_manifest(context, &provider)?;
     eprintln!(
         "  [OK] failover east fixtures applied \
          ({FAILOVER_EAST_PROVIDER}, model={model:?}, routingClusterRef={east_site:?})"
@@ -3525,7 +3567,7 @@ pub(crate) fn apply_failover_shared_east_provider(
         eprintln!("failover shared-east provider serialization failed: {e}");
         std::process::exit(1);
     });
-    apply_manifest(context, &manifest)?;
+    kubectl::apply_manifest(context, &manifest)?;
     eprintln!(
         "  [OK] {FAILOVER_SHARED_EAST_PROVIDER:?} applied \
          (backendKind=local, model={FAILOVER_SHARED_MODEL:?}, routingClusterRef={east_site:?})"
@@ -3573,8 +3615,8 @@ pub(crate) fn apply_failover_west_fixtures_with_shared(
         eprintln!("failover west provider (with-shared) serialization failed: {e}");
         std::process::exit(1);
     });
-    apply_manifest(context, &network)?;
-    apply_manifest(context, &provider)?;
+    kubectl::apply_manifest(context, &network)?;
+    kubectl::apply_manifest(context, &provider)?;
     eprintln!(
         "  [OK] failover west fixtures (with-shared) applied \
          ({FAILOVER_WEST_PROVIDER}, models=[{FAILOVER_REMOTE_MODEL:?}, {FAILOVER_SHARED_MODEL:?}], \
@@ -3835,7 +3877,7 @@ pub(crate) fn create_api_credential_secret(
         "",
     ]
     .join("\n");
-    apply_manifest(context, &manifest)?;
+    kubectl::apply_manifest(context, &manifest)?;
     eprintln!(
         "  [OK] credential Secret {name:?} created in {namespace:?} \
          (key={key:?}, token not logged)"

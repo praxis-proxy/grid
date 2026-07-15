@@ -23,6 +23,7 @@ use crate::env::{
     config::{ClusterDef, ClusterRole, EnvConfig},
     images::GATEWAY_IMAGE,
     kind::kubectl_context,
+    kubectl,
     operator_overlay::{self, RoutingOverlay},
     verify::{HttpResponse, PortForwardGuard, Tally, find_free_port, parse_curl_output, safe_truncate, wait_for_port},
 };
@@ -51,9 +52,6 @@ const GATEWAY_HTTP_PORT: u16 = 8080;
 /// `NodePort` range minimum for provider gateway exposure.
 const NODE_PORT_BASE: u16 = 30080;
 
-/// Rollout timeout in seconds.
-const ROLLOUT_TIMEOUT_SECS: u32 = 120;
-
 /// Network probe timeout.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -65,29 +63,6 @@ const CERT_MOUNT_PATH: &str = "/etc/praxis/tls";
 
 /// Host-side cert directory (relative to workspace root).
 const HOST_CERTS_DIR: &str = "tests/env/certs";
-
-// ---------------------------------------------------------------------------
-// Consumer cluster resolution
-// ---------------------------------------------------------------------------
-
-/// Resolve the consumer cluster name from the environment config.
-///
-/// Returns the name of the first cluster declared with
-/// [`ClusterRole::Consumer`].  Returns an error if no consumer cluster is
-/// configured.
-fn consumer_cluster_name(cfg: &EnvConfig) -> Result<&str, Box<dyn std::error::Error>> {
-    cfg.clusters
-        .names
-        .iter()
-        .find(|name| {
-            cfg.clusters
-                .definitions
-                .get(*name)
-                .is_some_and(|d| d.role == ClusterRole::Consumer)
-        })
-        .map(String::as_str)
-        .ok_or_else(|| "no consumer cluster configured in environment config".into())
-}
 
 // ---------------------------------------------------------------------------
 // Network probe
@@ -106,7 +81,9 @@ pub(crate) fn probe_network(cfg: &EnvConfig) -> Result<(), Box<dyn std::error::E
     eprintln!("Probing cross-kind network connectivity...");
     eprintln!();
 
-    let consumer_site = consumer_cluster_name(cfg)?;
+    let consumer_site = cfg
+        .consumer_cluster_name()
+        .ok_or("no consumer cluster configured in environment config")?;
     let consumer_ctx = kubectl_context(consumer_site);
 
     for name in &cfg.clusters.names {
@@ -296,7 +273,9 @@ pub(crate) fn deploy_consumer(
     cfg: &EnvConfig,
     overlay_config: Option<&Path>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let consumer_site = consumer_cluster_name(cfg)?;
+    let consumer_site = cfg
+        .consumer_cluster_name()
+        .ok_or("no consumer cluster configured in environment config")?;
     let consumer_ctx = kubectl_context(consumer_site);
     eprintln!("  deploying consumer gateway to {consumer_ctx}...");
 
@@ -328,7 +307,7 @@ pub(crate) fn deploy_consumer(
     apply_consumer_deployment(&consumer_ctx)?;
     rollout_restart(&consumer_ctx, "praxis-consumer")?;
 
-    wait_for_rollout(&consumer_ctx, "praxis-consumer", consumer_site)?;
+    kubectl::wait_for_rollout(&consumer_ctx, "praxis-consumer", consumer_site)?;
 
     eprintln!("  [PASS] consumer gateway ready in {consumer_ctx}");
     Ok(())
@@ -557,7 +536,7 @@ fn create_consumer_tls_secret(context: &str, consumer_site: &str) -> Result<(), 
     }
 
     let yaml = String::from_utf8(output.stdout)?;
-    apply_manifest(context, &yaml)
+    kubectl::apply_manifest(context, &yaml)
 }
 
 /// Apply the consumer gateway `ConfigMap`.
@@ -582,7 +561,7 @@ fn apply_consumer_config(
          {}\n",
         indent_yaml(&config, 4)
     );
-    apply_manifest(context, &yaml)
+    kubectl::apply_manifest(context, &yaml)
 }
 
 /// Build the consumer Praxis config YAML.
@@ -749,7 +728,7 @@ fn apply_consumer_deployment(context: &str) -> Result<(), Box<dyn std::error::Er
          \x20   - port: {GATEWAY_HTTP_PORT}\n\
          \x20     targetPort: {GATEWAY_HTTP_PORT}\n"
     );
-    apply_manifest(context, &yaml)
+    kubectl::apply_manifest(context, &yaml)
 }
 
 // ---------------------------------------------------------------------------
@@ -854,7 +833,9 @@ pub(crate) fn deploy_consumer_for_api_fallback(
     api_provider_endpoint: &str,
     api_provider_token: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let consumer_site = consumer_cluster_name(cfg)?;
+    let consumer_site = cfg
+        .consumer_cluster_name()
+        .ok_or("no consumer cluster configured in environment config")?;
     let consumer_ctx = kubectl_context(consumer_site);
     eprintln!("  deploying api-fallback consumer gateway to {consumer_ctx}...");
 
@@ -885,11 +866,11 @@ pub(crate) fn deploy_consumer_for_api_fallback(
          {}\n",
         indent_yaml(&config, 4)
     );
-    apply_manifest(&consumer_ctx, &yaml)?;
+    kubectl::apply_manifest(&consumer_ctx, &yaml)?;
 
     apply_consumer_deployment(&consumer_ctx)?;
     rollout_restart(&consumer_ctx, "praxis-consumer")?;
-    wait_for_rollout(&consumer_ctx, "praxis-consumer", consumer_site)?;
+    kubectl::wait_for_rollout(&consumer_ctx, "praxis-consumer", consumer_site)?;
 
     eprintln!("  [PASS] api-fallback consumer gateway ready in {consumer_ctx}");
     Ok(())
@@ -1002,7 +983,9 @@ pub(crate) fn deploy_consumer_for_full_grid(
     api_endpoint: &str,
     api_provider_token: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let consumer_site = consumer_cluster_name(cfg)?;
+    let consumer_site = cfg
+        .consumer_cluster_name()
+        .ok_or("no consumer cluster configured in environment config")?;
     let consumer_ctx = kubectl_context(consumer_site);
     eprintln!("  deploying full-grid consumer gateway to {consumer_ctx}...");
 
@@ -1035,10 +1018,10 @@ pub(crate) fn deploy_consumer_for_full_grid(
          {}\n",
         indent_yaml(&config, 4)
     );
-    apply_manifest(&consumer_ctx, &yaml)?;
+    kubectl::apply_manifest(&consumer_ctx, &yaml)?;
     apply_consumer_deployment(&consumer_ctx)?;
     rollout_restart(&consumer_ctx, "praxis-consumer")?;
-    wait_for_rollout(&consumer_ctx, "praxis-consumer", consumer_site)?;
+    kubectl::wait_for_rollout(&consumer_ctx, "praxis-consumer", consumer_site)?;
 
     eprintln!("  [PASS] full-grid consumer gateway ready in {consumer_ctx}");
     Ok(())
@@ -1058,7 +1041,9 @@ pub(crate) fn verify_full_grid_e2e(
     cloud_model: &str,
     api_model: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let consumer_site = consumer_cluster_name(cfg)?;
+    let consumer_site = cfg
+        .consumer_cluster_name()
+        .ok_or("no consumer cluster configured in environment config")?;
     let mut tally = Tally::default();
     let ctx = kubectl_context(consumer_site);
 
@@ -1197,7 +1182,9 @@ pub(crate) fn verify_api_fallback_e2e(
     mock_api_port: Option<u16>,
     api_provider_secret: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let consumer_site = consumer_cluster_name(cfg)?;
+    let consumer_site = cfg
+        .consumer_cluster_name()
+        .ok_or("no consumer cluster configured in environment config")?;
     let mut tally = Tally::default();
     let ctx = kubectl_context(consumer_site);
 
@@ -1275,7 +1262,9 @@ pub(crate) fn verify_api_fallback_e2e(
 /// Returns an error if any assertion fails.
 #[expect(clippy::too_many_lines, reason = "multi-cluster E2E verification loop")]
 pub(crate) fn verify_e2e(cfg: &EnvConfig) -> Result<(), Box<dyn std::error::Error>> {
-    let consumer_site = consumer_cluster_name(cfg)?;
+    let consumer_site = cfg
+        .consumer_cluster_name()
+        .ok_or("no consumer cluster configured in environment config")?;
     let mut tally = Tally::default();
     let ctx = kubectl_context(consumer_site);
 
@@ -1551,23 +1540,6 @@ pub(crate) fn verify_credential_injection(
 // Shared helpers
 // ---------------------------------------------------------------------------
 
-/// Apply a Kubernetes YAML manifest via `kubectl apply -f -`.
-fn apply_manifest(context: &str, yaml: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let mut child = Command::new("kubectl")
-        .args(["--context", context, "apply", "-f", "-"])
-        .stdin(std::process::Stdio::piped())
-        .spawn()?;
-
-    if let Some(stdin) = child.stdin.as_mut() {
-        std::io::Write::write_all(stdin, yaml.as_bytes())?;
-    }
-    let status = child.wait()?;
-    if !status.success() {
-        return Err(format!("kubectl apply failed: {status}").into());
-    }
-    Ok(())
-}
-
 /// Build the `kubectl rollout restart` argument list.
 ///
 /// Separated from [`rollout_restart`] so tests can verify the argument
@@ -1588,7 +1560,7 @@ fn rollout_restart_args(context: &str, deployment: &str) -> Vec<String> {
 ///
 /// `kubectl apply` updates a `ConfigMap` but does not restart the pod.  Calling
 /// this after applying the consumer config ensures the pod reloads with the
-/// new configuration before [`wait_for_rollout`] declares it ready.
+/// new configuration before [`kubectl::wait_for_rollout`] declares it ready.
 ///
 /// **xtask validation concern only.**  In production, Praxis detects
 /// `ConfigMap` mount changes via a file-watch and reloads without a pod
@@ -1601,30 +1573,6 @@ fn rollout_restart(context: &str, deployment: &str) -> Result<(), Box<dyn std::e
         .status()?;
     if !status.success() {
         return Err(format!("kubectl rollout restart {deployment} failed: {status}").into());
-    }
-    Ok(())
-}
-
-/// Wait for a Deployment rollout to complete.
-fn wait_for_rollout(context: &str, deployment: &str, cluster: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let timeout = format!("{ROLLOUT_TIMEOUT_SECS}s");
-    let resource = format!("deployment/{deployment}");
-    eprintln!("  waiting for {deployment} in {cluster}...");
-    let status = Command::new("kubectl")
-        .args([
-            "--context",
-            context,
-            "-n",
-            NAMESPACE,
-            "rollout",
-            "status",
-            &resource,
-            "--timeout",
-            &timeout,
-        ])
-        .status()?;
-    if !status.success() {
-        return Err(format!("{deployment} rollout timed out in {cluster}").into());
     }
     Ok(())
 }

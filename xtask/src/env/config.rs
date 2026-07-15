@@ -180,6 +180,24 @@ impl EnvConfig {
         Ok(config)
     }
 
+    /// Return the name of the first cluster with [`ClusterRole::Consumer`] role.
+    ///
+    /// Returns `None` when no consumer cluster is configured.  Call sites
+    /// that require a consumer cluster should convert `None` to an error
+    /// with their own diagnostic message via `.ok_or(...)`.
+    pub(crate) fn consumer_cluster_name(&self) -> Option<&str> {
+        self.clusters
+            .names
+            .iter()
+            .find(|name| {
+                self.clusters
+                    .definitions
+                    .get(*name)
+                    .is_some_and(|d| d.role == ClusterRole::Consumer)
+            })
+            .map(String::as_str)
+    }
+
     /// Validate cross-field constraints.
     fn validate(&self) -> Result<(), ConfigError> {
         for name in &self.clusters.names {
@@ -433,6 +451,89 @@ vertex = { port = 10004, project = "test-project" }
             def.backend,
             ProviderBackend::MockOpenai,
             "mock-openai backend must parse correctly"
+        );
+    }
+
+    #[test]
+    fn consumer_cluster_name_returns_consumer_cluster() {
+        let toml = r#"
+[clusters]
+names = ["provider-a", "consumer-b"]
+
+[clusters.provider-a]
+models = ["model-x"]
+role = "provider"
+
+[clusters.consumer-b]
+models = []
+role = "consumer"
+
+[providers]
+openai = { port = 10001 }
+anthropic = { port = 10002 }
+bedrock = { port = 10003, region = "us-east-1" }
+vertex = { port = 10004, project = "test-project" }
+"#;
+        let cfg = EnvConfig::from_str(toml).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            cfg.consumer_cluster_name(),
+            Some("consumer-b"),
+            "must return the consumer cluster name"
+        );
+    }
+
+    #[test]
+    fn consumer_cluster_name_returns_none_when_no_consumer_exists() {
+        let toml = r#"
+[clusters]
+names = ["provider-a"]
+
+[clusters.provider-a]
+models = ["model-x"]
+role = "provider"
+
+[providers]
+openai = { port = 10001 }
+anthropic = { port = 10002 }
+bedrock = { port = 10003, region = "us-east-1" }
+vertex = { port = 10004, project = "test-project" }
+"#;
+        let cfg = EnvConfig::from_str(toml).unwrap_or_else(|_| std::process::abort());
+        assert!(
+            cfg.consumer_cluster_name().is_none(),
+            "must return None when no consumer cluster is configured"
+        );
+    }
+
+    #[test]
+    fn consumer_cluster_name_works_regardless_of_cluster_ordering() {
+        let toml = r#"
+[clusters]
+names = ["provider-b", "provider-c", "consumer-last"]
+
+[clusters.provider-b]
+models = ["model-b"]
+role = "provider"
+
+[clusters.provider-c]
+models = ["model-c"]
+role = "provider"
+
+[clusters.consumer-last]
+models = []
+role = "consumer"
+
+[providers]
+openai = { port = 10001 }
+anthropic = { port = 10002 }
+bedrock = { port = 10003, region = "us-east-1" }
+vertex = { port = 10004, project = "test-project" }
+"#;
+        let cfg = EnvConfig::from_str(toml).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            cfg.consumer_cluster_name(),
+            Some("consumer-last"),
+            "must find consumer even when it appears last in names list"
         );
     }
 

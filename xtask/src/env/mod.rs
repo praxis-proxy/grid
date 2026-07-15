@@ -6,6 +6,7 @@ pub(crate) mod consumer;
 pub(crate) mod gateway;
 pub(crate) mod images;
 pub(crate) mod kind;
+pub(crate) mod kubectl;
 pub(crate) mod operator;
 pub(crate) mod operator_overlay;
 pub(crate) mod providers;
@@ -258,6 +259,35 @@ pub(crate) enum Action {
     /// Safe to rerun: the `GridNetwork` and `InferenceProvider` fixtures are
     /// deleted at the start of each run.
     VerifySwimState {
+        /// Path to the environment config file.
+        #[arg(short, long, default_value = "tests/env/operator-routing.toml")]
+        config: PathBuf,
+
+        /// Kind cluster context to run against (first provider site by default).
+        #[arg(long)]
+        site: Option<String>,
+    },
+
+    /// Prove that `GridNetwork.spec.seeds` drives SWIM mesh formation.
+    ///
+    /// Starts two out-of-cluster operator processes with
+    /// `GRID_SWIM_SEEDS=""` (env-var seeds intentionally empty).  Applies a
+    /// `GridNetwork` with `spec.seeds` containing the primary operator's UDP
+    /// address.  Both operators reconcile the `GridNetwork`, the secondary
+    /// reads `spec.seeds` and announces to the primary via the CRD-driven
+    /// seed path, and SWIM gossip converges.
+    ///
+    /// Asserts:
+    /// - Both operators started with `GRID_SWIM_SEEDS=""`.
+    /// - `GridNetwork.spec.seeds` contains the primary's address.
+    /// - `status.phase = Active` and `status.connectedSites >= 1`.
+    ///
+    /// This proves that CRD-sourced seeds alone are sufficient for mesh
+    /// formation — no env-var seeds are required.
+    ///
+    /// Requires a kind cluster with Grid CRDs.  Run `env up` first.
+    /// Safe to rerun: fixtures are deleted at the start of each run.
+    VerifySwimCrdSeeds {
         /// Path to the environment config file.
         #[arg(short, long, default_value = "tests/env/operator-routing.toml")]
         config: PathBuf,
@@ -532,6 +562,7 @@ pub(crate) fn run(action: &Action) -> Result<(), Box<dyn std::error::Error>> {
         Action::ValidateOperatorRouting { config, site } => env_validate_operator_routing(config, site.as_deref()),
         Action::VerifySwimMembership { config, site } => env_verify_swim_membership(config, site.as_deref()),
         Action::VerifySwimState { config, site } => env_verify_swim_state(config, site.as_deref()),
+        Action::VerifySwimCrdSeeds { config, site } => env_verify_swim_crd_seeds(config, site.as_deref()),
         Action::ValidateAll { config, site } => env_validate_all(config, site.as_deref()),
         Action::VerifyApiFallback { config, site } => env_verify_api_fallback(config, site.as_deref()),
         Action::VerifyCrdSchema => env_verify_crd_schema(),
@@ -725,18 +756,7 @@ fn env_verify_api_fallback(config: &Path, site: Option<&str>) -> Result<(), Box<
     let context = resolve_operator_context(&cfg, site)?;
     eprintln!("verify-api-fallback: context={context}");
 
-    let consumer_site = cfg
-        .clusters
-        .names
-        .iter()
-        .find(|n| {
-            cfg.clusters
-                .definitions
-                .get(*n)
-                .is_some_and(|d| d.role == ClusterRole::Consumer)
-        })
-        .map(String::as_str)
-        .ok_or("no consumer cluster in config")?;
+    let consumer_site = cfg.consumer_cluster_name().ok_or("no consumer cluster in config")?;
     let consumer_ctx = kind::kubectl_context(consumer_site);
 
     // ── Step 1: deploy provider gateways ────────────────────────────────────
@@ -1302,6 +1322,89 @@ fn env_verify_swim_membership(config: &Path, site: Option<&str>) -> Result<(), B
     Ok(())
 }
 
+/// Prove that `GridNetwork.spec.seeds` drives SWIM peer discovery without env-var seeds.
+///
+/// **Why this proves the CRD path:**
+///
+/// Both operators start with `GRID_SWIM_SEEDS=""` — no startup seeds at all.
+/// After the `GridNetwork` fixture is applied with `spec.seeds = [bind1]`,
+/// each operator reconciles the resource and calls `announce_crd_seeds`:
+/// - Primary: `parse_crd_seeds([bind1], Some(bind1)) → []` (self-filtered) → no announce
+/// - Secondary: `parse_crd_seeds([bind1], Some(bind2)) → [bind1]` → announces to primary
+///
+/// SWIM gossip then converges and `GridNetwork.status.phase` becomes `Active`.
+/// The `GRID_SWIM_SEEDS` env var is empty for both operators throughout.
+#[expect(
+    clippy::too_many_lines,
+    reason = "sequential CRD-seed kind steps: CRD install, two operator spawns, fixture apply with seeds, convergence wait, poll, cleanup"
+)]
+fn env_verify_swim_crd_seeds(config: &Path, site: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    use operator::{
+        CRD_SEEDS_TEST_NETWORK, SWIM_CONVERGENCE_WAIT, SWIM_NODE_PRIMARY_NAME, SWIM_NODE_SECONDARY_NAME,
+        SWIM_STATUS_POLL_TIMEOUT,
+    };
+
+    let cfg = EnvConfig::from_file(config)?;
+    let context = resolve_operator_context(&cfg, site)?;
+    eprintln!("verify-swim-crd-seeds: context={context}");
+
+    // Step 1: install Grid CRDs and remove any stale CRD-seed test resources.
+    operator::install_grid_crds(&context)?;
+    operator::cleanup_swim_crd_seeds_test_resources(&context)?;
+
+    let (bind1, bind2) = reserve_swim_bind_addrs()?;
+    let bind1_addr: std::net::SocketAddr = bind1
+        .parse()
+        .map_err(|e| format!("failed to parse bind1 addr {bind1:?}: {e}"))?;
+
+    // Step 2: start primary operator — NO GRID_SWIM_SEEDS, no peer at startup.
+    // The primary will self-filter bind1 when it reads spec.seeds later.
+    let op1 = operator::spawn_operator_with_swim(&context, &bind1, &bind1, SWIM_NODE_PRIMARY_NAME, "")?;
+    let mut op1_guard = ProcGuard(Some(op1), "operator-primary-crd");
+
+    // Step 3: start secondary operator — NO GRID_SWIM_SEEDS, no peer at startup.
+    // The secondary will announce to bind1 only after reading spec.seeds from the CRD.
+    let op2 = operator::spawn_operator_with_swim(&context, &bind2, &bind2, SWIM_NODE_SECONDARY_NAME, "")?;
+    let mut op2_guard = ProcGuard(Some(op2), "operator-secondary-crd");
+
+    // Step 4: apply the GridNetwork fixture with spec.seeds = [bind1].
+    // This is the key CRD-driven step: neither operator used GRID_SWIM_SEEDS.
+    // The secondary operator's reconcile will call parse_crd_seeds → announce_seeds → SWIM announce.
+    // The primary operator's reconcile will self-filter bind1 and announce nothing.
+    operator::apply_swim_test_network_with_seeds(&context, &[bind1_addr])?;
+    eprintln!(
+        "  GridNetwork {CRD_SEEDS_TEST_NETWORK} applied with spec.seeds=[{bind1}]; \
+         awaiting CRD-driven SWIM convergence..."
+    );
+
+    // Step 5: wait for the reconcile + announce + SWIM gossip to converge.
+    // The operators must reconcile the GridNetwork, call announce_seeds, and complete
+    // the foca gossip cycle. SWIM_CONVERGENCE_WAIT (10 s) covers this window.
+    operator::wait_for_swim_convergence(SWIM_CONVERGENCE_WAIT);
+
+    // Step 6: poll until the GridNetwork status reflects the SWIM membership.
+    let result = operator::wait_for_gridnetwork_active(&context, CRD_SEEDS_TEST_NETWORK, SWIM_STATUS_POLL_TIMEOUT);
+
+    // Always stop both operators before propagating errors.
+    if let Some(c) = op1_guard.0.take() {
+        operator::kill_operator(c);
+    }
+    if let Some(c) = op2_guard.0.take() {
+        operator::kill_operator(c);
+    }
+    operator::cleanup_swim_crd_seeds_test_resources(&context)?;
+
+    // Step 7: verify the result.
+    let connected_sites = result?;
+    operator::verify_swim_status("Active", connected_sites)?;
+
+    eprintln!(
+        "verify-swim-crd-seeds: PASS (connectedSites={connected_sites}; \
+         CRD seed path proven — both operators started with no GRID_SWIM_SEEDS)"
+    );
+    Ok(())
+}
+
 /// Prove that live CRDT state propagates between two SWIM-enabled operators via foca broadcast.
 ///
 /// Proves real `InferenceProvider`-derived CRDT state propagates over SWIM gossip.
@@ -1652,16 +1755,7 @@ fn reserve_swim_bind_addrs() -> Result<(String, String), Box<dyn std::error::Err
 
 /// Resolve the first consumer-role cluster name from the environment config.
 fn resolve_consumer_site(cfg: &EnvConfig) -> Result<&str, Box<dyn std::error::Error>> {
-    cfg.clusters
-        .names
-        .iter()
-        .find(|name| {
-            cfg.clusters
-                .definitions
-                .get(*name)
-                .is_some_and(|d| d.role == ClusterRole::Consumer)
-        })
-        .map(String::as_str)
+    cfg.consumer_cluster_name()
         .ok_or_else(|| "no consumer cluster in config".into())
 }
 
@@ -1960,18 +2054,7 @@ fn env_verify_full_grid_routing(config: &Path) -> Result<(), Box<dyn std::error:
     eprintln!("verify-full-grid-routing: loading two-provider config...");
 
     // Resolve consumer cluster and context.
-    let consumer_site = cfg
-        .clusters
-        .names
-        .iter()
-        .find(|n| {
-            cfg.clusters
-                .definitions
-                .get(*n)
-                .is_some_and(|d| d.role == ClusterRole::Consumer)
-        })
-        .map(String::as_str)
-        .ok_or("no consumer cluster in config")?;
+    let consumer_site = cfg.consumer_cluster_name().ok_or("no consumer cluster in config")?;
     let consumer_ctx = kind::kubectl_context(consumer_site);
 
     // Resolve the two provider sites (east = first, west = second).
