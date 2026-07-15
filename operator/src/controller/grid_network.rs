@@ -1722,6 +1722,97 @@ mod tests {
         );
     }
 
+    #[test]
+    fn staleness_override_dead_then_alive_restores_phase() {
+        // Recovery: provider was Degraded when west was Dead; after rejoin west is Alive
+        // and the override must no longer apply — phase returns to Available.
+        // This is the pure-function equivalent of the rejoin recovery proof.
+        let provider = make_crdt_provider("site-west", crdt::ProviderPhase::Available);
+
+        // Partition: Dead → Degraded
+        let dead_membership = make_swim_membership("site-west", MemberStatus::Dead);
+        let degraded = apply_swim_staleness_override(std::slice::from_ref(&provider), Some(&dead_membership));
+        assert_eq!(
+            degraded.first().map(|p| &p.phase),
+            Some(&crdt::ProviderPhase::Degraded),
+            "Dead peer must produce Degraded phase (partition)"
+        );
+
+        // Recovery: Alive → Available (override lifted)
+        let alive_membership = make_swim_membership("site-west", MemberStatus::Alive);
+        let recovered = apply_swim_staleness_override(std::slice::from_ref(&provider), Some(&alive_membership));
+        assert_eq!(
+            recovered.first().map(|p| &p.phase),
+            Some(&crdt::ProviderPhase::Available),
+            "Alive peer after rejoin must restore Available phase (recovery)"
+        );
+    }
+
+    #[test]
+    fn staleness_override_suspect_then_alive_restores_phase() {
+        // Same recovery path but starting from Suspect rather than Dead.
+        let provider = make_crdt_provider("site-west", crdt::ProviderPhase::Available);
+        let suspect_membership = make_swim_membership("site-west", MemberStatus::Suspect);
+        let degraded = apply_swim_staleness_override(std::slice::from_ref(&provider), Some(&suspect_membership));
+        assert_eq!(
+            degraded.first().map(|p| &p.phase),
+            Some(&crdt::ProviderPhase::Degraded),
+            "Suspect peer must produce Degraded phase"
+        );
+        let alive_membership = make_swim_membership("site-west", MemberStatus::Alive);
+        let recovered = apply_swim_staleness_override(&[provider], Some(&alive_membership));
+        assert_eq!(
+            recovered.first().map(|p| &p.phase),
+            Some(&crdt::ProviderPhase::Available),
+            "Alive peer must restore Available phase after Suspect"
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "two-provider membership fixture with inline vec construction"
+    )]
+    fn staleness_override_multiple_providers_only_dead_site_degraded() {
+        // Multi-provider recovery: west is Dead, east is Alive.
+        // Only west's provider becomes Degraded; east's provider stays Available.
+        let west_provider = make_crdt_provider("site-west", crdt::ProviderPhase::Available);
+        let east_provider = make_crdt_provider("site-east", crdt::ProviderPhase::Available);
+        let membership = MembershipSnapshot {
+            members: vec![
+                MemberRecord {
+                    site_id: "site-west".to_owned(),
+                    endpoint: "10.0.0.2:7946".to_owned(),
+                    incarnation: 0,
+                    status: MemberStatus::Dead,
+                    age_secs: 0,
+                },
+                MemberRecord {
+                    site_id: "site-east".to_owned(),
+                    endpoint: "10.0.0.1:7946".to_owned(),
+                    incarnation: 0,
+                    status: MemberStatus::Alive,
+                    age_secs: 0,
+                },
+            ],
+        };
+        let result = apply_swim_staleness_override(&[west_provider, east_provider], Some(&membership));
+        let west = result
+            .iter()
+            .find(|p| p.site_id == "site-west")
+            .unwrap_or_else(|| std::process::abort());
+        let east = result
+            .iter()
+            .find(|p| p.site_id == "site-east")
+            .unwrap_or_else(|| std::process::abort());
+        assert_eq!(west.phase, crdt::ProviderPhase::Degraded, "Dead west must be Degraded");
+        assert_eq!(
+            east.phase,
+            crdt::ProviderPhase::Available,
+            "Alive east must stay Available"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // resolve_grid_id — pure ID resolution (three branches)
     // -----------------------------------------------------------------------

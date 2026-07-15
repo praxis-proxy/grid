@@ -250,8 +250,12 @@ fn kv_cache_score(metrics: Option<&BackendMetrics>) -> f64 {
 }
 
 /// Computes prefix cache score (0.0 to 1.0, higher = warmer).
+///
+/// Clamps the hit ratio to `[0.0, 1.0]` before use so that an out-of-range
+/// value from a misconfigured exporter or a schema-incompatible remote site
+/// cannot inflate or deflate the score beyond expected bounds.
 fn prefix_cache_score(metrics: Option<&BackendMetrics>) -> f64 {
-    metrics.map_or(DEFAULT_SIGNAL_SCORE, |m| m.prefix_cache_hit_ratio)
+    metrics.map_or(DEFAULT_SIGNAL_SCORE, |m| m.prefix_cache_hit_ratio.clamp(0.0, 1.0))
 }
 
 // ---------------------------------------------------------------------------
@@ -430,6 +434,50 @@ mod tests {
             result.first().map(|b| b.name.as_str()),
             Some("warm"),
             "backend with warm prefix cache should rank first"
+        );
+    }
+
+    #[test]
+    fn prefix_cache_score_clamped_above_one() {
+        // prefix_cache_hit_ratio > 1.0 must not inflate the score above the signal weight.
+        let metrics = BackendMetrics::new(0.0, true, 0.0, 0.0, 1.5, 0.0);
+        assert_eq!(
+            prefix_cache_score(Some(&metrics)),
+            1.0,
+            "prefix_cache_hit_ratio > 1.0 must be clamped to 1.0"
+        );
+    }
+
+    #[test]
+    fn prefix_cache_score_clamped_below_zero() {
+        // Negative prefix_cache_hit_ratio (malformed metric) must not produce a negative score.
+        let metrics = BackendMetrics::new(0.0, true, 0.0, 0.0, -0.5, 0.0);
+        assert_eq!(
+            prefix_cache_score(Some(&metrics)),
+            0.0,
+            "prefix_cache_hit_ratio < 0.0 must be clamped to 0.0"
+        );
+    }
+
+    #[test]
+    fn latency_score_high_raw_ms_clamped_at_zero() {
+        // Very high latency (>= MAX_LATENCY) must produce a score of 0.0, not negative.
+        let metrics = BackendMetrics::new(0.0, true, 0.0, 10_000.0, 0.0, 0.0);
+        assert_eq!(
+            latency_score(Some(&metrics)),
+            0.0,
+            "latency_p99_ms >= MAX_LATENCY must yield 0.0 score, not negative"
+        );
+    }
+
+    #[test]
+    fn latency_score_neutral_at_half_max() {
+        // At 2500ms (half of MAX_LATENCY=5000), latency score must be 0.5.
+        let metrics = BackendMetrics::new(0.0, true, 0.0, 2500.0, 0.0, 0.0);
+        let score = latency_score(Some(&metrics));
+        assert!(
+            (score - 0.5).abs() < f64::EPSILON,
+            "latency at 2500ms must produce score 0.5, got {score}"
         );
     }
 

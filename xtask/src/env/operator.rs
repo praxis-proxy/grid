@@ -374,6 +374,21 @@ pub(crate) const SWIM_DEAD_MEMBER_WAIT: Duration = Duration::from_secs(20);
 /// Timeout for polling the overlay until a remote candidate becomes `fresh=false`.
 pub(crate) const FAILOVER_STALE_POLL_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Wait after restarting a killed SWIM peer before checking recovery.
+///
+/// After restart the rejoining operator announces to seeds, SWIM detects it
+/// `Alive`, the east operator reconciles (triggered by `GridNetwork` bump), and the
+/// overlay is regenerated.  20 s matches [`SWIM_DEAD_MEMBER_WAIT`] and provides
+/// enough headroom on loaded CI hosts.
+pub(crate) const FAILOVER_REJOIN_WAIT: Duration = Duration::from_secs(20);
+
+/// Timeout for polling the overlay until a remote candidate returns to `fresh=true`.
+///
+/// Recovery requires SWIM Alive detection + east reconcile + overlay render.
+/// The reconcile is triggered by a `bump_gridnetwork` call immediately after
+/// restart, so the principal variable is SWIM convergence time (~6 s max).
+pub(crate) const FAILOVER_RECOVERY_POLL_TIMEOUT: Duration = Duration::from_secs(45);
+
 // ---------------------------------------------------------------------------
 // CRD installation
 // ---------------------------------------------------------------------------
@@ -3525,6 +3540,71 @@ pub(crate) fn wait_for_remote_candidate_stale(
         if Instant::now() >= deadline {
             return Err(
                 format!("timeout waiting for remote candidate {remote_cluster:?} to become fresh=false").into(),
+            );
+        }
+        #[expect(clippy::disallowed_methods, reason = "polling wait between overlay reads")]
+        std::thread::sleep(Duration::from_secs(2));
+    }
+}
+
+/// Poll the overlay `ConfigMap` until a remote candidate has `fresh=true`.
+///
+/// Called during rejoin recovery to confirm that the east overlay reflects the
+/// recovered west SWIM peer.  The condition is met once SWIM marks the rejoined
+/// peer `Alive` and the east operator re-renders the overlay.
+///
+/// Bumps the `GridNetwork` every `RECOVERY_BUMP_INTERVAL` seconds so that as
+/// soon as SWIM fires a `Joined` event and updates the membership snapshot, the
+/// operator performs a fresh reconcile and the overlay reflects `fresh=true`.
+/// A single pre-poll bump is insufficient because the `Joined` event may arrive
+/// after the first reconcile completes (the bump and the SWIM Alive detection are
+/// asynchronous with respect to each other).
+///
+/// # Errors
+///
+/// Returns an error when `timeout` elapses without `fresh=true` for the candidate.
+#[expect(
+    clippy::too_many_lines,
+    reason = "polling loop with periodic bump + overlay read + deadline check; splitting would hide the recovery protocol"
+)]
+pub(crate) fn wait_for_remote_candidate_fresh(
+    context: &str,
+    network: &str,
+    gw: &str,
+    remote_cluster: &str,
+    timeout: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    const RECOVERY_BUMP_INTERVAL: Duration = Duration::from_secs(5);
+    let deadline = Instant::now() + timeout;
+    let mut last_bump = Instant::now() - RECOVERY_BUMP_INTERVAL; // trigger first bump immediately
+    loop {
+        // Periodic bump: ensure the operator reconciles after each SWIM membership
+        // update so the overlay reflects the latest fresh=true state.
+        if last_bump.elapsed() >= RECOVERY_BUMP_INTERVAL {
+            if let Err(e) = bump_gridnetwork(context, network) {
+                eprintln!("  [warn] recovery bump failed (will retry): {e}");
+            }
+            last_bump = Instant::now();
+        }
+
+        if let Ok(overlay) = read_overlay_configmap(context, network, gw, "default") {
+            let fresh = overlay
+                .get("candidates")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|cands| {
+                    cands.iter().any(|c| {
+                        c.get("cluster").and_then(serde_json::Value::as_str) == Some(remote_cluster)
+                            && c.get("fresh").and_then(serde_json::Value::as_bool) == Some(true)
+                    })
+                });
+            if fresh {
+                eprintln!("  [OK] overlay: remote candidate {remote_cluster:?} recovered to fresh=true");
+                return Ok(());
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(
+                format!("timeout waiting for remote candidate {remote_cluster:?} to recover to fresh=true").into(),
             );
         }
         #[expect(clippy::disallowed_methods, reason = "polling wait between overlay reads")]

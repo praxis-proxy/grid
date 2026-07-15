@@ -212,6 +212,63 @@ Both inputs are converted into the same scoring model before overlay rendering.
 Remote records are filtered by network and local site identity so a site does
 not route to its own CRDT echo or to providers from another `GridNetwork`.
 
+## Metrics normalization contract
+
+The `scoring::BackendMetrics` struct is the boundary between metrics ingestion
+and the scoring engine.  The following table defines the normalization
+responsibility at each layer:
+
+| Signal | Expected range in `BackendMetrics` | Normalization owner |
+|---|---|---|
+| `error_rate` | `[0.0, 1.0]` (ratio) | Prometheus exporter; clamped in the operator ingestion layer |
+| `healthy` | `bool` | Derived by the operator from a health gauge or error rate |
+| `kv_cache_utilization` | `[0.0, 1.0]` (ratio) | Prometheus exporter; clamped in the operator ingestion layer |
+| `latency_p99_ms` | `≥ 0.0 ms` (raw milliseconds) | Prometheus exporter exposes a pre-computed P99 gauge; the **scoring engine** normalizes internally using `MAX_LATENCY = 5000 ms` |
+| `prefix_cache_hit_ratio` | `[0.0, 1.0]` (ratio) | Prometheus exporter; clamped in the scoring engine |
+| `queue_depth` | `[0.0, 1.0]` (ratio) | **Must be pre-normalized by the exporter or recording rule**; raw integer queue counts are not accepted |
+
+### Destination-normalized metrics preferred
+
+Sites and clusters should normalize their own capability metrics where
+possible: the Prometheus exporter (or a recording rule on the destination)
+is responsible for converting raw queue depths to a `[0.0, 1.0]` ratio.
+This is the preferred pattern because heterogeneous sites can adapt
+normalization to their local context (different maximum queue depths,
+different latency budgets).
+
+For cloud-managed providers and third-party APIs where the destination
+cannot export normalized metrics, the Grid operator may apply an adapter
+in a future revision.
+
+### Missing-value defaults
+
+When a provider has no live metrics (no `spec.metricsConfig`, scrape
+failure, or absent CRDT record), scored signals default to neutral values
+and health/error signals default to no evidence of failure:
+
+| Signal | Default | Effect |
+|---|---|---|
+| `error_rate` | `0.0` | No evidence of errors; used for health derivation, not direct scoring |
+| `healthy` | `true` | Assume reachable until evidence of failure |
+| `kv_cache_utilization` | `0.5` | Neutral |
+| `latency_p99_ms` | `2500.0 ms` | `1.0 - 2500/5000 = 0.5` neutral latency score |
+| `prefix_cache_hit_ratio` | `0.5` | Neutral |
+| `queue_depth` | `0.5` | Neutral |
+
+### NaN and infinity
+
+Prometheus scraping drops NaN and ±Inf values at parse time.  CRDT values
+are treated as absent when non-finite and then defaulted/clamped in
+`crdt_metrics_to_backend`.  The scoring engine does not re-validate for
+NaN/Inf; callers must not propagate non-finite values.
+
+### Deferred: KV-cache affinity
+
+Routing decisions based on KV-cache affinity (routing requests to backends
+that already hold relevant KV-cache entries) are deferred until this
+normalization contract is stable.  The current `kv_cache_utilization` signal
+influences scoring but does not implement affinity-aware routing.
+
 ## Relevant files
 
 | File | Role |

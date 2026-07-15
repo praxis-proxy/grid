@@ -193,20 +193,45 @@ pub(crate) fn crdt_phase_to_fresh(phase: &crdt::ProviderPhase) -> Option<bool> {
 
 /// Convert a [`crdt::ProviderMetricsSnapshot`] to [`scoring::BackendMetrics`].
 ///
-/// Fields that are `None` in the CRDT record default to neutral values so
-/// the remote provider is treated the same as a local provider with no
-/// Prometheus metrics configured (neutral 0.5 signal score).  The only
-/// exception is `error_rate`, which defaults to `0.0` (no errors) so
-/// providers with unknown health are not penalised on error rate.
+/// # Defaults for absent fields
+///
+/// | Field | Missing default | Rationale |
+/// |---|---|---|
+/// | `error_rate` | `0.0` | No evidence of errors → do not penalise |
+/// | `healthy` | `true` | Assume reachable until evidence of failure |
+/// | `kv_cache_utilization` | `0.5` | Neutral (no signal) |
+/// | `latency_p99_ms` | `2500.0` | Neutral: `1.0 - 2500/5000 = 0.5` latency score |
+/// | `prefix_cache_hit_ratio` | `0.5` | Neutral (no signal) |
+/// | `queue_depth` | `0.5` | Neutral (no signal) |
+///
+/// Using `2500.0` for missing latency (rather than `0.0` or `0.5`) matches the
+/// local Prometheus scrape path (`PartialMetrics::into_backend_metrics`) and
+/// avoids inflating the latency score of remote providers whose latency has not
+/// yet been observed.
+///
+/// # Sanitize remote signals
+///
+/// CRDT values are produced by remote operators which may run a different
+/// software version.  Non-finite values fall back to the same defaults as
+/// absent values, ratio signals are clamped to `[0.0, 1.0]`, and latency is
+/// clamped to `≥ 0.0` so that a misbehaving or outdated remote site cannot
+/// corrupt overlay scoring through invalid or out-of-range values.
 pub(crate) fn crdt_metrics_to_backend(m: &crdt::ProviderMetricsSnapshot) -> scoring::BackendMetrics {
     scoring::BackendMetrics {
-        error_rate: m.error_rate.unwrap_or(0.0),
+        error_rate: finite_or(m.error_rate, 0.0).clamp(0.0, 1.0),
         healthy: m.healthy.unwrap_or(true),
-        kv_cache_utilization: m.kv_cache_utilization.unwrap_or(UNMAPPED_NEUTRAL_SIGNAL),
-        latency_p99_ms: m.latency_p99_ms.unwrap_or(UNMAPPED_NEUTRAL_SIGNAL),
-        prefix_cache_hit_ratio: m.prefix_cache_hit_ratio.unwrap_or(UNMAPPED_NEUTRAL_SIGNAL),
-        queue_depth: m.queue_depth.unwrap_or(UNMAPPED_NEUTRAL_SIGNAL),
+        kv_cache_utilization: finite_or(m.kv_cache_utilization, UNMAPPED_NEUTRAL_SIGNAL).clamp(0.0, 1.0),
+        latency_p99_ms: finite_or(m.latency_p99_ms, NEUTRAL_LATENCY_MS).max(0.0),
+        prefix_cache_hit_ratio: finite_or(m.prefix_cache_hit_ratio, UNMAPPED_NEUTRAL_SIGNAL).clamp(0.0, 1.0),
+        queue_depth: finite_or(m.queue_depth, UNMAPPED_NEUTRAL_SIGNAL).clamp(0.0, 1.0),
     }
+}
+
+/// Return `value` if it is `Some` and finite, otherwise return `default`.
+///
+/// Drops NaN and ±Inf so they cannot corrupt downstream scoring.
+fn finite_or(value: Option<f64>, default: f64) -> f64 {
+    value.filter(|v| v.is_finite()).unwrap_or(default)
 }
 
 /// Convert one remote CRDT provider record to [`RoutingCandidate`]s, one per model.
@@ -306,9 +331,21 @@ pub(crate) fn remote_crdt_provider_to_backend_config(provider: &crdt::ProviderSt
     ))
 }
 
-/// Neutral signal score when no live metrics are available; matches
-/// `scoring::DEFAULT_SIGNAL_SCORE` which is not exported from the scoring crate.
+/// Neutral signal score when no live metrics are available; mirrors
+/// `scoring::DEFAULT_SIGNAL_SCORE` (not exported) so unmapped providers score
+/// the same as providers with no observed metrics.
 const UNMAPPED_NEUTRAL_SIGNAL: f64 = 0.5;
+
+/// Neutral latency value (ms) applied when no latency observation is available.
+///
+/// Chosen so that the scoring formula produces a neutral latency score of 0.5:
+/// `1.0 - NEUTRAL_LATENCY_MS / MAX_LATENCY_MS = 1.0 - 2500 / 5000 = 0.5`.
+///
+/// Both the local Prometheus scrape path (`PartialMetrics::into_backend_metrics`)
+/// and the CRDT remote path (`crdt_metrics_to_backend`) use this constant so that
+/// providers with no latency observation score neutrally on the latency signal in
+/// both paths.
+const NEUTRAL_LATENCY_MS: f64 = 2500.0;
 
 /// Compute the score equivalent to what [`scoring::score_backends`] would
 /// assign to a provider whose `backend_kind` cannot be parsed.
@@ -3191,6 +3228,85 @@ mod tests {
         );
         assert!(bm.error_rate.abs() < f64::EPSILON, "error_rate must default to 0.0");
         assert!(bm.healthy, "healthy must default to true");
+    }
+
+    #[test]
+    fn crdt_metrics_absent_latency_defaults_to_neutral_ms() {
+        // Missing latency must use NEUTRAL_LATENCY_MS (2500.0) so that a remote
+        // provider with no latency observation scores neutrally (0.5) on the latency
+        // signal, not optimally (≈1.0 if 0.5ms were used).
+        let m = crdt::ProviderMetricsSnapshot::default(); // all None
+        let bm = crdt_metrics_to_backend(&m);
+        assert!(
+            (bm.latency_p99_ms - NEUTRAL_LATENCY_MS).abs() < f64::EPSILON,
+            "absent latency_p99_ms must default to {NEUTRAL_LATENCY_MS}ms (neutral), got {}",
+            bm.latency_p99_ms
+        );
+    }
+
+    #[test]
+    fn crdt_metrics_ratio_signals_clamped_above_one() {
+        // Out-of-range ratio values from a remote site with different schema must not
+        // corrupt scoring; they must be clamped to [0.0, 1.0].
+        let m = crdt::ProviderMetricsSnapshot {
+            queue_depth: Some(1.5),
+            kv_cache_utilization: Some(2.0),
+            latency_p99_ms: Some(-100.0), // negative latency → clamp to 0.0
+            prefix_cache_hit_ratio: Some(1.1),
+            error_rate: Some(1.3),
+            healthy: Some(false),
+        };
+        let bm = crdt_metrics_to_backend(&m);
+        assert_eq!(bm.queue_depth, 1.0, "queue_depth > 1.0 must be clamped to 1.0");
+        assert_eq!(bm.kv_cache_utilization, 1.0, "kv_cache > 1.0 must be clamped to 1.0");
+        assert_eq!(bm.latency_p99_ms, 0.0, "negative latency must be clamped to 0.0");
+        assert_eq!(
+            bm.prefix_cache_hit_ratio, 1.0,
+            "prefix_cache_hit_ratio > 1.0 must be clamped to 1.0"
+        );
+        assert_eq!(bm.error_rate, 1.0, "error_rate > 1.0 must be clamped to 1.0");
+        assert!(!bm.healthy, "healthy=false must propagate");
+    }
+
+    #[test]
+    fn crdt_metrics_ratio_signals_clamped_below_zero() {
+        // Negative ratio values must be clamped to 0.0.
+        let m = crdt::ProviderMetricsSnapshot {
+            queue_depth: Some(-0.1),
+            kv_cache_utilization: Some(-0.5),
+            latency_p99_ms: None,
+            prefix_cache_hit_ratio: Some(-1.0),
+            error_rate: Some(-0.2),
+            healthy: Some(true),
+        };
+        let bm = crdt_metrics_to_backend(&m);
+        assert_eq!(bm.queue_depth, 0.0, "negative queue_depth must be clamped to 0.0");
+        assert_eq!(bm.kv_cache_utilization, 0.0, "negative kv_cache must be clamped to 0.0");
+        assert_eq!(
+            bm.prefix_cache_hit_ratio, 0.0,
+            "negative prefix_cache_hit_ratio must be clamped to 0.0"
+        );
+        assert_eq!(bm.error_rate, 0.0, "negative error_rate must be clamped to 0.0");
+    }
+
+    #[test]
+    fn crdt_metrics_non_finite_values_default_before_scoring() {
+        // f64::clamp does not sanitize NaN, so CRDT values must be filtered before
+        // clamping. Treat non-finite values like absent fields.
+        let m = crdt::ProviderMetricsSnapshot {
+            queue_depth: Some(f64::NAN),
+            kv_cache_utilization: Some(f64::INFINITY),
+            latency_p99_ms: Some(f64::NEG_INFINITY),
+            prefix_cache_hit_ratio: Some(f64::NAN),
+            error_rate: Some(f64::INFINITY),
+            healthy: Some(true),
+        };
+        let bm = crdt_metrics_to_backend(&m);
+        assert_eq!(bm.queue_depth, UNMAPPED_NEUTRAL_SIGNAL);
+        assert_eq!(bm.kv_cache_utilization, UNMAPPED_NEUTRAL_SIGNAL);
+        assert_eq!(bm.latency_p99_ms, NEUTRAL_LATENCY_MS);
+        assert_eq!(bm.prefix_cache_hit_ratio, UNMAPPED_NEUTRAL_SIGNAL);
+        assert_eq!(bm.error_rate, 0.0);
     }
 
     // -----------------------------------------------------------------------

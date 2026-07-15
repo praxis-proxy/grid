@@ -2789,14 +2789,24 @@ fn env_verify_site_join_discovery(config: &Path) -> Result<(), Box<dyn std::erro
 /// attributed to east via overlay-position evidence (both mocks echo the same model name in
 /// the response body; the first-candidate position is the stated attribution mechanism).
 ///
+/// **Recovery phase (steps 8–9):**
+///
+/// After the consumer route-away proof, the surviving east operator is also stopped
+/// so both SWIM runtimes lose their in-memory membership state.  East and west are
+/// then restarted with the same bind addresses, with west seeding east.  SWIM detects
+/// west as `Alive`, the staleness override is lifted, and the east overlay reflects
+/// west with `fresh=true` again.  This proves the lost-peer → clean-restart recovery
+/// cycle without requiring fixture reapplication.
+///
 /// **Honest boundaries:**
 /// - Partition is simulated by process kill, not real network-level isolation (`iptables`/`tc`).
 /// - Attribution is overlay-based; this does not prove Praxis hard-excludes `fresh=false` candidates, only that the
 ///   operator correctly deprioritises them behind the healthy alternative for the shared model.
-/// - Recovery after west rejoins and stale-age-based expiry are not implemented.
+/// - Recovery proof is clean-restart SWIM Alive + CRDT republish; in-place rejoin after a hard kill and stale-age-based
+///   expiry are not implemented.
 #[expect(
     clippy::too_many_lines,
-    reason = "sequential 8-step failover proof: gateways, operators, SWIM, shared-model overlay ordering, route-away consumer request"
+    reason = "sequential 10-step failover + recovery proof: gateways, operators, SWIM, shared-model overlay ordering, route-away, rejoin, recovery"
 )]
 #[expect(
     clippy::large_stack_frames,
@@ -2805,8 +2815,9 @@ fn env_verify_site_join_discovery(config: &Path) -> Result<(), Box<dyn std::erro
 fn env_verify_failover_under_lost_peer(config: &Path) -> Result<(), Box<dyn std::error::Error>> {
     use operator::{
         CONFIGMAP_POLL_TIMEOUT, FAILOVER_EAST_PROVIDER, FAILOVER_GW, FAILOVER_LOCAL_MODEL, FAILOVER_NETWORK,
-        FAILOVER_REMOTE_MODEL, FAILOVER_SHARED_MODEL, FAILOVER_STALE_POLL_TIMEOUT, FAILOVER_WEST_PROVIDER,
-        SWIM_CONVERGENCE_WAIT, SWIM_DEAD_MEMBER_WAIT, SWIM_STATUS_POLL_TIMEOUT,
+        FAILOVER_RECOVERY_POLL_TIMEOUT, FAILOVER_REJOIN_WAIT, FAILOVER_REMOTE_MODEL, FAILOVER_SHARED_MODEL,
+        FAILOVER_STALE_POLL_TIMEOUT, FAILOVER_WEST_PROVIDER, SWIM_CONVERGENCE_WAIT, SWIM_DEAD_MEMBER_WAIT,
+        SWIM_STATUS_POLL_TIMEOUT,
     };
 
     let cfg = EnvConfig::from_file(config)?;
@@ -2831,7 +2842,7 @@ fn env_verify_failover_under_lost_peer(config: &Path) -> Result<(), Box<dyn std:
     eprintln!("  primary={east_site} ({east_ctx}), remote={west_site} ({west_ctx})");
 
     // ── Step 1: Preflight ─────────────────────────────────────────────────────
-    eprintln!("verify-failover-under-lost-peer: [1/8] preflight - CRDs, cleanup, operator binary...");
+    eprintln!("verify-failover-under-lost-peer: [1/10] preflight - CRDs, cleanup, operator binary...");
     let build_ok = std::process::Command::new("cargo")
         .args(["build", "--quiet", "-p", "operator", "--bin", "operator"])
         .status()
@@ -2849,7 +2860,7 @@ fn env_verify_failover_under_lost_peer(config: &Path) -> Result<(), Box<dyn std:
     // Gateway deployment enables consumer request routing in step 7.
     // The east mock-epp is patched to also serve FAILOVER_SHARED_MODEL so requests
     // for that model route cleanly through east's provider gateway after west is lost.
-    eprintln!("verify-failover-under-lost-peer: [2/8] deploying provider gateways...");
+    eprintln!("verify-failover-under-lost-peer: [2/10] deploying provider gateways...");
     let east_models = providers.first().map(|(_, m)| m.clone()).unwrap_or_default();
     let west_models = providers.get(1).map(|(_, m)| m.clone()).unwrap_or_default();
     gateway::deploy_all(&cfg)?;
@@ -2882,7 +2893,7 @@ fn env_verify_failover_under_lost_peer(config: &Path) -> Result<(), Box<dyn std:
     }
 
     // ── Step 3: Start SWIM operators ──────────────────────────────────────────
-    eprintln!("verify-failover-under-lost-peer: [3/8] starting SWIM operators...");
+    eprintln!("verify-failover-under-lost-peer: [3/10] starting SWIM operators...");
     let (bind_east, bind_west) = reserve_swim_bind_addrs()?;
     let op_east = operator::spawn_operator_with_swim_for_context(&east_ctx, &bind_east, &bind_east, east_site, "")?;
     let mut op_east_guard = ProcGuard(Some(op_east), "operator-east");
@@ -2892,7 +2903,7 @@ fn env_verify_failover_under_lost_peer(config: &Path) -> Result<(), Box<dyn std:
     eprintln!("  [OK] east (primary) and west (remote) operators started");
 
     // ── Step 4: SWIM convergence + fixtures ───────────────────────────────────
-    eprintln!("verify-failover-under-lost-peer: [4/8] waiting for SWIM convergence and applying fixtures...");
+    eprintln!("verify-failover-under-lost-peer: [4/10] waiting for SWIM convergence and applying fixtures...");
     operator::wait_for_swim_convergence(SWIM_CONVERGENCE_WAIT);
     // East: local dedicated model + shared model (local, healthy fallback).
     operator::apply_failover_east_fixtures(&east_ctx, east_site, FAILOVER_LOCAL_MODEL)?;
@@ -2913,7 +2924,7 @@ fn env_verify_failover_under_lost_peer(config: &Path) -> Result<(), Box<dyn std:
 
     // ── Step 5: Verify initial overlay ───────────────────────────────────────
     eprintln!(
-        "verify-failover-under-lost-peer: [5/8] verifying initial overlay \
+        "verify-failover-under-lost-peer: [5/10] verifying initial overlay \
          (dedicated + shared models, both providers fresh=true)..."
     );
     operator::bump_gridnetwork(&east_ctx, FAILOVER_NETWORK)?;
@@ -2950,7 +2961,7 @@ fn env_verify_failover_under_lost_peer(config: &Path) -> Result<(), Box<dyn std:
     );
 
     // ── Step 6: Kill west operator ────────────────────────────────────────────
-    eprintln!("verify-failover-under-lost-peer: [6/8] killing west operator - simulating partition...");
+    eprintln!("verify-failover-under-lost-peer: [6/10] killing west operator - simulating partition...");
     if let Some(c) = op_west_guard.0.take() {
         operator::kill_operator(c);
     }
@@ -2966,7 +2977,7 @@ fn env_verify_failover_under_lost_peer(config: &Path) -> Result<(), Box<dyn std:
     std::thread::sleep(SWIM_DEAD_MEMBER_WAIT);
 
     // ── Step 7: Verify stale overlay + route-away proof ───────────────────────
-    eprintln!("verify-failover-under-lost-peer: [7/8] verifying stale overlay and consumer route-away...");
+    eprintln!("verify-failover-under-lost-peer: [7/10] verifying stale overlay and consumer route-away...");
     operator::bump_gridnetwork(&east_ctx, FAILOVER_NETWORK)?;
     eprintln!("  [OK] bumped {FAILOVER_NETWORK:?} to force post-partition reconcile");
 
@@ -3007,11 +3018,8 @@ fn env_verify_failover_under_lost_peer(config: &Path) -> Result<(), Box<dyn std:
     // for the shared model returns 200.  East is the first shared-model candidate.
     // Attribution: overlay-based — both mocks echo the same model name in the response body;
     // first shared-model candidate being east is the stated evidence for routing to the healthy fallback.
+    // East operator is kept alive here (not killed yet) so it can reconcile the recovery phase below.
     let overlay_path = operator::export_overlay_to_file(&east_ctx, FAILOVER_NETWORK, FAILOVER_GW, "default")?;
-    // Kill east operator before deploying consumer so context switches don't race.
-    if let Some(c) = op_east_guard.0.take() {
-        operator::kill_operator(c);
-    }
     let overlay_json = std::fs::read_to_string(&overlay_path)?;
     let overlay = operator_overlay::parse_grid_config_json(&overlay_json)?;
     consumer::deploy_consumer(&cfg, Some(&overlay_path))?;
@@ -3096,18 +3104,103 @@ fn env_verify_failover_under_lost_peer(config: &Path) -> Result<(), Box<dyn std:
             .map_or("(not found)", |c| c.cluster.as_str()),
     );
 
-    // ── Step 8: Cleanup ───────────────────────────────────────────────────────
-    eprintln!("verify-failover-under-lost-peer: [8/8] cleanup...");
-    // East operator already killed before consumer deploy.
+    // ── Step 8: Kill east + both operators down ───────────────────────────────
+    eprintln!("verify-failover-under-lost-peer: [8/10] killing east operator (both operators now down)...");
+    // SWIM incarnation semantics: foca uses per-member incarnation numbers.  When a
+    // member is hard-killed and declared Dead, the cluster records identity state
+    // for that site.  A fresh process restarts at generation/incarnation 0 and
+    // can be treated as a stale announcement when the surviving cluster retains
+    // newer state for that site.
+    //
+    // Recovery proof strategy: kill both operators so SWIM state is cleared,
+    // then restart both fresh.  The Kubernetes CRD fixtures persist on both
+    // clusters (GridNetwork + InferenceProvider resources are durable), so east
+    // and west reconcile against the same resources.  This proves the core
+    // invariant: when SWIM sees the peer as Alive (no stale tombstone), the
+    // overlay emits fresh=true.
+    if let Some(c) = op_east_guard.0.take() {
+        operator::kill_operator(c);
+    }
+    eprintln!("  [OK] east operator killed; both operators are now down");
+
+    // ── Step 9: Restart both operators fresh + verify recovery ───────────────
+    eprintln!("verify-failover-under-lost-peer: [9/10] restarting both operators for recovery proof...");
+    // East restarts with no seeds — it is the primary node of the fresh cluster.
+    let op_east_rejoin =
+        operator::spawn_operator_with_swim_for_context(&east_ctx, &bind_east, &bind_east, east_site, "")?;
+    let mut op_east_rejoin_guard = ProcGuard(Some(op_east_rejoin), "operator-east-rejoin");
+    // West restarts with east as seed and joins the fresh east cluster during
+    // the convergence wait below.
+    let op_west_rejoin =
+        operator::spawn_operator_with_swim_for_context(&west_ctx, &bind_west, &bind_west, west_site, &bind_east)?;
+    let mut op_west_rejoin_guard = ProcGuard(Some(op_west_rejoin), "operator-west-rejoin");
+    eprintln!(
+        "  [OK] both operators restarted (east: bind={bind_east:?}, no seeds; \
+         west: bind={bind_west:?}, seed={bind_east:?})"
+    );
+    eprintln!(
+        "  [INFO] waiting {}s for fresh SWIM convergence...",
+        FAILOVER_REJOIN_WAIT.as_secs()
+    );
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "bounded wait for fresh SWIM cluster convergence after clean restart"
+    )]
+    std::thread::sleep(FAILOVER_REJOIN_WAIT);
+
+    // Poll until east overlay shows west candidate as fresh=true.
+    // The poll function bumps GridNetwork periodically so a reconcile fires after
+    // SWIM detects west Alive and west publishes its CRDT provider state.
+    eprintln!("  [INFO] polling for west recovery (fresh=true) with periodic reconcile bumps...");
+    operator::wait_for_remote_candidate_fresh(
+        &east_ctx,
+        FAILOVER_NETWORK,
+        FAILOVER_GW,
+        west_site,
+        FAILOVER_RECOVERY_POLL_TIMEOUT,
+    )?;
+
+    // Verify overlay ordering is restored: east before west, both fresh=true.
+    operator::verify_failover_overlay(
+        &east_ctx,
+        FAILOVER_NETWORK,
+        FAILOVER_GW,
+        east_site,
+        FAILOVER_LOCAL_MODEL,
+        west_site,
+        FAILOVER_REMOTE_MODEL,
+        false, // expect_remote_stale = false: west is Alive in the fresh cluster
+    )?;
+    operator::verify_shared_model_overlay_ordering(
+        &east_ctx,
+        FAILOVER_NETWORK,
+        FAILOVER_GW,
+        east_site,
+        west_site,
+        false, // expect_west_stale = false: west is Alive in the fresh cluster
+    )?;
+    eprintln!(
+        "  [PASS] recovery overlay: {FAILOVER_EAST_PROVIDER} fresh=true, \
+         {FAILOVER_WEST_PROVIDER} fresh=true; east still first for {FAILOVER_SHARED_MODEL:?}"
+    );
+
+    // ── Step 10: Cleanup ──────────────────────────────────────────────────────
+    eprintln!("verify-failover-under-lost-peer: [10/10] cleanup...");
+    if let Some(c) = op_east_rejoin_guard.0.take() {
+        operator::kill_operator(c);
+    }
+    if let Some(c) = op_west_rejoin_guard.0.take() {
+        operator::kill_operator(c);
+    }
     operator::cleanup_failover_east_resources(&east_ctx)
         .unwrap_or_else(|e| eprintln!("  warning: east cleanup failed: {e}"));
     operator::cleanup_failover_west_resources(&west_ctx)
         .unwrap_or_else(|e| eprintln!("  warning: west cleanup failed: {e}"));
 
     eprintln!(
-        "verify-failover-under-lost-peer: PASS - remote provider marked fresh=false \
-         after west operator killed; east (fresh=true) is first shared-model candidate; \
-         consumer request returns 200 through healthy east candidate"
+        "verify-failover-under-lost-peer: PASS - \
+         [partition] west fresh=false after kill; east routes shared model via healthy fallback; \
+         [recovery] both operators restarted fresh; west fresh=true restored; overlay ordering consistent"
     );
     Ok(())
 }
