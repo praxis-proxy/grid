@@ -104,10 +104,11 @@ spec:
     perMillionInputTokens: 3.0
     perMillionOutputTokens: 15.0
   auth:
-    strategy: api_key           # see Auth doc
+    strategy: bearer_token      # current native path; see Auth doc
     secretRef:
-      name: anthropic-key
+      name: anthropic-token
       namespace: praxis-system
+      key: token
   accessPolicy:
     siteSelector:
       matchLabels: {}           # empty = all sites
@@ -144,6 +145,33 @@ spec:
 The value influences scoring and routing policy. It does not require a specific
 transport implementation; for example, a `cloud_managed` backend can still be
 fronted by Praxis.
+
+### Credential projection
+
+`spec.auth.secretRef` points to a Kubernetes Secret that contains provider
+credential bytes.  For the current native `bearer_token` path:
+
+1. The operator validates that the Secret exists and contains the referenced key.
+2. The routing overlay candidate receives only:
+
+   ```json
+   {
+     "credential": {
+       "strategy": "bearer_token",
+       "secretRef": {
+         "name": "anthropic-token",
+         "namespace": "praxis-system",
+         "key": "token"
+       }
+     }
+   }
+   ```
+
+3. The consumer Praxis config uses `grid_credential_inject` with a `file:` source
+   pointing at a mounted Secret file.
+
+Token bytes do not appear in the overlay `ConfigMap`, `grid_route` candidates,
+filter metadata, or the consumer Praxis `ConfigMap`.
 
 ### Metrics configuration
 

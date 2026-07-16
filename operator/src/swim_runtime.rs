@@ -27,7 +27,12 @@
 //! [`operator::swim`]: crate::swim
 //! [`OperatorCtx`]: crate::controller::grid_network::OperatorCtx
 
-use std::{collections::HashMap, net::SocketAddr, sync::Arc};
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use crdt::GridStateSnapshot;
 use swim::{MemberEvent, NodeId, SwimNode, runtime::TimerEvent};
@@ -67,6 +72,77 @@ pub struct SwimConfig {
     /// An empty list starts a single-node cluster; other peers must
     /// announce to this node to join.
     pub seeds: Vec<SocketAddr>,
+}
+
+// ---------------------------------------------------------------------------
+// Internal runtime member tracking
+// ---------------------------------------------------------------------------
+
+/// Runtime-internal member state that extends [`MemberRecord`] with an
+/// age-tracking instant.
+///
+/// The public [`MemberRecord`] type carries an `age_secs` field but the SWIM
+/// runtime previously always set it to `0`.  This private struct holds the
+/// `status_changed_at` instant required to compute a real elapsed age at
+/// snapshot time.
+///
+/// Conversion to [`MemberRecord`] happens in [`members_snapshot`] by computing
+/// `now.saturating_duration_since(status_changed_at).as_secs()`.
+struct TrackedMember {
+    /// Opaque site identity — mirrors [`MemberRecord::site_id`].
+    site_id: String,
+    /// Advertised SWIM listener address — mirrors [`MemberRecord::endpoint`].
+    endpoint: String,
+    /// Incarnation counter — mirrors [`MemberRecord::incarnation`].
+    incarnation: u64,
+    /// Membership status — mirrors [`MemberRecord::status`].
+    status: MemberStatus,
+    /// Instant when `status` first transitioned to [`MemberStatus::Dead`] or
+    /// [`MemberStatus::Suspect`].  `None` for [`MemberStatus::Alive`] members
+    /// and for members that have never been dead/suspect.
+    ///
+    /// Semantics:
+    /// - Set (or preserved) on the **first** Dead/Suspect transition.
+    /// - Cleared on a [`MemberStatus::Alive`] (Joined) event.
+    /// - Repeated Dead/Suspect events with an existing timestamp are ignored so the age grows monotonically from the
+    ///   initial transition time.
+    status_changed_at: Option<Instant>,
+}
+
+impl TrackedMember {
+    /// Convert to a public [`MemberRecord`], computing `age_secs` from
+    /// `status_changed_at` relative to `now`.
+    ///
+    /// `age_secs` is non-zero only for Dead/Suspect members; Alive members
+    /// always report `0`.
+    fn to_member_record(&self, now: Instant) -> MemberRecord {
+        MemberRecord {
+            site_id: self.site_id.clone(),
+            endpoint: self.endpoint.clone(),
+            incarnation: self.incarnation,
+            status: self.status.clone(),
+            age_secs: self
+                .status_changed_at
+                .map_or(0, |t| now.saturating_duration_since(t).as_secs()),
+        }
+    }
+}
+
+/// Build a [`MembershipSnapshot`] from the current tracked member table.
+///
+/// `now` is injected so callers can use a fixed [`Instant`] for deterministic
+/// testing without sleeps.  In production, pass [`Instant::now()`].
+fn members_snapshot(tracked: &HashMap<String, TrackedMember>, now: Instant) -> MembershipSnapshot {
+    MembershipSnapshot {
+        members: tracked.values().map(|t| t.to_member_record(now)).collect(),
+    }
+}
+
+/// Return true when any tracked member needs age recomputation in snapshots.
+fn has_aging_members(tracked: &HashMap<String, TrackedMember>) -> bool {
+    tracked
+        .values()
+        .any(|t| t.status_changed_at.is_some() && matches!(t.status, MemberStatus::Dead | MemberStatus::Suspect))
 }
 
 /// Internal channels owned by the SWIM runtime loop.
@@ -348,14 +424,15 @@ async fn run_loop(
     let identity = NodeId::new(config.site_name, advertise_addr);
     let (event_tx, _event_rx) = mpsc::channel(1);
     let mut node = SwimNode::new(identity, event_tx);
-    let mut members: HashMap<String, MemberRecord> = HashMap::new();
+    let mut tracked: HashMap<String, TrackedMember> = HashMap::new();
     let mut buf = vec![0_u8; 65_536];
+    let mut age_tick = tokio::time::interval(Duration::from_secs(1));
 
     // Announce to seed peers.  Errors are logged inside SwimNode::announce.
     for &seed_addr in &config.seeds {
         let seed_id = NodeId::new(format!("seed-{seed_addr}"), seed_addr);
         let output = node.announce(seed_id);
-        drain_output(output, &socket, &channels.timer_tx, &mut members, &channels.snapshot_tx).await;
+        drain_output(output, &socket, &channels.timer_tx, &mut tracked, &channels.snapshot_tx).await;
     }
 
     loop {
@@ -370,7 +447,7 @@ async fn run_loop(
                             output,
                             &socket,
                             &channels.timer_tx,
-                            &mut members,
+                            &mut tracked,
                             &channels.snapshot_tx,
                         )
                         .await;
@@ -388,7 +465,7 @@ async fn run_loop(
                     output,
                     &socket,
                     &channels.timer_tx,
-                    &mut members,
+                    &mut tracked,
                     &channels.snapshot_tx,
                 )
                 .await;
@@ -404,7 +481,7 @@ async fn run_loop(
                         gossip_out,
                         &socket,
                         &channels.timer_tx,
-                        &mut members,
+                        &mut tracked,
                         &channels.snapshot_tx,
                     )
                     .await;
@@ -421,10 +498,19 @@ async fn run_loop(
                         output,
                         &socket,
                         &channels.timer_tx,
-                        &mut members,
+                        &mut tracked,
                         &channels.snapshot_tx,
                     )
                     .await;
+                }
+            }
+            _ = age_tick.tick() => {
+                // Age is derived from an internal Instant, but SwimHandle readers
+                // only see the latest published MembershipSnapshot.  Republish
+                // while any member is Dead/Suspect so age_secs advances even when
+                // no new membership event arrives.
+                if has_aging_members(&tracked) {
+                    drop(channels.snapshot_tx.send(members_snapshot(&tracked, Instant::now())));
                 }
             }
         }
@@ -432,11 +518,15 @@ async fn run_loop(
 }
 
 /// Send outbound messages, schedule timers, apply membership events.
+///
+/// Uses [`Instant::now()`] for age tracking so Dead/Suspect transitions record
+/// an accurate wall-clock start time.  The same `now` value is used for all
+/// events processed in a single call, ensuring consistency within one gossip round.
 async fn drain_output(
     output: swim::AccumulatedOutput,
     socket: &UdpSocket,
     timer_tx: &mpsc::Sender<TimerEvent>,
-    members: &mut HashMap<String, MemberRecord>,
+    tracked: &mut HashMap<String, TrackedMember>,
     snapshot_tx: &watch::Sender<MembershipSnapshot>,
 ) {
     for msg in output.messages {
@@ -456,61 +546,88 @@ async fn drain_output(
     }
 
     let mut changed = false;
+    // Capture a single `now` for all events in this batch so age is consistent.
+    let now = Instant::now();
     for event in output.events {
-        apply_member_event(event, members);
+        apply_member_event(event, tracked, now);
         changed = true;
     }
     if changed {
-        let snapshot = MembershipSnapshot {
-            members: members.values().cloned().collect(),
-        };
-        drop(snapshot_tx.send(snapshot));
+        drop(snapshot_tx.send(members_snapshot(tracked, now)));
     }
 }
 
-/// Apply a membership event to the local member map.
-fn apply_member_event(event: MemberEvent, members: &mut HashMap<String, MemberRecord>) {
+/// Apply a membership event to the internal tracked-member table.
+///
+/// `now` is the instant at which the event is being processed.  Pass
+/// [`Instant::now()`] in production; pass a synthetic past instant in tests to
+/// verify age computation without sleeping.
+///
+/// # Age-tracking semantics
+///
+/// | Event | `status_changed_at` | `status` |
+/// |-------|---------------------|---------|
+/// | `Joined` | Cleared (`None`) | `Alive` |
+/// | `Suspect` (first time or was `Alive`) | Set to `now` | `Suspect` |
+/// | `Suspect` (already `Suspect`/`Dead`) | Preserved (age grows monotonically) | `Suspect` |
+/// | `Left` / unknown (`Dead`) | Set to `now` if not already set | `Dead` |
+fn apply_member_event(event: MemberEvent, tracked: &mut HashMap<String, TrackedMember>, now: Instant) {
     match event {
         MemberEvent::Joined { site_name, addr } => {
             tracing::info!(site = %site_name, addr = %addr, "SWIM member joined");
-            members.insert(
+            // Joined always creates/replaces with Alive and clears age tracking.
+            tracked.insert(
                 site_name.clone(),
-                MemberRecord {
+                TrackedMember {
                     site_id: site_name,
                     endpoint: addr.to_string(),
                     incarnation: 0,
                     status: MemberStatus::Alive,
-                    age_secs: 0,
+                    status_changed_at: None,
                 },
             );
         },
         MemberEvent::Left { site_name } => {
             tracing::info!(site = %site_name, "SWIM member left");
-            apply_left_event(site_name, members);
+            apply_left_event(site_name, tracked, now);
         },
         MemberEvent::Suspect { site_name } => {
             tracing::warn!(site = %site_name, "SWIM member suspected");
-            if let Some(r) = members.get_mut(&site_name) {
-                r.status = MemberStatus::Suspect;
+            if let Some(t) = tracked.get_mut(&site_name) {
+                let was_healthy = t.status == MemberStatus::Alive;
+                t.status = MemberStatus::Suspect;
+                // Only record status_changed_at on the first transition from Alive.
+                // Repeated Suspect events preserve the original timestamp so age
+                // grows monotonically from the initial failure.
+                if was_healthy {
+                    t.status_changed_at = Some(now);
+                }
             }
         },
     }
 }
 
-/// Apply a member-left/down event as a dead tombstone.
-fn apply_left_event(site_name: String, members: &mut HashMap<String, MemberRecord>) {
-    if let Some(r) = members.get_mut(&site_name) {
-        r.status = MemberStatus::Dead;
+/// Apply a member-left/down event as a Dead tombstone with age tracking.
+fn apply_left_event(site_name: String, tracked: &mut HashMap<String, TrackedMember>, now: Instant) {
+    if let Some(t) = tracked.get_mut(&site_name) {
+        let was_not_dead = t.status != MemberStatus::Dead;
+        t.status = MemberStatus::Dead;
+        // Only set status_changed_at on the first Dead transition; preserve
+        // the original Suspect timestamp if already suspect so age is continuous.
+        if was_not_dead && t.status_changed_at.is_none() {
+            t.status_changed_at = Some(now);
+        }
         return;
     }
-    members.insert(
+    // Unknown member declared Dead — create a tombstone with age tracking from now.
+    tracked.insert(
         site_name.clone(),
-        MemberRecord {
+        TrackedMember {
             site_id: site_name,
             endpoint: String::new(),
             incarnation: 0,
             status: MemberStatus::Dead,
-            age_secs: 0,
+            status_changed_at: Some(now),
         },
     );
 }
@@ -556,7 +673,7 @@ mod tests {
     }
 
     async fn wait_until_member_alive(handle: &SwimHandle, site_id: &str) {
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
             let found = handle
                 .snapshot()
@@ -570,17 +687,21 @@ mod tests {
                 tokio::time::Instant::now() < deadline,
                 "member {site_id} must become Alive through seed announcement"
             );
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
+    }
+
+    fn now() -> Instant {
+        Instant::now()
     }
 
     #[test]
     fn joined_event_inserts_alive_member() {
-        let mut members = HashMap::new();
-        apply_member_event(joined("site-a"), &mut members);
-        assert!(members.contains_key("site-a"), "member must be inserted");
+        let mut tracked = HashMap::new();
+        apply_member_event(joined("site-a"), &mut tracked, now());
+        assert!(tracked.contains_key("site-a"), "member must be inserted");
         assert_eq!(
-            members.get("site-a").unwrap_or_else(|| std::process::abort()).status,
+            tracked.get("site-a").unwrap_or_else(|| std::process::abort()).status,
             MemberStatus::Alive,
             "joined member must be Alive"
         );
@@ -588,11 +709,11 @@ mod tests {
 
     #[test]
     fn left_event_marks_member_dead() {
-        let mut members = HashMap::new();
-        apply_member_event(joined("site-a"), &mut members);
-        apply_member_event(left("site-a"), &mut members);
+        let mut tracked = HashMap::new();
+        apply_member_event(joined("site-a"), &mut tracked, now());
+        apply_member_event(left("site-a"), &mut tracked, now());
         assert_eq!(
-            members.get("site-a").unwrap_or_else(|| std::process::abort()).status,
+            tracked.get("site-a").unwrap_or_else(|| std::process::abort()).status,
             MemberStatus::Dead,
             "member must be marked Dead after Left event"
         );
@@ -600,10 +721,10 @@ mod tests {
 
     #[test]
     fn left_event_for_unknown_member_inserts_dead_tombstone() {
-        let mut members = HashMap::new();
-        apply_member_event(left("site-a"), &mut members);
+        let mut tracked = HashMap::new();
+        apply_member_event(left("site-a"), &mut tracked, now());
         assert_eq!(
-            members.get("site-a").unwrap_or_else(|| std::process::abort()).status,
+            tracked.get("site-a").unwrap_or_else(|| std::process::abort()).status,
             MemberStatus::Dead,
             "unknown Left event must preserve a Dead tombstone"
         );
@@ -611,11 +732,11 @@ mod tests {
 
     #[test]
     fn suspect_event_marks_member_suspect() {
-        let mut members = HashMap::new();
-        apply_member_event(joined("site-a"), &mut members);
-        apply_member_event(suspect("site-a"), &mut members);
+        let mut tracked = HashMap::new();
+        apply_member_event(joined("site-a"), &mut tracked, now());
+        apply_member_event(suspect("site-a"), &mut tracked, now());
         assert_eq!(
-            members.get("site-a").unwrap_or_else(|| std::process::abort()).status,
+            tracked.get("site-a").unwrap_or_else(|| std::process::abort()).status,
             MemberStatus::Suspect,
             "member status must be Suspect after suspect event"
         );
@@ -623,31 +744,176 @@ mod tests {
 
     #[test]
     fn suspect_event_for_unknown_member_is_ignored() {
-        let mut members = HashMap::new();
-        apply_member_event(suspect("nonexistent"), &mut members);
-        assert!(members.is_empty(), "suspect for unknown member must not insert");
+        let mut tracked = HashMap::new();
+        apply_member_event(suspect("nonexistent"), &mut tracked, now());
+        assert!(tracked.is_empty(), "suspect for unknown member must not insert");
     }
 
     #[test]
     fn multiple_joins_produce_correct_connected_count() {
-        let mut members = HashMap::new();
-        apply_member_event(joined("site-a"), &mut members);
-        apply_member_event(joined("site-b"), &mut members);
-        let snap = MembershipSnapshot {
-            members: members.values().cloned().collect(),
-        };
+        let t = now();
+        let mut tracked = HashMap::new();
+        apply_member_event(joined("site-a"), &mut tracked, t);
+        apply_member_event(joined("site-b"), &mut tracked, t);
+        let snap = members_snapshot(&tracked, t);
         assert_eq!(snap.connected_count(), 2, "two Alive members must give count=2");
     }
 
     #[test]
     fn suspect_member_not_counted_as_connected() {
-        let mut members = HashMap::new();
-        apply_member_event(joined("site-a"), &mut members);
-        apply_member_event(suspect("site-a"), &mut members);
-        let snap = MembershipSnapshot {
-            members: members.values().cloned().collect(),
-        };
+        let t = now();
+        let mut tracked = HashMap::new();
+        apply_member_event(joined("site-a"), &mut tracked, t);
+        apply_member_event(suspect("site-a"), &mut tracked, t);
+        let snap = members_snapshot(&tracked, t);
         assert_eq!(snap.connected_count(), 0, "Suspect member must not count as connected");
+    }
+
+    #[test]
+    fn has_aging_members_false_for_empty_and_alive_members() {
+        let t = now();
+        let mut tracked = HashMap::new();
+        assert!(
+            !has_aging_members(&tracked),
+            "empty table must not require age republish"
+        );
+        apply_member_event(joined("site-a"), &mut tracked, t);
+        assert!(
+            !has_aging_members(&tracked),
+            "Alive members must not require age republish"
+        );
+    }
+
+    #[test]
+    fn has_aging_members_true_for_suspect_and_dead_members() {
+        let t = now();
+        let mut suspect_tracked = HashMap::new();
+        apply_member_event(joined("site-a"), &mut suspect_tracked, t);
+        apply_member_event(suspect("site-a"), &mut suspect_tracked, t);
+        assert!(
+            has_aging_members(&suspect_tracked),
+            "Suspect member must require age republish"
+        );
+
+        let mut dead_tracked = HashMap::new();
+        apply_member_event(left("site-b"), &mut dead_tracked, t);
+        assert!(
+            has_aging_members(&dead_tracked),
+            "Dead member must require age republish"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // SWIM age tracking — deterministic tests using synthetic instants
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn joined_member_has_zero_age() {
+        let t = now();
+        let mut tracked = HashMap::new();
+        apply_member_event(joined("site-a"), &mut tracked, t);
+        let snap = members_snapshot(&tracked, t);
+        let m = snap.members.first().unwrap_or_else(|| std::process::abort());
+        assert_eq!(m.age_secs, 0, "Alive member must have age_secs=0");
+    }
+
+    #[test]
+    fn suspect_event_starts_age_clock() {
+        // Simulate: join at t0, become suspect at t0+30s, snapshot at t0+30s.
+        let t0 = now();
+        let t_suspect = t0 + Duration::from_secs(30);
+        let mut tracked = HashMap::new();
+        apply_member_event(joined("site-a"), &mut tracked, t0);
+        apply_member_event(suspect("site-a"), &mut tracked, t_suspect);
+        let snap = members_snapshot(&tracked, t_suspect);
+        let m = snap.members.first().unwrap_or_else(|| std::process::abort());
+        assert_eq!(m.status, MemberStatus::Suspect);
+        assert_eq!(m.age_secs, 0, "age at the moment of transition must be 0");
+    }
+
+    #[test]
+    fn suspect_age_grows_over_time() {
+        let t0 = now();
+        let t_suspect = t0 + Duration::from_secs(10);
+        let t_snap = t0 + Duration::from_secs(70);
+        let mut tracked = HashMap::new();
+        apply_member_event(joined("site-a"), &mut tracked, t0);
+        apply_member_event(suspect("site-a"), &mut tracked, t_suspect);
+        let snap = members_snapshot(&tracked, t_snap);
+        let m = snap.members.first().unwrap_or_else(|| std::process::abort());
+        assert_eq!(m.status, MemberStatus::Suspect);
+        assert_eq!(m.age_secs, 60, "age must be elapsed since transition (70s - 10s = 60s)");
+    }
+
+    #[test]
+    fn repeated_suspect_preserves_original_timestamp() {
+        // First Suspect at t+10s, second at t+50s. Age at t+70s must be 60s (t+70 - t+10).
+        let t0 = now();
+        let mut tracked = HashMap::new();
+        apply_member_event(joined("site-a"), &mut tracked, t0);
+        apply_member_event(suspect("site-a"), &mut tracked, t0 + Duration::from_secs(10));
+        apply_member_event(suspect("site-a"), &mut tracked, t0 + Duration::from_secs(50));
+        let snap = members_snapshot(&tracked, t0 + Duration::from_secs(70));
+        let m = snap.members.first().unwrap_or_else(|| std::process::abort());
+        assert_eq!(m.age_secs, 60, "repeated Suspect must not reset age clock");
+    }
+
+    #[test]
+    fn dead_event_starts_age_clock() {
+        let t0 = now();
+        let t_dead = t0 + Duration::from_secs(20);
+        let t_snap = t0 + Duration::from_secs(80);
+        let mut tracked = HashMap::new();
+        apply_member_event(joined("site-a"), &mut tracked, t0);
+        apply_member_event(left("site-a"), &mut tracked, t_dead);
+        let snap = members_snapshot(&tracked, t_snap);
+        let m = snap.members.first().unwrap_or_else(|| std::process::abort());
+        assert_eq!(m.status, MemberStatus::Dead);
+        assert_eq!(m.age_secs, 60, "dead age must be 80s - 20s = 60s");
+    }
+
+    #[test]
+    fn suspect_to_dead_preserves_original_suspect_timestamp() {
+        // Suspect at t+10s, then Dead at t+40s. Age at t+70s = 70-10 = 60s.
+        let t0 = now();
+        let mut tracked = HashMap::new();
+        apply_member_event(joined("site-a"), &mut tracked, t0);
+        apply_member_event(suspect("site-a"), &mut tracked, t0 + Duration::from_secs(10));
+        apply_member_event(left("site-a"), &mut tracked, t0 + Duration::from_secs(40));
+        let snap = members_snapshot(&tracked, t0 + Duration::from_secs(70));
+        let m = snap.members.first().unwrap_or_else(|| std::process::abort());
+        assert_eq!(m.status, MemberStatus::Dead);
+        assert_eq!(
+            m.age_secs, 60,
+            "dead after suspect must use original suspect timestamp (60s), not dead transition time (30s)"
+        );
+    }
+
+    #[test]
+    fn alive_after_dead_resets_age_to_zero() {
+        let t0 = now();
+        let mut tracked = HashMap::new();
+        apply_member_event(joined("site-a"), &mut tracked, t0);
+        apply_member_event(left("site-a"), &mut tracked, t0 + Duration::from_secs(10));
+        // Rejoin clears status_changed_at → age=0.
+        apply_member_event(joined("site-a"), &mut tracked, t0 + Duration::from_secs(50));
+        let snap = members_snapshot(&tracked, t0 + Duration::from_secs(70));
+        let m = snap.members.first().unwrap_or_else(|| std::process::abort());
+        assert_eq!(m.status, MemberStatus::Alive);
+        assert_eq!(m.age_secs, 0, "rejoined Alive member must have age=0");
+    }
+
+    #[test]
+    fn unknown_left_creates_dead_tombstone_with_age() {
+        let t0 = now();
+        let t_dead = t0 + Duration::from_secs(15);
+        let t_snap = t0 + Duration::from_secs(75);
+        let mut tracked = HashMap::new();
+        apply_member_event(left("unknown-site"), &mut tracked, t_dead);
+        let snap = members_snapshot(&tracked, t_snap);
+        let m = snap.members.first().unwrap_or_else(|| std::process::abort());
+        assert_eq!(m.status, MemberStatus::Dead);
+        assert_eq!(m.age_secs, 60, "unknown Left tombstone age must be 75s - 15s = 60s");
     }
 
     // -----------------------------------------------------------------------

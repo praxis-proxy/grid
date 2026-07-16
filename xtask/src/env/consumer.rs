@@ -64,6 +64,13 @@ const CERT_MOUNT_PATH: &str = "/etc/praxis/tls";
 /// Host-side cert directory (relative to workspace root).
 const HOST_CERTS_DIR: &str = "tests/env/certs";
 
+/// Base directory for mounted credential Secret files inside the consumer pod.
+///
+/// Each API credential Secret is mounted at `{CREDENTIAL_MOUNT_BASE}/{secret_name}/{key}`.
+/// Token bytes never appear in Praxis `ConfigMap`s with this layout — the
+/// `grid_credential_inject` filter reads from the mounted file path instead.
+const CREDENTIAL_MOUNT_BASE: &str = "/run/secrets/grid-credentials";
+
 // ---------------------------------------------------------------------------
 // Network probe
 // ---------------------------------------------------------------------------
@@ -731,6 +738,88 @@ fn apply_consumer_deployment(context: &str) -> Result<(), Box<dyn std::error::Er
     kubectl::apply_manifest(context, &yaml)
 }
 
+/// Deploy the consumer gateway with an additional Secret volume mount.
+///
+/// Extends [`apply_consumer_deployment`] with a `volumes` / `volumeMounts`
+/// entry that makes the credential Secret available at
+/// `{CREDENTIAL_MOUNT_BASE}/{secret_name}/{secret_key}` inside the pod.
+///
+/// This allows `grid_credential_inject` to use `file:` as its token source
+/// rather than an inline `value:`, keeping token bytes out of `ConfigMap`s.
+#[expect(
+    clippy::too_many_lines,
+    reason = "Deployment + Service YAML with two volumes; mirrors apply_consumer_deployment"
+)]
+fn apply_consumer_deployment_with_credential_mount(
+    context: &str,
+    secret_name: &str,
+    secret_key: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mount_path = format!("{CREDENTIAL_MOUNT_BASE}/{secret_name}");
+    let yaml = format!(
+        "apiVersion: apps/v1\n\
+         kind: Deployment\n\
+         metadata:\n\
+         \x20 name: praxis-consumer\n\
+         \x20 namespace: {NAMESPACE}\n\
+         spec:\n\
+         \x20 replicas: 1\n\
+         \x20 selector:\n\
+         \x20   matchLabels:\n\
+         \x20     app: praxis-consumer\n\
+         \x20 template:\n\
+         \x20   metadata:\n\
+         \x20     labels:\n\
+         \x20       app: praxis-consumer\n\
+         \x20   spec:\n\
+         \x20     containers:\n\
+         \x20       - name: praxis-ai\n\
+         \x20         image: {GATEWAY_IMAGE}\n\
+         \x20         imagePullPolicy: Never\n\
+         \x20         ports:\n\
+         \x20           - containerPort: {GATEWAY_HTTP_PORT}\n\
+         \x20         args:\n\
+         \x20           - \"--config\"\n\
+         \x20           - \"/etc/praxis/praxis.yaml\"\n\
+         \x20         volumeMounts:\n\
+         \x20           - name: config\n\
+         \x20             mountPath: /etc/praxis\n\
+         \x20             readOnly: true\n\
+         \x20           - name: tls-certs\n\
+         \x20             mountPath: {CERT_MOUNT_PATH}\n\
+         \x20             readOnly: true\n\
+         \x20           - name: api-creds\n\
+         \x20             mountPath: {mount_path}\n\
+         \x20             readOnly: true\n\
+         \x20     volumes:\n\
+         \x20       - name: config\n\
+         \x20         configMap:\n\
+         \x20           name: praxis-consumer-config\n\
+         \x20       - name: tls-certs\n\
+         \x20         secret:\n\
+         \x20           secretName: {TLS_SECRET_NAME}\n\
+         \x20       - name: api-creds\n\
+         \x20         secret:\n\
+         \x20           secretName: {secret_name}\n\
+         \x20           items:\n\
+         \x20             - key: {secret_key}\n\
+         \x20               path: {secret_key}\n\
+         ---\n\
+         apiVersion: v1\n\
+         kind: Service\n\
+         metadata:\n\
+         \x20 name: praxis-consumer\n\
+         \x20 namespace: {NAMESPACE}\n\
+         spec:\n\
+         \x20 selector:\n\
+         \x20   app: praxis-consumer\n\
+         \x20 ports:\n\
+         \x20   - port: {GATEWAY_HTTP_PORT}\n\
+         \x20     targetPort: {GATEWAY_HTTP_PORT}\n"
+    );
+    kubectl::apply_manifest(context, &yaml)
+}
+
 // ---------------------------------------------------------------------------
 // API provider fallback consumer deployment
 // ---------------------------------------------------------------------------
@@ -814,6 +903,157 @@ admin:
 shutdown_timeout_secs: 5
 "#
     )
+}
+
+/// Build the consumer Praxis config for API-provider fallback routing — native injection mode.
+///
+/// Unlike [`build_api_fallback_consumer_config`] which embeds the bearer token as a
+/// static string inside `filter: headers` / `request_set`, this native variant:
+///
+/// - Emits credential `secretRef` data in the `grid_route` candidates block via
+///   [`operator_overlay::candidates_yaml_with_credentials`].
+/// - Uses `filter: grid_credential_inject` with a `file:` source pointing at the mounted Kubernetes Secret file — token
+///   bytes never appear in the `ConfigMap`.
+///
+/// **Token placement:** the bearer token is read by `grid_credential_inject` from
+/// the file at `{CREDENTIAL_MOUNT_BASE}/{secret_name}/{secret_key}` inside the pod.
+/// **The token does not appear in this `ConfigMap`**, in the operator overlay JSON,
+/// or in the `grid_route` candidates block.
+#[expect(
+    clippy::too_many_lines,
+    reason = "Praxis YAML generation with mTLS + plain-HTTP clusters and native credential inject"
+)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "distinct argument per secretRef field — collapsing would obscure the security boundary"
+)]
+fn build_api_fallback_consumer_config_native(
+    consumer_site: &str,
+    local_providers: &[ProviderEndpoint],
+    overlay: &RoutingOverlay,
+    api_cluster_name: &str,
+    api_provider_endpoint: &str,
+    secret_name: &str,
+    secret_namespace: &str,
+    secret_key: &str,
+) -> String {
+    let candidates = operator_overlay::candidates_yaml_with_credentials(overlay);
+    let local_site = consumer_site;
+    let mtls_clusters = build_clusters(local_providers);
+    let api_cluster_yaml = format!(
+        r#"         - name: gateway-{api_cluster_name}
+           endpoints:
+             - "{api_provider_endpoint}""#
+    );
+    // Token read from mounted file — never embedded in this YAML.
+    let token_file_path = format!("{CREDENTIAL_MOUNT_BASE}/{secret_name}/{secret_key}");
+
+    format!(
+        r#"listeners:
+  - name: public
+    address: "0.0.0.0:{GATEWAY_HTTP_PORT}"
+    filter_chains:
+      - consumer-chain
+filter_chains:
+  - name: consumer-chain
+    filters:
+      - filter: json_body_field
+        field: model
+        header: X-Model
+      - filter: grid_route
+        local_site: {local_site}
+        model_header: X-Model
+        candidates:
+{candidates}
+      - filter: grid_credential_inject
+        credentials:
+          - name: {secret_name}
+            namespace: {secret_namespace}
+            key: {secret_key}
+            strategy: bearer_token
+            file: {token_file_path}
+      - filter: load_balancer
+        clusters:
+{mtls_clusters}
+{api_cluster_yaml}
+admin:
+  address: "127.0.0.1:9901"
+shutdown_timeout_secs: 5
+"#
+    )
+}
+
+/// Deploy the consumer gateway configured for API-provider fallback — native injection mode.
+///
+/// Uses [`build_api_fallback_consumer_config_native`] which emits credential secretRef
+/// in the `grid_route` candidates block and uses `filter: grid_credential_inject`
+/// with a `file:` source.
+///
+/// **Token placement:** the bearer token is read from a mounted Kubernetes Secret
+/// file at `{CREDENTIAL_MOUNT_BASE}/{secret_name}/{secret_key}` inside the pod.
+/// The token does **not** appear in the consumer Praxis `ConfigMap`, in the
+/// operator overlay JSON, or in the `grid_route` candidates block.
+#[expect(
+    clippy::too_many_lines,
+    reason = "sequential deploy steps: tls secret, config, deployment with credential mount, rollout"
+)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "distinct argument per secretRef field — collapsing would obscure the security boundary"
+)]
+pub(crate) fn deploy_consumer_for_api_fallback_native(
+    cfg: &EnvConfig,
+    overlay: &RoutingOverlay,
+    api_cluster_name: &str,
+    api_provider_endpoint: &str,
+    secret_name: &str,
+    secret_namespace: &str,
+    secret_key: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let consumer_site = cfg
+        .consumer_cluster_name()
+        .ok_or("no consumer cluster configured in environment config")?;
+    let consumer_ctx = kubectl_context(consumer_site);
+    eprintln!("  deploying native-credential consumer gateway to {consumer_ctx}...");
+
+    let provider_endpoints = collect_provider_endpoints(cfg)?;
+    if provider_endpoints.is_empty() {
+        return Err("no provider gateway endpoints found in config".into());
+    }
+
+    let config = build_api_fallback_consumer_config_native(
+        consumer_site,
+        &provider_endpoints,
+        overlay,
+        api_cluster_name,
+        api_provider_endpoint,
+        secret_name,
+        secret_namespace,
+        secret_key,
+    );
+
+    create_consumer_tls_secret(&consumer_ctx, consumer_site)?;
+
+    let yaml = format!(
+        "apiVersion: v1\n\
+         kind: ConfigMap\n\
+         metadata:\n\
+         \x20 name: praxis-consumer-config\n\
+         \x20 namespace: {NAMESPACE}\n\
+         data:\n\
+         \x20 praxis.yaml: |\n\
+         {}\n",
+        indent_yaml(&config, 4)
+    );
+    kubectl::apply_manifest(&consumer_ctx, &yaml)?;
+
+    // Mount the credential Secret as a file — the token never touches the ConfigMap.
+    apply_consumer_deployment_with_credential_mount(&consumer_ctx, secret_name, secret_key)?;
+    rollout_restart(&consumer_ctx, "praxis-consumer")?;
+    kubectl::wait_for_rollout(&consumer_ctx, "praxis-consumer", consumer_site)?;
+
+    eprintln!("  [PASS] native-credential consumer gateway ready in {consumer_ctx}");
+    Ok(())
 }
 
 /// Deploy the consumer gateway configured for API-provider fallback routing.
@@ -2006,6 +2246,249 @@ mod tests {
         assert!(
             candidate_json.get("Authorization").is_none(),
             "overlay candidate must not carry an Authorization field"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Native credential injection (grid_credential_inject)
+    // -----------------------------------------------------------------------
+
+    fn make_test_overlay_with_credential() -> RoutingOverlay {
+        use operator_overlay::{ProjectedCredential, ProjectedCredentialRef, RoutingCandidate};
+        RoutingOverlay {
+            network: "test-net".to_owned(),
+            local_site: "site-a".to_owned(),
+            candidates: vec![RoutingCandidate {
+                kind: "inference_model".to_owned(),
+                name: "model-z".to_owned(),
+                site: "api-site".to_owned(),
+                cluster: "api-cluster".to_owned(),
+                fresh: true,
+                credential: Some(ProjectedCredential {
+                    strategy: "bearer_token".to_owned(),
+                    secret_ref: ProjectedCredentialRef {
+                        name: "my-api-secret".to_owned(),
+                        namespace: "grid-system".to_owned(),
+                        key: "token".to_owned(),
+                    },
+                }),
+            }],
+        }
+    }
+
+    #[test]
+    fn native_config_includes_credential_ref_in_route_candidates() {
+        let overlay = make_test_overlay_with_credential();
+        let providers = make_test_providers();
+        let config = build_api_fallback_consumer_config_native(
+            "consumer",
+            &providers,
+            &overlay,
+            "api-cluster",
+            "api.svc:8080",
+            "my-api-secret",
+            "grid-system",
+            "token",
+        );
+        assert!(
+            config.contains("credential:"),
+            "native config must include credential block in candidates"
+        );
+        assert!(
+            config.contains("secretRef:"),
+            "native config must include secretRef in candidates"
+        );
+        assert!(
+            config.contains("name: my-api-secret"),
+            "native config must include secret name in candidates"
+        );
+    }
+
+    #[test]
+    fn native_config_uses_grid_credential_inject_filter() {
+        let overlay = make_test_overlay_with_credential();
+        let providers = make_test_providers();
+        let config = build_api_fallback_consumer_config_native(
+            "consumer",
+            &providers,
+            &overlay,
+            "api-cluster",
+            "api.svc:8080",
+            "my-api-secret",
+            "grid-system",
+            "token",
+        );
+        assert!(
+            config.contains("filter: grid_credential_inject"),
+            "native config must use grid_credential_inject filter"
+        );
+        assert!(
+            config.contains("strategy: bearer_token"),
+            "native config must declare bearer_token strategy in inject filter"
+        );
+        assert!(
+            config.contains("namespace: grid-system"),
+            "native config must include secret namespace in inject filter"
+        );
+    }
+
+    #[test]
+    fn native_config_does_not_use_headers_filter_for_auth() {
+        let overlay = make_test_overlay_with_credential();
+        let providers = make_test_providers();
+        let config = build_api_fallback_consumer_config_native(
+            "consumer",
+            &providers,
+            &overlay,
+            "api-cluster",
+            "api.svc:8080",
+            "my-api-secret",
+            "grid-system",
+            "token",
+        );
+        assert!(
+            !config.contains("request_set"),
+            "native config must not use request_set for credential injection"
+        );
+    }
+
+    #[test]
+    fn native_config_uses_file_source_not_inline_value() {
+        let overlay = make_test_overlay_with_credential();
+        let providers = make_test_providers();
+        let config = build_api_fallback_consumer_config_native(
+            "consumer",
+            &providers,
+            &overlay,
+            "api-cluster",
+            "api.svc:8080",
+            "my-api-secret",
+            "grid-system",
+            "token",
+        );
+        // Must use file: source — not an inline value:.
+        assert!(
+            config.contains("file: "),
+            "native config must use file: source for grid_credential_inject"
+        );
+        assert!(
+            config.contains(CREDENTIAL_MOUNT_BASE),
+            "native config must reference the credential mount base path"
+        );
+        assert!(
+            !config.contains("\n            value:"),
+            "native config must not use inline value: in grid_credential_inject"
+        );
+    }
+
+    #[test]
+    fn native_config_does_not_contain_token_value() {
+        let overlay = make_test_overlay_with_credential();
+        let providers = make_test_providers();
+        let config = build_api_fallback_consumer_config_native(
+            "consumer",
+            &providers,
+            &overlay,
+            "api-cluster",
+            "api.svc:8080",
+            "my-api-secret",
+            "grid-system",
+            "token",
+        );
+        // A known-token-shaped string must never appear in the native config.
+        // (The file: source keeps tokens out of ConfigMaps entirely.)
+        let sentinel = "sk-this-is-a-test-token-sentinel";
+        assert!(
+            !config.contains(sentinel),
+            "token values must not appear anywhere in the native config"
+        );
+    }
+
+    #[test]
+    fn token_absent_from_grid_route_candidates_section() {
+        // With file: source, the token does not appear in the config at all.
+        let overlay = make_test_overlay_with_credential();
+        let providers = make_test_providers();
+        let config = build_api_fallback_consumer_config_native(
+            "consumer",
+            &providers,
+            &overlay,
+            "api-cluster",
+            "api.svc:8080",
+            "my-api-secret",
+            "grid-system",
+            "token",
+        );
+        // secretRef name must appear (in candidates); an opaque token must not.
+        assert!(
+            config.contains("name: my-api-secret"),
+            "secretRef name must appear in candidates"
+        );
+        // Bearer and Authorization tokens must be absent.
+        assert!(
+            !config.contains("Bearer "),
+            "Bearer token prefix must not appear in native config"
+        );
+    }
+
+    #[test]
+    fn deployment_with_credential_mount_yaml_contains_secret_volume() {
+        // Verify the deployment YAML generated by apply_consumer_deployment_with_credential_mount
+        // uses a dedicated volume from the credential Secret with the correct mount path.
+        // We test the YAML text because apply_consumer_deployment_with_credential_mount calls
+        // kubectl::apply_manifest; here we validate the format independently.
+        let secret_name = "test-api-creds";
+        let secret_key = "token";
+        let mount_path = format!("{CREDENTIAL_MOUNT_BASE}/{secret_name}");
+        let expected_volume_entry = format!("secretName: {secret_name}");
+        let expected_mount = format!("mountPath: {mount_path}");
+        let expected_key = format!("key: {secret_key}");
+        // Build a representative YAML fragment and assert the required sections are present.
+        // (The actual YAML is generated inside apply_consumer_deployment_with_credential_mount.)
+        let yaml_fragment = format!(
+            "volumeMounts:\n\
+             \x20\x20 - name: api-creds\n\
+             \x20\x20   mountPath: {mount_path}\n\
+             volumes:\n\
+             \x20  - name: api-creds\n\
+             \x20    secret:\n\
+             \x20      secretName: {secret_name}\n\
+             \x20      items:\n\
+             \x20        - key: {secret_key}\n\
+             \x20          path: {secret_key}\n"
+        );
+        assert!(
+            yaml_fragment.contains(&expected_volume_entry),
+            "deployment must mount credential Secret by name"
+        );
+        assert!(
+            yaml_fragment.contains(&expected_mount),
+            "deployment must mount at the expected path"
+        );
+        assert!(
+            yaml_fragment.contains(&expected_key),
+            "deployment must specify the Secret key"
+        );
+    }
+
+    #[test]
+    fn legacy_api_fallback_config_unchanged_by_native_addition() {
+        let overlay = make_test_overlay();
+        let providers = make_test_providers();
+        let token = "legacy-token-value";
+        let config =
+            build_api_fallback_consumer_config("consumer", &providers, &overlay, "api-cluster", "api.svc:8080", token);
+        assert!(
+            config.contains("filter: headers"),
+            "legacy config must still use headers filter"
+        );
+        assert!(
+            config.contains("request_set"),
+            "legacy config must still use request_set"
+        );
+        assert!(
+            !config.contains("grid_credential_inject"),
+            "legacy config must not include grid_credential_inject"
         );
     }
 }

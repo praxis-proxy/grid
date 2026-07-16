@@ -171,8 +171,11 @@ spec:
   models:
     - name: claude-sonnet-4
   auth:
-    strategy: api_key
-    secretRef: { name: anthropic-key }
+    strategy: bearer_token
+    secretRef:
+      name: anthropic-token
+      namespace: praxis-system
+      key: token
   accessPolicy:
     siteSelector: {}
 ```
@@ -201,7 +204,9 @@ named `grid-overlay-{network}-{gateway}` containing:
 
 - **`grid-config.json`**: JSON-serialised
   `RoutingOverlay` with one `RoutingCandidate` per
-  model per `InferenceProvider` in the network.
+  model per `InferenceProvider` in the network.  When
+  `spec.auth.secretRef` is set, candidates carry only
+  the credential reference, never token bytes.
 
 The overlay shape is compatible with the Praxis
 `grid_route` filter:
@@ -213,10 +218,18 @@ The overlay shape is compatible with the Praxis
   "candidates": [
     {
       "kind": "inference_model",
-      "name": "granite-3.3-8b",
-      "site": "local-vllm",
-      "cluster": "local-vllm",
-      "fresh": true
+      "name": "claude-sonnet-4",
+      "site": "anthropic-api",
+      "cluster": "anthropic-api",
+      "fresh": true,
+      "credential": {
+        "strategy": "bearer_token",
+        "secretRef": {
+          "name": "anthropic-token",
+          "namespace": "praxis-system",
+          "key": "token"
+        }
+      }
     }
   ]
 }
@@ -238,6 +251,21 @@ Workloads send requests to the Praxis Gateway.
 The gateway's grid scoring filter selects the optimal
 backend. Praxis handles API translation and credential
 injection transparently.
+
+For API-provider routes, the request-time path is:
+
+```text
+grid_route
+  -> writes grid.route.credential.* metadata from the selected candidate
+grid_credential_inject
+  -> reads the matching token from a mounted Secret file
+  -> injects Authorization: Bearer <token>
+load_balancer
+  -> forwards to the selected provider cluster
+```
+
+The token is not stored in the Grid overlay or consumer
+Praxis `ConfigMap`.
 
 See [Auth & Policy](auth.md) for workload access
 patterns and authentication strategies.
@@ -303,6 +331,8 @@ Available commands:
 | `cargo xtask env deploy-consumer-gateway --overlay-config <path>` | Deploys the consumer gateway using a `grid-config.json` routing overlay file |
 | `cargo xtask env verify-gateway-e2e` | Verifies consumer-to-provider routing end-to-end |
 | `cargo xtask env verify-mtls-trust` | Verifies provider gateway mTLS enforcement (positive + negative cases) |
+| `cargo xtask env verify-api-fallback-native` | Verifies native `grid_route` → `grid_credential_inject` credential injection with token bytes absent from overlay and consumer ConfigMap |
+| `cargo xtask env verify-stale-gc-ttl` | Verifies `GridNetwork.spec.staleCandidateTtlSeconds` evicts stale remote candidates from the rendered overlay |
 | `cargo xtask env verify-crd-schema` | Verifies required generated CRD schema fields without requiring kind clusters |
 | `cargo xtask env validate-all` | Runs the local validation suite and prints a Markdown result table |
 

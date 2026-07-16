@@ -63,7 +63,15 @@ The overlay is a compact JSON document consumed by Praxis:
       "name": "model-west",
       "site": "site-west",
       "cluster": "gateway-site-west",
-      "fresh": true
+      "fresh": true,
+      "credential": {
+        "strategy": "bearer_token",
+        "secretRef": {
+          "name": "west-api-token",
+          "namespace": "grid-system",
+          "key": "token"
+        }
+      }
     }
   ]
 }
@@ -78,6 +86,15 @@ Candidate fields:
 | `site` | Grid site advertising the capability. |
 | `cluster` | Praxis load-balancer cluster identity used for upstream routing. |
 | `fresh` | Whether provider status is considered fresh enough for normal routing. |
+| `credential` | Optional. Secret reference for upstream authentication. Present only for `api_provider` or authenticated `cloud_managed` candidates. **Never contains the token value** — only the Kubernetes Secret locating information. |
+
+### Credential field security contract
+
+When `credential` is present on a candidate, the field contains only:
+- `strategy`: the authentication mechanism (currently `"bearer_token"`)
+- `secretRef.name` / `secretRef.namespace` / `secretRef.key`: Kubernetes Secret locating information
+
+The token value is **never written into the overlay ConfigMap**. Consumers resolve the token from the Kubernetes Secret at credential-injection time. The `grid_route` filter parses the field for forward compatibility and makes it available to downstream filters, but does not perform Kubernetes API calls or inject credentials itself.
 
 ## Candidate scoring and ordering
 
@@ -91,6 +108,82 @@ scores.
 
 At request time, `grid_route` selects from this pre-sorted candidate list rather
 than recomputing the full scoring formula.
+
+## Stale candidate retention and expiry
+
+### Policy
+
+Stale candidates (`fresh: false`) are **retained in the overlay** rather than
+immediately excluded.  This policy supports:
+- **Observability** — operators can see that a remote peer is degraded before
+  it recovers.
+- **Last-resort fallback** — if no healthy candidate exists for a model, a
+  stale candidate is better than a hard 404.
+
+The authoritative GC policy function is `should_retain_candidate` in
+`operator/src/resources/routing_overlay.rs`.  Rules, in priority order:
+
+| Condition | Result |
+|---|---|
+| `fresh = true` | Always retain (local and healthy remote candidates) |
+| No TTL configured | Retain indefinitely (current default) |
+| Age unknown | Retain conservatively |
+| Age < TTL | Retain (within the allowed window) |
+| Age ≥ TTL | Evict |
+
+### SWIM member age — now real
+
+**`MemberRecord.age_secs` is now populated with actual elapsed seconds.**
+
+The SWIM runtime (`operator/src/swim_runtime.rs`) tracks a private
+`status_changed_at: Option<Instant>` for each member.  When a member transitions
+to `Dead` or `Suspect`, the instant is recorded and preserved monotonically.
+When the member rejoins (`Alive`), the instant is cleared.  The public
+`MemberRecord.age_secs` is computed as `now.saturating_duration_since(status_changed_at).as_secs()`
+at snapshot time.
+
+A `age_secs = 0` now has two distinct meanings:
+- **Alive member** — no Dead/Suspect transition has occurred.
+- **Dead/Suspect member with `age_secs = 0`** — the runtime has just transitioned
+  (elapsed is less than one second), or a synthetic snapshot did not include age.
+  The GC helper `dead_or_suspect_age_secs` treats `age_secs = 0` on a
+  Dead/Suspect member as "unknown" and retains conservatively.
+
+**`crdt::ProviderState`** still carries only a monotonic `revision` counter, not
+a wall-clock timestamp.  CRDT-storage-level GC remains deferred.
+
+### Per-GridNetwork TTL — `spec.staleCandidateTtlSeconds`
+
+The `GridNetwork` CRD exposes `spec.staleCandidateTtlSeconds` (optional `u32`)
+to control when stale candidates are removed from the overlay.
+
+| `spec.staleCandidateTtlSeconds` | Behaviour |
+|---|---|
+| Absent (default) | No-op — stale candidates retained indefinitely |
+| `0` | Rejected by the CRD schema (`minimum: 1`) |
+| `N >= 1` | Remote `fresh=false` candidates with SWIM member age `>= N` seconds are omitted from the overlay |
+
+The filter runs every reconcile cycle after `apply_swim_staleness_override`.
+Only remote candidates in the `Degraded` phase are subject to GC.  Local
+candidates and `Available` remote candidates are always retained.
+
+The controller also defensively treats an internally observed `0` as absent, so
+malformed data cannot accidentally trigger immediate eviction outside the normal
+Kubernetes API validation path.
+
+**Recommended starting value:** `3600` (one hour) — allows short outages to
+recover without overlay churn while bounding accumulation of truly dead peers.
+
+**Important:** The TTL is applied at overlay-rendering time.  CRDT provider
+records in storage are not deleted by this mechanism.  CRDT storage-level GC
+remains deferred.
+
+### Not implemented: hard exclusion
+
+The GC policy does not implement hard exclusion of all `fresh=false` candidates.
+A `fresh=false` candidate is only evicted after the TTL boundary; it is
+**deprioritized**, not blocked.  See the scoring section for how `fresh=false`
+affects candidate ordering.
 
 ## Backend kinds
 
@@ -151,8 +244,8 @@ The difference is the backend category and credential boundary:
 3. Scoring normally places self-hosted candidates ahead of API-provider
    candidates, so API providers are used as fallback or explicit lower-priority
    routes.
-4. Praxis applies configured credential injection before forwarding the request
-   to the provider endpoint.
+4. Praxis applies credential injection before forwarding the request to the
+   provider endpoint (see "Credential injection" below).
 5. If no self-hosted candidate is available for a model, the API-provider
    candidate can become the selected route.
 
@@ -164,6 +257,81 @@ Current local validation uses mock API-provider endpoints. That proves the Grid
 overlay and Praxis routing/credential-injection mechanics. It does not prove a
 real external provider protocol such as OpenAI, Anthropic, Bedrock SigV4, or
 Vertex OAuth2.
+
+## Credential injection
+
+When an `InferenceProvider` has `spec.auth.strategy: bearer_token` with a
+`spec.auth.secretRef`, the operator projects a credential reference — never the
+token value — into the routing overlay candidate:
+
+```json
+{
+  "kind": "inference_model",
+  "name": "model-z",
+  "site": "api-provider",
+  "cluster": "gateway-api-provider",
+  "fresh": true,
+  "credential": {
+    "strategy": "bearer_token",
+    "secretRef": {
+      "name": "my-api-token",
+      "namespace": "grid-system",
+      "key": "token"
+    }
+  }
+}
+```
+
+### Native injection path (current)
+
+The native injection path uses two AI-side filters in sequence:
+
+1. **`grid_route`** selects the candidate and writes the secretRef fields to
+   in-process filter metadata: `grid.route.credential.strategy`,
+   `grid.route.credential.name`, `grid.route.credential.namespace`,
+   `grid.route.credential.key`.  No token value is written.
+
+2. **`grid_credential_inject`** reads those metadata keys, looks up the
+   matching token in its configured credential map, and injects
+   `Authorization: Bearer <token>` into the upstream request.
+
+Consumer config filter chain ordering:
+
+```text
+grid_route              → selects candidate; writes credential metadata
+grid_credential_inject  → reads credential metadata; injects Authorization
+load_balancer           → upstream cluster selection with injected headers
+```
+
+### File-backed token source
+
+In the current xtask validation mode, the token value is resolved from a
+Kubernetes Secret by the xtask harness and written into a Kubernetes Secret in
+the consumer cluster.  The consumer pod mounts that Secret as a file, and
+`grid_credential_inject` reads the token from its configured `file:` path at
+filter construction time.
+
+The token does NOT appear in:
+
+- The Grid operator overlay `ConfigMap` (JSON).
+- The `grid_route` filter candidates YAML.
+- The consumer Praxis `ConfigMap`.
+- The `grid.route.*` in-process filter metadata.
+- Tracing spans or log lines.
+- HTTP error response bodies.
+
+### Future production path
+
+The remaining production work is ownership and lifecycle, not request-path
+injection mechanics:
+
+- **Operator-owned consumer config** — the operator generates the full consumer
+  Praxis config including the `grid_credential_inject` section.
+- **Consumer-cluster Secret provisioning** — the operator or an external Secret
+  manager creates, rotates, and synchronizes the mounted credential Secret.
+
+The `grid_route` → `grid_credential_inject` filter chain interface remains the
+same regardless of how the consumer-cluster Secret is provisioned.
 
 ## Consumer gateway selection
 

@@ -55,6 +55,36 @@ pub struct GridNetworkSpec {
 
     /// Availability zone.
     pub zone: Option<String>,
+
+    /// Maximum age in seconds before a stale (`fresh=false`) remote routing
+    /// candidate is removed from the overlay.
+    ///
+    /// When a remote peer is declared `Dead` or `Suspect` by SWIM, its
+    /// routing candidates are marked `fresh=false` and deprioritised.  Without
+    /// this field those stale candidates remain in the overlay indefinitely,
+    /// which is useful for observability but can accumulate over time if peers
+    /// never recover.
+    ///
+    /// Setting this field activates overlay-level garbage collection: remote
+    /// candidates whose SWIM member age is at or above this threshold are
+    /// omitted from the rendered overlay.  Fresh (`fresh=true`) candidates and
+    /// local candidates are never evicted.  CRDT provider records in storage
+    /// are not deleted.
+    ///
+    /// **Default (absent):** stale candidates are retained indefinitely —
+    /// the same behaviour as before this field existed.
+    ///
+    /// **Minimum value:** `1` second.  The generated CRD schema rejects `0`.
+    /// The controller still treats an internally observed `0` as absent
+    /// defensively, avoiding accidental immediate eviction if malformed data is
+    /// deserialized outside the Kubernetes API path.
+    ///
+    /// A conservative starting value for production is `3600` (one hour),
+    /// which allows short failures to recover without overlay churn while
+    /// still bounding accumulation of truly dead peers.
+    #[schemars(range(min = 1))]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale_candidate_ttl_seconds: Option<u32>,
 }
 
 /// Reference to a Praxis Gateway that participates in this grid.
@@ -316,6 +346,64 @@ mod tests {
                 .unwrap_or_else(|| std::process::abort()),
             "GridNetwork",
             "wrong kind name"
+        );
+    }
+
+    #[test]
+    fn stale_candidate_ttl_defaults_to_none_when_absent() {
+        let json = serde_json::json!({
+            "gridId": "",
+            "seeds": [],
+            "swim": {}
+        });
+        let spec: GridNetworkSpec = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
+        assert!(
+            spec.stale_candidate_ttl_seconds.is_none(),
+            "absent staleCandidateTtlSeconds must default to None (no-op GC)"
+        );
+    }
+
+    #[test]
+    fn stale_candidate_ttl_round_trips() {
+        let json = serde_json::json!({
+            "gridId": "",
+            "seeds": [],
+            "staleCandidateTtlSeconds": 3600
+        });
+        let spec: GridNetworkSpec = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            spec.stale_candidate_ttl_seconds,
+            Some(3600),
+            "staleCandidateTtlSeconds must round-trip through serde"
+        );
+    }
+
+    #[test]
+    fn stale_candidate_ttl_serializes_only_when_present() {
+        // absent field must not appear in serialized output
+        let json = serde_json::json!({ "gridId": "", "seeds": [] });
+        let spec: GridNetworkSpec = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
+        let serialized = serde_json::to_value(&spec).unwrap_or_else(|_| std::process::abort());
+        assert!(
+            serialized.get("staleCandidateTtlSeconds").is_none(),
+            "absent staleCandidateTtlSeconds must not appear in serialized output"
+        );
+    }
+
+    #[test]
+    fn stale_candidate_ttl_appears_in_crd_schema_with_minimum() {
+        let crd = crd_json();
+        let ttl_schema = crd
+            .pointer("/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties/staleCandidateTtlSeconds")
+            .unwrap_or_else(|| std::process::abort());
+        assert!(
+            ttl_schema.is_object(),
+            "staleCandidateTtlSeconds must appear in the CRD OpenAPI schema"
+        );
+        assert_eq!(
+            ttl_schema.pointer("/minimum").and_then(serde_json::Value::as_f64),
+            Some(1.0),
+            "staleCandidateTtlSeconds schema must reject zero"
         );
     }
 

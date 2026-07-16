@@ -19,8 +19,8 @@ Responsibilities:
 - **State propagation**: CRDT provider and capability
   snapshots piggybacked on SWIM probes
 - **Routing config**: Generates Praxis overlay config
-  (clusters, scoring filter, auth injection) as a
-  Kubernetes `ConfigMap`
+  (capability candidates, freshness, scoring order,
+  and credential references) as a Kubernetes `ConfigMap`
 
 ### Praxis AI Gateway (data plane)
 
@@ -31,7 +31,8 @@ Responsibilities:
 - Request proxying, connection pooling, retries
 - API format translation (OpenAI, Anthropic, Bedrock,
   Vertex) via `praxis-ai-apis`
-- Credential injection via filter pipeline
+- Credential injection via `grid_route` +
+  `grid_credential_inject` filter pipeline
 - Filter chain execution (guardrails, routing, LB)
 - TLS termination and mTLS handshake
 - Health checks against local backends
@@ -42,6 +43,8 @@ Responsibilities:
 - Proxy HTTP traffic
 - Translate API formats
 - Inject credentials at request time
+- Write provider token values into routing overlays or
+  consumer Praxis `ConfigMap`s
 - Run the filter pipeline
 
 ## Workspace Crates
@@ -113,12 +116,16 @@ both configure Praxis, but own different concerns:
 The Grid Operator renders routing overlay `ConfigMap`s
 from `GridNetwork` + `InferenceProvider` CRDs. Each
 `ConfigMap` encodes `grid_route` routing candidates
-(model name, site, cluster, fresh flag) as JSON under
+(capability kind, capability name, site, cluster, fresh
+flag, and optional credential reference) as JSON under
 the `grid-config.json` key.  Provider health determines
 candidate freshness, provider metrics influence
 candidate ordering, and `routingClusterRef` provides the
 Praxis cluster identity used by generated load-balancer
-configuration.
+configuration.  Credential-bearing candidates contain
+only `{ strategy, secretRef }`; token bytes remain in
+Kubernetes Secrets and are read by the data plane through
+mounted files.
 
 The Grid Operator also participates in the peer-to-peer
 control plane.  SWIM membership supplies liveness

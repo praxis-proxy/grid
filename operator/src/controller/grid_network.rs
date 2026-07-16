@@ -171,6 +171,13 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
     // Praxis can observe the stale-but-known state while preferring healthy fallbacks.
     let remote_crdt_providers = apply_swim_staleness_override(&remote_crdt_providers, membership.as_ref());
 
+    // Apply stale candidate GC policy: omit remote providers whose Dead/Suspect age
+    // exceeds the configured TTL.  With the default policy (TTL=None, absent field)
+    // this is a no-op — runtime behaviour is unchanged from pre-GC.
+    let stale_policy = routing_overlay::stale_policy_from_spec(network.spec.stale_candidate_ttl_seconds);
+    let remote_crdt_providers =
+        routing_overlay::apply_stale_gc_filter(&remote_crdt_providers, membership.as_ref(), &stale_policy);
+
     reconcile_routing_overlay_inner(&network, client, &providers, &remote_crdt_providers, &raw_metrics).await?;
 
     let grid_id = resolve_grid_id(&network);

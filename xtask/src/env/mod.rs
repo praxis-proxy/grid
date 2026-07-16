@@ -354,6 +354,36 @@ pub(crate) enum Action {
         site: Option<String>,
     },
 
+    /// Validate the native AI credential injection path.
+    ///
+    /// Proves the same API-provider fallback routing as `verify-api-fallback` but
+    /// uses `filter: grid_credential_inject` instead of `filter: headers` /
+    /// `request_set` for bearer token injection.
+    ///
+    /// Key differences from `verify-api-fallback`:
+    ///
+    /// - `grid_route` candidates include credential `secretRef` data from the overlay.
+    /// - `filter: grid_credential_inject` injects the bearer token, keyed by the credential secretRef `(name,
+    ///   namespace, key)` tuple.
+    /// - The old `filter: headers` / `request_set` static injection is absent.
+    ///
+    /// **Token placement:** the bearer token is mounted into the consumer pod from
+    /// a Kubernetes Secret and read through `grid_credential_inject.credentials[].file`.
+    /// It must not appear in the operator overlay or consumer Praxis `ConfigMap`.
+    ///
+    /// Requires: kind clusters (`grid-site-a` and `grid-consumer`) and gateway
+    /// images to be ready.  Run `env up` and `env load-gateway-images` first.
+    /// Safe to rerun: all owned resources are cleaned at the start.
+    VerifyApiFallbackNative {
+        /// Path to the environment config file.
+        #[arg(short, long, default_value = "tests/env/operator-routing.toml")]
+        config: PathBuf,
+
+        /// Kind cluster context (first provider site by default).
+        #[arg(long)]
+        site: Option<String>,
+    },
+
     /// Validate generated CRD schema fields.
     ///
     /// Runs `generate_crds`, parses the output JSON, and asserts that all
@@ -525,6 +555,30 @@ pub(crate) enum Action {
         #[arg(short, long, default_value = "tests/env/operator-routing-two-provider.toml")]
         config: PathBuf,
     },
+
+    /// Prove that stale remote candidates are evicted from the overlay after the
+    /// `GridNetwork.spec.staleCandidateTtlSeconds` TTL elapses.
+    ///
+    /// Starts two SWIM-enabled operators, applies fixtures that include
+    /// `staleCandidateTtlSeconds: 5`, verifies initial overlay contains both
+    /// candidates with `fresh=true`, kills the west operator so its candidate
+    /// becomes `fresh=false`, then waits for the TTL to expire and asserts
+    /// the stale candidate is **absent** from the rendered overlay.  The local
+    /// east candidate remains present and `fresh=true` throughout.
+    ///
+    /// This proves the full path:
+    /// - CRD field `staleCandidateTtlSeconds` is consumed by the controller.
+    /// - `stale_policy_from_spec` derives the correct policy.
+    /// - `apply_stale_gc_filter` omits the candidate once `age_secs >= TTL`.
+    /// - Local candidates are unaffected by the remote GC policy.
+    ///
+    /// Requires a kind cluster.  Run `env up` + `env load-gateway-images` first.
+    /// Safe to rerun: fixtures are deleted at the start of each run.
+    VerifyStaleGcTtl {
+        /// Path to the two-provider environment config file.
+        #[arg(short, long, default_value = "tests/env/operator-routing-two-provider.toml")]
+        config: PathBuf,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -565,6 +619,7 @@ pub(crate) fn run(action: &Action) -> Result<(), Box<dyn std::error::Error>> {
         Action::VerifySwimCrdSeeds { config, site } => env_verify_swim_crd_seeds(config, site.as_deref()),
         Action::ValidateAll { config, site } => env_validate_all(config, site.as_deref()),
         Action::VerifyApiFallback { config, site } => env_verify_api_fallback(config, site.as_deref()),
+        Action::VerifyApiFallbackNative { config, site } => env_verify_api_fallback_native(config, site.as_deref()),
         Action::VerifyCrdSchema => env_verify_crd_schema(),
         Action::VerifySwimOverlay { config, site } => env_verify_swim_overlay(config, site.as_deref()),
         Action::VerifySwimRouting { config } => env_verify_swim_routing(config),
@@ -573,6 +628,7 @@ pub(crate) fn run(action: &Action) -> Result<(), Box<dyn std::error::Error>> {
         Action::VerifyMetricsRouting { config } => env_verify_metrics_routing(config),
         Action::VerifySiteJoinDiscovery { config } => env_verify_site_join_discovery(config),
         Action::VerifyFailoverUnderLostPeer { config } => env_verify_failover_under_lost_peer(config),
+        Action::VerifyStaleGcTtl { config } => env_verify_stale_gc_ttl(config),
     }
 }
 
@@ -878,6 +934,214 @@ fn env_verify_api_fallback(config: &Path, site: Option<&str>) -> Result<(), Box<
     kind::delete_mock_api_provider(&consumer_ctx);
 
     eprintln!("verify-api-fallback: PASS");
+    Ok(())
+}
+
+/// Validate the native AI credential injection path end-to-end.
+///
+/// Same E2E chain as [`env_verify_api_fallback`] but uses `filter: grid_credential_inject`
+/// instead of `filter: headers` / `request_set` for bearer token injection.
+///
+/// Steps:
+///
+/// 1. Deploy provider gateways.
+/// 2. Deploy mock API-provider in consumer cluster.
+/// 3. Operator reconcile → overlay JSON with `credential.secretRef` on `api_provider` candidate.
+/// 4. Read secretRef from overlay, resolve token from K8s Secret (harness bridge).
+/// 5. Deploy consumer with `grid_route` candidates (including secretRef) + `grid_credential_inject` filter (token in
+///    filter config map — transitional; future: mounted Secret volume).
+/// 6. Verify: `model-x` → 200 local, `model-z` → 200 via mock API-provider with injected credential, unknown model →
+///    404/503.
+#[expect(clippy::too_many_lines, reason = "multi-step E2E orchestration")]
+fn env_verify_api_fallback_native(config: &Path, site: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    use operator::{
+        API_FALLBACK_MODEL, API_PROVIDER_SECRET_KEY, API_PROVIDER_SECRET_NAME, API_PROVIDER_SECRET_NS,
+        CONFIGMAP_POLL_TIMEOUT, STATUS_POLL_TIMEOUT, TEST_GATEWAY_NAME, TEST_GATEWAY_NS, TEST_HEALTHY_ROUTING_CLUSTER,
+        TEST_NETWORK, TEST_PROVIDER_API, TEST_PROVIDER_HEALTHY,
+    };
+
+    let cfg = EnvConfig::from_file(config)?;
+    let context = resolve_operator_context(&cfg, site)?;
+    eprintln!("verify-api-fallback-native: context={context}");
+
+    let consumer_site = cfg.consumer_cluster_name().ok_or("no consumer cluster in config")?;
+    let consumer_ctx = kind::kubectl_context(consumer_site);
+
+    // ── Step 1: deploy provider gateways ────────────────────────────────────
+    eprintln!("verify-api-fallback-native: [1/5] deploying provider gateways...");
+    gateway::deploy_all(&cfg)?;
+
+    // ── Step 2: deploy mock-api-provider in consumer cluster ─────────────────
+    eprintln!("verify-api-fallback-native: [2/5] deploying mock-api-provider...");
+    let consumer_cluster_name = format!("grid-{consumer_site}");
+    kind::deploy_mock_api_provider(&consumer_ctx, &consumer_cluster_name)?;
+    let api_provider_endpoint = format!("{}.default.svc:{}", kind::MOCK_API_SVC, kind::MOCK_API_PORT);
+    eprintln!("  api_provider endpoint: {api_provider_endpoint}");
+
+    // ── Step 3: operator reconcile → overlay with credential secretRef ────────
+    eprintln!("verify-api-fallback-native: [3/5] operator reconcile + overlay export...");
+    operator::install_grid_crds(&context)?;
+    operator::cleanup_validation_resources(&context)?;
+    operator::delete_api_credential_secret(&context, API_PROVIDER_SECRET_NS)
+        .unwrap_or_else(|e| eprintln!("  note: credential Secret cleanup: {e}"));
+    operator::create_api_credential_secret(
+        &context,
+        API_PROVIDER_SECRET_NAME,
+        API_PROVIDER_SECRET_NS,
+        API_PROVIDER_SECRET_KEY,
+        consumer::API_PROVIDER_INJECTED_TOKEN,
+    )?;
+
+    let healthy_endpoint = "http://mock-openai-provider.default.svc:8080";
+    operator::apply_test_fixtures(&context, healthy_endpoint)?;
+    operator::apply_api_provider_fixture(&context, healthy_endpoint)?;
+
+    let op = operator::spawn_operator(&context)?;
+    let mut op_guard = ProcGuard(Some(op), "operator");
+
+    let result: Result<PathBuf, Box<dyn std::error::Error>> = (|| {
+        operator::wait_for_provider_phase(&context, TEST_PROVIDER_HEALTHY, "Pending", STATUS_POLL_TIMEOUT)?;
+        operator::wait_for_provider_phase(&context, TEST_PROVIDER_API, "Pending", STATUS_POLL_TIMEOUT)?;
+        operator::wait_for_overlay_configmap(
+            &context,
+            TEST_NETWORK,
+            TEST_GATEWAY_NAME,
+            TEST_GATEWAY_NS,
+            CONFIGMAP_POLL_TIMEOUT,
+        )?;
+        let overlay = operator::read_overlay_configmap(&context, TEST_NETWORK, TEST_GATEWAY_NAME, TEST_GATEWAY_NS)?;
+        operator::verify_api_fallback_overlay(
+            &overlay,
+            TEST_HEALTHY_ROUTING_CLUSTER,
+            TEST_PROVIDER_API,
+            API_FALLBACK_MODEL,
+        )?;
+        eprintln!("  [OK] overlay contains api_provider candidate with credential secretRef");
+        let path = operator::export_overlay_to_file(&context, TEST_NETWORK, TEST_GATEWAY_NAME, TEST_GATEWAY_NS)?;
+        eprintln!("  overlay exported: {}", path.display());
+        Ok(path)
+    })();
+
+    if let Some(c) = op_guard.0.take() {
+        operator::kill_operator(c);
+    }
+    let overlay_path = result?;
+
+    // ── Step 4: deploy consumer with NATIVE grid_credential_inject ───────────
+    eprintln!("verify-api-fallback-native: [4/5] deploying native-credential consumer gateway...");
+    let overlay_json = std::fs::read_to_string(&overlay_path)?;
+    let overlay = operator_overlay::parse_grid_config_json(&overlay_json)?;
+
+    // Read the credential reference from the operator-projected overlay.
+    // The harness resolves the token from the K8s Secret — this is the transitional bridge.
+    // In the native path the token is placed in grid_credential_inject config (not the overlay).
+    let cred_plan = operator::api_credential_plan_from_overlay(&overlay, TEST_PROVIDER_API).ok_or(
+        "no bearer-token credential reference found in overlay; \
+         verify InferenceProvider spec.auth.secretRef is set and operator reconciled",
+    )?;
+
+    // Destructure the secretRef fields to pass to grid_credential_inject config.
+    let operator::ApiCredentialPlan::BearerToken {
+        secret_name,
+        namespace,
+        key,
+    } = &cred_plan
+    else {
+        return Err("unexpected non-bearer-token credential plan in native path".into());
+    };
+
+    // Deploy consumer using grid_credential_inject (native path) with file: source.
+    // The token is resolved only to verify the Secret is accessible (harness readiness
+    // check) — it does NOT appear in the consumer ConfigMap, overlay JSON, or route
+    // candidates.  grid_credential_inject reads the token from the mounted Secret file.
+    let api_token = operator::resolve_api_credential(&context, &cred_plan)?
+        .ok_or("credential plan resolved to no token (manual or absent auth)")?;
+    verify_token_absent_from_overlay(&overlay_json, &api_token);
+
+    // Create the credential Secret in the CONSUMER cluster so the pod can mount it.
+    // The token is in the Secret's `data` map — not in the Praxis ConfigMap.
+    // This is the xtask harness bridge: in production, the operator or an external
+    // secret manager would provision this Secret in the consumer cluster.
+    eprintln!("  creating credential Secret in consumer cluster for volume mount...");
+    operator::delete_api_credential_secret(&consumer_ctx, API_PROVIDER_SECRET_NS)
+        .unwrap_or_else(|e| eprintln!("  note: consumer credential Secret cleanup: {e}"));
+    operator::create_api_credential_secret(&consumer_ctx, secret_name, namespace, key, &api_token)?;
+    eprintln!("  [OK] credential Secret {secret_name:?} in consumer cluster (token not in ConfigMap)");
+
+    consumer::deploy_consumer_for_api_fallback_native(
+        &cfg,
+        &overlay,
+        TEST_PROVIDER_API,
+        &api_provider_endpoint,
+        secret_name,
+        namespace,
+        key,
+    )?;
+
+    // ── Step 5: verify routing + token-absence + native credential injection ──
+    eprintln!("verify-api-fallback-native: [5/5] verifying routing with grid_credential_inject...");
+    eprintln!("  local ({TEST_HEALTHY_ROUTING_CLUSTER}) → model-x via site-a provider gateway");
+    eprintln!(
+        "  api fallback ({TEST_PROVIDER_API}) → {API_FALLBACK_MODEL} via mock api-provider (grid_credential_inject)"
+    );
+
+    let mock_port = verify::find_free_port()?;
+    let mut mock_pf =
+        verify::PortForwardGuard::start(&consumer_ctx, kind::MOCK_API_SVC, mock_port, kind::MOCK_API_PORT)?;
+    let mock_pf_ready = verify::wait_for_port(mock_port);
+
+    consumer::verify_api_fallback_e2e(
+        &cfg,
+        "model-x",
+        API_FALLBACK_MODEL,
+        mock_pf_ready.then_some(mock_port),
+        API_PROVIDER_SECRET_NAME,
+    )?;
+
+    // Explicit token-absence proof: token must not appear in the consumer ConfigMap.
+    let consumer_ctx_ref = &consumer_ctx;
+    verify_token_absent_from_consumer_configmap(consumer_ctx_ref, &api_token)?;
+
+    mock_pf.stop();
+    kind::delete_mock_api_provider(&consumer_ctx);
+
+    eprintln!("verify-api-fallback-native: PASS");
+    Ok(())
+}
+
+/// Assert the known token string is absent from the operator overlay JSON.
+///
+/// Fails fast with a clear diagnostic rather than silently passing.
+fn verify_token_absent_from_overlay(overlay_json: &str, api_token: &str) {
+    if overlay_json.contains(api_token) {
+        eprintln!(
+            "SECURITY VIOLATION: token bytes found in operator overlay JSON\n\
+             This is a bug in the operator credential projection — overlay must \
+             carry only credential.secretRef, never the token value."
+        );
+        std::process::abort();
+    }
+    eprintln!("  [PASS] token bytes absent from operator overlay JSON");
+}
+
+/// Assert the known token string is absent from the consumer Praxis `ConfigMap`.
+///
+/// Reads the `ConfigMap` live from the cluster and fails if the token appears anywhere
+/// in the YAML.  This proves the file-backed path keeps tokens out of `ConfigMap`s.
+fn verify_token_absent_from_consumer_configmap(
+    consumer_ctx: &str,
+    api_token: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let configmap_yaml = kind::kubectl_get_configmap(consumer_ctx, "default", "praxis-consumer-config")?;
+    if configmap_yaml.contains(api_token) {
+        return Err(format!(
+            "SECURITY VIOLATION: token bytes found in consumer Praxis ConfigMap \
+             (praxis-consumer-config in {consumer_ctx}). \
+             The file-backed path must keep token bytes out of ConfigMaps."
+        )
+        .into());
+    }
+    eprintln!("  [PASS] token bytes absent from consumer Praxis ConfigMap");
     Ok(())
 }
 
@@ -3205,9 +3469,187 @@ fn env_verify_failover_under_lost_peer(config: &Path) -> Result<(), Box<dyn std:
     Ok(())
 }
 
-/// Verify a single metrics-routing phase: overlay order, shared model routing, unknown model rejection.
+/// Prove that `GridNetwork.spec.staleCandidateTtlSeconds` activates overlay-level GC.
 ///
-/// This is the inner verification loop called for both phase 1 and phase 2.
+/// **Why this is deterministic:**
+///
+/// The TTL is set to `STALE_GC_TTL_SECS = 5 s`.  After killing the west operator,
+/// `SWIM_DEAD_MEMBER_WAIT` (20 s) provides a safe window for SWIM to declare west Dead
+/// (typically within ~6 s).  At that point `MemberRecord.age_secs` is approximately
+/// 14 s (20 s wait − 6 s SWIM dead detection), which comfortably exceeds the 5 s TTL.
+///
+/// The `wait_for_remote_candidate_absent` helper bumps the `GridNetwork` every 5 s so
+/// a reconcile fires after each age-tick window.  Each reconcile calls
+/// `apply_stale_gc_filter` with the age read from the SWIM membership snapshot.  Once
+/// age ≥ TTL the stale candidate is omitted from the overlay.
+///
+/// **Honest boundaries:**
+/// - Only overlay-level filtering is proven.  CRDT storage records are not deleted.
+/// - The local east candidate is verified to remain present and `fresh=true`.
+/// - SWIM is not restarted; the proof uses the same two-provider kind environment.
+#[expect(
+    clippy::too_many_lines,
+    reason = "sequential 7-step GC proof: gateways, operators, SWIM, fixtures with TTL, initial overlay, kill+GC, verify+cleanup"
+)]
+fn env_verify_stale_gc_ttl(config: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    use operator::{
+        CONFIGMAP_POLL_TIMEOUT, STALE_GC_ABSENT_POLL_TIMEOUT, STALE_GC_EAST_PROVIDER, STALE_GC_GW, STALE_GC_NETWORK,
+        STALE_GC_TTL_SECS, STALE_GC_WEST_PROVIDER, SWIM_CONVERGENCE_WAIT, SWIM_DEAD_MEMBER_WAIT,
+        SWIM_STATUS_POLL_TIMEOUT,
+    };
+
+    let cfg = EnvConfig::from_file(config)?;
+    eprintln!("verify-stale-gc-ttl: loading two-provider config...");
+
+    let providers = provider_clusters_from_config(&cfg);
+    if providers.len() < 2 {
+        return Err(format!(
+            "verify-stale-gc-ttl requires >= 2 provider clusters; got {}",
+            providers.len()
+        )
+        .into());
+    }
+    let Some((east_site, _)) = providers.first() else {
+        return Err("verify-stale-gc-ttl: east provider cluster not found".into());
+    };
+    let Some((west_site, _)) = providers.get(1) else {
+        return Err("verify-stale-gc-ttl: west provider cluster not found".into());
+    };
+    let east_ctx = kind::kubectl_context(east_site);
+    let west_ctx = kind::kubectl_context(west_site);
+
+    // ── Step 1: Preflight ─────────────────────────────────────────────────────
+    eprintln!("verify-stale-gc-ttl: [1/7] preflight — CRDs, cleanup, operator binary...");
+    operator::install_grid_crds(&east_ctx)?;
+    operator::install_grid_crds(&west_ctx)?;
+    operator::ensure_operator_binary_built()?;
+    operator::cleanup_stale_gc_east_resources(&east_ctx).unwrap_or_else(|e| eprintln!("  cleanup: {e}"));
+    operator::cleanup_stale_gc_west_resources(&west_ctx).unwrap_or_else(|e| eprintln!("  cleanup: {e}"));
+
+    // ── Step 2: Provider gateways ─────────────────────────────────────────────
+    eprintln!("verify-stale-gc-ttl: [2/7] deploying provider gateways...");
+    gateway::deploy_all(&cfg)?;
+
+    // ── Step 3: SWIM operators ────────────────────────────────────────────────
+    eprintln!("verify-stale-gc-ttl: [3/7] starting SWIM operators...");
+    let (bind_east, bind_west) = reserve_swim_bind_addrs()?;
+    let op_east = operator::spawn_operator_with_swim_for_context(&east_ctx, &bind_east, &bind_east, east_site, "")?;
+    let mut op_east_guard = ProcGuard(Some(op_east), "operator-east");
+    let op_west =
+        operator::spawn_operator_with_swim_for_context(&west_ctx, &bind_west, &bind_west, west_site, &bind_east)?;
+    let mut op_west_guard = ProcGuard(Some(op_west), "operator-west");
+    eprintln!("  [OK] east + west operators started");
+
+    // ── Step 4: SWIM convergence + fixtures with TTL ──────────────────────────
+    eprintln!(
+        "verify-stale-gc-ttl: [4/7] SWIM convergence + applying fixtures \
+         (staleCandidateTtlSeconds={STALE_GC_TTL_SECS})..."
+    );
+    operator::wait_for_swim_convergence(SWIM_CONVERGENCE_WAIT);
+    operator::apply_stale_gc_east_fixtures(&east_ctx, east_site, STALE_GC_TTL_SECS)?;
+    operator::apply_stale_gc_west_fixtures(&west_ctx, west_site)?;
+    operator::bump_gridnetwork(&east_ctx, STALE_GC_NETWORK)?;
+
+    let dist = operator::wait_for_gridnetwork_distributed_state(&east_ctx, STALE_GC_NETWORK, SWIM_STATUS_POLL_TIMEOUT)?;
+    eprintln!("  [OK] CRDT distributed state: distributedProviderCount={dist}");
+
+    // ── Step 5: Verify initial overlay (both candidates fresh=true) ───────────
+    eprintln!("verify-stale-gc-ttl: [5/7] verifying initial overlay (west fresh=true before kill)...");
+    operator::bump_gridnetwork(&east_ctx, STALE_GC_NETWORK)?;
+    operator::wait_for_overlay_configmap(
+        &east_ctx,
+        STALE_GC_NETWORK,
+        STALE_GC_GW,
+        "default",
+        CONFIGMAP_POLL_TIMEOUT,
+    )?;
+
+    let initial_overlay = operator::read_overlay_configmap(&east_ctx, STALE_GC_NETWORK, STALE_GC_GW, "default")?;
+    let initial_candidates = initial_overlay
+        .get("candidates")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("initial overlay missing candidates")?;
+    let local_initially_fresh = initial_candidates.iter().any(|c| {
+        c.get("cluster").and_then(serde_json::Value::as_str) == Some(east_site)
+            && c.get("fresh").and_then(serde_json::Value::as_bool) == Some(true)
+    });
+    let remote_initially_fresh = initial_candidates.iter().any(|c| {
+        c.get("cluster").and_then(serde_json::Value::as_str) == Some(west_site)
+            && c.get("fresh").and_then(serde_json::Value::as_bool) == Some(true)
+    });
+    if !local_initially_fresh {
+        return Err(format!("initial overlay: local candidate ({east_site:?}) not fresh=true").into());
+    }
+    if !remote_initially_fresh {
+        return Err(format!("initial overlay: remote candidate ({west_site:?}) not fresh=true").into());
+    }
+    eprintln!(
+        "  [PASS] initial overlay: {STALE_GC_EAST_PROVIDER} fresh=true, \
+         {STALE_GC_WEST_PROVIDER} fresh=true"
+    );
+
+    // ── Step 6: Kill west, wait for GC eviction ───────────────────────────────
+    eprintln!(
+        "verify-stale-gc-ttl: [6/7] killing west operator; waiting for TTL-based GC eviction \
+         (TTL={STALE_GC_TTL_SECS}s)..."
+    );
+    if let Some(c) = op_west_guard.0.take() {
+        operator::kill_operator(c);
+    }
+    eprintln!(
+        "  [OK] west operator killed; waiting {}s for SWIM dead detection + age accumulation...",
+        SWIM_DEAD_MEMBER_WAIT.as_secs()
+    );
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "bounded wait for SWIM dead detection + age accumulation past TTL"
+    )]
+    std::thread::sleep(SWIM_DEAD_MEMBER_WAIT);
+
+    // Poll until the stale west candidate is absent (GC evicted it).
+    // The helper bumps GridNetwork every 5 s to trigger reconciles.
+    operator::wait_for_remote_candidate_absent(
+        &east_ctx,
+        STALE_GC_NETWORK,
+        STALE_GC_GW,
+        west_site,
+        STALE_GC_ABSENT_POLL_TIMEOUT,
+    )?;
+
+    // Verify the local east candidate is still present and fresh=true.
+    let final_overlay = operator::read_overlay_configmap(&east_ctx, STALE_GC_NETWORK, STALE_GC_GW, "default")?;
+    let final_candidates = final_overlay
+        .get("candidates")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("final overlay missing candidates")?;
+    let local_still_fresh = final_candidates.iter().any(|c| {
+        c.get("cluster").and_then(serde_json::Value::as_str) == Some(east_site)
+            && c.get("fresh").and_then(serde_json::Value::as_bool) == Some(true)
+    });
+    if !local_still_fresh {
+        return Err(format!("final overlay: local candidate ({east_site:?}) must still be fresh=true after GC").into());
+    }
+    eprintln!(
+        "  [PASS] final overlay: {STALE_GC_EAST_PROVIDER} (local) still fresh=true; \
+         {STALE_GC_WEST_PROVIDER} (remote, stale) absent — evicted by TTL={STALE_GC_TTL_SECS}s GC"
+    );
+
+    // ── Step 7: Cleanup ───────────────────────────────────────────────────────
+    eprintln!("verify-stale-gc-ttl: [7/7] cleanup...");
+    if let Some(c) = op_east_guard.0.take() {
+        operator::kill_operator(c);
+    }
+    operator::cleanup_stale_gc_east_resources(&east_ctx).unwrap_or_else(|e| eprintln!("  warning: {e}"));
+    operator::cleanup_stale_gc_west_resources(&west_ctx).unwrap_or_else(|e| eprintln!("  warning: {e}"));
+
+    eprintln!(
+        "verify-stale-gc-ttl: PASS — \
+         stale remote candidate evicted by TTL={STALE_GC_TTL_SECS}s GC; \
+         local candidate retained; CRD field staleCandidateTtlSeconds proven"
+    );
+    Ok(())
+}
+
 /// `expected_first_site` is the site that should appear first in the overlay after
 /// the current metrics values are applied.  The consumer config is generated solely
 /// from the metrics-routing overlay (which only advertises the shared model), so

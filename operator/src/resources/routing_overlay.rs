@@ -48,11 +48,14 @@ use crdt;
 use k8s_openapi::api::core::v1::ConfigMap;
 use serde::{Deserialize, Serialize};
 
-use crate::crd::{
-    auth::AuthStrategy,
-    grid_network::GridNetwork,
-    grid_site::GridSite,
-    inference_provider::{InferenceProvider, ProviderPhase},
+use crate::{
+    crd::{
+        auth::AuthStrategy,
+        grid_network::GridNetwork,
+        grid_site::GridSite,
+        inference_provider::{InferenceProvider, ProviderPhase},
+    },
+    swim::{MemberStatus, MembershipSnapshot},
 };
 
 // ---------------------------------------------------------------------------
@@ -346,6 +349,168 @@ const UNMAPPED_NEUTRAL_SIGNAL: f64 = 0.5;
 /// providers with no latency observation score neutrally on the latency signal in
 /// both paths.
 const NEUTRAL_LATENCY_MS: f64 = 2500.0;
+
+// ---------------------------------------------------------------------------
+// Stale candidate expiry policy
+// ---------------------------------------------------------------------------
+
+/// Policy controlling when `fresh=false` routing candidates are garbage-collected
+/// from the overlay.
+///
+/// # Design
+///
+/// The overlay retains stale (`fresh=false`) candidates for observability and
+/// to allow the data plane to prefer a healthy fallback without losing sight of
+/// the degraded peer.  However, candidates that have been dead for longer than
+/// the TTL should be evicted to prevent unbounded overlay growth.
+///
+/// # Runtime age source
+///
+/// `MemberRecord.age_secs` is populated by the SWIM runtime for members that
+/// have transitioned to `Dead` or `Suspect`.  `Alive` members report age `0`.
+/// The age is derived from an internal `Instant`, not from CRDT provider
+/// revisions.
+///
+/// `age_secs = 0` on a `Dead`/`Suspect` member is treated conservatively as
+/// unknown by `dead_or_suspect_age_secs`.  This avoids evicting candidates in
+/// the first sub-second after transition and protects callers that construct
+/// snapshots without runtime age data.
+///
+/// # TTL configuration
+///
+/// `GridNetwork.spec.staleCandidateTtlSeconds` is converted into this policy by
+/// the `stale_policy_from_spec` helper.  The field is optional; when absent,
+/// `StaleCandidatePolicy::default()` uses `dead_member_ttl_secs = None`, so the
+/// filter is wired but retains all stale candidates.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StaleCandidatePolicy {
+    /// Maximum age (seconds) for a stale (`fresh=false`) candidate.
+    ///
+    /// `None` means retain indefinitely — the conservative default until a
+    /// product-level TTL setting is added.
+    pub dead_member_ttl_secs: Option<u64>,
+}
+
+/// Build a [`StaleCandidatePolicy`] from `GridNetwork.spec.staleCandidateTtlSeconds`.
+///
+/// # Mapping
+///
+/// | `spec.staleCandidateTtlSeconds` | `StaleCandidatePolicy.dead_member_ttl_secs` |
+/// |---|---|
+/// | `None` (absent) | `None` — retain indefinitely (default no-op) |
+/// | `Some(0)` | `None` — defensive guard; the CRD schema rejects `0` |
+/// | `Some(n)` where `n >= 1` | `Some(n as u64)` |
+///
+/// # Pure function
+///
+/// This function is side-effect-free and depends only on its input.
+/// Call it once per reconcile; the result is passed to [`apply_stale_gc_filter`].
+#[must_use]
+pub(crate) fn stale_policy_from_spec(ttl_seconds: Option<u32>) -> StaleCandidatePolicy {
+    // The CRD schema rejects zero, but keep the pure helper defensive so
+    // malformed data from tests, downgraded resources, or non-API callers cannot
+    // cause immediate eviction of all stale candidates.
+    let effective_ttl = ttl_seconds.and_then(|s| (s > 0).then(|| u64::from(s)));
+    StaleCandidatePolicy {
+        dead_member_ttl_secs: effective_ttl,
+    }
+}
+
+/// Decide whether a `fresh=false` routing candidate should be retained or evicted.
+///
+/// This is the single authoritative place where the GC / expiry policy is
+/// encoded.  All overlay rendering paths should call this function to decide
+/// whether to include a degraded remote candidate.
+///
+/// # Policy rules
+///
+/// 1. **Fresh candidates** (`fresh = true`) are **always retained** regardless of age or policy.  Local candidates and
+///    healthy remote candidates must never be evicted by a stale-peer GC policy.
+///
+/// 2. **No TTL configured** (`policy.dead_member_ttl_secs = None`) → retain. The conservative default until a product
+///    TTL setting is added.
+///
+/// 3. **No age data** (`dead_age_secs = None`) → retain. This includes `age_secs = 0` for Dead/Suspect members, which
+///    means the transition happened less than one second ago or the caller provided a synthetic snapshot without age.
+///
+/// 4. **Age below TTL** (`dead_age_secs < ttl`) → retain. The peer has been dead for less than the configured window.
+///    The `fresh=false` signal is enough to deprioritise it.
+///
+/// 5. **Age at or above TTL** (`dead_age_secs >= ttl`) → evict. The peer has been dead long enough that its overlay
+///    entries add noise without adding observability value.
+///
+/// # Honest boundaries
+///
+/// This function only applies overlay-level filtering.  It does not remove
+/// records from CRDT storage.  With the default policy (`ttl = None`) it is a
+/// behavioral no-op.
+#[must_use]
+pub(crate) fn should_retain_candidate(fresh: bool, dead_age_secs: Option<u64>, policy: &StaleCandidatePolicy) -> bool {
+    if fresh {
+        return true; // Rule 1: fresh candidates are never evicted.
+    }
+    let Some(ttl) = policy.dead_member_ttl_secs else {
+        return true; // Rule 2: no TTL configured → retain.
+    };
+    let Some(age) = dead_age_secs else {
+        return true; // Rule 3: no age data → retain conservatively.
+    };
+    age < ttl // Rules 4 & 5: retain below TTL, evict at or above.
+}
+
+/// Return the age in seconds for which a SWIM member has been `Dead` or `Suspect`.
+///
+/// Returns `Some(age_secs)` only when the member is found with a
+/// `Dead` or `Suspect` status and a non-zero `age_secs` (populated by the
+/// SWIM runtime after the age-tracking fix).  Returns `None` when:
+/// - The site is not in the snapshot (unknown peer).
+/// - The member is `Alive` (no stale age relevant to GC).
+/// - `age_secs` is `0` — conservatively treated as "age unknown" so stale candidates are not evicted during the first
+///   sub-second after transition or when a synthetic snapshot lacks age data.
+///
+/// This is the bridge between the SWIM membership snapshot and the
+/// [`should_retain_candidate`] GC policy function.
+pub(crate) fn dead_or_suspect_age_secs(site_id: &str, membership: Option<&MembershipSnapshot>) -> Option<u64> {
+    let snap = membership?;
+    let member = snap.members.iter().find(|m| m.site_id == site_id)?;
+    match member.status {
+        MemberStatus::Dead | MemberStatus::Suspect => {
+            // age_secs=0 means the transition is sub-second or the snapshot lacks
+            // real runtime age data — retain conservatively.
+            (member.age_secs > 0).then_some(member.age_secs)
+        },
+        MemberStatus::Alive => None,
+    }
+}
+
+/// Filter remote CRDT providers through the stale-candidate GC policy.
+///
+/// For each provider:
+/// - If `phase != Degraded` (i.e. `fresh=true` candidates), always retained.
+/// - If `phase == Degraded` (i.e. `fresh=false` candidates), applies [`should_retain_candidate`] using the member's
+///   Dead/Suspect age from the SWIM snapshot.
+///
+/// This function is a pure filter over the already-staleness-overridden provider
+/// list produced by `apply_swim_staleness_override`.  It does **not** modify
+/// CRDT storage.
+///
+/// When `policy.dead_member_ttl_secs` is `None` (the current default), this
+/// function is a no-op — all providers are retained regardless of age.
+pub(crate) fn apply_stale_gc_filter(
+    providers: &[crdt::ProviderState],
+    membership: Option<&MembershipSnapshot>,
+    policy: &StaleCandidatePolicy,
+) -> Vec<crdt::ProviderState> {
+    providers
+        .iter()
+        .filter(|p| {
+            let fresh = p.phase != crdt::ProviderPhase::Degraded;
+            let age = dead_or_suspect_age_secs(&p.site_id, membership);
+            should_retain_candidate(fresh, age, policy)
+        })
+        .cloned()
+        .collect()
+}
 
 /// Compute the score equivalent to what [`scoring::score_backends`] would
 /// assign to a provider whose `backend_kind` cannot be parsed.
@@ -3534,6 +3699,331 @@ mod tests {
         assert!(
             candidate.get("credential").is_none(),
             "manual auth must produce no 'credential' field in JSON"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // stale_policy_from_spec — spec field to policy conversion
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn stale_policy_from_spec_absent_produces_none_ttl() {
+        let policy = stale_policy_from_spec(None);
+        assert!(
+            policy.dead_member_ttl_secs.is_none(),
+            "absent TTL spec field must produce no-op policy (None TTL)"
+        );
+    }
+
+    #[test]
+    fn stale_policy_from_spec_some_produces_matching_ttl() {
+        let policy = stale_policy_from_spec(Some(3600));
+        assert_eq!(
+            policy.dead_member_ttl_secs,
+            Some(3600),
+            "configured TTL must propagate as-is to policy"
+        );
+    }
+
+    #[test]
+    fn stale_policy_from_spec_one_second_minimum() {
+        let policy = stale_policy_from_spec(Some(1));
+        assert_eq!(
+            policy.dead_member_ttl_secs,
+            Some(1),
+            "minimum TTL of 1 second must be accepted"
+        );
+    }
+
+    #[test]
+    fn stale_policy_from_spec_zero_treated_as_absent() {
+        // The CRD schema rejects zero, but the pure helper defensively treats it
+        // as absent to avoid accidental immediate eviction.
+        let policy = stale_policy_from_spec(Some(0));
+        assert!(
+            policy.dead_member_ttl_secs.is_none(),
+            "zero TTL must be treated as absent internally even though the CRD schema rejects it"
+        );
+    }
+
+    #[test]
+    fn stale_policy_from_spec_large_ttl_preserves_precision() {
+        // u32::MAX seconds (~136 years) must round-trip without truncation through u64.
+        let policy = stale_policy_from_spec(Some(u32::MAX));
+        assert_eq!(
+            policy.dead_member_ttl_secs,
+            Some(u64::from(u32::MAX)),
+            "large TTL must round-trip through u64 without truncation"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // dead_or_suspect_age_secs — SWIM age extraction
+    // -----------------------------------------------------------------------
+
+    fn make_member(site_id: &str, status: MemberStatus, age_secs: u64) -> crate::swim::MemberRecord {
+        crate::swim::MemberRecord {
+            site_id: site_id.to_owned(),
+            endpoint: "127.0.0.1:7946".to_owned(),
+            incarnation: 1,
+            status,
+            age_secs,
+        }
+    }
+
+    fn make_snapshot(members: Vec<crate::swim::MemberRecord>) -> MembershipSnapshot {
+        MembershipSnapshot { members }
+    }
+
+    #[test]
+    fn dead_or_suspect_age_returns_none_for_alive_member() {
+        let snap = make_snapshot(vec![make_member("site-a", MemberStatus::Alive, 999)]);
+        let age = dead_or_suspect_age_secs("site-a", Some(&snap));
+        assert!(age.is_none(), "Alive member must not return an age (not stale)");
+    }
+
+    #[test]
+    fn dead_or_suspect_age_returns_none_for_unknown_site() {
+        let snap = make_snapshot(vec![make_member("site-b", MemberStatus::Dead, 300)]);
+        let age = dead_or_suspect_age_secs("site-unknown", Some(&snap));
+        assert!(age.is_none(), "unknown site must return None (retain conservatively)");
+    }
+
+    #[test]
+    fn dead_or_suspect_age_returns_none_when_no_snapshot() {
+        let age = dead_or_suspect_age_secs("site-a", None);
+        assert!(age.is_none(), "no snapshot must return None (retain conservatively)");
+    }
+
+    #[test]
+    fn dead_or_suspect_age_returns_none_for_zero_age_dead() {
+        // age_secs=0 on a Dead member means sub-second age or synthetic
+        // snapshot without age. Conservatively treat as unknown → retain.
+        let snap = make_snapshot(vec![make_member("site-a", MemberStatus::Dead, 0)]);
+        let age = dead_or_suspect_age_secs("site-a", Some(&snap));
+        assert!(
+            age.is_none(),
+            "Dead with age_secs=0 must return None (sub-second or synthetic age)"
+        );
+    }
+
+    #[test]
+    fn dead_or_suspect_age_returns_age_for_dead_member() {
+        let snap = make_snapshot(vec![make_member("site-a", MemberStatus::Dead, 600)]);
+        let age = dead_or_suspect_age_secs("site-a", Some(&snap));
+        assert_eq!(age, Some(600), "Dead member with real age must return Some(age)");
+    }
+
+    #[test]
+    fn dead_or_suspect_age_returns_age_for_suspect_member() {
+        let snap = make_snapshot(vec![make_member("site-a", MemberStatus::Suspect, 45)]);
+        let age = dead_or_suspect_age_secs("site-a", Some(&snap));
+        assert_eq!(age, Some(45), "Suspect member with real age must return Some(age)");
+    }
+
+    // -----------------------------------------------------------------------
+    // apply_stale_gc_filter — overlay-level expiry
+    // -----------------------------------------------------------------------
+
+    fn make_crdt_available(site_id: &str) -> crdt::ProviderState {
+        crdt::ProviderState {
+            network_id: "net".to_owned(),
+            site_id: site_id.to_owned(),
+            provider_id: "prov".to_owned(),
+            routing_cluster: site_id.to_owned(),
+            models: vec!["model".to_owned()],
+            backend_kind: "remote".to_owned(),
+            phase: crdt::ProviderPhase::Available,
+            metrics: crdt::ProviderMetricsSnapshot::default(),
+            revision: 1,
+            writer_id: "w".to_owned(),
+        }
+    }
+
+    fn make_crdt_degraded(site_id: &str) -> crdt::ProviderState {
+        crdt::ProviderState {
+            phase: crdt::ProviderPhase::Degraded,
+            ..make_crdt_available(site_id)
+        }
+    }
+
+    #[test]
+    fn gc_filter_no_ttl_retains_all() {
+        let policy = StaleCandidatePolicy {
+            dead_member_ttl_secs: None,
+        };
+        let providers = vec![make_crdt_degraded("site-a")];
+        let snap = make_snapshot(vec![make_member("site-a", MemberStatus::Dead, 999_999)]);
+        let result = apply_stale_gc_filter(&providers, Some(&snap), &policy);
+        assert_eq!(result.len(), 1, "no TTL must retain all providers");
+    }
+
+    #[test]
+    fn gc_filter_retains_fresh_candidate_even_at_ttl() {
+        let policy = StaleCandidatePolicy {
+            dead_member_ttl_secs: Some(60),
+        };
+        let providers = vec![make_crdt_available("site-a")]; // fresh (Available)
+        let snap = make_snapshot(vec![make_member("site-a", MemberStatus::Alive, 0)]);
+        let result = apply_stale_gc_filter(&providers, Some(&snap), &policy);
+        assert_eq!(
+            result.len(),
+            1,
+            "fresh/Available provider must be retained regardless of TTL"
+        );
+    }
+
+    #[test]
+    fn gc_filter_retains_stale_below_ttl() {
+        let policy = StaleCandidatePolicy {
+            dead_member_ttl_secs: Some(3_600),
+        };
+        let providers = vec![make_crdt_degraded("site-a")];
+        let snap = make_snapshot(vec![make_member("site-a", MemberStatus::Dead, 300)]);
+        let result = apply_stale_gc_filter(&providers, Some(&snap), &policy);
+        assert_eq!(result.len(), 1, "stale provider with age < TTL must be retained");
+    }
+
+    #[test]
+    fn gc_filter_evicts_stale_at_or_above_ttl() {
+        let policy = StaleCandidatePolicy {
+            dead_member_ttl_secs: Some(3_600),
+        };
+        let providers = vec![make_crdt_degraded("site-a")];
+        let snap = make_snapshot(vec![make_member("site-a", MemberStatus::Dead, 3_600)]);
+        let result = apply_stale_gc_filter(&providers, Some(&snap), &policy);
+        assert!(result.is_empty(), "stale provider with age >= TTL must be evicted");
+    }
+
+    #[test]
+    fn gc_filter_retains_stale_with_zero_age_conservatively() {
+        // age_secs=0 → sub-second age or synthetic snapshot without age.
+        // Retain conservatively.
+        let policy = StaleCandidatePolicy {
+            dead_member_ttl_secs: Some(60),
+        };
+        let providers = vec![make_crdt_degraded("site-a")];
+        let snap = make_snapshot(vec![make_member("site-a", MemberStatus::Dead, 0)]);
+        let result = apply_stale_gc_filter(&providers, Some(&snap), &policy);
+        assert_eq!(result.len(), 1, "stale with age_secs=0 must be retained (unknown age)");
+    }
+
+    #[test]
+    fn gc_filter_default_policy_is_noop() {
+        // Default policy (None TTL) must not evict anything at any age.
+        let policy = StaleCandidatePolicy::default();
+        let providers = vec![make_crdt_degraded("site-a"), make_crdt_degraded("site-b")];
+        let snap = make_snapshot(vec![
+            make_member("site-a", MemberStatus::Dead, 999_999),
+            make_member("site-b", MemberStatus::Suspect, 999_999),
+        ]);
+        let result = apply_stale_gc_filter(&providers, Some(&snap), &policy);
+        assert_eq!(result.len(), 2, "default policy must retain all providers (no TTL)");
+    }
+
+    // -----------------------------------------------------------------------
+    // should_retain_candidate — stale candidate GC policy
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn retain_fresh_candidate_regardless_of_age_and_ttl() {
+        // Rule 1: fresh=true is never evicted, even with an old age and tight TTL.
+        let policy = StaleCandidatePolicy {
+            dead_member_ttl_secs: Some(60),
+        };
+        assert!(
+            should_retain_candidate(true, Some(9_999), &policy),
+            "fresh=true must never be evicted regardless of age or TTL"
+        );
+    }
+
+    #[test]
+    fn retain_stale_candidate_when_no_ttl_configured() {
+        // Rule 2: no TTL → retain indefinitely regardless of age.
+        let policy = StaleCandidatePolicy {
+            dead_member_ttl_secs: None,
+        };
+        assert!(
+            should_retain_candidate(false, Some(99_999), &policy),
+            "fresh=false with no TTL must be retained indefinitely"
+        );
+    }
+
+    #[test]
+    fn retain_stale_candidate_when_age_unknown() {
+        // Rule 3: no age data (age_secs always 0 in current runtime) → retain conservatively.
+        let policy = StaleCandidatePolicy {
+            dead_member_ttl_secs: Some(300),
+        };
+        assert!(
+            should_retain_candidate(false, None, &policy),
+            "fresh=false with unknown age must be retained conservatively"
+        );
+    }
+
+    #[test]
+    fn retain_stale_candidate_when_age_below_ttl() {
+        // Rule 4: age < TTL → retain (candidate is stale but within the window).
+        let policy = StaleCandidatePolicy {
+            dead_member_ttl_secs: Some(300),
+        };
+        assert!(
+            should_retain_candidate(false, Some(120), &policy),
+            "fresh=false with age < TTL must be retained"
+        );
+    }
+
+    #[test]
+    fn evict_stale_candidate_when_age_meets_ttl() {
+        // Rule 5 (boundary): age == TTL → evict.
+        let policy = StaleCandidatePolicy {
+            dead_member_ttl_secs: Some(300),
+        };
+        assert!(
+            !should_retain_candidate(false, Some(300), &policy),
+            "fresh=false with age == TTL must be evicted"
+        );
+    }
+
+    #[test]
+    fn evict_stale_candidate_when_age_exceeds_ttl() {
+        // Rule 5: age > TTL → evict.
+        let policy = StaleCandidatePolicy {
+            dead_member_ttl_secs: Some(300),
+        };
+        assert!(
+            !should_retain_candidate(false, Some(7200), &policy),
+            "fresh=false with age > TTL must be evicted"
+        );
+    }
+
+    #[test]
+    fn default_policy_retains_all_stale_candidates() {
+        // Current default: None TTL → retain everything.
+        // This ensures that until real age data is available, no candidate
+        // is silently evicted at runtime.
+        let policy = StaleCandidatePolicy::default();
+        assert!(
+            should_retain_candidate(false, Some(999_999), &policy),
+            "default policy must retain all stale candidates (no TTL)"
+        );
+        assert!(
+            should_retain_candidate(false, None, &policy),
+            "default policy must retain stale candidates with unknown age"
+        );
+    }
+
+    #[test]
+    fn local_fresh_candidate_never_evicted_by_stale_policy() {
+        // Local candidates carry fresh=true by design (they are never Degraded
+        // by apply_swim_staleness_override for their own site).  This test
+        // documents that fresh=true candidates are not subject to GC.
+        let tight_policy = StaleCandidatePolicy {
+            dead_member_ttl_secs: Some(1),
+        };
+        assert!(
+            should_retain_candidate(true, Some(9_999), &tight_policy),
+            "local fresh candidate must not be evicted even with a tight TTL and large age"
         );
     }
 

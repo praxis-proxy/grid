@@ -390,6 +390,48 @@ pub(crate) const FAILOVER_REJOIN_WAIT: Duration = Duration::from_secs(20);
 pub(crate) const FAILOVER_RECOVERY_POLL_TIMEOUT: Duration = Duration::from_secs(45);
 
 // ---------------------------------------------------------------------------
+// Stale-candidate TTL GC validation constants
+// ---------------------------------------------------------------------------
+
+/// `GridNetwork` name used by the stale-candidate TTL GC validation.
+///
+/// Kept distinct from all other test networks to avoid resource collisions.
+pub(crate) const STALE_GC_NETWORK: &str = "op-e2e-stale-gc-net";
+
+/// Gateway reference name used in the stale-GC `GridNetwork`.
+pub(crate) const STALE_GC_GW: &str = "op-e2e-stale-gc-gw";
+
+/// `InferenceProvider` name for the east (local/primary) site.
+pub(crate) const STALE_GC_EAST_PROVIDER: &str = "op-e2e-stale-gc-east";
+
+/// `InferenceProvider` name for the west (remote/joining) site.
+pub(crate) const STALE_GC_WEST_PROVIDER: &str = "op-e2e-stale-gc-west";
+
+/// Model served by the local east provider.
+pub(crate) const STALE_GC_LOCAL_MODEL: &str = "model-stale-gc-local";
+
+/// Model served by the remote west provider.
+pub(crate) const STALE_GC_REMOTE_MODEL: &str = "model-stale-gc-remote";
+
+/// TTL (seconds) configured in the test `GridNetwork`.
+///
+/// 5 seconds is short enough that after `SWIM_DEAD_MEMBER_WAIT` (20 s) the
+/// SWIM Dead age (~14 s) reliably exceeds the TTL, triggering GC.  It is long
+/// enough to avoid false eviction during the normal setup window when no peer
+/// is Dead.
+pub(crate) const STALE_GC_TTL_SECS: u32 = 5;
+
+/// Timeout for polling until the stale remote candidate is absent from the overlay.
+///
+/// After killing west, the absence of the stale candidate requires:
+/// - SWIM dead detection (≤ 6 s with `foca::Config::simple()`)
+/// - Age accumulation past `STALE_GC_TTL_SECS` (5 s)
+/// - At least one `GridNetwork` reconcile (triggered by periodic bump inside the helper)
+///
+/// 45 s provides a safe margin on loaded CI hosts.
+pub(crate) const STALE_GC_ABSENT_POLL_TIMEOUT: Duration = Duration::from_secs(45);
+
+// ---------------------------------------------------------------------------
 // CRD installation
 // ---------------------------------------------------------------------------
 
@@ -3865,6 +3907,201 @@ pub(crate) fn cleanup_failover_west_resources(context: &str) -> Result<(), Box<d
     delete_cluster_resource(context, "inferenceprovider", FAILOVER_WEST_PROVIDER)?;
     delete_cluster_resource(context, "gridnetwork", FAILOVER_NETWORK)?;
     eprintln!("  [OK] stale failover west resources removed from {context}");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Stale-candidate TTL GC validation helpers
+// ---------------------------------------------------------------------------
+
+/// Apply east fixtures for the stale-GC validation.
+///
+/// Creates [`STALE_GC_NETWORK`] with `spec.staleCandidateTtlSeconds = ttl_secs`
+/// and [`STALE_GC_EAST_PROVIDER`] (local, `backendKind=local`).
+#[expect(clippy::too_many_lines, reason = "two JSON manifests with full K8s structure")]
+pub(crate) fn apply_stale_gc_east_fixtures(
+    context: &str,
+    east_site: &str,
+    ttl_secs: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let network = serde_json::to_string_pretty(&serde_json::json!({
+        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "kind": "GridNetwork",
+        "metadata": { "name": STALE_GC_NETWORK },
+        "spec": {
+            "seeds": [],
+            "staleCandidateTtlSeconds": ttl_secs,
+            "gatewayRefs": [{
+                "name": STALE_GC_GW,
+                "namespace": "default",
+                "localSiteName": east_site
+            }]
+        }
+    }))
+    .unwrap_or_else(|e| {
+        eprintln!("stale-GC east GridNetwork serialization failed: {e}");
+        std::process::exit(1);
+    });
+    let provider = serde_json::to_string_pretty(&serde_json::json!({
+        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "kind": "InferenceProvider",
+        "metadata": { "name": STALE_GC_EAST_PROVIDER },
+        "spec": {
+            "gridNetworkRef": STALE_GC_NETWORK,
+            "providerKind": "self_hosted",
+            "backendKind": "local",
+            "endpoint": "http://mock-openai-provider.default.svc:8080",
+            "models": [{ "name": STALE_GC_LOCAL_MODEL }],
+            "routingClusterRef": east_site
+        }
+    }))
+    .unwrap_or_else(|e| {
+        eprintln!("stale-GC east provider serialization failed: {e}");
+        std::process::exit(1);
+    });
+    kubectl::apply_manifest(context, &network)?;
+    kubectl::apply_manifest(context, &provider)?;
+    eprintln!(
+        "  [OK] stale-GC east fixtures applied \
+         ({STALE_GC_EAST_PROVIDER}, staleCandidateTtlSeconds={ttl_secs})"
+    );
+    Ok(())
+}
+
+/// Apply west fixtures for the stale-GC validation.
+///
+/// Creates [`STALE_GC_NETWORK`] on the west cluster and
+/// [`STALE_GC_WEST_PROVIDER`] (remote, `backendKind=remote`).
+#[expect(clippy::too_many_lines, reason = "two JSON manifests with full K8s structure")]
+pub(crate) fn apply_stale_gc_west_fixtures(context: &str, west_site: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let network = serde_json::to_string_pretty(&serde_json::json!({
+        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "kind": "GridNetwork",
+        "metadata": { "name": STALE_GC_NETWORK },
+        "spec": { "seeds": [] }
+    }))
+    .unwrap_or_else(|e| {
+        eprintln!("stale-GC west GridNetwork serialization failed: {e}");
+        std::process::exit(1);
+    });
+    let provider = serde_json::to_string_pretty(&serde_json::json!({
+        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "kind": "InferenceProvider",
+        "metadata": { "name": STALE_GC_WEST_PROVIDER },
+        "spec": {
+            "gridNetworkRef": STALE_GC_NETWORK,
+            "providerKind": "self_hosted",
+            "backendKind": "remote",
+            "endpoint": "http://mock-openai-provider.default.svc:8080",
+            "models": [{ "name": STALE_GC_REMOTE_MODEL }],
+            "routingClusterRef": west_site
+        }
+    }))
+    .unwrap_or_else(|e| {
+        eprintln!("stale-GC west provider serialization failed: {e}");
+        std::process::exit(1);
+    });
+    kubectl::apply_manifest(context, &network)?;
+    kubectl::apply_manifest(context, &provider)?;
+    eprintln!(
+        "  [OK] stale-GC west fixtures applied \
+         ({STALE_GC_WEST_PROVIDER}, routingClusterRef={west_site:?})"
+    );
+    Ok(())
+}
+
+/// Poll the overlay until the candidate for `remote_cluster` is **absent**.
+///
+/// Called after the west operator is killed and the TTL-based stale-GC policy
+/// is expected to evict the stale remote candidate.  Unlike
+/// [`wait_for_remote_candidate_stale`] (which asserts `fresh=false`), this
+/// asserts the candidate is completely gone from the overlay, proving that
+/// `apply_stale_gc_filter` removed it.
+///
+/// Bumps the `GridNetwork` every 5 s so a fresh reconcile runs after the member
+/// age crosses the TTL.
+///
+/// # Determinism
+///
+/// Age advances via the 1-second runtime tick independently of SWIM events.
+/// After `SWIM_DEAD_MEMBER_WAIT` (20 s) the west member's `age_secs` is
+/// typically ≥ 14 s (SWIM declares Dead within ~6 s of the kill).  With
+/// `STALE_GC_TTL_SECS = 5`, this comfortably exceeds the TTL.  The bump loop
+/// ensures a reconcile fires after each age-tick window.
+///
+/// `GridNetwork`: the `operator` crate's `GridNetwork` CRD type
+#[expect(
+    clippy::too_many_lines,
+    reason = "periodic bump + overlay read + deadline check; splitting would obscure the GC polling protocol"
+)]
+pub(crate) fn wait_for_remote_candidate_absent(
+    context: &str,
+    network: &str,
+    gw: &str,
+    remote_cluster: &str,
+    timeout: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    const BUMP_INTERVAL: Duration = Duration::from_secs(5);
+    let deadline = Instant::now() + timeout;
+    let mut last_bump = Instant::now() - BUMP_INTERVAL; // trigger first bump immediately
+    loop {
+        // Bump periodically so a reconcile fires after each age-tick window.
+        if last_bump.elapsed() >= BUMP_INTERVAL {
+            if let Err(e) = bump_gridnetwork(context, network) {
+                eprintln!("  [warn] GC absence bump failed (will retry): {e}");
+            }
+            last_bump = Instant::now();
+        }
+        if let Ok(overlay) = read_overlay_configmap(context, network, gw, "default") {
+            let still_present = overlay
+                .get("candidates")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|cands| {
+                    cands
+                        .iter()
+                        .any(|c| c.get("cluster").and_then(serde_json::Value::as_str) == Some(remote_cluster))
+                });
+            if !still_present {
+                eprintln!(
+                    "  [OK] overlay: remote candidate {remote_cluster:?} is absent \
+                     (evicted by TTL-based stale GC)"
+                );
+                return Ok(());
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "timeout waiting for remote candidate {remote_cluster:?} to be absent \
+                 (stale-GC TTL should have evicted it)"
+            )
+            .into());
+        }
+        #[expect(clippy::disallowed_methods, reason = "polling wait between overlay reads")]
+        std::thread::sleep(Duration::from_secs(2));
+    }
+}
+
+/// Delete all resources created by the stale-GC validation on east cluster.
+pub(crate) fn cleanup_stale_gc_east_resources(context: &str) -> Result<(), Box<dyn std::error::Error>> {
+    delete_namespaced_resource(
+        context,
+        "default",
+        "configmap",
+        &format!("grid-overlay-{STALE_GC_NETWORK}-{STALE_GC_GW}"),
+    )?;
+    delete_cluster_resource(context, "inferenceprovider", STALE_GC_EAST_PROVIDER)?;
+    delete_cluster_resource(context, "gridnetwork", STALE_GC_NETWORK)?;
+    cleanup_auto_discovered_gridsites_for_network(context, STALE_GC_NETWORK);
+    eprintln!("  [OK] stale-GC east resources removed");
+    Ok(())
+}
+
+/// Delete all resources created by the stale-GC validation on west cluster.
+pub(crate) fn cleanup_stale_gc_west_resources(context: &str) -> Result<(), Box<dyn std::error::Error>> {
+    delete_cluster_resource(context, "inferenceprovider", STALE_GC_WEST_PROVIDER)?;
+    delete_cluster_resource(context, "gridnetwork", STALE_GC_NETWORK)?;
+    cleanup_auto_discovered_gridsites_for_network(context, STALE_GC_NETWORK);
+    eprintln!("  [OK] stale-GC west resources removed");
     Ok(())
 }
 

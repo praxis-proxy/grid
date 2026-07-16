@@ -4,23 +4,24 @@
 
 Each provider declares how consumers authenticate.
 Praxis performs request-time credential injection from gateway configuration.
-The intended Grid Operator integration is to read provider credential references
-from Kubernetes Secrets and render the corresponding Praxis configuration.
+Grid's implemented bearer-token path projects credential references into the
+routing overlay, then uses an AI-side `grid_credential_inject` filter to read
+the selected token from a mounted Kubernetes Secret file.
 
 | Strategy | Header | Lifecycle | Used By |
 |----------|--------|-----------|---------|
-| `bearer_token` | `Authorization: Bearer X` | Static from Secret | OpenAI, Mistral |
-| `api_key` | Custom (e.g. `x-api-key`) | Static from Secret | Anthropic |
+| `bearer_token` | `Authorization: Bearer X` | Static from mounted Secret file | OpenAI, Mistral |
+| `api_key` | Custom (e.g. `x-api-key`) | Static from Secret *(planned)* | Anthropic |
 | `sigv4` | `Authorization: AWS4-HMAC-SHA256...` | Per-request compute *(planned)* | Bedrock |
 | `oauth2` | `Authorization: Bearer <token>` | Refresh on expiry *(planned)* | Vertex, Azure |
 | `mtls_only` | None (cert-based) | Grid cert lifecycle | Grid-internal |
-| `service_account` | `Authorization: Bearer <SA>` | K8s SA token | In-cluster |
-| `custom` | User-configured | Static from Secret | Fallback |
+| `service_account` | `Authorization: Bearer <SA>` | K8s SA token *(planned)* | In-cluster |
+| `custom` | User-configured | Static from Secret *(planned)* | Fallback |
 
-> **Implementation note:** Static strategies (`bearer_token`, `api_key`, `custom`,
-> `service_account`) are current.  `sigv4` per-request signature computation and
-> `oauth2` token refresh are planned and not yet wired into the operator or
-> Praxis filter pipeline.
+> **Implementation note:** `bearer_token` is the current native data-plane path.
+> `api_key`, `custom`, `service_account`, SigV4 per-request signing, and OAuth2
+> refresh are extension points and are not yet wired into the operator or Praxis
+> filter pipeline.
 
 ## Current implementation boundary
 
@@ -29,9 +30,11 @@ Grid's desired ownership model is:
 1. Users or external secret managers create provider credentials.
 2. Kubernetes Secrets store those credentials.
 3. `InferenceProvider.spec.auth.secretRef` points at the Secret.
-4. The Grid Operator validates and projects the credential into consumer
-   Praxis gateway configuration.
-5. Praxis injects the provider credential at request time.
+4. The Grid Operator validates the Secret and projects only the credential
+   reference into the routing overlay.
+5. The consumer gateway config maps that reference to a mounted Secret file.
+6. Praxis injects the provider credential at request time after `grid_route`
+   selects the credential-bearing candidate.
 
 ### What the controller now owns (controller-owned credential validation, resolver groundwork, and reference projection)
 
@@ -58,27 +61,36 @@ The `InferenceProvider` controller validates credentials during every reconcile:
   only the Secret reference, never the token value. This appears in the
   operator-produced `grid-config.json` ConfigMap.
 
-The xtask `verify-api-fallback` and `verify-full-grid-routing` test suites prove
-the data-plane side: xtask reads the credential reference for the target API
-provider from the operator overlay (not from the provider spec directly), resolves
-the token from the referenced Secret, and injects it into the consumer Praxis
-config. This harness-generated Praxis config still contains the resolved token;
-native Praxis Secret-ref consumption is the remaining production step that keeps
-tokens out of data-plane config entirely.
+The xtask `verify-api-fallback` (legacy) and `verify-api-fallback-native` (native)
+test suites prove the data-plane side:
 
-### What remains to complete full controller-owned projection
+- **Legacy path (`verify-api-fallback`)**: xtask reads the credential reference
+  from the operator overlay, resolves the token from the K8s Secret, and injects it
+  as a static `filter: headers` / `request_set` value in the consumer Praxis config.
+  Token appears in the consumer Praxis `ConfigMap`.
 
-The operator now projects credential **references** into the routing overlay
-(`grid-config.json` ConfigMap).  The remaining gap to full native projection:
+- **Native path (`verify-api-fallback-native`)**: xtask reads the credential
+  reference from the operator overlay, resolves the token, then generates consumer
+  config using `grid_route` (with credential `secretRef` in candidates) +
+  `grid_credential_inject` filter with a `file:` source pointing at a mounted
+  Kubernetes Secret.  The token does not appear in the operator overlay JSON,
+  in `grid_route` candidates, or in the consumer Praxis `ConfigMap`.
 
-- **Praxis native Secret-ref consumption**: the `grid_route` or `headers` filter
-  reads the `credential.secretRef` from the overlay candidate and fetches the
-  token from Kubernetes at request time — no token in ConfigMaps or Praxis config.
-  Until this lands, the xtask harness bridges the gap by reading the credential
-  reference from the overlay and resolving the token from the Secret.
-- **Operator-owned consumer Praxis config generation**: the operator would own the
-  consumer-side Praxis ConfigMap (currently xtask-generated), embedding credential
-  references rather than tokens.
+Both paths prove the operator→overlay→consumer routing chain.  The native path
+is the target architecture; the legacy path is kept for regression comparison.
+
+### What remains to complete full native projection
+
+The native injection path is now implemented.  The remaining gap:
+
+- **Consumer-cluster Secret lifecycle**: the token now lives in a Kubernetes
+  Secret mounted into the consumer gateway pod.  The xtask harness provisions
+  that Secret for validation.  Production needs operator-owned provisioning,
+  rotation, and cross-cluster Secret synchronization policy.
+- **Operator-owned consumer config generation**: the operator should generate the
+  full consumer Praxis ConfigMap (currently xtask-generated), embedding
+  `grid_credential_inject` file references from the overlay rather than requiring
+  the xtask bridge.
 
 **Future credential backends** (implement `CredentialResolver` without changing callers):
 - Vault / External Secrets Operator
@@ -94,9 +106,15 @@ and the user manages authentication externally.
 
 ### Credential Lifecycle
 
-For static strategies (`bearer_token`, `api_key`,
-`custom`), the credential value is read from a
-Kubernetes Secret at config generation time.
+For the current static `bearer_token` strategy, the
+credential value is mounted into the consumer gateway
+pod as a Kubernetes Secret file.  `grid_credential_inject`
+reads that file at filter construction time and injects
+`Authorization: Bearer <token>` after `grid_route`
+selects a credential-bearing candidate.
+
+Static `api_key` and `custom` strategies are planned
+extensions of the same file-backed injection seam.
 
 For dynamic strategies (`sigv4`, `oauth2`), the Grid
 Operator will manage the credential lifecycle once
@@ -221,6 +239,6 @@ correct `O=` value is accepted.
 
 | Who | What |
 |-----|------|
-| **Grid Operator** | References and validates Kubernetes Secrets. Rendering consumer-side Praxis auth configuration is planned. |
-| **Praxis** | Reads gateway config and injects credentials per request through the filter pipeline. |
+| **Grid Operator** | References and validates Kubernetes Secrets; projects credential references into routing overlays. Operator-owned consumer config and Secret lifecycle are planned. |
+| **Praxis / AI filters** | `grid_route` selects candidates and writes credential metadata; `grid_credential_inject` reads a mounted Secret file and injects credentials per request. |
 | **Workload** | Sends requests to the Gateway, optionally with routing headers — never handles provider credentials |

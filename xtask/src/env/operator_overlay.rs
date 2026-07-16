@@ -211,12 +211,63 @@ fn validate_overlay(overlay: &RoutingOverlay) -> Result<(), OverlayError> {
 ///
 /// Returns an empty string when the overlay has no candidates.
 pub(crate) fn candidates_yaml(overlay: &RoutingOverlay) -> String {
+    candidates_yaml_impl(overlay, false)
+}
+
+/// Generate the `candidates:` YAML block for a `grid_route` filter config,
+/// **including credential secretRef fields** when candidates carry them.
+///
+/// This is the native-injection-mode variant: the credential reference is
+/// emitted so that a downstream `grid_credential_inject` filter can read it
+/// from `grid.route.credential.*` filter metadata and inject the bearer token.
+///
+/// Token values are **never** emitted — only the secretRef `name`,
+/// `namespace`, and `key` fields that locate the Kubernetes Secret.
+///
+/// # Intended config shape
+///
+/// When `grid_credential_inject` is used, the consumer Praxis config should
+/// look like:
+///
+/// ```yaml
+/// - filter: grid_route
+///   local_site: site-east
+///   candidates:
+///     - kind: inference_model
+///       name: gpt-4
+///       site: site-west
+///       cluster: gateway-site-west
+///       fresh: true
+///       credential:
+///         strategy: bearer_token
+///         secretRef:
+///           name: my-api-token
+///           namespace: grid-system
+///           key: token
+///
+/// - filter: grid_credential_inject
+///   credentials:
+///     - name: my-api-token         # matches credential.secretRef.name
+///       namespace: grid-system      # matches credential.secretRef.namespace
+///       key: token                  # matches credential.secretRef.key
+///       strategy: bearer_token
+///       value: "sk-abc123"          # token resolved by xtask from K8s Secret
+/// ```
+///
+/// The `grid_credential_inject` section is generated separately by the xtask
+/// credential bridge; it is never part of the overlay JSON.
+pub(crate) fn candidates_yaml_with_credentials(overlay: &RoutingOverlay) -> String {
+    candidates_yaml_impl(overlay, true)
+}
+
+/// Shared implementation for [`candidates_yaml`] and [`candidates_yaml_with_credentials`].
+fn candidates_yaml_impl(overlay: &RoutingOverlay, emit_credential: bool) -> String {
     overlay
         .candidates
         .iter()
         .map(|c| {
             let fresh_str = if c.fresh { "true" } else { "false" };
-            [
+            let mut lines = vec![
                 format!("         - kind: {}", c.kind),
                 format!("           name: {}", c.name),
                 format!("           site: {}", c.site),
@@ -224,8 +275,16 @@ pub(crate) fn candidates_yaml(overlay: &RoutingOverlay) -> String {
                 // The operator's candidate.cluster is the production reference.
                 format!("           cluster: gateway-{}", c.site),
                 format!("           fresh: {fresh_str}"),
-            ]
-            .join("\n")
+            ];
+            if let Some(cred) = c.credential.as_ref().filter(|_| emit_credential) {
+                lines.push("           credential:".to_owned());
+                lines.push(format!("             strategy: {}", cred.strategy));
+                lines.push("             secretRef:".to_owned());
+                lines.push(format!("               name: {}", cred.secret_ref.name));
+                lines.push(format!("               namespace: {}", cred.secret_ref.namespace));
+                lines.push(format!("               key: {}", cred.secret_ref.key));
+            }
+            lines.join("\n")
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -458,6 +517,165 @@ mod tests {
         assert!(
             yaml.contains("gateway-site-a"),
             "gateway-{{site}} must appear as the cluster reference"
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "multi-line JSON fixture with distinct security invariant per assert"
+    )]
+    fn credential_bearing_candidate_parses_and_yaml_omits_credential() {
+        // Regression guard: candidates_yaml() must strip credential data so that
+        // grid_route filter YAML never contains secret references or token values.
+        // The grid_route filter rejects unknown fields via deny_unknown_fields;
+        // writing credential: into YAML would cause parse failure in old images.
+        let json = r#"{
+            "network": "net",
+            "local_site": "consumer-site",
+            "candidates": [{
+                "kind": "inference_model",
+                "name": "api-model",
+                "site": "site-b",
+                "cluster": "prov-b",
+                "fresh": true,
+                "credential": {
+                    "strategy": "bearer_token",
+                    "secretRef": {
+                        "name": "api-token-secret",
+                        "namespace": "grid-system",
+                        "key": "token"
+                    }
+                }
+            }]
+        }"#;
+        let overlay = parse_grid_config_json(json).unwrap_or_else(|_| std::process::abort());
+
+        // Overlay must parse credential reference correctly.
+        let cred = overlay
+            .candidates
+            .first()
+            .and_then(|c| c.credential.as_ref())
+            .unwrap_or_else(|| std::process::abort());
+        assert_eq!(cred.strategy, "bearer_token", "strategy must parse from JSON");
+        assert_eq!(cred.secret_ref.name, "api-token-secret", "secretRef.name must parse");
+
+        // YAML output must not contain credential data.
+        let yaml = candidates_yaml(&overlay);
+        assert!(yaml.contains("api-model"), "candidate name must appear");
+        assert!(yaml.contains("site-b"), "candidate site must appear");
+        assert!(
+            !yaml.contains("credential"),
+            "credential field must not appear in grid_route YAML"
+        );
+        assert!(
+            !yaml.contains("bearer_token"),
+            "credential strategy must not appear in grid_route YAML"
+        );
+        assert!(
+            !yaml.contains("secretRef"),
+            "secretRef must not appear in grid_route YAML"
+        );
+        assert!(
+            !yaml.contains("api-token-secret"),
+            "secret name must not appear in grid_route YAML"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Native injection mode: candidates_yaml_with_credentials
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn candidate_without_credential_unchanged_in_native_mode() {
+        let json = r#"{
+            "network": "net",
+            "local_site": "consumer-site",
+            "candidates": [{"kind":"inference_model","name":"m","site":"s","cluster":"c","fresh":true}]
+        }"#;
+        let overlay = parse_grid_config_json(json).unwrap_or_else(|_| std::process::abort());
+        let yaml = candidates_yaml_with_credentials(&overlay);
+        assert!(yaml.contains("kind: inference_model"), "kind must appear");
+        assert!(yaml.contains("name: m"), "name must appear");
+        assert!(
+            !yaml.contains("credential"),
+            "no credential block for no-auth candidate"
+        );
+    }
+
+    #[test]
+    #[expect(clippy::too_many_lines, reason = "multi-line JSON fixture with per-field assertions")]
+    fn credential_bearing_candidate_emits_secret_ref_in_native_mode() {
+        let json = r#"{
+            "network": "net",
+            "local_site": "consumer-site",
+            "candidates": [{
+                "kind": "inference_model",
+                "name": "api-model",
+                "site": "site-b",
+                "cluster": "prov-b",
+                "fresh": true,
+                "credential": {
+                    "strategy": "bearer_token",
+                    "secretRef": {
+                        "name": "api-token-secret",
+                        "namespace": "grid-system",
+                        "key": "token"
+                    }
+                }
+            }]
+        }"#;
+        let overlay = parse_grid_config_json(json).unwrap_or_else(|_| std::process::abort());
+        let yaml = candidates_yaml_with_credentials(&overlay);
+        assert!(yaml.contains("api-model"), "candidate name must appear");
+        assert!(
+            yaml.contains("credential:"),
+            "credential block must appear in native mode"
+        );
+        assert!(yaml.contains("strategy: bearer_token"), "strategy must appear");
+        assert!(yaml.contains("secretRef:"), "secretRef must appear");
+        assert!(yaml.contains("name: api-token-secret"), "secretRef.name must appear");
+        assert!(
+            yaml.contains("namespace: grid-system"),
+            "secretRef.namespace must appear"
+        );
+        assert!(yaml.contains("key: token"), "secretRef.key must appear");
+        // Token is never emitted — only the reference that locates the Secret.
+        assert!(!yaml.contains("sk-"), "token value must never appear in YAML");
+        assert!(!yaml.contains("Bearer"), "token prefix must never appear in YAML");
+    }
+
+    #[test]
+    fn legacy_mode_still_strips_credential() {
+        let json = r#"{
+            "network": "net",
+            "local_site": "consumer-site",
+            "candidates": [{
+                "kind": "inference_model",
+                "name": "api-model",
+                "site": "site-b",
+                "cluster": "prov-b",
+                "fresh": true,
+                "credential": {
+                    "strategy": "bearer_token",
+                    "secretRef": {"name": "s", "namespace": "ns", "key": "k"}
+                }
+            }]
+        }"#;
+        let overlay = parse_grid_config_json(json).unwrap_or_else(|_| std::process::abort());
+        let legacy_yaml = candidates_yaml(&overlay);
+        assert!(
+            !legacy_yaml.contains("credential"),
+            "legacy mode must still strip credential"
+        );
+        assert!(
+            !legacy_yaml.contains("secretRef"),
+            "legacy mode must still strip secretRef"
+        );
+        let native_yaml = candidates_yaml_with_credentials(&overlay);
+        assert!(
+            native_yaml.contains("credential"),
+            "native mode must include credential"
         );
     }
 }

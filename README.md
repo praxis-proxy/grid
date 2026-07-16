@@ -10,6 +10,8 @@ Grid is the Kubernetes control plane for multi-site AI routing with
 - Manages Grid trust material for mTLS between sites.
 - Scrapes configured provider metrics and scores routing candidates.
 - Renders Praxis routing overlay `ConfigMap`s consumed by gateway deployments.
+- Projects provider credential references into overlays without writing token
+  values into Grid routing data.
 
 ## What Grid does not do
 
@@ -29,8 +31,12 @@ cargo xtask env verify-demo1-llmd-routing -c tests/env/operator-routing-two-prov
 # Validate full-grid routing across local, remote, cloud mock, and API mock
 cargo xtask env verify-full-grid-routing -c tests/env/operator-routing-two-provider.toml
 
-# Validate API-provider fallback and Secret-backed credential projection
+# Validate legacy API-provider fallback and Secret-backed credential projection
 cargo xtask env verify-api-fallback -c tests/env/operator-routing.toml
+
+# Validate native grid_route → grid_credential_inject credential injection.
+# Tokens are read from a mounted Secret file and stay out of Praxis ConfigMaps.
+cargo xtask env verify-api-fallback-native -c tests/env/operator-routing.toml
 
 # Validate SWIM membership from env-var startup seeds
 cargo xtask env verify-swim-membership -c tests/env/operator-routing.toml
