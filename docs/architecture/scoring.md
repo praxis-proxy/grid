@@ -94,5 +94,5 @@ Unavailable providers are not emitted into the overlay.
 Praxis does not currently recompute the full six-signal formula for each
 request. The `grid_route` filter consumes the operator-rendered overlay,
 matches candidates by request attributes such as model name, and selects from
-the pre-sorted candidates. A future Praxis-side `grid_scorer` filter can add
-per-request scoring when request-local inputs are needed.
+the pre-sorted candidates. Per-request scoring remains an extension point for
+request-local inputs that are not available to the operator.

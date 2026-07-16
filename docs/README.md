@@ -12,18 +12,24 @@
   metrics input, and request-time scoring boundaries.
 - [Auth and Policy](architecture/auth.md) — provider authentication strategies,
   access policy, and trust model.
-- [Consumer Config](architecture/consumer-config.md) — design for
-  operator-owned consumer gateway configuration and Secret lifecycle.
+- [Consumer Config](architecture/consumer-config.md) — operator-generated
+  consumer Praxis `ConfigMap` and the `GatewayRef.consumerConfig` API.
 
 ## Operations
 
 - [Operations](architecture/operations.md) — local environment setup,
   validation commands, and operator workflows.
-- [CI Kind E2E Strategy](architecture/ci-kind-e2e.md) — CI stage definitions,
-  sequencing requirements, and gating recommendations.
+- [CI Kind E2E](architecture/ci-kind-e2e.md) — validation tiers, gate sequence,
+  sequencing requirements, and environment dependencies.
 
 ## Development
 
 - [Development](development.md) — build, test, format, lint, and coverage.
 - [Conventions](conventions.md) — coding style, testing requirements,
   documentation rules, and commit attribution.
+
+## Proposals
+
+- [Consumer Config Design](proposals/consumer-config.md) — design for full
+  operator ownership of consumer gateway config, cross-cluster Secrets, and
+  `ConsumerGateway` CRD.

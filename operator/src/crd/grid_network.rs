@@ -112,6 +112,77 @@ pub struct GatewayRef {
     /// [`GridNetwork`]: crate::crd::grid_network::GridNetwork
     #[serde(default)]
     pub local_site_name: Option<String>,
+
+    /// Opt-in configuration for operator-managed consumer Praxis config generation.
+    ///
+    /// When absent or `enabled: false`, this gateway behaves exactly as before —
+    /// only the routing overlay `ConfigMap` is applied.  When `enabled: true`, the
+    /// operator additionally renders a consumer Praxis `ConfigMap` containing the
+    /// `grid_route` candidates (with credential `secretRef` data), a
+    /// `grid_credential_inject` section for credential-bearing candidates, and a
+    /// `load_balancer` section with one cluster entry per unique candidate cluster.
+    ///
+    /// The generated `ConfigMap` contains no token bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consumer_config: Option<ConsumerConfig>,
+}
+
+/// Opt-in configuration for operator-generated consumer Praxis config.
+///
+/// When `enabled` is `true` on a [`GatewayRef`], the `GridNetwork` controller
+/// renders a `praxis.yaml`-keyed `ConfigMap` in the gateway namespace in addition
+/// to the normal routing overlay `ConfigMap`.  The generated config includes the
+/// `grid_route` candidates, `grid_credential_inject` (when credential-bearing
+/// candidates are present), and `load_balancer` cluster stubs.
+///
+/// # Security
+///
+/// The generated `ConfigMap` never contains credential token bytes.  Credential
+/// entries use a `file:` source under `credentialMountBase`; the mounted
+/// Kubernetes Secret provides the token at runtime.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConsumerConfig {
+    /// Enable operator-managed consumer Praxis config generation for this gateway.
+    ///
+    /// Default: `false`.  Set to `true` to opt in.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Base directory for mounted credential Secret files inside the consumer pod.
+    ///
+    /// Each credential Secret is expected to be mounted at
+    /// `{credentialMountBase}/{secret-name}/{secret-key}`.
+    ///
+    /// Default: `/run/secrets/grid-credentials`.
+    #[serde(default = "default_credential_mount_base")]
+    pub credential_mount_base: String,
+
+    /// Name of the generated consumer Praxis `ConfigMap`.
+    ///
+    /// Default: `praxis-consumer-config`.
+    #[serde(default = "default_consumer_config_map_name")]
+    pub config_map_name: String,
+}
+
+impl Default for ConsumerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            credential_mount_base: default_credential_mount_base(),
+            config_map_name: default_consumer_config_map_name(),
+        }
+    }
+}
+
+/// Default credential mount base path.
+fn default_credential_mount_base() -> String {
+    "/run/secrets/grid-credentials".to_owned()
+}
+
+/// Default consumer Praxis `ConfigMap` name.
+fn default_consumer_config_map_name() -> String {
+    "praxis-consumer-config".to_owned()
 }
 
 /// SWIM protocol tuning parameters.
@@ -417,6 +488,92 @@ mod tests {
         assert!(
             gateway_ref_properties.contains_key("localSiteName"),
             "CRD schema must include localSiteName field on GatewayRef"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // ConsumerConfig tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn consumer_config_absent_deserializes_to_none() {
+        let json = serde_json::json!({"name": "gw", "namespace": "ns"});
+        let gw: GatewayRef = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
+        assert!(
+            gw.consumer_config.is_none(),
+            "absent consumerConfig must deserialize to None"
+        );
+    }
+
+    #[test]
+    fn consumer_config_enabled_round_trips() {
+        let json = serde_json::json!({
+            "name": "gw",
+            "namespace": "ns",
+            "consumerConfig": {
+                "enabled": true,
+                "credentialMountBase": "/run/secrets/grid",
+                "configMapName": "my-consumer-config"
+            }
+        });
+        let gw: GatewayRef = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
+        let cc = gw.consumer_config.unwrap_or_else(|| std::process::abort());
+        assert!(cc.enabled, "enabled must round-trip");
+        assert_eq!(
+            cc.credential_mount_base, "/run/secrets/grid",
+            "credentialMountBase must round-trip"
+        );
+        assert_eq!(
+            cc.config_map_name, "my-consumer-config",
+            "configMapName must round-trip"
+        );
+    }
+
+    #[test]
+    fn consumer_config_defaults_when_subfields_absent() {
+        let json = serde_json::json!({
+            "name": "gw",
+            "namespace": "ns",
+            "consumerConfig": {}
+        });
+        let gw: GatewayRef = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
+        let cc = gw.consumer_config.unwrap_or_else(|| std::process::abort());
+        assert!(!cc.enabled, "enabled must default to false");
+        assert_eq!(
+            cc.credential_mount_base, "/run/secrets/grid-credentials",
+            "credentialMountBase must use default"
+        );
+        assert_eq!(
+            cc.config_map_name, "praxis-consumer-config",
+            "configMapName must use default"
+        );
+    }
+
+    #[test]
+    fn consumer_config_absent_not_serialized() {
+        let gw = GatewayRef {
+            name: "gw".to_owned(),
+            namespace: "ns".to_owned(),
+            local_site_name: None,
+            consumer_config: None,
+        };
+        let json = serde_json::to_value(&gw).unwrap_or_else(|_| std::process::abort());
+        assert!(
+            json.get("consumerConfig").is_none(),
+            "absent consumerConfig must not appear in serialized output"
+        );
+    }
+
+    #[test]
+    fn grid_network_crd_has_consumer_config_field_on_gateway_ref() {
+        let crd = crd_json();
+        let gateway_ref_properties = crd
+            .pointer("/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties/gatewayRefs/items/properties")
+            .and_then(serde_json::Value::as_object)
+            .unwrap_or_else(|| std::process::abort());
+        assert!(
+            gateway_ref_properties.contains_key("consumerConfig"),
+            "CRD schema must include consumerConfig field on GatewayRef"
         );
     }
 }

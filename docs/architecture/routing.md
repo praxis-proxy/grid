@@ -285,7 +285,7 @@ token value — into the routing overlay candidate:
 
 ### Native injection path (current)
 
-The native injection path uses two AI-side filters in sequence:
+The native injection path uses two gateway filters in sequence:
 
 1. **`grid_route`** selects the candidate and writes the secretRef fields to
    in-process filter metadata: `grid.route.credential.strategy`,

@@ -57,7 +57,7 @@ cargo xtask env verify-swim-state -c tests/env/operator-routing.toml
 - [Scoring](docs/architecture/scoring.md)
 - [Auth and policy](docs/architecture/auth.md)
 - [Operations](docs/architecture/operations.md)
-- [Consumer config design](docs/architecture/consumer-config.md)
+- [Consumer config](docs/architecture/consumer-config.md)
 - [CI Kind E2E strategy](docs/architecture/ci-kind-e2e.md)
 
 ## Development

@@ -5,23 +5,23 @@
 Each provider declares how consumers authenticate.
 Praxis performs request-time credential injection from gateway configuration.
 Grid's implemented bearer-token path projects credential references into the
-routing overlay, then uses an AI-side `grid_credential_inject` filter to read
+routing overlay, then uses a gateway-side `grid_credential_inject` filter to read
 the selected token from a mounted Kubernetes Secret file.
 
 | Strategy | Header | Lifecycle | Used By |
 |----------|--------|-----------|---------|
 | `bearer_token` | `Authorization: Bearer X` | Static from mounted Secret file | OpenAI, Mistral |
-| `api_key` | Custom (e.g. `x-api-key`) | Static from Secret *(planned)* | Anthropic |
-| `sigv4` | `Authorization: AWS4-HMAC-SHA256...` | Per-request compute *(planned)* | Bedrock |
-| `oauth2` | `Authorization: Bearer <token>` | Refresh on expiry *(planned)* | Vertex, Azure |
+| `api_key` | Custom (e.g. `x-api-key`) | Static Secret extension point | Anthropic |
+| `sigv4` | `Authorization: AWS4-HMAC-SHA256...` | Per-request compute extension point | Bedrock |
+| `oauth2` | `Authorization: Bearer <token>` | Refresh-on-expiry extension point | Vertex, Azure |
 | `mtls_only` | None (cert-based) | Grid cert lifecycle | Grid-internal |
-| `service_account` | `Authorization: Bearer <SA>` | K8s SA token *(planned)* | In-cluster |
-| `custom` | User-configured | Static from Secret *(planned)* | Fallback |
+| `service_account` | `Authorization: Bearer <SA>` | Kubernetes service-account extension point | In-cluster |
+| `custom` | User-configured | Static Secret extension point | Fallback |
 
 > **Implementation note:** `bearer_token` is the current native data-plane path.
 > `api_key`, `custom`, `service_account`, SigV4 per-request signing, and OAuth2
-> refresh are extension points and are not yet wired into the operator or Praxis
-> filter pipeline.
+> refresh are extension points that are not implemented in the current operator
+> and gateway filter pipeline.
 
 ## Current implementation boundary
 
@@ -121,21 +121,24 @@ The difference is where the resolved token lands:
 - **Native credential injection** mounts the Secret into the consumer pod and
   writes only a `file:` reference into the consumer Praxis `ConfigMap`.
 
-### Planned production work
+### Production boundaries
 
-The native injection path is implemented for validation.  The following items
-are needed before the path is fully production-ready:
+The native injection path keeps credential bytes out of Grid resources and
+consumer gateway `ConfigMap`s. Production deployments still need explicit
+ownership for credential Secret placement and rotation:
 
 - **Consumer-cluster Secret lifecycle**: the token lives in a Kubernetes Secret
-  mounted into the consumer gateway pod.  Production deployments need a defined
-  provisioning, rotation, and cross-cluster synchronization policy.  See
-  [Consumer Config](consumer-config.md) for the design.
-- **Operator-owned consumer config generation**: the operator should generate the
-  consumer Praxis ConfigMap from the routing overlay, embedding
-  `grid_credential_inject` file references rather than relying on the validation
-  harness.
+  mounted into the consumer gateway pod.  The Secret can be created by users,
+  platform automation, or an external secret manager.
+- **Operator-owned consumer config generation**: `GatewayRef.consumerConfig`
+  can render the consumer Praxis `ConfigMap` from routing overlay data,
+  including `grid_credential_inject` file references.
 
-**Future credential backends** (implement `CredentialResolver` without changing callers):
+See [Consumer Config](consumer-config.md) for the current operator-generated
+config shape.
+
+**Additional credential backends** can implement `CredentialResolver` without
+changing callers:
 - Vault / External Secrets Operator
 - OAuth2 token refresh
 - SigV4 per-request signing
@@ -156,16 +159,15 @@ reads that file at filter construction time and injects
 `Authorization: Bearer <token>` after `grid_route`
 selects a credential-bearing candidate.
 
-Static `api_key` and `custom` strategies are planned
-extensions of the same file-backed injection seam.
+Static `api_key` and `custom` strategies use the same file-backed injection
+seam when implemented.
 
 For dynamic strategies (`sigv4`, `oauth2`), the Grid
-Operator will manage the credential lifecycle once
-these are implemented (currently planned):
+Operator manages the credential lifecycle when those strategies are implemented:
 - `sigv4`: SigV4 signature computed per-request by
-  Praxis using AWS credentials from a Secret *(planned)*
+  Praxis using AWS credentials from a Secret
 - `oauth2`: Token refreshed before expiry by the
-  operator, cached, and injected by Praxis *(planned)*
+  operator, cached, and injected by Praxis
 
 ## Access Policy
 
@@ -261,9 +263,8 @@ workload's identity and access policies.
 
 Grid-generated site certificates set
 `OrganizationName = "ai-grid"` (see
-`certs::DEFAULT_ORGANIZATION`).  Once the AI/Praxis
-image includes `peer_identity_trust`, provider
-gateways can match incoming peer certificates on
+`certs::DEFAULT_ORGANIZATION`).  Gateway deployments
+that enable peer identity trust can match incoming peer certificates on
 `organization: ai-grid` by default.
 
 Any certificate signed by the Grid CA but with a
@@ -282,6 +283,6 @@ correct `O=` value is accepted.
 
 | Who | What |
 |-----|------|
-| **Grid Operator** | References and validates Kubernetes Secrets; projects credential references into routing overlays. Operator-owned consumer config and Secret lifecycle are planned. |
-| **Praxis / AI filters** | `grid_route` selects candidates and writes credential metadata; `grid_credential_inject` reads a mounted Secret file and injects credentials per request. |
+| **Grid Operator** | References and validates Kubernetes Secrets; projects credential references into routing overlays; can render opt-in consumer gateway config. |
+| **Gateway filters** | `grid_route` selects candidates and writes credential metadata; `grid_credential_inject` reads a mounted Secret file and injects credentials per request. |
 | **Workload** | Sends requests to the Gateway, optionally with routing headers — never handles provider credentials |

@@ -26,4 +26,8 @@ pub enum OperatorError {
     /// Routing overlay rendering failed.
     #[error("overlay render: {0}")]
     OverlayRender(String),
+
+    /// Consumer Praxis config rendering failed.
+    #[error("consumer config render: {0}")]
+    ConsumerConfigRender(#[from] crate::resources::consumer_config::ConsumerConfigError),
 }

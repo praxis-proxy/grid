@@ -25,12 +25,12 @@ use tracing::info;
 
 use crate::{
     crd::{
-        grid_network::{GatewayRef, GridNetwork, GridNetworkPhase, GridNetworkStatus},
+        grid_network::{ConsumerConfig, GatewayRef, GridNetwork, GridNetworkPhase, GridNetworkStatus},
         grid_site::GridSite,
         inference_provider::InferenceProvider,
     },
     error::OperatorError,
-    resources::{provider_metrics, routing_overlay, secret},
+    resources::{consumer_config, provider_metrics, routing_overlay, secret},
     swim::{MemberStatus, MembershipSnapshot},
     swim_runtime::SwimHandle,
 };
@@ -490,6 +490,11 @@ async fn reconcile_routing_overlay_inner(
             continue;
         }
         apply_overlay_for_gateway(&overlay, network, gw_ref, client).await?;
+
+        // Opt-in: generate and apply the consumer Praxis config when enabled.
+        if let Some(cc) = gw_ref.consumer_config.as_ref().filter(|cc| cc.enabled) {
+            apply_consumer_config_for_gateway(&overlay, network_name, gw_ref, cc, client).await?;
+        }
     }
     Ok(())
 }
@@ -508,6 +513,43 @@ async fn list_all_grid_sites(client: &Client) -> Result<Vec<GridSite>, OperatorE
     let api: Api<GridSite> = Api::all(client.clone());
     let list = api.list(&ListParams::default()).await?;
     Ok(list.items)
+}
+
+/// Server-side apply the operator-generated consumer Praxis config `ConfigMap`.
+///
+/// Only called when `gw_ref.consumer_config.enabled` is `true`.  Renders the
+/// consumer Praxis YAML from the routing overlay and applies it to the gateway
+/// namespace.  The generated config never contains credential token bytes.
+async fn apply_consumer_config_for_gateway(
+    overlay: &routing_overlay::RoutingOverlay,
+    network_name: &str,
+    gw_ref: &GatewayRef,
+    cc: &ConsumerConfig,
+    client: &Client,
+) -> Result<(), OperatorError> {
+    let config_yaml = consumer_config::generate_consumer_praxis_config(overlay, &cc.credential_mount_base)?;
+    let cm = consumer_config::build_consumer_config_map(
+        &config_yaml,
+        &cc.config_map_name,
+        &gw_ref.namespace,
+        network_name,
+        &gw_ref.name,
+    );
+
+    let api: Api<ConfigMap> = Api::namespaced(client.clone(), &gw_ref.namespace);
+    api.patch(
+        &cc.config_map_name,
+        &PatchParams::apply(FIELD_MANAGER).force(),
+        &Patch::Apply(&cm),
+    )
+    .await?;
+
+    info!(
+        config_map = %cc.config_map_name,
+        namespace = %gw_ref.namespace,
+        "applied consumer Praxis config ConfigMap"
+    );
+    Ok(())
 }
 
 /// Server-side apply one routing overlay `ConfigMap` for a single gateway.

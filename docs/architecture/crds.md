@@ -22,6 +22,11 @@ spec:
   gatewayRefs:
     - name: inference-gw
       namespace: praxis-system
+      localSiteName: cluster-east   # optional; defaults to network name
+      consumerConfig:               # optional; opt-in consumer Praxis config generation
+        enabled: true
+        credentialMountBase: /run/secrets/grid-credentials
+        configMapName: praxis-consumer-config
   region: us-east-1
   zone: us-east-1a
   swim:
@@ -62,6 +67,29 @@ candidates are evicted from the rendered overlay.
 
 Local and healthy remote candidates are never evicted.  CRDT storage records
 are not deleted by this mechanism.
+
+### GatewayRef.consumerConfig
+
+`spec.gatewayRefs[].consumerConfig` opts a gateway into operator-managed consumer
+Praxis `ConfigMap` generation.
+
+| Field | Default | Meaning |
+|---|---|---|
+| `enabled` | `false` | Set to `true` to enable consumer config generation for this gateway. |
+| `credentialMountBase` | `/run/secrets/grid-credentials` | Base directory where credential Secrets are mounted inside the consumer pod. |
+| `configMapName` | `praxis-consumer-config` | Name of the generated `ConfigMap` in the gateway namespace. |
+
+When `enabled: true`, the `GridNetwork` controller renders a `praxis.yaml`-keyed
+`ConfigMap` in the gateway namespace on each reconcile.  The generated config includes:
+
+- `grid_route` candidates from the routing overlay (with `credential.secretRef` for
+  credential-bearing candidates)
+- `grid_credential_inject` entries (one per unique credential reference) using
+  `file:` sources — token bytes are never written to the `ConfigMap`
+- `load_balancer` cluster stubs (one entry per unique candidate cluster)
+
+When `enabled: false` or `consumerConfig` is absent, this gateway behaves as before
+— only the routing overlay `ConfigMap` is applied.
 
 ## GridSite
 
