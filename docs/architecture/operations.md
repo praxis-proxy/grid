@@ -545,13 +545,9 @@ not by the imperative `xtask env` command flow.
 Scripts, static manifests, and walkthrough
 documentation for specific gateway-to-gateway
 topologies are maintained outside this repository
-at:
-
-```
-nerdalert/praxis-research-spikes/demo/ai-grid-gateway-to-gateway/
-```
+in the accompanying research-spikes repository.
 
 Grid keeps generic, config-driven, reusable commands.
 Topology-specific fixtures, static manifests, and
-presentation walkthroughs belong in the
-research-spikes repository.
+presentation walkthroughs belong outside the Grid
+repository.

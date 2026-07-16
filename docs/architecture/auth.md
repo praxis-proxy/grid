@@ -121,18 +121,19 @@ The difference is where the resolved token lands:
 - **Native credential injection** mounts the Secret into the consumer pod and
   writes only a `file:` reference into the consumer Praxis `ConfigMap`.
 
-### What remains to complete full native projection
+### Planned production work
 
-The native injection path is now implemented.  The remaining gap:
+The native injection path is implemented for validation.  The following items
+are needed before the path is fully production-ready:
 
-- **Consumer-cluster Secret lifecycle**: the token now lives in a Kubernetes
-  Secret mounted into the consumer gateway pod.  The xtask harness provisions
-  that Secret for validation.  Production needs operator-owned provisioning,
-  rotation, and cross-cluster Secret synchronization policy.
+- **Consumer-cluster Secret lifecycle**: the token lives in a Kubernetes Secret
+  mounted into the consumer gateway pod.  Production deployments need a defined
+  provisioning, rotation, and cross-cluster synchronization policy.  See
+  [Consumer Config](consumer-config.md) for the design.
 - **Operator-owned consumer config generation**: the operator should generate the
-  full consumer Praxis ConfigMap (currently xtask-generated), embedding
-  `grid_credential_inject` file references from the overlay rather than requiring
-  the xtask bridge.
+  consumer Praxis ConfigMap from the routing overlay, embedding
+  `grid_credential_inject` file references rather than relying on the validation
+  harness.
 
 **Future credential backends** (implement `CredentialResolver` without changing callers):
 - Vault / External Secrets Operator

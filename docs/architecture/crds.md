@@ -42,8 +42,26 @@ spec:
 
 **Phases**: Pending → Initializing → Active → Degraded
 
-**Status fields**: `gridId`, `connectedSites`,
+**Status fields**: `gridId`, `connectedSites`, `distributedProviderCount`,
 `observedGeneration`, `phase`
+
+`distributedProviderCount` reflects the number of remote `InferenceProvider`
+records received from peer sites via CRDT broadcast.  Local providers and records
+from other `GridNetwork`s are excluded from the count.
+
+### Stale candidate TTL
+
+`spec.staleCandidateTtlSeconds` controls when stale (fresh=false) remote
+candidates are evicted from the rendered overlay.
+
+| Value | Behaviour |
+|---|---|
+| Absent (default) | Stale candidates are retained indefinitely in the overlay. |
+| `0` | Rejected by the CRD schema (`minimum: 1`). |
+| `N >= 1` | Remote candidates with SWIM member age `>= N` seconds are omitted from the overlay. |
+
+Local and healthy remote candidates are never evicted.  CRDT storage records
+are not deleted by this mechanism.
 
 ## GridSite
 

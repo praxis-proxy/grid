@@ -92,10 +92,9 @@ require a live cluster are valuable but should be layered
 on top of pure unit tests, not used as the only coverage.
 
 **Topology-specific or presentation-only behavior** is
-not a substitute for tests in this repository.  If code
-is intended only for a specific external walkthrough,
-it should live in
-`nerdalert/praxis-research-spikes/demo/ai-grid-gateway-to-gateway/`,
+not a substitute for tests in this repository.  Code
+intended only for a specific external walkthrough
+belongs in an external research or demo repository,
 not here.  Generic, config-driven, reusable commands
 belong in Grid and require the test coverage described
 above.

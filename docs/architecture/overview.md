@@ -24,8 +24,8 @@ Responsibilities:
 
 ### Praxis AI Gateway (data plane)
 
-The AI-enabled Praxis proxy (`../ai/`) handles all
-traffic. It is configured by the Grid Operator.
+The AI-enabled Praxis gateway handles all traffic.
+It is configured by the Grid Operator.
 
 Responsibilities:
 - Request proxying, connection pooling, retries

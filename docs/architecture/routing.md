@@ -131,18 +131,19 @@ The authoritative GC policy function is `should_retain_candidate` in
 | Age < TTL | Retain (within the allowed window) |
 | Age ≥ TTL | Evict |
 
-### SWIM member age — now real
+### SWIM member age
 
-**`MemberRecord.age_secs` is now populated with actual elapsed seconds.**
+`MemberRecord.age_secs` tracks the elapsed time since a member last transitioned
+to `Dead` or `Suspect`.
 
-The SWIM runtime (`operator/src/swim_runtime.rs`) tracks a private
-`status_changed_at: Option<Instant>` for each member.  When a member transitions
-to `Dead` or `Suspect`, the instant is recorded and preserved monotonically.
-When the member rejoins (`Alive`), the instant is cleared.  The public
-`MemberRecord.age_secs` is computed as `now.saturating_duration_since(status_changed_at).as_secs()`
+The SWIM runtime (`operator/src/swim_runtime.rs`) records the transition instant
+in a private `status_changed_at: Option<Instant>` field for each member.  When a
+member transitions to `Dead` or `Suspect`, the instant is recorded and preserved
+monotonically.  When the member rejoins (`Alive`), the instant is cleared.  The
+public `MemberRecord.age_secs` is computed as `now.saturating_duration_since(status_changed_at).as_secs()`
 at snapshot time.
 
-A `age_secs = 0` now has two distinct meanings:
+A `age_secs = 0` has two distinct meanings:
 - **Alive member** — no Dead/Suspect transition has occurred.
 - **Dead/Suspect member with `age_secs = 0`** — the runtime has just transitioned
   (elapsed is less than one second), or a synthetic snapshot did not include age.
@@ -346,18 +347,17 @@ an unrelated backend.
 ## Provider gateway trust
 
 Provider gateways terminate mTLS before forwarding traffic to local inference
-infrastructure. Once the AI/Praxis image includes `peer_identity_trust`, provider
-gateways also run that filter before local handoff. The filter checks the
-verified peer identity from the downstream client certificate and rejects
-untrusted peers with HTTP 403.
+infrastructure. When the gateway image includes the `peer_identity_trust` filter,
+provider gateways verify the peer identity from the downstream client certificate
+and reject untrusted peers with HTTP 403 before forwarding to local infrastructure.
 
 The current development trust policy matches the peer certificate organization.
 Production policies should prefer stronger identity binding such as certificate
 digest pinning or SPIFFE-style identities.
 
-## Provider-side handoff
+## Provider-side request forwarding
 
-After site selection, provider-side Praxis filters hand the request to local
+After site selection, provider-side Praxis filters forward the request to local
 inference infrastructure. A common llm-d-style path is:
 
 ```text
