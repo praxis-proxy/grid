@@ -637,7 +637,7 @@ pub(crate) fn build_grid_state_with_metrics(
 /// Resolution of matching sites for a single provider.
 ///
 /// This enum distinguishes two semantically different "empty" cases so that
-/// the candidate generator cannot accidentally apply the legacy fallback when
+/// the candidate generator cannot accidentally apply the provider-name fallback when
 /// a real site inventory exists.
 ///
 /// | Variant | Meaning | Candidate action |

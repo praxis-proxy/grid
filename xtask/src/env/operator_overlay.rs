@@ -646,7 +646,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_mode_still_strips_credential() {
+    fn credential_stripping_mode_still_strips_credential() {
         let json = r#"{
             "network": "net",
             "local_site": "consumer-site",
@@ -663,14 +663,14 @@ mod tests {
             }]
         }"#;
         let overlay = parse_grid_config_json(json).unwrap_or_else(|_| std::process::abort());
-        let legacy_yaml = candidates_yaml(&overlay);
+        let stripped_yaml = candidates_yaml(&overlay);
         assert!(
-            !legacy_yaml.contains("credential"),
-            "legacy mode must still strip credential"
+            !stripped_yaml.contains("credential"),
+            "credential-stripping mode must still strip credential"
         );
         assert!(
-            !legacy_yaml.contains("secretRef"),
-            "legacy mode must still strip secretRef"
+            !stripped_yaml.contains("secretRef"),
+            "credential-stripping mode must still strip secretRef"
         );
         let native_yaml = candidates_yaml_with_credentials(&overlay);
         assert!(

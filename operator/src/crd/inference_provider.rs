@@ -120,6 +120,27 @@ pub struct MetricsConfig {
     /// queue counts — `queueDepth` must be pre-normalised to 0.0–1.0 by the exporter.
     #[serde(default)]
     pub signal_names: MetricSignalNames,
+
+    /// Maximum age in seconds for which a previously-scraped metric sample may be
+    /// used when the current scrape fails.
+    ///
+    /// When a Prometheus scrape fails (connection refused, timeout, HTTP error) the
+    /// operator normally drops the provider's metrics and falls back to neutral
+    /// (`0.5`) scoring for all signals.  Setting this field enables a grace period:
+    /// if the last *successful* scrape is no older than `stale_metrics_seconds`, that
+    /// cached sample is used instead of neutral scoring.
+    ///
+    /// After the grace period expires, or when no successful scrape has ever been
+    /// recorded for this reconcile epoch, the provider returns to neutral scoring.
+    ///
+    /// **Default (absent):** no grace period — scrape failures immediately produce
+    /// neutral scoring.  This preserves backward-compatible behaviour.
+    ///
+    /// **Minimum value:** `1` second.  The schema rejects `0`; the operator also
+    /// treats zero defensively as absent.
+    #[schemars(range(min = 1))]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale_metrics_seconds: Option<u32>,
 }
 
 /// Mapping from scoring signal names to Prometheus metric names.
@@ -423,6 +444,58 @@ mod tests {
         assert!(
             mc.signal_names.queue_depth.is_none(),
             "signal_names must default to all-None"
+        );
+    }
+
+    #[test]
+    fn stale_metrics_seconds_defaults_to_none_when_absent() {
+        let json = serde_json::json!({
+            "gridNetworkRef": "net",
+            "providerKind": "self_hosted",
+            "backendKind": "local",
+            "endpoint": "http://backend:8080",
+            "models": [{"name": "model-a"}],
+            "metricsConfig": {}
+        });
+        let spec: InferenceProviderSpec = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
+        let mc = spec.metrics_config.unwrap_or_else(|| std::process::abort());
+        assert!(
+            mc.stale_metrics_seconds.is_none(),
+            "absent staleMetricsSeconds must default to None (no grace period)"
+        );
+    }
+
+    #[test]
+    fn stale_metrics_seconds_round_trips() {
+        let json = serde_json::json!({
+            "gridNetworkRef": "net",
+            "providerKind": "self_hosted",
+            "backendKind": "local",
+            "endpoint": "http://backend:8080",
+            "models": [{"name": "model-a"}],
+            "metricsConfig": {"staleMetricsSeconds": 30}
+        });
+        let spec: InferenceProviderSpec = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
+        let mc = spec.metrics_config.unwrap_or_else(|| std::process::abort());
+        assert_eq!(
+            mc.stale_metrics_seconds,
+            Some(30),
+            "staleMetricsSeconds must round-trip through serde"
+        );
+    }
+
+    #[test]
+    fn stale_metrics_seconds_absent_from_serialised_output_when_none() {
+        let mc = MetricsConfig {
+            path: "/metrics".to_owned(),
+            timeout: "2s".to_owned(),
+            signal_names: MetricSignalNames::default(),
+            stale_metrics_seconds: None,
+        };
+        let serialised = serde_json::to_value(&mc).unwrap_or_else(|_| std::process::abort());
+        assert!(
+            serialised.get("staleMetricsSeconds").is_none(),
+            "absent staleMetricsSeconds must not appear in serialised output"
         );
     }
 }

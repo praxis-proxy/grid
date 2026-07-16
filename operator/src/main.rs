@@ -60,10 +60,7 @@ async fn main() {
     // operator continues in static mode.
     let swim = maybe_start_swim().await;
 
-    let ctx = Arc::new(OperatorCtx {
-        client: client.clone(),
-        swim,
-    });
+    let ctx = Arc::new(OperatorCtx::new(client.clone(), swim));
 
     let result = tokio::try_join!(
         run_network_controller(client.clone(), Arc::clone(&ctx)),

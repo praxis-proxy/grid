@@ -61,13 +61,14 @@ The `InferenceProvider` controller validates credentials during every reconcile:
   only the Secret reference, never the token value. This appears in the
   operator-produced `grid-config.json` ConfigMap.
 
-The xtask `verify-api-fallback` (legacy) and `verify-api-fallback-native` (native)
-test suites prove the data-plane side:
+The xtask `verify-api-fallback` and `verify-api-fallback-native` test suites
+prove the data-plane side:
 
-- **Legacy path (`verify-api-fallback`)**: xtask reads the credential reference
-  from the operator overlay, resolves the token from the K8s Secret, and injects it
-  as a static `filter: headers` / `request_set` value in the consumer Praxis config.
-  Token appears in the consumer Praxis `ConfigMap`.
+- **Static header injection (`verify-api-fallback`)**: xtask reads the
+  credential reference from the operator overlay, resolves the token from the
+  K8s Secret, and writes it as a static `filter: headers` / `request_set`
+  value in the consumer Praxis config. Token appears in the consumer Praxis
+  `ConfigMap`.
 
 - **Native path (`verify-api-fallback-native`)**: xtask reads the credential
   reference from the operator overlay, resolves the token, then generates consumer
@@ -77,7 +78,48 @@ test suites prove the data-plane side:
   in `grid_route` candidates, or in the consumer Praxis `ConfigMap`.
 
 Both paths prove the operator→overlay→consumer routing chain.  The native path
-is the target architecture; the legacy path is kept for regression comparison.
+is the target architecture; static header injection is kept for regression
+comparison while the xtask bridge still exists.
+
+### Supplying provider tokens
+
+For both validation paths, the install-time input is the same Kubernetes Secret
+plus an `InferenceProvider.spec.auth.secretRef`.  The Secret contains the
+provider token; the `InferenceProvider` points at the Secret without copying the
+token into Grid resources.
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: api-provider-creds
+  namespace: default
+type: Opaque
+stringData:
+  token: sk-provider-token
+```
+
+```yaml
+apiVersion: inference.networking.x-k8s.io/v1alpha1
+kind: InferenceProvider
+metadata:
+  name: api-provider
+spec:
+  auth:
+    strategy: bearer_token
+    secretRef:
+      name: api-provider-creds
+      namespace: default
+      key: token
+```
+
+The difference is where the resolved token lands:
+
+- **Static header injection** resolves the Secret during xtask config
+  generation and writes `Authorization: Bearer ...` directly into the consumer
+  Praxis `ConfigMap`.
+- **Native credential injection** mounts the Secret into the consumer pod and
+  writes only a `file:` reference into the consumer Praxis `ConfigMap`.
 
 ### What remains to complete full native projection
 

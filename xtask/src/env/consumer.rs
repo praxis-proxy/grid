@@ -2472,23 +2472,23 @@ mod tests {
     }
 
     #[test]
-    fn legacy_api_fallback_config_unchanged_by_native_addition() {
+    fn header_injection_api_fallback_config_unchanged_by_native_addition() {
         let overlay = make_test_overlay();
         let providers = make_test_providers();
-        let token = "legacy-token-value";
+        let token = "header-injection-token-value";
         let config =
             build_api_fallback_consumer_config("consumer", &providers, &overlay, "api-cluster", "api.svc:8080", token);
         assert!(
             config.contains("filter: headers"),
-            "legacy config must still use headers filter"
+            "header-injection config must still use headers filter"
         );
         assert!(
             config.contains("request_set"),
-            "legacy config must still use request_set"
+            "header-injection config must still use request_set"
         );
         assert!(
             !config.contains("grid_credential_inject"),
-            "legacy config must not include grid_credential_inject"
+            "header-injection config must not include grid_credential_inject"
         );
     }
 }

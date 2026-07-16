@@ -11,6 +11,7 @@ use std::{
     collections::{BTreeSet, HashMap},
     net::SocketAddr,
     sync::Arc,
+    time::Instant,
 };
 
 use k8s_openapi::api::core::v1::ConfigMap;
@@ -19,7 +20,7 @@ use kube::{
     api::{Api, ListParams, Patch, PatchParams},
     runtime::{controller::Action, reflector::ObjectRef},
 };
-use tokio::time::Duration;
+use tokio::{sync::Mutex, time::Duration};
 use tracing::info;
 
 use crate::{
@@ -54,6 +55,33 @@ pub struct OperatorCtx {
     /// `None` when the operator is started without a SWIM bind address
     /// configured (e.g. in single-node or test environments).
     pub swim: Option<Arc<SwimHandle>>,
+
+    /// Cross-reconcile cache of recently-scraped provider metrics.
+    ///
+    /// Keyed by `(network_name, provider_routing_identity)`.  Each successful
+    /// Prometheus scrape updates this cache.  When a subsequent scrape fails
+    /// and the provider's `metricsConfig.stale_metrics_seconds` grace period is
+    /// configured, the cached sample is used instead of falling back to neutral
+    /// scoring immediately.
+    ///
+    /// The cache is shared across concurrent reconcile invocations via the
+    /// wrapping `Arc`; the inner [`Mutex`] ensures safe concurrent access.
+    pub(crate) metrics_cache: Mutex<provider_metrics::MetricsCache>,
+}
+
+impl OperatorCtx {
+    /// Create a new [`OperatorCtx`] with an empty metrics cache.
+    ///
+    /// This is the canonical constructor used by the operator binary so that
+    /// the internal metrics cache type does not need to be exported from the
+    /// library crate.
+    pub fn new(client: Client, swim: Option<Arc<SwimHandle>>) -> Self {
+        Self {
+            client,
+            swim,
+            metrics_cache: Mutex::new(provider_metrics::MetricsCache::new()),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -153,7 +181,8 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
 
     // List providers once; share between routing overlay rendering and CRDT publishing.
     let providers = list_all_inference_providers(client).await?;
-    let raw_metrics = provider_metrics::collect_provider_metrics(name, &providers).await;
+    let raw_metrics =
+        provider_metrics::collect_provider_metrics(name, &providers, &ctx.metrics_cache, Instant::now()).await;
 
     let remote_crdt_providers: Vec<crdt::ProviderState> = ctx
         .swim

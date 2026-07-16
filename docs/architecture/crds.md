@@ -185,9 +185,12 @@ feeds the resulting `BackendMetrics` into overlay scoring.
 | `path` | `/metrics` | HTTP path, relative to `spec.endpoint`. |
 | `timeout` | `2s` | Scrape timeout. `s` and `ms` suffixes are recognized. |
 | `signalNames` | all unset | Mapping from scoring signals to Prometheus metric names. |
+| `staleMetricsSeconds` | absent | Grace period (seconds) for using a cached sample when the current scrape fails.  When absent, scrape failures immediately produce neutral scoring.  Minimum: `1`. |
 
-Providers without `metricsConfig`, providers with failed scrapes, and signals
-without configured metric names use neutral metric scores.
+Providers without `metricsConfig`, providers with failed scrapes (outside any
+configured grace period), and signals without configured metric names use neutral
+metric scores.  See [Stale metrics grace period](routing.md#stale-metrics-grace-period)
+in the routing architecture for the full semantics.
 
 #### Signal names
 

@@ -31,7 +31,7 @@ cargo xtask env verify-demo1-llmd-routing -c tests/env/operator-routing-two-prov
 # Validate full-grid routing across local, remote, cloud mock, and API mock
 cargo xtask env verify-full-grid-routing -c tests/env/operator-routing-two-provider.toml
 
-# Validate legacy API-provider fallback and Secret-backed credential projection
+# Validate API-provider fallback with static header injection
 cargo xtask env verify-api-fallback -c tests/env/operator-routing.toml
 
 # Validate native grid_route → grid_credential_inject credential injection.

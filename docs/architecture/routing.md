@@ -430,6 +430,28 @@ are treated as absent when non-finite and then defaulted/clamped in
 `crdt_metrics_to_backend`.  The scoring engine does not re-validate for
 NaN/Inf; callers must not propagate non-finite values.
 
+### Stale metrics grace period
+
+By default, a Prometheus scrape failure immediately causes the provider to
+fall back to neutral (0.5) scoring for all signals.  When
+`spec.metricsConfig.staleMetricsSeconds` is set, the operator keeps a
+cross-reconcile cache of the last successful scrape for each provider.  If
+the current scrape fails but the cached sample is no older than
+`staleMetricsSeconds`, the cached values are used instead of neutral
+scoring.
+
+After the grace period expires the provider reverts to neutral scoring.
+The cache is per-operator-process; restarting the operator clears all
+cached samples.
+
+`staleMetricsSeconds` has no effect on successful scrapes — fresh scraped
+values always win.  Setting it only extends the window in which a
+temporarily-unavailable endpoint's last known metrics influence scoring.
+
+The field is optional.  When absent (default), the behaviour is unchanged
+from before it was added: scrape failures produce neutral scoring
+immediately.
+
 ### Deferred: KV-cache affinity
 
 Routing decisions based on KV-cache affinity (routing requests to backends

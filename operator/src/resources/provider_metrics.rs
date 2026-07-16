@@ -5,12 +5,18 @@
 //! names, and returns a map keyed by provider routing identity for use with
 //! `render_routing_overlay`.
 //!
-//! Scrape and parse failures are non-fatal: the provider is omitted from the
-//! returned map and falls back to locality and cost scoring.
+//! Scrape failures are non-fatal: the provider is omitted from the returned map
+//! and falls back to static scoring unless a configured stale-metrics grace
+//! period can reuse a recent cached sample.
 //!
 //! [`GridNetwork`]: crate::crd::grid_network::GridNetwork
 
-use std::{collections::HashMap, time::Duration};
+use std::{
+    collections::HashMap,
+    time::{Duration, Instant},
+};
+
+use tokio::sync::Mutex;
 
 use crate::{
     crd::inference_provider::{InferenceProvider, MetricSignalNames},
@@ -25,6 +31,30 @@ use crate::{
 
 /// Scrape timeout used when the provider's `metricsConfig.timeout` cannot be parsed.
 const DEFAULT_SCRAPE_TIMEOUT: Duration = Duration::from_secs(2);
+
+// ---------------------------------------------------------------------------
+// Timestamped metrics and cache
+// ---------------------------------------------------------------------------
+
+/// A [`scoring::BackendMetrics`] value paired with the [`Instant`] it was scraped.
+///
+/// Stored in [`MetricsCache`] so that a recent successful scrape result can be
+/// reused during a brief endpoint outage if `metricsConfig.stale_metrics_seconds`
+/// is configured.
+#[derive(Clone, Debug)]
+pub(crate) struct TimestampedMetrics {
+    /// The scraped and parsed metrics.
+    pub(crate) metrics: scoring::BackendMetrics,
+    /// When the scrape completed successfully.
+    pub(crate) scraped_at: Instant,
+}
+
+/// Cross-reconcile cache for recently-scraped provider metrics.
+///
+/// Keyed by `(network_name, provider_routing_identity)`.  Entries are updated on
+/// every successful scrape and consulted when a subsequent scrape fails and the
+/// provider has `metricsConfig.stale_metrics_seconds` set.
+pub(crate) type MetricsCache = HashMap<(String, String), TimestampedMetrics>;
 
 // ---------------------------------------------------------------------------
 // URL construction
@@ -105,22 +135,47 @@ pub(crate) fn parse_metrics_timeout(s: &str) -> Duration {
 /// [`scoring::BackendMetrics`].
 ///
 /// Providers without `metricsConfig` or with a blank endpoint are skipped and
-/// not present in the returned map.  Scrape and parse failures are logged at
-/// `warn` level; those providers are also omitted from the map and fall back
-/// to neutral scoring in the overlay renderer.
+/// not present in the returned map.  Scrape failures are logged at `warn`
+/// level unless a cached sample is used.
 ///
-/// Returns an empty map when no providers have `metricsConfig` or when all
-/// scrapes fail.  The caller should pass `None` to `render_routing_overlay`
-/// in that case to preserve static ordering.
+/// # Stale metrics grace period
+///
+/// When `metricsConfig.stale_metrics_seconds` is set and a scrape fails, the
+/// function consults `cache` for a previously-scraped value.  If the cached
+/// entry is no older than `stale_metrics_seconds`, the cached
+/// [`scoring::BackendMetrics`] is used instead of neutral scoring.  After the
+/// grace period the provider falls back to absent metrics (neutral scoring).
+///
+/// When `stale_metrics_seconds` is absent (default), scrape failures always
+/// produce neutral scoring — the same backward-compatible behaviour as before
+/// this field was added.
+///
+/// `now` is passed in (rather than read from `Instant::now()`) so tests can
+/// control the clock without sleeping.
 #[expect(
     clippy::too_many_lines,
-    reason = "sequential per-provider scrape loop with early-continue guards and error logging"
+    reason = "sequential per-provider scrape loop with early-continue guards, cache read/write, and error logging"
 )]
 pub(crate) async fn collect_provider_metrics(
     network_name: &str,
     providers: &[InferenceProvider],
+    cache: &Mutex<MetricsCache>,
+    now: Instant,
 ) -> HashMap<String, scoring::BackendMetrics> {
+    // Snapshot only the relevant cache entries (for this network) so the lock
+    // is held for microseconds rather than across network I/O.
+    let cache_snapshot: HashMap<String, TimestampedMetrics> = {
+        let guard = cache.lock().await;
+        guard
+            .iter()
+            .filter(|((net, _), _)| net == network_name)
+            .map(|((_, id), tm)| (id.clone(), tm.clone()))
+            .collect()
+    };
+
     let mut result = HashMap::new();
+    let mut cache_updates: Vec<((String, String), TimestampedMetrics)> = Vec::new();
+
     for provider in providers {
         if provider.spec.grid_network_ref != network_name {
             continue;
@@ -138,22 +193,80 @@ pub(crate) async fn collect_provider_metrics(
         let url = metrics_url(endpoint, &mc.path);
         let timeout = parse_metrics_timeout(&mc.timeout);
         let names = metric_names_from_config(&mc.signal_names);
+
         match scrape_metrics(&url, timeout).await {
             Ok(text) => {
                 let bm = parse_prometheus_text(&text, &names).into_backend_metrics();
+                // Record the successful scrape in the cache.
+                cache_updates.push((
+                    (network_name.to_owned(), identity.to_owned()),
+                    TimestampedMetrics {
+                        metrics: bm,
+                        scraped_at: now,
+                    },
+                ));
                 result.insert(identity.to_owned(), bm);
             },
             Err(e) => {
-                tracing::warn!(
-                    provider = identity,
-                    url = %url,
-                    error = %e,
-                    "metrics scrape failed; provider will use neutral scoring"
-                );
+                // Attempt to use a cached sample within the configured grace period.
+                let used_cache =
+                    try_cached_metrics(identity, mc.stale_metrics_seconds, &cache_snapshot, now, &mut result);
+                if used_cache {
+                    tracing::debug!(
+                        provider = identity,
+                        url = %url,
+                        error = %e,
+                        "metrics scrape failed; using cached sample within stale_metrics_seconds grace period"
+                    );
+                } else {
+                    tracing::warn!(
+                        provider = identity,
+                        url = %url,
+                        error = %e,
+                        "metrics scrape failed; provider will use neutral scoring"
+                    );
+                }
             },
         }
     }
+
+    // Write back successful scrapes to the shared cache.
+    if !cache_updates.is_empty() {
+        let mut guard = cache.lock().await;
+        for (key, val) in cache_updates {
+            guard.insert(key, val);
+        }
+    }
+
     result
+}
+
+/// Attempt to populate `result` with a cached metric sample for `identity`.
+///
+/// Returns `true` if a valid cached sample was found and inserted; `false` if
+/// no grace period is configured, the cache has no entry, or the entry is
+/// too old.
+fn try_cached_metrics(
+    identity: &str,
+    stale_metrics_seconds: Option<u32>,
+    cache_snapshot: &HashMap<String, TimestampedMetrics>,
+    now: Instant,
+    result: &mut HashMap<String, scoring::BackendMetrics>,
+) -> bool {
+    // Zero is treated as absent defensively (schema already rejects 0).
+    let Some(ttl_secs) = stale_metrics_seconds.filter(|&s| s > 0) else {
+        return false;
+    };
+    let ttl = Duration::from_secs(u64::from(ttl_secs));
+    let Some(cached) = cache_snapshot.get(identity) else {
+        return false;
+    };
+    let age = now.saturating_duration_since(cached.scraped_at);
+    if age > ttl {
+        return false;
+    }
+    result.insert(identity.to_owned(), cached.metrics);
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -236,7 +349,25 @@ mod tests {
                 queue_depth: Some(metric_name.to_owned()),
                 ..Default::default()
             },
+            stale_metrics_seconds: None,
         }
+    }
+
+    fn mc_with_queue_and_ttl(metric_name: &str, ttl: u32) -> MetricsConfig {
+        MetricsConfig {
+            path: "/metrics".to_owned(),
+            timeout: "2s".to_owned(),
+            signal_names: MetricSignalNames {
+                queue_depth: Some(metric_name.to_owned()),
+                ..Default::default()
+            },
+            stale_metrics_seconds: Some(ttl),
+        }
+    }
+
+    /// Return a fresh empty metrics cache wrapped in a Mutex.
+    fn empty_cache() -> Mutex<MetricsCache> {
+        Mutex::new(MetricsCache::new())
     }
 
     // -----------------------------------------------------------------------
@@ -349,7 +480,7 @@ mod tests {
     #[tokio::test]
     async fn collect_metrics_no_config_returns_empty_map() {
         let provider = provider_fixture("prov-a", "http://127.0.0.1:9999", None);
-        let result = collect_provider_metrics("net", &[provider]).await;
+        let result = collect_provider_metrics("net", &[provider], &empty_cache(), Instant::now()).await;
         assert!(
             result.is_empty(),
             "provider without metricsConfig must not appear in metrics map"
@@ -359,7 +490,7 @@ mod tests {
     #[tokio::test]
     async fn collect_metrics_blank_endpoint_is_skipped() {
         let provider = provider_fixture("prov-a", "", Some(mc_with_queue("my_queue")));
-        let result = collect_provider_metrics("net", &[provider]).await;
+        let result = collect_provider_metrics("net", &[provider], &empty_cache(), Instant::now()).await;
         assert!(result.is_empty(), "provider with blank endpoint must not be scraped");
     }
 
@@ -369,7 +500,7 @@ mod tests {
         let base_url = start_test_server(ok_response(body)).await;
         let provider = provider_fixture("prov-a", &base_url, Some(mc_with_queue("my_queue")));
 
-        let result = collect_provider_metrics("net", &[provider]).await;
+        let result = collect_provider_metrics("net", &[provider], &empty_cache(), Instant::now()).await;
         assert!(
             result.contains_key("prov-a"),
             "provider must appear in metrics map after successful scrape"
@@ -406,7 +537,7 @@ mod tests {
         }))
         .unwrap_or_else(|_| std::process::abort());
 
-        let result = collect_provider_metrics("net", &[provider]).await;
+        let result = collect_provider_metrics("net", &[provider], &empty_cache(), Instant::now()).await;
         assert!(
             result.contains_key("site-x"),
             "metrics must be keyed by routingClusterRef, not metadata.name"
@@ -421,7 +552,7 @@ mod tests {
     async fn collect_metrics_scrape_failure_logs_and_omits_provider() {
         // Port 1 is never open — connection will be refused.
         let provider = provider_fixture("prov-a", "http://127.0.0.1:1", Some(mc_with_queue("my_queue")));
-        let result = collect_provider_metrics("net", &[provider]).await;
+        let result = collect_provider_metrics("net", &[provider], &empty_cache(), Instant::now()).await;
         assert!(
             result.is_empty(),
             "failed scrape must not panic and must omit provider from map"
@@ -432,7 +563,7 @@ mod tests {
     async fn collect_metrics_non_2xx_omits_provider() {
         let base_url = start_test_server(err_response(503)).await;
         let provider = provider_fixture("prov-a", &base_url, Some(mc_with_queue("my_queue")));
-        let result = collect_provider_metrics("net", &[provider]).await;
+        let result = collect_provider_metrics("net", &[provider], &empty_cache(), Instant::now()).await;
         assert!(
             result.is_empty(),
             "non-2xx response must omit provider from metrics map"
@@ -446,7 +577,7 @@ mod tests {
         let base_url = start_test_server(ok_response(body)).await;
         let provider = provider_fixture("prov-a", &base_url, Some(mc_with_queue("my_queue")));
 
-        let result = collect_provider_metrics("net", &[provider]).await;
+        let result = collect_provider_metrics("net", &[provider], &empty_cache(), Instant::now()).await;
         assert!(
             result.contains_key("prov-a"),
             "malformed body must still produce a metrics entry"
@@ -476,7 +607,7 @@ mod tests {
         let prov_a = provider_fixture("prov-a", &url_a, Some(mc_with_queue("my_queue")));
         let prov_b = provider_fixture("prov-b", &url_b, Some(mc_with_queue("my_queue")));
 
-        let result = collect_provider_metrics("net", &[prov_a, prov_b]).await;
+        let result = collect_provider_metrics("net", &[prov_a, prov_b], &empty_cache(), Instant::now()).await;
         assert!(result.contains_key("prov-a"), "prov-a must be in metrics map");
         assert!(result.contains_key("prov-b"), "prov-b must be in metrics map");
         assert!(
@@ -500,10 +631,166 @@ mod tests {
         let base_url = start_test_server(ok_response(body)).await;
         let provider = provider_fixture("prov-a", &base_url, Some(mc_with_queue("my_queue")));
 
-        let result = collect_provider_metrics("other-net", &[provider]).await;
+        let result = collect_provider_metrics("other-net", &[provider], &empty_cache(), Instant::now()).await;
         assert!(
             result.is_empty(),
             "provider from a different GridNetwork must not be scraped"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Stale metrics cache
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn stale_cache_used_within_ttl_on_scrape_failure() {
+        // Seed the cache with a known good sample from T=0.
+        let t0 = Instant::now();
+        let provider = provider_fixture("prov-a", "http://127.0.0.1:1", Some(mc_with_queue_and_ttl("q", 60)));
+        let cache = empty_cache();
+        {
+            let mut guard = cache.lock().await;
+            guard.insert(
+                ("net".to_owned(), "prov-a".to_owned()),
+                TimestampedMetrics {
+                    metrics: scoring::BackendMetrics {
+                        queue_depth: 0.42,
+                        healthy: true,
+                        kv_cache_utilization: 0.5,
+                        latency_p99_ms: 2500.0,
+                        prefix_cache_hit_ratio: 0.5,
+                        error_rate: 0.0,
+                    },
+                    scraped_at: t0,
+                },
+            );
+        }
+        // Scrape fails (port 1 is always refused); cache is within 60 s TTL.
+        let result = collect_provider_metrics("net", &[provider], &cache, t0).await;
+        assert!(
+            result.contains_key("prov-a"),
+            "failed scrape within TTL must use cached metrics"
+        );
+        let cached_bm = result.get("prov-a").copied().unwrap_or_else(|| std::process::abort());
+        assert!(
+            (cached_bm.queue_depth - 0.42).abs() < f64::EPSILON,
+            "cached queue_depth must be returned"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_cache_not_used_after_ttl_expires() {
+        let t0 = Instant::now();
+        // The TTL is 1 s; advance the clock by 2 s to make the cache stale.
+        let t_after_ttl = t0.checked_add(Duration::from_secs(2)).unwrap_or(t0);
+        let provider = provider_fixture("prov-a", "http://127.0.0.1:1", Some(mc_with_queue_and_ttl("q", 1)));
+        let cache = empty_cache();
+        {
+            let mut guard = cache.lock().await;
+            guard.insert(
+                ("net".to_owned(), "prov-a".to_owned()),
+                TimestampedMetrics {
+                    metrics: scoring::BackendMetrics {
+                        queue_depth: 0.42,
+                        healthy: true,
+                        kv_cache_utilization: 0.5,
+                        latency_p99_ms: 2500.0,
+                        prefix_cache_hit_ratio: 0.5,
+                        error_rate: 0.0,
+                    },
+                    scraped_at: t0,
+                },
+            );
+        }
+        // Clock advanced past TTL → cache entry is expired → neutral scoring.
+        let result = collect_provider_metrics("net", &[provider], &cache, t_after_ttl).await;
+        assert!(
+            !result.contains_key("prov-a"),
+            "expired cache must not be used; provider must be absent (neutral scoring)"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_ttl_configured_scrape_failure_gives_neutral() {
+        // No stale_metrics_seconds → backward-compatible: scrape failure = absent.
+        let provider = provider_fixture("prov-a", "http://127.0.0.1:1", Some(mc_with_queue("q")));
+        let cache = empty_cache();
+        {
+            // Put something in the cache — it must NOT be used when TTL is absent.
+            let mut guard = cache.lock().await;
+            guard.insert(
+                ("net".to_owned(), "prov-a".to_owned()),
+                TimestampedMetrics {
+                    metrics: scoring::BackendMetrics {
+                        queue_depth: 0.42,
+                        healthy: true,
+                        kv_cache_utilization: 0.5,
+                        latency_p99_ms: 2500.0,
+                        prefix_cache_hit_ratio: 0.5,
+                        error_rate: 0.0,
+                    },
+                    scraped_at: Instant::now(),
+                },
+            );
+        }
+        let result = collect_provider_metrics("net", &[provider], &cache, Instant::now()).await;
+        assert!(
+            !result.contains_key("prov-a"),
+            "without stale_metrics_seconds, scrape failure must produce absent (neutral) metrics"
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_scrape_updates_cache() {
+        let body = "my_queue 0.33\n";
+        let base_url = start_test_server(ok_response(body)).await;
+        let provider = provider_fixture("prov-a", &base_url, Some(mc_with_queue_and_ttl("my_queue", 30)));
+        let cache = empty_cache();
+        let t0 = Instant::now();
+
+        let _unused = collect_provider_metrics("net", &[provider], &cache, t0).await;
+
+        // Read from the cache: extract the queue_depth while holding the lock,
+        // then release the guard so the MutexGuard does not live across the assert.
+        let cached_queue_depth = cache
+            .lock()
+            .await
+            .get(&("net".to_owned(), "prov-a".to_owned()))
+            .map(|tm| tm.metrics.queue_depth);
+        assert!(cached_queue_depth.is_some(), "successful scrape must write to cache");
+        assert!(
+            (cached_queue_depth.unwrap_or_else(|| std::process::abort()) - 0.33).abs() < f64::EPSILON,
+            "cache must hold the scraped queue_depth value"
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_ttl_treated_as_absent_no_cache_used() {
+        // stale_metrics_seconds = 0 is defensively treated as absent (same as None).
+        // Schema rejects 0, but we guard internally too.
+        let provider = provider_fixture("prov-a", "http://127.0.0.1:1", Some(mc_with_queue_and_ttl("q", 0)));
+        let cache = empty_cache();
+        {
+            let mut guard = cache.lock().await;
+            guard.insert(
+                ("net".to_owned(), "prov-a".to_owned()),
+                TimestampedMetrics {
+                    metrics: scoring::BackendMetrics {
+                        queue_depth: 0.99,
+                        healthy: true,
+                        kv_cache_utilization: 0.5,
+                        latency_p99_ms: 2500.0,
+                        prefix_cache_hit_ratio: 0.5,
+                        error_rate: 0.0,
+                    },
+                    scraped_at: Instant::now(),
+                },
+            );
+        }
+        let result = collect_provider_metrics("net", &[provider], &cache, Instant::now()).await;
+        assert!(
+            !result.contains_key("prov-a"),
+            "zero TTL must be treated as absent: no cache use on failure"
         );
     }
 }
