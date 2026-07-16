@@ -19,7 +19,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use super::kubectl;
+use super::{kind, kubectl};
 
 /// Time allowed for the operator to reconcile a provider's status.
 pub(crate) const STATUS_POLL_TIMEOUT: Duration = Duration::from_secs(60);
@@ -71,6 +71,13 @@ pub(crate) const API_PROVIDER_SECRET_NS: &str = "default";
 
 /// Key within the API-provider credential Secret that holds the bearer token.
 pub(crate) const API_PROVIDER_SECRET_KEY: &str = "token";
+
+/// Name of the operator-generated consumer Praxis `ConfigMap` in the consumer-config validation.
+///
+/// Distinct from `praxis-consumer-config` (the xtask-generated name) so the two can coexist
+/// during the transition while the operator-generated config is shape-validated without
+/// replacing the xtask-generated config used by the live consumer pod.
+pub(crate) const TEST_CONSUMER_CONFIGMAP_NAME: &str = "op-e2e-consumer-config";
 
 // ---------------------------------------------------------------------------
 // Full-grid routing validation constants
@@ -460,6 +467,8 @@ pub(crate) fn cleanup_validation_resources(context: &str) -> Result<(), Box<dyn 
         "configmap",
         &format!("grid-overlay-{TEST_NETWORK}-{TEST_GATEWAY_NAME}"),
     )?;
+    // Best-effort: remove operator-generated consumer ConfigMap from previous runs.
+    let _unused = delete_namespaced_resource(context, TEST_GATEWAY_NS, "configmap", TEST_CONSUMER_CONFIGMAP_NAME);
     delete_namespaced_resource(context, TEST_GATEWAY_NS, "service", ERROR_ENDPOINT_NAME)?;
     force_delete_pod(context, TEST_GATEWAY_NS, ERROR_ENDPOINT_NAME)?;
     force_delete_pod(context, TEST_GATEWAY_NS, TEST_METRICS_IDLE_PROVIDER)?;
@@ -1862,6 +1871,292 @@ pub(crate) fn apply_api_provider_fixture(context: &str, endpoint: &str) -> Resul
     eprintln!(
         "  [OK] api provider fixture applied \
          (auth.strategy=bearer_token, secretRef={API_PROVIDER_SECRET_NAME:?}/{API_PROVIDER_SECRET_KEY:?})"
+    );
+    Ok(())
+}
+
+/// Name of the Kubernetes `Service` that exposes the provider Praxis gateway.
+///
+/// This is the service probed for `NodePort` discovery when building consumer
+/// endpoint topology for the operator-generated consumer `ConfigMap`.
+const PROVIDER_GATEWAY_SVC: &str = "praxis-provider";
+
+/// Apply the Grid operator validation fixtures with `consumerConfig` enabled.
+///
+/// Identical to [`apply_test_fixtures`] but includes
+/// `GatewayRef.consumerConfig.enabled: true` with `clusterEndpoints` populated
+/// from the provider cluster's `NodePort` address.  This allows the operator-
+/// generated consumer `ConfigMap` to include full `load_balancer` cluster entries
+/// (endpoint URL + mTLS config) instead of name-only stubs.
+///
+/// Two cluster entries are populated:
+/// - `TEST_HEALTHY_ROUTING_CLUSTER` — the self-hosted provider gateway, reached via `NodePort` with mTLS (SNI:
+///   `{cluster}.grid.internal`).
+/// - `TEST_PROVIDER_API` — the API-provider mock, reached via the in-cluster service DNS name (plain HTTP; no TLS).
+///
+/// When `NodePort` discovery fails for the provider gateway, the function falls
+/// back to a name-only stub for that cluster and logs a warning.
+pub(crate) fn apply_test_fixtures_with_consumer_config(
+    context: &str,
+    provider_endpoint: &str,
+    api_provider_svc_address: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Discover the provider gateway NodePort address for the self-hosted cluster.
+    let provider_cluster_endpoint = discover_provider_cluster_endpoint(context, TEST_HEALTHY_ROUTING_CLUSTER);
+
+    let cluster_endpoints = build_consumer_cluster_endpoints(
+        provider_cluster_endpoint.as_deref(),
+        TEST_HEALTHY_ROUTING_CLUSTER,
+        api_provider_svc_address,
+        TEST_PROVIDER_API,
+    );
+
+    let network = network_fixture_with_consumer_config_json(
+        TEST_NETWORK,
+        TEST_GATEWAY_NAME,
+        TEST_GATEWAY_NS,
+        TEST_CONSUMER_CONFIGMAP_NAME,
+        &cluster_endpoints,
+    );
+    let healthy = provider_fixture_json(
+        TEST_PROVIDER_HEALTHY,
+        TEST_NETWORK,
+        provider_endpoint,
+        Some(TEST_HEALTHY_ROUTING_CLUSTER),
+    );
+    let invalid = provider_fixture_json(TEST_PROVIDER_INVALID, TEST_NETWORK, "", None);
+    kubectl::apply_manifest(context, &network)?;
+    kubectl::apply_manifest(context, &healthy)?;
+    kubectl::apply_manifest(context, &invalid)?;
+    eprintln!("  [OK] test fixtures applied (consumerConfig.enabled: true, cluster_endpoints populated)");
+    Ok(())
+}
+
+/// Attempt to discover the `NodePort` endpoint for the provider gateway.
+///
+/// Returns `Some("ip:port")` when discovery succeeds, or `None` when the
+/// service has no `NodePort` or the cluster node IP cannot be determined.
+/// Logs a diagnostic on failure.
+fn discover_provider_cluster_endpoint(context: &str, cluster_name: &str) -> Option<String> {
+    let port = kind::service_node_port(context, PROVIDER_GATEWAY_SVC, "default")?;
+    match kind::kind_node_ip(context) {
+        Ok(ip) => {
+            let addr = format!("{ip}:{port}");
+            eprintln!("  [OK] {cluster_name} provider endpoint: {addr}");
+            Some(addr)
+        },
+        Err(e) => {
+            eprintln!("  [WARN] could not get node IP for {cluster_name}: {e}; cluster will use stub");
+            None
+        },
+    }
+}
+
+/// Build the JSON value for `consumerConfig.clusterEndpoints`.
+///
+/// - For the self-hosted provider (`provider_cluster`): uses mTLS when an address is available, stub otherwise.
+/// - For the API provider (`api_cluster`): always uses plain HTTP.
+fn build_consumer_cluster_endpoints(
+    provider_address: Option<&str>,
+    provider_cluster: &str,
+    api_provider_address: &str,
+    api_cluster: &str,
+) -> serde_json::Value {
+    let mut endpoints: Vec<serde_json::Value> = Vec::new();
+
+    if let Some(addr) = provider_address {
+        endpoints.push(serde_json::json!({
+            "cluster": provider_cluster,
+            "address": addr,
+            "sni": format!("{provider_cluster}.grid.internal")
+        }));
+    }
+
+    if !api_provider_address.is_empty() {
+        endpoints.push(serde_json::json!({
+            "cluster": api_cluster,
+            "address": api_provider_address
+            // sni absent → plain HTTP
+        }));
+    }
+
+    serde_json::Value::Array(endpoints)
+}
+
+/// Build a `GridNetwork` JSON fixture with `consumerConfig` enabled.
+///
+/// The gateway reference includes `consumerConfig.enabled: true`, the given
+/// `config_map_name`, and the provided `cluster_endpoints` so the operator
+/// generates a consumer Praxis `ConfigMap` with full load-balancer entries where
+/// endpoint information is available.
+fn network_fixture_with_consumer_config_json(
+    name: &str,
+    gw_name: &str,
+    gw_ns: &str,
+    config_map_name: &str,
+    cluster_endpoints: &serde_json::Value,
+) -> String {
+    serde_json::to_string_pretty(&serde_json::json!({
+        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "kind": "GridNetwork",
+        "metadata": { "name": name },
+        "spec": {
+            "seeds": [],
+            "gatewayRefs": [{
+                "name": gw_name,
+                "namespace": gw_ns,
+                "consumerConfig": {
+                    "enabled": true,
+                    "configMapName": config_map_name,
+                    "clusterEndpoints": cluster_endpoints
+                }
+            }]
+        }
+    }))
+    .unwrap_or_else(|e| {
+        eprintln!("fixture serialization failed: {e}");
+        std::process::exit(1);
+    })
+}
+
+/// Wait for the operator-generated consumer Praxis `ConfigMap` to appear.
+///
+/// Polls until the `ConfigMap` named `config_map_name` exists in `namespace`.
+/// Returns an error if the timeout expires before the `ConfigMap` appears.
+#[expect(
+    clippy::too_many_lines,
+    reason = "poll loop with kubectl args; mirrors wait_for_overlay_configmap structure"
+)]
+pub(crate) fn wait_for_consumer_configmap(
+    context: &str,
+    config_map_name: &str,
+    namespace: &str,
+    timeout: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let start = Instant::now();
+    loop {
+        let out = Command::new("kubectl")
+            .args([
+                "--context",
+                context,
+                "get",
+                "configmap",
+                config_map_name,
+                "-n",
+                namespace,
+                "--ignore-not-found",
+                "-o",
+                "name",
+            ])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+            .unwrap_or_default();
+
+        if !out.is_empty() {
+            eprintln!("  [OK] operator-generated consumer ConfigMap {config_map_name} exists");
+            return Ok(());
+        }
+        if start.elapsed() >= timeout {
+            return Err(format!("timeout waiting for consumer ConfigMap {config_map_name}").into());
+        }
+        eprintln!("  waiting for consumer ConfigMap {config_map_name}...");
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "synchronous poll loop; no async runtime available at call site"
+        )]
+        std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// Read the `praxis.yaml` value from the operator-generated consumer `ConfigMap`.
+///
+/// Returns the raw YAML string under the `praxis.yaml` key.
+pub(crate) fn read_consumer_configmap_praxis_yaml(
+    context: &str,
+    config_map_name: &str,
+    namespace: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    kubectl_jsonpath_ns(context, namespace, config_map_name, r"{.data.praxis\.yaml}")
+}
+
+/// Assert the operator-generated consumer `ConfigMap` has the expected shape.
+///
+/// Reads the `praxis.yaml` data from the `ConfigMap` and calls
+/// [`verify_consumer_praxis_yaml`] to check structural invariants.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "distinct arg per secretRef field + context + namespace; collapsing would obscure the security boundary"
+)]
+pub(crate) fn verify_operator_consumer_configmap(
+    context: &str,
+    config_map_name: &str,
+    namespace: &str,
+    api_token: &str,
+    secret_name: &str,
+    secret_key: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let yaml = read_consumer_configmap_praxis_yaml(context, config_map_name, namespace)?;
+    if yaml.is_empty() {
+        return Err(format!("consumer ConfigMap {config_map_name} has empty praxis.yaml").into());
+    }
+    verify_consumer_praxis_yaml(&yaml, api_token, secret_name, secret_key)
+}
+
+/// Verify structural invariants of an operator-generated consumer Praxis YAML.
+///
+/// This is a pure function that inspects the YAML string directly; it does not
+/// interact with Kubernetes.  Use it in unit tests or after reading the
+/// `ConfigMap` with [`verify_operator_consumer_configmap`].
+///
+/// # Invariants checked
+///
+/// **Must be present:** `listeners:`, `admin:`, `filter: grid_route`,
+/// `filter: grid_credential_inject`, `filter: load_balancer`, `credential:`,
+/// `secretRef:`, `file: …/{secret_name}/{secret_key}`, `endpoints:`.
+///
+/// **Must be absent:** token value, `value:`, `filter: headers`, `request_set:`.
+#[expect(
+    clippy::too_many_lines,
+    reason = "required-element loop + forbidden-element loop with an eprintln; hard to split without obscuring the invariants"
+)]
+pub(crate) fn verify_consumer_praxis_yaml(
+    yaml: &str,
+    api_token: &str,
+    secret_name: &str,
+    secret_key: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let expected_file_path = format!("/run/secrets/grid-credentials/{secret_name}/{secret_key}");
+    // Must be present.
+    for required in &[
+        "listeners:",
+        "admin:",
+        "filter: grid_route",
+        "filter: grid_credential_inject",
+        "filter: load_balancer",
+        "credential:",
+        "secretRef:",
+        expected_file_path.as_str(),
+        "endpoints:",
+    ] {
+        if !yaml.contains(required) {
+            return Err(format!("operator-generated consumer config missing required element: {required:?}").into());
+        }
+    }
+    // Must be absent.
+    if yaml.contains(api_token) {
+        return Err(
+            "operator-generated consumer config contains token bytes — token must not appear in ConfigMap".into(),
+        );
+    }
+    for forbidden in &["value:", "filter: headers", "request_set:"] {
+        if yaml.contains(forbidden) {
+            return Err(format!("operator-generated consumer config contains forbidden element: {forbidden:?}").into());
+        }
+    }
+    eprintln!(
+        "  [PASS] operator-generated consumer ConfigMap shape: listeners + filter_chains \
+         (grid_route + grid_credential_inject (file:{expected_file_path}) + load_balancer \
+         endpoints) + admin; token absent; no static header injection"
     );
     Ok(())
 }
@@ -4389,7 +4684,13 @@ pub(crate) fn delete_api_credential_secret(context: &str, namespace: &str) -> Re
 
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, reason = "tests")]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    reason = "tests"
+)]
 mod tests {
     use super::*;
 
@@ -5347,6 +5648,166 @@ mod tests {
             args.get(bin_pos + 1).copied(),
             Some("operator"),
             "--bin must be followed by 'operator'"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // verify_consumer_praxis_yaml
+    // -----------------------------------------------------------------------
+
+    /// Build a minimal but structurally valid operator-generated consumer Praxis YAML.
+    ///
+    /// Matches the complete config shape produced by `generate_consumer_praxis_config`:
+    /// `listeners:` → `filter_chains:` → `admin:` → `shutdown_timeout_secs`.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "multi-line YAML template; each line is a required field"
+    )]
+    fn sample_consumer_yaml(secret_name: &str, secret_key: &str) -> String {
+        format!(
+            "listeners:\n\
+             \x20 - name: public\n\
+             \x20   address: \"0.0.0.0:8080\"\n\
+             \x20   filter_chains:\n\
+             \x20     - consumer-chain\n\
+             filter_chains:\n\
+             \x20 - name: consumer-chain\n\
+             \x20   filters:\n\
+             \x20     - filter: json_body_field\n\
+             \x20       field: model\n\
+             \x20       header: X-Model\n\
+             \x20     - filter: grid_route\n\
+             \x20       local_site: site-a\n\
+             \x20       model_header: X-Model\n\
+             \x20       candidates:\n\
+             \x20         - kind: inference_model\n\
+             \x20           name: model-z\n\
+             \x20           site: op-e2e-api-fallback\n\
+             \x20           cluster: op-e2e-api-fallback\n\
+             \x20           fresh: true\n\
+             \x20           credential:\n\
+             \x20             strategy: bearer_token\n\
+             \x20             secretRef:\n\
+             \x20               name: {secret_name}\n\
+             \x20               namespace: default\n\
+             \x20               key: {secret_key}\n\
+             \x20     - filter: grid_credential_inject\n\
+             \x20       credentials:\n\
+             \x20         - name: {secret_name}\n\
+             \x20           namespace: default\n\
+             \x20           key: {secret_key}\n\
+             \x20           strategy: bearer_token\n\
+             \x20           file: /run/secrets/grid-credentials/{secret_name}/{secret_key}\n\
+             \x20     - filter: load_balancer\n\
+             \x20       clusters:\n\
+             \x20         - name: op-e2e-api-fallback\n\
+             \x20           endpoints:\n\
+             \x20             - \"mock-api-provider.default.svc:8080\"\n\
+             admin:\n\
+             \x20 address: \"127.0.0.1:9901\"\n\
+             shutdown_timeout_secs: 5\n"
+        )
+    }
+
+    #[test]
+    fn verify_consumer_praxis_yaml_passes_for_valid_config() {
+        let yaml = sample_consumer_yaml("my-creds", "token");
+        assert!(
+            verify_consumer_praxis_yaml(&yaml, "sentinel-token-must-not-appear", "my-creds", "token").is_ok(),
+            "valid consumer YAML must pass verification"
+        );
+    }
+
+    #[test]
+    fn verify_consumer_praxis_yaml_rejects_missing_grid_route() {
+        // Include listeners: and admin: so the checker reaches the grid_route check.
+        let yaml = "listeners:\nadmin:\nfilter: load_balancer\nfilter: grid_credential_inject\ncredential:\nsecretRef:\nfile: /run/secrets/grid-credentials/creds/token\nendpoints:\n";
+        let err = verify_consumer_praxis_yaml(yaml, "tok", "creds", "token").unwrap_err();
+        assert!(
+            err.to_string().contains("grid_route"),
+            "must report missing grid_route: {err}"
+        );
+    }
+
+    #[test]
+    fn verify_consumer_praxis_yaml_rejects_token_bytes_in_yaml() {
+        let secret_token = "sk-real-api-token-must-not-appear";
+        let yaml = format!(
+            "{}\ntoken-leaked: {secret_token}\n",
+            sample_consumer_yaml("creds", "token")
+        );
+        let err = verify_consumer_praxis_yaml(&yaml, secret_token, "creds", "token").unwrap_err();
+        assert!(
+            err.to_string().contains("token bytes"),
+            "must report token bytes present: {err}"
+        );
+    }
+
+    #[test]
+    fn verify_consumer_praxis_yaml_rejects_static_header_injection() {
+        let yaml = format!(
+            "{}\n- filter: headers\n  request_set:\n    - name: Authorization\n",
+            sample_consumer_yaml("creds", "token")
+        );
+        let result = verify_consumer_praxis_yaml(&yaml, "sentinel-token", "creds", "token");
+        assert!(result.is_err(), "static header injection must be rejected");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("headers") || err.contains("request_set"),
+            "error must mention forbidden element: {err}"
+        );
+    }
+
+    #[test]
+    fn verify_consumer_praxis_yaml_rejects_inline_value_source() {
+        let yaml = format!(
+            "{}\n          value: sk-some-token\n",
+            sample_consumer_yaml("creds", "token")
+        );
+        let err = verify_consumer_praxis_yaml(&yaml, "sentinel-token", "creds", "token").unwrap_err();
+        assert!(
+            err.to_string().contains("value:"),
+            "inline value source must be rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn verify_consumer_praxis_yaml_rejects_missing_file_path() {
+        // YAML with grid_credential_inject but no file: path for the secret.
+        // Includes listeners: and admin: so the checker reaches the file-path check.
+        let yaml = "listeners:\nadmin:\nfilter: grid_route\nfilter: grid_credential_inject\nfilter: load_balancer\ncredential:\nsecretRef:\nendpoints:\n";
+        let err = verify_consumer_praxis_yaml(yaml, "tok", "my-creds", "token").unwrap_err();
+        assert!(
+            err.to_string().contains("/run/secrets/grid-credentials/my-creds/token"),
+            "missing file path must be reported: {err}"
+        );
+    }
+
+    #[test]
+    fn network_fixture_with_consumer_config_includes_consumer_config() {
+        let endpoints = serde_json::json!([{
+            "cluster": "gateway-site-a",
+            "address": "10.0.0.10:30080",
+            "sni": "site-a.grid.internal"
+        }]);
+        let json_str = network_fixture_with_consumer_config_json("net", "gw", "ns", "my-cm", &endpoints);
+        let value: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        let refs = &value["spec"]["gatewayRefs"];
+        let first = &refs[0];
+        assert_eq!(
+            first["consumerConfig"]["enabled"].as_bool(),
+            Some(true),
+            "consumerConfig.enabled must be true"
+        );
+        assert_eq!(
+            first["consumerConfig"]["configMapName"].as_str(),
+            Some("my-cm"),
+            "configMapName must be the provided name"
+        );
+        assert_eq!(
+            first["consumerConfig"]["clusterEndpoints"][0]["cluster"].as_str(),
+            Some("gateway-site-a"),
+            "clusterEndpoints must be included"
         );
     }
 }

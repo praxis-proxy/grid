@@ -956,8 +956,8 @@ fn env_verify_api_fallback(config: &Path, site: Option<&str>) -> Result<(), Box<
 fn env_verify_api_fallback_native(config: &Path, site: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     use operator::{
         API_FALLBACK_MODEL, API_PROVIDER_SECRET_KEY, API_PROVIDER_SECRET_NAME, API_PROVIDER_SECRET_NS,
-        CONFIGMAP_POLL_TIMEOUT, STATUS_POLL_TIMEOUT, TEST_GATEWAY_NAME, TEST_GATEWAY_NS, TEST_HEALTHY_ROUTING_CLUSTER,
-        TEST_NETWORK, TEST_PROVIDER_API, TEST_PROVIDER_HEALTHY,
+        CONFIGMAP_POLL_TIMEOUT, STATUS_POLL_TIMEOUT, TEST_CONSUMER_CONFIGMAP_NAME, TEST_GATEWAY_NAME, TEST_GATEWAY_NS,
+        TEST_HEALTHY_ROUTING_CLUSTER, TEST_NETWORK, TEST_PROVIDER_API, TEST_PROVIDER_HEALTHY,
     };
 
     let cfg = EnvConfig::from_file(config)?;
@@ -968,18 +968,18 @@ fn env_verify_api_fallback_native(config: &Path, site: Option<&str>) -> Result<(
     let consumer_ctx = kind::kubectl_context(consumer_site);
 
     // ── Step 1: deploy provider gateways ────────────────────────────────────
-    eprintln!("verify-api-fallback-native: [1/5] deploying provider gateways...");
+    eprintln!("verify-api-fallback-native: [1/6] deploying provider gateways...");
     gateway::deploy_all(&cfg)?;
 
     // ── Step 2: deploy mock-api-provider in consumer cluster ─────────────────
-    eprintln!("verify-api-fallback-native: [2/5] deploying mock-api-provider...");
+    eprintln!("verify-api-fallback-native: [2/6] deploying mock-api-provider...");
     let consumer_cluster_name = format!("grid-{consumer_site}");
     kind::deploy_mock_api_provider(&consumer_ctx, &consumer_cluster_name)?;
     let api_provider_endpoint = format!("{}.default.svc:{}", kind::MOCK_API_SVC, kind::MOCK_API_PORT);
     eprintln!("  api_provider endpoint: {api_provider_endpoint}");
 
     // ── Step 3: operator reconcile → overlay with credential secretRef ────────
-    eprintln!("verify-api-fallback-native: [3/5] operator reconcile + overlay export...");
+    eprintln!("verify-api-fallback-native: [3/6] operator reconcile + overlay export...");
     operator::install_grid_crds(&context)?;
     operator::cleanup_validation_resources(&context)?;
     operator::delete_api_credential_secret(&context, API_PROVIDER_SECRET_NS)
@@ -993,13 +993,18 @@ fn env_verify_api_fallback_native(config: &Path, site: Option<&str>) -> Result<(
     )?;
 
     let healthy_endpoint = "http://mock-openai-provider.default.svc:8080";
-    operator::apply_test_fixtures(&context, healthy_endpoint)?;
+    // Use the consumer-config fixture variant: enables GatewayRef.consumerConfig so
+    // the operator renders a consumer Praxis ConfigMap for shape validation.
+    // Pass the API provider mock address so the operator-generated consumer ConfigMap
+    // includes a full (plain HTTP) cluster entry for the API fallback route.
+    let api_provider_svc_address = format!("{}.default.svc:{}", kind::MOCK_API_SVC, kind::MOCK_API_PORT);
+    operator::apply_test_fixtures_with_consumer_config(&context, healthy_endpoint, &api_provider_svc_address)?;
     operator::apply_api_provider_fixture(&context, healthy_endpoint)?;
 
     let op = operator::spawn_operator(&context)?;
     let mut op_guard = ProcGuard(Some(op), "operator");
 
-    let result: Result<PathBuf, Box<dyn std::error::Error>> = (|| {
+    let result: Result<(PathBuf, String), Box<dyn std::error::Error>> = (|| {
         operator::wait_for_provider_phase(&context, TEST_PROVIDER_HEALTHY, "Pending", STATUS_POLL_TIMEOUT)?;
         operator::wait_for_provider_phase(&context, TEST_PROVIDER_API, "Pending", STATUS_POLL_TIMEOUT)?;
         operator::wait_for_overlay_configmap(
@@ -1017,24 +1022,38 @@ fn env_verify_api_fallback_native(config: &Path, site: Option<&str>) -> Result<(
             API_FALLBACK_MODEL,
         )?;
         eprintln!("  [OK] overlay contains api_provider candidate with credential secretRef");
+
+        // Wait for and validate the operator-generated consumer ConfigMap.
+        // This ConfigMap is rendered because GatewayRef.consumerConfig.enabled = true.
+        // It is shape-validated here; the live consumer pod still uses the
+        // validation-harness-generated runtime config.
+        eprintln!("  waiting for operator-generated consumer ConfigMap {TEST_CONSUMER_CONFIGMAP_NAME}...");
+        operator::wait_for_consumer_configmap(
+            &context,
+            TEST_CONSUMER_CONFIGMAP_NAME,
+            TEST_GATEWAY_NS,
+            CONFIGMAP_POLL_TIMEOUT,
+        )?;
+
         let path = operator::export_overlay_to_file(&context, TEST_NETWORK, TEST_GATEWAY_NAME, TEST_GATEWAY_NS)?;
         eprintln!("  overlay exported: {}", path.display());
-        Ok(path)
+        Ok((path, TEST_CONSUMER_CONFIGMAP_NAME.to_owned()))
     })();
 
     if let Some(c) = op_guard.0.take() {
         operator::kill_operator(c);
     }
-    let overlay_path = result?;
+    let (overlay_path, consumer_cm_name) = result?;
 
-    // ── Step 4: deploy consumer with NATIVE grid_credential_inject ───────────
-    eprintln!("verify-api-fallback-native: [4/5] deploying native-credential consumer gateway...");
+    // ── Step 4: shape-validate operator consumer ConfigMap ────────────────────
+    eprintln!("verify-api-fallback-native: [4/6] shape-validating operator consumer ConfigMap...");
     let overlay_json = std::fs::read_to_string(&overlay_path)?;
     let overlay = operator_overlay::parse_grid_config_json(&overlay_json)?;
 
     // Read the credential reference from the operator-projected overlay.
-    // The harness resolves the token from the K8s Secret — this is the transitional bridge.
-    // In the native path the token is placed in grid_credential_inject config (not the overlay).
+    // The harness resolves the token from the K8s Secret only to prove the Secret is
+    // accessible — it does NOT appear in the consumer ConfigMap, overlay JSON, or route
+    // candidates.  grid_credential_inject reads the token from the mounted Secret file.
     let cred_plan = operator::api_credential_plan_from_overlay(&overlay, TEST_PROVIDER_API).ok_or(
         "no bearer-token credential reference found in overlay; \
          verify InferenceProvider spec.auth.secretRef is set and operator reconciled",
@@ -1050,36 +1069,52 @@ fn env_verify_api_fallback_native(config: &Path, site: Option<&str>) -> Result<(
         return Err("unexpected non-bearer-token credential plan in native path".into());
     };
 
-    // Deploy consumer using grid_credential_inject (native path) with file: source.
-    // The token is resolved only to verify the Secret is accessible (harness readiness
-    // check) — it does NOT appear in the consumer ConfigMap, overlay JSON, or route
-    // candidates.  grid_credential_inject reads the token from the mounted Secret file.
     let api_token = operator::resolve_api_credential(&context, &cred_plan)?
         .ok_or("credential plan resolved to no token (manual or absent auth)")?;
     verify_token_absent_from_overlay(&overlay_json, &api_token);
 
+    // Shape-validate the operator-generated consumer ConfigMap.  The ConfigMap was
+    // rendered because GatewayRef.consumerConfig.enabled = true in the fixture.
+    // It lives in the provider cluster's namespace (gw_ref.namespace = TEST_GATEWAY_NS).
+    operator::verify_operator_consumer_configmap(
+        &context,
+        &consumer_cm_name,
+        TEST_GATEWAY_NS,
+        &api_token,
+        secret_name,
+        key,
+    )?;
+
+    // Read the exact praxis.yaml from the operator-generated ConfigMap.
+    // This is the YAML the live consumer pod will run — byte-for-byte from the operator.
+    let operator_praxis_yaml =
+        operator::read_consumer_configmap_praxis_yaml(&context, &consumer_cm_name, TEST_GATEWAY_NS)?;
+    if operator_praxis_yaml.is_empty() {
+        return Err(format!("operator ConfigMap {consumer_cm_name} has empty praxis.yaml").into());
+    }
+    eprintln!(
+        "  [OK] operator-generated praxis.yaml read ({} bytes)",
+        operator_praxis_yaml.len()
+    );
+
+    // ── Step 5: apply operator config to consumer cluster + deploy consumer ──
+    eprintln!("verify-api-fallback-native: [5/6] deploying consumer from operator-generated config...");
     // Create the credential Secret in the CONSUMER cluster so the pod can mount it.
     // The token is in the Secret's `data` map — not in the Praxis ConfigMap.
-    // This is the xtask harness bridge: in production, the operator or an external
-    // secret manager would provision this Secret in the consumer cluster.
     eprintln!("  creating credential Secret in consumer cluster for volume mount...");
     operator::delete_api_credential_secret(&consumer_ctx, API_PROVIDER_SECRET_NS)
         .unwrap_or_else(|e| eprintln!("  note: consumer credential Secret cleanup: {e}"));
     operator::create_api_credential_secret(&consumer_ctx, secret_name, namespace, key, &api_token)?;
     eprintln!("  [OK] credential Secret {secret_name:?} in consumer cluster (token not in ConfigMap)");
 
-    consumer::deploy_consumer_for_api_fallback_native(
-        &cfg,
-        &overlay,
-        TEST_PROVIDER_API,
-        &api_provider_endpoint,
-        secret_name,
-        namespace,
-        key,
-    )?;
+    // Apply the operator-generated praxis.yaml directly to the consumer cluster as
+    // praxis-consumer-config, then deploy the consumer pod that mounts it.
+    // This proves E2E: the live consumer pod runs the exact config the operator rendered.
+    consumer::deploy_consumer_from_operator_yaml(&cfg, &operator_praxis_yaml, secret_name, key)?;
 
-    // ── Step 5: verify routing + token-absence + native credential injection ──
-    eprintln!("verify-api-fallback-native: [5/5] verifying routing with grid_credential_inject...");
+    // ── Step 6: verify routing + token-absence + native credential injection ──
+    eprintln!("verify-api-fallback-native: [6/6] verifying routing with grid_credential_inject...");
+    eprintln!("  live consumer pod runs operator-generated config (not harness-generated)");
     eprintln!("  local ({TEST_HEALTHY_ROUTING_CLUSTER}) → model-x via site-a provider gateway");
     eprintln!(
         "  api fallback ({TEST_PROVIDER_API}) → {API_FALLBACK_MODEL} via mock api-provider (grid_credential_inject)"
@@ -1098,7 +1133,7 @@ fn env_verify_api_fallback_native(config: &Path, site: Option<&str>) -> Result<(
         API_PROVIDER_SECRET_NAME,
     )?;
 
-    // Explicit token-absence proof: token must not appear in the consumer ConfigMap.
+    // Explicit token-absence proof: token must not appear in the operator-generated consumer ConfigMap.
     let consumer_ctx_ref = &consumer_ctx;
     verify_token_absent_from_consumer_configmap(consumer_ctx_ref, &api_token)?;
 

@@ -41,6 +41,13 @@ consumer gateway configuration: the gateway needs a Praxis config that includes
 the Grid route candidates, load-balancer clusters, and file-backed credential
 injection entries.
 
+The first operator-owned step is implemented as `GatewayRef.consumerConfig`: the
+operator can render and apply a consumer Praxis `ConfigMap`, and Kind validation
+checks its shape and token-safety invariants.  The API also accepts explicit
+`clusterEndpoints[]` entries for rendered `load_balancer` endpoint and TLS
+topology.  The generated config is not yet used as the live consumer gateway
+config because validation still uses the harness-generated runtime config.
+
 ## Ownership model
 
 | Resource | Recommended owner |
@@ -275,6 +282,24 @@ Required properties:
 The generated ConfigMap must be testable with a sentinel-token check: a known
 token value must not appear anywhere in rendered YAML.
 
+## Operator deployability gaps
+
+These are the gaps an operator or platform administrator would need answered
+before treating operator-generated consumer config as the production runtime
+path.
+
+| Gap | Current state | Required resolution |
+|---|---|---|
+| Provider endpoint topology | `GatewayRef.consumerConfig.clusterEndpoints[]` can provide explicit endpoint and SNI data, but the validation runtime does not yet consume the generated config. | Decide whether this explicit map remains the v1 API or whether topology moves to `GridSite` or a dedicated gateway resource. |
+| Consumer Secret lifecycle | The generated config references mounted files; the Secret itself must exist in the consumer cluster. | Decide whether Secrets are pre-provisioned, mirrored in same-cluster deployments, or supplied by External Secrets/Vault/platform automation. |
+| Secret rotation and gateway reload | Kubernetes updates mounted Secret files, but the credential injector reads token files when filter config is constructed. | Define reload or rollout semantics when a referenced Secret changes. |
+| Gateway config rollout | The operator applies a `ConfigMap`; it does not own consumer `Deployment` rollout or hot reload. | Define whether a gateway operator, deployment owner, or Grid annotation mechanism triggers reloads. |
+| RBAC and install profiles | The operator needs permissions to write gateway `ConfigMap`s and may need read/write access to Secrets depending on the chosen lifecycle model. | Provide least-privilege install profiles for same-namespace, cross-namespace, and external-secret-manager deployments. |
+| Status and diagnostics | Config rendering errors surface as reconcile errors, but there is no per-gateway consumer-config readiness status. | Add status conditions/events for rendered, missing topology, missing Secret, unsupported strategy, and last applied `ConfigMap`. |
+| Gateway image compatibility | The generated config assumes gateway filters such as `grid_route` and `grid_credential_inject` are available. | Pin or publish a compatible gateway image and document version skew behavior. |
+| Multi-tenant namespace boundaries | `GatewayRef` names a namespace, and credential refs can name namespaces. | Define allowed namespace relationships and tenant isolation rules before enabling broad cross-namespace writes. |
+| Observability and runbooks | Overlay/config render success is not yet exposed as operator-facing metrics or runbook guidance. | Add metrics/events and document how to diagnose stale overlay, missing config, missing Secret, and failed gateway reload. |
+
 ## Testing plan
 
 Unit tests should cover:
@@ -317,16 +342,27 @@ Kind validation should prove:
 5. **Secret synchronization owner.** Decide whether v1 requires pre-existing
    consumer-cluster Secrets or whether the operator mirrors Secrets in
    same-cluster deployments.
+6. **Endpoint/TLS topology owner.** Decide whether provider egress endpoint and
+   TLS data come from `GridSite`, `GatewayRef.consumerConfig`, or a dedicated
+   gateway resource.
+7. **Consumer config readiness status.** Decide whether `GridNetwork` should
+   report per-gateway render/apply status or whether that belongs on a future
+   gateway-specific resource.
 
 ## Recommended implementation sequence
 
 1. Add the `GatewayRef.consumerConfig` API as an opt-in no-op by default.
+   **Implemented.**
 2. Add a pure consumer config renderer with token-invariant tests.
+   **Implemented.**
 3. Wire `GridNetwork` reconcile to render the consumer ConfigMap only when
-   `consumerConfig.enabled` is true.
+   `consumerConfig.enabled` is true. **Implemented.**
 4. Extend Kind validation to assert the operator-generated ConfigMap shape.
-5. Move the local validation path to consume the operator-generated ConfigMap.
-6. Add Secret rotation/reload behavior after the base path is proven.
+   **Implemented.**
+5. Add provider endpoint/TLS topology to the rendered `load_balancer` clusters.
+   **Implemented with explicit `clusterEndpoints[]`.**
+6. Move the local validation path to consume the operator-generated ConfigMap.
+7. Add Secret rotation/reload behavior after the base path is proven.
 
 Do not implement cross-cluster Secret copying, a new `ConsumerGateway` CRD, or
 gateway Deployment ownership in the initial implementation.

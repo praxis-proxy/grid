@@ -994,6 +994,10 @@ shutdown_timeout_secs: 5
 /// The token does **not** appear in the consumer Praxis `ConfigMap`, in the
 /// operator overlay JSON, or in the `grid_route` candidates block.
 #[expect(
+    dead_code,
+    reason = "live consumer uses operator-generated config; retained for xtask-generated config unit tests"
+)]
+#[expect(
     clippy::too_many_lines,
     reason = "sequential deploy steps: tls secret, config, deployment with credential mount, rollout"
 )]
@@ -1053,6 +1057,51 @@ pub(crate) fn deploy_consumer_for_api_fallback_native(
     kubectl::wait_for_rollout(&consumer_ctx, "praxis-consumer", consumer_site)?;
 
     eprintln!("  [PASS] native-credential consumer gateway ready in {consumer_ctx}");
+    Ok(())
+}
+
+/// Deploy the consumer gateway using the YAML produced by the Grid operator.
+///
+/// Unlike [`deploy_consumer_for_api_fallback_native`], this function does **not**
+/// build its own Praxis config.  Instead it applies the operator-generated
+/// `praxis.yaml` string directly as the `praxis-consumer-config` `ConfigMap`, then
+/// deploys the consumer pod on top of it.
+///
+/// This proves end-to-end runtime consumption: the live consumer pod runs the
+/// exact config the operator rendered.
+pub(crate) fn deploy_consumer_from_operator_yaml(
+    cfg: &EnvConfig,
+    operator_praxis_yaml: &str,
+    secret_name: &str,
+    secret_key: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let consumer_site = cfg
+        .consumer_cluster_name()
+        .ok_or("no consumer cluster configured in environment config")?;
+    let consumer_ctx = kubectl_context(consumer_site);
+    eprintln!("  deploying consumer gateway from operator-generated config to {consumer_ctx}...");
+
+    create_consumer_tls_secret(&consumer_ctx, consumer_site)?;
+
+    // Apply operator-generated praxis.yaml as praxis-consumer-config in the consumer cluster.
+    let config_map_manifest = format!(
+        "apiVersion: v1\n\
+         kind: ConfigMap\n\
+         metadata:\n\
+         \x20 name: praxis-consumer-config\n\
+         \x20 namespace: {NAMESPACE}\n\
+         data:\n\
+         \x20 praxis.yaml: |\n\
+         {}\n",
+        indent_yaml(operator_praxis_yaml, 4)
+    );
+    kubectl::apply_manifest(&consumer_ctx, &config_map_manifest)?;
+
+    apply_consumer_deployment_with_credential_mount(&consumer_ctx, secret_name, secret_key)?;
+    rollout_restart(&consumer_ctx, "praxis-consumer")?;
+    kubectl::wait_for_rollout(&consumer_ctx, "praxis-consumer", consumer_site)?;
+
+    eprintln!("  [PASS] consumer gateway ready in {consumer_ctx} (operator-generated config)");
     Ok(())
 }
 

@@ -225,6 +225,56 @@ pub(crate) fn kubectl_get_configmap(
     Ok(String::from_utf8(output.stdout)?)
 }
 
+/// Get the internal IP of the first Kind cluster node.
+///
+/// Queries `kubectl get nodes` in the given context and returns the
+/// `InternalIP` address.  Used to construct `NodePort` endpoint URLs for
+/// consumer routing.
+///
+/// # Errors
+///
+/// Returns an error if the kubectl command fails or the IP is blank.
+pub(crate) fn kind_node_ip(context: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            context,
+            "get",
+            "nodes",
+            "-o",
+            "jsonpath={.items[0].status.addresses[?(@.type==\"InternalIP\")].address}",
+        ])
+        .output()?;
+    let ip = String::from_utf8(output.stdout)?.trim().to_owned();
+    if ip.is_empty() {
+        return Err(format!("could not get node IP for context {context}").into());
+    }
+    Ok(ip)
+}
+
+/// Get the `NodePort` for a named service in `namespace`.
+///
+/// Returns `None` if the service has no `NodePort` or if the kubectl call
+/// fails.
+pub(crate) fn service_node_port(context: &str, service: &str, namespace: &str) -> Option<u16> {
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            context,
+            "get",
+            "service",
+            service,
+            "-n",
+            namespace,
+            "-o",
+            "jsonpath={.spec.ports[0].nodePort}",
+        ])
+        .output()
+        .ok()?;
+    let port_str = String::from_utf8(output.stdout).ok()?;
+    port_str.trim().parse().ok().filter(|&p: &u16| p > 0)
+}
+
 // ---------------------------------------------------------------------------
 // Kubernetes manifests
 // ---------------------------------------------------------------------------

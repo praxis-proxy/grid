@@ -133,7 +133,11 @@ pub struct GatewayRef {
 /// renders a `praxis.yaml`-keyed `ConfigMap` in the gateway namespace in addition
 /// to the normal routing overlay `ConfigMap`.  The generated config includes the
 /// `grid_route` candidates, `grid_credential_inject` (when credential-bearing
-/// candidates are present), and `load_balancer` cluster stubs.
+/// candidates are present), and a `load_balancer` section.
+///
+/// When `clusterEndpoints` is populated, each listed cluster receives a full
+/// load-balancer entry with an endpoint address and optional mTLS configuration.
+/// Clusters without a matching entry receive a name-only stub.
 ///
 /// # Security
 ///
@@ -163,6 +167,41 @@ pub struct ConsumerConfig {
     /// Default: `praxis-consumer-config`.
     #[serde(default = "default_consumer_config_map_name")]
     pub config_map_name: String,
+
+    /// Endpoint topology for the generated `load_balancer` section.
+    ///
+    /// Each entry maps a routing candidate cluster name to a reachable endpoint
+    /// address and optional mTLS configuration.  When an entry is provided for a
+    /// cluster, the generated config includes a full cluster entry (endpoint URL
+    /// and TLS config when `sni` is set).  Clusters not listed here receive a
+    /// name-only stub.
+    ///
+    /// In production, this is populated by whoever manages the consumer gateway
+    /// deployment (platform automation, the gateway operator, or a Helm chart).
+    /// In local Kind validation, the xtask harness discovers `NodePort` addresses
+    /// and populates this field in the test fixture.
+    ///
+    /// Default: empty — all clusters render as name-only stubs.
+    #[serde(default)]
+    pub cluster_endpoints: Vec<ClusterEndpointConfig>,
+
+    /// Mount path for TLS certificates inside the consumer pod.
+    ///
+    /// Used when rendering mTLS cluster entries from `clusterEndpoints`.
+    /// The operator expects the consumer pod to mount a TLS Secret at this path,
+    /// containing `ca.crt`, `tls.crt`, and `tls.key`.
+    ///
+    /// Default: `/etc/praxis/tls`.
+    #[serde(default = "default_tls_cert_mount_path")]
+    pub tls_cert_mount_path: String,
+
+    /// HTTP port for the generated Praxis listener.
+    ///
+    /// The rendered `listeners[0].address` is `0.0.0.0:{listenerPort}`.
+    ///
+    /// Default: `8080`.
+    #[serde(default = "default_listener_port")]
+    pub listener_port: u16,
 }
 
 impl Default for ConsumerConfig {
@@ -171,8 +210,36 @@ impl Default for ConsumerConfig {
             enabled: false,
             credential_mount_base: default_credential_mount_base(),
             config_map_name: default_consumer_config_map_name(),
+            cluster_endpoints: Vec::new(),
+            tls_cert_mount_path: default_tls_cert_mount_path(),
+            listener_port: default_listener_port(),
         }
     }
+}
+
+/// Endpoint configuration for one consumer `load_balancer` cluster.
+///
+/// Maps a routing candidate cluster name to a reachable provider gateway endpoint.
+/// When `sni` is set, the cluster is rendered with mTLS configuration using the
+/// certificates mounted at `ConsumerConfig::tls_cert_mount_path`.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClusterEndpointConfig {
+    /// Cluster name — must match a `candidate.cluster` value in the routing overlay.
+    pub cluster: String,
+
+    /// Reachable endpoint address (`host:port`).
+    pub address: String,
+
+    /// TLS Server Name Indication.
+    ///
+    /// When set, the generated cluster entry uses mTLS with the certificates
+    /// at `ConsumerConfig::tls_cert_mount_path`.  The SNI must match the Subject
+    /// Alternative Name in the provider gateway's server certificate.
+    ///
+    /// When absent, the cluster is rendered as a plain-HTTP endpoint (no TLS).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sni: Option<String>,
 }
 
 /// Default credential mount base path.
@@ -183,6 +250,16 @@ fn default_credential_mount_base() -> String {
 /// Default consumer Praxis `ConfigMap` name.
 fn default_consumer_config_map_name() -> String {
     "praxis-consumer-config".to_owned()
+}
+
+/// Default TLS certificate mount path inside the consumer pod.
+fn default_tls_cert_mount_path() -> String {
+    "/etc/praxis/tls".to_owned()
+}
+
+/// Default HTTP listener port for the generated consumer Praxis config.
+fn default_listener_port() -> u16 {
+    8080
 }
 
 /// SWIM protocol tuning parameters.
@@ -506,6 +583,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::too_many_lines, reason = "round-trip test covers all ConsumerConfig fields")]
     fn consumer_config_enabled_round_trips() {
         let json = serde_json::json!({
             "name": "gw",
@@ -513,7 +591,13 @@ mod tests {
             "consumerConfig": {
                 "enabled": true,
                 "credentialMountBase": "/run/secrets/grid",
-                "configMapName": "my-consumer-config"
+                "configMapName": "my-consumer-config",
+                "tlsCertMountPath": "/etc/custom-tls",
+                "clusterEndpoints": [{
+                    "cluster": "gateway-site-a",
+                    "address": "10.0.0.10:30080",
+                    "sni": "site-a.grid.internal"
+                }]
             }
         });
         let gw: GatewayRef = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
@@ -527,6 +611,15 @@ mod tests {
             cc.config_map_name, "my-consumer-config",
             "configMapName must round-trip"
         );
+        assert_eq!(
+            cc.tls_cert_mount_path, "/etc/custom-tls",
+            "tlsCertMountPath must round-trip"
+        );
+        let endpoint = cc.cluster_endpoints.first().unwrap_or_else(|| std::process::abort());
+        assert_eq!(cc.cluster_endpoints.len(), 1, "clusterEndpoints must round-trip");
+        assert_eq!(endpoint.cluster, "gateway-site-a");
+        assert_eq!(endpoint.address, "10.0.0.10:30080");
+        assert_eq!(endpoint.sni.as_deref(), Some("site-a.grid.internal"));
     }
 
     #[test]
@@ -546,6 +639,14 @@ mod tests {
         assert_eq!(
             cc.config_map_name, "praxis-consumer-config",
             "configMapName must use default"
+        );
+        assert!(
+            cc.cluster_endpoints.is_empty(),
+            "clusterEndpoints must default to empty"
+        );
+        assert_eq!(
+            cc.tls_cert_mount_path, "/etc/praxis/tls",
+            "tlsCertMountPath must use default"
         );
     }
 
@@ -574,6 +675,19 @@ mod tests {
         assert!(
             gateway_ref_properties.contains_key("consumerConfig"),
             "CRD schema must include consumerConfig field on GatewayRef"
+        );
+        let consumer_config_properties = gateway_ref_properties
+            .get("consumerConfig")
+            .and_then(|v| v.pointer("/properties"))
+            .and_then(serde_json::Value::as_object)
+            .unwrap_or_else(|| std::process::abort());
+        assert!(
+            consumer_config_properties.contains_key("clusterEndpoints"),
+            "CRD schema must include consumerConfig.clusterEndpoints"
+        );
+        assert!(
+            consumer_config_properties.contains_key("tlsCertMountPath"),
+            "CRD schema must include consumerConfig.tlsCertMountPath"
         );
     }
 }
