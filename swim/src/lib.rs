@@ -32,5 +32,6 @@ pub use identity::NodeId;
 pub use node::SwimNode;
 pub use runtime::{AccumulatedOutput, GridRuntime};
 pub use state_broadcast::{
-    STATE_BROADCAST_VERSION, StateBroadcast, StateBroadcastError, StateBroadcastHandler, StateBroadcastKey,
+    STATE_BROADCAST_VERSION, STATE_BROADCAST_VERSION_V1, StateBroadcast, StateBroadcastError, StateBroadcastHandler,
+    StateBroadcastKey,
 };

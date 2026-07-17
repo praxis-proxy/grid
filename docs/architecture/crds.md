@@ -56,11 +56,77 @@ spec:
 **Phases**: Pending → Initializing → Active → Degraded
 
 **Status fields**: `gridId`, `connectedSites`, `distributedProviderCount`,
-`observedGeneration`, `phase`
+`observedGeneration`, `phase`, `consumerConfigStatus[]`
 
 `distributedProviderCount` reflects the number of remote `InferenceProvider`
 records received from peer sites via CRDT broadcast.  Local providers and records
 from other `GridNetwork`s are excluded from the count.
+
+`consumerConfigStatus[]` is populated for each gateway with
+`consumerConfig.enabled: true`, reporting the outcome of the most recent
+render/apply attempt.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `gatewayName` | string | Name of the gateway reference |
+| `namespace` | string | Namespace of the gateway and generated `ConfigMap` |
+| `configMapName` | string | Name of the generated `ConfigMap` |
+| `phase` | enum | `Rendered` \| `Error` \| `Disabled` |
+| `reason` | string | Machine-readable reason (`MissingClusterEndpoint`, `ConsumerConfigRenderFailed`, `ConsumerConfigApplyFailed`) — empty when `Rendered` |
+| `message` | string | Human-readable diagnostic; never contains token bytes |
+| `observedGeneration` | integer | `GridNetwork` generation when this entry was last updated |
+
+Example status output:
+
+```yaml
+status:
+  phase: Active
+  gridId: grid-abc123
+  connectedSites: 2
+  consumerConfigStatus:
+    - gatewayName: inference-gw
+      namespace: praxis-system
+      configMapName: praxis-consumer-config
+      phase: Rendered
+      reason: ""
+      message: "consumer config rendered and applied to praxis-system/praxis-consumer-config"
+      observedGeneration: 7
+    - gatewayName: fallback-gw
+      namespace: default
+      configMapName: op-e2e-consumer-config
+      phase: Error
+      reason: ConsumerConfigRenderFailed
+      message: "consumer config render: overlay local_site must not be blank"
+      observedGeneration: 7
+```
+
+### CRD-driven SWIM seeds
+
+`spec.seeds` is a list of socket addresses (`host:port`) used to bootstrap
+SWIM mesh formation.  Seeds are announced to the running SWIM runtime on every
+`GridNetwork` reconcile.  Re-announcing to an existing peer is idempotent — foca
+ignores redundant joins.
+
+**Runtime update behavior:**
+
+| Change | Effect |
+|---|---|
+| Seed added to `spec.seeds` | Announced to the SWIM runtime on the next reconcile (~300 s default); SWIM join initiated |
+| Seed removed from `spec.seeds` | No active disconnect; SWIM failure detection ages out the peer naturally |
+| `spec.seeds` unchanged | Re-announced on every reconcile; idempotent, no side effects |
+
+**Channel-full behavior:** If the SWIM announce channel is temporarily full
+(capacity 16 batches), the announce is silently retried on the next reconcile.
+Seeds are not guaranteed to be joined within one reconcile cycle under heavy
+broadcast load, but the retry is automatic.
+
+**Scope:** `spec.seeds` targets the SWIM site-membership layer.  The SWIM runtime
+is process-global — all `GridNetwork` resources in the operator process share the
+same SWIM node.  Seeds from any `GridNetwork` reach the shared SWIM membership
+table.  Provider CRDT state remains scoped per network.
+
+**Self-filtering:** The operator removes its own SWIM bind address from
+`spec.seeds` before announcing, preventing self-join loops.
 
 ### Stale candidate TTL
 
@@ -100,9 +166,9 @@ complete, runnable Praxis config containing:
     credential-bearing candidates)
   - `grid_credential_inject` entries (one per unique credential reference) using
     `file:` sources — token bytes are never written to the `ConfigMap`
-  - `load_balancer` entries (one per unique candidate cluster). Clusters with
-    matching `clusterEndpoints[]` entries include endpoint and TLS settings;
-    clusters without a match render as name-only stubs
+  - `load_balancer` entries (one per unique candidate cluster). Every referenced
+    cluster must have a matching `clusterEndpoints[]` entry with endpoint and
+    optional TLS settings
 - `admin:` — admin listener at `127.0.0.1:9901`
 - `shutdown_timeout_secs: 5`
 
@@ -132,18 +198,135 @@ spec:
   sovereigntyZone: us
 ```
 
-**Phases**: Pending → Discovered → Connecting →
-Active → Unreachable → Left
+**Phases**: Pending → Discovered → Connecting → Active → Unreachable → Left
 
-A GridSite does NOT reach Active until:
-1. SWIM connectivity confirmed
-2. mTLS certificates exchanged and verified
-3. At least one provider capability negotiated
-4. Data plane ping successful
+**Status fields**: `phase`, `reason`, `message`, `observedGeneration`,
+`publicCertPem`, `capabilities` (inference, agentTools, agentToAgent),
+`lastProbeTime`, `lastTransitionTime`
 
-**Status fields**: `phase`, `publicCertPem`,
-`capabilities` (inference, agentTools, agentToAgent),
-`lastProbeTime`, `observedGeneration`
+### GridSite lifecycle
+
+SWIM discovery, authentication, and authorization are separate concerns:
+
+- SWIM discovery identifies a peer and records liveness.
+- Authentication proves the peer gateway identity, normally through mTLS
+  certificate validation.
+- Authorization decides whether that authenticated peer is allowed to
+  participate in the Grid or carry traffic for a given policy boundary.
+
+A discovered SWIM peer is not automatically authorized for routing.
+
+| Phase | How entered | Transition driver |
+|---|---|---|
+| `Pending` | Resource created (manually or by auto-discovery) | Initial default |
+| `Discovered` | SWIM peer observed as Alive | `GridNetwork` controller writes on first observation |
+| `Connecting` | Gateway address known (`spec.egress.address` non-empty) | `GridSite` controller advances from Discovered; performs TCP probe |
+| `Active` | Set by deployment workflow after trust requirements are satisfied | `GridSite` controller preserves Active while probe succeeds |
+| `Unreachable` | Probe failure while Active | `GridSite` controller moves Active → Unreachable on TCP probe failure |
+| `Left` | Set on graceful site departure | Preserved by operator once set |
+
+**Reason codes** (in `status.reason`):
+
+| Reason | Phase | Meaning |
+|---|---|---|
+| `AwaitingDiscovery` | Pending | Site record exists; SWIM has not yet observed the peer as Alive |
+| `SWIMDiscovered` | Discovered | Peer observed as Alive in SWIM membership; gateway address propagating |
+| `GatewayAddressKnown` | Connecting | Gateway address received; advancing to Connecting |
+| `GatewayAddressMissing` | Discovered or Connecting | No gateway address known; see `GRID_GATEWAY_ADDRESS` |
+| `GatewayReachable` | Connecting | TCP probe to gateway address succeeded; mTLS trust verification is outside this check |
+| `GatewayUnreachable` | Connecting or Unreachable | TCP probe to gateway address failed |
+
+**GridSite phase transitions:**
+
+- Pending → Discovered: the `GridNetwork` controller writes `Discovered` when a remote SWIM
+  peer is first observed as Alive (requires `grid.praxis-proxy.io/auto-discover-sites: "true"`
+  label on the `GridNetwork`).
+- Discovered → Connecting: the `GridSite` controller advances automatically when
+  `spec.egress.address` is non-empty. For auto-discovered sites, the egress address comes from
+  the remote operator's `GRID_GATEWAY_ADDRESS` env var, propagated via SWIM state broadcast.
+  If the remote operator has not configured `GRID_GATEWAY_ADDRESS`, the egress address is empty
+  and the site stays Discovered with reason `GatewayAddressMissing`.
+- Connecting: the `GridSite` controller runs a TCP probe against `spec.egress.address` on each
+  reconcile. The probe result is reflected in `reason` (`GatewayReachable` / `GatewayUnreachable`).
+  This probe only proves TCP reachability. Advancing to Active requires mTLS trust
+  verification and authorization, which are outside the current TCP probe scope.
+  Active must be set by the deployment workflow once trust requirements are satisfied.
+- Active → Unreachable: the `GridSite` controller demotes Active to Unreachable when the TCP
+  probe fails, allowing the overlay to deprioritize unreachable sites.
+
+**`spec.egress.address` source:** For auto-discovered sites, the egress address is sourced from
+the remote operator's `GRID_GATEWAY_ADDRESS` environment variable, propagated through the SWIM
+state broadcast.  If the remote operator has not configured `GRID_GATEWAY_ADDRESS`, the field
+is empty and the site stays Discovered.  For manually-applied `GridSite` resources, set
+`spec.egress.address` explicitly to the data-plane gateway endpoint.
+
+**`status.publicCertPem`:** The public site certificate PEM received from the remote site via
+SWIM state broadcast.  Before storage, the operator performs a structural check:
+private-key markers (`PRIVATE KEY`) cause the input to be discarded entirely and an error
+logged.  Non-certificate PEM triggers `TrustMaterialInvalid` status.  A valid `CERTIFICATE`
+header passes the structural check.
+
+This field contains only the public certificate — never a private key.  A non-empty
+`publicCertPem` means the remote site has shared its public identity material and the
+structural check passed.  It does **not** mean:
+
+- The certificate has been chain-verified against a trusted CA.
+- The peer is authenticated or authorized for routing.
+- The content has been parsed as X.509.
+
+Private keys, bearer tokens, provider credentials, and Kubernetes Secret contents must never
+be written to status.
+
+**`status.reason` values for `Connecting` phase:**
+
+| Reason | Meaning |
+|---|---|
+| `GatewayAddressKnown` | Egress address received; site advancing from Discovered to Connecting |
+| `GatewayUnreachable` | TCP probe to gateway address failed |
+| `GatewayAddressMissing` | No gateway address set; cannot probe |
+| `TrustMaterialPresent` | TCP probe succeeded; `publicCertPem` set and structurally valid (not chain-verified) |
+| `TrustMaterialMissing` | TCP probe succeeded; no public certificate received yet |
+| `TrustMaterialInvalid` | Received PEM failed structural check (not a certificate, or discarded private key) |
+
+**Routing eligibility:** `GridSite.status.phase == Active` is the control-plane gate for
+remote CRDT provider records.  Provider records from a peer whose `GridSite` is in
+`Discovered`, `Connecting`, `Pending`, `Unreachable`, or `Left` are excluded from the
+routing overlay.  Records from a peer with no matching `GridSite` are also excluded
+(fail-closed).  Trust enforcement at request time is additionally enforced by data-plane
+mTLS at the provider gateway.  See [Routing eligibility](routing.md#routing-eligibility)
+for the full gating rule.
+
+Example status — gateway reachable, valid cert received:
+
+```yaml
+status:
+  phase: Connecting
+  reason: TrustMaterialPresent
+  message: >
+    gateway reachable; public certificate PEM received and structurally valid;
+    certificate has not been chain-verified — Active requires explicit trust policy
+  observedGeneration: 3
+```
+
+Example status — gateway reachable, no cert yet:
+
+```yaml
+status:
+  phase: Connecting
+  reason: TrustMaterialMissing
+  message: "gateway reachable; awaiting public trust material from remote site"
+  observedGeneration: 3
+```
+
+Example status — gateway address not configured on remote operator:
+
+```yaml
+status:
+  phase: Discovered
+  reason: GatewayAddressMissing
+  message: "gateway address not yet available; cannot advance to Connecting"
+  observedGeneration: 2
+```
 
 ## InferenceProvider
 

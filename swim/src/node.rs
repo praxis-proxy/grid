@@ -7,7 +7,7 @@
 //! The runtime is **not** thread-safe; run the node from a single task and pass
 //! only [`AccumulatedOutput`] across task boundaries.
 
-use std::time::Duration;
+use std::{collections::BTreeMap, time::Duration};
 
 use crdt::GridStateSnapshot;
 use rand::{SeedableRng as _, rngs::SmallRng};
@@ -51,6 +51,18 @@ pub struct SwimNode {
     /// Written by the [`StateBroadcastHandler`] inside foca whenever a
     /// broadcast is received; read via [`SwimNode::state_snapshot`].
     state_rx: watch::Receiver<GridStateSnapshot>,
+
+    /// Watch receiver for the gateway address map.
+    ///
+    /// Updated by the [`StateBroadcastHandler`] inside foca when a broadcast
+    /// with a gateway address extension is received.
+    gateway_addrs_rx: watch::Receiver<BTreeMap<String, String>>,
+
+    /// Watch receiver for the public site certificate PEM map.
+    ///
+    /// Updated by the [`StateBroadcastHandler`] inside foca when a broadcast
+    /// carrying a `site_cert_pem` extension is received.
+    cert_pems_rx: watch::Receiver<BTreeMap<String, String>>,
 }
 
 impl SwimNode {
@@ -78,11 +90,15 @@ impl SwimNode {
         let site_id = identity.site_name().to_owned();
         let handler = StateBroadcastHandler::new(site_id);
         let state_rx = handler.subscribe();
+        let gateway_addrs_rx = handler.subscribe_gateway_addrs();
+        let cert_pems_rx = handler.subscribe_cert_pems();
 
         Self {
             foca: foca::Foca::with_custom_broadcast(identity, foca::Config::simple(), rng, codec, handler),
             runtime: GridRuntime::new(event_tx),
             state_rx,
+            gateway_addrs_rx,
+            cert_pems_rx,
         }
     }
 
@@ -174,6 +190,25 @@ impl SwimNode {
     #[must_use]
     pub fn state_snapshot(&self) -> GridStateSnapshot {
         self.state_rx.borrow().clone()
+    }
+
+    /// Return the current gateway address map from all received broadcasts.
+    ///
+    /// Keyed by origin site name.  Updated whenever a broadcast carrying a
+    /// gateway address extension is received from a peer.
+    #[must_use]
+    pub fn gateway_addrs(&self) -> BTreeMap<String, String> {
+        self.gateway_addrs_rx.borrow().clone()
+    }
+
+    /// Return the current public site certificate PEM map from all received broadcasts.
+    ///
+    /// Keyed by origin site name.  Contains only public certificate material —
+    /// never private keys.  Updated whenever a broadcast carrying a
+    /// `site_cert_pem` extension is received from a peer.
+    #[must_use]
+    pub fn cert_pems(&self) -> BTreeMap<String, String> {
+        self.cert_pems_rx.borrow().clone()
     }
 }
 
@@ -274,7 +309,7 @@ mod tests {
     fn publish_state_broadcast_does_not_error() {
         let (mut node, _) = make_node("site-a", 19_105);
         let snap = provider_snap("site-a", 0.2);
-        let bc = StateBroadcast::new("site-a".to_owned(), 1, snap);
+        let bc = StateBroadcast::new("site-a".to_owned(), 1, snap, None);
         node.publish_state_broadcast(&bc)
             .unwrap_or_else(|_| std::process::abort());
     }
@@ -341,7 +376,7 @@ mod tests {
         establish_membership(&mut node_a, &mut node_b, &id_a, &id_b);
 
         // Step 2: queue a CRDT broadcast on A.
-        let bc = StateBroadcast::new("site-a".to_owned(), 1, provider_snap("site-a", 0.2));
+        let bc = StateBroadcast::new("site-a".to_owned(), 1, provider_snap("site-a", 0.2), None);
         node_a
             .publish_state_broadcast(&bc)
             .unwrap_or_else(|_| std::process::abort());
@@ -398,6 +433,7 @@ mod tests {
                 "site-a".to_owned(),
                 2,
                 provider_snap("site-a", 0.1),
+                None,
             ))
             .unwrap_or_else(|_| std::process::abort());
         for msg in &node_a.gossip().messages {
@@ -420,6 +456,7 @@ mod tests {
                 "site-a".to_owned(),
                 1,
                 provider_snap("site-a", 0.9),
+                None,
             ))
             .unwrap_or_else(|_| std::process::abort());
         for msg in &node_a.gossip().messages {
@@ -451,6 +488,7 @@ mod tests {
                 "site-a".to_owned(),
                 1,
                 provider_snap("site-a", 0.3),
+                None,
             ))
             .unwrap_or_else(|_| std::process::abort());
         for msg in &node_a.gossip().messages {
@@ -468,6 +506,36 @@ mod tests {
             before.providers.len(),
             after.providers.len(),
             "malformed packet must not corrupt B's CRDT state"
+        );
+    }
+
+    #[test]
+    fn gateway_address_propagates_to_peer_via_gossip_broadcast() {
+        let id_a = local_id("site-a", 19_210);
+        let id_b = local_id("site-b", 19_211);
+        let (mut node_a, _) = make_node("site-a", 19_210);
+        let (mut node_b, _) = make_node("site-b", 19_211);
+        establish_membership(&mut node_a, &mut node_b, &id_a, &id_b);
+
+        node_a
+            .publish_state_broadcast(&StateBroadcast::new(
+                "site-a".to_owned(),
+                1,
+                GridStateSnapshot::new("site-a".to_owned()),
+                Some("10.0.0.2:19080".to_owned()),
+            ))
+            .unwrap_or_else(|_| std::process::abort());
+
+        for msg in &node_a.gossip().messages {
+            if msg.addr == id_b.socket_addr() {
+                drop(node_b.handle_data(&msg.data));
+            }
+        }
+
+        assert_eq!(
+            node_b.gateway_addrs().get("site-a").map(String::as_str),
+            Some("10.0.0.2:19080"),
+            "B must receive A's gateway address via SWIM custom broadcast"
         );
     }
 
@@ -494,6 +562,7 @@ mod tests {
                 "site-a".to_owned(),
                 1,
                 provider_snap("site-a", 0.2),
+                None,
             ))
             .unwrap_or_else(|_| std::process::abort());
         for msg in &node_a.gossip().messages {
@@ -508,6 +577,7 @@ mod tests {
                 "site-b".to_owned(),
                 1,
                 provider_snap("site-b", 0.8),
+                None,
             ))
             .unwrap_or_else(|_| std::process::abort());
         for msg in &node_b.gossip().messages {

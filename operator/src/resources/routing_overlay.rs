@@ -3768,6 +3768,8 @@ mod tests {
             incarnation: 1,
             status,
             age_secs,
+            gateway_address: None,
+            site_cert_pem: None,
         }
     }
 

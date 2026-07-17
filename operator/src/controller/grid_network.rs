@@ -11,7 +11,7 @@ use std::{
     collections::{BTreeSet, HashMap},
     net::SocketAddr,
     sync::Arc,
-    time::Instant,
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use k8s_openapi::api::core::v1::ConfigMap;
@@ -25,12 +25,19 @@ use tracing::info;
 
 use crate::{
     crd::{
-        grid_network::{ConsumerConfig, GatewayRef, GridNetwork, GridNetworkPhase, GridNetworkStatus},
-        grid_site::GridSite,
+        grid_network::{
+            ConsumerConfig, ConsumerConfigPhase, ConsumerConfigStatus, GatewayRef, GridNetwork, GridNetworkPhase,
+            GridNetworkStatus,
+        },
+        grid_site::{GridSite, GridSitePhase},
         inference_provider::InferenceProvider,
     },
     error::OperatorError,
-    resources::{consumer_config, provider_metrics, routing_overlay, secret},
+    resources::{
+        consumer_config::{self, ConsumerConfigError},
+        provider_metrics, routing_overlay, secret,
+        trust_bundle::{self, CertPemStatus},
+    },
     swim::{MemberStatus, MembershipSnapshot},
     swim_runtime::SwimHandle,
 };
@@ -67,6 +74,17 @@ pub struct OperatorCtx {
     /// The cache is shared across concurrent reconcile invocations via the
     /// wrapping `Arc`; the inner [`Mutex`] ensures safe concurrent access.
     pub(crate) metrics_cache: Mutex<provider_metrics::MetricsCache>,
+
+    /// Tracks the seed set announced on the last reconcile per `GridNetwork`.
+    ///
+    /// Keyed by `GridNetwork` name.  On each reconcile, the new seed set is
+    /// compared against the stored set via [`diff_seed_sets`] to log additions
+    /// and removals.  Seeds are always announced in full (idempotent); this
+    /// state is used only for diagnostics.
+    ///
+    /// Uses [`std::sync::Mutex`] because [`announce_crd_seeds`] is a synchronous
+    /// function called from within the async reconcile loop.
+    pub(crate) last_seeds: std::sync::Mutex<HashMap<String, Vec<SocketAddr>>>,
 }
 
 impl OperatorCtx {
@@ -80,6 +98,7 @@ impl OperatorCtx {
             client,
             swim,
             metrics_cache: Mutex::new(provider_metrics::MetricsCache::new()),
+            last_seeds: std::sync::Mutex::new(HashMap::new()),
         }
     }
 }
@@ -160,6 +179,10 @@ pub fn network_refs_from_grid_site(site: GridSite) -> Option<ObjectRef<GridNetwo
     clippy::too_many_lines,
     reason = "sequential reconcile steps: TLS, providers fetch, overlay, CRDT broadcast, status update"
 )]
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "sequential reconcile steps with cert broadcast; extracting cert into a helper would obscure the security boundary"
+)]
 pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Result<Action, OperatorError> {
     let name = network
         .metadata
@@ -175,8 +198,24 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
     // Announce CRD-declared seeds to the SWIM runtime so peers can be reached
     // without requiring the GRID_SWIM_SEEDS environment variable.
     // Re-announcing on each reconcile is idempotent (foca ignores existing members).
+    // diff_seed_sets tracks additions/removals for diagnostic logging.
     if let Some(swim) = ctx.swim.as_ref() {
-        announce_crd_seeds(&network, swim);
+        announce_crd_seeds(&network, swim, &ctx.last_seeds);
+        // Broadcast the local site's public certificate PEM so remote peers can
+        // populate GridSite.status.publicCertPem.  Only the public cert is read —
+        // the private key (tls.key) is never accessed by this code path.
+        if let Ok(Some(cert_pem)) = secret::read_site_cert_pem(client, &network.spec.tls.site_secret_ref).await {
+            let cert_broadcast = swim::StateBroadcast::new(
+                swim.site_name().to_owned(),
+                cert_broadcast_revision(),
+                crdt::GridStateSnapshot::new(swim.site_name().to_owned()),
+                None,
+            )
+            .with_cert(Some(cert_pem));
+            if let Err(e) = swim.publish_state_broadcast(cert_broadcast) {
+                tracing::warn!(network = name, error = %e, "failed to publish site cert broadcast");
+            }
+        }
     }
 
     // List providers once; share between routing overlay rendering and CRDT publishing.
@@ -207,7 +246,8 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
     let remote_crdt_providers =
         routing_overlay::apply_stale_gc_filter(&remote_crdt_providers, membership.as_ref(), &stale_policy);
 
-    reconcile_routing_overlay_inner(&network, client, &providers, &remote_crdt_providers, &raw_metrics).await?;
+    let consumer_config_statuses =
+        reconcile_routing_overlay_inner(&network, client, &providers, &remote_crdt_providers, &raw_metrics).await?;
 
     let grid_id = resolve_grid_id(&network);
     let phase = determine_phase(&network, &grid_id, membership.as_ref());
@@ -227,6 +267,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
         &phase,
         membership.as_ref(),
         distributed_provider_count,
+        consumer_config_statuses,
     )
     .await?;
 
@@ -245,6 +286,19 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
     }
 
     Ok(Action::requeue(REQUEUE_INTERVAL))
+}
+
+/// Return a monotonic-ish revision for public-cert metadata broadcasts.
+///
+/// Cert rotation updates the Kubernetes Secret, not necessarily the `GridNetwork`
+/// generation.  Use wall-clock nanoseconds so a reconcile after rotation is not
+/// suppressed as a duplicate metadata broadcast.
+fn cert_broadcast_revision() -> u64 {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    u64::try_from(nanos).unwrap_or(u64::MAX)
 }
 
 /// Error policy for the [`GridNetwork`] controller.
@@ -292,10 +346,45 @@ pub(crate) fn parse_crd_seeds(raw: &[String], local_addr: Option<SocketAddr>) ->
     seen.into_iter().collect()
 }
 
+/// Compute the difference between two seed sets.
+///
+/// Returns `(added, removed)` as sorted `Vec<SocketAddr>` slices.
+///
+/// - `added`: seeds in `desired` that are not in `previous`.
+/// - `removed`: seeds in `previous` that are not in `desired`.
+///
+/// Both sides are sorted deterministically.  This is a pure function with no
+/// I/O — suitable for unit tests and for logging seed changes between reconciles.
+///
+/// # Removal semantics
+///
+/// A seed appearing in `removed` will **not** be actively disconnected from the
+/// SWIM runtime.  The SWIM protocol's own failure detection (probe → Suspect →
+/// Dead) handles peers that stop responding.  Use the `removed` list only for
+/// diagnostics and logging.
+pub(crate) fn diff_seed_sets(previous: &[SocketAddr], desired: &[SocketAddr]) -> (Vec<SocketAddr>, Vec<SocketAddr>) {
+    let prev_set: BTreeSet<SocketAddr> = previous.iter().copied().collect();
+    let next_set: BTreeSet<SocketAddr> = desired.iter().copied().collect();
+    let mut added: Vec<SocketAddr> = next_set.difference(&prev_set).copied().collect();
+    let mut removed: Vec<SocketAddr> = prev_set.difference(&next_set).copied().collect();
+    added.sort();
+    removed.sort();
+    (added, removed)
+}
+
 /// Announce `network.spec.seeds` to the live SWIM runtime.
 ///
 /// Called once per reconcile.  Re-announcing to existing members is
 /// idempotent — foca ignores redundant joins.
+///
+/// # Runtime update semantics
+///
+/// Seeds added to `spec.seeds` since the last reconcile are logged as
+/// additions via [`diff_seed_sets`].  Seeds removed from `spec.seeds` are
+/// logged as removals but are **not actively disconnected** — the SWIM
+/// protocol's own failure detection handles peers that stop responding.
+/// The full current seed set is always announced to ensure resilience against
+/// channel-full drops from previous reconciles.
 ///
 /// # Global-runtime semantics
 ///
@@ -315,21 +404,75 @@ pub(crate) fn parse_crd_seeds(raw: &[String], local_addr: Option<SocketAddr>) ->
 /// broadcast load, but they will be applied on the next reconcile.
 ///
 /// Channel errors are logged at `warn` level and do not fail the reconcile.
-fn announce_crd_seeds(network: &GridNetwork, swim: &SwimHandle) {
-    if network.spec.seeds.is_empty() {
-        return;
-    }
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "conditional logging paths for add/remove/announce; splitting would obscure the announce sequence"
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "linear announce sequence: parse → diff → log → announce → update tracker"
+)]
+fn announce_crd_seeds(
+    network: &GridNetwork,
+    swim: &SwimHandle,
+    last_seeds: &std::sync::Mutex<HashMap<String, Vec<SocketAddr>>>,
+) {
     let seeds = parse_crd_seeds(&network.spec.seeds, Some(swim.local_addr()));
+    let name = network.metadata.name.as_deref().unwrap_or("?");
+
+    // Log what changed since the last reconcile using diff_seed_sets.
+    // Always announce the full set for robustness (idempotent, handles channel-full retries).
+    let prev = last_seeds
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(name)
+        .cloned()
+        .unwrap_or_default();
+    let (added, removed) = diff_seed_sets(&prev, &seeds);
+    if !added.is_empty() {
+        let addrs: Vec<String> = added.iter().map(ToString::to_string).collect();
+        tracing::info!(
+            network = name,
+            count = added.len(),
+            ?addrs,
+            "new CRD seeds added; announcing to SWIM runtime"
+        );
+    }
+    if !removed.is_empty() {
+        let addrs: Vec<String> = removed.iter().map(ToString::to_string).collect();
+        tracing::info!(
+            network = name,
+            count = removed.len(),
+            ?addrs,
+            "CRD seeds removed from spec; no active disconnect — SWIM failure detection handles stale peers"
+        );
+    }
+
     if seeds.is_empty() {
+        last_seeds
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(name.to_owned(), seeds);
         return;
     }
-    let name = network.metadata.name.as_deref().unwrap_or("?");
-    tracing::info!(name, seeds = seeds.len(), "announcing CRD seeds to SWIM runtime");
-    if let Err(e) = swim.announce_seeds(seeds) {
+
+    tracing::debug!(
+        network = name,
+        seeds = seeds.len(),
+        "announcing CRD seeds to SWIM runtime"
+    );
+    if let Err(e) = swim.announce_seeds(seeds.clone()) {
         // Channel-full or closed: log and continue. Seeds will be re-queued on
         // the next reconcile cycle (REQUEUE_INTERVAL = 300 s by default).
-        tracing::warn!(name, error = %e, "failed to queue CRD seeds for SWIM announcement; will retry on next reconcile");
+        tracing::warn!(network = name, error = %e, "failed to queue CRD seeds for SWIM announcement; will retry on next reconcile");
+        return;
     }
+
+    // Update tracked seed set only on successful queue.
+    last_seeds
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(name.to_owned(), seeds);
 }
 
 // ---------------------------------------------------------------------------
@@ -439,13 +582,17 @@ async fn apply_site_secret(
 /// a single kube API fetch.  Remote CRDT providers are passed through to
 /// [`routing_overlay::render_routing_overlay`] so cross-site candidates appear
 /// in the overlay.
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "sequential overlay render loop with per-gateway eligibility filter, consumer config, and status; splitting obscures the pipeline"
+)]
 async fn reconcile_routing_overlay_inner(
     network: &GridNetwork,
     client: &Client,
     providers: &[InferenceProvider],
     remote_crdt_providers: &[crdt::ProviderState],
     raw_metrics: &HashMap<String, scoring::BackendMetrics>,
-) -> Result<(), OperatorError> {
+) -> Result<Vec<ConsumerConfigStatus>, OperatorError> {
     let network_name = network
         .metadata
         .name
@@ -462,15 +609,39 @@ async fn reconcile_routing_overlay_inner(
         Some(&metrics_by_str)
     };
 
+    let observed_generation = network.metadata.generation.unwrap_or(0);
+    let mut consumer_statuses: Vec<ConsumerConfigStatus> = Vec::new();
+
     for gw_ref in &network.spec.gateway_refs {
         // Each gateway identifies its own local site.  Fall back to the
         // network name for single-site deployments where the two are equal.
         let local_site = gw_ref.local_site_name.as_deref().unwrap_or(network_name);
+
+        // Filter remote CRDT providers to those whose source GridSite is Active.
+        // Providers from sites in any other phase (Discovered, Connecting, Pending,
+        // Unreachable, Left, or missing) are excluded before the overlay is rendered.
+        // This is the routing eligibility gate: SWIM membership alone does not
+        // make a remote site routable.
+        let eligible_remote: Vec<&crdt::ProviderState> =
+            filter_eligible_remote_crdt_providers(network_name, &sites, remote_crdt_providers);
+        let eligible_remote_owned: Vec<crdt::ProviderState> = eligible_remote.into_iter().cloned().collect();
+        let filtered_count = remote_crdt_providers.len() - eligible_remote_owned.len();
+        if filtered_count > 0 {
+            tracing::debug!(
+                network = network_name,
+                gateway = %gw_ref.name,
+                total_remote = remote_crdt_providers.len(),
+                filtered = filtered_count,
+                eligible = eligible_remote_owned.len(),
+                "filtered remote CRDT providers: source GridSite not Active"
+            );
+        }
+
         let overlay = routing_overlay::render_routing_overlay(
             network,
             &sites,
             providers,
-            remote_crdt_providers,
+            &eligible_remote_owned,
             local_site,
             metrics_arg,
         )
@@ -492,11 +663,31 @@ async fn reconcile_routing_overlay_inner(
         apply_overlay_for_gateway(&overlay, network, gw_ref, client).await?;
 
         // Opt-in: generate and apply the consumer Praxis config when enabled.
+        // Render/apply errors are recorded as per-gateway status and do NOT
+        // abort the reconcile loop — other gateways continue to be processed.
+        // Gateways with consumerConfig.enabled=false get a Disabled entry.
+        // Gateways without a consumerConfig block are omitted from status.
         if let Some(cc) = gw_ref.consumer_config.as_ref().filter(|cc| cc.enabled) {
-            apply_consumer_config_for_gateway(&overlay, network_name, gw_ref, cc, client).await?;
+            match apply_consumer_config_for_gateway(&overlay, network_name, gw_ref, cc, client).await {
+                Ok(()) => {
+                    consumer_statuses.push(consumer_config_status_rendered(gw_ref, cc, observed_generation));
+                },
+                Err(e) => {
+                    tracing::warn!(
+                        network = network_name,
+                        gateway = %gw_ref.name,
+                        namespace = %gw_ref.namespace,
+                        error = %e,
+                        "consumer Praxis config render/apply failed; recorded in status"
+                    );
+                    consumer_statuses.push(consumer_config_status_error(gw_ref, cc, &e, observed_generation));
+                },
+            }
+        } else if let Some(cc) = gw_ref.consumer_config.as_ref().filter(|cc| !cc.enabled) {
+            consumer_statuses.push(consumer_config_status_disabled(gw_ref, cc, observed_generation));
         }
     }
-    Ok(())
+    Ok(consumer_statuses)
 }
 
 /// List all [`InferenceProvider`] resources cluster-wide.
@@ -731,7 +922,10 @@ fn provider_revision(provider: &InferenceProvider) -> u64 {
 ///
 /// Builds a [`crdt::GridStateSnapshot`] from all providers belonging to
 /// `network_name`, attaches live metrics where configured, and sends the
-/// snapshot to SWIM peers via [`SwimHandle::publish_state_broadcast`].
+/// snapshot to SWIM peers via [`SwimHandle::publish_state_broadcast`].  When a
+/// gateway address is configured, a broadcast is sent even if the snapshot has
+/// no providers so peers can discover the data-plane address before providers
+/// are created.
 ///
 /// Providers are included regardless of their phase (even `Unavailable`) so
 /// remote sites can learn which providers exist and avoid routing to unhealthy
@@ -768,15 +962,16 @@ fn publish_real_provider_state(
         }
     }
 
-    if snap.providers.is_empty() {
-        // No providers in this network — nothing to broadcast.
+    let gateway_address = swim.gateway_address().map(str::to_owned);
+    if snap.providers.is_empty() && gateway_address.is_none() {
+        // No providers and no gateway address — nothing to broadcast.
         return;
     }
 
     // Use the highest provider revision as this origin's broadcast revision.
     // Duplicate unchanged broadcasts are idempotent; newer Kubernetes writes
     // advance resourceVersion and therefore advance the broadcast revision.
-    let bc = StateBroadcast::new(site_name.to_owned(), max_revision, snap);
+    let bc = StateBroadcast::new(site_name.to_owned(), max_revision, snap, gateway_address);
     if let Err(e) = swim.publish_state_broadcast(bc) {
         tracing::debug!(error = %e, "CRDT broadcast channel unavailable — runtime not yet receiving");
     }
@@ -879,11 +1074,13 @@ pub(crate) fn apply_swim_staleness_override(
 /// `connected_sites` is derived from `membership`: count of peers with
 /// [`Alive`] status.  `distributed_provider_count` reflects providers received via
 /// CRDT state broadcasts.  Both are `0` when SWIM is disabled.
+/// `consumer_config_statuses` holds per-gateway render/apply outcomes for
+/// gateways with `consumerConfig.enabled: true`; empty when no gateways opted in.
 ///
 /// [`Alive`]: MemberStatus::Alive
 #[expect(
     clippy::too_many_arguments,
-    reason = "all six arguments are distinct status fields; a wrapper struct would obscure the data flow"
+    reason = "all arguments are distinct status fields; a wrapper struct would obscure the data flow"
 )]
 async fn update_status(
     network: &GridNetwork,
@@ -892,6 +1089,7 @@ async fn update_status(
     phase: &GridNetworkPhase,
     membership: Option<&MembershipSnapshot>,
     distributed_provider_count: u32,
+    consumer_config_statuses: Vec<ConsumerConfigStatus>,
 ) -> Result<(), OperatorError> {
     let name = network
         .metadata
@@ -908,6 +1106,7 @@ async fn update_status(
         grid_id: grid_id.to_owned(),
         observed_generation: network.metadata.generation.unwrap_or(0),
         phase: phase.clone(),
+        consumer_config_status: consumer_config_statuses,
     };
 
     let patch = serde_json::json!({
@@ -923,6 +1122,80 @@ async fn update_status(
 }
 
 // ---------------------------------------------------------------------------
+// Consumer config status builders
+// ---------------------------------------------------------------------------
+
+/// Build a `Rendered` [`ConsumerConfigStatus`] for a successfully applied consumer config.
+pub(crate) fn consumer_config_status_rendered(
+    gw_ref: &GatewayRef,
+    cc: &ConsumerConfig,
+    observed_generation: i64,
+) -> ConsumerConfigStatus {
+    ConsumerConfigStatus {
+        gateway_name: gw_ref.name.clone(),
+        namespace: gw_ref.namespace.clone(),
+        config_map_name: cc.config_map_name.clone(),
+        phase: ConsumerConfigPhase::Rendered,
+        reason: String::new(),
+        message: format!(
+            "consumer config rendered and applied to {}/{}",
+            gw_ref.namespace, cc.config_map_name
+        ),
+        observed_generation,
+    }
+}
+
+/// Build a `Disabled` [`ConsumerConfigStatus`] for a gateway whose
+/// `consumerConfig.enabled` is `false`.
+pub(crate) fn consumer_config_status_disabled(
+    gw_ref: &GatewayRef,
+    cc: &ConsumerConfig,
+    observed_generation: i64,
+) -> ConsumerConfigStatus {
+    ConsumerConfigStatus {
+        gateway_name: gw_ref.name.clone(),
+        namespace: gw_ref.namespace.clone(),
+        config_map_name: cc.config_map_name.clone(),
+        phase: ConsumerConfigPhase::Disabled,
+        reason: "ConsumerConfigDisabled".to_owned(),
+        message: "consumerConfig.enabled is false; no ConfigMap generated".to_owned(),
+        observed_generation,
+    }
+}
+
+/// Build an `Error` [`ConsumerConfigStatus`] from a render or apply failure.
+///
+/// # Security
+///
+/// `message` is derived from the `OperatorError` `Display` impl only.  That
+/// impl never includes credential token bytes — error messages describe
+/// structural failures (blank fields, JSON errors, Kubernetes API errors).
+pub(crate) fn consumer_config_status_error(
+    gw_ref: &GatewayRef,
+    cc: &ConsumerConfig,
+    err: &OperatorError,
+    observed_generation: i64,
+) -> ConsumerConfigStatus {
+    let reason = match err {
+        OperatorError::ConsumerConfigRender(ConsumerConfigError::MissingClusterEndpoint { .. }) => {
+            "MissingClusterEndpoint"
+        },
+        OperatorError::ConsumerConfigRender(_) => "ConsumerConfigRenderFailed",
+        OperatorError::Kube(_) => "ConsumerConfigApplyFailed",
+        _ => "ConsumerConfigError",
+    };
+    ConsumerConfigStatus {
+        gateway_name: gw_ref.name.clone(),
+        namespace: gw_ref.namespace.clone(),
+        config_map_name: cc.config_map_name.clone(),
+        phase: ConsumerConfigPhase::Error,
+        reason: reason.to_owned(),
+        message: format!("{err}"),
+        observed_generation,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -933,6 +1206,62 @@ fn network_site_name(network: &GridNetwork) -> String {
         .name
         .clone()
         .unwrap_or_else(|| "unknown-site".to_owned())
+}
+
+// ---------------------------------------------------------------------------
+// Routing eligibility: CRDT provider → GridSite phase
+// ---------------------------------------------------------------------------
+
+/// Filter remote CRDT provider records to those whose source `GridSite` is
+/// routing-eligible.
+///
+/// A remote provider is eligible when a `GridSite` with:
+/// - resource name matching `discovered_site_k8s_name(provider.network_id, provider.site_id)`
+/// - `spec.gridNetworkRef == network_name`
+/// - `status.phase == Active`
+///
+/// exists in `sites`.
+///
+/// Local providers (`provider.site_id == local_site`) are excluded from this
+/// function's input by the caller — they are always eligible and use a separate
+/// rendering path.
+///
+/// Providers with no matching `GridSite`, a `GridSite` in any phase other than
+/// `Active`, or a `GridSite` in a different network are excluded.  This is the
+/// fail-closed contract: a SWIM-discovered site must not become routable solely
+/// because it gossiped.
+pub(crate) fn filter_eligible_remote_crdt_providers<'a>(
+    network_name: &str,
+    sites: &[GridSite],
+    remote_providers: &'a [crdt::ProviderState],
+) -> Vec<&'a crdt::ProviderState> {
+    remote_providers
+        .iter()
+        .filter(|p| is_crdt_provider_routing_eligible(network_name, sites, p))
+        .collect()
+}
+
+/// Return `true` when the `GridSite` corresponding to `provider` is routing-eligible.
+///
+/// Eligibility requires an `Active` `GridSite` matching the provider's network and site
+/// identity.  All other outcomes — missing `GridSite`, wrong network, wrong phase —
+/// are ineligible.
+///
+/// This is a pure function with no I/O, suitable for unit testing.
+pub(crate) fn is_crdt_provider_routing_eligible(
+    network_name: &str,
+    sites: &[GridSite],
+    provider: &crdt::ProviderState,
+) -> bool {
+    if provider.network_id != network_name {
+        return false;
+    }
+    let expected_name = discovered_site_k8s_name(&provider.network_id, &provider.site_id);
+    sites.iter().any(|s| {
+        s.metadata.name.as_deref() == Some(expected_name.as_str())
+            && s.spec.grid_network_ref == network_name
+            && s.status.as_ref().is_some_and(|st| st.phase == GridSitePhase::Active)
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -950,8 +1279,18 @@ pub(crate) struct DiscoveredSite {
     pub name: String,
     /// The `GridNetwork` this site belongs to.
     pub grid_network_ref: String,
-    /// Egress address for data-plane connectivity, sourced from the SWIM advertised address.
+    /// Data-plane gateway address for egress connectivity.
+    ///
+    /// When the remote peer advertises a gateway address via a SWIM state broadcast,
+    /// this field carries that address.  Otherwise it is empty and the `egress`
+    /// section should be omitted from the `GridSite` spec to allow the `GridSite`
+    /// controller to hold the site in `Discovered` until a gateway address arrives.
     pub egress_address: String,
+    /// Public site certificate PEM received from this peer via SWIM broadcast.
+    ///
+    /// Contains only the public certificate — never a private key.
+    /// `None` when the remote peer has not yet broadcast its certificate.
+    pub site_cert_pem: Option<String>,
 }
 
 /// Derive the set of remote [`GridSite`]s the operator should maintain from the SWIM snapshot.
@@ -978,7 +1317,8 @@ pub(crate) fn discovered_sites_from_swim(
         .map(|m| DiscoveredSite {
             name: discovered_site_k8s_name(network_name, &m.site_id),
             grid_network_ref: network_name.to_owned(),
-            egress_address: m.endpoint.clone(),
+            egress_address: m.gateway_address.clone().unwrap_or_default(),
+            site_cert_pem: m.site_cert_pem.clone(),
         })
         .collect()
 }
@@ -1023,24 +1363,25 @@ pub(crate) fn discovered_site_k8s_name(network_name: &str, site_id: &str) -> Str
 ///
 /// Uses server-side apply, so the call is idempotent: applying an already-existing
 /// `GridSite` with the same spec is a no-op.  After the spec is applied, the
-/// `status.phase` is set to `Discovered` to reflect that the member is observed
-/// Alive via SWIM.
+/// `status.phase` is set to `Discovered` **only if the current phase is `Pending`**,
+/// preventing this controller from regressing a site that the `GridSite` controller
+/// has already advanced to `Connecting` or beyond.
 ///
-/// The `GridSite` controller's `determine_phase` is an identity function (Phase 1),
-/// so subsequent `GridSite` reconciles preserve the `Discovered` phase.
-///
-/// # Phase 2 follow-up
-///
-/// This creates a site record at `Discovered`.  Advancing to `Active` (which
-/// requires mTLS cert exchange, capability negotiation, and a data-plane ping)
-/// is out of scope for Phase 1.
+/// Phase ownership:
+/// - Pending → Discovered: this function (`GridNetwork` controller), based on SWIM Alive
+/// - Discovered → Connecting: `GridSite` controller, based on data-plane gateway address presence.
+/// - Connecting → Active: deployment workflow establishes trust before setting Active.
 #[expect(
     clippy::too_many_lines,
-    reason = "sequential spec-apply + status-patch per discovered site; splitting would hide the per-site K8s transaction"
+    reason = "sequential spec-apply + conditional status-patch per discovered site"
 )]
 #[expect(
     clippy::large_stack_frames,
     reason = "async future over Kubernetes API types with serde_json values"
+)]
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "cert PEM validation branches add arms but each branch is a distinct security invariant; splitting obscures the trust contract"
 )]
 async fn reconcile_discovered_sites(
     network_name: &str,
@@ -1058,7 +1399,7 @@ async fn reconcile_discovered_sites(
     for site in &sites {
         // Server-side apply the spec.  Creating on first call; updating on subsequent
         // calls is a no-op when the spec has not changed.
-        let spec_doc = serde_json::json!({
+        let mut spec_obj = serde_json::json!({
             "apiVersion": "grid.praxis-proxy.io/v1alpha1",
             "kind": "GridSite",
             "metadata": {
@@ -1070,12 +1411,22 @@ async fn reconcile_discovered_sites(
             },
             "spec": {
                 "gridNetworkRef": site.grid_network_ref,
-                "egress": {
-                    "address": site.egress_address,
-                    "tls": { "mode": "Mutual" }
-                }
             }
         });
+        if !site.egress_address.is_empty() {
+            spec_obj.get_mut("spec").and_then(|s| {
+                s.as_object_mut().map(|o| {
+                    o.insert(
+                        "egress".to_owned(),
+                        serde_json::json!({
+                            "address": site.egress_address,
+                            "tls": { "mode": "Mutual" }
+                        }),
+                    );
+                })
+            });
+        }
+        let spec_doc = spec_obj;
 
         api.patch(
             &site.name,
@@ -1084,25 +1435,119 @@ async fn reconcile_discovered_sites(
         )
         .await?;
 
-        // Set status.phase = Discovered.  The GridSite controller's determine_phase
-        // is an identity function, so it will preserve this on subsequent reconciles.
-        let status_doc = serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
-            "kind": "GridSite",
-            "status": { "phase": "Discovered" }
-        });
+        // Only write Discovered when the current phase is Pending.
+        // If the GridSite controller has already advanced the phase (e.g. to
+        // Connecting), we must not regress it.
+        let should_write_discovered = {
+            match api.get(&site.name).await {
+                Ok(existing) => {
+                    let current_phase = existing.status.as_ref().map(|s| &s.phase);
+                    matches!(current_phase, None | Some(GridSitePhase::Pending))
+                },
+                Err(_) => true, // Site was just created; safe to write Discovered.
+            }
+        };
 
-        api.patch_status(
-            &site.name,
-            &PatchParams::apply(FIELD_MANAGER).force(),
-            &Patch::Apply(&status_doc),
-        )
-        .await?;
+        if should_write_discovered {
+            let status_doc = serde_json::json!({
+                "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+                "kind": "GridSite",
+                "status": {
+                    "phase": "Discovered",
+                    "reason": "SWIMDiscovered",
+                    "message": "site observed as Alive SWIM member"
+                }
+            });
+
+            api.patch_status(
+                &site.name,
+                &PatchParams::apply(FIELD_MANAGER).force(),
+                &Patch::Apply(&status_doc),
+            )
+            .await?;
+        }
+
+        // Write received public cert PEM to status after structure validation.
+        // Private key material must never be written to status; invalid PEM is
+        // also rejected and recorded as TrustMaterialInvalid.
+        if let Some(cert_pem) = &site.site_cert_pem {
+            match trust_bundle::check_cert_pem(cert_pem) {
+                CertPemStatus::ValidStructure => {
+                    let cert_status_doc = serde_json::json!({
+                        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+                        "kind": "GridSite",
+                        "status": {
+                            "publicCertPem": cert_pem
+                        }
+                    });
+                    api.patch_status(
+                        &site.name,
+                        &PatchParams::apply(FIELD_MANAGER).force(),
+                        &Patch::Apply(&cert_status_doc),
+                    )
+                    .await?;
+                    tracing::info!(
+                        name = %site.name,
+                        "received and stored public site certificate PEM (structure valid; not chain-verified)"
+                    );
+                },
+                CertPemStatus::ContainsPrivateKey => {
+                    // Security violation: the remote peer sent private key material.
+                    // Do not store it; clear any prior publicCertPem and log at error
+                    // level so operators can investigate.
+                    let invalid_status_doc = serde_json::json!({
+                        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+                        "kind": "GridSite",
+                        "status": {
+                            "publicCertPem": null,
+                            "reason": "TrustMaterialInvalid",
+                            "message": "received trust material from remote site contained private-key markers; discarded"
+                        }
+                    });
+                    api.patch_status(
+                        &site.name,
+                        &PatchParams::apply(FIELD_MANAGER).force(),
+                        &Patch::Apply(&invalid_status_doc),
+                    )
+                    .await?;
+                    tracing::error!(
+                        name = %site.name,
+                        "SECURITY: received cert PEM contains private key markers from remote SWIM peer; \
+                         discarding — private keys must never appear in SWIM broadcasts"
+                    );
+                },
+                CertPemStatus::NotACertificate => {
+                    // Write a status marker so operators can see the invalid material.
+                    // Do not store the raw PEM; record only the invalid status.
+                    let invalid_status_doc = serde_json::json!({
+                        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+                        "kind": "GridSite",
+                        "status": {
+                            "publicCertPem": null,
+                            "reason": "TrustMaterialInvalid",
+                            "message": "received cert PEM from remote site is not a valid certificate; \
+                                        check GRID_TLS_SITE_SECRET_REF configuration on the remote operator"
+                        }
+                    });
+                    api.patch_status(
+                        &site.name,
+                        &PatchParams::apply(FIELD_MANAGER).force(),
+                        &Patch::Apply(&invalid_status_doc),
+                    )
+                    .await?;
+                    tracing::warn!(
+                        name = %site.name,
+                        "received cert PEM from remote site is not a valid certificate (missing BEGIN CERTIFICATE header)"
+                    );
+                },
+            }
+        }
 
         tracing::info!(
             name = %site.name,
             network = %network_name,
             egress = %site.egress_address,
+            cert = site.site_cert_pem.is_some(),
             "reconciled auto-discovered GridSite from SWIM Alive member"
         );
     }
@@ -1252,6 +1697,8 @@ mod tests {
                     incarnation: 1,
                     status: MemberStatus::Alive,
                     age_secs: 0,
+                    gateway_address: None,
+                    site_cert_pem: None,
                 })
                 .collect(),
         }
@@ -1265,6 +1712,8 @@ mod tests {
                 incarnation: 1,
                 status: MemberStatus::Suspect,
                 age_secs: 5,
+                gateway_address: None,
+                site_cert_pem: None,
             }],
         }
     }
@@ -1743,6 +2192,8 @@ mod tests {
                 incarnation: 0,
                 status,
                 age_secs: 0,
+                gateway_address: None,
+                site_cert_pem: None,
             }],
         }
     }
@@ -1870,6 +2321,8 @@ mod tests {
                     incarnation: 0,
                     status: MemberStatus::Dead,
                     age_secs: 0,
+                    gateway_address: None,
+                    site_cert_pem: None,
                 },
                 MemberRecord {
                     site_id: "site-east".to_owned(),
@@ -1877,6 +2330,8 @@ mod tests {
                     incarnation: 0,
                     status: MemberStatus::Alive,
                     age_secs: 0,
+                    gateway_address: None,
+                    site_cert_pem: None,
                 },
             ],
         };
@@ -1978,6 +2433,8 @@ mod tests {
             incarnation: 0,
             status,
             age_secs: 0,
+            gateway_address: None,
+            site_cert_pem: None,
         }
     }
 
@@ -2002,9 +2459,9 @@ mod tests {
             site.grid_network_ref, "net",
             "grid_network_ref must match the network name"
         );
-        assert_eq!(
-            site.egress_address, "10.0.0.2:7946",
-            "egress_address must match the SWIM advertised address"
+        assert!(
+            site.egress_address.is_empty(),
+            "egress_address must be empty when member has no gateway_address"
         );
     }
 
@@ -2043,6 +2500,111 @@ mod tests {
         let a_name = a.first().unwrap_or_else(|| std::process::abort()).name.as_str();
         let b_name = b.first().unwrap_or_else(|| std::process::abort()).name.as_str();
         assert_eq!(a_name, b_name, "name must be deterministic across calls");
+    }
+
+    #[test]
+    fn discovered_site_uses_gateway_address_when_present() {
+        let snap = make_snapshot(vec![MemberRecord {
+            site_id: "remote".to_owned(),
+            endpoint: "10.0.0.2:7946".to_owned(),
+            incarnation: 0,
+            status: MemberStatus::Alive,
+            age_secs: 0,
+            gateway_address: Some("10.0.0.2:19080".to_owned()),
+            site_cert_pem: None,
+        }]);
+        let sites = discovered_sites_from_swim("net", "local", &snap);
+        assert_eq!(sites.len(), 1, "exactly one remote Alive member");
+        let site = sites.first().unwrap_or_else(|| std::process::abort());
+        assert_eq!(
+            site.egress_address, "10.0.0.2:19080",
+            "egress_address must use gateway_address when present"
+        );
+    }
+
+    #[test]
+    fn discovered_site_egress_empty_when_no_gateway_address() {
+        let snap = make_snapshot(vec![MemberRecord {
+            site_id: "remote".to_owned(),
+            endpoint: "10.0.0.2:7946".to_owned(),
+            incarnation: 0,
+            status: MemberStatus::Alive,
+            age_secs: 0,
+            gateway_address: None,
+            site_cert_pem: None,
+        }]);
+        let sites = discovered_sites_from_swim("net", "local", &snap);
+        assert_eq!(sites.len(), 1, "exactly one remote Alive member");
+        let site = sites.first().unwrap_or_else(|| std::process::abort());
+        assert!(
+            site.egress_address.is_empty(),
+            "egress_address must be empty when no gateway_address is set"
+        );
+    }
+
+    #[test]
+    fn discovered_site_carries_site_cert_pem_when_present() {
+        let sentinel_cert = "-----BEGIN CERTIFICATE-----\nMIIBIjANBgkqhkiG9\n-----END CERTIFICATE-----\n";
+        let snap = make_snapshot(vec![MemberRecord {
+            site_id: "remote".to_owned(),
+            endpoint: "10.0.0.2:7946".to_owned(),
+            incarnation: 0,
+            status: MemberStatus::Alive,
+            age_secs: 0,
+            gateway_address: Some("10.0.0.2:8080".to_owned()),
+            site_cert_pem: Some(sentinel_cert.to_owned()),
+        }]);
+        let sites = discovered_sites_from_swim("net", "local", &snap);
+        let site = sites.first().unwrap_or_else(|| std::process::abort());
+        assert_eq!(
+            site.site_cert_pem.as_deref(),
+            Some(sentinel_cert),
+            "site_cert_pem must propagate from MemberRecord to DiscoveredSite"
+        );
+    }
+
+    #[test]
+    fn discovered_site_cert_pem_none_when_not_received() {
+        let snap = make_snapshot(vec![MemberRecord {
+            site_id: "remote".to_owned(),
+            endpoint: "10.0.0.2:7946".to_owned(),
+            incarnation: 0,
+            status: MemberStatus::Alive,
+            age_secs: 0,
+            gateway_address: None,
+            site_cert_pem: None,
+        }]);
+        let sites = discovered_sites_from_swim("net", "local", &snap);
+        let site = sites.first().unwrap_or_else(|| std::process::abort());
+        assert!(
+            site.site_cert_pem.is_none(),
+            "site_cert_pem must be None when member has no cert"
+        );
+    }
+
+    #[test]
+    fn discovered_site_cert_does_not_contain_private_key_marker() {
+        // Defensive: prove that whatever appears in site_cert_pem does not
+        // look like a PEM private key.  This is a code-level invariant proof,
+        // not an exhaustive crypto check.
+        let sentinel_cert = "-----BEGIN CERTIFICATE-----\nMIIBIjANBgkqhkiG9\n-----END CERTIFICATE-----\n";
+        let snap = make_snapshot(vec![MemberRecord {
+            site_id: "remote".to_owned(),
+            endpoint: "10.0.0.2:7946".to_owned(),
+            incarnation: 0,
+            status: MemberStatus::Alive,
+            age_secs: 0,
+            gateway_address: Some("10.0.0.2:8080".to_owned()),
+            site_cert_pem: Some(sentinel_cert.to_owned()),
+        }]);
+        let sites = discovered_sites_from_swim("net", "local", &snap);
+        let site = sites.first().unwrap_or_else(|| std::process::abort());
+        if let Some(pem) = &site.site_cert_pem {
+            assert!(
+                !pem.contains("BEGIN RSA PRIVATE KEY") && !pem.contains("BEGIN PRIVATE KEY"),
+                "site_cert_pem must never contain private key material"
+            );
+        }
     }
 
     #[test]
@@ -2181,5 +2743,453 @@ mod tests {
         let mut expected = result.clone();
         expected.sort();
         assert_eq!(result, expected, "result must be sorted for deterministic ordering");
+    }
+
+    // -----------------------------------------------------------------------
+    // diff_seed_sets
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn diff_seed_sets_empty_to_empty_is_no_op() {
+        let (added, removed) = diff_seed_sets(&[], &[]);
+        assert!(added.is_empty(), "empty→empty must produce no additions");
+        assert!(removed.is_empty(), "empty→empty must produce no removals");
+    }
+
+    #[test]
+    fn diff_seed_sets_adding_a_seed() {
+        let prev = vec![addr("10.0.0.1:7946")];
+        let next = vec![addr("10.0.0.1:7946"), addr("10.0.0.2:7946")];
+        let (added, removed) = diff_seed_sets(&prev, &next);
+        assert_eq!(added, vec![addr("10.0.0.2:7946")], "new seed must appear in added");
+        assert!(removed.is_empty(), "no removals when only adding");
+    }
+
+    #[test]
+    fn diff_seed_sets_removing_a_seed() {
+        let prev = vec![addr("10.0.0.1:7946"), addr("10.0.0.2:7946")];
+        let next = vec![addr("10.0.0.1:7946")];
+        let (added, removed) = diff_seed_sets(&prev, &next);
+        assert!(added.is_empty(), "no additions when only removing");
+        assert_eq!(
+            removed,
+            vec![addr("10.0.0.2:7946")],
+            "removed seed must appear in removed"
+        );
+    }
+
+    #[test]
+    fn diff_seed_sets_unchanged_set_is_no_op() {
+        let seeds = vec![addr("10.0.0.1:7946"), addr("10.0.0.2:7946")];
+        let (added, removed) = diff_seed_sets(&seeds, &seeds);
+        assert!(added.is_empty(), "no additions when set is unchanged");
+        assert!(removed.is_empty(), "no removals when set is unchanged");
+    }
+
+    #[test]
+    fn diff_seed_sets_reorder_is_no_op() {
+        let prev = vec![addr("10.0.0.1:7946"), addr("10.0.0.2:7946")];
+        let next = vec![addr("10.0.0.2:7946"), addr("10.0.0.1:7946")];
+        let (added, removed) = diff_seed_sets(&prev, &next);
+        assert!(added.is_empty(), "reordering must not produce additions");
+        assert!(removed.is_empty(), "reordering must not produce removals");
+    }
+
+    #[test]
+    fn diff_seed_sets_from_empty_adds_all() {
+        let next = vec![addr("10.0.0.1:7946"), addr("10.0.0.2:7946")];
+        let (added, removed) = diff_seed_sets(&[], &next);
+        assert_eq!(added, vec![addr("10.0.0.1:7946"), addr("10.0.0.2:7946")]);
+        assert!(removed.is_empty());
+    }
+
+    #[test]
+    fn diff_seed_sets_to_empty_removes_all() {
+        let prev = vec![addr("10.0.0.1:7946"), addr("10.0.0.2:7946")];
+        let (added, removed) = diff_seed_sets(&prev, &[]);
+        assert!(added.is_empty());
+        assert_eq!(removed, vec![addr("10.0.0.1:7946"), addr("10.0.0.2:7946")]);
+    }
+
+    #[test]
+    fn diff_seed_sets_results_are_sorted() {
+        let prev = vec![addr("10.0.0.3:7946"), addr("10.0.0.1:7946")];
+        let next = vec![addr("10.0.0.2:7946"), addr("10.0.0.1:7946")];
+        let (added, removed) = diff_seed_sets(&prev, &next);
+        // added: 10.0.0.2 only; removed: 10.0.0.3 only
+        assert_eq!(added, vec![addr("10.0.0.2:7946")], "added must be sorted");
+        assert_eq!(removed, vec![addr("10.0.0.3:7946")], "removed must be sorted");
+    }
+
+    #[test]
+    fn diff_seed_sets_simultaneous_add_and_remove() {
+        let prev = vec![addr("10.0.0.1:7946"), addr("10.0.0.2:7946")];
+        let next = vec![addr("10.0.0.1:7946"), addr("10.0.0.3:7946")];
+        let (added, removed) = diff_seed_sets(&prev, &next);
+        assert_eq!(added, vec![addr("10.0.0.3:7946")]);
+        assert_eq!(removed, vec![addr("10.0.0.2:7946")]);
+    }
+
+    // -----------------------------------------------------------------------
+    // consumer config status builders
+    // -----------------------------------------------------------------------
+
+    fn make_gw_ref(name: &str, ns: &str) -> GatewayRef {
+        GatewayRef {
+            name: name.to_owned(),
+            namespace: ns.to_owned(),
+            local_site_name: None,
+            consumer_config: None,
+        }
+    }
+
+    fn make_consumer_config(cm_name: &str) -> ConsumerConfig {
+        ConsumerConfig {
+            enabled: true,
+            config_map_name: cm_name.to_owned(),
+            ..ConsumerConfig::default()
+        }
+    }
+
+    #[test]
+    fn consumer_config_status_rendered_has_rendered_phase() {
+        let gw = make_gw_ref("inference-gw", "praxis-system");
+        let cc = make_consumer_config("praxis-consumer-config");
+        let status = consumer_config_status_rendered(&gw, &cc, 5);
+        assert_eq!(
+            status.phase,
+            ConsumerConfigPhase::Rendered,
+            "rendered must set phase=Rendered"
+        );
+        assert_eq!(
+            status.gateway_name, "inference-gw",
+            "gateway_name must match gw_ref.name"
+        );
+        assert_eq!(
+            status.namespace, "praxis-system",
+            "namespace must match gw_ref.namespace"
+        );
+        assert_eq!(
+            status.config_map_name, "praxis-consumer-config",
+            "config_map_name must match cc"
+        );
+        assert_eq!(status.observed_generation, 5, "observed_generation must propagate");
+        assert!(status.reason.is_empty(), "Rendered status must have empty reason");
+        assert!(
+            status.message.contains("praxis-consumer-config"),
+            "message must name the ConfigMap"
+        );
+    }
+
+    #[test]
+    fn consumer_config_status_error_has_error_phase() {
+        let gw = make_gw_ref("inference-gw", "praxis-system");
+        let cc = make_consumer_config("praxis-consumer-config");
+        let err = OperatorError::OverlayRender("structural failure".to_owned());
+        let status = consumer_config_status_error(&gw, &cc, &err, 3);
+        assert_eq!(status.phase, ConsumerConfigPhase::Error, "error must set phase=Error");
+        assert!(!status.reason.is_empty(), "Error status must have non-empty reason");
+        assert!(
+            status.message.contains("structural failure"),
+            "message must include error detail"
+        );
+        assert_eq!(status.observed_generation, 3, "observed_generation must propagate");
+    }
+
+    #[test]
+    fn consumer_config_status_render_failed_reason() {
+        use crate::resources::consumer_config::ConsumerConfigError;
+        let gw = make_gw_ref("gw", "ns");
+        let cc = make_consumer_config("cm");
+        let err = OperatorError::ConsumerConfigRender(ConsumerConfigError::BlankLocalSite);
+        let status = consumer_config_status_error(&gw, &cc, &err, 1);
+        assert_eq!(
+            status.reason, "ConsumerConfigRenderFailed",
+            "render error must map to ConsumerConfigRenderFailed reason"
+        );
+    }
+
+    #[test]
+    fn consumer_config_status_missing_endpoint_reason() {
+        let gw = make_gw_ref("gw", "ns");
+        let cc = make_consumer_config("cm");
+        let err = OperatorError::ConsumerConfigRender(ConsumerConfigError::MissingClusterEndpoint {
+            cluster: "site-a".to_owned(),
+        });
+        let status = consumer_config_status_error(&gw, &cc, &err, 1);
+        assert_eq!(
+            status.reason, "MissingClusterEndpoint",
+            "missing endpoint topology must map to a specific operator-facing reason"
+        );
+        assert!(
+            status.message.contains("site-a"),
+            "missing endpoint message must identify the cluster"
+        );
+    }
+
+    #[test]
+    fn consumer_config_status_error_message_does_not_contain_sentinel_token() {
+        let sentinel = "sk-super-secret-token-do-not-emit";
+        let gw = make_gw_ref("gw", "ns");
+        let cc = make_consumer_config("cm");
+        // OverlayRender error message must not include the token (it never sees it).
+        let err = OperatorError::OverlayRender("render failed: blank field".to_owned());
+        let status = consumer_config_status_error(&gw, &cc, &err, 1);
+        assert!(
+            !status.message.contains(sentinel),
+            "error status message must not contain token bytes"
+        );
+    }
+
+    #[test]
+    fn consumer_config_status_disabled_has_disabled_phase() {
+        let gw = make_gw_ref("gw", "ns");
+        let mut cc = make_consumer_config("cm");
+        cc.enabled = false;
+        let status = consumer_config_status_disabled(&gw, &cc, 2);
+        assert_eq!(status.phase, ConsumerConfigPhase::Disabled, "must set phase=Disabled");
+        assert_eq!(
+            status.reason, "ConsumerConfigDisabled",
+            "must have ConsumerConfigDisabled reason"
+        );
+        assert!(!status.message.is_empty(), "must have a non-empty diagnostic message");
+        assert_eq!(status.observed_generation, 2);
+    }
+
+    #[test]
+    fn consumer_config_status_disabled_message_does_not_contain_sentinel_token() {
+        let sentinel = "sk-super-secret-token-must-not-appear";
+        let gw = make_gw_ref("gw", "ns");
+        let cc = make_consumer_config("cm");
+        let status = consumer_config_status_disabled(&gw, &cc, 1);
+        assert!(
+            !status.message.contains(sentinel),
+            "disabled message must not contain token bytes"
+        );
+        assert!(
+            !status.reason.contains(sentinel),
+            "disabled reason must not contain token bytes"
+        );
+    }
+
+    #[test]
+    fn consumer_config_status_serde_round_trip() {
+        use crate::crd::grid_network::ConsumerConfigStatus;
+        let original = ConsumerConfigStatus {
+            gateway_name: "inference-gw".to_owned(),
+            namespace: "praxis-system".to_owned(),
+            config_map_name: "praxis-consumer-config".to_owned(),
+            phase: ConsumerConfigPhase::Rendered,
+            reason: String::new(),
+            message: "consumer config rendered and applied".to_owned(),
+            observed_generation: 42,
+        };
+        let json = serde_json::to_string(&original).unwrap_or_else(|_| std::process::abort());
+        let round_tripped: ConsumerConfigStatus = serde_json::from_str(&json).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            original, round_tripped,
+            "ConsumerConfigStatus must survive a JSON round-trip unchanged"
+        );
+    }
+
+    #[test]
+    fn consumer_config_status_serde_includes_all_fields_in_camel_case() {
+        let status = ConsumerConfigStatus {
+            gateway_name: "gw".to_owned(),
+            namespace: "ns".to_owned(),
+            config_map_name: "cm".to_owned(),
+            phase: ConsumerConfigPhase::Error,
+            reason: "ConsumerConfigRenderFailed".to_owned(),
+            message: "error".to_owned(),
+            observed_generation: 1,
+        };
+        let json = serde_json::to_string(&status).unwrap_or_else(|_| std::process::abort());
+        assert!(json.contains("gatewayName"), "must serialize as camelCase gatewayName");
+        assert!(
+            json.contains("configMapName"),
+            "must serialize as camelCase configMapName"
+        );
+        assert!(
+            json.contains("observedGeneration"),
+            "must serialize as camelCase observedGeneration"
+        );
+    }
+
+    #[test]
+    fn consumer_config_status_multiple_gateways_produce_separate_entries() {
+        let gw_a = make_gw_ref("gw-a", "ns-a");
+        let gw_b = make_gw_ref("gw-b", "ns-b");
+        let cc_a = make_consumer_config("cm-a");
+        let cc_b = make_consumer_config("cm-b");
+        let status_a = consumer_config_status_rendered(&gw_a, &cc_a, 1);
+        let status_b = consumer_config_status_rendered(&gw_b, &cc_b, 1);
+        assert_eq!(status_a.gateway_name, "gw-a");
+        assert_eq!(status_b.gateway_name, "gw-b");
+        assert_eq!(status_a.config_map_name, "cm-a");
+        assert_eq!(status_b.config_map_name, "cm-b");
+        assert_eq!(status_a.phase, ConsumerConfigPhase::Rendered);
+        assert_eq!(status_b.phase, ConsumerConfigPhase::Rendered);
+    }
+
+    // -----------------------------------------------------------------------
+    // Routing eligibility: is_crdt_provider_routing_eligible
+    // -----------------------------------------------------------------------
+
+    fn make_eligible_crdt_provider(network_id: &str, site_id: &str) -> crdt::ProviderState {
+        crdt::ProviderState {
+            network_id: network_id.to_owned(),
+            site_id: site_id.to_owned(),
+            provider_id: "prov".to_owned(),
+            routing_cluster: site_id.to_owned(),
+            models: vec!["model-x".to_owned()],
+            backend_kind: "local".to_owned(),
+            phase: crdt::ProviderPhase::Available,
+            metrics: crdt::ProviderMetricsSnapshot::default(),
+            revision: 1,
+            writer_id: site_id.to_owned(),
+        }
+    }
+
+    fn make_active_grid_site(k8s_name: &str, network_ref: &str) -> GridSite {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "kind": "GridSite",
+            "metadata": { "name": k8s_name },
+            "spec": { "gridNetworkRef": network_ref },
+            "status": { "phase": "Active" }
+        }))
+        .unwrap_or_else(|_| std::process::abort())
+    }
+
+    fn make_phase_grid_site(k8s_name: &str, network_ref: &str, phase: &str) -> GridSite {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "kind": "GridSite",
+            "metadata": { "name": k8s_name },
+            "spec": { "gridNetworkRef": network_ref },
+            "status": { "phase": phase }
+        }))
+        .unwrap_or_else(|_| std::process::abort())
+    }
+
+    #[test]
+    fn active_grid_site_makes_crdt_provider_eligible() {
+        // GridSite name = discovered_site_k8s_name("net", "site-west") = "net-site-west"
+        let sites = vec![make_active_grid_site("net-site-west", "net")];
+        let provider = make_eligible_crdt_provider("net", "site-west");
+        assert!(
+            is_crdt_provider_routing_eligible("net", &sites, &provider),
+            "Active GridSite must make CRDT provider eligible"
+        );
+    }
+
+    #[test]
+    fn connecting_grid_site_excludes_crdt_provider() {
+        let sites = vec![make_phase_grid_site("net-site-west", "net", "Connecting")];
+        let provider = make_eligible_crdt_provider("net", "site-west");
+        assert!(
+            !is_crdt_provider_routing_eligible("net", &sites, &provider),
+            "Connecting GridSite must NOT make CRDT provider eligible"
+        );
+    }
+
+    #[test]
+    fn discovered_grid_site_excludes_crdt_provider() {
+        let sites = vec![make_phase_grid_site("net-site-west", "net", "Discovered")];
+        let provider = make_eligible_crdt_provider("net", "site-west");
+        assert!(
+            !is_crdt_provider_routing_eligible("net", &sites, &provider),
+            "Discovered GridSite must NOT make CRDT provider eligible"
+        );
+    }
+
+    #[test]
+    fn pending_grid_site_excludes_crdt_provider() {
+        let sites = vec![make_phase_grid_site("net-site-west", "net", "Pending")];
+        let provider = make_eligible_crdt_provider("net", "site-west");
+        assert!(
+            !is_crdt_provider_routing_eligible("net", &sites, &provider),
+            "Pending GridSite must NOT make CRDT provider eligible"
+        );
+    }
+
+    #[test]
+    fn unreachable_grid_site_excludes_crdt_provider() {
+        let sites = vec![make_phase_grid_site("net-site-west", "net", "Unreachable")];
+        let provider = make_eligible_crdt_provider("net", "site-west");
+        assert!(
+            !is_crdt_provider_routing_eligible("net", &sites, &provider),
+            "Unreachable GridSite must NOT make CRDT provider eligible"
+        );
+    }
+
+    #[test]
+    fn missing_grid_site_excludes_crdt_provider() {
+        let sites: Vec<GridSite> = vec![];
+        let provider = make_eligible_crdt_provider("net", "site-west");
+        assert!(
+            !is_crdt_provider_routing_eligible("net", &sites, &provider),
+            "No matching GridSite must NOT make CRDT provider eligible (fail-closed)"
+        );
+    }
+
+    #[test]
+    fn wrong_network_grid_site_excludes_crdt_provider() {
+        // GridSite is for a different network
+        let sites = vec![make_active_grid_site("net-site-west", "other-net")];
+        let provider = make_eligible_crdt_provider("net", "site-west");
+        assert!(
+            !is_crdt_provider_routing_eligible("net", &sites, &provider),
+            "Wrong-network GridSite must NOT make CRDT provider eligible"
+        );
+    }
+
+    #[test]
+    fn wrong_network_provider_excludes_crdt_provider() {
+        let sites = vec![make_active_grid_site("other-net-site-west", "net")];
+        let provider = make_eligible_crdt_provider("other-net", "site-west");
+        assert!(
+            !is_crdt_provider_routing_eligible("net", &sites, &provider),
+            "Provider from another network must NOT become eligible even if a matching-name Active GridSite exists"
+        );
+    }
+
+    #[test]
+    fn filter_keeps_only_active_site_providers() {
+        let sites = vec![
+            make_active_grid_site("net-site-a", "net"),
+            make_phase_grid_site("net-site-b", "net", "Connecting"),
+        ];
+        let providers = vec![
+            make_eligible_crdt_provider("net", "site-a"), // Active → eligible
+            make_eligible_crdt_provider("net", "site-b"), // Connecting → ineligible
+            make_eligible_crdt_provider("net", "site-c"), // Missing → ineligible
+        ];
+        let eligible = filter_eligible_remote_crdt_providers("net", &sites, &providers);
+        assert_eq!(eligible.len(), 1, "only Active site provider must pass filter");
+        let first = eligible.first().unwrap_or_else(|| std::process::abort());
+        assert_eq!(first.site_id, "site-a");
+    }
+
+    #[test]
+    fn filter_is_deterministic() {
+        let sites = vec![make_active_grid_site("net-site-a", "net")];
+        let providers = vec![make_eligible_crdt_provider("net", "site-a")];
+        let r1 = filter_eligible_remote_crdt_providers("net", &sites, &providers);
+        let r2 = filter_eligible_remote_crdt_providers("net", &sites, &providers);
+        assert_eq!(r1.len(), r2.len(), "filter must be deterministic");
+    }
+
+    #[test]
+    fn crdt_provider_identity_preserved_through_filter() {
+        // Remote CRDT providers never carry credential data (ProviderState has no credential field).
+        // The filter must not alter provider identity.
+        let sites = vec![make_active_grid_site("net-site-a", "net")];
+        let providers = vec![make_eligible_crdt_provider("net", "site-a")];
+        let eligible = filter_eligible_remote_crdt_providers("net", &sites, &providers);
+        assert_eq!(eligible.len(), 1, "eligible provider must pass filter");
+        let first = eligible.first().unwrap_or_else(|| std::process::abort());
+        assert_eq!(first.site_id, "site-a", "filter must not alter provider identity");
+        assert_eq!(first.network_id, "net", "filter must not alter provider network");
     }
 }

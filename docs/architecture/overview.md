@@ -15,7 +15,7 @@ Responsibilities:
 - **Mesh formation**: SWIM membership via `foca` for
   peer-to-peer discovery
 - **Trust**: CA generation, site certificate lifecycle,
-  mTLS certificate exchange, trust bundle distribution
+  public certificate propagation, and trust status
 - **State propagation**: CRDT provider and capability
   snapshots piggybacked on SWIM probes
 - **Routing config**: Generates Praxis overlay config

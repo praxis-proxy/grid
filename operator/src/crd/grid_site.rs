@@ -86,6 +86,13 @@ pub struct GridSiteStatus {
     /// Timestamp of the last phase transition.
     pub last_transition_time: Option<String>,
 
+    /// Human-readable diagnostic for the current phase.
+    ///
+    /// Never contains credential token bytes.  Populated on every reconcile;
+    /// empty when the operator has no additional context.
+    #[serde(default)]
+    pub message: String,
+
     /// Last observed generation.
     #[serde(default)]
     pub observed_generation: i64,
@@ -97,6 +104,14 @@ pub struct GridSiteStatus {
     /// Remote site's public certificate PEM (received
     /// during mTLS exchange).
     pub public_cert_pem: Option<String>,
+
+    /// Machine-readable reason for the current phase.
+    ///
+    /// Empty when `phase` is `Active` without additional context.
+    /// Examples: `"AwaitingDiscovery"`, `"EgressKnown"`, `"EgressMissing"`,
+    /// `"AwaitingReadiness"`.
+    #[serde(default)]
+    pub reason: String,
 }
 
 /// Capabilities a site advertises over the grid.
@@ -140,10 +155,10 @@ pub enum GridSitePhase {
     /// SWIM has discovered this site.
     Discovered,
 
-    /// mTLS certificate exchange in progress.
+    /// Gateway address known; trust and data-plane readiness being established.
     Connecting,
 
-    /// Fully connected: SWIM + mTLS + capabilities + ping.
+    /// Fully connected according to the deployment workflow.
     Active,
 
     /// Previously active but SWIM probes failing.

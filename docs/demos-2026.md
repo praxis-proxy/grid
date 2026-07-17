@@ -135,14 +135,14 @@ third cluster joins.
 **Flow**: Cluster C creates a GridNetwork with Cluster
 A as a seed. SWIM discovers A, then B (via A's
 membership list). GridSite resources appear
-automatically. mTLS certificates are exchanged.
+automatically. Public certificate material is propagated.
 Cluster C's GridSite status transitions:
-Pending → Discovered → Connecting → Active. Once
-Active, Cluster C's InferenceProviders are visible
-to A and B.
+Pending → Discovered → Connecting. Once trust policy
+and routing eligibility are satisfied, Cluster C's
+InferenceProviders are visible to A and B.
 
 **Demonstrates**: SWIM-based discovery, automatic
-GridSite creation, mTLS certificate exchange, site
+GridSite creation, public certificate propagation, site
 lifecycle state machine, capability propagation.
 
 ## Demo 8: MCP Tool Federation

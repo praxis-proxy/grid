@@ -75,6 +75,19 @@ pub struct MemberRecord {
     /// round.  Callers use this field to detect records that have not been
     /// refreshed and may be stale.
     pub age_secs: u64,
+
+    /// Data-plane gateway address advertised by this peer.
+    ///
+    /// When present, this is the address that should be used for the
+    /// `GridSite.spec.egress.address` field instead of the SWIM UDP
+    /// endpoint.  `None` when the peer has not configured a gateway address.
+    pub gateway_address: Option<String>,
+
+    /// Public site certificate PEM received from this peer via SWIM broadcast.
+    ///
+    /// Contains only the public certificate — never a private key.
+    /// `None` when the peer has not yet broadcast its site certificate.
+    pub site_cert_pem: Option<String>,
 }
 
 impl MemberRecord {
@@ -162,6 +175,8 @@ mod tests {
             incarnation: 1,
             status,
             age_secs: 0,
+            gateway_address: None,
+            site_cert_pem: None,
         }
     }
 

@@ -27,9 +27,7 @@
 - [Development](development.md) — build, test, format, lint, and coverage.
 - [Conventions](conventions.md) — coding style, testing requirements,
   documentation rules, and commit attribution.
-
-## Proposals
-
-- [Consumer Config Design](proposals/consumer-config.md) — design for full
-  operator ownership of consumer gateway config, cross-cluster Secrets, and
-  `ConsumerGateway` CRD.
+- [Developing: Conventions](developing/conventions.md) — shared Praxis coding,
+  tracing, testing, and review conventions.
+- [Developing: Type Design](developing/type-design.md) — shared Praxis guidance
+  for serde, enums, newtypes, and representable states.

@@ -82,6 +82,10 @@ async fn main() {
 /// Returns `Some(handle)` if `GRID_SWIM_BIND_ADDR` is set and the runtime
 /// starts successfully.  Returns `None` when the variable is absent,
 /// unparseable, or the bind fails (all logged at error level).
+#[expect(
+    clippy::too_many_lines,
+    reason = "sequential env-var parsing + runtime startup; splitting would obscure the startup sequence"
+)]
 async fn maybe_start_swim() -> Option<Arc<swim_runtime::SwimHandle>> {
     let addr_str = std::env::var("GRID_SWIM_BIND_ADDR").ok()?;
     let bind_addr = match addr_str.parse() {
@@ -94,11 +98,15 @@ async fn maybe_start_swim() -> Option<Arc<swim_runtime::SwimHandle>> {
     let advertise_addr = parse_optional_socket_addr_env("GRID_SWIM_ADVERTISE_ADDR");
     let seeds = parse_socket_addr_list_env("GRID_SWIM_SEEDS");
     let site_name = std::env::var("GRID_SWIM_SITE_NAME").unwrap_or_else(|_| hostname_or_default());
+    let gateway_address = std::env::var("GRID_GATEWAY_ADDRESS")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
     let cfg = SwimConfig {
         bind_addr,
         advertise_addr,
         site_name,
         seeds,
+        gateway_address,
     };
     match swim_runtime::start(cfg).await {
         Ok(handle) => {

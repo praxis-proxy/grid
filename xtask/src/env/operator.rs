@@ -333,11 +333,17 @@ pub(crate) const SITE_JOIN_LABEL_KEY: &str = "grid.praxis-proxy.io/sjd-site";
 /// validation harness.  It is not connected to during the test.
 pub(crate) const SITE_JOIN_PRIMARY_EGRESS: &str = "172.18.0.4:8443";
 
-/// Egress address for the joining site (Kind west-cluster node IP + TLS port).
-pub(crate) const SITE_JOIN_JOINING_EGRESS: &str = "172.18.0.5:8443";
-
 /// Timeout for polling `GridSite` phase transitions.
-pub(crate) const SITE_JOIN_PHASE_POLL_TIMEOUT: Duration = Duration::from_secs(30);
+///
+/// 60 s covers two back-to-back reconcile windows plus the 5 s TCP probe timeout
+/// in the `GridSite` controller.  The assertion itself (e.g. `Connecting`) is not
+/// weakened — a longer window is required because the `Discovered → Connecting`
+/// transition depends on the `GridNetwork` controller applying the egress spec,
+/// which the `GridSite` controller then reconciles.  The primary anti-flakiness
+/// measure is the cleanup in [`cleanup_site_join_resources`], which removes stale
+/// auto-discovered `GridSite` resources that would otherwise start the controller
+/// in an error-retry loop and consume most of the budget before the new site appears.
+pub(crate) const SITE_JOIN_PHASE_POLL_TIMEOUT: Duration = Duration::from_secs(60);
 
 // ---------------------------------------------------------------------------
 // Failover / lost-peer validation constants
@@ -658,12 +664,17 @@ pub(crate) fn spawn_operator(context: &str) -> Result<Child, Box<dyn std::error:
     clippy::too_many_lines,
     reason = "kubeconfig export + process spawn + sleep: splitting obscures the startup contract"
 )]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each argument maps to a distinct operator env var; a wrapper struct would obscure the address model"
+)]
 pub(crate) fn spawn_operator_with_swim_for_context(
     context: &str,
     bind_addr: &str,
     advertise_addr: &str,
     site_name: &str,
     seeds: &str,
+    gateway_address: Option<&str>,
 ) -> Result<Child, Box<dyn std::error::Error>> {
     // Ensure the operator binary is current before executing it directly.
     // This call is incremental (cargo skips recompilation if sources are
@@ -706,8 +717,8 @@ pub(crate) fn spawn_operator_with_swim_for_context(
     // environment forwarding behaviour under `cargo xtask`.
     // ensure_operator_binary_built() above guarantees the binary exists and is current.
     let operator_bin = operator_binary_path();
-    let child = Command::new(&operator_bin)
-        .env("KUBECONFIG", &kubeconfig_path)
+    let mut cmd = Command::new(&operator_bin);
+    cmd.env("KUBECONFIG", &kubeconfig_path)
         .env("GRID_SWIM_BIND_ADDR", bind_addr)
         .env("GRID_SWIM_ADVERTISE_ADDR", advertise_addr)
         .env("GRID_SWIM_SITE_NAME", site_name)
@@ -715,8 +726,11 @@ pub(crate) fn spawn_operator_with_swim_for_context(
         .env("RUST_LOG", "info")
         .stdin(Stdio::null())
         .stdout(Stdio::from(log_file))
-        .stderr(Stdio::from(log_file2))
-        .spawn()?;
+        .stderr(Stdio::from(log_file2));
+    if let Some(gw) = gateway_address.filter(|s| !s.is_empty()) {
+        cmd.env("GRID_GATEWAY_ADDRESS", gw);
+    }
+    let child = cmd.spawn()?;
     #[expect(
         clippy::disallowed_methods,
         reason = "deliberate fixed wait for operator startup before the caller continues"
@@ -748,10 +762,9 @@ pub(crate) fn reserve_local_udp_addr() -> Result<SocketAddr, Box<dyn std::error:
     Ok(addr)
 }
 
-#[expect(
-    clippy::disallowed_methods,
-    reason = "spawn + settle sleep in xtask; no async runtime available"
-)]
+/// Default data-plane gateway port used in site-join SWIM tests.
+pub(crate) const SITE_JOIN_GATEWAY_PORT: u16 = 19080;
+
 /// Spawn the Grid operator with SWIM membership enabled.
 ///
 /// Equivalent to [`spawn_operator`] but also sets:
@@ -759,12 +772,22 @@ pub(crate) fn reserve_local_udp_addr() -> Result<SocketAddr, Box<dyn std::error:
 /// - `GRID_SWIM_ADVERTISE_ADDR` — address peers use to reach this node
 /// - `GRID_SWIM_SITE_NAME` — stable site identity (must match `GridSite.metadata.name`)
 /// - `GRID_SWIM_SEEDS` — comma-separated seed peer addresses (empty = no seeds)
+/// - `GRID_GATEWAY_ADDRESS` — optional data-plane gateway address (omitted if `None` or empty)
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each argument maps to a distinct operator env var; a wrapper struct would obscure the address model"
+)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "spawn + settle sleep in xtask; no async runtime available"
+)]
 pub(crate) fn spawn_operator_with_swim(
     context: &str,
     bind_addr: &str,
     advertise_addr: &str,
     site_name: &str,
     seeds: &str,
+    gateway_address: Option<&str>,
 ) -> Result<Child, Box<dyn std::error::Error>> {
     eprintln!("  setting kubectl context to {context}...");
     Command::new("kubectl")
@@ -772,14 +795,17 @@ pub(crate) fn spawn_operator_with_swim(
         .status()?;
 
     eprintln!("  spawning SWIM operator (site={site_name}, bind={bind_addr}, seeds={seeds:?})...");
-    let child = Command::new("cargo")
-        .args(["run", "--quiet", "-p", "operator", "--bin", "operator"])
+    let mut cmd = Command::new("cargo");
+    cmd.args(["run", "--quiet", "-p", "operator", "--bin", "operator"])
         .env("GRID_SWIM_BIND_ADDR", bind_addr)
         .env("GRID_SWIM_ADVERTISE_ADDR", advertise_addr)
         .env("GRID_SWIM_SITE_NAME", site_name)
         .env("GRID_SWIM_SEEDS", seeds)
-        .stdin(Stdio::null())
-        .spawn()?;
+        .stdin(Stdio::null());
+    if let Some(gw) = gateway_address.filter(|s| !s.is_empty()) {
+        cmd.env("GRID_GATEWAY_ADDRESS", gw);
+    }
+    let child = cmd.spawn()?;
     // Brief pause so the operator establishes watches and starts its SWIM listener.
     std::thread::sleep(Duration::from_secs(3));
     Ok(child)
@@ -951,6 +977,55 @@ pub(crate) fn wait_for_gridnetwork_active(
     }
 }
 
+/// Snapshot of a `GridNetwork` status read from the cluster.
+///
+/// Returned by [`wait_for_gridnetwork_status`] for inspecting status before
+/// SWIM convergence — e.g. to verify isolation when no seeds are configured.
+pub(crate) struct GridNetworkStatusSnapshot {
+    /// Current lifecycle phase (e.g. `"Pending"`, `"Active"`).
+    pub phase: String,
+    /// Number of connected SWIM sites reported by the operator.
+    pub connected_sites: u32,
+}
+
+/// Poll until the `GridNetwork` has been reconciled at least once
+/// (`status.observedGeneration > 0`).
+///
+/// Unlike [`wait_for_gridnetwork_active`], this function does not require the network
+/// to reach `Active`.  It returns as soon as the operator has written a status.
+/// Use it to inspect isolation state when seeds are intentionally empty.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "synchronous poll loop in xtask harness; not in async context"
+)]
+pub(crate) fn wait_for_gridnetwork_status(
+    context: &str,
+    name: &str,
+    timeout: Duration,
+) -> Result<GridNetworkStatusSnapshot, Box<dyn std::error::Error>> {
+    let start = Instant::now();
+    let resource = format!("gridnetworks/{name}");
+    loop {
+        let gen_str = kubectl_jsonpath(context, &resource, "{.status.observedGeneration}").unwrap_or_default();
+        let observed_gen: i64 = gen_str.parse().unwrap_or(0);
+
+        if observed_gen > 0 {
+            let phase = kubectl_jsonpath(context, &resource, "{.status.phase}").unwrap_or_default();
+            let sites_str = kubectl_jsonpath(context, &resource, "{.status.connectedSites}").unwrap_or_default();
+            let connected_sites: u32 = sites_str.parse().unwrap_or(0);
+            return Ok(GridNetworkStatusSnapshot { phase, connected_sites });
+        }
+
+        if start.elapsed() >= timeout {
+            return Err(
+                format!("timeout waiting for GridNetwork {name} first reconcile (observedGeneration>0)").into(),
+            );
+        }
+        eprintln!("  waiting for GridNetwork {name} first reconcile (observedGeneration={observed_gen})...");
+        std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
 /// Verify that a `GridNetwork` `phase` is `"Active"` and `connected_sites > 0`.
 ///
 /// This is the pure assertion called after [`wait_for_gridnetwork_active`]
@@ -1073,6 +1148,7 @@ pub(crate) fn wait_for_gridnetwork_distributed_state(
             .into());
         }
         eprintln!("  waiting for GridNetwork {name} distributedProviderCount>0 (observed={count})...");
+        bump_gridnetwork(context, name)?;
         std::thread::sleep(POLL_INTERVAL);
     }
 }
@@ -2161,6 +2237,154 @@ pub(crate) fn verify_consumer_praxis_yaml(
     Ok(())
 }
 
+/// Read the `status.consumerConfigStatus` JSON array from a `GridNetwork`.
+///
+/// Returns the raw JSON string (may be empty if the field is not yet populated).
+pub(crate) fn read_gridnetwork_consumer_config_status(
+    context: &str,
+    network_name: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let out = Command::new("kubectl")
+        .args([
+            "--context",
+            context,
+            "get",
+            &format!("gridnetwork/{network_name}"),
+            "-o",
+            "jsonpath={.status.consumerConfigStatus}",
+        ])
+        .output()?;
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
+}
+
+/// Assert that the `GridNetwork` status reports `Rendered` for the expected consumer config.
+///
+/// Reads `status.consumerConfigStatus[]` and asserts:
+/// - An entry with `gatewayName == expected_gateway` exists.
+/// - Its `phase` is `"Rendered"`.
+/// - Its `configMapName` matches `expected_config_map`.
+/// - The status JSON does not contain the API token value (token-safety invariant).
+#[expect(
+    clippy::too_many_lines,
+    reason = "sequential validation steps: read → token-absent check → JSON parse → entry lookup → phase check → configmap check"
+)]
+pub(crate) fn verify_consumer_config_status_rendered(
+    context: &str,
+    network_name: &str,
+    expected_gateway: &str,
+    expected_config_map: &str,
+    api_token: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let raw = read_gridnetwork_consumer_config_status(context, network_name)?;
+
+    if raw.is_empty() {
+        return Err(format!(
+            "GridNetwork/{network_name} status.consumerConfigStatus is empty; \
+             operator may not have reconciled yet or the field is not populated"
+        )
+        .into());
+    }
+
+    // Security invariant: token bytes must never appear in status.
+    if raw.contains(api_token) {
+        return Err(format!(
+            "SECURITY VIOLATION: token bytes found in GridNetwork/{network_name} \
+             status.consumerConfigStatus — status must never contain credential token bytes"
+        )
+        .into());
+    }
+
+    let statuses: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| format!("failed to parse consumerConfigStatus JSON from {network_name}: {e}"))?;
+
+    let entries = statuses
+        .as_array()
+        .ok_or_else(|| format!("GridNetwork/{network_name} status.consumerConfigStatus is not a JSON array"))?;
+
+    let entry = entries
+        .iter()
+        .find(|e| e["gatewayName"].as_str() == Some(expected_gateway))
+        .ok_or_else(|| {
+            format!(
+                "no consumerConfigStatus entry for gateway {expected_gateway:?} in \
+                 GridNetwork/{network_name}; entries: {raw}"
+            )
+        })?;
+
+    let phase = entry["phase"].as_str().unwrap_or("(missing)");
+    if phase != "Rendered" {
+        let reason = entry["reason"].as_str().unwrap_or("");
+        let message = entry["message"].as_str().unwrap_or("");
+        return Err(format!(
+            "consumer config status for gateway {expected_gateway:?} is {phase:?} \
+             (reason={reason:?}, message={message:?}); expected Rendered"
+        )
+        .into());
+    }
+
+    let actual_cm = entry["configMapName"].as_str().unwrap_or("(missing)");
+    if actual_cm != expected_config_map {
+        return Err(
+            format!("consumer config status configMapName is {actual_cm:?}; expected {expected_config_map:?}").into(),
+        );
+    }
+
+    eprintln!(
+        "  [PASS] GridNetwork/{network_name} status.consumerConfigStatus: \
+         gateway={expected_gateway:?} phase=Rendered configMapName={expected_config_map:?}; \
+         token absent from status JSON"
+    );
+    Ok(())
+}
+
+/// Poll until `GridNetwork.status.consumerConfigStatus[]` reports `Rendered`
+/// for the expected consumer config.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "synchronous xtask poll loop; no async runtime available"
+)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "synchronous xtask poll over one explicit status assertion; grouping args would obscure the call site"
+)]
+pub(crate) fn wait_for_consumer_config_status_rendered(
+    context: &str,
+    network_name: &str,
+    expected_gateway: &str,
+    expected_config_map: &str,
+    api_token: &str,
+    timeout: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let start = Instant::now();
+
+    loop {
+        let last_err = match verify_consumer_config_status_rendered(
+            context,
+            network_name,
+            expected_gateway,
+            expected_config_map,
+            api_token,
+        ) {
+            Ok(()) => return Ok(()),
+            Err(e) => e.to_string(),
+        };
+
+        if start.elapsed() >= timeout {
+            return Err(format!(
+                "timeout waiting for GridNetwork/{network_name} consumerConfigStatus \
+                 gateway={expected_gateway:?} phase=Rendered; last error: {last_err}"
+            )
+            .into());
+        }
+
+        eprintln!(
+            "  waiting for GridNetwork/{network_name} consumerConfigStatus \
+             gateway={expected_gateway:?} phase=Rendered ({last_err})..."
+        );
+        std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
 /// Verify that the scoring-backed candidate order is visible in the overlay.
 ///
 /// Asserts that `api_cluster` appears after at least one `local_cluster` candidate,
@@ -2573,6 +2797,79 @@ pub(crate) fn apply_swim_overlay_test_fixtures(
     eprintln!(
         "  [OK] SWIM overlay fixtures applied (network={SWIM_OVERLAY_NETWORK}, \
          provider={SWIM_OVERLAY_PROVIDER}, model={SWIM_OVERLAY_MODEL})"
+    );
+    Ok(())
+}
+
+/// Apply a minimal `GridSite` with `Active` phase for routing eligibility testing.
+///
+/// Used in eligibility proofs to make a CRDT-sourced site eligible for routing.
+/// The `GridSite` has `spec.egress.address` set to ensure the `GridSite` controller
+/// advances it to Connecting and does not immediately demote it.
+pub(crate) fn apply_active_gridsite_for_eligibility(
+    context: &str,
+    site_k8s_name: &str,
+    network_ref: &str,
+    egress_addr: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Apply spec first, then patch status to Active.
+    let spec = serde_json::to_string_pretty(&serde_json::json!({
+        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "kind": "GridSite",
+        "metadata": { "name": site_k8s_name },
+        "spec": {
+            "gridNetworkRef": network_ref,
+            "egress": { "address": egress_addr, "tls": { "mode": "Mutual" } }
+        }
+    }))
+    .unwrap_or_else(|e| {
+        eprintln!("GridSite {site_k8s_name} spec serialization failed: {e}");
+        std::process::exit(1);
+    });
+    kubectl::apply_manifest(context, &spec)?;
+    patch_gridsite_phase(context, site_k8s_name, "Active")?;
+    eprintln!(
+        "  [OK] GridSite {site_k8s_name:?} applied with Active phase \
+         (network={network_ref:?}, egress={egress_addr:?})"
+    );
+    Ok(())
+}
+
+/// Assert that the overlay for `network/gw` has NO candidate with `site == excluded_site`.
+///
+/// Used to prove that CRDT provider records from a specific site with no Active `GridSite`
+/// are excluded from the routing overlay (routing eligibility gate).
+///
+/// `excluded_site` is the SWIM site identity of the peer whose CRDT providers should be absent.
+/// This is more precise than checking `site != primary` because local providers may use
+/// fallback site names (e.g., the provider name) when no `GridSite` matches.
+pub(crate) fn assert_no_crdt_candidates_for_site(
+    context: &str,
+    network: &str,
+    gw: &str,
+    excluded_site: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let overlay = read_overlay_configmap(context, network, gw, "default")?;
+    let candidates = overlay
+        .get("candidates")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("overlay missing candidates array")?;
+
+    let has_excluded = candidates
+        .iter()
+        .any(|c| c.get("site").and_then(serde_json::Value::as_str) == Some(excluded_site));
+
+    if has_excluded {
+        return Err(format!(
+            "routing eligibility violation: overlay contains a candidate with site={excluded_site:?} \
+             from a site without an Active GridSite; SWIM gossip must not be sufficient for routing"
+        )
+        .into());
+    }
+
+    eprintln!(
+        "  [PASS] routing eligibility: no overlay candidate with site={excluded_site:?} \
+         (CRDT providers from non-Active GridSite excluded)"
     );
     Ok(())
 }
@@ -3628,8 +3925,13 @@ pub(crate) fn wait_for_auto_gridsite(
 /// Verify spec and status fields of an auto-discovered `GridSite`.
 ///
 /// Checks `spec.gridNetworkRef`, `spec.egress.address`, and `status.phase`.
-/// The phase is expected to be `Discovered` since the operator sets it from
-/// the SWIM Alive membership signal.
+/// The expected phase is supplied by the caller; use [`wait_for_gridsite_phase`]
+/// before calling this to ensure the operator has had time to advance the phase.
+///
+/// For auto-discovered sites with a non-empty advertised gateway address, the `GridSite`
+/// controller advances the phase from `Discovered` → `Connecting` automatically,
+/// so `expected_phase` should be `"Connecting"` in E2E tests that wait long enough
+/// for the second reconcile.
 #[expect(
     clippy::too_many_lines,
     reason = "kubectl fetch + three field validations + diagnostic messages"
@@ -3638,6 +3940,7 @@ pub(crate) fn verify_auto_gridsite_fields(
     context: &str,
     site_name: &str,
     expected_network: &str,
+    expected_phase: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let out = Command::new("kubectl")
         .args([
@@ -3673,20 +3976,84 @@ pub(crate) fn verify_auto_gridsite_fields(
     if egress.is_empty() {
         return Err(format!(
             "auto-discovered GridSite {site_name:?}: spec.egress.address is empty; \
-             expected the SWIM advertised address"
+             expected the advertised gateway address"
         )
         .into());
     }
-    if phase != "Discovered" {
+    if phase != expected_phase {
         return Err(format!(
             "auto-discovered GridSite {site_name:?}: status.phase={phase:?} \
-             (expected \"Discovered\")"
+             (expected {expected_phase:?})"
         )
         .into());
     }
     eprintln!(
         "  [PASS] auto-discovered GridSite {site_name:?}: \
          gridNetworkRef={network:?}, egress={egress:?}, phase={phase:?}"
+    );
+    Ok(())
+}
+
+/// Assert that a `GridSite`'s `spec.egress.address` equals the expected gateway address
+/// and is distinct from the SWIM UDP bind address.
+///
+/// Hard-fails if the egress address equals the SWIM UDP address — that would indicate
+/// the gateway address was not propagated through the SWIM state broadcast and the site
+/// received the SWIM endpoint instead of the data-plane gateway address.
+#[expect(
+    clippy::too_many_lines,
+    reason = "sequential kubectl fetch + three defensive checks + diagnostic eprintln; splitting would obscure the invariant"
+)]
+pub(crate) fn verify_auto_gridsite_egress(
+    context: &str,
+    site_name: &str,
+    expected_gateway_addr: &str,
+    swim_udp_addr: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let out = Command::new("kubectl")
+        .args([
+            "--context",
+            context,
+            "get",
+            "gridsites",
+            site_name,
+            "-o",
+            "jsonpath={.spec.egress.address}",
+        ])
+        .output()?;
+    if !out.status.success() {
+        return Err(format!(
+            "kubectl get gridsites/{site_name} egress address failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        )
+        .into());
+    }
+    let actual = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    if actual.is_empty() {
+        return Err(format!(
+            "GridSite {site_name:?}: spec.egress.address is empty; \
+             expected gateway address {expected_gateway_addr:?}"
+        )
+        .into());
+    }
+    if actual == swim_udp_addr {
+        return Err(format!(
+            "GridSite {site_name:?}: spec.egress.address={actual:?} equals the SWIM UDP address; \
+             expected gateway address {expected_gateway_addr:?} — \
+             the data-plane gateway address was not propagated through SWIM"
+        )
+        .into());
+    }
+    if actual != expected_gateway_addr {
+        return Err(format!(
+            "GridSite {site_name:?}: spec.egress.address={actual:?}; \
+             expected {expected_gateway_addr:?}"
+        )
+        .into());
+    }
+    eprintln!(
+        "  [PASS] GridSite {site_name:?}: egress.address={actual:?} \
+         matches gateway address (distinct from SWIM UDP {swim_udp_addr:?})"
     );
     Ok(())
 }
@@ -3707,6 +4074,9 @@ pub(crate) fn cleanup_site_join_resources(context: &str) -> Result<(), Box<dyn s
     delete_cluster_resource(context, "gridsite", SITE_JOIN_PRIMARY_SITE)?;
     delete_cluster_resource(context, "gridsite", SITE_JOIN_JOINING_SITE)?;
     delete_cluster_resource(context, "gridsite", SITE_JOIN_WRONG_SITE)?;
+    // Delete any auto-discovered GridSites for this network so stale resources
+    // from a previous run do not interfere with phase-transition timing.
+    cleanup_auto_discovered_gridsites_for_network(context, SITE_JOIN_NETWORK);
     delete_cluster_resource(context, "gridnetwork", SITE_JOIN_NETWORK)?;
     delete_cluster_resource(context, "gridnetwork", SITE_JOIN_WRONG_NETWORK)?;
     eprintln!("  [OK] stale site-join-discovery resources removed from {context}");

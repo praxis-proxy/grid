@@ -279,6 +279,66 @@ cert identities are stable, as organization matching
 is weaker — any cert signed by a trusted CA with the
 correct `O=` value is accepted.
 
+### Authentication vs authorization
+
+Authentication answers: "is this peer really the Grid site or gateway it claims
+to be?"  In the data plane, this is handled by mTLS peer identity and certificate
+validation.
+
+Authorization answers: "is this authenticated peer allowed to participate in
+this Grid or carry this traffic?"  Grid policy and gateway trust configuration
+decide that boundary.
+
+SWIM discovery is neither authentication nor authorization.  A peer discovered
+through gossip must not become routable solely because it is alive.  The control
+plane can record discovered sites and trust material, but the provider gateway
+still enforces peer identity on every request.
+
+### Public certificate exchange
+
+The Grid operator propagates a site's public certificate PEM to peers via SWIM
+state broadcasts when the local `GridNetwork` has `spec.tls.siteSecretRef`
+configured.  Before storage, the receiving operator runs a structural check:
+
+- Input containing `PRIVATE KEY` markers is discarded and logged at error level.
+  Private key material must never enter status fields or SWIM broadcasts.
+- Input without a `-----BEGIN CERTIFICATE-----` header is rejected and recorded
+  as `TrustMaterialInvalid` in `GridSite.status.reason`.
+- Input with a valid `CERTIFICATE` header passes the structural check and is
+  stored in `GridSite.status.publicCertPem` with reason `TrustMaterialPresent`.
+
+This structural check is **not** cryptographic verification.  It does not parse
+DER bytes as X.509, check the issuer or validity period, or validate the signature
+against a CA.
+
+Presence of `publicCertPem` with reason `TrustMaterialPresent` indicates:
+- The remote site shared a PEM with a `CERTIFICATE` header.
+- No private-key markers were detected.
+- The structural check passed.
+
+Presence of `publicCertPem` does **not** indicate:
+- The certificate has been chain-verified against a trusted CA.
+- The remote site is authenticated or authorized for routing.
+- The mTLS handshake has succeeded.
+
+**Trust verification gap:** The current operator does not chain-verify received
+certificates against the local Grid CA.  The `certs` crate does not include
+X.509 chain verification — it only supports cert generation and CA/key matching.
+Chain verification would require an X.509 parsing library.  Until implemented,
+`publicCertPem` is informational, `TrustMaterialPresent` is a structural marker,
+and Active must be set by the deployment workflow after out-of-band verification.
+
+Private keys are never broadcast.  The operator reads only the `tls.crt` key from
+the site certificate Secret — the `tls.key` key is never accessed for broadcast
+purposes.  The gateway enforces mTLS identity on every request independently of
+the control-plane `publicCertPem` field.
+
+**Routing eligibility:** Remote CRDT provider records are included in the routing overlay
+only when the source `GridSite.status.phase == Active`.  Records from peers in any other
+phase (`Discovered`, `Connecting`, `Unreachable`, or missing) are excluded at the
+control-plane overlay level.  Data-plane mTLS at the provider gateway enforces peer
+identity on every request independently of the control-plane phase.
+
 ## Separation of Concerns
 
 | Who | What |

@@ -50,16 +50,31 @@ The GridNetwork controller:
 
 ### CRD-driven seeds
 
-`spec.seeds` is now **operator-consumed**: on every `GridNetwork` reconcile the
+`spec.seeds` is **operator-consumed**: on every `GridNetwork` reconcile the
 controller parses the seed list, filters invalid addresses (logged at `warn`,
 no reconcile failure), removes the local advertise address to prevent self-
 announce noise, deduplicates, and calls `SwimHandle::announce_seeds` to deliver
 the batch to the running SWIM event loop.  Re-announcing to already-connected
 peers is idempotent — foca ignores redundant joins.
 
-Startup seeds from `GRID_SWIM_SEEDS` (env var, set by `xtask`) and CRD seeds
-are additive.  The env var seeds run once at startup; CRD seeds run on every
-reconcile so dynamically added addresses take effect without an operator restart.
+Startup seeds from `GRID_SWIM_SEEDS` (env var) and CRD seeds are additive.
+The env var seeds are applied once at startup; CRD seeds are applied on every
+reconcile, so dynamically added addresses take effect without an operator restart.
+
+**Runtime update contract**
+
+| Change to `spec.seeds` | Effect |
+|---|---|
+| Seed added | Announced to SWIM on the next reconcile; join initiated |
+| Seed removed | Logged; no active disconnect — SWIM failure detection ages the peer out naturally |
+| Seeds unchanged | Re-announced idempotently; no side effects |
+
+Adding a seed requires no operator restart.  The new address is SWIM-joined within
+one reconcile cycle (~300 s default requeue, or sooner if a watch event fires).
+
+Removing a seed does not disconnect the peer.  The removed peer remains in SWIM
+membership until it stops responding to probes and is declared `Suspect` then
+`Dead` by the SWIM protocol.
 
 **Global-runtime semantics**
 
@@ -76,11 +91,28 @@ skipped for the current reconcile and retried on the next
 (`REQUEUE_INTERVAL = 300 s`).  Seeds are not guaranteed to be applied
 immediately under heavy broadcast load.
 
-**Limitations**
-- Seed removal is not tracked: removing an address from `spec.seeds` stops
-  re-announcing to it but does not evict an already-connected peer.
-- Seeds must be `IP:port` socket addresses; DNS names are not resolved.
-  Example valid value: `10.0.0.2:7946`.
+**Seed format**
+Seeds must be `IP:port` socket addresses.  DNS names are not resolved.
+Example: `10.0.0.2:7946`.  Invalid addresses are skipped and logged at `warn`
+level; the reconcile does not fail.
+
+**Troubleshooting seed changes**
+
+*New seed not joining:*
+- Verify the address is a valid `IP:port`.
+- Check the operator log for `announcing CRD seeds to SWIM runtime` or
+  `new CRD seeds added` — if absent, the reconcile may not have fired yet.
+- Check for `failed to queue CRD seeds for SWIM announcement` at `warn` level,
+  indicating a channel-full retry.
+- Verify the remote operator is running with `GRID_SWIM_BIND_ADDR` set to the
+  expected address.
+
+*Removed seed still shows as connected:*
+- Expected behavior.  SWIM does not actively disconnect on seed removal.
+- Wait for the SWIM probe failure window (default: ~10 s `suspicionTimeout`).
+  The peer is declared `Dead` and `GridNetwork.status.connectedSites` decreases.
+- If the remote operator is still running, it will rejoin as `Alive` again because
+  SWIM membership is peer-to-peer — seeds are only needed for initial discovery.
 
 **Phase progression:** `GridNetwork Active` is set when
 the SWIM runtime reports at least one `Alive` peer in
@@ -113,44 +145,99 @@ discovered peer.
 
 `GridSite` status: `phase: Discovered`
 
-## 4. mTLS Certificate Exchange
+## 4. Gateway Address and Trust Bootstrap
 
-For each Discovered `GridSite`:
-1. Local operator sends its public cert PEM via SWIM
-   piggyback broadcast (foca `BroadcastHandler`)
-2. Remote operator receives and stores the cert
-3. Each side appends the other's cert to their trust
-   bundle Secret
+SWIM discovery proves that a peer is participating in gossip.  It does not
+authorize that peer for request routing.
 
-`GridSite` status: `phase: Connecting`
+### SWIM bootstrap phases
+
+The trust bootstrap for a remote site progresses through these steps:
+
+1. **SWIM discovery** — the peer is observed as Alive in SWIM membership.
+   Phase: `Discovered`.  No trust established.
+
+2. **Gateway address known** — the remote operator advertises `GRID_GATEWAY_ADDRESS`
+   via SWIM state broadcast.  The local operator stores it in `GridSite.spec.egress.address`.
+   Phase: `Connecting`.  No trust established.
+
+3. **Public cert material received** — the remote operator broadcasts its public site
+   certificate PEM.  The operator validates the PEM structure (rejects private-key markers;
+   checks for `CERTIFICATE` header) and stores it in `GridSite.status.publicCertPem`.
+   Reason: `TrustMaterialPresent`.  Not chain-verified; not trusted.
+
+4. **TCP gateway probe passes** — the `GridSite` controller can reach the gateway
+   address.  Reason: `TrustMaterialPresent` (if cert received) or `TrustMaterialMissing`
+   (if cert not yet received).  Phase stays `Connecting`.
+
+5. **Trust policy verified** — advancing to `Active` requires the deployment workflow to
+   verify the remote cert against an explicit trust rule (CA chain, fingerprint pin, or
+   allow-list policy) and set the phase manually.
+   See [Authentication and Access Policy](auth.md) for the trust boundary.
+
+6. **Data-plane mTLS enforced** — the provider gateway enforces peer identity via mTLS
+   on every request, independent of the control-plane phase.
+
+### Authentication vs authorization
+
+| Concept | Question it answers | Grid mechanism |
+|---|---|---|
+| Authentication | "Is this peer really the site it claims to be?" | Gateway mTLS peer identity and certificate validation |
+| Authorization | "Is this authenticated peer allowed to participate in this Grid or receive/send this traffic?" | Grid trust policy, allowed peer identity, and gateway enforcement |
+
+A peer must satisfy both.  A SWIM peer must never become routable solely because
+it gossiped successfully.
+
+### Security boundary
+
+- SWIM membership is discovery, not authorization.
+- TCP reachability proves an address accepts connections, not identity.
+- `publicCertPem` present means the PEM structure is valid and no private-key markers
+  were detected.  It does not prove the cert is signed by a trusted CA or that
+  the peer is authorized.
+- Private keys, credential tokens, and Secret data must never be written to
+  `GridSite` status, `GridNetwork` status, overlays, generated ConfigMaps, or logs.
+- The operator does not copy Kubernetes Secrets across clusters as part of site discovery.
+- The provider gateway still enforces peer identity on every request with mTLS,
+  independently of `publicCertPem` status.
+
+### Routing eligibility
+
+`GridSite.status.phase == Active` is the control-plane gate for remote CRDT provider records.
+Provider records advertised by a SWIM peer are included in the routing overlay only when
+the corresponding `GridSite` is `Active`.  Peers in `Discovered`, `Connecting`, or any
+other phase are excluded.  Peers with no matching `GridSite` are also excluded (fail-closed).
+
+Setting `Active` is the responsibility of the deployment workflow — it requires explicit
+trust verification before the operator advances a site to `Active`.  Data-plane mTLS
+at the provider gateway enforces peer identity on every request independently of
+the control-plane phase.
 
 ## 5. Connectivity Verification
 
-The operator verifies three conditions:
+The current `GridSite` controller verifies gateway reachability with a TCP probe
+against `spec.egress.address`.
 
-| Condition | Check |
-|-----------|-------|
-| `SWIMReachable` | SWIM probes succeeding |
-| `MTLSEstablished` | mTLS handshake passes |
-| `DataPlaneHealthy` | HTTP ping through Praxis |
+| Condition | Current check |
+|-----------|---------------|
+| `SWIMReachable` | SWIM membership reports the peer Alive |
+| `GatewayAddressKnown` | `spec.egress.address` is non-empty |
+| `GatewayReachable` | TCP connect to `spec.egress.address` succeeds |
 
-A `connectivityPolicy` field on `GridNetwork`
-(default: `requireAll: true`) controls how strictly the
-operator evaluates partial connectivity and site-type
-specific checks.
+mTLS trust verification and request-time authorization are enforced by the
+gateway data plane.  Advancing a site to `Active` requires the deployment
+workflow to establish trust and data-plane readiness.
 
 ## 6. Capability Negotiation
 
-Before reaching Active, sites exchange capability
-summaries via SWIM piggyback:
-- Which provider types they offer (inference, tools,
-  agents)
-- Provider counts per type
+Sites publish capability and provider state through Grid control-plane records
+and CRDT-over-SWIM propagation.  Capability information can include models,
+tools, agents, and provider availability signals.
 
-The `GridSite` status `capabilities` field is updated.
-At least one provider type must be available.
-
-`GridSite` status: `phase: Active`
+The `GridSite` status `capabilities` field records broad site capability
+classes.  A site should only be treated as fully usable after discovery,
+gateway reachability, trust establishment, and data-plane readiness are all
+satisfied.
 
 ## 7. Register Providers
 
@@ -269,6 +356,207 @@ Praxis `ConfigMap`.
 
 See [Auth & Policy](auth.md) for workload access
 patterns and authentication strategies.
+
+## GridSite trust bootstrap
+
+### Public certificate exchange
+
+When a `GridNetwork` has `spec.tls.siteSecretRef` configured, the operator reads
+the public site certificate (`tls.crt`) from that Secret on each reconcile and
+broadcasts it to SWIM peers.  Remote peers store the received certificate in
+`GridSite.status.publicCertPem`.
+
+To verify that a remote site's public certificate has been received:
+
+```console
+kubectl get gridsite <site-name> -o jsonpath='{.status.publicCertPem}'
+```
+
+A non-empty value means the remote operator is advertising its site certificate.
+A `Connecting` site in the `TrustMaterialPresent` state has both:
+- A reachable gateway address (TCP probe succeeded)
+- A received public certificate PEM
+
+A site in `TrustMaterialMissing` has a reachable gateway but no certificate.
+Configure `spec.tls.siteSecretRef` on the remote `GridNetwork` to enable certificate advertisement.
+
+### Security boundary
+
+The public certificate recorded in `status.publicCertPem` is **not** automatically
+trusted.  The control plane records received trust material for operator visibility.
+The provider gateway enforces mTLS peer identity and certificate validation on every
+request — the control plane record does not bypass that check.
+
+Private keys are never included in SWIM broadcasts.  The operator reads only the
+public certificate (`tls.crt`) from the site Secret, not the private key (`tls.key`).
+
+## GridSite gateway address configuration
+
+Set `GRID_GATEWAY_ADDRESS` on the operator process to advertise the data-plane
+gateway endpoint to SWIM peers.  This address is propagated through SWIM state
+broadcasts and used by the primary operator to populate `GridSite.spec.egress.address`
+for auto-discovered sites.
+
+```bash
+# Example: operator running alongside a Praxis gateway on port 8080
+GRID_GATEWAY_ADDRESS=10.0.0.4:8080 ./operator
+```
+
+**Requirements:**
+- Format: `host:port` or `IP:port` (any non-empty string is accepted; the remote
+  operator stores it verbatim in `GridSite.spec.egress.address`)
+- When absent or empty: auto-discovered `GridSite` records have empty
+  `spec.egress.address` and stay in `Discovered` phase
+- This address is separate from `GRID_SWIM_BIND_ADDR` — the SWIM gossip endpoint
+  and the data-plane gateway address are distinct
+
+**Probe behavior:** The `GridSite` controller probes `spec.egress.address` with a
+TCP connect (5-second timeout) on each reconcile.  A successful probe reports
+`reason: GatewayReachable`.  A failed probe reports `reason: GatewayUnreachable`.
+An Active site is demoted to Unreachable when its probe fails.
+
+**Trust behavior:** The TCP probe is not an authentication or authorization
+check.  `GatewayReachable` means the address is reachable; it does not prove the
+remote peer identity.  Use gateway mTLS peer identity enforcement and Grid trust
+policy before treating a site as authorized for traffic.
+
+## GridSite Lifecycle Diagnostics
+
+Use `kubectl get gridsites` to inspect current lifecycle phases:
+
+```console
+kubectl get gridsites
+```
+
+Example output:
+
+```
+NAME                              PHASE        NETWORK
+op-e2e-sjd-net-grid-site-b       Connecting   op-e2e-sjd-net
+```
+
+To see the reason and diagnostic message:
+
+```console
+kubectl get gridsite <name> -o jsonpath='{.status.phase}/{.status.reason}: {.status.message}'
+```
+
+### Phase transitions and their cause
+
+| From | To | Trigger |
+|---|---|---|
+| (new) | Pending | Resource created |
+| Pending | Discovered | `GridNetwork` controller observes SWIM Alive member |
+| Discovered | Connecting | `GridSite` controller: `spec.egress.address` non-empty |
+| Connecting | Active | Set by deployment workflow when trust and data-plane readiness are established |
+
+Security invariant: a SWIM peer must never become routable solely because it
+gossiped successfully.  Discovery, authentication, and authorization are
+separate steps.
+
+### Troubleshooting
+
+**Phase stays Pending after SWIM convergence**
+
+- Check the `GridNetwork` has the label `grid.praxis-proxy.io/auto-discover-sites: "true"`.
+- Check that the `GridNetwork` controller has SWIM running (`GRID_SWIM_BIND_ADDR` env var set).
+- Check `kubectl get gridnetwork <name> -o jsonpath='{.status.connectedSites}'` — must be > 0.
+
+**Phase stays Discovered (not advancing to Connecting)**
+
+- The site has no `spec.egress.address`.  Configure `GRID_GATEWAY_ADDRESS` on the remote
+  operator and wait for the next reconcile to propagate the gateway address through SWIM.
+- Reason will be `GatewayAddressMissing`.
+
+**Phase stays Connecting**
+
+- Check `status.reason`:
+  - `GatewayReachable`: the TCP probe succeeded, but advancing to Active requires mTLS trust
+    verification.  Set Active manually or via the deployment workflow once trust is established.
+  - `GatewayUnreachable`: the TCP probe to `spec.egress.address` failed.  Verify the gateway
+    is running and `GRID_GATEWAY_ADDRESS` is correct on the remote operator.
+  - `GatewayAddressMissing`: no egress address is set.  Configure `GRID_GATEWAY_ADDRESS` on
+    the remote operator.
+
+**Phase is Active, site became Unreachable**
+
+- The TCP probe against `spec.egress.address` failed.  The `GridSite` controller moved the
+  site from Active to Unreachable.  When the gateway becomes reachable again, the site moves
+  to Connecting (reason `GatewayReachable`).  Returning to Active requires reapplying the
+  Active phase via the deployment workflow once the gateway and trust requirements are satisfied.
+
+**RBAC for GridSite status updates**
+
+The `GridSite` and `GridNetwork` controllers both write to `GridSite` status.  The operator's
+`ClusterRole` must include:
+
+```yaml
+- apiGroups: ["grid.praxis-proxy.io"]
+  resources: ["gridsites/status"]
+  verbs: ["get", "patch", "update"]
+```
+
+## Consumer Config RBAC
+
+When `GatewayRef.consumerConfig.enabled: true`, the Grid operator applies a
+`ConfigMap` in the gateway's namespace on every reconcile.  The operator's
+`ServiceAccount` requires the following permissions for each gateway namespace
+used with consumer config:
+
+```yaml
+# ClusterRole (or Role scoped to the target namespace)
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: grid-operator-consumer-config
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "create", "update", "patch"]
+```
+
+Bind this role to the operator's `ServiceAccount` in each namespace where
+consumer gateways reside:
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: grid-operator-consumer-config
+  namespace: praxis-system          # the gateway namespace
+subjects:
+  - kind: ServiceAccount
+    name: grid-operator
+    namespace: grid-system          # the operator namespace
+roleRef:
+  kind: ClusterRole
+  apiGroup: rbac.authorization.k8s.io
+  name: grid-operator-consumer-config
+```
+
+If the gateway namespace is the same as the operator namespace, an existing
+`Role` / `RoleBinding` may already cover this.
+
+### Credential Secret access
+
+The generated `ConfigMap` references credential Secrets by name, namespace, and
+key — it does not read Secret values.  The operator does NOT require `get` access
+to credential Secrets in the gateway namespace for config generation.
+
+The consumer gateway pod needs the credential Secret mounted.  Secret provisioning
+in the consumer cluster is the responsibility of external tooling (platform
+automation, External Secrets, Vault, or a manual process).  The Grid operator does
+not copy Secrets across clusters.
+
+### Cross-cluster limitations
+
+The operator's RBAC controls access within its own cluster.  When the consumer
+gateway runs in a different cluster, the generated `ConfigMap` must be delivered
+externally — the operator cannot write to a remote cluster's API server directly.
+The Kind validation harness (`verify-api-fallback-native`) bridges this gap for
+local testing by reading the generated YAML and re-applying it as
+`praxis-consumer-config` in the consumer cluster.  Production cross-cluster
+delivery requires GitOps, External Secrets, or a similar mechanism.
 
 ## Site Departure
 

@@ -51,6 +51,13 @@ pub enum ConsumerConfigError {
         name: String,
     },
 
+    /// A candidate cluster has no endpoint topology entry.
+    #[error("missing cluster endpoint for {cluster:?}")]
+    MissingClusterEndpoint {
+        /// Candidate cluster name.
+        cluster: String,
+    },
+
     /// JSON serialization failed.
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
@@ -74,7 +81,7 @@ pub enum ConsumerConfigError {
 ///   `/run/secrets/grid-credentials`).
 /// - `cluster_endpoints` — explicit endpoint topology for the `load_balancer` section.  When an entry exists for a
 ///   candidate cluster, the generated `load_balancer` section includes a full cluster entry (address and optional
-///   mTLS). Clusters with no matching entry receive a name-only stub.
+///   mTLS). Every unique candidate cluster must have a matching endpoint entry.
 /// - `tls_cert_mount_path` — mount path for TLS certificates inside the consumer pod.  Used only when rendering mTLS
 ///   cluster entries.
 /// - `listener_port` — HTTP port for the generated listener (`0.0.0.0:{listener_port}`).
@@ -85,6 +92,7 @@ pub enum ConsumerConfigError {
 /// - `overlay.local_site` is blank.
 /// - `credential_mount_base` is blank.
 /// - Any candidate has a blank cluster name.
+/// - Any candidate cluster has no matching endpoint in `cluster_endpoints`.
 #[expect(
     clippy::too_many_lines,
     reason = "sequential validation + three rendering passes; splitting would obscure the overall config shape"
@@ -115,7 +123,7 @@ pub(crate) fn generate_consumer_praxis_config(
     let local_site = yaml_scalar(&overlay.local_site)?;
 
     let credential_inject_section = render_credential_inject(&overlay.candidates, credential_mount_base);
-    let load_balancer_section = render_load_balancer(&overlay.candidates, cluster_endpoints, tls_cert_mount_path);
+    let load_balancer_section = render_load_balancer(&overlay.candidates, cluster_endpoints, tls_cert_mount_path)?;
 
     // Listeners section: one public listener referencing the consumer filter chain.
     let mut config = format!(
@@ -303,14 +311,14 @@ fn render_credential_inject(candidates: &[RoutingCandidate], credential_mount_ba
 /// Render the `load_balancer` filter section.
 ///
 /// Produces one cluster entry per unique `candidate.cluster`, ordered
-/// deterministically.  When a matching entry exists in `cluster_endpoints`,
-/// a full cluster entry is rendered (endpoint address + optional mTLS config).
-/// Clusters without a matching endpoint entry receive a name-only stub.
+/// deterministically.  Every cluster must have a matching entry in
+/// `cluster_endpoints`; otherwise the generated config would be incomplete at
+/// runtime.
 fn render_load_balancer(
     candidates: &[RoutingCandidate],
     cluster_endpoints: &[ClusterEndpointConfig],
     tls_cert_mount_path: &str,
-) -> String {
+) -> Result<String, ConsumerConfigError> {
     // Build a lookup map: cluster name → endpoint config.
     let endpoint_map: BTreeMap<&str, &ClusterEndpointConfig> =
         cluster_endpoints.iter().map(|ep| (ep.cluster.as_str(), ep)).collect();
@@ -320,21 +328,22 @@ fn render_load_balancer(
         .into_iter()
         .map(|cluster_name| {
             let quoted = yaml_scalar(cluster_name).unwrap_or_else(|_| "\"\"".to_owned());
-            if let Some(ep) = endpoint_map.get(cluster_name) {
-                render_cluster_entry(&quoted, ep, tls_cert_mount_path)
-            } else {
-                format!("          - name: {quoted}")
-            }
+            let ep = endpoint_map
+                .get(cluster_name)
+                .ok_or_else(|| ConsumerConfigError::MissingClusterEndpoint {
+                    cluster: cluster_name.to_owned(),
+                })?;
+            Ok(render_cluster_entry(&quoted, ep, tls_cert_mount_path))
         })
-        .collect();
+        .collect::<Result<Vec<_>, ConsumerConfigError>>()?;
 
-    format!(
+    Ok(format!(
         "\n\
          \x20     - filter: load_balancer\n\
          \x20       clusters:\n\
          {}",
         cluster_lines.join("\n")
-    )
+    ))
 }
 
 /// Render a full cluster entry with endpoint address and optional mTLS config.
@@ -485,6 +494,22 @@ mod tests {
     const MOUNT_BASE: &str = "/run/secrets/grid-credentials";
     const SENTINEL_TOKEN: &str = "sk-super-secret-bearer-token-do-not-emit";
 
+    fn endpoint_coverage(overlay: &RoutingOverlay) -> Vec<ClusterEndpointConfig> {
+        overlay
+            .candidates
+            .iter()
+            .map(|c| c.cluster.as_str())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .enumerate()
+            .map(|(idx, cluster)| ClusterEndpointConfig {
+                cluster: cluster.to_owned(),
+                address: format!("127.0.0.1:{}", 30_000 + idx),
+                sni: None,
+            })
+            .collect()
+    }
+
     // -----------------------------------------------------------------------
     // Renderer: basic structure
     // -----------------------------------------------------------------------
@@ -498,7 +523,14 @@ mod tests {
             "gateway-site-a",
             true,
         )]);
-        let yaml = generate_consumer_praxis_config(&overlay, MOUNT_BASE, &[], "/etc/praxis/tls", 8080).unwrap();
+        let yaml = generate_consumer_praxis_config(
+            &overlay,
+            MOUNT_BASE,
+            &endpoint_coverage(&overlay),
+            "/etc/praxis/tls",
+            8080,
+        )
+        .unwrap();
         assert!(yaml.contains("filter: grid_route"), "must include grid_route");
         assert!(yaml.contains("filter: load_balancer"), "must include load_balancer");
         assert!(yaml.contains("filter: json_body_field"), "must include json_body_field");
@@ -519,7 +551,14 @@ mod tests {
             "cluster-a",
             true,
         )]);
-        let yaml = generate_consumer_praxis_config(&overlay, MOUNT_BASE, &[], "/etc/praxis/tls", 8080).unwrap();
+        let yaml = generate_consumer_praxis_config(
+            &overlay,
+            MOUNT_BASE,
+            &endpoint_coverage(&overlay),
+            "/etc/praxis/tls",
+            8080,
+        )
+        .unwrap();
         assert!(
             !yaml.contains("grid_credential_inject"),
             "no credential candidates must produce no grid_credential_inject"
@@ -537,7 +576,14 @@ mod tests {
             "default",
             "token",
         )]);
-        let yaml = generate_consumer_praxis_config(&overlay, MOUNT_BASE, &[], "/etc/praxis/tls", 8080).unwrap();
+        let yaml = generate_consumer_praxis_config(
+            &overlay,
+            MOUNT_BASE,
+            &endpoint_coverage(&overlay),
+            "/etc/praxis/tls",
+            8080,
+        )
+        .unwrap();
         assert!(
             yaml.contains("filter: grid_credential_inject"),
             "credential candidate must produce grid_credential_inject"
@@ -550,6 +596,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "test constructs duplicate credential candidates and asserts rendered dedupe behavior"
+    )]
     fn multiple_candidates_sharing_same_secret_ref_produce_one_credential_entry() {
         let overlay = simple_overlay(vec![
             credential_candidate(
@@ -571,7 +621,14 @@ mod tests {
                 "token",
             ),
         ]);
-        let yaml = generate_consumer_praxis_config(&overlay, MOUNT_BASE, &[], "/etc/praxis/tls", 8080).unwrap();
+        let yaml = generate_consumer_praxis_config(
+            &overlay,
+            MOUNT_BASE,
+            &endpoint_coverage(&overlay),
+            "/etc/praxis/tls",
+            8080,
+        )
+        .unwrap();
         // Count occurrences of the file path — should be exactly 1.
         let count = yaml
             .matches("file: \"/run/secrets/grid-credentials/shared-creds/token\"")
@@ -580,6 +637,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "test constructs two credential references and asserts both rendered entries"
+    )]
     fn multiple_different_credentials_produce_multiple_entries() {
         let overlay = simple_overlay(vec![
             credential_candidate(
@@ -601,7 +662,14 @@ mod tests {
                 "tok",
             ),
         ]);
-        let yaml = generate_consumer_praxis_config(&overlay, MOUNT_BASE, &[], "/etc/praxis/tls", 8080).unwrap();
+        let yaml = generate_consumer_praxis_config(
+            &overlay,
+            MOUNT_BASE,
+            &endpoint_coverage(&overlay),
+            "/etc/praxis/tls",
+            8080,
+        )
+        .unwrap();
         assert!(yaml.contains("creds-a"), "first credential name must appear");
         assert!(yaml.contains("creds-b"), "second credential name must appear");
         let count = yaml.matches("file:").count();
@@ -625,7 +693,14 @@ mod tests {
             "default",
             "token",
         )]);
-        let yaml = generate_consumer_praxis_config(&overlay, MOUNT_BASE, &[], "/etc/praxis/tls", 8080).unwrap();
+        let yaml = generate_consumer_praxis_config(
+            &overlay,
+            MOUNT_BASE,
+            &endpoint_coverage(&overlay),
+            "/etc/praxis/tls",
+            8080,
+        )
+        .unwrap();
         assert!(
             !yaml.contains(SENTINEL_TOKEN),
             "generated YAML must not contain token bytes"
@@ -643,7 +718,14 @@ mod tests {
             "ns",
             "key",
         )]);
-        let yaml = generate_consumer_praxis_config(&overlay, MOUNT_BASE, &[], "/etc/praxis/tls", 8080).unwrap();
+        let yaml = generate_consumer_praxis_config(
+            &overlay,
+            MOUNT_BASE,
+            &endpoint_coverage(&overlay),
+            "/etc/praxis/tls",
+            8080,
+        )
+        .unwrap();
         // Ensure 'value:' does not appear — that would indicate static header injection.
         assert!(!yaml.contains("value:"), "must not emit value: in generated config");
     }
@@ -659,7 +741,14 @@ mod tests {
             "ns",
             "k",
         )]);
-        let yaml = generate_consumer_praxis_config(&overlay, MOUNT_BASE, &[], "/etc/praxis/tls", 8080).unwrap();
+        let yaml = generate_consumer_praxis_config(
+            &overlay,
+            MOUNT_BASE,
+            &endpoint_coverage(&overlay),
+            "/etc/praxis/tls",
+            8080,
+        )
+        .unwrap();
         assert!(
             !yaml.contains("filter: headers"),
             "must not include static header filter"
@@ -678,7 +767,14 @@ mod tests {
             "grid-system",
             "token",
         )]);
-        let yaml = generate_consumer_praxis_config(&overlay, MOUNT_BASE, &[], "/etc/praxis/tls", 8080).unwrap();
+        let yaml = generate_consumer_praxis_config(
+            &overlay,
+            MOUNT_BASE,
+            &endpoint_coverage(&overlay),
+            "/etc/praxis/tls",
+            8080,
+        )
+        .unwrap();
         assert!(yaml.contains("my-api-creds"), "secretRef.name must appear");
         assert!(yaml.contains("grid-system"), "secretRef.namespace must appear");
     }
@@ -692,7 +788,14 @@ mod tests {
             "cluster#a",
             true,
         )]);
-        let yaml = generate_consumer_praxis_config(&overlay, MOUNT_BASE, &[], "/etc/praxis/tls", 8080).unwrap();
+        let yaml = generate_consumer_praxis_config(
+            &overlay,
+            MOUNT_BASE,
+            &endpoint_coverage(&overlay),
+            "/etc/praxis/tls",
+            8080,
+        )
+        .unwrap();
         assert!(
             yaml.contains("name: \"vendor/model:latest\""),
             "model/capability names with YAML-significant characters must be quoted"
@@ -719,7 +822,14 @@ mod tests {
             candidates: vec![],
         };
         assert!(
-            generate_consumer_praxis_config(&overlay, MOUNT_BASE, &[], "/etc/praxis/tls", 8080).is_err(),
+            generate_consumer_praxis_config(
+                &overlay,
+                MOUNT_BASE,
+                &endpoint_coverage(&overlay),
+                "/etc/praxis/tls",
+                8080
+            )
+            .is_err(),
             "blank local_site must return error"
         );
     }
@@ -737,7 +847,14 @@ mod tests {
     fn blank_candidate_cluster_returns_error() {
         let overlay = simple_overlay(vec![plain_candidate("inference_model", "m", "s", "", true)]);
         assert!(
-            generate_consumer_praxis_config(&overlay, MOUNT_BASE, &[], "/etc/praxis/tls", 8080).is_err(),
+            generate_consumer_praxis_config(
+                &overlay,
+                MOUNT_BASE,
+                &endpoint_coverage(&overlay),
+                "/etc/praxis/tls",
+                8080
+            )
+            .is_err(),
             "blank candidate cluster must return error"
         );
     }
@@ -752,8 +869,22 @@ mod tests {
             credential_candidate("inference_model", "m1", "s1", "c1", "creds-b", "ns", "tok"),
             credential_candidate("inference_model", "m2", "s2", "c2", "creds-a", "ns", "tok"),
         ]);
-        let yaml1 = generate_consumer_praxis_config(&overlay, MOUNT_BASE, &[], "/etc/praxis/tls", 8080).unwrap();
-        let yaml2 = generate_consumer_praxis_config(&overlay, MOUNT_BASE, &[], "/etc/praxis/tls", 8080).unwrap();
+        let yaml1 = generate_consumer_praxis_config(
+            &overlay,
+            MOUNT_BASE,
+            &endpoint_coverage(&overlay),
+            "/etc/praxis/tls",
+            8080,
+        )
+        .unwrap();
+        let yaml2 = generate_consumer_praxis_config(
+            &overlay,
+            MOUNT_BASE,
+            &endpoint_coverage(&overlay),
+            "/etc/praxis/tls",
+            8080,
+        )
+        .unwrap();
         assert_eq!(yaml1, yaml2, "output must be deterministic");
     }
 
@@ -763,7 +894,14 @@ mod tests {
             credential_candidate("inference_model", "m1", "s1", "c1", "zzz-creds", "ns", "tok"),
             credential_candidate("inference_model", "m2", "s2", "c2", "aaa-creds", "ns", "tok"),
         ]);
-        let yaml = generate_consumer_praxis_config(&overlay, MOUNT_BASE, &[], "/etc/praxis/tls", 8080).unwrap();
+        let yaml = generate_consumer_praxis_config(
+            &overlay,
+            MOUNT_BASE,
+            &endpoint_coverage(&overlay),
+            "/etc/praxis/tls",
+            8080,
+        )
+        .unwrap();
         // Search within the credential_inject section only (after the section header).
         let inject_start = yaml
             .find("grid_credential_inject")
@@ -848,7 +986,7 @@ mod tests {
     }
 
     #[test]
-    fn load_balancer_missing_endpoint_keeps_safe_cluster_stub() {
+    fn load_balancer_missing_endpoint_returns_error() {
         let overlay = simple_overlay(vec![plain_candidate(
             "inference_model",
             "model-a",
@@ -856,14 +994,14 @@ mod tests {
             "gateway-site-a",
             true,
         )]);
-        let yaml = generate_consumer_praxis_config(&overlay, MOUNT_BASE, &[], "/etc/praxis/tls", 8080).unwrap();
+        let err = generate_consumer_praxis_config(&overlay, MOUNT_BASE, &[], "/etc/praxis/tls", 8080)
+            .expect_err("missing endpoint topology must fail config generation");
         assert!(
-            yaml.contains("          - name: \"gateway-site-a\""),
-            "cluster stub must remain"
-        );
-        assert!(
-            !yaml.contains("endpoints:"),
-            "missing endpoint topology must not invent endpoint URLs"
+            matches!(
+                err,
+                ConsumerConfigError::MissingClusterEndpoint { cluster } if cluster == "gateway-site-a"
+            ),
+            "missing endpoint must identify the candidate cluster"
         );
     }
 
@@ -906,9 +1044,14 @@ mod tests {
             "ns",
             "token",
         )]);
-        let yaml =
-            generate_consumer_praxis_config(&overlay, "/run/secrets/grid-credentials", &[], "/etc/praxis/tls", 8080)
-                .unwrap();
+        let yaml = generate_consumer_praxis_config(
+            &overlay,
+            "/run/secrets/grid-credentials",
+            &endpoint_coverage(&overlay),
+            "/etc/praxis/tls",
+            8080,
+        )
+        .unwrap();
         assert!(
             yaml.contains("file: \"/run/secrets/grid-credentials/my-creds/token\""),
             "default mount base must appear in file path"
@@ -1047,7 +1190,7 @@ mod tests {
     }
 
     #[test]
-    fn cluster_without_endpoint_entry_renders_stub() {
+    fn cluster_without_endpoint_entry_returns_error() {
         let overlay = simple_overlay(vec![plain_candidate(
             "inference_model",
             "m",
@@ -1055,9 +1198,15 @@ mod tests {
             "cluster-no-ep",
             true,
         )]);
-        let yaml = generate_consumer_praxis_config(&overlay, MOUNT_BASE, &[], "/etc/praxis/tls", 8080).unwrap();
-        assert!(yaml.contains("\"cluster-no-ep\""), "cluster name must appear as stub");
-        assert!(!yaml.contains("endpoints:"), "stub must not contain endpoints");
+        let err = generate_consumer_praxis_config(&overlay, MOUNT_BASE, &[], "/etc/praxis/tls", 8080)
+            .expect_err("missing cluster endpoint must fail config generation");
+        assert!(
+            matches!(
+                err,
+                ConsumerConfigError::MissingClusterEndpoint { cluster } if cluster == "cluster-no-ep"
+            ),
+            "missing endpoint error must include the cluster name"
+        );
     }
 
     #[test]

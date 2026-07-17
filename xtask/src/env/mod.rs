@@ -947,11 +947,10 @@ fn env_verify_api_fallback(config: &Path, site: Option<&str>) -> Result<(), Box<
 /// 1. Deploy provider gateways.
 /// 2. Deploy mock API-provider in consumer cluster.
 /// 3. Operator reconcile → overlay JSON with `credential.secretRef` on `api_provider` candidate.
-/// 4. Read secretRef from overlay, resolve token from K8s Secret (harness bridge).
-/// 5. Deploy consumer with `grid_route` candidates (including secretRef) + `grid_credential_inject` filter (token in
-///    filter config map — transitional; future: mounted Secret volume).
+/// 4. Validate the operator-generated consumer Praxis config and read it back byte-for-byte.
+/// 5. Deploy the consumer gateway from that operator-generated config with the credential Secret mounted as a file.
 /// 6. Verify: `model-x` → 200 local, `model-z` → 200 via mock API-provider with injected credential, unknown model →
-///    404/503.
+///    404/503, token bytes absent from the consumer `ConfigMap` and `GridNetwork` status.
 #[expect(clippy::too_many_lines, reason = "multi-step E2E orchestration")]
 fn env_verify_api_fallback_native(config: &Path, site: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     use operator::{
@@ -1025,8 +1024,7 @@ fn env_verify_api_fallback_native(config: &Path, site: Option<&str>) -> Result<(
 
         // Wait for and validate the operator-generated consumer ConfigMap.
         // This ConfigMap is rendered because GatewayRef.consumerConfig.enabled = true.
-        // It is shape-validated here; the live consumer pod still uses the
-        // validation-harness-generated runtime config.
+        // The live consumer pod is deployed from this exact rendered config below.
         eprintln!("  waiting for operator-generated consumer ConfigMap {TEST_CONSUMER_CONFIGMAP_NAME}...");
         operator::wait_for_consumer_configmap(
             &context,
@@ -1114,7 +1112,7 @@ fn env_verify_api_fallback_native(config: &Path, site: Option<&str>) -> Result<(
 
     // ── Step 6: verify routing + token-absence + native credential injection ──
     eprintln!("verify-api-fallback-native: [6/6] verifying routing with grid_credential_inject...");
-    eprintln!("  live consumer pod runs operator-generated config (not harness-generated)");
+    eprintln!("  live consumer pod runs operator-generated config");
     eprintln!("  local ({TEST_HEALTHY_ROUTING_CLUSTER}) → model-x via site-a provider gateway");
     eprintln!(
         "  api fallback ({TEST_PROVIDER_API}) → {API_FALLBACK_MODEL} via mock api-provider (grid_credential_inject)"
@@ -1136,6 +1134,17 @@ fn env_verify_api_fallback_native(config: &Path, site: Option<&str>) -> Result<(
     // Explicit token-absence proof: token must not appear in the operator-generated consumer ConfigMap.
     let consumer_ctx_ref = &consumer_ctx;
     verify_token_absent_from_consumer_configmap(consumer_ctx_ref, &api_token)?;
+
+    // Assert GridNetwork status records the consumer config as Rendered and token-safe.
+    operator::wait_for_consumer_config_status_rendered(
+        &context,
+        TEST_NETWORK,
+        TEST_GATEWAY_NAME,
+        &consumer_cm_name,
+        &api_token,
+        STATUS_POLL_TIMEOUT,
+    )
+    .map_err(|e| format!("operator-generated consumer config status assertion failed: {e}"))?;
 
     mock_pf.stop();
     kind::delete_mock_api_provider(&consumer_ctx);
@@ -1581,13 +1590,13 @@ fn env_verify_swim_membership(config: &Path, site: Option<&str>) -> Result<(), B
     let (bind1, bind2) = reserve_swim_bind_addrs()?;
 
     // Step 2: start the primary SWIM operator (no seeds — it is the first member).
-    let op1 = operator::spawn_operator_with_swim(&context, &bind1, &bind1, SWIM_NODE_PRIMARY_NAME, "")?;
+    let op1 = operator::spawn_operator_with_swim(&context, &bind1, &bind1, SWIM_NODE_PRIMARY_NAME, "", None)?;
     let mut op1_guard = ProcGuard(Some(op1), "operator-primary");
 
     // Step 3: start the secondary operator with the primary as its seed.
     // spawn_operator_with_swim includes a 3-second post-spawn settle sleep, so
     // the primary's SWIM listener is ready before the secondary announces.
-    let op2 = operator::spawn_operator_with_swim(&context, &bind2, &bind2, SWIM_NODE_SECONDARY_NAME, &bind1)?;
+    let op2 = operator::spawn_operator_with_swim(&context, &bind2, &bind2, SWIM_NODE_SECONDARY_NAME, &bind1, None)?;
     let mut op2_guard = ProcGuard(Some(op2), "operator-secondary");
 
     // Step 4: wait for SWIM gossip to converge (both nodes see each other as Alive).
@@ -1658,30 +1667,58 @@ fn env_verify_swim_crd_seeds(config: &Path, site: Option<&str>) -> Result<(), Bo
 
     // Step 2: start primary operator — NO GRID_SWIM_SEEDS, no peer at startup.
     // The primary will self-filter bind1 when it reads spec.seeds later.
-    let op1 = operator::spawn_operator_with_swim(&context, &bind1, &bind1, SWIM_NODE_PRIMARY_NAME, "")?;
+    let op1 = operator::spawn_operator_with_swim(&context, &bind1, &bind1, SWIM_NODE_PRIMARY_NAME, "", None)?;
     let mut op1_guard = ProcGuard(Some(op1), "operator-primary-crd");
 
     // Step 3: start secondary operator — NO GRID_SWIM_SEEDS, no peer at startup.
     // The secondary will announce to bind1 only after reading spec.seeds from the CRD.
-    let op2 = operator::spawn_operator_with_swim(&context, &bind2, &bind2, SWIM_NODE_SECONDARY_NAME, "")?;
+    let op2 = operator::spawn_operator_with_swim(&context, &bind2, &bind2, SWIM_NODE_SECONDARY_NAME, "", None)?;
     let mut op2_guard = ProcGuard(Some(op2), "operator-secondary-crd");
 
-    // Step 4: apply the GridNetwork fixture with spec.seeds = [bind1].
-    // This is the key CRD-driven step: neither operator used GRID_SWIM_SEEDS.
-    // The secondary operator's reconcile will call parse_crd_seeds → announce_seeds → SWIM announce.
-    // The primary operator's reconcile will self-filter bind1 and announce nothing.
+    // Step 4: Apply the GridNetwork fixture with an EMPTY spec.seeds.
+    // This proves that without seeds, both operators remain isolated (connectedSites = 0).
+    operator::apply_swim_test_network_with_seeds(&context, &[])?;
+    eprintln!("  GridNetwork {CRD_SEEDS_TEST_NETWORK} applied with empty spec.seeds; verifying isolation...");
+    // Allow one reconcile cycle to fire (operators are running and will reconcile the new CRD).
+    operator::wait_for_swim_convergence(SWIM_CONVERGENCE_WAIT);
+    // With empty seeds, the network must stay Pending or have connectedSites=0 — no SWIM join.
+    let isolated_status =
+        operator::wait_for_gridnetwork_status(&context, CRD_SEEDS_TEST_NETWORK, SWIM_STATUS_POLL_TIMEOUT)?;
+    if isolated_status.connected_sites > 0 {
+        // Stop operators before returning error
+        if let Some(c) = op1_guard.0.take() {
+            operator::kill_operator(c);
+        }
+        if let Some(c) = op2_guard.0.take() {
+            operator::kill_operator(c);
+        }
+        operator::cleanup_swim_crd_seeds_test_resources(&context)?;
+        return Err(format!(
+            "verify-swim-crd-seeds: expected connectedSites=0 with empty spec.seeds, \
+             got connectedSites={} — SWIM must not auto-join without seeds",
+            isolated_status.connected_sites
+        )
+        .into());
+    }
+    eprintln!(
+        "  [PASS] GridNetwork status with empty seeds: phase={:?} connectedSites={} \
+         (isolation confirmed — no SWIM join without CRD seeds)",
+        isolated_status.phase, isolated_status.connected_sites
+    );
+
+    // Step 5: Live-additive proof — patch spec.seeds to [bind1] while operators are running.
+    // This is the core runtime update contract: adding a seed while the operator is live
+    // causes SWIM join on the next reconcile cycle without operator restart.
     operator::apply_swim_test_network_with_seeds(&context, &[bind1_addr])?;
     eprintln!(
-        "  GridNetwork {CRD_SEEDS_TEST_NETWORK} applied with spec.seeds=[{bind1}]; \
+        "  spec.seeds patched to [{bind1}] while operators are running; \
          awaiting CRD-driven SWIM convergence..."
     );
 
-    // Step 5: wait for the reconcile + announce + SWIM gossip to converge.
-    // The operators must reconcile the GridNetwork, call announce_seeds, and complete
-    // the foca gossip cycle. SWIM_CONVERGENCE_WAIT (10 s) covers this window.
+    // Step 6: wait for the reconcile + announce + SWIM gossip to converge.
     operator::wait_for_swim_convergence(SWIM_CONVERGENCE_WAIT);
 
-    // Step 6: poll until the GridNetwork status reflects the SWIM membership.
+    // Step 7: poll until the GridNetwork status reflects the SWIM membership.
     let result = operator::wait_for_gridnetwork_active(&context, CRD_SEEDS_TEST_NETWORK, SWIM_STATUS_POLL_TIMEOUT);
 
     // Always stop both operators before propagating errors.
@@ -1693,13 +1730,14 @@ fn env_verify_swim_crd_seeds(config: &Path, site: Option<&str>) -> Result<(), Bo
     }
     operator::cleanup_swim_crd_seeds_test_resources(&context)?;
 
-    // Step 7: verify the result.
+    // Step 8: verify the result.
     let connected_sites = result?;
     operator::verify_swim_status("Active", connected_sites)?;
 
     eprintln!(
         "verify-swim-crd-seeds: PASS (connectedSites={connected_sites}; \
-         CRD seed path proven — both operators started with no GRID_SWIM_SEEDS)"
+         CRD seed path proven — both operators started with no GRID_SWIM_SEEDS; \
+         live-additive: spec.seeds added {bind1} while running, SWIM converged without restart)"
     );
     Ok(())
 }
@@ -1727,11 +1765,11 @@ fn env_verify_swim_state(config: &Path, site: Option<&str>) -> Result<(), Box<dy
 
     // Start primary operator (no seeds).
     let (bind1, bind2) = reserve_swim_bind_addrs()?;
-    let op1 = operator::spawn_operator_with_swim(&context, &bind1, &bind1, SWIM_NODE_PRIMARY_NAME, "")?;
+    let op1 = operator::spawn_operator_with_swim(&context, &bind1, &bind1, SWIM_NODE_PRIMARY_NAME, "", None)?;
     let mut op1_guard = ProcGuard(Some(op1), "operator-primary");
 
     // Start secondary operator; seeds point to primary.
-    let op2 = operator::spawn_operator_with_swim(&context, &bind2, &bind2, SWIM_NODE_SECONDARY_NAME, &bind1)?;
+    let op2 = operator::spawn_operator_with_swim(&context, &bind2, &bind2, SWIM_NODE_SECONDARY_NAME, &bind1, None)?;
     let mut op2_guard = ProcGuard(Some(op2), "operator-secondary");
 
     // Wait for SWIM convergence.
@@ -1802,11 +1840,11 @@ fn env_verify_swim_overlay(config: &Path, site: Option<&str>) -> Result<(), Box<
     let (bind1, bind2) = reserve_swim_bind_addrs()?;
 
     // Step 2: start the primary SWIM operator (no seeds).
-    let op1 = operator::spawn_operator_with_swim(&context, &bind1, &bind1, SWIM_NODE_PRIMARY_NAME, "")?;
+    let op1 = operator::spawn_operator_with_swim(&context, &bind1, &bind1, SWIM_NODE_PRIMARY_NAME, "", None)?;
     let mut op1_guard = ProcGuard(Some(op1), "operator-primary");
 
     // Step 3: start the secondary operator with the primary as its seed.
-    let op2 = operator::spawn_operator_with_swim(&context, &bind2, &bind2, SWIM_NODE_SECONDARY_NAME, &bind1)?;
+    let op2 = operator::spawn_operator_with_swim(&context, &bind2, &bind2, SWIM_NODE_SECONDARY_NAME, &bind1, None)?;
     let mut op2_guard = ProcGuard(Some(op2), "operator-secondary");
 
     // Step 4: wait for SWIM gossip to converge.
@@ -1822,11 +1860,14 @@ fn env_verify_swim_overlay(config: &Path, site: Option<&str>) -> Result<(), Box<
          waiting for distributed state propagation..."
     );
 
-    // Step 6: poll for distributedProviderCount > 0 (proves remote state arrived).
+    // Step 6: poll for distributedProviderCount > 0 (proves remote CRDT state arrived).
     let distributed_result =
         operator::wait_for_gridnetwork_distributed_state(&context, SWIM_OVERLAY_NETWORK, SWIM_STATUS_POLL_TIMEOUT);
 
     // Step 7: wait for the overlay ConfigMap to be generated.
+    // The local InferenceProvider ensures the overlay has at least one candidate;
+    // remote CRDT candidates from the secondary are filtered out at this point
+    // because there is no Active GridSite for the secondary site.
     let cm_result = distributed_result.and_then(|_| {
         operator::wait_for_overlay_configmap(
             &context,
@@ -1837,8 +1878,50 @@ fn env_verify_swim_overlay(config: &Path, site: Option<&str>) -> Result<(), Box<
         )
     });
 
-    // Step 8: verify the overlay contains a remote candidate.
-    let verify_result = cm_result.and_then(|()| {
+    // Step 7b: ROUTING ELIGIBILITY PROOF (before Active) — assert the secondary's CRDT
+    // candidates are absent from the overlay.  The secondary SWIM peer is Alive and has
+    // broadcast InferenceProvider state, but its corresponding GridSite is not Active, so
+    // its CRDT providers must be excluded by the routing eligibility gate.
+    // This proves SWIM gossip alone is NOT sufficient for routing.
+    let before_result = cm_result.and_then(|()| {
+        operator::assert_no_crdt_candidates_for_site(
+            &context,
+            SWIM_OVERLAY_NETWORK,
+            SWIM_OVERLAY_GW,
+            SWIM_NODE_SECONDARY_NAME, // exclude the secondary SWIM site's CRDT candidates
+        )
+    });
+
+    // Step 7c: Apply an Active GridSite for the secondary site.
+    // The GridSite name is the deterministic auto-discovered name for the secondary's SWIM site.
+    let secondary_k8s_name = operator::auto_discovered_gridsite_name(SWIM_OVERLAY_NETWORK, SWIM_NODE_SECONDARY_NAME);
+    let after_result = before_result.and_then(|()| {
+        eprintln!("  applying Active GridSite {secondary_k8s_name:?} for secondary SWIM site...");
+        operator::apply_active_gridsite_for_eligibility(
+            &context,
+            &secondary_k8s_name,
+            SWIM_OVERLAY_NETWORK,
+            "127.0.0.1:19080", // test gateway address, not probed in this validation
+        )
+    });
+
+    // Step 7d: bump GridNetwork annotation to force overlay reconcile.
+    let bump_result = after_result.and_then(|()| operator::bump_gridnetwork(&context, SWIM_OVERLAY_NETWORK));
+
+    // Step 7e: wait for the overlay to update (may be same ConfigMap, just re-rendered).
+    let cm2_result = bump_result.and_then(|()| {
+        operator::wait_for_overlay_configmap(
+            &context,
+            SWIM_OVERLAY_NETWORK,
+            SWIM_OVERLAY_GW,
+            "default",
+            CONFIGMAP_POLL_TIMEOUT,
+        )
+    });
+
+    // Step 8: ROUTING ELIGIBILITY PROOF (after Active) — verify remote candidate appears.
+    // After the secondary's GridSite reaches Active, its CRDT provider must appear in the overlay.
+    let verify_result = cm2_result.and_then(|()| {
         operator::verify_swim_overlay_candidates(
             &context,
             SWIM_OVERLAY_NETWORK,
@@ -1847,7 +1930,7 @@ fn env_verify_swim_overlay(config: &Path, site: Option<&str>) -> Result<(), Box<
         )
     });
 
-    // Cleanup — always stop operators and remove fixtures.
+    // Cleanup — always stop operators and remove fixtures regardless of result.
     if let Some(c) = op1_guard.0.take() {
         operator::kill_operator(c);
     }
@@ -1855,6 +1938,8 @@ fn env_verify_swim_overlay(config: &Path, site: Option<&str>) -> Result<(), Box<
         operator::kill_operator(c);
     }
     operator::cleanup_swim_overlay_test_resources(&context)?;
+    operator::cleanup_auto_discovered_gridsite(&context, &secondary_k8s_name)
+        .unwrap_or_else(|e| eprintln!("  warning: secondary GridSite cleanup: {e}"));
     // Also clean up the SWIM provider that may have been created during convergence
     // wait to avoid contaminating subsequent verify-swim-state runs.
     operator::cleanup_swim_test_resources(&context).unwrap_or_else(|e| {
@@ -1946,9 +2031,9 @@ fn env_verify_swim_routing(config: &Path) -> Result<(), Box<dyn std::error::Erro
     //         and the reconcile immediately observes the peer's CRDT state.
     eprintln!("verify-swim-routing: [3/6] starting SWIM operators...");
     let (bind1, bind2) = reserve_swim_bind_addrs()?;
-    let op1 = operator::spawn_operator_with_swim_for_context(&east_ctx, &bind1, &bind1, east_site, "")?;
+    let op1 = operator::spawn_operator_with_swim_for_context(&east_ctx, &bind1, &bind1, east_site, "", None)?;
     let mut op1_guard = ProcGuard(Some(op1), "operator-east");
-    let op2 = operator::spawn_operator_with_swim_for_context(&west_ctx, &bind2, &bind2, west_site, &bind1)?;
+    let op2 = operator::spawn_operator_with_swim_for_context(&west_ctx, &bind2, &bind2, west_site, &bind1, None)?;
     let mut op2_guard = ProcGuard(Some(op2), "operator-west");
 
     // Step 4: wait for SWIM gossip to converge, then apply fixtures.
@@ -2827,10 +2912,9 @@ fn env_verify_metrics_routing(config: &Path) -> Result<(), Box<dyn std::error::E
 )]
 fn env_verify_site_join_discovery(config: &Path) -> Result<(), Box<dyn std::error::Error>> {
     use operator::{
-        CONFIGMAP_POLL_TIMEOUT, SITE_JOIN_GW, SITE_JOIN_JOINING_EGRESS, SITE_JOIN_JOINING_MODEL,
-        SITE_JOIN_JOINING_SITE, SITE_JOIN_NETWORK, SITE_JOIN_PHASE_POLL_TIMEOUT, SITE_JOIN_PRIMARY_EGRESS,
-        SITE_JOIN_PRIMARY_MODEL, SITE_JOIN_PRIMARY_SITE, SITE_JOIN_WRONG_NETWORK, SITE_JOIN_WRONG_SITE,
-        SWIM_CONVERGENCE_WAIT, SWIM_STATUS_POLL_TIMEOUT,
+        CONFIGMAP_POLL_TIMEOUT, SITE_JOIN_GW, SITE_JOIN_JOINING_MODEL, SITE_JOIN_JOINING_SITE, SITE_JOIN_NETWORK,
+        SITE_JOIN_PHASE_POLL_TIMEOUT, SITE_JOIN_PRIMARY_EGRESS, SITE_JOIN_PRIMARY_MODEL, SITE_JOIN_PRIMARY_SITE,
+        SITE_JOIN_WRONG_NETWORK, SITE_JOIN_WRONG_SITE, SWIM_CONVERGENCE_WAIT, SWIM_STATUS_POLL_TIMEOUT,
     };
 
     let cfg = EnvConfig::from_file(config)?;
@@ -2872,17 +2956,23 @@ fn env_verify_site_join_discovery(config: &Path) -> Result<(), Box<dyn std::erro
     // ── Step 2: Start SWIM operators ──────────────────────────────────────────
     eprintln!("verify-site-join-discovery: [2/8] starting SWIM operators...");
     let (bind_primary, bind_joining) = reserve_swim_bind_addrs()?;
-    // Primary operator: east cluster, no seeds.
+    // Primary operator: east cluster, no seeds, no gateway address.
     let op_primary =
-        operator::spawn_operator_with_swim_for_context(&east_ctx, &bind_primary, &bind_primary, east_site, "")?;
+        operator::spawn_operator_with_swim_for_context(&east_ctx, &bind_primary, &bind_primary, east_site, "", None)?;
     let mut op_primary_guard = ProcGuard(Some(op_primary), "operator-primary");
     // Joining operator: west cluster, seeds = primary bind addr.
+    // Advertises a distinct gateway address (port SITE_JOIN_GATEWAY_PORT) so the auto-created
+    // GridSite carries the data-plane address, not the SWIM UDP bind address.
+    let joining_gw_addr = format!("127.0.0.1:{}", operator::SITE_JOIN_GATEWAY_PORT);
+    let _joining_gateway_listener = std::net::TcpListener::bind(&joining_gw_addr)
+        .map_err(|e| format!("failed to bind site-join gateway probe listener at {joining_gw_addr}: {e}"))?;
     let op_joining = operator::spawn_operator_with_swim_for_context(
         &west_ctx,
         &bind_joining,
         &bind_joining,
         west_site,
         &bind_primary,
+        Some(&joining_gw_addr),
     )?;
     let mut op_joining_guard = ProcGuard(Some(op_joining), "operator-joining");
     eprintln!("  [OK] primary operator ({east_site}) and joining operator ({west_site}) started");
@@ -2916,10 +3006,21 @@ fn env_verify_site_join_discovery(config: &Path) -> Result<(), Box<dyn std::erro
         SITE_JOIN_NETWORK,
         SITE_JOIN_PHASE_POLL_TIMEOUT,
     )?;
-    operator::verify_auto_gridsite_fields(&east_ctx, &auto_site_name, SITE_JOIN_NETWORK)?;
+    // Wait for the GridSite controller to advance Discovered → Connecting.
+    // The GridNetwork controller sets Discovered; the GridSite controller then
+    // advances to Connecting because the advertised gateway address is present.
+    operator::wait_for_gridsite_phase(&east_ctx, &auto_site_name, "Connecting", SITE_JOIN_PHASE_POLL_TIMEOUT)?;
+    operator::verify_auto_gridsite_fields(&east_ctx, &auto_site_name, SITE_JOIN_NETWORK, "Connecting")?;
+
+    // Hard assertion: spec.egress.address must equal the gateway address, NOT the SWIM UDP address.
+    // This proves that auto-discovered GridSites carry the data-plane gateway address
+    // separately from the SWIM membership endpoint.
+    operator::verify_auto_gridsite_egress(&east_ctx, &auto_site_name, &joining_gw_addr, &bind_joining)?;
+
     eprintln!(
-        "  [PASS] GridSite {auto_site_name:?} auto-created by primary operator \
-         from SWIM Alive membership (no harness kubectl apply)"
+        "  [PASS] GridSite {auto_site_name:?} auto-created and advanced to Connecting by primary operator \
+         from SWIM Alive membership (no harness kubectl apply); \
+         egress.address={joining_gw_addr:?} (gateway address, not SWIM UDP {bind_joining:?})"
     );
 
     // ── Step 4: Apply harness GridSites + wait for membership ────────────────
@@ -2940,7 +3041,7 @@ fn env_verify_site_join_discovery(config: &Path) -> Result<(), Box<dyn std::erro
         &east_ctx,
         SITE_JOIN_JOINING_SITE,
         SITE_JOIN_NETWORK,
-        SITE_JOIN_JOINING_EGRESS,
+        &joining_gw_addr,
         "joining",
     )?;
     operator::apply_gridsite(
@@ -2964,29 +3065,28 @@ fn env_verify_site_join_discovery(config: &Path) -> Result<(), Box<dyn std::erro
     eprintln!("  [OK] joining site: Pending (absent/unjoined state confirmed before SWIM event)");
 
     // Advance joining site to Discovered: simulates SWIM membership event.
-    // In Phase 2 this transition is automatic; here it is harness-assisted.
+    // The Pending→Discovered transition requires SWIM membership, which the GridSite
+    // controller does not have access to. The harness patches this to simulate the
+    // SWIM Alive event (same as the GridNetwork controller does for auto-discovered sites).
     operator::patch_gridsite_phase(&east_ctx, SITE_JOIN_JOINING_SITE, "Discovered")?;
     operator::bump_gridsite(&east_ctx, SITE_JOIN_JOINING_SITE)?;
-    operator::wait_for_gridsite_phase(
-        &east_ctx,
-        SITE_JOIN_JOINING_SITE,
-        "Discovered",
-        SITE_JOIN_PHASE_POLL_TIMEOUT,
-    )?;
-    eprintln!("  [OK] joining site: Discovered (operator preserved phase — SWIM event simulated)");
-
-    // Advance to Connecting: simulates mTLS certificate exchange initiation.
-    operator::patch_gridsite_phase(&east_ctx, SITE_JOIN_JOINING_SITE, "Connecting")?;
-    operator::bump_gridsite(&east_ctx, SITE_JOIN_JOINING_SITE)?;
+    // The GridSite controller now drives Discovered → Connecting automatically when
+    // spec.egress.address is non-empty and reachable by TCP.
+    // Wait for Connecting — do NOT wait for Discovered, which would be immediately
+    // superseded by the operator's automated transition.
     operator::wait_for_gridsite_phase(
         &east_ctx,
         SITE_JOIN_JOINING_SITE,
         "Connecting",
         SITE_JOIN_PHASE_POLL_TIMEOUT,
     )?;
-    eprintln!("  [OK] joining site: Connecting (operator preserved phase — mTLS initiation simulated)");
+    eprintln!(
+        "  [OK] joining site: Connecting \
+         (Discovered→Connecting driven by GridSite controller; egress address present)"
+    );
 
-    // Advance to Active: simulates mTLS success + capability exchange + data-plane ping.
+    // Advance to Active: simulates mTLS success, capability exchange, and data-plane readiness
+    // established by the deployment workflow. The harness patches it to prove phase preservation.
     operator::patch_gridsite_phase(&east_ctx, SITE_JOIN_JOINING_SITE, "Active")?;
     operator::bump_gridsite(&east_ctx, SITE_JOIN_JOINING_SITE)?;
     operator::wait_for_gridsite_phase(
@@ -2999,12 +3099,7 @@ fn env_verify_site_join_discovery(config: &Path) -> Result<(), Box<dyn std::erro
 
     // ── Step 5: Routing readiness ─────────────────────────────────────────────
     eprintln!("verify-site-join-discovery: [6/8] verifying join routing readiness...");
-    operator::verify_gridsite_routing_data(
-        &east_ctx,
-        SITE_JOIN_JOINING_SITE,
-        SITE_JOIN_NETWORK,
-        SITE_JOIN_JOINING_EGRESS,
-    )?;
+    operator::verify_gridsite_routing_data(&east_ctx, SITE_JOIN_JOINING_SITE, SITE_JOIN_NETWORK, &joining_gw_addr)?;
 
     // ── Step 6: Overlay + cross-network isolation ─────────────────────────────
     eprintln!("verify-site-join-discovery: [7/8] verifying overlay and cross-network isolation...");
@@ -3194,10 +3289,11 @@ fn env_verify_failover_under_lost_peer(config: &Path) -> Result<(), Box<dyn std:
     // ── Step 3: Start SWIM operators ──────────────────────────────────────────
     eprintln!("verify-failover-under-lost-peer: [3/10] starting SWIM operators...");
     let (bind_east, bind_west) = reserve_swim_bind_addrs()?;
-    let op_east = operator::spawn_operator_with_swim_for_context(&east_ctx, &bind_east, &bind_east, east_site, "")?;
+    let op_east =
+        operator::spawn_operator_with_swim_for_context(&east_ctx, &bind_east, &bind_east, east_site, "", None)?;
     let mut op_east_guard = ProcGuard(Some(op_east), "operator-east");
     let op_west =
-        operator::spawn_operator_with_swim_for_context(&west_ctx, &bind_west, &bind_west, west_site, &bind_east)?;
+        operator::spawn_operator_with_swim_for_context(&west_ctx, &bind_west, &bind_west, west_site, &bind_east, None)?;
     let mut op_west_guard = ProcGuard(Some(op_west), "operator-west");
     eprintln!("  [OK] east (primary) and west (remote) operators started");
 
@@ -3426,12 +3522,12 @@ fn env_verify_failover_under_lost_peer(config: &Path) -> Result<(), Box<dyn std:
     eprintln!("verify-failover-under-lost-peer: [9/10] restarting both operators for recovery proof...");
     // East restarts with no seeds — it is the primary node of the fresh cluster.
     let op_east_rejoin =
-        operator::spawn_operator_with_swim_for_context(&east_ctx, &bind_east, &bind_east, east_site, "")?;
+        operator::spawn_operator_with_swim_for_context(&east_ctx, &bind_east, &bind_east, east_site, "", None)?;
     let mut op_east_rejoin_guard = ProcGuard(Some(op_east_rejoin), "operator-east-rejoin");
     // West restarts with east as seed and joins the fresh east cluster during
     // the convergence wait below.
     let op_west_rejoin =
-        operator::spawn_operator_with_swim_for_context(&west_ctx, &bind_west, &bind_west, west_site, &bind_east)?;
+        operator::spawn_operator_with_swim_for_context(&west_ctx, &bind_west, &bind_west, west_site, &bind_east, None)?;
     let mut op_west_rejoin_guard = ProcGuard(Some(op_west_rejoin), "operator-west-rejoin");
     eprintln!(
         "  [OK] both operators restarted (east: bind={bind_east:?}, no seeds; \
@@ -3568,10 +3664,11 @@ fn env_verify_stale_gc_ttl(config: &Path) -> Result<(), Box<dyn std::error::Erro
     // ── Step 3: SWIM operators ────────────────────────────────────────────────
     eprintln!("verify-stale-gc-ttl: [3/7] starting SWIM operators...");
     let (bind_east, bind_west) = reserve_swim_bind_addrs()?;
-    let op_east = operator::spawn_operator_with_swim_for_context(&east_ctx, &bind_east, &bind_east, east_site, "")?;
+    let op_east =
+        operator::spawn_operator_with_swim_for_context(&east_ctx, &bind_east, &bind_east, east_site, "", None)?;
     let mut op_east_guard = ProcGuard(Some(op_east), "operator-east");
     let op_west =
-        operator::spawn_operator_with_swim_for_context(&west_ctx, &bind_west, &bind_west, west_site, &bind_east)?;
+        operator::spawn_operator_with_swim_for_context(&west_ctx, &bind_west, &bind_west, west_site, &bind_east, None)?;
     let mut op_west_guard = ProcGuard(Some(op_west), "operator-west");
     eprintln!("  [OK] east + west operators started");
 

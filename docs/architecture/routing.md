@@ -150,8 +150,8 @@ A `age_secs = 0` has two distinct meanings:
   The GC helper `dead_or_suspect_age_secs` treats `age_secs = 0` on a
   Dead/Suspect member as "unknown" and retains conservatively.
 
-**`crdt::ProviderState`** still carries only a monotonic `revision` counter, not
-a wall-clock timestamp.  CRDT-storage-level GC remains deferred.
+**`crdt::ProviderState`** carries only a monotonic `revision` counter, not
+a wall-clock timestamp.  CRDT storage-level GC is outside the current operator contract.
 
 ### Per-GridNetwork TTL — `spec.staleCandidateTtlSeconds`
 
@@ -177,13 +177,13 @@ recover without overlay churn while bounding accumulation of truly dead peers.
 
 **Important:** The TTL is applied at overlay-rendering time.  CRDT provider
 records in storage are not deleted by this mechanism.  CRDT storage-level GC
-remains deferred.
+is outside the current operator contract.
 
 ### Not implemented: hard exclusion
 
 The GC policy does not implement hard exclusion of all `fresh=false` candidates.
 A `fresh=false` candidate is only evicted after the TTL boundary; it is
-**deprioritized**, not blocked.  See the scoring section for how `fresh=false`
+**deprioritized**, not excluded.  See the scoring section for how `fresh=false`
 affects candidate ordering.
 
 ## Backend kinds
@@ -321,18 +321,48 @@ The token does NOT appear in:
 - Tracing spans or log lines.
 - HTTP error response bodies.
 
-### Future production path
+### Deployment ownership
 
-The remaining production work is ownership and lifecycle, not request-path
-injection mechanics:
+The operator generates the consumer Praxis config including the `grid_credential_inject`
+section.  Consumer-cluster Secret provisioning — creating, rotating, and synchronizing
+the mounted credential Secret — is the responsibility of the operator or an external
+Secret manager.
 
-- **Operator-owned consumer config** — the operator generates the full consumer
-  Praxis config including the `grid_credential_inject` section.
-- **Consumer-cluster Secret provisioning** — the operator or an external Secret
-  manager creates, rotates, and synchronizes the mounted credential Secret.
+The `grid_route` → `grid_credential_inject` filter chain interface is the same
+regardless of how the consumer-cluster Secret is provisioned.
 
-The `grid_route` → `grid_credential_inject` filter chain interface remains the
-same regardless of how the consumer-cluster Secret is provisioned.
+## Routing eligibility
+
+The Grid operator enforces a routing eligibility gate on remote provider state
+received over SWIM CRDT broadcasts.  A remote provider record is included in the
+routing overlay only when the corresponding `GridSite.status.phase` is `Active`.
+
+| Site state | Remote CRDT providers eligible |
+|---|---|
+| No matching `GridSite` | No — fail-closed |
+| `Pending` | No |
+| `Discovered` | No |
+| `Connecting` | No |
+| `Active` | Yes |
+| `Unreachable` | No |
+| `Left` | No |
+
+The matching rule: for a remote CRDT provider with `site_id = S` in network `N`,
+the operator looks for a `GridSite` resource whose Kubernetes name equals
+`discovered_site_k8s_name(N, S)` (the auto-discovered name derivation) and whose
+`spec.gridNetworkRef == N` and `status.phase == Active`.
+
+`Active` is set by the deployment workflow after the remote site satisfies the
+configured trust requirements.  It is not set automatically by the operator.
+See [Authentication and Access Policy](auth.md) for the trust contract.
+
+**Local providers** (from `InferenceProvider` resources in the same cluster) are
+always eligible.  They are not filtered by `GridSite.status.phase`.
+
+**Claim**: SWIM membership + TCP reachability + public cert material alone are not
+sufficient for a remote provider to become routable.  `Active` is the explicit
+routing eligibility gate; the deployment workflow must only set it after the
+site satisfies the configured trust and authorization policy.
 
 ## Consumer gateway selection
 
@@ -406,7 +436,7 @@ different latency budgets).
 
 For cloud-managed providers and third-party APIs where the destination
 cannot export normalized metrics, the Grid operator may apply an adapter
-in a future revision.
+when the normalization contract is stable.
 
 ### Missing-value defaults
 
@@ -452,12 +482,12 @@ The field is optional.  When absent (default), the behaviour is unchanged
 from before it was added: scrape failures produce neutral scoring
 immediately.
 
-### Deferred: KV-cache affinity
+### KV-cache affinity
 
-Routing decisions based on KV-cache affinity (routing requests to backends
-that already hold relevant KV-cache entries) are deferred until this
-normalization contract is stable.  The current `kv_cache_utilization` signal
-influences scoring but does not implement affinity-aware routing.
+Routing decisions based on KV-cache affinity — routing requests to backends
+that already hold relevant KV-cache entries — are not implemented in the current
+operator.  The `kv_cache_utilization` signal influences scoring but does not
+implement affinity-aware routing.
 
 ## Relevant files
 

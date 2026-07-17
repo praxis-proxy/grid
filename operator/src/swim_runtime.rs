@@ -28,7 +28,7 @@
 //! [`OperatorCtx`]: crate::controller::grid_network::OperatorCtx
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     net::SocketAddr,
     sync::Arc,
     time::{Duration, Instant},
@@ -72,6 +72,13 @@ pub struct SwimConfig {
     /// An empty list starts a single-node cluster; other peers must
     /// announce to this node to join.
     pub seeds: Vec<SocketAddr>,
+
+    /// Data-plane gateway address to advertise in SWIM state broadcasts.
+    ///
+    /// When set, this address is included in outbound `StateBroadcast` messages
+    /// as the `gateway_address` field, and remote peers will use it for
+    /// `GridSite.spec.egress.address` instead of the SWIM UDP endpoint.
+    pub gateway_address: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -107,6 +114,19 @@ struct TrackedMember {
     /// - Repeated Dead/Suspect events with an existing timestamp are ignored so the age grows monotonically from the
     ///   initial transition time.
     status_changed_at: Option<Instant>,
+
+    /// Data-plane gateway address for this member.
+    ///
+    /// Populated from the `gateway_addrs` map at snapshot time rather than
+    /// from membership events.  Always `None` until
+    /// [`members_snapshot`] enriches it.
+    gateway_address: Option<String>,
+
+    /// Public site certificate PEM for this member.
+    ///
+    /// Populated from the `cert_pems` map at snapshot time.
+    /// Contains only the public certificate — never a private key.
+    site_cert_pem: Option<String>,
 }
 
 impl TrackedMember {
@@ -124,6 +144,8 @@ impl TrackedMember {
             age_secs: self
                 .status_changed_at
                 .map_or(0, |t| now.saturating_duration_since(t).as_secs()),
+            gateway_address: self.gateway_address.clone(),
+            site_cert_pem: self.site_cert_pem.clone(),
         }
     }
 }
@@ -132,9 +154,29 @@ impl TrackedMember {
 ///
 /// `now` is injected so callers can use a fixed [`Instant`] for deterministic
 /// testing without sleeps.  In production, pass [`Instant::now()`].
-fn members_snapshot(tracked: &HashMap<String, TrackedMember>, now: Instant) -> MembershipSnapshot {
+///
+/// `gateway_addrs` is a map of site names to their data-plane gateway addresses,
+/// obtained from the [`StateBroadcastHandler`].  `cert_pems` is a map of site
+/// names to their public site certificate PEMs.  Both maps are used to enrich
+/// each [`MemberRecord`] in the returned snapshot.
+///
+/// [`StateBroadcastHandler`]: swim::StateBroadcastHandler
+fn members_snapshot(
+    tracked: &HashMap<String, TrackedMember>,
+    now: Instant,
+    gateway_addrs: &BTreeMap<String, String>,
+    cert_pems: &BTreeMap<String, String>,
+) -> MembershipSnapshot {
     MembershipSnapshot {
-        members: tracked.values().map(|t| t.to_member_record(now)).collect(),
+        members: tracked
+            .values()
+            .map(|t| {
+                let mut record = t.to_member_record(now);
+                record.gateway_address = gateway_addrs.get(&t.site_id).cloned();
+                record.site_cert_pem = cert_pems.get(&t.site_id).cloned();
+                record
+            })
+            .collect(),
     }
 }
 
@@ -240,6 +282,9 @@ pub struct SwimHandle {
     /// before calling [`SwimHandle::announce_seeds`].
     advertise_addr: SocketAddr,
 
+    /// Data-plane gateway address advertised in CRDT state broadcasts.
+    gateway_address: Option<String>,
+
     /// Watch channel receiver for SWIM membership snapshots.
     snapshot_rx: watch::Receiver<MembershipSnapshot>,
 
@@ -271,6 +316,12 @@ impl SwimHandle {
     #[must_use]
     pub fn local_addr(&self) -> SocketAddr {
         self.advertise_addr
+    }
+
+    /// Return the configured data-plane gateway address, if any.
+    #[must_use]
+    pub fn gateway_address(&self) -> Option<&str> {
+        self.gateway_address.as_deref()
     }
 
     /// Queue seed addresses for announcement to the SWIM runtime.
@@ -365,6 +416,7 @@ pub async fn start(config: SwimConfig) -> Result<Arc<SwimHandle>, SwimRuntimeErr
     let advertise_addr = config.advertise_addr.unwrap_or(local_addr);
 
     let site_name = config.site_name.clone();
+    let gateway_address = config.gateway_address.clone();
     let (snapshot_tx, snapshot_rx) = watch::channel(MembershipSnapshot::default());
     let (state_tx, state_rx) = watch::channel(GridStateSnapshot::new(site_name.clone()));
     let (timer_tx, timer_rx) = mpsc::channel::<TimerEvent>(256);
@@ -391,6 +443,7 @@ pub async fn start(config: SwimConfig) -> Result<Arc<SwimHandle>, SwimRuntimeErr
     Ok(Arc::new(SwimHandle {
         site_name,
         advertise_addr,
+        gateway_address,
         snapshot_rx,
         state_rx,
         broadcast_tx,
@@ -421,18 +474,35 @@ async fn run_loop(
     mut channels: RuntimeChannels,
     state_tx: watch::Sender<GridStateSnapshot>,
 ) {
-    let identity = NodeId::new(config.site_name, advertise_addr);
+    let site_name = config.site_name.clone();
+    let identity = NodeId::new(site_name.clone(), advertise_addr);
     let (event_tx, _event_rx) = mpsc::channel(1);
     let mut node = SwimNode::new(identity, event_tx);
     let mut tracked: HashMap<String, TrackedMember> = HashMap::new();
     let mut buf = vec![0_u8; 65_536];
     let mut age_tick = tokio::time::interval(Duration::from_secs(1));
+    let gateway_address = config.gateway_address.clone();
+    let mut gateway_address_revision = 0_u64;
+    let mut next_gateway_republish_at = Instant::now();
+
+    if let Some(gateway_address) = gateway_address.as_deref() {
+        publish_gateway_address_broadcast(&mut node, &site_name, gateway_address_revision, gateway_address);
+    }
 
     // Announce to seed peers.  Errors are logged inside SwimNode::announce.
     for &seed_addr in &config.seeds {
         let seed_id = NodeId::new(format!("seed-{seed_addr}"), seed_addr);
         let output = node.announce(seed_id);
-        drain_output(output, &socket, &channels.timer_tx, &mut tracked, &channels.snapshot_tx).await;
+        drain_output(
+            output,
+            &socket,
+            &channels.timer_tx,
+            &mut tracked,
+            &channels.snapshot_tx,
+            &node.gateway_addrs(),
+            &node.cert_pems(),
+        )
+        .await;
     }
 
     loop {
@@ -449,12 +519,44 @@ async fn run_loop(
                             &channels.timer_tx,
                             &mut tracked,
                             &channels.snapshot_tx,
+                            &node.gateway_addrs(),
+                            &node.cert_pems(),
                         )
                         .await;
                         // Publish updated CRDT state after every incoming UDP packet.
                         // Broadcasts are received inside handle_data, so the snapshot
                         // may have advanced.
                         drop(state_tx.send(node.state_snapshot()));
+                        // Gateway-address-only broadcasts update the node's gateway-address
+                        // map but may not emit a membership event.  Republish the
+                        // membership snapshot after every inbound packet so callers see the
+                        // latest gateway address attached to already-known members.
+                        drop(channels.snapshot_tx.send(members_snapshot(&tracked, Instant::now(), &node.gateway_addrs(), &node.cert_pems())));
+                        if let Some(gateway_address) = gateway_address.as_deref() {
+                            let now = Instant::now();
+                            if now >= next_gateway_republish_at {
+                                gateway_address_revision = gateway_address_revision.saturating_add(1);
+                                publish_gateway_address_broadcast(
+                                    &mut node,
+                                    &site_name,
+                                    gateway_address_revision,
+                                    gateway_address,
+                                );
+                                let output = node.gossip();
+                                drain_output(
+                                    output,
+                                    &socket,
+                                    &channels.timer_tx,
+                                    &mut tracked,
+                                    &channels.snapshot_tx,
+                                    &node.gateway_addrs(),
+                                    &node.cert_pems(),
+                                )
+                                .await;
+                                drop(state_tx.send(node.state_snapshot()));
+                                next_gateway_republish_at = now + Duration::from_secs(1);
+                            }
+                        }
                     }
                     Err(e) => tracing::warn!(error = %e, "SWIM UDP recv error"),
                 }
@@ -467,6 +569,8 @@ async fn run_loop(
                     &channels.timer_tx,
                     &mut tracked,
                     &channels.snapshot_tx,
+                    &node.gateway_addrs(),
+                    &node.cert_pems(),
                 )
                 .await;
             }
@@ -483,6 +587,8 @@ async fn run_loop(
                         &channels.timer_tx,
                         &mut tracked,
                         &channels.snapshot_tx,
+                        &node.gateway_addrs(),
+                        &node.cert_pems(),
                     )
                     .await;
                 }
@@ -500,6 +606,8 @@ async fn run_loop(
                         &channels.timer_tx,
                         &mut tracked,
                         &channels.snapshot_tx,
+                        &node.gateway_addrs(),
+                        &node.cert_pems(),
                     )
                     .await;
                 }
@@ -510,10 +618,28 @@ async fn run_loop(
                 // while any member is Dead/Suspect so age_secs advances even when
                 // no new membership event arrives.
                 if has_aging_members(&tracked) {
-                    drop(channels.snapshot_tx.send(members_snapshot(&tracked, Instant::now())));
+                    drop(channels.snapshot_tx.send(members_snapshot(&tracked, Instant::now(), &node.gateway_addrs(), &node.cert_pems())));
                 }
             }
         }
+    }
+}
+
+/// Queue a gateway-address-only state broadcast.
+///
+/// This is published at startup and re-published after SWIM activity so a node
+/// that joins before it has any local `GridNetwork` can still advertise its
+/// data-plane gateway address to peers.  The broadcast carries an empty CRDT
+/// snapshot and only updates the peer gateway-address map.
+fn publish_gateway_address_broadcast(node: &mut SwimNode, site_name: &str, revision: u64, gateway_address: &str) {
+    let broadcast = swim::StateBroadcast::new(
+        site_name.to_owned(),
+        revision,
+        GridStateSnapshot::new(site_name.to_owned()),
+        Some(gateway_address.to_owned()),
+    );
+    if let Err(e) = node.publish_state_broadcast(&broadcast) {
+        tracing::warn!(error = %e, "failed to encode gateway address broadcast");
     }
 }
 
@@ -522,12 +648,18 @@ async fn run_loop(
 /// Uses [`Instant::now()`] for age tracking so Dead/Suspect transitions record
 /// an accurate wall-clock start time.  The same `now` value is used for all
 /// events processed in a single call, ensuring consistency within one gossip round.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "distinct runtime state pointers; a wrapper struct would obscure the data-flow"
+)]
 async fn drain_output(
     output: swim::AccumulatedOutput,
     socket: &UdpSocket,
     timer_tx: &mpsc::Sender<TimerEvent>,
     tracked: &mut HashMap<String, TrackedMember>,
     snapshot_tx: &watch::Sender<MembershipSnapshot>,
+    gateway_addrs: &BTreeMap<String, String>,
+    cert_pems: &BTreeMap<String, String>,
 ) {
     for msg in output.messages {
         if let Err(e) = socket.send_to(&msg.data, msg.addr).await {
@@ -553,7 +685,7 @@ async fn drain_output(
         changed = true;
     }
     if changed {
-        drop(snapshot_tx.send(members_snapshot(tracked, now)));
+        drop(snapshot_tx.send(members_snapshot(tracked, now, gateway_addrs, cert_pems)));
     }
 }
 
@@ -571,6 +703,10 @@ async fn drain_output(
 /// | `Suspect` (first time or was `Alive`) | Set to `now` | `Suspect` |
 /// | `Suspect` (already `Suspect`/`Dead`) | Preserved (age grows monotonically) | `Suspect` |
 /// | `Left` / unknown (`Dead`) | Set to `now` if not already set | `Dead` |
+#[expect(
+    clippy::too_many_lines,
+    reason = "exhaustive match over all member-event variants with per-event age-tracking logic; splitting would obscure the status-change semantics"
+)]
 fn apply_member_event(event: MemberEvent, tracked: &mut HashMap<String, TrackedMember>, now: Instant) {
     match event {
         MemberEvent::Joined { site_name, addr } => {
@@ -584,6 +720,8 @@ fn apply_member_event(event: MemberEvent, tracked: &mut HashMap<String, TrackedM
                     incarnation: 0,
                     status: MemberStatus::Alive,
                     status_changed_at: None,
+                    gateway_address: None,
+                    site_cert_pem: None,
                 },
             );
         },
@@ -628,6 +766,8 @@ fn apply_left_event(site_name: String, tracked: &mut HashMap<String, TrackedMemb
             incarnation: 0,
             status: MemberStatus::Dead,
             status_changed_at: Some(now),
+            gateway_address: None,
+            site_cert_pem: None,
         },
     );
 }
@@ -755,7 +895,7 @@ mod tests {
         let mut tracked = HashMap::new();
         apply_member_event(joined("site-a"), &mut tracked, t);
         apply_member_event(joined("site-b"), &mut tracked, t);
-        let snap = members_snapshot(&tracked, t);
+        let snap = members_snapshot(&tracked, t, &BTreeMap::new(), &BTreeMap::new());
         assert_eq!(snap.connected_count(), 2, "two Alive members must give count=2");
     }
 
@@ -765,7 +905,7 @@ mod tests {
         let mut tracked = HashMap::new();
         apply_member_event(joined("site-a"), &mut tracked, t);
         apply_member_event(suspect("site-a"), &mut tracked, t);
-        let snap = members_snapshot(&tracked, t);
+        let snap = members_snapshot(&tracked, t, &BTreeMap::new(), &BTreeMap::new());
         assert_eq!(snap.connected_count(), 0, "Suspect member must not count as connected");
     }
 
@@ -812,7 +952,7 @@ mod tests {
         let t = now();
         let mut tracked = HashMap::new();
         apply_member_event(joined("site-a"), &mut tracked, t);
-        let snap = members_snapshot(&tracked, t);
+        let snap = members_snapshot(&tracked, t, &BTreeMap::new(), &BTreeMap::new());
         let m = snap.members.first().unwrap_or_else(|| std::process::abort());
         assert_eq!(m.age_secs, 0, "Alive member must have age_secs=0");
     }
@@ -825,7 +965,7 @@ mod tests {
         let mut tracked = HashMap::new();
         apply_member_event(joined("site-a"), &mut tracked, t0);
         apply_member_event(suspect("site-a"), &mut tracked, t_suspect);
-        let snap = members_snapshot(&tracked, t_suspect);
+        let snap = members_snapshot(&tracked, t_suspect, &BTreeMap::new(), &BTreeMap::new());
         let m = snap.members.first().unwrap_or_else(|| std::process::abort());
         assert_eq!(m.status, MemberStatus::Suspect);
         assert_eq!(m.age_secs, 0, "age at the moment of transition must be 0");
@@ -839,7 +979,7 @@ mod tests {
         let mut tracked = HashMap::new();
         apply_member_event(joined("site-a"), &mut tracked, t0);
         apply_member_event(suspect("site-a"), &mut tracked, t_suspect);
-        let snap = members_snapshot(&tracked, t_snap);
+        let snap = members_snapshot(&tracked, t_snap, &BTreeMap::new(), &BTreeMap::new());
         let m = snap.members.first().unwrap_or_else(|| std::process::abort());
         assert_eq!(m.status, MemberStatus::Suspect);
         assert_eq!(m.age_secs, 60, "age must be elapsed since transition (70s - 10s = 60s)");
@@ -853,7 +993,12 @@ mod tests {
         apply_member_event(joined("site-a"), &mut tracked, t0);
         apply_member_event(suspect("site-a"), &mut tracked, t0 + Duration::from_secs(10));
         apply_member_event(suspect("site-a"), &mut tracked, t0 + Duration::from_secs(50));
-        let snap = members_snapshot(&tracked, t0 + Duration::from_secs(70));
+        let snap = members_snapshot(
+            &tracked,
+            t0 + Duration::from_secs(70),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        );
         let m = snap.members.first().unwrap_or_else(|| std::process::abort());
         assert_eq!(m.age_secs, 60, "repeated Suspect must not reset age clock");
     }
@@ -866,7 +1011,7 @@ mod tests {
         let mut tracked = HashMap::new();
         apply_member_event(joined("site-a"), &mut tracked, t0);
         apply_member_event(left("site-a"), &mut tracked, t_dead);
-        let snap = members_snapshot(&tracked, t_snap);
+        let snap = members_snapshot(&tracked, t_snap, &BTreeMap::new(), &BTreeMap::new());
         let m = snap.members.first().unwrap_or_else(|| std::process::abort());
         assert_eq!(m.status, MemberStatus::Dead);
         assert_eq!(m.age_secs, 60, "dead age must be 80s - 20s = 60s");
@@ -880,7 +1025,12 @@ mod tests {
         apply_member_event(joined("site-a"), &mut tracked, t0);
         apply_member_event(suspect("site-a"), &mut tracked, t0 + Duration::from_secs(10));
         apply_member_event(left("site-a"), &mut tracked, t0 + Duration::from_secs(40));
-        let snap = members_snapshot(&tracked, t0 + Duration::from_secs(70));
+        let snap = members_snapshot(
+            &tracked,
+            t0 + Duration::from_secs(70),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        );
         let m = snap.members.first().unwrap_or_else(|| std::process::abort());
         assert_eq!(m.status, MemberStatus::Dead);
         assert_eq!(
@@ -897,7 +1047,12 @@ mod tests {
         apply_member_event(left("site-a"), &mut tracked, t0 + Duration::from_secs(10));
         // Rejoin clears status_changed_at → age=0.
         apply_member_event(joined("site-a"), &mut tracked, t0 + Duration::from_secs(50));
-        let snap = members_snapshot(&tracked, t0 + Duration::from_secs(70));
+        let snap = members_snapshot(
+            &tracked,
+            t0 + Duration::from_secs(70),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        );
         let m = snap.members.first().unwrap_or_else(|| std::process::abort());
         assert_eq!(m.status, MemberStatus::Alive);
         assert_eq!(m.age_secs, 0, "rejoined Alive member must have age=0");
@@ -910,7 +1065,7 @@ mod tests {
         let t_snap = t0 + Duration::from_secs(75);
         let mut tracked = HashMap::new();
         apply_member_event(left("unknown-site"), &mut tracked, t_dead);
-        let snap = members_snapshot(&tracked, t_snap);
+        let snap = members_snapshot(&tracked, t_snap, &BTreeMap::new(), &BTreeMap::new());
         let m = snap.members.first().unwrap_or_else(|| std::process::abort());
         assert_eq!(m.status, MemberStatus::Dead);
         assert_eq!(m.age_secs, 60, "unknown Left tombstone age must be 75s - 15s = 60s");
@@ -932,12 +1087,37 @@ mod tests {
         let handle = SwimHandle {
             site_name: "test".to_owned(),
             advertise_addr: "127.0.0.1:7946".parse().unwrap_or_else(|_| std::process::abort()),
+            gateway_address: None,
             snapshot_rx,
             state_rx,
             broadcast_tx,
             seed_tx,
         };
         (handle, snapshot_tx, state_tx)
+    }
+
+    #[test]
+    fn handle_exposes_gateway_address() {
+        let (snapshot_tx, snapshot_rx) = watch::channel(MembershipSnapshot::default());
+        let (state_tx, state_rx) = watch::channel(GridStateSnapshot::new("test".to_owned()));
+        let (broadcast_tx, _broadcast_rx) = mpsc::channel(1);
+        let (seed_tx, _seed_rx) = mpsc::channel(16);
+        let handle = SwimHandle {
+            site_name: "test".to_owned(),
+            advertise_addr: "127.0.0.1:7946".parse().unwrap_or_else(|_| std::process::abort()),
+            gateway_address: Some("127.0.0.1:19080".to_owned()),
+            snapshot_rx,
+            state_rx,
+            broadcast_tx,
+            seed_tx,
+        };
+        drop((snapshot_tx, state_tx));
+
+        assert_eq!(
+            handle.gateway_address(),
+            Some("127.0.0.1:19080"),
+            "handle must expose configured gateway address for state broadcasts"
+        );
     }
 
     #[test]
@@ -959,6 +1139,8 @@ mod tests {
                 incarnation: 0,
                 status: MemberStatus::Alive,
                 age_secs: 0,
+                gateway_address: None,
+                site_cert_pem: None,
             }],
         };
         drop(snapshot_tx.send(snap_with_member));
@@ -1038,6 +1220,7 @@ mod tests {
         let handle = SwimHandle {
             site_name: "test".to_owned(),
             advertise_addr: "127.0.0.1:7946".parse().unwrap_or_else(|_| std::process::abort()),
+            gateway_address: None,
             snapshot_rx,
             state_rx,
             broadcast_tx,
@@ -1062,6 +1245,7 @@ mod tests {
         let handle = SwimHandle {
             site_name: "test".to_owned(),
             advertise_addr: "127.0.0.1:7946".parse().unwrap_or_else(|_| std::process::abort()),
+            gateway_address: None,
             snapshot_rx,
             state_rx,
             broadcast_tx,
@@ -1089,6 +1273,7 @@ mod tests {
             advertise_addr: None,
             site_name: "test-node".to_owned(),
             seeds: Vec::new(),
+            gateway_address: None,
         };
         let handle = start(cfg).await;
         assert!(handle.is_ok(), "start must succeed with an available port");
@@ -1109,6 +1294,7 @@ mod tests {
             advertise_addr: None,
             site_name: "test".to_owned(),
             seeds: Vec::new(),
+            gateway_address: None,
         };
         let result = start(cfg).await;
         assert!(result.is_err(), "start on an already-bound port must fail");
@@ -1126,6 +1312,7 @@ mod tests {
             advertise_addr: Some(addr1),
             site_name: "node-1".to_owned(),
             seeds: Vec::new(),
+            gateway_address: None,
         };
         let handle1 = start(cfg1).await.unwrap_or_else(|_| std::process::abort());
 
@@ -1134,6 +1321,7 @@ mod tests {
             advertise_addr: Some(addr2),
             site_name: "node-2".to_owned(),
             seeds: vec![addr1],
+            gateway_address: None,
         };
         let handle2 = start(cfg2).await.unwrap_or_else(|_| std::process::abort());
 

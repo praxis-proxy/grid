@@ -135,9 +135,10 @@ pub struct GatewayRef {
 /// `grid_route` candidates, `grid_credential_inject` (when credential-bearing
 /// candidates are present), and a `load_balancer` section.
 ///
-/// When `clusterEndpoints` is populated, each listed cluster receives a full
-/// load-balancer entry with an endpoint address and optional mTLS configuration.
-/// Clusters without a matching entry receive a name-only stub.
+/// Every cluster referenced by a routing candidate must have a matching
+/// `clusterEndpoints` entry.  Missing endpoint topology causes config generation
+/// to fail with status reason `MissingClusterEndpoint` instead of rendering an
+/// incomplete `load_balancer` cluster.
 ///
 /// # Security
 ///
@@ -171,17 +172,17 @@ pub struct ConsumerConfig {
     /// Endpoint topology for the generated `load_balancer` section.
     ///
     /// Each entry maps a routing candidate cluster name to a reachable endpoint
-    /// address and optional mTLS configuration.  When an entry is provided for a
-    /// cluster, the generated config includes a full cluster entry (endpoint URL
-    /// and TLS config when `sni` is set).  Clusters not listed here receive a
-    /// name-only stub.
+    /// address and optional mTLS configuration.  Every cluster referenced by a
+    /// routing candidate must have a matching entry here.  Missing endpoint
+    /// topology causes config generation to fail with `MissingClusterEndpoint`
+    /// status instead of rendering an incomplete `load_balancer` cluster.
     ///
     /// In production, this is populated by whoever manages the consumer gateway
     /// deployment (platform automation, the gateway operator, or a Helm chart).
     /// In local Kind validation, the xtask harness discovers `NodePort` addresses
     /// and populates this field in the test fixture.
     ///
-    /// Default: empty — all clusters render as name-only stubs.
+    /// Default: empty — valid only when the rendered overlay has no candidates.
     #[serde(default)]
     pub cluster_endpoints: Vec<ClusterEndpointConfig>,
 
@@ -343,6 +344,75 @@ pub struct GridNetworkStatus {
     /// Current lifecycle phase.
     #[serde(default)]
     pub phase: GridNetworkPhase,
+
+    /// Per-gateway consumer Praxis config render and apply status.
+    ///
+    /// Populated for every gateway reference that has `consumerConfig.enabled: true`.
+    /// Gateways without `consumerConfig` are omitted.  Use this field to
+    /// determine whether the operator successfully rendered and applied a
+    /// consumer `ConfigMap` for each opted-in gateway.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub consumer_config_status: Vec<ConsumerConfigStatus>,
+}
+
+/// Phase of an operator-generated consumer Praxis `ConfigMap` for one gateway.
+#[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+pub enum ConsumerConfigPhase {
+    /// Consumer config was successfully rendered and applied.
+    Rendered,
+    /// Consumer config render or apply failed.
+    Error,
+    /// Consumer config generation is disabled for this gateway.
+    #[default]
+    Disabled,
+}
+
+/// Per-gateway status for operator-managed consumer Praxis config generation.
+///
+/// Reported in [`GridNetworkStatus::consumer_config_status`] for each gateway
+/// reference with `consumerConfig.enabled: true`.
+///
+/// # Security
+///
+/// `message` must never contain credential token bytes.  Error messages from
+/// rendering only describe structural problems (blank fields, unsupported
+/// strategies); credential bytes are never included.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConsumerConfigStatus {
+    /// Name of the `GatewayRef` this status entry corresponds to.
+    pub gateway_name: String,
+
+    /// Namespace of the gateway (and the generated `ConfigMap`).
+    pub namespace: String,
+
+    /// Name of the generated `ConfigMap`.
+    ///
+    /// Populated from `consumerConfig.configMapName`; empty for `Disabled` entries.
+    #[serde(default)]
+    pub config_map_name: String,
+
+    /// Current render/apply phase.
+    pub phase: ConsumerConfigPhase,
+
+    /// Machine-readable reason for the current phase.
+    ///
+    /// `""` when `phase` is `Rendered`.
+    /// One of `MissingClusterEndpoint`, `ConsumerConfigRenderFailed`,
+    /// `ConsumerConfigApplyFailed`, `ConsumerConfigDisabled`
+    /// otherwise.
+    #[serde(default)]
+    pub reason: String,
+
+    /// Human-readable diagnostic message.
+    ///
+    /// Never contains credential token bytes.
+    #[serde(default)]
+    pub message: String,
+
+    /// `GridNetwork` generation when this entry was last updated.
+    #[serde(default)]
+    pub observed_generation: i64,
 }
 
 /// Lifecycle phase of a [`GridNetwork`].
