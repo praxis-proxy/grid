@@ -394,24 +394,60 @@ pub(crate) enum Action {
     /// of `cargo run -p operator --bin generate_crds`.
     VerifyCrdSchema,
 
-    /// Prove that CRDT/SWIM-distributed provider records appear in the
-    /// operator-generated routing overlay.
+    /// Prove that SWIM transport AES-256-GCM encryption is enforced.
     ///
-    /// Starts two SWIM-enabled operator processes against the same kind
-    /// cluster.  Applies a `GridNetwork` with a `gatewayRef` and an
-    /// `InferenceProvider` so both operators publish real CRDT state.  After
-    /// gossip convergence and `distributedProviderCount > 0`, reads the
-    /// generated overlay `ConfigMap` and asserts that at least one candidate
-    /// has a `site` value from the remote operator (not the primary site).
+    /// Five scenarios: (A) env-keyed peers converge, (B) SecretRef-keyed
+    /// peers converge, (C) wrong-key peer rejected, (D) plaintext peer
+    /// rejected, (E) missing Secret prevents plaintext sends.
     ///
-    /// Proves that remote CRDT provider records flow from SWIM into the overlay
-    /// rendering pipeline end-to-end.
+    /// Requires the multisite kind environment.  Safe to rerun: fixtures
+    /// are deleted at the start of each run.
+    VerifySwimEncryption {
+        /// Path to the multisite environment config file.
+        #[arg(short, long, default_value = "tests/env/operator-routing-multisite.toml")]
+        config: PathBuf,
+
+        /// Kind cluster context to run against (first provider site by default).
+        #[arg(long)]
+        site: Option<String>,
+    },
+
+    /// Prove that CRDT/SWIM-distributed provider records appear in the routing overlay.
+    ///
+    /// Starts two SWIM-enabled operator processes with the same SWIM encryption
+    /// key and proves that CRDT state from the secondary peer enters the overlay.
+    /// Also proves that a peer with a wrong key and a plaintext peer cannot join.
     ///
     /// Requires a kind cluster.  Run `env up` first.  Safe to rerun: fixtures
     /// are deleted at the start of each run.
     VerifySwimOverlay {
         /// Path to the environment config file.
         #[arg(short, long, default_value = "tests/env/operator-routing.toml")]
+        config: PathBuf,
+
+        /// Kind cluster context to run against (first provider site by default).
+        #[arg(long)]
+        site: Option<String>,
+    },
+
+    /// Prove transitive SWIM discovery, provider propagation, and routing eligibility
+    /// across a three-node mesh.
+    ///
+    /// Spawns three operator processes:
+    /// - Node A: no seeds (origin).
+    /// - Node B: seeds A (bridge).
+    /// - Node C: seeds B only — not A (leaf).
+    ///
+    /// After SWIM gossip, A learns about C transitively through B.  The test proves:
+    /// 1. A's `distributedProviderCount >= 2` (received CRDT from both B and C).
+    /// 2. C's candidate is absent from A's overlay before C's `GridSite` is `Active`.
+    /// 3. After `Active`, C's candidate appears in A's overlay.
+    /// 4. Wrong-network provider records are absent from A's correct-network overlay.
+    ///
+    /// Requires the multisite kind environment.  Safe to rerun.
+    VerifySwimMeshThreeNode {
+        /// Path to the multisite environment config file.
+        #[arg(short, long, default_value = "tests/env/operator-routing-multisite.toml")]
         config: PathBuf,
 
         /// Kind cluster context to run against (first provider site by default).
@@ -442,6 +478,46 @@ pub(crate) enum Action {
         /// Path to the two-provider environment config file.
         #[arg(short, long, default_value = "tests/env/operator-routing-two-provider.toml")]
         config: PathBuf,
+    },
+
+    /// Prove the full fingerprint trust-promotion lifecycle for a `GridSite`.
+    ///
+    /// Spawns two SWIM-enabled operators.  Node B has TLS configured so it
+    /// broadcasts its public certificate.  The test proves:
+    ///
+    /// 1. B reaches `Connecting` with gateway reachable.
+    /// 2. `status.reason` is `TrustPolicyMissing` (cert present, no fingerprint configured).
+    /// 3. With a wrong fingerprint: `TrustPolicyMismatch`.
+    /// 4. With the correct fingerprint: operator promotes to `Active` (`TrustPolicyVerified`).
+    /// 5. Before `Active`: B's CRDT provider absent from A's overlay.
+    /// 6. After `Active`: B's CRDT provider present in A's overlay.
+    ///
+    /// Requires the multisite kind environment.  Safe to rerun.
+    VerifyGridsiteTrustFingerprint {
+        /// Path to the multisite environment config file.
+        #[arg(short, long, default_value = "tests/env/operator-routing-multisite.toml")]
+        config: PathBuf,
+
+        /// Kind cluster context to run against (first provider site by default).
+        #[arg(long)]
+        site: Option<String>,
+    },
+
+    /// Print the SHA-256 fingerprint of a `GridSite.status.publicCertPem`.
+    ///
+    /// Reads the public certificate PEM from the named `GridSite` status and
+    /// prints the colon-separated SHA-256 fingerprint suitable for use as
+    /// `spec.trust.certFingerprint`.
+    ///
+    /// Never prints private key material.
+    GridsiteFingerprint {
+        /// Kubernetes context to use.
+        #[arg(long)]
+        context: String,
+
+        /// Name of the `GridSite` resource.
+        #[arg(long)]
+        name: String,
     },
 
     /// Verify the Demo 1 llm-d-style two-provider model routing topology.
@@ -518,21 +594,20 @@ pub(crate) enum Action {
     ///
     /// Starts a primary SWIM operator and a joining SWIM operator, waits for
     /// membership formation, then advances the joining `GridSite`'s lifecycle
-    /// through `Pending → Discovered → Connecting → Active` via harness-assisted
-    /// status patches.  The operator preserves each phase through reconciliation,
-    /// proving that the lifecycle type system is end-to-end functional.
+    /// through `Pending → Discovered → Connecting → Active`.  Only `Discovered`
+    /// is harness-patched; `Connecting` and `Active` are driven by the
+    /// `GridSite` controller.  `Active` requires the TCP probe to succeed and
+    /// the configured `spec.trust.certFingerprint` to match `status.publicCertPem`.
     ///
     /// Also verifies:
     /// - the joined site has routing-relevant spec fields (egress, network, identity)
     /// - an overlay generated for the correct network contains both primary and joining site candidates
     /// - a wrong-network `GridSite` is absent from the correct-network overlay
     ///
-    /// Attribution is structural: harness-assisted phase transitions simulate
-    /// the SWIM discovery and mTLS exchange steps that will be automatic in
-    /// Phase 2.  Requires the two-provider kind environment.  Safe to rerun.
+    /// Requires the multisite kind environment.  Safe to rerun.
     VerifySiteJoinDiscovery {
-        /// Path to the two-provider environment config file.
-        #[arg(short, long, default_value = "tests/env/operator-routing-two-provider.toml")]
+        /// Path to the multisite environment config file.
+        #[arg(short, long, default_value = "tests/env/operator-routing-multisite.toml")]
         config: PathBuf,
     },
 
@@ -621,7 +696,13 @@ pub(crate) fn run(action: &Action) -> Result<(), Box<dyn std::error::Error>> {
         Action::VerifyApiFallback { config, site } => env_verify_api_fallback(config, site.as_deref()),
         Action::VerifyApiFallbackNative { config, site } => env_verify_api_fallback_native(config, site.as_deref()),
         Action::VerifyCrdSchema => env_verify_crd_schema(),
+        Action::VerifySwimEncryption { config, site } => env_verify_swim_encryption(config, site.as_deref()),
         Action::VerifySwimOverlay { config, site } => env_verify_swim_overlay(config, site.as_deref()),
+        Action::VerifySwimMeshThreeNode { config, site } => env_verify_swim_mesh_three_node(config, site.as_deref()),
+        Action::VerifyGridsiteTrustFingerprint { config, site } => {
+            env_verify_gridsite_trust_fingerprint(config, site.as_deref())
+        },
+        Action::GridsiteFingerprint { context, name } => env_gridsite_fingerprint(context.as_str(), name.as_str()),
         Action::VerifySwimRouting { config } => env_verify_swim_routing(config),
         Action::VerifyDemo1LlmdRouting { config } => env_verify_demo1_llmd_routing(config),
         Action::VerifyFullGridRouting { config } => env_verify_full_grid_routing(config),
@@ -1337,14 +1418,14 @@ fn run_operator_reconcile(context: &str) -> Result<PathBuf, Box<dyn std::error::
     operator::apply_error_endpoint_fixture(context)?;
     operator::wait_for_error_endpoint_ready(context, POD_READY_TIMEOUT)?;
 
-    // Step 2b: deploy metrics endpoint Pods.
+    // Step 3: deploy metrics endpoint Pods.
     // Each Pod serves a fixed Prometheus gauge for queue depth.  They are deployed
     // before spawning the operator so they are ready when the first reconcile fires.
     // - idle Pod → provider_queue_depth_normalized 0.1 (low queue → high score)
     // - busy Pod → provider_queue_depth_normalized 0.9 (high queue → low score)
     operator::apply_and_wait_for_metrics_pods(context, POD_READY_TIMEOUT)?;
 
-    // Step 3: port-forward all endpoints so the out-of-cluster operator can reach them.
+    // Step 4: port-forward all endpoints so the out-of-cluster operator can reach them.
     let pf_child = operator::start_error_endpoint_port_forward(context)?;
     let mut pf_guard = ProcGuard(Some(pf_child), ERROR_ENDPOINT_NAME);
 
@@ -1356,7 +1437,7 @@ fn run_operator_reconcile(context: &str) -> Result<PathBuf, Box<dyn std::error::
         operator::start_named_pod_port_forward(context, TEST_METRICS_BUSY_PROVIDER, METRICS_BUSY_LOCAL_PORT)?;
     let mut pf_busy_guard = ProcGuard(Some(pf_busy_child), TEST_METRICS_BUSY_PROVIDER);
 
-    // Step 4: spawn the operator out-of-cluster.
+    // Step 5: spawn the operator out-of-cluster.
     let op_child = operator::spawn_operator(context)?;
     eprintln!("  operator spawned (PID {})", op_child.id());
     let mut op_guard = ProcGuard(Some(op_child), "operator");
@@ -1365,7 +1446,7 @@ fn run_operator_reconcile(context: &str) -> Result<PathBuf, Box<dyn std::error::
     let metrics_idle_endpoint = format!("http://127.0.0.1:{METRICS_IDLE_LOCAL_PORT}");
     let metrics_busy_endpoint = format!("http://127.0.0.1:{METRICS_BUSY_LOCAL_PORT}");
 
-    // Step 5: apply InferenceProvider fixtures.
+    // Step 6: apply InferenceProvider fixtures.
     // GridNetwork is created first; providers follow so the operator resolves gridNetworkRef immediately.
     // api_provider is last to prove scoring is score-driven, not input-order-driven.
     //
@@ -1383,7 +1464,7 @@ fn run_operator_reconcile(context: &str) -> Result<PathBuf, Box<dyn std::error::
     operator::apply_api_provider_fixture(context, api_endpoint)?;
     operator::apply_metrics_provider_fixtures(context, &metrics_idle_endpoint, &metrics_busy_endpoint)?;
 
-    // Step 6–7: wait for reconciliation and verify overlay.
+    // Step 7: wait for reconciliation and verify overlay.
     let result = (|| -> Result<PathBuf, Box<dyn std::error::Error>> {
         operator::wait_for_provider_phase(context, TEST_PROVIDER_INVALID, "Unavailable", STATUS_POLL_TIMEOUT)?;
         operator::wait_for_provider_phase(context, TEST_PROVIDER_HEALTHY, "Pending", STATUS_POLL_TIMEOUT)?;
@@ -1411,7 +1492,7 @@ fn run_operator_reconcile(context: &str) -> Result<PathBuf, Box<dyn std::error::
             TEST_METRICS_BUSY_ROUTING_CLUSTER,
         )?;
 
-        // Step 8: export overlay for consumer gateway handoff.
+        // Step 8: export overlay for consumer gateway use.
         let path = operator::export_overlay_to_file(context, TEST_NETWORK, TEST_GATEWAY_NAME, TEST_GATEWAY_NS)?;
         eprintln!("  overlay exported: {}", path.display());
         Ok(path)
@@ -1812,6 +1893,315 @@ fn env_verify_swim_state(config: &Path, site: Option<&str>) -> Result<(), Box<dy
     Ok(())
 }
 
+/// Prove that SWIM transport AES-256-GCM encryption is enforced.
+///
+/// Five scenarios tested sequentially:
+///
+/// **A. Positive — env-keyed peers converge:** operators A and B share the same key;
+/// B's CRDT provider state propagates to A's `GridNetwork.status.distributedProviderCount`.
+///
+/// **B. Positive — SecretRef-keyed peers converge:** operators A and B start
+/// without `GRID_SWIM_ENCRYPT_KEY`.  The `GridNetwork` references a Kubernetes
+/// Secret via `spec.tls.swimKeyRef`; after reconcile, A uses a CRD-declared seed
+/// to join B with the Secret-backed key.
+///
+/// **C. Negative — wrong-key peer rejected:** A is keyed; C has a different key
+/// and seeds A's address.  A drops all of C's packets, so C is never admitted
+/// to A's SWIM membership.  During the observation window, A's `connectedSites == 0`
+/// and `distributedProviderCount == 0`.
+///
+/// **D. Negative — plaintext peer rejected:** A is keyed; D has no key.  A drops
+/// D's unencrypted packets for the same reason.  During the observation window,
+/// A's `connectedSites == 0` and `distributedProviderCount == 0`.
+///
+/// **E. Negative — missing Secret prevents plaintext sends:** A and B start
+/// without `GRID_SWIM_ENCRYPT_KEY`.  The `GridNetwork` configures `swimKeyRef`
+/// pointing to a Secret that does not exist.  Both operators' reconcile fails
+/// before seed announcement or provider broadcast.  During the observation
+/// window, A's `connectedSites == 0` and `distributedProviderCount == 0`.
+/// This proves fail-closed behavior: a configured `swimKeyRef` with a missing
+/// Secret does not silently degrade to plaintext.
+///
+/// All five scenarios are **hard failures** — they fail the test, not emit warnings.
+///
+/// Requires a kind cluster.  Run `env up` first.  Safe to rerun.
+#[expect(
+    clippy::too_many_lines,
+    reason = "five sequential SWIM encryption scenarios; splitting would obscure the test data flow"
+)]
+fn env_verify_swim_encryption(config: &Path, site: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    use operator::{
+        SWIM_CONVERGENCE_WAIT, SWIM_ENCRYPT_NETWORK, SWIM_ENCRYPT_NODE_A, SWIM_ENCRYPT_NODE_B, SWIM_ENCRYPT_NODE_PLAIN,
+        SWIM_ENCRYPT_NODE_WRONG, SWIM_STATUS_POLL_TIMEOUT,
+    };
+
+    let cfg = EnvConfig::from_file(config)?;
+    let context = resolve_operator_context(&cfg, site)?;
+    eprintln!("verify-swim-encryption: context={context}");
+
+    operator::install_grid_crds(&context)?;
+
+    // Generate two distinct keys.  key_ab is shared between A and B; key_wrong belongs to C only.
+    let key_ab = operator::generate_swim_key_hex();
+    let key_wrong = operator::generate_swim_key_hex();
+
+    // ── Scenario A: Keyed peers converge (positive) ───────────────────────────
+    eprintln!("verify-swim-encryption: [1/5] positive — env-keyed peers A + B converge...");
+    operator::cleanup_swim_encrypt_test_resources(&context)?;
+
+    let (bind_a, bind_b) = reserve_swim_bind_addrs()?;
+    let op_a = operator::spawn_operator_with_swim_keyed(
+        &context,
+        &bind_a,
+        &bind_a,
+        SWIM_ENCRYPT_NODE_A,
+        "",
+        None,
+        Some(&key_ab),
+    )?;
+    let mut op_a_guard = ProcGuard(Some(op_a), "encrypt-op-a");
+    let op_b = operator::spawn_operator_with_swim_keyed(
+        &context,
+        &bind_b,
+        &bind_b,
+        SWIM_ENCRYPT_NODE_B,
+        &bind_a,
+        None,
+        Some(&key_ab),
+    )?;
+    let mut op_b_guard = ProcGuard(Some(op_b), "encrypt-op-b");
+
+    operator::wait_for_swim_convergence(SWIM_CONVERGENCE_WAIT);
+    operator::apply_swim_encrypt_test_fixtures(&context, SWIM_ENCRYPT_NODE_A)?;
+
+    // A must see B in SWIM membership (connectedSites >= 1) — proves shared-key peers join.
+    let convergence_result =
+        operator::wait_for_gridnetwork_active(&context, SWIM_ENCRYPT_NETWORK, SWIM_STATUS_POLL_TIMEOUT);
+
+    if let Some(c) = op_a_guard.0.take() {
+        operator::kill_operator(c);
+    }
+    if let Some(c) = op_b_guard.0.take() {
+        operator::kill_operator(c);
+    }
+    operator::cleanup_swim_encrypt_test_resources(&context)?;
+
+    let connected = convergence_result?;
+    eprintln!("  [PASS] keyed peers A + B converged: connectedSites={connected}");
+
+    // ── Scenario B: Secret-backed CRD key peers converge (positive) ───────────
+    eprintln!("verify-swim-encryption: [2/5] positive — swimKeyRef Secret peers A + B converge...");
+    operator::cleanup_swim_encrypt_test_resources(&context)?;
+
+    let (bind_secret_a, bind_secret_b) = reserve_swim_bind_addrs()?;
+    let op_secret_a = operator::spawn_operator_with_swim_keyed(
+        &context,
+        &bind_secret_a,
+        &bind_secret_a,
+        SWIM_ENCRYPT_NODE_A,
+        "",
+        None,
+        None,
+    )?;
+    let mut op_secret_a_guard = ProcGuard(Some(op_secret_a), "encrypt-op-secret-a");
+    let op_secret_b = operator::spawn_operator_with_swim_keyed(
+        &context,
+        &bind_secret_b,
+        &bind_secret_b,
+        SWIM_ENCRYPT_NODE_B,
+        "",
+        None,
+        None,
+    )?;
+    let mut op_secret_b_guard = ProcGuard(Some(op_secret_b), "encrypt-op-secret-b");
+
+    operator::apply_swim_encrypt_key_secret(&context, "0123456789abcdefghijklmnopqrstuv")?;
+    operator::apply_swim_encrypt_test_fixtures_with_options(
+        &context,
+        SWIM_ENCRYPT_NODE_A,
+        std::slice::from_ref(&bind_secret_b),
+        true,
+    )?;
+
+    let secret_convergence_result =
+        operator::wait_for_gridnetwork_active(&context, SWIM_ENCRYPT_NETWORK, SWIM_STATUS_POLL_TIMEOUT);
+
+    if let Some(c) = op_secret_a_guard.0.take() {
+        operator::kill_operator(c);
+    }
+    if let Some(c) = op_secret_b_guard.0.take() {
+        operator::kill_operator(c);
+    }
+    operator::cleanup_swim_encrypt_test_resources(&context)?;
+
+    let secret_connected = secret_convergence_result?;
+    eprintln!("  [PASS] swimKeyRef Secret peers A + B converged: connectedSites={secret_connected}");
+
+    // ── Scenario C: Wrong-key peer cannot join (negative) ─────────────────────
+    eprintln!("verify-swim-encryption: [3/5] negative — wrong-key peer C is rejected by A...");
+    operator::cleanup_swim_encrypt_test_resources(&context)?;
+
+    let (bind_a2, bind_wrong) = reserve_swim_bind_addrs()?;
+    let op_a2 = operator::spawn_operator_with_swim_keyed(
+        &context,
+        &bind_a2,
+        &bind_a2,
+        SWIM_ENCRYPT_NODE_A,
+        "",
+        None,
+        Some(&key_ab),
+    )?;
+    let mut op_a2_guard = ProcGuard(Some(op_a2), "encrypt-op-a2");
+    let op_wrong = operator::spawn_operator_with_swim_keyed(
+        &context,
+        &bind_wrong,
+        &bind_wrong,
+        SWIM_ENCRYPT_NODE_WRONG,
+        &bind_a2, // C seeds A — but A drops all of C's packets (wrong key)
+        None,
+        Some(&key_wrong),
+    )?;
+    let mut op_wrong_guard = ProcGuard(Some(op_wrong), "encrypt-op-wrong");
+
+    operator::wait_for_swim_convergence(SWIM_CONVERGENCE_WAIT);
+    operator::apply_swim_encrypt_test_fixtures(&context, SWIM_ENCRYPT_NODE_A)?;
+
+    // A must NOT see C in SWIM membership, CRDT state, or overlay candidates.
+    let wrong_rejection_result = operator::assert_swim_peer_stays_isolated(
+        &context,
+        SWIM_ENCRYPT_NETWORK,
+        operator::SWIM_ENCRYPT_GW,
+        SWIM_ENCRYPT_NODE_WRONG,
+        SWIM_CONVERGENCE_WAIT,
+    );
+
+    if let Some(c) = op_a2_guard.0.take() {
+        operator::kill_operator(c);
+    }
+    if let Some(c) = op_wrong_guard.0.take() {
+        operator::kill_operator(c);
+    }
+    operator::cleanup_swim_encrypt_test_resources(&context)?;
+
+    wrong_rejection_result?;
+
+    // ── Scenario D: Plaintext peer cannot join (negative) ────────────────────
+    eprintln!("verify-swim-encryption: [4/5] negative — plaintext peer D is rejected by keyed A...");
+    operator::cleanup_swim_encrypt_test_resources(&context)?;
+
+    let (bind_a3, bind_plain) = reserve_swim_bind_addrs()?;
+    let op_a3 = operator::spawn_operator_with_swim_keyed(
+        &context,
+        &bind_a3,
+        &bind_a3,
+        SWIM_ENCRYPT_NODE_A,
+        "",
+        None,
+        Some(&key_ab),
+    )?;
+    let mut op_a3_guard = ProcGuard(Some(op_a3), "encrypt-op-a3");
+    let op_plain = operator::spawn_operator_with_swim_keyed(
+        &context,
+        &bind_plain,
+        &bind_plain,
+        SWIM_ENCRYPT_NODE_PLAIN,
+        &bind_a3, // D seeds A — but A drops D's plaintext packets
+        None,
+        None, // no key: plaintext
+    )?;
+    let mut op_plain_guard = ProcGuard(Some(op_plain), "encrypt-op-plain");
+
+    operator::wait_for_swim_convergence(SWIM_CONVERGENCE_WAIT);
+    operator::apply_swim_encrypt_test_fixtures(&context, SWIM_ENCRYPT_NODE_A)?;
+
+    let plaintext_rejection_result = operator::assert_swim_peer_stays_isolated(
+        &context,
+        SWIM_ENCRYPT_NETWORK,
+        operator::SWIM_ENCRYPT_GW,
+        SWIM_ENCRYPT_NODE_PLAIN,
+        SWIM_CONVERGENCE_WAIT,
+    );
+
+    if let Some(c) = op_a3_guard.0.take() {
+        operator::kill_operator(c);
+    }
+    if let Some(c) = op_plain_guard.0.take() {
+        operator::kill_operator(c);
+    }
+    operator::cleanup_swim_encrypt_test_resources(&context)?;
+
+    plaintext_rejection_result?;
+
+    // ── Scenario E: Missing Secret prevents plaintext sends (negative) ──────
+    eprintln!("verify-swim-encryption: [5/5] negative — missing Secret prevents plaintext sends...");
+    operator::cleanup_swim_encrypt_test_resources(&context)?;
+
+    let (bind_e_a, bind_e_b) = reserve_swim_bind_addrs()?;
+    let op_e_a = operator::spawn_operator_with_swim_keyed(
+        &context,
+        &bind_e_a,
+        &bind_e_a,
+        SWIM_ENCRYPT_NODE_A,
+        "",
+        None,
+        None, // no env var key
+    )?;
+    let mut op_e_a_guard = ProcGuard(Some(op_e_a), "encrypt-op-e-a");
+    let op_e_b = operator::spawn_operator_with_swim_keyed(
+        &context,
+        &bind_e_b,
+        &bind_e_b,
+        SWIM_ENCRYPT_NODE_B,
+        &bind_e_a,
+        None,
+        None, // no env var key
+    )?;
+    let mut op_e_b_guard = ProcGuard(Some(op_e_b), "encrypt-op-e-b");
+
+    // Apply fixtures with swimKeyRef enabled but do NOT create the Secret.
+    // Both operators' reconcile should fail at apply_configured_swim_key before
+    // announcing CRD seeds or publishing provider broadcasts.
+    operator::apply_swim_encrypt_test_fixtures_with_options(
+        &context,
+        SWIM_ENCRYPT_NODE_A,
+        std::slice::from_ref(&bind_e_b),
+        true, // swimKeyRef → points at non-existent Secret
+    )?;
+
+    let missing_secret_error_result = operator::wait_for_operator_log_contains(
+        SWIM_ENCRYPT_NODE_A,
+        &[
+            "swim key configuration",
+            SWIM_ENCRYPT_NETWORK,
+            "did not resolve to a valid 32-byte key",
+        ],
+        SWIM_STATUS_POLL_TIMEOUT,
+    );
+    let missing_secret_result = operator::assert_reconcile_blocked_no_side_effects(
+        &context,
+        SWIM_ENCRYPT_NETWORK,
+        operator::SWIM_ENCRYPT_GW,
+        SWIM_CONVERGENCE_WAIT,
+    );
+
+    if let Some(c) = op_e_a_guard.0.take() {
+        operator::kill_operator(c);
+    }
+    if let Some(c) = op_e_b_guard.0.take() {
+        operator::kill_operator(c);
+    }
+    operator::cleanup_swim_encrypt_test_resources(&context)?;
+
+    missing_secret_error_result?;
+    missing_secret_result?;
+
+    eprintln!(
+        "verify-swim-encryption: PASS — env-keyed peers converge; swimKeyRef Secret peers converge; \
+         wrong-key peer rejected; plaintext peer rejected; missing Secret prevents plaintext sends"
+    );
+    Ok(())
+}
+
 /// Prove that CRDT/SWIM-distributed provider records appear in the routing overlay.
 ///
 /// Starts two SWIM-enabled operator processes, applies a `GridNetwork` with a
@@ -1878,7 +2268,7 @@ fn env_verify_swim_overlay(config: &Path, site: Option<&str>) -> Result<(), Box<
         )
     });
 
-    // Step 7b: ROUTING ELIGIBILITY PROOF (before Active) — assert the secondary's CRDT
+    // Step 8: ROUTING ELIGIBILITY PROOF (before Active) — assert the secondary's CRDT
     // candidates are absent from the overlay.  The secondary SWIM peer is Alive and has
     // broadcast InferenceProvider state, but its corresponding GridSite is not Active, so
     // its CRDT providers must be excluded by the routing eligibility gate.
@@ -1892,41 +2282,40 @@ fn env_verify_swim_overlay(config: &Path, site: Option<&str>) -> Result<(), Box<
         )
     });
 
-    // Step 7c: Apply an Active GridSite for the secondary site.
+    // Step 9: Configure trust for the secondary site so the controller promotes it to Active.
     // The GridSite name is the deterministic auto-discovered name for the secondary's SWIM site.
+    // Bind a TCP listener so the controller's probe succeeds, then configure cert + fingerprint
+    // so the controller promotes Connecting → Active naturally (TrustPolicyVerified).
     let secondary_k8s_name = operator::auto_discovered_gridsite_name(SWIM_OVERLAY_NETWORK, SWIM_NODE_SECONDARY_NAME);
+    let secondary_listener = std::net::TcpListener::bind("127.0.0.1:0")
+        .map_err(|e| format!("failed to bind secondary site probe listener: {e}"))?;
+    let secondary_probe_addr = secondary_listener
+        .local_addr()
+        .map(|a| a.to_string())
+        .map_err(|e| format!("listener has no local addr: {e}"))?;
     let after_result = before_result.and_then(|()| {
-        eprintln!("  applying Active GridSite {secondary_k8s_name:?} for secondary SWIM site...");
+        eprintln!("  configuring trust for GridSite {secondary_k8s_name:?} for secondary SWIM site...");
         operator::apply_active_gridsite_for_eligibility(
             &context,
             &secondary_k8s_name,
             SWIM_OVERLAY_NETWORK,
-            "127.0.0.1:19080", // test gateway address, not probed in this validation
+            &secondary_probe_addr,
         )
     });
 
-    // Step 7d: bump GridNetwork annotation to force overlay reconcile.
-    let bump_result = after_result.and_then(|()| operator::bump_gridnetwork(&context, SWIM_OVERLAY_NETWORK));
-
-    // Step 7e: wait for the overlay to update (may be same ConfigMap, just re-rendered).
-    let cm2_result = bump_result.and_then(|()| {
-        operator::wait_for_overlay_configmap(
+    // Step 10: ROUTING ELIGIBILITY PROOF (after Active) — poll until the secondary's CRDT
+    // provider candidate appears in the overlay.  The controller must:
+    //   (a) probe the TCP listener at secondary_probe_addr (succeeds — listener is held above)
+    //   (b) verify the fingerprint matches → promote Connecting → Active (TrustPolicyVerified)
+    //   (c) re-render the overlay to include secondary CRDT providers
+    // wait_for_site_candidate_in_overlay bumps GridNetwork each cycle, triggering (b) and (c).
+    let verify_result = after_result.and_then(|()| {
+        operator::wait_for_site_candidate_in_overlay(
             &context,
             SWIM_OVERLAY_NETWORK,
             SWIM_OVERLAY_GW,
-            "default",
+            SWIM_NODE_SECONDARY_NAME,
             CONFIGMAP_POLL_TIMEOUT,
-        )
-    });
-
-    // Step 8: ROUTING ELIGIBILITY PROOF (after Active) — verify remote candidate appears.
-    // After the secondary's GridSite reaches Active, its CRDT provider must appear in the overlay.
-    let verify_result = cm2_result.and_then(|()| {
-        operator::verify_swim_overlay_candidates(
-            &context,
-            SWIM_OVERLAY_NETWORK,
-            SWIM_OVERLAY_GW,
-            SWIM_NODE_PRIMARY_NAME,
         )
     });
 
@@ -2125,6 +2514,193 @@ fn reserve_swim_bind_addrs() -> Result<(String, String), Box<dyn std::error::Err
         bind2 = operator::reserve_local_udp_addr()?.to_string();
     }
     Ok((bind1, bind2))
+}
+
+/// Reserve three distinct localhost UDP addresses for a three-node SWIM mesh.
+fn reserve_three_swim_bind_addrs() -> Result<(String, String, String), Box<dyn std::error::Error>> {
+    let (bind_a, bind_b) = reserve_swim_bind_addrs()?;
+    let mut bind_c = operator::reserve_local_udp_addr()?.to_string();
+    while bind_c == bind_a || bind_c == bind_b {
+        bind_c = operator::reserve_local_udp_addr()?.to_string();
+    }
+    Ok((bind_a, bind_b, bind_c))
+}
+
+// ---------------------------------------------------------------------------
+// Three-node SWIM mesh validation
+// ---------------------------------------------------------------------------
+
+/// Prove transitive SWIM discovery, provider state propagation, and routing
+/// eligibility gating across a three-node mesh.
+///
+/// Topology:
+///   A  ←seed—  B  ←seed—  C
+///
+/// A seeds nobody; B seeds A; C seeds B only.  A learns about C transitively.
+///
+/// What this proves:
+/// 1. `distributedProviderCount >= 2` on A: CRDT state from both B and C arrived.
+/// 2. C's overlay candidate is absent before C's `GridSite` is `Active`.
+/// 3. After `Active`, C's candidate appears in A's overlay.
+/// 4. A wrong-network `GridNetwork` and `InferenceProvider` are applied and their model is confirmed absent from A's
+///    correct-network overlay.
+#[expect(
+    clippy::too_many_lines,
+    reason = "sequential 11-step mesh proof: CRDs, three operators, CRDT convergence, \
+              eligibility before/after Active, wrong-network isolation, cleanup"
+)]
+fn env_verify_swim_mesh_three_node(config: &Path, site: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    use operator::{
+        CONFIGMAP_POLL_TIMEOUT, SWIM_CONVERGENCE_WAIT, SWIM_MESH_GW, SWIM_MESH_MODEL_C, SWIM_MESH_NETWORK,
+        SWIM_MESH_PROVIDER_C, SWIM_MESH_SITE_A, SWIM_MESH_SITE_B, SWIM_MESH_SITE_C, SWIM_MESH_WRONG_MODEL,
+        SWIM_STATUS_POLL_TIMEOUT,
+    };
+
+    let cfg = EnvConfig::from_file(config)?;
+    let context = resolve_operator_context(&cfg, site)?;
+    eprintln!("verify-swim-mesh-three-node: context={context}");
+
+    // ── Step 1: Install CRDs and remove any stale mesh test resources ─────────
+    operator::install_grid_crds(&context)?;
+    operator::cleanup_swim_mesh_test_resources(&context)?;
+
+    // ── Step 2: Reserve three distinct SWIM bind addresses ───────────────────
+    let (bind_a, bind_b, bind_c) = reserve_three_swim_bind_addrs()?;
+    eprintln!(
+        "  A={bind_a}  B={bind_b}  C={bind_c} \
+         (topology: A←B←C, C does NOT seed A directly)"
+    );
+
+    // ── Step 3: Spawn all three operators ─────────────────────────────────────
+    // A: no seeds.  B: seeds A.  C: seeds B only (not A) — ensures transitivity.
+    let op_a = operator::spawn_operator_with_swim(&context, &bind_a, &bind_a, SWIM_MESH_SITE_A, "", None)?;
+    let mut op_a_guard = ProcGuard(Some(op_a), "operator-mesh-a");
+
+    let op_b = operator::spawn_operator_with_swim(&context, &bind_b, &bind_b, SWIM_MESH_SITE_B, &bind_a, None)?;
+    let mut op_b_guard = ProcGuard(Some(op_b), "operator-mesh-b");
+
+    // C seeds only B — the proof that A learns C transitively.
+    let op_c = operator::spawn_operator_with_swim(&context, &bind_c, &bind_c, SWIM_MESH_SITE_C, &bind_b, None)?;
+    let mut op_c_guard = ProcGuard(Some(op_c), "operator-mesh-c");
+
+    // ── Step 4: Wait for SWIM gossip to propagate across the mesh ─────────────
+    operator::wait_for_swim_convergence(SWIM_CONVERGENCE_WAIT);
+    eprintln!("  SWIM convergence window elapsed — A should know B and C through B");
+
+    // ── Step 5: Apply main GridNetwork/provider and wrong-network isolation fixtures ─
+    operator::apply_swim_mesh_test_fixtures(&context, SWIM_MESH_SITE_A, SWIM_MESH_PROVIDER_C, SWIM_MESH_MODEL_C)?;
+    // Apply a wrong-network GridNetwork + InferenceProvider so we can assert their
+    // model does not leak into A's correct-network overlay.
+    operator::apply_swim_mesh_wrong_network_fixtures(&context)?;
+
+    // ── Step 6: Prove transitive state propagation — A has CRDT from both B and C ─
+    // `distributedProviderCount >= 2` means A received provider records from at
+    // least two remote sites.  Since C only seeded B, A must have learned C's
+    // record through B.
+    eprintln!("verify-swim-mesh-three-node: [6] waiting for A to receive CRDT from B AND C...");
+    let count_result =
+        operator::wait_for_distributed_state_count(&context, SWIM_MESH_NETWORK, 2, SWIM_STATUS_POLL_TIMEOUT);
+
+    let cm_result = count_result.and_then(|count| {
+        eprintln!(
+            "  [PASS] transitive CRDT propagation: A distributedProviderCount={count} \
+             (>= 2 — received from B and C through the mesh)"
+        );
+        // ── Step 7: Wait for A's overlay ConfigMap ───────────────────────────
+        eprintln!("verify-swim-mesh-three-node: [7] waiting for A's overlay ConfigMap...");
+        operator::wait_for_overlay_configmap(
+            &context,
+            SWIM_MESH_NETWORK,
+            SWIM_MESH_GW,
+            "default",
+            CONFIGMAP_POLL_TIMEOUT,
+        )
+    });
+
+    // ── Step 8: Routing eligibility — C's candidate absent before Active ──────
+    eprintln!("verify-swim-mesh-three-node: [8] proving C excluded before GridSite Active...");
+    let before_result = cm_result.and_then(|()| {
+        operator::assert_no_crdt_candidates_for_site(&context, SWIM_MESH_NETWORK, SWIM_MESH_GW, SWIM_MESH_SITE_C)
+    });
+
+    // Also assert B's candidates are absent (B GridSite also not Active).
+    let before_b_result = before_result.and_then(|()| {
+        operator::assert_no_crdt_candidates_for_site(&context, SWIM_MESH_NETWORK, SWIM_MESH_GW, SWIM_MESH_SITE_B)
+    });
+
+    // ── Step 9: Cross-network isolation — wrong-network model absent from A's overlay ─
+    // The wrong-network InferenceProvider serves SWIM_MESH_WRONG_MODEL.  It belongs to
+    // a different GridNetwork and must not appear in A's op-e2e-swim-mesh-net overlay.
+    eprintln!("verify-swim-mesh-three-node: [9] proving wrong-network model absent from A's overlay...");
+    let isolation_result = before_b_result.and_then(|()| {
+        operator::assert_no_overlay_candidate_for_model(
+            &context,
+            SWIM_MESH_NETWORK,
+            SWIM_MESH_GW,
+            SWIM_MESH_WRONG_MODEL,
+        )
+    });
+
+    // ── Step 10: Apply Active GridSite for C and verify C's candidate appears ──
+    // Bind a real TCP listener so the GridSite controller's probe succeeds and the
+    // GridSite stays in Active phase (rather than being demoted to Unreachable).
+    let c_site_k8s_name = operator::auto_discovered_gridsite_name(SWIM_MESH_NETWORK, SWIM_MESH_SITE_C);
+    let listener_result = isolation_result.and_then(|()| {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .map_err(|e| format!("failed to bind TCP listener for C probe: {e}").into())
+    });
+
+    let after_result = listener_result.and_then(|listener| {
+        let local_addr = match listener.local_addr() {
+            Ok(a) => a.to_string(),
+            Err(_) => "127.0.0.1:0".to_owned(),
+        };
+        eprintln!(
+            "verify-swim-mesh-three-node: [10] configuring trust for GridSite {c_site_k8s_name:?} \
+             (C) → waiting for Active (probe addr={local_addr})..."
+        );
+        let result =
+            operator::apply_active_gridsite_for_eligibility(&context, &c_site_k8s_name, SWIM_MESH_NETWORK, &local_addr);
+        // Keep listener alive so the GridSite TCP probe succeeds, then poll.
+        let verify = result.and_then(|()| {
+            operator::wait_for_site_candidate_in_overlay(
+                &context,
+                SWIM_MESH_NETWORK,
+                SWIM_MESH_GW,
+                SWIM_MESH_SITE_C,
+                SWIM_STATUS_POLL_TIMEOUT,
+            )
+        });
+        drop(listener); // release port after verification
+        verify
+    });
+
+    let verify_c_result = after_result;
+
+    // ── Step 10: Cleanup — always stop operators and remove fixtures ───────────
+    if let Some(c) = op_a_guard.0.take() {
+        operator::kill_operator(c);
+    }
+    if let Some(c) = op_b_guard.0.take() {
+        operator::kill_operator(c);
+    }
+    if let Some(c) = op_c_guard.0.take() {
+        operator::kill_operator(c);
+    }
+    operator::cleanup_swim_mesh_test_resources(&context)?;
+    operator::cleanup_auto_discovered_gridsite(&context, &c_site_k8s_name)
+        .unwrap_or_else(|e| eprintln!("  warning: C GridSite cleanup: {e}"));
+
+    verify_c_result?;
+
+    eprintln!(
+        "verify-swim-mesh-three-node: PASS — \
+         A→B→C transitive discovery proven; \
+         C's CRDT state reached A through B (distributedProviderCount >= 2); \
+         C absent before Active; C present after Active; \
+         wrong-network model absent from A's overlay"
+    );
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -2888,10 +3464,10 @@ fn env_verify_metrics_routing(config: &Path) -> Result<(), Box<dyn std::error::E
 
 /// Verify site join/discovery lifecycle, routing readiness, and cross-network isolation.
 ///
-/// **Design:** the operator's `determine_phase()` returns the current phase unchanged in Phase 1
-/// (manual lifecycle).  The harness advances the joining site through the state machine via
-/// `kubectl patch --subresource=status` and polls to confirm the controller preserved each phase
-/// through at least one reconcile.  This proves the lifecycle type system is functional end-to-end.
+/// **Design:** the harness advances the joining site through the state machine via
+/// `kubectl patch --subresource=status` and polls to confirm each expected phase is
+/// observed through at least one reconcile.  This proves the lifecycle type system is
+/// functional end-to-end.
 /// SWIM membership formation (two operators, east primary + west joining) provides the real
 /// distributed-system event that triggers the `Pending → Discovered` transition in production.
 ///
@@ -2904,21 +3480,22 @@ fn env_verify_metrics_routing(config: &Path) -> Result<(), Box<dyn std::error::E
 /// `spec.egress.address` populated from the SWIM membership record.
 ///
 /// **Lifecycle proof (step 5):** a separate harness-created `GridSite` is advanced through
-/// `Pending → Discovered → Connecting → Active` via status patches to prove the controller
-/// preserves each phase (Phase 1 identity `determine_phase`).
+/// `Pending → Discovered → Connecting → Active`.  Only `Discovered` is harness-patched;
+/// the controller drives `Connecting` (egress present) and `Active`
+/// (TCP probe succeeds + `spec.trust.certFingerprint` matches `status.publicCertPem`).
 #[expect(
     clippy::too_many_lines,
     reason = "sequential 8-step proof: auto-discovery + harness lifecycle + overlay isolation"
 )]
 fn env_verify_site_join_discovery(config: &Path) -> Result<(), Box<dyn std::error::Error>> {
     use operator::{
-        CONFIGMAP_POLL_TIMEOUT, SITE_JOIN_GW, SITE_JOIN_JOINING_MODEL, SITE_JOIN_JOINING_SITE, SITE_JOIN_NETWORK,
+        CONFIGMAP_POLL_TIMEOUT, SITE_JOIN_JOINING_MODEL, SITE_JOIN_JOINING_SITE, SITE_JOIN_NETWORK,
         SITE_JOIN_PHASE_POLL_TIMEOUT, SITE_JOIN_PRIMARY_EGRESS, SITE_JOIN_PRIMARY_MODEL, SITE_JOIN_PRIMARY_SITE,
         SITE_JOIN_WRONG_NETWORK, SITE_JOIN_WRONG_SITE, SWIM_CONVERGENCE_WAIT, SWIM_STATUS_POLL_TIMEOUT,
     };
 
     let cfg = EnvConfig::from_file(config)?;
-    eprintln!("verify-site-join-discovery: loading two-provider config...");
+    eprintln!("verify-site-join-discovery: loading multisite config...");
 
     let providers = provider_clusters_from_config(&cfg);
     if providers.len() < 2 {
@@ -3085,17 +3662,26 @@ fn env_verify_site_join_discovery(config: &Path) -> Result<(), Box<dyn std::erro
          (Discovered→Connecting driven by GridSite controller; egress address present)"
     );
 
-    // Advance to Active: simulates mTLS success, capability exchange, and data-plane readiness
-    // established by the deployment workflow. The harness patches it to prove phase preservation.
-    operator::patch_gridsite_phase(&east_ctx, SITE_JOIN_JOINING_SITE, "Active")?;
-    operator::bump_gridsite(&east_ctx, SITE_JOIN_JOINING_SITE)?;
-    operator::wait_for_gridsite_phase(
+    // Advance to Active via fingerprint trust policy.  The TCP listener at joining_gw_addr
+    // is already bound above so the controller's probe will succeed.  Configure a test cert
+    // + matching fingerprint at the same egress address and wait for the operator to promote
+    // Connecting → Active (TrustPolicyVerified).  This proves Active is only reached when
+    // the trust policy is satisfied — reachability alone is not sufficient.
+    operator::apply_active_gridsite_for_eligibility(
         &east_ctx,
         SITE_JOIN_JOINING_SITE,
-        "Active",
+        SITE_JOIN_NETWORK,
+        &joining_gw_addr,
+    )?;
+    operator::bump_gridsite(&east_ctx, SITE_JOIN_JOINING_SITE)?;
+    operator::wait_for_gridsite_reason_in_network(
+        &east_ctx,
+        SITE_JOIN_JOINING_SITE,
+        SITE_JOIN_NETWORK,
+        "TrustPolicyVerified",
         SITE_JOIN_PHASE_POLL_TIMEOUT,
     )?;
-    eprintln!("  [OK] joining site: Active (operator preserved phase — join complete)");
+    eprintln!("  [OK] joining site: Active (TrustPolicyVerified — fingerprint matched, lifecycle complete)");
 
     // ── Step 5: Routing readiness ─────────────────────────────────────────────
     eprintln!("verify-site-join-discovery: [6/8] verifying join routing readiness...");
@@ -3129,21 +3715,14 @@ fn env_verify_site_join_discovery(config: &Path) -> Result<(), Box<dyn std::erro
     operator::bump_gridnetwork(&east_ctx, SITE_JOIN_NETWORK)?;
     eprintln!("  [OK] bumped {SITE_JOIN_NETWORK:?} annotation to force overlay reconcile");
 
-    operator::wait_for_overlay_configmap(
-        &east_ctx,
-        SITE_JOIN_NETWORK,
-        SITE_JOIN_GW,
-        "default",
-        CONFIGMAP_POLL_TIMEOUT,
-    )?;
-
-    let overlay_result = operator::verify_site_join_overlay(
+    let overlay_result = operator::wait_for_site_join_overlay(
         &east_ctx,
         SITE_JOIN_PRIMARY_SITE,
         SITE_JOIN_PRIMARY_MODEL,
         SITE_JOIN_JOINING_SITE,
         SITE_JOIN_JOINING_MODEL,
         SITE_JOIN_WRONG_SITE,
+        CONFIGMAP_POLL_TIMEOUT,
     );
 
     // ── Step 8: Cleanup ───────────────────────────────────────────────────────
@@ -4402,6 +4981,190 @@ mod validate_all_tests {
         let t = safe_truncate_str(&s, 10);
         assert_eq!(t, "aaaaaaaaaa…");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Fingerprint trust promotion E2E
+// ---------------------------------------------------------------------------
+
+/// Print the SHA-256 fingerprint of a `GridSite.status.publicCertPem`.
+fn env_gridsite_fingerprint(context: &str, site_name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let pem = operator::read_gridsite_public_cert_pem(context, site_name)
+        .ok_or_else(|| format!("GridSite {site_name:?} has no publicCertPem in status"))?;
+    let fp = operator::sha256_fingerprint(&pem);
+    eprintln!("GridSite: {site_name:?}  context: {context}");
+    println!("{fp}");
+    Ok(())
+}
+
+/// Prove the complete fingerprint-pinning trust promotion lifecycle.
+///
+/// Steps:
+/// 1. Spawn operators A (no TLS) and B (TLS via `GridNetwork` spec).
+/// 2. Wait for SWIM convergence.
+/// 3. Apply `GridNetwork` with TLS references so B broadcasts its cert.
+/// 4. Wait for B's cert to appear in auto-discovered `GridSite` for B.
+/// 5. Bind TCP listener so `GridSite` probe succeeds.
+/// 6. Apply egress to B's `GridSite` so controller advances to `Connecting`.
+/// 7. Assert reason = `TrustPolicyMissing` (no fingerprint yet).
+/// 8. Patch wrong fingerprint → assert `TrustPolicyMismatch`.
+/// 9. Patch correct fingerprint → wait for `Active` (`TrustPolicyVerified`).
+/// 10. Assert B's CRDT provider appears in overlay.
+/// 11. Rotation proof: patch wrong fingerprint on `Active` site → observe `Connecting TrustPolicyMismatch`.
+#[expect(
+    clippy::too_many_lines,
+    reason = "sequential fingerprint lifecycle proof: 11 steps covering promotion, mismatch, and rotation"
+)]
+fn env_verify_gridsite_trust_fingerprint(config: &Path, site: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    use operator::{
+        CONFIGMAP_POLL_TIMEOUT, SWIM_CONVERGENCE_WAIT, SWIM_STATUS_POLL_TIMEOUT, SWIM_TRUST_GW, SWIM_TRUST_NETWORK,
+        SWIM_TRUST_SITE_A, SWIM_TRUST_SITE_B, sha256_fingerprint,
+    };
+
+    let cfg = EnvConfig::from_file(config)?;
+    let context = resolve_operator_context(&cfg, site)?;
+    eprintln!("verify-gridsite-trust-fingerprint: context={context}");
+
+    // ── Step 1: CRDs, cleanup ─────────────────────────────────────────────────
+    operator::install_grid_crds(&context)?;
+    operator::cleanup_swim_trust_test_resources(&context)?;
+
+    let (bind_a, bind_b) = reserve_swim_bind_addrs()?;
+    eprintln!("  A={bind_a} (no TLS)  B={bind_b} (TLS — cert will be broadcast)");
+
+    // ── Step 2: Spawn operators ───────────────────────────────────────────────
+    // A renders overlay; B has TLS so it broadcasts a cert that A receives.
+    let op_a = operator::spawn_operator_with_swim(&context, &bind_a, &bind_a, SWIM_TRUST_SITE_A, "", None)?;
+    let mut op_a_guard = ProcGuard(Some(op_a), "trust-op-a");
+    let op_b = operator::spawn_operator_with_swim(&context, &bind_b, &bind_b, SWIM_TRUST_SITE_B, &bind_a, None)?;
+    let mut op_b_guard = ProcGuard(Some(op_b), "trust-op-b");
+
+    // ── Step 3: SWIM convergence + apply fixtures ─────────────────────────────
+    operator::wait_for_swim_convergence(SWIM_CONVERGENCE_WAIT);
+    operator::apply_swim_trust_test_fixtures(&context, SWIM_TRUST_SITE_A)?;
+    eprintln!("  fixtures applied; waiting for B's TLS cert to broadcast via SWIM...");
+
+    // ── Step 4: Wait for distributedProviderCount > 0 and B's publicCertPem ──
+    let b_site_k8s_name = operator::auto_discovered_gridsite_name(SWIM_TRUST_NETWORK, SWIM_TRUST_SITE_B);
+    let result: Result<(), Box<dyn std::error::Error>> = (|| {
+        operator::wait_for_distributed_state_count(&context, SWIM_TRUST_NETWORK, 1, SWIM_STATUS_POLL_TIMEOUT)?;
+        eprintln!("  [OK] CRDT from B received by A (distributedProviderCount >= 1)");
+
+        let cert_pem =
+            operator::wait_for_gridsite_public_cert_pem(&context, &b_site_k8s_name, SWIM_STATUS_POLL_TIMEOUT)?;
+        eprintln!("  [OK] publicCertPem received on GridSite {b_site_k8s_name:?}");
+
+        // ── Step 5: Bind TCP listener for probe ───────────────────────────────
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| format!("TCP listener bind failed: {e}"))?;
+        let egress_addr = match listener.local_addr() {
+            Ok(a) => a.to_string(),
+            Err(_) => "127.0.0.1:0".to_owned(),
+        };
+        eprintln!("  TCP listener bound at {egress_addr} for GridSite probe");
+
+        // ── Step 6: Apply egress so controller advances Discovered → Connecting ─
+        // We deliberately do NOT patch status=Active here.  The controller will
+        // advance phase naturally once TCP probe + cert + fingerprint policy align.
+        operator::apply_gridsite_egress(&context, &b_site_k8s_name, SWIM_TRUST_NETWORK, &egress_addr)?;
+
+        // ── Step 7: Assert TrustPolicyMissing (cert present, no fingerprint) ──
+        eprintln!("verify-gridsite-trust-fingerprint: [7] asserting TrustPolicyMissing...");
+        operator::wait_for_gridsite_reason(
+            &context,
+            &b_site_k8s_name,
+            "TrustPolicyMissing",
+            SWIM_STATUS_POLL_TIMEOUT,
+        )?;
+        eprintln!("  [PASS] Connecting with TrustPolicyMissing (cert present, no fingerprint configured)");
+
+        // ── Step 8: Wrong fingerprint → TrustPolicyMismatch ──────────────────
+        eprintln!("verify-gridsite-trust-fingerprint: [8] patching wrong fingerprint...");
+        let wrong_fp = sha256_fingerprint("-----BEGIN CERTIFICATE-----\nwrong\n-----END CERTIFICATE-----\n");
+        operator::patch_gridsite_cert_fingerprint(&context, &b_site_k8s_name, &wrong_fp)?;
+        operator::wait_for_gridsite_reason(
+            &context,
+            &b_site_k8s_name,
+            "TrustPolicyMismatch",
+            SWIM_STATUS_POLL_TIMEOUT,
+        )?;
+        eprintln!("  [PASS] TrustPolicyMismatch — wrong fingerprint correctly rejected");
+
+        // Assert B's CRDT provider absent before Active.
+        operator::wait_for_overlay_configmap(
+            &context,
+            SWIM_TRUST_NETWORK,
+            SWIM_TRUST_GW,
+            "default",
+            CONFIGMAP_POLL_TIMEOUT,
+        )?;
+        operator::assert_no_crdt_candidates_for_site(&context, SWIM_TRUST_NETWORK, SWIM_TRUST_GW, SWIM_TRUST_SITE_B)?;
+        eprintln!("  [PASS] B absent from overlay before Active");
+
+        // ── Step 9: Correct fingerprint → Active (TrustPolicyVerified) ────────
+        eprintln!("verify-gridsite-trust-fingerprint: [9] patching correct fingerprint...");
+        let correct_fp = sha256_fingerprint(&cert_pem);
+        operator::patch_gridsite_cert_fingerprint(&context, &b_site_k8s_name, &correct_fp)?;
+        operator::wait_for_gridsite_reason(
+            &context,
+            &b_site_k8s_name,
+            "TrustPolicyVerified",
+            SWIM_STATUS_POLL_TIMEOUT,
+        )?;
+        eprintln!("  [PASS] TrustPolicyVerified — correct fingerprint promoted site to Active");
+
+        // ── Step 10: Assert B's CRDT provider appears in overlay ──────────────
+        eprintln!("verify-gridsite-trust-fingerprint: [10] verifying overlay includes B...");
+        operator::wait_for_site_candidate_in_overlay(
+            &context,
+            SWIM_TRUST_NETWORK,
+            SWIM_TRUST_GW,
+            SWIM_TRUST_SITE_B,
+            SWIM_STATUS_POLL_TIMEOUT,
+        )?;
+        eprintln!("  [PASS] B's CRDT provider appears in overlay after Active");
+
+        // ── Step 11: Rotation proof — patch wrong fingerprint on Active site ───
+        eprintln!("verify-gridsite-trust-fingerprint: [11] rotation proof...");
+        operator::patch_gridsite_cert_fingerprint(&context, &b_site_k8s_name, &wrong_fp)?;
+        operator::wait_for_gridsite_reason(
+            &context,
+            &b_site_k8s_name,
+            "TrustPolicyMismatch",
+            SWIM_STATUS_POLL_TIMEOUT,
+        )?;
+        eprintln!("  [PASS] rotation: cert fingerprint changed → site left Active (TrustPolicyMismatch)");
+
+        // Verify B absent from overlay after rotation mismatch.
+        operator::assert_no_crdt_candidates_for_site(&context, SWIM_TRUST_NETWORK, SWIM_TRUST_GW, SWIM_TRUST_SITE_B)?;
+        eprintln!("  [PASS] B absent from overlay after fingerprint rotation mismatch");
+
+        drop(listener); // release probe port
+        Ok(())
+    })();
+
+    // ── Cleanup ───────────────────────────────────────────────────────────────
+    if let Some(c) = op_a_guard.0.take() {
+        operator::kill_operator(c);
+    }
+    if let Some(c) = op_b_guard.0.take() {
+        operator::kill_operator(c);
+    }
+    operator::cleanup_swim_trust_test_resources(&context)?;
+    operator::cleanup_auto_discovered_gridsite(&context, &b_site_k8s_name)
+        .unwrap_or_else(|e| eprintln!("  warning: B GridSite cleanup: {e}"));
+
+    result?;
+
+    eprintln!(
+        "verify-gridsite-trust-fingerprint: PASS — \
+         TrustPolicyMissing without fingerprint; \
+         TrustPolicyMismatch with wrong fingerprint; \
+         TrustPolicyVerified + Active with correct fingerprint; \
+         B present in overlay after Active; \
+         B absent after rotation mismatch"
+    );
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

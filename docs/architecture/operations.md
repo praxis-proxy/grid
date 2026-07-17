@@ -44,9 +44,8 @@ The GridNetwork controller:
 2. Generates this site's certificate (DNS SAN:
    `{site-name}.grid.internal`, dual EKU for mTLS)
 3. Stores both in Kubernetes Secrets
-4. Generates a SWIM encryption key
-5. Starts the SWIM runtime with seed peers
-6. Sets `status.phase: Initializing`
+4. Starts the SWIM runtime with seed peers
+5. Sets `status.phase: Initializing`
 
 ### CRD-driven seeds
 
@@ -83,6 +82,43 @@ shared across all `GridNetwork` reconciles.  Seeds from any
 `GridNetwork.spec.seeds` are announced to the same SWIM membership node.
 This is site-membership bootstrap, not per-network membership isolation.
 CRDT provider records remain network-scoped separately.
+
+**Transport-security contract**
+
+SWIM is the Grid control-plane membership and state broadcast channel.  When
+`spec.tls.swimKeyRef` is configured and the referenced Secret resolves to a
+valid 32-byte key, reconcile applies the key before announcing CRD seeds or
+publishing certificate/provider state.  From that point, outgoing SWIM UDP
+packets are encrypted and authenticated with AES-256-GCM.  Incoming packets
+that fail authentication are silently dropped; the foca membership state
+machine never sees them.
+
+When `swimKeyRef` is absent, SWIM traffic is sent and received as cleartext
+(backward-compatible local and development behavior).
+
+If `swimKeyRef` is configured but the Secret is missing, unreadable, or not a
+valid 32-byte key, the reconcile fails before CRD seed announcement and
+certificate/provider broadcasts for that `GridNetwork`.  The SWIM runtime is
+process-global, so a previously loaded key remains active until restart; the
+operator does not switch to plaintext for that configured reconcile.
+
+`GRID_SWIM_ENCRYPT_KEY` is the local and Kind validation path for startup-time
+enforcement because it is available before the UDP socket starts.  It is
+process environment material and should not be treated as the production Secret
+delivery mechanism.  With CRD-backed `swimKeyRef`, the key is applied at
+`GridNetwork` reconcile time; use the environment key as well when startup-time
+plaintext acceptance must be avoided before CRD preload support exists.
+
+**SWIM encryption protects:** gossip membership packets, gateway address
+broadcasts, public certificate PEM broadcasts, and CRDT provider state broadcasts.
+
+**SWIM encryption does not protect:** data-plane request traffic.  Gateway
+request-time authentication and authorization are enforced by Praxis/Praxis AI
+gateway TLS and peer identity filters, not by SWIM membership.
+
+Routing eligibility remains fail-closed at the `GridSite` layer independently of
+SWIM encryption: remote CRDT provider records are rendered only for peers whose
+`GridSite` is `Active`.  Both layers are required for production deployments.
 
 **Channel-full retry**
 
@@ -164,16 +200,26 @@ The trust bootstrap for a remote site progresses through these steps:
 3. **Public cert material received** — the remote operator broadcasts its public site
    certificate PEM.  The operator validates the PEM structure (rejects private-key markers;
    checks for `CERTIFICATE` header) and stores it in `GridSite.status.publicCertPem`.
-   Reason: `TrustMaterialPresent`.  Not chain-verified; not trusted.
+   Reason: `TrustPolicyMissing` (cert received but no fingerprint policy configured).
 
 4. **TCP gateway probe passes** — the `GridSite` controller can reach the gateway
-   address.  Reason: `TrustMaterialPresent` (if cert received) or `TrustMaterialMissing`
-   (if cert not yet received).  Phase stays `Connecting`.
+   address.  Phase stays `Connecting` until a trust policy is configured.
 
-5. **Trust policy verified** — advancing to `Active` requires the deployment workflow to
-   verify the remote cert against an explicit trust rule (CA chain, fingerprint pin, or
-   allow-list policy) and set the phase manually.
-   See [Authentication and Access Policy](auth.md) for the trust boundary.
+5. **Trust policy verified** — configure `spec.trust.certFingerprint` with the SHA-256
+   fingerprint of the remote site's `publicCertPem`.  When the fingerprint matches and
+   the TCP probe succeeds, the operator promotes the site to `Active` with reason
+   `TrustPolicyVerified`.
+
+   ```bash
+   # Read the received certificate fingerprint
+   FP=$(kubectl get gridsite <name> -o jsonpath='{.status.publicCertPem}' | \
+        sha256sum | awk '{print $1}' | sed 's/\(..\)/\1:/g;s/:$//')
+   # Configure the fingerprint trust policy
+   kubectl patch gridsite <name> --type=merge \
+     -p '{"spec":{"trust":{"certFingerprint":"'"$FP"'"}}}'
+   ```
+
+   See [Authentication and Access Policy](auth.md) for the trust contract.
 
 6. **Data-plane mTLS enforced** — the provider gateway enforces peer identity via mTLS
    on every request, independent of the control-plane phase.
@@ -208,10 +254,11 @@ Provider records advertised by a SWIM peer are included in the routing overlay o
 the corresponding `GridSite` is `Active`.  Peers in `Discovered`, `Connecting`, or any
 other phase are excluded.  Peers with no matching `GridSite` are also excluded (fail-closed).
 
-Setting `Active` is the responsibility of the deployment workflow — it requires explicit
-trust verification before the operator advances a site to `Active`.  Data-plane mTLS
-at the provider gateway enforces peer identity on every request independently of
-the control-plane phase.
+Setting `Active` requires an explicit trust policy.  For the current operator, that
+policy is `GridSite.spec.trust.certFingerprint`: when the configured fingerprint
+matches the received public certificate and the TCP probe succeeds, the operator
+promotes the site to `Active`.  Data-plane mTLS at the provider gateway enforces
+peer identity on every request independently of the control-plane phase.
 
 ## 5. Connectivity Verification
 
@@ -373,9 +420,9 @@ kubectl get gridsite <site-name> -o jsonpath='{.status.publicCertPem}'
 ```
 
 A non-empty value means the remote operator is advertising its site certificate.
-A `Connecting` site in the `TrustMaterialPresent` state has both:
-- A reachable gateway address (TCP probe succeeded)
-- A received public certificate PEM
+A `Connecting` site with a non-empty `publicCertPem` and a reachable gateway
+(TCP probe succeeded) is ready for fingerprint trust verification.  Configure
+`spec.trust.certFingerprint` to advance it to `Active`.
 
 A site in `TrustMaterialMissing` has a reachable gateway but no certificate.
 Configure `spec.tls.siteSecretRef` on the remote `GridNetwork` to enable certificate advertisement.
@@ -448,7 +495,7 @@ kubectl get gridsite <name> -o jsonpath='{.status.phase}/{.status.reason}: {.sta
 | (new) | Pending | Resource created |
 | Pending | Discovered | `GridNetwork` controller observes SWIM Alive member |
 | Discovered | Connecting | `GridSite` controller: `spec.egress.address` non-empty |
-| Connecting | Active | Set by deployment workflow when trust and data-plane readiness are established |
+| Connecting | Active | `GridSite` controller: TCP probe succeeds and `spec.trust.certFingerprint` matches `status.publicCertPem` |
 
 Security invariant: a SWIM peer must never become routable solely because it
 gossiped successfully.  Discovery, authentication, and authorization are
@@ -471,8 +518,12 @@ separate steps.
 **Phase stays Connecting**
 
 - Check `status.reason`:
-  - `GatewayReachable`: the TCP probe succeeded, but advancing to Active requires mTLS trust
-    verification.  Set Active manually or via the deployment workflow once trust is established.
+  - `TrustPolicyMissing`: the TCP probe succeeded and public certificate material was received, but
+    `spec.trust.certFingerprint` is not configured.
+  - `TrustPolicyMismatch`: the TCP probe succeeded and public certificate material was received, but
+    the configured fingerprint does not match the received certificate.
+  - `TrustMaterialMissing`: the TCP probe succeeded, but no public certificate has been received.
+  - `TrustMaterialInvalid`: received trust material failed the structural PEM check.
   - `GatewayUnreachable`: the TCP probe to `spec.egress.address` failed.  Verify the gateway
     is running and `GRID_GATEWAY_ADDRESS` is correct on the remote operator.
   - `GatewayAddressMissing`: no egress address is set.  Configure `GRID_GATEWAY_ADDRESS` on
@@ -482,8 +533,8 @@ separate steps.
 
 - The TCP probe against `spec.egress.address` failed.  The `GridSite` controller moved the
   site from Active to Unreachable.  When the gateway becomes reachable again, the site moves
-  to Connecting (reason `GatewayReachable`).  Returning to Active requires reapplying the
-  Active phase via the deployment workflow once the gateway and trust requirements are satisfied.
+  to Connecting.  Returning to Active requires the gateway to be reachable and
+  `spec.trust.certFingerprint` to match the received public certificate.
 
 **RBAC for GridSite status updates**
 
@@ -578,10 +629,10 @@ If no refutation, declared dead. `GridSite` status:
    the membership list of all other sites
 4. The new site automatically discovers all grid
    members within seconds
-5. mTLS exchange and capability negotiation proceed
-   with each peer
-6. Once Active, the new site's providers are visible
-   to all other sites
+5. SWIM propagates public certificate material; the operator
+   verifies the fingerprint and advances matching sites to `Active`
+6. Once `Active`, the new site's providers are visible
+   to all other sites through the routing overlay
 
 ## Local kind environment orchestration
 
@@ -725,6 +776,34 @@ fixture expects exactly one remote provider record; zero
 means state did not arrive, and more than one indicates
 cross-network leakage or stale test state.
 
+#### Three-node SWIM mesh
+
+```console
+cargo xtask env verify-swim-mesh-three-node -c tests/env/operator-routing-multisite.toml
+```
+
+This command starts three SWIM-enabled operator processes in a linear topology:
+node A (no seeds), node B (seeds A), and node C (seeds B only — not A).  It proves:
+
+1. **Transitive discovery** — A learns about C through B.  After gossip convergence,
+   `GridNetwork.status.distributedProviderCount >= 2` on A, confirming CRDT state from
+   both B and C reached A transitively.
+
+2. **Routing eligibility before Active** — C's CRDT provider is present in A's
+   SWIM state but absent from A's routing overlay because C's `GridSite` is not yet
+   `Active`.  Both B and C are excluded.
+
+3. **Routing eligibility after Active** — After C's `GridSite` is set to `Active`
+   (with a reachable egress address), A's overlay is re-rendered and C's provider
+   candidate appears.
+
+4. **Cross-network isolation** — A wrong-network `GridNetwork` and `InferenceProvider`
+   are applied alongside the main network.  The wrong-network model is confirmed absent
+   from A's correct-network overlay, proving providers cannot cross network boundaries.
+
+This validation proves that SWIM gossip alone is not sufficient for routing; explicit
+`Active` phase assignment is required.
+
 #### Full local validation suite
 
 ```console
@@ -839,3 +918,11 @@ Grid keeps generic, config-driven, reusable commands.
 Topology-specific fixtures, static manifests, and
 presentation walkthroughs belong outside the Grid
 repository.
+
+## References
+
+- [HashiCorp memberlist](https://github.com/hashicorp/memberlist) — reference
+  design for SWIM-style membership, gossip transport encryption, key rotation,
+  and join/admission behavior. Grid uses foca rather than memberlist; the
+  memberlist model is used only as an architectural reference for control-plane
+  gossip hardening.

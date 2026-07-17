@@ -19,6 +19,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use sha2::{Digest as _, Sha256};
+
 use super::{kind, kubectl};
 
 /// Time allowed for the operator to reconcile a provider's status.
@@ -243,6 +245,91 @@ pub(crate) const CRD_SEEDS_TEST_NETWORK: &str = "op-e2e-swim-crd-seeds-net";
 /// Kept distinct from `SWIM_TEST_NETWORK` and `TEST_NETWORK` to avoid resource
 /// collisions when multiple validations run in the same cluster.
 pub(crate) const SWIM_OVERLAY_NETWORK: &str = "op-e2e-swim-overlay";
+
+// ---------------------------------------------------------------------------
+// Three-node SWIM mesh validation constants
+// ---------------------------------------------------------------------------
+
+/// `GridNetwork` resource name used by the three-node SWIM mesh validation.
+pub(crate) const SWIM_MESH_NETWORK: &str = "op-e2e-swim-mesh-net";
+
+/// Gateway reference name in the three-node mesh `GridNetwork` fixture.
+pub(crate) const SWIM_MESH_GW: &str = "op-e2e-swim-mesh-gw";
+
+/// SWIM site identity for node A (origin; seeds nobody).
+pub(crate) const SWIM_MESH_SITE_A: &str = "swim-mesh-a";
+
+/// SWIM site identity for node B (bridge; seeds A).
+pub(crate) const SWIM_MESH_SITE_B: &str = "swim-mesh-b";
+
+/// SWIM site identity for node C (leaf; seeds B only, not A).
+pub(crate) const SWIM_MESH_SITE_C: &str = "swim-mesh-c";
+
+/// `InferenceProvider` published by node C in the three-node mesh fixture.
+pub(crate) const SWIM_MESH_PROVIDER_C: &str = "op-e2e-swim-mesh-prov-c";
+
+/// Model served by the node-C provider fixture.
+pub(crate) const SWIM_MESH_MODEL_C: &str = "model-swim-mesh-c";
+
+/// `GridNetwork` name used for cross-network isolation in the three-node mesh proof.
+pub(crate) const SWIM_MESH_WRONG_NETWORK: &str = "op-e2e-swim-mesh-wrong-net";
+
+/// `InferenceProvider` applied to the wrong network; must not appear in the main overlay.
+pub(crate) const SWIM_MESH_WRONG_PROVIDER: &str = "op-e2e-swim-mesh-prov-wrong";
+
+/// Model served by the wrong-network provider; must not appear in the main overlay.
+pub(crate) const SWIM_MESH_WRONG_MODEL: &str = "model-swim-mesh-wrong";
+
+// ---------------------------------------------------------------------------
+// Fingerprint trust promotion validation constants
+// ---------------------------------------------------------------------------
+
+/// `GridNetwork` resource name for the trust fingerprint promotion validation.
+pub(crate) const SWIM_TRUST_NETWORK: &str = "op-e2e-swim-trust-net";
+
+/// Gateway reference name in the trust fingerprint test `GridNetwork`.
+pub(crate) const SWIM_TRUST_GW: &str = "op-e2e-swim-trust-gw";
+
+/// SWIM site identity for node A (primary — renders overlay, no TLS cert).
+pub(crate) const SWIM_TRUST_SITE_A: &str = "swim-trust-a";
+
+/// SWIM site identity for node B (secondary — has TLS cert, whose promotion is tested).
+pub(crate) const SWIM_TRUST_SITE_B: &str = "swim-trust-b";
+
+/// `InferenceProvider` published by site B in the trust fingerprint test.
+pub(crate) const SWIM_TRUST_PROVIDER_B: &str = "op-e2e-swim-trust-prov";
+
+/// Model served by the trust test provider fixture.
+pub(crate) const SWIM_TRUST_MODEL_B: &str = "model-swim-trust";
+
+/// Kubernetes Secret name for site B's grid CA certificate.
+pub(crate) const SWIM_TRUST_CA_SECRET: &str = "swim-trust-ca";
+
+/// Kubernetes Secret name for site B's site certificate.
+pub(crate) const SWIM_TRUST_SITE_SECRET: &str = "swim-trust-b-cert";
+
+/// `GridNetwork` name used by the SWIM transport encryption validation.
+pub(crate) const SWIM_ENCRYPT_NETWORK: &str = "op-e2e-swim-encrypt-net";
+
+/// Gateway reference name for the SWIM encryption validation overlay.
+pub(crate) const SWIM_ENCRYPT_GW: &str = "op-e2e-swim-encrypt-gw";
+
+/// Primary keyed node name (site A).
+pub(crate) const SWIM_ENCRYPT_NODE_A: &str = "swim-encrypt-a";
+/// Secondary keyed node name (site B — same key as A).
+pub(crate) const SWIM_ENCRYPT_NODE_B: &str = "swim-encrypt-b";
+/// Wrong-key node name (site C — different key, must be rejected).
+pub(crate) const SWIM_ENCRYPT_NODE_WRONG: &str = "swim-encrypt-wrong";
+/// Plaintext node name (site D — no key, must be rejected by keyed cluster).
+pub(crate) const SWIM_ENCRYPT_NODE_PLAIN: &str = "swim-encrypt-plain";
+
+/// `InferenceProvider` name for the primary keyed node (A).
+pub(crate) const SWIM_ENCRYPT_PROVIDER_A: &str = "op-e2e-swim-encrypt-prov-a";
+/// Model name served by the primary keyed provider.
+pub(crate) const SWIM_ENCRYPT_MODEL_A: &str = "model-swim-encrypt-a";
+
+/// Secret name used by the SWIM encryption `SecretRef` validation.
+pub(crate) const SWIM_ENCRYPT_KEY_SECRET: &str = "op-e2e-swim-encrypt-key";
 
 /// Gateway reference name used in the SWIM overlay `GridNetwork` fixture.
 pub(crate) const SWIM_OVERLAY_GW: &str = "op-e2e-gw";
@@ -811,6 +898,97 @@ pub(crate) fn spawn_operator_with_swim(
     Ok(child)
 }
 
+/// Generate a random 64-character hex string suitable as a `GRID_SWIM_ENCRYPT_KEY`.
+///
+/// Each call returns a unique 32-byte AES-256-GCM key encoded as lowercase hex.
+/// The returned string is safe to log (it is a key IDENTIFIER for test output,
+/// but the caller must not log the value in production code).
+///
+/// # Panics
+///
+/// Panics if the OS random source is unavailable (catastrophic environment failure).
+#[must_use]
+pub(crate) fn generate_swim_key_hex() -> String {
+    use rand::RngCore as _;
+    let mut key = [0_u8; 32];
+    rand::rng().fill_bytes(&mut key);
+    key.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Create paired stdout/stderr log files for an out-of-cluster operator process.
+fn operator_log_files(site_name: &str) -> Result<(std::fs::File, std::fs::File), Box<dyn std::error::Error>> {
+    let log_path = format!("/tmp/grid-operator-{site_name}.log");
+    let log_file =
+        std::fs::File::create(&log_path).map_err(|e| format!("could not create operator log {log_path}: {e}"))?;
+    let log_file2 = log_file.try_clone()?;
+    Ok((log_file, log_file2))
+}
+
+/// Spawn the Grid operator with SWIM membership and optional AES-256-GCM encryption.
+///
+/// Like [`spawn_operator_with_swim`] but also sets `GRID_SWIM_ENCRYPT_KEY` when
+/// `swim_key_hex` is `Some`.  The key must be a 64-character lowercase hex string
+/// (32 bytes).  Peers must use the same key; mismatched-key peers are silently
+/// dropped.
+///
+/// # Panics
+///
+/// Does not panic; propagates all errors via `Result`.
+///
+/// # Security invariant
+///
+/// The key value is passed to the child process via the environment — it is
+/// visible to other processes on the same host (standard Unix env var rules).
+/// In Kind-based tests this is acceptable; in production use
+/// `GridNetwork.spec.tls.swimKeyRef` instead.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "spawns a child operator process; sleep is deliberate startup pause"
+)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each argument maps to one operator env var; grouping would obscure the contract"
+)]
+pub(crate) fn spawn_operator_with_swim_keyed(
+    context: &str,
+    bind_addr: &str,
+    advertise_addr: &str,
+    site_name: &str,
+    seeds: &str,
+    gateway_address: Option<&str>,
+    swim_key_hex: Option<&str>,
+) -> Result<Child, Box<dyn std::error::Error>> {
+    eprintln!("  setting kubectl context to {context}...");
+    Command::new("kubectl")
+        .args(["config", "use-context", context])
+        .status()?;
+
+    let encrypted = swim_key_hex.is_some();
+    eprintln!(
+        "  spawning SWIM operator (site={site_name}, bind={bind_addr}, seeds={seeds:?}, encrypted={encrypted})..."
+    );
+    let (log_file, log_file2) = operator_log_files(site_name)?;
+    let operator_bin = operator_binary_path();
+    let mut cmd = Command::new(&operator_bin);
+    cmd.env("GRID_SWIM_BIND_ADDR", bind_addr)
+        .env("GRID_SWIM_ADVERTISE_ADDR", advertise_addr)
+        .env("GRID_SWIM_SITE_NAME", site_name)
+        .env("GRID_SWIM_SEEDS", seeds)
+        .env("RUST_LOG", "info")
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log_file))
+        .stderr(Stdio::from(log_file2));
+    if let Some(gw) = gateway_address.filter(|s| !s.is_empty()) {
+        cmd.env("GRID_GATEWAY_ADDRESS", gw);
+    }
+    if let Some(key) = swim_key_hex {
+        cmd.env("GRID_SWIM_ENCRYPT_KEY", key);
+    }
+    let child = cmd.spawn()?;
+    std::thread::sleep(Duration::from_secs(3));
+    Ok(child)
+}
+
 #[expect(
     clippy::disallowed_methods,
     reason = "deliberate fixed wait for SWIM gossip convergence; no async runtime available"
@@ -973,6 +1151,203 @@ pub(crate) fn wait_for_gridnetwork_active(
             .into());
         }
         eprintln!("  waiting for GridNetwork {name} Active (phase={phase:?}, connectedSites={sites})...");
+        std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// Assert that a rejected SWIM peer stays isolated for the whole observation window.
+///
+/// This is intentionally stronger than reading `connectedSites` once.  The helper:
+///
+/// - bumps the `GridNetwork` on every loop so the controller keeps reconciling;
+/// - waits until `status.observedGeneration` exists at least once;
+/// - fails immediately if `connectedSites` or `distributedProviderCount` becomes non-zero;
+/// - fails if the overlay ever contains a candidate from `rejected_site`.
+///
+/// # Errors
+///
+/// Returns an error if status never appears before `window` elapses, or if the
+/// rejected peer is observed through membership, CRDT state, or overlay output.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "synchronous poll loop in xtask harness; no async runtime available"
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "single observation loop keeps the negative proof easy to audit"
+)]
+pub(crate) fn assert_swim_peer_stays_isolated(
+    context: &str,
+    network: &str,
+    gw: &str,
+    rejected_site: &str,
+    window: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let start = Instant::now();
+    let resource = format!("gridnetworks/{network}");
+    let mut observed_status = false;
+
+    loop {
+        drop(bump_gridnetwork(context, network));
+
+        let observed_gen_str = kubectl_jsonpath(context, &resource, "{.status.observedGeneration}").unwrap_or_default();
+        let observed_gen: i64 = observed_gen_str.parse().unwrap_or(0);
+        if observed_gen > 0 {
+            observed_status = true;
+        }
+
+        let connected_str = kubectl_jsonpath(context, &resource, "{.status.connectedSites}").unwrap_or_default();
+        let connected_sites: u32 = connected_str.parse().unwrap_or(0);
+        if connected_sites != 0 {
+            return Err(format!(
+                "SWIM encryption negative proof failed: rejected site {rejected_site:?} changed \
+                 connectedSites to {connected_sites}"
+            )
+            .into());
+        }
+
+        let distributed_str =
+            kubectl_jsonpath(context, &resource, "{.status.distributedProviderCount}").unwrap_or_default();
+        let distributed_provider_count: u32 = distributed_str.parse().unwrap_or(0);
+        if distributed_provider_count != 0 {
+            return Err(format!(
+                "SWIM encryption negative proof failed: rejected site {rejected_site:?} changed \
+                 distributedProviderCount to {distributed_provider_count}"
+            )
+            .into());
+        }
+
+        if read_overlay_configmap(context, network, gw, "default").is_ok() {
+            assert_no_crdt_candidates_for_site(context, network, gw, rejected_site)?;
+        }
+
+        if start.elapsed() >= window {
+            break;
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+
+    if !observed_status {
+        return Err(format!(
+            "SWIM encryption negative proof failed: GridNetwork {network} never wrote status during isolation window"
+        )
+        .into());
+    }
+
+    eprintln!(
+        "  [PASS] rejected peer {rejected_site:?} stayed isolated for {window:?}: \
+         connectedSites=0, distributedProviderCount=0, no overlay candidate"
+    );
+    Ok(())
+}
+
+/// Assert that a `GridNetwork` reconcile is blocked: no status written, no
+/// SWIM side effects, no overlay generated.
+///
+/// Unlike [`assert_swim_peer_stays_isolated`], this helper does NOT require
+/// `status.observedGeneration` to appear.  It is designed for scenarios where
+/// the reconcile itself fails before reaching `update_status()` — e.g., when
+/// `swimKeyRef` is configured but the referenced Secret does not exist.
+///
+/// The proof is: for the entire `window`, `connectedSites` and
+/// `distributedProviderCount` stay at zero (or absent), and no overlay
+/// `ConfigMap` is generated.  The absence of `observedGeneration` is expected
+/// and is not treated as an error.
+///
+/// # Errors
+///
+/// Returns an error if any SWIM side effect is observed during the window.
+#[expect(
+    clippy::too_many_lines,
+    reason = "single observation loop with three invariant checks; splitting would obscure the proof"
+)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "synchronous poll loop in xtask harness; no async runtime available"
+)]
+pub(crate) fn assert_reconcile_blocked_no_side_effects(
+    context: &str,
+    network: &str,
+    gw: &str,
+    window: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let start = Instant::now();
+    let resource = format!("gridnetworks/{network}");
+
+    loop {
+        let connected_str = kubectl_jsonpath(context, &resource, "{.status.connectedSites}").unwrap_or_default();
+        let connected_sites: u32 = connected_str.parse().unwrap_or(0);
+        if connected_sites != 0 {
+            return Err(format!(
+                "reconcile-blocked proof failed: connectedSites unexpectedly became {connected_sites}"
+            )
+            .into());
+        }
+
+        let distributed_str =
+            kubectl_jsonpath(context, &resource, "{.status.distributedProviderCount}").unwrap_or_default();
+        let distributed_count: u32 = distributed_str.parse().unwrap_or(0);
+        if distributed_count != 0 {
+            return Err(format!(
+                "reconcile-blocked proof failed: distributedProviderCount unexpectedly became {distributed_count}"
+            )
+            .into());
+        }
+
+        if read_overlay_configmap(context, network, gw, "default").is_ok() {
+            return Err(format!(
+                "reconcile-blocked proof failed: overlay ConfigMap for {network}/{gw} was unexpectedly generated"
+            )
+            .into());
+        }
+
+        if start.elapsed() >= window {
+            break;
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+
+    eprintln!(
+        "  [PASS] reconcile blocked for {window:?}: no status written, no overlay generated, \
+         connectedSites=0, distributedProviderCount=0"
+    );
+    Ok(())
+}
+
+/// Wait for an out-of-cluster operator log to contain all expected strings.
+///
+/// `spawn_operator_with_swim_for_context` redirects stdout/stderr to
+/// `/tmp/grid-operator-<site_name>.log`. This helper gives E2E tests a
+/// non-Kubernetes signal that a reconcile reached a specific fail-closed path
+/// without printing the log body back to the terminal.
+///
+/// # Errors
+///
+/// Returns an error if the log file does not contain every expected string
+/// before the timeout expires.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "synchronous poll loop in xtask harness; no async runtime available"
+)]
+pub(crate) fn wait_for_operator_log_contains(
+    site_name: &str,
+    expected: &[&str],
+    timeout: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let log_path = format!("/tmp/grid-operator-{site_name}.log");
+    let start = Instant::now();
+
+    loop {
+        if let Ok(contents) = std::fs::read_to_string(&log_path)
+            && expected.iter().all(|needle| contents.contains(needle))
+        {
+            eprintln!("  [PASS] operator log for {site_name:?} contains expected reconcile failure signal");
+            return Ok(());
+        }
+
+        if start.elapsed() >= timeout {
+            return Err(format!("operator log {log_path} did not contain all expected strings before timeout").into());
+        }
         std::thread::sleep(POLL_INTERVAL);
     }
 }
@@ -2801,35 +3176,116 @@ pub(crate) fn apply_swim_overlay_test_fixtures(
     Ok(())
 }
 
-/// Apply a minimal `GridSite` with `Active` phase for routing eligibility testing.
+/// Minimal structurally-valid certificate PEM used in eligibility E2E tests.
 ///
-/// Used in eligibility proofs to make a CRDT-sourced site eligible for routing.
-/// The `GridSite` has `spec.egress.address` set to ensure the `GridSite` controller
-/// advances it to Connecting and does not immediately demote it.
+/// This is not a real certificate — it exists only to satisfy the `GridSite`
+/// controller's fingerprint trust policy check so test sites can reach `Active`
+/// without full TLS infrastructure.  The matching fingerprint is computed by
+/// [`sha256_fingerprint`] and configured in `spec.trust.certFingerprint`.
+pub(crate) const TEST_TRUST_CERT_PEM: &str =
+    "-----BEGIN CERTIFICATE-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA\n-----END CERTIFICATE-----\n";
+
+/// Apply a `GridSite` configured for routing eligibility testing.
+///
+/// Configures `spec.trust.certFingerprint` (fingerprint of [`TEST_TRUST_CERT_PEM`])
+/// and injects `TEST_TRUST_CERT_PEM` into `status.publicCertPem` so the `GridSite`
+/// controller can verify the fingerprint and promote the site to `Active`
+/// automatically when the TCP probe at `egress_addr` succeeds.
+///
+/// The caller must ensure a TCP listener is bound at `egress_addr` so the probe
+/// passes.  After calling this function, wait for `Active` (or `TrustPolicyVerified`)
+/// rather than asserting immediately.
+#[expect(
+    clippy::too_many_lines,
+    reason = "two sequential kubectl calls (spec apply + status merge patch) with distinct error paths; splitting adds indirection without clarity"
+)]
 pub(crate) fn apply_active_gridsite_for_eligibility(
     context: &str,
     site_k8s_name: &str,
     network_ref: &str,
     egress_addr: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Apply spec first, then patch status to Active.
-    let spec = serde_json::to_string_pretty(&serde_json::json!({
-        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
-        "kind": "GridSite",
-        "metadata": { "name": site_k8s_name },
+    let test_fp = sha256_fingerprint(TEST_TRUST_CERT_PEM);
+    // 1. Configure spec: egress + trust policy. Strategy: try a merge patch first (non-destructive — never removes
+    //    existing labels or other spec fields).  If the resource does not yet exist, fall back to a plain kubectl apply
+    //    to create it.  A plain apply on a NEW resource is safe because there are no prior labels to lose; on an
+    //    EXISTING resource it would do a three-way merge that strips labels from the previous
+    //    last-applied-configuration, so we always prefer the patch path when the resource already exists. Server-side
+    //    apply without --force-conflicts would be another option, but SSA also removes labels that were set by an
+    //    earlier client-side apply because those labels end up with no managedFields owner.
+    let spec_patch = serde_json::json!({
         "spec": {
             "gridNetworkRef": network_ref,
-            "egress": { "address": egress_addr, "tls": { "mode": "Mutual" } }
+            "egress": { "address": egress_addr, "tls": { "mode": "Mutual" } },
+            "trust": { "certFingerprint": test_fp }
         }
-    }))
-    .unwrap_or_else(|e| {
-        eprintln!("GridSite {site_k8s_name} spec serialization failed: {e}");
-        std::process::exit(1);
     });
-    kubectl::apply_manifest(context, &spec)?;
-    patch_gridsite_phase(context, site_k8s_name, "Active")?;
+    let patch_out = Command::new("kubectl")
+        .args([
+            "--context",
+            context,
+            "patch",
+            "gridsites",
+            site_k8s_name,
+            "--type=merge",
+            "-p",
+            &spec_patch.to_string(),
+        ])
+        .output()?;
+    if !patch_out.status.success() {
+        // Resource doesn't exist yet — create it with a minimal apply.
+        let create_spec = serde_json::to_string_pretty(&serde_json::json!({
+            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "kind": "GridSite",
+            "metadata": { "name": site_k8s_name },
+            "spec": {
+                "gridNetworkRef": network_ref,
+                "egress": { "address": egress_addr, "tls": { "mode": "Mutual" } },
+                "trust": { "certFingerprint": test_fp }
+            }
+        }))
+        .unwrap_or_else(|e| {
+            eprintln!("GridSite {site_k8s_name} spec serialization failed: {e}");
+            std::process::exit(1);
+        });
+        kubectl::apply_manifest(context, &create_spec)?;
+    }
+    // 2. Seed status with phase=Connecting and inject the matching cert.  The GridSite controller Connecting arm
+    //    promotes to Active when the TCP probe passes and the fingerprint matches. Seeding Connecting is necessary for
+    //    newly-created GridSites that would otherwise remain in Pending (which the GridSite controller never
+    //    auto-advances; only the GridNetwork controller does that on SWIM Alive events).  For pre-existing Connecting
+    //    sites this is a no-op on phase, only adding the cert.
+    let cert_merge = serde_json::json!({
+        "status": {
+            "phase": "Connecting",
+            "reason": "HarnessPreparation",
+            "message": "harness-seeded Connecting; awaiting trust verification",
+            "publicCertPem": TEST_TRUST_CERT_PEM,
+        }
+    });
+    let out = Command::new("kubectl")
+        .args([
+            "--context",
+            context,
+            "patch",
+            "gridsites",
+            site_k8s_name,
+            "--subresource=status",
+            "--type=merge",
+            "-p",
+            &cert_merge.to_string(),
+        ])
+        .output()?;
+    if !out.status.success() {
+        return Err(format!(
+            "status merge patch for {site_k8s_name} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        )
+        .into());
+    }
     eprintln!(
-        "  [OK] GridSite {site_k8s_name:?} applied with Active phase \
+        "  [OK] GridSite {site_k8s_name:?} spec+trust configured; \
+         publicCertPem injected — controller will promote to Active when TCP probe passes \
          (network={network_ref:?}, egress={egress_addr:?})"
     );
     Ok(())
@@ -2891,6 +3347,130 @@ pub(crate) fn cleanup_swim_overlay_test_resources(context: &str) -> Result<(), B
     Ok(())
 }
 
+/// Apply test fixtures for the SWIM transport encryption E2E.
+///
+/// Creates a `GridNetwork` with a single `gatewayRef` and an `InferenceProvider`
+/// for the keyed node.  The wrong-key and plaintext nodes should NOT have their
+/// providers appear in the overlay.
+pub(crate) fn apply_swim_encrypt_test_fixtures(
+    context: &str,
+    site_a_name: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    apply_swim_encrypt_test_fixtures_with_options(context, site_a_name, &[], false)
+}
+
+/// Apply SWIM encryption fixtures with optional CRD seed and `SecretRef` config.
+#[expect(
+    clippy::too_many_lines,
+    reason = "sequential GridNetwork + InferenceProvider JSON construction and apply"
+)]
+pub(crate) fn apply_swim_encrypt_test_fixtures_with_options(
+    context: &str,
+    site_a_name: &str,
+    seeds: &[String],
+    use_swim_key_ref: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let tls = if use_swim_key_ref {
+        serde_json::json!({
+            "swimKeyRef": {
+                "name": SWIM_ENCRYPT_KEY_SECRET,
+                "namespace": "default",
+                "key": "key"
+            }
+        })
+    } else {
+        serde_json::json!({})
+    };
+    let network = serde_json::to_string_pretty(&serde_json::json!({
+        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "kind": "GridNetwork",
+        "metadata": { "name": SWIM_ENCRYPT_NETWORK },
+        "spec": {
+            "seeds": seeds,
+            "tls": tls,
+            "gatewayRefs": [{
+                "name": SWIM_ENCRYPT_GW,
+                "namespace": "default",
+                "localSiteName": site_a_name
+            }]
+        }
+    }))
+    .unwrap_or_else(|e| {
+        eprintln!("SWIM encrypt network fixture serialization failed: {e}");
+        std::process::exit(1);
+    });
+    let provider = serde_json::to_string_pretty(&serde_json::json!({
+        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "kind": "InferenceProvider",
+        "metadata": { "name": SWIM_ENCRYPT_PROVIDER_A },
+        "spec": {
+            "gridNetworkRef": SWIM_ENCRYPT_NETWORK,
+            "providerKind": "self_hosted",
+            "backendKind": "local",
+            "endpoint": "http://mock-openai-provider.default.svc:8080",
+            "models": [{ "name": SWIM_ENCRYPT_MODEL_A }]
+        }
+    }))
+    .unwrap_or_else(|e| {
+        eprintln!("SWIM encrypt provider fixture serialization failed: {e}");
+        std::process::exit(1);
+    });
+    kubectl::apply_manifest(context, &network)?;
+    kubectl::apply_manifest(context, &provider)?;
+    eprintln!(
+        "  [OK] SWIM encrypt fixtures applied (network={SWIM_ENCRYPT_NETWORK}, provider={SWIM_ENCRYPT_PROVIDER_A})"
+    );
+    Ok(())
+}
+
+/// Apply a Secret suitable for `GridNetwork.spec.tls.swimKeyRef`.
+///
+/// `key_material` must be exactly 32 UTF-8 bytes so Kubernetes stores a valid
+/// AES-256-GCM key in the Secret's `data.key` field.
+pub(crate) fn apply_swim_encrypt_key_secret(
+    context: &str,
+    key_material: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if key_material.len() != 32 {
+        return Err("SWIM encryption test Secret key material must be exactly 32 bytes".into());
+    }
+    let manifest = serde_json::to_string_pretty(&serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {
+            "name": SWIM_ENCRYPT_KEY_SECRET,
+            "namespace": "default"
+        },
+        "type": "Opaque",
+        "stringData": {
+            "key": key_material
+        }
+    }))
+    .unwrap_or_else(|e| {
+        eprintln!("SWIM encrypt key Secret serialization failed: {e}");
+        std::process::exit(1);
+    });
+    kubectl::apply_manifest(context, &manifest)?;
+    eprintln!("  [OK] SWIM encrypt key Secret applied (name={SWIM_ENCRYPT_KEY_SECRET})");
+    Ok(())
+}
+
+/// Remove resources created by the SWIM encryption validation.
+pub(crate) fn cleanup_swim_encrypt_test_resources(context: &str) -> Result<(), Box<dyn std::error::Error>> {
+    delete_namespaced_resource(
+        context,
+        "default",
+        "configmap",
+        &format!("grid-overlay-{SWIM_ENCRYPT_NETWORK}-{SWIM_ENCRYPT_GW}"),
+    )?;
+    delete_namespaced_resource(context, "default", "secret", SWIM_ENCRYPT_KEY_SECRET)?;
+    delete_cluster_resource(context, "inferenceprovider", SWIM_ENCRYPT_PROVIDER_A)?;
+    delete_cluster_resource(context, "gridnetwork", SWIM_ENCRYPT_NETWORK)?;
+    cleanup_auto_discovered_gridsites_for_network(context, SWIM_ENCRYPT_NETWORK);
+    eprintln!("  [OK] stale SWIM encryption test resources removed");
+    Ok(())
+}
+
 /// Verify that the overlay `ConfigMap` contains at least one remote CRDT candidate.
 ///
 /// The overlay is read from `grid-overlay-{network}-{gw}` in the `default`
@@ -2940,6 +3520,589 @@ pub(crate) fn verify_swim_overlay_candidates(
          (site != {primary_site_name:?})"
     );
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Three-node SWIM mesh helpers
+// ---------------------------------------------------------------------------
+
+/// Poll until `GridNetwork.status.distributedProviderCount >= min_count`.
+///
+/// Uses the same bump-per-poll pattern as [`wait_for_gridnetwork_distributed_state`]
+/// so the operator reconciles during each wait cycle.
+///
+/// Returns the actual count when the threshold is reached.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "synchronous poll loop in xtask; no async runtime available"
+)]
+pub(crate) fn wait_for_distributed_state_count(
+    context: &str,
+    name: &str,
+    min_count: u32,
+    timeout: Duration,
+) -> Result<u32, Box<dyn std::error::Error>> {
+    let start = Instant::now();
+    loop {
+        drop(bump_gridnetwork(context, name));
+        let count_str = kubectl_jsonpath(
+            context,
+            &format!("gridnetworks/{name}"),
+            "{.status.distributedProviderCount}",
+        )
+        .unwrap_or_default();
+        let count: u32 = count_str.parse().unwrap_or(0);
+        if count >= min_count {
+            eprintln!("  [OK] GridNetwork {name}: distributedProviderCount={count} (>= {min_count})");
+            return Ok(count);
+        }
+        if start.elapsed() >= timeout {
+            return Err(format!(
+                "timeout waiting for GridNetwork {name} distributedProviderCount >= {min_count}; \
+                 last observed: {count}"
+            )
+            .into());
+        }
+        eprintln!(
+            "  waiting for GridNetwork {name} distributedProviderCount >= {min_count} \
+             (current={count})..."
+        );
+        std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// Assert that the overlay contains a candidate with `site == expected_site`.
+///
+/// Used to prove that a CRDT provider from a specific site reached the overlay after
+/// its `GridSite` was set to `Active`.
+pub(crate) fn verify_overlay_has_site_candidate(
+    context: &str,
+    network: &str,
+    gw: &str,
+    expected_site: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let overlay = read_overlay_configmap(context, network, gw, "default")?;
+    let candidates = overlay
+        .get("candidates")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("overlay missing candidates array")?;
+
+    let found = candidates
+        .iter()
+        .any(|c| c.get("site").and_then(serde_json::Value::as_str) == Some(expected_site));
+
+    if !found {
+        return Err(format!(
+            "routing eligibility: overlay has no candidate with site={expected_site:?}; \
+             expected the site's CRDT provider to appear after GridSite became Active"
+        )
+        .into());
+    }
+    eprintln!(
+        "  [PASS] routing eligibility: overlay contains candidate with site={expected_site:?} \
+         (GridSite Active → eligible)"
+    );
+    Ok(())
+}
+
+/// Poll until the overlay for `network/gw` contains a candidate with `site == expected_site`.
+///
+/// Bumps the `GridNetwork` on each poll cycle to force a reconcile.  Used after setting
+/// a `GridSite` to `Active` to wait for the overlay to be re-rendered with the new candidate.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "synchronous poll loop in xtask; no async runtime available"
+)]
+pub(crate) fn wait_for_site_candidate_in_overlay(
+    context: &str,
+    network: &str,
+    gw: &str,
+    expected_site: &str,
+    timeout: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let start = Instant::now();
+    loop {
+        drop(bump_gridnetwork(context, network));
+        if let Ok(()) = verify_overlay_has_site_candidate(context, network, gw, expected_site) {
+            return Ok(());
+        }
+        if start.elapsed() >= timeout {
+            return Err(format!(
+                "timeout waiting for overlay candidate with site={expected_site:?} \
+                 in {network}/{gw}"
+            )
+            .into());
+        }
+        eprintln!("  waiting for overlay candidate with site={expected_site:?} in {network}/{gw}...");
+        std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// Apply the three-node SWIM mesh `GridNetwork` and leaf-node `InferenceProvider` fixtures.
+///
+/// The `GridNetwork` uses `localSiteName = site_a_name` so node A's operator renders the
+/// overlay `ConfigMap`.  The `InferenceProvider` has no `siteSelector` or `routingClusterRef`,
+/// so each operator publishes it as CRDT with its own `site_id`.  The leaf node C's CRDT
+/// contribution (`site_id = site_c_name`) is the primary proof target.
+#[expect(
+    clippy::too_many_lines,
+    reason = "sequential GridNetwork + InferenceProvider JSON construction and apply"
+)]
+pub(crate) fn apply_swim_mesh_test_fixtures(
+    context: &str,
+    site_a_name: &str,
+    provider_name: &str,
+    model_name: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let network = serde_json::to_string_pretty(&serde_json::json!({
+        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "kind": "GridNetwork",
+        "metadata": { "name": SWIM_MESH_NETWORK },
+        "spec": {
+            "seeds": [],
+            "gatewayRefs": [{
+                "name": SWIM_MESH_GW,
+                "namespace": "default",
+                "localSiteName": site_a_name
+            }]
+        }
+    }))
+    .unwrap_or_else(|e| {
+        eprintln!("SWIM mesh network fixture serialization failed: {e}");
+        std::process::exit(1);
+    });
+    let provider = serde_json::to_string_pretty(&serde_json::json!({
+        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "kind": "InferenceProvider",
+        "metadata": { "name": provider_name },
+        "spec": {
+            "gridNetworkRef": SWIM_MESH_NETWORK,
+            "providerKind": "self_hosted",
+            "backendKind": "local",
+            "endpoint": "http://mock-openai-provider.default.svc:8080",
+            "models": [{ "name": model_name }]
+        }
+    }))
+    .unwrap_or_else(|e| {
+        eprintln!("SWIM mesh provider fixture serialization failed: {e}");
+        std::process::exit(1);
+    });
+    kubectl::apply_manifest(context, &network)?;
+    kubectl::apply_manifest(context, &provider)?;
+    eprintln!(
+        "  [OK] SWIM mesh fixtures applied (network={SWIM_MESH_NETWORK}, \
+         provider={provider_name}, model={model_name})"
+    );
+    Ok(())
+}
+
+/// Apply a wrong-network `GridNetwork` and `InferenceProvider` for cross-network
+/// isolation testing.
+///
+/// The fixtures use [`SWIM_MESH_WRONG_NETWORK`] as the network name.  Resources in
+/// this network must never appear in the overlay rendered for [`SWIM_MESH_NETWORK`].
+#[expect(
+    clippy::too_many_lines,
+    reason = "sequential wrong-network GridNetwork + InferenceProvider JSON construction and apply"
+)]
+pub(crate) fn apply_swim_mesh_wrong_network_fixtures(context: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let network = serde_json::to_string_pretty(&serde_json::json!({
+        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "kind": "GridNetwork",
+        "metadata": { "name": SWIM_MESH_WRONG_NETWORK },
+        "spec": {
+            "seeds": [],
+            "gatewayRefs": [{
+                "name": SWIM_MESH_GW,
+                "namespace": "default",
+                "localSiteName": "swim-mesh-wrong"
+            }]
+        }
+    }))
+    .unwrap_or_else(|e| {
+        eprintln!("SWIM mesh wrong-network fixture serialization failed: {e}");
+        std::process::exit(1);
+    });
+    let provider = serde_json::to_string_pretty(&serde_json::json!({
+        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "kind": "InferenceProvider",
+        "metadata": { "name": SWIM_MESH_WRONG_PROVIDER },
+        "spec": {
+            "gridNetworkRef": SWIM_MESH_WRONG_NETWORK,
+            "providerKind": "self_hosted",
+            "backendKind": "local",
+            "endpoint": "http://mock-openai-provider.default.svc:8080",
+            "models": [{ "name": SWIM_MESH_WRONG_MODEL }]
+        }
+    }))
+    .unwrap_or_else(|e| {
+        eprintln!("SWIM mesh wrong-network provider serialization failed: {e}");
+        std::process::exit(1);
+    });
+    kubectl::apply_manifest(context, &network)?;
+    kubectl::apply_manifest(context, &provider)?;
+    eprintln!(
+        "  [OK] SWIM mesh wrong-network fixtures applied \
+         (network={SWIM_MESH_WRONG_NETWORK}, provider={SWIM_MESH_WRONG_PROVIDER})"
+    );
+    Ok(())
+}
+
+/// Assert that the overlay contains no candidate with `model == excluded_model`.
+///
+/// Used to prove that providers from a wrong-network `GridNetwork` do not leak into
+/// the correct-network overlay.
+pub(crate) fn assert_no_overlay_candidate_for_model(
+    context: &str,
+    network: &str,
+    gw: &str,
+    excluded_model: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let overlay = read_overlay_configmap(context, network, gw, "default")?;
+    let candidates = overlay
+        .get("candidates")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("overlay missing candidates array")?;
+
+    let found = candidates
+        .iter()
+        .any(|c| c.get("name").and_then(serde_json::Value::as_str) == Some(excluded_model));
+
+    if found {
+        return Err(format!(
+            "cross-network isolation violation: overlay contains a candidate with \
+             model={excluded_model:?} from wrong-network resources"
+        )
+        .into());
+    }
+    eprintln!("  [PASS] cross-network isolation: overlay has no candidate with model={excluded_model:?}");
+    Ok(())
+}
+
+/// Delete all resources created by the three-node SWIM mesh validation.
+///
+/// Safe to call before a fresh run — all deletes use `--ignore-not-found`.
+pub(crate) fn cleanup_swim_mesh_test_resources(context: &str) -> Result<(), Box<dyn std::error::Error>> {
+    delete_namespaced_resource(
+        context,
+        "default",
+        "configmap",
+        &format!("grid-overlay-{SWIM_MESH_NETWORK}-{SWIM_MESH_GW}"),
+    )?;
+    delete_cluster_resource(context, "inferenceprovider", SWIM_MESH_PROVIDER_C)?;
+    delete_cluster_resource(context, "inferenceprovider", SWIM_MESH_WRONG_PROVIDER)?;
+    delete_cluster_resource(context, "gridnetwork", SWIM_MESH_NETWORK)?;
+    delete_cluster_resource(context, "gridnetwork", SWIM_MESH_WRONG_NETWORK)?;
+    cleanup_auto_discovered_gridsites_for_network(context, SWIM_MESH_NETWORK);
+    cleanup_auto_discovered_gridsites_for_network(context, SWIM_MESH_WRONG_NETWORK);
+    eprintln!("  [OK] stale SWIM mesh test resources removed");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Fingerprint trust promotion helpers
+// ---------------------------------------------------------------------------
+
+/// Compute the SHA-256 fingerprint of a PEM string.
+///
+/// Returns a colon-separated lowercase hex string (95 chars: 32 pairs + 31 colons).
+/// This matches the algorithm used by `operator::resources::trust_bundle::sha256_fingerprint`
+/// and is the correct value for `GridSite.spec.trust.certFingerprint`.
+#[must_use]
+pub(crate) fn sha256_fingerprint(pem_str: &str) -> String {
+    // Trim surrounding whitespace so fingerprints match regardless of trailing
+    // newlines from kubectl jsonpath vs Kubernetes API deserialization.
+    let digest = Sha256::digest(pem_str.trim().as_bytes());
+    digest.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(":")
+}
+
+/// Apply the trust fingerprint test `GridNetwork` and `InferenceProvider` fixtures.
+///
+/// The `GridNetwork` is configured with `localSiteName = site_a_name` so that
+/// node A's operator renders the overlay.  `spec.tls` references are set so that
+/// node B's operator generates a site certificate and broadcasts it via SWIM.
+#[expect(clippy::too_many_lines, reason = "sequential JSON fixture construction")]
+pub(crate) fn apply_swim_trust_test_fixtures(
+    context: &str,
+    site_a_name: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let network = serde_json::to_string_pretty(&serde_json::json!({
+        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "kind": "GridNetwork",
+        "metadata": {
+            "name": SWIM_TRUST_NETWORK,
+            "labels": {
+                // Enable auto-discovery so the operator creates auto-discovered GridSites
+                // and populates publicCertPem when cert broadcasts are received.
+                "grid.praxis-proxy.io/auto-discover-sites": "true"
+            }
+        },
+        "spec": {
+            "seeds": [],
+            "gatewayRefs": [{
+                "name": SWIM_TRUST_GW,
+                "namespace": "default",
+                "localSiteName": site_a_name
+            }],
+            "tls": {
+                "caSecretRef": {
+                    "name": SWIM_TRUST_CA_SECRET,
+                    "namespace": "default"
+                },
+                "siteSecretRef": {
+                    "name": SWIM_TRUST_SITE_SECRET,
+                    "namespace": "default"
+                }
+            }
+        }
+    }))
+    .unwrap_or_else(|e| {
+        eprintln!("SWIM trust network fixture serialization failed: {e}");
+        std::process::exit(1);
+    });
+    let provider = serde_json::to_string_pretty(&serde_json::json!({
+        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "kind": "InferenceProvider",
+        "metadata": { "name": SWIM_TRUST_PROVIDER_B },
+        "spec": {
+            "gridNetworkRef": SWIM_TRUST_NETWORK,
+            "providerKind": "self_hosted",
+            "backendKind": "local",
+            "endpoint": "http://mock-openai-provider.default.svc:8080",
+            "models": [{ "name": SWIM_TRUST_MODEL_B }]
+        }
+    }))
+    .unwrap_or_else(|e| {
+        eprintln!("SWIM trust provider fixture serialization failed: {e}");
+        std::process::exit(1);
+    });
+    kubectl::apply_manifest(context, &network)?;
+    kubectl::apply_manifest(context, &provider)?;
+    eprintln!(
+        "  [OK] SWIM trust fixtures applied (network={SWIM_TRUST_NETWORK}, \
+         provider={SWIM_TRUST_PROVIDER_B}, model={SWIM_TRUST_MODEL_B})"
+    );
+    Ok(())
+}
+
+/// Delete all resources created by the fingerprint trust promotion validation.
+pub(crate) fn cleanup_swim_trust_test_resources(context: &str) -> Result<(), Box<dyn std::error::Error>> {
+    delete_namespaced_resource(
+        context,
+        "default",
+        "configmap",
+        &format!("grid-overlay-{SWIM_TRUST_NETWORK}-{SWIM_TRUST_GW}"),
+    )?;
+    delete_cluster_resource(context, "inferenceprovider", SWIM_TRUST_PROVIDER_B)?;
+    delete_cluster_resource(context, "gridnetwork", SWIM_TRUST_NETWORK)?;
+    // Clean up TLS Secrets created by ensure_tls_secrets.
+    drop(
+        Command::new("kubectl")
+            .args([
+                "--context",
+                context,
+                "delete",
+                "secret",
+                SWIM_TRUST_CA_SECRET,
+                SWIM_TRUST_SITE_SECRET,
+                "-n",
+                "default",
+                "--ignore-not-found",
+            ])
+            .output(),
+    );
+    cleanup_auto_discovered_gridsites_for_network(context, SWIM_TRUST_NETWORK);
+    eprintln!("  [OK] stale SWIM trust test resources removed");
+    Ok(())
+}
+
+/// Read `status.publicCertPem` from a `GridSite` resource.
+///
+/// Returns `None` when the field is absent or empty, `Some(pem)` otherwise.
+pub(crate) fn read_gridsite_public_cert_pem(context: &str, site_name: &str) -> Option<String> {
+    let out = Command::new("kubectl")
+        .args([
+            "--context",
+            context,
+            "get",
+            "gridsites",
+            site_name,
+            "-o",
+            "jsonpath={.status.publicCertPem}",
+            "--ignore-not-found",
+        ])
+        .output()
+        .ok()?;
+    let pem = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    if pem.is_empty() { None } else { Some(pem) }
+}
+
+/// Apply egress address to a `GridSite` spec without patching the phase.
+///
+/// This allows the `GridSite` controller to advance phases naturally —
+/// use this to exercise the trust-policy-gated promotion path from the
+/// auto-discovered lifecycle state.
+pub(crate) fn apply_gridsite_egress(
+    context: &str,
+    site_k8s_name: &str,
+    network_ref: &str,
+    egress_addr: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let spec = serde_json::to_string_pretty(&serde_json::json!({
+        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "kind": "GridSite",
+        "metadata": { "name": site_k8s_name },
+        "spec": {
+            "gridNetworkRef": network_ref,
+            "egress": { "address": egress_addr, "tls": { "mode": "Mutual" } }
+        }
+    }))
+    .unwrap_or_else(|e| {
+        eprintln!("GridSite egress spec serialization failed: {e}");
+        std::process::exit(1);
+    });
+    kubectl::apply_manifest(context, &spec)?;
+    eprintln!("  [OK] GridSite {site_k8s_name:?}: egress={egress_addr:?} applied (phase NOT patched)");
+    Ok(())
+}
+
+/// Poll until `GridSite.status.publicCertPem` is non-empty.
+///
+/// Returns the PEM string when available, or an error on timeout.
+#[expect(clippy::disallowed_methods, reason = "synchronous poll loop in xtask")]
+pub(crate) fn wait_for_gridsite_public_cert_pem(
+    context: &str,
+    site_name: &str,
+    timeout: Duration,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let start = Instant::now();
+    loop {
+        if let Some(pem) = read_gridsite_public_cert_pem(context, site_name) {
+            eprintln!("  [OK] GridSite {site_name:?}: publicCertPem received");
+            return Ok(pem);
+        }
+        if start.elapsed() >= timeout {
+            return Err(format!("timeout waiting for GridSite {site_name:?} publicCertPem").into());
+        }
+        eprintln!("  waiting for GridSite {site_name:?} publicCertPem...");
+        std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// Read the `status.reason` field from a `GridSite` resource.
+pub(crate) fn read_gridsite_reason(context: &str, site_name: &str) -> String {
+    Command::new("kubectl")
+        .args([
+            "--context",
+            context,
+            "get",
+            "gridsites",
+            site_name,
+            "-o",
+            "jsonpath={.status.reason}",
+            "--ignore-not-found",
+        ])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+        .unwrap_or_default()
+}
+
+/// Patch `GridSite.spec.trust.certFingerprint`.
+pub(crate) fn patch_gridsite_cert_fingerprint(
+    context: &str,
+    site_name: &str,
+    fingerprint: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let patch = serde_json::to_string(&serde_json::json!({
+        "spec": { "trust": { "certFingerprint": fingerprint } }
+    }))
+    .unwrap_or_else(|_| "{}".to_owned());
+    let out = Command::new("kubectl")
+        .args([
+            "--context",
+            context,
+            "patch",
+            "gridsites",
+            site_name,
+            "--type=merge",
+            "-p",
+            &patch,
+        ])
+        .output()?;
+    if out.status.success() {
+        eprintln!("  [OK] GridSite {site_name:?}: spec.trust.certFingerprint patched");
+        Ok(())
+    } else {
+        Err(format!(
+            "kubectl patch gridsite {site_name} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        )
+        .into())
+    }
+}
+
+/// Poll until `GridSite.status.reason == expected_reason`, bumping `network` each cycle.
+#[expect(clippy::disallowed_methods, reason = "synchronous poll loop in xtask")]
+pub(crate) fn wait_for_gridsite_reason_in_network(
+    context: &str,
+    site_name: &str,
+    network: &str,
+    expected_reason: &str,
+    timeout: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let start = Instant::now();
+    loop {
+        drop(bump_gridnetwork(context, network));
+        let reason = read_gridsite_reason(context, site_name);
+        if reason == expected_reason {
+            eprintln!("  [OK] GridSite {site_name:?}: status.reason={reason:?}");
+            return Ok(());
+        }
+        if start.elapsed() >= timeout {
+            return Err(format!(
+                "timeout waiting for GridSite {site_name:?} reason={expected_reason:?}; \
+                 last observed: {reason:?}"
+            )
+            .into());
+        }
+        eprintln!(
+            "  waiting for GridSite {site_name:?} reason={expected_reason:?} \
+             (current={reason:?})..."
+        );
+        std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// Poll until `GridSite.status.reason == expected_reason` (bumps [`SWIM_TRUST_NETWORK`]).
+#[expect(clippy::disallowed_methods, reason = "synchronous poll loop in xtask")]
+pub(crate) fn wait_for_gridsite_reason(
+    context: &str,
+    site_name: &str,
+    expected_reason: &str,
+    timeout: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let start = Instant::now();
+    loop {
+        drop(bump_gridnetwork(context, SWIM_TRUST_NETWORK));
+        let reason = read_gridsite_reason(context, site_name);
+        if reason == expected_reason {
+            eprintln!("  [OK] GridSite {site_name:?}: status.reason={reason:?}");
+            return Ok(());
+        }
+        if start.elapsed() >= timeout {
+            return Err(format!(
+                "timeout waiting for GridSite {site_name:?} reason={expected_reason:?}; \
+                 last observed: {reason:?}"
+            )
+            .into());
+        }
+        eprintln!(
+            "  waiting for GridSite {site_name:?} reason={expected_reason:?} \
+             (current={reason:?})..."
+        );
+        std::thread::sleep(POLL_INTERVAL);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3506,14 +4669,13 @@ pub(crate) fn apply_gridsite(
 
 /// Patch the `GridSite` status subresource to set `phase`.
 ///
-/// The site controller preserves the patched phase through subsequent
-/// reconciles because the grid-site controller's `determine_phase()` returns the
-/// current phase unchanged in Phase 1 (manual lifecycle).  Polling with
-/// [`wait_for_gridsite_phase`] after this call confirms preservation.
+/// The site controller reconciles after this patch.  Polling with
+/// [`wait_for_gridsite_phase`] after this call confirms the expected phase is
+/// observed after reconciliation.
 ///
-/// This is xtask validation infrastructure — it simulates the transitions
-/// that SWIM discovery and mTLS exchange would trigger automatically in
-/// Phase 2.
+/// This is xtask validation infrastructure — it simulates lifecycle states
+/// that are otherwise reached through SWIM discovery, gateway reachability, and
+/// trust policy configuration.
 pub(crate) fn patch_gridsite_phase(
     context: &str,
     site_name: &str,
@@ -3838,6 +5000,47 @@ pub(crate) fn verify_site_join_overlay(
     eprintln!("  [PASS] overlay: wrong-network site {wrong_site:?} absent from {SITE_JOIN_NETWORK:?}");
 
     Ok(())
+}
+
+/// Poll until the site-join overlay contains both the primary and joining candidates.
+///
+/// Uses [`verify_site_join_overlay`] for each check.  Bumps the [`SITE_JOIN_NETWORK`]
+/// `GridNetwork` each cycle so the controller re-renders the overlay with the most
+/// recent provider list.  This is necessary because the `InferenceProvider` informer
+/// cache may lag behind provider creation — a one-shot check right after bumping may
+/// read a stale overlay that is missing newly-applied providers.
+#[expect(clippy::disallowed_methods, reason = "synchronous poll loop in xtask")]
+#[expect(clippy::too_many_arguments, reason = "delegates to verify_site_join_overlay")]
+pub(crate) fn wait_for_site_join_overlay(
+    context: &str,
+    primary_site: &str,
+    primary_model: &str,
+    joining_site: &str,
+    joining_model: &str,
+    wrong_site: &str,
+    timeout: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let start = Instant::now();
+    loop {
+        drop(bump_gridnetwork(context, SITE_JOIN_NETWORK));
+        match verify_site_join_overlay(
+            context,
+            primary_site,
+            primary_model,
+            joining_site,
+            joining_model,
+            wrong_site,
+        ) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                if start.elapsed() >= timeout {
+                    return Err(format!("timeout: {e}").into());
+                }
+                eprintln!("  waiting for site-join overlay ({e})...");
+                std::thread::sleep(POLL_INTERVAL);
+            },
+        }
+    }
 }
 
 /// Derive the Kubernetes resource name for an auto-discovered `GridSite`.

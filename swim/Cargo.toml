@@ -8,6 +8,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
+aes-gcm = { workspace = true }
 bincode = { workspace = true }
 bytes = { workspace = true }
 crdt = { path = "../crdt" }

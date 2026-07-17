@@ -21,6 +21,7 @@ scoring = { path = "../scoring" }
 k8s-openapi = { workspace = true }
 kube = { workspace = true }
 schemars = { workspace = true }
+sha2 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

@@ -51,7 +51,7 @@ use crate::swim::{MemberRecord, MemberStatus, MembershipSnapshot};
 // ---------------------------------------------------------------------------
 
 /// Configuration for the SWIM runtime.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct SwimConfig {
     /// UDP address to bind for SWIM gossip (e.g. `"0.0.0.0:7946"`).
     pub bind_addr: SocketAddr,
@@ -79,6 +79,39 @@ pub struct SwimConfig {
     /// as the `gateway_address` field, and remote peers will use it for
     /// `GridSite.spec.egress.address` instead of the SWIM UDP endpoint.
     pub gateway_address: Option<String>,
+
+    /// AES-256-GCM encryption key for SWIM UDP packets.
+    ///
+    /// When `Some`, every outgoing SWIM packet is encrypted and authenticated
+    /// with this key.  Incoming packets that do not authenticate with this key
+    /// are silently dropped — the SWIM state machine never sees them.
+    ///
+    /// When `None`, SWIM traffic is sent as plaintext (backward-compatible local
+    /// and development behavior).
+    ///
+    /// Configuring a key via `GridNetwork.spec.tls.swimKeyRef` is the preferred
+    /// production path.  This field is also used for testing: the operator reads
+    /// the env var `GRID_SWIM_ENCRYPT_KEY` (64 hex chars = 32 bytes) at startup
+    /// and stores the decoded key here.
+    ///
+    /// # Security invariant
+    ///
+    /// The key value must **never** appear in logs, tracing spans, error messages,
+    /// Kubernetes resources, or process output.
+    pub swim_key: Option<swim::crypto::SwimKey>,
+}
+
+impl std::fmt::Debug for SwimConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SwimConfig")
+            .field("bind_addr", &self.bind_addr)
+            .field("advertise_addr", &self.advertise_addr)
+            .field("site_name", &self.site_name)
+            .field("seeds", &self.seeds)
+            .field("gateway_address", &self.gateway_address)
+            .field("swim_key", &self.swim_key.map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -254,6 +287,14 @@ pub enum BroadcastError {
     ChannelClosed,
 }
 
+/// Error returned when [`SwimHandle::set_swim_key`] cannot apply the key.
+#[derive(Debug, thiserror::Error)]
+pub enum SetKeyError {
+    /// The SWIM runtime has exited and the key channel is closed.
+    #[error("SWIM runtime has exited; key not applied")]
+    RuntimeGone,
+}
+
 /// Error returned when seed addresses cannot be queued for announcement.
 #[derive(Debug, thiserror::Error)]
 pub enum SeedAnnounceError {
@@ -299,6 +340,26 @@ pub struct SwimHandle {
 
     /// Channel for queuing seed addresses to announce at runtime.
     seed_tx: mpsc::Sender<Vec<SocketAddr>>,
+
+    /// Watch sender for the SWIM encryption key.
+    ///
+    /// Send `Some(key)` to enable encryption; the run loop starts encrypting
+    /// outgoing packets and drops non-authenticating inbound packets.
+    ///
+    /// The initial value is `None` (no encryption) when no env-var key is
+    /// configured.  `set_swim_key` sends `Some(key)` once at reconcile time;
+    /// sending `None` after a key has been set is not an intended runtime
+    /// path and no production code does so.
+    ///
+    /// Key changes after the initial send require an operator restart because the
+    /// old key immediately loses the ability to decrypt in-flight packets from
+    /// peers that have not yet received the new key.
+    ///
+    /// # Security invariant
+    ///
+    /// The key value must **never** appear in logs, spans, error messages, or
+    /// status fields.
+    key_tx: watch::Sender<Option<Arc<swim::crypto::SwimKey>>>,
 }
 
 impl SwimHandle {
@@ -381,6 +442,34 @@ impl SwimHandle {
             TrySendError::Closed(_) => BroadcastError::ChannelClosed,
         })
     }
+
+    /// Configure the AES-256-GCM encryption key for SWIM traffic.
+    ///
+    /// After this call, the runtime encrypts every outgoing SWIM packet with the
+    /// given key and drops any incoming packet that does not authenticate.
+    ///
+    /// This method is idempotent: if the same key bytes are sent again, the
+    /// runtime receives the same value and behavior does not change.
+    ///
+    /// # Key change warning
+    ///
+    /// Changing to a different key while the cluster is live technically takes
+    /// effect immediately, but it is not a safe rotation mechanism: there is no
+    /// keyring, so peers that still hold the old key can no longer communicate.
+    /// Use a coordinated restart or simultaneous replacement across sites.
+    ///
+    /// # Security invariant
+    ///
+    /// The key value is never logged, traced, or exposed in status fields.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SetKeyError::RuntimeGone`] if the SWIM runtime has exited.
+    pub fn set_swim_key(&self, key: swim::crypto::SwimKey) -> Result<(), SetKeyError> {
+        self.key_tx
+            .send(Some(Arc::new(key)))
+            .map_err(|_e| SetKeyError::RuntimeGone)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -417,11 +506,13 @@ pub async fn start(config: SwimConfig) -> Result<Arc<SwimHandle>, SwimRuntimeErr
 
     let site_name = config.site_name.clone();
     let gateway_address = config.gateway_address.clone();
+    let initial_key: Option<Arc<swim::crypto::SwimKey>> = config.swim_key.map(Arc::new);
     let (snapshot_tx, snapshot_rx) = watch::channel(MembershipSnapshot::default());
     let (state_tx, state_rx) = watch::channel(GridStateSnapshot::new(site_name.clone()));
     let (timer_tx, timer_rx) = mpsc::channel::<TimerEvent>(256);
     let (broadcast_tx, broadcast_rx) = mpsc::channel::<swim::StateBroadcast>(32);
     let (seed_tx, seed_rx) = mpsc::channel::<Vec<SocketAddr>>(16);
+    let (key_tx, key_rx) = watch::channel(initial_key);
     let channels = RuntimeChannels {
         snapshot_tx,
         timer_tx,
@@ -435,10 +526,18 @@ pub async fn start(config: SwimConfig) -> Result<Arc<SwimHandle>, SwimRuntimeErr
         advertise_addr = %advertise_addr,
         site_name = %config.site_name,
         seeds = config.seeds.len(),
+        encrypted = config.swim_key.is_some(),
         "SWIM runtime starting"
     );
 
-    tokio::spawn(run_loop(Arc::new(socket), config, advertise_addr, channels, state_tx));
+    tokio::spawn(run_loop(
+        Arc::new(socket),
+        config,
+        advertise_addr,
+        channels,
+        state_tx,
+        key_rx,
+    ));
 
     Ok(Arc::new(SwimHandle {
         site_name,
@@ -448,6 +547,7 @@ pub async fn start(config: SwimConfig) -> Result<Arc<SwimHandle>, SwimRuntimeErr
         state_rx,
         broadcast_tx,
         seed_tx,
+        key_tx,
     }))
 }
 
@@ -467,12 +567,17 @@ pub async fn start(config: SwimConfig) -> Result<Arc<SwimHandle>, SwimRuntimeErr
     reason = "select! with four arms plus nested drain_output; extracting arms would hide the I/O ownership pattern"
 )]
 #[expect(clippy::large_stack_frames, reason = "async future over UDP socket + foca node")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "key_rx added to support runtime encryption key loading; separate struct would obscure the startup sequence"
+)]
 async fn run_loop(
     socket: Arc<UdpSocket>,
     config: SwimConfig,
     advertise_addr: SocketAddr,
     mut channels: RuntimeChannels,
     state_tx: watch::Sender<GridStateSnapshot>,
+    mut key_rx: watch::Receiver<Option<Arc<swim::crypto::SwimKey>>>,
 ) {
     let site_name = config.site_name.clone();
     let identity = NodeId::new(site_name.clone(), advertise_addr);
@@ -490,6 +595,8 @@ async fn run_loop(
     }
 
     // Announce to seed peers.  Errors are logged inside SwimNode::announce.
+    // Read the initial key (from SwimConfig, if any) for the startup seed sends.
+    let startup_key: Option<Arc<swim::crypto::SwimKey>> = key_rx.borrow_and_update().clone();
     for &seed_addr in &config.seeds {
         let seed_id = NodeId::new(format!("seed-{seed_addr}"), seed_addr);
         let output = node.announce(seed_id);
@@ -501,16 +608,43 @@ async fn run_loop(
             &channels.snapshot_tx,
             &node.gateway_addrs(),
             &node.cert_pems(),
+            startup_key.as_deref(),
         )
         .await;
     }
 
     loop {
+        // Snapshot the current key for this iteration.  The key is set once and
+        // never changes, so this borrow-and-clone is cheap and branch-free after
+        // the first successful key load.
+        let current_key: Option<Arc<swim::crypto::SwimKey>> = key_rx.borrow_and_update().clone();
+
         tokio::select! {
             result = socket.recv_from(&mut buf) => {
                 match result {
                     Ok((n, from)) => {
-                        let data = buf.get(..n).unwrap_or(&[]);
+                        let raw = buf.get(..n).unwrap_or(&[]);
+
+                        // Decrypt and authenticate when a key is configured.
+                        // On failure, drop the packet silently — do not pass
+                        // unauthenticated bytes to foca.
+                        let plaintext_buf: Vec<u8>;
+                        let data: &[u8] = if let Some(key) = &current_key {
+                            if let Ok(plain) = swim::crypto::decrypt(key.as_ref(), raw) {
+                                plaintext_buf = plain;
+                                &plaintext_buf
+                            } else {
+                                tracing::warn!(
+                                    addr = %from,
+                                    bytes = n,
+                                    "SWIM: dropped packet (authentication failed)"
+                                );
+                                continue;
+                            }
+                        } else {
+                            raw
+                        };
+
                         let output = node.handle_data(data);
                         tracing::trace!(from = %from, bytes = n, "SWIM UDP received");
                         drain_output(
@@ -521,6 +655,7 @@ async fn run_loop(
                             &channels.snapshot_tx,
                             &node.gateway_addrs(),
                             &node.cert_pems(),
+                            current_key.as_deref(),
                         )
                         .await;
                         // Publish updated CRDT state after every incoming UDP packet.
@@ -551,6 +686,7 @@ async fn run_loop(
                                     &channels.snapshot_tx,
                                     &node.gateway_addrs(),
                                     &node.cert_pems(),
+                                    current_key.as_deref(),
                                 )
                                 .await;
                                 drop(state_tx.send(node.state_snapshot()));
@@ -571,6 +707,7 @@ async fn run_loop(
                     &channels.snapshot_tx,
                     &node.gateway_addrs(),
                     &node.cert_pems(),
+                    current_key.as_deref(),
                 )
                 .await;
             }
@@ -589,6 +726,7 @@ async fn run_loop(
                         &channels.snapshot_tx,
                         &node.gateway_addrs(),
                         &node.cert_pems(),
+                        current_key.as_deref(),
                     )
                     .await;
                 }
@@ -608,6 +746,7 @@ async fn run_loop(
                         &channels.snapshot_tx,
                         &node.gateway_addrs(),
                         &node.cert_pems(),
+                        current_key.as_deref(),
                     )
                     .await;
                 }
@@ -648,6 +787,9 @@ fn publish_gateway_address_broadcast(node: &mut SwimNode, site_name: &str, revis
 /// Uses [`Instant::now()`] for age tracking so Dead/Suspect transitions record
 /// an accurate wall-clock start time.  The same `now` value is used for all
 /// events processed in a single call, ensuring consistency within one gossip round.
+///
+/// When `swim_key` is `Some`, every outgoing SWIM packet is encrypted with
+/// AES-256-GCM before being written to the socket.
 #[expect(
     clippy::too_many_arguments,
     reason = "distinct runtime state pointers; a wrapper struct would obscure the data-flow"
@@ -660,9 +802,16 @@ async fn drain_output(
     snapshot_tx: &watch::Sender<MembershipSnapshot>,
     gateway_addrs: &BTreeMap<String, String>,
     cert_pems: &BTreeMap<String, String>,
+    swim_key: Option<&swim::crypto::SwimKey>,
 ) {
     for msg in output.messages {
-        if let Err(e) = socket.send_to(&msg.data, msg.addr).await {
+        // Encrypt outgoing packet when a key is configured.
+        let payload: std::borrow::Cow<'_, [u8]> = if let Some(key) = swim_key {
+            std::borrow::Cow::Owned(swim::crypto::encrypt(key, &msg.data))
+        } else {
+            std::borrow::Cow::Borrowed(&msg.data)
+        };
+        if let Err(e) = socket.send_to(&payload, msg.addr).await {
             tracing::warn!(error = %e, addr = %msg.addr, "SWIM UDP send error");
         }
     }
@@ -1084,6 +1233,7 @@ mod tests {
         let (state_tx, state_rx) = watch::channel(GridStateSnapshot::new("test".to_owned()));
         let (broadcast_tx, _broadcast_rx) = mpsc::channel(1);
         let (seed_tx, _seed_rx) = mpsc::channel(16);
+        let (key_tx, _key_rx) = watch::channel(None);
         let handle = SwimHandle {
             site_name: "test".to_owned(),
             advertise_addr: "127.0.0.1:7946".parse().unwrap_or_else(|_| std::process::abort()),
@@ -1092,6 +1242,7 @@ mod tests {
             state_rx,
             broadcast_tx,
             seed_tx,
+            key_tx,
         };
         (handle, snapshot_tx, state_tx)
     }
@@ -1102,6 +1253,7 @@ mod tests {
         let (state_tx, state_rx) = watch::channel(GridStateSnapshot::new("test".to_owned()));
         let (broadcast_tx, _broadcast_rx) = mpsc::channel(1);
         let (seed_tx, _seed_rx) = mpsc::channel(16);
+        let (key_tx, _key_rx) = watch::channel(None);
         let handle = SwimHandle {
             site_name: "test".to_owned(),
             advertise_addr: "127.0.0.1:7946".parse().unwrap_or_else(|_| std::process::abort()),
@@ -1110,6 +1262,7 @@ mod tests {
             state_rx,
             broadcast_tx,
             seed_tx,
+            key_tx,
         };
         drop((snapshot_tx, state_tx));
 
@@ -1217,6 +1370,7 @@ mod tests {
         let (state_tx, state_rx) = watch::channel(GridStateSnapshot::new("test".to_owned()));
         let (broadcast_tx, _broadcast_rx) = mpsc::channel(1);
         let (seed_tx, mut seed_rx) = mpsc::channel(16);
+        let (key_tx, _key_rx) = watch::channel(None);
         let handle = SwimHandle {
             site_name: "test".to_owned(),
             advertise_addr: "127.0.0.1:7946".parse().unwrap_or_else(|_| std::process::abort()),
@@ -1225,6 +1379,7 @@ mod tests {
             state_rx,
             broadcast_tx,
             seed_tx,
+            key_tx,
         };
         drop((snapshot_tx, state_tx));
 
@@ -1242,6 +1397,7 @@ mod tests {
         let (_state_tx, state_rx) = watch::channel(GridStateSnapshot::new("test".to_owned()));
         let (broadcast_tx, _broadcast_rx) = mpsc::channel(1);
         let (seed_tx, seed_rx) = mpsc::channel::<Vec<SocketAddr>>(16);
+        let (key_tx, _key_rx) = watch::channel(None);
         let handle = SwimHandle {
             site_name: "test".to_owned(),
             advertise_addr: "127.0.0.1:7946".parse().unwrap_or_else(|_| std::process::abort()),
@@ -1250,6 +1406,7 @@ mod tests {
             state_rx,
             broadcast_tx,
             seed_tx,
+            key_tx,
         };
         // Drop the receiver to simulate the runtime loop having exited.
         drop(seed_rx);
@@ -1274,6 +1431,7 @@ mod tests {
             site_name: "test-node".to_owned(),
             seeds: Vec::new(),
             gateway_address: None,
+            swim_key: None,
         };
         let handle = start(cfg).await;
         assert!(handle.is_ok(), "start must succeed with an available port");
@@ -1295,6 +1453,7 @@ mod tests {
             site_name: "test".to_owned(),
             seeds: Vec::new(),
             gateway_address: None,
+            swim_key: None,
         };
         let result = start(cfg).await;
         assert!(result.is_err(), "start on an already-bound port must fail");
@@ -1313,6 +1472,7 @@ mod tests {
             site_name: "node-1".to_owned(),
             seeds: Vec::new(),
             gateway_address: None,
+            swim_key: None,
         };
         let handle1 = start(cfg1).await.unwrap_or_else(|_| std::process::abort());
 
@@ -1322,6 +1482,7 @@ mod tests {
             site_name: "node-2".to_owned(),
             seeds: vec![addr1],
             gateway_address: None,
+            swim_key: None,
         };
         let handle2 = start(cfg2).await.unwrap_or_else(|_| std::process::abort());
 

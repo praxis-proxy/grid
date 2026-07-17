@@ -259,6 +259,60 @@ GET /v1/grid/providers
 Returns all accessible providers filtered by the
 workload's identity and access policies.
 
+## SWIM Transport Authentication
+
+SWIM gossip carries membership packets, gateway address broadcasts, public
+certificate PEM broadcasts, and CRDT provider state.  When
+`GridNetwork.spec.tls.swimKeyRef` is configured and the referenced Secret
+resolves to a valid 32-byte key, the Grid operator applies the key before
+announcing CRD seeds or publishing certificate/provider state for that
+`GridNetwork`.  Authenticated SWIM traffic uses AES-256-GCM.  Incoming packets
+that do not authenticate are silently dropped before reaching the membership
+state machine.
+
+**Secret contract:** `swimKeyRef` points to a Kubernetes Secret in a specified
+namespace.  The Secret must contain a key named `"key"` (or the value of
+`swimKeyRef.key` if set) with exactly 32 bytes of key material.  The key is
+loaded at `GridNetwork` reconcile time.
+
+```yaml
+spec:
+  tls:
+    swimKeyRef:
+      name: grid-swim-key
+      namespace: praxis-system
+      key: key          # default when absent
+```
+
+**Configured-key behavior:** when `swimKeyRef` is configured but the Secret is
+missing, unreadable, or contains a key of the wrong length, the reconcile fails
+before CRD seed announcement and certificate/provider broadcasts.  The operator
+does not silently degrade that configured reconcile to plaintext.  Because the
+SWIM runtime is process-global, a key loaded by an earlier successful reconcile
+remains active until restart.
+
+**Environment variable path:** for local development and Kind-based
+testing, set `GRID_SWIM_ENCRYPT_KEY` (a 64-character lowercase hex string
+representing 32 bytes) on the operator process.  This takes effect at startup
+before the UDP socket processes packets, but environment variables are visible
+to same-host process inspectors.  Use Kubernetes Secret references for the
+production configuration path.
+
+**Startup plaintext window:** when the operator process starts, the SWIM UDP
+socket begins receiving immediately.  If only `swimKeyRef` is configured (no
+`GRID_SWIM_ENCRYPT_KEY` env var), the runtime has no key until the first
+`GridNetwork` reconcile loads it from the Secret.  During this window — typically
+a few seconds — the SWIM socket accepts plaintext packets.  The env var path
+closes this window at startup because the key is loaded before the UDP socket
+begins processing.  This is a known limitation of the CRD-only key path.
+
+**What SWIM encryption protects:** gossip membership messages, gateway address
+and public certificate broadcasts, and CRDT provider state.  It does not protect
+data-plane request traffic (that is Praxis/Praxis AI's responsibility).
+
+**Key rotation:** changing the key requires an operator restart.  Multi-key
+keyring support (allowing zero-downtime rotation) is not yet implemented.
+
 ## Grid mTLS Identity
 
 Grid-generated site certificates set
@@ -305,28 +359,59 @@ configured.  Before storage, the receiving operator runs a structural check:
 - Input without a `-----BEGIN CERTIFICATE-----` header is rejected and recorded
   as `TrustMaterialInvalid` in `GridSite.status.reason`.
 - Input with a valid `CERTIFICATE` header passes the structural check and is
-  stored in `GridSite.status.publicCertPem` with reason `TrustMaterialPresent`.
+  stored in `GridSite.status.publicCertPem`.  The `GridSite` controller then
+  sets `status.reason` based on trust policy evaluation (e.g., `TrustPolicyMissing`
+  if no fingerprint is configured, or `TrustPolicyMismatch` if the fingerprint does
+  not match).
 
 This structural check is **not** cryptographic verification.  It does not parse
 DER bytes as X.509, check the issuer or validity period, or validate the signature
 against a CA.
 
-Presence of `publicCertPem` with reason `TrustMaterialPresent` indicates:
+A non-empty `publicCertPem` with no private-key rejection indicates:
 - The remote site shared a PEM with a `CERTIFICATE` header.
 - No private-key markers were detected.
 - The structural check passed.
 
-Presence of `publicCertPem` does **not** indicate:
+`publicCertPem` does **not** indicate:
 - The certificate has been chain-verified against a trusted CA.
 - The remote site is authenticated or authorized for routing.
 - The mTLS handshake has succeeded.
 
-**Trust verification gap:** The current operator does not chain-verify received
-certificates against the local Grid CA.  The `certs` crate does not include
-X.509 chain verification — it only supports cert generation and CA/key matching.
-Chain verification would require an X.509 parsing library.  Until implemented,
-`publicCertPem` is informational, `TrustMaterialPresent` is a structural marker,
-and Active must be set by the deployment workflow after out-of-band verification.
+**Trust policy — fingerprint pinning:** The operator supports explicit trust authorization
+through `GridSite.spec.trust.certFingerprint`.  When configured, the operator computes the
+SHA-256 fingerprint of the received `publicCertPem` and promotes the site from `Connecting`
+to `Active` when the fingerprint matches and the TCP probe succeeds.
+
+```yaml
+spec:
+  trust:
+    certFingerprint: "ab:cd:ef:..."   # sha256 of publicCertPem PEM bytes
+```
+
+To compute the fingerprint from the received certificate:
+
+```bash
+kubectl get gridsite <name> -o jsonpath='{.status.publicCertPem}' | \
+  tr -d '\n' | sha256sum
+# Then convert to colon-separated format and patch spec.trust.certFingerprint.
+```
+
+When `spec.trust.certFingerprint` is absent, the site remains `Connecting` with
+reason `TrustPolicyMissing`, regardless of cert material.  When the fingerprint is
+configured but does not match, the reason is `TrustPolicyMismatch`.
+
+X.509 chain verification against a CA is not yet implemented.  The fingerprint
+is a direct comparison of the received certificate content — it verifies that the
+certificate is exactly the one expected, but does not validate its chain or
+issuer.  Obtain and verify the fingerprint out-of-band before configuring it.
+
+**Certificate rotation:** When `spec.trust.certFingerprint` is configured and the
+`Active` `GridSite` controller detects that the received `publicCertPem` no longer
+matches the fingerprint, the site is demoted from `Active` to `Connecting` with
+reason `TrustPolicyMismatch`.  Update `spec.trust.certFingerprint` to the new
+certificate's fingerprint to re-authorize the site.  Until the policy is updated,
+the site remains `Connecting` and its CRDT providers are excluded from routing.
 
 Private keys are never broadcast.  The operator reads only the `tls.crt` key from
 the site certificate Secret — the `tls.key` key is never accessed for broadcast
@@ -343,6 +428,13 @@ identity on every request independently of the control-plane phase.
 
 | Who | What |
 |-----|------|
-| **Grid Operator** | References and validates Kubernetes Secrets; projects credential references into routing overlays; can render opt-in consumer gateway config. |
-| **Gateway filters** | `grid_route` selects candidates and writes credential metadata; `grid_credential_inject` reads a mounted Secret file and injects credentials per request. |
-| **Workload** | Sends requests to the Gateway, optionally with routing headers — never handles provider credentials |
+| **Grid Operator** | Validates provider credential `secretRef`; projects credential references (never token values) into routing overlays; can render opt-in consumer Praxis `ConfigMap`; generates local CA and site cert Secrets; marks `GridSite.status.phase = Active` when fingerprint trust policy is satisfied (control-plane eligibility only). |
+| **Gateway filters** | `grid_route` selects candidates and writes credential metadata; `grid_credential_inject` reads a mounted Secret file and injects credentials per request; `peer_identity_trust` verifies peer certificate identity on provider gateways. |
+| **Deployment / platform** | Provisions gateway trust material (CA cert or cert bundle) at the path referenced by the consumer config's `ca_path`; distributes the Grid CA cert to remote clusters where gateways need to verify peer identity; configures the provider gateway's peer identity filter; manages gateway rollout when trust material changes. |
+| **Workload** | Sends requests to the Gateway, optionally with routing headers — never handles provider credentials. |
+
+`Active` GridSite status is the control-plane gate: it controls whether a remote site's
+providers appear in the routing overlay.  Before a site can participate in secure
+data-plane traffic, the gateway trust material (CA cert or cert bundle) must also be
+provisioned and the peer identity filter configured — these are deployment prerequisites,
+not automatic outputs of Grid's fingerprint verification.

@@ -128,6 +128,28 @@ table.  Provider CRDT state remains scoped per network.
 **Self-filtering:** The operator removes its own SWIM bind address from
 `spec.seeds` before announcing, preventing self-join loops.
 
+**`spec.tls.swimKeyRef`:** References a Kubernetes Secret containing the 32-byte
+AES-256-GCM key for SWIM transport authentication.  When configured, the
+`GridNetwork` controller reads the key from the Secret and configures the
+SWIM runtime to encrypt all outgoing UDP packets and reject incoming packets
+that fail authentication before it announces CRD seeds or publishes
+certificate/provider state for that reconcile.
+
+The Secret must contain a `"key"` field (or the field named by `swimKeyRef.key`)
+with exactly 32 bytes.  If the Secret is absent, unreadable, or has the wrong
+length, the reconcile fails before CRD seed announcement and state broadcast.
+The process-global SWIM runtime keeps any previously loaded key until restart;
+it does not switch to plaintext for that configured reconcile.
+
+For local development and testing, the `GRID_SWIM_ENCRYPT_KEY` environment
+variable (64-character hex) provides an alternative key injection path without
+requiring a Kubernetes Secret.  Because environment variables are visible to
+same-host process inspectors, this is not the production Secret delivery path.
+
+Routing eligibility remains gated separately by `GridSite.status.phase == Active`
+regardless of SWIM encryption configuration.  Both layers are required for a
+production-secure mesh.
+
 ### Stale candidate TTL
 
 `spec.staleCandidateTtlSeconds` controls when stale (fresh=false) remote
@@ -221,7 +243,7 @@ A discovered SWIM peer is not automatically authorized for routing.
 | `Pending` | Resource created (manually or by auto-discovery) | Initial default |
 | `Discovered` | SWIM peer observed as Alive | `GridNetwork` controller writes on first observation |
 | `Connecting` | Gateway address known (`spec.egress.address` non-empty) | `GridSite` controller advances from Discovered; performs TCP probe |
-| `Active` | Set by deployment workflow after trust requirements are satisfied | `GridSite` controller preserves Active while probe succeeds |
+| `Active` | Fingerprint trust policy matched and gateway probe succeeded | `GridSite` controller promotes from Connecting and preserves Active while probe succeeds |
 | `Unreachable` | Probe failure while Active | `GridSite` controller moves Active → Unreachable on TCP probe failure |
 | `Left` | Set on graceful site departure | Preserved by operator once set |
 
@@ -247,10 +269,8 @@ A discovered SWIM peer is not automatically authorized for routing.
   If the remote operator has not configured `GRID_GATEWAY_ADDRESS`, the egress address is empty
   and the site stays Discovered with reason `GatewayAddressMissing`.
 - Connecting: the `GridSite` controller runs a TCP probe against `spec.egress.address` on each
-  reconcile. The probe result is reflected in `reason` (`GatewayReachable` / `GatewayUnreachable`).
-  This probe only proves TCP reachability. Advancing to Active requires mTLS trust
-  verification and authorization, which are outside the current TCP probe scope.
-  Active must be set by the deployment workflow once trust requirements are satisfied.
+  reconcile. The probe only proves TCP reachability. Advancing to Active also requires
+  `spec.trust.certFingerprint` to match the SHA-256 fingerprint of `status.publicCertPem`.
 - Active → Unreachable: the `GridSite` controller demotes Active to Unreachable when the TCP
   probe fails, allowing the overlay to deprioritize unreachable sites.
 
@@ -277,6 +297,12 @@ structural check passed.  It does **not** mean:
 Private keys, bearer tokens, provider credentials, and Kubernetes Secret contents must never
 be written to status.
 
+**`spec.trust` fields:**
+
+| Field | Meaning |
+|---|---|
+| `certFingerprint` | SHA-256 fingerprint of the expected `publicCertPem` (colon-separated hex, PEM whitespace-trimmed before hashing); when set and matching, the operator promotes from `Connecting` to `Active`, and actively re-checks while `Active` — fingerprint mismatch demotes back to `Connecting` |
+
 **`status.reason` values for `Connecting` phase:**
 
 | Reason | Meaning |
@@ -284,9 +310,17 @@ be written to status.
 | `GatewayAddressKnown` | Egress address received; site advancing from Discovered to Connecting |
 | `GatewayUnreachable` | TCP probe to gateway address failed |
 | `GatewayAddressMissing` | No gateway address set; cannot probe |
-| `TrustMaterialPresent` | TCP probe succeeded; `publicCertPem` set and structurally valid (not chain-verified) |
 | `TrustMaterialMissing` | TCP probe succeeded; no public certificate received yet |
 | `TrustMaterialInvalid` | Received PEM failed structural check (not a certificate, or discarded private key) |
+| `TrustPolicyMissing` | TCP probe succeeded; valid cert received; `spec.trust.certFingerprint` not configured |
+| `TrustPolicyMismatch` | TCP probe succeeded; cert fingerprint does not match `spec.trust.certFingerprint` |
+
+**`status.reason` values for `Active` phase:**
+
+| Reason | Meaning |
+|---|---|
+| `TrustPolicyVerified` | Fingerprint matched; site promoted from `Connecting` to `Active` |
+| `TrustPolicyVerified` | Site was already `Active`; fingerprint still matches and TCP probe succeeded |
 
 **Routing eligibility:** `GridSite.status.phase == Active` is the control-plane gate for
 remote CRDT provider records.  Provider records from a peer whose `GridSite` is in
@@ -296,15 +330,25 @@ routing overlay.  Records from a peer with no matching `GridSite` are also exclu
 mTLS at the provider gateway.  See [Routing eligibility](routing.md#routing-eligibility)
 for the full gating rule.
 
-Example status — gateway reachable, valid cert received:
+Example status — gateway reachable, cert received, policy configured and matching:
+
+```yaml
+status:
+  phase: Active
+  reason: TrustPolicyVerified
+  message: "gateway reachable; certificate fingerprint verified against configured trust policy"
+  observedGeneration: 5
+```
+
+Example status — gateway reachable, cert received, no policy configured:
 
 ```yaml
 status:
   phase: Connecting
-  reason: TrustMaterialPresent
+  reason: TrustPolicyMissing
   message: >
-    gateway reachable; public certificate PEM received and structurally valid;
-    certificate has not been chain-verified — Active requires explicit trust policy
+    gateway reachable; public certificate received; set spec.trust.certFingerprint
+    to the certificate SHA-256 fingerprint to authorize this site
   observedGeneration: 3
 ```
 

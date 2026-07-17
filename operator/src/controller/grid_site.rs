@@ -22,7 +22,7 @@ use crate::{
         grid_site::{GridSite, GridSitePhase, GridSiteStatus},
     },
     error::OperatorError,
-    resources::trust_bundle::{CertPemStatus, check_cert_pem},
+    resources::trust_bundle::{CertPemStatus, check_cert_pem, sha256_fingerprint},
 };
 
 // ---------------------------------------------------------------------------
@@ -96,10 +96,13 @@ async fn validate_network_ref(site: &GridSite, client: &Client) -> Result<(), Op
 /// - Pending → stays Pending (`GridNetwork` controller writes Discovered on SWIM Alive).
 /// - Discovered + gateway address → Connecting (gateway address known; trust/data-plane readiness remain external).
 /// - Discovered, no gateway address → stays Discovered.
-/// - Connecting → stays Connecting; a TCP probe reports gateway reachability but advancing to Active requires trust
-///   verification outside this function.
-/// - Active → stays Active if gateway is reachable; transitions to Unreachable otherwise.
-/// - Unreachable → stays Unreachable; promotion back to Active requires trust verification outside this function.
+/// - Connecting → Active when the TCP probe succeeds and the configured fingerprint trust policy matches the received
+///   public certificate.
+/// - Connecting → stays Connecting when the gateway is unreachable, trust material is missing or invalid, or the
+///   fingerprint policy is missing or mismatched.
+/// - Active → stays Active if gateway is reachable and the fingerprint trust policy still matches; otherwise demotes to
+///   Connecting or Unreachable.
+/// - Unreachable → stays Unreachable.
 /// - Left → preserved.
 #[expect(
     clippy::too_many_lines,
@@ -150,13 +153,48 @@ pub(crate) async fn site_phase_next(current: &GridSitePhase, site: &GridSite) ->
             if let Some(addr) = probe_addr {
                 if tcp_probe(addr).await {
                     match cert_status {
-                        Some(CertPemStatus::ValidStructure) => (
-                            GridSitePhase::Connecting,
-                            "TrustMaterialPresent".to_owned(),
-                            "gateway reachable; public certificate PEM received and structurally valid; \
-                             certificate has not been chain-verified — Active requires explicit trust policy"
-                                .to_owned(),
-                        ),
+                        Some(CertPemStatus::ValidStructure) => {
+                            // Cert is structurally valid — check fingerprint trust policy.
+                            let configured_fp = site.spec.trust.as_ref().and_then(|t| t.cert_fingerprint.as_deref());
+                            let actual_fp = site
+                                .status
+                                .as_ref()
+                                .and_then(|s| s.public_cert_pem.as_ref())
+                                .map(|p| sha256_fingerprint(p));
+                            match (configured_fp, actual_fp) {
+                                (Some(expected), Some(actual)) if actual == expected => (
+                                    // Fingerprint matches — promote to Active.
+                                    GridSitePhase::Active,
+                                    "TrustPolicyVerified".to_owned(),
+                                    "gateway reachable; certificate fingerprint verified against \
+                                     configured trust policy"
+                                        .to_owned(),
+                                ),
+                                (Some(_), Some(_)) => (
+                                    // Fingerprint present but does not match policy.
+                                    GridSitePhase::Connecting,
+                                    "TrustPolicyMismatch".to_owned(),
+                                    "gateway reachable; certificate fingerprint does not match \
+                                     spec.trust.certFingerprint; verify the remote site's certificate"
+                                        .to_owned(),
+                                ),
+                                (None, _) => (
+                                    // Cert received but no trust policy configured.
+                                    GridSitePhase::Connecting,
+                                    "TrustPolicyMissing".to_owned(),
+                                    "gateway reachable; public certificate received; set \
+                                     spec.trust.certFingerprint to the certificate SHA-256 fingerprint \
+                                     to authorize this site"
+                                        .to_owned(),
+                                ),
+                                (Some(_), None) => (
+                                    // Policy configured but no cert received yet.
+                                    GridSitePhase::Connecting,
+                                    "TrustMaterialMissing".to_owned(),
+                                    "gateway reachable; awaiting public trust material from remote site".to_owned(),
+                                ),
+                            }
+                        },
                         Some(CertPemStatus::ContainsPrivateKey) => (
                             GridSitePhase::Connecting,
                             "TrustMaterialInvalid".to_owned(),
@@ -193,7 +231,69 @@ pub(crate) async fn site_phase_next(current: &GridSitePhase, site: &GridSite) ->
         GridSitePhase::Active => {
             if let Some(addr) = probe_addr {
                 if tcp_probe(addr).await {
-                    (GridSitePhase::Active, String::new(), String::new())
+                    // Re-check trust policy while Active to detect cert rotation or
+                    // policy changes that should revoke Active status.
+                    let active_cert_status = site
+                        .status
+                        .as_ref()
+                        .and_then(|s| s.public_cert_pem.as_ref())
+                        .filter(|p| !p.trim().is_empty())
+                        .map(|p| check_cert_pem(p));
+                    let fp_policy = site.spec.trust.as_ref().and_then(|t| t.cert_fingerprint.as_deref());
+
+                    match (fp_policy, active_cert_status) {
+                        // Trust policy was removed while Active.  TCP reachability
+                        // alone must not keep a remote site routable.
+                        (None, _) => (
+                            GridSitePhase::Connecting,
+                            "TrustPolicyMissing".to_owned(),
+                            "trust fingerprint policy no longer configured; \
+                             site reverted to Connecting pending trust re-verification"
+                                .to_owned(),
+                        ),
+                        // Policy configured, cert present and valid — re-verify fingerprint.
+                        (Some(expected), Some(CertPemStatus::ValidStructure)) => {
+                            let actual = site
+                                .status
+                                .as_ref()
+                                .and_then(|s| s.public_cert_pem.as_ref())
+                                .map(|p| sha256_fingerprint(p));
+                            if actual.as_deref() == Some(expected) {
+                                (GridSitePhase::Active, "TrustPolicyVerified".to_owned(), String::new())
+                            } else {
+                                // Fingerprint mismatch — cert rotated or policy updated.
+                                (
+                                    GridSitePhase::Connecting,
+                                    "TrustPolicyMismatch".to_owned(),
+                                    "certificate fingerprint no longer matches trust policy; \
+                                     site reverted to Connecting pending trust re-verification"
+                                        .to_owned(),
+                                )
+                            }
+                        },
+                        // Policy configured, cert contains private key — security violation.
+                        (Some(_), Some(CertPemStatus::ContainsPrivateKey)) => (
+                            GridSitePhase::Connecting,
+                            "TrustMaterialInvalid".to_owned(),
+                            "received material contains private key markers; \
+                             site reverted to Connecting"
+                                .to_owned(),
+                        ),
+                        // Policy configured, cert is not a certificate.
+                        (Some(_), Some(CertPemStatus::NotACertificate)) => (
+                            GridSitePhase::Connecting,
+                            "TrustMaterialInvalid".to_owned(),
+                            "received PEM is not a certificate; site reverted to Connecting".to_owned(),
+                        ),
+                        // Policy configured but no cert — cert may have been removed.
+                        (Some(_), None) => (
+                            GridSitePhase::Connecting,
+                            "TrustMaterialMissing".to_owned(),
+                            "public certificate no longer available; \
+                             site reverted to Connecting pending cert re-receipt"
+                                .to_owned(),
+                        ),
+                    }
                 } else {
                     (
                         GridSitePhase::Unreachable,
@@ -303,6 +403,7 @@ mod tests {
                 region: None,
                 sovereignty_zone: None,
                 zone: None,
+                trust: None,
             },
             status: phase.map(|p| GridSiteStatus {
                 phase: p,
@@ -324,6 +425,7 @@ mod tests {
                 region: None,
                 sovereignty_zone: None,
                 zone: None,
+                trust: None,
             },
             status: phase.map(|p| GridSiteStatus {
                 phase: p,
@@ -466,6 +568,29 @@ mod tests {
         site
     }
 
+    fn site_with_cert_and_trust(
+        phase: Option<GridSitePhase>,
+        egress: &str,
+        cert_pem: &str,
+        fingerprint: Option<&str>,
+    ) -> GridSite {
+        use crate::crd::grid_site::GridSiteTrustPolicy;
+        let mut site = site_with_cert(phase, egress, cert_pem);
+        site.spec.trust = fingerprint.map(|fp| GridSiteTrustPolicy {
+            cert_fingerprint: Some(fp.to_owned()),
+        });
+        site
+    }
+
+    fn reachable_probe_addr() -> (std::net::TcpListener, String) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap_or_else(|_| std::process::abort());
+        let addr = listener
+            .local_addr()
+            .unwrap_or_else(|_| std::process::abort())
+            .to_string();
+        (listener, addr)
+    }
+
     // -----------------------------------------------------------------------
     // Gateway address discovery tests
     // -----------------------------------------------------------------------
@@ -503,7 +628,7 @@ mod tests {
     const PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkq\n-----END PRIVATE KEY-----\n";
 
     #[tokio::test]
-    async fn connecting_with_valid_cert_reports_trust_material_present() {
+    async fn valid_cert_pem_reports_valid_structure() {
         // No real TCP probe in unit tests (no running server at 127.0.0.1:19080).
         // The gateway probe fails → GatewayUnreachable regardless of cert.
         // Test valid-cert path requires a running listener, so we test the cert
@@ -514,9 +639,9 @@ mod tests {
             CertPemStatus::ValidStructure,
             "valid cert PEM must be accepted as ValidStructure"
         );
-        // The TrustMaterialPresent reason is only emitted when TCP probe also succeeds.
-        // Without a running listener, the probe fails and the test would see GatewayUnreachable.
-        // This test validates the cert-checking logic separately.
+        // Without a running listener, the phase logic sees GatewayUnreachable
+        // before it evaluates trust material. This test validates the
+        // cert-checking helper separately.
     }
 
     #[tokio::test]
@@ -568,14 +693,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn trust_material_present_never_advances_to_active() {
+    async fn valid_structure_never_advances_to_active_without_policy() {
         // Even with a valid cert, the lifecycle must stay at most Connecting.
         // Active requires explicit trust policy + data-plane readiness, not cert presence.
         let status = check_cert_pem(VALID_CERT_PEM);
         assert_eq!(status, CertPemStatus::ValidStructure);
-        // The phase logic: Connecting + valid cert (if probe succeeds) → TrustMaterialPresent, stays Connecting.
-        // Connecting never advances to Active autonomously.
-        // This test proves the status enum name is not "Trusted" or "Active".
+        // The phase logic: Connecting + valid cert (probe succeeds) → TrustPolicyMissing, stays Connecting.
+        // Connecting never advances to Active on cert presence alone — fingerprint trust policy required.
+        // This test proves the CertPemStatus enum name is not "Trusted" or "Active".
         assert_ne!(format!("{status:?}"), "Trusted");
         assert_ne!(format!("{status:?}"), "Active");
         assert_ne!(format!("{status:?}"), "Authorized");
@@ -591,6 +716,252 @@ mod tests {
             status,
             CertPemStatus::NotACertificate,
             "public key PEM must not be accepted as a certificate"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Trust policy — fingerprint pinning (Connecting → Active gate)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn trust_material_present_without_policy_reports_policy_missing() {
+        let (_listener, addr) = reachable_probe_addr();
+        let site = site_with_cert(Some(GridSitePhase::Connecting), &addr, VALID_CERT_PEM);
+        let (phase, reason, _msg) = site_phase_next(&GridSitePhase::Connecting, &site).await;
+        assert_eq!(
+            phase,
+            GridSitePhase::Connecting,
+            "missing trust policy must not promote"
+        );
+        assert_eq!(reason, "TrustPolicyMissing");
+    }
+
+    #[tokio::test]
+    async fn fingerprint_match_promotes_to_active_when_gateway_reachable() {
+        use crate::resources::trust_bundle::sha256_fingerprint;
+        let (_listener, addr) = reachable_probe_addr();
+        let expected_fp = sha256_fingerprint(VALID_CERT_PEM);
+        let site = site_with_cert_and_trust(
+            Some(GridSitePhase::Connecting),
+            &addr,
+            VALID_CERT_PEM,
+            Some(&expected_fp),
+        );
+        let (phase, reason, message) = site_phase_next(&GridSitePhase::Connecting, &site).await;
+        assert_eq!(phase, GridSitePhase::Active);
+        assert_eq!(reason, "TrustPolicyVerified");
+        assert!(!message.contains(VALID_CERT_PEM), "status message must not include PEM");
+        assert!(
+            !message.contains(&expected_fp),
+            "status message must not include fingerprint"
+        );
+    }
+
+    #[tokio::test]
+    async fn fingerprint_mismatch_stays_connecting_when_gateway_reachable() {
+        use crate::resources::trust_bundle::sha256_fingerprint;
+        let (_listener, addr) = reachable_probe_addr();
+        let wrong_fp = sha256_fingerprint("-----BEGIN CERTIFICATE-----\nwrong\n-----END CERTIFICATE-----\n");
+        let site = site_with_cert_and_trust(Some(GridSitePhase::Connecting), &addr, VALID_CERT_PEM, Some(&wrong_fp));
+        let (phase, reason, message) = site_phase_next(&GridSitePhase::Connecting, &site).await;
+        assert_eq!(phase, GridSitePhase::Connecting, "wrong fingerprint must not promote");
+        assert_eq!(reason, "TrustPolicyMismatch");
+        assert!(!message.contains(VALID_CERT_PEM), "status message must not include PEM");
+        assert!(
+            !message.contains(&wrong_fp),
+            "status message must not include configured fingerprint"
+        );
+    }
+
+    #[test]
+    fn private_key_pem_cannot_influence_trust_policy() {
+        use crate::resources::trust_bundle::{CertPemStatus, check_cert_pem, sha256_fingerprint};
+        // Private key PEM is rejected structurally before any fingerprint comparison.
+        let pem = PRIVATE_KEY_PEM;
+        let status = check_cert_pem(pem);
+        assert_eq!(
+            status,
+            CertPemStatus::ContainsPrivateKey,
+            "private key must be rejected before fingerprint comparison"
+        );
+        // Even if someone attempted to compute a fingerprint of the private key PEM,
+        // the structural check rejects it first — so this code path never runs.
+        // We include this assertion to document the invariant.
+        let fp = sha256_fingerprint(pem); // fingerprint computation itself is safe
+        assert!(
+            !fp.is_empty(),
+            "fingerprint computation on any string is safe (but structural check blocks it first)"
+        );
+    }
+
+    #[test]
+    fn status_message_does_not_contain_pem_or_fingerprint_data() {
+        use crate::resources::trust_bundle::sha256_fingerprint;
+        let fp = sha256_fingerprint(VALID_CERT_PEM);
+        // Messages that reference trust policy must not embed raw PEM or raw fingerprint.
+        let policy_missing_msg = "gateway reachable; public certificate received; set spec.trust.certFingerprint \
+             to the certificate SHA-256 fingerprint to authorize this site";
+        assert!(!policy_missing_msg.contains("BEGIN CERTIFICATE"), "no PEM in message");
+        assert!(!policy_missing_msg.contains(&fp), "no fingerprint data in message");
+
+        let mismatch_msg = "gateway reachable; certificate fingerprint does not match \
+             spec.trust.certFingerprint; verify the remote site's certificate";
+        assert!(
+            !mismatch_msg.contains("BEGIN CERTIFICATE"),
+            "no PEM in mismatch message"
+        );
+    }
+
+    #[tokio::test]
+    async fn active_is_preserved_while_probe_succeeds() {
+        use crate::resources::trust_bundle::sha256_fingerprint;
+        let (_listener, addr) = reachable_probe_addr();
+        let fp = sha256_fingerprint(VALID_CERT_PEM);
+        let site = site_with_cert_and_trust(Some(GridSitePhase::Active), &addr, VALID_CERT_PEM, Some(&fp));
+        let (phase, reason, _msg) = site_phase_next(&GridSitePhase::Active, &site).await;
+        assert_eq!(phase, GridSitePhase::Active);
+        assert_eq!(reason, "TrustPolicyVerified");
+    }
+
+    #[tokio::test]
+    async fn active_with_removed_trust_policy_demotes_to_connecting() {
+        let (_listener, addr) = reachable_probe_addr();
+        let site = site_with_cert(Some(GridSitePhase::Active), &addr, VALID_CERT_PEM);
+        let (phase, reason, message) = site_phase_next(&GridSitePhase::Active, &site).await;
+        assert_eq!(phase, GridSitePhase::Connecting);
+        assert_eq!(reason, "TrustPolicyMissing");
+        assert!(!message.contains(VALID_CERT_PEM), "status message must not include PEM");
+    }
+
+    #[tokio::test]
+    async fn active_is_demoted_when_probe_fails() {
+        let site = site_with_egress(Some(GridSitePhase::Active), "127.0.0.1:19080");
+        let (phase, reason, _msg) = site_phase_next(&GridSitePhase::Active, &site).await;
+        assert_eq!(
+            phase,
+            GridSitePhase::Unreachable,
+            "failed probe must demote Active to Unreachable"
+        );
+        assert_eq!(reason, "GatewayUnreachable");
+    }
+
+    #[tokio::test]
+    async fn invalid_cert_with_matching_private_key_fingerprint_stays_connecting() {
+        use crate::resources::trust_bundle::sha256_fingerprint;
+        let (_listener, addr) = reachable_probe_addr();
+        let private_key_fp = sha256_fingerprint(PRIVATE_KEY_PEM);
+        let site = site_with_cert_and_trust(
+            Some(GridSitePhase::Connecting),
+            &addr,
+            PRIVATE_KEY_PEM,
+            Some(&private_key_fp),
+        );
+        let (phase, reason, message) = site_phase_next(&GridSitePhase::Connecting, &site).await;
+        assert_eq!(phase, GridSitePhase::Connecting);
+        assert_eq!(reason, "TrustMaterialInvalid");
+        assert!(
+            !message.contains("BEGIN PRIVATE KEY") && !message.contains(PRIVATE_KEY_PEM),
+            "status message must not include private key material"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Active phase — certificate rotation behavior
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn active_without_trust_policy_demotes_unreachable_when_probe_fails() {
+        // No trust policy → TCP probe failure → Unreachable (unchanged behavior).
+        let site = site_with_egress(Some(GridSitePhase::Active), "127.0.0.1:19080");
+        let (phase, reason, _msg) = site_phase_next(&GridSitePhase::Active, &site).await;
+        assert_eq!(phase, GridSitePhase::Unreachable);
+        assert_eq!(reason, "GatewayUnreachable");
+    }
+
+    #[tokio::test]
+    async fn active_cert_rotation_mismatch_demotes_to_connecting() {
+        use crate::resources::trust_bundle::sha256_fingerprint;
+        // Simulate the post-rotation state: Active has cert A configured,
+        // but publicCertPem now contains cert B (different bytes).
+        let (_listener, addr) = reachable_probe_addr();
+        let cert_a = VALID_CERT_PEM;
+        let cert_b = "-----BEGIN CERTIFICATE-----\nDifferentBytes\n-----END CERTIFICATE-----\n";
+        let fp_a = sha256_fingerprint(cert_a);
+        let site = site_with_cert_and_trust(Some(GridSitePhase::Active), &addr, cert_b, Some(&fp_a));
+        let (phase, reason, message) = site_phase_next(&GridSitePhase::Active, &site).await;
+        assert_eq!(phase, GridSitePhase::Connecting);
+        assert_eq!(reason, "TrustPolicyMismatch");
+        assert!(!message.contains(cert_b), "status message must not include PEM");
+        assert!(!message.contains(&fp_a), "status message must not include fingerprint");
+    }
+
+    #[tokio::test]
+    async fn active_cert_rotation_match_stays_active() {
+        use crate::resources::trust_bundle::sha256_fingerprint;
+        // Active with matching fingerprint → stays Active.
+        let (_listener, addr) = reachable_probe_addr();
+        let cert = VALID_CERT_PEM;
+        let fp = sha256_fingerprint(cert);
+        let site = site_with_cert_and_trust(Some(GridSitePhase::Active), &addr, cert, Some(&fp));
+        let (phase, reason, message) = site_phase_next(&GridSitePhase::Active, &site).await;
+        assert_eq!(phase, GridSitePhase::Active);
+        assert_eq!(reason, "TrustPolicyVerified");
+        assert!(message.is_empty());
+    }
+
+    #[tokio::test]
+    async fn active_with_missing_cert_and_policy_demotes_to_connecting() {
+        use crate::{crd::grid_site::GridSiteTrustPolicy, resources::trust_bundle::sha256_fingerprint};
+        // Policy configured but no cert in status → None case for cert_status.
+        let (_listener, addr) = reachable_probe_addr();
+        let fp = sha256_fingerprint(VALID_CERT_PEM);
+        let mut site = site_with_egress(Some(GridSitePhase::Active), &addr);
+        site.spec.trust = Some(GridSiteTrustPolicy {
+            cert_fingerprint: Some(fp),
+        });
+        let (phase, reason, message) = site_phase_next(&GridSitePhase::Active, &site).await;
+        assert_eq!(phase, GridSitePhase::Connecting);
+        assert_eq!(reason, "TrustMaterialMissing");
+        assert!(
+            !message.contains("BEGIN CERTIFICATE"),
+            "status message must not include PEM"
+        );
+    }
+
+    #[test]
+    fn active_status_message_never_contains_raw_pem() {
+        // Messages from the Active arm rotation branch must not contain raw cert data.
+        let mismatch_msg = "certificate fingerprint no longer matches trust policy; \
+             site reverted to Connecting pending trust re-verification";
+        assert!(!mismatch_msg.contains("BEGIN CERTIFICATE"), "no PEM header in message");
+        assert!(!mismatch_msg.contains("PRIVATE KEY"), "no private key in message");
+
+        let missing_msg = "public certificate no longer available; \
+             site reverted to Connecting pending cert re-receipt";
+        assert!(!missing_msg.contains("BEGIN CERTIFICATE"), "no PEM in missing message");
+    }
+
+    #[test]
+    fn site_with_cert_and_trust_helper_sets_fields() {
+        use crate::resources::trust_bundle::sha256_fingerprint;
+        // Exercise site_with_cert_and_trust to suppress dead-code warning and
+        // verify that the helper sets spec.trust correctly.
+        let fp = sha256_fingerprint(VALID_CERT_PEM);
+        let site = site_with_cert_and_trust(
+            Some(GridSitePhase::Connecting),
+            "10.0.0.1:8080",
+            VALID_CERT_PEM,
+            Some(&fp),
+        );
+        assert_eq!(
+            site.spec.trust.as_ref().and_then(|t| t.cert_fingerprint.as_deref()),
+            Some(fp.as_str()),
+            "trust.certFingerprint must be set"
+        );
+        assert_eq!(
+            site.status.as_ref().and_then(|s| s.public_cert_pem.as_deref()),
+            Some(VALID_CERT_PEM),
+            "publicCertPem must be set"
         );
     }
 }

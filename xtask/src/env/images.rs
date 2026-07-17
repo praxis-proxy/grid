@@ -56,7 +56,7 @@ pub(crate) fn build_all(ai_repo: &Path) -> Result<(), Box<dyn std::error::Error>
 
 /// Verify that the required source files exist in the AI repository checkout.
 ///
-/// Both files may be untracked or uncommitted in a given AI repo branch.
+/// Both files must exist in the selected AI repository checkout.
 /// This fails early with a clear diagnostic rather than letting a Docker
 /// build fail deep in the invocation chain.
 fn verify_ai_repo_source_files(ai_repo: &Path) -> Result<(), Box<dyn std::error::Error>> {
@@ -65,7 +65,6 @@ fn verify_ai_repo_source_files(ai_repo: &Path) -> Result<(), Box<dyn std::error:
         return Err(format!(
             "AI repo is missing Containerfile.composed at {path}\n\
              This file is required to build {image}.\n\
-             It may be untracked or uncommitted in the AI repo checkout.\n\
              Confirm the AI checkout at {repo} has this file before running build-gateway-images.",
             path = composed.display(),
             image = GATEWAY_IMAGE,
@@ -78,7 +77,6 @@ fn verify_ai_repo_source_files(ai_repo: &Path) -> Result<(), Box<dyn std::error:
         return Err(format!(
             "AI repo is missing integrations/llmd/mock-epp/Containerfile at {path}\n\
              This file is required to build {image}.\n\
-             It may be untracked or uncommitted in the AI repo checkout.\n\
              Confirm the AI checkout at {repo} has this directory before running build-gateway-images.",
             path = mock_epp_cf.display(),
             image = MOCK_EPP_IMAGE,

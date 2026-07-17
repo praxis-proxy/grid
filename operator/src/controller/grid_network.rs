@@ -195,12 +195,20 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
     let client = &ctx.client;
     ensure_tls_secrets(&network, client).await?;
 
-    // Announce CRD-declared seeds to the SWIM runtime so peers can be reached
-    // without requiring the GRID_SWIM_SEEDS environment variable.
-    // Re-announcing on each reconcile is idempotent (foca ignores existing members).
-    // diff_seed_sets tracks additions/removals for diagnostic logging.
     if let Some(swim) = ctx.swim.as_ref() {
+        // When a GridNetwork configures a SWIM key Secret, resolve and apply it
+        // before any reconcile-triggered SWIM send.  If the key cannot be
+        // loaded, fail this reconcile before announcing CRD seeds or publishing
+        // cert/provider state so the configured network does not silently send
+        // plaintext traffic.
+        apply_configured_swim_key(&network, client, swim).await?;
+
+        // Announce CRD-declared seeds to the SWIM runtime so peers can be reached
+        // without requiring the GRID_SWIM_SEEDS environment variable.
+        // Re-announcing on each reconcile is idempotent (foca ignores existing members).
+        // diff_seed_sets tracks additions/removals for diagnostic logging.
         announce_crd_seeds(&network, swim, &ctx.last_seeds);
+
         // Broadcast the local site's public certificate PEM so remote peers can
         // populate GridSite.status.publicCertPem.  Only the public cert is read —
         // the private key (tls.key) is never accessed by this code path.
@@ -286,6 +294,41 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
     }
 
     Ok(Action::requeue(REQUEUE_INTERVAL))
+}
+
+/// Apply `spec.tls.swimKeyRef` before any reconcile-triggered SWIM send.
+///
+/// A configured Secret reference is mandatory for that reconcile: missing
+/// Secret, missing key field, invalid key length, RBAC denial, or a stopped
+/// runtime all return an error.  This prevents the configured network from
+/// announcing CRD seeds or publishing certificate/provider broadcasts in
+/// plaintext after the operator has observed the `GridNetwork`.
+async fn apply_configured_swim_key(
+    network: &GridNetwork,
+    client: &Client,
+    swim: &SwimHandle,
+) -> Result<(), OperatorError> {
+    let Some(swim_key_ref) = &network.spec.tls.swim_key_ref else {
+        return Ok(());
+    };
+    let network_name = network.metadata.name.as_deref().unwrap_or("<unknown>");
+
+    let key = secret::read_swim_key(client, swim_key_ref)
+        .await
+        .map_err(|e| OperatorError::SwimKeyConfig(format!("failed to read swimKeyRef for {network_name}: {e}")))?
+        .ok_or_else(|| {
+            OperatorError::SwimKeyConfig(format!(
+                "swimKeyRef for {network_name} did not resolve to a valid 32-byte key \
+                 (secret={}/{}, key={})",
+                swim_key_ref.namespace,
+                swim_key_ref.name,
+                swim_key_ref.key.as_deref().unwrap_or("key")
+            ))
+        })?;
+
+    swim.set_swim_key(key)
+        .map_err(|e| OperatorError::SwimKeyConfig(format!("failed to apply swimKeyRef for {network_name}: {e}")))?;
+    Ok(())
 }
 
 /// Return a monotonic-ish revision for public-cert metadata broadcasts.
@@ -1473,19 +1516,12 @@ async fn reconcile_discovered_sites(
         if let Some(cert_pem) = &site.site_cert_pem {
             match trust_bundle::check_cert_pem(cert_pem) {
                 CertPemStatus::ValidStructure => {
-                    let cert_status_doc = serde_json::json!({
-                        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
-                        "kind": "GridSite",
-                        "status": {
-                            "publicCertPem": cert_pem
-                        }
-                    });
-                    api.patch_status(
-                        &site.name,
-                        &PatchParams::apply(FIELD_MANAGER).force(),
-                        &Patch::Apply(&cert_status_doc),
-                    )
-                    .await?;
+                    // Use strategic merge patch (not SSA) so only publicCertPem is
+                    // updated; SSA with a partial payload would clear other status
+                    // fields managed by "grid-operator" (e.g., reason, message).
+                    let cert_merge = serde_json::json!({ "status": { "publicCertPem": cert_pem } });
+                    api.patch_status(&site.name, &PatchParams::default(), &Patch::Merge(&cert_merge))
+                        .await?;
                     tracing::info!(
                         name = %site.name,
                         "received and stored public site certificate PEM (structure valid; not chain-verified)"
@@ -1504,12 +1540,8 @@ async fn reconcile_discovered_sites(
                             "message": "received trust material from remote site contained private-key markers; discarded"
                         }
                     });
-                    api.patch_status(
-                        &site.name,
-                        &PatchParams::apply(FIELD_MANAGER).force(),
-                        &Patch::Apply(&invalid_status_doc),
-                    )
-                    .await?;
+                    api.patch_status(&site.name, &PatchParams::default(), &Patch::Merge(&invalid_status_doc))
+                        .await?;
                     tracing::error!(
                         name = %site.name,
                         "SECURITY: received cert PEM contains private key markers from remote SWIM peer; \
@@ -1529,15 +1561,11 @@ async fn reconcile_discovered_sites(
                                         check GRID_TLS_SITE_SECRET_REF configuration on the remote operator"
                         }
                     });
-                    api.patch_status(
-                        &site.name,
-                        &PatchParams::apply(FIELD_MANAGER).force(),
-                        &Patch::Apply(&invalid_status_doc),
-                    )
-                    .await?;
+                    api.patch_status(&site.name, &PatchParams::default(), &Patch::Merge(&invalid_status_doc))
+                        .await?;
                     tracing::warn!(
                         name = %site.name,
-                        "received cert PEM from remote site is not a valid certificate (missing BEGIN CERTIFICATE header)"
+                        "received cert PEM from remote site is not a valid certificate"
                     );
                 },
             }

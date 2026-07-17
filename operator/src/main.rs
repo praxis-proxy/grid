@@ -15,6 +15,21 @@
 //! 0, and the phase stays `Pending`/`Initializing` based on TLS configuration
 //! only.
 //!
+//! # SWIM encryption (environment variable)
+//!
+//! Set `GRID_SWIM_ENCRYPT_KEY` to a 64-character lowercase hex string (32 bytes)
+//! to enable AES-256-GCM encryption for all SWIM gossip packets.  When set,
+//! packets from peers without the same key are silently dropped.
+//!
+//! This is the environment-variable path, intended for local development and
+//! Kind-based testing.  Environment variables are visible to same-host process
+//! inspectors, so the production configuration path uses
+//! `GridNetwork.spec.tls.swimKeyRef` to source the key from a Kubernetes
+//! Secret; the `GridNetwork` controller loads it and calls
+//! `SwimHandle::set_swim_key` at reconcile time.
+//!
+//! The key value is **never** written to logs or tracing spans.
+//!
 //! [`GridNetwork`]: operator::crd::grid_network::GridNetwork
 //! [`GridSite`]: operator::crd::grid_site::GridSite
 //! [`InferenceProvider`]: operator::crd::inference_provider::InferenceProvider
@@ -101,12 +116,14 @@ async fn maybe_start_swim() -> Option<Arc<swim_runtime::SwimHandle>> {
     let gateway_address = std::env::var("GRID_GATEWAY_ADDRESS")
         .ok()
         .filter(|s| !s.trim().is_empty());
+    let swim_key = parse_swim_key_env("GRID_SWIM_ENCRYPT_KEY");
     let cfg = SwimConfig {
         bind_addr,
         advertise_addr,
         site_name,
         seeds,
         gateway_address,
+        swim_key,
     };
     match swim_runtime::start(cfg).await {
         Ok(handle) => {
@@ -118,6 +135,48 @@ async fn maybe_start_swim() -> Option<Arc<swim_runtime::SwimHandle>> {
             None
         },
     }
+}
+
+/// Parse `GRID_SWIM_ENCRYPT_KEY` as a 32-byte AES-256-GCM key from 64 hex characters.
+///
+/// Returns `None` when the env var is absent (no encryption).
+/// Logs an error and returns `None` when the value is present but malformed.
+///
+/// # Security invariant
+///
+/// The decoded key bytes are never written to logs or tracing spans.
+fn parse_swim_key_env(name: &str) -> Option<swim::crypto::SwimKey> {
+    let hex = std::env::var(name).ok()?;
+    let hex = hex.trim();
+    if hex.len() != 64 {
+        tracing::error!(
+            env = name,
+            len = hex.len(),
+            "SWIM encryption key must be a 64-character hex string (32 bytes); ignoring"
+        );
+        return None;
+    }
+    // Parse hex byte-by-byte using char::to_digit to avoid string slice indexing.
+    // to_digit(16) returns 0..=15 as u32; cast to u8 is safe and done immediately.
+    let hex_nibbles: Vec<u8> = hex
+        .chars()
+        .filter_map(|c| c.to_digit(16).and_then(|n| u8::try_from(n).ok()))
+        .collect();
+    if hex_nibbles.len() != 64 {
+        tracing::error!(
+            env = name,
+            "SWIM encryption key contains invalid hex character; ignoring"
+        );
+        return None;
+    }
+    let mut key = [0_u8; 32];
+    for (i, byte) in key.iter_mut().enumerate() {
+        let hi = hex_nibbles.get(i * 2).copied().unwrap_or(0);
+        let lo = hex_nibbles.get(i * 2 + 1).copied().unwrap_or(0);
+        *byte = (hi << 4) | lo;
+    }
+    tracing::info!(env = name, "SWIM encryption key loaded from environment");
+    Some(key)
 }
 
 /// Parse an optional socket address environment variable.

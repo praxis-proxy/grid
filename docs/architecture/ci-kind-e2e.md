@@ -87,7 +87,7 @@ rerun.
 |---|---|---|
 | Static + unit | Every PR | 2–4 minutes |
 | Smoke Kind | Every PR (requires resolved gateway image) | 5–8 minutes |
-| Multi-cluster Kind | `main`, nightly, or release branch | 35–45 minutes |
+| Multi-cluster Kind | Mainline, nightly, or release qualification | 35–45 minutes |
 | Full release sweep | Manual or release candidate | 60+ minutes |
 
 ## Multi-cluster gate requirements

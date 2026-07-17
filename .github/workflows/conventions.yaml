@@ -1,0 +1,54 @@
+name: Coding Conventions
+
+# ------------------------------------------------------------------------------
+# Workflow Settings
+# ------------------------------------------------------------------------------
+
+on:
+  pull_request_target:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  # ----------------------------------------------------------------------------
+  # Signoff Check
+  # ----------------------------------------------------------------------------
+
+  signoff-check:
+    if: |
+      !github.event.pull_request.draft &&
+      !contains(github.event.pull_request.labels.*.name, 'skip/signoff')
+    runs-on: ubuntu-24.04
+    permissions:
+      pull-requests: read
+    steps:
+      - name: Check commits for Signed-off-by
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          missing=$(gh api \
+            "repos/${{ github.repository }}/pulls/${PR_NUMBER}/commits" \
+            --paginate \
+            --jq '[.[] | select(.parents | length == 1) | select(.commit.message | test("(?m)^Signed-off-by: ") | not) | .sha[:7]] | join(", ")')
+
+          if [ -n "$missing" ]; then
+            echo "::error::Commits missing Signed-off-by: ${missing}"
+            echo "All commits require sign-off via 'git commit --signoff'."
+            exit 1
+          fi
+
+  signoff-check-skipped:
+    if: |
+      !github.event.pull_request.draft &&
+      contains(github.event.pull_request.labels.*.name, 'skip/signoff')
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Report skipped signoff check
+        run: echo "skip/signoff label present — skipping signoff check"

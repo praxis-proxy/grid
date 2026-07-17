@@ -1,4 +1,4 @@
-//! Kubernetes Secret builders for grid TLS certificates.
+//! Kubernetes Secret builders for grid TLS certificates and SWIM encryption keys.
 
 use std::collections::BTreeMap;
 
@@ -73,6 +73,61 @@ fn public_cert_pem_from_secret(secret: &Secret) -> Option<String> {
 /// Return true if PEM text appears to contain private key material.
 fn contains_private_key_marker(pem: &str) -> bool {
     pem.contains("PRIVATE KEY")
+}
+
+/// Read a 32-byte AES-256-GCM encryption key from a Kubernetes Secret.
+///
+/// The Secret is identified by the provided `SecretRef`.  The key name within
+/// the Secret's `data` map defaults to `"key"` when `SecretRef::key` is
+/// `None`.
+///
+/// Returns `Ok(Some(key))` when the Secret exists and contains a valid 32-byte
+/// value, `Ok(None)` when the Secret does not exist or the key field is absent
+/// or has the wrong length, and `Err` on Kubernetes API failures.
+///
+/// # Errors
+///
+/// Returns [`kube::Error`] on Kubernetes API failures (e.g. network errors,
+/// RBAC denial).  Key-length and missing-field issues return `Ok(None)`, not
+/// `Err`.
+///
+/// # Security invariant
+///
+/// The decoded key bytes are **never** written to logs, tracing spans, error
+/// messages, or Kubernetes resources.  This function does not expose key
+/// contents in any return path — callers receive either the raw bytes or
+/// `None`/`Err`.
+pub async fn read_swim_key(
+    client: &kube::Client,
+    secret_ref: &crate::crd::grid_network::SecretRef,
+) -> Result<Option<swim::crypto::SwimKey>, kube::Error> {
+    let api: kube::Api<Secret> = kube::Api::namespaced(client.clone(), &secret_ref.namespace);
+    let Some(secret) = api.get_opt(&secret_ref.name).await? else {
+        return Ok(None);
+    };
+    let key_field = secret_ref.key.as_deref().unwrap_or("key");
+    let Some(bytes) = secret.data.as_ref().and_then(|d| d.get(key_field)) else {
+        tracing::warn!(
+            secret = %secret_ref.name,
+            namespace = %secret_ref.namespace,
+            key_field = %key_field,
+            "swimKeyRef Secret missing key field; SWIM key not applied"
+        );
+        return Ok(None);
+    };
+    if bytes.0.len() != 32 {
+        tracing::warn!(
+            secret = %secret_ref.name,
+            namespace = %secret_ref.namespace,
+            key_field = %key_field,
+            len = bytes.0.len(),
+            "swimKeyRef key must be exactly 32 bytes; SWIM key not applied"
+        );
+        return Ok(None);
+    }
+    let mut key = [0_u8; 32];
+    key.copy_from_slice(&bytes.0);
+    Ok(Some(key))
 }
 
 /// Build Secret data for a site certificate.

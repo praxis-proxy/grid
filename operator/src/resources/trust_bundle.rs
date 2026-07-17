@@ -8,6 +8,7 @@
 use std::collections::BTreeMap;
 
 use k8s_openapi::ByteString;
+use sha2::{Digest as _, Sha256};
 
 // ---------------------------------------------------------------------------
 // PEM structure validation
@@ -44,6 +45,34 @@ pub enum CertPemStatus {
     NotACertificate,
 }
 
+/// Compute the SHA-256 fingerprint of a PEM string.
+///
+/// Returns a colon-separated lowercase hex string of the 32-byte SHA-256 digest of
+/// the PEM's UTF-8 bytes.  This is the fingerprint format used by
+/// [`GridSiteTrustPolicy::cert_fingerprint`].
+///
+/// The equivalent shell computation is:
+/// ```text
+/// printf '%s' "$cert_pem" | sha256sum
+/// ```
+/// (without the trailing newline, matching Rust's `as_bytes()` on a `&str`).
+///
+/// # Security
+///
+/// This function hashes the PEM string bytes, not the DER-decoded certificate bytes.
+/// Both the operator and the operator configuring `certFingerprint` must use the same
+/// encoding (PEM string, not DER) to produce a matching fingerprint.
+///
+/// [`GridSiteTrustPolicy::cert_fingerprint`]: crate::crd::grid_site::GridSiteTrustPolicy
+#[must_use]
+pub fn sha256_fingerprint(pem_str: &str) -> String {
+    // Trim surrounding whitespace so fingerprints are consistent regardless of
+    // trailing newlines from different PEM serialization paths (kubectl jsonpath
+    // vs Kubernetes API deserialization).
+    let digest = Sha256::digest(pem_str.trim().as_bytes());
+    digest.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(":")
+}
+
 /// Check whether `pem_str` is structurally consistent with a public certificate.
 ///
 /// This is a **marker-based structural check**, not cryptographic verification.
@@ -60,7 +89,7 @@ pub enum CertPemStatus {
 /// - The peer holding this cert is authorized for routing.
 ///
 /// Use the result to gate storage in `publicCertPem` and trust bundles, but
-/// treat verified-status as at most `TrustMaterialPresent` — never `Trusted`.
+/// treat [`CertPemStatus::ValidStructure`] as structural validity only — never as trust or authorization.
 #[must_use]
 pub fn check_cert_pem(pem_str: &str) -> CertPemStatus {
     // Security invariant: private key markers must be rejected immediately.
@@ -287,5 +316,52 @@ mod tests {
         let pem = concatenated_pem(&data);
         assert!(pem.contains("MIIB"), "should contain first cert");
         assert!(pem.contains("MIIB-second"), "should contain second cert");
+    }
+
+    // -----------------------------------------------------------------------
+    // sha256_fingerprint
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn sha256_fingerprint_is_64_hex_bytes_with_colons() {
+        let fp = sha256_fingerprint(SAMPLE_CERT_PEM);
+        // 32 bytes × 2 hex chars + 31 colons = 95 chars
+        assert_eq!(fp.len(), 95, "fingerprint must be 95 chars (32 hex pairs, 31 colons)");
+        assert!(
+            fp.chars().all(|c| c.is_ascii_hexdigit() || c == ':'),
+            "only hex and colons"
+        );
+    }
+
+    #[test]
+    fn sha256_fingerprint_is_deterministic() {
+        let fp1 = sha256_fingerprint(SAMPLE_CERT_PEM);
+        let fp2 = sha256_fingerprint(SAMPLE_CERT_PEM);
+        assert_eq!(fp1, fp2, "fingerprint must be deterministic");
+    }
+
+    #[test]
+    fn sha256_fingerprint_differs_for_different_pems() {
+        let fp1 = sha256_fingerprint(SAMPLE_CERT_PEM);
+        let fp2 = sha256_fingerprint("-----BEGIN CERTIFICATE-----\ndifferent\n-----END CERTIFICATE-----\n");
+        assert_ne!(fp1, fp2, "different PEMs must produce different fingerprints");
+    }
+
+    #[test]
+    fn sha256_fingerprint_does_not_contain_private_key_material() {
+        // Fingerprints are derived from PEM bytes — they must never embed raw PEM or key data.
+        let fp = sha256_fingerprint(SAMPLE_CERT_PEM);
+        assert!(!fp.contains("CERTIFICATE"), "fingerprint must not contain PEM header");
+        assert!(
+            !fp.contains("PRIVATE"),
+            "fingerprint must not contain private key markers"
+        );
+    }
+
+    #[test]
+    fn sha256_fingerprint_empty_string() {
+        // Even empty input produces a valid deterministic fingerprint.
+        let fp = sha256_fingerprint("");
+        assert_eq!(fp.len(), 95, "empty-string fingerprint must still be 95 chars");
     }
 }

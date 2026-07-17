@@ -30,4 +30,8 @@ pub enum OperatorError {
     /// Consumer Praxis config rendering failed.
     #[error("consumer config render: {0}")]
     ConsumerConfigRender(#[from] crate::resources::consumer_config::ConsumerConfigError),
+
+    /// SWIM encryption key configuration failed.
+    #[error("swim key configuration: {0}")]
+    SwimKeyConfig(String),
 }

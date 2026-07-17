@@ -25,7 +25,7 @@ credential handling, and backend proxying.
 # Validate operator routing overlay generation in kind
 cargo xtask env validate-operator-routing -c tests/env/operator-routing.toml
 
-# Validate two-provider llm-d-style model routing in kind
+# Validate two-provider model routing through the llm-d-compatible gateway path
 cargo xtask env verify-demo1-llmd-routing -c tests/env/operator-routing-two-provider.toml
 
 # Validate full-grid routing across local, remote, cloud mock, and API mock
@@ -46,6 +46,15 @@ cargo xtask env verify-swim-crd-seeds -c tests/env/operator-routing.toml
 
 # Validate CRDT provider-state propagation over SWIM
 cargo xtask env verify-swim-state -c tests/env/operator-routing.toml
+
+# Validate encrypted SWIM transport behavior and failure cases
+cargo xtask env verify-swim-encryption -c tests/env/operator-routing-multisite.toml
+
+# Validate transitive three-node SWIM mesh propagation and routing eligibility
+cargo xtask env verify-swim-mesh-three-node -c tests/env/operator-routing-multisite.toml
+
+# Validate GridSite trust fingerprint promotion and fail-closed rotation
+cargo xtask env verify-gridsite-trust-fingerprint -c tests/env/operator-routing-multisite.toml
 ```
 
 ## Documentation

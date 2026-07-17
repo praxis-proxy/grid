@@ -352,8 +352,10 @@ the operator looks for a `GridSite` resource whose Kubernetes name equals
 `discovered_site_k8s_name(N, S)` (the auto-discovered name derivation) and whose
 `spec.gridNetworkRef == N` and `status.phase == Active`.
 
-`Active` is set by the deployment workflow after the remote site satisfies the
-configured trust requirements.  It is not set automatically by the operator.
+`Active` is set by the operator after the remote site satisfies the configured
+trust requirements.  The current trust gate is
+`GridSite.spec.trust.certFingerprint`: the configured fingerprint must match the
+received `status.publicCertPem`, and the gateway TCP probe must succeed.
 See [Authentication and Access Policy](auth.md) for the trust contract.
 
 **Local providers** (from `InferenceProvider` resources in the same cluster) are
@@ -361,8 +363,15 @@ always eligible.  They are not filtered by `GridSite.status.phase`.
 
 **Claim**: SWIM membership + TCP reachability + public cert material alone are not
 sufficient for a remote provider to become routable.  `Active` is the explicit
-routing eligibility gate; the deployment workflow must only set it after the
-site satisfies the configured trust and authorization policy.
+routing eligibility gate; the operator only sets it after the configured
+fingerprint trust policy matches.
+
+**Validation**: `verify-swim-mesh-three-node` proves the eligibility gate in a
+three-node mesh (A→B→C topology).  It asserts that C's provider is absent from
+A's overlay before C's `GridSite` is `Active`, and appears only after `Active`
+is set — even though CRDT state from C reached A transitively through B.  The
+same validation confirms wrong-network provider records are absent from A's
+correct-network overlay.
 
 ## Consumer gateway selection
 

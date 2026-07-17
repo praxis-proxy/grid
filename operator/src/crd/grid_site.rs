@@ -46,6 +46,43 @@ pub struct GridSiteSpec {
 
     /// Availability zone.
     pub zone: Option<String>,
+
+    /// Trust policy for this site.
+    ///
+    /// When configured, the operator verifies the received public certificate against
+    /// this policy before promoting the site to `Active`.  If absent, the site remains
+    /// `Connecting` with reason `TrustPolicyMissing` regardless of cert material.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust: Option<GridSiteTrustPolicy>,
+}
+
+/// Trust policy controlling when a [`GridSite`] can advance to `Active`.
+///
+/// Currently supports SHA-256 fingerprint pinning of the received public certificate.
+/// The fingerprint is computed from the raw PEM bytes of `status.publicCertPem`.
+///
+/// # Security
+///
+/// Setting `certFingerprint` means you explicitly trust the specific certificate
+/// that produces that fingerprint.  Verify the fingerprint out-of-band before
+/// configuring it.  The operator does **not** perform X.509 chain verification —
+/// the fingerprint is the trust anchor.
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GridSiteTrustPolicy {
+    /// Expected SHA-256 fingerprint of the remote site's public certificate PEM.
+    ///
+    /// Format: colon-separated lowercase hex bytes, e.g. `"ab:cd:ef:..."`.
+    /// Computed as `sha256(pem_bytes)` where `pem_bytes` are the UTF-8 bytes of
+    /// `status.publicCertPem`.
+    ///
+    /// To compute from the PEM string: `printf '%s' "$cert_pem" | sha256sum`.
+    ///
+    /// When this field matches the SHA-256 of `status.publicCertPem`, the site is
+    /// promoted to `Active` after a successful TCP probe.  When absent, the site
+    /// remains `Connecting` with reason `TrustPolicyMissing`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cert_fingerprint: Option<String>,
 }
 
 /// Egress endpoint configuration for a site.
@@ -102,7 +139,7 @@ pub struct GridSiteStatus {
     pub phase: GridSitePhase,
 
     /// Remote site's public certificate PEM (received
-    /// during mTLS exchange).
+    /// via SWIM state broadcast from the remote operator).
     pub public_cert_pem: Option<String>,
 
     /// Machine-readable reason for the current phase.

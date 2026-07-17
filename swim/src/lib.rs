@@ -16,6 +16,8 @@
 
 #![deny(unsafe_code)]
 
+/// AES-256-GCM encryption/authentication for SWIM UDP packets.
+pub mod crypto;
 /// Membership events emitted by the SWIM runtime.
 pub mod event;
 /// SWIM node identity for the AI Grid.
