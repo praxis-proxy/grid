@@ -1,0 +1,26 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: grid-operator-crd
+  labels:
+    app.kubernetes.io/managed-by: grid-operator
+rules:
+  # ── Grid CRDs (cluster-scoped) ──────────────────────────────────────
+  #
+  # The operator watches all three CRD types via kube-rs Controller::new
+  # (requires list + watch).  It reads individual resources with get and
+  # writes spec and status via server-side apply (patch).
+  - apiGroups: ["grid.praxis-proxy.io"]
+    resources:
+      - gridnetworks
+      - gridsites
+      - inferenceproviders
+    verbs: ["get", "list", "watch", "patch"]
+
+  # Status subresources are authorized separately.
+  - apiGroups: ["grid.praxis-proxy.io"]
+    resources:
+      - gridnetworks/status
+      - gridsites/status
+      - inferenceproviders/status
+    verbs: ["get", "patch"]

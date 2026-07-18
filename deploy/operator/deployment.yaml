@@ -1,0 +1,48 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grid-operator
+  namespace: grid-system
+  labels:
+    app.kubernetes.io/name: grid-operator
+    app.kubernetes.io/managed-by: grid-operator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: grid-operator
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: grid-operator
+    spec:
+      serviceAccountName: grid-operator
+      containers:
+        - name: operator
+          # Replace with the actual operator image before deploying.
+          # No release image convention exists yet; build from
+          # deploy/operator/Containerfile and load into Kind or
+          # push to your registry.
+          image: grid-operator:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: GRID_SWIM_BIND_ADDR
+              value: "0.0.0.0:7946"
+            - name: GRID_SWIM_ADVERTISE_ADDR
+              value: "$(POD_IP):7946"
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: GRID_SWIM_SITE_NAME
+              value: ""
+            - name: GRID_SWIM_SEEDS
+              value: ""
+            - name: GRID_GATEWAY_ADDRESS
+              value: ""
+            - name: RUST_LOG
+              value: "info"
+          ports:
+            - name: swim-udp
+              containerPort: 7946
+              protocol: UDP

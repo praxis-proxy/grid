@@ -520,7 +520,7 @@ pub(crate) enum Action {
         name: String,
     },
 
-    /// Verify the Demo 1 llm-d-style two-provider model routing topology.
+    /// Verify the llm-d-compatible two-provider model routing topology.
     ///
     /// Proves the full llm-d routing path end-to-end in kind:
     ///
@@ -536,7 +536,7 @@ pub(crate) enum Action {
     /// `env up -c tests/env/operator-routing-two-provider.toml` and
     /// `env load-gateway-images -c tests/env/operator-routing-two-provider.toml`
     /// first.
-    VerifyDemo1LlmdRouting {
+    VerifyLlmdCompatibleRouting {
         /// Path to the two-provider environment config file.
         #[arg(short, long, default_value = "tests/env/operator-routing-two-provider.toml")]
         config: PathBuf,
@@ -654,6 +654,26 @@ pub(crate) enum Action {
         #[arg(short, long, default_value = "tests/env/operator-routing-two-provider.toml")]
         config: PathBuf,
     },
+
+    /// Verify the operator install/RBAC package in Kind.
+    ///
+    /// Applies the install manifests from `deploy/operator/`, runs positive and
+    /// negative `kubectl auth can-i` checks against the `grid-operator`
+    /// `ServiceAccount`, then spawns an out-of-cluster operator and proves RBAC
+    /// is sufficient for a minimal reconcile (status written, overlay `ConfigMap`
+    /// created).
+    ///
+    /// Requires a kind cluster.  Run `env up` first.  Safe to rerun: install
+    /// resources and test fixtures are cleaned at the start.
+    VerifyOperatorInstallRbac {
+        /// Path to the environment config file.
+        #[arg(short, long, default_value = "tests/env/operator-routing.toml")]
+        config: PathBuf,
+
+        /// Kind cluster context to run against (first provider site by default).
+        #[arg(long)]
+        site: Option<String>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -704,12 +724,13 @@ pub(crate) fn run(action: &Action) -> Result<(), Box<dyn std::error::Error>> {
         },
         Action::GridsiteFingerprint { context, name } => env_gridsite_fingerprint(context.as_str(), name.as_str()),
         Action::VerifySwimRouting { config } => env_verify_swim_routing(config),
-        Action::VerifyDemo1LlmdRouting { config } => env_verify_demo1_llmd_routing(config),
+        Action::VerifyLlmdCompatibleRouting { config } => env_verify_llmd_compat_routing(config),
         Action::VerifyFullGridRouting { config } => env_verify_full_grid_routing(config),
         Action::VerifyMetricsRouting { config } => env_verify_metrics_routing(config),
         Action::VerifySiteJoinDiscovery { config } => env_verify_site_join_discovery(config),
         Action::VerifyFailoverUnderLostPeer { config } => env_verify_failover_under_lost_peer(config),
         Action::VerifyStaleGcTtl { config } => env_verify_stale_gc_ttl(config),
+        Action::VerifyOperatorInstallRbac { config, site } => env_verify_operator_install_rbac(config, site.as_deref()),
     }
 }
 
@@ -1357,9 +1378,13 @@ fn is_multi_provider_config(cfg: &EnvConfig) -> bool {
 /// Resolve the kubectl context for the target site.
 ///
 /// Uses the first provider site in the config when `site` is `None`.
-fn resolve_operator_context(cfg: &EnvConfig, site: Option<&str>) -> Result<String, Box<dyn std::error::Error>> {
-    let name = if let Some(site) = site {
-        site
+/// Resolve the config site name for operator validation.
+fn resolve_operator_site_name<'a>(
+    cfg: &'a EnvConfig,
+    site: Option<&'a str>,
+) -> Result<&'a str, Box<dyn std::error::Error>> {
+    if let Some(site) = site {
+        Ok(site)
     } else {
         cfg.clusters
             .names
@@ -1371,8 +1396,13 @@ fn resolve_operator_context(cfg: &EnvConfig, site: Option<&str>) -> Result<Strin
                     .is_some_and(|d| d.role == ClusterRole::Provider)
             })
             .map(String::as_str)
-            .ok_or("no provider site in config")?
-    };
+            .ok_or_else(|| "no provider site in config".into())
+    }
+}
+
+/// Resolve the kubectl context for operator validation.
+fn resolve_operator_context(cfg: &EnvConfig, site: Option<&str>) -> Result<String, Box<dyn std::error::Error>> {
+    let name = resolve_operator_site_name(cfg, site)?;
     Ok(kind::kubectl_context(name))
 }
 
@@ -2704,7 +2734,7 @@ fn env_verify_swim_mesh_three_node(config: &Path, site: Option<&str>) -> Result<
 }
 
 // ---------------------------------------------------------------------------
-// Demo 1 llm-d routing proof
+// llm-d-compatible routing proof
 // ---------------------------------------------------------------------------
 
 /// Resolve the first consumer-role cluster name from the environment config.
@@ -2771,8 +2801,8 @@ fn collect_pod_restart_counts(context: &str, namespace: &str) -> Result<PodResta
     Ok(parse_pod_restart_lines(&stdout))
 }
 
-/// Record a Demo 1 step result, returning whether it passed.
-fn demo1_record_step(
+/// Record an llm-d-compatible routing step result, returning whether it passed.
+fn llmd_compat_record_step(
     label: &'static str,
     results: &mut Vec<StepResult>,
     f: impl FnOnce() -> Result<String, Box<dyn std::error::Error>>,
@@ -2794,7 +2824,10 @@ fn demo1_record_step(
 /// Runs the standard consumer E2E check (HTTP 200 per model, unknown model
 /// returns 404/503) and then verifies that each response body includes the
 /// correct `model` field.
-fn verify_demo1_routing(cfg: &EnvConfig, results: &mut Vec<StepResult>) -> Result<(), Box<dyn std::error::Error>> {
+fn verify_llmd_compat_routing(
+    cfg: &EnvConfig,
+    results: &mut Vec<StepResult>,
+) -> Result<(), Box<dyn std::error::Error>> {
     match consumer::verify_e2e(cfg) {
         Ok(()) => results.push(StepResult::pass(
             "consumer routing",
@@ -2805,14 +2838,17 @@ fn verify_demo1_routing(cfg: &EnvConfig, results: &mut Vec<StepResult>) -> Resul
             return Ok(());
         },
     }
-    verify_demo1_model_fields(cfg, results)
+    verify_llmd_compat_model_fields(cfg, results)
 }
 
 /// Check Chat Completions response `model` fields via consumer gateway.
 ///
 /// Port-forwards to the consumer gateway and sends a request per configured
 /// model.  Asserts the response JSON `model` field matches the request.
-fn verify_demo1_model_fields(cfg: &EnvConfig, results: &mut Vec<StepResult>) -> Result<(), Box<dyn std::error::Error>> {
+fn verify_llmd_compat_model_fields(
+    cfg: &EnvConfig,
+    results: &mut Vec<StepResult>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let consumer_site = resolve_consumer_site(cfg)?;
     let ctx = kind::kubectl_context(consumer_site);
     let port = verify::find_free_port()?;
@@ -2822,14 +2858,14 @@ fn verify_demo1_model_fields(cfg: &EnvConfig, results: &mut Vec<StepResult>) -> 
         results.push(StepResult::blocked("response model field", "consumer not reachable"));
         return Ok(());
     }
-    let result = demo1_check_all_model_fields(cfg, port);
+    let result = llmd_compat_check_all_model_fields(cfg, port);
     pf.stop();
     results.push(result);
     Ok(())
 }
 
 /// Check model field in response for all provider models.
-fn demo1_check_all_model_fields(cfg: &EnvConfig, port: u16) -> StepResult {
+fn llmd_compat_check_all_model_fields(cfg: &EnvConfig, port: u16) -> StepResult {
     let mut verified = Vec::new();
     let mut failed = Vec::new();
     for name in &cfg.clusters.names {
@@ -2840,7 +2876,7 @@ fn demo1_check_all_model_fields(cfg: &EnvConfig, port: u16) -> StepResult {
             continue;
         }
         for model in &def.models {
-            match demo1_check_one_model_field(port, model) {
+            match llmd_compat_check_one_model_field(port, model) {
                 Ok(()) => verified.push(model.clone()),
                 Err(e) => failed.push(format!("{model}: {e}")),
             }
@@ -2858,7 +2894,7 @@ fn demo1_check_all_model_fields(cfg: &EnvConfig, port: u16) -> StepResult {
 }
 
 /// Send a consumer request and verify the response model field.
-fn demo1_check_one_model_field(port: u16, model: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn llmd_compat_check_one_model_field(port: u16, model: &str) -> Result<(), Box<dyn std::error::Error>> {
     let resp = consumer::send_consumer_request(port, model)?;
     if resp.status != 200 {
         return Err(format!("HTTP {}, expected 200", resp.status).into());
@@ -2866,11 +2902,14 @@ fn demo1_check_one_model_field(port: u16, model: &str) -> Result<(), Box<dyn std
     verify_response_model_field(&resp.body, model)
 }
 
-/// Assert no pods restarted during the Demo 1 test run.
+/// Assert no pods restarted during the llm-d-compatible routing test run.
 ///
 /// Queries every cluster in the topology for pods with non-zero restart
 /// counts in the `default` namespace.
-fn verify_demo1_pod_restarts(cfg: &EnvConfig, results: &mut Vec<StepResult>) -> Result<(), Box<dyn std::error::Error>> {
+fn verify_llmd_compat_pod_restarts(
+    cfg: &EnvConfig,
+    results: &mut Vec<StepResult>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut total_restarts: Vec<String> = Vec::new();
     for name in &cfg.clusters.names {
         let ctx = kind::kubectl_context(name);
@@ -2891,7 +2930,7 @@ fn verify_demo1_pod_restarts(cfg: &EnvConfig, results: &mut Vec<StepResult>) -> 
     Ok(())
 }
 
-/// Run the Demo 1 llm-d routing proof.
+/// Run the llm-d-compatible routing proof.
 ///
 /// Orchestrates the full two-provider llm-d routing proof:
 /// 1. Deploy provider gateways.
@@ -2904,27 +2943,27 @@ fn verify_demo1_pod_restarts(cfg: &EnvConfig, results: &mut Vec<StepResult>) -> 
     clippy::too_many_lines,
     reason = "sequential demo proof steps: each step depends on the previous; splitting obscures the proof flow"
 )]
-fn env_verify_demo1_llmd_routing(config: &Path) -> Result<(), Box<dyn std::error::Error>> {
+fn env_verify_llmd_compat_routing(config: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let cfg = EnvConfig::from_file(config)?;
     let providers = provider_clusters_from_config(&cfg);
     if providers.len() < 2 {
-        return Err(format!("demo1 requires >= 2 provider clusters; got {}", providers.len()).into());
+        return Err(format!("llmd-compat requires >= 2 provider clusters; got {}", providers.len()).into());
     }
     let mut results: Vec<StepResult> = Vec::new();
 
     // Step 1: Deploy provider gateways.
-    eprintln!("demo1: [1/6] deploying provider gateways...");
-    let gw_ok = demo1_record_step("provider gateways", &mut results, || {
+    eprintln!("llmd-compat: [1/6] deploying provider gateways...");
+    let gw_ok = llmd_compat_record_step("provider gateways", &mut results, || {
         gateway::deploy_all(&cfg)?;
         Ok(format!("{} sites deployed", providers.len()))
     });
     if !gw_ok {
         print_validate_all_table(&results);
-        return Err("demo1: provider gateway deployment failed".into());
+        return Err("llmd-compat: provider gateway deployment failed".into());
     }
 
     // Step 2: Operator reconcile + overlay export.
-    eprintln!("demo1: [2/6] operator reconcile + overlay export...");
+    eprintln!("llmd-compat: [2/6] operator reconcile + overlay export...");
     let context = resolve_operator_context(&cfg, None)?;
     let providers_ref: Vec<(&str, &[String])> = providers.iter().map(|(s, m)| (s.as_str(), m.as_slice())).collect();
     let overlay_path = match run_multi_provider_reconcile(&context, &providers_ref) {
@@ -2938,43 +2977,43 @@ fn env_verify_demo1_llmd_routing(config: &Path) -> Result<(), Box<dyn std::error
         Err(e) => {
             results.push(StepResult::fail("operator reconcile", e.as_ref()));
             print_validate_all_table(&results);
-            return Err("demo1: operator reconcile failed".into());
+            return Err("llmd-compat: operator reconcile failed".into());
         },
     };
 
     // Step 3: Verify provider-side llm-d path.
-    eprintln!("demo1: [3/6] verifying provider-side llm-d path...");
-    demo1_record_step("provider llm-d path", &mut results, || {
+    eprintln!("llmd-compat: [3/6] verifying provider-side llm-d path...");
+    llmd_compat_record_step("provider llm-d path", &mut results, || {
         gateway::verify_all(&cfg)?;
         Ok("ext_proc + mock EPP + endpoint_selector verified".to_owned())
     });
 
     // Step 4: Deploy consumer gateway from overlay.
-    eprintln!("demo1: [4/6] deploying consumer gateway from overlay...");
-    let consumer_ok = demo1_record_step("consumer deploy", &mut results, || {
+    eprintln!("llmd-compat: [4/6] deploying consumer gateway from overlay...");
+    let consumer_ok = llmd_compat_record_step("consumer deploy", &mut results, || {
         consumer::deploy_consumer(&cfg, Some(&overlay_path))?;
         Ok("deployed from operator overlay".to_owned())
     });
     if !consumer_ok {
         print_validate_all_table(&results);
-        return Err("demo1: consumer deploy failed".into());
+        return Err("llmd-compat: consumer deploy failed".into());
     }
 
     // Step 5: Verify consumer routing + model names.
-    eprintln!("demo1: [5/6] verifying consumer routing + model names...");
-    verify_demo1_routing(&cfg, &mut results)?;
+    eprintln!("llmd-compat: [5/6] verifying consumer routing + model names...");
+    verify_llmd_compat_routing(&cfg, &mut results)?;
 
     // Step 6: Pod restart check.
-    eprintln!("demo1: [6/6] checking for unexpected pod restarts...");
-    verify_demo1_pod_restarts(&cfg, &mut results)?;
+    eprintln!("llmd-compat: [6/6] checking for unexpected pod restarts...");
+    verify_llmd_compat_pod_restarts(&cfg, &mut results)?;
 
     eprintln!();
-    eprintln!("## Demo 1 llm-d Routing Proof");
+    eprintln!("## llm-d-compatible Routing Proof");
     print_validate_all_table(&results);
     if results.iter().any(|r| r.status.is_failure()) {
-        Err("demo1: one or more proof points FAILED".into())
+        Err("llmd-compat: one or more proof points FAILED".into())
     } else {
-        eprintln!("demo1: ALL proof points PASS");
+        eprintln!("llmd-compat: ALL proof points PASS");
         Ok(())
     }
 }
@@ -4720,6 +4759,228 @@ fn env_verify_crd_schema() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 // ---------------------------------------------------------------------------
+// verify-operator-install-rbac
+// ---------------------------------------------------------------------------
+
+/// Verify the operator install/RBAC package in Kind.
+///
+/// Applies `deploy/operator/` manifests, runs `kubectl auth can-i` checks for
+/// positive and negative permission expectations, then spawns an out-of-cluster
+/// operator to prove RBAC is sufficient for a minimal reconcile.
+/// Positive `kubectl auth can-i` checks for the installed operator RBAC.
+fn rbac_can_i_checks(context: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let checks: &[(&str, &str, Option<&str>)] = &[
+        ("patch", "gridnetworks.grid.praxis-proxy.io", None),
+        ("patch", "gridnetworks.grid.praxis-proxy.io/status", None),
+        ("get", "gridnetworks.grid.praxis-proxy.io", None),
+        ("list", "gridnetworks.grid.praxis-proxy.io", None),
+        ("watch", "gridnetworks.grid.praxis-proxy.io", None),
+        ("patch", "gridsites.grid.praxis-proxy.io", None),
+        ("patch", "gridsites.grid.praxis-proxy.io/status", None),
+        ("list", "inferenceproviders.grid.praxis-proxy.io", None),
+        ("patch", "inferenceproviders.grid.praxis-proxy.io/status", None),
+        ("get", "secrets", Some("default")),
+        ("create", "secrets", Some("default")),
+        ("patch", "secrets", Some("default")),
+        ("create", "configmaps", Some("default")),
+        ("patch", "configmaps", Some("default")),
+    ];
+    for (verb, resource, ns) in checks {
+        let allowed = operator::kubectl_auth_can_i(context, verb, resource, *ns)?;
+        if !allowed {
+            return Err(format!(
+                "RBAC check failed: grid-operator should be allowed to {verb} {resource}{}",
+                ns.map_or(String::new(), |n| format!(" in namespace {n}"))
+            )
+            .into());
+        }
+        eprintln!("  [PASS] can-i {verb} {resource}{}", ns.map_or("", |_| " (namespaced)"));
+    }
+    Ok(())
+}
+
+/// Negative `kubectl auth can-i` checks (must be denied).
+fn rbac_negative_checks(context: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let checks: &[(&str, &str, Option<&str>)] = &[
+        ("list", "secrets", Some("default")),
+        ("delete", "secrets", Some("default")),
+        ("create", "pods", Some("default")),
+        ("get", "pods", Some("default")),
+        ("create", "events", Some("default")),
+        ("delete", "gridnetworks.grid.praxis-proxy.io", None),
+        ("get", "secrets", Some("kube-system")),
+        ("patch", "configmaps", Some("kube-system")),
+    ];
+    for (verb, resource, ns) in checks {
+        let allowed = operator::kubectl_auth_can_i(context, verb, resource, *ns)?;
+        if allowed {
+            return Err(format!(
+                "RBAC check failed: grid-operator should NOT be allowed to {verb} {resource}{}",
+                ns.map_or(String::new(), |n| format!(" in namespace {n}"))
+            )
+            .into());
+        }
+        eprintln!(
+            "  [PASS] cannot {verb} {resource}{} (correctly denied)",
+            ns.map_or(String::new(), |n| format!(" in {n}"))
+        );
+    }
+    Ok(())
+}
+
+/// Validate operator install manifests, RBAC, and in-cluster reconcile.
+#[expect(
+    clippy::too_many_lines,
+    reason = "sequential install/RBAC verification steps; splitting would obscure the proof"
+)]
+fn env_verify_operator_install_rbac(config: &Path, site: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    let cfg = EnvConfig::from_file(config)?;
+    let site_cfg_name = resolve_operator_site_name(&cfg, site)?;
+    let context = kind::kubectl_context(site_cfg_name);
+    let cluster_name = kind::cluster_name_from_config(site_cfg_name);
+    eprintln!("verify-operator-install-rbac: context={context}");
+
+    // Step 1: preflight — CRDs + cleanup.
+    eprintln!("verify-operator-install-rbac: [1/11] preflight — CRDs, cleanup...");
+    operator::install_grid_crds(&context)?;
+    operator::cleanup_install_rbac_test_resources(&context)?;
+
+    // Step 2: build operator image + load into Kind.
+    eprintln!("verify-operator-install-rbac: [2/11] building operator image...");
+    operator::build_operator_image()?;
+    operator::load_operator_image(&cluster_name)?;
+    eprintln!("  [OK] operator image built and loaded into {cluster_name}");
+
+    // Step 3: apply install manifests.
+    eprintln!("verify-operator-install-rbac: [3/11] applying install manifests...");
+    operator::apply_install_manifests(&context)?;
+    eprintln!("  [OK] install manifests applied");
+
+    // Steps 4-5: RBAC can-i checks (positive + negative).
+    eprintln!("verify-operator-install-rbac: [4/11] positive RBAC checks...");
+    rbac_can_i_checks(&context)?;
+    eprintln!("verify-operator-install-rbac: [5/11] negative RBAC checks...");
+    rbac_negative_checks(&context)?;
+
+    // Step 6: patch Deployment env vars + wait for rollout.
+    eprintln!("verify-operator-install-rbac: [6/11] starting in-cluster operator...");
+    let test_site_name = "rbac-test-site";
+    operator::patch_operator_deployment_env(&context, test_site_name)?;
+    kubectl::wait_for_rollout_ns(&context, "grid-operator", "grid-system", &cluster_name)?;
+    eprintln!("  [OK] grid-operator Deployment available");
+
+    // Step 7: apply fixtures with TLS Secret refs.
+    eprintln!("verify-operator-install-rbac: [7/11] applying test fixtures...");
+    let network_name = "op-e2e-rbac-net";
+    let gw_name = "op-e2e-rbac-gw";
+    let provider_name = "op-e2e-rbac-prov";
+    let ca_secret_name = "op-e2e-rbac-ca";
+    let site_secret_name = "op-e2e-rbac-site";
+    let overlay_cm_name = format!("grid-overlay-{network_name}-{gw_name}");
+
+    let network_manifest = serde_json::to_string_pretty(&serde_json::json!({
+        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "kind": "GridNetwork",
+        "metadata": { "name": network_name },
+        "spec": {
+            "seeds": [],
+            "tls": {
+                "caSecretRef": {
+                    "name": ca_secret_name,
+                    "namespace": "default"
+                },
+                "siteSecretRef": {
+                    "name": site_secret_name,
+                    "namespace": "default"
+                }
+            },
+            "gatewayRefs": [{
+                "name": gw_name,
+                "namespace": "default"
+            }]
+        }
+    }))
+    .unwrap_or_else(|e| {
+        eprintln!("RBAC test network serialization failed: {e}");
+        std::process::exit(1);
+    });
+    kubectl::apply_manifest(&context, &network_manifest)?;
+    eprintln!("  [OK] GridNetwork {network_name} applied (with TLS Secret refs)");
+
+    let provider_manifest = serde_json::to_string_pretty(&serde_json::json!({
+        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "kind": "InferenceProvider",
+        "metadata": { "name": provider_name },
+        "spec": {
+            "gridNetworkRef": network_name,
+            "models": [{ "name": "model-rbac-test" }],
+            "backendKind": "SelfHosted",
+            "providerKind": "SelfHosted",
+            "routingClusterRef": test_site_name,
+            "endpoint": "http://localhost:10099"
+        }
+    }))
+    .unwrap_or_else(|e| {
+        eprintln!("RBAC test provider serialization failed: {e}");
+        std::process::exit(1);
+    });
+    kubectl::apply_manifest(&context, &provider_manifest)?;
+    eprintln!("  [OK] InferenceProvider {provider_name} applied");
+
+    // Step 8: wait for in-cluster operator to reconcile.
+    eprintln!("verify-operator-install-rbac: [8/11] waiting for in-cluster reconcile...");
+    let snap = operator::wait_for_gridnetwork_status(&context, network_name, operator::SWIM_STATUS_POLL_TIMEOUT)?;
+    eprintln!(
+        "  [PASS] GridNetwork {network_name} reconciled by in-cluster operator \
+         (phase={:?}, connectedSites={})",
+        snap.phase, snap.connected_sites
+    );
+
+    // Step 9: verify actual Secret writes (TLS CA + site cert).
+    eprintln!("verify-operator-install-rbac: [9/11] verifying Secret writes...");
+    if !kind::kubectl_secret_exists(&context, "default", ca_secret_name)? {
+        return Err(
+            format!("Secret {ca_secret_name} not found in default — operator failed to write CA Secret").into(),
+        );
+    }
+    eprintln!("  [PASS] Secret {ca_secret_name} exists (CA cert written by in-cluster operator)");
+
+    if !kind::kubectl_secret_exists(&context, "default", site_secret_name)? {
+        return Err(format!(
+            "Secret {site_secret_name} not found in default — operator failed to write site cert Secret"
+        )
+        .into());
+    }
+    eprintln!("  [PASS] Secret {site_secret_name} exists (site cert written by in-cluster operator)");
+
+    // Step 10: verify overlay ConfigMap write.
+    eprintln!("verify-operator-install-rbac: [10/11] verifying overlay ConfigMap write...");
+    match kind::kubectl_get_configmap(&context, "default", &overlay_cm_name) {
+        Ok(_) => {
+            eprintln!("  [PASS] ConfigMap {overlay_cm_name} exists (overlay written by in-cluster operator)");
+        },
+        Err(e) => {
+            return Err(format!(
+                "ConfigMap {overlay_cm_name} not found in default — operator failed to write overlay: {e}"
+            )
+            .into());
+        },
+    }
+
+    // Step 11: cleanup.
+    eprintln!("verify-operator-install-rbac: [11/11] cleanup...");
+    operator::cleanup_install_rbac_test_resources(&context)?;
+    operator::cleanup_install_manifests(&context)?;
+
+    eprintln!(
+        "verify-operator-install-rbac: PASS — install manifests apply cleanly; \
+         positive RBAC checks pass; negative RBAC checks (including namespace-scoped) pass; \
+         in-cluster operator reconcile succeeds; Secret patch and ConfigMap patch verified"
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // validate-all tests
 // ---------------------------------------------------------------------------
 
@@ -5168,11 +5429,11 @@ fn env_verify_gridsite_trust_fingerprint(config: &Path, site: Option<&str>) -> R
 }
 
 // ---------------------------------------------------------------------------
-// Demo 1 llm-d routing tests
+// llm-d-compatible routing tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-mod demo1_tests {
+mod llmd_compat_routing_tests {
     use super::*;
 
     #[test]
@@ -5282,9 +5543,9 @@ mod demo1_tests {
     }
 
     #[test]
-    fn demo1_record_step_pass_returns_true() {
+    fn llmd_compat_record_step_pass_returns_true() {
         let mut results = Vec::new();
-        let ok = demo1_record_step("test-step", &mut results, || Ok("evidence".to_owned()));
+        let ok = llmd_compat_record_step("test-step", &mut results, || Ok("evidence".to_owned()));
         assert!(ok, "passing step must return true");
         assert_eq!(results.len(), 1, "one result must be recorded");
         assert_eq!(
@@ -5295,9 +5556,9 @@ mod demo1_tests {
     }
 
     #[test]
-    fn demo1_record_step_fail_returns_false() {
+    fn llmd_compat_record_step_fail_returns_false() {
         let mut results = Vec::new();
-        let ok = demo1_record_step("test-step", &mut results, || Err("boom".into()));
+        let ok = llmd_compat_record_step("test-step", &mut results, || Err("boom".into()));
         assert!(!ok, "failing step must return false");
         assert_eq!(results.len(), 1, "one result must be recorded");
         assert_eq!(
@@ -5308,7 +5569,7 @@ mod demo1_tests {
     }
 
     /// Build a minimal [`EnvConfig`] for unit tests.
-    fn make_demo1_config(clusters: &[(&str, ClusterRole, Vec<String>)]) -> EnvConfig {
+    fn make_llmd_compat_config(clusters: &[(&str, ClusterRole, Vec<String>)]) -> EnvConfig {
         use std::collections::BTreeMap;
 
         use config::{BedrockDef, ClusterConfig, ProviderConfig, ProviderDef, VertexDef};
@@ -5344,7 +5605,7 @@ mod demo1_tests {
 
     #[test]
     fn resolve_consumer_site_finds_consumer() {
-        let cfg = make_demo1_config(&[
+        let cfg = make_llmd_compat_config(&[
             ("site-east", ClusterRole::Provider, vec!["model-east".to_owned()]),
             ("consumer", ClusterRole::Consumer, vec![]),
         ]);
@@ -5357,7 +5618,7 @@ mod demo1_tests {
 
     #[test]
     fn resolve_consumer_site_errors_when_missing() {
-        let cfg = make_demo1_config(&[("site-east", ClusterRole::Provider, vec!["model-east".to_owned()])]);
+        let cfg = make_llmd_compat_config(&[("site-east", ClusterRole::Provider, vec!["model-east".to_owned()])]);
         assert!(
             resolve_consumer_site(&cfg).is_err(),
             "must error when no consumer cluster exists"

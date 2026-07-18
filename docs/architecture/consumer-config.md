@@ -93,9 +93,9 @@ Example failure output:
 
 The operator could not apply the `ConfigMap`.  Common causes:
 
-- Missing RBAC: the operator's `ServiceAccount` lacks `configmaps.create` /
-  `configmaps.update` in the gateway namespace.  See the
-  [RBAC requirements](operations.md#consumer-config-rbac) in the operations guide.
+- Missing RBAC: the operator's `ServiceAccount` lacks `configmaps` `create`
+  and `patch` in the gateway namespace.  See the
+  [RBAC permissions](operations.md#rbac-permissions) in the operations guide.
 - The namespace does not exist.  Create it before enabling `consumerConfig`.
 - Kubernetes API server is temporarily unavailable.  The reconcile will retry on
   the next requeue (default 5 minutes) or when the `GridNetwork` or any watched

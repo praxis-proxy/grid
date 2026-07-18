@@ -225,6 +225,22 @@ pub(crate) fn kubectl_get_configmap(
     Ok(String::from_utf8(output.stdout)?)
 }
 
+/// Check whether a Kubernetes `Secret` exists.
+///
+/// # Errors
+///
+/// Returns an error if `kubectl` fails.
+pub(crate) fn kubectl_secret_exists(
+    context: &str,
+    namespace: &str,
+    name: &str,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let output = Command::new("kubectl")
+        .args(["--context", context, "-n", namespace, "get", "secret", name])
+        .output()?;
+    Ok(output.status.success())
+}
+
 /// Get the internal IP of the first Kind cluster node.
 ///
 /// Queries `kubectl get nodes` in the given context and returns the

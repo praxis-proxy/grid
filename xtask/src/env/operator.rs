@@ -579,6 +579,195 @@ pub(crate) fn cleanup_validation_resources(context: &str) -> Result<(), Box<dyn 
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Install/RBAC validation helpers
+// ---------------------------------------------------------------------------
+
+/// Apply the operator install manifests from `deploy/operator/`.
+///
+/// The namespace must exist before resources that target it, so the
+/// namespace manifest is applied first as a separate step.
+pub(crate) fn apply_install_manifests(context: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let ns = Command::new("kubectl")
+        .args(["apply", "--context", context, "-f", "deploy/operator/namespace.yaml"])
+        .status()?;
+    if !ns.success() {
+        return Err("failed to apply deploy/operator/namespace.yaml".into());
+    }
+    let rest = Command::new("kubectl")
+        .args(["apply", "--context", context, "-f", "deploy/operator/"])
+        .status()?;
+    if !rest.success() {
+        return Err("failed to apply install manifests from deploy/operator/".into());
+    }
+    Ok(())
+}
+
+/// Remove the operator install manifests from the cluster.
+pub(crate) fn cleanup_install_manifests(context: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let _status = Command::new("kubectl")
+        .args([
+            "delete",
+            "--context",
+            context,
+            "-f",
+            "deploy/operator/",
+            "--ignore-not-found",
+        ])
+        .status()?;
+    eprintln!("  [OK] install manifests removed");
+    Ok(())
+}
+
+/// Clean up test resources created by `verify-operator-install-rbac`.
+pub(crate) fn cleanup_install_rbac_test_resources(context: &str) -> Result<(), Box<dyn std::error::Error>> {
+    delete_namespaced_resource(
+        context,
+        "default",
+        "configmap",
+        "grid-overlay-op-e2e-rbac-net-op-e2e-rbac-gw",
+    )?;
+    delete_cluster_resource(context, "inferenceprovider", "op-e2e-rbac-prov")?;
+    delete_cluster_resource(context, "gridnetwork", "op-e2e-rbac-net")?;
+    cleanup_auto_discovered_gridsites_for_network(context, "op-e2e-rbac-net");
+    eprintln!("  [OK] stale install/RBAC test resources removed");
+    Ok(())
+}
+
+/// Container image name for the Grid operator.
+pub(crate) const OPERATOR_IMAGE: &str = "grid-operator:latest";
+
+/// Build the Grid operator container image.
+///
+/// Compiles the operator binary, copies it into a temporary build context,
+/// and runs `docker build` (or `podman build`) to produce the image.
+///
+/// # Errors
+///
+/// Returns an error if the binary build, context setup, or image build fails.
+pub(crate) fn build_operator_image() -> Result<(), Box<dyn std::error::Error>> {
+    ensure_operator_binary_built()?;
+    let ctx_dir = tempfile::tempdir()?;
+    std::fs::copy(operator_binary_path(), ctx_dir.path().join("operator"))?;
+    let engine = super::images::docker_engine();
+    let containerfile = "deploy/operator/Containerfile";
+    let ctx = ctx_dir.path().to_str().ok_or("temp dir path not UTF-8")?;
+    eprintln!("  building {OPERATOR_IMAGE} with {engine}...");
+    let status = Command::new(&engine)
+        .args(["build", "-f", containerfile, "-t", OPERATOR_IMAGE, ctx])
+        .status()?;
+    if !status.success() {
+        return Err(format!("{engine} build failed for {OPERATOR_IMAGE}").into());
+    }
+    Ok(())
+}
+
+/// Load the operator image into a Kind cluster.
+///
+/// When Podman is the container engine, `kind load docker-image` cannot
+/// access the Podman image store directly.  This function detects Podman
+/// and falls back to saving the image as a tar archive, then loading it
+/// with `kind load image-archive`.
+///
+/// # Errors
+///
+/// Returns an error if the image save or `kind load` fails.
+pub(crate) fn load_operator_image(cluster_name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let engine = super::images::docker_engine();
+    if engine == "podman" {
+        load_operator_image_podman(cluster_name)
+    } else {
+        let status = Command::new("kind")
+            .args(["load", "docker-image", OPERATOR_IMAGE, "--name", cluster_name])
+            .status()?;
+        if !status.success() {
+            return Err(format!("kind load docker-image {OPERATOR_IMAGE} failed for {cluster_name}").into());
+        }
+        Ok(())
+    }
+}
+
+/// Podman-specific image load: re-tag, save as archive, `kind load`.
+fn load_operator_image_podman(cluster_name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let qualified = format!("docker.io/library/{OPERATOR_IMAGE}");
+    let tag_status = Command::new("podman")
+        .args(["tag", OPERATOR_IMAGE, &qualified])
+        .status()?;
+    if !tag_status.success() {
+        return Err(format!("podman tag {OPERATOR_IMAGE} → {qualified} failed").into());
+    }
+    let archive = tempfile::NamedTempFile::new()?;
+    let archive_path = archive.path().to_str().ok_or("temp path not UTF-8")?;
+    let save_status = Command::new("podman")
+        .args(["save", "-o", archive_path, &qualified])
+        .status()?;
+    if !save_status.success() {
+        return Err(format!("podman save {qualified} failed").into());
+    }
+    let load_status = Command::new("kind")
+        .args(["load", "image-archive", archive_path, "--name", cluster_name])
+        .status()?;
+    if !load_status.success() {
+        return Err(format!("kind load image-archive failed for {cluster_name}").into());
+    }
+    Ok(())
+}
+
+/// Patch the `grid-operator` Deployment env vars for in-cluster testing.
+///
+/// # Errors
+///
+/// Returns an error if `kubectl set env` fails.
+pub(crate) fn patch_operator_deployment_env(context: &str, site_name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let status = Command::new("kubectl")
+        .args([
+            "--context",
+            context,
+            "set",
+            "env",
+            "deployment/grid-operator",
+            "-n",
+            "grid-system",
+            &format!("GRID_SWIM_SITE_NAME={site_name}"),
+            "GRID_SWIM_BIND_ADDR=0.0.0.0:7946",
+            "GRID_SWIM_SEEDS=",
+            "GRID_GATEWAY_ADDRESS=",
+            "RUST_LOG=info",
+        ])
+        .status()?;
+    if !status.success() {
+        return Err("kubectl set env for grid-operator deployment failed".into());
+    }
+    Ok(())
+}
+
+/// Run `kubectl auth can-i` as the `grid-operator` `ServiceAccount`.
+///
+/// Returns `true` if the action is allowed, `false` if denied.
+pub(crate) fn kubectl_auth_can_i(
+    context: &str,
+    verb: &str,
+    resource: &str,
+    namespace: Option<&str>,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let mut args = vec![
+        "auth",
+        "can-i",
+        verb,
+        resource,
+        "--context",
+        context,
+        "--as=system:serviceaccount:grid-system:grid-operator",
+    ];
+    if let Some(ns) = namespace {
+        args.push("-n");
+        args.push(ns);
+    }
+    let output = Command::new("kubectl").args(&args).output()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(stdout.trim() == "yes")
+}
+
 /// Run the `generate-crds` binary and return its stdout as a `String`.
 fn generate_crd_json() -> Result<String, Box<dyn std::error::Error>> {
     let out = Command::new("cargo")

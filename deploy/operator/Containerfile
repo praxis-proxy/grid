@@ -1,0 +1,3 @@
+FROM ubuntu:24.04
+COPY operator /usr/local/bin/operator
+ENTRYPOINT ["operator"]

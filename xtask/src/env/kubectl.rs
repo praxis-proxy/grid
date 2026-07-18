@@ -69,14 +69,29 @@ pub(crate) fn wait_for_rollout(
     deployment: &str,
     cluster: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    wait_for_rollout_ns(context, deployment, ROLLOUT_NAMESPACE, cluster)
+}
+
+/// Wait for a `Deployment` rollout in a specific namespace.
+///
+/// # Errors
+///
+/// Returns an error if the `kubectl` process cannot be spawned or if the
+/// rollout does not complete within the timeout window.
+pub(crate) fn wait_for_rollout_ns(
+    context: &str,
+    deployment: &str,
+    namespace: &str,
+    cluster: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
     let resource = format!("deployment/{deployment}");
-    eprintln!("  waiting for {deployment} in {cluster}...");
+    eprintln!("  waiting for {deployment} in {cluster} (ns={namespace})...");
     let status = Command::new("kubectl")
         .args([
             "--context",
             context,
             "-n",
-            ROLLOUT_NAMESPACE,
+            namespace,
             "rollout",
             "status",
             &resource,

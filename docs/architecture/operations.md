@@ -5,17 +5,179 @@ and routing configuration.
 
 ## 1. Deploy the Grid Operator
 
-Install CRDs and the operator Deployment. The operator
-starts its controller manager. No SWIM runtime starts
-until a `GridNetwork` resource exists.
+### Install
+
+Generate and install CRDs, then apply the operator install
+package:
 
 ```console
-kubectl apply -f grid-crds.yaml
-kubectl apply -f operator.yaml
+cargo run -p operator --bin generate_crds | kubectl apply -f -
+kubectl apply -f deploy/operator/
 ```
 
+The install package creates:
+
+| Resource | Name | Scope |
+|---|---|---|
+| `Namespace` | `grid-system` | cluster |
+| `ServiceAccount` | `grid-operator` | `grid-system` |
+| `ClusterRole` | `grid-operator-crd` | cluster |
+| `ClusterRoleBinding` | `grid-operator-crd` | cluster |
+| `ClusterRole` | `grid-operator-resources` | cluster (verb definitions only) |
+| `RoleBinding` | `grid-operator-resources` | `default` namespace |
+| `Deployment` | `grid-operator` | `grid-system` |
+
 The operator runs as a single binary with multiple
-controllers (one per CRD type) in the same process.
+controllers (one per CRD type) in the same process.  No
+SWIM runtime starts until a `GridNetwork` resource exists.
+
+The operator image must be built and loaded before the
+Deployment starts.  For Kind clusters, build the binary
+with `cargo build -p operator --bin operator`, then use
+`deploy/operator/Containerfile` to build the image and
+`kind load docker-image` to load it.  For production,
+replace the `image:` field in the Deployment with your
+registry path.
+
+### RBAC permissions
+
+RBAC is split into two `ClusterRoles`:
+
+1. **`grid-operator-crd`** — cluster-scoped CRD access,
+   bound via a `ClusterRoleBinding`.
+2. **`grid-operator-resources`** — namespaced `Secret` and
+   `ConfigMap` access, bound via per-namespace
+   `RoleBindings`.
+
+The default install includes a `RoleBinding` in the
+`default` namespace only.  All mutations use server-side
+apply (`patch`).  SSA on a non-existent resource requires
+`create` permission, so both `create` and `patch` are
+granted for `secrets` and `configmaps`.  `delete` and
+`update` are not granted.
+
+**Grid CRDs (cluster-scoped, `grid-operator-crd`):**
+
+| Resource | Verbs | Why |
+|---|---|---|
+| `gridnetworks` | `get`, `list`, `watch`, `patch` | Controller watch loop; SSA spec/status writes |
+| `gridnetworks/status` | `get`, `patch` | Phase, connectedSites, distributedProviderCount |
+| `gridsites` | `get`, `list`, `watch`, `patch` | Controller watch; auto-creation from SWIM Alive members |
+| `gridsites/status` | `get`, `patch` | Phase, reason, publicCertPem, observedGeneration |
+| `inferenceproviders` | `get`, `list`, `watch`, `patch` | Controller watch; site-selector matching |
+| `inferenceproviders/status` | `get`, `patch` | Phase, matchingSites, observedGeneration |
+
+**Core resources (namespaced, `grid-operator-resources`):**
+
+| Resource | Verbs | Why |
+|---|---|---|
+| `secrets` | `get`, `create`, `patch` | Read TLS certs, SWIM key, credential refs; SSA-create CA and site cert `Secrets` |
+| `configmaps` | `create`, `patch` | SSA-create routing overlay and consumer config `ConfigMaps` |
+
+The `grid-operator-resources` `ClusterRole` is never bound
+cluster-wide.  It takes effect only in namespaces where a
+`RoleBinding` references it.
+
+### Secret access boundaries
+
+The operator reads `Secrets` in the namespace declared by
+each `SecretRef` in the CRD spec.  It does not search
+across namespaces or list `Secrets`.
+
+| Secret path | Keys read | Keys written |
+|---|---|---|
+| `spec.tls.siteSecretRef` | `tls.crt` only (`tls.key` is never read) | `tls.crt`, `tls.key` (create-if-absent via SSA patch) |
+| `spec.tls.caSecretRef` | `ca.crt` (existence check) | `ca.crt`, `ca.key` (create-if-absent via SSA patch) |
+| `spec.tls.swimKeyRef` | `key` (or custom key field) | — |
+| `spec.auth.secretRef` | existence + UTF-8 validation | — |
+
+Secret writes use SSA `patch` with field manager
+`grid-operator`.  SSA on a non-existent resource requires
+both `create` and `patch` permission in the target
+namespace.
+
+Credential token bytes are never written to `ConfigMaps`,
+overlays, status fields, or logs.
+
+### ConfigMap write scope
+
+| `ConfigMap` | Naming | Data key | Namespace |
+|---|---|---|---|
+| Routing overlay | `grid-overlay-{network}-{gateway}` | `grid-config.json` | `GatewayRef.namespace` |
+| Consumer config | `consumerConfig.configMapName` | `praxis.yaml` | `GatewayRef.namespace` |
+
+### What is not granted
+
+Neither `ClusterRole` grants:
+
+- `events` — the operator does not emit Kubernetes Events
+- `pods`, `pods/exec`, `pods/log`, `pods/portforward`
+- `deployments`, `services`, `ingresses`
+- `secrets` `delete`, `list`, `watch`
+- `configmaps` `get`, `delete`, `list`, `watch`
+- Any `update` verb (all mutations use SSA `patch`)
+
+### Adding namespaces
+
+The default install grants `Secret` and `ConfigMap` access
+only in the `default` namespace.  To grant access in
+additional namespaces (e.g. the gateway namespace
+referenced by `GatewayRef`, or the namespace holding TLS
+`Secrets`), create a `RoleBinding` in each:
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: grid-operator-resources
+  namespace: praxis-system          # the target namespace
+subjects:
+  - kind: ServiceAccount
+    name: grid-operator
+    namespace: grid-system
+roleRef:
+  kind: ClusterRole
+  name: grid-operator-resources
+  apiGroup: rbac.authorization.k8s.io
+```
+
+Add one `RoleBinding` per namespace referenced by
+`GatewayRef.namespace`, `tls.caSecretRef.namespace`,
+`tls.siteSecretRef.namespace`, `tls.swimKeyRef.namespace`,
+and `auth.secretRef.namespace` in your CRD specs.
+
+### Deployment configuration
+
+The `Deployment` in `deploy/operator/deployment.yaml`
+exposes SWIM configuration through environment variables:
+
+| Variable | Purpose |
+|---|---|
+| `GRID_SWIM_BIND_ADDR` | UDP address to bind the SWIM listener |
+| `GRID_SWIM_ADVERTISE_ADDR` | Address advertised to peers (defaults to `$(POD_IP):7946`) |
+| `GRID_SWIM_SITE_NAME` | Unique site identity for this operator instance |
+| `GRID_SWIM_SEEDS` | Comma-separated SWIM seed addresses |
+| `GRID_GATEWAY_ADDRESS` | Gateway address for site discovery |
+
+`GRID_SWIM_ENCRYPT_KEY` is intentionally omitted from the
+`Deployment`.  Production SWIM encryption uses
+`GridNetwork.spec.tls.swimKeyRef` to reference a
+Kubernetes `Secret`.  The env var exists for local
+development and testing only.
+
+### Validate the install
+
+```console
+cargo xtask env verify-operator-install-rbac \
+  -c tests/env/operator-routing.toml
+```
+
+This command builds the operator image, loads it into a
+Kind cluster, applies the install manifests, runs positive
+and negative `kubectl auth can-i` checks (including
+namespace-scoped boundary proofs), then waits for the
+in-cluster `Deployment` to reconcile a test `GridNetwork`
+using only the installed `ServiceAccount`.
 
 ## 2. Create a GridNetwork
 
@@ -538,55 +700,17 @@ separate steps.
 
 **RBAC for GridSite status updates**
 
-The `GridSite` and `GridNetwork` controllers both write to `GridSite` status.  The operator's
-`ClusterRole` must include:
+The `GridSite` and `GridNetwork` controllers both write to `GridSite` status.
+The `grid-operator-crd` `ClusterRole` in `deploy/operator/cluster-role-crd.yaml`
+includes `gridsites/status` with verbs `get` and `patch`.
 
-```yaml
-- apiGroups: ["grid.praxis-proxy.io"]
-  resources: ["gridsites/status"]
-  verbs: ["get", "patch", "update"]
-```
-
-## Consumer Config RBAC
+## Consumer Config
 
 When `GatewayRef.consumerConfig.enabled: true`, the Grid operator applies a
-`ConfigMap` in the gateway's namespace on every reconcile.  The operator's
-`ServiceAccount` requires the following permissions for each gateway namespace
-used with consumer config:
-
-```yaml
-# ClusterRole (or Role scoped to the target namespace)
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
-metadata:
-  name: grid-operator-consumer-config
-rules:
-  - apiGroups: [""]
-    resources: ["configmaps"]
-    verbs: ["get", "create", "update", "patch"]
-```
-
-Bind this role to the operator's `ServiceAccount` in each namespace where
-consumer gateways reside:
-
-```yaml
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: grid-operator-consumer-config
-  namespace: praxis-system          # the gateway namespace
-subjects:
-  - kind: ServiceAccount
-    name: grid-operator
-    namespace: grid-system          # the operator namespace
-roleRef:
-  kind: ClusterRole
-  apiGroup: rbac.authorization.k8s.io
-  name: grid-operator-consumer-config
-```
-
-If the gateway namespace is the same as the operator namespace, an existing
-`Role` / `RoleBinding` may already cover this.
+`ConfigMap` in the gateway's namespace on every reconcile.  The
+`grid-operator-resources` `ClusterRole` includes `configmaps` with verbs
+`create` and `patch`.  A `RoleBinding` in the gateway's namespace is required
+for the operator `ServiceAccount` to write the `ConfigMap` there.
 
 ### Credential Secret access
 
@@ -673,6 +797,7 @@ Available commands:
 | `cargo xtask env verify-api-fallback-native` | Verifies native `grid_route` → `grid_credential_inject` credential injection with token bytes absent from overlay and consumer ConfigMap |
 | `cargo xtask env verify-stale-gc-ttl` | Verifies `GridNetwork.spec.staleCandidateTtlSeconds` evicts stale remote candidates from the rendered overlay |
 | `cargo xtask env verify-crd-schema` | Verifies required generated CRD schema fields without requiring kind clusters |
+| `cargo xtask env verify-operator-install-rbac` | Applies install manifests, runs positive/negative RBAC checks, proves minimal reconcile succeeds |
 | `cargo xtask env validate-all` | Runs the local validation suite and prints a Markdown result table |
 
 ### Operator and SWIM local validation

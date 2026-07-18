@@ -26,7 +26,7 @@ credential handling, and backend proxying.
 cargo xtask env validate-operator-routing -c tests/env/operator-routing.toml
 
 # Validate two-provider model routing through the llm-d-compatible gateway path
-cargo xtask env verify-demo1-llmd-routing -c tests/env/operator-routing-two-provider.toml
+cargo xtask env verify-llmd-compatible-routing -c tests/env/operator-routing-two-provider.toml
 
 # Validate full-grid routing across local, remote, cloud mock, and API mock
 cargo xtask env verify-full-grid-routing -c tests/env/operator-routing-two-provider.toml

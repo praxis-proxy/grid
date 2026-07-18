@@ -197,7 +197,7 @@ fn build_mock_epp_image(engine: &str, build_ctx: &Path, ai_repo: &Path) -> Resul
 }
 
 /// Detect Docker or Podman.
-fn docker_engine() -> String {
+pub(crate) fn docker_engine() -> String {
     if Command::new("podman")
         .arg("--version")
         .output()
