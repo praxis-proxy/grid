@@ -2,41 +2,72 @@
 
 ## Authentication Strategies
 
-Each provider declares how consumers authenticate.
-Praxis performs request-time credential injection from gateway configuration.
-Grid's implemented bearer-token path projects credential references into the
-routing overlay, then uses a gateway-side `grid_credential_inject` filter to read
-the selected token from a mounted Kubernetes Secret file.
+Authentication here means provider authentication: how the gateway or provider
+component that makes the final upstream call authenticates to the selected
+backend after routing has chosen a candidate.  It does not replace or rewrite
+credentials on the inbound client request.
 
-| Strategy | Header | Lifecycle | Used By |
-|----------|--------|-----------|---------|
-| `bearer_token` | `Authorization: Bearer X` | Static from mounted Secret file | OpenAI, Mistral |
-| `api_key` | Custom (e.g. `x-api-key`) | Static Secret extension point | Anthropic |
-| `sigv4` | `Authorization: AWS4-HMAC-SHA256...` | Per-request compute extension point | Bedrock |
-| `oauth2` | `Authorization: Bearer <token>` | Refresh-on-expiry extension point | Vertex, Azure |
-| `mtls_only` | None (cert-based) | Grid cert lifecycle | Grid-internal |
-| `service_account` | `Authorization: Bearer <SA>` | Kubernetes service-account extension point | In-cluster |
-| `custom` | User-configured | Static Secret extension point | Fallback |
+The implemented native path is `bearer_token`:
 
-> **Implementation note:** `bearer_token` is the current native data-plane path.
-> `api_key`, `custom`, `service_account`, SigV4 per-request signing, and OAuth2
-> refresh are extension points that are not implemented in the current operator
-> and gateway filter pipeline.
+1. A provider Secret contains the provider token.
+2. `InferenceProvider.spec.auth.secretRef` points at that Secret.
+3. The Grid Operator validates the Secret reference.
+4. Grid writes only the Secret reference into the routing overlay.
+5. The egress gateway mounts the Secret as a file.
+6. After `grid_route` selects a provider candidate, Praxis runs
+   `grid_credential_inject`, reads the selected token file, and injects
+   `Authorization: Bearer <token>` on the outbound provider request.
 
-## Current implementation boundary
+Provider tokens are never written into Grid status, routing overlays, or
+consumer gateway `ConfigMap`s.
 
-Grid's desired ownership model is:
+**Implementation status:** the Grid-side contract is implemented: the operator
+validates `secretRef`, projects only the reference into `grid-config.json`, and
+can render consumer Praxis config with file-backed credential references.  The
+request-time filter is the Praxis AI `grid_credential_inject` filter.  Runtime
+deployments must use a Praxis AI image that includes that filter; until that
+work is merged and published in Praxis AI, the native path is validated with the
+branch image used by the Kind harness.
+
+| Strategy | Status | Request-time behavior |
+|----------|--------|-----------------------|
+| `bearer_token` | Implemented native path | Praxis reads a mounted Secret file and injects `Authorization: Bearer <token>` on the outbound provider request. |
+| `api_key` | Extension point | Static Secret-backed header injection when implemented. |
+| `custom` | Extension point | User-configured Secret-backed injection when implemented. |
+| `service_account` | Extension point | Kubernetes service-account token injection when implemented. |
+| `sigv4` | Extension point | Per-request signing when implemented. |
+| `oauth2` | Extension point | Refresh-on-expiry token handling when implemented. |
+| `mtls_only` | Extension point | No HTTP credential injection; authentication is certificate-based. |
+
+## Implemented request path
+
+The request path is:
 
 1. Users or external secret managers create provider credentials.
 2. Kubernetes Secrets store those credentials.
 3. `InferenceProvider.spec.auth.secretRef` points at the Secret.
 4. The Grid Operator validates the Secret and projects only the credential
    reference into the routing overlay.
-5. The consumer gateway config maps that reference to a mounted Secret file.
+5. The gateway config maps that reference to a mounted Secret file at the
+   deployment point allowed to call the backend.
 6. Praxis injects the provider credential at request time after `grid_route`
    selects the credential-bearing candidate.
 
-### What the controller now owns (controller-owned credential validation, resolver groundwork, and reference projection)
+Credential placement follows the final-hop rule:
+
+| Route shape | Where the credential lives | Where injection happens |
+|---|---|---|
+| Direct API or cloud fallback from the ingress gateway | Secret mounted into that ingress/egress gateway pod | The same gateway injects or signs before calling the provider API. |
+| Remote Grid site reached over gateway-to-gateway mTLS | Secret mounted only in the remote provider site or provider-side component | The provider-side egress component injects before calling its local backend, if that backend needs a provider credential. |
+| Local self-hosted backend with no provider API credential | No provider token required | No HTTP credential injection; mTLS or local network policy handles gateway/backend trust. |
+
+In this document, **ingress gateway** means the Praxis gateway receiving the
+workload request.  **Egress gateway** means the Praxis gateway or provider-side
+component that makes the final outbound call to the backend.  For direct
+API-provider or cloud-provider fallback, the same gateway can be both ingress
+and egress.
+
+### Controller behavior
 
 The `InferenceProvider` controller validates credentials during every reconcile:
 
@@ -62,7 +93,7 @@ The `InferenceProvider` controller validates credentials during every reconcile:
   operator-produced `grid-config.json` ConfigMap.
 
 The xtask `verify-api-fallback` and `verify-api-fallback-native` test suites
-prove the data-plane side:
+prove the data-plane side for the direct API-provider fallback path:
 
 - **Static header injection (`verify-api-fallback`)**: xtask reads the
   credential reference from the operator overlay, resolves the token from the
@@ -77,9 +108,9 @@ prove the data-plane side:
   Kubernetes Secret.  The token does not appear in the operator overlay JSON,
   in `grid_route` candidates, or in the consumer Praxis `ConfigMap`.
 
-Both paths prove the operator→overlay→consumer routing chain.  The native path
-is the target architecture; static header injection is kept for regression
-comparison while the xtask bridge still exists.
+Both paths prove the operator-to-overlay-to-gateway routing chain for a direct
+API-provider route.  The native path is the target architecture; static header
+injection is kept for regression comparison while the xtask bridge still exists.
 
 ### Supplying provider tokens
 
@@ -121,18 +152,23 @@ The difference is where the resolved token lands:
 - **Native credential injection** mounts the Secret into the consumer pod and
   writes only a `file:` reference into the consumer Praxis `ConfigMap`.
 
-### Production boundaries
+### Secret placement and production responsibilities
 
 The native injection path keeps credential bytes out of Grid resources and
 consumer gateway `ConfigMap`s. Production deployments still need explicit
 ownership for credential Secret placement and rotation:
 
-- **Consumer-cluster Secret lifecycle**: the token lives in a Kubernetes Secret
-  mounted into the consumer gateway pod.  The Secret can be created by users,
-  platform automation, or an external secret manager.
+- **Egress Secret lifecycle**: the token lives in a Kubernetes Secret mounted
+  into the gateway or provider-side component that is authorized to make the
+  final backend call.  The Secret can be created by users, platform automation,
+  or an external secret manager.
 - **Operator-owned consumer config generation**: `GatewayRef.consumerConfig`
   can render the consumer Praxis `ConfigMap` from routing overlay data,
-  including `grid_credential_inject` file references.
+  including `grid_credential_inject` file references for direct API-provider
+  routes.
+- **Cross-cluster delivery**: Grid does not copy Secrets across clusters.
+  GitOps, External Secrets, Vault, or another platform mechanism must place the
+  Secret in the cluster where the egress component runs.
 
 See [Consumer Config](consumer-config.md) for the current operator-generated
 config shape.
@@ -153,8 +189,8 @@ and the user manages authentication externally.
 ### Credential Lifecycle
 
 For the current static `bearer_token` strategy, the
-credential value is mounted into the consumer gateway
-pod as a Kubernetes Secret file.  `grid_credential_inject`
+credential value is mounted into the egress gateway or
+provider-side component as a Kubernetes Secret file.  `grid_credential_inject`
 reads that file at filter construction time and injects
 `Authorization: Bearer <token>` after `grid_route`
 selects a credential-bearing candidate.
@@ -162,12 +198,13 @@ selects a credential-bearing candidate.
 Static `api_key` and `custom` strategies use the same file-backed injection
 seam when implemented.
 
-For dynamic strategies (`sigv4`, `oauth2`), the Grid
-Operator manages the credential lifecycle when those strategies are implemented:
-- `sigv4`: SigV4 signature computed per-request by
-  Praxis using AWS credentials from a Secret
-- `oauth2`: Token refreshed before expiry by the
-  operator, cached, and injected by Praxis
+Dynamic strategies (`sigv4`, `oauth2`) are extension points and need explicit
+ownership decisions before implementation:
+
+- `sigv4`: per-request signing by Praxis or a provider adapter using AWS
+  credentials from a Secret.
+- `oauth2`: refresh-on-expiry token handling by the operator, gateway, or an
+  external credential manager.
 
 ## Access Policy
 
@@ -341,7 +378,7 @@ validation.
 
 Authorization answers: "is this authenticated peer allowed to participate in
 this Grid or carry this traffic?"  Grid policy and gateway trust configuration
-decide that boundary.
+make that decision.
 
 SWIM discovery is neither authentication nor authorization.  A peer discovered
 through gossip must not become routable solely because it is alive.  The control

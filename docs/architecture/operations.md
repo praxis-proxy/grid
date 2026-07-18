@@ -31,13 +31,75 @@ The operator runs as a single binary with multiple
 controllers (one per CRD type) in the same process.  No
 SWIM runtime starts until a `GridNetwork` resource exists.
 
-The operator image must be built and loaded before the
-Deployment starts.  For Kind clusters, build the binary
-with `cargo build -p operator --bin operator`, then use
-`deploy/operator/Containerfile` to build the image and
-`kind load docker-image` to load it.  For production,
-replace the `image:` field in the Deployment with your
-registry path.
+### Operator image
+
+The reserved operator image path is:
+
+```
+ghcr.io/praxis-proxy/grid-operator
+```
+
+This image is not published yet.  The CI workflow builds the
+image for validation, but the GHCR push steps are disabled
+until package ownership and repository permissions are
+configured for `ghcr.io/praxis-proxy`.
+
+**Tag policy:**
+
+| Tag | Mutability | When pushed |
+|---|---|---|
+| `sha-<7-char-commit>` | Immutable | Used once publishing is enabled |
+| `latest` | Mutable | Convenience tag once publishing is enabled |
+
+Production deployments should pin an immutable SHA tag:
+
+```yaml
+image: ghcr.io/praxis-proxy/grid-operator:sha-4a4c064
+```
+
+**Override:** replace the `image:` field in
+`deploy/operator/deployment.yaml` or patch the
+Deployment after apply:
+
+```console
+kubectl set image deployment/grid-operator \
+  -n grid-system \
+  operator=ghcr.io/praxis-proxy/grid-operator:sha-<commit>
+```
+
+**Local Kind clusters:** the xtask validation harness
+builds `grid-operator:latest` from
+`deploy/operator/Containerfile` and loads it into Kind
+directly.  No registry pull is needed for local
+validation:
+
+```console
+cargo xtask env verify-operator-install-rbac \
+  -c tests/env/operator-routing-multisite.toml
+```
+
+Or build the image manually:
+
+```console
+make operator-image
+kind load docker-image grid-operator:latest --name <cluster>
+```
+
+**Registry namespace:** the image path is reserved under
+`ghcr.io/praxis-proxy/`.
+
+**CI publishing setup:** the
+`.github/workflows/operator-image.yaml` workflow builds
+the image but does not publish it yet.  Enable the
+commented GHCR login and push steps only after repository
+or organization package settings allow this workflow to
+create and update `ghcr.io/praxis-proxy/grid-operator`.
+
+**Security:** the operator image contains only the
+statically linked operator binary.  No secrets, tokens,
+SWIM encryption keys, or credentials are baked into the
+image.  SBOM generation and image signing are not yet
+implemented.
 
 ### RBAC permissions
 
@@ -78,7 +140,7 @@ The `grid-operator-resources` `ClusterRole` is never bound
 cluster-wide.  It takes effect only in namespaces where a
 `RoleBinding` references it.
 
-### Secret access boundaries
+### Secret access rules
 
 The operator reads `Secrets` in the namespace declared by
 each `SecretRef` in the CRD spec.  It does not search
@@ -175,7 +237,7 @@ cargo xtask env verify-operator-install-rbac \
 This command builds the operator image, loads it into a
 Kind cluster, applies the install manifests, runs positive
 and negative `kubectl auth can-i` checks (including
-namespace-scoped boundary proofs), then waits for the
+namespace-scope proofs), then waits for the
 in-cluster `Deployment` to reconcile a test `GridNetwork`
 using only the installed `ServiceAccount`.
 
@@ -396,7 +458,7 @@ The trust bootstrap for a remote site progresses through these steps:
 A peer must satisfy both.  A SWIM peer must never become routable solely because
 it gossiped successfully.
 
-### Security boundary
+### Security rules
 
 - SWIM membership is discovery, not authorization.
 - TCP reachability proves an address accepts connections, not identity.
@@ -563,6 +625,20 @@ load_balancer
 The token is not stored in the Grid overlay or consumer
 Praxis `ConfigMap`.
 
+For direct API-provider and cloud-provider fallback, the
+consumer gateway is also the egress gateway, so the
+credential Secret is mounted there.  For remote Grid sites,
+provider credentials should live only in the remote provider
+site or provider-side component that makes the final backend
+call.  Grid carries the reference needed for routing and
+configuration; it does not copy Secret values between
+clusters.
+
+The native path requires a Praxis AI image that includes the
+`grid_credential_inject` filter.  Grid can render the
+file-backed filter config today, but runtime deployments must
+use an AI image with that filter merged and published.
+
 See [Auth & Policy](auth.md) for workload access
 patterns and authentication strategies.
 
@@ -589,7 +665,7 @@ A `Connecting` site with a non-empty `publicCertPem` and a reachable gateway
 A site in `TrustMaterialMissing` has a reachable gateway but no certificate.
 Configure `spec.tls.siteSecretRef` on the remote `GridNetwork` to enable certificate advertisement.
 
-### Security boundary
+### Security rules
 
 The public certificate recorded in `status.publicCertPem` is **not** automatically
 trusted.  The control plane records received trust material for operator visibility.
@@ -718,10 +794,10 @@ The generated `ConfigMap` references credential Secrets by name, namespace, and
 key — it does not read Secret values.  The operator does NOT require `get` access
 to credential Secrets in the gateway namespace for config generation.
 
-The consumer gateway pod needs the credential Secret mounted.  Secret provisioning
-in the consumer cluster is the responsibility of external tooling (platform
-automation, External Secrets, Vault, or a manual process).  The Grid operator does
-not copy Secrets across clusters.
+The gateway or provider-side component making the final backend call needs the
+credential Secret mounted.  Secret provisioning in that cluster is the
+responsibility of external tooling (platform automation, External Secrets, Vault,
+or a manual process).  The Grid operator does not copy Secrets across clusters.
 
 ### Cross-cluster limitations
 
@@ -796,6 +872,7 @@ Available commands:
 | `cargo xtask env verify-mtls-trust` | Verifies provider gateway mTLS enforcement (positive + negative cases) |
 | `cargo xtask env verify-api-fallback-native` | Verifies native `grid_route` → `grid_credential_inject` credential injection with token bytes absent from overlay and consumer ConfigMap |
 | `cargo xtask env verify-stale-gc-ttl` | Verifies `GridNetwork.spec.staleCandidateTtlSeconds` evicts stale remote candidates from the rendered overlay |
+| `cargo xtask env verify-responses-routing` | Verifies `/v1/responses` routing through `openai_responses_format` filter chain |
 | `cargo xtask env verify-crd-schema` | Verifies required generated CRD schema fields without requiring kind clusters |
 | `cargo xtask env verify-operator-install-rbac` | Applies install manifests, runs positive/negative RBAC checks, proves minimal reconcile succeeds |
 | `cargo xtask env validate-all` | Runs the local validation suite and prints a Markdown result table |
@@ -924,7 +1001,7 @@ node A (no seeds), node B (seeds A), and node C (seeds B only — not A).  It pr
 
 4. **Cross-network isolation** — A wrong-network `GridNetwork` and `InferenceProvider`
    are applied alongside the main network.  The wrong-network model is confirmed absent
-   from A's correct-network overlay, proving providers cannot cross network boundaries.
+   from A's correct-network overlay, proving providers cannot cross network scopes.
 
 This validation proves that SWIM gossip alone is not sufficient for routing; explicit
 `Active` phase assignment is required.
@@ -1048,6 +1125,7 @@ repository.
 
 - [HashiCorp memberlist](https://github.com/hashicorp/memberlist) — reference
   design for SWIM-style membership, gossip transport encryption, key rotation,
-  and join/admission behavior. Grid uses foca rather than memberlist; the
-  memberlist model is used only as an architectural reference for control-plane
+  and join/admission behavior. Grid uses foca rather than memberlist; foca used
+  the Go-based memberlist implementation as a reference architecture, and Grid
+  uses memberlist the same way: as an architectural reference for control-plane
   gossip hardening.

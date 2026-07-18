@@ -320,6 +320,50 @@ pub(crate) fn deploy_consumer(
     Ok(())
 }
 
+/// Deploy the consumer gateway with `openai_responses_format` filter chain.
+///
+/// Identical to [`deploy_consumer`] except the generated config uses
+/// [`responses_consumer_gateway_config`], which replaces `json_body_field`
+/// with `openai_responses_format` for `/v1/responses` traffic.
+pub(crate) fn deploy_consumer_for_responses(
+    cfg: &EnvConfig,
+    overlay_config: Option<&Path>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let consumer_site = cfg
+        .consumer_cluster_name()
+        .ok_or("no consumer cluster configured in environment config")?;
+    let consumer_ctx = kubectl_context(consumer_site);
+    eprintln!("  deploying responses consumer gateway to {consumer_ctx}...");
+
+    let overlay = overlay_config.map(read_overlay_file).transpose()?;
+
+    let provider_endpoints = collect_provider_endpoints(cfg)?;
+    if provider_endpoints.is_empty() {
+        return Err("no provider gateway endpoints found".into());
+    }
+
+    let filtered_overlay = if let Some(o) = &overlay {
+        Some(filter_overlay_for_local_providers(o, &provider_endpoints)?)
+    } else {
+        None
+    };
+
+    create_consumer_tls_secret(&consumer_ctx, consumer_site)?;
+    apply_consumer_responses_config(
+        &consumer_ctx,
+        consumer_site,
+        &provider_endpoints,
+        filtered_overlay.as_ref().or(overlay.as_ref()),
+    )?;
+    apply_consumer_deployment(&consumer_ctx)?;
+    rollout_restart(&consumer_ctx, "praxis-consumer")?;
+
+    kubectl::wait_for_rollout(&consumer_ctx, "praxis-consumer", consumer_site)?;
+
+    eprintln!("  [PASS] responses consumer gateway ready in {consumer_ctx}");
+    Ok(())
+}
+
 /// Read and parse a routing overlay JSON file.
 ///
 /// # Errors
@@ -571,6 +615,31 @@ fn apply_consumer_config(
     kubectl::apply_manifest(context, &yaml)
 }
 
+/// Apply the Responses-aware consumer gateway config as a `ConfigMap`.
+///
+/// Uses [`responses_consumer_gateway_config`] which starts the filter chain
+/// with `openai_responses_format` instead of `json_body_field`.
+fn apply_consumer_responses_config(
+    context: &str,
+    consumer_site: &str,
+    providers: &[ProviderEndpoint],
+    overlay: Option<&RoutingOverlay>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config = responses_consumer_gateway_config(consumer_site, providers, overlay);
+    let yaml = format!(
+        "apiVersion: v1\n\
+         kind: ConfigMap\n\
+         metadata:\n\
+         \x20 name: praxis-consumer-config\n\
+         \x20 namespace: {NAMESPACE}\n\
+         data:\n\
+         \x20 praxis.yaml: |\n\
+         {}\n",
+        indent_yaml(&config, 4)
+    );
+    kubectl::apply_manifest(context, &yaml)
+}
+
 /// Build the consumer Praxis config YAML.
 ///
 /// When `overlay` is `Some`, candidates are taken from the overlay;
@@ -615,6 +684,55 @@ fn consumer_gateway_config(
          \x20     - filter: json_body_field\n\
          \x20       field: model\n\
          \x20       header: X-Model\n\
+         \x20     - filter: grid_route\n\
+         \x20       local_site: {local_site}\n\
+         \x20       model_header: X-Model\n\
+         \x20       candidates:\n\
+         {candidates}\n\
+         \x20     - filter: load_balancer\n\
+         \x20       clusters:\n\
+         {clusters}\n\
+         admin:\n\
+         \x20 address: \"127.0.0.1:9901\"\n\
+         shutdown_timeout_secs: 5\n"
+    )
+}
+
+/// Consumer gateway config with `openai_responses_format` for model extraction.
+///
+/// Identical to [`consumer_gateway_config`] except the filter chain starts
+/// with `openai_responses_format` (which parses Responses API request bodies
+/// and promotes the model to `X-Model`) instead of the generic
+/// `json_body_field` filter.  This is the correct chain for consumers that
+/// accept `/v1/responses` traffic.
+///
+/// `grid_route` reads the model from `X-Model` exactly as before.
+#[expect(clippy::too_many_lines, reason = "Praxis config YAML generation")]
+fn responses_consumer_gateway_config(
+    consumer_site: &str,
+    providers: &[ProviderEndpoint],
+    overlay: Option<&RoutingOverlay>,
+) -> String {
+    let candidates = if let Some(o) = overlay {
+        operator_overlay::candidates_yaml(o)
+    } else {
+        build_grid_route_candidates(providers)
+    };
+    let local_site = consumer_site;
+    let clusters = build_clusters(providers);
+    format!(
+        "listeners:\n\
+         \x20 - name: public\n\
+         \x20   address: \"0.0.0.0:{GATEWAY_HTTP_PORT}\"\n\
+         \x20   filter_chains:\n\
+         \x20     - consumer-responses-chain\n\
+         filter_chains:\n\
+         \x20 - name: consumer-responses-chain\n\
+         \x20   filters:\n\
+         \x20     - filter: openai_responses_format\n\
+         \x20       on_invalid: continue\n\
+         \x20       headers:\n\
+         \x20         model: X-Model\n\
          \x20     - filter: grid_route\n\
          \x20       local_site: {local_site}\n\
          \x20       model_header: X-Model\n\
@@ -1685,6 +1803,173 @@ pub(crate) fn send_consumer_request(port: u16, model: &str) -> Result<HttpRespon
     parse_curl_output(&String::from_utf8(output.stdout)?)
 }
 
+/// Send a Responses API request to the consumer gateway.
+///
+/// Posts a `/v1/responses` body with `model` and `input` fields.
+/// The `openai_responses_format` filter extracts the model from the body and
+/// promotes it to the `X-Model` header for `grid_route`.
+pub(crate) fn send_responses_request(port: u16, model: &str) -> Result<HttpResponse, Box<dyn std::error::Error>> {
+    let url = format!("http://127.0.0.1:{port}/v1/responses");
+    let body = format!(r#"{{"model":"{model}","input":"hello"}}"#);
+    let output = Command::new("curl")
+        .args([
+            "-s",
+            "-w",
+            "\n%{http_code}",
+            "--connect-timeout",
+            "5",
+            "--max-time",
+            "15",
+            "-X",
+            "POST",
+            "-H",
+            "Authorization: Bearer dummy-key",
+            "-H",
+            "Content-Type: application/json",
+            "-d",
+            &body,
+            &url,
+        ])
+        .output()?;
+    parse_curl_output(&String::from_utf8(output.stdout)?)
+}
+
+/// Validate a Responses API body returned through the consumer gateway.
+fn validate_responses_json(body: &str) -> Result<(), String> {
+    let json = serde_json::from_str::<serde_json::Value>(body).map_err(|e| format!("not valid JSON: {e}"))?;
+    let is_response_obj = json.get("object").and_then(serde_json::Value::as_str) == Some("response");
+    let is_completed = json.get("status").and_then(serde_json::Value::as_str) == Some("completed");
+    let has_output = json
+        .get("output")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|output| !output.is_empty());
+    let has_choices = json.get("choices").is_some();
+
+    if is_response_obj && is_completed && has_output && !has_choices {
+        Ok(())
+    } else {
+        Err(format!(
+            "invalid Responses body (object={is_response_obj}, status={is_completed}, \
+             output={has_output}, choices={has_choices})"
+        ))
+    }
+}
+
+/// Verify end-to-end routing for `/v1/responses` through the consumer gateway.
+///
+/// Like [`verify_e2e`] but sends Responses API requests.  Asserts:
+/// - Consumer gateway is reachable via port-forward.
+/// - Each configured model returns HTTP 200 with a valid Responses body.
+/// - An unknown model fails cleanly (404 or 503).
+#[expect(
+    clippy::too_many_lines,
+    reason = "port-forward setup + per-model assertions + negative case"
+)]
+pub(crate) fn verify_responses_e2e(cfg: &EnvConfig) -> Result<(), Box<dyn std::error::Error>> {
+    let consumer_site = cfg
+        .consumer_cluster_name()
+        .ok_or("no consumer cluster configured in environment config")?;
+    let mut tally = Tally::default();
+    let ctx = kubectl_context(consumer_site);
+
+    let port = find_free_port()?;
+    let mut pf = PortForwardGuard::start(&ctx, "praxis-consumer", port, GATEWAY_HTTP_PORT)?;
+
+    if !wait_for_port(port) {
+        tally.fail(consumer_site, "consumer gateway reachable via port-forward", &ctx);
+        pf.stop();
+        return tally.print_summary();
+    }
+    tally.pass(consumer_site, "consumer gateway reachable via port-forward");
+
+    for name in &cfg.clusters.names {
+        let Some(def) = cfg.clusters.definitions.get(name) else {
+            continue;
+        };
+        if def.role != ClusterRole::Provider {
+            continue;
+        }
+        for model in &def.models {
+            verify_responses_model(&ctx, port, name, model, consumer_site, &mut tally);
+        }
+    }
+
+    match send_responses_request(port, "nonexistent-model-xyz") {
+        Ok(resp) if resp.status == 404 || resp.status == 503 => {
+            tally.pass(consumer_site, "unknown model fails cleanly via responses path");
+        },
+        Ok(resp) => {
+            tally.fail(
+                consumer_site,
+                &format!("unknown model returned {} (expected 404 or 503)", resp.status),
+                &ctx,
+            );
+        },
+        Err(e) => {
+            tally.fail(consumer_site, &format!("unknown model request failed: {e}"), &ctx);
+        },
+    }
+
+    pf.stop();
+    tally.print_summary()
+}
+
+/// Verify a single model routes correctly via the `/v1/responses` path.
+#[expect(clippy::too_many_lines, reason = "per-model assertion chain")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "all args are distinct non-groupable identifiers"
+)]
+fn verify_responses_model(
+    context: &str,
+    port: u16,
+    provider: &str,
+    model: &str,
+    consumer_site: &str,
+    tally: &mut Tally,
+) {
+    match send_responses_request(port, model) {
+        Ok(resp) if resp.status == 200 => {
+            tally.pass(
+                consumer_site,
+                &format!("model {model} (from {provider}) returns 200 via responses path"),
+            );
+            match validate_responses_json(&resp.body) {
+                Ok(()) => tally.pass(
+                    consumer_site,
+                    &format!("model {model} response is valid Responses API JSON"),
+                ),
+                Err(e) => {
+                    let excerpt = safe_truncate(&resp.body, 200);
+                    tally.fail(
+                        consumer_site,
+                        &format!("model {model} response invalid: {e}\n         body: {excerpt}"),
+                        context,
+                    );
+                },
+            }
+        },
+        Ok(resp) => {
+            let excerpt = safe_truncate(&resp.body, 200);
+            tally.fail(
+                consumer_site,
+                &format!(
+                    "model {model} returned {} (expected 200)\n         body: {excerpt}",
+                    resp.status
+                ),
+                context,
+            );
+        },
+        Err(e) => {
+            tally.fail(
+                consumer_site,
+                &format!("model {model} request via responses path failed: {e}"),
+                context,
+            );
+        },
+    }
+}
+
 /// Send a Chat Completions request without any `Authorization` header.
 ///
 /// Used in the credential-injection proof to show that when the client does
@@ -1851,11 +2136,9 @@ fn rollout_restart_args(context: &str, deployment: &str) -> Vec<String> {
 /// this after applying the consumer config ensures the pod reloads with the
 /// new configuration before [`kubectl::wait_for_rollout`] declares it ready.
 ///
-/// **xtask validation concern only.**  In production, Praxis detects
-/// `ConfigMap` mount changes via a file-watch and reloads without a pod
-/// restart.  The forced restart here is needed only because the file-watch
-/// propagation window is indeterminate during xtask E2E validation — without
-/// it, the verify step can race against a Praxis reload that hasn't finished.
+/// **xtask validation concern only.**  Production deployments are responsible
+/// for a gateway reload or restart strategy when generated config changes.  The
+/// forced restart here keeps xtask E2E validation deterministic.
 fn rollout_restart(context: &str, deployment: &str) -> Result<(), Box<dyn std::error::Error>> {
     let status = Command::new("kubectl")
         .args(rollout_restart_args(context, deployment))
@@ -1964,6 +2247,68 @@ mod tests {
         assert!(
             config.contains("filter: load_balancer"),
             "load_balancer filter must be present"
+        );
+    }
+
+    #[test]
+    fn responses_config_uses_responses_format_before_grid_route() {
+        let providers = vec![make_provider("site-a", &["model"])];
+        let config = responses_consumer_gateway_config("consumer", &providers, None);
+        let responses_pos = config.find("filter: openai_responses_format");
+        let route_pos = config.find("filter: grid_route");
+        assert!(
+            responses_pos.is_some(),
+            "responses config must include openai_responses_format"
+        );
+        assert!(route_pos.is_some(), "responses config must include grid_route");
+        assert!(
+            matches!((responses_pos, route_pos), (Some(responses), Some(route)) if responses < route),
+            "openai_responses_format must run before grid_route"
+        );
+        assert!(
+            config.contains("model: X-Model") && config.contains("model_header: X-Model"),
+            "responses format and grid_route must agree on the model header"
+        );
+        assert!(
+            !config.contains("filter: grid_credential_inject"),
+            "plain responses routing config must not imply credential injection"
+        );
+    }
+
+    #[test]
+    fn validate_responses_json_accepts_completed_response() {
+        let body = r#"{
+            "object": "response",
+            "status": "completed",
+            "model": "model-a",
+            "output": [{"type": "message", "content": []}]
+        }"#;
+        assert!(validate_responses_json(body).is_ok(), "valid Responses body must pass");
+    }
+
+    #[test]
+    fn validate_responses_json_rejects_invalid_json() {
+        assert!(
+            validate_responses_json("{not json").is_err(),
+            "invalid JSON must fail Responses validation"
+        );
+    }
+
+    #[test]
+    fn validate_responses_json_rejects_chat_completions_shape() {
+        let body = r#"{"choices": [], "model": "model-a"}"#;
+        assert!(
+            validate_responses_json(body).is_err(),
+            "Chat Completions response must fail Responses validation"
+        );
+    }
+
+    #[test]
+    fn validate_responses_json_rejects_empty_output() {
+        let body = r#"{"object": "response", "status": "completed", "output": [], "model": "model-a"}"#;
+        assert!(
+            validate_responses_json(body).is_err(),
+            "empty Responses output must fail validation"
         );
     }
 

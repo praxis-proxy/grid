@@ -121,6 +121,7 @@ fn deploy_provider(name: &str, def: &ClusterDef) -> Result<(), Box<dyn std::erro
     apply_mock_epp(&ctx, name, def)?;
     apply_gateway_config(&ctx, def)?;
     apply_gateway_deployment(&ctx)?;
+    kubectl::rollout_restart(&ctx, GATEWAY_DEPLOYMENT)?;
 
     kubectl::wait_for_rollout(&ctx, MOCK_EPP_NAME, name)?;
     kubectl::wait_for_rollout(&ctx, GATEWAY_DEPLOYMENT, name)?;

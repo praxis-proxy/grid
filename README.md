@@ -28,6 +28,9 @@ cargo xtask env validate-operator-routing -c tests/env/operator-routing.toml
 # Validate two-provider model routing through the llm-d-compatible gateway path
 cargo xtask env verify-llmd-compatible-routing -c tests/env/operator-routing-two-provider.toml
 
+# Validate OpenAI /v1/responses routing with openai_responses_format filter
+cargo xtask env verify-responses-routing -c tests/env/operator-routing-multisite.toml
+
 # Validate full-grid routing across local, remote, cloud mock, and API mock
 cargo xtask env verify-full-grid-routing -c tests/env/operator-routing-two-provider.toml
 

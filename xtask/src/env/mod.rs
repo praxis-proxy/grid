@@ -542,6 +542,30 @@ pub(crate) enum Action {
         config: PathBuf,
     },
 
+    /// Verify `OpenAI` `/v1/responses` routing through the consumer gateway.
+    ///
+    /// Proves that requests using the Responses API format are correctly
+    /// routed when the consumer filter chain uses `openai_responses_format`
+    /// instead of the generic `json_body_field` extractor.
+    ///
+    /// 1. Deploy provider gateways (idempotent).
+    /// 2. Operator reconcile + overlay export.
+    /// 3. Deploy consumer gateway with `openai_responses_format` filter chain.
+    /// 4. Send `/v1/responses` requests: each model returns HTTP 200 with valid Responses body, unknown model fails
+    ///    closed.
+    /// 5. Verify response model fields match the requested model.
+    /// 6. Assert no unexpected pod restarts.
+    ///
+    /// Requires the multi-site kind environment.  Run
+    /// `env up -c tests/env/operator-routing-multisite.toml` and
+    /// `env load-gateway-images -c tests/env/operator-routing-multisite.toml`
+    /// first.
+    VerifyResponsesRouting {
+        /// Path to the environment config file.
+        #[arg(short, long, default_value = "tests/env/operator-routing-multisite.toml")]
+        config: PathBuf,
+    },
+
     /// Prove the full-grid routing path across all four backend kinds.
     ///
     /// Validates one consumer gateway routing across:
@@ -725,6 +749,7 @@ pub(crate) fn run(action: &Action) -> Result<(), Box<dyn std::error::Error>> {
         Action::GridsiteFingerprint { context, name } => env_gridsite_fingerprint(context.as_str(), name.as_str()),
         Action::VerifySwimRouting { config } => env_verify_swim_routing(config),
         Action::VerifyLlmdCompatibleRouting { config } => env_verify_llmd_compat_routing(config),
+        Action::VerifyResponsesRouting { config } => env_verify_responses_routing(config),
         Action::VerifyFullGridRouting { config } => env_verify_full_grid_routing(config),
         Action::VerifyMetricsRouting { config } => env_verify_metrics_routing(config),
         Action::VerifySiteJoinDiscovery { config } => env_verify_site_join_discovery(config),
@@ -2855,7 +2880,11 @@ fn verify_llmd_compat_model_fields(
     let mut pf = verify::PortForwardGuard::start(&ctx, "praxis-consumer", port, 8080)?;
     if !verify::wait_for_port(port) {
         pf.stop();
-        results.push(StepResult::blocked("response model field", "consumer not reachable"));
+        results.push(StepResult {
+            label: "response model field",
+            status: StepStatus::Fail,
+            evidence: "consumer not reachable".to_owned(),
+        });
         return Ok(());
     }
     let result = llmd_compat_check_all_model_fields(cfg, port);
@@ -3014,6 +3043,215 @@ fn env_verify_llmd_compat_routing(config: &Path) -> Result<(), Box<dyn std::erro
         Err("llmd-compat: one or more proof points FAILED".into())
     } else {
         eprintln!("llmd-compat: ALL proof points PASS");
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Responses routing validation
+// ---------------------------------------------------------------------------
+
+/// Record a step result for the Responses routing proof.
+fn responses_record_step(
+    label: &'static str,
+    results: &mut Vec<StepResult>,
+    f: impl FnOnce() -> Result<String, Box<dyn std::error::Error>>,
+) -> bool {
+    match f() {
+        Ok(evidence) => {
+            results.push(StepResult::pass(label, evidence));
+            true
+        },
+        Err(e) => {
+            results.push(StepResult::fail(label, e.as_ref()));
+            false
+        },
+    }
+}
+
+/// Check Responses API response `model` fields via consumer gateway.
+///
+/// Port-forwards to the consumer gateway and sends a `/v1/responses` request
+/// per configured model.  Asserts the response JSON `model` field matches.
+fn verify_responses_model_fields(
+    cfg: &EnvConfig,
+    results: &mut Vec<StepResult>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let consumer_site = resolve_consumer_site(cfg)?;
+    let ctx = kind::kubectl_context(consumer_site);
+    let port = verify::find_free_port()?;
+    let mut pf = verify::PortForwardGuard::start(&ctx, "praxis-consumer", port, 8080)?;
+    if !verify::wait_for_port(port) {
+        pf.stop();
+        results.push(StepResult {
+            label: "response model field",
+            status: StepStatus::Fail,
+            evidence: "consumer not reachable".to_owned(),
+        });
+        return Ok(());
+    }
+    let result = responses_check_all_model_fields(cfg, port);
+    pf.stop();
+    results.push(result);
+    Ok(())
+}
+
+/// Check model field in response for all provider models using Responses API.
+fn responses_check_all_model_fields(cfg: &EnvConfig, port: u16) -> StepResult {
+    let mut verified = Vec::new();
+    let mut failed = Vec::new();
+    for name in &cfg.clusters.names {
+        let Some(def) = cfg.clusters.definitions.get(name) else {
+            continue;
+        };
+        if def.role != ClusterRole::Provider {
+            continue;
+        }
+        for model in &def.models {
+            match responses_check_one_model_field(port, model) {
+                Ok(()) => verified.push(model.clone()),
+                Err(e) => failed.push(format!("{model}: {e}")),
+            }
+        }
+    }
+    if failed.is_empty() {
+        StepResult::pass("response model field", verified.join(", "))
+    } else {
+        StepResult {
+            label: "response model field",
+            status: StepStatus::Fail,
+            evidence: safe_truncate_str(&failed.join("; "), 120),
+        }
+    }
+}
+
+/// Send a Responses request and verify the response model field.
+fn responses_check_one_model_field(port: u16, model: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let resp = consumer::send_responses_request(port, model)?;
+    if resp.status != 200 {
+        return Err(format!("HTTP {}, expected 200", resp.status).into());
+    }
+    verify_response_model_field(&resp.body, model)
+}
+
+/// Assert no pods restarted during the Responses routing test run.
+fn verify_responses_pod_restarts(
+    cfg: &EnvConfig,
+    results: &mut Vec<StepResult>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut total_restarts: Vec<String> = Vec::new();
+    for name in &cfg.clusters.names {
+        let ctx = kind::kubectl_context(name);
+        let restarts = collect_pod_restart_counts(&ctx, "default")?;
+        for (pod, count) in &restarts {
+            total_restarts.push(format!("{name}/{pod}: {count}"));
+        }
+    }
+    if total_restarts.is_empty() {
+        results.push(StepResult::pass("pod restarts", "0 restarts across all clusters"));
+    } else {
+        results.push(StepResult {
+            label: "pod restarts",
+            status: StepStatus::Fail,
+            evidence: safe_truncate_str(&total_restarts.join(", "), 120),
+        });
+    }
+    Ok(())
+}
+
+/// Run the Responses routing proof.
+///
+/// Orchestrates the `/v1/responses` routing validation:
+/// 1. Deploy provider gateways.
+/// 2. Operator reconcile + overlay export.
+/// 3. Deploy consumer gateway with `openai_responses_format` filter chain.
+/// 4. Verify `/v1/responses` routing: each model returns 200, unknown fails.
+/// 5. Verify response model fields match the requested model.
+/// 6. Assert no unexpected pod restarts.
+#[expect(
+    clippy::too_many_lines,
+    reason = "sequential proof steps: each step depends on the previous; splitting obscures the proof flow"
+)]
+fn env_verify_responses_routing(config: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let cfg = EnvConfig::from_file(config)?;
+    let providers = provider_clusters_from_config(&cfg);
+    if providers.len() < 2 {
+        return Err(format!(
+            "responses-routing requires >= 2 provider clusters; got {}",
+            providers.len()
+        )
+        .into());
+    }
+    let mut results: Vec<StepResult> = Vec::new();
+
+    // Step 1: Deploy provider gateways.
+    eprintln!("responses-routing: [1/6] deploying provider gateways...");
+    let gw_ok = responses_record_step("provider gateways", &mut results, || {
+        gateway::deploy_all(&cfg)?;
+        Ok(format!("{} sites deployed", providers.len()))
+    });
+    if !gw_ok {
+        print_validate_all_table(&results);
+        return Err("responses-routing: provider gateway deployment failed".into());
+    }
+
+    // Step 2: Operator reconcile + overlay export.
+    eprintln!("responses-routing: [2/6] operator reconcile + overlay export...");
+    let context = resolve_operator_context(&cfg, None)?;
+    let providers_ref: Vec<(&str, &[String])> = providers.iter().map(|(s, m)| (s.as_str(), m.as_slice())).collect();
+    let overlay_path = match run_multi_provider_reconcile(&context, &providers_ref) {
+        Ok(path) => {
+            results.push(StepResult::pass(
+                "operator reconcile",
+                format!("overlay for {} sites", providers.len()),
+            ));
+            path
+        },
+        Err(e) => {
+            results.push(StepResult::fail("operator reconcile", e.as_ref()));
+            print_validate_all_table(&results);
+            return Err("responses-routing: operator reconcile failed".into());
+        },
+    };
+
+    // Step 3: Deploy consumer gateway with openai_responses_format filter chain.
+    eprintln!("responses-routing: [3/6] deploying responses consumer gateway...");
+    let consumer_ok = responses_record_step("consumer deploy", &mut results, || {
+        consumer::deploy_consumer_for_responses(&cfg, Some(&overlay_path))?;
+        Ok("deployed with openai_responses_format filter chain".to_owned())
+    });
+    if !consumer_ok {
+        print_validate_all_table(&results);
+        return Err("responses-routing: consumer deploy failed".into());
+    }
+
+    // Step 4: Verify /v1/responses routing.
+    eprintln!("responses-routing: [4/6] verifying /v1/responses routing...");
+    match consumer::verify_responses_e2e(&cfg) {
+        Ok(()) => results.push(StepResult::pass(
+            "responses routing",
+            "all models routed correctly, unknown model fails cleanly",
+        )),
+        Err(e) => {
+            results.push(StepResult::fail("responses routing", e.as_ref()));
+        },
+    }
+
+    // Step 5: Verify response model fields.
+    eprintln!("responses-routing: [5/6] verifying response model fields...");
+    verify_responses_model_fields(&cfg, &mut results)?;
+
+    // Step 6: Pod restart check.
+    eprintln!("responses-routing: [6/6] checking for unexpected pod restarts...");
+    verify_responses_pod_restarts(&cfg, &mut results)?;
+
+    eprintln!();
+    eprintln!("## Responses Routing Proof");
+    print_validate_all_table(&results);
+    if results.iter().any(|r| r.status.is_failure()) {
+        Err("responses-routing: one or more proof points FAILED".into())
+    } else {
+        eprintln!("responses-routing: ALL proof points PASS");
         Ok(())
     }
 }
@@ -4854,6 +5092,7 @@ fn env_verify_operator_install_rbac(config: &Path, site: Option<&str>) -> Result
     // Step 3: apply install manifests.
     eprintln!("verify-operator-install-rbac: [3/11] applying install manifests...");
     operator::apply_install_manifests(&context)?;
+    operator::override_operator_image_for_kind(&context)?;
     eprintln!("  [OK] install manifests applied");
 
     // Steps 4-5: RBAC can-i checks (positive + negative).

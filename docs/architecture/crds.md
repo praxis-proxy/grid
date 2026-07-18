@@ -6,7 +6,7 @@ All CRDs are cluster-scoped.
 
 ## GridNetwork
 
-The grid itself. Top-level tenancy boundary. A single
+The grid itself. Top-level tenancy scope. A single
 cluster can host multiple `GridNetworks` for
 multi-tenancy.
 
@@ -194,6 +194,16 @@ complete, runnable Praxis config containing:
 - `admin:` — admin listener at `127.0.0.1:9901`
 - `shutdown_timeout_secs: 5`
 
+The generated credential-injection config assumes the gateway is the egress
+component for the selected backend.  This is correct for direct API-provider and
+cloud-provider fallback routes.  For remote provider sites, provider credentials
+should be mounted only in the remote site or provider-side component that makes
+the final backend call.
+
+The `grid_credential_inject` filter is a Praxis AI runtime dependency.  The Grid
+operator can render the config shape, but the deployed Praxis AI image must
+include that filter for the generated config to start successfully.
+
 When `enabled: false` or `consumerConfig` is absent, this gateway behaves as before
 — only the routing overlay `ConfigMap` is applied.
 
@@ -234,7 +244,7 @@ SWIM discovery, authentication, and authorization are separate concerns:
 - Authentication proves the peer gateway identity, normally through mTLS
   certificate validation.
 - Authorization decides whether that authenticated peer is allowed to
-  participate in the Grid or carry traffic for a given policy boundary.
+  participate in the Grid or carry traffic for a given policy scope.
 
 A discovered SWIM peer is not automatically authorized for routing.
 

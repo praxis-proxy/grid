@@ -94,7 +94,20 @@ When `credential` is present on a candidate, the field contains only:
 - `strategy`: the authentication mechanism (currently `"bearer_token"`)
 - `secretRef.name` / `secretRef.namespace` / `secretRef.key`: Kubernetes Secret locating information
 
-The token value is **never written into the overlay ConfigMap**. Consumers resolve the token from the Kubernetes Secret at credential-injection time. The `grid_route` filter parses the field for forward compatibility and makes it available to downstream filters, but does not perform Kubernetes API calls or inject credentials itself.
+The token value is **never written into the overlay ConfigMap**. The `grid_route`
+filter parses the field and makes it available to downstream filters, but does
+not perform Kubernetes API calls or inject credentials itself.
+
+Credential injection is handled by the egress component that makes the final
+backend call.  For direct API-provider or cloud-provider fallback, the consumer
+gateway is usually both ingress and egress, so it mounts the Secret and injects
+or signs before forwarding to the provider API.  For remote Grid sites, provider
+backend credentials stay in the remote provider site or provider-side component;
+the ingress gateway should not receive those provider tokens.
+
+Native file-backed injection requires the Praxis AI `grid_credential_inject`
+filter.  Grid can render the overlay and generated config for that path today,
+but runtime deployments must use a Praxis AI image that includes the filter.
 
 ## Candidate scoring and ordering
 
@@ -182,7 +195,7 @@ is outside the current operator contract.
 ### Not implemented: hard exclusion
 
 The GC policy does not implement hard exclusion of all `fresh=false` candidates.
-A `fresh=false` candidate is only evicted after the TTL boundary; it is
+A `fresh=false` candidate is only evicted after the TTL expires; it is
 **deprioritized**, not excluded.  See the scoring section for how `fresh=false`
 affects candidate ordering.
 
@@ -202,7 +215,7 @@ or does not use a Praxis gateway.
 `cloud_managed` is distinct because Grid should apply different cost,
 credential, observability, and placement assumptions than it applies to
 self-hosted sites. A deployment may still place Praxis in front of a
-cloud-managed backend; the category describes the operational boundary, not a
+cloud-managed backend; the category describes operational ownership, not a
 requirement to bypass Praxis.
 
 ## Multi-cluster model routing
@@ -238,7 +251,7 @@ by the provider-side serving stack, such as llm-d/EPP endpoint selection.
 ## API-provider fallback
 
 API-provider fallback uses the same overlay mechanism as self-hosted routing.
-The difference is the backend category and credential boundary:
+The difference is the backend category and credential handling:
 
 1. An `InferenceProvider` declares `backendKind: api_provider`.
 2. The operator includes the API provider as a candidate when it is available.
@@ -304,13 +317,21 @@ grid_credential_inject  → reads credential metadata; injects Authorization
 load_balancer           → upstream cluster selection with injected headers
 ```
 
+This filter chain requires a Praxis AI image that includes
+`grid_credential_inject`.  Grid renders the overlay and generated config shape;
+the runtime image must provide the filter implementation.
+
 ### File-backed token source
 
-In the current xtask validation mode, the token value is resolved from a
-Kubernetes Secret by the xtask harness and written into a Kubernetes Secret in
-the consumer cluster.  The consumer pod mounts that Secret as a file, and
-`grid_credential_inject` reads the token from its configured `file:` path at
-filter construction time.
+In the current xtask validation mode for direct API-provider fallback, the token
+value is resolved from a Kubernetes Secret by the xtask harness and written into
+a Kubernetes Secret in the consumer cluster.  The consumer pod mounts that
+Secret as a file, and `grid_credential_inject` reads the token from its
+configured `file:` path at filter construction time.
+
+In production, the same rule applies at the egress point: mount the Secret only
+into the gateway or provider-side component that makes the final backend call.
+Grid does not copy Secret values across clusters.
 
 The token does NOT appear in:
 
@@ -324,12 +345,12 @@ The token does NOT appear in:
 ### Deployment ownership
 
 The operator generates the consumer Praxis config including the `grid_credential_inject`
-section.  Consumer-cluster Secret provisioning — creating, rotating, and synchronizing
-the mounted credential Secret — is the responsibility of the operator or an external
-Secret manager.
+section for direct API-provider routes.  Secret provisioning — creating,
+rotating, and synchronizing the mounted credential Secret in the egress cluster
+— is the responsibility of platform automation or an external Secret manager.
 
 The `grid_route` → `grid_credential_inject` filter chain interface is the same
-regardless of how the consumer-cluster Secret is provisioned.
+regardless of how the egress Secret is provisioned.
 
 ## Routing eligibility
 
@@ -421,8 +442,8 @@ not route to its own CRDT echo or to providers from another `GridNetwork`.
 
 ## Metrics normalization contract
 
-The `scoring::BackendMetrics` struct is the boundary between metrics ingestion
-and the scoring engine.  The following table defines the normalization
+The `scoring::BackendMetrics` struct is the handoff point between metrics
+ingestion and the scoring engine.  The following table defines the normalization
 responsibility at each layer:
 
 | Signal | Expected range in `BackendMetrics` | Normalization owner |

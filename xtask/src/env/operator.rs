@@ -713,6 +713,34 @@ fn load_operator_image_podman(cluster_name: &str) -> Result<(), Box<dyn std::err
     Ok(())
 }
 
+/// Override the operator Deployment image for Kind validation.
+///
+/// The install manifest references the published GHCR image.
+/// Kind clusters use a locally built image instead, so this
+/// patches the Deployment's container image after manifest apply.
+///
+/// # Errors
+///
+/// Returns an error if `kubectl set image` fails.
+pub(crate) fn override_operator_image_for_kind(context: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let status = Command::new("kubectl")
+        .args([
+            "--context",
+            context,
+            "set",
+            "image",
+            "deployment/grid-operator",
+            "-n",
+            "grid-system",
+            &format!("operator={OPERATOR_IMAGE}"),
+        ])
+        .status()?;
+    if !status.success() {
+        return Err("kubectl set image for grid-operator deployment failed".into());
+    }
+    Ok(())
+}
+
 /// Patch the `grid-operator` Deployment env vars for in-cluster testing.
 ///
 /// # Errors

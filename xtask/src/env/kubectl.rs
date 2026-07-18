@@ -72,6 +72,35 @@ pub(crate) fn wait_for_rollout(
     wait_for_rollout_ns(context, deployment, ROLLOUT_NAMESPACE, cluster)
 }
 
+/// Restart a `Deployment` rollout so pods pick up updated volume mounts.
+///
+/// Runs `kubectl rollout restart deployment/{deployment}` in the default
+/// namespace.  Pingora/rustls gateways do not hot-reload TLS material, so
+/// a restart is required after updating a mounted Secret.
+///
+/// # Errors
+///
+/// Returns an error if the `kubectl` process cannot be spawned or exits
+/// with a non-zero status.
+pub(crate) fn rollout_restart(context: &str, deployment: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let resource = format!("deployment/{deployment}");
+    let status = Command::new("kubectl")
+        .args([
+            "--context",
+            context,
+            "-n",
+            ROLLOUT_NAMESPACE,
+            "rollout",
+            "restart",
+            &resource,
+        ])
+        .status()?;
+    if !status.success() {
+        return Err(format!("kubectl rollout restart {deployment} failed").into());
+    }
+    Ok(())
+}
+
 /// Wait for a `Deployment` rollout in a specific namespace.
 ///
 /// # Errors

@@ -31,6 +31,16 @@ The generated config is a complete, runnable Praxis config containing:
 - `admin:` — admin listener at `127.0.0.1:9901`
 - `shutdown_timeout_secs: 5`
 
+This generated config covers the direct API-provider path where the consumer
+gateway is also the egress gateway for the provider API call.  Remote provider
+sites follow the same SecretRef contract, but the provider credential should be
+mounted only where the final backend call is made.
+
+The generated config requires a Praxis AI image that contains the
+`grid_credential_inject` filter.  Grid can render the config and project
+credential references today; deployments must ensure the selected Praxis AI image
+includes the matching request-time filter.
+
 See [`docs/architecture/crds.md`](crds.md#gatewayrefconsumerconfig) for the full
 field reference.
 
@@ -139,6 +149,7 @@ config or mounted Secret content changes.
 
 The generated `ConfigMap` never contains credential token bytes.  Credential
 entries reference a mounted Kubernetes Secret via a `file:` path.  The Secret must
-be provisioned in the consumer cluster by external tooling.  The
+be provisioned in the cluster where the egress gateway or provider-side component
+that calls the backend runs.  The
 `status.consumerConfigStatus[].message` field also never contains token bytes —
 error messages describe structural failures only.
