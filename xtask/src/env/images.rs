@@ -4,8 +4,7 @@
 //! from the AI repository, then loads them into all kind clusters.
 //!
 //! When a cluster is configured with `backend = "mock-openai"`, the
-//! `grid-mock-providers` image ([`kind::MOCK_PROVIDER_IMAGE`]) is also
-//! loaded into that cluster.
+//! `grid-mock-providers` image is also loaded into that cluster.
 
 use std::{
     env,
@@ -13,7 +12,7 @@ use std::{
     process::Command,
 };
 
-use crate::env::{config::EnvConfig, kind};
+use crate::env::{config::EnvConfig, image_overrides, kind};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -92,8 +91,11 @@ fn verify_ai_repo_source_files(ai_repo: &Path) -> Result<(), Box<dyn std::error:
 /// Always loads [`GATEWAY_IMAGE`] and [`MOCK_EPP_IMAGE`] into every cluster.
 ///
 /// For clusters configured with `backend = "mock-openai"`, also loads
-/// [`kind::MOCK_PROVIDER_IMAGE`]. This image must exist locally as
+/// the mock provider image. This image must exist locally as
 /// `grid-mock-providers:latest` before running `load-gateway-images`.
+///
+/// When `GRID_XTASK_IMAGE_PULL_POLICY` is not "Never", skips loading and
+/// lets Kubernetes pull images instead.
 ///
 /// # Errors
 ///
@@ -101,9 +103,21 @@ fn verify_ai_repo_source_files(ai_repo: &Path) -> Result<(), Box<dyn std::error:
 pub(crate) fn load_all(cfg: &EnvConfig) -> Result<(), Box<dyn std::error::Error>> {
     use crate::env::config::ProviderBackend;
 
+    // Skip loading if pull policy indicates registry images
+    if image_overrides::should_skip_kind_image_loading() {
+        eprintln!("  skipping Kind image loading (pull policy is not Never)");
+        eprintln!("  Kubernetes will pull images from registry");
+        return Ok(());
+    }
+
+    // Use override-aware image names
+    let gateway_img = image_overrides::gateway_image();
+    let mock_epp_img = image_overrides::mock_epp_image();
+    let mock_provider_img = image_overrides::mock_provider_image();
+
     for name in &cfg.clusters.names {
         let full = kind::cluster_name_from_config(name);
-        for image in &[GATEWAY_IMAGE, MOCK_EPP_IMAGE] {
+        for image in &[gateway_img.as_str(), mock_epp_img.as_str()] {
             eprintln!("  loading {image} into {full}...");
             run_cmd("kind", &["load", "docker-image", image, "--name", &full])?;
         }
@@ -114,11 +128,8 @@ pub(crate) fn load_all(cfg: &EnvConfig) -> Result<(), Box<dyn std::error::Error>
             .get(name)
             .is_some_and(|d| d.backend == ProviderBackend::MockOpenai)
         {
-            eprintln!("  loading {} into {full}...", kind::MOCK_PROVIDER_IMAGE);
-            run_cmd(
-                "kind",
-                &["load", "docker-image", kind::MOCK_PROVIDER_IMAGE, "--name", &full],
-            )?;
+            eprintln!("  loading {mock_provider_img} into {full}...");
+            run_cmd("kind", &["load", "docker-image", &mock_provider_img, "--name", &full])?;
         }
     }
     Ok(())

@@ -8,6 +8,7 @@
 //! `type` field (e.g. `"response.created"`, `"response.output_text.delta"`,
 //! `"response.completed"`) rather than named SSE events.
 
+
 use axum::{
     Router,
     body::Body,
@@ -18,6 +19,14 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::common;
+
+/// Read the optional expected bearer token from `MOCK_EXPECTED_BEARER_TOKEN`.
+///
+/// When set, handlers return 403 for a mismatched token (vs 401 for missing).
+/// When unset, any bearer token is accepted.
+fn expected_bearer_token() -> Option<String> {
+    std::env::var("MOCK_EXPECTED_BEARER_TOKEN").ok()
+}
 
 // ---------------------------------------------------------------------------
 // Router
@@ -66,8 +75,8 @@ struct ResponsesRequest {
 
 /// Handle `POST /v1/chat/completions`.
 async fn chat_completions(req: Request<Body>) -> Response<Body> {
-    if common::extract_bearer(req.headers()).is_none() {
-        return common::unauthorized("missing bearer token");
+    if let Err(resp) = common::validate_bearer(req.headers(), expected_bearer_token().as_deref()) {
+        return resp;
     }
 
     let body_bytes = axum::body::to_bytes(req.into_body(), 1_048_576)
@@ -93,8 +102,8 @@ async fn chat_completions(req: Request<Body>) -> Response<Body> {
 
 /// Handle `POST /v1/responses`.
 async fn responses(req: Request<Body>) -> Response<Body> {
-    if common::extract_bearer(req.headers()).is_none() {
-        return common::unauthorized("missing bearer token");
+    if let Err(resp) = common::validate_bearer(req.headers(), expected_bearer_token().as_deref()) {
+        return resp;
     }
 
     let body_bytes = axum::body::to_bytes(req.into_body(), 1_048_576)
@@ -127,8 +136,8 @@ async fn responses(req: Request<Body>) -> Response<Body> {
 
 /// Handle `GET /v1/models`.
 async fn list_models(req: Request<Body>) -> Response<Body> {
-    if common::extract_bearer(req.headers()).is_none() {
-        return common::unauthorized("missing bearer token");
+    if let Err(resp) = common::validate_bearer(req.headers(), expected_bearer_token().as_deref()) {
+        return resp;
     }
 
     common::json_response(

@@ -25,9 +25,7 @@ consumer gateway `ConfigMap`s.
 validates `secretRef`, projects only the reference into `grid-config.json`, and
 can render consumer Praxis config with file-backed credential references.  The
 request-time filter is the Praxis AI `grid_credential_inject` filter.  Runtime
-deployments must use a Praxis AI image that includes that filter; until that
-work is merged and published in Praxis AI, the native path is validated with the
-branch image used by the Kind harness.
+deployments must use a Praxis AI image that includes `grid_credential_inject`.
 
 | Strategy | Status | Request-time behavior |
 |----------|--------|-----------------------|

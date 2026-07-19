@@ -1,10 +1,10 @@
 //! Kind cluster lifecycle management.
 
-use std::process::Command;
+use std::{fmt::Write as _, process::Command};
 
 use crate::env::{
     config::{ClusterDef, ClusterRole, ProviderBackend},
-    kubectl,
+    image_overrides, kubectl,
 };
 
 // ---------------------------------------------------------------------------
@@ -17,11 +17,6 @@ const CLUSTER_PREFIX: &str = "grid-";
 /// Container image for llm-d inference simulator.
 const INFERENCE_SIM_IMAGE: &str = "ghcr.io/llm-d/llm-d-inference-sim:latest";
 
-/// Container image for the `openai` mock-providers backend.
-///
-/// Loaded into kind clusters via `kind load docker-image` for the
-/// [`ProviderBackend::MockOpenai`] backend.
-pub(crate) const MOCK_PROVIDER_IMAGE: &str = "grid-mock-providers:latest";
 
 /// Kubernetes Deployment and Service name for the `openai` provider backend.
 pub(crate) const MOCK_OPENAI_SVC: &str = "mock-openai-provider";
@@ -383,21 +378,46 @@ fn cluster_exists(full_name: &str) -> bool {
 /// but it is deployed independently under a different name so the two roles are
 /// clearly distinct in the Praxis consumer config.
 pub(crate) fn deploy_mock_api_provider(context: &str, cluster_name: &str) -> Result<(), Box<dyn std::error::Error>> {
-    eprintln!("  loading {MOCK_PROVIDER_IMAGE} into {cluster_name}...");
-    run_cmd(
-        "kind",
-        &["load", "docker-image", MOCK_PROVIDER_IMAGE, "--name", cluster_name],
-    )
-    .map_err(|e| {
-        format!(
-            "{e}\n\
-             hint: build the image first with:\n\
-             \x20 docker build -t {MOCK_PROVIDER_IMAGE} -f mock-providers/Containerfile ."
+    let mock_provider_img = image_overrides::mock_provider_image();
+
+    // Skip loading if pull policy indicates registry images
+    if image_overrides::should_skip_kind_image_loading() {
+        eprintln!("  skipping loading {mock_provider_img} (pull policy is not Never)");
+        eprintln!("  Kubernetes will pull image from registry");
+    } else {
+        eprintln!("  loading {mock_provider_img} into {cluster_name}...");
+        run_cmd(
+            "kind",
+            &["load", "docker-image", &mock_provider_img, "--name", cluster_name],
         )
-    })?;
+        .map_err(|e| {
+            format!(
+                "{e}\n\
+                 hint: build the image first with:\n\
+                 \x20 docker build -t {mock_provider_img} -f mock-providers/Containerfile ."
+            )
+        })?;
+    }
+
     eprintln!("  deploying {MOCK_API_SVC} to {cluster_name}...");
     kubectl::apply_manifest(context, &mock_api_provider_deployment_yaml())?;
     kubectl::apply_manifest(context, &mock_api_provider_service_yaml())?;
+    kubectl::wait_for_rollout(context, MOCK_API_SVC, cluster_name)?;
+    Ok(())
+}
+
+/// Redeploy the mock API-provider with `MOCK_EXPECTED_BEARER_TOKEN` set.
+///
+/// Applies the Deployment with the given token as an environment variable,
+/// then waits for the rollout. The image must already be loaded in the cluster.
+pub(crate) fn deploy_mock_api_provider_with_expected_token(
+    context: &str,
+    cluster_name: &str,
+    token: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    eprintln!("  redeploying {MOCK_API_SVC} with expected-token validation...");
+    let yaml = mock_api_provider_deployment_yaml_with_env(&[("MOCK_EXPECTED_BEARER_TOKEN", token)]);
+    kubectl::apply_manifest(context, &yaml)?;
     kubectl::wait_for_rollout(context, MOCK_API_SVC, cluster_name)?;
     Ok(())
 }
@@ -434,9 +454,16 @@ pub(crate) fn delete_mock_api_provider(context: &str) {
 }
 
 /// Generate the Deployment YAML for the standalone mock API-provider.
-#[expect(clippy::too_many_lines, reason = "readable multiline Kubernetes Deployment YAML")]
 pub(crate) fn mock_api_provider_deployment_yaml() -> String {
-    format!(
+    mock_api_provider_deployment_yaml_with_env(&[])
+}
+
+/// Generate the Deployment YAML with optional environment variables.
+#[expect(clippy::too_many_lines, reason = "readable multiline Kubernetes Deployment YAML")]
+pub(crate) fn mock_api_provider_deployment_yaml_with_env(envs: &[(&str, &str)]) -> String {
+    let mock_provider_img = image_overrides::mock_provider_image();
+    let pull_policy = image_overrides::image_pull_policy();
+    let mut yaml = format!(
         r#"apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -456,8 +483,8 @@ spec:
     spec:
       containers:
         - name: mock-api
-          image: {MOCK_PROVIDER_IMAGE}
-          imagePullPolicy: Never
+          image: {mock_provider_img}
+          imagePullPolicy: {pull_policy}
           args:
             - "--provider"
             - "openai"
@@ -466,7 +493,15 @@ spec:
           ports:
             - containerPort: {MOCK_API_PORT}
 "#
-    )
+    );
+    if !envs.is_empty() {
+        yaml.push_str("          env:\n");
+        for (name, value) in envs {
+            write!(yaml, "            - name: {name}\n              value: \"{value}\"\n")
+                .unwrap_or_else(|_| std::process::abort());
+        }
+    }
+    yaml
 }
 
 /// Generate the Service YAML for the standalone mock API-provider.
@@ -497,18 +532,27 @@ spec:
 /// scoring, and routing path. It intentionally does not exercise real cloud
 /// provider auth or protocols such as AWS `SigV4`, Google `OAuth2`, or Azure AAD.
 pub(crate) fn deploy_mock_cloud_provider(context: &str, cluster_name: &str) -> Result<(), Box<dyn std::error::Error>> {
-    eprintln!("  loading {MOCK_PROVIDER_IMAGE} into {cluster_name}...");
-    run_cmd(
-        "kind",
-        &["load", "docker-image", MOCK_PROVIDER_IMAGE, "--name", cluster_name],
-    )
-    .map_err(|e| {
-        format!(
-            "{e}\n\
-             hint: build the image first with:\n\
-             \x20 docker build -t {MOCK_PROVIDER_IMAGE} -f mock-providers/Containerfile ."
+    let mock_provider_img = image_overrides::mock_provider_image();
+
+    // Skip loading if pull policy indicates registry images
+    if image_overrides::should_skip_kind_image_loading() {
+        eprintln!("  skipping loading {mock_provider_img} (pull policy is not Never)");
+        eprintln!("  Kubernetes will pull image from registry");
+    } else {
+        eprintln!("  loading {mock_provider_img} into {cluster_name}...");
+        run_cmd(
+            "kind",
+            &["load", "docker-image", &mock_provider_img, "--name", cluster_name],
         )
-    })?;
+        .map_err(|e| {
+            format!(
+                "{e}\n\
+                 hint: build the image first with:\n\
+                 \x20 docker build -t {mock_provider_img} -f mock-providers/Containerfile ."
+            )
+        })?;
+    }
+
     eprintln!("  deploying {MOCK_CLOUD_SVC} to {cluster_name}...");
     kubectl::apply_manifest(context, &mock_cloud_provider_deployment_yaml())?;
     kubectl::apply_manifest(context, &mock_cloud_provider_service_yaml())?;
@@ -549,6 +593,8 @@ pub(crate) fn delete_mock_cloud_provider(context: &str) {
 /// Generate the Deployment YAML for the cloud-managed mock provider.
 #[expect(clippy::too_many_lines, reason = "readable multiline Kubernetes Deployment YAML")]
 pub(crate) fn mock_cloud_provider_deployment_yaml() -> String {
+    let mock_provider_img = image_overrides::mock_provider_image();
+    let pull_policy = image_overrides::image_pull_policy();
     format!(
         r#"apiVersion: apps/v1
 kind: Deployment
@@ -569,8 +615,8 @@ spec:
     spec:
       containers:
         - name: mock-cloud
-          image: {MOCK_PROVIDER_IMAGE}
-          imagePullPolicy: Never
+          image: {mock_provider_img}
+          imagePullPolicy: {pull_policy}
           args:
             - "--provider"
             - "openai"
@@ -603,7 +649,7 @@ spec:
 /// Deploy a single `grid-mock-providers` (openai backend) instance and wait
 /// for readiness.
 ///
-/// Loads [`MOCK_PROVIDER_IMAGE`] into the kind cluster before deploying because
+/// Loads the mock provider image into the kind cluster before deploying because
 /// the Deployment uses `imagePullPolicy: Never`.  The image must already be
 /// present in the local Docker daemon (built via
 /// `docker build -t grid-mock-providers:latest -f mock-providers/Containerfile .`).
@@ -613,18 +659,26 @@ spec:
 fn deploy_mock_openai(full_name: &str, site_name: &str) -> Result<(), Box<dyn std::error::Error>> {
     // Load the image into the cluster before deploying; imagePullPolicy: Never
     // requires the image to be present in the kind node before the Pod starts.
-    eprintln!("  loading {MOCK_PROVIDER_IMAGE} into {full_name}...");
-    run_cmd(
-        "kind",
-        &["load", "docker-image", MOCK_PROVIDER_IMAGE, "--name", full_name],
-    )
-    .map_err(|e| {
-        format!(
-            "{e}\n\
-             hint: build the image first with:\n\
-             \x20 docker build -t {MOCK_PROVIDER_IMAGE} -f mock-providers/Containerfile ."
+    let mock_provider_img = image_overrides::mock_provider_image();
+
+    // Skip loading if pull policy indicates registry images
+    if image_overrides::should_skip_kind_image_loading() {
+        eprintln!("  skipping loading {mock_provider_img} (pull policy is not Never)");
+        eprintln!("  Kubernetes will pull image from registry");
+    } else {
+        eprintln!("  loading {mock_provider_img} into {full_name}...");
+        run_cmd(
+            "kind",
+            &["load", "docker-image", &mock_provider_img, "--name", full_name],
         )
-    })?;
+        .map_err(|e| {
+            format!(
+                "{e}\n\
+                 hint: build the image first with:\n\
+                 \x20 docker build -t {mock_provider_img} -f mock-providers/Containerfile ."
+            )
+        })?;
+    }
 
     let ctx = format!("kind-{full_name}");
     eprintln!("  deploying {MOCK_OPENAI_SVC} to {full_name}...");
@@ -640,6 +694,8 @@ fn deploy_mock_openai(full_name: &str, site_name: &str) -> Result<(), Box<dyn st
 /// `openai` provider, serving all models in the cluster.
 #[expect(clippy::too_many_lines, reason = "Kubernetes manifest generation")]
 pub(crate) fn mock_openai_deployment_yaml(site_name: &str) -> String {
+    let mock_provider_img = image_overrides::mock_provider_image();
+    let pull_policy = image_overrides::image_pull_policy();
     format!(
         "apiVersion: apps/v1\n\
          kind: Deployment\n\
@@ -662,8 +718,8 @@ pub(crate) fn mock_openai_deployment_yaml(site_name: &str) -> String {
          \x20   spec:\n\
          \x20     containers:\n\
          \x20       - name: mock-openai\n\
-         \x20         image: {MOCK_PROVIDER_IMAGE}\n\
-         \x20         imagePullPolicy: Never\n\
+         \x20         image: {mock_provider_img}\n\
+         \x20         imagePullPolicy: {pull_policy}\n\
          \x20         args:\n\
          \x20           - \"--provider\"\n\
          \x20           - \"openai\"\n\
@@ -773,8 +829,14 @@ mod tests {
             "deployment must use MOCK_OPENAI_SVC name"
         );
         assert!(yaml.contains("grid-site: site-a"), "must include site label");
-        assert!(yaml.contains(MOCK_PROVIDER_IMAGE), "must reference MOCK_PROVIDER_IMAGE");
-        assert!(yaml.contains("imagePullPolicy: Never"), "must use Never pull policy");
+        assert!(
+            yaml.contains(&image_overrides::mock_provider_image()),
+            "must reference mock provider image"
+        );
+        assert!(
+            yaml.contains(&format!("imagePullPolicy: {}", image_overrides::image_pull_policy())),
+            "must use correct pull policy"
+        );
         assert!(yaml.contains("--provider"), "must pass --provider arg");
         assert!(yaml.contains("openai"), "must specify openai provider");
     }

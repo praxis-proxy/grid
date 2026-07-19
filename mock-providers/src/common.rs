@@ -75,6 +75,19 @@ pub(crate) fn unauthorized(message: &str) -> Response<Body> {
     )
 }
 
+/// Standard 403 Forbidden JSON response.
+pub(crate) fn forbidden(message: &str) -> Response<Body> {
+    json_response(
+        StatusCode::FORBIDDEN,
+        &serde_json::json!({
+            "error": {
+                "message": message,
+                "type": "access_denied",
+            }
+        }),
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Auth helpers
 // ---------------------------------------------------------------------------
@@ -85,6 +98,26 @@ pub(crate) fn extract_bearer(headers: &http::HeaderMap) -> Option<&str> {
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
+}
+
+/// Validate the bearer token against an optional expected value.
+///
+/// Returns `Ok(())` when auth passes. Returns `Err` with an appropriate
+/// error response when the token is missing (401) or does not match the
+/// expected value (403). When `expected` is `None`, any bearer token is
+/// accepted (backward-compatible behavior).
+#[expect(
+    clippy::result_large_err,
+    reason = "Response<Body> is the natural error type for HTTP handlers"
+)]
+pub(crate) fn validate_bearer(headers: &http::HeaderMap, expected: Option<&str>) -> Result<(), Response<Body>> {
+    let token = extract_bearer(headers).ok_or_else(|| unauthorized("missing bearer token"))?;
+    if let Some(exp) = expected
+        && token != exp
+    {
+        return Err(forbidden("invalid bearer token"));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -160,5 +193,65 @@ mod tests {
     fn unauthorized_response() {
         let resp = unauthorized("bad key");
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "status should be 401");
+    }
+
+    #[test]
+    fn forbidden_response() {
+        let resp = forbidden("wrong key");
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "status should be 403");
+    }
+
+    #[test]
+    fn validate_bearer_missing_returns_401() {
+        let headers = HeaderMap::new();
+        let Err(err) = validate_bearer(&headers, None) else {
+            std::process::abort();
+        };
+        assert_eq!(err.status(), StatusCode::UNAUTHORIZED, "missing token should be 401");
+    }
+
+    #[test]
+    fn validate_bearer_present_no_expected_accepts_any() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            "Bearer any-token"
+                .parse()
+                .unwrap_or_else(|_| http::HeaderValue::from_static("")),
+        );
+        assert!(
+            validate_bearer(&headers, None).is_ok(),
+            "any token should be accepted when expected is None"
+        );
+    }
+
+    #[test]
+    fn validate_bearer_correct_token_accepted() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            "Bearer correct-token"
+                .parse()
+                .unwrap_or_else(|_| http::HeaderValue::from_static("")),
+        );
+        assert!(
+            validate_bearer(&headers, Some("correct-token")).is_ok(),
+            "matching token should be accepted"
+        );
+    }
+
+    #[test]
+    fn validate_bearer_wrong_token_returns_403() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            "Bearer wrong-token"
+                .parse()
+                .unwrap_or_else(|_| http::HeaderValue::from_static("")),
+        );
+        let Err(err) = validate_bearer(&headers, Some("expected-token")) else {
+            std::process::abort();
+        };
+        assert_eq!(err.status(), StatusCode::FORBIDDEN, "wrong token should be 403");
     }
 }

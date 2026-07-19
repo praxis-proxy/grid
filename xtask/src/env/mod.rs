@@ -4,6 +4,7 @@ pub(crate) mod certs;
 pub(crate) mod config;
 pub(crate) mod consumer;
 pub(crate) mod gateway;
+pub(crate) mod image_overrides;
 pub(crate) mod images;
 pub(crate) mod kind;
 pub(crate) mod kubectl;
@@ -520,7 +521,12 @@ pub(crate) enum Action {
         name: String,
     },
 
-    /// Verify the llm-d-compatible two-provider model routing topology.
+    /// Verify the dedicated llm-d-compatible provider-gateway path.
+    ///
+    /// Tests routing through Praxis AI `ext_proc` with llm-d compatibility.
+    /// Requires Praxis AI image with llm-d `ext_proc` support (praxis-proxy/ai#334)
+    /// and AI-owned mock EPP test image (pending AI PR). Mock EPP is AI test
+    /// support, not a Grid mock provider.
     ///
     /// Proves the full llm-d routing path end-to-end in kind:
     ///
@@ -532,13 +538,13 @@ pub(crate) enum Action {
     /// 6. Verify Chat Completions response bodies include the requested model name.
     /// 7. Assert no unexpected pod restarts during the test.
     ///
-    /// Requires the two-provider kind environment.  Run
-    /// `env up -c tests/env/operator-routing-two-provider.toml` and
-    /// `env load-gateway-images -c tests/env/operator-routing-two-provider.toml`
+    /// Requires the multisite kind environment.  Run
+    /// `env up -c tests/env/operator-routing-multisite.toml` and
+    /// `env load-gateway-images -c tests/env/operator-routing-multisite.toml`
     /// first.
     VerifyLlmdCompatibleRouting {
-        /// Path to the two-provider environment config file.
-        #[arg(short, long, default_value = "tests/env/operator-routing-two-provider.toml")]
+        /// Path to the multisite environment config file.
+        #[arg(short, long, default_value = "tests/env/operator-routing-multisite.toml")]
         config: PathBuf,
     },
 
@@ -1073,11 +1079,12 @@ fn env_verify_api_fallback(config: &Path, site: Option<&str>) -> Result<(), Box<
 ///
 /// 1. Deploy provider gateways.
 /// 2. Deploy mock API-provider in consumer cluster.
-/// 3. Operator reconcile → overlay JSON with `credential.secretRef` on `api_provider` candidate.
-/// 4. Validate the operator-generated consumer Praxis config and read it back byte-for-byte.
-/// 5. Deploy the consumer gateway from that operator-generated config with the credential Secret mounted as a file.
-/// 6. Verify: `model-x` → 200 local, `model-z` → 200 via mock API-provider with injected credential, unknown model →
-///    404/503, token bytes absent from the consumer `ConfigMap` and `GridNetwork` status.
+/// 3. Operator reconcile → overlay JSON with `credential.secretRef`.
+/// 4. Validate the operator-generated consumer Praxis config.
+/// 5. Deploy the consumer gateway with the credential Secret mounted.
+/// 6. Verify routing, native injection, and token-absence invariants.
+/// 7. Prove a strict mock rejects a mismatched injected credential.
+/// 8. Prove the same strict mock accepts the correct injected credential.
 #[expect(clippy::too_many_lines, reason = "multi-step E2E orchestration")]
 fn env_verify_api_fallback_native(config: &Path, site: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     use operator::{
@@ -1094,18 +1101,18 @@ fn env_verify_api_fallback_native(config: &Path, site: Option<&str>) -> Result<(
     let consumer_ctx = kind::kubectl_context(consumer_site);
 
     // ── Step 1: deploy provider gateways ────────────────────────────────────
-    eprintln!("verify-api-fallback-native: [1/6] deploying provider gateways...");
+    eprintln!("verify-api-fallback-native: [1/8] deploying provider gateways...");
     gateway::deploy_all(&cfg)?;
 
     // ── Step 2: deploy mock-api-provider in consumer cluster ─────────────────
-    eprintln!("verify-api-fallback-native: [2/6] deploying mock-api-provider...");
+    eprintln!("verify-api-fallback-native: [2/8] deploying mock-api-provider...");
     let consumer_cluster_name = format!("grid-{consumer_site}");
     kind::deploy_mock_api_provider(&consumer_ctx, &consumer_cluster_name)?;
     let api_provider_endpoint = format!("{}.default.svc:{}", kind::MOCK_API_SVC, kind::MOCK_API_PORT);
     eprintln!("  api_provider endpoint: {api_provider_endpoint}");
 
     // ── Step 3: operator reconcile → overlay with credential secretRef ────────
-    eprintln!("verify-api-fallback-native: [3/6] operator reconcile + overlay export...");
+    eprintln!("verify-api-fallback-native: [3/8] operator reconcile + overlay export...");
     operator::install_grid_crds(&context)?;
     operator::cleanup_validation_resources(&context)?;
     operator::delete_api_credential_secret(&context, API_PROVIDER_SECRET_NS)
@@ -1171,7 +1178,7 @@ fn env_verify_api_fallback_native(config: &Path, site: Option<&str>) -> Result<(
     let (overlay_path, consumer_cm_name) = result?;
 
     // ── Step 4: shape-validate operator consumer ConfigMap ────────────────────
-    eprintln!("verify-api-fallback-native: [4/6] shape-validating operator consumer ConfigMap...");
+    eprintln!("verify-api-fallback-native: [4/8] shape-validating operator consumer ConfigMap...");
     let overlay_json = std::fs::read_to_string(&overlay_path)?;
     let overlay = operator_overlay::parse_grid_config_json(&overlay_json)?;
 
@@ -1223,7 +1230,7 @@ fn env_verify_api_fallback_native(config: &Path, site: Option<&str>) -> Result<(
     );
 
     // ── Step 5: apply operator config to consumer cluster + deploy consumer ──
-    eprintln!("verify-api-fallback-native: [5/6] deploying consumer from operator-generated config...");
+    eprintln!("verify-api-fallback-native: [5/8] deploying consumer from operator-generated config...");
     // Create the credential Secret in the CONSUMER cluster so the pod can mount it.
     // The token is in the Secret's `data` map — not in the Praxis ConfigMap.
     eprintln!("  creating credential Secret in consumer cluster for volume mount...");
@@ -1238,7 +1245,7 @@ fn env_verify_api_fallback_native(config: &Path, site: Option<&str>) -> Result<(
     consumer::deploy_consumer_from_operator_yaml(&cfg, &operator_praxis_yaml, secret_name, key)?;
 
     // ── Step 6: verify routing + token-absence + native credential injection ──
-    eprintln!("verify-api-fallback-native: [6/6] verifying routing with grid_credential_inject...");
+    eprintln!("verify-api-fallback-native: [6/8] verifying routing with grid_credential_inject...");
     eprintln!("  live consumer pod runs operator-generated config");
     eprintln!("  local ({TEST_HEALTHY_ROUTING_CLUSTER}) → model-x via site-a provider gateway");
     eprintln!(
@@ -1274,9 +1281,80 @@ fn env_verify_api_fallback_native(config: &Path, site: Option<&str>) -> Result<(
     .map_err(|e| format!("operator-generated consumer config status assertion failed: {e}"))?;
 
     mock_pf.stop();
+
+    // ── Step 7: wrong-credential proof (strict mock rejects mismatched token) ──
+    eprintln!("verify-api-fallback-native: [7/8] wrong-credential proof...");
+    kind::deploy_mock_api_provider_with_expected_token(
+        &consumer_ctx,
+        &consumer_cluster_name,
+        "wrong-sentinel-not-the-real-token",
+    )?;
+    eprintln!("  restarting consumer to clear cached connections...");
+    consumer::rollout_restart(&consumer_ctx, "praxis-consumer")?;
+    kubectl::wait_for_rollout(&consumer_ctx, "praxis-consumer", "consumer")?;
+    assert_wrong_credential_rejected(&consumer_ctx, API_FALLBACK_MODEL)?;
+
+    // ── Step 8: correct-credential proof (strict mock accepts correct token) ──
+    eprintln!("verify-api-fallback-native: [8/8] correct-credential with strict mock...");
+    kind::deploy_mock_api_provider_with_expected_token(&consumer_ctx, &consumer_cluster_name, &api_token)?;
+    eprintln!("  restarting consumer to clear cached connections...");
+    consumer::rollout_restart(&consumer_ctx, "praxis-consumer")?;
+    kubectl::wait_for_rollout(&consumer_ctx, "praxis-consumer", "consumer")?;
+    assert_correct_credential_accepted(&consumer_ctx, API_FALLBACK_MODEL)?;
+
     kind::delete_mock_api_provider(&consumer_ctx);
 
-    eprintln!("verify-api-fallback-native: PASS");
+    eprintln!("verify-api-fallback-native: PASS (8/8 steps)");
+    Ok(())
+}
+
+/// Assert that a wrong credential is rejected by the strict mock.
+///
+/// Port-forwards to the consumer gateway, sends a request for the given model,
+/// and expects a non-200 response (403 from the strict mock, or 502 if the
+/// gateway surfaces the upstream error).
+fn assert_wrong_credential_rejected(consumer_ctx: &str, model: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let port = verify::find_free_port()?;
+    let mut pf = verify::PortForwardGuard::start(consumer_ctx, "praxis-consumer", port, consumer::GATEWAY_HTTP_PORT)?;
+    if !verify::wait_for_port(port) {
+        pf.stop();
+        return Err("consumer port-forward not ready for wrong-credential proof".into());
+    }
+    let resp = consumer::send_consumer_request(port, model)?;
+    pf.stop();
+    if resp.status == 200 {
+        return Err(format!(
+            "wrong-credential proof failed: expected non-200 for model {model}, got 200. \
+             The mock should reject the token mismatch."
+        )
+        .into());
+    }
+    eprintln!("  [PASS] wrong credential rejected (status={})", resp.status);
+    Ok(())
+}
+
+/// Assert that the correct credential is accepted by the strict mock.
+///
+/// Port-forwards to the consumer gateway, sends a request for the given model,
+/// and expects 200.
+fn assert_correct_credential_accepted(consumer_ctx: &str, model: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let port = verify::find_free_port()?;
+    let mut pf = verify::PortForwardGuard::start(consumer_ctx, "praxis-consumer", port, consumer::GATEWAY_HTTP_PORT)?;
+    if !verify::wait_for_port(port) {
+        pf.stop();
+        return Err("consumer port-forward not ready for correct-credential proof".into());
+    }
+    let resp = consumer::send_consumer_request(port, model)?;
+    pf.stop();
+    if resp.status != 200 {
+        return Err(format!(
+            "correct-credential proof failed: expected 200 for model {model}, got {}. \
+             The mock should accept the injected token.",
+            resp.status
+        )
+        .into());
+    }
+    eprintln!("  [PASS] correct credential accepted with strict mock (status=200)");
     Ok(())
 }
 

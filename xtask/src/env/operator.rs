@@ -21,7 +21,7 @@ use std::{
 
 use sha2::{Digest as _, Sha256};
 
-use super::{kind, kubectl};
+use super::{image_overrides, kind, kubectl};
 
 /// Time allowed for the operator to reconcile a provider's status.
 pub(crate) const STATUS_POLL_TIMEOUT: Duration = Duration::from_secs(60);
@@ -634,8 +634,6 @@ pub(crate) fn cleanup_install_rbac_test_resources(context: &str) -> Result<(), B
     Ok(())
 }
 
-/// Container image name for the Grid operator.
-pub(crate) const OPERATOR_IMAGE: &str = "grid-operator:latest";
 
 /// Build the Grid operator container image.
 ///
@@ -652,12 +650,13 @@ pub(crate) fn build_operator_image() -> Result<(), Box<dyn std::error::Error>> {
     let engine = super::images::docker_engine();
     let containerfile = "deploy/operator/Containerfile";
     let ctx = ctx_dir.path().to_str().ok_or("temp dir path not UTF-8")?;
-    eprintln!("  building {OPERATOR_IMAGE} with {engine}...");
+    let operator_img = image_overrides::operator_image();
+    eprintln!("  building {operator_img} with {engine}...");
     let status = Command::new(&engine)
-        .args(["build", "-f", containerfile, "-t", OPERATOR_IMAGE, ctx])
+        .args(["build", "-f", containerfile, "-t", &operator_img, ctx])
         .status()?;
     if !status.success() {
-        return Err(format!("{engine} build failed for {OPERATOR_IMAGE}").into());
+        return Err(format!("{engine} build failed for {operator_img}").into());
     }
     Ok(())
 }
@@ -673,15 +672,24 @@ pub(crate) fn build_operator_image() -> Result<(), Box<dyn std::error::Error>> {
 ///
 /// Returns an error if the image save or `kind load` fails.
 pub(crate) fn load_operator_image(cluster_name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let operator_img = image_overrides::operator_image();
+
+    // Skip loading if pull policy indicates registry images
+    if image_overrides::should_skip_kind_image_loading() {
+        eprintln!("  skipping loading {operator_img} (pull policy is not Never)");
+        eprintln!("  Kubernetes will pull image from registry");
+        return Ok(());
+    }
+
     let engine = super::images::docker_engine();
     if engine == "podman" {
         load_operator_image_podman(cluster_name)
     } else {
         let status = Command::new("kind")
-            .args(["load", "docker-image", OPERATOR_IMAGE, "--name", cluster_name])
+            .args(["load", "docker-image", &operator_img, "--name", cluster_name])
             .status()?;
         if !status.success() {
-            return Err(format!("kind load docker-image {OPERATOR_IMAGE} failed for {cluster_name}").into());
+            return Err(format!("kind load docker-image {operator_img} failed for {cluster_name}").into());
         }
         Ok(())
     }
@@ -689,12 +697,21 @@ pub(crate) fn load_operator_image(cluster_name: &str) -> Result<(), Box<dyn std:
 
 /// Podman-specific image load: re-tag, save as archive, `kind load`.
 fn load_operator_image_podman(cluster_name: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let qualified = format!("docker.io/library/{OPERATOR_IMAGE}");
+    let operator_img = image_overrides::operator_image();
+
+    // Skip loading if pull policy indicates registry images
+    if image_overrides::should_skip_kind_image_loading() {
+        eprintln!("  skipping loading {operator_img} (pull policy is not Never)");
+        eprintln!("  Kubernetes will pull image from registry");
+        return Ok(());
+    }
+
+    let qualified = format!("docker.io/library/{operator_img}");
     let tag_status = Command::new("podman")
-        .args(["tag", OPERATOR_IMAGE, &qualified])
+        .args(["tag", &operator_img, &qualified])
         .status()?;
     if !tag_status.success() {
-        return Err(format!("podman tag {OPERATOR_IMAGE} → {qualified} failed").into());
+        return Err(format!("podman tag {operator_img} → {qualified} failed").into());
     }
     let archive = tempfile::NamedTempFile::new()?;
     let archive_path = archive.path().to_str().ok_or("temp path not UTF-8")?;
@@ -732,7 +749,7 @@ pub(crate) fn override_operator_image_for_kind(context: &str) -> Result<(), Box<
             "deployment/grid-operator",
             "-n",
             "grid-system",
-            &format!("operator={OPERATOR_IMAGE}"),
+            &format!("operator={}", image_overrides::operator_image()),
         ])
         .status()?;
     if !status.success() {

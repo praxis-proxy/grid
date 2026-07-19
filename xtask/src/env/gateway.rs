@@ -12,7 +12,7 @@ use std::{path::PathBuf, process::Command};
 
 use crate::env::{
     config::{ClusterDef, ClusterRole, EnvConfig, ProviderBackend},
-    images, kind, kubectl,
+    image_overrides, kind, kubectl,
     verify::{HttpResponse, PortForwardGuard, Tally, find_free_port, parse_curl_output, safe_truncate, wait_for_port},
 };
 
@@ -181,6 +181,8 @@ fn apply_tls_secret(
 #[expect(clippy::too_many_lines, reason = "K8s manifest generation")]
 fn apply_mock_epp(context: &str, site_name: &str, def: &ClusterDef) -> Result<(), Box<dyn std::error::Error>> {
     let route_args = mock_epp_route_args(def);
+    let mock_epp_img = image_overrides::mock_epp_image();
+    let pull_policy = image_overrides::image_pull_policy();
     let yaml = format!(
         "apiVersion: apps/v1\n\
          kind: Deployment\n\
@@ -202,8 +204,8 @@ fn apply_mock_epp(context: &str, site_name: &str, def: &ClusterDef) -> Result<()
          \x20   spec:\n\
          \x20     containers:\n\
          \x20       - name: {MOCK_EPP_NAME}\n\
-         \x20         image: {}\n\
-         \x20         imagePullPolicy: Never\n\
+         \x20         image: {mock_epp_img}\n\
+         \x20         imagePullPolicy: {pull_policy}\n\
          \x20         ports:\n\
          \x20           - containerPort: {MOCK_EPP_PORT}\n\
          \x20         args:\n\
@@ -220,7 +222,6 @@ fn apply_mock_epp(context: &str, site_name: &str, def: &ClusterDef) -> Result<()
          \x20 ports:\n\
          \x20   - port: {MOCK_EPP_PORT}\n\
          \x20     targetPort: {MOCK_EPP_PORT}\n",
-        images::MOCK_EPP_IMAGE,
     );
     kubectl::apply_manifest(context, &yaml)
 }
@@ -254,9 +255,8 @@ pub(crate) fn apply_mock_epp_with_extra_model(
     routes.push(format!("            - \"--route={extra_model}={target}\""));
     let route_args = routes.join("\n");
 
-    // Raw string: imagePullPolicy: "Never" contains a literal `"` which justifies r#"..."#.
     let yaml = format!(
-        r#"apiVersion: apps/v1
+        "apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: {MOCK_EPP_NAME}
@@ -277,13 +277,14 @@ spec:
       containers:
         - name: {MOCK_EPP_NAME}
           image: {image}
-          imagePullPolicy: "Never"
+          imagePullPolicy: {pull_policy}
           ports:
             - containerPort: {MOCK_EPP_PORT}
           args:
 {route_args}
-"#,
-        image = images::MOCK_EPP_IMAGE,
+",
+        image = image_overrides::mock_epp_image(),
+        pull_policy = image_overrides::image_pull_policy(),
     );
     kubectl::apply_manifest(context, &yaml)?;
     eprintln!("  [OK] mock-epp patched in {site_name} to also serve {extra_model:?}");
@@ -408,6 +409,8 @@ fn indent_yaml(yaml: &str, spaces: usize) -> String {
 /// Apply the gateway Deployment + Service.
 #[expect(clippy::too_many_lines, reason = "K8s manifest generation")]
 fn apply_gateway_deployment(context: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let gateway_img = image_overrides::gateway_image();
+    let pull_policy = image_overrides::image_pull_policy();
     let yaml = format!(
         "apiVersion: apps/v1\n\
          kind: Deployment\n\
@@ -426,8 +429,8 @@ fn apply_gateway_deployment(context: &str) -> Result<(), Box<dyn std::error::Err
          \x20   spec:\n\
          \x20     containers:\n\
          \x20       - name: praxis-ai\n\
-         \x20         image: {image}\n\
-         \x20         imagePullPolicy: Never\n\
+         \x20         image: {gateway_img}\n\
+         \x20         imagePullPolicy: {pull_policy}\n\
          \x20         ports:\n\
          \x20           - containerPort: {GATEWAY_HTTP_PORT}\n\
          \x20         args:\n\
@@ -460,7 +463,6 @@ fn apply_gateway_deployment(context: &str) -> Result<(), Box<dyn std::error::Err
          \x20   - name: http\n\
          \x20     port: {GATEWAY_HTTP_PORT}\n\
          \x20     targetPort: {GATEWAY_HTTP_PORT}\n",
-        image = images::GATEWAY_IMAGE,
     );
     kubectl::apply_manifest(context, &yaml)
 }

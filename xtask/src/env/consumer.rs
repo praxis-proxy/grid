@@ -21,7 +21,7 @@ use std::{
 
 use crate::env::{
     config::{ClusterDef, ClusterRole, EnvConfig},
-    images::GATEWAY_IMAGE,
+    image_overrides,
     kind::kubectl_context,
     kubectl,
     operator_overlay::{self, RoutingOverlay},
@@ -47,7 +47,7 @@ const NAMESPACE: &str = "default";
 pub(crate) const API_PROVIDER_INJECTED_TOKEN: &str = "grid-api-fallback-secret";
 
 /// Gateway HTTP port.
-const GATEWAY_HTTP_PORT: u16 = 8080;
+pub(crate) const GATEWAY_HTTP_PORT: u16 = 8080;
 
 /// `NodePort` range minimum for provider gateway exposure.
 const NODE_PORT_BASE: u16 = 30080;
@@ -801,6 +801,8 @@ fn build_clusters(providers: &[ProviderEndpoint]) -> String {
 /// Apply the consumer gateway Deployment and Service.
 #[expect(clippy::too_many_lines, reason = "K8s manifest generation")]
 fn apply_consumer_deployment(context: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let gateway_img = image_overrides::gateway_image();
+    let pull_policy = image_overrides::image_pull_policy();
     let yaml = format!(
         "apiVersion: apps/v1\n\
          kind: Deployment\n\
@@ -819,8 +821,8 @@ fn apply_consumer_deployment(context: &str) -> Result<(), Box<dyn std::error::Er
          \x20   spec:\n\
          \x20     containers:\n\
          \x20       - name: praxis-ai\n\
-         \x20         image: {GATEWAY_IMAGE}\n\
-         \x20         imagePullPolicy: Never\n\
+         \x20         image: {gateway_img}\n\
+         \x20         imagePullPolicy: {pull_policy}\n\
          \x20         ports:\n\
          \x20           - containerPort: {GATEWAY_HTTP_PORT}\n\
          \x20         args:\n\
@@ -874,6 +876,8 @@ fn apply_consumer_deployment_with_credential_mount(
     secret_key: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mount_path = format!("{CREDENTIAL_MOUNT_BASE}/{secret_name}");
+    let gateway_img = image_overrides::gateway_image();
+    let pull_policy = image_overrides::image_pull_policy();
     let yaml = format!(
         "apiVersion: apps/v1\n\
          kind: Deployment\n\
@@ -892,8 +896,8 @@ fn apply_consumer_deployment_with_credential_mount(
          \x20   spec:\n\
          \x20     containers:\n\
          \x20       - name: praxis-ai\n\
-         \x20         image: {GATEWAY_IMAGE}\n\
-         \x20         imagePullPolicy: Never\n\
+         \x20         image: {gateway_img}\n\
+         \x20         imagePullPolicy: {pull_policy}\n\
          \x20         ports:\n\
          \x20           - containerPort: {GATEWAY_HTTP_PORT}\n\
          \x20         args:\n\
@@ -2139,7 +2143,7 @@ fn rollout_restart_args(context: &str, deployment: &str) -> Vec<String> {
 /// **xtask validation concern only.**  Production deployments are responsible
 /// for a gateway reload or restart strategy when generated config changes.  The
 /// forced restart here keeps xtask E2E validation deterministic.
-fn rollout_restart(context: &str, deployment: &str) -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) fn rollout_restart(context: &str, deployment: &str) -> Result<(), Box<dyn std::error::Error>> {
     let status = Command::new("kubectl")
         .args(rollout_restart_args(context, deployment))
         .status()?;
