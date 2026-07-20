@@ -16,20 +16,25 @@ Grid is the Kubernetes control plane for multi-site AI routing with
 ## What Grid does not do
 
 Grid does not proxy model traffic, translate provider APIs, or run Praxis HTTP
-filters. Praxis handles request routing, filter execution, mTLS termination,
-credential handling, and backend proxying.
+filters. The Praxis gateway stack handles TLS, proxying, and backend I/O;
+Praxis AI supplies the AI-specific routing and credential filters.
 
 ## Getting started
+
+Some Kind validations require Praxis AI and Praxis Core features that are still
+pending merge or project-owned image publication. Until those images are
+available, use the documented xtask image override environment variables for
+local development runs.
 
 ```sh
 # Validate operator routing overlay generation in kind
 cargo xtask env validate-operator-routing -c tests/env/operator-routing.toml
 
 # Validate the dedicated llm-d-compatible provider-gateway path
-# Uses Praxis AI ext_proc with mock EPP test image (requires pending AI PRs)
+# Uses Praxis AI ext_proc with mock EPP test image
 cargo xtask env verify-llmd-compatible-routing -c tests/env/operator-routing-multisite.toml
 
-# Validate OpenAI /v1/responses routing with openai_responses_format filter
+# Validate /v1/responses request parsing and Grid overlay routing
 cargo xtask env verify-responses-routing -c tests/env/operator-routing-multisite.toml
 
 # Validate full-grid routing across local, remote, cloud mock, and API mock

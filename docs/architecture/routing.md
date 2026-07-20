@@ -98,12 +98,13 @@ The token value is **never written into the overlay ConfigMap**. The `grid_route
 filter parses the field and makes it available to downstream filters, but does
 not perform Kubernetes API calls or inject credentials itself.
 
-Credential injection is handled by the egress component that makes the final
+Credential injection is handled by the final-hop gateway that makes the final
 backend call.  For direct API-provider or cloud-provider fallback, the consumer
-gateway is usually both ingress and egress, so it mounts the Secret and injects
-or signs before forwarding to the provider API.  For remote Grid sites, provider
-backend credentials stay in the remote provider site or provider-side component;
-the ingress gateway should not receive those provider tokens.
+gateway is often also the final-hop gateway, so it mounts the Secret and Praxis
+AI injects the credential before forwarding to the provider API.  For remote
+Grid sites, provider backend credentials stay in the remote provider site or
+provider-side component; the consumer gateway should not receive those provider
+tokens.
 
 Native file-backed injection requires the Praxis AI `grid_credential_inject`
 filter.  Grid can render the overlay and generated config for that path today,
@@ -258,14 +259,14 @@ The difference is the backend category and credential handling:
 3. Scoring normally places self-hosted candidates ahead of API-provider
    candidates, so API providers are used as fallback or explicit lower-priority
    routes.
-4. Praxis applies credential injection before forwarding the request to the
+4. Praxis AI applies credential injection before forwarding the request to the
    provider endpoint (see "Credential injection" below).
 5. If no self-hosted candidate is available for a model, the API-provider
    candidate can become the selected route.
 
 The fallback decision is therefore still local to the consumer gateway at
 request time: `grid_route` selects from the pre-rendered candidate list, and the
-Praxis filter chain handles credential injection and upstream forwarding.
+Praxis AI filter chain handles credential injection and upstream forwarding.
 
 Current local validation uses mock API-provider endpoints. That proves the Grid
 overlay and Praxis routing/credential-injection mechanics. It does not prove a
@@ -329,9 +330,9 @@ a Kubernetes Secret in the consumer cluster.  The consumer pod mounts that
 Secret as a file, and `grid_credential_inject` reads the token from its
 configured `file:` path at filter construction time.
 
-In production, the same rule applies at the egress point: mount the Secret only
-into the gateway or provider-side component that makes the final backend call.
-Grid does not copy Secret values across clusters.
+In production, the same rule applies at the final-hop point: mount the Secret
+only into the final-hop gateway or provider-side component that makes the final
+backend call. Grid does not copy Secret values across clusters.
 
 The token does NOT appear in:
 
@@ -346,11 +347,12 @@ The token does NOT appear in:
 
 The operator generates the consumer Praxis config including the `grid_credential_inject`
 section for direct API-provider routes.  Secret provisioning — creating,
-rotating, and synchronizing the mounted credential Secret in the egress cluster
-— is the responsibility of platform automation or an external Secret manager.
+rotating, and synchronizing the mounted credential Secret in the final-hop
+cluster — is the responsibility of platform automation or an external Secret
+manager.
 
 The `grid_route` → `grid_credential_inject` filter chain interface is the same
-regardless of how the egress Secret is provisioned.
+regardless of how the final-hop Secret is provisioned.
 
 ## Routing eligibility
 

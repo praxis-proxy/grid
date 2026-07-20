@@ -129,15 +129,13 @@ only `{ strategy, secretRef }`; token bytes remain in
 Kubernetes Secrets and are read by the data plane through
 mounted files.
 
-Credential injection follows the final-hop rule: the
-Secret is mounted only where the provider call is made.
-For direct API-provider or cloud-provider fallback, the
-consumer gateway is also the egress gateway and injects or
-signs before calling the provider API.  For remote Grid
-sites, provider credentials stay in the remote provider
-site or provider-side component that calls its local
-backend.  Grid carries references for routing and config;
-it does not copy Secret values across clusters.
+Credential injection follows the final-hop rule: the Secret is mounted only
+where the provider call is made. For direct API-provider or cloud-provider
+fallback, the consumer gateway is often also the final-hop gateway and injects
+or signs before calling the provider API. For remote Grid sites, provider
+credentials stay in the remote provider site or provider-side component that
+calls its local backend. Grid carries references for routing and config; it does
+not copy Secret values across clusters.
 
 The Grid Operator also participates in the peer-to-peer
 control plane.  SWIM membership supplies liveness

@@ -257,6 +257,7 @@ mod tests {
                 queue_depth: Some(queue),
                 ..Default::default()
             },
+            access_policy: crdt::ProviderAccessPolicy::default(),
             revision: 1,
             writer_id: site.to_owned(),
         });

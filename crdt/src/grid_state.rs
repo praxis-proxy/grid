@@ -8,12 +8,38 @@
 //! Merge semantics are deterministic, commutative, associative, and idempotent:
 //! - provider records are last-writer-wins by `(revision, writer_id)`;
 //! - capabilities use the existing add-wins [`OrSet`].
+//!
+//! # Provider Access Policy
+//!
+//! Provider access policy enforcement allows providers to restrict which consumer
+//! sites may use them. Existing unrestricted-provider behavior is preserved: an
+//! empty accessPolicy still means allow all. This pre-release CRDT wire-shape
+//! change assumes all Grid operators in a Kind/test mesh run the same build.
+//! Mixed-version SWIM/CRDT compatibility is not currently defined or tested.
 
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
 use crate::OrSet;
+
+// ---------------------------------------------------------------------------
+// Access policy
+// ---------------------------------------------------------------------------
+
+/// CRDT-compatible representation of provider access policy.
+///
+/// Mirrors the operator's `AccessPolicy` but uses basic types suitable
+/// for CRDT propagation. Empty `match_labels` means allow all consumers.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ProviderAccessPolicy {
+    /// Labels that consumer sites must match to use this provider.
+    ///
+    /// Empty map means allow all consumers (backward compatible default).
+    /// Non-empty requires exact label matching.
+    pub match_labels: BTreeMap<String, String>,
+}
+
 
 // ---------------------------------------------------------------------------
 // Capability
@@ -100,6 +126,14 @@ pub struct ProviderState {
 
     /// Optional normalized metrics.
     pub metrics: ProviderMetricsSnapshot,
+
+    /// Access policy for consumer authorization.
+    ///
+    /// When empty `match_labels`, the provider allows all consumers (preserving
+    /// existing behavior). When non-empty labels, consumer sites must match
+    /// exactly to access this provider.
+    #[serde(default)]
+    pub access_policy: ProviderAccessPolicy,
 
     /// Monotonic per-writer revision for this provider record.
     pub revision: u64,
@@ -201,6 +235,7 @@ mod tests {
                 queue_depth: Some(queue_depth),
                 ..ProviderMetricsSnapshot::default()
             },
+            access_policy: ProviderAccessPolicy::default(), // Empty policy = allow all
             revision,
             writer_id: site.to_owned(),
         }
@@ -346,6 +381,97 @@ mod tests {
         assert!(
             restored.provider("net", "site-p", "provider").is_some(),
             "provider must survive serde"
+        );
+    }
+
+    #[test]
+    fn snapshot_bincode_round_trip_with_default_access_policy() {
+        // Test bincode round-trip with default (empty) access policy
+        let mut snap = GridStateSnapshot::new("site-a".to_owned());
+        let mut provider_state = provider("site-a", "provider-default", 1, 0.5);
+        provider_state.access_policy = ProviderAccessPolicy::default(); // Empty policy
+        snap.upsert_provider(provider_state);
+
+        let bytes =
+            bincode::serde::encode_to_vec(&snap, bincode::config::standard()).unwrap_or_else(|_| std::process::abort());
+        let (restored, _len): (GridStateSnapshot, usize) =
+            bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
+                .unwrap_or_else(|_| std::process::abort());
+
+        let restored_provider = restored
+            .provider("net", "site-a", "provider-default")
+            .unwrap_or_else(|| std::process::abort());
+        assert!(
+            restored_provider.access_policy.match_labels.is_empty(),
+            "default access policy must survive bincode round-trip"
+        );
+    }
+
+    #[test]
+    #[expect(clippy::too_many_lines, reason = "test needs comprehensive assertions")]
+    fn snapshot_bincode_round_trip_with_restricted_access_policy() {
+        // Test bincode round-trip with restricted access policy
+        let mut snap = GridStateSnapshot::new("site-b".to_owned());
+        let mut provider_state = provider("site-b", "provider-restricted", 2, 0.8);
+        provider_state.access_policy = ProviderAccessPolicy {
+            match_labels: [
+                ("env".to_owned(), "prod".to_owned()),
+                ("team".to_owned(), "platform".to_owned()),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        snap.upsert_provider(provider_state);
+
+        let bytes =
+            bincode::serde::encode_to_vec(&snap, bincode::config::standard()).unwrap_or_else(|_| std::process::abort());
+        let (restored, _len): (GridStateSnapshot, usize) =
+            bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
+                .unwrap_or_else(|_| std::process::abort());
+
+        let restored_provider = restored
+            .provider("net", "site-b", "provider-restricted")
+            .unwrap_or_else(|| std::process::abort());
+        assert_eq!(
+            restored_provider.access_policy.match_labels.len(),
+            2,
+            "restricted access policy labels must survive bincode round-trip"
+        );
+        assert_eq!(
+            restored_provider.access_policy.match_labels.get("env"),
+            Some(&"prod".to_owned()),
+            "env label must survive bincode round-trip"
+        );
+        assert_eq!(
+            restored_provider.access_policy.match_labels.get("team"),
+            Some(&"platform".to_owned()),
+            "team label must survive bincode round-trip"
+        );
+    }
+
+    #[test]
+    fn provider_access_policy_json_decode_missing_field_defaults_to_allow_all() {
+        // Test JSON deserialization when access_policy field is missing
+        // This ensures that #[serde(default)] works for JSON compatibility
+        let json_without_access_policy = r#"{
+            "network_id": "net",
+            "site_id": "site-c",
+            "provider_id": "provider-json",
+            "routing_cluster": "site-c",
+            "models": ["model-y"],
+            "backend_kind": "local",
+            "phase": "Available",
+            "metrics": {},
+            "revision": 5,
+            "writer_id": "site-c"
+        }"#;
+
+        let provider: ProviderState =
+            serde_json::from_str(json_without_access_policy).unwrap_or_else(|_| std::process::abort());
+
+        assert!(
+            provider.access_policy.match_labels.is_empty(),
+            "missing access_policy field must default to empty (allow all)"
         );
     }
 }

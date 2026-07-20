@@ -1323,6 +1323,7 @@ mod tests {
             backend_kind: "local".to_owned(),
             phase: crdt::ProviderPhase::Available,
             metrics: crdt::ProviderMetricsSnapshot::default(),
+            access_policy: crdt::ProviderAccessPolicy::default(),
             revision: 1,
             writer_id: "site-a".to_owned(),
         });

@@ -50,7 +50,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     crd::{
-        auth::AuthStrategy,
+        auth::{AccessPolicy, AuthStrategy},
         grid_network::GridNetwork,
         grid_site::GridSite,
         inference_provider::{InferenceProvider, ProviderPhase},
@@ -631,6 +631,76 @@ pub(crate) fn build_grid_state_with_metrics(
 }
 
 // ---------------------------------------------------------------------------
+// Access policy evaluation
+// ---------------------------------------------------------------------------
+
+/// Result of evaluating a provider's access policy against consumer site labels.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum AccessPolicyResult {
+    /// Access allowed: provider has no restrictions OR consumer site matches required labels.
+    Allow,
+
+    /// Access denied: provider requires specific labels but consumer site doesn't match.
+    Deny,
+
+    /// Access indeterminate: consumer site identity is unknown or ambiguous.
+    /// For restricted providers this should be treated as deny (fail closed).
+    Unknown,
+}
+
+/// Evaluate a provider's access policy against consumer site labels.
+///
+/// This function implements the provider access-policy enforcement logic:
+/// - Empty `accessPolicy.siteSelector.matchLabels` means allow all (preserve existing default)
+/// - Non-empty means consumer site must have matching labels
+/// - Consumer site identity absence/ambiguity with restricted provider fails closed
+///
+/// # Arguments
+///
+/// * `access_policy` - The provider's access policy configuration
+/// * `consumer_site_labels` - Labels of the consumer site, if known
+///
+/// # Returns
+///
+/// * `AccessPolicyResult::Allow` - Access permitted
+/// * `AccessPolicyResult::Deny` - Access explicitly denied due to label mismatch
+/// * `AccessPolicyResult::Unknown` - Consumer identity unknown/ambiguous
+///
+/// # Design Notes
+///
+/// This function is separate from placement logic (`siteSelector`) and evaluates
+/// authorization policy (`accessPolicy`) independently. The provider's `siteSelector`
+/// controls where the provider is placed; the `accessPolicy` controls which consumer
+/// sites may use it.
+pub(crate) fn evaluate_access_policy(
+    access_policy: &AccessPolicy,
+    consumer_site_labels: Option<&BTreeMap<String, String>>,
+) -> AccessPolicyResult {
+    let required_labels = &access_policy.site_selector.match_labels;
+
+    // Empty access policy means allow all - preserve existing behavior
+    if required_labels.is_empty() {
+        return AccessPolicyResult::Allow;
+    }
+
+    // Provider has restrictions - consumer site must be known
+    let Some(site_labels) = consumer_site_labels else {
+        return AccessPolicyResult::Unknown;
+    };
+
+    // Check if all required labels are present and match
+    let matches = required_labels
+        .iter()
+        .all(|(required_key, required_value)| site_labels.get(required_key) == Some(required_value));
+
+    if matches {
+        AccessPolicyResult::Allow
+    } else {
+        AccessPolicyResult::Deny
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Site resolution
 // ---------------------------------------------------------------------------
 
@@ -811,6 +881,12 @@ pub struct RoutingOverlay {
 /// local_site = gw_ref.local_site_name.as_deref().unwrap_or(network_name)
 /// ```
 ///
+/// Provider access policy enforcement: Each provider's `spec.accessPolicy`
+/// is evaluated against the consumer site's labels. Providers with non-empty
+/// access policies will only generate candidates if the consumer site matches
+/// the required labels. Empty access policies allow all consumers (preserving
+/// existing behavior).
+///
 /// Candidates are sorted by the scoring engine (descending score) then
 /// `(site, name, cluster)` for ties.  Scores are computed by
 /// [`scoring::score_backends`] using [`scoring::ScoringWeights::default`]
@@ -880,9 +956,47 @@ pub fn render_routing_overlay(
         metrics,
     );
 
-    let mut candidates = collect_candidates(network_name, sites, providers)?;
+    // Find the consumer site to get its labels for access policy evaluation
+    let consumer_site_labels = sites
+        .iter()
+        .find(|site| site.metadata.name.as_deref() == Some(local_site) && site.spec.grid_network_ref == network_name)
+        .and_then(|site| site.metadata.labels.as_ref());
+
+    let mut candidates = collect_candidates(network_name, sites, providers, consumer_site_labels)?;
     for provider in remote_crdt_providers {
-        candidates.extend(remote_crdt_provider_to_candidates(provider));
+        // Apply access policy enforcement for remote CRDT providers
+        let access_policy = crdt_access_policy_to_operator(&provider.access_policy);
+        let access_result = evaluate_access_policy(&access_policy, consumer_site_labels);
+        match access_result {
+            AccessPolicyResult::Allow => {
+                // Provider allows this consumer - include candidates
+                candidates.extend(remote_crdt_provider_to_candidates(provider));
+            },
+            AccessPolicyResult::Deny => {
+                // Provider explicitly denies this consumer - skip candidates
+                tracing::debug!(
+                    provider_id = %provider.provider_id,
+                    site_id = %provider.site_id,
+                    network = network_name,
+                    "remote access policy denied: consumer site labels do not match provider requirements"
+                );
+            },
+            AccessPolicyResult::Unknown => {
+                // Consumer identity unknown - fail closed for restricted providers
+                if provider.access_policy.match_labels.is_empty() {
+                    // Unrestricted provider - allow (preserve existing behavior)
+                    candidates.extend(remote_crdt_provider_to_candidates(provider));
+                } else {
+                    // Restricted provider with unknown consumer - fail closed
+                    tracing::debug!(
+                        provider_id = %provider.provider_id,
+                        site_id = %provider.site_id,
+                        network = network_name,
+                        "remote access policy failed closed: consumer site identity unknown for restricted provider"
+                    );
+                }
+            },
+        }
     }
     candidates.sort_by(|a, b| {
         let score_a = ordering.get(a.cluster.as_str()).copied().unwrap_or(DEFAULT_LOCALITY);
@@ -909,16 +1023,74 @@ pub fn render_routing_overlay(
     })
 }
 
+/// Convert a CRDT `ProviderAccessPolicy` to an operator `AccessPolicy` for evaluation.
+fn crdt_access_policy_to_operator(crdt_policy: &crdt::ProviderAccessPolicy) -> AccessPolicy {
+    use crate::crd::auth::SelectorConfig;
+    AccessPolicy {
+        site_selector: SelectorConfig {
+            match_labels: crdt_policy.match_labels.clone(),
+        },
+    }
+}
+
+/// Check if a provider should be included for a given consumer based on access policy.
+///
+/// Returns `true` if the provider should generate candidates for the consumer,
+/// `false` if it should be excluded due to access policy restrictions.
+fn should_include_provider_for_consumer(
+    provider: &InferenceProvider,
+    consumer_site_labels: Option<&BTreeMap<String, String>>,
+    network_name: &str,
+) -> bool {
+    let access_result = evaluate_access_policy(&provider.spec.access_policy, consumer_site_labels);
+    match access_result {
+        AccessPolicyResult::Allow => {
+            // Provider allows this consumer - proceed with candidate generation
+            true
+        },
+        AccessPolicyResult::Deny => {
+            // Provider explicitly denies this consumer - skip candidate generation
+            tracing::debug!(
+                provider = %provider.metadata.name.as_deref().unwrap_or("unknown"),
+                network = network_name,
+                "access policy denied: consumer site labels do not match provider requirements"
+            );
+            false
+        },
+        AccessPolicyResult::Unknown => {
+            // Consumer identity unknown - fail closed for restricted providers
+            if provider.spec.access_policy.site_selector.match_labels.is_empty() {
+                // Unrestricted provider - allow (preserve existing behavior)
+                true
+            } else {
+                // Restricted provider with unknown consumer - fail closed
+                tracing::debug!(
+                    provider = %provider.metadata.name.as_deref().unwrap_or("unknown"),
+                    network = network_name,
+                    "access policy failed closed: consumer site identity unknown for restricted provider"
+                );
+                false
+            }
+        },
+    }
+}
+
 /// Collect [`RoutingCandidate`]s from providers belonging to `network_name`.
 ///
 /// Providers explicitly marked [`ProviderPhase::Unavailable`] in their status
 /// are excluded.  Providers in any other phase (`Pending`, `Available`,
 /// `Degraded`, or absent status) are included.  See [`is_explicitly_unavailable`]
 /// for the rationale.
+///
+/// Provider access policy enforcement: Each provider's `spec.accessPolicy` is
+/// evaluated against the `consumer_site_labels`. Providers with non-empty access
+/// policies will only generate candidates if the consumer site matches the required
+/// labels. Empty access policies allow all consumers (preserving existing behavior).
 fn collect_candidates(
     network_name: &str,
     sites: &[GridSite],
     providers: &[InferenceProvider],
+    consumer_site_labels: Option<&BTreeMap<String, String>>,
 ) -> Result<Vec<RoutingCandidate>, String> {
     // Pre-filter sites to those in this network.
     let network_sites: Vec<&GridSite> = sites
@@ -934,6 +1106,12 @@ fn collect_candidates(
         if is_explicitly_unavailable(provider) {
             continue;
         }
+
+        // Apply access policy enforcement before generating candidates
+        if !should_include_provider_for_consumer(provider, consumer_site_labels, network_name) {
+            continue;
+        }
+
         let resolution = resolve_sites(provider, &network_sites);
         all.extend(candidates_from_provider(provider, &resolution)?);
     }
@@ -3257,6 +3435,7 @@ mod tests {
             backend_kind: "local".to_owned(),
             phase,
             metrics: crdt::ProviderMetricsSnapshot::default(),
+            access_policy: crdt::ProviderAccessPolicy::default(),
             revision: 1,
             writer_id: site_id.to_owned(),
         }
@@ -3837,6 +4016,7 @@ mod tests {
             backend_kind: "remote".to_owned(),
             phase: crdt::ProviderPhase::Available,
             metrics: crdt::ProviderMetricsSnapshot::default(),
+            access_policy: crdt::ProviderAccessPolicy::default(),
             revision: 1,
             writer_id: "w".to_owned(),
         }
@@ -4044,6 +4224,715 @@ mod tests {
             overlay.candidates.first().map(|c| c.cluster.as_str()),
             Some("prov-local"),
             "local provider must be the sole candidate when remote CRDT providers is empty"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Access policy evaluation tests
+    // -----------------------------------------------------------------------
+
+    /// Test utility to create an [`AccessPolicy`] with the given match labels.
+    fn test_access_policy(labels: &[(&str, &str)]) -> AccessPolicy {
+        use crate::crd::auth::SelectorConfig;
+        let match_labels = labels.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        AccessPolicy {
+            site_selector: SelectorConfig { match_labels },
+        }
+    }
+
+    /// Test utility to create consumer site labels from key-value pairs.
+    fn test_site_labels(labels: &[(&str, &str)]) -> BTreeMap<String, String> {
+        labels.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    /// Test utility to create a remote CRDT provider with access policy labels.
+    fn test_crdt_provider_with_access_policy(
+        site_id: &str,
+        provider_id: &str,
+        access_policy_labels: &[(&str, &str)],
+    ) -> crdt::ProviderState {
+        let access_policy = crdt::ProviderAccessPolicy {
+            match_labels: access_policy_labels
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        };
+        crdt::ProviderState {
+            network_id: "net".to_owned(),
+            site_id: site_id.to_owned(),
+            provider_id: provider_id.to_owned(),
+            routing_cluster: provider_id.to_owned(),
+            models: vec!["model-remote".to_owned()],
+            backend_kind: "remote".to_owned(),
+            phase: crdt::ProviderPhase::Available,
+            metrics: crdt::ProviderMetricsSnapshot::default(),
+            access_policy,
+            revision: 1,
+            writer_id: site_id.to_owned(),
+        }
+    }
+
+    /// Test utility to create an unrestricted remote CRDT provider.
+    fn test_crdt_provider_unrestricted(site_id: &str, provider_id: &str) -> crdt::ProviderState {
+        test_crdt_provider_with_access_policy(site_id, provider_id, &[])
+    }
+
+    #[test]
+    fn evaluate_access_policy_empty_policy_allows_all() {
+        let policy = test_access_policy(&[]);
+        let result = evaluate_access_policy(&policy, None);
+        assert_eq!(
+            result,
+            AccessPolicyResult::Allow,
+            "empty access policy must allow all consumers"
+        );
+
+        let labels = test_site_labels(&[("env", "prod")]);
+        let result = evaluate_access_policy(&policy, Some(&labels));
+        assert_eq!(
+            result,
+            AccessPolicyResult::Allow,
+            "empty access policy must allow any consumer"
+        );
+    }
+
+    #[test]
+    fn evaluate_access_policy_matching_labels_allow() {
+        let policy = test_access_policy(&[("env", "prod"), ("region", "us-west")]);
+        let labels = test_site_labels(&[("env", "prod"), ("region", "us-west"), ("team", "platform")]);
+        let result = evaluate_access_policy(&policy, Some(&labels));
+        assert_eq!(
+            result,
+            AccessPolicyResult::Allow,
+            "consumer with matching labels must be allowed"
+        );
+    }
+
+    #[test]
+    fn evaluate_access_policy_subset_labels_allow() {
+        let policy = test_access_policy(&[("env", "prod")]);
+        let labels = test_site_labels(&[("env", "prod"), ("region", "us-west")]);
+        let result = evaluate_access_policy(&policy, Some(&labels));
+        assert_eq!(
+            result,
+            AccessPolicyResult::Allow,
+            "consumer with superset labels must be allowed"
+        );
+    }
+
+    #[test]
+    fn evaluate_access_policy_missing_required_label_deny() {
+        let policy = test_access_policy(&[("env", "prod"), ("region", "us-west")]);
+        let labels = test_site_labels(&[("env", "prod")]);
+        let result = evaluate_access_policy(&policy, Some(&labels));
+        assert_eq!(
+            result,
+            AccessPolicyResult::Deny,
+            "consumer missing required label must be denied"
+        );
+    }
+
+    #[test]
+    fn evaluate_access_policy_wrong_label_value_deny() {
+        let policy = test_access_policy(&[("env", "prod")]);
+        let labels = test_site_labels(&[("env", "staging")]);
+        let result = evaluate_access_policy(&policy, Some(&labels));
+        assert_eq!(
+            result,
+            AccessPolicyResult::Deny,
+            "consumer with wrong label value must be denied"
+        );
+    }
+
+    #[test]
+    fn evaluate_access_policy_no_consumer_labels_unknown() {
+        let policy = test_access_policy(&[("env", "prod")]);
+        let result = evaluate_access_policy(&policy, None);
+        assert_eq!(
+            result,
+            AccessPolicyResult::Unknown,
+            "unknown consumer with restricted provider must return unknown"
+        );
+    }
+
+    #[test]
+    fn evaluate_access_policy_empty_consumer_labels_deny() {
+        let policy = test_access_policy(&[("env", "prod")]);
+        let labels = test_site_labels(&[]);
+        let result = evaluate_access_policy(&policy, Some(&labels));
+        assert_eq!(
+            result,
+            AccessPolicyResult::Deny,
+            "consumer with no labels but restricted provider must be denied"
+        );
+    }
+
+    #[test]
+    fn evaluate_access_policy_exact_match_required() {
+        let policy = test_access_policy(&[("env", "prod")]);
+        let labels = test_site_labels(&[("env", "production")]);
+        let result = evaluate_access_policy(&policy, Some(&labels));
+        assert_eq!(result, AccessPolicyResult::Deny, "label values must match exactly");
+    }
+
+    // -----------------------------------------------------------------------
+    // Access policy integration tests with CRD objects
+    // -----------------------------------------------------------------------
+
+    /// Test utility to create a provider with access policy labels.
+    fn test_provider_with_access_policy(
+        name: &str,
+        network: &str,
+        models: &[&str],
+        access_policy_labels: &[(&str, &str)],
+    ) -> InferenceProvider {
+        let models_json: Vec<serde_json::Value> = models.iter().map(|m| serde_json::json!({ "name": m })).collect();
+        let match_labels: serde_json::Map<String, serde_json::Value> = access_policy_labels
+            .iter()
+            .map(|(k, v)| (k.to_string(), serde_json::Value::String(v.to_string())))
+            .collect();
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "kind": "InferenceProvider",
+            "metadata": { "name": name },
+            "spec": {
+                "gridNetworkRef": network,
+                "providerKind": "self_hosted",
+                "backendKind": "local",
+                "endpoint": "http://localhost:8000",
+                "models": models_json,
+                "accessPolicy": { "siteSelector": { "matchLabels": match_labels } }
+            }
+        }))
+        .unwrap_or_else(|_| std::process::abort())
+    }
+
+    #[test]
+    fn overlay_unrestricted_provider_allows_all_consumers() {
+        // Provider with empty access policy should allow all consumers (existing behavior)
+        let network = test_network("net");
+        let site_prod = test_site_with_labels("site-prod", "net", &[("env", "prod")]);
+        let site_staging = test_site_with_labels("site-staging", "net", &[("env", "staging")]);
+        let provider = test_provider("unrestricted-prov", "net", &["model-a"]);
+
+        // The provider has an empty siteSelector, so it should generate candidates
+        // for ALL sites in the network when it appears in any overlay.
+        // With both sites present and an unrestricted access policy,
+        // we get one candidate per site.
+
+        // Consumer from prod site should get candidates for all sites
+        let overlay = render_routing_overlay(
+            &network,
+            &[site_prod.clone(), site_staging.clone()],
+            std::slice::from_ref(&provider),
+            &[],
+            "site-prod",
+            None,
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            overlay.candidates.len(),
+            2,
+            "unrestricted provider with empty selector must serve all sites"
+        );
+        let site_names: BTreeSet<&str> = overlay.candidates.iter().map(|c| c.site.as_str()).collect();
+        assert!(site_names.contains("site-prod"), "must include prod site");
+        assert!(site_names.contains("site-staging"), "must include staging site");
+
+        // Consumer from staging site should get the same candidates (all sites)
+        let overlay = render_routing_overlay(
+            &network,
+            &[site_prod, site_staging],
+            &[provider],
+            &[],
+            "site-staging",
+            None,
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            overlay.candidates.len(),
+            2,
+            "unrestricted provider must serve all sites regardless of consumer"
+        );
+    }
+
+    #[test]
+    fn overlay_restricted_provider_allows_matching_consumer() {
+        // Provider requiring "env=prod" should allow consumer with matching label
+        let network = test_network("net");
+        let site_prod = test_site_with_labels("site-prod", "net", &[("env", "prod"), ("region", "us-west")]);
+        let site_staging = test_site_with_labels("site-staging", "net", &[("env", "staging")]);
+        let provider = test_provider_with_access_policy("prod-only-prov", "net", &["model-a"], &[("env", "prod")]);
+
+        // Consumer from prod site should get candidates
+        // Since the provider has an empty siteSelector but restricted access policy,
+        // it will generate candidates for all sites if the consumer passes access policy
+        let overlay = render_routing_overlay(
+            &network,
+            &[site_prod.clone(), site_staging.clone()],
+            std::slice::from_ref(&provider),
+            &[],
+            "site-prod",
+            None,
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            overlay.candidates.len(),
+            2,
+            "matching consumer must get candidates for all sites from restricted provider"
+        );
+        assert!(
+            overlay.candidates.iter().all(|c| c.cluster == "prod-only-prov"),
+            "all candidates must be from restricted provider"
+        );
+
+        // Consumer from staging site should get no candidates due to access policy
+        let overlay = render_routing_overlay(
+            &network,
+            &[site_prod, site_staging],
+            &[provider],
+            &[],
+            "site-staging",
+            None,
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            overlay.candidates.len(),
+            0,
+            "non-matching consumer must get no candidates from restricted provider"
+        );
+    }
+
+    #[test]
+    fn overlay_restricted_provider_denies_non_matching_consumer() {
+        // Provider requiring specific labels should deny consumer without those labels
+        let network = test_network("net");
+        let site_prod = test_site_with_labels("site-prod", "net", &[("env", "prod"), ("team", "platform")]);
+        let site_wrong_env = test_site_with_labels("site-staging", "net", &[("env", "staging"), ("team", "platform")]);
+        let site_wrong_team = test_site_with_labels("site-other", "net", &[("env", "prod"), ("team", "ml")]);
+        let provider = test_provider_with_access_policy(
+            "restricted-prov",
+            "net",
+            &["model-a"],
+            &[("env", "prod"), ("team", "platform")],
+        );
+
+        // Consumer with exact matching labels should get candidates
+        let overlay = render_routing_overlay(
+            &network,
+            std::slice::from_ref(&site_prod),
+            std::slice::from_ref(&provider),
+            &[],
+            "site-prod",
+            None,
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            overlay.candidates.len(),
+            1,
+            "exactly matching consumer must get candidates"
+        );
+
+        // Consumer with wrong env should get no candidates
+        let overlay = render_routing_overlay(
+            &network,
+            &[site_prod.clone(), site_wrong_env.clone()],
+            std::slice::from_ref(&provider),
+            &[],
+            "site-staging",
+            None,
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            overlay.candidates.len(),
+            0,
+            "consumer with wrong env must get no candidates"
+        );
+
+        // Consumer with wrong team should get no candidates
+        let overlay = render_routing_overlay(
+            &network,
+            &[site_prod, site_wrong_env, site_wrong_team],
+            &[provider],
+            &[],
+            "site-other",
+            None,
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            overlay.candidates.len(),
+            0,
+            "consumer with wrong team must get no candidates"
+        );
+    }
+
+    #[test]
+    fn overlay_unknown_consumer_fails_closed_for_restricted_provider() {
+        // When consumer site identity is unknown, restricted providers should fail closed
+        let network = test_network("net");
+        let site = test_site_with_labels("known-site", "net", &[("env", "prod")]);
+        let provider_restricted =
+            test_provider_with_access_policy("restricted-prov", "net", &["model-a"], &[("env", "prod")]);
+        let provider_unrestricted = test_provider("unrestricted-prov", "net", &["model-b"]);
+
+        // Consumer site not in the sites list (unknown identity)
+        let overlay = render_routing_overlay(
+            &network,
+            &[site],
+            &[provider_restricted, provider_unrestricted],
+            &[],
+            "unknown-site",
+            None,
+        )
+        .unwrap_or_else(|_| std::process::abort());
+
+        // Should only get candidates from unrestricted provider for the known site
+        assert_eq!(
+            overlay.candidates.len(),
+            1,
+            "only unrestricted provider should serve unknown consumer"
+        );
+        assert_eq!(
+            overlay.candidates.first().map(|c| c.cluster.as_str()),
+            Some("unrestricted-prov"),
+            "candidate must be from unrestricted provider"
+        );
+    }
+
+    #[test]
+    fn overlay_mixed_providers_access_policy_independence() {
+        // Multiple providers with different access policies should be evaluated independently
+        let network = test_network("net");
+        let site_prod = test_site_with_labels("site-prod", "net", &[("env", "prod"), ("team", "platform")]);
+        let site_staging = test_site_with_labels("site-staging", "net", &[("env", "staging"), ("team", "platform")]);
+
+        let provider_unrestricted = test_provider("unrestricted-prov", "net", &["model-general"]);
+        let provider_prod_only =
+            test_provider_with_access_policy("prod-only-prov", "net", &["model-prod"], &[("env", "prod")]);
+        let provider_platform_only = test_provider_with_access_policy(
+            "platform-only-prov",
+            "net",
+            &["model-platform"],
+            &[("team", "platform")],
+        );
+
+        // Prod consumer should get all three providers (each provider generates candidates for both sites)
+        let overlay = render_routing_overlay(
+            &network,
+            &[site_prod, site_staging.clone()],
+            &[
+                provider_unrestricted.clone(),
+                provider_prod_only.clone(),
+                provider_platform_only.clone(),
+            ],
+            &[],
+            "site-prod",
+            None,
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        // With 2 sites and 3 providers, we expect 6 candidates (3 providers × 2 sites each)
+        assert_eq!(
+            overlay.candidates.len(),
+            6,
+            "prod consumer should get candidates from all providers for all sites"
+        );
+        let clusters: BTreeSet<&str> = overlay.candidates.iter().map(|c| c.cluster.as_str()).collect();
+        assert!(
+            clusters.contains("unrestricted-prov"),
+            "must include unrestricted provider"
+        );
+        assert!(clusters.contains("prod-only-prov"), "must include prod-only provider");
+        assert!(
+            clusters.contains("platform-only-prov"),
+            "must include platform-only provider"
+        );
+
+        // Staging consumer should get unrestricted + platform-only (but not prod-only)
+        let overlay = render_routing_overlay(
+            &network,
+            &[site_staging],
+            &[provider_unrestricted, provider_prod_only, provider_platform_only],
+            &[],
+            "site-staging",
+            None,
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        // Staging site only, 2 allowed providers (unrestricted + platform-only) = 2 candidates
+        assert_eq!(
+            overlay.candidates.len(),
+            2,
+            "staging consumer should get filtered candidates"
+        );
+        let clusters: BTreeSet<&str> = overlay.candidates.iter().map(|c| c.cluster.as_str()).collect();
+        assert!(
+            clusters.contains("unrestricted-prov"),
+            "must include unrestricted provider"
+        );
+        assert!(!clusters.contains("prod-only-prov"), "must exclude prod-only provider");
+        assert!(
+            clusters.contains("platform-only-prov"),
+            "must include platform-only provider"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Comprehensive access policy tests (local + remote CRDT)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn local_unrestricted_provider_still_appears() {
+        // Local provider with empty access policy should allow all consumers (existing behavior)
+        let network = test_network("net");
+        let site_prod = test_site_with_labels("site-prod", "net", &[("env", "prod")]);
+        let provider = test_provider("local-unrestricted-prov", "net", &["model-a"]);
+
+        let overlay = render_routing_overlay(
+            &network,
+            &[site_prod],
+            std::slice::from_ref(&provider),
+            &[],
+            "site-prod",
+            None,
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(overlay.candidates.len(), 1, "local unrestricted provider must appear");
+        assert_eq!(
+            overlay.candidates.first().map(|c| c.cluster.as_str()),
+            Some("local-unrestricted-prov"),
+            "candidate must be from local unrestricted provider"
+        );
+    }
+
+    #[test]
+    fn local_restricted_provider_appears_only_for_matching_consumer_site() {
+        // Local provider requiring specific labels should allow matching consumer, deny others
+        let network = test_network("net");
+        let site_prod = test_site_with_labels("site-prod", "net", &[("env", "prod")]);
+        let site_staging = test_site_with_labels("site-staging", "net", &[("env", "staging")]);
+        let provider =
+            test_provider_with_access_policy("local-restricted-prov", "net", &["model-a"], &[("env", "prod")]);
+
+        // Matching consumer should get candidates
+        let overlay = render_routing_overlay(
+            &network,
+            std::slice::from_ref(&site_prod),
+            std::slice::from_ref(&provider),
+            &[],
+            "site-prod",
+            None,
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            overlay.candidates.len(),
+            1,
+            "matching consumer must get candidates from local restricted provider"
+        );
+
+        // Non-matching consumer should get no candidates
+        let overlay = render_routing_overlay(
+            &network,
+            &[site_prod, site_staging],
+            std::slice::from_ref(&provider),
+            &[],
+            "site-staging",
+            None,
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            overlay.candidates.len(),
+            0,
+            "non-matching consumer must get no candidates from local restricted provider"
+        );
+    }
+
+    #[test]
+    fn local_restricted_provider_is_denied_for_nonmatching_consumer_site() {
+        // Same as above but specifically testing the deny case
+        let network = test_network("net");
+        let site_wrong = test_site_with_labels("site-wrong", "net", &[("env", "staging"), ("team", "ml")]);
+        let provider = test_provider_with_access_policy(
+            "local-restricted-prov",
+            "net",
+            &["model-a"],
+            &[("env", "prod"), ("team", "platform")],
+        );
+
+        let overlay = render_routing_overlay(
+            &network,
+            &[site_wrong],
+            std::slice::from_ref(&provider),
+            &[],
+            "site-wrong",
+            None,
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            overlay.candidates.len(),
+            0,
+            "consumer with wrong labels must get no candidates from local restricted provider"
+        );
+    }
+
+    #[test]
+    fn local_restricted_provider_is_denied_when_consumer_site_is_unknown() {
+        // When consumer site identity is unknown, local restricted providers should fail closed
+        let network = test_network("net");
+        let site = test_site_with_labels("known-site", "net", &[("env", "prod")]);
+        let provider_restricted =
+            test_provider_with_access_policy("local-restricted-prov", "net", &["model-a"], &[("env", "prod")]);
+        let provider_unrestricted = test_provider("local-unrestricted-prov", "net", &["model-b"]);
+
+        // Consumer site not in the sites list (unknown identity)
+        let overlay = render_routing_overlay(
+            &network,
+            &[site],
+            &[provider_restricted, provider_unrestricted],
+            &[],
+            "unknown-site",
+            None,
+        )
+        .unwrap_or_else(|_| std::process::abort());
+
+        // Should only get candidates from unrestricted provider
+        assert_eq!(
+            overlay.candidates.len(),
+            1,
+            "only unrestricted local provider should serve unknown consumer"
+        );
+        assert_eq!(
+            overlay.candidates.first().map(|c| c.cluster.as_str()),
+            Some("local-unrestricted-prov"),
+            "candidate must be from unrestricted local provider"
+        );
+    }
+
+    #[test]
+    fn remote_unrestricted_crdt_provider_still_appears() {
+        // Remote CRDT provider with empty access policy should allow all consumers
+        let network = test_network("net");
+        let site_prod = test_site_with_labels("site-prod", "net", &[("env", "prod")]);
+        let remote_provider = test_crdt_provider_unrestricted("remote-site", "remote-unrestricted-prov");
+
+        let overlay = render_routing_overlay(
+            &network,
+            &[site_prod],
+            &[],
+            std::slice::from_ref(&remote_provider),
+            "site-prod",
+            None,
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            overlay.candidates.len(),
+            1,
+            "remote unrestricted CRDT provider must appear"
+        );
+        assert_eq!(
+            overlay.candidates.first().map(|c| c.cluster.as_str()),
+            Some("remote-unrestricted-prov"),
+            "candidate must be from remote unrestricted provider"
+        );
+    }
+
+    #[test]
+    fn remote_restricted_crdt_provider_appears_only_for_matching_consumer_site() {
+        // Remote CRDT provider requiring specific labels should allow matching consumer, deny others
+        let network = test_network("net");
+        let site_prod = test_site_with_labels("site-prod", "net", &[("env", "prod")]);
+        let site_staging = test_site_with_labels("site-staging", "net", &[("env", "staging")]);
+        let remote_provider =
+            test_crdt_provider_with_access_policy("remote-site", "remote-restricted-prov", &[("env", "prod")]);
+
+        // Matching consumer should get candidates
+        let overlay = render_routing_overlay(
+            &network,
+            std::slice::from_ref(&site_prod),
+            &[],
+            std::slice::from_ref(&remote_provider),
+            "site-prod",
+            None,
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            overlay.candidates.len(),
+            1,
+            "matching consumer must get candidates from remote restricted provider"
+        );
+
+        // Non-matching consumer should get no candidates
+        let overlay = render_routing_overlay(
+            &network,
+            &[site_prod, site_staging],
+            &[],
+            std::slice::from_ref(&remote_provider),
+            "site-staging",
+            None,
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            overlay.candidates.len(),
+            0,
+            "non-matching consumer must get no candidates from remote restricted provider"
+        );
+    }
+
+    #[test]
+    fn remote_restricted_crdt_provider_is_denied_for_nonmatching_consumer_site() {
+        // Remote CRDT provider with specific requirements denies consumer with wrong labels
+        let network = test_network("net");
+        let site_wrong = test_site_with_labels("site-wrong", "net", &[("env", "staging"), ("team", "ml")]);
+        let remote_provider = test_crdt_provider_with_access_policy(
+            "remote-site",
+            "remote-restricted-prov",
+            &[("env", "prod"), ("team", "platform")],
+        );
+
+        let overlay = render_routing_overlay(
+            &network,
+            &[site_wrong],
+            &[],
+            std::slice::from_ref(&remote_provider),
+            "site-wrong",
+            None,
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            overlay.candidates.len(),
+            0,
+            "consumer with wrong labels must get no candidates from remote restricted provider"
+        );
+    }
+
+    #[test]
+    fn remote_restricted_crdt_provider_is_denied_when_consumer_site_is_unknown() {
+        // When consumer site identity is unknown, remote restricted CRDT providers should fail closed
+        let network = test_network("net");
+        let site = test_site_with_labels("known-site", "net", &[("env", "prod")]);
+        let remote_restricted =
+            test_crdt_provider_with_access_policy("remote-site", "remote-restricted-prov", &[("env", "prod")]);
+        let remote_unrestricted = test_crdt_provider_unrestricted("remote-site", "remote-unrestricted-prov");
+
+        // Consumer site not in the sites list (unknown identity)
+        let overlay = render_routing_overlay(
+            &network,
+            &[site],
+            &[],
+            &[remote_restricted, remote_unrestricted],
+            "unknown-site",
+            None,
+        )
+        .unwrap_or_else(|_| std::process::abort());
+
+        // Should only get candidates from unrestricted remote provider
+        assert_eq!(
+            overlay.candidates.len(),
+            1,
+            "only unrestricted remote provider should serve unknown consumer"
+        );
+        assert_eq!(
+            overlay.candidates.first().map(|c| c.cluster.as_str()),
+            Some("remote-unrestricted-prov"),
+            "candidate must be from unrestricted remote provider"
         );
     }
 }

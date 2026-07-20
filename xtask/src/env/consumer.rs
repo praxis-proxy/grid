@@ -312,7 +312,7 @@ pub(crate) fn deploy_consumer(
         filtered_overlay.as_ref().or(overlay.as_ref()),
     )?;
     apply_consumer_deployment(&consumer_ctx)?;
-    rollout_restart(&consumer_ctx, "praxis-consumer")?;
+    kubectl::rollout_restart(&consumer_ctx, "praxis-consumer")?;
 
     kubectl::wait_for_rollout(&consumer_ctx, "praxis-consumer", consumer_site)?;
 
@@ -320,11 +320,11 @@ pub(crate) fn deploy_consumer(
     Ok(())
 }
 
-/// Deploy the consumer gateway with `openai_responses_format` filter chain.
+/// Deploy the consumer gateway with `openai_responses_format` → `grid_route` filter chain.
 ///
 /// Identical to [`deploy_consumer`] except the generated config uses
-/// [`responses_consumer_gateway_config`], which replaces `json_body_field`
-/// with `openai_responses_format` for `/v1/responses` traffic.
+/// [`responses_consumer_gateway_config`], which starts the filter chain
+/// with `openai_responses_format` instead of `json_body_field` for `/v1/responses` traffic.
 pub(crate) fn deploy_consumer_for_responses(
     cfg: &EnvConfig,
     overlay_config: Option<&Path>,
@@ -356,7 +356,7 @@ pub(crate) fn deploy_consumer_for_responses(
         filtered_overlay.as_ref().or(overlay.as_ref()),
     )?;
     apply_consumer_deployment(&consumer_ctx)?;
-    rollout_restart(&consumer_ctx, "praxis-consumer")?;
+    kubectl::rollout_restart(&consumer_ctx, "praxis-consumer")?;
 
     kubectl::wait_for_rollout(&consumer_ctx, "praxis-consumer", consumer_site)?;
 
@@ -617,8 +617,8 @@ fn apply_consumer_config(
 
 /// Apply the Responses-aware consumer gateway config as a `ConfigMap`.
 ///
-/// Uses [`responses_consumer_gateway_config`] which starts the filter chain
-/// with `openai_responses_format` instead of `json_body_field`.
+/// Uses [`responses_consumer_gateway_config`] which generates a filter chain:
+/// `openai_responses_format` → `grid_route` → `load_balancer`.
 fn apply_consumer_responses_config(
     context: &str,
     consumer_site: &str,
@@ -698,7 +698,7 @@ fn consumer_gateway_config(
     )
 }
 
-/// Consumer gateway config with `openai_responses_format` for model extraction.
+/// Consumer gateway config with `openai_responses_format` → `grid_route` filter chain.
 ///
 /// Identical to [`consumer_gateway_config`] except the filter chain starts
 /// with `openai_responses_format` (which parses Responses API request bodies
@@ -706,7 +706,8 @@ fn consumer_gateway_config(
 /// `json_body_field` filter.  This is the correct chain for consumers that
 /// accept `/v1/responses` traffic.
 ///
-/// `grid_route` reads the model from `X-Model` exactly as before.
+/// `grid_route` reads the model from `X-Model` and selects from the Grid overlay
+/// exactly as in other routing modes.
 #[expect(clippy::too_many_lines, reason = "Praxis config YAML generation")]
 fn responses_consumer_gateway_config(
     consumer_site: &str,
@@ -1175,7 +1176,7 @@ pub(crate) fn deploy_consumer_for_api_fallback_native(
 
     // Mount the credential Secret as a file — the token never touches the ConfigMap.
     apply_consumer_deployment_with_credential_mount(&consumer_ctx, secret_name, secret_key)?;
-    rollout_restart(&consumer_ctx, "praxis-consumer")?;
+    kubectl::rollout_restart(&consumer_ctx, "praxis-consumer")?;
     kubectl::wait_for_rollout(&consumer_ctx, "praxis-consumer", consumer_site)?;
 
     eprintln!("  [PASS] native-credential consumer gateway ready in {consumer_ctx}");
@@ -1220,7 +1221,7 @@ pub(crate) fn deploy_consumer_from_operator_yaml(
     kubectl::apply_manifest(&consumer_ctx, &config_map_manifest)?;
 
     apply_consumer_deployment_with_credential_mount(&consumer_ctx, secret_name, secret_key)?;
-    rollout_restart(&consumer_ctx, "praxis-consumer")?;
+    kubectl::rollout_restart(&consumer_ctx, "praxis-consumer")?;
     kubectl::wait_for_rollout(&consumer_ctx, "praxis-consumer", consumer_site)?;
 
     eprintln!("  [PASS] consumer gateway ready in {consumer_ctx} (operator-generated config)");
@@ -1280,7 +1281,7 @@ pub(crate) fn deploy_consumer_for_api_fallback(
     kubectl::apply_manifest(&consumer_ctx, &yaml)?;
 
     apply_consumer_deployment(&consumer_ctx)?;
-    rollout_restart(&consumer_ctx, "praxis-consumer")?;
+    kubectl::rollout_restart(&consumer_ctx, "praxis-consumer")?;
     kubectl::wait_for_rollout(&consumer_ctx, "praxis-consumer", consumer_site)?;
 
     eprintln!("  [PASS] api-fallback consumer gateway ready in {consumer_ctx}");
@@ -1431,7 +1432,7 @@ pub(crate) fn deploy_consumer_for_full_grid(
     );
     kubectl::apply_manifest(&consumer_ctx, &yaml)?;
     apply_consumer_deployment(&consumer_ctx)?;
-    rollout_restart(&consumer_ctx, "praxis-consumer")?;
+    kubectl::rollout_restart(&consumer_ctx, "praxis-consumer")?;
     kubectl::wait_for_rollout(&consumer_ctx, "praxis-consumer", consumer_site)?;
 
     eprintln!("  [PASS] full-grid consumer gateway ready in {consumer_ctx}");
@@ -2118,40 +2119,6 @@ pub(crate) fn verify_credential_injection(
 // Shared helpers
 // ---------------------------------------------------------------------------
 
-/// Build the `kubectl rollout restart` argument list.
-///
-/// Separated from [`rollout_restart`] so tests can verify the argument
-/// structure without spawning a process.
-fn rollout_restart_args(context: &str, deployment: &str) -> Vec<String> {
-    vec![
-        "--context".to_owned(),
-        context.to_owned(),
-        "-n".to_owned(),
-        NAMESPACE.to_owned(),
-        "rollout".to_owned(),
-        "restart".to_owned(),
-        format!("deployment/{deployment}"),
-    ]
-}
-
-/// Trigger a `rollout restart` so the `Deployment` picks up `ConfigMap` changes.
-///
-/// `kubectl apply` updates a `ConfigMap` but does not restart the pod.  Calling
-/// this after applying the consumer config ensures the pod reloads with the
-/// new configuration before [`kubectl::wait_for_rollout`] declares it ready.
-///
-/// **xtask validation concern only.**  Production deployments are responsible
-/// for a gateway reload or restart strategy when generated config changes.  The
-/// forced restart here keeps xtask E2E validation deterministic.
-pub(crate) fn rollout_restart(context: &str, deployment: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let status = Command::new("kubectl")
-        .args(rollout_restart_args(context, deployment))
-        .status()?;
-    if !status.success() {
-        return Err(format!("kubectl rollout restart {deployment} failed: {status}").into());
-    }
-    Ok(())
-}
 
 /// Indent each line of a YAML string by `spaces` spaces.
 fn indent_yaml(yaml: &str, spaces: usize) -> String {
@@ -2510,35 +2477,6 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
-    // rollout_restart_args
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn rollout_restart_args_correct_structure() {
-        let args = rollout_restart_args("kind-grid-consumer", "praxis-consumer");
-        assert_eq!(
-            args.first().map(String::as_str),
-            Some("--context"),
-            "--context must be first arg"
-        );
-        assert!(
-            args.contains(&"kind-grid-consumer".to_owned()),
-            "context name must appear in args"
-        );
-        assert!(
-            args.contains(&"rollout".to_owned()),
-            "rollout subcommand must be present"
-        );
-        assert!(
-            args.contains(&"restart".to_owned()),
-            "restart subcommand must be present"
-        );
-        assert!(
-            args.contains(&"deployment/praxis-consumer".to_owned()),
-            "resource must use deployment/ prefix"
-        );
-    }
 
     // -----------------------------------------------------------------------
     // API-provider credential injection

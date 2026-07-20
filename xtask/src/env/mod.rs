@@ -548,15 +548,15 @@ pub(crate) enum Action {
         config: PathBuf,
     },
 
-    /// Verify `OpenAI` `/v1/responses` routing through the consumer gateway.
+    /// Verify `/v1/responses` request parsing and Grid overlay routing.
     ///
-    /// Proves that requests using the Responses API format are correctly
-    /// routed when the consumer filter chain uses `openai_responses_format`
-    /// instead of the generic `json_body_field` extractor.
+    /// Proves that Responses API requests are correctly parsed and routed
+    /// when the consumer filter chain uses `openai_responses_format` to extract
+    /// the model field, then `grid_route` for Grid overlay routing.
     ///
     /// 1. Deploy provider gateways (idempotent).
     /// 2. Operator reconcile + overlay export.
-    /// 3. Deploy consumer gateway with `openai_responses_format` filter chain.
+    /// 3. Deploy consumer gateway with `openai_responses_format` → `grid_route` filter chain.
     /// 4. Send `/v1/responses` requests: each model returns HTTP 200 with valid Responses body, unknown model fails
     ///    closed.
     /// 5. Verify response model fields match the requested model.
@@ -1290,7 +1290,7 @@ fn env_verify_api_fallback_native(config: &Path, site: Option<&str>) -> Result<(
         "wrong-sentinel-not-the-real-token",
     )?;
     eprintln!("  restarting consumer to clear cached connections...");
-    consumer::rollout_restart(&consumer_ctx, "praxis-consumer")?;
+    kubectl::rollout_restart(&consumer_ctx, "praxis-consumer")?;
     kubectl::wait_for_rollout(&consumer_ctx, "praxis-consumer", "consumer")?;
     assert_wrong_credential_rejected(&consumer_ctx, API_FALLBACK_MODEL)?;
 
@@ -1298,7 +1298,7 @@ fn env_verify_api_fallback_native(config: &Path, site: Option<&str>) -> Result<(
     eprintln!("verify-api-fallback-native: [8/8] correct-credential with strict mock...");
     kind::deploy_mock_api_provider_with_expected_token(&consumer_ctx, &consumer_cluster_name, &api_token)?;
     eprintln!("  restarting consumer to clear cached connections...");
-    consumer::rollout_restart(&consumer_ctx, "praxis-consumer")?;
+    kubectl::rollout_restart(&consumer_ctx, "praxis-consumer")?;
     kubectl::wait_for_rollout(&consumer_ctx, "praxis-consumer", "consumer")?;
     assert_correct_credential_accepted(&consumer_ctx, API_FALLBACK_MODEL)?;
 
@@ -1381,7 +1381,7 @@ fn verify_token_absent_from_consumer_configmap(
     consumer_ctx: &str,
     api_token: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let configmap_yaml = kind::kubectl_get_configmap(consumer_ctx, "default", "praxis-consumer-config")?;
+    let configmap_yaml = kubectl::get_configmap_yaml(consumer_ctx, "default", "praxis-consumer-config")?;
     if configmap_yaml.contains(api_token) {
         return Err(format!(
             "SECURITY VIOLATION: token bytes found in consumer Praxis ConfigMap \
@@ -3150,7 +3150,8 @@ fn responses_record_step(
 /// Check Responses API response `model` fields via consumer gateway.
 ///
 /// Port-forwards to the consumer gateway and sends a `/v1/responses` request
-/// per configured model.  Asserts the response JSON `model` field matches.
+/// per configured model. Verifies that the `openai_responses_format` request
+/// parsing and `grid_route` selection work correctly by checking response `model` fields.
 fn verify_responses_model_fields(
     cfg: &EnvConfig,
     results: &mut Vec<StepResult>,
@@ -3237,12 +3238,13 @@ fn verify_responses_pod_restarts(
     Ok(())
 }
 
-/// Run the Responses routing proof.
+/// Run the Responses request parsing and routing proof.
 ///
-/// Orchestrates the `/v1/responses` routing validation:
+/// Orchestrates the `/v1/responses` validation using Praxis AI request parsing
+/// with Grid overlay routing:
 /// 1. Deploy provider gateways.
-/// 2. Operator reconcile + overlay export.
-/// 3. Deploy consumer gateway with `openai_responses_format` filter chain.
+/// 2. Operator reconcile + Grid overlay export.
+/// 3. Deploy consumer gateway with `openai_responses_format` → `grid_route` filter chain.
 /// 4. Verify `/v1/responses` routing: each model returns 200, unknown fails.
 /// 5. Verify response model fields match the requested model.
 /// 6. Assert no unexpected pod restarts.
@@ -3273,7 +3275,7 @@ fn env_verify_responses_routing(config: &Path) -> Result<(), Box<dyn std::error:
         return Err("responses-routing: provider gateway deployment failed".into());
     }
 
-    // Step 2: Operator reconcile + overlay export.
+    // Step 2: Operator reconcile + Grid overlay export.
     eprintln!("responses-routing: [2/6] operator reconcile + overlay export...");
     let context = resolve_operator_context(&cfg, None)?;
     let providers_ref: Vec<(&str, &[String])> = providers.iter().map(|(s, m)| (s.as_str(), m.as_slice())).collect();
@@ -3292,11 +3294,11 @@ fn env_verify_responses_routing(config: &Path) -> Result<(), Box<dyn std::error:
         },
     };
 
-    // Step 3: Deploy consumer gateway with openai_responses_format filter chain.
+    // Step 3: Deploy consumer gateway with openai_responses_format → grid_route filter chain.
     eprintln!("responses-routing: [3/6] deploying responses consumer gateway...");
     let consumer_ok = responses_record_step("consumer deploy", &mut results, || {
         consumer::deploy_consumer_for_responses(&cfg, Some(&overlay_path))?;
-        Ok("deployed with openai_responses_format filter chain".to_owned())
+        Ok("deployed with openai_responses_format → grid_route filter chain".to_owned())
     });
     if !consumer_ok {
         print_validate_all_table(&results);
@@ -5272,7 +5274,7 @@ fn env_verify_operator_install_rbac(config: &Path, site: Option<&str>) -> Result
 
     // Step 10: verify overlay ConfigMap write.
     eprintln!("verify-operator-install-rbac: [10/11] verifying overlay ConfigMap write...");
-    match kind::kubectl_get_configmap(&context, "default", &overlay_cm_name) {
+    match kubectl::get_configmap_yaml(&context, "default", &overlay_cm_name) {
         Ok(_) => {
             eprintln!("  [PASS] ConfigMap {overlay_cm_name} exists (overlay written by in-cluster operator)");
         },

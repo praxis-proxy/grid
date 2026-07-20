@@ -133,3 +133,43 @@ pub(crate) fn wait_for_rollout_ns(
     }
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Resource queries
+// ---------------------------------------------------------------------------
+
+/// Get a Kubernetes `ConfigMap` as YAML.
+///
+/// Returns the full YAML output of `kubectl get configmap -o yaml`.
+///
+/// # Errors
+///
+/// Returns an error if the `kubectl` process cannot be spawned, if the
+/// `ConfigMap` does not exist, or if the command exits with a non-zero status.
+pub(crate) fn get_configmap_yaml(
+    context: &str,
+    namespace: &str,
+    name: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            context,
+            "-n",
+            namespace,
+            "get",
+            "configmap",
+            name,
+            "-o",
+            "yaml",
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "kubectl get configmap {name} in {context} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}

@@ -912,6 +912,13 @@ fn metrics_to_crdt(metrics: Option<scoring::BackendMetrics>) -> crdt::ProviderMe
     })
 }
 
+/// Convert an operator `AccessPolicy` to a CRDT `ProviderAccessPolicy`.
+fn access_policy_to_crdt(access_policy: &crate::crd::auth::AccessPolicy) -> crdt::ProviderAccessPolicy {
+    crdt::ProviderAccessPolicy {
+        match_labels: access_policy.site_selector.match_labels.clone(),
+    }
+}
+
 /// Map one Kubernetes [`InferenceProvider`] to a CRDT [`crdt::ProviderState`].
 ///
 /// Returns `None` when the provider has no metadata name (invalid resource).
@@ -941,6 +948,7 @@ fn provider_state_from_kube(
         backend_kind: provider.spec.backend_kind.clone(),
         phase,
         metrics: metrics_to_crdt(metrics),
+        access_policy: access_policy_to_crdt(&provider.spec.access_policy),
         revision,
         writer_id: site_id.to_owned(),
     })
@@ -1839,6 +1847,7 @@ mod tests {
             backend_kind: "local".to_owned(),
             phase: crdt::ProviderPhase::Available,
             metrics: crdt::ProviderMetricsSnapshot::default(),
+            access_policy: crdt::ProviderAccessPolicy::default(),
             revision: 1,
             writer_id: site_id.to_owned(),
         }
@@ -1858,6 +1867,7 @@ mod tests {
             backend_kind: "local".to_owned(),
             phase,
             metrics: crdt::ProviderMetricsSnapshot::default(),
+            access_policy: crdt::ProviderAccessPolicy::default(),
             revision: 1,
             writer_id: site_id.to_owned(),
         }
@@ -2207,6 +2217,7 @@ mod tests {
             backend_kind: "remote".to_owned(),
             phase,
             metrics: crdt::ProviderMetricsSnapshot::default(),
+            access_policy: crdt::ProviderAccessPolicy::default(), // Empty policy = allow all
             revision: 1,
             writer_id: "writer-1".to_owned(),
         }
@@ -3073,6 +3084,7 @@ mod tests {
             backend_kind: "local".to_owned(),
             phase: crdt::ProviderPhase::Available,
             metrics: crdt::ProviderMetricsSnapshot::default(),
+            access_policy: crdt::ProviderAccessPolicy::default(),
             revision: 1,
             writer_id: site_id.to_owned(),
         }

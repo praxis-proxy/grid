@@ -607,7 +607,7 @@ entries; see `xtask/src/env/operator_overlay.rs`.
 
 Workloads send requests to the Praxis Gateway.
 The gateway's grid scoring filter selects the optimal
-backend. Praxis handles API translation and credential
+backend. Praxis AI handles API translation and credential
 injection transparently.
 
 For API-provider routes, the request-time path is:
@@ -626,7 +626,7 @@ The token is not stored in the Grid overlay or consumer
 Praxis `ConfigMap`.
 
 For direct API-provider and cloud-provider fallback, the
-consumer gateway is also the egress gateway, so the
+consumer gateway is often also the final-hop gateway, so the
 credential Secret is mounted there.  For remote Grid sites,
 provider credentials should live only in the remote provider
 site or provider-side component that makes the final backend
@@ -794,10 +794,11 @@ The generated `ConfigMap` references credential Secrets by name, namespace, and
 key — it does not read Secret values.  The operator does NOT require `get` access
 to credential Secrets in the gateway namespace for config generation.
 
-The gateway or provider-side component making the final backend call needs the
-credential Secret mounted.  Secret provisioning in that cluster is the
-responsibility of external tooling (platform automation, External Secrets, Vault,
-or a manual process).  The Grid operator does not copy Secrets across clusters.
+The final-hop gateway or provider-side component making the final backend call
+needs the credential Secret mounted.  Secret provisioning in that cluster is
+the responsibility of external tooling (platform automation, External Secrets,
+Vault, or a manual process).  The Grid operator does not copy Secrets across
+clusters.
 
 ### Cross-cluster limitations
 
@@ -872,7 +873,7 @@ Available commands:
 | `cargo xtask env verify-mtls-trust` | Verifies provider gateway mTLS enforcement (positive + negative cases) |
 | `cargo xtask env verify-api-fallback-native` | Verifies native `grid_route` → `grid_credential_inject` credential injection with token bytes absent from overlay and consumer ConfigMap |
 | `cargo xtask env verify-stale-gc-ttl` | Verifies `GridNetwork.spec.staleCandidateTtlSeconds` evicts stale remote candidates from the rendered overlay |
-| `cargo xtask env verify-responses-routing` | Verifies `/v1/responses` routing through `openai_responses_format` filter chain |
+| `cargo xtask env verify-responses-routing` | Verifies `/v1/responses` request parsing and Grid overlay routing using `openai_responses_format` → `grid_route` filter chain |
 | `cargo xtask env verify-crd-schema` | Verifies required generated CRD schema fields without requiring kind clusters |
 | `cargo xtask env verify-operator-install-rbac` | Applies install manifests, runs positive/negative RBAC checks, proves minimal reconcile succeeds |
 | `cargo xtask env validate-all` | Runs the local validation suite and prints a Markdown result table |

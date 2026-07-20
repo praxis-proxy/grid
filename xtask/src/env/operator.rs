@@ -3568,15 +3568,7 @@ pub(crate) fn assert_no_crdt_candidates_for_site(
 ///
 /// Safe to call before a fresh run — all deletes use `--ignore-not-found`.
 pub(crate) fn cleanup_swim_overlay_test_resources(context: &str) -> Result<(), Box<dyn std::error::Error>> {
-    delete_namespaced_resource(
-        context,
-        "default",
-        "configmap",
-        &format!("grid-overlay-{SWIM_OVERLAY_NETWORK}-{SWIM_OVERLAY_GW}"),
-    )?;
-    delete_cluster_resource(context, "inferenceprovider", SWIM_OVERLAY_PROVIDER)?;
-    delete_cluster_resource(context, "gridnetwork", SWIM_OVERLAY_NETWORK)?;
-    cleanup_auto_discovered_gridsites_for_network(context, SWIM_OVERLAY_NETWORK);
+    cleanup_test_network_resources(context, SWIM_OVERLAY_NETWORK, SWIM_OVERLAY_GW, &[SWIM_OVERLAY_PROVIDER])?;
     eprintln!("  [OK] stale SWIM overlay test resources removed");
     Ok(())
 }
@@ -3723,11 +3715,7 @@ pub(crate) fn verify_swim_overlay_candidates(
     gw: &str,
     primary_site_name: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let overlay = read_overlay_configmap(context, network, gw, "default")?;
-    let candidates = overlay
-        .get("candidates")
-        .and_then(serde_json::Value::as_array)
-        .ok_or("overlay missing candidates array")?;
+    let candidates = get_overlay_candidates(context, network, gw, "default")?;
 
     if candidates.is_empty() {
         return Err("SWIM overlay validation failed: candidates array is empty".into());
@@ -4472,20 +4460,12 @@ pub(crate) fn apply_swim_routing_west_fixtures(
 /// Safe to call before a fresh run — all deletes use `--ignore-not-found`.
 /// Call once per cluster (east and west).
 pub(crate) fn cleanup_swim_routing_resources(context: &str) -> Result<(), Box<dyn std::error::Error>> {
-    delete_namespaced_resource(
+    cleanup_test_network_resources(
         context,
-        "default",
-        "configmap",
-        &format!("grid-overlay-{SWIM_ROUTING_NETWORK}-{SWIM_ROUTING_GW}"),
+        SWIM_ROUTING_NETWORK,
+        SWIM_ROUTING_GW,
+        &[SWIM_ROUTING_EAST_PROVIDER, SWIM_ROUTING_WEST_PROVIDER],
     )?;
-    delete_cluster_resource(context, "inferenceprovider", SWIM_ROUTING_EAST_PROVIDER)?;
-    delete_cluster_resource(context, "inferenceprovider", SWIM_ROUTING_WEST_PROVIDER)?;
-    delete_cluster_resource(context, "gridnetwork", SWIM_ROUTING_NETWORK)?;
-    // Also delete any auto-discovered GridSites for this network.
-    // These are created by reconcile_discovered_sites when the network has the opt-in
-    // label; cleanup must remove them even if the label was later removed or the test
-    // runs mixed between opt-in and non-opt-in states.
-    cleanup_auto_discovered_gridsites_for_network(context, SWIM_ROUTING_NETWORK);
     eprintln!("  [OK] stale SWIM routing test resources removed on {context}");
     Ok(())
 }
@@ -4751,6 +4731,58 @@ fn force_delete_pod(context: &str, namespace: &str, name: &str) -> Result<(), Bo
         .into());
     }
     Ok(())
+}
+
+/// Common cleanup pattern for test network resources.
+///
+/// Deletes the standard test resources associated with a grid network:
+/// 1. `ConfigMap` with overlay data in the default namespace
+/// 2. All specified `InferenceProviders`
+/// 3. The `GridNetwork` itself
+/// 4. Auto-discovered `GridSites` for the network
+///
+/// Many E2E test scenarios use this same cleanup sequence. This helper
+/// reduces duplication without changing the cleanup behavior.
+pub(crate) fn cleanup_test_network_resources(
+    context: &str,
+    network_name: &str,
+    gateway_name: &str,
+    provider_names: &[&str],
+) -> Result<(), Box<dyn std::error::Error>> {
+    delete_namespaced_resource(
+        context,
+        "default",
+        "configmap",
+        &format!("grid-overlay-{network_name}-{gateway_name}"),
+    )?;
+
+    for &provider_name in provider_names {
+        delete_cluster_resource(context, "inferenceprovider", provider_name)?;
+    }
+
+    delete_cluster_resource(context, "gridnetwork", network_name)?;
+    cleanup_auto_discovered_gridsites_for_network(context, network_name);
+
+    Ok(())
+}
+
+/// Get overlay candidates array from `ConfigMap`.
+///
+/// Common preflight pattern: many verification functions read the overlay
+/// `ConfigMap` and extract the candidates array. This helper consolidates
+/// the repetitive error handling for missing/invalid overlay structure.
+pub(crate) fn get_overlay_candidates(
+    context: &str,
+    network: &str,
+    gw: &str,
+    namespace: &str,
+) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
+    let overlay = read_overlay_configmap(context, network, gw, namespace)?;
+    let candidates = overlay
+        .get("candidates")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("overlay missing candidates array")?;
+    Ok(candidates.clone())
 }
 
 /// Delete a cluster-scoped resource, ignoring absence.

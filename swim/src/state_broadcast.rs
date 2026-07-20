@@ -501,6 +501,7 @@ mod tests {
                 queue_depth: Some(queue_depth),
                 ..ProviderMetricsSnapshot::default()
             },
+            access_policy: crdt::ProviderAccessPolicy::default(),
             revision,
             writer_id: site.to_owned(),
         });

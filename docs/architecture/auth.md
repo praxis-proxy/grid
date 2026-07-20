@@ -2,10 +2,10 @@
 
 ## Authentication Strategies
 
-Authentication here means provider authentication: how the gateway or provider
-component that makes the final upstream call authenticates to the selected
-backend after routing has chosen a candidate.  It does not replace or rewrite
-credentials on the inbound client request.
+Authentication here means provider authentication: how the final-hop gateway
+or provider component that makes the final upstream call authenticates to the
+selected backend after routing has chosen a candidate.  It does not replace
+or rewrite credentials on the inbound client request.
 
 The implemented native path is `bearer_token`:
 
@@ -13,8 +13,8 @@ The implemented native path is `bearer_token`:
 2. `InferenceProvider.spec.auth.secretRef` points at that Secret.
 3. The Grid Operator validates the Secret reference.
 4. Grid writes only the Secret reference into the routing overlay.
-5. The egress gateway mounts the Secret as a file.
-6. After `grid_route` selects a provider candidate, Praxis runs
+5. The final-hop gateway mounts the Secret as a file.
+6. After `grid_route` selects a provider candidate, Praxis AI runs
    `grid_credential_inject`, reads the selected token file, and injects
    `Authorization: Bearer <token>` on the outbound provider request.
 
@@ -29,7 +29,7 @@ deployments must use a Praxis AI image that includes `grid_credential_inject`.
 
 | Strategy | Status | Request-time behavior |
 |----------|--------|-----------------------|
-| `bearer_token` | Implemented native path | Praxis reads a mounted Secret file and injects `Authorization: Bearer <token>` on the outbound provider request. |
+| `bearer_token` | Implemented native path | Praxis AI reads a mounted Secret file and injects `Authorization: Bearer <token>` on the outbound provider request. |
 | `api_key` | Extension point | Static Secret-backed header injection when implemented. |
 | `custom` | Extension point | User-configured Secret-backed injection when implemented. |
 | `service_account` | Extension point | Kubernetes service-account token injection when implemented. |
@@ -46,24 +46,24 @@ The request path is:
 3. `InferenceProvider.spec.auth.secretRef` points at the Secret.
 4. The Grid Operator validates the Secret and projects only the credential
    reference into the routing overlay.
-5. The gateway config maps that reference to a mounted Secret file at the
-   deployment point allowed to call the backend.
-6. Praxis injects the provider credential at request time after `grid_route`
+5. The final-hop gateway config maps that reference to a mounted Secret file
+   at the deployment point allowed to call the backend.
+6. Praxis AI injects the provider credential at request time after `grid_route`
    selects the credential-bearing candidate.
 
 Credential placement follows the final-hop rule:
 
 | Route shape | Where the credential lives | Where injection happens |
 |---|---|---|
-| Direct API or cloud fallback from the ingress gateway | Secret mounted into that ingress/egress gateway pod | The same gateway injects or signs before calling the provider API. |
-| Remote Grid site reached over gateway-to-gateway mTLS | Secret mounted only in the remote provider site or provider-side component | The provider-side egress component injects before calling its local backend, if that backend needs a provider credential. |
+| Direct API or cloud fallback from the consumer gateway | Secret mounted into that consumer/final-hop gateway pod | The same gateway injects or signs before calling the provider API. |
+| Remote Grid site reached over gateway-to-gateway mTLS | Secret mounted only in the remote provider site or provider-side component | The provider-side final-hop component injects before calling its local backend, if that backend needs a provider credential. |
 | Local self-hosted backend with no provider API credential | No provider token required | No HTTP credential injection; mTLS or local network policy handles gateway/backend trust. |
 
-In this document, **ingress gateway** means the Praxis gateway receiving the
-workload request.  **Egress gateway** means the Praxis gateway or provider-side
-component that makes the final outbound call to the backend.  For direct
-API-provider or cloud-provider fallback, the same gateway can be both ingress
-and egress.
+In this document, **consumer gateway** (or **ingress gateway**) means the Praxis
+gateway receiving the workload request.  **Final-hop gateway** means the Praxis
+gateway or provider-side component that makes the final outbound call to the
+backend.  For direct API-provider or cloud-provider fallback, the consumer
+gateway is often also the final-hop gateway.
 
 ### Controller behavior
 
@@ -156,17 +156,17 @@ The native injection path keeps credential bytes out of Grid resources and
 consumer gateway `ConfigMap`s. Production deployments still need explicit
 ownership for credential Secret placement and rotation:
 
-- **Egress Secret lifecycle**: the token lives in a Kubernetes Secret mounted
-  into the gateway or provider-side component that is authorized to make the
-  final backend call.  The Secret can be created by users, platform automation,
-  or an external secret manager.
+- **Final-hop Secret lifecycle**: the token lives in a Kubernetes Secret mounted
+  into the final-hop gateway or provider-side component that is authorized to
+  make the final backend call.  The Secret can be created by users, platform
+  automation, or an external secret manager.
 - **Operator-owned consumer config generation**: `GatewayRef.consumerConfig`
   can render the consumer Praxis `ConfigMap` from routing overlay data,
   including `grid_credential_inject` file references for direct API-provider
   routes.
 - **Cross-cluster delivery**: Grid does not copy Secrets across clusters.
   GitOps, External Secrets, Vault, or another platform mechanism must place the
-  Secret in the cluster where the egress component runs.
+  Secret in the cluster where the final-hop component runs.
 
 See [Consumer Config](consumer-config.md) for the current operator-generated
 config shape.
@@ -187,7 +187,7 @@ and the user manages authentication externally.
 ### Credential Lifecycle
 
 For the current static `bearer_token` strategy, the
-credential value is mounted into the egress gateway or
+credential value is mounted into the final-hop gateway or
 provider-side component as a Kubernetes Secret file.  `grid_credential_inject`
 reads that file at filter construction time and injects
 `Authorization: Bearer <token>` after `grid_route`

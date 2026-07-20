@@ -186,40 +186,6 @@ pub(crate) fn cluster_name_from_config(name: &str) -> String {
 }
 
 /// Read the raw YAML content of a `ConfigMap` from a cluster.
-///
-/// Returns the full YAML output of `kubectl get configmap -o yaml`.
-///
-/// # Errors
-///
-/// Returns an error if `kubectl` fails or the `ConfigMap` does not exist.
-pub(crate) fn kubectl_get_configmap(
-    context: &str,
-    namespace: &str,
-    name: &str,
-) -> Result<String, Box<dyn std::error::Error>> {
-    let output = Command::new("kubectl")
-        .args([
-            "--context",
-            context,
-            "-n",
-            namespace,
-            "get",
-            "configmap",
-            name,
-            "-o",
-            "yaml",
-        ])
-        .output()?;
-    if !output.status.success() {
-        return Err(format!(
-            "kubectl get configmap {name} in {context} failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        )
-        .into());
-    }
-    Ok(String::from_utf8(output.stdout)?)
-}
-
 /// Check whether a Kubernetes `Secret` exists.
 ///
 /// # Errors

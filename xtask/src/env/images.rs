@@ -21,10 +21,16 @@ use crate::env::{config::EnvConfig, image_overrides, kind};
 /// Default environment variable for the AI repository path.
 const AI_REPO_PATH_ENV: &str = "AI_REPO_PATH";
 
-/// Image name for the composed Praxis AI gateway.
+/// Image name for building the composed Praxis AI gateway.
+///
+/// For loading/deployment, use `image_overrides::gateway_image()` which
+/// respects environment variable overrides.
 pub(crate) const GATEWAY_IMAGE: &str = "localhost/praxis-ai:llmd-ext-proc";
 
-/// Image name for the mock EPP.
+/// Image name for building the mock EPP.
+///
+/// For loading/deployment, use `image_overrides::mock_epp_image()` which
+/// respects environment variable overrides.
 pub(crate) const MOCK_EPP_IMAGE: &str = "localhost/praxis-ai-mock-epp:latest";
 
 /// Cargo features to enable for the gateway image.
