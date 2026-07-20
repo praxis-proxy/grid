@@ -366,7 +366,7 @@ routing overlay only when the corresponding `GridSite.status.phase` is `Active`.
 | `Pending` | No |
 | `Discovered` | No |
 | `Connecting` | No |
-| `Active` | Yes |
+| `Active` | Yes — control-plane eligible |
 | `Unreachable` | No |
 | `Left` | No |
 
@@ -375,10 +375,17 @@ the operator looks for a `GridSite` resource whose Kubernetes name equals
 `discovered_site_k8s_name(N, S)` (the auto-discovered name derivation) and whose
 `spec.gridNetworkRef == N` and `status.phase == Active`.
 
-`Active` is set by the operator after the remote site satisfies the configured
-trust requirements.  The current trust gate is
-`GridSite.spec.trust.certFingerprint`: the configured fingerprint must match the
-received `status.publicCertPem`, and the gateway TCP probe must succeed.
+`Active` indicates control-plane eligibility: the operator has verified the remote
+site's certificate fingerprint against the configured trust policy and confirmed TCP
+connectivity to the gateway. This allows the site's providers to appear in routing
+overlays for consideration by consumer gateways.
+
+GridSite Active is a control-plane eligibility signal. It means Grid has enough
+site/trust information to consider the site for overlay generation. It does not
+currently prove that a Praxis gateway has completed an mTLS handshake, accepted
+client identity, loaded the latest routing config, or authorized provider-side
+traffic. Data-plane readiness is enforced separately at request time.
+
 See [Authentication and Access Policy](auth.md) for the trust contract.
 
 **Local providers** (from `InferenceProvider` resources in the same cluster) are

@@ -147,8 +147,10 @@ requiring a Kubernetes Secret.  Because environment variables are visible to
 same-host process inspectors, this is not the production Secret delivery path.
 
 Routing eligibility remains gated separately by `GridSite.status.phase == Active`
-regardless of SWIM encryption configuration.  Both layers are required for a
-production-secure mesh.
+regardless of SWIM encryption configuration. Active status indicates control-plane
+eligibility only: sufficient trust information exists to include the site in routing
+overlays. Data-plane security readiness (mTLS handshake completion, client certificate
+validation, routing config loading) is verified separately at request time.
 
 ### Stale candidate TTL
 
@@ -253,7 +255,7 @@ A discovered SWIM peer is not automatically authorized for routing.
 | `Pending` | Resource created (manually or by auto-discovery) | Initial default |
 | `Discovered` | SWIM peer observed as Alive | `GridNetwork` controller writes on first observation |
 | `Connecting` | Gateway address known (`spec.egress.address` non-empty) | `GridSite` controller advances from Discovered; performs TCP probe |
-| `Active` | Fingerprint trust policy matched and gateway probe succeeded | `GridSite` controller promotes from Connecting and preserves Active while probe succeeds |
+| `Active` | CertificatePinned — configured fingerprint matches received cert and TCP probe succeeds | `GridSite` controller promotes from Connecting and preserves Active while probe succeeds |
 | `Unreachable` | Probe failure while Active | `GridSite` controller moves Active → Unreachable on TCP probe failure |
 | `Left` | Set on graceful site departure | Preserved by operator once set |
 
@@ -332,13 +334,37 @@ be written to status.
 | `TrustPolicyVerified` | Fingerprint matched; site promoted from `Connecting` to `Active` |
 | `TrustPolicyVerified` | Site was already `Active`; fingerprint still matches and TCP probe succeeded |
 
-**Routing eligibility:** `GridSite.status.phase == Active` is the control-plane gate for
-remote CRDT provider records.  Provider records from a peer whose `GridSite` is in
-`Discovered`, `Connecting`, `Pending`, `Unreachable`, or `Left` are excluded from the
-routing overlay.  Records from a peer with no matching `GridSite` are also excluded
-(fail-closed).  Trust enforcement at request time is additionally enforced by data-plane
-mTLS at the provider gateway.  See [Routing eligibility](routing.md#routing-eligibility)
-for the full gating rule.
+**Routing eligibility:** `GridSite.status.phase == Active` is the control-plane eligibility
+gate for remote CRDT provider records. Active means the control plane has verified the
+remote site's certificate fingerprint and TCP connectivity - sufficient information to
+include the site's providers in routing overlays for consideration.
+
+Provider records from a peer whose `GridSite` is in `Discovered`, `Connecting`, `Pending`,
+`Unreachable`, or `Left` are excluded from the routing overlay. Records from a peer with
+no matching `GridSite` are also excluded (fail-closed).
+
+GridSite Active is a control-plane eligibility signal. It means Grid has enough
+site/trust information to consider the site for overlay generation. It does not
+currently prove that a Praxis gateway has completed an mTLS handshake, accepted
+client identity, loaded the latest routing config, or authorized provider-side
+traffic. Data-plane readiness is verified separately at request time by provider
+gateway filters.
+
+See [Routing eligibility](routing.md#routing-eligibility) for the full gating rule.
+
+### Future Readiness Conditions
+
+Future Grid versions may implement richer readiness conditions beyond the current
+control-plane eligibility model:
+
+- `TransportReachable` — TCP connectivity verified
+- `CertificatePinned` — fingerprint matches configured trust policy
+- `MTLSVerified` — successful mTLS handshake with peer gateway
+- `PeerAuthorized` — client certificate identity validated
+- `RoutingConfigLoaded` — gateway has loaded latest routing overlay
+- `RoutingReady` — end-to-end data-plane readiness confirmed
+
+The current Active phase combines `TransportReachable` and `CertificatePinned`.
 
 Example status — gateway reachable, cert received, policy configured and matching:
 

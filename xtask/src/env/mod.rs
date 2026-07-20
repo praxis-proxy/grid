@@ -1535,11 +1535,12 @@ fn env_install_grid_crds(config: &Path, site: Option<&str>) -> Result<(), Box<dy
 )]
 fn run_operator_reconcile(context: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
     use operator::{
-        CONFIGMAP_POLL_TIMEOUT, ERROR_ENDPOINT_LOCAL_PORT, ERROR_ENDPOINT_NAME, METRICS_BUSY_LOCAL_PORT,
-        METRICS_IDLE_LOCAL_PORT, POD_READY_TIMEOUT, STATUS_POLL_TIMEOUT, TEST_DEGRADED_ROUTING_CLUSTER,
-        TEST_GATEWAY_NAME, TEST_GATEWAY_NS, TEST_HEALTHY_ROUTING_CLUSTER, TEST_METRICS_BUSY_PROVIDER,
-        TEST_METRICS_BUSY_ROUTING_CLUSTER, TEST_METRICS_IDLE_PROVIDER, TEST_METRICS_IDLE_ROUTING_CLUSTER, TEST_NETWORK,
-        TEST_PROVIDER_API, TEST_PROVIDER_DEGRADED, TEST_PROVIDER_HEALTHY, TEST_PROVIDER_INVALID,
+        API_PROVIDER_SECRET_KEY, API_PROVIDER_SECRET_NAME, API_PROVIDER_SECRET_NS, CONFIGMAP_POLL_TIMEOUT,
+        ERROR_ENDPOINT_LOCAL_PORT, ERROR_ENDPOINT_NAME, METRICS_BUSY_LOCAL_PORT, METRICS_IDLE_LOCAL_PORT,
+        POD_READY_TIMEOUT, STATUS_POLL_TIMEOUT, TEST_DEGRADED_ROUTING_CLUSTER, TEST_GATEWAY_NAME, TEST_GATEWAY_NS,
+        TEST_HEALTHY_ROUTING_CLUSTER, TEST_METRICS_BUSY_PROVIDER, TEST_METRICS_BUSY_ROUTING_CLUSTER,
+        TEST_METRICS_IDLE_PROVIDER, TEST_METRICS_IDLE_ROUTING_CLUSTER, TEST_NETWORK, TEST_PROVIDER_API,
+        TEST_PROVIDER_DEGRADED, TEST_PROVIDER_HEALTHY, TEST_PROVIDER_INVALID,
     };
 
     // Step 1: install Grid CRDs and remove stale owned resources.
@@ -1594,6 +1595,15 @@ fn run_operator_reconcile(context: &str) -> Result<PathBuf, Box<dyn std::error::
     let api_endpoint = "https://api.anthropic.com";
     operator::apply_test_fixtures(context, healthy_endpoint)?;
     operator::apply_degraded_provider_fixture(context, &degraded_endpoint)?;
+    operator::delete_api_credential_secret(context, API_PROVIDER_SECRET_NS)
+        .unwrap_or_else(|e| eprintln!("  note: credential Secret cleanup: {e}"));
+    operator::create_api_credential_secret(
+        context,
+        API_PROVIDER_SECRET_NAME,
+        API_PROVIDER_SECRET_NS,
+        API_PROVIDER_SECRET_KEY,
+        consumer::API_PROVIDER_INJECTED_TOKEN,
+    )?;
     operator::apply_api_provider_fixture(context, api_endpoint)?;
     operator::apply_metrics_provider_fixtures(context, &metrics_idle_endpoint, &metrics_busy_endpoint)?;
 

@@ -30,6 +30,12 @@ local development runs.
 # Validate operator routing overlay generation in kind
 cargo xtask env validate-operator-routing -c tests/env/operator-routing.toml
 
+# Validate generated CRD schema contains required fields
+cargo xtask env verify-crd-schema
+
+# Validate in-cluster operator install/RBAC behavior
+cargo xtask env verify-operator-install-rbac -c tests/env/operator-routing-multisite.toml
+
 # Validate the dedicated llm-d-compatible provider-gateway path
 # Uses Praxis AI ext_proc with mock EPP test image
 cargo xtask env verify-llmd-compatible-routing -c tests/env/operator-routing-multisite.toml
@@ -56,6 +62,12 @@ cargo xtask env verify-swim-crd-seeds -c tests/env/operator-routing.toml
 # Validate CRDT provider-state propagation over SWIM
 cargo xtask env verify-swim-state -c tests/env/operator-routing.toml
 
+# Validate CRDT-origin overlay rendering over SWIM
+cargo xtask env verify-swim-overlay -c tests/env/operator-routing-multisite.toml
+
+# Validate CRDT-origin routing over SWIM
+cargo xtask env verify-swim-routing -c tests/env/operator-routing-two-provider.toml
+
 # Validate encrypted SWIM transport behavior and failure cases
 cargo xtask env verify-swim-encryption -c tests/env/operator-routing-multisite.toml
 
@@ -64,6 +76,18 @@ cargo xtask env verify-swim-mesh-three-node -c tests/env/operator-routing-multis
 
 # Validate GridSite trust fingerprint promotion and fail-closed rotation
 cargo xtask env verify-gridsite-trust-fingerprint -c tests/env/operator-routing-multisite.toml
+
+# Validate metrics-driven candidate ordering and routing
+cargo xtask env verify-metrics-routing -c tests/env/operator-routing-two-provider.toml
+
+# Validate operator-created GridSite discovery and join lifecycle
+cargo xtask env verify-site-join-discovery -c tests/env/operator-routing-multisite.toml
+
+# Validate route-away behavior when a SWIM peer is lost
+cargo xtask env verify-failover-under-lost-peer -c tests/env/operator-routing-two-provider.toml
+
+# Validate stale remote candidate eviction from rendered overlays
+cargo xtask env verify-stale-gc-ttl -c tests/env/operator-routing-two-provider.toml
 ```
 
 ## Documentation

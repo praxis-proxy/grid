@@ -94,10 +94,10 @@ async fn validate_network_ref(site: &GridSite, client: &Client) -> Result<(), Op
 ///
 /// Transitions:
 /// - Pending → stays Pending (`GridNetwork` controller writes Discovered on SWIM Alive).
-/// - Discovered + gateway address → Connecting (gateway address known; trust/data-plane readiness remain external).
+/// - Discovered + gateway address → Connecting (gateway address known; control-plane eligibility assessment begins).
 /// - Discovered, no gateway address → stays Discovered.
 /// - Connecting → Active when the TCP probe succeeds and the configured fingerprint trust policy matches the received
-///   public certificate.
+///   public certificate. Active indicates control-plane eligibility for overlay inclusion.
 /// - Connecting → stays Connecting when the gateway is unreachable, trust material is missing or invalid, or the
 ///   fingerprint policy is missing or mismatched.
 /// - Active → stays Active if gateway is reachable and the fingerprint trust policy still matches; otherwise demotes to
@@ -129,7 +129,7 @@ pub(crate) async fn site_phase_next(current: &GridSitePhase, site: &GridSite) ->
                 (
                     GridSitePhase::Connecting,
                     "GatewayAddressKnown".to_owned(),
-                    "gateway address present; awaiting trust verification and data-plane readiness".to_owned(),
+                    "gateway address present; awaiting control-plane trust verification".to_owned(),
                 )
             } else {
                 (
@@ -695,7 +695,7 @@ mod tests {
     #[tokio::test]
     async fn valid_structure_never_advances_to_active_without_policy() {
         // Even with a valid cert, the lifecycle must stay at most Connecting.
-        // Active requires explicit trust policy + data-plane readiness, not cert presence.
+        // Active requires explicit trust policy, not cert presence alone.
         let status = check_cert_pem(VALID_CERT_PEM);
         assert_eq!(status, CertPemStatus::ValidStructure);
         // The phase logic: Connecting + valid cert (probe succeeds) → TrustPolicyMissing, stays Connecting.

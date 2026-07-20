@@ -413,10 +413,16 @@ A non-empty `publicCertPem` with no private-key rejection indicates:
 - The remote site is authenticated or authorized for routing.
 - The mTLS handshake has succeeded.
 
-**Trust policy — fingerprint pinning:** The operator supports explicit trust authorization
-through `GridSite.spec.trust.certFingerprint`.  When configured, the operator computes the
-SHA-256 fingerprint of the received `publicCertPem` and promotes the site from `Connecting`
-to `Active` when the fingerprint matches and the TCP probe succeeds.
+**Trust policy — fingerprint pinning:** The operator supports explicit control-plane trust
+verification through `GridSite.spec.trust.certFingerprint`.  When configured, the operator
+computes the SHA-256 fingerprint of the received `publicCertPem` and promotes the site from
+`Connecting` to `Active` when the fingerprint matches and the TCP probe succeeds.
+
+GridSite Active is a control-plane eligibility signal. It means Grid has enough
+site/trust information to consider the site for overlay generation. It does not
+currently prove that a Praxis gateway has completed an mTLS handshake, accepted
+client identity, loaded the latest routing config, or authorized provider-side
+traffic.
 
 ```yaml
 spec:
@@ -456,8 +462,14 @@ the control-plane `publicCertPem` field.
 **Routing eligibility:** Remote CRDT provider records are included in the routing overlay
 only when the source `GridSite.status.phase == Active`.  Records from peers in any other
 phase (`Discovered`, `Connecting`, `Unreachable`, or missing) are excluded at the
-control-plane overlay level.  Data-plane mTLS at the provider gateway enforces peer
-identity on every request independently of the control-plane phase.
+control-plane overlay level.
+
+Active phase indicates the control plane has verified the remote site's certificate
+fingerprint and TCP connectivity. Data-plane readiness requires additional steps:
+provider gateway mTLS handshake verification, client certificate validation, routing
+configuration propagation, and provider-side authorization. These readiness conditions
+are enforced at request time by the data-plane gateway filters, not by the control-plane
+Active status.
 
 ## Separation of Concerns
 
@@ -468,8 +480,11 @@ identity on every request independently of the control-plane phase.
 | **Deployment / platform** | Provisions gateway trust material (CA cert or cert bundle) at the path referenced by the consumer config's `ca_path`; distributes the Grid CA cert to remote clusters where gateways need to verify peer identity; configures the provider gateway's peer identity filter; manages gateway rollout when trust material changes. |
 | **Workload** | Sends requests to the Gateway, optionally with routing headers — never handles provider credentials. |
 
-`Active` GridSite status is the control-plane gate: it controls whether a remote site's
-providers appear in the routing overlay.  Before a site can participate in secure
-data-plane traffic, the gateway trust material (CA cert or cert bundle) must also be
-provisioned and the peer identity filter configured — these are deployment prerequisites,
-not automatic outputs of Grid's fingerprint verification.
+`Active` GridSite status is the control-plane eligibility gate: it controls whether a remote
+site's providers appear in the routing overlay. Active means the control plane has enough
+trust information to include the site in routing decisions.
+
+Secure data-plane traffic readiness requires additional steps beyond Active status: gateway
+trust material provisioning (CA cert or cert bundle), peer identity filter configuration,
+routing configuration loading, and provider authorization. These are deployment prerequisites
+and runtime readiness checks, not automatic outputs of Grid's fingerprint verification.

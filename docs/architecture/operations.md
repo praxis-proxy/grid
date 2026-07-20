@@ -342,7 +342,9 @@ gateway TLS and peer identity filters, not by SWIM membership.
 
 Routing eligibility remains fail-closed at the `GridSite` layer independently of
 SWIM encryption: remote CRDT provider records are rendered only for peers whose
-`GridSite` is `Active`.  Both layers are required for production deployments.
+`GridSite` is `Active`. Active indicates control-plane eligibility — sufficient
+trust information to include the site in routing overlays. Data-plane readiness
+is verified separately. Both layers are required for production deployments.
 
 **Channel-full retry**
 
@@ -473,10 +475,16 @@ it gossiped successfully.
 
 ### Routing eligibility
 
-`GridSite.status.phase == Active` is the control-plane gate for remote CRDT provider records.
+`GridSite.status.phase == Active` is the control-plane eligibility gate for remote CRDT provider records.
 Provider records advertised by a SWIM peer are included in the routing overlay only when
 the corresponding `GridSite` is `Active`.  Peers in `Discovered`, `Connecting`, or any
 other phase are excluded.  Peers with no matching `GridSite` are also excluded (fail-closed).
+
+GridSite Active is a control-plane eligibility signal. It means Grid has enough
+site/trust information to consider the site for overlay generation. It does not
+currently prove that a Praxis gateway has completed an mTLS handshake, accepted
+client identity, loaded the latest routing config, or authorized provider-side
+traffic.
 
 Setting `Active` requires an explicit trust policy.  For the current operator, that
 policy is `GridSite.spec.trust.certFingerprint`: when the configured fingerprint
