@@ -193,6 +193,13 @@ reads that file at filter construction time and injects
 `Authorization: Bearer <token>` after `grid_route`
 selects a credential-bearing candidate.
 
+The current tested Praxis AI `grid_credential_inject` implementation uses
+read-once/cache behavior: the mounted Secret file is read once during filter
+construction, the `Authorization` value is stored in an in-memory `HashMap`, and
+per-request injection is a metadata lookup plus header injection.  There is no
+Kubernetes API call and no per-request file read.  Secret rotation requires a
+Praxis AI config reload or pod restart; automatic rotation is not yet supported.
+
 Static `api_key` and `custom` strategies use the same file-backed injection
 seam when implemented.
 

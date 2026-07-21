@@ -126,8 +126,9 @@ cluster before restarting or rolling out the consumer gateway.
 **Consumer pod does not reload when the ConfigMap changes**
 
 Praxis gateways do not automatically hot-reload from a changed ConfigMap volume
-mount.  A pod restart or rollout is required after the operator updates the
-`ConfigMap`.  See [Reload and rollout](#reload-and-rollout) below.
+mount.  Until an explicit Praxis AI overlay reload path lands, a pod restart or
+rollout is required after the operator updates the `ConfigMap`.  See
+[Reload and rollout](#reload-and-rollout) below.
 
 ## Reload and rollout
 
