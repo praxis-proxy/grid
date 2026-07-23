@@ -28,13 +28,16 @@ spec:
         credentialMountBase: /run/secrets/grid-credentials
         configMapName: praxis-consumer-config
         tlsCertMountPath: /etc/praxis/tls
-        clusterEndpoints:           # optional; endpoint topology for load_balancer
+        clusterEndpoints:           # endpoint topology for load_balancer
           - cluster: site-a
             address: "10.0.0.4:30080"
-            sni: site-a.grid.internal
+            transport:
+              mode: mutual_tls         # mTLS with CA verification and client cert
+              sni: site-a.grid.internal
           - cluster: api-provider
             address: "mock-api.default.svc:8080"
-            # sni absent → plain HTTP, no mTLS
+            transport:
+              mode: plaintext          # explicit insecure/dev-only — no TLS
   region: us-east-1
   zone: us-east-1a
   swim:
@@ -176,8 +179,10 @@ Praxis `ConfigMap` generation.
 | `enabled` | `false` | Set to `true` to enable consumer config generation for this gateway. |
 | `credentialMountBase` | `/run/secrets/grid-credentials` | Base directory where credential Secrets are mounted inside the consumer pod. |
 | `configMapName` | `praxis-consumer-config` | Name of the generated `ConfigMap` in the gateway namespace. |
-| `clusterEndpoints[]` | `[]` | Optional endpoint topology for `load_balancer` clusters. Each entry maps a candidate cluster name to an address and optional SNI. |
-| `tlsCertMountPath` | `/etc/praxis/tls` | Base path for mounted TLS files used when a `clusterEndpoints[]` entry sets `sni`. |
+| `clusterEndpoints[]` | `[]` | Endpoint topology for `load_balancer` clusters. Each entry maps a candidate cluster name to an address with explicit `transport` configuration. Missing transport fails closed. |
+| `clusterEndpoints[].transport.mode` | _(required)_ | `mutual_tls` (mTLS with CA/client cert/SNI/verify) or `plaintext` (no TLS, insecure/dev-only). |
+| `clusterEndpoints[].transport.sni` | _(required for `mutual_tls`)_ | TLS Server Name Indication; must match the provider certificate SAN. |
+| `tlsCertMountPath` | `/etc/praxis/tls` | Base path for mounted TLS files used when a `clusterEndpoints[]` entry uses `mutual_tls` transport. |
 | `listenerPort` | `8080` | HTTP port for the generated `listeners[0].address` (`0.0.0.0:{listenerPort}`). |
 
 When `enabled: true`, the `GridNetwork` controller renders a `praxis.yaml`-keyed
@@ -191,8 +196,9 @@ complete, runnable Praxis config containing:
   - `grid_credential_inject` entries (one per unique credential reference) using
     `file:` sources — token bytes are never written to the `ConfigMap`
   - `load_balancer` entries (one per unique candidate cluster). Every referenced
-    cluster must have a matching `clusterEndpoints[]` entry with endpoint and
-    optional TLS settings
+    cluster must have a matching `clusterEndpoints[]` entry with endpoint address
+    and explicit `transport` configuration.  `transport.mode` is the security
+    switch — not `sni` presence.  Missing transport fails closed
 - `admin:` — admin listener at `127.0.0.1:9901`
 - `shutdown_timeout_secs: 5`
 

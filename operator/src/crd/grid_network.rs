@@ -172,10 +172,14 @@ pub struct ConsumerConfig {
     /// Endpoint topology for the generated `load_balancer` section.
     ///
     /// Each entry maps a routing candidate cluster name to a reachable endpoint
-    /// address and optional mTLS configuration.  Every cluster referenced by a
-    /// routing candidate must have a matching entry here.  Missing endpoint
-    /// topology causes config generation to fail with `MissingClusterEndpoint`
-    /// status instead of rendering an incomplete `load_balancer` cluster.
+    /// address with explicit transport configuration.  Every cluster referenced
+    /// by a routing candidate must have a matching entry here with a non-`None`
+    /// `transport` field.
+    ///
+    /// Missing endpoint topology causes config generation to fail with
+    /// `MissingClusterEndpoint`.  Missing transport fails with
+    /// `MissingTransport`.  Mutual-TLS transport without SNI fails with
+    /// `MissingSni`.
     ///
     /// In production, this is populated by whoever manages the consumer gateway
     /// deployment (platform automation, the gateway operator, or a Helm chart).
@@ -218,11 +222,54 @@ impl Default for ConsumerConfig {
     }
 }
 
+/// Transport mode for a consumer load-balancer cluster endpoint.
+///
+/// Determines whether the consumer connects to the provider gateway
+/// cluster over mutual TLS or plain HTTP.  This is an explicit security
+/// decision — the operator refuses to render a cluster entry without a
+/// declared transport mode, preventing accidental plaintext.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransportMode {
+    /// Mutual TLS with CA verification and client certificate.
+    MutualTls,
+    /// Plain HTTP — no TLS.  Explicit insecure/dev-only mode.
+    Plaintext,
+}
+
+/// Transport configuration for a cluster endpoint.
+///
+/// Bundles the [`TransportMode`] with an optional SNI field.
+/// When `mode` is [`MutualTls`](TransportMode::MutualTls), `sni` is
+/// required and must match the Subject Alternative Name in the provider
+/// gateway's server certificate.  When `mode` is
+/// [`Plaintext`](TransportMode::Plaintext), `sni` must not be set —
+/// setting it is rejected as a likely misconfiguration.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EndpointTransport {
+    /// Transport mode: `mutual_tls` or `plaintext`.
+    pub mode: TransportMode,
+
+    /// TLS Server Name Indication (required when mode is `mutual_tls`;
+    /// must not be set when mode is `plaintext`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sni: Option<String>,
+}
+
 /// Endpoint configuration for one consumer `load_balancer` cluster.
 ///
-/// Maps a routing candidate cluster name to a reachable provider gateway endpoint.
-/// When `sni` is set, the cluster is rendered with mTLS configuration using the
-/// certificates mounted at `ConsumerConfig::tls_cert_mount_path`.
+/// Maps a routing candidate cluster name to a reachable provider gateway
+/// endpoint with explicit transport intent.  Every cluster referenced by
+/// a routing candidate must have a matching entry.
+///
+/// # Transport requirement
+///
+/// The `transport` field is required.  Missing transport fails closed
+/// during config rendering with status reason `MissingTransport`.
+/// When `transport.mode` is `mutual_tls`, `transport.sni` must also
+/// be present and non-blank; otherwise rendering fails with status
+/// reason `MissingSni`.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClusterEndpointConfig {
@@ -232,15 +279,13 @@ pub struct ClusterEndpointConfig {
     /// Reachable endpoint address (`host:port`).
     pub address: String,
 
-    /// TLS Server Name Indication.
+    /// Explicit transport configuration.
     ///
-    /// When set, the generated cluster entry uses mTLS with the certificates
-    /// at `ConsumerConfig::tls_cert_mount_path`.  The SNI must match the Subject
-    /// Alternative Name in the provider gateway's server certificate.
-    ///
-    /// When absent, the cluster is rendered as a plain-HTTP endpoint (no TLS).
+    /// Required.  Use `mutual_tls` with `sni` for remote/provider-gateway
+    /// traffic.  Use `plaintext` only for local/dev-only endpoints.
+    /// Missing transport fails closed during config rendering.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sni: Option<String>,
+    pub transport: Option<EndpointTransport>,
 }
 
 /// Default credential mount base path.
@@ -398,9 +443,9 @@ pub struct ConsumerConfigStatus {
     /// Machine-readable reason for the current phase.
     ///
     /// `""` when `phase` is `Rendered`.
-    /// One of `MissingClusterEndpoint`, `ConsumerConfigRenderFailed`,
-    /// `ConsumerConfigApplyFailed`, `ConsumerConfigDisabled`
-    /// otherwise.
+    /// One of `MissingClusterEndpoint`, `MissingTransport`, `MissingSni`,
+    /// `PlaintextWithSni`, `ConsumerConfigRenderFailed`,
+    /// `ConsumerConfigApplyFailed`, `ConsumerConfigDisabled` otherwise.
     #[serde(default)]
     pub reason: String,
 
@@ -666,7 +711,10 @@ mod tests {
                 "clusterEndpoints": [{
                     "cluster": "gateway-site-a",
                     "address": "10.0.0.10:30080",
-                    "sni": "site-a.grid.internal"
+                    "transport": {
+                        "mode": "mutual_tls",
+                        "sni": "site-a.grid.internal"
+                    }
                 }]
             }
         });
@@ -689,7 +737,47 @@ mod tests {
         assert_eq!(cc.cluster_endpoints.len(), 1, "clusterEndpoints must round-trip");
         assert_eq!(endpoint.cluster, "gateway-site-a");
         assert_eq!(endpoint.address, "10.0.0.10:30080");
-        assert_eq!(endpoint.sni.as_deref(), Some("site-a.grid.internal"));
+        let transport = endpoint.transport.as_ref().unwrap_or_else(|| std::process::abort());
+        assert_eq!(
+            transport.mode,
+            TransportMode::MutualTls,
+            "transport mode must round-trip"
+        );
+        assert_eq!(
+            transport.sni.as_deref(),
+            Some("site-a.grid.internal"),
+            "transport SNI must round-trip"
+        );
+    }
+
+    #[test]
+    fn transport_mode_plaintext_round_trips() {
+        let json = serde_json::json!({
+            "cluster": "api-cluster",
+            "address": "mock-api.default.svc:8080",
+            "transport": { "mode": "plaintext" }
+        });
+        let ep: ClusterEndpointConfig = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
+        let transport = ep.transport.as_ref().unwrap_or_else(|| std::process::abort());
+        assert_eq!(
+            transport.mode,
+            TransportMode::Plaintext,
+            "plaintext mode must round-trip"
+        );
+        assert!(transport.sni.is_none(), "plaintext must not require SNI");
+    }
+
+    #[test]
+    fn transport_absent_deserializes_to_none() {
+        let json = serde_json::json!({
+            "cluster": "legacy-cluster",
+            "address": "10.0.0.1:8080"
+        });
+        let ep: ClusterEndpointConfig = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
+        assert!(
+            ep.transport.is_none(),
+            "absent transport must deserialize to None (fails closed at render time)"
+        );
     }
 
     #[test]
@@ -758,6 +846,65 @@ mod tests {
         assert!(
             consumer_config_properties.contains_key("tlsCertMountPath"),
             "CRD schema must include consumerConfig.tlsCertMountPath"
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "CRD schema test covers transport type, mode enum values, and sni field"
+    )]
+    fn grid_network_crd_has_transport_schema_on_cluster_endpoints() {
+        let crd = crd_json();
+        let endpoint_properties = crd
+            .pointer(
+                "/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties\
+                 /gatewayRefs/items/properties/consumerConfig/properties\
+                 /clusterEndpoints/items/properties",
+            )
+            .and_then(serde_json::Value::as_object)
+            .unwrap_or_else(|| std::process::abort());
+
+        assert!(
+            endpoint_properties.contains_key("transport"),
+            "CRD schema must include transport field on clusterEndpoints items"
+        );
+
+        let transport_properties = endpoint_properties
+            .get("transport")
+            .and_then(|v| v.pointer("/properties"))
+            .and_then(serde_json::Value::as_object)
+            .unwrap_or_else(|| std::process::abort());
+
+        assert!(
+            transport_properties.contains_key("mode"),
+            "CRD schema must include transport.mode"
+        );
+        assert!(
+            transport_properties.contains_key("sni"),
+            "CRD schema must include transport.sni"
+        );
+
+        let mode_enum = transport_properties
+            .get("mode")
+            .and_then(|v| v.get("enum"))
+            .and_then(serde_json::Value::as_array)
+            .unwrap_or_else(|| std::process::abort());
+
+        let mode_values: Vec<&str> = mode_enum.iter().filter_map(serde_json::Value::as_str).collect();
+
+        assert!(
+            mode_values.contains(&"mutual_tls"),
+            "transport.mode enum must include mutual_tls: {mode_values:?}"
+        );
+        assert!(
+            mode_values.contains(&"plaintext"),
+            "transport.mode enum must include plaintext: {mode_values:?}"
+        );
+        assert_eq!(
+            mode_values.len(),
+            2,
+            "transport.mode enum must have exactly 2 values: {mode_values:?}"
         );
     }
 }

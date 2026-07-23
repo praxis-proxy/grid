@@ -1231,6 +1231,9 @@ pub(crate) fn consumer_config_status_error(
         OperatorError::ConsumerConfigRender(ConsumerConfigError::MissingClusterEndpoint { .. }) => {
             "MissingClusterEndpoint"
         },
+        OperatorError::ConsumerConfigRender(ConsumerConfigError::MissingTransport { .. }) => "MissingTransport",
+        OperatorError::ConsumerConfigRender(ConsumerConfigError::MissingSni { .. }) => "MissingSni",
+        OperatorError::ConsumerConfigRender(ConsumerConfigError::PlaintextWithSni { .. }) => "PlaintextWithSni",
         OperatorError::ConsumerConfigRender(_) => "ConsumerConfigRenderFailed",
         OperatorError::Kube(_) => "ConsumerConfigApplyFailed",
         _ => "ConsumerConfigError",
@@ -2963,6 +2966,60 @@ mod tests {
         assert!(
             status.message.contains("site-a"),
             "missing endpoint message must identify the cluster"
+        );
+    }
+
+    #[test]
+    fn consumer_config_status_missing_transport_reason() {
+        let gw = make_gw_ref("gw", "ns");
+        let cc = make_consumer_config("cm");
+        let err = OperatorError::ConsumerConfigRender(ConsumerConfigError::MissingTransport {
+            cluster: "site-b".to_owned(),
+        });
+        let status = consumer_config_status_error(&gw, &cc, &err, 1);
+        assert_eq!(
+            status.reason, "MissingTransport",
+            "missing transport must map to MissingTransport reason"
+        );
+        assert!(
+            status.message.contains("site-b"),
+            "missing transport message must identify the cluster"
+        );
+    }
+
+    #[test]
+    fn consumer_config_status_missing_sni_reason() {
+        let gw = make_gw_ref("gw", "ns");
+        let cc = make_consumer_config("cm");
+        let err = OperatorError::ConsumerConfigRender(ConsumerConfigError::MissingSni {
+            cluster: "site-c".to_owned(),
+        });
+        let status = consumer_config_status_error(&gw, &cc, &err, 1);
+        assert_eq!(
+            status.reason, "MissingSni",
+            "missing sni on mutual_tls must map to MissingSni reason"
+        );
+        assert!(
+            status.message.contains("site-c"),
+            "missing sni message must identify the cluster"
+        );
+    }
+
+    #[test]
+    fn consumer_config_status_plaintext_with_sni_reason() {
+        let gw = make_gw_ref("gw", "ns");
+        let cc = make_consumer_config("cm");
+        let err = OperatorError::ConsumerConfigRender(ConsumerConfigError::PlaintextWithSni {
+            cluster: "site-d".to_owned(),
+        });
+        let status = consumer_config_status_error(&gw, &cc, &err, 1);
+        assert_eq!(
+            status.reason, "PlaintextWithSni",
+            "plaintext with sni must map to PlaintextWithSni reason"
+        );
+        assert!(
+            status.message.contains("site-d"),
+            "plaintext with sni message must identify the cluster"
         );
     }
 

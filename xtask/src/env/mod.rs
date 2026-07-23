@@ -937,11 +937,12 @@ fn env_verify_gateway_e2e(config: &Path) -> Result<(), Box<dyn std::error::Error
 fn env_verify_api_fallback(config: &Path, site: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     use operator::{
         API_FALLBACK_MODEL, API_PROVIDER_SECRET_KEY, API_PROVIDER_SECRET_NAME, API_PROVIDER_SECRET_NS,
-        CONFIGMAP_POLL_TIMEOUT, STATUS_POLL_TIMEOUT, TEST_GATEWAY_NAME, TEST_GATEWAY_NS, TEST_HEALTHY_ROUTING_CLUSTER,
-        TEST_NETWORK, TEST_PROVIDER_API, TEST_PROVIDER_HEALTHY,
+        CONFIGMAP_POLL_TIMEOUT, STATUS_POLL_TIMEOUT, TEST_GATEWAY_NAME, TEST_GATEWAY_NS, TEST_NETWORK,
+        TEST_PROVIDER_API, TEST_PROVIDER_HEALTHY,
     };
 
     let cfg = EnvConfig::from_file(config)?;
+    let (provider_cluster, provider_model) = resolve_operator_provider(&cfg, site)?;
     let context = resolve_operator_context(&cfg, site)?;
     eprintln!("verify-api-fallback: context={context}");
 
@@ -978,13 +979,13 @@ fn env_verify_api_fallback(config: &Path, site: Option<&str>) -> Result<(), Box<
     )?;
 
     let healthy_endpoint = "http://mock-openai-provider.default.svc:8080";
-    // Apply the GridNetwork + healthy local provider (model-x) + invalid (excluded by
+    // Apply the GridNetwork + healthy local provider + invalid (excluded by
     // operator) + api_provider (model-z, api_provider backendKind, auth.secretRef set).
     // The degraded and metrics fixtures are omitted — this validation focuses on the
     // local-vs-api_provider routing path, not on health/metrics signal ordering.
     // The spec.endpoint on the api_provider fixture is not used for routing; the xtask
     // builds the consumer cluster endpoint directly from the in-cluster mock service.
-    operator::apply_test_fixtures(&context, healthy_endpoint)?;
+    operator::apply_test_fixtures_for_cluster(&context, healthy_endpoint, &provider_cluster, &provider_model)?;
     operator::apply_api_provider_fixture(&context, healthy_endpoint)?;
 
     let op = operator::spawn_operator(&context)?;
@@ -1003,12 +1004,7 @@ fn env_verify_api_fallback(config: &Path, site: Option<&str>) -> Result<(), Box<
         )?;
 
         let overlay = operator::read_overlay_configmap(&context, TEST_NETWORK, TEST_GATEWAY_NAME, TEST_GATEWAY_NS)?;
-        operator::verify_api_fallback_overlay(
-            &overlay,
-            TEST_HEALTHY_ROUTING_CLUSTER,
-            TEST_PROVIDER_API,
-            API_FALLBACK_MODEL,
-        )?;
+        operator::verify_api_fallback_overlay(&overlay, &provider_cluster, TEST_PROVIDER_API, API_FALLBACK_MODEL)?;
         eprintln!("  [OK] overlay contains api_provider candidate with correct scoring order");
 
         let path = operator::export_overlay_to_file(&context, TEST_NETWORK, TEST_GATEWAY_NAME, TEST_GATEWAY_NS)?;
@@ -1041,7 +1037,7 @@ fn env_verify_api_fallback(config: &Path, site: Option<&str>) -> Result<(), Box<
 
     // ── Step 5: verify routing + credential injection ─────────────────────────
     eprintln!("verify-api-fallback: [5/5] verifying API-provider fallback routing and credential injection...");
-    eprintln!("  local model ({TEST_HEALTHY_ROUTING_CLUSTER}) → model-x via site-a provider gateway");
+    eprintln!("  local model ({provider_cluster}) → {provider_model} via provider gateway");
     eprintln!(
         "  api fallback ({TEST_PROVIDER_API}) → {API_FALLBACK_MODEL} via mock api-provider (injected credential)"
     );
@@ -1055,7 +1051,7 @@ fn env_verify_api_fallback(config: &Path, site: Option<&str>) -> Result<(), Box<
 
     consumer::verify_api_fallback_e2e(
         &cfg,
-        "model-x",
+        &provider_model,
         API_FALLBACK_MODEL,
         mock_pf_ready.then_some(mock_port),
         API_PROVIDER_SECRET_NAME,
@@ -1090,10 +1086,11 @@ fn env_verify_api_fallback_native(config: &Path, site: Option<&str>) -> Result<(
     use operator::{
         API_FALLBACK_MODEL, API_PROVIDER_SECRET_KEY, API_PROVIDER_SECRET_NAME, API_PROVIDER_SECRET_NS,
         CONFIGMAP_POLL_TIMEOUT, STATUS_POLL_TIMEOUT, TEST_CONSUMER_CONFIGMAP_NAME, TEST_GATEWAY_NAME, TEST_GATEWAY_NS,
-        TEST_HEALTHY_ROUTING_CLUSTER, TEST_NETWORK, TEST_PROVIDER_API, TEST_PROVIDER_HEALTHY,
+        TEST_NETWORK, TEST_PROVIDER_API, TEST_PROVIDER_HEALTHY,
     };
 
     let cfg = EnvConfig::from_file(config)?;
+    let (provider_cluster, provider_model) = resolve_operator_provider(&cfg, site)?;
     let context = resolve_operator_context(&cfg, site)?;
     eprintln!("verify-api-fallback-native: context={context}");
 
@@ -1131,7 +1128,13 @@ fn env_verify_api_fallback_native(config: &Path, site: Option<&str>) -> Result<(
     // Pass the API provider mock address so the operator-generated consumer ConfigMap
     // includes a full (plain HTTP) cluster entry for the API fallback route.
     let api_provider_svc_address = format!("{}.default.svc:{}", kind::MOCK_API_SVC, kind::MOCK_API_PORT);
-    operator::apply_test_fixtures_with_consumer_config(&context, healthy_endpoint, &api_provider_svc_address)?;
+    operator::apply_test_fixtures_with_consumer_config(
+        &context,
+        healthy_endpoint,
+        &api_provider_svc_address,
+        &provider_cluster,
+        &provider_model,
+    )?;
     operator::apply_api_provider_fixture(&context, healthy_endpoint)?;
 
     let op = operator::spawn_operator(&context)?;
@@ -1148,12 +1151,7 @@ fn env_verify_api_fallback_native(config: &Path, site: Option<&str>) -> Result<(
             CONFIGMAP_POLL_TIMEOUT,
         )?;
         let overlay = operator::read_overlay_configmap(&context, TEST_NETWORK, TEST_GATEWAY_NAME, TEST_GATEWAY_NS)?;
-        operator::verify_api_fallback_overlay(
-            &overlay,
-            TEST_HEALTHY_ROUTING_CLUSTER,
-            TEST_PROVIDER_API,
-            API_FALLBACK_MODEL,
-        )?;
+        operator::verify_api_fallback_overlay(&overlay, &provider_cluster, TEST_PROVIDER_API, API_FALLBACK_MODEL)?;
         eprintln!("  [OK] overlay contains api_provider candidate with credential secretRef");
 
         // Wait for and validate the operator-generated consumer ConfigMap.
@@ -1247,7 +1245,7 @@ fn env_verify_api_fallback_native(config: &Path, site: Option<&str>) -> Result<(
     // ── Step 6: verify routing + token-absence + native credential injection ──
     eprintln!("verify-api-fallback-native: [6/8] verifying routing with grid_credential_inject...");
     eprintln!("  live consumer pod runs operator-generated config");
-    eprintln!("  local ({TEST_HEALTHY_ROUTING_CLUSTER}) → model-x via site-a provider gateway");
+    eprintln!("  local ({provider_cluster}) → {provider_model} via provider gateway");
     eprintln!(
         "  api fallback ({TEST_PROVIDER_API}) → {API_FALLBACK_MODEL} via mock api-provider (grid_credential_inject)"
     );
@@ -1259,7 +1257,7 @@ fn env_verify_api_fallback_native(config: &Path, site: Option<&str>) -> Result<(
 
     consumer::verify_api_fallback_e2e(
         &cfg,
-        "model-x",
+        &provider_model,
         API_FALLBACK_MODEL,
         mock_pf_ready.then_some(mock_port),
         API_PROVIDER_SECRET_NAME,
@@ -1501,6 +1499,31 @@ fn resolve_operator_site_name<'a>(
             .map(String::as_str)
             .ok_or_else(|| "no provider site in config".into())
     }
+}
+
+/// Resolve the provider site and first model used by operator validation.
+///
+/// Single-site fixtures use `site-a`/`model-x`; multisite fixtures use the
+/// selected provider site and its configured model, for example
+/// `site-east`/`model-east`.
+fn resolve_operator_provider(
+    cfg: &EnvConfig,
+    site: Option<&str>,
+) -> Result<(String, String), Box<dyn std::error::Error>> {
+    let site_name = resolve_operator_site_name(cfg, site)?;
+    let def = cfg
+        .clusters
+        .definitions
+        .get(site_name)
+        .ok_or_else(|| format!("operator provider site {site_name:?} not found in config"))?;
+    if def.role != ClusterRole::Provider {
+        return Err(format!("operator site {site_name:?} is not a provider cluster").into());
+    }
+    let model = def
+        .models
+        .first()
+        .ok_or_else(|| format!("operator provider site {site_name:?} has no configured models"))?;
+    Ok((site_name.to_owned(), model.clone()))
 }
 
 /// Resolve the kubectl context for operator validation.
@@ -5382,6 +5405,29 @@ mod multi_provider_tests {
         assert_eq!(providers.len(), 2, "two provider clusters");
         assert_eq!(providers[0].0, "site-east");
         assert_eq!(providers[1].0, "site-west");
+    }
+
+    #[test]
+    fn resolve_operator_provider_uses_single_site_model() {
+        let cfg = make_config(&[
+            ("site-a", ClusterRole::Provider, vec!["model-x".to_owned()]),
+            ("consumer", ClusterRole::Consumer, vec![]),
+        ]);
+        let (site, model) = resolve_operator_provider(&cfg, None).expect("provider should resolve");
+        assert_eq!(site, "site-a", "single-site provider cluster must be selected");
+        assert_eq!(model, "model-x", "single-site model must be selected");
+    }
+
+    #[test]
+    fn resolve_operator_provider_uses_multisite_provider_model() {
+        let cfg = make_config(&[
+            ("site-east", ClusterRole::Provider, vec!["model-east".to_owned()]),
+            ("site-west", ClusterRole::Provider, vec!["model-west".to_owned()]),
+            ("consumer", ClusterRole::Consumer, vec![]),
+        ]);
+        let (site, model) = resolve_operator_provider(&cfg, None).expect("provider should resolve");
+        assert_eq!(site, "site-east", "first provider cluster must be selected");
+        assert_eq!(model, "model-east", "selected provider model must match topology");
     }
 
     #[test]

@@ -796,6 +796,14 @@ When `GatewayRef.consumerConfig.enabled: true`, the Grid operator applies a
 `create` and `patch`.  A `RoleBinding` in the gateway's namespace is required
 for the operator `ServiceAccount` to write the `ConfigMap` there.
 
+Every `clusterEndpoints[]` entry must declare explicit transport intent via the
+`transport` field.  Remote/provider-gateway clusters should use
+`transport.mode: mutual_tls` with a non-blank `transport.sni` matching the
+provider certificate SAN.  Local dev-only clusters may use
+`transport.mode: plaintext`.  Missing transport fails closed with status reason
+`MissingTransport`; missing SNI on `mutual_tls` fails with `MissingSni`.
+`transport.mode` is the security switch — not the presence of `sni`.
+
 ### Credential Secret access
 
 The generated `ConfigMap` references credential Secrets by name, namespace, and
@@ -1057,7 +1065,7 @@ not the production operator:
   continuously
 - They do not manage `GridNetwork`, `GridSite`, or
   `InferenceProvider` CRDs in a watch loop
-- They do not perform live config hot-reload against
+- They do not perform live config reload against
   a running gateway
 
 The `verify-swim-membership` and `verify-swim-state`

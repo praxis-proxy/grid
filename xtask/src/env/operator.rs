@@ -835,18 +835,33 @@ fn generate_crd_json() -> Result<String, Box<dyn std::error::Error>> {
 /// - `InferenceProvider` `op-e2e-healthy` — valid endpoint → reconciles to `Pending`
 /// - `InferenceProvider` `op-e2e-invalid` — blank endpoint → reconciles to `Unavailable`
 pub(crate) fn apply_test_fixtures(context: &str, provider_endpoint: &str) -> Result<(), Box<dyn std::error::Error>> {
+    apply_test_fixtures_for_cluster(context, provider_endpoint, TEST_HEALTHY_ROUTING_CLUSTER, "model-x")
+}
+
+/// Apply the Grid operator validation fixtures using an explicit routing cluster.
+///
+/// This is used by topology-aware E2Es where the provider site may be `site-east`
+/// or another configured provider cluster rather than the single-site default
+/// `site-a`.
+pub(crate) fn apply_test_fixtures_for_cluster(
+    context: &str,
+    provider_endpoint: &str,
+    routing_cluster: &str,
+    model: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
     let network = network_fixture_json(TEST_NETWORK, TEST_GATEWAY_NAME, TEST_GATEWAY_NS);
     let healthy = provider_fixture_json(
         TEST_PROVIDER_HEALTHY,
         TEST_NETWORK,
         provider_endpoint,
-        Some(TEST_HEALTHY_ROUTING_CLUSTER),
+        Some(routing_cluster),
+        model,
     );
-    let invalid = provider_fixture_json(TEST_PROVIDER_INVALID, TEST_NETWORK, "", None);
+    let invalid = provider_fixture_json(TEST_PROVIDER_INVALID, TEST_NETWORK, "", None, "model-x");
     kubectl::apply_manifest(context, &network)?;
     kubectl::apply_manifest(context, &healthy)?;
     kubectl::apply_manifest(context, &invalid)?;
-    eprintln!("  [OK] test fixtures applied");
+    eprintln!("  [OK] test fixtures applied (routingClusterRef={routing_cluster:?}, model={model:?})");
     Ok(())
 }
 
@@ -871,13 +886,19 @@ fn network_fixture_json(name: &str, gw_name: &str, gw_ns: &str) -> String {
 ///
 /// When `routing_cluster_ref` is `Some(name)`, sets `spec.routingClusterRef`
 /// so that overlay candidates use `name` as both `site` and `cluster` (Phase 1).
-fn provider_fixture_json(name: &str, network_ref: &str, endpoint: &str, routing_cluster_ref: Option<&str>) -> String {
+fn provider_fixture_json(
+    name: &str,
+    network_ref: &str,
+    endpoint: &str,
+    routing_cluster_ref: Option<&str>,
+    model: &str,
+) -> String {
     let mut spec = serde_json::json!({
         "gridNetworkRef": network_ref,
         "providerKind": "open_ai",
         "backendKind": "local",
         "endpoint": endpoint,
-        "models": [{ "name": "model-x" }]
+        "models": [{ "name": model }]
     });
     if let Some(r) = routing_cluster_ref
         && let Some(s) = spec.as_object_mut()
@@ -2585,13 +2606,15 @@ pub(crate) fn apply_test_fixtures_with_consumer_config(
     context: &str,
     provider_endpoint: &str,
     api_provider_svc_address: &str,
+    provider_cluster: &str,
+    provider_model: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Discover the provider gateway NodePort address for the self-hosted cluster.
-    let provider_cluster_endpoint = discover_provider_cluster_endpoint(context, TEST_HEALTHY_ROUTING_CLUSTER);
+    let provider_cluster_endpoint = discover_provider_cluster_endpoint(context, provider_cluster);
 
     let cluster_endpoints = build_consumer_cluster_endpoints(
         provider_cluster_endpoint.as_deref(),
-        TEST_HEALTHY_ROUTING_CLUSTER,
+        provider_cluster,
         api_provider_svc_address,
         TEST_PROVIDER_API,
     );
@@ -2607,9 +2630,10 @@ pub(crate) fn apply_test_fixtures_with_consumer_config(
         TEST_PROVIDER_HEALTHY,
         TEST_NETWORK,
         provider_endpoint,
-        Some(TEST_HEALTHY_ROUTING_CLUSTER),
+        Some(provider_cluster),
+        provider_model,
     );
-    let invalid = provider_fixture_json(TEST_PROVIDER_INVALID, TEST_NETWORK, "", None);
+    let invalid = provider_fixture_json(TEST_PROVIDER_INVALID, TEST_NETWORK, "", None, "model-x");
     kubectl::apply_manifest(context, &network)?;
     kubectl::apply_manifest(context, &healthy)?;
     kubectl::apply_manifest(context, &invalid)?;
@@ -2639,8 +2663,8 @@ fn discover_provider_cluster_endpoint(context: &str, cluster_name: &str) -> Opti
 
 /// Build the JSON value for `consumerConfig.clusterEndpoints`.
 ///
-/// - For the self-hosted provider (`provider_cluster`): uses mTLS when an address is available, stub otherwise.
-/// - For the API provider (`api_cluster`): always uses plain HTTP.
+/// - For the self-hosted provider (`provider_cluster`): uses `mutual_tls` transport when an address is available.
+/// - For the API provider (`api_cluster`): uses explicit `plaintext` transport.
 fn build_consumer_cluster_endpoints(
     provider_address: Option<&str>,
     provider_cluster: &str,
@@ -2653,15 +2677,20 @@ fn build_consumer_cluster_endpoints(
         endpoints.push(serde_json::json!({
             "cluster": provider_cluster,
             "address": addr,
-            "sni": format!("{provider_cluster}.grid.internal")
+            "transport": {
+                "mode": "mutual_tls",
+                "sni": format!("{provider_cluster}.grid.internal")
+            }
         }));
     }
 
     if !api_provider_address.is_empty() {
         endpoints.push(serde_json::json!({
             "cluster": api_cluster,
-            "address": api_provider_address
-            // sni absent → plain HTTP
+            "address": api_provider_address,
+            "transport": {
+                "mode": "plaintext"
+            }
         }));
     }
 
@@ -7627,7 +7656,10 @@ mod tests {
         let endpoints = serde_json::json!([{
             "cluster": "gateway-site-a",
             "address": "10.0.0.10:30080",
-            "sni": "site-a.grid.internal"
+            "transport": {
+                "mode": "mutual_tls",
+                "sni": "site-a.grid.internal"
+            }
         }]);
         let json_str = network_fixture_with_consumer_config_json("net", "gw", "ns", "my-cm", &endpoints);
         let value: serde_json::Value = serde_json::from_str(&json_str).unwrap();
@@ -7647,6 +7679,49 @@ mod tests {
             first["consumerConfig"]["clusterEndpoints"][0]["cluster"].as_str(),
             Some("gateway-site-a"),
             "clusterEndpoints must be included"
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "six assertions across two endpoint entries; splitting would lose the single-test readability"
+    )]
+    fn consumer_cluster_endpoints_use_provider_cluster_for_mtls_sni() {
+        let endpoints = build_consumer_cluster_endpoints(
+            Some("172.18.0.2:30443"),
+            "site-east",
+            "mock-api-provider.default.svc:8080",
+            TEST_PROVIDER_API,
+        );
+        let arr = endpoints.as_array().expect("clusterEndpoints must be an array");
+        let provider = arr
+            .iter()
+            .find(|ep| ep["cluster"].as_str() == Some("site-east"))
+            .expect("provider endpoint must be present");
+        assert_eq!(
+            provider["transport"]["mode"].as_str(),
+            Some("mutual_tls"),
+            "provider endpoint must use explicit mutual_tls transport"
+        );
+        assert_eq!(
+            provider["transport"]["sni"].as_str(),
+            Some("site-east.grid.internal"),
+            "mTLS SNI must match the selected provider cluster, not the single-site default"
+        );
+
+        let api = arr
+            .iter()
+            .find(|ep| ep["cluster"].as_str() == Some(TEST_PROVIDER_API))
+            .expect("api endpoint must be present");
+        assert_eq!(
+            api["transport"]["mode"].as_str(),
+            Some("plaintext"),
+            "api fallback endpoint must keep explicit plaintext transport"
+        );
+        assert!(
+            api["transport"].get("sni").is_none(),
+            "plaintext endpoint must not set SNI"
         );
     }
 }

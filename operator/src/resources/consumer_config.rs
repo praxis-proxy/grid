@@ -23,7 +23,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use k8s_openapi::api::core::v1::ConfigMap;
 
 use crate::{
-    crd::grid_network::ClusterEndpointConfig,
+    crd::grid_network::{ClusterEndpointConfig, TransportMode},
     resources::routing_overlay::{RoutingCandidate, RoutingOverlay},
 };
 
@@ -58,6 +58,33 @@ pub enum ConsumerConfigError {
         cluster: String,
     },
 
+    /// A cluster endpoint has no `transport` configuration.
+    #[error("missing transport for cluster endpoint {cluster:?}")]
+    MissingTransport {
+        /// Cluster name with missing transport.
+        cluster: String,
+    },
+
+    /// A `mutual_tls` cluster endpoint has no SNI (or blank SNI).
+    #[error("mutual_tls transport for cluster {cluster:?} requires a non-blank sni")]
+    MissingSni {
+        /// Cluster name with missing SNI.
+        cluster: String,
+    },
+
+    /// A `plaintext` cluster endpoint has an SNI field set.
+    ///
+    /// Plaintext transport does not use TLS, so `sni` has no effect.
+    /// Setting it is almost certainly a configuration mistake — the author
+    /// likely intended `mutual_tls`.
+    #[error(
+        "plaintext transport for cluster {cluster:?} must not set sni (sni does not enable TLS; use mutual_tls if TLS is intended)"
+    )]
+    PlaintextWithSni {
+        /// Cluster name with the conflicting configuration.
+        cluster: String,
+    },
+
     /// JSON serialization failed.
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
@@ -79,9 +106,9 @@ pub enum ConsumerConfigError {
 /// - `overlay` — the routing overlay produced by the Grid operator for this gateway.
 /// - `credential_mount_base` — base directory where credential Secrets are mounted inside the consumer pod (e.g.
 ///   `/run/secrets/grid-credentials`).
-/// - `cluster_endpoints` — explicit endpoint topology for the `load_balancer` section.  When an entry exists for a
-///   candidate cluster, the generated `load_balancer` section includes a full cluster entry (address and optional
-///   mTLS). Every unique candidate cluster must have a matching endpoint entry.
+/// - `cluster_endpoints` — explicit endpoint topology for the `load_balancer` section.  Every unique candidate cluster
+///   must have a matching endpoint entry with explicit transport configuration.  Missing transport or missing SNI on
+///   `mutual_tls` endpoints fail closed.
 /// - `tls_cert_mount_path` — mount path for TLS certificates inside the consumer pod.  Used only when rendering mTLS
 ///   cluster entries.
 /// - `listener_port` — HTTP port for the generated listener (`0.0.0.0:{listener_port}`).
@@ -93,6 +120,8 @@ pub enum ConsumerConfigError {
 /// - `credential_mount_base` is blank.
 /// - Any candidate has a blank cluster name.
 /// - Any candidate cluster has no matching endpoint in `cluster_endpoints`.
+/// - Any cluster endpoint has no `transport` configuration.
+/// - Any `mutual_tls` endpoint has no (or blank) `sni`.
 #[expect(
     clippy::too_many_lines,
     reason = "sequential validation + three rendering passes; splitting would obscure the overall config shape"
@@ -312,8 +341,8 @@ fn render_credential_inject(candidates: &[RoutingCandidate], credential_mount_ba
 ///
 /// Produces one cluster entry per unique `candidate.cluster`, ordered
 /// deterministically.  Every cluster must have a matching entry in
-/// `cluster_endpoints`; otherwise the generated config would be incomplete at
-/// runtime.
+/// `cluster_endpoints` with explicit transport configuration; missing
+/// endpoint, missing transport, or missing SNI on mTLS all fail closed.
 fn render_load_balancer(
     candidates: &[RoutingCandidate],
     cluster_endpoints: &[ClusterEndpointConfig],
@@ -333,7 +362,7 @@ fn render_load_balancer(
                 .ok_or_else(|| ConsumerConfigError::MissingClusterEndpoint {
                     cluster: cluster_name.to_owned(),
                 })?;
-            Ok(render_cluster_entry(&quoted, ep, tls_cert_mount_path))
+            render_cluster_entry(&quoted, ep, tls_cert_mount_path)
         })
         .collect::<Result<Vec<_>, ConsumerConfigError>>()?;
 
@@ -346,37 +375,66 @@ fn render_load_balancer(
     ))
 }
 
-/// Render a full cluster entry with endpoint address and optional mTLS config.
+/// Render a full cluster entry with endpoint address and explicit transport.
 ///
-/// When `ep.sni` is `Some`, renders an mTLS cluster using the certificates at
-/// `tls_cert_mount_path`.  When `ep.sni` is `None`, renders a plain-HTTP cluster
-/// with just the endpoint address.
-fn render_cluster_entry(quoted_name: &str, ep: &ClusterEndpointConfig, tls_cert_mount_path: &str) -> String {
+/// Validates that `transport` is present and, for `mutual_tls`, that `sni`
+/// is non-blank.  Missing transport fails closed with [`ConsumerConfigError::MissingTransport`];
+/// missing SNI on mTLS fails with [`ConsumerConfigError::MissingSni`].
+#[expect(
+    clippy::too_many_lines,
+    reason = "transport validation + two format branches; splitting would separate the match arms from their YAML templates"
+)]
+fn render_cluster_entry(
+    quoted_name: &str,
+    ep: &ClusterEndpointConfig,
+    tls_cert_mount_path: &str,
+) -> Result<String, ConsumerConfigError> {
     let quoted_addr = yaml_scalar(&ep.address).unwrap_or_else(|_| "\"\"".to_owned());
 
-    if let Some(sni) = &ep.sni {
-        let quoted_sni = yaml_scalar(sni).unwrap_or_else(|_| "\"\"".to_owned());
-        // mTLS cluster: ca, client cert, SNI, verify.
-        format!(
-            "          - name: {quoted_name}\n\
-             \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20  tls:\n\
-             \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20    ca:\n\
-             \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20      ca_path: {tls_cert_mount_path}/ca.crt\n\
-             \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20    client_cert:\n\
-             \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20      cert_path: {tls_cert_mount_path}/tls.crt\n\
-             \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20      key_path: {tls_cert_mount_path}/tls.key\n\
-             \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20    sni: {quoted_sni}\n\
-             \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20    verify: true\n\
-             \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20  endpoints:\n\
-             \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20    - {quoted_addr}"
-        )
-    } else {
-        // Plain HTTP cluster: endpoint only.
-        format!(
-            "          - name: {quoted_name}\n\
-             \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20  endpoints:\n\
-             \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20    - {quoted_addr}"
-        )
+    let transport = ep
+        .transport
+        .as_ref()
+        .ok_or_else(|| ConsumerConfigError::MissingTransport {
+            cluster: ep.cluster.clone(),
+        })?;
+
+    match transport.mode {
+        TransportMode::MutualTls => {
+            let raw_sni = transport
+                .sni
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+                .ok_or_else(|| ConsumerConfigError::MissingSni {
+                    cluster: ep.cluster.clone(),
+                })?;
+            let trimmed_sni = raw_sni.trim();
+            let quoted_sni = yaml_scalar(trimmed_sni).unwrap_or_else(|_| "\"\"".to_owned());
+            Ok(format!(
+                "          - name: {quoted_name}\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20  tls:\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20    ca:\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20      ca_path: {tls_cert_mount_path}/ca.crt\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20    client_cert:\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20      cert_path: {tls_cert_mount_path}/tls.crt\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20      key_path: {tls_cert_mount_path}/tls.key\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20    sni: {quoted_sni}\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20    verify: true\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20  endpoints:\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20    - {quoted_addr}"
+            ))
+        },
+        TransportMode::Plaintext => {
+            if transport.sni.as_deref().is_some_and(|s| !s.trim().is_empty()) {
+                return Err(ConsumerConfigError::PlaintextWithSni {
+                    cluster: ep.cluster.clone(),
+                });
+            }
+            Ok(format!(
+                "          - name: {quoted_name}\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20  endpoints:\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20    - {quoted_addr}"
+            ))
+        },
     }
 }
 
@@ -440,7 +498,10 @@ fn dns_safe(s: &str) -> String {
 )]
 mod tests {
     use super::*;
-    use crate::resources::routing_overlay::{ProjectedCredential, ProjectedCredentialRef, RoutingCandidate};
+    use crate::{
+        crd::grid_network::EndpointTransport,
+        resources::routing_overlay::{ProjectedCredential, ProjectedCredentialRef, RoutingCandidate},
+    };
 
     // -----------------------------------------------------------------------
     // Test utilities
@@ -505,7 +566,10 @@ mod tests {
             .map(|(idx, cluster)| ClusterEndpointConfig {
                 cluster: cluster.to_owned(),
                 address: format!("127.0.0.1:{}", 30_000 + idx),
-                sni: None,
+                transport: Some(EndpointTransport {
+                    mode: TransportMode::Plaintext,
+                    sni: None,
+                }),
             })
             .collect()
     }
@@ -920,7 +984,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn load_balancer_renders_endpoint_for_matching_cluster() {
+    fn load_balancer_renders_endpoint_for_matching_plaintext_cluster() {
         let overlay = simple_overlay(vec![plain_candidate(
             "inference_model",
             "model-a",
@@ -928,30 +992,21 @@ mod tests {
             "gateway-site-a",
             true,
         )]);
-        let endpoints = vec![ClusterEndpointConfig {
-            cluster: "gateway-site-a".to_owned(),
-            address: "10.0.0.10:30080".to_owned(),
-            sni: None,
-        }];
+        let endpoints = vec![plain_ep("gateway-site-a", "10.0.0.10:30080")];
         let yaml = generate_consumer_praxis_config(&overlay, MOUNT_BASE, &endpoints, "/etc/praxis/tls", 8080).unwrap();
         assert!(
             yaml.contains("name: \"gateway-site-a\""),
             "cluster name must be rendered"
         );
-        // Endpoint appears somewhere after the cluster name in the YAML.
         assert!(
             yaml.contains("10.0.0.10:30080"),
             "matching endpoint address must be rendered"
         );
-        assert!(!yaml.contains("tls:"), "plain endpoint must not render TLS config");
+        assert!(!yaml.contains("tls:"), "plaintext endpoint must not render TLS config");
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "TLS cluster rendering assertion covers all emitted TLS fields"
-    )]
-    fn load_balancer_renders_tls_for_sni_endpoint() {
+    fn load_balancer_renders_tls_for_mtls_endpoint() {
         let overlay = simple_overlay(vec![plain_candidate(
             "inference_model",
             "model-a",
@@ -959,13 +1014,9 @@ mod tests {
             "gateway-site-a",
             true,
         )]);
-        let endpoints = vec![ClusterEndpointConfig {
-            cluster: "gateway-site-a".to_owned(),
-            address: "10.0.0.10:30080".to_owned(),
-            sni: Some("site-a.grid.internal".to_owned()),
-        }];
+        let endpoints = vec![mtls_ep("gateway-site-a", "10.0.0.10:30080", "site-a.grid.internal")];
         let yaml = generate_consumer_praxis_config(&overlay, MOUNT_BASE, &endpoints, "/etc/praxis/tls", 8080).unwrap();
-        assert!(yaml.contains("tls:"), "SNI endpoint must render TLS config");
+        assert!(yaml.contains("tls:"), "mTLS endpoint must render TLS config");
         assert!(
             yaml.contains("ca_path: /etc/praxis/tls/ca.crt"),
             "TLS config must reference CA path"
@@ -1011,11 +1062,7 @@ mod tests {
             plain_candidate("inference_model", "model-a", "site-a", "gateway-site-a", true),
             plain_candidate("inference_model", "model-b", "site-a", "gateway-site-a", true),
         ]);
-        let endpoints = vec![ClusterEndpointConfig {
-            cluster: "gateway-site-a".to_owned(),
-            address: "10.0.0.10:30080".to_owned(),
-            sni: None,
-        }];
+        let endpoints = vec![plain_ep("gateway-site-a", "10.0.0.10:30080")];
         let yaml = generate_consumer_praxis_config(&overlay, MOUNT_BASE, &endpoints, "/etc/praxis/tls", 8080).unwrap();
         assert_eq!(
             yaml.matches("name: \"gateway-site-a\"").count(),
@@ -1136,17 +1183,31 @@ mod tests {
     // Cluster endpoint rendering
     // -----------------------------------------------------------------------
 
-    fn ep(cluster: &str, address: &str, sni: Option<&str>) -> ClusterEndpointConfig {
+    fn mtls_ep(cluster: &str, address: &str, sni: &str) -> ClusterEndpointConfig {
         ClusterEndpointConfig {
             cluster: cluster.to_owned(),
             address: address.to_owned(),
-            sni: sni.map(str::to_owned),
+            transport: Some(EndpointTransport {
+                mode: TransportMode::MutualTls,
+                sni: Some(sni.to_owned()),
+            }),
+        }
+    }
+
+    fn plain_ep(cluster: &str, address: &str) -> ClusterEndpointConfig {
+        ClusterEndpointConfig {
+            cluster: cluster.to_owned(),
+            address: address.to_owned(),
+            transport: Some(EndpointTransport {
+                mode: TransportMode::Plaintext,
+                sni: None,
+            }),
         }
     }
 
     #[test]
-    fn cluster_with_sni_renders_mtls_entry() {
-        let endpoints = [ep("site-a", "172.18.0.4:30080", Some("site-a.grid.internal"))];
+    fn cluster_with_mtls_transport_renders_mtls_entry() {
+        let endpoints = [mtls_ep("site-a", "172.18.0.4:30080", "site-a.grid.internal")];
         let overlay = simple_overlay(vec![plain_candidate(
             "inference_model",
             "model-x",
@@ -1170,8 +1231,8 @@ mod tests {
     }
 
     #[test]
-    fn cluster_without_sni_renders_plain_http_entry() {
-        let endpoints = [ep("api-cluster", "mock-api.default.svc:8080", None)];
+    fn cluster_with_plaintext_transport_renders_plain_http_entry() {
+        let endpoints = [plain_ep("api-cluster", "mock-api.default.svc:8080")];
         let overlay = simple_overlay(vec![plain_candidate(
             "inference_model",
             "model-z",
@@ -1210,8 +1271,153 @@ mod tests {
     }
 
     #[test]
+    fn cluster_without_transport_returns_error() {
+        let endpoints = [ClusterEndpointConfig {
+            cluster: "no-transport-cluster".to_owned(),
+            address: "10.0.0.1:8080".to_owned(),
+            transport: None,
+        }];
+        let overlay = simple_overlay(vec![plain_candidate(
+            "inference_model",
+            "m",
+            "s",
+            "no-transport-cluster",
+            true,
+        )]);
+        let err = generate_consumer_praxis_config(&overlay, MOUNT_BASE, &endpoints, "/etc/praxis/tls", 8080)
+            .expect_err("missing transport must fail closed");
+        assert!(
+            matches!(
+                err,
+                ConsumerConfigError::MissingTransport { cluster } if cluster == "no-transport-cluster"
+            ),
+            "missing transport error must identify the cluster"
+        );
+    }
+
+    #[test]
+    fn mutual_tls_without_sni_returns_error() {
+        let endpoints = [ClusterEndpointConfig {
+            cluster: "mtls-no-sni".to_owned(),
+            address: "10.0.0.1:8080".to_owned(),
+            transport: Some(EndpointTransport {
+                mode: TransportMode::MutualTls,
+                sni: None,
+            }),
+        }];
+        let overlay = simple_overlay(vec![plain_candidate("inference_model", "m", "s", "mtls-no-sni", true)]);
+        let err = generate_consumer_praxis_config(&overlay, MOUNT_BASE, &endpoints, "/etc/praxis/tls", 8080)
+            .expect_err("mutual_tls without sni must fail");
+        assert!(
+            matches!(
+                err,
+                ConsumerConfigError::MissingSni { cluster } if cluster == "mtls-no-sni"
+            ),
+            "missing sni error must identify the cluster"
+        );
+    }
+
+    #[test]
+    fn mutual_tls_with_blank_sni_returns_error() {
+        let endpoints = [ClusterEndpointConfig {
+            cluster: "mtls-blank-sni".to_owned(),
+            address: "10.0.0.1:8080".to_owned(),
+            transport: Some(EndpointTransport {
+                mode: TransportMode::MutualTls,
+                sni: Some("  ".to_owned()),
+            }),
+        }];
+        let overlay = simple_overlay(vec![plain_candidate(
+            "inference_model",
+            "m",
+            "s",
+            "mtls-blank-sni",
+            true,
+        )]);
+        let err = generate_consumer_praxis_config(&overlay, MOUNT_BASE, &endpoints, "/etc/praxis/tls", 8080)
+            .expect_err("mutual_tls with blank sni must fail");
+        assert!(
+            matches!(
+                err,
+                ConsumerConfigError::MissingSni { cluster } if cluster == "mtls-blank-sni"
+            ),
+            "blank sni error must identify the cluster"
+        );
+    }
+
+    #[test]
+    fn plaintext_with_sni_returns_error() {
+        let endpoints = [ClusterEndpointConfig {
+            cluster: "plain-with-sni".to_owned(),
+            address: "10.0.0.1:8080".to_owned(),
+            transport: Some(EndpointTransport {
+                mode: TransportMode::Plaintext,
+                sni: Some("unexpected.grid.internal".to_owned()),
+            }),
+        }];
+        let overlay = simple_overlay(vec![plain_candidate(
+            "inference_model",
+            "m",
+            "s",
+            "plain-with-sni",
+            true,
+        )]);
+        let err = generate_consumer_praxis_config(&overlay, MOUNT_BASE, &endpoints, "/etc/praxis/tls", 8080)
+            .expect_err("plaintext with sni must fail");
+        assert!(
+            matches!(
+                err,
+                ConsumerConfigError::PlaintextWithSni { cluster } if cluster == "plain-with-sni"
+            ),
+            "plaintext+sni error must identify the cluster"
+        );
+    }
+
+    #[test]
+    fn plaintext_with_blank_sni_is_accepted() {
+        let endpoints = [ClusterEndpointConfig {
+            cluster: "plain-blank-sni".to_owned(),
+            address: "10.0.0.1:8080".to_owned(),
+            transport: Some(EndpointTransport {
+                mode: TransportMode::Plaintext,
+                sni: Some("  ".to_owned()),
+            }),
+        }];
+        let overlay = simple_overlay(vec![plain_candidate(
+            "inference_model",
+            "m",
+            "s",
+            "plain-blank-sni",
+            true,
+        )]);
+        let yaml = generate_consumer_praxis_config(&overlay, MOUNT_BASE, &endpoints, "/etc/praxis/tls", 8080).unwrap();
+        assert!(
+            !yaml.contains("tls:"),
+            "plaintext with blank sni must render as plain HTTP"
+        );
+    }
+
+    #[test]
+    fn mutual_tls_sni_is_trimmed_before_rendering() {
+        let endpoints = [ClusterEndpointConfig {
+            cluster: "trim-test".to_owned(),
+            address: "10.0.0.1:8080".to_owned(),
+            transport: Some(EndpointTransport {
+                mode: TransportMode::MutualTls,
+                sni: Some("  site-a.grid.internal  ".to_owned()),
+            }),
+        }];
+        let overlay = simple_overlay(vec![plain_candidate("inference_model", "m", "s", "trim-test", true)]);
+        let yaml = generate_consumer_praxis_config(&overlay, MOUNT_BASE, &endpoints, "/etc/praxis/tls", 8080).unwrap();
+        assert!(
+            yaml.contains("sni: \"site-a.grid.internal\""),
+            "SNI must be trimmed of leading/trailing whitespace: {yaml}"
+        );
+    }
+
+    #[test]
     fn multiple_candidates_sharing_cluster_produce_one_cluster_entry() {
-        let endpoints = [ep("shared-cluster", "10.0.0.1:30080", Some("shared.grid.internal"))];
+        let endpoints = [mtls_ep("shared-cluster", "10.0.0.1:30080", "shared.grid.internal")];
         let overlay = simple_overlay(vec![
             plain_candidate("inference_model", "model-a", "site-a", "shared-cluster", true),
             plain_candidate("inference_model", "model-b", "site-b", "shared-cluster", true),
@@ -1225,10 +1431,10 @@ mod tests {
     }
 
     #[test]
-    fn mixed_mtls_and_plain_http_clusters() {
+    fn mixed_mtls_and_plaintext_clusters() {
         let endpoints = [
-            ep("provider-cluster", "172.18.0.4:30080", Some("provider.grid.internal")),
-            ep("api-cluster", "mock-api.default.svc:8080", None),
+            mtls_ep("provider-cluster", "172.18.0.4:30080", "provider.grid.internal"),
+            plain_ep("api-cluster", "mock-api.default.svc:8080"),
         ];
         let overlay = simple_overlay(vec![
             plain_candidate("inference_model", "model-x", "s1", "provider-cluster", true),
@@ -1238,7 +1444,7 @@ mod tests {
         assert!(yaml.contains("provider.grid.internal"), "mTLS cluster SNI must appear");
         assert!(
             yaml.contains("mock-api.default.svc:8080"),
-            "plain HTTP cluster endpoint must appear"
+            "plaintext cluster endpoint must appear"
         );
         assert!(yaml.contains("ca_path:"), "mTLS cluster must have TLS");
     }
@@ -1246,10 +1452,10 @@ mod tests {
     #[test]
     fn endpoint_address_not_token_bytes() {
         let sentinel = "sk-super-secret-token-do-not-emit";
-        let endpoints = [ep(
+        let endpoints = [mtls_ep(
             "site-a",
             &format!("172.18.0.4:{}", sentinel.len()),
-            Some("site-a.grid.internal"),
+            "site-a.grid.internal",
         )];
         let overlay = simple_overlay(vec![plain_candidate("inference_model", "m", "s", "site-a", true)]);
         let yaml = generate_consumer_praxis_config(&overlay, MOUNT_BASE, &endpoints, "/etc/praxis/tls", 8080).unwrap();
@@ -1261,7 +1467,7 @@ mod tests {
 
     #[test]
     fn custom_tls_cert_mount_path_used_in_cluster_entry() {
-        let endpoints = [ep("site-a", "10.0.0.1:8080", Some("site-a.grid.internal"))];
+        let endpoints = [mtls_ep("site-a", "10.0.0.1:8080", "site-a.grid.internal")];
         let overlay = simple_overlay(vec![plain_candidate("inference_model", "m", "s", "site-a", true)]);
         let yaml = generate_consumer_praxis_config(&overlay, MOUNT_BASE, &endpoints, "/custom/tls/path", 8080).unwrap();
         assert!(
@@ -1273,8 +1479,8 @@ mod tests {
     #[test]
     fn deterministic_ordering_with_endpoints() {
         let endpoints = [
-            ep("zzz-cluster", "10.0.0.3:30080", Some("zzz.grid.internal")),
-            ep("aaa-cluster", "10.0.0.1:30080", Some("aaa.grid.internal")),
+            mtls_ep("zzz-cluster", "10.0.0.3:30080", "zzz.grid.internal"),
+            mtls_ep("aaa-cluster", "10.0.0.1:30080", "aaa.grid.internal"),
         ];
         let overlay = simple_overlay(vec![
             plain_candidate("inference_model", "m1", "s1", "zzz-cluster", true),

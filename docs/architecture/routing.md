@@ -554,9 +554,8 @@ operator's next reconciliation loop observes the new SWIM/member/provider state
 and re-renders.
 
 Rendering a new `ConfigMap` does not mean the gateway has loaded it.  Praxis
-gateways do not automatically hot-reload from a changed `ConfigMap` volume
-mount — a pod restart, rollout, or explicit reload path is required.  Praxis AI
-overlay hot reload is work in progress.  See
+gateways do not automatically reload from a changed `ConfigMap` volume
+mount — a pod restart, rollout, or explicit gateway reload is required.  See
 [Consumer Config](consumer-config.md#reload-and-rollout).
 
 ## Relevant files

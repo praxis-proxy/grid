@@ -1,93 +1,86 @@
 # Architecture Overview
 
-The AI Grid is a Kubernetes control plane for AI inference routing across
-clusters, cloud providers, and third-party APIs.
+AI Grid is the control plane that prepares routing state for Praxis AI
+gateways.  It watches Kubernetes resources, learns remote provider state,
+scores candidates, and writes a local routing overlay.  The gateway then uses
+that overlay on the request path.
 
-Grid owns CRDs, reconciliation, SWIM/CRDT state distribution, scoring, routing
-overlay rendering, and certificate/Secret reference orchestration.  It does not
-proxy request traffic.
+The important boundary is simple:
 
-## Component Stack
+```text
+Grid decides what should be routable.
+Praxis AI performs the actual request routing.
+```
+
+Grid does not proxy HTTP traffic.  It does not parse OpenAI requests, inject
+provider credentials, terminate data-plane TLS, or call model backends.  Those
+jobs live in Praxis AI and Praxis Core.
+
+## Why Grid Exists
+
+Without Grid, every gateway would need static knowledge of every model backend,
+remote cluster, credential placement rule, health signal, and routing fallback.
+That does not scale across multi-cluster and mixed-provider environments.
+
+Grid turns that moving control-plane state into a local file that Praxis AI can
+route from cheaply:
+
+```text
+Grid CRDs + local health + remote SWIM/CRDT state
+  → scored routing candidates
+  → grid-config.json ConfigMap
+  → Praxis AI grid_route
+```
+
+The request hot path stays local.  A request should not call Kubernetes, SWIM,
+CRDT, or the Grid operator to decide where to go.
+
+## The Stack
 
 Grid sits above the Praxis data plane:
 
 | Layer | Role |
-|-------|------|
-| **Grid Operator** | Kubernetes control plane. Watches Grid CRDs, exchanges provider state with peers, scores candidates, and renders routing overlays. |
-| **Praxis AI** | AI-aware gateway/data plane. Runs request parsing, `grid_route`, optional `grid_credential_inject`, load balancing, TLS, and upstream proxying. |
-| **Praxis Core** | Generic proxy/filter runtime. Provides reusable filters such as load balancer, `endpoint_selector`, `ext_proc`, and `peer_identity_trust`. |
-| **Pingora** | Low-level async proxy engine. Handles TCP/TLS, connection pooling, HTTP codecs, and upstream I/O underneath Praxis. |
+|---|---|
+| **Grid Operator** | Kubernetes control plane. Watches Grid CRDs, exchanges provider state, scores candidates, renders `grid-config.json`, and manages Grid trust material. |
+| **Praxis AI** | AI-aware gateway. Runs request parsing, `grid_route`, optional `grid_credential_inject`, llm-d/ext_proc support, and AI-specific packaging. |
+| **Praxis Core** | Generic proxy/filter runtime. Owns listeners, filter pipelines, load balancing, `endpoint_selector`, `ext_proc`, `peer_identity_trust`, TLS integration, and request context. |
+| **Pingora** | Low-level async proxy engine under Praxis. Handles TCP/TLS, HTTP codecs, connection pooling, and upstream I/O. |
 
-The separation is intentional: Grid prepares routing state; Praxis AI executes
-the request path.
+The split keeps Grid focused on state preparation and keeps request handling in
+the gateway process that already owns the network hot path.
 
-## What Grid Does and Does Not Do
+## Control-Plane Resources
 
-Grid does:
-
-- watch `GridNetwork`, `GridSite`, and `InferenceProvider` resources
-- form a SWIM mesh with peer Grid operators
-- publish and merge CRDT provider/site snapshots
-- score provider candidates
-- render `grid-config.json` overlay `ConfigMap`s
-- project credential references, never credential values
-- generate and manage Grid TLS material
-
-Grid does not:
-
-- proxy HTTP requests
-- translate API formats
-- run Praxis filters
-- inject provider credentials at request time
-- write provider token values into overlays, generated `ConfigMap`s, status, or
-  logs
-
-## CRDs
-
-API group: `grid.praxis-proxy.io/v1alpha1`.  The current CRDs are
-cluster-scoped.
+The implemented inference path uses three cluster-scoped CRDs:
 
 | CRD | Current role |
-|-----|--------------|
-| `GridNetwork` | Top-level mesh configuration: SWIM seeds, TLS settings, gateway references, and optional consumer config generation. |
-| `GridSite` | One cluster/site in the mesh. Tracks discovery, gateway address, public cert material, trust fingerprint, and phase. |
-| `InferenceProvider` | One inference backend declaration: model name, backend kind, endpoint, health config, auth strategy, and provider status. |
-
-The inference path is the implemented and validated reconciled path today.
+|---|---|
+| `GridNetwork` | Defines a logical Grid: SWIM seeds, TLS settings, gateway references, and optional consumer config generation. |
+| `GridSite` | Represents one participating site or cluster. Tracks discovery, gateway address, public trust material, fingerprint trust, and phase. |
+| `InferenceProvider` | Declares model capacity: model name, backend kind, endpoint, health config, auth strategy, access policy, and provider status. |
 
 `AgentToolProvider` and `AgentToAgentProvider` are schema direction for MCP and
-A2A.  Their CRD types exist, but the operator does not currently run controllers
-or render complete routed paths for them.
+A2A.  Their resource types exist, but the operator does not currently run full
+controllers, distribute their state, score them, or render complete routed paths
+for them.  Inference is the mature reconciled path today.
 
-See [CRDs](crds.md) for field and status details.
+See [CRDs](crds.md) for field-level details.
 
-## SWIM and CRDT
+## How a Provider Enters the Grid
 
-SWIM and CRDT are the control-plane state distribution layer.
-
-SWIM, via `foca`, answers:
-
-```text
-Which peer Grid operators are alive?
-```
-
-CRDT state answers:
+A backend becomes routable in stages:
 
 ```text
-What provider/site state has each peer advertised?
+Provider site declares an InferenceProvider
+  → local Grid operator validates placement, status, and Secret references
+  → local provider state is recorded as CRDT state
+  → SWIM carries that state to peer Grid operators
+  → peers merge the CRDT state into their local view
+  → each operator applies access policy and scoring for its own gateways
+  → each operator renders its own grid-config.json overlay
 ```
 
-Neither SWIM nor CRDT makes authorization decisions.  SWIM discovery alone does
-not make a site routable.
-
-Provider snapshots include the network, advertising site, provider identity,
-routing cluster, model list, backend kind, lifecycle phase, optional metrics,
-access policy, and revision metadata.
-
-## Local Operator View
-
-Each operator renders overlays for its own local gateways from that operator's
-current merged view:
+Each operator renders from its own local view of the world:
 
 ```text
 local Kubernetes CRDs
@@ -96,62 +89,112 @@ local Kubernetes CRDs
 = this operator's local routing view
 ```
 
-Different sites should converge, but they are not guaranteed to have identical
-views at every instant.  Each operator renders from the state it has received
-and merged so far.
+Sites should converge, but they are not guaranteed to have identical views at
+every instant.  Overlay rendering is reconcile-driven, not request-driven.
 
-## Routing Overlay
+## SWIM and CRDT State
 
-For each gateway reference on a `GridNetwork`, the operator writes a routing
-overlay `ConfigMap` containing `grid-config.json`.
+Grid uses `foca`, a Rust SWIM implementation, for membership gossip.  `foca`
+used the Go memberlist model as a reference architecture, but Grid does not use
+memberlist itself.
 
-That overlay contains:
+SWIM answers:
+
+```text
+Which peer Grid operators are alive?
+```
+
+CRDT state answers:
+
+```text
+What provider and site state has each peer advertised?
+```
+
+Neither SWIM nor CRDT is an authorization engine.  Discovery alone does not make
+a site routable.  A provider still has to pass lifecycle, trust, freshness,
+placement, and access-policy checks before it enters a gateway overlay.
+
+Important current limitation: SWIM encryption proves membership in the shared
+key group, but stronger sender/origin binding is still hardening work.  Do not
+treat distributed CRDT state as fully security-sensitive routing input until
+that work is complete.
+
+## Routing Overlays
+
+For each gateway reference on a `GridNetwork`, the operator writes a
+`ConfigMap` with a `grid-config.json` key.
+
+The overlay contains:
 
 - the local site name for that gateway
-- routable model/provider candidates
+- candidate model/provider entries
 - candidate site and cluster identities
 - freshness and ordering information
 - optional credential references
 
-Credential references are only references:
+Credential references contain locating information only:
 
 ```text
 strategy + Secret name + namespace + key
 ```
 
-Token bytes are not written into the overlay.
+Token bytes are never written into overlays, generated `ConfigMap`s, status, or
+logs.
 
-Overlay regeneration is reconcile-driven, not request-driven.  See
-[When grid-config.json regenerates](routing.md#when-grid-configjson-regenerates)
-for the trigger list.
+See [Routing](routing.md) for the overlay format and regeneration triggers.
 
-## Scoring
+## Scoring and Selection
 
-Grid scores and orders candidates before writing the overlay.
+Grid scores provider candidates before writing the overlay.  The current scoring
+signals are:
 
-The current weighted signals are:
-
-| Signal | Weight | Source |
-|--------|--------|--------|
-| Locality | 3.0 | Configured backend category and region context |
-| Queue depth | 3.0 | Prometheus scrape or CRDT metrics |
-| KV-cache utilization | 2.0 | Prometheus scrape or CRDT metrics |
-| Prefix-cache hit ratio | 2.0 | Prometheus scrape or CRDT metrics |
-| Latency | 2.0 | Metrics/local observation |
+| Signal | Weight | Typical source |
+|---|---:|---|
+| Locality | 3.0 | Backend kind, site, region |
+| Queue depth | 3.0 | Metrics scrape or CRDT state |
+| KV-cache utilization | 2.0 | Metrics scrape or CRDT state |
+| Prefix-cache hit ratio | 2.0 | Metrics scrape or CRDT state |
+| Latency | 2.0 | Metrics or local observation |
 | Cost | 1.0 | Provider config |
 
-Higher score sorts earlier.  `Unavailable` providers are excluded.  `Degraded`
-or stale providers may remain in the overlay with `fresh: false` and are sorted
-behind equal-scored fresh candidates.  Remaining ties are deterministic by
-candidate identity.
+Higher-scored candidates sort earlier.  `Unavailable` providers are excluded.
+Stale or degraded candidates can remain in the overlay as lower-preference
+fallbacks.
 
-At request time, `grid_route` consumes the pre-rendered order.  It does not
-recompute the full scoring formula.
+At request time, Praxis AI `grid_route` consumes the loaded overlay.  It does
+not recompute Grid's full scoring formula.  Its job is to match the requested
+model or MCP tool against the already-loaded candidate set and choose the best
+candidate under its request-time rules.
 
-See [Scoring](scoring.md) for the full scoring model and metrics normalization
-contract.
+See [Scoring](scoring.md) for the full scoring model and known unknown-data
+semantics.
 
-## Credentials
+## Request Flow
+
+Once the overlay is loaded, traffic follows the gateway pipeline:
+
+```text
+client request
+  → Praxis AI consumer gateway
+  → request-format filter extracts model/tool metadata
+  → grid_route selects a candidate cluster from the loaded overlay
+  → optional grid_credential_inject adds provider auth at the final hop
+  → load_balancer selects an endpoint inside the chosen cluster
+  → Pingora sends the request upstream
+  → response returns to the client
+```
+
+For Chat Completions-style requests, the parser is typically a generic body
+field extractor.  For `/v1/responses`, Praxis AI uses
+`openai_responses_format` to parse the Responses API shape and promote the model
+for `grid_route`.
+
+The selected `cluster` is a Praxis load-balancer cluster name.  The overlay can
+switch a request from `cluster-east` to `cluster-west` only if both clusters are
+already present in the Praxis AI `load_balancer` config.  The overlay does not
+create endpoint definitions.
+
+## Credential Flow
 
 Credential handling follows the final-hop rule:
 
@@ -160,128 +203,96 @@ The gateway or provider-side component that makes the final backend call owns
 and injects the backend credential.
 ```
 
-Grid validates `InferenceProvider.spec.auth.secretRef` and projects only a
-credential reference into the overlay.  Praxis AI performs request-time
-injection with `grid_credential_inject` on the gateway that has the relevant
-Secret mounted.
+Examples:
 
-For direct API-provider or cloud-provider fallback, the consumer gateway is
-often also the final-hop gateway.  For remote Grid sites, provider credentials
-stay in the remote provider site or provider-side component.  Grid does not copy
-Secret values across clusters.
+| Scenario | Credential lives with | Injector |
+|---|---|---|
+| Local self-hosted backend | Local/provider site, if needed | Local/provider gateway |
+| Remote Grid site | Remote provider site | Remote provider gateway |
+| Direct API fallback | Consumer/final-hop site | Consumer gateway |
+| Direct Bedrock fallback | Consumer/final-hop site | Consumer gateway or provider-side component authorized for Bedrock |
+| Cloud-managed behind provider gateway | Provider site | Provider gateway |
+| mTLS-only provider | No HTTP token | None |
 
-See [Authentication and Access Policy](auth.md) for the credential lifecycle.
+Grid validates `InferenceProvider.spec.auth.secretRef` and projects only the
+reference into the overlay.  Praxis AI `grid_credential_inject` reads the
+mounted Secret file in the gateway that is allowed to call the backend and
+injects the outbound header.
 
-## End-to-end Request Flow
+Grid does not copy Secret values across clusters.
+
+## ConfigMap Handoff
+
+Rendering a new `ConfigMap` is not enough by itself.  Kubernetes can project the
+new file into a pod, but the running gateway still has to consume it.
+
+The current handoff boundary is:
+
+| Owner | Responsibility |
+|---|---|
+| Grid operator | Render and apply the consumer `ConfigMap` |
+| Kubernetes | Project the updated `ConfigMap` into the Praxis AI pod filesystem |
+| Deployment owner | Restart, roll out, or otherwise reload the gateway so it consumes the updated config |
+
+This keeps Grid outside the request path and outside the gateway deployment
+lifecycle.  Grid updates desired routing configuration; it does not restart
+Praxis pods or prove the gateway has loaded the latest file.
+
+When transport configuration changes, such as changing a remote endpoint from
+`plaintext` to `mutual_tls` or updating `transport.sni`, the deployment owner
+must ensure the gateway reloads that configuration.
+
+## Trust and Readiness
+
+Grid manages control-plane trust material and can generate Grid CA/site
+certificates.  It also records public trust material and fingerprint policy for
+discovered sites.
+
+`GridSite.status.phase == Active` currently means control-plane eligibility:
 
 ```text
-Kubernetes CRDs + SWIM/CRDT state
-  → Grid operator reconciles
-  → Grid renders the local gateway's grid-config.json ConfigMap
-  → Praxis AI gateway loads the overlay
-  → request arrives at the consumer gateway
-  → request-format filter extracts the model
-  → grid_route selects a provider cluster from the loaded overlay
-  → optional grid_credential_inject adds provider auth at the final hop
-  → load_balancer selects the upstream endpoint
-  → Pingora sends the request upstream
-  → response returns to the client
+the configured fingerprint matched
++ the TCP probe passed
+= Grid has enough information to consider the site for overlay generation
 ```
-
-The request hot path does not call Kubernetes, SWIM, or the Grid operator.
-Praxis AI routes from local, already-loaded config.
-
-## Readiness Caveats
-
-`GridSite.status.phase == Active` is a control-plane eligibility signal.  It
-means Grid has enough site/trust information to consider the site for overlay
-generation: the configured fingerprint matched and the TCP probe passed.
 
 It does not prove that a Praxis gateway has completed an mTLS handshake,
-accepted client identity, loaded the latest routing config, or authorized
-provider-side traffic.  Data-plane readiness is enforced separately by gateway
-filters and deployment health.
+accepted client identity, loaded the newest overlay, or authorized provider-side
+traffic.  Those are data-plane readiness concerns and need richer status
+conditions over time.
 
-Rendering a new `ConfigMap` also does not prove the gateway has loaded it.
-Praxis gateways do not automatically hot-reload from a changed `ConfigMap`
-volume mount; a pod restart, rollout, or explicit reload path is required.  See
-[Consumer Config](consumer-config.md#reload-and-rollout).
+Over time, readiness should distinguish states such as:
 
-Praxis AI overlay hot reload is work in progress.  Dynamic scoring is only
-useful for live traffic once Praxis AI can reload the overlay cheaply without
-restarting the pod.  Restarting gateways on every scoring or membership change
-would turn routing churn into deployment churn.
+- discovered
+- transport reachable
+- certificate pinned
+- mTLS verified
+- peer authorized
+- routing config loaded
+- routing ready
 
-## Workspace Crates
+## Boundaries to Keep in Mind
 
-| Crate | Purpose |
-|-------|---------|
-| `operator` | Kubernetes controllers, CRDs, overlay rendering, operator binary |
-| `scoring` | Candidate scoring engine and backend metric types |
-| `crdt` | Delta CRDTs: LWW Register, OR-Set, G-Counter |
-| `swim` | SWIM membership wrapper around `foca` |
-| `certs` | CA and site certificate generation |
-| `mock-providers` | Mock OpenAI/Anthropic/Bedrock/Vertex-style providers for tests |
-| `xtask` | Local multi-cluster validation harness |
+Grid is intentionally not the whole platform.  It prepares and publishes routing
+state, while Praxis AI, Praxis Core, Kubernetes, and the deployment owner each
+own different parts of the running gateway.
 
-Dependency shape:
+The most important boundaries are:
+
+- `GridSite Active` is not the same as end-to-end gateway readiness.
+- A rendered overlay is not the same as a gateway running that overlay.
+- Credential references are not credential values.
+- SWIM membership is not authorization.
+- Inference is the primary routed path; MCP and A2A should be treated as
+  separate routed surfaces as their controllers and overlays mature.
+
+When evaluating a new feature, first decide which side owns it:
 
 ```text
-operator ──→ scoring
-          ├─→ certs
-          ├─→ swim ──→ foca
-          └─→ crdt
+Does it change provider state, policy, scoring, or overlay content?
+  → Grid control plane
 
-crdt, scoring, certs: standalone crates
+Does it change request parsing, route selection, credential injection, or
+upstream proxy behavior?
+  → Praxis AI / Praxis Core data plane
 ```
-
-## Backend Categories
-
-Grid currently models these inference backend categories:
-
-| Backend kind | Meaning |
-|--------------|---------|
-| `local` | Self-hosted capacity in the local Grid site. |
-| `remote` | Self-hosted capacity reached through another Grid site. |
-| `cloud_managed` | Cloud inference controlled by the platform, such as Bedrock or Vertex. |
-| `api_provider` | Third-party hosted API, such as OpenAI or Anthropic. |
-
-These categories affect scoring, credential placement, and transport
-expectations.
-
-## Integration with Praxis
-
-Grid and the Praxis deployment owner configure different parts of the gateway:
-
-| Concern | Owner |
-|---------|-------|
-| Base listener/filter-chain config | Praxis Operator or deployment owner |
-| Praxis Deployment spec and rollout | Praxis Operator or deployment owner |
-| Grid overlay `ConfigMap` | Grid Operator |
-| Optional generated consumer Praxis `ConfigMap` | Grid Operator |
-| Grid TLS Secrets | Grid Operator |
-| Mounting/reloading generated config | Deployment owner |
-
-## Current Maturity
-
-**Inference path:** implemented and validated.  `GridNetwork`, `GridSite`, and
-`InferenceProvider` have controllers, scoring, overlay rendering, credential
-reference projection, and E2E validation coverage.
-
-**MCP / A2A:** architectural direction only.  `AgentToolProvider` and
-`AgentToAgentProvider` have CRD schema definitions but no controllers and no
-operator-started reconcile loops.
-
-**Known hardening backlog:**
-
-- operator HA and leader election
-- SWIM sender/origin binding
-- per-`GridNetwork` SWIM/key isolation
-- stronger `GridSite` readiness conditions beyond Active
-- explicit remote transport contract; no implicit plaintext remote routes
-- metrics/health endpoint SSRF and response-size hardening
-- `Unreachable` recovery semantics
-- unknown cost/health scoring semantics
-- gateway loaded-config/status handshake
-- CRDT record/tombstone garbage collection
-- production deployment hardening
