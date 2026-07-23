@@ -7,13 +7,59 @@ and routing configuration.
 
 ### Install
 
-Generate and install CRDs, then apply the operator install
-package:
+Grid provides deployment manifests for the operator and CRDs.
+
+**Option 1: Kustomize (recommended)**
 
 ```console
-cargo run -p operator --bin generate_crds | kubectl apply -f -
-kubectl apply -f deploy/operator/
+# Complete Grid deployment (CRDs + operator)
+kubectl apply -k deploy/
+
+# Or step-by-step:
+kubectl apply -f deploy/crds/
+kubectl apply -k deploy/operator/
 ```
+
+**Option 2: Direct YAML**
+
+```console
+# Apply CRDs first
+kubectl apply -f deploy/crds/gridnetwork.yaml
+kubectl apply -f deploy/crds/gridsite.yaml
+kubectl apply -f deploy/crds/inferenceprovider.yaml
+
+# Apply operator resources with Kustomize
+kubectl apply -k deploy/operator/
+```
+
+**Option 3: Generated CRDs (development)**
+
+```console
+# Generate CRDs from source and apply directly
+cargo run -p operator --bin generate_crds | kubectl apply -f -
+kubectl apply -k deploy/operator/
+```
+
+For regenerating CRDs after schema changes:
+
+```console
+./scripts/generate-deployment-crds.sh
+```
+
+**Container image pattern**: The operator Containerfile uses a
+`rust:1.96-alpine` builder, dependency-cache stubs, and an `alpine:3.23`
+runtime with a non-root user and no build toolchain.  The Kubernetes Deployment
+adds a restricted security context for OpenShift-style clusters.
+
+**Image availability**: Shared registry validation depends on project-owned
+published images. Local Kind image loading remains available as a developer
+override.
+
+### Deployment Examples
+
+See sample Custom Resource configurations:
+- `config/samples/` - standard operator sample CRs
+- `deploy/examples/single-cluster-api-provider/` - minimal example with external API
 
 The install package creates:
 
@@ -31,15 +77,28 @@ The operator runs as a single binary with multiple
 controllers (one per CRD type) in the same process.  No
 SWIM runtime starts until a `GridNetwork` resource exists.
 
+**Important**: Grid deploys only the operator and CRDs.
+It does not install Kind clusters, Praxis AI gateways,
+llm-d, mock EPP, MetalLB, Gateway API, or cross-cluster
+DNS.  Multi-cluster development environment composition
+is planned separately under the
+[Forge](https://github.com/praxis-proxy/grid/issues/2)
+direction.
+
+Praxis AI gateway deployment is separate and requires:
+1. Praxis AI image with required filters (`grid_route`, `grid_credential_inject`)
+2. Consumer gateway configuration referencing Grid-generated ConfigMaps
+3. Provider gateway deployment with Grid-compatible endpoints
+
 ### Operator image
 
-The reserved operator image path is:
+The intended project-owned operator image path is:
 
 ```
 ghcr.io/praxis-proxy/grid-operator
 ```
 
-This image is not published yet.  The CI workflow builds the
+This image path is reserved but not yet published. The CI workflow builds the
 image for validation, but the GHCR push steps are disabled
 until package ownership and repository permissions are
 configured for `ghcr.io/praxis-proxy`.
@@ -49,9 +108,9 @@ configured for `ghcr.io/praxis-proxy`.
 | Tag | Mutability | When pushed |
 |---|---|---|
 | `sha-<7-char-commit>` | Immutable | Used once publishing is enabled |
-| `latest` | Mutable | Convenience tag once publishing is enabled |
+| `v<version>` | Immutable release tag | Used once releases are cut |
 
-Production deployments should pin an immutable SHA tag:
+Once published, deployments should pin an immutable SHA tag:
 
 ```yaml
 image: ghcr.io/praxis-proxy/grid-operator:sha-4a4c064

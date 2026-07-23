@@ -1,3 +1,84 @@
-FROM ubuntu:24.04
-COPY operator /usr/local/bin/operator
+# syntax=docker/dockerfile:1
+
+# ------------------------------------------------------------------------------
+# Stage 1: Build
+# ------------------------------------------------------------------------------
+#
+# Copy workspace manifests first, build with stub sources to cache dependency
+# compilation, then copy real source and rebuild only project crates.
+
+FROM rust:1.96-alpine AS builder
+
+ENV OPENSSL_STATIC=1
+
+RUN apk add --no-cache musl-dev openssl-dev openssl-libs-static pkgconf cmake make g++
+
+WORKDIR /src
+
+# ------------------------------------------------------------------------------
+# Cache Build
+# ------------------------------------------------------------------------------
+
+COPY Cargo.toml Cargo.lock ./
+COPY certs/Cargo.toml certs/Cargo.toml
+COPY crdt/Cargo.toml crdt/Cargo.toml
+COPY operator/Cargo.toml operator/Cargo.toml
+COPY scoring/Cargo.toml scoring/Cargo.toml
+COPY swim/Cargo.toml swim/Cargo.toml
+
+# Strip workspace members not needed for the operator binary so this image build
+# does not need their manifests or source.
+RUN sed -i '/mock-providers/d; /xtask/d' Cargo.toml
+
+RUN mkdir -p certs/src crdt/src operator/src scoring/src swim/src \
+    && echo '//! stub' > certs/src/lib.rs \
+    && echo '//! stub' > crdt/src/lib.rs \
+    && echo '//! stub' > operator/src/lib.rs \
+    && echo '//! stub' > scoring/src/lib.rs \
+    && echo '//! stub' > swim/src/lib.rs \
+    && printf '//! stub\nfn main() {}\n' > operator/src/main.rs
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/src/target \
+    cargo build --release -p operator --bin operator
+
+# ------------------------------------------------------------------------------
+# Build
+# ------------------------------------------------------------------------------
+
+COPY certs/src certs/src
+COPY crdt/src crdt/src
+COPY operator/src operator/src
+COPY scoring/src scoring/src
+COPY swim/src swim/src
+
+RUN find certs/src crdt/src operator/src scoring/src swim/src \
+    -name '*.rs' -exec touch {} +
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/src/target \
+    cargo build --release -p operator --bin operator \
+    && cp target/release/operator /usr/local/bin/operator
+
+# ------------------------------------------------------------------------------
+# Stage 2: Runtime
+# ------------------------------------------------------------------------------
+
+FROM alpine:3.23
+
+LABEL org.opencontainers.image.source="https://github.com/praxis-proxy/grid" \
+    org.opencontainers.image.description="Grid operator for multi-site AI routing" \
+    org.opencontainers.image.licenses="MIT"
+
+RUN apk add --no-cache ca-certificates \
+    && addgroup -S grid \
+    && adduser -S -G grid -h /nonexistent -s /sbin/nologin grid
+
+COPY --from=builder --chown=root:root --chmod=0555 \
+    /usr/local/bin/operator /usr/local/bin/operator
+
+USER grid:grid
+
+EXPOSE 7946/udp
+
 ENTRYPOINT ["operator"]

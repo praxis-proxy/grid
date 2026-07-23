@@ -584,20 +584,11 @@ pub(crate) fn cleanup_validation_resources(context: &str) -> Result<(), Box<dyn 
 // ---------------------------------------------------------------------------
 
 /// Apply the operator install manifests from `deploy/operator/`.
-///
-/// The namespace must exist before resources that target it, so the
-/// namespace manifest is applied first as a separate step.
 pub(crate) fn apply_install_manifests(context: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let ns = Command::new("kubectl")
-        .args(["apply", "--context", context, "-f", "deploy/operator/namespace.yaml"])
+    let status = Command::new("kubectl")
+        .args(["apply", "--context", context, "-k", "deploy/operator/"])
         .status()?;
-    if !ns.success() {
-        return Err("failed to apply deploy/operator/namespace.yaml".into());
-    }
-    let rest = Command::new("kubectl")
-        .args(["apply", "--context", context, "-f", "deploy/operator/"])
-        .status()?;
-    if !rest.success() {
+    if !status.success() {
         return Err("failed to apply install manifests from deploy/operator/".into());
     }
     Ok(())
@@ -610,7 +601,7 @@ pub(crate) fn cleanup_install_manifests(context: &str) -> Result<(), Box<dyn std
             "delete",
             "--context",
             context,
-            "-f",
+            "-k",
             "deploy/operator/",
             "--ignore-not-found",
         ])
@@ -637,23 +628,19 @@ pub(crate) fn cleanup_install_rbac_test_resources(context: &str) -> Result<(), B
 
 /// Build the Grid operator container image.
 ///
-/// Compiles the operator binary, copies it into a temporary build context,
-/// and runs `docker build` (or `podman build`) to produce the image.
+/// Builds the operator image from the repository root using the multi-stage
+/// Containerfile.
 ///
 /// # Errors
 ///
-/// Returns an error if the binary build, context setup, or image build fails.
+/// Returns an error if the image build fails.
 pub(crate) fn build_operator_image() -> Result<(), Box<dyn std::error::Error>> {
-    ensure_operator_binary_built()?;
-    let ctx_dir = tempfile::tempdir()?;
-    std::fs::copy(operator_binary_path(), ctx_dir.path().join("operator"))?;
     let engine = super::images::docker_engine();
     let containerfile = "deploy/operator/Containerfile";
-    let ctx = ctx_dir.path().to_str().ok_or("temp dir path not UTF-8")?;
     let operator_img = image_overrides::operator_image();
     eprintln!("  building {operator_img} with {engine}...");
     let status = Command::new(&engine)
-        .args(["build", "-f", containerfile, "-t", &operator_img, ctx])
+        .args(["build", "-f", containerfile, "-t", &operator_img, "."])
         .status()?;
     if !status.success() {
         return Err(format!("{engine} build failed for {operator_img}").into());

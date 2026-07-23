@@ -17,15 +17,25 @@ spec:
         app.kubernetes.io/name: grid-operator
     spec:
       serviceAccountName: grid-operator
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: operator
+          # Project-owned image path (not yet published)
           # For production, use an immutable SHA tag:
           #   ghcr.io/praxis-proxy/grid-operator:sha-<commit>
-          # This GHCR image path is reserved but not published yet.
-          # For Kind validation, the xtask builds and loads
-          # grid-operator:latest into the cluster directly.
+          # For Kind validation, xtask loads grid-operator:latest locally
           image: ghcr.io/praxis-proxy/grid-operator:latest
           imagePullPolicy: IfNotPresent
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
           env:
             - name: GRID_SWIM_BIND_ADDR
               value: "0.0.0.0:7946"

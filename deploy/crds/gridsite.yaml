@@ -1,0 +1,179 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: gridsites.grid.praxis-proxy.io
+spec:
+  group: grid.praxis-proxy.io
+  names:
+    categories: []
+    kind: GridSite
+    plural: gridsites
+    shortNames: []
+    singular: gridsite
+  scope: Cluster
+  versions:
+    - additionalPrinterColumns:
+        - jsonPath: .status.phase
+          name: Phase
+          type: string
+        - jsonPath: .spec.gridNetworkRef
+          name: Network
+          type: string
+      name: v1alpha1
+      schema:
+        openAPIV3Schema:
+          description: Auto-generated derived type for GridSiteSpec via `CustomResource`
+          properties:
+            spec:
+              description: |-
+                Specification for a [`GridSite`].
+
+                Describes a remote site's egress endpoint, region, and
+                grid membership.
+              properties:
+                egress:
+                  description: Egress endpoint for data-plane connectivity.
+                  nullable: true
+                  properties:
+                    address:
+                      description: Address of the egress gateway (host:port).
+                      type: string
+                    tls:
+                      default:
+                        mode: ""
+                      description: TLS mode for the connection.
+                      properties:
+                        mode:
+                          default: Mutual
+                          description: 'TLS mode: Mutual, Simple, or Passthrough.'
+                          type: string
+                      type: object
+                  required:
+                    - address
+                  type: object
+                gridNetworkRef:
+                  description: |-
+                    Name of the [`GridNetwork`] this site belongs to.
+
+                    [`GridNetwork`]: crate::crd::grid_network::GridNetwork
+                  type: string
+                region:
+                  description: Deployment region.
+                  nullable: true
+                  type: string
+                sovereigntyZone:
+                  description: Sovereignty zone for data residency constraints.
+                  nullable: true
+                  type: string
+                trust:
+                  description: |-
+                    Trust policy for this site.
+
+                    When configured, the operator verifies the received public certificate against
+                    this policy before promoting the site to `Active`.  If absent, the site remains
+                    `Connecting` with reason `TrustPolicyMissing` regardless of cert material.
+                  nullable: true
+                  properties:
+                    certFingerprint:
+                      description: |-
+                        Expected SHA-256 fingerprint of the remote site's public certificate PEM.
+
+                        Format: colon-separated lowercase hex bytes, e.g. `"ab:cd:ef:..."`.
+                        Computed as `sha256(pem_bytes)` where `pem_bytes` are the UTF-8 bytes of
+                        `status.publicCertPem`.
+
+                        To compute from the PEM string: `printf '%s' "$cert_pem" | sha256sum`.
+
+                        When this field matches the SHA-256 of `status.publicCertPem`, the site is
+                        promoted to `Active` after a successful TCP probe.  When absent, the site
+                        remains `Connecting` with reason `TrustPolicyMissing`.
+                      nullable: true
+                      type: string
+                  type: object
+                zone:
+                  description: Availability zone.
+                  nullable: true
+                  type: string
+              required:
+                - gridNetworkRef
+              type: object
+            status:
+              description: Observed status of a [`GridSite`].
+              nullable: true
+              properties:
+                capabilities:
+                  default:
+                    agentToAgent: false
+                    agentTools: false
+                    inference: false
+                  description: Capabilities offered by this site.
+                  properties:
+                    agentToAgent:
+                      default: false
+                      description: Site offers A2A agent access.
+                      type: boolean
+                    agentTools:
+                      default: false
+                      description: Site offers MCP tool access.
+                      type: boolean
+                    inference:
+                      default: false
+                      description: Site offers inference access.
+                      type: boolean
+                  type: object
+                lastProbeTime:
+                  description: Timestamp of the last SWIM probe.
+                  nullable: true
+                  type: string
+                lastTransitionTime:
+                  description: Timestamp of the last phase transition.
+                  nullable: true
+                  type: string
+                message:
+                  default: ""
+                  description: |-
+                    Human-readable diagnostic for the current phase.
+
+                    Never contains credential token bytes.  Populated on every reconcile;
+                    empty when the operator has no additional context.
+                  type: string
+                observedGeneration:
+                  default: 0
+                  description: Last observed generation.
+                  format: int64
+                  type: integer
+                phase:
+                  default: Pending
+                  description: Current lifecycle phase.
+                  enum:
+                    - Pending
+                    - Discovered
+                    - Connecting
+                    - Active
+                    - Unreachable
+                    - Left
+                  type: string
+                publicCertPem:
+                  description: |-
+                    Remote site's public certificate PEM (received
+                    via SWIM state broadcast from the remote operator).
+                  nullable: true
+                  type: string
+                reason:
+                  default: ""
+                  description: |-
+                    Machine-readable reason for the current phase.
+
+                    Empty when `phase` is `Active` without additional context.
+                    Examples: `"AwaitingDiscovery"`, `"EgressKnown"`, `"EgressMissing"`,
+                    `"AwaitingReadiness"`.
+                  type: string
+              type: object
+          required:
+            - spec
+          title: GridSite
+          type: object
+      served: true
+      storage: true
+      subresources:
+        status: {}

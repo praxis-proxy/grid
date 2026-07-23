@@ -90,12 +90,8 @@ container:
 	docker build -t $(PROJECT_IMAGE) -f Containerfile .
 
 operator-image:
-	cargo build -p operator --bin operator --release
-	mkdir -p target/operator-ctx
-	cp target/release/operator target/operator-ctx/operator
-	podman build -f deploy/operator/Containerfile -t grid-operator:latest target/operator-ctx/ || \
-	docker build -f deploy/operator/Containerfile -t grid-operator:latest target/operator-ctx/
-	rm -rf target/operator-ctx
+	podman build -f deploy/operator/Containerfile -t grid-operator:latest . || \
+	docker build -f deploy/operator/Containerfile -t grid-operator:latest .
 
 images:
 	docker build -t $(PROJECT_IMAGE) -f Containerfile .

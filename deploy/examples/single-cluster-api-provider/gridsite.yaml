@@ -1,0 +1,20 @@
+apiVersion: grid.praxis-proxy.io/v1alpha1
+kind: GridSite
+metadata:
+  name: example
+spec:
+  # Link to the GridNetwork
+  gridNetworkRef: example
+
+  # Site location
+  region: us-west-2
+  zone: us-west-2a
+  sovereigntyZone: null
+
+  # No egress configuration for single-cluster example
+  # (Would be needed for multi-site routing)
+  egress: null
+
+  # No trust policy for single-cluster example
+  # (Would be needed for multi-site mTLS)
+  trust: null

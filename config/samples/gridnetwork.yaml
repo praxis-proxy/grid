@@ -1,0 +1,34 @@
+apiVersion: grid.praxis-proxy.io/v1alpha1
+kind: GridNetwork
+metadata:
+  name: example
+spec:
+  # Basic single-site configuration
+  gridId: ""  # Auto-generated on first join
+  region: us-west-2
+  zone: us-west-2a
+
+  # SWIM protocol settings (defaults)
+  swim:
+    probeInterval: "5s"
+    suspicionTimeout: "10s"
+    gossipNodes: 3
+
+  # Consumer gateway reference
+  gatewayRefs:
+    - name: consumer-gateway
+      namespace: default
+      consumerConfig:
+        enabled: true
+        configMapName: praxis-consumer-config
+        listenerPort: 8080
+        credentialMountBase: /run/secrets/grid-credentials
+        tlsCertMountPath: /etc/praxis/tls
+        # Cluster endpoints populated by gateway deployment or platform automation
+        clusterEndpoints: []
+
+  # TLS configuration (operator will generate if absent)
+  tls:
+    caSecretRef: null      # Auto-generated
+    siteSecretRef: null    # Auto-generated
+    swimKeyRef: null       # Unencrypted SWIM for this example

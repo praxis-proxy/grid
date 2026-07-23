@@ -49,24 +49,12 @@ jobs:
             ${{ runner.os }}-rust-1.96.0-operator-
           save-always: true
 
-      - name: Build operator binary
-        run: cargo build -p operator --bin operator --release
-
-      - name: Prepare build context
-        run: cp target/release/operator deploy/operator/operator
-
       - name: Build container image
         run: |
           SHORT_SHA="${GITHUB_SHA::7}"
           docker build -f deploy/operator/Containerfile \
             -t "${IMAGE_NAME}:sha-${SHORT_SHA}" \
-            deploy/operator/
-
-      - name: Tag latest
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        run: |
-          SHORT_SHA="${GITHUB_SHA::7}"
-          docker tag "${IMAGE_NAME}:sha-${SHORT_SHA}" "${IMAGE_NAME}:latest"
+            .
 
       # Publishing is intentionally disabled until GHCR package ownership and
       # repository permissions are configured for ghcr.io/praxis-proxy.
@@ -80,11 +68,3 @@ jobs:
       #   run: |
       #     SHORT_SHA="${GITHUB_SHA::7}"
       #     docker push "${IMAGE_NAME}:sha-${SHORT_SHA}"
-      #
-      # - name: Push latest
-      #   if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-      #   run: docker push "${IMAGE_NAME}:latest"
-
-      - name: Clean up build context
-        if: always()
-        run: rm -f deploy/operator/operator

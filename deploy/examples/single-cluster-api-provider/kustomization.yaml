@@ -1,0 +1,12 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - gridnetwork.yaml
+  - gridsite.yaml
+  - inference-provider.yaml
+
+labels:
+  - pairs:
+      app.kubernetes.io/name: grid-example
+      app.kubernetes.io/part-of: grid
