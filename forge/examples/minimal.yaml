@@ -1,0 +1,16 @@
+apiVersion: forge.praxis.dev/v1alpha1
+kind: Environment
+
+metadata:
+  name: minimal
+
+spec:
+  runtime:
+    provider: auto
+    clusterPrefix: forge
+
+  clusters: []
+
+  services: []
+
+  stacks: {}
