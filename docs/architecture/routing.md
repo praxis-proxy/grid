@@ -418,6 +418,28 @@ cluster.
 If no candidate matches, the request fails cleanly instead of falling through to
 an unrelated backend.
 
+### External edge routing
+
+External client ingress uses the same overlay consumption path. A Praxis AI
+edge-ingress gateway loads a Grid overlay rendered for that edge's routing
+perspective and runs `grid_route` identically to a cluster-local consumer
+gateway.
+
+The difference is upstream of `grid_route`: the external edge sits behind a
+global traffic manager that selects a healthy edge before the request body or
+model is known.  The edge then parses the OpenAI-compatible request, extracts
+the model, and runs the loaded overlay selection.  Two-stage routing separates
+edge selection (network proximity, health) from provider selection (model,
+policy, capacity, location affinity).
+
+Grid renders a per-gateway overlay specific to each edge's site and region.
+When overlay-file hot reload is available, the edge can swap its in-memory
+snapshot atomically without process restart.  Until that capability is merged
+and proven, overlay updates require a gateway reload or restart.
+
+See [External Client Ingress](external-ingress.md) for the full external
+routing design.
+
 ## Provider gateway trust
 
 Provider gateways terminate mTLS before forwarding traffic to local inference

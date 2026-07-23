@@ -1,11 +1,36 @@
 # Authentication & Access Policy
 
-## Authentication Strategies
+## Authentication layers
 
-Authentication here means provider authentication: how the final-hop gateway
-or provider component that makes the final upstream call authenticates to the
-selected backend after routing has chosen a candidate.  It does not replace
-or rewrite credentials on the inbound client request.
+Grid-based deployments involve up to three distinct authentication layers.
+Each serves a different trust boundary and must not be conflated.
+
+| Layer | What it authenticates | Where it is enforced |
+|---|---|---|
+| **External caller auth** | The end customer's identity (bearer token, JWT, API key). | At the Praxis edge or consumer gateway, before `grid_route`. |
+| **Grid mTLS peer identity** | The edge or consumer gateway's Grid site certificate. | At the provider gateway, via `peer_identity_trust`. |
+| **Provider credential injection** | The final-hop gateway's credential for a SaaS/cloud provider API. | At the final-hop gateway, via `grid_credential_inject`. |
+
+The customer's `Authorization` header must not be forwarded as a provider
+credential.  Public TLS certificates (for external endpoints) must be kept
+separate from Grid site mTLS certificates.
+
+**External caller authentication** is relevant for external client ingress,
+where customers outside the cluster reach a public endpoint.  Grid's provider
+`accessPolicy` is site-oriented, not tenant-oriented: an edge site's provider
+eligibility does not authorize every customer to every model.  Production
+external service requires request-time tenant-to-model authorization that is
+separate from Grid's site-level access control.  This is not yet implemented.
+
+See [External Client Ingress](external-ingress.md) for the full external
+authentication model.
+
+## Provider Authentication Strategies
+
+Authentication in this section means provider authentication: how the final-hop
+gateway or provider component that makes the final upstream call authenticates
+to the selected backend after routing has chosen a candidate.  It does not
+replace or rewrite credentials on the inbound client request.
 
 The implemented native path is `bearer_token`:
 

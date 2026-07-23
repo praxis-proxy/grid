@@ -271,6 +271,22 @@ Over time, readiness should distinguish states such as:
 - routing config loaded
 - routing ready
 
+## External Client Ingress
+
+Grid's baseline path serves in-cluster workloads through a cluster-local
+Praxis consumer gateway. External client ingress extends this to clients
+outside the cluster: a stable public DNS name backed by global traffic
+management routes clients to a healthy Praxis AI edge-ingress gateway, which
+uses the same Grid overlay and `grid_route` filter to select a provider.
+
+The edge tier is intended to be active-active behind platform-owned traffic
+management. Praxis AI is the L7 AI router and data-plane target, not the
+complete global traffic-management system.
+
+See [External Client Ingress](external-ingress.md) for the full design,
+ownership boundaries, authentication model, POC topology, and production
+requirements.
+
 ## Boundaries to Keep in Mind
 
 Grid is intentionally not the whole platform.  It prepares and publishes routing

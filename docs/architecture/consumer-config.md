@@ -195,6 +195,31 @@ mount.  A pod restart, rollout, or explicit gateway reload is required after the
 operator updates the `ConfigMap`.  See [Reload and rollout](#reload-and-rollout)
 below.
 
+## Edge-ingress deployments
+
+External edge-ingress gateways reuse the same consumer config contract: the
+operator renders a `ConfigMap` with static endpoint topology and `grid_route`
+candidates, and the edge gateway consumes it the same way a cluster-local
+consumer gateway does.
+
+The key distinction for edge deployments is that the routing overlay data
+(candidate membership, ordering, freshness) changes more frequently than
+static endpoint/TLS topology.  The intended architecture separates these:
+
+- **Static topology** (listener config, endpoint addresses, TLS material,
+  filter chain structure): changes require a gateway reload or restart.
+- **Dynamic overlay** (`grid-config.json` candidate data): changes should be
+  consumable without a full restart, via overlay-file hot reload.
+
+Dynamic overlay hot reload depends on Praxis AI `grid_route` overlay-file
+mode with in-process snapshot replacement.  Until that capability is merged
+and proven, overlay updates require the same gateway restart as static config
+changes.  Do not assume that a `ConfigMap` update automatically affects live
+edge traffic today.
+
+See [External Client Ingress](external-ingress.md) for the full edge
+deployment architecture.
+
 ## Reload and rollout
 
 The operator applies the consumer Praxis `ConfigMap` on every reconcile.  The
