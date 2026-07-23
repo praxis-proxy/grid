@@ -19,6 +19,7 @@ pub fn validate(config: &ForgeConfig) -> Result<(), ForgeError> {
     check_api_version(config)?;
     check_kind(config)?;
     check_metadata_name(&config.metadata.name)?;
+    check_network_name(&config.metadata.name, &config.spec)?;
     check_cluster_names(config)?;
     check_cluster_nodes(config)?;
     check_service_names(config)?;
@@ -97,6 +98,34 @@ fn check_dns_label_edges(name: &str, context: &str) -> Result<(), ForgeError> {
 /// `metadata.name` must be a DNS label.
 fn check_metadata_name(name: &str) -> Result<(), ForgeError> {
     check_dns_label(name, "metadata.name")
+}
+
+/// Derived network name must be safe for Docker/Podman.
+fn check_network_name(env_name: &str, spec: &crate::config::EnvironmentSpec) -> Result<(), ForgeError> {
+    let wants = spec.network.as_ref().is_some_and(|n| n.cross_cluster);
+    if !wants {
+        return Ok(());
+    }
+    let derived = format!("{env_name}-net");
+    check_docker_name(&derived, "derived network name")
+}
+
+/// Validate a Docker/Podman resource name.
+fn check_docker_name(name: &str, context: &str) -> Result<(), ForgeError> {
+    if name.is_empty() || name.len() > 128 {
+        return Err(ForgeError::Validation(format!(
+            "{context}: {name:?} must be 1\u{2013}128 characters"
+        )));
+    }
+    let valid = name
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.');
+    if !valid {
+        return Err(ForgeError::Validation(format!(
+            "{context}: {name:?} contains characters unsafe for Docker/Podman"
+        )));
+    }
+    Ok(())
 }
 
 /// Cluster names must be unique and DNS-label-valid.
@@ -640,5 +669,23 @@ spec:
         };
         let msg = err.to_string();
         assert!(msg.contains("exec command"), "expected exec error, got: {msg}");
+    }
+
+    #[test]
+    fn network_cross_cluster_passes_validation() {
+        let mut config = base_config();
+        config.spec.network = Some(crate::config::NetworkConfig { cross_cluster: true });
+        validate(&config).unwrap_or_else(|_e| {
+            std::process::abort();
+        });
+    }
+
+    #[test]
+    fn network_config_without_cross_cluster_passes() {
+        let mut config = base_config();
+        config.spec.network = Some(crate::config::NetworkConfig { cross_cluster: false });
+        validate(&config).unwrap_or_else(|_e| {
+            std::process::abort();
+        });
     }
 }

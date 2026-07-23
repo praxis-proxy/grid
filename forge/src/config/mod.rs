@@ -56,7 +56,7 @@ pub struct Metadata {
 pub struct EnvironmentSpec {
     /// Container runtime settings.
     pub runtime: RuntimeConfig,
-    /// Network configuration (reserved for future use).
+    /// Container-network settings (creates a shared Docker/Podman network).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network: Option<NetworkConfig>,
     /// Cluster definitions.
@@ -108,14 +108,14 @@ fn default_cluster_prefix() -> String {
 }
 
 // ---------------------------------------------------------------
-// Networking (placeholder)
+// Networking
 // ---------------------------------------------------------------
 
-/// Network configuration (reserved for future phases).
+/// Container-network configuration for the environment.
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct NetworkConfig {
-    /// Enable cross-cluster networking.
+    /// Enable a shared container network across clusters.
     #[serde(default)]
     pub cross_cluster: bool,
 }

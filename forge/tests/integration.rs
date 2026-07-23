@@ -7,7 +7,11 @@
 #![allow(clippy::tests_outside_test_module, reason = "integration tests live in tests/")]
 
 use clap::Parser as _;
-use forge::{cli::Cli, config, config::validate};
+use forge::{
+    cli::Cli,
+    config,
+    config::{RuntimeProvider, validate},
+};
 
 #[test]
 fn cli_recognizes_help_flag() {
@@ -73,4 +77,90 @@ fn config_validate_fails_with_invalid_yaml() {
 
     let result = config::load(&path).and_then(|cfg| validate::validate(&cfg));
     assert!(result.is_err(), "invalid config should fail: {result:?}");
+}
+
+// ---------------------------------------------------------------
+// F2 CLI parsing tests
+// ---------------------------------------------------------------
+
+#[test]
+fn cli_accepts_up_command() {
+    let result = Cli::try_parse_from(["praxis-forge", "up"]);
+    assert!(result.is_ok(), "up command should parse: {result:?}");
+}
+
+#[test]
+fn cli_accepts_up_with_dry_run() {
+    let result = Cli::try_parse_from(["praxis-forge", "up", "--dry-run"]);
+    assert!(result.is_ok(), "up --dry-run should parse: {result:?}");
+}
+
+#[test]
+fn cli_accepts_runtime_override() {
+    let cli = Cli::try_parse_from(["praxis-forge", "--runtime", "podman", "up"]).unwrap_or_else(|_| {
+        std::process::abort();
+        #[expect(unreachable_code, reason = "abort prevents reaching this")]
+        {
+            unreachable!()
+        }
+    });
+    assert_eq!(
+        cli.global.runtime,
+        Some(RuntimeProvider::Podman),
+        "runtime override should parse"
+    );
+}
+
+#[test]
+fn cli_accepts_down_command() {
+    let result = Cli::try_parse_from(["praxis-forge", "down"]);
+    assert!(result.is_ok(), "down command should parse: {result:?}");
+}
+
+#[test]
+fn cli_accepts_down_with_force() {
+    let result = Cli::try_parse_from(["praxis-forge", "down", "--force"]);
+    assert!(result.is_ok(), "down --force should parse: {result:?}");
+}
+
+#[test]
+fn cli_accepts_status_command() {
+    let result = Cli::try_parse_from(["praxis-forge", "status"]);
+    assert!(result.is_ok(), "status command should parse: {result:?}");
+}
+
+#[test]
+fn cli_accepts_cluster_create() {
+    let result = Cli::try_parse_from(["praxis-forge", "cluster", "create", "hub"]);
+    assert!(result.is_ok(), "cluster create should parse: {result:?}");
+}
+
+#[test]
+fn cli_accepts_cluster_delete_with_force() {
+    let result = Cli::try_parse_from(["praxis-forge", "cluster", "delete", "hub", "--force"]);
+    assert!(result.is_ok(), "cluster delete --force should parse: {result:?}");
+}
+
+#[test]
+fn cli_accepts_cluster_list() {
+    let result = Cli::try_parse_from(["praxis-forge", "cluster", "list"]);
+    assert!(result.is_ok(), "cluster list should parse: {result:?}");
+}
+
+#[test]
+fn cli_accepts_cluster_kubeconfig() {
+    let result = Cli::try_parse_from(["praxis-forge", "cluster", "kubeconfig", "hub"]);
+    assert!(result.is_ok(), "cluster kubeconfig should parse: {result:?}");
+}
+
+#[test]
+fn cli_accepts_cluster_load_image() {
+    let result = Cli::try_parse_from(["praxis-forge", "cluster", "load-image", "hub", "my-image:v1"]);
+    assert!(result.is_ok(), "cluster load-image should parse: {result:?}");
+}
+
+#[test]
+fn cli_accepts_cluster_kubectl() {
+    let result = Cli::try_parse_from(["praxis-forge", "cluster", "kubectl", "hub", "--", "get", "pods"]);
+    assert!(result.is_ok(), "cluster kubectl should parse: {result:?}");
 }

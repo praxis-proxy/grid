@@ -167,11 +167,13 @@ fn command_error(spec: &CommandSpec, err: &std::io::Error) -> ForgeError {
 // Mock runner for tests
 // -----------------------------------------------------------------
 
-/// A test-only command runner that records calls.
+/// A test-only command runner that records calls and returns canned responses.
 #[cfg(any(test, feature = "test-support"))]
 pub struct MockRunner {
-    /// Canned responses keyed by program name.
+    /// Canned responses keyed by display string or program name.
     responses: BTreeMap<String, CommandOutput>,
+    /// Recorded calls for assertion.
+    calls: std::cell::RefCell<Vec<CommandSpec>>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -187,20 +189,53 @@ impl MockRunner {
     pub fn new() -> Self {
         Self {
             responses: BTreeMap::new(),
+            calls: std::cell::RefCell::new(Vec::new()),
         }
     }
 
-    /// Register a canned response for a program.
+    /// Register a canned response for a display string or program.
     pub fn respond(&mut self, program: &str, output: CommandOutput) -> &mut Self {
         self.responses.insert(program.to_owned(), output);
         self
+    }
+
+    /// Return all recorded calls.
+    pub fn calls(&self) -> Vec<CommandSpec> {
+        self.calls.borrow().clone()
+    }
+
+    /// Return the number of recorded calls.
+    pub fn call_count(&self) -> usize {
+        self.calls.borrow().len()
+    }
+
+    /// Return recorded calls whose display string contains the pattern.
+    pub fn calls_matching(&self, pattern: &str) -> Vec<CommandSpec> {
+        self.calls
+            .borrow()
+            .iter()
+            .filter(|c| format!("{c}").contains(pattern))
+            .cloned()
+            .collect()
+    }
+
+    /// Check if any recorded call's display string contains the pattern.
+    pub fn was_called(&self, pattern: &str) -> bool {
+        self.calls.borrow().iter().any(|c| format!("{c}").contains(pattern))
+    }
+
+    /// Clear all recorded calls.
+    pub fn clear_calls(&self) {
+        self.calls.borrow_mut().clear();
     }
 }
 
 #[cfg(any(test, feature = "test-support"))]
 impl CommandRunner for MockRunner {
-    /// Look up by display string first, then by program name alone.
+    /// Record the call, then look up by display string first, then
+    /// by program name alone.
     fn run(&self, spec: &CommandSpec) -> Result<CommandOutput, ForgeError> {
+        self.calls.borrow_mut().push(spec.clone());
         let display = format!("{spec}");
         if let Some(output) = self.responses.get(&display) {
             return Ok(output.clone());
@@ -293,5 +328,74 @@ mod tests {
         };
         let msg = err.to_string();
         assert!(msg.contains("not found"), "expected not-found error, got: {msg}");
+    }
+
+    #[test]
+    fn mock_runner_records_calls() {
+        let mut runner = MockRunner::new();
+        runner.respond(
+            "kubectl",
+            CommandOutput {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+        );
+        let spec = CommandSpec {
+            program: "kubectl".into(),
+            args: vec!["get".into(), "pods".into()],
+            env: BTreeMap::new(),
+            stdin: None,
+            redact: Vec::new(),
+        };
+        let _result = runner.run(&spec);
+        assert_eq!(runner.call_count(), 1, "should record one call");
+    }
+
+    #[test]
+    fn mock_runner_was_called_matches() {
+        let mut runner = MockRunner::new();
+        runner.respond(
+            "kind get clusters",
+            CommandOutput {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+        );
+        let spec = CommandSpec {
+            program: "kind".into(),
+            args: vec!["get".into(), "clusters".into()],
+            env: BTreeMap::new(),
+            stdin: None,
+            redact: Vec::new(),
+        };
+        let _result = runner.run(&spec);
+        assert!(runner.was_called("kind get clusters"), "should match display string");
+        assert!(!runner.was_called("kind create"), "should not match unrelated command");
+    }
+
+    #[test]
+    fn mock_runner_clear_calls_resets() {
+        let mut runner = MockRunner::new();
+        runner.respond(
+            "kubectl",
+            CommandOutput {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+        );
+        let spec = CommandSpec {
+            program: "kubectl".into(),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            stdin: None,
+            redact: Vec::new(),
+        };
+        let _result = runner.run(&spec);
+        assert_eq!(runner.call_count(), 1, "should have one call before clear");
+        runner.clear_calls();
+        assert_eq!(runner.call_count(), 0, "should have zero calls after clear");
     }
 }

@@ -31,9 +31,9 @@ pub struct GlobalOptions {
     #[arg(long, env = "FORGE_STATE_DIR", default_value = ".forge", global = true)]
     pub state_dir: PathBuf,
 
-    /// Container runtime to use.
-    #[arg(long, default_value = "auto", global = true)]
-    pub runtime: RuntimeProvider,
+    /// Override the container runtime from the config.
+    #[arg(long, global = true)]
+    pub runtime: Option<RuntimeProvider>,
 
     /// Log level (e.g. `info`, `debug`, `trace`).
     #[arg(long, env = "FORGE_LOG", default_value = "info", global = true)]
@@ -62,6 +62,62 @@ pub enum Command {
     /// Configuration management subcommands.
     #[command(subcommand)]
     Config(ConfigCommand),
+    /// Bring up all clusters defined in the configuration.
+    Up,
+    /// Tear down all clusters.
+    Down {
+        /// Skip confirmation and force-delete clusters.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Show the status of the environment.
+    Status,
+    /// Individual cluster lifecycle commands.
+    #[command(subcommand)]
+    Cluster(ClusterCommand),
+}
+
+/// Cluster subcommands.
+#[derive(Debug, Subcommand)]
+pub enum ClusterCommand {
+    /// Create a single cluster by name.
+    Create {
+        /// Cluster name (must match a name in the config).
+        name: String,
+    },
+    /// Delete a single cluster by name.
+    Delete {
+        /// Cluster name.
+        name: String,
+        /// Skip confirmation and force-delete.
+        #[arg(long)]
+        force: bool,
+    },
+    /// List all managed KIND clusters.
+    List,
+    /// Export the kubeconfig for a cluster.
+    Kubeconfig {
+        /// Cluster name.
+        name: String,
+        /// Write kubeconfig to a file instead of stdout.
+        #[arg(long = "out-file")]
+        out_file: Option<PathBuf>,
+    },
+    /// Load a container image into a cluster.
+    LoadImage {
+        /// Cluster name.
+        name: String,
+        /// Container image reference.
+        image: String,
+    },
+    /// Run kubectl against a cluster.
+    Kubectl {
+        /// Cluster name.
+        name: String,
+        /// Arguments passed to kubectl (after `--`).
+        #[arg(last = true)]
+        args: Vec<String>,
+    },
 }
 
 /// Configuration subcommands.

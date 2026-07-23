@@ -27,4 +27,16 @@ pub enum ForgeError {
         /// Human-readable failure description.
         message: String,
     },
+
+    /// State file could not be read, written, or is corrupt.
+    #[error("state error: {0}")]
+    State(String),
+
+    /// Container runtime detection or probing failed.
+    #[error("runtime error: {0}")]
+    Runtime(String),
+
+    /// Could not acquire or release a file lock.
+    #[error("lock error: {0}")]
+    Lock(String),
 }

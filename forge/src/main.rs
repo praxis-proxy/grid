@@ -2,8 +2,10 @@
 
 use clap::Parser as _;
 use forge::{
-    cli::{Cli, Command, ConfigCommand},
-    command::{config, doctor, plan, runner},
+    cli::{Cli, ClusterCommand, Command, ConfigCommand},
+    cluster,
+    command::{config, doctor, down, plan, runner, status, up},
+    context::ForgeContext,
     error::ForgeError,
     output::{self, OutputFormat},
 };
@@ -23,6 +25,10 @@ fn dispatch(cli: &Cli, writer: &mut dyn std::io::Write) -> Result<(), ForgeError
         Command::Doctor => dispatch_doctor(format, writer),
         Command::Plan => dispatch_plan(cli, format, writer),
         Command::Config(sub) => dispatch_config(cli, sub, format, writer),
+        Command::Up => dispatch_up(cli, writer),
+        Command::Down { force } => dispatch_down(cli, *force, writer),
+        Command::Status => dispatch_status(cli, writer),
+        Command::Cluster(sub) => dispatch_cluster(cli, sub, writer),
     }
 }
 
@@ -52,6 +58,63 @@ fn dispatch_config(
         },
         ConfigCommand::Schema => config::run_schema(writer),
     }
+}
+
+/// Load config and validate it.
+fn load_config_validated(cli: &Cli) -> Result<forge::config::ForgeConfig, ForgeError> {
+    let mut cfg = forge::config::load(&cli.global.config)?;
+    if let Some(runtime) = &cli.global.runtime {
+        cfg.spec.runtime.provider = runtime.clone();
+    }
+    forge::config::validate::validate(&cfg)?;
+    Ok(cfg)
+}
+
+/// Build a [`ForgeContext`] from CLI options.
+fn build_context<'a>(
+    cli: &'a Cli,
+    runner: &'a dyn runner::CommandRunner,
+    config: &'a forge::config::ForgeConfig,
+) -> ForgeContext<'a> {
+    ForgeContext {
+        runner,
+        config,
+        state_dir: cli.global.state_dir.clone(),
+        format: cli.global.output.clone(),
+        dry_run: cli.global.dry_run,
+    }
+}
+
+/// Dispatch the `up` command.
+fn dispatch_up(cli: &Cli, writer: &mut dyn std::io::Write) -> Result<(), ForgeError> {
+    let config = load_config_validated(cli)?;
+    let runner = runner::SystemRunner;
+    let ctx = build_context(cli, &runner, &config);
+    up::run(&ctx, writer)
+}
+
+/// Dispatch the `down` command.
+fn dispatch_down(cli: &Cli, force: bool, writer: &mut dyn std::io::Write) -> Result<(), ForgeError> {
+    let config = load_config_validated(cli)?;
+    let runner = runner::SystemRunner;
+    let ctx = build_context(cli, &runner, &config);
+    down::run(&ctx, force, writer)
+}
+
+/// Dispatch the `status` command.
+fn dispatch_status(cli: &Cli, writer: &mut dyn std::io::Write) -> Result<(), ForgeError> {
+    let config = load_config_validated(cli)?;
+    let runner = runner::SystemRunner;
+    let ctx = build_context(cli, &runner, &config);
+    status::run(&ctx, writer)
+}
+
+/// Dispatch cluster subcommands.
+fn dispatch_cluster(cli: &Cli, sub: &ClusterCommand, writer: &mut dyn std::io::Write) -> Result<(), ForgeError> {
+    let config = load_config_validated(cli)?;
+    let runner = runner::SystemRunner;
+    let ctx = build_context(cli, &runner, &config);
+    cluster::dispatch(&ctx, sub, writer)
 }
 
 /// Handle the result of command dispatch.

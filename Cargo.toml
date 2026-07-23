@@ -24,6 +24,7 @@ bytes = "1.12.1"
 clap = { version = "4.6.1", features = ["derive"] }
 bincode = { version = "2", default-features = false, features = ["std", "serde"] }
 foca = { version = "1.0.0", features = ["std", "tracing", "bincode-codec"] }
+fs2 = "0.4"
 futures = "0.3.32"
 http = "1.4.2"
 http-body-util = "0.1"

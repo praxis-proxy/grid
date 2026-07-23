@@ -19,15 +19,20 @@
 //! validation, or operator testing.  Those responsibilities belong
 //! to the consuming project's own test harness.
 //!
-//! # Current status (F1)
+//! # Current status (F2)
 //!
-//! F1 is the initial foundation: CLI skeleton, configuration model,
-//! validation, and read-only commands (`doctor`, `plan`, `config`).
-//! The only mutation is `config init`, which writes a minimal
-//! `forge.yaml`.
+//! F2 adds the mutating layer on the F1 foundation: persistent state
+//! with file locking, container runtime detection, KIND cluster
+//! lifecycle (`up`, `down`, `status`, `cluster` subcommands), and
+//! container-network management with ownership-safe create/remove.
 
 pub mod cli;
+pub mod cluster;
 pub mod command;
 pub mod config;
+pub mod context;
 pub mod error;
+pub mod networking;
 pub mod output;
+pub mod runtime;
+pub mod state;

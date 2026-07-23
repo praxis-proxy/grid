@@ -9,6 +9,9 @@ spec:
     provider: auto
     clusterPrefix: forge
 
+  network:
+    crossCluster: false
+
   clusters: []
 
   services: []
