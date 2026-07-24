@@ -1,0 +1,133 @@
+apiVersion: forge.praxis.dev/v1alpha1
+kind: Environment
+
+metadata:
+  name: grid-glb-demo
+
+spec:
+  runtime:
+    provider: docker
+    clusterPrefix: grid-glb
+
+  network:
+    crossCluster: true
+    dnsZone: grid-glb.test
+
+  clusters:
+    - name: edge-control
+      stacks: [gateway-api, metallb, grid-operator, edge-demo]
+      properties:
+        region: us-east
+        role: edge
+
+    - name: provider-east
+      stacks: [gateway-api, metallb, grid-operator, provider-east-demo, inference-sim]
+      properties:
+        region: us-east
+        role: provider
+
+    - name: provider-west
+      stacks: [gateway-api, metallb, grid-operator, provider-west-demo, inference-sim]
+      properties:
+        region: us-west
+        role: provider
+
+  services:
+    - name: grid-overlay-sync-us-east
+      image: "ghcr.io/praxis-proxy/grid-overlay-sync:sha-PLACEHOLDER"
+      network: host
+      restart: on-failure
+      args:
+        - "--context=kind-grid-glb-edge-control"
+        - "--namespace=grid-system"
+        - "--configmap=grid-overlay-glb-demo-consumer-gateway"
+        - "--output=.forge/runtime/edge-us-east/"
+
+    - name: grid-edge-us-east
+      image: "ghcr.io/praxis-proxy/ai:sha-PLACEHOLDER"
+      network: environment
+      dependsOn:
+        - grid-overlay-sync-us-east
+      restart: on-failure
+      ports:
+        - bindAddress: "127.0.0.1"
+          host: 8080
+          container: 8080
+      volumes:
+        - source: configs/edge-us-east
+          target: /etc/praxis
+          readOnly: true
+        - source: .forge/runtime/edge-us-east
+          target: /etc/grid
+          readOnly: true
+      healthCheck:
+        type: tcp
+        port: 8080
+        interval: "2s"
+        timeout: "1s"
+        retries: 5
+
+  stacks:
+    gateway-api:
+      description: Gateway API CRDs (standard channel)
+      steps:
+        - type: url
+          url: https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.2.1/standard-install.yaml
+          sha256: 97598bf6ab3b33b9b5c5432bdd24de091e4e9c3aa0575ebb0710a2a19cd64d64
+
+    metallb:
+      description: MetalLB load balancer with auto-configured address pool
+      steps:
+        - type: url
+          url: https://raw.githubusercontent.com/metallb/metallb/v0.14.9/config/manifests/metallb-native.yaml
+          sha256: 951065e85692aa106f1bb5d5a487d9306154923a794ab1d82122881cbaf588e4
+        - type: wait
+          resource: deployment/metallb-controller
+          condition: available
+          timeout: "120s"
+        - type: metallb-auto-pool
+          name: forge-pool
+
+    grid-operator:
+      description: Grid CRDs and operator (local wrapper referencing /deploy)
+      steps:
+        - type: kustomize
+          path: resources/grid-operator
+        - type: wait
+          resource: deployment/grid-operator
+          condition: available
+          timeout: "120s"
+
+    edge-demo:
+      description: Grid network and edge site for GLB control plane
+      steps:
+        - type: manifest
+          path: resources/gridnetwork.yaml
+        - type: manifest
+          path: resources/edge-site.yaml
+        - type: manifest
+          path: policies/provider-access.yaml
+        - type: manifest
+          path: policies/external-auth-demo.yaml
+
+    provider-east-demo:
+      description: East provider site and inference provider registration
+      steps:
+        - type: manifest
+          path: resources/provider-east-site.yaml
+        - type: manifest
+          path: resources/provider-east-inference.yaml
+
+    provider-west-demo:
+      description: West provider site and inference provider registration
+      steps:
+        - type: manifest
+          path: resources/provider-west-site.yaml
+        - type: manifest
+          path: resources/provider-west-inference.yaml
+
+    inference-sim:
+      description: Simulated inference backends for provider clusters
+      steps:
+        - type: manifest
+          path: resources/provider-workloads.yaml

@@ -1,0 +1,26 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grid-external-auth-demo
+  namespace: grid-system
+  labels:
+    app.kubernetes.io/part-of: grid-glb-demo
+    grid.praxis-proxy.io/policy-type: external-auth
+  annotations:
+    grid.praxis-proxy.io/demo-only: "true"
+data:
+  auth-policy.json: |
+    {
+      "version": "v1alpha1",
+      "description": "Demo auth bypass - no real credentials required for simulator backends",
+      "providers": [
+        {
+          "name": "sim-provider-east",
+          "auth": {"strategy": "none"}
+        },
+        {
+          "name": "sim-provider-west",
+          "auth": {"strategy": "none"}
+        }
+      ]
+    }

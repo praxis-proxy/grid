@@ -1,0 +1,11 @@
+source:
+  context: kind-grid-glb-edge-control
+  namespace: grid-system
+  configMap: grid-overlay-glb-demo-consumer-gateway
+
+output:
+  path: /output/grid-config.json
+  format: json
+
+watch:
+  interval: "5s"

@@ -28,7 +28,7 @@ COPY swim/Cargo.toml swim/Cargo.toml
 
 # Strip workspace members not needed for the operator binary so this image build
 # does not need their manifests or source.
-RUN sed -i '/mock-providers/d; /xtask/d' Cargo.toml
+RUN sed -i '/forge/d; /mock-providers/d; /xtask/d' Cargo.toml
 
 RUN mkdir -p certs/src crdt/src operator/src scoring/src swim/src \
     && echo '//! stub' > certs/src/lib.rs \

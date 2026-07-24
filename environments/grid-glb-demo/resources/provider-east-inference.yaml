@@ -1,0 +1,26 @@
+apiVersion: grid.praxis-proxy.io/v1alpha1
+kind: InferenceProvider
+metadata:
+  name: sim-provider-east
+spec:
+  gridNetworkRef: glb-demo
+  providerKind: simulator
+  backendKind: local_model
+  endpoint: http://mock-inference.grid-system.svc.cluster.local:8080
+
+  models:
+    - name: sim-model-v1
+      capabilities: ["text_generation"]
+      contextWindow: 4096
+
+  siteSelector:
+    matchLabels: {}
+
+  accessPolicy:
+    siteSelector:
+      matchLabels: {}
+
+  healthCheck:
+    path: /health
+    interval: "30s"
+    timeout: "5s"

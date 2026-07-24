@@ -1,0 +1,8 @@
+listener:
+  address: "0.0.0.0:8080"
+
+grid:
+  configPath: /etc/grid/grid-config.json
+
+logging:
+  level: info

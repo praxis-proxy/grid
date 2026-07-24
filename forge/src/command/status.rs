@@ -7,9 +7,11 @@ use std::io::Write;
 
 use crate::{
     cluster::kind as kind_ops,
+    command::runner::CommandRunner,
     context::ForgeContext,
     error::ForgeError,
     output::{self, OutputFormat},
+    service::{self, ServiceIdentity},
     state,
 };
 
@@ -23,7 +25,7 @@ pub fn run(ctx: &ForgeContext<'_>, writer: &mut dyn Write) -> Result<(), ForgeEr
     let live = kind_ops::list_clusters(ctx.runner)?;
     let entries = build_entries(ctx, &st, &live);
     let net_info = network_info(&st);
-    let svc_entries = service_entries(&st);
+    let svc_entries = service_entries(ctx.runner, st.runtime.as_deref(), &st);
     render_all(writer, &entries, &net_info, &svc_entries, &ctx.format)
 }
 
@@ -105,10 +107,12 @@ struct SvcEntry {
     phase: String,
     /// Health label (e.g. "healthy", "unknown").
     health: String,
+    /// Live container identity from runtime inspect.
+    identity: ServiceIdentity,
 }
 
-/// Build service status entries from state.
-fn service_entries(st: &state::ForgeState) -> Vec<SvcEntry> {
+/// Build service status entries from state with live identity.
+fn service_entries(runner: &dyn CommandRunner, binary: Option<&str>, st: &state::ForgeState) -> Vec<SvcEntry> {
     st.services
         .iter()
         .map(|s| SvcEntry {
@@ -116,8 +120,20 @@ fn service_entries(st: &state::ForgeState) -> Vec<SvcEntry> {
             container_name: s.container_name.clone(),
             phase: format!("{:?}", s.phase).to_lowercase(),
             health: format!("{:?}", s.health).to_lowercase(),
+            identity: inspect_live(runner, binary, &s.container_name),
         })
         .collect()
+}
+
+/// Inspect a container for identity, falling back to empty on error.
+fn inspect_live(runner: &dyn CommandRunner, binary: Option<&str>, container_name: &str) -> ServiceIdentity {
+    let Some(bin) = binary else {
+        return ServiceIdentity::empty();
+    };
+    match service::inspect_identity(runner, bin, container_name) {
+        Ok(id) => id,
+        Err(_) => ServiceIdentity::empty(),
+    }
 }
 
 // ---------------------------------------------------------------
@@ -169,6 +185,9 @@ fn svc_to_json(s: &SvcEntry) -> serde_json::Value {
         "containerName": s.container_name,
         "phase": s.phase,
         "health": s.health,
+        "containerId": s.identity.container_id,
+        "startedAt": s.identity.started_at,
+        "restartCount": s.identity.restart_count,
     })
 }
 
@@ -203,9 +222,14 @@ fn render_text(
 
 /// Format a service entry as a text line.
 fn format_svc_text(s: &SvcEntry) -> String {
+    let id_label = s
+        .identity
+        .container_id
+        .as_deref()
+        .map_or("none", |id| id.get(..12).unwrap_or(id));
     format!(
-        "  {}: phase={}, health={}, container={}",
-        s.name, s.phase, s.health, s.container_name
+        "  {}: phase={}, health={}, container={}, id={}",
+        s.name, s.phase, s.health, s.container_name, id_label
     )
 }
 
@@ -350,6 +374,148 @@ spec:
             cluster_pools: Vec::new(),
         });
         state::save(state_dir, &st).unwrap_or_else(|_| std::process::abort());
+    }
+
+    /// Valid identity JSON matching the `--format` template output.
+    fn identity_json() -> String {
+        r#"{"containerId":"abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890","startedAt":"2026-07-22T14:30:00Z","restartCount":0}"#.to_owned()
+    }
+
+    /// Docker inspect output with valid identity.
+    fn docker_identity() -> CommandOutput {
+        CommandOutput {
+            status: 0,
+            stdout: identity_json(),
+            stderr: String::new(),
+        }
+    }
+
+    /// Docker inspect output for a missing container.
+    fn docker_gone() -> CommandOutput {
+        CommandOutput {
+            status: 1,
+            stdout: String::new(),
+            stderr: "no such container\n".to_owned(),
+        }
+    }
+
+    /// Seed state with a running hub cluster and a running service.
+    fn seed_with_service(state_dir: &std::path::Path) {
+        let mut st = state::empty();
+        st.runtime = Some("docker".to_owned());
+        st.clusters.push(ClusterState {
+            name: "hub".to_owned(),
+            kind_name: "forge-hub".to_owned(),
+            context: "kind-forge-hub".to_owned(),
+            phase: ClusterPhase::Running,
+        });
+        st.services.push(state::ServiceState {
+            name: "edge".to_owned(),
+            container_name: "test-edge".to_owned(),
+            image: "praxis:latest".to_owned(),
+            phase: state::ServicePhase::Running,
+            health: state::ServiceHealth::Healthy,
+            last_observed: 0,
+        });
+        state::save(state_dir, &st).unwrap_or_else(|_| std::process::abort());
+    }
+
+    /// KIND cluster list showing forge-hub as live.
+    fn kind_hub_live() -> CommandOutput {
+        CommandOutput {
+            status: 0,
+            stdout: "forge-hub\n".to_owned(),
+            stderr: String::new(),
+        }
+    }
+
+    /// Parse JSON envelope from output buffer.
+    fn parse_envelope(buf: &[u8]) -> serde_json::Value {
+        let text = String::from_utf8_lossy(buf);
+        serde_json::from_str(&text).unwrap_or_else(|_| {
+            std::process::abort();
+            #[expect(unreachable_code, reason = "abort prevents reaching this")]
+            {
+                unreachable!()
+            }
+        })
+    }
+
+    /// Extract the first service entry from a parsed JSON envelope.
+    fn first_service(envelope: &serde_json::Value) -> &serde_json::Value {
+        let Some(svc) = envelope
+            .get("data")
+            .and_then(|d| d.get("services"))
+            .and_then(|s| s.get(0))
+        else {
+            std::process::abort();
+        };
+        svc
+    }
+
+    #[test]
+    fn status_json_includes_service_identity() {
+        let dir = test_dir();
+        seed_with_service(dir.path());
+        let config = test_config();
+        let mut runner = MockRunner::new();
+        runner.respond("kind get clusters", kind_hub_live());
+        runner.respond("docker", docker_identity());
+        let ctx = ForgeContext {
+            runner: &runner,
+            config: &config,
+            state_dir: dir.path().to_path_buf(),
+            config_dir: dir.path().to_path_buf(),
+            format: OutputFormat::Json,
+            dry_run: false,
+        };
+        let mut buf = Vec::new();
+        run(&ctx, &mut buf).unwrap_or_else(|_| std::process::abort());
+        let envelope = parse_envelope(&buf);
+        let svc = first_service(&envelope);
+        assert!(
+            svc.get("containerId").is_some_and(serde_json::Value::is_string),
+            "containerId"
+        );
+        assert!(
+            svc.get("startedAt").is_some_and(serde_json::Value::is_string),
+            "startedAt"
+        );
+        assert_eq!(svc.get("restartCount"), Some(&serde_json::json!(0)), "restartCount");
+    }
+
+    #[test]
+    fn status_json_missing_container_has_null_identity() {
+        let dir = test_dir();
+        seed_with_service(dir.path());
+        let config = test_config();
+        let mut runner = MockRunner::new();
+        runner.respond("kind get clusters", kind_hub_live());
+        runner.respond("docker", docker_gone());
+        let ctx = ForgeContext {
+            runner: &runner,
+            config: &config,
+            state_dir: dir.path().to_path_buf(),
+            config_dir: dir.path().to_path_buf(),
+            format: OutputFormat::Json,
+            dry_run: false,
+        };
+        let mut buf = Vec::new();
+        run(&ctx, &mut buf).unwrap_or_else(|_| std::process::abort());
+        let envelope = parse_envelope(&buf);
+        let svc = first_service(&envelope);
+        assert!(
+            svc.get("containerId").is_some_and(serde_json::Value::is_null),
+            "containerId null"
+        );
+        assert!(
+            svc.get("startedAt").is_some_and(serde_json::Value::is_null),
+            "startedAt null"
+        );
+        assert!(
+            svc.get("restartCount").is_some_and(serde_json::Value::is_null),
+            "restartCount null"
+        );
     }
 
     #[test]

@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grid-provider-access
+  namespace: grid-system
+  labels:
+    app.kubernetes.io/part-of: grid-glb-demo
+    grid.praxis-proxy.io/policy-type: provider-access
+data:
+  policy.json: |
+    {
+      "version": "v1alpha1",
+      "rules": [
+        {
+          "description": "Allow all sites to consume all providers (demo-open)",
+          "siteSelector": {"matchLabels": {}},
+          "providerSelector": {"matchLabels": {}},
+          "effect": "allow"
+        }
+      ]
+    }

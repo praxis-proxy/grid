@@ -1,0 +1,38 @@
+apiVersion: grid.praxis-proxy.io/v1alpha1
+kind: GridNetwork
+metadata:
+  name: glb-demo
+spec:
+  gridId: ""
+  region: us-east
+  zone: us-east-1a
+
+  swim:
+    probeInterval: "5s"
+    suspicionTimeout: "10s"
+    gossipNodes: 3
+
+  gatewayRefs:
+    - name: consumer-gateway
+      namespace: grid-system
+      localSiteName: edge-control-site
+      consumerConfig:
+        enabled: true
+        configMapName: praxis-consumer-config
+        listenerPort: 8080
+        credentialMountBase: /run/secrets/grid-credentials
+        tlsCertMountPath: /etc/praxis/tls
+        clusterEndpoints:
+          - cluster: provider-east
+            address: "PROVIDER_EAST_LB:443"
+            transport:
+              mode: plaintext
+          - cluster: provider-west
+            address: "PROVIDER_WEST_LB:443"
+            transport:
+              mode: plaintext
+
+  tls:
+    caSecretRef: null
+    siteSecretRef: null
+    swimKeyRef: null

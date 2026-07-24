@@ -13,6 +13,8 @@ use std::{
     path::Path,
 };
 
+use serde::Deserialize;
+
 use crate::{
     cli::ServiceCommand,
     command::runner::{CommandOutput, CommandRunner, CommandSpec, Redaction, RedactionKind},
@@ -49,6 +51,56 @@ pub struct ServiceParams<'a> {
     pub env_name: &'a str,
     /// Directory containing the configuration file.
     pub config_dir: &'a Path,
+}
+
+// -------------------------------------------------------------
+// Identity
+// -------------------------------------------------------------
+
+/// Live container identity from runtime inspect.
+///
+/// All fields are optional because a stopped or missing container
+/// has no live identity to report.
+pub struct ServiceIdentity {
+    /// Full container ID (64-char hex string).
+    pub container_id: Option<String>,
+    /// Container start timestamp (RFC 3339).
+    pub started_at: Option<String>,
+    /// Number of container restarts.
+    pub restart_count: Option<u32>,
+}
+
+impl ServiceIdentity {
+    /// Empty identity for missing or uninspectable containers.
+    pub fn empty() -> Self {
+        Self {
+            container_id: None,
+            started_at: None,
+            restart_count: None,
+        }
+    }
+}
+
+/// Inspect a container for live identity fields.
+///
+/// Returns [`ServiceIdentity::empty`] when the container does not
+/// exist (exit code != 0).  Returns an error if the inspect output
+/// cannot be parsed as valid JSON.
+///
+/// # Errors
+///
+/// Returns [`ForgeError::State`] if the inspect output is malformed.
+pub fn inspect_identity(
+    runner: &dyn CommandRunner,
+    binary: &str,
+    container_name: &str,
+) -> Result<ServiceIdentity, ForgeError> {
+    let spec = identity_spec(binary, container_name);
+    let output = runner.run(&spec)?;
+    if output.status != 0 {
+        return Ok(ServiceIdentity::empty());
+    }
+    parse_identity(&output.stdout)
 }
 
 // -------------------------------------------------------------
@@ -361,6 +413,19 @@ fn labels_spec(binary: &str, name: &str) -> CommandSpec {
     )
 }
 
+/// Build a `<binary> inspect --format ...` spec for identity fields.
+fn identity_spec(binary: &str, name: &str) -> CommandSpec {
+    build_spec(
+        binary,
+        vec![
+            "inspect".into(),
+            "--format".into(),
+            r#"{"containerId":{{json .Id}},"startedAt":{{json .State.StartedAt}},"restartCount":{{json .RestartCount}}}"#.into(),
+            name.into(),
+        ],
+    )
+}
+
 /// Construct a [`CommandSpec`] from a binary and argument list.
 fn build_spec(binary: &str, args: Vec<OsString>) -> CommandSpec {
     build_spec_with_redactions(binary, args, Vec::new())
@@ -424,6 +489,30 @@ fn parse_labels(stdout: &str) -> Result<BTreeMap<String, String>, ForgeError> {
         return Ok(BTreeMap::new());
     }
     serde_json::from_str(trimmed).map_err(|e| ForgeError::State(format!("cannot parse container labels: {e}")))
+}
+
+/// Parsed identity fields from `docker inspect --format` output.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct InspectOutput {
+    /// Full container ID.
+    container_id: String,
+    /// Container start timestamp.
+    started_at: String,
+    /// Number of container restarts.
+    restart_count: u32,
+}
+
+/// Parse identity JSON from `docker inspect --format` output.
+fn parse_identity(stdout: &str) -> Result<ServiceIdentity, ForgeError> {
+    let trimmed = stdout.trim();
+    let parsed: InspectOutput =
+        serde_json::from_str(trimmed).map_err(|e| ForgeError::State(format!("cannot parse service inspect: {e}")))?;
+    Ok(ServiceIdentity {
+        container_id: Some(parsed.container_id),
+        started_at: Some(parsed.started_at),
+        restart_count: Some(parsed.restart_count),
+    })
 }
 
 /// Check command output for success (exit code 0).
@@ -963,5 +1052,115 @@ mod tests {
             !display.contains("--privileged"),
             "should not include --privileged: {display}"
         );
+    }
+
+    // ---------------------------------------------------------
+    // Identity inspect tests
+    // ---------------------------------------------------------
+
+    /// Valid identity JSON matching the `--format` template output.
+    fn valid_identity_json() -> String {
+        r#"{"containerId":"a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2","startedAt":"2026-07-22T14:30:00.123456789Z","restartCount":0}"#.to_owned()
+    }
+
+    #[test]
+    fn identity_spec_structured_argv() {
+        let spec = identity_spec("docker", "my-container");
+        assert_eq!(spec.program, "docker", "program");
+        let args: Vec<_> = spec.args.iter().map(|a| a.to_string_lossy()).collect();
+        assert_eq!(args.first().map(AsRef::as_ref), Some("inspect"), "first arg");
+        assert_eq!(args.get(1).map(AsRef::as_ref), Some("--format"), "second arg");
+        assert_eq!(args.last().map(AsRef::as_ref), Some("my-container"), "last arg");
+        assert!(spec.stdin.is_none(), "no stdin");
+    }
+
+    #[test]
+    fn inspect_parses_container_id() {
+        let mut runner = MockRunner::new();
+        runner.respond(
+            "docker",
+            CommandOutput {
+                status: 0,
+                stdout: valid_identity_json(),
+                stderr: String::new(),
+            },
+        );
+        let id = inspect_identity(&runner, "docker", "test-ctr").unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            id.container_id.as_deref(),
+            Some("a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"),
+            "container_id"
+        );
+    }
+
+    #[test]
+    fn inspect_parses_started_at() {
+        let mut runner = MockRunner::new();
+        runner.respond(
+            "docker",
+            CommandOutput {
+                status: 0,
+                stdout: valid_identity_json(),
+                stderr: String::new(),
+            },
+        );
+        let id = inspect_identity(&runner, "docker", "test-ctr").unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            id.started_at.as_deref(),
+            Some("2026-07-22T14:30:00.123456789Z"),
+            "started_at"
+        );
+    }
+
+    #[test]
+    fn inspect_parses_restart_count() {
+        let mut runner = MockRunner::new();
+        runner.respond(
+            "docker",
+            CommandOutput {
+                status: 0,
+                stdout: valid_identity_json(),
+                stderr: String::new(),
+            },
+        );
+        let id = inspect_identity(&runner, "docker", "test-ctr").unwrap_or_else(|_| std::process::abort());
+        assert_eq!(id.restart_count, Some(0), "restart_count");
+    }
+
+    #[test]
+    fn inspect_missing_container_yields_empty() {
+        let mut runner = MockRunner::new();
+        runner.respond(
+            "docker",
+            CommandOutput {
+                status: 1,
+                stdout: String::new(),
+                stderr: "no such container\n".to_owned(),
+            },
+        );
+        let id = inspect_identity(&runner, "docker", "gone").unwrap_or_else(|_| std::process::abort());
+        assert!(id.container_id.is_none(), "container_id should be None");
+        assert!(id.started_at.is_none(), "started_at should be None");
+        assert!(id.restart_count.is_none(), "restart_count should be None");
+    }
+
+    #[test]
+    fn inspect_malformed_json_returns_error() {
+        let mut runner = MockRunner::new();
+        runner.respond(
+            "docker",
+            CommandOutput {
+                status: 0,
+                stdout: "not valid json".to_owned(),
+                stderr: String::new(),
+            },
+        );
+        let result = inspect_identity(&runner, "docker", "bad");
+        assert!(result.is_err(), "malformed JSON should error");
+        let Err(err) = result else {
+            std::process::abort();
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("cannot parse service inspect"), "error message: {msg}");
     }
 }

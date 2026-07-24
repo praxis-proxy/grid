@@ -1,0 +1,10 @@
+{
+  "model": "sim-model-v1",
+  "messages": [
+    {
+      "role": "user",
+      "content": "hello"
+    }
+  ],
+  "max_tokens": 64
+}

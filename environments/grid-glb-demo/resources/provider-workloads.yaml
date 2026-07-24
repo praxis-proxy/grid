@@ -1,0 +1,53 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mock-inference
+  namespace: grid-system
+  labels:
+    app.kubernetes.io/name: mock-inference
+    app.kubernetes.io/part-of: grid-glb-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mock-inference
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mock-inference
+    spec:
+      containers:
+        - name: mock-inference
+          image: "ghcr.io/praxis-proxy/mock-providers:sha-PLACEHOLDER"
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mock-inference
+  namespace: grid-system
+  labels:
+    app.kubernetes.io/name: mock-inference
+    app.kubernetes.io/part-of: grid-glb-demo
+spec:
+  selector:
+    app.kubernetes.io/name: mock-inference
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
