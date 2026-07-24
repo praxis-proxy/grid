@@ -70,7 +70,7 @@ spec:
     edge-demo:
       description: Grid network and edge site for GLB control plane
       steps:
-        - type: manifest
+        - type: template-manifest
           path: resources/gridnetwork.yaml
         - type: manifest
           path: resources/edge-site.yaml
@@ -102,3 +102,10 @@ spec:
           path: resources/provider-workloads.yaml
         - type: manifest
           path: resources/provider-gateway.yaml
+        - type: capture
+          resource: svc/provider-gateway
+          namespace: grid-system
+          jsonpath: "{.status.loadBalancer.ingress[0].ip}"
+          key: provider-gateway-ip
+          timeout: "60s"
+          interval: "2s"

@@ -431,6 +431,27 @@ pub enum StepSpec {
         /// Upstream resolver addresses.
         upstreams: Vec<String>,
     },
+    /// Capture a kubectl jsonpath result into Forge state.
+    Capture {
+        /// Resource to query (e.g. `svc/provider-gateway`).
+        resource: String,
+        /// Namespace for the kubectl query.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        namespace: Option<String>,
+        /// kubectl jsonpath expression (e.g. `{.status.loadBalancer.ingress[0].ip}`).
+        jsonpath: String,
+        /// Key to store the captured value under in state.
+        key: String,
+        /// Maximum time to wait for a non-empty value.
+        timeout: String,
+        /// Interval between capture attempts.
+        interval: String,
+    },
+    /// Apply a local manifest file with template rendering.
+    TemplateManifest {
+        /// Path relative to the config root.
+        path: String,
+    },
 }
 
 // ---------------------------------------------------------------

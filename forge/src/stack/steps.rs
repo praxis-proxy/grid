@@ -221,6 +221,24 @@ pub fn docker_network_inspect(binary: &str, network: &str) -> CommandSpec {
     }
 }
 
+/// Build a `kubectl get` command with jsonpath output for value capture.
+pub fn kubectl_get_jsonpath(context: &str, resource: &str, namespace: Option<&str>, jsonpath: &str) -> CommandSpec {
+    let mut args: Vec<std::ffi::OsString> = vec!["--context".into(), context.into(), "get".into(), resource.into()];
+    if let Some(ns) = namespace {
+        args.push("-n".into());
+        args.push(ns.into());
+    }
+    args.push("-o".into());
+    args.push(format!("jsonpath={jsonpath}").into());
+    CommandSpec {
+        program: "kubectl".into(),
+        args,
+        env: BTreeMap::default(),
+        stdin: None,
+        redact: Vec::new(),
+    }
+}
+
 /// Build a `kubectl get configmap` command to read the `CoreDNS` Corefile.
 pub fn kubectl_get_corefile(context: &str) -> CommandSpec {
     CommandSpec {
@@ -839,6 +857,44 @@ mod tests {
         assert!(joined.contains("nc"), "should use nc: {joined}");
         assert!(joined.contains("10.0.0.1"), "should have target: {joined}");
         assert!(joined.contains("443"), "should have port: {joined}");
+    }
+
+    #[test]
+    fn kubectl_get_jsonpath_builds_correct_command() {
+        let spec = kubectl_get_jsonpath(
+            "kind-forge-hub",
+            "svc/provider-gateway",
+            Some("grid-system"),
+            "{.status.loadBalancer.ingress[0].ip}",
+        );
+        assert_eq!(spec.program, "kubectl", "program should be kubectl");
+        let args: Vec<String> = spec.args.iter().map(|a| a.to_string_lossy().into_owned()).collect();
+        let joined = args.join(" ");
+        assert!(
+            joined.contains("--context kind-forge-hub"),
+            "should have context: {joined}"
+        );
+        assert!(
+            joined.contains("get svc/provider-gateway"),
+            "should get resource: {joined}"
+        );
+        assert!(joined.contains("-n grid-system"), "should have namespace: {joined}");
+        assert!(
+            joined.contains("jsonpath={.status.loadBalancer.ingress[0].ip}"),
+            "should have jsonpath output: {joined}"
+        );
+    }
+
+    #[test]
+    fn kubectl_get_jsonpath_omits_namespace_when_none() {
+        let spec = kubectl_get_jsonpath("kind-forge-hub", "svc/web", None, "{.spec.clusterIP}");
+        let args: Vec<String> = spec.args.iter().map(|a| a.to_string_lossy().into_owned()).collect();
+        let joined = args.join(" ");
+        assert!(!joined.contains("-n "), "should not have namespace flag: {joined}");
+        assert!(
+            joined.contains("jsonpath={.spec.clusterIP}"),
+            "should have jsonpath: {joined}"
+        );
     }
 
     #[test]

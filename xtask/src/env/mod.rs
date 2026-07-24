@@ -4171,10 +4171,6 @@ fn env_verify_site_join_discovery(config: &Path) -> Result<(), Box<dyn std::erro
     clippy::too_many_lines,
     reason = "sequential 10-step failover + recovery proof: gateways, operators, SWIM, shared-model overlay ordering, route-away, rejoin, recovery"
 )]
-#[expect(
-    clippy::large_stack_frames,
-    reason = "gateway deploy + SWIM operator lifecycle + consumer port-forward state in one function"
-)]
 fn env_verify_failover_under_lost_peer(config: &Path) -> Result<(), Box<dyn std::error::Error>> {
     use operator::{
         CONFIGMAP_POLL_TIMEOUT, FAILOVER_EAST_PROVIDER, FAILOVER_GW, FAILOVER_LOCAL_MODEL, FAILOVER_NETWORK,

@@ -6,6 +6,7 @@
 pub mod lock;
 
 use std::{
+    collections::BTreeMap,
     io::Write as _,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
@@ -56,6 +57,9 @@ pub struct ForgeState {
     /// Description of the last mutation operation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_operation: Option<LastOperation>,
+    /// Values captured from stack steps, keyed by cluster then key.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub captures: BTreeMap<String, BTreeMap<String, String>>,
 }
 
 /// State of one managed KIND cluster.
@@ -233,6 +237,7 @@ pub fn empty() -> ForgeState {
         runtime: None,
         config_digest: None,
         last_operation: None,
+        captures: BTreeMap::new(),
     }
 }
 

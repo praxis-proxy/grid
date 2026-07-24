@@ -87,8 +87,9 @@ their images are not published.
 
 ### 3. Apply provider stacks
 
-Apply stacks to provider clusters first so their LoadBalancer IPs are
-available before configuring the edge:
+Apply stacks to provider clusters first. The `inference-sim` stack
+waits for the `provider-gateway` LoadBalancer Service to receive an IP,
+then captures it into Forge state automatically:
 
 ```console
 praxis-forge stack apply provider-east --config environments/grid-glb-demo/forge.yaml
@@ -97,47 +98,20 @@ praxis-forge stack apply provider-west --config environments/grid-glb-demo/forge
 
 This installs Gateway API CRDs, MetalLB, the Grid operator, provider
 Grid CRDs, mock-inference Deployments, and the `provider-gateway`
-LoadBalancer Service on each provider cluster.
+LoadBalancer Service on each provider cluster. The captured IPs are
+stored in `.forge/state.json` for use by downstream stacks.
 
-### 4. Discover provider gateway IPs
-
-After MetalLB assigns addresses, retrieve the LoadBalancer IPs:
-
-```console
-kubectl --context kind-grid-glb-provider-east get svc -n grid-system provider-gateway \
-  -o jsonpath='{.status.loadBalancer.ingress[0].ip}'
-
-kubectl --context kind-grid-glb-provider-west get svc -n grid-system provider-gateway \
-  -o jsonpath='{.status.loadBalancer.ingress[0].ip}'
-```
-
-### 5. Wire GridNetwork endpoints
-
-Edit `resources/gridnetwork.yaml` and replace the placeholder addresses
-with the discovered IPs:
-
-```yaml
-clusterEndpoints:
-  - cluster: provider-east
-    address: "<east-ip>:8080"
-    transport:
-      mode: plaintext
-  - cluster: provider-west
-    address: "<west-ip>:8080"
-    transport:
-      mode: plaintext
-```
-
-### 6. Apply edge-control stacks
+### 4. Apply edge-control stacks
 
 ```console
 praxis-forge stack apply edge-control --config environments/grid-glb-demo/forge.yaml
 ```
 
-This installs the Grid operator, GridNetwork (with wired endpoints),
-edge GridSite, and access policies on the edge-control cluster.
+The `edge-demo` stack uses `template-manifest` to render
+`gridnetwork.yaml` with the captured provider gateway IPs. No manual
+YAML editing is required.
 
-### 7. Verify cluster status
+### 5. Verify cluster status
 
 ```console
 praxis-forge status --config environments/grid-glb-demo/forge.yaml
@@ -145,9 +119,10 @@ praxis-forge status --config environments/grid-glb-demo/forge.yaml
 
 All three clusters should show `phase=running, live`.
 
-### 8. Verify provider gateway reachability
+### 6. Verify provider gateway reachability
 
-From the Docker host, confirm the provider gateways respond:
+From the Docker host, confirm the provider gateways respond (IPs
+are in `.forge/state.json` under `captures`):
 
 ```console
 curl -s http://<east-ip>:8080/health

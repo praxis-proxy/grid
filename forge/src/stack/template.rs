@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use crate::error::ForgeError;
 
 /// Maximum rendered string size from one template field.
-const MAX_RENDERED_TEMPLATE_BYTES: usize = 8192;
+pub const MAX_RENDERED_TEMPLATE_BYTES: usize = 8192;
 
 // -------------------------------------------------------------
 // Context
@@ -28,6 +28,8 @@ pub struct TemplateContext {
     pub item: Option<serde_json::Value>,
     /// Network variables (resolves `network.dnsZone`, `network.pool`).
     pub network: Option<NetworkTemplateVars>,
+    /// Captured values from stack steps (resolves `captures.CLUSTER.KEY`).
+    pub captures: BTreeMap<String, BTreeMap<String, String>>,
 }
 
 /// Network-related template variables.
@@ -49,8 +51,25 @@ pub struct NetworkTemplateVars {
 ///
 /// Returns [`ForgeError::Config`] if a variable path cannot be
 /// resolved against the context.
-#[expect(clippy::string_slice, reason = "{{ and }} are ASCII; find returns byte boundaries")]
 pub fn render(template: &str, ctx: &TemplateContext) -> Result<String, ForgeError> {
+    render_with_limit(template, ctx, MAX_RENDERED_TEMPLATE_BYTES)
+}
+
+/// Render all `{{ ... }}` expressions with a caller-supplied size limit.
+///
+/// Use this for whole-file templates where the normal field-sized limit is too
+/// small, but the caller still needs bounded expansion.
+///
+/// # Errors
+///
+/// Returns [`ForgeError::Config`] if a variable path cannot be resolved against
+/// the context or if the rendered output exceeds `max_rendered_bytes`.
+#[expect(clippy::string_slice, reason = "{{ and }} are ASCII; find returns byte boundaries")]
+pub fn render_with_limit(
+    template: &str,
+    ctx: &TemplateContext,
+    max_rendered_bytes: usize,
+) -> Result<String, ForgeError> {
     let mut result = String::with_capacity(template.len());
     let mut rest = template;
     while let Some(start) = rest.find("{{") {
@@ -60,21 +79,21 @@ pub fn render(template: &str, ctx: &TemplateContext) -> Result<String, ForgeErro
         let var_path = after_open[..end].trim();
         let value = resolve_variable(var_path, ctx)?;
         result.push_str(&value);
-        check_rendered_size(&result)?;
+        check_rendered_size(&result, max_rendered_bytes)?;
         rest = &after_open[end + 2..];
     }
     result.push_str(rest);
-    check_rendered_size(&result)?;
+    check_rendered_size(&result, max_rendered_bytes)?;
     Ok(result)
 }
 
 /// Enforce a bounded rendered string size.
-fn check_rendered_size(value: &str) -> Result<(), ForgeError> {
-    if value.len() <= MAX_RENDERED_TEMPLATE_BYTES {
+fn check_rendered_size(value: &str, max_rendered_bytes: usize) -> Result<(), ForgeError> {
+    if value.len() <= max_rendered_bytes {
         return Ok(());
     }
     Err(ForgeError::Config(format!(
-        "rendered template exceeds {MAX_RENDERED_TEMPLATE_BYTES} bytes"
+        "rendered template exceeds {max_rendered_bytes} bytes"
     )))
 }
 
@@ -98,6 +117,7 @@ fn resolve_variable(path: &str, ctx: &TemplateContext) -> Result<String, ForgeEr
         "stack" => resolve_stack(&parts, ctx),
         "item" => resolve_item(&parts, ctx),
         "network" => resolve_network(&parts, ctx),
+        "captures" => resolve_captures(&parts, ctx),
         _ => Err(ForgeError::Config(format!(
             "unknown template variable root '{root}' in '{path}'"
         ))),
@@ -169,6 +189,25 @@ fn resolve_network(parts: &[&str], ctx: &TemplateContext) -> Result<String, Forg
     }
 }
 
+/// Resolve `captures.CLUSTER.KEY`.
+fn resolve_captures(parts: &[&str], ctx: &TemplateContext) -> Result<String, ForgeError> {
+    let cluster = parts.get(1).copied().unwrap_or_default();
+    let key = parts.get(2).copied().unwrap_or_default();
+    if cluster.is_empty() || key.is_empty() {
+        return Err(ForgeError::Config(
+            "captures requires captures.CLUSTER.KEY syntax".to_owned(),
+        ));
+    }
+    let cluster_caps = ctx
+        .captures
+        .get(cluster)
+        .ok_or_else(|| ForgeError::Config(format!("no captures found for cluster '{cluster}'")))?;
+    cluster_caps
+        .get(key)
+        .cloned()
+        .ok_or_else(|| ForgeError::Config(format!("capture key '{key}' not found for cluster '{cluster}'")))
+}
+
 /// Walk into a JSON value following dot-separated path segments.
 fn navigate_value(val: &serde_json::Value, segments: &[&str]) -> Result<String, ForgeError> {
     if segments.is_empty() {
@@ -220,6 +259,7 @@ mod tests {
             ]),
             item: None,
             network: None,
+            captures: BTreeMap::new(),
         }
     }
 
@@ -270,6 +310,49 @@ mod tests {
         );
         let result = render("{{ cluster.properties.large }}", &ctx);
         assert!(result.is_err(), "oversized rendered template should fail");
+    }
+
+    #[test]
+    fn render_with_limit_allows_larger_manifest_templates() {
+        let ctx = test_ctx();
+        let template = format!("{}{{{{ cluster.name }}}}", "x".repeat(MAX_RENDERED_TEMPLATE_BYTES));
+        let result = render_with_limit(&template, &ctx, MAX_RENDERED_TEMPLATE_BYTES.saturating_add(16))
+            .unwrap_or_else(|_| std::process::abort());
+        assert!(
+            result.ends_with("hub"),
+            "should render with caller-supplied larger limit"
+        );
+    }
+
+    #[test]
+    fn render_captures_resolves_cross_cluster() {
+        let mut ctx = test_ctx();
+        ctx.captures = BTreeMap::from([(
+            "provider-east".to_owned(),
+            BTreeMap::from([("provider-gateway-ip".to_owned(), "172.18.255.200".to_owned())]),
+        )]);
+        let result =
+            render("{{ captures.provider-east.provider-gateway-ip }}", &ctx).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(result, "172.18.255.200", "should resolve captured value");
+    }
+
+    #[test]
+    fn render_captures_missing_cluster_fails() {
+        let ctx = test_ctx();
+        assert!(
+            render("{{ captures.unknown-cluster.key }}", &ctx).is_err(),
+            "unknown cluster should fail"
+        );
+    }
+
+    #[test]
+    fn render_captures_missing_key_fails() {
+        let mut ctx = test_ctx();
+        ctx.captures = BTreeMap::from([("provider-east".to_owned(), BTreeMap::new())]);
+        assert!(
+            render("{{ captures.provider-east.missing }}", &ctx).is_err(),
+            "missing key should fail"
+        );
     }
 
     #[test]

@@ -530,14 +530,10 @@ fn check_stack_steps(config: &ForgeConfig) -> Result<(), ForgeError> {
 fn check_step(stack_name: &str, step: &StepSpec) -> Result<(), ForgeError> {
     match step {
         StepSpec::Url { url, sha256 } => check_url_step(stack_name, url, sha256),
-        StepSpec::Manifest { path } | StepSpec::Kustomize { path } => check_step_path(stack_name, path),
-        StepSpec::Helm {
-            release,
-            chart,
-            version,
-            namespace,
-            values: _,
-        } => check_helm_step(stack_name, release, chart, version, namespace.as_deref()),
+        StepSpec::Manifest { path } | StepSpec::Kustomize { path } | StepSpec::TemplateManifest { path } => {
+            check_step_path(stack_name, path)
+        },
+        StepSpec::Helm { .. } => check_helm_step(stack_name, step),
         StepSpec::Deployment {
             name,
             image,
@@ -556,7 +552,34 @@ fn check_step(stack_name: &str, step: &StepSpec) -> Result<(), ForgeError> {
         StepSpec::ForEach { property, steps } => check_for_each_step(stack_name, property, steps),
         StepSpec::MetallbAutoPool { name } => check_named_resource_step(stack_name, "metallb pool", name, None),
         StepSpec::CoreDnsForward { zone, upstreams } => check_coredns_forward_step(stack_name, zone, upstreams),
+        StepSpec::Capture { .. } => check_capture_step(stack_name, step),
     }
+}
+
+/// Validate a capture step.
+fn check_capture_step(stack_name: &str, step: &StepSpec) -> Result<(), ForgeError> {
+    let StepSpec::Capture {
+        resource,
+        namespace,
+        jsonpath,
+        key,
+        timeout,
+        interval,
+    } = step
+    else {
+        return Ok(());
+    };
+    check_non_blank(resource, &format!("stack {stack_name:?}: capture resource"))?;
+    check_non_blank(jsonpath, &format!("stack {stack_name:?}: capture jsonpath"))?;
+    check_non_blank(key, &format!("stack {stack_name:?}: capture key"))?;
+    check_duration_string(timeout, &format!("stack {stack_name:?}: capture timeout"))?;
+    check_duration_string(interval, &format!("stack {stack_name:?}: capture interval"))?;
+    if key.contains('.') {
+        return Err(ForgeError::Validation(format!(
+            "stack {stack_name:?}: capture key must not contain dots"
+        )));
+    }
+    check_optional_namespace(stack_name, namespace.as_deref())
 }
 
 /// Validate a manifest or kustomize step path.
@@ -680,17 +703,21 @@ fn check_relative_path(path: &str, context: &str) -> Result<(), ForgeError> {
 }
 
 /// Validate a Helm step.
-fn check_helm_step(
-    stack_name: &str,
-    release: &str,
-    chart: &str,
-    version: &str,
-    namespace: Option<&str>,
-) -> Result<(), ForgeError> {
+fn check_helm_step(stack_name: &str, step: &StepSpec) -> Result<(), ForgeError> {
+    let StepSpec::Helm {
+        release,
+        chart,
+        version,
+        namespace,
+        ..
+    } = step
+    else {
+        return Ok(());
+    };
     check_dns_label(release, &format!("stack {stack_name:?}: helm release"))?;
     check_non_blank(chart, &format!("stack {stack_name:?}: helm chart"))?;
     check_non_blank(version, &format!("stack {stack_name:?}: helm version"))?;
-    check_optional_namespace(stack_name, namespace)
+    check_optional_namespace(stack_name, namespace.as_deref())
 }
 
 /// Validate a resource step with a Kubernetes-style name.
@@ -1755,6 +1782,124 @@ spec:
             cross_cluster: true,
             dns_zone: None,
         });
+        validate(&config).unwrap_or_else(|_e| {
+            std::process::abort();
+        });
+    }
+
+    #[test]
+    fn capture_step_rejects_blank_resource() {
+        let mut config = base_config();
+        config.spec.stacks.insert(
+            "base".to_owned(),
+            StackSpec {
+                description: None,
+                steps: vec![StepSpec::Capture {
+                    resource: String::new(),
+                    namespace: None,
+                    jsonpath: "{.spec}".to_owned(),
+                    key: "k".to_owned(),
+                    timeout: "1s".to_owned(),
+                    interval: "1ms".to_owned(),
+                }],
+            },
+        );
+        assert!(validate(&config).is_err(), "capture should reject blank resource");
+    }
+
+    #[test]
+    fn capture_step_rejects_blank_jsonpath() {
+        let mut config = base_config();
+        config.spec.stacks.insert(
+            "base".to_owned(),
+            StackSpec {
+                description: None,
+                steps: vec![StepSpec::Capture {
+                    resource: "svc/web".to_owned(),
+                    namespace: None,
+                    jsonpath: String::new(),
+                    key: "k".to_owned(),
+                    timeout: "1s".to_owned(),
+                    interval: "1ms".to_owned(),
+                }],
+            },
+        );
+        assert!(validate(&config).is_err(), "capture should reject blank jsonpath");
+    }
+
+    #[test]
+    fn capture_step_rejects_key_with_dots() {
+        let mut config = base_config();
+        config.spec.stacks.insert(
+            "base".to_owned(),
+            StackSpec {
+                description: None,
+                steps: vec![StepSpec::Capture {
+                    resource: "svc/web".to_owned(),
+                    namespace: None,
+                    jsonpath: "{.spec}".to_owned(),
+                    key: "bad.key".to_owned(),
+                    timeout: "1s".to_owned(),
+                    interval: "1ms".to_owned(),
+                }],
+            },
+        );
+        assert!(validate(&config).is_err(), "capture should reject key with dots");
+    }
+
+    #[test]
+    fn capture_step_valid_passes() {
+        let mut config = base_config();
+        config.spec.stacks.insert(
+            "base".to_owned(),
+            StackSpec {
+                description: None,
+                steps: vec![StepSpec::Capture {
+                    resource: "svc/provider-gateway".to_owned(),
+                    namespace: Some("grid-system".to_owned()),
+                    jsonpath: "{.status.loadBalancer.ingress[0].ip}".to_owned(),
+                    key: "provider-gateway-ip".to_owned(),
+                    timeout: "1s".to_owned(),
+                    interval: "1ms".to_owned(),
+                }],
+            },
+        );
+        validate(&config).unwrap_or_else(|_e| {
+            std::process::abort();
+        });
+    }
+
+    #[test]
+    fn template_manifest_validates_path() {
+        let mut config = base_config();
+        config.spec.stacks.insert(
+            "base".to_owned(),
+            StackSpec {
+                description: None,
+                steps: vec![StepSpec::TemplateManifest {
+                    path: "../escape.yaml".to_owned(),
+                }],
+            },
+        );
+        let Err(err) = validate(&config) else {
+            std::process::abort();
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("escape"), "should reject path escape: {msg}");
+    }
+
+    #[test]
+    fn template_manifest_valid_passes() {
+        let mut config = base_config();
+        config.spec.stacks.insert(
+            "base".to_owned(),
+            StackSpec {
+                description: None,
+                steps: vec![StepSpec::TemplateManifest {
+                    path: "resources/gridnetwork.yaml".to_owned(),
+                }],
+            },
+        );
         validate(&config).unwrap_or_else(|_e| {
             std::process::abort();
         });

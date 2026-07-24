@@ -140,11 +140,12 @@ fn apply_one(
     let digest = stack_digest(spec).ok();
     upsert_stack_state(st, name, &cluster.name, StackPhase::Applying, digest.as_deref());
     let network = build_network_params(ctx, cluster, st);
-    match engine::apply_stack(ctx, cluster, name, spec, network.as_ref()) {
+    match engine::apply_stack(ctx, cluster, name, spec, network.as_ref(), &st.captures) {
         Ok(r) => {
             if let Some(alloc) = &r.pool_allocation {
                 record_pool_allocation(st, &cluster.name, alloc);
             }
+            record_captures(st, &cluster.name, &r.captures);
             upsert_stack_state(st, name, &cluster.name, StackPhase::Applied, digest.as_deref());
             ApplyResult {
                 name: name.to_owned(),
@@ -313,6 +314,17 @@ fn record_pool_allocation(st: &mut state::ForgeState, cluster: &str, alloc: &eng
                 range: alloc.range.clone(),
             });
         }
+    }
+}
+
+/// Merge captured values from a stack apply into persisted state.
+fn record_captures(st: &mut state::ForgeState, cluster: &str, captures: &std::collections::BTreeMap<String, String>) {
+    if captures.is_empty() {
+        return;
+    }
+    let entry = st.captures.entry(cluster.to_owned()).or_default();
+    for (key, value) in captures {
+        entry.insert(key.clone(), value.clone());
     }
 }
 
@@ -518,6 +530,8 @@ fn step_type_label(step: &crate::config::StepSpec) -> &'static str {
         crate::config::StepSpec::ForEach { .. } => "for-each",
         crate::config::StepSpec::MetallbAutoPool { .. } => "metallb-auto-pool",
         crate::config::StepSpec::CoreDnsForward { .. } => "core-dns-forward",
+        crate::config::StepSpec::Capture { .. } => "capture",
+        crate::config::StepSpec::TemplateManifest { .. } => "template-manifest",
     }
 }
 
@@ -537,6 +551,8 @@ fn step_description(step: &crate::config::StepSpec) -> String {
         crate::config::StepSpec::ForEach { property, steps } => format!("for-each {property} ({} steps)", steps.len()),
         crate::config::StepSpec::MetallbAutoPool { name } => format!("metallb pool {name}"),
         crate::config::StepSpec::CoreDnsForward { zone, .. } => format!("coredns forward {zone}"),
+        crate::config::StepSpec::Capture { key, resource, .. } => format!("capture {key} from {resource}"),
+        crate::config::StepSpec::TemplateManifest { path } => format!("template-apply {path}"),
     }
 }
 

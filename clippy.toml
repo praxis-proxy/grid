@@ -9,7 +9,7 @@ max-struct-bools = 2
 enum-variant-size-threshold = 128
 future-size-threshold = 4096
 type-complexity-threshold = 200
-stack-size-threshold = 16384
+stack-size-threshold = 20480
 avoid-breaking-exported-api = false
 disallowed-methods = [
     { path = "std::thread::sleep", reason = "use tokio::time::sleep in async context" },

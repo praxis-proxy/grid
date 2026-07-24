@@ -11,6 +11,11 @@ use sha2::Digest as _;
 /// Maximum items expanded by a single for-each step.
 const MAX_FOREACH_ITEMS: usize = 256;
 
+use std::{
+    collections::BTreeMap,
+    time::{Duration, Instant},
+};
+
 use crate::{
     cluster::kind,
     command::runner::CommandRunner,
@@ -38,6 +43,8 @@ pub struct StackResult {
     pub steps_executed: usize,
     /// Newly computed `MetalLB` pool, if allocated during execution.
     pub pool_allocation: Option<PoolAllocation>,
+    /// Values captured during execution.
+    pub captures: BTreeMap<String, String>,
 }
 
 /// A newly computed `MetalLB` pool allocation.
@@ -82,6 +89,8 @@ pub struct StepContext {
     pub cluster_count: usize,
     /// Pool allocation computed during this execution.
     pub pool_allocation: Option<PoolAllocation>,
+    /// Values captured during this execution.
+    pub pending_captures: BTreeMap<String, String>,
 }
 
 // -------------------------------------------------------------
@@ -96,22 +105,28 @@ pub struct StepContext {
 /// # Errors
 ///
 /// Returns [`ForgeError`] if any step fails.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "captures needed for cross-stack template rendering"
+)]
 pub fn apply_stack(
     ctx: &ForgeContext<'_>,
     cluster: &ClusterSpec,
     stack_name: &str,
     stack: &StackSpec,
     network: Option<&NetworkParams<'_>>,
+    captures: &BTreeMap<String, BTreeMap<String, String>>,
 ) -> Result<StackResult, ForgeError> {
     let mut sc = build_step_context(ctx, cluster, network)?;
     precompute_pool_if_needed(ctx.runner, &mut sc)?;
-    let tpl = build_template_context(cluster, stack_name, network, sc.cluster_pool.as_deref());
+    let tpl = build_template_context(cluster, stack_name, network, sc.cluster_pool.as_deref(), captures);
     let count = execute_steps(ctx.runner, &stack.steps, &tpl, &mut sc)?;
     Ok(StackResult {
         name: stack_name.to_owned(),
         cluster: cluster.name.clone(),
         steps_executed: count,
         pool_allocation: sc.pool_allocation,
+        captures: sc.pending_captures,
     })
 }
 
@@ -125,6 +140,7 @@ fn build_template_context(
     stack_name: &str,
     network: Option<&NetworkParams<'_>>,
     pool: Option<&str>,
+    captures: &BTreeMap<String, BTreeMap<String, String>>,
 ) -> TemplateContext {
     TemplateContext {
         cluster_name: cluster.name.clone(),
@@ -135,6 +151,7 @@ fn build_template_context(
             dns_zone: n.dns_zone.to_owned(),
             pool: pool.map(ToOwned::to_owned),
         }),
+        captures: captures.clone(),
     }
 }
 
@@ -145,7 +162,7 @@ fn build_step_context(
     network: Option<&NetworkParams<'_>>,
 ) -> Result<StepContext, ForgeError> {
     let env_name = &ctx.config.metadata.name;
-    let kind_name = kind::kind_cluster_name(env_name, &cluster.name);
+    let kind_name = kind::kind_cluster_name(&ctx.config.spec.runtime.cluster_prefix, &cluster.name);
     let kube_ctx = kind::kubectl_context(&kind_name);
     let resolved = runtime::resolve(ctx.runner, &ctx.config.spec.runtime.provider)?;
     let wants_cross = ctx.config.spec.network.as_ref().is_some_and(|n| n.cross_cluster);
@@ -162,6 +179,7 @@ fn build_step_context(
         cluster_index: network.map_or(0, |n| n.cluster_index),
         cluster_count: network.map_or(1, |n| n.cluster_count),
         pool_allocation: None,
+        pending_captures: BTreeMap::new(),
     })
 }
 
@@ -232,6 +250,8 @@ fn execute_step(
         StepSpec::ForEach { property, steps: sub } => execute_foreach(runner, property, sub, tpl, sc),
         StepSpec::MetallbAutoPool { name } => execute_metallb(runner, name, sc).map(|()| 1),
         StepSpec::CoreDnsForward { .. } => execute_coredns_forward(runner, step, sc).map(|()| 1),
+        StepSpec::Capture { .. } => execute_capture(runner, step, sc).map(|()| 1),
+        StepSpec::TemplateManifest { path } => execute_template_manifest(runner, path, tpl, sc).map(|()| 1),
     }
 }
 
@@ -340,6 +360,77 @@ fn execute_exec(runner: &dyn CommandRunner, command: &[String]) -> Result<(), Fo
     let spec = steps::exec_spec(command)?;
     let output = runner.run(&spec)?;
     steps::check_success(&output, "exec")
+}
+
+/// Capture a kubectl jsonpath result into pending state.
+fn execute_capture(runner: &dyn CommandRunner, step: &StepSpec, sc: &mut StepContext) -> Result<(), ForgeError> {
+    let StepSpec::Capture {
+        resource,
+        namespace,
+        jsonpath,
+        key,
+        timeout,
+        interval,
+    } = step
+    else {
+        return Err(ForgeError::Config("expected Capture step".to_owned()));
+    };
+    let timeout = crate::service::health::parse_duration(timeout)?;
+    let interval = crate::service::health::parse_duration(interval)?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        let value = run_capture_attempt(runner, sc, resource, namespace.as_deref(), jsonpath)?;
+        if !value.is_empty() {
+            sc.pending_captures.insert(key.to_owned(), value);
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(ForgeError::Command {
+                program: "kubectl get".to_owned(),
+                message: format!("capture key '{key}': empty result from jsonpath '{jsonpath}' before timeout"),
+            });
+        }
+        sleep_capture_interval(interval);
+    }
+}
+
+/// Run one kubectl/jsonpath capture attempt.
+fn run_capture_attempt(
+    runner: &dyn CommandRunner,
+    sc: &StepContext,
+    resource: &str,
+    namespace: Option<&str>,
+    jsonpath: &str,
+) -> Result<String, ForgeError> {
+    let spec = steps::kubectl_get_jsonpath(&sc.kube_context, resource, namespace, jsonpath);
+    let output = runner.run(&spec)?;
+    steps::check_success(&output, "kubectl get")?;
+    Ok(output.stdout.trim().to_owned())
+}
+
+/// Sleep between capture attempts.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "forge is synchronous; capture polling has no async runtime"
+)]
+fn sleep_capture_interval(interval: Duration) {
+    std::thread::sleep(interval);
+}
+
+/// Apply a local manifest file after rendering template expressions.
+fn execute_template_manifest(
+    runner: &dyn CommandRunner,
+    path: &str,
+    tpl: &TemplateContext,
+    sc: &StepContext,
+) -> Result<(), ForgeError> {
+    let resolved = resolve_path(&sc.config_dir, path)?;
+    let content = std::fs::read_to_string(&resolved)
+        .map_err(|e| ForgeError::Config(format!("cannot read template manifest '{path}': {e}")))?;
+    let rendered = template::render_with_limit(&content, tpl, steps::MAX_REMOTE_MANIFEST_BYTES)?;
+    let spec = steps::kubectl_stdin_apply(&sc.kube_context, rendered.as_bytes());
+    let output = runner.run(&spec)?;
+    steps::check_success(&output, "kubectl apply")
 }
 
 /// Expand a for-each loop over a cluster property array.
@@ -489,16 +580,11 @@ fn restart_coredns(runner: &dyn CommandRunner, context: &str) -> Result<(), Forg
 /// Render template expressions in a step's string fields.
 fn render_step(step: &StepSpec, tpl: &TemplateContext) -> Result<StepSpec, ForgeError> {
     match step {
-        StepSpec::Url { url, sha256 } => Ok(StepSpec::Url {
-            url: template::render(url, tpl)?,
-            sha256: sha256.clone(),
-        }),
-        StepSpec::Manifest { path } => Ok(StepSpec::Manifest {
-            path: template::render(path, tpl)?,
-        }),
-        StepSpec::Kustomize { path } => Ok(StepSpec::Kustomize {
-            path: template::render(path, tpl)?,
-        }),
+        StepSpec::Url { url, sha256 } => render_url_step(url, sha256, tpl),
+        StepSpec::Manifest { path } => render_path(path, tpl).map(|p| StepSpec::Manifest { path: p }),
+        StepSpec::Kustomize { path } => render_path(path, tpl).map(|p| StepSpec::Kustomize { path: p }),
+        StepSpec::TemplateManifest { path } => render_path(path, tpl).map(|p| StepSpec::TemplateManifest { path: p }),
+        StepSpec::MetallbAutoPool { name } => render_path(name, tpl).map(|n| StepSpec::MetallbAutoPool { name: n }),
         StepSpec::Helm { .. } => render_helm_step(step, tpl),
         StepSpec::Deployment { .. } => render_deployment_step(step, tpl),
         StepSpec::Service { name, port, namespace } => render_service_step(name, *port, namespace, tpl),
@@ -506,15 +592,54 @@ fn render_step(step: &StepSpec, tpl: &TemplateContext) -> Result<StepSpec, Forge
         StepSpec::Exec { command } => Ok(StepSpec::Exec {
             command: render_vec(command, tpl)?,
         }),
-        StepSpec::ForEach { property, steps: sub } => Ok(StepSpec::ForEach {
-            property: template::render(property, tpl)?,
-            steps: sub.clone(),
-        }),
-        StepSpec::MetallbAutoPool { name } => Ok(StepSpec::MetallbAutoPool {
-            name: template::render(name, tpl)?,
-        }),
+        StepSpec::ForEach { property, steps: sub } => render_foreach_step(property, sub, tpl),
         StepSpec::CoreDnsForward { .. } => render_coredns_forward_step(step, tpl),
+        StepSpec::Capture { .. } => render_capture_step(step, tpl),
     }
+}
+
+/// Render a single template string field.
+fn render_path(value: &str, tpl: &TemplateContext) -> Result<String, ForgeError> {
+    template::render(value, tpl)
+}
+
+/// Render a URL step's url field (sha256 is passed through).
+fn render_url_step(url: &str, sha256: &str, tpl: &TemplateContext) -> Result<StepSpec, ForgeError> {
+    Ok(StepSpec::Url {
+        url: template::render(url, tpl)?,
+        sha256: sha256.to_owned(),
+    })
+}
+
+/// Render a for-each step's property field.
+fn render_foreach_step(property: &str, sub: &[StepSpec], tpl: &TemplateContext) -> Result<StepSpec, ForgeError> {
+    Ok(StepSpec::ForEach {
+        property: template::render(property, tpl)?,
+        steps: sub.to_vec(),
+    })
+}
+
+/// Render templates in a capture step (resource and namespace only).
+fn render_capture_step(step: &StepSpec, tpl: &TemplateContext) -> Result<StepSpec, ForgeError> {
+    let StepSpec::Capture {
+        resource,
+        namespace,
+        jsonpath,
+        key,
+        timeout,
+        interval,
+    } = step
+    else {
+        return Err(ForgeError::Config("expected Capture step".to_owned()));
+    };
+    Ok(StepSpec::Capture {
+        resource: template::render(resource, tpl)?,
+        namespace: render_optional(namespace, tpl)?,
+        jsonpath: jsonpath.clone(),
+        key: key.clone(),
+        timeout: template::render(timeout, tpl)?,
+        interval: template::render(interval, tpl)?,
+    })
 }
 
 /// Render templates in a Helm step.
@@ -540,9 +665,9 @@ fn render_helm_step(step: &StepSpec, tpl: &TemplateContext) -> Result<StepSpec, 
 
 /// Render template expressions in Helm values recursively.
 fn render_values(
-    values: &std::collections::BTreeMap<String, serde_json::Value>,
+    values: &BTreeMap<String, serde_json::Value>,
     tpl: &TemplateContext,
-) -> Result<std::collections::BTreeMap<String, serde_json::Value>, ForgeError> {
+) -> Result<BTreeMap<String, serde_json::Value>, ForgeError> {
     values
         .iter()
         .map(|(key, value)| Ok((key.clone(), render_json_value(value, tpl)?)))
@@ -689,7 +814,14 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
-    use crate::command::runner::{CommandOutput, MockRunner};
+    use crate::{
+        command::runner::{CommandOutput, MockRunner},
+        config::{
+            API_VERSION, ClusterSpec, EnvironmentSpec, ForgeConfig, KIND, Metadata, NodeConfig, RuntimeConfig,
+            RuntimeProvider,
+        },
+        output::OutputFormat,
+    };
 
     fn ok_output() -> CommandOutput {
         CommandOutput {
@@ -709,6 +841,7 @@ mod tests {
             cluster_index: 0,
             cluster_count: 2,
             pool_allocation: None,
+            pending_captures: BTreeMap::new(),
         }
     }
 
@@ -719,7 +852,62 @@ mod tests {
             properties: BTreeMap::new(),
             item: None,
             network: None,
+            captures: BTreeMap::new(),
         }
+    }
+
+    /// Build a Forge context whose metadata name intentionally differs from
+    /// runtime.clusterPrefix, proving stack operations use the runtime prefix.
+    fn make_forge_context<'a>(runner: &'a dyn CommandRunner, config: &'a ForgeConfig) -> ForgeContext<'a> {
+        ForgeContext {
+            runner,
+            config,
+            state_dir: std::path::PathBuf::from("/tmp/state"),
+            config_dir: std::path::PathBuf::from("/tmp"),
+            format: OutputFormat::Text,
+            dry_run: false,
+        }
+    }
+
+    /// Build minimal config for step-context tests.
+    fn context_test_config() -> ForgeConfig {
+        ForgeConfig {
+            api_version: API_VERSION.to_owned(),
+            kind: KIND.to_owned(),
+            metadata: Metadata {
+                name: "env-name".to_owned(),
+            },
+            spec: EnvironmentSpec {
+                runtime: RuntimeConfig {
+                    provider: RuntimeProvider::Docker,
+                    cluster_prefix: "runtime-prefix".to_owned(),
+                },
+                network: None,
+                clusters: Vec::new(),
+                services: Vec::new(),
+                certificates: None,
+                stacks: BTreeMap::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn step_context_uses_runtime_cluster_prefix() {
+        let mut runner = MockRunner::new();
+        runner.respond("docker", ok_output());
+        let config = context_test_config();
+        let ctx = make_forge_context(&runner, &config);
+        let cluster = ClusterSpec {
+            name: "provider-east".to_owned(),
+            nodes: NodeConfig::default(),
+            stacks: Vec::new(),
+            properties: BTreeMap::new(),
+        };
+        let sc = build_step_context(&ctx, &cluster, None).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            sc.kube_context, "kind-runtime-prefix-provider-east",
+            "stack operations must use runtime.clusterPrefix, not metadata.name"
+        );
     }
 
     #[test]
@@ -837,6 +1025,7 @@ mod tests {
             properties: BTreeMap::from([("path".to_owned(), serde_json::json!("../escape.yaml"))]),
             item: None,
             network: None,
+            captures: BTreeMap::new(),
         };
         let steps = vec![StepSpec::Manifest {
             path: "{{ cluster.properties.path }}".to_owned(),
@@ -873,6 +1062,7 @@ mod tests {
             properties: BTreeMap::new(),
             item: None,
             network: None,
+            captures: BTreeMap::new(),
         };
         let step = StepSpec::Manifest {
             path: "{{ cluster.name }}/manifests".to_owned(),
@@ -1044,6 +1234,107 @@ mod tests {
         assert!(
             !zone_present("other.forge.test:53 { # forge.test:53", "forge.test"),
             "forge.test:53 as a non-first-token should not match"
+        );
+    }
+
+    #[test]
+    fn capture_step_stores_value() {
+        let mut runner = MockRunner::new();
+        runner.respond(
+            "kubectl",
+            CommandOutput {
+                status: 0,
+                stdout: "  172.18.255.200  ".to_owned(),
+                stderr: String::new(),
+            },
+        );
+        let mut sc = make_step_context();
+        let step = StepSpec::Capture {
+            resource: "svc/provider-gateway".to_owned(),
+            namespace: Some("grid-system".to_owned()),
+            jsonpath: "{.status.loadBalancer.ingress[0].ip}".to_owned(),
+            key: "provider-gateway-ip".to_owned(),
+            timeout: "1s".to_owned(),
+            interval: "1ms".to_owned(),
+        };
+        execute_capture(&runner, &step, &mut sc).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            sc.pending_captures.get("provider-gateway-ip").map(String::as_str),
+            Some("172.18.255.200"),
+            "should capture and trim IP"
+        );
+    }
+
+    #[test]
+    fn capture_step_rejects_empty_result() {
+        let mut runner = MockRunner::new();
+        runner.respond(
+            "kubectl",
+            CommandOutput {
+                status: 0,
+                stdout: "   ".to_owned(),
+                stderr: String::new(),
+            },
+        );
+        let mut sc = make_step_context();
+        let step = StepSpec::Capture {
+            resource: "svc/provider-gateway".to_owned(),
+            namespace: None,
+            jsonpath: "{.status.loadBalancer.ingress[0].ip}".to_owned(),
+            key: "gw-ip".to_owned(),
+            timeout: "1ms".to_owned(),
+            interval: "1ms".to_owned(),
+        };
+        let result = execute_capture(&runner, &step, &mut sc);
+        assert!(result.is_err(), "empty capture should fail");
+        assert!(sc.pending_captures.is_empty(), "should not store empty value");
+    }
+
+    #[test]
+    fn template_manifest_renders_and_applies() {
+        let dir = tempfile::tempdir().unwrap_or_else(|_| std::process::abort());
+        let manifest_path = dir.path().join("net.yaml");
+        std::fs::write(&manifest_path, "name: {{ cluster.name }}").unwrap_or_else(|_| std::process::abort());
+        let mut runner = MockRunner::new();
+        runner.respond("kubectl", ok_output());
+        let mut tpl = make_template_context();
+        tpl.cluster_name = "edge".to_owned();
+        let mut sc = make_step_context();
+        sc.config_dir = dir.path().to_path_buf();
+        execute_template_manifest(&runner, "net.yaml", &tpl, &sc).unwrap_or_else(|_| std::process::abort());
+        let calls = runner.calls();
+        let apply = calls.first().unwrap_or_else(|| std::process::abort());
+        let stdin_bytes = apply.stdin.as_deref().unwrap_or_else(|| std::process::abort());
+        let stdin_text = std::str::from_utf8(stdin_bytes).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            stdin_text, "name: edge",
+            "should render cluster.name in manifest content"
+        );
+    }
+
+    #[test]
+    fn template_manifest_renders_captures() {
+        let dir = tempfile::tempdir().unwrap_or_else(|_| std::process::abort());
+        let manifest_path = dir.path().join("gw.yaml");
+        std::fs::write(&manifest_path, "ip: {{ captures.provider-east.gw-ip }}:8080")
+            .unwrap_or_else(|_| std::process::abort());
+        let mut runner = MockRunner::new();
+        runner.respond("kubectl", ok_output());
+        let mut tpl = make_template_context();
+        tpl.captures = BTreeMap::from([(
+            "provider-east".to_owned(),
+            BTreeMap::from([("gw-ip".to_owned(), "172.18.255.200".to_owned())]),
+        )]);
+        let mut sc = make_step_context();
+        sc.config_dir = dir.path().to_path_buf();
+        execute_template_manifest(&runner, "gw.yaml", &tpl, &sc).unwrap_or_else(|_| std::process::abort());
+        let calls = runner.calls();
+        let apply = calls.first().unwrap_or_else(|| std::process::abort());
+        let stdin_bytes = apply.stdin.as_deref().unwrap_or_else(|| std::process::abort());
+        let stdin_text = std::str::from_utf8(stdin_bytes).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            stdin_text, "ip: 172.18.255.200:8080",
+            "should render captures in manifest content"
         );
     }
 }
