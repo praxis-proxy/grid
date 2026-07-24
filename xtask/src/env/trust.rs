@@ -14,7 +14,7 @@ use certs::{generate_ca, generate_site_cert};
 
 use crate::env::{
     certs::WRONG_ORG,
-    config::{ClusterRole, EnvConfig},
+    config::EnvConfig,
     gateway::HOST_CA_CERT,
     kind::kubectl_context,
     verify::{HttpResponse, PortForwardGuard, Tally, find_free_port, parse_curl_output, safe_truncate, wait_for_port},
@@ -67,7 +67,7 @@ pub(crate) fn verify_mtls_trust(cfg: &EnvConfig) -> Result<(), Box<dyn std::erro
         let Some(def) = cfg.clusters.definitions.get(name) else {
             continue;
         };
-        if def.role != ClusterRole::Provider || def.models.is_empty() {
+        if !def.role.is_provider() || def.models.is_empty() {
             continue;
         }
         found = true;

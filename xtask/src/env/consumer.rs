@@ -20,7 +20,7 @@ use std::{
 };
 
 use crate::env::{
-    config::{ClusterDef, ClusterRole, EnvConfig},
+    config::{ClusterDef, EnvConfig},
     image_overrides,
     kind::kubectl_context,
     kubectl,
@@ -97,7 +97,7 @@ pub(crate) fn probe_network(cfg: &EnvConfig) -> Result<(), Box<dyn std::error::E
         let Some(def) = cfg.clusters.definitions.get(name) else {
             continue;
         };
-        if def.role != ClusterRole::Provider {
+        if !def.role.is_provider() {
             continue;
         }
         probe_provider_reachability(name, def, &consumer_ctx)?;
@@ -480,7 +480,7 @@ fn collect_provider_endpoints(cfg: &EnvConfig) -> Result<Vec<ProviderEndpoint>, 
         let Some(def) = cfg.clusters.definitions.get(name) else {
             continue;
         };
-        if def.role != ClusterRole::Provider || def.models.is_empty() {
+        if !def.role.is_provider() || def.models.is_empty() {
             continue;
         }
         endpoints.push(resolve_provider_endpoint(name, def)?);
@@ -1694,7 +1694,7 @@ pub(crate) fn verify_e2e(cfg: &EnvConfig) -> Result<(), Box<dyn std::error::Erro
         let Some(def) = cfg.clusters.definitions.get(name) else {
             continue;
         };
-        if def.role != ClusterRole::Provider {
+        if !def.role.is_provider() {
             continue;
         }
         for model in &def.models {
@@ -1891,7 +1891,7 @@ pub(crate) fn verify_responses_e2e(cfg: &EnvConfig) -> Result<(), Box<dyn std::e
         let Some(def) = cfg.clusters.definitions.get(name) else {
             continue;
         };
-        if def.role != ClusterRole::Provider {
+        if !def.role.is_provider() {
             continue;
         }
         for model in &def.models {

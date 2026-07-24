@@ -11,8 +11,10 @@ use std::{
     time::Duration,
 };
 
+#[cfg(test)]
+use crate::env::config::ClusterRole;
 use crate::env::{
-    config::{ClusterDef, ClusterRole, EnvConfig, ProviderBackend},
+    config::{ClusterDef, EnvConfig, ProviderBackend},
     kind,
 };
 
@@ -62,7 +64,7 @@ pub(crate) fn verify_providers(cfg: &EnvConfig) -> Result<(), Box<dyn std::error
         let Some(def) = cfg.clusters.definitions.get(name) else {
             continue;
         };
-        if def.role != ClusterRole::Provider || def.models.is_empty() {
+        if !def.role.is_provider() || def.models.is_empty() {
             continue;
         }
         providers_found = true;

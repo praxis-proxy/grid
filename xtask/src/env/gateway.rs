@@ -11,7 +11,7 @@
 use std::{path::PathBuf, process::Command};
 
 use crate::env::{
-    config::{ClusterDef, ClusterRole, EnvConfig, ProviderBackend},
+    config::{ClusterDef, EnvConfig, ProviderBackend},
     image_overrides, kind, kubectl,
     verify::{HttpResponse, PortForwardGuard, Tally, find_free_port, parse_curl_output, safe_truncate, wait_for_port},
 };
@@ -67,7 +67,7 @@ pub(crate) fn deploy_all(cfg: &EnvConfig) -> Result<(), Box<dyn std::error::Erro
         let Some(def) = cfg.clusters.definitions.get(name) else {
             continue;
         };
-        if def.role != ClusterRole::Provider || def.models.is_empty() {
+        if !def.role.is_provider() || def.models.is_empty() {
             continue;
         }
         deploy_provider(name, def)?;
@@ -94,7 +94,7 @@ pub(crate) fn verify_all(cfg: &EnvConfig) -> Result<(), Box<dyn std::error::Erro
         let Some(def) = cfg.clusters.definitions.get(name) else {
             continue;
         };
-        if def.role != ClusterRole::Provider || def.models.is_empty() {
+        if !def.role.is_provider() || def.models.is_empty() {
             continue;
         }
         found = true;

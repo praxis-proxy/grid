@@ -103,6 +103,21 @@ pub(crate) enum ClusterRole {
 
     /// Consumes inference from other sites.
     Consumer,
+
+    /// Both consumes inference and provides local inference backends.
+    Both,
+}
+
+impl ClusterRole {
+    /// Whether this role can host provider backends.
+    pub(crate) fn is_provider(self) -> bool {
+        matches!(self, Self::Provider | Self::Both)
+    }
+
+    /// Whether this role can host a consumer gateway.
+    pub(crate) fn is_consumer(self) -> bool {
+        matches!(self, Self::Consumer | Self::Both)
+    }
 }
 
 /// External mock provider configuration.
@@ -193,7 +208,7 @@ impl EnvConfig {
                 self.clusters
                     .definitions
                     .get(*name)
-                    .is_some_and(|d| d.role == ClusterRole::Consumer)
+                    .is_some_and(|d| d.role.is_consumer())
             })
             .map(String::as_str)
     }
@@ -277,6 +292,33 @@ vertex = { port = 10004, project = "test-project" }
             ClusterRole::Consumer,
             "cluster-c should be consumer"
         );
+    }
+
+    #[test]
+    fn parse_both_cluster_role() {
+        let toml = r#"
+[clusters]
+names = ["edge"]
+
+[clusters.edge]
+models = ["model-local"]
+role = "both"
+
+[providers]
+openai = { port = 10001 }
+anthropic = { port = 10002 }
+bedrock = { port = 10003, region = "us-east-1" }
+vertex = { port = 10004, project = "test-project" }
+"#;
+        let cfg = EnvConfig::from_str(toml).unwrap_or_else(|_| std::process::abort());
+        let edge = cfg
+            .clusters
+            .definitions
+            .get("edge")
+            .unwrap_or_else(|| std::process::abort());
+        assert_eq!(edge.role, ClusterRole::Both, "role must parse as both");
+        assert!(edge.role.is_consumer(), "both must be consumer-capable");
+        assert!(edge.role.is_provider(), "both must be provider-capable");
     }
 
     #[test]
@@ -479,6 +521,30 @@ vertex = { port = 10004, project = "test-project" }
             cfg.consumer_cluster_name(),
             Some("consumer-b"),
             "must return the consumer cluster name"
+        );
+    }
+
+    #[test]
+    fn consumer_cluster_name_accepts_both_cluster() {
+        let toml = r#"
+[clusters]
+names = ["edge"]
+
+[clusters.edge]
+models = ["model-local"]
+role = "both"
+
+[providers]
+openai = { port = 10001 }
+anthropic = { port = 10002 }
+bedrock = { port = 10003, region = "us-east-1" }
+vertex = { port = 10004, project = "test-project" }
+"#;
+        let cfg = EnvConfig::from_str(toml).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            cfg.consumer_cluster_name(),
+            Some("edge"),
+            "both-role cluster must be eligible as the consumer cluster"
         );
     }
 
