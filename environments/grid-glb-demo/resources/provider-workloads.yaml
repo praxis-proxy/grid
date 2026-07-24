@@ -19,6 +19,7 @@ spec:
       containers:
         - name: mock-inference
           image: "ghcr.io/praxis-proxy/mock-providers:sha-PLACEHOLDER"
+          args: ["--provider", "openai", "--port", "8080"]
           ports:
             - name: http
               containerPort: 8080

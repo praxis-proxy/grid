@@ -22,13 +22,19 @@ spec:
         listenerPort: 8080
         credentialMountBase: /run/secrets/grid-credentials
         tlsCertMountPath: /etc/praxis/tls
+        # After applying inference-sim stacks on provider clusters,
+        # replace these addresses with the MetalLB-assigned IPs:
+        #   kubectl --context kind-grid-glb-provider-east get svc -n grid-system provider-gateway \
+        #     -o jsonpath='{.status.loadBalancer.ingress[0].ip}'
+        #   kubectl --context kind-grid-glb-provider-west get svc -n grid-system provider-gateway \
+        #     -o jsonpath='{.status.loadBalancer.ingress[0].ip}'
         clusterEndpoints:
           - cluster: provider-east
-            address: "PROVIDER_EAST_LB:443"
+            address: "PROVIDER_EAST_GATEWAY_IP:8080"
             transport:
               mode: plaintext
           - cluster: provider-west
-            address: "PROVIDER_WEST_LB:443"
+            address: "PROVIDER_WEST_GATEWAY_IP:8080"
             transport:
               mode: plaintext
 

@@ -32,40 +32,9 @@ spec:
         region: us-west
         role: provider
 
-  services:
-    - name: grid-overlay-sync-us-east
-      image: "ghcr.io/praxis-proxy/grid-overlay-sync:sha-PLACEHOLDER"
-      network: host
-      restart: on-failure
-      args:
-        - "--context=kind-grid-glb-edge-control"
-        - "--namespace=grid-system"
-        - "--configmap=grid-overlay-glb-demo-consumer-gateway"
-        - "--output=.forge/runtime/edge-us-east/"
-
-    - name: grid-edge-us-east
-      image: "ghcr.io/praxis-proxy/ai:sha-PLACEHOLDER"
-      network: environment
-      dependsOn:
-        - grid-overlay-sync-us-east
-      restart: on-failure
-      ports:
-        - bindAddress: "127.0.0.1"
-          host: 8080
-          container: 8080
-      volumes:
-        - source: configs/edge-us-east
-          target: /etc/praxis
-          readOnly: true
-        - source: .forge/runtime/edge-us-east
-          target: /etc/grid
-          readOnly: true
-      healthCheck:
-        type: tcp
-        port: 8080
-        interval: "2s"
-        timeout: "1s"
-        retries: 5
+  # Host edge services are intentionally not active in this config yet.
+  # They require packaged grid-overlay-sync and Praxis AI hot-reload images.
+  services: []
 
   stacks:
     gateway-api:
@@ -127,7 +96,9 @@ spec:
           path: resources/provider-west-inference.yaml
 
     inference-sim:
-      description: Simulated inference backends for provider clusters
+      description: Simulated inference backends with LoadBalancer exposure
       steps:
         - type: manifest
           path: resources/provider-workloads.yaml
+        - type: manifest
+          path: resources/provider-gateway.yaml

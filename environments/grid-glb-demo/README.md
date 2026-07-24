@@ -1,43 +1,54 @@
 # Grid GLB Demo Environment
 
-Multi-cluster Grid environment skeleton demonstrating external ingress
-with GLB-style failover. Three Kind clusters simulate a realistic
-topology: one edge-control plane running Praxis AI as the external entry
-point, and two provider clusters hosting simulated inference backends.
+Multi-cluster Grid environment demonstrating external ingress with
+GLB-style failover. Three Kind clusters simulate a realistic topology:
+one edge-control plane running Praxis AI as the external entry point,
+and two provider clusters hosting simulated inference backends exposed
+via MetalLB LoadBalancer Services.
 
 ## Architecture
 
 ```
-                   ┌──────────────────┐
-                   │   Client (curl)  │
-                   └────────┬─────────┘
-                            │ :8080
-               ┌────────────▼────────────┐
-               │   grid-edge-us-east     │
-               │   (Praxis AI gateway)   │
-               └────────────┬────────────┘
-                            │ overlay routing
-            ┌───────────────┼───────────────┐
-            ▼               ▼               ▼
-   ┌─────────────┐  ┌──────────────┐  ┌──────────────┐
-   │ edge-control │  │provider-east │  │provider-west │
-   │  (Kind)      │  │  (Kind)      │  │  (Kind)      │
-   │  GridNetwork │  │  GridSite    │  │  GridSite    │
-   │  Operator    │  │  Operator    │  │  Operator    │
-   │              │  │  mock-provs  │  │  mock-provs  │
-   └─────────────┘  └──────────────┘  └──────────────┘
+                   +------------------+
+                   |  Client (curl)   |
+                   +--------+---------+
+                            | :8080
+               +------------v------------+
+               |   grid-edge-us-east     |
+               |   (Praxis AI gateway)   |
+               +------------+------------+
+                            | overlay routing
+            +---------------+---------------+
+            v                               v
+   +--------------+                +--------------+
+   |provider-east |                |provider-west |
+   |  (Kind)      |                |  (Kind)      |
+   |  GridSite    |                |  GridSite    |
+   |  Operator    |                |  Operator    |
+   |  mock-provs  |                |  mock-provs  |
+   |  LB :8080    |                |  LB :8080    |
+   +--------------+                +--------------+
 ```
 
-The `grid-overlay-sync-us-east` host service watches the edge-control
-cluster for the operator-generated overlay ConfigMap and writes it to a
-shared directory. The `grid-edge-us-east` service reads that config and
-routes inference requests to provider clusters via the Grid overlay.
+Each provider cluster exposes its mock-inference backend through a
+MetalLB-backed LoadBalancer Service (`provider-gateway`) on port 8080.
+The edge-control cluster's GridNetwork references these LoadBalancer
+IPs as `clusterEndpoints`, enabling the Grid overlay to route inference
+requests across the cross-cluster Docker network.
 
 ## Current Status
 
-This skeleton validates and defines the complete cluster, stack, and
-service topology. The following items are **not yet runnable** and are
-blocked on upstream packaging:
+### Runnable Now
+
+- Cluster creation with cross-cluster Docker networking
+- Gateway API CRDs, MetalLB with auto-configured address pools
+- Grid operator (CRDs + deployment) on all clusters
+- Per-cluster Grid CRD resources (GridNetwork, GridSites, InferenceProviders)
+- Mock inference backends (Deployment + ClusterIP Service) on provider clusters
+- Provider gateway LoadBalancer Services exposed via MetalLB
+- Config validation passes: `praxis-forge config validate`
+
+### Blocked on Upstream Packaging
 
 - **grid-overlay-sync image** does not yet exist (`sha-PLACEHOLDER`).
   The overlay-sync service requires a packaged watcher that reads the
@@ -45,23 +56,18 @@ blocked on upstream packaging:
 - **Praxis AI hot-reload image** does not yet exist (`sha-PLACEHOLDER`).
   The edge service requires a Praxis AI build with file-based Grid
   config hot-reload support.
-- **Provider gateway endpoints** (`PROVIDER_EAST_LB:443`,
-  `PROVIDER_WEST_LB:443` in gridnetwork.yaml) are placeholders. Each
-  provider cluster needs a Praxis gateway Deployment + LoadBalancer
-  Service exposed via MetalLB before the edge can route to them.
 - **Transport** between edge and providers is set to `plaintext` for
   initial development. Production requires `mutual_tls` with proper
-  SNI and cert references.
+  SNI and certificate references.
 
 ## Prerequisites
 
-- Docker (required for cross-cluster networking; Podman is not supported)
+- Docker (required for cross-cluster networking)
 - [kind](https://kind.sigs.k8s.io/) v0.20+
 - `praxis-forge` binary (built from this repo: `cargo build -p forge`)
 - `kubectl`
-- `helm` (not currently used but reserved for future chart steps)
 
-## What Works Today
+## Demo Workflow
 
 ### 1. Validate the environment config
 
@@ -69,39 +75,86 @@ blocked on upstream packaging:
 praxis-forge config validate --config environments/grid-glb-demo/forge.yaml
 ```
 
-### 2. Bring up clusters and infrastructure stacks
+### 2. Create clusters and network
 
 ```console
 praxis-forge up --config environments/grid-glb-demo/forge.yaml
 ```
 
-This creates three Kind clusters with cross-cluster networking, installs
-Gateway API CRDs, MetalLB with auto-configured address pools, the Grid
-operator (CRDs + deployment), and applies per-cluster Grid CRD resources
-(GridNetwork on edge-control, GridSites and InferenceProviders on
-provider clusters).
+This creates three Kind clusters with cross-cluster Docker networking.
+The standalone edge services are not active in `forge.yaml` yet because
+their images are not published.
 
-The host services (`grid-overlay-sync-us-east`, `grid-edge-us-east`)
-will fail to start until the placeholder images are replaced with real
-builds.
+### 3. Apply provider stacks
 
-### 3. Verify cluster status
+Apply stacks to provider clusters first so their LoadBalancer IPs are
+available before configuring the edge:
+
+```console
+praxis-forge stack apply provider-east --config environments/grid-glb-demo/forge.yaml
+praxis-forge stack apply provider-west --config environments/grid-glb-demo/forge.yaml
+```
+
+This installs Gateway API CRDs, MetalLB, the Grid operator, provider
+Grid CRDs, mock-inference Deployments, and the `provider-gateway`
+LoadBalancer Service on each provider cluster.
+
+### 4. Discover provider gateway IPs
+
+After MetalLB assigns addresses, retrieve the LoadBalancer IPs:
+
+```console
+kubectl --context kind-grid-glb-provider-east get svc -n grid-system provider-gateway \
+  -o jsonpath='{.status.loadBalancer.ingress[0].ip}'
+
+kubectl --context kind-grid-glb-provider-west get svc -n grid-system provider-gateway \
+  -o jsonpath='{.status.loadBalancer.ingress[0].ip}'
+```
+
+### 5. Wire GridNetwork endpoints
+
+Edit `resources/gridnetwork.yaml` and replace the placeholder addresses
+with the discovered IPs:
+
+```yaml
+clusterEndpoints:
+  - cluster: provider-east
+    address: "<east-ip>:8080"
+    transport:
+      mode: plaintext
+  - cluster: provider-west
+    address: "<west-ip>:8080"
+    transport:
+      mode: plaintext
+```
+
+### 6. Apply edge-control stacks
+
+```console
+praxis-forge stack apply edge-control --config environments/grid-glb-demo/forge.yaml
+```
+
+This installs the Grid operator, GridNetwork (with wired endpoints),
+edge GridSite, and access policies on the edge-control cluster.
+
+### 7. Verify cluster status
 
 ```console
 praxis-forge status --config environments/grid-glb-demo/forge.yaml
 ```
 
-All three clusters should show `phase=running, live`. Services will
-show as failed until the images exist.
+All three clusters should show `phase=running, live`.
 
-### 4. Inspect service identity (once services are running)
+### 8. Verify provider gateway reachability
+
+From the Docker host, confirm the provider gateways respond:
 
 ```console
-praxis-forge status --json --config environments/grid-glb-demo/forge.yaml
+curl -s http://<east-ip>:8080/health
+curl -s http://<west-ip>:8080/health
 ```
 
-Service entries include `containerId`, `startedAt`, and `restartCount`
-from live container inspect.
+Both should return `ok` from the mock-inference health endpoint.
 
 ## End-to-End Demo (Blocked on Prerequisites Above)
 
