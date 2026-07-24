@@ -31,3 +31,6 @@ target
 
 # Runtime-generated cert files from xtask env up/down
 tests/env/certs/
+
+# Forge runtime state and generated files
+.forge/

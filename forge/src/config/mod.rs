@@ -197,6 +197,9 @@ pub struct ServiceSpec {
     pub name: String,
     /// Container image reference.
     pub image: String,
+    /// Whether `forge up` should start this service automatically.
+    #[serde(default = "default_auto_start")]
+    pub auto_start: bool,
     /// Container network mode.
     #[serde(default)]
     pub network: NetworkMode,
@@ -221,6 +224,11 @@ pub struct ServiceSpec {
     /// Health-check configuration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health_check: Option<HealthCheck>,
+}
+
+/// Services auto-start during `forge up` by default.
+fn default_auto_start() -> bool {
+    true
 }
 
 /// Container network attachment mode.

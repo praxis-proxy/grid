@@ -32,9 +32,47 @@ spec:
         region: us-west
         role: provider
 
-  # Host edge services are intentionally not active in this config yet.
-  # They require packaged grid-overlay-sync and Praxis AI hot-reload images.
-  services: []
+  services:
+    - name: grid-overlay-sync-us-east
+      image: "ghcr.io/praxis-proxy/grid-overlay-sync:sha-PLACEHOLDER"
+      autoStart: false
+      network: environment
+      volumes:
+        - source: configs/overlay-sync
+          target: /etc/overlay-sync
+          readOnly: true
+        - source: .forge/runtime/edge-us-east
+          target: /output
+      args:
+        - "--config"
+        - "/etc/overlay-sync/sync.yaml"
+      restart: on-failure
+
+    - name: grid-edge-us-east
+      image: "ghcr.io/praxis-proxy/praxis-ai:sha-PLACEHOLDER"
+      autoStart: false
+      network: environment
+      dependsOn:
+        - grid-overlay-sync-us-east
+      ports:
+        - bindAddress: "127.0.0.1"
+          host: 8080
+          container: 8080
+          protocol: tcp
+      volumes:
+        - source: configs/edge-us-east
+          target: /etc/praxis
+          readOnly: true
+        - source: .forge/runtime/edge-us-east
+          target: /etc/grid
+          readOnly: true
+      restart: on-failure
+      healthCheck:
+        type: tcp
+        port: 8080
+        interval: "2s"
+        timeout: "1s"
+        retries: 30
 
   stacks:
     gateway-api:

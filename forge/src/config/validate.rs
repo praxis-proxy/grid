@@ -25,6 +25,7 @@ pub fn validate(config: &ForgeConfig) -> Result<(), ForgeError> {
     check_service_names(config)?;
     check_services(config)?;
     check_service_deps(config)?;
+    check_service_auto_start_deps(config)?;
     check_service_dep_cycles(config)?;
     check_service_port_conflicts(config)?;
     check_stack_names(config)?;
@@ -413,6 +414,27 @@ fn check_single_dep(svc_name: &str, dep: &str, known: &BTreeSet<&str>) -> Result
         return Err(ForgeError::Validation(format!(
             "service {svc_name:?}: depends on unknown service {dep:?}"
         )));
+    }
+    Ok(())
+}
+
+/// Auto-started services cannot depend on services skipped by `forge up`.
+fn check_service_auto_start_deps(config: &ForgeConfig) -> Result<(), ForgeError> {
+    let auto_start: BTreeMap<&str, bool> = config
+        .spec
+        .services
+        .iter()
+        .map(|svc| (svc.name.as_str(), svc.auto_start))
+        .collect();
+    for svc in config.spec.services.iter().filter(|svc| svc.auto_start) {
+        for dep in &svc.depends_on {
+            if auto_start.get(dep.as_str()) == Some(&false) {
+                return Err(ForgeError::Validation(format!(
+                    "service {:?}: auto-started service depends on non-auto-start service {:?}",
+                    svc.name, dep
+                )));
+            }
+        }
     }
     Ok(())
 }
@@ -940,6 +962,7 @@ mod tests {
         ServiceSpec {
             name: name.to_owned(),
             image: "example/svc:v1".to_owned(),
+            auto_start: true,
             network: NetworkMode::None,
             depends_on: Vec::new(),
             ports: Vec::new(),
@@ -1374,6 +1397,38 @@ spec:
     }
 
     #[test]
+    fn auto_start_service_cannot_depend_on_non_auto_start_service() {
+        let mut config = base_config();
+        let mut sync = test_service("sync");
+        sync.auto_start = false;
+        let mut edge = test_service("edge");
+        edge.depends_on = vec!["sync".to_owned()];
+        config.spec.services = vec![sync, edge];
+        let Err(err) = validate(&config) else {
+            std::process::abort();
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("auto-started service depends on non-auto-start service"),
+            "expected auto-start dependency error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn non_auto_start_service_may_depend_on_non_auto_start_service() {
+        let mut config = base_config();
+        let mut sync = test_service("sync");
+        sync.auto_start = false;
+        let mut edge = test_service("edge");
+        edge.auto_start = false;
+        edge.depends_on = vec!["sync".to_owned()];
+        config.spec.services = vec![sync, edge];
+        validate(&config).unwrap_or_else(|_e| {
+            std::process::abort();
+        });
+    }
+
+    #[test]
     fn service_bind_address_invalid_rejected() {
         let mut config = base_config();
         config.spec.services = vec![test_service_with_port(PortMapping {
@@ -1478,6 +1533,42 @@ spec:
         };
         let msg = err.to_string();
         assert!(msg.contains("absolute"), "expected absolute path error, got: {msg}");
+    }
+
+    #[test]
+    fn service_with_dotforge_runtime_volume_valid() {
+        let mut config = base_config();
+        let mut svc = test_service("edge");
+        svc.volumes = vec![VolumeMount {
+            source: ".forge/runtime/edge-us-east".to_owned(),
+            target: "/etc/grid".to_owned(),
+            read_only: true,
+        }];
+        config.spec.services = vec![svc];
+        validate(&config).unwrap_or_else(|_| std::process::abort());
+    }
+
+    #[test]
+    fn service_with_localhost_bind_address_valid() {
+        let mut config = base_config();
+        let mut svc = test_service("edge");
+        svc.ports = vec![PortMapping {
+            bind_address: Some("127.0.0.1".to_owned()),
+            host: 8080,
+            container: 8080,
+            protocol: "tcp".to_owned(),
+        }];
+        config.spec.services = vec![svc];
+        validate(&config).unwrap_or_else(|_| std::process::abort());
+    }
+
+    #[test]
+    fn service_with_placeholder_image_valid() {
+        let mut config = base_config();
+        let mut svc = test_service("sync");
+        svc.image = "ghcr.io/praxis-proxy/grid-overlay-sync:sha-PLACEHOLDER".to_owned();
+        config.spec.services = vec![svc];
+        validate(&config).unwrap_or_else(|_| std::process::abort());
     }
 
     #[test]

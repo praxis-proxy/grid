@@ -766,6 +766,7 @@ mod tests {
         ServiceSpec {
             name: "test-svc".to_owned(),
             image: "nginx:latest".to_owned(),
+            auto_start: true,
             network: NetworkMode::None,
             depends_on: Vec::new(),
             ports: Vec::new(),

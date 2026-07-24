@@ -226,6 +226,12 @@ fn start_services(
     let order = service::dependency_order(&ctx.config.spec.services)?;
     let mut results = Vec::new();
     for idx in order {
+        let Some(svc) = ctx.config.spec.services.get(idx) else {
+            return Err(ForgeError::State("service index out of range".to_owned()));
+        };
+        if !svc.auto_start {
+            continue;
+        }
         let r = start_one_svc(ctx, binary, state, idx)?;
         results.push(r);
     }
@@ -608,6 +614,57 @@ spec:
         let text = run_up(&ctx);
         assert!(!runner.was_called("kind create"), "dry-run should not call kind create");
         assert!(text.contains("would create"), "should say would create: {text}");
+    }
+
+    /// Build a config with one service disabled for `forge up`.
+    fn test_config_with_disabled_service() -> crate::config::ForgeConfig {
+        let yaml = "\
+apiVersion: forge.praxis.dev/v1alpha1
+kind: Environment
+metadata:
+  name: test
+spec:
+  runtime:
+    provider: docker
+    clusterPrefix: forge
+  clusters: []
+  services:
+    - name: placeholder
+      image: example/placeholder:v1
+      autoStart: false
+  stacks: {}
+";
+        serde_yaml::from_str(yaml).unwrap_or_else(|_| {
+            std::process::abort();
+            #[expect(unreachable_code, reason = "abort prevents reaching this")]
+            {
+                unreachable!()
+            }
+        })
+    }
+
+    #[test]
+    fn up_skips_services_with_auto_start_false() {
+        let config = test_config_with_disabled_service();
+        let dir = test_dir();
+        let mut runner = MockRunner::new();
+        runner.respond("docker version", docker_ok());
+        let ctx = ForgeContext {
+            runner: &runner,
+            config: &config,
+            state_dir: dir.path().to_path_buf(),
+            config_dir: dir.path().to_path_buf(),
+            format: OutputFormat::Text,
+            dry_run: false,
+        };
+
+        let text = run_up(&ctx);
+
+        assert!(!runner.was_called("docker run"), "autoStart false should not start");
+        assert!(
+            !text.contains("placeholder"),
+            "skipped service should not appear as started: {text}"
+        );
     }
 
     #[test]

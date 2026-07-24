@@ -36,6 +36,15 @@ The edge-control cluster's GridNetwork references these LoadBalancer
 IPs as `clusterEndpoints`, enabling the Grid overlay to route inference
 requests across the cross-cluster Docker network.
 
+Two host services complete the data path:
+
+- **grid-overlay-sync-us-east** watches the operator-generated
+  ConfigMap on edge-control and writes `grid-config.json` to a
+  shared runtime directory (`environments/grid-glb-demo/.forge/runtime/edge-us-east/`).
+- **grid-edge-us-east** runs Praxis AI with file-based Grid config,
+  reading from the same runtime directory. It listens on
+  `127.0.0.1:8080` for local client requests.
+
 ## Current Status
 
 ### Runnable Now
@@ -46,16 +55,19 @@ requests across the cross-cluster Docker network.
 - Per-cluster Grid CRD resources (GridNetwork, GridSites, InferenceProviders)
 - Mock inference backends (Deployment + ClusterIP Service) on provider clusters
 - Provider gateway LoadBalancer Services exposed via MetalLB
-- Config validation passes: `praxis-forge config validate`
+- Automatic capture of provider gateway IPs into Forge state
+- Template-manifest rendering of GridNetwork with captured IPs
+- Config validation passes with full service definitions
 
 ### Blocked on Upstream Packaging
 
-- **grid-overlay-sync image** does not yet exist (`sha-PLACEHOLDER`).
-  The overlay-sync service requires a packaged watcher that reads the
-  operator-generated ConfigMap and writes grid-config.json.
-- **Praxis AI hot-reload image** does not yet exist (`sha-PLACEHOLDER`).
-  The edge service requires a Praxis AI build with file-based Grid
-  config hot-reload support.
+- **grid-overlay-sync image** (`sha-PLACEHOLDER`): the overlay-sync
+  service requires a packaged watcher that reads the
+  operator-generated ConfigMap and writes `grid-config.json`. No
+  published image exists yet.
+- **Praxis AI hot-reload image** (`sha-PLACEHOLDER`): the edge
+  service requires a Praxis AI build with file-based Grid config
+  hot-reload support. No published image exists yet.
 - **Transport** between edge and providers is set to `plaintext` for
   initial development. Production requires `mutual_tls` with proper
   SNI and certificate references.
@@ -81,9 +93,10 @@ praxis-forge config validate --config environments/grid-glb-demo/forge.yaml
 praxis-forge up --config environments/grid-glb-demo/forge.yaml
 ```
 
-This creates three Kind clusters with cross-cluster Docker networking.
-The standalone edge services are not active in `forge.yaml` yet because
-their images are not published.
+This creates three Kind clusters (`edge-control`, `provider-east`,
+`provider-west`) with a shared Docker network (`grid-glb-demo-net`).
+The host edge services are marked `autoStart: false` until their
+placeholder images are replaced, so `up` will not try to start them.
 
 ### 3. Apply provider stacks
 
@@ -131,11 +144,32 @@ curl -s http://<west-ip>:8080/health
 
 Both should return `ok` from the mock-inference health endpoint.
 
-## End-to-End Demo (Blocked on Prerequisites Above)
+### 7. Start host services (blocked on images)
 
-Once the overlay-sync and hot-reload Praxis AI images are available:
+The two host services are defined in `forge.yaml` with `autoStart:
+false` and placeholder image tags (`sha-PLACEHOLDER`). Once real images
+are published, replace the tags and start the services:
 
-### Send a test request through the edge
+```console
+praxis-forge service start grid-overlay-sync-us-east --config environments/grid-glb-demo/forge.yaml
+praxis-forge service start grid-edge-us-east --config environments/grid-glb-demo/forge.yaml
+```
+
+The overlay-sync service writes `grid-config.json` to
+`environments/grid-glb-demo/.forge/runtime/edge-us-east/`. The edge service mounts that directory
+read-only at `/etc/grid` and begins accepting requests on
+`127.0.0.1:8080`.
+
+**Remaining blockers:**
+
+- `ghcr.io/praxis-proxy/grid-overlay-sync` image must be published
+  with a ConfigMap watcher that writes `grid-config.json`
+- `ghcr.io/praxis-proxy/praxis-ai` image must be published with
+  file-based Grid config hot-reload support
+
+### 8. Send a test request (blocked on step 7)
+
+Once both services are running:
 
 ```console
 curl -s http://127.0.0.1:8080/v1/chat/completions \
@@ -143,15 +177,18 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
   -d @environments/grid-glb-demo/fixtures/requests/shared-model.json
 ```
 
-### Confirm identity proof
+### Shared Runtime Layout
 
-```console
-praxis-forge status --json --config environments/grid-glb-demo/forge.yaml \
-  | jq '.data.services[] | select(.name == "grid-edge-us-east") | {containerId, startedAt, restartCount}'
+Both host services share a runtime directory on the Docker host:
+
+```
+environments/grid-glb-demo/.forge/runtime/edge-us-east/
+  grid-config.json    # written by overlay-sync, read by edge
+  tls/                # reserved for future mTLS certificates
 ```
 
-`restartCount` should be `0` and `containerId` unchanged across the
-failover window.
+This directory is created at service start time. It is gitignored
+(`.forge/` in root `.gitignore`) and must not be committed.
 
 ## Automated Proof (Not Yet Implemented)
 
