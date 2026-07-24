@@ -164,3 +164,53 @@ fn cli_accepts_cluster_kubectl() {
     let result = Cli::try_parse_from(["praxis-forge", "cluster", "kubectl", "hub", "--", "get", "pods"]);
     assert!(result.is_ok(), "cluster kubectl should parse: {result:?}");
 }
+
+// ---------------------------------------------------------------
+// F3 CLI parsing tests
+// ---------------------------------------------------------------
+
+#[test]
+fn cli_accepts_service_list() {
+    let result = Cli::try_parse_from(["praxis-forge", "service", "list"]);
+    assert!(result.is_ok(), "service list should parse: {result:?}");
+}
+
+#[test]
+fn cli_accepts_service_start() {
+    let result = Cli::try_parse_from(["praxis-forge", "service", "start", "edge"]);
+    assert!(result.is_ok(), "service start should parse: {result:?}");
+}
+
+#[test]
+fn cli_accepts_service_stop() {
+    let result = Cli::try_parse_from(["praxis-forge", "service", "stop", "edge"]);
+    assert!(result.is_ok(), "service stop should parse: {result:?}");
+}
+
+// ---------------------------------------------------------------
+// F4 CLI parsing tests
+// ---------------------------------------------------------------
+
+#[test]
+fn cli_accepts_stack_list() {
+    let result = Cli::try_parse_from(["praxis-forge", "stack", "list"]);
+    assert!(result.is_ok(), "stack list should parse: {result:?}");
+}
+
+#[test]
+fn cli_accepts_stack_plan() {
+    let result = Cli::try_parse_from(["praxis-forge", "stack", "plan", "hub"]);
+    assert!(result.is_ok(), "stack plan should parse: {result:?}");
+}
+
+#[test]
+fn cli_accepts_stack_apply_with_filter() {
+    let result = Cli::try_parse_from(["praxis-forge", "stack", "apply", "hub", "base"]);
+    assert!(result.is_ok(), "stack apply with filter should parse: {result:?}");
+}
+
+#[test]
+fn cli_accepts_stack_status() {
+    let result = Cli::try_parse_from(["praxis-forge", "stack", "status"]);
+    assert!(result.is_ok(), "stack status should parse: {result:?}");
+}

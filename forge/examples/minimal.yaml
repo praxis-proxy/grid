@@ -11,6 +11,7 @@ spec:
 
   network:
     crossCluster: false
+    dnsZone: forge.test
 
   clusters: []
 

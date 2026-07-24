@@ -138,7 +138,7 @@ fn create_if_missing(
     if kind_ops::cluster_exists(ctx.runner, kind_name)? {
         return Ok(());
     }
-    kind_ops::create_cluster(ctx.runner, kind_name, nodes, &ctx.state_dir)?;
+    kind_ops::create_cluster(ctx.runner, kind_name, nodes, &ctx.state_dir, None)?;
     upsert_cluster_state(st, name, kind_name, ClusterPhase::Running);
     Ok(())
 }

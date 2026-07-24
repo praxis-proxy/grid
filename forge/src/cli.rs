@@ -75,6 +75,12 @@ pub enum Command {
     /// Individual cluster lifecycle commands.
     #[command(subcommand)]
     Cluster(ClusterCommand),
+    /// Host-level container service commands.
+    #[command(subcommand)]
+    Service(ServiceCommand),
+    /// Deployment stack management.
+    #[command(subcommand)]
+    Stack(StackCommand),
 }
 
 /// Cluster subcommands.
@@ -117,6 +123,50 @@ pub enum ClusterCommand {
         /// Arguments passed to kubectl (after `--`).
         #[arg(last = true)]
         args: Vec<String>,
+    },
+}
+
+/// Service subcommands.
+#[derive(Debug, Subcommand)]
+pub enum ServiceCommand {
+    /// List configured services and their state.
+    List,
+    /// Start a service by name.
+    Start {
+        /// Service name (must match a name in the config).
+        name: String,
+    },
+    /// Stop a service by name.
+    Stop {
+        /// Service name.
+        name: String,
+    },
+}
+
+/// Stack deployment subcommands.
+#[derive(Debug, Subcommand)]
+pub enum StackCommand {
+    /// List configured stacks and their status.
+    List,
+    /// Show what a stack apply would do.
+    Plan {
+        /// Cluster name.
+        cluster: String,
+        /// Stack name (applies all assigned stacks if omitted).
+        stack: Option<String>,
+    },
+    /// Apply stacks to a cluster.
+    Apply {
+        /// Cluster name.
+        cluster: String,
+        /// Stack name (applies all assigned stacks if omitted).
+        stack: Option<String>,
+    },
+    /// Show stack application status.
+    Status {
+        /// Filter by cluster name.
+        #[arg(long)]
+        cluster: Option<String>,
     },
 }
 

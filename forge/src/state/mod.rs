@@ -38,6 +38,12 @@ pub struct ForgeState {
     /// Managed cluster states.
     #[serde(default)]
     pub clusters: Vec<ClusterState>,
+    /// Managed service states.
+    #[serde(default)]
+    pub services: Vec<ServiceState>,
+    /// Managed stack application states.
+    #[serde(default)]
+    pub stacks: Vec<StackState>,
     /// Managed container network state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network: Option<NetworkState>,
@@ -90,6 +96,12 @@ pub struct NetworkState {
     pub name: String,
     /// Current lifecycle phase.
     pub phase: NetworkPhase,
+    /// Discovered network CIDR (e.g. `"172.18.0.0/16"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cidr: Option<String>,
+    /// Per-cluster `MetalLB` pool allocations.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cluster_pools: Vec<ClusterPool>,
 }
 
 /// Lifecycle phases for a managed network.
@@ -100,6 +112,98 @@ pub enum NetworkPhase {
     Active,
     /// Network has been removed.
     Gone,
+}
+
+/// A per-cluster `MetalLB` IP address pool allocation.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ClusterPool {
+    /// Cluster name this pool belongs to.
+    pub cluster: String,
+    /// Allocated address range (e.g. `"172.18.255.231-172.18.255.250"`).
+    pub range: String,
+}
+
+/// State of one managed container service.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ServiceState {
+    /// Service name from the Forge config.
+    pub name: String,
+    /// Deterministic container name.
+    pub container_name: String,
+    /// Container image reference.
+    pub image: String,
+    /// Current lifecycle phase.
+    pub phase: ServicePhase,
+    /// Health observation.
+    pub health: ServiceHealth,
+    /// Unix epoch seconds when the service was last observed.
+    pub last_observed: u64,
+}
+
+/// Lifecycle phases for a managed service.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ServicePhase {
+    /// Container creation pending.
+    Pending,
+    /// Container starting.
+    Starting,
+    /// Container running normally.
+    Running,
+    /// Health check failed.
+    Unhealthy,
+    /// Container stopped.
+    Stopped,
+    /// Container removed.
+    Gone,
+}
+
+/// Health observation for a managed service.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ServiceHealth {
+    /// No health check configured or not yet probed.
+    Unknown,
+    /// Last health check succeeded.
+    Healthy,
+    /// Last health check failed.
+    Unhealthy,
+}
+
+/// State of one stack application to a cluster.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct StackState {
+    /// Stack name from the Forge config.
+    pub name: String,
+    /// Cluster this stack was applied to.
+    pub cluster: String,
+    /// Current lifecycle phase.
+    pub phase: StackPhase,
+    /// SHA-256 digest of the stack spec at last apply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
+    /// Unix epoch seconds of last state change.
+    pub timestamp: u64,
+    /// Error message if phase is `Failed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Lifecycle phases for a managed stack application.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StackPhase {
+    /// Stack application is pending.
+    Pending,
+    /// Stack is being applied.
+    Applying,
+    /// Stack has been successfully applied.
+    Applied,
+    /// Stack application failed.
+    Failed,
 }
 
 /// Record of the last mutation.
@@ -123,6 +227,8 @@ pub fn empty() -> ForgeState {
     ForgeState {
         api_version: STATE_API_VERSION.to_owned(),
         clusters: Vec::new(),
+        services: Vec::new(),
+        stacks: Vec::new(),
         network: None,
         runtime: None,
         config_digest: None,
@@ -184,6 +290,35 @@ pub fn find_cluster<'a>(state: &'a ForgeState, name: &str) -> Option<&'a Cluster
 /// Find a cluster in state by config name (mutable).
 pub fn find_cluster_mut<'a>(state: &'a mut ForgeState, name: &str) -> Option<&'a mut ClusterState> {
     state.clusters.iter_mut().find(|c| c.name == name)
+}
+
+/// Find a service in state by config name.
+pub fn find_service<'a>(state: &'a ForgeState, name: &str) -> Option<&'a ServiceState> {
+    state.services.iter().find(|s| s.name == name)
+}
+
+/// Find a service in state by config name (mutable).
+pub fn find_service_mut<'a>(state: &'a mut ForgeState, name: &str) -> Option<&'a mut ServiceState> {
+    state.services.iter_mut().find(|s| s.name == name)
+}
+
+/// Find a stack in state by name and cluster.
+pub fn find_stack<'a>(state: &'a ForgeState, name: &str, cluster: &str) -> Option<&'a StackState> {
+    state.stacks.iter().find(|s| s.name == name && s.cluster == cluster)
+}
+
+/// Find a stack in state by name and cluster (mutable).
+pub fn find_stack_mut<'a>(state: &'a mut ForgeState, name: &str, cluster: &str) -> Option<&'a mut StackState> {
+    state.stacks.iter_mut().find(|s| s.name == name && s.cluster == cluster)
+}
+
+/// Find a cluster's `MetalLB` pool allocation in network state.
+pub fn find_cluster_pool<'a>(state: &'a ForgeState, cluster: &str) -> Option<&'a str> {
+    state
+        .network
+        .as_ref()
+        .and_then(|n| n.cluster_pools.iter().find(|p| p.cluster == cluster))
+        .map(|p| p.range.as_str())
 }
 
 // ---------------------------------------------------------------
@@ -402,5 +537,128 @@ mod tests {
             Some(&ClusterPhase::Running),
             "phase should be updated"
         );
+    }
+
+    #[test]
+    fn stack_state_round_trips_through_json() {
+        let mut state = empty();
+        state.stacks.push(StackState {
+            name: "base".to_owned(),
+            cluster: "hub".to_owned(),
+            phase: StackPhase::Applied,
+            digest: Some("abc123".to_owned()),
+            timestamp: 1_700_000_000,
+            error: None,
+        });
+        let json = serde_json::to_string(&state).unwrap_or_else(|_| std::process::abort());
+        let parsed: ForgeState = serde_json::from_str(&json).unwrap_or_else(|_| {
+            std::process::abort();
+            #[expect(unreachable_code, reason = "abort prevents reaching this")]
+            {
+                unreachable!()
+            }
+        });
+        assert_eq!(parsed.stacks.len(), 1, "should have one stack");
+        assert_eq!(
+            parsed.stacks.first().map(|s| s.name.as_str()),
+            Some("base"),
+            "stack name mismatch"
+        );
+    }
+
+    #[test]
+    fn find_stack_returns_match() {
+        let mut state = empty();
+        state.stacks.push(make_stack_state("base", "hub"));
+        assert!(find_stack(&state, "base", "hub").is_some(), "should find base/hub");
+        assert!(find_stack(&state, "base", "missing").is_none(), "wrong cluster");
+        assert!(find_stack(&state, "missing", "hub").is_none(), "wrong name");
+    }
+
+    #[test]
+    fn find_stack_mut_allows_mutation() {
+        let mut state = empty();
+        state.stacks.push(make_stack_state("base", "hub"));
+        if let Some(s) = find_stack_mut(&mut state, "base", "hub") {
+            s.phase = StackPhase::Applied;
+        }
+        assert_eq!(
+            find_stack(&state, "base", "hub").map(|s| &s.phase),
+            Some(&StackPhase::Applied),
+            "phase should be updated"
+        );
+    }
+
+    #[test]
+    fn cluster_pool_roundtrip() {
+        let pool = ClusterPool {
+            cluster: "hub".to_owned(),
+            range: "172.18.255.231-172.18.255.250".to_owned(),
+        };
+        let json = serde_json::to_string(&pool).unwrap_or_else(|_| std::process::abort());
+        let back: ClusterPool = serde_json::from_str(&json).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(back.cluster, "hub", "cluster name should survive roundtrip");
+        assert_eq!(back.range, pool.range, "range should survive roundtrip");
+    }
+
+    #[test]
+    fn network_state_with_pools_roundtrip() {
+        let ns = NetworkState {
+            name: "test-net".to_owned(),
+            phase: NetworkPhase::Active,
+            cidr: Some("172.18.0.0/16".to_owned()),
+            cluster_pools: vec![
+                ClusterPool {
+                    cluster: "hub".to_owned(),
+                    range: "172.18.255.231-172.18.255.250".to_owned(),
+                },
+                ClusterPool {
+                    cluster: "spoke".to_owned(),
+                    range: "172.18.255.211-172.18.255.230".to_owned(),
+                },
+            ],
+        };
+        let json = serde_json::to_string(&ns).unwrap_or_else(|_| std::process::abort());
+        let back: NetworkState = serde_json::from_str(&json).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(back.cluster_pools.len(), 2, "both pools should roundtrip");
+        assert_eq!(back.cidr.as_deref(), Some("172.18.0.0/16"), "cidr should roundtrip");
+    }
+
+    #[test]
+    fn find_cluster_pool_returns_range() {
+        let mut state = empty();
+        state.network = Some(NetworkState {
+            name: "test-net".to_owned(),
+            phase: NetworkPhase::Active,
+            cidr: Some("172.18.0.0/16".to_owned()),
+            cluster_pools: vec![ClusterPool {
+                cluster: "hub".to_owned(),
+                range: "172.18.255.231-172.18.255.250".to_owned(),
+            }],
+        });
+        assert_eq!(
+            find_cluster_pool(&state, "hub"),
+            Some("172.18.255.231-172.18.255.250"),
+            "should find hub pool"
+        );
+        assert_eq!(
+            find_cluster_pool(&state, "spoke"),
+            None,
+            "should return None for unknown"
+        );
+    }
+
+    // Test Utilities
+
+    /// Build a minimal [`StackState`] for testing.
+    fn make_stack_state(name: &str, cluster: &str) -> StackState {
+        StackState {
+            name: name.to_owned(),
+            cluster: cluster.to_owned(),
+            phase: StackPhase::Pending,
+            digest: None,
+            timestamp: 0,
+            error: None,
+        }
     }
 }

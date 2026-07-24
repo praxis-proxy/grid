@@ -2,12 +2,13 @@
 
 use clap::Parser as _;
 use forge::{
-    cli::{Cli, ClusterCommand, Command, ConfigCommand},
+    cli::{Cli, ClusterCommand, Command, ConfigCommand, ServiceCommand, StackCommand},
     cluster,
     command::{config, doctor, down, plan, runner, status, up},
     context::ForgeContext,
     error::ForgeError,
     output::{self, OutputFormat},
+    stack,
 };
 
 /// Parse CLI arguments and dispatch to the appropriate handler.
@@ -29,6 +30,8 @@ fn dispatch(cli: &Cli, writer: &mut dyn std::io::Write) -> Result<(), ForgeError
         Command::Down { force } => dispatch_down(cli, *force, writer),
         Command::Status => dispatch_status(cli, writer),
         Command::Cluster(sub) => dispatch_cluster(cli, sub, writer),
+        Command::Service(sub) => dispatch_service(cli, sub, writer),
+        Command::Stack(sub) => dispatch_stack(cli, sub, writer),
     }
 }
 
@@ -80,9 +83,16 @@ fn build_context<'a>(
         runner,
         config,
         state_dir: cli.global.state_dir.clone(),
+        config_dir: config_dir_from_path(&cli.global.config),
         format: cli.global.output.clone(),
         dry_run: cli.global.dry_run,
     }
+}
+
+/// Derive the config directory from the config file path.
+fn config_dir_from_path(path: &std::path::Path) -> std::path::PathBuf {
+    path.parent()
+        .map_or_else(|| std::path::PathBuf::from("."), std::path::Path::to_path_buf)
 }
 
 /// Dispatch the `up` command.
@@ -107,6 +117,22 @@ fn dispatch_status(cli: &Cli, writer: &mut dyn std::io::Write) -> Result<(), For
     let runner = runner::SystemRunner;
     let ctx = build_context(cli, &runner, &config);
     status::run(&ctx, writer)
+}
+
+/// Dispatch service subcommands.
+fn dispatch_service(cli: &Cli, sub: &ServiceCommand, writer: &mut dyn std::io::Write) -> Result<(), ForgeError> {
+    let config = load_config_validated(cli)?;
+    let runner = runner::SystemRunner;
+    let ctx = build_context(cli, &runner, &config);
+    forge::service::dispatch(&ctx, sub, writer)
+}
+
+/// Dispatch stack subcommands.
+fn dispatch_stack(cli: &Cli, sub: &StackCommand, writer: &mut dyn std::io::Write) -> Result<(), ForgeError> {
+    let config = load_config_validated(cli)?;
+    let runner = runner::SystemRunner;
+    let ctx = build_context(cli, &runner, &config);
+    stack::dispatch(&ctx, sub, writer)
 }
 
 /// Dispatch cluster subcommands.

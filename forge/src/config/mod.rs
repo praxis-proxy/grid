@@ -111,6 +111,9 @@ fn default_cluster_prefix() -> String {
 // Networking
 // ---------------------------------------------------------------
 
+/// Default DNS zone for cross-cluster service discovery.
+pub const DEFAULT_DNS_ZONE: &str = "forge.test";
+
 /// Container-network configuration for the environment.
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -118,6 +121,16 @@ pub struct NetworkConfig {
     /// Enable a shared container network across clusters.
     #[serde(default)]
     pub cross_cluster: bool,
+    /// DNS zone for exported-service discovery (default `forge.test`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns_zone: Option<String>,
+}
+
+impl NetworkConfig {
+    /// Resolved DNS zone, falling back to [`DEFAULT_DNS_ZONE`].
+    pub fn dns_zone(&self) -> &str {
+        self.dns_zone.as_deref().unwrap_or(DEFAULT_DNS_ZONE)
+    }
 }
 
 // ---------------------------------------------------------------
@@ -178,27 +191,111 @@ fn default_workers() -> u32 {
 
 /// Specification for a host-level container service.
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ServiceSpec {
     /// Service name (DNS-label-like, unique within the environment).
     pub name: String,
     /// Container image reference.
     pub image: String,
+    /// Container network mode.
+    #[serde(default)]
+    pub network: NetworkMode,
+    /// Services that must start before this one.
+    #[serde(default)]
+    pub depends_on: Vec<String>,
     /// Host-to-container port mappings.
     #[serde(default)]
     pub ports: Vec<PortMapping>,
-    /// Container command arguments.
+    /// Bind-mount volume specifications.
     #[serde(default)]
-    pub args: Vec<String>,
+    pub volumes: Vec<VolumeMount>,
     /// Environment variables for the container.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// Container command arguments.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Container restart policy.
+    #[serde(default)]
+    pub restart: RestartPolicy,
+    /// Health-check configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_check: Option<HealthCheck>,
+}
+
+/// Container network attachment mode.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum NetworkMode {
+    /// Attach to the Forge environment container network.
+    Environment,
+    /// Use the host network namespace.
+    Host,
+    /// No explicit network attachment.
+    #[default]
+    None,
+}
+
+/// Container restart policy.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum RestartPolicy {
+    /// Never restart.
+    #[default]
+    No,
+    /// Restart on non-zero exit.
+    OnFailure,
+    /// Always restart.
+    Always,
+    /// Restart unless explicitly stopped.
+    UnlessStopped,
+}
+
+/// A bind-mount volume specification.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct VolumeMount {
+    /// Source path (relative to config root).
+    pub source: String,
+    /// Target path inside the container (must be absolute).
+    pub target: String,
+    /// Whether the mount is read-only.
+    #[serde(default)]
+    pub read_only: bool,
+}
+
+/// Health-check configuration for a service.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct HealthCheck {
+    /// Health-check type.
+    #[serde(rename = "type")]
+    pub check_type: HealthCheckType,
+    /// Port to probe (container-side).
+    pub port: u16,
+    /// Interval between probes (e.g. `"2s"`, `"500ms"`).
+    pub interval: String,
+    /// Per-probe timeout (e.g. `"1s"`).
+    pub timeout: String,
+    /// Maximum probe attempts before marking unhealthy.
+    pub retries: u32,
+}
+
+/// Supported health-check probe types.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum HealthCheckType {
+    /// TCP connect probe.
+    Tcp,
 }
 
 /// A host-to-container port mapping.
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct PortMapping {
+    /// Optional bind address (must be a valid IP).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bind_address: Option<String>,
     /// Host port.
     pub host: u16,
     /// Container port.
@@ -326,6 +423,13 @@ pub enum StepSpec {
     MetallbAutoPool {
         /// Pool name.
         name: String,
+    },
+    /// Patch `CoreDNS` to forward a zone to upstream resolvers.
+    CoreDnsForward {
+        /// DNS zone to forward (e.g. `"hub.forge.test"`).
+        zone: String,
+        /// Upstream resolver addresses.
+        upstreams: Vec<String>,
     },
 }
 

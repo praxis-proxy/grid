@@ -23,7 +23,8 @@ pub fn run(ctx: &ForgeContext<'_>, writer: &mut dyn Write) -> Result<(), ForgeEr
     let live = kind_ops::list_clusters(ctx.runner)?;
     let entries = build_entries(ctx, &st, &live);
     let net_info = network_info(&st);
-    render_entries(writer, &entries, &net_info, &ctx.format)
+    let svc_entries = service_entries(&st);
+    render_all(writer, &entries, &net_info, &svc_entries, &ctx.format)
 }
 
 // ---------------------------------------------------------------
@@ -91,24 +92,59 @@ fn network_info(st: &state::ForgeState) -> Option<NetInfo> {
 }
 
 // ---------------------------------------------------------------
+// Service status
+// ---------------------------------------------------------------
+
+/// Status information for one service.
+struct SvcEntry {
+    /// Service name.
+    name: String,
+    /// Container name.
+    container_name: String,
+    /// Phase label (e.g. "running", "stopped").
+    phase: String,
+    /// Health label (e.g. "healthy", "unknown").
+    health: String,
+}
+
+/// Build service status entries from state.
+fn service_entries(st: &state::ForgeState) -> Vec<SvcEntry> {
+    st.services
+        .iter()
+        .map(|s| SvcEntry {
+            name: s.name.clone(),
+            container_name: s.container_name.clone(),
+            phase: format!("{:?}", s.phase).to_lowercase(),
+            health: format!("{:?}", s.health).to_lowercase(),
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------
 // Rendering
 // ---------------------------------------------------------------
 
-/// Render status entries.
-fn render_entries(
+/// Render all status entries.
+fn render_all(
     writer: &mut dyn Write,
     entries: &[StatusEntry],
     net: &Option<NetInfo>,
+    services: &[SvcEntry],
     format: &OutputFormat,
 ) -> Result<(), ForgeError> {
     match format {
-        OutputFormat::Json => render_json(writer, entries, net),
-        OutputFormat::Text => render_text(writer, entries, net),
+        OutputFormat::Json => render_json(writer, entries, net, services),
+        OutputFormat::Text => render_text(writer, entries, net, services),
     }
 }
 
 /// Render entries as JSON.
-fn render_json(writer: &mut dyn Write, entries: &[StatusEntry], net: &Option<NetInfo>) -> Result<(), ForgeError> {
+fn render_json(
+    writer: &mut dyn Write,
+    entries: &[StatusEntry],
+    net: &Option<NetInfo>,
+    services: &[SvcEntry],
+) -> Result<(), ForgeError> {
     let items: Vec<_> = entries.iter().map(entry_to_json).collect();
     let mut data = serde_json::json!({ "clusters": items });
     if let (Some(n), Some(obj)) = (net, data.as_object_mut()) {
@@ -117,9 +153,23 @@ fn render_json(writer: &mut dyn Write, entries: &[StatusEntry], net: &Option<Net
             serde_json::json!({ "name": n.name, "phase": n.phase }),
         );
     }
+    if let (false, Some(obj)) = (services.is_empty(), data.as_object_mut()) {
+        let svc_items: Vec<_> = services.iter().map(svc_to_json).collect();
+        obj.insert("services".to_owned(), serde_json::json!(svc_items));
+    }
     let envelope = output::success(data);
     output::write_json(writer, &envelope)?;
     Ok(())
+}
+
+/// Convert one service entry to JSON.
+fn svc_to_json(s: &SvcEntry) -> serde_json::Value {
+    serde_json::json!({
+        "name": s.name,
+        "containerName": s.container_name,
+        "phase": s.phase,
+        "health": s.health,
+    })
 }
 
 /// Convert one entry to JSON.
@@ -133,14 +183,30 @@ fn entry_to_json(e: &StatusEntry) -> serde_json::Value {
 }
 
 /// Render entries as text.
-fn render_text(writer: &mut dyn Write, entries: &[StatusEntry], net: &Option<NetInfo>) -> Result<(), ForgeError> {
+fn render_text(
+    writer: &mut dyn Write,
+    entries: &[StatusEntry],
+    net: &Option<NetInfo>,
+    services: &[SvcEntry],
+) -> Result<(), ForgeError> {
     if let Some(n) = net {
         output::write_text(writer, &format!("  network: {} ({})", n.name, n.phase))?;
     }
     for e in entries {
         output::write_text(writer, &format_entry_text(e))?;
     }
+    for s in services {
+        output::write_text(writer, &format_svc_text(s))?;
+    }
     Ok(())
+}
+
+/// Format a service entry as a text line.
+fn format_svc_text(s: &SvcEntry) -> String {
+    format!(
+        "  {}: phase={}, health={}, container={}",
+        s.name, s.phase, s.health, s.container_name
+    )
 }
 
 /// Format one entry as a text line.
@@ -233,6 +299,7 @@ spec:
             runner: &runner,
             config: &config,
             state_dir: dir.path().to_path_buf(),
+            config_dir: dir.path().to_path_buf(),
             format: OutputFormat::Text,
             dry_run: false,
         };
@@ -258,6 +325,7 @@ spec:
             runner: &runner,
             config: &config,
             state_dir: dir.path().to_path_buf(),
+            config_dir: dir.path().to_path_buf(),
             format: OutputFormat::Text,
             dry_run: false,
         };
@@ -278,6 +346,8 @@ spec:
         st.network = Some(state::NetworkState {
             name: "test-net".to_owned(),
             phase: state::NetworkPhase::Active,
+            cidr: None,
+            cluster_pools: Vec::new(),
         });
         state::save(state_dir, &st).unwrap_or_else(|_| std::process::abort());
     }
@@ -300,6 +370,7 @@ spec:
             runner: &runner,
             config: &config,
             state_dir: dir.path().to_path_buf(),
+            config_dir: dir.path().to_path_buf(),
             format: OutputFormat::Text,
             dry_run: false,
         };

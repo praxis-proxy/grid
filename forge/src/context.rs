@@ -20,6 +20,8 @@ pub struct ForgeContext<'a> {
     pub config: &'a ForgeConfig,
     /// Directory for state files and locks.
     pub state_dir: PathBuf,
+    /// Directory containing the config file (for resolving relative paths).
+    pub config_dir: PathBuf,
     /// Output format (text or JSON).
     pub format: OutputFormat,
     /// If true, skip all mutating operations.

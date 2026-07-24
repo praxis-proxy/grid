@@ -15,6 +15,24 @@ use crate::{
 // Naming
 // ---------------------------------------------------------------
 
+/// Verify the resolved runtime supports cross-cluster networking.
+///
+/// `KIND_EXPERIMENTAL_DOCKER_NETWORK` is Docker-only; Podman does not
+/// support it.  Call after `runtime::resolve()` when cross-cluster
+/// networking is configured.
+///
+/// # Errors
+///
+/// Returns [`ForgeError::Config`] if the resolved binary is not Docker.
+pub fn require_docker_for_cross_cluster(binary: &str) -> Result<(), ForgeError> {
+    if binary == "docker" {
+        return Ok(());
+    }
+    Err(ForgeError::Config(format!(
+        "cross-cluster networking requires Docker, but runtime resolved to {binary:?}"
+    )))
+}
+
 /// Build the deterministic network name: `"{env_name}-net"`.
 pub fn network_name(env_name: &str) -> String {
     format!("{env_name}-net")

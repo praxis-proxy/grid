@@ -42,8 +42,8 @@ pub fn cluster_exists(runner: &dyn CommandRunner, kind_name: &str) -> Result<boo
 
 /// Create a KIND cluster with a generated config.
 ///
-/// Writes a temporary KIND config file to `config_dir`, runs
-/// `kind create cluster`, and cleans up the temp file.
+/// When `docker_network` is `Some`, the cluster nodes join that
+/// Docker network via `KIND_EXPERIMENTAL_DOCKER_NETWORK`.
 ///
 /// # Errors
 ///
@@ -53,10 +53,11 @@ pub fn create_cluster(
     kind_name: &str,
     nodes: &NodeConfig,
     config_dir: &std::path::Path,
+    docker_network: Option<&str>,
 ) -> Result<(), ForgeError> {
     let config_yaml = generate_kind_config(nodes);
     let config_path = write_kind_config(config_dir, kind_name, &config_yaml)?;
-    let result = run_create(runner, kind_name, &config_path);
+    let result = run_create(runner, kind_name, &config_path, docker_network);
     cleanup_kind_config(&config_path);
     result
 }
@@ -146,8 +147,13 @@ fn write_kind_config(dir: &std::path::Path, kind_name: &str, content: &str) -> R
 }
 
 /// Run `kind create cluster` with the given config file.
-fn run_create(runner: &dyn CommandRunner, kind_name: &str, config_path: &std::path::Path) -> Result<(), ForgeError> {
-    let spec = create_spec(kind_name, config_path);
+fn run_create(
+    runner: &dyn CommandRunner,
+    kind_name: &str,
+    config_path: &std::path::Path,
+    docker_network: Option<&str>,
+) -> Result<(), ForgeError> {
+    let spec = create_spec(kind_name, config_path, docker_network);
     let output = runner.run(&spec)?;
     check_success(&output, "kind create cluster")
 }
@@ -158,7 +164,11 @@ fn cleanup_kind_config(path: &std::path::Path) {
 }
 
 /// Build a `kind create cluster` command spec.
-fn create_spec(kind_name: &str, config_path: &std::path::Path) -> CommandSpec {
+fn create_spec(kind_name: &str, config_path: &std::path::Path, docker_network: Option<&str>) -> CommandSpec {
+    let mut env = BTreeMap::default();
+    if let Some(net) = docker_network {
+        env.insert("KIND_EXPERIMENTAL_DOCKER_NETWORK".into(), net.into());
+    }
     CommandSpec {
         program: "kind".into(),
         args: vec![
@@ -169,7 +179,7 @@ fn create_spec(kind_name: &str, config_path: &std::path::Path) -> CommandSpec {
             "--config".into(),
             config_path.as_os_str().to_owned(),
         ],
-        env: BTreeMap::default(),
+        env,
         stdin: None,
         redact: Vec::new(),
     }
@@ -327,6 +337,20 @@ mod tests {
             Some("forge-edge"),
             "second cluster"
         );
+    }
+
+    #[test]
+    fn create_spec_sets_docker_network_env() {
+        let spec = create_spec("forge-hub", std::path::Path::new("/tmp/cfg.yaml"), Some("test-net"));
+        let key = std::ffi::OsString::from("KIND_EXPERIMENTAL_DOCKER_NETWORK");
+        let expected = std::ffi::OsString::from("test-net");
+        assert_eq!(spec.env.get(&key), Some(&expected), "should set network env");
+    }
+
+    #[test]
+    fn create_spec_omits_env_without_network() {
+        let spec = create_spec("forge-hub", std::path::Path::new("/tmp/cfg.yaml"), None);
+        assert!(spec.env.is_empty(), "should have no env vars without network");
     }
 
     #[test]

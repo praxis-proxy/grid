@@ -11,8 +11,8 @@ use crate::{
     error::ForgeError,
     networking,
     output::{self, OutputFormat},
-    runtime,
-    state::{self, ClusterPhase, NetworkPhase, lock},
+    runtime, service,
+    state::{self, ClusterPhase, NetworkPhase, ServicePhase, lock},
 };
 
 /// Run the `down` command.
@@ -24,13 +24,14 @@ use crate::{
 pub fn run(ctx: &ForgeContext<'_>, _force: bool, writer: &mut dyn Write) -> Result<(), ForgeError> {
     let _lock = lock::acquire(&ctx.state_dir)?;
     let mut st = state::load(&ctx.state_dir)?;
+    let svc_results = stop_services(ctx, &mut st)?;
     let results = delete_clusters(ctx, &mut st)?;
     let net_result = remove_env_network(ctx, &mut st)?;
     record_operation(&mut st, "down", true);
     if !ctx.dry_run {
         state::save(&ctx.state_dir, &st)?;
     }
-    render_results(writer, &results, &net_result, &ctx.format)
+    render_all(writer, &svc_results, &results, &net_result, &ctx.format)
 }
 
 // ---------------------------------------------------------------
@@ -95,6 +96,79 @@ fn delete_one(
 fn mark_gone(state: &mut state::ForgeState, name: &str) {
     if let Some(cs) = state::find_cluster_mut(state, name) {
         cs.phase = ClusterPhase::Gone;
+    }
+}
+
+// ---------------------------------------------------------------
+// Service teardown
+// ---------------------------------------------------------------
+
+/// Result of processing one service for teardown.
+struct SvcDeleteResult {
+    /// Service config name.
+    name: String,
+    /// Deterministic container name.
+    container_name: String,
+    /// Whether this was a dry-run skip.
+    dry_run: bool,
+}
+
+/// Stop services in reverse dependency order.
+fn stop_services(ctx: &ForgeContext<'_>, state: &mut state::ForgeState) -> Result<Vec<SvcDeleteResult>, ForgeError> {
+    if ctx.config.spec.services.is_empty() {
+        return Ok(Vec::new());
+    }
+    let binary = resolve_binary(ctx, state)?;
+    let mut order = service::dependency_order(&ctx.config.spec.services)?;
+    order.reverse();
+    let mut results = Vec::new();
+    for idx in order {
+        let r = stop_one_svc(ctx, state, &binary, idx)?;
+        results.push(r);
+    }
+    Ok(results)
+}
+
+/// Stop a single service by index.
+fn stop_one_svc(
+    ctx: &ForgeContext<'_>,
+    state: &mut state::ForgeState,
+    binary: &str,
+    idx: usize,
+) -> Result<SvcDeleteResult, ForgeError> {
+    let svc = ctx
+        .config
+        .spec
+        .services
+        .get(idx)
+        .ok_or_else(|| ForgeError::State("service index out of range".to_owned()))?;
+    let cname = service::container_name(&ctx.config.metadata.name, &svc.name);
+    if ctx.dry_run {
+        return Ok(SvcDeleteResult {
+            name: svc.name.clone(),
+            container_name: cname,
+            dry_run: true,
+        });
+    }
+    let params = service::ServiceParams {
+        binary,
+        container_name: &cname,
+        env_name: &ctx.config.metadata.name,
+        config_dir: &ctx.config_dir,
+    };
+    service::stop_service(ctx.runner, &params)?;
+    mark_svc_gone(state, &svc.name);
+    Ok(SvcDeleteResult {
+        name: svc.name.clone(),
+        container_name: cname,
+        dry_run: false,
+    })
+}
+
+/// Mark a service as `Gone` in state.
+fn mark_svc_gone(state: &mut state::ForgeState, name: &str) {
+    if let Some(ss) = state::find_service_mut(state, name) {
+        ss.phase = ServicePhase::Gone;
     }
 }
 
@@ -164,27 +238,33 @@ fn record_operation(state: &mut state::ForgeState, operation: &str, success: boo
 // Rendering
 // ---------------------------------------------------------------
 
-/// Render deletion results.
-fn render_results(
+/// Render all deletion results.
+fn render_all(
     writer: &mut dyn Write,
-    results: &[DeleteResult],
+    services: &[SvcDeleteResult],
+    clusters: &[DeleteResult],
     net: &Option<NetworkTeardown>,
     format: &OutputFormat,
 ) -> Result<(), ForgeError> {
     match format {
-        OutputFormat::Json => render_json(writer, results, net),
-        OutputFormat::Text => render_text(writer, results, net),
+        OutputFormat::Json => render_json(writer, services, clusters, net),
+        OutputFormat::Text => render_text(writer, services, clusters, net),
     }
 }
 
 /// Render results as JSON.
 fn render_json(
     writer: &mut dyn Write,
-    results: &[DeleteResult],
+    services: &[SvcDeleteResult],
+    clusters: &[DeleteResult],
     net: &Option<NetworkTeardown>,
 ) -> Result<(), ForgeError> {
-    let items: Vec<_> = results.iter().map(result_to_json).collect();
+    let items: Vec<_> = clusters.iter().map(result_to_json).collect();
     let mut data = serde_json::json!({ "clusters": items });
+    if let (false, Some(obj)) = (services.is_empty(), data.as_object_mut()) {
+        let svc_items: Vec<_> = services.iter().map(svc_result_to_json).collect();
+        obj.insert("services".to_owned(), serde_json::json!(svc_items));
+    }
     if let (Some(n), Some(obj)) = (net, data.as_object_mut()) {
         obj.insert(
             "network".to_owned(),
@@ -194,6 +274,15 @@ fn render_json(
     let envelope = output::success(data);
     output::write_json(writer, &envelope)?;
     Ok(())
+}
+
+/// Convert one service teardown result to JSON.
+fn svc_result_to_json(r: &SvcDeleteResult) -> serde_json::Value {
+    serde_json::json!({
+        "name": r.name,
+        "containerName": r.container_name,
+        "dryRun": r.dry_run,
+    })
 }
 
 /// Convert one result to JSON.
@@ -208,16 +297,28 @@ fn result_to_json(r: &DeleteResult) -> serde_json::Value {
 /// Render results as text.
 fn render_text(
     writer: &mut dyn Write,
-    results: &[DeleteResult],
+    services: &[SvcDeleteResult],
+    clusters: &[DeleteResult],
     net: &Option<NetworkTeardown>,
 ) -> Result<(), ForgeError> {
-    for r in results {
+    for s in services {
+        output::write_text(writer, &format_svc_text(s))?;
+    }
+    for r in clusters {
         output::write_text(writer, &format_result_text(r))?;
     }
     if let Some(n) = net {
         output::write_text(writer, &format_net_text(n))?;
     }
     Ok(())
+}
+
+/// Format a service teardown result as a text line.
+fn format_svc_text(s: &SvcDeleteResult) -> String {
+    if s.dry_run {
+        return format!("would stop service '{}' (container: {})", s.name, s.container_name);
+    }
+    format!("stopped service '{}' (container: {})", s.name, s.container_name)
 }
 
 /// Format a network teardown result as a text line.
@@ -269,6 +370,17 @@ spec:
         })
     }
 
+    /// Create a temp dir for test state.
+    fn test_dir() -> tempfile::TempDir {
+        tempfile::tempdir().unwrap_or_else(|_| {
+            std::process::abort();
+            #[expect(unreachable_code, reason = "abort prevents reaching this")]
+            {
+                unreachable!()
+            }
+        })
+    }
+
     /// Pre-populate state with a running cluster.
     fn seed_state(state_dir: &std::path::Path) {
         let mut st = state::empty();
@@ -283,13 +395,7 @@ spec:
 
     #[test]
     fn down_deletes_cluster() {
-        let dir = tempfile::tempdir().unwrap_or_else(|_| {
-            std::process::abort();
-            #[expect(unreachable_code, reason = "abort prevents reaching this")]
-            {
-                unreachable!()
-            }
-        });
+        let dir = test_dir();
         seed_state(dir.path());
         let config = test_config();
         let mut runner = MockRunner::new();
@@ -305,6 +411,7 @@ spec:
             runner: &runner,
             config: &config,
             state_dir: dir.path().to_path_buf(),
+            config_dir: dir.path().to_path_buf(),
             format: OutputFormat::Text,
             dry_run: false,
         };
@@ -317,13 +424,7 @@ spec:
 
     #[test]
     fn down_dry_run_does_not_delete() {
-        let dir = tempfile::tempdir().unwrap_or_else(|_| {
-            std::process::abort();
-            #[expect(unreachable_code, reason = "abort prevents reaching this")]
-            {
-                unreachable!()
-            }
-        });
+        let dir = test_dir();
         seed_state(dir.path());
         let config = test_config();
         let runner = MockRunner::new();
@@ -331,6 +432,7 @@ spec:
             runner: &runner,
             config: &config,
             state_dir: dir.path().to_path_buf(),
+            config_dir: dir.path().to_path_buf(),
             format: OutputFormat::Text,
             dry_run: true,
         };
@@ -354,6 +456,8 @@ spec:
         st.network = Some(state::NetworkState {
             name: "test-net".to_owned(),
             phase: NetworkPhase::Active,
+            cidr: None,
+            cluster_pools: Vec::new(),
         });
         state::save(state_dir, &st).unwrap_or_else(|_| std::process::abort());
     }
@@ -378,13 +482,7 @@ spec:
 
     #[test]
     fn down_removes_network() {
-        let dir = tempfile::tempdir().unwrap_or_else(|_| {
-            std::process::abort();
-            #[expect(unreachable_code, reason = "abort prevents reaching this")]
-            {
-                unreachable!()
-            }
-        });
+        let dir = test_dir();
         seed_state_with_network(dir.path());
         let config = test_config();
         let mut runner = MockRunner::new();
@@ -399,6 +497,7 @@ spec:
             runner: &runner,
             config: &config,
             state_dir: dir.path().to_path_buf(),
+            config_dir: dir.path().to_path_buf(),
             format: OutputFormat::Text,
             dry_run: false,
         };
@@ -411,13 +510,7 @@ spec:
 
     #[test]
     fn down_dry_run_reports_network() {
-        let dir = tempfile::tempdir().unwrap_or_else(|_| {
-            std::process::abort();
-            #[expect(unreachable_code, reason = "abort prevents reaching this")]
-            {
-                unreachable!()
-            }
-        });
+        let dir = test_dir();
         seed_state_with_network(dir.path());
         let config = test_config();
         let runner = MockRunner::new();
@@ -425,6 +518,7 @@ spec:
             runner: &runner,
             config: &config,
             state_dir: dir.path().to_path_buf(),
+            config_dir: dir.path().to_path_buf(),
             format: OutputFormat::Text,
             dry_run: true,
         };

@@ -19,12 +19,11 @@
 //! validation, or operator testing.  Those responsibilities belong
 //! to the consuming project's own test harness.
 //!
-//! # Current status (F2)
+//! # Current status (F4)
 //!
-//! F2 adds the mutating layer on the F1 foundation: persistent state
-//! with file locking, container runtime detection, KIND cluster
-//! lifecycle (`up`, `down`, `status`, `cluster` subcommands), and
-//! container-network management with ownership-safe create/remove.
+//! F4 adds the generic stack execution engine: composable deployment
+//! stacks applied to KIND clusters via templates and sequential step
+//! execution, with `stack list/plan/apply/status` subcommands.
 
 pub mod cli;
 pub mod cluster;
@@ -35,4 +34,6 @@ pub mod error;
 pub mod networking;
 pub mod output;
 pub mod runtime;
+pub mod service;
+pub mod stack;
 pub mod state;
