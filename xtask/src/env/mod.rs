@@ -21,7 +21,9 @@ use std::{
 
 use clap::Subcommand;
 
-use self::config::{ClusterRole, EnvConfig, ProviderBackend};
+#[cfg(test)]
+use self::config::ClusterRole;
+use self::config::{EnvConfig, ProviderBackend};
 
 // ---------------------------------------------------------------------------
 // Shared infrastructure helpers
@@ -829,7 +831,7 @@ fn report_cluster_status(cfg: &EnvConfig, mut all_ok: bool) -> bool {
         eprintln!("  grid-{name}: {}", status_label(ok));
         if ok
             && let Some(def) = cfg.clusters.definitions.get(name)
-            && def.role == ClusterRole::Provider
+            && def.role.is_provider()
         {
             let deploy_ok = kind::is_provider_backend_ready(name, def);
             all_ok = all_ok && deploy_ok;
@@ -1435,8 +1437,7 @@ fn provider_clusters_from_config(cfg: &EnvConfig) -> Vec<(String, Vec<String>)> 
         .iter()
         .filter_map(|name| {
             cfg.clusters.definitions.get(name).and_then(|def| {
-                (def.role == ClusterRole::Provider && !def.models.is_empty())
-                    .then(|| (name.clone(), def.models.clone()))
+                (def.role.is_provider() && !def.models.is_empty()).then(|| (name.clone(), def.models.clone()))
             })
         })
         .collect()
@@ -1494,7 +1495,7 @@ fn resolve_operator_site_name<'a>(
                 cfg.clusters
                     .definitions
                     .get(*name)
-                    .is_some_and(|d| d.role == ClusterRole::Provider)
+                    .is_some_and(|d| d.role.is_provider())
             })
             .map(String::as_str)
             .ok_or_else(|| "no provider site in config".into())
@@ -1516,7 +1517,7 @@ fn resolve_operator_provider(
         .definitions
         .get(site_name)
         .ok_or_else(|| format!("operator provider site {site_name:?} not found in config"))?;
-    if def.role != ClusterRole::Provider {
+    if !def.role.is_provider() {
         return Err(format!("operator site {site_name:?} is not a provider cluster").into());
     }
     let model = def
@@ -3012,7 +3013,7 @@ fn llmd_compat_check_all_model_fields(cfg: &EnvConfig, port: u16) -> StepResult 
         let Some(def) = cfg.clusters.definitions.get(name) else {
             continue;
         };
-        if def.role != ClusterRole::Provider {
+        if !def.role.is_provider() {
             continue;
         }
         for model in &def.models {
@@ -3216,7 +3217,7 @@ fn responses_check_all_model_fields(cfg: &EnvConfig, port: u16) -> StepResult {
         let Some(def) = cfg.clusters.definitions.get(name) else {
             continue;
         };
-        if def.role != ClusterRole::Provider {
+        if !def.role.is_provider() {
             continue;
         }
         for model in &def.models {
@@ -3620,12 +3621,7 @@ fn env_verify_metrics_routing(config: &Path) -> Result<(), Box<dyn std::error::E
         .clusters
         .names
         .iter()
-        .find(|n| {
-            cfg.clusters
-                .definitions
-                .get(*n)
-                .is_some_and(|d| d.role == ClusterRole::Consumer)
-        })
+        .find(|n| cfg.clusters.definitions.get(*n).is_some_and(|d| d.role.is_consumer()))
         .map(String::as_str)
         .ok_or("no consumer cluster in config")?;
 
@@ -4388,12 +4384,7 @@ fn env_verify_failover_under_lost_peer(config: &Path) -> Result<(), Box<dyn std:
         .clusters
         .names
         .iter()
-        .find(|n| {
-            cfg.clusters
-                .definitions
-                .get(*n)
-                .is_some_and(|d| d.role == ClusterRole::Consumer)
-        })
+        .find(|n| cfg.clusters.definitions.get(*n).is_some_and(|d| d.role.is_consumer()))
         .map(String::as_str)
         .ok_or("no consumer cluster in config")?;
     let consumer_ctx = kind::kubectl_context(consumer_site);
@@ -5441,6 +5432,24 @@ mod multi_provider_tests {
         let cfg = make_config(&[("consumer", ClusterRole::Consumer, vec!["x".to_owned()])]);
         let providers = provider_clusters_from_config(&cfg);
         assert!(providers.is_empty(), "consumer clusters must not appear as providers");
+    }
+
+    #[test]
+    fn provider_clusters_from_config_includes_both_role_cluster() {
+        let cfg = make_config(&[("edge", ClusterRole::Both, vec!["model-local".to_owned()])]);
+        let providers = provider_clusters_from_config(&cfg);
+        assert_eq!(providers.len(), 1, "both-role cluster must be provider-capable");
+        assert_eq!(providers[0].0, "edge", "provider site should be the mixed-role cluster");
+        assert_eq!(
+            providers[0].1,
+            vec!["model-local"],
+            "provider models should come from the mixed-role cluster"
+        );
+        assert_eq!(
+            cfg.consumer_cluster_name(),
+            Some("edge"),
+            "same cluster must also be selected as the consumer"
+        );
     }
 
     #[test]

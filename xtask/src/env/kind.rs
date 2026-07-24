@@ -2,8 +2,10 @@
 
 use std::{fmt::Write as _, process::Command};
 
+#[cfg(test)]
+use crate::env::config::ClusterRole;
 use crate::env::{
-    config::{ClusterDef, ClusterRole, ProviderBackend},
+    config::{ClusterDef, ProviderBackend},
     image_overrides, kubectl,
 };
 
@@ -77,7 +79,7 @@ pub(crate) fn create_cluster(name: &str, def: &ClusterDef) -> Result<(), Box<dyn
         run_cmd("kind", &["create", "cluster", "--name", &full])?;
     }
 
-    if def.role == ClusterRole::Provider && !def.models.is_empty() {
+    if def.role.is_provider() && !def.models.is_empty() {
         match def.backend {
             ProviderBackend::InferenceSim => deploy_inference_sim(&full, name, def)?,
             ProviderBackend::MockOpenai => deploy_mock_openai(&full, name)?,
