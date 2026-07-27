@@ -9,7 +9,8 @@
 //! 1. If `GRID_GATEWAY_ADDRESS` env var is set and non-empty, use it (explicit override for testing or non-standard
 //!    topologies).  No background polling runs in this case.
 //! 2. Otherwise, look up a Kubernetes `LoadBalancer` Service by name and extract its external address.  A background
-//!    poller retries periodically until the address appears, then continues polling for changes.
+//!    poller retries periodically until the address appears, then continues polling and re-announcing the current
+//!    address.
 //!
 //! # Configuration
 //!
@@ -78,8 +79,8 @@ pub fn discovery_interval() -> Duration {
 
 /// Run the gateway address discovery poller.
 ///
-/// Periodically resolves the Service address and updates the SWIM
-/// handle when the address changes.  Runs until the process exits.
+/// Periodically resolves the Service address and re-announces it through the
+/// SWIM handle. Runs until the process exits.
 /// Once an address has been discovered, a later pending/missing Service
 /// address is treated as transient and the last-good address is retained.
 ///
@@ -93,21 +94,21 @@ pub async fn run_discovery_poller(client: Client, swim: Arc<SwimHandle>) {
     let interval = discovery_interval();
     let interval_ms = u64::try_from(interval.as_millis()).unwrap_or(u64::MAX);
     tracing::info!(interval_ms, "starting gateway address discovery poller");
-    let mut last_addr: Option<String> = swim.gateway_address();
-    poll_loop(&client, &swim, &mut last_addr, interval).await;
+    poll_loop(&client, &swim, interval).await;
 }
 
 /// Inner polling loop; separated to satisfy clippy complexity/loop lints.
-async fn poll_loop(client: &Client, swim: &SwimHandle, last_addr: &mut Option<String>, interval: Duration) -> ! {
+async fn poll_loop(client: &Client, swim: &SwimHandle, interval: Duration) -> ! {
     loop {
         tokio::time::sleep(interval).await;
         match discover_from_service(client).await {
-            Ok(Some(addr)) if Some(&addr) != last_addr.as_ref() => {
+            Ok(Some(addr)) => {
+                // Re-announce an unchanged address as well. A peer may join
+                // after the previous metadata broadcast, or retain an
+                // invalidation key from an earlier operator instance.
                 if let Err(e) = swim.set_gateway_address(Some(addr.clone())) {
                     tracing::warn!(error = %e, "failed to update gateway address on SWIM handle");
-                    continue;
                 }
-                *last_addr = Some(addr);
             },
             Ok(_) => {},
             Err(e) => {

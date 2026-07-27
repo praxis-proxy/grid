@@ -1,0 +1,58 @@
+listeners:
+  - name: proxy
+    address: "0.0.0.0:8080"
+    filter_chains:
+      - main
+
+filter_chains:
+  - name: main
+    filters:
+      - filter: json_body_field
+        field: model
+        header: X-Model
+      - filter: headers
+        response_set:
+          - name: X-Grid-Demo-Edge-Gateway
+            value: "{{ cluster.name }}"
+      - filter: grid_route
+        overlay_file: /etc/grid/grid-config.json
+        model_header: X-Model
+        provider_hop_clusters:
+          - sim-east-provider
+          - sim-west-provider
+        reload:
+          enabled: true
+          debounce_ms: 500
+        session_affinity:
+          enabled: true
+          header: X-Session-Id
+          ttl_secs: 3600
+      - filter: load_balancer
+        clusters:
+          - name: sim-east-provider
+            tls:
+              ca:
+                ca_path: /etc/praxis/tls/ca.crt
+              client_cert:
+                cert_path: /etc/praxis/tls/tls.crt
+                key_path: /etc/praxis/tls/tls.key
+              sni: east-provider.grid.internal
+              verify: true
+            endpoints:
+              - "{{ captures.east-provider.provider-gateway-ip }}:8443"
+          - name: sim-west-provider
+            tls:
+              ca:
+                ca_path: /etc/praxis/tls/ca.crt
+              client_cert:
+                cert_path: /etc/praxis/tls/tls.crt
+                key_path: /etc/praxis/tls/tls.key
+              sni: west-provider.grid.internal
+              verify: true
+            endpoints:
+              - "{{ captures.west-provider.provider-gateway-ip }}:8443"
+
+admin:
+  address: "127.0.0.1:9901"
+
+shutdown_timeout_secs: 5

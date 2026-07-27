@@ -113,7 +113,6 @@ mock-providers-image: | require-container-engine
 # GLB demo images — deterministic :glb-demo tags, no :latest dependency.
 glb-demo-images: | require-container-engine
 	$(CONTAINER_ENGINE) build -f deploy/operator/Containerfile -t grid-operator:glb-demo .
-	$(CONTAINER_ENGINE) build -f deploy/overlay-sync/Containerfile -t grid-overlay-sync:glb-demo .
 	$(CONTAINER_ENGINE) build -f mock-providers/Containerfile -t grid-mock-providers:glb-demo .
 
 # -------------------------------------------------------------------

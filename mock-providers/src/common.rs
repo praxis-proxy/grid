@@ -14,16 +14,38 @@ use crate::AppState;
 /// Header name for the demo provider site attribution.
 pub(crate) const PROVIDER_HEADER_NAME: &str = "x-grid-demo-provider";
 
-/// Axum middleware that injects `X-Grid-Demo-Provider` on every response.
+/// Provider-owned attribution received by the backend.
+const PROVIDER_ATTRIBUTION_INPUT: &str = "x-grid-provider-attribution";
+
+/// Provider-owned request ID received by the backend.
+const PROVIDER_REQUEST_ID_INPUT: &str = "x-grid-provider-request-id";
+
+/// Safe backend-capture response field for provider attribution.
+pub(crate) const BACKEND_PROVIDER_CAPTURE_HEADER: &str = "x-grid-demo-backend-provider-attribution";
+
+/// Safe backend-capture response field for provider request ID.
+pub(crate) const BACKEND_REQUEST_ID_CAPTURE_HEADER: &str = "x-grid-demo-backend-request-id";
+
+/// Axum middleware that injects bounded demo evidence on every response.
 pub(crate) async fn inject_provider_header(
     State(state): State<AppState>,
     req: Request<Body>,
     next: Next,
 ) -> Response<Body> {
+    let provider_attribution = req.headers().get(PROVIDER_ATTRIBUTION_INPUT).cloned();
+    let provider_request_id = req.headers().get(PROVIDER_REQUEST_ID_INPUT).cloned();
     let mut resp = next.run(req).await;
     if let Ok(val) = HeaderValue::from_str(&state.provider_site) {
         resp.headers_mut()
             .insert(HeaderName::from_static(PROVIDER_HEADER_NAME), val);
+    }
+    if let Some(value) = provider_attribution {
+        resp.headers_mut()
+            .insert(HeaderName::from_static(BACKEND_PROVIDER_CAPTURE_HEADER), value);
+    }
+    if let Some(value) = provider_request_id {
+        resp.headers_mut()
+            .insert(HeaderName::from_static(BACKEND_REQUEST_ID_CAPTURE_HEADER), value);
     }
     resp
 }

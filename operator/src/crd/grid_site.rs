@@ -110,7 +110,7 @@ pub struct EgressTls {
 // ---------------------------------------------------------------------------
 
 /// Observed status of a [`GridSite`].
-#[derive(Clone, Debug, Default, Deserialize, JsonSchema, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GridSiteStatus {
     /// Capabilities offered by this site.
@@ -152,7 +152,7 @@ pub struct GridSiteStatus {
 }
 
 /// Capabilities a site advertises over the grid.
-#[derive(Clone, Debug, Default, Deserialize, JsonSchema, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[expect(clippy::struct_excessive_bools, reason = "capability flags are boolean by nature")]
 #[serde(rename_all = "camelCase")]
 pub struct SiteCapabilities {

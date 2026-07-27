@@ -225,7 +225,7 @@ pub struct HealthCheckConfig {
 // ---------------------------------------------------------------------------
 
 /// Observed status of an [`InferenceProvider`].
-#[derive(Clone, Debug, Default, Deserialize, JsonSchema, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InferenceProviderStatus {
     /// Sites matched by the site selector.

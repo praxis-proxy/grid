@@ -1,0 +1,41 @@
+apiVersion: grid.praxis-proxy.io/v1alpha1
+kind: GridNetwork
+metadata:
+  name: glb-demo
+  labels:
+    grid.praxis-proxy.io/auto-discover-sites: "true"
+spec:
+  gridId: grid-glb-demo-v1
+  region: east
+  zone: east-edge-1
+  seeds:
+    - "{{ captures.east-provider.swim-lb-ip }}:7946"
+    - "{{ captures.west-edge.swim-lb-ip }}:7946"
+    - "{{ captures.west-provider.swim-lb-ip }}:7946"
+  swim:
+    probeInterval: "5s"
+    suspicionTimeout: "15s"
+    gossipNodes: 3
+  gatewayRefs:
+    - name: edge-gateway
+      namespace: grid-system
+      localSiteName: east-edge
+      consumerConfig:
+        enabled: false
+        clusterEndpoints:
+          - cluster: sim-east-provider
+            address: "{{ captures.east-provider.provider-gateway-ip }}:8443"
+            transport:
+              mode: mutual_tls
+              sni: east-provider.grid.internal
+          - cluster: sim-west-provider
+            address: "{{ captures.west-provider.provider-gateway-ip }}:8443"
+            transport:
+              mode: mutual_tls
+              sni: west-provider.grid.internal
+  tls:
+    caSecretRef: null
+    siteSecretRef:
+      name: edge-gateway-tls
+      namespace: grid-system
+    swimKeyRef: null

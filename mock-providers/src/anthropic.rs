@@ -191,6 +191,7 @@ mod tests {
     fn test_state() -> AppState {
         AppState {
             provider_site: Arc::from("test-site"),
+            queue_depth: 0.1,
         }
     }
 

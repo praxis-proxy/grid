@@ -14,6 +14,9 @@
   access policy, and trust model.
 - [Consumer Config](architecture/consumer-config.md) — operator-generated
   consumer Praxis `ConfigMap` and the `GatewayRef.consumerConfig` API.
+- [External Client Ingress](architecture/external-ingress.md) — GTM/GLB edge
+  selection, Grid provider routing, trust boundaries, affinity, snapshot
+  delivery, and provider-boundary ownership.
 
 ## Operations
 

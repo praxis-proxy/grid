@@ -81,6 +81,7 @@ fn handle_apply(
         return handle_plan(ctx, cluster_name, stack_filter, writer);
     }
     let results = apply_stacks(ctx, cluster, &stacks)?;
+    ensure_apply_success(cluster_name, &results)?;
     render_apply(cluster_name, &results, &ctx.format, writer)
 }
 
@@ -110,6 +111,8 @@ struct ApplyResult {
     steps_executed: usize,
     /// Whether the apply succeeded.
     success: bool,
+    /// Underlying step failure, when the apply did not succeed.
+    error: Option<String>,
 }
 
 /// Apply resolved stacks and persist state.
@@ -151,17 +154,32 @@ fn apply_one(
                 name: name.to_owned(),
                 steps_executed: r.steps_executed,
                 success: true,
+                error: None,
             }
         },
         Err(e) => {
-            set_stack_failed(st, name, &cluster.name, digest.as_deref(), &e.to_string());
+            let message = e.to_string();
+            set_stack_failed(st, name, &cluster.name, digest.as_deref(), &message);
             ApplyResult {
                 name: name.to_owned(),
                 steps_executed: 0,
                 success: false,
+                error: Some(message),
             }
         },
     }
+}
+
+/// Convert a failed stack result into a command error after state is saved.
+fn ensure_apply_success(cluster: &str, results: &[ApplyResult]) -> Result<(), ForgeError> {
+    let Some(failed) = results.iter().find(|result| !result.success) else {
+        return Ok(());
+    };
+    let message = failed.error.as_deref().unwrap_or("stack step failed");
+    Err(ForgeError::Command {
+        program: format!("stack apply {} -> {cluster}", failed.name),
+        message: message.to_owned(),
+    })
 }
 
 // -------------------------------------------------------------
@@ -463,6 +481,7 @@ fn apply_entry(r: &ApplyResult) -> serde_json::Value {
         "name": r.name,
         "stepsExecuted": r.steps_executed,
         "success": r.success,
+        "error": r.error,
     })
 }
 
@@ -653,6 +672,49 @@ mod tests {
         assert!(text.contains("Stack: base -> hub"), "should show stack target: {text}");
         assert!(text.contains("[manifest]"), "should describe manifest step: {text}");
         assert!(text.contains("[wait]"), "should describe wait step: {text}");
+    }
+
+    #[test]
+    fn failed_apply_surfaces_the_underlying_error() {
+        let results = [ApplyResult {
+            name: "edge-gateway".to_owned(),
+            steps_executed: 0,
+            success: false,
+            error: Some("deployment did not become available".to_owned()),
+        }];
+        let Err(error) = ensure_apply_success("east-edge", &results) else {
+            std::process::abort()
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("edge-gateway"),
+            "error must identify the stack: {message}"
+        );
+        assert!(
+            message.contains("east-edge"),
+            "error must identify the cluster: {message}"
+        );
+        assert!(
+            message.contains("deployment did not become available"),
+            "error must retain the step failure: {message}"
+        );
+    }
+
+    #[test]
+    fn failed_stack_state_is_retryable_without_manual_deletion() {
+        let mut state = state::empty();
+        set_stack_failed(&mut state, "edge-gateway", "east-edge", Some("old"), "first failure");
+        upsert_stack_state(
+            &mut state,
+            "edge-gateway",
+            "east-edge",
+            StackPhase::Applying,
+            Some("new"),
+        );
+        let entry = state::find_stack(&state, "edge-gateway", "east-edge").unwrap_or_else(|| std::process::abort());
+        assert_eq!(entry.phase, StackPhase::Applying);
+        assert_eq!(entry.digest.as_deref(), Some("new"));
+        assert!(entry.error.is_none(), "retry must clear the previous failure");
     }
 
     #[test]

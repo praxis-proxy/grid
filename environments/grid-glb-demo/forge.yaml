@@ -14,80 +14,57 @@ spec:
     dnsZone: grid-glb.test
 
   clusters:
-    - name: site-us-east
-      stacks: [gateway-api, metallb, grid-operator, swim-lb, site-us-east-demo]
+    - name: east-provider
+      stacks: [metallb, swim-lb, grid-operator, east-provider-operator, east-provider-site, inference-sim]
       properties:
-        region: us-east
-        role: site
+        region: east
+        role: provider
+        gatewayImage: "praxis-ai:glb-demo"
+        operatorImage: "grid-operator:glb-demo"
+        mockProviderImage: "grid-mock-providers:glb-demo"
+        imagePullPolicy: Never
 
-    - name: site-us-west
-      stacks: [gateway-api, metallb, grid-operator, swim-lb, site-us-west-demo, inference-sim]
+    - name: west-provider
+      stacks: [metallb, swim-lb, grid-operator, west-provider-operator, west-provider-site, inference-sim]
       properties:
-        region: us-west
-        role: site
+        region: west
+        role: provider
+        gatewayImage: "praxis-ai:glb-demo"
+        operatorImage: "grid-operator:glb-demo"
+        mockProviderImage: "grid-mock-providers:glb-demo"
+        imagePullPolicy: Never
 
-    - name: site-us-central
-      stacks: [gateway-api, metallb, grid-operator, swim-lb, site-us-central-demo, inference-sim]
+    - name: east-edge
+      stacks: [metallb, swim-lb, grid-operator, east-edge-operator, east-edge-site, edge-gateway]
       properties:
-        region: us-central
-        role: site
+        region: east
+        role: edge
+        gatewayImage: "praxis-ai:glb-demo"
+        operatorImage: "grid-operator:glb-demo"
+        mockProviderImage: "grid-mock-providers:glb-demo"
+        imagePullPolicy: Never
 
-  services:
-    - name: grid-overlay-sync-us-east
-      image: "grid-overlay-sync:glb-demo"
-      autoStart: false
-      network: environment
-      volumes:
-        - source: configs/overlay-sync
-          target: /etc/overlay-sync
-          readOnly: true
-        - source: .forge/runtime/edge-us-east
-          target: /output
-        - source: .forge/runtime/kubeconfig/site-us-east
-          target: /kube
-          readOnly: true
-      env:
-        KUBECONFIG: /kube/config
-        RUST_LOG: info
-      args:
-        - "--config"
-        - "/etc/overlay-sync/sync.yaml"
-      restart: on-failure
+    - name: west-edge
+      stacks: [metallb, swim-lb, grid-operator, west-edge-operator, west-edge-site, edge-gateway]
+      properties:
+        region: west
+        role: edge
+        gatewayImage: "praxis-ai:glb-demo"
+        operatorImage: "grid-operator:glb-demo"
+        mockProviderImage: "grid-mock-providers:glb-demo"
+        imagePullPolicy: Never
 
-    - name: grid-edge-us-east
-      image: "praxis-ai:glb-demo"
-      autoStart: false
-      network: environment
-      dependsOn:
-        - grid-overlay-sync-us-east
-      ports:
-        - bindAddress: "127.0.0.1"
-          host: 8080
-          container: 8080
-          protocol: tcp
-      volumes:
-        - source: .forge/runtime/edge-us-east/praxis
-          target: /etc/praxis
-          readOnly: true
-        - source: .forge/runtime/edge-us-east
-          target: /etc/grid
-          readOnly: true
-      restart: on-failure
-      healthCheck:
-        type: tcp
-        port: 8080
-        interval: "2s"
-        timeout: "1s"
-        retries: 30
+    - name: gtm-emulator
+      stacks: [metallb, gtm-emulator]
+      properties:
+        region: global
+        role: gtm-emulator
+        gatewayImage: "praxis-ai:glb-demo"
+        operatorImage: "grid-operator:glb-demo"
+        mockProviderImage: "grid-mock-providers:glb-demo"
+        imagePullPolicy: Never
 
   stacks:
-    gateway-api:
-      description: Gateway API CRDs (standard channel)
-      steps:
-        - type: url
-          url: https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.2.1/standard-install.yaml
-          sha256: 97598bf6ab3b33b9b5c5432bdd24de091e4e9c3aa0575ebb0710a2a19cd64d64
-
     metallb:
       description: MetalLB load balancer with auto-configured address pool
       steps:
@@ -103,10 +80,33 @@ spec:
           name: forge-pool
 
     grid-operator:
-      description: Grid CRDs and operator (local wrapper referencing /deploy)
+      description: Grid CRDs and operator
       steps:
         - type: kustomize
           path: resources/grid-operator
+        - type: exec
+          command:
+            - kubectl
+            - --context
+            - kind-grid-glb-{{ cluster.name }}
+            - -n
+            - grid-system
+            - set
+            - image
+            - deployment/grid-operator
+            - operator={{ cluster.properties.operatorImage }}
+        - type: exec
+          command:
+            - kubectl
+            - --context
+            - kind-grid-glb-{{ cluster.name }}
+            - -n
+            - grid-system
+            - patch
+            - deployment/grid-operator
+            - --type=json
+            - -p
+            - '[{"op":"replace","path":"/spec/template/spec/containers/0/imagePullPolicy","value":"{{ cluster.properties.imagePullPolicy }}"}]'
         - type: wait
           resource: deployment/grid-operator
           namespace: grid-system
@@ -126,60 +126,279 @@ spec:
           timeout: "60s"
           interval: "2s"
 
-    site-us-east-demo:
-      description: Grid network, site, and SWIM seed wiring for GLB entry point
+    east-provider-operator:
+      description: East provider Grid operator identity and SWIM peers
+      steps:
+        - type: exec
+          command:
+            - kubectl
+            - --context
+            - kind-grid-glb-east-provider
+            - -n
+            - grid-system
+            - set
+            - env
+            - deployment/grid-operator
+            - GRID_SWIM_BIND_ADDR=0.0.0.0:7946
+            - GRID_SWIM_ADVERTISE_ADDR={{ captures.east-provider.swim-lb-ip }}:7946
+            - GRID_SWIM_SITE_NAME=east-provider
+            - GRID_SWIM_SEEDS={{ captures.east-edge.swim-lb-ip }}:7946,{{ captures.west-edge.swim-lb-ip }}:7946,{{ captures.west-provider.swim-lb-ip }}:7946
+            - GRID_GATEWAY_PORT=8443
+            - RUST_LOG=info
+        - type: exec
+          command:
+            - kubectl
+            - --context
+            - kind-grid-glb-east-provider
+            - -n
+            - grid-system
+            - rollout
+            - status
+            - deployment/grid-operator
+            - --timeout=120s
+
+    west-provider-operator:
+      description: West provider Grid operator identity and SWIM peers
+      steps:
+        - type: exec
+          command:
+            - kubectl
+            - --context
+            - kind-grid-glb-west-provider
+            - -n
+            - grid-system
+            - set
+            - env
+            - deployment/grid-operator
+            - GRID_SWIM_BIND_ADDR=0.0.0.0:7946
+            - GRID_SWIM_ADVERTISE_ADDR={{ captures.west-provider.swim-lb-ip }}:7946
+            - GRID_SWIM_SITE_NAME=west-provider
+            - GRID_SWIM_SEEDS={{ captures.east-edge.swim-lb-ip }}:7946,{{ captures.east-provider.swim-lb-ip }}:7946,{{ captures.west-edge.swim-lb-ip }}:7946
+            - GRID_GATEWAY_PORT=8443
+            - RUST_LOG=info
+        - type: exec
+          command:
+            - kubectl
+            - --context
+            - kind-grid-glb-west-provider
+            - -n
+            - grid-system
+            - rollout
+            - status
+            - deployment/grid-operator
+            - --timeout=120s
+
+    east-edge-operator:
+      description: East edge Grid operator identity and SWIM peers
+      steps:
+        - type: exec
+          command:
+            - kubectl
+            - --context
+            - kind-grid-glb-east-edge
+            - -n
+            - grid-system
+            - set
+            - env
+            - deployment/grid-operator
+            - GRID_SWIM_BIND_ADDR=0.0.0.0:7946
+            - GRID_SWIM_ADVERTISE_ADDR={{ captures.east-edge.swim-lb-ip }}:7946
+            - GRID_SWIM_SITE_NAME=east-edge
+            - GRID_SWIM_SEEDS={{ captures.east-provider.swim-lb-ip }}:7946,{{ captures.west-edge.swim-lb-ip }}:7946,{{ captures.west-provider.swim-lb-ip }}:7946
+            - GRID_GATEWAY_SERVICE_NAME=edge-gateway
+            - GRID_GATEWAY_PORT=8080
+            - RUST_LOG=info
+        - type: exec
+          command:
+            - kubectl
+            - --context
+            - kind-grid-glb-east-edge
+            - -n
+            - grid-system
+            - rollout
+            - status
+            - deployment/grid-operator
+            - --timeout=120s
+
+    west-edge-operator:
+      description: West edge Grid operator identity and SWIM peers
+      steps:
+        - type: exec
+          command:
+            - kubectl
+            - --context
+            - kind-grid-glb-west-edge
+            - -n
+            - grid-system
+            - set
+            - env
+            - deployment/grid-operator
+            - GRID_SWIM_BIND_ADDR=0.0.0.0:7946
+            - GRID_SWIM_ADVERTISE_ADDR={{ captures.west-edge.swim-lb-ip }}:7946
+            - GRID_SWIM_SITE_NAME=west-edge
+            - GRID_SWIM_SEEDS={{ captures.east-edge.swim-lb-ip }}:7946,{{ captures.east-provider.swim-lb-ip }}:7946,{{ captures.west-provider.swim-lb-ip }}:7946
+            - GRID_GATEWAY_SERVICE_NAME=edge-gateway
+            - GRID_GATEWAY_PORT=8080
+            - RUST_LOG=info
+        - type: exec
+          command:
+            - kubectl
+            - --context
+            - kind-grid-glb-west-edge
+            - -n
+            - grid-system
+            - rollout
+            - status
+            - deployment/grid-operator
+            - --timeout=120s
+
+    east-provider-site:
+      description: East provider site and inference capacity
+      steps:
+        - type: manifest
+          path: resources/site-east-provider.yaml
+        - type: manifest
+          path: resources/inference-east-provider.yaml
+        - type: template-manifest
+          path: resources/gridnetwork-east-provider.yaml
+
+    west-provider-site:
+      description: West provider site and inference capacity
+      steps:
+        - type: manifest
+          path: resources/site-west-provider.yaml
+        - type: manifest
+          path: resources/inference-west-provider.yaml
+        - type: template-manifest
+          path: resources/gridnetwork-west-provider.yaml
+
+    east-edge-site:
+      description: East edge site and operator-rendered routing overlay
       steps:
         - type: manifest
           path: resources/operator-role-binding-grid-system.yaml
-        - type: template-manifest
-          path: resources/gridnetwork-site-us-east.yaml
-        - type: template-manifest
-          path: resources/operator-env-site-us-east.yaml
-        - type: template-file
-          source: configs/edge-us-east/praxis.yaml
-          target: .forge/runtime/edge-us-east/praxis/praxis.yaml
         - type: manifest
-          path: resources/site-us-east.yaml
+          path: resources/site-east-edge.yaml
         - type: manifest
           path: policies/provider-access.yaml
-        - type: manifest
-          path: policies/external-auth-demo.yaml
+        - type: template-manifest
+          path: resources/gridnetwork-east-edge.yaml
 
-    site-us-west-demo:
-      description: US-West site, inference provider, and SWIM seed wiring
+    west-edge-site:
+      description: West edge site and operator-rendered routing overlay
       steps:
-        - type: template-manifest
-          path: resources/gridnetwork-site-us-west.yaml
-        - type: template-manifest
-          path: resources/operator-env-site-us-west.yaml
         - type: manifest
-          path: resources/site-us-west.yaml
+          path: resources/operator-role-binding-grid-system.yaml
         - type: manifest
-          path: resources/site-us-west-inference.yaml
-
-    site-us-central-demo:
-      description: US-Central site, inference provider, and SWIM seed wiring
-      steps:
+          path: resources/site-west-edge.yaml
+        - type: manifest
+          path: policies/provider-access.yaml
         - type: template-manifest
-          path: resources/gridnetwork-site-us-central.yaml
-        - type: template-manifest
-          path: resources/operator-env-site-us-central.yaml
-        - type: manifest
-          path: resources/site-us-central.yaml
-        - type: manifest
-          path: resources/site-us-central-inference.yaml
+          path: resources/gridnetwork-west-edge.yaml
 
     inference-sim:
-      description: Simulated inference backends with LoadBalancer exposure
+      description: Private inference backend behind an mTLS Praxis provider gateway
       steps:
         - type: template-manifest
           path: resources/provider-workloads.yaml
+        - type: exec
+          command:
+            - bash
+            - -c
+            - >-
+              kubectl --context kind-grid-glb-{{ cluster.name }} -n grid-system
+              create configmap provider-gateway-config
+              --from-file=praxis.yaml=.forge/runtime/glb-tls/provider-configs/{{ cluster.name }}/praxis.yaml
+              --dry-run=client -o yaml |
+              kubectl --context kind-grid-glb-{{ cluster.name }} apply -f -
+        - type: template-manifest
+          path: resources/provider-gateway-deployment.yaml
+        - type: manifest
+          path: resources/backend-network-policy.yaml
         - type: manifest
           path: resources/provider-gateway.yaml
+        - type: wait
+          resource: deployment/mock-inference
+          namespace: grid-system
+          condition: available
+          timeout: "120s"
+        - type: wait
+          resource: deployment/provider-gateway
+          namespace: grid-system
+          condition: available
+          timeout: "120s"
         - type: capture
           resource: svc/provider-gateway
           namespace: grid-system
           jsonpath: "{.status.loadBalancer.ingress[0].ip}"
           key: provider-gateway-ip
+          timeout: "60s"
+          interval: "2s"
+
+    edge-gateway:
+      description: Kubernetes-native Praxis edge with a projected Grid overlay
+      steps:
+        - type: template-file
+          source: configs/edge/praxis.yaml
+          target: .forge/runtime/{{ cluster.name }}/edge/praxis.yaml
+        - type: exec
+          command:
+            - bash
+            - -c
+            - >-
+              kubectl --context kind-grid-glb-{{ cluster.name }} -n grid-system
+              create configmap edge-gateway-config
+              --from-file=praxis.yaml=.forge/runtime/{{ cluster.name }}/edge/praxis.yaml
+              --dry-run=client -o yaml |
+              kubectl --context kind-grid-glb-{{ cluster.name }} apply -f -
+        - type: template-manifest
+          path: resources/edge-gateway-deployment.yaml
+        - type: manifest
+          path: resources/edge-gateway-service.yaml
+        - type: wait
+          resource: deployment/edge-gateway
+          namespace: grid-system
+          condition: available
+          timeout: "120s"
+        - type: capture
+          resource: svc/edge-gateway
+          namespace: grid-system
+          jsonpath: "{.status.loadBalancer.ingress[0].ip}"
+          key: edge-gateway-ip
+          timeout: "60s"
+          interval: "2s"
+
+    gtm-emulator:
+      description: Local Praxis emulator for a managed GTM or global load-balancing service
+      steps:
+        - type: manifest
+          path: resources/grid-system-namespace.yaml
+        - type: template-file
+          source: configs/gtm-emulator/praxis.yaml
+          target: .forge/runtime/gtm-emulator/praxis.yaml
+        - type: exec
+          command:
+            - bash
+            - -c
+            - >-
+              kubectl --context kind-grid-glb-gtm-emulator -n grid-system
+              create configmap gtm-emulator-config
+              --from-file=praxis.yaml=.forge/runtime/gtm-emulator/praxis.yaml
+              --dry-run=client -o yaml |
+              kubectl --context kind-grid-glb-gtm-emulator apply -f -
+        - type: template-manifest
+          path: resources/gtm-emulator-deployment.yaml
+        - type: manifest
+          path: resources/gtm-emulator-service.yaml
+        - type: wait
+          resource: deployment/gtm-emulator
+          namespace: grid-system
+          condition: available
+          timeout: "120s"
+        - type: capture
+          resource: svc/gtm-emulator
+          namespace: grid-system
+          jsonpath: "{.status.loadBalancer.ingress[0].ip}"
+          key: gtm-emulator-ip
           timeout: "60s"
           interval: "2s"

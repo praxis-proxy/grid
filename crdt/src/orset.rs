@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 /// set.add("model-x".to_owned());
 /// assert!(set.contains(&"model-x".to_owned()));
 /// ```
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct OrSet<T: Ord> {
     /// Counter for generating unique add tags.
     counter: u64,

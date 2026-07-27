@@ -1,0 +1,59 @@
+listeners:
+  - name: provider
+    address: "0.0.0.0:8443"
+    filter_chains:
+      - provider-inference
+    tls:
+      certificates:
+        - cert_path: /etc/praxis/tls/tls.crt
+          key_path: /etc/praxis/tls/tls.key
+      client_ca:
+        ca_path: /etc/praxis/tls/ca.crt
+      client_cert_mode: require
+      hot_reload: false
+
+filter_chains:
+  - name: provider-inference
+    filters:
+      - filter: peer_identity_trust
+        trusted_peers:
+          - cert_digest: __EDGE_US_EAST_CERT_SHA256__
+            organization: ai-grid
+          - cert_digest: __EDGE_US_WEST_CERT_SHA256__
+            organization: ai-grid
+      - filter: json_body_field
+        field: model
+        header: X-Model
+      - filter: grid_provider_route
+        provider_id: west-provider
+        model_header: X-Model
+        emit_demo_attribution: true
+        routes:
+          - candidate_id: __GRID_CANDIDATE_ID__
+            model: sim-model-v1
+            paths:
+              - /v1/chat/completions
+              - /v1/responses
+            cluster: mock-backend
+            credential:
+              strategy: bearer_token
+              secretRef:
+                name: mock-inference-credential
+                namespace: grid-system
+                key: token
+      - filter: grid_credential_inject
+        credentials:
+          - strategy: bearer_token
+            name: mock-inference-credential
+            namespace: grid-system
+            key: token
+            file: /etc/praxis/credentials/mock-inference/token
+      - filter: load_balancer
+        clusters:
+          - name: mock-backend
+            endpoints:
+              - "mock-inference.grid-system.svc.cluster.local:8080"
+
+admin:
+  address: "127.0.0.1:9901"
+shutdown_timeout_secs: 5

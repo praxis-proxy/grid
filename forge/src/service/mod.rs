@@ -130,8 +130,13 @@ pub fn start_service(
         let rm = rm_spec(params.binary, params.container_name);
         check_success(&runner.run(&rm)?, "rm")?;
     }
-    prepare_writable_volumes(&service.volumes, params.config_dir, params.state_dir)?;
-    let spec = run_spec(params, service);
+    prepare_writable_volumes(
+        &service.volumes,
+        params.config_dir,
+        params.state_dir,
+        service.inherit_host_group,
+    )?;
+    let spec = run_spec(params, service)?;
     let output = runner.run(&spec)?;
     check_success(&output, "run")
 }
@@ -296,16 +301,17 @@ fn missing_label(name: &str, key: &str) -> ForgeError {
 // -------------------------------------------------------------
 
 /// Build a `docker run` command spec with all configured options.
-fn run_spec(params: &ServiceParams<'_>, service: &ServiceSpec) -> CommandSpec {
+fn run_spec(params: &ServiceParams<'_>, service: &ServiceSpec) -> Result<CommandSpec, ForgeError> {
     let mut args = base_run_args(params.container_name, params.env_name, &service.name);
     let mut redact = Vec::new();
     append_network_args(&mut args, &service.network, params.env_name);
     append_port_args(&mut args, &service.ports);
     append_volume_args(&mut args, &service.volumes, params.config_dir, params.state_dir);
+    append_host_group_arg(&mut args, service.inherit_host_group, params.state_dir)?;
     append_env_args(&mut args, &mut redact, &service.env);
     append_restart_arg(&mut args, &service.restart);
     append_image_and_cmd(&mut args, &service.image, &service.args);
-    build_spec_with_redactions(params.binary, args, redact)
+    Ok(build_spec_with_redactions(params.binary, args, redact))
 }
 
 /// Build the base `run -d --name ... --label ...` argument list.
@@ -352,6 +358,31 @@ fn append_volume_args(args: &mut Vec<OsString>, volumes: &[VolumeMount], config_
     for vol in volumes {
         args.push("-v".into());
         args.push(format_volume_arg(vol, config_dir, state_dir).into());
+    }
+}
+
+/// Add the invoking host group without replacing the image's configured user.
+fn append_host_group_arg(args: &mut Vec<OsString>, enabled: bool, state_dir: &Path) -> Result<(), ForgeError> {
+    if !enabled {
+        return Ok(());
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let gid = std::fs::metadata(state_dir)?.gid();
+        args.push("--group-add".into());
+        args.push(gid.to_string().into());
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = (args, state_dir);
+        Err(ForgeError::Config(
+            "inheritHostGroup is supported only on Unix hosts".to_owned(),
+        ))
     }
 }
 
@@ -509,19 +540,24 @@ fn resolve_source(source: &str, config_dir: &Path, state_dir: &Path) -> std::pat
 /// Ensure writable runtime directories exist before container start.
 ///
 /// For each non-read-only volume whose source is under
-/// `.forge/runtime/`, creates the host directory and sets mode 0o777
-/// so non-root container processes can write.  Container UIDs are
-/// unpredictable (Alpine dynamic system users), so world-writable is
-/// the narrowest portable mode for these ephemeral, gitignored paths.
-fn prepare_writable_volumes(volumes: &[VolumeMount], config_dir: &Path, state_dir: &Path) -> Result<(), ForgeError> {
+/// `.forge/runtime/`, creates the host directory. Services that inherit the
+/// host group use mode 0o770; other services retain the portable 0o777
+/// fallback required by arbitrary image user IDs.
+fn prepare_writable_volumes(
+    volumes: &[VolumeMount],
+    config_dir: &Path,
+    state_dir: &Path,
+    inherit_host_group: bool,
+) -> Result<(), ForgeError> {
     use std::os::unix::fs::PermissionsExt as _;
+    let mode = if inherit_host_group { 0o770 } else { 0o777 };
     for vol in volumes {
         if vol.read_only || !vol.source.starts_with(RUNTIME_DIR_PREFIX) {
             continue;
         }
         let path = resolve_source(&vol.source, config_dir, state_dir);
         std::fs::create_dir_all(&path)?;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o777))?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))?;
     }
     Ok(())
 }
@@ -847,6 +883,7 @@ mod tests {
             env: BTreeMap::new(),
             args: Vec::new(),
             restart: RestartPolicy::No,
+            inherit_host_group: false,
             health_check: None,
         }
     }
@@ -1023,7 +1060,7 @@ mod tests {
     fn run_spec_includes_labels() {
         let svc = minimal_service();
         let p = spec_params("env-svc", "env", Path::new("/tmp"), Path::new("/tmp/.forge"));
-        let spec = run_spec(&p, &svc);
+        let spec = run_spec(&p, &svc).unwrap_or_else(|_| std::process::abort());
         let display = format!("{spec}");
         assert!(
             display.contains("forge.managed=true"),
@@ -1044,7 +1081,7 @@ mod tests {
         let mut svc = minimal_service();
         svc.network = NetworkMode::Environment;
         let p = spec_params("env-svc", "myenv", Path::new("/tmp"), Path::new("/tmp/.forge"));
-        let spec = run_spec(&p, &svc);
+        let spec = run_spec(&p, &svc).unwrap_or_else(|_| std::process::abort());
         let display = format!("{spec}");
         assert!(display.contains("--network"), "should include --network: {display}");
         assert!(display.contains("myenv-net"), "should use env network: {display}");
@@ -1055,7 +1092,7 @@ mod tests {
         let mut svc = minimal_service();
         svc.network = NetworkMode::Host;
         let p = spec_params("env-svc", "env", Path::new("/tmp"), Path::new("/tmp/.forge"));
-        let spec = run_spec(&p, &svc);
+        let spec = run_spec(&p, &svc).unwrap_or_else(|_| std::process::abort());
         let display = format!("{spec}");
         assert!(display.contains("--network"), "should include --network: {display}");
         assert!(display.contains("host"), "should use host network: {display}");
@@ -1065,7 +1102,7 @@ mod tests {
     fn run_spec_network_none() {
         let svc = minimal_service();
         let p = spec_params("env-svc", "env", Path::new("/tmp"), Path::new("/tmp/.forge"));
-        let spec = run_spec(&p, &svc);
+        let spec = run_spec(&p, &svc).unwrap_or_else(|_| std::process::abort());
         let display = format!("{spec}");
         assert!(
             !display.contains("--network"),
@@ -1083,7 +1120,7 @@ mod tests {
             protocol: "tcp".to_owned(),
         });
         let p = spec_params("env-svc", "env", Path::new("/tmp"), Path::new("/tmp/.forge"));
-        let spec = run_spec(&p, &svc);
+        let spec = run_spec(&p, &svc).unwrap_or_else(|_| std::process::abort());
         let display = format!("{spec}");
         assert!(
             display.contains("127.0.0.1:8080:80/tcp"),
@@ -1100,7 +1137,7 @@ mod tests {
             read_only: true,
         });
         let p = spec_params("env-svc", "env", Path::new("/cfg"), Path::new("/cfg/.forge"));
-        let spec = run_spec(&p, &svc);
+        let spec = run_spec(&p, &svc).unwrap_or_else(|_| std::process::abort());
         let display = format!("{spec}");
         assert!(
             display.contains("/cfg/data:/mnt/data:ro"),
@@ -1113,7 +1150,7 @@ mod tests {
         let mut svc = minimal_service();
         svc.env.insert("MY_VAR".to_owned(), "my_value".to_owned());
         let p = spec_params("env-svc", "env", Path::new("/tmp"), Path::new("/tmp/.forge"));
-        let spec = run_spec(&p, &svc);
+        let spec = run_spec(&p, &svc).unwrap_or_else(|_| std::process::abort());
         let display = format!("{spec}");
         assert!(display.contains("-e"), "should include -e flag: {display}");
         assert!(
@@ -1135,7 +1172,7 @@ mod tests {
         let mut svc = minimal_service();
         svc.restart = RestartPolicy::UnlessStopped;
         let p = spec_params("env-svc", "env", Path::new("/tmp"), Path::new("/tmp/.forge"));
-        let spec = run_spec(&p, &svc);
+        let spec = run_spec(&p, &svc).unwrap_or_else(|_| std::process::abort());
         let display = format!("{spec}");
         assert!(display.contains("--restart"), "should include --restart: {display}");
         assert!(display.contains("unless-stopped"), "should include policy: {display}");
@@ -1145,11 +1182,38 @@ mod tests {
     fn run_spec_no_privileged() {
         let svc = minimal_service();
         let p = spec_params("env-svc", "env", Path::new("/tmp"), Path::new("/tmp/.forge"));
-        let spec = run_spec(&p, &svc);
+        let spec = run_spec(&p, &svc).unwrap_or_else(|_| std::process::abort());
         let display = format!("{spec}");
         assert!(
             !display.contains("--privileged"),
             "should not include --privileged: {display}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_spec_can_inherit_host_group_without_replacing_image_user() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let dir = tempfile::tempdir().unwrap_or_else(|_| std::process::abort());
+        let state = dir.path().join(".forge");
+        std::fs::create_dir_all(&state).unwrap_or_else(|_| std::process::abort());
+        let mut svc = minimal_service();
+        svc.inherit_host_group = true;
+        let p = spec_params("env-svc", "env", dir.path(), &state);
+        let spec = run_spec(&p, &svc).unwrap_or_else(|_| std::process::abort());
+        let display = format!("{spec}");
+        let gid = std::fs::metadata(&state)
+            .unwrap_or_else(|_| std::process::abort())
+            .gid();
+
+        assert!(
+            display.contains(&format!("--group-add {gid}")),
+            "should grant the state directory's host group: {display}"
+        );
+        assert!(
+            !display.contains("--user"),
+            "should preserve the image's configured non-root user: {display}"
         );
     }
 
@@ -1191,7 +1255,7 @@ mod tests {
             read_only: true,
         });
         let p = spec_params("env-svc", "env", Path::new("/cfg"), &state);
-        let spec = run_spec(&p, &svc);
+        let spec = run_spec(&p, &svc).unwrap_or_else(|_| std::process::abort());
         let display = format!("{spec}");
         let canonical = std::fs::canonicalize(&state).unwrap_or_else(|_| std::process::abort());
         let expected = format!(
@@ -1220,7 +1284,7 @@ mod tests {
             target: "/output".to_owned(),
             read_only: false,
         }];
-        prepare_writable_volumes(&vols, Path::new("/cfg"), &state).unwrap_or_else(|_| std::process::abort());
+        prepare_writable_volumes(&vols, Path::new("/cfg"), &state, false).unwrap_or_else(|_| std::process::abort());
         let created = state.join("runtime/out");
         assert!(created.is_dir(), "directory should exist");
         let mode = std::fs::metadata(&created)
@@ -1229,6 +1293,28 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o777, "mode should be 0o777, got {mode:o}");
+    }
+
+    #[test]
+    fn prepare_group_inherited_runtime_is_not_world_accessible() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap_or_else(|_| std::process::abort());
+        let state = dir.path().join(".forge");
+        std::fs::create_dir_all(&state).unwrap_or_else(|_| std::process::abort());
+        let vols = vec![VolumeMount {
+            source: ".forge/runtime/out".to_owned(),
+            target: "/output".to_owned(),
+            read_only: false,
+        }];
+        prepare_writable_volumes(&vols, Path::new("/cfg"), &state, true).unwrap_or_else(|_| std::process::abort());
+        let mode = std::fs::metadata(state.join("runtime/out"))
+            .unwrap_or_else(|_| std::process::abort())
+            .permissions()
+            .mode()
+            & 0o777;
+
+        assert_eq!(mode, 0o770, "group-shared runtime should exclude other users");
     }
 
     #[test]
@@ -1241,7 +1327,7 @@ mod tests {
             target: "/kube".to_owned(),
             read_only: true,
         }];
-        prepare_writable_volumes(&vols, Path::new("/cfg"), &state).unwrap_or_else(|_| std::process::abort());
+        prepare_writable_volumes(&vols, Path::new("/cfg"), &state, false).unwrap_or_else(|_| std::process::abort());
         let skipped = state.join("runtime/kube");
         assert!(!skipped.exists(), "read-only runtime dir should not be created");
     }
@@ -1258,7 +1344,7 @@ mod tests {
             target: "/etc/app".to_owned(),
             read_only: false,
         }];
-        prepare_writable_volumes(&vols, &cfg, &state).unwrap_or_else(|_| std::process::abort());
+        prepare_writable_volumes(&vols, &cfg, &state, false).unwrap_or_else(|_| std::process::abort());
         let skipped = cfg.join("configs/app");
         assert!(!skipped.exists(), "non-runtime config source should not be created");
     }
@@ -1274,8 +1360,8 @@ mod tests {
             target: "/output".to_owned(),
             read_only: false,
         }];
-        prepare_writable_volumes(&vols, Path::new("/cfg"), &state).unwrap_or_else(|_| std::process::abort());
-        prepare_writable_volumes(&vols, Path::new("/cfg"), &state).unwrap_or_else(|_| std::process::abort());
+        prepare_writable_volumes(&vols, Path::new("/cfg"), &state, false).unwrap_or_else(|_| std::process::abort());
+        prepare_writable_volumes(&vols, Path::new("/cfg"), &state, false).unwrap_or_else(|_| std::process::abort());
         let created = state.join("runtime/out");
         let mode = std::fs::metadata(&created)
             .unwrap_or_else(|_| std::process::abort())

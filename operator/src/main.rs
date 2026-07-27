@@ -248,6 +248,10 @@ fn hostname_or_default() -> String {
 /// reconciliation of the owning [`GridNetwork`] (identified by
 /// `spec.gridNetworkRef`), keeping routing overlay `ConfigMap`s consistent
 /// with provider availability and site membership.
+#[expect(
+    clippy::too_many_lines,
+    reason = "declarative controller trigger wiring is clearer in one function"
+)]
 async fn run_network_controller(
     client: Client,
     ctx: Arc<OperatorCtx>,
@@ -256,7 +260,7 @@ async fn run_network_controller(
     let provider_api = Api::<InferenceProvider>::all(client.clone());
     let site_api = Api::<GridSite>::all(client.clone());
 
-    Controller::new(api, watcher::Config::default())
+    let controller = Controller::new(api, watcher::Config::default())
         .watches(
             provider_api,
             watcher::Config::default(),
@@ -266,7 +270,13 @@ async fn run_network_controller(
             site_api,
             watcher::Config::default(),
             grid_network::network_refs_from_grid_site,
-        )
+        );
+    let controller = if let Some(swim) = ctx.swim.as_ref() {
+        controller.reconcile_all_on(swim.reconciliation_events())
+    } else {
+        controller
+    };
+    controller
         .run(grid_network::reconcile, grid_network::error_policy, ctx)
         .for_each(|result| async {
             match result {

@@ -362,7 +362,7 @@ pub struct SecretRef {
 // ---------------------------------------------------------------------------
 
 /// Observed status of a [`GridNetwork`].
-#[derive(Clone, Debug, Default, Deserialize, JsonSchema, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GridNetworkStatus {
     /// Number of connected (Active) sites.

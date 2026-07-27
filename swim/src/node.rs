@@ -7,7 +7,7 @@
 //! The runtime is **not** thread-safe; run the node from a single task and pass
 //! only [`AccumulatedOutput`] across task boundaries.
 
-use std::{collections::BTreeMap, time::Duration};
+use std::{collections::BTreeMap, num::NonZeroU32, time::Duration};
 
 use crdt::GridStateSnapshot;
 use rand::{SeedableRng as _, rngs::SmallRng};
@@ -68,6 +68,9 @@ pub struct SwimNode {
 impl SwimNode {
     /// Create a new SWIM node with the given identity.
     ///
+    /// Uses foca's WAN configuration with periodic announce, down-member
+    /// recovery, and gossip enabled.
+    ///
     /// Membership events are forwarded to `event_tx`.  Callers may also
     /// process events from [`AccumulatedOutput::events`] directly.
     pub fn new(identity: NodeId, event_tx: mpsc::Sender<MemberEvent>) -> Self {
@@ -94,7 +97,7 @@ impl SwimNode {
         let cert_pems_rx = handler.subscribe_cert_pems();
 
         Self {
-            foca: foca::Foca::with_custom_broadcast(identity, foca::Config::simple(), rng, codec, handler),
+            foca: foca::Foca::with_custom_broadcast(identity, grid_config(), rng, codec, handler),
             runtime: GridRuntime::new(event_tx),
             state_rx,
             gateway_addrs_rx,
@@ -158,6 +161,18 @@ impl SwimNode {
         self.runtime.take_output()
     }
 
+    /// Send queued custom broadcasts to all available broadcast candidates.
+    ///
+    /// Unlike a general gossip round, this uses foca's dedicated custom
+    /// broadcast path. It is used for retained state repair so a healthy peer
+    /// cannot remain permanently missing an origin's provider state.
+    pub fn broadcast(&mut self) -> AccumulatedOutput {
+        if let Err(e) = self.foca.broadcast(&mut self.runtime) {
+            tracing::warn!(error = %e, "foca broadcast error");
+        }
+        self.runtime.take_output()
+    }
+
     /// Queue a CRDT state broadcast for piggybacking on the next probe/gossip message.
     ///
     /// foca attaches queued broadcasts to outbound probe and gossip messages
@@ -210,6 +225,20 @@ impl SwimNode {
     pub fn cert_pems(&self) -> BTreeMap<String, String> {
         self.cert_pems_rx.borrow().clone()
     }
+}
+
+// ---------------------------------------------------------------------------
+// Foca configuration
+// ---------------------------------------------------------------------------
+
+/// Foca WAN configuration for cross-site SWIM.
+///
+/// Three is the minimum supported multi-site Grid topology. Capacity-specific
+/// tuning belongs in an explicit operator configuration rather than an
+/// assumed cluster size compiled into the transport.
+fn grid_config() -> foca::Config {
+    let expected_sites = NonZeroU32::new(3).unwrap_or(NonZeroU32::MIN);
+    foca::Config::new_wan(expected_sites)
 }
 
 // ---------------------------------------------------------------------------
@@ -267,6 +296,21 @@ mod tests {
     // -----------------------------------------------------------------------
     // Basic node construction
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn grid_config_uses_foca_wan_profile() {
+        let config = grid_config();
+        assert_eq!(config.probe_period, Duration::from_secs(5));
+        assert_eq!(config.probe_rtt, Duration::from_secs(3));
+        assert_eq!(config.suspect_to_down_after, Duration::from_secs(30));
+        assert!(config.periodic_announce.is_some());
+        assert!(config.periodic_announce_to_down_members.is_some());
+        assert!(config.periodic_gossip.is_some());
+        assert!(
+            config.notify_down_members,
+            "notify_down_members enables auto-rejoin with new generation"
+        );
+    }
 
     #[test]
     fn new_creates_node_without_panic() {
@@ -413,6 +457,59 @@ mod tests {
         assert!(
             !b_snap.capabilities.is_empty(),
             "B must receive A's capabilities via SWIM custom gossip broadcast"
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "three-node proof establishes membership, broadcasts once, and verifies both receivers"
+    )]
+    fn dedicated_broadcast_reaches_all_available_peers() {
+        let id_a = local_id("site-a", 19_210);
+        let id_b = local_id("site-b", 19_211);
+        let id_c = local_id("site-c", 19_212);
+        let (mut node_a, _) = make_node("site-a", 19_210);
+        let (mut node_b, _) = make_node("site-b", 19_211);
+        let (mut node_c, _) = make_node("site-c", 19_212);
+
+        establish_membership(&mut node_a, &mut node_b, &id_a, &id_b);
+        establish_membership(&mut node_a, &mut node_c, &id_a, &id_c);
+
+        node_a
+            .publish_state_broadcast(&StateBroadcast::new(
+                "site-a".to_owned(),
+                1,
+                provider_snap("site-a", 0.2),
+                None,
+            ))
+            .unwrap_or_else(|_| std::process::abort());
+
+        let outbound = node_a.broadcast();
+        let destinations: std::collections::BTreeSet<_> =
+            outbound.messages.iter().map(|message| message.addr).collect();
+        assert!(destinations.contains(&id_b.socket_addr()));
+        assert!(destinations.contains(&id_c.socket_addr()));
+
+        for message in &outbound.messages {
+            if message.addr == id_b.socket_addr() {
+                drop(node_b.handle_data(&message.data));
+            } else if message.addr == id_c.socket_addr() {
+                drop(node_c.handle_data(&message.data));
+            }
+        }
+
+        assert!(
+            node_b
+                .state_snapshot()
+                .provider("net", "site-a", "provider-1")
+                .is_some()
+        );
+        assert!(
+            node_c
+                .state_snapshot()
+                .provider("net", "site-a", "provider-1")
+                .is_some()
         );
     }
 

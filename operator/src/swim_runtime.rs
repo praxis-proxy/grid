@@ -35,6 +35,7 @@ use std::{
 };
 
 use crdt::GridStateSnapshot;
+use futures::{Stream, stream};
 use swim::{MemberEvent, NodeId, SwimNode, runtime::TimerEvent};
 use tokio::{
     net::UdpSocket,
@@ -243,6 +244,67 @@ struct RuntimeChannels {
     /// Populated by [`SwimHandle::announce_seeds`].  Each batch is
     /// announced via [`SwimNode::announce`] on the next event loop turn.
     seed_rx: mpsc::Receiver<Vec<SocketAddr>>,
+}
+
+/// Period between bounded anti-entropy publications of local provider state.
+const STATE_REPUBLISH_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Retains the latest local provider-state payload for bounded anti-entropy.
+///
+/// Foca intentionally removes a custom broadcast after its transmission
+/// budget is exhausted. A peer that joins later therefore needs a new
+/// transport revision even when the underlying provider state is unchanged.
+struct RetainedStateBroadcast {
+    /// Canonical encoded payload with its transport revision normalized to zero.
+    canonical_payload: Vec<u8>,
+    /// Latest provider-state payload to republish.
+    broadcast: swim::StateBroadcast,
+    /// Last origin-local transport revision assigned by this process.
+    last_revision: u64,
+}
+
+impl RetainedStateBroadcast {
+    /// Retain a changed state payload and assign a restart-safe transport revision.
+    ///
+    /// Returns `None` when the submitted provider state is byte-identical to the
+    /// retained state. Metadata-only broadcasts are not accepted by this helper.
+    fn update(
+        current: Option<Self>,
+        mut broadcast: swim::StateBroadcast,
+    ) -> Result<(Self, Option<swim::StateBroadcast>), String> {
+        debug_assert!(
+            broadcast.carries_grid_state(),
+            "retained anti-entropy accepts provider/capability state only"
+        );
+        let canonical_payload = canonical_state_payload(&broadcast)?;
+
+        if current
+            .as_ref()
+            .is_some_and(|retained| retained.canonical_payload == canonical_payload)
+        {
+            let retained = current.unwrap_or_else(|| std::process::abort());
+            return Ok((retained, None));
+        }
+
+        let last_revision = next_transport_revision(current.as_ref().map_or(0, |retained| retained.last_revision));
+        broadcast.revision = last_revision;
+        let outbound = broadcast.clone();
+        Ok((
+            Self {
+                canonical_payload,
+                broadcast,
+                last_revision,
+            },
+            Some(outbound),
+        ))
+    }
+
+    /// Create a fresh transport revision for periodic anti-entropy.
+    fn republish(&mut self) -> swim::StateBroadcast {
+        self.last_revision = next_transport_revision(self.last_revision);
+        self.broadcast.revision = self.last_revision;
+        self.broadcast.clone()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -467,6 +529,38 @@ impl SwimHandle {
         self.state_rx.borrow().clone()
     }
 
+    /// Return a stream that emits when SWIM state relevant to a
+    /// [`GridNetwork`] reconciliation changes.
+    ///
+    /// Repeated gossip packets commonly republish identical watch values. The
+    /// returned stream compares a semantic view of membership, gateway and
+    /// certificate metadata, and distributed provider state so those duplicate
+    /// packets do not cause Kubernetes API churn. Suspect/dead member age is
+    /// retained because stale-candidate TTL processing depends on it.
+    ///
+    /// [`GridNetwork`]: crate::crd::grid_network::GridNetwork
+    pub fn reconciliation_events(&self) -> impl Stream<Item = ()> + Send + Sync + 'static {
+        let membership_rx = self.snapshot_rx.clone();
+        let state_rx = self.state_rx.clone();
+        let previous = reconciliation_view(&membership_rx.borrow(), &state_rx.borrow());
+        stream::unfold(
+            (membership_rx, state_rx, previous),
+            |(mut membership_rx, mut state_rx, mut previous)| async move {
+                loop {
+                    tokio::select! {
+                        result = membership_rx.changed() => result.ok()?,
+                        result = state_rx.changed() => result.ok()?,
+                    }
+                    let current = reconciliation_view(&membership_rx.borrow(), &state_rx.borrow());
+                    if current != previous {
+                        previous = current;
+                        return Some(((), (membership_rx, state_rx, previous)));
+                    }
+                }
+            },
+        )
+    }
+
     /// Queue a CRDT state broadcast for delivery to SWIM peers.
     ///
     /// The runtime task encodes the broadcast and calls
@@ -511,6 +605,61 @@ impl SwimHandle {
         self.key_tx
             .send(Some(Arc::new(key)))
             .map_err(|_e| SetKeyError::RuntimeGone)
+    }
+}
+
+/// Stable SWIM data that can change rendered Grid resources.
+#[derive(Debug, PartialEq)]
+struct ReconciliationView {
+    /// Membership and peer metadata, sorted by site identity.
+    members: Vec<ReconciliationMember>,
+    /// Distributed provider and capability state.
+    state: GridStateSnapshot,
+}
+
+/// Membership fields consumed by Grid reconciliation.
+#[derive(Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ReconciliationMember {
+    /// Peer site identity.
+    site_id: String,
+    /// Peer SWIM endpoint.
+    endpoint: String,
+    /// Peer incarnation.
+    incarnation: u64,
+    /// Peer lifecycle state.
+    status: u8,
+    /// Suspect/dead age used by stale-candidate policy.
+    non_alive_age_secs: Option<u64>,
+    /// Peer data-plane gateway address.
+    gateway_address: Option<String>,
+    /// Peer public certificate.
+    site_cert_pem: Option<String>,
+}
+
+/// Build the deduplicated view used by [`SwimHandle::reconciliation_events`].
+fn reconciliation_view(membership: &MembershipSnapshot, state: &GridStateSnapshot) -> ReconciliationView {
+    let mut members: Vec<ReconciliationMember> = membership
+        .members
+        .iter()
+        .map(|member| ReconciliationMember {
+            site_id: member.site_id.clone(),
+            endpoint: member.endpoint.clone(),
+            incarnation: member.incarnation,
+            status: match member.status {
+                MemberStatus::Alive => 0,
+                MemberStatus::Suspect => 1,
+                MemberStatus::Dead => 2,
+            },
+            non_alive_age_secs: (member.status != MemberStatus::Alive).then_some(member.age_secs / 5),
+            gateway_address: member.gateway_address.clone(),
+            site_cert_pem: member.site_cert_pem.clone(),
+        })
+        .collect();
+    members.sort();
+
+    ReconciliationView {
+        members,
+        state: state.clone(),
     }
 }
 
@@ -633,9 +782,13 @@ async fn run_loop(
     let mut tracked: HashMap<String, TrackedMember> = HashMap::new();
     let mut buf = vec![0_u8; 65_536];
     let mut age_tick = tokio::time::interval(Duration::from_secs(1));
+    let mut seed_addrs = config.seeds.clone();
+    let mut next_seed_announce_at = Instant::now() + Duration::from_secs(5);
     let mut gateway_address = config.gateway_address.clone();
-    let mut gateway_address_revision = 0_u64;
+    let mut gateway_address_revision = initial_metadata_revision();
     let mut next_gateway_republish_at = Instant::now();
+    let mut retained_state_broadcast: Option<RetainedStateBroadcast> = None;
+    let mut next_state_republish_at = Instant::now() + STATE_REPUBLISH_INTERVAL;
 
     if let Some(addr) = gateway_address.as_deref() {
         publish_gateway_address_broadcast(&mut node, &site_name, gateway_address_revision, addr);
@@ -644,8 +797,8 @@ async fn run_loop(
     // Announce to seed peers.  Errors are logged inside SwimNode::announce.
     // Read the initial key (from SwimConfig, if any) for the startup seed sends.
     let startup_key: Option<Arc<swim::crypto::SwimKey>> = key_rx.borrow_and_update().clone();
-    for &seed_addr in &config.seeds {
-        let seed_id = NodeId::new(format!("seed-{seed_addr}"), seed_addr);
+    for &seed_addr in &seed_addrs {
+        let seed_id = NodeId::seed(seed_addr);
         let output = node.announce(seed_id);
         drain_output(
             output,
@@ -758,15 +911,31 @@ async fn run_loop(
                 )
                 .await;
             }
-            Some(bc) = channels.broadcast_rx.recv() => {
-                // Publish the broadcast then immediately gossip so peers
-                // receive it on the next outbound message.
+            Some(mut bc) = channels.broadcast_rx.recv() => {
+                if bc.carries_grid_state() {
+                    match RetainedStateBroadcast::update(retained_state_broadcast.take(), bc) {
+                        Ok((retained, Some(outbound))) => {
+                            retained_state_broadcast = Some(retained);
+                            bc = outbound;
+                        }
+                        Ok((retained, None)) => {
+                            retained_state_broadcast = Some(retained);
+                            continue;
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "failed to encode state broadcast");
+                            continue;
+                        }
+                    }
+                }
+                // Publish through foca's dedicated custom-broadcast path so
+                // every currently available candidate receives the update.
                 if let Err(e) = node.publish_state_broadcast(&bc) {
                     tracing::warn!(error = %e, "failed to encode state broadcast");
                 } else {
-                    let gossip_out = node.gossip();
+                    let broadcast_out = node.broadcast();
                     drain_output(
-                        gossip_out,
+                        broadcast_out,
                         &socket,
                         &channels.timer_tx,
                         &mut tracked,
@@ -782,8 +951,9 @@ async fn run_loop(
             Some(seeds) = channels.seed_rx.recv() => {
                 // Announce to CRD-declared seed peers at runtime.
                 // Re-announcing to existing members is idempotent (foca ignores them).
-                for addr in seeds {
-                    let seed_id = NodeId::new(format!("seed-{addr}"), addr);
+                seed_addrs = seeds;
+                for &addr in &seed_addrs {
+                    let seed_id = NodeId::seed(addr);
                     let output = node.announce(seed_id);
                     drain_output(
                         output,
@@ -799,6 +969,50 @@ async fn run_loop(
                 }
             }
             _ = age_tick.tick() => {
+                let now = Instant::now();
+                if now >= next_state_republish_at {
+                    if let Some(retained) = retained_state_broadcast.as_mut() {
+                        let bc = retained.republish();
+                        if let Err(e) = node.publish_state_broadcast(&bc) {
+                            tracing::warn!(error = %e, "failed to encode retained state broadcast");
+                        } else {
+                            let output = node.broadcast();
+                            drain_output(
+                                output,
+                                &socket,
+                                &channels.timer_tx,
+                                &mut tracked,
+                                &channels.snapshot_tx,
+                                &node.gateway_addrs(),
+                                &node.cert_pems(),
+                                current_key.as_deref(),
+                            )
+                            .await;
+                        }
+                    }
+                    next_state_republish_at = now + STATE_REPUBLISH_INTERVAL;
+                }
+                if now >= next_seed_announce_at {
+                    // Seed discovery is retried so serial startup, transient
+                    // packet loss, and a later MemberDown do not leave a site
+                    // permanently isolated. Announcing an active member is
+                    // idempotent in foca.
+                    for &addr in &seed_addrs {
+                        let output = node.announce(NodeId::seed(addr));
+                        drain_output(
+                            output,
+                            &socket,
+                            &channels.timer_tx,
+                            &mut tracked,
+                            &channels.snapshot_tx,
+                            &node.gateway_addrs(),
+                            &node.cert_pems(),
+                            current_key.as_deref(),
+                        )
+                        .await;
+                    }
+                    next_seed_announce_at = now + Duration::from_secs(5);
+                }
                 // Age is derived from an internal Instant, but SwimHandle readers
                 // only see the latest published MembershipSnapshot.  Republish
                 // while any member is Dead/Suspect so age_secs advances even when
@@ -835,6 +1049,34 @@ async fn run_loop(
             }
         }
     }
+}
+
+/// Seed restart-safe metadata revisions from wall-clock milliseconds.
+///
+/// Gateway metadata is a replaceable current-value lane, not a causal CRDT
+/// counter. A process-local zero seed lets peers retain a larger invalidation
+/// key from the previous operator instance and discard the restarted
+/// instance's advertisements. Milliseconds advance substantially faster than
+/// the once-per-second republish counter, so a normal restart starts beyond
+/// the prior process's revision range.
+fn initial_metadata_revision() -> u64 {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_millis();
+    u64::try_from(millis).unwrap_or(u64::MAX)
+}
+
+/// Return a restart-safe, strictly increasing transport revision.
+fn next_transport_revision(previous: u64) -> u64 {
+    initial_metadata_revision().max(previous.saturating_add(1))
+}
+
+/// Encode provider-state content without its replaceable transport revision.
+fn canonical_state_payload(broadcast: &swim::StateBroadcast) -> Result<Vec<u8>, String> {
+    let mut canonical = broadcast.clone();
+    canonical.revision = 0;
+    canonical.encode().map_err(|error| error.to_string())
 }
 
 /// Queue a gateway-address-only state broadcast.
@@ -1000,6 +1242,8 @@ fn apply_left_event(site_name: String, tracked: &mut HashMap<String, TrackedMemb
 
 #[cfg(test)]
 mod tests {
+    use futures::StreamExt as _;
+
     use super::*;
 
     // -----------------------------------------------------------------------
@@ -1322,6 +1566,122 @@ mod tests {
         (handle, snapshot_tx, state_tx)
     }
 
+    fn reconciliation_member(status: MemberStatus, age_secs: u64) -> MemberRecord {
+        MemberRecord {
+            site_id: "site-x".to_owned(),
+            endpoint: "10.0.0.1:7946".to_owned(),
+            incarnation: 1,
+            status,
+            age_secs,
+            gateway_address: Some("10.0.0.1:8443".to_owned()),
+            site_cert_pem: Some("-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----".to_owned()),
+        }
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one ordered test proves deduplication across membership, health, and provider-state changes"
+    )]
+    async fn reconciliation_events_emit_only_for_semantic_changes() {
+        let (handle, snapshot_tx, state_tx) = make_test_handle();
+        let mut events = Box::pin(handle.reconciliation_events());
+
+        drop(snapshot_tx.send(MembershipSnapshot::default()));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), events.next())
+                .await
+                .is_err(),
+            "an identical membership snapshot must not trigger reconciliation"
+        );
+
+        let alive = MembershipSnapshot {
+            members: vec![reconciliation_member(MemberStatus::Alive, 0)],
+        };
+        drop(snapshot_tx.send(alive.clone()));
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), events.next())
+                .await
+                .is_ok_and(|event| event.is_some()),
+            "a new member must trigger reconciliation"
+        );
+
+        let alive_with_new_age = MembershipSnapshot {
+            members: vec![reconciliation_member(MemberStatus::Alive, 30)],
+        };
+        drop(snapshot_tx.send(alive_with_new_age));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), events.next())
+                .await
+                .is_err(),
+            "age updates for a healthy member must not trigger reconciliation"
+        );
+
+        let suspect = MembershipSnapshot {
+            members: vec![reconciliation_member(MemberStatus::Suspect, 1)],
+        };
+        drop(snapshot_tx.send(suspect));
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), events.next())
+                .await
+                .is_ok_and(|event| event.is_some()),
+            "a health-state change must trigger reconciliation"
+        );
+
+        let suspect_same_age_bucket = MembershipSnapshot {
+            members: vec![reconciliation_member(MemberStatus::Suspect, 4)],
+        };
+        drop(snapshot_tx.send(suspect_same_age_bucket));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), events.next())
+                .await
+                .is_err(),
+            "suspect age changes inside one five-second bucket must be deduplicated"
+        );
+
+        let suspect_next_age_bucket = MembershipSnapshot {
+            members: vec![reconciliation_member(MemberStatus::Suspect, 5)],
+        };
+        drop(snapshot_tx.send(suspect_next_age_bucket));
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), events.next())
+                .await
+                .is_ok_and(|event| event.is_some()),
+            "crossing a suspect age bucket must trigger stale-policy reconciliation"
+        );
+
+        let mut provider_state = GridStateSnapshot::new("test".to_owned());
+        provider_state.add_capability(crdt::Capability::Model("model-x".to_owned()));
+        provider_state.upsert_provider(crdt::ProviderState {
+            network_id: "net".to_owned(),
+            site_id: "site-x".to_owned(),
+            provider_id: "provider-x".to_owned(),
+            routing_cluster: "site-x".to_owned(),
+            models: vec!["model-x".to_owned()],
+            backend_kind: "local".to_owned(),
+            phase: crdt::ProviderPhase::Available,
+            metrics: crdt::ProviderMetricsSnapshot::default(),
+            access_policy: crdt::ProviderAccessPolicy::default(),
+            revision: 1,
+            writer_id: "site-x".to_owned(),
+        });
+        drop(state_tx.send(provider_state.clone()));
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), events.next())
+                .await
+                .is_ok_and(|event| event.is_some()),
+            "a distributed provider-state change must trigger reconciliation"
+        );
+
+        drop(state_tx.send(provider_state));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), events.next())
+                .await
+                .is_err(),
+            "identical provider gossip must not trigger reconciliation"
+        );
+    }
+
     #[test]
     fn handle_exposes_gateway_address() {
         let (snapshot_tx, snapshot_rx) = watch::channel(MembershipSnapshot::default());
@@ -1412,6 +1772,87 @@ mod tests {
             handle.gateway_address(),
             None,
             "failed runtime update must not change cached gateway address"
+        );
+    }
+
+    #[test]
+    fn metadata_revision_seed_is_restart_scale_and_nondecreasing() {
+        let first = initial_metadata_revision();
+        let second = initial_metadata_revision();
+        assert!(first > 1_000_000_000_000);
+        assert!(second >= first);
+    }
+
+    fn provider_broadcast(queue_depth: f64) -> swim::StateBroadcast {
+        let mut snapshot = GridStateSnapshot::new("site-a".to_owned());
+        snapshot.add_capability(crdt::Capability::Model("model-x".to_owned()));
+        snapshot.upsert_provider(crdt::ProviderState {
+            network_id: "net".to_owned(),
+            site_id: "site-a".to_owned(),
+            provider_id: "provider-a".to_owned(),
+            routing_cluster: "site-a".to_owned(),
+            models: vec!["model-x".to_owned()],
+            backend_kind: "local".to_owned(),
+            phase: crdt::ProviderPhase::Available,
+            metrics: crdt::ProviderMetricsSnapshot {
+                queue_depth: Some(queue_depth),
+                ..crdt::ProviderMetricsSnapshot::default()
+            },
+            access_policy: crdt::ProviderAccessPolicy::default(),
+            revision: 7,
+            writer_id: "site-a".to_owned(),
+        });
+        swim::StateBroadcast::new("site-a".to_owned(), 7, snapshot, Some("10.0.0.1:8443".to_owned()))
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "ordered state-machine proof covers initial, duplicate, changed, and repair publications"
+    )]
+    fn retained_state_deduplicates_updates_and_republishes_with_new_revision() {
+        let original = provider_broadcast(0.1);
+        let (retained, first) =
+            RetainedStateBroadcast::update(None, original.clone()).unwrap_or_else(|_| std::process::abort());
+        let first = first.unwrap_or_else(|| std::process::abort());
+        assert!(
+            first.revision > original.revision,
+            "first publication must use a restart-safe transport revision"
+        );
+
+        let (retained, duplicate) =
+            RetainedStateBroadcast::update(Some(retained), original).unwrap_or_else(|_| std::process::abort());
+        assert!(
+            duplicate.is_none(),
+            "an identical controller reconcile must not reset the foca transmission budget"
+        );
+
+        let changed = provider_broadcast(0.8);
+        let (mut retained, changed_outbound) =
+            RetainedStateBroadcast::update(Some(retained), changed).unwrap_or_else(|_| std::process::abort());
+        let changed_outbound = changed_outbound.unwrap_or_else(|| std::process::abort());
+        assert!(
+            changed_outbound.revision > first.revision,
+            "changed provider state must advance the transport revision"
+        );
+        assert_eq!(
+            changed_outbound
+                .snapshot
+                .provider("net", "site-a", "provider-a")
+                .and_then(|provider| provider.metrics.queue_depth),
+            Some(0.8),
+            "changed provider state must publish immediately"
+        );
+
+        let repair = retained.republish();
+        assert!(
+            repair.revision > changed_outbound.revision,
+            "anti-entropy must use a fresh transport revision"
+        );
+        assert_eq!(
+            canonical_state_payload(&repair).unwrap_or_else(|_| std::process::abort()),
+            canonical_state_payload(&changed_outbound).unwrap_or_else(|_| std::process::abort()),
+            "anti-entropy must preserve the retained provider-state content"
         );
     }
 

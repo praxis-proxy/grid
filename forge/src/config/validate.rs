@@ -978,6 +978,7 @@ mod tests {
             env: BTreeMap::new(),
             args: Vec::new(),
             restart: RestartPolicy::No,
+            inherit_host_group: false,
             health_check: None,
         }
     }

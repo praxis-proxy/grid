@@ -1,0 +1,43 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mock-inference-allow-provider-gateway-only
+  namespace: grid-system
+  labels:
+    app.kubernetes.io/part-of: grid-glb-demo
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: mock-inference
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              grid.praxis-proxy.io/backend-access: provider-gateway
+      ports:
+        - protocol: TCP
+          port: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mock-inference-allow-grid-operator-health
+  namespace: grid-system
+  labels:
+    app.kubernetes.io/part-of: grid-glb-demo
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: mock-inference
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: grid-operator
+      ports:
+        - protocol: TCP
+          port: 8080

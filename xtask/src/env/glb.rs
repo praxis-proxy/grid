@@ -1,36 +1,26 @@
-//! GLB ingress hot-reload verifier.
+//! Grid routing and provider-boundary verifier.
 //!
-//! Runs prerequisite checks then a structured 23-step verification
-//! representing the full GLB proof.  Steps 1-4 validate prerequisite
-//! infrastructure.  Steps 5-10 verify SWIM cross-cluster discovery
-//! (LB services, advertise addresses, seeds, overlay metadata,
-//! gateway address advertisement, remote egress addresses).
-//! Steps 11-12 check site stacks and edge config.  Steps 13-14
-//! verify Forge-managed services are running.  Step 15 proves initial
-//! inference routing.  Steps 16-19 prove session affinity: binding,
-//! reuse, drain setup, and drain verification.  Steps 20-23 exercise
-//! overlay hot-reload: modify the overlay, observe the reload, verify
-//! routing, and confirm edge container stability.
+//! Runs the Grid routing and provider-boundary proof. The proof covers
+//! environment identity, SWIM discovery, edge-local overlays, provider mTLS,
+//! private backend policy, credential replacement, session behavior, and
+//! overlay hot reload without assigning a public contract to a step count.
 
 use std::{
     collections::BTreeMap,
+    fs,
     path::{Path, PathBuf},
     process::Command,
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
-use crate::env::{StepResult, StepStatus, print_validate_all_table, safe_truncate_str, verify};
+use sha2::{Digest as _, Sha256};
+
+use crate::env::{StepResult, StepStatus, certs, kubectl, print_validate_all_table, safe_truncate_str, verify};
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
-
-/// Edge service name in the GLB demo forge.yaml.
-const EDGE_SERVICE: &str = "grid-edge-us-east";
-
-/// Overlay-sync service name in the GLB demo forge.yaml.
-const OVERLAY_SYNC_SERVICE: &str = "grid-overlay-sync-us-east";
 
 /// Kubernetes namespace for Grid resources.
 const GRID_SYSTEM_NS: &str = "grid-system";
@@ -39,16 +29,25 @@ const GRID_SYSTEM_NS: &str = "grid-system";
 const CLUSTER_PREFIX: &str = "grid-glb";
 
 /// Expected cluster names in the GLB demo environment.
-const CLUSTER_NAMES: &[&str] = &["site-us-east", "site-us-west", "site-us-central"];
+const CLUSTER_NAMES: &[&str] = &[
+    "gtm-emulator",
+    "east-edge",
+    "east-provider",
+    "west-edge",
+    "west-provider",
+];
+
+/// Clusters participating in the Grid SWIM mesh.
+const GRID_CLUSTERS: &[&str] = &["east-edge", "east-provider", "west-edge", "west-provider"];
 
 /// Required CLI tools (checked during prerequisites).
-const REQUIRED_TOOLS: &[&str] = &["kind", "kubectl", "curl", "docker"];
-
-/// Total number of verification steps.
-const TOTAL_STEPS: u32 = 23;
+const REQUIRED_TOOLS: &[&str] = &["kind", "kubectl", "curl", "docker", "openssl"];
 
 /// Provider-role clusters that advertise a gateway address.
-const PROVIDER_CLUSTERS: &[&str] = &["site-us-west", "site-us-central"];
+const PROVIDER_CLUSTERS: &[&str] = &["east-provider", "west-provider"];
+
+/// Clusters running public Praxis edge gateways.
+const EDGE_CLUSTERS: &[&str] = &["east-edge", "west-edge"];
 
 /// SWIM LB service name in the GLB demo.
 const SWIM_LB_SERVICE: &str = "operator-swim-lb";
@@ -56,48 +55,471 @@ const SWIM_LB_SERVICE: &str = "operator-swim-lb";
 /// Overlay [`ConfigMap`] name on the edge site.
 ///
 /// [`ConfigMap`]: https://kubernetes.io/docs/concepts/configuration/configmap/
-const OVERLAY_CONFIGMAP: &str = "grid-overlay-glb-demo-consumer-gateway";
+const OVERLAY_CONFIGMAP: &str = "grid-overlay-glb-demo-edge-gateway";
 
 /// [`GridNetwork`] resource name in the GLB demo.
 ///
 /// [`GridNetwork`]: crate
 const GRID_NETWORK_NAME: &str = "glb-demo";
 
-/// Overlay file relative to the working directory.
-const OVERLAY_FILE: &str = ".forge/runtime/edge-us-east/grid-config.json";
-
 /// Edge service host port.
 const EDGE_PORT: u16 = 8080;
 
-/// Time to wait for overlay hot-reload (debounce + propagation).
-const HOT_RELOAD_WAIT: Duration = Duration::from_millis(1500);
+/// Edge used by the direct Grid routing and hot-reload proof.
+const PRIMARY_EDGE: &str = "east-edge";
 
-/// Edge container name (deterministic from forge naming).
-const EDGE_CONTAINER: &str = "grid-glb-demo-grid-edge-us-east";
+/// Maximum time for provider state to traverse reconciliation and SWIM.
+const PROVIDER_STATE_WAIT: Duration = Duration::from_secs(180);
+
+/// Queue depth that admits both new and existing sessions.
+const PROVIDER_QUEUE_READY: &str = "0.10";
+
+/// Queue depth above the operator's `existing_only` admission threshold.
+const PROVIDER_QUEUE_DRAINING: &str = "0.95";
+
+/// Runtime directory retaining the public CA used by client probes.
+const GTM_TLS_DIR: &str = ".forge/runtime/glb-tls/gtm";
+
+/// Stable HTTPS name exposed by the local GTM profile.
+const GTM_SERVER_NAME: &str = "api.grid-glb.test";
+
+/// Source directory used by the shared test certificate generator.
+const GENERATED_CERTS_DIR: &str = "tests/env/certs";
+
+/// Kubernetes Secret mounted by provider Praxis gateways.
+const PROVIDER_TLS_SECRET: &str = "provider-gateway-tls";
+
+/// Kubernetes Secret mounted by edge Praxis gateways.
+const EDGE_TLS_SECRET: &str = "edge-gateway-tls";
+
+/// Kubernetes Secret mounted by the GTM emulator.
+const GTM_TLS_SECRET: &str = "gtm-emulator-tls";
+
+/// Kubernetes Secret containing the demo backend's final-hop credential.
+const PROVIDER_CREDENTIAL_SECRET: &str = "mock-inference-credential";
+
+/// Token replaced with the generated edge certificate digest.
+const EDGE_US_EAST_CERT_DIGEST_TOKEN: &str = "__EDGE_US_EAST_CERT_SHA256__";
+
+/// Provider-config token replaced with the west edge certificate digest.
+const EDGE_US_WEST_CERT_DIGEST_TOKEN: &str = "__EDGE_US_WEST_CERT_SHA256__";
+
+/// Provider-config token replaced with the deterministic candidate ID.
+const PROVIDER_CANDIDATE_ID_TOKEN: &str = "__GRID_CANDIDATE_ID__";
+
+/// Candidate kind used by the GLB provider fixture.
+const DEMO_CANDIDATE_KIND: &str = "inference_model";
+
+/// Model name used by the GLB provider fixture.
+const DEMO_MODEL: &str = "sim-model-v1";
+
+/// AI-owned candidate identity header on the authenticated provider hop.
+const GRID_PEER_SELECTED_CANDIDATE_HEADER: &str = "x-grid-peer-selected-candidate";
+
+/// AI-owned request correlation header on the authenticated provider hop.
+const GRID_PEER_HOP_REQUEST_ID_HEADER: &str = "x-grid-peer-hop-request-id";
+
+/// Provider-owned response attribution emitted by `grid_provider_route`.
+const PROVIDER_GATEWAY_RESPONSE_HEADER: &str = "x-grid-demo-provider-gateway";
+
+/// Safe backend capture of provider-owned attribution.
+const BACKEND_PROVIDER_CAPTURE_HEADER: &str = "x-grid-demo-backend-provider-attribution";
+
+/// Safe backend capture of the provider-owned request ID.
+const BACKEND_REQUEST_ID_CAPTURE_HEADER: &str = "x-grid-demo-backend-request-id";
+
+/// External credential sent to the edge; intentionally differs from provider auth.
+const CLIENT_BEARER_TOKEN: &str = "test-token";
 
 // ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
 
-/// Verify GLB ingress hot-reload readiness.
+/// Materialize the mTLS contract used by the GLB provider boundary.
 ///
-/// Checks prerequisites (config, tools, forge binary, placeholder
-/// images), then runs a 23-step structured verification.  Exits
-/// non-zero if any step is `FAIL` or `BLOCKED`.
+/// The edge receives one client identity. Each provider receives its own
+/// server identity with a site-specific SNI. All identities are signed by the
+/// same demo CA and use organization `ai-grid`, which is independently checked
+/// by `peer_identity_trust` in the provider pipeline.
+pub(crate) fn prepare_provider_boundary() -> Result<(), Box<dyn std::error::Error>> {
+    stage_provider_boundary()?;
+    install_provider_boundary()
+}
+
+/// Generate and stage all local GLB identities and rendered provider configs.
+///
+/// This phase does not require Kubernetes. It runs before the provider
+/// workload stack so no pod is created with unresolved trust placeholders.
+pub(crate) fn stage_provider_boundary() -> Result<(), Box<dyn std::error::Error>> {
+    let identities = vec![
+        "east-edge".to_owned(),
+        "west-edge".to_owned(),
+        "edge-untrusted".to_owned(),
+        "east-provider".to_owned(),
+        "west-provider".to_owned(),
+    ];
+    certs::generate_all(&identities)?;
+    let wrong_ca = ::certs::generate_ca("Grid GLB untrusted test CA")?;
+    fs::write(
+        Path::new(GENERATED_CERTS_DIR).join("untrusted-ca.pem"),
+        wrong_ca.cert_pem,
+    )?;
+    stage_gtm_tls()?;
+    let east_edge_digest = certificate_sha256(&Path::new(GENERATED_CERTS_DIR).join("east-edge-cert.pem"))?;
+    let west_edge_digest = certificate_sha256(&Path::new(GENERATED_CERTS_DIR).join("west-edge-cert.pem"))?;
+    stage_provider_configs(&east_edge_digest, &west_edge_digest)?;
+    Ok(())
+}
+
+/// Install staged provider identities, configs, and backend credentials.
+///
+/// The `grid-system` namespace must exist. Provider deployments may already
+/// exist or may be applied after this function returns.
+pub(crate) fn install_provider_boundary() -> Result<(), Box<dyn std::error::Error>> {
+    ensure_demo_namespace("gtm-emulator")?;
+    for edge in EDGE_CLUSTERS {
+        apply_identity_tls_secret(edge, edge, EDGE_TLS_SECRET)?;
+    }
+    apply_gtm_tls_secret()?;
+    for provider in PROVIDER_CLUSTERS {
+        let provider_credential = generate_provider_credential()?;
+        apply_provider_config(provider)?;
+        apply_provider_tls_secret(provider)?;
+        apply_provider_credential_secret(provider, &provider_credential)?;
+        restart_provider_deployments_if_present(provider)?;
+    }
+    eprintln!(
+        "grid-routing: edge identities, GTM certificate, provider configs, mTLS material, and credentials installed"
+    );
+    Ok(())
+}
+
+/// Restart and await provider workloads when they have already been applied.
+fn restart_provider_deployments_if_present(provider: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let context = kubectl_context(provider);
+    for deployment in ["mock-inference", "provider-gateway"] {
+        if !deployment_exists(&context, deployment)? {
+            continue;
+        }
+        restart_deployment(provider, deployment)?;
+        kubectl::wait_for_rollout_ns(&context, deployment, GRID_SYSTEM_NS, provider)?;
+    }
+    Ok(())
+}
+
+/// Return whether a named provider deployment currently exists.
+fn deployment_exists(context: &str, deployment: &str) -> Result<bool, Box<dyn std::error::Error>> {
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            context,
+            "-n",
+            GRID_SYSTEM_NS,
+            "get",
+            "deployment",
+            deployment,
+            "--ignore-not-found",
+            "-o",
+            "name",
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "failed to inspect deployment/{deployment} in {context}: {}",
+            safe_truncate_str(String::from_utf8_lossy(&output.stderr).trim(), 160)
+        )
+        .into());
+    }
+    Ok(!output.stdout.is_empty())
+}
+
+/// Compute the SHA-256 fingerprint of a PEM certificate.
+fn certificate_sha256(cert_path: &Path) -> Result<String, Box<dyn std::error::Error>> {
+    let output = Command::new("openssl")
+        .args(["x509", "-in", &cert_path.display().to_string(), "-outform", "DER"])
+        .output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("failed to decode edge certificate: {}", stderr.trim()).into());
+    }
+    Ok(format!("{:x}", Sha256::digest(output.stdout)))
+}
+
+/// Compute the control-plane trust fingerprint for one generated site certificate.
+///
+/// Unlike [`certificate_sha256`], `GridSite` trust hashes the normalized PEM
+/// bytes because that is the representation distributed through SWIM.
+pub(crate) fn site_certificate_fingerprint(site: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let path = Path::new(GENERATED_CERTS_DIR).join(format!("{site}-cert.pem"));
+    let pem = fs::read_to_string(&path)?;
+    Ok(crate::env::operator::sha256_fingerprint(&pem))
+}
+
+/// Render provider gateway configs with the edge certificate digest.
+fn stage_provider_configs(east_edge_digest: &str, west_edge_digest: &str) -> Result<(), Box<dyn std::error::Error>> {
+    for provider in PROVIDER_CLUSTERS {
+        let source = Path::new("environments/grid-glb-demo/configs")
+            .join(provider)
+            .join("praxis.yaml");
+        let template = fs::read_to_string(&source)?;
+        if !template.contains(EDGE_US_EAST_CERT_DIGEST_TOKEN)
+            || !template.contains(EDGE_US_WEST_CERT_DIGEST_TOKEN)
+            || !template.contains(PROVIDER_CANDIDATE_ID_TOKEN)
+        {
+            return Err(format!(
+                "provider config template is missing an identity token: {}",
+                source.display()
+            )
+            .into());
+        }
+        let rendered = template
+            .replace(EDGE_US_EAST_CERT_DIGEST_TOKEN, east_edge_digest)
+            .replace(EDGE_US_WEST_CERT_DIGEST_TOKEN, west_edge_digest)
+            .replace(PROVIDER_CANDIDATE_ID_TOKEN, &provider_candidate_id(provider)?);
+        let target_dir = Path::new(".forge/runtime/glb-tls/provider-configs").join(provider);
+        fs::create_dir_all(&target_dir)?;
+        fs::write(target_dir.join("praxis.yaml"), rendered)?;
+    }
+    Ok(())
+}
+
+/// Generate a public-facing certificate for the stable local GTM name.
+fn stage_gtm_tls() -> Result<(), Box<dyn std::error::Error>> {
+    let certs_dir = Path::new(GENERATED_CERTS_DIR);
+    let ca = certs::load_or_generate_ca(certs_dir)?;
+    let certificate = ::certs::generate_dns_cert(&ca, "Grid GLB demo ingress", GTM_SERVER_NAME)?;
+    let target = Path::new(GTM_TLS_DIR);
+    fs::create_dir_all(target)?;
+    fs::write(target.join("ca.crt"), &ca.cert_pem)?;
+    fs::write(target.join("tls.crt"), certificate.cert_pem)?;
+    fs::write(target.join("tls.key"), certificate.key_pem)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        fs::set_permissions(target, fs::Permissions::from_mode(0o750))?;
+        fs::set_permissions(target.join("tls.key"), fs::Permissions::from_mode(0o640))?;
+    }
+    Ok(())
+}
+
+/// Ensure the shared namespace exists in a cluster without a Grid operator.
+fn ensure_demo_namespace(cluster: &str) -> Result<(), Box<dyn std::error::Error>> {
+    kubectl::apply_manifest(
+        &kubectl_context(cluster),
+        r#"{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"grid-system"}}"#,
+    )
+}
+
+/// Apply an identity certificate and the demo CA as one Kubernetes Secret.
+fn apply_identity_tls_secret(
+    cluster: &str,
+    identity: &str,
+    secret_name: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let certs_dir = Path::new(GENERATED_CERTS_DIR);
+    apply_tls_secret_from_paths(
+        cluster,
+        secret_name,
+        &certs_dir.join(format!("{identity}-cert.pem")),
+        &certs_dir.join(format!("{identity}-key.pem")),
+        &certs_dir.join("ca.pem"),
+    )
+}
+
+/// Apply the stable-name certificate used by the GTM emulator.
+fn apply_gtm_tls_secret() -> Result<(), Box<dyn std::error::Error>> {
+    let tls_dir = Path::new(GTM_TLS_DIR);
+    apply_tls_secret_from_paths(
+        "gtm-emulator",
+        GTM_TLS_SECRET,
+        &tls_dir.join("tls.crt"),
+        &tls_dir.join("tls.key"),
+        &tls_dir.join("ca.crt"),
+    )
+}
+
+/// Render and apply a generic TLS Secret from three local files.
+fn apply_tls_secret_from_paths(
+    cluster: &str,
+    secret_name: &str,
+    cert: &Path,
+    key: &Path,
+    ca: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            &kubectl_context(cluster),
+            "-n",
+            GRID_SYSTEM_NS,
+            "create",
+            "secret",
+            "generic",
+            secret_name,
+            &format!("--from-file=tls.crt={}", cert.display()),
+            &format!("--from-file=tls.key={}", key.display()),
+            &format!("--from-file=ca.crt={}", ca.display()),
+            "--dry-run=client",
+            "-o",
+            "yaml",
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "failed to render {cluster} Secret/{secret_name}: {}",
+            safe_truncate_str(String::from_utf8_lossy(&output.stderr).trim(), 160)
+        )
+        .into());
+    }
+    kubectl::apply_manifest(&kubectl_context(cluster), &String::from_utf8(output.stdout)?)
+}
+
+/// Apply the rendered provider gateway `ConfigMap`.
+fn apply_provider_config(provider: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let config_path = Path::new(".forge/runtime/glb-tls/provider-configs")
+        .join(provider)
+        .join("praxis.yaml");
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            &kubectl_context(provider),
+            "-n",
+            GRID_SYSTEM_NS,
+            "create",
+            "configmap",
+            "provider-gateway-config",
+            &format!("--from-file=praxis.yaml={}", config_path.display()),
+            "--dry-run=client",
+            "-o",
+            "yaml",
+        ])
+        .output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("failed to render {provider} provider ConfigMap: {}", stderr.trim()).into());
+    }
+    let manifest = String::from_utf8(output.stdout)?;
+    kubectl::apply_manifest(&kubectl_context(provider), &manifest)
+}
+
+/// Build `--from-file` arguments for a provider TLS Secret.
+fn tls_secret_from_file_args(provider: &str) -> [String; 3] {
+    let d = Path::new(GENERATED_CERTS_DIR);
+    [
+        format!(
+            "--from-file=tls.crt={}",
+            d.join(format!("{provider}-cert.pem")).display()
+        ),
+        format!(
+            "--from-file=tls.key={}",
+            d.join(format!("{provider}-key.pem")).display()
+        ),
+        format!("--from-file=ca.crt={}", d.join("ca.pem").display()),
+    ]
+}
+
+/// Apply the provider TLS Secret containing cert, key, and CA.
+fn apply_provider_tls_secret(provider: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let from_files = tls_secret_from_file_args(provider);
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            &kubectl_context(provider),
+            "-n",
+            GRID_SYSTEM_NS,
+            "create",
+            "secret",
+            "generic",
+            PROVIDER_TLS_SECRET,
+            &from_files[0],
+            &from_files[1],
+            &from_files[2],
+            "--dry-run=client",
+            "-o",
+            "yaml",
+        ])
+        .output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("failed to render {provider} TLS Secret: {}", stderr.trim()).into());
+    }
+    let manifest = String::from_utf8(output.stdout)?;
+    kubectl::apply_manifest(&kubectl_context(provider), &manifest)
+}
+
+/// Generate a fresh non-production provider credential.
+fn generate_provider_credential() -> Result<String, Box<dyn std::error::Error>> {
+    let output = Command::new("openssl").args(["rand", "-hex", "32"]).output()?;
+    if !output.status.success() {
+        return Err("openssl failed to generate provider credential".into());
+    }
+    let token = String::from_utf8(output.stdout)?.trim().to_owned();
+    if token.len() != 64 || !token.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("openssl returned an invalid provider credential".into());
+    }
+    Ok(token)
+}
+
+/// Apply the provider-local credential consumed only on the backend hop.
+fn apply_provider_credential_secret(provider: &str, token: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let manifest = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {
+            "name": PROVIDER_CREDENTIAL_SECRET,
+            "namespace": GRID_SYSTEM_NS,
+        },
+        "type": "Opaque",
+        "stringData": {
+            "token": token,
+        },
+    })
+    .to_string();
+    kubectl::apply_manifest(&kubectl_context(provider), &manifest)
+}
+
+/// Restart a provider deployment to pick up `ConfigMap` or Secret changes.
+fn restart_deployment(provider: &str, deployment: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let status = Command::new("kubectl")
+        .args([
+            "--context",
+            &kubectl_context(provider),
+            "-n",
+            GRID_SYSTEM_NS,
+            "rollout",
+            "restart",
+            &format!("deployment/{deployment}"),
+        ])
+        .status()?;
+    if !status.success() {
+        return Err(format!("failed to restart {provider} deployment/{deployment}").into());
+    }
+    Ok(())
+}
+
+/// Verify Grid routing and provider-boundary readiness.
+///
+/// Checks prerequisites, then proves Grid routing and the provider boundary.
+/// Exits non-zero if any assertion is `FAIL` or `BLOCKED`.
 ///
 /// # Errors
 ///
 /// Returns an error if hard prerequisites fail (config, tools,
 /// forge binary) or any verification step is not `PASS`.
-pub(crate) fn verify_glb_ingress(forge_config: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    eprintln!("glb-ingress: checking prerequisites...");
+pub(crate) fn verify_grid_routing(forge_config: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    eprintln!("grid-routing: checking prerequisites...");
     let ctx = check_prerequisites(forge_config)?;
 
     let mut results: Vec<StepResult> = Vec::new();
     run_steps(&ctx, &mut results);
 
     eprintln!();
-    eprintln!("## GLB Ingress Hot-Reload Proof");
+    eprintln!("## Grid Routing And Provider-Boundary Proof");
+    eprintln!();
+    eprintln!(
+        "User story: As a Grid and provider operator, I need discovered provider changes to update live edge routing while authenticated provider gateways protect private backends."
+    );
     print_validate_all_table(&results);
 
     let any_not_pass = results.iter().any(|r| r.status != StepStatus::Pass);
@@ -105,12 +527,12 @@ pub(crate) fn verify_glb_ingress(forge_config: &Path) -> Result<(), Box<dyn std:
         let fail_count = results.iter().filter(|r| r.status.is_failure()).count();
         let blocked_count = results.iter().filter(|r| r.status == StepStatus::Blocked).count();
         Err(format!(
-            "glb-ingress: {fail_count} FAIL, {blocked_count} BLOCKED \
-             — hot-reload proof incomplete"
+            "grid-routing: {fail_count} FAIL, {blocked_count} BLOCKED \
+             — routing and provider-boundary proof incomplete"
         )
         .into())
     } else {
-        eprintln!("glb-ingress: all proof points PASS");
+        eprintln!("grid-routing: all proof points PASS");
         Ok(())
     }
 }
@@ -126,8 +548,6 @@ struct PrereqContext {
     config: PathBuf,
     /// Resolved forge binary path.
     forge_bin: String,
-    /// Overlay file path (for hot-reload testing).
-    overlay_path: PathBuf,
     /// Services blocked by placeholder images (warning only).
     placeholders: Vec<(String, String)>,
 }
@@ -144,7 +564,7 @@ fn check_prerequisites(forge_config: &Path) -> Result<PrereqContext, Box<dyn std
         return Err(format!("{} prerequisite(s) failed", errors.len()).into());
     }
 
-    let config_text = std::fs::read_to_string(forge_config)?;
+    let config_text = fs::read_to_string(forge_config)?;
     check_no_latest_images(&config_text, forge_config)?;
 
     let placeholders = detect_placeholder_images(&config_text);
@@ -157,7 +577,6 @@ fn check_prerequisites(forge_config: &Path) -> Result<PrereqContext, Box<dyn std
     Ok(PrereqContext {
         config: forge_config.to_path_buf(),
         forge_bin,
-        overlay_path: PathBuf::from(OVERLAY_FILE),
         placeholders,
     })
 }
@@ -198,11 +617,11 @@ fn report_prereq_errors(errors: &[String]) {
     eprintln!();
 }
 
-/// Warn about placeholder images (steps 7+ will be BLOCKED).
+/// Warn that runtime assertions will be blocked by placeholder images.
 fn warn_placeholder_images(placeholders: &[(String, String)]) {
     eprintln!();
     for (svc, img) in placeholders {
-        eprintln!("  WARNING: service '{svc}' uses placeholder image '{img}' — steps 7+ will be BLOCKED");
+        eprintln!("  WARNING: service '{svc}' uses placeholder image '{img}' — runtime assertions will be BLOCKED");
     }
     eprintln!();
 }
@@ -259,7 +678,7 @@ fn tool_available(name: &str) -> bool {
 
 /// Resolve the forge binary: prefer `praxis-forge` on PATH, fall
 /// back to `target/debug/praxis-forge`.
-fn resolve_forge_binary() -> Option<String> {
+pub(crate) fn resolve_forge_binary() -> Option<String> {
     if tool_available("praxis-forge") {
         return Some("praxis-forge".to_owned());
     }
@@ -270,53 +689,72 @@ fn resolve_forge_binary() -> Option<String> {
     None
 }
 
-/// Detect placeholder images in forge config text.
+/// Detect placeholder images in Forge configuration.
 ///
-/// Scans for lines containing both `image:` and `PLACEHOLDER`,
-/// tracking the nearest preceding `- name:` line as the service name.
+/// Parses YAML and inspects `image` plus camel-cased image property keys such
+/// as `gatewayImage`, `operatorImage`, and `mockProviderImage`.
 pub(crate) fn detect_placeholder_images(config_text: &str) -> Vec<(String, String)> {
-    let mut results = Vec::new();
-    let mut current_service = String::new();
-
-    for line in config_text.lines() {
-        let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix("- name:") {
-            rest.trim().clone_into(&mut current_service);
-        }
-        if trimmed.contains("image:") && trimmed.contains("PLACEHOLDER") {
-            let image = trimmed
-                .split("image:")
-                .nth(1)
-                .unwrap_or("")
-                .trim()
-                .trim_matches('"')
-                .to_owned();
-            results.push((current_service.clone(), image));
-        }
-    }
-    results
+    yaml_image_references(config_text)
+        .into_iter()
+        .filter(|(_, image)| image.contains("PLACEHOLDER"))
+        .collect()
 }
 
 /// Detect `:latest`-tagged images in forge config text.
 ///
-/// Same scanning pattern as [`detect_placeholder_images`] — tracks
-/// the nearest preceding `- name:` line as context.
+/// Uses the same structured traversal as [`detect_placeholder_images`].
 pub(crate) fn detect_latest_images(config_text: &str) -> Vec<(String, String)> {
-    let mut results = Vec::new();
-    let mut current_service = String::new();
+    yaml_image_references(config_text)
+        .into_iter()
+        .filter(|(_, image)| image_is_latest(image))
+        .collect()
+}
 
-    for line in config_text.lines() {
-        let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix("- name:") {
-            rest.trim().clone_into(&mut current_service);
-        }
-        if let Some(raw) = extract_image_value(trimmed)
-            && image_is_latest(&raw)
-        {
-            results.push((current_service.clone(), raw));
-        }
-    }
+/// Return image references from a YAML document with their nearest named
+/// object as context.
+fn yaml_image_references(config_text: &str) -> Vec<(String, String)> {
+    let Ok(document) = serde_yaml::from_str::<serde_yaml::Value>(config_text) else {
+        return Vec::new();
+    };
+    let mut results = Vec::new();
+    collect_yaml_images(&document, "root", "root", &mut results);
     results
+}
+
+/// Recursively collect image-like YAML fields.
+fn collect_yaml_images(value: &serde_yaml::Value, path: &str, owner: &str, results: &mut Vec<(String, String)>) {
+    match value {
+        serde_yaml::Value::Mapping(mapping) => {
+            let local_owner = mapping
+                .get(serde_yaml::Value::String("name".to_owned()))
+                .and_then(serde_yaml::Value::as_str)
+                .unwrap_or(owner);
+            for (key, child) in mapping {
+                let Some(key) = key.as_str() else {
+                    continue;
+                };
+                let child_path = format!("{path}.{key}");
+                if is_image_key(key) {
+                    if let Some(image) = child.as_str() {
+                        results.push((local_owner.to_owned(), image.to_owned()));
+                    }
+                } else {
+                    collect_yaml_images(child, &child_path, local_owner, results);
+                }
+            }
+        },
+        serde_yaml::Value::Sequence(sequence) => {
+            for (index, child) in sequence.iter().enumerate() {
+                collect_yaml_images(child, &format!("{path}[{index}]"), owner, results);
+            }
+        },
+        _ => {},
+    }
+}
+
+/// Whether a YAML key holds a container image reference.
+fn is_image_key(key: &str) -> bool {
+    key.to_ascii_lowercase().ends_with("image")
 }
 
 /// Detect `:latest`-tagged images in YAML resource files under the
@@ -328,7 +766,7 @@ fn detect_latest_in_resources(demo_dir: &Path) -> Vec<(PathBuf, String)> {
         return results;
     };
     for path in entries {
-        let Ok(text) = std::fs::read_to_string(&path) else {
+        let Ok(text) = fs::read_to_string(&path) else {
             continue;
         };
         for line in text.lines() {
@@ -345,7 +783,7 @@ fn detect_latest_in_resources(demo_dir: &Path) -> Vec<(PathBuf, String)> {
 /// Collect `.yaml` / `.yml` file paths under a directory recursively.
 fn walk_yaml_files(dir: &Path) -> Result<Vec<PathBuf>, std::io::Error> {
     let mut files = Vec::new();
-    for entry in std::fs::read_dir(dir)? {
+    for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
         if path.is_dir() {
@@ -377,6 +815,9 @@ fn extract_image_value(trimmed: &str) -> Option<String> {
 /// Digest-pinned images (`image@sha256:...`) are always considered
 /// pinned regardless of whether a tag is also present.
 fn image_is_latest(image: &str) -> bool {
+    if image.contains("{{") {
+        return false;
+    }
     if image.contains('@') {
         return false;
     }
@@ -388,50 +829,28 @@ fn image_is_latest(image: &str) -> bool {
     tag == Some("latest") || tag.is_none()
 }
 
-/// Parse the host port for a named service from forge config text.
-///
-/// Looks for the `- name: <service>` block and extracts the first
-/// `host:` value from its `ports:` section.
-#[cfg(test)]
-fn parse_edge_host_port(config_text: &str, service_name: &str) -> Option<u16> {
-    let name_marker = format!("- name: {service_name}");
-    let mut in_service = false;
-
-    for line in config_text.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("- name:") {
-            in_service = trimmed.contains(&name_marker);
-            continue;
-        }
-        if in_service && let Some(rest) = trimmed.strip_prefix("host:") {
-            return rest.trim().parse().ok();
-        }
-    }
-    None
-}
-
 // ---------------------------------------------------------------------------
 // Verification steps
 // ---------------------------------------------------------------------------
 
-/// Run all 23 verification steps.
+/// Run all Grid routing and provider-boundary proof assertions.
 #[expect(
     clippy::too_many_lines,
     reason = "sequential proof steps: each step depends on the previous; splitting obscures the proof flow"
 )]
 fn run_steps(ctx: &PrereqContext, results: &mut Vec<StepResult>) {
-    // Step 1: Forge config validation.
-    step_banner(1, "validating forge config");
+    // Forge config validation.
+    proof_banner("validating forge config");
     let config_ok = record_step("prerequisites", results, || {
         validate_forge_config(&ctx.forge_bin, &ctx.config)
     });
     if !config_ok {
-        block_remaining(2, "config validation failed", results);
+        block_remaining("forge status", "config validation failed", results);
         return;
     }
 
-    // Step 2: Environment status.
-    step_banner(2, "checking environment status");
+    // Environment status.
+    proof_banner("checking environment status");
     let status_json = match run_forge_status(&ctx.forge_bin, &ctx.config) {
         Ok(json) => {
             results.push(StepResult::pass("forge status", "forge status returned OK"));
@@ -439,46 +858,50 @@ fn run_steps(ctx: &PrereqContext, results: &mut Vec<StepResult>) {
         },
         Err(e) => {
             results.push(StepResult::fail("forge status", e.as_ref()));
-            block_remaining(3, "status unavailable", results);
+            block_remaining("clusters live", "status unavailable", results);
             return;
         },
     };
 
-    // Step 3: All clusters live.
-    step_banner(3, "checking clusters live");
+    // All clusters live.
+    proof_banner("checking clusters live");
     let clusters_ok = record_step("clusters live", results, || check_clusters_live(&status_json));
     if !clusters_ok {
-        block_remaining(4, "clusters not live", results);
+        block_remaining("provider gateway IPs", "clusters not live", results);
         return;
     }
 
-    // Step 4: Provider gateway IPs.
-    step_banner(4, "checking provider gateway IPs");
-    let gateways_ok = record_step("provider gateway IPs", results, check_provider_gateways_captured);
+    // Provider gateway IPs.
+    proof_banner("checking provider gateway IPs");
+    let _gateways_ok = record_step("provider gateway IPs", results, check_provider_gateways_captured);
 
-    // Step 5: SWIM LB services.
-    step_banner(5, "checking SWIM LB services");
+    // SWIM LB services.
+    proof_banner("checking SWIM LB services");
     record_step("swim lb services", results, check_swim_lb_services);
 
-    // Step 6: Operator SWIM advertise address.
-    step_banner(6, "checking operator SWIM advertise address");
+    // Operator SWIM advertise address.
+    proof_banner("checking operator SWIM advertise address");
     record_step("swim advertise addr", results, check_swim_advertise_addr);
 
-    // Step 7: GridNetwork seeds populated.
-    step_banner(7, "checking GridNetwork seeds");
+    // GridNetwork seeds populated.
+    proof_banner("checking GridNetwork seeds");
     record_step("gridnetwork seeds", results, check_gridnetwork_seeds);
 
-    // Step 8: Overlay metadata.
-    step_banner(8, "checking overlay candidate metadata");
+    // Overlay metadata.
+    proof_banner("checking overlay candidate metadata");
     record_step("overlay metadata", results, check_overlay_metadata);
 
-    // Step 9: Provider gateway self-discovery.
-    step_banner(9, "checking provider gateway self-discovery");
+    // Provider gateway self-discovery.
+    proof_banner("checking provider gateway self-discovery");
     let provider_gateway_addrs = match load_provider_gateway_addresses() {
         Ok(addrs) => addrs,
         Err(e) => {
             results.push(StepResult::fail("provider gateway addr", e.as_ref()));
-            block_remaining(10, "provider gateway captures unavailable", results);
+            block_remaining(
+                "remote gridsite egress",
+                "provider gateway captures unavailable",
+                results,
+            );
             return;
         },
     };
@@ -486,30 +909,45 @@ fn run_steps(ctx: &PrereqContext, results: &mut Vec<StepResult>) {
         check_provider_gateway_addr(&provider_gateway_addrs)
     });
 
-    // Step 10: Remote GridSite egress addresses.
-    step_banner(10, "checking remote GridSite egress addresses");
+    // Remote GridSite egress addresses.
+    proof_banner("checking remote GridSite egress addresses");
     record_step("remote gridsite egress", results, || {
         check_remote_gridsite_egress(&provider_gateway_addrs)
     });
 
-    // Step 11: Provider gateways reachable.
-    step_banner(11, "checking provider gateway reachability");
-    if gateways_ok {
-        record_step("provider gateways reachable", results, || {
-            check_provider_gateways_reachable()
-        });
-    } else {
-        results.push(StepResult::blocked(
-            "provider gateways reachable",
-            "gateway IPs not captured",
-        ));
-    }
+    // Provider-boundary runtime probes.
+    proof_banner("checking provider service selector");
+    record_step("provider service selector", results, check_provider_service_selector);
 
-    // Step 12: Edge config applied.
-    step_banner(12, "checking edge config applied");
+    proof_banner("checking provider gateway pods");
+    record_step("provider gateway pods", results, check_provider_gateway_pods);
+
+    proof_banner("checking backend private service");
+    record_step("backend private service", results, check_backend_private_service);
+
+    proof_banner("checking backend network policy");
+    record_step("backend network policy", results, check_backend_network_policy);
+
+    proof_banner("checking provider mTLS trust matrix");
+    record_step("provider mTLS trust matrix", results, || {
+        check_provider_mtls_trust_matrix(&provider_gateway_addrs)
+    });
+
+    proof_banner("checking provider peer policy");
+    record_step("provider peer policy", results, || {
+        check_provider_peer_policy(&provider_gateway_addrs)
+    });
+
+    proof_banner("checking provider request boundary");
+    record_step("provider request boundary", results, || {
+        check_provider_request_boundary(&provider_gateway_addrs)
+    });
+
+    // Edge config applied.
+    proof_banner("checking edge config applied");
     record_step("edge config applied", results, check_site_stacks);
 
-    // Gate steps 13+ on placeholder images.
+    // Gate steps 19+ on placeholder images.
     if !ctx.placeholders.is_empty() {
         let reason = format!(
             "placeholder images: {}",
@@ -519,45 +957,42 @@ fn run_steps(ctx: &PrereqContext, results: &mut Vec<StepResult>) {
                 .collect::<Vec<_>>()
                 .join(", ")
         );
-        block_remaining(13, &reason, results);
+        block_remaining("edge overlays mounted", &reason, results);
         return;
     }
 
-    // Step 13: Overlay-sync service running.
-    step_banner(13, "checking overlay-sync service");
-    let sync_ok = record_step("overlay-sync running", results, || {
-        check_service_running(&status_json, OVERLAY_SYNC_SERVICE)
-    });
-    if !sync_ok {
-        block_remaining(14, "overlay-sync not running", results);
+    // Both operator overlays are projected into their local edge pods.
+    proof_banner("checking edge overlay projections");
+    let overlays_ok = record_step("edge overlays mounted", results, wait_for_edge_overlays_ready);
+    if !overlays_ok {
+        block_remaining("edge gateways running", "edge overlays unavailable", results);
         return;
     }
 
-    // Step 14: Edge service running — capture container ID.
-    step_banner(14, "capturing edge service identity");
-    let edge_identity = match check_service_running(&status_json, EDGE_SERVICE) {
-        Ok(evidence) => {
-            let captured = extract_service_identity(&status_json, EDGE_SERVICE);
-            results.push(StepResult::pass("edge service running", evidence));
+    // Both Kubernetes edge gateways are ready; capture east pod identity.
+    proof_banner("capturing edge gateway pod identity");
+    let edge_identity = match check_edge_gateway_pods() {
+        Ok((evidence, captured)) => {
+            results.push(StepResult::pass("edge gateways running", evidence));
             captured
         },
         Err(e) => {
-            results.push(StepResult::fail("edge service running", e.as_ref()));
-            block_remaining(15, "edge not running", results);
+            results.push(StepResult::fail("edge gateways running", e.as_ref()));
+            block_remaining("inference routed", "edge not running", results);
             return;
         },
     };
 
-    // Step 15: Inference routed (initial request).
-    step_banner(15, "sending inference request");
+    // Initial inference request.
+    proof_banner("sending inference request");
     let routed_ok = record_step("inference routed", results, check_inference_routed);
     if !routed_ok {
-        block_remaining(16, "initial inference failed", results);
+        block_remaining("session affinity bind", "initial inference failed", results);
         return;
     }
 
-    // Step 16: Session affinity — initial bind.
-    step_banner(16, "session affinity bind");
+    // Session affinity initial bind.
+    proof_banner("checking session affinity bind");
     let provider_a = match check_session_bind(EDGE_PORT) {
         Ok((evidence, provider)) => {
             results.push(StepResult::pass("session affinity bind", evidence));
@@ -565,101 +1000,103 @@ fn run_steps(ctx: &PrereqContext, results: &mut Vec<StepResult>) {
         },
         Err(e) => {
             results.push(StepResult::fail("session affinity bind", e.as_ref()));
-            block_remaining(17, "session bind failed", results);
+            block_remaining("session affinity reuse", "session bind failed", results);
             return;
         },
     };
 
-    // Step 17: Session affinity — reuse.
-    step_banner(17, "session affinity reuse");
+    // Session affinity reuse.
+    proof_banner("checking session affinity reuse");
     let reuse_ok = record_step("session affinity reuse", results, || {
         check_session_reuse(EDGE_PORT, &provider_a)
     });
     if !reuse_ok {
-        block_remaining(18, "session reuse failed", results);
+        block_remaining("session drain setup", "session reuse failed", results);
         return;
     }
 
-    // Step 18: Session drain — set candidate to existing_only.
-    step_banner(18, "session drain setup");
-    let drain_original = match setup_session_drain(&ctx.overlay_path, &provider_a) {
-        Ok((evidence, original)) => {
+    // Session drain setup.
+    proof_banner("setting up provider drain");
+    match setup_session_drain(PRIMARY_EDGE, &provider_a) {
+        Ok(evidence) => {
             results.push(StepResult::pass("session drain setup", evidence));
-            Some(original)
         },
         Err(e) => {
             results.push(StepResult::fail("session drain setup", e.as_ref()));
-            block_remaining(19, "drain setup failed", results);
+            block_remaining("session drain verified", "drain setup failed", results);
             return;
         },
     };
 
-    // Step 19: Session drain — verify routing.
-    step_banner(19, "session drain verified");
-    record_step("session drain verified", results, || {
-        check_session_drain(EDGE_PORT, &provider_a)
-    });
-
-    // Restore overlay after drain test.
-    if let Some(original) = &drain_original {
-        restore_overlay(&ctx.overlay_path, original);
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "xtask is synchronous; no async runtime available for tokio::time::sleep"
-        )]
-        {
-            thread::sleep(HOT_RELOAD_WAIT);
-        }
+    // Session drain routing verification.
+    proof_banner("checking provider drain");
+    let drain_proof = check_session_drain(EDGE_PORT, &provider_a);
+    let drain_restore = restore_provider_admission(PRIMARY_EDGE, &provider_a);
+    match (drain_proof, drain_restore) {
+        (Ok(proof), Ok(restored)) => {
+            results.push(StepResult::pass(
+                "session drain verified",
+                format!("{proof}; {restored}"),
+            ));
+        },
+        (Err(proof), Ok(_)) => {
+            results.push(StepResult::fail("session drain verified", proof.as_ref()));
+        },
+        (Ok(_), Err(restore)) => {
+            results.push(StepResult::fail("session drain verified", restore.as_ref()));
+            block_remaining("provider withdrawn", "provider admission restoration failed", results);
+            return;
+        },
+        (Err(proof), Err(restore)) => {
+            let error = format!("{proof}; provider admission restoration also failed: {restore}");
+            results.push(StepResult::fail(
+                "session drain verified",
+                &std::io::Error::other(error),
+            ));
+            block_remaining("provider withdrawn", "provider admission restoration failed", results);
+            return;
+        },
     }
 
-    let reload_count_before = count_overlay_reload_logs(EDGE_CONTAINER).unwrap_or(0);
-
-    // Step 20: Modify overlay (remove one provider).
-    step_banner(20, "modifying overlay for hot-reload test");
-    let original_overlay = match modify_overlay_for_test(&ctx.overlay_path) {
-        Ok((evidence, original)) => {
-            results.push(StepResult::pass("overlay modified", evidence));
-            Some(original)
+    // Make the selected provider unavailable through its declared backend.
+    proof_banner("withdrawing a provider through health reconciliation");
+    let withdrawal = match withdraw_provider(PRIMARY_EDGE, &provider_a) {
+        Ok((evidence, state)) => {
+            results.push(StepResult::pass("provider withdrawn", evidence));
+            state
         },
         Err(e) => {
-            results.push(StepResult::fail("overlay modified", e.as_ref()));
-            block_remaining(21, "overlay modification failed", results);
+            results.push(StepResult::fail("provider withdrawn", e.as_ref()));
+            block_remaining("hot-reload observed", "provider withdrawal failed", results);
             return;
         },
     };
 
-    // Step 21: Hot-reload observed.
-    step_banner(21, "checking hot-reload");
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "xtask is synchronous; no async runtime available for tokio::time::sleep"
-    )]
-    {
-        thread::sleep(HOT_RELOAD_WAIT);
-    }
+    // Hot reload observed.
+    proof_banner("checking hot reload");
     record_step("hot-reload observed", results, || {
-        check_hot_reload_observed(EDGE_CONTAINER, reload_count_before)
+        check_hot_reload_observed(PRIMARY_EDGE, withdrawal.reload_count_before)
     });
 
-    // Step 22: Routing after reload.
-    step_banner(22, "sending post-reload inference request");
+    // Routing after reload.
+    proof_banner("sending post-reload inference request");
     record_step("routing after reload", results, check_inference_routed);
 
-    // Restore overlay before step 23.
-    if let Some(original) = &original_overlay {
-        restore_overlay(&ctx.overlay_path, original);
-    }
+    // Restore the provider and require the operator-generated overlay to recover.
+    let restore_result = restore_withdrawn_provider(PRIMARY_EDGE, &withdrawal);
 
-    // Step 23: Edge container stable (same ID, no restart).
-    step_banner(23, "checking edge container stability");
-    record_step("edge container stable", results, || {
-        check_container_stable(EDGE_CONTAINER, edge_identity.as_ref())
+    // Edge pod stability.
+    proof_banner("checking edge pod stability");
+    record_step("edge pod stable", results, move || {
+        let restore_evidence = restore_result?;
+        let stable_evidence = check_edge_pod_stable(PRIMARY_EDGE, &edge_identity)?;
+        Ok(format!("{stable_evidence}; {restore_evidence}"))
     });
 }
 
 /// Print a step progress banner.
-fn step_banner(step: u32, description: &str) {
-    eprintln!("glb-ingress: [{step}/{TOTAL_STEPS}] {description}...");
+fn proof_banner(description: &str) {
+    eprintln!("grid-routing: {description}...");
 }
 
 /// Record a step result, returning whether it passed.
@@ -680,8 +1117,8 @@ fn record_step(
     }
 }
 
-/// Labels for all 23 steps, indexed from 0.
-const STEP_LABELS: &[&str] = &[
+/// Ordered assertion labels used for dependency-aware blocking.
+const PROOF_LABELS: &[&str] = &[
     "prerequisites",
     "forge status",
     "clusters live",
@@ -692,24 +1129,545 @@ const STEP_LABELS: &[&str] = &[
     "overlay metadata",
     "provider gateway addr",
     "remote gridsite egress",
-    "provider gateways reachable",
+    "provider service selector",
+    "provider gateway pods",
+    "backend private service",
+    "backend network policy",
+    "provider mTLS trust matrix",
+    "provider peer policy",
+    "provider request boundary",
     "edge config applied",
-    "overlay-sync running",
-    "edge service running",
+    "edge overlays mounted",
+    "edge gateways running",
     "inference routed",
     "session affinity bind",
     "session affinity reuse",
     "session drain setup",
     "session drain verified",
-    "overlay modified",
+    "provider withdrawn",
     "hot-reload observed",
     "routing after reload",
-    "edge container stable",
+    "edge pod stable",
 ];
 
-/// Block all steps from `from_step` (1-indexed) onward.
-fn block_remaining(from_step: u32, reason: &str, results: &mut Vec<StepResult>) {
-    for label in STEP_LABELS.get((from_step.saturating_sub(1) as usize)..).unwrap_or(&[]) {
+/// Verify provider gateway Service selector and port on each site.
+fn check_provider_service_selector() -> Result<String, Box<dyn std::error::Error>> {
+    let mut evidence = Vec::new();
+    for provider in PROVIDER_CLUSTERS {
+        let ctx = kubectl_context(provider);
+        let sel = kubectl_jsonpath(&ctx, "svc", "provider-gateway", "{.spec.selector}")?;
+        let port = kubectl_jsonpath(&ctx, "svc", "provider-gateway", "{.spec.ports[0].port}")?;
+        if port != "8443" {
+            return Err(format!("{provider}: expected port 8443, got {port}").into());
+        }
+        evidence.push(format!("{provider}: port={port}, selector={sel}"));
+    }
+    Ok(evidence.join("; "))
+}
+
+/// Verify provider gateway pods are Running with the expected image.
+fn check_provider_gateway_pods() -> Result<String, Box<dyn std::error::Error>> {
+    let mut evidence = Vec::new();
+    for provider in PROVIDER_CLUSTERS {
+        let ctx = kubectl_context(provider);
+        let phase = kubectl_jsonpath(
+            &ctx,
+            "pods",
+            "-l app.kubernetes.io/name=provider-gateway",
+            "{.items[0].status.phase}",
+        )?;
+        if phase != "Running" {
+            return Err(format!("{provider}: pod phase is {phase}, expected Running").into());
+        }
+        let image = kubectl_jsonpath(
+            &ctx,
+            "pods",
+            "-l app.kubernetes.io/name=provider-gateway",
+            "{.items[0].spec.containers[0].image}",
+        )?;
+        evidence.push(format!("{provider}: {phase}, image={image}"));
+    }
+    Ok(evidence.join("; "))
+}
+
+/// Verify the backend Service is `ClusterIP` and not externally reachable.
+fn check_backend_private_service() -> Result<String, Box<dyn std::error::Error>> {
+    let mut evidence = Vec::new();
+    for provider in PROVIDER_CLUSTERS {
+        let ctx = kubectl_context(provider);
+        let svc_type = kubectl_jsonpath(&ctx, "svc", "mock-inference", "{.spec.type}")?;
+        if svc_type != "ClusterIP" {
+            return Err(format!("{provider}: backend type is {svc_type}, expected ClusterIP").into());
+        }
+        evidence.push(format!("{provider}: type={svc_type}"));
+    }
+    Ok(evidence.join("; "))
+}
+
+/// Prove the backend ingress policy with differential runtime probes.
+///
+/// The same image and target are used for both probes. A pod carrying the
+/// provider-gateway access label must connect, while an otherwise identical
+/// unlabeled pod must be denied. This detects actual enforcement rather than
+/// inferring support from the CNI name or the presence of a manifest.
+#[expect(
+    clippy::too_many_lines,
+    reason = "sequential network probes for a single verification step"
+)]
+fn check_backend_network_policy() -> Result<String, Box<dyn std::error::Error>> {
+    let mut evidence = Vec::new();
+    for provider in PROVIDER_CLUSTERS {
+        let context = kubectl_context(provider);
+        let target = "mock-inference.grid-system.svc.cluster.local:8080";
+        let allowed_name = "grid-netpol-allowed";
+        let denied_name = "grid-netpol-denied";
+
+        delete_probe_pod(&context, allowed_name);
+        delete_probe_pod(&context, denied_name);
+
+        let allowed = run_probe_pod(
+            &context,
+            allowed_name,
+            Some("grid.praxis-proxy.io/backend-access=provider-gateway"),
+            &["--tcp-probe", target, "--tcp-probe-timeout-ms", "2000"],
+        )?;
+        if allowed.phase != "Succeeded" || !allowed.logs.contains("tcp-probe=connected") {
+            return Err(format!(
+                "{provider}: allowed backend probe did not connect (phase={}, logs={})",
+                allowed.phase,
+                safe_truncate_str(&allowed.logs, 120)
+            )
+            .into());
+        }
+
+        let denied = run_probe_pod(
+            &context,
+            denied_name,
+            None,
+            &["--tcp-probe", target, "--tcp-probe-timeout-ms", "2000"],
+        )?;
+        if denied.phase != "Failed"
+            || !(denied.logs.contains("tcp-probe=timeout") || denied.logs.contains("tcp-probe=connect-failed"))
+        {
+            return Err(format!(
+                "{provider}: unlabeled backend probe was not denied (phase={}, logs={})",
+                denied.phase,
+                safe_truncate_str(&denied.logs, 120)
+            )
+            .into());
+        }
+
+        let no_auth = run_probe_pod(
+            &context,
+            "grid-backend-no-auth",
+            Some("grid.praxis-proxy.io/backend-access=provider-gateway"),
+            &["--http-probe", target],
+        )?;
+        require_http_probe_status(provider, "missing credential", &no_auth, 401)?;
+
+        let client_auth = run_probe_pod(
+            &context,
+            "grid-backend-client-auth",
+            Some("grid.praxis-proxy.io/backend-access=provider-gateway"),
+            &[
+                "--http-probe",
+                target,
+                "--http-probe-authorization",
+                "Bearer test-token",
+            ],
+        )?;
+        require_http_probe_status(provider, "client-supplied credential", &client_auth, 403)?;
+
+        evidence.push(format!(
+            "{provider}: allowed=connected, unlabeled=denied, no_auth=HTTP_401, client_auth=HTTP_403"
+        ));
+    }
+    Ok(evidence.join("; "))
+}
+
+/// Terminal evidence from one `NetworkPolicy` probe pod.
+struct NetworkPolicyProbe {
+    /// Kubernetes pod phase.
+    phase: String,
+    /// Bounded probe output.
+    logs: String,
+}
+
+/// Delete a fixed-name probe pod without failing cleanup.
+fn delete_probe_pod(context: &str, name: &str) {
+    drop(
+        Command::new("kubectl")
+            .args([
+                "--context",
+                context,
+                "-n",
+                GRID_SYSTEM_NS,
+                "delete",
+                "pod",
+                name,
+                "--ignore-not-found",
+                "--wait=true",
+            ])
+            .output(),
+    );
+}
+
+/// Run a bounded TCP probe pod and return its terminal phase and logs.
+#[expect(
+    clippy::too_many_lines,
+    reason = "kubectl pod lifecycle: create, poll, collect logs — splitting obscures the sequence"
+)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "xtask is synchronous; no async runtime available for tokio::time::sleep"
+)]
+fn run_probe_pod(
+    context: &str,
+    name: &str,
+    labels: Option<&str>,
+    probe_args: &[&str],
+) -> Result<NetworkPolicyProbe, Box<dyn std::error::Error>> {
+    let _guard = ProbePodGuard {
+        context: context.to_owned(),
+        name: name.to_owned(),
+    };
+    let mut command = Command::new("kubectl");
+    let probe_image = crate::env::image_overrides::glb_mock_provider_image();
+    command.args([
+        "--context",
+        context,
+        "-n",
+        GRID_SYSTEM_NS,
+        "run",
+        name,
+        &format!("--image={probe_image}"),
+        &format!(
+            "--image-pull-policy={}",
+            crate::env::image_overrides::image_pull_policy()
+        ),
+        "--restart=Never",
+    ]);
+    if let Some(value) = labels {
+        command.arg(format!("--labels={value}"));
+    }
+    command.arg("--").args(probe_args);
+    let output = command.output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "failed to create probe pod {name}: {}",
+            safe_truncate_str(String::from_utf8_lossy(&output.stderr).trim(), 120)
+        )
+        .into());
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let phase = loop {
+        let phase = kubectl_jsonpath(context, "pod", name, "{.status.phase}")?;
+        if matches!(phase.as_str(), "Succeeded" | "Failed") {
+            break phase;
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("probe pod {name} did not finish; last phase={phase}").into());
+        }
+        thread::sleep(Duration::from_millis(250));
+    };
+
+    let output = Command::new("kubectl")
+        .args(["--context", context, "-n", GRID_SYSTEM_NS, "logs", name])
+        .output()?;
+    let logs = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(NetworkPolicyProbe {
+        phase,
+        logs: safe_truncate_str(logs.trim(), 512),
+    })
+}
+
+/// Require one in-cluster HTTP probe to complete with the expected status.
+fn require_http_probe_status(
+    provider: &str,
+    condition: &str,
+    probe: &NetworkPolicyProbe,
+    expected: u16,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let marker = format!("http-probe=status status={expected}");
+    if probe.phase == "Succeeded" && probe.logs.contains(&marker) {
+        return Ok(());
+    }
+    Err(format!(
+        "{provider}: {condition} probe expected HTTP {expected} (phase={}, logs={})",
+        probe.phase,
+        safe_truncate_str(&probe.logs, 120)
+    )
+    .into())
+}
+
+/// Best-effort cleanup for a `NetworkPolicy` probe pod.
+struct ProbePodGuard {
+    /// Kubernetes context.
+    context: String,
+    /// Pod name.
+    name: String,
+}
+
+impl Drop for ProbePodGuard {
+    fn drop(&mut self) {
+        delete_probe_pod(&self.context, &self.name);
+    }
+}
+
+/// Run positive and negative provider mTLS handshake probes.
+fn check_provider_mtls_trust_matrix(addrs: &BTreeMap<String, String>) -> Result<String, Box<dyn std::error::Error>> {
+    let ca = format!("{GENERATED_CERTS_DIR}/ca.pem");
+    let wrong_ca = format!("{GENERATED_CERTS_DIR}/untrusted-ca.pem");
+    let mut evidence = Vec::new();
+    for (provider, addr) in addrs {
+        check_provider_tls(provider, addr, &ca, &wrong_ca)?;
+        evidence.push(format!(
+            "{provider}: valid_edges=2, no_cert/wrong_sni/wrong_ca=TLS_REFUSED"
+        ));
+    }
+    Ok(evidence.join("; "))
+}
+
+/// Prove the TLS matrix for one provider endpoint.
+fn check_provider_tls(provider: &str, addr: &str, ca: &str, wrong_ca: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let sni = format!("{provider}.grid.internal");
+    let ip = addr.split(':').next().unwrap_or(addr);
+    for edge in EDGE_CLUSTERS {
+        let cert = format!("{GENERATED_CERTS_DIR}/{edge}-cert.pem");
+        let key = format!("{GENERATED_CERTS_DIR}/{edge}-key.pem");
+        if curl_mtls_probe(ip, &sni, Some((&cert, &key)), ca, "/healthz").is_err() {
+            return Err(format!("{provider}/{edge}: TLS handshake failed").into());
+        }
+    }
+    if curl_mtls_probe(ip, &sni, None, ca, "/healthz").is_ok() {
+        return Err(format!("{provider}: no client cert unexpectedly reached HTTP").into());
+    }
+    let edge_cert = format!("{GENERATED_CERTS_DIR}/east-edge-cert.pem");
+    let edge_key = format!("{GENERATED_CERTS_DIR}/east-edge-key.pem");
+    let identity = Some((edge_cert.as_str(), edge_key.as_str()));
+    if curl_mtls_probe(ip, "wrong-provider.grid.internal", identity, ca, "/healthz").is_ok() {
+        return Err(format!("{provider}: wrong SNI unexpectedly passed TLS").into());
+    }
+    if curl_mtls_probe(ip, &sni, identity, wrong_ca, "/healthz").is_ok() {
+        return Err(format!("{provider}: wrong CA unexpectedly passed TLS").into());
+    }
+    Ok(())
+}
+
+/// Prove a wrong-organization certificate is rejected
+/// by `peer_identity_trust` filter (HTTP 403).
+fn check_provider_peer_policy(addrs: &BTreeMap<String, String>) -> Result<String, Box<dyn std::error::Error>> {
+    let wrong_cert = format!("{GENERATED_CERTS_DIR}/wrong-org-client-cert.pem");
+    let wrong_key = format!("{GENERATED_CERTS_DIR}/wrong-org-client-key.pem");
+    let unknown_cert = format!("{GENERATED_CERTS_DIR}/edge-untrusted-cert.pem");
+    let unknown_key = format!("{GENERATED_CERTS_DIR}/edge-untrusted-key.pem");
+    let ca = format!("{GENERATED_CERTS_DIR}/ca.pem");
+    let mut evidence = Vec::new();
+    for (provider, addr) in addrs {
+        let sni = format!("{provider}.grid.internal");
+        let ip = addr.split(':').next().unwrap_or(addr);
+        let wrong_org = curl_mtls_probe(ip, &sni, Some((&wrong_cert, &wrong_key)), &ca, "/healthz")?;
+        if wrong_org != 403 {
+            return Err(format!("{provider}: wrong-org cert expected 403, got {wrong_org}").into());
+        }
+        let wrong_digest = curl_mtls_probe(ip, &sni, Some((&unknown_cert, &unknown_key)), &ca, "/healthz")?;
+        if wrong_digest != 403 {
+            return Err(format!("{provider}: untrusted cert digest expected 403, got {wrong_digest}").into());
+        }
+        evidence.push(format!("{provider}: wrong_org=HTTP_403, unknown_digest=HTTP_403"));
+    }
+    Ok(evidence.join("; "))
+}
+
+/// Prove unknown peer candidates and wrong paths are rejected
+/// by provider-local routing policy after successful peer authentication.
+#[expect(
+    clippy::too_many_lines,
+    reason = "sequential network probes for a single verification step"
+)]
+fn check_provider_request_boundary(addrs: &BTreeMap<String, String>) -> Result<String, Box<dyn std::error::Error>> {
+    let cert = format!("{GENERATED_CERTS_DIR}/east-edge-cert.pem");
+    let key = format!("{GENERATED_CERTS_DIR}/east-edge-key.pem");
+    let ca = format!("{GENERATED_CERTS_DIR}/ca.pem");
+    let mut evidence = Vec::new();
+    for (provider, addr) in addrs {
+        let sni = format!("{provider}.grid.internal");
+        let ip = addr.split(':').next().unwrap_or(addr);
+        let unknown_candidate = curl_mtls_probe_with_headers(&MtlsHeaderProbe {
+            ip,
+            sni: &sni,
+            cert_key: (&cert, &key),
+            ca: &ca,
+            path: "/v1/chat/completions",
+            headers: &[
+                (GRID_PEER_SELECTED_CANDIDATE_HEADER, "spoofed"),
+                (GRID_PEER_HOP_REQUEST_ID_HEADER, "boundary-unknown-candidate"),
+                ("X-Model", "sim-model-v1"),
+            ],
+        })?;
+        if unknown_candidate != 403 {
+            return Err(format!("{provider}: unknown candidate expected 403, got {unknown_candidate}").into());
+        }
+
+        let candidate = provider_candidate_id(provider)?;
+        let bad_path = curl_mtls_probe_with_headers(&MtlsHeaderProbe {
+            ip,
+            sni: &sni,
+            cert_key: (&cert, &key),
+            ca: &ca,
+            path: "/v1/unauthorized-path",
+            headers: &[
+                (GRID_PEER_SELECTED_CANDIDATE_HEADER, &candidate),
+                (GRID_PEER_HOP_REQUEST_ID_HEADER, "boundary-wrong-path"),
+                ("X-Model", "sim-model-v1"),
+            ],
+        })?;
+        if bad_path != 404 {
+            return Err(format!("{provider}: wrong path expected 404, got {bad_path}").into());
+        }
+        evidence.push(format!("{provider}: unknown_candidate=HTTP_403, wrong_path=HTTP_404"));
+    }
+    Ok(evidence.join("; "))
+}
+
+/// Run a curl mTLS probe against a provider gateway.
+///
+/// Returns `Ok(http_status)` on successful TLS handshake or `Err` on
+/// TLS failure.
+fn curl_mtls_probe(
+    ip: &str,
+    sni: &str,
+    cert: Option<(&str, &str)>,
+    ca: &str,
+    path: &str,
+) -> Result<u16, Box<dyn std::error::Error>> {
+    let resolve = format!("{sni}:8443:{ip}");
+    let url = format!("https://{sni}:8443{path}");
+    let mut cmd = Command::new("curl");
+    cmd.args(["-s", "-o", "/dev/null", "-w", "%{http_code}"]);
+    cmd.args(["--connect-timeout", "5", "--max-time", "10"]);
+    cmd.args(["--cacert", ca, "--resolve", &resolve]);
+    if let Some((cert_path, key_path)) = cert {
+        cmd.args(["--cert", cert_path, "--key", key_path]);
+    }
+    cmd.arg(&url);
+    let output = cmd.output()?;
+    if !output.status.success() {
+        return Err(format!("curl TLS handshake failed (exit {})", output.status).into());
+    }
+    let code: u16 = String::from_utf8(output.stdout)?
+        .trim()
+        .parse()
+        .map_err(|e| format!("failed to parse HTTP status: {e}"))?;
+    Ok(code)
+}
+
+/// Arguments for a curl mTLS probe with request headers.
+struct MtlsHeaderProbe<'a> {
+    /// Provider gateway IP.
+    ip: &'a str,
+    /// SNI hostname.
+    sni: &'a str,
+    /// Client certificate and key paths.
+    cert_key: (&'a str, &'a str),
+    /// CA certificate path.
+    ca: &'a str,
+    /// URL path to request.
+    path: &'a str,
+    /// Request header name/value pairs.
+    headers: &'a [(&'a str, &'a str)],
+}
+
+/// Run a curl mTLS probe with request headers.
+fn curl_mtls_probe_with_headers(args: &MtlsHeaderProbe<'_>) -> Result<u16, Box<dyn std::error::Error>> {
+    let resolve = format!("{}:8443:{}", args.sni, args.ip);
+    let url = format!("https://{}:8443{}", args.sni, args.path);
+    let mut cmd = Command::new("curl");
+    cmd.args(["-s", "-o", "/dev/null", "-w", "%{http_code}"]);
+    cmd.args(["--connect-timeout", "5", "--max-time", "10"]);
+    cmd.args(["--cacert", args.ca, "--resolve", &resolve]);
+    cmd.args(["--cert", args.cert_key.0, "--key", args.cert_key.1]);
+    for (name, value) in args.headers {
+        cmd.args(["-H", &format!("{name}: {value}")]);
+    }
+    cmd.arg(&url);
+    let output = cmd.output()?;
+    if !output.status.success() {
+        return Err(format!("curl failed (exit {})", output.status).into());
+    }
+    let code: u16 = String::from_utf8(output.stdout)?
+        .trim()
+        .parse()
+        .map_err(|e| format!("failed to parse HTTP status: {e}"))?;
+    Ok(code)
+}
+
+/// Derive the stable candidate ID rendered for one provider demo site.
+fn provider_candidate_id(provider: &str) -> Result<String, Box<dyn std::error::Error>> {
+    if !PROVIDER_CLUSTERS.contains(&provider) {
+        return Err(format!("no provider candidate ID configured for {provider}").into());
+    }
+    let cluster = format!("sim-{provider}");
+    Ok(fnv1a_hex8(&format!(
+        "{DEMO_CANDIDATE_KIND}/{DEMO_MODEL}/{provider}/{cluster}"
+    )))
+}
+
+/// Compute the operator's dependency-free eight-character FNV-1a fixture ID.
+fn fnv1a_hex8(input: &str) -> String {
+    const FNV_OFFSET: u32 = 2_166_136_261;
+    const FNV_PRIME: u32 = 16_777_619;
+    let mut hash = FNV_OFFSET;
+    for byte in input.bytes() {
+        hash ^= u32::from(byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    format!("{hash:08x}")
+}
+
+/// Query a kubectl jsonpath field from a resource.
+fn kubectl_jsonpath(
+    context: &str,
+    resource: &str,
+    name: &str,
+    jsonpath: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            context,
+            "-n",
+            GRID_SYSTEM_NS,
+            "get",
+            resource,
+            name,
+            "-o",
+            &format!("jsonpath={jsonpath}"),
+        ])
+        .output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "kubectl get {resource} {name}: {}",
+            safe_truncate_str(stderr.trim(), 120)
+        )
+        .into());
+    }
+    Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+}
+
+/// Block the named assertion and every dependent assertion after it.
+fn block_remaining(from_label: &str, reason: &str, results: &mut Vec<StepResult>) {
+    let start = PROOF_LABELS
+        .iter()
+        .position(|label| *label == from_label)
+        .unwrap_or(PROOF_LABELS.len());
+    for label in PROOF_LABELS.get(start..).unwrap_or(&[]) {
         results.push(StepResult::blocked(label, reason.to_owned()));
     }
 }
@@ -718,7 +1676,7 @@ fn block_remaining(from_step: u32, reason: &str, results: &mut Vec<StepResult>) 
 // Step implementations
 // ---------------------------------------------------------------------------
 
-/// Step 1: Validate forge config.
+/// Validate the Forge config.
 fn validate_forge_config(forge_bin: &str, config: &Path) -> Result<String, Box<dyn std::error::Error>> {
     let output = Command::new(forge_bin)
         .args(["config", "validate", "--config", &config.display().to_string()])
@@ -731,7 +1689,7 @@ fn validate_forge_config(forge_bin: &str, config: &Path) -> Result<String, Box<d
     }
 }
 
-/// Step 2: Run `praxis-forge status --output json` and parse.
+/// Run `praxis-forge status --output json` and parse it.
 pub(crate) fn run_forge_status(
     forge_bin: &str,
     config: &Path,
@@ -748,7 +1706,7 @@ pub(crate) fn run_forge_status(
     Ok(json)
 }
 
-/// Step 3: Verify all expected clusters are live.
+/// Verify all expected clusters are live.
 pub(crate) fn check_clusters_live(status_json: &serde_json::Value) -> Result<String, Box<dyn std::error::Error>> {
     let clusters = status_json
         .get("data")
@@ -774,10 +1732,10 @@ pub(crate) fn check_clusters_live(status_json: &serde_json::Value) -> Result<Str
     }
 }
 
-/// Step 4: Check provider gateway IPs via kubectl.
+/// Check provider gateway IPs through Kubernetes.
 fn check_provider_gateways_captured() -> Result<String, Box<dyn std::error::Error>> {
     let mut found = Vec::new();
-    for cluster in &["site-us-west", "site-us-central"] {
+    for cluster in PROVIDER_CLUSTERS {
         let context = kubectl_context(cluster);
         let ip = get_provider_gateway_ip(&context)?;
         found.push(format!("{cluster}={ip}"));
@@ -785,26 +1743,10 @@ fn check_provider_gateways_captured() -> Result<String, Box<dyn std::error::Erro
     Ok(found.join(", "))
 }
 
-/// Step 5: Check provider gateways are reachable via curl.
-fn check_provider_gateways_reachable() -> Result<String, Box<dyn std::error::Error>> {
-    let mut verified = Vec::new();
-    for cluster in &["site-us-west", "site-us-central"] {
-        let context = kubectl_context(cluster);
-        let ip = get_provider_gateway_ip(&context)?;
-        let url = format!("http://{ip}:8080/health");
-        let resp = verify::curl_get(&url)?;
-        if resp.status != 200 {
-            return Err(format!("{cluster} gateway returned HTTP {} (expected 200)", resp.status).into());
-        }
-        verified.push(*cluster);
-    }
-    Ok(format!("{} gateways healthy", verified.len()))
-}
-
-/// Step 5: SWIM LB services exist on all clusters.
+/// Verify SWIM `LoadBalancer` Services on all Grid clusters.
 fn check_swim_lb_services() -> Result<String, Box<dyn std::error::Error>> {
     let mut found = Vec::new();
-    for cluster in CLUSTER_NAMES {
+    for cluster in GRID_CLUSTERS {
         let ip = get_swim_lb_ip(&kubectl_context(cluster), cluster)?;
         found.push(format!("{cluster}={ip}"));
     }
@@ -841,10 +1783,10 @@ fn get_swim_lb_ip(context: &str, cluster: &str) -> Result<String, Box<dyn std::e
     Ok(ip)
 }
 
-/// Step 6: Operator SWIM advertise address matches LB IP.
+/// Verify each operator SWIM advertise address matches its `LoadBalancer` IP.
 fn check_swim_advertise_addr() -> Result<String, Box<dyn std::error::Error>> {
     let mut verified = Vec::new();
-    for cluster in CLUSTER_NAMES {
+    for cluster in GRID_CLUSTERS {
         let context = kubectl_context(cluster);
         let output = Command::new("kubectl")
             .args([
@@ -885,10 +1827,10 @@ fn parse_env_var_from_json(json: &str, var_name: &str) -> Option<String> {
     })
 }
 
-/// Step 7: `GridNetwork` seeds populated on all clusters.
+/// Verify `GridNetwork` seeds on all Grid clusters.
 fn check_gridnetwork_seeds() -> Result<String, Box<dyn std::error::Error>> {
     let mut verified = Vec::new();
-    for cluster in CLUSTER_NAMES {
+    for cluster in GRID_CLUSTERS {
         let context = kubectl_context(cluster);
         let output = Command::new("kubectl")
             .args([
@@ -905,8 +1847,8 @@ fn check_gridnetwork_seeds() -> Result<String, Box<dyn std::error::Error>> {
             .output()?;
         let seeds_raw = String::from_utf8(output.stdout)?.trim().to_owned();
         let count = parse_seeds_count(&seeds_raw);
-        if count != 2 {
-            return Err(format!("GridNetwork on {cluster} has {count} seed(s) (expected exactly 2)").into());
+        if count != 3 {
+            return Err(format!("GridNetwork on {cluster} has {count} seed(s) (expected exactly 3)").into());
         }
         verified.push(format!("{cluster}={count}"));
     }
@@ -922,11 +1864,11 @@ fn parse_seeds_count(raw: &str) -> usize {
     trimmed.split(' ').filter(|s| !s.is_empty()).count()
 }
 
-/// Step 8: Overlay [`ConfigMap`] has candidates with required metadata.
+/// Verify the overlay [`ConfigMap`] candidate metadata.
 ///
 /// [`ConfigMap`]: https://kubernetes.io/docs/concepts/configuration/configmap/
 fn check_overlay_metadata() -> Result<String, Box<dyn std::error::Error>> {
-    let context = kubectl_context("site-us-east");
+    let context = kubectl_context(PRIMARY_EDGE);
     let output = Command::new("kubectl")
         .args([
             "--context",
@@ -1000,7 +1942,7 @@ fn validate_candidate_metadata(candidates: &[serde_json::Value]) -> Result<(), B
     Ok(())
 }
 
-/// Step 9: Provider gateway self-discovery.
+/// Verify provider gateway self-discovery.
 ///
 /// Proves the operator's self-discovery path works end-to-end:
 ///
@@ -1114,13 +2056,13 @@ fn verify_expected_gateway_addr(
     Ok(())
 }
 
-/// Step 10: Remote [`GridSite`] egress addresses on the edge cluster.
+/// Verify remote [`GridSite`] egress addresses on the primary edge.
 ///
 /// [`GridSite`]: crate
 fn check_remote_gridsite_egress(
     expected_addrs: &BTreeMap<String, String>,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let context = kubectl_context("site-us-east");
+    let context = kubectl_context(PRIMARY_EDGE);
     let output = Command::new("kubectl")
         .args([
             "--context",
@@ -1193,7 +2135,7 @@ fn find_gridsite_egress<'a>(
 /// Load expected provider gateway addresses from Forge's default state file
 /// (verifier evidence only — operators self-discover their own addresses).
 fn load_provider_gateway_addresses() -> Result<BTreeMap<String, String>, Box<dyn std::error::Error>> {
-    let state = std::fs::read_to_string(".forge/state.json")?;
+    let state = fs::read_to_string(".forge/state.json")?;
     parse_provider_gateway_captures(&state)
 }
 
@@ -1213,15 +2155,161 @@ fn parse_provider_gateway_captures(json: &str) -> Result<BTreeMap<String, String
             .and_then(serde_json::Value::as_str)
             .filter(|s| !s.is_empty())
             .ok_or_else(|| format!("Forge state missing captures.{cluster}.provider-gateway-ip"))?;
-        addrs.insert((*cluster).to_owned(), format!("{ip}:8080"));
+        addrs.insert((*cluster).to_owned(), format!("{ip}:8443"));
     }
     Ok(addrs)
 }
 
-/// Step 12: Verify the expected `GridNetwork` resource exists on the
+/// Verify the expected `GridNetwork` resource exists on each
 /// edge cluster.
 fn check_site_stacks() -> Result<String, Box<dyn std::error::Error>> {
-    let context = kubectl_context("site-us-east");
+    for edge in EDGE_CLUSTERS {
+        let context = kubectl_context(edge);
+        let output = Command::new("kubectl")
+            .args([
+                "--context",
+                &context,
+                "-n",
+                GRID_SYSTEM_NS,
+                "get",
+                "gridnetwork",
+                GRID_NETWORK_NAME,
+                "--no-headers",
+            ])
+            .output()?;
+        if !output.status.success() {
+            return Err(format!(
+                "GridNetwork '{GRID_NETWORK_NAME}' not found on {edge}: {}",
+                safe_truncate_str(String::from_utf8_lossy(&output.stderr).trim(), 120)
+            )
+            .into());
+        }
+    }
+    Ok(format!(
+        "GridNetwork '{GRID_NETWORK_NAME}' applied on both edge clusters"
+    ))
+}
+
+/// Require both edge overlays to exist and be projected at `/etc/grid`.
+fn check_edge_overlay_mounts() -> Result<String, Box<dyn std::error::Error>> {
+    let mut evidence = Vec::new();
+    for edge in EDGE_CLUSTERS {
+        verify_single_edge_overlay(edge)?;
+        evidence.push(format!("{edge}=2 candidates, projected `ConfigMap`"));
+    }
+    Ok(evidence.join(", "))
+}
+
+/// Wait until both edge gateways have a complete operator-rendered overlay.
+///
+/// # Errors
+///
+/// Returns an error when both provider candidates and the overlay projection
+/// do not become ready before the provider-state timeout.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "bounded polling for asynchronous SWIM and operator convergence"
+)]
+pub(crate) fn wait_for_edge_overlays_ready() -> Result<String, Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + PROVIDER_STATE_WAIT;
+    let mut last_error = String::from("overlay validation has not run");
+    while Instant::now() < deadline {
+        match check_edge_overlay_mounts() {
+            Ok(evidence) => return Ok(evidence),
+            Err(error) => last_error = error.to_string(),
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
+    Err(format!("timeout waiting for complete edge overlays: {last_error}").into())
+}
+
+/// Validate one edge cluster's overlay content and volume projection.
+fn verify_single_edge_overlay(edge: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let context = kubectl_context(edge);
+    let overlay = kubectl_jsonpath(&context, "configmap", OVERLAY_CONFIGMAP, r"{.data.grid-config\.json}")?;
+    let document: serde_json::Value = serde_json::from_str(&overlay)?;
+    let local_site = document
+        .get("local_site")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("{edge} overlay missing local_site"))?;
+    let candidates = document
+        .get("candidates")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| format!("{edge} overlay missing candidates"))?;
+    if local_site != edge || candidates.len() < 2 {
+        return Err(format!(
+            "{edge} overlay local_site={local_site:?}, candidates={}",
+            candidates.len()
+        )
+        .into());
+    }
+    let mounted = kubectl_jsonpath(
+        &context,
+        "deployment",
+        "edge-gateway",
+        "{.spec.template.spec.volumes[?(@.name=='overlay')].configMap.name}",
+    )?;
+    if mounted != OVERLAY_CONFIGMAP {
+        return Err(format!("{edge} edge-gateway mounts overlay `ConfigMap` {mounted:?}").into());
+    }
+    Ok(())
+}
+
+/// Kubernetes pod identity used to prove hot reload did not restart the edge.
+#[derive(Debug)]
+struct EdgePodIdentity {
+    /// Kubernetes Pod UID.
+    uid: String,
+    /// Restart count for the Praxis container.
+    restart_count: u64,
+}
+
+/// Require both edge gateway pods ready and capture the primary pod identity.
+fn check_edge_gateway_pods() -> Result<(String, EdgePodIdentity), Box<dyn std::error::Error>> {
+    let mut primary = None;
+    let mut evidence = Vec::new();
+    for edge in EDGE_CLUSTERS {
+        let identity = edge_pod_identity(edge)?;
+        evidence.push(format!(
+            "{edge}=uid:{}, restarts:{}",
+            safe_truncate_str(&identity.uid, 12),
+            identity.restart_count
+        ));
+        if *edge == PRIMARY_EDGE {
+            primary = Some(identity);
+        }
+    }
+    Ok((
+        evidence.join(", "),
+        primary.ok_or("primary edge pod identity unavailable")?,
+    ))
+}
+
+/// Read the ready Praxis pod UID and restart count from one edge cluster.
+fn edge_pod_identity(edge: &str) -> Result<EdgePodIdentity, Box<dyn std::error::Error>> {
+    let pod = get_edge_pod_json(edge)?;
+    let ready = pod
+        .pointer("/status/containerStatuses/0/ready")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if !ready {
+        return Err(format!("{edge} edge-gateway pod is not ready").into());
+    }
+    let uid = pod
+        .pointer("/metadata/uid")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("{edge} edge-gateway pod has no UID"))?
+        .to_owned();
+    let restart_count = pod
+        .pointer("/status/containerStatuses/0/restartCount")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| format!("{edge} edge-gateway pod has no restartCount"))?;
+    Ok(EdgePodIdentity { uid, restart_count })
+}
+
+/// Fetch the first edge-gateway pod as JSON from one cluster.
+fn get_edge_pod_json(edge: &str) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let context = kubectl_context(edge);
     let output = Command::new("kubectl")
         .args([
             "--context",
@@ -1229,89 +2317,77 @@ fn check_site_stacks() -> Result<String, Box<dyn std::error::Error>> {
             "-n",
             GRID_SYSTEM_NS,
             "get",
-            "gridnetwork",
-            GRID_NETWORK_NAME,
-            "--no-headers",
+            "pods",
+            "-l",
+            "app.kubernetes.io/name=edge-gateway",
+            "-o",
+            "json",
         ])
         .output()?;
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!(
-            "GridNetwork '{GRID_NETWORK_NAME}' not found on site-us-east: {}",
-            safe_truncate_str(stderr.trim(), 120)
+            "failed to inspect {edge} edge pod: {}",
+            safe_truncate_str(String::from_utf8_lossy(&output.stderr).trim(), 120)
         )
         .into());
     }
-    Ok(format!("GridNetwork '{GRID_NETWORK_NAME}' applied on site-us-east"))
+    let list: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    list.get("items")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|items| items.first().cloned())
+        .ok_or_else(|| format!("{edge} has no edge-gateway pod").into())
 }
 
-/// Steps 7-8: Verify a service is running (phase=running,
-/// containerId present).
-fn check_service_running(
-    status_json: &serde_json::Value,
-    service_name: &str,
-) -> Result<String, Box<dyn std::error::Error>> {
-    let svc = find_service_in_status(status_json, service_name)?;
-
-    let phase = svc
-        .get("phase")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("unknown");
-    if phase != "running" {
-        return Err(format!("service '{service_name}' phase={phase} (expected running)").into());
-    }
-
-    let container_id = svc.get("containerId").and_then(serde_json::Value::as_str);
-    let Some(id) = container_id.filter(|id| !id.is_empty()) else {
-        return Err(format!("service '{service_name}' has no containerId").into());
-    };
-
-    let restart_count = svc.get("restartCount").and_then(serde_json::Value::as_u64);
-    let restart_text = restart_count.map_or_else(|| "unknown".to_owned(), |count| count.to_string());
-
-    Ok(format!(
-        "containerId={}, phase=running, restartCount={restart_text}",
-        safe_truncate_str(id, 12)
-    ))
-}
-
-/// Baseline identity for a Forge-managed service.
-struct ServiceIdentity {
-    /// Full container ID.
-    id: String,
-    /// Restart count observed before the proof window.
-    restart_count: Option<u64>,
-}
-
-/// Extract baseline service identity from Forge status JSON.
-fn extract_service_identity(status_json: &serde_json::Value, service_name: &str) -> Option<ServiceIdentity> {
-    let svc = find_service_in_status(status_json, service_name).ok()?;
-    let id = svc
-        .get("containerId")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_owned)?;
-    let restart_count = svc.get("restartCount").and_then(serde_json::Value::as_u64);
-    Some(ServiceIdentity { id, restart_count })
-}
-
-/// Step 15/22: Send an inference request and verify 200 OK with
+/// Send an inference request and verify HTTP 200 with
 /// provider attribution and model echo.
+#[expect(
+    clippy::too_many_lines,
+    reason = "sequential verification assertions for a single step"
+)]
 fn check_inference_routed() -> Result<String, Box<dyn std::error::Error>> {
     let resp = curl_post_with_auth(EDGE_PORT)?;
     if resp.status != 200 {
         return Err(format!("inference request returned HTTP {}", resp.status).into());
     }
     let provider = extract_provider(&resp).map_err(|_e| "inference response missing X-Grid-Demo-Provider header")?;
+    let provider_gateway = resp
+        .headers
+        .get(PROVIDER_GATEWAY_RESPONSE_HEADER)
+        .ok_or("inference response missing X-Grid-Demo-Provider-Gateway header")?;
+    if provider_gateway != &provider {
+        return Err(format!(
+            "backend provider attribution '{provider}' does not match provider gateway '{provider_gateway}'"
+        )
+        .into());
+    }
+    let backend_provider = resp
+        .headers
+        .get(BACKEND_PROVIDER_CAPTURE_HEADER)
+        .ok_or("inference response missing backend provider-attribution capture")?;
+    if backend_provider != provider_gateway {
+        return Err(format!(
+            "backend captured provider '{backend_provider}' does not match provider gateway '{provider_gateway}'"
+        )
+        .into());
+    }
+    let backend_request_id = resp
+        .headers
+        .get(BACKEND_REQUEST_ID_CAPTURE_HEADER)
+        .filter(|value| !value.is_empty())
+        .ok_or("inference response missing backend provider-request-id capture")?;
     let body: serde_json::Value =
         serde_json::from_str(&resp.body).map_err(|e| format!("inference response body is not valid JSON: {e}"))?;
     let model = body
         .get("model")
         .and_then(serde_json::Value::as_str)
         .ok_or("inference response missing model field")?;
-    Ok(format!("HTTP 200, model={model}, provider={provider}"))
+    Ok(format!(
+        "HTTP 200, model={model}, provider={provider}, gateway={provider_gateway}, backend_request_id={}, provider credential replaced client-supplied credential",
+        safe_truncate_str(backend_request_id, 16)
+    ))
 }
 
-/// Step 16: Bind a session and record which provider served it.
+/// Bind a session and record which provider served it.
 fn check_session_bind(port: u16) -> Result<(String, String), Box<dyn std::error::Error>> {
     let resp = curl_edge_request(port, Some("glb-proof-a"))?;
     if resp.status != 200 {
@@ -1321,7 +2397,7 @@ fn check_session_bind(port: u16) -> Result<(String, String), Box<dyn std::error:
     Ok((format!("session=glb-proof-a bound to {provider}"), provider))
 }
 
-/// Step 17: Verify the same session reuses the same provider.
+/// Verify the same session reuses the same provider.
 fn check_session_reuse(port: u16, expected_provider: &str) -> Result<String, Box<dyn std::error::Error>> {
     for i in 0..2 {
         let resp = curl_edge_request(port, Some("glb-proof-a"))?;
@@ -1338,32 +2414,37 @@ fn check_session_reuse(port: u16, expected_provider: &str) -> Result<String, Box
     ))
 }
 
-/// Step 18: Drain a provider via `existing_only` and wait for reload.
-fn setup_session_drain(
-    overlay_path: &Path,
-    provider_site: &str,
-) -> Result<(String, String), Box<dyn std::error::Error>> {
-    let reload_before = count_overlay_reload_logs(EDGE_CONTAINER).unwrap_or(0);
-    let (evidence, original) = modify_overlay_drain(overlay_path, provider_site)?;
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "xtask is synchronous; no async runtime available for tokio::time::sleep"
-    )]
-    {
-        thread::sleep(HOT_RELOAD_WAIT);
+/// Drive a provider into `existing_only` through its exported queue metric.
+fn setup_session_drain(edge: &str, provider_site: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let reload_before = count_overlay_reload_logs(edge).unwrap_or(0);
+    let result = (|| {
+        set_provider_queue_depth(provider_site, PROVIDER_QUEUE_DRAINING)?;
+        refresh_provider(provider_site)?;
+        let admission = wait_for_candidate_admission(edge, provider_site, "existing_only")?;
+        let reload = check_hot_reload_observed(edge, reload_before)?;
+        Ok(format!(
+            "site={provider_site}, queue_depth={PROVIDER_QUEUE_DRAINING}, {admission}; {reload}"
+        ))
+    })();
+    if let Err(error) = result {
+        return match restore_provider_admission_without_reload(edge, provider_site) {
+            Ok(()) => Err(error),
+            Err(restore) => Err(format!("{error}; admission restoration also failed: {restore}").into()),
+        };
     }
-    match check_hot_reload_observed(EDGE_CONTAINER, reload_before) {
-        Ok(reload_evidence) => Ok((format!("{evidence}; {reload_evidence}"), original)),
-        Err(e) => {
-            restore_overlay(overlay_path, &original);
-            Err(e)
-        },
-    }
+    result
 }
 
-/// Step 19: Verify drain routing — new session avoids drained, old retains.
+/// Verify new sessions avoid a drained provider while existing sessions retain it.
 fn check_session_drain(port: u16, drained_provider: &str) -> Result<String, Box<dyn std::error::Error>> {
-    let new_resp = curl_edge_request(port, Some("glb-proof-c"))?;
+    let new_session = format!(
+        "glb-proof-new-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    );
+    let new_resp = curl_edge_request(port, Some(&new_session))?;
     if new_resp.status != 200 {
         return Err(format!("drain new-session returned HTTP {}", new_resp.status).into());
     }
@@ -1384,57 +2465,45 @@ fn check_session_drain(port: u16, drained_provider: &str) -> Result<String, Box<
     ))
 }
 
-/// Step 20: Modify the overlay file for hot-reload testing.
-///
-/// Reads the current overlay, removes one candidate, and writes the
-/// modified version back. Returns the evidence string and the original
-/// content for later restoration.
-fn modify_overlay_for_test(overlay_path: &Path) -> Result<(String, String), Box<dyn std::error::Error>> {
-    let original = std::fs::read_to_string(overlay_path).map_err(|e| format!("failed to read overlay: {e}"))?;
-
-    let mut doc: serde_json::Value =
-        serde_json::from_str(&original).map_err(|e| format!("failed to parse overlay: {e}"))?;
-
-    let candidates = doc
-        .get_mut("candidates")
-        .and_then(serde_json::Value::as_array_mut)
-        .ok_or("overlay missing candidates array")?;
-
-    let original_count = candidates.len();
-    if original_count < 2 {
-        return Err("need at least 2 candidates for hot-reload test".into());
+/// Check edge logs for hot-reload evidence.
+fn check_hot_reload_observed(edge: &str, previous_count: usize) -> Result<String, Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + Duration::from_secs(90);
+    while Instant::now() < deadline {
+        let current_count = count_overlay_reload_logs(edge)?;
+        if current_count > previous_count {
+            return Ok(format!(
+                "overlay reload observed: before={previous_count}, after={current_count}"
+            ));
+        }
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "xtask is synchronous; no async runtime available for tokio::time::sleep"
+        )]
+        thread::sleep(Duration::from_secs(1));
     }
-    candidates.pop();
-
-    let modified = serde_json::to_string(&doc).map_err(|e| format!("failed to serialize: {e}"))?;
-    write_overlay(overlay_path, &modified)?;
-
-    Ok((
-        format!("candidates {original_count} → {}", original_count - 1),
-        original,
-    ))
+    Err(format!("{edge} overlay reload log count did not increase from {previous_count}").into())
 }
 
-/// Step 21: Check docker logs for hot-reload evidence and verify
-/// the container was not restarted.
-fn check_hot_reload_observed(container: &str, previous_count: usize) -> Result<String, Box<dyn std::error::Error>> {
-    let current_count = count_overlay_reload_logs(container)?;
-    if current_count <= previous_count {
+/// Count overlay reload log entries for a Kubernetes edge pod.
+fn count_overlay_reload_logs(edge: &str) -> Result<usize, Box<dyn std::error::Error>> {
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            &kubectl_context(edge),
+            "-n",
+            GRID_SYSTEM_NS,
+            "logs",
+            "deployment/edge-gateway",
+            "--tail=200",
+        ])
+        .output()?;
+    if !output.status.success() {
         return Err(format!(
-            "overlay reload log count did not increase: before={previous_count}, after={current_count}"
+            "failed to read {edge} edge logs: {}",
+            safe_truncate_str(String::from_utf8_lossy(&output.stderr).trim(), 120)
         )
         .into());
     }
-    Ok(format!(
-        "overlay reload observed: before={previous_count}, after={current_count}"
-    ))
-}
-
-/// Count overlay reload log entries for a Docker container.
-fn count_overlay_reload_logs(container: &str) -> Result<usize, Box<dyn std::error::Error>> {
-    let output = Command::new("docker")
-        .args(["logs", "--tail", "200", container])
-        .output()?;
     let logs = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     let combined = format!("{logs}{stderr}");
@@ -1446,104 +2515,332 @@ fn count_reload_entries(logs: &str) -> usize {
     logs.matches("overlay reloaded").count()
 }
 
-/// Step 23: Verify the edge container was not restarted during the
-/// hot-reload test.
-fn check_container_stable(
-    container: &str,
-    expected: Option<&ServiceIdentity>,
-) -> Result<String, Box<dyn std::error::Error>> {
-    let state = inspect_container_state(container)?;
-
-    if let Some(expected) = expected
-        && state.id != expected.id
-    {
+/// Verify the edge Pod was not replaced or restarted during hot reload.
+fn check_edge_pod_stable(edge: &str, expected: &EdgePodIdentity) -> Result<String, Box<dyn std::error::Error>> {
+    let current = edge_pod_identity(edge)?;
+    if current.uid != expected.uid {
         return Err(format!(
-            "container restarted: expected {}, got {}",
-            safe_truncate_str(&expected.id, 12),
-            safe_truncate_str(&state.id, 12)
+            "{edge} edge pod changed UID: expected {}, got {}",
+            safe_truncate_str(&expected.uid, 12),
+            safe_truncate_str(&current.uid, 12)
         )
         .into());
     }
-    if let Some(expected) = expected.and_then(|id| id.restart_count)
-        && state.restart_count != expected
-    {
+    if current.restart_count != expected.restart_count {
         return Err(format!(
-            "container restart count changed: expected {expected}, got {}",
-            state.restart_count
+            "{edge} restart count changed: expected {}, got {}",
+            expected.restart_count, current.restart_count
         )
         .into());
     }
-
     Ok(format!(
-        "containerId={} unchanged, startedAt={}, restartCount={}",
-        safe_truncate_str(&state.id, 12),
-        state.started_at,
-        state.restart_count
+        "pod UID {} unchanged, restartCount={}",
+        safe_truncate_str(&current.uid, 12),
+        current.restart_count
     ))
 }
 
-/// Minimal Docker container state needed by the verifier.
-struct ContainerState {
-    /// Full container ID.
-    id: String,
-    /// Docker start timestamp.
-    started_at: String,
-    /// Docker restart count.
-    restart_count: u64,
+/// Read the operator-rendered overlay from an edge `ConfigMap`.
+fn read_overlay(edge: &str) -> Result<String, Box<dyn std::error::Error>> {
+    kubectl_jsonpath(
+        &kubectl_context(edge),
+        "configmap",
+        OVERLAY_CONFIGMAP,
+        r"{.data.grid-config\.json}",
+    )
 }
 
-/// Inspect a Docker container and parse its identity fields.
-fn inspect_container_state(container: &str) -> Result<ContainerState, Box<dyn std::error::Error>> {
-    let output = Command::new("docker")
+/// Return one provider candidate from the operator-rendered edge overlay.
+fn overlay_candidate(edge: &str, site: &str) -> Result<Option<serde_json::Value>, Box<dyn std::error::Error>> {
+    let overlay: serde_json::Value =
+        serde_json::from_str(&read_overlay(edge)?).map_err(|e| format!("failed to parse {edge} overlay: {e}"))?;
+    let candidates = overlay
+        .get("candidates")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| format!("{edge} overlay missing candidates array"))?;
+    Ok(candidates
+        .iter()
+        .find(|candidate| candidate.get("site").and_then(serde_json::Value::as_str) == Some(site))
+        .cloned())
+}
+
+/// Wait for an operator-derived candidate admission state.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "synchronous polling in xtask; no async runtime is active"
+)]
+fn wait_for_candidate_admission(edge: &str, site: &str, expected: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + PROVIDER_STATE_WAIT;
+    let mut observed = None;
+    while Instant::now() < deadline {
+        observed = overlay_candidate(edge, site)?.and_then(|candidate| {
+            candidate
+                .get("admission_state")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        });
+        if observed.as_deref() == Some(expected) {
+            return Ok(format!("overlay admission_state={expected}"));
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
+    Err(format!("timeout waiting for {site} admission_state={expected} on {edge}; observed={observed:?}").into())
+}
+
+/// Wait until an unavailable provider is absent from the edge overlay.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "synchronous polling in xtask; no async runtime is active"
+)]
+fn wait_for_candidate_absent(edge: &str, site: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + PROVIDER_STATE_WAIT;
+    while Instant::now() < deadline {
+        if overlay_candidate(edge, site)?.is_none() {
+            return Ok(format!("site={site} absent from operator-rendered overlay"));
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
+    Err(format!("timeout waiting for {site} removal from {edge} overlay").into())
+}
+
+/// Return the `InferenceProvider` resource for one demo provider site.
+fn provider_resource_name(site: &str) -> Result<&'static str, Box<dyn std::error::Error>> {
+    match site {
+        "east-provider" => Ok("sim-east-provider"),
+        "west-provider" => Ok("sim-west-provider"),
+        _ => Err(format!("unknown demo provider site {site}").into()),
+    }
+}
+
+/// Set the mock backend's normalized queue metric and wait for its rollout.
+fn set_provider_queue_depth(site: &str, queue_depth: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let assignment = format!("MOCK_QUEUE_DEPTH={queue_depth}");
+    let output = Command::new("kubectl")
         .args([
-            "inspect",
-            container,
-            "--format",
-            "{{.Id}} {{.State.StartedAt}} {{.RestartCount}}",
+            "--context",
+            &kubectl_context(site),
+            "-n",
+            GRID_SYSTEM_NS,
+            "set",
+            "env",
+            "deployment/mock-inference",
+            &assignment,
         ])
         .output()?;
     if !output.status.success() {
-        return Err(format!("docker inspect failed for {container}").into());
+        return Err(format!(
+            "failed to set {site} queue depth: {}",
+            safe_truncate_str(String::from_utf8_lossy(&output.stderr).trim(), 120)
+        )
+        .into());
     }
-    parse_container_state(container, &String::from_utf8_lossy(&output.stdout))
+    kubectl::wait_for_rollout_ns(&kubectl_context(site), "mock-inference", GRID_SYSTEM_NS, site)
 }
 
-/// Parse Docker inspect output from `inspect_container_state`.
-fn parse_container_state(container: &str, inspect: &str) -> Result<ContainerState, Box<dyn std::error::Error>> {
-    let mut fields = inspect.split_whitespace();
-    let id = fields
-        .next()
-        .ok_or_else(|| format!("docker inspect returned no container ID for {container}"))?
-        .to_owned();
-    let started_at = fields
-        .next()
-        .ok_or_else(|| format!("docker inspect returned no start time for {container}"))?
-        .to_owned();
-    let restart_count = fields
-        .next()
-        .ok_or_else(|| format!("docker inspect returned no restart count for {container}"))?
-        .parse::<u64>()?;
-    Ok(ContainerState {
-        id,
-        started_at,
-        restart_count,
-    })
-}
-
-/// Write content to the overlay file via rename (handles ownership).
-fn write_overlay(overlay_path: &Path, content: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let parent = overlay_path.parent().ok_or("overlay path has no parent directory")?;
-    let tmp = parent.join(".grid-config.json.tmp");
-    std::fs::write(&tmp, content).map_err(|e| format!("failed to write temp overlay: {e}"))?;
-    std::fs::rename(&tmp, overlay_path).map_err(|e| format!("failed to rename overlay: {e}"))?;
+/// Trigger provider health, metrics, `GridNetwork`, and SWIM reconciliation.
+fn refresh_provider(site: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let provider = provider_resource_name(site)?;
+    let revision = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let annotation = format!("grid.praxis-proxy.io/demo-refresh={revision}");
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            &kubectl_context(site),
+            "-n",
+            GRID_SYSTEM_NS,
+            "annotate",
+            "inferenceprovider",
+            provider,
+            &annotation,
+            "--overwrite",
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "failed to refresh {site} provider reconciliation: {}",
+            safe_truncate_str(String::from_utf8_lossy(&output.stderr).trim(), 120)
+        )
+        .into());
+    }
     Ok(())
 }
 
-/// Restore the overlay file to its original content.
-fn restore_overlay(overlay_path: &Path, original: &str) {
-    if write_overlay(overlay_path, original).is_err() {
-        eprintln!("glb-ingress: WARNING: failed to restore overlay file");
+/// Remove the verifier's transient reconcile annotation.
+fn clear_provider_refresh(site: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let provider = provider_resource_name(site)?;
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            &kubectl_context(site),
+            "-n",
+            GRID_SYSTEM_NS,
+            "annotate",
+            "inferenceprovider",
+            provider,
+            "grid.praxis-proxy.io/demo-refresh-",
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "failed to clear {site} verifier annotation: {}",
+            safe_truncate_str(String::from_utf8_lossy(&output.stderr).trim(), 120)
+        )
+        .into());
     }
+    Ok(())
+}
+
+/// Restore normal provider admission and require the generated overlay to recover.
+fn restore_provider_admission(edge: &str, site: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let reload_before = count_overlay_reload_logs(edge)?;
+    set_provider_queue_depth(site, PROVIDER_QUEUE_READY)?;
+    refresh_provider(site)?;
+    let admission = wait_for_candidate_admission(edge, site, "new_and_existing")?;
+    let reload = check_hot_reload_observed(edge, reload_before)?;
+    clear_provider_refresh(site)?;
+    Ok(format!("queue_depth={PROVIDER_QUEUE_READY}, {admission}; {reload}"))
+}
+
+/// Best-effort restoration used when drain setup fails before proof begins.
+fn restore_provider_admission_without_reload(edge: &str, site: &str) -> Result<(), Box<dyn std::error::Error>> {
+    set_provider_queue_depth(site, PROVIDER_QUEUE_READY)?;
+    refresh_provider(site)?;
+    wait_for_candidate_admission(edge, site, "new_and_existing")?;
+    clear_provider_refresh(site)
+}
+
+/// Provider state captured before a health-driven hot-reload proof.
+struct ProviderWithdrawal {
+    /// Provider site being withdrawn.
+    site: String,
+    /// Desired backend replica count to restore.
+    original_replicas: u32,
+    /// Edge reload count captured before withdrawal.
+    reload_count_before: usize,
+}
+
+/// Return the declared mock backend replica count.
+fn provider_backend_replicas(site: &str) -> Result<u32, Box<dyn std::error::Error>> {
+    let value = kubectl_jsonpath(
+        &kubectl_context(site),
+        "deployment",
+        "mock-inference",
+        "{.spec.replicas}",
+    )?;
+    value
+        .parse()
+        .map_err(|e| format!("{site} mock-inference has invalid replica count {value:?}: {e}").into())
+}
+
+/// Scale the provider backend and wait for the desired availability.
+fn scale_provider_backend(site: &str, replicas: u32) -> Result<(), Box<dyn std::error::Error>> {
+    let target = format!("--replicas={replicas}");
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            &kubectl_context(site),
+            "-n",
+            GRID_SYSTEM_NS,
+            "scale",
+            "deployment/mock-inference",
+            &target,
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "failed to scale {site} mock-inference: {}",
+            safe_truncate_str(String::from_utf8_lossy(&output.stderr).trim(), 120)
+        )
+        .into());
+    }
+    if replicas > 0 {
+        return kubectl::wait_for_rollout_ns(&kubectl_context(site), "mock-inference", GRID_SYSTEM_NS, site);
+    }
+    wait_for_backend_scaled_to_zero(site)
+}
+
+/// Wait until a scaled-down provider backend has no available replicas.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "synchronous polling in xtask; no async runtime is active"
+)]
+fn wait_for_backend_scaled_to_zero(site: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut observed = String::new();
+    while Instant::now() < deadline {
+        observed = kubectl_jsonpath(
+            &kubectl_context(site),
+            "deployment",
+            "mock-inference",
+            "{.status.availableReplicas}",
+        )?;
+        if observed.is_empty() || observed == "0" {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
+    Err(format!("timeout scaling {site} mock-inference to zero; availableReplicas={observed:?}").into())
+}
+
+/// Wait for an `InferenceProvider` phase produced by health reconciliation.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "synchronous polling in xtask; no async runtime is active"
+)]
+fn wait_for_provider_phase(site: &str, expected: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let provider = provider_resource_name(site)?;
+    let deadline = Instant::now() + PROVIDER_STATE_WAIT;
+    let mut observed = String::new();
+    while Instant::now() < deadline {
+        observed = kubectl_jsonpath(&kubectl_context(site), "inferenceprovider", provider, "{.status.phase}")?;
+        if observed == expected {
+            return Ok(format!("{provider} phase={expected}"));
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
+    Err(format!("timeout waiting for {provider} phase={expected}; observed={observed:?}").into())
+}
+
+/// Withdraw a provider by making its declared backend unavailable.
+fn withdraw_provider(edge: &str, site: &str) -> Result<(String, ProviderWithdrawal), Box<dyn std::error::Error>> {
+    let original_replicas = provider_backend_replicas(site)?;
+    if original_replicas == 0 {
+        return Err(format!("{site} mock-inference already has zero replicas").into());
+    }
+    let state = ProviderWithdrawal {
+        site: site.to_owned(),
+        original_replicas,
+        reload_count_before: count_overlay_reload_logs(edge)?,
+    };
+    let result = (|| {
+        scale_provider_backend(site, 0)?;
+        refresh_provider(site)?;
+        let phase = wait_for_provider_phase(site, "Unavailable")?;
+        let overlay = wait_for_candidate_absent(edge, site)?;
+        Ok(format!("{phase}; {overlay}"))
+    })();
+    match result {
+        Ok(evidence) => Ok((evidence, state)),
+        Err(error) => match restore_withdrawn_provider(edge, &state) {
+            Ok(_) => Err(error),
+            Err(restore) => Err(format!("{error}; provider restoration also failed: {restore}").into()),
+        },
+    }
+}
+
+/// Restore a health-withdrawn provider and its operator-generated overlay entry.
+fn restore_withdrawn_provider(edge: &str, state: &ProviderWithdrawal) -> Result<String, Box<dyn std::error::Error>> {
+    let reload_before = count_overlay_reload_logs(edge)?;
+    scale_provider_backend(&state.site, state.original_replicas)?;
+    refresh_provider(&state.site)?;
+    let phase = wait_for_provider_phase(&state.site, "Available")?;
+    let admission = wait_for_candidate_admission(edge, &state.site, "new_and_existing")?;
+    let reload = check_hot_reload_observed(edge, reload_before)?;
+    clear_provider_refresh(&state.site)?;
+    Ok(format!("{phase}; {admission}; {reload}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -1587,23 +2884,6 @@ fn get_provider_gateway_ip(context: &str) -> Result<String, Box<dyn std::error::
     Ok(ip)
 }
 
-/// Find a service entry in forge status JSON by name.
-pub(crate) fn find_service_in_status<'a>(
-    status_json: &'a serde_json::Value,
-    service_name: &str,
-) -> Result<&'a serde_json::Value, Box<dyn std::error::Error>> {
-    let services = status_json
-        .get("data")
-        .and_then(|d| d.get("services"))
-        .and_then(serde_json::Value::as_array)
-        .ok_or("status JSON missing data.services array")?;
-
-    services
-        .iter()
-        .find(|s| s.get("name").and_then(serde_json::Value::as_str) == Some(service_name))
-        .ok_or_else(|| format!("service '{service_name}' not found in status").into())
-}
-
 /// Send a Chat Completions request to the edge with bearer auth.
 fn curl_post_with_auth(port: u16) -> Result<verify::HttpResponse, Box<dyn std::error::Error>> {
     curl_edge_request(port, None)
@@ -1613,10 +2893,11 @@ fn curl_post_with_auth(port: u16) -> Result<verify::HttpResponse, Box<dyn std::e
 const CHAT_BODY: &str = r#"{"model":"sim-model-v1","messages":[{"role":"user","content":"hello"}],"max_tokens":64}"#;
 
 /// Send a Chat Completions request with an optional session header.
-fn curl_edge_request(port: u16, session_id: Option<&str>) -> Result<verify::HttpResponse, Box<dyn std::error::Error>> {
-    let url = format!("http://127.0.0.1:{port}/v1/chat/completions");
+fn curl_edge_request(_port: u16, session_id: Option<&str>) -> Result<verify::HttpResponse, Box<dyn std::error::Error>> {
+    let address = get_service_lb_address(PRIMARY_EDGE, "edge-gateway")?;
+    let url = format!("http://{address}/v1/chat/completions");
     let header_file = header_dump_path();
-    let header_path = header_file.display().to_string();
+    let auth = format!("Authorization: Bearer {CLIENT_BEARER_TOKEN}");
     let mut cmd = Command::new("curl");
     cmd.args([
         "-s",
@@ -1627,22 +2908,30 @@ fn curl_edge_request(port: u16, session_id: Option<&str>) -> Result<verify::Http
         "--max-time",
         "15",
         "-D",
-        &header_path,
+        &header_file.display().to_string(),
         "-X",
         "POST",
         "-H",
         "Content-Type: application/json",
         "-H",
-        "Authorization: Bearer test-token",
+        &auth,
     ]);
     if let Some(sid) = session_id {
         cmd.args(["-H", &format!("X-Session-Id: {sid}")]);
     }
     cmd.args(["-d", CHAT_BODY, &url]);
     let output = cmd.output()?;
+    parse_edge_curl_response(output, &header_file)
+}
+
+/// Parse one edge curl response and remove its temporary header dump.
+fn parse_edge_curl_response(
+    output: std::process::Output,
+    header_file: &Path,
+) -> Result<verify::HttpResponse, Box<dyn std::error::Error>> {
     let mut resp = verify::parse_curl_output(&String::from_utf8(output.stdout)?)?;
-    resp.headers = parse_header_file(&header_file);
-    drop(std::fs::remove_file(&header_file));
+    resp.headers = parse_header_file(header_file);
+    drop(fs::remove_file(header_file));
     Ok(resp)
 }
 
@@ -1653,7 +2942,7 @@ fn header_dump_path() -> PathBuf {
 
 /// Parse a curl `-D` header dump file into a map with lowercase keys.
 fn parse_header_file(path: &Path) -> BTreeMap<String, String> {
-    let content = std::fs::read_to_string(path).unwrap_or_default();
+    let content = fs::read_to_string(path).unwrap_or_default();
     parse_header_dump(&content)
 }
 
@@ -1679,38 +2968,6 @@ fn extract_provider(resp: &verify::HttpResponse) -> Result<String, Box<dyn std::
         .ok_or_else(|| "missing x-grid-demo-provider header".into())
 }
 
-/// Modify overlay to set a candidate's `admission_state` to `existing_only`.
-///
-/// Finds the candidate whose `site` field matches the given site name
-/// and changes its `admission_state`. Returns the evidence string and
-/// the original overlay content for restoration.
-fn modify_overlay_drain(overlay_path: &Path, site: &str) -> Result<(String, String), Box<dyn std::error::Error>> {
-    let original = std::fs::read_to_string(overlay_path).map_err(|e| format!("failed to read overlay: {e}"))?;
-    let mut doc: serde_json::Value =
-        serde_json::from_str(&original).map_err(|e| format!("failed to parse overlay: {e}"))?;
-    let candidates = doc
-        .get_mut("candidates")
-        .and_then(serde_json::Value::as_array_mut)
-        .ok_or("overlay missing candidates array")?;
-    let mut found = false;
-    for c in candidates.iter_mut() {
-        let s = c.get("site").and_then(serde_json::Value::as_str);
-        if s == Some(site) {
-            c.as_object_mut().ok_or("candidate is not an object")?.insert(
-                "admission_state".to_owned(),
-                serde_json::Value::String("existing_only".to_owned()),
-            );
-            found = true;
-        }
-    }
-    if !found {
-        return Err(format!("no candidate with site={site}").into());
-    }
-    let modified = serde_json::to_string(&doc).map_err(|e| format!("failed to serialize: {e}"))?;
-    write_overlay(overlay_path, &modified)?;
-    Ok((format!("drained site={site}"), original))
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1719,7 +2976,11 @@ fn modify_overlay_drain(overlay_path: &Path, site: &str) -> Result<(String, Stri
 mod tests {
     use super::*;
 
-    /// Sample forge.yaml with placeholder images.
+    fn workspace_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("..")
+    }
+
+    /// Sample Forge configuration with placeholder images.
     fn sample_config_with_placeholders() -> &'static str {
         "\
 apiVersion: forge.praxis.dev/v1alpha1
@@ -1727,18 +2988,14 @@ kind: Environment
 metadata:
   name: grid-glb-demo
 spec:
-  services:
-    - name: grid-overlay-sync-us-east
-      image: \"ghcr.io/praxis-proxy/grid-overlay-sync:sha-PLACEHOLDER\"
-    - name: grid-edge-us-east
-      image: \"ghcr.io/praxis-proxy/praxis-ai:sha-PLACEHOLDER\"
-      ports:
-        - bindAddress: \"127.0.0.1\"
-          host: 8080
-          container: 8080"
+  clusters:
+    - name: east-edge
+      properties:
+        operatorImage: \"ghcr.io/praxis-proxy/grid-operator:sha-PLACEHOLDER\"
+        gatewayImage: \"ghcr.io/praxis-proxy/praxis-ai:sha-PLACEHOLDER\""
     }
 
-    /// Sample forge.yaml with real SHA tags.
+    /// Sample Forge configuration with immutable development tags.
     fn sample_config_no_placeholders() -> &'static str {
         "\
 apiVersion: forge.praxis.dev/v1alpha1
@@ -1746,46 +3003,24 @@ kind: Environment
 metadata:
   name: grid-glb-demo
 spec:
-  services:
-    - name: grid-overlay-sync-us-east
-      image: \"ghcr.io/praxis-proxy/grid-overlay-sync:sha-abc123\"
-    - name: grid-edge-us-east
-      image: \"ghcr.io/praxis-proxy/praxis-ai:sha-def456\"
-      ports:
-        - bindAddress: \"127.0.0.1\"
-          host: 9090
-          container: 9090"
+  clusters:
+    - name: east-edge
+      properties:
+        operatorImage: \"ghcr.io/praxis-proxy/grid-operator:sha-abc123\"
+        gatewayImage: \"ghcr.io/praxis-proxy/praxis-ai:sha-def456\""
     }
 
-    /// Build a status JSON with configurable service fields.
-    fn status_with_services(phase: &str, container_id: Option<&str>) -> serde_json::Value {
+    /// Build Forge status JSON for the five Kubernetes clusters.
+    fn status_with_clusters() -> serde_json::Value {
         serde_json::json!({
             "status": "ok",
             "data": {
                 "clusters": [
-                    {"name": "site-us-east", "statePhase": "running", "live": true},
-                    {"name": "site-us-west", "statePhase": "running", "live": true},
-                    {"name": "site-us-central", "statePhase": "running", "live": true}
-                ],
-                "services": [
-                    {
-                        "name": OVERLAY_SYNC_SERVICE,
-                        "containerName": "grid-glb-demo-grid-overlay-sync-us-east",
-                        "phase": phase,
-                        "health": "unknown",
-                        "containerId": container_id,
-                        "startedAt": "2026-07-22T14:31:00Z",
-                        "restartCount": 0,
-                    },
-                    {
-                        "name": EDGE_SERVICE,
-                        "containerName": "grid-glb-demo-grid-edge-us-east",
-                        "phase": phase,
-                        "health": "unknown",
-                        "containerId": container_id,
-                        "startedAt": "2026-07-22T14:31:00Z",
-                        "restartCount": 0,
-                    }
+                    {"name": "gtm-emulator", "statePhase": "running", "live": true},
+                    {"name": "east-edge", "statePhase": "running", "live": true},
+                    {"name": "east-provider", "statePhase": "running", "live": true},
+                    {"name": "west-edge", "statePhase": "running", "live": true},
+                    {"name": "west-provider", "statePhase": "running", "live": true}
                 ]
             }
         })
@@ -1795,16 +3030,7 @@ spec:
     fn detects_placeholder_images() {
         let placeholders = detect_placeholder_images(sample_config_with_placeholders());
         assert_eq!(placeholders.len(), 2, "should find 2 placeholders");
-        assert_eq!(
-            placeholders.first().map(|(n, _)| n.as_str()),
-            Some("grid-overlay-sync-us-east"),
-            "first placeholder service name"
-        );
-        assert_eq!(
-            placeholders.get(1).map(|(n, _)| n.as_str()),
-            Some("grid-edge-us-east"),
-            "second placeholder service name"
-        );
+        assert!(placeholders.iter().all(|(owner, _)| owner == "east-edge"));
     }
 
     #[test]
@@ -1826,21 +3052,21 @@ spec:
     #[test]
     fn detects_latest_explicit_tag() {
         let config = "\
-services:
-  - name: overlay-sync
-    image: \"grid-overlay-sync:latest\"
-  - name: edge
-    image: \"praxis-ai:glb-demo\"";
+clusters:
+  - name: east-edge
+    properties:
+      operatorImage: \"grid-operator:latest\"
+      gatewayImage: \"praxis-ai:glb-demo\"";
         let latest = detect_latest_images(config);
         assert_eq!(latest.len(), 1, "should find 1 :latest image");
         assert_eq!(
             latest.first().map(|(n, _)| n.as_str()),
-            Some("overlay-sync"),
-            "service name"
+            Some("east-edge"),
+            "cluster name"
         );
         assert_eq!(
             latest.first().map(|(_, i)| i.as_str()),
-            Some("grid-overlay-sync:latest"),
+            Some("grid-operator:latest"),
             "image value"
         );
     }
@@ -1848,9 +3074,10 @@ services:
     #[test]
     fn detects_latest_implicit_no_tag() {
         let config = "\
-services:
-  - name: operator
-    image: grid-operator";
+clusters:
+  - name: east-edge
+    properties:
+      operatorImage: grid-operator";
         let latest = detect_latest_images(config);
         assert_eq!(latest.len(), 1, "untagged image implies :latest");
     }
@@ -1858,11 +3085,11 @@ services:
     #[test]
     fn no_latest_in_pinned_config() {
         let config = "\
-services:
-  - name: overlay-sync
-    image: \"grid-overlay-sync:glb-demo\"
-  - name: edge
-    image: \"praxis-ai:glb-demo\"";
+clusters:
+  - name: east-edge
+    properties:
+      operatorImage: \"grid-operator:glb-demo\"
+      gatewayImage: \"praxis-ai:glb-demo\"";
         let latest = detect_latest_images(config);
         assert!(latest.is_empty(), "pinned tags should not trigger: {latest:?}");
     }
@@ -1907,71 +3134,28 @@ services:
     fn detect_latest_in_resources_finds_nested_yaml() {
         let dir = std::env::temp_dir().join(format!("glb-test-{}", std::process::id()));
         let resources = dir.join("resources").join("nested");
-        std::fs::create_dir_all(&resources).unwrap_or_else(|_| std::process::abort());
-        std::fs::write(resources.join("bad.yaml"), "  image: grid-operator:latest\n")
+        fs::create_dir_all(&resources).unwrap_or_else(|_| std::process::abort());
+        fs::write(resources.join("bad.yaml"), "  image: grid-operator:latest\n")
             .unwrap_or_else(|_| std::process::abort());
-        std::fs::write(resources.join("good.yaml"), "  image: grid-operator:glb-demo\n")
+        fs::write(resources.join("good.yaml"), "  image: grid-operator:glb-demo\n")
             .unwrap_or_else(|_| std::process::abort());
-        std::fs::write(resources.join("notes.txt"), "  image: foo:latest\n").unwrap_or_else(|_| std::process::abort());
+        fs::write(resources.join("notes.txt"), "  image: foo:latest\n").unwrap_or_else(|_| std::process::abort());
         let results = detect_latest_in_resources(&dir);
         assert_eq!(results.len(), 1, "should find 1 :latest in nested yaml: {results:?}");
         assert!(
             results.first().map(|(_, img)| img.as_str()) == Some("grid-operator:latest"),
             "should report the image value"
         );
-        drop(std::fs::remove_dir_all(&dir));
+        drop(fs::remove_dir_all(&dir));
     }
 
     #[test]
     fn parses_forge_status_clusters() {
-        let status = status_with_services("running", Some("abc123"));
+        let status = status_with_clusters();
         let result = check_clusters_live(&status);
         assert!(result.is_ok(), "all clusters should be live: {result:?}");
         let evidence = result.unwrap_or_else(|_| std::process::abort());
-        assert!(evidence.contains("3"), "should report 3 clusters: {evidence}");
-    }
-
-    #[test]
-    fn service_running_check_pass() {
-        let status = status_with_services("running", Some("abcdef1234567890"));
-        let result = check_service_running(&status, EDGE_SERVICE);
-        assert!(result.is_ok(), "should pass: {result:?}");
-        let evidence = result.unwrap_or_else(|_| std::process::abort());
-        assert!(evidence.contains("containerId="), "evidence: {evidence}");
-    }
-
-    #[test]
-    fn service_running_check_stopped_fails() {
-        let status = status_with_services("stopped", Some("abc123"));
-        let Err(err) = check_service_running(&status, EDGE_SERVICE) else {
-            std::process::abort()
-        };
-        let msg = err.to_string();
-        assert!(msg.contains("phase=stopped"), "error: {msg}");
-    }
-
-    #[test]
-    fn service_running_no_container_id_fails() {
-        let status = status_with_services("running", None);
-        let Err(err) = check_service_running(&status, EDGE_SERVICE) else {
-            std::process::abort()
-        };
-        let msg = err.to_string();
-        assert!(msg.contains("no containerId"), "error: {msg}");
-    }
-
-    #[test]
-    fn service_running_restart_count_nonzero_is_baseline() {
-        let mut status = status_with_services("running", Some("abc123"));
-        status
-            .get_mut("data")
-            .and_then(|data| data.get_mut("services"))
-            .and_then(serde_json::Value::as_array_mut)
-            .and_then(|services| services.get_mut(1))
-            .and_then(|svc| svc.get_mut("restartCount"))
-            .map_or_else(|| std::process::abort(), |count| *count = serde_json::json!(2));
-        let evidence = check_service_running(&status, EDGE_SERVICE).unwrap_or_else(|_| std::process::abort());
-        assert!(evidence.contains("restartCount=2"), "evidence: {evidence}");
+        assert!(evidence.contains("5"), "should report 5 clusters: {evidence}");
     }
 
     #[test]
@@ -1980,38 +3164,6 @@ services:
         assert_eq!(count_reload_entries(logs), 2, "should count reload entries");
     }
 
-    #[test]
-    fn extract_service_identity_present() {
-        let status = status_with_services("running", Some("abcdef1234567890"));
-        let identity = extract_service_identity(&status, EDGE_SERVICE).unwrap_or_else(|| std::process::abort());
-        assert_eq!(identity.id, "abcdef1234567890", "should extract container ID");
-        assert_eq!(identity.restart_count, Some(0), "should extract restart count");
-    }
-
-    #[test]
-    fn extract_service_identity_missing() {
-        let status = status_with_services("running", None);
-        let identity = extract_service_identity(&status, EDGE_SERVICE);
-        assert!(identity.is_none(), "should return None when containerId is null");
-    }
-
-    #[test]
-    fn parses_edge_host_port_from_config() {
-        let port = parse_edge_host_port(sample_config_with_placeholders(), "grid-edge-us-east");
-        assert_eq!(port, Some(8080), "should parse host port 8080");
-    }
-
-    #[test]
-    fn parses_custom_edge_host_port() {
-        let port = parse_edge_host_port(sample_config_no_placeholders(), "grid-edge-us-east");
-        assert_eq!(port, Some(9090), "should parse host port 9090");
-    }
-
-    #[test]
-    fn edge_port_none_for_unknown_service() {
-        let port = parse_edge_host_port(sample_config_with_placeholders(), "nonexistent");
-        assert_eq!(port, None, "unknown service should return None");
-    }
 
     #[test]
     fn blocked_steps_cause_nonzero_exit() {
@@ -2026,21 +3178,14 @@ services:
     #[test]
     fn block_remaining_adds_each_remaining_step_once() {
         let mut results = vec![StepResult::pass("prerequisites", "ok")];
-        block_remaining(22, "reload failed", &mut results);
+        block_remaining("routing after reload", "reload failed", &mut results);
         let blocked = results
             .iter()
             .filter(|r| r.status == StepStatus::Blocked)
             .collect::<Vec<_>>();
-        assert_eq!(blocked.len(), 2, "steps 22 and 23 should be blocked once");
+        assert_eq!(blocked.len(), 2, "dependent assertions should be blocked once");
         assert_eq!(blocked.first().map(|r| r.label), Some("routing after reload"));
-        assert_eq!(blocked.get(1).map(|r| r.label), Some("edge container stable"));
-    }
-
-    #[test]
-    fn overlay_sync_service_check_pass() {
-        let status = status_with_services("running", Some("abc123"));
-        let result = check_service_running(&status, OVERLAY_SYNC_SERVICE);
-        assert!(result.is_ok(), "overlay-sync should pass: {result:?}");
+        assert_eq!(blocked.get(1).map(|r| r.label), Some("edge pod stable"));
     }
 
     #[test]
@@ -2094,16 +3239,185 @@ services:
     }
 
     #[test]
+    fn provider_boundary_headers_match_ai_contract() {
+        assert_eq!(GRID_PEER_SELECTED_CANDIDATE_HEADER, "x-grid-peer-selected-candidate");
+        assert_eq!(GRID_PEER_HOP_REQUEST_ID_HEADER, "x-grid-peer-hop-request-id");
+        for header in [GRID_PEER_SELECTED_CANDIDATE_HEADER, GRID_PEER_HOP_REQUEST_ID_HEADER] {
+            assert!(!header.starts_with("x-praxis-"), "{header} would be stripped by Praxis");
+        }
+    }
+
+    #[test]
+    fn provider_demo_uses_distinct_final_hop_credential() {
+        assert!(
+            !CLIENT_BEARER_TOKEN.bytes().all(|b| b.is_ascii_hexdigit()),
+            "client fixture must not match the generated 64-character hexadecimal provider credential"
+        );
+    }
+
+    #[test]
+    fn provider_configs_wire_secret_backed_credential_injection() {
+        for provider in PROVIDER_CLUSTERS {
+            let path = workspace_root()
+                .join("environments/grid-glb-demo/configs")
+                .join(provider)
+                .join("praxis.yaml");
+            let config = fs::read_to_string(&path).unwrap_or_else(|_| std::process::abort());
+            let route_index = config
+                .find("filter: grid_provider_route")
+                .unwrap_or_else(|| std::process::abort());
+            let inject_index = config
+                .find("filter: grid_credential_inject")
+                .unwrap_or_else(|| std::process::abort());
+            let load_balancer_index = config
+                .find("filter: load_balancer")
+                .unwrap_or_else(|| std::process::abort());
+            assert!(
+                route_index < inject_index && inject_index < load_balancer_index,
+                "{provider} must authorize the route before credential injection and load balancing"
+            );
+            assert!(config.contains("name: mock-inference-credential"));
+            assert!(config.contains("namespace: grid-system"));
+            assert!(config.contains("key: token"));
+            assert!(config.contains("file: /etc/praxis/credentials/mock-inference/token"));
+            assert!(
+                !config.contains(CLIENT_BEARER_TOKEN),
+                "{provider} ConfigMap template must not contain the client-supplied credential"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_deployment_mounts_credential_secret() {
+        let deployment = fs::read_to_string(
+            workspace_root().join("environments/grid-glb-demo/resources/provider-gateway-deployment.yaml"),
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        assert!(deployment.contains("mountPath: /etc/praxis/credentials/mock-inference"));
+        assert!(deployment.contains("secretName: mock-inference-credential"));
+        assert!(!deployment.contains(CLIENT_BEARER_TOKEN));
+    }
+
+    #[test]
+    fn provider_drain_uses_declared_metrics_and_health_inputs() {
+        let root = workspace_root();
+        let resources = root.join("environments/grid-glb-demo/resources");
+        let workloads =
+            fs::read_to_string(resources.join("provider-workloads.yaml")).unwrap_or_else(|_| std::process::abort());
+        assert!(workloads.contains("name: MOCK_QUEUE_DEPTH"));
+        assert!(workloads.contains("value: \"0.10\""));
+
+        for site in ["east-provider", "west-provider"] {
+            let provider = fs::read_to_string(resources.join(format!("inference-{site}.yaml")))
+                .unwrap_or_else(|_| std::process::abort());
+            assert!(provider.contains("metricsConfig:"));
+            assert!(provider.contains("path: /metrics"));
+            assert!(provider.contains("queueDepth: grid_demo_queue_depth"));
+        }
+
+        let verifier = fs::read_to_string(root.join("xtask/src/env/glb.rs")).unwrap_or_else(|_| std::process::abort());
+        assert!(verifier.contains("set_provider_queue_depth"));
+        assert!(verifier.contains("scale_provider_backend"));
+        assert!(
+            !verifier.contains(concat!("fn write_", "overlay")),
+            "the verifier must not mutate operator-owned overlay ConfigMaps"
+        );
+    }
+
+    #[test]
+    fn backend_network_policy_separates_data_and_health_access() {
+        let resources = workspace_root().join("environments/grid-glb-demo/resources");
+        let policy =
+            fs::read_to_string(resources.join("backend-network-policy.yaml")).unwrap_or_else(|_| std::process::abort());
+        let gateway = fs::read_to_string(resources.join("provider-gateway-deployment.yaml"))
+            .unwrap_or_else(|_| std::process::abort());
+
+        assert!(policy.contains("grid.praxis-proxy.io/backend-access: provider-gateway"));
+        assert!(policy.contains("app.kubernetes.io/name: grid-operator"));
+        assert!(gateway.contains("grid.praxis-proxy.io/backend-access: provider-gateway"));
+        assert!(
+            !gateway.contains("app.kubernetes.io/name: grid-operator"),
+            "provider gateway must retain its own workload identity"
+        );
+    }
+
+    #[test]
+    fn provider_candidate_ids_cover_every_provider_cluster() {
+        for provider in PROVIDER_CLUSTERS {
+            let id = provider_candidate_id(provider).unwrap_or_else(|_| std::process::abort());
+            assert_eq!(id.len(), 8);
+            assert!(id.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        }
+        assert_ne!(
+            provider_candidate_id("east-provider").unwrap_or_default(),
+            provider_candidate_id("west-provider").unwrap_or_default()
+        );
+        assert!(provider_candidate_id("unknown-provider").is_err());
+    }
+
+    #[test]
+    fn provider_configs_render_candidate_ids_from_identity_contract() {
+        let configs = workspace_root().join("environments/grid-glb-demo/configs");
+        for provider in PROVIDER_CLUSTERS {
+            let template = fs::read_to_string(configs.join(format!("{provider}/praxis.yaml")))
+                .unwrap_or_else(|_| std::process::abort());
+            assert!(
+                template.contains(PROVIDER_CANDIDATE_ID_TOKEN),
+                "{provider} must use the rendered candidate identity token"
+            );
+        }
+    }
+
+    #[test]
+    fn providers_bind_only_to_their_explicit_local_sites() {
+        let resources = workspace_root().join("environments/grid-glb-demo/resources");
+        for provider in PROVIDER_CLUSTERS {
+            let inference = fs::read_to_string(resources.join(format!("inference-{provider}.yaml")))
+                .unwrap_or_else(|_| std::process::abort());
+            let site = fs::read_to_string(resources.join(format!("site-{provider}.yaml")))
+                .unwrap_or_else(|_| std::process::abort());
+            let selector = format!("grid.praxis-proxy.io/provider-site: {provider}");
+            assert!(
+                inference.contains(&selector),
+                "{provider} provider must select only its local site"
+            );
+            assert!(
+                site.contains(&selector),
+                "{provider} site must carry its provider identity"
+            );
+        }
+    }
+
+    #[test]
+    fn operator_sites_set_explicit_swim_identity_without_partial_deployments() {
+        let forge = fs::read_to_string(workspace_root().join("environments/grid-glb-demo/forge.yaml"))
+            .unwrap_or_else(|_| std::process::abort());
+        for site in ["east-edge", "east-provider", "west-edge", "west-provider"] {
+            assert!(
+                forge.contains(&format!("GRID_SWIM_SITE_NAME={site}")),
+                "{site} must set an explicit SWIM identity"
+            );
+        }
+        assert!(forge.contains("kubectl"));
+        assert!(forge.contains("set"));
+        assert!(forge.contains("env"));
+        assert!(
+            !forge.contains("operator-env-"),
+            "partial Deployment overlays can remove base security settings"
+        );
+    }
+
+    #[test]
     fn overlay_json_valid() {
         let json = serde_json::json!({
             "network": "glb-demo",
-            "local_site": "site-us-east",
+            "local_site": "east-edge",
             "generated_at": "2026-07-25T00:00:00Z",
             "candidates": [
                 {
                     "kind": "InferenceProvider",
-                    "name": "sim-provider-us-west",
-                    "site": "site-us-west",
+                    "name": "sim-west-provider",
+                    "site": "west-provider",
                     "stable_id": "abc123",
                     "admission_state": "admitted",
                     "selection_tier": "preferred",
@@ -2185,63 +3499,63 @@ services:
     fn provider_gateway_captures_parsed() {
         let state = serde_json::json!({
             "captures": {
-                "site-us-west": {"provider-gateway-ip": "172.18.0.5"},
-                "site-us-central": {"provider-gateway-ip": "172.18.0.6"}
+                "west-provider": {"provider-gateway-ip": "172.18.0.5"},
+                "east-provider": {"provider-gateway-ip": "172.18.0.6"}
             }
         });
         let addrs = parse_provider_gateway_captures(&state.to_string()).unwrap_or_else(|_| std::process::abort());
         assert_eq!(
-            addrs.get("site-us-west").map(String::as_str),
-            Some("172.18.0.5:8080"),
+            addrs.get("west-provider").map(String::as_str),
+            Some("172.18.0.5:8443"),
             "west"
         );
         assert_eq!(
-            addrs.get("site-us-central").map(String::as_str),
-            Some("172.18.0.6:8080"),
-            "central"
+            addrs.get("east-provider").map(String::as_str),
+            Some("172.18.0.6:8443"),
+            "east"
         );
     }
 
     #[test]
     fn gridsite_egress_found() {
         let expected = BTreeMap::from([
-            ("site-us-west".to_owned(), "172.18.0.5:8080".to_owned()),
-            ("site-us-central".to_owned(), "172.18.0.6:8080".to_owned()),
+            ("west-provider".to_owned(), "172.18.0.5:8443".to_owned()),
+            ("east-provider".to_owned(), "172.18.0.6:8443".to_owned()),
         ]);
         let json = serde_json::json!({
             "items": [
                 {
-                    "metadata": {"name": "glb-demo-site-us-west"},
-                    "spec": {"egress": {"address": "172.18.0.5:8080"}}
+                    "metadata": {"name": "glb-demo-west-provider"},
+                    "spec": {"egress": {"address": "172.18.0.5:8443"}}
                 },
                 {
-                    "metadata": {"name": "glb-demo-site-us-central"},
-                    "spec": {"egress": {"address": "172.18.0.6:8080"}}
+                    "metadata": {"name": "glb-demo-east-provider"},
+                    "spec": {"egress": {"address": "172.18.0.6:8443"}}
                 }
             ]
         });
         let result = parse_gridsite_egress(&json.to_string(), &expected);
         assert!(result.is_ok(), "should find egress: {result:?}");
         let evidence = result.unwrap_or_else(|_| std::process::abort());
-        assert!(evidence.contains("site-us-west="), "evidence: {evidence}");
-        assert!(evidence.contains("site-us-central="), "evidence: {evidence}");
+        assert!(evidence.contains("west-provider="), "evidence: {evidence}");
+        assert!(evidence.contains("east-provider="), "evidence: {evidence}");
     }
 
     #[test]
     fn gridsite_egress_missing_fails() {
         let expected = BTreeMap::from([
-            ("site-us-west".to_owned(), "172.18.0.5:8080".to_owned()),
-            ("site-us-central".to_owned(), "172.18.0.6:8080".to_owned()),
+            ("west-provider".to_owned(), "172.18.0.5:8443".to_owned()),
+            ("east-provider".to_owned(), "172.18.0.6:8443".to_owned()),
         ]);
         let json = serde_json::json!({
             "items": [
                 {
-                    "metadata": {"name": "glb-demo-site-us-west"},
+                    "metadata": {"name": "glb-demo-west-provider"},
                     "spec": {"egress": {"address": ""}}
                 },
                 {
-                    "metadata": {"name": "glb-demo-site-us-central"},
-                    "spec": {"egress": {"address": "172.18.0.6:8080"}}
+                    "metadata": {"name": "glb-demo-east-provider"},
+                    "spec": {"egress": {"address": "172.18.0.6:8443"}}
                 }
             ]
         });
@@ -2249,24 +3563,24 @@ services:
             std::process::abort()
         };
         let msg = err.to_string();
-        assert!(msg.contains("site-us-west"), "error should name site: {msg}");
+        assert!(msg.contains("west-provider"), "error should name site: {msg}");
     }
 
     #[test]
     fn gridsite_egress_mismatch_fails() {
         let expected = BTreeMap::from([
-            ("site-us-west".to_owned(), "172.18.0.9:8080".to_owned()),
-            ("site-us-central".to_owned(), "172.18.0.6:8080".to_owned()),
+            ("west-provider".to_owned(), "172.18.0.9:8443".to_owned()),
+            ("east-provider".to_owned(), "172.18.0.6:8443".to_owned()),
         ]);
         let json = serde_json::json!({
             "items": [
                 {
-                    "metadata": {"name": "glb-demo-site-us-west"},
-                    "spec": {"egress": {"address": "172.18.0.5:8080"}}
+                    "metadata": {"name": "glb-demo-west-provider"},
+                    "spec": {"egress": {"address": "172.18.0.5:8443"}}
                 },
                 {
-                    "metadata": {"name": "glb-demo-site-us-central"},
-                    "spec": {"egress": {"address": "172.18.0.6:8080"}}
+                    "metadata": {"name": "glb-demo-east-provider"},
+                    "spec": {"egress": {"address": "172.18.0.6:8443"}}
                 }
             ]
         });
@@ -2284,18 +3598,18 @@ services:
     fn provider_gateway_captures_parse() {
         let json = serde_json::json!({
             "captures": {
-                "site-us-west": {"provider-gateway-ip": "172.18.0.5"},
-                "site-us-central": {"provider-gateway-ip": "172.18.0.6"}
+                "west-provider": {"provider-gateway-ip": "172.18.0.5"},
+                "east-provider": {"provider-gateway-ip": "172.18.0.6"}
             }
         });
         let captures = parse_provider_gateway_captures(&json.to_string()).unwrap_or_else(|_| std::process::abort());
         assert_eq!(
-            captures.get("site-us-west").map(String::as_str),
-            Some("172.18.0.5:8080")
+            captures.get("west-provider").map(String::as_str),
+            Some("172.18.0.5:8443")
         );
         assert_eq!(
-            captures.get("site-us-central").map(String::as_str),
-            Some("172.18.0.6:8080")
+            captures.get("east-provider").map(String::as_str),
+            Some("172.18.0.6:8443")
         );
     }
 
@@ -2303,34 +3617,32 @@ services:
     fn provider_gateway_captures_missing_provider_fails() {
         let json = serde_json::json!({
             "captures": {
-                "site-us-west": {"provider-gateway-ip": "172.18.0.5"}
+                "west-provider": {"provider-gateway-ip": "172.18.0.5"}
             }
         });
         let Err(err) = parse_provider_gateway_captures(&json.to_string()) else {
             std::process::abort()
         };
         assert!(
-            err.to_string().contains("site-us-central"),
+            err.to_string().contains("east-provider"),
             "error should name missing provider: {err}"
         );
     }
 
     #[test]
-    fn step_labels_match_total() {
-        assert_eq!(
-            STEP_LABELS.len(),
-            TOTAL_STEPS as usize,
-            "STEP_LABELS length must match TOTAL_STEPS",
-        );
+    fn proof_labels_are_unique_and_nonempty() {
+        let unique = PROOF_LABELS.iter().copied().collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(unique.len(), PROOF_LABELS.len(), "proof labels must remain unique",);
+        assert!(PROOF_LABELS.iter().all(|label| !label.is_empty()));
     }
 
     #[test]
     fn parse_header_dump_basic() {
-        let dump = "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nx-grid-demo-provider: site-us-west\r\n\r\n";
+        let dump = "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nx-grid-demo-provider: west-provider\r\n\r\n";
         let map = parse_header_dump(dump);
         assert_eq!(
             map.get("x-grid-demo-provider").map(String::as_str),
-            Some("site-us-west"),
+            Some("west-provider"),
             "should parse provider header"
         );
         assert_eq!(
@@ -2352,14 +3664,10 @@ services:
         let resp = verify::HttpResponse {
             status: 200,
             body: String::new(),
-            headers: BTreeMap::from([("x-grid-demo-provider".to_owned(), "site-us-central".to_owned())]),
+            headers: BTreeMap::from([("x-grid-demo-provider".to_owned(), "east-provider".to_owned())]),
         };
         let result = extract_provider(&resp);
-        assert_eq!(
-            result.ok().as_deref(),
-            Some("site-us-central"),
-            "should extract provider"
-        );
+        assert_eq!(result.ok().as_deref(), Some("east-provider"), "should extract provider");
     }
 
     #[test]
@@ -2370,57 +3678,5 @@ services:
             headers: BTreeMap::new(),
         };
         assert!(extract_provider(&resp).is_err(), "missing header should return error");
-    }
-
-    #[test]
-    fn modify_overlay_drain_sets_existing_only_for_matching_site() {
-        let dir = tempfile::tempdir().unwrap_or_else(|_| std::process::abort());
-        let path = dir.path().join("grid-config.json");
-        let original = serde_json::json!({
-            "candidates": [
-                {"site": "site-us-west", "admission_state": "new_and_existing"},
-                {"site": "site-us-central", "admission_state": "new_and_existing"}
-            ]
-        })
-        .to_string();
-        std::fs::write(&path, &original).unwrap_or_else(|_| std::process::abort());
-
-        let (evidence, returned_original) =
-            modify_overlay_drain(&path, "site-us-west").unwrap_or_else(|_| std::process::abort());
-        let modified: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap_or_default())
-            .unwrap_or_else(|_| std::process::abort());
-        assert!(evidence.contains("site=site-us-west"), "evidence: {evidence}");
-        assert_eq!(returned_original, original, "must return original for restore");
-        assert_eq!(
-            modified
-                .pointer("/candidates/0/admission_state")
-                .and_then(serde_json::Value::as_str),
-            Some("existing_only")
-        );
-        assert_eq!(
-            modified
-                .pointer("/candidates/1/admission_state")
-                .and_then(serde_json::Value::as_str),
-            Some("new_and_existing")
-        );
-    }
-
-    #[test]
-    fn modify_overlay_drain_missing_site_fails() {
-        let dir = tempfile::tempdir().unwrap_or_else(|_| std::process::abort());
-        let path = dir.path().join("grid-config.json");
-        std::fs::write(
-            &path,
-            serde_json::json!({"candidates": [{"site": "site-us-central"}]}).to_string(),
-        )
-        .unwrap_or_else(|_| std::process::abort());
-
-        let Err(err) = modify_overlay_drain(&path, "site-us-west") else {
-            std::process::abort()
-        };
-        assert!(
-            err.to_string().contains("site=site-us-west"),
-            "error should name missing site: {err}"
-        );
     }
 }

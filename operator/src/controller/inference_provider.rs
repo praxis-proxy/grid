@@ -560,6 +560,10 @@ async fn update_status(
         reason,
     };
 
+    if !inference_provider_status_needs_update(provider.status.as_ref(), &status) {
+        return Ok(());
+    }
+
     let patch = serde_json::json!({
         "apiVersion": "grid.praxis-proxy.io/v1alpha1",
         "kind": "InferenceProvider",
@@ -573,6 +577,14 @@ async fn update_status(
     Ok(())
 }
 
+/// Return whether the status subresource differs from the desired status.
+fn inference_provider_status_needs_update(
+    current: Option<&InferenceProviderStatus>,
+    desired: &InferenceProviderStatus,
+) -> bool {
+    current != Some(desired)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -582,6 +594,24 @@ async fn update_status(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, reason = "tests")]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_status_update_is_skipped_when_semantically_unchanged() {
+        let baseline = InferenceProviderStatus {
+            matching_sites: vec!["site-a".to_owned()],
+            observed_generation: 2,
+            phase: ProviderPhase::Available,
+            reason: None,
+        };
+        assert!(!inference_provider_status_needs_update(Some(&baseline), &baseline));
+
+        let changed = InferenceProviderStatus {
+            phase: ProviderPhase::Degraded,
+            ..baseline.clone()
+        };
+        assert!(inference_provider_status_needs_update(Some(&baseline), &changed));
+        assert!(inference_provider_status_needs_update(None, &baseline));
+    }
 
     // -----------------------------------------------------------------------
     // Test utilities

@@ -1,0 +1,45 @@
+listeners:
+  - name: public-https
+    address: "0.0.0.0:8443"
+    filter_chains:
+      - edge-steering
+    tls:
+      certificates:
+        - cert_path: /etc/praxis/tls/tls.crt
+          key_path: /etc/praxis/tls/tls.key
+
+clusters:
+  - name: grid-edges
+    endpoints:
+      - "{{ captures.east-edge.edge-gateway-ip }}:8080"
+      - "{{ captures.west-edge.edge-gateway-ip }}:8080"
+    health_check:
+      type: tcp
+      interval_ms: 1000
+      timeout_ms: 500
+      healthy_threshold: 2
+      unhealthy_threshold: 2
+      passive_healthy_threshold: 1
+      passive_unhealthy_threshold: 2
+
+filter_chains:
+  - name: edge-steering
+    filters:
+      - filter: router
+        routes:
+          - path_prefix: /
+            cluster: grid-edges
+      - filter: load_balancer
+        clusters:
+          - name: grid-edges
+            load_balancer_strategy:
+              consistent_hash:
+                header: X-Edge-Session-Id
+            endpoints:
+              - "{{ captures.east-edge.edge-gateway-ip }}:8080"
+              - "{{ captures.west-edge.edge-gateway-ip }}:8080"
+
+admin:
+  address: "127.0.0.1:9901"
+
+shutdown_timeout_secs: 5

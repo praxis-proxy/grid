@@ -130,6 +130,15 @@ impl StateBroadcast {
         }
     }
 
+    /// Return true when this broadcast carries provider or capability state.
+    ///
+    /// Metadata-only broadcasts use independent invalidation lanes and are
+    /// refreshed separately by the operator runtime.
+    #[must_use]
+    pub fn carries_grid_state(&self) -> bool {
+        !self.is_metadata_only()
+    }
+
     /// Return true when this payload only advertises side-channel metadata
     /// (gateway address and/or site cert PEM) with no CRDT state.
     #[must_use]
@@ -317,6 +326,9 @@ pub struct StateBroadcastHandler {
     /// Gateway addresses received from each origin site.
     gateway_addrs: BTreeMap<String, String>,
 
+    /// Highest gateway-address revision received from each origin.
+    latest_gateway_revision_by_origin: BTreeMap<String, u64>,
+
     /// Watch channel for broadcasting gateway address updates to observers.
     ///
     /// Updated whenever a broadcast with a gateway address extension is received.
@@ -327,6 +339,9 @@ pub struct StateBroadcastHandler {
     ///
     /// Contains only public certificate material — never private keys.
     cert_pems: BTreeMap<String, String>,
+
+    /// Highest certificate revision received from each origin.
+    latest_cert_revision_by_origin: BTreeMap<String, u64>,
 
     /// Watch channel for broadcasting public cert PEM updates to observers.
     cert_pems_tx: watch::Sender<BTreeMap<String, String>>,
@@ -348,8 +363,10 @@ impl StateBroadcastHandler {
             state_tx: tx,
             latest_by_origin: BTreeMap::new(),
             gateway_addrs: BTreeMap::new(),
+            latest_gateway_revision_by_origin: BTreeMap::new(),
             gateway_addrs_tx: gw_tx,
             cert_pems: BTreeMap::new(),
+            latest_cert_revision_by_origin: BTreeMap::new(),
             cert_pems_tx: cert_tx,
         }
     }
@@ -413,6 +430,15 @@ impl StateBroadcastHandler {
     /// Store and publish the gateway address carried by a broadcast, if any.
     fn store_gateway_address(&mut self, broadcast: &StateBroadcast) {
         if let Some(gw) = &broadcast.gateway_address {
+            let latest = self
+                .latest_gateway_revision_by_origin
+                .get(&broadcast.origin_site)
+                .copied();
+            if latest.is_some_and(|revision| revision > broadcast.revision) {
+                return;
+            }
+            self.latest_gateway_revision_by_origin
+                .insert(broadcast.origin_site.clone(), broadcast.revision);
             self.gateway_addrs.insert(broadcast.origin_site.clone(), gw.clone());
             self.gateway_addrs_tx.send_modify(|m| {
                 m.insert(broadcast.origin_site.clone(), gw.clone());
@@ -426,6 +452,12 @@ impl StateBroadcastHandler {
     /// never appear in a `StateBroadcast` payload.
     fn store_site_cert_pem(&mut self, broadcast: &StateBroadcast) {
         if let Some(pem) = &broadcast.site_cert_pem {
+            let latest = self.latest_cert_revision_by_origin.get(&broadcast.origin_site).copied();
+            if latest.is_some_and(|revision| revision > broadcast.revision) {
+                return;
+            }
+            self.latest_cert_revision_by_origin
+                .insert(broadcast.origin_site.clone(), broadcast.revision);
             self.cert_pems.insert(broadcast.origin_site.clone(), pem.clone());
             self.cert_pems_tx.send_modify(|m| {
                 m.insert(broadcast.origin_site.clone(), pem.clone());
@@ -447,28 +479,32 @@ impl foca::BroadcastHandler<NodeId> for StateBroadcastHandler {
             });
         }
 
+        // Metadata-only broadcasts (gateway address or cert PEM, empty CRDT
+        // snapshot) have independent revision lanes. They must not be rejected
+        // by an unrelated provider-state revision.
+        if broadcast.is_metadata_only() {
+            self.store_gateway_address(&broadcast);
+            self.store_site_cert_pem(&broadcast);
+            return Ok(Some(broadcast.key()));
+        }
+
         let latest = self.latest_by_origin.get(&broadcast.origin_site).copied();
         if latest.is_some_and(|latest| latest > broadcast.revision) {
             return Ok(None);
         }
 
-        // Store side-channel metadata regardless of whether this is
-        // a state update.  Gateway address and cert PEM use independent
-        // invalidation lanes and must not block provider/capability state.
+        // Extensions on a non-stale state broadcast remain authoritative.
         self.store_gateway_address(&broadcast);
         self.store_site_cert_pem(&broadcast);
-
-        // Metadata-only broadcasts (gateway address or cert PEM, empty CRDT
-        // snapshot) are always disseminated but never merge CRDT state.
-        if broadcast.is_metadata_only() {
-            return Ok(Some(broadcast.key()));
-        }
 
         if latest.is_some_and(|latest| latest == broadcast.revision) {
             return Ok(None);
         }
 
-        self.state_tx.send_modify(|snap| snap.merge(&broadcast.snapshot));
+        self.state_tx.send_modify(|snap| {
+            snap.capabilities.merge(&broadcast.snapshot.capabilities);
+            snap.replace_origin_providers(&broadcast.origin_site, broadcast.revision, &broadcast.snapshot);
+        });
         self.latest_by_origin
             .insert(broadcast.origin_site.clone(), broadcast.revision);
         Ok(Some(broadcast.key()))
@@ -534,6 +570,23 @@ mod tests {
             .unwrap_or_else(|| std::process::abort());
         assert_eq!(decoded.version, STATE_BROADCAST_VERSION_V1, "version without gateway");
         assert_eq!(provider.metrics.queue_depth, Some(0.1), "metric value");
+    }
+
+    #[test]
+    fn grid_state_and_metadata_broadcasts_are_distinguished() {
+        let state = StateBroadcast::new("site-p".to_owned(), 7, snapshot("site-p", 7, 0.1), None);
+        let metadata = StateBroadcast::new(
+            "site-p".to_owned(),
+            8,
+            GridStateSnapshot::new("site-p".to_owned()),
+            Some("10.0.0.1:8443".to_owned()),
+        );
+
+        assert!(state.carries_grid_state(), "provider state must be retained for repair");
+        assert!(
+            !metadata.carries_grid_state(),
+            "metadata uses its existing independent refresh path"
+        );
     }
 
     #[test]
@@ -640,6 +693,30 @@ mod tests {
             .provider("net", "site-p", "provider")
             .unwrap_or_else(|| std::process::abort());
         assert_eq!(provider.metrics.queue_depth, Some(0.2), "snapshot must merge");
+    }
+
+    #[test]
+    fn newer_transport_revision_replaces_equal_revision_provider_metrics() {
+        let mut handler = StateBroadcastHandler::new("site-local".to_owned());
+        let initial = StateBroadcast::new("site-p".to_owned(), 10, snapshot("site-p", 1, 0.9), None);
+        let changed = StateBroadcast::new("site-p".to_owned(), 11, snapshot("site-p", 1, 0.1), None);
+
+        assert!(receive(&mut handler, &initial).is_some());
+        assert!(receive(&mut handler, &changed).is_some());
+
+        let snap = handler.snapshot();
+        let provider = snap
+            .provider("net", "site-p", "provider")
+            .unwrap_or_else(|| std::process::abort());
+        assert_eq!(
+            provider.revision, 11,
+            "transport revision must become the provider LWW revision"
+        );
+        assert_eq!(
+            provider.metrics.queue_depth,
+            Some(0.1),
+            "newer origin snapshot must replace metric-only state"
+        );
     }
 
     #[test]
@@ -865,6 +942,50 @@ mod tests {
     }
 
     #[test]
+    fn handler_state_revision_does_not_block_gateway_only_update() {
+        let mut handler = StateBroadcastHandler::new("site-local".to_owned());
+        let state = StateBroadcast::new("site-p".to_owned(), 99, snapshot("site-p", 99, 0.8), None);
+        assert!(receive(&mut handler, &state).is_some());
+
+        let gateway_only = StateBroadcast::new(
+            "site-p".to_owned(),
+            1,
+            GridStateSnapshot::new("site-p".to_owned()),
+            Some("10.0.0.2:8443".to_owned()),
+        );
+        assert!(
+            receive(&mut handler, &gateway_only).is_some(),
+            "gateway-only update must use its independent revision lane"
+        );
+        assert_eq!(
+            handler.gateway_address_for_site("site-p"),
+            Some("10.0.0.2:8443"),
+            "provider-state revision must not leave the gateway address stale"
+        );
+    }
+
+    #[test]
+    fn handler_rejects_out_of_order_gateway_rollback() {
+        let mut handler = StateBroadcastHandler::new("site-local".to_owned());
+        let newer = StateBroadcast::new(
+            "site-p".to_owned(),
+            8,
+            GridStateSnapshot::new("site-p".to_owned()),
+            Some("10.0.0.8:8443".to_owned()),
+        );
+        let older = StateBroadcast::new(
+            "site-p".to_owned(),
+            7,
+            GridStateSnapshot::new("site-p".to_owned()),
+            Some("10.0.0.7:8443".to_owned()),
+        );
+
+        assert!(receive(&mut handler, &newer).is_some());
+        assert!(receive(&mut handler, &older).is_some());
+        assert_eq!(handler.gateway_address_for_site("site-p"), Some("10.0.0.8:8443"));
+    }
+
+    #[test]
     fn cert_extension_round_trips() {
         let cert = "-----BEGIN CERTIFICATE-----\npublic\n-----END CERTIFICATE-----\n";
         let broadcast = StateBroadcast::new("site-p".to_owned(), 4, snapshot("site-p", 4, 0.6), None)
@@ -885,6 +1006,29 @@ mod tests {
 
         assert!(receive(&mut handler, &broadcast).is_some());
         assert_eq!(handler.cert_pem_for_site("site-p"), Some(cert));
+    }
+
+    #[test]
+    fn handler_rejects_out_of_order_certificate_rollback() {
+        let mut handler = StateBroadcastHandler::new("site-local".to_owned());
+        let newer = StateBroadcast::new(
+            "site-p".to_owned(),
+            8,
+            GridStateSnapshot::new("site-p".to_owned()),
+            None,
+        )
+        .with_cert(Some("new-cert".to_owned()));
+        let older = StateBroadcast::new(
+            "site-p".to_owned(),
+            7,
+            GridStateSnapshot::new("site-p".to_owned()),
+            None,
+        )
+        .with_cert(Some("old-cert".to_owned()));
+
+        assert!(receive(&mut handler, &newer).is_some());
+        assert!(receive(&mut handler, &older).is_some());
+        assert_eq!(handler.cert_pem_for_site("site-p"), Some("new-cert"));
     }
 
     #[test]

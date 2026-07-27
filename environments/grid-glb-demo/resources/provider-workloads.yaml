@@ -16,14 +16,28 @@ spec:
       labels:
         app.kubernetes.io/name: mock-inference
     spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: mock-inference
-          image: "grid-mock-providers:glb-demo"
-          imagePullPolicy: Never
+          image: "{{ cluster.properties.mockProviderImage }}"
+          imagePullPolicy: "{{ cluster.properties.imagePullPolicy }}"
           args: ["--provider", "openai", "--port", "8080"]
           env:
             - name: MOCK_PROVIDER_SITE
               value: "{{ cluster.name }}"
+            - name: MOCK_QUEUE_DEPTH
+              value: "0.10"
+            - name: MOCK_EXPECTED_BEARER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: mock-inference-credential
+                  key: token
           ports:
             - name: http
               containerPort: 8080
@@ -33,6 +47,13 @@ spec:
               port: 8080
             initialDelaySeconds: 2
             periodSeconds: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
           resources:
             requests:
               cpu: 100m
@@ -50,6 +71,7 @@ metadata:
     app.kubernetes.io/name: mock-inference
     app.kubernetes.io/part-of: grid-glb-demo
 spec:
+  type: ClusterIP
   selector:
     app.kubernetes.io/name: mock-inference
   ports:

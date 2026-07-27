@@ -1,0 +1,79 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: provider-gateway
+  namespace: grid-system
+  labels:
+    app.kubernetes.io/name: provider-gateway
+    app.kubernetes.io/component: provider-ingress
+    app.kubernetes.io/part-of: grid-glb-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: provider-gateway
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: provider-gateway
+        app.kubernetes.io/component: provider-ingress
+        app.kubernetes.io/part-of: grid-glb-demo
+        grid.praxis-proxy.io/backend-access: provider-gateway
+        grid.praxis-proxy.io/provider-site: "{{ cluster.name }}"
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 100
+        runAsGroup: 101
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: praxis-ai
+          image: "{{ cluster.properties.gatewayImage }}"
+          imagePullPolicy: "{{ cluster.properties.imagePullPolicy }}"
+          args:
+            - "--config"
+            - "/etc/praxis/praxis.yaml"
+          ports:
+            - name: https-mtls
+              containerPort: 8443
+          readinessProbe:
+            tcpSocket:
+              port: https-mtls
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          volumeMounts:
+            - name: config
+              mountPath: /etc/praxis
+              readOnly: true
+            - name: provider-tls
+              mountPath: /etc/praxis/tls
+              readOnly: true
+            - name: provider-credential
+              mountPath: /etc/praxis/credentials/mock-inference
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: provider-gateway-config
+        - name: provider-tls
+          secret:
+            secretName: provider-gateway-tls
+        - name: provider-credential
+          secret:
+            secretName: mock-inference-credential

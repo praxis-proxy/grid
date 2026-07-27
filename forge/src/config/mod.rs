@@ -228,6 +228,13 @@ pub struct ServiceSpec {
     /// Container restart policy.
     #[serde(default)]
     pub restart: RestartPolicy,
+    /// Add the Forge state directory's host group as a supplemental container
+    /// group.
+    ///
+    /// This lets the image's non-root user read group-protected bind mounts
+    /// without making credentials world-readable or replacing the image user.
+    #[serde(default)]
+    pub inherit_host_group: bool,
     /// Health-check configuration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health_check: Option<HealthCheck>,

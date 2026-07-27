@@ -155,7 +155,7 @@ impl ProviderState {
 // ---------------------------------------------------------------------------
 
 /// Mergeable distributed state for one grid view.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct GridStateSnapshot {
     /// Site that created this snapshot replica.
     pub site_id: String,
@@ -199,6 +199,26 @@ impl GridStateSnapshot {
         self.capabilities.merge(&other.capabilities);
         for provider in other.providers.values() {
             self.upsert_provider(provider.clone());
+        }
+    }
+
+    /// Replace provider records owned by one authoritative origin snapshot.
+    ///
+    /// SWIM state envelopes carry an origin-local transport revision that
+    /// advances for metric-only changes and periodic repairs. Provider records
+    /// from other origins are retained. Records whose embedded `site_id` does
+    /// not match `origin_site` are ignored.
+    pub fn replace_origin_providers(&mut self, origin_site: &str, revision: u64, authoritative: &Self) {
+        self.providers.retain(|_, provider| provider.site_id != origin_site);
+        for provider in authoritative
+            .providers
+            .values()
+            .filter(|provider| provider.site_id == origin_site)
+        {
+            let mut provider = provider.clone();
+            provider.revision = revision;
+            origin_site.clone_into(&mut provider.writer_id);
+            self.upsert_provider(provider);
         }
     }
 
@@ -293,6 +313,38 @@ mod tests {
 
         assert_eq!(snap.capabilities.len(), 1, "duplicate capabilities must collapse");
         assert_eq!(snap.providers.len(), 1, "duplicate providers must collapse");
+    }
+
+    #[test]
+    fn authoritative_origin_replacement_updates_and_removes_provider_records() {
+        let mut current = GridStateSnapshot::new("consumer".to_owned());
+        current.upsert_provider(provider("site-p", "stale", 9, 0.9));
+        current.upsert_provider(provider("site-p", "current", 9, 0.9));
+        current.upsert_provider(provider("site-q", "preserved", 9, 0.4));
+
+        let mut authoritative = GridStateSnapshot::new("site-p".to_owned());
+        authoritative.upsert_provider(provider("site-p", "current", 1, 0.1));
+        authoritative.upsert_provider(provider("site-q", "foreign", 20, 0.2));
+
+        current.replace_origin_providers("site-p", 10, &authoritative);
+
+        assert!(
+            current.provider("net", "site-p", "stale").is_none(),
+            "provider absent from the authoritative origin snapshot must be removed"
+        );
+        let updated = current
+            .provider("net", "site-p", "current")
+            .unwrap_or_else(|| std::process::abort());
+        assert_eq!(updated.revision, 10, "transport revision must govern the origin record");
+        assert_eq!(updated.metrics.queue_depth, Some(0.1), "metric-only change must apply");
+        assert!(
+            current.provider("net", "site-q", "preserved").is_some(),
+            "records owned by other origins must remain"
+        );
+        assert!(
+            current.provider("net", "site-q", "foreign").is_none(),
+            "an origin cannot authoritatively replace another site's provider"
+        );
     }
 
     #[test]

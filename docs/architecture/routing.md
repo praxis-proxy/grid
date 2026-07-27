@@ -170,9 +170,10 @@ Admission state is threshold-based from current metrics only:
 | `queue_depth > 0.85` or `kv_cache_utilization > 0.90` | `existing_only` |
 | Otherwise | `new_and_existing` |
 
-Hysteresis, hold-down timers, CAS, and shared active-active admission state
-are future work. The current implementation is a snapshot of the last observed
-metrics at reconcile time.
+Admission is a point-in-time snapshot of the metrics observed at reconcile
+time. Deployments that require hysteresis, hold-down timers, compare-and-swap
+coordination, or shared active-active admission state must provide those
+control-plane guarantees before enabling threshold-based admission.
 
 ### Locality tier derivation
 
@@ -343,10 +344,10 @@ The fallback decision is therefore still local to the consumer gateway at
 request time: `grid_route` selects from the pre-rendered candidate list, and the
 Praxis AI filter chain handles credential injection and upstream forwarding.
 
-Current local validation uses mock API-provider endpoints. That proves the Grid
-overlay and Praxis routing/credential-injection mechanics. It does not prove a
-real external provider protocol such as OpenAI, Anthropic, Bedrock SigV4, or
-Vertex OAuth2.
+Grid overlay and credential-injection validation is distinct from
+provider-protocol acceptance. Each external provider integration must
+separately qualify its protocol, authentication exchange, timeout and retry
+semantics, error mapping, streaming behavior, and credential rotation.
 
 ## Credential injection
 
@@ -508,9 +509,9 @@ edge selection (network proximity, health) from provider selection (model,
 policy, capacity, location affinity).
 
 Grid renders a per-gateway overlay specific to each edge's site and region.
-When overlay-file hot reload is available, the edge can swap its in-memory
-snapshot atomically without process restart.  Until that capability is merged
-and proven, overlay updates require a gateway reload or restart.
+With overlay-file hot reload enabled, the edge validates a replacement overlay
+and swaps its in-memory snapshot atomically without process restart. Each
+request uses one loaded snapshot for selection.
 
 See [External Client Ingress](external-ingress.md) for the full external
 routing design.
@@ -522,14 +523,39 @@ infrastructure. When the gateway image includes the `peer_identity_trust` filter
 provider gateways verify the peer identity from the downstream client certificate
 and reject untrusted peers with HTTP 403 before forwarding to local infrastructure.
 
-The current development trust policy matches the peer certificate organization.
-Production policies should prefer stronger identity binding such as certificate
-digest pinning or SPIFFE-style identities.
+Provider gateways require a client certificate and can match both its exact
+digest and organization. Certificate identity authorizes the peer; it does not
+authorize an arbitrary candidate, model, or backend.
 
 ## Provider-side request forwarding
 
-After site selection, provider-side Praxis filters forward the request to local
-inference infrastructure. A common llm-d-style path is:
+After site selection, the edge AI filter removes inbound copies of the fixed
+`X-Grid-Peer-*` contract and reconstructs the selected stable candidate and hop
+request ID. The provider consumes those fields only after mTLS and
+`peer_identity_trust`. `grid_provider_route` removes them, validates an exact
+provider-local candidate/model/path map, and selects the local backend cluster.
+It performs no discovery, scoring, affinity, or hot reload.
+
+Praxis AI rejects provider pipelines at startup unless the listener requires
+client certificates and an unconditional, fail-closed `peer_identity_trust` is
+the first filter before the top-level `grid_provider_route`. First position
+prevents an earlier branch from bypassing peer authorization. The validation
+cannot be downgraded with the generic pipeline-validation skip options.
+
+The provider inference path is:
+
+```text
+grid_route
+  -> mTLS provider hop
+  -> peer_identity_trust
+  -> inference parser
+  -> grid_provider_route
+  -> optional grid_credential_inject
+  -> load_balancer
+  -> private backend
+```
+
+A provider can then use a local llm-d-style scheduling path:
 
 ```text
 provider gateway

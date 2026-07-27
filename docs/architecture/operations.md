@@ -1,7 +1,8 @@
-# Grid Operations Walkthrough
+# Grid Operations
 
-Step-by-step guide to grid formation, site lifecycle,
-and routing configuration.
+This guide covers production installation, grid formation, site lifecycle,
+routing configuration, security, and observability. Development-only
+orchestration is isolated under **Development Validation Environments**.
 
 ## 1. Deploy the Grid Operator
 
@@ -51,9 +52,9 @@ For regenerating CRDs after schema changes:
 runtime with a non-root user and no build toolchain.  The Kubernetes Deployment
 adds a restricted security context for OpenShift-style clusters.
 
-**Image availability**: Shared registry validation depends on project-owned
-published images. Local Kind image loading remains available as a developer
-override.
+**Image availability**: Production deployments pin project-owned release or
+commit-digest images. Local image loading is documented under
+**Development Validation Environments**.
 
 ### Deployment Examples
 
@@ -77,13 +78,9 @@ The operator runs as a single binary with multiple
 controllers (one per CRD type) in the same process.  No
 SWIM runtime starts until a `GridNetwork` resource exists.
 
-**Important**: Grid deploys only the operator and CRDs.
-It does not install Kind clusters, Praxis AI gateways,
-llm-d, mock EPP, MetalLB, Gateway API, or cross-cluster
-DNS.  Multi-cluster development environment composition
-is handled by
-[Forge](https://github.com/praxis-proxy/grid/issues/2)
-(`praxis-forge` CLI).
+**Important**: Grid deploys only the operator and CRDs. Cluster lifecycle,
+Praxis AI gateways, inference runtimes, load-balancer integrations, and DNS
+remain deployment-platform responsibilities.
 
 Praxis AI gateway deployment is separate and requires:
 1. Praxis AI image with required filters (`grid_route`, `grid_credential_inject`)
@@ -98,10 +95,10 @@ The intended project-owned operator image path is:
 ghcr.io/praxis-proxy/grid-operator
 ```
 
-This image path is reserved but not yet published. The CI workflow builds the
-image for validation, but the GHCR push steps are disabled
-until package ownership and repository permissions are
-configured for `ghcr.io/praxis-proxy`.
+The repository CI builds this image for validation. Registry publication
+requires package ownership and repository permissions for
+`ghcr.io/praxis-proxy`; until those are configured, deployments must supply an
+operator image through their environment configuration.
 
 **Tag policy:**
 
@@ -126,39 +123,21 @@ kubectl set image deployment/grid-operator \
   operator=ghcr.io/praxis-proxy/grid-operator:sha-<commit>
 ```
 
-**Local Kind clusters:** the xtask validation harness
-builds `grid-operator:latest` from
-`deploy/operator/Containerfile` and loads it into Kind
-directly.  No registry pull is needed for local
-validation:
-
-```console
-cargo xtask env verify-operator-install-rbac \
-  -c tests/env/operator-routing-multisite.toml
-```
-
-Or build the image manually:
-
-```console
-make operator-image
-kind load docker-image grid-operator:latest --name <cluster>
-```
-
 **Registry namespace:** the image path is reserved under
 `ghcr.io/praxis-proxy/`.
 
 **CI publishing setup:** the
 `.github/workflows/operator-image.yaml` workflow builds
-the image but does not publish it yet.  Enable the
-commented GHCR login and push steps only after repository
-or organization package settings allow this workflow to
-create and update `ghcr.io/praxis-proxy/grid-operator`.
+the image without publishing it. Enable the GHCR login
+and push steps only when repository or organization
+package settings authorize the workflow to create and
+update `ghcr.io/praxis-proxy/grid-operator`.
 
 **Security:** the operator image contains only the
 statically linked operator binary.  No secrets, tokens,
 SWIM encryption keys, or credentials are baked into the
-image.  SBOM generation and image signing are not yet
-implemented.
+image. Production publication requires an SBOM and image
+signing in the release pipeline.
 
 ### RBAC permissions
 
@@ -370,6 +349,14 @@ shared across all `GridNetwork` reconciles.  Seeds from any
 This is site-membership bootstrap, not per-network membership isolation.
 CRDT provider records remain network-scoped separately.
 
+Each membership identity carries a restart-scale `u64` generation. A
+replacement process at the same advertised address presents a greater
+generation and supersedes the retained process identity; in-process renewals
+increment it without wrapping. All peers in one SWIM membership domain must
+run a wire-compatible identity schema. A release that changes that schema
+must be coordinated across the membership domain rather than deployed as an
+unqualified rolling update.
+
 **Transport-security contract**
 
 SWIM is the Grid control-plane membership and state broadcast channel.  When
@@ -434,10 +421,13 @@ level; the reconcile does not fail.
 
 *Removed seed still shows as connected:*
 - Expected behavior.  SWIM does not actively disconnect on seed removal.
-- Wait for the SWIM probe failure window (default: ~10 s `suspicionTimeout`).
-  The peer is declared `Dead` and `GridNetwork.status.connectedSites` decreases.
+- Wait for the WAN probe and suspicion window. The runtime probes every five
+  seconds, allows three seconds for a direct response before indirect probes,
+  and retains a suspect member for at least three probe periods before
+  declaring it `Dead`. `GridNetwork.status.connectedSites` then decreases.
 - If the remote operator is still running, it will rejoin as `Alive` again because
-  SWIM membership is peer-to-peer — seeds are only needed for initial discovery.
+  SWIM membership is peer-to-peer and periodically announces to live and down
+  members. Seeds bootstrap discovery; they are not an allowlist.
 
 **Phase progression:** `GridNetwork Active` is set when
 the SWIM runtime reports at least one `Alive` peer in
@@ -496,9 +486,10 @@ The trust bootstrap for a remote site progresses through these steps:
 4. **TCP gateway probe passes** — the `GridSite` controller can reach the gateway
    address.  Phase stays `Connecting` until a trust policy is configured.
 
-5. **Trust policy verified** — configure `spec.trust.certFingerprint` with the SHA-256
-   fingerprint of the remote site's `publicCertPem`.  When the fingerprint matches and
-   the TCP probe succeeds, the operator promotes the site to `Active` with reason
+5. **Control-plane fingerprint policy verified** — configure
+   `spec.trust.certFingerprint` with the SHA-256 fingerprint of the remote
+   site's advertised `publicCertPem`. When the fingerprint matches and the TCP
+   probe succeeds, the operator promotes the site to `Active` with reason
    `TrustPolicyVerified`.
 
    ```bash
@@ -512,15 +503,21 @@ The trust bootstrap for a remote site progresses through these steps:
 
    See [Authentication and Access Policy](auth.md) for the trust contract.
 
-6. **Data-plane mTLS enforced** — the provider gateway enforces peer identity via mTLS
-   on every request, independent of the control-plane phase.
+   This comparison pins advertised control-plane material. It does not perform
+   a TLS handshake with the endpoint or prove possession of the corresponding
+   private key.
+
+6. **Data-plane mTLS enforced** — a provider Praxis gateway validates peer
+   identity over mTLS on every request, independent of the control-plane
+   phase. Deployment acceptance requires positive and negative runtime probes;
+   manifest inspection alone is not evidence.
 
 ### Authentication vs authorization
 
 | Concept | Question it answers | Grid mechanism |
 |---|---|---|
-| Authentication | "Is this peer really the site it claims to be?" | Gateway mTLS peer identity and certificate validation |
-| Authorization | "Is this authenticated peer allowed to participate in this Grid or receive/send this traffic?" | Grid trust policy, allowed peer identity, and gateway enforcement |
+| Authentication | "Is this peer really the site it claims to be?" | Gateway mTLS peer identity and certificate validation in the data plane |
+| Authorization | "Is this authenticated peer allowed to participate in this Grid or receive/send this traffic?" | Local Grid policy plus destination gateway enforcement |
 
 A peer must satisfy both.  A SWIM peer must never become routable solely because
 it gossiped successfully.
@@ -551,11 +548,12 @@ currently prove that a Praxis gateway has completed an mTLS handshake, accepted
 client identity, loaded the latest routing config, or authorized provider-side
 traffic.
 
-Setting `Active` requires an explicit trust policy.  For the current operator, that
-policy is `GridSite.spec.trust.certFingerprint`: when the configured fingerprint
-matches the received public certificate and the TCP probe succeeds, the operator
-promotes the site to `Active`.  Data-plane mTLS at the provider gateway enforces
-peer identity on every request independently of the control-plane phase.
+Setting `Active` requires an explicit control-plane fingerprint policy. For the
+current operator, that policy is `GridSite.spec.trust.certFingerprint`: when
+the configured fingerprint matches the advertised public certificate and the
+TCP probe succeeds, the operator promotes the site to `Active`. A production
+provider gateway independently enforces peer identity on every data-plane
+request. `Active` alone is not evidence that this enforcement exists.
 
 ## 5. Connectivity Verification
 
@@ -751,8 +749,8 @@ public certificate (`tls.crt`) from the site Secret, not the private key (`tls.k
 ## GridSite gateway address configuration
 
 The operator resolves and advertises its data-plane gateway address to SWIM
-peers.  This address is propagated through SWIM state broadcasts and used by
-the primary operator to populate `GridSite.spec.egress.address` for
+peers. This address is propagated through SWIM state broadcasts and used by
+receiving operators to populate `GridSite.spec.egress.address` for
 auto-discovered sites.
 
 **Self-discovery (default):** A background poller periodically looks up the
@@ -781,6 +779,11 @@ GRID_GATEWAY_ADDRESS=10.0.0.4:8080 ./operator
   phase until the Service appears
 - This address is separate from `GRID_SWIM_BIND_ADDR` — the SWIM gossip endpoint
   and the data-plane gateway address are distinct
+
+The current first-ingress, configured-port discovery contract is appropriate
+for the local MetalLB environment. A production endpoint is represented and
+validated by host, named port, protocol, SNI, address scope, and generation;
+arbitrary or ambiguous advertised strings do not become routable endpoints.
 
 **Probe behavior:** The `GridSite` controller probes `spec.egress.address` with a
 TCP connect (5-second timeout) on each reconcile.  A successful probe reports
@@ -909,14 +912,15 @@ delivery requires GitOps, External Secrets, or a similar mechanism.
 
 ## Site Departure
 
-**Graceful leave**: Operator sends SWIM leave message.
-Peers remove the site from membership immediately.
-`GridSite` deleted.
+The running SWIM implementation detects an abrupt loss through direct and
+indirect probes. Remote provider records are treated as degraded when the peer
+is `Suspect` or `Dead`, and stale-candidate retention follows the configured
+overlay TTL policy.
 
-**Crash**: SWIM probe fails (direct + indirect).
-Site enters suspect state (default 10s timeout).
-If no refutation, declared dead. `GridSite` status:
-`Active → Unreachable → Left`.
+The current operator does not delete the `GridSite`, garbage-collect the CRDT
+record, or automatically complete a `Left` transition on process shutdown.
+Departure therefore preserves control-plane evidence and requires explicit
+site lifecycle cleanup by the deployment owner.
 
 ## Adding a New Site to an Existing Grid
 
@@ -928,15 +932,99 @@ If no refutation, declared dead. `GridSite` status:
 4. The new site automatically discovers all grid
    members within seconds
 5. SWIM propagates public certificate material; the operator
-   verifies the fingerprint and advances matching sites to `Active`
+   verifies the explicitly configured fingerprint and advances matching sites
+   to `Active`
 6. Once `Active`, the new site's providers are visible
    to all other sites through the routing overlay
 
-## Local kind environment orchestration
+## External Ingress Operations
 
-The `xtask env` commands provide a local development
-and integration-validation path using `kind` clusters.
-They are **not** the production reconciliation model.
+External ingress operates as a two-stage service:
+
+```text
+managed GTM -> Praxis AI edge -> Grid-selected Praxis provider gateway
+```
+
+The production deployment inventory contains:
+
+| Layer | Operational inventory |
+|---|---|
+| GTM | Public service name, public TLS ownership, edge origins, health probes, steering policy, drain/failback policy, DDoS/WAF controls. |
+| Edge | At least two failure domains, pinned Grid/AI/Praxis compatibility set, caller authentication, tenant/model authorization, request limits, accepted overlay status. |
+| Grid | One edge-specific `GatewayRef` and routing perspective per edge location, authenticated site state, bounded admission policy, versioned overlay revisions. |
+| Provider | Private backend, provider Praxis gateway, mTLS listener, trusted edge identities, local authorization, local limits, and final-hop credentials. |
+
+### Edge Readiness
+
+A production GTM integration uses a route-aware readiness signal. The edge is
+ready when:
+
+- its public listener and external authentication dependencies are healthy;
+- a supported overlay version has been accepted;
+- the accepted overlay age is within policy;
+- endpoint/TLS configuration exists for every usable selected cluster; and
+- the public offer has its configured minimum authorized route coverage.
+
+One unavailable optional provider does not withdraw the edge. Loss of all
+required routes, a hard-expired snapshot, or a failed security dependency does.
+Liveness remains a process/listener signal and is not used as route coverage.
+
+During drain, readiness is withdrawn before shutdown. New requests stop while
+existing SSE streams receive the configured completion interval.
+
+### Overlay Rollout Evidence
+
+A production external-edge rollout tracks four distinct states:
+
+```text
+desired revision
+  -> rendered ConfigMap revision
+  -> distributed file revision
+  -> Praxis accepted/serving revision
+```
+
+`GridNetwork.status.consumerConfigStatus=Rendered` reports successful desired
+config rendering and apply. It does not report that the gateway loaded the
+overlay. The production contract requires gateway status for the accepted
+revision, digest, acceptance time, age, and last rejection reason. That
+contract is not satisfied by compatibility profiles that expose only
+`Rendered` status.
+
+Operational checks compare the same revision across all four states and send a
+request whose internal route-decision record contains that revision.
+
+An invalid overlay is expected to:
+
+1. fail strict parse or semantic validation;
+2. leave the previous accepted snapshot serving;
+3. increment a bounded rejection metric;
+4. expose the rejection reason without content or secrets; and
+5. affect readiness only according to accepted-snapshot age policy.
+
+### Provider Trust Verification
+
+Control-plane `GridSite Active` is necessary but not sufficient. The data-plane
+verification uses the actual edge-to-provider path:
+
+```text
+known edge certificate -> accepted
+unknown/revoked certificate -> rejected
+wrong SNI/server identity -> rejected
+direct public client -> rejected
+authorized peer but denied provider policy -> rejected
+```
+
+The provider gateway's backend remains `ClusterIP`-only or otherwise private.
+Customer `Authorization` values are absent from the provider request. Provider
+credentials exist only at the final hop.
+
+## Development Validation Environments
+
+The `xtask env` commands provide a local development and
+integration-validation path using Kind clusters. They are not the production
+reconciliation model. The Kubernetes-native global-ingress scenario is
+documented in
+[`environments/grid-glb-demo/README.md`](../../environments/grid-glb-demo/README.md).
 
 This path is intended for:
 

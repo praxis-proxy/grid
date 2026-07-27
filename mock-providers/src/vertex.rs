@@ -136,6 +136,7 @@ mod tests {
     fn test_state() -> AppState {
         AppState {
             provider_site: Arc::from("test-site"),
+            queue_depth: 0.1,
         }
     }
 
@@ -152,9 +153,9 @@ mod tests {
     }
 
     const GENERATE_URL: &str =
-        "/v1/projects/test-project/locations/us-central1/publishers/google/models/gemini-pro:generateContent";
+        "/v1/projects/test-project/locations/us-east1/publishers/google/models/gemini-pro:generateContent";
     const STREAM_URL: &str =
-        "/v1/projects/test-project/locations/us-central1/publishers/google/models/gemini-pro:streamGenerateContent";
+        "/v1/projects/test-project/locations/us-east1/publishers/google/models/gemini-pro:streamGenerateContent";
 
     fn bearer_header() -> (http::HeaderName, &'static str) {
         (header::AUTHORIZATION, "Bearer ya29.test-oauth2-token")

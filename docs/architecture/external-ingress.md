@@ -1,420 +1,379 @@
 # External Client Ingress
 
-Grid supports two complementary ingress patterns for AI inference routing.
+External client ingress extends Grid's workload-routing model to a stable
+public endpoint. A global traffic manager selects an edge. Grid and Praxis then
+select and reach an eligible provider.
 
-## Ingress patterns
+This document defines the production architecture contract. The
+`Repository Implementation` section identifies the capabilities implemented
+by the current Grid/Praxis integration. Deployment-specific development
+topologies and proof commands are documented with their environment rather
+than embedded in this contract.
 
-### Workload ingress
+The architecture has two independent routing stages:
 
-An in-cluster workload calls its cluster-local Praxis gateway. That gateway
-uses a Grid routing overlay to select a provider site for the requested model.
-This is the baseline Grid data-plane path documented in [Routing](routing.md).
+```text
+external client
+  -> managed DNS / Anycast / global traffic manager
+  -> Praxis AI edge gateway
+  -> Grid-selected Praxis provider gateway
+  -> provider-local inference backend
+```
+
+The first stage is network and edge selection. The second stage is
+model/provider selection. Combining them would put model, tenant, and provider
+capacity policy into DNS, which does not have the authenticated request context
+or parsed request body.
+
+## Ingress Patterns
+
+Grid uses the same provider-routing contract for two entry patterns.
+
+### Workload Ingress
 
 ```text
 in-cluster workload
   -> cluster-local Praxis consumer gateway
-  -> Grid-selected provider gateway (local or remote)
-  -> inference backend
-```
-
-### External client ingress
-
-An external client calls a stable public DNS name. Global traffic management
-sends the connection to a healthy Praxis AI edge-ingress gateway. That gateway
-uses a Grid routing overlay to select a provider site, the same way a
-cluster-local consumer gateway does.
-
-```text
-external client
-  -> public DNS / managed GLB / Anycast / CDN
-  -> Praxis AI edge-ingress gateway
   -> Grid-selected provider gateway
   -> inference backend
 ```
 
-Both patterns use the same Grid overlay format, the same `grid_route` filter,
-and the same provider gateway trust model. The difference is what sits in front
-of the Praxis gateway: a cluster-local service for workload ingress, or a
-global traffic manager for external client ingress.
-
-## One name, not one process
-
-One stable public DNS name does not require one central gateway process. The
-intended production shape is an active-active fleet of Praxis AI edge-ingress
-gateways behind platform-owned global traffic management.
-
-```text
-one public service name  !=  one public gateway instance
-```
-
-The name and API contract are global. The edge execution tier is replicated.
-The Grid control plane remains distributed. Provider clusters remain private.
-No single Praxis edge instance is required on the live request path for all
-traffic.
-
-## Ownership boundaries
-
-External client ingress spans four ownership boundaries:
-
-| Owner | Responsibility |
-|---|---|
-| **Global traffic manager** | Client-to-edge selection, public DNS, public TLS front door, DDoS/WAF/Anycast/cloud LB behavior, edge health steering. |
-| **Grid** | Provider discovery, policy eligibility, scoring, routing overlay generation. One overlay per gateway perspective. |
-| **Praxis AI** | Request-time parsing, auth/filter chain execution, `grid_route` selection from a loaded overlay snapshot, forwarding to the selected provider gateway. |
-| **Praxis core / Pingora** | Lower-level proxying, TLS termination, connection pooling, load-balancer mechanics. |
-
-Praxis AI is the L7 AI router and GLB data-plane target. It is not the
-complete global traffic-management system. DNS health steering, Anycast
-advertisement, DDoS protection, and internet-scale traffic absorption are
-external platform infrastructure.
-
-Praxis AI must not join SWIM, call Kubernetes, or call the Grid operator in the
-request path. It consumes a local validated snapshot rendered by Grid.
-
-## Two-stage routing
-
-External ingress requires two routing decisions because they use different
-information available at different times.
-
-### Stage 1: client to edge
-
-The global traffic manager selects a healthy edge based on network proximity,
-latency, geography, policy, and edge health. This decision happens before the
-HTTP request body is available. The global traffic manager does not know the
-requested model, tenant policy, or provider capacity.
-
-### Stage 2: edge to provider
-
-After receiving the request, the Praxis AI edge parses the OpenAI-compatible
-body, extracts the model, and invokes `grid_route` against the loaded Grid
-overlay. The overlay provides eligible provider candidates ordered for that
-edge's routing perspective. Praxis selects a candidate and forwards to the
-provider gateway using the existing `load_balancer` / Pingora path.
-
-DNS must not select the provider site because it does not know the requested
-model.
-
-### Request flow (target architecture)
+### External Client Ingress
 
 ```text
 external client
-  -> TLS to api.example.com
-  -> global traffic manager selects healthy edge
-  -> Praxis AI edge: [external auth] -> [rate limit] -> parse model
-  -> grid_route: in-memory candidate lookup from loaded overlay
-  -> Grid mTLS to selected provider gateway
-  -> provider gateway: verify edge peer identity, forward to backend
-  -> inference backend returns response
-```
-
-Steps in brackets are production requirements not yet implemented in the POC.
-The request path must not call Kubernetes, Grid operators, SWIM, CRDT, DNS
-control APIs, or the filesystem.
-
-### Control-plane flow (target architecture)
-
-```text
-provider CRDs + metrics + SWIM/CRDT state
-  -> Grid reconciliation
-  -> edge-specific routing overlay ConfigMap
-  -> projected ConfigMap volume (Kubernetes deployments)
-     or overlay-sync adapter (standalone container POC)
-  -> atomic file replacement
-  -> grid_route validates and atomically swaps the in-memory snapshot
-  -> subsequent requests use the new snapshot
-```
-
-The last two steps — in-process snapshot validation and atomic swap — depend
-on Praxis AI overlay-file hot reload, which is not yet merged.  Until that
-lands, overlay updates require a gateway restart.  See
-[Current implementation status](#current-implementation-status).
-
-Praxis AI does not become a SWIM member. The Grid operator or a future Grid
-edge agent represents the site in the Grid control plane. Praxis remains the
-data plane and consumes a local validated snapshot.
-
-## Authentication boundaries
-
-External client ingress introduces a three-layer authentication model. Each
-layer serves a different trust boundary and must not be conflated with the
-others.
-
-### External caller authentication
-
-The customer's bearer token, JWT, or API key authenticates and authorizes the
-external caller at the edge. This is terminated before `grid_route` runs.
-
-The customer's `Authorization` header must not be forwarded as a provider
-credential. It must be stripped or replaced before the request leaves the edge.
-
-### Grid mTLS peer identity
-
-The edge gateway's Grid site certificate authenticates the edge to provider
-gateways. Provider gateways verify the edge peer identity using
-`peer_identity_trust` and reject untrusted peers before forwarding to local
-infrastructure.
-
-Public TLS certificates (for `api.example.com`) must be kept separate from Grid
-site mTLS certificates. They serve different trust domains and have different
-rotation lifecycles.
-
-### Provider credential injection
-
-The provider credential authenticates the final-hop gateway to SaaS or cloud
-provider APIs. This is handled by `grid_credential_inject` at the authorized
-final-hop point, using a mounted Secret file. Grid carries only credential
-references in the overlay, never token values.
-
-See [Authentication & Access Policy](auth.md) for the full credential flow.
-
-### Current gap: tenant and model authorization
-
-Grid's provider `accessPolicy` is site-oriented: it controls which Grid sites
-can consume a provider. An edge site's provider eligibility does not authorize
-every customer to every model. Production external service requires
-request-time tenant-to-model authorization policy that is separate from Grid's
-site-level access control. This is not yet implemented.
-
-## Current implementation status
-
-The following reflects the current state of relevant components:
-
-- **Grid routing overlays**: Grid renders per-gateway routing overlays with
-  scored candidates. The overlay format and `grid_route` consumption path are
-  implemented and validated. See [Routing](routing.md).
-
-- **Grid consumer config**: The operator can generate complete consumer Praxis
-  configurations from `GatewayRef` data, including explicit endpoint transport
-  and credential references. See [Consumer Config](consumer-config.md).
-
-- **Grid explicit endpoint transport**: The `clusterEndpoints` transport shape
-  (`mutual_tls` / `plaintext`) is implemented with fail-closed validation.
-
-- **Grid deployment package**: The `/deploy` directory provides CRDs, operator
-  manifests, and RBAC configuration.
-
-- **SWIM cross-cluster discovery**: The GLB demo wires deterministic SWIM
-  seeds through MetalLB-backed LoadBalancer Services (UDP 7946) captured by
-  Forge. Per-site GridNetwork templates reference captured SWIM LB IPs as
-  seeds, enabling operators to discover each other and propagate provider
-  state via CRDT without hard-coded Pod IPs. Provider-role sites discover
-  their own data-plane gateway address from the `provider-gateway` Service
-  `LoadBalancer` IP. An initial lookup runs at startup; a background
-  poller retries periodically (default 5 s) until the address appears and
-  continues watching for changes. Discovered addresses are pushed to the
-  SWIM runtime via a watch channel and broadcast to peers, allowing peer
-  operators to populate `GridSite` egress addresses and advance remote
-  sites to Active phase.
-
-- **Forge**: The CLI supports `doctor`, `plan`, `config`, cluster lifecycle
-  (`up`/`down`/`status`/`cluster`), service lifecycle (`service
-  start`/`stop`/`logs`/`list`), composable stack execution (`stack
-  apply`/`plan`/`status`/`list`, top-level `apply` alias), persistent state
-  with locking, Docker/Podman runtime detection, cross-cluster Docker
-  networking, template-manifest rendering with capture variables, and
-  `status --json`. Certificate management and image building are planned
-  but not yet implemented.
-
-- **`grid_route` overlay mode**: Praxis AI PR #339 introduces static candidate
-  mode for `grid_route`. Overlay-file hot reload, which would allow dynamic
-  failover without restarting the Praxis edge process, is follow-up work. Do
-  not claim dynamic in-process overlay reload until that work lands and is
-  proven.
-
-- **Provider credential injection**: Praxis AI `grid_credential_inject` is
-  separate from external caller authentication. It handles provider-side
-  credential injection at the final hop.
-
-- **Gateway peer identity**: Praxis core `peer_identity_trust` is available
-  for provider gateways to verify edge peer certificates.
-
-## POC topology
-
-The first proof-of-concept demonstrates external client ingress in a local
-development environment. It is explicitly not a production GLB deployment.
-
-### Components
-
-- **Site clusters**: Three KIND clusters (e.g. `site-us-east`,
-  `site-us-west`, `site-us-central`) on a Forge-managed container network,
-  each running Grid operator, CRDs, and site-local resources. Any site can
-  act as edge or provider for a given request flow. Two sites run inference
-  simulators and a provider gateway; one hosts the Praxis edge process.
-
-- **Praxis AI edge container**: A standalone container connected to the Forge
-  network, bound to `127.0.0.1` on the host for the POC. Configured with a
-  Grid routing overlay for its edge perspective (e.g. `edge-us-east`). Uses
-  Grid mTLS when calling provider gateways.
-
-- **Provider gateways**: Exposed only on the Forge container network (e.g. via
-  MetalLB addresses). Not exposed on host ports.
-
-### POC DNS
-
-The POC uses `curl --resolve` to emulate a stable public name without changing
-host DNS:
-
-```console
-curl --resolve api.grid.test:8443:127.0.0.1 \
-  https://api.grid.test:8443/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  --data '{"model":"shared-model","messages":[{"role":"user","content":"hello"}]}'
-```
-
-This is not a claim that Forge implements production DNS, Anycast, or global
-traffic management.
-
-### POC network path
-
-```text
-host client
-  -> 127.0.0.1:8443
-  -> standalone Praxis edge container
-  -> Forge container network
-  -> provider gateway (MetalLB address on Forge network)
+  -> stable public service name
+  -> healthy active edge selected by GTM
+  -> Grid-selected provider gateway
   -> inference backend
 ```
 
-Provider gateways and inference services do not bind host ports.
+The edge fleet is replicated. One public name does not imply one gateway
+process or a single Grid controller.
 
-### What the POC does not include
+## Component Ownership
 
-- Production DNS, Anycast, CDN, or managed GLB.
-- DDoS or WAF protection.
-- External customer authentication or tenant isolation.
-- Active-active edge fleet (single edge for the initial POC).
-- Dynamic overlay hot reload (depends on Praxis AI follow-up work).
-- Automatic failover without edge process restart (depends on overlay hot
-  reload).
+| Component | Owned behavior |
+|---|---|
+| Global traffic manager | Public DNS/Anycast, client-to-edge proximity and latency steering, edge health withdrawal, controlled failback, public-edge DDoS/WAF integration. |
+| Grid operator | Site/provider discovery, policy eligibility, provider and metric state, edge-perspective scoring, admission state, ordered overlay generation. |
+| Overlay distribution | Delivery of a versioned local snapshot to the edge without entering the request path. |
+| Praxis AI edge | External identity/policy filters, model extraction, `grid_route`, session binding, selected-cluster metadata, provider credential injection when the edge is the final hop. |
+| Praxis provider gateway | Edge-peer authentication, destination-side authorization, provider-local limits/policy, and private backend forwarding. |
+| Praxis core / Pingora | Listener TLS, mTLS, peer identity extraction, connection pooling, health checks, load balancing, timeouts, graceful drain, and upstream I/O. |
 
-## Production requirements
+Grid is a routing control plane. It does not proxy inference traffic. Praxis AI
+does not join SWIM or query Kubernetes, Grid operators, DNS control APIs, or
+the filesystem while processing a request.
 
-The following are required for production external service but are not
-implemented or proven today. They are listed here as architectural
-requirements, not as claims of current capability.
+## Request Path
 
-### Active-active edge fleet
-
-Run at least two edge instances in separate failure domains. Each edge
-receives its own routing overlay rendered for its location perspective. An
-edge must continue serving its loaded overlay during temporary control-plane
-disconnection.
-
-### Route-aware edge readiness
-
-Praxis's generic readiness behavior must be reviewed for multi-provider Grid
-use. Marking the whole edge unready because any single provider is unavailable
-is too strict. A route-aware readiness policy should consider whether at least
-one eligible route exists for the public service.
-
-### Overlay freshness and readiness policy
-
-Last-known-good routing is necessary, but serving an old snapshot indefinitely
-is not a complete production policy. Production deployments need overlay
-revision tracking, reload success/failure counters, configurable readiness
-thresholds, and optional hard expiry for environments that must fail closed.
-
-### Public TLS separate from Grid mTLS
-
-Public server certificates for the external endpoint must be separate from Grid
-site mTLS certificates. They serve different trust domains.
-
-### External customer authentication and tenant authorization
-
-External callers must be authenticated before `grid_route` runs. Tenant-to-model
-authorization must be enforced before routing. Grid's site-oriented
-`accessPolicy` does not cover per-tenant model authorization.
-
-### Rate, concurrency, and body limits
-
-Edge gateways need maximum connections, request/response body size limits,
-per-client and global rate limits, concurrency limits appropriate for
-long-running inference, and upstream timeouts.
-
-### No unsafe automatic POST replay
-
-OpenAI-compatible inference calls are `POST` requests that can consume
-expensive capacity even when the client never receives the response. Proxies
-must not automatically replay a request after request bytes may have reached a
-provider. Safe pre-connect failover (before the upstream request is sent) is
-acceptable.
-
-### Streaming drain behavior
-
-SSE inference streams are long-lived requests. Edge shutdown must stop
-accepting new traffic and give existing streams time to complete. Active
-streams must not be migrated between edges or providers.
-
-### Managed DDoS/WAF/global traffic steering
-
-Praxis should not replace a managed DDoS/WAF/Anycast service. Production
-deployment should place the Praxis edge fleet behind the organization's
-approved internet edge.
-
-### Observability
-
-Production deployments need request-level metadata including edge site/region,
-requested model, selected provider site/cluster, overlay revision and age,
-route decision reason, and auth/rate-limit outcomes. Prompts, tokens, API keys,
-and provider credentials must not be logged.
-
-## Location-aware affinity
-
-Location is a property of the edge deployment, not a client-controlled routing
-header.
-
-Each edge has a configured routing perspective:
+The external edge pipeline is ordered so hard security and policy decisions
+run before provider preference:
 
 ```text
-edge-us-east:
-  site = edge-us-east
-  region = us-east
+request ID and trusted forwarding metadata
+  -> external caller authentication
+  -> tenant/model/region authorization
+  -> rate, concurrency, and body limits
+  -> model or capability extraction
+  -> optional logical-model classification
+  -> Grid candidate matching
+  -> established-session binding or new-session selection
+  -> provider cluster selection
+  -> gateway-to-gateway mTLS
 ```
 
-The global traffic manager steers the client to the nearest healthy edge. Grid
-then orders provider candidates for that edge's perspective, considering
-policy eligibility, provider health and capacity, location affinity, cost, and
-deterministic tie-breaking.
+The provider gateway authenticates the edge again and applies its own local
+authorization. Discovery at the edge does not authorize access at the
+destination.
 
-Per-edge location scoring is implemented via site-level geography comparison.
-The operator derives a locality tier (`same_site`, `same_zone`, `same_region`,
-`cross_region`, `unknown`) by comparing the consumer gateway's `GridSite`
-region and zone against each provider's `GridSite` region and zone.  This
-locality tier, together with threshold-based admission state, drives the
-candidate ordering in the overlay.  See [Routing — Candidate scoring and
-ordering](routing.md#candidate-scoring-and-ordering) for the full ordering
-contract.
+The selected overlay `cluster` names a pre-authorized Praxis load-balancer
+cluster. Overlay updates can change candidate eligibility and ordering. They
+do not create arbitrary endpoints, CA roots, client keys, or SNI values on the
+request path.
 
-The `backendKind`-based locality score still contributes to the scoring
-signal within each locality tier, but the primary ordering dimension is now
-the geography-derived tier.
+## Control-Plane Path
 
-Hysteresis and semantic routing remain future work.
+```text
+local provider CRDs and observed metrics
+  + remote authenticated SWIM/CRDT state
+  + GridSite lifecycle and access policy
+  -> per-edge eligibility, admission, locality, and scoring
+  -> versioned routing overlay ConfigMap
+  -> projected Kubernetes volume
+  -> strict validation and atomic in-memory swap in Praxis AI
+  -> loaded revision exposed by gateway status
+```
 
-Location is an affinity, not a hard pin. A healthy cross-region provider must
-be preferred over an unavailable same-region provider.
+The edge serves an accepted last-known-good snapshot during a bounded
+control-plane interruption. A rejected update never replaces the accepted
+snapshot. Overlay age and public route coverage feed edge readiness.
 
-Spoofed client location headers (e.g. `X-Region`, `X-Country`) must not
-influence routing. Location trust comes from the edge's own configured
-identity and the global traffic manager's selection, not from client-supplied
-headers.
+## Routing Order
 
-## Deterministic failure behavior (target)
+Hard gates precede preferences:
 
-The following failure modes describe target behavior for production external
-service.  They are not all enforced by the current implementation.
+1. authenticated tenant and model authorization;
+2. capability availability and destination trust;
+3. residency, external-egress, and sovereignty policy;
+4. provider/site lifecycle, health freshness, and admission;
+5. logical route class for configured aliases;
+6. established-session binding;
+7. new-session locality tier;
+8. Grid selection tier and rank;
+9. deterministic selection among candidates Grid marks equivalent.
 
-- Unknown model: 404 or OpenAI-compatible error, not random fallback.
-- No eligible provider: 503 with bounded error.
-- Invalid overlay update: last-known-good remains active.
-- Expired overlay: readiness degrades or requests fail according to policy.
-- Provider loss: only new requests move; in-flight requests are not replayed.
-- All providers unavailable: fail closed with `Retry-After`.
+Location is a property of the edge's trusted deployment identity. Client
+headers such as `X-Region`, `X-Country`, or internal route-class headers do not
+control Grid locality.
 
-## Related documents
+Grid computes site distance from the edge `GridSite` and provider `GridSite`:
 
-- [Architecture Overview](overview.md)
-- [Routing](routing.md)
-- [Authentication & Access Policy](auth.md)
-- [Consumer Config](consumer-config.md)
-- [Scoring](scoring.md)
+```text
+same_site -> same_zone -> same_region -> cross_region -> unknown
+```
+
+A closer provider is preferred only while it remains eligible for the request
+class. Hard failure, policy loss, stale state, or closed admission overrides
+locality.
+
+## Provider Admission
+
+The overlay carries a bounded admission result rather than raw metric series:
+
+| State | New sessions | Established sessions |
+|---|---|---|
+| `new_and_existing` | allowed | allowed |
+| `existing_only` | denied | allowed while the binding remains valid |
+| `none` | denied | denied; the binding is replaced or the request fails |
+
+The provider site owns normalized, timestamped capacity signals. Grid owns the
+policy that turns those signals into admission state, including hysteresis,
+hold-down, expiry, and explicit drain overrides. Praxis consumes the result and
+does not reproduce Grid's metric formula.
+
+Unknown, pending, stale, or expired provider state is closed to new work in the
+external edge profile.
+
+## Session Affinity
+
+Affinity is keyed from authenticated tenant identity, a validated session ID,
+the normalized capability, and any bound route class. Source IP and
+client-supplied tenant metadata are not affinity inputs.
+
+For a new session, Praxis selects within the closest usable Grid selection
+tier. For an established session, the binding remains authoritative while the
+candidate is eligible for existing work. A `none` candidate, provider loss,
+policy loss, or capability loss breaks the binding. Recovery does not
+automatically pull a rebound session back.
+
+An in-memory binding store scopes affinity to one edge process. Active-active
+production uses an explicitly supported shared-store or signed-token contract
+with bounded TTL, entry count, creation rate, concurrency behavior, and failure
+semantics.
+
+## Authentication Boundaries
+
+External ingress has three separate credential domains.
+
+### Customer Identity
+
+The edge authenticates the external bearer token, JWT, or API key and derives a
+bounded tenant/principal context. The external client's `Authorization` header is
+removed before gateway-to-gateway or provider traffic.
+
+### Grid Peer Identity
+
+The edge presents its Grid client certificate to a provider Praxis gateway.
+The provider validates the CA chain, SNI/server identity, client certificate,
+and configured `peer_identity_trust` policy. Public server certificates and
+Grid site certificates remain separate trust domains with separate rotation.
+
+### Provider Credential
+
+The component making the final provider API call owns the provider credential.
+Grid carries a Secret reference, never credential bytes.
+
+| Route | Credential placement |
+|---|---|
+| Self-hosted backend through a provider site | Provider site, if required |
+| Remote cloud/API provider through a provider gateway | Provider site |
+| Direct API fallback from the external edge | Edge, because it is the final hop |
+| mTLS-only backend | No HTTP provider credential |
+
+Praxis AI `grid_credential_inject` maps an authorized selected candidate to a
+mounted Secret file at the final hop.
+
+## Edge Health and GTM
+
+GTM probes edge liveness and readiness separately:
+
+| Signal | Meaning |
+|---|---|
+| Liveness | Process and public listener are running. |
+| Readiness | Public TLS/auth dependencies work, an accepted overlay is within policy age, and the advertised service has minimum authorized route coverage. |
+| Drain | The edge accepts no new connections while existing streams receive a bounded completion window. |
+
+An individual provider failure does not make an otherwise useful edge unready.
+Grid removes that provider from eligible routes. Loss of all required route
+coverage, a hard-expired snapshot, or a failed security dependency makes the
+edge unready and causes GTM withdrawal.
+
+GTM steering moves new connections. It does not migrate an in-flight SSE
+stream.
+
+Route-aware readiness belongs with the accepted Grid routing snapshot because
+generic process or cluster health cannot prove that the edge has fresh, usable
+public route coverage. The traffic manager consumes readiness but never reads
+the Grid overlay or selects a provider.
+
+## Retry and Streaming Rules
+
+Inference calls are commonly non-idempotent `POST` requests. Praxis may fail
+over before sending request bytes upstream. It does not automatically replay a
+request after bytes may have reached a provider unless that API and provider
+have an explicit idempotency contract.
+
+During shutdown:
+
+1. readiness is withdrawn;
+2. new requests stop;
+3. active streams receive the configured drain interval;
+4. remaining connections close at the documented hard deadline.
+
+Provider or edge failover applies to later requests, not an active stream.
+
+## Overlay Contract
+
+The production acceptance contract uses a versioned, bounded envelope. The
+current repository emits the subset listed under `Repository Implementation`;
+revision, digest, expiry, and serving-status fields remain release gates until
+their implementation is present across Grid generation, distribution, and
+Praxis acceptance.
+
+```json
+{
+  "api_version": "grid.praxis-proxy.io/v1alpha2",
+  "grid_id": "grid-identity",
+  "network": "production",
+  "consumer": {
+    "gateway": "public-edge",
+    "site": "edge-us-east"
+  },
+  "revision": 42,
+  "content_digest": "sha256:...",
+  "generated_at": "2026-07-25T12:00:00Z",
+  "valid_until": "2026-07-25T12:05:00Z",
+  "candidates": [
+    {
+      "kind": "inference_model",
+      "name": "shared-model",
+      "site": "provider-us-east",
+      "cluster": "gateway-provider-us-east",
+      "stable_id": "sha256:...",
+      "admission_state": "new_and_existing",
+      "selection_tier": "same_region",
+      "rank": 0
+    }
+  ]
+}
+```
+
+The accepted schema defines maximum document size, candidate count, identifier
+length, duplicate behavior, supported versions, and unknown-field behavior.
+Praxis reports the loaded revision/digest, acceptance time, snapshot age, and
+last rejection reason.
+
+## Observability
+
+Every request decision records bounded internal fields:
+
+- edge site and region;
+- authenticated tenant class, without raw identity;
+- requested logical/concrete model;
+- selected provider site, cluster, admission state, tier, and rank;
+- overlay revision, digest, and age;
+- decision reason and binding outcome;
+- caller-auth, authorization, quota, and rate-limit result; and
+- upstream connection phase, without request replay.
+
+Prompts, session IDs, raw tenant identifiers, external-client credentials, provider
+credentials, private keys, and affinity secrets are never log or metric labels.
+
+Control-plane status distinguishes:
+
+```text
+desired -> rendered -> distributed -> accepted -> serving
+```
+
+This makes ConfigMap apply success distinguishable from the gateway actually
+using that revision.
+
+## Repository Implementation
+
+The Grid and Praxis integration provides:
+
+- per-`GatewayRef` routing overlay generation;
+- candidate model/site/cluster identity;
+- provider access-policy filtering;
+- operator-side scoring;
+- geography-derived locality tiers;
+- threshold-derived admission metadata;
+- `stable_id`, `rank`, and `generated_at` metadata;
+- explicit `mutual_tls` or `plaintext` endpoint transport in generated
+  consumer config;
+- SWIM membership and CRDT provider propagation;
+- provider Service address discovery and remote `GridSite` materialization;
+- Kubernetes-native provider gateway address discovery;
+- edge-local overlay ConfigMaps projected directly into Praxis pods; and
+- independently rendered overlays for each edge `GatewayRef`.
+
+Praxis core implements the generic primitives used by the completed path:
+upstream mTLS, downstream mTLS identity, `peer_identity_trust`, listeners,
+load balancing, health checks, configuration reload, and connection handling.
+
+Praxis AI owns `grid_route`, provider credential injection, AI request parsing,
+`grid_provider_route`, and the Grid-specific request-time selection contract.
+A compatible Praxis AI build provides overlay-file reload and the configured
+session-affinity behavior.
+
+The deployment contract treats a ConfigMap write and process liveness as
+control-plane observations, not serving proof. Operators use gateway status,
+snapshot age, route coverage, and request evidence to determine whether an
+edge is ready for global traffic.
+
+## Provider Boundary
+
+The `provider-gateway` Service selects only Praxis AI provider pods. Provider
+listeners require an edge certificate, validate the authorized edge identity
+with `peer_identity_trust` as the first unconditional filter, parse the
+inference model, and use an exact provider-local candidate/model/path map
+before forwarding to a private backend. That map selects a provider-local
+Secret reference; `grid_credential_inject` reads the mounted Secret and
+replaces the external-client credential only on the final backend hop. The edge
+presents its client identity and verifies the provider CA and site-specific
+SNI.
+
+`grid_route.provider_hop_clusters` defines the AI-owned serialization
+boundary. The filter always removes client-supplied `X-Grid-Peer-*` fields and
+reconstructs the selected stable candidate and hop request ID only when the
+selected cluster is explicitly allowlisted as a provider hop. Direct backend
+and API clusters remain absent from that allowlist. Praxis does not interpret
+these fields. The provider consumes them only after mTLS and
+`peer_identity_trust`;
+`grid_provider_route` then removes them, performs an exact local lookup, and
+writes provider-owned backend attribution. `X-Praxis-*` is not used for this
+wire contract because Praxis strips its reserved namespace before upstream
+requests.
+
+Gateway addresses and provider state use independent SWIM broadcast lanes. A
+gateway-only update is accepted independently of the last provider-state
+revision, so a Service port or address change cannot remain hidden behind a
+higher, unrelated CRDT revision. The receiving operator reconciles the updated
+address into the auto-discovered `GridSite.spec.egress.address`.
+
+Provider backends are private Services. Network policy admits inference
+traffic from provider-gateway workloads and explicitly authorized health
+observers; other workloads are denied. Health observers do not possess the
+provider credential.

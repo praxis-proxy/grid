@@ -25,4 +25,7 @@ pub mod vertex;
 pub struct AppState {
     /// Site identity for the `X-Grid-Demo-Provider` response header.
     pub provider_site: Arc<str>,
+
+    /// Normalized queue depth exported by the demo metrics endpoint.
+    pub queue_depth: f64,
 }

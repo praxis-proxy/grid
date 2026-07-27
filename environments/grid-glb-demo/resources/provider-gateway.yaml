@@ -9,8 +9,8 @@ metadata:
 spec:
   type: LoadBalancer
   selector:
-    app.kubernetes.io/name: mock-inference
+    app.kubernetes.io/name: provider-gateway
   ports:
-    - name: http
-      port: 8080
-      targetPort: 8080
+    - name: https-mtls
+      port: 8443
+      targetPort: https-mtls

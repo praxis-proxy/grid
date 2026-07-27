@@ -34,3 +34,4 @@ tests/env/certs/
 
 # Forge runtime state and generated files
 .forge/
+environments/grid-glb-demo/.forge.resolved.yaml

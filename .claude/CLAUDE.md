@@ -6,7 +6,7 @@ repository.
 
 ## What This Is
 
-The AI Grid: a decentralized, peer-to-peer network
+The AI Grid: a distributed, peer-to-peer network
 for AI inference routing and agentic networking
 across clusters, cloud providers, and third-party
 APIs. The Grid Operator orchestrates mesh formation,

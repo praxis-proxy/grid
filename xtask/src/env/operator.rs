@@ -364,8 +364,8 @@ pub(crate) const SWIM_ROUTING_WEST_PROVIDER: &str = "op-e2e-swim-rt-west";
 /// Time to wait after the secondary operator announces to the primary before
 /// applying the `GridNetwork` fixture.
 ///
-/// SWIM gossip converges in 1–3 s with foca's default probe interval; 10 s
-/// provides a comfortable margin on slow CI hosts.
+/// The explicit seed announcement starts convergence immediately; 10 seconds
+/// covers the exchange and scheduling variance on loaded CI hosts.
 pub(crate) const SWIM_CONVERGENCE_WAIT: Duration = Duration::from_secs(10);
 
 /// Timeout for polling the `GridNetwork` status to reach `Active`.
@@ -466,10 +466,9 @@ pub(crate) const FAILOVER_SHARED_EAST_PROVIDER: &str = "op-e2e-failover-shared-e
 
 /// Time to wait after killing the west operator before triggering a reconcile.
 ///
-/// With `foca::Config::simple()` the probe period is 1.5 s and
-/// `suspect_to_down_after` is 3 s, so a killed process is declared `Dead`
-/// within ~6 s.  20 s provides a safe margin on loaded CI hosts.
-pub(crate) const SWIM_DEAD_MEMBER_WAIT: Duration = Duration::from_secs(20);
+/// The three-site WAN membership profile uses a 30-second suspicion window.
+/// Forty-five seconds leaves headroom for probe scheduling on loaded CI hosts.
+pub(crate) const SWIM_DEAD_MEMBER_WAIT: Duration = Duration::from_secs(45);
 
 /// Timeout for polling the overlay until a remote candidate becomes `fresh=false`.
 pub(crate) const FAILOVER_STALE_POLL_TIMEOUT: Duration = Duration::from_secs(30);
@@ -478,16 +477,16 @@ pub(crate) const FAILOVER_STALE_POLL_TIMEOUT: Duration = Duration::from_secs(30)
 ///
 /// After restart the rejoining operator announces to seeds, SWIM detects it
 /// `Alive`, the east operator reconciles (triggered by `GridNetwork` bump), and the
-/// overlay is regenerated.  20 s matches [`SWIM_DEAD_MEMBER_WAIT`] and provides
-/// enough headroom on loaded CI hosts.
-pub(crate) const FAILOVER_REJOIN_WAIT: Duration = Duration::from_secs(20);
+/// overlay is regenerated. Thirty seconds provides headroom for the initial
+/// announce and reconciliation on loaded CI hosts.
+pub(crate) const FAILOVER_REJOIN_WAIT: Duration = Duration::from_secs(30);
 
 /// Timeout for polling the overlay until a remote candidate returns to `fresh=true`.
 ///
 /// Recovery requires SWIM Alive detection + east reconcile + overlay render.
 /// The reconcile is triggered by a `bump_gridnetwork` call immediately after
-/// restart, so the principal variable is SWIM convergence time (~6 s max).
-pub(crate) const FAILOVER_RECOVERY_POLL_TIMEOUT: Duration = Duration::from_secs(45);
+/// restart, so the principal variable is SWIM convergence and scheduling time.
+pub(crate) const FAILOVER_RECOVERY_POLL_TIMEOUT: Duration = Duration::from_secs(75);
 
 // ---------------------------------------------------------------------------
 // Stale-candidate TTL GC validation constants
@@ -515,16 +514,15 @@ pub(crate) const STALE_GC_REMOTE_MODEL: &str = "model-stale-gc-remote";
 
 /// TTL (seconds) configured in the test `GridNetwork`.
 ///
-/// 5 seconds is short enough that after `SWIM_DEAD_MEMBER_WAIT` (20 s) the
-/// SWIM Dead age (~14 s) reliably exceeds the TTL, triggering GC.  It is long
-/// enough to avoid false eviction during the normal setup window when no peer
-/// is Dead.
+/// Five seconds is short enough that the member's post-Dead age exceeds the
+/// TTL during [`SWIM_DEAD_MEMBER_WAIT`], triggering GC. It is long enough to
+/// avoid false eviction during the normal setup window when no peer is Dead.
 pub(crate) const STALE_GC_TTL_SECS: u32 = 5;
 
 /// Timeout for polling until the stale remote candidate is absent from the overlay.
 ///
 /// After killing west, the absence of the stale candidate requires:
-/// - SWIM dead detection (≤ 6 s with `foca::Config::simple()`)
+/// - SWIM dead detection under the configured WAN profile
 /// - Age accumulation past `STALE_GC_TTL_SECS` (5 s)
 /// - At least one `GridNetwork` reconcile (triggered by periodic bump inside the helper)
 ///
@@ -717,32 +715,51 @@ fn load_operator_image_podman(cluster_name: &str) -> Result<(), Box<dyn std::err
     Ok(())
 }
 
-/// Override the operator Deployment image for Kind validation.
+/// Override the operator Deployment image and pull policy for validation.
 ///
-/// The install manifest references the published GHCR image.
-/// Kind clusters use a locally built image instead, so this
-/// patches the Deployment's container image after manifest apply.
+/// This keeps local-image and registry-backed runs on the same install path
+/// while ensuring the selected environment overrides reach the Deployment.
 ///
 /// # Errors
 ///
 /// Returns an error if `kubectl set image` fails.
 pub(crate) fn override_operator_image_for_kind(context: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let patch = operator_image_patch();
     let status = Command::new("kubectl")
         .args([
             "--context",
             context,
-            "set",
-            "image",
+            "patch",
             "deployment/grid-operator",
             "-n",
             "grid-system",
-            &format!("operator={}", image_overrides::operator_image()),
+            "--type=strategic",
+            "-p",
+            &patch,
         ])
         .status()?;
     if !status.success() {
-        return Err("kubectl set image for grid-operator deployment failed".into());
+        return Err("kubectl patch image for grid-operator deployment failed".into());
     }
     Ok(())
+}
+
+/// Build the strategic-merge patch for the selected operator image contract.
+fn operator_image_patch() -> String {
+    serde_json::json!({
+        "spec": {
+            "template": {
+                "spec": {
+                    "containers": [{
+                        "name": "operator",
+                        "image": image_overrides::operator_image(),
+                        "imagePullPolicy": image_overrides::image_pull_policy(),
+                    }]
+                }
+            }
+        }
+    })
+    .to_string()
 }
 
 /// Patch the `grid-operator` Deployment env vars for in-cluster testing.
@@ -1237,9 +1254,8 @@ pub(crate) fn spawn_operator_with_swim_keyed(
 )]
 /// Wait `duration` for SWIM gossip to converge between peer operators.
 ///
-/// SWIM uses repeated probes on a ~1 s interval (foca `Config::simple`).
 /// Calling this after announcing the secondary operator to the primary gives
-/// time for both sides to exchange membership tables before the test reads
+/// both sides time to exchange membership tables before the test reads
 /// `GridNetwork.status.connectedSites`.
 pub(crate) fn wait_for_swim_convergence(duration: Duration) {
     eprintln!("  waiting {duration:?} for SWIM gossip convergence...");
@@ -6174,10 +6190,9 @@ pub(crate) fn apply_stale_gc_west_fixtures(context: &str, west_site: &str) -> Re
 /// # Determinism
 ///
 /// Age advances via the 1-second runtime tick independently of SWIM events.
-/// After `SWIM_DEAD_MEMBER_WAIT` (20 s) the west member's `age_secs` is
-/// typically ≥ 14 s (SWIM declares Dead within ~6 s of the kill).  With
-/// `STALE_GC_TTL_SECS = 5`, this comfortably exceeds the TTL.  The bump loop
-/// ensures a reconcile fires after each age-tick window.
+/// `SWIM_DEAD_MEMBER_WAIT` covers the WAN suspicion window and allows the west
+/// member's `age_secs` to exceed `STALE_GC_TTL_SECS`. The bump loop ensures a
+/// reconcile fires after each age-tick window.
 ///
 /// `GridNetwork`: the `operator` crate's `GridNetwork` CRD type
 #[expect(
@@ -6548,6 +6563,29 @@ pub(crate) fn delete_api_credential_secret(context: &str, namespace: &str) -> Re
 )]
 mod tests {
     use super::*;
+
+    #[test]
+    fn operator_image_patch_uses_selected_image_contract() {
+        let patch: serde_json::Value =
+            serde_json::from_str(&operator_image_patch()).expect("operator image patch must be valid JSON");
+        let container = &patch["spec"]["template"]["spec"]["containers"][0];
+
+        assert_eq!(
+            container["name"].as_str(),
+            Some("operator"),
+            "patch must target the operator container"
+        );
+        assert_eq!(
+            container["image"].as_str(),
+            Some(image_overrides::operator_image().as_str()),
+            "patch must use the selected image"
+        );
+        assert_eq!(
+            container["imagePullPolicy"].as_str(),
+            Some(image_overrides::image_pull_policy().as_str()),
+            "patch must use the selected pull policy"
+        );
+    }
 
     fn make_overlay(candidates: &[(&str, bool)]) -> serde_json::Value {
         let items: Vec<serde_json::Value> = candidates

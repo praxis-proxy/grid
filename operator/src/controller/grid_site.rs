@@ -424,6 +424,10 @@ async fn update_status(
         public_cert_pem: existing.and_then(|s| s.public_cert_pem.clone()),
     };
 
+    if !grid_site_status_needs_update(existing, &status) {
+        return Ok(());
+    }
+
     let patch = serde_json::json!({
         "apiVersion": "grid.praxis-proxy.io/v1alpha1",
         "kind": "GridSite",
@@ -436,6 +440,11 @@ async fn update_status(
     Ok(())
 }
 
+/// Return whether the status subresource differs from the desired status.
+fn grid_site_status_needs_update(current: Option<&GridSiteStatus>, desired: &GridSiteStatus) -> bool {
+    current != Some(desired)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -443,6 +452,25 @@ async fn update_status(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grid_site_status_update_is_skipped_when_semantically_unchanged() {
+        let baseline = GridSiteStatus {
+            phase: GridSitePhase::Active,
+            observed_generation: 2,
+            reason: "Ready".to_owned(),
+            message: "gateway reachable".to_owned(),
+            ..GridSiteStatus::default()
+        };
+        assert!(!grid_site_status_needs_update(Some(&baseline), &baseline));
+
+        let changed = GridSiteStatus {
+            phase: GridSitePhase::Unreachable,
+            ..baseline.clone()
+        };
+        assert!(grid_site_status_needs_update(Some(&baseline), &changed));
+        assert!(grid_site_status_needs_update(None, &baseline));
+    }
     use crate::crd::grid_site::{EgressConfig, EgressTls, GridSiteSpec};
 
     fn site_with_egress(phase: Option<GridSitePhase>, egress: &str) -> GridSite {

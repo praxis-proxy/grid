@@ -120,7 +120,21 @@ pub struct SiteCertOutput {
 /// Returns [`GenerateError`] if key generation or signing fails.
 pub fn generate_site_cert(ca: &CaCert, site_name: &str) -> Result<SiteCertOutput, GenerateError> {
     let dns_san = format!("{site_name}.grid.internal");
-    let params = build_site_params(site_name, &dns_san)?;
+    generate_dns_cert(ca, site_name, &dns_san)
+}
+
+/// Generate a certificate for an exact DNS name, signed by the given CA.
+///
+/// Unlike [`generate_site_cert`], this function does not append the Grid
+/// internal DNS suffix. Callers use it when the complete service DNS name is
+/// already known.
+///
+/// # Errors
+///
+/// Returns [`GenerateError`] if the DNS name is invalid or certificate
+/// generation fails.
+pub fn generate_dns_cert(ca: &CaCert, common_name: &str, dns_name: &str) -> Result<SiteCertOutput, GenerateError> {
+    let params = build_site_params(common_name, dns_name)?;
 
     let site_key = KeyPair::generate()?;
     let issuer = Issuer::new(ca.params.clone(), &ca.key_pair);
@@ -130,7 +144,7 @@ pub fn generate_site_cert(ca: &CaCert, site_name: &str) -> Result<SiteCertOutput
         cert_pem: cert.pem(),
         key_pem: site_key.serialize_pem(),
         organization: DEFAULT_ORGANIZATION.to_owned(),
-        sans: vec![dns_san],
+        sans: vec![dns_name.to_owned()],
     })
 }
 
@@ -261,6 +275,19 @@ mod tests {
             site.sans.first().map(String::as_str),
             Some("cluster-a.grid.internal"),
             "SAN should match site name"
+        );
+    }
+
+    #[test]
+    fn generate_dns_cert_preserves_exact_san() {
+        let ca = generate_ca("test-ca").unwrap_or_else(|_| std::process::abort());
+        let cert =
+            generate_dns_cert(&ca, "Grid demo ingress", "api.grid-glb.test").unwrap_or_else(|_| std::process::abort());
+
+        assert_eq!(
+            cert.sans,
+            ["api.grid-glb.test"],
+            "DNS SAN must not gain the Grid internal suffix"
         );
     }
 

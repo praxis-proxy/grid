@@ -39,8 +39,10 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/responses", post(responses))
         .route("/v1/models", get(list_models))
+        .route("/metrics", get(metrics))
         .route("/health", get(common::health_ok))
-        .layer(from_fn_with_state(state, common::inject_provider_header))
+        .layer(from_fn_with_state(state.clone(), common::inject_provider_header))
+        .with_state(state)
 }
 
 // ---------------------------------------------------------------------------
@@ -152,6 +154,15 @@ async fn list_models(req: Request<Body>) -> Response<Body> {
             ]
         }),
     )
+}
+
+/// Export the normalized queue-depth signal consumed by the Grid operator.
+async fn metrics(axum::extract::State(state): axum::extract::State<AppState>) -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(http::header::CONTENT_TYPE, "text/plain; version=0.0.4")
+        .body(Body::from(format!("grid_demo_queue_depth {}\n", state.queue_depth)))
+        .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -295,6 +306,7 @@ mod tests {
     fn test_state() -> AppState {
         AppState {
             provider_site: Arc::from("test-site"),
+            queue_depth: 0.25,
         }
     }
 
@@ -341,6 +353,39 @@ mod tests {
         );
         assert!(json.get("choices").is_some(), "should have choices");
         assert!(json.get("usage").is_some(), "should have usage");
+    }
+
+    #[tokio::test]
+    async fn response_captures_only_provider_owned_backend_evidence() {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(auth_header().0, auth_header().1)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("x-grid-provider-attribution", "site-us-west")
+            .header("x-grid-provider-request-id", "provider-request-1")
+            .body(Body::from(r#"{"model":"gpt-4o","stream":false}"#))
+            .unwrap_or_default();
+
+        let resp = send(req).await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(common::BACKEND_PROVIDER_CAPTURE_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some("site-us-west")
+        );
+        assert_eq!(
+            resp.headers()
+                .get(common::BACKEND_REQUEST_ID_CAPTURE_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some("provider-request-1")
+        );
+        assert!(
+            resp.headers().get(header::AUTHORIZATION).is_none(),
+            "backend evidence must never echo Authorization"
+        );
     }
 
     #[tokio::test]
@@ -392,6 +437,20 @@ mod tests {
 
         let resp = send(req).await;
         assert_eq!(resp.status(), StatusCode::OK, "health should return 200");
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_exports_normalized_queue_depth() {
+        let req = Request::builder()
+            .method("GET")
+            .uri("/metrics")
+            .body(Body::empty())
+            .unwrap_or_default();
+
+        let resp = send(req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), 4096).await.unwrap_or_default();
+        assert_eq!(body.as_ref(), b"grid_demo_queue_depth 0.25\n");
     }
 
     #[tokio::test]

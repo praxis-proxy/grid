@@ -1172,6 +1172,10 @@ async fn update_status(
         consumer_config_status: consumer_config_statuses,
     };
 
+    if !grid_network_status_needs_update(network.status.as_ref(), &status) {
+        return Ok(());
+    }
+
     let patch = serde_json::json!({
         "apiVersion": "grid.praxis-proxy.io/v1alpha1",
         "kind": "GridNetwork",
@@ -1182,6 +1186,11 @@ async fn update_status(
         .await?;
 
     Ok(())
+}
+
+/// Return whether the status subresource differs from the desired status.
+fn grid_network_status_needs_update(current: Option<&GridNetworkStatus>, desired: &GridNetworkStatus) -> bool {
+    current != Some(desired)
 }
 
 // ---------------------------------------------------------------------------
@@ -2461,6 +2470,26 @@ mod tests {
             "status.gridId must be returned when spec.gridId is empty, \
              preserving a previously negotiated ID across operator restarts"
         );
+    }
+
+    #[test]
+    fn grid_network_status_update_is_skipped_when_semantically_unchanged() {
+        let baseline = GridNetworkStatus {
+            connected_sites: 2,
+            distributed_provider_count: 2,
+            grid_id: "grid-id".to_owned(),
+            observed_generation: 3,
+            phase: GridNetworkPhase::Active,
+            consumer_config_status: Vec::new(),
+        };
+        assert!(!grid_network_status_needs_update(Some(&baseline), &baseline));
+
+        let changed = GridNetworkStatus {
+            distributed_provider_count: 1,
+            ..baseline.clone()
+        };
+        assert!(grid_network_status_needs_update(Some(&baseline), &changed));
+        assert!(grid_network_status_needs_update(None, &baseline));
     }
 
     #[test]

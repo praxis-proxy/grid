@@ -42,7 +42,7 @@ Grid sits above the Praxis data plane:
 | Layer | Role |
 |---|---|
 | **Grid Operator** | Kubernetes control plane. Watches Grid CRDs, exchanges provider state, scores candidates, renders `grid-config.json`, and manages Grid trust material. |
-| **Praxis AI** | AI-aware gateway. Runs request parsing, `grid_route`, optional `grid_credential_inject`, llm-d/ext_proc support, and AI-specific packaging. |
+| **Praxis AI** | AI-aware gateway. Runs request parsing, `grid_route`, the AI-owned `X-Grid-Peer-*` provider-hop contract, exact `grid_provider_route`, optional `grid_credential_inject`, llm-d/ext_proc support, and AI-specific packaging. |
 | **Praxis Core** | Generic proxy/filter runtime. Owns listeners, filter pipelines, load balancing, `endpoint_selector`, `ext_proc`, `peer_identity_trust`, TLS integration, and request context. |
 | **Pingora** | Low-level async proxy engine under Praxis. Handles TCP/TLS, HTTP codecs, connection pooling, and upstream I/O. |
 
@@ -284,8 +284,7 @@ management. Praxis AI is the L7 AI router and data-plane target, not the
 complete global traffic-management system.
 
 See [External Client Ingress](external-ingress.md) for the full design,
-ownership boundaries, authentication model, POC topology, and production
-requirements.
+ownership boundaries, authentication model, and production contract.
 
 ## Boundaries to Keep in Mind
 

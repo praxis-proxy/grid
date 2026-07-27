@@ -5,6 +5,8 @@ pub(crate) mod config;
 pub(crate) mod consumer;
 pub(crate) mod gateway;
 pub(crate) mod glb;
+pub(crate) mod glb_demo;
+pub(crate) mod gtm_emulator;
 pub(crate) mod image_overrides;
 pub(crate) mod images;
 pub(crate) mod kind;
@@ -708,15 +710,58 @@ pub(crate) enum Action {
         site: Option<String>,
     },
 
-    /// Verify GLB ingress failover readiness.
+    /// Verify Grid routing and the secure provider boundary.
     ///
-    /// Checks prerequisites (tools, forge binary, placeholder images),
-    /// then runs a 10-step structured verification of the GLB demo
-    /// environment from cluster health through edge inference routing.
-    /// Steps requiring running services are marked `BLOCKED` when
-    /// placeholder images are detected.
-    VerifyGridGlbIngress {
+    /// Covers Grid discovery, edge-local overlays, provider topology, mTLS and
+    /// peer policy, backend privacy, credential replacement, inference
+    /// routing, provider affinity and drain, hot reload, and pod stability.
+    VerifyGridGlbRouting {
         /// Path to the Forge environment config file.
+        #[arg(long, default_value = "environments/grid-glb-demo/forge.yaml")]
+        forge_config: PathBuf,
+    },
+
+    /// Generate and install GLB demo edge/provider mTLS material.
+    ///
+    /// Run after Forge has created the five Kind clusters and before starting
+    /// the edge/provider Praxis workloads. The command stages distinct east
+    /// and west edge client certificates, the stable emulator ingress
+    /// certificate, and the Kubernetes TLS/credential Secrets.
+    PrepareGridGlbProviderBoundary,
+
+    /// Verify the two-edge Praxis GTM emulator through one stable HTTPS name.
+    ///
+    /// Proves that two independent Kubernetes Praxis edges are reachable
+    /// through the local GTM stand-in, that a session header is consistently
+    /// mapped, and that scaling either edge to zero withdraws it without
+    /// changing the client URL. The edge is restored before this command exits.
+    VerifyGridGlbGtmEmulator {
+        /// Path to the Forge environment config file.
+        #[arg(long, default_value = "environments/grid-glb-demo/forge.yaml")]
+        forge_config: PathBuf,
+    },
+
+    /// Run the narrated GLB scenario collection with runtime evidence.
+    ///
+    /// Runs the secure provider-boundary and hot-reload proof, discovers live
+    /// edge/provider path combinations, proves session affinity, and performs
+    /// Kubernetes edge withdrawal and recovery through the GTM emulator.
+    DemonstrateGridGlb {
+        /// Path to the Forge environment config file.
+        #[arg(long, default_value = "environments/grid-glb-demo/forge.yaml")]
+        forge_config: PathBuf,
+    },
+
+    /// Create the complete local GLB environment from image overrides.
+    SetupGridGlb {
+        /// Path to the source Forge environment config file.
+        #[arg(long, default_value = "environments/grid-glb-demo/forge.yaml")]
+        forge_config: PathBuf,
+    },
+
+    /// Create the environment, then run the narrated GLB scenario collection.
+    RunGridGlbDemo {
+        /// Path to the source Forge environment config file.
         #[arg(long, default_value = "environments/grid-glb-demo/forge.yaml")]
         forge_config: PathBuf,
     },
@@ -778,7 +823,12 @@ pub(crate) fn run(action: &Action) -> Result<(), Box<dyn std::error::Error>> {
         Action::VerifyFailoverUnderLostPeer { config } => env_verify_failover_under_lost_peer(config),
         Action::VerifyStaleGcTtl { config } => env_verify_stale_gc_ttl(config),
         Action::VerifyOperatorInstallRbac { config, site } => env_verify_operator_install_rbac(config, site.as_deref()),
-        Action::VerifyGridGlbIngress { forge_config } => glb::verify_glb_ingress(forge_config),
+        Action::VerifyGridGlbRouting { forge_config } => glb::verify_grid_routing(forge_config),
+        Action::PrepareGridGlbProviderBoundary => glb::prepare_provider_boundary(),
+        Action::VerifyGridGlbGtmEmulator { forge_config } => gtm_emulator::verify(forge_config),
+        Action::DemonstrateGridGlb { forge_config } => glb_demo::demonstrate(forge_config),
+        Action::SetupGridGlb { forge_config } => glb_demo::setup(forge_config).map(|_| ()),
+        Action::RunGridGlbDemo { forge_config } => glb_demo::run(forge_config),
     }
 }
 
@@ -4340,7 +4390,7 @@ fn env_verify_failover_under_lost_peer(config: &Path) -> Result<(), Box<dyn std:
         "  [OK] west operator killed; waiting {}s for SWIM to declare peer Dead...",
         SWIM_DEAD_MEMBER_WAIT.as_secs()
     );
-    // foca::Config::simple(): probe_period=1.5s, suspect_to_down=3s → Dead in ≤6s.
+    // The wait includes the WAN suspicion window plus CI scheduling headroom.
     #[expect(
         clippy::disallowed_methods,
         reason = "bounded wait for SWIM dead detection after operator kill"
@@ -4575,10 +4625,9 @@ fn env_verify_failover_under_lost_peer(config: &Path) -> Result<(), Box<dyn std:
 ///
 /// **Why this is deterministic:**
 ///
-/// The TTL is set to `STALE_GC_TTL_SECS = 5 s`.  After killing the west operator,
-/// `SWIM_DEAD_MEMBER_WAIT` (20 s) provides a safe window for SWIM to declare west Dead
-/// (typically within ~6 s).  At that point `MemberRecord.age_secs` is approximately
-/// 14 s (20 s wait − 6 s SWIM dead detection), which comfortably exceeds the 5 s TTL.
+/// The TTL is set to `STALE_GC_TTL_SECS = 5 s`. After killing the west operator,
+/// `SWIM_DEAD_MEMBER_WAIT` covers the configured WAN suspicion window and enough
+/// post-Dead time for `MemberRecord.age_secs` to exceed the TTL.
 ///
 /// The `wait_for_remote_candidate_absent` helper bumps the `GridNetwork` every 5 s so
 /// a reconcile fires after each age-tick window.  Each reconcile calls
@@ -5198,11 +5247,19 @@ fn env_verify_operator_install_rbac(config: &Path, site: Option<&str>) -> Result
     operator::install_grid_crds(&context)?;
     operator::cleanup_install_rbac_test_resources(&context)?;
 
-    // Step 2: build operator image + load into Kind.
-    eprintln!("verify-operator-install-rbac: [2/11] building operator image...");
-    operator::build_operator_image()?;
-    operator::load_operator_image(&cluster_name)?;
-    eprintln!("  [OK] operator image built and loaded into {cluster_name}");
+    // Step 2: prepare the selected local or registry-backed operator image.
+    eprintln!("verify-operator-install-rbac: [2/11] preparing operator image...");
+    if image_overrides::should_skip_kind_image_loading() {
+        eprintln!(
+            "  [OK] using registry-backed operator image {} with pull policy {}",
+            image_overrides::operator_image(),
+            image_overrides::image_pull_policy()
+        );
+    } else {
+        operator::build_operator_image()?;
+        operator::load_operator_image(&cluster_name)?;
+        eprintln!("  [OK] operator image built and loaded into {cluster_name}");
+    }
 
     // Step 3: apply install manifests.
     eprintln!("verify-operator-install-rbac: [3/11] applying install manifests...");
