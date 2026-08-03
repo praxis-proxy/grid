@@ -377,6 +377,7 @@ fn resolve_exec_args(command: &[String], config_dir: &Path) -> Result<Vec<String
         .collect()
 }
 
+/// Resolve one exec argument, optionally absolutizing relative paths.
 fn resolve_exec_arg(idx: usize, arg: &str, config_dir: &Path) -> Result<String, ForgeError> {
     if idx == 0 && !arg.contains('/') {
         return Ok(arg.to_owned());
@@ -1186,7 +1187,11 @@ mod tests {
         let env = BTreeMap::from([("GIE_VERSION".to_owned(), "v1.5.0".to_owned())]);
         let command = vec!["bash".to_owned(), "-c".to_owned(), "true".to_owned()];
         execute_exec(&runner, &command, &env, dir.path()).unwrap_or_else(|_| std::process::abort());
-        let call = runner.calls().into_iter().next().unwrap_or_else(|| std::process::abort());
+        let call = runner
+            .calls()
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| std::process::abort());
         assert_eq!(
             call.env.get(std::ffi::OsStr::new("GIE_VERSION")),
             Some(&std::ffi::OsString::from("v1.5.0")),
@@ -1197,14 +1202,16 @@ mod tests {
     #[test]
     fn render_exec_env_and_url_sha256_from_properties() {
         let mut tpl = make_template_context();
-        tpl.properties.insert("gieVersion".to_owned(), serde_json::json!("v1.5.0"));
-        tpl.properties.insert(
-            "gatewayApiSha256".to_owned(),
-            serde_json::json!("abc123"),
-        );
+        tpl.properties
+            .insert("gieVersion".to_owned(), serde_json::json!("v1.5.0"));
+        tpl.properties
+            .insert("gatewayApiSha256".to_owned(), serde_json::json!("abc123"));
         let exec = StepSpec::Exec {
             command: vec!["bash".to_owned(), "scripts/install-gie-crds.sh".to_owned()],
-            env: BTreeMap::from([("GIE_VERSION".to_owned(), "{{ cluster.properties.gieVersion }}".to_owned())]),
+            env: BTreeMap::from([(
+                "GIE_VERSION".to_owned(),
+                "{{ cluster.properties.gieVersion }}".to_owned(),
+            )]),
         };
         let rendered = render_step(&exec, &tpl).unwrap_or_else(|_| std::process::abort());
         let StepSpec::Exec { env, .. } = rendered else {
@@ -1228,11 +1235,10 @@ mod tests {
     fn exec_rejects_path_escape() {
         let dir = tempfile::tempdir().unwrap_or_else(|_| std::process::abort());
         let command = vec!["bash".to_owned(), "../outside.sh".to_owned()];
-        let err = resolve_exec_args(&command, dir.path()).expect_err("escape must fail");
-        assert!(
-            err.to_string().contains("must not escape"),
-            "unexpected error: {err}"
-        );
+        let Err(err) = resolve_exec_args(&command, dir.path()) else {
+            std::process::abort();
+        };
+        assert!(err.to_string().contains("must not escape"), "unexpected error: {err}");
     }
 
     #[test]

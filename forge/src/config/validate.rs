@@ -812,11 +812,7 @@ fn check_wait_step(stack_name: &str, resource: &str, condition: &str, timeout: &
 }
 
 /// Validate an exec step.
-fn check_exec_step(
-    stack_name: &str,
-    command: &[String],
-    env: &BTreeMap<String, String>,
-) -> Result<(), ForgeError> {
+fn check_exec_step(stack_name: &str, command: &[String], env: &BTreeMap<String, String>) -> Result<(), ForgeError> {
     if command.is_empty() {
         return Err(ForgeError::Validation(format!(
             "stack {stack_name:?}: exec command must not be empty"
