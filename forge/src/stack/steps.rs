@@ -203,7 +203,7 @@ pub fn kubectl_wait_spec(
 /// # Errors
 ///
 /// Returns [`ForgeError::Config`] if the command array is empty.
-pub fn exec_spec(command: &[String]) -> Result<CommandSpec, ForgeError> {
+pub fn exec_spec(command: &[String], env: &BTreeMap<String, String>) -> Result<CommandSpec, ForgeError> {
     let program = command
         .first()
         .ok_or_else(|| ForgeError::Config("exec step has empty command".to_owned()))?;
@@ -215,7 +215,10 @@ pub fn exec_spec(command: &[String]) -> Result<CommandSpec, ForgeError> {
             .iter()
             .map(std::ffi::OsString::from)
             .collect(),
-        env: BTreeMap::default(),
+        env: env
+            .iter()
+            .map(|(k, v)| (std::ffi::OsString::from(k), std::ffi::OsString::from(v)))
+            .collect(),
         stdin: None,
         redact: Vec::new(),
     })

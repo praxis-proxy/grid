@@ -12,14 +12,20 @@ This profile is for MaaS + Praxis integration work. It is **not** the Grid multi
 
 ## Pins
 
+Version and namespace pins live in `forge.yaml` cluster `properties`. Stacks
+template them into URL steps and `exec.env`; `scripts/lib.sh` defaults are only
+fallbacks for running scripts outside Forge.
 
-| Component     | Version                                                |
-| ------------- | ------------------------------------------------------ |
-| Istio         | 1.30.3 (`ENABLE_GATEWAY_API_INFERENCE_EXTENSION=true`) |
-| Gateway API   | 1.5.1                                                  |
-| GIE CRDs      | v1.5.0                                                 |
-| Kuadrant Helm | 1.3.1                                                  |
-| cert-manager  | 1.17.2                                                 |
+
+| Component     | Property / env                         |
+| ------------- | -------------------------------------- |
+| MetalLB       | `metallbVersion` (+ `metallbSha256`)   |
+| Gateway API   | `gatewayApiVersion` (+ sha256)         |
+| GIE CRDs      | `gieVersion` → `GIE_VERSION`           |
+| Istio         | `istioVersion` → `ISTIO_VERSION`       |
+| cert-manager  | `certManagerVersion` (+ sha256)        |
+| Kuadrant Helm | `kuadrantVersion` → `KUADRANT_VERSION` |
+| Namespaces    | `maasNamespace`, `gatewayNamespace`    |
 
 
 
@@ -27,7 +33,8 @@ This profile is for MaaS + Praxis integration work. It is **not** the Grid multi
 ## Prerequisites
 
 - Docker, `kind`, `kubectl`, `kustomize` (≥5.7), `helm`, `jq`, `curl` (or `wget`), `openssl`, `python3`
-- `istioctl` is **not** required on PATH — `scripts/install-istio.sh` fetches `${ISTIO_VERSION}` (default 1.30.3) into `demos/maas-ipp/.cache/`
+- `istioctl` is **not** required on PATH — `scripts/install-istio.sh` fetches
+  `cluster.properties.istioVersion` (via `ISTIO_VERSION`) into `demos/maas-ipp/.cache/`
 - Optional for arm64 LLMIS build: `gh`, `docker buildx`
 - A local checkout of [models-as-a-service](https://github.com/opendatahub-io/models-as-a-service):
 

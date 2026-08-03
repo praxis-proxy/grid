@@ -26,11 +26,18 @@ spec:
         - maas-platform
         - maas-fixtures
       properties:
-        istioVersion: "1.30.3"
+        # Single source of truth for pin versions / namespaces.
+        # Stacks template these into URL steps and exec env; lib.sh defaults
+        # only apply when scripts are run outside Forge.
+        metallbVersion: "v0.14.9"
+        metallbSha256: "951065e85692aa106f1bb5d5a487d9306154923a794ab1d82122881cbaf588e4"
         gatewayApiVersion: "1.5.1"
+        gatewayApiSha256: "751002b3b91a87f7ae3bd2517c79a47a8d7ed6702901808a1cf9bd97d284f9b8"
         gieVersion: "v1.5.0"
-        kuadrantVersion: "1.3.1"
+        istioVersion: "1.30.3"
         certManagerVersion: "1.17.2"
+        certManagerSha256: "dab2794176629d8042ce97b885f378dfe4ef7b5bed5859e9f06616ead9980f4b"
+        kuadrantVersion: "1.3.1"
         maasNamespace: maas-system
         gatewayNamespace: istio-system
 
@@ -39,8 +46,8 @@ spec:
       description: MetalLB load balancer with Kind docker-network IP pool
       steps:
         - type: url
-          url: https://raw.githubusercontent.com/metallb/metallb/v0.14.9/config/manifests/metallb-native.yaml
-          sha256: 951065e85692aa106f1bb5d5a487d9306154923a794ab1d82122881cbaf588e4
+          url: https://raw.githubusercontent.com/metallb/metallb/{{ cluster.properties.metallbVersion }}/config/manifests/metallb-native.yaml
+          sha256: "{{ cluster.properties.metallbSha256 }}"
         - type: wait
           resource: deployment/controller
           namespace: metallb-system
@@ -53,21 +60,25 @@ spec:
             - kind-maas-ipp-{{ cluster.name }}
 
     gateway-api:
-      description: Gateway API 1.5.1 CRDs + Inference Extension (GIE) CRDs
+      description: Gateway API CRDs + Inference Extension (GIE) CRDs
       steps:
         - type: url
-          url: https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.5.1/standard-install.yaml
-          sha256: 751002b3b91a87f7ae3bd2517c79a47a8d7ed6702901808a1cf9bd97d284f9b8
+          url: https://github.com/kubernetes-sigs/gateway-api/releases/download/v{{ cluster.properties.gatewayApiVersion }}/standard-install.yaml
+          sha256: "{{ cluster.properties.gatewayApiSha256 }}"
         - type: exec
+          env:
+            GIE_VERSION: "{{ cluster.properties.gieVersion }}"
           command:
             - bash
             - scripts/install-gie-crds.sh
             - kind-maas-ipp-{{ cluster.name }}
 
     istio:
-      description: Istio 1.30.3 minimal with Gateway API Inference Extension enabled
+      description: Istio minimal with Gateway API Inference Extension enabled
       steps:
         - type: exec
+          env:
+            ISTIO_VERSION: "{{ cluster.properties.istioVersion }}"
           command:
             - bash
             - scripts/install-istio.sh
@@ -82,8 +93,8 @@ spec:
       description: cert-manager + Kind TLS CA chain for maas-api
       steps:
         - type: url
-          url: https://github.com/cert-manager/cert-manager/releases/download/v1.17.2/cert-manager.yaml
-          sha256: dab2794176629d8042ce97b885f378dfe4ef7b5bed5859e9f06616ead9980f4b
+          url: https://github.com/cert-manager/cert-manager/releases/download/v{{ cluster.properties.certManagerVersion }}/cert-manager.yaml
+          sha256: "{{ cluster.properties.certManagerSha256 }}"
         - type: wait
           resource: deployment/cert-manager
           namespace: cert-manager
@@ -95,15 +106,20 @@ spec:
           condition: available
           timeout: "180s"
         - type: exec
+          env:
+            MAAS_NAMESPACE: "{{ cluster.properties.maasNamespace }}"
           command:
             - bash
             - scripts/install-maas-tls.sh
             - kind-maas-ipp-{{ cluster.name }}
 
     kuadrant:
-      description: Kuadrant 1.3.1 + Authorino CA trust for maas-api
+      description: Kuadrant + Authorino CA trust for maas-api
       steps:
         - type: exec
+          env:
+            KUADRANT_VERSION: "{{ cluster.properties.kuadrantVersion }}"
+            MAAS_NAMESPACE: "{{ cluster.properties.maasNamespace }}"
           command:
             - bash
             - scripts/install-kuadrant.sh
@@ -113,6 +129,9 @@ spec:
       description: Postgres, MaaS/KServe CRDs, Gateway, stock maas-controller (deploys IPP)
       steps:
         - type: exec
+          env:
+            MAAS_NAMESPACE: "{{ cluster.properties.maasNamespace }}"
+            GATEWAY_NAMESPACE: "{{ cluster.properties.gatewayNamespace }}"
           command:
             - bash
             - scripts/install-maas-platform.sh
@@ -122,6 +141,9 @@ spec:
       description: ExternalModel + llm-d sim LLMInferenceService + subscription/auth fixtures
       steps:
         - type: exec
+          env:
+            MAAS_NAMESPACE: "{{ cluster.properties.maasNamespace }}"
+            GATEWAY_NAMESPACE: "{{ cluster.properties.gatewayNamespace }}"
           command:
             - bash
             - scripts/install-maas-fixtures.sh

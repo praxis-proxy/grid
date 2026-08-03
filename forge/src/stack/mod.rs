@@ -567,7 +567,7 @@ fn step_description(step: &crate::config::StepSpec) -> String {
         crate::config::StepSpec::Deployment { name, image, .. } => format!("deploy {name} ({image})"),
         crate::config::StepSpec::Service { name, port, .. } => format!("service {name}:{port}"),
         crate::config::StepSpec::Wait { resource, .. } => format!("wait {resource}"),
-        crate::config::StepSpec::Exec { command } => command
+        crate::config::StepSpec::Exec { command, .. } => command
             .first()
             .map_or_else(|| "exec <empty>".to_owned(), |p| format!("exec {p}")),
         crate::config::StepSpec::ForEach { property, steps } => format!("for-each {property} ({} steps)", steps.len()),

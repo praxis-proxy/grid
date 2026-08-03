@@ -571,7 +571,7 @@ fn check_step(stack_name: &str, step: &StepSpec) -> Result<(), ForgeError> {
             timeout,
             ..
         } => check_wait_step(stack_name, resource, condition, timeout),
-        StepSpec::Exec { command } => check_exec_step(stack_name, command),
+        StepSpec::Exec { command, env } => check_exec_step(stack_name, command, env),
         StepSpec::ForEach { property, steps } => check_for_each_step(stack_name, property, steps),
         StepSpec::MetallbAutoPool { name } => check_named_resource_step(stack_name, "metallb pool", name, None),
         StepSpec::CoreDnsForward { zone, upstreams } => check_coredns_forward_step(stack_name, zone, upstreams),
@@ -712,13 +712,25 @@ fn check_url_step(stack_name: &str, url: &str, sha256: &str) -> Result<(), Forge
 }
 
 /// Validate a SHA-256 hex digest.
+///
+/// Full-field template expressions are allowed; they must resolve to a
+/// 64-character hex digest at apply time before content verification.
 fn check_sha256(value: &str, context: &str) -> Result<(), ForgeError> {
+    if is_full_field_template(value) {
+        return Ok(());
+    }
     if value.len() != 64 || !value.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(ForgeError::Validation(format!(
             "{context}: expected a 64-character SHA-256 hex digest"
         )));
     }
     Ok(())
+}
+
+/// True when `value` is a single `{{ ... }}` template expression.
+fn is_full_field_template(value: &str) -> bool {
+    let trimmed = value.trim();
+    trimmed.starts_with("{{") && trimmed.ends_with("}}") && trimmed.matches("{{").count() == 1
 }
 
 /// Validate a path that must stay relative to the config root.
@@ -800,7 +812,11 @@ fn check_wait_step(stack_name: &str, resource: &str, condition: &str, timeout: &
 }
 
 /// Validate an exec step.
-fn check_exec_step(stack_name: &str, command: &[String]) -> Result<(), ForgeError> {
+fn check_exec_step(
+    stack_name: &str,
+    command: &[String],
+    env: &BTreeMap<String, String>,
+) -> Result<(), ForgeError> {
     if command.is_empty() {
         return Err(ForgeError::Validation(format!(
             "stack {stack_name:?}: exec command must not be empty"
@@ -808,6 +824,21 @@ fn check_exec_step(stack_name: &str, command: &[String]) -> Result<(), ForgeErro
     }
     for arg in command {
         check_non_blank(arg, &format!("stack {stack_name:?}: exec command argument"))?;
+    }
+    for (key, value) in env {
+        check_exec_env_key(stack_name, key)?;
+        check_non_blank(value, &format!("stack {stack_name:?}: exec env value for {key:?}"))?;
+    }
+    Ok(())
+}
+
+/// Validate an exec environment variable name.
+fn check_exec_env_key(stack_name: &str, key: &str) -> Result<(), ForgeError> {
+    check_non_blank(key, &format!("stack {stack_name:?}: exec env key"))?;
+    if !is_shell_safe_ident(key) {
+        return Err(ForgeError::Validation(format!(
+            "stack {stack_name:?}: exec env key {key:?} is not a valid identifier"
+        )));
     }
     Ok(())
 }
@@ -1229,6 +1260,25 @@ spec:
     }
 
     #[test]
+    fn templated_sha256_accepted() {
+        let mut config = base_config();
+        config.spec.stacks.insert(
+            "base".to_owned(),
+            StackSpec {
+                description: None,
+                steps: vec![StepSpec::Url {
+                    url: "https://example.invalid/install.yaml".to_owned(),
+                    sha256: "{{ cluster.properties.artifactSha256 }}".to_owned(),
+                }],
+            },
+        );
+        assert!(
+            validate(&config).is_ok(),
+            "full-field sha256 templates must be allowed at validate time"
+        );
+    }
+
+    #[test]
     fn invalid_sha256_rejected() {
         let mut config = base_config();
         config.spec.stacks.insert(
@@ -1249,13 +1299,36 @@ spec:
     }
 
     #[test]
+    fn invalid_exec_env_key_rejected() {
+        let mut config = base_config();
+        config.spec.stacks.insert(
+            "base".to_owned(),
+            StackSpec {
+                description: None,
+                steps: vec![StepSpec::Exec {
+                    command: vec!["true".to_owned()],
+                    env: BTreeMap::from([("BAD-KEY".to_owned(), "x".to_owned())]),
+                }],
+            },
+        );
+        let Err(err) = validate(&config) else {
+            std::process::abort();
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("env key"), "expected env key error, got: {msg}");
+    }
+
+    #[test]
     fn empty_exec_command_rejected() {
         let mut config = base_config();
         config.spec.stacks.insert(
             "base".to_owned(),
             StackSpec {
                 description: None,
-                steps: vec![StepSpec::Exec { command: Vec::new() }],
+                steps: vec![StepSpec::Exec {
+                    command: Vec::new(),
+                    env: BTreeMap::new(),
+                }],
             },
         );
         let Err(err) = validate(&config) else {

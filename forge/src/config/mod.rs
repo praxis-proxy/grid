@@ -436,6 +436,9 @@ pub enum StepSpec {
     Exec {
         /// Command to run.
         command: Vec<String>,
+        /// Extra environment variables for the process (values are templated).
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        env: BTreeMap<String, String>,
     },
     /// Iterate over a cluster property array.
     ForEach {
