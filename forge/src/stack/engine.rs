@@ -254,7 +254,7 @@ fn execute_step(
             let output = runner.run(&spec)?;
             steps::check_success(&output, "kubectl wait").map(|()| 1)
         },
-        StepSpec::Exec { command } => execute_exec(runner, command).map(|()| 1),
+        StepSpec::Exec { command } => execute_exec(runner, command, &sc.config_dir).map(|()| 1),
         StepSpec::ForEach { property, steps: sub } => execute_foreach(runner, property, sub, tpl, sc),
         StepSpec::MetallbAutoPool { name } => execute_metallb(runner, name, sc).map(|()| 1),
         StepSpec::CoreDnsForward { .. } => execute_coredns_forward(runner, step, sc).map(|()| 1),
@@ -352,10 +352,44 @@ fn execute_service(
 }
 
 /// Execute an arbitrary command.
-fn execute_exec(runner: &dyn CommandRunner, command: &[String]) -> Result<(), ForgeError> {
-    let spec = steps::exec_spec(command)?;
+fn execute_exec(runner: &dyn CommandRunner, command: &[String], config_dir: &Path) -> Result<(), ForgeError> {
+    let resolved = resolve_exec_args(command, config_dir)?;
+    let spec = steps::exec_spec(&resolved)?;
     let output = runner.run(&spec)?;
     steps::check_success(&output, "exec")
+}
+
+/// Resolve relative path arguments in an exec step against the config directory.
+///
+/// Bare program names stay on `PATH`. Relative paths that exist under
+/// `config_dir` become absolute so stacks work regardless of process cwd.
+/// Path escape (`..`) is rejected.
+fn resolve_exec_args(command: &[String], config_dir: &Path) -> Result<Vec<String>, ForgeError> {
+    command
+        .iter()
+        .enumerate()
+        .map(|(idx, arg)| resolve_exec_arg(idx, arg, config_dir))
+        .collect()
+}
+
+fn resolve_exec_arg(idx: usize, arg: &str, config_dir: &Path) -> Result<String, ForgeError> {
+    if idx == 0 && !arg.contains('/') {
+        return Ok(arg.to_owned());
+    }
+    if Path::new(arg).is_absolute() || arg.starts_with('-') {
+        return Ok(arg.to_owned());
+    }
+    if arg.split('/').any(|part| part == "..") {
+        return Err(ForgeError::Config(format!(
+            "exec path '{arg}' must not escape the config root"
+        )));
+    }
+    let candidate = config_dir.join(arg);
+    if candidate.exists() {
+        Ok(candidate.to_string_lossy().into_owned())
+    } else {
+        Ok(arg.to_owned())
+    }
 }
 
 /// Capture a kubectl jsonpath result into pending state.
@@ -1093,6 +1127,49 @@ mod tests {
         let result = execute_steps(&runner, &steps, &tpl, &mut sc);
         assert!(result.is_err(), "rendered path escape must fail");
         assert_eq!(runner.call_count(), 0, "must fail before kubectl");
+    }
+
+    #[test]
+    fn exec_resolves_relative_script_against_config_dir() {
+        let dir = tempfile::tempdir().unwrap_or_else(|_| std::process::abort());
+        let scripts = dir.path().join("scripts");
+        std::fs::create_dir(&scripts).unwrap_or_else(|_| std::process::abort());
+        let script = scripts.join("install.sh");
+        std::fs::write(&script, "#!/bin/true\n").unwrap_or_else(|_| std::process::abort());
+
+        let mut runner = MockRunner::new();
+        runner.respond("bash", ok_output());
+        let command = vec![
+            "bash".to_owned(),
+            "scripts/install.sh".to_owned(),
+            "kind-maas-ipp-local".to_owned(),
+        ];
+        execute_exec(&runner, &command, dir.path()).unwrap_or_else(|_| std::process::abort());
+
+        let calls = runner.calls();
+        let call = calls.first().unwrap_or_else(|| std::process::abort());
+        assert_eq!(call.program, "bash");
+        assert_eq!(
+            call.args.first().map(|a| a.to_string_lossy().into_owned()),
+            Some(script.to_string_lossy().into_owned()),
+            "script path must resolve under config_dir"
+        );
+        assert_eq!(
+            call.args.get(1).map(|a| a.to_string_lossy().into_owned()).as_deref(),
+            Some("kind-maas-ipp-local"),
+            "non-path args must stay unchanged"
+        );
+    }
+
+    #[test]
+    fn exec_rejects_path_escape() {
+        let dir = tempfile::tempdir().unwrap_or_else(|_| std::process::abort());
+        let command = vec!["bash".to_owned(), "../outside.sh".to_owned()];
+        let err = resolve_exec_args(&command, dir.path()).expect_err("escape must fail");
+        assert!(
+            err.to_string().contains("must not escape"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

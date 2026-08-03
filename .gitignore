@@ -38,3 +38,6 @@ demos/grid-glb-demo/.forge.resolved.yaml
 
 # Helm chart packaging artifacts
 *.tgz
+
+# Demo-local tool caches (e.g. fetched istioctl)
+demos/**/.cache/

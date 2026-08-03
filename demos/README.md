@@ -28,6 +28,14 @@ consumer gateway, a separately secured provider gateway, and a private
 inference endpoint. The directory currently records the standalone demo
 contract in a validated, runnable environment.
 
+## MaaS IPP lab
+
+The [MaaS IPP lab](maas-ipp/README.md) is a single-cluster Forge environment
+that brings up the stock Models-as-a-Service Kind path (Istio Gateway, Kuadrant
+auth, controller-owned IPP EnvoyFilters, llm-d sim). Use it to develop and
+validate MaaS dataplane changes before swapping IPP for Praxis in the
+controller.
+
 ## Existing-Cluster Installation
 
 For deploying Grid onto existing Kubernetes clusters (rather than disposable

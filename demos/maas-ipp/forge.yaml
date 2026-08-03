@@ -1,0 +1,128 @@
+apiVersion: forge.praxis.dev/v1alpha1
+kind: Environment
+
+metadata:
+  name: maas-ipp
+
+spec:
+  runtime:
+    provider: docker
+    clusterPrefix: maas-ipp
+
+  network:
+    # Single-cluster lab. MetalLB pool is configured via scripts/install-metallb-pool.sh
+    # (forge metallb-auto-pool requires crossCluster: true).
+    crossCluster: false
+    dnsZone: maas-ipp.test
+
+  clusters:
+    - name: local
+      stacks:
+        - metallb
+        - gateway-api
+        - istio
+        - cert-manager
+        - kuadrant
+        - maas-platform
+        - maas-fixtures
+      properties:
+        istioVersion: "1.30.3"
+        gatewayApiVersion: "1.5.1"
+        gieVersion: "v1.5.0"
+        kuadrantVersion: "1.3.1"
+        certManagerVersion: "1.17.2"
+        maasNamespace: maas-system
+        gatewayNamespace: istio-system
+
+  stacks:
+    metallb:
+      description: MetalLB load balancer with Kind docker-network IP pool
+      steps:
+        - type: url
+          url: https://raw.githubusercontent.com/metallb/metallb/v0.14.9/config/manifests/metallb-native.yaml
+          sha256: 951065e85692aa106f1bb5d5a487d9306154923a794ab1d82122881cbaf588e4
+        - type: wait
+          resource: deployment/controller
+          namespace: metallb-system
+          condition: available
+          timeout: "180s"
+        - type: exec
+          command:
+            - bash
+            - scripts/install-metallb-pool.sh
+            - kind-maas-ipp-{{ cluster.name }}
+
+    gateway-api:
+      description: Gateway API 1.5.1 CRDs + Inference Extension (GIE) CRDs
+      steps:
+        - type: url
+          url: https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.5.1/standard-install.yaml
+          sha256: 751002b3b91a87f7ae3bd2517c79a47a8d7ed6702901808a1cf9bd97d284f9b8
+        - type: exec
+          command:
+            - bash
+            - scripts/install-gie-crds.sh
+            - kind-maas-ipp-{{ cluster.name }}
+
+    istio:
+      description: Istio 1.30.3 minimal with Gateway API Inference Extension enabled
+      steps:
+        - type: exec
+          command:
+            - bash
+            - scripts/install-istio.sh
+            - kind-maas-ipp-{{ cluster.name }}
+        - type: wait
+          resource: deployment/istiod
+          namespace: istio-system
+          condition: available
+          timeout: "180s"
+
+    cert-manager:
+      description: cert-manager + Kind TLS CA chain for maas-api
+      steps:
+        - type: url
+          url: https://github.com/cert-manager/cert-manager/releases/download/v1.17.2/cert-manager.yaml
+          sha256: dab2794176629d8042ce97b885f378dfe4ef7b5bed5859e9f06616ead9980f4b
+        - type: wait
+          resource: deployment/cert-manager
+          namespace: cert-manager
+          condition: available
+          timeout: "180s"
+        - type: wait
+          resource: deployment/cert-manager-webhook
+          namespace: cert-manager
+          condition: available
+          timeout: "180s"
+        - type: exec
+          command:
+            - bash
+            - scripts/install-maas-tls.sh
+            - kind-maas-ipp-{{ cluster.name }}
+
+    kuadrant:
+      description: Kuadrant 1.3.1 + Authorino CA trust for maas-api
+      steps:
+        - type: exec
+          command:
+            - bash
+            - scripts/install-kuadrant.sh
+            - kind-maas-ipp-{{ cluster.name }}
+
+    maas-platform:
+      description: Postgres, MaaS/KServe CRDs, Gateway, stock maas-controller (deploys IPP)
+      steps:
+        - type: exec
+          command:
+            - bash
+            - scripts/install-maas-platform.sh
+            - kind-maas-ipp-{{ cluster.name }}
+
+    maas-fixtures:
+      description: ExternalModel + llm-d sim LLMInferenceService + subscription/auth fixtures
+      steps:
+        - type: exec
+          command:
+            - bash
+            - scripts/install-maas-fixtures.sh
+            - kind-maas-ipp-{{ cluster.name }}
