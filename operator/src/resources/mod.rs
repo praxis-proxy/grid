@@ -38,6 +38,8 @@ pub mod secret;
 /// Trust bundle management for grid mTLS.
 pub mod trust_bundle;
 
+/// Shared TLS material resolution and validation for endpoint probes.
+pub(crate) mod endpoint_tls;
 /// Typed gateway probe outcome and phase-transition contracts.
 pub(crate) mod gateway_probe;
 /// TLS gateway probe — bounded handshake and peer certificate extraction.

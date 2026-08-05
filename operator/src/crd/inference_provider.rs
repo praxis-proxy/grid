@@ -199,14 +199,15 @@ pub struct MetricsConfig {
     /// resolved or contain invalid material, the scrape is skipped entirely.
     /// The scraper never falls back to system roots or plain HTTP.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tls: Option<MetricsTlsConfig>,
+    pub tls: Option<EndpointTlsConfig>,
 }
 
-/// TLS configuration for metrics endpoint scraping.
+/// TLS configuration for endpoint scraping or health probes.
 ///
-/// Controls how the operator verifies the metrics server's identity and,
+/// Controls how the operator verifies the remote server's identity and,
 /// optionally, authenticates itself to the server via a client certificate
-/// (mutual TLS / mTLS).
+/// (mutual TLS / mTLS).  Used by both `metricsConfig.tls` and
+/// `healthCheck.tls`.
 ///
 /// Secret references include explicit `namespace` and `name` fields.
 /// The operator reads referenced Secrets during reconciliation —
@@ -229,7 +230,7 @@ pub struct MetricsConfig {
 /// [`rustls::ClientConfig`]: rustls::ClientConfig
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct MetricsTlsConfig {
+pub struct EndpointTlsConfig {
     /// Reference to a Secret containing the CA certificate PEM for server
     /// verification.
     ///
@@ -357,8 +358,26 @@ pub struct ModelInfo {
 }
 
 /// Health check configuration.
+///
+/// The probe URL is `{endpoint}{path}` when `endpoint` is set, or
+/// `{spec.endpoint}{path}` when absent.  This allows pointing health
+/// probes at a different service (e.g. an llm-d EPP health endpoint)
+/// while `spec.endpoint` points at the inference backend.
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct HealthCheckConfig {
+    /// Base URL for health probes, independent of `spec.endpoint`.
+    ///
+    /// When set, the probe URL is `{endpoint}{path}` instead of
+    /// `{spec.endpoint}{path}`.  This allows probing a separate service
+    /// (such as an llm-d EPP) while the provider inference endpoint
+    /// points at the pool's request path.
+    ///
+    /// When absent, the probe URL uses `spec.endpoint` as before.
+    #[schemars(length(min = 1))]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+
     /// Check interval (e.g. "30s").
     pub interval: Option<String>,
 
@@ -367,6 +386,19 @@ pub struct HealthCheckConfig {
 
     /// Timeout per check (e.g. "5s").
     pub timeout: Option<String>,
+
+    /// TLS configuration for the health probe endpoint.
+    ///
+    /// When set, the operator uses the provided CA certificate for TLS server
+    /// verification and optionally presents a client certificate for mutual TLS
+    /// (mTLS).  When absent, the probe uses system root certificates
+    /// (backward-compatible).
+    ///
+    /// **Fail-closed:** when configured but the referenced Secrets cannot be
+    /// resolved or contain invalid material, the probe is skipped entirely.
+    /// The operator never falls back to system roots or plain HTTP.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<EndpointTlsConfig>,
 }
 
 // ---------------------------------------------------------------------------
@@ -392,13 +424,15 @@ pub struct InferenceProviderStatus {
     /// Machine-readable reason for the current phase when not `Available`.
     ///
     /// Set when the provider cannot reach `Available` due to a configuration,
-    /// credential, or metrics collection error.  `None` when the provider is
-    /// `Available`, `Pending`, or the reason is unknown.
+    /// credential, or metrics/health-check collection error.  `None` when the
+    /// provider is `Available`, `Pending`, or the reason is unknown.
     ///
     /// Stable reason values:
     /// - `UnsupportedAuthStrategy`, `CredentialSecretRefInvalid`, `CredentialSecretMissing`,
     ///   `CredentialSecretKeyMissing`, `CredentialSecretValueInvalid`
     /// - `MetricsTlsSecretMissing`, `MetricsTlsKeyMissing`, `MetricsTlsMaterialInvalid`, `MetricsTlsIdentityMismatch`
+    /// - `HealthCheckTlsSecretMissing`, `HealthCheckTlsKeyMissing`, `HealthCheckTlsMaterialInvalid`,
+    ///   `HealthCheckTlsIdentityMismatch`, `HealthCheckTlsResolutionFailed`
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
 }
@@ -517,6 +551,37 @@ mod tests {
         assert!(
             spec_properties.contains_key("metricsConfig"),
             "CRD schema must include metricsConfig field"
+        );
+    }
+
+    #[test]
+    fn inference_provider_crd_health_check_has_endpoint_and_tls_fields() {
+        let crd = crd_json();
+        let hc_properties = crd
+            .pointer(
+                "/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties/healthCheck/properties",
+            )
+            .and_then(serde_json::Value::as_object)
+            .unwrap_or_else(|| std::process::abort());
+        assert!(
+            hc_properties.contains_key("endpoint"),
+            "healthCheck must include endpoint field"
+        );
+        assert!(
+            hc_properties.contains_key("tls"),
+            "healthCheck must include tls field"
+        );
+        assert!(
+            hc_properties.contains_key("path"),
+            "healthCheck must include path field"
+        );
+        assert!(
+            hc_properties.contains_key("interval"),
+            "healthCheck must include interval field"
+        );
+        assert!(
+            hc_properties.contains_key("timeout"),
+            "healthCheck must include timeout field"
         );
     }
 

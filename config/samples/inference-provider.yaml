@@ -44,10 +44,23 @@ spec:
       matchLabels: {}
 
   # Health check
+  # endpoint: overrides spec.endpoint as the base URL for health probes.
+  #   Useful when health and inference endpoints are separate services
+  #   (e.g. an llm-d EPP health endpoint vs the pool request path).
+  # tls: CA and optional client certificate for HTTPS health probes
+  #   using non-public CAs (e.g. OCP service CA, custom EPP certs).
   healthCheck:
+    # endpoint: https://epp-service:9090
     path: /v1/complete
     interval: "60s"
     timeout: "10s"
+    # tls:
+    #   caSecretRef:
+    #     name: backend-ca
+    #     namespace: grid-system
+    #   clientCertificateSecretRef:
+    #     name: client-cert
+    #     namespace: grid-system
 
   # No metrics scraping for external API
   metricsConfig: null

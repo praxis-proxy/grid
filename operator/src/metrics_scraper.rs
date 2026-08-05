@@ -296,7 +296,7 @@ fn build_native_connector()
 }
 
 /// Build an HTTPS-only connector using a custom [`rustls::ClientConfig`].
-fn build_custom_tls_connector(
+pub(crate) fn build_custom_tls_connector(
     config: &rustls::ClientConfig,
 ) -> hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector> {
     hyper_rustls::HttpsConnectorBuilder::new()
