@@ -11,15 +11,21 @@ rules:
   #   - TLS site certificate (tls.crt, tls.key for mTLS client auth)
   #   - SWIM encryption key (swimKeyRef)
   #   - Credential Secrets (existence + key validation only)
+  #   - Metrics TLS CA and client certificate Secrets
   #
   # Write paths:
   #   - Grid CA certificate Secret (ca.crt, ca.key)
   #   - Grid site certificate Secret (tls.crt, tls.key)
   #
+  # The operator reads Secrets by explicit namespace/name during
+  # reconciliation — no cluster-wide list or watch.  TLS material
+  # rotation is detected by bounded requeue (60s for TLS-configured
+  # providers).
+  #
   # All writes use server-side apply (patch).  SSA on a non-existent
   # resource requires create permission, so both create and patch are
-  # granted.  delete, list, and watch are not granted.  The namespace
-  # for each Secret is declared in the CRD spec (SecretRef.namespace).
+  # granted.  The namespace for each Secret is declared in the CRD
+  # spec (SecretRef.namespace).
   - apiGroups: [""]
     resources: ["secrets"]
     verbs: ["get", "create", "patch"]

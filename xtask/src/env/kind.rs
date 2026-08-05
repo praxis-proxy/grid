@@ -18,8 +18,6 @@ const CLUSTER_PREFIX: &str = "grid-";
 
 /// Container image for llm-d inference simulator.
 const INFERENCE_SIM_IMAGE: &str = "ghcr.io/llm-d/llm-d-inference-sim:latest";
-
-
 /// Kubernetes Deployment and Service name for the `openai` provider backend.
 pub(crate) const MOCK_OPENAI_SVC: &str = "mock-openai-provider";
 

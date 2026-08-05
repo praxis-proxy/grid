@@ -471,6 +471,10 @@ spec:
       prefixCacheHitRatio: provider_prefix_cache_hit_ratio
       errorRate: provider_error_rate
       healthy: provider_healthy
+    tls:
+      caSecretRef:
+        name: metrics-ca
+        namespace: grid-system
 ```
 
 **Phases**: Pending → Available → Degraded → Unavailable
@@ -530,6 +534,7 @@ feeds the resulting `BackendMetrics` into overlay scoring.
 | `timeout` | `2s` | Scrape timeout. `s` and `ms` suffixes are recognized. |
 | `signalNames` | all unset | Mapping from scoring signals to Prometheus metric names. |
 | `staleMetricsSeconds` | absent | Grace period (seconds) for using a cached sample when the current scrape fails.  When absent, scrape failures immediately produce neutral scoring.  Minimum: `1`. |
+| `tls` | absent | TLS configuration for metrics scraping.  See [TLS and mTLS](#tls-and-mtls). |
 
 Providers without `metricsConfig`, providers with failed scrapes (outside any
 configured grace period), and signals without configured metric names use neutral
@@ -546,6 +551,77 @@ in the routing architecture for the full semantics.
 | `prefixCacheHitRatio` | Prefix-cache hit ratio from `0.0` to `1.0`. |
 | `errorRate` | Error rate from `0.0` to `1.0`. |
 | `healthy` | Health gauge interpreted by the metrics parser. |
+
+#### TLS and mTLS
+
+`metricsConfig.tls` enables Secret-backed TLS (and optionally mutual TLS)
+for metrics scraping.  When configured, the operator resolves PEM material
+from Kubernetes Secrets at reconcile time and uses it for all scrape
+requests to this provider's metrics endpoint.
+
+| Field | Required | Meaning |
+|-------|----------|---------|
+| `tls.caSecretRef` | yes | Secret containing the CA certificate for server verification. Default key: `ca.crt`. |
+| `tls.clientCertificateSecretRef` | no | Secret containing client certificate and private key for mTLS. |
+| `tls.clientCertificateSecretRef.certificateKey` | no | Key within `Secret.data` for the certificate PEM. Default: `tls.crt`. |
+| `tls.clientCertificateSecretRef.privateKeyKey` | no | Key within `Secret.data` for the private key PEM. Default: `tls.key`. |
+
+`caSecretRef` follows the same [`SecretRef`](#secretref) schema used by
+`spec.auth.secretRef`.  `clientCertificateSecretRef` adds explicit
+`certificateKey` and `privateKeyKey` fields with serde defaults.
+
+**Failure behavior**: when TLS material cannot be resolved or parsed, the
+provider phase is downgraded from `Available` to `Degraded` with a
+machine-readable `status.reason`:
+
+| Reason | Category | Meaning |
+|--------|----------|---------|
+| `MetricsTlsSecretMissing` | reconcile-time | A referenced Secret does not exist. |
+| `MetricsTlsKeyMissing` | reconcile-time | The expected key is absent from `Secret.data`. |
+| `MetricsTlsMaterialInvalid` | reconcile-time | PEM material could not be parsed. |
+| `MetricsTlsIdentityMismatch` | reconcile-time | Client certificate and private key do not match. |
+| `MetricsTlsHandshakeFailed` | scrape-time | TLS handshake failed (wrong CA, expired cert, hostname mismatch). |
+| `MetricsUnauthorized` | scrape-time | Metrics endpoint returned HTTP 401 or 403. |
+| `MetricsScrapeTimeout` | scrape-time | Metrics scrape timed out before receiving a response. |
+
+Scrape-time failures are logged with the classified reason.  The provider
+falls back to the stale metrics cache (if `staleMetricsSeconds` is set) or
+is excluded from routing with `UNOBSERVABLE_METRICS` (`healthy: false`).
+
+There is no `insecureSkipVerify` option.
+
+Example (one-way TLS):
+
+```yaml
+metricsConfig:
+  path: /metrics
+  timeout: 2s
+  signalNames:
+    queueDepth: vllm:num_requests_waiting
+  tls:
+    caSecretRef:
+      name: metrics-ca
+      namespace: grid-system
+```
+
+Example (mTLS):
+
+```yaml
+metricsConfig:
+  path: /metrics
+  timeout: 2s
+  signalNames:
+    queueDepth: vllm:num_requests_waiting
+  tls:
+    caSecretRef:
+      name: metrics-ca
+      namespace: grid-system
+    clientCertificateSecretRef:
+      name: metrics-client-cert
+      namespace: grid-system
+      certificateKey: tls.crt
+      privateKeyKey: tls.key
+```
 
 #### Queue depth normalization
 

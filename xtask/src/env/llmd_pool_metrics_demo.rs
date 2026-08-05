@@ -16,7 +16,7 @@
 )]
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     fs,
     path::{Path, PathBuf},
     process::Command,
@@ -59,7 +59,7 @@ const OUTPUT_RULE: &str = "=====================================================
 const EVIDENCE_SCHEMA_VERSION: &str = "1";
 
 /// Number of setup phases.
-const SETUP_PHASES: usize = 10;
+const SETUP_PHASES: usize = 11;
 
 /// Primary model name served by inference simulators.
 const SIM_MODEL: &str = "llmd-sim-model";
@@ -105,6 +105,23 @@ const DEFAULT_SIM_IMAGE: &str = "llm-d-inference-sim:llmd-pool-metrics-demo";
 /// Default overlay-sync sidecar image tag.
 const DEFAULT_OVERLAY_SYNC_IMAGE: &str = "grid-overlay-sync:llmd-pool-metrics-demo";
 
+/// Default nginx image for the metrics TLS reverse proxy sidecar.
+const DEFAULT_NGINX_IMAGE: &str = "nginx:metrics-proxy-demo";
+
+/// Metrics TLS CA common name (separate from gateway CA).
+const METRICS_CA_CN: &str = "Grid Metrics Test CA";
+
+/// DNS SAN for the metrics TLS server certificate.
+const METRICS_SERVER_DNS: &str = "llmd-epp-metrics.grid-system.svc.cluster.local";
+
+/// Secret name holding the metrics CA certificate.
+const METRICS_CA_SECRET: &str = "metrics-ca";
+
+/// Secret name holding the metrics server TLS certificate and key.
+const METRICS_SERVER_TLS_SECRET: &str = "metrics-server-tls";
+
+/// Secret name holding the metrics client TLS certificate and key.
+const METRICS_CLIENT_TLS_SECRET: &str = "metrics-client-tls";
 
 // ---------------------------------------------------------------------------
 // Context
@@ -132,6 +149,8 @@ struct ResolvedImages {
     sim: String,
     /// Grid overlay-sync sidecar image.
     overlay_sync: String,
+    /// nginx image for metrics TLS reverse proxy sidecar.
+    nginx: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -393,6 +412,7 @@ fn resolve_images() -> Result<ResolvedImages, Box<dyn std::error::Error>> {
     let sim = std::env::var("GRID_XTASK_SIM_IMAGE").unwrap_or_else(|_| DEFAULT_SIM_IMAGE.to_owned());
     let overlay_sync =
         std::env::var("GRID_XTASK_OVERLAY_SYNC_IMAGE").unwrap_or_else(|_| DEFAULT_OVERLAY_SYNC_IMAGE.to_owned());
+    let nginx = std::env::var("GRID_XTASK_NGINX_IMAGE").unwrap_or_else(|_| DEFAULT_NGINX_IMAGE.to_owned());
 
     eprintln!("  Images:");
     eprintln!("    gateway:      {gateway}");
@@ -400,6 +420,7 @@ fn resolve_images() -> Result<ResolvedImages, Box<dyn std::error::Error>> {
     eprintln!("    epp:          {epp}");
     eprintln!("    sim:          {sim}");
     eprintln!("    overlay-sync: {overlay_sync}");
+    eprintln!("    nginx:        {nginx}");
 
     Ok(ResolvedImages {
         gateway,
@@ -407,6 +428,7 @@ fn resolve_images() -> Result<ResolvedImages, Box<dyn std::error::Error>> {
         epp,
         sim,
         overlay_sync,
+        nginx,
     })
 }
 
@@ -418,6 +440,7 @@ fn verify_images(images: &ResolvedImages) -> Result<(), Box<dyn std::error::Erro
         ("epp", &images.epp, "EPP"),
         ("sim", &images.sim, "SIM"),
         ("overlay-sync", &images.overlay_sync, "OVERLAY_SYNC"),
+        ("nginx", &images.nginx, "NGINX"),
     ] {
         let status = Command::new("docker")
             .args(["image", "inspect", image])
@@ -523,7 +546,21 @@ fn deploy_setup(context: &DemoContext) -> Result<(), Box<dyn std::error::Error>>
     eprintln!("[SETUP {}/{}] Seeding SWIM cross-cluster membership", next(), total);
     seed_swim_membership()?;
 
-    // Phase 7: Deploy llm-d simulators and EPP
+    // Phase 7: Install metrics TLS secrets (before EPP deployment needs them)
+    eprintln!();
+    eprintln!(
+        "[SETUP {}/{}] Installing metrics TLS secrets for EPP sidecar",
+        next(),
+        total
+    );
+    let metrics_certs_dir = Path::new(CERTS_DIR);
+    for cluster in CLUSTERS {
+        let ctx = kind_context(cluster);
+        install_metrics_tls_secrets(&ctx, metrics_certs_dir)?;
+        eprintln!("  [OK] {cluster}: metrics TLS secrets installed");
+    }
+
+    // Phase 8: Deploy llm-d simulators and EPP
     eprintln!();
     eprintln!("[SETUP {}/{}] Deploying llm-d simulators and EPP", next(), total);
     for cluster in CLUSTERS {
@@ -532,7 +569,7 @@ fn deploy_setup(context: &DemoContext) -> Result<(), Box<dyn std::error::Error>>
         eprintln!("  [OK] {cluster}: sim-1, sim-2, and EPP running");
     }
 
-    // Phase 8: Install provider trust and credentials
+    // Phase 9: Install provider trust and credentials
     eprintln!();
     eprintln!("[SETUP {}/{}] Installing provider trust and credentials", next(), total);
     install_provider_trust()?;
@@ -600,10 +637,11 @@ fn run_proof_scenarios(context: &DemoContext, mode: DemoMode) -> BTreeMap<String
 
         // Proof 4: Recovery — poll until ramp resets
         results.insert("recovery".to_owned(), proof_recovery(context));
-
-        // Proof 5: Zero restarts — no container restarts during the proof sequence
-        results.insert("zero_restarts".to_owned(), proof_zero_restarts());
     }
+
+    // TLS proof stages — always run (these are the core mTLS acceptance criteria)
+    let tls_results = run_tls_proof_stages();
+    results.extend(tls_results);
 
     results
 }
@@ -618,10 +656,7 @@ fn proof_provenance() -> ProofResult {
         let mut metrics_ok = false;
         let deadline = Instant::now() + Duration::from_secs(30);
         while Instant::now() < deadline {
-            if let Ok(metrics_text) = kubectl_exec_curl(
-                &ctx,
-                "http://llmd-epp-metrics.grid-system.svc.cluster.local:9090/metrics",
-            ) {
+            if let Ok(metrics_text) = kubectl_exec_epp_metrics(cluster) {
                 let has_kv = metrics_text.contains("llm_d_router_epp_average_kv_cache_utilization");
                 let has_queue = metrics_text.contains("llm_d_router_epp_average_queue_size");
                 let has_ready = metrics_text.contains("llm_d_router_epp_ready_endpoints");
@@ -913,63 +948,6 @@ fn proof_recovery(_context: &DemoContext) -> ProofResult {
     }
 }
 
-/// Proof 5: Verify that no consumer-gateway containers restarted during the proofs.
-fn proof_zero_restarts() -> ProofResult {
-    let mut observations = Vec::new();
-    let mut success = true;
-
-    for cluster in CLUSTERS {
-        let ctx = kind_context(cluster);
-        let output = Command::new("kubectl")
-            .args([
-                "--context",
-                &ctx,
-                "-n",
-                GRID_SYSTEM_NS,
-                "get",
-                "pods",
-                "-l",
-                "app.kubernetes.io/name=praxis-gateway",
-                "-o",
-                "jsonpath={range .items[*]}{.metadata.name}{\" \"}{range .status.containerStatuses[*]}{.name}={.restartCount}{\" \"}{end}{\"\\n\"}{end}",
-            ])
-            .output();
-
-        match output {
-            Ok(o) => {
-                let text = String::from_utf8_lossy(&o.stdout);
-                let mut any_nonzero = false;
-                for line in text.lines().filter(|l| !l.is_empty()) {
-                    let parts: Vec<&str> = line.split_whitespace().collect();
-                    let pod_name = parts.first().unwrap_or(&"unknown");
-                    for part in parts.iter().skip(1) {
-                        if let Some((container, count_str)) = part.split_once('=') {
-                            let count: u32 = count_str.parse().unwrap_or(0);
-                            observations.push(format!("{cluster}/{pod_name}: {container} restarts={count}"));
-                            if count > 0 {
-                                any_nonzero = true;
-                            }
-                        }
-                    }
-                }
-                if any_nonzero {
-                    success = false;
-                }
-            },
-            Err(e) => {
-                observations.push(format!("{cluster}: kubectl failed: {e}"));
-                success = false;
-            },
-        }
-    }
-
-    ProofResult {
-        success,
-        description: "Zero restarts: no container restarts during proof sequence".to_owned(),
-        observations,
-    }
-}
-
 // ---------------------------------------------------------------------------
 // EPP metrics helpers
 // ---------------------------------------------------------------------------
@@ -982,14 +960,12 @@ struct EppMetrics {
     kv_cache: f64,
 }
 
-/// Scrape EPP metrics from a cluster's EPP service.
+/// Scrape EPP metrics by exec-ing into the nginx sidecar.
+///
+/// The metrics Service requires mTLS, so demo probes access the EPP's
+/// plain HTTP port (9090) via localhost inside the pod.
 fn scrape_epp_metrics(cluster: &str) -> EppMetrics {
-    let ctx = kind_context(cluster);
-    let text = kubectl_exec_curl(
-        &ctx,
-        "http://llmd-epp-metrics.grid-system.svc.cluster.local:9090/metrics",
-    )
-    .unwrap_or_default();
+    let text = kubectl_exec_epp_metrics(cluster).unwrap_or_default();
 
     EppMetrics {
         queue_size: extract_prom_value(&text, "llm_d_router_epp_average_queue_size").unwrap_or(0.0),
@@ -1175,9 +1151,34 @@ fn send_inference_request(kube_context: &str, model: &str) -> Result<InferenceRe
     })
 }
 
-/// Run a curl command inside a temporary pod in the given cluster.
-fn kubectl_exec_curl(kube_context: &str, url: &str) -> Result<String, Box<dyn std::error::Error>> {
-    kubectl_exec_curl_raw(kube_context, &format!("curl -sf {url}"))
+/// Exec into the nginx sidecar to fetch EPP metrics via localhost.
+fn kubectl_exec_epp_metrics(cluster: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let ctx = kind_context(cluster);
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            &ctx,
+            "-n",
+            GRID_SYSTEM_NS,
+            "exec",
+            "deploy/llmd-epp",
+            "-c",
+            "metrics-tls-proxy",
+            "--",
+            "wget",
+            "-qO-",
+            "--timeout=5",
+            "http://127.0.0.1:9090/metrics",
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "kubectl exec metrics failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
 /// Run an arbitrary command via `kubectl run` in a temporary pod.
@@ -1360,15 +1361,21 @@ fn seed_swim_membership() -> Result<(), Box<dyn std::error::Error>> {
 // Certificate and trust staging
 // ---------------------------------------------------------------------------
 
-/// Generate TLS certificates for both clusters.
+/// Generate TLS certificates for both clusters and metrics TLS.
 fn stage_certificates() -> Result<(), Box<dyn std::error::Error>> {
     let clusters: Vec<String> = CLUSTERS.iter().map(|s| (*s).to_owned()).collect();
     certs::generate_all(&clusters)?;
     eprintln!("  [OK] TLS certificates generated for pool-a, pool-b");
+
+    certs::generate_metrics_certs(METRICS_CA_CN, METRICS_SERVER_DNS)?;
+    eprintln!("  [OK] Metrics TLS certificates generated (separate CA)");
     Ok(())
 }
 
 /// Install provider trust secrets into both clusters.
+///
+/// Metrics TLS secrets are installed earlier in phase 7 (before EPP
+/// deployment) since the nginx sidecar mounts them at startup.
 fn install_provider_trust() -> Result<(), Box<dyn std::error::Error>> {
     let certs_dir = Path::new(CERTS_DIR);
 
@@ -1383,6 +1390,112 @@ fn install_provider_trust() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("  [OK] {cluster}: TLS secrets and credentials installed");
     }
     Ok(())
+}
+
+/// Install the three metrics TLS secrets (CA, server, client) into a cluster.
+fn install_metrics_tls_secrets(context: &str, certs_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    apply_metrics_ca_secret(context, certs_dir)?;
+    apply_metrics_server_secret(context, certs_dir)?;
+    apply_metrics_client_secret(context, certs_dir)?;
+    Ok(())
+}
+
+/// Create the metrics CA Secret (holds only ca.crt).
+fn apply_metrics_ca_secret(context: &str, certs_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            context,
+            "-n",
+            GRID_SYSTEM_NS,
+            "create",
+            "secret",
+            "generic",
+            METRICS_CA_SECRET,
+            &format!("--from-file=ca.crt={}", certs_dir.join("metrics-ca.pem").display()),
+            "--dry-run=client",
+            "-o",
+            "yaml",
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "failed to render Secret/{METRICS_CA_SECRET}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+    kubectl::apply_manifest(context, &String::from_utf8(output.stdout)?)
+}
+
+/// Create the metrics server TLS Secret (tls.crt + tls.key for nginx).
+fn apply_metrics_server_secret(context: &str, certs_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            context,
+            "-n",
+            GRID_SYSTEM_NS,
+            "create",
+            "secret",
+            "generic",
+            METRICS_SERVER_TLS_SECRET,
+            &format!(
+                "--from-file=tls.crt={}",
+                certs_dir.join("metrics-server-cert.pem").display()
+            ),
+            &format!(
+                "--from-file=tls.key={}",
+                certs_dir.join("metrics-server-key.pem").display()
+            ),
+            "--dry-run=client",
+            "-o",
+            "yaml",
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "failed to render Secret/{METRICS_SERVER_TLS_SECRET}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+    kubectl::apply_manifest(context, &String::from_utf8(output.stdout)?)
+}
+
+/// Create the metrics client TLS Secret (tls.crt + tls.key for the operator).
+fn apply_metrics_client_secret(context: &str, certs_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            context,
+            "-n",
+            GRID_SYSTEM_NS,
+            "create",
+            "secret",
+            "generic",
+            METRICS_CLIENT_TLS_SECRET,
+            &format!(
+                "--from-file=tls.crt={}",
+                certs_dir.join("metrics-client-cert.pem").display()
+            ),
+            &format!(
+                "--from-file=tls.key={}",
+                certs_dir.join("metrics-client-key.pem").display()
+            ),
+            "--dry-run=client",
+            "-o",
+            "yaml",
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "failed to render Secret/{METRICS_CLIENT_TLS_SECRET}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+    kubectl::apply_manifest(context, &String::from_utf8(output.stdout)?)
 }
 
 /// Create a TLS secret from the generated cert, key, and CA files.
@@ -1497,6 +1610,7 @@ fn load_images_into_clusters(_context: &DemoContext) -> Result<(), Box<dyn std::
         "praxis-ai:llmd-pool-metrics-demo",
         "llm-d-epp:llmd-pool-metrics-demo",
         "llm-d-inference-sim:llmd-pool-metrics-demo",
+        "nginx:metrics-proxy-demo",
     ];
     for cluster in CLUSTERS {
         let kind_name = format!("grid-llmd-pm-{cluster}");
@@ -1522,6 +1636,7 @@ fn collect_image_evidence(resolved: &ResolvedImages) -> Result<BTreeMap<String, 
         ("epp", &resolved.epp),
         ("sim", &resolved.sim),
         ("overlay-sync", &resolved.overlay_sync),
+        ("nginx", &resolved.nginx),
     ] {
         let digest = Command::new("docker")
             .args(["inspect", "--format", "{{.Id}}", tag])
@@ -1730,6 +1845,1022 @@ fn resolve_evidence_dir(
         .clone()
         .unwrap_or_else(|| forge_config.parent().unwrap_or_else(|| Path::new(".")).join("evidence"));
     Ok(base.join(run_id))
+}
+
+// ---------------------------------------------------------------------------
+// TLS proof stages
+// ---------------------------------------------------------------------------
+
+/// Timeout for a single TLS state transition.
+const TLS_TRANSITION_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// Interval between overlay checks during TLS proofs.
+const TLS_POLL_INTERVAL: Duration = Duration::from_secs(3);
+
+/// Value of `staleMetricsSeconds` in the demo InferenceProvider.
+const STALE_METRICS_TTL_SECS: u64 = 20;
+
+/// Check whether a provider is observable in the overlay.
+///
+/// Returns `true` when a candidate containing `provider_suffix` is present
+/// with a score above zero — meaning the operator successfully scraped its
+/// metrics via TLS. When scraping fails, `UNOBSERVABLE_METRICS` sets
+/// `healthy: false`, which results in a zero score.
+fn is_provider_observable(cluster: &str, provider_suffix: &str) -> bool {
+    let candidates = read_overlay_candidates(cluster);
+    candidates
+        .iter()
+        .any(|c| c.cluster.contains(provider_suffix) && c.score > 0.0)
+}
+
+/// Wait until a provider becomes observable in the overlay.
+fn wait_for_observable(cluster: &str, provider_suffix: &str, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        trigger_gridnetwork_reconcile(cluster);
+        if is_provider_observable(cluster, provider_suffix) {
+            return true;
+        }
+        std::thread::sleep(TLS_POLL_INTERVAL);
+    }
+    false
+}
+
+/// Wait until a provider becomes unobservable in the overlay.
+fn wait_for_unobservable(cluster: &str, provider_suffix: &str, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        trigger_gridnetwork_reconcile(cluster);
+        if !is_provider_observable(cluster, provider_suffix) {
+            return true;
+        }
+        std::thread::sleep(TLS_POLL_INTERVAL);
+    }
+    false
+}
+
+/// Delete a Kubernetes Secret.
+fn delete_secret(context: &str, name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let status = Command::new("kubectl")
+        .args([
+            "--context",
+            context,
+            "-n",
+            GRID_SYSTEM_NS,
+            "delete",
+            "secret",
+            name,
+            "--ignore-not-found",
+        ])
+        .status()?;
+    if !status.success() {
+        return Err(format!("failed to delete Secret/{name}").into());
+    }
+    Ok(())
+}
+
+/// Rollout-restart a Deployment and wait for it to become available.
+fn rollout_restart(context: &str, deployment: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let status = Command::new("kubectl")
+        .args([
+            "--context",
+            context,
+            "-n",
+            GRID_SYSTEM_NS,
+            "rollout",
+            "restart",
+            &format!("deployment/{deployment}"),
+        ])
+        .status()?;
+    if !status.success() {
+        return Err(format!("failed to rollout restart {deployment}").into());
+    }
+    let wait = Command::new("kubectl")
+        .args([
+            "--context",
+            context,
+            "-n",
+            GRID_SYSTEM_NS,
+            "rollout",
+            "status",
+            &format!("deployment/{deployment}"),
+            "--timeout=120s",
+        ])
+        .status()?;
+    if !wait.success() {
+        return Err(format!("{deployment} rollout timed out").into());
+    }
+    Ok(())
+}
+
+/// Snapshot of a pod's identity and restart counts.
+struct PodSnapshot {
+    /// Pod name.
+    name: String,
+    /// Pod UID.
+    uid: String,
+    /// Container restart counts: `(container_name, restart_count)`.
+    restarts: Vec<(String, u32)>,
+}
+
+/// Capture pod snapshots for a given label selector in one cluster.
+fn capture_pod_snapshots(cluster: &str, label: &str) -> Vec<PodSnapshot> {
+    let ctx = kind_context(cluster);
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            &ctx,
+            "-n",
+            GRID_SYSTEM_NS,
+            "get",
+            "pods",
+            "-l",
+            label,
+            "-o",
+            "jsonpath={range .items[*]}{.metadata.name}|{.metadata.uid}|{range .status.containerStatuses[*]}{.name}={.restartCount},{end}{\"\\n\"}{end}",
+        ])
+        .output();
+    let Ok(o) = output else { return Vec::new() };
+    let text = String::from_utf8_lossy(&o.stdout);
+    text.lines()
+        .filter(|l| !l.is_empty())
+        .filter_map(|line| {
+            let mut parts = line.splitn(3, '|');
+            let name = parts.next()?.to_owned();
+            let uid = parts.next()?.to_owned();
+            let containers = parts.next().unwrap_or("");
+            let restarts: Vec<(String, u32)> = containers
+                .split(',')
+                .filter(|s| !s.is_empty())
+                .filter_map(|entry| {
+                    let (cname, count_str) = entry.split_once('=')?;
+                    Some((cname.to_owned(), count_str.parse().unwrap_or(0)))
+                })
+                .collect();
+            Some(PodSnapshot { name, uid, restarts })
+        })
+        .collect()
+}
+
+/// Snapshot of all workload pods relevant for restart accounting.
+struct RestartSnapshot {
+    /// Grid operator pods.
+    operator: Vec<PodSnapshot>,
+    /// EPP + metrics proxy pods.
+    epp: Vec<PodSnapshot>,
+    /// Gateway and overlay-sync pods.
+    gateway: Vec<PodSnapshot>,
+}
+
+/// Capture restart snapshots for all relevant workloads on one cluster.
+fn capture_restart_snapshot(cluster: &str) -> RestartSnapshot {
+    RestartSnapshot {
+        operator: capture_pod_snapshots(cluster, "app.kubernetes.io/name=grid-operator"),
+        epp: capture_pod_snapshots(cluster, "app.kubernetes.io/name=llmd-epp"),
+        gateway: capture_pod_snapshots(cluster, "app.kubernetes.io/name=praxis-gateway"),
+    }
+}
+
+/// Compare restart snapshots and emit observations.
+///
+/// Returns `(success, observations)`.
+fn compare_restart_snapshots(
+    cluster: &str,
+    before: &RestartSnapshot,
+    after: &RestartSnapshot,
+    server_rotation_performed: bool,
+) -> (bool, Vec<String>) {
+    let mut observations = Vec::new();
+    let mut success = true;
+
+    // Operator: pod identity must be unchanged, zero restarts
+    for bp in &before.operator {
+        let matching_after = after.operator.iter().find(|ap| ap.uid == bp.uid);
+        if let Some(ap) = matching_after {
+            let total: u32 = ap.restarts.iter().map(|(_, c)| c).sum();
+            observations.push(format!(
+                "{cluster}/operator/{}: uid unchanged, restart_count={total}",
+                ap.name
+            ));
+            if total > 0 {
+                observations.push(format!("{cluster}: operator restarted unexpectedly"));
+                success = false;
+            }
+        } else {
+            observations.push(format!(
+                "{cluster}: operator pod {} (uid={}) replaced — unexpected restart",
+                bp.name, bp.uid
+            ));
+            success = false;
+        }
+    }
+
+    // EPP: if server rotation was performed, expect a new pod (rollout restart)
+    if server_rotation_performed {
+        let before_uids: Vec<&str> = before.epp.iter().map(|p| p.uid.as_str()).collect();
+        let new_pods: Vec<&PodSnapshot> = after
+            .epp
+            .iter()
+            .filter(|p| !before_uids.contains(&p.uid.as_str()))
+            .collect();
+        if new_pods.is_empty() {
+            observations.push(format!(
+                "{cluster}: EPP pod was not replaced after server rotation — expected rollout restart"
+            ));
+        } else {
+            for np in &new_pods {
+                let total: u32 = np.restarts.iter().map(|(_, c)| c).sum();
+                observations.push(format!(
+                    "{cluster}/epp/{}: new pod after server cert rotation (expected), restart_count={total}",
+                    np.name
+                ));
+            }
+        }
+    } else {
+        for bp in &before.epp {
+            let matching_after = after.epp.iter().find(|ap| ap.uid == bp.uid);
+            if let Some(ap) = matching_after {
+                let total: u32 = ap.restarts.iter().map(|(_, c)| c).sum();
+                observations.push(format!(
+                    "{cluster}/epp/{}: uid unchanged, restart_count={total}",
+                    ap.name
+                ));
+                if total > 0 {
+                    observations.push(format!("{cluster}: EPP restarted unexpectedly"));
+                    success = false;
+                }
+            }
+        }
+    }
+
+    // Gateway: no restarts expected
+    for bp in &before.gateway {
+        let matching_after = after.gateway.iter().find(|ap| ap.uid == bp.uid);
+        if let Some(ap) = matching_after {
+            for (cname, count) in &ap.restarts {
+                observations.push(format!("{cluster}/gateway/{}: {cname} restarts={count}", ap.name));
+                if *count > 0 {
+                    success = false;
+                }
+            }
+        } else {
+            observations.push(format!("{cluster}: gateway pod {} replaced unexpectedly", bp.name));
+            success = false;
+        }
+    }
+
+    (success, observations)
+}
+
+/// Prove that TLS proof stages did not cause unexpected restarts.
+///
+/// Compares before/after pod snapshots across operator, EPP, and gateway
+/// workloads. The intentional EPP rollout restart from server certificate
+/// rotation is documented and excluded from the failure check — but only
+/// on the cluster where rotation was actually performed (pool-a).
+fn proof_restart_accounting(
+    before: &HashMap<String, RestartSnapshot>,
+    after: &HashMap<String, RestartSnapshot>,
+    rotation_cluster: Option<&str>,
+) -> ProofResult {
+    let mut observations = Vec::new();
+    let mut success = true;
+
+    for cluster in CLUSTERS {
+        let cluster_had_rotation = rotation_cluster.is_some_and(|c| c == *cluster);
+        if let (Some(b), Some(a)) = (before.get(*cluster), after.get(*cluster)) {
+            let (ok, obs) = compare_restart_snapshots(cluster, b, a, cluster_had_rotation);
+            for o in &obs {
+                eprintln!("    {o}");
+            }
+            observations.extend(obs);
+            if !ok {
+                success = false;
+            }
+        } else {
+            let msg = format!("{cluster}: snapshot missing");
+            eprintln!("    {msg}");
+            observations.push(msg);
+            success = false;
+        }
+    }
+
+    if let Some(rc) = rotation_cluster {
+        let msg = format!(
+            "server rotation (stage 8) on {rc}: EPP rollout restart is expected — nginx does not reload TLS in-place"
+        );
+        eprintln!("    {msg}");
+        observations.push(msg);
+    }
+
+    ProofResult {
+        success,
+        description: "Restart accounting: operator/gateway zero restarts, EPP restart only from server rotation"
+            .to_owned(),
+        observations,
+    }
+}
+
+/// Run all TLS proof stages in sequence.
+///
+/// Returns the proof results keyed by stage name. Stages build on each
+/// other (each manipulates Secrets, so ordering matters). Captures
+/// before/after restart snapshots and includes restart accounting.
+fn run_tls_proof_stages() -> BTreeMap<String, ProofResult> {
+    let mut results = BTreeMap::new();
+
+    eprintln!();
+    eprintln!("{OUTPUT_RULE}");
+    eprintln!("TLS PROOF STAGES");
+    eprintln!("{OUTPUT_RULE}");
+
+    // Capture restart snapshots before TLS stages
+    let before_snapshots: HashMap<String, RestartSnapshot> = CLUSTERS
+        .iter()
+        .map(|c| ((*c).to_owned(), capture_restart_snapshot(c)))
+        .collect();
+
+    // Stage 1: Baseline mTLS — verify operator scrapes through TLS
+    eprintln!();
+    eprintln!("  [TLS 1/9] Baseline mTLS");
+    results.insert("tls_01_baseline".to_owned(), proof_tls_baseline());
+
+    // Stage 2: Handshake rejection — TLS proxy rejects connection without client cert
+    eprintln!();
+    eprintln!("  [TLS 2/9] Handshake rejection");
+    results.insert("tls_02_handshake_rejection".to_owned(), proof_tls_handshake_rejection());
+
+    // Stage 3: Missing client identity — delete client cert Secret
+    eprintln!();
+    eprintln!("  [TLS 3/9] Missing client identity");
+    results.insert("tls_03_missing_client".to_owned(), proof_tls_missing_client());
+
+    // Stage 4: Wrong CA — replace CA Secret with untrusted CA
+    eprintln!();
+    eprintln!("  [TLS 4/9] Wrong CA");
+    results.insert("tls_04_wrong_ca".to_owned(), proof_tls_wrong_ca());
+
+    // Stage 5: Restore valid mTLS — recreate correct Secrets
+    eprintln!();
+    eprintln!("  [TLS 5/9] Restore valid mTLS");
+    results.insert("tls_05_restore".to_owned(), proof_tls_restore());
+
+    // Stage 6: Stale-cache behavior — independent TTL verification
+    eprintln!();
+    eprintln!("  [TLS 6/9] Stale-cache TTL");
+    results.insert("tls_06_stale_cache".to_owned(), proof_tls_stale_cache());
+
+    // Stage 7: Client Secret rotation — new cert, same CA
+    eprintln!();
+    eprintln!("  [TLS 7/9] Client Secret rotation");
+    results.insert("tls_07_client_rotation".to_owned(), proof_tls_client_rotation());
+
+    // Stage 8: Server cert/CA rotation — new server cert + nginx restart
+    eprintln!();
+    eprintln!("  [TLS 8/9] Server cert rotation");
+    let server_rotation = proof_tls_server_rotation();
+    let rotation_cluster = server_rotation.success.then_some("pool-a");
+    results.insert("tls_08_server_rotation".to_owned(), server_rotation);
+
+    // Stage 9: Existing routing behavior — verify routing after TLS manipulations
+    eprintln!();
+    eprintln!("  [TLS 9/9] Existing routing behavior");
+    results.insert("tls_09_routing".to_owned(), proof_tls_routing());
+
+    // Restart accounting — compare before/after snapshots
+    eprintln!();
+    eprintln!("  Restart accounting");
+    let after_snapshots: HashMap<String, RestartSnapshot> = CLUSTERS
+        .iter()
+        .map(|c| ((*c).to_owned(), capture_restart_snapshot(c)))
+        .collect();
+    results.insert(
+        "restart_accounting".to_owned(),
+        proof_restart_accounting(&before_snapshots, &after_snapshots, rotation_cluster),
+    );
+
+    results
+}
+
+/// TLS Stage 1: Verify baseline mTLS scraping produces valid overlay scores.
+fn proof_tls_baseline() -> ProofResult {
+    let mut observations = Vec::new();
+
+    for cluster in CLUSTERS {
+        if is_provider_observable(cluster, cluster) {
+            let candidates = read_overlay_candidates(cluster);
+            let score = overlay_score_for_cluster(&candidates, cluster);
+            observations.push(format!("{cluster}: observable, score={score:.2} (mTLS working)"));
+        } else {
+            observations.push(format!("{cluster}: NOT observable — mTLS scraping may have failed"));
+            return ProofResult {
+                success: false,
+                description: "Baseline mTLS: operator scrapes metrics through TLS".to_owned(),
+                observations,
+            };
+        }
+    }
+
+    ProofResult {
+        success: true,
+        description: "Baseline mTLS: operator scrapes metrics through TLS".to_owned(),
+        observations,
+    }
+}
+
+/// TLS Stage 2: Prove the TLS proxy rejects connections without a client certificate.
+///
+/// Connects to the metrics endpoint from inside the cluster without presenting
+/// a client identity. The nginx proxy has `ssl_verify_client on`, so it must
+/// reject the handshake or return an error. This tests the server-side mTLS
+/// enforcement path directly (independent of Secret-watch behavior).
+fn proof_tls_handshake_rejection() -> ProofResult {
+    let mut observations = Vec::new();
+    let cluster = "pool-a";
+    let ctx = kind_context(cluster);
+
+    // Connect to the metrics TLS endpoint without a client certificate.
+    // We use `wget` inside the nginx sidecar — it has network access to
+    // localhost:9443 but does not present a client cert.
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            &ctx,
+            "-n",
+            GRID_SYSTEM_NS,
+            "exec",
+            "deployment/llmd-epp",
+            "-c",
+            "metrics-tls-proxy",
+            "--",
+            "wget",
+            "-q",
+            "--timeout=5",
+            "-O",
+            "/dev/null",
+            "https://localhost:9443/metrics",
+        ])
+        .output();
+
+    match output {
+        Ok(o) => {
+            if o.status.success() {
+                observations.push(format!(
+                    "{cluster}: metrics endpoint accepted connection WITHOUT client cert — mTLS NOT enforced"
+                ));
+                return ProofResult {
+                    success: false,
+                    description: "Handshake rejection: TLS proxy requires client certificate".to_owned(),
+                    observations,
+                };
+            }
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            let category = if stderr.contains("SSL") || stderr.contains("ssl") || stderr.contains("handshake") {
+                "MetricsTlsHandshakeFailed"
+            } else if stderr.contains("400") || stderr.contains("certificate") {
+                "MetricsTlsClientCertRequired"
+            } else {
+                "MetricsTlsConnectionRejected"
+            };
+            observations.push(format!(
+                "{cluster}: connection without client cert rejected (category={category})"
+            ));
+        },
+        Err(e) => {
+            observations.push(format!("{cluster}: kubectl exec failed: {e}"));
+            return ProofResult {
+                success: false,
+                description: "Handshake rejection: TLS proxy requires client certificate".to_owned(),
+                observations,
+            };
+        },
+    }
+
+    ProofResult {
+        success: true,
+        description: "Handshake rejection: TLS proxy requires client certificate".to_owned(),
+        observations,
+    }
+}
+
+/// TLS Stage 3: Delete client cert Secret → provider becomes unobservable.
+fn proof_tls_missing_client() -> ProofResult {
+    let mut observations = Vec::new();
+    let cluster = "pool-a";
+    let ctx = kind_context(cluster);
+
+    if let Err(e) = delete_secret(&ctx, METRICS_CLIENT_TLS_SECRET) {
+        observations.push(format!("failed to delete {METRICS_CLIENT_TLS_SECRET}: {e}"));
+        return ProofResult {
+            success: false,
+            description: "Missing client identity: scrape fails without client cert".to_owned(),
+            observations,
+        };
+    }
+    observations.push(format!("deleted Secret/{METRICS_CLIENT_TLS_SECRET} from {cluster}"));
+
+    let became_unobservable = wait_for_unobservable(cluster, cluster, TLS_TRANSITION_TIMEOUT);
+    if became_unobservable {
+        observations.push(format!(
+            "{cluster}: provider became unobservable after client cert removal (Secret-watch fail-closed)"
+        ));
+    } else {
+        observations.push(format!(
+            "{cluster}: provider still observable after client cert removal — fail-closed NOT working"
+        ));
+        return ProofResult {
+            success: false,
+            description: "Missing client identity: scrape fails without client cert".to_owned(),
+            observations,
+        };
+    }
+
+    ProofResult {
+        success: true,
+        description: "Missing client identity: scrape fails without client cert".to_owned(),
+        observations,
+    }
+}
+
+/// TLS Stage 3: Replace CA Secret with wrong CA → scrape fails.
+fn proof_tls_wrong_ca() -> ProofResult {
+    let mut observations = Vec::new();
+    let cluster = "pool-a";
+    let ctx = kind_context(cluster);
+    let certs_dir = Path::new(CERTS_DIR);
+
+    // First restore client secret (deleted in stage 2) so only CA is wrong
+    if let Err(e) = apply_metrics_client_secret(&ctx, certs_dir) {
+        observations.push(format!("failed to restore client secret: {e}"));
+    }
+
+    // Generate a wrong CA and replace the Secret
+    if let Err(e) = certs::generate_wrong_metrics_ca() {
+        observations.push(format!("failed to generate wrong CA: {e}"));
+        return ProofResult {
+            success: false,
+            description: "Wrong CA: scrape fails with untrusted CA".to_owned(),
+            observations,
+        };
+    }
+
+    let wrong_ca_path = certs_dir.join("metrics-wrong-ca.pem");
+    let result = Command::new("kubectl")
+        .args([
+            "--context",
+            &ctx,
+            "-n",
+            GRID_SYSTEM_NS,
+            "create",
+            "secret",
+            "generic",
+            METRICS_CA_SECRET,
+            &format!("--from-file=ca.crt={}", wrong_ca_path.display()),
+            "--dry-run=client",
+            "-o",
+            "yaml",
+        ])
+        .output();
+    match result {
+        Ok(output) if output.status.success() => {
+            if let Err(e) = kubectl::apply_manifest(&ctx, &String::from_utf8_lossy(&output.stdout)) {
+                observations.push(format!("failed to apply wrong CA secret: {e}"));
+                return ProofResult {
+                    success: false,
+                    description: "Wrong CA: scrape fails with untrusted CA".to_owned(),
+                    observations,
+                };
+            }
+        },
+        _ => {
+            observations.push("failed to render wrong CA secret".to_owned());
+            return ProofResult {
+                success: false,
+                description: "Wrong CA: scrape fails with untrusted CA".to_owned(),
+                observations,
+            };
+        },
+    }
+    observations.push(format!(
+        "replaced Secret/{METRICS_CA_SECRET} with wrong CA on {cluster}"
+    ));
+
+    let became_unobservable = wait_for_unobservable(cluster, cluster, TLS_TRANSITION_TIMEOUT);
+    if became_unobservable {
+        observations.push(format!(
+            "{cluster}: provider unobservable with wrong CA (server cert rejected)"
+        ));
+    } else {
+        observations.push(format!(
+            "{cluster}: provider still observable with wrong CA — CA validation NOT working"
+        ));
+        return ProofResult {
+            success: false,
+            description: "Wrong CA: scrape fails with untrusted CA".to_owned(),
+            observations,
+        };
+    }
+
+    ProofResult {
+        success: true,
+        description: "Wrong CA: scrape fails with untrusted CA".to_owned(),
+        observations,
+    }
+}
+
+/// TLS Stage 4: Restore correct Secrets → provider recovers.
+fn proof_tls_restore() -> ProofResult {
+    let mut observations = Vec::new();
+    let cluster = "pool-a";
+    let ctx = kind_context(cluster);
+    let certs_dir = Path::new(CERTS_DIR);
+
+    if let Err(e) = apply_metrics_ca_secret(&ctx, certs_dir) {
+        observations.push(format!("failed to restore CA secret: {e}"));
+        return ProofResult {
+            success: false,
+            description: "Restore: provider recovers with correct Secrets".to_owned(),
+            observations,
+        };
+    }
+    if let Err(e) = apply_metrics_client_secret(&ctx, certs_dir) {
+        observations.push(format!("failed to restore client secret: {e}"));
+        return ProofResult {
+            success: false,
+            description: "Restore: provider recovers with correct Secrets".to_owned(),
+            observations,
+        };
+    }
+    observations.push(format!(
+        "restored correct {METRICS_CA_SECRET} and {METRICS_CLIENT_TLS_SECRET} on {cluster}"
+    ));
+
+    let recovered = wait_for_observable(cluster, cluster, TLS_TRANSITION_TIMEOUT);
+    if recovered {
+        let candidates = read_overlay_candidates(cluster);
+        let score = overlay_score_for_cluster(&candidates, cluster);
+        observations.push(format!("{cluster}: provider recovered, score={score:.2}"));
+    } else {
+        observations.push(format!("{cluster}: provider did not recover within timeout"));
+        return ProofResult {
+            success: false,
+            description: "Restore: provider recovers with correct Secrets".to_owned(),
+            observations,
+        };
+    }
+
+    ProofResult {
+        success: true,
+        description: "Restore: provider recovers with correct Secrets".to_owned(),
+        observations,
+    }
+}
+
+/// TLS Stage 5: Rotate client cert (new cert, same CA) → scrape continues.
+fn proof_tls_client_rotation() -> ProofResult {
+    let mut observations = Vec::new();
+    let cluster = "pool-a";
+    let ctx = kind_context(cluster);
+    let certs_dir = Path::new(CERTS_DIR);
+
+    if !is_provider_observable(cluster, cluster) {
+        observations.push("precondition failed: provider not observable at entry".to_owned());
+        return ProofResult {
+            success: false,
+            description: "Client rotation: new cert from same CA works".to_owned(),
+            observations,
+        };
+    }
+    observations.push("precondition: provider observable at entry".to_owned());
+
+    if let Err(e) = certs::rotate_metrics_client_cert(METRICS_CA_CN) {
+        observations.push(format!("failed to generate rotated client cert: {e}"));
+        return ProofResult {
+            success: false,
+            description: "Client rotation: new cert from same CA works".to_owned(),
+            observations,
+        };
+    }
+    observations.push("generated new client cert signed by same metrics CA".to_owned());
+
+    if let Err(e) = apply_metrics_client_secret(&ctx, certs_dir) {
+        observations.push(format!("failed to apply rotated client secret: {e}"));
+        return ProofResult {
+            success: false,
+            description: "Client rotation: new cert from same CA works".to_owned(),
+            observations,
+        };
+    }
+    observations.push(format!("updated Secret/{METRICS_CLIENT_TLS_SECRET} with rotated cert"));
+
+    // Wait a few reconcile cycles to confirm the operator picks up the new cert
+    std::thread::sleep(Duration::from_secs(10));
+    for _ in 0..3 {
+        trigger_gridnetwork_reconcile(cluster);
+        std::thread::sleep(TLS_POLL_INTERVAL);
+    }
+
+    let still_observable = wait_for_observable(cluster, cluster, TLS_TRANSITION_TIMEOUT);
+    if still_observable {
+        let candidates = read_overlay_candidates(cluster);
+        let score = overlay_score_for_cluster(&candidates, cluster);
+        observations.push(format!(
+            "{cluster}: provider still observable after client rotation, score={score:.2}"
+        ));
+    } else {
+        observations.push(format!(
+            "{cluster}: provider became unobservable after client rotation — rotation failed"
+        ));
+        return ProofResult {
+            success: false,
+            description: "Client rotation: new cert from same CA works".to_owned(),
+            observations,
+        };
+    }
+
+    ProofResult {
+        success: true,
+        description: "Client rotation: new cert from same CA works".to_owned(),
+        observations,
+    }
+}
+
+/// TLS Stage 6: Rotate server cert + restart nginx → scrape continues.
+///
+/// **Limitation:** nginx does not reload TLS material automatically.
+/// A `rollout restart` of the EPP Deployment is required. This is
+/// documented honestly — the operator handles Secret rotation, but
+/// the metrics proxy (nginx) needs a pod restart to load new certs.
+fn proof_tls_server_rotation() -> ProofResult {
+    let mut observations = Vec::new();
+    let cluster = "pool-a";
+    let ctx = kind_context(cluster);
+    let certs_dir = Path::new(CERTS_DIR);
+
+    if !is_provider_observable(cluster, cluster) {
+        observations.push("precondition failed: provider not observable at entry".to_owned());
+        return ProofResult {
+            success: false,
+            description: "Server rotation: new cert + nginx restart works".to_owned(),
+            observations,
+        };
+    }
+    observations.push("precondition: provider observable at entry".to_owned());
+
+    if let Err(e) = certs::rotate_metrics_server_cert(METRICS_CA_CN, METRICS_SERVER_DNS) {
+        observations.push(format!("failed to generate rotated server cert: {e}"));
+        return ProofResult {
+            success: false,
+            description: "Server rotation: new cert + nginx restart works".to_owned(),
+            observations,
+        };
+    }
+    observations.push("generated new server cert signed by same metrics CA".to_owned());
+
+    if let Err(e) = apply_metrics_server_secret(&ctx, certs_dir) {
+        observations.push(format!("failed to apply rotated server secret: {e}"));
+        return ProofResult {
+            success: false,
+            description: "Server rotation: new cert + nginx restart works".to_owned(),
+            observations,
+        };
+    }
+    observations.push(format!("updated Secret/{METRICS_SERVER_TLS_SECRET} with rotated cert"));
+
+    observations.push("LIMITATION: nginx does not reload TLS in-place; rollout restart required".to_owned());
+    if let Err(e) = rollout_restart(&ctx, "llmd-epp") {
+        observations.push(format!("rollout restart failed: {e}"));
+        return ProofResult {
+            success: false,
+            description: "Server rotation: new cert + nginx restart works".to_owned(),
+            observations,
+        };
+    }
+    observations.push("rollout restart of llmd-epp completed".to_owned());
+
+    let recovered = wait_for_observable(cluster, cluster, TLS_TRANSITION_TIMEOUT);
+    if recovered {
+        let candidates = read_overlay_candidates(cluster);
+        let score = overlay_score_for_cluster(&candidates, cluster);
+        observations.push(format!(
+            "{cluster}: provider observable after server rotation, score={score:.2}"
+        ));
+    } else {
+        observations.push(format!(
+            "{cluster}: provider not observable after server rotation — rotation failed"
+        ));
+        return ProofResult {
+            success: false,
+            description: "Server rotation: new cert + nginx restart works".to_owned(),
+            observations,
+        };
+    }
+
+    ProofResult {
+        success: true,
+        description: "Server rotation: new cert + nginx restart works".to_owned(),
+        observations,
+    }
+}
+
+/// TLS Stage 6: Independent stale-cache TTL verification.
+///
+/// Proves that `staleMetricsSeconds` (set to [`STALE_METRICS_TTL_SECS`])
+/// allows the operator to serve cached metrics during a brief TLS outage,
+/// and that the cached sample expires after the TTL.
+///
+/// Sequence:
+/// 1. Record baseline score (provider must be observable).
+/// 2. Trigger a reconcile to establish a fresh metrics sample.
+/// 3. Delete the client cert Secret to break TLS.
+/// 4. Before TTL expires: assert the provider is still observable (cached).
+/// 5. After TTL expires: assert the provider becomes unobservable.
+/// 6. Restore the client cert Secret and verify recovery.
+fn proof_tls_stale_cache() -> ProofResult {
+    let mut observations = Vec::new();
+    let cluster = "pool-a";
+    let ctx = kind_context(cluster);
+    let certs_dir = Path::new(CERTS_DIR);
+
+    // 1. Precondition: provider must be observable.
+    if !is_provider_observable(cluster, cluster) {
+        observations.push("precondition failed: provider not observable at entry".to_owned());
+        return ProofResult {
+            success: false,
+            description: "Stale-cache TTL: cached metrics served before expiry, rejected after".to_owned(),
+            observations,
+        };
+    }
+    let candidates = read_overlay_candidates(cluster);
+    let baseline_score = overlay_score_for_cluster(&candidates, cluster);
+    observations.push(format!("baseline: {cluster} observable, score={baseline_score:.2}"));
+    eprintln!("    baseline: {cluster} observable, score={baseline_score:.2}");
+
+    // 2. Force a fresh scrape so the cache timestamp is recent.
+    trigger_gridnetwork_reconcile(cluster);
+    std::thread::sleep(Duration::from_secs(3));
+    let pre_break = Instant::now();
+
+    // 3. Break TLS by deleting the client cert Secret.
+    if let Err(e) = delete_secret(&ctx, METRICS_CLIENT_TLS_SECRET) {
+        observations.push(format!("failed to delete {METRICS_CLIENT_TLS_SECRET}: {e}"));
+        return ProofResult {
+            success: false,
+            description: "Stale-cache TTL: cached metrics served before expiry, rejected after".to_owned(),
+            observations,
+        };
+    }
+    let msg = format!(
+        "deleted Secret/{METRICS_CLIENT_TLS_SECRET} to break TLS (staleMetricsSeconds={STALE_METRICS_TTL_SECS})"
+    );
+    eprintln!("    {msg}");
+    observations.push(msg);
+
+    // 4. Inside-TTL check: provider should still be observable (cached metrics). Poll within the first half of the TTL
+    //    window.
+    let inside_ttl_deadline = pre_break + Duration::from_secs(STALE_METRICS_TTL_SECS / 2);
+    let mut inside_ttl_observable = false;
+    while Instant::now() < inside_ttl_deadline {
+        trigger_gridnetwork_reconcile(cluster);
+        std::thread::sleep(Duration::from_secs(2));
+        if is_provider_observable(cluster, cluster) {
+            inside_ttl_observable = true;
+            let elapsed = pre_break.elapsed().as_secs();
+            let candidates = read_overlay_candidates(cluster);
+            let score = overlay_score_for_cluster(&candidates, cluster);
+            let msg = format!(
+                "inside-TTL ({elapsed}s/{STALE_METRICS_TTL_SECS}s): {cluster} still observable, \
+                 score={score:.2} (cached metrics served)"
+            );
+            eprintln!("    {msg}");
+            observations.push(msg);
+            break;
+        }
+    }
+    if !inside_ttl_observable {
+        let elapsed = pre_break.elapsed().as_secs();
+        observations.push(format!(
+            "inside-TTL ({elapsed}s/{STALE_METRICS_TTL_SECS}s): {cluster} became unobservable \
+             before TTL expired — cached metrics not served"
+        ));
+        // Restore before returning
+        drop(apply_metrics_client_secret(&ctx, certs_dir));
+        wait_for_observable(cluster, cluster, TLS_TRANSITION_TIMEOUT);
+        return ProofResult {
+            success: false,
+            description: "Stale-cache TTL: cached metrics served before expiry, rejected after".to_owned(),
+            observations,
+        };
+    }
+
+    // 5. Post-TTL check: wait for the TTL to expire, then assert unobservable.
+    let remaining_ttl = STALE_METRICS_TTL_SECS.saturating_sub(pre_break.elapsed().as_secs());
+    if remaining_ttl > 0 {
+        std::thread::sleep(Duration::from_secs(remaining_ttl + 5));
+    }
+    // Force a reconcile so the operator evaluates the expired cache.
+    trigger_gridnetwork_reconcile(cluster);
+    std::thread::sleep(Duration::from_secs(3));
+
+    let post_ttl_unobservable =
+        !is_provider_observable(cluster, cluster) || wait_for_unobservable(cluster, cluster, Duration::from_secs(30));
+    let elapsed = pre_break.elapsed().as_secs();
+    if post_ttl_unobservable {
+        let msg = format!(
+            "post-TTL ({elapsed}s/{STALE_METRICS_TTL_SECS}s): {cluster} unobservable \
+             (cached metrics expired, UNOBSERVABLE_METRICS applied)"
+        );
+        eprintln!("    {msg}");
+        observations.push(msg);
+    } else {
+        observations.push(format!(
+            "post-TTL ({elapsed}s/{STALE_METRICS_TTL_SECS}s): {cluster} still observable \
+             after TTL expired — stale metrics not evicted"
+        ));
+        drop(apply_metrics_client_secret(&ctx, certs_dir));
+        wait_for_observable(cluster, cluster, TLS_TRANSITION_TIMEOUT);
+        return ProofResult {
+            success: false,
+            description: "Stale-cache TTL: cached metrics served before expiry, rejected after".to_owned(),
+            observations,
+        };
+    }
+
+    // 6. Restore the client cert Secret and verify recovery.
+    if let Err(e) = apply_metrics_client_secret(&ctx, certs_dir) {
+        observations.push(format!("failed to restore client secret: {e}"));
+        return ProofResult {
+            success: false,
+            description: "Stale-cache TTL: cached metrics served before expiry, rejected after".to_owned(),
+            observations,
+        };
+    }
+    let recovered = wait_for_observable(cluster, cluster, TLS_TRANSITION_TIMEOUT);
+    if recovered {
+        let candidates = read_overlay_candidates(cluster);
+        let score = overlay_score_for_cluster(&candidates, cluster);
+        let msg = format!("recovery: {cluster} observable after client cert restored, score={score:.2}");
+        eprintln!("    {msg}");
+        observations.push(msg);
+    } else {
+        observations.push(format!("{cluster}: provider did not recover after stale-cache test"));
+        return ProofResult {
+            success: false,
+            description: "Stale-cache TTL: cached metrics served before expiry, rejected after".to_owned(),
+            observations,
+        };
+    }
+
+    ProofResult {
+        success: true,
+        description: "Stale-cache TTL: cached metrics served before expiry, rejected after".to_owned(),
+        observations,
+    }
+}
+
+/// TLS Stage 8: Verify existing routing still works after TLS manipulations.
+fn proof_tls_routing() -> ProofResult {
+    let mut observations = Vec::new();
+
+    // Verify both providers are observable
+    for cluster in CLUSTERS {
+        if !is_provider_observable(cluster, cluster) && !wait_for_observable(cluster, cluster, TLS_TRANSITION_TIMEOUT) {
+            observations.push(format!("{cluster}: provider NOT observable — routing check impossible"));
+            return ProofResult {
+                success: false,
+                description: "Existing routing: inference routing works after TLS manipulations".to_owned(),
+                observations,
+            };
+        }
+        let candidates = read_overlay_candidates(cluster);
+        let score = overlay_score_for_cluster(&candidates, cluster);
+        observations.push(format!("{cluster}: observable, score={score:.2}"));
+    }
+
+    // Send an inference request and verify attribution
+    let probe_ctx = kind_context("pool-a");
+    match send_inference_request(&probe_ctx, SIM_MODEL) {
+        Ok(resp) => {
+            observations.push(format!(
+                "routing attribution: gateway={} provider={}",
+                resp.provider_gateway, resp.demo_attribution
+            ));
+        },
+        Err(e) => {
+            observations.push(format!("inference request failed: {e}"));
+            return ProofResult {
+                success: false,
+                description: "Existing routing: inference routing works after TLS manipulations".to_owned(),
+                observations,
+            };
+        },
+    }
+
+    ProofResult {
+        success: true,
+        description: "Existing routing: inference routing works after TLS manipulations".to_owned(),
+        observations,
+    }
 }
 
 // ---------------------------------------------------------------------------

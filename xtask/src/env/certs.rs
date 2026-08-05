@@ -5,7 +5,9 @@ use std::{
     process::Command,
 };
 
-use certs::{DEFAULT_ORGANIZATION, generate_ca, generate_cert_with_org, generate_site_cert, load_ca};
+use certs::{
+    DEFAULT_ORGANIZATION, generate_ca, generate_cert_with_org, generate_dns_cert, generate_site_cert, load_ca,
+};
 use sha2::{Digest as _, Sha256};
 
 // ---------------------------------------------------------------------------
@@ -68,6 +70,95 @@ pub(crate) fn generate_all(cluster_names: &[String]) -> Result<PathBuf, Box<dyn 
     ensure_wrong_org_identity(&dir, &ca, cluster_names, ca_was_complete)?;
 
     Ok(dir)
+}
+
+/// Generate a dedicated CA and certificates for metrics endpoint mTLS.
+///
+/// Produces files under `{CERTS_DIR}/`:
+/// - `metrics-ca.pem` / `metrics-ca-key.pem` — metrics-only CA
+/// - `metrics-server-cert.pem` / `metrics-server-key.pem` — TLS proxy cert
+/// - `metrics-client-cert.pem` / `metrics-client-key.pem` — operator client cert
+///
+/// # Errors
+///
+/// Returns an error if certificate generation or file writes fail.
+pub(crate) fn generate_metrics_certs(ca_cn: &str, server_dns: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let dir = PathBuf::from(CERTS_DIR);
+    std::fs::create_dir_all(&dir)?;
+
+    let metrics_ca = generate_ca(ca_cn)?;
+    write_pem(&dir.join("metrics-ca.pem"), &metrics_ca.cert_pem)?;
+    write_pem(&dir.join("metrics-ca-key.pem"), &metrics_ca.key_pem)?;
+
+    let server = generate_dns_cert(&metrics_ca, "metrics-server", server_dns)?;
+    write_pem(&dir.join("metrics-server-cert.pem"), &server.cert_pem)?;
+    write_pem(&dir.join("metrics-server-key.pem"), &server.key_pem)?;
+
+    let client = generate_dns_cert(&metrics_ca, "metrics-client", "grid-operator.grid-system")?;
+    write_pem(&dir.join("metrics-client-cert.pem"), &client.cert_pem)?;
+    write_pem(&dir.join("metrics-client-key.pem"), &client.key_pem)?;
+
+    Ok(dir)
+}
+
+/// Load the metrics CA from disk for signing new certificates.
+///
+/// # Errors
+///
+/// Returns an error if the files are missing or contain invalid PEM.
+pub(crate) fn load_metrics_ca(ca_cn: &str) -> Result<certs::CaCert, Box<dyn std::error::Error>> {
+    let dir = PathBuf::from(CERTS_DIR);
+    let cert_pem = std::fs::read_to_string(dir.join("metrics-ca.pem"))?;
+    let key_pem = std::fs::read_to_string(dir.join("metrics-ca-key.pem"))?;
+    Ok(load_ca(ca_cn, &key_pem, &cert_pem)?)
+}
+
+/// Regenerate the metrics client certificate (for rotation proofs).
+///
+/// Overwrites `metrics-client-cert.pem` and `metrics-client-key.pem`
+/// with a freshly generated cert signed by the same metrics CA.
+///
+/// # Errors
+///
+/// Returns an error if signing or file writes fail.
+pub(crate) fn rotate_metrics_client_cert(ca_cn: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let dir = PathBuf::from(CERTS_DIR);
+    let metrics_ca = load_metrics_ca(ca_cn)?;
+    let client = generate_dns_cert(&metrics_ca, "metrics-client-rotated", "grid-operator.grid-system")?;
+    write_pem(&dir.join("metrics-client-cert.pem"), &client.cert_pem)?;
+    write_pem(&dir.join("metrics-client-key.pem"), &client.key_pem)?;
+    Ok(())
+}
+
+/// Regenerate the metrics server certificate (for rotation proofs).
+///
+/// Overwrites `metrics-server-cert.pem` and `metrics-server-key.pem`
+/// with a freshly generated cert signed by the same metrics CA.
+///
+/// # Errors
+///
+/// Returns an error if signing or file writes fail.
+pub(crate) fn rotate_metrics_server_cert(ca_cn: &str, server_dns: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let dir = PathBuf::from(CERTS_DIR);
+    let metrics_ca = load_metrics_ca(ca_cn)?;
+    let server = generate_dns_cert(&metrics_ca, "metrics-server-rotated", server_dns)?;
+    write_pem(&dir.join("metrics-server-cert.pem"), &server.cert_pem)?;
+    write_pem(&dir.join("metrics-server-key.pem"), &server.key_pem)?;
+    Ok(())
+}
+
+/// Generate a wrong-CA cert for metrics TLS negative testing.
+///
+/// Creates a self-signed CA and writes its cert to `metrics-wrong-ca.pem`.
+///
+/// # Errors
+///
+/// Returns an error if generation or file writes fail.
+pub(crate) fn generate_wrong_metrics_ca() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = PathBuf::from(CERTS_DIR);
+    let wrong_ca = generate_ca("Wrong Metrics CA")?;
+    write_pem(&dir.join("metrics-wrong-ca.pem"), &wrong_ca.cert_pem)?;
+    Ok(())
 }
 
 /// Remove the generated certificates directory.

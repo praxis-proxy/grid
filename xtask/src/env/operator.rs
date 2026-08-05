@@ -685,8 +685,6 @@ pub(crate) fn cleanup_install_rbac_test_resources(context: &str) -> Result<(), B
     eprintln!("  [OK] stale install/RBAC test resources removed");
     Ok(())
 }
-
-
 /// Build the Grid operator container image.
 ///
 /// Builds the operator image from the repository root using the multi-stage
@@ -4353,8 +4351,6 @@ pub(crate) fn assert_no_crdt_candidates_for_site(
     );
     Ok(())
 }
-
-
 /// Validate `GridSite` transition events with deterministic filtering,
 /// sorting, and content assertions.
 ///

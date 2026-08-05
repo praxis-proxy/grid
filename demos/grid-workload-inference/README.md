@@ -63,6 +63,9 @@ site.
 cargo xtask env run-grid-glb-demo --no-ingress --quick --teardown
 ```
 
+See [e2e-demo-output.txt](e2e-demo-output.txt) for example narrated output
+from a quick cold run.
+
 ## Prerequisites
 
 - Rust stable 1.96+

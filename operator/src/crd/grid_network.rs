@@ -391,9 +391,11 @@ pub struct TlsConfig {
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 pub struct SecretRef {
     /// Secret name.
+    #[schemars(length(min = 1))]
     pub name: String,
 
     /// Secret namespace.
+    #[schemars(length(min = 1))]
     pub namespace: String,
 
     /// Key within the Secret's `data` map.
@@ -401,6 +403,7 @@ pub struct SecretRef {
     /// Required when the Secret holds multiple keys (e.g. credential references
     /// in `InferenceProvider.spec.auth.secretRef`).  Omit only when the entire
     /// Secret is consumed (e.g. TLS `ca_secret_ref`).
+    #[schemars(length(min = 1))]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
 }

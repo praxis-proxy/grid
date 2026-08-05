@@ -24,13 +24,16 @@
 //! | `spec.gridNetworkRef` not found | `Unavailable` |
 //! | Config valid, probe returns transport failure | `Unavailable` |
 //! | Config valid, probe returns degraded response | `Degraded` |
+//! | `metricsConfig.tls` Secret missing, key absent, or material invalid | `Degraded` |
 //! | Config valid, probe healthy or not run, no matching sites | `Pending` |
 //! | Config valid, probe healthy or not run, ≥1 matching site | `Available` |
 //!
 //! `Degraded` is emitted by `phase_from_probe` when a health probe
-//! returns a degraded response.  Until live probing is wired into the
-//! reconcile loop, `ProbeOutcome::NotProbed` is always used, which
-//! preserves the pre-OP-05 site-matching behaviour.
+//! returns a degraded response, or by the metrics TLS validation when
+//! Secret references cannot be resolved or PEM material is invalid.
+//! Until live probing is wired into the reconcile loop,
+//! `ProbeOutcome::NotProbed` is always used, which preserves the
+//! pre-OP-05 site-matching behaviour.
 //!
 //! # Watch / reconcile note
 //!
@@ -72,7 +75,7 @@ use crate::{
         },
     },
     error::OperatorError,
-    resources::credentials,
+    resources::{credentials, provider_metrics},
 };
 
 // ---------------------------------------------------------------------------
@@ -82,6 +85,14 @@ use crate::{
 /// Requeue interval after a successful reconciliation when no `healthCheck.interval` is set.
 const REQUEUE_INTERVAL: Duration = Duration::from_secs(300);
 
+/// Shorter requeue interval for providers with `metricsConfig.tls` configured.
+///
+/// Without a cluster-wide Secret watch, the operator detects TLS material
+/// rotation (certificate renewal, CA rollover) by re-reconciling on this
+/// bounded interval.  60 seconds balances rotation detection latency against
+/// API server load.
+const TLS_REQUEUE_INTERVAL: Duration = Duration::from_secs(60);
+
 /// Field manager name for server-side apply.
 const FIELD_MANAGER: &str = "grid-operator";
 
@@ -90,7 +101,6 @@ const DEFAULT_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Default health-check path when `spec.healthCheck.path` is absent.
 const DEFAULT_HEALTH_PATH: &str = "/health";
-
 
 // ---------------------------------------------------------------------------
 // Reconcile
@@ -319,8 +329,10 @@ fn parse_duration_str(s: &str) -> Option<Duration> {
 ///
 /// When `spec.healthCheck.interval` is configured and parseable, the
 /// provider is requeued after that duration so that health probes run
-/// at approximately the requested cadence.  Falls back to
-/// [`REQUEUE_INTERVAL`] (300s) when the field is absent or unparseable.
+/// at approximately the requested cadence.  When `metricsConfig.tls` is
+/// configured, falls back to [`TLS_REQUEUE_INTERVAL`] (60s) so the
+/// operator detects certificate rotation without a cluster-wide Secret
+/// watch.  Otherwise falls back to [`REQUEUE_INTERVAL`] (300s).
 ///
 /// The interval controls **reconcile frequency**, not a separate timer
 /// loop.  The probe runs at the start of each reconcile, so the actual
@@ -330,11 +342,20 @@ fn parse_duration_str(s: &str) -> Option<Duration> {
 ///
 /// [`InferenceProvider`]: crate::crd::inference_provider::InferenceProvider
 pub(crate) fn requeue_interval_for_provider(spec: &InferenceProviderSpec) -> Duration {
-    spec.health_check
+    if let Some(interval) = spec
+        .health_check
         .as_ref()
         .and_then(|hc| hc.interval.as_deref())
         .and_then(parse_duration_str)
-        .unwrap_or(REQUEUE_INTERVAL)
+    {
+        return interval;
+    }
+    let has_tls = spec.metrics_config.as_ref().is_some_and(|mc| mc.tls.is_some());
+    if has_tls {
+        TLS_REQUEUE_INTERVAL
+    } else {
+        REQUEUE_INTERVAL
+    }
 }
 
 /// Probe an `http://` or `https://` endpoint and return a [`ProbeOutcome`].
@@ -412,11 +433,11 @@ pub(crate) async fn probe_endpoint(url: &str, timeout: Duration) -> ProbeOutcome
 #[expect(clippy::large_stack_frames, reason = "async future with kube API types")]
 #[expect(
     clippy::too_many_lines,
-    reason = "reconcile: static checks, credential verification, site matching, probe, and phase merge"
+    reason = "reconcile: static checks, credential verification, site matching, probe, metrics TLS, and phase merge"
 )]
 #[expect(
     clippy::cognitive_complexity,
-    reason = "sequential reconcile steps with early returns"
+    reason = "sequential reconcile steps with early returns and metrics TLS validation"
 )]
 async fn resolve_phase_and_sites(
     provider: &InferenceProvider,
@@ -477,6 +498,19 @@ async fn resolve_phase_and_sites(
         None => ProbeOutcome::NotProbed,
     };
     let phase = phase_from_probe(probe_result, site_phase);
+
+    if phase == ProviderPhase::Available
+        && let Some(mc) = &provider.spec.metrics_config
+        && mc.tls.is_some()
+        && let Some(tls_reason) = provider_metrics::verify_metrics_tls_accessible(client, mc.tls.as_ref()).await?
+    {
+        tracing::warn!(
+            name,
+            reason = tls_reason.as_str(),
+            "InferenceProvider metrics TLS configuration invalid"
+        );
+        return Ok((ProviderPhase::Degraded, matching, Some(tls_reason.as_str().to_owned())));
+    }
 
     Ok((phase, matching, None))
 }
@@ -1423,6 +1457,51 @@ mod tests {
             requeue_interval_for_provider(&spec),
             REQUEUE_INTERVAL,
             "timeout field must not affect the requeue interval"
+        );
+    }
+
+    #[test]
+    fn requeue_uses_tls_interval_when_metrics_tls_configured() {
+        let spec: InferenceProviderSpec = serde_json::from_value(serde_json::json!({
+            "gridNetworkRef": "net",
+            "providerKind": "self_hosted",
+            "backendKind": "local",
+            "endpoint": "https://vllm:8443",
+            "models": [{"name": "model"}],
+            "metricsConfig": {
+                "tls": {
+                    "caSecretRef": { "name": "ca", "namespace": "ns" }
+                }
+            }
+        }))
+        .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            requeue_interval_for_provider(&spec),
+            TLS_REQUEUE_INTERVAL,
+            "provider with metricsConfig.tls must use shorter TLS requeue interval"
+        );
+    }
+
+    #[test]
+    fn requeue_health_check_interval_wins_over_tls_interval() {
+        let spec: InferenceProviderSpec = serde_json::from_value(serde_json::json!({
+            "gridNetworkRef": "net",
+            "providerKind": "self_hosted",
+            "backendKind": "local",
+            "endpoint": "https://vllm:8443",
+            "models": [{"name": "model"}],
+            "healthCheck": { "interval": "30s" },
+            "metricsConfig": {
+                "tls": {
+                    "caSecretRef": { "name": "ca", "namespace": "ns" }
+                }
+            }
+        }))
+        .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            requeue_interval_for_provider(&spec),
+            Duration::from_secs(30),
+            "explicit healthCheck.interval must take precedence over TLS requeue"
         );
     }
 

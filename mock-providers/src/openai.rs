@@ -7,8 +7,6 @@
 //! The `/v1/responses` streaming path uses SSE `data:` events with an embedded
 //! `type` field (e.g. `"response.created"`, `"response.output_text.delta"`,
 //! `"response.completed"`) rather than named SSE events.
-
-
 use axum::{
     Router,
     body::Body,

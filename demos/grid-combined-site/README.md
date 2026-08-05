@@ -133,6 +133,9 @@ cargo xtask env run-grid-combined-site-demo \
   --teardown
 ```
 
+See [e2e-demo-output.txt](e2e-demo-output.txt) for example narrated output
+from a quick cold run with external OpenAI provider.
+
 Without these flags, the demo must create no external-provider Secret,
 configuration, candidate, or evidence. With the flags, only the selected
 site's provider gateway may mount the credential. The generated upstream

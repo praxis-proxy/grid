@@ -1,0 +1,59 @@
+{
+  "schema_version": "1",
+  "run_id": "20260805T040717Z",
+  "mode": "workload-quick",
+  "started_at": "2026-08-05T04:07:17Z",
+  "completed_at": "2026-08-05T04:14:05Z",
+  "duration_secs": 407.605479064,
+  "status": "pass",
+  "error": null,
+  "capabilities": [
+    {
+      "capability": "Observable overlay contract",
+      "result": "pass",
+      "evidence": "one revision matched rendered/distributed/accepted/serving evidence"
+    },
+    {
+      "capability": "Secure provider boundary",
+      "result": "pass",
+      "evidence": "mTLS, peer auth, NetworkPolicy, credential replacement verified"
+    },
+    {
+      "capability": "In-cluster workload routing",
+      "result": "pass",
+      "evidence": "2 consumer cluster(s) routed to provider via in-cluster Jobs"
+    },
+    {
+      "capability": "Edge withdrawal and recovery",
+      "result": "not_applicable",
+      "evidence": "workload mode has no traffic manager"
+    },
+    {
+      "capability": "Local preference and remote fallback",
+      "result": "skipped",
+      "evidence": "quick mode"
+    }
+  ],
+  "observed_paths": [
+    {
+      "edge": "east-edge",
+      "provider": "east-provider",
+      "path": "workload -> east-edge consumer gateway -> east-provider gateway -> east-provider backend"
+    },
+    {
+      "edge": "west-edge",
+      "provider": "west-provider",
+      "path": "workload -> west-edge consumer gateway -> west-provider gateway -> west-provider backend"
+    }
+  ],
+  "lifecycle": {
+    "teardown_requested": true,
+    "teardown_performed": true,
+    "teardown_result": "success",
+    "kept_on_failure": false
+  },
+  "artifacts": {
+    "narration": "demos/grid-workload-inference/evidence/narration.txt",
+    "results": "demos/grid-workload-inference/evidence/results.json"
+  }
+}

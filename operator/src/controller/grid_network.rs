@@ -110,6 +110,13 @@ impl OperatorCtx {
 /// Requeue interval after a successful reconciliation.
 const REQUEUE_INTERVAL: Duration = Duration::from_secs(300);
 
+/// Shorter requeue interval when any provider in the network has
+/// `metricsConfig.tls` configured.  Without a cluster-wide Secret watch,
+/// this bounded interval detects TLS material rotation for the metrics
+/// collection and overlay publication that happen in the `GridNetwork`
+/// reconcile loop.
+const TLS_REQUEUE_INTERVAL: Duration = Duration::from_secs(60);
+
 /// Field manager name for server-side apply.
 const FIELD_MANAGER: &str = "grid-operator";
 
@@ -241,7 +248,8 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
     // List providers once; share between routing overlay rendering and CRDT publishing.
     let providers = list_all_inference_providers(client).await?;
     let raw_metrics =
-        provider_metrics::collect_provider_metrics(name, &providers, &ctx.metrics_cache, Instant::now()).await;
+        provider_metrics::collect_provider_metrics(name, &providers, &ctx.metrics_cache, Instant::now(), Some(client))
+            .await;
 
     let remote_crdt_providers: Vec<crdt::ProviderState> = ctx
         .swim
@@ -312,7 +320,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
         reconcile_discovered_sites(name, swim.site_name(), snapshot, client, plaintext).await?;
     }
 
-    Ok(Action::requeue(REQUEUE_INTERVAL))
+    Ok(Action::requeue(requeue_interval_for_network(&providers)))
 }
 
 /// Apply `spec.tls.swimKeyRef` before any reconcile-triggered SWIM send.
@@ -1916,6 +1924,28 @@ async fn reconcile_discovered_sites(
     }
 
     Ok(())
+}
+
+/// Compute the requeue interval for a [`GridNetwork`] reconcile.
+///
+/// When any [`InferenceProvider`] in the network has `metricsConfig.tls`
+/// configured, returns [`TLS_REQUEUE_INTERVAL`] (60 s) so the metrics
+/// collection and overlay publication in this reconcile loop detect
+/// certificate rotation without a cluster-wide Secret watch.
+///
+/// For networks with only plaintext metrics (or no metrics), returns the
+/// default [`REQUEUE_INTERVAL`] (300 s).
+///
+/// [`InferenceProvider`]: crate::crd::inference_provider::InferenceProvider
+fn requeue_interval_for_network(providers: &[InferenceProvider]) -> Duration {
+    let any_has_tls = providers
+        .iter()
+        .any(|p| p.spec.metrics_config.as_ref().is_some_and(|mc| mc.tls.is_some()));
+    if any_has_tls {
+        TLS_REQUEUE_INTERVAL
+    } else {
+        REQUEUE_INTERVAL
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3957,5 +3987,100 @@ mod tests {
         let first = eligible.first().unwrap_or_else(|| std::process::abort());
         assert_eq!(first.site_id, "site-a", "filter must not alter provider identity");
         assert_eq!(first.network_id, "net", "filter must not alter provider network");
+    }
+
+    // -----------------------------------------------------------------------
+    // requeue_interval_for_network
+    // -----------------------------------------------------------------------
+
+    fn make_provider_with_tls(name: &str, network_ref: &str) -> InferenceProvider {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "kind": "InferenceProvider",
+            "metadata": { "name": name },
+            "spec": {
+                "gridNetworkRef": network_ref,
+                "providerKind": "self_hosted",
+                "backendKind": "local",
+                "endpoint": "http://localhost:8000",
+                "models": [],
+                "metricsConfig": {
+                    "endpoint": "https://localhost:9090/metrics",
+                    "tls": {
+                        "caSecretRef": { "namespace": "ns", "name": "ca" }
+                    }
+                }
+            }
+        }))
+        .unwrap_or_else(|_| std::process::abort())
+    }
+
+    fn make_provider_with_tls_and_health_interval(name: &str, network_ref: &str, interval: &str) -> InferenceProvider {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "kind": "InferenceProvider",
+            "metadata": { "name": name },
+            "spec": {
+                "gridNetworkRef": network_ref,
+                "providerKind": "self_hosted",
+                "backendKind": "local",
+                "endpoint": "http://localhost:8000",
+                "models": [],
+                "healthCheck": { "interval": interval },
+                "metricsConfig": {
+                    "endpoint": "https://localhost:9090/metrics",
+                    "tls": {
+                        "caSecretRef": { "namespace": "ns", "name": "ca" }
+                    }
+                }
+            }
+        }))
+        .unwrap_or_else(|_| std::process::abort())
+    }
+
+    #[test]
+    fn network_requeue_no_tls_uses_default() {
+        let providers = vec![
+            make_inference_provider("p1", "net"),
+            make_inference_provider("p2", "net"),
+        ];
+        assert_eq!(
+            requeue_interval_for_network(&providers),
+            REQUEUE_INTERVAL,
+            "networks with no TLS providers should use 300s"
+        );
+    }
+
+    #[test]
+    fn network_requeue_tls_provider_uses_tls_interval() {
+        let providers = vec![make_provider_with_tls("p1", "net")];
+        assert_eq!(
+            requeue_interval_for_network(&providers),
+            TLS_REQUEUE_INTERVAL,
+            "network with a TLS provider should use 60s"
+        );
+    }
+
+    #[test]
+    fn network_requeue_mixed_providers_uses_tls_interval() {
+        let providers = vec![
+            make_inference_provider("plain", "net"),
+            make_provider_with_tls("secure", "net"),
+        ];
+        assert_eq!(
+            requeue_interval_for_network(&providers),
+            TLS_REQUEUE_INTERVAL,
+            "mixed plaintext/TLS providers should use 60s"
+        );
+    }
+
+    #[test]
+    fn network_requeue_longer_health_interval_does_not_delay_tls() {
+        let providers = vec![make_provider_with_tls_and_health_interval("p1", "net", "600s")];
+        assert_eq!(
+            requeue_interval_for_network(&providers),
+            TLS_REQUEUE_INTERVAL,
+            "a longer healthCheck.interval must not delay TLS rotation detection"
+        );
     }
 }

@@ -215,6 +215,9 @@ cargo run -p xtask -- env run-grid-llmd-pool-metrics-demo --full --evidence-dir 
 cargo run -p xtask -- env run-grid-llmd-pool-metrics-demo --full --teardown
 ```
 
+See [e2e-demo-output.txt](e2e-demo-output.txt) for example narrated output
+from a full cold run.
+
 ## Prerequisites
 
 ### Local Repositories and Images

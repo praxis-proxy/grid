@@ -1,0 +1,242 @@
+===============================================================================
+ENVIRONMENT SETUP
+===============================================================================
+
+[SETUP 1/7] Staging demo certificates and provider identities
+  reusing existing CA certificate
+  reusing cert for east-edge
+  reusing cert for west-edge
+  reusing cert for edge-untrusted
+  reusing cert for east-provider
+  reusing cert for west-provider
+  reusing wrong-org cert
+
+[SETUP 2/7] Creating four Kind clusters on one shared cross-cluster network
+            Forge will report again after cluster creation completes.
+
+[SETUP 3/7] Resolving and loading runtime images
+  gateway:       praxis-ai:glb-demo
+  operator:      grid-operator:glb-demo
+  mock provider: grid-mock-providers:glb-demo
+  pull policy:   Never
+
+[SETUP 4/7] Installing MetalLB, SWIM services, and Grid operators
+
+[SETUP 5/7] Installing provider trust, credentials, and policy
+secret/edge-gateway-tls created
+secret/edge-gateway-tls created
+configmap/provider-gateway-config created
+secret/provider-gateway-tls created
+secret/mock-inference-credential created
+secret/mock-inference-secondary-credential created
+configmap/provider-gateway-config created
+secret/provider-gateway-tls created
+secret/mock-inference-credential created
+grid-routing: edge identities, provider configs, mTLS material, and credentials installed
+
+[SETUP 6/7] Deploying two provider gateways and three private inference providers
+
+[SETUP 7/7] Configuring edge trust and deploying Praxis edge gateways
+  [OK] east-edge: local edge site configured
+  [OK] west-edge: local edge site configured
+
+  east-edge trust view: authorizing providers discovered through Grid
+  [OK] GridSite "glb-demo-east-provider" auto-created by operator (gridNetworkRef="glb-demo")
+  [OK] GridSite "glb-demo-east-provider": advertised certificate matches the staged identity
+  [OK] GridSite "glb-demo-east-provider": canonicalFingerprints + serverName="east-provider.grid.internal" patched
+  [OK] GridSite "glb-demo-east-provider": phase="Active" (confirmed)
+  [OK] GridSite "glb-demo-west-provider" auto-created by operator (gridNetworkRef="glb-demo")
+  [OK] GridSite "glb-demo-west-provider": advertised certificate matches the staged identity
+  [OK] GridSite "glb-demo-west-provider": canonicalFingerprints + serverName="west-provider.grid.internal" patched
+  [OK] GridSite "glb-demo-west-provider": phase="Active" (confirmed)
+
+  west-edge trust view: authorizing providers discovered through Grid
+  [OK] GridSite "glb-demo-east-provider" auto-created by operator (gridNetworkRef="glb-demo")
+  [OK] GridSite "glb-demo-east-provider": advertised certificate matches the staged identity
+  [OK] GridSite "glb-demo-east-provider": canonicalFingerprints + serverName="east-provider.grid.internal" patched
+  [OK] GridSite "glb-demo-east-provider": phase="Active" (confirmed)
+  [OK] GridSite "glb-demo-west-provider" auto-created by operator (gridNetworkRef="glb-demo")
+  [OK] GridSite "glb-demo-west-provider": advertised certificate matches the staged identity
+  [OK] GridSite "glb-demo-west-provider": canonicalFingerprints + serverName="west-provider.grid.internal" patched
+  [OK] GridSite "glb-demo-west-provider": phase="Active" (confirmed)
+  [OK] east-edge: Praxis edge gateway deployed
+  [OK] west-edge: Praxis edge gateway deployed
+
+[SETUP 8/7] Waiting for both edge-local routing overlays to converge
+            Each edge must receive one complete, versioned provider view.
+            This proves distribution; Praxis acceptance is verified next.
+  distributed → east-edge: revision=2e72db5b51ec21d4…
+  distributed → west-edge: revision=c93cdc56350ee985…
+
+[READY] Environment deployed from demos/grid-glb-demo/.forge.resolved.yaml
+        east-edge=3 candidates, projected `ConfigMap`, west-edge=3 candidates, projected `ConfigMap`
+
+===============================================================================
+PRAXIS GRID WORKLOAD INFERENCE DEMO
+===============================================================================
+
+Mode: QUICK
+Proof policy: Every PASS comes from a runtime assertion; manifest intent is not
+              counted as proof.
+
+EXPECTED PATH
+  workload -> local Praxis consumer gateway
+           -> Grid-selected provider gateway -> private backend
+
+No traffic manager or public endpoint involved.
+
+===============================================================================
+DEMO 1 | GRID ROUTING AND PROVIDER BOUNDARY
+===============================================================================
+
+USER STORY
+  As a platform operator, I need the Grid mesh to converge, discover providers,
+  and enforce the provider security boundary.
+
+DETAILED RUNTIME PROOF
+-------------------------------------------------------------------------------
+  [CHECK] Prerequisites
+  [CHECK] validating forge config
+  [CHECK] checking environment status
+  [CHECK] checking clusters live
+  [CHECK] checking provider gateway IPs
+  [CHECK] checking SWIM LB services
+  [CHECK] checking operator SWIM advertise address
+  [CHECK] checking GridNetwork seeds
+  [CHECK] checking overlay candidate metadata
+  rendered → revision=2e72db5b51ec21d4…
+  distributed → revision=2e72db5b51ec21d4…, resourceVersion=6618
+  [CHECK] checking multiple providers in one site overlay
+  [CHECK] checking provider gateway self-discovery
+  [CHECK] checking remote GridSite egress addresses
+  [CHECK] checking provider service selector
+  [CHECK] checking provider gateway pods
+  [CHECK] checking backend private service
+  [CHECK] checking backend network policy
+  [CHECK] checking provider mTLS trust matrix
+  [CHECK] checking provider peer policy
+  [CHECK] checking provider request boundary
+  [CHECK] checking edge config applied
+  [CHECK] checking edge overlay projections
+  distributed → east-edge: revision=2e72db5b51ec21d4…
+  distributed → west-edge: revision=c93cdc56350ee985…
+  [CHECK] capturing edge gateway pod identity
+  accepted → east-edge: revision=2e72db5b51ec21d4…
+  accepted → west-edge: revision=c93cdc56350ee985…
+  [CHECK] sending inference request
+  serving → revision=2e72db5b51ec21d4…
+  [CHECK] routing to both providers hosted by the east site
+  waiting for mock-inference in east-provider (ns=grid-system)...
+Waiting for deployment "mock-inference" rollout to finish: 1 old replicas are pending termination...
+Waiting for deployment "mock-inference" rollout to finish: 1 old replicas are pending termination...
+deployment "mock-inference" successfully rolled out
+  waiting for mock-inference in east-provider (ns=grid-system)...
+Waiting for deployment "mock-inference" rollout to finish: 0 out of 1 new replicas have been updated...
+Waiting for deployment "mock-inference" rollout to finish: 1 old replicas are pending termination...
+Waiting for deployment "mock-inference" rollout to finish: 1 old replicas are pending termination...
+deployment "mock-inference" successfully rolled out
+
+RUNTIME PROOF RESULTS
+-------------------------------------------------------------------------------
+Grid must update live edge routing from discovered provider state while authenticated provider gateways protect private backends.
+
+
+| Step | Result | Evidence |
+|---|---|---|
+| prerequisites | **PASS** | config validation passed |
+| forge status | **PASS** | forge status returned OK |
+| clusters live | **PASS** | all 4 clusters live |
+| provider gateway IPs | **PASS** | east-provider=172.19.255.232, west-provider=172.19.255.212 |
+| swim lb services | **PASS** | east-edge=172.19.255.191, east-provider=172.19.255.231, west-edge=172.19.255.171, west-provider=172.19.255.211 |
+| swim advertise addr | **PASS** | east-edge=172.19.255.191:7946, east-provider=172.19.255.231:7946, west-edge=172.19.255.171:7946, west-provider=172.19.255.211:7946 |
+| gridnetwork seeds | **PASS** | seeds: east-edge=3, east-provider=3, west-edge=3, west-provider=3 |
+| overlay metadata | **PASS** | dual-key: 3 candidate(s), validated: stable_id, admission_state, selection_tier, rank, generated_at; envelope: schema=1.0.0, revision=2e72db5b51ec21d4…, annotations and Grid status verified |
+| same-site provider candidates | **PASS** | east-edge: east-provider clusters=[sim-east-provider,sim-east-provider-secondary], stable_ids=[84f799fe,eaf38b2d]; west-edge: east-provider clusters=[sim-east-provider,sim-east-provider-secondary], stable_ids=[84f799fe,eaf38b2d] |
+| provider gateway addr | **PASS** | east-provider=172.19.255.232:8443 (self-discovered, broadcast via SWIM), west-provider=172.19.255.212:8443 (self-discovered, broadcast via SWIM) |
+| remote gridsite egress | **PASS** | east-provider=172.19.255.232:8443, west-provider=172.19.255.212:8443 |
+| provider service selector | **PASS** | east-provider: port=8443, selector={"app.kubernetes.io/instance":"provider-gateway","app.kubernetes.io/name":"provider-gateway"}; west-provider: port=8443, selector={"app.kubernetes.io/instance":"provider-gateway","app.kubernetes.io/name":"provider-gateway"} |
+| provider gateway pods | **PASS** | east-provider: Running, image=praxis-ai:glb-demo; west-provider: Running, image=praxis-ai:glb-demo |
+| backend private service | **PASS** | east-provider/mock-inference: type=ClusterIP; east-provider/mock-inference-secondary: type=ClusterIP; west-provider/mock-inference: type=ClusterIP |
+| backend network policy | **PASS** | east-provider/primary: allowed=connected, unlabeled=denied, no_auth=HTTP_401, client_auth=HTTP_403; east-provider/secondary: allowed=connected, unlabeled=denied, no_auth=HTTP_401, client_auth=HTTP_403; west-provider/primary: allowed=connected, unlabeled=denied, no_auth=HTTP_401, client_auth=HTTP_403 |
+| provider mTLS trust matrix | **PASS** | east-provider: valid_edges=2, no_cert/wrong_sni/wrong_ca=TLS_REFUSED; west-provider: valid_edges=2, no_cert/wrong_sni/wrong_ca=TLS_REFUSED |
+| provider peer policy | **PASS** | east-provider: wrong_org=HTTP_403, unknown_digest=HTTP_403; west-provider: wrong_org=HTTP_403, unknown_digest=HTTP_403 |
+| provider request boundary | **PASS** | east-provider: unknown_candidate=HTTP_403, wrong_path=HTTP_404; west-provider: unknown_candidate=HTTP_403, wrong_path=HTTP_404 |
+| edge config applied | **PASS** | GridNetwork 'glb-demo' applied on both edge clusters |
+| edge overlays mounted | **PASS** | east-edge=3 candidates, projected `ConfigMap`, west-edge=3 candidates, projected `ConfigMap` |
+| edge gateways running | **PASS** | east-edge=uid:5db52839-76a…, restarts:0, accepted_revision:2e72db5b51ec21d4…, west-edge=uid:0d4e8cc9-bfc…, restarts:0, accepted_revision:c93cdc56350ee985… |
+| inference routed | **PASS** | HTTP 200, model=sim-model-v1, provider=east-provider, gateway=east-provider, backend_request_id=5844fa9c98a429af…, overlay_revision=2e72db5b51ec21d4…, provider credential replaced client-supplied credential |
+| same-site providers routed | **PASS** | east-provider gateway routed sim-model-v1 to independent providers east-provider and east-provider-secondary; provider=east-provider, queue_depth=0.95, overlay admission_state=existing_only; overlay reload observed: before=3, after=4; queue_depth=0.10, overlay admission_state=new_and_existing; overlay reload observed: before=4, after=5 |
+
+[PASS] All routing and provider-boundary proof points passed.
+
+===============================================================================
+DEMO 2 | IN-CLUSTER WORKLOAD ROUTING
+===============================================================================
+
+USER STORY
+  As a platform workload, I need requests from inside the consumer cluster to
+  reach a Grid-selected provider without any external ingress.
+configmap/workload-request-body created
+job.batch/workload-request-31559 created
+configmap/workload-request-body created
+job.batch/workload-request-36801 created
+
+OBSERVED WORKLOAD ROUTES
+  [PASS] east-edge -> east-provider
+         workload -> east-edge consumer gateway -> east-provider gateway -> east-provider backend
+  [PASS] west-edge -> west-provider
+         workload -> west-edge consumer gateway -> west-provider gateway -> west-provider backend
+
+===============================================================================
+DEMO 3 | SECURE PROVIDER BOUNDARY
+===============================================================================
+
+USER STORY
+  As a provider and security owner, I need authenticated Grid traffic, exact
+  local policy, private backend isolation, and final-hop credential
+  replacement.
+
+[PASS] Both provider gateways required mTLS, accepted both pinned edge
+       identities, rejected missing or invalid TLS identities, and enforced
+       exact candidate/model/path policy for three provider candidates.
+
+[PASS] All three private provider paths are isolated by NetworkPolicy and
+       provider-local credentials; the two east providers use distinct backends
+       and credentials behind one site gateway.
+
+[SKIP] Local preference/fallback runs only in full mode.
+
+===============================================================================
+DEMONSTRATED BOUNDARY
+===============================================================================
+
+[PROVEN] In-cluster workloads reached Grid-selected providers through local
+         consumer gateways without external ingress.
+[PROVEN] Versioned overlays with provider candidates, plus
+         rendered/distributed/accepted/serving revision evidence.
+[PROVEN] Provider mTLS, peer authorization, and credential replacement.
+[NOT APPLICABLE] Edge withdrawal and GTM steering (workload mode has no traffic
+                 manager).
+
+[CLEANUP] Tearing down demo clusters...
+[CLEANUP] Teardown complete.
+
+===============================================================================
+FINAL RESULT
+===============================================================================
+[PASS   ] Observable overlay contract
+          one revision matched rendered/distributed/accepted/serving evidence
+[PASS   ] Secure provider boundary
+          mTLS, peer auth, NetworkPolicy, credential replacement verified
+[PASS   ] In-cluster workload routing
+          2 consumer cluster(s) routed to provider via in-cluster Jobs
+[NOT_APPLICABLE] Edge withdrawal and recovery
+          workload mode has no traffic manager
+[SKIPPED] Local preference and remote fallback
+          quick mode
+
+OVERALL   PASS
+MODE      WORKLOAD-QUICK
+ELAPSED   407.6s
+EVIDENCE  demos/grid-workload-inference/evidence
+[EVIDENCE] Human narration and results.json written to demos/grid-workload-inference/evidence

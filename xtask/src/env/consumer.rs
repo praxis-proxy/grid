@@ -2119,8 +2119,6 @@ pub(crate) fn verify_credential_injection(
 // ---------------------------------------------------------------------------
 // Shared helpers
 // ---------------------------------------------------------------------------
-
-
 /// Indent each line of a YAML string by `spaces` spaces.
 fn indent_yaml(yaml: &str, spaces: usize) -> String {
     let prefix = " ".repeat(spaces);
@@ -2143,7 +2141,6 @@ fn indent_yaml(yaml: &str, spaces: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
     // -----------------------------------------------------------------------
     // Test utilities
     // -----------------------------------------------------------------------
@@ -2477,7 +2474,6 @@ mod tests {
             "overlay mode must include intelligent_route"
         );
     }
-
 
     // -----------------------------------------------------------------------
     // API-provider credential injection

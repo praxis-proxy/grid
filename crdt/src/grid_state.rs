@@ -22,7 +22,6 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::OrSet;
-
 // ---------------------------------------------------------------------------
 // Access policy
 // ---------------------------------------------------------------------------
@@ -39,7 +38,6 @@ pub struct ProviderAccessPolicy {
     /// Non-empty requires exact label matching.
     pub match_labels: BTreeMap<String, String>,
 }
-
 
 // ---------------------------------------------------------------------------
 // Capability

@@ -1227,6 +1227,9 @@ cargo xtask env run-grid-glb-demo \
   2>&1 | tee grid-glb-demo-output.txt
 ```
 
+See [e2e-demo-output.txt](e2e-demo-output.txt) for example narrated output
+from a quick cold run.
+
 The command:
 
 1. resolves image overrides without changing source manifests;

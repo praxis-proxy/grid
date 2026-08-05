@@ -33,6 +33,7 @@ spec:
         eppImageTag: "llmd-pool-metrics-demo"
         simImageRepo: "llm-d-inference-sim"
         simImageTag: "llmd-pool-metrics-demo"
+        nginxImage: "nginx:metrics-proxy-demo"
         poolName: pool-a
 
     - name: pool-b
@@ -54,6 +55,7 @@ spec:
         eppImageTag: "llmd-pool-metrics-demo"
         simImageRepo: "llm-d-inference-sim"
         simImageTag: "llmd-pool-metrics-demo"
+        nginxImage: "nginx:metrics-proxy-demo"
         poolName: pool-b
 
   stacks:
@@ -151,6 +153,8 @@ spec:
         - type: manifest
           path: resources/common/epp-rbac.yaml
         - type: manifest
+          path: resources/common/metrics-tls-proxy-config.yaml
+        - type: manifest
           path: resources/pool-a/sim-config.yaml
         - type: manifest
           path: resources/pool-a/sim-deployment.yaml
@@ -190,6 +194,8 @@ spec:
           path: resources/common/inferencepool-crd.yaml
         - type: manifest
           path: resources/common/epp-rbac.yaml
+        - type: manifest
+          path: resources/common/metrics-tls-proxy-config.yaml
         - type: manifest
           path: resources/pool-b/sim-config.yaml
         - type: manifest
@@ -282,13 +288,21 @@ spec:
                 metricsConfig:
                   path: /metrics
                   timeout: "2s"
-                  metricsEndpoint: "http://llmd-epp-metrics.grid-system.svc.cluster.local:9090"
+                  staleMetricsSeconds: 20
+                  metricsEndpoint: "https://llmd-epp-metrics.grid-system.svc.cluster.local:9443"
                   poolName: "{{ cluster.properties.poolName }}"
                   queueCapacity: 16
                   signalNames:
                     kvCacheUtilization: llm_d_router_epp_average_kv_cache_utilization
                     queueDepth: llm_d_router_epp_average_queue_size
                     healthy: llm_d_router_epp_ready_endpoints
+                  tls:
+                    caSecretRef:
+                      name: metrics-ca
+                      namespace: grid-system
+                    clientCertificateSecretRef:
+                      name: metrics-client-tls
+                      namespace: grid-system
 
     pool-b-site:
       description: Pool-B combined site with Grid CRs
@@ -351,13 +365,21 @@ spec:
                 metricsConfig:
                   path: /metrics
                   timeout: "2s"
-                  metricsEndpoint: "http://llmd-epp-metrics.grid-system.svc.cluster.local:9090"
+                  staleMetricsSeconds: 20
+                  metricsEndpoint: "https://llmd-epp-metrics.grid-system.svc.cluster.local:9443"
                   poolName: "{{ cluster.properties.poolName }}"
                   queueCapacity: 16
                   signalNames:
                     kvCacheUtilization: llm_d_router_epp_average_kv_cache_utilization
                     queueDepth: llm_d_router_epp_average_queue_size
                     healthy: llm_d_router_epp_ready_endpoints
+                  tls:
+                    caSecretRef:
+                      name: metrics-ca
+                      namespace: grid-system
+                    clientCertificateSecretRef:
+                      name: metrics-client-tls
+                      namespace: grid-system
 
     provider-gateway:
       description: Praxis provider gateway with mTLS and credential mounts

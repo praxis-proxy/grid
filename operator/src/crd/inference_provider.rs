@@ -9,7 +9,10 @@ use kube::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use super::auth::{AccessPolicy, AuthConfig};
+use super::{
+    auth::{AccessPolicy, AuthConfig},
+    grid_network::SecretRef,
+};
 
 // ---------------------------------------------------------------------------
 // Spec
@@ -184,6 +187,109 @@ pub struct MetricsConfig {
     #[schemars(range(min = 1))]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stale_metrics_seconds: Option<u32>,
+
+    /// TLS configuration for the metrics endpoint.
+    ///
+    /// When set, the operator uses the provided CA certificate for TLS server
+    /// verification and optionally presents a client certificate for mutual TLS
+    /// (mTLS).  When absent, the scraper uses system root certificates
+    /// (backward-compatible).
+    ///
+    /// **Fail-closed:** when configured but the referenced Secrets cannot be
+    /// resolved or contain invalid material, the scrape is skipped entirely.
+    /// The scraper never falls back to system roots or plain HTTP.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<MetricsTlsConfig>,
+}
+
+/// TLS configuration for metrics endpoint scraping.
+///
+/// Controls how the operator verifies the metrics server's identity and,
+/// optionally, authenticates itself to the server via a client certificate
+/// (mutual TLS / mTLS).
+///
+/// Secret references include explicit `namespace` and `name` fields.
+/// The operator reads referenced Secrets during reconciliation —
+/// bounded requeue (60 s for TLS-configured providers) detects
+/// certificate rotation without a cluster-wide Secret watch.
+///
+/// # Secret key conventions
+///
+/// | Secret ref                       | Default keys                | Override field(s)                        |
+/// |----------------------------------|-----------------------------|------------------------------------------|
+/// | `ca_secret_ref`                  | `ca.crt`                    | `key`                                    |
+/// | `client_certificate_secret_ref`  | `tls.crt` / `tls.key`       | `certificate_key` / `private_key_key`    |
+///
+/// # Security invariant
+///
+/// Private key bytes from `client_certificate_secret_ref` are loaded into a
+/// [`rustls::ClientConfig`] and **never** written to logs, events, status
+/// fields, or Prometheus labels.
+///
+/// [`rustls::ClientConfig`]: rustls::ClientConfig
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MetricsTlsConfig {
+    /// Reference to a Secret containing the CA certificate PEM for server
+    /// verification.
+    ///
+    /// The Secret must contain the PEM-encoded CA certificate under the key
+    /// `ca.crt` (or the key specified by `key`).  When this CA is
+    /// set, the scraper trusts **only** this CA — system root certificates
+    /// are not consulted.
+    pub ca_secret_ref: SecretRef,
+
+    /// Reference to a Secret containing the client certificate and private
+    /// key for mutual TLS.
+    ///
+    /// When set, the scraper presents this identity during the TLS handshake.
+    /// The Secret must contain `tls.crt` (or `certificate_key`) and
+    /// `tls.key` (or `private_key_key`) in PEM format.
+    ///
+    /// When absent, the scraper performs one-way TLS only (server verification
+    /// with the CA from `ca_secret_ref`, no client certificate).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_certificate_secret_ref: Option<ClientCertificateSecretRef>,
+}
+
+/// Reference to a Kubernetes Secret containing a client certificate and
+/// private key for mutual TLS.
+///
+/// Both `name` and `namespace` are required because [`InferenceProvider`] is
+/// cluster-scoped.
+///
+/// The key fields default to the standard Kubernetes TLS Secret convention
+/// (`tls.crt` / `tls.key`) but can be overridden for non-standard Secrets.
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientCertificateSecretRef {
+    /// Secret name.
+    #[schemars(length(min = 1))]
+    pub name: String,
+
+    /// Secret namespace.
+    #[schemars(length(min = 1))]
+    pub namespace: String,
+
+    /// Key within `Secret.data` holding the PEM-encoded client certificate.
+    #[schemars(length(min = 1))]
+    #[serde(default = "default_certificate_key")]
+    pub certificate_key: String,
+
+    /// Key within `Secret.data` holding the PEM-encoded private key.
+    #[schemars(length(min = 1))]
+    #[serde(default = "default_private_key_key")]
+    pub private_key_key: String,
+}
+
+/// Default key for the client certificate PEM in a Secret.
+fn default_certificate_key() -> String {
+    "tls.crt".to_owned()
+}
+
+/// Default key for the private key PEM in a Secret.
+fn default_private_key_key() -> String {
+    "tls.key".to_owned()
 }
 
 /// Mapping from scoring signal names to Prometheus metric names.
@@ -285,13 +391,15 @@ pub struct InferenceProviderStatus {
 
     /// Machine-readable reason for the current phase when not `Available`.
     ///
-    /// Set when the provider cannot reach `Available` due to a configuration
-    /// or credential error.  `None` when the provider is `Available`, `Pending`,
-    /// or the reason is unknown.
+    /// Set when the provider cannot reach `Available` due to a configuration,
+    /// credential, or metrics collection error.  `None` when the provider is
+    /// `Available`, `Pending`, or the reason is unknown.
     ///
-    /// Stable reason values: `UnsupportedAuthStrategy`, `CredentialSecretRefInvalid`,
-    /// `CredentialSecretMissing`, `CredentialSecretKeyMissing`,
-    /// `CredentialSecretValueInvalid`.
+    /// Stable reason values:
+    /// - `UnsupportedAuthStrategy`, `CredentialSecretRefInvalid`, `CredentialSecretMissing`,
+    ///   `CredentialSecretKeyMissing`, `CredentialSecretValueInvalid`
+    /// - `MetricsTlsSecretMissing`, `MetricsTlsKeyMissing`, `MetricsTlsMaterialInvalid`,
+    ///   `MetricsTlsIdentityMismatch`
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
 }
@@ -537,11 +645,93 @@ mod tests {
             metrics_endpoint: None,
             pool_name: None,
             queue_capacity: None,
+            tls: None,
         };
         let serialised = serde_json::to_value(&mc).unwrap_or_else(|_| std::process::abort());
         assert!(
             serialised.get("staleMetricsSeconds").is_none(),
             "absent staleMetricsSeconds must not appear in serialised output"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // CRD schema: minLength validation on Secret reference fields
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "tests multiple schema paths in one assertion block"
+    )]
+    fn crd_schema_enforces_min_length_on_tls_secret_fields() {
+        let crd = crd_json();
+        let tls_props = crd
+            .pointer(
+                "/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties/metricsConfig/properties/tls/properties",
+            )
+            .and_then(serde_json::Value::as_object)
+            .unwrap_or_else(|| std::process::abort());
+
+        let ca_ref_props = tls_props
+            .get("caSecretRef")
+            .and_then(|v| v.pointer("/properties"))
+            .and_then(serde_json::Value::as_object)
+            .unwrap_or_else(|| std::process::abort());
+
+        assert_eq!(
+            ca_ref_props
+                .get("name")
+                .and_then(|v| v.get("minLength"))
+                .and_then(serde_json::Value::as_u64),
+            Some(1),
+            "caSecretRef.name must have minLength: 1"
+        );
+        assert_eq!(
+            ca_ref_props
+                .get("namespace")
+                .and_then(|v| v.get("minLength"))
+                .and_then(serde_json::Value::as_u64),
+            Some(1),
+            "caSecretRef.namespace must have minLength: 1"
+        );
+
+        let client_ref_props = tls_props
+            .get("clientCertificateSecretRef")
+            .and_then(|v| v.pointer("/properties"))
+            .and_then(serde_json::Value::as_object)
+            .unwrap_or_else(|| std::process::abort());
+
+        assert_eq!(
+            client_ref_props
+                .get("name")
+                .and_then(|v| v.get("minLength"))
+                .and_then(serde_json::Value::as_u64),
+            Some(1),
+            "clientCertificateSecretRef.name must have minLength: 1"
+        );
+        assert_eq!(
+            client_ref_props
+                .get("namespace")
+                .and_then(|v| v.get("minLength"))
+                .and_then(serde_json::Value::as_u64),
+            Some(1),
+            "clientCertificateSecretRef.namespace must have minLength: 1"
+        );
+        assert_eq!(
+            client_ref_props
+                .get("certificateKey")
+                .and_then(|v| v.get("minLength"))
+                .and_then(serde_json::Value::as_u64),
+            Some(1),
+            "clientCertificateSecretRef.certificateKey must have minLength: 1"
+        );
+        assert_eq!(
+            client_ref_props
+                .get("privateKeyKey")
+                .and_then(|v| v.get("minLength"))
+                .and_then(serde_json::Value::as_u64),
+            Some(1),
+            "clientCertificateSecretRef.privateKeyKey must have minLength: 1"
         );
     }
 }

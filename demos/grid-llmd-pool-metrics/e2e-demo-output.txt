@@ -1,0 +1,312 @@
+===============================================================================
+Grid llm-d Pool-Metrics Routing Demo
+Mode: full
+Config: demos/grid-llmd-pool-metrics/forge.yaml
+===============================================================================
+  Images:
+    gateway:      praxis-ai:glb-demo
+    operator:     grid-operator:llmd-pool-metrics-demo
+    epp:          llm-d-epp:llmd-pool-metrics-demo
+    sim:          llm-d-inference-sim:llmd-pool-metrics-demo
+    overlay-sync: grid-overlay-sync:llmd-pool-metrics-demo
+    nginx:        nginx:metrics-proxy-demo
+  tagged praxis-ai:glb-demo -> praxis-ai:llmd-pool-metrics-demo
+
+[SETUP 1/11] Validating Forge config
+  [OK] Config: demos/grid-llmd-pool-metrics/.forge.resolved.yaml
+
+[SETUP 2/11] Generating TLS certificates
+  reusing existing CA certificate
+  reusing cert for pool-a
+  reusing cert for pool-b
+  reusing wrong-org cert
+  [OK] TLS certificates generated for pool-a, pool-b
+  [OK] Metrics TLS certificates generated (separate CA)
+
+[SETUP 3/11] Creating two Kind clusters: pool-a, pool-b
+
+[SETUP 4/11] Loading container images into clusters
+Image: "grid-operator:llmd-pool-metrics-demo" with ID "sha256:aec534367ab833b3d7f8a91d6b00ad580e04379d924c3978363eaf7e78c168f2" not yet present on node "grid-llmd-pm-pool-a-control-plane", loading...
+Image: "grid-overlay-sync:llmd-pool-metrics-demo" with ID "sha256:7318c7840022d224274a3ff4b3b41dbaa2b3168971c40b565bd8e7d78253c675" not yet present on node "grid-llmd-pm-pool-a-control-plane", loading...
+Image: "praxis-ai:llmd-pool-metrics-demo" with ID "sha256:ba793df04668f9835fb8cf7175dff5dbd0f48d6f27f138cdb53d2b71454334fe" not yet present on node "grid-llmd-pm-pool-a-control-plane", loading...
+Image: "llm-d-epp:llmd-pool-metrics-demo" with ID "sha256:ca7b4e42fdc2b4b9f327b245237e55be3b1ca044fd4d96475b1a4cede216b0f0" not yet present on node "grid-llmd-pm-pool-a-control-plane", loading...
+Image: "llm-d-inference-sim:llmd-pool-metrics-demo" with ID "sha256:9b4734b61b1dbd036d63b88f210f1e3a85b724f1fe79230c36b5223cf7289e30" not yet present on node "grid-llmd-pm-pool-a-control-plane", loading...
+Image: "nginx:metrics-proxy-demo" with ID "sha256:dce494e22cc769b643412276f57181a31d17a3b5ae28aeaab420aa6fbc93c6d5" not yet present on node "grid-llmd-pm-pool-a-control-plane", loading...
+  [OK] pool-a: all images loaded
+Image: "grid-operator:llmd-pool-metrics-demo" with ID "sha256:aec534367ab833b3d7f8a91d6b00ad580e04379d924c3978363eaf7e78c168f2" not yet present on node "grid-llmd-pm-pool-b-control-plane", loading...
+Image: "grid-overlay-sync:llmd-pool-metrics-demo" with ID "sha256:7318c7840022d224274a3ff4b3b41dbaa2b3168971c40b565bd8e7d78253c675" not yet present on node "grid-llmd-pm-pool-b-control-plane", loading...
+Image: "praxis-ai:llmd-pool-metrics-demo" with ID "sha256:ba793df04668f9835fb8cf7175dff5dbd0f48d6f27f138cdb53d2b71454334fe" not yet present on node "grid-llmd-pm-pool-b-control-plane", loading...
+Image: "llm-d-epp:llmd-pool-metrics-demo" with ID "sha256:ca7b4e42fdc2b4b9f327b245237e55be3b1ca044fd4d96475b1a4cede216b0f0" not yet present on node "grid-llmd-pm-pool-b-control-plane", loading...
+Image: "llm-d-inference-sim:llmd-pool-metrics-demo" with ID "sha256:9b4734b61b1dbd036d63b88f210f1e3a85b724f1fe79230c36b5223cf7289e30" not yet present on node "grid-llmd-pm-pool-b-control-plane", loading...
+Image: "nginx:metrics-proxy-demo" with ID "sha256:dce494e22cc769b643412276f57181a31d17a3b5ae28aeaab420aa6fbc93c6d5" not yet present on node "grid-llmd-pm-pool-b-control-plane", loading...
+  [OK] pool-b: all images loaded
+
+[SETUP 5/11] Installing MetalLB and Grid operators
+  [OK] pool-a: MetalLB and operator ready
+  [OK] pool-b: MetalLB and operator ready
+
+[SETUP 6/11] Seeding SWIM cross-cluster membership
+  pool-a: SWIM LB IP = 172.19.255.231
+  pool-b: SWIM LB IP = 172.19.255.211
+  pool-a: seeds=172.19.255.211:7946
+  pool-b: seeds=172.19.255.231:7946
+Waiting for deployment "grid-operator" rollout to finish: 1 old replicas are pending termination...
+Waiting for deployment "grid-operator" rollout to finish: 1 old replicas are pending termination...
+deployment "grid-operator" successfully rolled out
+  [OK] pool-a: operator restarted with SWIM seeds
+Waiting for deployment "grid-operator" rollout to finish: 1 old replicas are pending termination...
+Waiting for deployment "grid-operator" rollout to finish: 1 old replicas are pending termination...
+deployment "grid-operator" successfully rolled out
+  [OK] pool-b: operator restarted with SWIM seeds
+
+[SETUP 7/11] Installing metrics TLS secrets for EPP sidecar
+secret/metrics-ca created
+secret/metrics-server-tls created
+secret/metrics-client-tls created
+  [OK] pool-a: metrics TLS secrets installed
+secret/metrics-ca created
+secret/metrics-server-tls created
+secret/metrics-client-tls created
+  [OK] pool-b: metrics TLS secrets installed
+
+[SETUP 8/11] Deploying llm-d simulators and EPP
+  [OK] pool-a: sim-1, sim-2, and EPP running
+  [OK] pool-b: sim-1, sim-2, and EPP running
+
+[SETUP 9/11] Installing provider trust and credentials
+secret/consumer-gateway-tls created
+secret/provider-gateway-tls created
+secret/sim-inference-credential created
+  [OK] pool-a: TLS secrets and credentials installed
+secret/consumer-gateway-tls created
+secret/provider-gateway-tls created
+secret/sim-inference-credential created
+  [OK] pool-b: TLS secrets and credentials installed
+
+[SETUP 10/11] Deploying Grid site resources and gateways
+  [OK] pool-a: site and provider-gateway deployed
+  [OK] pool-b: site and provider-gateway deployed
+  [OK] pool-a: consumer-gateway deployed
+  [OK] pool-b: consumer-gateway deployed
+
+[SETUP 11/11] Waiting for overlay convergence
+  pool-a: authorizing remote provider sites
+  [OK] GridSite "grid-llmd-pool-metrics-pool-b" auto-created by operator (gridNetworkRef="grid-llmd-pool-metrics")
+  [OK] GridSite "grid-llmd-pool-metrics-pool-b": advertised certificate matches the staged identity
+  [OK] GridSite "grid-llmd-pool-metrics-pool-b": canonicalFingerprints + serverName="pool-b.grid.internal" patched
+  [OK] GridSite "grid-llmd-pool-metrics-pool-b": phase="Active" (confirmed)
+  pool-b: authorizing remote provider sites
+  [OK] GridSite "grid-llmd-pool-metrics-pool-a" auto-created by operator (gridNetworkRef="grid-llmd-pool-metrics")
+  [OK] GridSite "grid-llmd-pool-metrics-pool-a": advertised certificate matches the staged identity
+  [OK] GridSite "grid-llmd-pool-metrics-pool-a": canonicalFingerprints + serverName="pool-a.grid.internal" patched
+  [OK] GridSite "grid-llmd-pool-metrics-pool-a": phase="Active" (confirmed)
+  [OK] All auto-discovered remote GridSites authorized and Active
+  [OK] pool-a: overlay converged with both providers
+  [OK] pool-b: overlay converged with both providers
+
+[READY] Environment deployed
+
+===============================================================================
+ENVIRONMENT READY - Starting proof scenarios
+===============================================================================
+  Waiting for pool-a to become preferred (ramp reset)...
+  pool-a: queue=6.0 rank=1 (waiting for ramp reset)
+  pool-a: queue=6.0 rank=1 (waiting for ramp reset)
+  pool-a: queue=6.0 rank=1 (waiting for ramp reset)
+  pool-a: queue=6.0 rank=1 (waiting for ramp reset)
+  pool-a: queue=7.0 rank=1 (waiting for ramp reset)
+  pool-a: queue=7.0 rank=1 (waiting for ramp reset)
+  pool-a: queue=7.0 rank=1 (waiting for ramp reset)
+  pool-a: queue=7.0 rank=1 (waiting for ramp reset)
+  pool-a: queue=7.0 rank=1 (waiting for ramp reset)
+  pool-a: queue=8.0 rank=1 (waiting for ramp reset)
+  pool-a: queue=8.0 rank=1 (waiting for ramp reset)
+  pool-a: queue=8.0 rank=1 (waiting for ramp reset)
+  pool-a: queue=8.0 rank=1 (waiting for ramp reset)
+  pool-a: queue=8.0 rank=1 (waiting for ramp reset)
+  pool-a: queue=8.0 rank=1 (waiting for ramp reset)
+  pool-a: queue=8.0 rank=1 (waiting for ramp reset)
+  pool-a: queue=8.0 rank=1 (waiting for ramp reset)
+  pool-a: queue=9.0 rank=1 (waiting for ramp reset)
+  pool-a: queue=9.0 rank=1 (waiting for ramp reset)
+  pool-a: queue=9.0 rank=1 (waiting for ramp reset)
+  pool-a: queue=9.0 rank=1 (waiting for ramp reset)
+  pool-a: queue=10.0 rank=1 (waiting for ramp reset)
+  pool-a: queue=10.0 rank=1 (waiting for ramp reset)
+  pool-a: queue=10.0 rank=1 (waiting for ramp reset)
+  pool-a: queue=10.0 rank=1 (waiting for ramp reset)
+  pool-a: queue=10.0 rank=1 (waiting for ramp reset)
+  pool-a: queue=10.0 rank=1 (waiting for ramp reset)
+  pool-a: queue=10.0 rank=1 (waiting for ramp reset)
+  pool-a: queue=10.0 rank=1 (waiting for ramp reset)
+  pool-a: queue=10.0 rank=1 (waiting for ramp reset)
+  pool-a: queue=11.0 rank=1 (waiting for ramp reset)
+  pool-a: queue=11.0 rank=1 (waiting for ramp reset)
+  pool-a: queue=11.0 rank=1 (waiting for ramp reset)
+  pool-a: queue=11.0 rank=1 (waiting for ramp reset)
+  pool-a: queue=12.0 rank=1 (waiting for ramp reset)
+  pool-a: queue=12.0 rank=1 (waiting for ramp reset)
+  pool-a: queue=12.0 rank=1 (waiting for ramp reset)
+  pool-a: queue=12.0 rank=1 (waiting for ramp reset)
+  pool-a: queue=12.0 rank=1 (waiting for ramp reset)
+  pool-a: queue=12.0 rank=1 (waiting for ramp reset)
+  pool-a: queue=12.0 rank=1 (waiting for ramp reset)
+  pool-a: queue=12.0 rank=1 (waiting for ramp reset)
+  pool-a: queue=13.0 rank=1 (waiting for ramp reset)
+  pool-a: queue=13.0 rank=1 (waiting for ramp reset)
+  pool-a: queue=13.0 rank=1 (waiting for ramp reset)
+  pool-a: queue=13.0 rank=1 (waiting for ramp reset)
+  pool-a: queue=14.0 rank=1 (waiting for ramp reset)
+  pool-a: queue=14.0 rank=1 (waiting for ramp reset)
+  pool-a: queue=14.0 rank=1 (waiting for ramp reset)
+  pool-a: queue=14.0 rank=1 (waiting for ramp reset)
+  pool-a: queue=14.0 rank=1 (waiting for ramp reset)
+  pool-a: queue=14.0 rank=1 (waiting for ramp reset)
+  pool-a: queue=14.0 rank=1 (waiting for ramp reset)
+  pool-a: queue=14.0 rank=1 (waiting for ramp reset)
+  pool-a: queue=14.0 rank=1 (waiting for ramp reset)
+  pool-a: queue=15.0 rank=1 (waiting for ramp reset)
+  pool-a: queue=15.0 rank=1 (waiting for ramp reset)
+  pool-a: queue=15.0 rank=1 (waiting for ramp reset)
+  pool-a: queue=15.0 rank=1 (waiting for ramp reset)
+
+  LLM-D POOL ROUTING DECISION
+  State: BASELINE
+
+                   Queue  Capacity  Pressure  KV Cache   Score  Rank
+       Cluster A     0.0        16      0.00      0.11   10.77     0
+       Cluster B     1.0        16      0.06      0.15    9.01     1
+  Score breakdown (llmd-pool-a-provider): locality=3.00 queue=3.00 kv=1.77 prefix=1.00 latency=1.00 cost=1.00
+  Score breakdown (llmd-pool-b-provider): locality=1.50 queue=2.81 kv=1.70 prefix=1.00 latency=1.00 cost=1.00
+
+  Grid preference: CLUSTER A
+
+  Polling for pool-a pressure and A→B routing flip...
+  pool-a: queue=3.0 kv=0.28 score=9.88 rank=0  pool-b: score=9.01 rank=1 gap=-0.86
+  pool-a: queue=3.0 kv=0.28 score=9.88 rank=0  pool-b: score=9.01 rank=1 gap=-0.86
+  pool-a: queue=3.0 kv=0.28 score=9.88 rank=0  pool-b: score=9.01 rank=1 gap=-0.86
+  pool-a: queue=3.0 kv=0.28 score=9.88 rank=0  pool-b: score=9.01 rank=1 gap=-0.86
+  pool-a: queue=4.0 kv=0.31 score=9.62 rank=0  pool-b: score=9.01 rank=1 gap=-0.61
+  pool-a: queue=4.0 kv=0.31 score=9.62 rank=0  pool-b: score=9.01 rank=1 gap=-0.61
+  pool-a: queue=4.0 kv=0.31 score=9.62 rank=0  pool-b: score=9.01 rank=1 gap=-0.61
+  pool-a: queue=4.0 kv=0.31 score=9.62 rank=0  pool-b: score=9.01 rank=1 gap=-0.61
+  pool-a: queue=4.0 kv=0.31 score=9.62 rank=0  pool-b: score=9.01 rank=1 gap=-0.61
+  pool-a: queue=4.0 kv=0.35 score=9.56 rank=0  pool-b: score=9.01 rank=1 gap=-0.54
+  pool-a: queue=4.0 kv=0.35 score=9.56 rank=0  pool-b: score=9.01 rank=1 gap=-0.54
+  pool-a: queue=4.0 kv=0.35 score=9.56 rank=0  pool-b: score=9.01 rank=1 gap=-0.54
+  pool-a: queue=4.0 kv=0.35 score=9.56 rank=0  pool-b: score=9.01 rank=1 gap=-0.54
+  pool-a: queue=5.0 kv=0.38 score=9.30 rank=0  pool-b: score=9.01 rank=1 gap=-0.29
+  pool-a: queue=5.0 kv=0.38 score=9.30 rank=0  pool-b: score=9.01 rank=1 gap=-0.29
+  pool-a: queue=5.0 kv=0.38 score=9.30 rank=0  pool-b: score=9.01 rank=1 gap=-0.29
+  pool-a: queue=5.0 kv=0.38 score=9.30 rank=0  pool-b: score=9.01 rank=1 gap=-0.29
+  pool-a: queue=6.0 kv=0.41 score=9.05 rank=0  pool-b: score=9.01 rank=1 gap=-0.04
+  pool-a: queue=6.0 kv=0.41 score=9.05 rank=0  pool-b: score=9.01 rank=1 gap=-0.04
+  pool-a: queue=6.0 kv=0.41 score=9.05 rank=0  pool-b: score=9.01 rank=1 gap=-0.04
+  pool-a: queue=6.0 kv=0.41 score=9.05 rank=0  pool-b: score=9.01 rank=1 gap=-0.04
+  pool-a: queue=6.0 kv=0.45 score=8.98 rank=1  pool-b: score=9.01 rank=0 gap=0.03
+  pool-a: queue=6.0 kv=0.45 score=8.98 rank=1  pool-b: score=9.01 rank=0 gap=0.03
+  pool-a: queue=6.0 kv=0.45 score=8.98 rank=1  pool-b: score=9.01 rank=0 gap=0.03
+  pool-a: queue=6.0 kv=0.45 score=8.98 rank=1  pool-b: score=9.01 rank=0 gap=0.03
+  pool-a: queue=7.0 kv=0.48 score=8.73 rank=1  pool-b: score=9.01 rank=0 gap=0.29
+  pool-a: queue=7.0 kv=0.48 score=8.73 rank=1  pool-b: score=9.01 rank=0 gap=0.29
+  pool-a: queue=7.0 kv=0.48 score=8.73 rank=1  pool-b: score=9.01 rank=0 gap=0.29
+  pool-a: queue=7.0 kv=0.48 score=8.73 rank=1  pool-b: score=9.01 rank=0 gap=0.29
+  pool-a: queue=8.0 kv=0.51 score=8.73 rank=1  pool-b: score=9.01 rank=0 gap=0.29
+  pool-a: queue=8.0 kv=0.51 score=8.47 rank=1  pool-b: score=9.01 rank=0 gap=0.54
+  pool-a: queue=8.0 kv=0.51 score=8.47 rank=1  pool-b: score=9.01 rank=0 gap=0.54
+  pool-a: queue=8.0 kv=0.51 score=8.47 rank=1  pool-b: score=9.01 rank=0 gap=0.54
+  pool-a: queue=8.0 kv=0.51 score=8.47 rank=1  pool-b: score=9.01 rank=0 gap=0.54
+  pool-a: queue=8.0 kv=0.55 score=8.41 rank=1  pool-b: score=9.01 rank=0 gap=0.61
+  pool-a: queue=8.0 kv=0.55 score=8.41 rank=1  pool-b: score=9.01 rank=0 gap=0.61
+  pool-a: queue=8.0 kv=0.55 score=8.41 rank=1  pool-b: score=9.01 rank=0 gap=0.61
+  pool-a: queue=8.0 kv=0.55 score=8.41 rank=1  pool-b: score=9.01 rank=0 gap=0.61
+  pool-a: queue=9.0 kv=0.58 score=8.15 rank=1  pool-b: score=9.01 rank=0 gap=0.86
+  pool-a: queue=9.0 kv=0.58 score=8.15 rank=1  pool-b: score=9.01 rank=0 gap=0.86
+  pool-a: queue=9.0 kv=0.58 score=8.15 rank=1  pool-b: score=9.01 rank=0 gap=0.86
+  pool-a: queue=9.0 kv=0.58 score=8.15 rank=1  pool-b: score=9.01 rank=0 gap=0.86
+
+  LLM-D POOL ROUTING DECISION
+  State: CLUSTER A CAPACITY PRESSURE
+
+                   Queue  Capacity  Pressure  KV Cache   Score  Rank
+       Cluster A    10.0        16      0.62      0.61    7.90     1
+       Cluster B     1.0        16      0.06      0.15    9.01     0
+  Score breakdown (llmd-pool-b-provider): locality=1.50 queue=2.81 kv=1.70 prefix=1.00 latency=1.00 cost=1.00
+  Score breakdown (llmd-pool-a-provider): locality=3.00 queue=1.12 kv=0.77 prefix=1.00 latency=1.00 cost=1.00
+
+  Grid preference: CLUSTER B
+
+  Waiting for pool-a ramp reset and recovery...
+
+  LLM-D POOL ROUTING DECISION
+  State: RECOVERED
+
+                   Queue  Capacity  Pressure  KV Cache   Score  Rank
+       Cluster A     0.0        16      0.00      0.11   10.77     0
+       Cluster B     1.0        16      0.06      0.15    9.01     1
+  Score breakdown (llmd-pool-a-provider): locality=3.00 queue=3.00 kv=1.77 prefix=1.00 latency=1.00 cost=1.00
+  Score breakdown (llmd-pool-b-provider): locality=1.50 queue=2.81 kv=1.70 prefix=1.00 latency=1.00 cost=1.00
+
+  Grid preference: CLUSTER A
+
+
+===============================================================================
+TLS PROOF STAGES
+===============================================================================
+
+  [TLS 1/9] Baseline mTLS
+
+  [TLS 2/9] Handshake rejection
+
+  [TLS 3/9] Missing client identity
+secret "metrics-client-tls" deleted from grid-system namespace
+
+  [TLS 4/9] Wrong CA
+secret/metrics-client-tls created
+secret/metrics-ca configured
+
+  [TLS 5/9] Restore valid mTLS
+secret/metrics-ca configured
+secret/metrics-client-tls unchanged
+
+  [TLS 6/9] Stale-cache TTL
+    baseline: pool-a observable, score=9.05
+secret "metrics-client-tls" deleted from grid-system namespace
+    deleted Secret/metrics-client-tls to break TLS (staleMetricsSeconds=20)
+    inside-TTL (2s/20s): pool-a still observable, score=8.98 (cached metrics served)
+    post-TTL (28s/20s): pool-a unobservable (cached metrics expired, UNOBSERVABLE_METRICS applied)
+secret/metrics-client-tls created
+    recovery: pool-a observable after client cert restored, score=7.83
+
+  [TLS 7/9] Client Secret rotation
+secret/metrics-client-tls configured
+
+  [TLS 8/9] Server cert rotation
+secret/metrics-server-tls configured
+deployment.apps/llmd-epp restarted
+Waiting for deployment "llmd-epp" rollout to finish: 1 old replicas are pending termination...
+Waiting for deployment "llmd-epp" rollout to finish: 1 old replicas are pending termination...
+deployment "llmd-epp" successfully rolled out
+
+  [TLS 9/9] Existing routing behavior
+
+  Restart accounting
+    pool-a/operator/grid-operator-5d547d8dd-ltht6: uid unchanged, restart_count=0
+    pool-a/epp/llmd-epp-5f8584b68c-5p75s: new pod after server cert rotation (expected), restart_count=0
+    pool-a/gateway/consumer-gateway-75785956d9-tlwh8: overlay-sync restarts=0
+    pool-a/gateway/consumer-gateway-75785956d9-tlwh8: praxis restarts=0
+    pool-a/gateway/provider-gateway-75db8f4547-bdsc5: praxis restarts=0
+    pool-b/operator/grid-operator-f4f679f-dsmdq: uid unchanged, restart_count=0
+    pool-b/epp/llmd-epp-b9cf6694c-2xsmf: uid unchanged, restart_count=0
+    pool-b/gateway/consumer-gateway-797c5844bb-t8p9l: overlay-sync restarts=0
+    pool-b/gateway/consumer-gateway-797c5844bb-t8p9l: praxis restarts=0
+    pool-b/gateway/provider-gateway-7cf855c4f6-j2kzv: praxis restarts=0
+    server rotation (stage 8) on pool-a: EPP rollout restart is expected — nginx does not reload TLS in-place
+
+[TEARDOWN] Removing Kind clusters
+  [OK] Teardown complete
+
+===============================================================================
+DEMO PASSED  (469.3s)
+Evidence: demos/grid-llmd-pool-metrics/evidence/20260805T041659Z/evidence.json
+===============================================================================

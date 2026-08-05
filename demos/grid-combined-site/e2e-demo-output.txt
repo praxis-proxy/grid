@@ -1,0 +1,301 @@
+===============================================================================
+Grid Combined-Site Demo
+Mode: quick
+Config: demos/grid-combined-site/forge.yaml
+===============================================================================
+
+[SETUP 1/14] Resolving Forge config and building images
+  [OK] Forge config resolved to demos/grid-combined-site/.forge.resolved.yaml
+
+[SETUP 2/14] Generating TLS certificates for all sites
+  reusing existing CA certificate
+  generated cert for west (SAN: west.grid.internal)
+  generated cert for central (SAN: central.grid.internal)
+  generated cert for east (SAN: east.grid.internal)
+  reusing wrong-org cert
+  [OK] TLS certificates generated for west, central, east
+
+[SETUP 3/14] Creating three Kind clusters: west, central, east
+network 'grid-combined-site-net' ready
+created cluster 'west' (kind name: grid-combined-west)
+created cluster 'central' (kind name: grid-combined-central)
+created cluster 'east' (kind name: grid-combined-east)
+  [OK] All three clusters created
+
+[SETUP 4/14] Loading container images into Kind clusters
+  verified local image: praxis-ai:combined-site-demo
+  verified local image: grid-operator:combined-site-demo
+  verified local image: grid-mock-providers:combined-site-demo
+  verified numeric USER for grid-mock-providers:combined-site-demo
+  loading praxis-ai:combined-site-demo into west...
+  loading grid-operator:combined-site-demo into west...
+  loading grid-mock-providers:combined-site-demo into west...
+  [OK] west: all images loaded
+  loading praxis-ai:combined-site-demo into central...
+  loading grid-operator:combined-site-demo into central...
+  loading grid-mock-providers:combined-site-demo into central...
+  [OK] central: all images loaded
+  loading praxis-ai:combined-site-demo into east...
+  loading grid-operator:combined-site-demo into east...
+  loading grid-mock-providers:combined-site-demo into east...
+  [OK] east: all images loaded
+
+[SETUP 5/14] Deploying infrastructure stacks
+  applying metallb to west...
+applied stack metallb -> west (3 steps)
+  applying metallb to central...
+applied stack metallb -> central (3 steps)
+  applying metallb to east...
+applied stack metallb -> east (3 steps)
+  applying west-operator-base to west...
+applied stack west-operator-base -> west (3 steps)
+  applying central-operator-base to central...
+applied stack central-operator-base -> central (3 steps)
+  applying east-operator-base to east...
+applied stack east-operator-base -> east (3 steps)
+  [OK] Infrastructure stacks applied
+
+[SETUP 6/14] Verifying Grid operators are ready
+  waiting for grid-operator in deployment (ns=grid-system)...
+deployment "grid-operator" successfully rolled out
+  [OK] west: Grid operator ready
+  waiting for grid-operator in deployment (ns=grid-system)...
+deployment "grid-operator" successfully rolled out
+  [OK] central: Grid operator ready
+  waiting for grid-operator in deployment (ns=grid-system)...
+deployment "grid-operator" successfully rolled out
+  [OK] east: Grid operator ready
+
+[SETUP 7/14] Deploying mock providers
+secret/mock-inference-credential created
+  [OK] west: mock-inference-credential created
+  applying mock-providers to west...
+applied stack mock-providers -> west (3 steps)
+secret/mock-inference-credential created
+  [OK] central: mock-inference-credential created
+  applying mock-providers to central...
+applied stack mock-providers -> central (3 steps)
+secret/mock-inference-credential created
+  [OK] east: mock-inference-credential created
+  applying mock-providers to east...
+applied stack mock-providers -> east (3 steps)
+  [OK] Mock providers deployed
+
+[SETUP 8/14] Deploying grid-site resources
+  applying west-site to west...
+applied stack west-site -> west (1 steps)
+  applying central-site to central...
+applied stack central-site -> central (1 steps)
+  applying east-site to east...
+applied stack east-site -> east (1 steps)
+  [OK] Grid site resources deployed
+
+[SETUP 9/14] Waiting for local overlay ConfigMaps
+  Polling for local overlay ConfigMaps (timeout 180s)...
+  west: sim-west-provider present (semantic_rev=58a156ab437bdab3d77d354c821e729861abae165a3e1bd7d12de3e6d0d06b98, stable_id=65b2bd5b)
+  central: sim-central-provider present (semantic_rev=438a7577f9a1e5756aa4d2a83aa9b9cb56e2c226423bd9bf77947437f308a850, stable_id=2b659cf3)
+  east: sim-east-provider present (semantic_rev=4cd36ca32ad84b2791f579ce32228cc0814d7d7f981944e5857ec8bd55a9e9e9, stable_id=aaea54b3)
+  [OK] Local overlay ConfigMaps ready
+
+[SETUP 10/14] Materializing provider config and installing trust
+Warning: resource secrets/consumer-gateway-tls is missing the kubectl.kubernetes.io/last-applied-configuration annotation which is required by kubectl apply. kubectl apply should only be used on resources created declaratively by either kubectl create --save-config or kubectl apply. The missing annotation will be patched automatically.
+secret/consumer-gateway-tls configured
+secret/provider-gateway-tls created
+secret/wrong-org-client-tls created
+  [OK] west: TLS secrets installed
+Warning: resource secrets/consumer-gateway-tls is missing the kubectl.kubernetes.io/last-applied-configuration annotation which is required by kubectl apply. kubectl apply should only be used on resources created declaratively by either kubectl create --save-config or kubectl apply. The missing annotation will be patched automatically.
+secret/consumer-gateway-tls configured
+secret/provider-gateway-tls created
+secret/wrong-org-client-tls created
+  [OK] central: TLS secrets installed
+Warning: resource secrets/consumer-gateway-tls is missing the kubectl.kubernetes.io/last-applied-configuration annotation which is required by kubectl apply. kubectl apply should only be used on resources created declaratively by either kubectl create --save-config or kubectl apply. The missing annotation will be patched automatically.
+secret/consumer-gateway-tls configured
+secret/provider-gateway-tls created
+secret/wrong-org-client-tls created
+  [OK] east: TLS secrets installed
+  [OK] central: external provider Secret created from key file
+inferenceprovider.grid.praxis-proxy.io/external-open-ai created
+  [OK] central: external InferenceProvider created
+  [OK] External provider configured at central
+  Waiting for external candidate 'openai-api' in central overlay...
+  [OK] External candidate stable_id=518e434a
+  west: sim-west-provider -> 65b2bd5b
+configmap/provider-gateway-config created
+  [OK] west: provider-gateway-config created (stable_id=65b2bd5b)
+  central: sim-central-provider -> 2b659cf3
+  central: external provider config appended (external-open-ai route + cluster, candidate_id=518e434a)
+configmap/provider-gateway-config created
+  [OK] central: provider-gateway-config created (stable_id=2b659cf3)
+  east: sim-east-provider -> aaea54b3
+configmap/provider-gateway-config created
+  [OK] east: provider-gateway-config created (stable_id=aaea54b3)
+  [OK] Provider config materialized, trust installed
+
+[SETUP 11/14] Deploying provider gateways
+  applying provider-gateway to west...
+applied stack provider-gateway -> west (3 steps)
+  applying provider-gateway-external to central...
+applied stack provider-gateway-external -> central (3 steps)
+  applying provider-gateway to east...
+applied stack provider-gateway -> east (3 steps)
+  [OK] Provider gateways deployed
+
+[SETUP 12/14] Deploying consumer gateways
+  applying consumer-gateway to west...
+applied stack consumer-gateway -> west (5 steps)
+  applying consumer-gateway to central...
+applied stack consumer-gateway -> central (5 steps)
+  applying consumer-gateway to east...
+applied stack consumer-gateway -> east (5 steps)
+  [OK] Consumer gateways deployed
+
+[SETUP 13/14] SWIM discovery and trust authorization
+  west: SWIM LB IP = 172.19.255.231
+  central: SWIM LB IP = 172.19.255.211
+  east: SWIM LB IP = 172.19.255.191
+  [OK] west: SWIM peers configured
+  [OK] central: SWIM peers configured
+  [OK] east: SWIM peers configured
+  waiting for grid-operator in deployment (ns=grid-system)...
+deployment "grid-operator" successfully rolled out
+  [OK] west: operator restarted with SWIM config
+  waiting for grid-operator in deployment (ns=grid-system)...
+deployment "grid-operator" successfully rolled out
+  [OK] central: operator restarted with SWIM config
+  waiting for grid-operator in deployment (ns=grid-system)...
+deployment "grid-operator" successfully rolled out
+  [OK] east: operator restarted with SWIM config
+
+  west: authorizing remote provider sites
+  [OK] GridSite "grid-combined-site-central" auto-created by operator (gridNetworkRef="grid-combined-site")
+  [OK] GridSite "grid-combined-site-central": advertised certificate matches the staged identity
+  [OK] GridSite "grid-combined-site-central": canonicalFingerprints + serverName="central.grid.internal" patched
+  [OK] GridSite "grid-combined-site-central": phase="Active" (confirmed)
+  [OK] GridSite "grid-combined-site-east" auto-created by operator (gridNetworkRef="grid-combined-site")
+  [OK] GridSite "grid-combined-site-east": advertised certificate matches the staged identity
+  [OK] GridSite "grid-combined-site-east": canonicalFingerprints + serverName="east.grid.internal" patched
+  [OK] GridSite "grid-combined-site-east": phase="Active" (confirmed)
+
+  central: authorizing remote provider sites
+  [OK] GridSite "grid-combined-site-west" auto-created by operator (gridNetworkRef="grid-combined-site")
+  [OK] GridSite "grid-combined-site-west": advertised certificate matches the staged identity
+  [OK] GridSite "grid-combined-site-west": canonicalFingerprints + serverName="west.grid.internal" patched
+  [OK] GridSite "grid-combined-site-west": phase="Active" (confirmed)
+  [OK] GridSite "grid-combined-site-east" auto-created by operator (gridNetworkRef="grid-combined-site")
+  [OK] GridSite "grid-combined-site-east": advertised certificate matches the staged identity
+  [OK] GridSite "grid-combined-site-east": canonicalFingerprints + serverName="east.grid.internal" patched
+  [OK] GridSite "grid-combined-site-east": phase="Active" (confirmed)
+
+  east: authorizing remote provider sites
+  [OK] GridSite "grid-combined-site-west" auto-created by operator (gridNetworkRef="grid-combined-site")
+  [OK] GridSite "grid-combined-site-west": advertised certificate matches the staged identity
+  [OK] GridSite "grid-combined-site-west": canonicalFingerprints + serverName="west.grid.internal" patched
+  [OK] GridSite "grid-combined-site-west": phase="Active" (confirmed)
+  [OK] GridSite "grid-combined-site-central" auto-created by operator (gridNetworkRef="grid-combined-site")
+  [OK] GridSite "grid-combined-site-central": advertised certificate matches the staged identity
+  [OK] GridSite "grid-combined-site-central": canonicalFingerprints + serverName="central.grid.internal" patched
+  [OK] GridSite "grid-combined-site-central": phase="Active" (confirmed)
+  [OK] All auto-discovered remote GridSites authorized and Active
+
+[SETUP 14/14] Waiting for global overlay convergence
+  Waiting for global overlay convergence (4 candidates on all clusters, timeout 180s)...
+  east: missing candidates ["openai-api", "sim-central-provider", "sim-west-provider"]
+  east: missing candidates ["openai-api", "sim-central-provider", "sim-west-provider"]
+  east: missing candidates ["openai-api", "sim-central-provider", "sim-west-provider"]
+  External candidate external-open-ai: model=gpt-4o-mini, site=central, routing_cluster=openai-api validated
+  Global overlay converged: 4 candidates on all 3 clusters, stable_ids agree
+  [WAIT] west: Grid operator convergence
+  waiting for grid-operator in deployment (ns=grid-system)...
+deployment "grid-operator" successfully rolled out
+  waiting for consumer-gateway in deployment (ns=grid-system)...
+deployment "consumer-gateway" successfully rolled out
+  waiting for provider-gateway in deployment (ns=grid-system)...
+deployment "provider-gateway" successfully rolled out
+  [OK] west: Gateways ready
+  [WAIT] central: Grid operator convergence
+  waiting for grid-operator in deployment (ns=grid-system)...
+deployment "grid-operator" successfully rolled out
+  waiting for consumer-gateway in deployment (ns=grid-system)...
+deployment "consumer-gateway" successfully rolled out
+  waiting for provider-gateway in deployment (ns=grid-system)...
+deployment "provider-gateway" successfully rolled out
+  [OK] central: Gateways ready
+  [WAIT] east: Grid operator convergence
+  waiting for grid-operator in deployment (ns=grid-system)...
+deployment "grid-operator" successfully rolled out
+  waiting for consumer-gateway in deployment (ns=grid-system)...
+deployment "consumer-gateway" successfully rolled out
+  waiting for provider-gateway in deployment (ns=grid-system)...
+deployment "provider-gateway" successfully rolled out
+  [OK] east: Gateways ready
+  [OK] All three combined sites converged and gateways ready
+
+===============================================================================
+ENVIRONMENT READY - Starting proof scenarios
+===============================================================================
+
+=== QUICK MODE SCENARIOS ===
+
+[SCENARIO 1] Verify three clusters are healthy
+  [ASSERT] cluster_health
+  [OK] cluster_health: All 3 clusters are healthy with ready nodes
+
+[SCENARIO 2] Verify component deployment
+  [ASSERT] component_deployment
+  [OK] component_deployment: All 4 components are ready across 3 sites
+
+[SCENARIO 3] Verify SWIM convergence
+  [ASSERT] swim_convergence
+  [OK] swim_convergence: Every GridNetwork is Active with both remote sites connected
+
+[SCENARIO 4] Verify site auto-discovery
+  [ASSERT] site_auto_discovery
+  [OK] site_auto_discovery: Every cluster has two Active/TlsVerified remote GridSites with :8443 addresses and trust configuration
+
+[SCENARIO 5] Verify external provider isolation (site: central)
+
+[SCENARIO 6] Verify external provider gateway config (site: central)
+
+[SCENARIO 7] Verify overlay acceptance
+  [ASSERT] overlay_acceptance
+  [OK] overlay_acceptance: All sites: overlay ConfigMap exists with data, gateway ready, health check passes
+
+[SCENARIO 8] Verify local provider selection
+  [ASSERT] local_provider_selection
+  [OK] local_provider_selection: All consumer sites correctly prefer their local provider (west→west, central→central, east→east)
+
+[SCENARIO 9] Verify response attribution
+  [ASSERT] response_attribution
+  [OK] response_attribution: All responses include complete attribution: consumer site, provider site, instance, session, and revision
+
+[SCENARIO 10] Verify TLS certificate rejection
+  [ASSERT] tls_certificate_validation
+  [OK] tls_certificate_validation: TLS validation correct: no-cert and wrong-organization identities rejected; consumer identity accepted
+
+[SCENARIO 11] Verify authorization replacement
+  [ASSERT] authorization_replacement
+  [OK] authorization_replacement: Authorized provider-hop traffic succeeds with caller authorization properly replaced at final hop
+
+[SCENARIO 12] Verify credential isolation
+  [ASSERT] credential_isolation
+  [OK] credential_isolation: Provider credentials are absent from consumer and operator mounts; consumer Secret reads are denied
+
+[SCENARIO 13] Verify backend access denial
+  [ASSERT] backend_access_denial
+  [OK] backend_access_denial: Direct consumer/workload backend access is correctly denied by NetworkPolicy
+
+[SCENARIO 14] Verify negative routing (invalid inputs)
+  [ASSERT] negative_routing
+  [OK] negative_routing: All negative routing inputs correctly rejected (positive control passed first)
+
+=== TEARDOWN ===
+deleted cluster 'east' (kind name: grid-combined-east)
+deleted cluster 'central' (kind name: grid-combined-central)
+deleted cluster 'west' (kind name: grid-combined-west)
+removed network 'grid-combined-site-net'
+  [OK] Environment torn down successfully
+
+===============================================================================
+Demo completed in 392.8s
+Evidence: demos/grid-combined-site/evidence-1785898332/results.json
+===============================================================================

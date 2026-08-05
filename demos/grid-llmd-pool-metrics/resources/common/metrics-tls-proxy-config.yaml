@@ -1,0 +1,38 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: metrics-tls-proxy-config
+  namespace: grid-system
+  labels:
+    app.kubernetes.io/part-of: grid-llmd-pool-metrics
+data:
+  nginx.conf: |
+    worker_processes 1;
+    error_log /dev/stderr warn;
+    pid /tmp/nginx.pid;
+
+    events {
+        worker_connections 64;
+    }
+
+    http {
+        client_body_temp_path /tmp/client_body_temp;
+        proxy_temp_path /tmp/proxy_temp;
+        fastcgi_temp_path /tmp/fastcgi_temp;
+        uwsgi_temp_path /tmp/uwsgi_temp;
+        scgi_temp_path /tmp/scgi_temp;
+
+        server {
+            listen 9443 ssl;
+
+            ssl_certificate /etc/nginx/server-tls/tls.crt;
+            ssl_certificate_key /etc/nginx/server-tls/tls.key;
+            ssl_client_certificate /etc/nginx/client-ca/ca.crt;
+            ssl_verify_client on;
+            ssl_protocols TLSv1.2 TLSv1.3;
+
+            location /metrics {
+                proxy_pass http://127.0.0.1:9090/metrics;
+            }
+        }
+    }

@@ -1,0 +1,87 @@
+
+===============================================================================
+PRAXIS GRID WORKLOAD INFERENCE DEMO
+===============================================================================
+
+Mode: QUICK
+Proof policy: Every PASS comes from a runtime assertion; manifest intent is not
+              counted as proof.
+
+EXPECTED PATH
+  workload -> local Praxis consumer gateway
+           -> Grid-selected provider gateway -> private backend
+
+No traffic manager or public endpoint involved.
+
+===============================================================================
+DEMO 1 | GRID ROUTING AND PROVIDER BOUNDARY
+===============================================================================
+
+USER STORY
+  As a platform operator, I need the Grid mesh to converge, discover providers,
+  and enforce the provider security boundary.
+
+===============================================================================
+DEMO 2 | IN-CLUSTER WORKLOAD ROUTING
+===============================================================================
+
+USER STORY
+  As a platform workload, I need requests from inside the consumer cluster to
+  reach a Grid-selected provider without any external ingress.
+
+OBSERVED WORKLOAD ROUTES
+  [PASS] east-edge -> east-provider
+         workload -> east-edge consumer gateway -> east-provider gateway -> east-provider backend
+  [PASS] west-edge -> west-provider
+         workload -> west-edge consumer gateway -> west-provider gateway -> west-provider backend
+
+===============================================================================
+DEMO 3 | SECURE PROVIDER BOUNDARY
+===============================================================================
+
+USER STORY
+  As a provider and security owner, I need authenticated Grid traffic, exact
+  local policy, private backend isolation, and final-hop credential
+  replacement.
+
+[PASS] Both provider gateways required mTLS, accepted both pinned edge
+       identities, rejected missing or invalid TLS identities, and enforced
+       exact candidate/model/path policy for three provider candidates.
+
+[PASS] All three private provider paths are isolated by NetworkPolicy and
+       provider-local credentials; the two east providers use distinct backends
+       and credentials behind one site gateway.
+
+[SKIP] Local preference/fallback runs only in full mode.
+
+===============================================================================
+DEMONSTRATED BOUNDARY
+===============================================================================
+
+[PROVEN] In-cluster workloads reached Grid-selected providers through local
+         consumer gateways without external ingress.
+[PROVEN] Versioned overlays with provider candidates, plus
+         rendered/distributed/accepted/serving revision evidence.
+[PROVEN] Provider mTLS, peer authorization, and credential replacement.
+[NOT APPLICABLE] Edge withdrawal and GTM steering (workload mode has no traffic
+                 manager).
+[CLEANUP] Teardown complete.
+
+===============================================================================
+FINAL RESULT
+===============================================================================
+[PASS   ] Observable overlay contract
+          one revision matched rendered/distributed/accepted/serving evidence
+[PASS   ] Secure provider boundary
+          mTLS, peer auth, NetworkPolicy, credential replacement verified
+[PASS   ] In-cluster workload routing
+          2 consumer cluster(s) routed to provider via in-cluster Jobs
+[NOT_APPLICABLE] Edge withdrawal and recovery
+          workload mode has no traffic manager
+[SKIPPED] Local preference and remote fallback
+          quick mode
+
+OVERALL   PASS
+MODE      WORKLOAD-QUICK
+ELAPSED   407.6s
+EVIDENCE  demos/grid-workload-inference/evidence

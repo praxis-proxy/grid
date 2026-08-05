@@ -422,13 +422,15 @@ fn hostname_or_default() -> String {
 /// Run the [`GridNetwork`] controller.
 ///
 /// In addition to watching `GridNetwork` resources, this controller watches
-/// `InferenceProvider` and `GridSite` resources.  Changes to either trigger
-/// reconciliation of the owning [`GridNetwork`] (identified by
-/// `spec.gridNetworkRef`), keeping routing overlay `ConfigMap`s consistent
-/// with provider availability and site membership.
+/// `InferenceProvider`, `GridSite`, and `Secret` resources.  Secret changes
+/// trigger reconciliation of affected `GridNetwork`s when providers change.
+///
+/// Metrics TLS rotation is detected by bounded requeue rather than a
+/// cluster-wide Secret watch — the operator only reads referenced
+/// Secrets by explicit namespace/name during reconciliation.
 #[expect(
     clippy::too_many_lines,
-    reason = "declarative controller trigger wiring is clearer in one function"
+    reason = "controller setup with two cross-resource watches and optional SWIM"
 )]
 async fn run_network_controller(
     client: Client,
@@ -486,6 +488,11 @@ async fn run_site_controller(client: Client) -> Result<(), Box<dyn std::error::E
 }
 
 /// Run the [`InferenceProvider`] controller (OP-02).
+///
+/// Watches `InferenceProvider` resources.  Metrics TLS rotation is detected
+/// by bounded requeue rather than a cluster-wide Secret watch — the operator
+/// only reads referenced Secrets by explicit namespace/name during
+/// reconciliation.
 ///
 /// [`InferenceProvider`]: operator::crd::inference_provider::InferenceProvider
 async fn run_provider_controller(client: Client) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {

@@ -1,0 +1,26 @@
+# InferenceProvider with one-way TLS metrics scraping.
+#
+# The operator verifies the metrics endpoint's certificate against the
+# CA in the referenced Secret.  No client certificate is presented.
+apiVersion: grid.praxis-proxy.io/v1alpha1
+kind: InferenceProvider
+metadata:
+  name: vllm-tls
+spec:
+  gridNetworkRef: my-network
+  providerKind: self_hosted
+  backendKind: local
+  endpoint: https://vllm.inference:8443
+  models:
+    - name: llama-3.1-8b
+  metricsConfig:
+    path: /metrics
+    timeout: "2s"
+    signalNames:
+      queueDepth: vllm:num_requests_waiting
+      kvCacheUtilization: vllm:gpu_cache_usage_perc
+    tls:
+      caSecretRef:
+        name: metrics-ca
+        namespace: grid-system
+        key: ca.crt

@@ -65,6 +65,44 @@ spec:
             limits:
               cpu: 500m
               memory: 256Mi
+        - name: metrics-tls-proxy
+          image: "nginx:metrics-proxy-demo"
+          imagePullPolicy: "Never"
+          ports:
+            - name: metrics-tls
+              containerPort: 9443
+          volumeMounts:
+            - name: metrics-proxy-config
+              mountPath: /etc/nginx/nginx.conf
+              subPath: nginx.conf
+            - name: metrics-server-tls
+              mountPath: /etc/nginx/server-tls
+              readOnly: true
+            - name: metrics-client-ca
+              mountPath: /etc/nginx/client-ca
+              readOnly: true
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            runAsNonRoot: true
+          resources:
+            requests:
+              cpu: 50m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 64Mi
+      volumes:
+        - name: metrics-proxy-config
+          configMap:
+            name: metrics-tls-proxy-config
+        - name: metrics-server-tls
+          secret:
+            secretName: metrics-server-tls
+        - name: metrics-client-ca
+          secret:
+            secretName: metrics-ca
 ---
 apiVersion: v1
 kind: Service
@@ -99,6 +137,6 @@ spec:
   selector:
     app.kubernetes.io/name: llmd-epp
   ports:
-    - name: metrics
-      port: 9090
-      targetPort: 9090
+    - name: metrics-tls
+      port: 9443
+      targetPort: 9443

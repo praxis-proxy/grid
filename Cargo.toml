@@ -37,6 +37,7 @@ kube = { version = "3.1.0", features = ["client", "derive", "runtime", "rustls-t
 prometheus = "0.14"
 rcgen = "0.14.8"
 rustls = { version = "0.23", default-features = false, features = ["logging", "std", "tls12"] }
+rustls-pemfile = "2"
 schemars = "1.2.1"
 sha2 = "0.10"
 serde = { version = "1.0.228", features = ["derive"] }

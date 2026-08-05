@@ -1,0 +1,35 @@
+# InferenceProvider with mutual TLS (mTLS) metrics scraping.
+#
+# The operator verifies the metrics endpoint's certificate against the
+# CA, and presents a client certificate for the endpoint to verify.
+# Both caSecretRef and clientCertificateSecretRef are required for mTLS.
+apiVersion: grid.praxis-proxy.io/v1alpha1
+kind: InferenceProvider
+metadata:
+  name: vllm-mtls
+spec:
+  gridNetworkRef: my-network
+  providerKind: self_hosted
+  backendKind: local
+  endpoint: https://vllm.inference:8443
+  models:
+    - name: llama-3.1-8b
+  metricsConfig:
+    path: /metrics
+    timeout: "2s"
+    staleMetricsSeconds: 30
+    signalNames:
+      queueDepth: vllm:num_requests_waiting
+      kvCacheUtilization: vllm:gpu_cache_usage_perc
+      latencyP99Ms: vllm:e2e_request_latency_seconds
+      prefixCacheHitRatio: vllm:prefix_cache_hit_rate
+    tls:
+      caSecretRef:
+        name: metrics-ca
+        namespace: grid-system
+        key: ca.crt
+      clientCertificateSecretRef:
+        name: metrics-client-cert
+        namespace: grid-system
+        certificateKey: tls.crt
+        privateKeyKey: tls.key
