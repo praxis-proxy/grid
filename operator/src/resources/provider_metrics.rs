@@ -405,8 +405,8 @@ async fn resolve_tls_config(
 /// # Returns
 ///
 /// - `Ok(None)` — TLS material is accessible and valid (or no TLS configured).
-/// - `Ok(Some(reason_string))` — failure; the provider should be marked [`Degraded`]
-///   with the returned reason in `status.reason`.
+/// - `Ok(Some(reason_string))` — failure; the provider should be marked [`Degraded`] with the returned reason in
+///   `status.reason`.
 ///
 /// [`Degraded`]: crate::crd::inference_provider::ProviderPhase::Degraded
 ///

@@ -5,8 +5,8 @@
 //! [`rustls::ClientConfig`], and validating that referenced Secrets are
 //! accessible before a live probe runs.
 //!
-//! Used by both metrics scraping ([`super::provider_metrics`]) and
-//! health check probing ([`crate::controller::inference_provider`]).
+//! Used by both metrics scraping (`provider_metrics`) and
+//! health check probing (`controller::inference_provider`).
 
 use std::sync::Arc;
 
@@ -204,8 +204,8 @@ enum TlsSecretCheck {
 /// # Returns
 ///
 /// - `Ok(None)` — TLS material is accessible and valid (or no TLS configured).
-/// - `Ok(Some(reason))` — failure; the provider should be marked [`Degraded`]
-///   with the returned reason in `status.reason`.
+/// - `Ok(Some(reason))` — failure; the provider should be marked [`Degraded`] with the returned reason in
+///   `status.reason`.
 ///
 /// [`Degraded`]: crate::crd::inference_provider::ProviderPhase::Degraded
 ///
@@ -266,6 +266,32 @@ pub(crate) async fn verify_tls_accessible(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Error-to-reason mapping
+// ---------------------------------------------------------------------------
+
+/// Map an error string from [`resolve_tls_config`] to a [`TlsFailureReason`].
+///
+/// This allows callers to derive a structured `status.reason` from the
+/// error returned by [`resolve_tls_config`] without needing a separate
+/// validation pass (and its extra Kubernetes API calls).
+#[must_use]
+pub(crate) fn tls_failure_reason_from_error(err: &str) -> TlsFailureReason {
+    if err.contains("not found") {
+        TlsFailureReason::SecretMissing
+    } else if err.contains("is empty") {
+        TlsFailureReason::KeyMissing
+    } else if err.contains("identity construction failed") {
+        TlsFailureReason::IdentityMismatch
+    } else {
+        TlsFailureReason::MaterialInvalid
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Secret helpers (private)
+// ---------------------------------------------------------------------------
+
 /// Read raw bytes from a Kubernetes Secret for TLS validation.
 ///
 /// Distinguishes between "Secret not found" and "key not found" to map to
@@ -287,10 +313,153 @@ async fn read_tls_secret_for_verify(
         return Ok(TlsSecretCheck::SecretMissing);
     };
     let Some(data) = &secret.data else {
-        return Ok(TlsSecretCheck::KeyMissing);
+        // The Secret exists but has no `data` section — treat it the same
+        // as a missing Secret since there is nothing to read.
+        return Ok(TlsSecretCheck::SecretMissing);
     };
     match data.get(key_name) {
         Some(bytes) if !bytes.0.is_empty() => Ok(TlsSecretCheck::Ok(bytes.0.clone())),
         _ => Ok(TlsSecretCheck::KeyMissing),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
+#[allow(clippy::unwrap_used, clippy::expect_used, reason = "tests")]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // secret_ref_from_client_cert — field mapping
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn secret_ref_from_client_cert_maps_fields() {
+        let client_ref = ClientCertificateSecretRef {
+            name: "my-cert".to_owned(),
+            namespace: "my-ns".to_owned(),
+            certificate_key: "tls.crt".to_owned(),
+            private_key_key: "tls.key".to_owned(),
+        };
+        let sref = secret_ref_from_client_cert(&client_ref);
+        assert_eq!(sref.name, "my-cert", "name must be copied");
+        assert_eq!(sref.namespace, "my-ns", "namespace must be copied");
+        assert!(sref.key.is_none(), "key must be None (not used for Secret lookup)");
+    }
+
+    // -----------------------------------------------------------------------
+    // TlsFailureReason::as_status_reason — stable prefixed strings
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn as_status_reason_all_variants_metrics_prefix() {
+        assert_eq!(
+            TlsFailureReason::SecretMissing.as_status_reason("Metrics"),
+            "MetricsTlsSecretMissing"
+        );
+        assert_eq!(
+            TlsFailureReason::KeyMissing.as_status_reason("Metrics"),
+            "MetricsTlsKeyMissing"
+        );
+        assert_eq!(
+            TlsFailureReason::MaterialInvalid.as_status_reason("Metrics"),
+            "MetricsTlsMaterialInvalid"
+        );
+        assert_eq!(
+            TlsFailureReason::IdentityMismatch.as_status_reason("Metrics"),
+            "MetricsTlsIdentityMismatch"
+        );
+    }
+
+    #[test]
+    fn as_status_reason_all_variants_health_check_prefix() {
+        assert_eq!(
+            TlsFailureReason::SecretMissing.as_status_reason("HealthCheck"),
+            "HealthCheckTlsSecretMissing"
+        );
+        assert_eq!(
+            TlsFailureReason::KeyMissing.as_status_reason("HealthCheck"),
+            "HealthCheckTlsKeyMissing"
+        );
+        assert_eq!(
+            TlsFailureReason::MaterialInvalid.as_status_reason("HealthCheck"),
+            "HealthCheckTlsMaterialInvalid"
+        );
+        assert_eq!(
+            TlsFailureReason::IdentityMismatch.as_status_reason("HealthCheck"),
+            "HealthCheckTlsIdentityMismatch"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_tls_config — None input
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn resolve_tls_config_none_returns_ok_none() {
+        let result = resolve_tls_config(None, None, "test-provider").await;
+        assert!(matches!(result, Ok(None)), "None tls_config must return Ok(None)");
+    }
+
+    #[tokio::test]
+    async fn resolve_tls_config_some_without_client_returns_err() {
+        let tls = EndpointTlsConfig {
+            ca_secret_ref: crate::crd::grid_network::SecretRef {
+                name: "ca".to_owned(),
+                namespace: "ns".to_owned(),
+                key: None,
+            },
+            client_certificate_secret_ref: None,
+        };
+        let result = resolve_tls_config(Some(&tls), None, "test-provider").await;
+        assert!(result.is_err(), "TLS configured without a kube client must return Err");
+    }
+
+    // -----------------------------------------------------------------------
+    // tls_failure_reason_from_error — error string mapping
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn tls_failure_reason_from_error_secret_not_found() {
+        let reason = tls_failure_reason_from_error("CA Secret ns/ca or key \"ca.crt\" not found for provider x");
+        assert_eq!(
+            reason,
+            TlsFailureReason::SecretMissing,
+            "\"not found\" must map to SecretMissing"
+        );
+    }
+
+    #[test]
+    fn tls_failure_reason_from_error_key_empty() {
+        let reason = tls_failure_reason_from_error("CA key \"ca.crt\" in Secret ns/ca is empty for provider x");
+        assert_eq!(
+            reason,
+            TlsFailureReason::KeyMissing,
+            "\"is empty\" must map to KeyMissing"
+        );
+    }
+
+    #[test]
+    fn tls_failure_reason_from_error_identity_mismatch() {
+        let reason = tls_failure_reason_from_error("client identity construction failed: key mismatch");
+        assert_eq!(
+            reason,
+            TlsFailureReason::IdentityMismatch,
+            "\"identity construction failed\" must map to IdentityMismatch"
+        );
+    }
+
+    #[test]
+    fn tls_failure_reason_from_error_fallback_to_material_invalid() {
+        let reason = tls_failure_reason_from_error("CA PEM parse failed: invalid base64");
+        assert_eq!(
+            reason,
+            TlsFailureReason::MaterialInvalid,
+            "unrecognised error must fall back to MaterialInvalid"
+        );
     }
 }

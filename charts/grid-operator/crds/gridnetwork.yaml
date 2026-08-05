@@ -302,13 +302,16 @@ spec:
                             Required when the Secret holds multiple keys (e.g. credential references
                             in `InferenceProvider.spec.auth.secretRef`).  Omit only when the entire
                             Secret is consumed (e.g. TLS `ca_secret_ref`).
+                          minLength: 1
                           nullable: true
                           type: string
                         name:
                           description: Secret name.
+                          minLength: 1
                           type: string
                         namespace:
                           description: Secret namespace.
+                          minLength: 1
                           type: string
                       required:
                         - name
@@ -325,13 +328,16 @@ spec:
                             Required when the Secret holds multiple keys (e.g. credential references
                             in `InferenceProvider.spec.auth.secretRef`).  Omit only when the entire
                             Secret is consumed (e.g. TLS `ca_secret_ref`).
+                          minLength: 1
                           nullable: true
                           type: string
                         name:
                           description: Secret name.
+                          minLength: 1
                           type: string
                         namespace:
                           description: Secret namespace.
+                          minLength: 1
                           type: string
                       required:
                         - name
@@ -348,13 +354,16 @@ spec:
                             Required when the Secret holds multiple keys (e.g. credential references
                             in `InferenceProvider.spec.auth.secretRef`).  Omit only when the entire
                             Secret is consumed (e.g. TLS `ca_secret_ref`).
+                          minLength: 1
                           nullable: true
                           type: string
                         name:
                           description: Secret name.
+                          minLength: 1
                           type: string
                         namespace:
                           description: Secret namespace.
+                          minLength: 1
                           type: string
                       required:
                         - name

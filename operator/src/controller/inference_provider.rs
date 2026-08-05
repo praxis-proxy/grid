@@ -168,7 +168,7 @@ pub(crate) fn validate_provider_config(provider: &InferenceProvider) -> Option<&
 ///
 /// Pass a [`ProbeOutcome`] to [`phase_from_probe`] to merge it with the
 /// site-matching phase.  When `spec.healthCheck` is configured, the
-/// reconcile loop runs a live HTTP probe via [`probe_endpoint`]; when
+/// reconcile loop runs a live HTTP probe via `probe_endpoint`; when
 /// absent, [`ProbeOutcome::NotProbed`] preserves the site-matching phase.
 ///
 /// [`InferenceProvider`]: crate::crd::inference_provider::InferenceProvider
@@ -389,7 +389,10 @@ pub(crate) fn requeue_interval_for_provider(spec: &InferenceProviderSpec) -> Dur
 /// [`Healthy`]: ProbeOutcome::Healthy
 /// [`Degraded`]: ProbeOutcome::Degraded
 /// [`Unavailable`]: ProbeOutcome::Unavailable
-#[expect(clippy::too_many_lines, reason = "URL parse + scheme check + TLS branch + client build + request: sequential steps")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "URL parse + scheme check + TLS branch + client build + request: sequential steps"
+)]
 pub(crate) async fn probe_endpoint(
     url: &str,
     timeout: Duration,
@@ -403,6 +406,15 @@ pub(crate) async fn probe_endpoint(
     match uri.scheme_str() {
         Some("http" | "https") => {},
         _ => return ProbeOutcome::Unavailable,
+    }
+
+    // Fail-closed: TLS config with a non-https URL is a misconfiguration.
+    if tls_config.is_some() && uri.scheme_str() != Some("https") {
+        tracing::warn!(
+            url,
+            "healthCheck.tls configured but endpoint uses http; probe will fail"
+        );
+        return ProbeOutcome::Unavailable;
     }
 
     let connector = if let Some(config) = &tls_config {
@@ -499,40 +511,23 @@ async fn resolve_phase_and_sites(
     let matching = sites_matching_selector(provider, &sites);
     let site_phase = phase_from_matching(&matching);
 
-    // Validate health check TLS configuration early (before probing).
-    if let Some(hc) = &provider.spec.health_check
-        && hc.tls.is_some()
-        && let Some(tls_reason) =
-            crate::resources::endpoint_tls::verify_tls_accessible(client, hc.tls.as_ref()).await?
-    {
-        let reason_str = tls_reason.as_status_reason("HealthCheck");
-        tracing::warn!(
-            name,
-            reason = %reason_str,
-            "InferenceProvider health check TLS configuration invalid"
-        );
-        return Ok((ProviderPhase::Degraded, matching, Some(reason_str)));
-    }
-
-    // Resolve health check TLS config for the probe (if configured).
+    // Resolve health check TLS config (if configured).  On failure, map
+    // the error to a structured status reason and mark the provider Degraded.
     let health_tls_config = if let Some(hc) = &provider.spec.health_check
         && hc.tls.is_some()
     {
-        match crate::resources::endpoint_tls::resolve_tls_config(
-            hc.tls.as_ref(),
-            Some(client),
-            name,
-        )
-        .await
-        {
+        match crate::resources::endpoint_tls::resolve_tls_config(hc.tls.as_ref(), Some(client), name).await {
             Ok(cfg) => cfg,
             Err(e) => {
-                tracing::warn!(name, error = %e, "health check TLS resolution failed");
-                return Ok((
-                    ProviderPhase::Degraded,
-                    matching,
-                    Some("HealthCheckTlsResolutionFailed".to_owned()),
-                ));
+                let reason_str =
+                    crate::resources::endpoint_tls::tls_failure_reason_from_error(&e).as_status_reason("HealthCheck");
+                tracing::warn!(
+                    name,
+                    reason = %reason_str,
+                    error = %e,
+                    "InferenceProvider health check TLS configuration invalid"
+                );
+                return Ok((ProviderPhase::Degraded, matching, Some(reason_str)));
             },
         }
     } else {
@@ -548,10 +543,7 @@ async fn resolve_phase_and_sites(
         && let Some(ep) = hc.endpoint.as_deref()
         && ep.trim().is_empty()
     {
-        tracing::warn!(
-            name,
-            "healthCheck.endpoint is present but blank; probe will fail"
-        );
+        tracing::warn!(name, "healthCheck.endpoint is present but blank; probe will fail");
     }
 
     let probe_result = match probe_url_for_provider(&provider.spec) {
@@ -1812,7 +1804,11 @@ mod tests {
         }))
         .unwrap_or_else(|_| std::process::abort());
         let hc = spec.health_check.unwrap_or_else(|| std::process::abort());
-        assert_eq!(hc.endpoint.as_deref(), Some("https://epp:9090"), "endpoint must round-trip");
+        assert_eq!(
+            hc.endpoint.as_deref(),
+            Some("https://epp:9090"),
+            "endpoint must round-trip"
+        );
         assert_eq!(hc.path.as_deref(), Some("/healthz"), "path must round-trip");
         assert_eq!(hc.interval.as_deref(), Some("30s"), "interval must round-trip");
         assert_eq!(hc.timeout.as_deref(), Some("5s"), "timeout must round-trip");
@@ -1852,6 +1848,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::too_many_lines, reason = "tests multiple TLS fields in one assertion block")]
     fn health_check_config_with_tls_and_client_cert_deserializes() {
         let spec: InferenceProviderSpec = serde_json::from_value(serde_json::json!({
             "gridNetworkRef": "net",
@@ -1876,11 +1873,22 @@ mod tests {
         .unwrap_or_else(|_| std::process::abort());
         let hc = spec.health_check.unwrap_or_else(|| std::process::abort());
         let tls = hc.tls.unwrap_or_else(|| std::process::abort());
-        let client_ref = tls.client_certificate_secret_ref.unwrap_or_else(|| std::process::abort());
+        let client_ref = tls
+            .client_certificate_secret_ref
+            .unwrap_or_else(|| std::process::abort());
         assert_eq!(client_ref.name, "client-cert", "client cert name must round-trip");
-        assert_eq!(client_ref.namespace, "grid-system", "client cert namespace must round-trip");
-        assert_eq!(client_ref.certificate_key, "tls.crt", "certificateKey must default to tls.crt");
-        assert_eq!(client_ref.private_key_key, "tls.key", "privateKeyKey must default to tls.key");
+        assert_eq!(
+            client_ref.namespace, "grid-system",
+            "client cert namespace must round-trip"
+        );
+        assert_eq!(
+            client_ref.certificate_key, "tls.crt",
+            "certificateKey must default to tls.crt"
+        );
+        assert_eq!(
+            client_ref.private_key_key, "tls.key",
+            "privateKeyKey must default to tls.key"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2080,6 +2088,101 @@ mod tests {
         let url = format!("http://127.0.0.1:{port}");
         let result = probe_endpoint(&url, Duration::from_millis(100), None).await;
         assert_eq!(result, ProbeOutcome::Unavailable, "timeout must yield Unavailable");
+    }
+
+    // -----------------------------------------------------------------------
+    // probe_endpoint — TLS tests (real certificates, real handshakes)
+    // -----------------------------------------------------------------------
+
+    /// Start a one-shot TLS server on localhost and return the URL.
+    ///
+    /// Mirrors `metrics_scraper::tests::start_tls_test_server` but lives
+    /// in this module so it can be used by `probe_endpoint` TLS tests.
+    async fn start_tls_test_server(server_cert_pem: &str, server_key_pem: &str, response: Vec<u8>) -> String {
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject as _};
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let server_certs = CertificateDer::pem_slice_iter(server_cert_pem.as_bytes())
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let server_key = PrivateKeyDer::from_pem_slice(server_key_pem.as_bytes()).unwrap();
+
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(server_certs, server_key)
+            .unwrap();
+
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await
+                && let Ok(tls_stream) = acceptor.accept(stream).await
+            {
+                let (mut reader, mut writer) = tokio::io::split(tls_stream);
+                let mut buf = [0_u8; 4096];
+                drop(reader.read(&mut buf).await);
+                drop(writer.write_all(&response).await);
+            }
+        });
+
+        format!("https://localhost:{port}")
+    }
+
+    #[tokio::test]
+    async fn probe_tls_with_matching_ca_yields_healthy() {
+        let ca = certs::generate_ca("test-ca").unwrap();
+        let server_cert = certs::generate_dns_cert(&ca, "test-server", "localhost").unwrap();
+        let url = start_tls_test_server(
+            &server_cert.cert_pem,
+            &server_cert.key_pem,
+            b"HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n".to_vec(),
+        )
+        .await;
+        let tls_config = crate::metrics_scraper::build_tls_client_config(ca.cert_pem.as_bytes(), None, None).unwrap();
+        let result = probe_endpoint(&url, Duration::from_secs(5), Some(Arc::new(tls_config))).await;
+        assert_eq!(
+            result,
+            ProbeOutcome::Healthy,
+            "TLS probe with matching CA must yield Healthy"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_tls_with_wrong_ca_yields_unavailable() {
+        let ca_server = certs::generate_ca("server-ca").unwrap();
+        let ca_wrong = certs::generate_ca("wrong-ca").unwrap();
+        let server_cert = certs::generate_dns_cert(&ca_server, "test-server", "localhost").unwrap();
+        let url = start_tls_test_server(
+            &server_cert.cert_pem,
+            &server_cert.key_pem,
+            b"HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n".to_vec(),
+        )
+        .await;
+        // Client trusts wrong CA — handshake must fail.
+        let tls_config =
+            crate::metrics_scraper::build_tls_client_config(ca_wrong.cert_pem.as_bytes(), None, None).unwrap();
+        let result = probe_endpoint(&url, Duration::from_secs(5), Some(Arc::new(tls_config))).await;
+        assert_eq!(
+            result,
+            ProbeOutcome::Unavailable,
+            "TLS probe with wrong CA must yield Unavailable"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_http_url_with_tls_config_yields_unavailable() {
+        // http:// URL with a TLS config is a misconfiguration — fail-closed.
+        let ca = certs::generate_ca("test-ca").unwrap();
+        let tls_config = crate::metrics_scraper::build_tls_client_config(ca.cert_pem.as_bytes(), None, None).unwrap();
+        let url = start_test_server(b"HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n").await;
+        let result = probe_endpoint(&url, Duration::from_secs(5), Some(Arc::new(tls_config))).await;
+        assert_eq!(
+            result,
+            ProbeOutcome::Unavailable,
+            "http:// URL with TLS config must yield Unavailable (fail-closed)"
+        );
     }
 
     // -----------------------------------------------------------------------

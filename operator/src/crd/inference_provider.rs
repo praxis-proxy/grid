@@ -558,19 +558,14 @@ mod tests {
     fn inference_provider_crd_health_check_has_endpoint_and_tls_fields() {
         let crd = crd_json();
         let hc_properties = crd
-            .pointer(
-                "/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties/healthCheck/properties",
-            )
+            .pointer("/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties/healthCheck/properties")
             .and_then(serde_json::Value::as_object)
             .unwrap_or_else(|| std::process::abort());
         assert!(
             hc_properties.contains_key("endpoint"),
             "healthCheck must include endpoint field"
         );
-        assert!(
-            hc_properties.contains_key("tls"),
-            "healthCheck must include tls field"
-        );
+        assert!(hc_properties.contains_key("tls"), "healthCheck must include tls field");
         assert!(
             hc_properties.contains_key("path"),
             "healthCheck must include path field"
