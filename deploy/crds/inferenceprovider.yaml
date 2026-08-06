@@ -561,7 +561,7 @@ spec:
                       `CredentialSecretKeyMissing`, `CredentialSecretValueInvalid`
                     - `MetricsTlsSecretMissing`, `MetricsTlsKeyMissing`, `MetricsTlsMaterialInvalid`, `MetricsTlsIdentityMismatch`
                     - `HealthCheckTlsSecretMissing`, `HealthCheckTlsKeyMissing`, `HealthCheckTlsMaterialInvalid`,
-                      `HealthCheckTlsIdentityMismatch`, `HealthCheckTlsResolutionFailed`
+                      `HealthCheckTlsIdentityMismatch`
                   nullable: true
                   type: string
               type: object

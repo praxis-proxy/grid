@@ -253,7 +253,7 @@ pub(crate) async fn collect_provider_metrics(
 
         let tls_config = match resolve_tls_config(mc.tls.as_ref(), client, identity).await {
             Ok(cfg) => cfg,
-            Err(e) => {
+            Err((_reason, e)) => {
                 let used_cache =
                     try_cached_metrics(identity, mc.stale_metrics_seconds, &cache_snapshot, now, &mut result);
                 if used_cache {
@@ -388,7 +388,7 @@ async fn resolve_tls_config(
     tls_config: Option<&EndpointTlsConfig>,
     client: Option<&kube::Client>,
     provider_identity: &str,
-) -> Result<Option<Arc<rustls::ClientConfig>>, String> {
+) -> Result<Option<Arc<rustls::ClientConfig>>, (super::endpoint_tls::TlsFailureReason, String)> {
     super::endpoint_tls::resolve_tls_config(tls_config, client, provider_identity).await
 }
 

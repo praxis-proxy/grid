@@ -432,7 +432,7 @@ pub struct InferenceProviderStatus {
     ///   `CredentialSecretKeyMissing`, `CredentialSecretValueInvalid`
     /// - `MetricsTlsSecretMissing`, `MetricsTlsKeyMissing`, `MetricsTlsMaterialInvalid`, `MetricsTlsIdentityMismatch`
     /// - `HealthCheckTlsSecretMissing`, `HealthCheckTlsKeyMissing`, `HealthCheckTlsMaterialInvalid`,
-    ///   `HealthCheckTlsIdentityMismatch`, `HealthCheckTlsResolutionFailed`
+    ///   `HealthCheckTlsIdentityMismatch`
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
 }

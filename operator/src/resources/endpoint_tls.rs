@@ -61,6 +61,23 @@ impl TlsFailureReason {
             Self::IdentityMismatch => format!("{prefix}TlsIdentityMismatch"),
         }
     }
+
+    /// Classify a [`MetricsScrapeError`](metrics_scraper::MetricsScrapeError)
+    /// from [`build_tls_client_config`](metrics_scraper::build_tls_client_config)
+    /// into the appropriate failure reason.
+    ///
+    /// The `"identity construction failed"` message maps to
+    /// [`IdentityMismatch`](Self::IdentityMismatch); all other errors map to
+    /// [`MaterialInvalid`](Self::MaterialInvalid).
+    #[must_use]
+    pub(crate) fn from_build_tls_error(e: &metrics_scraper::MetricsScrapeError) -> Self {
+        let msg = e.to_string();
+        if msg.contains("identity construction failed") {
+            Self::IdentityMismatch
+        } else {
+            Self::MaterialInvalid
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -81,30 +98,39 @@ pub(crate) fn secret_ref_from_client_cert(
 
 /// Read raw bytes from a Kubernetes Secret for TLS material resolution.
 ///
-/// Returns an error string suitable for logging (never includes the byte
-/// content itself).
+/// Returns a structured `(TlsFailureReason, String)` error so callers can
+/// derive a machine-readable `status.reason` without parsing error text.
 pub(crate) async fn read_secret_bytes_for_tls(
     client: &kube::Client,
     secret_ref: &crate::crd::grid_network::SecretRef,
     key_name: &str,
     provider_identity: &str,
     material_desc: &str,
-) -> Result<Vec<u8>, String> {
+) -> Result<Vec<u8>, (TlsFailureReason, String)> {
     use crate::resources::secret::read_secret_bytes;
 
     match read_secret_bytes(client, secret_ref, key_name).await {
         Ok(Some(bytes)) if !bytes.is_empty() => Ok(bytes),
-        Ok(Some(_)) => Err(format!(
-            "{material_desc} key {key_name:?} in Secret {}/{} is empty for provider {provider_identity}",
-            secret_ref.namespace, secret_ref.name
+        Ok(Some(_)) => Err((
+            TlsFailureReason::KeyMissing,
+            format!(
+                "{material_desc} key {key_name:?} in Secret {}/{} is empty for provider {provider_identity}",
+                secret_ref.namespace, secret_ref.name
+            ),
         )),
-        Ok(None) => Err(format!(
-            "{material_desc} Secret {}/{} or key {key_name:?} not found for provider {provider_identity}",
-            secret_ref.namespace, secret_ref.name
+        Ok(None) => Err((
+            TlsFailureReason::SecretMissing,
+            format!(
+                "{material_desc} Secret {}/{} or key {key_name:?} not found for provider {provider_identity}",
+                secret_ref.namespace, secret_ref.name
+            ),
         )),
-        Err(e) => Err(format!(
-            "{material_desc} Secret {}/{} read failed for provider {provider_identity}: {e}",
-            secret_ref.namespace, secret_ref.name
+        Err(e) => Err((
+            TlsFailureReason::MaterialInvalid,
+            format!(
+                "{material_desc} Secret {}/{} read failed for provider {provider_identity}: {e}",
+                secret_ref.namespace, secret_ref.name
+            ),
         )),
     }
 }
@@ -137,18 +163,19 @@ pub(crate) async fn resolve_tls_config(
     tls_config: Option<&EndpointTlsConfig>,
     client: Option<&kube::Client>,
     provider_identity: &str,
-) -> Result<Option<Arc<rustls::ClientConfig>>, String> {
+) -> Result<Option<Arc<rustls::ClientConfig>>, (TlsFailureReason, String)> {
     let Some(tls) = tls_config else {
         return Ok(None);
     };
     let Some(kube_client) = client else {
-        return Err("TLS configured but no Kubernetes client available".to_owned());
+        return Err((
+            TlsFailureReason::MaterialInvalid,
+            "TLS configured but no Kubernetes client available".to_owned(),
+        ));
     };
 
     let ca_key = tls.ca_secret_ref.key.as_deref().unwrap_or("ca.crt");
-    let ca_pem = read_secret_bytes_for_tls(kube_client, &tls.ca_secret_ref, ca_key, provider_identity, "CA")
-        .await
-        .map_err(|e| format!("CA secret resolution failed: {e}"))?;
+    let ca_pem = read_secret_bytes_for_tls(kube_client, &tls.ca_secret_ref, ca_key, provider_identity, "CA").await?;
 
     let (client_cert_pem, client_key_pem) = if let Some(client_ref) = &tls.client_certificate_secret_ref {
         let cert_ref = secret_ref_from_client_cert(client_ref);
@@ -175,7 +202,10 @@ pub(crate) async fn resolve_tls_config(
 
     let config =
         metrics_scraper::build_tls_client_config(&ca_pem, client_cert_pem.as_deref(), client_key_pem.as_deref())
-            .map_err(|e| format!("{e}"))?;
+            .map_err(|e| {
+                let reason = TlsFailureReason::from_build_tls_error(&e);
+                (reason, e.to_string())
+            })?;
 
     Ok(Some(Arc::new(config)))
 }
@@ -254,37 +284,7 @@ pub(crate) async fn verify_tls_accessible(
 
     match metrics_scraper::build_tls_client_config(&ca_pem, client_cert_pem.as_deref(), client_key_pem.as_deref()) {
         Ok(_) => Ok(None),
-        Err(e) => {
-            let msg = e.to_string();
-            let reason = if msg.contains("identity construction failed") {
-                TlsFailureReason::IdentityMismatch
-            } else {
-                TlsFailureReason::MaterialInvalid
-            };
-            Ok(Some(reason))
-        },
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Error-to-reason mapping
-// ---------------------------------------------------------------------------
-
-/// Map an error string from [`resolve_tls_config`] to a [`TlsFailureReason`].
-///
-/// This allows callers to derive a structured `status.reason` from the
-/// error returned by [`resolve_tls_config`] without needing a separate
-/// validation pass (and its extra Kubernetes API calls).
-#[must_use]
-pub(crate) fn tls_failure_reason_from_error(err: &str) -> TlsFailureReason {
-    if err.contains("not found") {
-        TlsFailureReason::SecretMissing
-    } else if err.contains("is empty") {
-        TlsFailureReason::KeyMissing
-    } else if err.contains("identity construction failed") {
-        TlsFailureReason::IdentityMismatch
-    } else {
-        TlsFailureReason::MaterialInvalid
+        Err(e) => Ok(Some(TlsFailureReason::from_build_tls_error(&e))),
     }
 }
 
@@ -396,6 +396,45 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // TlsFailureReason::from_build_tls_error — error classification
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn from_build_tls_error_identity_mismatch() {
+        let err = metrics_scraper::MetricsScrapeError::TlsMaterial(
+            "client identity construction failed: key mismatch".to_owned(),
+        );
+        assert_eq!(
+            TlsFailureReason::from_build_tls_error(&err),
+            TlsFailureReason::IdentityMismatch,
+            "\"identity construction failed\" must map to IdentityMismatch"
+        );
+    }
+
+    #[test]
+    fn from_build_tls_error_material_invalid_ca_parse() {
+        let err =
+            metrics_scraper::MetricsScrapeError::TlsMaterial("CA PEM parse failed: invalid base64".to_owned());
+        assert_eq!(
+            TlsFailureReason::from_build_tls_error(&err),
+            TlsFailureReason::MaterialInvalid,
+            "CA parse errors must map to MaterialInvalid"
+        );
+    }
+
+    #[test]
+    fn from_build_tls_error_material_invalid_generic() {
+        let err = metrics_scraper::MetricsScrapeError::TlsMaterial(
+            "client cert and key must both be present or both absent".to_owned(),
+        );
+        assert_eq!(
+            TlsFailureReason::from_build_tls_error(&err),
+            TlsFailureReason::MaterialInvalid,
+            "unrecognised TLS build errors must fall back to MaterialInvalid"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // resolve_tls_config — None input
     // -----------------------------------------------------------------------
 
@@ -417,49 +456,11 @@ mod tests {
         };
         let result = resolve_tls_config(Some(&tls), None, "test-provider").await;
         assert!(result.is_err(), "TLS configured without a kube client must return Err");
-    }
-
-    // -----------------------------------------------------------------------
-    // tls_failure_reason_from_error — error string mapping
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn tls_failure_reason_from_error_secret_not_found() {
-        let reason = tls_failure_reason_from_error("CA Secret ns/ca or key \"ca.crt\" not found for provider x");
-        assert_eq!(
-            reason,
-            TlsFailureReason::SecretMissing,
-            "\"not found\" must map to SecretMissing"
-        );
-    }
-
-    #[test]
-    fn tls_failure_reason_from_error_key_empty() {
-        let reason = tls_failure_reason_from_error("CA key \"ca.crt\" in Secret ns/ca is empty for provider x");
-        assert_eq!(
-            reason,
-            TlsFailureReason::KeyMissing,
-            "\"is empty\" must map to KeyMissing"
-        );
-    }
-
-    #[test]
-    fn tls_failure_reason_from_error_identity_mismatch() {
-        let reason = tls_failure_reason_from_error("client identity construction failed: key mismatch");
-        assert_eq!(
-            reason,
-            TlsFailureReason::IdentityMismatch,
-            "\"identity construction failed\" must map to IdentityMismatch"
-        );
-    }
-
-    #[test]
-    fn tls_failure_reason_from_error_fallback_to_material_invalid() {
-        let reason = tls_failure_reason_from_error("CA PEM parse failed: invalid base64");
+        let (reason, _msg) = result.unwrap_err();
         assert_eq!(
             reason,
             TlsFailureReason::MaterialInvalid,
-            "unrecognised error must fall back to MaterialInvalid"
+            "TLS configured without a kube client must return MaterialInvalid"
         );
     }
 }

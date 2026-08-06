@@ -518,9 +518,8 @@ async fn resolve_phase_and_sites(
     {
         match crate::resources::endpoint_tls::resolve_tls_config(hc.tls.as_ref(), Some(client), name).await {
             Ok(cfg) => cfg,
-            Err(e) => {
-                let reason_str =
-                    crate::resources::endpoint_tls::tls_failure_reason_from_error(&e).as_status_reason("HealthCheck");
+            Err((reason, e)) => {
+                let reason_str = reason.as_status_reason("HealthCheck");
                 tracing::warn!(
                     name,
                     reason = %reason_str,
