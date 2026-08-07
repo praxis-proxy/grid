@@ -413,8 +413,7 @@ mod tests {
 
     #[test]
     fn from_build_tls_error_material_invalid_ca_parse() {
-        let err =
-            metrics_scraper::MetricsScrapeError::TlsMaterial("CA PEM parse failed: invalid base64".to_owned());
+        let err = metrics_scraper::MetricsScrapeError::TlsMaterial("CA PEM parse failed: invalid base64".to_owned());
         assert_eq!(
             TlsFailureReason::from_build_tls_error(&err),
             TlsFailureReason::MaterialInvalid,

@@ -84,12 +84,14 @@ use crate::{
 /// Requeue interval after a successful reconciliation when no `healthCheck.interval` is set.
 const REQUEUE_INTERVAL: Duration = Duration::from_secs(300);
 
-/// Shorter requeue interval for providers with `metricsConfig.tls` configured.
+/// Shorter requeue interval for providers with `metricsConfig.tls` or
+/// `healthCheck.tls` configured.
 ///
 /// Without a cluster-wide Secret watch, the operator detects TLS material
 /// rotation (certificate renewal, CA rollover) by re-reconciling on this
 /// bounded interval.  60 seconds balances rotation detection latency against
-/// API server load.
+/// API server load.  When `healthCheck.interval` is also set, the effective
+/// interval is `min(healthCheck.interval, TLS_REQUEUE_INTERVAL)`.
 const TLS_REQUEUE_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Field manager name for server-side apply.
@@ -330,10 +332,12 @@ fn parse_duration_str(s: &str) -> Option<Duration> {
 ///
 /// When `spec.healthCheck.interval` is configured and parseable, the
 /// provider is requeued after that duration so that health probes run
-/// at approximately the requested cadence.  When `metricsConfig.tls` is
-/// configured, falls back to [`TLS_REQUEUE_INTERVAL`] (60s) so the
-/// operator detects certificate rotation without a cluster-wide Secret
-/// watch.  Otherwise falls back to [`REQUEUE_INTERVAL`] (300s).
+/// at approximately the requested cadence.  When TLS is configured
+/// (`metricsConfig.tls` or `healthCheck.tls`), the effective interval
+/// is capped at [`TLS_REQUEUE_INTERVAL`] (60s) so the operator detects
+/// certificate rotation without a cluster-wide Secret watch.  When no
+/// interval is configured, falls back to [`TLS_REQUEUE_INTERVAL`] if
+/// TLS is present, or [`REQUEUE_INTERVAL`] (300s) otherwise.
 ///
 /// The interval controls **reconcile frequency**, not a separate timer
 /// loop.  The probe runs at the start of each reconcile, so the actual
@@ -343,20 +347,30 @@ fn parse_duration_str(s: &str) -> Option<Duration> {
 ///
 /// [`InferenceProvider`]: crate::crd::inference_provider::InferenceProvider
 pub(crate) fn requeue_interval_for_provider(spec: &InferenceProviderSpec) -> Duration {
-    if let Some(interval) = spec
+    let configured_interval = spec
         .health_check
         .as_ref()
         .and_then(|hc| hc.interval.as_deref())
-        .and_then(parse_duration_str)
-    {
-        return interval;
-    }
+        .and_then(parse_duration_str);
+
     let has_tls = spec.metrics_config.as_ref().is_some_and(|mc| mc.tls.is_some())
         || spec.health_check.as_ref().is_some_and(|hc| hc.tls.is_some());
-    if has_tls {
-        TLS_REQUEUE_INTERVAL
-    } else {
-        REQUEUE_INTERVAL
+
+    match (configured_interval, has_tls) {
+        (Some(interval), true) => {
+            let capped = interval.min(TLS_REQUEUE_INTERVAL);
+            if capped < interval {
+                tracing::info!(
+                    configured = ?interval,
+                    capped = ?capped,
+                    "healthCheck.interval exceeds TLS requeue bound; capping to ensure timely certificate rotation detection"
+                );
+            }
+            capped
+        },
+        (Some(interval), false) => interval,
+        (None, true) => TLS_REQUEUE_INTERVAL,
+        (None, false) => REQUEUE_INTERVAL,
     }
 }
 
@@ -1557,7 +1571,7 @@ mod tests {
     }
 
     #[test]
-    fn requeue_health_check_interval_wins_over_tls_interval() {
+    fn requeue_interval_below_tls_bound_passes_through() {
         let spec: InferenceProviderSpec = serde_json::from_value(serde_json::json!({
             "gridNetworkRef": "net",
             "providerKind": "self_hosted",
@@ -1575,7 +1589,30 @@ mod tests {
         assert_eq!(
             requeue_interval_for_provider(&spec),
             Duration::from_secs(30),
-            "explicit healthCheck.interval must take precedence over TLS requeue"
+            "healthCheck.interval below TLS bound must pass through unchanged"
+        );
+    }
+
+    #[test]
+    fn requeue_interval_above_tls_bound_is_capped() {
+        let spec: InferenceProviderSpec = serde_json::from_value(serde_json::json!({
+            "gridNetworkRef": "net",
+            "providerKind": "self_hosted",
+            "backendKind": "local",
+            "endpoint": "https://vllm:8443",
+            "models": [{"name": "model"}],
+            "healthCheck": { "interval": "120s" },
+            "metricsConfig": {
+                "tls": {
+                    "caSecretRef": { "name": "ca", "namespace": "ns" }
+                }
+            }
+        }))
+        .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            requeue_interval_for_provider(&spec),
+            TLS_REQUEUE_INTERVAL,
+            "healthCheck.interval exceeding TLS bound must be capped to 60s"
         );
     }
 
@@ -1759,7 +1796,7 @@ mod tests {
     }
 
     #[test]
-    fn requeue_health_check_interval_wins_over_health_check_tls() {
+    fn requeue_interval_below_hc_tls_bound_passes_through() {
         let spec: InferenceProviderSpec = serde_json::from_value(serde_json::json!({
             "gridNetworkRef": "net",
             "providerKind": "self_hosted",
@@ -1778,7 +1815,7 @@ mod tests {
         assert_eq!(
             requeue_interval_for_provider(&spec),
             Duration::from_secs(30),
-            "explicit healthCheck.interval must take precedence over healthCheck.tls requeue"
+            "healthCheck.interval below TLS bound must pass through unchanged (healthCheck.tls)"
         );
     }
 
