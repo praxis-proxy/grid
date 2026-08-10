@@ -109,9 +109,11 @@ spec:
   metricsRefreshInterval: "10s"
 ```
 
-The value accepts positive milliseconds or seconds; the CRD rejects other
-formats before they reach the operator. An absent value uses the safe default
-of 300 seconds for plaintext metrics. A network with TLS
+The value accepts seconds or millisecond durations of at least one second; the
+CRD rejects zero, subsecond, and unsupported formats before they reach the
+operator. The controller also fails reconciliation if malformed data reaches
+it outside the Kubernetes admission path. An absent value uses the safe
+default of 300 seconds for plaintext metrics. A network with TLS
 metric credentials defaults to 60 seconds and never permits a custom interval
 longer than that bound, so certificate rotation detection is not delayed.
 Shorter intervals increase Kubernetes API, metrics-scrape, and overlay-update
@@ -125,13 +127,13 @@ During reconciliation, Grid:
 
 1. Lists the eligible `InferenceProvider` resources and `GridSite` resources.
 2. Scrapes each configured metrics endpoint, such as an llm-d EPP endpoint.
-3. Normalizes queue, KV-cache, latency, and other signals; applies freshness
-   and health handling.
+3. Normalizes the signal selected by `scoringPolicy` and applies freshness and
+   health handling.
 4. Builds the candidate set, including eligible remote providers received
    through Grid state.
-5. Computes the weighted score and applies admission and `routingPolicy`
-   ordering. The first candidate receives rank `0`, the next receives rank
-   `1`, and so on.
+5. Computes the selected strategy's score and applies admission and
+   `routingPolicy` ordering. The first candidate receives rank `0`, the next
+   receives rank `1`, and so on.
 6. Renders a content-addressed overlay for each gateway reference. Each
    gateway can therefore receive a different ranking because its `localSite`
    and routing perspective can differ.

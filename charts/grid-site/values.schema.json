@@ -51,7 +51,7 @@
         },
         "metricsRefreshInterval": {
           "type": "string",
-          "pattern": "^[0-9]+(ms|s)$"
+          "pattern": "^([1-9][0-9]*s|[1-9][0-9]{3,}ms)$"
         },
         "gatewayRefs": {
           "type": "array",

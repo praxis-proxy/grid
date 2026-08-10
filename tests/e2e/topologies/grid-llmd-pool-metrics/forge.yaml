@@ -238,8 +238,8 @@ spec:
               routingPolicy: scoreFirst
               scoringPolicy:
                 strategy: queueDepth
-              # Ten seconds keeps pressure transitions visible without creating
-              # unnecessary reconcile, scrape, and overlay-update churn.
+              # Ten seconds is the periodic fallback. The harness also forces
+              # reconciles while waiting for deterministic pressure transitions.
               metricsRefreshInterval: "10s"
               swim:
                 probeInterval: "5s"
@@ -313,8 +313,8 @@ spec:
               routingPolicy: scoreFirst
               scoringPolicy:
                 strategy: queueDepth
-              # Ten seconds keeps pressure transitions visible without creating
-              # unnecessary reconcile, scrape, and overlay-update churn.
+              # Ten seconds is the periodic fallback. The harness also forces
+              # reconciles while waiting for deterministic pressure transitions.
               metricsRefreshInterval: "10s"
               swim:
                 probeInterval: "5s"

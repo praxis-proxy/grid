@@ -247,6 +247,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
 
     // List providers once; share between routing overlay rendering and CRDT publishing.
     let providers = list_all_inference_providers(client).await?;
+    let requeue_interval = requeue_interval_for_network(&network, &providers)?;
     let raw_metrics =
         provider_metrics::collect_provider_metrics(name, &providers, &ctx.metrics_cache, Instant::now(), Some(client))
             .await;
@@ -329,7 +330,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
         reconcile_discovered_sites(name, swim.site_name(), snapshot, client, plaintext).await?;
     }
 
-    Ok(Action::requeue(requeue_interval_for_network(&network, &providers)))
+    Ok(Action::requeue(requeue_interval))
 }
 
 /// Apply `spec.tls.swimKeyRef` before any reconcile-triggered SWIM send.
@@ -1948,16 +1949,21 @@ async fn reconcile_discovered_sites(
 /// collection and overlay publication in this reconcile loop detect
 /// certificate rotation without a cluster-wide Secret watch.
 ///
-/// An explicit `spec.metricsRefreshInterval` is used when parseable. TLS
+/// An explicit `spec.metricsRefreshInterval` is used when valid. TLS
 /// networks are capped at [`TLS_REQUEUE_INTERVAL`] so certificate rotation is
-/// not delayed by an unsafe long custom interval. Invalid or absent values
-/// fall back to the appropriate safe default.
+/// not delayed by an unsafe long custom interval. An absent value uses the
+/// appropriate safe default; an invalid value fails reconciliation.
 ///
 /// [`InferenceProvider`]: crate::crd::inference_provider::InferenceProvider
-fn requeue_interval_for_network(network: &GridNetwork, providers: &[InferenceProvider]) -> Duration {
+fn requeue_interval_for_network(
+    network: &GridNetwork,
+    providers: &[InferenceProvider],
+) -> Result<Duration, OperatorError> {
+    let network_name = grid_network_name(network)?;
     let any_has_tls = providers
         .iter()
-        .any(|p| p.spec.metrics_config.as_ref().is_some_and(|mc| mc.tls.is_some()));
+        .filter(|provider| provider.spec.grid_network_ref == network_name)
+        .any(|provider| provider.spec.metrics_config.as_ref().is_some_and(|mc| mc.tls.is_some()));
     let default = if any_has_tls {
         TLS_REQUEUE_INTERVAL
     } else {
@@ -1967,28 +1973,49 @@ fn requeue_interval_for_network(network: &GridNetwork, providers: &[InferencePro
         .spec
         .metrics_refresh_interval
         .as_deref()
-        .and_then(parse_metrics_refresh_interval);
+        .map(parse_metrics_refresh_interval)
+        .transpose()?;
 
-    match (configured, any_has_tls) {
+    Ok(match (configured, any_has_tls) {
         (Some(interval), true) => interval.min(TLS_REQUEUE_INTERVAL),
         (Some(interval), false) => interval,
         (None, _) => default,
-    }
+    })
 }
 
 /// Parse the deliberately small duration format accepted by
-/// `metricsRefreshInterval`: positive seconds or milliseconds.
-fn parse_metrics_refresh_interval(value: &str) -> Option<Duration> {
-    let value = value.trim();
+/// `metricsRefreshInterval`: seconds or milliseconds, with a one-second
+/// minimum.
+fn parse_metrics_refresh_interval(value: &str) -> Result<Duration, OperatorError> {
     let (number, multiplier) = if let Some(number) = value.strip_suffix("ms") {
         (number, 1_u64)
     } else if let Some(number) = value.strip_suffix('s') {
         (number, 1_000_u64)
     } else {
-        return None;
+        return Err(OperatorError::InvalidResource(format!(
+            "spec.metricsRefreshInterval must use seconds or milliseconds, got {value:?}"
+        )));
     };
-    let millis = number.trim().parse::<u64>().ok()?.checked_mul(multiplier)?;
-    (millis > 0).then(|| Duration::from_millis(millis))
+    if number.is_empty() || number.starts_with('0') || !number.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(OperatorError::InvalidResource(format!(
+            "spec.metricsRefreshInterval contains an invalid duration: {value:?}"
+        )));
+    }
+    let millis = number
+        .parse::<u64>()
+        .ok()
+        .and_then(|number| number.checked_mul(multiplier))
+        .ok_or_else(|| {
+            OperatorError::InvalidResource(format!(
+                "spec.metricsRefreshInterval contains an invalid duration: {value:?}"
+            ))
+        })?;
+    if millis < 1_000 {
+        return Err(OperatorError::InvalidResource(
+            "spec.metricsRefreshInterval must be at least one second".to_owned(),
+        ));
+    }
+    Ok(Duration::from_millis(millis))
 }
 
 // ---------------------------------------------------------------------------
@@ -4088,8 +4115,8 @@ mod tests {
             make_inference_provider("p2", "net"),
         ];
         assert_eq!(
-            requeue_interval_for_network(&base_network(), &providers),
-            REQUEUE_INTERVAL,
+            requeue_interval_for_network(&base_network(), &providers).ok(),
+            Some(REQUEUE_INTERVAL),
             "networks with no TLS providers should use 300s"
         );
     }
@@ -4098,8 +4125,8 @@ mod tests {
     fn network_requeue_tls_provider_uses_tls_interval() {
         let providers = vec![make_provider_with_tls("p1", "net")];
         assert_eq!(
-            requeue_interval_for_network(&base_network(), &providers),
-            TLS_REQUEUE_INTERVAL,
+            requeue_interval_for_network(&base_network(), &providers).ok(),
+            Some(TLS_REQUEUE_INTERVAL),
             "network with a TLS provider should use 60s"
         );
     }
@@ -4111,8 +4138,8 @@ mod tests {
             make_provider_with_tls("secure", "net"),
         ];
         assert_eq!(
-            requeue_interval_for_network(&base_network(), &providers),
-            TLS_REQUEUE_INTERVAL,
+            requeue_interval_for_network(&base_network(), &providers).ok(),
+            Some(TLS_REQUEUE_INTERVAL),
             "mixed plaintext/TLS providers should use 60s"
         );
     }
@@ -4121,8 +4148,8 @@ mod tests {
     fn network_requeue_longer_health_interval_does_not_delay_tls() {
         let providers = vec![make_provider_with_tls_and_health_interval("p1", "net", "600s")];
         assert_eq!(
-            requeue_interval_for_network(&base_network(), &providers),
-            TLS_REQUEUE_INTERVAL,
+            requeue_interval_for_network(&base_network(), &providers).ok(),
+            Some(TLS_REQUEUE_INTERVAL),
             "a longer healthCheck.interval must not delay TLS rotation detection"
         );
     }
@@ -4133,8 +4160,8 @@ mod tests {
         let mut network = base_network();
         network.spec.metrics_refresh_interval = Some("10s".to_owned());
         assert_eq!(
-            requeue_interval_for_network(&network, &providers),
-            Duration::from_secs(10)
+            requeue_interval_for_network(&network, &providers).ok(),
+            Some(Duration::from_secs(10))
         );
     }
 
@@ -4142,27 +4169,30 @@ mod tests {
     fn network_requeue_uses_configured_milliseconds_interval() {
         let providers = vec![make_inference_provider("p1", "net")];
         let mut network = base_network();
-        network.spec.metrics_refresh_interval = Some("500ms".to_owned());
+        network.spec.metrics_refresh_interval = Some("1500ms".to_owned());
         assert_eq!(
-            requeue_interval_for_network(&network, &providers),
-            Duration::from_millis(500)
+            requeue_interval_for_network(&network, &providers).ok(),
+            Some(Duration::from_millis(1_500))
         );
     }
 
     #[test]
-    fn network_requeue_invalid_config_falls_back_to_safe_default() {
+    fn network_requeue_invalid_config_fails() {
         let providers = vec![make_inference_provider("p1", "net")];
         let mut network = base_network();
         network.spec.metrics_refresh_interval = Some("5m".to_owned());
-        assert_eq!(requeue_interval_for_network(&network, &providers), REQUEUE_INTERVAL);
+        assert!(requeue_interval_for_network(&network, &providers).is_err());
     }
 
     #[test]
     fn network_requeue_tls_caps_long_configured_interval() {
         let providers = vec![make_provider_with_tls("p1", "net")];
         let mut network = base_network();
-        network.spec.metrics_refresh_interval = Some("10m".to_owned());
-        assert_eq!(requeue_interval_for_network(&network, &providers), TLS_REQUEUE_INTERVAL);
+        network.spec.metrics_refresh_interval = Some("600s".to_owned());
+        assert_eq!(
+            requeue_interval_for_network(&network, &providers).ok(),
+            Some(TLS_REQUEUE_INTERVAL)
+        );
     }
 
     #[test]
@@ -4171,17 +4201,36 @@ mod tests {
         let mut network = base_network();
         network.spec.metrics_refresh_interval = Some("10s".to_owned());
         assert_eq!(
-            requeue_interval_for_network(&network, &providers),
-            Duration::from_secs(10)
+            requeue_interval_for_network(&network, &providers).ok(),
+            Some(Duration::from_secs(10))
+        );
+    }
+
+    #[test]
+    fn network_requeue_ignores_tls_providers_from_other_networks() {
+        let providers = vec![
+            make_inference_provider("local", "net"),
+            make_provider_with_tls("unrelated-secure", "other-net"),
+        ];
+        let mut network = base_network();
+        network.spec.metrics_refresh_interval = Some("120s".to_owned());
+        assert_eq!(
+            requeue_interval_for_network(&network, &providers).ok(),
+            Some(Duration::from_secs(120)),
+            "TLS providers from another network must not cap this network's interval"
         );
     }
 
     #[test]
     fn metrics_refresh_duration_parser_rejects_unsupported_values() {
-        assert_eq!(parse_metrics_refresh_interval(""), None);
-        assert_eq!(parse_metrics_refresh_interval("10"), None);
-        assert_eq!(parse_metrics_refresh_interval("0s"), None);
-        assert_eq!(parse_metrics_refresh_interval("-1s"), None);
-        assert_eq!(parse_metrics_refresh_interval("1m"), None);
+        assert!(parse_metrics_refresh_interval("").is_err());
+        assert!(parse_metrics_refresh_interval("10").is_err());
+        assert!(parse_metrics_refresh_interval("0s").is_err());
+        assert!(parse_metrics_refresh_interval("500ms").is_err());
+        assert!(parse_metrics_refresh_interval("-1s").is_err());
+        assert!(parse_metrics_refresh_interval("1m").is_err());
+        assert!(parse_metrics_refresh_interval("01s").is_err());
+        assert!(parse_metrics_refresh_interval(" 10s").is_err());
+        assert!(parse_metrics_refresh_interval("18446744073709551615s").is_err());
     }
 }
