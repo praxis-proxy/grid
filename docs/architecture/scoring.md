@@ -114,6 +114,38 @@ per-request endpoint scheduling. Grid deliberately exposes less complexity at
 the cross-site provider layer. New strategies should be added only when Grid
 has a real provider-level signal with defined freshness and normalization.
 
+## Selecting the provider-level strategy
+
+`GridNetwork.spec.scoringPolicy.strategy` selects the one provider-level signal
+that Grid should use for dynamic metric scoring. It is intentionally not an
+opaque blend of every available signal:
+
+| Strategy | What a higher score means |
+|---|---|
+| `noMetrics` | Do not prefer a provider using dynamic metrics. Health, admission, freshness, locality, and request-time policy still apply. |
+| `queueDepth` | The provider has less normalized queue pressure. This is the llm-d load-aware mode used by the pool-metrics demo. |
+| `kvCachePressure` | The provider has more available KV-cache capacity, meaning lower utilization pressure. |
+
+When `scoringPolicy` is absent, Grid uses `noMetrics`. The six weights in the
+table above describe the scoring engine's legacy combined-weight capability;
+they are not silently enabled by omitting the policy. Explicitly select a
+strategy when provider metrics should move cross-provider ranking.
+
+For example:
+
+```yaml
+spec:
+  routingPolicy: scoreFirst
+  scoringPolicy:
+    strategy: queueDepth
+  metricsRefreshInterval: "10s"
+```
+
+`routingPolicy` and `scoringPolicy` answer different questions. The scoring
+strategy calculates the dynamic metric score. `geographyFirst` or `scoreFirst`
+then determines whether locality or that score is the primary ordering rule.
+Admission and freshness remain higher-priority safety gates in both modes.
+
 ## Metrics Configuration
 
 `InferenceProvider.spec.metricsConfig` enables Prometheus text-format scraping.

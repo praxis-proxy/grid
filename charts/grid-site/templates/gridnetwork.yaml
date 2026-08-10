@@ -24,6 +24,11 @@ spec:
     strategy: {{ .strategy | quote }}
   {{- end }}
   {{- end }}
+  {{- with .Values.gridNetwork.metricsRefreshInterval }}
+  {{- if . }}
+  metricsRefreshInterval: {{ . | quote }}
+  {{- end }}
+  {{- end }}
   {{- with .Values.gridNetwork.swim }}
   swim:
     {{- toYaml . | nindent 4 }}

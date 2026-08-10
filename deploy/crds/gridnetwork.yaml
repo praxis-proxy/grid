@@ -249,6 +249,14 @@ spec:
                   required:
                     - strategy
                   type: object
+                metricsRefreshInterval:
+                  description: |-
+                    Maximum time between provider metric refreshes and score/ranking recalculation.
+
+                    Use a duration such as `10s`. TLS metric networks cap the interval at 60 seconds.
+                  nullable: true
+                  pattern: ^[0-9]+(ms|s)$
+                  type: string
                 seeds:
                   default: []
                   description: Initial SWIM seed peer addresses.
