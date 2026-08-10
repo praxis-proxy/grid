@@ -275,8 +275,17 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
     let remote_crdt_providers =
         routing_overlay::apply_stale_gc_filter(&remote_crdt_providers, membership.as_ref(), &stale_policy);
 
-    let (consumer_config_statuses, overlay_statuses) =
-        reconcile_routing_overlay_inner(&network, client, &providers, &remote_crdt_providers, &raw_metrics).await?;
+    let scoring_weights = crate::crd::grid_network::resolve_scoring_weights(network.spec.scoring_policy.as_ref());
+
+    let (consumer_config_statuses, overlay_statuses) = reconcile_routing_overlay_inner(
+        &network,
+        client,
+        &providers,
+        &remote_crdt_providers,
+        &raw_metrics,
+        &scoring_weights,
+    )
+    .await?;
 
     let grid_id = resolve_grid_id(&network);
     let phase = if swim_runtime_running {
@@ -320,7 +329,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
         reconcile_discovered_sites(name, swim.site_name(), snapshot, client, plaintext).await?;
     }
 
-    Ok(Action::requeue(requeue_interval_for_network(&providers)))
+    Ok(Action::requeue(requeue_interval_for_network(&network, &providers)))
 }
 
 /// Apply `spec.tls.swimKeyRef` before any reconcile-triggered SWIM send.
@@ -674,12 +683,17 @@ async fn apply_site_secret(
     clippy::cognitive_complexity,
     reason = "sequential overlay render loop with per-gateway eligibility filter, consumer config, and status; splitting obscures the pipeline"
 )]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "scoring_weights is threaded through overlay rendering without hiding the selected strategy"
+)]
 async fn reconcile_routing_overlay_inner(
     network: &GridNetwork,
     client: &Client,
     providers: &[InferenceProvider],
     remote_crdt_providers: &[crdt::ProviderState],
     raw_metrics: &HashMap<String, scoring::BackendMetrics>,
+    scoring_weights: &scoring::ScoringWeights,
 ) -> Result<(Vec<ConsumerConfigStatus>, Vec<OverlayRevisionStatus>), OperatorError> {
     let network_name = grid_network_name(network)?;
 
@@ -731,6 +745,7 @@ async fn reconcile_routing_overlay_inner(
             local_site,
             metrics_arg,
             timestamp.as_deref(),
+            scoring_weights,
         ) {
             Ok(overlay) => overlay,
             Err(error) => {
@@ -1933,19 +1948,47 @@ async fn reconcile_discovered_sites(
 /// collection and overlay publication in this reconcile loop detect
 /// certificate rotation without a cluster-wide Secret watch.
 ///
-/// For networks with only plaintext metrics (or no metrics), returns the
-/// default [`REQUEUE_INTERVAL`] (300 s).
+/// An explicit `spec.metricsRefreshInterval` is used when parseable. TLS
+/// networks are capped at [`TLS_REQUEUE_INTERVAL`] so certificate rotation is
+/// not delayed by an unsafe long custom interval. Invalid or absent values
+/// fall back to the appropriate safe default.
 ///
 /// [`InferenceProvider`]: crate::crd::inference_provider::InferenceProvider
-fn requeue_interval_for_network(providers: &[InferenceProvider]) -> Duration {
+fn requeue_interval_for_network(network: &GridNetwork, providers: &[InferenceProvider]) -> Duration {
     let any_has_tls = providers
         .iter()
         .any(|p| p.spec.metrics_config.as_ref().is_some_and(|mc| mc.tls.is_some()));
-    if any_has_tls {
+    let default = if any_has_tls {
         TLS_REQUEUE_INTERVAL
     } else {
         REQUEUE_INTERVAL
+    };
+    let configured = network
+        .spec
+        .metrics_refresh_interval
+        .as_deref()
+        .and_then(parse_metrics_refresh_interval);
+
+    match (configured, any_has_tls) {
+        (Some(interval), true) => interval.min(TLS_REQUEUE_INTERVAL),
+        (Some(interval), false) => interval,
+        (None, _) => default,
     }
+}
+
+/// Parse the deliberately small duration format accepted by
+/// `metricsRefreshInterval`: positive seconds or milliseconds.
+fn parse_metrics_refresh_interval(value: &str) -> Option<Duration> {
+    let value = value.trim();
+    let (number, multiplier) = if let Some(number) = value.strip_suffix("ms") {
+        (number, 1_u64)
+    } else if let Some(number) = value.strip_suffix('s') {
+        (number, 1_000_u64)
+    } else {
+        return None;
+    };
+    let millis = number.trim().parse::<u64>().ok()?.checked_mul(multiplier)?;
+    (millis > 0).then(|| Duration::from_millis(millis))
 }
 
 // ---------------------------------------------------------------------------
@@ -4045,7 +4088,7 @@ mod tests {
             make_inference_provider("p2", "net"),
         ];
         assert_eq!(
-            requeue_interval_for_network(&providers),
+            requeue_interval_for_network(&base_network(), &providers),
             REQUEUE_INTERVAL,
             "networks with no TLS providers should use 300s"
         );
@@ -4055,7 +4098,7 @@ mod tests {
     fn network_requeue_tls_provider_uses_tls_interval() {
         let providers = vec![make_provider_with_tls("p1", "net")];
         assert_eq!(
-            requeue_interval_for_network(&providers),
+            requeue_interval_for_network(&base_network(), &providers),
             TLS_REQUEUE_INTERVAL,
             "network with a TLS provider should use 60s"
         );
@@ -4068,7 +4111,7 @@ mod tests {
             make_provider_with_tls("secure", "net"),
         ];
         assert_eq!(
-            requeue_interval_for_network(&providers),
+            requeue_interval_for_network(&base_network(), &providers),
             TLS_REQUEUE_INTERVAL,
             "mixed plaintext/TLS providers should use 60s"
         );
@@ -4078,9 +4121,67 @@ mod tests {
     fn network_requeue_longer_health_interval_does_not_delay_tls() {
         let providers = vec![make_provider_with_tls_and_health_interval("p1", "net", "600s")];
         assert_eq!(
-            requeue_interval_for_network(&providers),
+            requeue_interval_for_network(&base_network(), &providers),
             TLS_REQUEUE_INTERVAL,
             "a longer healthCheck.interval must not delay TLS rotation detection"
         );
+    }
+
+    #[test]
+    fn network_requeue_uses_configured_seconds_interval() {
+        let providers = vec![make_inference_provider("p1", "net")];
+        let mut network = base_network();
+        network.spec.metrics_refresh_interval = Some("10s".to_owned());
+        assert_eq!(
+            requeue_interval_for_network(&network, &providers),
+            Duration::from_secs(10)
+        );
+    }
+
+    #[test]
+    fn network_requeue_uses_configured_milliseconds_interval() {
+        let providers = vec![make_inference_provider("p1", "net")];
+        let mut network = base_network();
+        network.spec.metrics_refresh_interval = Some("500ms".to_owned());
+        assert_eq!(
+            requeue_interval_for_network(&network, &providers),
+            Duration::from_millis(500)
+        );
+    }
+
+    #[test]
+    fn network_requeue_invalid_config_falls_back_to_safe_default() {
+        let providers = vec![make_inference_provider("p1", "net")];
+        let mut network = base_network();
+        network.spec.metrics_refresh_interval = Some("5m".to_owned());
+        assert_eq!(requeue_interval_for_network(&network, &providers), REQUEUE_INTERVAL);
+    }
+
+    #[test]
+    fn network_requeue_tls_caps_long_configured_interval() {
+        let providers = vec![make_provider_with_tls("p1", "net")];
+        let mut network = base_network();
+        network.spec.metrics_refresh_interval = Some("10m".to_owned());
+        assert_eq!(requeue_interval_for_network(&network, &providers), TLS_REQUEUE_INTERVAL);
+    }
+
+    #[test]
+    fn network_requeue_tls_allows_short_configured_interval() {
+        let providers = vec![make_provider_with_tls("p1", "net")];
+        let mut network = base_network();
+        network.spec.metrics_refresh_interval = Some("10s".to_owned());
+        assert_eq!(
+            requeue_interval_for_network(&network, &providers),
+            Duration::from_secs(10)
+        );
+    }
+
+    #[test]
+    fn metrics_refresh_duration_parser_rejects_unsupported_values() {
+        assert_eq!(parse_metrics_refresh_interval(""), None);
+        assert_eq!(parse_metrics_refresh_interval("10"), None);
+        assert_eq!(parse_metrics_refresh_interval("0s"), None);
+        assert_eq!(parse_metrics_refresh_interval("-1s"), None);
+        assert_eq!(parse_metrics_refresh_interval("1m"), None);
     }
 }

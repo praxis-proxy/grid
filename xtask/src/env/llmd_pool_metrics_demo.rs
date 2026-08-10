@@ -76,11 +76,11 @@ const DATA_PLANE_INTERVAL: Duration = Duration::from_secs(1);
 /// Configured queue capacity (matches MOCK_MAX_NUM_SEQS on VCR pods).
 const QUEUE_CAPACITY: f64 = 4.0;
 
-/// Scoring weight for queue_depth signal (must match ScoringWeights default).
-const QUEUE_DEPTH_WEIGHT: f64 = 3.0;
+/// Scoring weight for queue_depth signal (one-hot strategy: weight = 1.0).
+const QUEUE_DEPTH_WEIGHT: f64 = 1.0;
 
-/// Scoring weight for kv_cache signal (must match ScoringWeights default).
-const KV_CACHE_WEIGHT: f64 = 2.0;
+/// Scoring weight for kv_cache signal (one-hot strategy: weight = 1.0).
+const KV_CACHE_WEIGHT: f64 = 1.0;
 
 /// Minimum score gap required before capturing the pressure scorecard.
 ///

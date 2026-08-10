@@ -38,6 +38,21 @@
           "type": "string",
           "enum": ["geographyFirst", "scoreFirst"]
         },
+        "scoringPolicy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["strategy"],
+          "properties": {
+            "strategy": {
+              "type": "string",
+              "enum": ["noMetrics", "queueDepth", "kvCachePressure"]
+            }
+          }
+        },
+        "metricsRefreshInterval": {
+          "type": "string",
+          "pattern": "^[0-9]+(ms|s)$"
+        },
         "gatewayRefs": {
           "type": "array",
           "items": {

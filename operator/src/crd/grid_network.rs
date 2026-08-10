@@ -38,6 +38,119 @@ pub enum RoutingPolicy {
 }
 
 // ---------------------------------------------------------------------------
+// Scoring policy
+// ---------------------------------------------------------------------------
+
+/// Provider-level strategy used to order inference pools.
+///
+/// Grid follows llm-d's scorer model: the operator selects one independently
+/// meaningful signal instead of blending unrelated objectives into an opaque
+/// total. Request-specific decisions, such as prefix-cache affinity, remain in
+/// the llm-d EPP after Grid has selected a provider pool.
+///
+/// When no [`ScoringPolicyConfig`] is set on the [`GridNetworkSpec`], dynamic
+/// metric scoring is disabled. This supports external APIs and ordinary
+/// providers that do not expose comparable EPP telemetry.
+#[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ScoringStrategy {
+    /// Do not prefer providers using dynamic metrics.
+    ///
+    /// All score contributions are zero. Health, admission, freshness,
+    /// geography, selection tiers, session affinity, and request-time picker
+    /// policy still apply. This is the generic default.
+    #[default]
+    NoMetrics,
+
+    /// Prefer the provider pool with the shortest normalized queue.
+    ///
+    /// This load-aware strategy corresponds to llm-d's `queue-scorer`. Lower
+    /// queue pressure produces a higher score.
+    QueueDepth,
+
+    /// Prefer the provider pool with the most available KV-cache capacity.
+    ///
+    /// This corresponds to llm-d's `kv-cache-utilization-scorer`: lower
+    /// utilization produces a higher score. It is a capacity-pressure signal,
+    /// not evidence that the current request's prefix is cached.
+    KvCachePressure,
+}
+
+impl ScoringStrategy {
+    /// Adapts the selected strategy to the existing scoring engine.
+    #[must_use]
+    pub fn weights(self) -> scoring::ScoringWeights {
+        match self {
+            Self::NoMetrics => scoring::ScoringWeights {
+                locality: 0.0,
+                queue_depth: 0.0,
+                kv_cache: 0.0,
+                prefix_cache: 0.0,
+                latency: 0.0,
+                cost: 0.0,
+            },
+            Self::QueueDepth => scoring::ScoringWeights {
+                locality: 0.0,
+                queue_depth: 1.0,
+                kv_cache: 0.0,
+                prefix_cache: 0.0,
+                latency: 0.0,
+                cost: 0.0,
+            },
+            Self::KvCachePressure => scoring::ScoringWeights {
+                locality: 0.0,
+                queue_depth: 0.0,
+                kv_cache: 1.0,
+                prefix_cache: 0.0,
+                latency: 0.0,
+                cost: 0.0,
+            },
+        }
+    }
+}
+
+/// Scoring policy configuration for the routing overlay.
+///
+/// Selects exactly one provider-level signal. When this field is absent from
+/// [`GridNetworkSpec`], `noMetrics` is used.
+///
+/// # Examples
+///
+/// ```yaml
+/// # Generic default (equivalent to omitting scoringPolicy):
+/// scoringPolicy:
+///   strategy: noMetrics
+///
+/// # Opt into llm-d load-aware scoring:
+/// scoringPolicy:
+///   strategy: queueDepth
+///
+/// # Or prefer available KV-cache capacity:
+/// scoringPolicy:
+///   strategy: kvCachePressure
+/// ```
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct ScoringPolicyConfig {
+    /// Provider-level scoring strategy.
+    ///
+    /// Required when `scoringPolicy` is present. Omit the entire policy to use
+    /// the `noMetrics` default.
+    pub strategy: ScoringStrategy,
+}
+
+/// Resolve the effective [`scoring::ScoringWeights`] from a scoring policy.
+///
+/// The public API selects one scorer. The weight adapter is internal and
+/// keeps the existing scoring engine and score-breakdown contract intact.
+pub fn resolve_scoring_weights(policy: Option<&ScoringPolicyConfig>) -> scoring::ScoringWeights {
+    policy
+        .map_or_else(ScoringStrategy::default, |policy| policy.strategy)
+        .weights()
+}
+
+// ---------------------------------------------------------------------------
 // Spec
 // ---------------------------------------------------------------------------
 
@@ -103,6 +216,27 @@ pub struct GridNetworkSpec {
     /// freshness is a tiebreaker below geography and score.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub routing_policy: Option<RoutingPolicy>,
+
+    /// Scoring policy configuration.
+    ///
+    /// Selects how the operator scores providers for the routing overlay.
+    ///
+    /// **Default (absent):** the `noMetrics` strategy is used.
+    ///
+    /// See [`ScoringStrategy`] for the available provider-level strategies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scoring_policy: Option<ScoringPolicyConfig>,
+
+    /// Maximum time between metric refreshes and score/ranking recalculation.
+    ///
+    /// This controls the `GridNetwork` reconcile cadence for provider metrics;
+    /// it does not change request-path routing or the overlay watch latency.
+    /// Use a duration such as `"10s"`. When absent or invalid, Grid uses its
+    /// safe default cadence (300 seconds, or 60 seconds when TLS metric
+    /// credentials require bounded certificate-rotation detection).
+    #[schemars(regex(pattern = "^[0-9]+(ms|s)$"))]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics_refresh_interval: Option<String>,
 
     /// Maximum age in seconds before a stale (`fresh=false`) remote routing
     /// candidate is removed from the overlay.
@@ -1234,5 +1368,384 @@ mod tests {
             json.get("reason").and_then(serde_json::Value::as_str),
             Some("EmptyCandidates"),
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // ScoringPolicy tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn scoring_strategy_default_is_no_metrics() {
+        assert_eq!(
+            ScoringStrategy::default(),
+            ScoringStrategy::NoMetrics,
+            "default strategy must be noMetrics"
+        );
+    }
+
+    #[test]
+    fn scoring_policy_absent_defaults_to_none() {
+        let json = serde_json::json!({ "gridId": "", "seeds": [] });
+        let spec: GridNetworkSpec = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
+        assert!(
+            spec.scoring_policy.is_none(),
+            "absent scoringPolicy must default to None"
+        );
+    }
+
+    #[test]
+    fn scoring_policy_queue_depth_round_trips() {
+        let json = serde_json::json!({
+            "gridId": "",
+            "seeds": [],
+            "scoringPolicy": { "strategy": "queueDepth" }
+        });
+        let spec: GridNetworkSpec = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
+        let policy = spec.scoring_policy.unwrap_or_else(|| std::process::abort());
+        assert_eq!(
+            policy.strategy,
+            ScoringStrategy::QueueDepth,
+            "queueDepth strategy must round-trip"
+        );
+    }
+
+    #[test]
+    fn scoring_policy_no_metrics_round_trips() {
+        let json = serde_json::json!({
+            "gridId": "",
+            "seeds": [],
+            "scoringPolicy": { "strategy": "noMetrics" }
+        });
+        let spec: GridNetworkSpec = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
+        let policy = spec.scoring_policy.unwrap_or_else(|| std::process::abort());
+        assert_eq!(
+            policy.strategy,
+            ScoringStrategy::NoMetrics,
+            "noMetrics strategy must round-trip"
+        );
+    }
+
+    #[test]
+    fn scoring_policy_kv_cache_pressure_round_trips() {
+        let json = serde_json::json!({
+            "gridId": "",
+            "seeds": [],
+            "scoringPolicy": { "strategy": "kvCachePressure" }
+        });
+        let spec: GridNetworkSpec = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
+        let policy = spec.scoring_policy.unwrap_or_else(|| std::process::abort());
+        assert_eq!(
+            policy.strategy,
+            ScoringStrategy::KvCachePressure,
+            "kvCachePressure strategy must round-trip"
+        );
+    }
+
+    #[test]
+    fn scoring_policy_rejects_removed_profile_shape() {
+        let json = serde_json::json!({
+            "gridId": "",
+            "seeds": [],
+            "scoringPolicy": { "profile": "balanced" }
+        });
+        let result = serde_json::from_value::<GridNetworkSpec>(json);
+        assert!(result.is_err(), "the removed profile/weights API must be rejected");
+    }
+
+    #[test]
+    fn scoring_policy_absent_not_serialized() {
+        let json = serde_json::json!({ "gridId": "", "seeds": [] });
+        let spec: GridNetworkSpec = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
+        let serialized = serde_json::to_value(&spec).unwrap_or_else(|_| std::process::abort());
+        assert!(
+            serialized.get("scoringPolicy").is_none(),
+            "absent scoringPolicy must not appear in serialized output"
+        );
+    }
+
+    #[test]
+    fn scoring_policy_appears_in_crd_schema() {
+        let crd = crd_json();
+        let schema = crd
+            .pointer("/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties/scoringPolicy")
+            .unwrap_or_else(|| std::process::abort());
+        assert!(schema.is_object(), "scoringPolicy must appear in the CRD schema");
+    }
+
+    #[test]
+    fn scoring_strategy_enum_in_crd_schema() {
+        let crd = crd_json();
+        let strategy_schema = crd
+            .pointer(
+                "/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties/scoringPolicy/properties/strategy",
+            )
+            .unwrap_or_else(|| std::process::abort());
+        let enum_values = strategy_schema
+            .get("enum")
+            .and_then(serde_json::Value::as_array)
+            .unwrap_or_else(|| std::process::abort());
+        let values: Vec<&str> = enum_values.iter().filter_map(serde_json::Value::as_str).collect();
+        assert!(
+            values.contains(&"noMetrics"),
+            "CRD enum must include noMetrics: {values:?}"
+        );
+        assert!(
+            values.contains(&"queueDepth"),
+            "CRD enum must include queueDepth: {values:?}"
+        );
+        assert!(
+            values.contains(&"kvCachePressure"),
+            "CRD enum must include kvCachePressure: {values:?}"
+        );
+        assert_eq!(values.len(), 3, "only the three supported strategies belong in the CRD");
+    }
+
+    #[test]
+    fn metrics_refresh_interval_schema_requires_duration_suffix() {
+        let crd = crd_json();
+        let schema = crd
+            .pointer("/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties/metricsRefreshInterval")
+            .unwrap_or_else(|| std::process::abort());
+        assert_eq!(schema.get("type").and_then(serde_json::Value::as_str), Some("string"));
+        assert_eq!(
+            schema.get("pattern").and_then(serde_json::Value::as_str),
+            Some("^[0-9]+(ms|s)$")
+        );
+    }
+
+    #[test]
+    fn scoring_strategy_is_required_when_policy_is_present() {
+        let crd = crd_json();
+        let required = crd
+            .pointer("/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties/scoringPolicy/required")
+            .and_then(serde_json::Value::as_array)
+            .unwrap_or_else(|| std::process::abort());
+        assert_eq!(required, &[serde_json::Value::String("strategy".to_owned())]);
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_scoring_weights tests
+    // -----------------------------------------------------------------------
+
+    fn assert_weight(actual: f64, expected: f64, label: &str) {
+        assert!(
+            (actual - expected).abs() < f64::EPSILON,
+            "{label}: expected {expected}, got {actual}"
+        );
+    }
+
+    #[test]
+    fn resolve_weights_none_disables_all_signals() {
+        let w = resolve_scoring_weights(None);
+        assert_weight(w.queue_depth, 0.0, "queue_depth");
+        assert_weight(w.locality, 0.0, "locality");
+        assert_weight(w.kv_cache, 0.0, "kv_cache");
+        assert_weight(w.prefix_cache, 0.0, "prefix_cache");
+        assert_weight(w.latency, 0.0, "latency");
+        assert_weight(w.cost, 0.0, "cost");
+    }
+
+    #[test]
+    fn resolve_weights_explicit_no_metrics_disables_all_signals() {
+        let policy = ScoringPolicyConfig {
+            strategy: ScoringStrategy::NoMetrics,
+        };
+        let w = resolve_scoring_weights(Some(&policy));
+        assert_weight(w.queue_depth, 0.0, "queue_depth");
+        assert_weight(w.locality, 0.0, "locality");
+        assert_weight(w.kv_cache, 0.0, "kv_cache");
+        assert_weight(w.prefix_cache, 0.0, "prefix_cache");
+        assert_weight(w.latency, 0.0, "latency");
+        assert_weight(w.cost, 0.0, "cost");
+    }
+
+    #[test]
+    fn resolve_weights_explicit_queue_depth_all_others_zero() {
+        let policy = ScoringPolicyConfig {
+            strategy: ScoringStrategy::QueueDepth,
+        };
+        let w = resolve_scoring_weights(Some(&policy));
+        assert_weight(w.queue_depth, 1.0, "queue_depth");
+        assert_weight(w.locality, 0.0, "locality");
+        assert_weight(w.kv_cache, 0.0, "kv_cache");
+        assert_weight(w.prefix_cache, 0.0, "prefix_cache");
+        assert_weight(w.latency, 0.0, "latency");
+        assert_weight(w.cost, 0.0, "cost");
+    }
+
+    #[test]
+    fn resolve_weights_kv_cache_pressure_all_others_zero() {
+        let policy = ScoringPolicyConfig {
+            strategy: ScoringStrategy::KvCachePressure,
+        };
+        let w = resolve_scoring_weights(Some(&policy));
+        assert_weight(w.kv_cache, 1.0, "kv_cache");
+        assert_weight(w.queue_depth, 0.0, "queue_depth");
+        assert_weight(w.locality, 0.0, "locality");
+        assert_weight(w.prefix_cache, 0.0, "prefix_cache");
+        assert_weight(w.latency, 0.0, "latency");
+        assert_weight(w.cost, 0.0, "cost");
+    }
+
+    #[test]
+    fn scoring_policy_rejects_unknown_strategy() {
+        let json = serde_json::json!({
+            "gridId": "",
+            "seeds": [],
+            "scoringPolicy": { "strategy": "prefixAware" }
+        });
+        let result = serde_json::from_value::<GridNetworkSpec>(json);
+        assert!(result.is_err(), "unknown strategy must be rejected");
+    }
+
+    #[test]
+    fn scoring_policy_rejects_removed_weights_field() {
+        let json = serde_json::json!({
+            "gridId": "",
+            "seeds": [],
+            "scoringPolicy": {
+                "strategy": "queueDepth",
+                "weights": { "locality": 1.0 }
+            }
+        });
+        let result = serde_json::from_value::<GridNetworkSpec>(json);
+        assert!(result.is_err(), "weights field must be rejected by deny_unknown_fields");
+    }
+
+    // -----------------------------------------------------------------------
+    // Hand-calculated scoring assertions
+    // -----------------------------------------------------------------------
+
+    fn test_backend(name: &str) -> scoring::BackendConfig {
+        scoring::BackendConfig::new(
+            name.to_owned(),
+            0.0,
+            0.0,
+            format!("http://{name}:8000"),
+            scoring::BackendKind::Local,
+            scoring::ProviderKind::OpenAi,
+            Some("us-east-1".to_owned()),
+        )
+    }
+
+    fn assert_all_zero_except(b: &scoring::ScoreBreakdown, active: &str) {
+        if active != "queue_depth" {
+            assert_weight(b.queue_depth, 0.0, "queue_depth must be zero");
+        }
+        if active != "kv_cache" {
+            assert_weight(b.kv_cache, 0.0, "kv_cache must be zero");
+        }
+        assert_weight(b.locality, 0.0, "locality must be zero");
+        assert_weight(b.prefix_cache, 0.0, "prefix_cache must be zero");
+        assert_weight(b.latency, 0.0, "latency must be zero");
+        assert_weight(b.cost, 0.0, "cost must be zero");
+    }
+
+    #[test]
+    fn queue_depth_strategy_hand_calculated_score() {
+        let weights = ScoringStrategy::QueueDepth.weights();
+        let mut state = scoring::GridState::new();
+        state
+            .add_backend(test_backend("pool-a"))
+            .unwrap_or_else(|_| std::process::abort());
+        state.set_metrics(
+            "pool-a".to_owned(),
+            scoring::BackendMetrics::new(0.0, true, 0.50, 100.0, 0.0, 0.25),
+        );
+
+        let scored = scoring::score_backends(&state, &weights, Some("us-east-1"));
+        let s = scored.first().unwrap_or_else(|| std::process::abort());
+
+        assert_weight(s.breakdown.queue_depth, 0.75, "queue: 1.0*(1.0-0.25)");
+        assert_weight(s.breakdown.total, 0.75, "total score");
+        assert_all_zero_except(&s.breakdown, "queue_depth");
+    }
+
+    #[test]
+    fn kv_cache_pressure_strategy_hand_calculated_score() {
+        let weights = ScoringStrategy::KvCachePressure.weights();
+        let mut state = scoring::GridState::new();
+        state
+            .add_backend(test_backend("pool-a"))
+            .unwrap_or_else(|_| std::process::abort());
+        state.set_metrics(
+            "pool-a".to_owned(),
+            scoring::BackendMetrics::new(0.0, true, 0.60, 100.0, 0.0, 0.10),
+        );
+
+        let scored = scoring::score_backends(&state, &weights, Some("us-east-1"));
+        let s = scored.first().unwrap_or_else(|| std::process::abort());
+
+        assert_weight(s.breakdown.kv_cache, 0.40, "kv: 1.0*(1.0-0.60)");
+        assert_weight(s.breakdown.total, 0.40, "total score");
+        assert_all_zero_except(&s.breakdown, "kv_cache");
+    }
+
+    // -----------------------------------------------------------------------
+    // Opposing-signal ordering: prove strategies are not combined
+    // -----------------------------------------------------------------------
+
+    fn opposing_signal_state() -> scoring::GridState {
+        let mut state = scoring::GridState::new();
+        state
+            .add_backend(test_backend("pool-a"))
+            .unwrap_or_else(|_| std::process::abort());
+        state
+            .add_backend(test_backend("pool-b"))
+            .unwrap_or_else(|_| std::process::abort());
+        state.set_metrics(
+            "pool-a".to_owned(),
+            scoring::BackendMetrics::new(0.0, true, 0.80, 100.0, 0.0, 0.10),
+        );
+        state.set_metrics(
+            "pool-b".to_owned(),
+            scoring::BackendMetrics::new(0.0, true, 0.20, 100.0, 0.0, 0.90),
+        );
+        state
+    }
+
+    #[test]
+    fn no_metrics_strategy_ignores_runtime_metric_differences() {
+        let state = opposing_signal_state();
+        let weights = ScoringStrategy::NoMetrics.weights();
+        let scored = scoring::score_backends(&state, &weights, Some("us-east-1"));
+
+        assert_eq!(scored.len(), 2);
+        for backend in scored {
+            assert_weight(backend.breakdown.total, 0.0, "total");
+            assert_all_zero_except(&backend.breakdown, "none");
+        }
+    }
+
+    #[test]
+    fn queue_depth_strategy_prefers_shorter_queue_despite_worse_kv() {
+        let state = opposing_signal_state();
+        let weights = ScoringStrategy::QueueDepth.weights();
+        let scored = scoring::score_backends(&state, &weights, Some("us-east-1"));
+
+        let first = scored.first().unwrap_or_else(|| std::process::abort());
+        let second = scored.get(1).unwrap_or_else(|| std::process::abort());
+        assert_eq!(first.name, "pool-a", "pool-a has shorter queue and must rank first");
+        assert_eq!(second.name, "pool-b");
+        assert_weight(first.breakdown.total, 0.90, "pool-a: 1-0.10");
+        assert_weight(second.breakdown.total, 0.10, "pool-b: 1-0.90");
+        assert_weight(first.breakdown.kv_cache, 0.0, "kv must not contribute");
+        assert_weight(second.breakdown.kv_cache, 0.0, "kv must not contribute");
+    }
+
+    #[test]
+    fn kv_cache_pressure_strategy_prefers_lower_kv_despite_worse_queue() {
+        let state = opposing_signal_state();
+        let weights = ScoringStrategy::KvCachePressure.weights();
+        let scored = scoring::score_backends(&state, &weights, Some("us-east-1"));
+
+        let first = scored.first().unwrap_or_else(|| std::process::abort());
+        let second = scored.get(1).unwrap_or_else(|| std::process::abort());
+        assert_eq!(first.name, "pool-b", "pool-b has lower KV and must rank first");
+        assert_eq!(second.name, "pool-a");
+        assert_weight(first.breakdown.total, 0.80, "pool-b: 1-0.20");
+        assert_weight(second.breakdown.total, 0.20, "pool-a: 1-0.80");
+        assert_weight(first.breakdown.queue_depth, 0.0, "queue must not contribute");
+        assert_weight(second.breakdown.queue_depth, 0.0, "queue must not contribute");
     }
 }

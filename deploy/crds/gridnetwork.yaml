@@ -224,6 +224,40 @@ spec:
                     - scoreFirst
                   nullable: true
                   type: string
+                scoringPolicy:
+                  description: |-
+                    Scoring policy configuration.
+
+                    Selects how the operator scores providers for the routing overlay.
+
+                    **Default (absent):** the `noMetrics` strategy is used.
+
+                    See [`ScoringStrategy`] for the available provider-level strategies.
+                  nullable: true
+                  properties:
+                    strategy:
+                      description: |-
+                        Provider-level scoring strategy.
+
+                        Required when `scoringPolicy` is present. Omit the entire policy to use
+                        the `noMetrics` default.
+                      enum:
+                        - noMetrics
+                        - queueDepth
+                        - kvCachePressure
+                      type: string
+                  required:
+                    - strategy
+                  type: object
+                metricsRefreshInterval:
+                  description: |-
+                    Maximum time between provider metric refreshes and score/ranking recalculation.
+
+                    Use a duration such as `10s`. When absent or invalid, the operator uses its
+                    safe default cadence. TLS metric networks cap the interval at 60 seconds.
+                  nullable: true
+                  pattern: ^[0-9]+(ms|s)$
+                  type: string
                 seeds:
                   default: []
                   description: Initial SWIM seed peer addresses.

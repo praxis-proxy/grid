@@ -522,12 +522,12 @@ pub(crate) fn apply_stale_gc_filter(
 /// Compute the score breakdown equivalent to what [`scoring::score_backends`]
 /// would assign to a provider whose `backend_kind` cannot be parsed.
 ///
-/// Applies [`scoring::ScoringWeights::default`] with neutral runtime signals
-/// (0.5, the scoring crate's default for missing metrics) and no cost (treated
-/// as free → cost signal = 1.0).  This places unmapped providers on the same
-/// numeric scale as scored providers so they can be sorted in a single pass.
-fn unmapped_provider_breakdown(backend_kind: &str) -> scoring::ScoreBreakdown {
-    let w = scoring::ScoringWeights::default();
+/// Applies the given weights with neutral runtime signals (0.5, the scoring
+/// crate's default for missing metrics) and no cost (treated as free → cost
+/// signal = 1.0).  This places unmapped providers on the same numeric scale
+/// as scored providers so they can be sorted in a single pass.
+fn unmapped_provider_breakdown(backend_kind: &str, weights: &scoring::ScoringWeights) -> scoring::ScoreBreakdown {
+    let w = weights;
     let locality = w.locality * backend_locality_score(backend_kind);
     let cost = w.cost * 1.0;
     let queue_depth = w.queue_depth * UNMAPPED_NEUTRAL_SIGNAL;
@@ -550,10 +550,9 @@ fn unmapped_provider_breakdown(backend_kind: &str) -> scoring::ScoreBreakdown {
 ///
 /// For each local [`InferenceProvider`] in `network_name` that can be mapped
 /// to a [`scoring::BackendConfig`], the score is produced by
-/// [`scoring::score_backends`] using [`scoring::ScoringWeights::default`]
-/// and the network's `local_region`.  Providers whose `backend_kind` cannot
-/// be parsed fall back to [`unmapped_provider_breakdown`], which is on the same
-/// numeric scale.
+/// [`scoring::score_backends`] using the given weights and the network's
+/// `local_region`.  Providers whose `backend_kind` cannot be parsed fall back
+/// to [`unmapped_provider_breakdown`], which is on the same numeric scale.
 ///
 /// Remote CRDT providers are also scored and included in the result map.
 /// Their scores are derived from [`scoring::score_backends`] via
@@ -567,15 +566,20 @@ fn unmapped_provider_breakdown(backend_kind: &str) -> scoring::ScoreBreakdown {
 /// by [`is_candidate_fresh`] (local) or [`crdt_phase_to_fresh`] (remote).
 ///
 /// Returns a map from routing cluster name to score.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "scoring_weights is threaded through overlay rendering without hiding the selected strategy"
+)]
 fn provider_ordering_scores(
     network_name: &str,
     providers: &[InferenceProvider],
     remote_crdt_providers: &[crdt::ProviderState],
     local_region: Option<&str>,
     metrics: Option<&HashMap<&str, scoring::BackendMetrics>>,
+    weights: &scoring::ScoringWeights,
 ) -> HashMap<String, scoring::ScoreBreakdown> {
     let state = build_grid_state_with_metrics(network_name, providers, remote_crdt_providers, metrics);
-    let scored = scoring::score_backends(&state, &scoring::ScoringWeights::default(), local_region);
+    let scored = scoring::score_backends(&state, weights, local_region);
     let from_engine: HashMap<String, scoring::ScoreBreakdown> =
         scored.into_iter().map(|sb| (sb.name, sb.breakdown)).collect();
 
@@ -586,7 +590,7 @@ fn provider_ordering_scores(
             let breakdown = from_engine
                 .get(cluster.as_str())
                 .cloned()
-                .unwrap_or_else(|| unmapped_provider_breakdown(&p.spec.backend_kind));
+                .unwrap_or_else(|| unmapped_provider_breakdown(&p.spec.backend_kind, weights));
             Some((cluster, breakdown))
         })
         .collect();
@@ -596,7 +600,7 @@ fn provider_ordering_scores(
             from_engine
                 .get(provider.routing_cluster.as_str())
                 .cloned()
-                .unwrap_or_else(|| unmapped_provider_breakdown(&provider.backend_kind))
+                .unwrap_or_else(|| unmapped_provider_breakdown(&provider.backend_kind, weights))
         });
     }
 
@@ -1099,6 +1103,7 @@ pub fn render_routing_overlay(
     local_site: &str,
     metrics: Option<&HashMap<&str, scoring::BackendMetrics>>,
     generated_at: Option<&str>,
+    weights: &scoring::ScoringWeights,
 ) -> Result<RoutingOverlay, String> {
     let network_name = network
         .metadata
@@ -1112,6 +1117,7 @@ pub fn render_routing_overlay(
         remote_crdt_providers,
         network.spec.region.as_deref(),
         metrics,
+        weights,
     );
 
     let admission_map = build_admission_map(network_name, providers, remote_crdt_providers, metrics);
@@ -1921,6 +1927,14 @@ mod tests {
 
     // -----------------------------------------------------------------------
     // Scoring-engine-backed ordering (OP-05c-a)
+    //
+    // These tests pass `ScoringWeights::default()` — the scoring crate's
+    // legacy combined defaults (locality=3, queue=3, kv=2, …). They verify
+    // overlay rendering mechanics (sort stability, admission, locality tiers)
+    // against the full six-signal surface. Production deploys use
+    // `resolve_scoring_weights(policy)`, which returns strategy-selected
+    // one-hot weights; those paths are covered by the dedicated noMetrics,
+    // queueDepth, and kvCachePressure sections below and in the CRD tests.
     // -----------------------------------------------------------------------
 
     #[test]
@@ -1929,8 +1943,17 @@ mod tests {
         let network = test_network("net");
         let local_prov = test_provider_with_backend_kind("local-prov", "net", "local");
         let api_prov = test_provider_with_backend_kind("api-prov", "net", "api_provider");
-        let overlay = render_routing_overlay(&network, &[], &[api_prov, local_prov], &[], "test-site", None, None)
-            .unwrap_or_else(|_| std::process::abort());
+        let overlay = render_routing_overlay(
+            &network,
+            &[],
+            &[api_prov, local_prov],
+            &[],
+            "test-site",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
         assert_eq!(
             overlay.candidates.first().map(|c| c.cluster.as_str()),
             Some("local-prov"),
@@ -1946,8 +1969,17 @@ mod tests {
         let network = test_network("net");
         let free_prov = test_provider_with_cost("free-prov", "net", 0.0);
         let costly_prov = test_provider_with_cost("costly-prov", "net", 50.0); // 50/million = 0.05/1k
-        let overlay = render_routing_overlay(&network, &[], &[costly_prov, free_prov], &[], "test-site", None, None)
-            .unwrap_or_else(|_| std::process::abort());
+        let overlay = render_routing_overlay(
+            &network,
+            &[],
+            &[costly_prov, free_prov],
+            &[],
+            "test-site",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
         assert_eq!(
             overlay.candidates.first().map(|c| c.cluster.as_str()),
             Some("free-prov"),
@@ -1961,8 +1993,17 @@ mod tests {
         let network = test_network("net");
         let p_z = test_provider_with_backend_kind("z-local", "net", "local");
         let p_a = test_provider_with_backend_kind("a-local", "net", "local");
-        let overlay = render_routing_overlay(&network, &[], &[p_z, p_a], &[], "test-site", None, None)
-            .unwrap_or_else(|_| std::process::abort());
+        let overlay = render_routing_overlay(
+            &network,
+            &[],
+            &[p_z, p_a],
+            &[],
+            "test-site",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
         assert_eq!(
             overlay.candidates.first().map(|c| c.cluster.as_str()),
             Some("a-local"),
@@ -1980,8 +2021,17 @@ mod tests {
         let network = test_network("net");
         let cloud = test_provider_with_backend_kind("cloud-prov", "net", "cloud_managed");
         let unknown = test_provider_with_backend_kind("unknown-prov", "net", "nonexistent_kind");
-        let overlay = render_routing_overlay(&network, &[], &[cloud, unknown], &[], "test-site", None, None)
-            .unwrap_or_else(|_| std::process::abort());
+        let overlay = render_routing_overlay(
+            &network,
+            &[],
+            &[cloud, unknown],
+            &[],
+            "test-site",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
         assert_eq!(
             overlay.candidates.first().map(|c| c.cluster.as_str()),
             Some("unknown-prov"),
@@ -1996,8 +2046,17 @@ mod tests {
         let network = test_network("net");
         let self_hosted = test_provider_with_backend_kind("vllm-prov", "net", "local");
         let api = test_provider_with_backend_kind("api-prov", "net", "api_provider");
-        let overlay = render_routing_overlay(&network, &[], &[api, self_hosted], &[], "test-site", None, None)
-            .unwrap_or_else(|_| std::process::abort());
+        let overlay = render_routing_overlay(
+            &network,
+            &[],
+            &[api, self_hosted],
+            &[],
+            "test-site",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
         assert_eq!(overlay.candidates.len(), 2, "both providers must appear");
         assert_eq!(
             overlay.candidates.first().map(|c| c.cluster.as_str()),
@@ -2020,10 +2079,20 @@ mod tests {
             "test-site",
             None,
             None,
+            &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
-        let rev = render_routing_overlay(&network, &[], &[api, local], &[], "test-site", None, None)
-            .unwrap_or_else(|_| std::process::abort());
+        let rev = render_routing_overlay(
+            &network,
+            &[],
+            &[api, local],
+            &[],
+            "test-site",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
         let fwd_clusters: Vec<&str> = fwd.candidates.iter().map(|c| c.cluster.as_str()).collect();
         let rev_clusters: Vec<&str> = rev.candidates.iter().map(|c| c.cluster.as_str()).collect();
         assert_eq!(
@@ -2040,8 +2109,17 @@ mod tests {
         let network = test_network_with_region("net", "eu-west-1");
         let local = test_provider_with_backend_kind("local-prov", "net", "local");
         let remote = test_provider_with_backend_kind("remote-prov", "net", "remote");
-        let overlay = render_routing_overlay(&network, &[], &[remote, local], &[], "test-site", None, None)
-            .unwrap_or_else(|_| std::process::abort());
+        let overlay = render_routing_overlay(
+            &network,
+            &[],
+            &[remote, local],
+            &[],
+            "test-site",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
         assert_eq!(
             overlay.candidates.first().map(|c| c.cluster.as_str()),
             Some("local-prov"),
@@ -2104,8 +2182,17 @@ mod tests {
         let network = test_network("mesh-net");
         let local_prov = test_provider_with_backend_kind("provider-self-hosted", "mesh-net", "local");
         let remote_prov = test_provider_with_backend_kind("provider-remote", "mesh-net", "remote");
-        let overlay = render_routing_overlay(&network, &[], &[remote_prov, local_prov], &[], "site-a", None, None)
-            .unwrap_or_else(|_| std::process::abort());
+        let overlay = render_routing_overlay(
+            &network,
+            &[],
+            &[remote_prov, local_prov],
+            &[],
+            "site-a",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
 
         assert_eq!(overlay.candidates.len(), 2, "both local and remote must appear");
         // Local must rank first (higher locality/score).
@@ -2138,8 +2225,17 @@ mod tests {
         let local_down =
             test_provider_with_backend_kind_and_phase("provider-local", "fallback-net", "local", "Unavailable");
         let api_fallback = test_provider_with_backend_kind("provider-api", "fallback-net", "api_provider");
-        let overlay = render_routing_overlay(&network, &[], &[local_down, api_fallback], &[], "site-a", None, None)
-            .unwrap_or_else(|_| std::process::abort());
+        let overlay = render_routing_overlay(
+            &network,
+            &[],
+            &[local_down, api_fallback],
+            &[],
+            "site-a",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
 
         assert_eq!(
             overlay.candidates.len(),
@@ -2171,8 +2267,17 @@ mod tests {
         let local_degraded =
             test_provider_with_backend_kind_and_phase("provider-local", "fallback-net", "local", "Degraded");
         let api_ok = test_provider_with_backend_kind("provider-api", "fallback-net", "api_provider");
-        let overlay = render_routing_overlay(&network, &[], &[api_ok, local_degraded], &[], "site-a", None, None)
-            .unwrap_or_else(|_| std::process::abort());
+        let overlay = render_routing_overlay(
+            &network,
+            &[],
+            &[api_ok, local_degraded],
+            &[],
+            "site-a",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
 
         assert_eq!(
             overlay.candidates.len(),
@@ -2216,6 +2321,7 @@ mod tests {
             "site-a",
             None,
             None,
+            &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
 
@@ -2253,6 +2359,7 @@ mod tests {
             "site-a",
             None,
             None,
+            &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
         assert_eq!(
@@ -2276,6 +2383,7 @@ mod tests {
             "site-a",
             None,
             None,
+            &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
         assert_eq!(overlay2.candidates.len(), 2, "recovered local must reappear (cycle 2)");
@@ -2300,8 +2408,17 @@ mod tests {
         let network = test_network("empty-net");
         let p1 = test_provider_with_phase("prov-a", "empty-net", &["model-a"], "Unavailable");
         let p2 = test_provider_with_phase("prov-b", "empty-net", &["model-b"], "Unavailable");
-        let overlay = render_routing_overlay(&network, &[], &[p1, p2], &[], "site-a", None, None)
-            .unwrap_or_else(|_| std::process::abort());
+        let overlay = render_routing_overlay(
+            &network,
+            &[],
+            &[p1, p2],
+            &[],
+            "site-a",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
 
         assert!(
             overlay.candidates.is_empty(),
@@ -2320,8 +2437,17 @@ mod tests {
         let network = test_network("json-net");
         let local_prov = test_provider_with_backend_kind("prov-a", "json-net", "local");
         let api_prov = test_provider_with_backend_kind("prov-b", "json-net", "api_provider");
-        let overlay = render_routing_overlay(&network, &[], &[local_prov, api_prov], &[], "site-a", None, None)
-            .unwrap_or_else(|_| std::process::abort());
+        let overlay = render_routing_overlay(
+            &network,
+            &[],
+            &[local_prov, api_prov],
+            &[],
+            "site-a",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
         let cm = build_cm(&overlay, "json-net", "gw");
         let json = overlay_json_from_cm(&cm);
         let candidates = json
@@ -2434,8 +2560,17 @@ mod tests {
         let network = test_network("net");
         let local_prov = test_provider_with_backend_kind("local-prov", "net", "local");
         let api_prov = test_provider_with_backend_kind("api-prov", "net", "api_provider");
-        let overlay = render_routing_overlay(&network, &[], &[api_prov, local_prov], &[], "test-site", None, None)
-            .unwrap_or_else(|_| std::process::abort());
+        let overlay = render_routing_overlay(
+            &network,
+            &[],
+            &[api_prov, local_prov],
+            &[],
+            "test-site",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
         assert_eq!(
             overlay.candidates.first().map(|c| c.cluster.as_str()),
             Some("local-prov"),
@@ -2459,6 +2594,7 @@ mod tests {
             "test-site",
             None,
             None,
+            &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
         let clusters: Vec<&str> = overlay.candidates.iter().map(|c| c.cluster.as_str()).collect();
@@ -2475,8 +2611,17 @@ mod tests {
         let network = test_network("net");
         let p_z = test_provider_with_backend_kind("z-api", "net", "api_provider");
         let p_a = test_provider_with_backend_kind("a-api", "net", "api_provider");
-        let overlay = render_routing_overlay(&network, &[], &[p_z, p_a], &[], "test-site", None, None)
-            .unwrap_or_else(|_| std::process::abort());
+        let overlay = render_routing_overlay(
+            &network,
+            &[],
+            &[p_z, p_a],
+            &[],
+            "test-site",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
         assert_eq!(
             overlay.candidates.first().map(|c| c.cluster.as_str()),
             Some("a-api"),
@@ -2497,10 +2642,20 @@ mod tests {
             "test-site",
             None,
             None,
+            &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
-        let rev = render_routing_overlay(&network, &[], &[api, local], &[], "test-site", None, None)
-            .unwrap_or_else(|_| std::process::abort());
+        let rev = render_routing_overlay(
+            &network,
+            &[],
+            &[api, local],
+            &[],
+            "test-site",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
         let fwd_clusters: Vec<&str> = fwd.candidates.iter().map(|c| c.cluster.as_str()).collect();
         let rev_clusters: Vec<&str> = rev.candidates.iter().map(|c| c.cluster.as_str()).collect();
         assert_eq!(
@@ -2516,8 +2671,17 @@ mod tests {
         let network = test_network("net");
         let cloud = test_provider_with_backend_kind("cloud-prov", "net", "cloud_managed");
         let unknown = test_provider_with_backend_kind("unknown-prov", "net", "nonexistent_kind");
-        let overlay = render_routing_overlay(&network, &[], &[cloud, unknown], &[], "test-site", None, None)
-            .unwrap_or_else(|_| std::process::abort());
+        let overlay = render_routing_overlay(
+            &network,
+            &[],
+            &[cloud, unknown],
+            &[],
+            "test-site",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
         assert_eq!(
             overlay.candidates.first().map(|c| c.cluster.as_str()),
             Some("unknown-prov"),
@@ -2532,8 +2696,17 @@ mod tests {
     #[test]
     fn empty_network_renders_empty_candidates() {
         let network = test_network("my-net");
-        let overlay = render_routing_overlay(&network, &[], &[], &[], "test-site", None, None)
-            .unwrap_or_else(|_| std::process::abort());
+        let overlay = render_routing_overlay(
+            &network,
+            &[],
+            &[],
+            &[],
+            "test-site",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
         assert!(overlay.candidates.is_empty(), "no providers should yield no candidates");
     }
 
@@ -2541,8 +2714,17 @@ mod tests {
     fn provider_in_different_network_is_excluded() {
         let network = test_network("net-a");
         let provider = test_provider("prov", "net-b", &["model-1"]);
-        let overlay = render_routing_overlay(&network, &[], &[provider], &[], "test-site", None, None)
-            .unwrap_or_else(|_| std::process::abort());
+        let overlay = render_routing_overlay(
+            &network,
+            &[],
+            &[provider],
+            &[],
+            "test-site",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
         assert!(
             overlay.candidates.is_empty(),
             "provider in net-b must be excluded from net-a overlay"
@@ -2553,8 +2735,17 @@ mod tests {
     fn provider_with_two_models_renders_two_candidates() {
         let network = test_network("net-a");
         let provider = test_provider("prov", "net-a", &["model-1", "model-2"]);
-        let overlay = render_routing_overlay(&network, &[], &[provider], &[], "test-site", None, None)
-            .unwrap_or_else(|_| std::process::abort());
+        let overlay = render_routing_overlay(
+            &network,
+            &[],
+            &[provider],
+            &[],
+            "test-site",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
         assert_eq!(overlay.candidates.len(), 2, "two models must produce two candidates");
     }
 
@@ -2563,8 +2754,17 @@ mod tests {
         let network = test_network("net");
         let p1 = test_provider("prov-a", "net", &["llama-3"]);
         let p2 = test_provider("prov-b", "net", &["llama-3"]);
-        let overlay = render_routing_overlay(&network, &[], &[p1, p2], &[], "test-site", None, None)
-            .unwrap_or_else(|_| std::process::abort());
+        let overlay = render_routing_overlay(
+            &network,
+            &[],
+            &[p1, p2],
+            &[],
+            "test-site",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
         assert_eq!(
             overlay.candidates.len(),
             2,
@@ -2580,8 +2780,17 @@ mod tests {
         let network = test_network("net");
         let p1 = test_provider("site-b", "net", &["z-model", "a-model"]);
         let p2 = test_provider("site-a", "net", &["c-model"]);
-        let overlay = render_routing_overlay(&network, &[], &[p1, p2], &[], "test-site", None, None)
-            .unwrap_or_else(|_| std::process::abort());
+        let overlay = render_routing_overlay(
+            &network,
+            &[],
+            &[p1, p2],
+            &[],
+            "test-site",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
         let names: Vec<&str> = overlay.candidates.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(
             names,
@@ -2595,10 +2804,28 @@ mod tests {
         let network = test_network("net");
         let p1 = test_provider("z-site", "net", &["z-model"]);
         let p2 = test_provider("a-site", "net", &["a-model"]);
-        let fwd = render_routing_overlay(&network, &[], &[p1.clone(), p2.clone()], &[], "test-site", None, None)
-            .unwrap_or_else(|_| std::process::abort());
-        let rev = render_routing_overlay(&network, &[], &[p2, p1], &[], "test-site", None, None)
-            .unwrap_or_else(|_| std::process::abort());
+        let fwd = render_routing_overlay(
+            &network,
+            &[],
+            &[p1.clone(), p2.clone()],
+            &[],
+            "test-site",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        let rev = render_routing_overlay(
+            &network,
+            &[],
+            &[p2, p1],
+            &[],
+            "test-site",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
         let fwd_names: Vec<&str> = fwd.candidates.iter().map(|c| c.name.as_str()).collect();
         let rev_names: Vec<&str> = rev.candidates.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(
@@ -2611,7 +2838,16 @@ mod tests {
     fn blank_model_name_returns_error() {
         let network = test_network("net");
         let provider = test_provider("prov", "net", &[""]);
-        let result = render_routing_overlay(&network, &[], &[provider], &[], "test-site", None, None);
+        let result = render_routing_overlay(
+            &network,
+            &[],
+            &[provider],
+            &[],
+            "test-site",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+        );
         assert!(result.is_err(), "blank model name must return an error");
     }
 
@@ -2625,8 +2861,17 @@ mod tests {
         let site_a = test_site("site-a", "net");
         let site_b = test_site("site-b", "net");
         let provider = test_provider("prov", "net", &["model"]);
-        let overlay = render_routing_overlay(&network, &[site_a, site_b], &[provider], &[], "test-site", None, None)
-            .unwrap_or_else(|_| std::process::abort());
+        let overlay = render_routing_overlay(
+            &network,
+            &[site_a, site_b],
+            &[provider],
+            &[],
+            "test-site",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
         assert_eq!(
             overlay.candidates.len(),
             2,
@@ -2651,6 +2896,7 @@ mod tests {
             "test-site",
             None,
             None,
+            &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
         assert_eq!(
@@ -2669,8 +2915,17 @@ mod tests {
         let network = test_network("net-a");
         let site_other = test_site("site-other", "net-b");
         let provider = test_provider("prov", "net-a", &["model"]);
-        let overlay = render_routing_overlay(&network, &[site_other], &[provider], &[], "test-site", None, None)
-            .unwrap_or_else(|_| std::process::abort());
+        let overlay = render_routing_overlay(
+            &network,
+            &[site_other],
+            &[provider],
+            &[],
+            "test-site",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
         assert_eq!(
             overlay.candidates.len(),
             1,
@@ -2691,8 +2946,17 @@ mod tests {
         let network = test_network("net");
         let site_cpu = test_site_with_labels("cpu-site", "net", &[("hw", "cpu")]);
         let provider = test_provider_with_selector("prov", "net", &["model"], &[("hw", "gpu")]);
-        let overlay = render_routing_overlay(&network, &[site_cpu], &[provider], &[], "test-site", None, None)
-            .unwrap_or_else(|_| std::process::abort());
+        let overlay = render_routing_overlay(
+            &network,
+            &[site_cpu],
+            &[provider],
+            &[],
+            "test-site",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
         assert!(
             overlay.candidates.is_empty(),
             "selector matched nothing in a known site inventory — must emit no candidates"
@@ -2707,8 +2971,17 @@ mod tests {
         let site = test_site("site-a", "net");
         let p1 = test_provider("prov-a", "net", &["shared-model"]);
         let p2 = test_provider("prov-b", "net", &["shared-model"]);
-        let overlay = render_routing_overlay(&network, &[site], &[p1, p2], &[], "test-site", None, None)
-            .unwrap_or_else(|_| std::process::abort());
+        let overlay = render_routing_overlay(
+            &network,
+            &[site],
+            &[p1, p2],
+            &[],
+            "test-site",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
         assert_eq!(
             overlay.candidates.len(),
             2,
@@ -2724,8 +2997,17 @@ mod tests {
         let network = test_network("net");
         let site = test_site("site-a", "net");
         let provider = test_provider("my-provider", "net", &["model"]);
-        let overlay = render_routing_overlay(&network, &[site], &[provider], &[], "test-site", None, None)
-            .unwrap_or_else(|_| std::process::abort());
+        let overlay = render_routing_overlay(
+            &network,
+            &[site],
+            &[provider],
+            &[],
+            "test-site",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
         assert_eq!(
             overlay.candidates[0].cluster, "my-provider",
             "cluster must always equal the provider metadata name"
@@ -2778,8 +3060,17 @@ mod tests {
     fn unavailable_provider_is_excluded() {
         let network = test_network("net");
         let provider = test_provider_with_phase("prov", "net", &["model-1"], "Unavailable");
-        let overlay = render_routing_overlay(&network, &[], &[provider], &[], "test-site", None, None)
-            .unwrap_or_else(|_| std::process::abort());
+        let overlay = render_routing_overlay(
+            &network,
+            &[],
+            &[provider],
+            &[],
+            "test-site",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
         assert!(overlay.candidates.is_empty(), "Unavailable provider must be excluded");
     }
 
@@ -2787,8 +3078,17 @@ mod tests {
     fn available_provider_is_included_with_fresh_true() {
         let network = test_network("net");
         let provider = test_provider_with_phase("prov", "net", &["model-1"], "Available");
-        let overlay = render_routing_overlay(&network, &[], &[provider], &[], "test-site", None, None)
-            .unwrap_or_else(|_| std::process::abort());
+        let overlay = render_routing_overlay(
+            &network,
+            &[],
+            &[provider],
+            &[],
+            "test-site",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
         assert_eq!(overlay.candidates.len(), 1, "Available provider must be included");
         assert!(
             overlay.candidates.first().is_some_and(|c| c.fresh),
@@ -2800,8 +3100,17 @@ mod tests {
     fn pending_provider_is_included_with_fresh_true() {
         let network = test_network("net");
         let provider = test_provider_with_phase("prov", "net", &["model-1"], "Pending");
-        let overlay = render_routing_overlay(&network, &[], &[provider], &[], "test-site", None, None)
-            .unwrap_or_else(|_| std::process::abort());
+        let overlay = render_routing_overlay(
+            &network,
+            &[],
+            &[provider],
+            &[],
+            "test-site",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
         assert_eq!(
             overlay.candidates.len(),
             1,
@@ -2817,8 +3126,17 @@ mod tests {
     fn provider_with_absent_status_is_included_with_fresh_true() {
         let network = test_network("net");
         let provider = test_provider("prov", "net", &["model-1"]);
-        let overlay = render_routing_overlay(&network, &[], &[provider], &[], "test-site", None, None)
-            .unwrap_or_else(|_| std::process::abort());
+        let overlay = render_routing_overlay(
+            &network,
+            &[],
+            &[provider],
+            &[],
+            "test-site",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
         assert_eq!(
             overlay.candidates.len(),
             1,
@@ -2834,8 +3152,17 @@ mod tests {
     fn degraded_provider_is_included_with_fresh_false() {
         let network = test_network("net");
         let provider = test_provider_with_phase("prov", "net", &["model-1"], "Degraded");
-        let overlay = render_routing_overlay(&network, &[], &[provider], &[], "test-site", None, None)
-            .unwrap_or_else(|_| std::process::abort());
+        let overlay = render_routing_overlay(
+            &network,
+            &[],
+            &[provider],
+            &[],
+            "test-site",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
         assert_eq!(
             overlay.candidates.len(),
             1,
@@ -2852,8 +3179,17 @@ mod tests {
         // All models from a Degraded provider inherit fresh=false.
         let network = test_network("net");
         let provider = test_provider_with_phase("prov", "net", &["model-a", "model-b"], "Degraded");
-        let overlay = render_routing_overlay(&network, &[], &[provider], &[], "test-site", None, None)
-            .unwrap_or_else(|_| std::process::abort());
+        let overlay = render_routing_overlay(
+            &network,
+            &[],
+            &[provider],
+            &[],
+            "test-site",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
         assert_eq!(overlay.candidates.len(), 2, "both models must be present");
         assert!(
             overlay.candidates.iter().all(|c| !c.fresh),
@@ -2868,8 +3204,17 @@ mod tests {
         let network = test_network("net");
         let available = test_provider_with_phase("avail-prov", "net", &["model-a"], "Available");
         let degraded = test_provider_with_phase("degr-prov", "net", &["model-a"], "Degraded");
-        let overlay = render_routing_overlay(&network, &[], &[available, degraded], &[], "test-site", None, None)
-            .unwrap_or_else(|_| std::process::abort());
+        let overlay = render_routing_overlay(
+            &network,
+            &[],
+            &[available, degraded],
+            &[],
+            "test-site",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
         assert_eq!(overlay.candidates.len(), 2, "both providers must contribute candidates");
         let avail_candidate = overlay
             .candidates
@@ -2891,8 +3236,17 @@ mod tests {
         // in the ConfigMap and be readable by the overlay consumer.
         let network = test_network("net");
         let provider = test_provider_with_phase("prov", "net", &["model-1"], "Degraded");
-        let overlay = render_routing_overlay(&network, &[], &[provider], &[], "test-site", None, None)
-            .unwrap_or_else(|_| std::process::abort());
+        let overlay = render_routing_overlay(
+            &network,
+            &[],
+            &[provider],
+            &[],
+            "test-site",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
         let cm = build_cm(&overlay, "net", "gw");
         let json = overlay_json_from_cm(&cm);
         let fresh = json
@@ -2913,8 +3267,17 @@ mod tests {
         let site_a = test_site("site-a", "net");
         let site_b = test_site("site-b", "net");
         let provider = test_provider_with_phase("prov", "net", &["model-a"], "Degraded");
-        let overlay = render_routing_overlay(&network, &[site_a, site_b], &[provider], &[], "test-site", None, None)
-            .unwrap_or_else(|_| std::process::abort());
+        let overlay = render_routing_overlay(
+            &network,
+            &[site_a, site_b],
+            &[provider],
+            &[],
+            "test-site",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
         assert_eq!(overlay.candidates.len(), 2, "one candidate per matched site");
         assert!(
             overlay.candidates.iter().all(|c| !c.fresh),
@@ -2936,8 +3299,17 @@ mod tests {
         // Stale provider is given Degraded status so is_candidate_fresh returns false.
         let healthy = test_provider("healthy-prov", "net", &["shared-model"]);
         let stale = test_provider_with_phase("stale-prov", "net", &["shared-model"], "Degraded");
-        let overlay = render_routing_overlay(&network, &[], &[stale, healthy], &[], "test-site", None, None)
-            .unwrap_or_else(|_| std::process::abort());
+        let overlay = render_routing_overlay(
+            &network,
+            &[],
+            &[stale, healthy],
+            &[],
+            "test-site",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
 
         assert_eq!(overlay.candidates.len(), 2, "both candidates must be present");
         let first = overlay.candidates.first().unwrap_or_else(|| std::process::abort());
@@ -2961,8 +3333,17 @@ mod tests {
         // observability and as a last-resort fallback when no healthy alternative exists.
         let network = test_network("net");
         let stale = test_provider_with_phase("stale-prov", "net", &["model-x"], "Degraded");
-        let overlay = render_routing_overlay(&network, &[], &[stale], &[], "test-site", None, None)
-            .unwrap_or_else(|_| std::process::abort());
+        let overlay = render_routing_overlay(
+            &network,
+            &[],
+            &[stale],
+            &[],
+            "test-site",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
         assert_eq!(overlay.candidates.len(), 1, "stale candidate must not be dropped");
         assert!(
             overlay.candidates.first().is_some_and(|c| !c.fresh),
@@ -2991,6 +3372,7 @@ mod tests {
             "test-site",
             None,
             None,
+            &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
         assert_eq!(overlay.candidates.len(), 2, "both local and remote candidates present");
@@ -3017,12 +3399,21 @@ mod tests {
             "test-site",
             None,
             None,
+            &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
         // Submit healthy first, then stale.
-        let overlay_healthy_first =
-            render_routing_overlay(&network, &[], &[healthy, stale], &[], "test-site", None, None)
-                .unwrap_or_else(|_| std::process::abort());
+        let overlay_healthy_first = render_routing_overlay(
+            &network,
+            &[],
+            &[healthy, stale],
+            &[],
+            "test-site",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
 
         let first_stale_first = overlay_stale_first
             .candidates
@@ -3049,8 +3440,17 @@ mod tests {
     #[test]
     fn configmap_name_matches_pattern() {
         let network = test_network("my-net");
-        let overlay = render_routing_overlay(&network, &[], &[], &[], "test-site", None, None)
-            .unwrap_or_else(|_| std::process::abort());
+        let overlay = render_routing_overlay(
+            &network,
+            &[],
+            &[],
+            &[],
+            "test-site",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
         let cm = build_cm(&overlay, "my-net", "gw");
         assert_eq!(
             cm.metadata.name.as_deref(),
@@ -3062,8 +3462,17 @@ mod tests {
     #[test]
     fn configmap_has_correct_labels() {
         let network = test_network("net");
-        let overlay = render_routing_overlay(&network, &[], &[], &[], "test-site", None, None)
-            .unwrap_or_else(|_| std::process::abort());
+        let overlay = render_routing_overlay(
+            &network,
+            &[],
+            &[],
+            &[],
+            "test-site",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
         let cm = build_cm(&overlay, "net", "gw");
         let labels = cm.metadata.labels.as_ref().unwrap_or_else(|| std::process::abort());
         assert_eq!(
@@ -3083,8 +3492,17 @@ mod tests {
     #[test]
     fn configmap_data_key_is_grid_config_json() {
         let network = test_network("net");
-        let overlay = render_routing_overlay(&network, &[], &[], &[], "test-site", None, None)
-            .unwrap_or_else(|_| std::process::abort());
+        let overlay = render_routing_overlay(
+            &network,
+            &[],
+            &[],
+            &[],
+            "test-site",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
         let cm = build_cm(&overlay, "net", "gw");
         assert!(
             cm.data.as_ref().is_some_and(|d| d.contains_key("routing-config.json")),
@@ -3098,8 +3516,17 @@ mod tests {
         // Serialization of RoutingOverlay cannot currently fail (all fields
         // are plain Strings / booleans), so we just verify the Ok path.
         let network = test_network("net");
-        let overlay = render_routing_overlay(&network, &[], &[], &[], "test-site", None, None)
-            .unwrap_or_else(|_| std::process::abort());
+        let overlay = render_routing_overlay(
+            &network,
+            &[],
+            &[],
+            &[],
+            "test-site",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
         let result = build_overlay_configmap(&overlay, None, "net", "gw", "ns");
         assert!(result.is_ok(), "well-formed overlay must serialize without error");
     }
@@ -3152,8 +3579,17 @@ mod tests {
     #[test]
     fn json_overlay_has_correct_top_level_fields() {
         let network = test_network("my-net");
-        let overlay = render_routing_overlay(&network, &[], &[], &[], "site-a", None, None)
-            .unwrap_or_else(|_| std::process::abort());
+        let overlay = render_routing_overlay(
+            &network,
+            &[],
+            &[],
+            &[],
+            "site-a",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
         let value = overlay_json_from_cm(&build_cm(&overlay, "my-net", "gw"));
         assert_eq!(value.get("network").and_then(serde_json::Value::as_str), Some("my-net"));
         assert_eq!(
@@ -3166,8 +3602,17 @@ mod tests {
     #[test]
     fn local_site_parameter_flows_to_overlay() {
         let network = test_network("my-net");
-        let overlay = render_routing_overlay(&network, &[], &[], &[], "site-a", None, None)
-            .unwrap_or_else(|_| std::process::abort());
+        let overlay = render_routing_overlay(
+            &network,
+            &[],
+            &[],
+            &[],
+            "site-a",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
         assert_eq!(
             overlay.local_site, "site-a",
             "local_site parameter must appear verbatim in the overlay"
@@ -3179,10 +3624,28 @@ mod tests {
     fn different_local_site_per_call_produces_different_overlays() {
         // Simulates two gateways in the same network declaring different local sites.
         let network = test_network("my-net");
-        let overlay_a = render_routing_overlay(&network, &[], &[], &[], "site-a", None, None)
-            .unwrap_or_else(|_| std::process::abort());
-        let overlay_b = render_routing_overlay(&network, &[], &[], &[], "site-b", None, None)
-            .unwrap_or_else(|_| std::process::abort());
+        let overlay_a = render_routing_overlay(
+            &network,
+            &[],
+            &[],
+            &[],
+            "site-a",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        let overlay_b = render_routing_overlay(
+            &network,
+            &[],
+            &[],
+            &[],
+            "site-b",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
         assert_eq!(overlay_a.local_site, "site-a", "gateway A must identify site-a");
         assert_eq!(overlay_b.local_site, "site-b", "gateway B must identify site-b");
         assert_eq!(
@@ -3195,8 +3658,17 @@ mod tests {
     fn json_candidate_has_correct_fields() {
         let network = test_network("my-net");
         let provider = test_provider("prov-a", "my-net", &["granite-3.3-8b"]);
-        let overlay = render_routing_overlay(&network, &[], &[provider], &[], "test-site", None, None)
-            .unwrap_or_else(|_| std::process::abort());
+        let overlay = render_routing_overlay(
+            &network,
+            &[],
+            &[provider],
+            &[],
+            "test-site",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
         let value = overlay_json_from_cm(&build_cm(&overlay, "my-net", "gw"));
         let c = value
             .get("candidates")
@@ -3230,7 +3702,16 @@ mod tests {
             "spec": { "seeds": [] }
         }))
         .unwrap_or_else(|_| std::process::abort());
-        let result = render_routing_overlay(&network, &[], &[], &[], "local", None, None);
+        let result = render_routing_overlay(
+            &network,
+            &[],
+            &[],
+            &[],
+            "local",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+        );
         assert!(result.is_err(), "network without metadata.name must return an error");
     }
 
@@ -3251,7 +3732,16 @@ mod tests {
             }
         }))
         .unwrap_or_else(|_| std::process::abort());
-        let result = render_routing_overlay(&network, &[], &[provider], &[], "local", None, None);
+        let result = render_routing_overlay(
+            &network,
+            &[],
+            &[provider],
+            &[],
+            "local",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+        );
         assert!(
             result.is_err(),
             "InferenceProvider without metadata.name must return an error"
@@ -3281,7 +3771,14 @@ mod tests {
         );
 
         let providers_for_ordering = [provider_busy, provider_idle];
-        let ordering = provider_ordering_scores("net", &providers_for_ordering, &[], None, Some(&metrics));
+        let ordering = provider_ordering_scores(
+            "net",
+            &providers_for_ordering,
+            &[],
+            None,
+            Some(&metrics),
+            &scoring::ScoringWeights::default(),
+        );
 
         let busy_score = ordering["provider-busy"].total;
         let idle_score = ordering["provider-idle"].total;
@@ -3299,9 +3796,17 @@ mod tests {
         let local = test_provider_with_backend_kind("prov-local", "net", "local");
         let api = test_provider_with_backend_kind("prov-api", "net", "api_provider");
         let ps_static = [local.clone(), api.clone()];
-        let ordering_static = provider_ordering_scores("net", &ps_static, &[], None, None);
+        let ordering_static =
+            provider_ordering_scores("net", &ps_static, &[], None, None, &scoring::ScoringWeights::default());
         let ps_empty = [local, api];
-        let ordering_no_metrics = provider_ordering_scores("net", &ps_empty, &[], None, Some(&HashMap::new()));
+        let ordering_no_metrics = provider_ordering_scores(
+            "net",
+            &ps_empty,
+            &[],
+            None,
+            Some(&HashMap::new()),
+            &scoring::ScoringWeights::default(),
+        );
         assert_eq!(
             ordering_static["prov-local"].total, ordering_no_metrics["prov-local"].total,
             "empty metrics map must yield same score as None"
@@ -3309,6 +3814,240 @@ mod tests {
         assert_eq!(
             ordering_static["prov-api"].total, ordering_no_metrics["prov-api"].total,
             "empty metrics map must yield same score as None"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // noMetrics strategy — overlay rendering with production default weights
+    //
+    // Weight resolution itself is tested in crd::grid_network::tests.
+    // These tests verify overlay-level behavior: that zero weights produce
+    // zero breakdowns, that admission and geography still apply, and that
+    // scoreFirst does not manufacture a preference.
+    // -----------------------------------------------------------------------
+
+    fn no_metrics_weights() -> scoring::ScoringWeights {
+        crate::crd::grid_network::resolve_scoring_weights(None)
+    }
+
+    fn assert_weight(actual: f64, expected: f64, label: &str) {
+        assert!(
+            (actual - expected).abs() < f64::EPSILON,
+            "{label}: expected {expected}, got {actual}"
+        );
+    }
+
+    #[test]
+    fn no_metrics_all_score_contributions_are_zero() {
+        let a = test_provider_with_backend_kind("prov-a", "net", "local");
+        let b = test_provider_with_backend_kind("prov-b", "net", "local");
+        let network = test_network("net");
+
+        let mut metrics = HashMap::new();
+        metrics.insert(
+            "prov-a",
+            scoring::BackendMetrics::new(0.0, true, 0.80, 100.0, 0.0, 0.10),
+        );
+        metrics.insert(
+            "prov-b",
+            scoring::BackendMetrics::new(0.0, true, 0.20, 100.0, 0.0, 0.90),
+        );
+
+        let overlay = render_routing_overlay(
+            &network,
+            &[],
+            &[a, b],
+            &[],
+            "gw",
+            Some(&metrics),
+            None,
+            &no_metrics_weights(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
+
+        for c in &overlay.candidates {
+            let bd = c.score_breakdown.as_ref().unwrap_or_else(|| std::process::abort());
+            assert_weight(bd.queue_depth, 0.0, &format!("{}: queue_depth", c.cluster));
+            assert_weight(bd.kv_cache, 0.0, &format!("{}: kv_cache", c.cluster));
+            assert_weight(bd.locality, 0.0, &format!("{}: locality", c.cluster));
+            assert_weight(bd.prefix_cache, 0.0, &format!("{}: prefix_cache", c.cluster));
+            assert_weight(bd.latency, 0.0, &format!("{}: latency", c.cluster));
+            assert_weight(bd.cost, 0.0, &format!("{}: cost", c.cluster));
+            assert_weight(bd.total, 0.0, &format!("{}: total", c.cluster));
+        }
+    }
+
+    #[test]
+    fn no_metrics_opposing_metrics_produce_equal_dynamic_scores() {
+        let a = test_provider_with_backend_kind("prov-a", "net", "local");
+        let b = test_provider_with_backend_kind("prov-b", "net", "local");
+        let network = test_network_score_first("net");
+
+        let mut metrics = HashMap::new();
+        metrics.insert(
+            "prov-a",
+            scoring::BackendMetrics::new(0.0, true, 0.80, 100.0, 0.0, 0.10),
+        );
+        metrics.insert(
+            "prov-b",
+            scoring::BackendMetrics::new(0.0, true, 0.20, 100.0, 0.0, 0.90),
+        );
+
+        let overlay = render_routing_overlay(
+            &network,
+            &[],
+            &[a, b],
+            &[],
+            "gw",
+            Some(&metrics),
+            None,
+            &no_metrics_weights(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
+
+        let scores: Vec<f64> = overlay.candidates.iter().map(|c| c.score.unwrap_or(f64::NAN)).collect();
+        assert_eq!(scores.len(), 2);
+        assert_weight(
+            scores[0],
+            scores[1],
+            "both providers must have equal dynamic scores under noMetrics",
+        );
+    }
+
+    #[test]
+    fn no_metrics_geography_first_still_prefers_local() {
+        let local = test_provider_with_backend_kind("prov-local", "net", "local");
+        let remote = test_provider_with_backend_kind("prov-remote", "net", "remote");
+        let network = test_network("net");
+
+        let mut metrics = HashMap::new();
+        metrics.insert(
+            "prov-local",
+            scoring::BackendMetrics::new(0.0, true, 0.80, 0.0, 0.0, 0.80),
+        );
+        metrics.insert(
+            "prov-remote",
+            scoring::BackendMetrics::new(0.0, true, 0.01, 0.0, 0.0, 0.01),
+        );
+
+        let overlay = render_routing_overlay(
+            &network,
+            &[],
+            &[remote, local],
+            &[],
+            "prov-local",
+            Some(&metrics),
+            None,
+            &no_metrics_weights(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
+
+        assert_eq!(
+            overlay.candidates.first().map(|c| c.cluster.as_str()),
+            Some("prov-local"),
+            "geographyFirst with noMetrics: local must rank first despite worse metrics"
+        );
+    }
+
+    #[test]
+    fn no_metrics_admission_still_restricts_saturated_provider() {
+        let healthy = test_provider_with_backend_kind("prov-healthy", "net", "api_provider");
+        let saturated = test_provider_with_backend_kind("prov-saturated", "net", "local");
+        let network = test_network("net");
+
+        let mut metrics = HashMap::new();
+        metrics.insert(
+            "prov-saturated",
+            scoring::BackendMetrics::new(0.0, true, 0.95, 0.0, 0.0, 0.95),
+        );
+        metrics.insert(
+            "prov-healthy",
+            scoring::BackendMetrics::new(0.0, true, 0.1, 0.0, 0.0, 0.1),
+        );
+
+        let overlay = render_routing_overlay(
+            &network,
+            &[],
+            &[saturated, healthy],
+            &[],
+            "gw",
+            Some(&metrics),
+            None,
+            &no_metrics_weights(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
+
+        assert_eq!(
+            overlay.candidates.first().map(|c| c.cluster.as_str()),
+            Some("prov-healthy"),
+            "noMetrics: admission must still order NewAndExisting above ExistingOnly"
+        );
+        assert_eq!(
+            overlay.candidates[0].admission_state,
+            Some(AdmissionState::NewAndExisting),
+            "first candidate must be NewAndExisting under noMetrics"
+        );
+    }
+
+    #[test]
+    fn no_metrics_unavailable_provider_still_excluded() {
+        let available = test_provider_with_backend_kind("prov-up", "net", "local");
+        let unavailable = test_provider_with_backend_kind_and_phase("prov-down", "net", "local", "Unavailable");
+
+        let network = test_network("net");
+        let overlay = render_routing_overlay(
+            &network,
+            &[],
+            &[available, unavailable],
+            &[],
+            "gw",
+            None,
+            None,
+            &no_metrics_weights(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
+
+        let names: Vec<&str> = overlay.candidates.iter().map(|c| c.cluster.as_str()).collect();
+        assert!(names.contains(&"prov-up"), "available provider must appear in overlay");
+        assert!(
+            !names.contains(&"prov-down"),
+            "unavailable provider must be excluded even under noMetrics"
+        );
+    }
+
+    #[test]
+    fn no_metrics_score_first_does_not_manufacture_preference() {
+        let a = test_provider_with_backend_kind("prov-a", "net", "local");
+        let b = test_provider_with_backend_kind("prov-b", "net", "local");
+        let network = test_network_score_first("net");
+
+        let mut metrics = HashMap::new();
+        metrics.insert(
+            "prov-a",
+            scoring::BackendMetrics::new(0.0, true, 0.90, 100.0, 0.0, 0.99),
+        );
+        metrics.insert(
+            "prov-b",
+            scoring::BackendMetrics::new(0.0, true, 0.01, 100.0, 0.0, 0.01),
+        );
+
+        let overlay = render_routing_overlay(
+            &network,
+            &[],
+            &[a, b],
+            &[],
+            "gw",
+            Some(&metrics),
+            None,
+            &no_metrics_weights(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
+
+        let scores: Vec<f64> = overlay.candidates.iter().map(|c| c.score.unwrap_or(f64::NAN)).collect();
+        assert_weight(
+            scores[0],
+            scores[1],
+            "scoreFirst with noMetrics: extreme metric differences must not create score preference",
         );
     }
 
@@ -3336,8 +4075,17 @@ mod tests {
             scoring::BackendMetrics::new(0.0, true, 0.0, 0.0, 0.0, 0.1),
         );
 
-        let overlay = render_routing_overlay(&network, &[], &[busy, idle], &[], "local-gw", Some(&metrics), None)
-            .unwrap_or_else(|_| std::process::abort());
+        let overlay = render_routing_overlay(
+            &network,
+            &[],
+            &[busy, idle],
+            &[],
+            "local-gw",
+            Some(&metrics),
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
 
         // idle (queue_depth=0.1) must rank before busy (queue_depth=0.9).
         let first = overlay.candidates.first().map(|c| c.cluster.as_str());
@@ -3357,12 +4105,29 @@ mod tests {
         let api = test_provider_with_backend_kind("prov-api", "net", "api_provider");
         let network = test_network("net");
 
-        let overlay_none = render_routing_overlay(&network, &[], &[api.clone(), local.clone()], &[], "gw", None, None)
-            .unwrap_or_else(|_| std::process::abort());
+        let overlay_none = render_routing_overlay(
+            &network,
+            &[],
+            &[api.clone(), local.clone()],
+            &[],
+            "gw",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
 
-        let overlay_empty =
-            render_routing_overlay(&network, &[], &[api, local], &[], "gw", Some(&HashMap::new()), None)
-                .unwrap_or_else(|_| std::process::abort());
+        let overlay_empty = render_routing_overlay(
+            &network,
+            &[],
+            &[api, local],
+            &[],
+            "gw",
+            Some(&HashMap::new()),
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
 
         assert_eq!(
             overlay_none.candidates[0].cluster, overlay_empty.candidates[0].cluster,
@@ -3391,8 +4156,17 @@ mod tests {
         );
         // "unmapped-prov" intentionally absent from the metrics map.
 
-        let overlay = render_routing_overlay(&network, &[], &[known, unmapped], &[], "gw", Some(&metrics), None)
-            .unwrap_or_else(|_| std::process::abort());
+        let overlay = render_routing_overlay(
+            &network,
+            &[],
+            &[known, unmapped],
+            &[],
+            "gw",
+            Some(&metrics),
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
 
         assert_eq!(
             overlay.candidates.len(),
@@ -3462,8 +4236,17 @@ mod tests {
             scoring::BackendMetrics::new(0.0, true, 0.1, 0.0, 0.0, 0.1),
         );
 
-        let overlay = render_routing_overlay(&network, &[], &[local, remote], &[], "gw", Some(&metrics), None)
-            .unwrap_or_else(|_| std::process::abort());
+        let overlay = render_routing_overlay(
+            &network,
+            &[],
+            &[local, remote],
+            &[],
+            "gw",
+            Some(&metrics),
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
 
         assert_eq!(
             overlay.candidates.first().map(|c| c.cluster.as_str()),
@@ -3488,8 +4271,17 @@ mod tests {
             scoring::BackendMetrics::new(0.0, true, 0.3, 100.0, 0.5, 0.3),
         );
 
-        let overlay = render_routing_overlay(&network, &[], &[local, remote], &[], "gw", Some(&metrics), None)
-            .unwrap_or_else(|_| std::process::abort());
+        let overlay = render_routing_overlay(
+            &network,
+            &[],
+            &[local, remote],
+            &[],
+            "gw",
+            Some(&metrics),
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
 
         assert_eq!(
             overlay.candidates.first().map(|c| c.cluster.as_str()),
@@ -3504,8 +4296,17 @@ mod tests {
         let api = test_provider_with_backend_kind("prov-api", "net", "api_provider");
         let network = test_network_score_first("net");
 
-        let overlay = render_routing_overlay(&network, &[], &[local, api], &[], "gw", None, None)
-            .unwrap_or_else(|_| std::process::abort());
+        let overlay = render_routing_overlay(
+            &network,
+            &[],
+            &[local, api],
+            &[],
+            "gw",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
 
         let first = &overlay.candidates[0];
         assert!(first.fresh, "first candidate must be fresh");
@@ -3532,8 +4333,17 @@ mod tests {
             scoring::BackendMetrics::new(0.0, true, 0.1, 0.0, 0.0, 0.1),
         );
 
-        let overlay = render_routing_overlay(&network, &[], &[saturated, healthy], &[], "gw", Some(&metrics), None)
-            .unwrap_or_else(|_| std::process::abort());
+        let overlay = render_routing_overlay(
+            &network,
+            &[],
+            &[saturated, healthy],
+            &[],
+            "gw",
+            Some(&metrics),
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
 
         assert_eq!(
             overlay.candidates.first().map(|c| c.cluster.as_str()),
@@ -3563,8 +4373,17 @@ mod tests {
             scoring::BackendMetrics::new(0.0, true, 0.3, 500.0, 0.4, 0.2),
         );
 
-        let overlay = render_routing_overlay(&network, &[], &[local], &[], "gw", Some(&metrics), None)
-            .unwrap_or_else(|_| std::process::abort());
+        let overlay = render_routing_overlay(
+            &network,
+            &[],
+            &[local],
+            &[],
+            "gw",
+            Some(&metrics),
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
 
         let c = &overlay.candidates[0];
         assert!(c.score.is_some(), "candidate must have a score");
@@ -3598,10 +4417,28 @@ mod tests {
         .unwrap_or_else(|_| std::process::abort());
 
         let providers = [local, remote, api];
-        let overlay_default = render_routing_overlay(&no_policy, &[], &providers, &[], "gw", None, None)
-            .unwrap_or_else(|_| std::process::abort());
-        let overlay_geo = render_routing_overlay(&geo_policy, &[], &providers, &[], "gw", None, None)
-            .unwrap_or_else(|_| std::process::abort());
+        let overlay_default = render_routing_overlay(
+            &no_policy,
+            &[],
+            &providers,
+            &[],
+            "gw",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        let overlay_geo = render_routing_overlay(
+            &geo_policy,
+            &[],
+            &providers,
+            &[],
+            "gw",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
 
         let order_default: Vec<&str> = overlay_default.candidates.iter().map(|c| c.cluster.as_str()).collect();
         let order_geo: Vec<&str> = overlay_geo.candidates.iter().map(|c| c.cluster.as_str()).collect();
@@ -3627,8 +4464,17 @@ mod tests {
             scoring::BackendMetrics::new(0.0, true, 0.1, 0.0, 0.0, 0.1),
         );
 
-        let overlay = render_routing_overlay(&network, &[], &[local, remote], &[], "local-site", Some(&metrics), None)
-            .unwrap_or_else(|_| std::process::abort());
+        let overlay = render_routing_overlay(
+            &network,
+            &[],
+            &[local, remote],
+            &[],
+            "local-site",
+            Some(&metrics),
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
 
         assert_eq!(
             overlay.candidates.first().map(|c| c.cluster.as_str()),
@@ -3699,8 +4545,17 @@ mod tests {
     fn routing_cluster_ref_appears_in_candidate_cluster() {
         let network = test_network("net");
         let provider = test_provider_with_routing_cluster_ref("prov-a", "net", Some("gateway-site-x"));
-        let overlay = render_routing_overlay(&network, &[], &[provider], &[], "test-site", None, None)
-            .unwrap_or_else(|_| std::process::abort());
+        let overlay = render_routing_overlay(
+            &network,
+            &[],
+            &[provider],
+            &[],
+            "test-site",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
         assert_eq!(overlay.candidates.len(), 1, "one candidate");
         assert_eq!(
             overlay.candidates.first().map(|c| c.cluster.as_str()),
@@ -3714,8 +4569,17 @@ mod tests {
         // In Phase 1 (no GridSites), site = routingClusterRef.
         let network = test_network("net");
         let provider = test_provider_with_routing_cluster_ref("prov-a", "net", Some("site-x"));
-        let overlay = render_routing_overlay(&network, &[], &[provider], &[], "test-site", None, None)
-            .unwrap_or_else(|_| std::process::abort());
+        let overlay = render_routing_overlay(
+            &network,
+            &[],
+            &[provider],
+            &[],
+            "test-site",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
         assert_eq!(
             overlay.candidates.first().map(|c| c.site.as_str()),
             Some("site-x"),
@@ -3740,8 +4604,17 @@ mod tests {
             }
         }))
         .unwrap_or_else(|_| std::process::abort());
-        let overlay = render_routing_overlay(&network, &[], &[provider], &[], "test-site", None, None)
-            .unwrap_or_else(|_| std::process::abort());
+        let overlay = render_routing_overlay(
+            &network,
+            &[],
+            &[provider],
+            &[],
+            "test-site",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
         assert_eq!(overlay.candidates.len(), 2, "two model candidates");
         assert!(
             overlay.candidates.iter().all(|c| c.cluster == "gateway-site-x"),
@@ -3757,8 +4630,17 @@ mod tests {
         let p2 = test_provider_with_routing_cluster_ref("prov-b", "net", Some("site-x"));
         // Both produce (kind=inference_model, name=model-x, site=site-x, cluster=site-x)
         // They share the same cluster and site, so after dedup there should be ONE entry.
-        let overlay = render_routing_overlay(&network, &[], &[p1, p2], &[], "test-site", None, None)
-            .unwrap_or_else(|_| std::process::abort());
+        let overlay = render_routing_overlay(
+            &network,
+            &[],
+            &[p1, p2],
+            &[],
+            "test-site",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
         assert_eq!(
             overlay.candidates.len(),
             1,
@@ -3784,8 +4666,17 @@ mod tests {
             "status": { "phase": "Unavailable", "matchingSites": [], "observedGeneration": 0 }
         }))
         .unwrap_or_else(|_| std::process::abort());
-        let overlay = render_routing_overlay(&network, &[], &[provider], &[], "test-site", None, None)
-            .unwrap_or_else(|_| std::process::abort());
+        let overlay = render_routing_overlay(
+            &network,
+            &[],
+            &[provider],
+            &[],
+            "test-site",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
         assert!(
             overlay.candidates.is_empty(),
             "Unavailable must be excluded even with routingClusterRef"
@@ -3810,8 +4701,17 @@ mod tests {
             "status": { "phase": "Degraded", "matchingSites": [], "observedGeneration": 0 }
         }))
         .unwrap_or_else(|_| std::process::abort());
-        let overlay = render_routing_overlay(&network, &[], &[provider], &[], "test-site", None, None)
-            .unwrap_or_else(|_| std::process::abort());
+        let overlay = render_routing_overlay(
+            &network,
+            &[],
+            &[provider],
+            &[],
+            "test-site",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
         assert_eq!(overlay.candidates.len(), 1, "Degraded must be included");
         assert!(
             overlay.candidates.first().is_some_and(|c| !c.fresh),
@@ -3850,6 +4750,7 @@ mod tests {
             "test-site",
             None,
             None,
+            &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
         assert_eq!(overlay.candidates.len(), 2, "two candidates");
@@ -4167,8 +5068,17 @@ mod tests {
             crdt::ProviderPhase::Available,
             &["model-remote"],
         );
-        let overlay = render_routing_overlay(&network, &[], &[], &[remote], "local-site", None, None)
-            .unwrap_or_else(|_| std::process::abort());
+        let overlay = render_routing_overlay(
+            &network,
+            &[],
+            &[],
+            &[remote],
+            "local-site",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
         assert_eq!(
             overlay.candidates.len(),
             1,
@@ -4193,8 +5103,17 @@ mod tests {
             crdt::ProviderPhase::Unavailable,
             &["model-remote"],
         );
-        let overlay = render_routing_overlay(&network, &[], &[], &[unavailable], "local-site", None, None)
-            .unwrap_or_else(|_| std::process::abort());
+        let overlay = render_routing_overlay(
+            &network,
+            &[],
+            &[],
+            &[unavailable],
+            "local-site",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
         assert!(
             overlay.candidates.is_empty(),
             "Unavailable CRDT provider must be excluded from overlay"
@@ -4301,8 +5220,17 @@ mod tests {
     fn bearer_token_candidate_carries_credential_ref() {
         let network = test_network("net");
         let provider = test_provider_with_bearer_auth("api-prov", "net");
-        let overlay = render_routing_overlay(&network, &[], &[provider], &[], "site-a", None, None)
-            .unwrap_or_else(|_| std::process::abort());
+        let overlay = render_routing_overlay(
+            &network,
+            &[],
+            &[provider],
+            &[],
+            "site-a",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
         let cred = overlay
             .candidates
             .first()
@@ -4318,8 +5246,17 @@ mod tests {
     fn credential_ref_in_configmap_json_contains_secret_ref_not_token_value() {
         let network = test_network("net");
         let provider = test_provider_with_bearer_auth("api-prov", "net");
-        let overlay = render_routing_overlay(&network, &[], &[provider], &[], "site-a", None, None)
-            .unwrap_or_else(|_| std::process::abort());
+        let overlay = render_routing_overlay(
+            &network,
+            &[],
+            &[provider],
+            &[],
+            "site-a",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
         let cm = build_cm(&overlay, "net", "gw");
         let json = overlay_json_from_cm(&cm);
         let candidate = json
@@ -4348,8 +5285,17 @@ mod tests {
     fn no_auth_candidate_has_no_credential_field_in_json() {
         let network = test_network("net");
         let provider = test_provider("no-auth", "net", &["model-a"]);
-        let overlay = render_routing_overlay(&network, &[], &[provider], &[], "site-a", None, None)
-            .unwrap_or_else(|_| std::process::abort());
+        let overlay = render_routing_overlay(
+            &network,
+            &[],
+            &[provider],
+            &[],
+            "site-a",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
         let cm = build_cm(&overlay, "net", "gw");
         let json = overlay_json_from_cm(&cm);
         let candidate = json
@@ -4367,8 +5313,17 @@ mod tests {
     fn manual_auth_candidate_has_no_credential_field_in_json() {
         let network = test_network("net");
         let provider = test_provider_with_manual_auth("manual-prov", "net");
-        let overlay = render_routing_overlay(&network, &[], &[provider], &[], "site-a", None, None)
-            .unwrap_or_else(|_| std::process::abort());
+        let overlay = render_routing_overlay(
+            &network,
+            &[],
+            &[provider],
+            &[],
+            "site-a",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
         let cm = build_cm(&overlay, "net", "gw");
         let json = overlay_json_from_cm(&cm);
         let candidate = json
@@ -4714,8 +5669,17 @@ mod tests {
     fn render_overlay_local_providers_unchanged_with_empty_remote() {
         let network = test_network("net");
         let local_prov = test_provider_with_backend_kind("prov-local", "net", "local");
-        let overlay = render_routing_overlay(&network, &[], &[local_prov], &[], "local-site", None, None)
-            .unwrap_or_else(|_| std::process::abort());
+        let overlay = render_routing_overlay(
+            &network,
+            &[],
+            &[local_prov],
+            &[],
+            "local-site",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
         assert_eq!(
             overlay.candidates.len(),
             1,
@@ -4930,6 +5894,7 @@ mod tests {
             "site-prod",
             None,
             None,
+            &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
         assert_eq!(
@@ -4950,6 +5915,7 @@ mod tests {
             "site-staging",
             None,
             None,
+            &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
         assert_eq!(
@@ -4978,6 +5944,7 @@ mod tests {
             "site-prod",
             None,
             None,
+            &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
         assert_eq!(
@@ -4999,6 +5966,7 @@ mod tests {
             "site-staging",
             None,
             None,
+            &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
         assert_eq!(
@@ -5031,6 +5999,7 @@ mod tests {
             "site-prod",
             None,
             None,
+            &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
         assert_eq!(
@@ -5048,6 +6017,7 @@ mod tests {
             "site-staging",
             None,
             None,
+            &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
         assert_eq!(
@@ -5065,6 +6035,7 @@ mod tests {
             "site-other",
             None,
             None,
+            &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
         assert_eq!(
@@ -5092,6 +6063,7 @@ mod tests {
             "unknown-site",
             None,
             None,
+            &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
 
@@ -5138,6 +6110,7 @@ mod tests {
             "site-prod",
             None,
             None,
+            &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
         // With 2 sites and 3 providers, we expect 6 candidates (3 providers × 2 sites each)
@@ -5166,6 +6139,7 @@ mod tests {
             "site-staging",
             None,
             None,
+            &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
         // Staging site only, 2 allowed providers (unrestricted + platform-only) = 2 candidates
@@ -5205,6 +6179,7 @@ mod tests {
             "site-prod",
             None,
             None,
+            &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
         assert_eq!(overlay.candidates.len(), 1, "local unrestricted provider must appear");
@@ -5233,6 +6208,7 @@ mod tests {
             "site-prod",
             None,
             None,
+            &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
         assert_eq!(
@@ -5250,6 +6226,7 @@ mod tests {
             "site-staging",
             None,
             None,
+            &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
         assert_eq!(
@@ -5279,6 +6256,7 @@ mod tests {
             "site-wrong",
             None,
             None,
+            &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
         assert_eq!(
@@ -5306,6 +6284,7 @@ mod tests {
             "unknown-site",
             None,
             None,
+            &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
 
@@ -5337,6 +6316,7 @@ mod tests {
             "site-prod",
             None,
             None,
+            &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
         assert_eq!(
@@ -5369,6 +6349,7 @@ mod tests {
             "site-prod",
             None,
             None,
+            &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
         assert_eq!(
@@ -5386,6 +6367,7 @@ mod tests {
             "site-staging",
             None,
             None,
+            &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
         assert_eq!(
@@ -5414,6 +6396,7 @@ mod tests {
             "site-wrong",
             None,
             None,
+            &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
         assert_eq!(
@@ -5441,6 +6424,7 @@ mod tests {
             "unknown-site",
             None,
             None,
+            &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
 
@@ -5535,6 +6519,7 @@ mod tests {
             "site-a",
             Some(&metrics),
             None,
+            &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
 
@@ -5579,6 +6564,7 @@ mod tests {
             "site-a",
             Some(&metrics),
             None,
+            &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
 
@@ -5626,6 +6612,7 @@ mod tests {
             "site-a",
             Some(&metrics),
             None,
+            &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
 
@@ -5642,8 +6629,17 @@ mod tests {
         let prov_local = test_provider_with_backend_kind("prov-local", "net", "local");
         let prov_api = test_provider_with_backend_kind("prov-api", "net", "api_provider");
 
-        let overlay = render_routing_overlay(&network, &[], &[prov_local, prov_api], &[], "local-gw", None, None)
-            .unwrap_or_else(|_| std::process::abort());
+        let overlay = render_routing_overlay(
+            &network,
+            &[],
+            &[prov_local, prov_api],
+            &[],
+            "local-gw",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
 
         assert_eq!(overlay.candidates.len(), 2, "both candidates must be present");
         assert_eq!(
@@ -5681,6 +6677,7 @@ mod tests {
             "site-a",
             None,
             None,
+            &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
 
@@ -5712,6 +6709,7 @@ mod tests {
             "site-a",
             None,
             Some("2026-07-24T12:00:00Z"),
+            &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
 
@@ -5770,8 +6768,17 @@ mod tests {
         let prov = test_provider("prov-a", "net", &["llm"]);
         let ts = "2026-07-24T12:00:00Z";
 
-        let overlay = render_routing_overlay(&network, &[], &[prov], &[], "net", None, Some(ts))
-            .unwrap_or_else(|_| std::process::abort());
+        let overlay = render_routing_overlay(
+            &network,
+            &[],
+            &[prov],
+            &[],
+            "net",
+            None,
+            Some(ts),
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
 
         assert_eq!(
             overlay.generated_at.as_deref(),
@@ -5793,8 +6800,17 @@ mod tests {
         let site_b = test_site_with_geography_and_label("site-b", "net", Some("us-east"), Some("az-2"));
         let prov = test_provider_on_site("prov-b", "net", "site-b", "local", &["llm"]);
 
-        let overlay = render_routing_overlay(&network, &[site_a, site_b], &[prov], &[], "site-a", None, None)
-            .unwrap_or_else(|_| std::process::abort());
+        let overlay = render_routing_overlay(
+            &network,
+            &[site_a, site_b],
+            &[prov],
+            &[],
+            "site-a",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
 
         assert_eq!(overlay.candidates.len(), 1, "one candidate");
         assert_eq!(
@@ -5819,8 +6835,17 @@ mod tests {
         let mut metrics: HashMap<&str, scoring::BackendMetrics> = HashMap::new();
         metrics.insert("prov-a", scoring::BackendMetrics::new(0.0, true, 0.5, 100.0, 0.5, 0.90));
 
-        let overlay = render_routing_overlay(&network, &[site_a], &[prov], &[], "site-a", Some(&metrics), None)
-            .unwrap_or_else(|_| std::process::abort());
+        let overlay = render_routing_overlay(
+            &network,
+            &[site_a],
+            &[prov],
+            &[],
+            "site-a",
+            Some(&metrics),
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
 
         assert_eq!(overlay.candidates.len(), 1, "one candidate");
         assert_eq!(
