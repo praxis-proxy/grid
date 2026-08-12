@@ -968,6 +968,11 @@ pub(crate) enum Action {
         /// Protect EPP metrics with an nginx mTLS proxy instead of scraping directly over HTTP.
         #[arg(long)]
         metrics_mtls: bool,
+        /// Drive routing off llm-d's kv-cache-utilization signal
+        /// (`GridNetwork` `scoringPolicy.strategy: kvCachePressure`) instead
+        /// of the default queue-depth signal.
+        #[arg(long)]
+        kv_cache: bool,
     },
 }
 
@@ -1052,7 +1057,8 @@ pub(crate) fn run(action: &Action) -> Result<(), Box<dyn std::error::Error>> {
             forge_config,
             options,
             metrics_mtls,
-        } => llmd_pool_metrics_demo::run(forge_config, options, *metrics_mtls),
+            kv_cache,
+        } => llmd_pool_metrics_demo::run(forge_config, options, *metrics_mtls, *kv_cache),
     }
 }
 
