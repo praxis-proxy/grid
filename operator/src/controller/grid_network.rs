@@ -29,7 +29,7 @@ use crate::{
             ConsumerConfig, ConsumerConfigPhase, ConsumerConfigStatus, GatewayRef, GridNetwork, GridNetworkPhase,
             GridNetworkStatus, OverlayPhase, OverlayRevisionStatus, TransportMode,
         },
-        grid_site::{GridSite, GridSitePhase},
+        grid_site::{GridSite, GridSitePhase, GridSiteStatus},
         inference_provider::InferenceProvider,
     },
     error::OperatorError,
@@ -829,6 +829,12 @@ async fn reconcile_routing_overlay_inner(
                 continue;
             },
         };
+        let rendered_at = stable_rendered_at(
+            find_prior_overlay(network, gw_ref),
+            &render.revision_hex,
+            &resource_version,
+            &render.rendered_at,
+        );
         overlay_statuses.push(OverlayRevisionStatus {
             gateway_name: gw_ref.name.clone(),
             namespace: gw_ref.namespace.clone(),
@@ -838,7 +844,7 @@ async fn reconcile_routing_overlay_inner(
             distributed_revision: render.revision_hex.clone(),
             content_digest: render.revision_hex,
             config_map_resource_version: resource_version,
-            rendered_at: render.rendered_at,
+            rendered_at,
             candidate_count: render.candidate_count,
             phase: OverlayPhase::Distributed,
             reason: String::new(),
@@ -883,6 +889,35 @@ fn find_prior_overlay<'a>(network: &'a GridNetwork, gw_ref: &GatewayRef) -> Opti
             .find(|e| e.gateway_name == gw_ref.name && e.namespace == gw_ref.namespace)
             .filter(|e| !e.distributed_revision.is_empty())
     })
+}
+
+/// Decide the `rendered_at` timestamp to record for a freshly-successful
+/// overlay distribution.
+///
+/// `fresh_rendered_at` is derived from a new timestamp taken on every
+/// reconcile tick (see `rfc3339_now` in `reconcile_overlays_and_consumer_configs`),
+/// so using it unconditionally would make every `OverlayRevisionStatus`
+/// compare as changed even when the overlay's actual content (distributed
+/// revision, `ConfigMap` `resourceVersion`) is byte-for-byte identical to
+/// what is already recorded — silently defeating
+/// [`grid_network_status_needs_update`]'s equality check and reproducing the
+/// same class of reconcile hot-loop as grid#42, just against the
+/// `GridNetwork` object's own status subresource instead of `GridSite` or
+/// the overlay `ConfigMap`. Reuse the prior timestamp whenever nothing
+/// observable changed; only advance it when the distributed revision or
+/// `ConfigMap` `resourceVersion` actually moved.
+fn stable_rendered_at(
+    prior: Option<&OverlayRevisionStatus>,
+    revision_hex: &str,
+    resource_version: &str,
+    fresh_rendered_at: &str,
+) -> String {
+    match prior {
+        Some(p) if p.distributed_revision == revision_hex && p.config_map_resource_version == resource_version => {
+            p.rendered_at.clone()
+        },
+        _ => fresh_rendered_at.to_owned(),
+    }
 }
 
 /// Resolve rendered-side evidence from render result, prior status, or defaults.
@@ -1072,9 +1107,37 @@ fn render_overlay_for_gateway(
     })
 }
 
-/// Server-side apply a pre-rendered overlay `ConfigMap` for a single gateway.
+/// True when `existing`'s revision annotation already matches `revision_hex`,
+/// meaning a re-apply of the overlay `ConfigMap` would be a no-op write.
 ///
-/// Returns the Kubernetes `resourceVersion` of the applied `ConfigMap`.
+/// Pure/synchronous so it is fully unit-testable without a live Kubernetes
+/// API. Server-side apply still writes managedFields metadata (bumping
+/// resourceVersion and firing a watch event) even when applied content is
+/// byte-for-byte unchanged; combined with the apply being re-triggered by the
+/// very watch event it emits, applying unconditionally becomes an infinite
+/// reconcile hot-loop (see grid#42).
+fn configmap_up_to_date(existing: &ConfigMap, revision_hex: &str) -> bool {
+    existing
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|a| a.get(overlay_envelope::ANNOTATION_REVISION))
+        .is_some_and(|rev| rev == revision_hex)
+}
+
+/// Server-side apply a pre-rendered overlay `ConfigMap` for a single gateway,
+/// skipping the apply when [`configmap_up_to_date`] says it would be a no-op.
+///
+/// Returns the Kubernetes `resourceVersion` of the (applied or pre-existing)
+/// `ConfigMap`.
+#[expect(
+    clippy::too_many_lines,
+    reason = "fetch-guard, apply, and logging is a single cohesive sequence"
+)]
+#[expect(
+    clippy::large_stack_frames,
+    reason = "async future over Kubernetes API types with serde_json values"
+)]
 async fn distribute_overlay_configmap(
     overlay: &routing_overlay::RoutingOverlay,
     render: &OverlayRenderResult,
@@ -1092,6 +1155,18 @@ async fn distribute_overlay_configmap(
     .map_err(OperatorError::Json)?;
 
     let api: Api<ConfigMap> = Api::namespaced(client.clone(), &gw_ref.namespace);
+
+    if let Ok(existing) = api.get(&render.config_map_name).await
+        && configmap_up_to_date(&existing, &render.revision_hex)
+    {
+        tracing::debug!(
+            cm_name = %render.config_map_name,
+            revision = %render.revision_hex,
+            "routing overlay ConfigMap already at this revision; skipping no-op apply"
+        );
+        return Ok(existing.metadata.resource_version.unwrap_or_default());
+    }
+
     let applied = api
         .patch(
             &render.config_map_name,
@@ -1740,6 +1815,166 @@ fn network_uses_plaintext_egress(network: &GridNetwork) -> bool {
     has_plaintext_endpoint || (network.spec.tls.ca_secret_ref.is_none() && network.spec.tls.site_secret_ref.is_none())
 }
 
+/// `GridSite.status.reason` recorded for every cert-PEM validation failure.
+///
+/// Single source of truth for both [`decide_cert_pem_write`]'s write (via
+/// [`reconcile_site_cert_pem`]) and [`already_recorded_invalid`]'s read, so
+/// the two can never drift apart the way a hand-duplicated literal could.
+const REASON_TRUST_MATERIAL_INVALID: &str = "TrustMaterialInvalid";
+
+/// Diagnostic message for [`CertPemStatus::ContainsPrivateKey`].
+const CERT_PEM_MSG_CONTAINS_PRIVATE_KEY: &str =
+    "received trust material from remote site contained private-key markers; discarded";
+
+/// Diagnostic message for [`CertPemStatus::NotACertificate`].
+const CERT_PEM_MSG_NOT_A_CERTIFICATE: &str = "received cert PEM from remote site is not a valid certificate; check \
+                                               GRID_TLS_SITE_SECRET_REF configuration on the remote operator";
+
+/// Diagnostic message for [`CertPemStatus::TooLarge`].
+const CERT_PEM_MSG_TOO_LARGE: &str = "received cert PEM from remote site exceeds the configured size bound";
+
+/// What (if anything) [`reconcile_site_cert_pem`] should write to `GridSite`
+/// status for a received site cert PEM.
+///
+/// Produced by the pure [`decide_cert_pem_write`] so the branching logic is
+/// unit-testable without a live Kubernetes API — see grid#42, where writing
+/// unconditionally on every branch turned a stable, unchanged site into an
+/// infinite reconcile hot-loop.
+#[derive(Debug, Eq, PartialEq)]
+enum CertPemWrite {
+    /// `existing_status` already reflects this outcome; nothing to do.
+    NoOp,
+    /// Store the structurally-valid cert PEM.
+    StoreValid,
+    /// Reject with `TrustMaterialInvalid`, recording this diagnostic message.
+    RejectInvalid {
+        /// Diagnostic message to record in `status.message`.
+        message: &'static str,
+        /// Selects `error!` (private-key leak) vs `warn!` (malformed or
+        /// oversized) logging in the caller.
+        security_violation: bool,
+    },
+}
+
+/// Pure decision: given the current `GridSite` status and a freshly-checked
+/// [`CertPemStatus`], decide what (if anything) to write.
+///
+/// Never itself touches the Kubernetes API — see [`CertPemWrite`].
+fn decide_cert_pem_write(
+    existing_status: &Option<GridSiteStatus>,
+    cert_pem: &str,
+    check: &CertPemStatus,
+) -> CertPemWrite {
+    match check {
+        CertPemStatus::ValidStructure => {
+            if existing_status.as_ref().and_then(|s| s.public_cert_pem.as_deref()) == Some(cert_pem) {
+                CertPemWrite::NoOp
+            } else {
+                CertPemWrite::StoreValid
+            }
+        },
+        CertPemStatus::ContainsPrivateKey => {
+            decide_reject_invalid(existing_status, CERT_PEM_MSG_CONTAINS_PRIVATE_KEY, true)
+        },
+        CertPemStatus::NotACertificate => decide_reject_invalid(existing_status, CERT_PEM_MSG_NOT_A_CERTIFICATE, false),
+        CertPemStatus::TooLarge => decide_reject_invalid(existing_status, CERT_PEM_MSG_TOO_LARGE, false),
+    }
+}
+
+/// Shared decision logic for the three invalid-cert-PEM outcomes: skip when
+/// `existing_status` already records this exact `message`, otherwise reject.
+fn decide_reject_invalid(
+    existing_status: &Option<GridSiteStatus>,
+    message: &'static str,
+    security_violation: bool,
+) -> CertPemWrite {
+    if already_recorded_invalid(existing_status, message) {
+        CertPemWrite::NoOp
+    } else {
+        CertPemWrite::RejectInvalid {
+            message,
+            security_violation,
+        }
+    }
+}
+
+/// True when `existing` already records the given invalid-cert `message` with
+/// no stored `publicCertPem`, meaning a re-patch with the same content would
+/// be a redundant write.
+fn already_recorded_invalid(existing: &Option<GridSiteStatus>, message: &str) -> bool {
+    existing.as_ref().is_some_and(|s| {
+        s.public_cert_pem.is_none() && s.reason == REASON_TRUST_MATERIAL_INVALID && s.message == message
+    })
+}
+
+/// Validate a received site cert PEM and store (or reject) it in `GridSite`
+/// status, per [`decide_cert_pem_write`]. Purely an imperative shell around
+/// that pure decision: no branching logic lives here, only I/O and logging.
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "three sequential match arms, each a distinct security invariant (store/reject/security-log); splitting further would fragment cohesive I/O steps rather than reduce complexity"
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "three JSON-patch-plus-log branches read clearer inline than split further"
+)]
+#[expect(
+    clippy::large_stack_frames,
+    reason = "async future over Kubernetes API types with serde_json values"
+)]
+async fn reconcile_site_cert_pem(
+    api: &Api<GridSite>,
+    site_name: &str,
+    existing_status: &Option<GridSiteStatus>,
+    cert_pem: &str,
+) -> Result<(), OperatorError> {
+    match decide_cert_pem_write(existing_status, cert_pem, &trust_bundle::check_cert_pem(cert_pem)) {
+        CertPemWrite::NoOp => {
+            tracing::debug!(name = %site_name, "cert PEM status already up to date; skipping no-op status patch");
+        },
+        CertPemWrite::StoreValid => {
+            // Use strategic merge patch (not SSA) so only publicCertPem is
+            // updated; SSA with a partial payload would clear other status
+            // fields managed by "grid-operator" (e.g., reason, message).
+            let cert_merge = serde_json::json!({ "status": { "publicCertPem": cert_pem } });
+            api.patch_status(site_name, &PatchParams::default(), &Patch::Merge(&cert_merge))
+                .await?;
+            tracing::info!(
+                name = %site_name,
+                "received and stored public site certificate PEM (structure valid; not chain-verified)"
+            );
+        },
+        CertPemWrite::RejectInvalid {
+            message,
+            security_violation,
+        } => {
+            // Write a status marker so operators can see the invalid material.
+            // Do not store the raw PEM; record only the invalid status.
+            let invalid_status_doc = serde_json::json!({
+                "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+                "kind": "GridSite",
+                "status": {
+                    "publicCertPem": null,
+                    "reason": REASON_TRUST_MATERIAL_INVALID,
+                    "message": message
+                }
+            });
+            api.patch_status(site_name, &PatchParams::default(), &Patch::Merge(&invalid_status_doc))
+                .await?;
+            if security_violation {
+                tracing::error!(
+                    name = %site_name,
+                    "SECURITY: received cert PEM contains private key markers from remote SWIM peer; \
+                     discarding — private keys must never appear in SWIM broadcasts"
+                );
+            } else {
+                tracing::warn!(name = %site_name, %message, "rejected invalid cert PEM from remote site");
+            }
+        },
+    }
+    Ok(())
+}
+
 /// Create or update `GridSite` resources for remote Alive SWIM members.
 ///
 /// Uses server-side apply, so the call is idempotent: applying an already-existing
@@ -1760,10 +1995,6 @@ fn network_uses_plaintext_egress(network: &GridNetwork) -> bool {
 #[expect(
     clippy::large_stack_frames,
     reason = "async future over Kubernetes API types with serde_json values"
-)]
-#[expect(
-    clippy::cognitive_complexity,
-    reason = "cert PEM validation branches add arms but each branch is a distinct security invariant; splitting obscures the trust contract"
 )]
 async fn reconcile_discovered_sites(
     network_name: &str,
@@ -1819,18 +2050,23 @@ async fn reconcile_discovered_sites(
         )
         .await?;
 
+        // Fetch current status once and reuse it below for every write in this
+        // iteration. Every status patch bumps the GridSite's resourceVersion,
+        // which fires a watch event that re-triggers a GridNetwork reconcile
+        // (related object updated) — re-entering this same loop. Writing
+        // unconditionally therefore turns a stable, unchanged site into an
+        // infinite reconcile hot-loop; checking against current state first
+        // makes each write idempotent in practice, not just in intent (see
+        // grid#42).
+        let existing_status = api.get(&site.name).await.ok().and_then(|s| s.status);
+
         // Only write Discovered when the current phase is Pending.
         // If the GridSite controller has already advanced the phase (e.g. to
         // Connecting), we must not regress it.
-        let should_write_discovered = {
-            match api.get(&site.name).await {
-                Ok(existing) => {
-                    let current_phase = existing.status.as_ref().map(|s| &s.phase);
-                    matches!(current_phase, None | Some(GridSitePhase::Pending))
-                },
-                Err(_) => true, // Site was just created; safe to write Discovered.
-            }
-        };
+        let should_write_discovered = matches!(
+            existing_status.as_ref().map(|s| &s.phase),
+            None | Some(GridSitePhase::Pending)
+        );
 
         if should_write_discovered {
             let status_doc = serde_json::json!({
@@ -1853,80 +2089,13 @@ async fn reconcile_discovered_sites(
 
         // Write received public cert PEM to status after structure validation.
         // Private key material must never be written to status; invalid PEM is
-        // also rejected and recorded as TrustMaterialInvalid.
+        // also rejected and recorded as TrustMaterialInvalid. Skips any patch
+        // that would be a no-op given `existing_status` — otherwise every
+        // reconcile re-issues an unconditional write, which (per the comment
+        // above `existing_status`) becomes an infinite reconcile hot-loop even
+        // when the remote site's cert hasn't changed (grid#42).
         if let Some(cert_pem) = &site.site_cert_pem {
-            match trust_bundle::check_cert_pem(cert_pem) {
-                CertPemStatus::ValidStructure => {
-                    // Use strategic merge patch (not SSA) so only publicCertPem is
-                    // updated; SSA with a partial payload would clear other status
-                    // fields managed by "grid-operator" (e.g., reason, message).
-                    let cert_merge = serde_json::json!({ "status": { "publicCertPem": cert_pem } });
-                    api.patch_status(&site.name, &PatchParams::default(), &Patch::Merge(&cert_merge))
-                        .await?;
-                    tracing::info!(
-                        name = %site.name,
-                        "received and stored public site certificate PEM (structure valid; not chain-verified)"
-                    );
-                },
-                CertPemStatus::ContainsPrivateKey => {
-                    // Security violation: the remote peer sent private key material.
-                    // Do not store it; clear any prior publicCertPem and log at error
-                    // level so operators can investigate.
-                    let invalid_status_doc = serde_json::json!({
-                        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
-                        "kind": "GridSite",
-                        "status": {
-                            "publicCertPem": null,
-                            "reason": "TrustMaterialInvalid",
-                            "message": "received trust material from remote site contained private-key markers; discarded"
-                        }
-                    });
-                    api.patch_status(&site.name, &PatchParams::default(), &Patch::Merge(&invalid_status_doc))
-                        .await?;
-                    tracing::error!(
-                        name = %site.name,
-                        "SECURITY: received cert PEM contains private key markers from remote SWIM peer; \
-                         discarding — private keys must never appear in SWIM broadcasts"
-                    );
-                },
-                CertPemStatus::NotACertificate => {
-                    // Write a status marker so operators can see the invalid material.
-                    // Do not store the raw PEM; record only the invalid status.
-                    let invalid_status_doc = serde_json::json!({
-                        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
-                        "kind": "GridSite",
-                        "status": {
-                            "publicCertPem": null,
-                            "reason": "TrustMaterialInvalid",
-                            "message": "received cert PEM from remote site is not a valid certificate; \
-                                        check GRID_TLS_SITE_SECRET_REF configuration on the remote operator"
-                        }
-                    });
-                    api.patch_status(&site.name, &PatchParams::default(), &Patch::Merge(&invalid_status_doc))
-                        .await?;
-                    tracing::warn!(
-                        name = %site.name,
-                        "received cert PEM from remote site is not a valid certificate"
-                    );
-                },
-                CertPemStatus::TooLarge => {
-                    let invalid_status_doc = serde_json::json!({
-                        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
-                        "kind": "GridSite",
-                        "status": {
-                            "publicCertPem": null,
-                            "reason": "TrustMaterialInvalid",
-                            "message": "received cert PEM from remote site exceeds the configured size bound"
-                        }
-                    });
-                    api.patch_status(&site.name, &PatchParams::default(), &Patch::Merge(&invalid_status_doc))
-                        .await?;
-                    tracing::warn!(
-                        name = %site.name,
-                        "received cert PEM from remote site exceeds the configured size bound"
-                    );
-                },
-            }
+            reconcile_site_cert_pem(&api, &site.name, &existing_status, cert_pem).await?;
         }
 
         tracing::info!(
@@ -3143,6 +3312,232 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // already_recorded_invalid — grid#42 reconcile-hot-loop regression guard
+    // -----------------------------------------------------------------------
+
+    fn invalid_cert_status(message: &str) -> GridSiteStatus {
+        GridSiteStatus {
+            public_cert_pem: None,
+            reason: REASON_TRUST_MATERIAL_INVALID.to_owned(),
+            message: message.to_owned(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn already_recorded_invalid_true_when_reason_message_and_absence_all_match() {
+        let existing = Some(invalid_cert_status("private key detected"));
+        assert!(
+            already_recorded_invalid(&existing, "private key detected"),
+            "identical reason/message/absent-cert must be recognized as already recorded"
+        );
+    }
+
+    #[test]
+    fn already_recorded_invalid_false_when_status_is_none() {
+        assert!(
+            !already_recorded_invalid(&None, "private key detected"),
+            "a GridSite with no status yet has nothing recorded"
+        );
+    }
+
+    #[test]
+    fn already_recorded_invalid_false_when_message_differs() {
+        let existing = Some(invalid_cert_status("private key detected"));
+        assert!(
+            !already_recorded_invalid(&existing, "cert exceeds size bound"),
+            "a different rejection reason must not be treated as already recorded"
+        );
+    }
+
+    #[test]
+    fn already_recorded_invalid_false_when_reason_is_not_trust_material_invalid() {
+        let existing = Some(GridSiteStatus {
+            public_cert_pem: None,
+            reason: "AwaitingDiscovery".to_owned(),
+            message: "private key detected".to_owned(),
+            ..Default::default()
+        });
+        assert!(
+            !already_recorded_invalid(&existing, "private key detected"),
+            "a status recorded for an unrelated reason must not suppress the write"
+        );
+    }
+
+    #[test]
+    fn already_recorded_invalid_false_when_public_cert_pem_still_present() {
+        let existing = Some(GridSiteStatus {
+            public_cert_pem: Some("stale cert".to_owned()),
+            reason: REASON_TRUST_MATERIAL_INVALID.to_owned(),
+            message: "private key detected".to_owned(),
+            ..Default::default()
+        });
+        assert!(
+            !already_recorded_invalid(&existing, "private key detected"),
+            "a leftover publicCertPem means the invalid status was never actually applied yet"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // decide_cert_pem_write — grid#42 acceptance criterion:
+    //
+    //   "reconciling an unchanged remote site must decide NoOp for every
+    //    possible cert-PEM outcome" — i.e. a stable GridSite never causes a
+    //    write, which is precisely the condition that stops the infinite
+    //    reconcile hot-loop (repeated no-op writes bumping resourceVersion
+    //    and re-triggering the reconciler). These tests assert that
+    //    business-level property directly, across all four outcomes, rather
+    //    than only exercising the internal `already_recorded_invalid` guard.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn decide_cert_pem_write_is_noop_for_every_outcome_when_site_is_already_stable() {
+        // ValidStructure: publicCertPem already stored verbatim.
+        let stored = Some(GridSiteStatus {
+            public_cert_pem: Some("cert-a".to_owned()),
+            ..Default::default()
+        });
+        assert_eq!(
+            decide_cert_pem_write(&stored, "cert-a", &CertPemStatus::ValidStructure),
+            CertPemWrite::NoOp,
+            "an unchanged valid cert must never be re-patched (grid#42)"
+        );
+
+        // Every invalid outcome: already recorded with its exact message.
+        for (check, message) in [
+            (CertPemStatus::ContainsPrivateKey, CERT_PEM_MSG_CONTAINS_PRIVATE_KEY),
+            (CertPemStatus::NotACertificate, CERT_PEM_MSG_NOT_A_CERTIFICATE),
+            (CertPemStatus::TooLarge, CERT_PEM_MSG_TOO_LARGE),
+        ] {
+            let recorded = Some(invalid_cert_status(message));
+            assert_eq!(
+                decide_cert_pem_write(&recorded, "irrelevant-pem", &check),
+                CertPemWrite::NoOp,
+                "an unchanged rejection ({check:?}) must never be re-patched (grid#42)"
+            );
+        }
+    }
+
+    #[test]
+    fn decide_cert_pem_write_stores_valid_cert_on_first_sight() {
+        assert_eq!(
+            decide_cert_pem_write(&None, "cert-a", &CertPemStatus::ValidStructure),
+            CertPemWrite::StoreValid,
+            "a GridSite with no prior status must store the first valid cert seen"
+        );
+    }
+
+    #[test]
+    fn decide_cert_pem_write_stores_valid_cert_when_it_rotates() {
+        let stale = Some(GridSiteStatus {
+            public_cert_pem: Some("cert-old".to_owned()),
+            ..Default::default()
+        });
+        assert_eq!(
+            decide_cert_pem_write(&stale, "cert-new", &CertPemStatus::ValidStructure),
+            CertPemWrite::StoreValid,
+            "a rotated cert (different from what's stored) must still be written"
+        );
+    }
+
+    #[test]
+    fn decide_cert_pem_write_rejects_private_key_as_security_violation() {
+        assert_eq!(
+            decide_cert_pem_write(&None, "leaked-key", &CertPemStatus::ContainsPrivateKey),
+            CertPemWrite::RejectInvalid {
+                message: CERT_PEM_MSG_CONTAINS_PRIVATE_KEY,
+                security_violation: true
+            },
+            "private-key leakage must be flagged as a security violation, not a routine rejection"
+        );
+    }
+
+    #[test]
+    fn decide_cert_pem_write_rejects_malformed_cert_as_non_security() {
+        assert_eq!(
+            decide_cert_pem_write(&None, "garbage", &CertPemStatus::NotACertificate),
+            CertPemWrite::RejectInvalid {
+                message: CERT_PEM_MSG_NOT_A_CERTIFICATE,
+                security_violation: false
+            },
+            "a malformed cert is an operator misconfiguration, not a security violation"
+        );
+    }
+
+    #[test]
+    fn decide_cert_pem_write_rejects_oversized_cert_as_non_security() {
+        assert_eq!(
+            decide_cert_pem_write(&None, "huge", &CertPemStatus::TooLarge),
+            CertPemWrite::RejectInvalid {
+                message: CERT_PEM_MSG_TOO_LARGE,
+                security_violation: false
+            },
+            "an oversized cert is a bound violation, not a security violation"
+        );
+    }
+
+    #[test]
+    fn decide_cert_pem_write_re_rejects_when_recorded_reason_no_longer_matches() {
+        // Status shows a *different* rejection (or none) — must not be
+        // mistaken for "already handled".
+        let recorded_other_reason = Some(invalid_cert_status(CERT_PEM_MSG_TOO_LARGE));
+        assert_eq!(
+            decide_cert_pem_write(&recorded_other_reason, "leaked-key", &CertPemStatus::ContainsPrivateKey),
+            CertPemWrite::RejectInvalid {
+                message: CERT_PEM_MSG_CONTAINS_PRIVATE_KEY,
+                security_violation: true
+            },
+            "a newly-observed private-key leak must be recorded even if a different rejection was previously stored"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // configmap_up_to_date — grid#42 acceptance criterion for the overlay
+    // ConfigMap: re-applying an unchanged revision must be recognized as a
+    // no-op so `distribute_overlay_configmap` can skip the write.
+    // -----------------------------------------------------------------------
+
+    fn configmap_with_revision(revision: Option<&str>) -> ConfigMap {
+        let annotations = revision.map(|rev| {
+            std::collections::BTreeMap::from([(overlay_envelope::ANNOTATION_REVISION.to_owned(), rev.to_owned())])
+        });
+        ConfigMap {
+            metadata: kube::api::ObjectMeta {
+                annotations,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn configmap_up_to_date_true_when_revision_annotation_matches() {
+        let cm = configmap_with_revision(Some("abc123"));
+        assert!(
+            configmap_up_to_date(&cm, "abc123"),
+            "identical revision must be recognized as up to date (grid#42)"
+        );
+    }
+
+    #[test]
+    fn configmap_up_to_date_false_when_revision_annotation_differs() {
+        let cm = configmap_with_revision(Some("abc123"));
+        assert!(
+            !configmap_up_to_date(&cm, "def456"),
+            "a changed revision must not be treated as up to date"
+        );
+    }
+
+    #[test]
+    fn configmap_up_to_date_false_when_no_revision_annotation_present() {
+        let cm = configmap_with_revision(None);
+        assert!(
+            !configmap_up_to_date(&cm, "abc123"),
+            "a ConfigMap with no revision annotation at all must never be treated as up to date"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // parse_crd_seeds — pure seed normalization
     // -----------------------------------------------------------------------
 
@@ -3440,6 +3835,67 @@ mod tests {
         assert!(status.rendered_revision.is_empty());
         assert!(status.distributed_revision.is_empty());
         assert_eq!(status.reason, "EmptyCandidates");
+    }
+
+    // -----------------------------------------------------------------------
+    // stable_rendered_at (grid#42: GridNetwork status resourceVersion churn)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn stable_rendered_at_reuses_prior_when_nothing_changed() {
+        let gw = make_gw_ref("gw", "grid-system");
+        let prior = rendered_overlay_status(&gw);
+
+        let rendered_at = stable_rendered_at(
+            Some(&prior),
+            &prior.distributed_revision,
+            &prior.config_map_resource_version,
+            "2026-08-12T04:37:55.488097906Z",
+        );
+
+        assert_eq!(
+            rendered_at, prior.rendered_at,
+            "identical revision and resourceVersion must not advance rendered_at, or every \
+             reconcile tick bumps GridNetwork's own resourceVersion forever (grid#42)"
+        );
+    }
+
+    #[test]
+    fn stable_rendered_at_advances_when_revision_changes() {
+        let gw = make_gw_ref("gw", "grid-system");
+        let prior = rendered_overlay_status(&gw);
+        let fresh = "2026-08-12T04:37:55.488097906Z";
+
+        let rendered_at = stable_rendered_at(Some(&prior), &"b".repeat(64), &prior.config_map_resource_version, fresh);
+
+        assert_eq!(
+            rendered_at, fresh,
+            "a genuinely new distributed revision must advance rendered_at"
+        );
+    }
+
+    #[test]
+    fn stable_rendered_at_advances_when_configmap_resource_version_changes() {
+        let gw = make_gw_ref("gw", "grid-system");
+        let prior = rendered_overlay_status(&gw);
+        let fresh = "2026-08-12T04:37:55.488097906Z";
+
+        let rendered_at = stable_rendered_at(Some(&prior), &prior.distributed_revision, "43", fresh);
+
+        assert_eq!(
+            rendered_at, fresh,
+            "a genuinely new ConfigMap resourceVersion must advance rendered_at"
+        );
+    }
+
+    #[test]
+    fn stable_rendered_at_uses_fresh_value_with_no_prior() {
+        let fresh = "2026-08-12T04:37:55.488097906Z";
+        let rendered_at = stable_rendered_at(None, &"a".repeat(64), "42", fresh);
+        assert_eq!(
+            rendered_at, fresh,
+            "first-ever distribution has no prior to compare against"
+        );
     }
 
     #[expect(
