@@ -98,6 +98,14 @@ const QUEUE_PRESSURE_THRESHOLD: f64 = 1.0;
 /// under the same synthetic load than discrete queued-request counts.
 const KV_CACHE_PRESSURE_THRESHOLD: f64 = 0.1;
 
+/// Queue-depth recovery threshold: how low `queue_size` must drop before the
+/// recovery proof attempts its verification probe.
+///
+/// Deliberately looser than `QUEUE_PRESSURE_THRESHOLD` (3.0 vs 1.0) -- recovery
+/// only needs "clearly drained," not a full return below the more sensitive
+/// phase-detection threshold. Extracted from the original inline literal.
+const RECOVERY_QUEUE_THRESHOLD: f64 = 3.0;
+
 /// Pressure generator Deployment name.
 const PRESSURE_GENERATOR_DEPLOYMENT: &str = "pressure-generator";
 
@@ -1183,10 +1191,10 @@ fn proof_recovery(context: &DemoContext, table_start: Instant) -> ProofResult {
             last_route: &last_route,
         });
 
-        if row_a.rank == 0 && epp_a.queue_size < 3.0 {
+        if row_a.rank == 0 && recovery_condition_met(context.scoring_flavor, &epp_a) {
             eprintln!(
-                "  [RECOVERY] Pool A queue drained (queue={:.1}); sending verification request",
-                epp_a.queue_size
+                "  [RECOVERY] Pool A drained (queue={:.1} kv={:.2}); sending verification request",
+                epp_a.queue_size, epp_a.kv_cache
             );
             let probe_ctx = kind_context("pool-a");
             if let Ok(resp) = send_inference_request(&probe_ctx, VCR_MODEL) {
@@ -1377,12 +1385,26 @@ struct EppMetrics {
 /// In direct-HTTP mode, uses the Kubernetes API proxy to reach the Service.
 fn scrape_epp_metrics(cluster: &str, mtls: bool) -> EppMetrics {
     let text = kubectl_exec_epp_metrics(cluster, mtls).unwrap_or_default();
+    parse_epp_metrics(&text)
+}
 
+/// Parse `EppMetrics` out of raw Prometheus text (functional core of
+/// [`scrape_epp_metrics`], separated out so metric-name-fallback behavior is
+/// unit-testable without a live EPP).
+///
+/// Both `queue_size` and `kv_cache` fall back from the `inference_pool_*`
+/// series to the `llm_d_router_epp_*` series symmetrically -- an EPP build
+/// that only exposes the latter must not silently read `kv_cache` as a
+/// permanent 0.0, which would make a `kvCachePressure` run's pressure phase
+/// never announce despite real KV pressure driving the flip.
+fn parse_epp_metrics(text: &str) -> EppMetrics {
     EppMetrics {
-        queue_size: extract_prom_value(&text, "inference_pool_average_queue_size")
-            .or_else(|| extract_prom_value(&text, "llm_d_router_epp_average_queue_size"))
+        queue_size: extract_prom_value(text, "inference_pool_average_queue_size")
+            .or_else(|| extract_prom_value(text, "llm_d_router_epp_average_queue_size"))
             .unwrap_or(0.0),
-        kv_cache: extract_prom_value(&text, "inference_pool_average_kv_cache_utilization").unwrap_or(0.0),
+        kv_cache: extract_prom_value(text, "inference_pool_average_kv_cache_utilization")
+            .or_else(|| extract_prom_value(text, "llm_d_router_epp_average_kv_cache_utilization"))
+            .unwrap_or(0.0),
     }
 }
 
@@ -1398,6 +1420,22 @@ fn pressure_phase_active(flavor: ScoringFlavor, epp: &EppMetrics) -> bool {
     match flavor {
         ScoringFlavor::QueueDepth => epp.queue_size > QUEUE_PRESSURE_THRESHOLD,
         ScoringFlavor::KvCachePressure => epp.kv_cache > KV_CACHE_PRESSURE_THRESHOLD,
+    }
+}
+
+/// Whether pool-a has drained enough, for the given scoring flavor, to
+/// attempt the recovery verification probe.
+///
+/// `QueueDepth` uses its own calibrated [`RECOVERY_QUEUE_THRESHOLD`] (looser
+/// than [`QUEUE_PRESSURE_THRESHOLD`] by design -- recovery only needs "clearly
+/// drained," not a full return below the phase-detection threshold).
+/// `KvCachePressure` has no independently-calibrated recovery threshold yet,
+/// so it reuses the inverse of [`pressure_phase_active`] rather than
+/// inventing an untested second KV constant.
+fn recovery_condition_met(flavor: ScoringFlavor, epp: &EppMetrics) -> bool {
+    match flavor {
+        ScoringFlavor::QueueDepth => epp.queue_size < RECOVERY_QUEUE_THRESHOLD,
+        ScoringFlavor::KvCachePressure => !pressure_phase_active(flavor, epp),
     }
 }
 
@@ -3787,6 +3825,72 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
             kv_cache: 0.5,
         };
         assert!(pressure_phase_active(ScoringFlavor::KvCachePressure, &high_kv));
+    }
+
+    #[test]
+    fn parse_epp_metrics_prefers_primary_metric_names() {
+        let text = "inference_pool_average_queue_size{name=\"pool-a\"} 4.5\n\
+                     inference_pool_average_kv_cache_utilization{name=\"pool-a\"} 0.35\n";
+        let epp = parse_epp_metrics(text);
+        assert_eq!(epp.queue_size, 4.5);
+        assert_eq!(epp.kv_cache, 0.35);
+    }
+
+    #[test]
+    fn parse_epp_metrics_falls_back_to_llm_d_router_metric_names() {
+        // Some EPP builds only expose the llm_d_router_* series (no
+        // inference_pool_* series at all) -- both queue_size and kv_cache
+        // must fall back symmetrically, or a kvCachePressure run against
+        // such an EPP always reads kv_cache=0.0 and never detects pressure.
+        let text = "llm_d_router_epp_average_queue_size{name=\"pool-a\"} 6.0\n\
+                     llm_d_router_epp_average_kv_cache_utilization{name=\"pool-a\"} 0.42\n";
+        let epp = parse_epp_metrics(text);
+        assert_eq!(epp.queue_size, 6.0);
+        assert_eq!(epp.kv_cache, 0.42);
+    }
+
+    #[test]
+    fn parse_epp_metrics_defaults_to_zero_when_absent() {
+        let epp = parse_epp_metrics("");
+        assert_eq!(epp.queue_size, 0.0);
+        assert_eq!(epp.kv_cache, 0.0);
+    }
+
+    #[test]
+    fn recovery_condition_met_queue_depth_flavor_uses_calibrated_threshold() {
+        let draining = EppMetrics {
+            queue_size: 2.9,
+            kv_cache: 0.9, // must be ignored for this flavor
+        };
+        assert!(recovery_condition_met(ScoringFlavor::QueueDepth, &draining));
+
+        let still_pressured = EppMetrics {
+            queue_size: 3.0,
+            kv_cache: 0.0,
+        };
+        assert!(!recovery_condition_met(ScoringFlavor::QueueDepth, &still_pressured));
+    }
+
+    #[test]
+    fn recovery_condition_met_kv_cache_flavor_uses_pressure_active_inverse() {
+        // No independently-calibrated recovery threshold exists for
+        // kv_cache yet, so recovery is defined as "pressure phase is no
+        // longer active" -- reusing the one KV threshold that IS
+        // calibrated, rather than inventing an untested second one.
+        let recovered = EppMetrics {
+            queue_size: 99.0, // must be ignored for this flavor
+            kv_cache: 0.0,
+        };
+        assert!(recovery_condition_met(ScoringFlavor::KvCachePressure, &recovered));
+
+        let still_pressured = EppMetrics {
+            queue_size: 0.0,
+            kv_cache: 0.5,
+        };
+        assert!(!recovery_condition_met(
+            ScoringFlavor::KvCachePressure,
+            &still_pressured
+        ));
     }
 
     #[test]
