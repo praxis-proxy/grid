@@ -154,6 +154,20 @@ impl StateBroadcast {
             && self.snapshot.tenant_spend.is_empty()
     }
 
+    /// Return true when this payload carries provider or capability records.
+    ///
+    /// Distinct from [`carries_grid_state`](Self::carries_grid_state): a
+    /// tenant-spend-only broadcast carries grid state (must not be treated as
+    /// metadata-only) but must **not** trigger `replace_origin_providers`,
+    /// which performs a destructive retain-then-replace of the origin's
+    /// provider set. Only a broadcast that actually carries provider or
+    /// capability data represents an authoritative provider-state sync for
+    /// its origin.
+    #[must_use]
+    fn carries_provider_state(&self) -> bool {
+        !self.snapshot.providers.is_empty() || !self.snapshot.capabilities.is_empty()
+    }
+
     /// Return true when this payload only advertises a gateway address.
     #[must_use]
     fn is_gateway_address_only(&self) -> bool {
@@ -387,8 +401,10 @@ impl OriginStateHandle {
     /// Remove all state associated with an origin and publish the result.
     pub(crate) fn remove_origin(&self, origin: &str) {
         self.lock().remove(origin);
-        self.state_tx
-            .send_modify(|snapshot| snapshot.remove_origin_providers(origin));
+        self.state_tx.send_modify(|snapshot| {
+            snapshot.remove_origin_providers(origin);
+            snapshot.remove_origin_tenant_spend(origin);
+        });
         self.gateway_addrs_tx.send_modify(|addresses| {
             addresses.remove(origin);
         });
@@ -673,10 +689,16 @@ impl foca::BroadcastHandler<NodeId> for StateBroadcastHandler {
             return Ok(None);
         }
 
+        let carries_provider_state = broadcast.carries_provider_state();
         self.state_tx.send_modify(|snap| {
             snap.capabilities.merge(&broadcast.snapshot.capabilities);
-            snap.merge_tenant_spend(&broadcast.snapshot.tenant_spend);
-            snap.replace_origin_providers(&broadcast.origin_site, broadcast.revision, &broadcast.snapshot);
+            snap.merge_tenant_spend_from_origin(&broadcast.origin_site, &broadcast.snapshot.tenant_spend);
+            // A spend-only broadcast must not run the destructive
+            // origin-provider replace below — it doesn't carry an
+            // authoritative provider list for this cycle at all.
+            if carries_provider_state {
+                snap.replace_origin_providers(&broadcast.origin_site, broadcast.revision, &broadcast.snapshot);
+            }
         });
         self.retained
             .lock()
@@ -693,7 +715,7 @@ impl foca::BroadcastHandler<NodeId> for StateBroadcastHandler {
 
 #[cfg(test)]
 mod tests {
-    use crdt::{Capability, ProviderMetricsSnapshot, ProviderPhase, ProviderState};
+    use crdt::{Capability, GCounter, ProviderMetricsSnapshot, ProviderPhase, ProviderState};
     use foca::{BroadcastHandler as _, Invalidates as _};
 
     use super::*;
@@ -801,6 +823,72 @@ mod tests {
             500,
             "a broadcast with only tenant_spend set (no providers/capabilities) must still be merged, \
              not dropped as metadata-only"
+        );
+    }
+
+    #[test]
+    fn receive_item_spend_only_broadcast_does_not_wipe_origins_existing_providers() {
+        // Bugbot regression: a later spend-only broadcast from an origin that
+        // already has real providers must not erase those providers.
+        // `replace_origin_providers` performs a destructive retain-then-replace
+        // for the origin's provider set; it must only run when the broadcast
+        // actually carries provider/capability data, not merely because
+        // `carries_grid_state()` is true (which tenant_spend alone satisfies).
+        let mut handler = StateBroadcastHandler::new("site-local".to_owned());
+        let full = StateBroadcast::new("site-p".to_owned(), 1, snapshot("site-p", 1, 0.2), None);
+        receive(&mut handler, &full);
+        assert!(
+            handler.snapshot().provider("net", "site-p", "provider").is_some(),
+            "precondition: origin's provider must be present after the first broadcast"
+        );
+
+        let mut spend_only = GridStateSnapshot::new("site-p".to_owned());
+        spend_only.increment_tenant_spend("tenant-x", 500);
+        let spend_broadcast = StateBroadcast::new("site-p".to_owned(), 2, spend_only, None);
+        receive(&mut handler, &spend_broadcast);
+
+        assert!(
+            handler.snapshot().provider("net", "site-p", "provider").is_some(),
+            "a spend-only broadcast from the same origin must not wipe that origin's provider records"
+        );
+        assert_eq!(
+            handler
+                .snapshot()
+                .tenant_spend
+                .get("tenant-x")
+                .unwrap_or_else(|| std::process::abort())
+                .total(),
+            500,
+            "the spend-only broadcast's tenant_spend must still be merged"
+        );
+    }
+
+    #[test]
+    fn origin_state_handle_remove_origin_also_clears_that_origins_tenant_spend() {
+        // Security (unbounded growth): eviction must strip the evicted
+        // origin's tenant_spend contribution too, mirroring provider cleanup,
+        // so a churning/attacking origin's slots don't linger forever.
+        let (mut handler, control) = StateBroadcastHandler::with_capacity("site-local".to_owned(), 8);
+        let mut snap = GridStateSnapshot::new("site-p".to_owned());
+        snap.increment_tenant_spend("tenant-x", 500);
+        let broadcast = StateBroadcast::new("site-p".to_owned(), 1, snap, None);
+        receive(&mut handler, &broadcast);
+        assert_eq!(
+            control
+                .state_tx
+                .borrow()
+                .tenant_spend
+                .get("tenant-x")
+                .map(GCounter::total),
+            Some(500),
+            "precondition: tenant spend merged before eviction"
+        );
+
+        control.remove_origin("site-p");
+
+        assert!(
+            !control.state_tx.borrow().tenant_spend.contains_key("tenant-x"),
+            "evicting the only contributing origin must prune the tenant's spend entry entirely"
         );
     }
 

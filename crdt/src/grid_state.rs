@@ -22,6 +22,15 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::{GCounter, OrSet};
+
+/// Hard bound on the number of distinct `tenant_id`s tracked in
+/// [`GridStateSnapshot::tenant_spend`].
+///
+/// Bounds memory growth from gossip: a malicious or buggy origin could
+/// otherwise flood arbitrary `tenant_id` keys indefinitely. Mirrors the
+/// `max_origins` bound already used for retained-origin maps in `swim`.
+pub const MAX_TRACKED_TENANTS: usize = 1_024;
+
 // ---------------------------------------------------------------------------
 // Access policy
 // ---------------------------------------------------------------------------
@@ -228,6 +237,54 @@ impl GridStateSnapshot {
                 .or_insert_with(|| GCounter::new(self.site_id.clone()))
                 .merge(counter);
         }
+    }
+
+    /// Merge tenant spend from a single wire broadcast, trusting only the
+    /// slot attributable to its claimed `origin_site`.
+    ///
+    /// This is the trust boundary for gossip ingest (called from
+    /// `StateBroadcastHandler::receive_item`). Unlike [`merge_tenant_spend`]
+    /// — used for trusted full-snapshot-to-full-snapshot merges where every
+    /// slot is already locally attested — a single broadcast should only
+    /// ever carry its own origin's contribution. Any other slot present in
+    /// the payload is dropped rather than merged, so a compromised or buggy
+    /// peer cannot forge another site's recorded spend by embedding extra
+    /// slots in its own broadcast.
+    ///
+    /// Also enforces [`MAX_TRACKED_TENANTS`]: once that many distinct
+    /// `tenant_id`s are tracked, brand-new `tenant_id`s are silently refused
+    /// (already-tracked tenants keep accepting updates) to bound memory
+    /// growth from gossip carrying arbitrary attacker-supplied `tenant_id`s.
+    ///
+    /// [`merge_tenant_spend`]: Self::merge_tenant_spend
+    pub fn merge_tenant_spend_from_origin(&mut self, origin_site: &str, other: &BTreeMap<String, GCounter>) {
+        for (tenant_id, counter) in other {
+            let origin_only = counter.retain_origin(origin_site);
+            if origin_only.total() == 0 {
+                continue;
+            }
+            if !self.tenant_spend.contains_key(tenant_id) && self.tenant_spend.len() >= MAX_TRACKED_TENANTS {
+                continue;
+            }
+            self.tenant_spend
+                .entry(tenant_id.clone())
+                .or_insert_with(|| GCounter::new(self.site_id.clone()))
+                .merge(&origin_only);
+        }
+    }
+
+    /// Remove `origin_site`'s contribution from every tenant's spend counter.
+    ///
+    /// Used by the SWIM runtime's dead-member eviction sweep (mirrors
+    /// [`remove_origin_providers`](Self::remove_origin_providers)) so an
+    /// evicted site's slot doesn't linger forever. A tenant whose spend
+    /// counter becomes entirely empty as a result is pruned from the map, to
+    /// bound its long-term growth as origins churn.
+    pub fn remove_origin_tenant_spend(&mut self, origin_site: &str) {
+        self.tenant_spend.retain(|_, counter| {
+            counter.remove_slot(origin_site);
+            counter.total() > 0
+        });
     }
 
     /// Increment this site's local slot of a tenant's spend counter.
@@ -763,6 +820,213 @@ mod tests {
         assert!(
             restored.tenant_spend.is_empty(),
             "missing tenant_spend field must default to an empty map, not fail to deserialize"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // merge_tenant_spend_from_origin: wire-ingest trust boundary (security)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn merge_tenant_spend_from_origin_accepts_the_claimed_origins_own_slot() {
+        let mut local = GridStateSnapshot::new("site-local".to_owned());
+        let mut incoming = BTreeMap::new();
+        let mut counter = GCounter::new("site-p".to_owned());
+        counter.increment(500);
+        incoming.insert("tenant-x".to_owned(), counter);
+
+        local.merge_tenant_spend_from_origin("site-p", &incoming);
+
+        assert_eq!(
+            local
+                .tenant_spend
+                .get("tenant-x")
+                .unwrap_or_else(|| std::process::abort())
+                .total(),
+            500,
+            "the claimed origin's own slot must be merged normally"
+        );
+    }
+
+    #[test]
+    fn merge_tenant_spend_from_origin_drops_forged_foreign_slots() {
+        // Security: a broadcast claiming origin "site-a" must not be able to
+        // smuggle in an inflated slot for "site-b" and have it accepted as
+        // site-b's real contribution — that would let one compromised/buggy
+        // peer forge another site's recorded spend mesh-wide.
+        let mut local = GridStateSnapshot::new("site-local".to_owned());
+        let mut forged = BTreeMap::new();
+        let mut counter = GCounter::new("site-a".to_owned());
+        counter.increment(10); // site-a's genuine contribution
+        let mut fake_site_b = GCounter::new("site-b".to_owned());
+        fake_site_b.increment(u64::MAX);
+        counter.merge(&fake_site_b); // origin locally folds in a forged foreign slot
+        forged.insert("tenant-x".to_owned(), counter);
+
+        local.merge_tenant_spend_from_origin("site-a", &forged);
+
+        assert_eq!(
+            local
+                .tenant_spend
+                .get("tenant-x")
+                .unwrap_or_else(|| std::process::abort())
+                .total(),
+            10,
+            "only the claimed origin's own slot must be accepted; the forged site-b slot must be dropped"
+        );
+    }
+
+    #[test]
+    fn merge_tenant_spend_from_origin_ignores_tenant_the_claimed_origin_never_contributed_to() {
+        // The incoming counter carries only a foreign slot (no slot at all
+        // for the claimed origin) — after stripping the forged foreign slot
+        // there is nothing genuine left to merge, so the tenant must not be
+        // created locally at all (not even as a zero entry).
+        let mut local = GridStateSnapshot::new("site-local".to_owned());
+        let mut forged = BTreeMap::new();
+        let mut foreign_only = GCounter::new("site-b".to_owned());
+        foreign_only.increment(999);
+        forged.insert("tenant-x".to_owned(), foreign_only);
+
+        local.merge_tenant_spend_from_origin("site-a", &forged);
+
+        assert!(
+            !local.tenant_spend.contains_key("tenant-x"),
+            "a tenant with zero genuine contribution from the claimed origin must not be created"
+        );
+    }
+
+    #[test]
+    fn merge_tenant_spend_from_origin_repeated_calls_are_idempotent() {
+        let mut local = GridStateSnapshot::new("site-local".to_owned());
+        let mut incoming = BTreeMap::new();
+        let mut counter = GCounter::new("site-p".to_owned());
+        counter.increment(500);
+        incoming.insert("tenant-x".to_owned(), counter);
+
+        local.merge_tenant_spend_from_origin("site-p", &incoming);
+        local.merge_tenant_spend_from_origin("site-p", &incoming);
+
+        assert_eq!(
+            local
+                .tenant_spend
+                .get("tenant-x")
+                .unwrap_or_else(|| std::process::abort())
+                .total(),
+            500,
+            "re-merging the same origin broadcast must not double-count (max-per-slot semantics)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // remove_origin_tenant_spend + tenant-count bound (security: unbounded growth)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn remove_origin_tenant_spend_strips_only_that_origins_slot() {
+        let mut snap = GridStateSnapshot::new("site-local".to_owned());
+        let mut incoming_a = BTreeMap::new();
+        let mut counter_a = GCounter::new("site-a".to_owned());
+        counter_a.increment(100);
+        incoming_a.insert("tenant-x".to_owned(), counter_a);
+        snap.merge_tenant_spend_from_origin("site-a", &incoming_a);
+
+        let mut incoming_b = BTreeMap::new();
+        let mut counter_b = GCounter::new("site-b".to_owned());
+        counter_b.increment(200);
+        incoming_b.insert("tenant-x".to_owned(), counter_b);
+        snap.merge_tenant_spend_from_origin("site-b", &incoming_b);
+
+        snap.remove_origin_tenant_spend("site-a");
+
+        assert_eq!(
+            snap.tenant_spend
+                .get("tenant-x")
+                .unwrap_or_else(|| std::process::abort())
+                .total(),
+            200,
+            "evicting site-a must remove only its own contribution, leaving site-b's spend intact"
+        );
+    }
+
+    #[test]
+    fn remove_origin_tenant_spend_prunes_tenant_entry_once_fully_empty() {
+        let mut snap = GridStateSnapshot::new("site-local".to_owned());
+        let mut incoming = BTreeMap::new();
+        let mut counter = GCounter::new("site-a".to_owned());
+        counter.increment(100);
+        incoming.insert("tenant-x".to_owned(), counter);
+        snap.merge_tenant_spend_from_origin("site-a", &incoming);
+
+        snap.remove_origin_tenant_spend("site-a");
+
+        assert!(
+            !snap.tenant_spend.contains_key("tenant-x"),
+            "a tenant with no remaining site contributions must be pruned entirely, not left as a zero entry"
+        );
+    }
+
+    #[test]
+    fn merge_tenant_spend_from_origin_refuses_new_tenants_once_at_capacity() {
+        // Security: bound the number of distinct tenant_id keys accepted from
+        // gossip so a malicious/buggy origin flooding arbitrary tenant_ids
+        // cannot grow tenant_spend without bound. Already-tracked tenants may
+        // still accumulate; only brand-new tenant_ids are refused at capacity.
+        let mut snap = GridStateSnapshot::new("site-local".to_owned());
+        for i in 0..MAX_TRACKED_TENANTS {
+            let mut incoming = BTreeMap::new();
+            let mut counter = GCounter::new("site-a".to_owned());
+            counter.increment(1);
+            incoming.insert(format!("tenant-{i}"), counter);
+            snap.merge_tenant_spend_from_origin("site-a", &incoming);
+        }
+        assert_eq!(
+            snap.tenant_spend.len(),
+            MAX_TRACKED_TENANTS,
+            "precondition: at capacity"
+        );
+
+        let mut overflow = BTreeMap::new();
+        let mut counter = GCounter::new("site-a".to_owned());
+        counter.increment(1);
+        overflow.insert("tenant-overflow".to_owned(), counter);
+        snap.merge_tenant_spend_from_origin("site-a", &overflow);
+
+        assert_eq!(
+            snap.tenant_spend.len(),
+            MAX_TRACKED_TENANTS,
+            "a brand-new tenant_id must be refused once the map is at its hard bound"
+        );
+        assert!(
+            !snap.tenant_spend.contains_key("tenant-overflow"),
+            "the refused tenant_id must not be present at all"
+        );
+    }
+
+    #[test]
+    fn merge_tenant_spend_from_origin_still_updates_already_tracked_tenant_at_capacity() {
+        let mut snap = GridStateSnapshot::new("site-local".to_owned());
+        for i in 0..MAX_TRACKED_TENANTS {
+            let mut incoming = BTreeMap::new();
+            let mut counter = GCounter::new("site-a".to_owned());
+            counter.increment(1);
+            incoming.insert(format!("tenant-{i}"), counter);
+            snap.merge_tenant_spend_from_origin("site-a", &incoming);
+        }
+
+        let mut more = BTreeMap::new();
+        let mut counter = GCounter::new("site-a".to_owned());
+        counter.increment(99);
+        more.insert("tenant-0".to_owned(), counter);
+        snap.merge_tenant_spend_from_origin("site-a", &more);
+
+        assert_eq!(
+            snap.tenant_spend
+                .get("tenant-0")
+                .unwrap_or_else(|| std::process::abort())
+                .total(),
+            99,
+            "an already-tracked tenant must still accept updates while the map is at capacity"
         );
     }
 }
