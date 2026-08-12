@@ -21,7 +21,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::OrSet;
+use crate::{GCounter, OrSet};
 // ---------------------------------------------------------------------------
 // Access policy
 // ---------------------------------------------------------------------------
@@ -163,6 +163,20 @@ pub struct GridStateSnapshot {
 
     /// Provider records keyed by a stable `network_id/site_id/provider_id` string.
     pub providers: BTreeMap<String, ProviderState>,
+
+    /// Per-tenant cumulative spend, keyed by tenant identifier.
+    ///
+    /// Each [`GCounter`] total is denominated in **cents** (`u64`) to keep
+    /// the CRDT free of float-merge precision concerns; consumers convert to
+    /// USD at the edge (see `operator::crd::grid_network::spend_ratio`).
+    /// This is a cross-site *visibility* signal only — Grid does not enforce
+    /// budget limits; that is a gateway-side policy-filter concern.
+    ///
+    /// `#[serde(default)]` so snapshots serialized before this field existed
+    /// (or peers running an older build) deserialize to an empty map instead
+    /// of failing.
+    #[serde(default)]
+    pub tenant_spend: BTreeMap<String, GCounter>,
 }
 
 impl GridStateSnapshot {
@@ -172,6 +186,7 @@ impl GridStateSnapshot {
         Self {
             capabilities: OrSet::new(site_id.clone()),
             providers: BTreeMap::new(),
+            tenant_spend: BTreeMap::new(),
             site_id,
         }
     }
@@ -198,6 +213,32 @@ impl GridStateSnapshot {
         for provider in other.providers.values() {
             self.upsert_provider(provider.clone());
         }
+        self.merge_tenant_spend(&other.tenant_spend);
+    }
+
+    /// Merge tenant spend counters from another snapshot's `tenant_spend` map.
+    ///
+    /// Mirrors the add-wins semantics of `capabilities.merge`: each tenant's
+    /// [`GCounter`] merge takes the max of every site's slot, so this is safe
+    /// to call repeatedly, out of order, or with disjoint tenant sets.
+    pub fn merge_tenant_spend(&mut self, other: &BTreeMap<String, GCounter>) {
+        for (tenant_id, counter) in other {
+            self.tenant_spend
+                .entry(tenant_id.clone())
+                .or_insert_with(|| GCounter::new(self.site_id.clone()))
+                .merge(counter);
+        }
+    }
+
+    /// Increment this site's local slot of a tenant's spend counter.
+    ///
+    /// Creates the tenant's counter if this is the first spend recorded for
+    /// it. `amount_cents` is in cents (see [`GridStateSnapshot::tenant_spend`]).
+    pub fn increment_tenant_spend(&mut self, tenant_id: &str, amount_cents: u64) {
+        self.tenant_spend
+            .entry(tenant_id.to_owned())
+            .or_insert_with(|| GCounter::new(self.site_id.clone()))
+            .increment(amount_cents);
     }
 
     /// Replace provider records owned by one authoritative origin snapshot.
@@ -553,6 +594,175 @@ mod tests {
         assert!(
             snap.provider("net", "site-b", "p1").is_some(),
             "other origins' providers must be preserved"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // tenant_spend tests (C1-C8)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn new_snapshot_has_empty_tenant_spend() {
+        let snap = GridStateSnapshot::new("site-p".to_owned());
+        assert!(
+            snap.tenant_spend.is_empty(),
+            "new snapshot must start with no tenant spend"
+        );
+    }
+
+    #[test]
+    fn merge_adds_tenant_present_only_in_other() {
+        let mut a = GridStateSnapshot::new("site-a".to_owned());
+        let mut b = GridStateSnapshot::new("site-b".to_owned());
+        b.increment_tenant_spend("tenant-x", 500);
+
+        a.merge(&b);
+
+        assert_eq!(
+            a.tenant_spend
+                .get("tenant-x")
+                .unwrap_or_else(|| std::process::abort())
+                .total(),
+            500,
+            "tenant absent from self before merge must be added from other"
+        );
+    }
+
+    #[test]
+    fn merge_tenant_spend_takes_per_site_max() {
+        let mut a = GridStateSnapshot::new("site-a".to_owned());
+        a.increment_tenant_spend("tenant-x", 100);
+        let mut b = GridStateSnapshot::new("site-b".to_owned());
+        b.increment_tenant_spend("tenant-x", 200);
+
+        a.merge(&b);
+
+        assert_eq!(
+            a.tenant_spend
+                .get("tenant-x")
+                .unwrap_or_else(|| std::process::abort())
+                .total(),
+            300,
+            "per-site slots must sum via GCounter's max-per-slot merge rule"
+        );
+    }
+
+    #[test]
+    fn merge_tenant_spend_is_idempotent() {
+        let mut a = GridStateSnapshot::new("site-a".to_owned());
+        a.increment_tenant_spend("tenant-x", 100);
+        let duplicate = a.clone();
+
+        a.merge(&duplicate);
+
+        assert_eq!(
+            a.tenant_spend
+                .get("tenant-x")
+                .unwrap_or_else(|| std::process::abort())
+                .total(),
+            100,
+            "merging a duplicate snapshot must not double-count tenant spend"
+        );
+    }
+
+    #[test]
+    fn merge_tenant_spend_is_commutative() {
+        let mut a = GridStateSnapshot::new("site-a".to_owned());
+        a.increment_tenant_spend("tenant-x", 100);
+        let mut b = GridStateSnapshot::new("site-b".to_owned());
+        b.increment_tenant_spend("tenant-x", 200);
+
+        let mut ab = a.clone();
+        ab.merge(&b);
+        let mut ba = b;
+        ba.merge(&a);
+
+        assert_eq!(
+            ab.tenant_spend
+                .get("tenant-x")
+                .unwrap_or_else(|| std::process::abort())
+                .total(),
+            ba.tenant_spend
+                .get("tenant-x")
+                .unwrap_or_else(|| std::process::abort())
+                .total(),
+            "tenant spend merge must be commutative"
+        );
+    }
+
+    #[test]
+    fn merge_tenant_spend_is_associative() {
+        let mut a = GridStateSnapshot::new("site-a".to_owned());
+        a.increment_tenant_spend("tenant-x", 100);
+        let mut b = GridStateSnapshot::new("site-b".to_owned());
+        b.increment_tenant_spend("tenant-x", 200);
+        let mut c = GridStateSnapshot::new("site-c".to_owned());
+        c.increment_tenant_spend("tenant-x", 300);
+
+        let mut ab_then_c = a.clone();
+        ab_then_c.merge(&b);
+        ab_then_c.merge(&c);
+
+        let mut bc = b;
+        bc.merge(&c);
+        let mut a_then_bc = a;
+        a_then_bc.merge(&bc);
+
+        assert_eq!(
+            ab_then_c
+                .tenant_spend
+                .get("tenant-x")
+                .unwrap_or_else(|| std::process::abort())
+                .total(),
+            a_then_bc
+                .tenant_spend
+                .get("tenant-x")
+                .unwrap_or_else(|| std::process::abort())
+                .total(),
+            "tenant spend merge must be associative"
+        );
+    }
+
+    #[test]
+    fn tenant_spend_survives_bincode_round_trip() {
+        let mut snap = GridStateSnapshot::new("site-p".to_owned());
+        snap.increment_tenant_spend("tenant-x", 4200);
+
+        let bytes =
+            bincode::serde::encode_to_vec(&snap, bincode::config::standard()).unwrap_or_else(|_| std::process::abort());
+        let (restored, _len): (GridStateSnapshot, usize) =
+            bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
+                .unwrap_or_else(|_| std::process::abort());
+
+        assert_eq!(
+            restored
+                .tenant_spend
+                .get("tenant-x")
+                .unwrap_or_else(|| std::process::abort())
+                .total(),
+            4200,
+            "tenant_spend must survive bincode round-trip"
+        );
+    }
+
+    #[test]
+    fn tenant_spend_json_decode_missing_field_defaults_to_empty() {
+        // Simulates a peer running an older build whose wire payload predates
+        // this field: start from a real serialized snapshot (avoiding any
+        // guesswork about OrSet's/ProviderState's internal JSON shape), strip
+        // the key, and confirm deserialization still succeeds and defaults.
+        let mut snap = GridStateSnapshot::new("site-p".to_owned());
+        snap.increment_tenant_spend("tenant-x", 100);
+        let mut json = serde_json::to_value(&snap).unwrap_or_else(|_| std::process::abort());
+        json.as_object_mut()
+            .unwrap_or_else(|| std::process::abort())
+            .remove("tenant_spend");
+
+        let restored: GridStateSnapshot = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
+
+        assert!(
+            restored.tenant_spend.is_empty(),
+            "missing tenant_spend field must default to an empty map, not fail to deserialize"
         );
     }
 }

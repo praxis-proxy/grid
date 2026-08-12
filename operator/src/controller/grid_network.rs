@@ -27,7 +27,7 @@ use crate::{
     crd::{
         grid_network::{
             ConsumerConfig, ConsumerConfigPhase, ConsumerConfigStatus, GatewayRef, GridNetwork, GridNetworkPhase,
-            GridNetworkStatus, OverlayPhase, OverlayRevisionStatus, TransportMode,
+            GridNetworkStatus, OverlayPhase, OverlayRevisionStatus, TenantBudgetStatus, TransportMode,
         },
         grid_site::{GridSite, GridSitePhase, GridSiteStatus},
         inference_provider::InferenceProvider,
@@ -303,6 +303,18 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
         0
     };
 
+    // Resolve per-tenant budget status from the merged CRDT spend state, if any.
+    // Empty tenant_spend (SWIM disabled, or no spend broadcast received yet) is
+    // indistinguishable here from "no spend recorded" — resolve_budget_statuses
+    // still emits a zero-spend entry for every policy-declared tenant.
+    let tenant_spend = ctx
+        .swim
+        .as_ref()
+        .map(|swim| swim.state_snapshot().tenant_spend)
+        .unwrap_or_default();
+    let budget_statuses =
+        crate::crd::grid_network::resolve_budget_statuses(network.spec.budget_policy.as_ref(), &tenant_spend);
+
     update_status(
         &network,
         client,
@@ -312,6 +324,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
         distributed_provider_count,
         consumer_config_statuses,
         overlay_statuses,
+        budget_statuses,
     )
     .await?;
 
@@ -1498,6 +1511,9 @@ pub(crate) fn apply_swim_staleness_override(
 /// CRDT state broadcasts.  Both are `0` when SWIM is disabled.
 /// `consumer_config_statuses` holds per-gateway render/apply outcomes for
 /// gateways with `consumerConfig.enabled: true`; empty when no gateways opted in.
+/// `budget_statuses` holds per-tenant spend status derived from
+/// `spec.budgetPolicy` and merged CRDT spend state; empty when `budgetPolicy`
+/// is absent.
 ///
 /// [`Alive`]: MemberStatus::Alive
 #[expect(
@@ -1513,6 +1529,7 @@ async fn update_status(
     distributed_provider_count: u32,
     consumer_config_statuses: Vec<ConsumerConfigStatus>,
     overlay_statuses: Vec<OverlayRevisionStatus>,
+    budget_statuses: Vec<TenantBudgetStatus>,
 ) -> Result<(), OperatorError> {
     let name = grid_network_name(network)?;
 
@@ -1527,6 +1544,7 @@ async fn update_status(
         phase: phase.clone(),
         consumer_config_status: consumer_config_statuses,
         overlay_status: overlay_statuses,
+        budget_status: budget_statuses,
     };
 
     if !grid_network_status_needs_update(network.status.as_ref(), &status) {
@@ -3027,6 +3045,7 @@ mod tests {
             phase: GridNetworkPhase::Active,
             consumer_config_status: Vec::new(),
             overlay_status: Vec::new(),
+            budget_status: Vec::new(),
         };
         assert!(!grid_network_status_needs_update(Some(&baseline), &baseline));
 

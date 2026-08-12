@@ -149,7 +149,9 @@ impl StateBroadcast {
     /// (gateway address and/or site cert PEM) with no CRDT state.
     #[must_use]
     fn is_metadata_only(&self) -> bool {
-        self.snapshot.providers.is_empty() && self.snapshot.capabilities.is_empty()
+        self.snapshot.providers.is_empty()
+            && self.snapshot.capabilities.is_empty()
+            && self.snapshot.tenant_spend.is_empty()
     }
 
     /// Return true when this payload only advertises a gateway address.
@@ -673,6 +675,7 @@ impl foca::BroadcastHandler<NodeId> for StateBroadcastHandler {
 
         self.state_tx.send_modify(|snap| {
             snap.capabilities.merge(&broadcast.snapshot.capabilities);
+            snap.merge_tenant_spend(&broadcast.snapshot.tenant_spend);
             snap.replace_origin_providers(&broadcast.origin_site, broadcast.revision, &broadcast.snapshot);
         });
         self.retained
@@ -759,6 +762,45 @@ mod tests {
         assert!(
             !metadata.carries_grid_state(),
             "metadata uses its existing independent refresh path"
+        );
+    }
+
+    #[test]
+    fn tenant_spend_only_snapshot_carries_grid_state() {
+        // A broadcast can carry only a tenant_spend increment (no provider or
+        // capability change this gossip cycle) — this must NOT be classified
+        // as metadata-only, or receive_item's merge path is skipped entirely
+        // (regression: `is_metadata_only` originally only checked
+        // providers/capabilities, silently dropping spend-only broadcasts).
+        let mut snap = GridStateSnapshot::new("site-p".to_owned());
+        snap.increment_tenant_spend("tenant-x", 500);
+        let broadcast = StateBroadcast::new("site-p".to_owned(), 1, snap, None);
+
+        assert!(
+            broadcast.carries_grid_state(),
+            "tenant_spend-only snapshot must be treated as carrying grid state, not metadata-only"
+        );
+    }
+
+    #[test]
+    fn receive_item_merges_tenant_spend_only_broadcast_with_no_providers_or_capabilities() {
+        let mut handler = StateBroadcastHandler::new("site-local".to_owned());
+        let mut snap = GridStateSnapshot::new("site-p".to_owned());
+        snap.increment_tenant_spend("tenant-x", 500);
+        let broadcast = StateBroadcast::new("site-p".to_owned(), 1, snap, None);
+
+        receive(&mut handler, &broadcast);
+
+        assert_eq!(
+            handler
+                .snapshot()
+                .tenant_spend
+                .get("tenant-x")
+                .unwrap_or_else(|| std::process::abort())
+                .total(),
+            500,
+            "a broadcast with only tenant_spend set (no providers/capabilities) must still be merged, \
+             not dropped as metadata-only"
         );
     }
 
@@ -1278,6 +1320,55 @@ mod tests {
             Some("10.0.0.2:19080")
         );
         assert_eq!(handler.cert_pem_for_site("site-p").as_deref(), Some(cert));
+    }
+
+    // -----------------------------------------------------------------------
+    // tenant_spend broadcast wiring tests (F1-F2)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn receive_item_merges_tenant_spend_from_broadcast() {
+        let mut handler = StateBroadcastHandler::new("site-local".to_owned());
+        let mut snap = snapshot("site-p", 1, 0.2);
+        snap.increment_tenant_spend("tenant-x", 500);
+        let broadcast = StateBroadcast::new("site-p".to_owned(), 1, snap, None);
+
+        receive(&mut handler, &broadcast);
+
+        let merged = handler.snapshot();
+        assert_eq!(
+            merged
+                .tenant_spend
+                .get("tenant-x")
+                .unwrap_or_else(|| std::process::abort())
+                .total(),
+            500,
+            "receive_item must merge the broadcast's tenant_spend into the handler's snapshot"
+        );
+    }
+
+    #[test]
+    fn receive_item_sums_tenant_spend_across_origin_sites() {
+        let mut handler = StateBroadcastHandler::new("site-local".to_owned());
+
+        let mut snap_a = snapshot("site-a", 1, 0.2);
+        snap_a.increment_tenant_spend("tenant-x", 300);
+        receive(&mut handler, &StateBroadcast::new("site-a".to_owned(), 1, snap_a, None));
+
+        let mut snap_b = snapshot("site-b", 1, 0.2);
+        snap_b.increment_tenant_spend("tenant-x", 700);
+        receive(&mut handler, &StateBroadcast::new("site-b".to_owned(), 1, snap_b, None));
+
+        let merged = handler.snapshot();
+        assert_eq!(
+            merged
+                .tenant_spend
+                .get("tenant-x")
+                .unwrap_or_else(|| std::process::abort())
+                .total(),
+            1000,
+            "tenant spend from two different origin sites must sum, proving cross-site convergence at the wiring layer"
+        );
     }
 
     #[test]

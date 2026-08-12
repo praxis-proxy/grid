@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 /// c.increment(10);
 /// assert_eq!(c.total(), 10);
 /// ```
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct GCounter {
     /// Site identifier for this replica.
     site_id: String,
