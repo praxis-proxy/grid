@@ -34,6 +34,42 @@ spec:
                 Defines the grid's seed peers, gateway associations, SWIM
                 tuning, and TLS secret references.
               properties:
+                budgetPolicy:
+                  description: |-
+                    Budget policy configuration for per-tenant spend tracking.
+
+                    Selects which tenants Grid tracks cumulative spend for. See
+                    [`BudgetPolicyConfig`] for what this does and does not do.
+
+                    **Default (absent):** no tenants are tracked; `budgetStatus` is
+                    always empty.
+                  nullable: true
+                  properties:
+                    tenants:
+                      default: []
+                      description: Per-tenant budget caps.
+                      items:
+                        description: Per-tenant budget cap declaration.
+                        properties:
+                          capUsd:
+                            description: |-
+                              Maximum cumulative spend in USD before this tenant is considered over budget.
+
+                              **Minimum value:** `0`. The generated CRD schema rejects negative caps;
+                              [`validate_budget_policy`] additionally rejects `NaN`/infinite values
+                              that the schema's numeric minimum does not catch.
+                            format: double
+                            minimum: 0.0
+                            type: number
+                          tenantId:
+                            description: Tenant identifier. Must be non-empty and unique within the policy.
+                            type: string
+                        required:
+                          - capUsd
+                          - tenantId
+                        type: object
+                      type: array
+                  type: object
                 gatewayRefs:
                   default: []
                   description: References to Praxis Gateways that participate in this grid.
@@ -416,6 +452,48 @@ spec:
               description: Observed status of a [`GridNetwork`].
               nullable: true
               properties:
+                budgetStatus:
+                  description: |-
+                    Per-tenant budget status, derived from `spec.budgetPolicy` and merged
+                    cross-site CRDT spend state.
+
+                    Empty when `budgetPolicy` is absent. This is a status signal only —
+                    Grid does not enforce budget limits itself (see [`BudgetPolicyConfig`]).
+                  items:
+                    description: |-
+                      Per-tenant budget status derived from policy + merged CRDT spend state.
+
+                      Populated in [`GridNetworkStatus::budget_status`] for every tenant
+                      declared in `spec.budgetPolicy`, regardless of whether spend has been
+                      recorded for that tenant yet. This is a status signal only — Grid does
+                      not enforce budget limits (see [`BudgetPolicyConfig`] doc).
+                    properties:
+                      capUsd:
+                        description: Budget cap for this tenant, in USD, copied from `spec.budgetPolicy`.
+                        format: double
+                        type: number
+                      spendRatio:
+                        description: '`spend_usd / cap_usd`, clamped to `0.0..=1.0`. See [`spend_ratio`].'
+                        format: double
+                        type: number
+                      spendUsd:
+                        description: |-
+                          Cumulative spend observed for this tenant, in USD.
+
+                          Converged across all sites that have merged CRDT state for this
+                          tenant; may lag briefly during a partition (see [`GCounter`]).
+                        format: double
+                        type: number
+                      tenantId:
+                        description: Tenant identifier, matching `spec.budgetPolicy.tenants[].tenantId`.
+                        type: string
+                    required:
+                      - capUsd
+                      - spendRatio
+                      - spendUsd
+                      - tenantId
+                    type: object
+                  type: array
                 connectedSites:
                   default: 0
                   description: Number of connected (Active) sites.
