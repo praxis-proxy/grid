@@ -29,6 +29,10 @@ spec:
   metricsRefreshInterval: {{ . | quote }}
   {{- end }}
   {{- end }}
+  {{- with .Values.gridNetwork.budgetPolicy }}
+  budgetPolicy:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
   {{- with .Values.gridNetwork.swim }}
   swim:
     {{- toYaml . | nindent 4 }}
