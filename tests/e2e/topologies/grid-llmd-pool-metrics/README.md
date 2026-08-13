@@ -17,11 +17,23 @@ filters used by this topology. For local development, set
 [`provider_route`](https://github.com/praxis-proxy/ai/pull/386) and set
 `GRID_XTASK_IMAGE_PULL_POLICY=Never` explicitly.
 
+### Flags
+
+- `--metrics-mtls` — protect EPP metrics scraping with an nginx mTLS proxy
+  instead of scraping directly over HTTP.
+- `--kv-cache` — drive routing off llm-d's kv-cache-utilization signal
+  (`GridNetwork.spec.scoringPolicy.strategy: kvCachePressure`) instead of the
+  default queue-depth signal (`strategy: queueDepth`). Both signals are
+  always shown in the live scorecard; this flag only changes which one
+  actually produces the `score`/`rank` that drives the A→B failover.
+
 ## What this tests
 
 - Two-cluster llm-d pool topology with EPP telemetry
 - Score-first routing based on live queue-depth and KV-cache utilization
-- A-to-B-to-A capacity failover under simulated pressure ramp
+- A-to-B-to-A capacity failover under simulated pressure ramp, with either
+  the queue-depth (default) or kv-cache-pressure (`--kv-cache`) scoring
+  strategy
 - mTLS metrics scraping through the nginx TLS proxy
 - Provider boundary and credential isolation
 

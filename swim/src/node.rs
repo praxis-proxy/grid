@@ -707,6 +707,87 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Tenant budget spend convergence (grid#40 AC3)
+    // -----------------------------------------------------------------------
+
+    /// Compute a spend increment in cents from a real product cost field
+    /// ([`scoring::BackendConfig::cost_per_1k_input`], mirrored here without a
+    /// crate dependency to keep `swim` free of the `scoring` crate) and a
+    /// request's input token count — the same unit conversion
+    /// `operator::crd::grid_network::spend_ratio` expects on the read side.
+    fn cost_cents_for_request(cost_per_1k_input_usd: f64, input_tokens: u64) -> u64 {
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "test-only cost simulation, not the production conversion path"
+        )]
+        let tokens = input_tokens as f64;
+        let usd = cost_per_1k_input_usd * (tokens / 1000.0);
+        #[expect(
+            clippy::cast_sign_loss,
+            clippy::cast_possible_truncation,
+            reason = "usd is always non-negative in this test fixture"
+        )]
+        let cents = (usd * 100.0).round() as u64;
+        cents
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "two-origin gossip proof establishes membership, broadcasts twice, and verifies convergence"
+    )]
+    fn tenant_spend_from_two_origin_sites_converges_at_third_via_gossip() {
+        let id_a = local_id("site-a", 19_216);
+        let id_b = local_id("site-b", 19_217);
+        let id_c = local_id("site-c", 19_218);
+        let (mut node_a, _) = make_node("site-a", 19_216);
+        let (mut node_b, _) = make_node("site-b", 19_217);
+        let (mut node_c, _) = make_node("site-c", 19_218);
+
+        establish_membership(&mut node_a, &mut node_c, &id_a, &id_c);
+        establish_membership(&mut node_b, &mut node_c, &id_b, &id_c);
+
+        // Site A serves a request for tenant-acme against a $0.03/1k-input-token backend.
+        let a_cents = cost_cents_for_request(0.03, 4_000);
+        let mut a_snap = GridStateSnapshot::new("site-a".to_owned());
+        a_snap.increment_tenant_spend("tenant-acme", a_cents);
+        node_a
+            .publish_state_broadcast(&StateBroadcast::new("site-a".to_owned(), 1, a_snap, None))
+            .unwrap_or_else(|_| std::process::abort());
+        for msg in &node_a.gossip().messages {
+            if msg.addr == id_c.socket_addr() {
+                drop(node_c.handle_data(&msg.data));
+            }
+        }
+
+        // Site B independently serves a request for the same tenant against a pricier backend.
+        let b_cents = cost_cents_for_request(0.06, 2_500);
+        let mut b_snap = GridStateSnapshot::new("site-b".to_owned());
+        b_snap.increment_tenant_spend("tenant-acme", b_cents);
+        node_b
+            .publish_state_broadcast(&StateBroadcast::new("site-b".to_owned(), 1, b_snap, None))
+            .unwrap_or_else(|_| std::process::abort());
+        for msg in &node_b.gossip().messages {
+            if msg.addr == id_c.socket_addr() {
+                drop(node_c.handle_data(&msg.data));
+            }
+        }
+
+        let c_snap = node_c.state_snapshot();
+        let converged_total = c_snap
+            .tenant_spend
+            .get("tenant-acme")
+            .unwrap_or_else(|| std::process::abort())
+            .total();
+        assert_eq!(
+            converged_total,
+            a_cents + b_cents,
+            "tenant spend from two independent origin sites must converge to the true sum \
+             at a third site via real SWIM gossip broadcast, proving AC3 (cross-site convergence)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // StateBroadcastError display
     // -----------------------------------------------------------------------
 

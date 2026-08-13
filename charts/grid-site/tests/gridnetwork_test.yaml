@@ -1,0 +1,63 @@
+suite: GridNetwork template
+templates:
+  - templates/gridnetwork.yaml
+tests:
+  - it: renders as a GridNetwork resource with no budgetPolicy by default
+    set:
+      gridNetwork.name: prod-grid
+      gridSite.name: prod-site
+    asserts:
+      - hasDocuments:
+          count: 1
+      - isKind:
+          of: GridNetwork
+      - equal:
+          path: metadata.name
+          value: prod-grid
+      - notExists:
+          path: spec.budgetPolicy
+
+  - it: renders a non-null spec when only the required name fields are set
+    # Regression test: every optional field used to be gated behind `with`,
+    # so `spec:` rendered as YAML null when all of them were left at their
+    # falsy chart defaults. A real API server rejects that with
+    # "spec: Required value" on both create and update — helm-unittest
+    # can't reproduce server-side CRD validation, so this asserts the
+    # concrete symptom instead: gridId must always be present.
+    set:
+      gridNetwork.name: prod-grid
+      gridSite.name: prod-site
+    asserts:
+      - equal:
+          path: spec.gridId
+          value: ""
+
+  - it: renders budgetPolicy.tenants verbatim when set
+    set:
+      gridNetwork.name: prod-grid
+      gridSite.name: prod-site
+      gridNetwork.budgetPolicy:
+        tenants:
+          - tenantId: tenant-a
+            capUsd: 100
+          - tenantId: tenant-b
+            capUsd: 250
+    asserts:
+      - equal:
+          path: spec.budgetPolicy.tenants
+          value:
+            - tenantId: tenant-a
+              capUsd: 100
+            - tenantId: tenant-b
+              capUsd: 250
+
+  - it: renders budgetPolicy with an empty tenants list without erroring
+    set:
+      gridNetwork.name: prod-grid
+      gridSite.name: prod-site
+      gridNetwork.budgetPolicy:
+        tenants: []
+    asserts:
+      - equal:
+          path: spec.budgetPolicy.tenants
+          value: []

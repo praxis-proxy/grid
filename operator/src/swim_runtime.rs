@@ -2341,6 +2341,149 @@ mod tests {
         drop(handle2);
     }
 
+    /// Poll a handle's `state_snapshot()` until a tenant's converged spend
+    /// reaches `expected_cents`, or panic at the deadline.
+    ///
+    /// Exercises the real production merge path: [`GridStateSnapshot::merge_tenant_spend`]
+    /// as invoked by [`swim::state_broadcast::StateBroadcastHandler::receive_item`] on
+    /// every SWIM gossip round — no CRDT logic is duplicated here.
+    async fn wait_until_tenant_spend_converges(handle: &SwimHandle, tenant_id: &str, expected_cents: u64) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let total = handle
+                .state_snapshot()
+                .tenant_spend
+                .get(tenant_id)
+                .map(crdt::GCounter::total)
+                .unwrap_or_default();
+            if total == expected_cents {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "tenant '{tenant_id}' spend must converge to {expected_cents} cents via real SWIM gossip \
+                 (last observed: {total} cents)"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "three-node real-UDP gossip proof: join, dual increment, convergence, late join, status tie-in"
+    )]
+    async fn tenant_spend_converges_at_late_joining_site_after_partition_heals() {
+        // grid#40 AC3, live network proof: sites A and B accumulate real per-request
+        // spend for the same tenant *before* site C ever joins the mesh (a stand-in
+        // for C being partitioned away while A and B kept serving traffic). C then
+        // joins ("the partition heals") and must converge to the true cross-site sum
+        // purely through the real UDP-bound SWIM runtime — no manual message shuttling,
+        // unlike the lower-tier unit-level proof in `swim::node::tests`.
+        let addr_a = reserve_local_addr().await;
+        let addr_b = reserve_local_addr().await;
+        let addr_c = reserve_local_addr().await;
+
+        let handle_a = start(SwimConfig {
+            bind_addr: addr_a,
+            advertise_addr: Some(addr_a),
+            site_name: "site-a".to_owned(),
+            seeds: Vec::new(),
+            gateway_address: None,
+            swim_key: None,
+            revision_lease: test_revision_lease(80_000),
+        })
+        .await
+        .unwrap_or_else(|_| std::process::abort());
+
+        let handle_b = start(SwimConfig {
+            bind_addr: addr_b,
+            advertise_addr: Some(addr_b),
+            site_name: "site-b".to_owned(),
+            seeds: vec![addr_a],
+            gateway_address: None,
+            swim_key: None,
+            revision_lease: test_revision_lease(90_000),
+        })
+        .await
+        .unwrap_or_else(|_| std::process::abort());
+        wait_until_member_alive(&handle_a, "site-b").await;
+
+        // Real per-request cost values, matching `scoring::BackendConfig::cost_per_1k_input`
+        // shape rather than an arbitrary test constant.
+        let a_cents = cost_cents_for_tokens(0.03, 1_800);
+        let mut a_snap = GridStateSnapshot::new("site-a".to_owned());
+        a_snap.increment_tenant_spend("tenant-acme", a_cents);
+        handle_a
+            .publish_state_broadcast(swim::StateBroadcast::new("site-a".to_owned(), 1, a_snap, None))
+            .unwrap_or_else(|_| std::process::abort());
+
+        let b_cents = cost_cents_for_tokens(0.06, 2_500);
+        let mut b_snap = GridStateSnapshot::new("site-b".to_owned());
+        b_snap.increment_tenant_spend("tenant-acme", b_cents);
+        handle_b
+            .publish_state_broadcast(swim::StateBroadcast::new("site-b".to_owned(), 1, b_snap, None))
+            .unwrap_or_else(|_| std::process::abort());
+
+        let total_cents = a_cents + b_cents;
+        wait_until_tenant_spend_converges(&handle_a, "tenant-acme", total_cents).await;
+        wait_until_tenant_spend_converges(&handle_b, "tenant-acme", total_cents).await;
+
+        // The partition "heals": site-c joins the already-converged A/B mesh for
+        // the first time, having missed every prior broadcast.
+        let handle_c = start(SwimConfig {
+            bind_addr: addr_c,
+            advertise_addr: Some(addr_c),
+            site_name: "site-c".to_owned(),
+            seeds: vec![addr_a],
+            gateway_address: None,
+            swim_key: None,
+            revision_lease: test_revision_lease(100_000),
+        })
+        .await
+        .unwrap_or_else(|_| std::process::abort());
+        wait_until_member_alive(&handle_a, "site-c").await;
+
+        wait_until_tenant_spend_converges(&handle_c, "tenant-acme", total_cents).await;
+
+        // End-to-end tie-in: the same status-derivation function the reconciler
+        // calls on every reconcile must report the correct spendRatio from C's
+        // independently-converged view, proving the full CRDT -> status pipeline.
+        let policy = crate::crd::grid_network::BudgetPolicyConfig {
+            tenants: vec![crate::crd::grid_network::TenantBudgetConfig {
+                tenant_id: "tenant-acme".to_owned(),
+                cap_usd: 1.00,
+            }],
+        };
+        let statuses =
+            crate::crd::grid_network::resolve_budget_statuses(Some(&policy), &handle_c.state_snapshot().tenant_spend);
+        let status = statuses.first().unwrap_or_else(|| std::process::abort());
+        assert_eq!(
+            status.tenant_id, "tenant-acme",
+            "status must be keyed by the policy's tenant_id"
+        );
+        assert!(
+            (status.spend_usd - crate::crd::grid_network::cents_to_usd(total_cents)).abs() < f64::EPSILON,
+            "spend_usd must reflect the fully-converged cross-site total observed at the late-joining site"
+        );
+
+        drop((handle_b, handle_c));
+    }
+
+    /// Real per-request USD cost for `tokens` at `cost_per_1k`, in integer cents —
+    /// mirrors how a gateway-side policy filter would size a spend increment from
+    /// `scoring::BackendConfig::cost_per_1k_input` (AC5 non-goal: that filter does
+    /// not exist yet, so this helper stands in for it here).
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss,
+        reason = "test-only cost simulation over small constant token counts, well within f64 exact-integer range"
+    )]
+    fn cost_cents_for_tokens(cost_per_1k: f64, tokens: u64) -> u64 {
+        (cost_per_1k * (tokens as f64 / 1000.0) * 100.0).round() as u64
+    }
+
     // -----------------------------------------------------------------------
     // Dead-member eviction
     // -----------------------------------------------------------------------

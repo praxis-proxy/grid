@@ -88,6 +88,24 @@ const KV_CACHE_WEIGHT: f64 = 1.0;
 /// (queue=2 → gap ≈ 0.03) from live VCR/EPP pressure.
 const MIN_PRESSURE_SCORE_GAP: f64 = 0.01;
 
+/// Queue-depth pressure-phase threshold (raw queue size, out of `QUEUE_CAPACITY`).
+const QUEUE_PRESSURE_THRESHOLD: f64 = 1.0;
+
+/// KV-cache pressure-phase threshold (normalized utilization, 0.0-1.0).
+///
+/// Lower than the queue threshold's fraction of capacity (1.0/4.0 = 25%)
+/// because KV-cache utilization is a smoother, more gradually-rising signal
+/// under the same synthetic load than discrete queued-request counts.
+const KV_CACHE_PRESSURE_THRESHOLD: f64 = 0.1;
+
+/// Queue-depth recovery threshold: how low `queue_size` must drop before the
+/// recovery proof attempts its verification probe.
+///
+/// Deliberately looser than `QUEUE_PRESSURE_THRESHOLD` (3.0 vs 1.0) -- recovery
+/// only needs "clearly drained," not a full return below the more sensitive
+/// phase-detection threshold. Extracted from the original inline literal.
+const RECOVERY_QUEUE_THRESHOLD: f64 = 3.0;
+
 /// Pressure generator Deployment name.
 const PRESSURE_GENERATOR_DEPLOYMENT: &str = "pressure-generator";
 
@@ -162,6 +180,52 @@ impl MetricsTransport {
     }
 }
 
+/// Which of Grid's real scoring signals drives routing in this demo run.
+///
+/// Selected via the `--kv-cache` CLI flag. Both flavors share the same
+/// pressure generator and the same overlay score-breakdown display (both
+/// `queue_depth` and `kv_cache` are always shown); only the operator's
+/// `GridNetwork.spec.scoringPolicy.strategy` — and therefore which raw
+/// signal actually produces the `score`/`rank` that drives the A\u{2192}B flip —
+/// changes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScoringFlavor {
+    /// llm-d's `queue-scorer` equivalent (default).
+    QueueDepth,
+    /// llm-d's `kv-cache-utilization-scorer` equivalent.
+    KvCachePressure,
+}
+
+impl ScoringFlavor {
+    /// Selects the flavor from the `--kv-cache` CLI flag.
+    fn from_kv_cache_flag(kv_cache: bool) -> Self {
+        if kv_cache {
+            Self::KvCachePressure
+        } else {
+            Self::QueueDepth
+        }
+    }
+
+    /// Human-readable label used in CLI output and evidence JSON.
+    fn label(self) -> &'static str {
+        match self {
+            Self::QueueDepth => "queue-depth",
+            Self::KvCachePressure => "kv-cache-pressure",
+        }
+    }
+
+    /// `GridNetwork.spec.scoringPolicy.strategy` YAML value for this flavor.
+    ///
+    /// Must match `ScoringStrategy`'s `camelCase` serde rename in
+    /// `operator/src/crd/grid_network.rs` exactly.
+    fn strategy_yaml(self) -> &'static str {
+        match self {
+            Self::QueueDepth => "queueDepth",
+            Self::KvCachePressure => "kvCachePressure",
+        }
+    }
+}
+
 /// Demo execution context holding resolved paths.
 struct DemoContext {
     /// Path to the resolved Forge config.
@@ -172,6 +236,8 @@ struct DemoContext {
     images: ResolvedImages,
     /// Selected metrics transport mode.
     metrics_transport: MetricsTransport,
+    /// Selected scoring flavor (which signal drives routing).
+    scoring_flavor: ScoringFlavor,
 }
 
 /// Resolved container image references.
@@ -203,6 +269,8 @@ struct Evidence {
     mode: String,
     /// Metrics transport: "direct-http" or "mtls-proxy".
     metrics_transport: String,
+    /// Scoring strategy: "queue-depth" or "kv-cache-pressure".
+    scoring_strategy: String,
     /// UTC timestamp when the run started.
     started_at: String,
     /// Wall-clock duration in seconds.
@@ -326,6 +394,7 @@ pub(crate) fn run(
     forge_config: &Path,
     options: &GlbDemoOptions,
     metrics_mtls: bool,
+    kv_cache: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mode = options.mode();
     let metrics_transport = if metrics_mtls {
@@ -333,6 +402,7 @@ pub(crate) fn run(
     } else {
         MetricsTransport::DirectHttp
     };
+    let scoring_flavor = ScoringFlavor::from_kv_cache_flag(kv_cache);
     let run_id = format_utc_timestamp();
     let started_at = format_utc_iso();
     let wall_start = Instant::now();
@@ -345,11 +415,12 @@ pub(crate) fn run(
     eprintln!("Grid llm-d Pool-Metrics Routing Demo");
     eprintln!("Mode: {}", if mode == DemoMode::Quick { "quick" } else { "full" });
     eprintln!("Metrics transport: {}", metrics_transport.label());
+    eprintln!("Scoring strategy:  {}", scoring_flavor.label());
     eprintln!("Forge config: {}", forge_config.display());
     eprintln!("Demo root:    {}", demo_root.display());
     eprintln!("{OUTPUT_RULE}");
 
-    let context = prepare_setup(forge_config, metrics_transport)?;
+    let context = prepare_setup(forge_config, metrics_transport, scoring_flavor)?;
     let mut teardown_success = false;
     let mut run_error: Option<String> = None;
 
@@ -408,6 +479,7 @@ pub(crate) fn run(
         schema_version: EVIDENCE_SCHEMA_VERSION.to_owned(),
         mode: format!("{mode:?}").to_lowercase(),
         metrics_transport: metrics_transport.label().to_owned(),
+        scoring_strategy: scoring_flavor.label().to_owned(),
         started_at,
         wall_secs,
         success,
@@ -457,11 +529,12 @@ pub(crate) fn run(
 fn prepare_setup(
     forge_config: &Path,
     metrics_transport: MetricsTransport,
+    scoring_flavor: ScoringFlavor,
 ) -> Result<DemoContext, Box<dyn std::error::Error>> {
     let images = resolve_images(metrics_transport)?;
     verify_images(&images)?;
 
-    let resolved_config = materialize_config(forge_config, metrics_transport, images.nginx.as_deref())?;
+    let resolved_config = materialize_config(forge_config, metrics_transport, scoring_flavor, images.nginx.as_deref())?;
     let forge_bin = glb::resolve_forge_binary()
         .ok_or("praxis-forge binary not found")?
         .into();
@@ -471,6 +544,7 @@ fn prepare_setup(
         forge_bin,
         images,
         metrics_transport,
+        scoring_flavor,
     })
 }
 
@@ -969,17 +1043,17 @@ fn proof_pressure_and_flip(context: &DemoContext, table_start: Instant) -> Proof
 
         let phase = if row_b.rank == 0 && row_a.rank > 0 {
             "FAILOVER"
-        } else if epp_a.queue_size > 1.0 {
+        } else if pressure_phase_active(context.scoring_flavor, &epp_a) {
             "PRESSURE"
         } else {
             "BASELINE"
         };
 
-        if !pressure_announced && epp_a.queue_size > 1.0 {
+        if !pressure_announced && pressure_phase_active(context.scoring_flavor, &epp_a) {
             pressure_announced = true;
             eprintln!(
-                "  [PRESSURE] Pool A queue/KV pressure is increasing (queue={:.1})",
-                epp_a.queue_size
+                "  [PRESSURE] Pool A queue/KV pressure is increasing (queue={:.1} kv={:.2})",
+                epp_a.queue_size, epp_a.kv_cache
             );
         }
 
@@ -1119,10 +1193,10 @@ fn proof_recovery(context: &DemoContext, table_start: Instant) -> ProofResult {
             last_route: &last_route,
         });
 
-        if row_a.rank == 0 && epp_a.queue_size < 3.0 {
+        if row_a.rank == 0 && recovery_condition_met(context.scoring_flavor, &epp_a) {
             eprintln!(
-                "  [RECOVERY] Pool A queue drained (queue={:.1}); sending verification request",
-                epp_a.queue_size
+                "  [RECOVERY] Pool A drained (queue={:.1} kv={:.2}); sending verification request",
+                epp_a.queue_size, epp_a.kv_cache
             );
             let probe_ctx = kind_context("pool-a");
             if let Ok(resp) = send_inference_request(&probe_ctx, VCR_MODEL) {
@@ -1303,6 +1377,8 @@ fn kubectl_get_deployment_env(
 struct EppMetrics {
     /// Average queue size (raw, unnormalized).
     queue_size: f64,
+    /// Average KV-cache utilization (raw, unnormalized, 0.0-1.0).
+    kv_cache: f64,
 }
 
 /// Scrape EPP metrics.
@@ -1311,11 +1387,57 @@ struct EppMetrics {
 /// In direct-HTTP mode, uses the Kubernetes API proxy to reach the Service.
 fn scrape_epp_metrics(cluster: &str, mtls: bool) -> EppMetrics {
     let text = kubectl_exec_epp_metrics(cluster, mtls).unwrap_or_default();
+    parse_epp_metrics(&text)
+}
 
+/// Parse `EppMetrics` out of raw Prometheus text (functional core of
+/// [`scrape_epp_metrics`], separated out so metric-name-fallback behavior is
+/// unit-testable without a live EPP).
+///
+/// Both `queue_size` and `kv_cache` fall back from the `inference_pool_*`
+/// series to the `llm_d_router_epp_*` series symmetrically -- an EPP build
+/// that only exposes the latter must not silently read `kv_cache` as a
+/// permanent 0.0, which would make a `kvCachePressure` run's pressure phase
+/// never announce despite real KV pressure driving the flip.
+fn parse_epp_metrics(text: &str) -> EppMetrics {
     EppMetrics {
-        queue_size: extract_prom_value(&text, "inference_pool_average_queue_size")
-            .or_else(|| extract_prom_value(&text, "llm_d_router_epp_average_queue_size"))
+        queue_size: extract_prom_value(text, "inference_pool_average_queue_size")
+            .or_else(|| extract_prom_value(text, "llm_d_router_epp_average_queue_size"))
             .unwrap_or(0.0),
+        kv_cache: extract_prom_value(text, "inference_pool_average_kv_cache_utilization")
+            .or_else(|| extract_prom_value(text, "llm_d_router_epp_average_kv_cache_utilization"))
+            .unwrap_or(0.0),
+    }
+}
+
+/// Whether the pressure phase should be announced/entered for the given
+/// scoring flavor.
+///
+/// Both metrics typically rise together under the pressure generator's
+/// synthetic load, but the announced phase must key off the signal that
+/// actually drives the active `GridNetwork` scoring strategy — otherwise a
+/// `kvCachePressure` run could narrate "queue pressure" while queue depth
+/// isn't what's producing the rank flip.
+fn pressure_phase_active(flavor: ScoringFlavor, epp: &EppMetrics) -> bool {
+    match flavor {
+        ScoringFlavor::QueueDepth => epp.queue_size > QUEUE_PRESSURE_THRESHOLD,
+        ScoringFlavor::KvCachePressure => epp.kv_cache > KV_CACHE_PRESSURE_THRESHOLD,
+    }
+}
+
+/// Whether pool-a has drained enough, for the given scoring flavor, to
+/// attempt the recovery verification probe.
+///
+/// `QueueDepth` uses its own calibrated [`RECOVERY_QUEUE_THRESHOLD`] (looser
+/// than [`QUEUE_PRESSURE_THRESHOLD`] by design -- recovery only needs "clearly
+/// drained," not a full return below the phase-detection threshold).
+/// `KvCachePressure` has no independently-calibrated recovery threshold yet,
+/// so it reuses the inverse of [`pressure_phase_active`] rather than
+/// inventing an untested second KV constant.
+fn recovery_condition_met(flavor: ScoringFlavor, epp: &EppMetrics) -> bool {
+    match flavor {
+        ScoringFlavor::QueueDepth => epp.queue_size < RECOVERY_QUEUE_THRESHOLD,
+        ScoringFlavor::KvCachePressure => !pressure_phase_active(flavor, epp),
     }
 }
 
@@ -2182,9 +2304,14 @@ fn run_forge_stack(
 /// - Adds the metrics TLS proxy ConfigMap manifest step
 /// - Changes the metricsEndpoint to HTTPS :9443
 /// - Adds the TLS Secret references to the InferenceProvider metricsConfig
+///
+/// When `scoring_flavor` is `KvCachePressure`, additionally swaps both
+/// sites' `GridNetwork.spec.scoringPolicy.strategy` from the template's
+/// default `queueDepth` to `kvCachePressure`.
 fn materialize_config(
     forge_config: &Path,
     metrics_transport: MetricsTransport,
+    scoring_flavor: ScoringFlavor,
     nginx_image: Option<&str>,
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let dir = forge_config.parent().unwrap_or_else(|| Path::new("."));
@@ -2255,6 +2382,18 @@ fn materialize_config(
              \x20                     namespace: grid-system"
         );
         result = checked_replace(&result, signal_anchor, &tls_block, 2, "metrics signal anchor")?;
+    }
+
+    if scoring_flavor == ScoringFlavor::KvCachePressure {
+        let default_strategy = format!("strategy: {}", ScoringFlavor::QueueDepth.strategy_yaml());
+        let selected_strategy = format!("strategy: {}", scoring_flavor.strategy_yaml());
+        result = checked_replace(
+            &result,
+            &default_strategy,
+            &selected_strategy,
+            2,
+            "scoringPolicy.strategy",
+        )?;
     }
 
     fs::write(&resolved, result)?;
@@ -3595,6 +3734,7 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
             schema_version: "1".to_owned(),
             mode: "quick".to_owned(),
             metrics_transport: "direct-http".to_owned(),
+            scoring_strategy: ScoringFlavor::QueueDepth.label().to_owned(),
             started_at: "2026-01-01T00:00:00Z".to_owned(),
             wall_secs: 42.0,
             success: true,
@@ -3631,6 +3771,129 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
     }
 
     #[test]
+    fn scoring_flavor_from_kv_cache_flag() {
+        assert_eq!(ScoringFlavor::from_kv_cache_flag(false), ScoringFlavor::QueueDepth);
+        assert_eq!(ScoringFlavor::from_kv_cache_flag(true), ScoringFlavor::KvCachePressure);
+    }
+
+    #[test]
+    fn scoring_flavor_labels() {
+        assert_eq!(ScoringFlavor::QueueDepth.label(), "queue-depth");
+        assert_eq!(ScoringFlavor::KvCachePressure.label(), "kv-cache-pressure");
+    }
+
+    #[test]
+    fn scoring_flavor_strategy_yaml_matches_grid_network_crd() {
+        // Must match `ScoringStrategy`'s camelCase serde rename in
+        // operator/src/crd/grid_network.rs exactly, since this string is
+        // spliced directly into the GridNetwork Helm values.
+        assert_eq!(ScoringFlavor::QueueDepth.strategy_yaml(), "queueDepth");
+        assert_eq!(ScoringFlavor::KvCachePressure.strategy_yaml(), "kvCachePressure");
+    }
+
+    #[test]
+    fn pressure_phase_active_queue_depth_flavor_ignores_kv_cache() {
+        let low_queue_high_kv = EppMetrics {
+            queue_size: 0.0,
+            kv_cache: 0.9,
+        };
+        assert!(
+            !pressure_phase_active(ScoringFlavor::QueueDepth, &low_queue_high_kv),
+            "queue-depth flavor must key off queue_size, not kv_cache"
+        );
+
+        let high_queue = EppMetrics {
+            queue_size: 2.0,
+            kv_cache: 0.0,
+        };
+        assert!(pressure_phase_active(ScoringFlavor::QueueDepth, &high_queue));
+    }
+
+    #[test]
+    fn pressure_phase_active_kv_cache_flavor_ignores_queue_size() {
+        let high_queue_low_kv = EppMetrics {
+            queue_size: 3.0,
+            kv_cache: 0.0,
+        };
+        assert!(
+            !pressure_phase_active(ScoringFlavor::KvCachePressure, &high_queue_low_kv),
+            "kv-cache flavor must key off kv_cache, not queue_size"
+        );
+
+        let high_kv = EppMetrics {
+            queue_size: 0.0,
+            kv_cache: 0.5,
+        };
+        assert!(pressure_phase_active(ScoringFlavor::KvCachePressure, &high_kv));
+    }
+
+    #[test]
+    fn parse_epp_metrics_prefers_primary_metric_names() {
+        let text = "inference_pool_average_queue_size{name=\"pool-a\"} 4.5\n\
+                     inference_pool_average_kv_cache_utilization{name=\"pool-a\"} 0.35\n";
+        let epp = parse_epp_metrics(text);
+        assert_eq!(epp.queue_size, 4.5);
+        assert_eq!(epp.kv_cache, 0.35);
+    }
+
+    #[test]
+    fn parse_epp_metrics_falls_back_to_llm_d_router_metric_names() {
+        // Some EPP builds only expose the llm_d_router_* series (no
+        // inference_pool_* series at all) -- both queue_size and kv_cache
+        // must fall back symmetrically, or a kvCachePressure run against
+        // such an EPP always reads kv_cache=0.0 and never detects pressure.
+        let text = "llm_d_router_epp_average_queue_size{name=\"pool-a\"} 6.0\n\
+                     llm_d_router_epp_average_kv_cache_utilization{name=\"pool-a\"} 0.42\n";
+        let epp = parse_epp_metrics(text);
+        assert_eq!(epp.queue_size, 6.0);
+        assert_eq!(epp.kv_cache, 0.42);
+    }
+
+    #[test]
+    fn parse_epp_metrics_defaults_to_zero_when_absent() {
+        let epp = parse_epp_metrics("");
+        assert_eq!(epp.queue_size, 0.0);
+        assert_eq!(epp.kv_cache, 0.0);
+    }
+
+    #[test]
+    fn recovery_condition_met_queue_depth_flavor_uses_calibrated_threshold() {
+        let draining = EppMetrics {
+            queue_size: 2.9,
+            kv_cache: 0.9, // must be ignored for this flavor
+        };
+        assert!(recovery_condition_met(ScoringFlavor::QueueDepth, &draining));
+
+        let still_pressured = EppMetrics {
+            queue_size: 3.0,
+            kv_cache: 0.0,
+        };
+        assert!(!recovery_condition_met(ScoringFlavor::QueueDepth, &still_pressured));
+    }
+
+    #[test]
+    fn recovery_condition_met_kv_cache_flavor_uses_pressure_active_inverse() {
+        // No independently-calibrated recovery threshold exists for
+        // kv_cache yet, so recovery is defined as "pressure phase is no
+        // longer active" -- reusing the one KV threshold that IS
+        // calibrated, rather than inventing an untested second one.
+        let recovered = EppMetrics {
+            queue_size: 99.0, // must be ignored for this flavor
+            kv_cache: 0.0,
+        };
+        assert!(recovery_condition_met(ScoringFlavor::KvCachePressure, &recovered));
+
+        let still_pressured = EppMetrics {
+            queue_size: 0.0,
+            kv_cache: 0.5,
+        };
+        assert!(!recovery_condition_met(
+            ScoringFlavor::KvCachePressure,
+            &still_pressured
+        ));
+    }
+
+    #[test]
     fn setup_phase_count_differs_by_transport() {
         const _: () = assert!(SETUP_PHASES_MTLS > SETUP_PHASES_DIRECT);
         const _: () = assert!(SETUP_PHASES_MTLS - SETUP_PHASES_DIRECT == 1);
@@ -3642,6 +3905,7 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
             schema_version: "1".to_owned(),
             mode: "quick".to_owned(),
             metrics_transport: MetricsTransport::DirectHttp.label().to_owned(),
+            scoring_strategy: ScoringFlavor::QueueDepth.label().to_owned(),
             started_at: "2026-01-01T00:00:00Z".to_owned(),
             wall_secs: 10.0,
             success: true,
@@ -3668,6 +3932,7 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
             schema_version: "1".to_owned(),
             mode: "quick".to_owned(),
             metrics_transport: MetricsTransport::MtlsProxy.label().to_owned(),
+            scoring_strategy: ScoringFlavor::QueueDepth.label().to_owned(),
             started_at: "2026-01-01T00:00:00Z".to_owned(),
             wall_secs: 10.0,
             success: true,
@@ -3721,6 +3986,12 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
                   metricsEndpoint: \"http://llmd-epp-metrics.grid-system.svc.cluster.local:9090\"
                   signalNames:
                     healthy: inference_pool_ready_pods
+
+              scoringPolicy:
+                strategy: queueDepth
+
+              scoringPolicy:
+                strategy: queueDepth
 "
         .to_owned()
     }
@@ -3749,7 +4020,13 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
         drop(fs::create_dir_all(&dir));
         let forge_path = dir.join("forge.yaml");
         fs::write(&forge_path, test_forge_config()).unwrap();
-        let resolved = materialize_config(&forge_path, MetricsTransport::DirectHttp, None).unwrap();
+        let resolved = materialize_config(
+            &forge_path,
+            MetricsTransport::DirectHttp,
+            ScoringFlavor::QueueDepth,
+            None,
+        )
+        .unwrap();
         let content = fs::read_to_string(&resolved).unwrap();
 
         assert!(
@@ -3782,7 +4059,13 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
         write_test_mtls_manifests(&dir);
         let forge_path = dir.join("forge.yaml");
         fs::write(&forge_path, test_forge_config()).unwrap();
-        let resolved = materialize_config(&forge_path, MetricsTransport::MtlsProxy, None).unwrap();
+        let resolved = materialize_config(
+            &forge_path,
+            MetricsTransport::MtlsProxy,
+            ScoringFlavor::QueueDepth,
+            None,
+        )
+        .unwrap();
         let content = fs::read_to_string(&resolved).unwrap();
 
         assert!(
@@ -3818,7 +4101,13 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
         fs::write(&forge_path, test_forge_config()).unwrap();
 
         let custom_image = "registry.example.com/nginx:custom";
-        materialize_config(&forge_path, MetricsTransport::MtlsProxy, Some(custom_image)).unwrap();
+        materialize_config(
+            &forge_path,
+            MetricsTransport::MtlsProxy,
+            ScoringFlavor::QueueDepth,
+            Some(custom_image),
+        )
+        .unwrap();
 
         for pool in CLUSTERS {
             let resolved_manifest =
@@ -3836,12 +4125,70 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
     }
 
     #[test]
+    fn materialize_queue_depth_flavor_leaves_default_strategy() {
+        let dir = std::env::temp_dir().join("grid-test-materialize-queue-depth-flavor");
+        drop(fs::create_dir_all(&dir));
+        let forge_path = dir.join("forge.yaml");
+        fs::write(&forge_path, test_forge_config()).unwrap();
+
+        let resolved = materialize_config(
+            &forge_path,
+            MetricsTransport::DirectHttp,
+            ScoringFlavor::QueueDepth,
+            None,
+        )
+        .unwrap();
+        let content = fs::read_to_string(&resolved).unwrap();
+
+        assert_eq!(
+            content.matches("strategy: queueDepth").count(),
+            2,
+            "queue-depth flavor must leave both sites' default strategy untouched"
+        );
+        assert!(!content.contains("kvCachePressure"));
+        drop(fs::remove_dir_all(&dir));
+    }
+
+    #[test]
+    fn materialize_kv_cache_flavor_swaps_strategy_on_both_sites() {
+        let dir = std::env::temp_dir().join("grid-test-materialize-kv-cache-flavor");
+        drop(fs::create_dir_all(&dir));
+        let forge_path = dir.join("forge.yaml");
+        fs::write(&forge_path, test_forge_config()).unwrap();
+
+        let resolved = materialize_config(
+            &forge_path,
+            MetricsTransport::DirectHttp,
+            ScoringFlavor::KvCachePressure,
+            None,
+        )
+        .unwrap();
+        let content = fs::read_to_string(&resolved).unwrap();
+
+        assert_eq!(
+            content.matches("strategy: kvCachePressure").count(),
+            2,
+            "kv-cache flavor must swap both pool-a-site and pool-b-site's strategy"
+        );
+        assert!(
+            !content.contains("strategy: queueDepth"),
+            "no queueDepth strategy should remain after the swap"
+        );
+        drop(fs::remove_dir_all(&dir));
+    }
+
+    #[test]
     fn materialize_fails_on_missing_anchor() {
         let dir = std::env::temp_dir().join("grid-test-materialize-bad-anchor");
         drop(fs::create_dir_all(&dir));
         let forge_path = dir.join("forge.yaml");
         fs::write(&forge_path, "empty config with no anchors").unwrap();
-        let result = materialize_config(&forge_path, MetricsTransport::DirectHttp, None);
+        let result = materialize_config(
+            &forge_path,
+            MetricsTransport::DirectHttp,
+            ScoringFlavor::QueueDepth,
+            None,
+        );
         assert!(result.is_err(), "must fail when anchors are missing");
         let err = result.unwrap_err().to_string();
         assert!(

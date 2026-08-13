@@ -3,6 +3,9 @@
 //! The top-level tenancy boundary for the AI Grid. A cluster
 //! can host multiple `GridNetworks` for multi-tenancy.
 
+use std::collections::BTreeMap;
+
+use crdt::GCounter;
 use kube::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -151,6 +154,214 @@ pub fn resolve_scoring_weights(policy: Option<&ScoringPolicyConfig>) -> scoring:
 }
 
 // ---------------------------------------------------------------------------
+// Budget policy
+// ---------------------------------------------------------------------------
+
+/// Per-tenant budget cap declaration.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct TenantBudgetConfig {
+    /// Tenant identifier. Must be non-empty and unique within the policy.
+    pub tenant_id: String,
+
+    /// Maximum cumulative spend in USD before this tenant is considered over budget.
+    ///
+    /// **Minimum value:** `0`. The generated CRD schema rejects negative caps;
+    /// [`validate_budget_policy`] additionally rejects `NaN`/infinite values
+    /// that the schema's numeric minimum does not catch.
+    #[schemars(range(min = 0.0))]
+    pub cap_usd: f64,
+}
+
+/// Budget policy configuration for per-tenant spend tracking.
+///
+/// Declares the tenants Grid should track cumulative spend for. Grid tracks
+/// and cross-site-converges the spend signal (via G-Counter CRDT, see
+/// [`crdt::GridStateSnapshot::tenant_spend`]) and exposes it in
+/// [`GridNetworkStatus::budget_status`]; it does **not** enforce budget
+/// limits itself — degrade/reject decisions are a gateway-side `praxis-ai`
+/// policy-filter concern, not a Grid-side one.
+///
+/// **Default (absent):** no tenants are tracked; `budgetStatus` is always empty.
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct BudgetPolicyConfig {
+    /// Per-tenant budget caps.
+    #[serde(default)]
+    pub tenants: Vec<TenantBudgetConfig>,
+}
+
+/// Reason a [`BudgetPolicyConfig`] failed validation.
+///
+/// The CRD schema's numeric minimum on `capUsd` (see [`TenantBudgetConfig`])
+/// already rejects negative values at admission time; [`validate_budget_policy`]
+/// is a defensive second layer for callers that construct or deserialize a
+/// [`BudgetPolicyConfig`] outside the Kubernetes API path.
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum BudgetPolicyValidationError {
+    /// A tenant's `capUsd` is negative.
+    #[error("tenant {tenant_id:?} has a negative capUsd")]
+    NegativeCap {
+        /// Offending tenant identifier.
+        tenant_id: String,
+    },
+    /// A tenant's `capUsd` is `NaN` or infinite.
+    #[error("tenant {tenant_id:?} has a non-finite capUsd")]
+    NonFiniteCap {
+        /// Offending tenant identifier.
+        tenant_id: String,
+    },
+    /// The same `tenantId` appears more than once.
+    #[error("tenant id {tenant_id:?} appears more than once")]
+    DuplicateTenant {
+        /// The repeated tenant identifier.
+        tenant_id: String,
+    },
+    /// A tenant entry has a blank (empty or whitespace-only) `tenantId`.
+    #[error("a tenant entry has a blank tenantId")]
+    BlankTenantId,
+}
+
+/// Validate a [`BudgetPolicyConfig`].
+///
+/// # Errors
+///
+/// Returns [`BudgetPolicyValidationError`] for the first invalid tenant entry
+/// found, in declaration order: a blank `tenantId`, a duplicate `tenantId`, a
+/// negative `capUsd`, or a non-finite `capUsd`.
+pub fn validate_budget_policy(policy: &BudgetPolicyConfig) -> Result<(), BudgetPolicyValidationError> {
+    let mut seen_tenant_ids = std::collections::HashSet::new();
+    for tenant in &policy.tenants {
+        if tenant.tenant_id.trim().is_empty() {
+            return Err(BudgetPolicyValidationError::BlankTenantId);
+        }
+        if !seen_tenant_ids.insert(tenant.tenant_id.as_str()) {
+            return Err(BudgetPolicyValidationError::DuplicateTenant {
+                tenant_id: tenant.tenant_id.clone(),
+            });
+        }
+        if !tenant.cap_usd.is_finite() {
+            return Err(BudgetPolicyValidationError::NonFiniteCap {
+                tenant_id: tenant.tenant_id.clone(),
+            });
+        }
+        if tenant.cap_usd < 0.0 {
+            return Err(BudgetPolicyValidationError::NegativeCap {
+                tenant_id: tenant.tenant_id.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Convert a G-Counter total (cents, `u64`) into USD (`f64`).
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "budget ratio is inherently approximate under partition; see GCounter docs"
+)]
+pub(crate) fn cents_to_usd(cents: u64) -> f64 {
+    cents as f64 / 100.0
+}
+
+/// Convert a tenant's cumulative spend counter into a cap-relative ratio.
+///
+/// `tenant_spend.total()` is denominated in cents (see
+/// [`crdt::GridStateSnapshot::tenant_spend`]); `cap_usd` is dollars. The
+/// result is always clamped to `0.0..=1.0`:
+///
+/// - `cap_usd <= 0.0` (including non-finite) is treated defensively as "no budget available" and always returns `1.0`,
+///   regardless of spend. The CRD schema and [`validate_budget_policy`] should already prevent this, but a caller
+///   bypassing both must not panic or divide by zero.
+/// - Spend above the cap clamps to `1.0` rather than exceeding it — a real possibility, not a bug: G-Counter is
+///   monotonic and an individual site sees only a lower bound under partition, so local overspend is expected.
+#[must_use]
+pub fn spend_ratio(tenant_spend: &GCounter, cap_usd: f64) -> f64 {
+    if !cap_usd.is_finite() || cap_usd <= 0.0 {
+        return 1.0;
+    }
+    (cents_to_usd(tenant_spend.total()) / cap_usd).clamp(0.0, 1.0)
+}
+
+/// Per-tenant budget status derived from policy + merged CRDT spend state.
+///
+/// Populated in [`GridNetworkStatus::budget_status`] for every tenant
+/// declared in `spec.budgetPolicy`, regardless of whether spend has been
+/// recorded for that tenant yet. This is a status signal only — Grid does
+/// not enforce budget limits (see [`BudgetPolicyConfig`] doc).
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TenantBudgetStatus {
+    /// Tenant identifier, matching `spec.budgetPolicy.tenants[].tenantId`.
+    pub tenant_id: String,
+
+    /// Cumulative spend observed for this tenant, in USD.
+    ///
+    /// Converged across all sites that have merged CRDT state for this
+    /// tenant; may lag briefly during a partition (see [`GCounter`]).
+    pub spend_usd: f64,
+
+    /// Budget cap for this tenant, in USD, copied from `spec.budgetPolicy`.
+    pub cap_usd: f64,
+
+    /// `spend_usd / cap_usd`, clamped to `0.0..=1.0`. See [`spend_ratio`].
+    pub spend_ratio: f64,
+}
+
+/// Build one tenant's status entry.
+///
+/// `counter` is `None` when no spend has been recorded for this tenant yet;
+/// in that case both `spend_usd` and `spend_ratio` are `0.0` rather than
+/// delegating to [`spend_ratio`] (which would read a non-positive cap as
+/// maxed — not the right answer for "no traffic yet").
+fn tenant_budget_status(tenant: &TenantBudgetConfig, counter: Option<&GCounter>) -> TenantBudgetStatus {
+    let (spend_usd, ratio) = counter.map_or((0.0, 0.0), |counter| {
+        (cents_to_usd(counter.total()), spend_ratio(counter, tenant.cap_usd))
+    });
+    TenantBudgetStatus {
+        tenant_id: tenant.tenant_id.clone(),
+        spend_usd,
+        cap_usd: tenant.cap_usd,
+        spend_ratio: ratio,
+    }
+}
+
+/// Assemble per-tenant budget status from policy and merged CRDT spend state.
+///
+/// Driven by `policy.tenants`, not by `tenant_spend`: a tenant declared in
+/// the policy but with no recorded spend yet still gets an entry
+/// (`spendUsd: 0.0`); CRDT spend recorded for a tenant no longer declared in
+/// the policy is silently excluded — the policy is the source of truth for
+/// which tenants are tracked. Output is sorted by `tenantId` for
+/// deterministic status ordering.
+#[must_use]
+pub fn tenant_spend_status(
+    policy: &BudgetPolicyConfig,
+    tenant_spend: &BTreeMap<String, GCounter>,
+) -> Vec<TenantBudgetStatus> {
+    let mut statuses: Vec<TenantBudgetStatus> = policy
+        .tenants
+        .iter()
+        .map(|tenant| tenant_budget_status(tenant, tenant_spend.get(&tenant.tenant_id)))
+        .collect();
+    statuses.sort_by(|a, b| a.tenant_id.cmp(&b.tenant_id));
+    statuses
+}
+
+/// Resolve tenant budget statuses for [`GridNetworkStatus::budget_status`].
+///
+/// `policy` is `None` when `spec.budgetPolicy` is absent — no tenants are
+/// tracked, so the result is always empty in that case.
+#[must_use]
+pub fn resolve_budget_statuses(
+    policy: Option<&BudgetPolicyConfig>,
+    tenant_spend: &BTreeMap<String, GCounter>,
+) -> Vec<TenantBudgetStatus> {
+    policy.map_or_else(Vec::new, |policy| tenant_spend_status(policy, tenant_spend))
+}
+
+// ---------------------------------------------------------------------------
 // Spec
 // ---------------------------------------------------------------------------
 
@@ -237,6 +448,16 @@ pub struct GridNetworkSpec {
     #[schemars(regex(pattern = "^([1-9][0-9]*s|[1-9][0-9]{3,}ms)$"))]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metrics_refresh_interval: Option<String>,
+
+    /// Budget policy configuration for per-tenant spend tracking.
+    ///
+    /// Selects which tenants Grid tracks cumulative spend for. See
+    /// [`BudgetPolicyConfig`] for what this does and does not do.
+    ///
+    /// **Default (absent):** no tenants are tracked; `budgetStatus` is
+    /// always empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_policy: Option<BudgetPolicyConfig>,
 
     /// Maximum age in seconds before a stale (`fresh=false`) remote routing
     /// candidate is removed from the overlay.
@@ -547,7 +768,7 @@ pub struct SecretRef {
 // ---------------------------------------------------------------------------
 
 /// Observed status of a [`GridNetwork`].
-#[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GridNetworkStatus {
     /// Number of connected (Active) sites.
@@ -592,6 +813,14 @@ pub struct GridNetworkStatus {
     /// the last successfully distributed revision.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub overlay_status: Vec<OverlayRevisionStatus>,
+
+    /// Per-tenant budget status, derived from `spec.budgetPolicy` and merged
+    /// cross-site CRDT spend state.
+    ///
+    /// Empty when `budgetPolicy` is absent. This is a status signal only —
+    /// Grid does not enforce budget limits itself (see [`BudgetPolicyConfig`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub budget_status: Vec<TenantBudgetStatus>,
 }
 
 /// Phase of an operator-generated consumer Praxis `ConfigMap` for one gateway.
@@ -788,6 +1017,9 @@ impl Default for SwimConfig {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
+    use crdt::GCounter;
     use kube::CustomResourceExt as _;
 
     use super::*;
@@ -1747,5 +1979,353 @@ mod tests {
         assert_weight(second.breakdown.total, 0.20, "pool-a: 1-0.80");
         assert_weight(first.breakdown.queue_depth, 0.0, "queue must not contribute");
         assert_weight(second.breakdown.queue_depth, 0.0, "queue must not contribute");
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_budget_policy tests (A1-A6)
+    // -----------------------------------------------------------------------
+
+    fn tenant(id: &str, cap_usd: f64) -> TenantBudgetConfig {
+        TenantBudgetConfig {
+            tenant_id: id.to_owned(),
+            cap_usd,
+        }
+    }
+
+    #[test]
+    fn validate_budget_policy_accepts_valid_config() {
+        let policy = BudgetPolicyConfig {
+            tenants: vec![tenant("tenant-a", 100.0), tenant("tenant-b", 250.0)],
+        };
+        assert!(
+            validate_budget_policy(&policy).is_ok(),
+            "distinct positive caps and non-empty tenant ids must be valid"
+        );
+    }
+
+    #[test]
+    fn validate_budget_policy_rejects_negative_cap() {
+        let policy = BudgetPolicyConfig {
+            tenants: vec![tenant("tenant-a", -5.0)],
+        };
+        assert_eq!(
+            validate_budget_policy(&policy),
+            Err(BudgetPolicyValidationError::NegativeCap {
+                tenant_id: "tenant-a".to_owned()
+            }),
+            "negative capUsd must be rejected"
+        );
+    }
+
+    #[test]
+    fn validate_budget_policy_rejects_non_finite_cap() {
+        for bad_cap in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let policy = BudgetPolicyConfig {
+                tenants: vec![tenant("tenant-a", bad_cap)],
+            };
+            assert_eq!(
+                validate_budget_policy(&policy),
+                Err(BudgetPolicyValidationError::NonFiniteCap {
+                    tenant_id: "tenant-a".to_owned()
+                }),
+                "non-finite capUsd ({bad_cap}) must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_budget_policy_rejects_duplicate_tenant_id() {
+        let policy = BudgetPolicyConfig {
+            tenants: vec![tenant("tenant-a", 100.0), tenant("tenant-a", 200.0)],
+        };
+        assert_eq!(
+            validate_budget_policy(&policy),
+            Err(BudgetPolicyValidationError::DuplicateTenant {
+                tenant_id: "tenant-a".to_owned()
+            }),
+            "duplicate tenantId must be rejected"
+        );
+    }
+
+    #[test]
+    fn validate_budget_policy_rejects_blank_tenant_id() {
+        for blank in ["", "   "] {
+            let policy = BudgetPolicyConfig {
+                tenants: vec![tenant(blank, 100.0)],
+            };
+            assert_eq!(
+                validate_budget_policy(&policy),
+                Err(BudgetPolicyValidationError::BlankTenantId),
+                "blank tenantId ({blank:?}) must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_budget_policy_accepts_empty_tenant_list() {
+        let policy = BudgetPolicyConfig { tenants: Vec::new() };
+        assert!(
+            validate_budget_policy(&policy).is_ok(),
+            "an empty tenants list is a valid no-op policy"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // spend_ratio tests (B1-B6)
+    // -----------------------------------------------------------------------
+
+    fn spend_of(cents: u64) -> GCounter {
+        let mut counter = GCounter::new("site-a".to_owned());
+        counter.increment(cents);
+        counter
+    }
+
+    #[test]
+    fn spend_ratio_below_cap() {
+        // 50.00 spent against a 100.00 cap.
+        assert_weight(spend_ratio(&spend_of(5000), 100.0), 0.5, "spend/cap");
+    }
+
+    #[test]
+    fn spend_ratio_at_cap() {
+        assert_weight(spend_ratio(&spend_of(10_000), 100.0), 1.0, "spend == cap");
+    }
+
+    #[test]
+    fn spend_ratio_overspend_clamps_to_one() {
+        // 150.00 spent against a 100.00 cap must not exceed 1.0.
+        assert_weight(spend_ratio(&spend_of(15_000), 100.0), 1.0, "overspend must clamp");
+    }
+
+    #[test]
+    fn spend_ratio_zero_spend_is_zero() {
+        assert_weight(
+            spend_ratio(&spend_of(0), 100.0),
+            0.0,
+            "zero spend against a positive cap",
+        );
+    }
+
+    #[test]
+    fn spend_ratio_non_positive_cap_is_always_one() {
+        for bad_cap in [0.0, -1.0, f64::NAN, f64::NEG_INFINITY] {
+            assert_weight(
+                spend_ratio(&spend_of(0), bad_cap),
+                1.0,
+                &format!("cap_usd={bad_cap} must defensively read as maxed regardless of spend"),
+            );
+        }
+    }
+
+    #[test]
+    fn spend_ratio_near_u64_max_does_not_panic_and_clamps() {
+        let ratio = spend_ratio(&spend_of(u64::MAX), 100.0);
+        assert!(ratio.is_finite(), "must not produce NaN/inf from a huge u64 conversion");
+        assert_weight(ratio, 1.0, "huge spend against a small cap must clamp to 1.0");
+    }
+
+    // -----------------------------------------------------------------------
+    // BudgetPolicy CRD spec wiring tests (D1-D6)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn budget_policy_absent_defaults_to_none() {
+        let json = serde_json::json!({ "gridId": "", "seeds": [] });
+        let spec: GridNetworkSpec = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
+        assert!(spec.budget_policy.is_none(), "absent budgetPolicy must default to None");
+    }
+
+    #[test]
+    fn budget_policy_absent_not_serialized() {
+        let json = serde_json::json!({ "gridId": "", "seeds": [] });
+        let spec: GridNetworkSpec = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
+        let serialized = serde_json::to_value(&spec).unwrap_or_else(|_| std::process::abort());
+        assert!(
+            serialized.get("budgetPolicy").is_none(),
+            "absent budgetPolicy must not appear in serialized output"
+        );
+    }
+
+    #[test]
+    fn budget_policy_with_tenants_round_trips() {
+        let json = serde_json::json!({
+            "gridId": "",
+            "seeds": [],
+            "budgetPolicy": {
+                "tenants": [
+                    { "tenantId": "tenant-a", "capUsd": 100.0 },
+                    { "tenantId": "tenant-b", "capUsd": 50.0 }
+                ]
+            }
+        });
+        let spec: GridNetworkSpec = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
+        let policy = spec.budget_policy.unwrap_or_else(|| std::process::abort());
+        assert_eq!(policy.tenants.len(), 2, "both tenants must round-trip");
+        let first = policy.tenants.first().unwrap_or_else(|| std::process::abort());
+        let second = policy.tenants.get(1).unwrap_or_else(|| std::process::abort());
+        assert_eq!(first.tenant_id, "tenant-a");
+        assert_weight(first.cap_usd, 100.0, "tenant-a capUsd");
+        assert_eq!(second.tenant_id, "tenant-b");
+        assert_weight(second.cap_usd, 50.0, "tenant-b capUsd");
+    }
+
+    #[test]
+    fn budget_policy_appears_in_crd_schema() {
+        let crd = crd_json();
+        let schema = crd
+            .pointer("/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties/budgetPolicy")
+            .unwrap_or_else(|| std::process::abort());
+        assert!(schema.is_object(), "budgetPolicy must appear in the CRD schema");
+    }
+
+    #[test]
+    fn budget_policy_cap_usd_schema_has_zero_minimum() {
+        let crd = crd_json();
+        let cap_schema = crd
+            .pointer(
+                "/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties\
+                 /budgetPolicy/properties/tenants/items/properties/capUsd",
+            )
+            .unwrap_or_else(|| std::process::abort());
+        assert_eq!(
+            cap_schema.pointer("/minimum").and_then(serde_json::Value::as_f64),
+            Some(0.0),
+            "capUsd schema must reject negative values"
+        );
+    }
+
+    #[test]
+    fn budget_policy_rejects_unknown_shape() {
+        let json = serde_json::json!({
+            "gridId": "",
+            "seeds": [],
+            "budgetPolicy": { "caps": [] }
+        });
+        let result = serde_json::from_value::<GridNetworkSpec>(json);
+        assert!(result.is_err(), "unknown budgetPolicy shape must be rejected");
+    }
+
+    // -----------------------------------------------------------------------
+    // tenant_spend_status tests (E1-E6)
+    // -----------------------------------------------------------------------
+
+    fn spend_map(entries: &[(&str, u64)]) -> BTreeMap<String, GCounter> {
+        entries
+            .iter()
+            .map(|(tenant_id, cents)| ((*tenant_id).to_owned(), spend_of(*cents)))
+            .collect()
+    }
+
+    #[test]
+    fn tenant_spend_status_reports_recorded_spend() {
+        let policy = BudgetPolicyConfig {
+            tenants: vec![tenant("tenant-a", 100.0)],
+        };
+        let spend = spend_map(&[("tenant-a", 2500)]);
+        let statuses = tenant_spend_status(&policy, &spend);
+        assert_eq!(statuses.len(), 1);
+        let entry = statuses.first().unwrap_or_else(|| std::process::abort());
+        assert_eq!(entry.tenant_id, "tenant-a");
+        assert_weight(entry.spend_usd, 25.0, "spend_usd");
+        assert_weight(entry.cap_usd, 100.0, "cap_usd");
+        assert_weight(entry.spend_ratio, 0.25, "spend_ratio");
+    }
+
+    #[test]
+    fn tenant_spend_status_includes_tenant_with_no_spend_yet() {
+        let policy = BudgetPolicyConfig {
+            tenants: vec![tenant("tenant-a", 100.0)],
+        };
+        let statuses = tenant_spend_status(&policy, &BTreeMap::new());
+        assert_eq!(
+            statuses.len(),
+            1,
+            "declared tenant must be present even with zero recorded spend"
+        );
+        let entry = statuses.first().unwrap_or_else(|| std::process::abort());
+        assert_weight(entry.spend_usd, 0.0, "spend_usd with no traffic yet");
+        assert_weight(entry.spend_ratio, 0.0, "spend_ratio with no traffic yet");
+    }
+
+    #[test]
+    fn tenant_spend_status_excludes_spend_for_undeclared_tenant() {
+        let policy = BudgetPolicyConfig {
+            tenants: vec![tenant("tenant-a", 100.0)],
+        };
+        let spend = spend_map(&[("tenant-a", 1000), ("tenant-orphan", 9999)]);
+        let statuses = tenant_spend_status(&policy, &spend);
+        assert_eq!(
+            statuses.len(),
+            1,
+            "CRDT spend for a tenant no longer declared in policy must be excluded"
+        );
+        assert_eq!(
+            statuses.first().unwrap_or_else(|| std::process::abort()).tenant_id,
+            "tenant-a"
+        );
+    }
+
+    #[test]
+    fn tenant_spend_status_empty_policy_is_empty() {
+        let policy = BudgetPolicyConfig { tenants: Vec::new() };
+        let statuses = tenant_spend_status(&policy, &spend_map(&[("tenant-a", 1000)]));
+        assert!(statuses.is_empty(), "empty policy must produce empty status");
+    }
+
+    #[test]
+    fn tenant_spend_status_is_sorted_by_tenant_id() {
+        let policy = BudgetPolicyConfig {
+            tenants: vec![tenant("tenant-z", 100.0), tenant("tenant-a", 100.0)],
+        };
+        let statuses = tenant_spend_status(&policy, &BTreeMap::new());
+        let ids: Vec<&str> = statuses.iter().map(|s| s.tenant_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["tenant-a", "tenant-z"],
+            "status must be deterministically sorted by tenant_id"
+        );
+    }
+
+    #[test]
+    fn tenant_spend_status_over_cap_clamps_ratio() {
+        let policy = BudgetPolicyConfig {
+            tenants: vec![tenant("tenant-a", 10.0)],
+        };
+        // 20.00 spent against a 10.00 cap.
+        let spend = spend_map(&[("tenant-a", 2000)]);
+        let statuses = tenant_spend_status(&policy, &spend);
+        assert_weight(
+            statuses.first().unwrap_or_else(|| std::process::abort()).spend_ratio,
+            1.0,
+            "over-cap spend_ratio must clamp to 1.0",
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_budget_statuses tests (G1)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn resolve_budget_statuses_none_policy_is_empty() {
+        let statuses = resolve_budget_statuses(None, &spend_map(&[("tenant-a", 1000)]));
+        assert!(
+            statuses.is_empty(),
+            "absent budgetPolicy must produce empty budget_status"
+        );
+    }
+
+    #[test]
+    fn resolve_budget_statuses_delegates_to_tenant_spend_status() {
+        let policy = BudgetPolicyConfig {
+            tenants: vec![tenant("tenant-a", 100.0)],
+        };
+        let spend = spend_map(&[("tenant-a", 5000)]);
+        let statuses = resolve_budget_statuses(Some(&policy), &spend);
+        assert_eq!(statuses.len(), 1);
+        assert_weight(
+            statuses.first().unwrap_or_else(|| std::process::abort()).spend_ratio,
+            0.5,
+            "spend_ratio via resolve_budget_statuses",
+        );
     }
 }

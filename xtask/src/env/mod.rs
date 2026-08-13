@@ -968,7 +968,45 @@ pub(crate) enum Action {
         /// Protect EPP metrics with an nginx mTLS proxy instead of scraping directly over HTTP.
         #[arg(long)]
         metrics_mtls: bool,
+        /// Drive routing off llm-d's kv-cache-utilization signal
+        /// (`GridNetwork` `scoringPolicy.strategy: kvCachePressure`) instead
+        /// of the default queue-depth signal.
+        #[arg(long)]
+        kv_cache: bool,
     },
+}
+
+#[cfg(test)]
+#[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, reason = "tests")]
+mod llmd_pool_metrics_demo_cli_tests {
+    use clap::Parser as _;
+
+    use super::Action;
+    use crate::{Cli, Command};
+
+    /// Parses `env run-grid-llmd-pool-metrics-demo` with the given extra args
+    /// and returns its `kv_cache` flag value.
+    fn parsed_kv_cache_flag(extra_args: &[&str]) -> bool {
+        let mut args = vec!["xtask", "env", "run-grid-llmd-pool-metrics-demo"];
+        args.extend_from_slice(extra_args);
+        let cli = Cli::try_parse_from(args).expect("valid CLI invocation must parse");
+        let Command::Env { action } = cli.command;
+        match action {
+            Action::RunGridLlmdPoolMetricsDemo { kv_cache, .. } => kv_cache,
+            other => panic!("expected RunGridLlmdPoolMetricsDemo, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn kv_cache_flag_defaults_to_false() {
+        assert!(!parsed_kv_cache_flag(&[]));
+    }
+
+    #[test]
+    fn kv_cache_flag_parses_when_passed() {
+        assert!(parsed_kv_cache_flag(&["--kv-cache"]));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1052,7 +1090,8 @@ pub(crate) fn run(action: &Action) -> Result<(), Box<dyn std::error::Error>> {
             forge_config,
             options,
             metrics_mtls,
-        } => llmd_pool_metrics_demo::run(forge_config, options, *metrics_mtls),
+            kv_cache,
+        } => llmd_pool_metrics_demo::run(forge_config, options, *metrics_mtls, *kv_cache),
     }
 }
 

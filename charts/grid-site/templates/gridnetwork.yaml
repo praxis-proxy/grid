@@ -6,9 +6,14 @@ metadata:
   labels:
     {{- include "grid-site.labels" . | nindent 4 }}
 spec:
-  {{- with .Values.gridNetwork.gridId }}
-  gridId: {{ . | quote }}
-  {{- end }}
+  {{- /*
+  gridId is always rendered (even when empty) so `spec` is never a null
+  YAML value. The CRD schema requires `spec` to be present, and a bare
+  `spec:` with no children renders as null when every other field below
+  is also left at its falsy chart default, which the API server rejects
+  with "spec: Required value" on both create and update.
+  */}}
+  gridId: {{ .Values.gridNetwork.gridId | quote }}
   {{- with .Values.gridNetwork.region }}
   region: {{ . | quote }}
   {{- end }}
@@ -28,6 +33,10 @@ spec:
   {{- if . }}
   metricsRefreshInterval: {{ . | quote }}
   {{- end }}
+  {{- end }}
+  {{- with .Values.gridNetwork.budgetPolicy }}
+  budgetPolicy:
+    {{- toYaml . | nindent 4 }}
   {{- end }}
   {{- with .Values.gridNetwork.swim }}
   swim:
