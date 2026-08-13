@@ -22,6 +22,10 @@ env:
   HELM_VERSION: v3.17.3
   KIND_VERSION: v0.32.0
   KUBECONFORM_VERSION: 0.6.7
+  # v1.x's plugin.yaml uses the platformCommand/platformHooks manifest
+  # schema, which the pinned Helm v3.17.3 cannot load. v0.8.2 is the last
+  # release using the command/hooks schema Helm 3.17 supports.
+  HELM_UNITTEST_VERSION: v0.8.2
 
 jobs:
   # ----------------------------------------------------------------------------
@@ -48,6 +52,12 @@ jobs:
           tar xz -C /usr/local/bin kubeconform < /tmp/kubeconform.tar.gz
           rm /tmp/kubeconform.tar.gz
           kubeconform -v
+
+      - name: Install helm-unittest
+        run: helm plugin install https://github.com/helm-unittest/helm-unittest --version "${HELM_UNITTEST_VERSION}"
+
+      - name: Chart template unit tests
+        run: helm unittest charts/grid-site
 
       - name: Validate charts (static)
         run: ./scripts/verify-helm-chart.sh

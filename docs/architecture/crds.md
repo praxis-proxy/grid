@@ -54,12 +54,18 @@ spec:
     swimKeyRef:
       name: swim-key
       namespace: praxis-system
+  budgetPolicy:                   # optional; absent means no tenants are tracked
+    tenants:
+      - tenantId: tenant-a
+        capUsd: 100.0
+      - tenantId: tenant-b
+        capUsd: 250.0
 ```
 
 **Phases**: Pending → Initializing → Active → Degraded
 
 **Status fields**: `gridId`, `connectedSites`, `distributedProviderCount`,
-`observedGeneration`, `phase`, `consumerConfigStatus[]`
+`observedGeneration`, `phase`, `consumerConfigStatus[]`, `budgetStatus[]`
 
 `distributedProviderCount` reflects the number of remote `InferenceProvider`
 records received from peer sites via CRDT broadcast.  Local providers and records
@@ -68,6 +74,35 @@ from other `GridNetwork`s are excluded from the count.
 `consumerConfigStatus[]` is populated for each gateway with
 `consumerConfig.enabled: true`, reporting the outcome of the most recent
 render/apply attempt.
+
+### Tenant budget tracking
+
+`budgetPolicy.tenants[]` opts individual tenants into cumulative spend
+tracking. Grid merges each site's locally recorded spend for a tenant into a
+per-tenant CRDT counter (a `GCounter`, one slot per originating site) that is
+gossiped over SWIM alongside provider state, so the reported total reflects
+spend recorded anywhere in the grid, not just the local site.
+
+For every tenant declared in `budgetPolicy`, `budgetStatus[]` reports:
+
+- `tenantId` — matches `budgetPolicy.tenants[].tenantId`
+- `capUsd` — copied from the policy, in USD
+- `spendUsd` — the converged cross-site total, in USD
+- `spendRatio` — `spendUsd / capUsd`, for at-a-glance dashboarding
+
+`budgetStatus[]` is a status **signal only**. Grid does not itself degrade or
+reject traffic when a tenant's `spendRatio` reaches or exceeds `1.0` — that
+enforcement decision is expected to live in a gateway-side policy filter
+(cross-repo, `praxis-ai`), the same split used for `provider_route`
+authorization. Real per-request tenant attribution also depends on
+upstream work (`praxis-ai#130`/`praxis-ai#104`) and does not exist yet.
+
+Because `budgetStatus[]` is visible to any caller with read access to the
+`GridNetwork` resource, and Kubernetes RBAC is not field-level, a reader
+authorized to view one tenant's status can see every other tracked tenant's
+spend on the same `GridNetwork`. See
+[`grid#48`](https://github.com/praxis-proxy/grid/issues/48) for the
+options under consideration if per-tenant confidentiality is required.
 
 | Field | Type | Meaning |
 |---|---|---|

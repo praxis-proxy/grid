@@ -149,7 +149,23 @@ impl StateBroadcast {
     /// (gateway address and/or site cert PEM) with no CRDT state.
     #[must_use]
     fn is_metadata_only(&self) -> bool {
-        self.snapshot.providers.is_empty() && self.snapshot.capabilities.is_empty()
+        self.snapshot.providers.is_empty()
+            && self.snapshot.capabilities.is_empty()
+            && self.snapshot.tenant_spend.is_empty()
+    }
+
+    /// Return true when this payload carries provider or capability records.
+    ///
+    /// Distinct from [`carries_grid_state`](Self::carries_grid_state): a
+    /// tenant-spend-only broadcast carries grid state (must not be treated as
+    /// metadata-only) but must **not** trigger `replace_origin_providers`,
+    /// which performs a destructive retain-then-replace of the origin's
+    /// provider set. Only a broadcast that actually carries provider or
+    /// capability data represents an authoritative provider-state sync for
+    /// its origin.
+    #[must_use]
+    fn carries_provider_state(&self) -> bool {
+        !self.snapshot.providers.is_empty() || !self.snapshot.capabilities.is_empty()
     }
 
     /// Return true when this payload only advertises a gateway address.
@@ -382,11 +398,27 @@ impl OriginStateHandle {
             })
     }
 
-    /// Remove all state associated with an origin and publish the result.
+    /// Remove provider and transport state for a departed origin, and
+    /// publish the result.
+    ///
+    /// Deliberately does **not** touch `tenant_spend`: this method fires on
+    /// ordinary SWIM membership churn (a site marked `Suspect`/`Dead` past
+    /// its suspect/dead TTL, e.g. a pod restart or a transient partition —
+    /// see `operator::swim_runtime::prune_tracked_members`), not on
+    /// permanent tenant-budget retirement. `tenant_spend` is a cumulative
+    /// (grow-only) ledger; wiping a site's slot here would let a tenant's
+    /// `spendRatio` drop on a restart or blip and reopen an
+    /// already-exhausted budget. If spend ever needs to expire, that must be
+    /// an explicit budget-epoch/window reset, not a side effect of
+    /// membership eviction — tracked in
+    /// [grid#52](https://github.com/praxis-proxy/grid/issues/52), which also
+    /// covers bounding per-tenant site-slot growth now that this path no
+    /// longer prunes it.
     pub(crate) fn remove_origin(&self, origin: &str) {
         self.lock().remove(origin);
-        self.state_tx
-            .send_modify(|snapshot| snapshot.remove_origin_providers(origin));
+        self.state_tx.send_modify(|snapshot| {
+            snapshot.remove_origin_providers(origin);
+        });
         self.gateway_addrs_tx.send_modify(|addresses| {
             addresses.remove(origin);
         });
@@ -671,9 +703,16 @@ impl foca::BroadcastHandler<NodeId> for StateBroadcastHandler {
             return Ok(None);
         }
 
+        let carries_provider_state = broadcast.carries_provider_state();
         self.state_tx.send_modify(|snap| {
             snap.capabilities.merge(&broadcast.snapshot.capabilities);
-            snap.replace_origin_providers(&broadcast.origin_site, broadcast.revision, &broadcast.snapshot);
+            snap.merge_tenant_spend_from_origin(&broadcast.origin_site, &broadcast.snapshot.tenant_spend);
+            // A spend-only broadcast must not run the destructive
+            // origin-provider replace below — it doesn't carry an
+            // authoritative provider list for this cycle at all.
+            if carries_provider_state {
+                snap.replace_origin_providers(&broadcast.origin_site, broadcast.revision, &broadcast.snapshot);
+            }
         });
         self.retained
             .lock()
@@ -690,7 +729,7 @@ impl foca::BroadcastHandler<NodeId> for StateBroadcastHandler {
 
 #[cfg(test)]
 mod tests {
-    use crdt::{Capability, ProviderMetricsSnapshot, ProviderPhase, ProviderState};
+    use crdt::{Capability, GCounter, ProviderMetricsSnapshot, ProviderPhase, ProviderState};
     use foca::{BroadcastHandler as _, Invalidates as _};
 
     use super::*;
@@ -759,6 +798,121 @@ mod tests {
         assert!(
             !metadata.carries_grid_state(),
             "metadata uses its existing independent refresh path"
+        );
+    }
+
+    #[test]
+    fn tenant_spend_only_snapshot_carries_grid_state() {
+        // A broadcast can carry only a tenant_spend increment (no provider or
+        // capability change this gossip cycle) — this must NOT be classified
+        // as metadata-only, or receive_item's merge path is skipped entirely
+        // (regression: `is_metadata_only` originally only checked
+        // providers/capabilities, silently dropping spend-only broadcasts).
+        let mut snap = GridStateSnapshot::new("site-p".to_owned());
+        snap.increment_tenant_spend("tenant-x", 500);
+        let broadcast = StateBroadcast::new("site-p".to_owned(), 1, snap, None);
+
+        assert!(
+            broadcast.carries_grid_state(),
+            "tenant_spend-only snapshot must be treated as carrying grid state, not metadata-only"
+        );
+    }
+
+    #[test]
+    fn receive_item_merges_tenant_spend_only_broadcast_with_no_providers_or_capabilities() {
+        let mut handler = StateBroadcastHandler::new("site-local".to_owned());
+        let mut snap = GridStateSnapshot::new("site-p".to_owned());
+        snap.increment_tenant_spend("tenant-x", 500);
+        let broadcast = StateBroadcast::new("site-p".to_owned(), 1, snap, None);
+
+        receive(&mut handler, &broadcast);
+
+        assert_eq!(
+            handler
+                .snapshot()
+                .tenant_spend
+                .get("tenant-x")
+                .unwrap_or_else(|| std::process::abort())
+                .total(),
+            500,
+            "a broadcast with only tenant_spend set (no providers/capabilities) must still be merged, \
+             not dropped as metadata-only"
+        );
+    }
+
+    #[test]
+    fn receive_item_spend_only_broadcast_does_not_wipe_origins_existing_providers() {
+        // Bugbot regression: a later spend-only broadcast from an origin that
+        // already has real providers must not erase those providers.
+        // `replace_origin_providers` performs a destructive retain-then-replace
+        // for the origin's provider set; it must only run when the broadcast
+        // actually carries provider/capability data, not merely because
+        // `carries_grid_state()` is true (which tenant_spend alone satisfies).
+        let mut handler = StateBroadcastHandler::new("site-local".to_owned());
+        let full = StateBroadcast::new("site-p".to_owned(), 1, snapshot("site-p", 1, 0.2), None);
+        receive(&mut handler, &full);
+        assert!(
+            handler.snapshot().provider("net", "site-p", "provider").is_some(),
+            "precondition: origin's provider must be present after the first broadcast"
+        );
+
+        let mut spend_only = GridStateSnapshot::new("site-p".to_owned());
+        spend_only.increment_tenant_spend("tenant-x", 500);
+        let spend_broadcast = StateBroadcast::new("site-p".to_owned(), 2, spend_only, None);
+        receive(&mut handler, &spend_broadcast);
+
+        assert!(
+            handler.snapshot().provider("net", "site-p", "provider").is_some(),
+            "a spend-only broadcast from the same origin must not wipe that origin's provider records"
+        );
+        assert_eq!(
+            handler
+                .snapshot()
+                .tenant_spend
+                .get("tenant-x")
+                .unwrap_or_else(|| std::process::abort())
+                .total(),
+            500,
+            "the spend-only broadcast's tenant_spend must still be merged"
+        );
+    }
+
+    #[test]
+    fn origin_state_handle_remove_origin_preserves_that_origins_tenant_spend() {
+        // Correctness (grid#47 review): membership eviction fires on ordinary
+        // SWIM churn (a restart or a transient partition exceeding the
+        // suspect/dead TTL), not on permanent tenant-budget retirement.
+        // Wiping a site's cumulative spend contribution here would let
+        // `spendRatio` drop and reopen an already-exhausted budget on a mere
+        // restart, unlike provider records (which are membership-scoped and
+        // correctly pruned).
+        let (mut handler, control) = StateBroadcastHandler::with_capacity("site-local".to_owned(), 8);
+        let mut snap = GridStateSnapshot::new("site-p".to_owned());
+        snap.increment_tenant_spend("tenant-x", 500);
+        let broadcast = StateBroadcast::new("site-p".to_owned(), 1, snap, None);
+        receive(&mut handler, &broadcast);
+        assert_eq!(
+            control
+                .state_tx
+                .borrow()
+                .tenant_spend
+                .get("tenant-x")
+                .map(GCounter::total),
+            Some(500),
+            "precondition: tenant spend merged before eviction"
+        );
+
+        control.remove_origin("site-p");
+
+        assert_eq!(
+            control
+                .state_tx
+                .borrow()
+                .tenant_spend
+                .get("tenant-x")
+                .map(GCounter::total),
+            Some(500),
+            "evicting an origin from membership must not erase its cumulative spend contribution"
         );
     }
 
@@ -1278,6 +1432,55 @@ mod tests {
             Some("10.0.0.2:19080")
         );
         assert_eq!(handler.cert_pem_for_site("site-p").as_deref(), Some(cert));
+    }
+
+    // -----------------------------------------------------------------------
+    // tenant_spend broadcast wiring tests (F1-F2)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn receive_item_merges_tenant_spend_from_broadcast() {
+        let mut handler = StateBroadcastHandler::new("site-local".to_owned());
+        let mut snap = snapshot("site-p", 1, 0.2);
+        snap.increment_tenant_spend("tenant-x", 500);
+        let broadcast = StateBroadcast::new("site-p".to_owned(), 1, snap, None);
+
+        receive(&mut handler, &broadcast);
+
+        let merged = handler.snapshot();
+        assert_eq!(
+            merged
+                .tenant_spend
+                .get("tenant-x")
+                .unwrap_or_else(|| std::process::abort())
+                .total(),
+            500,
+            "receive_item must merge the broadcast's tenant_spend into the handler's snapshot"
+        );
+    }
+
+    #[test]
+    fn receive_item_sums_tenant_spend_across_origin_sites() {
+        let mut handler = StateBroadcastHandler::new("site-local".to_owned());
+
+        let mut snap_a = snapshot("site-a", 1, 0.2);
+        snap_a.increment_tenant_spend("tenant-x", 300);
+        receive(&mut handler, &StateBroadcast::new("site-a".to_owned(), 1, snap_a, None));
+
+        let mut snap_b = snapshot("site-b", 1, 0.2);
+        snap_b.increment_tenant_spend("tenant-x", 700);
+        receive(&mut handler, &StateBroadcast::new("site-b".to_owned(), 1, snap_b, None));
+
+        let merged = handler.snapshot();
+        assert_eq!(
+            merged
+                .tenant_spend
+                .get("tenant-x")
+                .unwrap_or_else(|| std::process::abort())
+                .total(),
+            1000,
+            "tenant spend from two different origin sites must sum, proving cross-site convergence at the wiring layer"
+        );
     }
 
     #[test]
