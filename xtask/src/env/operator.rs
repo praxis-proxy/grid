@@ -6755,7 +6755,10 @@ pub(crate) fn wait_for_remote_candidate_fresh(
 ) -> Result<(), Box<dyn std::error::Error>> {
     const RECOVERY_BUMP_INTERVAL: Duration = Duration::from_secs(5);
     let deadline = Instant::now() + timeout;
-    let mut last_bump = Instant::now() - RECOVERY_BUMP_INTERVAL; // trigger first bump immediately
+    // trigger first bump immediately
+    let mut last_bump = Instant::now()
+        .checked_sub(RECOVERY_BUMP_INTERVAL)
+        .unwrap_or_else(Instant::now);
     loop {
         // Periodic bump: ensure the operator reconciles after each SWIM membership
         // update so the overlay reflects the latest fresh=true state.
@@ -7179,7 +7182,8 @@ pub(crate) fn wait_for_remote_candidate_absent(
 ) -> Result<(), Box<dyn std::error::Error>> {
     const BUMP_INTERVAL: Duration = Duration::from_secs(5);
     let deadline = Instant::now() + timeout;
-    let mut last_bump = Instant::now() - BUMP_INTERVAL; // trigger first bump immediately
+    // trigger first bump immediately
+    let mut last_bump = Instant::now().checked_sub(BUMP_INTERVAL).unwrap_or_else(Instant::now);
     loop {
         // Bump periodically so a reconcile fires after each age-tick window.
         if last_bump.elapsed() >= BUMP_INTERVAL {

@@ -818,7 +818,9 @@ fn proof_baseline(context: &DemoContext) -> ProofResult {
     eprintln!("  [BASELINE] Waiting for pool-a to become preferred at idle");
     let deadline = Instant::now() + DATA_PLANE_WAIT;
     let mut last_reconcile_trigger = Instant::now();
-    let mut last_request = Instant::now() - Duration::from_secs(10);
+    let mut last_request = Instant::now()
+        .checked_sub(Duration::from_secs(10))
+        .unwrap_or_else(Instant::now);
 
     for cluster in CLUSTERS {
         trigger_gridnetwork_reconcile(cluster);
@@ -2187,9 +2189,7 @@ fn materialize_config(
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let dir = forge_config.parent().unwrap_or_else(|| Path::new("."));
     let resolved = dir.join(".forge.resolved.yaml");
-    let content = fs::read_to_string(forge_config)?;
-
-    let mut result = content.clone();
+    let mut result = fs::read_to_string(forge_config)?;
     for cluster in CLUSTERS {
         let provider_name = format!("llmd-{cluster}-provider");
         let candidate_id = fnv1a_hex8(&format!("inference_model/{VCR_MODEL}/{cluster}/{provider_name}"));

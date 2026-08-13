@@ -166,7 +166,7 @@ mod tests {
         let req = Request::builder()
             .method("POST")
             .uri(GENERATE_URL)
-            .header(bearer_header().0.clone(), bearer_header().1)
+            .header(bearer_header().0, bearer_header().1)
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(r#"{"contents":[{"parts":[{"text":"hi"}]}]}"#))
             .unwrap_or_default();
@@ -185,7 +185,7 @@ mod tests {
         let req = Request::builder()
             .method("POST")
             .uri(STREAM_URL)
-            .header(bearer_header().0.clone(), bearer_header().1)
+            .header(bearer_header().0, bearer_header().1)
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(r#"{"contents":[{"parts":[{"text":"hi"}]}]}"#))
             .unwrap_or_default();

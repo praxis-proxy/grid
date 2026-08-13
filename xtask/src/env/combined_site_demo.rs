@@ -2092,11 +2092,12 @@ fn wait_for_remote_session(
     context: &str,
     pod_name: &str,
     session_id: &str,
-    content: &str,
+    message_text: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
     wait_for_combined_site_data_plane("combined-site remote session routing", || {
         let session_header = format!("X-Session-Id: {session_id}");
-        let body = format!(r#"{{"model":"{PRIMARY_MODEL}","messages":[{{"role":"user","content":"{content}"}}]}}"#);
+        let body =
+            format!(r#"{{"model":"{PRIMARY_MODEL}","messages":[{{"role":"user","content":"{message_text}"}}]}}"#);
         let output = run_curl_probe(
             context,
             pod_name,

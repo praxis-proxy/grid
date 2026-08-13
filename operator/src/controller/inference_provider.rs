@@ -2268,7 +2268,7 @@ mod tests {
         // A successful HTTP probe followed by an HTTPS failure must not
         // interfere with each other.
         let http_url = start_test_server(b"HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n").await;
-        let http_result = probe_endpoint(&http_url, Duration::from_secs(5), None).await;
+        let plain_outcome = probe_endpoint(&http_url, Duration::from_secs(5), None).await;
 
         // HTTPS probe against a non-TLS server → Unavailable (TLS error).
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -2276,15 +2276,15 @@ mod tests {
             .unwrap_or_else(|_| std::process::abort());
         let port = listener.local_addr().unwrap_or_else(|_| std::process::abort()).port();
         tokio::spawn(async move { if let Ok((_stream, _)) = listener.accept().await {} });
-        let https_result = probe_endpoint(&format!("https://127.0.0.1:{port}"), Duration::from_secs(5), None).await;
+        let tls_outcome = probe_endpoint(&format!("https://127.0.0.1:{port}"), Duration::from_secs(5), None).await;
 
         assert_eq!(
-            http_result,
+            plain_outcome,
             ProbeOutcome::Healthy,
             "HTTP probe must succeed independently"
         );
         assert_eq!(
-            https_result,
+            tls_outcome,
             ProbeOutcome::Unavailable,
             "HTTPS TLS error must yield Unavailable independently"
         );

@@ -4103,7 +4103,7 @@ mod tests {
             schema_version: "1.0.0".to_owned(),
             rendered_revision: rev.clone(),
             distributed_revision: rev.clone(),
-            content_digest: rev.clone(),
+            content_digest: rev,
             config_map_resource_version: "100".to_owned(),
             rendered_at: "2026-07-29T01:00:00Z".to_owned(),
             candidate_count: 2,

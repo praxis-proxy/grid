@@ -809,7 +809,7 @@ pub async fn start(config: SwimConfig) -> Result<Arc<SwimHandle>, SwimRuntimeErr
     let (broadcast_tx, broadcast_rx) = mpsc::channel::<swim::StateBroadcast>(32);
     let (seed_tx, seed_rx) = mpsc::channel::<Vec<SocketAddr>>(16);
     let (key_tx, key_rx) = watch::channel(initial_key);
-    let (gateway_tx, gateway_loop_rx) = watch::channel(gateway_address.clone());
+    let (gateway_tx, gateway_loop_rx) = watch::channel(gateway_address);
     let (runtime_tx, _) = watch::channel(true);
     let channels = RuntimeChannels {
         snapshot_tx,
@@ -2354,8 +2354,9 @@ mod tests {
         let mut tracked = HashMap::new();
         apply_member_event(joined("site-a"), &mut tracked, t0);
         apply_member_event(left("site-a"), &mut tracked, t_dead);
+        let just_before_ttl = (t_dead + ttl).checked_sub(Duration::from_secs(1)).unwrap_or(t0);
         assert!(
-            prune_tracked_members(&mut tracked, t_dead + ttl - Duration::from_secs(1), ttl).is_empty(),
+            prune_tracked_members(&mut tracked, just_before_ttl, ttl).is_empty(),
             "dead member must remain before TTL"
         );
         assert_eq!(
@@ -2390,13 +2391,11 @@ mod tests {
         let mut tracked = HashMap::new();
         apply_member_event(joined("site-a"), &mut tracked, t0);
         apply_member_event(suspect("site-a"), &mut tracked, t_suspect);
+        let just_before_ttl = (t_suspect + SUSPECT_MEMBER_TTL)
+            .checked_sub(Duration::from_secs(1))
+            .unwrap_or(t0);
         assert!(
-            prune_tracked_members(
-                &mut tracked,
-                t_suspect + SUSPECT_MEMBER_TTL - Duration::from_secs(1),
-                ttl
-            )
-            .is_empty(),
+            prune_tracked_members(&mut tracked, just_before_ttl, ttl).is_empty(),
             "suspect member must remain before its TTL"
         );
         assert_eq!(

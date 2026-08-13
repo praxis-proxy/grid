@@ -61,6 +61,11 @@ mod tests {
         };
         let cloned = event.clone();
         assert!(matches!(cloned, MemberEvent::Left { .. }), "should clone correctly");
+        assert_eq!(
+            format!("{event:?}"),
+            format!("{cloned:?}"),
+            "clone must be independently equal to the original, not just the same variant shape"
+        );
     }
 
     #[test]
@@ -75,6 +80,11 @@ mod tests {
         assert!(
             matches!(cloned, MemberEvent::Suspect { .. }),
             "Suspect must clone correctly"
+        );
+        assert_eq!(
+            format!("{event:?}"),
+            format!("{cloned:?}"),
+            "clone must be independently equal to the original, not just the same variant shape"
         );
     }
 }

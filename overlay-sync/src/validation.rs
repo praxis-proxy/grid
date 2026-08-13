@@ -136,7 +136,7 @@ pub(crate) fn validate_envelope(
     validate_revision_digest_agreement(&envelope)?;
     validate_content_digest(&envelope)?;
 
-    let revision = envelope.revision.value.clone();
+    let revision = envelope.revision.value;
 
     if let Some(current) = current_revision
         && revision == current

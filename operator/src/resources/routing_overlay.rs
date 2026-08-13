@@ -2885,12 +2885,12 @@ mod tests {
     #[test]
     fn selector_labels_match_only_labeled_sites() {
         let network = test_network("net");
-        let site_gpu = test_site_with_labels("gpu-site", "net", &[("hw", "gpu")]);
-        let site_cpu = test_site_with_labels("cpu-site", "net", &[("hw", "cpu")]);
+        let matching_site = test_site_with_labels("gpu-site", "net", &[("hw", "gpu")]);
+        let non_matching_site = test_site_with_labels("cpu-site", "net", &[("hw", "cpu")]);
         let provider = test_provider_with_selector("prov", "net", &["model"], &[("hw", "gpu")]);
         let overlay = render_routing_overlay(
             &network,
-            &[site_gpu, site_cpu],
+            &[matching_site, non_matching_site],
             &[provider],
             &[],
             "test-site",
