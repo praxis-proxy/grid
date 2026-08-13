@@ -1305,6 +1305,31 @@ images must exist in the local container daemon:
 | `localhost/praxis-ai-mock-epp:latest` | AI repository external checkout | All provider gateways |
 | `grid-mock-providers:latest` | This repository, `mock-providers/Containerfile` | Provider clusters with `backend = "mock-openai"` only |
 
+This table applies to the generic `xtask env` harness above
+(`validate-all`, `verify-swim-mesh-three-node`,
+`verify-failover-under-lost-peer`, etc.), which is the only
+path that consumes these two locally-built defaults directly.
+The named demos (`grid-glb-demo`, `grid-combined-site`,
+`grid-llmd-pool-metrics`) do **not** need them — they override
+`GRID_XTASK_GATEWAY_IMAGE`/`GRID_XTASK_MOCK_EPP_IMAGE`
+(see `xtask/src/env/image_overrides.rs`) with published
+`ghcr.io/praxis-proxy/grid-ai-rollup` images and never build
+from an AI repository checkout.
+
+As of this writing, neither `Containerfile.composed` nor a mock
+llm-d Endpoint Picker server implementation exists in the AI
+repository (tracked in
+[`ai#716`](https://github.com/praxis-proxy/ai/issues/716)), so
+`build-gateway-images --ai-repo <path>` cannot currently produce
+either of the first two images. That gap blocks only the
+generic-harness path — concretely, `verify-failover-under-lost-peer`
+today — not any of the three named demos above. It is itself
+soft-blocked on the in-flight, other-team-owned
+[`ai#334`](https://github.com/praxis-proxy/ai/pull/334)
+(`ext_proc` compatibility moving into the AI repository), which is
+deliberately paused pending a release-timeline decision rather than
+abandoned.
+
 Use `build-gateway-images --ai-repo <path>` to build the first two images from
 the AI repository source tree. Build `grid-mock-providers:latest` separately
 from this repository:
