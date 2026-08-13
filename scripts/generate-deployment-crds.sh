@@ -13,9 +13,10 @@ echo "Generating Grid CRDs..."
 mkdir -p "$CRD_DIR"
 
 # Generate CRDs and split into individual YAML files
-cargo run -p operator --bin generate_crds | jq -r '.items[0]' | yq eval -P > "$CRD_DIR/gridnetwork.yaml"
-cargo run -p operator --bin generate_crds | jq -r '.items[1]' | yq eval -P > "$CRD_DIR/gridsite.yaml"
-cargo run -p operator --bin generate_crds | jq -r '.items[2]' | yq eval -P > "$CRD_DIR/inferenceprovider.yaml"
+cargo run -p operator --bin generate_crds | jq -r '.items[0]' | yq eval -P > "$CRD_DIR/agenttoolprovider.yaml"
+cargo run -p operator --bin generate_crds | jq -r '.items[1]' | yq eval -P > "$CRD_DIR/gridnetwork.yaml"
+cargo run -p operator --bin generate_crds | jq -r '.items[2]' | yq eval -P > "$CRD_DIR/gridsite.yaml"
+cargo run -p operator --bin generate_crds | jq -r '.items[3]' | yq eval -P > "$CRD_DIR/inferenceprovider.yaml"
 
 echo "CRDs generated in $CRD_DIR:"
 ls -la "$CRD_DIR"

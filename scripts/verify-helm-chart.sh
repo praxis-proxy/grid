@@ -75,7 +75,7 @@ fi
 # ── CRD synchronization ─────────────────────────────────────────────
 echo ""
 echo "=== CRD synchronization ==="
-for crd in gridnetwork gridsite inferenceprovider; do
+for crd in agenttoolprovider gridnetwork gridsite inferenceprovider; do
   if diff -q "$DEPLOY_CRDS/${crd}.yaml" "$CHART_DIR/crds/${crd}.yaml" >/dev/null 2>&1; then
     pass "crd sync: ${crd}.yaml"
   else
@@ -167,7 +167,8 @@ TGZ=$(echo "$PKG_OUT" | grep -oP '/tmp/\S+\.tgz')
 if [ -f "$TGZ" ]; then
   pass "helm package: $(basename "$TGZ") ($(stat -c%s "$TGZ") bytes)"
   CONTENTS=$(tar tzf "$TGZ" 2>&1)
-  for f in Chart.yaml values.yaml values.schema.json templates/deployment.yaml crds/gridnetwork.yaml; do
+  for f in Chart.yaml values.yaml values.schema.json templates/deployment.yaml crds/agenttoolprovider.yaml \
+    crds/gridnetwork.yaml crds/gridsite.yaml crds/inferenceprovider.yaml; do
     if echo "$CONTENTS" | grep -q "$f"; then
       pass "package contains: $f"
     else
@@ -537,7 +538,8 @@ if [ "${KIND:-}" = "1" ] || [ "${1:-}" = "--kind" ]; then
     fail "kind: operator install"
   fi
 
-  for crd in gridnetworks.grid.praxis-proxy.io gridsites.grid.praxis-proxy.io inferenceproviders.grid.praxis-proxy.io; do
+  for crd in agenttoolproviders.grid.praxis-proxy.io gridnetworks.grid.praxis-proxy.io gridsites.grid.praxis-proxy.io \
+    inferenceproviders.grid.praxis-proxy.io; do
     if kubectl --context "$KCTX" get crd "$crd" >/dev/null 2>&1; then
       pass "kind: crd $crd established"
     else
@@ -617,7 +619,8 @@ CR_EOF
     fail "kind: operator uninstall"
   fi
 
-  for crd in gridnetworks.grid.praxis-proxy.io gridsites.grid.praxis-proxy.io inferenceproviders.grid.praxis-proxy.io; do
+  for crd in agenttoolproviders.grid.praxis-proxy.io gridnetworks.grid.praxis-proxy.io gridsites.grid.praxis-proxy.io \
+    inferenceproviders.grid.praxis-proxy.io; do
     if kubectl --context "$KCTX" get crd "$crd" >/dev/null 2>&1; then
       pass "kind: crd $crd retained after uninstall"
     else
