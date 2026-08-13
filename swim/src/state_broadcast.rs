@@ -398,12 +398,26 @@ impl OriginStateHandle {
             })
     }
 
-    /// Remove all state associated with an origin and publish the result.
+    /// Remove provider and transport state for a departed origin, and
+    /// publish the result.
+    ///
+    /// Deliberately does **not** touch `tenant_spend`: this method fires on
+    /// ordinary SWIM membership churn (a site marked `Suspect`/`Dead` past
+    /// its suspect/dead TTL, e.g. a pod restart or a transient partition —
+    /// see `operator::swim_runtime::prune_tracked_members`), not on
+    /// permanent tenant-budget retirement. `tenant_spend` is a cumulative
+    /// (grow-only) ledger; wiping a site's slot here would let a tenant's
+    /// `spendRatio` drop on a restart or blip and reopen an
+    /// already-exhausted budget. If spend ever needs to expire, that must be
+    /// an explicit budget-epoch/window reset, not a side effect of
+    /// membership eviction — tracked in
+    /// [grid#52](https://github.com/praxis-proxy/grid/issues/52), which also
+    /// covers bounding per-tenant site-slot growth now that this path no
+    /// longer prunes it.
     pub(crate) fn remove_origin(&self, origin: &str) {
         self.lock().remove(origin);
         self.state_tx.send_modify(|snapshot| {
             snapshot.remove_origin_providers(origin);
-            snapshot.remove_origin_tenant_spend(origin);
         });
         self.gateway_addrs_tx.send_modify(|addresses| {
             addresses.remove(origin);
@@ -864,10 +878,14 @@ mod tests {
     }
 
     #[test]
-    fn origin_state_handle_remove_origin_also_clears_that_origins_tenant_spend() {
-        // Security (unbounded growth): eviction must strip the evicted
-        // origin's tenant_spend contribution too, mirroring provider cleanup,
-        // so a churning/attacking origin's slots don't linger forever.
+    fn origin_state_handle_remove_origin_preserves_that_origins_tenant_spend() {
+        // Correctness (grid#47 review): membership eviction fires on ordinary
+        // SWIM churn (a restart or a transient partition exceeding the
+        // suspect/dead TTL), not on permanent tenant-budget retirement.
+        // Wiping a site's cumulative spend contribution here would let
+        // `spendRatio` drop and reopen an already-exhausted budget on a mere
+        // restart, unlike provider records (which are membership-scoped and
+        // correctly pruned).
         let (mut handler, control) = StateBroadcastHandler::with_capacity("site-local".to_owned(), 8);
         let mut snap = GridStateSnapshot::new("site-p".to_owned());
         snap.increment_tenant_spend("tenant-x", 500);
@@ -886,9 +904,15 @@ mod tests {
 
         control.remove_origin("site-p");
 
-        assert!(
-            !control.state_tx.borrow().tenant_spend.contains_key("tenant-x"),
-            "evicting the only contributing origin must prune the tenant's spend entry entirely"
+        assert_eq!(
+            control
+                .state_tx
+                .borrow()
+                .tenant_spend
+                .get("tenant-x")
+                .map(GCounter::total),
+            Some(500),
+            "evicting an origin from membership must not erase its cumulative spend contribution"
         );
     }
 

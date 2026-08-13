@@ -22,7 +22,10 @@ env:
   HELM_VERSION: v3.17.3
   KIND_VERSION: v0.32.0
   KUBECONFORM_VERSION: 0.6.7
-  HELM_UNITTEST_VERSION: v1.1.1
+  # v1.x's plugin.yaml uses the platformCommand/platformHooks manifest
+  # schema, which the pinned Helm v3.17.3 cannot load. v0.8.2 is the last
+  # release using the command/hooks schema Helm 3.17 supports.
+  HELM_UNITTEST_VERSION: v0.8.2
 
 jobs:
   # ----------------------------------------------------------------------------

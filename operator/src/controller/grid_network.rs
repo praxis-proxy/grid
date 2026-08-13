@@ -187,6 +187,24 @@ fn grid_network_name(network: &GridNetwork) -> Result<&str, OperatorError> {
         .ok_or_else(|| OperatorError::InvalidResource("GridNetwork missing metadata.name".into()))
 }
 
+/// Reject a [`GridNetwork`] whose `budgetPolicy` fails validation, before any
+/// other reconcile work begins.
+///
+/// Pure and I/O-free (network fields only), so the reconcile-time wiring this
+/// guards is exercised directly by unit tests without a live or mocked
+/// Kubernetes client, per this repo's convention of preferring pure decision
+/// functions for reconciliation logic (`docs/conventions.md`). The CRD
+/// schema's numeric minimum on `capUsd` already rejects negative values at
+/// admission time; this is the defensive second layer for `NaN`/infinite
+/// caps and blank/duplicate `tenantId`s that the schema cannot express.
+fn reject_invalid_budget_policy(network: &GridNetwork) -> Result<(), OperatorError> {
+    let Some(policy) = network.spec.budget_policy.as_ref() else {
+        return Ok(());
+    };
+    crate::crd::grid_network::validate_budget_policy(policy)
+        .map_err(|error| OperatorError::InvalidResource(format!("invalid budgetPolicy: {error}")))
+}
+
 // ---------------------------------------------------------------------------
 // Reconcile
 // ---------------------------------------------------------------------------
@@ -208,6 +226,7 @@ fn grid_network_name(network: &GridNetwork) -> Result<&str, OperatorError> {
 )]
 pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Result<Action, OperatorError> {
     let name = grid_network_name(&network)?;
+    reject_invalid_budget_policy(&network)?;
 
     info!(name, "reconciling GridNetwork");
 
@@ -2212,7 +2231,10 @@ fn parse_metrics_refresh_interval(value: &str) -> Result<Duration, OperatorError
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::swim::MemberRecord;
+    use crate::{
+        crd::grid_network::{BudgetPolicyConfig, TenantBudgetConfig},
+        swim::MemberRecord,
+    };
 
     fn make_inference_provider(name: &str, network_ref: &str) -> InferenceProvider {
         serde_json::from_value(serde_json::json!({
@@ -2336,6 +2358,85 @@ mod tests {
             "spec": { "seeds": [], "gridId": "test-id" }
         }))
         .unwrap_or_else(|_| std::process::abort())
+    }
+
+    // -----------------------------------------------------------------------
+    // reject_invalid_budget_policy
+    // -----------------------------------------------------------------------
+
+    fn network_with_budget_policy(tenants: Vec<TenantBudgetConfig>) -> GridNetwork {
+        let mut network = base_network();
+        network.spec.budget_policy = Some(BudgetPolicyConfig { tenants });
+        network
+    }
+
+    fn tenant(tenant_id: &str, cap_usd: f64) -> TenantBudgetConfig {
+        TenantBudgetConfig {
+            tenant_id: tenant_id.to_owned(),
+            cap_usd,
+        }
+    }
+
+    #[test]
+    fn reject_invalid_budget_policy_accepts_absent_policy() {
+        let network = base_network();
+        assert!(
+            reject_invalid_budget_policy(&network).is_ok(),
+            "a GridNetwork with no budgetPolicy at all must not be rejected"
+        );
+    }
+
+    #[test]
+    fn reject_invalid_budget_policy_accepts_valid_policy() {
+        let network = network_with_budget_policy(vec![tenant("tenant-a", 100.0), tenant("tenant-b", 250.0)]);
+        assert!(
+            reject_invalid_budget_policy(&network).is_ok(),
+            "distinct positive caps and non-empty tenant ids must be accepted"
+        );
+    }
+
+    #[test]
+    fn reject_invalid_budget_policy_rejects_blank_tenant_id() {
+        let network = network_with_budget_policy(vec![tenant("", 100.0)]);
+        let Err(error) = reject_invalid_budget_policy(&network) else {
+            std::process::abort()
+        };
+        assert!(
+            error.to_string().contains("budgetPolicy"),
+            "error must identify the budgetPolicy as the invalid field, got: {error}"
+        );
+    }
+
+    #[test]
+    fn reject_invalid_budget_policy_rejects_duplicate_tenant_id() {
+        let network = network_with_budget_policy(vec![tenant("tenant-a", 100.0), tenant("tenant-a", 200.0)]);
+        let Err(error) = reject_invalid_budget_policy(&network) else {
+            std::process::abort()
+        };
+        assert!(
+            error.to_string().contains("tenant-a"),
+            "error must name the offending tenant_id, got: {error}"
+        );
+    }
+
+    #[test]
+    fn reject_invalid_budget_policy_rejects_negative_cap() {
+        let network = network_with_budget_policy(vec![tenant("tenant-a", -5.0)]);
+        assert!(
+            reject_invalid_budget_policy(&network).is_err(),
+            "negative capUsd must be rejected even though the CRD schema minimum should already catch this before reconcile"
+        );
+    }
+
+    #[test]
+    fn reject_invalid_budget_policy_rejects_non_finite_cap() {
+        for bad_cap in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let network = network_with_budget_policy(vec![tenant("tenant-a", bad_cap)]);
+            assert!(
+                reject_invalid_budget_policy(&network).is_err(),
+                "non-finite capUsd ({bad_cap}) must be rejected"
+            );
+        }
     }
 
     fn alive_snapshot(count: usize) -> MembershipSnapshot {

@@ -199,24 +199,28 @@ pub struct BudgetPolicyConfig {
 /// already rejects negative values at admission time; [`validate_budget_policy`]
 /// is a defensive second layer for callers that construct or deserialize a
 /// [`BudgetPolicyConfig`] outside the Kubernetes API path.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum BudgetPolicyValidationError {
     /// A tenant's `capUsd` is negative.
+    #[error("tenant {tenant_id:?} has a negative capUsd")]
     NegativeCap {
         /// Offending tenant identifier.
         tenant_id: String,
     },
     /// A tenant's `capUsd` is `NaN` or infinite.
+    #[error("tenant {tenant_id:?} has a non-finite capUsd")]
     NonFiniteCap {
         /// Offending tenant identifier.
         tenant_id: String,
     },
     /// The same `tenantId` appears more than once.
+    #[error("tenant id {tenant_id:?} appears more than once")]
     DuplicateTenant {
         /// The repeated tenant identifier.
         tenant_id: String,
     },
     /// A tenant entry has a blank (empty or whitespace-only) `tenantId`.
+    #[error("a tenant entry has a blank tenantId")]
     BlankTenantId,
 }
 
