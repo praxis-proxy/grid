@@ -7,13 +7,17 @@
 //! (legacy handshake-based and modern stateless) transparently, so none of
 //! that detection logic is reimplemented here.
 //!
-//! Split into two layers, deliberately:
+//! Split into three layers, deliberately:
 //!
 //! - **Pure decision logic** (outcome classification, phase/reason mapping, discovered-tools preservation, tool-name
 //!   extraction, header/TLS attachment decisions): unit-tested with hand-built fixtures, no network.
-//! - **I/O glue** (`rmcp`/`reqwest` error introspection, the actual live probe): covered by the integration tier
-//!   against a real local HTTP listener (see `probe_integration_tests` in the tracking plan), not unit-tested, since it
-//!   exercises third-party wire behavior rather than this crate's own branching.
+//! - **Mockable Kubernetes I/O** (`attach_tls_ca`/`attach_tls_client_identity`/`read_tls_material`'s
+//!   `Api::<Secret>::get_opt` calls and PEM parsing): unit-tested against a `tower::service_fn`-backed `kube::Client`
+//!   (see `mock_kube_client_with_secrets` in `mod tests`) — this is genuine Secret I/O, but deterministic and mockable
+//!   without a real API server, so it stays at the unit tier rather than the integration tier below.
+//! - **Real network I/O** (`rmcp`/`reqwest` error introspection, the actual live probe): covered by the integration
+//!   tier against a real local HTTP listener (`mod integration_tests`), not unit-tested, since it exercises third-party
+//!   wire behavior rather than this crate's own branching.
 
 use std::{
     collections::HashMap,
@@ -29,6 +33,7 @@ use rmcp::{
         streamable_http_client::{StreamableHttpClientTransportConfig, StreamableHttpError},
     },
 };
+use rustls::pki_types::pem::PemObject as _;
 
 use crate::{
     crd::inference_provider::EndpointTlsConfig,
@@ -49,6 +54,16 @@ use crate::{
 /// blocks) since Alibaba's metadata service sits in RFC 6598 shared address
 /// space, not the link-local range.
 const ALIBABA_CLOUD_METADATA_V4: Ipv4Addr = Ipv4Addr::new(100, 100, 100, 200);
+
+/// Stable `status.reason` for any of `attach_tls_client_identity`'s three
+/// client-identity failure modes (unparseable cert, unparseable key, or a
+/// cert/key pair `reqwest::Identity` itself refuses to build from).
+///
+/// A single shared reason rather than three variants: none of the three are
+/// distinguishable in a way that would change what an operator does next
+/// (fix the referenced client certificate/key Secret), so splitting them
+/// would add `status.reason` cardinality without adding diagnostic value.
+const ENDPOINT_TLS_IDENTITY_MISMATCH: &str = "EndpointTlsIdentityMismatch";
 
 // ---------------------------------------------------------------------------
 // McpProbeOutcome
@@ -473,6 +488,38 @@ async fn read_tls_material(
         })
 }
 
+/// Structurally validate that `pem` decodes to at least one well-formed
+/// certificate.
+///
+/// `reqwest::Certificate::from_pem` is too lenient to be a validation gate
+/// by itself: it accepts empty input and PEM blocks with undecodable base64
+/// content without returning `Err` (only genuine third-party wire behavior,
+/// like a TLS handshake against real malformed material, would eventually
+/// surface a problem — far too late for a reconcile-time `status.reason`).
+/// This reuses the same strict `rustls::pki_types` parsing
+/// [`metrics_scraper::build_tls_client_config`](crate::metrics_scraper::build_tls_client_config)
+/// already relies on for `InferenceProvider`, so both TLS paths reject
+/// malformed CA material identically rather than diverging silently.
+fn validate_pem_certificates(pem: &[u8]) -> Result<(), String> {
+    let certs = rustls::pki_types::CertificateDer::pem_slice_iter(pem)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    if certs.is_empty() {
+        return Err("PEM contains no certificates".to_owned());
+    }
+    Ok(())
+}
+
+/// Structurally validate that `pem` decodes to a well-formed private key.
+///
+/// Same rationale as [`validate_pem_certificates`]: `reqwest::Identity::from_pem`
+/// alone is not a reliable validation gate for malformed key material.
+fn validate_pem_private_key(pem: &[u8]) -> Result<(), String> {
+    rustls::pki_types::PrivateKeyDer::from_pem_slice(pem)
+        .map(|_key| ())
+        .map_err(|e| e.to_string())
+}
+
 /// Read `tls.ca_secret_ref`'s CA certificate and add it to `builder` as a
 /// trusted root.
 async fn attach_tls_ca(
@@ -490,6 +537,17 @@ async fn attach_tls_ca(
         "CA",
     ))
     .await?;
+    if let Err(e) = validate_pem_certificates(&ca_pem) {
+        tracing::warn!(provider_identity, error = %e, "AgentToolProvider probe CA PEM unparseable");
+        return Err(McpProbeOutcome::TlsConfigInvalid(
+            "EndpointTlsMaterialInvalid".to_owned(),
+        ));
+    }
+    // `reqwest::Certificate::from_pem` itself no longer needs to be a
+    // validation gate — `validate_pem_certificates` above already is —
+    // but building the actual `Certificate` reqwest will use is still
+    // required, and kept as defense-in-depth should a future reqwest
+    // version regain stricter parsing of its own.
     let ca_cert = reqwest::Certificate::from_pem(&ca_pem).map_err(|e| {
         tracing::warn!(provider_identity, error = %e, "AgentToolProvider probe CA PEM unparseable");
         McpProbeOutcome::TlsConfigInvalid("EndpointTlsMaterialInvalid".to_owned())
@@ -499,6 +557,10 @@ async fn attach_tls_ca(
 
 /// Read `client_ref`'s certificate and private key and attach them to
 /// `builder` as the mTLS client identity.
+#[expect(
+    clippy::too_many_lines,
+    reason = "sequential cert+key reads, eager rustls PEM validation for each, then the reqwest Identity build"
+)]
 async fn attach_tls_client_identity(
     builder: reqwest::ClientBuilder,
     kube_client: &kube::Client,
@@ -522,10 +584,25 @@ async fn attach_tls_client_identity(
         "client key",
     ))
     .await?;
+    if let Err(e) = validate_pem_certificates(&identity_pem) {
+        tracing::warn!(provider_identity, error = %e, "AgentToolProvider probe client certificate unparseable");
+        return Err(McpProbeOutcome::TlsConfigInvalid(
+            ENDPOINT_TLS_IDENTITY_MISMATCH.to_owned(),
+        ));
+    }
+    if let Err(e) = validate_pem_private_key(&key_pem) {
+        tracing::warn!(provider_identity, error = %e, "AgentToolProvider probe client key unparseable");
+        return Err(McpProbeOutcome::TlsConfigInvalid(
+            ENDPOINT_TLS_IDENTITY_MISMATCH.to_owned(),
+        ));
+    }
     identity_pem.extend_from_slice(&key_pem);
+    // As in `attach_tls_ca`: the strict `rustls::pki_types` validation above
+    // is the real gate; this call still has to happen to build the
+    // `Identity` reqwest will actually use.
     let identity = reqwest::Identity::from_pem(&identity_pem).map_err(|e| {
         tracing::warn!(provider_identity, error = %e, "AgentToolProvider probe client identity unparseable");
-        McpProbeOutcome::TlsConfigInvalid("EndpointTlsIdentityMismatch".to_owned())
+        McpProbeOutcome::TlsConfigInvalid(ENDPOINT_TLS_IDENTITY_MISMATCH.to_owned())
     })?;
     Ok(builder.identity(identity))
 }
@@ -1078,16 +1155,419 @@ mod tests {
             "a non-transport ServiceError variant carries no HTTP status to extract"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // TLS Secret resolution — attach_tls_ca / attach_tls_client_identity /
+    // read_tls_material, against a mocked Kubernetes API.
+    //
+    // Uses a real `tower::service_fn`-backed `kube::Client` (no network) so
+    // these functions' actual `Api::<Secret>::get_opt` calls, PEM parsing,
+    // and reason-mapping are the thing under test — not a hand-built
+    // `McpProbeOutcome` fixture standing in for them.
+    // -----------------------------------------------------------------------
+
+    /// Build a `kube::Client` backed by an in-memory Secret map keyed by
+    /// Secret name, so a real `Api::<Secret>::get_opt` round-trips through
+    /// this module's own `TlsFailureReason`-mapping logic.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "test mock builder: 404-vs-200 branches are the whole point"
+    )]
+    fn mock_kube_client_with_secrets(
+        secrets: HashMap<&'static str, k8s_openapi::api::core::v1::Secret>,
+    ) -> kube::Client {
+        let service = tower::service_fn(move |req: http::Request<kube::client::Body>| {
+            let secrets = secrets.clone();
+            async move {
+                let name = req.uri().path().rsplit('/').next().unwrap_or_default().to_owned();
+                let response = secrets.get(name.as_str()).map_or_else(
+                    || {
+                        let not_found = serde_json::json!({
+                            "kind": "Status",
+                            "apiVersion": "v1",
+                            "status": "Failure",
+                            "message": format!("secrets \"{name}\" not found"),
+                            "reason": "NotFound",
+                            "code": 404,
+                        });
+                        http::Response::builder()
+                            .status(404)
+                            .body(kube::client::Body::from(
+                                serde_json::to_vec(&not_found).unwrap_or_else(|_| std::process::abort()),
+                            ))
+                            .unwrap_or_else(|_| std::process::abort())
+                    },
+                    |secret| {
+                        http::Response::builder()
+                            .status(200)
+                            .body(kube::client::Body::from(
+                                serde_json::to_vec(secret).unwrap_or_else(|_| std::process::abort()),
+                            ))
+                            .unwrap_or_else(|_| std::process::abort())
+                    },
+                );
+                Ok::<_, std::convert::Infallible>(response)
+            }
+        });
+        kube::Client::new(service, "default")
+    }
+
+    /// Build a Secret with a single `data` key.
+    fn secret_with_key(key: &str, value: &[u8]) -> k8s_openapi::api::core::v1::Secret {
+        let mut data = std::collections::BTreeMap::new();
+        data.insert(key.to_owned(), k8s_openapi::ByteString(value.to_vec()));
+        k8s_openapi::api::core::v1::Secret {
+            data: Some(data),
+            ..Default::default()
+        }
+    }
+
+    fn test_secret_ref(name: &str) -> crate::crd::grid_network::SecretRef {
+        crate::crd::grid_network::SecretRef {
+            name: name.to_owned(),
+            namespace: "default".to_owned(),
+            key: None,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_pem_certificates / validate_pem_private_key — pure decision
+    // logic, no Kubernetes I/O
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_pem_certificates_accepts_a_real_certificate() {
+        let ca = certs::generate_ca("test-ca").unwrap_or_else(|_| std::process::abort());
+        assert!(
+            validate_pem_certificates(ca.cert_pem.as_bytes()).is_ok(),
+            "a real, well-formed certificate PEM must validate"
+        );
+    }
+
+    #[test]
+    fn validate_pem_certificates_rejects_empty_input() {
+        assert!(
+            validate_pem_certificates(b"").is_err(),
+            "empty input contains no certificates and must be rejected — this is exactly what \
+             reqwest::Certificate::from_pem fails to reject on its own"
+        );
+    }
+
+    #[test]
+    fn validate_pem_certificates_rejects_undecodable_base64() {
+        assert!(
+            validate_pem_certificates(b"-----BEGIN CERTIFICATE-----\nnot valid base64!!!\n-----END CERTIFICATE-----\n")
+                .is_err(),
+            "undecodable base64 inside PEM markers must be rejected"
+        );
+    }
+
+    #[test]
+    fn validate_pem_private_key_accepts_a_real_key() {
+        let ca = certs::generate_ca("test-ca").unwrap_or_else(|_| std::process::abort());
+        assert!(
+            validate_pem_private_key(ca.key_pem.as_bytes()).is_ok(),
+            "a real, well-formed private key PEM must validate"
+        );
+    }
+
+    #[test]
+    fn validate_pem_private_key_rejects_garbage() {
+        assert!(
+            validate_pem_private_key(b"not a private key").is_err(),
+            "garbage input must be rejected"
+        );
+    }
+
+    /// Installs the process-wide `rustls` crypto provider these tests need
+    /// before any `reqwest::Certificate`/`reqwest::Identity` PEM parsing —
+    /// see `probe_via_pipeline_for_tests` in `integration_tests` for why.
+    fn install_test_crypto_provider() {
+        drop(rustls::crypto::ring::default_provider().install_default());
+    }
+
+    #[tokio::test]
+    async fn read_tls_material_returns_bytes_when_secret_and_key_present() {
+        let client =
+            mock_kube_client_with_secrets(HashMap::from([("ca-secret", secret_with_key("ca.crt", b"ca-bytes"))]));
+        let result = read_tls_material(&client, &test_secret_ref("ca-secret"), "ca.crt", "test-provider", "CA").await;
+        assert_eq!(result, Ok(b"ca-bytes".to_vec()), "must return the exact stored bytes");
+    }
+
+    #[tokio::test]
+    async fn read_tls_material_secret_missing_yields_endpoint_tls_secret_missing() {
+        let client = mock_kube_client_with_secrets(HashMap::new());
+        let result = read_tls_material(&client, &test_secret_ref("absent"), "ca.crt", "test-provider", "CA").await;
+        assert_eq!(
+            result,
+            Err(McpProbeOutcome::TlsConfigInvalid("EndpointTlsSecretMissing".to_owned())),
+            "a missing Secret must surface as EndpointTlsSecretMissing"
+        );
+    }
+
+    /// Documents a pre-existing bug in the shared
+    /// `resources::secret::read_secret_bytes`/`endpoint_tls::read_secret_bytes_for_tls`
+    /// pipeline (used by `InferenceProvider`'s metrics/health-check TLS too,
+    /// not introduced by `AgentToolProvider`): `read_secret_bytes` returns
+    /// `Ok(None)` both when the Secret itself is missing *and* when the
+    /// Secret exists but lacks the requested key, so the two cases are
+    /// indistinguishable by the time `read_secret_bytes_for_tls` sees them —
+    /// `KeyMissing` is only reachable for a key present with an *empty*
+    /// value, never for a key absent entirely, despite `TlsFailureReason`'s
+    /// own doc comment claiming otherwise. Tracked in
+    /// <https://github.com/praxis-proxy/grid/issues/58> for a fix in the
+    /// shared code; this test locks in current (misleading) behavior so a
+    /// fix shows up as an intentional test change, not a silent regression.
+    #[tokio::test]
+    async fn read_tls_material_key_absent_from_data_currently_misreported_as_secret_missing() {
+        let client = mock_kube_client_with_secrets(HashMap::from([(
+            "ca-secret",
+            secret_with_key("wrong-key", b"ca-bytes"),
+        )]));
+        let result = read_tls_material(&client, &test_secret_ref("ca-secret"), "ca.crt", "test-provider", "CA").await;
+        assert_eq!(
+            result,
+            Err(McpProbeOutcome::TlsConfigInvalid("EndpointTlsSecretMissing".to_owned())),
+            "known bug (grid#58): a key absent from an existing Secret's data is currently misreported as \
+             EndpointTlsSecretMissing rather than EndpointTlsKeyMissing"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_tls_material_key_present_but_empty_yields_endpoint_tls_key_missing() {
+        let client = mock_kube_client_with_secrets(HashMap::from([("ca-secret", secret_with_key("ca.crt", b""))]));
+        let result = read_tls_material(&client, &test_secret_ref("ca-secret"), "ca.crt", "test-provider", "CA").await;
+        assert_eq!(
+            result,
+            Err(McpProbeOutcome::TlsConfigInvalid("EndpointTlsKeyMissing".to_owned())),
+            "a key present in Secret.data with an empty value must surface as EndpointTlsKeyMissing \
+             (the only currently-reachable path to this reason — see grid#58)"
+        );
+    }
+
+    #[tokio::test]
+    async fn attach_tls_ca_succeeds_with_valid_ca_pem() {
+        install_test_crypto_provider();
+        let ca = certs::generate_ca("test-ca").unwrap_or_else(|_| std::process::abort());
+        let client = mock_kube_client_with_secrets(HashMap::from([(
+            "ca-secret",
+            secret_with_key("ca.crt", ca.cert_pem.as_bytes()),
+        )]));
+        let tls = EndpointTlsConfig {
+            ca_secret_ref: test_secret_ref("ca-secret"),
+            client_certificate_secret_ref: None,
+        };
+        let result = attach_tls_ca(reqwest::Client::builder(), &client, &tls, "test-provider").await;
+        drop(result.expect("a valid CA PEM must attach cleanly"));
+    }
+
+    #[tokio::test]
+    async fn attach_tls_ca_malformed_pem_yields_material_invalid() {
+        install_test_crypto_provider();
+        // Must have valid PEM *markers* with undecodable content inside: bytes
+        // with no `-----BEGIN CERTIFICATE-----` block at all are silently
+        // treated by `reqwest::Certificate::from_pem` as "zero certificates
+        // found" rather than a parse error, so they would not exercise this
+        // failure path.
+        let client = mock_kube_client_with_secrets(HashMap::from([(
+            "ca-secret",
+            secret_with_key(
+                "ca.crt",
+                b"-----BEGIN CERTIFICATE-----\nnot valid base64 content!!!\n-----END CERTIFICATE-----\n",
+            ),
+        )]));
+        let tls = EndpointTlsConfig {
+            ca_secret_ref: test_secret_ref("ca-secret"),
+            client_certificate_secret_ref: None,
+        };
+        let result = attach_tls_ca(reqwest::Client::builder(), &client, &tls, "test-provider").await;
+        assert_eq!(
+            result.unwrap_err(),
+            McpProbeOutcome::TlsConfigInvalid("EndpointTlsMaterialInvalid".to_owned()),
+            "unparseable CA PEM must surface as EndpointTlsMaterialInvalid"
+        );
+    }
+
+    #[tokio::test]
+    async fn attach_tls_ca_empty_pem_yields_material_invalid() {
+        install_test_crypto_provider();
+        let client = mock_kube_client_with_secrets(HashMap::from([("ca-secret", secret_with_key("ca.crt", b""))]));
+        let tls = EndpointTlsConfig {
+            ca_secret_ref: test_secret_ref("ca-secret"),
+            client_certificate_secret_ref: None,
+        };
+        let result = attach_tls_ca(reqwest::Client::builder(), &client, &tls, "test-provider").await;
+        // An empty key value is caught earlier by read_tls_material's own
+        // "key present but empty" check, before validate_pem_certificates
+        // ever runs — this asserts that ordering explicitly, since it's
+        // easy to accidentally invert.
+        assert_eq!(
+            result.unwrap_err(),
+            McpProbeOutcome::TlsConfigInvalid("EndpointTlsKeyMissing".to_owned()),
+            "an empty CA Secret value is caught by read_tls_material before PEM validation runs"
+        );
+    }
+
+    #[tokio::test]
+    async fn attach_tls_ca_missing_secret_propagates_read_tls_material_reason() {
+        install_test_crypto_provider();
+        let client = mock_kube_client_with_secrets(HashMap::new());
+        let tls = EndpointTlsConfig {
+            ca_secret_ref: test_secret_ref("absent"),
+            client_certificate_secret_ref: None,
+        };
+        let result = attach_tls_ca(reqwest::Client::builder(), &client, &tls, "test-provider").await;
+        assert_eq!(
+            result.unwrap_err(),
+            McpProbeOutcome::TlsConfigInvalid("EndpointTlsSecretMissing".to_owned()),
+            "attach_tls_ca must propagate read_tls_material's Secret-missing reason unchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn attach_tls_client_identity_succeeds_with_matching_cert_and_key() {
+        install_test_crypto_provider();
+        let ca = certs::generate_ca("test-ca").unwrap_or_else(|_| std::process::abort());
+        let site = certs::generate_site_cert(&ca, "test-client").unwrap_or_else(|_| std::process::abort());
+        let mut data = std::collections::BTreeMap::new();
+        data.insert(
+            "tls.crt".to_owned(),
+            k8s_openapi::ByteString(site.cert_pem.into_bytes()),
+        );
+        data.insert("tls.key".to_owned(), k8s_openapi::ByteString(site.key_pem.into_bytes()));
+        let secret = k8s_openapi::api::core::v1::Secret {
+            data: Some(data),
+            ..Default::default()
+        };
+        let client = mock_kube_client_with_secrets(HashMap::from([("client-cert", secret)]));
+        let client_ref = crate::crd::inference_provider::ClientCertificateSecretRef {
+            name: "client-cert".to_owned(),
+            namespace: "default".to_owned(),
+            certificate_key: "tls.crt".to_owned(),
+            private_key_key: "tls.key".to_owned(),
+        };
+        let result =
+            attach_tls_client_identity(reqwest::Client::builder(), &client, &client_ref, "test-provider").await;
+        drop(result.expect("a valid, matching cert/key pair must attach cleanly"));
+    }
+
+    #[tokio::test]
+    async fn attach_tls_client_identity_unparseable_key_yields_identity_mismatch() {
+        install_test_crypto_provider();
+        let ca = certs::generate_ca("test-ca").unwrap_or_else(|_| std::process::abort());
+        let site = certs::generate_site_cert(&ca, "test-client").unwrap_or_else(|_| std::process::abort());
+        let mut data = std::collections::BTreeMap::new();
+        data.insert(
+            "tls.crt".to_owned(),
+            k8s_openapi::ByteString(site.cert_pem.into_bytes()),
+        );
+        data.insert(
+            "tls.key".to_owned(),
+            k8s_openapi::ByteString(b"not a private key".to_vec()),
+        );
+        let secret = k8s_openapi::api::core::v1::Secret {
+            data: Some(data),
+            ..Default::default()
+        };
+        let client = mock_kube_client_with_secrets(HashMap::from([("client-cert", secret)]));
+        let client_ref = crate::crd::inference_provider::ClientCertificateSecretRef {
+            name: "client-cert".to_owned(),
+            namespace: "default".to_owned(),
+            certificate_key: "tls.crt".to_owned(),
+            private_key_key: "tls.key".to_owned(),
+        };
+        let result =
+            attach_tls_client_identity(reqwest::Client::builder(), &client, &client_ref, "test-provider").await;
+        assert_eq!(
+            result.unwrap_err(),
+            McpProbeOutcome::TlsConfigInvalid(ENDPOINT_TLS_IDENTITY_MISMATCH.to_owned()),
+            "unparseable key material must surface as EndpointTlsIdentityMismatch"
+        );
+    }
+
+    #[tokio::test]
+    async fn attach_tls_material_ca_only_when_no_client_cert_configured() {
+        install_test_crypto_provider();
+        let ca = certs::generate_ca("test-ca").unwrap_or_else(|_| std::process::abort());
+        let client = mock_kube_client_with_secrets(HashMap::from([(
+            "ca-secret",
+            secret_with_key("ca.crt", ca.cert_pem.as_bytes()),
+        )]));
+        let tls = EndpointTlsConfig {
+            ca_secret_ref: test_secret_ref("ca-secret"),
+            client_certificate_secret_ref: None,
+        };
+        let result = attach_tls_material(reqwest::Client::builder(), &client, &tls, "test-provider").await;
+        drop(result.expect("CA-only TLS config must attach cleanly"));
+    }
+
+    #[tokio::test]
+    async fn attach_tls_material_attaches_both_ca_and_client_identity() {
+        install_test_crypto_provider();
+        let ca = certs::generate_ca("test-ca").unwrap_or_else(|_| std::process::abort());
+        let site = certs::generate_site_cert(&ca, "test-client").unwrap_or_else(|_| std::process::abort());
+        let mut client_data = std::collections::BTreeMap::new();
+        client_data.insert(
+            "tls.crt".to_owned(),
+            k8s_openapi::ByteString(site.cert_pem.into_bytes()),
+        );
+        client_data.insert("tls.key".to_owned(), k8s_openapi::ByteString(site.key_pem.into_bytes()));
+        let client_secret = k8s_openapi::api::core::v1::Secret {
+            data: Some(client_data),
+            ..Default::default()
+        };
+        let kube_client = mock_kube_client_with_secrets(HashMap::from([
+            ("ca-secret", secret_with_key("ca.crt", ca.cert_pem.as_bytes())),
+            ("client-cert", client_secret),
+        ]));
+        let tls = EndpointTlsConfig {
+            ca_secret_ref: test_secret_ref("ca-secret"),
+            client_certificate_secret_ref: Some(crate::crd::inference_provider::ClientCertificateSecretRef {
+                name: "client-cert".to_owned(),
+                namespace: "default".to_owned(),
+                certificate_key: "tls.crt".to_owned(),
+                private_key_key: "tls.key".to_owned(),
+            }),
+        };
+        let result = attach_tls_material(reqwest::Client::builder(), &kube_client, &tls, "test-provider").await;
+        drop(result.expect("CA + client identity TLS config must attach cleanly"));
+    }
+
+    #[tokio::test]
+    async fn attach_tls_material_propagates_client_identity_secret_missing() {
+        install_test_crypto_provider();
+        let ca = certs::generate_ca("test-ca").unwrap_or_else(|_| std::process::abort());
+        let kube_client = mock_kube_client_with_secrets(HashMap::from([(
+            "ca-secret",
+            secret_with_key("ca.crt", ca.cert_pem.as_bytes()),
+        )]));
+        let tls = EndpointTlsConfig {
+            ca_secret_ref: test_secret_ref("ca-secret"),
+            client_certificate_secret_ref: Some(crate::crd::inference_provider::ClientCertificateSecretRef {
+                name: "absent-client-cert".to_owned(),
+                namespace: "default".to_owned(),
+                certificate_key: "tls.crt".to_owned(),
+                private_key_key: "tls.key".to_owned(),
+            }),
+        };
+        let result = attach_tls_material(reqwest::Client::builder(), &kube_client, &tls, "test-provider").await;
+        assert_eq!(
+            result.unwrap_err(),
+            McpProbeOutcome::TlsConfigInvalid("EndpointTlsSecretMissing".to_owned()),
+            "a missing client-cert Secret must fail the whole attach_tls_material call, not be silently skipped"
+        );
+    }
 }
 
 /// Integration tier: [`probe_agent_tool_provider`] against a real Streamable
 /// HTTP MCP server over a local TCP listener — no mocks below the socket.
 ///
 /// The pure decision logic (URL validation, outcome-to-phase mapping,
-/// discovered-tools preservation, TLS material attachment) is already
-/// covered at the unit tier above; these tests instead exercise the actual
-/// network path: DNS/address resolution, `reqwest` client construction,
-/// the `rmcp` client/server handshake, and header propagation.
+/// discovered-tools preservation) and the TLS/Secret material attachment
+/// path (`attach_tls_material` and friends, against a mocked `kube::Client`)
+/// are already covered at the unit tier above; these tests instead exercise
+/// the actual network path: DNS/address resolution, `reqwest` client
+/// construction, the `rmcp` client/server handshake, and header propagation.
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(clippy::unwrap_used, clippy::expect_used, reason = "tests")]
@@ -1213,9 +1693,10 @@ mod integration_tests {
     ///
     /// Every test in this module uses `tls_config: None`, so `kube_client`
     /// is never dereferenced by [`probe_agent_tool_provider`] — it is only
-    /// used on the `spec.tls`-configured path (covered by the pure
-    /// `attach_tls_material`/`read_tls_material` unit tests instead, where
-    /// Secret I/O is the thing under test).
+    /// used on the `spec.tls`-configured path, covered by the
+    /// `attach_tls_material`/`attach_tls_ca`/`attach_tls_client_identity`/
+    /// `read_tls_material` unit tests in `mod tests` above (against a
+    /// mocked `kube::Client`, where Secret I/O is the thing under test).
     fn unused_kube_client() -> kube::Client {
         let service = tower::service_fn(|_req: http::Request<kube::client::Body>| async {
             Ok::<_, std::convert::Infallible>(http::Response::new(kube::client::Body::empty()))

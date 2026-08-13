@@ -8,7 +8,7 @@
 //!
 //! Structured exactly like [`inference_provider`](crate::controller::inference_provider):
 //! static validation short-circuits first, then `GridNetwork`/site
-//! resolution, then (once wired) the live probe merges on top.
+//! resolution, then the live probe outcome merges on top.
 //!
 //! [`AgentToolProvider`]: crate::crd::agent_tool_provider::AgentToolProvider
 //! [`GridNetwork`]: crate::crd::grid_network::GridNetwork
@@ -153,8 +153,8 @@ pub(crate) fn validate_provider_config(provider: &AgentToolProvider) -> Option<&
 ///
 /// This function never returns [`ProviderPhase::Degraded`] or
 /// [`ProviderPhase::Unavailable`] — those are only reachable via the
-/// `GridNetwork`-missing short-circuit in `resolve_phase_and_sites`, or
-/// (once PR 2 lands) the live probe outcome merge.
+/// config/`GridNetwork`-missing short-circuits in `resolve_phase_and_sites`,
+/// or the live probe outcome merge (`phase_and_reason_from_probe`).
 pub(crate) fn phase_from_matching(matching: &[String]) -> ProviderPhase {
     if matching.is_empty() {
         ProviderPhase::Pending
@@ -529,8 +529,8 @@ fn telemetry_reason_label<'a>(phase: &ProviderPhase, status_reason: Option<&'a s
 ///
 /// [`Normal`] for the two healthy-phase labels synthesized by
 /// [`telemetry_reason_label`]; [`Warning`] for every diagnostic
-/// `status.reason` code (config, `GridNetwork`, and — once PR 2 lands —
-/// probe/TLS failures), including any future code not yet in this list,
+/// `status.reason` code (config, `GridNetwork`, and probe/TLS failures),
+/// including any future code not yet in this list,
 /// since an unrecognized reason is safer treated as a `Warning` than
 /// silently downgraded to `Normal`.
 ///
@@ -570,6 +570,8 @@ fn agent_tool_provider_status_needs_update(
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(clippy::unwrap_used, clippy::expect_used, reason = "tests")]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
 
     fn test_provider(endpoint: &str, grid_network_ref: &str) -> AgentToolProvider {
@@ -638,12 +640,109 @@ mod tests {
         );
     }
 
-    // Missing GridNetwork → Unavailable requires a Kubernetes API call
-    // (network_api.get_opt) and cannot be unit-tested without a live cluster
-    // or a mock Kubernetes server. Covered at the E2E level
-    // (env_verify_agenttoolprovider_convergence); documented here for
-    // completeness, mirroring inference_provider.rs's own precedent for the
-    // identical GridNetwork-existence check.
+    // -----------------------------------------------------------------------
+    // static_config_failure_reason — async wiring around validate_provider_config
+    // and the GridNetwork-existence check, against a mocked Kubernetes API.
+    // -----------------------------------------------------------------------
+
+    /// Build a `kube::Client` backed by an in-memory `GridNetwork` map keyed
+    /// by name, mirroring `mcp_probe::tests::mock_kube_client_with_secrets`'
+    /// pattern for a different resource type.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "test mock builder: 404-vs-200 branches are the whole point"
+    )]
+    fn mock_kube_client_with_grid_networks(networks: HashMap<&'static str, GridNetwork>) -> Client {
+        let service = tower::service_fn(move |req: http::Request<kube::client::Body>| {
+            let networks = networks.clone();
+            async move {
+                let name = req.uri().path().rsplit('/').next().unwrap_or_default().to_owned();
+                let response = networks.get(name.as_str()).map_or_else(
+                    || {
+                        let not_found = serde_json::json!({
+                            "kind": "Status",
+                            "apiVersion": "v1",
+                            "status": "Failure",
+                            "message": format!("gridnetworks.grid.praxis-proxy.io \"{name}\" not found"),
+                            "reason": "NotFound",
+                            "code": 404,
+                        });
+                        http::Response::builder()
+                            .status(404)
+                            .body(kube::client::Body::from(
+                                serde_json::to_vec(&not_found).unwrap_or_else(|_| std::process::abort()),
+                            ))
+                            .unwrap_or_else(|_| std::process::abort())
+                    },
+                    |network| {
+                        http::Response::builder()
+                            .status(200)
+                            .body(kube::client::Body::from(
+                                serde_json::to_vec(network).unwrap_or_else(|_| std::process::abort()),
+                            ))
+                            .unwrap_or_else(|_| std::process::abort())
+                    },
+                );
+                Ok::<_, std::convert::Infallible>(response)
+            }
+        });
+        Client::new(service, "default")
+    }
+
+    fn test_grid_network(name: &str) -> GridNetwork {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "kind": "GridNetwork",
+            "metadata": { "name": name },
+            "spec": {}
+        }))
+        .unwrap_or_else(|_| std::process::abort())
+    }
+
+    /// A `kube::Client` that panics if a request is ever sent through it —
+    /// used to prove `static_config_failure_reason` short-circuits on a
+    /// config error *before* making any Kubernetes API call.
+    fn unused_kube_client() -> Client {
+        let service = tower::service_fn(|_req: http::Request<kube::client::Body>| async {
+            Ok::<_, std::convert::Infallible>(http::Response::new(kube::client::Body::empty()))
+        });
+        Client::new(service, "default")
+    }
+
+    #[tokio::test]
+    async fn static_config_failure_reason_short_circuits_on_invalid_config_without_calling_kubernetes() {
+        let provider = test_provider("", "net");
+        let result = static_config_failure_reason(&provider, &unused_kube_client(), "prov").await;
+        assert_eq!(
+            result.unwrap_or_else(|_| std::process::abort()),
+            Some("ProviderConfigInvalid"),
+            "an invalid static config must short-circuit to ProviderConfigInvalid before any GridNetwork lookup"
+        );
+    }
+
+    #[tokio::test]
+    async fn static_config_failure_reason_returns_grid_network_not_found_when_absent() {
+        let provider = test_provider("http://tools:8080", "absent-net");
+        let client = mock_kube_client_with_grid_networks(HashMap::new());
+        let result = static_config_failure_reason(&provider, &client, "prov").await;
+        assert_eq!(
+            result.unwrap_or_else(|_| std::process::abort()),
+            Some("GridNetworkNotFound"),
+            "a gridNetworkRef that doesn't resolve to an existing GridNetwork must yield GridNetworkNotFound"
+        );
+    }
+
+    #[tokio::test]
+    async fn static_config_failure_reason_returns_none_when_grid_network_exists() {
+        let provider = test_provider("http://tools:8080", "net");
+        let client = mock_kube_client_with_grid_networks(HashMap::from([("net", test_grid_network("net"))]));
+        let result = static_config_failure_reason(&provider, &client, "prov").await;
+        assert_eq!(
+            result.unwrap_or_else(|_| std::process::abort()),
+            None,
+            "a valid config with an existing GridNetwork must pass both static checks"
+        );
+    }
 
     // -----------------------------------------------------------------------
     // phase_from_matching — pure phase logic
