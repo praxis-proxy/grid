@@ -128,10 +128,13 @@ pub(crate) fn image_pull_policy() -> String {
 }
 
 /// Get the image pull policy for the given ingress mode.
+///
+/// Both `IngressMode` variants currently use the same registry-backed
+/// default; the parameter is kept so a future mode-specific default can be
+/// added without changing this function's signature.
 pub(crate) fn demo_image_pull_policy(mode: IngressMode) -> String {
     let default = match mode {
-        IngressMode::Global => DEFAULT_WORKLOAD_IMAGE_PULL_POLICY,
-        IngressMode::Workload => DEFAULT_WORKLOAD_IMAGE_PULL_POLICY,
+        IngressMode::Global | IngressMode::Workload => DEFAULT_WORKLOAD_IMAGE_PULL_POLICY,
     };
     env::var(IMAGE_PULL_POLICY_ENV).unwrap_or_else(|_| default.to_owned())
 }
@@ -170,14 +173,8 @@ mod tests {
         assert_eq!(DEFAULT_GATEWAY_IMAGE, "localhost/praxis-ai:llmd-ext-proc");
         assert_eq!(DEFAULT_MOCK_EPP_IMAGE, "localhost/praxis-ai-mock-epp:latest");
         assert_eq!(DEFAULT_OPERATOR_IMAGE, "grid-operator:latest");
-        assert_eq!(
-            DEFAULT_GLB_GATEWAY_IMAGE,
-            "ghcr.io/praxis-proxy/grid-ai-rollup:v0.1.3"
-        );
-        assert_eq!(
-            DEFAULT_GLB_OPERATOR_IMAGE,
-            "ghcr.io/praxis-proxy/grid-operator:v0.1.3"
-        );
+        assert_eq!(DEFAULT_GLB_GATEWAY_IMAGE, "ghcr.io/praxis-proxy/grid-ai-rollup:v0.1.3");
+        assert_eq!(DEFAULT_GLB_OPERATOR_IMAGE, "ghcr.io/praxis-proxy/grid-operator:v0.1.3");
         assert_eq!(DEFAULT_IMAGE_PULL_POLICY, "Never");
         assert_eq!(
             DEFAULT_WORKLOAD_GATEWAY_IMAGE,
