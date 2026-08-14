@@ -571,7 +571,7 @@ fn agent_tool_provider_status_needs_update(
 
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
-#[allow(clippy::unwrap_used, clippy::expect_used, reason = "tests")]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, reason = "tests")]
 mod tests {
     use std::collections::HashMap;
 
@@ -1118,5 +1118,167 @@ mod tests {
     #[test]
     fn both_changing_is_a_real_transition() {
         assert!(is_real_transition(true, true));
+    }
+
+    // -----------------------------------------------------------------------
+    // reconcile — full orchestration against a mocked Kubernetes API.
+    //
+    // Everything above exercises resolve_phase_and_sites/update_status's
+    // constituent resolve_*/pure-logic functions in isolation. These tests
+    // drive the public reconcile() entrypoint itself end-to-end, proving the
+    // resolved (phase, reason, matchingSites, discoveredTools) tuple actually
+    // reaches the Kubernetes API as the status PATCH body a real controller
+    // would send — the seam none of the functions above individually cover.
+    // -----------------------------------------------------------------------
+
+    /// A `kube::Client` that serves `GridNetwork` GETs from an in-memory map
+    /// and captures every status-subresource PATCH body sent through it into
+    /// `captured`. Any other request (a missing `GridNetwork`, the `Event`
+    /// POST from `Recorder::publish`, a `GridSite` LIST) 404s: `update_status`
+    /// and `emit_transition_telemetry` both already tolerate a failed event
+    /// publish by design (logged, not propagated — see `emit_transition_telemetry`),
+    /// and the two scenarios below never reach `GridSite` listing at all,
+    /// since both short-circuit inside `static_config_failure_reason`.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "test mock builder: PATCH-capture vs GridNetwork-GET vs catch-all-404 branches are the whole point"
+    )]
+    fn mock_kube_client_capturing_status_patch(
+        networks: HashMap<&'static str, GridNetwork>,
+        captured: Arc<std::sync::Mutex<Option<serde_json::Value>>>,
+    ) -> Client {
+        let service = tower::service_fn(move |req: http::Request<kube::client::Body>| {
+            let networks = networks.clone();
+            let captured = Arc::clone(&captured);
+            async move {
+                if req.method() == http::Method::PATCH && req.uri().path().ends_with("/status") {
+                    let name = req
+                        .uri()
+                        .path()
+                        .trim_end_matches("/status")
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or_default()
+                        .to_owned();
+                    let bytes = http_body_util::BodyExt::collect(req.into_body())
+                        .await
+                        .unwrap_or_else(|_| std::process::abort())
+                        .to_bytes();
+                    let body: serde_json::Value =
+                        serde_json::from_slice(&bytes).unwrap_or_else(|_| std::process::abort());
+                    *captured.lock().unwrap_or_else(|_| std::process::abort()) = Some(body.clone());
+
+                    let echo = serde_json::json!({
+                        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+                        "kind": "AgentToolProvider",
+                        "metadata": { "name": name },
+                        "spec": { "gridNetworkRef": "net", "endpoint": "http://tools:8080" },
+                        "status": body["status"],
+                    });
+                    return Ok::<_, std::convert::Infallible>(
+                        http::Response::builder()
+                            .status(200)
+                            .body(kube::client::Body::from(
+                                serde_json::to_vec(&echo).unwrap_or_else(|_| std::process::abort()),
+                            ))
+                            .unwrap_or_else(|_| std::process::abort()),
+                    );
+                }
+
+                if req.method() == http::Method::GET {
+                    let name = req.uri().path().rsplit('/').next().unwrap_or_default().to_owned();
+                    if let Some(network) = networks.get(name.as_str()) {
+                        return Ok(http::Response::builder()
+                            .status(200)
+                            .body(kube::client::Body::from(
+                                serde_json::to_vec(network).unwrap_or_else(|_| std::process::abort()),
+                            ))
+                            .unwrap_or_else(|_| std::process::abort()));
+                    }
+                }
+
+                let not_found = serde_json::json!({
+                    "kind": "Status",
+                    "apiVersion": "v1",
+                    "status": "Failure",
+                    "message": "not found",
+                    "reason": "NotFound",
+                    "code": 404,
+                });
+                Ok(http::Response::builder()
+                    .status(404)
+                    .body(kube::client::Body::from(
+                        serde_json::to_vec(&not_found).unwrap_or_else(|_| std::process::abort()),
+                    ))
+                    .unwrap_or_else(|_| std::process::abort()))
+            }
+        });
+        Client::new(service, "default")
+    }
+
+    #[tokio::test]
+    async fn reconcile_patches_unavailable_provider_config_invalid_without_any_grid_network_lookup() {
+        let provider = test_provider("", "net");
+        let captured = Arc::new(std::sync::Mutex::new(None));
+        let client = mock_kube_client_capturing_status_patch(HashMap::new(), Arc::clone(&captured));
+
+        let action = Box::pin(reconcile(Arc::new(provider), Arc::new(client)))
+            .await
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            action,
+            Action::requeue(REQUEUE_INTERVAL),
+            "reconcile must always requeue on a successful (non-erroring) pass, even when the provider is Unavailable"
+        );
+
+        let patched = captured
+            .lock()
+            .unwrap_or_else(|_| std::process::abort())
+            .clone()
+            .expect("reconcile must PATCH the status subresource for a first-seen config-invalid provider");
+        assert_eq!(
+            patched["status"]["phase"], "Unavailable",
+            "a blank endpoint must surface as Unavailable all the way through to the persisted status"
+        );
+        assert_eq!(
+            patched["status"]["reason"], "ProviderConfigInvalid",
+            "the specific static-validation failure reason must reach the persisted status"
+        );
+        assert_eq!(
+            patched["status"]["matchingSites"],
+            serde_json::json!([]),
+            "a config-invalid provider must never report matching sites"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_patches_unavailable_grid_network_not_found_when_referenced_network_absent() {
+        let provider = test_provider("http://tools:8080", "missing-net");
+        let captured = Arc::new(std::sync::Mutex::new(None));
+        let client = mock_kube_client_capturing_status_patch(HashMap::new(), Arc::clone(&captured));
+
+        let action = Box::pin(reconcile(Arc::new(provider), Arc::new(client)))
+            .await
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            action,
+            Action::requeue(REQUEUE_INTERVAL),
+            "reconcile must requeue even when the referenced GridNetwork cannot be found"
+        );
+
+        let patched = captured
+            .lock()
+            .unwrap_or_else(|_| std::process::abort())
+            .clone()
+            .expect("reconcile must PATCH the status subresource once the GridNetwork lookup 404s");
+        assert_eq!(
+            patched["status"]["phase"], "Unavailable",
+            "an unresolvable gridNetworkRef must surface as Unavailable through the full reconcile path"
+        );
+        assert_eq!(
+            patched["status"]["reason"], "GridNetworkNotFound",
+            "the GridNetwork-lookup failure reason must reach the persisted status, proving reconcile actually \
+             performed the live GET rather than short-circuiting on static config alone"
+        );
     }
 }
