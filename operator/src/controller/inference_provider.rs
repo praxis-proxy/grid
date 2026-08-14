@@ -784,6 +784,163 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // resolve_phase_and_sites — integration tier: reconcile-path TLS
+    // failure reasons through a mocked kube::Client (grid#58)
+    //
+    // The unit tier (endpoint_tls.rs, secret.rs) already exercises
+    // resolve_tls_config/read_secret_bytes directly. These tests instead
+    // drive the same scenario through resolve_phase_and_sites — the actual
+    // function reconcile() calls — proving the SecretMissing/KeyMissing
+    // distinction survives all the way to the (phase, status.reason) pair
+    // reconcile() writes to the CR, not just to an intermediate type.
+    // -----------------------------------------------------------------------
+
+    use std::collections::HashMap;
+
+    use k8s_openapi::{ByteString, api::core::v1::Secret};
+
+    /// Build an HTTP 200 JSON response from any serializable value.
+    fn json_ok(body: &impl serde::Serialize) -> http::Response<kube::client::Body> {
+        http::Response::builder()
+            .status(200)
+            .body(kube::client::Body::from(
+                serde_json::to_vec(body).unwrap_or_else(|_| std::process::abort()),
+            ))
+            .unwrap_or_else(|_| std::process::abort())
+    }
+
+    /// Build an HTTP 404 Kubernetes `Status` response for a named resource.
+    ///
+    /// Must actually set the 404 status (not reuse [`json_ok`]'s 200) —
+    /// `kube`'s client only maps a response onto `ApiError`/`get_opt: None`
+    /// when the HTTP status itself is 404; a 200 body shaped like a `Status`
+    /// object is instead treated as a malformed resource and surfaces as a
+    /// deserialization error.
+    fn json_not_found(resource_and_name: &str) -> http::Response<kube::client::Body> {
+        http::Response::builder()
+            .status(404)
+            .body(kube::client::Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "kind": "Status",
+                    "apiVersion": "v1",
+                    "status": "Failure",
+                    "message": format!("{resource_and_name} not found"),
+                    "reason": "NotFound",
+                    "code": 404,
+                }))
+                .unwrap_or_else(|_| std::process::abort()),
+            ))
+            .unwrap_or_else(|_| std::process::abort())
+    }
+
+    /// A `kube::Client` that serves just enough of the Kubernetes API surface
+    /// for `resolve_phase_and_sites` to reach its health-check TLS branch:
+    /// a `GridNetwork` matching `provider.spec.gridNetworkRef`, an empty
+    /// `GridSite` list, and the supplied CA Secrets.
+    fn mock_kube_client_for_health_tls(
+        grid_network_name: &'static str,
+        secrets: HashMap<&'static str, Secret>,
+    ) -> Client {
+        let service = tower::service_fn(move |req: http::Request<kube::client::Body>| {
+            let secrets = secrets.clone();
+            async move {
+                let path = req.uri().path().to_owned();
+                let name = path.rsplit('/').next().unwrap_or_default().to_owned();
+                let response = if path.contains("/secrets/") {
+                    secrets
+                        .get(name.as_str())
+                        .map_or_else(|| json_not_found(&format!("secrets {name:?}")), json_ok)
+                } else if path.ends_with("/gridsites") {
+                    json_ok(&serde_json::json!({
+                        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+                        "kind": "GridSiteList",
+                        "items": [],
+                    }))
+                } else if path.contains("/gridnetworks/") && name == grid_network_name {
+                    json_ok(&serde_json::json!({
+                        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+                        "kind": "GridNetwork",
+                        "metadata": { "name": grid_network_name },
+                        "spec": {},
+                    }))
+                } else {
+                    json_not_found(&format!("gridnetworks {name:?}"))
+                };
+                Ok::<_, std::convert::Infallible>(response)
+            }
+        });
+        Client::new(service, "default")
+    }
+
+    fn secret_with_key(key: &str, value: &[u8]) -> Secret {
+        let mut data = std::collections::BTreeMap::new();
+        data.insert(key.to_owned(), ByteString(value.to_vec()));
+        Secret {
+            data: Some(data),
+            ..Default::default()
+        }
+    }
+
+    /// An otherwise-valid provider with `healthCheck.tls.caSecretRef` pointing
+    /// at `ca_secret_name` in the `default` namespace.
+    fn provider_with_health_check_tls(network: &str, ca_secret_name: &str) -> InferenceProvider {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "kind": "InferenceProvider",
+            "metadata": { "name": "prov" },
+            "spec": {
+                "gridNetworkRef": network,
+                "providerKind": "self_hosted",
+                "backendKind": "local",
+                "endpoint": "http://localhost:8000",
+                "models": [{"name": "model"}],
+                "healthCheck": {
+                    "tls": {
+                        "caSecretRef": { "name": ca_secret_name, "namespace": "default" }
+                    }
+                }
+            }
+        }))
+        .unwrap_or_else(|_| std::process::abort())
+    }
+
+    #[tokio::test]
+    async fn resolve_phase_and_sites_health_check_key_absent_from_existing_secret_yields_degraded_key_missing() {
+        let client = mock_kube_client_for_health_tls(
+            "net-1",
+            HashMap::from([("ca-secret", secret_with_key("wrong-key", b"ca-bytes"))]),
+        );
+        let provider = provider_with_health_check_tls("net-1", "ca-secret");
+
+        let (phase, matching, reason) = resolve_phase_and_sites(&provider, &client)
+            .await
+            .expect("mocked API calls must not fail");
+
+        assert_eq!(phase, ProviderPhase::Degraded);
+        assert!(matching.is_empty(), "no GridSites exist in this fixture");
+        assert_eq!(
+            reason.as_deref(),
+            Some("HealthCheckTlsKeyMissing"),
+            "grid#58: end-to-end through resolve_phase_and_sites (the function reconcile() calls), a key \
+             absent from an existing Secret's data must produce status.reason = HealthCheckTlsKeyMissing, \
+             not HealthCheckTlsSecretMissing"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_phase_and_sites_health_check_secret_absent_yields_degraded_secret_missing() {
+        let client = mock_kube_client_for_health_tls("net-1", HashMap::new());
+        let provider = provider_with_health_check_tls("net-1", "absent-secret");
+
+        let (phase, _matching, reason) = resolve_phase_and_sites(&provider, &client)
+            .await
+            .expect("mocked API calls must not fail");
+
+        assert_eq!(phase, ProviderPhase::Degraded);
+        assert_eq!(reason.as_deref(), Some("HealthCheckTlsSecretMissing"));
+    }
+
+    // -----------------------------------------------------------------------
     // validate_provider_config — static validation (items 1-4)
     // -----------------------------------------------------------------------
 

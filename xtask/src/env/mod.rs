@@ -1851,7 +1851,7 @@ fn run_operator_reconcile(context: &str) -> Result<PathBuf, Box<dyn std::error::
         POD_READY_TIMEOUT, STATUS_POLL_TIMEOUT, TEST_DEGRADED_ROUTING_CLUSTER, TEST_GATEWAY_NAME, TEST_GATEWAY_NS,
         TEST_HEALTHY_ROUTING_CLUSTER, TEST_METRICS_BUSY_PROVIDER, TEST_METRICS_BUSY_ROUTING_CLUSTER,
         TEST_METRICS_IDLE_PROVIDER, TEST_METRICS_IDLE_ROUTING_CLUSTER, TEST_NETWORK, TEST_PROVIDER_API,
-        TEST_PROVIDER_DEGRADED, TEST_PROVIDER_HEALTHY, TEST_PROVIDER_INVALID,
+        TEST_PROVIDER_DEGRADED, TEST_PROVIDER_HEALTHY, TEST_PROVIDER_INVALID, TEST_PROVIDER_TLS_KEY_MISSING,
     };
 
     // Step 1: install Grid CRDs and remove stale owned resources.
@@ -1917,6 +1917,7 @@ fn run_operator_reconcile(context: &str) -> Result<PathBuf, Box<dyn std::error::
     )?;
     operator::apply_api_provider_fixture(context, api_endpoint)?;
     operator::apply_metrics_provider_fixtures(context, &metrics_idle_endpoint, &metrics_busy_endpoint)?;
+    operator::apply_provider_with_health_check_tls_key_missing_fixture(context)?;
 
     // Step 7: wait for reconciliation and verify overlay.
     let result = (|| -> Result<PathBuf, Box<dyn std::error::Error>> {
@@ -1926,6 +1927,15 @@ fn run_operator_reconcile(context: &str) -> Result<PathBuf, Box<dyn std::error::
         operator::wait_for_provider_phase(context, TEST_PROVIDER_API, "Pending", STATUS_POLL_TIMEOUT)?;
         operator::wait_for_provider_phase(context, TEST_METRICS_IDLE_PROVIDER, "Pending", STATUS_POLL_TIMEOUT)?;
         operator::wait_for_provider_phase(context, TEST_METRICS_BUSY_PROVIDER, "Pending", STATUS_POLL_TIMEOUT)?;
+        // grid#58 regression: a CA Secret that exists but lacks the expected key must
+        // surface as HealthCheckTlsKeyMissing, not HealthCheckTlsSecretMissing.
+        operator::wait_for_provider_phase_and_reason(
+            context,
+            TEST_PROVIDER_TLS_KEY_MISSING,
+            "Degraded",
+            "HealthCheckTlsKeyMissing",
+            STATUS_POLL_TIMEOUT,
+        )?;
         operator::wait_for_overlay_configmap(
             context,
             TEST_NETWORK,

@@ -48,6 +48,24 @@ pub(crate) const TEST_PROVIDER_DEGRADED: &str = "op-e2e-degraded";
 /// appear after local providers (score ≈ 7.0) regardless of input order.
 pub(crate) const TEST_PROVIDER_API: &str = "op-e2e-api-fallback";
 
+/// Name of the `InferenceProvider` whose `healthCheck.tls.caSecretRef` points at a
+/// Secret that exists but lacks the expected key (expected: `Degraded` /
+/// `status.reason = "HealthCheckTlsKeyMissing"`).
+///
+/// Live-cluster regression fixture for grid#58: proves the
+/// `SecretMissing`-vs-`KeyMissing` distinction survives a real reconcile
+/// against a live API server, not just the unit/integration-tier mocked-client
+/// tests in `operator/src/resources/{secret,endpoint_tls}.rs` and
+/// `operator/src/controller/inference_provider.rs`.
+pub(crate) const TEST_PROVIDER_TLS_KEY_MISSING: &str = "op-e2e-tls-key-missing";
+
+/// Name of the CA Secret referenced by [`TEST_PROVIDER_TLS_KEY_MISSING`].
+///
+/// Created with a key named `wrong-key` instead of the expected `ca.crt`, so
+/// the Secret exists (ruling out the `SecretMissing` case) but the lookup
+/// still fails.
+pub(crate) const TLS_KEY_MISSING_CA_SECRET_NAME: &str = "op-e2e-tls-key-missing-ca";
+
 /// The model name served by the API-provider fallback fixture.
 ///
 /// Distinct from the self-hosted models so the consumer `intelligent_route` can route
@@ -633,6 +651,8 @@ pub(crate) fn cleanup_validation_resources(context: &str) -> Result<(), Box<dyn 
     delete_cluster_resource(context, "inferenceprovider", TEST_PROVIDER_API)?;
     delete_cluster_resource(context, "inferenceprovider", TEST_METRICS_IDLE_PROVIDER)?;
     delete_cluster_resource(context, "inferenceprovider", TEST_METRICS_BUSY_PROVIDER)?;
+    delete_cluster_resource(context, "inferenceprovider", TEST_PROVIDER_TLS_KEY_MISSING)?;
+    delete_namespaced_resource(context, "default", "secret", TLS_KEY_MISSING_CA_SECRET_NAME)?;
     delete_cluster_resource(context, "gridnetwork", TEST_NETWORK)?;
     // Remove auto-discovered GridSites created during previous validation runs.
     cleanup_auto_discovered_gridsites_for_network(context, TEST_NETWORK);
@@ -2107,6 +2127,51 @@ pub(crate) fn wait_for_provider_phase(
     }
 }
 
+/// Read the `status.reason` field from an `InferenceProvider` resource.
+pub(crate) fn read_provider_reason(context: &str, name: &str) -> String {
+    kubectl_jsonpath(context, &format!("inferenceproviders/{name}"), "{.status.reason}").unwrap_or_default()
+}
+
+#[expect(
+    clippy::disallowed_methods,
+    reason = "synchronous poll loop in xtask; no async runtime available"
+)]
+/// Poll until `InferenceProvider` `name` has both the expected `phase` and `status.reason`.
+///
+/// Returns `Ok(())` when both match within `timeout`.  Returns `Err` if the
+/// timeout elapses, reporting the last-observed `(phase, reason)` pair.
+pub(crate) fn wait_for_provider_phase_and_reason(
+    context: &str,
+    name: &str,
+    expected_phase: &str,
+    expected_reason: &str,
+    timeout: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let start = Instant::now();
+    loop {
+        let phase =
+            kubectl_jsonpath(context, &format!("inferenceproviders/{name}"), "{.status.phase}").unwrap_or_default();
+        let reason = read_provider_reason(context, name);
+
+        if phase == expected_phase && reason == expected_reason {
+            eprintln!("  [OK] {name} phase={phase} reason={reason:?}");
+            return Ok(());
+        }
+        if start.elapsed() >= timeout {
+            return Err(format!(
+                "timeout waiting for {name} phase={expected_phase:?} reason={expected_reason:?}; \
+                 last observed: phase={phase:?} reason={reason:?}"
+            )
+            .into());
+        }
+        eprintln!(
+            "  waiting for {name} phase={expected_phase:?} reason={expected_reason:?} \
+             (observed: phase={phase:?} reason={reason:?})..."
+        );
+        std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
 #[expect(
     clippy::disallowed_methods,
     reason = "synchronous poll loop in xtask; no async runtime available"
@@ -2798,6 +2863,67 @@ pub(crate) fn apply_degraded_provider_fixture(context: &str, endpoint: &str) -> 
     });
     kubectl::apply_manifest(context, &manifest)?;
     eprintln!("  [OK] degraded provider fixture applied");
+    Ok(())
+}
+
+/// Create [`TLS_KEY_MISSING_CA_SECRET_NAME`] with its data under `wrong-key`
+/// instead of the `ca.crt` key `resolve_tls_config` expects.
+fn apply_tls_key_missing_ca_secret(context: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let manifest = [
+        "apiVersion: v1",
+        "kind: Secret",
+        "metadata:",
+        &format!("  name: {TLS_KEY_MISSING_CA_SECRET_NAME}"),
+        "  namespace: default",
+        "type: Opaque",
+        "stringData:",
+        "  wrong-key: not-a-real-ca-cert",
+        "",
+    ]
+    .join("\n");
+    kubectl::apply_manifest(context, &manifest)
+}
+
+/// Create the CA Secret and apply the `InferenceProvider` fixture for the
+/// grid#58 health-check-TLS-key-missing regression scenario.
+///
+/// The Secret is created with data under `wrong-key` instead of the expected
+/// `ca.crt`, so it exists but the key lookup still fails: `resolve_tls_config`
+/// must return `TlsFailureReason::KeyMissing`, and the provider must
+/// reconcile to `Degraded` / `status.reason = "HealthCheckTlsKeyMissing"`
+/// rather than the pre-fix (incorrect) `"HealthCheckTlsSecretMissing"`.
+///
+/// The endpoint is a placeholder — TLS resolution runs and fails before any
+/// health probe is attempted (see `resolve_phase_and_sites`), so no live HTTP
+/// backend is required for this fixture.
+pub(crate) fn apply_provider_with_health_check_tls_key_missing_fixture(
+    context: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    apply_tls_key_missing_ca_secret(context)?;
+
+    let manifest = serde_json::to_string_pretty(&serde_json::json!({
+        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "kind": "InferenceProvider",
+        "metadata": { "name": TEST_PROVIDER_TLS_KEY_MISSING },
+        "spec": {
+            "gridNetworkRef": TEST_NETWORK,
+            "providerKind": "self_hosted",
+            "backendKind": "local",
+            "endpoint": "http://127.0.0.1:1",
+            "models": [{ "name": "model-tls-key-missing" }],
+            "healthCheck": {
+                "tls": {
+                    "caSecretRef": { "name": TLS_KEY_MISSING_CA_SECRET_NAME, "namespace": "default" }
+                }
+            }
+        }
+    }))
+    .unwrap_or_else(|e| {
+        eprintln!("tls-key-missing provider fixture serialization failed: {e}");
+        std::process::exit(1);
+    });
+    kubectl::apply_manifest(context, &manifest)?;
+    eprintln!("  [OK] TLS-key-missing provider fixture applied (grid#58 regression)");
     Ok(())
 }
 
