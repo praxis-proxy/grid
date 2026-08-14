@@ -7857,6 +7857,7 @@ mod tests {
             TEST_PROVIDER_API,
             TEST_METRICS_IDLE_PROVIDER,
             TEST_METRICS_BUSY_PROVIDER,
+            TEST_PROVIDER_TLS_KEY_MISSING,
         ];
         // Each must be distinct (no duplicate delete).
         let unique: std::collections::HashSet<_> = all_providers.iter().collect();
