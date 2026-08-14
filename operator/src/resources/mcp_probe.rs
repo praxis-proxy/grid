@@ -213,6 +213,10 @@ pub(crate) fn auth_header_map(token: Option<&BearerToken>) -> HashMap<HeaderName
     let bearer = format!("Bearer {}", token.expose_secret());
     if let Ok(value) = HeaderValue::from_str(&bearer) {
         headers.insert(http::header::AUTHORIZATION, value);
+    } else {
+        tracing::warn!(
+            "bearer token contains characters invalid in an HTTP header value; probe will proceed unauthenticated"
+        );
     }
     headers
 }
@@ -617,8 +621,12 @@ async fn attach_tls_client_identity(
 pub(crate) struct ProbeRequest<'a> {
     /// `spec.endpoint` — the MCP server's HTTP(S) URL.
     pub(crate) endpoint: &'a str,
-    /// Bounded wall-clock budget for DNS resolution, connect, and the
-    /// `tools/list` call combined.
+    /// Total wall-clock budget for the whole probe: DNS resolution, TLS
+    /// Secret material reads, connect/handshake, and the `tools/list` call
+    /// combined. Enforced by a single outer `tokio::time::timeout` in
+    /// [`probe_agent_tool_provider`] — the per-phase timeouts inside it are
+    /// defensive inner bounds, not independent budgets, so this value is
+    /// never multiplied across phases.
     pub(crate) timeout: Duration,
     /// `spec.tls`, when the probe should use a custom CA/client identity
     /// instead of the platform trust store.
@@ -639,10 +647,32 @@ pub(crate) struct ProbeRequest<'a> {
 /// Only the first page of results is fetched — `AgentToolProvider` has no
 /// documented need for multi-page tool catalogs at this scope, and every
 /// reconcile re-probes regardless (see the CRD's staleness-note doc comment).
+///
+/// The whole sequence — DNS resolution, TLS Secret reads, connect/handshake,
+/// and `tools/list` — is bounded by one outer `request.timeout`, so a slow
+/// Kubernetes API (TLS Secret fetch has no timeout of its own) or a peer
+/// that stalls at one phase cannot push total probe latency past the
+/// documented budget by combining several unbounded or independently-bounded
+/// phases.
 pub(crate) async fn probe_agent_tool_provider(
     kube_client: &kube::Client,
     request: ProbeRequest<'_>,
 ) -> McpProbeOutcome {
+    match tokio::time::timeout(
+        request.timeout,
+        probe_agent_tool_provider_unbounded(kube_client, request),
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(_elapsed) => McpProbeOutcome::Unreachable,
+    }
+}
+
+/// The actual probe sequence, without its own overall deadline —
+/// [`probe_agent_tool_provider`] is the only caller and supplies the single
+/// outer `tokio::time::timeout` that bounds this function's total runtime.
+async fn probe_agent_tool_provider_unbounded(kube_client: &kube::Client, request: ProbeRequest<'_>) -> McpProbeOutcome {
     if validate_probe_url(request.endpoint) != McpUrlValidation::Ok {
         tracing::warn!(
             provider_identity = request.provider_identity,
@@ -1063,6 +1093,24 @@ mod tests {
         assert_eq!(
             validate_probe_url("http://[::1]:8080/mcp"),
             McpUrlValidation::BlockedHost
+        );
+    }
+
+    #[test]
+    fn ipv6_link_local_literal_is_blocked() {
+        assert_eq!(
+            validate_probe_url("http://[fe80::1]:8080/mcp"),
+            McpUrlValidation::BlockedHost,
+            "IPv6 link-local addresses must be blocked"
+        );
+    }
+
+    #[test]
+    fn ipv6_unique_local_literal_is_blocked() {
+        assert_eq!(
+            validate_probe_url("http://[fd00::1]:8080/mcp"),
+            McpUrlValidation::BlockedHost,
+            "IPv6 unique-local (ULA) addresses must be blocked"
         );
     }
 

@@ -55,8 +55,11 @@ use crate::{
 /// [`AgentToolProviderSpec`](crate::crd::agent_tool_provider::AgentToolProviderSpec) yet.
 const REQUEUE_INTERVAL: Duration = Duration::from_secs(300);
 
-/// Bounded wall-clock budget for the live MCP `tools/list` probe (connect +
-/// handshake + the call itself).
+/// Total bounded wall-clock budget for the live MCP probe: DNS resolution,
+/// TLS Secret material reads, connect/handshake, and the `tools/list` call
+/// combined — enforced as a single outer timeout in
+/// [`mcp_probe::probe_agent_tool_provider`], not summed/multiplied across
+/// phases.
 ///
 /// [`AgentToolProviderSpec`](crate::crd::agent_tool_provider::AgentToolProviderSpec)
 /// has no `healthCheck.timeout`-equivalent field yet, so this is a fixed
