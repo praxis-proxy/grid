@@ -5519,6 +5519,17 @@ fn multi_provider_fixture_json(
     })
 }
 
+/// Build the multi-provider validation `GridNetwork` fixture JSON.
+///
+/// No single site is "local" across multiple provider sites — this
+/// intentionally passes `TEST_NETWORK` (not a real site name) as
+/// `local_site`, preserving the prior behavior (`localSiteName` falls back to
+/// the network name, which matches no candidate) since this validation
+/// checks candidate presence per site, not locality ordering.
+fn multi_provider_network_fixture_json() -> String {
+    network_fixture_json(TEST_NETWORK, TEST_GATEWAY_NAME, TEST_GATEWAY_NS, TEST_NETWORK)
+}
+
 /// Apply a `GridNetwork` + one `InferenceProvider` per provider site.
 ///
 /// Used in multi-provider mode instead of `apply_test_fixtures`.  Each
@@ -5533,11 +5544,7 @@ pub(crate) fn apply_multi_provider_fixtures(
     providers: &[(&str, &[String])],
     provider_endpoint: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // No single site is "local" across multiple provider sites — preserve the
-    // prior behavior (localSiteName absent, falling back to the network name,
-    // which matches no candidate) since this validation checks candidate
-    // presence per site, not locality ordering.
-    let network = network_fixture_json(TEST_NETWORK, TEST_GATEWAY_NAME, TEST_GATEWAY_NS, TEST_NETWORK);
+    let network = multi_provider_network_fixture_json();
     kubectl::apply_manifest(context, &network)?;
     for &(site_name, models) in providers {
         let fixture_name = multi_provider_fixture_name(site_name);
@@ -7590,9 +7597,6 @@ mod tests {
 
     #[test]
     fn apply_test_fixtures_for_cluster_wires_routing_cluster_as_local_site_name() {
-        // apply_test_fixtures_for_cluster's healthy/degraded/metrics fixtures all use
-        // `routingClusterRef = routing_cluster`; the GridNetwork it builds must use that
-        // same value as localSiteName, or those candidates never resolve to SameSite.
         let routing_cluster = "site-nonstandard";
         let network = network_fixture_json(TEST_NETWORK, TEST_GATEWAY_NAME, TEST_GATEWAY_NS, routing_cluster);
         let healthy = provider_fixture_json(
@@ -7613,6 +7617,20 @@ mod tests {
             provider_json["spec"]["routingClusterRef"].as_str(),
             "GridNetwork.gatewayRefs[0].localSiteName must match the healthy provider's \
              routingClusterRef so its candidate resolves to LocalityTier::SameSite"
+        );
+    }
+
+    #[test]
+    fn apply_multi_provider_fixtures_network_uses_test_network_as_local_site_name() {
+        let json = multi_provider_network_fixture_json();
+        let value: serde_json::Value = serde_json::from_str(&json).expect("fixture must be valid JSON");
+
+        assert_eq!(
+            value["spec"]["gatewayRefs"][0]["localSiteName"].as_str(),
+            Some(TEST_NETWORK),
+            "multi-provider validation has no single local site; localSiteName must stay TEST_NETWORK \
+             (matching no candidate) so candidate-presence checks aren't skewed by locality ordering — if this \
+             ever changed to pass a real site name, locality ordering would silently re-engage with no signal"
         );
     }
 
