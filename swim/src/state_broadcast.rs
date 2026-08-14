@@ -1508,9 +1508,6 @@ mod tests {
 
     #[test]
     fn receive_item_caps_distinct_origin_slots_for_a_tenant() {
-        // Exercises MAX_TENANT_SPEND_ORIGINS at the real SWIM ingest boundary
-        // (receive_item), not just the internal merge function directly, to
-        // prove the bound actually applies to gossip as delivered.
         let mut handler = StateBroadcastHandler::new("site-local".to_owned());
         for i in 0..crdt::grid_state::MAX_TENANT_SPEND_ORIGINS {
             receive_tenant_spend_broadcast(&mut handler, &format!("site-{i}"), 1, "tenant-x", 1);
@@ -1526,7 +1523,9 @@ mod tests {
         assert_eq!(
             counter.slot_count(),
             crdt::grid_state::MAX_TENANT_SPEND_ORIGINS,
-            "a brand-new origin's broadcast must be dropped once the tenant's counter is at capacity"
+            "a brand-new origin's broadcast must be dropped once the tenant's counter is at capacity -- \
+             exercised at the real SWIM ingest boundary (receive_item), not just the internal merge function \
+             directly, to prove the bound actually applies to gossip as delivered"
         );
         assert_eq!(
             counter.total(),
@@ -1542,10 +1541,6 @@ mod tests {
             receive_tenant_spend_broadcast(&mut handler, &format!("site-{i}"), 1, "tenant-x", 1);
         }
 
-        // site-0 already has a slot; a higher-revision, higher-amount
-        // broadcast from it must still be merged even though the tenant is
-        // at the origin-slot cap — the cap only blocks brand-new origins,
-        // not legitimate ongoing updates from origins already being tracked.
         receive_tenant_spend_broadcast(&mut handler, "site-0", 2, "tenant-x", 500);
 
         let merged = handler.snapshot();
@@ -1556,7 +1551,9 @@ mod tests {
         assert_eq!(
             counter.total(),
             u64::try_from(crdt::grid_state::MAX_TENANT_SPEND_ORIGINS - 1).unwrap_or(u64::MAX) + 500,
-            "an already-tracked origin must keep converging normally once the tenant is at capacity"
+            "site-0 already has a slot, so a higher-revision, higher-amount broadcast from it must still merge \
+             at the origin-slot cap -- the cap only blocks brand-new origins, not ongoing updates from origins \
+             already being tracked"
         );
     }
 
