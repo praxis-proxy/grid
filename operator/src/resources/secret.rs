@@ -207,54 +207,7 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-
-    // -----------------------------------------------------------------------
-    // Test doubles
-    // -----------------------------------------------------------------------
-
-    /// Build a `kube::Client` backed by an in-memory map of Secret name to
-    /// `Secret`, so `read_secret_bytes` can be exercised without a real
-    /// cluster. Any name not present in the map returns HTTP 404.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "test mock builder: 404-vs-200 branches are the whole point"
-    )]
-    fn mock_kube_client_with_secrets(secrets: HashMap<&'static str, Secret>) -> kube::Client {
-        let service = tower::service_fn(move |req: http::Request<kube::client::Body>| {
-            let secrets = secrets.clone();
-            async move {
-                let name = req.uri().path().rsplit('/').next().unwrap_or_default().to_owned();
-                let response = secrets.get(name.as_str()).map_or_else(
-                    || {
-                        let not_found = serde_json::json!({
-                            "kind": "Status",
-                            "apiVersion": "v1",
-                            "status": "Failure",
-                            "message": format!("secrets \"{name}\" not found"),
-                            "reason": "NotFound",
-                            "code": 404,
-                        });
-                        http::Response::builder()
-                            .status(404)
-                            .body(kube::client::Body::from(
-                                serde_json::to_vec(&not_found).unwrap_or_else(|_| std::process::abort()),
-                            ))
-                            .unwrap_or_else(|_| std::process::abort())
-                    },
-                    |secret| {
-                        http::Response::builder()
-                            .status(200)
-                            .body(kube::client::Body::from(
-                                serde_json::to_vec(secret).unwrap_or_else(|_| std::process::abort()),
-                            ))
-                            .unwrap_or_else(|_| std::process::abort())
-                    },
-                );
-                Ok::<_, std::convert::Infallible>(response)
-            }
-        });
-        kube::Client::new(service, "default")
-    }
+    use crate::resources::test_doubles::mock_kube_client_with_secrets;
 
     fn secret_ref(name: &str) -> crate::crd::grid_network::SecretRef {
         crate::crd::grid_network::SecretRef {
@@ -313,9 +266,6 @@ mod tests {
         );
     }
 
-    /// Regression test for grid#58: a key absent from an *existing* Secret's
-    /// `data` map must be reported as `KeyMissing`, not conflated with the
-    /// Secret itself being absent.
     #[tokio::test]
     async fn read_secret_bytes_key_absent_from_existing_secret_returns_key_missing() {
         let mut data = BTreeMap::new();
