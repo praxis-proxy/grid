@@ -280,7 +280,8 @@ pub(crate) async fn verify_tls_accessible(
 
 /// Read raw bytes from a Kubernetes Secret for TLS validation.
 ///
-/// Thin wrapper over [`secret::read_secret_bytes`] that maps its
+/// Thin wrapper over [`read_secret_bytes`](crate::resources::secret::read_secret_bytes)
+/// that maps its
 /// [`SecretKeyLookup`](crate::resources::secret::SecretKeyLookup) result
 /// onto the [`TlsFailureReason`] this module's callers expect, so "Secret
 /// not found" and "key not found" map to the correct variant.
