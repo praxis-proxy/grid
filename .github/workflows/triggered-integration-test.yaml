@@ -152,21 +152,22 @@ jobs:
           REPO_URL="https://github.com/${{ github.repository }}.git"
 
           if [[ -n "${PR_NUM}" ]]; then
-            MERGE_SHA=$(git ls-remote "${REPO_URL}" \
-              "refs/pull/${PR_NUM}/merge" | awk '{print $1}')
+            # Resolve the merge ref and refs/heads/main in a single
+            # `git ls-remote` call, instead of trusting the PR REST
+            # resource's `.base.sha` (see note in "Query PR metadata") and
+            # instead of two sequential round-trips, which would leave a
+            # window for main to advance between them and make BASE_SHA
+            # point past the merge ref's actual first parent. One call
+            # resolves both refs from the same server-side view, making
+            # them atomically consistent with each other.
+            LS_OUTPUT=$(git ls-remote "${REPO_URL}" "refs/pull/${PR_NUM}/merge" refs/heads/main)
+            MERGE_SHA=$(echo "${LS_OUTPUT}" | awk '/refs\/pull\//{print $1}')
+            BASE_SHA=$(echo "${LS_OUTPUT}" | awk '/refs\/heads\/main/{print $1}')
             if [[ -z "${MERGE_SHA}" ]]; then
               echo "::error::Cannot resolve refs/pull/${PR_NUM}/merge"
               echo "::error::The PR may have merge conflicts or the merge ref may not exist"
               exit 1
             fi
-
-            # Resolve the base live from refs/heads/main, right alongside
-            # the merge ref above, instead of trusting the PR REST
-            # resource's `.base.sha` (see note in "Query PR metadata").
-            # refs/pull/<n>/merge is kept in sync with main automatically,
-            # so re-deriving the expected base the same way keeps both
-            # values consistent with each other.
-            BASE_SHA=$(git ls-remote "${REPO_URL}" refs/heads/main | awk '{print $1}')
             if [[ -z "${BASE_SHA}" ]]; then
               echo "::error::Cannot resolve refs/heads/main for base verification"
               exit 1
