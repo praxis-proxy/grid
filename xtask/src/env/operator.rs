@@ -914,7 +914,15 @@ pub(crate) fn apply_test_fixtures_for_cluster(
     routing_cluster: &str,
     model: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let network = network_fixture_json(TEST_NETWORK, TEST_GATEWAY_NAME, TEST_GATEWAY_NS);
+    // localSiteName must match the healthy/degraded/metrics fixtures'
+    // routingClusterRef so their overlay candidates resolve to
+    // LocalityTier::SameSite (grid#60): without it, GatewayRef.localSiteName
+    // falls back to the network name, which matches no candidate's site, so
+    // every candidate ties at LocalityTier::Unknown and GeographyFirst
+    // ordering falls through to score (tied under the noMetrics default
+    // strategy) and then to the alphabetical (site, name, cluster) tiebreak —
+    // silently masking locality-order assertions instead of exercising them.
+    let network = network_fixture_json(TEST_NETWORK, TEST_GATEWAY_NAME, TEST_GATEWAY_NS, routing_cluster);
     let healthy = provider_fixture_json(
         TEST_PROVIDER_HEALTHY,
         TEST_NETWORK,
@@ -931,14 +939,19 @@ pub(crate) fn apply_test_fixtures_for_cluster(
 }
 
 /// Build a `GridNetwork` JSON fixture.
-fn network_fixture_json(name: &str, gw_name: &str, gw_ns: &str) -> String {
+///
+/// `local_site_name` becomes `gatewayRefs[0].localSiteName` — the site the
+/// rendered overlay treats as "local" for `GeographyFirst` locality-tier
+/// ordering. Pass the `routingClusterRef` used by the fixtures that should
+/// resolve to `LocalityTier::SameSite`.
+fn network_fixture_json(name: &str, gw_name: &str, gw_ns: &str, local_site_name: &str) -> String {
     serde_json::to_string_pretty(&serde_json::json!({
         "apiVersion": "grid.praxis-proxy.io/v1alpha1",
         "kind": "GridNetwork",
         "metadata": { "name": name },
         "spec": {
             "seeds": [],
-            "gatewayRefs": [{ "name": gw_name, "namespace": gw_ns }]
+            "gatewayRefs": [{ "name": gw_name, "namespace": gw_ns, "localSiteName": local_site_name }]
         }
     }))
     .unwrap_or_else(|e| {
@@ -5520,7 +5533,11 @@ pub(crate) fn apply_multi_provider_fixtures(
     providers: &[(&str, &[String])],
     provider_endpoint: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let network = network_fixture_json(TEST_NETWORK, TEST_GATEWAY_NAME, TEST_GATEWAY_NS);
+    // No single site is "local" across multiple provider sites — preserve the
+    // prior behavior (localSiteName absent, falling back to the network name,
+    // which matches no candidate) since this validation checks candidate
+    // presence per site, not locality ordering.
+    let network = network_fixture_json(TEST_NETWORK, TEST_GATEWAY_NAME, TEST_GATEWAY_NS, TEST_NETWORK);
     kubectl::apply_manifest(context, &network)?;
     for &(site_name, models) in providers {
         let fixture_name = multi_provider_fixture_name(site_name);
