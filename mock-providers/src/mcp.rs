@@ -67,7 +67,8 @@ impl ServerHandler for FixedToolsServer {
     }
 }
 
-/// Build an `axum::Router` serving a [`FixedToolsServer`] at `/mcp`.
+/// Build an `axum::Router` serving a `FixedToolsServer` (private to this
+/// module) at `/mcp`.
 ///
 /// `required_bearer: None` means the server accepts any (or no)
 /// `Authorization` header — used to validate `AgentToolProvider`'s
