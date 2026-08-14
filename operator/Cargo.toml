@@ -37,5 +37,8 @@ tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 zeroize = { workspace = true }
 
+[dev-dependencies]
+tower = { workspace = true }
+
 [lints]
 workspace = true

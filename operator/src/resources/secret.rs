@@ -57,9 +57,38 @@ pub async fn read_site_cert_pem(
     Ok(public_cert_pem_from_secret(&secret))
 }
 
+/// Result of looking up a named key within a Kubernetes Secret's `data` map.
+///
+/// Distinguishes "the Secret itself is absent" from "the Secret exists but
+/// the key is absent (or empty)" so callers can surface an accurate
+/// diagnostic instead of collapsing both into a single `None`. See
+/// [grid#58](https://github.com/praxis-proxy/grid/issues/58).
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum SecretKeyLookup {
+    /// The key was found and contains non-empty bytes.
+    Found(Vec<u8>),
+    /// The Secret does not exist, or exists but has no `data` section.
+    SecretMissing,
+    /// The Secret exists but the key is absent from `data`, or its value is
+    /// empty.
+    KeyMissing,
+}
+
+impl SecretKeyLookup {
+    /// Collapse into the historical `Option<Vec<u8>>` shape for callers that
+    /// don't need to distinguish "Secret missing" from "key missing".
+    pub(crate) fn into_bytes(self) -> Option<Vec<u8>> {
+        match self {
+            Self::Found(bytes) => Some(bytes),
+            Self::SecretMissing | Self::KeyMissing => None,
+        }
+    }
+}
+
 /// Read raw bytes from a named key within a Kubernetes Secret.
 ///
-/// Returns `Ok(None)` when the Secret or the key does not exist.
+/// Returns [`SecretKeyLookup`] so callers can distinguish a missing Secret
+/// from a Secret that exists but lacks (or has an empty) requested key.
 /// Never logs the byte content — callers handle private material.
 ///
 /// # Errors
@@ -69,12 +98,18 @@ pub(crate) async fn read_secret_bytes(
     client: &kube::Client,
     secret_ref: &crate::crd::grid_network::SecretRef,
     key_name: &str,
-) -> Result<Option<Vec<u8>>, kube::Error> {
+) -> Result<SecretKeyLookup, kube::Error> {
     let api: kube::Api<Secret> = kube::Api::namespaced(client.clone(), &secret_ref.namespace);
     let Some(secret) = api.get_opt(&secret_ref.name).await? else {
-        return Ok(None);
+        return Ok(SecretKeyLookup::SecretMissing);
     };
-    Ok(secret.data.as_ref().and_then(|d| d.get(key_name)).map(|b| b.0.clone()))
+    let Some(data) = &secret.data else {
+        return Ok(SecretKeyLookup::SecretMissing);
+    };
+    Ok(match data.get(key_name) {
+        Some(bytes) if !bytes.0.is_empty() => SecretKeyLookup::Found(bytes.0.clone()),
+        Some(_) | None => SecretKeyLookup::KeyMissing,
+    })
 }
 
 /// Extract public certificate PEM from `secret.data["tls.crt"]`.
@@ -166,8 +201,177 @@ pub fn site_cert_secret_data(site: &certs::SiteCertOutput) -> BTreeMap<String, B
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
+#[allow(clippy::unwrap_used, clippy::expect_used, reason = "tests")]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // Test doubles
+    // -----------------------------------------------------------------------
+
+    /// Build a `kube::Client` backed by an in-memory map of Secret name to
+    /// `Secret`, so `read_secret_bytes` can be exercised without a real
+    /// cluster. Any name not present in the map returns HTTP 404.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "test mock builder: 404-vs-200 branches are the whole point"
+    )]
+    fn mock_kube_client_with_secrets(secrets: HashMap<&'static str, Secret>) -> kube::Client {
+        let service = tower::service_fn(move |req: http::Request<kube::client::Body>| {
+            let secrets = secrets.clone();
+            async move {
+                let name = req.uri().path().rsplit('/').next().unwrap_or_default().to_owned();
+                let response = secrets.get(name.as_str()).map_or_else(
+                    || {
+                        let not_found = serde_json::json!({
+                            "kind": "Status",
+                            "apiVersion": "v1",
+                            "status": "Failure",
+                            "message": format!("secrets \"{name}\" not found"),
+                            "reason": "NotFound",
+                            "code": 404,
+                        });
+                        http::Response::builder()
+                            .status(404)
+                            .body(kube::client::Body::from(
+                                serde_json::to_vec(&not_found).unwrap_or_else(|_| std::process::abort()),
+                            ))
+                            .unwrap_or_else(|_| std::process::abort())
+                    },
+                    |secret| {
+                        http::Response::builder()
+                            .status(200)
+                            .body(kube::client::Body::from(
+                                serde_json::to_vec(secret).unwrap_or_else(|_| std::process::abort()),
+                            ))
+                            .unwrap_or_else(|_| std::process::abort())
+                    },
+                );
+                Ok::<_, std::convert::Infallible>(response)
+            }
+        });
+        kube::Client::new(service, "default")
+    }
+
+    fn secret_ref(name: &str) -> crate::crd::grid_network::SecretRef {
+        crate::crd::grid_network::SecretRef {
+            name: name.to_owned(),
+            namespace: "default".to_owned(),
+            key: None,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // read_secret_bytes — SecretMissing vs KeyMissing (grid#58)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn read_secret_bytes_found_returns_bytes() {
+        let mut data = BTreeMap::new();
+        data.insert("ca.crt".to_owned(), ByteString(b"ca-bytes".to_vec()));
+        let client = mock_kube_client_with_secrets(HashMap::from([(
+            "ca-secret",
+            Secret {
+                data: Some(data),
+                ..Default::default()
+            },
+        )]));
+        let result = read_secret_bytes(&client, &secret_ref("ca-secret"), "ca.crt")
+            .await
+            .expect("mock API call must not fail");
+        assert_eq!(result, SecretKeyLookup::Found(b"ca-bytes".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn read_secret_bytes_secret_absent_returns_secret_missing() {
+        let client = mock_kube_client_with_secrets(HashMap::new());
+        let result = read_secret_bytes(&client, &secret_ref("absent"), "ca.crt")
+            .await
+            .expect("mock API call must not fail");
+        assert_eq!(result, SecretKeyLookup::SecretMissing);
+    }
+
+    #[tokio::test]
+    async fn read_secret_bytes_secret_with_no_data_section_returns_secret_missing() {
+        let client = mock_kube_client_with_secrets(HashMap::from([(
+            "empty-secret",
+            Secret {
+                data: None,
+                ..Default::default()
+            },
+        )]));
+        let result = read_secret_bytes(&client, &secret_ref("empty-secret"), "ca.crt")
+            .await
+            .expect("mock API call must not fail");
+        assert_eq!(
+            result,
+            SecretKeyLookup::SecretMissing,
+            "a Secret with no data section at all has nothing to read; treated as missing"
+        );
+    }
+
+    /// Regression test for grid#58: a key absent from an *existing* Secret's
+    /// `data` map must be reported as `KeyMissing`, not conflated with the
+    /// Secret itself being absent.
+    #[tokio::test]
+    async fn read_secret_bytes_key_absent_from_existing_secret_returns_key_missing() {
+        let mut data = BTreeMap::new();
+        data.insert("wrong-key".to_owned(), ByteString(b"ca-bytes".to_vec()));
+        let client = mock_kube_client_with_secrets(HashMap::from([(
+            "ca-secret",
+            Secret {
+                data: Some(data),
+                ..Default::default()
+            },
+        )]));
+        let result = read_secret_bytes(&client, &secret_ref("ca-secret"), "ca.crt")
+            .await
+            .expect("mock API call must not fail");
+        assert_eq!(
+            result,
+            SecretKeyLookup::KeyMissing,
+            "grid#58: a key absent from an existing Secret's data must be KeyMissing, not SecretMissing"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_secret_bytes_key_present_but_empty_returns_key_missing() {
+        let mut data = BTreeMap::new();
+        data.insert("ca.crt".to_owned(), ByteString(Vec::new()));
+        let client = mock_kube_client_with_secrets(HashMap::from([(
+            "ca-secret",
+            Secret {
+                data: Some(data),
+                ..Default::default()
+            },
+        )]));
+        let result = read_secret_bytes(&client, &secret_ref("ca-secret"), "ca.crt")
+            .await
+            .expect("mock API call must not fail");
+        assert_eq!(result, SecretKeyLookup::KeyMissing);
+    }
+
+    // -----------------------------------------------------------------------
+    // SecretKeyLookup::into_bytes — pure collapse to Option<Vec<u8>>
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn into_bytes_found_yields_some() {
+        assert_eq!(SecretKeyLookup::Found(b"x".to_vec()).into_bytes(), Some(b"x".to_vec()));
+    }
+
+    #[test]
+    fn into_bytes_secret_missing_yields_none() {
+        assert_eq!(SecretKeyLookup::SecretMissing.into_bytes(), None);
+    }
+
+    #[test]
+    fn into_bytes_key_missing_yields_none() {
+        assert_eq!(SecretKeyLookup::KeyMissing.into_bytes(), None);
+    }
 
     #[test]
     fn build_creates_secret_with_metadata() {

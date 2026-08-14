@@ -263,6 +263,7 @@ async fn build_probe_config_from_secrets(
     let ca_bytes = read_secret_bytes(client, ca_ref, "ca.crt")
         .await
         .map_err(|_err| O::TrustMaterialMissing)?
+        .into_bytes()
         .ok_or(O::TrustMaterialMissing)?;
     let roots = parse_ca_roots(&ca_bytes).map_err(|_err| O::TrustMaterialInvalid)?;
 
@@ -275,11 +276,13 @@ async fn build_probe_config_from_secrets(
     let cert_bytes = read_secret_bytes(client, secret_ref, "tls.crt")
         .await
         .map_err(|_err| O::TrustMaterialMissing)?
+        .into_bytes()
         .ok_or(O::TrustMaterialMissing)?;
     let key_bytes = Zeroizing::new(
         read_secret_bytes(client, secret_ref, "tls.key")
             .await
             .map_err(|_err| O::TrustMaterialMissing)?
+            .into_bytes()
             .ok_or(O::TrustMaterialMissing)?,
     );
     let client_certs = parse_client_certs(&cert_bytes).map_err(|_err| O::TrustMaterialInvalid)?;
