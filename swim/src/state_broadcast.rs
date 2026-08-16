@@ -1483,6 +1483,80 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // tenant_spend origin-slot cap tests (grid#52)
+    // -----------------------------------------------------------------------
+
+    /// Deliver one origin's tenant-spend-only broadcast through the real
+    /// SWIM ingest entry point (`receive_item`, via the `receive` helper).
+    ///
+    /// `revision` must be unique-and-increasing per call for the same
+    /// `origin` — `receive_item` drops a same-or-lower-revision broadcast
+    /// from an origin it has already seen as stale, independent of this
+    /// module's own cap logic (see `receive_item`'s `latest_by_origin` check).
+    fn receive_tenant_spend_broadcast(
+        handler: &mut StateBroadcastHandler,
+        origin: &str,
+        revision: u64,
+        tenant_id: &str,
+        amount: u64,
+    ) {
+        let mut snap = GridStateSnapshot::new(origin.to_owned());
+        snap.increment_tenant_spend(tenant_id, amount);
+        receive(handler, &StateBroadcast::new(origin.to_owned(), revision, snap, None));
+    }
+
+    #[test]
+    fn receive_item_caps_distinct_origin_slots_for_a_tenant() {
+        let mut handler = StateBroadcastHandler::new("site-local".to_owned());
+        for i in 0..crdt::grid_state::MAX_TENANT_SPEND_ORIGINS {
+            receive_tenant_spend_broadcast(&mut handler, &format!("site-{i}"), 1, "tenant-x", 1);
+        }
+
+        receive_tenant_spend_broadcast(&mut handler, "site-overflow", 1, "tenant-x", 1);
+
+        let merged = handler.snapshot();
+        let counter = merged
+            .tenant_spend
+            .get("tenant-x")
+            .unwrap_or_else(|| std::process::abort());
+        assert_eq!(
+            counter.slot_count(),
+            crdt::grid_state::MAX_TENANT_SPEND_ORIGINS,
+            "a brand-new origin's broadcast must be dropped once the tenant's counter is at capacity -- \
+             exercised at the real SWIM ingest boundary (receive_item), not just the internal merge function \
+             directly, to prove the bound actually applies to gossip as delivered"
+        );
+        assert_eq!(
+            counter.total(),
+            u64::try_from(crdt::grid_state::MAX_TENANT_SPEND_ORIGINS).unwrap_or(u64::MAX),
+            "the overflow origin's amount must not be reflected in the merged total"
+        );
+    }
+
+    #[test]
+    fn receive_item_still_merges_updates_from_an_already_tracked_origin_once_capped() {
+        let mut handler = StateBroadcastHandler::new("site-local".to_owned());
+        for i in 0..crdt::grid_state::MAX_TENANT_SPEND_ORIGINS {
+            receive_tenant_spend_broadcast(&mut handler, &format!("site-{i}"), 1, "tenant-x", 1);
+        }
+
+        receive_tenant_spend_broadcast(&mut handler, "site-0", 2, "tenant-x", 500);
+
+        let merged = handler.snapshot();
+        let counter = merged
+            .tenant_spend
+            .get("tenant-x")
+            .unwrap_or_else(|| std::process::abort());
+        assert_eq!(
+            counter.total(),
+            u64::try_from(crdt::grid_state::MAX_TENANT_SPEND_ORIGINS - 1).unwrap_or(u64::MAX) + 500,
+            "site-0 already has a slot, so a higher-revision, higher-amount broadcast from it must still merge \
+             at the origin-slot cap -- the cap only blocks brand-new origins, not ongoing updates from origins \
+             already being tracked"
+        );
+    }
+
     #[test]
     fn handler_accepts_v1_broadcast_without_gateway_address() {
         let mut handler = StateBroadcastHandler::new("site-local".to_owned());

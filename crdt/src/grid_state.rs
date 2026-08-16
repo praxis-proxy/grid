@@ -31,6 +31,25 @@ use crate::{GCounter, OrSet};
 /// `max_origins` bound already used for retained-origin maps in `swim`.
 pub const MAX_TRACKED_TENANTS: usize = 1_024;
 
+/// Hard bound on the number of distinct site-slots accumulated within a
+/// single tenant's [`GridStateSnapshot::tenant_spend`] counter.
+///
+/// A different axis from [`MAX_TRACKED_TENANTS`], which bounds the number of
+/// distinct `tenant_id` keys: this bounds the number of distinct *origins*
+/// (sites) contributing to any one tenant's counter. Without this bound, a
+/// compromised or churning origin repeatedly claiming new site identities
+/// could grow a single tenant's [`GCounter`] slot map without limit, since
+/// nothing currently removes a site's slot once recorded (dead-member
+/// eviction deliberately does not clear `tenant_spend` — see
+/// [`GridStateSnapshot::remove_origin_tenant_spend`]'s doc comment).
+///
+/// 256 is generous headroom for any real Grid deployment's site count (Grid's
+/// SWIM layer is documented to scale to 50,000+ nodes, but that bounds
+/// membership gossip fan-out, not the number of *distinct sites a customer
+/// actually deploys* — realistically tens, not thousands) while still
+/// bounding pathological/adversarial growth.
+pub const MAX_TENANT_SPEND_ORIGINS: usize = 256;
+
 // ---------------------------------------------------------------------------
 // Access policy
 // ---------------------------------------------------------------------------
@@ -251,10 +270,17 @@ impl GridStateSnapshot {
     /// peer cannot forge another site's recorded spend by embedding extra
     /// slots in its own broadcast.
     ///
-    /// Also enforces [`MAX_TRACKED_TENANTS`]: once that many distinct
-    /// `tenant_id`s are tracked, brand-new `tenant_id`s are silently refused
-    /// (already-tracked tenants keep accepting updates) to bound memory
-    /// growth from gossip carrying arbitrary attacker-supplied `tenant_id`s.
+    /// Also enforces two independent bounds:
+    ///
+    /// - [`MAX_TRACKED_TENANTS`]: once that many distinct `tenant_id`s are tracked, brand-new `tenant_id`s are silently
+    ///   refused.
+    /// - [`MAX_TENANT_SPEND_ORIGINS`]: once a single tenant's counter has that many distinct origin slots, a brand-new
+    ///   origin's contribution to that tenant is silently refused.
+    ///
+    /// In both cases, already-tracked tenants/origins keep accepting
+    /// updates — only brand-new keys are refused at capacity — to bound
+    /// memory growth from gossip carrying arbitrary attacker-supplied
+    /// `tenant_id`s or an unbounded number of claimed origin identities.
     ///
     /// [`merge_tenant_spend`]: Self::merge_tenant_spend
     pub fn merge_tenant_spend_from_origin(&mut self, origin_site: &str, other: &BTreeMap<String, GCounter>) {
@@ -266,10 +292,14 @@ impl GridStateSnapshot {
             if !self.tenant_spend.contains_key(tenant_id) && self.tenant_spend.len() >= MAX_TRACKED_TENANTS {
                 continue;
             }
-            self.tenant_spend
+            let entry = self
+                .tenant_spend
                 .entry(tenant_id.clone())
-                .or_insert_with(|| GCounter::new(self.site_id.clone()))
-                .merge(&origin_only);
+                .or_insert_with(|| GCounter::new(self.site_id.clone()));
+            if !entry.has_slot(origin_site) && entry.slot_count() >= MAX_TENANT_SPEND_ORIGINS {
+                continue;
+            }
+            entry.merge(&origin_only);
         }
     }
 
@@ -1028,5 +1058,117 @@ mod tests {
             99,
             "an already-tracked tenant must still accept updates while the map is at capacity"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // MAX_TENANT_SPEND_ORIGINS bound (grid#52: distinct site-slots per tenant)
+    // -----------------------------------------------------------------------
+
+    /// Merge one origin's `amount`-cent contribution to `tenant_id` into `snap`.
+    fn merge_one_origin_spend(snap: &mut GridStateSnapshot, origin: &str, tenant_id: &str, amount: u64) {
+        let mut incoming = BTreeMap::new();
+        let mut counter = GCounter::new(origin.to_owned());
+        counter.increment(amount);
+        incoming.insert(tenant_id.to_owned(), counter);
+        snap.merge_tenant_spend_from_origin(origin, &incoming);
+    }
+
+    /// Fill `tenant_id`'s counter to exactly `count` distinct origin slots
+    /// (`site-0..site-{count - 1}`, one cent each).
+    fn fill_tenant_origins(snap: &mut GridStateSnapshot, tenant_id: &str, count: usize) {
+        for i in 0..count {
+            merge_one_origin_spend(snap, &format!("site-{i}"), tenant_id, 1);
+        }
+    }
+
+    /// Look up `tenant_id`'s counter, aborting the test if it's missing.
+    fn tenant_counter<'a>(snap: &'a GridStateSnapshot, tenant_id: &str) -> &'a GCounter {
+        snap.tenant_spend
+            .get(tenant_id)
+            .unwrap_or_else(|| std::process::abort())
+    }
+
+    #[test]
+    fn merge_tenant_spend_from_origin_refuses_new_origin_once_tenant_at_capacity() {
+        let mut snap = GridStateSnapshot::new("site-local".to_owned());
+        fill_tenant_origins(&mut snap, "tenant-x", MAX_TENANT_SPEND_ORIGINS);
+
+        merge_one_origin_spend(&mut snap, "site-overflow", "tenant-x", 1);
+
+        let counter = tenant_counter(&snap, "tenant-x");
+        assert_eq!(
+            counter.slot_count(),
+            MAX_TENANT_SPEND_ORIGINS,
+            "a brand-new origin must be refused once this tenant's counter is at its hard bound -- this caps \
+             distinct site-slots per tenant, independent of MAX_TRACKED_TENANTS (which bounds tenant_id count)"
+        );
+        assert!(
+            !counter.has_slot("site-overflow"),
+            "the refused origin's slot must not be present at all"
+        );
+        assert_eq!(
+            counter.total(),
+            u64::try_from(MAX_TENANT_SPEND_ORIGINS).unwrap_or(u64::MAX),
+            "the refused origin's contribution must not be reflected in the total"
+        );
+    }
+
+    #[test]
+    fn merge_tenant_spend_from_origin_still_updates_already_tracked_origin_at_capacity() {
+        let mut snap = GridStateSnapshot::new("site-local".to_owned());
+        fill_tenant_origins(&mut snap, "tenant-x", MAX_TENANT_SPEND_ORIGINS);
+
+        merge_one_origin_spend(&mut snap, "site-0", "tenant-x", 99);
+
+        let counter = tenant_counter(&snap, "tenant-x");
+        assert_eq!(
+            counter.slot_count(),
+            MAX_TENANT_SPEND_ORIGINS,
+            "site-0 already has a slot, so a higher-amount update from it must still merge even at the \
+             origin-slot cap; updating an already-tracked origin must not change the slot count"
+        );
+        assert_eq!(
+            counter.total(),
+            u64::try_from(MAX_TENANT_SPEND_ORIGINS - 1).unwrap_or(u64::MAX) + 99,
+            "an already-tracked origin must still accept updates (max-per-slot) while the tenant is at capacity"
+        );
+    }
+
+    #[test]
+    fn merge_tenant_spend_from_origin_admits_new_origin_one_below_capacity() {
+        let mut snap = GridStateSnapshot::new("site-local".to_owned());
+        fill_tenant_origins(&mut snap, "tenant-x", MAX_TENANT_SPEND_ORIGINS - 1);
+
+        merge_one_origin_spend(&mut snap, "site-last", "tenant-x", 1);
+
+        let counter = tenant_counter(&snap, "tenant-x");
+        assert_eq!(
+            counter.slot_count(),
+            MAX_TENANT_SPEND_ORIGINS,
+            "pins the exact boundary: with MAX_TENANT_SPEND_ORIGINS - 1 origins already tracked, the \
+             (MAX_TENANT_SPEND_ORIGINS)-th distinct origin must still be admitted -- the cap itself, not \
+             cap - 1, is the refusal point"
+        );
+        assert!(
+            counter.has_slot("site-last"),
+            "the newly-admitted origin's slot must be present"
+        );
+    }
+
+    #[test]
+    fn merge_tenant_spend_from_origin_caps_are_independent_per_tenant() {
+        let mut snap = GridStateSnapshot::new("site-local".to_owned());
+        fill_tenant_origins(&mut snap, "tenant-x", MAX_TENANT_SPEND_ORIGINS);
+
+        merge_one_origin_spend(&mut snap, "site-0", "tenant-y", 5);
+
+        let tenant_y = tenant_counter(&snap, "tenant-y");
+        assert_eq!(
+            tenant_y.slot_count(),
+            1,
+            "tenant-y's cap is independent of tenant-x's; another tenant reaching its origin-slot cap must \
+             not affect this one"
+        );
+        assert_eq!(tenant_y.total(), 5);
     }
 }
