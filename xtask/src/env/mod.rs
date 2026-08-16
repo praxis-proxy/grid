@@ -968,7 +968,45 @@ pub(crate) enum Action {
         /// Protect EPP metrics with an nginx mTLS proxy instead of scraping directly over HTTP.
         #[arg(long)]
         metrics_mtls: bool,
+        /// Drive routing off llm-d's kv-cache-utilization signal
+        /// (`GridNetwork` `scoringPolicy.strategy: kvCachePressure`) instead
+        /// of the default queue-depth signal.
+        #[arg(long)]
+        kv_cache: bool,
     },
+}
+
+#[cfg(test)]
+#[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, reason = "tests")]
+mod llmd_pool_metrics_demo_cli_tests {
+    use clap::Parser as _;
+
+    use super::Action;
+    use crate::{Cli, Command};
+
+    /// Parses `env run-grid-llmd-pool-metrics-demo` with the given extra args
+    /// and returns its `kv_cache` flag value.
+    fn parsed_kv_cache_flag(extra_args: &[&str]) -> bool {
+        let mut args = vec!["xtask", "env", "run-grid-llmd-pool-metrics-demo"];
+        args.extend_from_slice(extra_args);
+        let cli = Cli::try_parse_from(args).expect("valid CLI invocation must parse");
+        let Command::Env { action } = cli.command;
+        match action {
+            Action::RunGridLlmdPoolMetricsDemo { kv_cache, .. } => kv_cache,
+            other => panic!("expected RunGridLlmdPoolMetricsDemo, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn kv_cache_flag_defaults_to_false() {
+        assert!(!parsed_kv_cache_flag(&[]));
+    }
+
+    #[test]
+    fn kv_cache_flag_parses_when_passed() {
+        assert!(parsed_kv_cache_flag(&["--kv-cache"]));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1052,7 +1090,8 @@ pub(crate) fn run(action: &Action) -> Result<(), Box<dyn std::error::Error>> {
             forge_config,
             options,
             metrics_mtls,
-        } => llmd_pool_metrics_demo::run(forge_config, options, *metrics_mtls),
+            kv_cache,
+        } => llmd_pool_metrics_demo::run(forge_config, options, *metrics_mtls, *kv_cache),
     }
 }
 
@@ -2393,6 +2432,11 @@ fn env_verify_swim_state(config: &Path, site: Option<&str>) -> Result<(), Box<dy
     clippy::too_many_lines,
     reason = "five sequential SWIM encryption scenarios; splitting would obscure the test data flow"
 )]
+#[expect(
+    clippy::similar_names,
+    reason = "op_a/op_b-style peer-pair naming is the clear, established idiom for symmetric two-node \
+              scenarios in this file; alternatives would be longer without being less ambiguous"
+)]
 fn env_verify_swim_encryption(config: &Path, site: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     use operator::{
         SWIM_CONVERGENCE_WAIT, SWIM_ENCRYPT_NETWORK, SWIM_ENCRYPT_NODE_A, SWIM_ENCRYPT_NODE_B, SWIM_ENCRYPT_NODE_PLAIN,
@@ -2999,6 +3043,11 @@ fn reserve_three_swim_bind_addrs() -> Result<(String, String, String), Box<dyn s
     clippy::too_many_lines,
     reason = "sequential 11-step mesh proof: CRDs, three operators, CRDT convergence, \
               eligibility before/after Active, wrong-network isolation, cleanup"
+)]
+#[expect(
+    clippy::similar_names,
+    reason = "op_a/op_b/op_c-style peer-pair naming is the clear, established idiom for the \
+              three-node scenario in this file"
 )]
 fn env_verify_swim_mesh_three_node(config: &Path, site: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     use operator::{
@@ -3856,6 +3905,11 @@ fn env_verify_full_grid_routing(config: &Path) -> Result<(), Box<dyn std::error:
 #[expect(
     clippy::too_many_lines,
     reason = "sequential two-phase metrics validation with port-forward lifecycle"
+)]
+#[expect(
+    clippy::similar_names,
+    reason = "east/west paired port-forward guard naming is the clear, established idiom for this \
+              two-site scenario"
 )]
 fn env_verify_metrics_routing(config: &Path) -> Result<(), Box<dyn std::error::Error>> {
     use operator::{
@@ -5850,7 +5904,7 @@ mod validate_all_tests {
     #[test]
     fn step_result_fail_truncates_long_evidence() {
         let long_msg = "x".repeat(200);
-        let err: Box<dyn std::error::Error> = long_msg.clone().into();
+        let err: Box<dyn std::error::Error> = long_msg.into();
         let r = StepResult::fail("step", err.as_ref());
         assert!(r.evidence.len() < 200, "evidence should be truncated");
         assert!(r.evidence.ends_with('…'), "truncated evidence should end with ellipsis");
@@ -6416,6 +6470,11 @@ fn reserve_single_bind_addr() -> Result<String, Box<dyn std::error::Error>> {
     clippy::too_many_lines,
     reason = "sequential convergence test: setup → verify → destabilize → recover → observe stability"
 )]
+#[expect(
+    clippy::similar_names,
+    reason = "op_a/op_b-style peer-pair naming is the clear, established idiom for symmetric two-replica \
+              scenarios in this file"
+)]
 fn env_verify_gridsite_convergence(config: &Path, site: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     use operator::{
         CONVERGENCE_DNS_SAN, CONVERGENCE_NETWORK, CONVERGENCE_POLL_TIMEOUT, CONVERGENCE_SITE,
@@ -6686,6 +6745,11 @@ fn env_verify_gridsite_convergence(config: &Path, site: Option<&str>) -> Result<
 #[expect(
     clippy::too_many_lines,
     reason = "sequential routing-eligibility proof: 7 steps covering SWIM → overlay"
+)]
+#[expect(
+    clippy::similar_names,
+    reason = "op_a/op_b-style peer-pair naming is the clear, established idiom for symmetric two-node \
+              scenarios in this file"
 )]
 fn env_verify_gridsite_trust_fingerprint(config: &Path, site: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     use operator::{

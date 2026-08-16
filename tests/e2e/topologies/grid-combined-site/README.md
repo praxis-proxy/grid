@@ -10,6 +10,13 @@ cargo xtask env run-grid-combined-site-demo \
   --quick --teardown
 ```
 
+The default configuration pulls
+`ghcr.io/praxis-proxy/grid-ai-rollup:v0.1.3`, which contains the provider-side
+filters used by this topology. For local development, set
+`GRID_XTASK_GATEWAY_IMAGE` to an AI image containing
+[`provider_route`](https://github.com/praxis-proxy/ai/pull/386) and set
+`GRID_XTASK_IMAGE_PULL_POLICY=Never` explicitly.
+
 ## What this tests
 
 - Three-cluster combined topology (consumer and provider roles colocated)

@@ -78,6 +78,17 @@ const DATA_PLANE_CONVERGENCE_WAIT: Duration = Duration::from_secs(45);
 /// Delay between request-path convergence probes.
 const DATA_PLANE_PROBE_INTERVAL: Duration = Duration::from_secs(1);
 
+/// Window over which [`check_overlay_metadata_settles`] confirms the overlay
+/// `ConfigMap`'s `resourceVersion` stops changing once converged.
+///
+/// grid#42's reconcile hot-loop produced continuous writes at roughly
+/// 250-300/sec on helios08, so any window long enough to observe a handful of
+/// reconcile ticks (the operator's default requeue is much faster than that
+/// under active SWIM traffic) is enough to distinguish "stopped writing" from
+/// "still churning" — 15s is comfortably longer than that while keeping the
+/// added proof step fast.
+const OVERLAY_SETTLE_WINDOW: Duration = Duration::from_secs(15);
+
 /// Runtime directory retaining the public CA used by client probes.
 const GTM_TLS_DIR: &str = ".forge/runtime/glb-tls/gtm";
 
@@ -1416,6 +1427,16 @@ fn run_steps(ctx: &PrereqContext, mode: DemoMode, ingress_mode: IngressMode, res
         )
     });
 
+    // Regression guard for grid#42: convergence above proves the ConfigMap
+    // *reached* the right state; this proves it *stays* there instead of
+    // being unconditionally re-applied on every reconcile tick.
+    proof_banner("checking overlay metadata stays converged (no reconcile hot-loop)");
+    record_step(
+        "overlay metadata stable (grid#42)",
+        results,
+        check_overlay_metadata_settles,
+    );
+
     // One site advertises two independent providers for the same model.
     proof_banner("checking multiple providers in one site overlay");
     record_step("same-site provider candidates", results, || {
@@ -1706,6 +1727,7 @@ const PROOF_LABELS: &[&str] = &[
     "swim advertise addr",
     "gridnetwork seeds",
     "overlay metadata",
+    "overlay metadata stable (grid#42)",
     "same-site provider candidates",
     "provider gateway addr",
     "remote gridsite egress",
@@ -1983,7 +2005,6 @@ fn run_probe_pod(
         logs: safe_truncate_str(logs.trim(), 512),
     })
 }
-
 
 /// Best-effort cleanup for a `NetworkPolicy` probe pod.
 struct ProbePodGuard {
@@ -2588,6 +2609,100 @@ fn check_overlay_metadata() -> Result<String, Box<dyn std::error::Error>> {
         "dual-key: {legacy_evidence}; envelope: schema=1.0.0, revision={}, annotations and Grid status verified",
         safe_truncate_str(revision, 16)
     ))
+}
+
+/// Regression guard for [grid#42](https://github.com/praxis-proxy/grid/issues/42): an infinite
+/// reconcile hot-loop with three independent unconditional-write sources —
+/// `distribute_overlay_configmap`'s overlay `ConfigMap` apply, the `GridSite`
+/// cert-PEM status patch, and (discovered during live helios08 validation of
+/// the first two fixes) the `GridNetwork`'s own `status.overlayStatus[].renderedAt`
+/// timestamp, which was refreshed from a new clock read on every reconcile
+/// tick regardless of whether the distributed content actually changed.
+/// Each write bumped its object's `resourceVersion` and fired a watch event
+/// that re-triggered the `GridNetwork` reconciler — so the overlay
+/// `ConfigMap`'s and/or the `GridNetwork`'s own `resourceVersion` climbed
+/// continuously (~250-300 writes/sec on the `ConfigMap`, ~13-14 writes/sec on
+/// `GridNetwork` itself, observed on helios08) and never settled —
+/// [`check_overlay_metadata`]'s own resourceVersion-equality assertion would
+/// eventually see a match by chance, but the underlying churn never stopped.
+///
+/// Must run *after* [`check_overlay_metadata`] has already passed once (see
+/// its call site): this only proves stability, not initial correctness.
+/// Captures the `ConfigMap`'s and the `GridNetwork`'s current
+/// `resourceVersion`s and confirms both are unchanged after
+/// [`OVERLAY_SETTLE_WINDOW`] — proving the operator actually stopped
+/// writing to either object, rather than merely happening to observe
+/// equal resourceVersions mid-churn.
+fn check_overlay_metadata_settles() -> Result<String, Box<dyn std::error::Error>> {
+    let context = kubectl_context(PRIMARY_EDGE);
+    let watched = [
+        WatchedResourceVersion::capture(&context, "configmap", OVERLAY_CONFIGMAP)?,
+        WatchedResourceVersion::capture(&context, "gridnetwork", GRID_NETWORK_NAME)?,
+    ];
+
+    let deadline = Instant::now() + OVERLAY_SETTLE_WINDOW;
+    while Instant::now() < deadline {
+        thread::park_timeout(DATA_PLANE_PROBE_INTERVAL);
+        for resource in &watched {
+            resource.assert_unchanged(&context)?;
+        }
+    }
+
+    Ok(format!(
+        "{} both stable for {OVERLAY_SETTLE_WINDOW:?}",
+        watched
+            .iter()
+            .map(WatchedResourceVersion::summary)
+            .collect::<Vec<_>>()
+            .join(" and ")
+    ))
+}
+
+/// A Kubernetes object's `resourceVersion`, captured once as a baseline so it
+/// can be re-checked against the live value to detect reconcile churn.
+///
+/// Used by [`check_overlay_metadata_settles`] to watch both the overlay
+/// `ConfigMap` and the `GridNetwork` object itself without duplicating the
+/// fetch-compare-format logic per resource (see grid#42: both objects were
+/// independent sources of the same unconditional-write hot-loop pattern).
+struct WatchedResourceVersion {
+    /// `kubectl` resource kind, e.g. `"configmap"`.
+    kind: &'static str,
+    /// Resource name within `PRIMARY_EDGE`'s namespace.
+    name: &'static str,
+    /// `resourceVersion` observed at capture time.
+    baseline: String,
+}
+
+impl WatchedResourceVersion {
+    /// Read `kind`/`name`'s current `resourceVersion` as the stability baseline.
+    fn capture(context: &str, kind: &'static str, name: &'static str) -> Result<Self, Box<dyn std::error::Error>> {
+        let baseline = kubectl_jsonpath(context, kind, name, "{.metadata.resourceVersion}")?;
+        Ok(Self { kind, name, baseline })
+    }
+
+    /// Re-reads the live `resourceVersion` and errors if it moved away from
+    /// `baseline` — the observable signature of an unconditional-write
+    /// reconcile hot-loop (grid#42).
+    fn assert_unchanged(&self, context: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let current = kubectl_jsonpath(context, self.kind, self.name, "{.metadata.resourceVersion}")?;
+        let baseline = &self.baseline;
+        if current != *baseline {
+            return Err(format!(
+                "{} {} resourceVersion changed from {baseline} to {current} within the \
+                 {OVERLAY_SETTLE_WINDOW:?} settle window — indicates an unconditional-write reconcile \
+                 hot-loop (grid#42), not a converged, stable overlay",
+                self.kind, self.name
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    /// One-line "kind name resourceVersion=X" fragment for the success message.
+    fn summary(&self) -> String {
+        format!("{} {} resourceVersion={}", self.kind, self.name, self.baseline)
+    }
 }
 
 /// Validate overlay JSON contains candidates with required metadata.

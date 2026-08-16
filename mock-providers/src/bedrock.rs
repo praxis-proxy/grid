@@ -199,7 +199,7 @@ mod tests {
         let req = Request::builder()
             .method("POST")
             .uri("/model/anthropic.claude-3-sonnet/converse")
-            .header(sigv4_header().0.clone(), sigv4_header().1)
+            .header(sigv4_header().0, sigv4_header().1)
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(
                 r#"{"messages":[{"role":"user","content":[{"text":"hi"}]}]}"#,
@@ -225,7 +225,7 @@ mod tests {
         let req = Request::builder()
             .method("POST")
             .uri("/model/anthropic.claude-3-sonnet/converse-stream")
-            .header(sigv4_header().0.clone(), sigv4_header().1)
+            .header(sigv4_header().0, sigv4_header().1)
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(
                 r#"{"messages":[{"role":"user","content":[{"text":"hi"}]}]}"#,

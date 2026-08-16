@@ -611,7 +611,7 @@ fn read_corefile(runner: &dyn CommandRunner, context: &str) -> Result<String, Fo
     let cmd = steps::kubectl_get_corefile(context);
     let output = runner.run(&cmd)?;
     steps::check_success(&output, "coredns read")?;
-    Ok(output.stdout.clone())
+    Ok(output.stdout)
 }
 
 /// Check whether a Corefile already contains a server block for the zone.

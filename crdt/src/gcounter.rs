@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 /// c.increment(10);
 /// assert_eq!(c.total(), 10);
 /// ```
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct GCounter {
     /// Site identifier for this replica.
     site_id: String,
@@ -72,6 +72,47 @@ impl GCounter {
             let slot = self.slots.entry(site.clone()).or_default();
             *slot = (*slot).max(*count);
         }
+    }
+
+    /// Return a copy of this counter containing only the slot for `origin_site`.
+    ///
+    /// Used at trust boundaries (e.g. gossip wire-ingest) where a payload's
+    /// claimed origin should only ever be believed for its own contribution.
+    /// Any other slot present in `self` — legitimate or forged — is dropped,
+    /// mirroring how provider records are scoped to their claimed origin
+    /// before being accepted.
+    #[must_use]
+    pub fn retain_origin(&self, origin_site: &str) -> Self {
+        let mut retained = Self::new(origin_site.to_owned());
+        if let Some(&value) = self.slots.get(origin_site) {
+            retained.slots.insert(origin_site.to_owned(), value);
+        }
+        retained
+    }
+
+    /// Remove the slot belonging to `site`, if present.
+    ///
+    /// Used when evicting a dead site so its contribution doesn't linger in
+    /// other tenants' counters forever. A no-op if `site` never contributed.
+    pub fn remove_slot(&mut self, site: &str) {
+        self.slots.remove(site);
+    }
+
+    /// Return the number of distinct sites with a recorded slot.
+    ///
+    /// Used to enforce a hard cap on distinct origins contributing to a
+    /// single counter (see `grid_state::MAX_TENANT_SPEND_ORIGINS`), as
+    /// defense-in-depth against a compromised or churning origin claiming
+    /// unbounded new site identities.
+    #[must_use]
+    pub fn slot_count(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// Return whether `site` already has a recorded slot.
+    #[must_use]
+    pub fn has_slot(&self, site: &str) -> bool {
+        self.slots.contains_key(site)
     }
 }
 
@@ -175,6 +216,93 @@ mod tests {
             ab_then_c.total(),
             a_then_bc.total(),
             "(a merge b) merge c == a merge (b merge c)"
+        );
+    }
+
+    #[test]
+    fn retain_origin_keeps_only_the_named_slot() {
+        let mut c = GCounter::new("site-a".to_owned());
+        c.increment(10);
+        c.slots.insert("site-b".to_owned(), 999);
+        c.slots.insert("site-c".to_owned(), 42);
+
+        let retained = c.retain_origin("site-a");
+
+        assert_eq!(retained.total(), 10, "only site-a's slot must survive");
+        assert_eq!(
+            retained.local(),
+            10,
+            "the retained counter is keyed by site-a, so local() reflects its slot"
+        );
+    }
+
+    #[test]
+    fn retain_origin_for_absent_slot_is_zero() {
+        let mut c = GCounter::new("site-a".to_owned());
+        c.increment(10);
+
+        let retained = c.retain_origin("site-b");
+
+        assert_eq!(
+            retained.total(),
+            0,
+            "a slot the origin never wrote must retain as zero, not forged"
+        );
+    }
+
+    #[test]
+    fn remove_slot_drops_only_the_named_site() {
+        let mut c = GCounter::new("site-a".to_owned());
+        c.increment(10);
+        c.slots.insert("site-b".to_owned(), 20);
+
+        c.remove_slot("site-a");
+
+        assert_eq!(
+            c.total(),
+            20,
+            "removing site-a's slot must leave site-b's contribution intact"
+        );
+    }
+
+    #[test]
+    fn remove_slot_for_absent_site_is_a_no_op() {
+        let mut c = GCounter::new("site-a".to_owned());
+        c.increment(10);
+
+        c.remove_slot("site-never-contributed");
+
+        assert_eq!(c.total(), 10, "removing an absent slot must not change the total");
+    }
+
+    #[test]
+    fn slot_count_reflects_distinct_sites_after_merge() {
+        let mut a = GCounter::new("site-a".to_owned());
+        a.increment(10);
+        assert_eq!(a.slot_count(), 1, "one increment from one site is one slot");
+
+        let mut b = GCounter::new("site-b".to_owned());
+        b.increment(5);
+        a.merge(&b);
+
+        assert_eq!(a.slot_count(), 2, "merging in a second site's slot must be counted");
+    }
+
+    #[test]
+    fn slot_count_is_zero_for_a_fresh_counter() {
+        let c = GCounter::new("site-a".to_owned());
+        assert_eq!(c.slot_count(), 0, "a counter with no increments yet has no slots");
+    }
+
+    #[test]
+    fn has_slot_reports_presence_per_site() {
+        let mut c = GCounter::new("site-a".to_owned());
+        c.increment(10);
+
+        assert!(c.has_slot("site-a"), "site-a incremented, so it must have a slot");
+        assert!(
+            !c.has_slot("site-b"),
+            "site-b never contributed, so it must not have a slot"
         );
     }
 

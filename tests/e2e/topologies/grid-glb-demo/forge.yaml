@@ -19,70 +19,70 @@ spec:
       properties:
         region: east
         role: provider
-        gatewayImage: "praxis-ai:glb-demo"
-        operatorImage: "grid-operator:glb-demo"
+        gatewayImage: "ghcr.io/praxis-proxy/grid-ai-rollup:v0.1.3"
+        operatorImage: "ghcr.io/praxis-proxy/grid-operator:v0.1.3"
         vcrImage: "ghcr.io/neuralmagic/vllm-vcr:vllm0.23"
         imagePullPolicy: IfNotPresent
-        gatewayImageRepo: "praxis-ai"
-        gatewayImageTag: "glb-demo"
-        operatorImageRepo: "grid-operator"
-        operatorImageTag: "glb-demo"
+        gatewayImageRepo: "ghcr.io/praxis-proxy/grid-ai-rollup"
+        gatewayImageTag: "v0.1.3"
+        operatorImageRepo: "ghcr.io/praxis-proxy/grid-operator"
+        operatorImageTag: "v0.1.3"
 
     - name: west-provider
       stacks: [metallb, grid-operator, west-provider-operator, west-provider-site, vcr-backend]
       properties:
         region: west
         role: provider
-        gatewayImage: "praxis-ai:glb-demo"
-        operatorImage: "grid-operator:glb-demo"
+        gatewayImage: "ghcr.io/praxis-proxy/grid-ai-rollup:v0.1.3"
+        operatorImage: "ghcr.io/praxis-proxy/grid-operator:v0.1.3"
         vcrImage: "ghcr.io/neuralmagic/vllm-vcr:vllm0.23"
         imagePullPolicy: IfNotPresent
-        gatewayImageRepo: "praxis-ai"
-        gatewayImageTag: "glb-demo"
-        operatorImageRepo: "grid-operator"
-        operatorImageTag: "glb-demo"
+        gatewayImageRepo: "ghcr.io/praxis-proxy/grid-ai-rollup"
+        gatewayImageTag: "v0.1.3"
+        operatorImageRepo: "ghcr.io/praxis-proxy/grid-operator"
+        operatorImageTag: "v0.1.3"
 
     - name: east-edge
       stacks: [metallb, grid-operator, east-edge-operator, east-edge-site, edge-gateway]
       properties:
         region: east
         role: edge
-        gatewayImage: "praxis-ai:glb-demo"
-        operatorImage: "grid-operator:glb-demo"
+        gatewayImage: "ghcr.io/praxis-proxy/grid-ai-rollup:v0.1.3"
+        operatorImage: "ghcr.io/praxis-proxy/grid-operator:v0.1.3"
         vcrImage: "ghcr.io/neuralmagic/vllm-vcr:vllm0.23"
         imagePullPolicy: IfNotPresent
-        gatewayImageRepo: "praxis-ai"
-        gatewayImageTag: "glb-demo"
-        operatorImageRepo: "grid-operator"
-        operatorImageTag: "glb-demo"
+        gatewayImageRepo: "ghcr.io/praxis-proxy/grid-ai-rollup"
+        gatewayImageTag: "v0.1.3"
+        operatorImageRepo: "ghcr.io/praxis-proxy/grid-operator"
+        operatorImageTag: "v0.1.3"
 
     - name: west-edge
       stacks: [metallb, grid-operator, west-edge-operator, west-edge-site, edge-gateway]
       properties:
         region: west
         role: edge
-        gatewayImage: "praxis-ai:glb-demo"
-        operatorImage: "grid-operator:glb-demo"
+        gatewayImage: "ghcr.io/praxis-proxy/grid-ai-rollup:v0.1.3"
+        operatorImage: "ghcr.io/praxis-proxy/grid-operator:v0.1.3"
         vcrImage: "ghcr.io/neuralmagic/vllm-vcr:vllm0.23"
         imagePullPolicy: IfNotPresent
-        gatewayImageRepo: "praxis-ai"
-        gatewayImageTag: "glb-demo"
-        operatorImageRepo: "grid-operator"
-        operatorImageTag: "glb-demo"
+        gatewayImageRepo: "ghcr.io/praxis-proxy/grid-ai-rollup"
+        gatewayImageTag: "v0.1.3"
+        operatorImageRepo: "ghcr.io/praxis-proxy/grid-operator"
+        operatorImageTag: "v0.1.3"
 
     - name: gtm-emulator
       stacks: [metallb, gtm-emulator]
       properties:
         region: global
         role: gtm-emulator
-        gatewayImage: "praxis-ai:glb-demo"
-        operatorImage: "grid-operator:glb-demo"
+        gatewayImage: "ghcr.io/praxis-proxy/grid-ai-rollup:v0.1.3"
+        operatorImage: "ghcr.io/praxis-proxy/grid-operator:v0.1.3"
         vcrImage: "ghcr.io/neuralmagic/vllm-vcr:vllm0.23"
         imagePullPolicy: IfNotPresent
-        gatewayImageRepo: "praxis-ai"
-        gatewayImageTag: "glb-demo"
-        operatorImageRepo: "grid-operator"
-        operatorImageTag: "glb-demo"
+        gatewayImageRepo: "ghcr.io/praxis-proxy/grid-ai-rollup"
+        gatewayImageTag: "v0.1.3"
+        operatorImageRepo: "ghcr.io/praxis-proxy/grid-operator"
+        operatorImageTag: "v0.1.3"
 
   stacks:
     metallb:

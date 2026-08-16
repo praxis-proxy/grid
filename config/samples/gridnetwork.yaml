@@ -11,6 +11,7 @@ spec:
   # Provider scoring (defaults to noMetrics when absent).
   # scoringPolicy:
   #   strategy: noMetrics  # "noMetrics" | "queueDepth" | "kvCachePressure"
+  # metricsRefreshInterval: "30s"  # optional, minimum 1s; defaults to 300s, or 60s with TLS metrics
 
   # SWIM protocol settings (defaults)
   swim:

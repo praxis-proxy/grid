@@ -27,9 +27,9 @@ use crate::{
     crd::{
         grid_network::{
             ConsumerConfig, ConsumerConfigPhase, ConsumerConfigStatus, GatewayRef, GridNetwork, GridNetworkPhase,
-            GridNetworkStatus, OverlayPhase, OverlayRevisionStatus, TransportMode,
+            GridNetworkStatus, OverlayPhase, OverlayRevisionStatus, TenantBudgetStatus, TransportMode,
         },
-        grid_site::{GridSite, GridSitePhase},
+        grid_site::{GridSite, GridSitePhase, GridSiteStatus},
         inference_provider::InferenceProvider,
     },
     error::OperatorError,
@@ -187,6 +187,24 @@ fn grid_network_name(network: &GridNetwork) -> Result<&str, OperatorError> {
         .ok_or_else(|| OperatorError::InvalidResource("GridNetwork missing metadata.name".into()))
 }
 
+/// Reject a [`GridNetwork`] whose `budgetPolicy` fails validation, before any
+/// other reconcile work begins.
+///
+/// Pure and I/O-free (network fields only), so the reconcile-time wiring this
+/// guards is exercised directly by unit tests without a live or mocked
+/// Kubernetes client, per this repo's convention of preferring pure decision
+/// functions for reconciliation logic (`docs/conventions.md`). The CRD
+/// schema's numeric minimum on `capUsd` already rejects negative values at
+/// admission time; this is the defensive second layer for `NaN`/infinite
+/// caps and blank/duplicate `tenantId`s that the schema cannot express.
+fn reject_invalid_budget_policy(network: &GridNetwork) -> Result<(), OperatorError> {
+    let Some(policy) = network.spec.budget_policy.as_ref() else {
+        return Ok(());
+    };
+    crate::crd::grid_network::validate_budget_policy(policy)
+        .map_err(|error| OperatorError::InvalidResource(format!("invalid budgetPolicy: {error}")))
+}
+
 // ---------------------------------------------------------------------------
 // Reconcile
 // ---------------------------------------------------------------------------
@@ -208,6 +226,7 @@ fn grid_network_name(network: &GridNetwork) -> Result<&str, OperatorError> {
 )]
 pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Result<Action, OperatorError> {
     let name = grid_network_name(&network)?;
+    reject_invalid_budget_policy(&network)?;
 
     info!(name, "reconciling GridNetwork");
 
@@ -247,6 +266,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
 
     // List providers once; share between routing overlay rendering and CRDT publishing.
     let providers = list_all_inference_providers(client).await?;
+    let requeue_interval = requeue_interval_for_network(&network, &providers)?;
     let raw_metrics =
         provider_metrics::collect_provider_metrics(name, &providers, &ctx.metrics_cache, Instant::now(), Some(client))
             .await;
@@ -302,6 +322,18 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
         0
     };
 
+    // Resolve per-tenant budget status from the merged CRDT spend state, if any.
+    // Empty tenant_spend (SWIM disabled, or no spend broadcast received yet) is
+    // indistinguishable here from "no spend recorded" — resolve_budget_statuses
+    // still emits a zero-spend entry for every policy-declared tenant.
+    let tenant_spend = ctx
+        .swim
+        .as_ref()
+        .map(|swim| swim.state_snapshot().tenant_spend)
+        .unwrap_or_default();
+    let budget_statuses =
+        crate::crd::grid_network::resolve_budget_statuses(network.spec.budget_policy.as_ref(), &tenant_spend);
+
     update_status(
         &network,
         client,
@@ -311,6 +343,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
         distributed_provider_count,
         consumer_config_statuses,
         overlay_statuses,
+        budget_statuses,
     )
     .await?;
 
@@ -329,7 +362,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
         reconcile_discovered_sites(name, swim.site_name(), snapshot, client, plaintext).await?;
     }
 
-    Ok(Action::requeue(requeue_interval_for_network(&providers)))
+    Ok(Action::requeue(requeue_interval))
 }
 
 /// Apply `spec.tls.swimKeyRef` before any reconcile-triggered SWIM send.
@@ -829,6 +862,12 @@ async fn reconcile_routing_overlay_inner(
                 continue;
             },
         };
+        let rendered_at = stable_rendered_at(
+            find_prior_overlay(network, gw_ref),
+            &render.revision_hex,
+            &resource_version,
+            &render.rendered_at,
+        );
         overlay_statuses.push(OverlayRevisionStatus {
             gateway_name: gw_ref.name.clone(),
             namespace: gw_ref.namespace.clone(),
@@ -838,7 +877,7 @@ async fn reconcile_routing_overlay_inner(
             distributed_revision: render.revision_hex.clone(),
             content_digest: render.revision_hex,
             config_map_resource_version: resource_version,
-            rendered_at: render.rendered_at,
+            rendered_at,
             candidate_count: render.candidate_count,
             phase: OverlayPhase::Distributed,
             reason: String::new(),
@@ -883,6 +922,35 @@ fn find_prior_overlay<'a>(network: &'a GridNetwork, gw_ref: &GatewayRef) -> Opti
             .find(|e| e.gateway_name == gw_ref.name && e.namespace == gw_ref.namespace)
             .filter(|e| !e.distributed_revision.is_empty())
     })
+}
+
+/// Decide the `rendered_at` timestamp to record for a freshly-successful
+/// overlay distribution.
+///
+/// `fresh_rendered_at` is derived from a new timestamp taken on every
+/// reconcile tick (see `rfc3339_now` in `reconcile_overlays_and_consumer_configs`),
+/// so using it unconditionally would make every `OverlayRevisionStatus`
+/// compare as changed even when the overlay's actual content (distributed
+/// revision, `ConfigMap` `resourceVersion`) is byte-for-byte identical to
+/// what is already recorded — silently defeating
+/// [`grid_network_status_needs_update`]'s equality check and reproducing the
+/// same class of reconcile hot-loop as grid#42, just against the
+/// `GridNetwork` object's own status subresource instead of `GridSite` or
+/// the overlay `ConfigMap`. Reuse the prior timestamp whenever nothing
+/// observable changed; only advance it when the distributed revision or
+/// `ConfigMap` `resourceVersion` actually moved.
+fn stable_rendered_at(
+    prior: Option<&OverlayRevisionStatus>,
+    revision_hex: &str,
+    resource_version: &str,
+    fresh_rendered_at: &str,
+) -> String {
+    match prior {
+        Some(p) if p.distributed_revision == revision_hex && p.config_map_resource_version == resource_version => {
+            p.rendered_at.clone()
+        },
+        _ => fresh_rendered_at.to_owned(),
+    }
 }
 
 /// Resolve rendered-side evidence from render result, prior status, or defaults.
@@ -1072,9 +1140,118 @@ fn render_overlay_for_gateway(
     })
 }
 
-/// Server-side apply a pre-rendered overlay `ConfigMap` for a single gateway.
+/// True when the existing overlay has the expected semantic content and scope.
 ///
-/// Returns the Kubernetes `resourceVersion` of the applied `ConfigMap`.
+/// Provenance and timestamps are intentionally ignored: they explain when and
+/// where an overlay was rendered, but do not change request routing. The
+/// semantic digest and parsed payload still protect against a corrupted or
+/// partially modified `ConfigMap` retaining an old revision annotation.
+fn overlay_configmap_matches(existing: &ConfigMap, desired: &ConfigMap, revision: &str) -> bool {
+    configmap_revision_matches(existing, desired, revision)
+        && overlay_envelope_payload_matches(existing, desired, revision)
+        && legacy_overlay_payload_matches(existing, desired, revision)
+}
+
+/// Check all content-addressed annotations before parsing the stored payload.
+fn configmap_revision_matches(existing: &ConfigMap, desired: &ConfigMap, revision: &str) -> bool {
+    let (Some(existing_annotations), Some(desired_annotations)) = (
+        existing.metadata.annotations.as_ref(),
+        desired.metadata.annotations.as_ref(),
+    ) else {
+        return false;
+    };
+    let annotation_matches = |key: &str| {
+        existing_annotations
+            .get(key)
+            .zip(desired_annotations.get(key))
+            .is_some_and(|(existing, desired)| existing == desired)
+    };
+
+    annotation_matches(overlay_envelope::ANNOTATION_SCHEMA_VERSION)
+        && annotation_matches(overlay_envelope::ANNOTATION_REVISION)
+        && annotation_matches(overlay_envelope::ANNOTATION_CONTENT_DIGEST)
+        && desired_annotations
+            .get(overlay_envelope::ANNOTATION_REVISION)
+            .is_some_and(|value| value == revision)
+        && desired_annotations
+            .get(overlay_envelope::ANNOTATION_CONTENT_DIGEST)
+            .is_some_and(|value| value == revision)
+}
+
+/// Parse the content-addressed envelope stored in a routing `ConfigMap`.
+fn overlay_envelope_from_configmap(configmap: &ConfigMap) -> Option<overlay_envelope::OverlayEnvelope> {
+    configmap
+        .data
+        .as_ref()
+        .and_then(|data| data.get(overlay_envelope::ENVELOPE_KEY))
+        .and_then(|payload| serde_json::from_str(payload).ok())
+}
+
+/// Parse the compatibility routing payload stored in a routing `ConfigMap`.
+fn routing_overlay_from_configmap(configmap: &ConfigMap) -> Option<routing_overlay::RoutingOverlay> {
+    configmap
+        .data
+        .as_ref()
+        .and_then(|data| data.get("routing-config.json"))
+        .and_then(|payload| serde_json::from_str(payload).ok())
+}
+
+/// Validate the semantic envelope and its gateway scope.
+fn overlay_envelope_payload_matches(existing: &ConfigMap, desired: &ConfigMap, revision: &str) -> bool {
+    let (Some(existing_envelope), Some(desired_envelope)) = (
+        overlay_envelope_from_configmap(existing),
+        overlay_envelope_from_configmap(desired),
+    ) else {
+        return false;
+    };
+
+    existing_envelope.schema_version == desired_envelope.schema_version
+        && existing_envelope.revision.kind == desired_envelope.revision.kind
+        && existing_envelope.revision.algorithm == desired_envelope.revision.algorithm
+        && existing_envelope.content_digest.algorithm == desired_envelope.content_digest.algorithm
+        && existing_envelope.revision.value == revision
+        && existing_envelope.content_digest.value == revision
+        && existing_envelope.scope.network == desired_envelope.scope.network
+        && existing_envelope.scope.gateway == desired_envelope.scope.gateway
+        && existing_envelope.scope.namespace == desired_envelope.scope.namespace
+        && existing_envelope.scope.local_site == desired_envelope.scope.local_site
+        && overlay_envelope::compute_semantic_digest(&existing_envelope.overlay)
+            .ok()
+            .as_deref()
+            == Some(revision)
+}
+
+/// Validate the compatibility routing payload and its semantic digest.
+fn legacy_overlay_payload_matches(existing: &ConfigMap, desired: &ConfigMap, revision: &str) -> bool {
+    let (Some(existing_overlay), Some(desired_overlay)) = (
+        routing_overlay_from_configmap(existing),
+        routing_overlay_from_configmap(desired),
+    ) else {
+        return false;
+    };
+
+    existing_overlay.network == desired_overlay.network
+        && existing_overlay.local_site == desired_overlay.local_site
+        && overlay_envelope::compute_semantic_digest(&existing_overlay)
+            .ok()
+            .as_deref()
+            == Some(revision)
+}
+
+/// Server-side apply a pre-rendered overlay `ConfigMap` for a single gateway,
+/// skipping the apply when [`overlay_configmap_matches`] says it would be a
+/// no-op.
+///
+/// Returns the Kubernetes `resourceVersion` of the (applied or pre-existing)
+/// `ConfigMap`.
+#[expect(
+    clippy::too_many_lines,
+    reason = "fetch-guard, apply, and logging is a single cohesive sequence"
+)]
+#[expect(
+    clippy::large_stack_frames,
+    reason = "async future over Kubernetes API types with serde_json values"
+)]
 async fn distribute_overlay_configmap(
     overlay: &routing_overlay::RoutingOverlay,
     render: &OverlayRenderResult,
@@ -1092,6 +1269,18 @@ async fn distribute_overlay_configmap(
     .map_err(OperatorError::Json)?;
 
     let api: Api<ConfigMap> = Api::namespaced(client.clone(), &gw_ref.namespace);
+
+    if let Ok(existing) = api.get(&render.config_map_name).await
+        && overlay_configmap_matches(&existing, &cm, &render.revision_hex)
+    {
+        tracing::debug!(
+            cm_name = %render.config_map_name,
+            revision = %render.revision_hex,
+            "routing overlay ConfigMap already at this revision; skipping no-op apply"
+        );
+        return Ok(existing.metadata.resource_version.unwrap_or_default());
+    }
+
     let applied = api
         .patch(
             &render.config_map_name,
@@ -1422,6 +1611,9 @@ pub(crate) fn apply_swim_staleness_override(
 /// CRDT state broadcasts.  Both are `0` when SWIM is disabled.
 /// `consumer_config_statuses` holds per-gateway render/apply outcomes for
 /// gateways with `consumerConfig.enabled: true`; empty when no gateways opted in.
+/// `budget_statuses` holds per-tenant spend status derived from
+/// `spec.budgetPolicy` and merged CRDT spend state; empty when `budgetPolicy`
+/// is absent.
 ///
 /// [`Alive`]: MemberStatus::Alive
 #[expect(
@@ -1437,6 +1629,7 @@ async fn update_status(
     distributed_provider_count: u32,
     consumer_config_statuses: Vec<ConsumerConfigStatus>,
     overlay_statuses: Vec<OverlayRevisionStatus>,
+    budget_statuses: Vec<TenantBudgetStatus>,
 ) -> Result<(), OperatorError> {
     let name = grid_network_name(network)?;
 
@@ -1451,6 +1644,7 @@ async fn update_status(
         phase: phase.clone(),
         consumer_config_status: consumer_config_statuses,
         overlay_status: overlay_statuses,
+        budget_status: budget_statuses,
     };
 
     if !grid_network_status_needs_update(network.status.as_ref(), &status) {
@@ -1740,6 +1934,166 @@ fn network_uses_plaintext_egress(network: &GridNetwork) -> bool {
     has_plaintext_endpoint || (network.spec.tls.ca_secret_ref.is_none() && network.spec.tls.site_secret_ref.is_none())
 }
 
+/// `GridSite.status.reason` recorded for every cert-PEM validation failure.
+///
+/// Single source of truth for both [`decide_cert_pem_write`]'s write (via
+/// [`reconcile_site_cert_pem`]) and [`already_recorded_invalid`]'s read, so
+/// the two can never drift apart the way a hand-duplicated literal could.
+const REASON_TRUST_MATERIAL_INVALID: &str = "TrustMaterialInvalid";
+
+/// Diagnostic message for [`CertPemStatus::ContainsPrivateKey`].
+const CERT_PEM_MSG_CONTAINS_PRIVATE_KEY: &str =
+    "received trust material from remote site contained private-key markers; discarded";
+
+/// Diagnostic message for [`CertPemStatus::NotACertificate`].
+const CERT_PEM_MSG_NOT_A_CERTIFICATE: &str = "received cert PEM from remote site is not a valid certificate; check \
+                                               GRID_TLS_SITE_SECRET_REF configuration on the remote operator";
+
+/// Diagnostic message for [`CertPemStatus::TooLarge`].
+const CERT_PEM_MSG_TOO_LARGE: &str = "received cert PEM from remote site exceeds the configured size bound";
+
+/// What (if anything) [`reconcile_site_cert_pem`] should write to `GridSite`
+/// status for a received site cert PEM.
+///
+/// Produced by the pure [`decide_cert_pem_write`] so the branching logic is
+/// unit-testable without a live Kubernetes API — see grid#42, where writing
+/// unconditionally on every branch turned a stable, unchanged site into an
+/// infinite reconcile hot-loop.
+#[derive(Debug, Eq, PartialEq)]
+enum CertPemWrite {
+    /// `existing_status` already reflects this outcome; nothing to do.
+    NoOp,
+    /// Store the structurally-valid cert PEM.
+    StoreValid,
+    /// Reject with `TrustMaterialInvalid`, recording this diagnostic message.
+    RejectInvalid {
+        /// Diagnostic message to record in `status.message`.
+        message: &'static str,
+        /// Selects `error!` (private-key leak) vs `warn!` (malformed or
+        /// oversized) logging in the caller.
+        security_violation: bool,
+    },
+}
+
+/// Pure decision: given the current `GridSite` status and a freshly-checked
+/// [`CertPemStatus`], decide what (if anything) to write.
+///
+/// Never itself touches the Kubernetes API — see [`CertPemWrite`].
+fn decide_cert_pem_write(
+    existing_status: &Option<GridSiteStatus>,
+    cert_pem: &str,
+    check: &CertPemStatus,
+) -> CertPemWrite {
+    match check {
+        CertPemStatus::ValidStructure => {
+            if existing_status.as_ref().and_then(|s| s.public_cert_pem.as_deref()) == Some(cert_pem) {
+                CertPemWrite::NoOp
+            } else {
+                CertPemWrite::StoreValid
+            }
+        },
+        CertPemStatus::ContainsPrivateKey => {
+            decide_reject_invalid(existing_status, CERT_PEM_MSG_CONTAINS_PRIVATE_KEY, true)
+        },
+        CertPemStatus::NotACertificate => decide_reject_invalid(existing_status, CERT_PEM_MSG_NOT_A_CERTIFICATE, false),
+        CertPemStatus::TooLarge => decide_reject_invalid(existing_status, CERT_PEM_MSG_TOO_LARGE, false),
+    }
+}
+
+/// Shared decision logic for the three invalid-cert-PEM outcomes: skip when
+/// `existing_status` already records this exact `message`, otherwise reject.
+fn decide_reject_invalid(
+    existing_status: &Option<GridSiteStatus>,
+    message: &'static str,
+    security_violation: bool,
+) -> CertPemWrite {
+    if already_recorded_invalid(existing_status, message) {
+        CertPemWrite::NoOp
+    } else {
+        CertPemWrite::RejectInvalid {
+            message,
+            security_violation,
+        }
+    }
+}
+
+/// True when `existing` already records the given invalid-cert `message` with
+/// no stored `publicCertPem`, meaning a re-patch with the same content would
+/// be a redundant write.
+fn already_recorded_invalid(existing: &Option<GridSiteStatus>, message: &str) -> bool {
+    existing.as_ref().is_some_and(|s| {
+        s.public_cert_pem.is_none() && s.reason == REASON_TRUST_MATERIAL_INVALID && s.message == message
+    })
+}
+
+/// Validate a received site cert PEM and store (or reject) it in `GridSite`
+/// status, per [`decide_cert_pem_write`]. Purely an imperative shell around
+/// that pure decision: no branching logic lives here, only I/O and logging.
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "three sequential match arms, each a distinct security invariant (store/reject/security-log); splitting further would fragment cohesive I/O steps rather than reduce complexity"
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "three JSON-patch-plus-log branches read clearer inline than split further"
+)]
+#[expect(
+    clippy::large_stack_frames,
+    reason = "async future over Kubernetes API types with serde_json values"
+)]
+async fn reconcile_site_cert_pem(
+    api: &Api<GridSite>,
+    site_name: &str,
+    existing_status: &Option<GridSiteStatus>,
+    cert_pem: &str,
+) -> Result<(), OperatorError> {
+    match decide_cert_pem_write(existing_status, cert_pem, &trust_bundle::check_cert_pem(cert_pem)) {
+        CertPemWrite::NoOp => {
+            tracing::debug!(name = %site_name, "cert PEM status already up to date; skipping no-op status patch");
+        },
+        CertPemWrite::StoreValid => {
+            // Use strategic merge patch (not SSA) so only publicCertPem is
+            // updated; SSA with a partial payload would clear other status
+            // fields managed by "grid-operator" (e.g., reason, message).
+            let cert_merge = serde_json::json!({ "status": { "publicCertPem": cert_pem } });
+            api.patch_status(site_name, &PatchParams::default(), &Patch::Merge(&cert_merge))
+                .await?;
+            tracing::info!(
+                name = %site_name,
+                "received and stored public site certificate PEM (structure valid; not chain-verified)"
+            );
+        },
+        CertPemWrite::RejectInvalid {
+            message,
+            security_violation,
+        } => {
+            // Write a status marker so operators can see the invalid material.
+            // Do not store the raw PEM; record only the invalid status.
+            let invalid_status_doc = serde_json::json!({
+                "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+                "kind": "GridSite",
+                "status": {
+                    "publicCertPem": null,
+                    "reason": REASON_TRUST_MATERIAL_INVALID,
+                    "message": message
+                }
+            });
+            api.patch_status(site_name, &PatchParams::default(), &Patch::Merge(&invalid_status_doc))
+                .await?;
+            if security_violation {
+                tracing::error!(
+                    name = %site_name,
+                    "SECURITY: received cert PEM contains private key markers from remote SWIM peer; \
+                     discarding — private keys must never appear in SWIM broadcasts"
+                );
+            } else {
+                tracing::warn!(name = %site_name, %message, "rejected invalid cert PEM from remote site");
+            }
+        },
+    }
+    Ok(())
+}
+
 /// Create or update `GridSite` resources for remote Alive SWIM members.
 ///
 /// Uses server-side apply, so the call is idempotent: applying an already-existing
@@ -1760,10 +2114,6 @@ fn network_uses_plaintext_egress(network: &GridNetwork) -> bool {
 #[expect(
     clippy::large_stack_frames,
     reason = "async future over Kubernetes API types with serde_json values"
-)]
-#[expect(
-    clippy::cognitive_complexity,
-    reason = "cert PEM validation branches add arms but each branch is a distinct security invariant; splitting obscures the trust contract"
 )]
 async fn reconcile_discovered_sites(
     network_name: &str,
@@ -1819,18 +2169,23 @@ async fn reconcile_discovered_sites(
         )
         .await?;
 
+        // Fetch current status once and reuse it below for every write in this
+        // iteration. Every status patch bumps the GridSite's resourceVersion,
+        // which fires a watch event that re-triggers a GridNetwork reconcile
+        // (related object updated) — re-entering this same loop. Writing
+        // unconditionally therefore turns a stable, unchanged site into an
+        // infinite reconcile hot-loop; checking against current state first
+        // makes each write idempotent in practice, not just in intent (see
+        // grid#42).
+        let existing_status = api.get(&site.name).await.ok().and_then(|s| s.status);
+
         // Only write Discovered when the current phase is Pending.
         // If the GridSite controller has already advanced the phase (e.g. to
         // Connecting), we must not regress it.
-        let should_write_discovered = {
-            match api.get(&site.name).await {
-                Ok(existing) => {
-                    let current_phase = existing.status.as_ref().map(|s| &s.phase);
-                    matches!(current_phase, None | Some(GridSitePhase::Pending))
-                },
-                Err(_) => true, // Site was just created; safe to write Discovered.
-            }
-        };
+        let should_write_discovered = matches!(
+            existing_status.as_ref().map(|s| &s.phase),
+            None | Some(GridSitePhase::Pending)
+        );
 
         if should_write_discovered {
             let status_doc = serde_json::json!({
@@ -1853,80 +2208,13 @@ async fn reconcile_discovered_sites(
 
         // Write received public cert PEM to status after structure validation.
         // Private key material must never be written to status; invalid PEM is
-        // also rejected and recorded as TrustMaterialInvalid.
+        // also rejected and recorded as TrustMaterialInvalid. Skips any patch
+        // that would be a no-op given `existing_status` — otherwise every
+        // reconcile re-issues an unconditional write, which (per the comment
+        // above `existing_status`) becomes an infinite reconcile hot-loop even
+        // when the remote site's cert hasn't changed (grid#42).
         if let Some(cert_pem) = &site.site_cert_pem {
-            match trust_bundle::check_cert_pem(cert_pem) {
-                CertPemStatus::ValidStructure => {
-                    // Use strategic merge patch (not SSA) so only publicCertPem is
-                    // updated; SSA with a partial payload would clear other status
-                    // fields managed by "grid-operator" (e.g., reason, message).
-                    let cert_merge = serde_json::json!({ "status": { "publicCertPem": cert_pem } });
-                    api.patch_status(&site.name, &PatchParams::default(), &Patch::Merge(&cert_merge))
-                        .await?;
-                    tracing::info!(
-                        name = %site.name,
-                        "received and stored public site certificate PEM (structure valid; not chain-verified)"
-                    );
-                },
-                CertPemStatus::ContainsPrivateKey => {
-                    // Security violation: the remote peer sent private key material.
-                    // Do not store it; clear any prior publicCertPem and log at error
-                    // level so operators can investigate.
-                    let invalid_status_doc = serde_json::json!({
-                        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
-                        "kind": "GridSite",
-                        "status": {
-                            "publicCertPem": null,
-                            "reason": "TrustMaterialInvalid",
-                            "message": "received trust material from remote site contained private-key markers; discarded"
-                        }
-                    });
-                    api.patch_status(&site.name, &PatchParams::default(), &Patch::Merge(&invalid_status_doc))
-                        .await?;
-                    tracing::error!(
-                        name = %site.name,
-                        "SECURITY: received cert PEM contains private key markers from remote SWIM peer; \
-                         discarding — private keys must never appear in SWIM broadcasts"
-                    );
-                },
-                CertPemStatus::NotACertificate => {
-                    // Write a status marker so operators can see the invalid material.
-                    // Do not store the raw PEM; record only the invalid status.
-                    let invalid_status_doc = serde_json::json!({
-                        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
-                        "kind": "GridSite",
-                        "status": {
-                            "publicCertPem": null,
-                            "reason": "TrustMaterialInvalid",
-                            "message": "received cert PEM from remote site is not a valid certificate; \
-                                        check GRID_TLS_SITE_SECRET_REF configuration on the remote operator"
-                        }
-                    });
-                    api.patch_status(&site.name, &PatchParams::default(), &Patch::Merge(&invalid_status_doc))
-                        .await?;
-                    tracing::warn!(
-                        name = %site.name,
-                        "received cert PEM from remote site is not a valid certificate"
-                    );
-                },
-                CertPemStatus::TooLarge => {
-                    let invalid_status_doc = serde_json::json!({
-                        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
-                        "kind": "GridSite",
-                        "status": {
-                            "publicCertPem": null,
-                            "reason": "TrustMaterialInvalid",
-                            "message": "received cert PEM from remote site exceeds the configured size bound"
-                        }
-                    });
-                    api.patch_status(&site.name, &PatchParams::default(), &Patch::Merge(&invalid_status_doc))
-                        .await?;
-                    tracing::warn!(
-                        name = %site.name,
-                        "received cert PEM from remote site exceeds the configured size bound"
-                    );
-                },
-            }
+            reconcile_site_cert_pem(&api, &site.name, &existing_status, cert_pem).await?;
         }
 
         tracing::info!(
@@ -1948,19 +2236,73 @@ async fn reconcile_discovered_sites(
 /// collection and overlay publication in this reconcile loop detect
 /// certificate rotation without a cluster-wide Secret watch.
 ///
-/// For networks with only plaintext metrics (or no metrics), returns the
-/// default [`REQUEUE_INTERVAL`] (300 s).
+/// An explicit `spec.metricsRefreshInterval` is used when valid. TLS
+/// networks are capped at [`TLS_REQUEUE_INTERVAL`] so certificate rotation is
+/// not delayed by an unsafe long custom interval. An absent value uses the
+/// appropriate safe default; an invalid value fails reconciliation.
 ///
 /// [`InferenceProvider`]: crate::crd::inference_provider::InferenceProvider
-fn requeue_interval_for_network(providers: &[InferenceProvider]) -> Duration {
+fn requeue_interval_for_network(
+    network: &GridNetwork,
+    providers: &[InferenceProvider],
+) -> Result<Duration, OperatorError> {
+    let network_name = grid_network_name(network)?;
     let any_has_tls = providers
         .iter()
-        .any(|p| p.spec.metrics_config.as_ref().is_some_and(|mc| mc.tls.is_some()));
-    if any_has_tls {
+        .filter(|provider| provider.spec.grid_network_ref == network_name)
+        .any(|provider| provider.spec.metrics_config.as_ref().is_some_and(|mc| mc.tls.is_some()));
+    let default = if any_has_tls {
         TLS_REQUEUE_INTERVAL
     } else {
         REQUEUE_INTERVAL
+    };
+    let configured = network
+        .spec
+        .metrics_refresh_interval
+        .as_deref()
+        .map(parse_metrics_refresh_interval)
+        .transpose()?;
+
+    Ok(match (configured, any_has_tls) {
+        (Some(interval), true) => interval.min(TLS_REQUEUE_INTERVAL),
+        (Some(interval), false) => interval,
+        (None, _) => default,
+    })
+}
+
+/// Parse the deliberately small duration format accepted by
+/// `metricsRefreshInterval`: seconds or milliseconds, with a one-second
+/// minimum.
+fn parse_metrics_refresh_interval(value: &str) -> Result<Duration, OperatorError> {
+    let (number, multiplier) = if let Some(number) = value.strip_suffix("ms") {
+        (number, 1_u64)
+    } else if let Some(number) = value.strip_suffix('s') {
+        (number, 1_000_u64)
+    } else {
+        return Err(OperatorError::InvalidResource(format!(
+            "spec.metricsRefreshInterval must use seconds or milliseconds, got {value:?}"
+        )));
+    };
+    if number.is_empty() || number.starts_with('0') || !number.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(OperatorError::InvalidResource(format!(
+            "spec.metricsRefreshInterval contains an invalid duration: {value:?}"
+        )));
     }
+    let millis = number
+        .parse::<u64>()
+        .ok()
+        .and_then(|number| number.checked_mul(multiplier))
+        .ok_or_else(|| {
+            OperatorError::InvalidResource(format!(
+                "spec.metricsRefreshInterval contains an invalid duration: {value:?}"
+            ))
+        })?;
+    if millis < 1_000 {
+        return Err(OperatorError::InvalidResource(
+            "spec.metricsRefreshInterval must be at least one second".to_owned(),
+        ));
+    }
+    Ok(Duration::from_millis(millis))
 }
 
 // ---------------------------------------------------------------------------
@@ -1970,7 +2312,10 @@ fn requeue_interval_for_network(providers: &[InferenceProvider]) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::swim::MemberRecord;
+    use crate::{
+        crd::grid_network::{BudgetPolicyConfig, TenantBudgetConfig},
+        swim::MemberRecord,
+    };
 
     fn make_inference_provider(name: &str, network_ref: &str) -> InferenceProvider {
         serde_json::from_value(serde_json::json!({
@@ -2094,6 +2439,85 @@ mod tests {
             "spec": { "seeds": [], "gridId": "test-id" }
         }))
         .unwrap_or_else(|_| std::process::abort())
+    }
+
+    // -----------------------------------------------------------------------
+    // reject_invalid_budget_policy
+    // -----------------------------------------------------------------------
+
+    fn network_with_budget_policy(tenants: Vec<TenantBudgetConfig>) -> GridNetwork {
+        let mut network = base_network();
+        network.spec.budget_policy = Some(BudgetPolicyConfig { tenants });
+        network
+    }
+
+    fn tenant(tenant_id: &str, cap_usd: f64) -> TenantBudgetConfig {
+        TenantBudgetConfig {
+            tenant_id: tenant_id.to_owned(),
+            cap_usd,
+        }
+    }
+
+    #[test]
+    fn reject_invalid_budget_policy_accepts_absent_policy() {
+        let network = base_network();
+        assert!(
+            reject_invalid_budget_policy(&network).is_ok(),
+            "a GridNetwork with no budgetPolicy at all must not be rejected"
+        );
+    }
+
+    #[test]
+    fn reject_invalid_budget_policy_accepts_valid_policy() {
+        let network = network_with_budget_policy(vec![tenant("tenant-a", 100.0), tenant("tenant-b", 250.0)]);
+        assert!(
+            reject_invalid_budget_policy(&network).is_ok(),
+            "distinct positive caps and non-empty tenant ids must be accepted"
+        );
+    }
+
+    #[test]
+    fn reject_invalid_budget_policy_rejects_blank_tenant_id() {
+        let network = network_with_budget_policy(vec![tenant("", 100.0)]);
+        let Err(error) = reject_invalid_budget_policy(&network) else {
+            std::process::abort()
+        };
+        assert!(
+            error.to_string().contains("budgetPolicy"),
+            "error must identify the budgetPolicy as the invalid field, got: {error}"
+        );
+    }
+
+    #[test]
+    fn reject_invalid_budget_policy_rejects_duplicate_tenant_id() {
+        let network = network_with_budget_policy(vec![tenant("tenant-a", 100.0), tenant("tenant-a", 200.0)]);
+        let Err(error) = reject_invalid_budget_policy(&network) else {
+            std::process::abort()
+        };
+        assert!(
+            error.to_string().contains("tenant-a"),
+            "error must name the offending tenant_id, got: {error}"
+        );
+    }
+
+    #[test]
+    fn reject_invalid_budget_policy_rejects_negative_cap() {
+        let network = network_with_budget_policy(vec![tenant("tenant-a", -5.0)]);
+        assert!(
+            reject_invalid_budget_policy(&network).is_err(),
+            "negative capUsd must be rejected even though the CRD schema minimum should already catch this before reconcile"
+        );
+    }
+
+    #[test]
+    fn reject_invalid_budget_policy_rejects_non_finite_cap() {
+        for bad_cap in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let network = network_with_budget_policy(vec![tenant("tenant-a", bad_cap)]);
+            assert!(
+                reject_invalid_budget_policy(&network).is_err(),
+                "non-finite capUsd ({bad_cap}) must be rejected"
+            );
+        }
     }
 
     fn alive_snapshot(count: usize) -> MembershipSnapshot {
@@ -2803,6 +3227,7 @@ mod tests {
             phase: GridNetworkPhase::Active,
             consumer_config_status: Vec::new(),
             overlay_status: Vec::new(),
+            budget_status: Vec::new(),
         };
         assert!(!grid_network_status_needs_update(Some(&baseline), &baseline));
 
@@ -3143,6 +3568,336 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // already_recorded_invalid — grid#42 reconcile-hot-loop regression guard
+    // -----------------------------------------------------------------------
+
+    fn invalid_cert_status(message: &str) -> GridSiteStatus {
+        GridSiteStatus {
+            public_cert_pem: None,
+            reason: REASON_TRUST_MATERIAL_INVALID.to_owned(),
+            message: message.to_owned(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn already_recorded_invalid_true_when_reason_message_and_absence_all_match() {
+        let existing = Some(invalid_cert_status("private key detected"));
+        assert!(
+            already_recorded_invalid(&existing, "private key detected"),
+            "identical reason/message/absent-cert must be recognized as already recorded"
+        );
+    }
+
+    #[test]
+    fn already_recorded_invalid_false_when_status_is_none() {
+        assert!(
+            !already_recorded_invalid(&None, "private key detected"),
+            "a GridSite with no status yet has nothing recorded"
+        );
+    }
+
+    #[test]
+    fn already_recorded_invalid_false_when_message_differs() {
+        let existing = Some(invalid_cert_status("private key detected"));
+        assert!(
+            !already_recorded_invalid(&existing, "cert exceeds size bound"),
+            "a different rejection reason must not be treated as already recorded"
+        );
+    }
+
+    #[test]
+    fn already_recorded_invalid_false_when_reason_is_not_trust_material_invalid() {
+        let existing = Some(GridSiteStatus {
+            public_cert_pem: None,
+            reason: "AwaitingDiscovery".to_owned(),
+            message: "private key detected".to_owned(),
+            ..Default::default()
+        });
+        assert!(
+            !already_recorded_invalid(&existing, "private key detected"),
+            "a status recorded for an unrelated reason must not suppress the write"
+        );
+    }
+
+    #[test]
+    fn already_recorded_invalid_false_when_public_cert_pem_still_present() {
+        let existing = Some(GridSiteStatus {
+            public_cert_pem: Some("stale cert".to_owned()),
+            reason: REASON_TRUST_MATERIAL_INVALID.to_owned(),
+            message: "private key detected".to_owned(),
+            ..Default::default()
+        });
+        assert!(
+            !already_recorded_invalid(&existing, "private key detected"),
+            "a leftover publicCertPem means the invalid status was never actually applied yet"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // decide_cert_pem_write — grid#42 acceptance criterion:
+    //
+    //   "reconciling an unchanged remote site must decide NoOp for every
+    //    possible cert-PEM outcome" — i.e. a stable GridSite never causes a
+    //    write, which is precisely the condition that stops the infinite
+    //    reconcile hot-loop (repeated no-op writes bumping resourceVersion
+    //    and re-triggering the reconciler). These tests assert that
+    //    business-level property directly, across all four outcomes, rather
+    //    than only exercising the internal `already_recorded_invalid` guard.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn decide_cert_pem_write_is_noop_for_every_outcome_when_site_is_already_stable() {
+        // ValidStructure: publicCertPem already stored verbatim.
+        let stored = Some(GridSiteStatus {
+            public_cert_pem: Some("cert-a".to_owned()),
+            ..Default::default()
+        });
+        assert_eq!(
+            decide_cert_pem_write(&stored, "cert-a", &CertPemStatus::ValidStructure),
+            CertPemWrite::NoOp,
+            "an unchanged valid cert must never be re-patched (grid#42)"
+        );
+
+        // Every invalid outcome: already recorded with its exact message.
+        for (check, message) in [
+            (CertPemStatus::ContainsPrivateKey, CERT_PEM_MSG_CONTAINS_PRIVATE_KEY),
+            (CertPemStatus::NotACertificate, CERT_PEM_MSG_NOT_A_CERTIFICATE),
+            (CertPemStatus::TooLarge, CERT_PEM_MSG_TOO_LARGE),
+        ] {
+            let recorded = Some(invalid_cert_status(message));
+            assert_eq!(
+                decide_cert_pem_write(&recorded, "irrelevant-pem", &check),
+                CertPemWrite::NoOp,
+                "an unchanged rejection ({check:?}) must never be re-patched (grid#42)"
+            );
+        }
+    }
+
+    #[test]
+    fn decide_cert_pem_write_stores_valid_cert_on_first_sight() {
+        assert_eq!(
+            decide_cert_pem_write(&None, "cert-a", &CertPemStatus::ValidStructure),
+            CertPemWrite::StoreValid,
+            "a GridSite with no prior status must store the first valid cert seen"
+        );
+    }
+
+    #[test]
+    fn decide_cert_pem_write_stores_valid_cert_when_it_rotates() {
+        let stale = Some(GridSiteStatus {
+            public_cert_pem: Some("cert-old".to_owned()),
+            ..Default::default()
+        });
+        assert_eq!(
+            decide_cert_pem_write(&stale, "cert-new", &CertPemStatus::ValidStructure),
+            CertPemWrite::StoreValid,
+            "a rotated cert (different from what's stored) must still be written"
+        );
+    }
+
+    #[test]
+    fn decide_cert_pem_write_rejects_private_key_as_security_violation() {
+        assert_eq!(
+            decide_cert_pem_write(&None, "leaked-key", &CertPemStatus::ContainsPrivateKey),
+            CertPemWrite::RejectInvalid {
+                message: CERT_PEM_MSG_CONTAINS_PRIVATE_KEY,
+                security_violation: true
+            },
+            "private-key leakage must be flagged as a security violation, not a routine rejection"
+        );
+    }
+
+    #[test]
+    fn decide_cert_pem_write_rejects_malformed_cert_as_non_security() {
+        assert_eq!(
+            decide_cert_pem_write(&None, "garbage", &CertPemStatus::NotACertificate),
+            CertPemWrite::RejectInvalid {
+                message: CERT_PEM_MSG_NOT_A_CERTIFICATE,
+                security_violation: false
+            },
+            "a malformed cert is an operator misconfiguration, not a security violation"
+        );
+    }
+
+    #[test]
+    fn decide_cert_pem_write_rejects_oversized_cert_as_non_security() {
+        assert_eq!(
+            decide_cert_pem_write(&None, "huge", &CertPemStatus::TooLarge),
+            CertPemWrite::RejectInvalid {
+                message: CERT_PEM_MSG_TOO_LARGE,
+                security_violation: false
+            },
+            "an oversized cert is a bound violation, not a security violation"
+        );
+    }
+
+    #[test]
+    fn decide_cert_pem_write_re_rejects_when_recorded_reason_no_longer_matches() {
+        // Status shows a *different* rejection (or none) — must not be
+        // mistaken for "already handled".
+        let recorded_other_reason = Some(invalid_cert_status(CERT_PEM_MSG_TOO_LARGE));
+        assert_eq!(
+            decide_cert_pem_write(&recorded_other_reason, "leaked-key", &CertPemStatus::ContainsPrivateKey),
+            CertPemWrite::RejectInvalid {
+                message: CERT_PEM_MSG_CONTAINS_PRIVATE_KEY,
+                security_violation: true
+            },
+            "a newly-observed private-key leak must be recorded even if a different rejection was previously stored"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // overlay_configmap_matches — grid#42 no-op write guard
+    // -----------------------------------------------------------------------
+
+    fn overlay_configmaps_for_test() -> (ConfigMap, ConfigMap, String) {
+        let overlay: routing_overlay::RoutingOverlay = serde_json::from_value(serde_json::json!({
+            "network": "net",
+            "local_site": "site",
+            "candidates": []
+        }))
+        .unwrap_or_else(|_| std::process::abort());
+        let built = overlay_envelope::build_overlay_envelope(&overlay, "gateway", "grid-system", "uid", 1, "now")
+            .unwrap_or_else(|_| std::process::abort());
+        let desired =
+            routing_overlay::build_overlay_configmap(&overlay, Some(&built.envelope), "net", "gateway", "grid-system")
+                .unwrap_or_else(|_| std::process::abort());
+        (desired.clone(), desired, built.revision_hex)
+    }
+
+    fn mutate_envelope(configmap: &mut ConfigMap, mutate: impl FnOnce(&mut overlay_envelope::OverlayEnvelope)) {
+        let payload = configmap
+            .data
+            .as_mut()
+            .and_then(|data| data.get_mut(overlay_envelope::ENVELOPE_KEY))
+            .unwrap_or_else(|| std::process::abort());
+        let mut envelope = serde_json::from_str(payload).unwrap_or_else(|_| std::process::abort());
+        mutate(&mut envelope);
+        *payload = serde_json::to_string_pretty(&envelope).unwrap_or_else(|_| std::process::abort());
+    }
+
+    #[test]
+    fn identical_overlay_configmap_is_safe_to_skip() {
+        let (existing, desired, revision) = overlay_configmaps_for_test();
+        assert!(overlay_configmap_matches(&existing, &desired, &revision));
+    }
+
+    #[test]
+    fn provenance_only_overlay_changes_are_safe_to_skip() {
+        let (mut existing, desired, revision) = overlay_configmaps_for_test();
+        let envelope_payload = existing
+            .data
+            .as_mut()
+            .and_then(|data| data.get_mut(overlay_envelope::ENVELOPE_KEY))
+            .unwrap_or_else(|| std::process::abort());
+        let mut envelope: overlay_envelope::OverlayEnvelope =
+            serde_json::from_str(envelope_payload).unwrap_or_else(|_| std::process::abort());
+        envelope.provenance.rendered_at = "later-render-time".to_owned();
+        envelope.overlay.generated_at = Some("later-overlay-time".to_owned());
+        *envelope_payload = serde_json::to_string_pretty(&envelope).unwrap_or_else(|_| std::process::abort());
+
+        let legacy_payload = existing
+            .data
+            .as_mut()
+            .and_then(|data| data.get_mut("routing-config.json"))
+            .unwrap_or_else(|| std::process::abort());
+        *legacy_payload = serde_json::to_string_pretty(&envelope.overlay).unwrap_or_else(|_| std::process::abort());
+
+        assert!(overlay_configmap_matches(&existing, &desired, &revision));
+    }
+
+    #[test]
+    fn corrupted_overlay_configmap_is_repaired_even_with_matching_annotation() {
+        let (mut existing, desired, revision) = overlay_configmaps_for_test();
+        if let Some(payload) = existing
+            .data
+            .as_mut()
+            .and_then(|data| data.get_mut(overlay_envelope::ENVELOPE_KEY))
+        {
+            *payload = "not-json".to_owned();
+        }
+        assert!(!overlay_configmap_matches(&existing, &desired, &revision));
+    }
+
+    #[test]
+    fn missing_overlay_payload_is_repaired_even_with_matching_annotation() {
+        let (mut existing, desired, revision) = overlay_configmaps_for_test();
+        existing.data = None;
+        assert!(!overlay_configmap_matches(&existing, &desired, &revision));
+    }
+
+    #[test]
+    fn annotation_payload_disagreement_is_repaired() {
+        let (mut existing, desired, revision) = overlay_configmaps_for_test();
+        if let Some(value) = existing
+            .metadata
+            .annotations
+            .as_mut()
+            .and_then(|annotations| annotations.get_mut(overlay_envelope::ANNOTATION_REVISION))
+        {
+            *value = "stale-revision".to_owned();
+        }
+        assert!(!overlay_configmap_matches(&existing, &desired, &revision));
+    }
+
+    #[test]
+    fn contract_annotation_disagreement_is_repaired() {
+        let (_, desired, revision) = overlay_configmaps_for_test();
+        for key in [
+            overlay_envelope::ANNOTATION_SCHEMA_VERSION,
+            overlay_envelope::ANNOTATION_REVISION,
+            overlay_envelope::ANNOTATION_CONTENT_DIGEST,
+        ] {
+            let mut existing = desired.clone();
+            existing
+                .metadata
+                .annotations
+                .as_mut()
+                .unwrap_or_else(|| std::process::abort())
+                .insert(key.to_owned(), "corrupted".to_owned());
+            assert!(!overlay_configmap_matches(&existing, &desired, &revision));
+        }
+    }
+
+    #[test]
+    fn envelope_revision_contract_disagreement_is_repaired() {
+        let (_, desired, revision) = overlay_configmaps_for_test();
+        for field in ["schema", "kind", "revision_algorithm", "digest_algorithm"] {
+            let mut existing = desired.clone();
+            mutate_envelope(&mut existing, |envelope| match field {
+                "schema" => envelope.schema_version = "corrupted".to_owned(),
+                "kind" => envelope.revision.kind = "corrupted".to_owned(),
+                "revision_algorithm" => envelope.revision.algorithm = "corrupted".to_owned(),
+                "digest_algorithm" => envelope.content_digest.algorithm = "corrupted".to_owned(),
+                _ => std::process::abort(),
+            });
+            assert!(!overlay_configmap_matches(&existing, &desired, &revision));
+        }
+    }
+
+    #[test]
+    fn corrupted_legacy_payload_is_repaired_even_when_envelope_is_valid() {
+        let (mut existing, desired, revision) = overlay_configmaps_for_test();
+        let payload = existing
+            .data
+            .as_mut()
+            .and_then(|data| data.get_mut("routing-config.json"))
+            .unwrap_or_else(|| std::process::abort());
+        *payload = "not-json".to_owned();
+        assert!(!overlay_configmap_matches(&existing, &desired, &revision));
+    }
+
+    #[test]
+    fn semantic_payload_disagreement_is_repaired() {
+        let (mut existing, desired, revision) = overlay_configmaps_for_test();
+        mutate_envelope(&mut existing, |envelope| {
+            envelope.overlay.local_site = "other-site".to_owned();
+        });
+        assert!(!overlay_configmap_matches(&existing, &desired, &revision));
+    }
+
+    // -----------------------------------------------------------------------
     // parse_crd_seeds — pure seed normalization
     // -----------------------------------------------------------------------
 
@@ -3442,6 +4197,67 @@ mod tests {
         assert_eq!(status.reason, "EmptyCandidates");
     }
 
+    // -----------------------------------------------------------------------
+    // stable_rendered_at (grid#42: GridNetwork status resourceVersion churn)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn stable_rendered_at_reuses_prior_when_nothing_changed() {
+        let gw = make_gw_ref("gw", "grid-system");
+        let prior = rendered_overlay_status(&gw);
+
+        let rendered_at = stable_rendered_at(
+            Some(&prior),
+            &prior.distributed_revision,
+            &prior.config_map_resource_version,
+            "2026-08-12T04:37:55.488097906Z",
+        );
+
+        assert_eq!(
+            rendered_at, prior.rendered_at,
+            "identical revision and resourceVersion must not advance rendered_at, or every \
+             reconcile tick bumps GridNetwork's own resourceVersion forever (grid#42)"
+        );
+    }
+
+    #[test]
+    fn stable_rendered_at_advances_when_revision_changes() {
+        let gw = make_gw_ref("gw", "grid-system");
+        let prior = rendered_overlay_status(&gw);
+        let fresh = "2026-08-12T04:37:55.488097906Z";
+
+        let rendered_at = stable_rendered_at(Some(&prior), &"b".repeat(64), &prior.config_map_resource_version, fresh);
+
+        assert_eq!(
+            rendered_at, fresh,
+            "a genuinely new distributed revision must advance rendered_at"
+        );
+    }
+
+    #[test]
+    fn stable_rendered_at_advances_when_configmap_resource_version_changes() {
+        let gw = make_gw_ref("gw", "grid-system");
+        let prior = rendered_overlay_status(&gw);
+        let fresh = "2026-08-12T04:37:55.488097906Z";
+
+        let rendered_at = stable_rendered_at(Some(&prior), &prior.distributed_revision, "43", fresh);
+
+        assert_eq!(
+            rendered_at, fresh,
+            "a genuinely new ConfigMap resourceVersion must advance rendered_at"
+        );
+    }
+
+    #[test]
+    fn stable_rendered_at_uses_fresh_value_with_no_prior() {
+        let fresh = "2026-08-12T04:37:55.488097906Z";
+        let rendered_at = stable_rendered_at(None, &"a".repeat(64), "42", fresh);
+        assert_eq!(
+            rendered_at, fresh,
+            "first-ever distribution has no prior to compare against"
+        );
+    }
+
     #[expect(
         clippy::too_many_lines,
         reason = "test helper constructing deeply nested envelope struct"
@@ -3592,7 +4408,7 @@ mod tests {
             schema_version: "1.0.0".to_owned(),
             rendered_revision: rev.clone(),
             distributed_revision: rev.clone(),
-            content_digest: rev.clone(),
+            content_digest: rev,
             config_map_resource_version: "100".to_owned(),
             rendered_at: "2026-07-29T01:00:00Z".to_owned(),
             candidate_count: 2,
@@ -4060,8 +4876,8 @@ mod tests {
             make_inference_provider("p2", "net"),
         ];
         assert_eq!(
-            requeue_interval_for_network(&providers),
-            REQUEUE_INTERVAL,
+            requeue_interval_for_network(&base_network(), &providers).ok(),
+            Some(REQUEUE_INTERVAL),
             "networks with no TLS providers should use 300s"
         );
     }
@@ -4070,8 +4886,8 @@ mod tests {
     fn network_requeue_tls_provider_uses_tls_interval() {
         let providers = vec![make_provider_with_tls("p1", "net")];
         assert_eq!(
-            requeue_interval_for_network(&providers),
-            TLS_REQUEUE_INTERVAL,
+            requeue_interval_for_network(&base_network(), &providers).ok(),
+            Some(TLS_REQUEUE_INTERVAL),
             "network with a TLS provider should use 60s"
         );
     }
@@ -4083,8 +4899,8 @@ mod tests {
             make_provider_with_tls("secure", "net"),
         ];
         assert_eq!(
-            requeue_interval_for_network(&providers),
-            TLS_REQUEUE_INTERVAL,
+            requeue_interval_for_network(&base_network(), &providers).ok(),
+            Some(TLS_REQUEUE_INTERVAL),
             "mixed plaintext/TLS providers should use 60s"
         );
     }
@@ -4093,9 +4909,89 @@ mod tests {
     fn network_requeue_longer_health_interval_does_not_delay_tls() {
         let providers = vec![make_provider_with_tls_and_health_interval("p1", "net", "600s")];
         assert_eq!(
-            requeue_interval_for_network(&providers),
-            TLS_REQUEUE_INTERVAL,
+            requeue_interval_for_network(&base_network(), &providers).ok(),
+            Some(TLS_REQUEUE_INTERVAL),
             "a longer healthCheck.interval must not delay TLS rotation detection"
         );
+    }
+
+    #[test]
+    fn network_requeue_uses_configured_seconds_interval() {
+        let providers = vec![make_inference_provider("p1", "net")];
+        let mut network = base_network();
+        network.spec.metrics_refresh_interval = Some("10s".to_owned());
+        assert_eq!(
+            requeue_interval_for_network(&network, &providers).ok(),
+            Some(Duration::from_secs(10))
+        );
+    }
+
+    #[test]
+    fn network_requeue_uses_configured_milliseconds_interval() {
+        let providers = vec![make_inference_provider("p1", "net")];
+        let mut network = base_network();
+        network.spec.metrics_refresh_interval = Some("1500ms".to_owned());
+        assert_eq!(
+            requeue_interval_for_network(&network, &providers).ok(),
+            Some(Duration::from_millis(1_500))
+        );
+    }
+
+    #[test]
+    fn network_requeue_invalid_config_fails() {
+        let providers = vec![make_inference_provider("p1", "net")];
+        let mut network = base_network();
+        network.spec.metrics_refresh_interval = Some("5m".to_owned());
+        assert!(requeue_interval_for_network(&network, &providers).is_err());
+    }
+
+    #[test]
+    fn network_requeue_tls_caps_long_configured_interval() {
+        let providers = vec![make_provider_with_tls("p1", "net")];
+        let mut network = base_network();
+        network.spec.metrics_refresh_interval = Some("600s".to_owned());
+        assert_eq!(
+            requeue_interval_for_network(&network, &providers).ok(),
+            Some(TLS_REQUEUE_INTERVAL)
+        );
+    }
+
+    #[test]
+    fn network_requeue_tls_allows_short_configured_interval() {
+        let providers = vec![make_provider_with_tls("p1", "net")];
+        let mut network = base_network();
+        network.spec.metrics_refresh_interval = Some("10s".to_owned());
+        assert_eq!(
+            requeue_interval_for_network(&network, &providers).ok(),
+            Some(Duration::from_secs(10))
+        );
+    }
+
+    #[test]
+    fn network_requeue_ignores_tls_providers_from_other_networks() {
+        let providers = vec![
+            make_inference_provider("local", "net"),
+            make_provider_with_tls("unrelated-secure", "other-net"),
+        ];
+        let mut network = base_network();
+        network.spec.metrics_refresh_interval = Some("120s".to_owned());
+        assert_eq!(
+            requeue_interval_for_network(&network, &providers).ok(),
+            Some(Duration::from_secs(120)),
+            "TLS providers from another network must not cap this network's interval"
+        );
+    }
+
+    #[test]
+    fn metrics_refresh_duration_parser_rejects_unsupported_values() {
+        assert!(parse_metrics_refresh_interval("").is_err());
+        assert!(parse_metrics_refresh_interval("10").is_err());
+        assert!(parse_metrics_refresh_interval("0s").is_err());
+        assert!(parse_metrics_refresh_interval("500ms").is_err());
+        assert!(parse_metrics_refresh_interval("-1s").is_err());
+        assert!(parse_metrics_refresh_interval("1m").is_err());
+        assert!(parse_metrics_refresh_interval("01s").is_err());
+        assert!(parse_metrics_refresh_interval(" 10s").is_err());
+        assert!(parse_metrics_refresh_interval("18446744073709551615s").is_err());
     }
 }
