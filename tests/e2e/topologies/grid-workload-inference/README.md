@@ -14,6 +14,12 @@ cargo xtask env run-grid-glb-demo \
   --no-ingress --quick --teardown
 ```
 
+The reused GLB configuration defaults to
+`ghcr.io/praxis-proxy/grid-ai-rollup:v0.1.3`. For local development, set
+`GRID_XTASK_GATEWAY_IMAGE` to an AI image containing
+[`provider_route`](https://github.com/praxis-proxy/ai/pull/386) and set
+`GRID_XTASK_IMAGE_PULL_POLICY=Never` explicitly.
+
 ## What this tests
 
 - Four-cluster workload-inference topology (no GTM emulator)

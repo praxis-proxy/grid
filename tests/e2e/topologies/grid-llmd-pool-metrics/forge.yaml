@@ -238,6 +238,9 @@ spec:
               routingPolicy: scoreFirst
               scoringPolicy:
                 strategy: queueDepth
+              # Ten seconds is the periodic fallback. The harness also forces
+              # reconciles while waiting for deterministic pressure transitions.
+              metricsRefreshInterval: "10s"
               swim:
                 probeInterval: "5s"
                 suspicionTimeout: "15s"
@@ -310,6 +313,9 @@ spec:
               routingPolicy: scoreFirst
               scoringPolicy:
                 strategy: queueDepth
+              # Ten seconds is the periodic fallback. The harness also forces
+              # reconciles while waiting for deterministic pressure transitions.
+              metricsRefreshInterval: "10s"
               swim:
                 probeInterval: "5s"
                 suspicionTimeout: "15s"

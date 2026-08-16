@@ -1476,7 +1476,7 @@ fn verify_local_routing(consumer_edge: &str) -> Result<String, Box<dyn std::erro
     let provider = if verify.provider.is_empty() {
         extract_provider_from_response(&verify.body)?
     } else {
-        verify.provider.clone()
+        verify.provider
     };
     let region = consumer_edge.strip_suffix("-edge").unwrap_or(consumer_edge);
     if !provider.starts_with(region) {

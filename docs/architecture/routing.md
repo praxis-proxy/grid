@@ -54,6 +54,122 @@ The `ConfigMap` contains:
 
 Both keys describe the same routing state.
 
+## How re-ranking updates
+
+Grid does not re-rank a provider inside the request path. Re-ranking happens
+when the Grid operator reconciles a `GridNetwork` and publishes a new routing
+overlay. Praxis then uses the most recent overlay that it has accepted.
+
+The complete update path is:
+
+```text
+provider metrics / Kubernetes state / remote Grid state changes
+                              |
+                              v
+                    Grid operator reconcile
+                              |
+              scrape and normalize provider metrics
+                              |
+                  score and order candidates
+                              |
+          write a new versioned overlay ConfigMap
+                              |
+                 ConfigMap watch / projection
+                              |
+                    overlay-sync, if enabled
+                              |
+                    Praxis atomic hot reload
+                              |
+              next request uses the new ordering
+```
+
+### What causes a reconcile
+
+The operator has two kinds of triggers:
+
+| Trigger | What happens | Typical timing |
+|---|---|---:|
+| `InferenceProvider` change | Provider health, endpoint, model, metrics, or configuration changes can enqueue the owning `GridNetwork`. | Immediate watch event |
+| `GridSite` change | Site labels, geography, membership, or site status changes can enqueue the owning `GridNetwork`. | Immediate watch event |
+| `GridNetwork` change | A change to the network or gateway references enqueues that network. | Immediate watch event |
+| Remote SWIM/CRDT state observed | Remote provider and site state is consumed during reconciliation. | On the next reconcile/event-driven enqueue |
+| Periodic requeue | The operator periodically re-scrapes metrics and re-renders overlays. | **300 seconds by default** |
+| TLS metrics configuration | A network with any TLS-protected metrics provider uses a shorter bounded requeue so certificate rotation is noticed without a Secret watch. | **60 seconds** |
+
+The periodic interval is important for live metrics: a changing EPP queue does
+not itself change a Kubernetes resource, so it normally waits for the next
+`GridNetwork` reconcile. A provider or site watch can cause an earlier
+reconcile for other state changes.
+
+Set `spec.metricsRefreshInterval` when a deployment needs a different periodic
+cadence:
+
+```yaml
+spec:
+  metricsRefreshInterval: "10s"
+```
+
+The value accepts seconds or millisecond durations of at least one second; the
+CRD rejects zero, subsecond, and unsupported formats before they reach the
+operator. The controller also fails reconciliation if malformed data reaches
+it outside the Kubernetes admission path. An absent value uses the safe
+default of 300 seconds for plaintext metrics. A network with TLS
+metric credentials defaults to 60 seconds and never permits a custom interval
+longer than that bound, so certificate rotation detection is not delayed.
+Shorter intervals increase Kubernetes API, metrics-scrape, and overlay-update
+load. Ten seconds is a reasonable demo value: it is responsive enough to show
+EPP pressure transitions while avoiding the extra churn of a five-second loop.
+Use shorter intervals only for deliberately latency-sensitive deployments.
+
+### What happens during re-ranking
+
+During reconciliation, Grid:
+
+1. Lists the eligible `InferenceProvider` resources and `GridSite` resources.
+2. Scrapes each configured metrics endpoint, such as an llm-d EPP endpoint.
+3. Normalizes the signal selected by `scoringPolicy` and applies freshness and
+   health handling.
+4. Builds the candidate set, including eligible remote providers received
+   through Grid state.
+5. Computes the selected strategy's score and applies admission and
+   `routingPolicy` ordering. The first candidate receives rank `0`, the next
+   receives rank `1`, and so on.
+6. Renders a content-addressed overlay for each gateway reference. Each
+   gateway can therefore receive a different ranking because its `localSite`
+   and routing perspective can differ.
+7. Applies the overlay ConfigMap and records rendered/distributed revision
+   status.
+
+If rendering or applying a new overlay fails, Grid retains the previously
+distributed revision rather than publishing a partial routing state.
+
+### How the new overlay reaches Praxis
+
+After Grid applies the ConfigMap, delivery is separate from re-ranking:
+
+- With `overlay-sync` enabled, the sidecar watches the named ConfigMap,
+  validates the envelope and digest, atomically replaces the serving file, and
+  exposes readiness/liveness state.
+- Without `overlay-sync`, Praxis uses the direct ConfigMap mount and its normal
+  file-watch/projection behavior.
+- Praxis validates the new overlay and atomically swaps its in-memory snapshot.
+  Invalid updates leave the last-known-good snapshot serving; no request reads
+  Kubernetes or Grid directly.
+
+Overlay-sync can remove kubelet projection delay, but it does **not** make
+metrics collection or operator reconciliation more frequent. The end-to-end
+route-change time is the sum of metric availability, the next reconcile,
+ConfigMap application, overlay delivery, and Praxis hot reload.
+
+### Demo-specific forced refresh
+
+The LLM-D pool metrics demo deliberately annotates the `GridNetwork` after a
+pressure or recovery transition. That annotation creates an immediate watch
+event and bypasses the normal 300-second periodic requeue, allowing the demo
+to show the queue change, re-ranking, overlay revision, and routed request in
+one controlled flow. This is orchestration behavior for the demo; it is not a
+different Grid scoring algorithm.
+
 ## Routing overlay format
 
 The envelope is the authoritative observable contract consumed by Praxis AI:

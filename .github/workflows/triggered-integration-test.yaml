@@ -65,7 +65,7 @@ jobs:
       head_repo: ${{ steps.pr.outputs.head_repo }}
       head_branch: ${{ steps.pr.outputs.head_branch }}
       head_sha: ${{ steps.pr.outputs.head_sha }}
-      base_sha: ${{ steps.pr.outputs.base_sha }}
+      base_sha: ${{ steps.source.outputs.base_sha }}
     steps:
       - name: Validate PR number
         if: inputs.pr_number != ''
@@ -115,9 +115,16 @@ jobs:
             echo "head_repo=$(echo "${PR_JSON}" | jq -r '.head.repo.full_name')"
             echo "head_branch=$(echo "${PR_JSON}" | jq -r '.head.ref')"
             echo "head_sha=$(echo "${PR_JSON}" | jq -r '.head.sha')"
-            echo "base_sha=$(echo "${PR_JSON}" | jq -r '.base.sha')"
           } >> "${GITHUB_OUTPUT}"
 
+          # NOTE: intentionally not capturing `.base.sha` here as the
+          # verified base — GitHub only refreshes this REST field on PR
+          # synchronize events (e.g. a push to the head branch), so it can
+          # lag `main`'s actual tip by hours if the PR sits idle while main
+          # moves forward. `refs/pull/<n>/merge`, resolved in the next step,
+          # IS kept continuously current against `main`, so the base used
+          # for verification is instead re-resolved live from
+          # refs/heads/main in the "Resolve source" step below.
           echo "${PR_JSON}" | jq '{
             number: .number,
             title: .title,
@@ -129,7 +136,7 @@ jobs:
             head_branch: .head.ref,
             head_sha: .head.sha,
             base_branch: .base.ref,
-            base_sha: .base.sha
+            base_sha_at_pr_query: .base.sha
           }' > source-metadata.json
 
           echo "::group::PR metadata"
@@ -145,19 +152,35 @@ jobs:
           REPO_URL="https://github.com/${{ github.repository }}.git"
 
           if [[ -n "${PR_NUM}" ]]; then
-            MERGE_SHA=$(git ls-remote "${REPO_URL}" \
-              "refs/pull/${PR_NUM}/merge" | awk '{print $1}')
+            # Resolve the merge ref and refs/heads/main in a single
+            # `git ls-remote` call, instead of trusting the PR REST
+            # resource's `.base.sha` (see note in "Query PR metadata") and
+            # instead of two sequential round-trips, which would leave a
+            # window for main to advance between them and make BASE_SHA
+            # point past the merge ref's actual first parent. One call
+            # resolves both refs from the same server-side view, making
+            # them atomically consistent with each other.
+            LS_OUTPUT=$(git ls-remote "${REPO_URL}" "refs/pull/${PR_NUM}/merge" refs/heads/main)
+            MERGE_SHA=$(echo "${LS_OUTPUT}" | awk '/refs\/pull\//{print $1}')
+            BASE_SHA=$(echo "${LS_OUTPUT}" | awk '/refs\/heads\/main/{print $1}')
             if [[ -z "${MERGE_SHA}" ]]; then
               echo "::error::Cannot resolve refs/pull/${PR_NUM}/merge"
               echo "::error::The PR may have merge conflicts or the merge ref may not exist"
               exit 1
             fi
+            if [[ -z "${BASE_SHA}" ]]; then
+              echo "::error::Cannot resolve refs/heads/main for base verification"
+              exit 1
+            fi
+
             {
               echo "source_kind=pr"
               echo "source_label=PR #${PR_NUM}"
               echo "tested_sha=${MERGE_SHA}"
+              echo "base_sha=${BASE_SHA}"
             } >> "${GITHUB_OUTPUT}"
             echo "Resolved refs/pull/${PR_NUM}/merge -> ${MERGE_SHA}"
+            echo "Resolved refs/heads/main -> ${BASE_SHA} (expected base)"
           else
             MAIN_SHA=$(git ls-remote "${REPO_URL}" refs/heads/main | awk '{print $1}')
             if [[ -z "${MAIN_SHA}" ]]; then

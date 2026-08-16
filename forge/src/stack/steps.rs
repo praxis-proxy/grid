@@ -60,7 +60,7 @@ pub fn curl_download_spec(url: &str) -> CommandSpec {
 }
 
 /// Build a `kubectl apply -f -` command spec with content on stdin.
-pub fn kubectl_stdin_apply(context: &str, content: &[u8]) -> CommandSpec {
+pub fn kubectl_stdin_apply(context: &str, manifest_bytes: &[u8]) -> CommandSpec {
     CommandSpec {
         program: "kubectl".into(),
         args: vec![
@@ -71,7 +71,7 @@ pub fn kubectl_stdin_apply(context: &str, content: &[u8]) -> CommandSpec {
             "-".into(),
         ],
         env: BTreeMap::default(),
-        stdin: Some(content.to_vec()),
+        stdin: Some(manifest_bytes.to_vec()),
         redact: Vec::new(),
     }
 }

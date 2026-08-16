@@ -2092,11 +2092,12 @@ fn wait_for_remote_session(
     context: &str,
     pod_name: &str,
     session_id: &str,
-    content: &str,
+    message_text: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
     wait_for_combined_site_data_plane("combined-site remote session routing", || {
         let session_header = format!("X-Session-Id: {session_id}");
-        let body = format!(r#"{{"model":"{PRIMARY_MODEL}","messages":[{{"role":"user","content":"{content}"}}]}}"#);
+        let body =
+            format!(r#"{{"model":"{PRIMARY_MODEL}","messages":[{{"role":"user","content":"{message_text}"}}]}}"#);
         let output = run_curl_probe(
             context,
             pod_name,
@@ -3440,16 +3441,16 @@ fn require_numeric_image_user(image: &str) -> Result<(), Box<dyn std::error::Err
 /// (same source as `apply_image_overrides`). When `imagePullPolicy` is not
 /// `Never`, this is a no-op.
 fn load_images_into_clusters(forge_bin: &Path, resolved_config: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let pull_policy = std::env::var("GRID_XTASK_IMAGE_PULL_POLICY").unwrap_or_else(|_| "Never".to_owned());
+    let pull_policy = std::env::var("GRID_XTASK_IMAGE_PULL_POLICY").unwrap_or_else(|_| "IfNotPresent".to_owned());
     if pull_policy != "Never" {
         eprintln!("  skipping Kind image loading (pull policy is {pull_policy})");
         return Ok(());
     }
 
-    let gateway =
-        std::env::var("GRID_XTASK_GATEWAY_IMAGE").unwrap_or_else(|_| "praxis-ai:combined-site-demo".to_owned());
-    let operator =
-        std::env::var("GRID_XTASK_OPERATOR_IMAGE").unwrap_or_else(|_| "grid-operator:combined-site-demo".to_owned());
+    let gateway = std::env::var("GRID_XTASK_GATEWAY_IMAGE")
+        .unwrap_or_else(|_| "ghcr.io/praxis-proxy/grid-ai-rollup:v0.1.3".to_owned());
+    let operator = std::env::var("GRID_XTASK_OPERATOR_IMAGE")
+        .unwrap_or_else(|_| "ghcr.io/praxis-proxy/grid-operator:v0.1.3".to_owned());
     let vcr = crate::env::image_overrides::vcr_image();
 
     for image in [&gateway, &operator, &vcr] {
@@ -4354,12 +4355,12 @@ fn materialize_external_provider_stack(
     reason = "Image override application with structured YAML manipulation; nested ifs follow YAML structure hierarchy"
 )]
 fn apply_image_overrides(config: &mut serde_yaml::Value) {
-    let gateway_image =
-        std::env::var("GRID_XTASK_GATEWAY_IMAGE").unwrap_or_else(|_| "praxis-ai:combined-site-demo".to_owned());
-    let operator_image =
-        std::env::var("GRID_XTASK_OPERATOR_IMAGE").unwrap_or_else(|_| "grid-operator:combined-site-demo".to_owned());
+    let gateway_image = std::env::var("GRID_XTASK_GATEWAY_IMAGE")
+        .unwrap_or_else(|_| "ghcr.io/praxis-proxy/grid-ai-rollup:v0.1.3".to_owned());
+    let operator_image = std::env::var("GRID_XTASK_OPERATOR_IMAGE")
+        .unwrap_or_else(|_| "ghcr.io/praxis-proxy/grid-operator:v0.1.3".to_owned());
     let vcr_image = crate::env::image_overrides::vcr_image();
-    let image_pull_policy = std::env::var("GRID_XTASK_IMAGE_PULL_POLICY").unwrap_or_else(|_| "Never".to_owned());
+    let image_pull_policy = std::env::var("GRID_XTASK_IMAGE_PULL_POLICY").unwrap_or_else(|_| "IfNotPresent".to_owned());
 
     let (gateway_repo, gateway_tag) = parse_image_ref(&gateway_image);
     let (operator_repo, operator_tag) = parse_image_ref(&operator_image);

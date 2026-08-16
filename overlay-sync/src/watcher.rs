@@ -423,7 +423,7 @@ fn apply_jitter(base: Duration) -> Duration {
         .map_or(0, |d| d.subsec_nanos());
     let jitter_range = base / (100 / JITTER_FRACTION_PERCENT);
     let offset = jitter_range.mul_f64(f64::from(nanos % 1000) / 1000.0);
-    base - offset
+    base.saturating_sub(offset)
 }
 
 /// Advance an exponential backoff delay with a 30-second cap and 25% jitter.
