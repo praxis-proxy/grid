@@ -6233,13 +6233,8 @@ fn env_verify_gridsite_rotation(config: &Path, site: Option<&str>) -> Result<(),
             ROTATION_POLL_TIMEOUT,
         )?;
         eprintln!("  [PASS] step 6b: TlsVerified — cert-B matches fp-B in dual-pin");
-        // NOTE: AdvertisedCertificateMismatch (SWIM-advertised cert vs configured
-        // pins) requires modifying the remote operator's TLS broadcast secret
-        // independently of the probe server cert.  This pathway has unit test
-        // coverage (advertised_cert_mismatch_demotes_active_to_connecting,
-        // advertised_cert_mismatch_stays_connecting) but no xtask verifier
-        // intentionally creates that runtime state.  The rotation verifier
-        // focuses on the live TLS handshake lifecycle.
+        // No step for AdvertisedCertificateMismatch: it needs the remote TLS broadcast
+        // secret patched apart from the probe cert, and no longer changes phase.
 
         // ── Step 7: Patch [fp-B] only → still Active/TlsVerified ────────────
         eprintln!("verify-gridsite-rotation: [7] single pin [fp-B]");

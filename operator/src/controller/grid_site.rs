@@ -238,6 +238,26 @@ async fn evaluate_gateway(site: &GridSite, client: &Client, network: &GridNetwor
     }
 }
 
+/// SWIM-advertised leaf DER, or `None` when absent or unparseable.
+///
+/// Gossiped, so unparseable is ignored: an `Err` would skip the authenticating handshake.
+fn advertised_leaf_der(site: &GridSite) -> Option<Vec<u8>> {
+    site.status
+        .as_ref()
+        .and_then(|s| s.public_cert_pem.as_ref())
+        .and_then(|pem| match first_cert_der_from_pem(pem) {
+            Ok(der) => Some(der),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    site = site.metadata.name.as_deref().unwrap_or_default(),
+                    "ignoring unparseable advertised certificate"
+                );
+                None
+            },
+        })
+}
+
 /// Build a `ProbeConfig` by loading trust material from Kubernetes
 /// Secrets referenced by the `GridNetwork`.
 ///
@@ -302,19 +322,14 @@ async fn build_probe_config_from_secrets(
 
     let pins = resolve_pins(site)?;
 
-    let advertised_leaf_der = site
-        .status
-        .as_ref()
-        .and_then(|s| s.public_cert_pem.as_ref())
-        .map(|pem| first_cert_der_from_pem(pem).map_err(|_err| O::TrustMaterialInvalid))
-        .transpose()?;
+    let advertised = advertised_leaf_der(site);
 
     Ok(crate::resources::tls_probe::ProbeConfig {
         address: addr.to_owned(),
         tls_config,
         server_name,
         pins,
-        advertised_leaf_der,
+        advertised_leaf_der: advertised,
     })
 }
 
@@ -525,7 +540,10 @@ async fn update_status(
 /// [`Warning`]: EventType::Warning
 fn event_type_for_reason(reason: &str) -> EventType {
     match reason {
-        "TlsVerified" | "AwaitingDiscovery" | "GatewayAddressKnown" | "Left" => EventType::Normal,
+        // AdvertisedCertMismatch is a success path, so Warning would be false alarm.
+        "TlsVerified" | "AwaitingDiscovery" | "GatewayAddressKnown" | "Left" | "AdvertisedCertMismatch" => {
+            EventType::Normal
+        },
         _ => EventType::Warning,
     }
 }
@@ -977,15 +995,96 @@ mod tests {
         assert_eq!(reason, "PinMismatch");
     }
 
+    /// A site whose only relevant property is its advertised certificate.
+    fn site_with_advertised(pem: Option<&str>) -> GridSite {
+        GridSite {
+            status: Some(GridSiteStatus {
+                public_cert_pem: pem.map(ToOwned::to_owned),
+                ..Default::default()
+            }),
+            ..site_no_egress(None)
+        }
+    }
+
+    /// Absent advertised material yields no DER, and no error.
     #[test]
-    fn advertised_cert_mismatch_demotes_active_to_connecting() {
+    fn advertised_leaf_absent_is_none() {
+        assert!(advertised_leaf_der(&site_no_egress(None)).is_none(), "no status");
+        assert!(
+            advertised_leaf_der(&site_with_advertised(None)).is_none(),
+            "status, no PEM"
+        );
+    }
+
+    /// A real advertised certificate parses to the expected DER.
+    #[test]
+    fn advertised_leaf_valid_is_parsed() {
+        let ca = certs::generate_ca("t").unwrap_or_else(|_| std::process::abort());
+        let leaf = certs::generate_site_cert(&ca, "peer").unwrap_or_else(|_| std::process::abort());
+        let want = first_cert_der_from_pem(&leaf.cert_pem).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            advertised_leaf_der(&site_with_advertised(Some(&leaf.cert_pem))),
+            Some(want)
+        );
+    }
+
+    /// A chain PEM yields the leaf, not an intermediate.
+    #[test]
+    fn advertised_leaf_of_chain_is_the_leaf() {
+        let ca = certs::generate_ca("t").unwrap_or_else(|_| std::process::abort());
+        let leaf = certs::generate_site_cert(&ca, "peer").unwrap_or_else(|_| std::process::abort());
+        let chain = format!("{}{}", leaf.cert_pem, ca.cert_pem);
+        let want = first_cert_der_from_pem(&leaf.cert_pem).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(advertised_leaf_der(&site_with_advertised(Some(&chain))), Some(want));
+    }
+
+    /// An unparseable advertised PEM is ignored, not surfaced as an error.
+    #[test]
+    fn unparseable_advertised_leaf_is_ignored() {
+        let bad = "-----BEGIN CERTIFICATE-----\nMIIBIjANBgkqhkiG9\n-----END CERTIFICATE-----";
+        assert!(
+            first_cert_der_from_pem(bad).is_err(),
+            "fixture must be the unparseable case this guards"
+        );
+        assert!(
+            advertised_leaf_der(&site_with_advertised(Some(bad))).is_none(),
+            "unparseable advertised material must be ignored, never surfaced as an error"
+        );
+    }
+
+    #[test]
+    fn advertised_cert_mismatch_promotes_connecting_to_active() {
+        let site = site_with_egress(Some(GridSitePhase::Connecting), "10.0.0.1:8443");
+        let (phase, reason, _msg) = site_phase_next(
+            &GridSitePhase::Connecting,
+            &site,
+            Some(&GatewayProbeOutcome::AdvertisedCertificateMismatch),
+        );
+        assert_eq!(phase, GridSitePhase::Active);
+        assert_eq!(reason, "AdvertisedCertMismatch");
+    }
+
+    #[test]
+    fn advertised_cert_mismatch_recovers_unreachable_to_active() {
+        let site = site_with_egress(Some(GridSitePhase::Unreachable), "10.0.0.1:8443");
+        let (phase, reason, _msg) = site_phase_next(
+            &GridSitePhase::Unreachable,
+            &site,
+            Some(&GatewayProbeOutcome::AdvertisedCertificateMismatch),
+        );
+        assert_eq!(phase, GridSitePhase::Active);
+        assert_eq!(reason, "AdvertisedCertMismatch");
+    }
+
+    #[test]
+    fn advertised_cert_mismatch_keeps_active() {
         let site = site_with_egress(Some(GridSitePhase::Active), "10.0.0.1:8443");
         let (phase, reason, _msg) = site_phase_next(
             &GridSitePhase::Active,
             &site,
             Some(&GatewayProbeOutcome::AdvertisedCertificateMismatch),
         );
-        assert_eq!(phase, GridSitePhase::Connecting);
+        assert_eq!(phase, GridSitePhase::Active);
         assert_eq!(reason, "AdvertisedCertMismatch");
     }
 
@@ -1372,6 +1471,14 @@ mod tests {
     #[test]
     fn event_type_left_is_normal() {
         assert!(matches!(event_type_for_reason("Left"), EventType::Normal));
+    }
+
+    #[test]
+    fn event_type_advertised_cert_mismatch_is_normal() {
+        assert!(matches!(
+            event_type_for_reason("AdvertisedCertMismatch"),
+            EventType::Normal
+        ));
     }
 
     #[test]

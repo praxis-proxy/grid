@@ -322,7 +322,7 @@ A discovered SWIM peer is not automatically authorized for routing.
 | `IdentityMismatch` | Connecting | Server SAN does not match configured `serverName` |
 | `CertificateExpired` / `CertificateNotYetValid` | Connecting | Server certificate is outside its validity period |
 | `PinMismatch` | Connecting | Canonical fingerprint does not match a configured pin |
-| `AdvertisedCertMismatch` | Connecting | SWIM-advertised certificate does not match either configured rotation pin |
+| `AdvertisedCertMismatch` | Active | SWIM-advertised certificate does not match a configured pin; recorded only, since the live leaf verified |
 | `TrustMaterialMissing` | Connecting | CA, client certificate, key, server name, or pin policy is absent |
 | `TrustMaterialInvalid` | Connecting | Trust material is malformed, oversized, or uses the deprecated fingerprint format |
 

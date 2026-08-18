@@ -64,8 +64,8 @@ pub(crate) struct ProbeConfig {
     /// Canonical DER fingerprint pins (1–2 entries).
     pub pins: Vec<CanonicalFingerprint>,
 
-    /// Optional SWIM-advertised leaf cert DER for authorization against the
-    /// configured rotation pins.
+    /// Optional SWIM-advertised leaf cert DER, compared with the configured
+    /// rotation pins for diagnostics only.
     pub advertised_leaf_der: Option<Vec<u8>>,
 }
 
@@ -182,7 +182,8 @@ pub(crate) fn build_tls_config(
 /// 2. TLS handshake under [`PROBE_DEADLINE`] (total, including connect).
 /// 3. Extract peer leaf certificate DER.
 /// 4. Validate canonical fingerprint pin.
-/// 5. If present, verify the SWIM-advertised leaf cert matches an authorized rotation pin.
+/// 5. If present, compare the SWIM-advertised leaf with the pins and record a mismatch without failing the verified
+///    connection.
 ///
 /// Returns a `GatewayProbeOutcome` — never panics, never leaks
 /// private material.
