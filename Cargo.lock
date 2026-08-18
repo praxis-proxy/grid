@@ -2904,6 +2904,7 @@ dependencies = [
  "clap",
  "pem",
  "rand",
+ "regex",
  "serde",
  "serde_json",
  "serde_yaml",

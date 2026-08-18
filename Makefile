@@ -14,7 +14,7 @@ ifneq ($(V),)
 endif
 
 .PHONY: all build release check clean \
-	test test-unit lint fmt doc audit \
+	test test-unit lint lint-extended fmt doc audit \
 	coverage coverage-check \
 	require-container-engine \
 	images container operator-image \
@@ -64,6 +64,9 @@ lint:
 	cargo clippy --workspace --all-targets -- -D warnings
 	cargo +$(NIGHTLY_RUSTFMT) fmt --all -- --check
 	cargo machete
+
+lint-extended:
+	cargo xtask lint-extended
 
 fmt:
 	cargo +$(NIGHTLY_RUSTFMT) fmt --all
@@ -188,6 +191,7 @@ help:
 	@echo ""
 	@echo "Quality:"
 	@echo "  lint             clippy + rustfmt check + machete"
+	@echo "  lint-extended    diff-scoped heuristic checks (comment slop, repetition)"
 	@echo "  fmt              format with nightly rustfmt"
 	@echo "  doc              build docs with warnings denied"
 	@echo "  audit            cargo audit + cargo deny"
