@@ -43,6 +43,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use clap::Parser as _;
 use futures::StreamExt as _;
 use k8s_openapi::api::core::v1::ConfigMap;
 use kube::{
@@ -51,11 +52,13 @@ use kube::{
     runtime::{controller::Controller, watcher},
 };
 use operator::{
+    cli::Cli,
     controller::{
         grid_network::{self, OperatorCtx},
         grid_site, inference_provider,
     },
     crd::{grid_network::GridNetwork, grid_site::GridSite, inference_provider::InferenceProvider},
+    gateway,
     swim_runtime::{self, RevisionLease, SwimConfig},
 };
 
@@ -69,6 +72,8 @@ async fn main() {
     tracing_subscriber::fmt::init();
     tracing::info!("starting grid-operator");
 
+    let config = Cli::parse();
+
     let client = match Client::try_default().await {
         Ok(c) => c,
         Err(e) => {
@@ -77,12 +82,13 @@ async fn main() {
         },
     };
 
-    let swim = maybe_start_swim(&client).await;
+    let swim = maybe_start_swim(&client, &config.gateway).await;
 
     if let Some(handle) = &swim {
-        tokio::spawn(operator::gateway::run_discovery_poller(
+        tokio::spawn(gateway::run_discovery_poller(
             client.clone(),
             Arc::clone(handle),
+            config.gateway.clone(),
         ));
     }
 
@@ -119,7 +125,7 @@ async fn main() {
     clippy::large_stack_frames,
     reason = "sequential env-var parsing + runtime startup; splitting would obscure the startup sequence"
 )]
-async fn maybe_start_swim(client: &Client) -> Option<Arc<swim_runtime::SwimHandle>> {
+async fn maybe_start_swim(client: &Client, config: &gateway::Config) -> Option<Arc<swim_runtime::SwimHandle>> {
     let addr_str = std::env::var("GRID_SWIM_BIND_ADDR").ok()?;
     let bind_addr = match addr_str.parse() {
         Ok(a) => a,
@@ -131,7 +137,7 @@ async fn maybe_start_swim(client: &Client) -> Option<Arc<swim_runtime::SwimHandl
     let advertise_addr = parse_optional_socket_addr_env("GRID_SWIM_ADVERTISE_ADDR");
     let seeds = parse_socket_addr_list_env("GRID_SWIM_SEEDS");
     let site_name = std::env::var("GRID_SWIM_SITE_NAME").unwrap_or_else(|_| hostname_or_default());
-    let gateway_address = match operator::gateway::resolve(client).await {
+    let gateway_address = match gateway::resolve(client, config).await {
         Ok(addr) => addr,
         Err(e) => {
             tracing::error!(error = %e, "gateway address discovery failed; continuing without");

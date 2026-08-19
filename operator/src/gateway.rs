@@ -1,111 +1,134 @@
 //! Provider gateway address self-discovery.
 //!
-//! Resolves the data-plane gateway address that this operator
-//! advertises to SWIM peers.  The address is used to populate
-//! `GridSite.spec.egress.address` on remote clusters.
-//!
-//! # Resolution order
-//!
-//! 1. If `GRID_GATEWAY_ADDRESS` env var is set and non-empty, use it (explicit override for testing or non-standard
-//!    topologies).  No background polling runs in this case.
-//! 2. Otherwise, look up a Kubernetes `LoadBalancer` Service by name and extract its external address.  A background
-//!    poller retries periodically until the address appears, then continues polling and re-announcing the current
-//!    address.
-//!
-//! # Configuration
-//!
-//! | Env var | Default | Purpose |
-//! |---|---|---|
-//! | `GRID_GATEWAY_ADDRESS` | (none) | Explicit override; skips discovery and polling |
-//! | `GRID_GATEWAY_SERVICE_NAME` | `provider-gateway` | Service to look up |
-//! | `GRID_GATEWAY_NAMESPACE` | `grid-system` | Namespace of the Service |
-//! | `GRID_GATEWAY_PORT` | `8080` | Port to append to discovered IP |
-//! | `GRID_GATEWAY_DISCOVERY_INTERVAL_MS` | `5000` | Polling interval in milliseconds |
+//! Resolves the data-plane gateway address this operator advertises to SWIM
+//! peers (populates `GridSite.spec.egress.address`): an explicit override wins,
+//! else a background poller discovers the Service `LoadBalancer` address.
 
 use std::{sync::Arc, time::Duration};
 
+use clap::Args;
 use k8s_openapi::api::core::v1::Service;
 use kube::{Api, Client};
 
 use crate::swim_runtime::SwimHandle;
 
-/// Default Service name for gateway self-discovery.
-const DEFAULT_SERVICE_NAME: &str = "provider-gateway";
-
-/// Default namespace for gateway Service lookup.
-const DEFAULT_NAMESPACE: &str = "grid-system";
-
-/// Default port appended to the discovered address.
-const DEFAULT_PORT: u16 = 8080;
-
-/// Default polling interval for gateway discovery.
-const DEFAULT_DISCOVERY_INTERVAL_MS: u64 = 5000;
-
-/// Resolve the gateway address, preferring an explicit env-var override.
+/// Trims a value and rejects it when nothing remains.
 ///
-/// Returns `None` when neither the env var nor the Service provides
-/// a usable address (e.g. Service has no `LoadBalancer` ingress yet).
+/// Clap applies a default only when the variable is absent, so a blank one
+/// would otherwise reach discovery as an empty name.
 ///
 /// # Errors
 ///
-/// Returns an error only on Kubernetes API failures.  A missing
-/// Service or pending `LoadBalancer` is returned as `Ok(None)`.
-pub async fn resolve(client: &Client) -> Result<Option<String>, kube::Error> {
-    if let Some(addr) = env_override() {
-        tracing::info!(addr = %addr, "using explicit GRID_GATEWAY_ADDRESS override");
-        return Ok(Some(addr));
+/// When `raw` is blank.
+fn parse_non_blank(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("must not be blank".to_owned());
     }
-    discover_from_service(client).await
+    Ok(trimmed.to_owned())
 }
 
-/// Read the explicit `GRID_GATEWAY_ADDRESS` override from the environment.
+/// Gateway self-discovery configuration.
 ///
-/// Returns `None` when the env var is absent or blank.
-pub fn env_override() -> Option<String> {
-    std::env::var("GRID_GATEWAY_ADDRESS")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
+/// Explicit group id: clap derives it from the struct name, and duplicates
+/// panic at startup.
+#[derive(Args, Debug, Clone)]
+#[group(id = "gateway")]
+pub struct Config {
+    /// Explicit gateway address (host:port); skips discovery when set.
+    ///
+    /// Blank means unset here, unlike the discovery fields.
+    #[arg(long = "gateway-address", env = "GRID_GATEWAY_ADDRESS")]
+    pub address: Option<String>,
+
+    /// Gateway Service name to discover.
+    #[arg(
+        long = "gateway-service-name",
+        env = "GRID_GATEWAY_SERVICE_NAME",
+        default_value = "provider-gateway",
+        value_parser = parse_non_blank
+    )]
+    pub service_name: String,
+
+    /// Namespace of the gateway Service.
+    #[arg(
+        long = "gateway-namespace",
+        env = "GRID_GATEWAY_NAMESPACE",
+        default_value = "grid-system",
+        value_parser = parse_non_blank
+    )]
+    pub namespace: String,
+
+    /// Port appended to the discovered address.
+    #[arg(
+        long = "gateway-port",
+        env = "GRID_GATEWAY_PORT",
+        default_value_t = 8080,
+        value_parser = clap::value_parser!(u16).range(1..=65535)
+    )]
+    pub port: u16,
+
+    /// Discovery poll interval, milliseconds.
+    ///
+    /// Bounded 100ms..=1h: `poll_loop` sleeps on it, so zero busy-polls the API
+    /// and an out-of-range value never fires.
+    #[arg(
+        long = "gateway-discovery-interval-ms",
+        env = "GRID_GATEWAY_DISCOVERY_INTERVAL_MS",
+        default_value_t = 5000,
+        value_parser = clap::value_parser!(u64).range(100..=3_600_000)
+    )]
+    pub discovery_interval_ms: u64,
 }
 
-/// Parse the discovery polling interval from `GRID_GATEWAY_DISCOVERY_INTERVAL_MS`.
-pub fn discovery_interval() -> Duration {
-    Duration::from_millis(
-        std::env::var("GRID_GATEWAY_DISCOVERY_INTERVAL_MS")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(DEFAULT_DISCOVERY_INTERVAL_MS),
-    )
+impl Config {
+    /// Override address, blank treated as unset.
+    fn address_override(&self) -> Option<&str> {
+        self.address.as_deref().map(str::trim).filter(|s| !s.is_empty())
+    }
+
+    /// Poll interval as a `Duration`.
+    fn discovery_interval(&self) -> Duration {
+        Duration::from_millis(self.discovery_interval_ms)
+    }
 }
 
-/// Run the gateway address discovery poller.
+/// Resolve the gateway address: explicit override, else Service discovery.
 ///
-/// Periodically resolves the Service address and re-announces it through the
-/// SWIM handle. Runs until the process exits.
-/// Once an address has been discovered, a later pending/missing Service
-/// address is treated as transient and the last-good address is retained.
+/// `Ok(None)` means no address yet.
 ///
-/// This is a no-op when `GRID_GATEWAY_ADDRESS` is set (the explicit
-/// override takes precedence and never changes at runtime).
-pub async fn run_discovery_poller(client: Client, swim: Arc<SwimHandle>) {
-    if env_override().is_some() {
-        tracing::info!("GRID_GATEWAY_ADDRESS override set; skipping discovery poller");
+/// # Errors
+///
+/// Kubernetes API failures.
+pub async fn resolve(client: &Client, config: &Config) -> Result<Option<String>, kube::Error> {
+    if let Some(addr) = config.address_override() {
+        tracing::info!(addr = %addr, "using explicit gateway address override");
+        return Ok(Some(addr.to_owned()));
+    }
+    discover_from_service(client, config).await
+}
+
+/// Poll for the gateway Service address and re-announce it via SWIM.
+///
+/// No-op when an explicit address override is set.
+pub async fn run_discovery_poller(client: Client, swim: Arc<SwimHandle>, config: Config) {
+    if config.address_override().is_some() {
+        tracing::info!("gateway address override set; skipping discovery poller");
         return;
     }
-    let interval = discovery_interval();
+    let interval = config.discovery_interval();
     let interval_ms = u64::try_from(interval.as_millis()).unwrap_or(u64::MAX);
     tracing::info!(interval_ms, "starting gateway address discovery poller");
-    poll_loop(&client, &swim, interval).await;
+    poll_loop(&client, &swim, interval, &config).await;
 }
 
-/// Inner polling loop; separated to satisfy clippy complexity/loop lints.
-async fn poll_loop(client: &Client, swim: &SwimHandle, interval: Duration) -> ! {
+/// Inner polling loop; separated to satisfy clippy complexity lints.
+async fn poll_loop(client: &Client, swim: &SwimHandle, interval: Duration, config: &Config) -> ! {
     loop {
         tokio::time::sleep(interval).await;
-        match discover_from_service(client).await {
+        match discover_from_service(client, config).await {
+            // Re-announce even if unchanged: a peer may have joined since.
             Ok(Some(addr)) => {
-                // Re-announce an unchanged address as well. A peer may join
-                // after the previous metadata broadcast, or retain an
-                // invalidation key from an earlier operator instance.
                 if let Err(e) = swim.set_gateway_address(Some(addr.clone())) {
                     tracing::warn!(error = %e, "failed to update gateway address on SWIM handle");
                 }
@@ -118,36 +141,21 @@ async fn poll_loop(client: &Client, swim: &SwimHandle, interval: Duration) -> ! 
     }
 }
 
-/// Look up the provider gateway Service and extract its `LoadBalancer` address.
-async fn discover_from_service(client: &Client) -> Result<Option<String>, kube::Error> {
-    let service_name = env_or_default("GRID_GATEWAY_SERVICE_NAME", DEFAULT_SERVICE_NAME);
-    let namespace = env_or_default("GRID_GATEWAY_NAMESPACE", DEFAULT_NAMESPACE);
-    let port = std::env::var("GRID_GATEWAY_PORT")
-        .ok()
-        .and_then(|s| s.parse::<u16>().ok())
-        .unwrap_or(DEFAULT_PORT);
-
-    let api: Api<Service> = Api::namespaced(client.clone(), &namespace);
-    if let Some(svc) = api.get_opt(&service_name).await? {
-        let addr = extract_lb_address(&svc, port);
-        log_discovery_result(&service_name, &namespace, &addr);
+/// Look up the gateway Service and extract its `LoadBalancer` address.
+async fn discover_from_service(client: &Client, config: &Config) -> Result<Option<String>, kube::Error> {
+    let api: Api<Service> = Api::namespaced(client.clone(), &config.namespace);
+    if let Some(svc) = api.get_opt(&config.service_name).await? {
+        let addr = extract_lb_address(&svc, config.port);
+        log_discovery_result(&config.service_name, &config.namespace, &addr);
         Ok(addr)
     } else {
         tracing::info!(
-            service = %service_name,
-            namespace = %namespace,
-            "provider gateway Service not found; gateway address unavailable"
+            service = %config.service_name,
+            namespace = %config.namespace,
+            "gateway Service not found; address unavailable"
         );
         Ok(None)
     }
-}
-
-/// Read an env var, falling back to `default` when absent or blank.
-fn env_or_default(name: &str, default: &str) -> String {
-    std::env::var(name)
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| default.to_owned())
 }
 
 /// Log the outcome of Service-based discovery.
@@ -157,22 +165,16 @@ fn log_discovery_result(service: &str, namespace: &str, addr: &Option<String>) {
             service = %service,
             namespace = %namespace,
             addr = %a,
-            "discovered provider gateway address from Service"
+            "discovered gateway address from Service"
         );
     } else {
-        tracing::info!(
-            service = %service,
-            namespace = %namespace,
-            "provider gateway Service has no LoadBalancer address yet"
-        );
+        tracing::info!(service = %service, namespace = %namespace, "gateway Service has no LoadBalancer address yet");
     }
 }
 
-/// Extract the first `LoadBalancer` ingress address from a Service,
-/// formatted as `"<ip-or-hostname>:<port>"`.
+/// Extract the first `LoadBalancer` ingress address as `"<host>:<port>"`.
 ///
-/// Prefers `.ip` over `.hostname`.  Returns `None` when the Service
-/// has no `LoadBalancer` ingress entries.
+/// Prefers `.ip` over `.hostname`; `None` when there is no ingress.
 pub fn extract_lb_address(svc: &Service, port: u16) -> Option<String> {
     let ingress = svc.status.as_ref()?.load_balancer.as_ref()?.ingress.as_ref()?;
     let first = ingress.first()?;
@@ -186,6 +188,7 @@ pub fn extract_lb_address(svc: &Service, port: u16) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use clap::Parser as _;
     use k8s_openapi::api::core::v1::{LoadBalancerIngress, LoadBalancerStatus, Service, ServiceStatus};
 
     use super::*;
@@ -238,23 +241,29 @@ mod tests {
         Service::default()
     }
 
+    /// Parse a `Config` in isolation for validation tests.
+    fn parse_gateway(args: &[&str]) -> Result<Config, clap::Error> {
+        #[derive(clap::Parser)]
+        struct Cli {
+            #[command(flatten)]
+            gateway: Config,
+        }
+        Cli::try_parse_from(std::iter::once("test").chain(args.iter().copied())).map(|c| c.gateway)
+    }
+
     #[test]
     fn extract_ip_address() {
-        let svc = svc_with_ip("172.19.0.5");
         assert_eq!(
-            extract_lb_address(&svc, 8080),
-            Some("172.19.0.5:8080".to_owned()),
-            "should extract IP"
+            extract_lb_address(&svc_with_ip("172.19.0.5"), 8080),
+            Some("172.19.0.5:8080".to_owned())
         );
     }
 
     #[test]
     fn extract_hostname_address() {
-        let svc = svc_with_hostname("gateway.example.com");
         assert_eq!(
-            extract_lb_address(&svc, 8080),
-            Some("gateway.example.com:8080".to_owned()),
-            "should fall back to hostname"
+            extract_lb_address(&svc_with_hostname("gateway.example.com"), 8080),
+            Some("gateway.example.com:8080".to_owned())
         );
     }
 
@@ -274,35 +283,134 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert_eq!(
-            extract_lb_address(&svc, 9090),
-            Some("10.0.0.1:9090".to_owned()),
-            "IP should be preferred over hostname"
-        );
+        assert_eq!(extract_lb_address(&svc, 9090), Some("10.0.0.1:9090".to_owned()));
     }
 
     #[test]
     fn no_ingress_returns_none() {
-        assert_eq!(extract_lb_address(&svc_no_ingress(), 8080), None, "empty ingress list");
+        assert_eq!(extract_lb_address(&svc_no_ingress(), 8080), None);
     }
 
     #[test]
     fn no_status_returns_none() {
-        assert_eq!(extract_lb_address(&svc_no_status(), 8080), None, "no status at all");
+        assert_eq!(extract_lb_address(&svc_no_status(), 8080), None);
     }
 
     #[test]
     fn custom_port() {
-        let svc = svc_with_ip("192.168.1.1");
         assert_eq!(
-            extract_lb_address(&svc, 443),
-            Some("192.168.1.1:443".to_owned()),
-            "custom port should be appended"
+            extract_lb_address(&svc_with_ip("192.168.1.1"), 443),
+            Some("192.168.1.1:443".to_owned())
         );
     }
 
     #[test]
-    fn default_interval_is_5s() {
-        assert_eq!(discovery_interval(), Duration::from_millis(5000), "default interval");
+    fn port_and_interval_default() {
+        assert!(matches!(parse_gateway(&[]), Ok(g) if g.port == 8080 && g.discovery_interval_ms == 5000));
+    }
+
+    #[test]
+    fn valid_port_accepted() {
+        assert!(matches!(parse_gateway(&["--gateway-port", "443"]), Ok(g) if g.port == 443));
+    }
+
+    #[test]
+    fn zero_port_rejected() {
+        assert!(parse_gateway(&["--gateway-port", "0"]).is_err());
+    }
+
+    #[test]
+    fn out_of_range_port_rejected() {
+        assert!(parse_gateway(&["--gateway-port", "99999"]).is_err());
+    }
+
+    #[test]
+    fn non_numeric_port_rejected() {
+        assert!(parse_gateway(&["--gateway-port", "abc"]).is_err());
+    }
+
+    #[test]
+    fn zero_interval_rejected() {
+        assert!(parse_gateway(&["--gateway-discovery-interval-ms", "0"]).is_err());
+    }
+
+    #[test]
+    fn below_floor_interval_rejected() {
+        assert!(parse_gateway(&["--gateway-discovery-interval-ms", "99"]).is_err());
+    }
+
+    #[test]
+    fn above_ceiling_interval_rejected() {
+        assert!(parse_gateway(&["--gateway-discovery-interval-ms", "3600001"]).is_err());
+    }
+
+    #[test]
+    fn ceiling_interval_accepted() {
+        let parsed = parse_gateway(&["--gateway-discovery-interval-ms", "3600000"]);
+        assert!(matches!(parsed, Ok(g) if g.discovery_interval_ms == 3_600_000));
+    }
+
+    #[test]
+    fn floor_interval_accepted() {
+        let parsed = parse_gateway(&["--gateway-discovery-interval-ms", "100"]);
+        assert!(matches!(parsed, Ok(g) if g.discovery_interval_ms == 100));
+    }
+
+    #[test]
+    fn blank_service_name_rejected() {
+        assert!(parse_gateway(&["--gateway-service-name", ""]).is_err());
+    }
+
+    #[test]
+    fn whitespace_service_name_rejected() {
+        assert!(parse_gateway(&["--gateway-service-name", "   "]).is_err());
+    }
+
+    #[test]
+    fn blank_namespace_rejected() {
+        assert!(parse_gateway(&["--gateway-namespace", ""]).is_err());
+    }
+
+    #[test]
+    fn whitespace_namespace_rejected() {
+        assert!(parse_gateway(&["--gateway-namespace", "\t "]).is_err());
+    }
+
+    #[test]
+    fn discovery_names_are_trimmed() {
+        let parsed = parse_gateway(&[
+            "--gateway-service-name",
+            " edge-gateway ",
+            "--gateway-namespace",
+            " grid ",
+        ]);
+        assert!(matches!(parsed, Ok(g) if g.service_name == "edge-gateway" && g.namespace == "grid"));
+    }
+
+    #[test]
+    fn discovery_names_default_when_absent() {
+        let parsed = parse_gateway(&[]);
+        assert!(
+            matches!(parsed, Ok(g) if g.service_name == "provider-gateway" && g.namespace == "grid-system"),
+            "defaults still apply when the flags are not supplied"
+        );
+    }
+
+    #[test]
+    fn absent_address_is_unset() {
+        assert!(matches!(parse_gateway(&[]), Ok(g) if g.address_override().is_none()));
+    }
+
+    #[test]
+    fn blank_address_treated_as_unset() {
+        assert!(matches!(parse_gateway(&["--gateway-address", "   "]), Ok(g) if g.address_override().is_none()));
+    }
+
+    #[test]
+    fn address_is_trimmed() {
+        assert!(
+            matches!(parse_gateway(&["--gateway-address", "  10.0.0.1:8443  "]), Ok(g)
+                if g.address_override() == Some("10.0.0.1:8443"))
+        );
     }
 }

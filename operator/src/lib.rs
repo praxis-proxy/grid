@@ -6,6 +6,9 @@
 
 #![deny(unsafe_code)]
 
+/// Command-line interface.
+pub mod cli;
+
 /// Kubernetes controllers.
 pub mod controller;
 /// Custom resource definitions.
