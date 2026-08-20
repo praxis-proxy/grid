@@ -36,6 +36,8 @@ spec:
                 - ALL
             readOnlyRootFilesystem: false
             runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
           env:
             - name: MODEL
               value: "Qwen/Qwen3-0.6B"

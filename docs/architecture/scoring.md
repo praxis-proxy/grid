@@ -1,5 +1,10 @@
 # Provider Scoring
 
+For the complete relationship between scoring, routing groups, and request-time
+selection, see [Provider Selection and Load Balancing](provider-selection-and-load-balancing.md).
+Scores influence candidate ordering; they are not traffic weights and do not
+split selection groups.
+
 Grid scores provider pools when the operator renders a Praxis routing overlay.
 Praxis reads that overlay from memory at request time; it does not call Grid,
 Kubernetes, the operator, or an EPP metrics endpoint on the request path.
@@ -53,7 +58,7 @@ spec:
 Omitting `scoringPolicy` has the same effect. Every admitted candidate receives
 zero dynamic score. "No metrics" does not mean "no policy": health, admission,
 freshness, model compatibility, geography, selection tiers, session affinity,
-and Praxis picker policy continue to apply.
+and Praxis selection policy continue to apply.
 
 Use this strategy for heterogeneous grids, external APIs such as OpenAI,
 Anthropic, or Bedrock, and providers that do not expose comparable pool

@@ -1,4 +1,15 @@
 {{- if .Values.gridNetwork.name }}
+{{- $existing := lookup "grid.praxis-proxy.io/v1alpha1" "GridNetwork" .Release.Namespace .Values.gridNetwork.name }}
+{{- $configuredSelectionPolicy := .Values.gridNetwork.selectionPolicy }}
+{{- $existingSelectionPolicy := dig "spec" "selectionPolicy" nil $existing }}
+{{- $selectionPolicy := $configuredSelectionPolicy }}
+{{- if not $selectionPolicy }}
+  {{- if $existingSelectionPolicy }}
+    {{- $selectionPolicy = $existingSelectionPolicy }}
+  {{- else if not $existing }}
+    {{- $selectionPolicy = dict "mode" "roundRobin" }}
+  {{- end }}
+{{- end }}
 apiVersion: grid.praxis-proxy.io/v1alpha1
 kind: GridNetwork
 metadata:
@@ -32,6 +43,12 @@ spec:
   {{- with .Values.gridNetwork.admissionPolicy }}
   admissionPolicy:
     {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with $selectionPolicy }}
+  {{- if .mode }}
+  selectionPolicy:
+    mode: {{ .mode | quote }}
+  {{- end }}
   {{- end }}
   {{- with .Values.gridNetwork.metricsRefreshInterval }}
   {{- if . }}

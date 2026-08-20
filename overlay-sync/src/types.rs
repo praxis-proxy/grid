@@ -116,9 +116,33 @@ pub(crate) struct RoutingOverlay {
     /// Routing candidates ordered by the operator's sort.
     pub(crate) candidates: Vec<RoutingCandidate>,
 
+    /// Optional local request-selection policy from the Grid operator.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) selection_policy: Option<SelectionPolicy>,
+
     /// RFC 3339 timestamp of when this overlay was rendered.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) generated_at: Option<String>,
+}
+
+/// Selection policy copied without interpretation by overlay-sync.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct SelectionPolicy {
+    /// Selection mode consumed by Praxis.
+    pub(crate) mode: SelectionMode,
+}
+
+/// Wire-level mode validation. Overlay-sync does not choose or execute it.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum SelectionMode {
+    /// Ordered selection.
+    Deterministic,
+    /// Equal local rotation.
+    RoundRobin,
+    /// Local random selection.
+    Random,
 }
 
 /// A single routing candidate.
@@ -166,11 +190,16 @@ pub(crate) struct RoutingCandidate {
     /// Zero-based position in the final sorted overlay.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) rank: Option<u32>,
+
+    /// Producer-assigned active selection group.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) selection_group: Option<u32>,
 }
 
 /// Credential reference projected alongside a routing candidate.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ProjectedCredential {
     /// Authentication strategy.
     pub(crate) strategy: String,
@@ -182,6 +211,7 @@ pub(crate) struct ProjectedCredential {
 /// A reference to a Kubernetes Secret holding a credential value.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ProjectedCredentialRef {
     /// Secret name.
     pub(crate) name: String,

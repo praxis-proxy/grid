@@ -23,7 +23,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use k8s_openapi::api::core::v1::ConfigMap;
 
 use crate::{
-    crd::grid_network::{ClusterEndpointConfig, TransportMode},
+    crd::grid_network::{ClusterEndpointConfig, SelectionMode, TransportMode},
     resources::routing_overlay::{RoutingCandidate, RoutingOverlay},
 };
 
@@ -149,6 +149,7 @@ pub(crate) fn generate_consumer_praxis_config(
     }
 
     let candidates_yaml = render_candidates(&overlay.candidates);
+    let selection_policy_yaml = render_selection_policy(overlay.selection_policy.as_ref());
     let local_site = yaml_scalar(&overlay.local_site)?;
 
     let credential_inject_section = render_credential_inject(&overlay.candidates, credential_mount_base);
@@ -170,6 +171,7 @@ pub(crate) fn generate_consumer_praxis_config(
          \x20     - filter: intelligent_route\n\
          \x20       local_site: {local_site}\n\
          \x20       model_header: \"X-Model\"\n\
+         {selection_policy_yaml}\
          \x20       candidates:\n\
          {candidates_yaml}"
     );
@@ -229,7 +231,24 @@ fn render_candidates(candidates: &[RoutingCandidate]) -> String {
     candidates.iter().map(render_candidate).collect::<Vec<_>>().join("\n")
 }
 
+/// Render the explicit Grid-owned request-selection policy.
+fn render_selection_policy(policy: Option<&crate::crd::grid_network::SelectionPolicyConfig>) -> String {
+    let Some(policy) = policy else {
+        return String::new();
+    };
+    let mode = match policy.mode {
+        SelectionMode::Deterministic => "deterministic",
+        SelectionMode::RoundRobin => "roundRobin",
+        SelectionMode::Random => "random",
+    };
+    format!("         selection_policy:\n           mode: {mode}\n")
+}
+
 /// Render one `intelligent_route` candidate.
+#[expect(
+    clippy::too_many_lines,
+    reason = "Candidate YAML fields are kept together to mirror the wire contract."
+)]
 fn render_candidate(c: &RoutingCandidate) -> String {
     let mut lines = vec![
         format!(
@@ -250,6 +269,15 @@ fn render_candidate(c: &RoutingCandidate) -> String {
         ),
         format!("           fresh: {}", c.fresh),
     ];
+    if let Some(admission) = c.admission_state {
+        lines.push(format!(
+            "           admission_state: {}",
+            serde_json::to_string(&admission).unwrap_or_default()
+        ));
+    }
+    if let Some(group) = c.selection_group {
+        lines.push(format!("           selection_group: {group}"));
+    }
     if let Some(cred) = &c.credential {
         lines.extend(render_credential_reference(cred));
     }
@@ -524,6 +552,7 @@ mod tests {
             score: None,
             score_breakdown: None,
             rank: None,
+            selection_group: None,
         }
     }
 
@@ -556,6 +585,7 @@ mod tests {
             score: None,
             score_breakdown: None,
             rank: None,
+            selection_group: None,
         }
     }
 
@@ -564,6 +594,7 @@ mod tests {
             network: "test-net".to_owned(),
             local_site: "site-a".to_owned(),
             candidates,
+            selection_policy: None,
             generated_at: None,
         }
     }
@@ -626,12 +657,32 @@ mod tests {
     }
 
     #[test]
+    fn explicit_selection_policy_reaches_intelligent_route_config() {
+        let mut overlay = simple_overlay(vec![plain_candidate(
+            "inference_model",
+            "model",
+            "site-a",
+            "cluster-a",
+            true,
+        )]);
+        overlay.selection_policy = Some(crate::crd::grid_network::SelectionPolicyConfig {
+            mode: SelectionMode::RoundRobin,
+        });
+        let endpoints = endpoint_coverage(&overlay);
+        let config = generate_consumer_praxis_config(&overlay, MOUNT_BASE, &endpoints, "/run/tls", 8080)
+            .unwrap_or_else(|_| std::process::abort());
+        assert!(config.contains("selection_policy:"));
+        assert!(config.contains("mode: roundRobin"));
+    }
+
+    #[test]
     fn generated_praxis_yaml_omits_operator_overlay_metadata() {
         let mut candidate = plain_candidate("inference_model", "model-a", "site-a", "gateway-site-a", true);
         candidate.stable_id = Some("abcd1234".to_owned());
         candidate.admission_state = Some(AdmissionState::NewAndExisting);
         candidate.selection_tier = Some(LocalityTier::SameSite);
         candidate.rank = Some(0);
+        candidate.selection_group = Some(0);
 
         let mut overlay = simple_overlay(vec![candidate]);
         overlay.generated_at = Some("2026-07-24T12:00:00Z".to_owned());
@@ -645,12 +696,14 @@ mod tests {
         )
         .unwrap();
 
-        for forbidden in ["stable_id", "admission_state", "selection_tier", "rank", "generated_at"] {
+        for forbidden in ["stable_id", "selection_tier", "rank", "generated_at"] {
             assert!(
                 !yaml.contains(forbidden),
                 "operator-only metadata field {forbidden} must not enter generated Praxis YAML"
             );
         }
+        assert!(yaml.contains("admission_state: \"new_and_existing\""));
+        assert!(yaml.contains("selection_group: 0"));
     }
 
     #[test]
@@ -931,6 +984,7 @@ mod tests {
             network: "n".to_owned(),
             local_site: String::new(),
             candidates: vec![],
+            selection_policy: None,
             generated_at: None,
         };
         assert!(

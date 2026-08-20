@@ -9,6 +9,9 @@
 - [Routing](architecture/routing.md) — versioned overlay contract, revision
   lifecycle, candidate ordering, `intelligent_route`, `peer_identity_trust`, and
   provider-side request forwarding.
+- [Provider Selection and Load Balancing](architecture/provider-selection-and-load-balancing.md) —
+  eligibility, routing groups, scoring, selection modes, affinity, and
+  overlay lifecycle.
 - [Scoring](architecture/scoring.md) — operator-side candidate scoring,
   metrics input, and request-time scoring boundaries.
 - [Auth and Policy](architecture/auth.md) — provider authentication strategies,
