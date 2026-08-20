@@ -32,6 +32,12 @@ llm-d / EPP / inference backend
 
 Grid does not proxy traffic. It writes the overlay used by Praxis filters.
 
+For the complete provider-selection model, including selection groups and the
+`deterministic`, `roundRobin`, and `random` modes, see [Provider Selection
+and Load Balancing](provider-selection-and-load-balancing.md). Routing policy
+defines candidate ordering and hard group boundaries; selection policy controls
+request distribution within the first viable group.
+
 ## Control-plane rendering path
 
 For each `GridNetwork` and gateway reference, the operator:
@@ -363,8 +369,8 @@ The operator orders candidates before writing the overlay. Ordering proceeds
 in two phases:
 
 1. **Scoring.** Each provider is scored by `scoring::score_backends` using
-   the weights selected by `GridNetwork.spec.scoringPolicy.strategy`,
-   optional live metrics, and optional CRDT-propagated provider metrics.
+   the signal selected by `GridNetwork.spec.scoringPolicy.strategy`, optional
+   live metrics, and optional CRDT-propagated provider metrics.
    Providers with no live metrics use neutral metric scores.
    See [Scoring](scoring.md) for the available strategies.
 
@@ -375,7 +381,7 @@ in two phases:
 
    | Policy | Order |
    |---|---|
-   | `geographyFirst` (default) | admission, locality, score descending, freshness, deterministic tie-break |
+   | `geographyFirst` (default) | admission, locality, freshness, score descending, deterministic tie-break |
    | `scoreFirst` | admission, freshness, score descending, locality, deterministic tie-break |
 
    The deterministic tie-break is `(site, name, cluster)`. After

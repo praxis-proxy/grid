@@ -95,8 +95,10 @@ mod tests {
                     score: None,
                     score_breakdown: None,
                     rank: None,
+                    selection_group: None,
                 })
                 .collect(),
+            selection_policy: None,
             generated_at: None,
         }
     }

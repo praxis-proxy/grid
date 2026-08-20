@@ -32,6 +32,15 @@ tests:
           path: spec.gridId
           value: ""
 
+  - it: defaults a new GridNetwork to roundRobin selection
+    set:
+      gridNetwork.name: prod-grid
+      gridSite.name: prod-site
+    asserts:
+      - equal:
+          path: spec.selectionPolicy.mode
+          value: roundRobin
+
   - it: renders budgetPolicy.tenants verbatim when set
     set:
       gridNetwork.name: prod-grid
