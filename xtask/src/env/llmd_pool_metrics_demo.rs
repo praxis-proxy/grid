@@ -125,7 +125,7 @@ const DEFAULT_GATEWAY_IMAGE: &str = "ghcr.io/praxis-proxy/grid-ai-rollup:v0.1.3"
 const DEFAULT_OPERATOR_IMAGE: &str = "ghcr.io/praxis-proxy/grid-operator:v0.1.3";
 
 /// Default EPP image reference required by this demo.
-const DEFAULT_EPP_IMAGE: &str = "ghcr.io/llm-d/llm-d-inference-scheduler:v0.8.0";
+const DEFAULT_EPP_IMAGE: &str = "ghcr.io/llm-d/llm-d-router-endpoint-picker:v0.9.0";
 
 /// Default vllm-vcr image reference required by this demo.
 const DEFAULT_VCR_IMAGE: &str = "ghcr.io/neuralmagic/vllm-vcr:vllm0.23";
@@ -836,11 +836,14 @@ fn proof_provenance(mtls: bool) -> ProofResult {
         let deadline = Instant::now() + Duration::from_secs(30);
         while Instant::now() < deadline {
             if let Ok(metrics_text) = kubectl_exec_epp_metrics(cluster, mtls) {
-                let has_kv = metrics_text.contains("inference_pool_average_kv_cache_utilization")
+                let has_kv = metrics_text.contains("llm_d_epp_average_kv_cache_utilization")
+                    || metrics_text.contains("inference_pool_average_kv_cache_utilization")
                     || metrics_text.contains("llm_d_router_epp_average_kv_cache_utilization");
-                let has_queue = metrics_text.contains("inference_pool_average_queue_size")
+                let has_queue = metrics_text.contains("llm_d_epp_average_queue_size")
+                    || metrics_text.contains("inference_pool_average_queue_size")
                     || metrics_text.contains("llm_d_router_epp_average_queue_size");
-                let has_ready = metrics_text.contains("inference_pool_ready_pods")
+                let has_ready = metrics_text.contains("llm_d_epp_ready_endpoints")
+                    || metrics_text.contains("inference_pool_ready_pods")
                     || metrics_text.contains("llm_d_router_epp_ready_endpoints");
                 if has_kv && has_queue && has_ready {
                     observations.push(format!("{cluster}: all 3 EPP pool metrics present"));
@@ -1392,17 +1395,16 @@ fn scrape_epp_metrics(cluster: &str, mtls: bool) -> EppMetrics {
 /// [`scrape_epp_metrics`], separated out so metric-name-fallback behavior is
 /// unit-testable without a live EPP).
 ///
-/// Both `queue_size` and `kv_cache` fall back from the `inference_pool_*`
-/// series to the `llm_d_router_epp_*` series symmetrically -- an EPP build
-/// that only exposes the latter must not silently read `kv_cache` as a
-/// permanent 0.0, which would make a `kvCachePressure` run's pressure phase
-/// never announce despite real KV pressure driving the flip.
+/// Both `queue_size` and `kv_cache` prefer the canonical `llm_d_epp_*`
+/// series and fall back symmetrically to the legacy metric names.
 fn parse_epp_metrics(text: &str) -> EppMetrics {
     EppMetrics {
-        queue_size: extract_prom_value(text, "inference_pool_average_queue_size")
+        queue_size: extract_prom_value(text, "llm_d_epp_average_queue_size")
+            .or_else(|| extract_prom_value(text, "inference_pool_average_queue_size"))
             .or_else(|| extract_prom_value(text, "llm_d_router_epp_average_queue_size"))
             .unwrap_or(0.0),
-        kv_cache: extract_prom_value(text, "inference_pool_average_kv_cache_utilization")
+        kv_cache: extract_prom_value(text, "llm_d_epp_average_kv_cache_utilization")
+            .or_else(|| extract_prom_value(text, "inference_pool_average_kv_cache_utilization"))
             .or_else(|| extract_prom_value(text, "llm_d_router_epp_average_kv_cache_utilization"))
             .unwrap_or(0.0),
     }
@@ -3838,12 +3840,24 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
 
     #[test]
     #[expect(clippy::float_cmp, reason = "exact literal round-trips in test assertions")]
-    fn parse_epp_metrics_prefers_primary_metric_names() {
-        let text = "inference_pool_average_queue_size{name=\"pool-a\"} 4.5\n\
-                     inference_pool_average_kv_cache_utilization{name=\"pool-a\"} 0.35\n";
+    fn parse_epp_metrics_prefers_llm_d_epp_metric_names() {
+        let text = "llm_d_epp_average_queue_size{name=\"pool-a\"} 4.5\n\
+                     llm_d_epp_average_kv_cache_utilization{name=\"pool-a\"} 0.35\n\
+                     inference_pool_average_queue_size{name=\"pool-a\"} 7.0\n\
+                     inference_pool_average_kv_cache_utilization{name=\"pool-a\"} 0.70\n";
         let epp = parse_epp_metrics(text);
         assert_eq!(epp.queue_size, 4.5);
         assert_eq!(epp.kv_cache, 0.35);
+    }
+
+    #[test]
+    #[expect(clippy::float_cmp, reason = "exact literal round-trips in test assertions")]
+    fn parse_epp_metrics_falls_back_to_inference_pool_metric_names() {
+        let text = "inference_pool_average_queue_size{name=\"pool-a\"} 5.0\n\
+                     inference_pool_average_kv_cache_utilization{name=\"pool-a\"} 0.40\n";
+        let epp = parse_epp_metrics(text);
+        assert_eq!(epp.queue_size, 5.0);
+        assert_eq!(epp.kv_cache, 0.40);
     }
 
     #[test]
