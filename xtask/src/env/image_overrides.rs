@@ -29,6 +29,9 @@ const VCR_IMAGE_ENV: &str = "GRID_XTASK_VCR_IMAGE";
 /// Environment variable to override the operator image.
 const OPERATOR_IMAGE_ENV: &str = "GRID_XTASK_OPERATOR_IMAGE";
 
+/// Environment variable to override the overlay-sync image.
+const OVERLAY_SYNC_IMAGE_ENV: &str = "GRID_XTASK_OVERLAY_SYNC_IMAGE";
+
 /// Environment variable to override the image pull policy.
 const IMAGE_PULL_POLICY_ENV: &str = "GRID_XTASK_IMAGE_PULL_POLICY";
 
@@ -47,6 +50,9 @@ const DEFAULT_MOCK_PROVIDER_IMAGE: &str = "grid-mock-providers:latest";
 
 /// Default operator image (matches operator.rs).
 const DEFAULT_OPERATOR_IMAGE: &str = "grid-operator:latest";
+
+/// Default overlay-sync image used by overlay-enabled demo gateways.
+const DEFAULT_OVERLAY_SYNC_IMAGE: &str = "grid-overlay-sync:latest";
 
 /// Default gateway image used by the GLB demo.
 const DEFAULT_GLB_GATEWAY_IMAGE: &str = "ghcr.io/praxis-proxy/grid-ai-rollup:v0.1.3";
@@ -94,6 +100,11 @@ pub(crate) fn mock_provider_image() -> String {
 /// Get the operator image name, respecting environment overrides.
 pub(crate) fn operator_image() -> String {
     env::var(OPERATOR_IMAGE_ENV).unwrap_or_else(|_| DEFAULT_OPERATOR_IMAGE.to_owned())
+}
+
+/// Get the overlay-sync image name, respecting environment overrides.
+pub(crate) fn overlay_sync_image() -> String {
+    env::var(OVERLAY_SYNC_IMAGE_ENV).unwrap_or_else(|_| DEFAULT_OVERLAY_SYNC_IMAGE.to_owned())
 }
 
 /// Get the VCR image name, respecting environment overrides.

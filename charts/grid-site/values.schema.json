@@ -71,6 +71,17 @@
             }
           }
         },
+        "selectionPolicy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode"],
+          "properties": {
+            "mode": {
+              "type": "string",
+              "enum": ["deterministic", "roundRobin", "random"]
+            }
+          }
+        },
         "metricsRefreshInterval": {
           "type": "string",
           "pattern": "^([1-9][0-9]*s|[1-9][0-9]{3,}ms)$"

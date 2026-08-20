@@ -4,9 +4,9 @@
 //!
 //! Wraps a routing overlay in a versioned envelope with a SHA-256 digest
 //! computed over the [RFC 8785][] canonical form of the semantic payload.
-//! The semantic payload includes only routing-relevant fields (`network`,
-//! `local_site`, `candidates`), so the revision changes only when routing
-//! behavior changes — timestamp and provenance changes are no-ops.
+//! The semantic payload includes `network`, `local_site`, and `candidates`,
+//! plus `selection_policy` when present, so the revision changes only when
+//! routing behavior changes — timestamp and provenance changes are no-ops.
 //!
 //! The envelope is published as the `routing-overlay.json` key in the overlay
 //! `ConfigMap`, alongside the `routing-config.json` legacy key.
@@ -182,11 +182,17 @@ pub struct EnvelopeBuildResult {
 /// [`ProjectedCredentialRef`]: super::routing_overlay::ProjectedCredentialRef
 pub fn compute_semantic_digest(overlay: &RoutingOverlay) -> Result<String, serde_json::Error> {
     let candidates_value = serde_json::to_value(&overlay.candidates)?;
-    let semantic_payload = serde_json::json!({
+    let mut semantic_payload = serde_json::json!({
         "candidates": candidates_value,
         "local_site": overlay.local_site,
         "network": overlay.network,
     });
+    if let Some(policy) = &overlay.selection_policy {
+        let Some(object) = semantic_payload.as_object_mut() else {
+            return Err(serde_json::Error::custom("semantic payload must be an object"));
+        };
+        object.insert("selection_policy".to_owned(), serde_json::to_value(policy)?);
+    }
 
     let canonical = serde_json_canonicalizer::to_vec(&semantic_payload).map_err(serde_json::Error::custom)?;
 
@@ -307,7 +313,9 @@ mod tests {
                 score: None,
                 score_breakdown: None,
                 rank: Some(0),
+                selection_group: None,
             }],
+            selection_policy: None,
             generated_at: Some("2026-07-29T00:00:00Z".to_owned()),
         }
     }
@@ -341,6 +349,7 @@ mod tests {
                     score: None,
                     score_breakdown: None,
                     rank: Some(0),
+                    selection_group: None,
                 },
                 RoutingCandidate {
                     kind: "inference_model".to_owned(),
@@ -355,8 +364,10 @@ mod tests {
                     score: None,
                     score_breakdown: None,
                     rank: Some(1),
+                    selection_group: None,
                 },
             ],
+            selection_policy: None,
             generated_at: Some("2026-07-29T01:00:00Z".to_owned()),
         }
     }

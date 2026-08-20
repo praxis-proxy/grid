@@ -1,0 +1,56 @@
+{
+  "schema_version": "1.0.0",
+  "revision": {
+    "kind": "content_addressed",
+    "algorithm": "sha256",
+    "value": "d3321586b5e414b8bd80c07a9d16ac10dce38d6810e3591a8526a6bdd0639007"
+  },
+  "content_digest": {
+    "algorithm": "sha256",
+    "value": "d3321586b5e414b8bd80c07a9d16ac10dce38d6810e3591a8526a6bdd0639007"
+  },
+  "scope": {
+    "network": "test-net",
+    "gateway": "gw",
+    "namespace": "ns",
+    "local_site": "site-a"
+  },
+  "provenance": {
+    "producer": "grid-operator",
+    "producer_version": "0.1.3",
+    "source_name": "test-net",
+    "source_uid": "uid-selection-policy",
+    "source_generation": 1,
+    "rendered_at": "2026-08-12T00:00:00Z"
+  },
+  "overlay": {
+    "network": "test-net",
+    "local_site": "site-a",
+    "selection_policy": {
+      "mode": "roundRobin"
+    },
+    "candidates": [
+      {
+        "kind": "inference_model",
+        "name": "model-a",
+        "site": "site-a",
+        "cluster": "cluster-a",
+        "fresh": true,
+        "stable_id": "abcd1234",
+        "rank": 0,
+        "selection_group": 0
+      },
+      {
+        "kind": "inference_model",
+        "name": "model-b",
+        "site": "site-b",
+        "cluster": "cluster-b",
+        "fresh": true,
+        "stable_id": "efgh5678",
+        "rank": 1,
+        "selection_group": 0
+      }
+    ],
+    "generated_at": "2026-08-12T00:00:00Z"
+  }
+}
