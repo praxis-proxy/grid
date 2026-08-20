@@ -1,0 +1,770 @@
+apiVersion: forge.praxis.dev/v1alpha1
+kind: Environment
+
+metadata:
+  name: grid-token-rate-limit
+
+spec:
+  runtime:
+    provider: docker
+    clusterPrefix: grid-token-rate-limit
+
+  network:
+    crossCluster: true
+    dnsZone: grid-token-rate-limit.test
+
+  clusters:
+    - name: west
+      stacks: [metallb, west-operator-base, vcr-backend, provider-boundary, west-trust-bootstrap, west-site, provider-gateway, valkey, consumer-west-a, consumer-west-b]
+      properties:
+        region: west
+        role: combined
+        siteName: west
+        gatewayImage: "ghcr.io/praxis-proxy/grid-ai-rollup:v0.1.3"
+        operatorImage: "ghcr.io/praxis-proxy/grid-operator:v0.1.3"
+        vcrImage: "ghcr.io/neuralmagic/vllm-vcr:vllm0.23"
+        vcrImagePullPolicy: IfNotPresent
+        imagePullPolicy: IfNotPresent
+        gatewayImageRepo: "ghcr.io/praxis-proxy/grid-ai-rollup"
+        gatewayImageTag: "v0.1.3"
+        operatorImageRepo: "ghcr.io/praxis-proxy/grid-operator"
+        operatorImageTag: "v0.1.3"
+        overlaySyncImageRepo: "ghcr.io/praxis-proxy/grid-overlay-sync"
+        overlaySyncImageTag: "v0.1.3"
+
+    - name: central
+      stacks: [metallb, central-operator-base, vcr-backend, provider-boundary, central-trust-bootstrap, central-site, provider-gateway]
+      properties:
+        region: central
+        role: combined
+        siteName: central
+        gatewayImage: "ghcr.io/praxis-proxy/grid-ai-rollup:v0.1.3"
+        operatorImage: "ghcr.io/praxis-proxy/grid-operator:v0.1.3"
+        vcrImage: "ghcr.io/neuralmagic/vllm-vcr:vllm0.23"
+        vcrImagePullPolicy: IfNotPresent
+        imagePullPolicy: IfNotPresent
+        gatewayImageRepo: "ghcr.io/praxis-proxy/grid-ai-rollup"
+        gatewayImageTag: "v0.1.3"
+        operatorImageRepo: "ghcr.io/praxis-proxy/grid-operator"
+        operatorImageTag: "v0.1.3"
+        overlaySyncImageRepo: "ghcr.io/praxis-proxy/grid-overlay-sync"
+        overlaySyncImageTag: "v0.1.3"
+
+    - name: east
+      stacks: [metallb, east-operator-base, vcr-backend, provider-boundary, east-trust-bootstrap, east-site, provider-gateway]
+      properties:
+        region: east
+        role: combined
+        siteName: east
+        gatewayImage: "ghcr.io/praxis-proxy/grid-ai-rollup:v0.1.3"
+        operatorImage: "ghcr.io/praxis-proxy/grid-operator:v0.1.3"
+        vcrImage: "ghcr.io/neuralmagic/vllm-vcr:vllm0.23"
+        vcrImagePullPolicy: IfNotPresent
+        imagePullPolicy: IfNotPresent
+        gatewayImageRepo: "ghcr.io/praxis-proxy/grid-ai-rollup"
+        gatewayImageTag: "v0.1.3"
+        operatorImageRepo: "ghcr.io/praxis-proxy/grid-operator"
+        operatorImageTag: "v0.1.3"
+        overlaySyncImageRepo: "ghcr.io/praxis-proxy/grid-overlay-sync"
+        overlaySyncImageTag: "v0.1.3"
+
+  stacks:
+    metallb:
+      description: MetalLB load balancer with auto-configured address pool
+      steps:
+        - type: url
+          url: https://raw.githubusercontent.com/metallb/metallb/v0.14.9/config/manifests/metallb-native.yaml
+          sha256: 951065e85692aa106f1bb5d5a487d9306154923a794ab1d82122881cbaf588e4
+        - type: wait
+          resource: deployment/controller
+          namespace: metallb-system
+          condition: available
+          timeout: "120s"
+        - type: metallb-auto-pool
+          name: forge-pool
+
+    west-operator-base:
+      description: West Grid operator initial deployment with SWIM LoadBalancer
+      steps:
+        - type: helm
+          release: grid-operator
+          chart: charts/grid-operator
+          version: "0.1.0"
+          namespace: grid-system
+          values:
+            image:
+              repository: "{{ cluster.properties.operatorImageRepo }}"
+              tag: "{{ cluster.properties.operatorImageTag }}"
+              pullPolicy: "{{ cluster.properties.imagePullPolicy }}"
+            swim:
+              siteName: "west"
+              seeds: ""
+              advertiseAddress: "{{ captures.west.swim-lb-ip }}:7946"
+              service:
+                enabled: true
+                type: "LoadBalancer"
+            gateway:
+              serviceName: "provider-gateway"
+              port: "8443"
+        - type: wait
+          resource: deployment/grid-operator
+          namespace: grid-system
+          condition: available
+          timeout: "120s"
+        - type: capture
+          resource: svc/grid-operator-swim
+          namespace: grid-system
+          jsonpath: "{.status.loadBalancer.ingress[0].ip}"
+          key: swim-lb-ip
+          timeout: "60s"
+          interval: "2s"
+
+    central-operator-base:
+      description: Central Grid operator initial deployment with SWIM LoadBalancer
+      steps:
+        - type: helm
+          release: grid-operator
+          chart: charts/grid-operator
+          version: "0.1.0"
+          namespace: grid-system
+          values:
+            image:
+              repository: "{{ cluster.properties.operatorImageRepo }}"
+              tag: "{{ cluster.properties.operatorImageTag }}"
+              pullPolicy: "{{ cluster.properties.imagePullPolicy }}"
+            swim:
+              siteName: "central"
+              seeds: ""
+              advertiseAddress: "{{ captures.central.swim-lb-ip }}:7946"
+              service:
+                enabled: true
+                type: "LoadBalancer"
+            gateway:
+              serviceName: "provider-gateway"
+              port: "8443"
+        - type: wait
+          resource: deployment/grid-operator
+          namespace: grid-system
+          condition: available
+          timeout: "120s"
+        - type: capture
+          resource: svc/grid-operator-swim
+          namespace: grid-system
+          jsonpath: "{.status.loadBalancer.ingress[0].ip}"
+          key: swim-lb-ip
+          timeout: "60s"
+          interval: "2s"
+
+    east-operator-base:
+      description: East Grid operator initial deployment with SWIM LoadBalancer
+      steps:
+        - type: helm
+          release: grid-operator
+          chart: charts/grid-operator
+          version: "0.1.0"
+          namespace: grid-system
+          values:
+            image:
+              repository: "{{ cluster.properties.operatorImageRepo }}"
+              tag: "{{ cluster.properties.operatorImageTag }}"
+              pullPolicy: "{{ cluster.properties.imagePullPolicy }}"
+            swim:
+              siteName: "east"
+              seeds: ""
+              advertiseAddress: "{{ captures.east.swim-lb-ip }}:7946"
+              service:
+                enabled: true
+                type: "LoadBalancer"
+            gateway:
+              serviceName: "provider-gateway"
+              port: "8443"
+        - type: wait
+          resource: deployment/grid-operator
+          namespace: grid-system
+          condition: available
+          timeout: "120s"
+        - type: capture
+          resource: svc/grid-operator-swim
+          namespace: grid-system
+          jsonpath: "{.status.loadBalancer.ingress[0].ip}"
+          key: swim-lb-ip
+          timeout: "60s"
+          interval: "2s"
+
+    vcr-backend:
+      description: vllm-vcr inference backend for demo scenarios
+      steps:
+        - type: manifest
+          path: resources/common/grid-system-namespace.yaml
+        - type: template-manifest
+          path: resources/common/vcr-provider-workload.yaml
+        - type: manifest
+          path: resources/common/backend-network-policy.yaml
+        - type: wait
+          resource: deployment/vcr-inference-{{ cluster.name }}
+          namespace: grid-system
+          condition: available
+          timeout: "120s"
+
+    provider-boundary:
+      description: mTLS, provider credential, and provider gateway configuration bootstrap
+      steps:
+        - type: template-file
+          source: configs/provider/praxis.yaml
+          target: .forge/runtime/{{ cluster.name }}/provider/praxis.yaml
+        - type: exec
+          command:
+            - bash
+            - -c
+            - >-
+              context=kind-grid-token-rate-limit-{{ cluster.name }};
+              kubectl --context "$context" -n grid-system create secret generic consumer-gateway-tls
+              --from-file=tls.crt=tests/env/certs/{{ cluster.name }}-cert.pem
+              --from-file=tls.key=tests/env/certs/{{ cluster.name }}-key.pem
+              --from-file=ca.crt=tests/env/certs/ca.pem --dry-run=client -o yaml |
+              kubectl --context "$context" apply -f -;
+              kubectl --context "$context" -n grid-system create secret generic provider-gateway-tls
+              --from-file=tls.crt=tests/env/certs/{{ cluster.name }}-cert.pem
+              --from-file=tls.key=tests/env/certs/{{ cluster.name }}-key.pem
+              --from-file=ca.crt=tests/env/certs/ca.pem --dry-run=client -o yaml |
+              kubectl --context "$context" apply -f -;
+              kubectl --context "$context" -n grid-system create secret generic vcr-inference-credential
+              --from-literal=token="$(openssl rand -hex 32)" --dry-run=client -o yaml |
+              kubectl --context "$context" apply -f -;
+              sed -i -e "s/SITE_PLACEHOLDER/{{ cluster.name }}/g"
+              -e "s/CANDIDATE_ID_PLACEHOLDER/$(case '{{ cluster.name }}' in west) echo f4c20a10;; central) echo c7fa24b0;; east) echo 9d876274;; esac)/g"
+              tests/e2e/topologies/grid-token-rate-limit/.forge/runtime/{{ cluster.name }}/provider/praxis.yaml;
+              kubectl --context "$context" -n grid-system create configmap provider-gateway-config
+              --from-file=praxis.yaml=tests/e2e/topologies/grid-token-rate-limit/.forge/runtime/{{ cluster.name }}/provider/praxis.yaml --dry-run=client -o yaml |
+              kubectl --context "$context" apply -f -
+
+    west-trust-bootstrap:
+      description: Pre-provision verified remote GridSite trust pins for west
+      steps:
+        - type: template-file
+          source: resources/trust/west.yaml
+          target: .forge/runtime/{{ cluster.name }}/trust.yaml
+        - type: exec
+          command:
+            - bash
+            - -c
+            - >-
+              set -euo pipefail;
+              runtime=tests/e2e/topologies/grid-token-rate-limit/.forge/runtime/{{ cluster.name }}/trust.yaml;
+              central=$(kubectl --context kind-grid-token-rate-limit-central -n grid-system get secret provider-gateway-tls -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -outform DER | sha256sum | awk '{print $1}');
+              east=$(kubectl --context kind-grid-token-rate-limit-east -n grid-system get secret provider-gateway-tls -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -outform DER | sha256sum | awk '{print $1}');
+              sed -i "s/PEER_CENTRAL_FINGERPRINT/${central}/g; s/PEER_EAST_FINGERPRINT/${east}/g" "$runtime";
+              kubectl --context kind-grid-token-rate-limit-{{ cluster.name }} apply -f "$runtime"
+
+    central-trust-bootstrap:
+      description: Pre-provision verified remote GridSite trust pins for central
+      steps:
+        - type: template-file
+          source: resources/trust/central.yaml
+          target: .forge/runtime/{{ cluster.name }}/trust.yaml
+        - type: exec
+          command:
+            - bash
+            - -c
+            - >-
+              set -euo pipefail;
+              runtime=tests/e2e/topologies/grid-token-rate-limit/.forge/runtime/{{ cluster.name }}/trust.yaml;
+              west=$(kubectl --context kind-grid-token-rate-limit-west -n grid-system get secret provider-gateway-tls -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -outform DER | sha256sum | awk '{print $1}');
+              east=$(kubectl --context kind-grid-token-rate-limit-east -n grid-system get secret provider-gateway-tls -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -outform DER | sha256sum | awk '{print $1}');
+              sed -i "s/PEER_WEST_FINGERPRINT/${west}/g; s/PEER_EAST_FINGERPRINT/${east}/g" "$runtime";
+              kubectl --context kind-grid-token-rate-limit-{{ cluster.name }} apply -f "$runtime"
+
+    east-trust-bootstrap:
+      description: Pre-provision verified remote GridSite trust pins for east
+      steps:
+        - type: template-file
+          source: resources/trust/east.yaml
+          target: .forge/runtime/{{ cluster.name }}/trust.yaml
+        - type: exec
+          command:
+            - bash
+            - -c
+            - >-
+              set -euo pipefail;
+              runtime=tests/e2e/topologies/grid-token-rate-limit/.forge/runtime/{{ cluster.name }}/trust.yaml;
+              west=$(kubectl --context kind-grid-token-rate-limit-west -n grid-system get secret provider-gateway-tls -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -outform DER | sha256sum | awk '{print $1}');
+              central=$(kubectl --context kind-grid-token-rate-limit-central -n grid-system get secret provider-gateway-tls -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -outform DER | sha256sum | awk '{print $1}');
+              sed -i "s/PEER_WEST_FINGERPRINT/${west}/g; s/PEER_CENTRAL_FINGERPRINT/${central}/g" "$runtime";
+              kubectl --context kind-grid-token-rate-limit-{{ cluster.name }} apply -f "$runtime"
+
+    west-site:
+      description: West combined site with Grid CRs via grid-site chart
+      steps:
+        - type: helm
+          release: grid-site
+          chart: charts/grid-site
+          version: "0.1.0"
+          namespace: grid-system
+          values:
+            commonLabels:
+              grid.praxis-proxy.io/auto-discover-sites: "true"
+            gridNetwork:
+              name: grid-token-rate-limit
+              gridId: grid-token-rate-limit-v1
+              region: west
+              zone: west-1
+              routingPolicy: scoreFirst
+              scoringPolicy:
+                strategy: noMetrics
+              selectionPolicy:
+                mode: roundRobin
+              seeds:
+                - "{{ captures.central.swim-lb-ip }}:7946"
+                - "{{ captures.east.swim-lb-ip }}:7946"
+              swim:
+                probeInterval: "5s"
+                suspicionTimeout: "15s"
+                gossipNodes: 3
+              tls:
+                caSecretRef:
+                  name: consumer-gateway-tls
+                  namespace: grid-system
+                siteSecretRef:
+                  name: consumer-gateway-tls
+                  namespace: grid-system
+              gatewayRefs:
+                - name: consumer-gateway-a
+                  namespace: grid-system
+                  localSiteName: west
+                - name: consumer-gateway-b
+                  namespace: grid-system
+                  localSiteName: west
+            gridSite:
+              name: west
+              region: west
+              zone: west-1
+              providerSiteLabel: west
+            inferenceProviders:
+              - name: vcr-west-provider
+                gridNetworkRef: grid-token-rate-limit
+                providerKind: vllm-vcr
+                backendKind: local
+                endpoint: "http://vcr-inference-west.grid-system.svc.cluster.local:8000"
+                siteSelector:
+                  matchLabels:
+                    grid.praxis-proxy.io/provider-site: west
+                accessPolicy:
+                  siteSelector:
+                    matchLabels: {}
+                models:
+                  - name: Qwen/Qwen3-0.6B
+                    capabilities:
+                      - text_generation
+                    contextWindow: 4096
+                healthCheck:
+                  path: /health
+                  interval: "30s"
+                  timeout: "5s"
+
+    central-site:
+      description: Central combined site with Grid CRs via grid-site chart
+      steps:
+        - type: helm
+          release: grid-site
+          chart: charts/grid-site
+          version: "0.1.0"
+          namespace: grid-system
+          values:
+            commonLabels:
+              grid.praxis-proxy.io/auto-discover-sites: "true"
+            gridNetwork:
+              name: grid-token-rate-limit
+              gridId: grid-token-rate-limit-v1
+              region: central
+              zone: central-1
+              routingPolicy: scoreFirst
+              scoringPolicy:
+                strategy: noMetrics
+              selectionPolicy:
+                mode: roundRobin
+              seeds:
+                - "{{ captures.west.swim-lb-ip }}:7946"
+                - "{{ captures.east.swim-lb-ip }}:7946"
+              swim:
+                probeInterval: "5s"
+                suspicionTimeout: "15s"
+                gossipNodes: 3
+              tls:
+                caSecretRef:
+                  name: consumer-gateway-tls
+                  namespace: grid-system
+                siteSecretRef:
+                  name: consumer-gateway-tls
+                  namespace: grid-system
+              gatewayRefs:
+                - name: provider-gateway
+                  namespace: grid-system
+                  localSiteName: central
+            gridSite:
+              name: central
+              region: central
+              zone: central-1
+              providerSiteLabel: central
+            inferenceProviders:
+              - name: vcr-central-provider
+                gridNetworkRef: grid-token-rate-limit
+                providerKind: vllm-vcr
+                backendKind: local
+                endpoint: "http://vcr-inference-central.grid-system.svc.cluster.local:8000"
+                siteSelector:
+                  matchLabels:
+                    grid.praxis-proxy.io/provider-site: central
+                accessPolicy:
+                  siteSelector:
+                    matchLabels: {}
+                models:
+                  - name: Qwen/Qwen3-0.6B
+                    capabilities:
+                      - text_generation
+                    contextWindow: 4096
+                healthCheck:
+                  path: /health
+                  interval: "30s"
+                  timeout: "5s"
+
+    east-site:
+      description: East combined site with Grid CRs via grid-site chart
+      steps:
+        - type: helm
+          release: grid-site
+          chart: charts/grid-site
+          version: "0.1.0"
+          namespace: grid-system
+          values:
+            commonLabels:
+              grid.praxis-proxy.io/auto-discover-sites: "true"
+            gridNetwork:
+              name: grid-token-rate-limit
+              gridId: grid-token-rate-limit-v1
+              region: east
+              zone: east-1
+              routingPolicy: scoreFirst
+              scoringPolicy:
+                strategy: noMetrics
+              selectionPolicy:
+                mode: roundRobin
+              seeds:
+                - "{{ captures.west.swim-lb-ip }}:7946"
+                - "{{ captures.central.swim-lb-ip }}:7946"
+              swim:
+                probeInterval: "5s"
+                suspicionTimeout: "15s"
+                gossipNodes: 3
+              tls:
+                caSecretRef:
+                  name: consumer-gateway-tls
+                  namespace: grid-system
+                siteSecretRef:
+                  name: consumer-gateway-tls
+                  namespace: grid-system
+              gatewayRefs:
+                - name: provider-gateway
+                  namespace: grid-system
+                  localSiteName: east
+            gridSite:
+              name: east
+              region: east
+              zone: east-1
+              providerSiteLabel: east
+            inferenceProviders:
+              - name: vcr-east-provider
+                gridNetworkRef: grid-token-rate-limit
+                providerKind: vllm-vcr
+                backendKind: local
+                endpoint: "http://vcr-inference-east.grid-system.svc.cluster.local:8000"
+                siteSelector:
+                  matchLabels:
+                    grid.praxis-proxy.io/provider-site: east
+                accessPolicy:
+                  siteSelector:
+                    matchLabels: {}
+                models:
+                  - name: Qwen/Qwen3-0.6B
+                    capabilities:
+                      - text_generation
+                    contextWindow: 4096
+                healthCheck:
+                  path: /health
+                  interval: "30s"
+                  timeout: "5s"
+
+    provider-gateway:
+      description: Praxis provider gateway with mTLS and credential mounts
+      steps:
+        - type: helm
+          release: provider-gateway
+          chart: charts/praxis-gateway
+          version: "0.1.0"
+          namespace: grid-system
+          values:
+            fullnameOverride: "provider-gateway"
+            image:
+              repository: "{{ cluster.properties.gatewayImageRepo }}"
+              tag: "{{ cluster.properties.gatewayImageTag }}"
+              pullPolicy: "{{ cluster.properties.imagePullPolicy }}"
+            podSecurityContext:
+              runAsUser: 100
+              runAsGroup: 101
+            resources:
+              requests:
+                cpu: 100m
+                memory: 64Mi
+              limits:
+                cpu: 500m
+                memory: 256Mi
+            config:
+              existingConfigMap: "provider-gateway-config"
+            port:
+              containerPort: 8443
+              name: "https-mtls"
+            service:
+              type: "LoadBalancer"
+              port: 8443
+            health:
+              readiness:
+                tcpSocket:
+                  port: "https-mtls"
+                initialDelaySeconds: 3
+                periodSeconds: 5
+              liveness:
+                tcpSocket:
+                  port: "https-mtls"
+                initialDelaySeconds: 5
+                periodSeconds: 10
+            tls:
+              enabled: true
+              existingSecret: "provider-gateway-tls"
+            credentials:
+              - name: "vcr-inference-credential"
+                mountPath: "/etc/praxis/credentials/vcr-inference"
+            podLabels:
+              grid.praxis-proxy.io/backend-access: "provider-gateway"
+              grid.praxis-proxy.io/provider-site: "{{ cluster.name }}"
+        - type: wait
+          resource: deployment/provider-gateway
+          namespace: grid-system
+          condition: available
+          timeout: "120s"
+        - type: capture
+          resource: svc/provider-gateway
+          namespace: grid-system
+          jsonpath: "{.status.loadBalancer.ingress[0].ip}"
+          key: provider-gateway-ip
+          timeout: "60s"
+          interval: "2s"
+
+    consumer-gateway:
+      description: Praxis consumer gateway with operator-managed overlay
+      steps:
+        - type: template-file
+          source: configs/consumer/praxis.yaml
+          target: .forge/runtime/{{ cluster.name }}/consumer/praxis.yaml
+        - type: exec
+          command:
+            - bash
+            - -c
+            - >-
+              kubectl --context kind-grid-token-rate-limit-{{ cluster.name }} -n grid-system
+              create configmap consumer-gateway-config
+              --from-file=praxis.yaml=tests/e2e/topologies/grid-token-rate-limit/.forge/runtime/{{ cluster.name }}/consumer/praxis.yaml
+              --dry-run=client -o yaml |
+              kubectl --context kind-grid-token-rate-limit-{{ cluster.name }} apply -f -
+        - type: helm
+          release: consumer-gateway
+          chart: charts/praxis-gateway
+          version: "0.1.0"
+          namespace: grid-system
+          values:
+            fullnameOverride: "consumer-gateway"
+            image:
+              repository: "{{ cluster.properties.gatewayImageRepo }}"
+              tag: "{{ cluster.properties.gatewayImageTag }}"
+              pullPolicy: "{{ cluster.properties.imagePullPolicy }}"
+            podSecurityContext:
+              runAsUser: 100
+              runAsGroup: 101
+            resources:
+              requests:
+                cpu: 100m
+                memory: 64Mi
+              limits:
+                cpu: 500m
+                memory: 256Mi
+            config:
+              existingConfigMap: "consumer-gateway-config"
+            service:
+              type: "LoadBalancer"
+            overlay:
+              enabled: true
+              existingConfigMap: "grid-overlay-grid-token-rate-limit-consumer-gateway"
+              sidecar:
+                enabled: true
+                image:
+                  repository: "{{ cluster.properties.overlaySyncImageRepo }}"
+                  tag: "{{ cluster.properties.overlaySyncImageTag }}"
+                  pullPolicy: "{{ cluster.properties.imagePullPolicy }}"
+                expectedNetwork: "grid-token-rate-limit"
+                expectedLocalSite: "{{ cluster.name }}"
+            tls:
+              enabled: true
+              existingSecret: "consumer-gateway-tls"
+            podLabels:
+              grid.praxis-proxy.io/consumer-site: "{{ cluster.name }}"
+        - type: wait
+          resource: deployment/consumer-gateway
+          namespace: grid-system
+          condition: available
+          timeout: "120s"
+        - type: capture
+          resource: svc/consumer-gateway
+          namespace: grid-system
+          jsonpath: "{.status.loadBalancer.ingress[0].ip}"
+          key: consumer-gateway-ip
+          timeout: "60s"
+          interval: "2s"
+
+    valkey:
+      description: Private shared Valkey quota state for the west consumers
+      steps:
+        - type: manifest
+          path: resources/common/valkey.yaml
+        - type: wait
+          resource: deployment/valkey
+          namespace: grid-system
+          condition: available
+          timeout: "120s"
+
+    consumer-west-a:
+      description: West consumer A using shared Valkey quota state
+      steps:
+        - type: template-file
+          source: configs/consumer/praxis-valkey-a.yaml
+          target: .forge/runtime/{{ cluster.name }}/consumer-a/praxis.yaml
+        - type: exec
+          command:
+            - bash
+            - -c
+            - >-
+              kubectl --context kind-grid-token-rate-limit-{{ cluster.name }} -n grid-system
+              create configmap consumer-gateway-a-config
+              --from-file=praxis.yaml=tests/e2e/topologies/grid-token-rate-limit/.forge/runtime/{{ cluster.name }}/consumer-a/praxis.yaml
+              --dry-run=client -o yaml |
+              kubectl --context kind-grid-token-rate-limit-{{ cluster.name }} apply -f -
+        - type: helm
+          release: consumer-gateway-a
+          chart: charts/praxis-gateway
+          version: "0.1.0"
+          namespace: grid-system
+          values:
+            fullnameOverride: "consumer-gateway-a"
+            image:
+              repository: "{{ cluster.properties.gatewayImageRepo }}"
+              tag: "{{ cluster.properties.gatewayImageTag }}"
+              pullPolicy: "{{ cluster.properties.imagePullPolicy }}"
+            podSecurityContext:
+              runAsUser: 100
+              runAsGroup: 101
+            resources:
+              requests: { cpu: 100m, memory: 64Mi }
+              limits: { cpu: 500m, memory: 256Mi }
+            config:
+              existingConfigMap: "consumer-gateway-a-config"
+            env:
+              - name: TOKEN_RATE_LIMIT_VALKEY_URL
+                valueFrom:
+                  secretKeyRef:
+                    name: valkey-auth
+                    key: url
+            service: { type: LoadBalancer }
+            overlay:
+              enabled: true
+              existingConfigMap: "grid-overlay-grid-token-rate-limit-consumer-gateway-a"
+              sidecar:
+                enabled: true
+                image:
+                  repository: "{{ cluster.properties.overlaySyncImageRepo }}"
+                  tag: "{{ cluster.properties.overlaySyncImageTag }}"
+                  pullPolicy: "{{ cluster.properties.imagePullPolicy }}"
+                expectedNetwork: "grid-token-rate-limit"
+                expectedLocalSite: "{{ cluster.name }}"
+            tls:
+              enabled: true
+              existingSecret: consumer-gateway-tls
+            podLabels:
+              grid.praxis-proxy.io/consumer-site: "{{ cluster.name }}"
+              grid.praxis-proxy.io/quota-client: "true"
+        - type: wait
+          resource: deployment/consumer-gateway-a
+          namespace: grid-system
+          condition: available
+          timeout: "120s"
+
+    consumer-west-b:
+      description: West consumer B using shared Valkey quota state
+      steps:
+        - type: template-file
+          source: configs/consumer/praxis-valkey-b.yaml
+          target: .forge/runtime/{{ cluster.name }}/consumer-b/praxis.yaml
+        - type: exec
+          command:
+            - bash
+            - -c
+            - >-
+              kubectl --context kind-grid-token-rate-limit-{{ cluster.name }} -n grid-system
+              create configmap consumer-gateway-b-config
+              --from-file=praxis.yaml=tests/e2e/topologies/grid-token-rate-limit/.forge/runtime/{{ cluster.name }}/consumer-b/praxis.yaml
+              --dry-run=client -o yaml |
+              kubectl --context kind-grid-token-rate-limit-{{ cluster.name }} apply -f -
+        - type: helm
+          release: consumer-gateway-b
+          chart: charts/praxis-gateway
+          version: "0.1.0"
+          namespace: grid-system
+          values:
+            fullnameOverride: "consumer-gateway-b"
+            image:
+              repository: "{{ cluster.properties.gatewayImageRepo }}"
+              tag: "{{ cluster.properties.gatewayImageTag }}"
+              pullPolicy: "{{ cluster.properties.imagePullPolicy }}"
+            podSecurityContext:
+              runAsUser: 100
+              runAsGroup: 101
+            resources:
+              requests: { cpu: 100m, memory: 64Mi }
+              limits: { cpu: 500m, memory: 256Mi }
+            config:
+              existingConfigMap: "consumer-gateway-b-config"
+            env:
+              - name: TOKEN_RATE_LIMIT_VALKEY_URL
+                valueFrom:
+                  secretKeyRef:
+                    name: valkey-auth
+                    key: url
+            service: { type: LoadBalancer }
+            overlay:
+              enabled: true
+              existingConfigMap: "grid-overlay-grid-token-rate-limit-consumer-gateway-b"
+              sidecar:
+                enabled: true
+                image:
+                  repository: "{{ cluster.properties.overlaySyncImageRepo }}"
+                  tag: "{{ cluster.properties.overlaySyncImageTag }}"
+                  pullPolicy: "{{ cluster.properties.imagePullPolicy }}"
+                expectedNetwork: "grid-token-rate-limit"
+                expectedLocalSite: "{{ cluster.name }}"
+            tls:
+              enabled: true
+              existingSecret: consumer-gateway-tls
+            podLabels:
+              grid.praxis-proxy.io/consumer-site: "{{ cluster.name }}"
+              grid.praxis-proxy.io/quota-client: "true"
+        - type: wait
+          resource: deployment/consumer-gateway-b
+          namespace: grid-system
+          condition: available
+          timeout: "120s"

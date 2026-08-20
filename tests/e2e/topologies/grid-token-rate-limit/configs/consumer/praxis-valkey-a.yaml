@@ -1,0 +1,134 @@
+listeners:
+  - name: proxy
+    address: "0.0.0.0:8080"
+    filter_chains:
+      - main
+
+filter_chains:
+  - name: main
+    filters:
+      - filter: basic_auth
+        realm: "Grid token-rate-limit demo"
+        strip_authorization: true
+        credentials:
+          - username: alice
+            password: alice-secret
+          - username: bob
+            password: bob-secret
+      - filter: token_rate_limit
+        key:
+          principal:
+            source: metadata
+            name: identity.user_id
+            onMissing: reject
+          model:
+            source: header
+            name: x-model
+            onMissing: reject
+            allowedModels:
+              - Qwen/Qwen3-0.6B
+        reservationTimeout: 2m
+        backend:
+          kind: valkey
+          url: "${TOKEN_RATE_LIMIT_VALKEY_URL}"
+          namespace: praxis:token-rate-limit:v1
+        limits:
+          maxKeys: 32
+          maxKeyLength: 256
+          maxActiveReservations: 16
+        rules:
+          - name: alice
+            match:
+              metadata:
+                identity.user_id: alice
+            estimation:
+              strategy: fixed
+              tokens: 5
+            token_budgets:
+              - window: 1m
+                capacity: 60
+          - name: bob
+            match:
+              metadata:
+                identity.user_id: bob
+            estimation:
+              strategy: fixed
+              tokens: 5
+            token_budgets:
+              - window: 10m
+                capacity: 5000
+          - name: default
+            estimation:
+              strategy: fixed
+              tokens: 5
+            token_budgets:
+              - window: 10m
+                capacity: 5000
+      - filter: json_body_field
+        field: model
+        header: X-Model
+      - filter: headers
+        response_set:
+          - name: X-Grid-Combined-Consumer-Gateway
+            value: "{{ cluster.name }}"
+      - filter: intelligent_route
+        overlay_file: /etc/praxis/routing/routing-overlay.json
+        model_header: X-Model
+        provider_hop_clusters:
+          - vcr-west-provider
+          - vcr-central-provider
+          - vcr-east-provider
+        expected_overlay_scope:
+          network: grid-token-rate-limit
+          gateway: consumer-gateway-a
+          namespace: grid-system
+          local_site: "{{ cluster.name }}"
+        reload:
+          enabled: true
+          debounce_ms: 500
+        session_affinity:
+          enabled: true
+          header: X-Session-Id
+          ttl_secs: 3600
+      - filter: token_count
+        provider: openai
+      - filter: load_balancer
+        clusters:
+          - name: vcr-west-provider
+            tls:
+              ca:
+                ca_path: /etc/praxis/tls/ca.crt
+              client_cert:
+                cert_path: /etc/praxis/tls/tls.crt
+                key_path: /etc/praxis/tls/tls.key
+              sni: west.grid.internal
+              verify: true
+            endpoints:
+              - "{{ captures.west.provider-gateway-ip }}:8443"
+          - name: vcr-central-provider
+            tls:
+              ca:
+                ca_path: /etc/praxis/tls/ca.crt
+              client_cert:
+                cert_path: /etc/praxis/tls/tls.crt
+                key_path: /etc/praxis/tls/tls.key
+              sni: central.grid.internal
+              verify: true
+            endpoints:
+              - "{{ captures.central.provider-gateway-ip }}:8443"
+          - name: vcr-east-provider
+            tls:
+              ca:
+                ca_path: /etc/praxis/tls/ca.crt
+              client_cert:
+                cert_path: /etc/praxis/tls/tls.crt
+                key_path: /etc/praxis/tls/tls.key
+              sni: east.grid.internal
+              verify: true
+            endpoints:
+              - "{{ captures.east.provider-gateway-ip }}:8443"
+
+admin:
+  address: "127.0.0.1:9901"
+
+shutdown_timeout_secs: 5

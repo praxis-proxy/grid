@@ -1,0 +1,23 @@
+apiVersion: grid.praxis-proxy.io/v1alpha1
+kind: GridNetwork
+metadata:
+  name: grid-combined-site
+  labels:
+    grid.praxis-proxy.io/auto-discover-sites: "true"
+spec:
+  gridId: grid-combined-site-v1
+  region: central
+  zone: central-1
+  seeds:
+    - "{{ captures.west.swim-lb-ip }}:7946"
+    - "{{ captures.east.swim-lb-ip }}:7946"
+  swim:
+    probeInterval: "5s"
+    suspicionTimeout: "15s"
+    gossipNodes: 3
+  tls:
+    caSecretRef: null
+    siteSecretRef:
+      name: consumer-gateway-tls
+      namespace: grid-system
+    swimKeyRef: null

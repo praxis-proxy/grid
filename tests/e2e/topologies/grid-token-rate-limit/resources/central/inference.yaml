@@ -1,0 +1,23 @@
+apiVersion: grid.praxis-proxy.io/v1alpha1
+kind: InferenceProvider
+metadata:
+  name: vcr-central-provider
+spec:
+  gridNetworkRef: grid-combined-site
+  providerKind: vllm-vcr
+  backendKind: local
+  endpoint: http://vcr-inference-central.grid-system.svc.cluster.local:8000
+  models:
+    - name: Qwen/Qwen3-0.6B
+      capabilities: ["text_generation"]
+      contextWindow: 4096
+  siteSelector:
+    matchLabels:
+      grid.praxis-proxy.io/provider-site: central
+  accessPolicy:
+    siteSelector:
+      matchLabels: {}
+  healthCheck:
+    path: /health
+    interval: "30s"
+    timeout: "5s"

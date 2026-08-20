@@ -38,6 +38,10 @@ args:
   - "--config"
   - "/etc/praxis/praxis.yaml"
 
+# -- Environment variables passed to the Praxis container. Use valueFrom for
+# -- credentials and other deployment-managed secrets.
+env: []
+
 # -- Required Praxis configuration.
 config:
   # -- Name of an existing ConfigMap containing the Praxis configuration.

@@ -1,0 +1,10 @@
+apiVersion: grid.praxis-proxy.io/v1alpha1
+kind: GridSite
+metadata:
+  name: west
+  labels:
+    grid.praxis-proxy.io/combined-site: west
+spec:
+  gridNetworkRef: grid-combined-site
+  region: west
+  zone: west-1
