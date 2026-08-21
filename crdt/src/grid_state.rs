@@ -1085,7 +1085,7 @@ mod tests {
     }
 
     /// Look up `tenant_id`'s counter, aborting the test if it's missing.
-    fn tenant_counter<'a>(snap: &'a GridStateSnapshot, tenant_id: &str) -> &'a GCounter {
+    fn tenant_counter<'snapshot>(snap: &'snapshot GridStateSnapshot, tenant_id: &str) -> &'snapshot GCounter {
         snap.tenant_spend
             .get(tenant_id)
             .unwrap_or_else(|| std::process::abort())

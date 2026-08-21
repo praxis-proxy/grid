@@ -376,7 +376,7 @@ pub(crate) async fn collect_provider_metrics_with_refresh_interval(
                 let reason_str = scrape_result
                     .as_ref()
                     .err()
-                    .map_or("MetricsScrapeError", |e| classify_scrape_error(e));
+                    .map_or("MetricsScrapeError", |error| classify_scrape_error(error));
                 let used_cache = try_cached_metrics(
                     identity,
                     mc.stale_metrics_seconds,

@@ -187,6 +187,10 @@ pub fn extract_lb_address(svc: &Service, port: u16) -> Option<String> {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::assertions_on_result_states,
+    reason = "parser tests intentionally assert only success or failure"
+)]
 mod tests {
     use clap::Parser as _;
     use k8s_openapi::api::core::v1::{LoadBalancerIngress, LoadBalancerStatus, ServiceStatus};

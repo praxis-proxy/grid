@@ -277,31 +277,35 @@ mod tests {
 
     #[test]
     fn slot_count_reflects_distinct_sites_after_merge() {
-        let mut a = GCounter::new("site-a".to_owned());
-        a.increment(10);
-        assert_eq!(a.slot_count(), 1, "one increment from one site is one slot");
+        let mut counter_a = GCounter::new("site-a".to_owned());
+        counter_a.increment(10);
+        assert_eq!(counter_a.slot_count(), 1, "one increment from one site is one slot");
 
-        let mut b = GCounter::new("site-b".to_owned());
-        b.increment(5);
-        a.merge(&b);
+        let mut counter_b = GCounter::new("site-b".to_owned());
+        counter_b.increment(5);
+        counter_a.merge(&counter_b);
 
-        assert_eq!(a.slot_count(), 2, "merging in a second site's slot must be counted");
+        assert_eq!(
+            counter_a.slot_count(),
+            2,
+            "merging in a second site's slot must be counted"
+        );
     }
 
     #[test]
     fn slot_count_is_zero_for_a_fresh_counter() {
-        let c = GCounter::new("site-a".to_owned());
-        assert_eq!(c.slot_count(), 0, "a counter with no increments yet has no slots");
+        let counter = GCounter::new("site-a".to_owned());
+        assert_eq!(counter.slot_count(), 0, "a counter with no increments yet has no slots");
     }
 
     #[test]
     fn has_slot_reports_presence_per_site() {
-        let mut c = GCounter::new("site-a".to_owned());
-        c.increment(10);
+        let mut counter = GCounter::new("site-a".to_owned());
+        counter.increment(10);
 
-        assert!(c.has_slot("site-a"), "site-a incremented, so it must have a slot");
+        assert!(counter.has_slot("site-a"), "site-a incremented, so it must have a slot");
         assert!(
-            !c.has_slot("site-b"),
+            !counter.has_slot("site-b"),
             "site-b never contributed, so it must not have a slot"
         );
     }

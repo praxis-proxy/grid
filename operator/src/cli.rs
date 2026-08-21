@@ -37,6 +37,10 @@ mod tests {
 
     /// The real parser accepts an empty argv. Asserts no values: `GRID_*` leak in.
     #[test]
+    #[expect(
+        clippy::assertions_on_result_states,
+        reason = "parser smoke test only needs to assert successful parsing"
+    )]
     fn empty_argv_parses() {
         assert!(Cli::try_parse_from(["grid-operator"]).is_ok());
     }
