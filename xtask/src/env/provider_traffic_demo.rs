@@ -2878,8 +2878,6 @@ fn collect_image_evidence() -> Result<BTreeMap<String, String>, Box<dyn std::err
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, time::Duration};
-
     use super::*;
 
     #[test]
