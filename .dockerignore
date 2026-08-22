@@ -1,0 +1,5 @@
+.git
+.forge
+target
+**/target
+evidence

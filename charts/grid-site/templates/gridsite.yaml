@@ -16,4 +16,8 @@ spec:
   {{- with .Values.gridSite.zone }}
   zone: {{ . | quote }}
   {{- end }}
+  {{- with .Values.gridSite.egress }}
+  egress:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
 {{- end }}

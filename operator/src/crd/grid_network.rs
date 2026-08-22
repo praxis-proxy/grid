@@ -60,7 +60,7 @@ pub enum ScoringStrategy {
     /// Do not prefer providers using dynamic metrics.
     ///
     /// All score contributions are zero. Health, admission, freshness,
-    /// geography, selection tiers, session affinity, and request-time picker
+    /// geography, selection tiers, session affinity, and request-time selection
     /// policy still apply. This is the generic default.
     #[default]
     NoMetrics,
@@ -141,6 +141,28 @@ pub struct ScoringPolicyConfig {
     /// Required when `scoringPolicy` is present. Omit the entire policy to use
     /// the `noMetrics` default.
     pub strategy: ScoringStrategy,
+}
+
+/// Local request-selection mode applied by Praxis inside the active group.
+#[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SelectionMode {
+    /// Select the first admitted candidate in the active group.
+    #[default]
+    Deterministic,
+    /// Distribute new requests equally in the active group.
+    RoundRobin,
+    /// Distribute new requests randomly in the active group.
+    Random,
+}
+
+/// Request selection policy published in the routing overlay.
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct SelectionPolicyConfig {
+    /// Local selection mode used by the data-plane gateway.
+    pub mode: SelectionMode,
 }
 
 /// Resolve the effective [`scoring::ScoringWeights`] from a scoring policy.
@@ -517,7 +539,8 @@ pub struct GridNetworkSpec {
     /// Admission state (`newAndExisting` before `existingOnly`) always
     /// outranks both geography and score in either mode.  In `scoreFirst`
     /// mode, freshness also outranks both; in `geographyFirst` mode,
-    /// freshness is a tiebreaker below geography and score.
+    /// freshness is below locality but above score so it cannot interleave
+    /// candidates across freshness-based selection groups.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub routing_policy: Option<RoutingPolicy>,
 
@@ -539,6 +562,13 @@ pub struct GridNetworkSpec {
     /// fail closed according to `missingMetrics`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub admission_policy: Option<AdmissionPolicyConfig>,
+
+    /// Local request distribution policy for the active selection group.
+    ///
+    /// This is independent of scoring. When absent, the overlay carries no
+    /// selection override and Praxis uses deterministic selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection_policy: Option<SelectionPolicyConfig>,
 
     /// Maximum time between metric refreshes and score/ranking recalculation.
     ///
@@ -1931,6 +1961,37 @@ mod tests {
         });
         let result = serde_json::from_value::<GridNetworkSpec>(json);
         assert!(result.is_err(), "unknown strategy must be rejected");
+    }
+
+    #[test]
+    fn selection_policy_round_trips_and_rejects_unknown_mode() {
+        let spec: GridNetworkSpec = serde_json::from_value(serde_json::json!({
+            "seeds": [],
+            "selectionPolicy": { "mode": "roundRobin" }
+        }))
+        .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            spec.selection_policy.map(|policy| policy.mode),
+            Some(SelectionMode::RoundRobin)
+        );
+
+        let result = serde_json::from_value::<GridNetworkSpec>(serde_json::json!({
+            "seeds": [],
+            "selectionPolicy": { "mode": "weightedRandom" }
+        }));
+        let Err(error) = result else {
+            std::process::abort();
+        };
+        assert!(error.to_string().contains("unknown variant"));
+    }
+
+    #[test]
+    fn round_robin_mode_serializes_for_explicit_policy() {
+        let serialized = serde_json::to_value(&SelectionPolicyConfig {
+            mode: SelectionMode::RoundRobin,
+        })
+        .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(serialized, serde_json::json!({"mode": "roundRobin"}));
     }
 
     #[test]

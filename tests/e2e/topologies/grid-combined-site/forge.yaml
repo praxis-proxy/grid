@@ -210,6 +210,11 @@ spec:
               gridId: grid-combined-site-v1
               region: west
               zone: west-1
+              routingPolicy: scoreFirst
+              scoringPolicy:
+                strategy: noMetrics
+              selectionPolicy:
+                mode: roundRobin
               swim:
                 probeInterval: "5s"
                 suspicionTimeout: "15s"
@@ -268,6 +273,11 @@ spec:
               gridId: grid-combined-site-v1
               region: central
               zone: central-1
+              routingPolicy: scoreFirst
+              scoringPolicy:
+                strategy: noMetrics
+              selectionPolicy:
+                mode: roundRobin
               swim:
                 probeInterval: "5s"
                 suspicionTimeout: "15s"
@@ -326,6 +336,11 @@ spec:
               gridId: grid-combined-site-v1
               region: east
               zone: east-1
+              routingPolicy: scoreFirst
+              scoringPolicy:
+                strategy: noMetrics
+              selectionPolicy:
+                mode: roundRobin
               swim:
                 probeInterval: "5s"
                 suspicionTimeout: "15s"

@@ -381,6 +381,24 @@ spec:
                   items:
                     type: string
                   type: array
+                selectionPolicy:
+                  description: |-
+                    Local request distribution policy for the active selection group.
+
+                    This is independent of scoring. When absent, the overlay carries no
+                    selection override and Praxis uses deterministic selection.
+                  nullable: true
+                  properties:
+                    mode:
+                      description: Local selection mode used by the data-plane gateway.
+                      enum:
+                        - deterministic
+                        - roundRobin
+                        - random
+                      type: string
+                  required:
+                    - mode
+                  type: object
                 staleCandidateTtlSeconds:
                   description: |-
                     Maximum age in seconds before a stale (`fresh=false`) remote routing

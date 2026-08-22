@@ -1,0 +1,43 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: vcr-inference-allow-provider-gateway-only
+  namespace: grid-system
+  labels:
+    app.kubernetes.io/part-of: grid-combined-site
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: vllm-vcr
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              grid.praxis-proxy.io/backend-access: "provider-gateway"
+      ports:
+        - protocol: TCP
+          port: 8000
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: vcr-inference-allow-grid-operator-health
+  namespace: grid-system
+  labels:
+    app.kubernetes.io/part-of: grid-combined-site
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: vllm-vcr
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: grid-operator
+      ports:
+        - protocol: TCP
+          port: 8000

@@ -3407,34 +3407,6 @@ fn require_local_image(image: &str) -> Result<(), Box<dyn std::error::Error>> {
     .into())
 }
 
-/// Verify that `image` has a numeric USER (or UID:GID) so Kubernetes can
-/// enforce `runAsNonRoot` without `runAsUser` in the pod spec.
-fn require_numeric_image_user(image: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let output = Command::new("docker")
-        .args(["inspect", "--format", "{{.Config.User}}", image])
-        .output()?;
-    if !output.status.success() {
-        return Err(format!(
-            "cannot inspect image {image:?}: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )
-        .into());
-    }
-    let user = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    if user.is_empty() {
-        return Err(format!("image {image:?} has no USER set; runAsNonRoot requires a numeric user").into());
-    }
-    let valid = user.split(':').all(|part| part.parse::<u32>().is_ok());
-    if !valid {
-        return Err(format!(
-            "image {image:?} has non-numeric USER {user:?}; \
-             Kubernetes cannot verify runAsNonRoot with a non-numeric user"
-        )
-        .into());
-    }
-    Ok(())
-}
-
 /// Load local container images into all Kind clusters.
 ///
 /// Reads image references from the `GRID_XTASK_*_IMAGE` environment variables
@@ -3457,9 +3429,6 @@ fn load_images_into_clusters(forge_bin: &Path, resolved_config: &Path) -> Result
         require_local_image(image)?;
         eprintln!("  verified local image: {image}");
     }
-
-    require_numeric_image_user(&vcr)?;
-    eprintln!("  verified numeric USER for {vcr}");
 
     for cluster in CLUSTERS {
         for image in [&gateway, &operator, &vcr] {

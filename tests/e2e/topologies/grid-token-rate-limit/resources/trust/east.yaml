@@ -1,0 +1,35 @@
+apiVersion: grid.praxis-proxy.io/v1alpha1
+kind: GridSite
+metadata:
+  name: grid-token-rate-limit-west
+  labels:
+    grid.praxis-proxy.io/network: grid-token-rate-limit
+    grid.praxis-proxy.io/auto-discovered: "true"
+spec:
+  gridNetworkRef: grid-token-rate-limit
+  egress:
+    address: "{{ captures.west.swim-lb-ip }}:8443"
+    tls:
+      mode: Mutual
+      serverName: west.grid.internal
+  trust:
+    canonicalFingerprints:
+      - PEER_WEST_FINGERPRINT
+---
+apiVersion: grid.praxis-proxy.io/v1alpha1
+kind: GridSite
+metadata:
+  name: grid-token-rate-limit-central
+  labels:
+    grid.praxis-proxy.io/network: grid-token-rate-limit
+    grid.praxis-proxy.io/auto-discovered: "true"
+spec:
+  gridNetworkRef: grid-token-rate-limit
+  egress:
+    address: "{{ captures.central.swim-lb-ip }}:8443"
+    tls:
+      mode: Mutual
+      serverName: central.grid.internal
+  trust:
+    canonicalFingerprints:
+      - PEER_CENTRAL_FINGERPRINT

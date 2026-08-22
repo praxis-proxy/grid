@@ -100,6 +100,40 @@
       "items": { "type": "string" },
       "description": "Container arguments."
     },
+    "env": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name"],
+        "properties": {
+          "name": { "type": "string", "minLength": 1 },
+          "value": { "type": "string" },
+          "valueFrom": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["secretKeyRef"],
+            "properties": {
+              "secretKeyRef": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["name", "key"],
+                "properties": {
+                  "name": { "type": "string", "minLength": 1 },
+                  "key": { "type": "string", "minLength": 1 },
+                  "optional": { "type": "boolean" }
+                }
+              }
+            }
+          }
+        },
+        "oneOf": [
+          { "required": ["value"] },
+          { "required": ["valueFrom"] }
+        ]
+      },
+      "description": "Environment variables passed to the Praxis container."
+    },
     "config": {
       "type": "object",
       "additionalProperties": false,

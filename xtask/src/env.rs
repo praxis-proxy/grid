@@ -5,6 +5,7 @@ pub(crate) mod combined_site_demo;
 pub(crate) mod config;
 pub(crate) mod consumer;
 pub(crate) mod external_provider;
+pub(crate) mod forge_config;
 pub(crate) mod gateway;
 pub(crate) mod glb;
 pub(crate) mod glb_demo;
@@ -16,6 +17,7 @@ pub(crate) mod kubectl;
 pub(crate) mod llmd_pool_metrics_demo;
 pub(crate) mod operator;
 pub(crate) mod operator_overlay;
+pub(crate) mod provider_traffic_demo;
 pub(crate) mod providers;
 pub(crate) mod trust;
 pub(crate) mod verify;
@@ -196,6 +198,16 @@ pub(crate) fn demo_root(forge_config: &Path) -> PathBuf {
 /// Actions for the `env` subcommand.
 #[derive(Debug, Subcommand)]
 pub(crate) enum Action {
+    /// Materialize a Forge config with `GRID_XTASK_*` image overrides.
+    MaterializeForgeConfig {
+        /// Source Forge environment config.
+        #[arg(long)]
+        forge_config: PathBuf,
+        /// Destination for the rendered config. Defaults beside the source.
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+
     /// Create or update the test environment.
     Up {
         /// Path to the environment config file.
@@ -974,6 +986,19 @@ pub(crate) enum Action {
         #[arg(long)]
         kv_cache: bool,
     },
+
+    /// Create the focused provider-gateway traffic demo, then prove equal
+    /// selection across its active provider group.
+    RunGridProviderTrafficDemo {
+        /// Path to the public or internal Forge environment config file.
+        /// This is required because the focused demo currently lives in the
+        /// public demos repository rather than the Grid source tree.
+        #[arg(long)]
+        forge_config: PathBuf,
+        /// Demo mode and teardown options. Only `--quick` is supported.
+        #[command(flatten)]
+        options: GlbDemoOptions,
+    },
 }
 
 #[cfg(test)]
@@ -1029,6 +1054,11 @@ mod llmd_pool_metrics_demo_cli_tests {
 )]
 pub(crate) fn run(action: &Action) -> Result<(), Box<dyn std::error::Error>> {
     match action {
+        Action::MaterializeForgeConfig { forge_config, output } => {
+            let resolved = forge_config::materialize(forge_config, output.as_deref())?;
+            eprintln!("materialized Forge config: {}", resolved.display());
+            Ok(())
+        },
         Action::Up { config } => env_up(config),
         Action::Down { config } => env_down(config),
         Action::Status { config } => env_status(config),
@@ -1096,6 +1126,9 @@ pub(crate) fn run(action: &Action) -> Result<(), Box<dyn std::error::Error>> {
             metrics_mtls,
             kv_cache,
         } => llmd_pool_metrics_demo::run(forge_config, options, *metrics_mtls, *kv_cache),
+        Action::RunGridProviderTrafficDemo { forge_config, options } => {
+            provider_traffic_demo::run(forge_config, options)
+        },
     }
 }
 

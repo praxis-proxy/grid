@@ -1,0 +1,117 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vcr-inference-{{ cluster.name }}
+  namespace: grid-system
+  labels:
+    app.kubernetes.io/name: vllm-vcr
+    app.kubernetes.io/part-of: grid-token-rate-limit
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: vllm-vcr
+      app.kubernetes.io/instance: "{{ cluster.name }}"
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: vllm-vcr
+        app.kubernetes.io/instance: "{{ cluster.name }}"
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: vcr
+          image: "{{ cluster.properties.vcrImage }}"
+          imagePullPolicy: "{{ cluster.properties.vcrImagePullPolicy }}"
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: false
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+          env:
+            - name: MODEL
+              value: "Qwen/Qwen3-0.6B"
+            - name: MOCK_PD_ROLE
+              value: "both"
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: VLLM_PORT
+              value: "8000"
+            - name: MOCK_MAX_NUM_SEQS
+              value: "4"
+            - name: MOCK_KV_CACHE_SIZE
+              value: "64"
+            - name: MOCK_TOKENS_PER_BLOCK
+              value: "16"
+            - name: MOCK_MAX_MODEL_LEN
+              value: "512"
+            - name: MOCK_TTFT_MS
+              value: "50"
+            - name: MOCK_ITL_MS
+              value: "20"
+            - name: MOCK_TIME_FACTOR_UNDER_LOAD
+              value: "2.0"
+          ports:
+            - name: http
+              containerPort: 8000
+          startupProbe:
+            httpGet:
+              path: /v1/models
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            periodSeconds: 5
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+            limits:
+              memory: 2Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vcr-inference-{{ cluster.name }}
+  namespace: grid-system
+  labels:
+    app.kubernetes.io/name: vllm-vcr
+    app.kubernetes.io/part-of: grid-token-rate-limit
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: vllm-vcr
+    app.kubernetes.io/instance: "{{ cluster.name }}"
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000

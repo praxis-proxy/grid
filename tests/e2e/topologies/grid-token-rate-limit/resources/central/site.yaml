@@ -1,0 +1,10 @@
+apiVersion: grid.praxis-proxy.io/v1alpha1
+kind: GridSite
+metadata:
+  name: central
+  labels:
+    grid.praxis-proxy.io/combined-site: central
+spec:
+  gridNetworkRef: grid-combined-site
+  region: central
+  zone: central-1

@@ -481,20 +481,45 @@ mod tests {
                 score: None,
                 score_breakdown: None,
                 rank: Some(0),
+                selection_group: None,
             }],
+            selection_policy: None,
             generated_at: Some("2026-07-29T00:00:00Z".to_owned()),
         }
     }
 
     fn overlay_digest(overlay: &crate::types::RoutingOverlay) -> String {
-        let canonical = serde_json::json!({
+        let mut semantic_payload = serde_json::json!({
             "candidates": serde_json::to_value(&overlay.candidates).unwrap(),
             "local_site": overlay.local_site,
             "network": overlay.network,
         });
-        let canonical_bytes = serde_json_canonicalizer::to_vec(&canonical).unwrap();
+        if let Some(policy) = &overlay.selection_policy {
+            semantic_payload
+                .as_object_mut()
+                .unwrap()
+                .insert("selection_policy".to_owned(), serde_json::to_value(policy).unwrap());
+        }
+        let canonical_bytes = serde_json_canonicalizer::to_vec(&semantic_payload).unwrap();
         let digest: [u8; 32] = sha2::Sha256::new().chain_update(&canonical_bytes).finalize().into();
         digest.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    #[test]
+    fn overlay_digest_includes_selection_policy() {
+        let scope = ExpectedScope {
+            network: "test-net".to_owned(),
+            gateway: "gw".to_owned(),
+            namespace: "ns".to_owned(),
+            local_site: "site-a".to_owned(),
+        };
+        let without_policy = test_overlay(&scope);
+        let mut with_policy = without_policy.clone();
+        with_policy.selection_policy = Some(crate::types::SelectionPolicy {
+            mode: crate::types::SelectionMode::RoundRobin,
+        });
+
+        assert_ne!(overlay_digest(&without_policy), overlay_digest(&with_policy));
     }
 
     fn test_provenance() -> crate::types::OverlayProvenance {

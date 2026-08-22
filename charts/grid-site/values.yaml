@@ -3,6 +3,7 @@ gridNetwork:
   gridId: ""
   region: ""
   zone: ""
+  seeds: []
   swim: {}
   tls: {}
   gatewayRefs: []
@@ -24,6 +25,7 @@ gridSite:
   region: ""
   zone: ""
   providerSiteLabel: ""
+  egress: {}
 
 inferenceProviders: []
 

@@ -1,0 +1,72 @@
+# Combined-site provider gateway: mTLS listener with Grid peer authentication.
+#
+# This listener requires downstream mTLS. `peer_identity_trust` authenticates
+# and authorizes the consumer gateway before AI-owned x-ai-routing-* fields can
+# influence provider-local routing.
+
+listeners:
+  - name: provider
+    address: "0.0.0.0:8443"
+    filter_chains:
+      - provider-inference
+    tls:
+      certificates:
+        - cert_path: /etc/praxis/tls/tls.crt
+          key_path: /etc/praxis/tls/tls.key
+      client_ca:
+        ca_path: /etc/praxis/tls/ca.crt
+      client_cert_mode: require
+
+filter_chains:
+  - name: provider-inference
+    filters:
+      # This security filter must remain first, unconditional, and fail closed.
+      - filter: peer_identity_trust
+        trusted_peers:
+          - organization: ai-grid
+
+      # Parse the OpenAI-compatible request and promote model to X-Model.
+      - filter: json_body_field
+        field: model
+        header: X-Model
+
+      - filter: headers
+        response_set:
+          - name: X-Grid-Combined-Provider-Gateway
+            value: "SITE_PLACEHOLDER"
+
+      - filter: provider_route
+        provider_id: "SITE_PLACEHOLDER"
+        model_header: X-Model
+        emit_demo_attribution: true
+        routes:
+          - candidate_id: "CANDIDATE_ID_PLACEHOLDER"
+            model: Qwen/Qwen3-0.6B
+            paths:
+              - /v1/chat/completions
+              - /v1/responses
+            cluster: vcr-backend
+            credential:
+              strategy: bearer_token
+              secretRef:
+                name: vcr-inference-credential
+                namespace: grid-system
+                key: token
+
+      - filter: credential_inject
+        credentials:
+          - strategy: bearer_token
+            name: vcr-inference-credential
+            namespace: grid-system
+            key: token
+            file: /etc/praxis/credentials/vcr-inference/token
+
+      - filter: load_balancer
+        clusters:
+          - name: vcr-backend
+            endpoints:
+              - "vcr-inference-SITE_PLACEHOLDER.grid-system.svc.cluster.local:8000"
+
+admin:
+  address: "127.0.0.1:9901"
+shutdown_timeout_secs: 5

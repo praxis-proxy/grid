@@ -8,10 +8,13 @@
 
 use std::{fmt, fmt::Write as _};
 
+#[cfg(test)]
 use serde::ser::Error as _;
 use sha2::{Digest as _, Sha256};
 
-use crate::types::{OverlayEnvelope, OverlayScope, RoutingOverlay};
+#[cfg(test)]
+use crate::types::RoutingOverlay;
+use crate::types::{OverlayEnvelope, OverlayScope};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -126,15 +129,12 @@ pub(crate) fn validate_envelope(
         });
     }
 
-    let envelope: OverlayEnvelope = serde_json::from_slice(raw).map_err(|e| ValidationError {
-        reason: RejectionReason::Malformed,
-        detail: format!("JSON parse failed: {e}"),
-    })?;
+    let (raw_value, envelope) = parse_envelope(raw)?;
 
     validate_schema_version(&envelope.schema_version)?;
     validate_scope(&envelope.scope, expected_scope)?;
     validate_revision_digest_agreement(&envelope)?;
-    validate_content_digest(&envelope)?;
+    validate_content_digest(&raw_value, &envelope)?;
 
     let revision = envelope.revision.value;
 
@@ -151,6 +151,20 @@ pub(crate) fn validate_envelope(
         revision,
         raw_bytes: raw.to_vec(),
     })
+}
+
+/// Parse the raw envelope while converting both parser failures into the
+/// bounded validation error type.
+fn parse_envelope(raw: &[u8]) -> Result<(serde_json::Value, OverlayEnvelope), ValidationError> {
+    let raw_value: serde_json::Value = serde_json::from_slice(raw).map_err(|e| ValidationError {
+        reason: RejectionReason::Malformed,
+        detail: format!("JSON parse failed: {e}"),
+    })?;
+    let envelope: OverlayEnvelope = serde_json::from_value(raw_value.clone()).map_err(|e| ValidationError {
+        reason: RejectionReason::Malformed,
+        detail: format!("envelope structure invalid: {e}"),
+    })?;
+    Ok((raw_value, envelope))
 }
 
 /// Check that the schema version is supported.
@@ -224,8 +238,15 @@ fn validate_revision_digest_agreement(envelope: &OverlayEnvelope) -> Result<(), 
 }
 
 /// Recompute the semantic digest and verify it matches the envelope.
-fn validate_content_digest(envelope: &OverlayEnvelope) -> Result<(), ValidationError> {
-    let recomputed = compute_semantic_digest(&envelope.overlay).map_err(|e| ValidationError {
+fn validate_content_digest(
+    raw_envelope: &serde_json::Value,
+    envelope: &OverlayEnvelope,
+) -> Result<(), ValidationError> {
+    let raw_overlay = raw_envelope.get("overlay").ok_or_else(|| ValidationError {
+        reason: RejectionReason::Malformed,
+        detail: "overlay payload is missing".to_owned(),
+    })?;
+    let recomputed = compute_raw_semantic_digest(raw_overlay).map_err(|e| ValidationError {
         reason: RejectionReason::Malformed,
         detail: format!("cannot canonicalize overlay: {e}"),
     })?;
@@ -239,21 +260,64 @@ fn validate_content_digest(envelope: &OverlayEnvelope) -> Result<(), ValidationE
     Ok(())
 }
 
+/// Compute the semantic digest from the raw overlay JSON.
+///
+/// The operator's semantic payload includes the complete candidate objects.
+/// Computing from raw JSON keeps additive routing metadata digest-significant
+/// even when this sidecar does not understand the new field yet.
+fn compute_raw_semantic_digest(overlay: &serde_json::Value) -> Result<String, String> {
+    let object = overlay
+        .as_object()
+        .ok_or_else(|| "overlay must be a JSON object".to_owned())?;
+    let network = object
+        .get("network")
+        .ok_or_else(|| "overlay.network is missing".to_owned())?;
+    let local_site = object
+        .get("local_site")
+        .ok_or_else(|| "overlay.local_site is missing".to_owned())?;
+    let candidates = object
+        .get("candidates")
+        .ok_or_else(|| "overlay.candidates is missing".to_owned())?;
+    let mut semantic_payload = serde_json::json!({
+        "candidates": candidates,
+        "local_site": local_site,
+        "network": network,
+    });
+    if let Some(selection_policy) = object.get("selection_policy") {
+        semantic_payload
+            .as_object_mut()
+            .ok_or_else(|| "semantic payload is not an object".to_owned())?
+            .insert("selection_policy".to_owned(), selection_policy.clone());
+    }
+    let canonical = serde_json_canonicalizer::to_vec(&semantic_payload)
+        .map_err(|e| format!("RFC 8785 canonicalization failed: {e}"))?;
+    let digest: [u8; 32] = Sha256::digest(&canonical).into();
+    Ok(hex_encode(&digest))
+}
+
 // ---------------------------------------------------------------------------
 // Digest computation (same algorithm as the operator)
 // ---------------------------------------------------------------------------
 
 /// Compute the SHA-256 digest of the RFC 8785 canonical semantic payload.
 ///
-/// The semantic payload includes only `network`, `local_site`, and
-/// `candidates` — the same fields used by the operator.
+/// The semantic payload includes `network`, `local_site`, and `candidates`,
+/// plus `selection_policy` when present — the same fields used by the
+/// operator.
+#[cfg(test)]
 fn compute_semantic_digest(overlay: &RoutingOverlay) -> Result<String, serde_json::Error> {
     let candidates_value = serde_json::to_value(&overlay.candidates)?;
-    let semantic_payload = serde_json::json!({
+    let mut semantic_payload = serde_json::json!({
         "candidates": candidates_value,
         "local_site": overlay.local_site,
         "network": overlay.network,
     });
+    if let Some(policy) = &overlay.selection_policy {
+        let Some(object) = semantic_payload.as_object_mut() else {
+            return Err(serde_json::Error::custom("semantic payload must be an object"));
+        };
+        object.insert("selection_policy".to_owned(), serde_json::to_value(policy)?);
+    }
 
     let canonical = serde_json_canonicalizer::to_vec(&semantic_payload).map_err(serde_json::Error::custom)?;
 
@@ -280,7 +344,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, reason = "tests")]
 mod tests {
     use super::*;
-    use crate::types::{ContentDigest, ContentRevision, OverlayProvenance, RoutingCandidate};
+    use crate::types::{ContentDigest, ContentRevision, OverlayProvenance, RoutingCandidate, RoutingOverlay};
 
     fn test_scope() -> ExpectedScope {
         ExpectedScope {
@@ -308,7 +372,9 @@ mod tests {
                 score: None,
                 score_breakdown: None,
                 rank: Some(0),
+                selection_group: None,
             }],
+            selection_policy: None,
             generated_at: Some("2026-07-29T00:00:00Z".to_owned()),
         }
     }
@@ -352,6 +418,50 @@ mod tests {
         let scope = test_scope();
         let result = validate_envelope(&raw, &scope, 1_048_576, None);
         result.unwrap();
+    }
+
+    #[test]
+    fn additive_candidate_field_is_digest_significant_and_accepted() {
+        let env = valid_envelope();
+        let mut value = serde_json::to_value(env).unwrap();
+        value["overlay"]["candidates"][0]["future_field"] = serde_json::json!({"mode": "x"});
+        let digest = compute_raw_semantic_digest(&value["overlay"]).unwrap();
+        value["revision"]["value"] = serde_json::Value::String(digest.clone());
+        value["content_digest"]["value"] = serde_json::Value::String(digest);
+
+        let raw = serde_json::to_vec(&value).unwrap();
+        let result = validate_envelope(&raw, &test_scope(), 1_048_576, None);
+        assert!(result.is_ok(), "additive candidate metadata should survive validation");
+    }
+
+    #[test]
+    fn additive_candidate_field_mutation_without_digest_update_is_rejected() {
+        let env = valid_envelope();
+        let mut value = serde_json::to_value(env).unwrap();
+        value["overlay"]["candidates"][0]["future_field"] = serde_json::json!({"mode": "x"});
+
+        let raw = serde_json::to_vec(&value).unwrap();
+        let result = validate_envelope(&raw, &test_scope(), 1_048_576, None);
+        assert!(matches!(result.unwrap_err().reason, RejectionReason::DigestMismatch));
+    }
+
+    #[test]
+    fn credential_value_fields_remain_rejected() {
+        let env = valid_envelope();
+        let mut value = serde_json::to_value(env).unwrap();
+        value["overlay"]["candidates"][0]["credential"] = serde_json::json!({
+            "strategy": "bearer_token",
+            "secretRef": {
+                "name": "credential",
+                "namespace": "ns",
+                "key": "token"
+            },
+            "token": "must-not-enter-overlay"
+        });
+
+        let raw = serde_json::to_vec(&value).unwrap();
+        let result = validate_envelope(&raw, &test_scope(), 1_048_576, None);
+        assert!(matches!(result.unwrap_err().reason, RejectionReason::Malformed));
     }
 
     #[test]
@@ -435,6 +545,37 @@ mod tests {
             recomputed, envelope.revision.value,
             "sidecar digest must match operator fixture"
         );
+    }
+
+    #[test]
+    fn selection_policy_fixture_digest_matches_operator_contract() {
+        let fixture = include_str!("../../tests/fixtures/overlay-contract/v1/valid-selection-policy.json");
+        let envelope: OverlayEnvelope = serde_json::from_str(fixture).unwrap();
+        let recomputed = compute_semantic_digest(&envelope.overlay).unwrap();
+        assert_eq!(
+            recomputed, envelope.revision.value,
+            "selection policy fixture must match the producer digest; computed={recomputed}"
+        );
+        let scope = test_scope();
+        validate_envelope(fixture.as_bytes(), &scope, 1_048_576, None)
+            .expect("selection policy fixture must pass transparent validation");
+    }
+
+    #[test]
+    fn unknown_selection_policy_field_is_rejected() {
+        let env = valid_envelope();
+        let mut value = serde_json::to_value(env).unwrap();
+        value["overlay"]["selection_policy"] = serde_json::json!({
+            "mode": "roundRobin",
+            "unexpected": true
+        });
+        let digest = compute_raw_semantic_digest(&value["overlay"]).unwrap();
+        value["revision"]["value"] = serde_json::Value::String(digest.clone());
+        value["content_digest"]["value"] = serde_json::Value::String(digest);
+
+        let raw = serde_json::to_vec(&value).unwrap();
+        let result = validate_envelope(&raw, &test_scope(), 1_048_576, None);
+        assert!(matches!(result.unwrap_err().reason, RejectionReason::Malformed));
     }
 
     #[test]

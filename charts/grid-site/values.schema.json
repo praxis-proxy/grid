@@ -21,6 +21,10 @@
         "zone": {
           "type": "string"
         },
+        "seeds": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
         "swim": {
           "type": "object",
           "additionalProperties": true,
@@ -68,6 +72,17 @@
                 "minimumStateDuration": { "type": "string", "pattern": "^[1-9][0-9]*s$" },
                 "recoveryHoldDown": { "type": "string", "pattern": "^[1-9][0-9]*s$" }
               }
+            }
+          }
+        },
+        "selectionPolicy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode"],
+          "properties": {
+            "mode": {
+              "type": "string",
+              "enum": ["deterministic", "roundRobin", "random"]
             }
           }
         },
@@ -125,6 +140,14 @@
         },
         "providerSiteLabel": {
           "type": "string"
+        },
+        "egress": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "address": { "type": "string", "minLength": 1 },
+            "tls": { "type": "object", "additionalProperties": true }
+          }
         }
       }
     },

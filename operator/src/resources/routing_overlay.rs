@@ -269,6 +269,7 @@ pub(crate) fn remote_crdt_provider_to_candidates(provider: &crdt::ProviderState)
             score: None,
             score_breakdown: None,
             rank: None,
+            selection_group: None,
         })
         .collect()
 }
@@ -876,6 +877,13 @@ pub struct RoutingCandidate {
     /// Zero-based position in the final sorted overlay.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rank: Option<u32>,
+
+    /// Zero-based active selection group for request distribution.
+    ///
+    /// Group metadata is additive and does not change the default ordered
+    /// routing behavior until the data plane explicitly enables it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selection_group: Option<u32>,
 }
 
 /// The full routing overlay for a single [`GridNetwork`].
@@ -904,9 +912,14 @@ pub struct RoutingOverlay {
     /// higher than remote candidates.
     pub local_site: String,
 
-    /// Routing candidates, ordered by admission state, locality tier, score,
-    /// freshness, then alphabetical tiebreak.
+    /// Routing candidates, ordered by admission state, locality tier,
+    /// freshness, score, then alphabetical tiebreak.
     pub candidates: Vec<RoutingCandidate>,
+
+    /// Optional explicit local selection policy for Praxis. An absent field is
+    /// intentionally backward-compatible and means deterministic selection.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selection_policy: Option<crate::crd::grid_network::SelectionPolicyConfig>,
 
     /// RFC 3339 timestamp of when this overlay was rendered.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1016,6 +1029,71 @@ fn locality_sort_key(tier: Option<LocalityTier>) -> u8 {
     }
 }
 
+/// Assign deterministic priority groups after the existing candidate sort.
+///
+/// Groups are hard eligibility/priority boundaries, not score buckets. The
+/// current producer contract deliberately leaves metric differences inside a
+/// group so a later traffic-weight field can distribute among eligible
+/// candidates without changing the active priority boundary.
+///
+/// Geography-first keeps admission, locality, and freshness as boundaries;
+/// Score-first keeps admission and freshness as boundaries. Scores are
+/// therefore never used to split a group, and floating-point equality is not
+/// part of the grouping contract.
+#[derive(Clone, Copy)]
+struct GroupState {
+    /// Admission boundary for the previous candidate.
+    admission: AdmissionState,
+    /// Freshness boundary for the previous candidate.
+    fresh: bool,
+    /// Locality boundary for the previous candidate.
+    tier: LocalityTier,
+    /// Group assigned to the previous candidate.
+    group: u32,
+}
+
+/// Assign zero-based contiguous groups for each capability.
+#[expect(
+    clippy::too_many_lines,
+    reason = "The two routing policies are explicit at this contract boundary."
+)]
+fn assign_selection_groups(candidates: &mut [RoutingCandidate], policy: crate::crd::grid_network::RoutingPolicy) {
+    let mut last_by_capability: HashMap<(String, String), GroupState> = HashMap::new();
+    for candidate in candidates {
+        let key = (candidate.kind.clone(), candidate.name.clone());
+        let admission = candidate.admission_state.unwrap_or(AdmissionState::NewAndExisting);
+        let tier = candidate.selection_tier.unwrap_or(LocalityTier::Unknown);
+        let next = match last_by_capability.get(&key) {
+            Some(last) => {
+                let boundary = match policy {
+                    crate::crd::grid_network::RoutingPolicy::GeographyFirst => {
+                        admission != last.admission || tier != last.tier || candidate.fresh != last.fresh
+                    },
+                    crate::crd::grid_network::RoutingPolicy::ScoreFirst => {
+                        admission != last.admission || candidate.fresh != last.fresh
+                    },
+                };
+                if boundary {
+                    last.group.saturating_add(1)
+                } else {
+                    last.group
+                }
+            },
+            None => 0,
+        };
+        candidate.selection_group = Some(next);
+        last_by_capability.insert(
+            key,
+            GroupState {
+                admission,
+                fresh: candidate.fresh,
+                tier,
+                group: next,
+            },
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Renderer
 // ---------------------------------------------------------------------------
@@ -1048,9 +1126,13 @@ fn locality_sort_key(tier: Option<LocalityTier>) -> u8 {
 /// **`GeographyFirst`** (default):
 /// 1. admission state: `new_and_existing` before `existing_only`;
 /// 2. geography tier: same site, same zone, same region, cross region;
-/// 3. scoring engine score, descending;
-/// 4. `fresh=true` before `fresh=false`;
+/// 3. freshness: `fresh=true` before `fresh=false`;
+/// 4. scoring engine score, descending;
 /// 5. deterministic `(site, name, cluster)` tiebreak.
+///
+/// Freshness intentionally precedes score in this policy. Group assignment
+/// treats freshness as a hard boundary, so this ordering prevents a stale
+/// candidate from interleaving with fresh candidates of the same capability.
 ///
 /// **`ScoreFirst`**:
 /// 1. admission state: `new_and_existing` before `existing_only`;
@@ -1220,8 +1302,8 @@ pub fn render_routing_overlay_with_admission(
                 admission_sort_key(a.admission_state)
                     .cmp(&admission_sort_key(b.admission_state))
                     .then(locality_sort_key(a.selection_tier).cmp(&locality_sort_key(b.selection_tier)))
-                    .then_with(|| score_of(&b.cluster).total_cmp(&score_of(&a.cluster)))
                     .then(b.fresh.cmp(&a.fresh))
+                    .then_with(|| score_of(&b.cluster).total_cmp(&score_of(&a.cluster)))
                     .then(a.site.cmp(&b.site))
                     .then(a.name.cmp(&b.name))
                     .then(a.cluster.cmp(&b.cluster))
@@ -1255,10 +1337,19 @@ pub fn render_routing_overlay_with_admission(
         }
     }
 
+    assign_selection_groups(&mut candidates, policy);
+
+    // Preserve omission for existing GridNetwork resources. New Helm
+    // installations resolve their round-robin default in chart values, while
+    // an upgraded resource without this field must retain deterministic
+    // Praxis compatibility behavior.
+    let selection_policy = network.spec.selection_policy.clone();
+
     Ok(RoutingOverlay {
         network: network_name.to_owned(),
         local_site: local_site.to_owned(),
         candidates,
+        selection_policy,
         generated_at: generated_at.map(str::to_owned),
     })
 }
@@ -1454,6 +1545,7 @@ fn candidates_from_provider(
                 score: None,
                 score_breakdown: None,
                 rank: None,
+                selection_group: None,
             });
         }
     }
@@ -1669,6 +1761,156 @@ mod tests {
         .unwrap_or_else(|_| std::process::abort())
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Test fixture mirrors all grouping dimensions explicitly."
+    )]
+    fn group_candidate(
+        name: &str,
+        site: &str,
+        cluster: &str,
+        admission_state: AdmissionState,
+        tier: LocalityTier,
+        fresh: bool,
+        score: f64,
+    ) -> RoutingCandidate {
+        RoutingCandidate {
+            kind: CANDIDATE_KIND.to_owned(),
+            name: name.to_owned(),
+            site: site.to_owned(),
+            cluster: cluster.to_owned(),
+            fresh,
+            credential: None,
+            stable_id: None,
+            admission_state: Some(admission_state),
+            selection_tier: Some(tier),
+            score: Some(score),
+            score_breakdown: None,
+            rank: None,
+            selection_group: None,
+        }
+    }
+
+    #[test]
+    fn equivalent_candidates_share_group_without_identity_comparison() {
+        let mut candidates = vec![
+            group_candidate(
+                "model-a",
+                "site-a",
+                "cluster-a",
+                AdmissionState::NewAndExisting,
+                LocalityTier::SameSite,
+                true,
+                0.8,
+            ),
+            group_candidate(
+                "model-a",
+                "site-b",
+                "cluster-b",
+                AdmissionState::NewAndExisting,
+                LocalityTier::SameSite,
+                true,
+                0.8,
+            ),
+        ];
+        assign_selection_groups(&mut candidates, crate::crd::grid_network::RoutingPolicy::GeographyFirst);
+        assert_eq!(candidates[0].selection_group, Some(0));
+        assert_eq!(candidates[1].selection_group, Some(0));
+    }
+
+    #[test]
+    fn changed_routing_properties_split_groups_deterministically() {
+        let mut candidates = vec![
+            group_candidate(
+                "model-a",
+                "site-a",
+                "cluster-a",
+                AdmissionState::NewAndExisting,
+                LocalityTier::SameSite,
+                true,
+                0.8,
+            ),
+            group_candidate(
+                "model-a",
+                "site-b",
+                "cluster-b",
+                AdmissionState::NewAndExisting,
+                LocalityTier::CrossRegion,
+                true,
+                0.8,
+            ),
+            group_candidate(
+                "model-a",
+                "site-c",
+                "cluster-c",
+                AdmissionState::ExistingOnly,
+                LocalityTier::CrossRegion,
+                false,
+                0.2,
+            ),
+        ];
+        assign_selection_groups(&mut candidates, crate::crd::grid_network::RoutingPolicy::GeographyFirst);
+        assert_eq!(
+            candidates.iter().map(|c| c.selection_group).collect::<Vec<_>>(),
+            vec![Some(0), Some(1), Some(2)]
+        );
+    }
+
+    #[test]
+    fn metric_differences_stay_in_same_group_for_both_policies() {
+        let mut geography = vec![
+            group_candidate(
+                "model-a",
+                "site-a",
+                "cluster-a",
+                AdmissionState::NewAndExisting,
+                LocalityTier::SameSite,
+                true,
+                0.9,
+            ),
+            group_candidate(
+                "model-a",
+                "site-b",
+                "cluster-b",
+                AdmissionState::NewAndExisting,
+                LocalityTier::SameSite,
+                true,
+                0.1,
+            ),
+        ];
+        assign_selection_groups(&mut geography, crate::crd::grid_network::RoutingPolicy::GeographyFirst);
+        assert_eq!(
+            geography.iter().map(|c| c.selection_group).collect::<Vec<_>>(),
+            vec![Some(0), Some(0)]
+        );
+
+        let mut score_first = vec![
+            group_candidate(
+                "model-a",
+                "site-a",
+                "cluster-a",
+                AdmissionState::NewAndExisting,
+                LocalityTier::SameSite,
+                true,
+                0.9,
+            ),
+            group_candidate(
+                "model-a",
+                "site-b",
+                "cluster-b",
+                AdmissionState::NewAndExisting,
+                LocalityTier::SameSite,
+                true,
+                0.1,
+            ),
+        ];
+        assign_selection_groups(&mut score_first, crate::crd::grid_network::RoutingPolicy::ScoreFirst);
+        assert_eq!(
+            score_first.iter().map(|c| c.selection_group).collect::<Vec<_>>(),
+            vec![Some(0), Some(0)]
+        );
+    }
+
     fn test_site(name: &str, network: &str) -> GridSite {
         serde_json::from_value(serde_json::json!({
             "apiVersion": "grid.praxis-proxy.io/v1alpha1",
@@ -1711,6 +1953,27 @@ mod tests {
             }
         }))
         .unwrap_or_else(|_| std::process::abort())
+    }
+
+    #[test]
+    fn omitted_selection_policy_remains_omitted_from_overlay() {
+        let network = test_network_score_first("net");
+        let provider = test_provider("provider", "net", &["model"]);
+        let overlay = render_routing_overlay(
+            &network,
+            &[],
+            &[provider],
+            &[],
+            "site-a",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        assert!(
+            overlay.selection_policy.is_none(),
+            "an upgraded GridNetwork that omits selectionPolicy must not be migrated implicitly"
+        );
     }
 
     fn test_provider_with_selector(
@@ -2308,9 +2571,9 @@ mod tests {
         // provider is also unavailable, but its fresh=false signals that its
         // metrics are stale.
         //
-        // Default GeographyFirst sort: admission → locality → score → fresh → tiebreak.
-        // The degraded local (SameSite, fresh=false) outranks the fresh API
-        // (CrossRegion, fresh=true) because geography sorts above freshness.
+        // Default GeographyFirst sort: admission → locality → fresh → score → tiebreak.
+        // Freshness is evaluated before score after locality, so a fresh remote
+        // candidate can precede a degraded local candidate.
         let network = test_network("fallback-net");
         let local_degraded =
             test_provider_with_backend_kind_and_phase("provider-local", "fallback-net", "local", "Degraded");
@@ -2346,8 +2609,8 @@ mod tests {
         assert!(api_c.fresh, "API provider with absent status must have fresh=true");
         assert_eq!(
             overlay.candidates.first().map(|c| c.cluster.as_str()),
-            Some("provider-local"),
-            "Degraded local must rank before API (GeographyFirst: locality outranks freshness)"
+            Some("provider-api"),
+            "with equal unknown locality, GeographyFirst freshness precedes score"
         );
     }
 
