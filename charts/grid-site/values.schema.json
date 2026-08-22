@@ -21,6 +21,10 @@
         "zone": {
           "type": "string"
         },
+        "seeds": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
         "swim": {
           "type": "object",
           "additionalProperties": true,
@@ -136,6 +140,14 @@
         },
         "providerSiteLabel": {
           "type": "string"
+        },
+        "egress": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "address": { "type": "string", "minLength": 1 },
+            "tls": { "type": "object", "additionalProperties": true }
+          }
         }
       }
     },

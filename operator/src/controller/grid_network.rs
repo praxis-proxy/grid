@@ -442,10 +442,55 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
         .is_some_and(|v| v == "true");
     if auto_discover_enabled && let (Some(swim), Some(snapshot)) = (ctx.swim.as_ref(), membership.as_ref()) {
         let plaintext = network_uses_plaintext_egress(&network);
+        reconcile_local_site(name, swim.site_name(), client).await?;
         reconcile_discovered_sites(name, swim.site_name(), snapshot, client, plaintext).await?;
     }
 
     Ok(Action::requeue(requeue_interval))
+}
+
+/// Advance the explicitly configured local [`GridSite`] into discovery.
+///
+/// Remote sites are created from SWIM membership, but the local site is
+/// intentionally excluded from that discovery list. When a topology provides
+/// its local `GridSite` declaratively, this controller must still hand it to the
+/// `GridSite` controller for gateway probing. The status write is idempotent and
+/// only applies while the site is still pending.
+#[expect(
+    clippy::too_many_lines,
+    reason = "status patch keeps the local-site transition explicit"
+)]
+async fn reconcile_local_site(network_name: &str, local_site: &str, client: &Client) -> Result<(), OperatorError> {
+    let api: Api<GridSite> = Api::all(client.clone());
+    let Ok(site) = api.get(local_site).await else {
+        return Ok(());
+    };
+    if site.spec.grid_network_ref != network_name {
+        return Ok(());
+    }
+    let pending = site
+        .status
+        .as_ref()
+        .is_none_or(|status| status.phase == GridSitePhase::Pending);
+    if !pending {
+        return Ok(());
+    }
+    let status_doc = serde_json::json!({
+        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "kind": "GridSite",
+        "status": {
+            "phase": "Discovered",
+            "reason": "SWIMDiscovered",
+            "message": "local site configured and ready for gateway probing"
+        }
+    });
+    api.patch_status(
+        local_site,
+        &PatchParams::apply(FIELD_MANAGER).force(),
+        &Patch::Apply(&status_doc),
+    )
+    .await?;
+    Ok(())
 }
 
 /// Apply `spec.tls.swimKeyRef` before any reconcile-triggered SWIM send.

@@ -15,7 +15,7 @@ spec:
 
   clusters:
     - name: west
-      stacks: [metallb, west-operator-base, vcr-backend, provider-boundary, west-trust-bootstrap, west-site, provider-gateway, valkey, consumer-west-a, consumer-west-b]
+      stacks: [metallb, west-operator-base, west-operator-seed, vcr-backend, provider-boundary, west-trust-bootstrap, west-site, site-trust-bootstrap, provider-gateway, valkey, consumer-west-a, consumer-west-b]
       properties:
         region: west
         role: combined
@@ -24,7 +24,7 @@ spec:
         operatorImage: "ghcr.io/praxis-proxy/grid-operator:v0.1.3"
         vcrImage: "ghcr.io/neuralmagic/vllm-vcr:vllm0.23"
         vcrImagePullPolicy: IfNotPresent
-        imagePullPolicy: IfNotPresent
+        imagePullPolicy: Never
         gatewayImageRepo: "ghcr.io/praxis-proxy/grid-ai-rollup"
         gatewayImageTag: "v0.1.3"
         operatorImageRepo: "ghcr.io/praxis-proxy/grid-operator"
@@ -33,7 +33,7 @@ spec:
         overlaySyncImageTag: "v0.1.3"
 
     - name: central
-      stacks: [metallb, central-operator-base, vcr-backend, provider-boundary, central-trust-bootstrap, central-site, provider-gateway]
+      stacks: [metallb, central-operator-base, central-operator-seed, vcr-backend, provider-boundary, central-trust-bootstrap, central-site, site-trust-bootstrap, provider-gateway]
       properties:
         region: central
         role: combined
@@ -42,7 +42,7 @@ spec:
         operatorImage: "ghcr.io/praxis-proxy/grid-operator:v0.1.3"
         vcrImage: "ghcr.io/neuralmagic/vllm-vcr:vllm0.23"
         vcrImagePullPolicy: IfNotPresent
-        imagePullPolicy: IfNotPresent
+        imagePullPolicy: Never
         gatewayImageRepo: "ghcr.io/praxis-proxy/grid-ai-rollup"
         gatewayImageTag: "v0.1.3"
         operatorImageRepo: "ghcr.io/praxis-proxy/grid-operator"
@@ -51,7 +51,7 @@ spec:
         overlaySyncImageTag: "v0.1.3"
 
     - name: east
-      stacks: [metallb, east-operator-base, vcr-backend, provider-boundary, east-trust-bootstrap, east-site, provider-gateway]
+      stacks: [metallb, east-operator-base, east-operator-seed, vcr-backend, provider-boundary, east-trust-bootstrap, east-site, site-trust-bootstrap, provider-gateway]
       properties:
         region: east
         role: combined
@@ -60,7 +60,7 @@ spec:
         operatorImage: "ghcr.io/praxis-proxy/grid-operator:v0.1.3"
         vcrImage: "ghcr.io/neuralmagic/vllm-vcr:vllm0.23"
         vcrImagePullPolicy: IfNotPresent
-        imagePullPolicy: IfNotPresent
+        imagePullPolicy: Never
         gatewayImageRepo: "ghcr.io/praxis-proxy/grid-ai-rollup"
         gatewayImageTag: "v0.1.3"
         operatorImageRepo: "ghcr.io/praxis-proxy/grid-operator"
@@ -99,7 +99,6 @@ spec:
             swim:
               siteName: "west"
               seeds: ""
-              advertiseAddress: "{{ captures.west.swim-lb-ip }}:7946"
               service:
                 enabled: true
                 type: "LoadBalancer"
@@ -118,6 +117,30 @@ spec:
           key: swim-lb-ip
           timeout: "60s"
           interval: "2s"
+
+    west-operator-seed:
+      description: Add the captured remote SWIM seeds to the west operator
+      steps:
+        - type: helm
+          release: grid-operator
+          chart: charts/grid-operator
+          version: "0.1.0"
+          namespace: grid-system
+          values:
+            image:
+              repository: "{{ cluster.properties.operatorImageRepo }}"
+              tag: "{{ cluster.properties.operatorImageTag }}"
+              pullPolicy: "{{ cluster.properties.imagePullPolicy }}"
+            swim:
+              siteName: "west"
+              seeds: "{{ captures.central.swim-lb-ip }}:7946,{{ captures.east.swim-lb-ip }}:7946"
+              advertiseAddress: "{{ captures.west.swim-lb-ip }}:7946"
+              service:
+                enabled: true
+                type: "LoadBalancer"
+            gateway:
+              serviceName: "provider-gateway"
+              port: "8443"
 
     central-operator-base:
       description: Central Grid operator initial deployment with SWIM LoadBalancer
@@ -135,7 +158,6 @@ spec:
             swim:
               siteName: "central"
               seeds: ""
-              advertiseAddress: "{{ captures.central.swim-lb-ip }}:7946"
               service:
                 enabled: true
                 type: "LoadBalancer"
@@ -154,6 +176,29 @@ spec:
           key: swim-lb-ip
           timeout: "60s"
           interval: "2s"
+    central-operator-seed:
+      description: Add the captured remote SWIM seeds to the central operator
+      steps:
+        - type: helm
+          release: grid-operator
+          chart: charts/grid-operator
+          version: "0.1.0"
+          namespace: grid-system
+          values:
+            image:
+              repository: "{{ cluster.properties.operatorImageRepo }}"
+              tag: "{{ cluster.properties.operatorImageTag }}"
+              pullPolicy: "{{ cluster.properties.imagePullPolicy }}"
+            swim:
+              siteName: "central"
+              seeds: "{{ captures.west.swim-lb-ip }}:7946,{{ captures.east.swim-lb-ip }}:7946"
+              advertiseAddress: "{{ captures.central.swim-lb-ip }}:7946"
+              service:
+                enabled: true
+                type: "LoadBalancer"
+            gateway:
+              serviceName: "provider-gateway"
+              port: "8443"
 
     east-operator-base:
       description: East Grid operator initial deployment with SWIM LoadBalancer
@@ -171,7 +216,6 @@ spec:
             swim:
               siteName: "east"
               seeds: ""
-              advertiseAddress: "{{ captures.east.swim-lb-ip }}:7946"
               service:
                 enabled: true
                 type: "LoadBalancer"
@@ -190,6 +234,29 @@ spec:
           key: swim-lb-ip
           timeout: "60s"
           interval: "2s"
+    east-operator-seed:
+      description: Add the captured remote SWIM seeds to the east operator
+      steps:
+        - type: helm
+          release: grid-operator
+          chart: charts/grid-operator
+          version: "0.1.0"
+          namespace: grid-system
+          values:
+            image:
+              repository: "{{ cluster.properties.operatorImageRepo }}"
+              tag: "{{ cluster.properties.operatorImageTag }}"
+              pullPolicy: "{{ cluster.properties.imagePullPolicy }}"
+            swim:
+              siteName: "east"
+              seeds: "{{ captures.west.swim-lb-ip }}:7946,{{ captures.central.swim-lb-ip }}:7946"
+              advertiseAddress: "{{ captures.east.swim-lb-ip }}:7946"
+              service:
+                enabled: true
+                type: "LoadBalancer"
+            gateway:
+              serviceName: "provider-gateway"
+              port: "8443"
 
     vcr-backend:
       description: vllm-vcr inference backend for demo scenarios
@@ -233,9 +300,9 @@ spec:
               kubectl --context "$context" apply -f -;
               sed -i -e "s/SITE_PLACEHOLDER/{{ cluster.name }}/g"
               -e "s/CANDIDATE_ID_PLACEHOLDER/$(case '{{ cluster.name }}' in west) echo f4c20a10;; central) echo c7fa24b0;; east) echo 9d876274;; esac)/g"
-              tests/e2e/topologies/grid-token-rate-limit/.forge/runtime/{{ cluster.name }}/provider/praxis.yaml;
+              .forge/runtime/{{ cluster.name }}/provider/praxis.yaml;
               kubectl --context "$context" -n grid-system create configmap provider-gateway-config
-              --from-file=praxis.yaml=tests/e2e/topologies/grid-token-rate-limit/.forge/runtime/{{ cluster.name }}/provider/praxis.yaml --dry-run=client -o yaml |
+              --from-file=praxis.yaml=.forge/runtime/{{ cluster.name }}/provider/praxis.yaml --dry-run=client -o yaml |
               kubectl --context "$context" apply -f -
 
     west-trust-bootstrap:
@@ -250,7 +317,7 @@ spec:
             - -c
             - >-
               set -euo pipefail;
-              runtime=tests/e2e/topologies/grid-token-rate-limit/.forge/runtime/{{ cluster.name }}/trust.yaml;
+              runtime=.forge/runtime/{{ cluster.name }}/trust.yaml;
               central=$(kubectl --context kind-grid-token-rate-limit-central -n grid-system get secret provider-gateway-tls -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -outform DER | sha256sum | awk '{print $1}');
               east=$(kubectl --context kind-grid-token-rate-limit-east -n grid-system get secret provider-gateway-tls -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -outform DER | sha256sum | awk '{print $1}');
               sed -i "s/PEER_CENTRAL_FINGERPRINT/${central}/g; s/PEER_EAST_FINGERPRINT/${east}/g" "$runtime";
@@ -268,7 +335,7 @@ spec:
             - -c
             - >-
               set -euo pipefail;
-              runtime=tests/e2e/topologies/grid-token-rate-limit/.forge/runtime/{{ cluster.name }}/trust.yaml;
+              runtime=.forge/runtime/{{ cluster.name }}/trust.yaml;
               west=$(kubectl --context kind-grid-token-rate-limit-west -n grid-system get secret provider-gateway-tls -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -outform DER | sha256sum | awk '{print $1}');
               east=$(kubectl --context kind-grid-token-rate-limit-east -n grid-system get secret provider-gateway-tls -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -outform DER | sha256sum | awk '{print $1}');
               sed -i "s/PEER_WEST_FINGERPRINT/${west}/g; s/PEER_EAST_FINGERPRINT/${east}/g" "$runtime";
@@ -286,7 +353,7 @@ spec:
             - -c
             - >-
               set -euo pipefail;
-              runtime=tests/e2e/topologies/grid-token-rate-limit/.forge/runtime/{{ cluster.name }}/trust.yaml;
+              runtime=.forge/runtime/{{ cluster.name }}/trust.yaml;
               west=$(kubectl --context kind-grid-token-rate-limit-west -n grid-system get secret provider-gateway-tls -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -outform DER | sha256sum | awk '{print $1}');
               central=$(kubectl --context kind-grid-token-rate-limit-central -n grid-system get secret provider-gateway-tls -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -outform DER | sha256sum | awk '{print $1}');
               sed -i "s/PEER_WEST_FINGERPRINT/${west}/g; s/PEER_CENTRAL_FINGERPRINT/${central}/g" "$runtime";
@@ -339,6 +406,11 @@ spec:
               region: west
               zone: west-1
               providerSiteLabel: west
+              egress:
+                address: "{{ captures.west.provider-gateway-ip }}:8443"
+                tls:
+                  mode: Mutual
+                  serverName: west.grid.internal
             inferenceProviders:
               - name: vcr-west-provider
                 gridNetworkRef: grid-token-rate-limit
@@ -405,6 +477,11 @@ spec:
               region: central
               zone: central-1
               providerSiteLabel: central
+              egress:
+                address: "{{ captures.central.provider-gateway-ip }}:8443"
+                tls:
+                  mode: Mutual
+                  serverName: central.grid.internal
             inferenceProviders:
               - name: vcr-central-provider
                 gridNetworkRef: grid-token-rate-limit
@@ -471,6 +548,11 @@ spec:
               region: east
               zone: east-1
               providerSiteLabel: east
+              egress:
+                address: "{{ captures.east.provider-gateway-ip }}:8443"
+                tls:
+                  mode: Mutual
+                  serverName: east.grid.internal
             inferenceProviders:
               - name: vcr-east-provider
                 gridNetworkRef: grid-token-rate-limit
@@ -492,6 +574,20 @@ spec:
                   path: /health
                   interval: "30s"
                   timeout: "5s"
+
+    site-trust-bootstrap:
+      description: Pin the generated local provider certificate for GridSite probing
+      steps:
+        - type: exec
+          command:
+            - bash
+            - -c
+            - >-
+              set -euo pipefail;
+              context=kind-grid-token-rate-limit-{{ cluster.name }};
+              fingerprint=$(kubectl --context "$context" -n grid-system get secret provider-gateway-tls -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -outform DER | sha256sum | awk '{print $1}');
+              kubectl --context "$context" -n grid-system patch gridsite "{{ cluster.name }}" --type merge
+              -p "{\"spec\":{\"trust\":{\"canonicalFingerprints\":[\"$fingerprint\"]}}}"
 
     provider-gateway:
       description: Praxis provider gateway with mTLS and credential mounts
@@ -571,7 +667,7 @@ spec:
             - >-
               kubectl --context kind-grid-token-rate-limit-{{ cluster.name }} -n grid-system
               create configmap consumer-gateway-config
-              --from-file=praxis.yaml=tests/e2e/topologies/grid-token-rate-limit/.forge/runtime/{{ cluster.name }}/consumer/praxis.yaml
+              --from-file=praxis.yaml=.forge/runtime/{{ cluster.name }}/consumer/praxis.yaml
               --dry-run=client -o yaml |
               kubectl --context kind-grid-token-rate-limit-{{ cluster.name }} apply -f -
         - type: helm
@@ -652,7 +748,7 @@ spec:
             - >-
               kubectl --context kind-grid-token-rate-limit-{{ cluster.name }} -n grid-system
               create configmap consumer-gateway-a-config
-              --from-file=praxis.yaml=tests/e2e/topologies/grid-token-rate-limit/.forge/runtime/{{ cluster.name }}/consumer-a/praxis.yaml
+              --from-file=praxis.yaml=.forge/runtime/{{ cluster.name }}/consumer-a/praxis.yaml
               --dry-run=client -o yaml |
               kubectl --context kind-grid-token-rate-limit-{{ cluster.name }} apply -f -
         - type: helm
@@ -717,7 +813,7 @@ spec:
             - >-
               kubectl --context kind-grid-token-rate-limit-{{ cluster.name }} -n grid-system
               create configmap consumer-gateway-b-config
-              --from-file=praxis.yaml=tests/e2e/topologies/grid-token-rate-limit/.forge/runtime/{{ cluster.name }}/consumer-b/praxis.yaml
+              --from-file=praxis.yaml=.forge/runtime/{{ cluster.name }}/consumer-b/praxis.yaml
               --dry-run=client -o yaml |
               kubectl --context kind-grid-token-rate-limit-{{ cluster.name }} apply -f -
         - type: helm

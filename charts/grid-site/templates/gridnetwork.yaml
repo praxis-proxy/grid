@@ -31,6 +31,10 @@ spec:
   {{- with .Values.gridNetwork.zone }}
   zone: {{ . | quote }}
   {{- end }}
+  {{- with .Values.gridNetwork.seeds }}
+  seeds:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
   {{- with .Values.gridNetwork.routingPolicy }}
   routingPolicy: {{ . | quote }}
   {{- end }}

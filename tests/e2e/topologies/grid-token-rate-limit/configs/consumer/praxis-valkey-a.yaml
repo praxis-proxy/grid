@@ -70,7 +70,7 @@ filter_chains:
       - filter: headers
         response_set:
           - name: X-Grid-Combined-Consumer-Gateway
-            value: "{{ cluster.name }}"
+            value: "consumer-gateway-a"
       - filter: intelligent_route
         overlay_file: /etc/praxis/routing/routing-overlay.json
         model_header: X-Model
