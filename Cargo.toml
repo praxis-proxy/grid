@@ -36,6 +36,7 @@ k8s-openapi = { version = "0.27.1", features = ["v1_32"] }
 kube = { version = "3.1.0", features = ["client", "derive", "runtime", "rustls-tls"] }
 prometheus = "0.14"
 rcgen = "0.14.8"
+ring = "0.17"
 rustls = { version = "0.23", default-features = false, features = ["logging", "std", "tls12"] }
 schemars = "1.2.1"
 sha2 = "0.10"
@@ -53,6 +54,7 @@ tracing = "0.1.44"
 rand = { version = "0.9", features = ["small_rng"] }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 uuid = { version = "1.23.4", features = ["v4"] }
+x509-parser = "0.18"
 zeroize = "1.8"
 
 [profile.release]

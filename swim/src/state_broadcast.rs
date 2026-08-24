@@ -63,7 +63,25 @@ pub struct StateBroadcast {
     /// `None` when the originating operator has no TLS certificate configured.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub site_cert_pem: Option<String>,
+
+    /// ECDSA P-256 signature (ASN.1 DER) over [`signable_bytes`](Self::signable_bytes).
+    ///
+    /// `None` when the originating site has no signing key configured, or
+    /// during the rollout window before every peer signs broadcasts. A
+    /// receiver only requires this field once it holds a pinned identity for
+    /// `origin_site`; see [`StateBroadcastHandler::receive_item`].
+    ///
+    /// [`StateBroadcastHandler::receive_item`]: foca::BroadcastHandler::receive_item
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature: Option<Vec<u8>>,
 }
+
+/// Raw uncompressed EC point, keyed by origin site name.
+///
+/// Deliberately opaque to *how* a pinned identity was established — that is
+/// an operator-level concern (see [`crate::signing`]).  An origin with no
+/// entry here is not yet enforced against a signature.
+pub type TrustStore = BTreeMap<String, Vec<u8>>;
 
 /// Base wire-format struct.
 ///
@@ -92,6 +110,10 @@ struct BroadcastExtension {
     gateway_address: Option<String>,
     /// Optional public site certificate PEM — never a private key.
     site_cert_pem: Option<String>,
+    /// Optional ECDSA P-256 signature over the base payload plus the other
+    /// extension fields. Absent on older peers and pre-rollout broadcasts.
+    #[serde(default)]
+    signature: Option<Vec<u8>>,
 }
 
 impl StateBroadcast {
@@ -114,6 +136,7 @@ impl StateBroadcast {
             snapshot,
             gateway_address,
             site_cert_pem: None,
+            signature: None,
         }
     }
 
@@ -124,6 +147,31 @@ impl StateBroadcast {
     pub fn with_cert(mut self, site_cert_pem: Option<String>) -> Self {
         self.site_cert_pem = site_cert_pem;
         self
+    }
+
+    /// Attach a signature computed over [`signable_bytes`](Self::signable_bytes).
+    ///
+    /// Callers are responsible for computing `signature` (typically via
+    /// [`crate::signing::sign_ecdsa_p256`] over `self.signable_bytes()`)
+    /// before attaching it; this method performs no verification.
+    #[must_use]
+    pub fn with_signature(mut self, signature: Option<Vec<u8>>) -> Self {
+        self.signature = signature;
+        self
+    }
+
+    /// Return the canonical bytes this broadcast's signature covers.
+    ///
+    /// Equal to [`encode`](Self::encode) of this broadcast with `signature`
+    /// cleared, so a signature can never cover itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bincode encode error if the snapshot cannot be serialized.
+    pub fn signable_bytes(&self) -> Result<Vec<u8>, bincode::error::EncodeError> {
+        let mut unsigned = self.clone();
+        unsigned.signature = None;
+        unsigned.encode()
     }
 
     /// Return this broadcast's invalidation key.
@@ -211,10 +259,11 @@ impl StateBroadcast {
             snapshot: self.snapshot.clone(),
         };
         let mut bytes = bincode::serde::encode_to_vec(&v1, bincode::config::standard())?;
-        if self.gateway_address.is_some() || self.site_cert_pem.is_some() {
+        if self.gateway_address.is_some() || self.site_cert_pem.is_some() || self.signature.is_some() {
             let ext = BroadcastExtension {
                 gateway_address: self.gateway_address.clone(),
                 site_cert_pem: self.site_cert_pem.clone(),
+                signature: self.signature.clone(),
             };
             let ext_bytes = bincode::serde::encode_to_vec(&ext, bincode::config::standard())?;
             bytes.extend_from_slice(&ext_bytes);
@@ -241,17 +290,17 @@ impl StateBroadcast {
             bincode::serde::decode_from_slice(bytes, bincode::config::standard())?;
 
         let remaining = bytes.get(consumed..).unwrap_or(&[]);
-        let (gateway_address, site_cert_pem) = if remaining.is_empty() {
-            (None, None)
+        let (gateway_address, site_cert_pem, signature) = if remaining.is_empty() {
+            (None, None, None)
         } else {
             // Try the current extension struct format.
             match bincode::serde::decode_from_slice::<BroadcastExtension, _>(remaining, bincode::config::standard()) {
-                Ok((ext, _)) => (ext.gateway_address, ext.site_cert_pem),
+                Ok((ext, _)) => (ext.gateway_address, ext.site_cert_pem, ext.signature),
                 Err(_) => {
                     // Compatibility fallback: bare String encoding for gateway_address only.
                     match bincode::serde::decode_from_slice::<String, _>(remaining, bincode::config::standard()) {
-                        Ok((gw, _)) => (Some(gw), None),
-                        Err(_) => (None, None),
+                        Ok((gw, _)) => (Some(gw), None, None),
+                        Err(_) => (None, None, None),
                     }
                 },
             }
@@ -264,6 +313,7 @@ impl StateBroadcast {
             snapshot: v1.snapshot,
             gateway_address,
             site_cert_pem,
+            signature,
         })
     }
 }
@@ -334,6 +384,29 @@ pub enum StateBroadcastError {
         expected: u16,
         /// Actual version.
         actual: u16,
+    },
+
+    /// The origin has a pinned identity but the broadcast carries no signature.
+    #[error("state broadcast from pinned origin {origin_site} carries no signature")]
+    MissingSignature {
+        /// Site that originated the broadcast.
+        origin_site: String,
+    },
+
+    /// The broadcast's signature does not verify against the pinned identity.
+    #[error("state broadcast from pinned origin {origin_site} failed signature verification")]
+    SignatureInvalid {
+        /// Site that originated the broadcast.
+        origin_site: String,
+    },
+
+    /// The broadcast's own bytes could not be re-encoded to check its signature.
+    #[error("state broadcast from origin {origin_site} could not be re-encoded for signature verification: {source}")]
+    SignableEncode {
+        /// Site that originated the broadcast.
+        origin_site: String,
+        /// Underlying encode error.
+        source: bincode::error::EncodeError,
     },
 }
 
@@ -453,6 +526,17 @@ pub struct StateBroadcastHandler {
     /// Watch channel for broadcasting public cert PEM updates to observers.
     cert_pems_tx: watch::Sender<BTreeMap<String, String>>,
 
+    /// Sender half of the pinned-identity trust store.
+    ///
+    /// Exposed via [`trust_store_sender`](Self::trust_store_sender) so a
+    /// caller (e.g. the operator, once it has established which certificate
+    /// pins an origin site's signing identity) can populate or update
+    /// entries at runtime, after this handler has been moved into foca.
+    trust_store_tx: watch::Sender<TrustStore>,
+
+    /// Receiver half read synchronously by [`receive_item`](foca::BroadcastHandler::receive_item).
+    trust_store_rx: watch::Receiver<TrustStore>,
+
     /// Hard bound for per-origin revision and metadata maps.
     max_origins: usize,
 }
@@ -479,6 +563,7 @@ impl StateBroadcastHandler {
         let (tx, _) = watch::channel(GridStateSnapshot::new(site_id));
         let (gw_tx, _) = watch::channel(BTreeMap::new());
         let (cert_tx, _) = watch::channel(BTreeMap::new());
+        let (trust_tx, trust_rx) = watch::channel(TrustStore::new());
         let max_origins = max_origins.max(1);
         let retained = Arc::new(Mutex::new(RetainedOrigins::default()));
         let control = OriginStateHandle {
@@ -493,10 +578,25 @@ impl StateBroadcastHandler {
                 retained,
                 gateway_addrs_tx: gw_tx,
                 cert_pems_tx: cert_tx,
+                trust_store_tx: trust_tx,
+                trust_store_rx: trust_rx,
                 max_origins,
             },
             control,
         )
+    }
+
+    /// Return a sender for updating the pinned-identity trust store.
+    ///
+    /// Clone and hold this to push pinned identities in after `self` has
+    /// been moved into foca. An origin site with no entry is not yet
+    /// enforced against a signature — see [`receive_item`]'s doc comment for
+    /// the rollout-transition rationale.
+    ///
+    /// [`receive_item`]: foca::BroadcastHandler::receive_item
+    #[must_use]
+    pub fn trust_store_sender(&self) -> watch::Sender<TrustStore> {
+        self.trust_store_tx.clone()
     }
 
     /// Return a receiver for the live merged grid-state snapshot.
@@ -644,6 +744,38 @@ impl StateBroadcastHandler {
         });
     }
 
+    /// Reject a broadcast that fails signature verification against a
+    /// pinned identity.
+    ///
+    /// An origin with **no** entry in the trust store passes through
+    /// unchecked — this is deliberate: it lets a signed-broadcast rollout
+    /// proceed incrementally as origins are pinned one at a time, rather
+    /// than requiring a synchronized flag-day cutover. Once nerdalert's
+    /// key-source question (grid#75) is resolved and the operator starts
+    /// populating pins, this becomes the enforcement point; until then it is
+    /// a no-op for every unpinned origin.
+    fn verify_signature_if_pinned(&self, broadcast: &StateBroadcast) -> Result<(), StateBroadcastError> {
+        let Some(pinned_pubkey) = self.trust_store_rx.borrow().get(&broadcast.origin_site).cloned() else {
+            return Ok(());
+        };
+        let Some(signature) = broadcast.signature.as_ref() else {
+            return Err(StateBroadcastError::MissingSignature {
+                origin_site: broadcast.origin_site.clone(),
+            });
+        };
+        let signable = broadcast
+            .signable_bytes()
+            .map_err(|source| StateBroadcastError::SignableEncode {
+                origin_site: broadcast.origin_site.clone(),
+                source,
+            })?;
+        crate::signing::verify_ecdsa_p256(&pinned_pubkey, &signable, signature).map_err(|_invalid| {
+            StateBroadcastError::SignatureInvalid {
+                origin_site: broadcast.origin_site.clone(),
+            }
+        })
+    }
+
     /// Enforce the hard origin bound before accepting an unknown origin.
     fn make_room_for(&self, incoming_origin: &str) {
         let origins = self.known_origins();
@@ -677,6 +809,7 @@ impl foca::BroadcastHandler<NodeId> for StateBroadcastHandler {
                 actual: broadcast.version,
             });
         }
+        self.verify_signature_if_pinned(&broadcast)?;
         self.make_room_for(&broadcast.origin_site);
 
         // Metadata-only broadcasts (gateway address or cert PEM, empty CRDT
@@ -765,6 +898,117 @@ mod tests {
         handler
             .receive_item(&bytes, None)
             .unwrap_or_else(|_| std::process::abort())
+    }
+
+    /// Generate an ECDSA P-256 signing key plus the raw SPKI EC point a
+    /// verifier needs, independent of *how* a real deployment would source
+    /// or pin this key material (grid#75, still open).
+    fn generate_signing_key_and_pubkey() -> (Vec<u8>, Vec<u8>) {
+        let key_pair = rcgen::KeyPair::generate().unwrap_or_else(|_| std::process::abort());
+        let pkcs8_der = key_pair.serialize_der();
+        let params = rcgen::CertificateParams::new(vec!["spike.grid.internal".to_owned()])
+            .unwrap_or_else(|_| std::process::abort());
+        let cert = params.self_signed(&key_pair).unwrap_or_else(|_| std::process::abort());
+        let (_, parsed) = x509_parser::parse_x509_certificate(cert.der()).unwrap_or_else(|_| std::process::abort());
+        let raw_pubkey = parsed.public_key().subject_public_key.as_ref().to_vec();
+        (pkcs8_der, raw_pubkey)
+    }
+
+    #[test]
+    fn receive_item_accepts_a_correctly_signed_broadcast_from_a_pinned_origin() {
+        let (mut handler, _control) = StateBroadcastHandler::with_capacity("site-local".to_owned(), 8);
+        let (pkcs8_der, raw_pubkey) = generate_signing_key_and_pubkey();
+        handler
+            .trust_store_sender()
+            .send_modify(|store| drop(store.insert("site-p".to_owned(), raw_pubkey)));
+
+        let unsigned = StateBroadcast::new("site-p".to_owned(), 1, snapshot("site-p", 1, 0.1), None);
+        let signature = crate::signing::sign_ecdsa_p256(
+            &pkcs8_der,
+            &unsigned.signable_bytes().unwrap_or_else(|_| std::process::abort()),
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        let signed = unsigned.with_signature(Some(signature));
+
+        let key = receive(&mut handler, &signed);
+
+        assert!(
+            key.is_some(),
+            "a correctly signed broadcast from a pinned origin must be accepted"
+        );
+        assert!(
+            handler.snapshot().provider("net", "site-p", "provider").is_some(),
+            "the signed broadcast's provider state must be merged"
+        );
+    }
+
+    #[test]
+    fn receive_item_rejects_an_unsigned_broadcast_from_a_pinned_origin() {
+        let (mut handler, _control) = StateBroadcastHandler::with_capacity("site-local".to_owned(), 8);
+        let (_pkcs8_der, raw_pubkey) = generate_signing_key_and_pubkey();
+        handler
+            .trust_store_sender()
+            .send_modify(|store| drop(store.insert("site-p".to_owned(), raw_pubkey)));
+        let unsigned = StateBroadcast::new("site-p".to_owned(), 1, snapshot("site-p", 1, 0.1), None);
+        let bytes = unsigned.encode().unwrap_or_else(|_| std::process::abort());
+
+        let result = handler.receive_item(&bytes, None);
+
+        assert!(
+            matches!(&result, Err(StateBroadcastError::MissingSignature { origin_site }) if origin_site.as_str() == "site-p"),
+            "an unsigned broadcast from a pinned origin must be rejected, got {result:?}"
+        );
+        assert!(
+            handler.snapshot().provider("net", "site-p", "provider").is_none(),
+            "a rejected broadcast must not be merged into the snapshot"
+        );
+    }
+
+    #[test]
+    fn receive_item_rejects_a_broadcast_signed_by_the_wrong_key_for_a_pinned_origin() {
+        let (mut handler, _control) = StateBroadcastHandler::with_capacity("site-local".to_owned(), 8);
+        let (_correct_key, pinned_pubkey) = generate_signing_key_and_pubkey();
+        let (wrong_key, _wrong_pubkey) = generate_signing_key_and_pubkey();
+        handler
+            .trust_store_sender()
+            .send_modify(|store| drop(store.insert("site-p".to_owned(), pinned_pubkey)));
+
+        let unsigned = StateBroadcast::new("site-p".to_owned(), 1, snapshot("site-p", 1, 0.1), None);
+        let signature = crate::signing::sign_ecdsa_p256(
+            &wrong_key,
+            &unsigned.signable_bytes().unwrap_or_else(|_| std::process::abort()),
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        let bytes = unsigned
+            .with_signature(Some(signature))
+            .encode()
+            .unwrap_or_else(|_| std::process::abort());
+
+        let result = handler.receive_item(&bytes, None);
+
+        assert!(
+            matches!(&result, Err(StateBroadcastError::SignatureInvalid { origin_site }) if origin_site.as_str() == "site-p"),
+            "a broadcast signed by a key other than the pinned one must be rejected, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn receive_item_still_merges_an_unsigned_broadcast_from_an_origin_with_no_pinned_identity() {
+        // Guards the incremental-rollout property documented on
+        // `verify_signature_if_pinned`: no synchronized flag-day cutover.
+        let (mut handler, _control) = StateBroadcastHandler::with_capacity("site-local".to_owned(), 8);
+        let unsigned = StateBroadcast::new("site-p".to_owned(), 1, snapshot("site-p", 1, 0.1), None);
+
+        let key = receive(&mut handler, &unsigned);
+
+        assert!(
+            key.is_some(),
+            "an unsigned broadcast from an unpinned origin must still be accepted"
+        );
+        assert!(
+            handler.snapshot().provider("net", "site-p", "provider").is_some(),
+            "the unsigned broadcast's provider state must be merged while the origin is unpinned"
+        );
     }
 
     #[test]

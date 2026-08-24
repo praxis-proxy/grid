@@ -2262,11 +2262,14 @@ dependencies = [
  "crdt",
  "foca",
  "rand",
+ "rcgen",
+ "ring",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "x509-parser",
 ]
 
 [[package]]
