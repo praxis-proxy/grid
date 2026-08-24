@@ -1430,12 +1430,30 @@ fn determine_phase(network: &GridNetwork, grid_id: &str, membership: Option<&Mem
     {
         return hint;
     }
-    // Existing static phase logic (no live membership yet).
+    // No live phase hint. `phase_hint` returns `Some` only when at least one
+    // Alive/Degraded peer exists, so we reach here when the network has no peers
+    // yet — either the SWIM runtime is not up (`membership` is `None`) or it is
+    // up but no peers have joined (`Some`, empty snapshot).
     let has_tls = network.spec.tls.ca_secret_ref.is_some();
-    if has_tls {
-        GridNetworkPhase::Initializing
+    if !has_tls {
+        return GridNetworkPhase::Pending;
+    }
+    // A single-site / combined deployment legitimately has zero SWIM peers —
+    // peers are other *sites*, not intra-site gateways or pods. When no seeds
+    // are configured, this network is standalone, so a running SWIM runtime
+    // (`membership.is_some()`) with TLS trust material is a locally operational
+    // control plane and reports `Active` instead of pinning `Initializing`
+    // forever. Peer connectivity is reported separately via
+    // `status.connectedSites`.
+    //
+    // When seeds ARE configured the network expects peers, so a peerless
+    // snapshot stays `Initializing` until at least one peer is observed (handled
+    // by `phase_hint` above). `membership.is_none()` means the SWIM runtime is
+    // not up yet, which also stays `Initializing`.
+    if membership.is_some() && network.spec.seeds.is_empty() {
+        GridNetworkPhase::Active
     } else {
-        GridNetworkPhase::Pending
+        GridNetworkPhase::Initializing
     }
 }
 
@@ -2704,6 +2722,48 @@ mod tests {
             phase,
             GridNetworkPhase::Active,
             "Alive membership must override TLS-Initializing phase"
+        );
+    }
+
+    #[test]
+    fn determine_phase_standalone_single_site_reaches_active() {
+        // Single-site / combined deployment: no seeds, no SWIM peers. With TLS
+        // trust material and the SWIM runtime up (Some, but empty membership),
+        // the local control plane is operational and reports Active rather than
+        // staying Initializing forever.
+        let mut network = base_network();
+        network.spec.tls.ca_secret_ref = Some(crate::crd::grid_network::SecretRef {
+            name: "ca".to_owned(),
+            namespace: "default".to_owned(),
+            key: None,
+        });
+        network.spec.seeds.clear();
+        let empty = MembershipSnapshot::default();
+        let phase = determine_phase(&network, "some-id", Some(&empty));
+        assert_eq!(
+            phase,
+            GridNetworkPhase::Active,
+            "peerless single-site (no seeds) with SWIM up and TLS must reach Active"
+        );
+    }
+
+    #[test]
+    fn determine_phase_seeded_but_peerless_stays_initializing() {
+        // With seeds configured the network expects peers; until at least one is
+        // observed it must stay Initializing and not prematurely claim Active.
+        let mut network = base_network();
+        network.spec.tls.ca_secret_ref = Some(crate::crd::grid_network::SecretRef {
+            name: "ca".to_owned(),
+            namespace: "default".to_owned(),
+            key: None,
+        });
+        network.spec.seeds = vec!["grid.peer:7946".to_owned()];
+        let empty = MembershipSnapshot::default();
+        let phase = determine_phase(&network, "some-id", Some(&empty));
+        assert_eq!(
+            phase,
+            GridNetworkPhase::Initializing,
+            "seeded network with no peers observed yet must stay Initializing"
         );
     }
 
