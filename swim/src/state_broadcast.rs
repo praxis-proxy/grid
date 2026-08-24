@@ -755,25 +755,33 @@ impl StateBroadcastHandler {
     /// populating pins, this becomes the enforcement point; until then it is
     /// a no-op for every unpinned origin.
     fn verify_signature_if_pinned(&self, broadcast: &StateBroadcast) -> Result<(), StateBroadcastError> {
+        /// Rejection log message shared by every failure branch below.
+        ///
+        /// Deliberately carries no payload contents, matching grid#75's
+        /// review request for bounded rejection metrics that never log
+        /// broadcast bodies; `reason` stays a small closed set of values.
+        const REJECTED: &str = "rejecting pinned-origin state broadcast";
+
         let Some(pinned_pubkey) = self.trust_store_rx.borrow().get(&broadcast.origin_site).cloned() else {
             return Ok(());
         };
+        let origin_site = broadcast.origin_site.clone();
         let Some(signature) = broadcast.signature.as_ref() else {
-            return Err(StateBroadcastError::MissingSignature {
-                origin_site: broadcast.origin_site.clone(),
-            });
+            tracing::warn!(origin_site = %origin_site, reason = "missing_signature", REJECTED);
+            return Err(StateBroadcastError::MissingSignature { origin_site });
         };
-        let signable = broadcast
-            .signable_bytes()
-            .map_err(|source| StateBroadcastError::SignableEncode {
-                origin_site: broadcast.origin_site.clone(),
-                source,
-            })?;
-        crate::signing::verify_ecdsa_p256(&pinned_pubkey, &signable, signature).map_err(|_invalid| {
-            StateBroadcastError::SignatureInvalid {
-                origin_site: broadcast.origin_site.clone(),
-            }
-        })
+        let signable = match broadcast.signable_bytes() {
+            Ok(bytes) => bytes,
+            Err(source) => {
+                tracing::warn!(origin_site = %origin_site, reason = "signable_encode", REJECTED);
+                return Err(StateBroadcastError::SignableEncode { origin_site, source });
+            },
+        };
+        if crate::signing::verify_ecdsa_p256(&pinned_pubkey, &signable, signature).is_err() {
+            tracing::warn!(origin_site = %origin_site, reason = "signature_invalid", REJECTED);
+            return Err(StateBroadcastError::SignatureInvalid { origin_site });
+        }
+        Ok(())
     }
 
     /// Enforce the hard origin bound before accepting an unknown origin.
