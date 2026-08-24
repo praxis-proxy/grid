@@ -127,4 +127,25 @@ mod tests {
 
         assert!(matches!(result, Err(SigningError::InvalidKey)));
     }
+
+    #[test]
+    fn invalid_key_error_message_is_descriptive() {
+        assert!(SigningError::InvalidKey.to_string().contains("PKCS8"));
+    }
+
+    #[test]
+    fn signing_failed_error_message_is_descriptive() {
+        // SigningFailed only arises from an RNG failure inside ring's sign
+        // call, which cannot be triggered deterministically through this
+        // module's public API. Constructed directly to verify the message
+        // wording, matching this codebase's `..._error_formats_correctly`
+        // convention for defensive error variants (see e.g.
+        // `node::tests::state_broadcast_error_formats_correctly`).
+        assert!(SigningError::SigningFailed.to_string().contains("signing"));
+    }
+
+    #[test]
+    fn verification_invalid_error_message_is_descriptive() {
+        assert!(VerificationError::Invalid.to_string().contains("verification"));
+    }
 }

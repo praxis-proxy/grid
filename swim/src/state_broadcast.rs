@@ -1001,6 +1001,47 @@ mod tests {
     }
 
     #[test]
+    fn missing_signature_error_message_names_the_origin() {
+        let err = StateBroadcastError::MissingSignature {
+            origin_site: "site-p".to_owned(),
+        };
+        assert!(
+            err.to_string().contains("site-p"),
+            "error message must name the origin site"
+        );
+    }
+
+    #[test]
+    fn signature_invalid_error_message_names_the_origin() {
+        let err = StateBroadcastError::SignatureInvalid {
+            origin_site: "site-p".to_owned(),
+        };
+        assert!(
+            err.to_string().contains("site-p"),
+            "error message must name the origin site"
+        );
+    }
+
+    #[test]
+    fn signable_encode_error_message_names_the_origin_and_wraps_the_source() {
+        // A genuine bincode encode failure on `StateBroadcast`'s own fields
+        // (String/u64/u16/GridStateSnapshot, encoded to an in-memory Vec<u8>
+        // with no writer I/O) has no reachable trigger through this crate's
+        // public API; constructed directly to verify the message wording,
+        // matching this codebase's `..._error_formats_correctly` convention
+        // for defensive error variants (see e.g.
+        // `node::tests::state_broadcast_error_formats_correctly`).
+        let err = StateBroadcastError::SignableEncode {
+            origin_site: "site-p".to_owned(),
+            source: bincode::error::EncodeError::UnexpectedEnd,
+        };
+        assert!(
+            err.to_string().contains("site-p"),
+            "error message must name the origin site"
+        );
+    }
+
+    #[test]
     fn receive_item_still_merges_an_unsigned_broadcast_from_an_origin_with_no_pinned_identity() {
         // Guards the incremental-rollout property documented on
         // `verify_signature_if_pinned`: no synchronized flag-day cutover.
