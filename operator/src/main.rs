@@ -59,10 +59,14 @@ use kube::{
 use operator::{
     cli::Cli,
     controller::{
+        agent_tool_provider,
         grid_network::{self, OperatorCtx},
         grid_site, inference_provider,
     },
-    crd::{grid_network::GridNetwork, grid_site::GridSite, inference_provider::InferenceProvider},
+    crd::{
+        agent_tool_provider::AgentToolProvider, grid_network::GridNetwork, grid_site::GridSite,
+        inference_provider::InferenceProvider,
+    },
     gateway,
     swim_runtime::{self, RevisionLease, SwimConfig},
 };
@@ -72,10 +76,34 @@ use operator::{
 // ---------------------------------------------------------------------------
 
 #[tokio::main]
-#[expect(clippy::large_stack_frames, reason = "top-level binary with tokio runtime")]
+#[expect(
+    clippy::large_stack_frames,
+    clippy::too_many_lines,
+    reason = "top-level binary with tokio runtime; startup sequence (crypto provider, CLI parsing, \
+              SWIM bootstrap, controller fan-out) reads clearer sequential than split further"
+)]
 async fn main() {
     tracing_subscriber::fmt::init();
     tracing::info!("starting grid-operator");
+
+    // Explicit process-wide rustls crypto-provider choice.
+    //
+    // `InferenceProvider`'s probe (`inference_provider.rs`) builds a
+    // `hyper-rustls` client via `.with_native_roots()`, which relies on
+    // `rustls` auto-detecting a single process-wide `CryptoProvider`. The
+    // `AgentToolProvider` MCP probe (PR 2 of grid#41) links in `reqwest`
+    // (via `rmcp`'s reqwest-backed transport) using its `rustls-no-provider`
+    // feature specifically to avoid pulling in `aws-lc-rs` alongside `ring`
+    // (see the workspace `Cargo.toml` comment on the `reqwest`/`rmcp`
+    // entries) — but that feature means `reqwest` will no longer install a
+    // default provider on our behalf either, so `Client::builder().build()`
+    // panics with "No rustls crypto provider is configured" unless one is
+    // installed explicitly first. Installing `ring` here, once, up front,
+    // covers both `hyper-rustls` and `reqwest` for every reconciler in this
+    // binary, regardless of which one runs first.
+    if rustls::crypto::ring::default_provider().install_default().is_err() {
+        tracing::warn!("rustls default CryptoProvider already installed; continuing");
+    }
 
     let config = Cli::parse();
 
@@ -103,6 +131,7 @@ async fn main() {
         run_network_controller(client.clone(), Arc::clone(&ctx)),
         run_site_controller(client.clone()),
         run_provider_controller(client.clone()),
+        run_agent_tool_provider_controller(client.clone()),
         run_metrics_server(),
     );
 
@@ -519,6 +548,32 @@ async fn run_provider_controller(client: Client) -> Result<(), Box<dyn std::erro
             match result {
                 Ok((obj, _action)) => tracing::info!(%obj, "reconciled InferenceProvider"),
                 Err(e) => tracing::error!(error = ?e, "InferenceProvider watch error"),
+            }
+        })
+        .await;
+
+    Ok(())
+}
+
+/// Run the [`AgentToolProvider`] controller (grid#41).
+///
+/// Watches `AgentToolProvider` resources. Mirrors
+/// [`run_provider_controller`]'s structure; cross-resource watches for
+/// `GridNetwork`/`GridSite` changes are a follow-up, matching
+/// [`InferenceProvider`]'s own documented watch limitation.
+async fn run_agent_tool_provider_controller(client: Client) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let api = Api::<AgentToolProvider>::all(client.clone());
+
+    Controller::new(api, watcher::Config::default())
+        .run(
+            agent_tool_provider::reconcile,
+            agent_tool_provider::error_policy,
+            Arc::new(client),
+        )
+        .for_each(|result| async {
+            match result {
+                Ok((obj, _action)) => tracing::info!(%obj, "reconciled AgentToolProvider"),
+                Err(e) => tracing::error!(error = ?e, "AgentToolProvider watch error"),
             }
         })
         .await;

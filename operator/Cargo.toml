@@ -24,6 +24,8 @@ k8s-openapi = { workspace = true }
 kube = { workspace = true }
 prometheus = { workspace = true }
 schemars = { workspace = true }
+reqwest = { workspace = true }
+rmcp = { workspace = true }
 rustls = { workspace = true }
 sha2 = { workspace = true }
 serde = { workspace = true }
@@ -39,6 +41,9 @@ uuid = { workspace = true }
 zeroize = { workspace = true }
 
 [dev-dependencies]
+# Server-side rmcp features, only for the mcp_probe integration tests, which
+# spin up a real Streamable HTTP MCP server to probe against.
+rmcp = { workspace = true, features = ["server", "transport-streamable-http-server"] }
 tower = { workspace = true }
 
 [lints]

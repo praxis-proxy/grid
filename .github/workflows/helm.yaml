@@ -92,7 +92,7 @@ jobs:
         run: helm plugin install https://github.com/helm-unittest/helm-unittest --version "${HELM_UNITTEST_VERSION}"
 
       - name: Chart template unit tests
-        run: helm unittest charts/grid-site
+        run: helm unittest charts/grid-site charts/grid-operator
 
       - name: Validate charts (static)
         run: ./scripts/verify-helm-chart.sh

@@ -17,10 +17,14 @@
 //! independently.
 
 use kube::CustomResourceExt as _;
-use operator::crd::{grid_network::GridNetwork, grid_site::GridSite, inference_provider::InferenceProvider};
+use operator::crd::{
+    agent_tool_provider::AgentToolProvider, grid_network::GridNetwork, grid_site::GridSite,
+    inference_provider::InferenceProvider,
+};
 
 fn main() {
     let crds = [
+        serde_json::to_value(AgentToolProvider::crd()),
         serde_json::to_value(GridNetwork::crd()),
         serde_json::to_value(GridSite::crd()),
         serde_json::to_value(InferenceProvider::crd()),

@@ -703,10 +703,40 @@ spec:
         grid.praxis-proxy.io/site: cluster-a
 ```
 
-**Phases**: Pending → Available → Degraded → Unavailable
+**Phases**: Pending → Available → Unavailable
+
+`Degraded` is not currently reachable for this CRD: unlike
+`InferenceProvider`'s metrics-scrape path, the MCP `tools/list` probe has no
+partial-success state to represent — it either succeeds (`Available`) or
+fails outright (`Unavailable`), mirroring `phase_and_reason_from_probe`'s and
+`phase_from_matching`'s explicit design (both are tested to never emit
+`Degraded`).
 
 **Status fields**: `discoveredTools` (auto-populated
-from MCP `tools/list`), `matchingSites`
+from MCP `tools/list`; a failed probe preserves the previous list rather than
+clearing it), `matchingSites`, `reason` (machine-readable; see reason codes
+below), `observedGeneration`
+
+#### AgentToolProvider reason codes
+
+| Reason | Phase | Meaning |
+|---|---|---|
+| `ProviderConfigInvalid` | Unavailable | Static spec validation failed (e.g. malformed `siteSelector`) before any `GridNetwork`/site/probe work runs. |
+| `GridNetworkNotFound` | Unavailable | `spec.gridNetworkRef` does not resolve to an existing `GridNetwork`. |
+| `CredentialSecretMissing` | Unavailable | `spec.auth.secretRef` does not resolve to an accessible Secret. |
+| `McpEndpointUnreachable` | Unavailable | The MCP endpoint could not be reached: transport failure, DNS error, timeout, or a blocked (SSRF-sensitive) address. |
+| `McpToolsListInvalidResponse` | Unavailable | The endpoint was reached but the `tools/list` exchange failed or returned an unparseable response. |
+| `McpAuthRejected` | Unavailable | The MCP server rejected the configured `spec.auth` credentials (HTTP 401/403). |
+| `McpAuthTokenInvalid` | Unavailable | The resolved `spec.auth` bearer token contains characters that cannot be sent as an HTTP header value; the probe fails closed rather than proceeding unauthenticated. |
+| `EndpointTlsSecretMissing` | Unavailable | A referenced TLS Secret does not exist (or the requested key is absent — see [`grid#58`](https://github.com/praxis-proxy/grid/issues/58) for a known misclassification of the latter). |
+| `EndpointTlsKeyMissing` | Unavailable | The expected key exists in the Secret but its value is empty. |
+| `EndpointTlsMaterialInvalid` | Unavailable | CA certificate PEM material could not be parsed. |
+| `EndpointTlsIdentityMismatch` | Unavailable | Client certificate or private key PEM material could not be parsed. |
+
+An empty `reason` with `phase: Available` means `SitesMatched`; an empty
+`reason` with `phase: Pending` means `AwaitingSiteMatch` — both are
+telemetry-only labels (`grid_mcp_probe_total`, Events), not persisted to
+`status.reason` itself.
 
 ## AgentToAgentProvider
 

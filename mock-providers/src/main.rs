@@ -29,8 +29,8 @@ struct Cli {
     #[arg(
         short,
         long,
-        required_unless_present_any = ["tcp_probe", "http_probe", "tls_probe_server"],
-        conflicts_with_all = ["tcp_probe", "http_probe", "tls_probe_server"]
+        required_unless_present_any = ["tcp_probe", "http_probe", "tls_probe_server", "mcp_server"],
+        conflicts_with_all = ["tcp_probe", "http_probe", "tls_probe_server", "mcp_server"]
     )]
     provider: Option<ProviderKind>,
 
@@ -38,10 +38,24 @@ struct Cli {
     #[arg(long, default_value = "8080")]
     port: u16,
 
+    /// Run a mock MCP (Model Context Protocol) `tools/list` server instead
+    /// of an AI provider mock.
+    #[arg(long, conflicts_with_all = ["provider", "tcp_probe", "http_probe", "tls_probe_server"])]
+    mcp_server: bool,
+
+    /// Comma-separated tool names the MCP mock reports from `tools/list`.
+    #[arg(long, default_value = "search", requires = "mcp_server")]
+    mcp_tools: String,
+
+    /// If set, the MCP mock rejects `tools/list` calls whose bearer token
+    /// does not match this value.
+    #[arg(long, requires = "mcp_server")]
+    mcp_bearer: Option<String>,
+
     /// Run a TLS-only probe server that accepts mTLS connections.
     #[arg(
         long,
-        conflicts_with_all = ["provider", "tcp_probe", "http_probe"],
+        conflicts_with_all = ["provider", "tcp_probe", "http_probe", "mcp_server"],
         requires_all = ["tls_cert", "tls_key", "tls_ca"]
     )]
     tls_probe_server: bool,
@@ -125,8 +139,13 @@ async fn main() {
         return;
     }
 
+    if cli.mcp_server {
+        run_mcp_server(cli.port, &cli.mcp_tools, cli.mcp_bearer.as_deref()).await;
+        return;
+    }
+
     let Some(provider) = cli.provider else {
-        eprintln!("either --provider, --tcp-probe, or --http-probe is required");
+        eprintln!("either --provider, --mcp-server, --tcp-probe, or --http-probe is required");
         std::process::exit(2);
     };
     let state = app_state();
@@ -281,6 +300,30 @@ async fn run_tls_probe_server(
     }
 }
 
+/// Run the mock MCP `tools/list` server (see `mock_providers::mcp`).
+async fn run_mcp_server(port: u16, tools_csv: &str, required_bearer: Option<&str>) {
+    let tools: Vec<String> = tools_csv
+        .split(',')
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(str::to_owned)
+        .collect();
+    let router = mock_providers::mcp::router(tools, required_bearer.map(str::to_owned));
+
+    let addr = format!("0.0.0.0:{port}");
+    eprintln!("mock-mcp-server listening on {addr}");
+
+    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap_or_else(|error| {
+        eprintln!("failed to bind {addr}: {error}");
+        std::process::exit(1);
+    });
+
+    axum::serve(listener, router).await.unwrap_or_else(|error| {
+        eprintln!("server error: {error}");
+        std::process::exit(1);
+    });
+}
+
 /// Run a single TCP probe for `NetworkPolicy` verification.
 async fn run_tcp_probe(target: &str, timeout: Duration) {
     if target.is_empty() || target.len() > 512 || timeout.is_zero() || timeout > Duration::from_secs(30) {
@@ -428,6 +471,38 @@ mod tests {
             Cli::try_parse_from(["mock-providers"]).is_err(),
             "at least one mode must be specified"
         );
+    }
+
+    #[test]
+    fn mcp_server_mode_parses_without_provider() {
+        let cli = Cli::try_parse_from([
+            "mock-providers",
+            "--mcp-server",
+            "--port",
+            "9091",
+            "--mcp-tools",
+            "search,read_file",
+            "--mcp-bearer",
+            "s3cr3t",
+        ])
+        .unwrap_or_else(|_| std::process::abort());
+        assert!(cli.provider.is_none());
+        assert!(cli.mcp_server);
+        assert_eq!(cli.mcp_tools, "search,read_file");
+        assert_eq!(cli.mcp_bearer.as_deref(), Some("s3cr3t"));
+    }
+
+    #[test]
+    fn mcp_server_conflicts_with_provider() {
+        let result = Cli::try_parse_from(["mock-providers", "--provider", "openai", "--mcp-server"]);
+        assert!(result.is_err(), "--mcp-server must conflict with --provider");
+    }
+
+    #[test]
+    fn mcp_tools_defaults_to_search_when_unset() {
+        let cli = Cli::try_parse_from(["mock-providers", "--mcp-server"]).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(cli.mcp_tools, "search");
+        assert!(cli.mcp_bearer.is_none());
     }
 
     #[test]

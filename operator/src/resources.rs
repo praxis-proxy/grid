@@ -48,5 +48,7 @@ pub mod trust_bundle;
 pub(crate) mod endpoint_tls;
 /// Typed gateway probe outcome and phase-transition contracts.
 pub(crate) mod gateway_probe;
+/// Live MCP `tools/list` probe for [`AgentToolProvider`](crate::crd::agent_tool_provider::AgentToolProvider).
+pub(crate) mod mcp_probe;
 /// TLS gateway probe — bounded handshake and peer certificate extraction.
 pub(crate) mod tls_probe;
