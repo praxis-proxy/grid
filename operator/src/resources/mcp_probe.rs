@@ -556,7 +556,12 @@ async fn attach_tls_ca(
         tracing::warn!(provider_identity, error = %e, "AgentToolProvider probe CA PEM unparseable");
         McpProbeOutcome::TlsConfigInvalid("EndpointTlsMaterialInvalid".to_owned())
     })?;
-    Ok(builder.add_root_certificate(ca_cert))
+    // `tls_certs_only` (not `add_root_certificate`, which merges this CA
+    // into reqwest's platform trust store) so a publicly trusted
+    // certificate cannot satisfy a probe explicitly configured to trust
+    // only this private CA -- `spec.tls.caSecretRef` documents the
+    // supplied CA as the endpoint's only trusted root.
+    Ok(builder.tls_certs_only([ca_cert]))
 }
 
 /// Read `client_ref`'s certificate and private key and attach them to
