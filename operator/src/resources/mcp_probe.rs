@@ -87,6 +87,14 @@ pub(crate) enum McpProbeOutcome {
     /// (HTTP 401/403-equivalent).
     AuthRejected,
 
+    /// The resolved `spec.auth` bearer token contains characters that
+    /// cannot be encoded into an HTTP header value, so no request was ever
+    /// sent. Fails closed rather than silently proceeding unauthenticated
+    /// — an endpoint that permits anonymous `tools/list` could otherwise
+    /// be marked `Available` without ever exercising the configured
+    /// credential.
+    AuthConfigInvalid,
+
     /// `spec.tls`'s referenced Secret material could not be resolved into a
     /// usable client certificate/CA bundle. Carries the stable status.reason
     /// string (`EndpointTls*`) rather than a fixed variant, since the exact
@@ -121,6 +129,7 @@ pub(crate) fn phase_and_reason_from_probe(
             Some("McpToolsListInvalidResponse".to_owned()),
         ),
         McpProbeOutcome::AuthRejected => (ProviderPhase::Unavailable, Some("McpAuthRejected".to_owned())),
+        McpProbeOutcome::AuthConfigInvalid => (ProviderPhase::Unavailable, Some("McpAuthTokenInvalid".to_owned())),
         McpProbeOutcome::TlsConfigInvalid(reason) => (ProviderPhase::Unavailable, Some(reason.clone())),
     }
 }
@@ -139,6 +148,7 @@ pub(crate) fn mcp_probe_outcome_label(outcome: &McpProbeOutcome) -> &'static str
         McpProbeOutcome::Unreachable => "Unreachable",
         McpProbeOutcome::InvalidResponse => "InvalidResponse",
         McpProbeOutcome::AuthRejected => "AuthRejected",
+        McpProbeOutcome::AuthConfigInvalid => "AuthConfigInvalid",
         McpProbeOutcome::TlsConfigInvalid(_) => "TlsConfigInvalid",
     }
 }
@@ -155,6 +165,7 @@ pub(crate) fn discovered_tools_after_probe(previous: &[String], outcome: &McpPro
         McpProbeOutcome::Unreachable
         | McpProbeOutcome::InvalidResponse
         | McpProbeOutcome::AuthRejected
+        | McpProbeOutcome::AuthConfigInvalid
         | McpProbeOutcome::TlsConfigInvalid(_) => previous.to_vec(),
     }
 }
@@ -205,20 +216,32 @@ pub(crate) fn should_use_custom_tls(tls_config: Option<&EndpointTlsConfig>) -> b
 /// header, matching an unauthenticated MCP server. The token value is
 /// wrapped in [`BearerToken`], which suppresses `Debug` output, so it is
 /// never visible if this map is accidentally logged.
-pub(crate) fn auth_header_map(token: Option<&BearerToken>) -> HashMap<HeaderName, HeaderValue> {
+///
+/// # Errors
+///
+/// Returns [`McpProbeOutcome::AuthConfigInvalid`] if `token` is `Some` but
+/// its value cannot be encoded into an HTTP header value. Fails closed
+/// rather than silently omitting the header: an endpoint that permits
+/// anonymous `tools/list` could otherwise be probed successfully — and
+/// marked `Available` — without the configured credential ever being
+/// exercised.
+pub(crate) fn auth_header_map(
+    token: Option<&BearerToken>,
+) -> Result<HashMap<HeaderName, HeaderValue>, McpProbeOutcome> {
     let mut headers = HashMap::new();
     let Some(token) = token else {
-        return headers;
+        return Ok(headers);
     };
     let bearer = format!("Bearer {}", token.expose_secret());
-    if let Ok(value) = HeaderValue::from_str(&bearer) {
-        headers.insert(http::header::AUTHORIZATION, value);
-    } else {
+    let value = HeaderValue::from_str(&bearer).map_err(|_invalid_header_value| {
         tracing::warn!(
-            "bearer token contains characters invalid in an HTTP header value; probe will proceed unauthenticated"
+            "bearer token contains characters invalid in an HTTP header value; failing the probe closed rather than \
+             proceeding unauthenticated"
         );
-    }
-    headers
+        McpProbeOutcome::AuthConfigInvalid
+    })?;
+    headers.insert(http::header::AUTHORIZATION, value);
+    Ok(headers)
 }
 
 // ---------------------------------------------------------------------------
@@ -719,7 +742,10 @@ async fn run_probe_session(
     auth_token: Option<&BearerToken>,
 ) -> McpProbeOutcome {
     let mut transport_config = StreamableHttpClientTransportConfig::with_uri(endpoint);
-    let headers = auth_header_map(auth_token);
+    let headers = match auth_header_map(auth_token) {
+        Ok(headers) => headers,
+        Err(outcome) => return outcome,
+    };
     if !headers.is_empty() {
         transport_config = transport_config.custom_headers(headers);
     }
@@ -789,6 +815,13 @@ mod tests {
     }
 
     #[test]
+    fn auth_config_invalid_outcome_yields_unavailable_with_stable_reason() {
+        let (phase, reason) = phase_and_reason_from_probe(&McpProbeOutcome::AuthConfigInvalid);
+        assert_eq!(phase, ProviderPhase::Unavailable);
+        assert_eq!(reason.as_deref(), Some("McpAuthTokenInvalid"));
+    }
+
+    #[test]
     fn tls_config_invalid_outcome_yields_unavailable_with_its_carried_reason() {
         let (phase, reason) = phase_and_reason_from_probe(&McpProbeOutcome::TlsConfigInvalid(
             "EndpointTlsSecretMissing".to_owned(),
@@ -829,6 +862,14 @@ mod tests {
     #[test]
     fn auth_rejected_outcome_label_is_auth_rejected() {
         assert_eq!(mcp_probe_outcome_label(&McpProbeOutcome::AuthRejected), "AuthRejected");
+    }
+
+    #[test]
+    fn auth_config_invalid_outcome_label_is_auth_config_invalid() {
+        assert_eq!(
+            mcp_probe_outcome_label(&McpProbeOutcome::AuthConfigInvalid),
+            "AuthConfigInvalid"
+        );
     }
 
     #[test]
@@ -895,6 +936,16 @@ mod tests {
         let previous = vec!["search".to_owned()];
         assert_eq!(
             discovered_tools_after_probe(&previous, &McpProbeOutcome::AuthRejected),
+            previous,
+            "a probe failure must never wipe a previously-discovered tool list"
+        );
+    }
+
+    #[test]
+    fn auth_config_invalid_probe_preserves_previously_discovered_tools() {
+        let previous = vec!["search".to_owned()];
+        assert_eq!(
+            discovered_tools_after_probe(&previous, &McpProbeOutcome::AuthConfigInvalid),
             previous,
             "a probe failure must never wipe a previously-discovered tool list"
         );
@@ -1005,7 +1056,7 @@ mod tests {
 
     #[test]
     fn absent_token_yields_no_authorization_header() {
-        let headers = auth_header_map(None);
+        let headers = auth_header_map(None).expect("no token must never fail");
         assert!(
             headers.is_empty(),
             "no resolved bearer token must mean no Authorization header at all"
@@ -1015,11 +1066,22 @@ mod tests {
     #[test]
     fn present_token_yields_bearer_authorization_header() {
         let token = BearerToken::new("s3cr3t".to_owned());
-        let headers = auth_header_map(Some(&token));
+        let headers = auth_header_map(Some(&token)).expect("a well-formed token must not fail");
         assert_eq!(
             headers.get(&http::header::AUTHORIZATION).map(|v| v.to_str().unwrap()),
             Some("Bearer s3cr3t"),
             "a resolved bearer token must be attached as a standard Bearer Authorization header"
+        );
+    }
+
+    #[test]
+    fn token_with_invalid_header_characters_fails_closed() {
+        let token = BearerToken::new("s3cr3t\nwith-newline".to_owned());
+        assert_eq!(
+            auth_header_map(Some(&token)),
+            Err(McpProbeOutcome::AuthConfigInvalid),
+            "a token that cannot be encoded as an HTTP header value must fail the probe closed, \
+             not proceed unauthenticated"
         );
     }
 

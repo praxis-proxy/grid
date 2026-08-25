@@ -714,6 +714,7 @@ below), `observedGeneration`
 | `McpEndpointUnreachable` | Unavailable | The MCP endpoint could not be reached: transport failure, DNS error, timeout, or a blocked (SSRF-sensitive) address. |
 | `McpToolsListInvalidResponse` | Unavailable | The endpoint was reached but the `tools/list` exchange failed or returned an unparseable response. |
 | `McpAuthRejected` | Unavailable | The MCP server rejected the configured `spec.auth` credentials (HTTP 401/403). |
+| `McpAuthTokenInvalid` | Unavailable | The resolved `spec.auth` bearer token contains characters that cannot be sent as an HTTP header value; the probe fails closed rather than proceeding unauthenticated. |
 | `EndpointTlsSecretMissing` | Unavailable | A referenced TLS Secret does not exist (or the requested key is absent — see [`grid#58`](https://github.com/praxis-proxy/grid/issues/58) for a known misclassification of the latter). |
 | `EndpointTlsKeyMissing` | Unavailable | The expected key exists in the Secret but its value is empty. |
 | `EndpointTlsMaterialInvalid` | Unavailable | CA certificate PEM material could not be parsed. |

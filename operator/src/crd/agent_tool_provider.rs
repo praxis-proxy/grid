@@ -97,6 +97,7 @@ pub struct ToolInfo {
 /// | `McpEndpointUnreachable` | The MCP probe could not connect (transport failure, timeout, DNS error). |
 /// | `McpToolsListInvalidResponse` | The endpoint responded but the `tools/list` response was malformed. |
 /// | `McpAuthRejected` | The MCP server rejected the configured `spec.auth` credentials. |
+/// | `McpAuthTokenInvalid` | The resolved `spec.auth` bearer token contains characters that cannot be sent as an HTTP header value; the probe fails closed rather than proceeding unauthenticated. |
 /// | `EndpointTlsSecretMissing` | `spec.tls`'s referenced Secret does not exist in the cluster. |
 /// | `EndpointTlsKeyMissing` | `spec.tls`'s referenced Secret exists but is missing the expected key. |
 /// | `EndpointTlsMaterialInvalid` | `spec.tls`'s certificate or key material could not be parsed. |
