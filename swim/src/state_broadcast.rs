@@ -116,6 +116,22 @@ struct BroadcastExtension {
     signature: Option<Vec<u8>>,
 }
 
+/// Extension format used by peers that predate the `signature` field.
+///
+/// bincode is not self-describing, so decoding a two-field payload as
+/// [`BroadcastExtension`] fails partway through the third field rather than
+/// falling back to `#[serde(default)]` — `decode` tries this shape before
+/// falling further back to the original bare-`String` format, so a rolling
+/// update does not silently drop or misdecode `gateway_address`/
+/// `site_cert_pem` from not-yet-upgraded peers.
+#[derive(Serialize, Deserialize)]
+struct PreSignatureBroadcastExtension {
+    /// Optional data-plane gateway address.
+    gateway_address: Option<String>,
+    /// Optional public site certificate PEM — never a private key.
+    site_cert_pem: Option<String>,
+}
+
 impl StateBroadcast {
     /// Create a versioned state broadcast.
     ///
@@ -274,9 +290,14 @@ impl StateBroadcast {
     /// Decode this broadcast from bincode bytes.
     ///
     /// Decodes the base v1 payload, then tries to decode any trailing bytes as
-    /// a `BroadcastExtension` struct.  Falls back to the previous bare-`String`
-    /// format for `gateway_address` when the struct decode fails, ensuring
-    /// interoperability with older peers that use the first extension format.
+    /// a `BroadcastExtension` struct.  Because bincode is not self-describing,
+    /// a three-field extension decode does not simply come back `Ok` with
+    /// `signature: None` when reading bytes from an older, two-field peer —
+    /// it fails partway through the missing field.  Falls back in turn to the
+    /// two-field pre-signature extension format, then to the
+    /// original bare-`String` format for `gateway_address`, ensuring
+    /// interoperability with peers running any prior wire format during a
+    /// rolling update.
     ///
     /// Payloads without any extension decode with `gateway_address = None` and
     /// `site_cert_pem = None`.
@@ -290,21 +311,7 @@ impl StateBroadcast {
             bincode::serde::decode_from_slice(bytes, bincode::config::standard())?;
 
         let remaining = bytes.get(consumed..).unwrap_or(&[]);
-        let (gateway_address, site_cert_pem, signature) = if remaining.is_empty() {
-            (None, None, None)
-        } else {
-            // Try the current extension struct format.
-            match bincode::serde::decode_from_slice::<BroadcastExtension, _>(remaining, bincode::config::standard()) {
-                Ok((ext, _)) => (ext.gateway_address, ext.site_cert_pem, ext.signature),
-                Err(_) => {
-                    // Compatibility fallback: bare String encoding for gateway_address only.
-                    match bincode::serde::decode_from_slice::<String, _>(remaining, bincode::config::standard()) {
-                        Ok((gw, _)) => (Some(gw), None, None),
-                        Err(_) => (None, None, None),
-                    }
-                },
-            }
-        };
+        let (gateway_address, site_cert_pem, signature) = Self::decode_extension(remaining);
 
         Ok(Self {
             version: v1.version,
@@ -315,6 +322,31 @@ impl StateBroadcast {
             site_cert_pem,
             signature,
         })
+    }
+
+    /// Decode the trailing extension bytes, falling back across every prior
+    /// wire format in turn. See [`decode`](Self::decode) for why a naive
+    /// single-shot struct decode is not enough during a rolling update.
+    fn decode_extension(remaining: &[u8]) -> (Option<String>, Option<String>, Option<Vec<u8>>) {
+        if remaining.is_empty() {
+            return (None, None, None);
+        }
+        if let Ok((ext, _)) =
+            bincode::serde::decode_from_slice::<BroadcastExtension, _>(remaining, bincode::config::standard())
+        {
+            return (ext.gateway_address, ext.site_cert_pem, ext.signature);
+        }
+        if let Ok((ext, _)) = bincode::serde::decode_from_slice::<PreSignatureBroadcastExtension, _>(
+            remaining,
+            bincode::config::standard(),
+        ) {
+            return (ext.gateway_address, ext.site_cert_pem, None);
+        }
+        // Compatibility fallback: bare String encoding for gateway_address only.
+        match bincode::serde::decode_from_slice::<String, _>(remaining, bincode::config::standard()) {
+            Ok((gw, _)) => (Some(gw), None, None),
+            Err(_) => (None, None, None),
+        }
     }
 }
 
@@ -908,6 +940,33 @@ mod tests {
             .unwrap_or_else(|_| std::process::abort())
     }
 
+    /// Encode a base v1 payload plus a two-field pre-signature extension,
+    /// mirroring the wire bytes a peer running the extension format that
+    /// predates the `signature` field would have sent.
+    fn encode_v1_plus_pre_signature_extension(
+        origin_site: &str,
+        revision: u64,
+        gateway_address: Option<String>,
+        site_cert_pem: Option<String>,
+    ) -> Vec<u8> {
+        let v1 = StateBroadcastV1 {
+            version: STATE_BROADCAST_VERSION,
+            origin_site: origin_site.to_owned(),
+            revision,
+            snapshot: snapshot(origin_site, revision, 0.4),
+        };
+        let mut bytes =
+            bincode::serde::encode_to_vec(&v1, bincode::config::standard()).unwrap_or_else(|_| std::process::abort());
+        let ext = PreSignatureBroadcastExtension {
+            gateway_address,
+            site_cert_pem,
+        };
+        let ext_bytes =
+            bincode::serde::encode_to_vec(&ext, bincode::config::standard()).unwrap_or_else(|_| std::process::abort());
+        bytes.extend_from_slice(&ext_bytes);
+        bytes
+    }
+
     /// Generate an ECDSA P-256 signing key plus the raw SPKI EC point a
     /// verifier needs, independent of *how* a real deployment would source
     /// or pin this key material (grid#75, still open).
@@ -1079,6 +1138,39 @@ mod tests {
             .unwrap_or_else(|| std::process::abort());
         assert_eq!(decoded.version, STATE_BROADCAST_VERSION_V1, "version without gateway");
         assert_eq!(provider.metrics.queue_depth, Some(0.1), "metric value");
+    }
+
+    #[test]
+    fn decode_recovers_gateway_and_cert_from_a_pre_signature_two_field_extension() {
+        // Simulates a broadcast sent by a peer running the two-field
+        // `BroadcastExtension` (gateway_address, site_cert_pem) that predates
+        // the `signature` field added in this PR. bincode is not
+        // self-describing: decoding those bytes as the current three-field
+        // struct hits `UnexpectedEnd` while reading `signature`, and
+        // `#[serde(default)]` never gets a chance to apply because the `?`
+        // inside serde's generated `visit_seq` propagates that error first.
+        // A rolling update must not silently drop `gateway_address`/
+        // `site_cert_pem` for every broadcast from a not-yet-upgraded peer.
+        let bytes = encode_v1_plus_pre_signature_extension(
+            "site-old-peer",
+            3,
+            Some("10.0.0.9:8443".to_owned()),
+            Some("-----BEGIN CERTIFICATE-----legacy-----END CERTIFICATE-----".to_owned()),
+        );
+
+        let decoded = StateBroadcast::decode(&bytes).unwrap_or_else(|_| std::process::abort());
+
+        assert_eq!(
+            decoded.gateway_address.as_deref(),
+            Some("10.0.0.9:8443"),
+            "gateway_address from a pre-signature peer must survive decode, not be silently dropped"
+        );
+        assert_eq!(
+            decoded.site_cert_pem.as_deref(),
+            Some("-----BEGIN CERTIFICATE-----legacy-----END CERTIFICATE-----"),
+            "site_cert_pem from a pre-signature peer must survive decode, not be silently dropped"
+        );
+        assert_eq!(decoded.signature, None, "a pre-signature peer never sends a signature");
     }
 
     #[test]
