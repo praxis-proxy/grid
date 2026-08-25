@@ -50,6 +50,18 @@ pub(crate) const MOCK_CLOUD_PORT: u16 = 8080;
 /// Kubernetes namespace for provider backend deployments.
 const NAMESPACE: &str = "default";
 
+/// Kubernetes Deployment and Service name for the mock MCP `tools/list` server.
+///
+/// Deployed as a real in-cluster Service (not a locally-spawned process) so
+/// that `AgentToolProvider`'s SSRF-hardened probe — which deliberately
+/// blocks loopback/link-local targets, unlike `GridSite`'s gateway probe —
+/// has a legitimate, non-blocked address to discover tools from. See
+/// `cargo xtask env verify-agenttoolprovider-convergence`.
+pub(crate) const MOCK_MCP_SVC: &str = "mock-mcp-server";
+
+/// Port used by the mock MCP server.
+pub(crate) const MOCK_MCP_PORT: u16 = 8080;
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -484,6 +496,140 @@ spec:
   ports:
     - port: {MOCK_API_PORT}
       targetPort: {MOCK_API_PORT}
+"
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Mock MCP server (AgentToolProvider probe target)
+// ---------------------------------------------------------------------------
+
+/// Deploy the mock MCP `tools/list` server into `cluster_name`, reusing the
+/// same `grid-mock-providers` image as the AI-provider mocks (just a
+/// different `--mcp-server` CLI mode — see `mock-providers/src/mcp.rs`).
+///
+/// `tools_csv` and `required_bearer` are forwarded verbatim as the mock's
+/// `--mcp-tools`/`--mcp-bearer` arguments.
+pub(crate) fn deploy_mock_mcp_server(
+    context: &str,
+    cluster_name: &str,
+    tools_csv: &str,
+    required_bearer: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mock_provider_img = image_overrides::mock_provider_image();
+
+    if image_overrides::should_skip_kind_image_loading() {
+        eprintln!("  skipping loading {mock_provider_img} (pull policy is not Never)");
+    } else {
+        eprintln!("  loading {mock_provider_img} into {cluster_name}...");
+        run_cmd(
+            "kind",
+            &["load", "docker-image", &mock_provider_img, "--name", cluster_name],
+        )
+        .map_err(|e| {
+            format!(
+                "{e}\n\
+                 hint: build the image first with:\n\
+                 \x20 docker build -t {mock_provider_img} -f mock-providers/Containerfile ."
+            )
+        })?;
+    }
+
+    eprintln!("  deploying {MOCK_MCP_SVC} to {cluster_name}...");
+    kubectl::apply_manifest(context, &mock_mcp_server_deployment_yaml(tools_csv, required_bearer))?;
+    kubectl::apply_manifest(context, &mock_mcp_server_service_yaml())?;
+    kubectl::wait_for_rollout(context, MOCK_MCP_SVC, cluster_name)?;
+    Ok(())
+}
+
+/// Delete the mock MCP server Deployment and Service if they exist.
+///
+/// Best-effort: errors are ignored, matching [`delete_mock_api_provider`].
+pub(crate) fn delete_mock_mcp_server(context: &str) {
+    for kind in ["deployment", "service"] {
+        drop(
+            Command::new("kubectl")
+                .args([
+                    "--context",
+                    context,
+                    "-n",
+                    NAMESPACE,
+                    "delete",
+                    kind,
+                    MOCK_MCP_SVC,
+                    "--ignore-not-found",
+                ])
+                .status(),
+        );
+    }
+}
+
+/// Generate the Deployment YAML for the mock MCP server.
+#[expect(clippy::too_many_lines, reason = "readable multiline Kubernetes Deployment YAML")]
+fn mock_mcp_server_deployment_yaml(tools_csv: &str, required_bearer: Option<&str>) -> String {
+    let mock_provider_img = image_overrides::mock_provider_image();
+    let pull_policy = image_overrides::image_pull_policy();
+    let mut yaml = format!(
+        r#"apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {MOCK_MCP_SVC}
+  namespace: {NAMESPACE}
+  labels:
+    app: {MOCK_MCP_SVC}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: {MOCK_MCP_SVC}
+  template:
+    metadata:
+      labels:
+        app: {MOCK_MCP_SVC}
+    spec:
+      containers:
+        - name: mock-mcp
+          image: {mock_provider_img}
+          imagePullPolicy: {pull_policy}
+          args:
+            - "--mcp-server"
+            - "--port"
+            - "{MOCK_MCP_PORT}"
+            - "--mcp-tools"
+            - "{tools_csv}"
+"#
+    );
+    if let Some(token) = required_bearer {
+        write!(yaml, "            - \"--mcp-bearer\"\n            - \"{token}\"\n")
+            .unwrap_or_else(|_| std::process::abort());
+    }
+    write!(yaml, "          ports:\n            - containerPort: {MOCK_MCP_PORT}\n")
+        .unwrap_or_else(|_| std::process::abort());
+    yaml
+}
+
+/// Generate the Service YAML for the mock MCP server.
+///
+/// `NodePort` (not `ClusterIP`): the `AgentToolProvider` E2E check spawns the
+/// operator as a local out-of-cluster process (see `spawn_operator`), which
+/// cannot resolve in-cluster `.svc` DNS names or reach `ClusterIP`s — only
+/// the kind node's `NodePort`-mapped address is reachable from the host. No
+/// `nodePort` is pinned; callers discover the assigned port via
+/// [`service_node_port`].
+fn mock_mcp_server_service_yaml() -> String {
+    format!(
+        "apiVersion: v1
+kind: Service
+metadata:
+  name: {MOCK_MCP_SVC}
+  namespace: {NAMESPACE}
+spec:
+  type: NodePort
+  selector:
+    app: {MOCK_MCP_SVC}
+  ports:
+    - port: {MOCK_MCP_PORT}
+      targetPort: {MOCK_MCP_PORT}
 "
     )
 }

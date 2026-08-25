@@ -817,6 +817,29 @@ pub(crate) enum Action {
         site: Option<String>,
     },
 
+    /// Verify `AgentToolProvider` convergence: `Pending` -> `Available` with `discoveredTools`
+    /// populated against a real mock MCP server, plus the unreachable-endpoint failure path.
+    ///
+    /// Deploys a real (not local-loopback) mock MCP `tools/list` server in-cluster —
+    /// `AgentToolProvider`'s probe deliberately blocks loopback/link-local targets via
+    /// SSRF protection, unlike `GridSite`'s gateway probe — applies a `GridNetwork` +
+    /// `GridSite` + healthy `AgentToolProvider`, and asserts the phase transitions to
+    /// `Available` with the mock's tool names in `status.discoveredTools`. A second
+    /// `AgentToolProvider` pointed at a nonexistent Service confirms the failure path:
+    /// `Unavailable` with a populated `status.reason`.
+    ///
+    /// Requires a kind cluster with Grid CRDs and the `grid-mock-providers` image
+    /// loaded (or pullable). Safe to rerun.
+    VerifyAgenttoolproviderConvergence {
+        /// Path to the environment config file.
+        #[arg(short, long, default_value = "tests/env/operator-routing.toml")]
+        config: PathBuf,
+
+        /// Kind cluster context to run against (first provider site by default).
+        #[arg(long)]
+        site: Option<String>,
+    },
+
     /// Verify lost-peer staleness: remote provider marked stale when SWIM peer is killed.
     ///
     /// Starts a primary (east) and a joining (west) SWIM operator, publishes a
@@ -1068,6 +1091,9 @@ pub(crate) fn run(action: &Action) -> Result<(), Box<dyn std::error::Error>> {
         Action::VerifySiteJoinDiscovery { config } => env_verify_site_join_discovery(config),
         Action::VerifyGridsiteRotation { config, site } => env_verify_gridsite_rotation(config, site.as_deref()),
         Action::VerifyGridsiteConvergence { config, site } => env_verify_gridsite_convergence(config, site.as_deref()),
+        Action::VerifyAgenttoolproviderConvergence { config, site } => {
+            env_verify_agenttoolprovider_convergence(config, site.as_deref())
+        },
         Action::VerifyFailoverUnderLostPeer { config } => env_verify_failover_under_lost_peer(config),
         Action::VerifyStaleGcTtl { config } => env_verify_stale_gc_ttl(config),
         Action::VerifyOperatorInstallRbac { config, site } => env_verify_operator_install_rbac(config, site.as_deref()),
@@ -6717,6 +6743,124 @@ fn env_verify_gridsite_convergence(config: &Path, site: Option<&str>) -> Result<
         "verify-gridsite-convergence: PASS — \
          equivalent replicas converged, survived restart, \
          reconverged, no oscillation, no duplicate Events"
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// AgentToolProvider convergence verifier (grid#41)
+// ---------------------------------------------------------------------------
+
+/// Verify `AgentToolProvider` convergence against a real mock MCP server.
+///
+/// Proves the full stack end-to-end: real cluster, real controller binary,
+/// real (mock) MCP server, actual `status.phase`/`status.discoveredTools`
+/// convergence — not a one-off manual check. See `grid#41`'s plan
+/// ("E2E tier"), which this command was scoped to satisfy permanently.
+///
+/// Steps:
+/// 1. Install CRDs, clean up any stale prior run's resources.
+/// 2. Deploy a real mock MCP server in-cluster (a Service is required — the probe's SSRF protection deliberately blocks
+///    loopback/link-local targets, so a locally-spawned process is not a legitimate substitute here, unlike
+///    `GridSite`'s gateway probe) and discover its `NodePort` address: the operator under test runs out-of-cluster
+///    (step 4), so it cannot resolve the mock's in-cluster `.svc` DNS name.
+/// 3. Apply `GridNetwork` + `GridSite` + a healthy `AgentToolProvider`.
+/// 4. Spawn the operator locally and wait for `Pending` -> `Available` with `discoveredTools` matching the mock's
+///    configured tool list.
+/// 5. Apply a second `AgentToolProvider` pointed at a nonexistent Service and confirm it lands on `Unavailable` with a
+///    populated `status.reason`.
+#[expect(clippy::too_many_lines, reason = "multi-step E2E orchestration")]
+fn env_verify_agenttoolprovider_convergence(
+    config: &Path,
+    site: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use operator::{AGENT_TOOL_TEST_PROVIDER_HEALTHY, AGENT_TOOL_TEST_PROVIDER_UNREACHABLE, STATUS_POLL_TIMEOUT};
+
+    let cfg = EnvConfig::from_file(config)?;
+    let site_name = resolve_operator_site_name(&cfg, site)?;
+    let context = resolve_operator_context(&cfg, site)?;
+    let cluster_name = kind::cluster_name_from_config(site_name);
+    eprintln!("verify-agenttoolprovider-convergence: context={context}");
+
+    // ── Step 1: setup ────────────────────────────────────────────────────
+    eprintln!("verify-agenttoolprovider-convergence: [1/5] setup");
+    operator::install_grid_crds(&context)?;
+    operator::cleanup_agent_tool_provider_test_resources(&context);
+    kind::delete_mock_mcp_server(&context);
+
+    // ── Step 2: deploy the real mock MCP server ─────────────────────────
+    eprintln!("verify-agenttoolprovider-convergence: [2/5] deploying mock MCP server...");
+    let mock_tools = ["read_file", "list_directory"];
+    kind::deploy_mock_mcp_server(&context, &cluster_name, &mock_tools.join(","), None)?;
+    // The operator under test runs as a local out-of-cluster process (see
+    // `spawn_operator` below), so it cannot resolve in-cluster `.svc` DNS
+    // names — it must reach the mock over the kind node's NodePort address,
+    // the same pattern `discover_provider_cluster_endpoint` uses for the
+    // provider gateway.
+    let mock_node_port = kind::service_node_port(&context, kind::MOCK_MCP_SVC, "default")
+        .ok_or("mock MCP server Service has no NodePort assigned")?;
+    let mock_node_ip = kind::kind_node_ip(&context)?;
+    let mock_endpoint = format!("http://{mock_node_ip}:{mock_node_port}/mcp");
+
+    // ── Step 3: apply GridNetwork + GridSite + healthy AgentToolProvider ─
+    eprintln!("verify-agenttoolprovider-convergence: [3/5] applying fixtures...");
+    operator::apply_agent_tool_provider_network_fixtures(&context)?;
+    operator::apply_agent_tool_provider(&context, AGENT_TOOL_TEST_PROVIDER_HEALTHY, &mock_endpoint)?;
+    // A Service name that cannot resolve — DNS failure, not a refused
+    // connection, exercising the same Unreachable classification either way.
+    operator::apply_agent_tool_provider(
+        &context,
+        AGENT_TOOL_TEST_PROVIDER_UNREACHABLE,
+        "http://mock-mcp-server-does-not-exist.default.svc:8080/mcp",
+    )?;
+
+    let op = operator::spawn_operator(&context)?;
+    let mut op_guard = ProcGuard(Some(op), "agent-tool-provider-operator");
+
+    let result: Result<(), Box<dyn std::error::Error>> = (|| {
+        // ── Step 4: healthy path — Pending -> Available, tools discovered ─
+        eprintln!("verify-agenttoolprovider-convergence: [4/5] waiting for healthy convergence...");
+        operator::wait_for_agent_tool_provider_phase(
+            &context,
+            AGENT_TOOL_TEST_PROVIDER_HEALTHY,
+            "Available",
+            STATUS_POLL_TIMEOUT,
+        )?;
+        let mut expected_tools: Vec<String> = mock_tools.iter().map(|t| (*t).to_owned()).collect();
+        expected_tools.sort();
+        let discovered =
+            operator::read_agent_tool_provider_discovered_tools(&context, AGENT_TOOL_TEST_PROVIDER_HEALTHY)?;
+        if discovered != expected_tools {
+            return Err(format!("discoveredTools mismatch: expected {expected_tools:?}, got {discovered:?}").into());
+        }
+        eprintln!("  [OK] discoveredTools = {discovered:?}");
+
+        // ── Step 5: unreachable path — Unavailable + populated reason ────
+        eprintln!("verify-agenttoolprovider-convergence: [5/5] waiting for unreachable-endpoint failure...");
+        operator::wait_for_agent_tool_provider_phase(
+            &context,
+            AGENT_TOOL_TEST_PROVIDER_UNREACHABLE,
+            "Unavailable",
+            STATUS_POLL_TIMEOUT,
+        )?;
+        let reason = operator::read_agent_tool_provider_reason(&context, AGENT_TOOL_TEST_PROVIDER_UNREACHABLE)?;
+        if reason.is_empty() {
+            return Err("expected a populated status.reason for the unreachable-endpoint AgentToolProvider".into());
+        }
+        eprintln!("  [OK] unreachable endpoint reason = {reason:?}");
+        Ok(())
+    })();
+
+    if let Some(c) = op_guard.0.take() {
+        operator::kill_operator(c);
+    }
+    operator::cleanup_agent_tool_provider_test_resources(&context);
+    kind::delete_mock_mcp_server(&context);
+    result?;
+
+    eprintln!(
+        "verify-agenttoolprovider-convergence: PASS — Pending -> Available with discoveredTools populated \
+         against a real mock MCP server, and the unreachable-endpoint path lands on Unavailable with a reason"
     );
     Ok(())
 }

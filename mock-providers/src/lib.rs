@@ -15,6 +15,8 @@ pub mod anthropic;
 pub mod bedrock;
 /// Shared HTTP response utilities.
 mod common;
+/// Mock MCP (Model Context Protocol) `tools/list` server.
+pub mod mcp;
 /// Mock `OpenAI` chat completions and Responses API.
 pub mod openai;
 /// Mock Google Vertex AI `generateContent` API.

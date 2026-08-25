@@ -10,6 +10,7 @@ publish = false
 axum = { workspace = true }
 clap = { workspace = true }
 http = { workspace = true }
+rmcp = { workspace = true, features = ["server", "transport-streamable-http-server"] }
 rustls = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

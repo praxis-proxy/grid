@@ -38,6 +38,22 @@ pub(crate) const TEST_GATEWAY_NAME: &str = "op-e2e-gw";
 pub(crate) const TEST_GATEWAY_NS: &str = "default";
 /// Name of the `InferenceProvider` with a valid endpoint (expected: reconciles to `Pending`).
 pub(crate) const TEST_PROVIDER_HEALTHY: &str = "op-e2e-healthy";
+
+/// Name of the test `GridNetwork` used by the `AgentToolProvider` convergence check.
+///
+/// Distinct from [`TEST_NETWORK`] so this E2E command can be re-run
+/// independently of (and concurrently with) the `InferenceProvider`-focused
+/// fixtures without name collisions.
+pub(crate) const AGENT_TOOL_TEST_NETWORK: &str = "op-e2e-agent-tool-net";
+/// Name of the test `GridSite` referencing [`AGENT_TOOL_TEST_NETWORK`].
+///
+/// Its mere existence is sufficient for site-matching: `AgentToolProvider`'s
+/// default (empty) `siteSelector` matches every `GridSite` in the network.
+pub(crate) const AGENT_TOOL_TEST_SITE: &str = "op-e2e-agent-tool-site";
+/// Name of the `AgentToolProvider` pointed at a real, reachable mock MCP server.
+pub(crate) const AGENT_TOOL_TEST_PROVIDER_HEALTHY: &str = "op-e2e-agent-tool-healthy";
+/// Name of the `AgentToolProvider` pointed at a deliberately-unreachable endpoint.
+pub(crate) const AGENT_TOOL_TEST_PROVIDER_UNREACHABLE: &str = "op-e2e-agent-tool-unreachable";
 /// Name of the `InferenceProvider` with a blank endpoint (expected: reconciles to `Unavailable`).
 pub(crate) const TEST_PROVIDER_INVALID: &str = "op-e2e-invalid";
 /// Name of the `InferenceProvider` whose health probe returns non-2xx (expected: `Degraded`).
@@ -1013,6 +1029,136 @@ fn provider_fixture_json(
         eprintln!("fixture serialization failed: {e}");
         std::process::exit(1);
     })
+}
+
+// ---------------------------------------------------------------------------
+// AgentToolProvider convergence fixtures (grid#41)
+// ---------------------------------------------------------------------------
+
+/// Apply the minimal `GridNetwork` + `GridSite` fixtures the
+/// `AgentToolProvider` convergence check needs.
+///
+/// Neither resource needs a `gatewayRef` or labels: `AgentToolProvider`'s
+/// default `siteSelector` matches every `GridSite` referencing the network,
+/// so a bare `GridSite` is enough to clear site-matching once the network
+/// exists.
+pub(crate) fn apply_agent_tool_provider_network_fixtures(context: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let network = serde_json::to_string_pretty(&serde_json::json!({
+        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "kind": "GridNetwork",
+        "metadata": { "name": AGENT_TOOL_TEST_NETWORK },
+        "spec": {}
+    }))
+    .unwrap_or_else(|e| {
+        eprintln!("AgentToolProvider GridNetwork fixture serialization failed: {e}");
+        std::process::exit(1);
+    });
+    let site = serde_json::to_string_pretty(&serde_json::json!({
+        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "kind": "GridSite",
+        "metadata": { "name": AGENT_TOOL_TEST_SITE },
+        "spec": { "gridNetworkRef": AGENT_TOOL_TEST_NETWORK }
+    }))
+    .unwrap_or_else(|e| {
+        eprintln!("AgentToolProvider GridSite fixture serialization failed: {e}");
+        std::process::exit(1);
+    });
+    kubectl::apply_manifest(context, &network)?;
+    kubectl::apply_manifest(context, &site)?;
+    Ok(())
+}
+
+/// Apply an `AgentToolProvider` fixture pointed at `endpoint`.
+pub(crate) fn apply_agent_tool_provider(
+    context: &str,
+    name: &str,
+    endpoint: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let manifest = serde_json::to_string_pretty(&serde_json::json!({
+        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "kind": "AgentToolProvider",
+        "metadata": { "name": name },
+        "spec": {
+            "gridNetworkRef": AGENT_TOOL_TEST_NETWORK,
+            "endpoint": endpoint
+        }
+    }))
+    .unwrap_or_else(|e| {
+        eprintln!("AgentToolProvider fixture serialization failed: {e}");
+        std::process::exit(1);
+    });
+    kubectl::apply_manifest(context, &manifest)?;
+    Ok(())
+}
+
+/// Delete the `AgentToolProvider` convergence test's `GridNetwork`,
+/// `GridSite`, and `AgentToolProvider` resources if they exist.
+///
+/// Best-effort: errors are ignored, matching [`cleanup_validation_resources`].
+pub(crate) fn cleanup_agent_tool_provider_test_resources(context: &str) {
+    for (kind, name) in [
+        ("agenttoolproviders", AGENT_TOOL_TEST_PROVIDER_HEALTHY),
+        ("agenttoolproviders", AGENT_TOOL_TEST_PROVIDER_UNREACHABLE),
+        ("gridsites", AGENT_TOOL_TEST_SITE),
+        ("gridnetworks", AGENT_TOOL_TEST_NETWORK),
+    ] {
+        drop(
+            Command::new("kubectl")
+                .args(["--context", context, "delete", kind, name, "--ignore-not-found"])
+                .status(),
+        );
+    }
+}
+
+#[expect(
+    clippy::disallowed_methods,
+    reason = "synchronous poll loop in xtask; no async runtime available"
+)]
+/// Poll until an `AgentToolProvider`'s `status.phase` equals `expected_phase`.
+pub(crate) fn wait_for_agent_tool_provider_phase(
+    context: &str,
+    name: &str,
+    expected_phase: &str,
+    timeout: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let start = Instant::now();
+    loop {
+        let observed =
+            kubectl_jsonpath(context, &format!("agenttoolproviders/{name}"), "{.status.phase}").unwrap_or_default();
+
+        if observed == expected_phase {
+            eprintln!("  [OK] {name} phase = {observed}");
+            return Ok(());
+        }
+
+        if start.elapsed() >= timeout {
+            return Err(
+                format!("timeout waiting for {name} phase={expected_phase}; last observed: {observed:?}").into(),
+            );
+        }
+        eprintln!("  waiting for {name} phase={expected_phase} (observed={observed:?})...");
+        std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// Read an `AgentToolProvider`'s `status.discoveredTools` as a sorted `Vec<String>`.
+pub(crate) fn read_agent_tool_provider_discovered_tools(
+    context: &str,
+    name: &str,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let raw = kubectl_jsonpath(
+        context,
+        &format!("agenttoolproviders/{name}"),
+        "{.status.discoveredTools[*]}",
+    )?;
+    let mut tools: Vec<String> = raw.split_whitespace().map(str::to_owned).collect();
+    tools.sort();
+    Ok(tools)
+}
+
+/// Read an `AgentToolProvider`'s `status.reason`.
+pub(crate) fn read_agent_tool_provider_reason(context: &str, name: &str) -> Result<String, Box<dyn std::error::Error>> {
+    kubectl_jsonpath(context, &format!("agenttoolproviders/{name}"), "{.status.reason}")
 }
 
 // ---------------------------------------------------------------------------

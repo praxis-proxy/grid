@@ -36,6 +36,16 @@ k8s-openapi = { version = "0.27.1", features = ["v1_32"] }
 kube = { version = "3.1.0", features = ["client", "derive", "runtime", "rustls-tls"] }
 prometheus = "0.14"
 rcgen = "0.14.8"
+# rustls-no-provider (not "rustls"): the plain "rustls" feature pulls in
+# aws-lc-rs as reqwest's crypto provider, which conflicts at runtime with the
+# ring provider main.rs installs process-wide for kube/hyper-rustls — see
+# rustls::crypto::CryptoProvider::install_default() in main.rs.
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls-no-provider", "json", "stream"] }
+rmcp = { version = "3.1.1", default-features = false, features = [
+    "client",
+    "transport-streamable-http-client-reqwest",
+    "reqwest-tls-no-provider",
+] }
 rustls = { version = "0.23", default-features = false, features = ["logging", "std", "tls12"] }
 schemars = "1.2.1"
 sha2 = "0.10"
