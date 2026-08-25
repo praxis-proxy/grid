@@ -69,7 +69,7 @@ pub fn run(runner: &dyn CommandRunner, format: &OutputFormat, writer: &mut dyn W
 
 /// Probe all tools and collect results.
 fn probe_tools(runner: &dyn CommandRunner) -> Vec<ToolStatus> {
-    TOOLS.iter().map(|t| probe_one(runner, t)).collect()
+    TOOLS.iter().map(|tool| probe_one(runner, tool)).collect()
 }
 
 /// Probe one tool by running `which <name>`.
@@ -132,7 +132,11 @@ fn render_text(results: &[ToolStatus], writer: &mut dyn Write) -> Result<(), For
     for tool in results {
         let icon = if tool.found { "ok" } else { "MISSING" };
         let req = if tool.required { " (required)" } else { "" };
-        let path = tool.path.as_deref().map(|p| format!(" -> {p}")).unwrap_or_default();
+        let path = tool
+            .path
+            .as_deref()
+            .map(|path_str| format!(" -> {path_str}"))
+            .unwrap_or_default();
         output::write_text(writer, &format!("  {icon}: {}{req}{path}", tool.name))?;
     }
     Ok(())
@@ -141,7 +145,7 @@ fn render_text(results: &[ToolStatus], writer: &mut dyn Write) -> Result<(), For
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::command::runner::{CommandOutput, MockRunner};
+    use crate::command::runner::MockRunner;
 
     /// Build a mock runner with kubectl and kind present.
     fn mock_with_tools() -> MockRunner {
@@ -182,8 +186,8 @@ mod tests {
         assert!(
             parsed
                 .get("data")
-                .and_then(|d| d.get("tools"))
-                .and_then(|t| t.as_array())
+                .and_then(|doc| doc.get("tools"))
+                .and_then(|tools| tools.as_array())
                 .is_some(),
             "should have data.tools array"
         );

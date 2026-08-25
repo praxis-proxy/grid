@@ -27,7 +27,7 @@ pub fn dispatch(ctx: &ForgeContext<'_>, cmd: &ClusterCommand, writer: &mut dyn W
         ClusterCommand::Create { name } => handle_create(ctx, name, writer),
         ClusterCommand::Delete { name, force } => handle_delete(ctx, name, *force, writer),
         ClusterCommand::List => handle_list(ctx, writer),
-        ClusterCommand::Kubeconfig { name, out_file } => handle_kubeconfig(ctx, name, out_file, writer),
+        ClusterCommand::Kubeconfig { name, out_file } => handle_kubeconfig(ctx, name, out_file.as_ref(), writer),
         ClusterCommand::LoadImage { name, image } => handle_load_image(ctx, name, image, writer),
         ClusterCommand::Kubectl { name, args } => handle_kubectl(ctx, name, args, writer),
     }
@@ -73,7 +73,7 @@ fn handle_list(ctx: &ForgeContext<'_>, writer: &mut dyn Write) -> Result<(), For
 fn handle_kubeconfig(
     ctx: &ForgeContext<'_>,
     name: &str,
-    output_path: &Option<std::path::PathBuf>,
+    output_path: Option<&std::path::PathBuf>,
     writer: &mut dyn Write,
 ) -> Result<(), ForgeError> {
     let kind_name = cluster_kind_name(ctx, name);
@@ -114,12 +114,15 @@ fn handle_kubectl(
 // ---------------------------------------------------------------
 
 /// Look up a cluster in the config by name.
-fn lookup_cluster<'a>(ctx: &'a ForgeContext<'_>, name: &str) -> Result<&'a crate::config::ClusterSpec, ForgeError> {
+fn lookup_cluster<'ctx>(
+    ctx: &'ctx ForgeContext<'_>,
+    name: &str,
+) -> Result<&'ctx crate::config::ClusterSpec, ForgeError> {
     ctx.config
         .spec
         .clusters
         .iter()
-        .find(|c| c.name == name)
+        .find(|cluster| cluster.name == name)
         .ok_or_else(|| ForgeError::Config(format!("cluster '{name}' not found in config")))
 }
 
@@ -170,7 +173,7 @@ fn update_phase_gone(ctx: &ForgeContext<'_>, name: &str) -> Result<(), ForgeErro
 /// Write kubeconfig to file or writer.
 fn write_kubeconfig(
     writer: &mut dyn Write,
-    output_path: &Option<std::path::PathBuf>,
+    output_path: Option<&std::path::PathBuf>,
     kubeconfig: &str,
     format: &OutputFormat,
 ) -> Result<(), ForgeError> {
@@ -239,8 +242,8 @@ fn render_list(writer: &mut dyn Write, clusters: &[String], format: &OutputForma
             output::write_json(writer, &envelope)?;
         },
         OutputFormat::Text => {
-            for c in clusters {
-                output::write_text(writer, c)?;
+            for cluster in clusters {
+                output::write_text(writer, cluster)?;
             }
         },
     }

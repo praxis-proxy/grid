@@ -110,24 +110,26 @@ mod tests {
     use super::*;
 
     #[test]
+    #[expect(clippy::float_cmp, reason = "exact literal round-trip")]
     fn healthy_default_values() {
-        let m = BackendMetrics::healthy_default();
-        assert!(m.healthy, "default should be healthy");
-        assert_eq!(m.error_rate, 0.0, "default error rate");
-        assert_eq!(m.latency_p99_ms, 2500.0, "default latency");
-        assert_eq!(m.queue_depth, 0.5, "default queue depth");
-        assert_eq!(m.kv_cache_utilization, 0.5, "default kv cache");
-        assert_eq!(m.prefix_cache_hit_ratio, 0.5, "default prefix cache");
+        let metrics = BackendMetrics::healthy_default();
+        assert!(metrics.healthy, "default should be healthy");
+        assert_eq!(metrics.error_rate, 0.0, "default error rate");
+        assert_eq!(metrics.latency_p99_ms, 2500.0, "default latency");
+        assert_eq!(metrics.queue_depth, 0.5, "default queue depth");
+        assert_eq!(metrics.kv_cache_utilization, 0.5, "default kv cache");
+        assert_eq!(metrics.prefix_cache_hit_ratio, 0.5, "default prefix cache");
     }
 
     #[test]
+    #[expect(clippy::float_cmp, reason = "exact literal round-trip")]
     fn custom_metrics() {
-        let m = BackendMetrics::new(0.05, true, 0.6, 150.0, 0.8, 0.3);
-        assert!(m.healthy, "should be healthy");
-        assert_eq!(m.error_rate, 0.05, "error rate mismatch");
-        assert_eq!(m.kv_cache_utilization, 0.6, "kv cache mismatch");
-        assert_eq!(m.latency_p99_ms, 150.0, "latency mismatch");
-        assert_eq!(m.prefix_cache_hit_ratio, 0.8, "prefix cache mismatch");
-        assert_eq!(m.queue_depth, 0.3, "queue depth mismatch");
+        let metrics = BackendMetrics::new(0.05, true, 0.6, 150.0, 0.8, 0.3);
+        assert!(metrics.healthy, "should be healthy");
+        assert_eq!(metrics.error_rate, 0.05, "error rate mismatch");
+        assert_eq!(metrics.kv_cache_utilization, 0.6, "kv cache mismatch");
+        assert_eq!(metrics.latency_p99_ms, 150.0, "latency mismatch");
+        assert_eq!(metrics.prefix_cache_hit_ratio, 0.8, "prefix cache mismatch");
+        assert_eq!(metrics.queue_depth, 0.3, "queue depth mismatch");
     }
 }

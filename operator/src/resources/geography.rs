@@ -38,6 +38,7 @@ const KV_CACHE_SATURATION: f64 = 0.90;
 /// [`GridSite`]: crate::crd::grid_site::GridSite
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[expect(unnameable_types, reason = "pub(crate) module restricts reachability")]
 pub enum LocalityTier {
     /// Consumer and provider are the same named site.
     SameSite,
@@ -62,6 +63,7 @@ pub enum LocalityTier {
 /// future work.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[expect(unnameable_types, reason = "pub(crate) module restricts reachability")]
 pub enum AdmissionState {
     /// Accepts new sessions and established sessions.
     NewAndExisting,
@@ -106,11 +108,11 @@ pub(crate) fn derive_locality_tier(
 }
 
 /// Look up region and zone for a named site in a network.
-fn resolve_site_geography<'a>(
+fn resolve_site_geography<'site>(
     site_name: &str,
-    sites: &'a [GridSite],
+    sites: &'site [GridSite],
     network_name: &str,
-) -> (Option<&'a str>, Option<&'a str>) {
+) -> (Option<&'site str>, Option<&'site str>) {
     sites
         .iter()
         .find(|s| s.metadata.name.as_deref() == Some(site_name) && s.spec.grid_network_ref == network_name)

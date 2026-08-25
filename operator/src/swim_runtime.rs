@@ -1009,9 +1009,9 @@ async fn run_loop(
                                     gateway_address_revision,
                                     gateway_address,
                                 );
-                                let output = node.gossip();
+                                let gossip_output = node.gossip();
                                 drain_output(
-                                    output,
+                                    gossip_output,
                                     &socket,
                                     &channels.timer_tx,
                                     &mut tracked,

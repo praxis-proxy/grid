@@ -35,6 +35,11 @@
 //! [`InferenceProvider`]: operator::crd::inference_provider::InferenceProvider
 
 #![deny(unsafe_code)]
+#![expect(
+    clippy::arithmetic_side_effects,
+    clippy::min_ident_chars,
+    reason = "operator uses short closure params and index arithmetic pervasively"
+)]
 
 use std::{
     collections::BTreeMap,
@@ -43,6 +48,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use clap::Parser as _;
 use futures::StreamExt as _;
 use k8s_openapi::api::core::v1::ConfigMap;
 use kube::{
@@ -51,6 +57,7 @@ use kube::{
     runtime::{controller::Controller, watcher},
 };
 use operator::{
+    cli::Cli,
     controller::{
         agent_tool_provider,
         grid_network::{self, OperatorCtx},
@@ -60,6 +67,7 @@ use operator::{
         agent_tool_provider::AgentToolProvider, grid_network::GridNetwork, grid_site::GridSite,
         inference_provider::InferenceProvider,
     },
+    gateway,
     swim_runtime::{self, RevisionLease, SwimConfig},
 };
 
@@ -68,7 +76,12 @@ use operator::{
 // ---------------------------------------------------------------------------
 
 #[tokio::main]
-#[expect(clippy::large_stack_frames, reason = "top-level binary with tokio runtime")]
+#[expect(
+    clippy::large_stack_frames,
+    clippy::too_many_lines,
+    reason = "top-level binary with tokio runtime; startup sequence (crypto provider, CLI parsing, \
+              SWIM bootstrap, controller fan-out) reads clearer sequential than split further"
+)]
 async fn main() {
     tracing_subscriber::fmt::init();
     tracing::info!("starting grid-operator");
@@ -92,6 +105,8 @@ async fn main() {
         tracing::warn!("rustls default CryptoProvider already installed; continuing");
     }
 
+    let config = Cli::parse();
+
     let client = match Client::try_default().await {
         Ok(c) => c,
         Err(e) => {
@@ -100,12 +115,13 @@ async fn main() {
         },
     };
 
-    let swim = maybe_start_swim(&client).await;
+    let swim = maybe_start_swim(&client, &config.gateway).await;
 
     if let Some(handle) = &swim {
-        tokio::spawn(operator::gateway::run_discovery_poller(
+        tokio::spawn(gateway::run_discovery_poller(
             client.clone(),
             Arc::clone(handle),
+            config.gateway.clone(),
         ));
     }
 
@@ -143,7 +159,7 @@ async fn main() {
     clippy::large_stack_frames,
     reason = "sequential env-var parsing + runtime startup; splitting would obscure the startup sequence"
 )]
-async fn maybe_start_swim(client: &Client) -> Option<Arc<swim_runtime::SwimHandle>> {
+async fn maybe_start_swim(client: &Client, config: &gateway::Config) -> Option<Arc<swim_runtime::SwimHandle>> {
     let addr_str = std::env::var("GRID_SWIM_BIND_ADDR").ok()?;
     let bind_addr = match addr_str.parse() {
         Ok(a) => a,
@@ -155,7 +171,7 @@ async fn maybe_start_swim(client: &Client) -> Option<Arc<swim_runtime::SwimHandl
     let advertise_addr = parse_optional_socket_addr_env("GRID_SWIM_ADVERTISE_ADDR");
     let seeds = parse_socket_addr_list_env("GRID_SWIM_SEEDS");
     let site_name = std::env::var("GRID_SWIM_SITE_NAME").unwrap_or_else(|_| hostname_or_default());
-    let gateway_address = match operator::gateway::resolve(client).await {
+    let gateway_address = match gateway::resolve(client, config).await {
         Ok(addr) => addr,
         Err(e) => {
             tracing::error!(error = %e, "gateway address discovery failed; continuing without");
@@ -244,11 +260,11 @@ async fn reserve_revision_lease(client: &Client, site_name: &str) -> Result<Revi
                         );
                         return Ok(lease);
                     },
-                    Err(kube::Error::Api(error)) if error.code == 409 => {},
-                    Err(error) => return Err(format!("replace {cm_name}: {error}")),
+                    Err(kube::Error::Api(conflict)) if conflict.code == 409 => {},
+                    Err(replace_err) => return Err(format!("replace {cm_name}: {replace_err}")),
                 }
             },
-            Err(kube::Error::Api(error)) if error.code == 404 => {
+            Err(kube::Error::Api(not_found)) if not_found.code == 404 => {
                 let lease = initial_revision_lease()?;
                 let cm = ConfigMap {
                     metadata: ObjectMeta {
@@ -270,11 +286,11 @@ async fn reserve_revision_lease(client: &Client, site_name: &str) -> Result<Revi
                         );
                         return Ok(lease);
                     },
-                    Err(kube::Error::Api(error)) if error.code == 409 => {},
-                    Err(error) => return Err(format!("create {cm_name}: {error}")),
+                    Err(kube::Error::Api(conflict)) if conflict.code == 409 => {},
+                    Err(create_err) => return Err(format!("create {cm_name}: {create_err}")),
                 }
             },
-            Err(error) => return Err(format!("read {cm_name}: {error}")),
+            Err(read_err) => return Err(format!("read {cm_name}: {read_err}")),
         }
     }
     Err(format!(
@@ -628,9 +644,15 @@ mod tests {
 
     #[test]
     fn exhausted_revision_or_generation_fails_closed() {
-        assert!(next_revision_lease(u64::MAX, 1).is_err());
-        assert!(next_revision_lease(1, u64::MAX).is_err());
-        assert!(lease_from_seeds(u64::MAX, 1).is_err());
+        assert!(
+            next_revision_lease(u64::MAX, 1).is_err(),
+            "u64::MAX revision must overflow"
+        );
+        assert!(
+            next_revision_lease(1, u64::MAX).is_err(),
+            "u64::MAX generation must overflow"
+        );
+        assert!(lease_from_seeds(u64::MAX, 1).is_err(), "u64::MAX seed must overflow");
     }
 
     #[test]

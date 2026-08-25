@@ -154,6 +154,99 @@ pub fn resolve_scoring_weights(policy: Option<&ScoringPolicyConfig>) -> scoring:
 }
 
 // ---------------------------------------------------------------------------
+// Admission policy
+// ---------------------------------------------------------------------------
+
+/// Controls whether provider admission reacts immediately or uses bounded
+/// hysteresis across reconciles.
+#[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AdmissionMode {
+    /// Apply the current observation immediately.  This is the compatibility
+    /// behaviour used when `admissionPolicy` is omitted.
+    #[default]
+    Instantaneous,
+    /// Require repeated pressure/recovery observations before changing state.
+    Stabilized,
+}
+
+/// Fail-closed state to use when configured provider metrics are unavailable.
+#[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum MissingMetricsPolicy {
+    /// Preserve existing sessions but do not admit new ones.
+    #[default]
+    ExistingOnly,
+    /// Remove the provider from the published routing overlay.
+    Excluded,
+}
+
+/// Pressure and recovery hysteresis configuration.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[schemars(
+    deny_unknown_fields,
+    extend("x-kubernetes-validations" = [{
+        "rule": "self.exitThreshold < self.enterThreshold",
+        "message": "exitThreshold must be less than enterThreshold"
+    }])
+)]
+pub struct AdmissionPressureConfig {
+    /// Pressure level at which a provider is considered saturated.
+    #[schemars(range(min = 0.0, max = 1.0))]
+    pub enter_threshold: f64,
+    /// Lower pressure level required before recovery can begin.
+    #[schemars(range(min = 0.0, max = 1.0))]
+    pub exit_threshold: f64,
+    /// Consecutive pressure observations required to enter `existingOnly`.
+    #[schemars(range(min = 1, max = 100))]
+    pub failure_threshold: u32,
+    /// Consecutive healthy observations required to recover new admission.
+    #[schemars(range(min = 1, max = 100))]
+    pub success_threshold: u32,
+    /// Minimum time a state must remain active before changing.
+    #[schemars(regex(pattern = "^[1-9][0-9]*s$"))]
+    pub minimum_state_duration: String,
+    /// Additional time to hold a recovering provider in `existingOnly`.
+    #[schemars(regex(pattern = "^[1-9][0-9]*s$"))]
+    pub recovery_hold_down: String,
+}
+
+impl Default for AdmissionPressureConfig {
+    fn default() -> Self {
+        Self {
+            enter_threshold: 0.85,
+            exit_threshold: 0.70,
+            failure_threshold: 2,
+            success_threshold: 3,
+            minimum_state_duration: "10s".to_owned(),
+            recovery_hold_down: "30s".to_owned(),
+        }
+    }
+}
+
+/// Provider admission policy for routing overlays.
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct AdmissionPolicyConfig {
+    /// Admission evaluation mode.
+    #[serde(default)]
+    pub mode: AdmissionMode,
+    /// Pressure and recovery thresholds.
+    #[serde(default)]
+    pub pressure: AdmissionPressureConfig,
+    /// Fail-closed state for missing or expired metrics.
+    #[serde(default = "default_missing_metrics_policy")]
+    pub missing_metrics: MissingMetricsPolicy,
+}
+
+/// Return the fail-closed default for omitted `missingMetrics`.
+fn default_missing_metrics_policy() -> MissingMetricsPolicy {
+    MissingMetricsPolicy::ExistingOnly
+}
+
+// ---------------------------------------------------------------------------
 // Budget policy
 // ---------------------------------------------------------------------------
 
@@ -437,6 +530,15 @@ pub struct GridNetworkSpec {
     /// See [`ScoringStrategy`] for the available provider-level strategies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scoring_policy: Option<ScoringPolicyConfig>,
+
+    /// Provider admission and pressure-recovery policy.
+    ///
+    /// When omitted, Grid preserves the historical instantaneous admission
+    /// behaviour and providers without metrics remain eligible. New
+    /// stabilized deployments should set this explicitly so missing metrics
+    /// fail closed according to `missingMetrics`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission_policy: Option<AdmissionPolicyConfig>,
 
     /// Maximum time between metric refreshes and score/ranking recalculation.
     ///
@@ -731,6 +833,10 @@ pub struct SwimConfig {
 /// TLS configuration for grid certificate management.
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[expect(
+    clippy::struct_field_names,
+    reason = "fields named after Kubernetes Secret references"
+)]
 pub struct TlsConfig {
     /// Secret storing the grid CA certificate and key.
     pub ca_secret_ref: Option<SecretRef>,
@@ -1017,9 +1123,6 @@ impl Default for SwimConfig {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
-    use crdt::GCounter;
     use kube::CustomResourceExt as _;
 
     use super::*;
@@ -1028,7 +1131,7 @@ mod tests {
         serde_json::to_value(GridNetwork::crd()).unwrap_or_else(|_| std::process::abort())
     }
 
-    fn crd_spec<'a>(crd: &'a serde_json::Value, field: &str) -> &'a str {
+    fn crd_spec<'val>(crd: &'val serde_json::Value, field: &str) -> &'val str {
         crd.get("spec")
             .and_then(|spec| spec.get(field))
             .and_then(serde_json::Value::as_str)

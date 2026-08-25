@@ -187,13 +187,13 @@ mod tests {
 
         let result = provider.site_certificate();
         assert!(result.is_err(), "should fail on missing file");
-        let msg = result.err().map(|e| e.to_string()).unwrap_or_default();
+        let msg = result.err().map(|err| err.to_string()).unwrap_or_default();
         assert!(msg.contains("nonexistent"), "error should reference the path: {msg}");
     }
 
     /// Write test data to a file.
     fn write_file(path: &Path, content: &str) {
-        let mut f = std::fs::File::create(path).unwrap_or_else(|_| std::process::abort());
-        f.write_all(content.as_bytes()).unwrap_or_default();
+        let mut file = std::fs::File::create(path).unwrap_or_else(|_| std::process::abort());
+        file.write_all(content.as_bytes()).unwrap_or_default();
     }
 }

@@ -28,6 +28,41 @@ env:
   HELM_UNITTEST_VERSION: v0.8.2
 
 jobs:
+  # ------------------------------------------------------------------------------
+  # Avoid building runtime images for documentation-only pull requests.
+  # ------------------------------------------------------------------------------
+
+  changes:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      runtime: ${{ steps.changed.outputs.runtime }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Detect runtime changes
+        id: changed
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+
+          if [ "${EVENT_NAME}" != "pull_request" ]; then
+            echo "runtime=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          changed_files="$(git diff --name-only "${BASE_SHA}...${GITHUB_SHA}")"
+          if printf '%s\n' "${changed_files}" | grep -qvE '(^docs/|(^|/)README[^/]*$|\.md$)'; then
+            echo "runtime=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "runtime=false" >> "${GITHUB_OUTPUT}"
+          fi
+
   # ----------------------------------------------------------------------------
   # Static chart validation (lint, template, schema, CRD sync, package)
   # ----------------------------------------------------------------------------
@@ -89,6 +124,8 @@ jobs:
   # ----------------------------------------------------------------------------
 
   kind:
+    needs: changes
+    if: needs.changes.outputs.runtime == 'true'
     runs-on: ubuntu-24.04
     permissions:
       contents: read

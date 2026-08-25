@@ -64,8 +64,8 @@ pub(crate) struct ProbeConfig {
     /// Canonical DER fingerprint pins (1–2 entries).
     pub pins: Vec<CanonicalFingerprint>,
 
-    /// Optional SWIM-advertised leaf cert DER for authorization against the
-    /// configured rotation pins.
+    /// Optional SWIM-advertised leaf cert DER, compared with the configured
+    /// rotation pins for diagnostics only.
     pub advertised_leaf_der: Option<Vec<u8>>,
 }
 
@@ -182,7 +182,8 @@ pub(crate) fn build_tls_config(
 /// 2. TLS handshake under [`PROBE_DEADLINE`] (total, including connect).
 /// 3. Extract peer leaf certificate DER.
 /// 4. Validate canonical fingerprint pin.
-/// 5. If present, verify the SWIM-advertised leaf cert matches an authorized rotation pin.
+/// 5. If present, compare the SWIM-advertised leaf with the pins and record a mismatch without failing the verified
+///    connection.
 ///
 /// Returns a `GatewayProbeOutcome` — never panics, never leaks
 /// private material.
@@ -273,6 +274,7 @@ fn classify_tls_error(err: &std::io::Error) -> GatewayProbeOutcome {
 }
 
 /// Map a rustls error to a `GatewayProbeOutcome`.
+#[expect(clippy::wildcard_enum_match_arm, reason = "external type with many variants")]
 fn classify_rustls_error(err: &rustls::Error) -> GatewayProbeOutcome {
     use rustls::{CertificateError, Error};
 
@@ -476,8 +478,11 @@ mod tests {
 
     #[test]
     fn first_cert_der_from_invalid_pem() {
-        assert!(first_cert_der_from_pem("not a cert").is_err());
-        assert!(first_cert_der_from_pem("").is_err());
+        assert!(
+            first_cert_der_from_pem("not a cert").is_err(),
+            "non-PEM text must be rejected"
+        );
+        assert!(first_cert_der_from_pem("").is_err(), "empty input must be rejected");
     }
 
     #[test]

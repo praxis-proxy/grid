@@ -5,6 +5,15 @@
 //! mesh of Praxis AI gateways across clusters.
 
 #![deny(unsafe_code)]
+#![expect(
+    clippy::arithmetic_side_effects,
+    clippy::as_conversions,
+    clippy::min_ident_chars,
+    reason = "operator uses short closure params, index arithmetic, and casts pervasively"
+)]
+
+/// Command-line interface.
+pub mod cli;
 
 /// Kubernetes controllers.
 pub mod controller;

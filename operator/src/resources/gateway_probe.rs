@@ -160,9 +160,10 @@ pub(crate) fn probe_transition(current_phase: &GridSitePhase, outcome: &GatewayP
             "PinMismatch",
             "server cert fingerprint does not match any configured pin",
         ),
-        O::AdvertisedCertificateMismatch => trust_failure(
+        // Recorded, not acted on: the live leaf already matched a pin above.
+        O::AdvertisedCertificateMismatch => success(
             "AdvertisedCertMismatch",
-            "SWIM-advertised certificate does not match any configured pin",
+            "SWIM-advertised certificate does not match any configured pin; live leaf verified",
         ),
     }
 }
@@ -181,7 +182,11 @@ fn connectivity_failure(current: &GridSitePhase, reason: &'static str, msg: &str
     ProbeTransition {
         phase: match current {
             GridSitePhase::Active => GridSitePhase::Unreachable,
-            _ => current.clone(),
+            GridSitePhase::Pending
+            | GridSitePhase::Discovered
+            | GridSitePhase::Connecting
+            | GridSitePhase::Unreachable
+            | GridSitePhase::Left => current.clone(),
         },
         reason,
         message: truncate_message(msg),
@@ -470,32 +475,45 @@ mod tests {
     }
 
     #[test]
-    fn advertised_cert_mismatch_demotes_active_to_connecting() {
+    fn advertised_cert_mismatch_keeps_active() {
         let t = probe_transition(
             &GridSitePhase::Active,
             &GatewayProbeOutcome::AdvertisedCertificateMismatch,
         );
         assert_eq!(
             t.phase,
-            GridSitePhase::Connecting,
-            "advertised cert mismatch must demote Active to Connecting"
+            GridSitePhase::Active,
+            "the live leaf already matched a pin; the advertised copy must not demote"
         );
         assert_eq!(
             t.reason, "AdvertisedCertMismatch",
-            "reason must be AdvertisedCertMismatch"
+            "the mismatch is still recorded in the reason"
         );
     }
 
     #[test]
-    fn advertised_cert_mismatch_stays_connecting() {
+    fn advertised_cert_mismatch_recovers_from_unreachable() {
+        let t = probe_transition(
+            &GridSitePhase::Unreachable,
+            &GatewayProbeOutcome::AdvertisedCertificateMismatch,
+        );
+        assert_eq!(
+            t.phase,
+            GridSitePhase::Active,
+            "the peer answered and verified, so it is no longer unreachable"
+        );
+    }
+
+    #[test]
+    fn advertised_cert_mismatch_does_not_block_active() {
         let t = probe_transition(
             &GridSitePhase::Connecting,
             &GatewayProbeOutcome::AdvertisedCertificateMismatch,
         );
         assert_eq!(
             t.phase,
-            GridSitePhase::Connecting,
-            "advertised cert mismatch must keep Connecting"
+            GridSitePhase::Active,
+            "reached only after chain, SAN, and live-leaf pin verified"
         );
         assert_eq!(
             t.reason, "AdvertisedCertMismatch",
@@ -574,7 +592,6 @@ mod tests {
             GatewayProbeOutcome::CertificateExpired,
             GatewayProbeOutcome::CertificateNotYetValid,
             GatewayProbeOutcome::PinMismatch,
-            GatewayProbeOutcome::AdvertisedCertificateMismatch,
         ];
         for outcome in &trust_failures {
             let t = probe_transition(&GridSitePhase::Active, outcome);
@@ -598,7 +615,6 @@ mod tests {
             GatewayProbeOutcome::CertificateExpired,
             GatewayProbeOutcome::CertificateNotYetValid,
             GatewayProbeOutcome::PinMismatch,
-            GatewayProbeOutcome::AdvertisedCertificateMismatch,
         ];
         for outcome in &trust_failures {
             let t = probe_transition(&GridSitePhase::Connecting, outcome);
@@ -691,7 +707,7 @@ mod tests {
     #[test]
     fn valid_single_pin() {
         let pins = vec!["a".repeat(64)];
-        assert!(validate_canonical_pins(&pins).is_ok());
+        validate_canonical_pins(&pins).unwrap();
     }
 
     #[test]
@@ -720,7 +736,9 @@ mod tests {
         let err = validate_canonical_pins(&pins).unwrap_err();
         match err {
             CanonicalPinError::Invalid { index: 1, .. } => {},
-            other => panic!("expected Invalid at index 1, got {other:?}"),
+            CanonicalPinError::Empty | CanonicalPinError::TooMany(_) | CanonicalPinError::Invalid { .. } => {
+                panic!("expected Invalid at index 1, got {err:?}")
+            },
         }
     }
 
@@ -728,12 +746,12 @@ mod tests {
 
     #[test]
     fn valid_server_name() {
-        assert!(validate_server_name("east-provider.grid.internal").is_ok());
+        validate_server_name("east-provider.grid.internal").unwrap();
     }
 
     #[test]
     fn valid_simple_name() {
-        assert!(validate_server_name("provider").is_ok());
+        validate_server_name("provider").unwrap();
     }
 
     #[test]

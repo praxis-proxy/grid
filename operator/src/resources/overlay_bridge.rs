@@ -74,10 +74,7 @@ fn candidate_to_value(c: &RoutingCandidate) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::resources::{
-        geography::{AdmissionState, LocalityTier},
-        routing_overlay::{RoutingCandidate, RoutingOverlay},
-    };
+    use crate::resources::geography::{AdmissionState, LocalityTier};
 
     fn make_overlay(candidates: Vec<(&str, &str, &str)>) -> RoutingOverlay {
         RoutingOverlay {
@@ -171,7 +168,7 @@ mod tests {
             value.get("generated_at").is_none(),
             "operator overlay timestamp must not enter static intelligent_route filter config"
         );
-        let candidate = value
+        let rendered_candidate = value
             .get("candidates")
             .and_then(serde_json::Value::as_array)
             .and_then(|candidates| candidates.first())
@@ -179,7 +176,7 @@ mod tests {
             .unwrap_or_else(|| std::process::abort());
         for key in ["stable_id", "admission_state", "selection_tier", "rank"] {
             assert!(
-                !candidate.contains_key(key),
+                !rendered_candidate.contains_key(key),
                 "operator-only metadata field {key} must not enter static intelligent_route filter config"
             );
         }

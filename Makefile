@@ -14,8 +14,9 @@ ifneq ($(V),)
 endif
 
 .PHONY: all build release check clean \
-	test test-unit lint fmt doc audit \
+	test test-unit lint lint-extra fmt doc audit \
 	coverage coverage-check \
+	mutants semver publish-dry-run \
 	require-container-engine \
 	images container operator-image \
 	mock-providers-image overlay-sync-image glb-demo-images \
@@ -75,11 +76,27 @@ audit:
 	cargo audit
 	cargo deny check
 
+lint-extra:
+	typos
+	taplo fmt --check
+	shellcheck .hooks/pre-commit
+	actionlint
+
+mutants:
+	cargo mutants --workspace
+
+semver:
+	cargo semver-checks
+
+publish-dry-run:
+	cargo package --workspace --allow-dirty
+
 coverage:
 	cargo llvm-cov --workspace --html --output-dir target/coverage \
 		--exclude xtask \
 		--ignore-filename-regex '(target/|tests/)'
 
+# Convention target is 90%; ratchet up incrementally.
 coverage-check:
 	cargo llvm-cov --workspace --json \
 		--exclude xtask \
@@ -188,11 +205,15 @@ help:
 	@echo ""
 	@echo "Quality:"
 	@echo "  lint             clippy + rustfmt check + machete"
+	@echo "  lint-extra       typos + taplo + shellcheck + actionlint"
 	@echo "  fmt              format with nightly rustfmt"
 	@echo "  doc              build docs with warnings denied"
 	@echo "  audit            cargo audit + cargo deny"
 	@echo "  coverage         HTML coverage report"
 	@echo "  coverage-check   fail if line coverage < 80%%"
+	@echo "  mutants          mutation testing (cargo mutants)"
+	@echo "  semver           semver compatibility check"
+	@echo "  publish-dry-run  cargo package verification"
 	@echo ""
 	@echo "Helm:"
 	@echo "  helm-lint        lint, template, schema, CRD sync, package"

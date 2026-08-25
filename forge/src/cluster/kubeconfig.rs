@@ -69,14 +69,14 @@ fn rewrite_cluster_entries(doc: &mut serde_yaml::Value, kind_name: &str) {
 fn rewrite_cluster_entry(entry: &mut serde_yaml::Value, kind_name: &str) {
     let url = entry
         .get("cluster")
-        .and_then(|c| c.get("server"))
+        .and_then(|cluster| cluster.get("server"))
         .and_then(serde_yaml::Value::as_str)
         .map(ToOwned::to_owned);
     let Some(url) = url else {
         return;
     };
     if let Some(rewritten) = rewrite_loopback_url(&url, kind_name)
-        && let Some(server) = entry.get_mut("cluster").and_then(|c| c.get_mut("server"))
+        && let Some(server) = entry.get_mut("cluster").and_then(|cluster| cluster.get_mut("server"))
     {
         *server = serde_yaml::Value::String(rewritten);
     }
@@ -269,7 +269,7 @@ users:
 
         let err = match export_kubeconfig(&runner, "test-hub", "hub", dir.path()) {
             Ok(()) => std::process::abort(),
-            Err(e) => e,
+            Err(err) => err,
         };
         let msg = err.to_string();
         assert!(

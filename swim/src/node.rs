@@ -81,12 +81,17 @@ impl SwimNode {
     }
 
     /// Create a node with an explicit hard bound for retained state origins.
+    #[expect(clippy::too_many_lines, reason = "seed + foca setup is one logical step")]
     pub fn with_origin_capacity(identity: NodeId, max_origins: usize) -> Self {
         let seed = {
             // Truncate nanoseconds to u64; we want spread, not precision.
             #[expect(
                 clippy::cast_possible_truncation,
                 reason = "intentional truncation for entropy mixing"
+            )]
+            #[expect(
+                clippy::as_conversions,
+                reason = "u128 -> u64 truncation is intentional for entropy mixing"
             )]
             let nanos = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -125,8 +130,8 @@ impl SwimNode {
     /// membership events, and any CRDT state broadcast payloads received.
     /// Protocol errors are logged at `warn` level and do not abort the output.
     pub fn handle_data(&mut self, data: &[u8]) -> AccumulatedOutput {
-        if let Err(e) = self.foca.handle_data(data, &mut self.runtime) {
-            tracing::warn!(error = %e, len = data.len(), "foca handle_data error");
+        if let Err(err) = self.foca.handle_data(data, &mut self.runtime) {
+            tracing::warn!(error = %err, len = data.len(), "foca handle_data error");
         }
         self.runtime.take_output()
     }
@@ -136,10 +141,10 @@ impl SwimNode {
     /// Only [`TimerEvent::Token`] events are forwarded; others are silently
     /// ignored.
     pub fn handle_timer(&mut self, event: TimerEvent) -> AccumulatedOutput {
-        if let TimerEvent::Token(t) = event
-            && let Err(e) = self.foca.handle_timer(t, &mut self.runtime)
+        if let TimerEvent::Token(token) = event
+            && let Err(err) = self.foca.handle_timer(token, &mut self.runtime)
         {
-            tracing::warn!(error = %e, "foca handle_timer error");
+            tracing::warn!(error = %err, "foca handle_timer error");
         }
         self.runtime.take_output()
     }
@@ -152,8 +157,8 @@ impl SwimNode {
     ///
     /// [`publish_state_broadcast`]: SwimNode::publish_state_broadcast
     pub fn announce(&mut self, dst: NodeId) -> AccumulatedOutput {
-        if let Err(e) = self.foca.announce(dst, &mut self.runtime) {
-            tracing::warn!(error = %e, "foca announce error");
+        if let Err(err) = self.foca.announce(dst, &mut self.runtime) {
+            tracing::warn!(error = %err, "foca announce error");
         }
         self.runtime.take_output()
     }
@@ -169,8 +174,8 @@ impl SwimNode {
     ///
     /// [`publish_state_broadcast`]: SwimNode::publish_state_broadcast
     pub fn gossip(&mut self) -> AccumulatedOutput {
-        if let Err(e) = self.foca.gossip(&mut self.runtime) {
-            tracing::warn!(error = %e, "foca gossip error");
+        if let Err(err) = self.foca.gossip(&mut self.runtime) {
+            tracing::warn!(error = %err, "foca gossip error");
         }
         self.runtime.take_output()
     }
@@ -181,8 +186,8 @@ impl SwimNode {
     /// broadcast path. It is used for retained state repair so a healthy peer
     /// cannot remain permanently missing an origin's provider state.
     pub fn broadcast(&mut self) -> AccumulatedOutput {
-        if let Err(e) = self.foca.broadcast(&mut self.runtime) {
-            tracing::warn!(error = %e, "foca broadcast error");
+        if let Err(err) = self.foca.broadcast(&mut self.runtime) {
+            tracing::warn!(error = %err, "foca broadcast error");
         }
         self.runtime.take_output()
     }
@@ -206,7 +211,7 @@ impl SwimNode {
             Ok(false) => {
                 tracing::debug!(origin = %broadcast.origin_site, "state broadcast rejected (stale or duplicate)");
             },
-            Err(e) => tracing::warn!(error = %e, "foca add_broadcast failed"),
+            Err(err) => tracing::warn!(error = %err, "foca add_broadcast failed"),
         }
         Ok(())
     }
@@ -261,7 +266,7 @@ fn grid_config() -> foca::Config {
 
 #[cfg(test)]
 mod tests {
-    use crdt::{Capability, GridStateSnapshot, ProviderMetricsSnapshot, ProviderPhase, ProviderState};
+    use crdt::{Capability, ProviderMetricsSnapshot, ProviderPhase, ProviderState};
 
     use super::*;
     use crate::state_broadcast::StateBroadcastError;
@@ -399,9 +404,9 @@ mod tests {
             if msg.addr == id_a.socket_addr() {
                 let oa = node_a.handle_data(&msg.data);
                 // Pass any A→B follow-ups to B (acknowledgements etc.)
-                for m in &oa.messages {
-                    if m.addr == id_b.socket_addr() {
-                        drop(node_b.handle_data(&m.data));
+                for followup in &oa.messages {
+                    if followup.addr == id_b.socket_addr() {
+                        drop(node_b.handle_data(&followup.data));
                     }
                 }
             }
@@ -554,7 +559,7 @@ mod tests {
             node_b
                 .state_snapshot()
                 .provider("net", "site-a", "provider-1")
-                .map(|p| p.metrics.queue_depth),
+                .map(|prov| prov.metrics.queue_depth),
             Some(Some(0.1)),
             "B should have queue_depth=0.1 from rev=2"
         );
@@ -577,7 +582,7 @@ mod tests {
             node_b
                 .state_snapshot()
                 .provider("net", "site-a", "provider-1")
-                .map(|p| p.metrics.queue_depth),
+                .map(|prov| prov.metrics.queue_depth),
             Some(Some(0.1)),
             "stale rev=1 must not overwrite newer rev=2 state"
         );
@@ -717,12 +722,14 @@ mod tests {
     /// `operator::crd::grid_network::spend_ratio` expects on the read side.
     fn cost_cents_for_request(cost_per_1k_input_usd: f64, input_tokens: u64) -> u64 {
         #[expect(
+            clippy::as_conversions,
             clippy::cast_precision_loss,
             reason = "test-only cost simulation, not the production conversion path"
         )]
         let tokens = input_tokens as f64;
         let usd = cost_per_1k_input_usd * (tokens / 1000.0);
         #[expect(
+            clippy::as_conversions,
             clippy::cast_sign_loss,
             clippy::cast_possible_truncation,
             reason = "usd is always non-negative in this test fixture"

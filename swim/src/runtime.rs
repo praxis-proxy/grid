@@ -146,7 +146,10 @@ impl foca::Runtime<NodeId> for GridRuntime {
                     addr: new.socket_addr(),
                 }
             },
-            _ => return,
+            foca::Notification::Active
+            | foca::Notification::Idle
+            | foca::Notification::Defunct
+            | foca::Notification::Rejoin(_) => return,
         };
 
         self.output.events.push(event);

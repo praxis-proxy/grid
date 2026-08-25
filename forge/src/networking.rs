@@ -143,8 +143,8 @@ fn inspect_labels(
 /// Verify a single label value matches the expected value.
 fn check_label(labels: &BTreeMap<String, String>, key: &str, expected: &str, net_name: &str) -> Result<(), ForgeError> {
     match labels.get(key) {
-        Some(v) if v == expected => Ok(()),
-        Some(v) => Err(ownership_mismatch(net_name, key, expected, v)),
+        Some(val) if val == expected => Ok(()),
+        Some(val) => Err(ownership_mismatch(net_name, key, expected, val)),
         None => Err(missing_label(net_name, key)),
     }
 }
@@ -250,13 +250,13 @@ fn parse_labels(stdout: &str) -> Result<BTreeMap<String, String>, ForgeError> {
     if trimmed.is_empty() {
         return Ok(BTreeMap::new());
     }
-    serde_json::from_str(trimmed).map_err(|e| ForgeError::State(format!("cannot parse network labels: {e}")))
+    serde_json::from_str(trimmed).map_err(|err| ForgeError::State(format!("cannot parse network labels: {err}")))
 }
 
 /// Parse and validate the first IPv4 subnet in a formatted IPAM config.
 fn parse_ipam_config(stdout: &str) -> Result<String, ForgeError> {
     let config: Vec<serde_json::Value> = serde_json::from_str(stdout.trim())
-        .map_err(|e| ForgeError::State(format!("cannot parse network IPAM config: {e}")))?;
+        .map_err(|err| ForgeError::State(format!("cannot parse network IPAM config: {err}")))?;
     let subnet = config
         .first()
         .and_then(|entry| entry.get("Subnet"))
@@ -273,10 +273,10 @@ fn validate_ipv4_cidr(cidr: &str) -> Result<(), ForgeError> {
         .ok_or_else(|| ForgeError::State(format!("network subnet is not CIDR: {cidr:?}")))?;
     address
         .parse::<std::net::Ipv4Addr>()
-        .map_err(|e| ForgeError::State(format!("network subnet has an invalid IPv4 address: {e}")))?;
+        .map_err(|err| ForgeError::State(format!("network subnet has an invalid IPv4 address: {err}")))?;
     let prefix = prefix
         .parse::<u8>()
-        .map_err(|e| ForgeError::State(format!("network subnet has an invalid prefix: {e}")))?;
+        .map_err(|err| ForgeError::State(format!("network subnet has an invalid prefix: {err}")))?;
     if prefix > 32 {
         return Err(ForgeError::State(format!(
             "network subnet prefix /{prefix} exceeds /32"

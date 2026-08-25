@@ -259,35 +259,41 @@ mod tests {
         #[test]
         fn resolve_rejects_key_without_provider() {
             let result = resolve_external_provider(None, Some(Path::new("/tmp/key")), None);
-            assert!(result.is_err());
-            assert!(result.unwrap_err().to_string().contains("--external-provider"));
+            assert!(
+                matches!(&result, Err(err) if err.to_string().contains("--external-provider")),
+                "must mention --external-provider"
+            );
         }
 
         #[test]
         fn resolve_rejects_model_without_provider() {
             let result = resolve_external_provider(None, None, Some("gpt-5-mini"));
-            assert!(result.is_err());
+            assert!(result.is_err(), "model without provider must fail");
         }
 
         #[test]
         fn resolve_rejects_provider_without_key() {
             let result = resolve_external_provider(Some(ExternalProvider::OpenAi), None, Some("gpt-5-mini"));
-            assert!(result.is_err());
-            assert!(result.unwrap_err().to_string().contains("key-file"));
+            assert!(
+                matches!(&result, Err(err) if err.to_string().contains("key-file")),
+                "must mention key-file"
+            );
         }
 
         #[test]
         fn resolve_rejects_provider_without_model() {
             let result = resolve_external_provider(Some(ExternalProvider::OpenAi), Some(Path::new("/tmp/key")), None);
-            assert!(result.is_err());
-            assert!(result.unwrap_err().to_string().contains("model"));
+            assert!(
+                matches!(&result, Err(err) if err.to_string().contains("model")),
+                "must mention model"
+            );
         }
 
         #[test]
         fn resolve_rejects_empty_model() {
             let result =
                 resolve_external_provider(Some(ExternalProvider::OpenAi), Some(Path::new("/tmp/key")), Some(""));
-            assert!(result.is_err());
+            assert!(result.is_err(), "empty model must fail");
         }
 
         #[test]

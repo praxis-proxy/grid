@@ -42,17 +42,17 @@ pub fn container_name(env_name: &str, service_name: &str) -> String {
 ///
 /// Groups common arguments to keep public function signatures
 /// under the five-argument limit.
-pub struct ServiceParams<'a> {
+pub struct ServiceParams<'ctx> {
     /// Container runtime binary name (e.g. `"docker"`).
-    pub binary: &'a str,
+    pub binary: &'ctx str,
     /// Deterministic container name.
-    pub container_name: &'a str,
+    pub container_name: &'ctx str,
     /// Environment name from configuration metadata.
-    pub env_name: &'a str,
+    pub env_name: &'ctx str,
     /// Directory containing the configuration file.
-    pub config_dir: &'a Path,
+    pub config_dir: &'ctx Path,
     /// Forge state directory (for resolving `.forge/` volume sources).
-    pub state_dir: &'a Path,
+    pub state_dir: &'ctx Path,
 }
 
 // -------------------------------------------------------------
@@ -195,25 +195,30 @@ type DepGraph = (Vec<Vec<usize>>, Vec<usize>);
 
 /// Map service names to their indices in the slice.
 fn build_name_index(services: &[ServiceSpec]) -> BTreeMap<&str, usize> {
-    services.iter().enumerate().map(|(i, s)| (s.name.as_str(), i)).collect()
+    services
+        .iter()
+        .enumerate()
+        .map(|(idx, svc)| (svc.name.as_str(), idx))
+        .collect()
 }
 
 /// Build adjacency list and in-degree vector from service deps.
+#[expect(clippy::arithmetic_side_effects, reason = "in-degree count bounded by service count")]
 fn build_dep_graph(services: &[ServiceSpec], index: &BTreeMap<&str, usize>) -> Result<DepGraph, ForgeError> {
-    let n = services.len();
-    let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
-    let mut in_deg: Vec<usize> = vec![0; n];
-    for (i, svc) in services.iter().enumerate() {
+    let count = services.len();
+    let mut adj: Vec<Vec<usize>> = vec![Vec::new(); count];
+    let mut in_deg: Vec<usize> = vec![0; count];
+    for (src, svc) in services.iter().enumerate() {
         for dep in &svc.depends_on {
-            let &j = index
+            let &dst = index
                 .get(dep.as_str())
                 .ok_or_else(|| ForgeError::Config(format!("service '{}' depends on unknown '{dep}'", svc.name)))?;
             let neighbours = adj
-                .get_mut(j)
+                .get_mut(dst)
                 .ok_or_else(|| ForgeError::State("graph index out of bounds".to_owned()))?;
-            neighbours.push(i);
+            neighbours.push(src);
             let deg = in_deg
-                .get_mut(i)
+                .get_mut(src)
                 .ok_or_else(|| ForgeError::State("graph index out of bounds".to_owned()))?;
             *deg += 1;
         }
@@ -222,30 +227,30 @@ fn build_dep_graph(services: &[ServiceSpec], index: &BTreeMap<&str, usize>) -> R
 }
 
 /// Run Kahn's algorithm on the adjacency list.
-fn toposort(adj: &[Vec<usize>], in_deg: &mut [usize], n: usize) -> Result<Vec<usize>, ForgeError> {
+fn toposort(adj: &[Vec<usize>], in_deg: &mut [usize], total: usize) -> Result<Vec<usize>, ForgeError> {
     let mut queue: VecDeque<usize> = in_deg
         .iter()
         .enumerate()
-        .filter(|(_, d)| **d == 0)
-        .map(|(i, _)| i)
+        .filter(|(_, deg)| **deg == 0)
+        .map(|(idx, _)| idx)
         .collect();
-    let mut order = Vec::with_capacity(n);
-    while let Some(u) = queue.pop_front() {
-        order.push(u);
+    let mut order = Vec::with_capacity(total);
+    while let Some(node) = queue.pop_front() {
+        order.push(node);
         let neighbours = adj
-            .get(u)
+            .get(node)
             .ok_or_else(|| ForgeError::State("toposort index error".to_owned()))?;
-        for &v in neighbours {
+        for &neighbor in neighbours {
             let deg = in_deg
-                .get_mut(v)
+                .get_mut(neighbor)
                 .ok_or_else(|| ForgeError::State("toposort index error".to_owned()))?;
             *deg = deg.saturating_sub(1);
             if *deg == 0 {
-                queue.push_back(v);
+                queue.push_back(neighbor);
             }
         }
     }
-    if order.len() == n {
+    if order.len() == total {
         Ok(order)
     } else {
         Err(ForgeError::Config("cycle in service dependencies".to_owned()))
@@ -278,8 +283,8 @@ fn inspect_labels(
 /// Verify a single label value matches the expected value.
 fn check_label(labels: &BTreeMap<String, String>, key: &str, expected: &str, name: &str) -> Result<(), ForgeError> {
     match labels.get(key) {
-        Some(v) if v == expected => Ok(()),
-        Some(v) => Err(ownership_mismatch(name, key, expected, v)),
+        Some(val) if val == expected => Ok(()),
+        Some(val) => Err(ownership_mismatch(name, key, expected, val)),
         None => Err(missing_label(name, key)),
     }
 }
@@ -408,8 +413,8 @@ fn append_restart_arg(args: &mut Vec<OsString>, restart: &RestartPolicy) {
 /// Append the image name and optional command arguments.
 fn append_image_and_cmd(args: &mut Vec<OsString>, image: &str, cmd_args: &[String]) {
     args.push(image.into());
-    for a in cmd_args {
-        args.push(a.into());
+    for arg in cmd_args {
+        args.push(arg.into());
     }
 }
 
@@ -457,9 +462,9 @@ fn identity_spec(binary: &str, name: &str) -> CommandSpec {
 /// Build a `<binary> logs [--tail N] <name>` command spec.
 pub fn logs_spec(binary: &str, name: &str, tail: Option<u32>) -> CommandSpec {
     let mut args: Vec<OsString> = vec!["logs".into()];
-    if let Some(n) = tail {
+    if let Some(lines) = tail {
         args.push("--tail".into());
-        args.push(n.to_string().into());
+        args.push(lines.to_string().into());
     }
     args.push(name.into());
     build_spec(binary, args)
@@ -568,7 +573,7 @@ fn parse_labels(stdout: &str) -> Result<BTreeMap<String, String>, ForgeError> {
     if trimmed.is_empty() {
         return Ok(BTreeMap::new());
     }
-    serde_json::from_str(trimmed).map_err(|e| ForgeError::State(format!("cannot parse container labels: {e}")))
+    serde_json::from_str(trimmed).map_err(|err| ForgeError::State(format!("cannot parse container labels: {err}")))
 }
 
 /// Parsed identity fields from `docker inspect --format` output.
@@ -586,8 +591,8 @@ struct InspectOutput {
 /// Parse identity JSON from `docker inspect --format` output.
 fn parse_identity(stdout: &str) -> Result<ServiceIdentity, ForgeError> {
     let trimmed = stdout.trim();
-    let parsed: InspectOutput =
-        serde_json::from_str(trimmed).map_err(|e| ForgeError::State(format!("cannot parse service inspect: {e}")))?;
+    let parsed: InspectOutput = serde_json::from_str(trimmed)
+        .map_err(|err| ForgeError::State(format!("cannot parse service inspect: {err}")))?;
     Ok(ServiceIdentity {
         container_id: Some(parsed.container_id),
         started_at: Some(parsed.started_at),
@@ -708,12 +713,12 @@ fn handle_logs(
 // -------------------------------------------------------------
 
 /// Find a service in the config by name.
-fn lookup_service<'a>(ctx: &'a ForgeContext<'_>, name: &str) -> Result<&'a ServiceSpec, ForgeError> {
+fn lookup_service<'ctx>(ctx: &'ctx ForgeContext<'_>, name: &str) -> Result<&'ctx ServiceSpec, ForgeError> {
     ctx.config
         .spec
         .services
         .iter()
-        .find(|s| s.name == name)
+        .find(|svc| svc.name == name)
         .ok_or_else(|| ForgeError::Config(format!("service '{name}' not found in config")))
 }
 
@@ -814,8 +819,6 @@ fn report_text_or_json(writer: &mut dyn Write, message: &str, format: &OutputFor
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
-
     use super::*;
     use crate::command::runner::MockRunner;
 
@@ -1014,18 +1017,18 @@ mod tests {
 
     #[test]
     fn dependency_order_linear_chain() {
-        let mut a = minimal_service();
-        a.name = "a".to_owned();
+        let mut svc_a = minimal_service();
+        svc_a.name = "a".to_owned();
 
-        let mut b = minimal_service();
-        b.name = "b".to_owned();
-        b.depends_on = vec!["a".to_owned()];
+        let mut svc_b = minimal_service();
+        svc_b.name = "b".to_owned();
+        svc_b.depends_on = vec!["a".to_owned()];
 
-        let mut c = minimal_service();
-        c.name = "c".to_owned();
-        c.depends_on = vec!["b".to_owned()];
+        let mut svc_c = minimal_service();
+        svc_c.name = "c".to_owned();
+        svc_c.depends_on = vec!["b".to_owned()];
 
-        let services = vec![a, b, c];
+        let services = vec![svc_a, svc_b, svc_c];
         let order = dependency_order(&services).unwrap_or_else(|_| {
             std::process::abort();
             #[expect(unreachable_code, reason = "abort prevents reaching this")]
@@ -1041,12 +1044,12 @@ mod tests {
     // ---------------------------------------------------------
 
     /// Build `ServiceParams` for `run_spec` tests.
-    fn spec_params<'a>(
-        name: &'a str,
-        env_name: &'a str,
-        config_dir: &'a Path,
-        state_dir: &'a Path,
-    ) -> ServiceParams<'a> {
+    fn spec_params<'ctx>(
+        name: &'ctx str,
+        env_name: &'ctx str,
+        config_dir: &'ctx Path,
+        state_dir: &'ctx Path,
+    ) -> ServiceParams<'ctx> {
         ServiceParams {
             binary: "docker",
             container_name: name,
@@ -1059,8 +1062,8 @@ mod tests {
     #[test]
     fn run_spec_includes_labels() {
         let svc = minimal_service();
-        let p = spec_params("env-svc", "env", Path::new("/tmp"), Path::new("/tmp/.forge"));
-        let spec = run_spec(&p, &svc).unwrap_or_else(|_| std::process::abort());
+        let params = spec_params("env-svc", "env", Path::new("/tmp"), Path::new("/tmp/.forge"));
+        let spec = run_spec(&params, &svc).unwrap_or_else(|_| std::process::abort());
         let display = format!("{spec}");
         assert!(
             display.contains("forge.managed=true"),
@@ -1080,8 +1083,8 @@ mod tests {
     fn run_spec_network_environment() {
         let mut svc = minimal_service();
         svc.network = NetworkMode::Environment;
-        let p = spec_params("env-svc", "myenv", Path::new("/tmp"), Path::new("/tmp/.forge"));
-        let spec = run_spec(&p, &svc).unwrap_or_else(|_| std::process::abort());
+        let params = spec_params("env-svc", "myenv", Path::new("/tmp"), Path::new("/tmp/.forge"));
+        let spec = run_spec(&params, &svc).unwrap_or_else(|_| std::process::abort());
         let display = format!("{spec}");
         assert!(display.contains("--network"), "should include --network: {display}");
         assert!(display.contains("myenv-net"), "should use env network: {display}");
@@ -1091,8 +1094,8 @@ mod tests {
     fn run_spec_network_host() {
         let mut svc = minimal_service();
         svc.network = NetworkMode::Host;
-        let p = spec_params("env-svc", "env", Path::new("/tmp"), Path::new("/tmp/.forge"));
-        let spec = run_spec(&p, &svc).unwrap_or_else(|_| std::process::abort());
+        let params = spec_params("env-svc", "env", Path::new("/tmp"), Path::new("/tmp/.forge"));
+        let spec = run_spec(&params, &svc).unwrap_or_else(|_| std::process::abort());
         let display = format!("{spec}");
         assert!(display.contains("--network"), "should include --network: {display}");
         assert!(display.contains("host"), "should use host network: {display}");
@@ -1101,8 +1104,8 @@ mod tests {
     #[test]
     fn run_spec_network_none() {
         let svc = minimal_service();
-        let p = spec_params("env-svc", "env", Path::new("/tmp"), Path::new("/tmp/.forge"));
-        let spec = run_spec(&p, &svc).unwrap_or_else(|_| std::process::abort());
+        let params = spec_params("env-svc", "env", Path::new("/tmp"), Path::new("/tmp/.forge"));
+        let spec = run_spec(&params, &svc).unwrap_or_else(|_| std::process::abort());
         let display = format!("{spec}");
         assert!(
             !display.contains("--network"),
@@ -1119,8 +1122,8 @@ mod tests {
             container: 80,
             protocol: "tcp".to_owned(),
         });
-        let p = spec_params("env-svc", "env", Path::new("/tmp"), Path::new("/tmp/.forge"));
-        let spec = run_spec(&p, &svc).unwrap_or_else(|_| std::process::abort());
+        let params = spec_params("env-svc", "env", Path::new("/tmp"), Path::new("/tmp/.forge"));
+        let spec = run_spec(&params, &svc).unwrap_or_else(|_| std::process::abort());
         let display = format!("{spec}");
         assert!(
             display.contains("127.0.0.1:8080:80/tcp"),
@@ -1136,8 +1139,8 @@ mod tests {
             target: "/mnt/data".to_owned(),
             read_only: true,
         });
-        let p = spec_params("env-svc", "env", Path::new("/cfg"), Path::new("/cfg/.forge"));
-        let spec = run_spec(&p, &svc).unwrap_or_else(|_| std::process::abort());
+        let params = spec_params("env-svc", "env", Path::new("/cfg"), Path::new("/cfg/.forge"));
+        let spec = run_spec(&params, &svc).unwrap_or_else(|_| std::process::abort());
         let display = format!("{spec}");
         assert!(
             display.contains("/cfg/data:/mnt/data:ro"),
@@ -1149,8 +1152,8 @@ mod tests {
     fn run_spec_env_vars() {
         let mut svc = minimal_service();
         svc.env.insert("MY_VAR".to_owned(), "my_value".to_owned());
-        let p = spec_params("env-svc", "env", Path::new("/tmp"), Path::new("/tmp/.forge"));
-        let spec = run_spec(&p, &svc).unwrap_or_else(|_| std::process::abort());
+        let params = spec_params("env-svc", "env", Path::new("/tmp"), Path::new("/tmp/.forge"));
+        let spec = run_spec(&params, &svc).unwrap_or_else(|_| std::process::abort());
         let display = format!("{spec}");
         assert!(display.contains("-e"), "should include -e flag: {display}");
         assert!(
@@ -1171,8 +1174,8 @@ mod tests {
     fn run_spec_restart_policy() {
         let mut svc = minimal_service();
         svc.restart = RestartPolicy::UnlessStopped;
-        let p = spec_params("env-svc", "env", Path::new("/tmp"), Path::new("/tmp/.forge"));
-        let spec = run_spec(&p, &svc).unwrap_or_else(|_| std::process::abort());
+        let params = spec_params("env-svc", "env", Path::new("/tmp"), Path::new("/tmp/.forge"));
+        let spec = run_spec(&params, &svc).unwrap_or_else(|_| std::process::abort());
         let display = format!("{spec}");
         assert!(display.contains("--restart"), "should include --restart: {display}");
         assert!(display.contains("unless-stopped"), "should include policy: {display}");
@@ -1181,8 +1184,8 @@ mod tests {
     #[test]
     fn run_spec_no_privileged() {
         let svc = minimal_service();
-        let p = spec_params("env-svc", "env", Path::new("/tmp"), Path::new("/tmp/.forge"));
-        let spec = run_spec(&p, &svc).unwrap_or_else(|_| std::process::abort());
+        let params = spec_params("env-svc", "env", Path::new("/tmp"), Path::new("/tmp/.forge"));
+        let spec = run_spec(&params, &svc).unwrap_or_else(|_| std::process::abort());
         let display = format!("{spec}");
         assert!(
             !display.contains("--privileged"),
@@ -1200,8 +1203,8 @@ mod tests {
         std::fs::create_dir_all(&state).unwrap_or_else(|_| std::process::abort());
         let mut svc = minimal_service();
         svc.inherit_host_group = true;
-        let p = spec_params("env-svc", "env", dir.path(), &state);
-        let spec = run_spec(&p, &svc).unwrap_or_else(|_| std::process::abort());
+        let params = spec_params("env-svc", "env", dir.path(), &state);
+        let spec = run_spec(&params, &svc).unwrap_or_else(|_| std::process::abort());
         let display = format!("{spec}");
         let gid = std::fs::metadata(&state)
             .unwrap_or_else(|_| std::process::abort())
@@ -1254,8 +1257,8 @@ mod tests {
             target: "/etc/grid".to_owned(),
             read_only: true,
         });
-        let p = spec_params("env-svc", "env", Path::new("/cfg"), &state);
-        let spec = run_spec(&p, &svc).unwrap_or_else(|_| std::process::abort());
+        let params = spec_params("env-svc", "env", Path::new("/cfg"), &state);
+        let spec = run_spec(&params, &svc).unwrap_or_else(|_| std::process::abort());
         let display = format!("{spec}");
         let canonical = std::fs::canonicalize(&state).unwrap_or_else(|_| std::process::abort());
         let expected = format!(
@@ -1384,7 +1387,7 @@ mod tests {
     fn identity_spec_structured_argv() {
         let spec = identity_spec("docker", "my-container");
         assert_eq!(spec.program, "docker", "program");
-        let args: Vec<_> = spec.args.iter().map(|a| a.to_string_lossy()).collect();
+        let args: Vec<_> = spec.args.iter().map(|arg| arg.to_string_lossy()).collect();
         assert_eq!(args.first().map(AsRef::as_ref), Some("inspect"), "first arg");
         assert_eq!(args.get(1).map(AsRef::as_ref), Some("--format"), "second arg");
         assert_eq!(args.last().map(AsRef::as_ref), Some("my-container"), "last arg");
@@ -1489,14 +1492,14 @@ mod tests {
     fn logs_spec_without_tail() {
         let spec = logs_spec("docker", "my-svc", None);
         assert_eq!(spec.program, "docker", "program");
-        let args: Vec<_> = spec.args.iter().map(|a| a.to_string_lossy()).collect();
+        let args: Vec<_> = spec.args.iter().map(|arg| arg.to_string_lossy()).collect();
         assert_eq!(args.as_slice(), &["logs", "my-svc"], "argv");
     }
 
     #[test]
     fn logs_spec_with_tail() {
         let spec = logs_spec("docker", "my-svc", Some(50));
-        let args: Vec<_> = spec.args.iter().map(|a| a.to_string_lossy()).collect();
+        let args: Vec<_> = spec.args.iter().map(|arg| arg.to_string_lossy()).collect();
         assert_eq!(args.as_slice(), &["logs", "--tail", "50", "my-svc"], "argv with --tail");
     }
 }

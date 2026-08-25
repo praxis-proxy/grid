@@ -27,6 +27,8 @@ pub mod credentials;
 pub mod overlay_bridge;
 /// Versioned overlay envelope for content-addressed revision tracking.
 pub mod overlay_envelope;
+/// Stateful provider admission and pressure-recovery evaluator.
+pub(crate) mod provider_admission;
 /// Provider metrics collection for the [`GridNetwork`] overlay renderer.
 ///
 /// [`GridNetwork`]: crate::crd::grid_network::GridNetwork
@@ -35,6 +37,10 @@ pub(crate) mod provider_metrics;
 pub mod routing_overlay;
 /// Secret builders for grid TLS certificates.
 pub mod secret;
+/// Shared Kubernetes Secret test doubles, reused by `secret`/`endpoint_tls`
+/// unit tests instead of each keeping its own copy of the same mock.
+#[cfg(test)]
+pub(crate) mod test_doubles;
 /// Trust bundle management for grid mTLS.
 pub mod trust_bundle;
 

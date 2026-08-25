@@ -256,22 +256,27 @@ pub fn parse_prometheus_text(text: &str, names: &MetricNames) -> Result<PartialM
             before.error_rate,
             before.healthy,
         );
-        apply_if_match(&mut result.queue_depth, &names.queue_depth, metric_name, value);
+        apply_if_match(&mut result.queue_depth, names.queue_depth.as_ref(), metric_name, value);
         apply_if_match(
             &mut result.kv_cache_utilization,
-            &names.kv_cache_utilization,
+            names.kv_cache_utilization.as_ref(),
             metric_name,
             value,
         );
         apply_if_match(
             &mut result.prefix_cache_hit_ratio,
-            &names.prefix_cache_hit_ratio,
+            names.prefix_cache_hit_ratio.as_ref(),
             metric_name,
             value,
         );
-        apply_if_match(&mut result.latency_p99_ms, &names.latency_p99_ms, metric_name, value);
-        apply_if_match(&mut result.error_rate, &names.error_rate, metric_name, value);
-        apply_if_match(&mut result.healthy, &names.healthy, metric_name, value);
+        apply_if_match(
+            &mut result.latency_p99_ms,
+            names.latency_p99_ms.as_ref(),
+            metric_name,
+            value,
+        );
+        apply_if_match(&mut result.error_rate, names.error_rate.as_ref(), metric_name, value);
+        apply_if_match(&mut result.healthy, names.healthy.as_ref(), metric_name, value);
         if names.pool_name.is_some() {
             let after = (
                 result.queue_depth,
@@ -335,8 +340,8 @@ fn has_label_value(name_with_labels: &str, label_key: &str, expected_value: &str
 
 /// Assign `value` to `target` if `configured` matches `metric_name` and
 /// `target` is not already set (first-wins).
-fn apply_if_match(target: &mut Option<f64>, configured: &Option<String>, metric_name: &str, value: f64) {
-    if target.is_none() && configured.as_deref() == Some(metric_name) {
+fn apply_if_match(target: &mut Option<f64>, configured: Option<&String>, metric_name: &str, value: f64) {
+    if target.is_none() && configured.map(String::as_str) == Some(metric_name) {
         *target = Some(value);
     }
 }
@@ -599,6 +604,7 @@ test_kv_cache{model="llama"} 0.3
     // -----------------------------------------------------------------------
 
     #[test]
+    #[expect(clippy::float_cmp, reason = "exact neutral defaults are deterministic constants")]
     fn missing_fields_use_neutral_defaults() {
         let partial = PartialMetrics::default();
         let metrics = partial.into_backend_metrics();
@@ -623,6 +629,7 @@ test_kv_cache{model="llama"} 0.3
     }
 
     #[test]
+    #[expect(clippy::float_cmp, reason = "clamp boundaries are exact IEEE 754 values")]
     fn out_of_range_signals_are_clamped_on_conversion() {
         let partial = PartialMetrics {
             error_rate: Some(1.2),
@@ -706,6 +713,7 @@ test_kv_cache{model="llama"} 0.3
     }
 
     #[test]
+    #[expect(clippy::float_cmp, reason = "parsed float literals round-trip exactly")]
     fn full_round_trip_all_signals() {
         let text = "test_queue_depth 0.3\ntest_kv_cache 0.6\ntest_prefix_cache 0.9\n\
                     test_latency_p99_ms 250.0\ntest_error_rate 0.02\ntest_healthy 1\n";

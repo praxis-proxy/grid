@@ -97,6 +97,23 @@ impl GCounter {
     pub fn remove_slot(&mut self, site: &str) {
         self.slots.remove(site);
     }
+
+    /// Return the number of distinct sites with a recorded slot.
+    ///
+    /// Used to enforce a hard cap on distinct origins contributing to a
+    /// single counter (see `grid_state::MAX_TENANT_SPEND_ORIGINS`), as
+    /// defense-in-depth against a compromised or churning origin claiming
+    /// unbounded new site identities.
+    #[must_use]
+    pub fn slot_count(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// Return whether `site` already has a recorded slot.
+    #[must_use]
+    pub fn has_slot(&self, site: &str) -> bool {
+        self.slots.contains_key(site)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -109,90 +126,90 @@ mod tests {
 
     #[test]
     fn new_counter_is_zero() {
-        let c = GCounter::new("a".to_owned());
-        assert_eq!(c.total(), 0, "new counter should be zero");
+        let counter = GCounter::new("a".to_owned());
+        assert_eq!(counter.total(), 0, "new counter should be zero");
     }
 
     #[test]
     fn increment_adds_to_local() {
-        let mut c = GCounter::new("a".to_owned());
-        c.increment(5);
-        c.increment(3);
-        assert_eq!(c.total(), 8, "should sum increments");
-        assert_eq!(c.local(), 8, "local should match");
+        let mut counter = GCounter::new("a".to_owned());
+        counter.increment(5);
+        counter.increment(3);
+        assert_eq!(counter.total(), 8, "should sum increments");
+        assert_eq!(counter.local(), 8, "local should match");
     }
 
     #[test]
     fn merge_takes_max() {
-        let mut a = GCounter::new("a".to_owned());
-        let mut b = GCounter::new("b".to_owned());
-        a.increment(10);
-        b.increment(20);
-        a.merge(&b);
-        assert_eq!(a.total(), 30, "should sum both sites");
+        let mut counter_a = GCounter::new("a".to_owned());
+        let mut counter_b = GCounter::new("b".to_owned());
+        counter_a.increment(10);
+        counter_b.increment(20);
+        counter_a.merge(&counter_b);
+        assert_eq!(counter_a.total(), 30, "should sum both sites");
     }
 
     #[test]
     fn merge_max_per_site() {
-        let mut a = GCounter::new("a".to_owned());
-        a.increment(10);
+        let mut counter_a = GCounter::new("a".to_owned());
+        counter_a.increment(10);
 
-        let mut b = GCounter::new("b".to_owned());
-        b.slots.insert("a".to_owned(), 5);
-        b.increment(20);
+        let mut counter_b = GCounter::new("b".to_owned());
+        counter_b.slots.insert("a".to_owned(), 5);
+        counter_b.increment(20);
 
-        a.merge(&b);
-        assert_eq!(a.local(), 10, "should keep own higher value");
-        assert_eq!(a.total(), 30, "total = max(10,5) + 20");
+        counter_a.merge(&counter_b);
+        assert_eq!(counter_a.local(), 10, "should keep own higher value");
+        assert_eq!(counter_a.total(), 30, "total = max(10,5) + 20");
     }
 
     #[test]
     fn merge_is_commutative() {
-        let mut a = GCounter::new("a".to_owned());
-        let mut b = GCounter::new("b".to_owned());
-        a.increment(10);
-        b.increment(20);
+        let mut counter_a = GCounter::new("a".to_owned());
+        let mut counter_b = GCounter::new("b".to_owned());
+        counter_a.increment(10);
+        counter_b.increment(20);
 
-        let a2 = a.clone();
-        a.merge(&b);
-        b.merge(&a2);
+        let snapshot = counter_a.clone();
+        counter_a.merge(&counter_b);
+        counter_b.merge(&snapshot);
 
-        assert_eq!(a.total(), b.total(), "merge should be commutative");
+        assert_eq!(counter_a.total(), counter_b.total(), "merge should be commutative");
     }
 
     #[test]
     fn merge_is_idempotent() {
-        let mut a = GCounter::new("a".to_owned());
-        a.increment(10);
-        let snapshot = a.clone();
-        a.merge(&snapshot);
-        assert_eq!(a.total(), 10, "merge with self should be idempotent");
+        let mut counter_a = GCounter::new("a".to_owned());
+        counter_a.increment(10);
+        let snapshot = counter_a.clone();
+        counter_a.merge(&snapshot);
+        assert_eq!(counter_a.total(), 10, "merge with self should be idempotent");
     }
 
     #[test]
     fn saturating_increment() {
-        let mut c = GCounter::new("a".to_owned());
-        c.increment(u64::MAX);
-        c.increment(1);
-        assert_eq!(c.total(), u64::MAX, "should saturate");
+        let mut counter = GCounter::new("a".to_owned());
+        counter.increment(u64::MAX);
+        counter.increment(1);
+        assert_eq!(counter.total(), u64::MAX, "should saturate");
     }
 
     #[test]
     fn merge_is_associative() {
-        let mut a = GCounter::new("a".to_owned());
-        let mut b = GCounter::new("b".to_owned());
-        let mut c = GCounter::new("c".to_owned());
-        a.increment(10);
-        b.increment(20);
-        c.increment(30);
+        let mut counter_a = GCounter::new("a".to_owned());
+        let mut counter_b = GCounter::new("b".to_owned());
+        let mut counter_c = GCounter::new("c".to_owned());
+        counter_a.increment(10);
+        counter_b.increment(20);
+        counter_c.increment(30);
 
-        let mut ab_then_c = a.clone();
-        ab_then_c.merge(&b);
-        ab_then_c.merge(&c);
+        let mut ab_then_c = counter_a.clone();
+        ab_then_c.merge(&counter_b);
+        ab_then_c.merge(&counter_c);
 
-        let mut bc = b.clone();
-        bc.merge(&c);
-        let mut a_then_bc = a.clone();
+        let mut bc = counter_b.clone();
+        bc.merge(&counter_c);
+        let mut a_then_bc = counter_a.clone();
         a_then_bc.merge(&bc);
 
         assert_eq!(
@@ -204,12 +221,12 @@ mod tests {
 
     #[test]
     fn retain_origin_keeps_only_the_named_slot() {
-        let mut c = GCounter::new("site-a".to_owned());
-        c.increment(10);
-        c.slots.insert("site-b".to_owned(), 999);
-        c.slots.insert("site-c".to_owned(), 42);
+        let mut counter = GCounter::new("site-a".to_owned());
+        counter.increment(10);
+        counter.slots.insert("site-b".to_owned(), 999);
+        counter.slots.insert("site-c".to_owned(), 42);
 
-        let retained = c.retain_origin("site-a");
+        let retained = counter.retain_origin("site-a");
 
         assert_eq!(retained.total(), 10, "only site-a's slot must survive");
         assert_eq!(
@@ -221,10 +238,10 @@ mod tests {
 
     #[test]
     fn retain_origin_for_absent_slot_is_zero() {
-        let mut c = GCounter::new("site-a".to_owned());
-        c.increment(10);
+        let mut counter = GCounter::new("site-a".to_owned());
+        counter.increment(10);
 
-        let retained = c.retain_origin("site-b");
+        let retained = counter.retain_origin("site-b");
 
         assert_eq!(
             retained.total(),
@@ -235,14 +252,14 @@ mod tests {
 
     #[test]
     fn remove_slot_drops_only_the_named_site() {
-        let mut c = GCounter::new("site-a".to_owned());
-        c.increment(10);
-        c.slots.insert("site-b".to_owned(), 20);
+        let mut counter = GCounter::new("site-a".to_owned());
+        counter.increment(10);
+        counter.slots.insert("site-b".to_owned(), 20);
 
-        c.remove_slot("site-a");
+        counter.remove_slot("site-a");
 
         assert_eq!(
-            c.total(),
+            counter.total(),
             20,
             "removing site-a's slot must leave site-b's contribution intact"
         );
@@ -250,19 +267,54 @@ mod tests {
 
     #[test]
     fn remove_slot_for_absent_site_is_a_no_op() {
-        let mut c = GCounter::new("site-a".to_owned());
-        c.increment(10);
+        let mut counter = GCounter::new("site-a".to_owned());
+        counter.increment(10);
 
-        c.remove_slot("site-never-contributed");
+        counter.remove_slot("site-never-contributed");
 
-        assert_eq!(c.total(), 10, "removing an absent slot must not change the total");
+        assert_eq!(counter.total(), 10, "removing an absent slot must not change the total");
+    }
+
+    #[test]
+    fn slot_count_reflects_distinct_sites_after_merge() {
+        let mut counter_a = GCounter::new("site-a".to_owned());
+        counter_a.increment(10);
+        assert_eq!(counter_a.slot_count(), 1, "one increment from one site is one slot");
+
+        let mut counter_b = GCounter::new("site-b".to_owned());
+        counter_b.increment(5);
+        counter_a.merge(&counter_b);
+
+        assert_eq!(
+            counter_a.slot_count(),
+            2,
+            "merging in a second site's slot must be counted"
+        );
+    }
+
+    #[test]
+    fn slot_count_is_zero_for_a_fresh_counter() {
+        let counter = GCounter::new("site-a".to_owned());
+        assert_eq!(counter.slot_count(), 0, "a counter with no increments yet has no slots");
+    }
+
+    #[test]
+    fn has_slot_reports_presence_per_site() {
+        let mut counter = GCounter::new("site-a".to_owned());
+        counter.increment(10);
+
+        assert!(counter.has_slot("site-a"), "site-a incremented, so it must have a slot");
+        assert!(
+            !counter.has_slot("site-b"),
+            "site-b never contributed, so it must not have a slot"
+        );
     }
 
     #[test]
     fn gcounter_serde_round_trip() {
-        let mut c = GCounter::new("site-x".to_owned());
-        c.increment(42);
-        let json = serde_json::to_string(&c).unwrap_or_else(|_| std::process::abort());
+        let mut counter = GCounter::new("site-x".to_owned());
+        counter.increment(42);
+        let json = serde_json::to_string(&counter).unwrap_or_else(|_| std::process::abort());
         let restored: GCounter = serde_json::from_str(&json).unwrap_or_else(|_| std::process::abort());
         assert_eq!(restored.total(), 42, "serde round-trip must preserve total");
         assert_eq!(restored.local(), 42, "serde round-trip must preserve local");

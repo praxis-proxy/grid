@@ -159,13 +159,13 @@ async fn main() {
     let addr = format!("0.0.0.0:{}", cli.port);
     eprintln!("mock-{provider:?} listening on {addr}");
 
-    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap_or_else(|e| {
-        eprintln!("failed to bind {addr}: {e}");
+    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap_or_else(|err| {
+        eprintln!("failed to bind {addr}: {err}");
         std::process::exit(1);
     });
 
-    axum::serve(listener, router).await.unwrap_or_else(|e| {
-        eprintln!("server error: {e}");
+    axum::serve(listener, router).await.unwrap_or_else(|err| {
+        eprintln!("server error: {err}");
         std::process::exit(1);
     });
 }
@@ -224,38 +224,38 @@ async fn run_tls_probe_server(
     key_path: &std::path::Path,
     ca_path: &std::path::Path,
 ) {
-    let cert_pem = std::fs::read(cert_path).unwrap_or_else(|e| {
-        eprintln!("tls-probe-server: failed to read cert {}: {e}", cert_path.display());
+    let cert_pem = std::fs::read(cert_path).unwrap_or_else(|err| {
+        eprintln!("tls-probe-server: failed to read cert {}: {err}", cert_path.display());
         std::process::exit(1);
     });
-    let key_pem = std::fs::read(key_path).unwrap_or_else(|e| {
-        eprintln!("tls-probe-server: failed to read key {}: {e}", key_path.display());
+    let key_pem = std::fs::read(key_path).unwrap_or_else(|err| {
+        eprintln!("tls-probe-server: failed to read key {}: {err}", key_path.display());
         std::process::exit(1);
     });
-    let ca_pem = std::fs::read(ca_path).unwrap_or_else(|e| {
-        eprintln!("tls-probe-server: failed to read CA {}: {e}", ca_path.display());
+    let ca_pem = std::fs::read(ca_path).unwrap_or_else(|err| {
+        eprintln!("tls-probe-server: failed to read CA {}: {err}", ca_path.display());
         std::process::exit(1);
     });
 
     let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(&cert_pem)
         .collect::<Result<Vec<_>, _>>()
-        .unwrap_or_else(|e| {
-            eprintln!("tls-probe-server: invalid cert PEM: {e}");
+        .unwrap_or_else(|err| {
+            eprintln!("tls-probe-server: invalid cert PEM: {err}");
             std::process::exit(1);
         });
-    let key = PrivateKeyDer::from_pem_slice(&key_pem).unwrap_or_else(|e| {
-        eprintln!("tls-probe-server: invalid key PEM: {e}");
+    let key = PrivateKeyDer::from_pem_slice(&key_pem).unwrap_or_else(|err| {
+        eprintln!("tls-probe-server: invalid key PEM: {err}");
         std::process::exit(1);
     });
 
     let mut roots = rustls::RootCertStore::empty();
     for cert in CertificateDer::pem_slice_iter(&ca_pem) {
-        let cert = cert.unwrap_or_else(|e| {
-            eprintln!("tls-probe-server: invalid CA PEM: {e}");
+        let cert = cert.unwrap_or_else(|err| {
+            eprintln!("tls-probe-server: invalid CA PEM: {err}");
             std::process::exit(1);
         });
-        roots.add(cert).unwrap_or_else(|e| {
-            eprintln!("tls-probe-server: failed to add CA cert: {e}");
+        roots.add(cert).unwrap_or_else(|err| {
+            eprintln!("tls-probe-server: failed to add CA cert: {err}");
             std::process::exit(1);
         });
     }
@@ -263,30 +263,30 @@ async fn run_tls_probe_server(
     let provider = rustls::crypto::ring::default_provider();
     let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
         .build()
-        .unwrap_or_else(|e| {
-            eprintln!("tls-probe-server: failed to build client verifier: {e}");
+        .unwrap_or_else(|err| {
+            eprintln!("tls-probe-server: failed to build client verifier: {err}");
             std::process::exit(1);
         });
     let config = rustls::ServerConfig::builder_with_provider(Arc::new(provider))
         .with_safe_default_protocol_versions()
-        .unwrap_or_else(|e| {
-            eprintln!("tls-probe-server: failed to build TLS config: {e}");
+        .unwrap_or_else(|err| {
+            eprintln!("tls-probe-server: failed to build TLS config: {err}");
             std::process::exit(1);
         })
         .with_client_cert_verifier(verifier)
         .with_single_cert(certs, key)
-        .unwrap_or_else(|e| {
-            eprintln!("tls-probe-server: failed to set cert/key: {e}");
+        .unwrap_or_else(|err| {
+            eprintln!("tls-probe-server: failed to set cert/key: {err}");
             std::process::exit(1);
         });
 
     let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
     let addr = format!("0.0.0.0:{port}");
-    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap_or_else(|e| {
-        eprintln!("tls-probe-server: failed to bind {addr}: {e}");
+    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap_or_else(|err| {
+        eprintln!("tls-probe-server: failed to bind {addr}: {err}");
         std::process::exit(1);
     });
-    let local_port = listener.local_addr().map_or(port, |a| a.port());
+    let local_port = listener.local_addr().map_or(port, |local| local.port());
     eprintln!("tls-probe-server=listening port={local_port}");
 
     loop {
@@ -305,7 +305,7 @@ async fn run_mcp_server(port: u16, tools_csv: &str, required_bearer: Option<&str
     let tools: Vec<String> = tools_csv
         .split(',')
         .map(str::trim)
-        .filter(|t| !t.is_empty())
+        .filter(|token| !token.is_empty())
         .map(str::to_owned)
         .collect();
     let router = mock_providers::mcp::router(tools, required_bearer.map(str::to_owned));
@@ -313,13 +313,13 @@ async fn run_mcp_server(port: u16, tools_csv: &str, required_bearer: Option<&str
     let addr = format!("0.0.0.0:{port}");
     eprintln!("mock-mcp-server listening on {addr}");
 
-    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap_or_else(|e| {
-        eprintln!("failed to bind {addr}: {e}");
+    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap_or_else(|error| {
+        eprintln!("failed to bind {addr}: {error}");
         std::process::exit(1);
     });
 
-    axum::serve(listener, router).await.unwrap_or_else(|e| {
-        eprintln!("server error: {e}");
+    axum::serve(listener, router).await.unwrap_or_else(|error| {
+        eprintln!("server error: {error}");
         std::process::exit(1);
     });
 }
@@ -403,6 +403,7 @@ async fn send_http_probe(target: &str, authorization: Option<&str>) -> Result<u1
 mod tests {
     use super::*;
 
+    #[expect(clippy::float_cmp, reason = "exact equality valid for parsed f64 test literals")]
     #[test]
     fn queue_depth_accepts_only_normalized_finite_values() {
         assert_eq!(parse_queue_depth(Some("0.95")), 0.95);
@@ -461,12 +462,15 @@ mod tests {
             "--tcp-probe",
             "mock-inference:8080",
         ]);
-        assert!(result.is_err());
+        assert!(result.is_err(), "provider and tcp-probe must conflict");
     }
 
     #[test]
     fn one_mode_is_required() {
-        assert!(Cli::try_parse_from(["mock-providers"]).is_err());
+        assert!(
+            Cli::try_parse_from(["mock-providers"]).is_err(),
+            "at least one mode must be specified"
+        );
     }
 
     #[test]

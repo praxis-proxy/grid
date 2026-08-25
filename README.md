@@ -21,31 +21,36 @@ overlay that Praxis consumes at request time.
 +---------------------------+     +---------------------------+
 |  Site A (Kubernetes)      |     |  Site B (Kubernetes)      |
 |                           |     |                           |
-|  +---------------------+ |     | +---------------------+   |
-|  | Grid Operator       | |     | | Grid Operator       |   |
-|  | - SWIM membership   |<-------->| - SWIM membership   |   |
-|  | - CRDT state sync   | |     | | - CRDT state sync   |   |
-|  | - scoring engine    | |     | | - scoring engine    |   |
-|  | - overlay renderer  | |     | | - overlay renderer  |   |
-|  +--------+------------+ |     | +--------+------------+   |
-|           |               |     |          |                |
-|           | ConfigMap     |     |          | ConfigMap      |
-|           v               |     |          v                |
-|  +---------------------+ |     | +---------------------+   |
-|  | Praxis AI Gateway   | |     | | Praxis AI Gateway   |   |
-|  | - request routing   |<-------->| - request routing   |   |
-|  | - API translation   | | mTLS| | - API translation   |   |
-|  | - credential inject | |     | | - credential inject |   |
-|  +--------+------------+ |     | +--------+------------+   |
-|           |               |     |          |                |
-|           v               |     |          v                |
-|  +---------------------+ |     | +---------------------+   |
-|  | Inference Backends  | |     | | Inference Backends  |   |
-|  | (llm-d, vLLM, etc.) | |     | | (Bedrock, Vertex,   |   |
-|  +---------------------+ |     | | OpenAI, Anthropic)  |   |
-+---------------------------+     | +---------------------+   |
-                                  +---------------------------+
+|  +---------------------+  |     |  +---------------------+  |
+|  | Grid Operator       |  |     |  | Grid Operator       |  |
+|  | - SWIM membership   |  |     |  | - SWIM membership   |  |
+|  | - CRDT state sync   |  |     |  | - CRDT state sync   |  |
+|  | - scoring engine    |  |     |  | - scoring engine    |  |
+|  | - overlay renderer  |  |     |  | - overlay renderer  |  |
+|  +--------+------------+  |     |  +--------+------------+  |
+|           |               |     |           |               |
+|           | ConfigMap     |     |           | ConfigMap     |
+|           v               |     |           v               |
+|  +---------------------+  |     |  +---------------------+  |
+|  | Praxis AI Gateway   |  |     |  | Praxis AI Gateway   |  |
+|  | - request routing   |  |     |  | - request routing   |  |
+|  | - API translation   |  |     |  | - API translation   |  |
+|  | - credential inject |  |     |  | - credential inject |  |
+|  +--------+------------+  |     |  +--------+------------+  |
+|           |               |     |           |               |
+|           v               |     |           v               |
+|  +---------------------+  |     |  +---------------------+  |
+|  | Inference Backends  |  |     |  | Inference Backends  |  |
+|  | (llm-d, vLLM, etc.) |  |     |  | (Bedrock, Vertex,   |  |
+|                           |     |  | OpenAI, Anthropic)  |  |
+|  +---------------------+  |     |  +---------------------+  |
++---------------------------+     +---------------------------+
 ```
+
+The gateways communicate over mTLS.
+
+The Grid operators exchange membership and provider state over SWIM and CRDT
+replication.
 
 Grid handles the **control plane** (what should be
 routable). Praxis handles the **data plane** (routing

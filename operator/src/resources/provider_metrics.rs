@@ -69,6 +69,8 @@ pub(crate) struct TimestampedMetrics {
     pub(crate) metrics: scoring::BackendMetrics,
     /// When the scrape completed successfully.
     pub(crate) scraped_at: Instant,
+    /// Monotonic scrape generation assigned when this sample was collected.
+    pub(crate) generation: u64,
 }
 
 /// Cross-reconcile cache for recently-scraped provider metrics.
@@ -76,7 +78,30 @@ pub(crate) struct TimestampedMetrics {
 /// Keyed by `(network_name, provider_routing_identity)`.  Entries are updated on
 /// every successful scrape and consulted when a subsequent scrape fails and the
 /// provider has `metricsConfig.stale_metrics_seconds` set.
-pub(crate) type MetricsCache = HashMap<(String, String), TimestampedMetrics>;
+pub(crate) struct MetricsCache {
+    /// Per-provider cached metrics keyed by `(network_name, routing_identity)`.
+    entries: HashMap<(String, String), TimestampedMetrics>,
+    /// Monotonic counter incremented on each scrape call.
+    next_generation: u64,
+}
+
+impl MetricsCache {
+    /// Create an empty cache with the generation counter starting at 1.
+    pub(crate) fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            next_generation: 1,
+        }
+    }
+}
+
+/// Metrics collected from a single scrape call, with scrape-level identity.
+pub(crate) struct CollectedMetrics {
+    /// Parsed metrics keyed by provider routing identity.
+    pub(crate) metrics: HashMap<String, scoring::BackendMetrics>,
+    /// Scrape generation per provider, monotonically increasing per successful scrape.
+    pub(crate) generations: HashMap<String, u64>,
+}
 
 // ---------------------------------------------------------------------------
 // URL construction
@@ -159,6 +184,10 @@ pub(crate) fn parse_metrics_timeout(s: &str) -> Duration {
 
 /// Scrape and parse live metrics for providers in `network_name` that have `spec.metricsConfig`.
 ///
+/// This compatibility wrapper always performs a fresh collection. Production
+/// reconciliation should use [`collect_provider_metrics_with_refresh_interval`]
+/// so watch-triggered reconciles can reuse the current scrape generation.
+///
 /// Returns a map from provider routing identity (the value of
 /// `spec.routingClusterRef`, or `metadata.name` when absent) to
 /// [`scoring::BackendMetrics`].
@@ -187,31 +216,57 @@ pub(crate) fn parse_metrics_timeout(s: &str) -> Duration {
 ///
 /// `now` is passed in (rather than read from `Instant::now()`) so tests can
 /// control the clock without sleeping.
-#[expect(
-    clippy::cognitive_complexity,
-    clippy::too_many_lines,
-    clippy::large_stack_frames,
-    reason = "sequential per-provider scrape loop with early-continue guards, cache read/write, TLS resolution, and error logging"
-)]
+#[cfg(test)]
 pub(crate) async fn collect_provider_metrics(
     network_name: &str,
     providers: &[InferenceProvider],
     cache: &Mutex<MetricsCache>,
     now: Instant,
     client: Option<&kube::Client>,
-) -> HashMap<String, scoring::BackendMetrics> {
-    // Snapshot only the relevant cache entries (for this network) so the lock
-    // is held for microseconds rather than across network I/O.
-    let cache_snapshot: HashMap<String, TimestampedMetrics> = {
-        let guard = cache.lock().await;
-        guard
+) -> CollectedMetrics {
+    collect_provider_metrics_with_refresh_interval(network_name, providers, cache, now, Duration::ZERO, client).await
+}
+
+/// Collect provider metrics, reusing samples collected within `refresh_interval`.
+///
+/// Reconciliation can be triggered by an overlay write or another watch event
+/// before the next metrics refresh is due. Reusing the cached sample in that
+/// window is important: it preserves the sample generation and prevents one
+/// underlying EPP observation from advancing admission hysteresis twice.
+#[expect(
+    clippy::cognitive_complexity,
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::large_stack_frames,
+    reason = "sequential per-provider scrape loop with cache reuse, TLS resolution, and error handling"
+)]
+pub(crate) async fn collect_provider_metrics_with_refresh_interval(
+    network_name: &str,
+    providers: &[InferenceProvider],
+    cache: &Mutex<MetricsCache>,
+    now: Instant,
+    refresh_interval: Duration,
+    client: Option<&kube::Client>,
+) -> CollectedMetrics {
+    // Snapshot the relevant cache entries and allocate a generation for this
+    // refresh cycle. Cached samples reused below retain their own generation.
+    // The lock is held for microseconds rather than across network I/O.
+    let (cache_snapshot, scrape_generation) = {
+        let mut guard = cache.lock().await;
+        let generation = guard.next_generation;
+        guard.next_generation = generation.wrapping_add(1);
+        let snapshot: HashMap<String, TimestampedMetrics> = guard
+            .entries
             .iter()
             .filter(|((net, _), _)| net == network_name)
             .map(|((_, id), tm)| (id.clone(), tm.clone()))
-            .collect()
+            .collect();
+        drop(guard);
+        (snapshot, generation)
     };
 
     let mut result = HashMap::new();
+    let mut generations: HashMap<String, u64> = HashMap::new();
     let mut cache_updates: Vec<((String, String), TimestampedMetrics)> = Vec::new();
 
     for provider in providers {
@@ -251,11 +306,26 @@ pub(crate) async fn collect_provider_metrics(
         let timeout = parse_metrics_timeout(&mc.timeout);
         let names = metric_names_from_config(&mc.signal_names, mc.pool_name.as_deref(), mc.queue_capacity);
 
+        if refresh_interval > Duration::ZERO
+            && let Some(cached) = cache_snapshot.get(identity)
+            && now.saturating_duration_since(cached.scraped_at) < refresh_interval
+        {
+            result.insert(identity.to_owned(), cached.metrics);
+            generations.insert(identity.to_owned(), cached.generation);
+            continue;
+        }
+
         let tls_config = match resolve_tls_config(mc.tls.as_ref(), client, identity).await {
             Ok(cfg) => cfg,
             Err((_reason, e)) => {
-                let used_cache =
-                    try_cached_metrics(identity, mc.stale_metrics_seconds, &cache_snapshot, now, &mut result);
+                let used_cache = try_cached_metrics(
+                    identity,
+                    mc.stale_metrics_seconds,
+                    &cache_snapshot,
+                    now,
+                    &mut result,
+                    &mut generations,
+                );
                 if used_cache {
                     tracing::debug!(
                         provider = identity,
@@ -270,6 +340,7 @@ pub(crate) async fn collect_provider_metrics(
                             "metrics TLS resolution failed; provider excluded from routing"
                         );
                         result.insert(identity.to_owned(), UNOBSERVABLE_METRICS);
+                        generations.insert(identity.to_owned(), scrape_generation);
                     } else {
                         tracing::warn!(
                             provider = identity,
@@ -295,17 +366,25 @@ pub(crate) async fn collect_provider_metrics(
                     TimestampedMetrics {
                         metrics: bm,
                         scraped_at: now,
+                        generation: scrape_generation,
                     },
                 ));
                 result.insert(identity.to_owned(), bm);
+                generations.insert(identity.to_owned(), scrape_generation);
             },
             Err(e) => {
                 let reason_str = scrape_result
                     .as_ref()
                     .err()
-                    .map_or("MetricsScrapeError", |e| classify_scrape_error(e));
-                let used_cache =
-                    try_cached_metrics(identity, mc.stale_metrics_seconds, &cache_snapshot, now, &mut result);
+                    .map_or("MetricsScrapeError", |error| classify_scrape_error(error));
+                let used_cache = try_cached_metrics(
+                    identity,
+                    mc.stale_metrics_seconds,
+                    &cache_snapshot,
+                    now,
+                    &mut result,
+                    &mut generations,
+                );
                 if used_cache {
                     tracing::debug!(
                         provider = identity,
@@ -324,6 +403,7 @@ pub(crate) async fn collect_provider_metrics(
                             "metrics scrape failed; provider excluded from routing"
                         );
                         result.insert(identity.to_owned(), UNOBSERVABLE_METRICS);
+                        generations.insert(identity.to_owned(), scrape_generation);
                     } else {
                         tracing::warn!(
                             provider = identity,
@@ -342,11 +422,14 @@ pub(crate) async fn collect_provider_metrics(
     if !cache_updates.is_empty() {
         let mut guard = cache.lock().await;
         for (key, val) in cache_updates {
-            guard.insert(key, val);
+            guard.entries.insert(key, val);
         }
     }
 
-    result
+    CollectedMetrics {
+        metrics: result,
+        generations,
+    }
 }
 
 /// Attempt to populate `result` with a cached metric sample for `identity`.
@@ -354,14 +437,18 @@ pub(crate) async fn collect_provider_metrics(
 /// Returns `true` if a valid cached sample was found and inserted; `false` if
 /// no grace period is configured, the cache has no entry, or the entry is
 /// too old.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "generations mirror added alongside existing result out-param"
+)]
 fn try_cached_metrics(
     identity: &str,
     stale_metrics_seconds: Option<u32>,
     cache_snapshot: &HashMap<String, TimestampedMetrics>,
     now: Instant,
     result: &mut HashMap<String, scoring::BackendMetrics>,
+    generations: &mut HashMap<String, u64>,
 ) -> bool {
-    // Zero is treated as absent defensively (schema already rejects 0).
     let Some(ttl_secs) = stale_metrics_seconds.filter(|&s| s > 0) else {
         return false;
     };
@@ -374,6 +461,7 @@ fn try_cached_metrics(
         return false;
     }
     result.insert(identity.to_owned(), cached.metrics);
+    generations.insert(identity.to_owned(), cached.generation);
     true
 }
 
@@ -449,7 +537,9 @@ pub(crate) fn classify_scrape_error(err: &metrics_scraper::MetricsScrapeError) -
         metrics_scraper::MetricsScrapeError::TlsMaterial(_) | metrics_scraper::MetricsScrapeError::HttpWithTls(_) => {
             "MetricsTlsMaterialInvalid"
         },
-        _ => "MetricsScrapeError",
+        metrics_scraper::MetricsScrapeError::InvalidUrl(_)
+        | metrics_scraper::MetricsScrapeError::NonOkStatus { .. }
+        | metrics_scraper::MetricsScrapeError::Encoding(_) => "MetricsScrapeError",
     }
 }
 
@@ -685,7 +775,7 @@ mod tests {
         let provider = provider_fixture("prov-a", "http://127.0.0.1:9999", None);
         let result = collect_provider_metrics("net", &[provider], &empty_cache(), Instant::now(), None).await;
         assert!(
-            result.is_empty(),
+            result.metrics.is_empty(),
             "provider without metricsConfig must not appear in metrics map"
         );
     }
@@ -694,7 +784,10 @@ mod tests {
     async fn collect_metrics_blank_endpoint_is_skipped() {
         let provider = provider_fixture("prov-a", "", Some(mc_with_queue("my_queue")));
         let result = collect_provider_metrics("net", &[provider], &empty_cache(), Instant::now(), None).await;
-        assert!(result.is_empty(), "provider with blank endpoint must not be scraped");
+        assert!(
+            result.metrics.is_empty(),
+            "provider with blank endpoint must not be scraped"
+        );
     }
 
     #[tokio::test]
@@ -705,10 +798,14 @@ mod tests {
 
         let result = collect_provider_metrics("net", &[provider], &empty_cache(), Instant::now(), None).await;
         assert!(
-            result.contains_key("prov-a"),
+            result.metrics.contains_key("prov-a"),
             "provider must appear in metrics map after successful scrape"
         );
-        let bm = result.get("prov-a").copied().unwrap_or_else(|| std::process::abort());
+        let bm = result
+            .metrics
+            .get("prov-a")
+            .copied()
+            .unwrap_or_else(|| std::process::abort());
         assert!(bm.queue_depth.is_finite(), "queue_depth must be finite");
         assert!(
             bm.queue_depth >= 0.0 && bm.queue_depth <= 1.0,
@@ -742,11 +839,11 @@ mod tests {
 
         let result = collect_provider_metrics("net", &[provider], &empty_cache(), Instant::now(), None).await;
         assert!(
-            result.contains_key("site-x"),
+            result.metrics.contains_key("site-x"),
             "metrics must be keyed by routingClusterRef, not metadata.name"
         );
         assert!(
-            !result.contains_key("prov-a"),
+            !result.metrics.contains_key("prov-a"),
             "metadata.name must not be used as key when routingClusterRef is set"
         );
     }
@@ -756,7 +853,7 @@ mod tests {
         let provider = provider_fixture("prov-a", "http://127.0.0.1:1", Some(mc_with_queue("my_queue")));
         let result = collect_provider_metrics("net", &[provider], &empty_cache(), Instant::now(), None).await;
         assert!(
-            !result.contains_key("prov-a"),
+            !result.metrics.contains_key("prov-a"),
             "plaintext provider scrape failure must not insert unobservable metrics"
         );
     }
@@ -767,7 +864,7 @@ mod tests {
         let provider = provider_fixture("prov-a", &base_url, Some(mc_with_queue("my_queue")));
         let result = collect_provider_metrics("net", &[provider], &empty_cache(), Instant::now(), None).await;
         assert!(
-            !result.contains_key("prov-a"),
+            !result.metrics.contains_key("prov-a"),
             "plaintext provider non-2xx response must not insert unobservable metrics"
         );
     }
@@ -781,10 +878,14 @@ mod tests {
 
         let result = collect_provider_metrics("net", &[provider], &empty_cache(), Instant::now(), None).await;
         assert!(
-            result.contains_key("prov-a"),
+            result.metrics.contains_key("prov-a"),
             "malformed body must still produce a metrics entry"
         );
-        let bm = result.get("prov-a").copied().unwrap_or_else(|| std::process::abort());
+        let bm = result
+            .metrics
+            .get("prov-a")
+            .copied()
+            .unwrap_or_else(|| std::process::abort());
         assert!(
             bm.queue_depth.is_finite(),
             "malformed body must produce finite queue_depth"
@@ -810,20 +911,88 @@ mod tests {
         let prov_b = provider_fixture("prov-b", &url_b, Some(mc_with_queue("my_queue")));
 
         let result = collect_provider_metrics("net", &[prov_a, prov_b], &empty_cache(), Instant::now(), None).await;
-        assert!(result.contains_key("prov-a"), "prov-a must be in metrics map");
-        assert!(result.contains_key("prov-b"), "prov-b must be in metrics map");
+        assert!(result.metrics.contains_key("prov-a"), "prov-a must be in metrics map");
+        assert!(result.metrics.contains_key("prov-b"), "prov-b must be in metrics map");
         assert!(
             result
+                .metrics
                 .get("prov-a")
                 .copied()
                 .unwrap_or_else(|| std::process::abort())
                 .queue_depth
                 < result
+                    .metrics
                     .get("prov-b")
                     .copied()
                     .unwrap_or_else(|| std::process::abort())
                     .queue_depth,
             "prov-a (queue=0.1) must have lower queue_depth than prov-b (queue=0.9)"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_interval_reuses_generation_for_watch_reconcile() {
+        let url = start_test_server(ok_response("my_queue 0.9\n")).await;
+        let provider = provider_fixture("prov-a", &url, Some(mc_with_queue("my_queue")));
+        let cache = empty_cache();
+        let t0 = Instant::now();
+
+        let first = collect_provider_metrics_with_refresh_interval(
+            "net",
+            std::slice::from_ref(&provider),
+            &cache,
+            t0,
+            Duration::from_secs(10),
+            None,
+        )
+        .await;
+        let second = collect_provider_metrics_with_refresh_interval(
+            "net",
+            std::slice::from_ref(&provider),
+            &cache,
+            t0 + Duration::from_secs(1),
+            Duration::from_secs(10),
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            first.generations.get("prov-a"),
+            second.generations.get("prov-a"),
+            "a watch-triggered reconcile within the refresh interval must reuse the scrape generation"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_interval_allocates_new_generation_after_expiry() {
+        let url = start_test_server(ok_response("my_queue 0.9\n")).await;
+        let provider = provider_fixture("prov-a", &url, Some(mc_with_queue("my_queue")));
+        let cache = empty_cache();
+        let t0 = Instant::now();
+
+        let first = collect_provider_metrics_with_refresh_interval(
+            "net",
+            std::slice::from_ref(&provider),
+            &cache,
+            t0,
+            Duration::from_secs(10),
+            None,
+        )
+        .await;
+        let second = collect_provider_metrics_with_refresh_interval(
+            "net",
+            std::slice::from_ref(&provider),
+            &cache,
+            t0 + Duration::from_secs(11),
+            Duration::from_secs(10),
+            None,
+        )
+        .await;
+
+        assert_ne!(
+            first.generations.get("prov-a"),
+            second.generations.get("prov-a"),
+            "a later metrics refresh must receive a new scrape generation"
         );
     }
 
@@ -835,7 +1004,7 @@ mod tests {
 
         let result = collect_provider_metrics("other-net", &[provider], &empty_cache(), Instant::now(), None).await;
         assert!(
-            result.is_empty(),
+            result.metrics.is_empty(),
             "provider from a different GridNetwork must not be scraped"
         );
     }
@@ -845,6 +1014,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
+    #[expect(clippy::too_many_lines, reason = "cache seeding + assertion")]
     async fn stale_cache_used_within_ttl_on_scrape_failure() {
         // Seed the cache with a known good sample from T=0.
         let t0 = Instant::now();
@@ -852,7 +1022,7 @@ mod tests {
         let cache = empty_cache();
         {
             let mut guard = cache.lock().await;
-            guard.insert(
+            guard.entries.insert(
                 ("net".to_owned(), "prov-a".to_owned()),
                 TimestampedMetrics {
                     metrics: scoring::BackendMetrics {
@@ -864,16 +1034,21 @@ mod tests {
                         error_rate: 0.0,
                     },
                     scraped_at: t0,
+                    generation: 0,
                 },
             );
         }
         // Scrape fails (port 1 is always refused); cache is within 60 s TTL.
         let result = collect_provider_metrics("net", &[provider], &cache, t0, None).await;
         assert!(
-            result.contains_key("prov-a"),
+            result.metrics.contains_key("prov-a"),
             "failed scrape within TTL must use cached metrics"
         );
-        let cached_bm = result.get("prov-a").copied().unwrap_or_else(|| std::process::abort());
+        let cached_bm = result
+            .metrics
+            .get("prov-a")
+            .copied()
+            .unwrap_or_else(|| std::process::abort());
         assert!(
             (cached_bm.queue_depth - 0.42).abs() < f64::EPSILON,
             "cached queue_depth must be returned"
@@ -889,7 +1064,7 @@ mod tests {
         let cache = empty_cache();
         {
             let mut guard = cache.lock().await;
-            guard.insert(
+            guard.entries.insert(
                 ("net".to_owned(), "prov-a".to_owned()),
                 TimestampedMetrics {
                     metrics: scoring::BackendMetrics {
@@ -901,13 +1076,14 @@ mod tests {
                         error_rate: 0.0,
                     },
                     scraped_at: t0,
+                    generation: 0,
                 },
             );
         }
         // Clock advanced past TTL → cache entry is expired → plaintext provider omitted.
         let result = collect_provider_metrics("net", &[provider], &cache, t_after_ttl, None).await;
         assert!(
-            !result.contains_key("prov-a"),
+            !result.metrics.contains_key("prov-a"),
             "expired cache on plaintext provider must not insert unobservable metrics"
         );
     }
@@ -918,7 +1094,7 @@ mod tests {
         let cache = empty_cache();
         {
             let mut guard = cache.lock().await;
-            guard.insert(
+            guard.entries.insert(
                 ("net".to_owned(), "prov-a".to_owned()),
                 TimestampedMetrics {
                     metrics: scoring::BackendMetrics {
@@ -930,12 +1106,13 @@ mod tests {
                         error_rate: 0.0,
                     },
                     scraped_at: Instant::now(),
+                    generation: 0,
                 },
             );
         }
         let result = collect_provider_metrics("net", &[provider], &cache, Instant::now(), None).await;
         assert!(
-            !result.contains_key("prov-a"),
+            !result.metrics.contains_key("prov-a"),
             "plaintext provider without stale_metrics_seconds must not insert unobservable metrics"
         );
     }
@@ -955,6 +1132,7 @@ mod tests {
         let cached_queue_depth = cache
             .lock()
             .await
+            .entries
             .get(&("net".to_owned(), "prov-a".to_owned()))
             .map(|tm| tm.metrics.queue_depth);
         assert!(cached_queue_depth.is_some(), "successful scrape must write to cache");
@@ -970,7 +1148,7 @@ mod tests {
         let cache = empty_cache();
         {
             let mut guard = cache.lock().await;
-            guard.insert(
+            guard.entries.insert(
                 ("net".to_owned(), "prov-a".to_owned()),
                 TimestampedMetrics {
                     metrics: scoring::BackendMetrics {
@@ -982,12 +1160,13 @@ mod tests {
                         error_rate: 0.0,
                     },
                     scraped_at: Instant::now(),
+                    generation: 0,
                 },
             );
         }
         let result = collect_provider_metrics("net", &[provider], &cache, Instant::now(), None).await;
         assert!(
-            !result.contains_key("prov-a"),
+            !result.metrics.contains_key("prov-a"),
             "plaintext provider with zero TTL must not insert unobservable metrics"
         );
     }

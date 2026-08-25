@@ -65,6 +65,10 @@ pub fn render(template: &str, ctx: &TemplateContext) -> Result<String, ForgeErro
 /// Returns [`ForgeError::Config`] if a variable path cannot be resolved against
 /// the context or if the rendered output exceeds `max_rendered_bytes`.
 #[expect(clippy::string_slice, reason = "{{ and }} are ASCII; find returns byte boundaries")]
+#[expect(
+    clippy::arithmetic_side_effects,
+    reason = "offsets from find + 2 cannot overflow on valid strings"
+)]
 pub fn render_with_limit(
     template: &str,
     ctx: &TemplateContext,
@@ -223,13 +227,15 @@ fn navigate_value(val: &serde_json::Value, segments: &[&str]) -> Result<String, 
 /// Convert a scalar JSON value to a string.
 fn value_to_string(val: &serde_json::Value) -> Result<String, ForgeError> {
     match val {
-        serde_json::Value::String(s) => Ok(s.clone()),
-        serde_json::Value::Number(n) => Ok(n.to_string()),
-        serde_json::Value::Bool(b) => Ok(b.to_string()),
-        _ => Err(ForgeError::Config(format!(
-            "cannot convert {kind} to template string",
-            kind = value_kind(val)
-        ))),
+        serde_json::Value::String(text) => Ok(text.clone()),
+        serde_json::Value::Number(num) => Ok(num.to_string()),
+        serde_json::Value::Bool(flag) => Ok(flag.to_string()),
+        serde_json::Value::Null | serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
+            Err(ForgeError::Config(format!(
+                "cannot convert {kind} to template string",
+                kind = value_kind(val)
+            )))
+        },
     }
 }
 

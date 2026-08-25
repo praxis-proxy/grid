@@ -1248,6 +1248,7 @@ fn yaml_image_references(config_text: &str) -> Vec<(String, String)> {
 }
 
 /// Recursively collect image-like YAML fields.
+#[expect(clippy::too_many_lines, reason = "expanded wildcard match adds boilerplate")]
 fn collect_yaml_images(value: &serde_yaml::Value, path: &str, owner: &str, results: &mut Vec<(String, String)>) {
     match value {
         serde_yaml::Value::Mapping(mapping) => {
@@ -1274,7 +1275,11 @@ fn collect_yaml_images(value: &serde_yaml::Value, path: &str, owner: &str, resul
                 collect_yaml_images(child, &format!("{path}[{index}]"), owner, results);
             }
         },
-        _ => {},
+        serde_yaml::Value::Null
+        | serde_yaml::Value::Bool(_)
+        | serde_yaml::Value::Number(_)
+        | serde_yaml::Value::String(_)
+        | serde_yaml::Value::Tagged(_) => {},
     }
 }
 
@@ -1992,13 +1997,13 @@ fn run_probe_pod(
         thread::sleep(Duration::from_millis(250));
     };
 
-    let output = Command::new("kubectl")
+    let kubectl_output = Command::new("kubectl")
         .args(["--context", context, "-n", GRID_SYSTEM_NS, "logs", name])
         .output()?;
     let logs = format!(
         "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+        String::from_utf8_lossy(&kubectl_output.stdout),
+        String::from_utf8_lossy(&kubectl_output.stderr)
     );
     Ok(NetworkPolicyProbe {
         phase,
@@ -2169,19 +2174,19 @@ fn curl_mtls_probe(
 }
 
 /// Arguments for a curl mTLS probe with request headers.
-struct MtlsHeaderProbe<'a> {
+struct MtlsHeaderProbe<'probe> {
     /// Provider gateway IP.
-    ip: &'a str,
+    ip: &'probe str,
     /// SNI hostname.
-    sni: &'a str,
+    sni: &'probe str,
     /// Client certificate and key paths.
-    cert_key: (&'a str, &'a str),
+    cert_key: (&'probe str, &'probe str),
     /// CA certificate path.
-    ca: &'a str,
+    ca: &'probe str,
     /// URL path to request.
-    path: &'a str,
+    path: &'probe str,
     /// Request header name/value pairs.
-    headers: &'a [(&'a str, &'a str)],
+    headers: &'probe [(&'probe str, &'probe str)],
 }
 
 /// Run a curl mTLS probe with request headers.
@@ -2772,10 +2777,10 @@ fn check_same_site_provider_candidates() -> Result<String, Box<dyn std::error::E
 }
 
 /// Validate the exact provider identity contract for one edge overlay.
-fn validate_same_site_candidates<'a>(
+fn validate_same_site_candidates<'cfg>(
     edge: &str,
-    candidates: &'a [serde_json::Value],
-) -> Result<(&'a str, &'a str), Box<dyn std::error::Error>> {
+    candidates: &'cfg [serde_json::Value],
+) -> Result<(&'cfg str, &'cfg str), Box<dyn std::error::Error>> {
     let primary = find_overlay_candidate(candidates, "east-provider", "vcr-east-provider")?;
     let secondary = find_overlay_candidate(candidates, "east-provider", EAST_SECONDARY_CLUSTER)?;
     find_overlay_candidate(candidates, "west-provider", "vcr-west-provider")?;
@@ -2794,11 +2799,11 @@ fn validate_same_site_candidates<'a>(
 }
 
 /// Find one exact site/routing-cluster pair in an overlay.
-fn find_overlay_candidate<'a>(
-    candidates: &'a [serde_json::Value],
+fn find_overlay_candidate<'cfg>(
+    candidates: &'cfg [serde_json::Value],
     site: &str,
     cluster: &str,
-) -> Result<&'a serde_json::Value, Box<dyn std::error::Error>> {
+) -> Result<&'cfg serde_json::Value, Box<dyn std::error::Error>> {
     candidates
         .iter()
         .find(|candidate| {
@@ -2988,10 +2993,10 @@ fn parse_gridsite_egress(
 }
 
 /// Find one provider site's egress address in a `GridSite` list.
-fn find_gridsite_egress<'a>(
-    items: &'a [serde_json::Value],
+fn find_gridsite_egress<'cfg>(
+    items: &'cfg [serde_json::Value],
     provider: &str,
-) -> Result<&'a str, Box<dyn std::error::Error>> {
+) -> Result<&'cfg str, Box<dyn std::error::Error>> {
     let expected_name = format!("{GRID_NETWORK_NAME}-{provider}");
     let site = items.iter().find(|item| {
         item.get("metadata")
@@ -4125,7 +4130,7 @@ fn scale_operator(edge: &str, replicas: u32) -> Result<(), Box<dyn std::error::E
     let ctx = kubectl_context(edge);
     let deadline = Instant::now() + Duration::from_secs(90);
     while Instant::now() < deadline {
-        let output = Command::new("kubectl")
+        let logs_output = Command::new("kubectl")
             .args([
                 "--context",
                 &ctx,
@@ -4138,7 +4143,7 @@ fn scale_operator(edge: &str, replicas: u32) -> Result<(), Box<dyn std::error::E
                 "--no-headers",
             ])
             .output()?;
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stdout = String::from_utf8_lossy(&logs_output.stdout);
         if stdout.trim().is_empty() {
             return Ok(());
         }
@@ -4824,7 +4829,10 @@ clusters:
             provider_candidate_id(EAST_SECONDARY_PROVIDER).unwrap_or_default(),
             provider_candidate_id("west-provider").unwrap_or_default()
         );
-        assert!(provider_candidate_id("unknown-provider").is_err());
+        assert!(
+            provider_candidate_id("unknown-provider").is_err(),
+            "unknown provider must fail"
+        );
     }
 
     #[test]
@@ -5697,7 +5705,10 @@ admin:
     fn append_openai_provider_config_rejects_missing_markers() {
         let ext = ExternalProviderDescriptor::openai("gpt-5-mini");
         let bad = "some: yaml\nwithout: markers";
-        assert!(append_openai_provider_config(bad, &ext, &openai_candidate_id(&ext.model)).is_err());
+        assert!(
+            append_openai_provider_config(bad, &ext, &openai_candidate_id(&ext.model)).is_err(),
+            "missing markers must fail"
+        );
     }
 
     #[test]

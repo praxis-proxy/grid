@@ -186,10 +186,10 @@ pub fn score_backends(state: &GridState, weights: &ScoringWeights, local_region:
     let mut scored: Vec<ScoredBackend> = state
         .backends()
         .iter()
-        .filter(|b| is_healthy(state, b))
-        .map(|b| score_one(b, state.metrics(&b.name), weights, local_region))
+        .filter(|backend| is_healthy(state, backend))
+        .map(|backend| score_one(backend, state.metrics(&backend.name), weights, local_region))
         .collect();
-    scored.sort_by(|a, b| b.score.total_cmp(&a.score));
+    scored.sort_by(|lhs, rhs| rhs.score.total_cmp(&lhs.score));
     scored
 }
 
@@ -223,7 +223,7 @@ pub fn locality_score(kind: BackendKind, backend_region: Option<&str>, local_reg
 /// Computes remote locality based on region comparison.
 fn remote_locality(backend_region: Option<&str>, local_region: Option<&str>) -> f64 {
     match (backend_region, local_region) {
-        (Some(b), Some(l)) if b == l => 0.7,
+        (Some(br), Some(lr)) if br == lr => 0.7,
         (Some(_), Some(_)) => 0.4,
         _ => 0.5,
     }
@@ -235,7 +235,7 @@ fn remote_locality(backend_region: Option<&str>, local_region: Option<&str>) -> 
 
 /// Checks whether a backend is healthy or has no metrics.
 fn is_healthy(state: &GridState, backend: &BackendConfig) -> bool {
-    state.metrics(&backend.name).is_none_or(|m| m.healthy)
+    state.metrics(&backend.name).is_none_or(|metrics| metrics.healthy)
 }
 
 /// Scores a single backend using all six signals.
@@ -279,19 +279,19 @@ fn cost_score(cost_per_1k: f64) -> f64 {
 
 /// Computes latency score (0.0 to 1.0, higher = faster).
 fn latency_score(metrics: Option<&BackendMetrics>) -> f64 {
-    metrics.map_or(DEFAULT_SIGNAL_SCORE, |m| {
-        (1.0 - m.latency_p99_ms / MAX_LATENCY).max(0.0)
+    metrics.map_or(DEFAULT_SIGNAL_SCORE, |bm| {
+        (1.0 - bm.latency_p99_ms / MAX_LATENCY).max(0.0)
     })
 }
 
 /// Computes queue depth score (0.0 to 1.0, higher = emptier).
 fn queue_score(metrics: Option<&BackendMetrics>) -> f64 {
-    metrics.map_or(DEFAULT_SIGNAL_SCORE, |m| (1.0 - m.queue_depth).max(0.0))
+    metrics.map_or(DEFAULT_SIGNAL_SCORE, |bm| (1.0 - bm.queue_depth).max(0.0))
 }
 
 /// Computes KV cache score (0.0 to 1.0, higher = more available).
 fn kv_cache_score(metrics: Option<&BackendMetrics>) -> f64 {
-    metrics.map_or(DEFAULT_SIGNAL_SCORE, |m| (1.0 - m.kv_cache_utilization).max(0.0))
+    metrics.map_or(DEFAULT_SIGNAL_SCORE, |bm| (1.0 - bm.kv_cache_utilization).max(0.0))
 }
 
 /// Computes prefix cache score (0.0 to 1.0, higher = warmer).
@@ -300,7 +300,7 @@ fn kv_cache_score(metrics: Option<&BackendMetrics>) -> f64 {
 /// value from a misconfigured exporter or a schema-incompatible remote site
 /// cannot inflate or deflate the score beyond expected bounds.
 fn prefix_cache_score(metrics: Option<&BackendMetrics>) -> f64 {
-    metrics.map_or(DEFAULT_SIGNAL_SCORE, |m| m.prefix_cache_hit_ratio.clamp(0.0, 1.0))
+    metrics.map_or(DEFAULT_SIGNAL_SCORE, |bm| bm.prefix_cache_hit_ratio.clamp(0.0, 1.0))
 }
 
 // ---------------------------------------------------------------------------
@@ -308,6 +308,7 @@ fn prefix_cache_score(metrics: Option<&BackendMetrics>) -> f64 {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[expect(clippy::float_cmp, reason = "exact literal round-trips in scoring tests")]
 mod tests {
     use super::*;
 
@@ -362,7 +363,7 @@ mod tests {
         add(&mut state, "api", BackendKind::ApiProvider, 0.01);
         let result = score_backends(&state, &ScoringWeights::default(), None);
         assert_eq!(
-            result.first().map(|b| b.name.as_str()),
+            result.first().map(|sb| sb.name.as_str()),
             Some("local"),
             "local should rank first"
         );
@@ -383,7 +384,7 @@ mod tests {
         };
         let result = score_backends(&state, &w, None);
         assert_eq!(
-            result.first().map(|b| b.name.as_str()),
+            result.first().map(|sb| sb.name.as_str()),
             Some("cheap"),
             "cheaper backend should rank first"
         );
@@ -405,10 +406,11 @@ mod tests {
         add(&mut state, "high", BackendKind::Local, 0.01);
         add(&mut state, "mid", BackendKind::Remote, 0.03);
         let result = score_backends(&state, &ScoringWeights::default(), None);
-        let scores: Vec<f64> = result.iter().map(|b| b.score).collect();
+        let scores: Vec<f64> = result.iter().map(|sb| sb.score).collect();
         for pair in scores.windows(2) {
             assert!(
-                pair.first().is_some_and(|a| { pair.get(1).is_some_and(|b| a >= b) }),
+                pair.first()
+                    .is_some_and(|hi| { pair.get(1).is_some_and(|lo| hi >= lo) }),
                 "scores should be in descending order"
             );
         }
@@ -423,7 +425,7 @@ mod tests {
         state.set_metrics("idle".to_owned(), BackendMetrics::new(0.0, true, 0.0, 0.0, 0.0, 0.1));
         let result = score_backends(&state, &ScoringWeights::default(), None);
         assert_eq!(
-            result.first().map(|b| b.name.as_str()),
+            result.first().map(|sb| sb.name.as_str()),
             Some("idle"),
             "idle backend should rank first"
         );
@@ -438,7 +440,7 @@ mod tests {
         state.set_metrics("avail".to_owned(), BackendMetrics::new(0.0, true, 0.1, 0.0, 0.0, 0.0));
         let result = score_backends(&state, &ScoringWeights::default(), None);
         assert_eq!(
-            result.first().map(|b| b.name.as_str()),
+            result.first().map(|sb| sb.name.as_str()),
             Some("avail"),
             "backend with more KV cache available should rank first"
         );
@@ -476,7 +478,7 @@ mod tests {
         state.set_metrics("warm".to_owned(), BackendMetrics::new(0.0, true, 0.0, 0.0, 0.9, 0.0));
         let result = score_backends(&state, &ScoringWeights::default(), None);
         assert_eq!(
-            result.first().map(|b| b.name.as_str()),
+            result.first().map(|sb| sb.name.as_str()),
             Some("warm"),
             "backend with warm prefix cache should rank first"
         );
@@ -569,12 +571,12 @@ mod tests {
         let result = score_backends(&state, &ScoringWeights::default(), None);
         let local_bd = &result
             .iter()
-            .find(|b| b.name == "local")
+            .find(|sb| sb.name == "local")
             .unwrap_or_else(|| std::process::abort())
             .breakdown;
         let api_bd = &result
             .iter()
-            .find(|b| b.name == "api")
+            .find(|sb| sb.name == "api")
             .unwrap_or_else(|| std::process::abort())
             .breakdown;
         let expected_diff = ScoringWeights::default().locality * (1.0 - 0.1);

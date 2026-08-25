@@ -1010,6 +1010,10 @@ mod llmd_pool_metrics_demo_cli_tests {
 
     /// Parses `env run-grid-llmd-pool-metrics-demo` with the given extra args
     /// and returns its `kv_cache` flag value.
+    #[expect(
+        clippy::wildcard_enum_match_arm,
+        reason = "catch-all panic for unexpected Action variants"
+    )]
     fn parsed_kv_cache_flag(extra_args: &[&str]) -> bool {
         let mut args = vec!["xtask", "env", "run-grid-llmd-pool-metrics-demo"];
         args.extend_from_slice(extra_args);
@@ -1833,10 +1837,10 @@ fn is_multi_provider_config(cfg: &EnvConfig) -> bool {
 ///
 /// Uses the first provider site in the config when `site` is `None`.
 /// Resolve the config site name for operator validation.
-fn resolve_operator_site_name<'a>(
-    cfg: &'a EnvConfig,
-    site: Option<&'a str>,
-) -> Result<&'a str, Box<dyn std::error::Error>> {
+fn resolve_operator_site_name<'cfg>(
+    cfg: &'cfg EnvConfig,
+    site: Option<&'cfg str>,
+) -> Result<&'cfg str, Box<dyn std::error::Error>> {
     if let Some(site) = site {
         Ok(site)
     } else {
@@ -1916,7 +1920,7 @@ fn run_operator_reconcile(context: &str) -> Result<PathBuf, Box<dyn std::error::
         POD_READY_TIMEOUT, STATUS_POLL_TIMEOUT, TEST_DEGRADED_ROUTING_CLUSTER, TEST_GATEWAY_NAME, TEST_GATEWAY_NS,
         TEST_HEALTHY_ROUTING_CLUSTER, TEST_METRICS_BUSY_PROVIDER, TEST_METRICS_BUSY_ROUTING_CLUSTER,
         TEST_METRICS_IDLE_PROVIDER, TEST_METRICS_IDLE_ROUTING_CLUSTER, TEST_NETWORK, TEST_PROVIDER_API,
-        TEST_PROVIDER_DEGRADED, TEST_PROVIDER_HEALTHY, TEST_PROVIDER_INVALID,
+        TEST_PROVIDER_DEGRADED, TEST_PROVIDER_HEALTHY, TEST_PROVIDER_INVALID, TEST_PROVIDER_TLS_KEY_MISSING,
     };
 
     // Step 1: install Grid CRDs and remove stale owned resources.
@@ -1982,6 +1986,7 @@ fn run_operator_reconcile(context: &str) -> Result<PathBuf, Box<dyn std::error::
     )?;
     operator::apply_api_provider_fixture(context, api_endpoint)?;
     operator::apply_metrics_provider_fixtures(context, &metrics_idle_endpoint, &metrics_busy_endpoint)?;
+    operator::apply_provider_with_health_check_tls_key_missing_fixture(context)?;
 
     // Step 7: wait for reconciliation and verify overlay.
     let result = (|| -> Result<PathBuf, Box<dyn std::error::Error>> {
@@ -1991,6 +1996,15 @@ fn run_operator_reconcile(context: &str) -> Result<PathBuf, Box<dyn std::error::
         operator::wait_for_provider_phase(context, TEST_PROVIDER_API, "Pending", STATUS_POLL_TIMEOUT)?;
         operator::wait_for_provider_phase(context, TEST_METRICS_IDLE_PROVIDER, "Pending", STATUS_POLL_TIMEOUT)?;
         operator::wait_for_provider_phase(context, TEST_METRICS_BUSY_PROVIDER, "Pending", STATUS_POLL_TIMEOUT)?;
+        // grid#58 regression: a CA Secret that exists but lacks the expected key must
+        // surface as HealthCheckTlsKeyMissing, not HealthCheckTlsSecretMissing.
+        operator::wait_for_provider_phase_and_reason(
+            context,
+            TEST_PROVIDER_TLS_KEY_MISSING,
+            "Degraded",
+            "HealthCheckTlsKeyMissing",
+            STATUS_POLL_TIMEOUT,
+        )?;
         operator::wait_for_overlay_configmap(
             context,
             TEST_NETWORK,
@@ -3997,7 +4011,7 @@ fn env_verify_metrics_routing(config: &Path) -> Result<(), Box<dyn std::error::E
             if !status.success() {
                 return Err(format!("mock-epp restart failed in {site}").into());
             }
-            let status = Command::new("kubectl")
+            let delete_status = Command::new("kubectl")
                 .args([
                     "--context",
                     ctx,
@@ -4010,7 +4024,7 @@ fn env_verify_metrics_routing(config: &Path) -> Result<(), Box<dyn std::error::E
                     "60s",
                 ])
                 .status()?;
-            if !status.success() {
+            if !delete_status.success() {
                 return Err(format!("mock-epp rollout timed out in {site}").into());
             }
             eprintln!("  [OK] {site} mock-epp ready with shared model route");
@@ -6249,13 +6263,8 @@ fn env_verify_gridsite_rotation(config: &Path, site: Option<&str>) -> Result<(),
             ROTATION_POLL_TIMEOUT,
         )?;
         eprintln!("  [PASS] step 6b: TlsVerified — cert-B matches fp-B in dual-pin");
-        // NOTE: AdvertisedCertificateMismatch (SWIM-advertised cert vs configured
-        // pins) requires modifying the remote operator's TLS broadcast secret
-        // independently of the probe server cert.  This pathway has unit test
-        // coverage (advertised_cert_mismatch_demotes_active_to_connecting,
-        // advertised_cert_mismatch_stays_connecting) but no xtask verifier
-        // intentionally creates that runtime state.  The rotation verifier
-        // focuses on the live TLS handshake lifecycle.
+        // No step for AdvertisedCertificateMismatch: it needs the remote TLS broadcast
+        // secret patched apart from the probe cert, and no longer changes phase.
 
         // ── Step 7: Patch [fp-B] only → still Active/TlsVerified ────────────
         eprintln!("verify-gridsite-rotation: [7] single pin [fp-B]");

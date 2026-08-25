@@ -76,12 +76,6 @@ const DATA_PLANE_INTERVAL: Duration = Duration::from_secs(1);
 /// Configured queue capacity (matches MOCK_MAX_NUM_SEQS on VCR pods).
 const QUEUE_CAPACITY: f64 = 4.0;
 
-/// Scoring weight for queue_depth signal (one-hot strategy: weight = 1.0).
-const QUEUE_DEPTH_WEIGHT: f64 = 1.0;
-
-/// Scoring weight for kv_cache signal (one-hot strategy: weight = 1.0).
-const KV_CACHE_WEIGHT: f64 = 1.0;
-
 /// Minimum score gap required before capturing the pressure scorecard.
 ///
 /// With real VCR backends, pressure creates modest score differences
@@ -131,7 +125,7 @@ const DEFAULT_GATEWAY_IMAGE: &str = "ghcr.io/praxis-proxy/grid-ai-rollup:v0.1.3"
 const DEFAULT_OPERATOR_IMAGE: &str = "ghcr.io/praxis-proxy/grid-operator:v0.1.3";
 
 /// Default EPP image reference required by this demo.
-const DEFAULT_EPP_IMAGE: &str = "ghcr.io/llm-d/llm-d-inference-scheduler:v0.8.0";
+const DEFAULT_EPP_IMAGE: &str = "ghcr.io/llm-d/llm-d-router-endpoint-picker:v0.9.0";
 
 /// Default vllm-vcr image reference required by this demo.
 const DEFAULT_VCR_IMAGE: &str = "ghcr.io/neuralmagic/vllm-vcr:vllm0.23";
@@ -842,11 +836,14 @@ fn proof_provenance(mtls: bool) -> ProofResult {
         let deadline = Instant::now() + Duration::from_secs(30);
         while Instant::now() < deadline {
             if let Ok(metrics_text) = kubectl_exec_epp_metrics(cluster, mtls) {
-                let has_kv = metrics_text.contains("inference_pool_average_kv_cache_utilization")
+                let has_kv = metrics_text.contains("llm_d_epp_average_kv_cache_utilization")
+                    || metrics_text.contains("inference_pool_average_kv_cache_utilization")
                     || metrics_text.contains("llm_d_router_epp_average_kv_cache_utilization");
-                let has_queue = metrics_text.contains("inference_pool_average_queue_size")
+                let has_queue = metrics_text.contains("llm_d_epp_average_queue_size")
+                    || metrics_text.contains("inference_pool_average_queue_size")
                     || metrics_text.contains("llm_d_router_epp_average_queue_size");
-                let has_ready = metrics_text.contains("inference_pool_ready_pods")
+                let has_ready = metrics_text.contains("llm_d_epp_ready_endpoints")
+                    || metrics_text.contains("inference_pool_ready_pods")
                     || metrics_text.contains("llm_d_router_epp_ready_endpoints");
                 if has_kv && has_queue && has_ready {
                     observations.push(format!("{cluster}: all 3 EPP pool metrics present"));
@@ -922,8 +919,10 @@ fn proof_baseline(context: &DemoContext) -> ProofResult {
             match send_inference_request(&probe_ctx, VCR_MODEL) {
                 Ok(resp) => {
                     if resp.provider_gateway.contains("pool-a") && resp.demo_attribution.contains("pool-a") {
-                        let row_a = build_scorecard_row("Cluster A", &candidates, "pool-a");
-                        let row_b = build_scorecard_row("Cluster B", &candidates, "pool-b");
+                        let epp_b =
+                            scrape_epp_metrics("pool-b", context.metrics_transport == MetricsTransport::MtlsProxy);
+                        let row_a = build_scorecard_row("Cluster A", &candidates, "pool-a", &epp_a);
+                        let row_b = build_scorecard_row("Cluster B", &candidates, "pool-b", &epp_b);
                         eprintln!("  [BASELINE] Request attributed to pool-a -- baseline confirmed");
                         print_scorecard_with_cause(
                             "BASELINE",
@@ -1035,9 +1034,10 @@ fn proof_pressure_and_flip(context: &DemoContext, table_start: Instant) -> Proof
         }
 
         let epp_a = scrape_epp_metrics("pool-a", mtls);
-        let candidates = read_overlay_candidates("pool-a");
-        let row_a = build_scorecard_row("Cluster A", &candidates, "pool-a");
-        let row_b = build_scorecard_row("Cluster B", &candidates, "pool-b");
+        let epp_b = scrape_epp_metrics("pool-b", mtls);
+        let updated_candidates = read_overlay_candidates("pool-a");
+        let row_a = build_scorecard_row("Cluster A", &updated_candidates, "pool-a", &epp_a);
+        let row_b = build_scorecard_row("Cluster B", &updated_candidates, "pool-b", &epp_b);
         let stats = read_pressure_stats("pool-a");
         let score_gap = row_b.score - row_a.score;
 
@@ -1088,7 +1088,7 @@ fn proof_pressure_and_flip(context: &DemoContext, table_start: Instant) -> Proof
                         "FAILOVER",
                         &[&row_a, &row_b],
                         "CLUSTER B",
-                        &candidates,
+                        &updated_candidates,
                         "Pool A pressure lowered its queue/KV scores, so Pool B became rank 0.",
                     );
                     observations.push(format!(
@@ -1181,9 +1181,10 @@ fn proof_recovery(context: &DemoContext, table_start: Instant) -> ProofResult {
         }
 
         let epp_a = scrape_epp_metrics("pool-a", mtls);
+        let epp_b = scrape_epp_metrics("pool-b", mtls);
         let candidates = read_overlay_candidates("pool-a");
-        let row_a = build_scorecard_row("Cluster A", &candidates, "pool-a");
-        let row_b = build_scorecard_row("Cluster B", &candidates, "pool-b");
+        let row_a = build_scorecard_row("Cluster A", &candidates, "pool-a", &epp_a);
+        let row_b = build_scorecard_row("Cluster B", &candidates, "pool-b", &epp_b);
 
         print_live_table_row(&LiveTableRow {
             elapsed: table_start.elapsed(),
@@ -1394,17 +1395,16 @@ fn scrape_epp_metrics(cluster: &str, mtls: bool) -> EppMetrics {
 /// [`scrape_epp_metrics`], separated out so metric-name-fallback behavior is
 /// unit-testable without a live EPP).
 ///
-/// Both `queue_size` and `kv_cache` fall back from the `inference_pool_*`
-/// series to the `llm_d_router_epp_*` series symmetrically -- an EPP build
-/// that only exposes the latter must not silently read `kv_cache` as a
-/// permanent 0.0, which would make a `kvCachePressure` run's pressure phase
-/// never announce despite real KV pressure driving the flip.
+/// Both `queue_size` and `kv_cache` prefer the canonical `llm_d_epp_*`
+/// series and fall back symmetrically to the legacy metric names.
 fn parse_epp_metrics(text: &str) -> EppMetrics {
     EppMetrics {
-        queue_size: extract_prom_value(text, "inference_pool_average_queue_size")
+        queue_size: extract_prom_value(text, "llm_d_epp_average_queue_size")
+            .or_else(|| extract_prom_value(text, "inference_pool_average_queue_size"))
             .or_else(|| extract_prom_value(text, "llm_d_router_epp_average_queue_size"))
             .unwrap_or(0.0),
-        kv_cache: extract_prom_value(text, "inference_pool_average_kv_cache_utilization")
+        kv_cache: extract_prom_value(text, "llm_d_epp_average_kv_cache_utilization")
+            .or_else(|| extract_prom_value(text, "inference_pool_average_kv_cache_utilization"))
             .or_else(|| extract_prom_value(text, "llm_d_router_epp_average_kv_cache_utilization"))
             .unwrap_or(0.0),
     }
@@ -1431,13 +1431,15 @@ fn pressure_phase_active(flavor: ScoringFlavor, epp: &EppMetrics) -> bool {
 /// `QueueDepth` uses its own calibrated [`RECOVERY_QUEUE_THRESHOLD`] (looser
 /// than [`QUEUE_PRESSURE_THRESHOLD`] by design -- recovery only needs "clearly
 /// drained," not a full return below the phase-detection threshold).
-/// `KvCachePressure` has no independently-calibrated recovery threshold yet,
-/// so it reuses the inverse of [`pressure_phase_active`] rather than
-/// inventing an untested second KV constant.
+/// `KvCachePressure` requires the shared queue-drain threshold as well as the
+/// inverse of [`pressure_phase_active`]. This prevents a locality tie-break
+/// from being reported as recovery while request queues remain saturated.
 fn recovery_condition_met(flavor: ScoringFlavor, epp: &EppMetrics) -> bool {
     match flavor {
         ScoringFlavor::QueueDepth => epp.queue_size < RECOVERY_QUEUE_THRESHOLD,
-        ScoringFlavor::KvCachePressure => !pressure_phase_active(flavor, epp),
+        ScoringFlavor::KvCachePressure => {
+            epp.queue_size < RECOVERY_QUEUE_THRESHOLD && !pressure_phase_active(flavor, epp)
+        },
     }
 }
 
@@ -1508,33 +1510,26 @@ fn overlay_score_for_cluster(candidates: &[OverlayCandidate], cluster_suffix: &s
         .map_or(0.0, |c| c.score)
 }
 
-/// Build a scorecard row entirely from the overlay.
+/// Build a scorecard row from the overlay decision and live EPP metrics.
 ///
-/// Raw queue size and KV-cache utilization are back-computed from the
-/// score breakdown so that every value in the row comes from the same
-/// operator scoring revision.  Mixing live EPP metrics with overlay
-/// scores produces contradictions when the pressure ramp advances
-/// between the operator scrape and the demo capture.
-fn build_scorecard_row(label: &str, candidates: &[OverlayCandidate], cluster_suffix: &str) -> ScorecardRow {
+/// The overlay owns score and rank. EPP owns the raw queue and KV-cache
+/// measurements. Reconstructing raw metrics from score-breakdown weights is
+/// invalid when a signal is inactive, because its zero contribution does not
+/// mean the underlying metric is zero.
+fn build_scorecard_row(
+    label: &str,
+    candidates: &[OverlayCandidate],
+    cluster_suffix: &str,
+    metrics: &EppMetrics,
+) -> ScorecardRow {
     let rank = overlay_rank_for_cluster(candidates, cluster_suffix);
     let score = overlay_score_for_cluster(candidates, cluster_suffix);
-    let bd = candidates
-        .iter()
-        .find(|c| c.cluster.contains(cluster_suffix))
-        .and_then(|c| c.breakdown.as_ref());
-    let (queue, kv_cache) = if let Some(b) = bd {
-        let q = QUEUE_CAPACITY * (1.0 - b.queue_depth / QUEUE_DEPTH_WEIGHT);
-        let kv = 1.0 - b.kv_cache / KV_CACHE_WEIGHT;
-        (q.max(0.0), kv.max(0.0))
-    } else {
-        (0.0, 0.0)
-    };
     ScorecardRow {
         cluster: label.to_owned(),
-        queue,
+        queue: metrics.queue_size,
         capacity: QUEUE_CAPACITY,
-        pressure: queue / QUEUE_CAPACITY,
-        kv_cache,
+        pressure: metrics.queue_size / QUEUE_CAPACITY,
+        kv_cache: metrics.kv_cache,
         score,
         rank,
     }
@@ -1612,17 +1607,17 @@ fn print_live_table_header() {
 }
 
 /// Snapshot of live table data for one row.
-struct LiveTableRow<'a> {
+struct LiveTableRow<'row> {
     /// Elapsed time since the table started.
     elapsed: Duration,
     /// Current phase label.
-    phase: &'a str,
+    phase: &'row str,
     /// Scorecard rows for pool-a and pool-b.
-    rows: (&'a ScorecardRow, &'a ScorecardRow),
+    rows: (&'row ScorecardRow, &'row ScorecardRow),
     /// Pressure generator attribution stats.
-    stats: &'a PressureStats,
+    stats: &'row PressureStats,
     /// Last probe request attribution.
-    last_route: &'a str,
+    last_route: &'row str,
 }
 
 /// Print one row of the live metrics table.
@@ -2387,13 +2382,29 @@ fn materialize_config(
     if scoring_flavor == ScoringFlavor::KvCachePressure {
         let default_strategy = format!("strategy: {}", ScoringFlavor::QueueDepth.strategy_yaml());
         let selected_strategy = format!("strategy: {}", scoring_flavor.strategy_yaml());
-        result = checked_replace(
-            &result,
-            &default_strategy,
-            &selected_strategy,
-            2,
-            "scoringPolicy.strategy",
-        )?;
+        let default_matches = result.matches(&default_strategy).count();
+        let selected_matches = result.matches(&selected_strategy).count();
+        match (default_matches, selected_matches) {
+            (2, 0) => {
+                result = checked_replace(
+                    &result,
+                    &default_strategy,
+                    &selected_strategy,
+                    2,
+                    "scoringPolicy.strategy",
+                )?;
+            },
+            (0, 2) => {
+                // The wrapper may select a Forge config that already uses the
+                // requested strategy. Keep materialization idempotent.
+            },
+            _ => {
+                return Err(format!(
+                    "materialize_config: scoringPolicy.strategy: expected either 2 queueDepth matches or 2 kvCachePressure matches, found {default_matches} and {selected_matches}"
+                )
+                .into());
+            },
+        }
     }
 
     fs::write(&resolved, result)?;
@@ -3533,14 +3544,14 @@ fn proof_tls_stale_cache() -> ProofResult {
         if is_provider_observable(cluster, cluster) {
             inside_ttl_observable = true;
             let elapsed = pre_break.elapsed().as_secs();
-            let candidates = read_overlay_candidates(cluster);
-            let score = overlay_score_for_cluster(&candidates, cluster);
-            let msg = format!(
+            let refreshed_candidates = read_overlay_candidates(cluster);
+            let score = overlay_score_for_cluster(&refreshed_candidates, cluster);
+            let overlay_msg = format!(
                 "inside-TTL ({elapsed}s/{STALE_METRICS_TTL_SECS}s): {cluster} still observable, \
                  score={score:.2} (cached metrics served)"
             );
-            eprintln!("    {msg}");
-            observations.push(msg);
+            eprintln!("    {overlay_msg}");
+            observations.push(overlay_msg);
             break;
         }
     }
@@ -3573,12 +3584,12 @@ fn proof_tls_stale_cache() -> ProofResult {
         !is_provider_observable(cluster, cluster) || wait_for_unobservable(cluster, cluster, Duration::from_secs(30));
     let elapsed = pre_break.elapsed().as_secs();
     if post_ttl_unobservable {
-        let msg = format!(
+        let retry_msg = format!(
             "post-TTL ({elapsed}s/{STALE_METRICS_TTL_SECS}s): {cluster} unobservable \
              (cached metrics expired, UNOBSERVABLE_METRICS applied)"
         );
-        eprintln!("    {msg}");
-        observations.push(msg);
+        eprintln!("    {retry_msg}");
+        observations.push(retry_msg);
     } else {
         observations.push(format!(
             "post-TTL ({elapsed}s/{STALE_METRICS_TTL_SECS}s): {cluster} still observable \
@@ -3604,11 +3615,11 @@ fn proof_tls_stale_cache() -> ProofResult {
     }
     let recovered = wait_for_observable(cluster, cluster, TLS_TRANSITION_TIMEOUT);
     if recovered {
-        let candidates = read_overlay_candidates(cluster);
-        let score = overlay_score_for_cluster(&candidates, cluster);
-        let msg = format!("recovery: {cluster} observable after client cert restored, score={score:.2}");
-        eprintln!("    {msg}");
-        observations.push(msg);
+        let recovery_candidates = read_overlay_candidates(cluster);
+        let score = overlay_score_for_cluster(&recovery_candidates, cluster);
+        let recovery_msg = format!("recovery: {cluster} observable after client cert restored, score={score:.2}");
+        eprintln!("    {recovery_msg}");
+        observations.push(recovery_msg);
     } else {
         observations.push(format!("{cluster}: provider did not recover after stale-cache test"));
         return ProofResult {
@@ -3828,15 +3839,29 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
     }
 
     #[test]
-    fn parse_epp_metrics_prefers_primary_metric_names() {
-        let text = "inference_pool_average_queue_size{name=\"pool-a\"} 4.5\n\
-                     inference_pool_average_kv_cache_utilization{name=\"pool-a\"} 0.35\n";
+    #[expect(clippy::float_cmp, reason = "exact literal round-trips in test assertions")]
+    fn parse_epp_metrics_prefers_llm_d_epp_metric_names() {
+        let text = "llm_d_epp_average_queue_size{name=\"pool-a\"} 4.5\n\
+                     llm_d_epp_average_kv_cache_utilization{name=\"pool-a\"} 0.35\n\
+                     inference_pool_average_queue_size{name=\"pool-a\"} 7.0\n\
+                     inference_pool_average_kv_cache_utilization{name=\"pool-a\"} 0.70\n";
         let epp = parse_epp_metrics(text);
         assert_eq!(epp.queue_size, 4.5);
         assert_eq!(epp.kv_cache, 0.35);
     }
 
     #[test]
+    #[expect(clippy::float_cmp, reason = "exact literal round-trips in test assertions")]
+    fn parse_epp_metrics_falls_back_to_inference_pool_metric_names() {
+        let text = "inference_pool_average_queue_size{name=\"pool-a\"} 5.0\n\
+                     inference_pool_average_kv_cache_utilization{name=\"pool-a\"} 0.40\n";
+        let epp = parse_epp_metrics(text);
+        assert_eq!(epp.queue_size, 5.0);
+        assert_eq!(epp.kv_cache, 0.40);
+    }
+
+    #[test]
+    #[expect(clippy::float_cmp, reason = "exact literal round-trips in test assertions")]
     fn parse_epp_metrics_falls_back_to_llm_d_router_metric_names() {
         // Some EPP builds only expose the llm_d_router_* series (no
         // inference_pool_* series at all) -- both queue_size and kv_cache
@@ -3850,6 +3875,7 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
     }
 
     #[test]
+    #[expect(clippy::float_cmp, reason = "exact literal round-trips in test assertions")]
     fn parse_epp_metrics_defaults_to_zero_when_absent() {
         let epp = parse_epp_metrics("");
         assert_eq!(epp.queue_size, 0.0);
@@ -3872,16 +3898,21 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
     }
 
     #[test]
-    fn recovery_condition_met_kv_cache_flavor_uses_pressure_active_inverse() {
-        // No independently-calibrated recovery threshold exists for
-        // kv_cache yet, so recovery is defined as "pressure phase is no
-        // longer active" -- reusing the one KV threshold that IS
-        // calibrated, rather than inventing an untested second one.
+    fn recovery_condition_met_kv_cache_flavor_requires_queue_drain_and_low_pressure() {
         let recovered = EppMetrics {
-            queue_size: 99.0, // must be ignored for this flavor
+            queue_size: 2.9, // must be below the shared recovery threshold
             kv_cache: 0.0,
         };
         assert!(recovery_condition_met(ScoringFlavor::KvCachePressure, &recovered));
+
+        let queue_still_saturated = EppMetrics {
+            queue_size: 4.0,
+            kv_cache: 0.0,
+        };
+        assert!(!recovery_condition_met(
+            ScoringFlavor::KvCachePressure,
+            &queue_still_saturated
+        ));
 
         let still_pressured = EppMetrics {
             queue_size: 0.0,
@@ -4174,6 +4205,32 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
             !content.contains("strategy: queueDepth"),
             "no queueDepth strategy should remain after the swap"
         );
+        drop(fs::remove_dir_all(&dir));
+    }
+
+    #[test]
+    fn materialize_kv_cache_flavor_accepts_preselected_strategy() {
+        let dir = std::env::temp_dir().join("grid-test-materialize-kv-cache-preselected");
+        drop(fs::create_dir_all(&dir));
+        let forge_path = dir.join("forge-kv-cache.yaml");
+        let config = test_forge_config().replace("strategy: queueDepth", "strategy: kvCachePressure");
+        fs::write(&forge_path, config).unwrap();
+
+        let resolved = materialize_config(
+            &forge_path,
+            MetricsTransport::DirectHttp,
+            ScoringFlavor::KvCachePressure,
+            None,
+        )
+        .unwrap();
+        let content = fs::read_to_string(&resolved).unwrap();
+
+        assert_eq!(
+            content.matches("strategy: kvCachePressure").count(),
+            2,
+            "a preselected kv-cache config must remain unchanged"
+        );
+        assert!(!content.contains("strategy: queueDepth"));
         drop(fs::remove_dir_all(&dir));
     }
 

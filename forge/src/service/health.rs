@@ -19,21 +19,21 @@ use crate::{config::HealthCheck, error::ForgeError};
 ///
 /// Returns [`ForgeError::Config`] if the format is unrecognised or
 /// the numeric portion cannot be parsed.
-pub fn parse_duration(s: &str) -> Result<Duration, ForgeError> {
-    if let Some(ms) = s.strip_suffix("ms") {
+pub fn parse_duration(input: &str) -> Result<Duration, ForgeError> {
+    if let Some(ms) = input.strip_suffix("ms") {
         let val: u64 = ms
             .parse()
-            .map_err(|e| ForgeError::Config(format!("invalid duration '{s}': {e}")))?;
+            .map_err(|err| ForgeError::Config(format!("invalid duration '{input}': {err}")))?;
         return Ok(Duration::from_millis(val));
     }
-    if let Some(secs) = s.strip_suffix('s') {
+    if let Some(secs) = input.strip_suffix('s') {
         let val: u64 = secs
             .parse()
-            .map_err(|e| ForgeError::Config(format!("invalid duration '{s}': {e}")))?;
+            .map_err(|err| ForgeError::Config(format!("invalid duration '{input}': {err}")))?;
         return Ok(Duration::from_secs(val));
     }
     Err(ForgeError::Config(format!(
-        "unsupported duration format '{s}' (expected '2s' or '500ms')"
+        "unsupported duration format '{input}' (expected '2s' or '500ms')"
     )))
 }
 
@@ -47,7 +47,7 @@ pub fn parse_duration(s: &str) -> Result<Duration, ForgeError> {
 pub fn tcp_probe(addr: &str, port: u16, timeout: Duration) -> bool {
     let target = format!("{addr}:{port}");
     let socket_addr: std::net::SocketAddr = match target.parse() {
-        Ok(a) => a,
+        Ok(socket) => socket,
         Err(_) => return false,
     };
     std::net::TcpStream::connect_timeout(&socket_addr, timeout).is_ok()
@@ -95,26 +95,26 @@ mod tests {
 
     #[test]
     fn parse_duration_seconds() {
-        let d = parse_duration("2s").unwrap_or_else(|_| {
+        let dur = parse_duration("2s").unwrap_or_else(|_| {
             std::process::abort();
             #[expect(unreachable_code, reason = "abort prevents reaching this")]
             {
                 unreachable!()
             }
         });
-        assert_eq!(d, Duration::from_secs(2), "should parse 2 seconds");
+        assert_eq!(dur, Duration::from_secs(2), "should parse 2 seconds");
     }
 
     #[test]
     fn parse_duration_millis() {
-        let d = parse_duration("500ms").unwrap_or_else(|_| {
+        let dur = parse_duration("500ms").unwrap_or_else(|_| {
             std::process::abort();
             #[expect(unreachable_code, reason = "abort prevents reaching this")]
             {
                 unreachable!()
             }
         });
-        assert_eq!(d, Duration::from_millis(500), "should parse 500 milliseconds");
+        assert_eq!(dur, Duration::from_millis(500), "should parse 500 milliseconds");
     }
 
     #[test]

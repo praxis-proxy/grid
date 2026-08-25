@@ -180,13 +180,13 @@ mod tests {
 
     #[test]
     fn merge_combines_items() {
-        let mut a = OrSet::new("a".to_owned());
-        let mut b = OrSet::new("b".to_owned());
-        a.add("x".to_owned());
-        b.add("y".to_owned());
-        a.merge(&b);
-        assert!(a.contains(&"x".to_owned()), "should have x");
-        assert!(a.contains(&"y".to_owned()), "should have y");
+        let mut set_a = OrSet::new("a".to_owned());
+        let mut set_b = OrSet::new("b".to_owned());
+        set_a.add("x".to_owned());
+        set_b.add("y".to_owned());
+        set_a.merge(&set_b);
+        assert!(set_a.contains(&"x".to_owned()), "should have x");
+        assert!(set_a.contains(&"y".to_owned()), "should have y");
     }
 
     #[test]
@@ -225,16 +225,16 @@ mod tests {
 
     #[test]
     fn merge_is_commutative() {
-        let mut a = OrSet::new("a".to_owned());
-        let mut b = OrSet::new("b".to_owned());
-        a.add("x".to_owned());
-        b.add("y".to_owned());
+        let mut set_a = OrSet::new("a".to_owned());
+        let mut set_b = OrSet::new("b".to_owned());
+        set_a.add("x".to_owned());
+        set_b.add("y".to_owned());
 
-        let mut ab = a.clone();
-        ab.merge(&b);
+        let mut ab = set_a.clone();
+        ab.merge(&set_b);
 
-        let mut ba = b.clone();
-        ba.merge(&a);
+        let mut ba = set_b.clone();
+        ba.merge(&set_a);
 
         assert_eq!(ab.len(), ba.len(), "merge must be commutative");
         assert_eq!(
@@ -251,29 +251,29 @@ mod tests {
 
     #[test]
     fn merge_is_idempotent() {
-        let mut a = OrSet::new("a".to_owned());
-        a.add("x".to_owned());
-        let snapshot = a.clone();
-        a.merge(&snapshot);
-        assert_eq!(a.len(), 1, "merge with self must be idempotent");
+        let mut set_a = OrSet::new("a".to_owned());
+        set_a.add("x".to_owned());
+        let snapshot = set_a.clone();
+        set_a.merge(&snapshot);
+        assert_eq!(set_a.len(), 1, "merge with self must be idempotent");
     }
 
     #[test]
     fn merge_is_associative() {
-        let mut a = OrSet::new("a".to_owned());
-        let mut b = OrSet::new("b".to_owned());
-        let mut c = OrSet::new("c".to_owned());
-        a.add("x".to_owned());
-        b.add("y".to_owned());
-        c.add("z".to_owned());
+        let mut set_a = OrSet::new("a".to_owned());
+        let mut set_b = OrSet::new("b".to_owned());
+        let mut set_c = OrSet::new("c".to_owned());
+        set_a.add("x".to_owned());
+        set_b.add("y".to_owned());
+        set_c.add("z".to_owned());
 
-        let mut ab_then_c = a.clone();
-        ab_then_c.merge(&b);
-        ab_then_c.merge(&c);
+        let mut ab_then_c = set_a.clone();
+        ab_then_c.merge(&set_b);
+        ab_then_c.merge(&set_c);
 
-        let mut bc = b.clone();
-        bc.merge(&c);
-        let mut a_then_bc = a.clone();
+        let mut bc = set_b.clone();
+        bc.merge(&set_c);
+        let mut a_then_bc = set_a.clone();
         a_then_bc.merge(&bc);
 
         assert_eq!(

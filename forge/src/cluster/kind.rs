@@ -37,7 +37,7 @@ pub fn kubectl_context(kind_name: &str) -> String {
 /// Returns [`ForgeError`] if the `kind get clusters` command fails.
 pub fn cluster_exists(runner: &dyn CommandRunner, kind_name: &str) -> Result<bool, ForgeError> {
     let clusters = list_clusters(runner)?;
-    Ok(clusters.iter().any(|c| c == kind_name))
+    Ok(clusters.iter().any(|name| name == kind_name))
 }
 
 /// Create a KIND cluster with a generated config.
@@ -142,7 +142,7 @@ pub fn generate_kind_config(nodes: &NodeConfig) -> String {
 fn write_kind_config(dir: &std::path::Path, kind_name: &str, content: &str) -> Result<std::path::PathBuf, ForgeError> {
     let path = dir.join(format!("kind-config-{kind_name}.yaml"));
     std::fs::write(&path, content)
-        .map_err(|e| ForgeError::State(format!("cannot write KIND config {}: {e}", path.display())))?;
+        .map_err(|err| ForgeError::State(format!("cannot write KIND config {}: {err}", path.display())))?;
     Ok(path)
 }
 
@@ -254,7 +254,7 @@ fn parse_cluster_list(output: &CommandOutput) -> Vec<String> {
         .stdout
         .lines()
         .map(str::trim)
-        .filter(|l| !l.is_empty())
+        .filter(|line| !line.is_empty())
         .map(str::to_owned)
         .collect()
 }
@@ -273,7 +273,7 @@ fn check_success(output: &CommandOutput, program: &str) -> Result<(), ForgeError
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::command::runner::{CommandOutput, MockRunner};
+    use crate::command::runner::MockRunner;
 
     #[test]
     fn kind_cluster_name_format() {

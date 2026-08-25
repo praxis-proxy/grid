@@ -397,7 +397,7 @@ fn handle_validation_error(e: &validation::ValidationError, status: &SharedStatu
 // ---------------------------------------------------------------------------
 
 /// Extract a data key from a `ConfigMap`.
-fn extract_data<'a>(cm: &'a ConfigMap, key: &str) -> Option<&'a String> {
+fn extract_data<'cm>(cm: &'cm ConfigMap, key: &str) -> Option<&'cm String> {
     cm.data.as_ref().and_then(|data| data.get(key))
 }
 
@@ -446,7 +446,6 @@ mod tests {
     use sha2::Digest as _;
 
     use super::*;
-    use crate::{metrics::Metrics, status::SharedStatus};
 
     fn test_config(output_path: PathBuf) -> WatcherConfig {
         WatcherConfig {
@@ -762,11 +761,11 @@ mod tests {
 
     #[test]
     fn backoff_doubles_and_caps() {
-        let (_, next) = next_backoff(Duration::from_secs(1));
-        assert_eq!(next, Duration::from_secs(2));
-        let (_, next) = next_backoff(Duration::from_secs(16));
-        assert_eq!(next, Duration::from_secs(30));
-        let (_, next) = next_backoff(Duration::from_secs(30));
-        assert_eq!(next, Duration::from_secs(30));
+        let (_, next_2s) = next_backoff(Duration::from_secs(1));
+        assert_eq!(next_2s, Duration::from_secs(2));
+        let (_, next_30s) = next_backoff(Duration::from_secs(16));
+        assert_eq!(next_30s, Duration::from_secs(30));
+        let (_, next_cap) = next_backoff(Duration::from_secs(30));
+        assert_eq!(next_cap, Duration::from_secs(30));
     }
 }

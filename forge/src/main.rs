@@ -82,11 +82,11 @@ fn load_config_validated(cli: &Cli) -> Result<forge::config::ForgeConfig, ForgeE
 }
 
 /// Build a [`ForgeContext`] from CLI options.
-fn build_context<'a>(
-    cli: &'a Cli,
-    runner: &'a dyn runner::CommandRunner,
-    config: &'a forge::config::ForgeConfig,
-) -> ForgeContext<'a> {
+fn build_context<'ctx>(
+    cli: &'ctx Cli,
+    runner: &'ctx dyn runner::CommandRunner,
+    config: &'ctx forge::config::ForgeConfig,
+) -> ForgeContext<'ctx> {
     ForgeContext {
         runner,
         config,
@@ -161,10 +161,10 @@ fn dispatch_cluster(cli: &Cli, sub: &ClusterCommand, writer: &mut dyn std::io::W
 
 /// Handle the result of command dispatch.
 fn handle_result(result: Result<(), ForgeError>, format: &OutputFormat) -> std::process::ExitCode {
-    let Err(e) = result else {
+    let Err(err) = result else {
         return std::process::ExitCode::SUCCESS;
     };
-    report_error(&e, format);
+    report_error(&err, format);
     std::process::ExitCode::FAILURE
 }
 
@@ -179,16 +179,16 @@ fn error_format(cli: &Cli) -> OutputFormat {
 
 /// Print an error to stderr in the appropriate format.
 #[expect(clippy::print_stderr, reason = "CLI error reporting")]
-fn report_error(e: &ForgeError, format: &OutputFormat) {
+fn report_error(err: &ForgeError, format: &OutputFormat) {
     match format {
         OutputFormat::Json => {
-            let envelope = output::error(&e.to_string());
+            let envelope = output::error(&err.to_string());
             let json = serde_json::to_string_pretty(&envelope)
                 .unwrap_or_else(|_| r#"{"error":"serialization failed"}"#.to_owned());
             eprintln!("{json}");
         },
         OutputFormat::Text => {
-            eprintln!("error: {e}");
+            eprintln!("error: {err}");
         },
     }
 }

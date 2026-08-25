@@ -520,9 +520,9 @@ fn phase_label(phase: &ProviderPhase) -> &'static str {
 /// `status.reason` is `None` (a healthy phase), this synthesizes one of two
 /// bounded labels from the phase alone, since [`AgentToolProviderStatus`]
 /// deliberately never sets `reason` while healthy.
-fn telemetry_reason_label<'a>(phase: &ProviderPhase, status_reason: Option<&'a str>) -> &'a str {
+fn telemetry_reason_label<'reason>(phase: &ProviderPhase, status_reason: Option<&'reason str>) -> &'reason str {
     match status_reason {
-        Some(r) => r,
+        Some(reason) => reason,
         None if *phase == ProviderPhase::Available => "SitesMatched",
         None => "AwaitingSiteMatch",
     }

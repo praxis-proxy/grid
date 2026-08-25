@@ -420,6 +420,7 @@ pub(crate) fn check_resolved_addrs(addrs: &[SocketAddr]) -> bool {
 /// produces. Returns `None` for any error shape that isn't HTTP-status-like
 /// (deserialize errors, closed transports, etc.) — callers treat `None` as
 /// "no distinguishing status observed" via [`classify_list_tools_failure`].
+#[expect(clippy::wildcard_enum_match_arm, reason = "external type with many variants")]
 pub(crate) fn observed_status_from_service_error(error: &rmcp::ServiceError) -> Option<u16> {
     let rmcp::ServiceError::TransportSend(dyn_err) = error else {
         return None;
@@ -697,9 +698,9 @@ async fn attach_tls_client_identity(
 /// `too_many_arguments` lint — `kube_client` stays a separate parameter
 /// since callers already hold it as a long-lived `&kube::Client` distinct
 /// from this per-attempt request data.
-pub(crate) struct ProbeRequest<'a> {
+pub(crate) struct ProbeRequest<'request> {
     /// `spec.endpoint` — the MCP server's HTTP(S) URL.
-    pub(crate) endpoint: &'a str,
+    pub(crate) endpoint: &'request str,
     /// Total wall-clock budget for the whole probe: DNS resolution, TLS
     /// Secret material reads, connect/handshake, and the `tools/list` call
     /// combined. Enforced by a single outer `tokio::time::timeout` in
@@ -709,11 +710,11 @@ pub(crate) struct ProbeRequest<'a> {
     pub(crate) timeout: Duration,
     /// `spec.tls`, when the probe should use a custom CA/client identity
     /// instead of the platform trust store.
-    pub(crate) tls_config: Option<&'a EndpointTlsConfig>,
+    pub(crate) tls_config: Option<&'request EndpointTlsConfig>,
     /// The `AgentToolProvider`'s name, for log/tracing attribution only.
-    pub(crate) provider_identity: &'a str,
+    pub(crate) provider_identity: &'request str,
     /// The resolved bearer token from `spec.auth`, when configured.
-    pub(crate) auth_token: Option<&'a BearerToken>,
+    pub(crate) auth_token: Option<&'request BearerToken>,
 }
 
 /// Run a live MCP `tools/list` probe against `request.endpoint`.
@@ -826,7 +827,7 @@ async fn run_probe_session(
 #[allow(clippy::unwrap_used, clippy::expect_used, reason = "tests")]
 mod tests {
     use super::*;
-    use crate::{crd::inference_provider::ProviderPhase, resources::credentials::BearerToken};
+    use crate::crd::inference_provider::ProviderPhase;
 
     // -----------------------------------------------------------------------
     // phase_and_reason_from_probe
@@ -1555,21 +1556,16 @@ mod tests {
         );
     }
 
-    /// Documents a pre-existing bug in the shared
+    /// Covers the fix landed for
+    /// <https://github.com/praxis-proxy/grid/issues/58>: the shared
     /// `resources::secret::read_secret_bytes`/`endpoint_tls::read_secret_bytes_for_tls`
     /// pipeline (used by `InferenceProvider`'s metrics/health-check TLS too,
-    /// not introduced by `AgentToolProvider`): `read_secret_bytes` returns
-    /// `Ok(None)` both when the Secret itself is missing *and* when the
-    /// Secret exists but lacks the requested key, so the two cases are
-    /// indistinguishable by the time `read_secret_bytes_for_tls` sees them —
-    /// `KeyMissing` is only reachable for a key present with an *empty*
-    /// value, never for a key absent entirely, despite `TlsFailureReason`'s
-    /// own doc comment claiming otherwise. Tracked in
-    /// <https://github.com/praxis-proxy/grid/issues/58> for a fix in the
-    /// shared code; this test locks in current (misleading) behavior so a
-    /// fix shows up as an intentional test change, not a silent regression.
+    /// not specific to `AgentToolProvider`) now distinguishes a Secret that
+    /// exists but lacks the requested key (`KeyMissing`) from a Secret that
+    /// does not exist at all (`SecretMissing`), rather than collapsing both
+    /// into the latter.
     #[tokio::test]
-    async fn read_tls_material_key_absent_from_data_currently_misreported_as_secret_missing() {
+    async fn read_tls_material_key_absent_from_data_yields_endpoint_tls_key_missing() {
         let client = mock_kube_client_with_secrets(HashMap::from([(
             "ca-secret",
             secret_with_key("wrong-key", b"ca-bytes"),
@@ -1577,9 +1573,9 @@ mod tests {
         let result = read_tls_material(&client, &test_secret_ref("ca-secret"), "ca.crt", "test-provider", "CA").await;
         assert_eq!(
             result,
-            Err(McpProbeOutcome::TlsConfigInvalid("EndpointTlsSecretMissing".to_owned())),
-            "known bug (grid#58): a key absent from an existing Secret's data is currently misreported as \
-             EndpointTlsSecretMissing rather than EndpointTlsKeyMissing"
+            Err(McpProbeOutcome::TlsConfigInvalid("EndpointTlsKeyMissing".to_owned())),
+            "a key absent from an existing Secret's data must surface as EndpointTlsKeyMissing, \
+             not EndpointTlsSecretMissing (grid#58)"
         );
     }
 
@@ -1590,8 +1586,8 @@ mod tests {
         assert_eq!(
             result,
             Err(McpProbeOutcome::TlsConfigInvalid("EndpointTlsKeyMissing".to_owned())),
-            "a key present in Secret.data with an empty value must surface as EndpointTlsKeyMissing \
-             (the only currently-reachable path to this reason — see grid#58)"
+            "a key present in Secret.data with an empty value must also surface as EndpointTlsKeyMissing, \
+             the same as a key absent entirely (grid#58)"
         );
     }
 

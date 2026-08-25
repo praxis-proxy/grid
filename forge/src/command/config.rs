@@ -149,7 +149,7 @@ fn report_init_success(config_path: &Path, format: &OutputFormat, writer: &mut d
 /// Returns [`ForgeError`] if the operation fails.
 pub fn run_schema(writer: &mut dyn Write) -> Result<(), ForgeError> {
     let schema = config::schema::generate();
-    let json = serde_json::to_string_pretty(&schema).map_err(|e| ForgeError::Config(e.to_string()))?;
+    let json = serde_json::to_string_pretty(&schema).map_err(|err| ForgeError::Config(err.to_string()))?;
     output::write_text(writer, &json)?;
     Ok(())
 }

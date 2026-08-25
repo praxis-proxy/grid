@@ -523,9 +523,8 @@ The trust bootstrap for a remote site progresses through these steps:
 
 5. **Identity-aware gateway probe passes** — the `GridSite` controller performs
    a bounded mTLS handshake. It verifies the CA chain, DNS SAN, client
-   authentication, canonical pin, and agreement with the SWIM-advertised leaf
-   certificate. Success promotes the site to `Active` with reason
-   `TlsVerified`.
+   authentication, and the canonical pin against the live leaf certificate.
+   Success promotes the site to `Active` with reason `TlsVerified`.
 
    ```yaml
    spec:
@@ -594,7 +593,7 @@ The `GridSite` controller verifies gateway reachability and identity against
 |-----------|---------------|
 | `SWIMReachable` | SWIM membership reports the peer Alive |
 | `GatewayAddressKnown` | `spec.egress.address` is non-empty |
-| `TlsVerified` | Mutual TLS handshake, chain, SAN, pin, and advertised leaf all verify |
+| `TlsVerified` | Mutual TLS handshake, chain, SAN, and live-leaf pin all verify |
 | `IdentityVerificationRequired` | Plaintext endpoint accepts TCP, but remains ineligible because its identity is not verified |
 
 Request-time authorization remains enforced by the provider gateway after the
@@ -870,10 +869,14 @@ arbitrary or ambiguous advertised strings do not become routable endpoints.
 
 **Probe behavior:** In Mutual mode, the `GridSite` controller performs a bounded
 mTLS connection to `spec.egress.address`. It verifies the configured CA,
-`serverName`, canonical live-certificate pin, and that any SWIM-advertised
-certificate matches one of the configured rotation pins. A successful probe
-reports `reason: TlsVerified`. Connection failures move an Active site to
-`Unreachable`; identity or trust failures move it to `Connecting`.
+`serverName`, and the canonical live-certificate pin. A successful probe reports
+`reason: TlsVerified`. Connection failures move an Active site to `Unreachable`;
+identity or trust failures move it to `Connecting`.
+
+A SWIM-advertised certificate that does not match a configured pin is recorded
+as `reason: AdvertisedCertMismatch` and does not change the phase: it arrives
+over gossip and is not trust material. Trust comes from the handshake above,
+where a pin mismatch on the live leaf is `PinMismatch` and still demotes.
 
 Explicit `Plaintext` mode performs only a bounded TCP connection for
 diagnostics. It never promotes a site to `Active` and is never selected as a
@@ -943,8 +946,8 @@ separate steps.
     configured CA/server name.
   - `PinMismatch`: the live leaf certificate does not match either configured
     canonical pin.
-  - `AdvertisedCertMismatch`: wait for certificate gossip to converge or
-    investigate an unexpected live gateway identity.
+  - `AdvertisedCertMismatch`: the gossiped certificate copy does not match a
+    configured pin. Diagnostic, the site stays Active.
   - `HandshakeTimeout` or `TlsProtocolError`: the TCP endpoint answered but did
     not complete the expected TLS protocol.
 

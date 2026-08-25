@@ -500,7 +500,8 @@ pub enum StepSpec {
 ///
 /// Returns [`ForgeError`] if the file cannot be read or parsed.
 pub fn load(path: &Path) -> Result<ForgeConfig, ForgeError> {
-    let content = std::fs::read_to_string(path).map_err(|e| ForgeError::Config(format!("{}: {e}", path.display())))?;
+    let content =
+        std::fs::read_to_string(path).map_err(|err| ForgeError::Config(format!("{}: {err}", path.display())))?;
     let config: ForgeConfig = serde_yaml::from_str(&content)?;
     Ok(config)
 }

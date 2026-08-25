@@ -82,7 +82,7 @@ fn validate_dns_label_rules(name: &str, context: &str) -> Result<(), ForgeError>
 fn check_dns_label_chars(name: &str, context: &str) -> Result<(), ForgeError> {
     let valid = name
         .bytes()
-        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');
     if !valid {
         return Err(ForgeError::Validation(format!(
             "{context}: {name:?} contains invalid characters \
@@ -126,7 +126,7 @@ fn check_docker_name(name: &str, context: &str) -> Result<(), ForgeError> {
     }
     let valid = name
         .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.');
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_' || byte == b'.');
     if !valid {
         return Err(ForgeError::Validation(format!(
             "{context}: {name:?} contains characters unsafe for Docker/Podman"
@@ -206,7 +206,7 @@ fn check_service_ports(svc: &ServiceSpec) -> Result<(), ForgeError> {
     for port in &svc.ports {
         check_port_nonzero(port.host, &svc.name, "host")?;
         check_port_nonzero(port.container, &svc.name, "container")?;
-        check_port_bind_address(&port.bind_address, &svc.name)?;
+        check_port_bind_address(port.bind_address.as_ref(), &svc.name)?;
         check_port_protocol_tcp(&port.protocol, &svc.name)?;
     }
     Ok(())
@@ -223,8 +223,8 @@ fn check_port_nonzero(port: u16, svc_name: &str, field: &str) -> Result<(), Forg
 }
 
 /// Validate an optional bind address as a valid IP.
-fn check_port_bind_address(addr: &Option<String>, svc_name: &str) -> Result<(), ForgeError> {
-    if let Some(addr) = addr.as_ref().filter(|a| a.parse::<std::net::IpAddr>().is_err()) {
+fn check_port_bind_address(addr: Option<&String>, svc_name: &str) -> Result<(), ForgeError> {
+    if let Some(addr) = addr.filter(|val| val.parse::<std::net::IpAddr>().is_err()) {
         return Err(ForgeError::Validation(format!(
             "service {svc_name:?}: bind address {addr:?} is not a valid IP"
         )));
@@ -305,7 +305,7 @@ fn is_shell_safe_ident(key: &str) -> bool {
     if !first.is_ascii_alphabetic() && first != '_' {
         return false;
     }
-    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
 }
 
 /// Validate container argument count and individual length.
@@ -359,7 +359,11 @@ fn check_health_port_is_reachable(svc: &ServiceSpec, hc: &HealthCheck) -> Result
     if matches!(svc.network, NetworkMode::Host) {
         return Ok(());
     }
-    if svc.ports.iter().any(|p| p.container == hc.port && p.protocol == "tcp") {
+    if svc
+        .ports
+        .iter()
+        .any(|pm| pm.container == hc.port && pm.protocol == "tcp")
+    {
         return Ok(());
     }
     Err(ForgeError::Validation(format!(
@@ -394,7 +398,7 @@ fn check_positive_integer(value: &str, context: &str) -> Result<(), ForgeError> 
 
 /// Validate that all service dependency references are valid.
 fn check_service_deps(config: &ForgeConfig) -> Result<(), ForgeError> {
-    let names: BTreeSet<&str> = config.spec.services.iter().map(|s| s.name.as_str()).collect();
+    let names: BTreeSet<&str> = config.spec.services.iter().map(|svc| svc.name.as_str()).collect();
     for svc in &config.spec.services {
         for dep in &svc.depends_on {
             check_single_dep(&svc.name, dep, &names)?;
@@ -448,7 +452,11 @@ fn check_service_dep_cycles(config: &ForgeConfig) -> Result<(), ForgeError> {
 
 /// Map each service name to its index in the services list.
 fn build_svc_name_index(services: &[ServiceSpec]) -> BTreeMap<&str, usize> {
-    services.iter().enumerate().map(|(i, s)| (s.name.as_str(), i)).collect()
+    services
+        .iter()
+        .enumerate()
+        .map(|(idx, svc)| (svc.name.as_str(), idx))
+        .collect()
 }
 
 /// Build adjacency list from dependency edges.
@@ -479,8 +487,8 @@ fn compute_in_degrees(count: usize, adj: &[Vec<usize>]) -> Vec<usize> {
     let mut in_deg: Vec<usize> = vec![0; count];
     for edges in adj {
         for &to in edges {
-            if let Some(d) = in_deg.get_mut(to) {
-                *d = d.saturating_add(1);
+            if let Some(deg) = in_deg.get_mut(to) {
+                *deg = deg.saturating_add(1);
             }
         }
     }
@@ -492,17 +500,17 @@ fn kahn_bfs(in_deg: &mut [usize], adj: &[Vec<usize>]) -> usize {
     let mut queue: VecDeque<usize> = in_deg
         .iter()
         .enumerate()
-        .filter(|&(_, &d)| d == 0)
-        .map(|(i, _)| i)
+        .filter(|&(_, &deg)| deg == 0)
+        .map(|(idx, _)| idx)
         .collect();
     let mut visited: usize = 0;
     while let Some(node) = queue.pop_front() {
         visited = visited.saturating_add(1);
         if let Some(edges) = adj.get(node) {
             for &to in edges {
-                if let Some(d) = in_deg.get_mut(to) {
-                    *d = d.saturating_sub(1);
-                    if *d == 0 {
+                if let Some(deg) = in_deg.get_mut(to) {
+                    *deg = deg.saturating_sub(1);
+                    if *deg == 0 {
                         queue.push_back(to);
                     }
                 }
@@ -557,10 +565,7 @@ fn check_step(stack_name: &str, step: &StepSpec) -> Result<(), ForgeError> {
         },
         StepSpec::Helm { .. } => check_helm_step(stack_name, step),
         StepSpec::Deployment {
-            name,
-            image,
-            namespace,
-            args: _,
+            name, image, namespace, ..
         } => check_named_workload_step(stack_name, "deployment", name, image, namespace.as_deref()),
         StepSpec::Service { name, port, namespace } => {
             check_service_step(stack_name, name, *port, namespace.as_deref())
@@ -644,8 +649,8 @@ fn check_upstream_value(value: &str, stack_name: &str) -> Result<(), ForgeError>
         return Err(ForgeError::Validation(format!("{ctx}: exceeds 253 characters")));
     }
     let (host, port) = split_upstream_host_port(value);
-    if let Some(p) = port {
-        check_upstream_port(p, &ctx)?;
+    if let Some(port_str) = port {
+        check_upstream_port(port_str, &ctx)?;
     }
     check_upstream_host(host, &ctx)
 }
@@ -654,7 +659,7 @@ fn check_upstream_value(value: &str, stack_name: &str) -> Result<(), ForgeError>
 fn split_upstream_host_port(value: &str) -> (&str, Option<&str>) {
     if let Some(pos) = value.rfind(':') {
         let after = value.get(pos.saturating_add(1)..).unwrap_or("");
-        if !after.is_empty() && after.bytes().all(|b| b.is_ascii_digit()) {
+        if !after.is_empty() && after.bytes().all(|byte| byte.is_ascii_digit()) {
             return (value.get(..pos).unwrap_or(""), Some(after));
         }
     }
@@ -679,7 +684,7 @@ fn check_upstream_host(host: &str, ctx: &str) -> Result<(), ForgeError> {
     if host.is_empty() {
         return Err(ForgeError::Validation(format!("{ctx}: empty host")));
     }
-    if host.bytes().next().is_some_and(|b| b.is_ascii_digit()) {
+    if host.bytes().next().is_some_and(|byte| byte.is_ascii_digit()) {
         return check_upstream_ipv4(host, ctx);
     }
     check_upstream_dns_name(host, ctx)
@@ -719,7 +724,7 @@ fn check_sha256(value: &str, context: &str) -> Result<(), ForgeError> {
     if is_full_field_template(value) {
         return Ok(());
     }
-    if value.len() != 64 || !value.bytes().all(|b| b.is_ascii_hexdigit()) {
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(ForgeError::Validation(format!(
             "{context}: expected a 64-character SHA-256 hex digest"
         )));
@@ -883,7 +888,7 @@ fn check_cluster_stack_refs(config: &ForgeConfig) -> Result<(), ForgeError> {
 fn check_no_templates(config: &ForgeConfig) -> Result<(), ForgeError> {
     let mut sanitized = config.clone();
     sanitized.spec.stacks.clear();
-    let yaml = serde_yaml::to_string(&sanitized).map_err(|e| ForgeError::Validation(e.to_string()))?;
+    let yaml = serde_yaml::to_string(&sanitized).map_err(|err| ForgeError::Validation(err.to_string()))?;
     if yaml.contains("{{") && yaml.contains("}}") {
         return Err(ForgeError::Validation(
             "template syntax ({{ ... }}) is not supported outside \
@@ -909,7 +914,7 @@ fn validate_dns_zone_rules(zone: &str) -> Result<(), ForgeError> {
     }
     if !zone
         .bytes()
-        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'.')
+        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-' || byte == b'.')
     {
         return Err(ForgeError::Validation(
             "dnsZone must contain only lowercase alphanumeric, hyphens, and dots".to_owned(),
@@ -964,13 +969,10 @@ fn check_cross_cluster_provider(config: &ForgeConfig) -> Result<(), ForgeError> 
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
     use super::*;
     use crate::config::{
-        API_VERSION, ClusterSpec, EnvironmentSpec, ForgeConfig, HealthCheck, HealthCheckType, KIND, Metadata,
-        NetworkConfig, NetworkMode, NodeConfig, PortMapping, RestartPolicy, RuntimeConfig, RuntimeProvider,
-        ServiceSpec, StackSpec, StepSpec, VolumeMount,
+        ClusterSpec, EnvironmentSpec, HealthCheckType, Metadata, NetworkConfig, NodeConfig, PortMapping, RestartPolicy,
+        RuntimeConfig, StackSpec, VolumeMount,
     };
 
     /// Build a minimal valid config for test modification.
@@ -1463,11 +1465,11 @@ spec:
     #[test]
     fn service_dependency_cycle_rejected() {
         let mut config = base_config();
-        let mut a = test_service("a");
-        a.depends_on = vec!["b".to_owned()];
-        let mut b = test_service("b");
-        b.depends_on = vec!["a".to_owned()];
-        config.spec.services = vec![a, b];
+        let mut svc_a = test_service("a");
+        svc_a.depends_on = vec!["b".to_owned()];
+        let mut svc_b = test_service("b");
+        svc_b.depends_on = vec!["a".to_owned()];
+        config.spec.services = vec![svc_a, svc_b];
         let Err(err) = validate(&config) else {
             std::process::abort();
         };
@@ -1892,7 +1894,7 @@ spec:
                     description: None,
                     steps: vec![StepSpec::CoreDnsForward {
                         zone: "forge.test".to_owned(),
-                        upstreams: upstreams.iter().map(|s| (*s).to_owned()).collect(),
+                        upstreams: upstreams.iter().map(|upstream| (*upstream).to_owned()).collect(),
                     }],
                 },
             );

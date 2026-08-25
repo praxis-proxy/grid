@@ -51,6 +51,10 @@ pub enum GenerateError {
 
 /// A generated CA certificate and key pair.
 #[derive(Debug)]
+#[expect(
+    clippy::partial_pub_fields,
+    reason = "cert_pem/key_pem are public API; params/key_pair are internal for signing"
+)]
 pub struct CaCert {
     /// PEM-encoded CA certificate.
     pub cert_pem: String,
@@ -156,6 +160,10 @@ pub fn generate_dns_cert(ca: &CaCert, common_name: &str, dns_name: &str) -> Resu
 /// # Errors
 ///
 /// Returns [`GenerateError`] if certificate generation fails.
+#[expect(
+    clippy::arithmetic_side_effects,
+    reason = "now +/- 1-2 days cannot overflow OffsetDateTime"
+)]
 pub fn generate_expired_dns_cert(
     ca: &CaCert,
     common_name: &str,
@@ -179,6 +187,10 @@ pub fn generate_expired_dns_cert(
 /// # Errors
 ///
 /// Returns [`GenerateError`] if certificate generation fails.
+#[expect(
+    clippy::arithmetic_side_effects,
+    reason = "now +/- 1-2 days cannot overflow OffsetDateTime"
+)]
 pub fn generate_not_yet_valid_dns_cert(
     ca: &CaCert,
     common_name: &str,
@@ -419,10 +431,10 @@ mod tests {
     #[test]
     fn different_sites_get_different_keys() {
         let ca = generate_ca("Test CA").unwrap_or_else(|_| std::process::abort());
-        let a = generate_site_cert(&ca, "cluster-a").unwrap_or_else(|_| std::process::abort());
-        let b = generate_site_cert(&ca, "cluster-b").unwrap_or_else(|_| std::process::abort());
-        assert_ne!(a.key_pem, b.key_pem, "sites should have different keys");
-        assert_ne!(a.cert_pem, b.cert_pem, "sites should have different certs");
+        let site_a = generate_site_cert(&ca, "cluster-a").unwrap_or_else(|_| std::process::abort());
+        let site_b = generate_site_cert(&ca, "cluster-b").unwrap_or_else(|_| std::process::abort());
+        assert_ne!(site_a.key_pem, site_b.key_pem, "sites should have different keys");
+        assert_ne!(site_a.cert_pem, site_b.cert_pem, "sites should have different certs");
     }
 
     #[test]

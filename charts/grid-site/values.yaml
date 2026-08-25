@@ -6,6 +6,18 @@ gridNetwork:
   swim: {}
   tls: {}
   gatewayRefs: []
+  # New chart installations fail closed on missing metrics and stabilize
+  # pressure admission. Omit this block only for legacy instantaneous mode.
+  admissionPolicy:
+    mode: stabilized
+    pressure:
+      enterThreshold: 0.85
+      exitThreshold: 0.70
+      failureThreshold: 2
+      successThreshold: 3
+      minimumStateDuration: 10s
+      recoveryHoldDown: 30s
+    missingMetrics: existingOnly
 
 gridSite:
   name: ""

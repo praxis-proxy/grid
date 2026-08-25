@@ -107,21 +107,21 @@ pub(crate) async fn read_secret_bytes_for_tls(
     provider_identity: &str,
     material_desc: &str,
 ) -> Result<Vec<u8>, (TlsFailureReason, String)> {
-    use crate::resources::secret::read_secret_bytes;
+    use crate::resources::secret::{SecretKeyLookup, read_secret_bytes};
 
     match read_secret_bytes(client, secret_ref, key_name).await {
-        Ok(Some(bytes)) if !bytes.is_empty() => Ok(bytes),
-        Ok(Some(_)) => Err((
+        Ok(SecretKeyLookup::Found(bytes)) => Ok(bytes),
+        Ok(SecretKeyLookup::KeyMissing) => Err((
             TlsFailureReason::KeyMissing,
             format!(
-                "{material_desc} key {key_name:?} in Secret {}/{} is empty for provider {provider_identity}",
+                "{material_desc} key {key_name:?} in Secret {}/{} is absent or empty for provider {provider_identity}",
                 secret_ref.namespace, secret_ref.name
             ),
         )),
-        Ok(None) => Err((
+        Ok(SecretKeyLookup::SecretMissing) => Err((
             TlsFailureReason::SecretMissing,
             format!(
-                "{material_desc} Secret {}/{} or key {key_name:?} not found for provider {provider_identity}",
+                "{material_desc} Secret {}/{} not found for provider {provider_identity}",
                 secret_ref.namespace, secret_ref.name
             ),
         )),
@@ -214,16 +214,6 @@ pub(crate) async fn resolve_tls_config(
 // TLS validation
 // ---------------------------------------------------------------------------
 
-/// Result of reading a TLS Secret key for validation.
-enum TlsSecretCheck {
-    /// The key was found and contains non-empty bytes.
-    Ok(Vec<u8>),
-    /// The Secret does not exist or has no `data` section.
-    SecretMissing,
-    /// The expected key is absent or its value is empty.
-    KeyMissing,
-}
-
 /// Verify that TLS Secrets exist, contain the expected keys, and the PEM
 /// material can be assembled into a valid [`rustls::ClientConfig`].
 ///
@@ -246,7 +236,6 @@ enum TlsSecretCheck {
 ///
 /// [`OperatorError`]: crate::error::OperatorError
 #[expect(
-    clippy::too_many_lines,
     clippy::large_stack_frames,
     reason = "sequential Secret reads for CA, client cert, and client key with match arms"
 )]
@@ -260,22 +249,19 @@ pub(crate) async fn verify_tls_accessible(
 
     let ca_key = tls.ca_secret_ref.key.as_deref().unwrap_or("ca.crt");
     let ca_pem = match read_tls_secret_for_verify(client, &tls.ca_secret_ref, ca_key).await? {
-        TlsSecretCheck::Ok(bytes) => bytes,
-        TlsSecretCheck::SecretMissing => return Ok(Some(TlsFailureReason::SecretMissing)),
-        TlsSecretCheck::KeyMissing => return Ok(Some(TlsFailureReason::KeyMissing)),
+        Ok(bytes) => bytes,
+        Err(reason) => return Ok(Some(reason)),
     };
 
     let (client_cert_pem, client_key_pem) = if let Some(client_ref) = &tls.client_certificate_secret_ref {
         let sref = secret_ref_from_client_cert(client_ref);
         let cert = match read_tls_secret_for_verify(client, &sref, &client_ref.certificate_key).await? {
-            TlsSecretCheck::Ok(bytes) => bytes,
-            TlsSecretCheck::SecretMissing => return Ok(Some(TlsFailureReason::SecretMissing)),
-            TlsSecretCheck::KeyMissing => return Ok(Some(TlsFailureReason::KeyMissing)),
+            Ok(bytes) => bytes,
+            Err(reason) => return Ok(Some(reason)),
         };
         let key = match read_tls_secret_for_verify(client, &sref, &client_ref.private_key_key).await? {
-            TlsSecretCheck::Ok(bytes) => bytes,
-            TlsSecretCheck::SecretMissing => return Ok(Some(TlsFailureReason::SecretMissing)),
-            TlsSecretCheck::KeyMissing => return Ok(Some(TlsFailureReason::KeyMissing)),
+            Ok(bytes) => bytes,
+            Err(reason) => return Ok(Some(reason)),
         };
         (Some(cert), Some(key))
     } else {
@@ -294,8 +280,11 @@ pub(crate) async fn verify_tls_accessible(
 
 /// Read raw bytes from a Kubernetes Secret for TLS validation.
 ///
-/// Distinguishes between "Secret not found" and "key not found" to map to
-/// the correct [`TlsFailureReason`] variant.
+/// Thin wrapper over [`read_secret_bytes`](crate::resources::secret::read_secret_bytes)
+/// that maps its
+/// [`SecretKeyLookup`](crate::resources::secret::SecretKeyLookup) result
+/// onto the [`TlsFailureReason`] this module's callers expect, so "Secret
+/// not found" and "key not found" map to the correct variant.
 ///
 /// # Errors
 ///
@@ -306,21 +295,14 @@ async fn read_tls_secret_for_verify(
     client: &kube::Client,
     secret_ref: &crate::crd::grid_network::SecretRef,
     key_name: &str,
-) -> Result<TlsSecretCheck, crate::error::OperatorError> {
-    let api: kube::Api<k8s_openapi::api::core::v1::Secret> =
-        kube::Api::namespaced(client.clone(), &secret_ref.namespace);
-    let Some(secret) = api.get_opt(&secret_ref.name).await? else {
-        return Ok(TlsSecretCheck::SecretMissing);
-    };
-    let Some(data) = &secret.data else {
-        // The Secret exists but has no `data` section — treat it the same
-        // as a missing Secret since there is nothing to read.
-        return Ok(TlsSecretCheck::SecretMissing);
-    };
-    match data.get(key_name) {
-        Some(bytes) if !bytes.0.is_empty() => Ok(TlsSecretCheck::Ok(bytes.0.clone())),
-        _ => Ok(TlsSecretCheck::KeyMissing),
-    }
+) -> Result<Result<Vec<u8>, TlsFailureReason>, crate::error::OperatorError> {
+    use crate::resources::secret::{SecretKeyLookup, read_secret_bytes};
+
+    Ok(match read_secret_bytes(client, secret_ref, key_name).await? {
+        SecretKeyLookup::Found(bytes) => Ok(bytes),
+        SecretKeyLookup::SecretMissing => Err(TlsFailureReason::SecretMissing),
+        SecretKeyLookup::KeyMissing => Err(TlsFailureReason::KeyMissing),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -331,7 +313,21 @@ async fn read_tls_secret_for_verify(
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(clippy::unwrap_used, clippy::expect_used, reason = "tests")]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
+    use crate::resources::test_doubles::{mock_kube_client_with_secrets, secret_with_key};
+
+    fn test_tls_config(ca_secret_name: &str) -> EndpointTlsConfig {
+        EndpointTlsConfig {
+            ca_secret_ref: crate::crd::grid_network::SecretRef {
+                name: ca_secret_name.to_owned(),
+                namespace: "default".to_owned(),
+                key: None,
+            },
+            client_certificate_secret_ref: None,
+        }
+    }
 
     // -----------------------------------------------------------------------
     // secret_ref_from_client_cert — field mapping
@@ -461,5 +457,63 @@ mod tests {
             TlsFailureReason::MaterialInvalid,
             "TLS configured without a kube client must return MaterialInvalid"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_tls_config / verify_tls_accessible — SecretMissing vs
+    // KeyMissing (grid#58), against a mocked Kubernetes API
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn resolve_tls_config_ca_secret_absent_yields_secret_missing() {
+        let client = mock_kube_client_with_secrets(HashMap::new());
+        let tls = test_tls_config("absent");
+        let (reason, _msg) = resolve_tls_config(Some(&tls), Some(&client), "test-provider")
+            .await
+            .unwrap_err();
+        assert_eq!(reason, TlsFailureReason::SecretMissing);
+    }
+
+    #[tokio::test]
+    async fn resolve_tls_config_ca_key_absent_from_existing_secret_yields_key_missing() {
+        let client =
+            mock_kube_client_with_secrets(HashMap::from([("ca-secret", secret_with_key("wrong-key", b"bytes"))]));
+        let tls = test_tls_config("ca-secret");
+        let (reason, _msg) = resolve_tls_config(Some(&tls), Some(&client), "test-provider")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            reason,
+            TlsFailureReason::KeyMissing,
+            "grid#58: a key absent from an existing Secret's data must be KeyMissing, not SecretMissing"
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_tls_accessible_ca_secret_absent_returns_secret_missing() {
+        let client = mock_kube_client_with_secrets(HashMap::new());
+        let tls = test_tls_config("absent");
+        let result = verify_tls_accessible(&client, Some(&tls)).await.expect("no API error");
+        assert_eq!(result, Some(TlsFailureReason::SecretMissing));
+    }
+
+    #[tokio::test]
+    async fn verify_tls_accessible_ca_key_absent_from_existing_secret_returns_key_missing() {
+        let client =
+            mock_kube_client_with_secrets(HashMap::from([("ca-secret", secret_with_key("wrong-key", b"bytes"))]));
+        let tls = test_tls_config("ca-secret");
+        let result = verify_tls_accessible(&client, Some(&tls)).await.expect("no API error");
+        assert_eq!(
+            result,
+            Some(TlsFailureReason::KeyMissing),
+            "grid#58: a key absent from an existing Secret's data must be KeyMissing, not SecretMissing"
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_tls_accessible_no_tls_config_returns_none() {
+        let client = mock_kube_client_with_secrets(HashMap::new());
+        let result = verify_tls_accessible(&client, None).await.expect("no API error");
+        assert!(result.is_none(), "no TLS configured must skip validation");
     }
 }

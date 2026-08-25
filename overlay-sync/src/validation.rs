@@ -351,7 +351,7 @@ mod tests {
         let raw = serde_json::to_vec(&env).unwrap();
         let scope = test_scope();
         let result = validate_envelope(&raw, &scope, 1_048_576, None);
-        assert!(result.is_ok());
+        result.unwrap();
     }
 
     #[test]

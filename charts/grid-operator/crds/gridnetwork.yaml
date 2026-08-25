@@ -34,6 +34,84 @@ spec:
                 Defines the grid's seed peers, gateway associations, SWIM
                 tuning, and TLS secret references.
               properties:
+                admissionPolicy:
+                  description: |-
+                    Provider admission and pressure-recovery policy.
+
+                    When omitted, Grid preserves the historical instantaneous admission
+                    behaviour and providers without metrics remain eligible. New
+                    stabilized deployments should set this explicitly so missing metrics
+                    fail closed according to `missingMetrics`.
+                  nullable: true
+                  properties:
+                    missingMetrics:
+                      default: existingOnly
+                      description: Fail-closed state for missing or expired metrics.
+                      enum:
+                        - existingOnly
+                        - excluded
+                      type: string
+                    mode:
+                      default: instantaneous
+                      description: Admission evaluation mode.
+                      enum:
+                        - instantaneous
+                        - stabilized
+                      type: string
+                    pressure:
+                      default:
+                        enterThreshold: 0.85
+                        exitThreshold: 0.7
+                        failureThreshold: 2
+                        minimumStateDuration: 10s
+                        recoveryHoldDown: 30s
+                        successThreshold: 3
+                      description: Pressure and recovery thresholds.
+                      properties:
+                        enterThreshold:
+                          description: Pressure level at which a provider is considered saturated.
+                          format: double
+                          maximum: 1.0
+                          minimum: 0.0
+                          type: number
+                        exitThreshold:
+                          description: Lower pressure level required before recovery can begin.
+                          format: double
+                          maximum: 1.0
+                          minimum: 0.0
+                          type: number
+                        failureThreshold:
+                          description: Consecutive pressure observations required to enter `existingOnly`.
+                          format: uint32
+                          maximum: 100.0
+                          minimum: 1.0
+                          type: integer
+                        minimumStateDuration:
+                          description: Minimum time a state must remain active before changing.
+                          pattern: ^[1-9][0-9]*s$
+                          type: string
+                        recoveryHoldDown:
+                          description: Additional time to hold a recovering provider in `existingOnly`.
+                          pattern: ^[1-9][0-9]*s$
+                          type: string
+                        successThreshold:
+                          description: Consecutive healthy observations required to recover new admission.
+                          format: uint32
+                          maximum: 100.0
+                          minimum: 1.0
+                          type: integer
+                      required:
+                        - enterThreshold
+                        - exitThreshold
+                        - failureThreshold
+                        - minimumStateDuration
+                        - recoveryHoldDown
+                        - successThreshold
+                      type: object
+                      x-kubernetes-validations:
+                        - message: exitThreshold must be less than enterThreshold
+                          rule: self.exitThreshold < self.enterThreshold
+                  type: object
                 budgetPolicy:
                   description: |-
                     Budget policy configuration for per-tenant spend tracking.

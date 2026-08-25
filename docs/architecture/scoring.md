@@ -209,8 +209,11 @@ seconds is not a substitute for request-time load balancing.
 
 - No request-specific prefix affinity at the Grid layer.
 - No independent remote metric sample timestamp yet.
-- No score-switch margin, dwell timer, or recovery hold-down.
-- Admission thresholds are point-in-time comparisons without hysteresis.
+- Stabilized admission is available through `spec.admissionPolicy`; it uses
+  bounded pressure/recovery counters and hold-down timers, while omitting the
+  field preserves instantaneous compatibility behavior.
+- Ranking still has no independent score-switch margin or dwell timer; that is
+  separate from provider admission and remains future work.
 - Queue normalization depends on a correct `queueCapacity`.
 - A network-wide metric strategy is appropriate only when competing providers
   expose comparable telemetry; use `noMetrics` for heterogeneous providers.

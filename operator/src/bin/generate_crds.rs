@@ -1,8 +1,7 @@
-#![allow(
+#![expect(
     clippy::print_stdout,
     clippy::print_stderr,
-    clippy::exit,
-    reason = "generate-crds is a CLI tool; printing and exit are intentional"
+    reason = "generate-crds is a CLI tool that prints to the terminal"
 )]
 //! Generate Grid operator CRD manifests as a JSON `List` for `kubectl apply`.
 //!
@@ -32,16 +31,16 @@ fn main() {
     ];
     let items: Vec<serde_json::Value> = crds
         .into_iter()
-        .map(|r| {
-            r.unwrap_or_else(|e| {
-                eprintln!("CRD serialization failed: {e}");
+        .map(|result| {
+            result.unwrap_or_else(|err| {
+                eprintln!("CRD serialization failed: {err}");
                 std::process::exit(1);
             })
         })
         .collect();
     let list = serde_json::json!({ "apiVersion": "v1", "kind": "List", "items": items });
-    let out = serde_json::to_string_pretty(&list).unwrap_or_else(|e| {
-        eprintln!("JSON serialization failed: {e}");
+    let out = serde_json::to_string_pretty(&list).unwrap_or_else(|err| {
+        eprintln!("JSON serialization failed: {err}");
         std::process::exit(1);
     });
     println!("{out}");

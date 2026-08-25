@@ -7,6 +7,13 @@
 //! writes the latest valid overlay to a shared `emptyDir` volume
 //! consumed by Praxis.
 
+#![expect(
+    clippy::arithmetic_side_effects,
+    clippy::as_conversions,
+    clippy::min_ident_chars,
+    reason = "overlay-sync uses short closure params and index arithmetic pervasively"
+)]
+
 mod atomic_file;
 mod metrics;
 mod status;

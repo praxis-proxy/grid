@@ -210,16 +210,16 @@ use std::io::Write;
 ### Additional Coding Conventions
 
 - **Separator comments** visually separate distinct
-  sections of code. Each separator line must be exactly
-  80 columns wide (indent + `// ` + dashes). Adjust the
-  dash count for the indentation level:
-  Top-level (77 dashes = 80 cols):
+  sections of code. Use exactly 77 dashes at the top
+  level. Adjust the dash count for the indentation
+  level to keep the total line at 80 columns:
+  Top-level (77 dashes):
   ```rust
-  // -----------------------------------------------------------------------------
+  // ---------------------------------------------------------------------------
   ```
-  Inside `mod tests` with 4-space indent (73 dashes = 80 cols):
+  Inside `mod tests` with 4-space indent (73 dashes):
   ```rust
-      // -------------------------------------------------------------------------
+      // -----------------------------------------------------------------------
   ```
   `cargo xtask lint-separators` enforces this.
 - **No re-export-only files.** If a file exists solely
@@ -246,19 +246,17 @@ use std::io::Write;
      separator)
 - **Attribute formatting on structs, enums, fields,
   and variants**:
-  - Place a blank line between each `#[...]` attribute
-    annotation.
   - Order items within `#[derive(...)]` alphabetically.
-  - Order parameters within `#[serde(...)]` alphabetically.
+  - Order parameters within `#[serde(...)]`
+    alphabetically.
 
   ```rust
   // Good:
   #[derive(Clone, Debug, Default, Deserialize, Serialize)]
-
   #[serde(default, deny_unknown_fields)]
   pub struct Foo {
 
-  // Bad (no blank lines, non-alphabetical):
+  // Bad (non-alphabetical):
   #[derive(Debug, Clone, Default, Serialize, Deserialize)]
   #[serde(deny_unknown_fields, default)]
   pub struct Foo {
@@ -273,6 +271,74 @@ use std::io::Write;
 
 See also [Type Design](type-design.md) for serde patterns
 and data modeling conventions.
+
+### Arithmetic Safety
+
+No unchecked arithmetic. The `arithmetic_side_effects`
+lint denies all operators (`+`, `-`, `*`, `/`, `%`,
+`<<`, `>>`) on integer types. Use
+`checked_`/`saturating_`/`wrapping_` methods:
+
+```rust
+// Bad - denied by arithmetic_side_effects:
+let total = a + b;
+
+// Good:
+let total = a.saturating_add(b);
+```
+
+Where overflow is provably impossible (e.g. adding
+small constants to bounded values), suppress with
+`#[expect(clippy::arithmetic_side_effects, reason)]`.
+
+### Exhaustive Matching
+
+Name every variant; do not use `_` arms over enums.
+The `wildcard_enum_match_arm` lint enforces this.
+Exhaustive matching ensures new variants produce
+compile errors at every match site, preventing
+silent bugs.
+
+### Deterministic Iteration
+
+Do not iterate over `HashMap` or `HashSet` when
+output order matters. The `iter_over_hash_type` lint
+catches this. Use `BTreeMap`/`BTreeSet` for
+deterministic ordering, or suppress with reason when
+order truly does not matter.
+
+### Module Organization
+
+Use `foo.rs` style, never `foo/mod.rs`. The
+`mod_module_files` lint enforces this. A module
+`cluster` with children should be:
+
+```text
+src/cluster.rs          (module root)
+src/cluster/kind.rs     (child module)
+src/cluster/config.rs   (child module)
+```
+
+### Naming Clarity
+
+- No single-character identifiers
+  (`min_ident_chars` lint). Use descriptive names
+  even in closures: `|backend|` not `|b|`,
+  `|err|` not `|e|`.
+- No single-character lifetime names
+  (`single_char_lifetime_names` lint). Use `'ctx`,
+  `'state`, `'input`, etc.
+- No `as` casts (`as_conversions` lint). Use
+  `From`/`TryFrom` or suppress with reason.
+
+### Visibility Design
+
+- No mixed pub/non-pub fields in the same struct
+  (`partial_pub_fields` lint). Either all fields are
+  public or all are private with accessor methods.
+  Suppress with reason when the design is intentional.
+- Use `Option<&T>` instead of `&Option<T>` in
+  function parameters (`ref_option` lint).
 
 ## Code Responsibility
 

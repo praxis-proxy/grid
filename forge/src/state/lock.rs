@@ -50,13 +50,13 @@ fn open_lock_file(path: &Path) -> Result<File, ForgeError> {
         .truncate(false)
         .write(true)
         .open(path)
-        .map_err(|e| ForgeError::Lock(format!("cannot open lock file {}: {e}", path.display())))
+        .map_err(|err| ForgeError::Lock(format!("cannot open lock file {}: {err}", path.display())))
 }
 
 /// Lock the file exclusively, blocking until acquired.
 fn lock_exclusive(file: &File) -> Result<(), ForgeError> {
     file.lock_exclusive()
-        .map_err(|e| ForgeError::Lock(format!("cannot acquire lock: {e}")))
+        .map_err(|err| ForgeError::Lock(format!("cannot acquire lock: {err}")))
 }
 
 #[cfg(test)]

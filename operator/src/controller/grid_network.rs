@@ -35,7 +35,7 @@ use crate::{
     error::OperatorError,
     resources::{
         consumer_config::{self, ConsumerConfigError},
-        overlay_envelope, provider_metrics, routing_overlay, secret,
+        overlay_envelope, provider_admission, provider_metrics, routing_overlay, secret,
         trust_bundle::{self, CertPemStatus},
     },
     swim::{MemberStatus, MembershipSnapshot},
@@ -53,6 +53,10 @@ use crate::{
 /// [`MembershipSnapshot`] to feed into `determine_phase` and
 /// `update_status`.  When `swim` is `None`, the controller falls back
 /// to its existing static phase logic.
+#[expect(
+    clippy::partial_pub_fields,
+    reason = "client and swim are public API; metrics_cache and last_seeds are crate-internal"
+)]
 pub struct OperatorCtx {
     /// Kubernetes API client.
     pub client: Client,
@@ -74,6 +78,12 @@ pub struct OperatorCtx {
     /// The cache is shared across concurrent reconcile invocations via the
     /// wrapping `Arc`; the inner [`Mutex`] ensures safe concurrent access.
     pub(crate) metrics_cache: Mutex<provider_metrics::MetricsCache>,
+
+    /// Stateful admission memory keyed by provider routing identity.
+    ///
+    /// Admission is evaluated in the control plane and the resulting wire
+    /// state is copied into the overlay. It is never consulted by a request.
+    pub(crate) admission_memory: Mutex<provider_admission::AdmissionMemory>,
 
     /// Tracks the seed set announced on the last reconcile per `GridNetwork`.
     ///
@@ -98,6 +108,7 @@ impl OperatorCtx {
             client,
             swim,
             metrics_cache: Mutex::new(provider_metrics::MetricsCache::new()),
+            admission_memory: Mutex::new(provider_admission::AdmissionMemory::default()),
             last_seeds: std::sync::Mutex::new(HashMap::new()),
         }
     }
@@ -250,7 +261,8 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
         // Broadcast the local site's public certificate PEM so remote peers can
         // populate GridSite.status.publicCertPem.  Only the public cert is read —
         // the private key (tls.key) is never accessed by this code path.
-        if let Ok(Some(cert_pem)) = secret::read_site_cert_pem(client, &network.spec.tls.site_secret_ref).await {
+        if let Ok(Some(cert_pem)) = secret::read_site_cert_pem(client, network.spec.tls.site_secret_ref.as_ref()).await
+        {
             let cert_broadcast = swim::StateBroadcast::new(
                 swim.site_name().to_owned(),
                 cert_broadcast_revision(),
@@ -267,9 +279,79 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
     // List providers once; share between routing overlay rendering and CRDT publishing.
     let providers = list_all_inference_providers(client).await?;
     let requeue_interval = requeue_interval_for_network(&network, &providers)?;
-    let raw_metrics =
-        provider_metrics::collect_provider_metrics(name, &providers, &ctx.metrics_cache, Instant::now(), Some(client))
-            .await;
+    let collected = provider_metrics::collect_provider_metrics_with_refresh_interval(
+        name,
+        &providers,
+        &ctx.metrics_cache,
+        Instant::now(),
+        requeue_interval,
+        Some(client),
+    )
+    .await;
+    let raw_metrics = collected.metrics;
+
+    let scoring_strategy = network
+        .spec
+        .scoring_policy
+        .as_ref()
+        .map_or(crate::crd::grid_network::ScoringStrategy::NoMetrics, |policy| {
+            policy.strategy
+        });
+    let admission_policy =
+        provider_admission::Policy::from_config(network.spec.admission_policy.as_ref(), scoring_strategy.into())
+            .map_err(OperatorError::InvalidResource)?;
+    let now = Instant::now();
+    let mut admission_states = HashMap::new();
+    let mut admission_keys = Vec::new();
+    {
+        let mut memory = ctx.admission_memory.lock().await;
+        for provider in providers
+            .iter()
+            .filter(|provider| provider.spec.grid_network_ref == name)
+        {
+            let Some(identity) = routing_overlay::routing_identity(provider) else {
+                continue;
+            };
+            let identity = identity.to_owned();
+            let memory_key = format!(
+                "{name}/{}/{}",
+                provider.metadata.uid.as_deref().map_or(identity.as_str(), |uid| uid),
+                identity
+            );
+            let signal_configured = match scoring_strategy {
+                crate::crd::grid_network::ScoringStrategy::QueueDepth => provider
+                    .spec
+                    .metrics_config
+                    .as_ref()
+                    .and_then(|config| config.signal_names.queue_depth.as_ref())
+                    .is_some(),
+                crate::crd::grid_network::ScoringStrategy::KvCachePressure => provider
+                    .spec
+                    .metrics_config
+                    .as_ref()
+                    .and_then(|config| config.signal_names.kv_cache_utilization.as_ref())
+                    .is_some(),
+                crate::crd::grid_network::ScoringStrategy::NoMetrics => false,
+            };
+            let observation = if signal_configured {
+                raw_metrics
+                    .get(&identity)
+                    .copied()
+                    .map_or(provider_admission::Observation::Missing, |metrics| {
+                        provider_admission::Observation::Fresh {
+                            revision: collected.generations.get(&identity).copied().unwrap_or(0),
+                            metrics,
+                        }
+                    })
+            } else {
+                provider_admission::Observation::NotConfigured
+            };
+            let state = memory.evaluate(&memory_key, observation, admission_policy, now);
+            admission_keys.push(memory_key);
+            admission_states.insert(identity, state);
+        }
+        memory.retain_network_keys(name, admission_keys.iter().cloned());
+    }
 
     let remote_crdt_providers: Vec<crdt::ProviderState> = ctx
         .swim
@@ -304,6 +386,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
         &remote_crdt_providers,
         &raw_metrics,
         &scoring_weights,
+        &admission_states,
     )
     .await?;
 
@@ -727,6 +810,7 @@ async fn reconcile_routing_overlay_inner(
     remote_crdt_providers: &[crdt::ProviderState],
     raw_metrics: &HashMap<String, scoring::BackendMetrics>,
     scoring_weights: &scoring::ScoringWeights,
+    admission_states: &HashMap<String, crate::resources::geography::AdmissionState>,
 ) -> Result<(Vec<ConsumerConfigStatus>, Vec<OverlayRevisionStatus>), OperatorError> {
     let network_name = grid_network_name(network)?;
 
@@ -770,7 +854,7 @@ async fn reconcile_routing_overlay_inner(
         }
 
         let timestamp = rfc3339_now();
-        let overlay = match routing_overlay::render_routing_overlay(
+        let overlay = match routing_overlay::render_routing_overlay_with_admission(
             network,
             &sites,
             providers,
@@ -779,6 +863,7 @@ async fn reconcile_routing_overlay_inner(
             metrics_arg,
             timestamp.as_deref(),
             scoring_weights,
+            Some(admission_states),
         ) {
             Ok(overlay) => overlay,
             Err(error) => {
@@ -914,7 +999,7 @@ async fn reconcile_routing_overlay_inner(
 }
 
 /// Find the last successfully distributed overlay status for a gateway.
-fn find_prior_overlay<'a>(network: &'a GridNetwork, gw_ref: &GatewayRef) -> Option<&'a OverlayRevisionStatus> {
+fn find_prior_overlay<'net>(network: &'net GridNetwork, gw_ref: &GatewayRef) -> Option<&'net OverlayRevisionStatus> {
     network.status.as_ref().and_then(|status| {
         status
             .overlay_status
@@ -1140,26 +1225,107 @@ fn render_overlay_for_gateway(
     })
 }
 
-/// True when `existing`'s revision annotation already matches `revision_hex`,
-/// meaning a re-apply of the overlay `ConfigMap` would be a no-op write.
+/// True when the existing overlay has the expected semantic content and scope.
 ///
-/// Pure/synchronous so it is fully unit-testable without a live Kubernetes
-/// API. Server-side apply still writes managedFields metadata (bumping
-/// resourceVersion and firing a watch event) even when applied content is
-/// byte-for-byte unchanged; combined with the apply being re-triggered by the
-/// very watch event it emits, applying unconditionally becomes an infinite
-/// reconcile hot-loop (see grid#42).
-fn configmap_up_to_date(existing: &ConfigMap, revision_hex: &str) -> bool {
-    existing
-        .metadata
-        .annotations
+/// Provenance and timestamps are intentionally ignored: they explain when and
+/// where an overlay was rendered, but do not change request routing. The
+/// semantic digest and parsed payload still protect against a corrupted or
+/// partially modified `ConfigMap` retaining an old revision annotation.
+fn overlay_configmap_matches(existing: &ConfigMap, desired: &ConfigMap, revision: &str) -> bool {
+    configmap_revision_matches(existing, desired, revision)
+        && overlay_envelope_payload_matches(existing, desired, revision)
+        && legacy_overlay_payload_matches(existing, desired, revision)
+}
+
+/// Check all content-addressed annotations before parsing the stored payload.
+fn configmap_revision_matches(existing: &ConfigMap, desired: &ConfigMap, revision: &str) -> bool {
+    let (Some(existing_annotations), Some(desired_annotations)) = (
+        existing.metadata.annotations.as_ref(),
+        desired.metadata.annotations.as_ref(),
+    ) else {
+        return false;
+    };
+    let annotation_matches = |key: &str| {
+        existing_annotations
+            .get(key)
+            .zip(desired_annotations.get(key))
+            .is_some_and(|(cm_existing, cm_desired)| cm_existing == cm_desired)
+    };
+
+    annotation_matches(overlay_envelope::ANNOTATION_SCHEMA_VERSION)
+        && annotation_matches(overlay_envelope::ANNOTATION_REVISION)
+        && annotation_matches(overlay_envelope::ANNOTATION_CONTENT_DIGEST)
+        && desired_annotations
+            .get(overlay_envelope::ANNOTATION_REVISION)
+            .is_some_and(|value| value == revision)
+        && desired_annotations
+            .get(overlay_envelope::ANNOTATION_CONTENT_DIGEST)
+            .is_some_and(|value| value == revision)
+}
+
+/// Parse the content-addressed envelope stored in a routing `ConfigMap`.
+fn overlay_envelope_from_configmap(configmap: &ConfigMap) -> Option<overlay_envelope::OverlayEnvelope> {
+    configmap
+        .data
         .as_ref()
-        .and_then(|a| a.get(overlay_envelope::ANNOTATION_REVISION))
-        .is_some_and(|rev| rev == revision_hex)
+        .and_then(|data| data.get(overlay_envelope::ENVELOPE_KEY))
+        .and_then(|payload| serde_json::from_str(payload).ok())
+}
+
+/// Parse the compatibility routing payload stored in a routing `ConfigMap`.
+fn routing_overlay_from_configmap(configmap: &ConfigMap) -> Option<routing_overlay::RoutingOverlay> {
+    configmap
+        .data
+        .as_ref()
+        .and_then(|data| data.get("routing-config.json"))
+        .and_then(|payload| serde_json::from_str(payload).ok())
+}
+
+/// Validate the semantic envelope and its gateway scope.
+fn overlay_envelope_payload_matches(existing: &ConfigMap, desired: &ConfigMap, revision: &str) -> bool {
+    let (Some(existing_envelope), Some(desired_envelope)) = (
+        overlay_envelope_from_configmap(existing),
+        overlay_envelope_from_configmap(desired),
+    ) else {
+        return false;
+    };
+
+    existing_envelope.schema_version == desired_envelope.schema_version
+        && existing_envelope.revision.kind == desired_envelope.revision.kind
+        && existing_envelope.revision.algorithm == desired_envelope.revision.algorithm
+        && existing_envelope.content_digest.algorithm == desired_envelope.content_digest.algorithm
+        && existing_envelope.revision.value == revision
+        && existing_envelope.content_digest.value == revision
+        && existing_envelope.scope.network == desired_envelope.scope.network
+        && existing_envelope.scope.gateway == desired_envelope.scope.gateway
+        && existing_envelope.scope.namespace == desired_envelope.scope.namespace
+        && existing_envelope.scope.local_site == desired_envelope.scope.local_site
+        && overlay_envelope::compute_semantic_digest(&existing_envelope.overlay)
+            .ok()
+            .as_deref()
+            == Some(revision)
+}
+
+/// Validate the compatibility routing payload and its semantic digest.
+fn legacy_overlay_payload_matches(existing: &ConfigMap, desired: &ConfigMap, revision: &str) -> bool {
+    let (Some(existing_overlay), Some(desired_overlay)) = (
+        routing_overlay_from_configmap(existing),
+        routing_overlay_from_configmap(desired),
+    ) else {
+        return false;
+    };
+
+    existing_overlay.network == desired_overlay.network
+        && existing_overlay.local_site == desired_overlay.local_site
+        && overlay_envelope::compute_semantic_digest(&existing_overlay)
+            .ok()
+            .as_deref()
+            == Some(revision)
 }
 
 /// Server-side apply a pre-rendered overlay `ConfigMap` for a single gateway,
-/// skipping the apply when [`configmap_up_to_date`] says it would be a no-op.
+/// skipping the apply when [`overlay_configmap_matches`] says it would be a
+/// no-op.
 ///
 /// Returns the Kubernetes `resourceVersion` of the (applied or pre-existing)
 /// `ConfigMap`.
@@ -1190,7 +1356,7 @@ async fn distribute_overlay_configmap(
     let api: Api<ConfigMap> = Api::namespaced(client.clone(), &gw_ref.namespace);
 
     if let Ok(existing) = api.get(&render.config_map_name).await
-        && configmap_up_to_date(&existing, &render.revision_hex)
+        && overlay_configmap_matches(&existing, &cm, &render.revision_hex)
     {
         tracing::debug!(
             cm_name = %render.config_map_name,
@@ -1264,12 +1430,30 @@ fn determine_phase(network: &GridNetwork, grid_id: &str, membership: Option<&Mem
     {
         return hint;
     }
-    // Existing static phase logic (no live membership yet).
+    // No live phase hint. `phase_hint` returns `Some` only when at least one
+    // Alive/Degraded peer exists, so we reach here when the network has no peers
+    // yet — either the SWIM runtime is not up (`membership` is `None`) or it is
+    // up but no peers have joined (`Some`, empty snapshot).
     let has_tls = network.spec.tls.ca_secret_ref.is_some();
-    if has_tls {
-        GridNetworkPhase::Initializing
+    if !has_tls {
+        return GridNetworkPhase::Pending;
+    }
+    // A single-site / combined deployment legitimately has zero SWIM peers —
+    // peers are other *sites*, not intra-site gateways or pods. When no seeds
+    // are configured, this network is standalone, so a running SWIM runtime
+    // (`membership.is_some()`) with TLS trust material is a locally operational
+    // control plane and reports `Active` instead of pinning `Initializing`
+    // forever. Peer connectivity is reported separately via
+    // `status.connectedSites`.
+    //
+    // When seeds ARE configured the network expects peers, so a peerless
+    // snapshot stays `Initializing` until at least one peer is observed (handled
+    // by `phase_hint` above). `membership.is_none()` means the SWIM runtime is
+    // not up yet, which also stays `Initializing`.
+    if membership.is_some() && network.spec.seeds.is_empty() {
+        GridNetworkPhase::Active
     } else {
-        GridNetworkPhase::Pending
+        GridNetworkPhase::Initializing
     }
 }
 
@@ -1651,7 +1835,12 @@ pub(crate) fn consumer_config_status_error(
         OperatorError::ConsumerConfigRender(ConsumerConfigError::PlaintextWithSni { .. }) => "PlaintextWithSni",
         OperatorError::ConsumerConfigRender(_) => "ConsumerConfigRenderFailed",
         OperatorError::Kube(_) => "ConsumerConfigApplyFailed",
-        _ => "ConsumerConfigError",
+        OperatorError::Certificate(_)
+        | OperatorError::Json(_)
+        | OperatorError::NotFound(_)
+        | OperatorError::OverlayRender(_)
+        | OperatorError::SwimKeyConfig(_)
+        | OperatorError::InvalidResource(_) => "ConsumerConfigError",
     };
     ConsumerConfigStatus {
         gateway_name: gw_ref.name.clone(),
@@ -1699,11 +1888,11 @@ fn network_site_name(network: &GridNetwork) -> String {
 /// `Active`, or a `GridSite` in a different network are excluded.  This is the
 /// fail-closed contract: a SWIM-discovered site must not become routable solely
 /// because it gossiped.
-pub(crate) fn filter_eligible_remote_crdt_providers<'a>(
+pub(crate) fn filter_eligible_remote_crdt_providers<'ctx>(
     network_name: &str,
     sites: &[GridSite],
-    remote_providers: &'a [crdt::ProviderState],
-) -> Vec<&'a crdt::ProviderState> {
+    remote_providers: &'ctx [crdt::ProviderState],
+) -> Vec<&'ctx crdt::ProviderState> {
     remote_providers
         .iter()
         .filter(|p| is_crdt_provider_routing_eligible(network_name, sites, p))
@@ -1899,13 +2088,13 @@ enum CertPemWrite {
 ///
 /// Never itself touches the Kubernetes API — see [`CertPemWrite`].
 fn decide_cert_pem_write(
-    existing_status: &Option<GridSiteStatus>,
+    existing_status: Option<&GridSiteStatus>,
     cert_pem: &str,
     check: &CertPemStatus,
 ) -> CertPemWrite {
     match check {
         CertPemStatus::ValidStructure => {
-            if existing_status.as_ref().and_then(|s| s.public_cert_pem.as_deref()) == Some(cert_pem) {
+            if existing_status.and_then(|s| s.public_cert_pem.as_deref()) == Some(cert_pem) {
                 CertPemWrite::NoOp
             } else {
                 CertPemWrite::StoreValid
@@ -1922,7 +2111,7 @@ fn decide_cert_pem_write(
 /// Shared decision logic for the three invalid-cert-PEM outcomes: skip when
 /// `existing_status` already records this exact `message`, otherwise reject.
 fn decide_reject_invalid(
-    existing_status: &Option<GridSiteStatus>,
+    existing_status: Option<&GridSiteStatus>,
     message: &'static str,
     security_violation: bool,
 ) -> CertPemWrite {
@@ -1939,8 +2128,8 @@ fn decide_reject_invalid(
 /// True when `existing` already records the given invalid-cert `message` with
 /// no stored `publicCertPem`, meaning a re-patch with the same content would
 /// be a redundant write.
-fn already_recorded_invalid(existing: &Option<GridSiteStatus>, message: &str) -> bool {
-    existing.as_ref().is_some_and(|s| {
+fn already_recorded_invalid(existing: Option<&GridSiteStatus>, message: &str) -> bool {
+    existing.is_some_and(|s| {
         s.public_cert_pem.is_none() && s.reason == REASON_TRUST_MATERIAL_INVALID && s.message == message
     })
 }
@@ -1963,7 +2152,7 @@ fn already_recorded_invalid(existing: &Option<GridSiteStatus>, message: &str) ->
 async fn reconcile_site_cert_pem(
     api: &Api<GridSite>,
     site_name: &str,
-    existing_status: &Option<GridSiteStatus>,
+    existing_status: Option<&GridSiteStatus>,
     cert_pem: &str,
 ) -> Result<(), OperatorError> {
     match decide_cert_pem_write(existing_status, cert_pem, &trust_bundle::check_cert_pem(cert_pem)) {
@@ -2133,7 +2322,7 @@ async fn reconcile_discovered_sites(
         // above `existing_status`) becomes an infinite reconcile hot-loop even
         // when the remote site's cert hasn't changed (grid#42).
         if let Some(cert_pem) = &site.site_cert_pem {
-            reconcile_site_cert_pem(&api, &site.name, &existing_status, cert_pem).await?;
+            reconcile_site_cert_pem(&api, &site.name, existing_status.as_ref(), cert_pem).await?;
         }
 
         tracing::info!(
@@ -2533,6 +2722,48 @@ mod tests {
             phase,
             GridNetworkPhase::Active,
             "Alive membership must override TLS-Initializing phase"
+        );
+    }
+
+    #[test]
+    fn determine_phase_standalone_single_site_reaches_active() {
+        // Single-site / combined deployment: no seeds, no SWIM peers. With TLS
+        // trust material and the SWIM runtime up (Some, but empty membership),
+        // the local control plane is operational and reports Active rather than
+        // staying Initializing forever.
+        let mut network = base_network();
+        network.spec.tls.ca_secret_ref = Some(crate::crd::grid_network::SecretRef {
+            name: "ca".to_owned(),
+            namespace: "default".to_owned(),
+            key: None,
+        });
+        network.spec.seeds.clear();
+        let empty = MembershipSnapshot::default();
+        let phase = determine_phase(&network, "some-id", Some(&empty));
+        assert_eq!(
+            phase,
+            GridNetworkPhase::Active,
+            "peerless single-site (no seeds) with SWIM up and TLS must reach Active"
+        );
+    }
+
+    #[test]
+    fn determine_phase_seeded_but_peerless_stays_initializing() {
+        // With seeds configured the network expects peers; until at least one is
+        // observed it must stay Initializing and not prematurely claim Active.
+        let mut network = base_network();
+        network.spec.tls.ca_secret_ref = Some(crate::crd::grid_network::SecretRef {
+            name: "ca".to_owned(),
+            namespace: "default".to_owned(),
+            key: None,
+        });
+        network.spec.seeds = vec!["grid.peer:7946".to_owned()];
+        let empty = MembershipSnapshot::default();
+        let phase = determine_phase(&network, "some-id", Some(&empty));
+        assert_eq!(
+            phase,
+            GridNetworkPhase::Initializing,
+            "seeded network with no peers observed yet must stay Initializing"
         );
     }
 
@@ -3503,7 +3734,7 @@ mod tests {
     fn already_recorded_invalid_true_when_reason_message_and_absence_all_match() {
         let existing = Some(invalid_cert_status("private key detected"));
         assert!(
-            already_recorded_invalid(&existing, "private key detected"),
+            already_recorded_invalid(existing.as_ref(), "private key detected"),
             "identical reason/message/absent-cert must be recognized as already recorded"
         );
     }
@@ -3511,7 +3742,7 @@ mod tests {
     #[test]
     fn already_recorded_invalid_false_when_status_is_none() {
         assert!(
-            !already_recorded_invalid(&None, "private key detected"),
+            !already_recorded_invalid(None, "private key detected"),
             "a GridSite with no status yet has nothing recorded"
         );
     }
@@ -3520,7 +3751,7 @@ mod tests {
     fn already_recorded_invalid_false_when_message_differs() {
         let existing = Some(invalid_cert_status("private key detected"));
         assert!(
-            !already_recorded_invalid(&existing, "cert exceeds size bound"),
+            !already_recorded_invalid(existing.as_ref(), "cert exceeds size bound"),
             "a different rejection reason must not be treated as already recorded"
         );
     }
@@ -3534,7 +3765,7 @@ mod tests {
             ..Default::default()
         });
         assert!(
-            !already_recorded_invalid(&existing, "private key detected"),
+            !already_recorded_invalid(existing.as_ref(), "private key detected"),
             "a status recorded for an unrelated reason must not suppress the write"
         );
     }
@@ -3548,7 +3779,7 @@ mod tests {
             ..Default::default()
         });
         assert!(
-            !already_recorded_invalid(&existing, "private key detected"),
+            !already_recorded_invalid(existing.as_ref(), "private key detected"),
             "a leftover publicCertPem means the invalid status was never actually applied yet"
         );
     }
@@ -3573,7 +3804,7 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(
-            decide_cert_pem_write(&stored, "cert-a", &CertPemStatus::ValidStructure),
+            decide_cert_pem_write(stored.as_ref(), "cert-a", &CertPemStatus::ValidStructure),
             CertPemWrite::NoOp,
             "an unchanged valid cert must never be re-patched (grid#42)"
         );
@@ -3586,7 +3817,7 @@ mod tests {
         ] {
             let recorded = Some(invalid_cert_status(message));
             assert_eq!(
-                decide_cert_pem_write(&recorded, "irrelevant-pem", &check),
+                decide_cert_pem_write(recorded.as_ref(), "irrelevant-pem", &check),
                 CertPemWrite::NoOp,
                 "an unchanged rejection ({check:?}) must never be re-patched (grid#42)"
             );
@@ -3596,7 +3827,7 @@ mod tests {
     #[test]
     fn decide_cert_pem_write_stores_valid_cert_on_first_sight() {
         assert_eq!(
-            decide_cert_pem_write(&None, "cert-a", &CertPemStatus::ValidStructure),
+            decide_cert_pem_write(None, "cert-a", &CertPemStatus::ValidStructure),
             CertPemWrite::StoreValid,
             "a GridSite with no prior status must store the first valid cert seen"
         );
@@ -3609,7 +3840,7 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(
-            decide_cert_pem_write(&stale, "cert-new", &CertPemStatus::ValidStructure),
+            decide_cert_pem_write(stale.as_ref(), "cert-new", &CertPemStatus::ValidStructure),
             CertPemWrite::StoreValid,
             "a rotated cert (different from what's stored) must still be written"
         );
@@ -3618,7 +3849,7 @@ mod tests {
     #[test]
     fn decide_cert_pem_write_rejects_private_key_as_security_violation() {
         assert_eq!(
-            decide_cert_pem_write(&None, "leaked-key", &CertPemStatus::ContainsPrivateKey),
+            decide_cert_pem_write(None, "leaked-key", &CertPemStatus::ContainsPrivateKey),
             CertPemWrite::RejectInvalid {
                 message: CERT_PEM_MSG_CONTAINS_PRIVATE_KEY,
                 security_violation: true
@@ -3630,7 +3861,7 @@ mod tests {
     #[test]
     fn decide_cert_pem_write_rejects_malformed_cert_as_non_security() {
         assert_eq!(
-            decide_cert_pem_write(&None, "garbage", &CertPemStatus::NotACertificate),
+            decide_cert_pem_write(None, "garbage", &CertPemStatus::NotACertificate),
             CertPemWrite::RejectInvalid {
                 message: CERT_PEM_MSG_NOT_A_CERTIFICATE,
                 security_violation: false
@@ -3642,7 +3873,7 @@ mod tests {
     #[test]
     fn decide_cert_pem_write_rejects_oversized_cert_as_non_security() {
         assert_eq!(
-            decide_cert_pem_write(&None, "huge", &CertPemStatus::TooLarge),
+            decide_cert_pem_write(None, "huge", &CertPemStatus::TooLarge),
             CertPemWrite::RejectInvalid {
                 message: CERT_PEM_MSG_TOO_LARGE,
                 security_violation: false
@@ -3657,7 +3888,11 @@ mod tests {
         // mistaken for "already handled".
         let recorded_other_reason = Some(invalid_cert_status(CERT_PEM_MSG_TOO_LARGE));
         assert_eq!(
-            decide_cert_pem_write(&recorded_other_reason, "leaked-key", &CertPemStatus::ContainsPrivateKey),
+            decide_cert_pem_write(
+                recorded_other_reason.as_ref(),
+                "leaked-key",
+                &CertPemStatus::ContainsPrivateKey
+            ),
             CertPemWrite::RejectInvalid {
                 message: CERT_PEM_MSG_CONTAINS_PRIVATE_KEY,
                 security_violation: true
@@ -3667,49 +3902,153 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // configmap_up_to_date — grid#42 acceptance criterion for the overlay
-    // ConfigMap: re-applying an unchanged revision must be recognized as a
-    // no-op so `distribute_overlay_configmap` can skip the write.
+    // overlay_configmap_matches — grid#42 no-op write guard
     // -----------------------------------------------------------------------
 
-    fn configmap_with_revision(revision: Option<&str>) -> ConfigMap {
-        let annotations = revision.map(|rev| {
-            std::collections::BTreeMap::from([(overlay_envelope::ANNOTATION_REVISION.to_owned(), rev.to_owned())])
-        });
-        ConfigMap {
-            metadata: kube::api::ObjectMeta {
-                annotations,
-                ..Default::default()
-            },
-            ..Default::default()
+    fn overlay_configmaps_for_test() -> (ConfigMap, ConfigMap, String) {
+        let overlay: routing_overlay::RoutingOverlay = serde_json::from_value(serde_json::json!({
+            "network": "net",
+            "local_site": "site",
+            "candidates": []
+        }))
+        .unwrap_or_else(|_| std::process::abort());
+        let built = overlay_envelope::build_overlay_envelope(&overlay, "gateway", "grid-system", "uid", 1, "now")
+            .unwrap_or_else(|_| std::process::abort());
+        let desired =
+            routing_overlay::build_overlay_configmap(&overlay, Some(&built.envelope), "net", "gateway", "grid-system")
+                .unwrap_or_else(|_| std::process::abort());
+        (desired.clone(), desired, built.revision_hex)
+    }
+
+    fn mutate_envelope(configmap: &mut ConfigMap, mutate: impl FnOnce(&mut overlay_envelope::OverlayEnvelope)) {
+        let payload = configmap
+            .data
+            .as_mut()
+            .and_then(|data| data.get_mut(overlay_envelope::ENVELOPE_KEY))
+            .unwrap_or_else(|| std::process::abort());
+        let mut envelope = serde_json::from_str(payload).unwrap_or_else(|_| std::process::abort());
+        mutate(&mut envelope);
+        *payload = serde_json::to_string_pretty(&envelope).unwrap_or_else(|_| std::process::abort());
+    }
+
+    #[test]
+    fn identical_overlay_configmap_is_safe_to_skip() {
+        let (existing, desired, revision) = overlay_configmaps_for_test();
+        assert!(overlay_configmap_matches(&existing, &desired, &revision));
+    }
+
+    #[test]
+    fn provenance_only_overlay_changes_are_safe_to_skip() {
+        let (mut existing, desired, revision) = overlay_configmaps_for_test();
+        let envelope_payload = existing
+            .data
+            .as_mut()
+            .and_then(|data| data.get_mut(overlay_envelope::ENVELOPE_KEY))
+            .unwrap_or_else(|| std::process::abort());
+        let mut envelope: overlay_envelope::OverlayEnvelope =
+            serde_json::from_str(envelope_payload).unwrap_or_else(|_| std::process::abort());
+        envelope.provenance.rendered_at = "later-render-time".to_owned();
+        envelope.overlay.generated_at = Some("later-overlay-time".to_owned());
+        *envelope_payload = serde_json::to_string_pretty(&envelope).unwrap_or_else(|_| std::process::abort());
+
+        let legacy_payload = existing
+            .data
+            .as_mut()
+            .and_then(|data| data.get_mut("routing-config.json"))
+            .unwrap_or_else(|| std::process::abort());
+        *legacy_payload = serde_json::to_string_pretty(&envelope.overlay).unwrap_or_else(|_| std::process::abort());
+
+        assert!(overlay_configmap_matches(&existing, &desired, &revision));
+    }
+
+    #[test]
+    fn corrupted_overlay_configmap_is_repaired_even_with_matching_annotation() {
+        let (mut existing, desired, revision) = overlay_configmaps_for_test();
+        if let Some(payload) = existing
+            .data
+            .as_mut()
+            .and_then(|data| data.get_mut(overlay_envelope::ENVELOPE_KEY))
+        {
+            *payload = "not-json".to_owned();
+        }
+        assert!(!overlay_configmap_matches(&existing, &desired, &revision));
+    }
+
+    #[test]
+    fn missing_overlay_payload_is_repaired_even_with_matching_annotation() {
+        let (mut existing, desired, revision) = overlay_configmaps_for_test();
+        existing.data = None;
+        assert!(!overlay_configmap_matches(&existing, &desired, &revision));
+    }
+
+    #[test]
+    fn annotation_payload_disagreement_is_repaired() {
+        let (mut existing, desired, revision) = overlay_configmaps_for_test();
+        if let Some(value) = existing
+            .metadata
+            .annotations
+            .as_mut()
+            .and_then(|annotations| annotations.get_mut(overlay_envelope::ANNOTATION_REVISION))
+        {
+            *value = "stale-revision".to_owned();
+        }
+        assert!(!overlay_configmap_matches(&existing, &desired, &revision));
+    }
+
+    #[test]
+    fn contract_annotation_disagreement_is_repaired() {
+        let (_, desired, revision) = overlay_configmaps_for_test();
+        for key in [
+            overlay_envelope::ANNOTATION_SCHEMA_VERSION,
+            overlay_envelope::ANNOTATION_REVISION,
+            overlay_envelope::ANNOTATION_CONTENT_DIGEST,
+        ] {
+            let mut existing = desired.clone();
+            existing
+                .metadata
+                .annotations
+                .as_mut()
+                .unwrap_or_else(|| std::process::abort())
+                .insert(key.to_owned(), "corrupted".to_owned());
+            assert!(!overlay_configmap_matches(&existing, &desired, &revision));
         }
     }
 
     #[test]
-    fn configmap_up_to_date_true_when_revision_annotation_matches() {
-        let cm = configmap_with_revision(Some("abc123"));
-        assert!(
-            configmap_up_to_date(&cm, "abc123"),
-            "identical revision must be recognized as up to date (grid#42)"
-        );
+    fn envelope_revision_contract_disagreement_is_repaired() {
+        let (_, desired, revision) = overlay_configmaps_for_test();
+        for field in ["schema", "kind", "revision_algorithm", "digest_algorithm"] {
+            let mut existing = desired.clone();
+            mutate_envelope(&mut existing, |envelope| match field {
+                "schema" => envelope.schema_version = "corrupted".to_owned(),
+                "kind" => envelope.revision.kind = "corrupted".to_owned(),
+                "revision_algorithm" => envelope.revision.algorithm = "corrupted".to_owned(),
+                "digest_algorithm" => envelope.content_digest.algorithm = "corrupted".to_owned(),
+                _ => std::process::abort(),
+            });
+            assert!(!overlay_configmap_matches(&existing, &desired, &revision));
+        }
     }
 
     #[test]
-    fn configmap_up_to_date_false_when_revision_annotation_differs() {
-        let cm = configmap_with_revision(Some("abc123"));
-        assert!(
-            !configmap_up_to_date(&cm, "def456"),
-            "a changed revision must not be treated as up to date"
-        );
+    fn corrupted_legacy_payload_is_repaired_even_when_envelope_is_valid() {
+        let (mut existing, desired, revision) = overlay_configmaps_for_test();
+        let payload = existing
+            .data
+            .as_mut()
+            .and_then(|data| data.get_mut("routing-config.json"))
+            .unwrap_or_else(|| std::process::abort());
+        *payload = "not-json".to_owned();
+        assert!(!overlay_configmap_matches(&existing, &desired, &revision));
     }
 
     #[test]
-    fn configmap_up_to_date_false_when_no_revision_annotation_present() {
-        let cm = configmap_with_revision(None);
-        assert!(
-            !configmap_up_to_date(&cm, "abc123"),
-            "a ConfigMap with no revision annotation at all must never be treated as up to date"
-        );
+    fn semantic_payload_disagreement_is_repaired() {
+        let (mut existing, desired, revision) = overlay_configmaps_for_test();
+        mutate_envelope(&mut existing, |envelope| {
+            envelope.overlay.local_site = "other-site".to_owned();
+        });
+        assert!(!overlay_configmap_matches(&existing, &desired, &revision));
     }
 
     // -----------------------------------------------------------------------
@@ -4757,7 +5096,10 @@ mod tests {
         let providers = vec![make_inference_provider("p1", "net")];
         let mut network = base_network();
         network.spec.metrics_refresh_interval = Some("5m".to_owned());
-        assert!(requeue_interval_for_network(&network, &providers).is_err());
+        assert!(
+            requeue_interval_for_network(&network, &providers).is_err(),
+            "unsupported duration unit '5m' must be rejected"
+        );
     }
 
     #[test]
@@ -4798,15 +5140,43 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::too_many_lines, reason = "exhaustive rejection table")]
     fn metrics_refresh_duration_parser_rejects_unsupported_values() {
-        assert!(parse_metrics_refresh_interval("").is_err());
-        assert!(parse_metrics_refresh_interval("10").is_err());
-        assert!(parse_metrics_refresh_interval("0s").is_err());
-        assert!(parse_metrics_refresh_interval("500ms").is_err());
-        assert!(parse_metrics_refresh_interval("-1s").is_err());
-        assert!(parse_metrics_refresh_interval("1m").is_err());
-        assert!(parse_metrics_refresh_interval("01s").is_err());
-        assert!(parse_metrics_refresh_interval(" 10s").is_err());
-        assert!(parse_metrics_refresh_interval("18446744073709551615s").is_err());
+        assert!(
+            parse_metrics_refresh_interval("").is_err(),
+            "empty string must be rejected"
+        );
+        assert!(
+            parse_metrics_refresh_interval("10").is_err(),
+            "bare number without unit must be rejected"
+        );
+        assert!(
+            parse_metrics_refresh_interval("0s").is_err(),
+            "zero-second interval must be rejected"
+        );
+        assert!(
+            parse_metrics_refresh_interval("500ms").is_err(),
+            "sub-second interval must be rejected"
+        );
+        assert!(
+            parse_metrics_refresh_interval("-1s").is_err(),
+            "negative interval must be rejected"
+        );
+        assert!(
+            parse_metrics_refresh_interval("1m").is_err(),
+            "minute unit must be rejected"
+        );
+        assert!(
+            parse_metrics_refresh_interval("01s").is_err(),
+            "leading-zero numeric must be rejected"
+        );
+        assert!(
+            parse_metrics_refresh_interval(" 10s").is_err(),
+            "leading whitespace must be rejected"
+        );
+        assert!(
+            parse_metrics_refresh_interval("18446744073709551615s").is_err(),
+            "overflow value must be rejected"
+        );
     }
 }

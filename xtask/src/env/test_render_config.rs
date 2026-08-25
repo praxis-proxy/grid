@@ -30,7 +30,7 @@ spec:
     clippy::unwrap_used,
     reason = "test assertions benefit from unwrap for clear failure location"
 )]
-fn test_normal_mode_no_openai() {
+fn normal_mode_no_openai() {
     let result = super::render_config(MINIMAL_FORGE_CONFIG, super::IngressMode::Global, None).unwrap();
     let config: serde_yaml::Value = serde_yaml::from_str(&result).unwrap();
 
@@ -63,7 +63,7 @@ fn test_normal_mode_no_openai() {
     clippy::too_many_lines,
     reason = "one linear assertion verifies the generated credential mount"
 )]
-fn test_openai_mode_creates_required_credential() {
+fn openai_mode_creates_required_credential() {
     let external_provider = ExternalProviderDescriptor::openai("gpt-4o-mini");
 
     let result = super::render_config(
@@ -112,7 +112,7 @@ fn test_openai_mode_creates_required_credential() {
     clippy::unwrap_used,
     reason = "test assertions benefit from unwrap for clear failure location"
 )]
-fn test_normal_stack_unchanged_in_openai_mode() {
+fn normal_stack_unchanged_in_openai_mode() {
     let external_provider = ExternalProviderDescriptor::openai("gpt-4o-mini");
 
     let result = super::render_config(
@@ -145,7 +145,7 @@ fn test_normal_stack_unchanged_in_openai_mode() {
 }
 
 #[test]
-fn test_missing_helm_paths_fail() {
+fn missing_helm_paths_fail() {
     let config_without_steps = "
 apiVersion: forge.praxis.dev/v1alpha1
 spec:
@@ -174,7 +174,7 @@ spec:
 }
 
 #[test]
-fn test_missing_stacks_fails() {
+fn missing_stacks_fails() {
     let config_without_stacks = "
 apiVersion: forge.praxis.dev/v1alpha1
 spec:
@@ -192,11 +192,11 @@ spec:
         super::IngressMode::Global,
         Some(&external_provider),
     );
-    assert!(result.is_err());
+    assert!(result.is_err(), "missing stacks must fail");
 }
 
 #[test]
-fn test_stack_selection() {
+fn stack_selection() {
     assert_eq!(super::select_stack_for_provider("east", true), "vcr-backend-openai");
     assert_eq!(super::select_stack_for_provider("east", false), "vcr-backend");
     assert_eq!(super::select_stack_for_provider("west", true), "vcr-backend");
@@ -205,7 +205,7 @@ fn test_stack_selection() {
 
 #[test]
 #[expect(clippy::too_many_lines, reason = "Test case with extensive configuration data")]
-fn test_existing_openai_stack_fails() {
+fn existing_openai_stack_fails() {
     let config_with_existing_stack = "
 apiVersion: forge.praxis.dev/v1alpha1
 kind: Environment

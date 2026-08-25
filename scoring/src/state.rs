@@ -36,7 +36,7 @@ impl GridState {
     /// Returns [`CoreError::DuplicateBackend`] if a backend with
     /// the same name is already registered.
     pub fn add_backend(&mut self, backend: BackendConfig) -> Result<(), CoreError> {
-        if self.backends.iter().any(|b| b.name == backend.name) {
+        if self.backends.iter().any(|existing| existing.name == backend.name) {
             return Err(CoreError::DuplicateBackend { name: backend.name });
         }
         self.backends.push(backend);
@@ -107,9 +107,9 @@ mod tests {
     fn set_and_get_metrics() {
         let mut state = GridState::new();
         state.set_metrics("test".to_owned(), BackendMetrics::healthy_default());
-        let m = state.metrics("test");
-        assert!(m.is_some(), "should have metrics");
-        assert!(m.is_some_and(|m| m.healthy), "should be healthy");
+        let got = state.metrics("test");
+        assert!(got.is_some(), "should have metrics");
+        assert!(got.is_some_and(|bm| bm.healthy), "should be healthy");
     }
 
     #[test]

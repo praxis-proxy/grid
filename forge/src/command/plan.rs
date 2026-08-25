@@ -56,7 +56,7 @@ fn render_clusters(config: &config::ForgeConfig, writer: &mut dyn Write) -> Resu
             &format!(
                 "  - {} ({} nodes, {} stacks)",
                 cluster.name,
-                cluster.nodes.control_planes + cluster.nodes.workers,
+                cluster.nodes.control_planes.saturating_add(cluster.nodes.workers),
                 cluster.stacks.len()
             ),
         )?;

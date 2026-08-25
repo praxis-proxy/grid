@@ -93,17 +93,17 @@ mod tests {
             }
         });
         assert_eq!(
-            json.get("apiVersion").and_then(|v| v.as_str()),
+            json.get("apiVersion").and_then(|val| val.as_str()),
             Some(OUTPUT_API_VERSION),
             "apiVersion mismatch"
         );
         assert_eq!(
-            json.get("kind").and_then(|v| v.as_str()),
+            json.get("kind").and_then(|val| val.as_str()),
             Some(OUTPUT_KIND),
             "kind mismatch"
         );
         assert_eq!(
-            json.get("status").and_then(|v| v.as_str()),
+            json.get("status").and_then(|val| val.as_str()),
             Some("Success"),
             "status mismatch"
         );

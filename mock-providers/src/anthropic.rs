@@ -49,7 +49,7 @@ struct MessagesRequest {
 
 /// Extract the `x-api-key` header value.
 fn extract_api_key(headers: &http::HeaderMap) -> Option<&str> {
-    headers.get("x-api-key").and_then(|v| v.to_str().ok())
+    headers.get("x-api-key").and_then(|val| val.to_str().ok())
 }
 
 // ---------------------------------------------------------------------------
@@ -78,7 +78,7 @@ async fn messages(req: Request<Body>) -> Response<Body> {
         .unwrap_or_default();
 
     let msg_req: MessagesRequest = match serde_json::from_slice(&body_bytes) {
-        Ok(r) => r,
+        Ok(parsed) => parsed,
         Err(_) => {
             return common::json_response(
                 StatusCode::BAD_REQUEST,
@@ -256,7 +256,7 @@ mod tests {
         let ct = resp
             .headers()
             .get(header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
+            .and_then(|val| val.to_str().ok())
             .unwrap_or_default();
         assert_eq!(ct, "text/event-stream", "should be SSE");
 

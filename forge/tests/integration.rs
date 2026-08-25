@@ -17,9 +17,9 @@ use forge::{
 fn cli_recognizes_help_flag() {
     let result = Cli::try_parse_from(["praxis-forge", "--help"]);
     assert!(result.is_err(), "--help should produce a help error");
-    if let Err(e) = result {
+    if let Err(err) = result {
         assert_eq!(
-            e.kind(),
+            err.kind(),
             clap::error::ErrorKind::DisplayHelp,
             "should produce help output"
         );

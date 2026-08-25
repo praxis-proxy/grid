@@ -196,7 +196,7 @@ mod tests {
         let ct = resp
             .headers()
             .get(header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
+            .and_then(|val| val.to_str().ok())
             .unwrap_or_default();
         assert_eq!(ct, "text/event-stream", "should be SSE");
 

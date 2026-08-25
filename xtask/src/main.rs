@@ -1,9 +1,15 @@
 //! Development task runner for the AI Grid workspace.
-#![allow(
+#![expect(
     clippy::print_stdout,
     clippy::print_stderr,
     clippy::exit,
     reason = "xtask is a CLI tool that prints to the terminal"
+)]
+#![expect(
+    clippy::arithmetic_side_effects,
+    clippy::as_conversions,
+    clippy::min_ident_chars,
+    reason = "xtask config generators use short closure params, port arithmetic, and index casts pervasively"
 )]
 
 mod env;

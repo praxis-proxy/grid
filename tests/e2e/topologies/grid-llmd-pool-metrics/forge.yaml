@@ -22,15 +22,15 @@ spec:
         siteName: pool-a
         gatewayImage: "ghcr.io/praxis-proxy/grid-ai-rollup:v0.1.3"
         operatorImage: "ghcr.io/praxis-proxy/grid-operator:v0.1.3"
-        eppImage: "ghcr.io/llm-d/llm-d-inference-scheduler:v0.8.0"
+        eppImage: "ghcr.io/llm-d/llm-d-router-endpoint-picker:v0.9.0"
         vcrImage: "ghcr.io/neuralmagic/vllm-vcr:vllm0.23"
         imagePullPolicy: IfNotPresent
         gatewayImageRepo: "ghcr.io/praxis-proxy/grid-ai-rollup"
         gatewayImageTag: "v0.1.3"
         operatorImageRepo: "ghcr.io/praxis-proxy/grid-operator"
         operatorImageTag: "v0.1.3"
-        eppImageRepo: "ghcr.io/llm-d/llm-d-inference-scheduler"
-        eppImageTag: "v0.8.0"
+        eppImageRepo: "ghcr.io/llm-d/llm-d-router-endpoint-picker"
+        eppImageTag: "v0.9.0"
         vcrImageRepo: "ghcr.io/neuralmagic/vllm-vcr"
         vcrImageTag: "vllm0.23"
         poolName: pool-a
@@ -43,15 +43,15 @@ spec:
         siteName: pool-b
         gatewayImage: "ghcr.io/praxis-proxy/grid-ai-rollup:v0.1.3"
         operatorImage: "ghcr.io/praxis-proxy/grid-operator:v0.1.3"
-        eppImage: "ghcr.io/llm-d/llm-d-inference-scheduler:v0.8.0"
+        eppImage: "ghcr.io/llm-d/llm-d-router-endpoint-picker:v0.9.0"
         vcrImage: "ghcr.io/neuralmagic/vllm-vcr:vllm0.23"
         imagePullPolicy: IfNotPresent
         gatewayImageRepo: "ghcr.io/praxis-proxy/grid-ai-rollup"
         gatewayImageTag: "v0.1.3"
         operatorImageRepo: "ghcr.io/praxis-proxy/grid-operator"
         operatorImageTag: "v0.1.3"
-        eppImageRepo: "ghcr.io/llm-d/llm-d-inference-scheduler"
-        eppImageTag: "v0.8.0"
+        eppImageRepo: "ghcr.io/llm-d/llm-d-router-endpoint-picker"
+        eppImageTag: "v0.9.0"
         vcrImageRepo: "ghcr.io/neuralmagic/vllm-vcr"
         vcrImageTag: "vllm0.23"
         poolName: pool-b

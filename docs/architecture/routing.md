@@ -395,7 +395,8 @@ before candidates reach the ordering phase.
 
 ### Admission state derivation
 
-Admission state is threshold-based from current metrics only:
+When `spec.admissionPolicy` is omitted, admission preserves the legacy
+instantaneous behavior:
 
 | Condition | State |
 |-----------|-------|
@@ -404,10 +405,19 @@ Admission state is threshold-based from current metrics only:
 | `queue_depth > 0.85` or `kv_cache_utilization > 0.90` | `existing_only` |
 | Otherwise | `new_and_existing` |
 
-Admission is a point-in-time snapshot of the metrics observed at reconcile
-time. Deployments that require hysteresis, hold-down timers, compare-and-swap
-coordination, or shared active-active admission state must provide those
-control-plane guarantees before enabling threshold-based admission.
+New installations from the `grid-site` Helm chart explicitly select the
+stabilized policy. Stabilized admission requires repeated pressure observations
+before entering `existing_only`, and repeated low-pressure observations plus a
+minimum state duration and recovery hold-down before returning to
+`new_and_existing`. Missing or expired metrics fail closed to `existing_only`
+by default (or `none` when `missingMetrics: excluded`). Hard health failures
+still move immediately to `none`. The evaluator is control-plane state keyed by
+provider identity; no admission check runs in the request path.
+
+The wire states remain `new_and_existing`, `existing_only`, and `none`, so this
+change is compatible with existing Praxis consumers. Restarting the operator
+resets the hysteresis counters and requires fresh observations before a
+restrictive provider is promoted.
 
 ### Locality tier derivation
 

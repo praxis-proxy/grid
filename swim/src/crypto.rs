@@ -137,7 +137,8 @@ pub fn encrypt(key: &SwimKey, plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> 
         .encrypt(&nonce, plaintext)
         .map_err(|_e| CryptoError::EncryptFailed)?;
 
-    let mut out = Vec::with_capacity(OVERHEAD + plaintext.len());
+    let capacity = OVERHEAD.saturating_add(plaintext.len());
+    let mut out = Vec::with_capacity(capacity);
     out.extend_from_slice(&MAGIC);
     out.push(ENCRYPTED_VERSION);
     out.extend_from_slice(&nonce);
@@ -215,8 +216,8 @@ mod tests {
         let mut ciphertext = encrypt(&key, PLAINTEXT).unwrap_or_else(|_| std::process::abort());
         // Flip a bit in the ciphertext body (past the 17-byte header).
         // Using get_mut to satisfy indexing_slicing lint.
-        if let Some(b) = ciphertext.get_mut(20) {
-            *b ^= 0xFF;
+        if let Some(byte) = ciphertext.get_mut(20) {
+            *byte ^= 0xFF;
         }
         assert!(
             matches!(decrypt(&key, &ciphertext), Err(CryptoError::AuthFailed)),
@@ -263,8 +264,8 @@ mod tests {
     fn unknown_version_fails() {
         let key = test_key(0x55);
         let mut ciphertext = encrypt(&key, PLAINTEXT).unwrap_or_else(|_| std::process::abort());
-        if let Some(b) = ciphertext.get_mut(4) {
-            *b = 0xFF;
+        if let Some(byte) = ciphertext.get_mut(4) {
+            *byte = 0xFF;
         }
         assert!(
             matches!(decrypt(&key, &ciphertext), Err(CryptoError::UnknownVersion(0xFF))),
@@ -309,8 +310,8 @@ mod tests {
     fn wrong_magic_byte_produces_bad_magic() {
         let key = test_key(0x13);
         let mut ciphertext = encrypt(&key, PLAINTEXT).unwrap_or_else(|_| std::process::abort());
-        if let Some(b) = ciphertext.get_mut(0) {
-            *b ^= 0x01;
+        if let Some(byte) = ciphertext.get_mut(0) {
+            *byte ^= 0x01;
         }
         assert!(
             matches!(decrypt(&key, &ciphertext), Err(CryptoError::BadMagic)),

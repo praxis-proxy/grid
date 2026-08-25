@@ -1758,6 +1758,7 @@ dependencies = [
  "axum",
  "bytes",
  "certs",
+ "clap",
  "crdt",
  "futures",
  "http",

@@ -323,7 +323,12 @@ pub fn credential_failure_reason_for_auth(auth: Option<&AuthConfig>) -> Credenti
             // BearerToken fails only when secretRef is absent or has blank fields.
             CredentialFailureReason::CredentialSecretRefInvalid
         },
-        _ => CredentialFailureReason::UnsupportedAuthStrategy,
+        AuthStrategy::ApiKey
+        | AuthStrategy::Custom
+        | AuthStrategy::MtlsOnly
+        | AuthStrategy::Oauth2
+        | AuthStrategy::ServiceAccount
+        | AuthStrategy::Sigv4 => CredentialFailureReason::UnsupportedAuthStrategy,
     }
 }
 
@@ -433,12 +438,7 @@ pub(crate) fn validate_bearer_secret_data(
 #[expect(clippy::allow_attributes, reason = "test module suppressions")]
 #[allow(clippy::unwrap_used, clippy::expect_used, reason = "tests")]
 mod tests {
-    use std::collections::BTreeMap;
-
-    use k8s_openapi::ByteString;
-
     use super::*;
-    use crate::crd::{auth::AuthConfig, grid_network::SecretRef};
 
     fn bearer_auth(name: &str, ns: &str, key: &str) -> AuthConfig {
         AuthConfig {

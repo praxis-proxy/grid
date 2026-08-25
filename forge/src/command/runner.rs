@@ -73,13 +73,13 @@ impl fmt::Display for CommandSpec {
 
 /// Replace a value with `[REDACTED]` if it matches any redaction.
 fn redact_value(value: &OsString, redactions: &[Redaction]) -> String {
-    let s = value.to_string_lossy();
-    for r in redactions {
-        if *value == r.value {
+    let lossy = value.to_string_lossy();
+    for redaction in redactions {
+        if *value == redaction.value {
             return "[REDACTED]".to_owned();
         }
     }
-    s.into_owned()
+    lossy.into_owned()
 }
 
 // -----------------------------------------------------------------
@@ -101,8 +101,8 @@ impl CommandRunner for SystemRunner {
 fn build_process(spec: &CommandSpec) -> std::process::Command {
     let mut cmd = std::process::Command::new(&spec.program);
     cmd.args(&spec.args);
-    for (k, v) in &spec.env {
-        cmd.env(k, v);
+    for (key, val) in &spec.env {
+        cmd.env(key, val);
     }
     configure_stdio(&mut cmd, spec.stdin.is_some());
     cmd
@@ -121,7 +121,7 @@ fn configure_stdio(cmd: &mut std::process::Command, pipe_stdin: bool) {
 fn run_process(cmd: &mut std::process::Command, spec: &CommandSpec) -> Result<std::process::Output, ForgeError> {
     match &spec.stdin {
         Some(data) => run_with_stdin(cmd, data, spec),
-        None => cmd.output().map_err(|e| command_error(spec, &e)),
+        None => cmd.output().map_err(|err| command_error(spec, &err)),
     }
 }
 
@@ -131,9 +131,9 @@ fn run_with_stdin(
     data: &[u8],
     spec: &CommandSpec,
 ) -> Result<std::process::Output, ForgeError> {
-    let mut child = cmd.spawn().map_err(|e| command_error(spec, &e))?;
+    let mut child = cmd.spawn().map_err(|err| command_error(spec, &err))?;
     let write_result = pipe_stdin(&mut child, data);
-    let output = child.wait_with_output().map_err(|e| command_error(spec, &e))?;
+    let output = child.wait_with_output().map_err(|err| command_error(spec, &err))?;
 
     match write_result {
         Ok(()) => Ok(output),
@@ -223,14 +223,17 @@ impl MockRunner {
         self.calls
             .borrow()
             .iter()
-            .filter(|c| format!("{c}").contains(pattern))
+            .filter(|call| format!("{call}").contains(pattern))
             .cloned()
             .collect()
     }
 
     /// Check if any recorded call's display string contains the pattern.
     pub fn was_called(&self, pattern: &str) -> bool {
-        self.calls.borrow().iter().any(|c| format!("{c}").contains(pattern))
+        self.calls
+            .borrow()
+            .iter()
+            .any(|call| format!("{call}").contains(pattern))
     }
 
     /// Clear all recorded calls.

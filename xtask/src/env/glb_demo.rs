@@ -1871,7 +1871,7 @@ fn prove_external_provider(
 }
 
 /// Find one case-insensitive response header without retaining response bytes.
-fn response_header<'a>(headers: &'a str, name: &str) -> Option<&'a str> {
+fn response_header<'resp>(headers: &'resp str, name: &str) -> Option<&'resp str> {
     headers.lines().find_map(|line| {
         let (candidate, value) = line.split_once(':')?;
         candidate.eq_ignore_ascii_case(name).then(|| value.trim())
@@ -2433,19 +2433,19 @@ fn strip_gtm_cluster(spec: &mut serde_yaml::Mapping) -> Result<(), Box<dyn std::
 // ---------------------------------------------------------------------------
 
 /// Return a named mapping from a YAML value.
-fn mapping_mut<'a>(
-    value: &'a mut serde_yaml::Value,
+fn mapping_mut<'doc>(
+    value: &'doc mut serde_yaml::Value,
     field: &str,
-) -> Result<&'a mut serde_yaml::Mapping, Box<dyn std::error::Error>> {
+) -> Result<&'doc mut serde_yaml::Mapping, Box<dyn std::error::Error>> {
     let mapping = value.as_mapping_mut().ok_or("YAML root must be a mapping")?;
     mapping_mut_in(mapping, field)
 }
 
 /// Return a named child mapping.
-fn mapping_mut_in<'a>(
-    mapping: &'a mut serde_yaml::Mapping,
+fn mapping_mut_in<'doc>(
+    mapping: &'doc mut serde_yaml::Mapping,
     field: &str,
-) -> Result<&'a mut serde_yaml::Mapping, Box<dyn std::error::Error>> {
+) -> Result<&'doc mut serde_yaml::Mapping, Box<dyn std::error::Error>> {
     mapping
         .get_mut(yaml_key(field))
         .and_then(serde_yaml::Value::as_mapping_mut)
@@ -2453,10 +2453,10 @@ fn mapping_mut_in<'a>(
 }
 
 /// Return a named child sequence.
-fn sequence_mut<'a>(
-    mapping: &'a mut serde_yaml::Mapping,
+fn sequence_mut<'doc>(
+    mapping: &'doc mut serde_yaml::Mapping,
     field: &str,
-) -> Result<&'a mut Vec<serde_yaml::Value>, Box<dyn std::error::Error>> {
+) -> Result<&'doc mut Vec<serde_yaml::Value>, Box<dyn std::error::Error>> {
     mapping
         .get_mut(yaml_key(field))
         .and_then(serde_yaml::Value::as_sequence_mut)
@@ -2603,12 +2603,12 @@ mod setup_tests {
 
         #[test]
         fn default_glb_image_contract_is_valid() {
-            assert!(validate_image_contract_for_mode(IngressMode::Global).is_ok());
+            validate_image_contract_for_mode(IngressMode::Global).unwrap();
         }
 
         #[test]
         fn default_workload_image_contract_is_valid() {
-            assert!(validate_image_contract_for_mode(IngressMode::Workload).is_ok());
+            validate_image_contract_for_mode(IngressMode::Workload).unwrap();
         }
 
         #[test]
@@ -2939,8 +2939,8 @@ mod setup_tests {
                 teardown_result: Some("success".to_owned()),
                 kept_on_failure: false,
             };
-            let json = serde_json::to_string(&with_teardown).unwrap();
-            assert!(json.contains("\"teardown_performed\":true"));
+            let json_teardown = serde_json::to_string(&with_teardown).unwrap();
+            assert!(json_teardown.contains("\"teardown_performed\":true"));
         }
 
         #[test]

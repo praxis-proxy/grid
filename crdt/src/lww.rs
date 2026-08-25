@@ -88,85 +88,92 @@ impl<T: Clone + PartialOrd> LwwRegister<T> {
 mod tests {
     use super::*;
 
+    #[expect(clippy::float_cmp, reason = "exact equality valid for LWW test literals")]
     #[test]
     fn new_creates_register() {
-        let r = LwwRegister::new(42.0, 1);
-        assert_eq!(r.value(), 42.0, "initial value");
-        assert_eq!(r.timestamp(), 1, "initial timestamp");
+        let reg = LwwRegister::new(42.0, 1);
+        assert_eq!(reg.value(), 42.0, "initial value");
+        assert_eq!(reg.timestamp(), 1, "initial timestamp");
     }
 
+    #[expect(clippy::float_cmp, reason = "exact equality valid for LWW test literals")]
     #[test]
     fn set_updates_on_newer_timestamp() {
-        let mut r = LwwRegister::new(1.0, 1);
-        r.set(2.0, 2);
-        assert_eq!(r.value(), 2.0, "should update");
+        let mut reg = LwwRegister::new(1.0, 1);
+        reg.set(2.0, 2);
+        assert_eq!(reg.value(), 2.0, "should update");
     }
 
+    #[expect(clippy::float_cmp, reason = "exact equality valid for LWW test literals")]
     #[test]
     fn set_ignores_older_timestamp() {
-        let mut r = LwwRegister::new(1.0, 5);
-        r.set(2.0, 3);
-        assert_eq!(r.value(), 1.0, "should not update");
+        let mut reg = LwwRegister::new(1.0, 5);
+        reg.set(2.0, 3);
+        assert_eq!(reg.value(), 1.0, "should not update");
     }
 
+    #[expect(clippy::float_cmp, reason = "exact equality valid for LWW test literals")]
     #[test]
     fn merge_takes_newer() {
-        let mut a = LwwRegister::new(1.0, 1);
-        let b = LwwRegister::new(2.0, 2);
-        a.merge(&b);
-        assert_eq!(a.value(), 2.0, "should take newer");
+        let mut reg_a = LwwRegister::new(1.0, 1);
+        let reg_b = LwwRegister::new(2.0, 2);
+        reg_a.merge(&reg_b);
+        assert_eq!(reg_a.value(), 2.0, "should take newer");
     }
 
+    #[expect(clippy::float_cmp, reason = "exact equality valid for LWW test literals")]
     #[test]
     fn merge_keeps_newer_self() {
-        let mut a = LwwRegister::new(1.0, 5);
-        let b = LwwRegister::new(2.0, 3);
-        a.merge(&b);
-        assert_eq!(a.value(), 1.0, "should keep self");
+        let mut reg_a = LwwRegister::new(1.0, 5);
+        let reg_b = LwwRegister::new(2.0, 3);
+        reg_a.merge(&reg_b);
+        assert_eq!(reg_a.value(), 1.0, "should keep self");
     }
 
+    #[expect(clippy::float_cmp, reason = "exact equality valid for LWW test literals")]
     #[test]
     fn merge_equal_timestamps_keeps_self() {
-        let mut a = LwwRegister::new(1.0, 1);
-        let b = LwwRegister::new(2.0, 1);
-        a.merge(&b);
-        assert_eq!(a.value(), 1.0, "equal timestamp keeps self");
+        let mut reg_a = LwwRegister::new(1.0, 1);
+        let reg_b = LwwRegister::new(2.0, 1);
+        reg_a.merge(&reg_b);
+        assert_eq!(reg_a.value(), 1.0, "equal timestamp keeps self");
     }
 
     #[test]
     fn works_with_strings() {
-        let mut r = LwwRegister::new("old".to_owned(), 1);
-        r.merge(&LwwRegister::new("new".to_owned(), 2));
-        assert_eq!(r.value_ref(), "new", "string merge");
+        let mut reg = LwwRegister::new("old".to_owned(), 1);
+        reg.merge(&LwwRegister::new("new".to_owned(), 2));
+        assert_eq!(reg.value_ref(), "new", "string merge");
     }
 
+    #[expect(clippy::float_cmp, reason = "exact equality valid for LWW test literals")]
     #[test]
     fn set_ignores_equal_timestamp() {
-        let mut r = LwwRegister::new(1.0, 5);
-        r.set(99.0, 5);
-        assert_eq!(r.value(), 1.0, "set with equal timestamp must not change value");
-        assert_eq!(r.timestamp(), 5, "set with equal timestamp must not change timestamp");
+        let mut reg = LwwRegister::new(1.0, 5);
+        reg.set(99.0, 5);
+        assert_eq!(reg.value(), 1.0, "set with equal timestamp must not change value");
+        assert_eq!(reg.timestamp(), 5, "set with equal timestamp must not change timestamp");
     }
 
+    #[expect(clippy::float_cmp, reason = "exact equality valid for LWW test literals")]
     #[test]
     fn merge_equal_timestamps_is_not_commutative() {
-        // Equal-timestamp merge keeps self — this is intentional and non-commutative.
-        // Pinning this behavior so future changes are deliberate.
-        let mut a = LwwRegister::new(1.0, 1);
-        let b = LwwRegister::new(2.0, 1);
-        a.merge(&b);
-        assert_eq!(a.value(), 1.0, "a keeps its own value on equal timestamps");
+        let mut reg_a = LwwRegister::new(1.0, 1);
+        let reg_b = LwwRegister::new(2.0, 1);
+        reg_a.merge(&reg_b);
+        assert_eq!(reg_a.value(), 1.0, "a keeps its own value on equal timestamps");
 
-        let mut b2 = LwwRegister::new(2.0, 1);
-        let a2 = LwwRegister::new(1.0, 1);
-        b2.merge(&a2);
-        assert_eq!(b2.value(), 2.0, "b keeps its own value on equal timestamps");
+        let mut other_b = LwwRegister::new(2.0, 1);
+        let other_a = LwwRegister::new(1.0, 1);
+        other_b.merge(&other_a);
+        assert_eq!(other_b.value(), 2.0, "b keeps its own value on equal timestamps");
     }
 
+    #[expect(clippy::float_cmp, reason = "exact equality valid for LWW test literals")]
     #[test]
     fn lww_register_serde_round_trip() {
-        let r = LwwRegister::new(42.5_f64, 100);
-        let json = serde_json::to_string(&r).unwrap_or_else(|_| std::process::abort());
+        let reg = LwwRegister::new(42.5_f64, 100);
+        let json = serde_json::to_string(&reg).unwrap_or_else(|_| std::process::abort());
         let restored: LwwRegister<f64> = serde_json::from_str(&json).unwrap_or_else(|_| std::process::abort());
         assert_eq!(restored.value(), 42.5, "serde round-trip must preserve value");
         assert_eq!(restored.timestamp(), 100, "serde round-trip must preserve timestamp");

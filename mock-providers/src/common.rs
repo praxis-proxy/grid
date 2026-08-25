@@ -150,8 +150,8 @@ pub(crate) fn forbidden(message: &str) -> Response<Body> {
 pub(crate) fn extract_bearer(headers: &http::HeaderMap) -> Option<&str> {
     headers
         .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
+        .and_then(|val| val.to_str().ok())
+        .and_then(|val| val.strip_prefix("Bearer "))
 }
 
 /// Validate the bearer token against an optional expected value.
@@ -191,7 +191,7 @@ mod tests {
         let ct = resp.headers().get(header::CONTENT_TYPE);
         assert!(ct.is_some(), "content-type should be set");
         assert_eq!(
-            ct.and_then(|v| v.to_str().ok()).unwrap_or_default(),
+            ct.and_then(|val| val.to_str().ok()).unwrap_or_default(),
             "application/json",
             "content-type should be application/json"
         );
@@ -205,7 +205,7 @@ mod tests {
         let ct = resp
             .headers()
             .get(header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
+            .and_then(|val| val.to_str().ok())
             .unwrap_or_default();
         assert_eq!(ct, "text/event-stream", "content-type should be text/event-stream");
     }

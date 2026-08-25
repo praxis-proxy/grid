@@ -37,8 +37,8 @@ pub fn router(state: AppState) -> Router {
 fn has_sigv4_auth(headers: &http::HeaderMap) -> bool {
     headers
         .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.starts_with("AWS4-HMAC-SHA256"))
+        .and_then(|val| val.to_str().ok())
+        .is_some_and(|val| val.starts_with("AWS4-HMAC-SHA256"))
 }
 
 /// Build a 403 response for missing `SigV4` credentials.
@@ -238,7 +238,7 @@ mod tests {
         let ct = resp
             .headers()
             .get(header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
+            .and_then(|val| val.to_str().ok())
             .unwrap_or_default();
         assert_eq!(
             ct, "application/vnd.amazon.eventstream",
@@ -297,7 +297,7 @@ mod tests {
         assert_eq!(buf.len(), 4 + payload.len(), "frame should be 4-byte prefix + payload");
         let len_bytes: [u8; 4] = buf
             .get(..4)
-            .and_then(|s| <[u8; 4]>::try_from(s).ok())
+            .and_then(|slice| <[u8; 4]>::try_from(slice).ok())
             .unwrap_or_default();
         let len = u32::from_be_bytes(len_bytes);
         assert_eq!(

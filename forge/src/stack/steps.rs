@@ -23,17 +23,17 @@ pub const MAX_REMOTE_MANIFEST_BYTES: usize = 1_048_576;
 // -------------------------------------------------------------
 
 /// Parameters for a Helm release installation.
-pub struct HelmParams<'a> {
+pub struct HelmParams<'input> {
     /// kubectl/helm `--kube-context` value.
-    pub context: &'a str,
+    pub context: &'input str,
     /// Helm release name.
-    pub release: &'a str,
+    pub release: &'input str,
     /// Chart reference.
-    pub chart: &'a str,
+    pub chart: &'input str,
     /// Chart version.
-    pub version: &'a str,
+    pub version: &'input str,
     /// Target namespace (optional).
-    pub namespace: Option<&'a str>,
+    pub namespace: Option<&'input str>,
 }
 
 // -------------------------------------------------------------
@@ -162,8 +162,8 @@ fn helm_values_stdin(
     }
     args.push("--values".into());
     args.push("-".into());
-    let yaml =
-        serde_yaml::to_string(values).map_err(|e| ForgeError::Config(format!("cannot serialize helm values: {e}")))?;
+    let yaml = serde_yaml::to_string(values)
+        .map_err(|err| ForgeError::Config(format!("cannot serialize helm values: {err}")))?;
     Ok(Some(yaml.into_bytes()))
 }
 
@@ -217,7 +217,7 @@ pub fn exec_spec(command: &[String], env: &BTreeMap<String, String>) -> Result<C
             .collect(),
         env: env
             .iter()
-            .map(|(k, v)| (std::ffi::OsString::from(k), std::ffi::OsString::from(v)))
+            .map(|(key, val)| (std::ffi::OsString::from(key), std::ffi::OsString::from(val)))
             .collect(),
         stdin: None,
         redact: Vec::new(),
@@ -396,7 +396,7 @@ pub fn generate_coredns_configmap(corefile: &str) -> String {
 /// Returns [`ForgeError::Command`] if parsing fails or no subnet found.
 pub fn parse_network_cidr(inspect_output: &str) -> Result<String, ForgeError> {
     let arr: Vec<serde_json::Value> = serde_json::from_str(inspect_output.trim())
-        .map_err(|e| cmd_error("network inspect", &format!("invalid JSON: {e}")))?;
+        .map_err(|err| cmd_error("network inspect", &format!("invalid JSON: {err}")))?;
     let entry = arr
         .first()
         .ok_or_else(|| cmd_error("network inspect", "no network entries"))?;
@@ -502,10 +502,10 @@ fn parse_cidr_parts(cidr: &str) -> Result<(u32, u32), ForgeError> {
     let (ip_str, prefix_str) = split_cidr(cidr)?;
     let ip: std::net::Ipv4Addr = ip_str
         .parse()
-        .map_err(|e| ForgeError::Config(format!("invalid CIDR IP '{ip_str}': {e}")))?;
+        .map_err(|err| ForgeError::Config(format!("invalid CIDR IP '{ip_str}': {err}")))?;
     let prefix: u32 = prefix_str
         .parse()
-        .map_err(|e| ForgeError::Config(format!("invalid CIDR prefix '{prefix_str}': {e}")))?;
+        .map_err(|err| ForgeError::Config(format!("invalid CIDR prefix '{prefix_str}': {err}")))?;
     if prefix > 32 {
         return Err(ForgeError::Config(format!("CIDR prefix /{prefix} exceeds /32")));
     }
@@ -641,13 +641,13 @@ fn append_container_args(manifest: &mut serde_json::Value, args: &[String]) {
     if args.is_empty() {
         return;
     }
-    let args_val: Vec<serde_json::Value> = args.iter().map(|a| serde_json::Value::String(a.clone())).collect();
+    let args_val: Vec<serde_json::Value> = args.iter().map(|arg| serde_json::Value::String(arg.clone())).collect();
     let Some(container) = manifest
         .get_mut("spec")
-        .and_then(|v| v.get_mut("template"))
-        .and_then(|v| v.get_mut("spec"))
-        .and_then(|v| v.get_mut("containers"))
-        .and_then(|v| v.get_mut(0))
+        .and_then(|val| val.get_mut("template"))
+        .and_then(|val| val.get_mut("spec"))
+        .and_then(|val| val.get_mut("containers"))
+        .and_then(|val| val.get_mut(0))
     else {
         return;
     };
@@ -677,7 +677,7 @@ mod tests {
     fn manifest_step_builds_kubectl_apply() {
         let spec = kubectl_apply("kind-forge-hub", "manifests/crds.yaml");
         assert_eq!(spec.program, "kubectl", "program should be kubectl");
-        let args: Vec<String> = spec.args.iter().map(|a| a.to_string_lossy().into_owned()).collect();
+        let args: Vec<String> = spec.args.iter().map(|arg| arg.to_string_lossy().into_owned()).collect();
         let joined = args.join(" ");
         assert!(
             joined.contains("--context kind-forge-hub"),
@@ -692,7 +692,7 @@ mod tests {
     #[test]
     fn kustomize_step_builds_kubectl_apply_k() {
         let spec = kubectl_kustomize("kind-forge-hub", "overlays/prod");
-        let args: Vec<String> = spec.args.iter().map(|a| a.to_string_lossy().into_owned()).collect();
+        let args: Vec<String> = spec.args.iter().map(|arg| arg.to_string_lossy().into_owned()).collect();
         let joined = args.join(" ");
         assert!(joined.contains("-k overlays/prod"), "should use -k flag: {joined}");
     }
@@ -708,7 +708,7 @@ mod tests {
         };
         let values = BTreeMap::from([("key".to_owned(), serde_json::json!("val"))]);
         let spec = helm_upgrade_spec(&params, &values).unwrap_or_else(|_| std::process::abort());
-        let args: Vec<String> = spec.args.iter().map(|a| a.to_string_lossy().into_owned()).collect();
+        let args: Vec<String> = spec.args.iter().map(|arg| arg.to_string_lossy().into_owned()).collect();
         let joined = args.join(" ");
         assert!(
             joined.contains("upgrade --install metallb"),
@@ -743,7 +743,7 @@ mod tests {
     #[test]
     fn wait_step_builds_kubectl_wait() {
         let spec = kubectl_wait_spec("kind-forge-hub", "deployment/controller", "available", "120s", None);
-        let args: Vec<String> = spec.args.iter().map(|a| a.to_string_lossy().into_owned()).collect();
+        let args: Vec<String> = spec.args.iter().map(|arg| arg.to_string_lossy().into_owned()).collect();
         let joined = args.join(" ");
         assert!(
             joined.contains("wait deployment/controller"),
@@ -759,7 +759,7 @@ mod tests {
     #[test]
     fn wait_step_includes_namespace() {
         let spec = kubectl_wait_spec("ctx", "deployment/web", "available", "60s", Some("my-ns"));
-        let args: Vec<String> = spec.args.iter().map(|a| a.to_string_lossy().into_owned()).collect();
+        let args: Vec<String> = spec.args.iter().map(|arg| arg.to_string_lossy().into_owned()).collect();
         let joined = args.join(" ");
         assert!(joined.contains("-n my-ns"), "should have namespace: {joined}");
     }
@@ -818,9 +818,9 @@ mod tests {
     #[test]
     fn compute_cluster_pool_deterministic() {
         let cidr = "172.18.0.0/16";
-        let a = compute_cluster_pool(cidr, 1, 2).unwrap_or_else(|_| std::process::abort());
-        let b = compute_cluster_pool(cidr, 1, 2).unwrap_or_else(|_| std::process::abort());
-        assert_eq!(a, b, "same inputs should produce same output");
+        let first = compute_cluster_pool(cidr, 1, 2).unwrap_or_else(|_| std::process::abort());
+        let second = compute_cluster_pool(cidr, 1, 2).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(first, second, "same inputs should produce same output");
     }
 
     #[test]
@@ -860,7 +860,7 @@ mod tests {
     #[test]
     fn connectivity_check_builds_wget_command() {
         let spec = kubectl_connectivity_check("kind-forge-hub", "svc.ns.spoke.forge.test", 8080);
-        let args: Vec<String> = spec.args.iter().map(|a| a.to_string_lossy().into_owned()).collect();
+        let args: Vec<String> = spec.args.iter().map(|arg| arg.to_string_lossy().into_owned()).collect();
         let joined = args.join(" ");
         assert!(joined.contains("forge-cc-"), "should have unique pod name: {joined}");
         assert!(joined.contains("wget"), "should use wget: {joined}");
@@ -873,7 +873,7 @@ mod tests {
     #[test]
     fn tcp_check_builds_nc_command() {
         let spec = kubectl_tcp_check("kind-forge-hub", "10.0.0.1", 443);
-        let args: Vec<String> = spec.args.iter().map(|a| a.to_string_lossy().into_owned()).collect();
+        let args: Vec<String> = spec.args.iter().map(|arg| arg.to_string_lossy().into_owned()).collect();
         let joined = args.join(" ");
         assert!(joined.contains("forge-cc-"), "should have unique pod name: {joined}");
         assert!(joined.contains("nc"), "should use nc: {joined}");
@@ -890,7 +890,7 @@ mod tests {
             "{.status.loadBalancer.ingress[0].ip}",
         );
         assert_eq!(spec.program, "kubectl", "program should be kubectl");
-        let args: Vec<String> = spec.args.iter().map(|a| a.to_string_lossy().into_owned()).collect();
+        let args: Vec<String> = spec.args.iter().map(|arg| arg.to_string_lossy().into_owned()).collect();
         let joined = args.join(" ");
         assert!(
             joined.contains("--context kind-forge-hub"),
@@ -910,7 +910,7 @@ mod tests {
     #[test]
     fn kubectl_get_jsonpath_omits_namespace_when_none() {
         let spec = kubectl_get_jsonpath("kind-forge-hub", "svc/web", None, "{.spec.clusterIP}");
-        let args: Vec<String> = spec.args.iter().map(|a| a.to_string_lossy().into_owned()).collect();
+        let args: Vec<String> = spec.args.iter().map(|arg| arg.to_string_lossy().into_owned()).collect();
         let joined = args.join(" ");
         assert!(!joined.contains("-n "), "should not have namespace flag: {joined}");
         assert!(
@@ -921,10 +921,10 @@ mod tests {
 
     #[test]
     fn connectivity_pod_names_are_unique_per_target() {
-        let a = conn_check_pod_name("svc.a.forge.test", 80);
-        let b = conn_check_pod_name("svc.b.forge.test", 80);
-        let c = conn_check_pod_name("svc.a.forge.test", 443);
-        assert_ne!(a, b, "different targets should produce different pod names");
-        assert_ne!(a, c, "different ports should produce different pod names");
+        let pod_a = conn_check_pod_name("svc.a.forge.test", 80);
+        let pod_b = conn_check_pod_name("svc.b.forge.test", 80);
+        let pod_c = conn_check_pod_name("svc.a.forge.test", 443);
+        assert_ne!(pod_a, pod_b, "different targets should produce different pod names");
+        assert_ne!(pod_a, pod_c, "different ports should produce different pod names");
     }
 }

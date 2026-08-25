@@ -13,11 +13,11 @@ use crate::{command::runner::CommandRunner, config::ForgeConfig, output::OutputF
 /// Constructed in `main.rs` after parsing CLI arguments and loading
 /// the configuration.  Command handlers receive `&ForgeContext`
 /// instead of five separate parameters.
-pub struct ForgeContext<'a> {
+pub struct ForgeContext<'ctx> {
     /// Command runner (real or mock).
-    pub runner: &'a dyn CommandRunner,
+    pub runner: &'ctx dyn CommandRunner,
     /// Parsed and validated Forge configuration.
-    pub config: &'a ForgeConfig,
+    pub config: &'ctx ForgeConfig,
     /// Directory for state files and locks.
     pub state_dir: PathBuf,
     /// Directory containing the config file (for resolving relative paths).

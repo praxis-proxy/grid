@@ -39,7 +39,7 @@ pub fn run(ctx: &ForgeContext<'_>, writer: &mut dyn Write) -> Result<(), ForgeEr
     if !ctx.dry_run {
         state::save(&ctx.state_dir, &state)?;
     }
-    render_all(writer, &net_result, &results, &svc_results, &ctx.format)
+    render_all(writer, net_result.as_ref(), &results, &svc_results, &ctx.format)
 }
 
 // ---------------------------------------------------------------
@@ -130,8 +130,8 @@ fn create_clusters(ctx: &ForgeContext<'_>, state: &mut state::ForgeState) -> Res
     let docker_network = docker_network_for_kind(ctx);
     let mut results = Vec::new();
     for cluster in &ctx.config.spec.clusters {
-        let r = process_cluster(ctx, state, cluster, docker_network.as_deref())?;
-        results.push(r);
+        let result = process_cluster(ctx, state, cluster, docker_network.as_deref())?;
+        results.push(result);
     }
     Ok(results)
 }
@@ -261,8 +261,8 @@ fn start_services(
         if !svc.auto_start {
             continue;
         }
-        let r = start_one_svc(ctx, binary, state, idx)?;
-        results.push(r);
+        let result = start_one_svc(ctx, binary, state, idx)?;
+        results.push(result);
     }
     Ok(results)
 }
@@ -300,7 +300,11 @@ fn start_one_svc(
 }
 
 /// Build service parameters from context.
-fn build_svc_params<'a>(binary: &'a str, cname: &'a str, ctx: &'a ForgeContext<'_>) -> service::ServiceParams<'a> {
+fn build_svc_params<'input>(
+    binary: &'input str,
+    cname: &'input str,
+    ctx: &'input ForgeContext<'_>,
+) -> service::ServiceParams<'input> {
     service::ServiceParams {
         binary,
         container_name: cname,
@@ -332,8 +336,8 @@ fn health_probe_host_port(svc: &crate::config::ServiceSpec, container_port: u16)
     }
     svc.ports
         .iter()
-        .find(|p| p.container == container_port && p.protocol == "tcp")
-        .map(|p| p.host)
+        .find(|pm| pm.container == container_port && pm.protocol == "tcp")
+        .map(|pm| pm.host)
 }
 
 /// Insert or update a service state entry.
@@ -345,7 +349,7 @@ fn upsert_svc_state(
 ) {
     let phase = match health {
         ServiceHealth::Unhealthy => ServicePhase::Unhealthy,
-        _ => ServicePhase::Running,
+        ServiceHealth::Unknown | ServiceHealth::Healthy => ServicePhase::Running,
     };
     if let Some(ss) = state::find_service_mut(state, &svc.name) {
         ss.phase = phase;
@@ -389,7 +393,7 @@ fn record_operation(state: &mut state::ForgeState, operation: &str, success: boo
 /// Render all results (network, clusters, services).
 fn render_all(
     writer: &mut dyn Write,
-    net: &Option<NetworkSetup>,
+    net: Option<&NetworkSetup>,
     clusters: &[ClusterResult],
     services: &[ServiceResult],
     format: &OutputFormat,
@@ -403,7 +407,7 @@ fn render_all(
 /// Render results as JSON.
 fn render_json(
     writer: &mut dyn Write,
-    net: &Option<NetworkSetup>,
+    net: Option<&NetworkSetup>,
     clusters: &[ClusterResult],
     services: &[ServiceResult],
 ) -> Result<(), ForgeError> {
@@ -425,49 +429,49 @@ fn render_json(
 }
 
 /// Convert one result to a JSON value.
-fn result_to_json(r: &ClusterResult) -> serde_json::Value {
+fn result_to_json(cr: &ClusterResult) -> serde_json::Value {
     serde_json::json!({
-        "name": r.name,
-        "kindName": r.kind_name,
-        "created": r.created,
-        "dryRun": r.dry_run,
+        "name": cr.name,
+        "kindName": cr.kind_name,
+        "created": cr.created,
+        "dryRun": cr.dry_run,
     })
 }
 
 /// Convert one service result to JSON.
-fn svc_to_json(s: &ServiceResult) -> serde_json::Value {
+fn svc_to_json(sr: &ServiceResult) -> serde_json::Value {
     serde_json::json!({
-        "name": s.name,
-        "containerName": s.container_name,
-        "dryRun": s.dry_run,
+        "name": sr.name,
+        "containerName": sr.container_name,
+        "dryRun": sr.dry_run,
     })
 }
 
 /// Render results as text.
 fn render_text(
     writer: &mut dyn Write,
-    net: &Option<NetworkSetup>,
+    net: Option<&NetworkSetup>,
     clusters: &[ClusterResult],
     services: &[ServiceResult],
 ) -> Result<(), ForgeError> {
     if let Some(n) = net {
         output::write_text(writer, &format_net_text(n))?;
     }
-    for r in clusters {
-        output::write_text(writer, &format_result_text(r))?;
+    for cluster in clusters {
+        output::write_text(writer, &format_result_text(cluster))?;
     }
-    for s in services {
-        output::write_text(writer, &format_svc_text(s))?;
+    for svc in services {
+        output::write_text(writer, &format_svc_text(svc))?;
     }
     Ok(())
 }
 
 /// Format a service result as a text line.
-fn format_svc_text(s: &ServiceResult) -> String {
-    if s.dry_run {
-        return format!("would start service '{}' (container: {})", s.name, s.container_name);
+fn format_svc_text(sr: &ServiceResult) -> String {
+    if sr.dry_run {
+        return format!("would start service '{}' (container: {})", sr.name, sr.container_name);
     }
-    format!("started service '{}' (container: {})", s.name, s.container_name)
+    format!("started service '{}' (container: {})", sr.name, sr.container_name)
 }
 
 /// Format a network setup result as a text line.
@@ -479,14 +483,14 @@ fn format_net_text(n: &NetworkSetup) -> String {
 }
 
 /// Format a single result as a text line.
-fn format_result_text(r: &ClusterResult) -> String {
-    if r.dry_run {
-        return format!("would create cluster '{}' (kind name: {})", r.name, r.kind_name);
+fn format_result_text(cr: &ClusterResult) -> String {
+    if cr.dry_run {
+        return format!("would create cluster '{}' (kind name: {})", cr.name, cr.kind_name);
     }
-    if r.created {
-        return format!("created cluster '{}' (kind name: {})", r.name, r.kind_name);
+    if cr.created {
+        return format!("created cluster '{}' (kind name: {})", cr.name, cr.kind_name);
     }
-    format!("cluster '{}' already exists (kind name: {})", r.name, r.kind_name)
+    format!("cluster '{}' already exists (kind name: {})", cr.name, cr.kind_name)
 }
 
 #[cfg(test)]
@@ -1119,11 +1123,11 @@ spec:
     /// Verify `kind create` was called with the expected Docker network env.
     fn assert_kind_create_has_network_env(runner: &MockRunner, expected: &str) {
         let calls = runner.calls();
-        let Some(call) = calls.iter().find(|c| c.to_string().contains("kind create")) else {
+        let Some(call) = calls.iter().find(|cmd| cmd.to_string().contains("kind create")) else {
             std::process::abort();
         };
         let key = std::ffi::OsString::from("KIND_EXPERIMENTAL_DOCKER_NETWORK");
-        let val = call.env.get(&key).map(|v| v.to_string_lossy().into_owned());
+        let val = call.env.get(&key).map(|os| os.to_string_lossy().into_owned());
         assert_eq!(val.as_deref(), Some(expected), "kind create should set network env");
     }
 

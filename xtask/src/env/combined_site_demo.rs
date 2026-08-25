@@ -1408,7 +1408,7 @@ fn run_pod_to_completion(
     );
 
     // Clean up the pod
-    let _cleanup = Command::new("kubectl")
+    let _cleanup_trigger = Command::new("kubectl")
         .args([
             "delete",
             "pod",
@@ -4553,12 +4553,12 @@ fn deploy_setup(context: &CombinedSiteContext) -> Result<OverlayState, Box<dyn s
                        stack: &str|
      -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("  applying {stack} to {cluster}...");
-        let status = Command::new(forge_bin)
+        let forge_status = Command::new(forge_bin)
             .arg("--config")
             .arg(resolved_config)
             .args(["--non-interactive", "stack", "apply", cluster, stack])
             .status()?;
-        if !status.success() {
+        if !forge_status.success() {
             return Err(format!("Failed to apply {stack} to {cluster}").into());
         }
         Ok(())
@@ -6186,9 +6186,9 @@ fn run_provider_lifecycle_sequence(
 
     let baseline_deployments = record_gateway_deployment_state();
 
-    let skip = |results: &mut BTreeMap<String, ProofResult>, name: &str, blocker: &str| {
+    let skip = |proof_results: &mut BTreeMap<String, ProofResult>, name: &str, blocker: &str| {
         eprintln!("  [SKIP] {name}: prerequisite {blocker} failed");
-        results.insert(
+        proof_results.insert(
             name.to_owned(),
             proof_failure(
                 &format!("skipped: prerequisite {blocker} failed"),
@@ -6682,7 +6682,7 @@ fn collect_image_evidence() -> Result<BTreeMap<String, String>, Box<dyn std::err
         }
 
         // Get consumer gateway image
-        let output = Command::new("kubectl")
+        let output_2 = Command::new("kubectl")
             .args([
                 "get",
                 "deployment/consumer-gateway",
@@ -6695,13 +6695,13 @@ fn collect_image_evidence() -> Result<BTreeMap<String, String>, Box<dyn std::err
             ])
             .output()?;
 
-        if output.status.success() {
-            let consumer_image = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        if output_2.status.success() {
+            let consumer_image = String::from_utf8_lossy(&output_2.stdout).trim().to_owned();
             images.insert(format!("{cluster}_consumer_gateway"), consumer_image);
         }
 
         // Get provider gateway image
-        let output = Command::new("kubectl")
+        let output_3 = Command::new("kubectl")
             .args([
                 "get",
                 "deployment/provider-gateway",
@@ -6714,13 +6714,13 @@ fn collect_image_evidence() -> Result<BTreeMap<String, String>, Box<dyn std::err
             ])
             .output()?;
 
-        if output.status.success() {
-            let provider_image = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        if output_3.status.success() {
+            let provider_image = String::from_utf8_lossy(&output_3.stdout).trim().to_owned();
             images.insert(format!("{cluster}_provider_gateway"), provider_image);
         }
 
         // Get VCR inference image
-        let output = Command::new("kubectl")
+        let output_4 = Command::new("kubectl")
             .args([
                 "get",
                 &format!("deployment/vcr-inference-{cluster}"),
@@ -6733,8 +6733,8 @@ fn collect_image_evidence() -> Result<BTreeMap<String, String>, Box<dyn std::err
             ])
             .output()?;
 
-        if output.status.success() {
-            let mock_image = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        if output_4.status.success() {
+            let mock_image = String::from_utf8_lossy(&output_4.stdout).trim().to_owned();
             images.insert(format!("{cluster}_mock_inference"), mock_image);
         }
     }
@@ -6759,8 +6759,6 @@ fn collect_external_provider_evidence(
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, time::Duration};
-
     use super::*;
 
     #[test]
@@ -6796,7 +6794,7 @@ mod tests {
     }
 
     #[test]
-    fn test_proof_success_creation() {
+    fn proof_success_creation() {
         let mut facts = BTreeMap::new();
         facts.insert("cluster_count".to_owned(), serde_json::Value::Number(3.into()));
         facts.insert("all_healthy".to_owned(), serde_json::Value::Bool(true));
@@ -6814,7 +6812,7 @@ mod tests {
     }
 
     #[test]
-    fn test_proof_failure_creation() {
+    fn proof_failure_creation() {
         let mut facts = BTreeMap::new();
         facts.insert("error_code".to_owned(), serde_json::Value::Number(500.into()));
 
@@ -6831,7 +6829,7 @@ mod tests {
     }
 
     #[test]
-    fn test_assertion_result_error_handling() {
+    fn assertion_result_error_handling() {
         let assertion_fn = || -> AssertionResult { Err("Simulated assertion failure".into()) };
 
         let result = run_assertion("test_assertion", assertion_fn);
@@ -6843,7 +6841,7 @@ mod tests {
     }
 
     #[test]
-    fn test_evidence_serialization() {
+    fn evidence_serialization() {
         let evidence = Evidence {
             schema_version: "test".to_owned(),
             mode: "quick".to_owned(),
@@ -6889,7 +6887,7 @@ mod tests {
     }
 
     #[test]
-    fn test_proof_count_validation() {
+    fn proof_count_validation() {
         let names = [
             "cluster_health",
             "component_deployment",
@@ -6910,13 +6908,13 @@ mod tests {
     }
 
     #[test]
-    fn test_cluster_constants() {
+    fn cluster_constants() {
         assert_eq!(CLUSTERS.len(), 3);
         assert_eq!(CLUSTERS, &["west", "central", "east"]);
     }
 
     #[test]
-    fn test_evidence_schema_version() {
+    fn evidence_schema_version() {
         assert_eq!(EVIDENCE_SCHEMA_VERSION, "1");
     }
 
@@ -7124,7 +7122,7 @@ spec:
         let ext = test_openai_descriptor();
         let yaml = minimal_forge_yaml().replace("provider-gateway:", "other-gateway:");
         let result = render_config(&yaml, Some(&ext), Some("west"));
-        assert!(result.is_err());
+        assert!(result.is_err(), "expected render_config to fail");
     }
 
     #[test]

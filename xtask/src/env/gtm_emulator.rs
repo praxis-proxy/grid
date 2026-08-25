@@ -494,7 +494,7 @@ fn parse_provider_attribution(headers: &str) -> Result<(String, String, String),
 }
 
 /// Find one case-insensitive HTTP response header.
-fn parse_header<'a>(headers: &'a str, name: &str) -> Option<&'a str> {
+fn parse_header<'resp>(headers: &'resp str, name: &str) -> Option<&'resp str> {
     headers.lines().find_map(|line| {
         let (candidate, value) = line.split_once(':')?;
         candidate.eq_ignore_ascii_case(name).then(|| value.trim())
@@ -554,7 +554,7 @@ mod tests {
     #[test]
     fn parse_response_rejects_unknown_edge() {
         let response = "HTTP/1.1 200 OK\r\nX-Grid-Demo-Edge-Gateway: client-value\r\n\r\n{}";
-        assert!(parse_response(response).is_err());
+        assert!(parse_response(response).is_err(), "unknown edge must fail");
     }
 
     #[test]

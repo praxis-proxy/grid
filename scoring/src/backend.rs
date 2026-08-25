@@ -117,7 +117,7 @@ mod tests {
 
     #[test]
     fn backend_construction() {
-        let b = BackendConfig::new(
+        let cfg = BackendConfig::new(
             "test".to_owned(),
             0.03,
             0.06,
@@ -126,14 +126,14 @@ mod tests {
             ProviderKind::OpenAi,
             None,
         );
-        assert_eq!(b.name, "test", "name mismatch");
-        assert_eq!(b.kind, BackendKind::ApiProvider, "kind mismatch");
-        assert_eq!(b.provider, ProviderKind::OpenAi, "provider mismatch");
+        assert_eq!(cfg.name, "test", "name mismatch");
+        assert_eq!(cfg.kind, BackendKind::ApiProvider, "kind mismatch");
+        assert_eq!(cfg.provider, ProviderKind::OpenAi, "provider mismatch");
     }
 
     #[test]
     fn serde_round_trip() {
-        let b = BackendConfig::new(
+        let cfg = BackendConfig::new(
             "demo".to_owned(),
             0.01,
             0.02,
@@ -142,7 +142,7 @@ mod tests {
             ProviderKind::Anthropic,
             Some("us-east-1".to_owned()),
         );
-        let json = serde_json::to_string(&b).unwrap_or_else(|_| std::process::abort());
+        let json = serde_json::to_string(&cfg).unwrap_or_else(|_| std::process::abort());
         let parsed: BackendConfig = serde_json::from_str(&json).unwrap_or_else(|_| std::process::abort());
         assert_eq!(parsed.name, "demo", "name mismatch after round-trip");
         assert_eq!(parsed.kind, BackendKind::Local, "kind mismatch after round-trip");

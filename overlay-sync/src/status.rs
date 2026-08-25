@@ -193,9 +193,9 @@ impl SharedStatus {
 
 /// Format a `SystemTime` as a simplified RFC 3339 string.
 fn format_rfc3339(t: SystemTime) -> String {
-    let d = t.duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default();
-    let secs = d.as_secs();
-    let (days, rem) = (secs / 86400, secs % 86400);
+    let dur = t.duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default();
+    let total_secs = dur.as_secs();
+    let (days, rem) = (total_secs / 86400, total_secs % 86400);
     let (hours, rem) = (rem / 3600, rem % 3600);
     let (mins, secs) = (rem / 60, rem % 60);
 

@@ -56,15 +56,15 @@ pub struct PoolAllocation {
 }
 
 /// Network parameters passed to the engine by the caller.
-pub struct NetworkParams<'a> {
+pub struct NetworkParams<'ctx> {
     /// Pre-allocated pool range from state, if any.
-    pub cluster_pool: Option<&'a str>,
+    pub cluster_pool: Option<&'ctx str>,
     /// This cluster's index in the config cluster list.
     pub cluster_index: usize,
     /// Total number of clusters.
     pub cluster_count: usize,
     /// DNS zone for cross-cluster service discovery.
-    pub dns_zone: &'a str,
+    pub dns_zone: &'ctx str,
 }
 
 // -------------------------------------------------------------
@@ -149,8 +149,8 @@ fn build_template_context(
         stack_name: stack_name.to_owned(),
         properties: cluster.properties.clone(),
         item: None,
-        network: network.map(|n| template::NetworkTemplateVars {
-            dns_zone: n.dns_zone.to_owned(),
+        network: network.map(|net| template::NetworkTemplateVars {
+            dns_zone: net.dns_zone.to_owned(),
             pool: pool.map(ToOwned::to_owned),
         }),
         captures: captures.clone(),
@@ -167,7 +167,7 @@ fn build_step_context(
     let kind_name = kind::kind_cluster_name(&ctx.config.spec.runtime.cluster_prefix, &cluster.name);
     let kube_ctx = kind::kubectl_context(&kind_name);
     let resolved = runtime::resolve(ctx.runner, &ctx.config.spec.runtime.provider)?;
-    let wants_cross = ctx.config.spec.network.as_ref().is_some_and(|n| n.cross_cluster);
+    let wants_cross = ctx.config.spec.network.as_ref().is_some_and(|net| net.cross_cluster);
     if wants_cross {
         networking::require_docker_for_cross_cluster(&resolved.binary)?;
     }
@@ -178,9 +178,9 @@ fn build_step_context(
         state_dir: ctx.state_dir.clone(),
         runtime_binary: resolved.binary,
         network_name,
-        cluster_pool: network.and_then(|n| n.cluster_pool.map(ToOwned::to_owned)),
-        cluster_index: network.map_or(0, |n| n.cluster_index),
-        cluster_count: network.map_or(1, |n| n.cluster_count),
+        cluster_pool: network.and_then(|net| net.cluster_pool.map(ToOwned::to_owned)),
+        cluster_index: network.map_or(0, |net| net.cluster_index),
+        cluster_count: network.map_or(1, |net| net.cluster_count),
         pool_allocation: None,
         pending_captures: BTreeMap::new(),
     })
@@ -399,6 +399,10 @@ fn resolve_exec_arg(idx: usize, arg: &str, config_dir: &Path) -> Result<String, 
 }
 
 /// Capture a kubectl jsonpath result into pending state.
+#[expect(
+    clippy::arithmetic_side_effects,
+    reason = "Instant + Duration cannot panic for reasonable timeouts"
+)]
 fn execute_capture(runner: &dyn CommandRunner, step: &StepSpec, sc: &mut StepContext) -> Result<(), ForgeError> {
     let StepSpec::Capture {
         resource,
@@ -462,7 +466,7 @@ fn execute_template_manifest(
 ) -> Result<(), ForgeError> {
     let resolved = resolve_path(&sc.config_dir, path)?;
     let content = std::fs::read_to_string(&resolved)
-        .map_err(|e| ForgeError::Config(format!("cannot read template manifest '{path}': {e}")))?;
+        .map_err(|err| ForgeError::Config(format!("cannot read template manifest '{path}': {err}")))?;
     let rendered = template::render_with_limit(&content, tpl, steps::MAX_REMOTE_MANIFEST_BYTES)?;
     let spec = steps::kubectl_stdin_apply(&sc.kube_context, rendered.as_bytes());
     let output = runner.run(&spec)?;
@@ -478,7 +482,7 @@ fn execute_template_file(
 ) -> Result<(), ForgeError> {
     let resolved_source = resolve_path(&sc.config_dir, source)?;
     let content = std::fs::read_to_string(&resolved_source)
-        .map_err(|e| ForgeError::Config(format!("cannot read template file '{source}': {e}")))?;
+        .map_err(|err| ForgeError::Config(format!("cannot read template file '{source}': {err}")))?;
     let rendered = template::render_with_limit(&content, tpl, steps::MAX_REMOTE_MANIFEST_BYTES)?;
     let resolved_target = resolve_output_path(&sc.config_dir, &sc.state_dir, target)?;
     write_rendered_file(&resolved_target, rendered.as_bytes())
@@ -493,16 +497,16 @@ fn write_rendered_file(path: &Path, bytes: &[u8]) -> Result<(), ForgeError> {
         )));
     };
     std::fs::create_dir_all(parent)
-        .map_err(|e| ForgeError::Config(format!("cannot create output directory '{}': {e}", parent.display())))?;
+        .map_err(|err| ForgeError::Config(format!("cannot create output directory '{}': {err}", parent.display())))?;
     let file_name = path
         .file_name()
-        .and_then(|n| n.to_str())
+        .and_then(|name| name.to_str())
         .ok_or_else(|| ForgeError::Config(format!("invalid target filename '{}'", path.display())))?;
     let tmp = parent.join(format!(".{file_name}.tmp"));
     std::fs::write(&tmp, bytes)
-        .map_err(|e| ForgeError::Config(format!("cannot write temporary file '{}': {e}", tmp.display())))?;
+        .map_err(|err| ForgeError::Config(format!("cannot write temporary file '{}': {err}", tmp.display())))?;
     std::fs::rename(&tmp, path)
-        .map_err(|e| ForgeError::Config(format!("cannot move rendered file to '{}': {e}", path.display())))
+        .map_err(|err| ForgeError::Config(format!("cannot move rendered file to '{}': {err}", path.display())))
 }
 
 /// Expand a for-each loop over a cluster property array.
@@ -537,7 +541,11 @@ fn lookup_property_array(property: &str, tpl: &TemplateContext) -> Result<Vec<se
         .ok_or_else(|| ForgeError::Config(format!("for-each property '{property}' not found")))?;
     match val {
         serde_json::Value::Array(arr) => Ok(arr.clone()),
-        _ => Err(ForgeError::Config(format!(
+        serde_json::Value::Null
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::String(_)
+        | serde_json::Value::Object(_) => Err(ForgeError::Config(format!(
             "for-each property '{property}' must be an array"
         ))),
     }
@@ -653,9 +661,11 @@ fn restart_coredns(runner: &dyn CommandRunner, context: &str) -> Result<(), Forg
 fn render_step(step: &StepSpec, tpl: &TemplateContext) -> Result<StepSpec, ForgeError> {
     match step {
         StepSpec::Url { url, sha256 } => render_url_step(url, sha256, tpl),
-        StepSpec::Manifest { path } => render_path(path, tpl).map(|p| StepSpec::Manifest { path: p }),
-        StepSpec::Kustomize { path } => render_path(path, tpl).map(|p| StepSpec::Kustomize { path: p }),
-        StepSpec::TemplateManifest { path } => render_path(path, tpl).map(|p| StepSpec::TemplateManifest { path: p }),
+        StepSpec::Manifest { path } => render_path(path, tpl).map(|rendered| StepSpec::Manifest { path: rendered }),
+        StepSpec::Kustomize { path } => render_path(path, tpl).map(|rendered| StepSpec::Kustomize { path: rendered }),
+        StepSpec::TemplateManifest { path } => {
+            render_path(path, tpl).map(|rendered| StepSpec::TemplateManifest { path: rendered })
+        },
         StepSpec::TemplateFile { source, target } => Ok(StepSpec::TemplateFile {
             source: render_path(source, tpl)?,
             target: render_path(target, tpl)?,
@@ -663,7 +673,7 @@ fn render_step(step: &StepSpec, tpl: &TemplateContext) -> Result<StepSpec, Forge
         StepSpec::MetallbAutoPool { name } => render_path(name, tpl).map(|n| StepSpec::MetallbAutoPool { name: n }),
         StepSpec::Helm { .. } => render_helm_step(step, tpl),
         StepSpec::Deployment { .. } => render_deployment_step(step, tpl),
-        StepSpec::Service { name, port, namespace } => render_service_step(name, *port, namespace, tpl),
+        StepSpec::Service { name, port, namespace } => render_service_step(name, *port, namespace.as_ref(), tpl),
         StepSpec::Wait { .. } => render_wait_step(step, tpl),
         StepSpec::Exec { command, env } => Ok(StepSpec::Exec {
             command: render_vec(command, tpl)?,
@@ -722,7 +732,7 @@ fn render_capture_step(step: &StepSpec, tpl: &TemplateContext) -> Result<StepSpe
     };
     Ok(StepSpec::Capture {
         resource: template::render(resource, tpl)?,
-        namespace: render_optional(namespace, tpl)?,
+        namespace: render_optional(namespace.as_ref(), tpl)?,
         jsonpath: jsonpath.clone(),
         key: key.clone(),
         timeout: template::render(timeout, tpl)?,
@@ -746,7 +756,7 @@ fn render_helm_step(step: &StepSpec, tpl: &TemplateContext) -> Result<StepSpec, 
         release: template::render(release, tpl)?,
         chart: template::render(chart, tpl)?,
         version: template::render(version, tpl)?,
-        namespace: render_optional(namespace, tpl)?,
+        namespace: render_optional(namespace.as_ref(), tpl)?,
         values: render_values(values, tpl)?,
     })
 }
@@ -765,7 +775,7 @@ fn render_values(
 /// Render a JSON value, preserving non-string types.
 fn render_json_value(value: &serde_json::Value, tpl: &TemplateContext) -> Result<serde_json::Value, ForgeError> {
     match value {
-        serde_json::Value::String(s) => Ok(serde_json::Value::String(template::render(s, tpl)?)),
+        serde_json::Value::String(text) => Ok(serde_json::Value::String(template::render(text, tpl)?)),
         serde_json::Value::Array(items) => items
             .iter()
             .map(|item| render_json_value(item, tpl))
@@ -776,7 +786,7 @@ fn render_json_value(value: &serde_json::Value, tpl: &TemplateContext) -> Result
             .map(|(key, val)| Ok((key.clone(), render_json_value(val, tpl)?)))
             .collect::<Result<serde_json::Map<_, _>, _>>()
             .map(serde_json::Value::Object),
-        _ => Ok(value.clone()),
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => Ok(value.clone()),
     }
 }
 
@@ -794,7 +804,7 @@ fn render_deployment_step(step: &StepSpec, tpl: &TemplateContext) -> Result<Step
     Ok(StepSpec::Deployment {
         name: template::render(name, tpl)?,
         image: template::render(image, tpl)?,
-        namespace: render_optional(namespace, tpl)?,
+        namespace: render_optional(namespace.as_ref(), tpl)?,
         args: render_vec(args, tpl)?,
     })
 }
@@ -803,7 +813,7 @@ fn render_deployment_step(step: &StepSpec, tpl: &TemplateContext) -> Result<Step
 fn render_service_step(
     name: &str,
     port: u16,
-    namespace: &Option<String>,
+    namespace: Option<&String>,
     tpl: &TemplateContext,
 ) -> Result<StepSpec, ForgeError> {
     Ok(StepSpec::Service {
@@ -828,7 +838,7 @@ fn render_wait_step(step: &StepSpec, tpl: &TemplateContext) -> Result<StepSpec, 
         resource: template::render(resource, tpl)?,
         condition: template::render(condition, tpl)?,
         timeout: template::render(timeout, tpl)?,
-        namespace: render_optional(namespace, tpl)?,
+        namespace: render_optional(namespace.as_ref(), tpl)?,
     })
 }
 
@@ -844,13 +854,13 @@ fn render_coredns_forward_step(step: &StepSpec, tpl: &TemplateContext) -> Result
 }
 
 /// Render an optional string through the template engine.
-fn render_optional(opt: &Option<String>, tpl: &TemplateContext) -> Result<Option<String>, ForgeError> {
-    opt.as_ref().map(|s| template::render(s, tpl)).transpose()
+fn render_optional(opt: Option<&String>, tpl: &TemplateContext) -> Result<Option<String>, ForgeError> {
+    opt.map(|text| template::render(text, tpl)).transpose()
 }
 
 /// Render a vec of strings through the template engine.
 fn render_vec(items: &[String], tpl: &TemplateContext) -> Result<Vec<String>, ForgeError> {
-    items.iter().map(|s| template::render(s, tpl)).collect()
+    items.iter().map(|text| template::render(text, tpl)).collect()
 }
 
 // -------------------------------------------------------------
@@ -921,14 +931,11 @@ fn resolve_output_path(config_dir: &Path, state_dir: &Path, path: &str) -> Resul
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
     use super::*;
     use crate::{
         command::runner::{CommandOutput, MockRunner},
         config::{
-            API_VERSION, ClusterSpec, EnvironmentSpec, ForgeConfig, KIND, Metadata, NodeConfig, RuntimeConfig,
-            RuntimeProvider,
+            API_VERSION, EnvironmentSpec, ForgeConfig, KIND, Metadata, NodeConfig, RuntimeConfig, RuntimeProvider,
         },
         output::OutputFormat,
     };
@@ -969,7 +976,7 @@ mod tests {
 
     /// Build a Forge context whose metadata name intentionally differs from
     /// runtime.clusterPrefix, proving stack operations use the runtime prefix.
-    fn make_forge_context<'a>(runner: &'a dyn CommandRunner, config: &'a ForgeConfig) -> ForgeContext<'a> {
+    fn make_forge_context<'ctx>(runner: &'ctx dyn CommandRunner, config: &'ctx ForgeConfig) -> ForgeContext<'ctx> {
         ForgeContext {
             runner,
             config,
@@ -1089,11 +1096,11 @@ mod tests {
         let calls = runner.calls();
         let call_strs: Vec<String> = calls.iter().map(ToString::to_string).collect();
         assert!(
-            call_strs.iter().any(|s| s.contains("w1.yaml")),
+            call_strs.iter().any(|cmd| cmd.contains("w1.yaml")),
             "should apply w1.yaml: {call_strs:?}"
         );
         assert!(
-            call_strs.iter().any(|s| s.contains("w2.yaml")),
+            call_strs.iter().any(|cmd| cmd.contains("w2.yaml")),
             "should apply w2.yaml: {call_strs:?}"
         );
     }
@@ -1104,7 +1111,7 @@ mod tests {
         let mut sc = make_step_context();
         let mut tpl = make_template_context();
         let items: Vec<serde_json::Value> = (0..=MAX_FOREACH_ITEMS)
-            .map(|i| serde_json::Value::String(format!("item-{i}")))
+            .map(|idx| serde_json::Value::String(format!("item-{idx}")))
             .collect();
         tpl.properties
             .insert("workers".to_owned(), serde_json::Value::Array(items));
@@ -1168,12 +1175,15 @@ mod tests {
         let call = calls.first().unwrap_or_else(|| std::process::abort());
         assert_eq!(call.program, "bash");
         assert_eq!(
-            call.args.first().map(|a| a.to_string_lossy().into_owned()),
+            call.args.first().map(|arg| arg.to_string_lossy().into_owned()),
             Some(script.to_string_lossy().into_owned()),
             "script path must resolve under config_dir"
         );
         assert_eq!(
-            call.args.get(1).map(|a| a.to_string_lossy().into_owned()).as_deref(),
+            call.args
+                .get(1)
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .as_deref(),
             Some("kind-maas-ipp-local"),
             "non-path args must stay unchanged"
         );
@@ -1219,11 +1229,11 @@ mod tests {
         };
         assert_eq!(env.get("GIE_VERSION").map(String::as_str), Some("v1.5.0"));
 
-        let url = StepSpec::Url {
+        let url_step = StepSpec::Url {
             url: "https://example.test/v{{ cluster.properties.gieVersion }}/x.yaml".to_owned(),
             sha256: "{{ cluster.properties.gatewayApiSha256 }}".to_owned(),
         };
-        let rendered_url = render_step(&url, &tpl).unwrap_or_else(|_| std::process::abort());
+        let rendered_url = render_step(&url_step, &tpl).unwrap_or_else(|_| std::process::abort());
         let StepSpec::Url { url, sha256 } = rendered_url else {
             std::process::abort();
         };
@@ -1273,12 +1283,10 @@ mod tests {
             path: "{{ cluster.name }}/manifests".to_owned(),
         };
         let rendered = render_step(&step, &tpl).unwrap_or_else(|_| std::process::abort());
-        match &rendered {
-            StepSpec::Manifest { path } => {
-                assert_eq!(path, "hub/manifests", "template should be resolved");
-            },
-            _ => std::process::abort(),
-        }
+        let StepSpec::Manifest { path } = &rendered else {
+            std::process::abort();
+        };
+        assert_eq!(path, "hub/manifests", "template should be resolved");
     }
 
     #[test]
@@ -1292,11 +1300,11 @@ mod tests {
             std::process::abort();
         };
         assert_eq!(
-            values.get("image").and_then(|v| v.get("repository")),
+            values.get("image").and_then(|val| val.get("repository")),
             Some(&serde_json::Value::String("example/web:v1".to_owned()))
         );
         assert_eq!(
-            values.get("image").and_then(|v| v.get("replicas")),
+            values.get("image").and_then(|val| val.get("replicas")),
             Some(&serde_json::json!(2))
         );
     }
@@ -1337,7 +1345,7 @@ mod tests {
         let calls = runner.calls();
         let apply = calls
             .iter()
-            .find(|c| c.to_string().contains("apply"))
+            .find(|call| call.to_string().contains("apply"))
             .unwrap_or_else(|| std::process::abort());
         assert!(apply.stdin.is_some(), "kubectl apply should have MetalLB YAML on stdin");
     }
@@ -1354,7 +1362,7 @@ mod tests {
         let calls = runner.calls();
         let apply = calls
             .iter()
-            .find(|c| c.to_string().contains("apply"))
+            .find(|call| call.to_string().contains("apply"))
             .unwrap_or_else(|| std::process::abort());
         let stdin_bytes = apply.stdin.as_deref().unwrap_or_else(|| std::process::abort());
         let stdin_text = std::str::from_utf8(stdin_bytes).unwrap_or_else(|_| std::process::abort());
@@ -1382,9 +1390,9 @@ mod tests {
             get_str.contains("get") && get_str.contains("configmap"),
             "first call should get configmap"
         );
-        let apply = calls.iter().find(|c| c.to_string().contains("apply"));
+        let apply = calls.iter().find(|call| call.to_string().contains("apply"));
         assert!(apply.is_some(), "should apply updated configmap");
-        let restart = calls.iter().find(|c| c.to_string().contains("rollout"));
+        let restart = calls.iter().find(|call| call.to_string().contains("rollout"));
         assert!(restart.is_some(), "should restart coredns deployment");
     }
 

@@ -33,6 +33,7 @@ use crate::{
 
 /// Errors from consumer Praxis config generation.
 #[derive(Debug, thiserror::Error)]
+#[expect(unnameable_types, reason = "pub(crate) module restricts reachability")]
 pub enum ConsumerConfigError {
     /// The overlay's `local_site` field is blank.
     #[error("overlay local_site must not be blank")]
@@ -502,7 +503,7 @@ mod tests {
         crd::grid_network::EndpointTransport,
         resources::{
             geography::{AdmissionState, LocalityTier},
-            routing_overlay::{ProjectedCredential, ProjectedCredentialRef, RoutingCandidate},
+            routing_overlay::{ProjectedCredential, ProjectedCredentialRef},
         },
     };
 

@@ -291,6 +291,36 @@ key group, but stronger sender/origin binding is still hardening work.  Do not
 treat distributed CRDT state as fully security-sensitive routing input until
 that work is complete.
 
+## Single-Site and Combined Deployments
+
+SWIM membership is **site-granular**: each Grid operator is a single SWIM node
+carrying its site's identity, and SWIM members are *other sites'* operators - not
+the gateways, providers, or pods inside a site. Seeds (`GridNetwork.spec.seeds`)
+point at other sites, and the operator filters out its own address, so a lone
+site legitimately forms a **single-node mesh with zero peers**.
+
+```text
+Multi-site                              Single / combined site
+--------------------------------        ------------------------------
+site-a operator -- SWIM -- site-b       one operator -- SWIM (self only)
+    |                        |              |
+ local providers        local providers   several gateways / providers
+                                          (NOT SWIM members)
+```
+
+Two things that commonly surprise people on a single or combined cluster:
+
+- **Zero SWIM peers is expected, not a failure.** There is no second site to
+  discover, so do not add SWIM seeds or extra operator replicas to "make
+  discovery work."
+- **Local routing does not require `GridSite.status.phase == Active`.** Local
+  `InferenceProvider`s are eligible regardless of GridSite phase; only *remote*
+  (cross-site CRDT) provider records are phase-gated. So a single-site deployment
+  routes to its local providers even while its own `GridSite` is `Pending`.
+
+See the [GridSite lifecycle](crds.md#gridsite) for the phase machine and this
+single-site behavior.
+
 ## Routing Overlays
 
 For each gateway reference on a `GridNetwork`, the operator writes a
