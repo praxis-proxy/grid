@@ -65,6 +65,23 @@ const ALIBABA_CLOUD_METADATA_V4: Ipv4Addr = Ipv4Addr::new(100, 100, 100, 200);
 /// would add `status.reason` cardinality without adding diagnostic value.
 const ENDPOINT_TLS_IDENTITY_MISMATCH: &str = "EndpointTlsIdentityMismatch";
 
+/// Maximum number of tool names persisted to `status.discoveredTools` from
+/// a single probe.
+///
+/// Bounds the Kubernetes status object's size against a server advertising
+/// an implausibly large tool catalog; ordinary MCP servers advertise a
+/// handful to a few dozen tools. Applied after deduplication, so it only
+/// discards genuinely distinct names beyond this limit.
+const MAX_DISCOVERED_TOOLS: usize = 500;
+
+/// Maximum length, in bytes, of a single tool name persisted to
+/// `status.discoveredTools`.
+///
+/// Bounds per-entry size against a server advertising implausibly long
+/// tool names. Truncation lands on a UTF-8 character boundary so it never
+/// produces invalid UTF-8.
+const MAX_TOOL_NAME_LEN: usize = 256;
+
 // ---------------------------------------------------------------------------
 // McpProbeOutcome
 // ---------------------------------------------------------------------------
@@ -176,6 +193,40 @@ pub(crate) fn discovered_tools_after_probe(previous: &[String], outcome: &McpPro
 /// the name is surfaced on `status.discoveredTools`.
 pub(crate) fn discovered_tool_names(tools: &[rmcp::model::Tool]) -> Vec<String> {
     tools.iter().map(|tool| tool.name.clone().into_owned()).collect()
+}
+
+/// Truncate `name` to at most [`MAX_TOOL_NAME_LEN`] bytes, landing on a
+/// UTF-8 character boundary so truncation never produces invalid UTF-8.
+fn truncate_tool_name(name: String) -> String {
+    if name.len() <= MAX_TOOL_NAME_LEN {
+        return name;
+    }
+    let mut end = MAX_TOOL_NAME_LEN;
+    while end > 0 && !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut truncated = name;
+    truncated.truncate(end);
+    truncated
+}
+
+/// Bound and normalize a raw list of discovered tool names before it is
+/// persisted to `status.discoveredTools`.
+///
+/// Applies, in order: (1) per-name truncation to [`MAX_TOOL_NAME_LEN`]
+/// bytes, (2) deduplication and sorting — tool order is not semantically
+/// meaningful, and a server returning the same catalog in a different
+/// order must not trigger a status patch on a later reconcile — and (3)
+/// truncation of the deduplicated list to at most [`MAX_DISCOVERED_TOOLS`]
+/// entries. Keeps both the persisted Kubernetes status object and this
+/// reconciler's own memory use bounded against a server advertising an
+/// implausibly large or malformed tool catalog.
+pub(crate) fn bound_and_normalize_discovered_tools(names: Vec<String>) -> Vec<String> {
+    let mut names: Vec<String> = names.into_iter().map(truncate_tool_name).collect();
+    names.sort();
+    names.dedup();
+    names.truncate(MAX_DISCOVERED_TOOLS);
+    names
 }
 
 /// Classify a post-connect `tools/list` call failure into a [`McpProbeOutcome`].
@@ -760,7 +811,9 @@ async fn run_probe_session(
     match tokio::time::timeout(timeout, Box::pin(running.list_tools(None))).await {
         Err(_elapsed) => McpProbeOutcome::Unreachable,
         Ok(Err(service_err)) => classify_list_tools_failure(observed_status_from_service_error(&service_err)),
-        Ok(Ok(page)) => McpProbeOutcome::Success(discovered_tool_names(&page.tools)),
+        Ok(Ok(page)) => {
+            McpProbeOutcome::Success(bound_and_normalize_discovered_tools(discovered_tool_names(&page.tools)))
+        },
     }
 }
 
@@ -1082,6 +1135,88 @@ mod tests {
             Err(McpProbeOutcome::AuthConfigInvalid),
             "a token that cannot be encoded as an HTTP header value must fail the probe closed, \
              not proceed unauthenticated"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // bound_and_normalize_discovered_tools
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn small_valid_list_passes_through_sorted() {
+        let names = vec!["fetch".to_owned(), "search".to_owned()];
+        assert_eq!(
+            bound_and_normalize_discovered_tools(names),
+            vec!["fetch".to_owned(), "search".to_owned()],
+            "an already-small, already-sorted list must pass through unchanged"
+        );
+    }
+
+    #[test]
+    fn out_of_order_names_are_sorted() {
+        let names = vec!["search".to_owned(), "fetch".to_owned()];
+        assert_eq!(
+            bound_and_normalize_discovered_tools(names),
+            vec!["fetch".to_owned(), "search".to_owned()],
+            "tool order is not semantically meaningful and must be normalized to avoid \
+             unnecessary status churn on later reconciles"
+        );
+    }
+
+    #[test]
+    fn duplicate_names_are_deduplicated() {
+        let names = vec!["search".to_owned(), "fetch".to_owned(), "search".to_owned()];
+        assert_eq!(
+            bound_and_normalize_discovered_tools(names),
+            vec!["fetch".to_owned(), "search".to_owned()],
+            "duplicate tool names must be collapsed to one entry"
+        );
+    }
+
+    #[test]
+    fn overly_long_name_is_truncated_at_a_char_boundary() {
+        let long_name = "€".repeat(MAX_TOOL_NAME_LEN); // multi-byte codepoint, byte length != char count
+        let result = bound_and_normalize_discovered_tools(vec![long_name]);
+        assert_eq!(result.len(), 1);
+        let truncated = result.first().expect("one entry must remain");
+        assert!(
+            truncated.len() <= MAX_TOOL_NAME_LEN,
+            "a name longer than the byte limit must be truncated to at most {MAX_TOOL_NAME_LEN} bytes"
+        );
+        assert!(
+            truncated.is_char_boundary(truncated.len()),
+            "truncation must never split a multi-byte UTF-8 codepoint"
+        );
+    }
+
+    #[test]
+    fn name_at_exactly_the_limit_is_not_truncated() {
+        let name = "a".repeat(MAX_TOOL_NAME_LEN);
+        let result = bound_and_normalize_discovered_tools(vec![name.clone()]);
+        assert_eq!(
+            result,
+            vec![name],
+            "a name exactly at the byte limit must not be altered"
+        );
+    }
+
+    #[test]
+    fn tool_count_beyond_the_limit_is_truncated() {
+        let names: Vec<String> = (0..MAX_DISCOVERED_TOOLS + 10).map(|i| format!("tool-{i:05}")).collect();
+        let result = bound_and_normalize_discovered_tools(names);
+        assert_eq!(
+            result.len(),
+            MAX_DISCOVERED_TOOLS,
+            "a catalog advertising more than {MAX_DISCOVERED_TOOLS} distinct tools must be truncated \
+             to keep the persisted status object bounded"
+        );
+    }
+
+    #[test]
+    fn empty_list_stays_empty() {
+        assert!(
+            bound_and_normalize_discovered_tools(vec![]).is_empty(),
+            "an empty catalog must remain empty, not panic or fabricate entries"
         );
     }
 
@@ -1820,7 +1955,7 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    async fn probe_against_real_server_discovers_tools_in_order() {
+    async fn probe_against_real_server_discovers_tools_sorted() {
         let endpoint = spawn_mcp_server(&["read_file", "list_directory"], None).await;
         let kube_client = unused_kube_client();
 
@@ -1838,8 +1973,8 @@ mod integration_tests {
 
         assert_eq!(
             outcome,
-            McpProbeOutcome::Success(vec!["read_file".to_owned(), "list_directory".to_owned()]),
-            "a real tools/list round trip must surface the server's tool names in order"
+            McpProbeOutcome::Success(vec!["list_directory".to_owned(), "read_file".to_owned()]),
+            "a real tools/list round trip must surface the server's tool names, normalized to sorted order"
         );
     }
 
