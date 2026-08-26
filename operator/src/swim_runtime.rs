@@ -1215,6 +1215,11 @@ fn canonical_state_payload(broadcast: &swim::StateBroadcast) -> Result<Vec<u8>, 
 /// that joins before it has any local `GridNetwork` can still advertise its
 /// data-plane gateway address to peers.  The broadcast carries an empty CRDT
 /// snapshot and only updates the peer gateway-address map.
+///
+/// Deliberately leaves [`swim::StateBroadcast::grid_id`] as `None`: this
+/// broadcast can fire before the node has joined any `GridNetwork`, so no
+/// `grid_id` is available yet here. `publish_real_provider_state` in the
+/// `grid_network` controller attaches `grid_id` once a `GridNetwork` exists.
 fn publish_gateway_address_broadcast(node: &mut SwimNode, site_name: &str, revision: u64, gateway_address: &str) {
     let broadcast = swim::StateBroadcast::new(
         site_name.to_owned(),

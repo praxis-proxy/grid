@@ -14,13 +14,16 @@ bytes = { workspace = true }
 crdt = { path = "../crdt" }
 foca = { workspace = true }
 rand = { workspace = true }
+ring = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
 tracing = { workspace = true }
 
 [dev-dependencies]
+rcgen = { workspace = true }
 serde_json = { workspace = true }
+x509-parser = { workspace = true }
 
 [lints]
 workspace = true

@@ -26,6 +26,8 @@ pub mod identity;
 pub mod node;
 /// Foca runtime adapter with accumulated output.
 pub mod runtime;
+/// ECDSA P-256 sign/verify primitives for SWIM state broadcasts.
+pub mod signing;
 /// State snapshot payloads for SWIM custom broadcasts.
 pub mod state_broadcast;
 
@@ -33,7 +35,8 @@ pub use event::MemberEvent;
 pub use identity::NodeId;
 pub use node::SwimNode;
 pub use runtime::{AccumulatedOutput, GridRuntime};
+pub use signing::{SigningError, VerificationError};
 pub use state_broadcast::{
-    STATE_BROADCAST_VERSION, STATE_BROADCAST_VERSION_V1, StateBroadcast, StateBroadcastError, StateBroadcastHandler,
-    StateBroadcastKey,
+    MAX_PINNED_KEYS_PER_ORIGIN, STATE_BROADCAST_VERSION, STATE_BROADCAST_VERSION_V1, StateBroadcast,
+    StateBroadcastError, StateBroadcastHandler, StateBroadcastKey, TooManyPinnedKeys, TrustStore,
 };
