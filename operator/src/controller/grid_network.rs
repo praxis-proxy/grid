@@ -399,7 +399,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
 
     // Publish real InferenceProvider-derived CRDT state so peers learn this site's providers.
     let distributed_provider_count = if let Some(swim) = ctx.swim.as_ref().filter(|handle| handle.is_running()) {
-        publish_real_provider_state(swim, name, &providers, &raw_metrics);
+        publish_real_provider_state(swim, name, &grid_id, &providers, &raw_metrics);
         count_remote_provider_records(swim, name)
     } else {
         0
@@ -1569,9 +1569,15 @@ fn provider_revision(provider: &InferenceProvider) -> u64 {
 /// remote sites can learn which providers exist and avoid routing to unhealthy
 /// ones.  The routing overlay layer already filters `Unavailable` providers
 /// from local routing decisions.
+///
+/// `grid_id` (the caller's already-[`resolve_grid_id`]d value) is attached to
+/// the broadcast so a signature over this `GridNetwork`'s state cannot be
+/// replayed as valid for a different `GridNetwork` sharing the same
+/// cluster's `SwimHandle` — see [`swim::StateBroadcast::grid_id`].
 fn publish_real_provider_state(
     swim: &SwimHandle,
     network_name: &str,
+    grid_id: &str,
     providers: &[InferenceProvider],
     raw_metrics: &HashMap<String, scoring::BackendMetrics>,
 ) {
@@ -1609,7 +1615,8 @@ fn publish_real_provider_state(
     // Use the highest provider revision as this origin's broadcast revision.
     // Duplicate unchanged broadcasts are idempotent; newer Kubernetes writes
     // advance resourceVersion and therefore advance the broadcast revision.
-    let bc = StateBroadcast::new(site_name.to_owned(), max_revision, snap, gateway_address);
+    let bc = StateBroadcast::new(site_name.to_owned(), max_revision, snap, gateway_address)
+        .with_grid_id(Some(grid_id.to_owned()));
     if let Err(e) = swim.publish_state_broadcast(bc) {
         tracing::debug!(error = %e, "CRDT broadcast channel unavailable — runtime not yet receiving");
     }
