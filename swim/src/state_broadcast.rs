@@ -1469,6 +1469,68 @@ mod tests {
     }
 
     #[test]
+    fn receive_item_rejects_a_broadcast_signed_by_a_key_dropped_from_a_completed_rotation() {
+        // Same rejection path as the wrong-key test, but exercised as a
+        // rotation *completion*: the old key is fully retired (not just
+        // outnumbered by a new one), so a straggler still signing with it
+        // must be rejected exactly like an impostor would be.
+        let (mut handler, _control) = StateBroadcastHandler::with_capacity("site-local".to_owned(), 8);
+        let (retired_key, retired_pubkey) = generate_signing_key_and_pubkey();
+        handler
+            .trust_store_sender()
+            .send_modify(|store| drop(store.insert("site-p".to_owned(), vec![retired_pubkey])));
+        let (_current_key, current_pubkey) = generate_signing_key_and_pubkey();
+        handler
+            .trust_store_sender()
+            .send_modify(|store| drop(store.insert("site-p".to_owned(), vec![current_pubkey])));
+
+        let unsigned = StateBroadcast::new("site-p".to_owned(), 1, snapshot("site-p", 1, 0.1), None)
+            .with_signed_at(Some(now_ms()));
+        let signature = crate::signing::sign_ecdsa_p256(
+            &retired_key,
+            &unsigned.signable_bytes().unwrap_or_else(|_| std::process::abort()),
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        let bytes = unsigned
+            .with_signature(Some(signature))
+            .encode()
+            .unwrap_or_else(|_| std::process::abort());
+
+        let result = handler.receive_item(&bytes, None);
+
+        assert!(
+            matches!(&result, Err(StateBroadcastError::SignatureInvalid { origin_site }) if origin_site.as_str() == "site-p"),
+            "a broadcast signed by a key retired at the end of rotation must be rejected, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn receive_item_rejects_a_malformed_signature_without_panicking() {
+        // Distinct from "signed by the wrong key": this signature isn't a
+        // well-formed ECDSA signature at all, proving the verifier fails
+        // closed on garbage input instead of panicking on it.
+        let (mut handler, _control) = StateBroadcastHandler::with_capacity("site-local".to_owned(), 8);
+        let (_signing_key, pubkey) = generate_signing_key_and_pubkey();
+        handler
+            .trust_store_sender()
+            .send_modify(|store| drop(store.insert("site-p".to_owned(), vec![pubkey])));
+
+        let unsigned = StateBroadcast::new("site-p".to_owned(), 1, snapshot("site-p", 1, 0.1), None)
+            .with_signed_at(Some(now_ms()));
+        let bytes = unsigned
+            .with_signature(Some(vec![0xFF; 4]))
+            .encode()
+            .unwrap_or_else(|_| std::process::abort());
+
+        let result = handler.receive_item(&bytes, None);
+
+        assert!(
+            matches!(&result, Err(StateBroadcastError::SignatureInvalid { origin_site }) if origin_site.as_str() == "site-p"),
+            "a malformed signature must be rejected cleanly, not panic, got {result:?}"
+        );
+    }
+
+    #[test]
     #[expect(
         clippy::too_many_lines,
         reason = "verifies acceptance under both the 'next' and 'current' pinned keys in one proof"
