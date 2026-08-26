@@ -16,7 +16,10 @@ use tokio::sync::watch;
 use crate::{
     AccumulatedOutput, GridRuntime, NodeId,
     runtime::TimerEvent,
-    state_broadcast::{DEFAULT_MAX_RETAINED_ORIGINS, OriginStateHandle, StateBroadcast, StateBroadcastHandler},
+    state_broadcast::{
+        DEFAULT_MAX_RETAINED_ORIGINS, MAX_PINNED_KEYS_PER_ORIGIN, OriginStateHandle, StateBroadcast,
+        StateBroadcastHandler, TooManyPinnedKeys, TrustStore,
+    },
 };
 
 // ---------------------------------------------------------------------------
@@ -66,6 +69,10 @@ pub struct SwimNode {
 
     /// Immediate control path for coordinated per-origin state eviction.
     origin_state: OriginStateHandle,
+
+    /// Sender for the pinned-identity trust store read by the broadcast
+    /// handler inside `foca`. See [`SwimNode::pin_origin`].
+    trust_store_tx: watch::Sender<TrustStore>,
 }
 
 impl SwimNode {
@@ -108,6 +115,7 @@ impl SwimNode {
         let state_rx = handler.subscribe();
         let gateway_addrs_rx = handler.subscribe_gateway_addrs();
         let cert_pems_rx = handler.subscribe_cert_pems();
+        let trust_store_tx = handler.trust_store_sender();
 
         Self {
             foca: foca::Foca::with_custom_broadcast(identity, grid_config(), rng, codec, handler),
@@ -116,12 +124,58 @@ impl SwimNode {
             gateway_addrs_rx,
             cert_pems_rx,
             origin_state,
+            trust_store_tx,
         }
     }
 
     /// Immediately remove provider, metadata, and revision state for one origin.
     pub fn evict_origin(&self, origin: &str) {
         self.origin_state.remove_origin(origin);
+    }
+
+    /// Pin `origin` to a bounded set of accepted raw ECDSA P-256 public keys.
+    ///
+    /// If `origin` has no existing pin (or its existing pin is empty),
+    /// immediately purges any state already merged from that origin via
+    /// [`evict_origin`](Self::evict_origin) before installing the new pin —
+    /// so state accepted from `origin` while it was unauthenticated cannot
+    /// silently remain trusted once signature enforcement begins for it.
+    /// Updating an *existing* non-empty pin (e.g. adding a next key during
+    /// rotation, or dropping a retired one) does not purge state, since
+    /// that update never crosses the unauthenticated-to-authenticated
+    /// boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TooManyPinnedKeys`] if `keys` has more than
+    /// [`MAX_PINNED_KEYS_PER_ORIGIN`] entries, without changing the trust
+    /// store.
+    pub fn pin_origin(&self, origin: String, keys: Vec<Vec<u8>>) -> Result<(), TooManyPinnedKeys> {
+        if keys.len() > MAX_PINNED_KEYS_PER_ORIGIN {
+            return Err(TooManyPinnedKeys {
+                origin,
+                supplied: keys.len(),
+            });
+        }
+        let was_unpinned = self.trust_store_tx.borrow().get(&origin).is_none_or(Vec::is_empty);
+        if was_unpinned {
+            self.evict_origin(&origin);
+        }
+        self.trust_store_tx.send_modify(|store| {
+            store.insert(origin, keys);
+        });
+        Ok(())
+    }
+
+    /// Remove `origin`'s pin, returning it to unenforced (pass-through) status.
+    ///
+    /// Does not purge `origin`'s currently merged state — unpinning is a
+    /// deliberate relaxation, not a security event, and the state was
+    /// already accepted under whatever enforcement applied when it arrived.
+    pub fn unpin_origin(&self, origin: &str) {
+        self.trust_store_tx.send_modify(|store| {
+            store.remove(origin);
+        });
     }
 
     /// Feed an incoming UDP packet to foca.
@@ -373,6 +427,195 @@ mod tests {
         let bc = StateBroadcast::new("site-a".to_owned(), 1, snap, None);
         node.publish_state_broadcast(&bc)
             .unwrap_or_else(|_| std::process::abort());
+    }
+
+    // -----------------------------------------------------------------------
+    // Trust-store pinning
+    // -----------------------------------------------------------------------
+
+    /// Generate an ECDSA P-256 signing key plus the raw SPKI EC point a
+    /// verifier needs, independent of *how* a real deployment would source
+    /// or pin this key material (grid#75, still open).
+    fn generate_signing_key_and_pubkey() -> (Vec<u8>, Vec<u8>) {
+        let key_pair = rcgen::KeyPair::generate().unwrap_or_else(|_| std::process::abort());
+        let pkcs8_der = key_pair.serialize_der();
+        let params = rcgen::CertificateParams::new(vec!["spike.grid.internal".to_owned()])
+            .unwrap_or_else(|_| std::process::abort());
+        let cert = params.self_signed(&key_pair).unwrap_or_else(|_| std::process::abort());
+        let (_, parsed) = x509_parser::parse_x509_certificate(cert.der()).unwrap_or_else(|_| std::process::abort());
+        let raw_pubkey = parsed.public_key().subject_public_key.as_ref().to_vec();
+        (pkcs8_der, raw_pubkey)
+    }
+
+    /// Return the current wall-clock time in milliseconds since the Unix
+    /// epoch, for constructing test broadcasts with a fresh `signed_at_ms`.
+    fn now_ms() -> u64 {
+        u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_else(|_| std::process::abort())
+                .as_millis(),
+        )
+        .unwrap_or_else(|_| std::process::abort())
+    }
+
+    #[test]
+    fn pin_origin_rejects_more_than_the_max_pinned_keys() {
+        let (node, _) = make_node("site-b", 19_230);
+
+        let result = node.pin_origin("site-p".to_owned(), vec![vec![1], vec![2], vec![3]]);
+
+        assert!(
+            matches!(&result, Err(TooManyPinnedKeys { origin, supplied }) if origin == "site-p" && *supplied == 3),
+            "pinning 3 keys (over MAX_PINNED_KEYS_PER_ORIGIN=2) must be rejected, got {result:?}"
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "establishes membership, publishes unpinned state, then pins and re-checks purge in one proof"
+    )]
+    fn pin_origin_purges_previously_unauthenticated_state_from_that_origin() {
+        let id_a = local_id("site-a", 19_231);
+        let id_b = local_id("site-b", 19_232);
+        let (mut node_a, _) = make_node("site-a", 19_231);
+        let (mut node_b, _) = make_node("site-b", 19_232);
+        establish_membership(&mut node_a, &mut node_b, &id_a, &id_b);
+
+        // A publishes unsigned state; B has no pin for A yet, so it merges.
+        node_a
+            .publish_state_broadcast(&StateBroadcast::new(
+                "site-a".to_owned(),
+                1,
+                provider_snap("site-a", 0.4),
+                None,
+            ))
+            .unwrap_or_else(|_| std::process::abort());
+        for msg in &node_a.gossip().messages {
+            if msg.addr == id_b.socket_addr() {
+                drop(node_b.handle_data(&msg.data));
+            }
+        }
+        assert!(
+            node_b
+                .state_snapshot()
+                .provider("net", "site-a", "provider-1")
+                .is_some(),
+            "B must have accepted A's unsigned, unpinned state"
+        );
+
+        let (_key, pubkey) = generate_signing_key_and_pubkey();
+        node_b
+            .pin_origin("site-a".to_owned(), vec![pubkey])
+            .unwrap_or_else(|_| std::process::abort());
+
+        assert!(
+            node_b
+                .state_snapshot()
+                .provider("net", "site-a", "provider-1")
+                .is_none(),
+            "pinning a previously-unpinned origin for the first time must purge its unauthenticated state"
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "establishes membership, pins, signs+publishes, and re-pins with a rotated key set in one proof"
+    )]
+    fn pin_origin_rotation_update_does_not_purge_already_authenticated_state() {
+        let id_a = local_id("site-a", 19_233);
+        let id_b = local_id("site-b", 19_234);
+        let (mut node_a, _) = make_node("site-a", 19_233);
+        let (mut node_b, _) = make_node("site-b", 19_234);
+        establish_membership(&mut node_a, &mut node_b, &id_a, &id_b);
+
+        let (signing_key, current_pubkey) = generate_signing_key_and_pubkey();
+        node_b
+            .pin_origin("site-a".to_owned(), vec![current_pubkey.clone()])
+            .unwrap_or_else(|_| std::process::abort());
+
+        let unsigned = StateBroadcast::new("site-a".to_owned(), 1, provider_snap("site-a", 0.5), None)
+            .with_signed_at(Some(now_ms()));
+        let signature = crate::signing::sign_ecdsa_p256(
+            &signing_key,
+            &unsigned.signable_bytes().unwrap_or_else(|_| std::process::abort()),
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        node_a
+            .publish_state_broadcast(&unsigned.with_signature(Some(signature)))
+            .unwrap_or_else(|_| std::process::abort());
+        for msg in &node_a.gossip().messages {
+            if msg.addr == id_b.socket_addr() {
+                drop(node_b.handle_data(&msg.data));
+            }
+        }
+        assert!(
+            node_b
+                .state_snapshot()
+                .provider("net", "site-a", "provider-1")
+                .is_some(),
+            "B must have accepted A's correctly signed, pinned state"
+        );
+
+        // Rotation: add a next key alongside the current one. This is an
+        // update to an existing non-empty pin, not a first-time pin.
+        let (_next_key, next_pubkey) = generate_signing_key_and_pubkey();
+        node_b
+            .pin_origin("site-a".to_owned(), vec![current_pubkey, next_pubkey])
+            .unwrap_or_else(|_| std::process::abort());
+
+        assert!(
+            node_b
+                .state_snapshot()
+                .provider("net", "site-a", "provider-1")
+                .is_some(),
+            "rotating an already-pinned origin's key set must not purge its already-authenticated state"
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "establishes membership, publishes state, then unpins and re-checks retention in one proof"
+    )]
+    fn unpin_origin_does_not_purge_existing_state() {
+        let id_a = local_id("site-a", 19_235);
+        let id_b = local_id("site-b", 19_236);
+        let (mut node_a, _) = make_node("site-a", 19_235);
+        let (mut node_b, _) = make_node("site-b", 19_236);
+        establish_membership(&mut node_a, &mut node_b, &id_a, &id_b);
+
+        node_a
+            .publish_state_broadcast(&StateBroadcast::new(
+                "site-a".to_owned(),
+                1,
+                provider_snap("site-a", 0.6),
+                None,
+            ))
+            .unwrap_or_else(|_| std::process::abort());
+        for msg in &node_a.gossip().messages {
+            if msg.addr == id_b.socket_addr() {
+                drop(node_b.handle_data(&msg.data));
+            }
+        }
+        assert!(
+            node_b
+                .state_snapshot()
+                .provider("net", "site-a", "provider-1")
+                .is_some()
+        );
+
+        node_b.unpin_origin("site-a");
+
+        assert!(
+            node_b
+                .state_snapshot()
+                .provider("net", "site-a", "provider-1")
+                .is_some(),
+            "unpinning an origin must not purge its currently merged state"
+        );
     }
 
     // -----------------------------------------------------------------------

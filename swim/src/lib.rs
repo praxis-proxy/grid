@@ -37,6 +37,6 @@ pub use node::SwimNode;
 pub use runtime::{AccumulatedOutput, GridRuntime};
 pub use signing::{SigningError, VerificationError};
 pub use state_broadcast::{
-    STATE_BROADCAST_VERSION, STATE_BROADCAST_VERSION_V1, StateBroadcast, StateBroadcastError, StateBroadcastHandler,
-    StateBroadcastKey, TrustStore,
+    MAX_PINNED_KEYS_PER_ORIGIN, STATE_BROADCAST_VERSION, STATE_BROADCAST_VERSION_V1, StateBroadcast,
+    StateBroadcastError, StateBroadcastHandler, StateBroadcastKey, TooManyPinnedKeys, TrustStore,
 };

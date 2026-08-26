@@ -8,6 +8,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex, MutexGuard, PoisonError},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use crdt::GridStateSnapshot;
@@ -33,6 +34,40 @@ pub const STATE_BROADCAST_VERSION: u16 = STATE_BROADCAST_VERSION_V1;
 
 /// Default hard bound for distinct origins retained by one broadcast handler.
 pub const DEFAULT_MAX_RETAINED_ORIGINS: usize = 1_024;
+
+/// Domain-separation prefix mixed into every state-broadcast signature.
+///
+/// Binds a signature to this exact protocol, message type, and wire-format
+/// version, so it can never be replayed as valid input to a different
+/// signing context even if the same ECDSA key were ever reused elsewhere.
+///
+/// Scopes a signature to *this protocol*, not to a particular
+/// `GridNetwork`: that narrower scoping is [`StateBroadcast::grid_id`]'s
+/// job, since a node can publish a broadcast before joining any
+/// `GridNetwork` and so cannot always supply one. Anything broader than a
+/// single cluster's `GridNetwork`s — cross-deployment or per-peer mesh
+/// identity — remains out of scope for this constant and for `grid_id`
+/// alike.
+const SIGNATURE_DOMAIN: &[u8] = b"praxis-grid/swim/state-broadcast/v1";
+
+/// Maximum age, in milliseconds, of a pinned origin's signed broadcast
+/// timestamp before it is rejected as stale.
+///
+/// Set to several orders of magnitude above the default 5-second SWIM probe
+/// interval (`default_probe_interval` in `operator/src/crd/grid_network.rs`),
+/// comfortably covering ordinary gossip fan-out delay while still bounding a
+/// captured signature's replay window to minutes rather than leaving it
+/// unbounded. See [`StateBroadcast::signed_at_ms`] for what this window does
+/// and does not defend against.
+pub const MAX_BROADCAST_AGE_MS: u64 = 5 * 60 * 1_000;
+
+/// Maximum amount, in milliseconds, a pinned origin's signed broadcast
+/// timestamp may be ahead of this node's own clock before it is rejected.
+///
+/// Tolerates ordinary clock drift between SWIM peers without opening a
+/// window for a broadcast timestamped far in the future to keep outrunning
+/// [`MAX_BROADCAST_AGE_MS`] on every receiving peer.
+pub const MAX_CLOCK_SKEW_AHEAD_MS: u64 = 30_000;
 
 /// Broadcast envelope carrying one CRDT grid-state snapshot.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -74,14 +109,85 @@ pub struct StateBroadcast {
     /// [`StateBroadcastHandler::receive_item`]: foca::BroadcastHandler::receive_item
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signature: Option<Vec<u8>>,
+
+    /// Wall-clock time this broadcast was signed, in milliseconds since the
+    /// Unix epoch.
+    ///
+    /// `None` under the same conditions as [`signature`](Self::signature)
+    /// — no signing key configured, or the pre-rollout window. Included in
+    /// [`signable_bytes`](Self::signable_bytes) so a captured signature
+    /// cannot be re-attached to a forged, more-recent timestamp. A receiver
+    /// holding a pinned identity for `origin_site` rejects a signature whose
+    /// timestamp is more than [`MAX_BROADCAST_AGE_MS`] in the past, or more
+    /// than [`MAX_CLOCK_SKEW_AHEAD_MS`] in the future, bounding how long a
+    /// captured, validly signed broadcast can be replayed as current.
+    ///
+    /// Bounds only the *replay window*, not full replay elimination: this
+    /// value is never persisted, so a process restart resets every
+    /// receiver's notion of "now" relative to nothing durable. Full replay
+    /// elimination needs a persisted, monotonic revision floor surviving
+    /// restarts, which this in-memory crate does not provide.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signed_at_ms: Option<u64>,
+
+    /// Identifier of the `GridNetwork` this broadcast's state belongs to.
+    ///
+    /// Included in [`signable_bytes`](Self::signable_bytes) so a signature
+    /// is scoped to one `GridNetwork`: issue [#48] documents that a single
+    /// cluster can run multiple `GridNetwork`s as separate tenants,
+    /// environments, or trust domains with independent provider
+    /// inventories, yet one `SwimHandle` is shared across every
+    /// `GridNetwork` reconcile on that cluster. Without this field, a
+    /// signature valid for one `GridNetwork` would also verify, bit for
+    /// bit, as a broadcast claiming to belong to another `GridNetwork` on
+    /// the same cluster — a cross-tenant replay that would defeat #48's
+    /// stated isolation guarantee.
+    ///
+    /// `None` for broadcasts published before a node has joined any
+    /// `GridNetwork` (e.g. a bare gateway-address advertisement — see
+    /// `publish_gateway_address_broadcast` in the operator crate), and for
+    /// broadcasts from operators old enough to predate this field.
+    ///
+    /// [#48]: https://github.com/praxis-proxy/grid/issues/48
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub grid_id: Option<String>,
 }
 
-/// Raw uncompressed EC point, keyed by origin site name.
+/// Maximum number of raw public keys retained per pinned origin.
 ///
-/// Deliberately opaque to *how* a pinned identity was established — that is
-/// an operator-level concern (see [`crate::signing`]).  An origin with no
-/// entry here is not yet enforced against a signature.
-pub type TrustStore = BTreeMap<String, Vec<u8>>;
+/// Mirrors `GridSiteTrustPolicy.canonical_fingerprints`'s dual-pin bound for
+/// mTLS certificate rotation (`operator/src/crd/grid_site.rs`): one slot for
+/// the current signing key and one for a next key during a bounded rotation
+/// overlap window.
+pub const MAX_PINNED_KEYS_PER_ORIGIN: usize = 2;
+
+/// Bounded set of accepted raw ECDSA P-256 public keys, keyed by origin site
+/// name.
+///
+/// Each value holds up to [`MAX_PINNED_KEYS_PER_ORIGIN`] raw uncompressed EC
+/// points. A broadcast's signature verifies if it is valid under **any** key
+/// in its origin's pinned set — this is what makes bounded key rotation
+/// possible without an instantaneous flag-day cutover: a site publishes a
+/// next key alongside its current one, callers add the next key to the pin
+/// set, and once every peer has observed the rotation the old key is
+/// dropped. Deliberately opaque to *how* a pinned identity was established —
+/// that is an operator-level concern (see [`crate::signing`]). An origin
+/// with no entry, or an empty entry, is not yet enforced against a
+/// signature. Prefer [`crate::node::SwimNode::pin_origin`] over mutating
+/// this map directly through [`StateBroadcastHandler::trust_store_sender`]:
+/// `pin_origin` also purges any state accepted from an origin before it had
+/// a pin, which a raw `watch::Sender::send`/`send_modify` call does not.
+pub type TrustStore = BTreeMap<String, Vec<Vec<u8>>>;
+
+/// A caller supplied more than [`MAX_PINNED_KEYS_PER_ORIGIN`] keys for one origin.
+#[derive(Debug, thiserror::Error)]
+#[error("origin {origin} was pinned with {supplied} keys, exceeding the max of {MAX_PINNED_KEYS_PER_ORIGIN}")]
+pub struct TooManyPinnedKeys {
+    /// Origin site the caller attempted to pin.
+    pub origin: String,
+    /// Number of keys the caller supplied.
+    pub supplied: usize,
+}
 
 /// Base wire-format struct.
 ///
@@ -114,16 +220,56 @@ struct BroadcastExtension {
     /// extension fields. Absent on older peers and pre-rollout broadcasts.
     #[serde(default)]
     signature: Option<Vec<u8>>,
+    /// Optional wall-clock signing timestamp, milliseconds since the Unix
+    /// epoch. Absent on older peers and pre-rollout broadcasts.
+    #[serde(default)]
+    signed_at_ms: Option<u64>,
+    /// Optional owning `GridNetwork` identifier. Absent on older peers,
+    /// pre-rollout broadcasts, and broadcasts published before a node has
+    /// joined any `GridNetwork`.
+    #[serde(default)]
+    grid_id: Option<String>,
 }
+
+/// Extension format used by peers that predate both the `signed_at_ms` and
+/// `grid_id` fields.
+///
+/// bincode is not self-describing, so decoding a three-field payload as the
+/// current five-field [`BroadcastExtension`] fails partway through the
+/// fourth field rather than falling back to `#[serde(default)]` — `decode`
+/// tries this shape before falling further back through every prior wire
+/// format, so a rolling update does not silently drop or misdecode
+/// `gateway_address`/`site_cert_pem`/`signature` from not-yet-upgraded peers.
+#[derive(Serialize, Deserialize)]
+struct PreTimestampBroadcastExtension {
+    /// Optional data-plane gateway address.
+    gateway_address: Option<String>,
+    /// Optional public site certificate PEM — never a private key.
+    site_cert_pem: Option<String>,
+    /// Optional ECDSA P-256 signature over the base payload plus the other
+    /// extension fields. Absent on older peers and pre-rollout broadcasts.
+    #[serde(default)]
+    signature: Option<Vec<u8>>,
+}
+
+/// Decoded extension fields:
+/// `(gateway_address, site_cert_pem, signature, signed_at_ms, grid_id)`.
+type DecodedExtension = (
+    Option<String>,
+    Option<String>,
+    Option<Vec<u8>>,
+    Option<u64>,
+    Option<String>,
+);
 
 /// Extension format used by peers that predate the `signature` field.
 ///
 /// bincode is not self-describing, so decoding a two-field payload as
-/// [`BroadcastExtension`] fails partway through the third field rather than
-/// falling back to `#[serde(default)]` — `decode` tries this shape before
-/// falling further back to the original bare-`String` format, so a rolling
-/// update does not silently drop or misdecode `gateway_address`/
-/// `site_cert_pem` from not-yet-upgraded peers.
+/// [`PreTimestampBroadcastExtension`] fails partway through the third field
+/// rather than falling back to `#[serde(default)]` — `decode` tries that
+/// shape before falling further back to this one, then to the original
+/// bare-`String` format, so a rolling update does not silently drop or
+/// misdecode `gateway_address`/`site_cert_pem` from not-yet-upgraded peers.
 #[derive(Serialize, Deserialize)]
 struct PreSignatureBroadcastExtension {
     /// Optional data-plane gateway address.
@@ -153,6 +299,8 @@ impl StateBroadcast {
             gateway_address,
             site_cert_pem: None,
             signature: None,
+            signed_at_ms: None,
+            grid_id: None,
         }
     }
 
@@ -176,10 +324,39 @@ impl StateBroadcast {
         self
     }
 
+    /// Attach the wall-clock signing timestamp (milliseconds since the Unix
+    /// epoch).
+    ///
+    /// Set this **before** computing [`signable_bytes`](Self::signable_bytes)
+    /// so the timestamp itself is covered by the signature — see
+    /// [`signed_at_ms`](Self::signed_at_ms)'s doc comment for why an
+    /// unsigned timestamp would defeat the freshness check it exists to
+    /// support.
+    #[must_use]
+    pub fn with_signed_at(mut self, signed_at_ms: Option<u64>) -> Self {
+        self.signed_at_ms = signed_at_ms;
+        self
+    }
+
+    /// Attach the owning `GridNetwork` identifier.
+    ///
+    /// Set this **before** computing [`signable_bytes`](Self::signable_bytes)
+    /// so the identifier is covered by the signature — see
+    /// [`grid_id`](Self::grid_id)'s doc comment for the cross-`GridNetwork`
+    /// replay this scoping closes.
+    #[must_use]
+    pub fn with_grid_id(mut self, grid_id: Option<String>) -> Self {
+        self.grid_id = grid_id;
+        self
+    }
+
     /// Return the canonical bytes this broadcast's signature covers.
     ///
-    /// Equal to [`encode`](Self::encode) of this broadcast with `signature`
-    /// cleared, so a signature can never cover itself.
+    /// Prefixed with a fixed domain-separation tag followed by
+    /// [`encode`](Self::encode) of this broadcast with `signature` cleared,
+    /// so a signature can never cover itself and can never be replayed as
+    /// valid input to a different signing context even if the same key were
+    /// ever reused elsewhere.
     ///
     /// # Errors
     ///
@@ -187,7 +364,9 @@ impl StateBroadcast {
     pub fn signable_bytes(&self) -> Result<Vec<u8>, bincode::error::EncodeError> {
         let mut unsigned = self.clone();
         unsigned.signature = None;
-        unsigned.encode()
+        let mut signable = SIGNATURE_DOMAIN.to_vec();
+        signable.extend(unsigned.encode()?);
+        Ok(signable)
     }
 
     /// Return this broadcast's invalidation key.
@@ -275,11 +454,18 @@ impl StateBroadcast {
             snapshot: self.snapshot.clone(),
         };
         let mut bytes = bincode::serde::encode_to_vec(&v1, bincode::config::standard())?;
-        if self.gateway_address.is_some() || self.site_cert_pem.is_some() || self.signature.is_some() {
+        if self.gateway_address.is_some()
+            || self.site_cert_pem.is_some()
+            || self.signature.is_some()
+            || self.signed_at_ms.is_some()
+            || self.grid_id.is_some()
+        {
             let ext = BroadcastExtension {
                 gateway_address: self.gateway_address.clone(),
                 site_cert_pem: self.site_cert_pem.clone(),
                 signature: self.signature.clone(),
+                signed_at_ms: self.signed_at_ms,
+                grid_id: self.grid_id.clone(),
             };
             let ext_bytes = bincode::serde::encode_to_vec(&ext, bincode::config::standard())?;
             bytes.extend_from_slice(&ext_bytes);
@@ -291,9 +477,10 @@ impl StateBroadcast {
     ///
     /// Decodes the base v1 payload, then tries to decode any trailing bytes as
     /// a `BroadcastExtension` struct.  Because bincode is not self-describing,
-    /// a three-field extension decode does not simply come back `Ok` with
-    /// `signature: None` when reading bytes from an older, two-field peer —
-    /// it fails partway through the missing field.  Falls back in turn to the
+    /// a five-field extension decode does not simply come back `Ok` with
+    /// `grid_id: None` when reading bytes from an older, three-field
+    /// peer — it fails partway through the missing fields.  Falls back in
+    /// turn to the three-field pre-timestamp extension format, then the
     /// two-field pre-signature extension format, then to the
     /// original bare-`String` format for `gateway_address`, ensuring
     /// interoperability with peers running any prior wire format during a
@@ -311,7 +498,7 @@ impl StateBroadcast {
             bincode::serde::decode_from_slice(bytes, bincode::config::standard())?;
 
         let remaining = bytes.get(consumed..).unwrap_or(&[]);
-        let (gateway_address, site_cert_pem, signature) = Self::decode_extension(remaining);
+        let (gateway_address, site_cert_pem, signature, signed_at_ms, grid_id) = Self::decode_extension(remaining);
 
         Ok(Self {
             version: v1.version,
@@ -321,31 +508,45 @@ impl StateBroadcast {
             gateway_address,
             site_cert_pem,
             signature,
+            signed_at_ms,
+            grid_id,
         })
     }
 
     /// Decode the trailing extension bytes, falling back across every prior
     /// wire format in turn. See [`decode`](Self::decode) for why a naive
     /// single-shot struct decode is not enough during a rolling update.
-    fn decode_extension(remaining: &[u8]) -> (Option<String>, Option<String>, Option<Vec<u8>>) {
+    fn decode_extension(remaining: &[u8]) -> DecodedExtension {
         if remaining.is_empty() {
-            return (None, None, None);
+            return (None, None, None, None, None);
         }
         if let Ok((ext, _)) =
             bincode::serde::decode_from_slice::<BroadcastExtension, _>(remaining, bincode::config::standard())
         {
-            return (ext.gateway_address, ext.site_cert_pem, ext.signature);
+            return (
+                ext.gateway_address,
+                ext.site_cert_pem,
+                ext.signature,
+                ext.signed_at_ms,
+                ext.grid_id,
+            );
+        }
+        if let Ok((ext, _)) = bincode::serde::decode_from_slice::<PreTimestampBroadcastExtension, _>(
+            remaining,
+            bincode::config::standard(),
+        ) {
+            return (ext.gateway_address, ext.site_cert_pem, ext.signature, None, None);
         }
         if let Ok((ext, _)) = bincode::serde::decode_from_slice::<PreSignatureBroadcastExtension, _>(
             remaining,
             bincode::config::standard(),
         ) {
-            return (ext.gateway_address, ext.site_cert_pem, None);
+            return (ext.gateway_address, ext.site_cert_pem, None, None, None);
         }
         // Compatibility fallback: bare String encoding for gateway_address only.
         match bincode::serde::decode_from_slice::<String, _>(remaining, bincode::config::standard()) {
-            Ok((gw, _)) => (Some(gw), None, None),
-            Err(_) => (None, None, None),
+            Ok((gw, _)) => (Some(gw), None, None, None, None),
+            Err(_) => (None, None, None, None, None),
         }
     }
 }
@@ -439,6 +640,22 @@ pub enum StateBroadcastError {
         origin_site: String,
         /// Underlying encode error.
         source: bincode::error::EncodeError,
+    },
+
+    /// The origin has a pinned identity but the broadcast carries no signing timestamp.
+    #[error("state broadcast from pinned origin {origin_site} carries no signing timestamp")]
+    MissingTimestamp {
+        /// Site that originated the broadcast.
+        origin_site: String,
+    },
+
+    /// The broadcast's signing timestamp falls outside the accepted freshness window.
+    #[error(
+        "state broadcast from pinned origin {origin_site} has a signing timestamp outside the accepted freshness window"
+    )]
+    TimestampOutOfWindow {
+        /// Site that originated the broadcast.
+        origin_site: String,
     },
 }
 
@@ -564,6 +781,10 @@ pub struct StateBroadcastHandler {
     /// caller (e.g. the operator, once it has established which certificate
     /// pins an origin site's signing identity) can populate or update
     /// entries at runtime, after this handler has been moved into foca.
+    /// Prefer [`crate::node::SwimNode::pin_origin`] over mutating this
+    /// sender directly: pinning through the raw sender does not purge state
+    /// merged from an origin before it was pinned, which is a correctness
+    /// gap for a signature to close, not just an inconvenience.
     trust_store_tx: watch::Sender<TrustStore>,
 
     /// Receiver half read synchronously by [`receive_item`](foca::BroadcastHandler::receive_item).
@@ -624,6 +845,13 @@ impl StateBroadcastHandler {
     /// been moved into foca. An origin site with no entry is not yet
     /// enforced against a signature — see [`receive_item`]'s doc comment for
     /// the rollout-transition rationale.
+    ///
+    /// This is the low-level primitive [`crate::node::SwimNode::pin_origin`]
+    /// is built on. Prefer `pin_origin` for real use: sending directly
+    /// through this sender skips the purge of state merged from an origin
+    /// before it had a pin. This accessor stays public for tests and for
+    /// callers that hold a bare [`StateBroadcastHandler`] outside a
+    /// [`SwimNode`](crate::node::SwimNode).
     ///
     /// [`receive_item`]: foca::BroadcastHandler::receive_item
     #[must_use]
@@ -779,13 +1007,25 @@ impl StateBroadcastHandler {
     /// Reject a broadcast that fails signature verification against a
     /// pinned identity.
     ///
-    /// An origin with **no** entry in the trust store passes through
-    /// unchecked — this is deliberate: it lets a signed-broadcast rollout
-    /// proceed incrementally as origins are pinned one at a time, rather
-    /// than requiring a synchronized flag-day cutover. Once nerdalert's
-    /// key-source question (grid#75) is resolved and the operator starts
-    /// populating pins, this becomes the enforcement point; until then it is
-    /// a no-op for every unpinned origin.
+    /// An origin with **no** entry (or an empty entry) in the trust store
+    /// passes through unchecked — this is deliberate: it lets a
+    /// signed-broadcast rollout proceed incrementally as origins are pinned
+    /// one at a time, rather than requiring a synchronized flag-day
+    /// cutover. Once nerdalert's key-source question (grid#75) is resolved
+    /// and the operator starts populating pins, this becomes the
+    /// enforcement point; until then it is a no-op for every unpinned
+    /// origin. An origin pinned to more than one key (rotation overlap)
+    /// verifies against **any** key in its set.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "signature-presence, timestamp-presence, signature-validity, and freshness-window checks form one \
+                  atomic gate with a shared rejection log message"
+    )]
+    #[expect(
+        clippy::cognitive_complexity,
+        reason = "four independent rejection branches over one broadcast, each with its own log statement, \
+                  read more branchily than they actually are"
+    )]
     fn verify_signature_if_pinned(&self, broadcast: &StateBroadcast) -> Result<(), StateBroadcastError> {
         /// Rejection log message shared by every failure branch below.
         ///
@@ -794,13 +1034,23 @@ impl StateBroadcastHandler {
         /// broadcast bodies; `reason` stays a small closed set of values.
         const REJECTED: &str = "rejecting pinned-origin state broadcast";
 
-        let Some(pinned_pubkey) = self.trust_store_rx.borrow().get(&broadcast.origin_site).cloned() else {
+        let pinned_keys = self
+            .trust_store_rx
+            .borrow()
+            .get(&broadcast.origin_site)
+            .cloned()
+            .unwrap_or_default();
+        if pinned_keys.is_empty() {
             return Ok(());
-        };
+        }
         let origin_site = broadcast.origin_site.clone();
         let Some(signature) = broadcast.signature.as_ref() else {
             tracing::warn!(origin_site = %origin_site, reason = "missing_signature", REJECTED);
             return Err(StateBroadcastError::MissingSignature { origin_site });
+        };
+        let Some(signed_at_ms) = broadcast.signed_at_ms else {
+            tracing::warn!(origin_site = %origin_site, reason = "missing_timestamp", REJECTED);
+            return Err(StateBroadcastError::MissingTimestamp { origin_site });
         };
         let signable = match broadcast.signable_bytes() {
             Ok(bytes) => bytes,
@@ -809,27 +1059,75 @@ impl StateBroadcastHandler {
                 return Err(StateBroadcastError::SignableEncode { origin_site, source });
             },
         };
-        if crate::signing::verify_ecdsa_p256(&pinned_pubkey, &signable, signature).is_err() {
+        let verified = pinned_keys
+            .iter()
+            .any(|key| crate::signing::verify_ecdsa_p256(key, &signable, signature).is_ok());
+        if !verified {
             tracing::warn!(origin_site = %origin_site, reason = "signature_invalid", REJECTED);
             return Err(StateBroadcastError::SignatureInvalid { origin_site });
+        }
+        if !Self::within_freshness_window(signed_at_ms) {
+            tracing::warn!(origin_site = %origin_site, reason = "timestamp_out_of_window", REJECTED);
+            return Err(StateBroadcastError::TimestampOutOfWindow { origin_site });
         }
         Ok(())
     }
 
+    /// Return true when `signed_at_ms` falls within the accepted freshness
+    /// window relative to this node's own clock.
+    ///
+    /// A [`SystemTime::now`] that somehow predates the Unix epoch (a
+    /// pathologically misconfigured clock) is treated as epoch zero rather
+    /// than propagating an error — every positive `signed_at_ms` then falls
+    /// outside the window and is rejected, failing closed rather than
+    /// disabling the freshness check entirely.
+    fn within_freshness_window(signed_at_ms: u64) -> bool {
+        let now_ms = u64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or(Duration::ZERO)
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX);
+        let not_too_old = now_ms.saturating_sub(signed_at_ms) <= MAX_BROADCAST_AGE_MS;
+        let not_too_far_future = signed_at_ms.saturating_sub(now_ms) <= MAX_CLOCK_SKEW_AHEAD_MS;
+        not_too_old && not_too_far_future
+    }
+
     /// Enforce the hard origin bound before accepting an unknown origin.
+    ///
+    /// Never evicts a pinned origin's retained state: a signature pin is an
+    /// authenticated fact about that origin, and evicting it would silently
+    /// discard the anti-replay value of the origin's tracked revision (see
+    /// [`verify_signature_if_pinned`](Self::verify_signature_if_pinned)) the
+    /// moment memory pressure forces a choice. If every retained origin is
+    /// pinned, the incoming origin is accepted anyway without evicting
+    /// anything — the map temporarily exceeds `max_origins` by at most one
+    /// rather than dropping an authenticated peer's state.
     fn make_room_for(&self, incoming_origin: &str) {
         let origins = self.known_origins();
         if origins.contains(incoming_origin) || origins.len() < self.max_origins {
             return;
         }
-        if let Some(origin) = origins.into_iter().next() {
+        let trust_store = self.trust_store_rx.borrow();
+        let Some(origin) = origins
+            .into_iter()
+            .find(|origin| trust_store.get(origin).is_none_or(Vec::is_empty))
+        else {
             tracing::warn!(
-                evicted_origin = %origin,
                 max_origins = self.max_origins,
-                "SWIM state origin capacity reached; evicting retained origin"
+                "SWIM state origin capacity reached and every retained origin is pinned; \
+                 accepting the new origin without evicting an authenticated peer"
             );
-            self.remove_origin(&origin);
-        }
+            return;
+        };
+        drop(trust_store);
+        tracing::warn!(
+            evicted_origin = %origin,
+            max_origins = self.max_origins,
+            "SWIM state origin capacity reached; evicting retained origin"
+        );
+        self.remove_origin(&origin);
     }
 }
 
@@ -967,6 +1265,47 @@ mod tests {
         bytes
     }
 
+    /// Encode a base v1 payload plus a three-field pre-timestamp extension,
+    /// mirroring the wire bytes a peer running the extension format that
+    /// predates the `signed_at_ms` field would have sent.
+    fn encode_v1_plus_pre_timestamp_extension(
+        origin_site: &str,
+        revision: u64,
+        gateway_address: Option<String>,
+        site_cert_pem: Option<String>,
+        signature: Option<Vec<u8>>,
+    ) -> Vec<u8> {
+        let v1 = StateBroadcastV1 {
+            version: STATE_BROADCAST_VERSION,
+            origin_site: origin_site.to_owned(),
+            revision,
+            snapshot: snapshot(origin_site, revision, 0.4),
+        };
+        let mut bytes =
+            bincode::serde::encode_to_vec(&v1, bincode::config::standard()).unwrap_or_else(|_| std::process::abort());
+        let ext = PreTimestampBroadcastExtension {
+            gateway_address,
+            site_cert_pem,
+            signature,
+        };
+        let ext_bytes =
+            bincode::serde::encode_to_vec(&ext, bincode::config::standard()).unwrap_or_else(|_| std::process::abort());
+        bytes.extend_from_slice(&ext_bytes);
+        bytes
+    }
+
+    /// Return the current wall-clock time in milliseconds since the Unix
+    /// epoch, for constructing test broadcasts with a fresh `signed_at_ms`.
+    fn now_ms() -> u64 {
+        u64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_else(|_| std::process::abort())
+                .as_millis(),
+        )
+        .unwrap_or_else(|_| std::process::abort())
+    }
+
     /// Generate an ECDSA P-256 signing key plus the raw SPKI EC point a
     /// verifier needs, independent of *how* a real deployment would source
     /// or pin this key material (grid#75, still open).
@@ -987,9 +1326,10 @@ mod tests {
         let (pkcs8_der, raw_pubkey) = generate_signing_key_and_pubkey();
         handler
             .trust_store_sender()
-            .send_modify(|store| drop(store.insert("site-p".to_owned(), raw_pubkey)));
+            .send_modify(|store| drop(store.insert("site-p".to_owned(), vec![raw_pubkey])));
 
-        let unsigned = StateBroadcast::new("site-p".to_owned(), 1, snapshot("site-p", 1, 0.1), None);
+        let unsigned = StateBroadcast::new("site-p".to_owned(), 1, snapshot("site-p", 1, 0.1), None)
+            .with_signed_at(Some(now_ms()));
         let signature = crate::signing::sign_ecdsa_p256(
             &pkcs8_der,
             &unsigned.signable_bytes().unwrap_or_else(|_| std::process::abort()),
@@ -1015,7 +1355,7 @@ mod tests {
         let (_pkcs8_der, raw_pubkey) = generate_signing_key_and_pubkey();
         handler
             .trust_store_sender()
-            .send_modify(|store| drop(store.insert("site-p".to_owned(), raw_pubkey)));
+            .send_modify(|store| drop(store.insert("site-p".to_owned(), vec![raw_pubkey])));
         let unsigned = StateBroadcast::new("site-p".to_owned(), 1, snapshot("site-p", 1, 0.1), None);
         let bytes = unsigned.encode().unwrap_or_else(|_| std::process::abort());
 
@@ -1038,9 +1378,10 @@ mod tests {
         let (wrong_key, _wrong_pubkey) = generate_signing_key_and_pubkey();
         handler
             .trust_store_sender()
-            .send_modify(|store| drop(store.insert("site-p".to_owned(), pinned_pubkey)));
+            .send_modify(|store| drop(store.insert("site-p".to_owned(), vec![pinned_pubkey])));
 
-        let unsigned = StateBroadcast::new("site-p".to_owned(), 1, snapshot("site-p", 1, 0.1), None);
+        let unsigned = StateBroadcast::new("site-p".to_owned(), 1, snapshot("site-p", 1, 0.1), None)
+            .with_signed_at(Some(now_ms()));
         let signature = crate::signing::sign_ecdsa_p256(
             &wrong_key,
             &unsigned.signable_bytes().unwrap_or_else(|_| std::process::abort()),
@@ -1056,6 +1397,357 @@ mod tests {
         assert!(
             matches!(&result, Err(StateBroadcastError::SignatureInvalid { origin_site }) if origin_site.as_str() == "site-p"),
             "a broadcast signed by a key other than the pinned one must be rejected, got {result:?}"
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "verifies acceptance under both the 'next' and 'current' pinned keys in one proof"
+    )]
+    fn receive_item_accepts_a_broadcast_signed_by_either_key_in_a_rotated_pin_set() {
+        // Bounded key rotation: an origin pinned to [current, next] must
+        // verify against a signature made with *either* key, mirroring
+        // canonical_fingerprints' current+next mTLS pin overlap window.
+        let (mut handler, _control) = StateBroadcastHandler::with_capacity("site-local".to_owned(), 8);
+        let (current_key, current_pubkey) = generate_signing_key_and_pubkey();
+        let (next_key, next_pubkey) = generate_signing_key_and_pubkey();
+        handler
+            .trust_store_sender()
+            .send_modify(|store| drop(store.insert("site-p".to_owned(), vec![current_pubkey, next_pubkey])));
+
+        let unsigned_from_next = StateBroadcast::new("site-p".to_owned(), 1, snapshot("site-p", 1, 0.1), None)
+            .with_signed_at(Some(now_ms()));
+        let signature_from_next = crate::signing::sign_ecdsa_p256(
+            &next_key,
+            &unsigned_from_next
+                .signable_bytes()
+                .unwrap_or_else(|_| std::process::abort()),
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        let signed_by_next = unsigned_from_next.with_signature(Some(signature_from_next));
+
+        assert!(
+            receive(&mut handler, &signed_by_next).is_some(),
+            "a broadcast signed by the 'next' key in a rotated pin set must be accepted"
+        );
+
+        let unsigned_from_current = StateBroadcast::new("site-p".to_owned(), 2, snapshot("site-p", 2, 0.2), None)
+            .with_signed_at(Some(now_ms()));
+        let signature_from_current = crate::signing::sign_ecdsa_p256(
+            &current_key,
+            &unsigned_from_current
+                .signable_bytes()
+                .unwrap_or_else(|_| std::process::abort()),
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        let signed_by_current = unsigned_from_current.with_signature(Some(signature_from_current));
+
+        assert!(
+            receive(&mut handler, &signed_by_current).is_some(),
+            "a broadcast signed by the 'current' key in a rotated pin set must also be accepted"
+        );
+    }
+
+    #[test]
+    fn receive_item_rejects_a_signed_broadcast_missing_a_timestamp_from_a_pinned_origin() {
+        let (mut handler, _control) = StateBroadcastHandler::with_capacity("site-local".to_owned(), 8);
+        let (pkcs8_der, raw_pubkey) = generate_signing_key_and_pubkey();
+        handler
+            .trust_store_sender()
+            .send_modify(|store| drop(store.insert("site-p".to_owned(), vec![raw_pubkey])));
+
+        let unsigned = StateBroadcast::new("site-p".to_owned(), 1, snapshot("site-p", 1, 0.1), None);
+        let signature = crate::signing::sign_ecdsa_p256(
+            &pkcs8_der,
+            &unsigned.signable_bytes().unwrap_or_else(|_| std::process::abort()),
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        let bytes = unsigned
+            .with_signature(Some(signature))
+            .encode()
+            .unwrap_or_else(|_| std::process::abort());
+
+        let result = handler.receive_item(&bytes, None);
+
+        assert!(
+            matches!(&result, Err(StateBroadcastError::MissingTimestamp { origin_site }) if origin_site.as_str() == "site-p"),
+            "a signed broadcast with no signing timestamp from a pinned origin must be rejected, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn receive_item_rejects_a_signed_broadcast_with_a_stale_timestamp_from_a_pinned_origin() {
+        let (mut handler, _control) = StateBroadcastHandler::with_capacity("site-local".to_owned(), 8);
+        let (pkcs8_der, raw_pubkey) = generate_signing_key_and_pubkey();
+        handler
+            .trust_store_sender()
+            .send_modify(|store| drop(store.insert("site-p".to_owned(), vec![raw_pubkey])));
+        let stale_at = now_ms().saturating_sub(MAX_BROADCAST_AGE_MS + 1_000);
+
+        let unsigned = StateBroadcast::new("site-p".to_owned(), 1, snapshot("site-p", 1, 0.1), None)
+            .with_signed_at(Some(stale_at));
+        let signature = crate::signing::sign_ecdsa_p256(
+            &pkcs8_der,
+            &unsigned.signable_bytes().unwrap_or_else(|_| std::process::abort()),
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        let bytes = unsigned
+            .with_signature(Some(signature))
+            .encode()
+            .unwrap_or_else(|_| std::process::abort());
+
+        let result = handler.receive_item(&bytes, None);
+
+        assert!(
+            matches!(&result, Err(StateBroadcastError::TimestampOutOfWindow { origin_site }) if origin_site.as_str() == "site-p"),
+            "a signed broadcast with a stale timestamp from a pinned origin must be rejected, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn receive_item_rejects_a_signed_broadcast_with_a_far_future_timestamp_from_a_pinned_origin() {
+        let (mut handler, _control) = StateBroadcastHandler::with_capacity("site-local".to_owned(), 8);
+        let (pkcs8_der, raw_pubkey) = generate_signing_key_and_pubkey();
+        handler
+            .trust_store_sender()
+            .send_modify(|store| drop(store.insert("site-p".to_owned(), vec![raw_pubkey])));
+        let future_at = now_ms() + MAX_CLOCK_SKEW_AHEAD_MS + 1_000;
+
+        let unsigned = StateBroadcast::new("site-p".to_owned(), 1, snapshot("site-p", 1, 0.1), None)
+            .with_signed_at(Some(future_at));
+        let signature = crate::signing::sign_ecdsa_p256(
+            &pkcs8_der,
+            &unsigned.signable_bytes().unwrap_or_else(|_| std::process::abort()),
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        let bytes = unsigned
+            .with_signature(Some(signature))
+            .encode()
+            .unwrap_or_else(|_| std::process::abort());
+
+        let result = handler.receive_item(&bytes, None);
+
+        assert!(
+            matches!(&result, Err(StateBroadcastError::TimestampOutOfWindow { origin_site }) if origin_site.as_str() == "site-p"),
+            "a signed broadcast with a far-future timestamp from a pinned origin must be rejected, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn within_freshness_window_accepts_a_timestamp_comfortably_within_max_age() {
+        let now = now_ms();
+        assert!(
+            StateBroadcastHandler::within_freshness_window(now.saturating_sub(MAX_BROADCAST_AGE_MS - 1_000)),
+            "a timestamp just inside MAX_BROADCAST_AGE_MS old must be within the window"
+        );
+    }
+
+    #[test]
+    fn within_freshness_window_rejects_a_timestamp_older_than_max_age() {
+        let now = now_ms();
+        assert!(
+            !StateBroadcastHandler::within_freshness_window(now.saturating_sub(MAX_BROADCAST_AGE_MS + 1_000)),
+            "a timestamp older than MAX_BROADCAST_AGE_MS must fall outside the window"
+        );
+    }
+
+    #[test]
+    fn within_freshness_window_accepts_a_timestamp_comfortably_ahead_within_clock_skew() {
+        let now = now_ms();
+        assert!(
+            StateBroadcastHandler::within_freshness_window(now + MAX_CLOCK_SKEW_AHEAD_MS - 1_000),
+            "a timestamp just inside MAX_CLOCK_SKEW_AHEAD_MS ahead must be within the window"
+        );
+    }
+
+    #[test]
+    fn within_freshness_window_rejects_a_timestamp_further_ahead_than_clock_skew() {
+        let now = now_ms();
+        assert!(
+            !StateBroadcastHandler::within_freshness_window(now + MAX_CLOCK_SKEW_AHEAD_MS + 1_000),
+            "a timestamp further ahead than MAX_CLOCK_SKEW_AHEAD_MS must fall outside the window"
+        );
+    }
+
+    #[test]
+    fn missing_timestamp_error_message_names_the_origin() {
+        let err = StateBroadcastError::MissingTimestamp {
+            origin_site: "site-p".to_owned(),
+        };
+        assert!(
+            err.to_string().contains("site-p"),
+            "error message must name the origin site"
+        );
+    }
+
+    #[test]
+    fn timestamp_out_of_window_error_message_names_the_origin() {
+        let err = StateBroadcastError::TimestampOutOfWindow {
+            origin_site: "site-p".to_owned(),
+        };
+        assert!(
+            err.to_string().contains("site-p"),
+            "error message must name the origin site"
+        );
+    }
+
+    /// Build and receive a correctly signed broadcast for a pinned origin.
+    fn receive_signed(
+        handler: &mut StateBroadcastHandler,
+        origin: &str,
+        revision: u64,
+        signing_key: &[u8],
+    ) -> Option<StateBroadcastKey> {
+        let unsigned = StateBroadcast::new(origin.to_owned(), revision, snapshot(origin, revision, 0.1), None)
+            .with_signed_at(Some(now_ms()));
+        let signature = crate::signing::sign_ecdsa_p256(
+            signing_key,
+            &unsigned.signable_bytes().unwrap_or_else(|_| std::process::abort()),
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        receive(handler, &unsigned.with_signature(Some(signature)))
+    }
+
+    #[test]
+    fn make_room_for_never_evicts_a_pinned_origin() {
+        let (mut handler, _control) = StateBroadcastHandler::with_capacity("site-local".to_owned(), 2);
+        let (signing_key, pubkey) = generate_signing_key_and_pubkey();
+        handler
+            .trust_store_sender()
+            .send_modify(|store| drop(store.insert("site-pinned".to_owned(), vec![pubkey])));
+
+        drop(receive_signed(&mut handler, "site-pinned", 1, &signing_key));
+        for (origin, revision) in [("site-unpinned", 2), ("site-new", 3)] {
+            let broadcast = StateBroadcast::new(origin.to_owned(), revision, snapshot(origin, revision, 0.1), None);
+            drop(receive(&mut handler, &broadcast));
+        }
+
+        let origins = handler.known_origins();
+        assert!(
+            origins.contains("site-pinned"),
+            "a pinned origin must never be evicted for capacity, got {origins:?}"
+        );
+        assert!(
+            !origins.contains("site-unpinned"),
+            "an unpinned origin must be evicted ahead of a pinned one, got {origins:?}"
+        );
+    }
+
+    #[test]
+    fn make_room_for_accepts_a_new_origin_without_evicting_when_every_retained_origin_is_pinned() {
+        let (mut handler, _control) = StateBroadcastHandler::with_capacity("site-local".to_owned(), 2);
+        for origin in ["site-pinned-a", "site-pinned-b"] {
+            let (signing_key, pubkey) = generate_signing_key_and_pubkey();
+            handler
+                .trust_store_sender()
+                .send_modify(|store| drop(store.insert(origin.to_owned(), vec![pubkey])));
+            drop(receive_signed(&mut handler, origin, 1, &signing_key));
+        }
+
+        let broadcast = StateBroadcast::new("site-new".to_owned(), 1, snapshot("site-new", 1, 0.1), None);
+        drop(receive(&mut handler, &broadcast));
+
+        let origins = handler.known_origins();
+        assert!(
+            origins.contains("site-pinned-a") && origins.contains("site-pinned-b"),
+            "both pinned origins must survive even though capacity was reached, got {origins:?}"
+        );
+        assert!(
+            origins.contains("site-new"),
+            "the new origin must still be accepted even though nothing could be evicted, got {origins:?}"
+        );
+    }
+
+    #[test]
+    fn signable_bytes_domain_prefix_is_load_bearing_not_decorative() {
+        // Proves the domain-separation prefix actually participates in what
+        // gets signed: a signature computed over signable_bytes() (prefix +
+        // payload) must not verify against the bare, unprefixed encode() of
+        // the same broadcast.
+        let (key, pubkey) = generate_signing_key_and_pubkey();
+        let broadcast = StateBroadcast::new("site-p".to_owned(), 1, snapshot("site-p", 1, 0.1), None);
+        let signature = crate::signing::sign_ecdsa_p256(
+            &key,
+            &broadcast.signable_bytes().unwrap_or_else(|_| std::process::abort()),
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        let bare_encoded = broadcast.encode().unwrap_or_else(|_| std::process::abort());
+
+        let result = crate::signing::verify_ecdsa_p256(&pubkey, &bare_encoded, &signature);
+
+        assert!(
+            result.is_err(),
+            "a signature over the domain-prefixed signable_bytes() must not verify against the bare encoded payload"
+        );
+    }
+
+    #[test]
+    fn signable_bytes_differ_for_broadcasts_that_differ_only_by_grid_id() {
+        // Same origin_site, revision, and snapshot -- the only difference is
+        // which GridNetwork the broadcast claims to belong to. If these
+        // produced identical signable bytes, a signature valid for one
+        // GridNetwork would silently double as valid for another sharing
+        // the same cluster's SwimHandle (issue #48's per-tenant isolation).
+        let base = StateBroadcast::new("site-p".to_owned(), 1, snapshot("site-p", 1, 0.1), None);
+        let for_grid_a = base.clone().with_grid_id(Some("grid-a".to_owned()));
+        let for_grid_b = base.with_grid_id(Some("grid-b".to_owned()));
+
+        let bytes_a = for_grid_a.signable_bytes().unwrap_or_else(|_| std::process::abort());
+        let bytes_b = for_grid_b.signable_bytes().unwrap_or_else(|_| std::process::abort());
+
+        assert_ne!(
+            bytes_a, bytes_b,
+            "signable_bytes() must depend on grid_id, or a signature would be replayable across GridNetworks"
+        );
+    }
+
+    #[test]
+    fn receive_item_rejects_a_signature_computed_for_a_different_grid_id() {
+        // A signature made over a broadcast claiming grid_id="grid-a" must
+        // not verify once the broadcast is re-labeled grid_id="grid-b" --
+        // the cross-GridNetwork replay this field exists to prevent.
+        let (mut handler, _control) = StateBroadcastHandler::with_capacity("site-local".to_owned(), 8);
+        let (pkcs8_der, raw_pubkey) = generate_signing_key_and_pubkey();
+        handler
+            .trust_store_sender()
+            .send_modify(|store| drop(store.insert("site-p".to_owned(), vec![raw_pubkey])));
+
+        let signed_at_ms = Some(now_ms());
+        let for_grid_a = StateBroadcast::new("site-p".to_owned(), 1, snapshot("site-p", 1, 0.1), None)
+            .with_grid_id(Some("grid-a".to_owned()))
+            .with_signed_at(signed_at_ms);
+        let signature = crate::signing::sign_ecdsa_p256(
+            &pkcs8_der,
+            &for_grid_a.signable_bytes().unwrap_or_else(|_| std::process::abort()),
+        )
+        .unwrap_or_else(|_| std::process::abort());
+
+        // Re-label as grid-b, reusing grid-a's signature over grid-a's bytes.
+        let relabeled_as_grid_b = for_grid_a.with_grid_id(Some("grid-b".to_owned()));
+        let bytes = relabeled_as_grid_b
+            .with_signature(Some(signature))
+            .encode()
+            .unwrap_or_else(|_| std::process::abort());
+
+        let result = handler.receive_item(&bytes, None);
+
+        assert!(
+            matches!(&result, Err(StateBroadcastError::SignatureInvalid { origin_site }) if origin_site.as_str() == "site-p"),
+            "a broadcast re-labeled with a different grid_id than it was signed for must be rejected, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn too_many_pinned_keys_error_message_is_descriptive() {
+        let err = TooManyPinnedKeys {
+            origin: "site-p".to_owned(),
+            supplied: 3,
+        };
+        assert!(err.to_string().contains("site-p"), "error message must name the origin");
+        assert!(
+            err.to_string().contains('3'),
+            "error message must name the supplied count"
         );
     }
 
@@ -1171,6 +1863,135 @@ mod tests {
             "site_cert_pem from a pre-signature peer must survive decode, not be silently dropped"
         );
         assert_eq!(decoded.signature, None, "a pre-signature peer never sends a signature");
+    }
+
+    #[test]
+    fn decode_recovers_gateway_signature_and_cert_from_a_pre_timestamp_three_field_extension() {
+        // Simulates a broadcast sent by a peer running the three-field
+        // `PreTimestampBroadcastExtension` (gateway_address, site_cert_pem,
+        // signature) that predates the `signed_at_ms` field added in this
+        // fix. Same bincode non-self-describing failure mode as the
+        // pre-signature case above, one field further down the chain.
+        let signature = vec![9_u8, 8, 7, 6];
+        let bytes = encode_v1_plus_pre_timestamp_extension(
+            "site-old-peer",
+            5,
+            Some("10.0.0.4:8443".to_owned()),
+            Some("-----BEGIN CERTIFICATE-----legacy-----END CERTIFICATE-----".to_owned()),
+            Some(signature.clone()),
+        );
+
+        let decoded = StateBroadcast::decode(&bytes).unwrap_or_else(|_| std::process::abort());
+
+        assert_eq!(
+            decoded.gateway_address.as_deref(),
+            Some("10.0.0.4:8443"),
+            "gateway_address from a pre-timestamp peer must survive decode, not be silently dropped"
+        );
+        assert_eq!(
+            decoded.site_cert_pem.as_deref(),
+            Some("-----BEGIN CERTIFICATE-----legacy-----END CERTIFICATE-----"),
+            "site_cert_pem from a pre-timestamp peer must survive decode, not be silently dropped"
+        );
+        assert_eq!(
+            decoded.signature,
+            Some(signature),
+            "signature from a pre-timestamp peer must survive decode, not be silently dropped"
+        );
+        assert_eq!(
+            decoded.signed_at_ms, None,
+            "a pre-timestamp peer never sends a signing timestamp"
+        );
+        assert_eq!(decoded.grid_id, None, "a pre-timestamp peer never sends a grid_id");
+    }
+
+    #[test]
+    fn signed_at_ms_round_trips_through_encode_and_decode() {
+        let broadcast = StateBroadcast::new("site-p".to_owned(), 1, snapshot("site-p", 1, 0.1), None)
+            .with_signed_at(Some(1_700_000_000_000));
+        let bytes = broadcast.encode().unwrap_or_else(|_| std::process::abort());
+
+        let decoded = StateBroadcast::decode(&bytes).unwrap_or_else(|_| std::process::abort());
+
+        assert_eq!(
+            decoded.signed_at_ms,
+            Some(1_700_000_000_000),
+            "signed_at_ms must round-trip"
+        );
+    }
+
+    #[test]
+    fn grid_id_round_trips_through_encode_and_decode() {
+        let broadcast = StateBroadcast::new("site-p".to_owned(), 1, snapshot("site-p", 1, 0.1), None)
+            .with_grid_id(Some("grid-a".to_owned()));
+        let bytes = broadcast.encode().unwrap_or_else(|_| std::process::abort());
+
+        let decoded = StateBroadcast::decode(&bytes).unwrap_or_else(|_| std::process::abort());
+
+        assert_eq!(decoded.grid_id.as_deref(), Some("grid-a"), "grid_id must round-trip");
+    }
+
+    #[test]
+    fn decode_recovers_gateway_from_the_original_bare_string_extension() {
+        // The oldest wire format, predating even the two-field
+        // `PreSignatureBroadcastExtension`: a bare bincode-encoded `String`
+        // for `gateway_address`, with no `site_cert_pem` or `signature`.
+        // `decode_extension` falls all the way through to this tier only
+        // after both newer struct shapes fail to decode, so it must stay
+        // covered whenever that fallback chain is touched.
+        let v1 = StateBroadcastV1 {
+            version: STATE_BROADCAST_VERSION,
+            origin_site: "site-ancient-peer".to_owned(),
+            revision: 2,
+            snapshot: snapshot("site-ancient-peer", 2, 0.2),
+        };
+        let mut bytes =
+            bincode::serde::encode_to_vec(&v1, bincode::config::standard()).unwrap_or_else(|_| std::process::abort());
+        let gw_bytes = bincode::serde::encode_to_vec("10.0.0.5:8443".to_owned(), bincode::config::standard())
+            .unwrap_or_else(|_| std::process::abort());
+        bytes.extend_from_slice(&gw_bytes);
+
+        let decoded = StateBroadcast::decode(&bytes).unwrap_or_else(|_| std::process::abort());
+
+        assert_eq!(
+            decoded.gateway_address.as_deref(),
+            Some("10.0.0.5:8443"),
+            "gateway_address from the original bare-String wire format must survive decode"
+        );
+        assert_eq!(
+            decoded.site_cert_pem, None,
+            "the bare-String format never carries a cert"
+        );
+        assert_eq!(
+            decoded.signature, None,
+            "the bare-String format never carries a signature"
+        );
+    }
+
+    #[test]
+    fn decode_extension_returns_no_extension_fields_for_undecodable_trailing_bytes() {
+        // Bytes that match none of the three known extension shapes -- the
+        // final fallback in `decode_extension`'s chain must degrade to no
+        // extension data rather than propagating a decode error, since the
+        // trailing bytes might belong to a future format this peer doesn't
+        // understand yet.
+        let v1 = StateBroadcastV1 {
+            version: STATE_BROADCAST_VERSION,
+            origin_site: "site-p".to_owned(),
+            revision: 1,
+            snapshot: snapshot("site-p", 1, 0.1),
+        };
+        let mut bytes =
+            bincode::serde::encode_to_vec(&v1, bincode::config::standard()).unwrap_or_else(|_| std::process::abort());
+        // A single 0xFF byte is not a valid bincode length prefix for a
+        // `String`, `PreSignatureBroadcastExtension`, or `BroadcastExtension`.
+        bytes.push(0xFF);
+
+        let decoded = StateBroadcast::decode(&bytes).unwrap_or_else(|_| std::process::abort());
+
+        assert_eq!(decoded.gateway_address, None);
+        assert_eq!(decoded.site_cert_pem, None);
+        assert_eq!(decoded.signature, None);
     }
 
     #[test]
