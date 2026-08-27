@@ -145,7 +145,7 @@ clusters with Helm.
 | `crdt` | Delta CRDT types (LWW, OR-Set, G-Counter) |
 | `overlay-sync` | Sidecar for fast ConfigMap-to-file delivery |
 | `mock-providers` | Mock OpenAI, Anthropic, Bedrock, Vertex APIs |
-| `forge` | Demo test harness and validation runner |
+| `forge` | Generic development-environment orchestrator for Kubernetes |
 | `xtask` | Dev task runner for multi-cluster test environments |
 
 ## Development

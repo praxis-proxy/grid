@@ -96,7 +96,7 @@ cargo xtask env status   # health of all components
 | `scoring` | Scoring engine, backend types, grid state |
 | `certs` | Certificate generation and provider trait |
 | `mock-providers` | Mock OpenAI, Anthropic, Bedrock, Vertex APIs |
-| `forge` | Multi-cluster test environment provisioner |
+| `forge` | Generic development-environment orchestrator for Kubernetes |
 | `xtask` | Dev task runner for test environments |
 
 ### scoring
