@@ -35,7 +35,7 @@ Praxis AI handles:
 - Filter pipeline execution
 - TLS termination, health checks, connection pooling
 
-See `.docs/operator/architecture.md` for the full
+See `docs/architecture/overview.md` for the full
 design: CRDs, controllers, operational walkthrough,
 scoring model, and auth framework. See
 `docs/conventions.md` for coding style and policies.
