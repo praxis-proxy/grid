@@ -25,6 +25,7 @@ jobs:
       !github.event.pull_request.draft &&
       !contains(github.event.pull_request.labels.*.name, 'skip/signoff')
     runs-on: ubuntu-24.04
+    timeout-minutes: 5
     permissions:
       pull-requests: read
     steps:
@@ -49,6 +50,7 @@ jobs:
       !github.event.pull_request.draft &&
       contains(github.event.pull_request.labels.*.name, 'skip/signoff')
     runs-on: ubuntu-24.04
+    timeout-minutes: 5
     steps:
       - name: Report skipped signoff check
         run: echo "skip/signoff label present — skipping signoff check"
