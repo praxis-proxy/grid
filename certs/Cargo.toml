@@ -7,7 +7,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
-pem = "3"
+pem = "4"
 rcgen = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true }
