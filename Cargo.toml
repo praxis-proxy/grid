@@ -58,7 +58,7 @@ thiserror = "2.0.20"
 time = { version = "0.3", features = ["formatting"] }
 tokio = { version = "1.53.1", features = ["macros", "rt", "rt-multi-thread", "signal", "net", "time", "io-util"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12", "ring"] }
-toml = "0.8.23"
+toml = "1.1.4"
 tower = "0.5.3"
 tracing = "0.1.44"
 rand = { version = "0.9", features = ["small_rng"] }
