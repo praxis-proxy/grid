@@ -2,7 +2,7 @@
 
 ## Requirements
 
-- Rust stable 1.94+
+- Rust stable 1.96+
 - Rust nightly (for `rustfmt`)
 
 ## Conventions

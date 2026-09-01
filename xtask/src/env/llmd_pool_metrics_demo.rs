@@ -836,15 +836,9 @@ fn proof_provenance(mtls: bool) -> ProofResult {
         let deadline = Instant::now() + Duration::from_secs(30);
         while Instant::now() < deadline {
             if let Ok(metrics_text) = kubectl_exec_epp_metrics(cluster, mtls) {
-                let has_kv = metrics_text.contains("llm_d_epp_average_kv_cache_utilization")
-                    || metrics_text.contains("inference_pool_average_kv_cache_utilization")
-                    || metrics_text.contains("llm_d_router_epp_average_kv_cache_utilization");
-                let has_queue = metrics_text.contains("llm_d_epp_average_queue_size")
-                    || metrics_text.contains("inference_pool_average_queue_size")
-                    || metrics_text.contains("llm_d_router_epp_average_queue_size");
-                let has_ready = metrics_text.contains("llm_d_epp_ready_endpoints")
-                    || metrics_text.contains("inference_pool_ready_pods")
-                    || metrics_text.contains("llm_d_router_epp_ready_endpoints");
+                let has_kv = any_metric_present(&metrics_text, EPP_KV_CACHE_METRICS);
+                let has_queue = any_metric_present(&metrics_text, EPP_QUEUE_SIZE_METRICS);
+                let has_ready = any_metric_present(&metrics_text, EPP_READY_METRICS);
                 if has_kv && has_queue && has_ready {
                     observations.push(format!("{cluster}: all 3 EPP pool metrics present"));
                     metrics_ok = true;
@@ -1391,22 +1385,46 @@ fn scrape_epp_metrics(cluster: &str, mtls: bool) -> EppMetrics {
     parse_epp_metrics(&text)
 }
 
+/// EPP Prometheus metric names accepted for each reading, in priority order.
+///
+/// The endpoint picker's metric names have changed across releases: the
+/// current `llm-d-router-endpoint-picker` build emits the `llm_d_epp_*`
+/// series, older `llm-d-inference-scheduler` builds emit `inference_pool_*`,
+/// and an intermediate build emitted `llm_d_router_epp_*`. Keeping the names
+/// as data lets one accessor serve whichever EPP image the topology pins.
+/// Average per-pool request queue depth, newest EPP series first.
+const EPP_QUEUE_SIZE_METRICS: &[&str] = &[
+    "llm_d_epp_average_queue_size",
+    "inference_pool_average_queue_size",
+    "llm_d_router_epp_average_queue_size",
+];
+/// Average per-pool KV cache utilization, newest EPP series first.
+const EPP_KV_CACHE_METRICS: &[&str] = &[
+    "llm_d_epp_average_kv_cache_utilization",
+    "inference_pool_average_kv_cache_utilization",
+    "llm_d_router_epp_average_kv_cache_utilization",
+];
+/// Ready endpoint/pod count for a pool, newest EPP series first.
+const EPP_READY_METRICS: &[&str] = &[
+    "llm_d_epp_ready_endpoints",
+    "inference_pool_ready_pods",
+    "llm_d_router_epp_ready_endpoints",
+];
+
 /// Parse `EppMetrics` out of raw Prometheus text (functional core of
 /// [`scrape_epp_metrics`], separated out so metric-name-fallback behavior is
 /// unit-testable without a live EPP).
 ///
-/// Both `queue_size` and `kv_cache` prefer the canonical `llm_d_epp_*`
-/// series and fall back symmetrically to the legacy metric names.
+/// Each field takes the first series the EPP actually exposes (see
+/// [`EPP_QUEUE_SIZE_METRICS`] and [`EPP_KV_CACHE_METRICS`]), so a build
+/// emitting only the newer or only the older names still yields a real
+/// reading. An absent series must not be read as a silent 0.0: that would
+/// leave a `kvCachePressure` run's pressure phase unannounced even while real
+/// KV pressure is driving the rank flip.
 fn parse_epp_metrics(text: &str) -> EppMetrics {
     EppMetrics {
-        queue_size: extract_prom_value(text, "llm_d_epp_average_queue_size")
-            .or_else(|| extract_prom_value(text, "inference_pool_average_queue_size"))
-            .or_else(|| extract_prom_value(text, "llm_d_router_epp_average_queue_size"))
-            .unwrap_or(0.0),
-        kv_cache: extract_prom_value(text, "llm_d_epp_average_kv_cache_utilization")
-            .or_else(|| extract_prom_value(text, "inference_pool_average_kv_cache_utilization"))
-            .or_else(|| extract_prom_value(text, "llm_d_router_epp_average_kv_cache_utilization"))
-            .unwrap_or(0.0),
+        queue_size: first_prom_value(text, EPP_QUEUE_SIZE_METRICS).unwrap_or(0.0),
+        kv_cache: first_prom_value(text, EPP_KV_CACHE_METRICS).unwrap_or(0.0),
     }
 }
 
@@ -1452,6 +1470,19 @@ fn extract_prom_value(text: &str, metric_name: &str) -> Option<f64> {
         }
     }
     None
+}
+
+/// Value of the first metric in `names` that is present in `text`, in order.
+fn first_prom_value(text: &str, names: &[&str]) -> Option<f64> {
+    names.iter().find_map(|name| extract_prom_value(text, name))
+}
+
+/// Whether any metric in `names` is emitted as a (non-comment) line in `text`.
+fn any_metric_present(text: &str, names: &[&str]) -> bool {
+    names.iter().any(|name| {
+        text.lines()
+            .any(|line| line.starts_with(name) && !line.starts_with('#'))
+    })
 }
 
 /// Read overlay candidates from the overlay ConfigMap on a cluster.
@@ -3841,10 +3872,12 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
     #[test]
     #[expect(clippy::float_cmp, reason = "exact literal round-trips in test assertions")]
     fn parse_epp_metrics_prefers_llm_d_epp_metric_names() {
+        // The current llm-d-router-endpoint-picker build emits the
+        // llm_d_epp_* series; when several series are present it must win.
         let text = "llm_d_epp_average_queue_size{name=\"pool-a\"} 4.5\n\
                      llm_d_epp_average_kv_cache_utilization{name=\"pool-a\"} 0.35\n\
-                     inference_pool_average_queue_size{name=\"pool-a\"} 7.0\n\
-                     inference_pool_average_kv_cache_utilization{name=\"pool-a\"} 0.70\n";
+                     inference_pool_average_queue_size{name=\"pool-a\"} 9.9\n\
+                     inference_pool_average_kv_cache_utilization{name=\"pool-a\"} 0.99\n";
         let epp = parse_epp_metrics(text);
         assert_eq!(epp.queue_size, 4.5);
         assert_eq!(epp.kv_cache, 0.35);
@@ -3853,11 +3886,12 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
     #[test]
     #[expect(clippy::float_cmp, reason = "exact literal round-trips in test assertions")]
     fn parse_epp_metrics_falls_back_to_inference_pool_metric_names() {
-        let text = "inference_pool_average_queue_size{name=\"pool-a\"} 5.0\n\
-                     inference_pool_average_kv_cache_utilization{name=\"pool-a\"} 0.40\n";
+        // Older llm-d-inference-scheduler builds expose only inference_pool_*.
+        let text = "inference_pool_average_queue_size{name=\"pool-a\"} 4.5\n\
+                     inference_pool_average_kv_cache_utilization{name=\"pool-a\"} 0.35\n";
         let epp = parse_epp_metrics(text);
-        assert_eq!(epp.queue_size, 5.0);
-        assert_eq!(epp.kv_cache, 0.40);
+        assert_eq!(epp.queue_size, 4.5);
+        assert_eq!(epp.kv_cache, 0.35);
     }
 
     #[test]
@@ -3880,6 +3914,14 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
         let epp = parse_epp_metrics("");
         assert_eq!(epp.queue_size, 0.0);
         assert_eq!(epp.kv_cache, 0.0);
+    }
+
+    #[test]
+    fn any_metric_present_ignores_comment_lines_and_absence() {
+        let text = "# HELP llm_d_epp_ready_endpoints ready endpoints\n\
+                     llm_d_epp_ready_endpoints{name=\"pool-a\"} 2\n";
+        assert!(any_metric_present(text, EPP_READY_METRICS));
+        assert!(!any_metric_present("no epp metrics here", EPP_READY_METRICS));
     }
 
     #[test]
