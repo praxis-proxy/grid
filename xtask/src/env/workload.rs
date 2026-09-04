@@ -47,7 +47,7 @@ pub(crate) struct WorkloadResponse {
     pub(crate) status: u16,
     /// Raw response body.
     pub(crate) body: String,
-    /// Provider identity from the `x-grid-demo-provider` response header.
+    /// Provider gateway identity from Praxis provider-route attribution.
     pub(crate) provider: String,
 }
 
@@ -134,8 +134,10 @@ fn build_curl_job_manifest(job_name: &str, session_id: Option<&str>) -> String {
         "--show-error".to_owned(),
         "--max-time".to_owned(),
         "15".to_owned(),
+        "--dump-header".to_owned(),
+        "-".to_owned(),
         "--write-out".to_owned(),
-        "\nSTATUS:%{http_code}\nPROVIDER:%header{x-grid-demo-provider}".to_owned(),
+        "\nSTATUS:%{http_code}\nPROVIDER:%header{x-ai-demo-provider-gateway}".to_owned(),
         "--header".to_owned(),
         "Content-Type: application/json".to_owned(),
     ];
@@ -318,8 +320,35 @@ fn parse_curl_output(output: &str) -> WorkloadResponse {
         body_end = 0;
     }
 
-    let body = trimmed.get(..body_end).unwrap_or("").trim().to_owned();
+    let response = trimmed.get(..body_end).unwrap_or("");
+    let (headers, body) = split_response_headers(response);
+    if provider.is_empty() {
+        provider = header_value(headers, "x-ai-demo-provider-gateway").unwrap_or_default();
+    }
+    let body = body.trim().to_owned();
     WorkloadResponse { status, body, provider }
+}
+
+/// Split curl's dumped HTTP headers from the response body.
+fn split_response_headers(response: &str) -> (&str, &str) {
+    response.find("\r\n\r\n").map_or_else(
+        || {
+            response
+                .find("\n\n")
+                .map_or(("", response), |end| response.split_at(end + 2))
+        },
+        |end| response.split_at(end + 4),
+    )
+}
+
+/// Read one case-insensitive response header from a dumped header block.
+fn header_value(headers: &str, expected: &str) -> Option<String> {
+    headers.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.trim()
+            .eq_ignore_ascii_case(expected)
+            .then(|| value.trim().to_owned())
+    })
 }
 
 /// Build the kind cluster context name.
@@ -353,11 +382,21 @@ mod tests {
 
         #[test]
         fn parse_status_trailer_extracts_code_and_body() {
-            let output = "{\"choices\":[]}\nSTATUS:200\nPROVIDER:east-provider";
+            let output = "HTTP/1.1 200 OK\r\nX-AI-Demo-Provider-Gateway: east-provider\r\n\r\n{\"choices\":[]}\nSTATUS:200\nPROVIDER:east-provider";
             let response = parse_curl_output(output);
             assert_eq!(response.status, 200);
             assert_eq!(response.body, r#"{"choices":[]}"#);
             assert_eq!(response.provider, "east-provider");
+        }
+
+        #[test]
+        fn raw_header_supplies_attribution_when_curl_trailer_is_empty() {
+            let output =
+                "HTTP/1.1 200 OK\r\nx-ai-demo-provider-gateway: west-provider\r\n\r\n{}\nSTATUS:200\nPROVIDER:";
+            let response = parse_curl_output(output);
+            assert_eq!(response.status, 200);
+            assert_eq!(response.provider, "west-provider");
+            assert_eq!(response.body, "{}");
         }
 
         #[test]

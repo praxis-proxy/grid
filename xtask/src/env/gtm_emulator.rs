@@ -469,7 +469,7 @@ fn parse_provider_attribution(headers: &str) -> Result<(String, String, String),
     // vllm-vcr intentionally exposes the normal OpenAI-compatible response
     // surface, so use the authenticated provider gateway as the observable
     // final-hop identity when those mock-only headers are absent.
-    let provider = parse_header(headers, "x-grid-demo-provider")
+    let provider = parse_header(headers, "x-grid-test-provider")
         .filter(|value| matches!(*value, "east-provider" | "east-provider-secondary" | "west-provider"))
         .unwrap_or(provider_gateway);
     let expected_gateway = match provider {
@@ -520,7 +520,7 @@ mod tests {
             "HTTP/1.1 200 OK\r\n",
             "X-Grid-Demo-Edge-Gateway: west-edge\r\n",
             "X-AI-Demo-Provider-Gateway: east-provider\r\n",
-            "X-Grid-Demo-Provider: east-provider\r\n",
+            "X-Grid-Test-Provider: east-provider\r\n",
             "X-Grid-Demo-Backend-Request-Id: backend-123\r\n",
             "Content-Type: application/json\r\n\r\n{}"
         );
@@ -543,7 +543,7 @@ mod tests {
             "HTTP/1.1 200 OK\r\n",
             "X-Grid-Demo-Edge-Gateway: west-edge\r\n",
             "X-AI-Demo-Provider-Gateway: east-provider\r\n",
-            "X-Grid-Demo-Provider: east-provider-secondary\r\n",
+            "X-Grid-Test-Provider: east-provider-secondary\r\n",
             "X-Grid-Demo-Backend-Request-Id: backend-secondary\r\n\r\n{}"
         );
         let sample = parse_response(response).unwrap_or_else(|_| std::process::abort());
