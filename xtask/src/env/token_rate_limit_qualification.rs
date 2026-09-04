@@ -1904,7 +1904,11 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), Box<dyn std::e
 }
 
 /// Materialize the Forge config with the requested image tag and verify it.
-fn materialize(options: &Options, names: &RunIdentity) -> Result<PathBuf, Box<dyn std::error::Error>> {
+fn materialize(
+    options: &Options,
+    names: &RunIdentity,
+    state_dir: &Path,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let tag = options
         .image_tag
         .as_deref()
@@ -1913,6 +1917,7 @@ fn materialize(options: &Options, names: &RunIdentity) -> Result<PathBuf, Box<dy
     let mut config: serde_yaml::Value = serde_yaml::from_str(&content)?;
     apply_run_identity(&mut config, names);
     rewrite_context_references(&mut config, names);
+    rewrite_exec_state_references(&mut config, state_dir);
     apply_image_tag(&mut config, tag);
     let rendered = serde_yaml::to_string(&config)?;
     let parent = options
@@ -1924,6 +1929,61 @@ fn materialize(options: &Options, names: &RunIdentity) -> Result<PathBuf, Box<dy
     verify_resolved_tag(&resolved, tag)?;
     verify_resolved_names(&resolved, names)?;
     Ok(resolved)
+}
+
+/// Point shell steps at the run-scoped Forge state while preserving
+/// `template-file` targets, whose `.forge/` prefix Forge resolves itself.
+fn rewrite_exec_state_references(value: &mut serde_yaml::Value, state_dir: &Path) {
+    match value {
+        serde_yaml::Value::Mapping(mapping) => {
+            let is_exec = mapping
+                .get(serde_yaml::Value::String("type".to_owned()))
+                .and_then(serde_yaml::Value::as_str)
+                == Some("exec");
+            if is_exec {
+                if let Some(command) = mapping.get_mut(serde_yaml::Value::String("command".to_owned())) {
+                    rewrite_state_path_strings(command, state_dir);
+                }
+            } else {
+                for child in mapping.values_mut() {
+                    rewrite_exec_state_references(child, state_dir);
+                }
+            }
+        },
+        serde_yaml::Value::Sequence(sequence) => {
+            for child in sequence {
+                rewrite_exec_state_references(child, state_dir);
+            }
+        },
+        serde_yaml::Value::Null
+        | serde_yaml::Value::Bool(_)
+        | serde_yaml::Value::Number(_)
+        | serde_yaml::Value::String(_)
+        | serde_yaml::Value::Tagged(_) => {},
+    }
+}
+
+/// Rewrite `.forge/` paths contained in one exec command value.
+fn rewrite_state_path_strings(value: &mut serde_yaml::Value, state_dir: &Path) {
+    match value {
+        serde_yaml::Value::String(string) => {
+            *string = string.replace(".forge/runtime/", &format!("{}/runtime/", state_dir.display()));
+        },
+        serde_yaml::Value::Sequence(sequence) => {
+            for child in sequence {
+                rewrite_state_path_strings(child, state_dir);
+            }
+        },
+        serde_yaml::Value::Mapping(mapping) => {
+            for child in mapping.values_mut() {
+                rewrite_state_path_strings(child, state_dir);
+            }
+        },
+        serde_yaml::Value::Null
+        | serde_yaml::Value::Bool(_)
+        | serde_yaml::Value::Number(_)
+        | serde_yaml::Value::Tagged(_) => {},
+    }
 }
 
 /// Inject the physical Forge environment identity while preserving logical
@@ -2197,12 +2257,12 @@ fn prepare(options: &Options) -> Result<Session, Box<dyn std::error::Error>> {
     let names = select_run_identity(options)?;
     let evidence = resolve_evidence_dir(options)?;
     fs::create_dir_all(&evidence)?;
-    let config = materialize(options, &names)?;
     let state_dir = options
         .forge_config
         .parent()
         .ok_or("Forge config must have a parent directory")?
         .join(format!(".forge.{}", names.run_id));
+    let config = materialize(options, &names, &state_dir)?;
     let forge = PathBuf::from(std::env::var_os("FORGE_BIN").unwrap_or_else(|| "target/debug/praxis-forge".into()));
     Ok(Session {
         forge,
@@ -2583,5 +2643,17 @@ mod tests {
             template.as_str(),
             Some("kind-grid-token-rate-limit-quota-a1b2c3-{{ cluster.name }}")
         );
+    }
+
+    #[test]
+    fn run_state_rewrite_changes_exec_paths_but_not_template_targets() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            "spec:\n  stacks:\n    test:\n      steps:\n        - type: template-file\n          target: .forge/runtime/west/provider/praxis.yaml\n          source: source.yaml\n        - type: exec\n          command: [bash, -c, 'cat .forge/runtime/west/provider/praxis.yaml']\n",
+        )
+        .unwrap();
+        rewrite_exec_state_references(&mut config, Path::new("topology/.forge.quota-a1b2c3"));
+        let rendered = serde_yaml::to_string(&config).unwrap();
+        assert!(rendered.contains("target: .forge/runtime/west/provider/praxis.yaml"));
+        assert!(rendered.contains("cat topology/.forge.quota-a1b2c3/runtime/west/provider/praxis.yaml"));
     }
 }
