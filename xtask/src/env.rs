@@ -1050,6 +1050,9 @@ pub(crate) enum Action {
         /// Expected locally materialized image tag.
         #[arg(long)]
         image_tag: Option<String>,
+        /// DNS-safe physical resource suffix for deterministic runs.
+        #[arg(long)]
+        run_id: Option<String>,
         /// Keep clusters for debugging instead of automatic teardown.
         #[arg(long)]
         keep: bool,
@@ -1203,11 +1206,13 @@ pub(crate) fn run(action: &Action) -> Result<(), Box<dyn std::error::Error>> {
             forge_config,
             evidence_dir,
             image_tag,
+            run_id,
             keep,
         } => token_rate_limit_qualification::run(&token_rate_limit_qualification::Options {
             forge_config: forge_config.clone(),
             evidence_dir: evidence_dir.clone(),
             image_tag: image_tag.clone(),
+            run_id: run_id.clone(),
             keep: *keep,
         }),
     }

@@ -28,10 +28,18 @@ use serde::{Deserialize, Serialize};
 const TOPOLOGY: &str = "tests/e2e/topologies/grid-token-rate-limit/forge.yaml";
 /// Cluster (site) names in deployment order.
 const CLUSTERS: [&str; 3] = ["west", "central", "east"];
+/// Certificate identities expected by the provider-boundary stack.
+const CERTIFICATE_IDENTITIES: [&str; 3] = ["provider-a", "provider-b", "provider-c"];
 /// Kubernetes namespace hosting every workload.
 const NAMESPACE: &str = "grid-system";
 /// KIND cluster name prefix; the context is `kind-<prefix>-<site>`.
-const CLUSTER_PREFIX: &str = "grid-token-rate-limit";
+const LOGICAL_NETWORK: &str = "grid-token-rate-limit";
+/// Prefix for physical Forge and Kind resources.
+const PHYSICAL_PREFIX: &str = "grid-token-rate-limit";
+/// Maximum explicit run suffix length.
+const MAX_RUN_ID_LEN: usize = 24;
+/// Maximum generated suffix attempts before failing safely.
+const GENERATED_RUN_ID_ATTEMPTS: usize = 8;
 /// West consumer gateway A release name.
 const CONSUMER_A: &str = "consumer-gateway-a";
 /// West consumer gateway B release name.
@@ -54,6 +62,8 @@ const CAPACITY_TOKENS: u32 = 60;
 const RESERVED_TOKENS: u32 = 15;
 /// Sliding-window length in seconds.
 const WINDOW_SECS: u64 = 60;
+/// Additional attempts allowed only when a probe receives no HTTP response.
+const TRANSPORT_RETRIES: u32 = 3;
 /// Cargo features that must be compiled into the Praxis AI qualification image.
 const REQUIRED_GATEWAY_FEATURES: &str = "token-rate-limit-filter,praxis-filter/basic-auth-filter";
 /// OCI label used to make the gateway image's feature contract inspectable.
@@ -82,6 +92,9 @@ pub(crate) struct Options {
     /// Image tag to materialize and load (e.g. `quota-qualification-20260902T023708Z`).
     #[arg(long)]
     pub(crate) image_tag: Option<String>,
+    /// DNS-safe physical resource suffix for deterministic CI/reproduction runs.
+    #[arg(long)]
+    pub(crate) run_id: Option<String>,
     /// Keep Kind resources after completion for debugging.
     #[arg(long)]
     pub(crate) keep: bool,
@@ -168,6 +181,12 @@ struct Evidence {
     schema_version: &'static str,
     /// Topology identifier.
     topology: &'static str,
+    /// Run-scoped physical identity.
+    run_id: String,
+    /// Derived physical resource names and ownership facts.
+    run_identity: RunIdentity,
+    /// Resources observed and created by this invocation.
+    ownership: OwnershipPlan,
     /// Image tag deployed.
     image_tag: String,
     /// Cargo feature contract required of the Praxis AI gateway image.
@@ -182,8 +201,78 @@ struct Evidence {
     distribution: BTreeMap<String, u32>,
     /// Scenario outcomes.
     scenarios: Vec<ScenarioResult>,
+    /// Seconds spent naturally aging authenticated warmup reservations before
+    /// scenario execution. This is deliberately time-based and does not
+    /// mutate Valkey state.
+    warmup_window_reset_seconds: u64,
     /// Whether cluster teardown ran and succeeded.
     cleanup_succeeded: Option<bool>,
+}
+
+/// Physical names for one qualification invocation. Logical Grid identities
+/// intentionally remain the checked-in topology names.
+#[derive(Clone, Debug, Serialize)]
+struct RunIdentity {
+    /// Validated run suffix.
+    run_id: String,
+    /// Forge environment metadata name.
+    forge_name: String,
+    /// Kind cluster prefix.
+    cluster_prefix: String,
+    /// Docker network name.
+    network: String,
+    /// Physical Kind names keyed by logical site.
+    kind_clusters: BTreeMap<String, String>,
+    /// kubectl contexts keyed by logical site.
+    kubectl_contexts: BTreeMap<String, String>,
+}
+
+impl RunIdentity {
+    /// Derive all physical names from one validated run suffix.
+    fn new(run_id: &str) -> Self {
+        let forge_name = format!("{PHYSICAL_PREFIX}-{run_id}");
+        let cluster_prefix = forge_name.clone();
+        let network = format!("{forge_name}-net");
+        let kind_clusters = CLUSTERS
+            .iter()
+            .map(|site| ((*site).to_owned(), format!("{cluster_prefix}-{site}")))
+            .collect();
+        let kubectl_contexts = CLUSTERS
+            .iter()
+            .map(|site| ((*site).to_owned(), format!("kind-{cluster_prefix}-{site}")))
+            .collect();
+        Self {
+            run_id: run_id.to_owned(),
+            forge_name,
+            cluster_prefix,
+            network,
+            kind_clusters,
+            kubectl_contexts,
+        }
+    }
+
+    /// Return the physical Kind cluster name for one logical site.
+    fn kind_cluster(&self, site: &str) -> &str {
+        self.kind_clusters.get(site).map_or("", String::as_str)
+    }
+
+    /// Return the kubectl context for one logical site.
+    fn context(&self, site: &str) -> &str {
+        self.kubectl_contexts.get(site).map_or("", String::as_str)
+    }
+}
+
+/// Resources observed before this run and resources successfully created by it.
+#[derive(Clone, Debug, Serialize)]
+struct OwnershipPlan {
+    /// Exact physical clusters found before this run.
+    preexisting_clusters: Vec<String>,
+    /// Whether the run network existed before this run.
+    preexisting_network: bool,
+    /// Physical clusters successfully created by this run.
+    owned_clusters: Vec<String>,
+    /// Whether the run network was successfully created by this run.
+    owned_network: bool,
 }
 
 /// Accepted overlays keyed by consumer gateway release name.
@@ -202,6 +291,8 @@ struct Collected {
     distribution: BTreeMap<String, u32>,
     /// Scenario outcomes.
     scenarios: Vec<ScenarioResult>,
+    /// Seconds spent naturally aging authenticated warmup reservations.
+    warmup_window_reset_seconds: u64,
 }
 
 /// Results and ledger observations from one synchronized burst.
@@ -273,13 +364,23 @@ struct Session {
     forge: PathBuf,
     /// Resolved (materialized) Forge config.
     config: PathBuf,
+    /// Run-scoped Forge state directory.
+    state_dir: PathBuf,
     /// Evidence output directory.
     evidence: PathBuf,
     /// Image tag deployed.
     image_tag: String,
     /// When false, clusters are torn down on drop/exit.
     keep: bool,
+    /// Centralized physical names for this invocation.
+    names: RunIdentity,
+    /// Ownership ledger used for evidence.
+    ownership: std::cell::RefCell<OwnershipPlan>,
 }
+
+/// The qualification is a single CLI invocation, so its physical naming
+/// context can be installed once for the existing helper graph.
+static RUN_IDENTITY: std::sync::OnceLock<RunIdentity> = std::sync::OnceLock::new();
 
 /// Best-effort cleanup on early return. Drop does NOT run on SIGKILL or the
 /// default SIGINT handler; teardown on those paths is not guaranteed.
@@ -300,7 +401,10 @@ impl Drop for CleanupGuard<'_> {
 
 /// Kubernetes context for a cluster.
 fn context_for(cluster: &str) -> String {
-    format!("kind-{CLUSTER_PREFIX}-{cluster}")
+    RUN_IDENTITY.get().map_or_else(
+        || format!("kind-{PHYSICAL_PREFIX}-{cluster}"),
+        |names| names.context(cluster).to_owned(),
+    )
 }
 
 /// Run a command under a hard `timeout`, capturing output and checking status.
@@ -390,6 +494,96 @@ fn resolve_evidence_dir(options: &Options) -> Result<PathBuf, Box<dyn std::error
     let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     let parent = options.forge_config.parent().unwrap_or_else(|| Path::new("."));
     Ok(parent.join(format!("evidence-token-rate-limit-{stamp}")))
+}
+
+/// Validate an explicitly supplied physical run suffix.
+fn validate_run_id(run_id: &str) -> Result<(), Box<dyn std::error::Error>> {
+    if run_id.is_empty() || run_id.len() > MAX_RUN_ID_LEN {
+        return Err(format!("--run-id must contain 1..{MAX_RUN_ID_LEN} ASCII characters").into());
+    }
+    if !run_id
+        .bytes()
+        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        || !run_id.as_bytes().first().is_some_and(u8::is_ascii_alphanumeric)
+        || !run_id.as_bytes().last().is_some_and(u8::is_ascii_alphanumeric)
+    {
+        return Err(
+            "--run-id must be lowercase ASCII DNS-label text, beginning and ending with a letter or digit".into(),
+        );
+    }
+    Ok(())
+}
+
+/// Generate a collision-resistant short suffix for local execution.
+fn generated_run_id(attempt: usize) -> Result<String, Box<dyn std::error::Error>> {
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let pid = std::process::id();
+    let id = format!("q{nanos:x}{pid:x}{attempt:x}");
+    let id = id.chars().take(MAX_RUN_ID_LEN).collect::<String>();
+    validate_run_id(&id)?;
+    Ok(id)
+}
+
+/// Return whether the exact physical resources already exist.
+#[expect(
+    clippy::too_many_lines,
+    reason = "Collision preflight keeps cluster and network checks together for one atomic decision."
+)]
+fn physical_resources_exist(names: &RunIdentity) -> Result<bool, Box<dyn std::error::Error>> {
+    let clusters = spawn_timed("kind", &["get", "clusters"], 30)?;
+    if !clusters.status.success() {
+        return Err(format!(
+            "kind get clusters failed during collision preflight: {}",
+            String::from_utf8_lossy(&clusters.stderr).trim()
+        )
+        .into());
+    }
+    let existing = String::from_utf8_lossy(&clusters.stdout);
+    if names
+        .kind_clusters
+        .values()
+        .any(|cluster| existing.lines().any(|line| line.trim() == cluster))
+    {
+        return Ok(true);
+    }
+    let network = spawn_timed("docker", &["network", "inspect", &names.network], 30)?;
+    if network.status.success() {
+        return Ok(true);
+    }
+    if !String::from_utf8_lossy(&network.stderr)
+        .to_ascii_lowercase()
+        .contains("no such network")
+        && !String::from_utf8_lossy(&network.stderr)
+            .to_ascii_lowercase()
+            .contains("not found")
+    {
+        return Err(format!(
+            "docker network collision preflight failed for {}: {}",
+            names.network,
+            String::from_utf8_lossy(&network.stderr).trim()
+        )
+        .into());
+    }
+    Ok(false)
+}
+
+/// Select a validated run identity and reject explicit collisions.
+fn select_run_identity(options: &Options) -> Result<RunIdentity, Box<dyn std::error::Error>> {
+    if let Some(run_id) = options.run_id.as_deref() {
+        validate_run_id(run_id)?;
+        let names = RunIdentity::new(run_id);
+        if physical_resources_exist(&names)? {
+            return Err(format!("explicit --run-id {run_id:?} collides with an existing cluster or network").into());
+        }
+        return Ok(names);
+    }
+    for attempt in 0..GENERATED_RUN_ID_ATTEMPTS {
+        let names = RunIdentity::new(&generated_run_id(attempt)?);
+        if !physical_resources_exist(&names)? {
+            return Ok(names);
+        }
+    }
+    Err(format!("could not find a free generated run identity after {GENERATED_RUN_ID_ATTEMPTS} attempts").into())
 }
 
 /// Poll `condition` until it yields a value or the timeout elapses.
@@ -701,15 +895,28 @@ fn active_reservations() -> Result<(u64, u64), Box<dyn std::error::Error>> {
 /// Deploy `forge up` (cluster creation only; stacks are applied per phase).
 fn forge_up(session: &Session) -> Result<(), Box<dyn std::error::Error>> {
     let config = session.config.to_string_lossy().into_owned();
+    let state_dir = session.state_dir.to_string_lossy().into_owned();
     let forge = session.forge.to_string_lossy().into_owned();
-    run_timed(&forge, &["--config", &config, "--non-interactive", "up"], 600)?;
+    run_timed(
+        &forge,
+        &[
+            "--config",
+            &config,
+            "--state-dir",
+            &state_dir,
+            "--non-interactive",
+            "up",
+        ],
+        600,
+    )?;
     Ok(())
 }
 
 /// Load one image into every Kind cluster with an explicit pull-free load.
 fn load_image(image: &str) -> Result<(), Box<dyn std::error::Error>> {
     for cluster in CLUSTERS {
-        let name = format!("{CLUSTER_PREFIX}-{cluster}");
+        let names = RUN_IDENTITY.get().ok_or("run identity is not initialized")?;
+        let name = names.kind_cluster(cluster).to_owned();
         run_timed("kind", &["load", "docker-image", image, "--name", &name], 300)?;
     }
     Ok(())
@@ -728,12 +935,15 @@ fn load_images(session: &Session) -> Result<(), Box<dyn std::error::Error>> {
 /// Apply a single Forge stack to one cluster.
 fn apply_stack(session: &Session, cluster: &str, stack: &str) -> Result<(), Box<dyn std::error::Error>> {
     let config = session.config.to_string_lossy().into_owned();
+    let state_dir = session.state_dir.to_string_lossy().into_owned();
     let forge = session.forge.to_string_lossy().into_owned();
     run_timed(
         &forge,
         &[
             "--config",
             &config,
+            "--state-dir",
+            &state_dir,
             "--non-interactive",
             "stack",
             "apply",
@@ -813,6 +1023,12 @@ fn note(message: &str) {
 
 /// Deploy the whole topology in explicit dependency order.
 fn deploy(session: &Session) -> Result<(), Box<dyn std::error::Error>> {
+    crate::env::certs::generate_all(
+        &CERTIFICATE_IDENTITIES
+            .iter()
+            .map(|identity| (*identity).to_owned())
+            .collect::<Vec<_>>(),
+    )?;
     note("forge up (clusters + network)");
     forge_up(session)?;
     note("loading immutable images into all clusters");
@@ -847,7 +1063,7 @@ fn wait_for_consumers() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Read and parse one consumer gateway's accepted overlay `ConfigMap`.
 fn read_overlay(gateway: &str) -> Result<OverlayView, Box<dyn std::error::Error>> {
-    let name = format!("grid-overlay-{CLUSTER_PREFIX}-{gateway}");
+    let name = format!("grid-overlay-{LOGICAL_NETWORK}-{gateway}");
     let out = kubectl("west", &["get", "configmap", &name, "-o", "json"], 30)?;
     let map: serde_json::Value = serde_json::from_slice(&out.stdout)?;
     parse_overlay(&map)
@@ -1111,12 +1327,36 @@ fn record(results: &mut Vec<HttpResult>, result: HttpResult) -> Outcome {
     outcome
 }
 
+/// Whether a probe failed before receiving any HTTP response.
+fn is_transport_failure(status: u16) -> bool {
+    status == 0
+}
+
+/// Retry only transport failures while retaining every attempt as evidence.
+/// Real HTTP responses, including quota and provider errors, are never retried.
+fn probe_with_transport_retry(
+    results: &mut Vec<HttpResult>,
+    label: &str,
+    gateway: &str,
+    credential: Credential,
+) -> Result<HttpResult, Box<dyn std::error::Error>> {
+    for retry in 0..=TRANSPORT_RETRIES {
+        let mut result = probe(&format!("{label}-transport-{retry}"), gateway, credential)?;
+        if !is_transport_failure(result.status) || retry == TRANSPORT_RETRIES {
+            label.clone_into(&mut result.label);
+            return Ok(result);
+        }
+        results.push(result);
+    }
+    Err("transport retry loop ended without a result".into())
+}
+
 /// Scenario: valid Alice auth is admitted on both gateways with attribution.
 fn scenario_valid_auth(results: &mut Vec<HttpResult>) -> Result<ScenarioResult, Box<dyn std::error::Error>> {
     let mut facts = BTreeMap::new();
     let mut ok = true;
     for gateway in CONSUMERS {
-        let result = probe(&format!("valid-{gateway}"), gateway, Credential::Valid)?;
+        let result = probe_with_transport_retry(results, &format!("valid-{gateway}"), gateway, Credential::Valid)?;
         let site = result.provider_site.clone();
         let admitted = record(results, result) == Outcome::Admitted;
         facts.insert(
@@ -1206,7 +1446,7 @@ fn exhaust_budget(results: &mut Vec<HttpResult>) -> Result<ExhaustOutcome, Box<d
     let mut saw_denied = false;
     for index in 0..attempts {
         let gateway = consumer_for(index as usize);
-        let result = probe(&format!("exhaust-{index}"), gateway, Credential::Valid)?;
+        let result = probe_with_transport_retry(results, &format!("exhaust-{index}"), gateway, Credential::Valid)?;
         if let Some(site) = result.provider_site.clone() {
             sites.push(site);
         }
@@ -1227,7 +1467,8 @@ fn scenario_shared_budget(
     for site in &sites {
         *distribution.entry(site.clone()).or_insert(0) += 1;
     }
-    let denied_b = classify(probe("shared-b-after-exhaust", CONSUMER_B, Credential::Valid)?.status);
+    let denied_b =
+        classify(probe_with_transport_retry(results, "shared-b-after-exhaust", CONSUMER_B, Credential::Valid)?.status);
     let all_sites = CLUSTERS.iter().all(|site| distribution.contains_key(*site));
     let facts = BTreeMap::from([
         ("distribution".to_owned(), serde_json::json!(distribution)),
@@ -1627,8 +1868,30 @@ fn scenario_network_policy() -> Result<ScenarioResult, Box<dyn std::error::Error
 /// Tear down all clusters via `forge down`.
 fn teardown(session: &Session) -> Result<(), Box<dyn std::error::Error>> {
     let config = session.config.to_string_lossy().into_owned();
+    let state_dir = session.state_dir.to_string_lossy().into_owned();
     let forge = session.forge.to_string_lossy().into_owned();
-    run_timed(&forge, &["--config", &config, "--non-interactive", "down"], 300)?;
+    run_timed(
+        &forge,
+        &[
+            "--config",
+            &config,
+            "--state-dir",
+            &state_dir,
+            "--non-interactive",
+            "down",
+        ],
+        300,
+    )?;
+    if session.state_dir.exists() {
+        fs::remove_dir_all(&session.state_dir)
+            .map_err(|error| format!("remove run-scoped Forge state {}: {error}", session.state_dir.display()))?;
+    }
+    fs::remove_file(&session.config).map_err(|error| {
+        format!(
+            "remove run-scoped resolved Forge config {}: {error}",
+            session.config.display()
+        )
+    })?;
     Ok(())
 }
 
@@ -1641,23 +1904,79 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), Box<dyn std::e
 }
 
 /// Materialize the Forge config with the requested image tag and verify it.
-fn materialize(options: &Options) -> Result<PathBuf, Box<dyn std::error::Error>> {
+fn materialize(options: &Options, names: &RunIdentity) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let tag = options
         .image_tag
         .as_deref()
         .ok_or("--image-tag is required for a Never-pull run")?;
     let content = fs::read_to_string(&options.forge_config)?;
     let mut config: serde_yaml::Value = serde_yaml::from_str(&content)?;
+    apply_run_identity(&mut config, names);
+    rewrite_context_references(&mut config, names);
     apply_image_tag(&mut config, tag);
     let rendered = serde_yaml::to_string(&config)?;
     let parent = options
         .forge_config
         .parent()
         .ok_or("Forge config must have a parent directory")?;
-    let resolved = parent.join(".forge.resolved.yaml");
+    let resolved = parent.join(format!(".forge.resolved.{}.yaml", names.run_id));
     fs::write(&resolved, rendered)?;
     verify_resolved_tag(&resolved, tag)?;
+    verify_resolved_names(&resolved, names)?;
     Ok(resolved)
+}
+
+/// Inject the physical Forge environment identity while preserving logical
+/// Grid resource names inside the checked-in manifests.
+fn apply_run_identity(config: &mut serde_yaml::Value, names: &RunIdentity) {
+    if let Some(metadata) = config.get_mut("metadata").and_then(serde_yaml::Value::as_mapping_mut) {
+        metadata.insert(
+            serde_yaml::Value::String("name".to_owned()),
+            serde_yaml::Value::String(names.forge_name.clone()),
+        );
+    }
+    if let Some(runtime) = config
+        .get_mut("spec")
+        .and_then(serde_yaml::Value::as_mapping_mut)
+        .and_then(|spec| spec.get_mut("runtime"))
+        .and_then(serde_yaml::Value::as_mapping_mut)
+    {
+        runtime.insert(
+            serde_yaml::Value::String("clusterPrefix".to_owned()),
+            serde_yaml::Value::String(names.cluster_prefix.clone()),
+        );
+    }
+}
+
+/// Rewrite only the topology's known fixed kubectl context tokens. Logical
+/// Kubernetes object names and DNS identities are intentionally untouched.
+fn rewrite_context_references(value: &mut serde_yaml::Value, names: &RunIdentity) {
+    match value {
+        serde_yaml::Value::Mapping(mapping) => {
+            for child in mapping.values_mut() {
+                rewrite_context_references(child, names);
+            }
+        },
+        serde_yaml::Value::Sequence(sequence) => {
+            for child in sequence {
+                rewrite_context_references(child, names);
+            }
+        },
+        serde_yaml::Value::String(string) => {
+            let old_template = format!("kind-{PHYSICAL_PREFIX}-{{{{ cluster.name }}}}");
+            let new_template = format!("kind-{}-{{{{ cluster.name }}}}", names.cluster_prefix);
+            *string = string.replace(&old_template, &new_template);
+            for site in CLUSTERS {
+                let old = format!("kind-{PHYSICAL_PREFIX}-{site}");
+                let new = names.context(site);
+                *string = string.replace(&old, new);
+            }
+        },
+        serde_yaml::Value::Null
+        | serde_yaml::Value::Bool(_)
+        | serde_yaml::Value::Number(_)
+        | serde_yaml::Value::Tagged(_) => {},
+    }
 }
 
 /// Rewrite every cluster's image properties to the local `tag` under Never.
@@ -1708,6 +2027,36 @@ fn verify_resolved_tag(resolved: &Path, tag: &str) -> Result<(), Box<dyn std::er
         if !content.contains(&format!("{repo}:{tag}")) {
             return Err(format!("resolved config missing {repo}:{tag} (image mismatch under Never)").into());
         }
+    }
+    Ok(())
+}
+
+/// Ensure all physical names were rendered exactly into the resolved config.
+fn verify_resolved_names(resolved: &Path, names: &RunIdentity) -> Result<(), Box<dyn std::error::Error>> {
+    let content = fs::read_to_string(resolved)?;
+    let config: serde_yaml::Value = serde_yaml::from_str(&content)?;
+    let metadata_name = config
+        .get("metadata")
+        .and_then(|metadata| metadata.get("name"))
+        .and_then(serde_yaml::Value::as_str);
+    let cluster_prefix = config
+        .get("spec")
+        .and_then(|spec| spec.get("runtime"))
+        .and_then(|runtime| runtime.get("clusterPrefix"))
+        .and_then(serde_yaml::Value::as_str);
+    if metadata_name != Some(names.forge_name.as_str()) {
+        return Err(format!(
+            "resolved Forge metadata.name {:?} does not equal {:?}",
+            metadata_name, names.forge_name
+        )
+        .into());
+    }
+    if cluster_prefix != Some(names.cluster_prefix.as_str()) {
+        return Err(format!(
+            "resolved Forge runtime.clusterPrefix {:?} does not equal {:?}",
+            cluster_prefix, names.cluster_prefix
+        )
+        .into());
     }
     Ok(())
 }
@@ -1767,7 +2116,10 @@ fn persist_evidence(
     let summary = summarize(&collected.scenarios, &collected.distribution);
     let evidence = Evidence {
         schema_version: "1",
-        topology: CLUSTER_PREFIX,
+        topology: LOGICAL_NETWORK,
+        run_id: session.names.run_id.clone(),
+        run_identity: session.names.clone(),
+        ownership: session.ownership.borrow().clone(),
         image_tag: session.image_tag.clone(),
         required_gateway_features: REQUIRED_GATEWAY_FEATURES,
         resolved_config: session.config.to_string_lossy().into_owned(),
@@ -1775,6 +2127,7 @@ fn persist_evidence(
         http_results: collected.results,
         distribution: collected.distribution,
         scenarios: collected.scenarios,
+        warmup_window_reset_seconds: collected.warmup_window_reset_seconds,
         cleanup_succeeded,
     };
     write_json(&session.evidence.join("results.json"), &evidence)?;
@@ -1794,12 +2147,26 @@ fn summarize(scenarios: &[ScenarioResult], distribution: &BTreeMap<String, u32>)
     lines.join("\n")
 }
 
+/// Run explicit cleanup while retaining the drop fallback until it succeeds.
+fn cleanup_after_run(session: &Session, guard: &mut CleanupGuard<'_>) -> Option<bool> {
+    if session.keep {
+        guard.disarmed = true;
+        return None;
+    }
+    let succeeded = teardown(session).is_ok();
+    if succeeded {
+        guard.disarmed = true;
+    }
+    Some(succeeded)
+}
+
 /// Entry point for `cargo xtask env run-grid-token-rate-limit-qualification`.
 ///
 /// # Errors
 /// Returns an error if setup, deployment, a scenario, or evidence writing fails.
 pub(crate) fn run(options: &Options) -> Result<(), Box<dyn std::error::Error>> {
     let session = prepare(options)?;
+    drop(RUN_IDENTITY.set(session.names.clone()));
     note(&format!("required Praxis AI features: {REQUIRED_GATEWAY_FEATURES}"));
     note(&format!(
         "verifying praxis-ai:{} label {GATEWAY_FEATURES_LABEL}",
@@ -1811,12 +2178,12 @@ pub(crate) fn run(options: &Options) -> Result<(), Box<dyn std::error::Error>> {
         disarmed: false,
     };
     let collected = qualify(&session)?;
-    guard.disarmed = true;
-    let cleanup = if session.keep {
-        None
-    } else {
-        Some(teardown(&session).is_ok())
-    };
+    {
+        let mut ownership = session.ownership.borrow_mut();
+        ownership.owned_clusters = session.names.kind_clusters.values().cloned().collect();
+        ownership.owned_network = true;
+    }
+    let cleanup = cleanup_after_run(&session, &mut guard);
     let passed = persist_evidence(&session, collected, cleanup)?;
     if passed {
         return Ok(());
@@ -1827,16 +2194,30 @@ pub(crate) fn run(options: &Options) -> Result<(), Box<dyn std::error::Error>> {
 /// Validate tooling, materialize the config, and build the session.
 fn prepare(options: &Options) -> Result<Session, Box<dyn std::error::Error>> {
     require_tools()?;
+    let names = select_run_identity(options)?;
     let evidence = resolve_evidence_dir(options)?;
     fs::create_dir_all(&evidence)?;
-    let config = materialize(options)?;
+    let config = materialize(options, &names)?;
+    let state_dir = options
+        .forge_config
+        .parent()
+        .ok_or("Forge config must have a parent directory")?
+        .join(format!(".forge.{}", names.run_id));
     let forge = PathBuf::from(std::env::var_os("FORGE_BIN").unwrap_or_else(|| "target/debug/praxis-forge".into()));
     Ok(Session {
         forge,
         config,
+        state_dir,
         evidence,
         image_tag: options.image_tag.clone().unwrap_or_default(),
         keep: options.keep,
+        names,
+        ownership: std::cell::RefCell::new(OwnershipPlan {
+            preexisting_clusters: Vec::new(),
+            preexisting_network: false,
+            owned_clusters: Vec::new(),
+            owned_network: false,
+        }),
     })
 }
 
@@ -1847,6 +2228,11 @@ fn qualify(session: &Session) -> Result<Collected, Box<dyn std::error::Error>> {
     let mut results = Vec::new();
     note("warming data plane (both gateways must return 200 + provider-site)");
     await_data_plane_ready(&mut results)?;
+    note("aging authenticated warmup reservations before qualification scenarios");
+    let warmup_window_reset_seconds = reset_window();
+    note(&format!(
+        "warmup quota reset completed after {warmup_window_reset_seconds}s of natural window aging"
+    ));
     let mut distribution = BTreeMap::new();
     let scenarios = run_scenarios(&mut results, &mut distribution);
     Ok(Collected {
@@ -1854,6 +2240,7 @@ fn qualify(session: &Session) -> Result<Collected, Box<dyn std::error::Error>> {
         results,
         distribution,
         scenarios,
+        warmup_window_reset_seconds,
     })
 }
 
@@ -1892,12 +2279,13 @@ fn await_data_plane_ready(results: &mut Vec<HttpResult>) -> Result<(), Box<dyn s
 /// one full window plus a margin guarantees the next request prunes every prior
 /// entry. This is a genuine time condition, not a pollable readiness signal, and
 /// it never mutates Valkey state.
-fn reset_window() {
+fn reset_window() -> u64 {
     let deadline = Duration::from_secs(WINDOW_SECS.saturating_add(5));
     let start = Instant::now();
     while start.elapsed() < deadline {
         std::thread::park_timeout(deadline.saturating_sub(start.elapsed()));
     }
+    start.elapsed().as_secs()
 }
 
 #[cfg(test)]
@@ -2121,5 +2509,79 @@ mod tests {
         };
         let encoded = serde_json::to_string(&result).unwrap();
         assert_eq!(serde_json::from_str::<HttpResult>(&encoded).unwrap(), result);
+    }
+
+    #[test]
+    fn only_missing_http_response_is_transport_retryable() {
+        assert!(is_transport_failure(0));
+        for status in [200, 401, 429, 503] {
+            assert!(!is_transport_failure(status));
+        }
+    }
+
+    #[test]
+    fn explicit_run_id_validation_is_strict() {
+        for valid in ["quota-a1b2c3", "run1", "a-b"] {
+            validate_run_id(valid).unwrap();
+        }
+        for invalid in [
+            "",
+            "-leading",
+            "trailing-",
+            "Upper",
+            "has_under",
+            "a.b",
+            "1234567890123456789012345",
+        ] {
+            assert!(validate_run_id(invalid).is_err(), "{invalid} must be rejected");
+        }
+    }
+
+    #[test]
+    fn run_identity_separates_physical_names_from_logical_sites() {
+        let names = RunIdentity::new("quota-a1b2c3");
+        assert_eq!(names.kind_cluster("west"), "grid-token-rate-limit-quota-a1b2c3-west");
+        assert_eq!(names.context("west"), "kind-grid-token-rate-limit-quota-a1b2c3-west");
+        assert_eq!(names.network, "grid-token-rate-limit-quota-a1b2c3-net");
+        assert_eq!(CLUSTERS, ["west", "central", "east"]);
+        assert!(names.kind_clusters.values().all(|value| value.len() <= 63));
+        assert!(names.network.len() <= 63);
+    }
+
+    #[test]
+    fn generated_run_ids_are_valid_and_distinct() {
+        let first = generated_run_id(0).unwrap();
+        let second = generated_run_id(1).unwrap();
+        validate_run_id(&first).unwrap();
+        validate_run_id(&second).unwrap();
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn materialized_config_contains_run_identity_and_preserves_logical_resources() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            "apiVersion: forge.praxis.dev/v1alpha1\nkind: Environment\nmetadata:\n  name: grid-token-rate-limit\nspec:\n  runtime:\n    provider: docker\n    clusterPrefix: grid-token-rate-limit\n  clusters: []\n",
+        )
+        .unwrap();
+        let names = RunIdentity::new("quota-a1b2c3");
+        apply_run_identity(&mut config, &names);
+        let mut context =
+            serde_yaml::Value::String("kubectl --context kind-grid-token-rate-limit-west get pods".to_owned());
+        rewrite_context_references(&mut context, &names);
+        rewrite_context_references(&mut config, &names);
+        let rendered = serde_yaml::to_string(&config).unwrap();
+        assert!(rendered.contains("name: grid-token-rate-limit-quota-a1b2c3"));
+        assert!(rendered.contains("clusterPrefix: grid-token-rate-limit-quota-a1b2c3"));
+        assert!(!rendered.contains("clusterPrefix: grid-token-rate-limit\n"));
+        assert_eq!(
+            context.as_str(),
+            Some("kubectl --context kind-grid-token-rate-limit-quota-a1b2c3-west get pods")
+        );
+        let mut template = serde_yaml::Value::String("kind-grid-token-rate-limit-{{ cluster.name }}".to_owned());
+        rewrite_context_references(&mut template, &names);
+        assert_eq!(
+            template.as_str(),
+            Some("kind-grid-token-rate-limit-quota-a1b2c3-{{ cluster.name }}")
+        );
     }
 }

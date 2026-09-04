@@ -218,6 +218,7 @@ evidence, and tears the clusters down.
 # IMAGE_TAG is the tag of your locally built praxis-ai / grid-operator /
 # grid-overlay-sync images (all three share one tag).
 cargo xtask env run-grid-token-rate-limit-qualification \
+  --run-id quota-a1b2c3 \
   --image-tag "$IMAGE_TAG" \
   --evidence-dir "$EVIDENCE_DIR"
 ```
@@ -226,6 +227,21 @@ Pass `--keep` to leave the clusters running for debugging. Evidence is written
 to `results.json` (machine-readable) and `summary.txt` (human-readable) in the
 evidence directory; neither contains credentials, authorization values, the
 Valkey password, or kubeconfig contents.
+
+Each invocation uses a unique validated run identity for its Forge environment,
+Kind clusters, kubectl contexts, Docker network, resolved Forge file, and probe
+names. The run-id option is optional; use a lowercase DNS-safe value such as
+quota-a1b2c3 for CI or reproducibility. Values must be 1-24 characters,
+contain only lowercase ASCII letters, digits, and hyphens, and start and end
+with an alphanumeric character. Explicit collisions fail before cluster
+creation; omitted IDs are generated and checked for collisions.
+
+Physical names are run-scoped, while logical site names (west, central, east),
+GridNetwork identity, provider candidate IDs, attribution, and the quota
+namespace remain stable. The runner records its ownership plan and deletes only
+resources created by that invocation. Resolved Forge files are removed after
+successful teardown, and a collision or cleanup failure is never reported as a
+qualification pass.
 
 The runner creates all clusters first, applies independent base stacks to every
 site, and only then applies stacks that consume cross-cluster captures. Directly
