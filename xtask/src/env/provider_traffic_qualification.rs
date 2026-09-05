@@ -2113,6 +2113,7 @@ fn deploy_setup(context: &ProviderTrafficContext) -> Result<OverlayState, Box<dy
             .args(["--non-interactive", "stack", "apply", cluster, stack])
             .status()?;
         if !stack_status.success() {
+            capture_stack_failure(cluster, stack);
             return Err(format!("Failed to apply {stack} to {cluster}").into());
         }
         Ok(())
@@ -2233,6 +2234,32 @@ fn deploy_setup(context: &ProviderTrafficContext) -> Result<OverlayState, Box<dy
         pre_swim: pre_swim_overlays,
         post_swim: post_swim_overlays,
     })
+}
+
+/// Capture bounded Kubernetes diagnostics before failed setup is torn down.
+fn capture_stack_failure(cluster: &str, stack: &str) {
+    let context = format!("kind-grid-provider-traffic-{cluster}");
+    eprintln!("  [DIAG] {stack} failed on {cluster}; capturing Kubernetes state");
+    for args in [
+        vec!["get", "pods", "-o", "wide"],
+        vec!["get", "deployments", "-o", "wide"],
+        vec!["describe", "deployment", stack],
+        vec!["get", "events", "--sort-by=.lastTimestamp"],
+        vec!["logs", "deployment/provider-gateway", "--all-containers", "--tail=100"],
+    ] {
+        let output = Command::new("kubectl")
+            .args(["--context", &context, "-n", GRID_SYSTEM_NS, "--request-timeout=10s"])
+            .args(&args)
+            .output();
+        match output {
+            Ok(output) => {
+                let stdout = safe_truncate_str(String::from_utf8_lossy(&output.stdout).trim(), 8_000);
+                let stderr = safe_truncate_str(String::from_utf8_lossy(&output.stderr).trim(), 2_000);
+                eprintln!("  [DIAG] kubectl {}\n{stdout}\n{stderr}", args.join(" "));
+            },
+            Err(error) => eprintln!("  [DIAG] kubectl {} failed: {error}", args.join(" ")),
+        }
+    }
 }
 
 // -----------------------------------------------------------------------------

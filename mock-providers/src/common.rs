@@ -11,8 +11,8 @@ use serde_json::Value;
 
 use crate::AppState;
 
-/// Header name for the demo provider site attribution.
-pub(crate) const PROVIDER_HEADER_NAME: &str = "x-grid-demo-provider";
+/// Header name for test-provider identity attribution.
+pub(crate) const PROVIDER_HEADER_NAME: &str = "x-grid-test-provider";
 
 /// Provider-owned attribution received by the backend.
 const PROVIDER_ATTRIBUTION_INPUT: &str = "x-ai-provider-attribution";

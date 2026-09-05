@@ -4,6 +4,9 @@
 # and authorizes the consumer gateway before AI-owned x-ai-routing-* fields can
 # influence provider-local routing.
 
+insecure_options:
+  allow_private_endpoints: true
+
 listeners:
   - name: provider
     address: "0.0.0.0:8443"

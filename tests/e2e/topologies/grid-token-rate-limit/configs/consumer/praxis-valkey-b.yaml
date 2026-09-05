@@ -1,3 +1,6 @@
+insecure_options:
+  allow_private_endpoints: true
+
 listeners:
   - name: proxy
     address: "0.0.0.0:8080"

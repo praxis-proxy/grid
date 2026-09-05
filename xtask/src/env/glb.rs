@@ -1183,11 +1183,7 @@ fn collect_prereq_errors(forge_config: &Path) -> (Vec<String>, Option<String>) {
     }
     let forge_bin = resolve_forge_binary();
     if forge_bin.is_none() {
-        errors.push(
-            "praxis-forge binary not found on PATH or at \
-             target/debug/praxis-forge"
-                .to_owned(),
-        );
+        errors.push("praxis-forge was unavailable and its workspace build failed".to_owned());
     }
     (errors, forge_bin)
 }
@@ -1202,17 +1198,53 @@ fn tool_available(name: &str) -> bool {
         .is_ok_and(|s| s.success())
 }
 
-/// Resolve the forge binary: prefer `praxis-forge` on PATH, fall
-/// back to `target/debug/praxis-forge`.
+/// Resolve Forge from an override, `PATH`, or the workspace build.
+///
+/// A fresh checkout builds the workspace binary automatically under a hard
+/// timeout so qualifications do not require an undocumented bootstrap step.
 pub(crate) fn resolve_forge_binary() -> Option<String> {
+    if let Some(override_path) = std::env::var_os("FORGE_BIN") {
+        let path = PathBuf::from(override_path);
+        if path.is_file() {
+            return Some(path.to_string_lossy().into_owned());
+        }
+        eprintln!("FORGE_BIN does not name a file: {}", path.display());
+        return None;
+    }
     if tool_available("praxis-forge") {
         return Some("praxis-forge".to_owned());
     }
-    let local = "target/debug/praxis-forge";
-    if Path::new(local).exists() {
-        return Some(local.to_owned());
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap_or_else(|| Path::new("."));
+    let local = workspace.join("target/debug/praxis-forge");
+    if local.is_file() {
+        return Some(local.to_string_lossy().into_owned());
     }
-    None
+    build_workspace_forge(workspace, &local)
+}
+
+/// Build the workspace Forge binary under a hard timeout.
+fn build_workspace_forge(workspace: &Path, local: &Path) -> Option<String> {
+    eprintln!("praxis-forge not found; building the workspace binary");
+    let manifest = workspace.join("Cargo.toml");
+    let target = workspace.join("target");
+    let output = Command::new("timeout")
+        .args(["300", "cargo", "build", "--manifest-path"])
+        .arg(manifest)
+        .args(["--target-dir"])
+        .arg(target)
+        .args(["-p", "forge", "--bin", "praxis-forge"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        eprintln!(
+            "failed to build praxis-forge: {}",
+            safe_truncate_str(String::from_utf8_lossy(&output.stderr).trim(), 2_000)
+        );
+        return None;
+    }
+    local.is_file().then(|| local.to_string_lossy().into_owned())
 }
 
 /// Detect placeholder images in Forge configuration.
@@ -1612,20 +1644,7 @@ fn run_steps(ctx: &PrereqContext, mode: DemoMode, ingress_mode: IngressMode, res
 
     // Drain routing verification — new sessions must avoid the withdrawn provider.
     proof_banner("checking drain routing");
-    let drain_proof = wait_for_data_plane_convergence("provider drain routing", || {
-        let session = format!("drain-proof-{}", unix_nanos());
-        let resp = curl_edge_request(EDGE_PORT, Some(&session))?;
-        if resp.status != 200 {
-            return Err(format!("drain routing request returned HTTP {}", resp.status).into());
-        }
-        let provider = extract_provider(&resp)?;
-        if provider == provider_a {
-            return Err(format!("new session routed to withdrawn provider {provider_a}").into());
-        }
-        Ok(format!(
-            "new session routed to {provider}, avoiding withdrawn {provider_a}"
-        ))
-    });
+    let drain_proof = verify_new_sessions_avoid_provider(EDGE_PORT, &provider_a, 6);
     let drain_restore = restore_withdrawn_provider(PRIMARY_EDGE, &drain_withdrawal);
     match (drain_proof, drain_restore) {
         (Ok(proof), Ok(restored)) => {
@@ -1703,6 +1722,57 @@ fn run_steps(ctx: &PrereqContext, mode: DemoMode, ingress_mode: IngressMode, res
     record_step("invalid overlay protection", results, || {
         check_invalid_overlay_protection(PRIMARY_EDGE)
     });
+}
+
+/// Require several distinct post-barrier sessions to avoid one exact backend.
+/// A withdrawn response is a real failure and is never retried away.
+fn verify_new_sessions_avoid_provider(
+    port: u16,
+    withdrawn: &str,
+    count: usize,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let withdrawn_cluster = provider_routing_cluster(withdrawn)?;
+    let mut observations = Vec::with_capacity(count);
+    for index in 0..count {
+        let session = format!("drain-proof-{index}-{}", unix_nanos());
+        let resp = curl_edge_request(port, Some(&session))?;
+        let provider = extract_provider(&resp)?;
+        let observation = drain_observation(&session, &resp, &provider);
+        eprintln!("  drain observation: {observation}");
+        observations.push(observation);
+        if resp.status != 200 {
+            return Err(format!("post-withdrawal observations={observations:?}").into());
+        }
+        let selected = resp
+            .headers
+            .get("x-ai-inference-provider")
+            .ok_or("post-withdrawal response missing x-ai-inference-provider")?;
+        if selected == withdrawn_cluster {
+            return Err(format!(
+                "new session selected withdrawn cluster {withdrawn_cluster}; observations={observations:?}"
+            )
+            .into());
+        }
+    }
+    Ok(format!(
+        "{count} new sessions avoided withdrawn backend {withdrawn}; observations={observations:?}"
+    ))
+}
+
+/// Format the two routing identities needed to locate a stale decision.
+fn drain_observation(session: &str, resp: &verify::HttpResponse, provider: &str) -> String {
+    let gateway = resp
+        .headers
+        .get(PROVIDER_GATEWAY_RESPONSE_HEADER)
+        .map_or("missing", String::as_str);
+    let selected = resp
+        .headers
+        .get("x-ai-inference-provider")
+        .map_or("missing", String::as_str);
+    format!(
+        "session={session} status={} selected={selected} backend={provider} gateway={gateway}",
+        resp.status
+    )
 }
 
 /// Print a step progress banner.
@@ -3215,14 +3285,14 @@ fn check_edge_overlay_mounts_with_count(expected_candidates: usize) -> Result<St
 /// do not become ready before the provider-state timeout.
 pub(crate) fn wait_for_edge_overlays_ready() -> Result<String, Box<dyn std::error::Error>> {
     // Try to auto-detect the candidate count by checking the actual overlay
-    match detect_candidate_count() {
+    match edge_candidate_count() {
         Ok(count) => wait_for_edge_overlays_ready_with_count(count),
         Err(_) => wait_for_edge_overlays_ready_with_count(3), // fallback to default
     }
 }
 
 /// Detect the expected candidate count by checking the first edge's overlay
-fn detect_candidate_count() -> Result<usize, Box<dyn std::error::Error>> {
+pub(crate) fn edge_candidate_count() -> Result<usize, Box<dyn std::error::Error>> {
     let context = kubectl_context("east-edge");
     let overlay = kubectl_jsonpath(
         &context,
@@ -3287,8 +3357,8 @@ fn verify_single_edge_overlay_with_count(
         .ok_or_else(|| format!("{edge} overlay missing candidates"))?;
     if local_site != edge || candidates.len() != expected_candidates {
         return Err(format!(
-            "{edge} overlay local_site={local_site:?}, candidates={}",
-            candidates.len()
+            "{edge} overlay local_site={local_site:?}, candidates={} (expected {expected_candidates})",
+            candidates.len(),
         )
         .into());
     }
@@ -3308,7 +3378,7 @@ fn verify_single_edge_overlay_with_count(
 }
 
 /// Read the semantic revision from one edge's distributed envelope.
-fn overlay_revision(edge: &str) -> Result<String, Box<dyn std::error::Error>> {
+pub(crate) fn overlay_revision(edge: &str) -> Result<String, Box<dyn std::error::Error>> {
     let envelope_raw = kubectl_jsonpath(
         &kubectl_context(edge),
         "configmap",
@@ -4632,7 +4702,7 @@ fn extract_provider(resp: &verify::HttpResponse) -> Result<String, Box<dyn std::
     // site can host multiple candidates, so using it for withdrawal checks
     // would confuse a withdrawn backend with a still-eligible sibling.
     resp.headers
-        .get("x-grid-demo-provider")
+        .get("x-grid-test-provider")
         .or_else(|| resp.headers.get("x-ai-demo-provider-gateway"))
         .cloned()
         .ok_or_else(|| "missing provider attribution headers".into())
@@ -5444,6 +5514,24 @@ clusters:
     }
 
     #[test]
+    fn drain_observation_distinguishes_selection_from_backend() {
+        let response = verify::HttpResponse {
+            status: 200,
+            body: "{}".to_owned(),
+            headers: BTreeMap::from([
+                (
+                    "x-ai-inference-provider".to_owned(),
+                    "vcr-east-provider-secondary".to_owned(),
+                ),
+                (PROVIDER_GATEWAY_RESPONSE_HEADER.to_owned(), "east-provider".to_owned()),
+            ]),
+        };
+        let observed = drain_observation("new-session", &response, "east-provider");
+        assert!(observed.contains("selected=vcr-east-provider-secondary"));
+        assert!(observed.contains("backend=east-provider"));
+    }
+
+    #[test]
     fn parse_header_dump_empty() {
         let map = parse_header_dump("");
         assert!(map.is_empty(), "empty input should produce empty map");
@@ -5467,7 +5555,7 @@ clusters:
             body: String::new(),
             headers: BTreeMap::from([
                 ("x-ai-demo-provider-gateway".to_owned(), "east-provider".to_owned()),
-                ("x-grid-demo-provider".to_owned(), "east-provider-secondary".to_owned()),
+                ("x-grid-test-provider".to_owned(), "east-provider-secondary".to_owned()),
             ]),
         };
         assert_eq!(extract_provider(&resp).ok().as_deref(), Some("east-provider-secondary"));

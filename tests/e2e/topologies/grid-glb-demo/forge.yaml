@@ -120,7 +120,7 @@ spec:
           resource: deployment/grid-operator
           namespace: grid-system
           condition: available
-          timeout: "120s"
+          timeout: "180s"
         - type: capture
           resource: svc/grid-operator-swim
           namespace: grid-system

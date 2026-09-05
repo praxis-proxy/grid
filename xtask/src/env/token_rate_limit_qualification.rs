@@ -937,7 +937,7 @@ fn apply_stack(session: &Session, cluster: &str, stack: &str) -> Result<(), Box<
     let config = session.config.to_string_lossy().into_owned();
     let state_dir = session.state_dir.to_string_lossy().into_owned();
     let forge = session.forge.to_string_lossy().into_owned();
-    run_timed(
+    let result = run_timed(
         &forge,
         &[
             "--config",
@@ -951,8 +951,32 @@ fn apply_stack(session: &Session, cluster: &str, stack: &str) -> Result<(), Box<
             stack,
         ],
         300,
-    )?;
-    Ok(())
+    );
+    if result.is_err() {
+        capture_stack_failure(cluster, stack);
+    }
+    result.map(|_| ())
+}
+
+/// Capture bounded Kubernetes state before a failed stack is torn down.
+fn capture_stack_failure(cluster: &str, stack: &str) {
+    note(&format!("diagnostics: {stack} failed on {cluster}"));
+    for args in [
+        vec!["get", "pods", "-o", "wide"],
+        vec!["get", "deployments", "-o", "wide"],
+        vec!["describe", "deployment", stack],
+        vec!["get", "events", "--sort-by=.lastTimestamp"],
+        vec!["logs", "deployment/provider-gateway", "--all-containers", "--tail=100"],
+    ] {
+        match kubectl_unchecked(cluster, &args, 15) {
+            Ok(output) => {
+                let stdout = crate::env::safe_truncate_str(String::from_utf8_lossy(&output.stdout).trim(), 8_000);
+                let stderr = crate::env::safe_truncate_str(String::from_utf8_lossy(&output.stderr).trim(), 2_000);
+                eprintln!("[token-rate-limit] kubectl {}\n{stdout}\n{stderr}", args.join(" "));
+            },
+            Err(error) => eprintln!("[token-rate-limit] kubectl {} failed: {error}", args.join(" ")),
+        }
+    }
 }
 
 /// Apply a per-site stack (named `<site>-<suffix>`) across all clusters.

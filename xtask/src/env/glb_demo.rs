@@ -1043,8 +1043,10 @@ fn print_crossed_path(narrator: &mut Narrator, paths: &ObservedPaths) {
 
 /// Map a backend provider identity to its provider-site gateway.
 fn provider_gateway_for_backend(provider: &str) -> &str {
-    if provider == "east-provider-secondary" {
+    if matches!(provider, "east-provider-secondary" | "vcr-east-provider-secondary") {
         "east-provider"
+    } else if let Some(site) = provider.strip_prefix("vcr-") {
+        site
     } else {
         provider
     }
@@ -1192,11 +1194,7 @@ fn discover_workload_paths() -> Result<Vec<ObservedPathEntry>, Box<dyn std::erro
         if response.status != 200 {
             return Err(format!("workload request from {cluster} returned status {}", response.status).into());
         }
-        let provider = if response.provider.is_empty() {
-            extract_provider_from_response(&response.body)?
-        } else {
-            response.provider.clone()
-        };
+        let provider = require_workload_provider(&response)?;
         paths.push(ObservedPathEntry {
             edge: (*cluster).to_owned(),
             provider: provider.clone(),
@@ -1209,19 +1207,16 @@ fn discover_workload_paths() -> Result<Vec<ObservedPathEntry>, Box<dyn std::erro
     Ok(paths)
 }
 
-/// Extract provider identity from the workload response body.
-///
-/// Returns an error when the response is not valid JSON or lacks a
-/// `model` field — missing attribution must fail the proof rather than
-/// silently substituting a placeholder.
-fn extract_provider_from_response(body: &str) -> Result<String, Box<dyn std::error::Error>> {
-    let value: serde_json::Value =
-        serde_json::from_str(body).map_err(|e| format!("response is not valid JSON: {e}"))?;
-    value
-        .get("model")
-        .and_then(serde_json::Value::as_str)
-        .map(String::from)
-        .ok_or_else(|| "response JSON missing 'model' field for provider attribution".into())
+/// Require provider identity from the trusted workload response header.
+fn require_workload_provider(response: &workload::WorkloadResponse) -> Result<String, Box<dyn std::error::Error>> {
+    if response.provider.is_empty() {
+        return Err(format!(
+            "workload response lacked provider-owned x-ai-demo-provider-gateway attribution (HTTP {}, body={})",
+            response.status, response.body
+        )
+        .into());
+    }
+    Ok(response.provider.clone())
 }
 
 /// Maximum time to wait for overlay convergence during drain/restore.
@@ -1469,11 +1464,7 @@ fn verify_local_routing(consumer_edge: &str) -> Result<String, Box<dyn std::erro
     if verify.status != 200 {
         return Err(format!("{consumer_edge} returned status {}", verify.status).into());
     }
-    let provider = if verify.provider.is_empty() {
-        extract_provider_from_response(&verify.body)?
-    } else {
-        verify.provider
-    };
+    let provider = require_workload_provider(&verify)?;
     let region = consumer_edge.strip_suffix("-edge").unwrap_or(consumer_edge);
     if !provider.starts_with(region) {
         return Err(format!("{consumer_edge} routed to {provider}, expected local {region} provider").into());
@@ -1615,6 +1606,7 @@ fn prove_operator_restarts(
     fixtures: &[&AffinityFixture],
     request_fixture: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let expected_candidates = glb::edge_candidate_count()?;
     narrator.narrate("");
     narrator.wrapped(
         "[RESTART] ",
@@ -1628,7 +1620,7 @@ fn prove_operator_restarts(
             GRID_CLUSTERS.len()
         ));
         restart_grid_operator(cluster)?;
-        let overlay_evidence = glb::wait_for_edge_overlays_ready()?;
+        let overlay_evidence = verify_restart_overlay_recovery(expected_candidates)?;
         let fixture = fixtures
             .get(index % fixtures.len())
             .ok_or("no affinity fixture available after Grid restart")?;
@@ -1643,6 +1635,16 @@ fn prove_operator_restarts(
         ));
     }
     Ok(())
+}
+
+/// Require both consumers to return to the complete, served overlay after a restart.
+fn verify_restart_overlay_recovery(expected_candidates: usize) -> Result<String, Box<dyn std::error::Error>> {
+    let evidence = glb::wait_for_edge_overlays_ready_with_count(expected_candidates)?;
+    for edge in CONSUMER_CLUSTERS {
+        let revision = glb::overlay_revision(edge)?;
+        glb::verify_edge_serving_revision(edge, &revision)?;
+    }
+    Ok(evidence)
 }
 
 /// Sustain inference requests for the full-mode soak window.
@@ -2490,6 +2492,27 @@ mod setup_tests {
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .parent()
                 .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
+        }
+
+        #[test]
+        fn workload_provider_requires_trusted_header() {
+            let response = workload::WorkloadResponse {
+                status: 200,
+                body: r#"{"model":"east-provider"}"#.to_owned(),
+                provider: String::new(),
+            };
+            let error = require_workload_provider(&response).unwrap_err();
+            assert!(error.to_string().contains("lacked provider-owned"));
+        }
+
+        #[test]
+        fn workload_provider_returns_header_identity() {
+            let response = workload::WorkloadResponse {
+                status: 200,
+                body: "{}".to_owned(),
+                provider: "east-provider".to_owned(),
+            };
+            assert_eq!(require_workload_provider(&response).unwrap(), "east-provider");
         }
 
         #[test]

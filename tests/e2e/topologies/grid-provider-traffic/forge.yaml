@@ -70,7 +70,7 @@ spec:
           resource: deployment/controller
           namespace: metallb-system
           condition: available
-          timeout: "120s"
+          timeout: "180s"
         - type: metallb-auto-pool
           name: forge-pool
 

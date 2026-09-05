@@ -2,8 +2,8 @@
 //!
 //! Each module exposes a `router()` function returning an
 //! [`axum::Router`] that simulates a specific provider's API.
-//! Pass an [`AppState`] to inject the `X-Grid-Demo-Provider`
-//! response header for demo attribution.
+//! Pass an [`AppState`] to inject the `X-Grid-Test-Provider`
+//! response header for test attribution.
 
 #![deny(unsafe_code)]
 
@@ -25,7 +25,7 @@ pub mod vertex;
 /// Shared application state injected into every provider router.
 #[derive(Clone, Debug)]
 pub struct AppState {
-    /// Site identity for the `X-Grid-Demo-Provider` response header.
+    /// Site identity for the `X-Grid-Test-Provider` response header.
     pub provider_site: Arc<str>,
 
     /// Normalized queue depth exported by the demo metrics endpoint.
