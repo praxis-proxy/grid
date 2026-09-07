@@ -19,7 +19,7 @@ rust-version = "1.96"
 license = "MIT"
 
 [workspace.dependencies]
-aes-gcm = "0.10"
+aes-gcm = "0.11"
 axum = "0.8.9"
 bytes = "1.12.1"
 clap = { version = "4.6.6", features = ["derive"] }
