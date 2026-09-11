@@ -1,0 +1,5 @@
+# Run-scoped qualification evidence and Forge materialization.
+evidence/
+evidence-*/
+.forge.resolved.yaml
+.forge.resolved.*

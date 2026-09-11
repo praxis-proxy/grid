@@ -154,6 +154,8 @@ pub enum SelectionMode {
     RoundRobin,
     /// Distribute new requests randomly in the active group.
     Random,
+    /// Select candidates proportionally to their configured capacity.
+    WeightedRandom,
 }
 
 /// Request selection policy published in the routing overlay.
@@ -163,6 +165,23 @@ pub enum SelectionMode {
 pub struct SelectionPolicyConfig {
     /// Local selection mode used by the data-plane gateway.
     pub mode: SelectionMode,
+}
+
+/// Explicit static provider-capacity placement strategy.
+#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PlacementStrategy {
+    /// Use operator-configured provider capacity weights.
+    Static,
+}
+
+/// Traffic placement policy. This static stack intentionally has no metric inputs.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct PlacementPolicyConfig {
+    /// Placement strategy.
+    pub strategy: PlacementStrategy,
 }
 
 /// Resolve the effective [`scoring::ScoringWeights`] from a scoring policy.
@@ -496,6 +515,10 @@ pub fn resolve_budget_statuses(
     printcolumn = r#"{"name":"Phase","type":"string","jsonPath":".status.phase"}"#,
     printcolumn = r#"{"name":"Sites","type":"integer","jsonPath":".status.connectedSites"}"#
 )]
+#[schemars(extend("x-kubernetes-validations" = [{
+    "rule": "has(self.placementPolicy) == (has(self.selectionPolicy) && self.selectionPolicy.mode == 'weightedRandom')",
+    "message": "placementPolicy must be set if and only if selectionPolicy.mode is weightedRandom"
+}]))]
 #[serde(rename_all = "camelCase")]
 pub struct GridNetworkSpec {
     /// Grid ID for tenancy. Empty on creation; auto-generated
@@ -569,6 +592,10 @@ pub struct GridNetworkSpec {
     /// selection override and Praxis uses deterministic selection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selection_policy: Option<SelectionPolicyConfig>,
+
+    /// Optional static capacity-placement policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement_policy: Option<PlacementPolicyConfig>,
 
     /// Maximum time between metric refreshes and score/ranking recalculation.
     ///
@@ -1977,7 +2004,7 @@ mod tests {
 
         let result = serde_json::from_value::<GridNetworkSpec>(serde_json::json!({
             "seeds": [],
-            "selectionPolicy": { "mode": "weightedRandom" }
+            "selectionPolicy": { "mode": "not-a-mode" }
         }));
         let Err(error) = result else {
             std::process::abort();

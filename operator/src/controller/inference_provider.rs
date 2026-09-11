@@ -2541,6 +2541,7 @@ mod tests {
         health_check: Option<HealthCheckConfig>,
     ) -> InferenceProviderSpec {
         InferenceProviderSpec {
+            capacity_weight: None,
             grid_network_ref: "net".to_owned(),
             access_policy: crate::crd::auth::AccessPolicy::default(),
             auth: None,

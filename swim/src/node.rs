@@ -352,6 +352,7 @@ mod tests {
             routing_cluster: site.to_owned(),
             models: vec!["model-x".to_owned()],
             backend_kind: "local".to_owned(),
+            capacity_weight: 1,
             phase: ProviderPhase::Available,
             metrics: ProviderMetricsSnapshot {
                 queue_depth: Some(queue),

@@ -482,6 +482,7 @@ mod tests {
                 score_breakdown: None,
                 rank: Some(0),
                 selection_group: None,
+                traffic_weight: None,
             }],
             selection_policy: None,
             generated_at: Some("2026-07-29T00:00:00Z".to_owned()),

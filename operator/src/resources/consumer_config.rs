@@ -241,6 +241,7 @@ fn render_selection_policy(policy: Option<&crate::crd::grid_network::SelectionPo
         SelectionMode::Deterministic => "deterministic",
         SelectionMode::RoundRobin => "roundRobin",
         SelectionMode::Random => "random",
+        SelectionMode::WeightedRandom => "weightedRandom",
     };
     format!("        selection_policy:\n          mode: {mode}\n")
 }
@@ -278,6 +279,9 @@ fn render_candidate(c: &RoutingCandidate) -> String {
     }
     if let Some(group) = c.selection_group {
         lines.push(format!("           selection_group: {group}"));
+    }
+    if let Some(weight) = c.traffic_weight {
+        lines.push(format!("           traffic_weight: {weight}"));
     }
     if let Some(cred) = &c.credential {
         lines.extend(render_credential_reference(cred));
@@ -554,6 +558,8 @@ mod tests {
             score_breakdown: None,
             rank: None,
             selection_group: None,
+            traffic_weight: None,
+            capacity_weight: 1,
         }
     }
 
@@ -587,6 +593,8 @@ mod tests {
             score_breakdown: None,
             rank: None,
             selection_group: None,
+            traffic_weight: None,
+            capacity_weight: 1,
         }
     }
 

@@ -11,6 +11,9 @@ spec:
   providerKind: {{ required "inferenceProviders[].providerKind is required" .providerKind }}
   backendKind: {{ required "inferenceProviders[].backendKind is required" .backendKind }}
   endpoint: {{ required "inferenceProviders[].endpoint is required" .endpoint | quote }}
+  {{- with .capacityWeight }}
+  capacityWeight: {{ . }}
+  {{- end }}
   {{- with .routingClusterRef }}
   routingClusterRef: {{ . | quote }}
   {{- end }}

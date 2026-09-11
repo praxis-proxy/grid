@@ -46,25 +46,43 @@ use crate::resources::routing_overlay::{RoutingCandidate, RoutingOverlay};
 pub fn to_intelligent_route_value(overlay: &RoutingOverlay, model_header: &str) -> serde_json::Value {
     let candidates: Vec<serde_json::Value> = overlay.candidates.iter().map(candidate_to_value).collect();
 
-    serde_json::json!({
+    let mut value = serde_json::json!({
         "filter": "intelligent_route",
         "local_site": overlay.local_site,
         "model_header": model_header,
         "candidates": candidates
-    })
+    });
+    if let Some(policy) = &overlay.selection_policy
+        && let Some(object) = value.as_object_mut()
+    {
+        object.insert(
+            "selection_policy".to_owned(),
+            serde_json::json!({ "mode": policy.mode }),
+        );
+    }
+    value
 }
 
 /// Serialise one [`RoutingCandidate`] to a `serde_json::Value`.
 ///
 /// [`RoutingCandidate`]: crate::resources::routing_overlay::RoutingCandidate
 fn candidate_to_value(c: &RoutingCandidate) -> serde_json::Value {
-    serde_json::json!({
+    let mut value = serde_json::json!({
         "kind": c.kind,
         "name": c.name,
         "site": c.site,
         "cluster": c.cluster,
         "fresh": c.fresh
-    })
+    });
+    if let Some(object) = value.as_object_mut() {
+        if let Some(group) = c.selection_group {
+            object.insert("selection_group".to_owned(), serde_json::json!(group));
+        }
+        if let Some(weight) = c.traffic_weight {
+            object.insert("traffic_weight".to_owned(), serde_json::json!(weight));
+        }
+    }
+    value
 }
 
 // ---------------------------------------------------------------------------
@@ -96,6 +114,8 @@ mod tests {
                     score_breakdown: None,
                     rank: None,
                     selection_group: None,
+                    traffic_weight: None,
+                    capacity_weight: 1,
                 })
                 .collect(),
             selection_policy: None,
@@ -153,6 +173,14 @@ mod tests {
         assert_eq!(c.get("site").and_then(serde_json::Value::as_str), Some("site-a"));
         assert_eq!(c.get("cluster").and_then(serde_json::Value::as_str), Some("prov-a"));
         assert_eq!(c.get("fresh").and_then(serde_json::Value::as_bool), Some(true));
+        assert!(
+            c.get("selection_group").is_none(),
+            "default candidate must omit selection_group"
+        );
+        assert!(
+            c.get("traffic_weight").is_none(),
+            "default candidate must omit traffic_weight"
+        );
     }
 
     #[test]

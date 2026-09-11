@@ -147,6 +147,13 @@ pub struct ProviderState {
     /// Backend locality kind (`local`, `remote`, `cloud_managed`, `api_provider`).
     pub backend_kind: String,
 
+    /// Relative configured capacity used by opt-in traffic placement.
+    ///
+    /// The SWIM wire envelope transports this value in its versioned trailing
+    /// extension so the positional bincode base snapshot remains compatible.
+    #[serde(skip, default = "default_capacity_weight")]
+    pub capacity_weight: u32,
+
     /// Lifecycle phase observed by the advertising site.
     pub phase: ProviderPhase,
 
@@ -168,12 +175,29 @@ pub struct ProviderState {
     pub writer_id: String,
 }
 
+/// Smallest valid operator-configured static capacity weight.
+pub const MIN_CAPACITY_WEIGHT: u32 = 1;
+
+/// Largest valid operator-configured static capacity weight.
+pub const MAX_CAPACITY_WEIGHT: u32 = 1_000;
+
+/// Return whether a capacity weight is valid across CRD, SWIM, and rendering.
+#[must_use]
+pub const fn is_valid_capacity_weight(weight: u32) -> bool {
+    weight >= MIN_CAPACITY_WEIGHT && weight <= MAX_CAPACITY_WEIGHT
+}
+
 impl ProviderState {
     /// Return true when `self` should replace `other` during merge.
     #[must_use]
     fn supersedes(&self, other: &Self) -> bool {
         (self.revision, &self.writer_id) > (other.revision, &other.writer_id)
     }
+}
+
+/// Backward-compatible capacity for provider records from older peers.
+const fn default_capacity_weight() -> u32 {
+    1
 }
 
 // ---------------------------------------------------------------------------
@@ -376,6 +400,15 @@ fn provider_key(network_id: &str, site_id: &str, provider_id: &str) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn capacity_weight_contract_accepts_only_one_through_one_thousand() {
+        assert!(!is_valid_capacity_weight(0));
+        assert!(is_valid_capacity_weight(1));
+        assert!(is_valid_capacity_weight(1_000));
+        assert!(!is_valid_capacity_weight(1_001));
+        assert!(!is_valid_capacity_weight(u32::MAX));
+    }
+
     fn provider(site: &str, provider_id: &str, revision: u64, queue_depth: f64) -> ProviderState {
         ProviderState {
             network_id: "net".to_owned(),
@@ -384,6 +417,7 @@ mod tests {
             routing_cluster: site.to_owned(),
             models: vec!["model-x".to_owned()],
             backend_kind: "local".to_owned(),
+            capacity_weight: 1,
             phase: ProviderPhase::Available,
             metrics: ProviderMetricsSnapshot {
                 queue_depth: Some(queue_depth),
@@ -555,7 +589,9 @@ mod tests {
     fn snapshot_serde_round_trip() {
         let mut snap = GridStateSnapshot::new("site-p".to_owned());
         snap.add_capability(Capability::Model("model-x".to_owned()));
-        snap.upsert_provider(provider("site-p", "provider", 1, 0.3));
+        let mut weighted = provider("site-p", "provider", 1, 0.3);
+        weighted.capacity_weight = 70;
+        snap.upsert_provider(weighted);
 
         let bytes =
             bincode::serde::encode_to_vec(&snap, bincode::config::standard()).unwrap_or_else(|_| std::process::abort());
@@ -564,9 +600,12 @@ mod tests {
                 .unwrap_or_else(|_| std::process::abort());
 
         assert_eq!(restored.capabilities.len(), 1, "capabilities must survive serde");
-        assert!(
-            restored.provider("net", "site-p", "provider").is_some(),
-            "provider must survive serde"
+        let restored = restored
+            .provider("net", "site-p", "provider")
+            .unwrap_or_else(|| std::process::abort());
+        assert_eq!(
+            restored.capacity_weight, 1,
+            "base snapshot must omit capacity for legacy bincode compatibility"
         );
     }
 
@@ -658,6 +697,10 @@ mod tests {
         assert!(
             provider.access_policy.match_labels.is_empty(),
             "missing access_policy field must default to empty (allow all)"
+        );
+        assert_eq!(
+            provider.capacity_weight, 1,
+            "missing capacity_weight must retain equal-capacity behavior"
         );
     }
 

@@ -143,6 +143,8 @@ pub(crate) enum SelectionMode {
     RoundRobin,
     /// Local random selection.
     Random,
+    /// Weighted random selection among eligible candidates.
+    WeightedRandom,
 }
 
 /// A single routing candidate.
@@ -194,6 +196,10 @@ pub(crate) struct RoutingCandidate {
     /// Producer-assigned active selection group.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) selection_group: Option<u32>,
+
+    /// Bounded request share weight for weighted random selection.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) traffic_weight: Option<u32>,
 }
 
 /// Credential reference projected alongside a routing candidate.

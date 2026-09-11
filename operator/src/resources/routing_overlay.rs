@@ -253,6 +253,11 @@ pub(crate) fn remote_crdt_provider_to_candidates(provider: &crdt::ProviderState)
     let Some(fresh) = crdt_phase_to_fresh(&provider.phase) else {
         return Vec::new();
     };
+    let capacity_weight = if crdt::is_valid_capacity_weight(provider.capacity_weight) {
+        provider.capacity_weight
+    } else {
+        1
+    };
     provider
         .models
         .iter()
@@ -270,6 +275,8 @@ pub(crate) fn remote_crdt_provider_to_candidates(provider: &crdt::ProviderState)
             score_breakdown: None,
             rank: None,
             selection_group: None,
+            traffic_weight: None,
+            capacity_weight,
         })
         .collect()
 }
@@ -884,6 +891,14 @@ pub struct RoutingCandidate {
     /// routing behavior until the data plane explicitly enables it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub selection_group: Option<u32>,
+
+    /// Optional configured traffic weight for weighted selection.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub traffic_weight: Option<u32>,
+
+    /// Relative provider capacity retained for static placement.
+    #[serde(skip)]
+    pub capacity_weight: u32,
 }
 
 /// The full routing overlay for a single [`GridNetwork`].
@@ -1345,6 +1360,23 @@ pub fn render_routing_overlay_with_admission(
     // Praxis compatibility behavior.
     let selection_policy = network.spec.selection_policy.clone();
 
+    if matches!(
+        selection_policy.as_ref().map(|p| p.mode),
+        Some(crate::crd::grid_network::SelectionMode::WeightedRandom)
+    ) {
+        if !matches!(
+            network.spec.placement_policy.as_ref().map(|p| p.strategy),
+            Some(crate::crd::grid_network::PlacementStrategy::Static)
+        ) {
+            return Err("weightedRandom requires placementPolicy.strategy=static".to_owned());
+        }
+        for candidate in &mut candidates {
+            // Publish configured relative capacity directly. Ratios are
+            // preserved without a lossy or overflowing presentation scale.
+            candidate.traffic_weight = Some(candidate.capacity_weight);
+        }
+    }
+
     Ok(RoutingOverlay {
         network: network_name.to_owned(),
         local_site: local_site.to_owned(),
@@ -1516,6 +1548,12 @@ fn candidates_from_provider(
     // When spec.routingClusterRef is set, it overrides metadata.name so that
     // overlay candidates reference the correct upstream cluster and site.
     let cluster = routing_identity(provider).unwrap_or(provider_name);
+    let capacity_weight = provider.spec.capacity_weight.unwrap_or(1);
+    if !crdt::is_valid_capacity_weight(capacity_weight) {
+        return Err(format!(
+            "provider {provider_name} has invalid capacityWeight {capacity_weight}; expected 1..=1000"
+        ));
+    }
 
     let sites: Vec<&str> = match &site_resolution {
         // No site inventory at all → Phase 1 fallback.
@@ -1546,6 +1584,8 @@ fn candidates_from_provider(
                 score_breakdown: None,
                 rank: None,
                 selection_group: None,
+                traffic_weight: None,
+                capacity_weight,
             });
         }
     }
@@ -1761,6 +1801,20 @@ mod tests {
         .unwrap_or_else(|_| std::process::abort())
     }
 
+    fn test_weighted_network(name: &str) -> GridNetwork {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "kind": "GridNetwork",
+            "metadata": { "name": name },
+            "spec": {
+                "seeds": [],
+                "selectionPolicy": { "mode": "weightedRandom" },
+                "placementPolicy": { "strategy": "static" }
+            }
+        }))
+        .unwrap_or_else(|_| std::process::abort())
+    }
+
     #[expect(
         clippy::too_many_arguments,
         reason = "Test fixture mirrors all grouping dimensions explicitly."
@@ -1788,6 +1842,8 @@ mod tests {
             score_breakdown: None,
             rank: None,
             selection_group: None,
+            traffic_weight: None,
+            capacity_weight: 1,
         }
     }
 
@@ -1974,6 +2030,62 @@ mod tests {
             overlay.selection_policy.is_none(),
             "an upgraded GridNetwork that omits selectionPolicy must not be migrated implicitly"
         );
+    }
+
+    #[test]
+    fn static_weighted_overlay_preserves_direct_capacity_values() {
+        let network = test_weighted_network("net");
+        let mut providers = Vec::new();
+        for (name, weight) in [("provider-a", 1), ("provider-b", 100), ("provider-c", 1_000)] {
+            let mut provider = test_provider(name, "net", &["model"]);
+            provider.spec.capacity_weight = Some(weight);
+            providers.push(provider);
+        }
+        let overlay = render_routing_overlay(
+            &network,
+            &[],
+            &providers,
+            &[],
+            "site-a",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        let mut weights = overlay
+            .candidates
+            .iter()
+            .map(|candidate| (candidate.cluster.as_str(), candidate.traffic_weight))
+            .collect::<Vec<_>>();
+        weights.sort_unstable_by_key(|(cluster, _)| *cluster);
+        assert_eq!(
+            weights,
+            vec![
+                ("provider-a", Some(1)),
+                ("provider-b", Some(100)),
+                ("provider-c", Some(1_000))
+            ]
+        );
+    }
+
+    #[test]
+    fn invalid_local_capacity_fails_before_rendering() {
+        for invalid in [0, 1_001, u32::MAX] {
+            let network = test_weighted_network("net");
+            let mut provider = test_provider("provider", "net", &["model"]);
+            provider.spec.capacity_weight = Some(invalid);
+            let result = render_routing_overlay(
+                &network,
+                &[],
+                &[provider],
+                &[],
+                "site-a",
+                None,
+                None,
+                &scoring::ScoringWeights::default(),
+            );
+            assert!(result.is_err(), "invalid capacity {invalid} must fail closed");
+        }
     }
 
     fn test_provider_with_selector(
@@ -5147,6 +5259,7 @@ mod tests {
             routing_cluster: routing_cluster.to_owned(),
             models: models.iter().map(|m| (*m).to_owned()).collect(),
             backend_kind: "local".to_owned(),
+            capacity_weight: 1,
             phase,
             metrics: crdt::ProviderMetricsSnapshot::default(),
             access_policy: crdt::ProviderAccessPolicy::default(),
@@ -5785,6 +5898,7 @@ mod tests {
             routing_cluster: site_id.to_owned(),
             models: vec!["model".to_owned()],
             backend_kind: "remote".to_owned(),
+            capacity_weight: 1,
             phase: crdt::ProviderPhase::Available,
             metrics: crdt::ProviderMetricsSnapshot::default(),
             access_policy: crdt::ProviderAccessPolicy::default(),
@@ -6044,6 +6158,7 @@ mod tests {
             routing_cluster: provider_id.to_owned(),
             models: vec!["model-remote".to_owned()],
             backend_kind: "remote".to_owned(),
+            capacity_weight: 1,
             phase: crdt::ProviderPhase::Available,
             metrics: crdt::ProviderMetricsSnapshot::default(),
             access_policy,

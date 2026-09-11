@@ -7,6 +7,32 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["name"],
+      "allOf": [
+        {
+          "if": { "required": ["placementPolicy"] },
+          "then": {
+            "required": ["selectionPolicy"],
+            "properties": {
+              "selectionPolicy": {
+                "required": ["mode"],
+                "properties": { "mode": { "const": "weightedRandom" } }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": ["selectionPolicy"],
+            "properties": {
+              "selectionPolicy": {
+                "required": ["mode"],
+                "properties": { "mode": { "const": "weightedRandom" } }
+              }
+            }
+          },
+          "then": { "required": ["placementPolicy"] }
+        }
+      ],
       "properties": {
         "name": {
           "type": "string",
@@ -82,7 +108,18 @@
           "properties": {
             "mode": {
               "type": "string",
-              "enum": ["deterministic", "roundRobin", "random"]
+              "enum": ["deterministic", "roundRobin", "random", "weightedRandom"]
+            }
+          }
+        },
+        "placementPolicy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["strategy"],
+          "properties": {
+            "strategy": {
+              "type": "string",
+              "enum": ["static"]
             }
           }
         },
@@ -169,7 +206,8 @@
             "type": "object",
             "additionalProperties": false,
             "properties": { "drain": { "type": "boolean", "default": false } }
-          }
+          },
+          "capacityWeight": { "type": "integer", "minimum": 1, "maximum": 1000 }
         }
       }
     },

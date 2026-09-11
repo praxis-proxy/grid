@@ -101,6 +101,13 @@ spec:
                 backendKind:
                   description: Backend deployment category.
                   type: string
+                capacityWeight:
+                  description: Relative capacity used by an opt-in placement policy.
+                  format: uint32
+                  maximum: 1000.0
+                  minimum: 1.0
+                  nullable: true
+                  type: integer
                 cost:
                   description: Cost information.
                   nullable: true

@@ -1878,6 +1878,7 @@ mod tests {
             routing_cluster: "site-x".to_owned(),
             models: vec!["model-x".to_owned()],
             backend_kind: "local".to_owned(),
+            capacity_weight: 1,
             phase: crdt::ProviderPhase::Available,
             metrics: crdt::ProviderMetricsSnapshot::default(),
             access_policy: crdt::ProviderAccessPolicy::default(),
@@ -2058,6 +2059,7 @@ mod tests {
             routing_cluster: "site-a".to_owned(),
             models: vec!["model-x".to_owned()],
             backend_kind: "local".to_owned(),
+            capacity_weight: 1,
             phase: crdt::ProviderPhase::Available,
             metrics: crdt::ProviderMetricsSnapshot {
                 queue_depth: Some(queue_depth),
@@ -2169,6 +2171,7 @@ mod tests {
             routing_cluster: "site-a".to_owned(),
             models: vec!["model-x".to_owned()],
             backend_kind: "local".to_owned(),
+            capacity_weight: 1,
             phase: crdt::ProviderPhase::Available,
             metrics: crdt::ProviderMetricsSnapshot::default(),
             access_policy: crdt::ProviderAccessPolicy::default(),

@@ -229,13 +229,32 @@ struct BroadcastExtension {
     /// joined any `GridNetwork`.
     #[serde(default)]
     grid_id: Option<String>,
+    /// Provider capacities keyed by stable network/site/provider identity.
+    #[serde(default)]
+    provider_capacity_weights: BTreeMap<String, u32>,
+}
+
+/// Extension format used by peers that predate provider capacity weights.
+#[derive(Serialize, Deserialize)]
+struct PreCapacityBroadcastExtension {
+    /// Optional data-plane gateway address.
+    gateway_address: Option<String>,
+    /// Optional public site certificate PEM.
+    site_cert_pem: Option<String>,
+    /// Optional ECDSA P-256 signature.
+    signature: Option<Vec<u8>>,
+    /// Optional wall-clock signing timestamp.
+    signed_at_ms: Option<u64>,
+    /// Optional owning `GridNetwork` identifier.
+    grid_id: Option<String>,
 }
 
 /// Extension format used by peers that predate both the `signed_at_ms` and
 /// `grid_id` fields.
 ///
 /// bincode is not self-describing, so decoding a three-field payload as the
-/// current five-field [`BroadcastExtension`] fails partway through the
+/// current six-field [`BroadcastExtension`] and the preceding five-field
+/// [`PreCapacityBroadcastExtension`] fail partway through the
 /// fourth field rather than falling back to `#[serde(default)]` — `decode`
 /// tries this shape before falling further back through every prior wire
 /// format, so a rolling update does not silently drop or misdecode
@@ -253,13 +272,14 @@ struct PreTimestampBroadcastExtension {
 }
 
 /// Decoded extension fields:
-/// `(gateway_address, site_cert_pem, signature, signed_at_ms, grid_id)`.
+/// Decoded trailing broadcast extension fields.
 type DecodedExtension = (
     Option<String>,
     Option<String>,
     Option<Vec<u8>>,
     Option<u64>,
     Option<String>,
+    BTreeMap<String, u32>,
 );
 
 /// Extension format used by peers that predate the `signature` field.
@@ -446,6 +466,10 @@ impl StateBroadcast {
     /// # Errors
     ///
     /// Returns a bincode encode error if the snapshot cannot be serialized.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "base and trailing extension must be encoded as one atomic wire operation"
+    )]
     pub fn encode(&self) -> Result<Vec<u8>, bincode::error::EncodeError> {
         let v1 = StateBroadcastV1 {
             version: self.version,
@@ -454,11 +478,19 @@ impl StateBroadcast {
             snapshot: self.snapshot.clone(),
         };
         let mut bytes = bincode::serde::encode_to_vec(&v1, bincode::config::standard())?;
+        let provider_capacity_weights = self
+            .snapshot
+            .providers
+            .values()
+            .filter(|provider| provider.capacity_weight != 1)
+            .map(|provider| (provider_capacity_key(provider), provider.capacity_weight))
+            .collect::<BTreeMap<_, _>>();
         if self.gateway_address.is_some()
             || self.site_cert_pem.is_some()
             || self.signature.is_some()
             || self.signed_at_ms.is_some()
             || self.grid_id.is_some()
+            || !provider_capacity_weights.is_empty()
         {
             let ext = BroadcastExtension {
                 gateway_address: self.gateway_address.clone(),
@@ -466,6 +498,7 @@ impl StateBroadcast {
                 signature: self.signature.clone(),
                 signed_at_ms: self.signed_at_ms,
                 grid_id: self.grid_id.clone(),
+                provider_capacity_weights,
             };
             let ext_bytes = bincode::serde::encode_to_vec(&ext, bincode::config::standard())?;
             bytes.extend_from_slice(&ext_bytes);
@@ -477,7 +510,7 @@ impl StateBroadcast {
     ///
     /// Decodes the base v1 payload, then tries to decode any trailing bytes as
     /// a `BroadcastExtension` struct.  Because bincode is not self-describing,
-    /// a five-field extension decode does not simply come back `Ok` with
+    /// a newer extension decode does not simply come back `Ok` with
     /// `grid_id: None` when reading bytes from an older, three-field
     /// peer — it fails partway through the missing fields.  Falls back in
     /// turn to the three-field pre-timestamp extension format, then the
@@ -494,11 +527,23 @@ impl StateBroadcast {
     /// Returns a bincode decode error if `bytes` is not a valid
     /// [`StateBroadcast`] payload.
     pub fn decode(bytes: &[u8]) -> Result<Self, bincode::error::DecodeError> {
-        let (v1, consumed): (StateBroadcastV1, usize) =
+        let (mut v1, consumed): (StateBroadcastV1, usize) =
             bincode::serde::decode_from_slice(bytes, bincode::config::standard())?;
 
         let remaining = bytes.get(consumed..).unwrap_or(&[]);
-        let (gateway_address, site_cert_pem, signature, signed_at_ms, grid_id) = Self::decode_extension(remaining);
+        let (gateway_address, site_cert_pem, signature, signed_at_ms, grid_id, provider_capacity_weights) =
+            Self::decode_extension(remaining);
+        for provider in v1.snapshot.providers.values_mut() {
+            if let Some(weight) = provider_capacity_weights.get(&provider_capacity_key(provider))
+                && !apply_capacity_weight(provider, *weight)
+            {
+                tracing::warn!(
+                    provider = %provider_capacity_key(provider),
+                    capacity_weight = *weight,
+                    "ignoring out-of-range remote provider capacity weight"
+                );
+            }
+        }
 
         Ok(Self {
             version: v1.version,
@@ -516,9 +561,13 @@ impl StateBroadcast {
     /// Decode the trailing extension bytes, falling back across every prior
     /// wire format in turn. See [`decode`](Self::decode) for why a naive
     /// single-shot struct decode is not enough during a rolling update.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "ordered decoding of every historical extension shape is one compatibility chain"
+    )]
     fn decode_extension(remaining: &[u8]) -> DecodedExtension {
         if remaining.is_empty() {
-            return (None, None, None, None, None);
+            return (None, None, None, None, None, BTreeMap::new());
         }
         if let Ok((ext, _)) =
             bincode::serde::decode_from_slice::<BroadcastExtension, _>(remaining, bincode::config::standard())
@@ -529,26 +578,71 @@ impl StateBroadcast {
                 ext.signature,
                 ext.signed_at_ms,
                 ext.grid_id,
+                ext.provider_capacity_weights,
+            );
+        }
+        if let Ok((ext, _)) = bincode::serde::decode_from_slice::<PreCapacityBroadcastExtension, _>(
+            remaining,
+            bincode::config::standard(),
+        ) {
+            return (
+                ext.gateway_address,
+                ext.site_cert_pem,
+                ext.signature,
+                ext.signed_at_ms,
+                ext.grid_id,
+                BTreeMap::new(),
             );
         }
         if let Ok((ext, _)) = bincode::serde::decode_from_slice::<PreTimestampBroadcastExtension, _>(
             remaining,
             bincode::config::standard(),
         ) {
-            return (ext.gateway_address, ext.site_cert_pem, ext.signature, None, None);
+            return (
+                ext.gateway_address,
+                ext.site_cert_pem,
+                ext.signature,
+                None,
+                None,
+                BTreeMap::new(),
+            );
         }
         if let Ok((ext, _)) = bincode::serde::decode_from_slice::<PreSignatureBroadcastExtension, _>(
             remaining,
             bincode::config::standard(),
         ) {
-            return (ext.gateway_address, ext.site_cert_pem, None, None, None);
+            return (
+                ext.gateway_address,
+                ext.site_cert_pem,
+                None,
+                None,
+                None,
+                BTreeMap::new(),
+            );
         }
         // Compatibility fallback: bare String encoding for gateway_address only.
         match bincode::serde::decode_from_slice::<String, _>(remaining, bincode::config::standard()) {
-            Ok((gw, _)) => (Some(gw), None, None, None, None),
-            Err(_) => (None, None, None, None, None),
+            Ok((gw, _)) => (Some(gw), None, None, None, None, BTreeMap::new()),
+            Err(_) => (None, None, None, None, None, BTreeMap::new()),
         }
     }
+}
+
+/// Apply a remote capacity extension only when it satisfies the shared
+/// operator/CRDT contract. Invalid signed state must not overwrite a valid
+/// local value or silently become a different capacity.
+fn apply_capacity_weight(provider: &mut crdt::ProviderState, weight: u32) -> bool {
+    if crdt::is_valid_capacity_weight(weight) {
+        provider.capacity_weight = weight;
+        true
+    } else {
+        false
+    }
+}
+
+/// Build the stable extension key for one provider capacity.
+fn provider_capacity_key(provider: &crdt::ProviderState) -> String {
+    format!("{}/{}/{}", provider.network_id, provider.site_id, provider.provider_id)
 }
 
 /// Key used to replace stale queued broadcasts in foca.
@@ -1219,6 +1313,7 @@ mod tests {
             routing_cluster: site.to_owned(),
             models: vec!["model-x".to_owned()],
             backend_kind: "local".to_owned(),
+            capacity_weight: 1,
             phase: ProviderPhase::Available,
             metrics: ProviderMetricsSnapshot {
                 queue_depth: Some(queue_depth),
@@ -1292,6 +1387,55 @@ mod tests {
             bincode::serde::encode_to_vec(&ext, bincode::config::standard()).unwrap_or_else(|_| std::process::abort());
         bytes.extend_from_slice(&ext_bytes);
         bytes
+    }
+
+    /// Encode the extension shape used immediately before capacity weights.
+    fn encode_v1_plus_pre_capacity_extension(origin_site: &str, revision: u64) -> Vec<u8> {
+        let v1 = StateBroadcastV1 {
+            version: STATE_BROADCAST_VERSION,
+            origin_site: origin_site.to_owned(),
+            revision,
+            snapshot: snapshot(origin_site, revision, 0.4),
+        };
+        let mut bytes =
+            bincode::serde::encode_to_vec(&v1, bincode::config::standard()).unwrap_or_else(|_| std::process::abort());
+        let ext = PreCapacityBroadcastExtension {
+            gateway_address: Some("10.0.0.8:8443".to_owned()),
+            site_cert_pem: None,
+            signature: None,
+            signed_at_ms: Some(1_700_000_000_000),
+            grid_id: Some("net".to_owned()),
+        };
+        let ext_bytes =
+            bincode::serde::encode_to_vec(&ext, bincode::config::standard()).unwrap_or_else(|_| std::process::abort());
+        bytes.extend_from_slice(&ext_bytes);
+        bytes
+    }
+
+    /// Reproduce the bytes an immediately pre-capacity peer signs.
+    fn pre_capacity_signable_bytes(broadcast: &StateBroadcast) -> Vec<u8> {
+        let v1 = StateBroadcastV1 {
+            version: broadcast.version,
+            origin_site: broadcast.origin_site.clone(),
+            revision: broadcast.revision,
+            snapshot: broadcast.snapshot.clone(),
+        };
+        let mut encoded =
+            bincode::serde::encode_to_vec(&v1, bincode::config::standard()).unwrap_or_else(|_| std::process::abort());
+        let extension = PreCapacityBroadcastExtension {
+            gateway_address: broadcast.gateway_address.clone(),
+            site_cert_pem: broadcast.site_cert_pem.clone(),
+            signature: None,
+            signed_at_ms: broadcast.signed_at_ms,
+            grid_id: broadcast.grid_id.clone(),
+        };
+        encoded.extend(
+            bincode::serde::encode_to_vec(&extension, bincode::config::standard())
+                .unwrap_or_else(|_| std::process::abort()),
+        );
+        let mut signable = SIGNATURE_DOMAIN.to_vec();
+        signable.extend(encoded);
+        signable
     }
 
     /// Return the current wall-clock time in milliseconds since the Unix
@@ -1833,6 +1977,29 @@ mod tests {
     }
 
     #[test]
+    fn signed_pre_capacity_and_capacity_extensions_fail_closed_across_versions() {
+        let broadcast = StateBroadcast::new("site-p".to_owned(), 1, snapshot("site-p", 1, 0.1), None)
+            .with_grid_id(Some("net".to_owned()))
+            .with_signed_at(Some(now_ms()));
+        let legacy = pre_capacity_signable_bytes(&broadcast);
+        let current = broadcast.signable_bytes().unwrap_or_else(|_| std::process::abort());
+        assert_ne!(legacy, current, "wire extensions must have distinct signed bytes");
+
+        let (key, public_key) = generate_signing_key_and_pubkey();
+        let old_signature = crate::signing::sign_ecdsa_p256(&key, &legacy).unwrap_or_else(|_| std::process::abort());
+        let new_signature = crate::signing::sign_ecdsa_p256(&key, &current).unwrap_or_else(|_| std::process::abort());
+
+        assert!(
+            crate::signing::verify_ecdsa_p256(&public_key, &current, &old_signature).is_err(),
+            "new peers must reject signatures that do not cover the capacity extension"
+        );
+        assert!(
+            crate::signing::verify_ecdsa_p256(&public_key, &legacy, &new_signature).is_err(),
+            "old peers must reject signatures over an unknown extension"
+        );
+    }
+
+    #[test]
     fn receive_item_rejects_a_signature_computed_for_a_different_grid_id() {
         // A signature made over a broadcast claiming grid_id="grid-a" must
         // not verify once the broadcast is re-labeled grid_id="grid-b" --
@@ -1951,7 +2118,12 @@ mod tests {
 
     #[test]
     fn encode_decode_round_trip_preserves_snapshot() {
-        let broadcast = StateBroadcast::new("site-p".to_owned(), 7, snapshot("site-p", 7, 0.1), None);
+        let mut weighted = snapshot("site-p", 7, 0.1);
+        weighted
+            .providers
+            .values_mut()
+            .for_each(|provider| provider.capacity_weight = 70);
+        let broadcast = StateBroadcast::new("site-p".to_owned(), 7, weighted, None);
         let bytes = broadcast.encode().unwrap_or_else(|_| std::process::abort());
         let decoded = StateBroadcast::decode(&bytes).unwrap_or_else(|_| std::process::abort());
         let provider = decoded
@@ -1960,6 +2132,47 @@ mod tests {
             .unwrap_or_else(|| std::process::abort());
         assert_eq!(decoded.version, STATE_BROADCAST_VERSION_V1, "version without gateway");
         assert_eq!(provider.metrics.queue_depth, Some(0.1), "metric value");
+        assert_eq!(
+            provider.capacity_weight, 70,
+            "capacity extension must hydrate provider state"
+        );
+    }
+
+    #[test]
+    fn invalid_remote_capacity_cannot_overwrite_valid_provider_capacity() {
+        let mut provider = snapshot("site-p", 7, 0.1)
+            .provider("net", "site-p", "provider")
+            .cloned()
+            .unwrap_or_else(|| std::process::abort());
+        provider.capacity_weight = 70;
+
+        for invalid in [0, 1_001, u32::MAX] {
+            assert!(!apply_capacity_weight(&mut provider, invalid));
+            assert_eq!(provider.capacity_weight, 70);
+        }
+        assert!(apply_capacity_weight(&mut provider, 1));
+        assert_eq!(provider.capacity_weight, 1);
+        assert!(apply_capacity_weight(&mut provider, 1_000));
+        assert_eq!(provider.capacity_weight, 1_000);
+    }
+
+    #[test]
+    fn decode_pre_capacity_extension_preserves_old_fields_and_defaults_capacity() {
+        let bytes = encode_v1_plus_pre_capacity_extension("site-old-peer", 6);
+
+        let decoded = StateBroadcast::decode(&bytes).unwrap_or_else(|_| std::process::abort());
+        let provider = decoded
+            .snapshot
+            .provider("net", "site-old-peer", "provider")
+            .unwrap_or_else(|| std::process::abort());
+
+        assert_eq!(decoded.gateway_address.as_deref(), Some("10.0.0.8:8443"));
+        assert_eq!(decoded.signed_at_ms, Some(1_700_000_000_000));
+        assert_eq!(decoded.grid_id.as_deref(), Some("net"));
+        assert_eq!(
+            provider.capacity_weight, 1,
+            "older extension must default provider capacity"
+        );
     }
 
     #[test]

@@ -373,6 +373,7 @@ mod tests {
                 score_breakdown: None,
                 rank: Some(0),
                 selection_group: None,
+                traffic_weight: None,
             }],
             selection_policy: None,
             generated_at: Some("2026-07-29T00:00:00Z".to_owned()),
@@ -576,6 +577,22 @@ mod tests {
         let raw = serde_json::to_vec(&value).unwrap();
         let result = validate_envelope(&raw, &test_scope(), 1_048_576, None);
         assert!(matches!(result.unwrap_err().reason, RejectionReason::Malformed));
+    }
+
+    #[test]
+    fn weighted_selection_policy_and_traffic_weight_are_accepted() {
+        let env = valid_envelope();
+        let mut value = serde_json::to_value(env).unwrap();
+        value["overlay"]["selection_policy"] = serde_json::json!({"mode": "weightedRandom"});
+        value["overlay"]["candidates"][0]["selection_group"] = serde_json::json!(0);
+        value["overlay"]["candidates"][0]["traffic_weight"] = serde_json::json!(700);
+        let digest = compute_raw_semantic_digest(&value["overlay"]).unwrap();
+        value["revision"]["value"] = serde_json::Value::String(digest.clone());
+        value["content_digest"]["value"] = serde_json::Value::String(digest);
+
+        let raw = serde_json::to_vec(&value).unwrap();
+        validate_envelope(&raw, &test_scope(), 1_048_576, None)
+            .expect("weighted overlays must be accepted by the sidecar");
     }
 
     #[test]

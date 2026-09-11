@@ -71,6 +71,7 @@ clusters and Docker networks whose names can otherwise collide.
 | Area | Command | Topology/config path | Classification | Required when |
 |---|---|---|---|---|
 | Provider traffic selection and round-robin | `cargo xtask env run-grid-provider-traffic-qualification --forge-config tests/e2e/topologies/grid-provider-traffic/forge.yaml --full --teardown --evidence-dir "$EVIDENCE_DIR"` | `tests/e2e/topologies/grid-provider-traffic/forge.yaml` | Release qualification | Routing, provider candidates, overlay selection policy, provider attribution, or gateway compatibility changes |
+| Static weighted provider selection | `cargo xtask env run-grid-static-weighted-qualification --forge-config tests/e2e/topologies/grid-static-weighted/forge.yaml --quick --teardown --evidence-dir "$EVIDENCE_DIR"` | `tests/e2e/topologies/grid-static-weighted/forge.yaml` | Release qualification | `weightedRandom`, static placement, provider capacity, weighted overlay, or cross-site capacity propagation changes |
 | Distributed token quota | `cargo xtask env run-grid-token-rate-limit-qualification --forge-config tests/e2e/topologies/grid-token-rate-limit/forge.yaml --image-tag "$IMAGE_TAG" --evidence-dir "$EVIDENCE_DIR"` | `tests/e2e/topologies/grid-token-rate-limit/forge.yaml` | Experimental integration qualification | Quota, identity, Basic Auth, Valkey, gateway image, or shared-consumer changes |
 | Single-cluster multi-gateway | `cargo xtask env run-grid-single-cluster-multi-gateway-qualification --forge-config tests/e2e/topologies/grid-single-cluster-multi-gateway/forge.yaml --evidence-dir "$EVIDENCE_DIR"` | `tests/e2e/topologies/grid-single-cluster-multi-gateway/forge.yaml` | Integration qualification | Same-site gateway lifecycle, overlay delivery, provider selection, concurrency, or NetworkPolicy behavior changes |
 | Combined-site lifecycle | `cargo xtask env run-grid-combined-site-demo --forge-config tests/e2e/topologies/grid-combined-site/forge.yaml --full --teardown --evidence-dir "$EVIDENCE_DIR"` | `tests/e2e/topologies/grid-combined-site/forge.yaml` | Experimental lifecycle qualification | Combined-site routing, provider add/remove/re-add, session fallback, rollout, trust, or lifecycle changes |
@@ -86,6 +87,7 @@ official compatible AI image where applicable.
 
 ```console
 cargo xtask env run-grid-provider-traffic-qualification --forge-config tests/e2e/topologies/grid-provider-traffic/forge.yaml --full --teardown --evidence-dir "$EVIDENCE_DIR"
+cargo xtask env run-grid-static-weighted-qualification --forge-config tests/e2e/topologies/grid-static-weighted/forge.yaml --quick --teardown --evidence-dir "$EVIDENCE_DIR"
 cargo xtask env run-grid-token-rate-limit-qualification --forge-config tests/e2e/topologies/grid-token-rate-limit/forge.yaml --image-tag "$IMAGE_TAG" --evidence-dir "$EVIDENCE_DIR"
 cargo xtask env run-grid-single-cluster-multi-gateway-qualification --forge-config tests/e2e/topologies/grid-single-cluster-multi-gateway/forge.yaml --evidence-dir "$EVIDENCE_DIR"
 cargo xtask env run-grid-combined-site-demo --forge-config tests/e2e/topologies/grid-combined-site/forge.yaml --full --teardown --evidence-dir "$EVIDENCE_DIR"

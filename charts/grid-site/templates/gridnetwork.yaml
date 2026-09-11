@@ -43,6 +43,10 @@ spec:
   scoringPolicy:
     strategy: {{ .strategy | quote }}
   {{- end }}
+  {{- with $.Values.gridNetwork.placementPolicy }}
+  placementPolicy:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
   {{- end }}
   {{- with .Values.gridNetwork.admissionPolicy }}
   admissionPolicy:

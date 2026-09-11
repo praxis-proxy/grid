@@ -56,6 +56,11 @@ pub struct InferenceProviderSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gateway_ref: Option<String>,
 
+    /// Relative capacity used by an opt-in placement policy.
+    #[schemars(range(min = 1, max = 1000))]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity_weight: Option<u32>,
+
     /// Cost information.
     pub cost: Option<CostConfig>,
 

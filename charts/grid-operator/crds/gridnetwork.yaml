@@ -338,6 +338,18 @@ spec:
                   description: Region where this site is deployed.
                   nullable: true
                   type: string
+                placementPolicy:
+                  description: Static provider-capacity placement policy.
+                  nullable: true
+                  properties:
+                    strategy:
+                      description: Placement strategy.
+                      enum:
+                        - static
+                      type: string
+                  required:
+                    - strategy
+                  type: object
                 routingPolicy:
                   description: |-
                     Candidate ordering policy for the routing overlay.
@@ -395,6 +407,7 @@ spec:
                         - deterministic
                         - roundRobin
                         - random
+                        - weightedRandom
                       type: string
                   required:
                     - mode
@@ -544,6 +557,9 @@ spec:
                   nullable: true
                   type: string
               type: object
+              x-kubernetes-validations:
+                - message: placementPolicy must be set if and only if selectionPolicy.mode is weightedRandom
+                  rule: has(self.placementPolicy) == (has(self.selectionPolicy) && self.selectionPolicy.mode == 'weightedRandom')
             status:
               description: Observed status of a [`GridNetwork`].
               nullable: true

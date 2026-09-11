@@ -12,6 +12,9 @@
 - [Provider Selection and Load Balancing](architecture/provider-selection-and-load-balancing.md) —
   eligibility, routing groups, scoring, selection modes, affinity, and
   overlay lifecycle.
+- [Static Provider Weighting](architecture/static-weighting.md) — configured
+  relative capacity, policy precedence, cross-site propagation, and weighted
+  request selection.
 - [Scoring](architecture/scoring.md) — operator-side candidate scoring,
   metrics input, and request-time scoring boundaries.
 - [Auth and Policy](architecture/auth.md) — provider authentication strategies,
@@ -48,6 +51,9 @@
 - [Provider Traffic Qualification](../tests/e2e/topologies/grid-provider-traffic/README.md) -
   proves multi-cluster discovery, accepted-overlay delivery, request-time
   round-robin selection, provider attribution, and stable routing.
+- [Static Weighted Provider Qualification](../tests/e2e/topologies/grid-static-weighted/README.md) -
+  proves configured capacity propagation, weighted overlay convergence,
+  proportional request selection, hot reload, and equal-weight recovery.
 - [Distributed Token Quota Qualification](../tests/e2e/topologies/grid-token-rate-limit/README.md) -
   proves shared identity-scoped quota enforcement across gateway replicas,
   regional provider selection, expiry, restart persistence, fail-closed state

@@ -163,6 +163,15 @@ For detailed metric input and normalization, see [Provider Scoring](scoring.md).
 viable group. The selection mode is applied from an accepted in-memory
 snapshot by Praxis; Grid is not called for each request.
 
+- **`deterministic`** selects the first provider after Grid has ordered the
+  active group. Use it for strict preference or primary/fallback routing.
+- **`roundRobin`** takes equal turns across the active group. Use it for a
+  predictable, even sequence of selections.
+- **`random`** gives every provider in the active group an equal chance. Use it
+  when a repeating sequence is unnecessary.
+- **`weightedRandom`** gives providers different chances based on configured
+  relative capacity. Use it when providers should receive unequal shares.
+
 ### `deterministic`
 
 Selects the first viable candidate in the active group. This is strict
@@ -170,6 +179,15 @@ preference behavior: Grid's ordering determines which provider receives new
 unbound traffic. It is useful when locality, score, primary/standby order, or
 predictability should dominate. When `selectionPolicy` is absent from an
 overlay, Praxis uses `deterministic`.
+
+```yaml
+spec:
+  routingPolicy: geographyFirst
+  scoringPolicy:
+    strategy: noMetrics
+  selectionPolicy:
+    mode: deterministic
+```
 
 ### `roundRobin`
 
@@ -179,11 +197,66 @@ while the active group is viable. It balances selections, not necessarily
 tokens, latency, request cost, or concurrent work. Session affinity is checked
 before this mode runs.
 
+```yaml
+spec:
+  routingPolicy: geographyFirst
+  scoringPolicy:
+    strategy: noMetrics
+  selectionPolicy:
+    mode: roundRobin
+```
+
 ### `random`
 
 Selects uniformly from viable candidates in the active group. It follows the
 same admission, group, and affinity rules as round-robin. Random state is local
 to the gateway process and is not a global coordinator.
+
+```yaml
+spec:
+  routingPolicy: geographyFirst
+  scoringPolicy:
+    strategy: noMetrics
+  selectionPolicy:
+    mode: random
+```
+
+### `weightedRandom`
+
+Selects new, unbound requests proportionally using each candidate's explicit
+static `traffic_weight`. It is valid only with `placementPolicy.strategy:
+static`; the weights originate from `InferenceProvider.spec.capacityWeight`
+and are not inferred from scores or live metrics. Eligibility, affinity, and
+group precedence are unchanged: Praxis checks a permitted affinity binding
+first, finds the first viable group, and applies weights only within that
+group.
+
+```yaml
+spec:
+  routingPolicy: geographyFirst
+  scoringPolicy:
+    strategy: noMetrics
+  selectionPolicy:
+    mode: weightedRandom
+  placementPolicy:
+    strategy: static
+```
+
+Each provider supplies its relative capacity separately:
+
+```yaml
+apiVersion: grid.praxis-proxy.io/v1alpha1
+kind: InferenceProvider
+metadata:
+  name: provider-a
+spec:
+  capacityWeight: 50
+```
+
+With `geographyFirst`, a high-weight remote provider remains fallback while a
+closer group is viable. With `scoreFirst`, eligible providers across sites can
+share the active group and their relative weights participate together. See
+[Static provider weighting](static-weighting.md) for the complete contract.
 
 ## Policy matrix
 
@@ -192,9 +265,11 @@ to the gateway process and is not a global coordinator.
 | `geographyFirst` | `deterministic` | Strict preference for the highest-ranked provider in the closest viable tier |
 | `geographyFirst` | `roundRobin` | Equal selection in the closest viable tier; remote tiers are fallback |
 | `geographyFirst` | `random` | Uniform selection in the closest viable tier |
+| `geographyFirst` | `weightedRandom` | Weighted selection in the closest viable tier; remote tiers are fallback |
 | `scoreFirst` | `deterministic` | Strict preference for the highest-ranked fresh admitted provider across sites |
 | `scoreFirst` | `roundRobin` | Equal selection across fresh admitted providers in the active group |
 | `scoreFirst` | `random` | Uniform selection across fresh admitted providers in the active group |
+| `scoreFirst` | `weightedRandom` | Weighted selection across fresh admitted providers in the active group |
 
 The scoring strategy changes ordering, not the selection mode:
 
@@ -379,7 +454,7 @@ call to Grid. A request already sent upstream can fail before a newer snapshot
 is accepted; do not assume automatic retry unless the gateway configuration
 explicitly provides it.
 
-## Overlay contract and future weighting
+## Overlay contract and static weighting
 
 `selectionPolicy` is optional in both the Grid API and the overlay. An omitted
 field remains omitted, and Praxis interprets it as deterministic selection.
@@ -400,9 +475,10 @@ which provider is first when candidates differ in freshness. Deployments that
 require a fixed primary provider should set their routing and selection policy
 explicitly and validate the resulting overlay during upgrade.
 
-Weighted selection is a future extension, not part of the current API. A
-future mode such as `weightedRandom` would need an explicit overlay weight,
-normalization, capacity semantics, missing-metric behavior, bounds, and
-stability controls. It must not be inferred from score, rank, metric presence,
-or candidate count, and it must not change admission, locality,
-authorization, freshness, or group boundaries.
+Static weighted selection is explicit and opt-in. `weightedRandom` requires a
+static placement policy, and Grid publishes the configured provider capacity as
+a bounded relative `traffic_weight`. It is not inferred from score, rank,
+metric presence, or candidate count, and it does not change admission,
+locality, authorization, freshness, affinity, or group boundaries. Dynamic
+metric-based weighting remains a separate follow-up built on this selection
+foundation.

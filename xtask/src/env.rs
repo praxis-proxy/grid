@@ -21,6 +21,7 @@ pub(crate) mod provider_drain;
 pub(crate) mod provider_traffic_qualification;
 pub(crate) mod providers;
 pub(crate) mod single_cluster_multi_gateway_qualification;
+pub(crate) mod static_weighted_qualification;
 pub(crate) mod token_rate_limit_qualification;
 pub(crate) mod trust;
 pub(crate) mod verify;
@@ -1065,6 +1066,17 @@ pub(crate) enum Action {
         options: GlbDemoOptions,
     },
 
+    /// Qualify operator-configured static provider weighting independently of
+    /// the ordinary provider-traffic round-robin qualification.
+    RunGridStaticWeightedQualification {
+        /// Path to the static-weighted Forge topology.
+        #[arg(default_value = "tests/e2e/topologies/grid-static-weighted/forge.yaml")]
+        forge_config: PathBuf,
+        /// Run mode and teardown options.
+        #[command(flatten)]
+        options: GlbDemoOptions,
+    },
+
     /// Qualify multiple consumer and provider gateways in one Kind cluster.
     RunGridSingleClusterMultiGatewayQualification {
         /// Path to the single-cluster Forge topology.
@@ -1251,6 +1263,9 @@ pub(crate) fn run(action: &Action) -> Result<(), Box<dyn std::error::Error>> {
         } => llmd_pool_metrics_demo::run(forge_config, options, *metrics_mtls, *kv_cache),
         Action::RunGridProviderTrafficQualification { forge_config, options } => {
             provider_traffic_qualification::run(forge_config, options)
+        },
+        Action::RunGridStaticWeightedQualification { forge_config, options } => {
+            static_weighted_qualification::run(forge_config, options)
         },
         Action::RunGridSingleClusterMultiGatewayQualification {
             forge_config,

@@ -1589,6 +1589,18 @@ fn provider_state_from_kube(
     let models = provider.spec.models.iter().map(|m| m.name.clone()).collect();
     let phase = crdt_phase_from_provider(provider.status.as_ref().map(|s| &s.phase));
     let revision = provider_revision(provider);
+    let capacity_weight = provider
+        .spec
+        .capacity_weight
+        .filter(|weight| crdt::is_valid_capacity_weight(*weight))
+        .unwrap_or(crdt::MIN_CAPACITY_WEIGHT);
+
+    tracing::info!(
+        site_id,
+        provider_id,
+        capacity_weight,
+        "published local provider CRDT capacity"
+    );
 
     Some(crdt::ProviderState {
         network_id: network_id.to_owned(),
@@ -1597,6 +1609,7 @@ fn provider_state_from_kube(
         routing_cluster,
         models,
         backend_kind: provider.spec.backend_kind.clone(),
+        capacity_weight,
         phase,
         metrics: metrics_to_crdt(metrics),
         access_policy: access_policy_to_crdt(&provider.spec.access_policy),
@@ -2907,6 +2920,7 @@ mod tests {
             routing_cluster: site_id.to_owned(),
             models: vec!["model-x".to_owned()],
             backend_kind: "local".to_owned(),
+            capacity_weight: 1,
             phase: crdt::ProviderPhase::Available,
             metrics: crdt::ProviderMetricsSnapshot::default(),
             access_policy: crdt::ProviderAccessPolicy::default(),
@@ -2927,6 +2941,7 @@ mod tests {
             routing_cluster: site_id.to_owned(),
             models: vec!["model-x".to_owned()],
             backend_kind: "local".to_owned(),
+            capacity_weight: 1,
             phase,
             metrics: crdt::ProviderMetricsSnapshot::default(),
             access_policy: crdt::ProviderAccessPolicy::default(),
@@ -3277,6 +3292,7 @@ mod tests {
             routing_cluster: site_id.to_owned(),
             models: vec!["model-x".to_owned()],
             backend_kind: "remote".to_owned(),
+            capacity_weight: 1,
             phase,
             metrics: crdt::ProviderMetricsSnapshot::default(),
             access_policy: crdt::ProviderAccessPolicy::default(), // Empty policy = allow all
@@ -4849,6 +4865,7 @@ mod tests {
             routing_cluster: site_id.to_owned(),
             models: vec!["model-x".to_owned()],
             backend_kind: "local".to_owned(),
+            capacity_weight: 1,
             phase: crdt::ProviderPhase::Available,
             metrics: crdt::ProviderMetricsSnapshot::default(),
             access_policy: crdt::ProviderAccessPolicy::default(),
