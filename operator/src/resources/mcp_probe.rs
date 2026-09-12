@@ -639,11 +639,26 @@ async fn attach_tls_ca(
     Ok(builder.tls_certs_only([ca_cert]))
 }
 
+/// Build the probe client identity: rustls takes one concatenated PEM, native-tls (fips) takes cert and key separately.
+#[cfg(not(feature = "fips"))]
+fn build_probe_client_identity(cert_pem: &[u8], key_pem: &[u8]) -> Result<reqwest::Identity, reqwest::Error> {
+    let mut combined = Vec::with_capacity(cert_pem.len() + key_pem.len());
+    combined.extend_from_slice(cert_pem);
+    combined.extend_from_slice(key_pem);
+    reqwest::Identity::from_pem(&combined)
+}
+
+/// Build the probe client identity: rustls takes one concatenated PEM, native-tls (fips) takes cert and key separately.
+#[cfg(feature = "fips")]
+fn build_probe_client_identity(cert_pem: &[u8], key_pem: &[u8]) -> Result<reqwest::Identity, reqwest::Error> {
+    reqwest::Identity::from_pkcs8_pem(cert_pem, key_pem)
+}
+
 /// Read `client_ref`'s certificate and private key and attach them to
 /// `builder` as the mTLS client identity.
 #[expect(
     clippy::too_many_lines,
-    reason = "sequential cert+key reads, eager rustls PEM validation for each, then the reqwest Identity build"
+    reason = "sequential cert and key reads, then eager PEM validation of each"
 )]
 async fn attach_tls_client_identity(
     builder: reqwest::ClientBuilder,
@@ -652,7 +667,7 @@ async fn attach_tls_client_identity(
     provider_identity: &str,
 ) -> Result<reqwest::ClientBuilder, McpProbeOutcome> {
     let cert_ref = secret_ref_from_client_cert(client_ref);
-    let mut identity_pem = Box::pin(read_tls_material(
+    let identity_pem = Box::pin(read_tls_material(
         kube_client,
         &cert_ref,
         &client_ref.certificate_key,
@@ -680,11 +695,7 @@ async fn attach_tls_client_identity(
             ENDPOINT_TLS_IDENTITY_MISMATCH.to_owned(),
         ));
     }
-    identity_pem.extend_from_slice(&key_pem);
-    // As in `attach_tls_ca`: the strict `rustls::pki_types` validation above
-    // is the real gate; this call still has to happen to build the
-    // `Identity` reqwest will actually use.
-    let identity = reqwest::Identity::from_pem(&identity_pem).map_err(|e| {
+    let identity = build_probe_client_identity(&identity_pem, &key_pem).map_err(|e| {
         tracing::warn!(provider_identity, error = %e, "AgentToolProvider probe client identity unparseable");
         McpProbeOutcome::TlsConfigInvalid(ENDPOINT_TLS_IDENTITY_MISMATCH.to_owned())
     })?;
