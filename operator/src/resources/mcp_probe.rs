@@ -33,13 +33,13 @@ use rmcp::{
         streamable_http_client::{StreamableHttpClientTransportConfig, StreamableHttpError},
     },
 };
-use rustls::pki_types::pem::PemObject as _;
 
 use crate::{
     crd::inference_provider::EndpointTlsConfig,
     resources::{
         credentials::BearerToken,
         endpoint_tls::{read_secret_bytes_for_tls, secret_ref_from_client_cert},
+        tls_backend::{validate_pem_certificates, validate_pem_private_key},
     },
 };
 
@@ -565,38 +565,6 @@ async fn read_tls_material(
             tracing::warn!(provider_identity, error = %msg, material_desc, "AgentToolProvider probe TLS material invalid");
             McpProbeOutcome::TlsConfigInvalid(reason.as_status_reason("Endpoint"))
         })
-}
-
-/// Structurally validate that `pem` decodes to at least one well-formed
-/// certificate.
-///
-/// `reqwest::Certificate::from_pem` is too lenient to be a validation gate
-/// by itself: it accepts empty input and PEM blocks with undecodable base64
-/// content without returning `Err` (only genuine third-party wire behavior,
-/// like a TLS handshake against real malformed material, would eventually
-/// surface a problem — far too late for a reconcile-time `status.reason`).
-/// This reuses the same strict `rustls::pki_types` parsing
-/// [`metrics_scraper::build_tls_client_config`](crate::metrics_scraper::build_tls_client_config)
-/// already relies on for `InferenceProvider`, so both TLS paths reject
-/// malformed CA material identically rather than diverging silently.
-fn validate_pem_certificates(pem: &[u8]) -> Result<(), String> {
-    let certs = rustls::pki_types::CertificateDer::pem_slice_iter(pem)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| e.to_string())?;
-    if certs.is_empty() {
-        return Err("PEM contains no certificates".to_owned());
-    }
-    Ok(())
-}
-
-/// Structurally validate that `pem` decodes to a well-formed private key.
-///
-/// Same rationale as [`validate_pem_certificates`]: `reqwest::Identity::from_pem`
-/// alone is not a reliable validation gate for malformed key material.
-fn validate_pem_private_key(pem: &[u8]) -> Result<(), String> {
-    rustls::pki_types::PrivateKeyDer::from_pem_slice(pem)
-        .map(|_key| ())
-        .map_err(|e| e.to_string())
 }
 
 /// Read `tls.ca_secret_ref`'s CA certificate and add it to `builder` as a
