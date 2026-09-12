@@ -7,12 +7,15 @@
 //! All timeouts are bounded.  No private key material appears in return
 //! values, log fields, or error messages.
 
-use std::sync::Arc;
-
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, pem::PemObject as _};
 use tokio::time::Duration;
 
-use crate::resources::gateway_probe::{CanonicalFingerprint, GatewayProbeOutcome, fingerprint_matches_any};
+pub(crate) use crate::resources::tls_backend::{
+    build_tls_config, first_cert_der_from_pem, parse_ca_roots, parse_client_certs, parse_private_key,
+};
+use crate::resources::{
+    gateway_probe::{CanonicalFingerprint, GatewayProbeOutcome, fingerprint_matches_any},
+    tls_backend::{self, ClientTlsConfig, ServerName},
+};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -23,21 +26,6 @@ const PROBE_DEADLINE: Duration = Duration::from_secs(10);
 
 /// Maximum TCP connect timeout (subset of [`PROBE_DEADLINE`]).
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Maximum number of intermediate certificates accepted in the chain.
-const MAX_CHAIN_DEPTH: usize = 4;
-
-/// Maximum number of CA certificates accepted from one trust Secret.
-const MAX_CA_CERTIFICATES: usize = 16;
-
-/// Maximum size (bytes) of any single certificate in the chain.
-const MAX_CERT_BYTES: usize = 16_384;
-
-/// Maximum encoded size of one certificate bundle read from a Secret.
-const MAX_CERT_BUNDLE_BYTES: usize = 262_144;
-
-/// Maximum encoded size of one private key read from a Secret.
-const MAX_PRIVATE_KEY_BYTES: usize = 65_536;
 
 // ---------------------------------------------------------------------------
 // Probe configuration
@@ -52,14 +40,12 @@ pub(crate) struct ProbeConfig {
     /// TCP address to connect to (host:port).
     pub address: String,
 
-    /// rustls [`ClientConfig`] with Grid-only trust roots and optional
+    /// Client TLS config with Grid-only trust roots and optional
     /// client identity.
-    ///
-    /// [`ClientConfig`]: rustls::ClientConfig
-    pub tls_config: Arc<rustls::ClientConfig>,
+    pub tls_config: ClientTlsConfig,
 
     /// Expected DNS server name for SNI and SAN verification.
-    pub server_name: ServerName<'static>,
+    pub server_name: ServerName,
 
     /// Canonical DER fingerprint pins (1–2 entries).
     pub pins: Vec<CanonicalFingerprint>,
@@ -67,109 +53,6 @@ pub(crate) struct ProbeConfig {
     /// Optional SWIM-advertised leaf cert DER, compared with the configured
     /// rotation pins for diagnostics only.
     pub advertised_leaf_der: Option<Vec<u8>>,
-}
-
-// ---------------------------------------------------------------------------
-// TLS material parsing
-// ---------------------------------------------------------------------------
-
-/// Parse PEM-encoded CA certificates into a rustls root store.
-///
-/// # Errors
-///
-/// Returns a description if no valid certificate could be parsed.
-pub(crate) fn parse_ca_roots(ca_pem: &[u8]) -> Result<rustls::RootCertStore, &'static str> {
-    if ca_pem.len() > MAX_CERT_BUNDLE_BYTES {
-        return Err("CA certificate bundle exceeds maximum size");
-    }
-    let mut roots = rustls::RootCertStore::empty();
-    let mut count = 0_usize;
-    for cert in CertificateDer::pem_slice_iter(ca_pem) {
-        let cert = cert.map_err(|_err| "CA PEM contains invalid certificate data")?;
-        if cert.as_ref().len() > MAX_CERT_BYTES {
-            return Err("CA certificate exceeds maximum size");
-        }
-        roots
-            .add(cert)
-            .map_err(|_err| "CA certificate failed trust store insertion")?;
-        count += 1;
-        if count > MAX_CA_CERTIFICATES {
-            return Err("CA certificate bundle exceeds maximum certificate count");
-        }
-    }
-    if count == 0 {
-        return Err("CA PEM contains no certificates");
-    }
-    Ok(roots)
-}
-
-/// Parse PEM-encoded client certificate chain.
-///
-/// # Errors
-///
-/// Returns a description if parsing fails or the chain is oversized.
-pub(crate) fn parse_client_certs(cert_pem: &[u8]) -> Result<Vec<CertificateDer<'static>>, &'static str> {
-    if cert_pem.len() > MAX_CERT_BUNDLE_BYTES {
-        return Err("client certificate bundle exceeds maximum size");
-    }
-    let mut certs = Vec::new();
-    for cert in CertificateDer::pem_slice_iter(cert_pem) {
-        let cert = cert.map_err(|_err| "client certificate PEM is malformed")?;
-        if cert.as_ref().len() > MAX_CERT_BYTES {
-            return Err("client certificate exceeds maximum size");
-        }
-        certs.push(cert);
-        if certs.len() > MAX_CHAIN_DEPTH {
-            return Err("client certificate chain exceeds maximum depth");
-        }
-    }
-    if certs.is_empty() {
-        return Err("client certificate PEM contains no certificates");
-    }
-    Ok(certs)
-}
-
-/// Parse a PEM-encoded private key (PKCS#8 or PKCS#1 or SEC1).
-///
-/// # Errors
-///
-/// Returns a description if parsing fails.
-pub(crate) fn parse_private_key(key_pem: &[u8]) -> Result<PrivateKeyDer<'static>, &'static str> {
-    if key_pem.len() > MAX_PRIVATE_KEY_BYTES {
-        return Err("private key PEM exceeds maximum size");
-    }
-    PrivateKeyDer::from_pem_slice(key_pem).map_err(|_err| "private key PEM is malformed or missing")
-}
-
-/// Build a rustls [`ClientConfig`] from parsed trust material.
-///
-/// Uses only the provided Grid CA roots — no system/native roots.
-/// When `client_certs` and `client_key` are provided, configures
-/// mTLS client authentication.
-///
-/// # Errors
-///
-/// Returns a description if the configuration fails.
-///
-/// [`ClientConfig`]: rustls::ClientConfig
-pub(crate) fn build_tls_config(
-    roots: rustls::RootCertStore,
-    client_certs: Option<Vec<CertificateDer<'static>>>,
-    client_key: Option<PrivateKeyDer<'static>>,
-) -> Result<Arc<rustls::ClientConfig>, &'static str> {
-    let provider = rustls::crypto::ring::default_provider();
-    let builder = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
-        .with_safe_default_protocol_versions()
-        .map_err(|_err| "failed to configure TLS protocol versions")?
-        .with_root_certificates(roots);
-    let config = match (client_certs, client_key) {
-        (Some(certs), Some(key)) => builder
-            .with_client_auth_cert(certs, key)
-            .map_err(|_err| "client certificate and key are incompatible")?,
-        (None, None) => builder.with_no_client_auth(),
-        _ => return Err("client certificate and key must both be present or both absent"),
-    };
-    Ok(Arc::new(config))
 }
 
 // ---------------------------------------------------------------------------
@@ -202,12 +85,15 @@ pub(crate) async fn probe_gateway(config: &ProbeConfig) -> GatewayProbeOutcome {
         Err(_elapsed) => return GatewayProbeOutcome::ConnectTimeout,
     };
 
-    let connector = tokio_rustls::TlsConnector::from(Arc::clone(&config.tls_config));
-    let tls_result = tokio::time::timeout_at(deadline, connector.connect(config.server_name.clone(), tcp_stream)).await;
+    let tls_result = tokio::time::timeout_at(
+        deadline,
+        tls_backend::connect(tcp_stream, &config.tls_config, &config.server_name),
+    )
+    .await;
 
     let tls_stream = match tls_result {
         Ok(Ok(stream)) => stream,
-        Ok(Err(err)) => return classify_tls_error(&err),
+        Ok(Err(err)) => return tls_backend::classify_tls_error(&err),
         Err(_elapsed) => return GatewayProbeOutcome::HandshakeTimeout,
     };
 
@@ -215,20 +101,16 @@ pub(crate) async fn probe_gateway(config: &ProbeConfig) -> GatewayProbeOutcome {
 }
 
 /// Verify the peer certificate after a successful TLS handshake.
-fn verify_peer_certificate(
-    tls_stream: &tokio_rustls::client::TlsStream<tokio::net::TcpStream>,
-    config: &ProbeConfig,
-) -> GatewayProbeOutcome {
-    let (_, server_conn) = tls_stream.get_ref();
-    let Some(peer_certs) = server_conn.peer_certificates() else {
+fn verify_peer_certificate(tls_stream: &tls_backend::ClientTlsStream, config: &ProbeConfig) -> GatewayProbeOutcome {
+    let Some(peer_certs) = tls_backend::peer_chain_der(tls_stream) else {
         return GatewayProbeOutcome::TlsProtocolError;
     };
 
-    if peer_certs.len() > MAX_CHAIN_DEPTH {
+    if peer_certs.len() > tls_backend::MAX_CHAIN_DEPTH {
         return GatewayProbeOutcome::TrustMaterialInvalid;
     }
-    for cert in peer_certs {
-        if cert.as_ref().len() > MAX_CERT_BYTES {
+    for cert in &peer_certs {
+        if cert.len() > tls_backend::MAX_CERT_BYTES {
             return GatewayProbeOutcome::TrustMaterialInvalid;
         }
     }
@@ -237,7 +119,7 @@ fn verify_peer_certificate(
         return GatewayProbeOutcome::TlsProtocolError;
     };
 
-    let leaf_fp = CanonicalFingerprint::from_der(leaf_der.as_ref());
+    let leaf_fp = CanonicalFingerprint::from_der(leaf_der);
     if !fingerprint_matches_any(&leaf_fp, &config.pins) {
         return GatewayProbeOutcome::PinMismatch;
     }
@@ -250,77 +132,6 @@ fn verify_peer_certificate(
     }
 
     GatewayProbeOutcome::Verified
-}
-
-// ---------------------------------------------------------------------------
-// Error classification
-// ---------------------------------------------------------------------------
-
-/// Classify a rustls/TLS error into a `GatewayProbeOutcome`.
-///
-/// Never exposes the raw error string in the outcome — the controller
-/// maps the outcome to bounded status reason codes.
-fn classify_tls_error(err: &std::io::Error) -> GatewayProbeOutcome {
-    if let Some(rustls_err) = err.get_ref().and_then(|inner| inner.downcast_ref::<rustls::Error>()) {
-        return classify_rustls_error(rustls_err);
-    }
-    if err.kind() == std::io::ErrorKind::ConnectionRefused {
-        return GatewayProbeOutcome::ConnectionFailed;
-    }
-    if err.kind() == std::io::ErrorKind::TimedOut {
-        return GatewayProbeOutcome::ConnectTimeout;
-    }
-    GatewayProbeOutcome::TlsProtocolError
-}
-
-/// Map a rustls error to a `GatewayProbeOutcome`.
-#[expect(clippy::wildcard_enum_match_arm, reason = "external type with many variants")]
-fn classify_rustls_error(err: &rustls::Error) -> GatewayProbeOutcome {
-    use rustls::{CertificateError, Error};
-
-    match err {
-        Error::InvalidCertificate(cert_err) => match cert_err {
-            CertificateError::UnknownIssuer => GatewayProbeOutcome::UntrustedIssuer,
-            CertificateError::NotValidForName | CertificateError::NotValidForNameContext { .. } => {
-                GatewayProbeOutcome::IdentityMismatch
-            },
-            CertificateError::Expired | CertificateError::ExpiredContext { .. } => {
-                GatewayProbeOutcome::CertificateExpired
-            },
-            CertificateError::NotValidYet | CertificateError::NotValidYetContext { .. } => {
-                GatewayProbeOutcome::CertificateNotYetValid
-            },
-            _ => GatewayProbeOutcome::TrustMaterialInvalid,
-        },
-        _ => GatewayProbeOutcome::TlsProtocolError,
-    }
-}
-
-// ---------------------------------------------------------------------------
-// PEM DER extraction (for advertised cert comparison)
-// ---------------------------------------------------------------------------
-
-/// Extract the first DER certificate from a PEM string.
-///
-/// Used to parse `status.publicCertPem` for comparison against the
-/// live peer certificate.
-///
-/// # Errors
-///
-/// Returns a bounded description if the PEM is oversized, malformed, or
-/// contains no certificate.
-pub(crate) fn first_cert_der_from_pem(pem: &str) -> Result<Vec<u8>, &'static str> {
-    if pem.len() > MAX_CERT_BUNDLE_BYTES {
-        return Err("advertised certificate PEM exceeds maximum size");
-    }
-    let cert = CertificateDer::pem_slice_iter(pem.as_bytes())
-        .next()
-        .ok_or("advertised certificate PEM contains no certificate")?
-        .map_err(|_err| "advertised certificate PEM is malformed")?;
-    if cert.as_ref().len() > MAX_CERT_BYTES {
-        return Err("advertised certificate exceeds maximum size");
-    }
-    Ok(cert.as_ref().to_vec())
 }
 
 // ---------------------------------------------------------------------------
@@ -337,7 +148,18 @@ pub(crate) fn first_cert_der_from_pem(pem: &str) -> Result<Vec<u8>, &'static str
     reason = "tests"
 )]
 mod tests {
+    #[cfg(not(feature = "fips"))]
+    use std::sync::Arc;
+
+    #[cfg(not(feature = "fips"))]
+    use rustls::pki_types::{CertificateDer, pem::PemObject as _};
+
     use super::*;
+    #[cfg(not(feature = "fips"))]
+    use crate::resources::tls_backend::classify_rustls_error;
+    use crate::resources::tls_backend::{
+        MAX_CA_CERTIFICATES, MAX_CERT_BUNDLE_BYTES, MAX_PRIVATE_KEY_BYTES, classify_tls_error,
+    };
 
     fn test_ca() -> certs::CaCert {
         certs::generate_ca("test-grid").unwrap()
@@ -525,12 +347,14 @@ mod tests {
         assert_eq!(classify_tls_error(&err), GatewayProbeOutcome::TlsProtocolError);
     }
 
+    #[cfg(not(feature = "fips"))]
     #[test]
     fn classify_rustls_unknown_issuer() {
         let rustls_err = rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer);
         assert_eq!(classify_rustls_error(&rustls_err), GatewayProbeOutcome::UntrustedIssuer);
     }
 
+    #[cfg(not(feature = "fips"))]
     #[test]
     fn classify_rustls_not_valid_for_name() {
         let rustls_err = rustls::Error::InvalidCertificate(rustls::CertificateError::NotValidForName);
@@ -540,6 +364,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(feature = "fips"))]
     #[test]
     fn classify_rustls_context_certificate_errors() {
         use rustls::{CertificateError, pki_types::UnixTime};
@@ -569,6 +394,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(feature = "fips"))]
     #[test]
     fn classify_rustls_expired() {
         let rustls_err = rustls::Error::InvalidCertificate(rustls::CertificateError::Expired);
@@ -578,6 +404,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(feature = "fips"))]
     #[test]
     fn classify_rustls_not_yet_valid() {
         let rustls_err = rustls::Error::InvalidCertificate(rustls::CertificateError::NotValidYet);
@@ -615,7 +442,7 @@ mod tests {
     // Focused TLS handshake tests — real listeners, real certificates
     // -----------------------------------------------------------------------
 
-    fn client_tls_config(ca: &certs::CaCert, client: &certs::SiteCertOutput) -> Arc<rustls::ClientConfig> {
+    fn client_tls_config(ca: &certs::CaCert, client: &certs::SiteCertOutput) -> ClientTlsConfig {
         let roots = parse_ca_roots(ca.cert_pem.as_bytes()).unwrap();
         let client_certs = parse_client_certs(client.cert_pem.as_bytes()).unwrap();
         let client_key = parse_private_key(client.key_pem.as_bytes()).unwrap();
@@ -638,6 +465,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(feature = "fips"))]
     fn server_tls_config(server_cert: &certs::SiteCertOutput, ca: &certs::CaCert) -> Arc<rustls::ServerConfig> {
         let certs = parse_client_certs(server_cert.cert_pem.as_bytes()).unwrap();
         let key = parse_private_key(server_cert.key_pem.as_bytes()).unwrap();
@@ -659,6 +487,7 @@ mod tests {
         Arc::new(config)
     }
 
+    #[cfg(not(feature = "fips"))]
     fn start_tls_server(server_cert: &certs::SiteCertOutput, ca: &certs::CaCert) -> std::net::SocketAddr {
         let server_config = server_tls_config(server_cert, ca);
         let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -674,6 +503,53 @@ mod tests {
                 let acc = acceptor.clone();
                 tokio::spawn(async move {
                     drop(acc.accept(stream).await);
+                });
+            }
+        });
+        addr
+    }
+
+    /// OpenSSL twin of the rustls test server: presents the grid server cert
+    /// and verifies the client cert against the grid CA (mTLS), so the probe
+    /// handshake tests exercise the real OpenSSL path under `fips`.
+    #[cfg(feature = "fips")]
+    fn start_tls_server(server_cert: &certs::SiteCertOutput, ca: &certs::CaCert) -> std::net::SocketAddr {
+        use openssl::{
+            pkey::PKey,
+            ssl::{Ssl, SslAcceptor, SslMethod, SslVerifyMode},
+            x509::{X509, store::X509StoreBuilder},
+        };
+
+        let cert = X509::from_pem(server_cert.cert_pem.as_bytes()).unwrap();
+        let key = PKey::private_key_from_pem(server_cert.key_pem.as_bytes()).unwrap();
+        let mut builder = SslAcceptor::mozilla_intermediate(SslMethod::tls()).unwrap();
+        builder.set_certificate(&cert).unwrap();
+        builder.set_private_key(&key).unwrap();
+        builder.check_private_key().unwrap();
+        let mut store = X509StoreBuilder::new().unwrap();
+        for client_ca in X509::stack_from_pem(ca.cert_pem.as_bytes()).unwrap() {
+            store.add_cert(client_ca).unwrap();
+        }
+        builder.set_verify_cert_store(store.build()).unwrap();
+        builder.set_verify(SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT);
+        let acceptor = builder.build();
+
+        let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = std_listener.local_addr().unwrap();
+        std_listener.set_nonblocking(true).unwrap();
+        tokio::spawn(async move {
+            let listener = tokio::net::TcpListener::from_std(std_listener).unwrap();
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let ctx = acceptor.context().to_owned();
+                tokio::spawn(async move {
+                    let Ok(ssl) = Ssl::new(&ctx) else { return };
+                    let Ok(mut tls) = tokio_openssl::SslStream::new(ssl, stream) else {
+                        return;
+                    };
+                    drop(std::pin::Pin::new(&mut tls).accept().await);
                 });
             }
         });

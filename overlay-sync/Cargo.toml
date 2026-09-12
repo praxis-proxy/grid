@@ -10,6 +10,11 @@ license.workspace = true
 name = "grid-overlay-sync"
 path = "src/main.rs"
 
+[features]
+default = ["tls-rustls"]
+tls-rustls = ["kube/rustls-tls", "kube/ring"]
+fips = ["kube/openssl-tls"]
+
 [dependencies]
 axum = { workspace = true }
 clap = { workspace = true, features = ["env"] }

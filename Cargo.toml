@@ -30,22 +30,20 @@ futures = "0.3.34"
 http = "1.5.0"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http1"] }
+hyper-openssl = { version = "0.10", default-features = false, features = ["client-legacy", "tokio"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "native-tokio", "ring"] }
 hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "tokio"] }
 k8s-openapi = { version = "0.28.0", features = ["v1_32"] }
-kube = { version = "4.2.0", features = ["client", "derive", "runtime", "rustls-tls"] }
+kube = { version = "4.2.0", default-features = false, features = ["client", "derive", "runtime"] }
+openssl = "0.10"
+openssl-sys = "0.9"
 prometheus = "0.14"
 rcgen = "0.14.9"
-# rustls-no-provider (not "rustls"): the plain "rustls" feature pulls in
-# aws-lc-rs as reqwest's crypto provider, which conflicts at runtime with the
-# ring provider main.rs installs process-wide for kube/hyper-rustls — see
-# rustls::crypto::CryptoProvider::install_default() in main.rs.
-reqwest = { version = "0.13.4", default-features = false, features = ["rustls-no-provider", "json", "stream"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "stream"] }
 ring = "0.17"
 rmcp = { version = "3.1.4", default-features = false, features = [
     "client",
     "transport-streamable-http-client-reqwest",
-    "reqwest-tls-no-provider",
 ] }
 rustls = { version = "0.23", default-features = false, features = ["logging", "std", "tls12"] }
 schemars = "1.2.2"
@@ -57,6 +55,7 @@ serde_yaml = "0.9"
 thiserror = "2.0.20"
 time = { version = "0.3", features = ["formatting"] }
 tokio = { version = "1.53.1", features = ["macros", "rt", "rt-multi-thread", "signal", "net", "time", "io-util"] }
+tokio-openssl = "0.6"
 tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12", "ring"] }
 toml = "1.1.4"
 tower = "0.5.3"
