@@ -12,6 +12,11 @@
     reason = "operator uses short closure params, index arithmetic, and casts pervasively"
 )]
 
+#[cfg(all(feature = "tls-rustls", feature = "fips"))]
+compile_error!(
+    "features `tls-rustls` and `fips` are mutually exclusive; build a FIPS binary with --no-default-features --features fips"
+);
+
 /// Command-line interface.
 pub mod cli;
 
