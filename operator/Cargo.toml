@@ -9,8 +9,24 @@ publish = false
 
 [features]
 default = ["tls-rustls"]
-tls-rustls = ["reqwest/rustls-no-provider", "rmcp/reqwest-tls-no-provider", "kube/rustls-tls", "kube/ring"]
-fips = ["reqwest/native-tls", "rmcp/reqwest-native-tls", "kube/openssl-tls"]
+tls-rustls = [
+    "reqwest/rustls-no-provider",
+    "rmcp/reqwest-tls-no-provider",
+    "kube/rustls-tls",
+    "kube/ring",
+    "dep:rustls",
+    "dep:hyper-rustls",
+    "dep:tokio-rustls",
+]
+fips = [
+    "reqwest/native-tls",
+    "rmcp/reqwest-native-tls",
+    "kube/openssl-tls",
+    "dep:openssl",
+    "dep:openssl-sys",
+    "dep:tokio-openssl",
+    "dep:hyper-openssl",
+]
 
 [dependencies]
 axum = { workspace = true }
@@ -22,7 +38,8 @@ swim = { path = "../swim" }
 futures = { workspace = true }
 http = { workspace = true }
 http-body-util = { workspace = true }
-hyper-rustls = { workspace = true }
+hyper-rustls = { workspace = true, optional = true }
+hyper-openssl = { workspace = true, optional = true }
 hyper-util = { workspace = true }
 scoring = { path = "../scoring" }
 k8s-openapi = { workspace = true }
@@ -31,7 +48,9 @@ prometheus = { workspace = true }
 schemars = { workspace = true }
 reqwest = { workspace = true }
 rmcp = { workspace = true }
-rustls = { workspace = true }
+rustls = { workspace = true, optional = true }
+openssl = { workspace = true, optional = true }
+openssl-sys = { workspace = true, optional = true }
 sha2 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -39,7 +58,8 @@ serde_json_canonicalizer = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true }
 tokio = { workspace = true }
-tokio-rustls = { workspace = true }
+tokio-rustls = { workspace = true, optional = true }
+tokio-openssl = { workspace = true, optional = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }

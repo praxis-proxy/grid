@@ -47,7 +47,7 @@ const MAX_RESPONSE_BODY_BYTES: usize = 1024 * 1024;
 // Error type
 // ---------------------------------------------------------------------------
 
-/// Error returned by [`scrape_metrics`].
+/// Error returned by `scrape_metrics`.
 #[derive(Debug, thiserror::Error)]
 pub enum MetricsScrapeError {
     /// The URL could not be parsed.
@@ -108,7 +108,7 @@ pub enum MetricsScrapeError {
     clippy::too_many_lines,
     reason = "URL parse + scheme check + client build + request + body read: sequential steps"
 )]
-pub async fn scrape_metrics(
+pub(crate) async fn scrape_metrics(
     url: &str,
     timeout: Duration,
     tls_config: Option<ClientTlsConfig>,
@@ -129,7 +129,7 @@ pub async fn scrape_metrics(
     }
 
     let connector = if let Some(config) = &tls_config {
-        build_custom_tls_connector(config)
+        build_custom_tls_connector(config)?
     } else {
         build_native_connector()?
     };
@@ -181,6 +181,7 @@ pub async fn scrape_metrics(
 mod tests {
     use std::sync::Arc;
 
+    #[cfg(not(feature = "fips"))]
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject as _};
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
@@ -433,6 +434,7 @@ mod tests {
     ///
     /// `client_ca_pem`: when `Some`, the server requires client certificate
     /// authentication (mTLS).  When `None`, one-way TLS only.
+    #[cfg(not(feature = "fips"))]
     #[expect(
         clippy::too_many_lines,
         reason = "TLS server setup: certs + verifier + acceptor + one-shot handler"
@@ -479,6 +481,61 @@ mod tests {
                 && let Ok(tls_stream) = acceptor.accept(stream).await
             {
                 let (mut reader, mut writer) = tokio::io::split(tls_stream);
+                let mut buf = [0_u8; 4096];
+                drop(reader.read(&mut buf).await);
+                drop(writer.write_all(&response).await);
+            }
+        });
+
+        format!("https://localhost:{port}")
+    }
+
+    /// OpenSSL twin of the rustls one-shot TLS server, so the scrape and mTLS
+    /// integration tests exercise the real `hyper-openssl` connector path
+    /// under `fips`.
+    #[cfg(feature = "fips")]
+    async fn start_tls_test_server(
+        server_cert_pem: &str,
+        server_key_pem: &str,
+        client_ca_pem: Option<&str>,
+        response: Vec<u8>,
+    ) -> String {
+        use openssl::{
+            pkey::PKey,
+            ssl::{Ssl, SslAcceptor, SslMethod, SslVerifyMode},
+            x509::{X509, store::X509StoreBuilder},
+        };
+
+        let cert = X509::from_pem(server_cert_pem.as_bytes()).unwrap();
+        let key = PKey::private_key_from_pem(server_key_pem.as_bytes()).unwrap();
+        let mut builder = SslAcceptor::mozilla_intermediate(SslMethod::tls()).unwrap();
+        builder.set_certificate(&cert).unwrap();
+        builder.set_private_key(&key).unwrap();
+        builder.check_private_key().unwrap();
+        if let Some(ca) = client_ca_pem {
+            let mut store = X509StoreBuilder::new().unwrap();
+            for client_ca in X509::stack_from_pem(ca.as_bytes()).unwrap() {
+                store.add_cert(client_ca).unwrap();
+            }
+            builder.set_verify_cert_store(store.build()).unwrap();
+            builder.set_verify(SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT);
+        }
+        let acceptor = builder.build();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(ssl) = Ssl::new(acceptor.context()) else {
+                return;
+            };
+            let Ok(mut tls) = tokio_openssl::SslStream::new(ssl, stream) else {
+                return;
+            };
+            if std::pin::Pin::new(&mut tls).accept().await.is_ok() {
+                let (mut reader, mut writer) = tokio::io::split(tls);
                 let mut buf = [0_u8; 4096];
                 drop(reader.read(&mut buf).await);
                 drop(writer.write_all(&response).await);
@@ -730,7 +787,7 @@ mod tests {
         let ca = certs::generate_ca("test-ca").unwrap();
         let client = certs::generate_dns_cert(&ca, "client", "localhost").unwrap();
 
-        let cases: Vec<(&str, Result<rustls::ClientConfig, MetricsScrapeError>)> = vec![
+        let cases = vec![
             ("empty CA", build_tls_client_config(b"", None, None)),
             ("garbage CA", build_tls_client_config(b"not valid", None, None)),
             ("mismatched cert/key", {

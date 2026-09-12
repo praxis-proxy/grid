@@ -433,7 +433,10 @@ pub(crate) async fn probe_endpoint(
 
     let connector = if let Some(config) = &tls_config {
         // Custom TLS config: use the provided CA / client identity.
-        crate::metrics_scraper::build_custom_tls_connector(config)
+        match crate::metrics_scraper::build_custom_tls_connector(config) {
+            Ok(connector) => connector,
+            Err(_err) => return ProbeOutcome::Unavailable,
+        }
     } else {
         // No custom TLS: use native root certificates.
         match crate::metrics_scraper::build_native_connector() {
@@ -2291,6 +2294,7 @@ mod tests {
     ///
     /// Mirrors `metrics_scraper::tests::start_tls_test_server` but lives
     /// in this module so it can be used by `probe_endpoint` TLS tests.
+    #[cfg(not(feature = "fips"))]
     async fn start_tls_test_server(server_cert_pem: &str, server_key_pem: &str, response: Vec<u8>) -> String {
         use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject as _};
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -2314,6 +2318,47 @@ mod tests {
                 && let Ok(tls_stream) = acceptor.accept(stream).await
             {
                 let (mut reader, mut writer) = tokio::io::split(tls_stream);
+                let mut buf = [0_u8; 4096];
+                drop(reader.read(&mut buf).await);
+                drop(writer.write_all(&response).await);
+            }
+        });
+
+        format!("https://localhost:{port}")
+    }
+
+    /// OpenSSL twin of the one-shot TLS server for `fips` probe tests.
+    #[cfg(feature = "fips")]
+    async fn start_tls_test_server(server_cert_pem: &str, server_key_pem: &str, response: Vec<u8>) -> String {
+        use openssl::{
+            pkey::PKey,
+            ssl::{Ssl, SslAcceptor, SslMethod},
+            x509::X509,
+        };
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let cert = X509::from_pem(server_cert_pem.as_bytes()).unwrap();
+        let key = PKey::private_key_from_pem(server_key_pem.as_bytes()).unwrap();
+        let mut builder = SslAcceptor::mozilla_intermediate(SslMethod::tls()).unwrap();
+        builder.set_certificate(&cert).unwrap();
+        builder.set_private_key(&key).unwrap();
+        builder.check_private_key().unwrap();
+        let acceptor = builder.build();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(ssl) = Ssl::new(acceptor.context()) else {
+                return;
+            };
+            let Ok(mut tls) = tokio_openssl::SslStream::new(ssl, stream) else {
+                return;
+            };
+            if std::pin::Pin::new(&mut tls).accept().await.is_ok() {
+                let (mut reader, mut writer) = tokio::io::split(tls);
                 let mut buf = [0_u8; 4096];
                 drop(reader.read(&mut buf).await);
                 drop(writer.write_all(&response).await);

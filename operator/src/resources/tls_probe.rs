@@ -148,13 +148,17 @@ fn verify_peer_certificate(tls_stream: &tls_backend::ClientTlsStream, config: &P
     reason = "tests"
 )]
 mod tests {
+    #[cfg(not(feature = "fips"))]
     use std::sync::Arc;
 
+    #[cfg(not(feature = "fips"))]
     use rustls::pki_types::{CertificateDer, pem::PemObject as _};
 
     use super::*;
+    #[cfg(not(feature = "fips"))]
+    use crate::resources::tls_backend::classify_rustls_error;
     use crate::resources::tls_backend::{
-        MAX_CA_CERTIFICATES, MAX_CERT_BUNDLE_BYTES, MAX_PRIVATE_KEY_BYTES, classify_rustls_error, classify_tls_error,
+        MAX_CA_CERTIFICATES, MAX_CERT_BUNDLE_BYTES, MAX_PRIVATE_KEY_BYTES, classify_tls_error,
     };
 
     fn test_ca() -> certs::CaCert {
@@ -343,12 +347,14 @@ mod tests {
         assert_eq!(classify_tls_error(&err), GatewayProbeOutcome::TlsProtocolError);
     }
 
+    #[cfg(not(feature = "fips"))]
     #[test]
     fn classify_rustls_unknown_issuer() {
         let rustls_err = rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer);
         assert_eq!(classify_rustls_error(&rustls_err), GatewayProbeOutcome::UntrustedIssuer);
     }
 
+    #[cfg(not(feature = "fips"))]
     #[test]
     fn classify_rustls_not_valid_for_name() {
         let rustls_err = rustls::Error::InvalidCertificate(rustls::CertificateError::NotValidForName);
@@ -358,6 +364,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(feature = "fips"))]
     #[test]
     fn classify_rustls_context_certificate_errors() {
         use rustls::{CertificateError, pki_types::UnixTime};
@@ -387,6 +394,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(feature = "fips"))]
     #[test]
     fn classify_rustls_expired() {
         let rustls_err = rustls::Error::InvalidCertificate(rustls::CertificateError::Expired);
@@ -396,6 +404,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(feature = "fips"))]
     #[test]
     fn classify_rustls_not_yet_valid() {
         let rustls_err = rustls::Error::InvalidCertificate(rustls::CertificateError::NotValidYet);
@@ -433,7 +442,7 @@ mod tests {
     // Focused TLS handshake tests — real listeners, real certificates
     // -----------------------------------------------------------------------
 
-    fn client_tls_config(ca: &certs::CaCert, client: &certs::SiteCertOutput) -> Arc<rustls::ClientConfig> {
+    fn client_tls_config(ca: &certs::CaCert, client: &certs::SiteCertOutput) -> ClientTlsConfig {
         let roots = parse_ca_roots(ca.cert_pem.as_bytes()).unwrap();
         let client_certs = parse_client_certs(client.cert_pem.as_bytes()).unwrap();
         let client_key = parse_private_key(client.key_pem.as_bytes()).unwrap();
@@ -456,6 +465,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(feature = "fips"))]
     fn server_tls_config(server_cert: &certs::SiteCertOutput, ca: &certs::CaCert) -> Arc<rustls::ServerConfig> {
         let certs = parse_client_certs(server_cert.cert_pem.as_bytes()).unwrap();
         let key = parse_private_key(server_cert.key_pem.as_bytes()).unwrap();
@@ -477,6 +487,7 @@ mod tests {
         Arc::new(config)
     }
 
+    #[cfg(not(feature = "fips"))]
     fn start_tls_server(server_cert: &certs::SiteCertOutput, ca: &certs::CaCert) -> std::net::SocketAddr {
         let server_config = server_tls_config(server_cert, ca);
         let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -492,6 +503,53 @@ mod tests {
                 let acc = acceptor.clone();
                 tokio::spawn(async move {
                     drop(acc.accept(stream).await);
+                });
+            }
+        });
+        addr
+    }
+
+    /// OpenSSL twin of the rustls test server: presents the grid server cert
+    /// and verifies the client cert against the grid CA (mTLS), so the probe
+    /// handshake tests exercise the real OpenSSL path under `fips`.
+    #[cfg(feature = "fips")]
+    fn start_tls_server(server_cert: &certs::SiteCertOutput, ca: &certs::CaCert) -> std::net::SocketAddr {
+        use openssl::{
+            pkey::PKey,
+            ssl::{Ssl, SslAcceptor, SslMethod, SslVerifyMode},
+            x509::{X509, store::X509StoreBuilder},
+        };
+
+        let cert = X509::from_pem(server_cert.cert_pem.as_bytes()).unwrap();
+        let key = PKey::private_key_from_pem(server_cert.key_pem.as_bytes()).unwrap();
+        let mut builder = SslAcceptor::mozilla_intermediate(SslMethod::tls()).unwrap();
+        builder.set_certificate(&cert).unwrap();
+        builder.set_private_key(&key).unwrap();
+        builder.check_private_key().unwrap();
+        let mut store = X509StoreBuilder::new().unwrap();
+        for client_ca in X509::stack_from_pem(ca.cert_pem.as_bytes()).unwrap() {
+            store.add_cert(client_ca).unwrap();
+        }
+        builder.set_verify_cert_store(store.build()).unwrap();
+        builder.set_verify(SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT);
+        let acceptor = builder.build();
+
+        let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = std_listener.local_addr().unwrap();
+        std_listener.set_nonblocking(true).unwrap();
+        tokio::spawn(async move {
+            let listener = tokio::net::TcpListener::from_std(std_listener).unwrap();
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let ctx = acceptor.context().to_owned();
+                tokio::spawn(async move {
+                    let Ok(ssl) = Ssl::new(&ctx) else { return };
+                    let Ok(mut tls) = tokio_openssl::SslStream::new(ssl, stream) else {
+                        return;
+                    };
+                    drop(std::pin::Pin::new(&mut tls).accept().await);
                 });
             }
         });

@@ -1513,6 +1513,7 @@ mod tests {
     /// before any `reqwest::Certificate`/`reqwest::Identity` PEM parsing —
     /// see `probe_via_pipeline_for_tests` in `integration_tests` for why.
     fn install_test_crypto_provider() {
+        #[cfg(not(feature = "fips"))]
         drop(rustls::crypto::ring::default_provider().install_default());
     }
 
@@ -1830,6 +1831,7 @@ mod integration_tests {
         // no equivalent entry point, so each call here does it instead.
         // Idempotent: a second install attempt just returns `Err`, which is
         // exactly what happens when multiple tests in this binary race here.
+        #[cfg(not(feature = "fips"))]
         drop(rustls::crypto::ring::default_provider().install_default());
 
         let resolved = match resolve_endpoint_for_probe(request.endpoint, request.timeout).await {
