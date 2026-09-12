@@ -410,7 +410,7 @@ pub(crate) fn requeue_interval_for_provider(spec: &InferenceProviderSpec) -> Dur
 pub(crate) async fn probe_endpoint(
     url: &str,
     timeout: Duration,
-    tls_config: Option<Arc<rustls::ClientConfig>>,
+    tls_config: Option<crate::resources::tls_backend::ClientTlsConfig>,
 ) -> ProbeOutcome {
     let Ok(uri) = url.parse::<http::Uri>() else {
         return ProbeOutcome::Unavailable;
@@ -432,14 +432,14 @@ pub(crate) async fn probe_endpoint(
     }
 
     let connector = if let Some(config) = &tls_config {
-        // Custom TLS config — use the provided CA / client identity.
+        // Custom TLS config: use the provided CA / client identity.
         crate::metrics_scraper::build_custom_tls_connector(config)
     } else {
-        // No custom TLS — use native root certificates.
-        let Ok(tls_builder) = hyper_rustls::HttpsConnectorBuilder::new().with_native_roots() else {
-            return ProbeOutcome::Unavailable;
-        };
-        tls_builder.https_or_http().enable_http1().build()
+        // No custom TLS: use native root certificates.
+        match crate::metrics_scraper::build_native_connector() {
+            Ok(connector) => connector,
+            Err(_err) => return ProbeOutcome::Unavailable,
+        }
     };
 
     let client: HyperClient<_, Empty<Bytes>> = HyperClient::builder(TokioExecutor::new()).build(connector);

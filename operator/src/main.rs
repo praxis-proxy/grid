@@ -88,24 +88,9 @@ async fn main() {
     tracing_subscriber::fmt::init();
     tracing::info!("starting grid-operator");
 
-    // Explicit process-wide rustls crypto-provider choice.
-    //
-    // `InferenceProvider`'s probe (`inference_provider.rs`) builds a
-    // `hyper-rustls` client via `.with_native_roots()`, which relies on
-    // `rustls` auto-detecting a single process-wide `CryptoProvider`. The
-    // `AgentToolProvider` MCP probe (PR 2 of grid#41) links in `reqwest`
-    // (via `rmcp`'s reqwest-backed transport) using its `rustls-no-provider`
-    // feature specifically to avoid pulling in `aws-lc-rs` alongside `ring`
-    // (see the workspace `Cargo.toml` comment on the `reqwest`/`rmcp`
-    // entries) — but that feature means `reqwest` will no longer install a
-    // default provider on our behalf either, so `Client::builder().build()`
-    // panics with "No rustls crypto provider is configured" unless one is
-    // installed explicitly first. Installing `ring` here, once, up front,
-    // covers both `hyper-rustls` and `reqwest` for every reconciler in this
-    // binary, regardless of which one runs first.
-    if rustls::crypto::ring::default_provider().install_default().is_err() {
-        tracing::warn!("rustls default CryptoProvider already installed; continuing");
-    }
+    // Install the process-wide crypto provider the TLS stack requires, once,
+    // up front, before any reconciler builds a client.
+    operator::init_process_crypto();
 
     let config = Cli::parse();
 

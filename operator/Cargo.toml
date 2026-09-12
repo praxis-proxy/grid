@@ -7,6 +7,11 @@ rust-version.workspace = true
 license.workspace = true
 publish = false
 
+[features]
+default = ["tls-rustls"]
+tls-rustls = ["reqwest/rustls-no-provider", "rmcp/reqwest-tls-no-provider", "kube/rustls-tls", "kube/ring"]
+fips = ["reqwest/native-tls", "rmcp/reqwest-native-tls", "kube/openssl-tls"]
+
 [dependencies]
 axum = { workspace = true }
 bytes = { workspace = true }

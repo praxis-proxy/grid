@@ -16,7 +16,6 @@
 
 use std::{
     collections::HashMap,
-    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -476,7 +475,7 @@ async fn resolve_tls_config(
     tls_config: Option<&EndpointTlsConfig>,
     client: Option<&kube::Client>,
     provider_identity: &str,
-) -> Result<Option<Arc<rustls::ClientConfig>>, (super::endpoint_tls::TlsFailureReason, String)> {
+) -> Result<Option<super::tls_backend::ClientTlsConfig>, (super::endpoint_tls::TlsFailureReason, String)> {
     super::endpoint_tls::resolve_tls_config(tls_config, client, provider_identity).await
 }
 

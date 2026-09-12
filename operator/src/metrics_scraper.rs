@@ -25,28 +25,20 @@
 //!
 //! [`rustls::ClientConfig`]: rustls::ClientConfig
 
-use std::{sync::Arc, time::Duration};
+use std::time::Duration;
 
 use bytes::Bytes;
 use http_body_util::{BodyExt as _, Empty, Limited};
 use hyper_util::{client::legacy::Client as HyperClient, rt::TokioExecutor};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject as _};
+
+use crate::resources::tls_backend::ClientTlsConfig;
+pub(crate) use crate::resources::tls_backend::{
+    build_custom_tls_connector, build_native_connector, build_tls_client_config,
+};
 
 // ---------------------------------------------------------------------------
 // Bounded input limits
 // ---------------------------------------------------------------------------
-
-/// Maximum size for a CA PEM bundle (256 KiB).
-const MAX_CA_PEM_BYTES: usize = 256 * 1024;
-
-/// Maximum size for a client certificate PEM (64 KiB).
-const MAX_CLIENT_CERT_PEM_BYTES: usize = 64 * 1024;
-
-/// Maximum size for a client private key PEM (64 KiB).
-const MAX_CLIENT_KEY_PEM_BYTES: usize = 64 * 1024;
-
-/// Maximum number of certificates in a CA or client chain.
-const MAX_CERT_CHAIN_LENGTH: usize = 10;
 
 /// Maximum size for a metrics response body (1 MiB).
 const MAX_RESPONSE_BODY_BYTES: usize = 1024 * 1024;
@@ -119,7 +111,7 @@ pub enum MetricsScrapeError {
 pub async fn scrape_metrics(
     url: &str,
     timeout: Duration,
-    tls_config: Option<Arc<rustls::ClientConfig>>,
+    tls_config: Option<ClientTlsConfig>,
 ) -> Result<String, MetricsScrapeError> {
     let uri = url
         .parse::<http::Uri>()
@@ -180,133 +172,6 @@ pub async fn scrape_metrics(
 }
 
 // ---------------------------------------------------------------------------
-// TLS client config builder
-// ---------------------------------------------------------------------------
-
-/// Build a [`rustls::ClientConfig`] from raw PEM bytes.
-///
-/// `ca_pem` is the CA certificate chain (required).  `client_cert_pem` and
-/// `client_key_pem` are the client identity for mTLS (both required together,
-/// or both absent for one-way TLS).
-///
-/// # Security invariant
-///
-/// Private key bytes are consumed by `rustls` and never written to logs,
-/// events, status fields, or Prometheus labels.
-///
-/// # Errors
-///
-/// Returns [`MetricsScrapeError::TlsMaterial`] when PEM parsing fails or the
-/// material is structurally invalid.
-#[expect(
-    clippy::too_many_lines,
-    reason = "sequential PEM parsing for CA, client cert, and client key with validation"
-)]
-pub fn build_tls_client_config(
-    ca_pem: &[u8],
-    client_cert_pem: Option<&[u8]>,
-    client_key_pem: Option<&[u8]>,
-) -> Result<rustls::ClientConfig, MetricsScrapeError> {
-    if ca_pem.len() > MAX_CA_PEM_BYTES {
-        return Err(MetricsScrapeError::TlsMaterial(format!(
-            "CA PEM exceeds maximum size ({} bytes > {MAX_CA_PEM_BYTES})",
-            ca_pem.len()
-        )));
-    }
-
-    let mut root_store = rustls::RootCertStore::empty();
-    let ca_certs = CertificateDer::pem_slice_iter(ca_pem)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| MetricsScrapeError::TlsMaterial(format!("CA PEM parse failed: {e}")))?;
-    if ca_certs.is_empty() {
-        return Err(MetricsScrapeError::TlsMaterial(
-            "CA PEM contains no certificates".to_owned(),
-        ));
-    }
-    if ca_certs.len() > MAX_CERT_CHAIN_LENGTH {
-        return Err(MetricsScrapeError::TlsMaterial(format!(
-            "CA PEM contains too many certificates ({} > {MAX_CERT_CHAIN_LENGTH})",
-            ca_certs.len()
-        )));
-    }
-    for cert in &ca_certs {
-        root_store
-            .add(cert.clone())
-            .map_err(|e| MetricsScrapeError::TlsMaterial(format!("CA certificate invalid: {e}")))?;
-    }
-
-    let builder = rustls::ClientConfig::builder().with_root_certificates(root_store);
-
-    let config = match (client_cert_pem, client_key_pem) {
-        (Some(cert_pem), Some(key_pem)) => {
-            if cert_pem.len() > MAX_CLIENT_CERT_PEM_BYTES {
-                return Err(MetricsScrapeError::TlsMaterial(format!(
-                    "client cert PEM exceeds maximum size ({} bytes > {MAX_CLIENT_CERT_PEM_BYTES})",
-                    cert_pem.len()
-                )));
-            }
-            if key_pem.len() > MAX_CLIENT_KEY_PEM_BYTES {
-                return Err(MetricsScrapeError::TlsMaterial(format!(
-                    "client key PEM exceeds maximum size ({} bytes > {MAX_CLIENT_KEY_PEM_BYTES})",
-                    key_pem.len()
-                )));
-            }
-            let certs = CertificateDer::pem_slice_iter(cert_pem)
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| MetricsScrapeError::TlsMaterial(format!("client cert PEM parse failed: {e}")))?;
-            if certs.is_empty() {
-                return Err(MetricsScrapeError::TlsMaterial(
-                    "client cert PEM contains no certificates".to_owned(),
-                ));
-            }
-            if certs.len() > MAX_CERT_CHAIN_LENGTH {
-                return Err(MetricsScrapeError::TlsMaterial(format!(
-                    "client cert PEM contains too many certificates ({} > {MAX_CERT_CHAIN_LENGTH})",
-                    certs.len()
-                )));
-            }
-            let key = PrivateKeyDer::from_pem_slice(key_pem)
-                .map_err(|e| MetricsScrapeError::TlsMaterial(format!("client key PEM parse failed: {e}")))?;
-            builder
-                .with_client_auth_cert(certs, key)
-                .map_err(|e| MetricsScrapeError::TlsMaterial(format!("client identity construction failed: {e}")))?
-        },
-        (None, None) => builder.with_no_client_auth(),
-        _ => {
-            return Err(MetricsScrapeError::TlsMaterial(
-                "client cert and key must both be present or both absent".to_owned(),
-            ));
-        },
-    };
-
-    Ok(config)
-}
-
-// ---------------------------------------------------------------------------
-// Connector builders
-// ---------------------------------------------------------------------------
-
-/// Build an HTTPS connector using native root certificates.
-fn build_native_connector()
--> Result<hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>, MetricsScrapeError> {
-    hyper_rustls::HttpsConnectorBuilder::new()
-        .with_native_roots()
-        .map(|b| b.https_or_http().enable_http1().build())
-        .map_err(|e| MetricsScrapeError::Transport(e.into()))
-}
-
-/// Build an HTTPS-only connector using a custom [`rustls::ClientConfig`].
-pub(crate) fn build_custom_tls_connector(
-    config: &rustls::ClientConfig,
-) -> hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector> {
-    hyper_rustls::HttpsConnectorBuilder::new()
-        .with_tls_config(config.clone())
-        .https_only()
-        .enable_http1()
-        .build()
-}
-
-// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -314,9 +179,13 @@ pub(crate) fn build_custom_tls_connector(
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(clippy::unwrap_used, clippy::expect_used, reason = "tests")]
 mod tests {
+    use std::sync::Arc;
+
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject as _};
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     use super::*;
+    use crate::resources::tls_backend::{MAX_CA_PEM_BYTES, MAX_CLIENT_CERT_PEM_BYTES, MAX_CLIENT_KEY_PEM_BYTES};
 
     /// Start a local HTTP server on a random port and return the URL.
     async fn start_test_server(response: &'static [u8]) -> String {

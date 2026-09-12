@@ -50,5 +50,7 @@ pub(crate) mod endpoint_tls;
 pub(crate) mod gateway_probe;
 /// Live MCP `tools/list` probe for [`AgentToolProvider`](crate::crd::agent_tool_provider::AgentToolProvider).
 pub(crate) mod mcp_probe;
+/// TLS backend abstraction: client config, connectors, handshake, PEM gates.
+pub(crate) mod tls_backend;
 /// TLS gateway probe — bounded handshake and peer certificate extraction.
 pub(crate) mod tls_probe;

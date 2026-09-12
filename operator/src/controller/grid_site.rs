@@ -17,7 +17,6 @@ use kube::{
         events::{Event, EventType, Recorder, Reporter},
     },
 };
-use rustls::pki_types::ServerName;
 use tokio::time::Duration;
 use tracing::info;
 use zeroize::Zeroizing;
@@ -318,7 +317,8 @@ async fn build_probe_config_from_secrets(
         .and_then(|e| e.tls.server_name.as_deref())
         .ok_or(O::TrustMaterialMissing)?;
     validate_server_name(server_name_str).map_err(|_err| O::TrustMaterialInvalid)?;
-    let server_name = ServerName::try_from(server_name_str.to_owned()).map_err(|_err| O::TrustMaterialInvalid)?;
+    let server_name =
+        crate::resources::tls_backend::parse_server_name(server_name_str).map_err(|_err| O::TrustMaterialInvalid)?;
 
     let pins = resolve_pins(site)?;
 

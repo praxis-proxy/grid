@@ -13,6 +13,7 @@ use std::sync::Arc;
 use crate::{
     crd::inference_provider::{ClientCertificateSecretRef, EndpointTlsConfig},
     metrics_scraper,
+    resources::tls_backend::ClientTlsConfig,
 };
 
 // ---------------------------------------------------------------------------
@@ -163,7 +164,7 @@ pub(crate) async fn resolve_tls_config(
     tls_config: Option<&EndpointTlsConfig>,
     client: Option<&kube::Client>,
     provider_identity: &str,
-) -> Result<Option<Arc<rustls::ClientConfig>>, (TlsFailureReason, String)> {
+) -> Result<Option<ClientTlsConfig>, (TlsFailureReason, String)> {
     let Some(tls) = tls_config else {
         return Ok(None);
     };
