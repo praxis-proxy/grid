@@ -20,6 +20,7 @@ pub fn validate(config: &ForgeConfig) -> Result<(), ForgeError> {
     check_kind(config)?;
     check_metadata_name(&config.metadata.name)?;
     check_network_name(&config.metadata.name, &config.spec)?;
+    check_network_subnet(&config.spec)?;
     check_cluster_names(config)?;
     check_cluster_nodes(config)?;
     check_service_names(config)?;
@@ -36,6 +37,15 @@ pub fn validate(config: &ForgeConfig) -> Result<(), ForgeError> {
     check_cross_cluster_provider(config)?;
     check_no_templates(config)?;
     Ok(())
+}
+
+/// Validate an explicitly configured Docker network subnet.
+fn check_network_subnet(spec: &crate::config::EnvironmentSpec) -> Result<(), ForgeError> {
+    let Some(subnet) = spec.network.as_ref().and_then(|network| network.subnet.as_deref()) else {
+        return Ok(());
+    };
+    crate::networking::validate_ipv4_cidr(subnet)
+        .map_err(|error| ForgeError::Validation(format!("network subnet is invalid: {error}")))
 }
 
 /// `apiVersion` must match the current schema.
@@ -1385,10 +1395,22 @@ spec:
         config.spec.network = Some(NetworkConfig {
             cross_cluster: true,
             dns_zone: None,
+            subnet: None,
         });
         validate(&config).unwrap_or_else(|_e| {
             std::process::abort();
         });
+    }
+
+    #[test]
+    fn invalid_network_subnet_is_rejected() {
+        let mut config = base_config();
+        config.spec.network = Some(NetworkConfig {
+            cross_cluster: true,
+            dns_zone: None,
+            subnet: Some("not-a-cidr".to_owned()),
+        });
+        assert!(validate(&config).is_err(), "invalid subnet must be rejected");
     }
 
     #[test]
@@ -1397,6 +1419,7 @@ spec:
         config.spec.network = Some(NetworkConfig {
             cross_cluster: false,
             dns_zone: None,
+            subnet: None,
         });
         validate(&config).unwrap_or_else(|_e| {
             std::process::abort();
@@ -1770,6 +1793,7 @@ spec:
         config.spec.network = Some(NetworkConfig {
             cross_cluster: true,
             dns_zone: Some("forge.test".to_owned()),
+            subnet: None,
         });
         assert!(validate(&config).is_ok(), "forge.test should be a valid dns zone");
     }
@@ -1780,18 +1804,21 @@ spec:
         config.spec.network = Some(NetworkConfig {
             cross_cluster: true,
             dns_zone: Some("UPPER.case".to_owned()),
+            subnet: None,
         });
         assert!(validate(&config).is_err(), "uppercase should be rejected");
 
         config.spec.network = Some(NetworkConfig {
             cross_cluster: true,
             dns_zone: Some(".leading-dot".to_owned()),
+            subnet: None,
         });
         assert!(validate(&config).is_err(), "leading dot should be rejected");
 
         config.spec.network = Some(NetworkConfig {
             cross_cluster: true,
             dns_zone: Some("nodot".to_owned()),
+            subnet: None,
         });
         assert!(validate(&config).is_err(), "no dot should be rejected");
     }
@@ -1822,6 +1849,7 @@ spec:
         config.spec.network = Some(NetworkConfig {
             cross_cluster: true,
             dns_zone: None,
+            subnet: None,
         });
         config.spec.stacks.insert(
             "net".to_owned(),
@@ -1858,6 +1886,7 @@ spec:
             config.spec.network = Some(NetworkConfig {
                 cross_cluster: true,
                 dns_zone: None,
+                subnet: None,
             });
             config.spec.stacks.insert(
                 "net".to_owned(),
@@ -1887,6 +1916,7 @@ spec:
             config.spec.network = Some(NetworkConfig {
                 cross_cluster: true,
                 dns_zone: None,
+                subnet: None,
             });
             config.spec.stacks.insert(
                 "net".to_owned(),
@@ -1914,6 +1944,7 @@ spec:
         config.spec.network = Some(NetworkConfig {
             cross_cluster: true,
             dns_zone: None,
+            subnet: None,
         });
         let Err(err) = validate(&config) else {
             std::process::abort();
@@ -1932,6 +1963,7 @@ spec:
         config.spec.network = Some(NetworkConfig {
             cross_cluster: true,
             dns_zone: None,
+            subnet: None,
         });
         validate(&config).unwrap_or_else(|_e| {
             std::process::abort();
@@ -1944,6 +1976,7 @@ spec:
         config.spec.network = Some(NetworkConfig {
             cross_cluster: true,
             dns_zone: None,
+            subnet: None,
         });
         validate(&config).unwrap_or_else(|_e| {
             std::process::abort();

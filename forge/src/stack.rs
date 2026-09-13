@@ -760,6 +760,7 @@ mod tests {
         config.spec.network = Some(NetworkConfig {
             cross_cluster: true,
             dns_zone: None,
+            subnet: None,
         });
         let runner = crate::command::runner::MockRunner::new();
         let ctx = ForgeContext {

@@ -11,6 +11,7 @@ spec:
 
   network:
     crossCluster: true
+    subnet: 10.251.0.0/16
     dnsZone: grid-token-rate-limit.test
 
   clusters:
@@ -690,6 +691,7 @@ spec:
           namespace: grid-system
           values:
             fullnameOverride: "consumer-gateway-a"
+            terminationGracePeriodSeconds: 10
             image:
               repository: "{{ cluster.properties.gatewayImageRepo }}"
               tag: "{{ cluster.properties.gatewayImageTag }}"
@@ -708,7 +710,17 @@ spec:
                   secretKeyRef:
                     name: valkey-auth
                     key: url
-            service: { type: LoadBalancer }
+            port: { containerPort: 8443, name: http, protocol: TCP }
+            service: { type: ClusterIP, port: 8443 }
+            health:
+              readiness:
+                tcpSocket: { port: http }
+                initialDelaySeconds: 3
+                periodSeconds: 5
+              liveness:
+                tcpSocket: { port: http }
+                initialDelaySeconds: 5
+                periodSeconds: 10
             overlay:
               enabled: true
               existingConfigMap: "grid-overlay-grid-token-rate-limit-consumer-gateway-a"
@@ -755,6 +767,7 @@ spec:
           namespace: grid-system
           values:
             fullnameOverride: "consumer-gateway-b"
+            terminationGracePeriodSeconds: 10
             image:
               repository: "{{ cluster.properties.gatewayImageRepo }}"
               tag: "{{ cluster.properties.gatewayImageTag }}"
@@ -773,7 +786,17 @@ spec:
                   secretKeyRef:
                     name: valkey-auth
                     key: url
-            service: { type: LoadBalancer }
+            port: { containerPort: 8443, name: http, protocol: TCP }
+            service: { type: ClusterIP, port: 8443 }
+            health:
+              readiness:
+                tcpSocket: { port: http }
+                initialDelaySeconds: 3
+                periodSeconds: 5
+              liveness:
+                tcpSocket: { port: http }
+                initialDelaySeconds: 5
+                periodSeconds: 10
             overlay:
               enabled: true
               existingConfigMap: "grid-overlay-grid-token-rate-limit-consumer-gateway-b"

@@ -1,6 +1,11 @@
 # -- Number of gateway replicas.
 replicaCount: 1
 
+# -- Optional maximum time Kubernetes allows a terminating pod to finish.
+# Qualification topologies set this explicitly; leaving it null preserves
+# Kubernetes' default for general chart consumers.
+terminationGracePeriodSeconds: null
+
 # -- Gateway container image settings.
 image:
   # -- Image repository.

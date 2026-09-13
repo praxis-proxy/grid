@@ -131,6 +131,9 @@ pub struct NetworkConfig {
     /// DNS zone for exported-service discovery (default `forge.test`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dns_zone: Option<String>,
+    /// Optional IPv4 subnet for the managed cross-cluster network.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subnet: Option<String>,
 }
 
 impl NetworkConfig {

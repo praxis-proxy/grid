@@ -1,101 +1,103 @@
+---
 insecure_options:
   allow_private_endpoints: true
-
 listeners:
-  - name: proxy
-    address: "0.0.0.0:8080"
-    filter_chains:
-      - main
-
+- name: proxy
+  address: 0.0.0.0:8443
+  filter_chains:
+  - main
 filter_chains:
-  - name: main
-    filters:
-      - filter: basic_auth
-        realm: "Grid token-rate-limit qualification"
-        strip_authorization: true
-        credentials:
-          - username: alice
-            password: alice-secret
-      - filter: json_body_field
-        field: model
-        header: X-Model
-      - filter: token_rate_limit
-        backend:
-          kind: valkey
-          url: "${TOKEN_RATE_LIMIT_VALKEY_URL}"
-          namespace: praxis:grid-token-rate-limit
-        rules:
-          - name: alice-shared-budget
-            match:
-              headers:
-                x-model: Qwen/Qwen3-0.6B
-            algorithm: sliding_window
-            window: 60s
-            capacity: 60
-            reserved_tokens: 15
-            reservation_timeout: 30s
-      - filter: headers
-        response_set:
-          - name: X-Grid-Quota-Consumer-Gateway
-            value: "consumer-gateway-b"
-      - filter: intelligent_route
-        overlay_file: /etc/praxis/routing/routing-overlay.json
-        model_header: X-Model
-        provider_hop_clusters:
-          - vcr-west-provider
-          - vcr-central-provider
-          - vcr-east-provider
-        expected_overlay_scope:
-          network: grid-token-rate-limit
-          gateway: consumer-gateway-b
-          namespace: grid-system
-          local_site: "{{ cluster.name }}"
-        reload:
-          enabled: true
-          debounce_ms: 500
-        session_affinity:
-          enabled: true
-          header: X-Session-Id
-          ttl_secs: 3600
-      - filter: token_count
-        provider: openai
-      - filter: load_balancer
-        clusters:
-          - name: vcr-west-provider
-            tls:
-              ca:
-                ca_path: /etc/praxis/tls/ca.crt
-              client_cert:
-                cert_path: /etc/praxis/tls/tls.crt
-                key_path: /etc/praxis/tls/tls.key
-              sni: provider-a.grid.internal
-              verify: true
-            endpoints:
-              - "{{ captures.west.provider-gateway-ip }}:8443"
-          - name: vcr-central-provider
-            tls:
-              ca:
-                ca_path: /etc/praxis/tls/ca.crt
-              client_cert:
-                cert_path: /etc/praxis/tls/tls.crt
-                key_path: /etc/praxis/tls/tls.key
-              sni: provider-b.grid.internal
-              verify: true
-            endpoints:
-              - "{{ captures.central.provider-gateway-ip }}:8443"
-          - name: vcr-east-provider
-            tls:
-              ca:
-                ca_path: /etc/praxis/tls/ca.crt
-              client_cert:
-                cert_path: /etc/praxis/tls/tls.crt
-                key_path: /etc/praxis/tls/tls.key
-              sni: provider-c.grid.internal
-              verify: true
-            endpoints:
-              - "{{ captures.east.provider-gateway-ip }}:8443"
-
+- name: main
+  filters:
+  - filter: basic_auth
+    realm: Grid distributed quota
+    strip_authorization: true
+    credentials:
+    - username: application-a
+      password: application-a-secret
+    - username: application-b
+      password: application-b-secret
+    - username: application-c
+      password: application-c-secret
+  - filter: json_body_field
+    field: model
+    header: X-Model
+  - filter: token_rate_limit
+    backend:
+      kind: valkey
+      url: "${TOKEN_RATE_LIMIT_VALKEY_URL}"
+      namespace: praxis:grid-token-rate-limit
+    rules:
+    - name: per-application-budget
+      match:
+        headers:
+          x-model: Qwen/Qwen3-0.6B
+      algorithm: sliding_window
+      window: 60s
+      capacity: 60
+      reserved_tokens: 15
+      reservation_timeout: 30s
+    key: authenticated_subject
+  - filter: headers
+    response_set:
+    - name: X-Grid-Quota-Consumer-Gateway
+      value: consumer-gateway-b
+  - filter: intelligent_route
+    overlay_file: "/etc/praxis/routing/routing-overlay.json"
+    model_header: X-Model
+    provider_hop_clusters:
+    - vcr-west-provider
+    - vcr-central-provider
+    - vcr-east-provider
+    expected_overlay_scope:
+      network: grid-token-rate-limit
+      gateway: consumer-gateway-b
+      namespace: grid-system
+      local_site: west
+    reload:
+      enabled: true
+      debounce_ms: 500
+    session_affinity:
+      enabled: true
+      header: X-Session-Id
+      ttl_secs: 3600
+  - filter: token_count
+    provider: openai
+  - filter: load_balancer
+    clusters:
+    - name: vcr-west-provider
+      tls:
+        ca:
+          ca_path: "/etc/praxis/tls/ca.crt"
+        client_cert:
+          cert_path: "/etc/praxis/tls/tls.crt"
+          key_path: "/etc/praxis/tls/tls.key"
+        sni: provider-a.grid.internal
+        verify: true
+      endpoints:
+      - "{{ captures.west.provider-gateway-ip }}:8443"
+    - name: vcr-central-provider
+      tls:
+        ca:
+          ca_path: "/etc/praxis/tls/ca.crt"
+        client_cert:
+          cert_path: "/etc/praxis/tls/tls.crt"
+          key_path: "/etc/praxis/tls/tls.key"
+        sni: provider-b.grid.internal
+        verify: true
+      endpoints:
+      - "{{ captures.central.provider-gateway-ip }}:8443"
+    - name: vcr-east-provider
+      tls:
+        ca:
+          ca_path: "/etc/praxis/tls/ca.crt"
+        client_cert:
+          cert_path: "/etc/praxis/tls/tls.crt"
+          key_path: "/etc/praxis/tls/tls.key"
+        sni: provider-c.grid.internal
+        verify: true
+      endpoints:
+      - "{{ captures.east.provider-gateway-ip }}:8443"
 admin:
-  address: "127.0.0.1:9901"
-
+  address: 127.0.0.1:9901
 shutdown_timeout_secs: 5

@@ -4,6 +4,11 @@
   "additionalProperties": false,
   "required": ["config"],
   "properties": {
+    "terminationGracePeriodSeconds": {
+      "type": ["integer", "null"],
+      "minimum": 1,
+      "description": "Maximum termination grace period for the gateway pod."
+    },
     "replicaCount": {
       "type": "integer",
       "minimum": 1,
