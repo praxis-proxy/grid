@@ -30,7 +30,8 @@ use std::{sync::Arc, time::Duration};
 use bytes::Bytes;
 use http_body_util::{BodyExt as _, Empty, Limited};
 use hyper_util::{client::legacy::Client as HyperClient, rt::TokioExecutor};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject as _};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime, pem::PemObject as _};
+use sha2::{Digest as _, Sha256};
 
 // ---------------------------------------------------------------------------
 // Bounded input limits
@@ -176,7 +177,12 @@ pub async fn scrape_metrics(
         })?
         .to_bytes();
 
-    String::from_utf8(body_bytes.to_vec()).map_err(MetricsScrapeError::Encoding)
+    // Vec::from reclaims the buffer when this Bytes uniquely owns it, which it
+    // does whenever the body arrived in one chunk or was aggregated into one.
+    // to_vec copied the whole body unconditionally, up to the megabyte cap,
+    // once per peer per round, to hand it straight to a validator that would
+    // have been happy to read it where it lay.
+    String::from_utf8(Vec::from(body_bytes)).map_err(MetricsScrapeError::Encoding)
 }
 
 // ---------------------------------------------------------------------------
@@ -295,7 +301,148 @@ fn build_native_connector()
         .map_err(|e| MetricsScrapeError::Transport(e.into()))
 }
 
-/// Build an HTTPS-only connector using a custom [`rustls::ClientConfig`].
+/// Build a client config that accepts only the pins declared for one peer.
+///
+/// Reuses the ordinary config for the CA roots and client identity, then swaps
+/// the server verifier for one that also requires the leaf to be a key this
+/// site wrote down for that peer.
+///
+/// # Errors
+///
+/// Returns [`MetricsScrapeError::TlsMaterial`] when the material cannot be
+/// parsed, or when no pins are declared: dialling a peer whose key we have not
+/// written down is the case this exists to refuse.
+pub fn build_pinned_client_config(
+    ca_pem: &[u8],
+    client_cert_pem: Option<&[u8]>,
+    client_key_pem: Option<&[u8]>,
+    pins: &[String],
+) -> Result<rustls::ClientConfig, MetricsScrapeError> {
+    if pins.is_empty() {
+        return Err(MetricsScrapeError::TlsMaterial(
+            "no declared fingerprints for this peer".to_owned(),
+        ));
+    }
+    let mut config = build_tls_client_config(ca_pem, client_cert_pem, client_key_pem)?;
+    let verifier = pinned_verifier(ca_pem, pins, config.crypto_provider().signature_verification_algorithms)?;
+    config.dangerous().set_certificate_verifier(Arc::new(verifier));
+    Ok(config)
+}
+
+/// The verifier [`build_pinned_client_config`] installs.
+///
+/// Split out so a test can exercise the same construction the poller uses.
+fn pinned_verifier(
+    ca_pem: &[u8],
+    pins: &[String],
+    algorithms: rustls::crypto::WebPkiSupportedAlgorithms,
+) -> Result<PinnedPeer, MetricsScrapeError> {
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in CertificateDer::pem_slice_iter(ca_pem) {
+        let cert = cert.map_err(|e| MetricsScrapeError::TlsMaterial(format!("CA PEM parse failed: {e}")))?;
+        roots
+            .add(cert)
+            .map_err(|e| MetricsScrapeError::TlsMaterial(format!("CA rejected: {e}")))?;
+    }
+    let declared = pins.iter().map(|pin| decode_pin(pin)).collect::<Result<_, _>>()?;
+    Ok(PinnedPeer {
+        roots: Arc::new(roots),
+        algorithms,
+        pins: declared,
+    })
+}
+
+/// Accepts a peer whose leaf certificate is one this site declared.
+///
+/// Hostname verification is deliberately not performed. Membership advertises
+/// an IP and a site certificate carries a DNS name, so the two never match, and
+/// checking the name would add nothing once the exact key is known. The pin is
+/// the stronger statement: not "something the authority signed for this name"
+/// but "this key, which we wrote down".
+///
+/// This is the same rule the listener applies to callers, pointed the other
+/// way, so a site deals only with peers it has declared in both directions.
+#[derive(Debug)]
+pub(crate) struct PinnedPeer {
+    /// Authorities the chain is verified against.
+    roots: Arc<rustls::RootCertStore>,
+    /// Algorithms the chain and its signatures may use.
+    algorithms: rustls::crypto::WebPkiSupportedAlgorithms,
+    /// Digests this site declared for the peer, decoded once.
+    pins: Vec<[u8; 32]>,
+}
+
+/// Decodes a declared fingerprint to the digest bytes it names.
+///
+/// The CRD constrains these to lowercase hex, so the tolerance here is only so
+/// a hand-edited pin fails as a bad pin rather than as a rejected peer.
+/// Anything that is not 32 bytes of hex is an error: a pin that cannot be
+/// decoded can never match, and silently keeping it would refuse the peer for a
+/// reason nobody can see.
+fn decode_pin(pin: &str) -> Result<[u8; 32], MetricsScrapeError> {
+    let hex: String = pin.chars().filter(|c| *c != ':').collect();
+    let bytes: Vec<u8> = (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(hex.get(i..i + 2).unwrap_or(""), 16))
+        .collect::<Result<_, _>>()
+        .map_err(|source| MetricsScrapeError::TlsMaterial(format!("fingerprint is not hex: {pin}: {source}")))?;
+    bytes.try_into().map_err(|bytes: Vec<u8>| {
+        MetricsScrapeError::TlsMaterial(format!("fingerprint is {} bytes, not 32: {pin}", bytes.len()))
+    })
+}
+
+impl rustls::client::danger::ServerCertVerifier for PinnedPeer {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        // Not WebPkiServerVerifier: it ends in verify_server_name, and peers are
+        // dialled at an advertised IP, so that check fails every handshake.
+        let _ = (server_name, ocsp_response);
+        rustls::client::verify_server_cert_signed_by_trust_anchor(
+            &rustls::server::ParsedCertificate::try_from(end_entity)?,
+            &self.roots,
+            intermediates,
+            now,
+            self.algorithms.all,
+        )?;
+        let presented = Sha256::digest(end_entity);
+        if self.pins.iter().any(|pin| pin == presented.as_slice()) {
+            return Ok(rustls::client::danger::ServerCertVerified::assertion());
+        }
+        Err(rustls::Error::General(
+            "peer presented a certificate this site has not declared".to_owned(),
+        ))
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.algorithms)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.algorithms)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.algorithms.supported_schemes()
+    }
+}
+
+/// Builds an HTTPS-only connector from an already-built client config.
 pub(crate) fn build_custom_tls_connector(
     config: &rustls::ClientConfig,
 ) -> hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector> {
@@ -930,5 +1077,125 @@ mod tests {
         let url = start_test_server(response).await;
         let result = scrape_metrics(&url, Duration::from_secs(5), None).await;
         assert!(result.is_ok(), "HTTP URL without TLS config must succeed: {result:?}");
+    }
+}
+
+#[cfg(test)]
+#[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
+#[allow(clippy::unwrap_used, clippy::expect_used, reason = "tests")]
+mod pinned_peer_tests {
+    use rustls::{client::danger::ServerCertVerifier as _, pki_types::pem::PemObject as _};
+
+    use super::*;
+
+    /// A CA, and a site cert whose only SAN is a DNS name.
+    fn site() -> (certs::CaCert, certs::SiteCertOutput) {
+        let ca = certs::generate_ca("test-ca").unwrap();
+        let site = certs::generate_site_cert(&ca, "pool-b").unwrap();
+        (ca, site)
+    }
+
+    fn leaf(site: &certs::SiteCertOutput) -> CertificateDer<'static> {
+        CertificateDer::pem_slice_iter(site.cert_pem.as_bytes())
+            .next()
+            .unwrap()
+            .unwrap()
+    }
+
+    fn verify(ca: &certs::CaCert, site: &certs::SiteCertOutput, pins: &[String]) -> Result<(), rustls::Error> {
+        let algorithms = rustls::crypto::CryptoProvider::get_default().map_or_else(
+            || rustls::crypto::ring::default_provider().signature_verification_algorithms,
+            |p| p.signature_verification_algorithms,
+        );
+        let verifier = pinned_verifier(ca.cert_pem.as_bytes(), pins, algorithms)
+            .map_err(|e| rustls::Error::General(e.to_string()))?;
+        let der = leaf(site);
+        // An IP, which is what membership advertises and what the poller dials.
+        let dialled = ServerName::try_from("10.89.1.231").unwrap();
+        verifier
+            .verify_server_cert(&der, &[], &dialled, &[], UnixTime::now())
+            .map(|_| ())
+    }
+
+    #[test]
+    fn a_declared_key_is_accepted_at_an_address_its_name_does_not_cover() {
+        // The whole design: a site is named by its key, so the cert's DNS SAN
+        // never has to match the address membership advertises. Verifying the
+        // chain through WebPkiServerVerifier would fail this on the name alone.
+        let (ca, site) = site();
+        let pin = crate::signals::leaf_fingerprint(&leaf(&site));
+        verify(&ca, &site, &[pin]).expect("a declared key is served at any address");
+    }
+
+    #[test]
+    fn the_stock_verifier_would_reject_the_address_we_dial() {
+        // Guards the choice above. If someone swaps the trust-anchor check back
+        // to WebPkiServerVerifier::verify_server_cert, this is what they get.
+        let (ca, site) = site();
+        let algorithms = rustls::crypto::CryptoProvider::get_default().map_or_else(
+            || rustls::crypto::ring::default_provider().signature_verification_algorithms,
+            |p| p.signature_verification_algorithms,
+        );
+        let _ = algorithms;
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in CertificateDer::pem_slice_iter(ca.cert_pem.as_bytes()) {
+            roots.add(cert.unwrap()).unwrap();
+        }
+        let stock = rustls::client::WebPkiServerVerifier::builder(Arc::new(roots))
+            .build()
+            .unwrap();
+        let dialled = ServerName::try_from("10.89.1.231").unwrap();
+        let error = stock
+            .verify_server_cert(&leaf(&site), &[], &dialled, &[], UnixTime::now())
+            .expect_err("a DNS-SAN cert is not valid for an IP");
+        assert!(
+            matches!(
+                error,
+                rustls::Error::InvalidCertificate(
+                    rustls::CertificateError::NotValidForName | rustls::CertificateError::NotValidForNameContext { .. }
+                )
+            ),
+            "expected a name failure, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn an_undeclared_key_is_refused() {
+        let (ca, site) = site();
+        let other = certs::generate_site_cert(&ca, "pool-c").unwrap();
+        let pin = crate::signals::leaf_fingerprint(&leaf(&other));
+        verify(&ca, &site, &[pin]).expect_err("the CA signing it is not enough");
+    }
+
+    #[test]
+    fn a_key_from_another_authority_is_refused() {
+        let (_, site) = site();
+        let stranger = certs::generate_ca("stranger-ca").unwrap();
+        let pin = crate::signals::leaf_fingerprint(&leaf(&site));
+        assert!(
+            verify(&stranger, &site, &[pin]).is_err(),
+            "the pin does not replace the chain"
+        );
+    }
+
+    #[test]
+    fn declaring_no_key_refuses_before_a_config_exists() {
+        let ca = certs::generate_ca("test-ca").unwrap();
+        build_pinned_client_config(ca.cert_pem.as_bytes(), None, None, &[])
+            .expect_err("a peer with no declared key is refused");
+    }
+
+    #[test]
+    fn a_hand_edited_pin_still_matches() {
+        let (ca, site) = site();
+        let pin = crate::signals::leaf_fingerprint(&leaf(&site));
+        let typed = pin
+            .to_uppercase()
+            .as_bytes()
+            .chunks(2)
+            .map(|p| String::from_utf8_lossy(p).into_owned())
+            .collect::<Vec<_>>()
+            .join(":");
+        verify(&ca, &site, &[typed]).expect("uppercase and colons name the same key");
     }
 }

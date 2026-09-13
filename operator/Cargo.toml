@@ -17,11 +17,13 @@ swim = { path = "../swim" }
 futures = { workspace = true }
 http = { workspace = true }
 http-body-util = { workspace = true }
+hyper = { workspace = true, features = ["server"] }
 hyper-rustls = { workspace = true }
 hyper-util = { workspace = true }
 scoring = { path = "../scoring" }
 k8s-openapi = { workspace = true }
 kube = { workspace = true }
+percent-encoding = { workspace = true }
 prometheus = { workspace = true }
 schemars = { workspace = true }
 reqwest = { workspace = true }
@@ -35,6 +37,7 @@ thiserror = { workspace = true }
 time = { workspace = true }
 tokio = { workspace = true }
 tokio-rustls = { workspace = true }
+tower = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
