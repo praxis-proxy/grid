@@ -104,6 +104,107 @@ pub(crate) struct CollectedMetrics {
 }
 
 // ---------------------------------------------------------------------------
+// Signals collection (polling-metrics-signals feature)
+// ---------------------------------------------------------------------------
+
+/// Scrape each provider's endpoint and keep only its configured coarse signals.
+///
+/// A sibling of [`collect_provider_metrics_with_refresh_interval`], which parses
+/// the same text into [`scoring::BackendMetrics`] for local scoring. The signals
+/// path keeps the provider's own exposition, narrowed to the metric names its
+/// `metricsConfig.signalNames` declares, so a reader scores from the source
+/// series and the wire carries a coarse rollup rather than the full `/metrics`
+/// firehose.
+///
+/// Fails closed on TLS: a provider whose configured TLS will not resolve is
+/// skipped, never scraped in plaintext. A scrape that fails leaves the last
+/// value to expire on its own rather than erasing it.
+pub(crate) async fn collect_provider_signals(
+    network_name: &str,
+    providers: &[InferenceProvider],
+    client: Option<&kube::Client>,
+) -> HashMap<String, Vec<crate::signals::Observation>> {
+    let mut out = HashMap::new();
+    for provider in providers {
+        if provider.spec.grid_network_ref != network_name {
+            continue;
+        }
+        if let Some((identity, observations)) = scrape_provider_signals(provider, client).await {
+            out.insert(identity, observations);
+        }
+    }
+    out
+}
+
+/// Scrape one provider's coarse signals, or `None` to leave its last value be.
+///
+/// Every skip and failure returns `None`: a provider absent from the collection
+/// is left alone rather than erased, so a missed scrape expires on its own.
+async fn scrape_provider_signals(
+    provider: &InferenceProvider,
+    client: Option<&kube::Client>,
+) -> Option<(String, Vec<crate::signals::Observation>)> {
+    let mc = provider.spec.metrics_config.as_ref()?;
+    let (identity, url, wanted) = signal_scrape_plan(provider)?;
+    let tls_config = match resolve_tls_config(mc.tls.as_ref(), client, identity).await {
+        Ok(cfg) => cfg,
+        Err((_reason, e)) => {
+            if mc.tls.is_some() {
+                tracing::warn!(provider = identity, error = %e, "signals: provider metrics TLS unavailable; not scraping in plaintext");
+            }
+            return None;
+        },
+    };
+    let text = scrape_metrics(&url, parse_metrics_timeout(&mc.timeout), tls_config)
+        .await
+        .inspect_err(|e| {
+            tracing::debug!(provider = identity, error = %e, "signals: provider scrape failed; last value left to expire");
+        })
+        .ok()?;
+    let observations = crate::signals::parse(&text)
+        .into_iter()
+        .filter(|o| wanted.contains(o.metric.as_str()))
+        .collect();
+    Some((identity.to_owned(), observations))
+}
+
+/// The scrape target for a provider's coarse signals, if it is eligible.
+///
+/// Pure and synchronous: eligibility is decided here so the scrape path stays
+/// the I/O alone. `None` for a provider with no metrics config, no routing
+/// identity, a blank endpoint, or no declared signal names.
+fn signal_scrape_plan(provider: &InferenceProvider) -> Option<(&str, String, std::collections::BTreeSet<String>)> {
+    let mc = provider.spec.metrics_config.as_ref()?;
+    let identity = routing_identity(provider)?;
+    let endpoint = provider.spec.endpoint.trim();
+    if endpoint.is_empty() || mc.metrics_endpoint.as_deref().is_some_and(|ep| ep.trim().is_empty()) {
+        return None;
+    }
+    let wanted = signal_metric_names(&mc.signal_names);
+    if wanted.is_empty() {
+        return None;
+    }
+    let url = metrics_url(mc.metrics_endpoint.as_deref().unwrap_or(endpoint), &mc.path);
+    Some((identity, url, wanted))
+}
+
+/// The source metric names a provider declares for its coarse signals.
+fn signal_metric_names(cfg: &MetricSignalNames) -> std::collections::BTreeSet<String> {
+    [
+        &cfg.queue_depth,
+        &cfg.kv_cache_utilization,
+        &cfg.latency_p99_ms,
+        &cfg.prefix_cache_hit_ratio,
+        &cfg.error_rate,
+        &cfg.healthy,
+    ]
+    .into_iter()
+    .flatten()
+    .cloned()
+    .collect()
+}
+
+// ---------------------------------------------------------------------------
 // URL construction
 // ---------------------------------------------------------------------------
 
@@ -742,6 +843,27 @@ mod tests {
         assert_eq!(names.prefix_cache_hit_ratio.as_deref(), Some("my_prefix"));
         assert_eq!(names.error_rate.as_deref(), Some("my_errors"));
         assert_eq!(names.healthy.as_deref(), Some("my_health"));
+    }
+
+    #[test]
+    fn signal_metric_names_keeps_only_declared_coarse_signals() {
+        // The rollup carries the provider's declared coarse signals, not the
+        // full /metrics firehose: absent signals contribute no metric name, so
+        // the later filter drops everything the provider did not declare.
+        let cfg = MetricSignalNames {
+            queue_depth: Some("vllm:num_requests_waiting".to_owned()),
+            kv_cache_utilization: Some("vllm:gpu_cache_usage_perc".to_owned()),
+            ..Default::default()
+        };
+        let wanted = signal_metric_names(&cfg);
+        assert_eq!(wanted.len(), 2, "only the two declared signals are kept");
+        assert!(wanted.contains("vllm:num_requests_waiting"));
+        assert!(wanted.contains("vllm:gpu_cache_usage_perc"));
+        assert!(
+            !wanted.contains("vllm:gpu_memory_usage_bytes"),
+            "an undeclared series is not in the rollup"
+        );
+        assert!(signal_metric_names(&MetricSignalNames::default()).is_empty());
     }
 
     #[test]

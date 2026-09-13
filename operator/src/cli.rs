@@ -11,6 +11,20 @@ pub struct Cli {
     /// Gateway self-discovery options.
     #[command(flatten)]
     pub gateway: gateway::Config,
+
+    /// Source routing signals by polling provider metrics endpoints instead of SWIM gossip.
+    ///
+    /// Opt-in (default off). When enabled, the operator serves the signals it
+    /// already scrapes over a signals endpoint for peers and the data plane to
+    /// read, and polls peer signals endpoints. When disabled, behaviour is
+    /// unchanged: signals travel over SWIM gossip and the operator scores
+    /// locally.
+    #[arg(
+        long = "polling-metrics-signals",
+        env = "GRID_POLLING_METRICS_SIGNALS",
+        action = clap::ArgAction::SetTrue
+    )]
+    pub polling_metrics_signals: bool,
 }
 
 #[cfg(test)]

@@ -38,6 +38,7 @@ use crate::{
         overlay_envelope, provider_admission, provider_metrics, routing_overlay, secret,
         trust_bundle::{self, CertPemStatus},
     },
+    signals,
     swim::{MemberStatus, MembershipSnapshot},
     swim_endpoint::{SeedResolution, resolve_endpoint_list_partial},
     swim_runtime::SwimHandle,
@@ -96,6 +97,28 @@ pub struct OperatorCtx {
     /// Uses [`std::sync::Mutex`] because seed tracking is updated synchronously
     /// after async DNS resolution and the SWIM channel announcement.
     pub(crate) last_seeds: std::sync::Mutex<HashMap<String, Vec<SocketAddr>>>,
+
+    /// Who may read, keyed by the fingerprint of the certificate they present.
+    ///
+    /// A site generates its own keypair and publishes the certificate. Binding
+    /// that certificate to a name and a set of labels is what an approved
+    /// `GridSite` does, so identity is registered rather than issued. Read by
+    /// the signals listener to decide a caller's scope and by the peer poller
+    /// to skip a peer this site refuses.
+    pub(crate) peer_identities: signals::PeerIdentities,
+
+    /// Signals polled from peer operators, keyed by their site name.
+    ///
+    /// Kept apart from this site's own so that a scoped request can answer with
+    /// only what this site observed. Relaying a peer's copy of a third site
+    /// would make its data second hand, and its age unknowable.
+    pub(crate) peers: signals::SignalStore,
+
+    /// This site's scraped signals, as published to gateways and peers.
+    ///
+    /// Filled by the local scraper from what the provider scrape observed, and
+    /// read by the signals listener. Cloning it shares the same contents.
+    pub(crate) signals: signals::SignalStore,
 }
 
 impl OperatorCtx {
@@ -111,8 +134,282 @@ impl OperatorCtx {
             metrics_cache: Mutex::new(provider_metrics::MetricsCache::new()),
             admission_memory: Mutex::new(provider_admission::AdmissionMemory::default()),
             last_seeds: std::sync::Mutex::new(HashMap::new()),
+            peer_identities: signals::PeerIdentities::new(),
+            peers: signals::SignalStore::new(),
+            signals: signals::SignalStore::new(),
         }
     }
+
+    /// A handle to what this site publishes, for the signals listener.
+    #[must_use]
+    pub fn signals(&self) -> signals::SignalStore {
+        self.signals.clone()
+    }
+
+    /// A handle to what peers publish, for the signals listener and poller.
+    #[must_use]
+    pub fn peers(&self) -> signals::SignalStore {
+        self.peers.clone()
+    }
+
+    /// A handle to who may read, for the signals listener and poller.
+    #[must_use]
+    pub fn peer_identities(&self) -> signals::PeerIdentities {
+        self.peer_identities.clone()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Signals (polling-metrics-signals feature)
+// ---------------------------------------------------------------------------
+
+/// Label key for this site's region, read from `GRID_SITE_REGION`.
+const SITE_REGION_LABEL: &str = "topology.grid.praxis-proxy.io/region";
+/// Label key for this site's zone, read from `GRID_SITE_ZONE`.
+const SITE_ZONE_LABEL: &str = "topology.grid.praxis-proxy.io/zone";
+
+/// The labels a local consumer reads as, which are this site's own.
+///
+/// A target whose `accessPolicy.siteSelector` this site does not satisfy is
+/// withheld from the local reader just as it is from a peer, so the listener
+/// fails closed rather than serving the co-located gateway a target no site may
+/// route to. Empty when neither topology variable is set, which restricts the
+/// local reader to unrestricted targets.
+#[must_use]
+pub fn local_site_labels() -> std::collections::BTreeMap<String, String> {
+    let mut labels = std::collections::BTreeMap::new();
+    for (key, var) in [
+        (SITE_REGION_LABEL, "GRID_SITE_REGION"),
+        (SITE_ZONE_LABEL, "GRID_SITE_ZONE"),
+    ] {
+        if let Ok(value) = std::env::var(var) {
+            let value = value.trim();
+            if !value.is_empty() {
+                labels.insert(key.to_owned(), value.to_owned());
+            }
+        }
+    }
+    labels
+}
+
+/// How long a published site signal is served before it expires.
+///
+/// Several scrape intervals, so a couple of missed scrapes do not erase what is
+/// known; absence, not a stale flag, is what tells a reader a writer stopped.
+fn site_signals_ttl() -> Duration {
+    let secs = std::env::var("GRID_SIGNALS_TTL_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(30);
+    Duration::from_secs(secs.max(1))
+}
+
+/// Scrape this site's providers once and publish the coarse signals observed.
+///
+/// Called from its own loop rather than from reconcile. Reconcile runs on an
+/// interval sized for declarations, two orders of magnitude slower than these
+/// values move; driving publication from it would leave a reader re-reading one
+/// observation for minutes.
+///
+/// # Errors
+///
+/// Returns [`OperatorError`] when providers or sites cannot be listed.
+pub async fn refresh_signals(ctx: &OperatorCtx, client: &Client, network_name: &str) -> Result<(), OperatorError> {
+    let providers = list_all_inference_providers(client).await?;
+    ctx.signals.set_access(signal_access(&providers));
+    Box::pin(register_peers(ctx, client)).await?;
+    let collected = provider_metrics::collect_provider_signals(network_name, &providers, Some(client)).await;
+    publish_signals(ctx, collected);
+    Ok(())
+}
+
+/// Refresh who may read from the currently approved sites.
+async fn register_peers(ctx: &OperatorCtx, client: &Client) -> Result<(), OperatorError> {
+    let sites = list_all_grid_sites(client).await?;
+    ctx.peer_identities.set(peer_identities(&sites));
+    Ok(())
+}
+
+/// What this site holds about each peer it knows.
+///
+/// Keyed by `GridSite` name, which is the name a peer's certificate carries in
+/// its DNS SAN. The SAN survives renewal, so a peer stays named through a key
+/// rotation. `status` is deliberately not read: it is populated from gossip,
+/// and a member could advertise its own certificate under another site's name.
+/// The labels are the local object's for the same reason.
+fn peer_identities(sites: &[GridSite]) -> std::collections::BTreeMap<String, signals::PeerRecord> {
+    sites
+        .iter()
+        .filter_map(|site| {
+            let name = site.metadata.name.clone()?;
+            let record = signals::PeerRecord {
+                labels: site.metadata.labels.clone().unwrap_or_default(),
+                pins: site
+                    .spec
+                    .trust
+                    .as_ref()
+                    .and_then(|trust| trust.canonical_fingerprints.clone())
+                    .unwrap_or_default(),
+            };
+            Some((name, record))
+        })
+        .collect()
+}
+
+/// What a reader must satisfy to be served each provider's signals.
+///
+/// `accessPolicy.siteSelector` says who may route to a provider, and reading
+/// its load is not a wider right than using it, so the same selector bounds
+/// both.
+fn signal_access(providers: &[InferenceProvider]) -> signals::AccessMap {
+    providers
+        .iter()
+        .filter_map(|provider| {
+            let target = routing_overlay::routing_identity(provider)?.to_owned();
+            let required = provider.spec.access_policy.site_selector.match_labels.clone();
+            (!required.is_empty()).then_some((target, vec![required]))
+        })
+        .collect()
+}
+
+/// Attribute this cycle's observations to this site and publish them.
+///
+/// The site label is applied here because this is where the membership identity
+/// is known. A provider that set it itself keeps its value under an exported
+/// name, so what a reader sees as the origin is what this site says it is.
+fn publish_signals(ctx: &OperatorCtx, collected: HashMap<String, Vec<signals::Observation>>) {
+    let site = ctx.swim.as_ref().map(|s| s.site_name().to_owned()).unwrap_or_default();
+    let attributed = collected
+        .into_iter()
+        .map(|(provider, observations)| {
+            let attributed = signals::attribute(observations, &site, &provider);
+            (provider, attributed)
+        })
+        .collect();
+    ctx.signals.refresh(attributed, site_signals_ttl());
+}
+
+/// Client TLS for polling peer operators, built from the network's own trust.
+///
+/// The same CA and site identity the gateways already use between sites, so a
+/// peer proves which site it is rather than only that it holds a key the mesh
+/// shares.
+///
+/// # Errors
+///
+/// `Ok(None)` when the network declares no TLS. `Err` when the referenced
+/// Secrets are declared but missing or unusable, so a caller can fail closed
+/// rather than poll in plaintext.
+pub async fn peer_tls_config(
+    network: &GridNetwork,
+    client: &Client,
+) -> Result<Option<Arc<signals::PeerTlsMaterial>>, String> {
+    let (Some(ca), Some(site)) = (&network.spec.tls.ca_secret_ref, &network.spec.tls.site_secret_ref) else {
+        return Ok(None);
+    };
+    let ca_pem = read_signals_pem(client, ca, "ca.crt").await?;
+    let cert_pem = read_signals_pem(client, site, "tls.crt").await?;
+    let key_pem = read_signals_pem(client, site, "tls.key").await?;
+    Ok(Some(Arc::new(signals::PeerTlsMaterial {
+        ca: ca_pem,
+        identity: Some(signals::PeerClientIdentity {
+            cert: cert_pem,
+            key: zeroize::Zeroizing::new(key_pem),
+        }),
+    })))
+}
+
+/// TLS for the signals listener, from the same material peers dial with.
+///
+/// Client auth is optional on purpose: the co-located gateway connects with
+/// this site's own certificate and a peer presents its own, and that difference
+/// is what the scope rule reads.
+///
+/// # Errors
+///
+/// `Ok(None)` when the network declares no TLS. `Err` when the configured
+/// material cannot be read or parsed, so the listener fails closed rather than
+/// serving every caller unauthenticated.
+pub async fn signals_server_config(
+    network: &GridNetwork,
+    client: &Client,
+) -> Result<Option<Arc<rustls::ServerConfig>>, String> {
+    let (Some(ca), Some(site)) = (&network.spec.tls.ca_secret_ref, &network.spec.tls.site_secret_ref) else {
+        return Ok(None);
+    };
+    let ca_pem = read_signals_pem(client, ca, "ca.crt").await?;
+    let cert_pem = read_signals_pem(client, site, "tls.crt").await?;
+    let key_pem = read_signals_pem(client, site, "tls.key").await?;
+    build_signals_server_config(&ca_pem, &cert_pem, &key_pem).map(Some)
+}
+
+/// This site's own certificate fingerprint, for recognising its own workloads.
+///
+/// The gateway shares the site's identity: it presents the same certificate the
+/// operator serves with, so recognising that key needs no declaration.
+///
+/// # Errors
+///
+/// Returns a message when the configured material cannot be read or parsed.
+pub async fn signals_own_key(network: &GridNetwork, client: &Client) -> Result<Option<String>, String> {
+    use rustls::pki_types::{CertificateDer, pem::PemObject as _};
+
+    let Some(site) = &network.spec.tls.site_secret_ref else {
+        return Ok(None);
+    };
+    let cert_pem = read_signals_pem(client, site, "tls.crt").await?;
+    let der = CertificateDer::pem_slice_iter(&cert_pem)
+        .next()
+        .transpose()
+        .map_err(|e| format!("signals TLS: certificate is not valid PEM: {e}"))?;
+    Ok(der.map(|der| signals::leaf_fingerprint(&der)))
+}
+
+/// Read one PEM value out of a Secret.
+///
+/// The structured `TlsFailureReason` is dropped deliberately: every signals
+/// consumer only logs the message and fails closed, none sets a CRD
+/// `status.reason`. Return `OperatorError`/`TlsFailureReason` instead the day a
+/// consumer needs to branch on the cause.
+async fn read_signals_pem(
+    client: &Client,
+    secret: &crate::crd::grid_network::SecretRef,
+    key: &str,
+) -> Result<Vec<u8>, String> {
+    crate::resources::endpoint_tls::read_secret_bytes_for_tls(client, secret, key, "signals", "signals TLS")
+        .await
+        .map_err(|(_, message)| message)
+}
+
+/// Assemble the listener config from PEM material.
+///
+/// Split from the loader so the assembly is testable without a cluster.
+fn build_signals_server_config(
+    ca_pem: &[u8],
+    cert_pem: &[u8],
+    key_pem: &[u8],
+) -> Result<Arc<rustls::ServerConfig>, String> {
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject as _};
+
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in CertificateDer::pem_slice_iter(ca_pem) {
+        let cert = cert.map_err(|e| format!("signals TLS: CA is not valid PEM: {e}"))?;
+        roots.add(cert).map_err(|e| format!("signals TLS: CA rejected: {e}"))?;
+    }
+    let chain = CertificateDer::pem_slice_iter(cert_pem)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("signals TLS: certificate is not valid PEM: {e}"))?;
+    let key = PrivateKeyDer::from_pem_slice(key_pem).map_err(|e| format!("signals TLS: key is not valid PEM: {e}"))?;
+
+    let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
+        .allow_unauthenticated()
+        .build()
+        .map_err(|e| format!("signals TLS: client verifier: {e}"))?;
+    rustls::ServerConfig::builder()
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(chain, key)
+        .map(Arc::new)
+        .map_err(|e| format!("signals TLS: server config: {e}"))
 }
 
 // ---------------------------------------------------------------------------
