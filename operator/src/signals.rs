@@ -27,7 +27,11 @@ use crate::metrics_scraper::{MetricsScrapeError, scrape_metrics};
 /// gateway hit the same route, differing only by the certificate they present
 /// and how often they poll. Scope is decided from that certificate, never from
 /// the path, so there is no second path to widen a caller's view.
-pub const SIGNALS_PATH: &str = "/grid/v1/signals";
+///
+/// Singular `site`, not `sites`: the segment is not a collection to select one
+/// of many, it is this site serving its own rollup. Which site a caller reads
+/// as is its own mTLS certificate identity, never a path parameter.
+pub const SIGNALS_PATH: &str = "/v1/site/signals";
 
 /// Label naming the site a sample was observed at.
 pub const SITE_LABEL: &str = "grid_site";
@@ -1096,13 +1100,13 @@ mod tests {
         // answered with an empty body and no site ever relayed another.
         let sites = vec![PeerSite {
             name: "pool-b".to_owned(),
-            url: "http://10.0.0.2:9091/grid/v1/signals".to_owned(),
+            url: "http://10.0.0.2:9091/v1/site/signals".to_owned(),
             pins: Vec::new(),
         }];
         let urls = peer_urls(&sites, "");
         assert_eq!(
             urls.first().map(|(_, u, _)| u.as_str()),
-            Some("http://10.0.0.2:9091/grid/v1/signals"),
+            Some("http://10.0.0.2:9091/v1/site/signals"),
             "the whole site is asked for, with no target"
         );
     }
@@ -1111,13 +1115,13 @@ mod tests {
     fn requested_signal_names_still_reach_the_peer() {
         let sites = vec![PeerSite {
             name: "pool-b".to_owned(),
-            url: "http://10.0.0.2:9091/grid/v1/signals".to_owned(),
+            url: "http://10.0.0.2:9091/v1/site/signals".to_owned(),
             pins: Vec::new(),
         }];
         let urls = peer_urls(&sites, "collect[]=queue");
         assert_eq!(
             urls.first().map(|(_, u, _)| u.as_str()),
-            Some("http://10.0.0.2:9091/grid/v1/signals?collect[]=queue")
+            Some("http://10.0.0.2:9091/v1/site/signals?collect[]=queue")
         );
     }
 
