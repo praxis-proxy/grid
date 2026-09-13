@@ -51,6 +51,9 @@ log:
   # -- RUST_LOG filter directive.
   level: "info"
 
+# Signal propagation mode is grid-wide configuration, set on the GridNetwork
+# via the grid-site chart's signalTransport value, not on the operator.
+
 # -- Metrics and health server configuration.
 metrics:
   # -- Metrics server bind address (host:port).

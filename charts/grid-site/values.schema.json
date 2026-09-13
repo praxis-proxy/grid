@@ -112,6 +112,17 @@
             }
           }
         },
+        "signalTransport": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode"],
+          "properties": {
+            "mode": {
+              "type": "string",
+              "enum": ["gossip", "poll"]
+            }
+          }
+        },
         "placementPolicy": {
           "type": "object",
           "additionalProperties": false,

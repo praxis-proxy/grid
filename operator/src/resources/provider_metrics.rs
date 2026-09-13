@@ -105,21 +105,17 @@ pub(crate) struct CollectedMetrics {
 }
 
 // ---------------------------------------------------------------------------
-// Signals collection (polling-metrics-signals feature)
+// Signals collection (poll mode)
 // ---------------------------------------------------------------------------
 
 /// Scrape each provider's endpoint and keep only its configured coarse signals.
 ///
-/// A sibling of [`collect_provider_metrics_with_refresh_interval`], which parses
-/// the same text into [`scoring::BackendMetrics`] for local scoring. The signals
-/// path keeps the provider's own exposition, narrowed to the metric names its
-/// `metricsConfig.signalNames` declares, so a reader scores from the source
-/// series and the wire carries a coarse rollup rather than the full `/metrics`
-/// firehose.
-///
-/// Fails closed on TLS: a provider whose configured TLS will not resolve is
-/// skipped, never scraped in plaintext. A scrape that fails leaves the last
-/// value to expire on its own rather than erasing it.
+/// Sibling of [`collect_provider_metrics_with_refresh_interval`], which parses
+/// the same text into [`scoring::BackendMetrics`] for local scoring. This keeps
+/// the provider's own exposition narrowed to its declared `signalNames`, so the
+/// wire carries a coarse rollup rather than the full `/metrics` firehose. Fails
+/// closed on TLS: a provider whose TLS will not resolve is skipped, never
+/// scraped in plaintext. A failed scrape leaves the last value to expire.
 pub(crate) async fn collect_provider_signals(
     network_name: &str,
     providers: &[InferenceProvider],

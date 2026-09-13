@@ -1,11 +1,9 @@
-//! Cooperative shutdown.
+//! Shutdown signal: a watch channel workers observe to unwind in-flight work
+//! on purpose, rather than being dropped mid-await.
 //!
-//! Dropping a future stops it wherever it happens to be, which for a poll in
-//! flight leaves an incremented gauge and an outcome nobody recorded. Work that
-//! holds state across an await needs to see the signal and unwind on purpose.
-//!
-//! A watch channel rather than another crate's token: tokio already has it, and
-//! the semantics fit. Many readers, latest wins, late readers still see it.
+//! Dropping a future stops it wherever it sits, leaving a poll's gauge
+//! incremented and its outcome unrecorded. A watch channel fits: tokio ships
+//! it, the latest value wins, and a late reader still sees it.
 
 use tokio::sync::watch;
 
@@ -50,8 +48,7 @@ impl Drop for Trigger {
 impl Shutdown {
     /// A shutdown that never fires, for callers that do not manage a lifecycle.
     ///
-    /// Tests and one-shot tools do not need a signal, and making them invent a
-    /// trigger they will never pull would be worse than saying so here.
+    /// Tests and one-shot tools have no signal to give and should not invent one.
     #[must_use]
     pub fn never() -> Self {
         let (_, rx) = watch::channel(false);
@@ -69,18 +66,8 @@ impl Shutdown {
     /// Safe to race in a `select!`: it holds nothing across the await, so losing
     /// the race costs nothing and the arm can be polled again.
     pub async fn triggered(&self) {
-        let mut rx = self.rx.clone();
-        // The borrow guard is not held across the await, which would deadlock
-        // the sender.
-        if *rx.borrow() {
-            return;
-        }
-        // A send error means every sender is gone, which is itself shutdown.
-        while rx.changed().await.is_ok() {
-            if *rx.borrow() {
-                return;
-            }
-        }
+        // Err means every sender is gone, which is itself shutdown.
+        drop(self.rx.clone().wait_for(|&fired| fired).await);
     }
 }
 

@@ -67,7 +67,9 @@ use operator::{
         grid_site, inference_provider,
     },
     crd::{
-        agent_tool_provider::AgentToolProvider, grid_network::GridNetwork, grid_site::GridSite,
+        agent_tool_provider::AgentToolProvider,
+        grid_network::{GridNetwork, SignalMode},
+        grid_site::GridSite,
         inference_provider::InferenceProvider,
     },
     gateway,
@@ -95,7 +97,7 @@ async fn main() {
     // `InferenceProvider`'s probe (`inference_provider.rs`) builds a
     // `hyper-rustls` client via `.with_native_roots()`, which relies on
     // `rustls` auto-detecting a single process-wide `CryptoProvider`. The
-    // `AgentToolProvider` MCP probe (PR 2 of grid#41) links in `reqwest`
+    // `AgentToolProvider` MCP probe links in `reqwest`
     // (via `rmcp`'s reqwest-backed transport) using its `rustls-no-provider`
     // feature specifically to avoid pulling in `aws-lc-rs` alongside `ring`
     // (see the workspace `Cargo.toml` comment on the `reqwest`/`rmcp`
@@ -135,9 +137,16 @@ async fn main() {
         ));
     }
 
-    let signals_enabled = config.polling_metrics_signals;
+    let signal_mode = match resolve_signal_mode(&client).await {
+        Ok(mode) => mode,
+        Err(error) => {
+            tracing::error!(%error, "failed to resolve signal transport");
+            std::process::exit(1);
+        },
+    };
+    let signals_enabled = matches!(signal_mode, SignalMode::Poll);
     let swim_for_poller = swim.clone();
-    let ctx = Arc::new(OperatorCtx::new(client.clone(), swim, signals_enabled));
+    let ctx = Arc::new(OperatorCtx::new(client.clone(), swim, signal_mode));
 
     // A round of peer polls can be in flight when the pod is told to terminate;
     // the trigger lets it stand down cleanly rather than being dropped mid-await.
@@ -178,6 +187,38 @@ async fn main() {
 
     if let Err(e) = result {
         tracing::error!(error = %e, "controller error");
+    }
+}
+
+/// Resolve the grid-wide signal mode from the sole `GridNetwork` at startup.
+///
+/// One operator serves one grid, so more than one `GridNetwork` fails loud
+/// rather than picking a mode for a process-global serve and poll path. Absent
+/// defaults to gossip. Read once, so a change needs an operator restart.
+async fn resolve_signal_mode(client: &Client) -> Result<SignalMode, String> {
+    let networks: Api<GridNetwork> = Api::all(client.clone());
+    let modes: Vec<SignalMode> = networks
+        .list(&kube::api::ListParams::default())
+        .await
+        .map_err(|e| format!("listing GridNetworks: {e}"))?
+        .items
+        .iter()
+        .map(|n| n.spec.signal_transport.as_ref().map(|t| t.mode).unwrap_or_default())
+        .collect();
+    match modes.as_slice() {
+        [] => {
+            tracing::info!("no GridNetwork at startup; signals default to gossip");
+            Ok(SignalMode::default())
+        },
+        [mode] => {
+            tracing::info!(?mode, "resolved grid-wide signal transport");
+            Ok(*mode)
+        },
+        many => Err(format!(
+            "multiple GridNetworks unsupported: found {}; a process-global signals serve/poll path \
+             cannot serve more than one grid mode",
+            many.len()
+        )),
     }
 }
 
@@ -660,25 +701,20 @@ async fn health_handler() -> &'static str {
 }
 
 // ---------------------------------------------------------------------------
-// Signals serving and peer polling (polling-metrics-signals feature)
+// Signals serving and peer polling (poll mode)
 // ---------------------------------------------------------------------------
 //
-// PR1 wires the mTLS serve path and the peer poller behind the opt-in flag and
-// folds the rollup onto one wire path. It is additive: when the flag is on this
-// site also serves and polls signals; the SWIM-carried signals and local
-// scoring paths are untouched.
-//
-// PR2 SEAM: commit 8b25c3a ("take signals out of gossip and out of the
-// overlay") is where the flag also *stops* carrying metrics signals through
-// SWIM gossip and *disables* local scoring. That gating is deliberately NOT in
-// this PR. It attaches in the GridNetwork reconcile/gossip path, not here.
+// Under poll mode this site serves the coarse rollup over mTLS and polls its
+// peers; the gossip-carried signals and local scoring paths are untouched here.
+// Poll mode also stops carrying metrics through SWIM gossip and turns off local
+// scoring, but that gating lives in the GridNetwork reconcile path, not here.
 
 /// How often the listener and poller re-read their own certificate.
 ///
 /// Material rarely arrives with the process: cert-manager writes the Secret
-/// after the operator rolls and rewrites it on renewal. Resolving once at
-/// startup left a listener that came up early stuck without TLS for the process
-/// lifetime, and one that came up after a renewal serving the old key.
+/// after the operator rolls and rewrites it on renewal. Re-reading keeps a
+/// listener that came up early from being stuck without TLS, and one that came
+/// up before a renewal from serving the old key.
 const SIGNALS_TLS_POLL: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Trigger cooperative shutdown on the first termination signal.
@@ -1157,10 +1193,10 @@ impl PeerPoller {
         tracing::info!(
             self.port,
             interval_secs = self.interval.as_secs(),
-            source = source.name(),
+            source = "poll",
             "peer signals poller started"
         );
-        self.poll_until_changed(source.as_ref(), material_changed(self.client.clone(), own_key))
+        self.poll_until_changed(&source, material_changed(self.client.clone(), own_key))
             .await;
         true
     }
@@ -1177,7 +1213,7 @@ impl PeerPoller {
     /// Poll every interval until this site's material changes, or shutdown.
     async fn poll_until_changed(
         &self,
-        source: &dyn operator::signals::PeerSignals,
+        source: &operator::signals::PollPeers,
         changed: impl Future<Output = ()> + Send,
     ) {
         let mut ticker = tokio::time::interval(self.interval);
@@ -1198,7 +1234,7 @@ impl PeerPoller {
     }
 
     /// Collect from every alive peer and replace what is published for them.
-    async fn poll_once(&self, source: &dyn operator::signals::PeerSignals) {
+    async fn poll_once(&self, source: &operator::signals::PollPeers) {
         // A refusal is symmetric: one we will not answer is one we do not read.
         let identities = self.ctx.peer_identities();
         let snapshot = self.swim.snapshot();
@@ -1222,12 +1258,9 @@ impl PeerPoller {
 }
 
 /// Build the peer poller source from verified TLS material, or `None` when absent.
-async fn peer_source(
-    client: &Client,
-    shutdown: operator::shutdown::Shutdown,
-) -> Option<Box<dyn operator::signals::PeerSignals>> {
+async fn peer_source(client: &Client, shutdown: operator::shutdown::Shutdown) -> Option<operator::signals::PollPeers> {
     let tls = peer_tls(client).await?;
-    Some(Box::new(operator::signals::PollPeers {
+    Some(operator::signals::PollPeers {
         timeout: std::time::Duration::from_secs(parse_env_or("GRID_SIGNALS_PEER_TIMEOUT_SECS", 5_u64)),
         tls: Some(tls),
         collect: parse_peer_collect(),
@@ -1237,7 +1270,7 @@ async fn peer_source(
         budget: std::time::Duration::from_secs(parse_env_or("GRID_SIGNALS_PEER_BUDGET_SECS", 10_u64)),
         slow_after: std::time::Duration::from_millis(parse_env_or("GRID_SIGNALS_PEER_SLOW_MS", 1_000_u64)),
         shutdown,
-    }))
+    })
 }
 
 /// How long a polled peer signal is served before it expires.

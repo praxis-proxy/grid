@@ -33,7 +33,7 @@ pub mod resources;
 pub use resources::trust_bundle::sha256_fingerprint;
 /// Provider gateway address self-discovery.
 pub mod gateway;
-/// Cooperative shutdown, so work crossing a network can be told to stop.
+/// Shutdown signal for unwinding in-flight work cleanly.
 pub mod shutdown;
 /// Provider signals, served as a multi-target exporter.
 pub mod signals;

@@ -120,10 +120,9 @@ static PEER_RESPONSE_BYTES: LazyLock<IntCounterVec> = LazyLock::new(|| {
 
 /// Whether this site can currently collect from each peer.
 ///
-/// The design requires this: without it a peer that has nothing to report and a
-/// peer this site cannot reach look identical to anyone reading the exposition,
-/// and a routing decision made in that ambiguity cannot be explained after the
-/// fact.
+/// Without it, a peer with nothing to report and a peer this site cannot reach
+/// look identical in the exposition, and a routing decision made in that
+/// ambiguity cannot be explained afterward.
 static PEER_COLLECTION_UP: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     IntGaugeVec::new(
         Opts::new("grid_collection_up", "Whether the last poll of this peer succeeded"),

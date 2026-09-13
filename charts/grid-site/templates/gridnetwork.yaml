@@ -58,6 +58,12 @@ spec:
     mode: {{ .mode | quote }}
   {{- end }}
   {{- end }}
+  {{- with .Values.gridNetwork.signalTransport }}
+  {{- if .mode }}
+  signalTransport:
+    mode: {{ .mode | quote }}
+  {{- end }}
+  {{- end }}
   {{- with .Values.gridNetwork.metricsRefreshInterval }}
   {{- if . }}
   metricsRefreshInterval: {{ . | quote }}

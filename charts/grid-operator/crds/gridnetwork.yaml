@@ -412,6 +412,25 @@ spec:
                   required:
                     - mode
                   type: object
+                signalTransport:
+                  description: |-
+                    Grid-wide signal transport.
+
+                    **Default (absent):** `gossip`, the established SWIM and CRDT overlay
+                    path. Set `mode: poll` to propagate signals by direct mTLS pull instead.
+                    The mode is read at operator start, so a change requires an operator
+                    restart.
+                  nullable: true
+                  properties:
+                    mode:
+                      description: Signal dissemination mode.
+                      enum:
+                        - gossip
+                        - poll
+                      type: string
+                  required:
+                    - mode
+                  type: object
                 staleCandidateTtlSeconds:
                   description: |-
                     Maximum age in seconds before a stale (`fresh=false`) remote routing

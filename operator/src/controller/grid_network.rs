@@ -27,7 +27,7 @@ use crate::{
     crd::{
         grid_network::{
             ConsumerConfig, ConsumerConfigPhase, ConsumerConfigStatus, GatewayRef, GridNetwork, GridNetworkPhase,
-            GridNetworkStatus, OverlayPhase, OverlayRevisionStatus, TenantBudgetStatus, TransportMode,
+            GridNetworkStatus, OverlayPhase, OverlayRevisionStatus, SignalMode, TenantBudgetStatus, TransportMode,
         },
         grid_site::{GridSite, GridSitePhase, GridSiteStatus},
         inference_provider::InferenceProvider,
@@ -98,36 +98,22 @@ pub struct OperatorCtx {
     /// after async DNS resolution and the SWIM channel announcement.
     pub(crate) last_seeds: std::sync::Mutex<HashMap<String, Vec<SocketAddr>>>,
 
-    /// Who may read, keyed by the fingerprint of the certificate they present.
-    ///
-    /// A site generates its own keypair and publishes the certificate. Binding
-    /// that certificate to a name and a set of labels is what an approved
-    /// `GridSite` does, so identity is registered rather than issued. Read by
-    /// the signals listener to decide a caller's scope and by the peer poller
-    /// to skip a peer this site refuses.
+    /// Who may read the signals endpoint, keyed by presented-cert fingerprint.
+    /// Set by reconcile from each `GridSite`'s trust pins.
     pub(crate) peer_identities: signals::PeerIdentities,
 
-    /// Signals polled from peer operators, keyed by their site name.
-    ///
-    /// Kept apart from this site's own so that a scoped request can answer with
-    /// only what this site observed. Relaying a peer's copy of a third site
-    /// would make its data second hand, and its age unknowable.
+    /// Signals polled from peers, keyed by site name. Kept apart from local so a
+    /// scoped read returns only what this site observed, never a second-hand copy.
     pub(crate) peers: signals::SignalStore,
 
-    /// This site's scraped signals, as published to gateways and peers.
-    ///
-    /// Filled by the local scraper from what the provider scrape observed, and
-    /// read by the signals listener. Cloning it shares the same contents.
+    /// This site's scraped signals, served to gateways and peers.
     pub(crate) signals: signals::SignalStore,
 
-    /// Whether the polling-metrics-signals feature is enabled.
+    /// Signal transport resolved once at startup: gossip or poll.
     ///
-    /// When set, load travels the signals path: the operator stops carrying
-    /// metric samples in gossip and stops scoring the overlay from them, so a
-    /// scrape no longer mutates replicated state and the gateway decides which
-    /// candidate takes a request from the signal it polls. Unset is the default
-    /// path, unchanged: signals ride gossip and the operator scores locally.
-    pub(crate) polling_metrics_signals: bool,
+    /// Under poll the operator stops carrying metrics in gossip and scoring the
+    /// overlay, and the gateway ranks from the signal it pulls instead.
+    pub(crate) signal_mode: SignalMode,
 }
 
 impl OperatorCtx {
@@ -136,7 +122,7 @@ impl OperatorCtx {
     /// This is the canonical constructor used by the operator binary so that
     /// the internal metrics cache type does not need to be exported from the
     /// library crate.
-    pub fn new(client: Client, swim: Option<Arc<SwimHandle>>, polling_metrics_signals: bool) -> Self {
+    pub fn new(client: Client, swim: Option<Arc<SwimHandle>>, signal_mode: SignalMode) -> Self {
         Self {
             client,
             swim,
@@ -146,7 +132,7 @@ impl OperatorCtx {
             peer_identities: signals::PeerIdentities::new(),
             peers: signals::SignalStore::new(),
             signals: signals::SignalStore::new(),
-            polling_metrics_signals,
+            signal_mode,
         }
     }
 
@@ -170,7 +156,7 @@ impl OperatorCtx {
 }
 
 // ---------------------------------------------------------------------------
-// Signals (polling-metrics-signals feature)
+// Signals (poll mode)
 // ---------------------------------------------------------------------------
 
 /// Label key for this site's region, read from `GRID_SITE_REGION`.
@@ -549,6 +535,23 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
 
     info!(name, "reconciling GridNetwork");
 
+    // Mode is resolved once at start and never re-resolved live, so warn on a
+    // spec-versus-running divergence rather than diverge silently.
+    let desired = network
+        .spec
+        .signal_transport
+        .as_ref()
+        .map(|t| t.mode)
+        .unwrap_or_default();
+    if desired != ctx.signal_mode {
+        tracing::warn!(
+            network = name,
+            ?desired,
+            running = ?ctx.signal_mode,
+            "signalTransport.mode differs from the mode resolved at startup; restart the operator to apply"
+        );
+    }
+
     let client = &ctx.client;
     ensure_tls_secrets(&network, client).await?;
 
@@ -587,13 +590,13 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
     // List providers once; share between routing overlay rendering and CRDT publishing.
     let providers = list_all_inference_providers(client).await?;
     let requeue_interval = requeue_interval_for_network(&network, &providers)?;
-    // With the polling-metrics-signals feature, load travels the signals path:
+    // In poll mode, load travels the signals path:
     // the operator neither scrapes providers for scoring nor lets a metric
     // sample reach gossip or the overlay. An empty collection makes the overlay
     // score neutrally (no load-driven reordering, no ConfigMap churn per scrape)
     // and makes `publish_real_provider_state` carry no metrics into the gossiped
     // record, so a scrape no longer mutates replicated state.
-    let collected = if ctx.polling_metrics_signals {
+    let collected = if ctx.signal_mode == SignalMode::Poll {
         provider_metrics::CollectedMetrics::default()
     } else {
         provider_metrics::collect_provider_metrics_with_refresh_interval(
@@ -612,7 +615,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
     // metric on every render. With the feature on there are no live metrics, so
     // the strategy is `NoMetrics`: a provider present and not Unavailable is
     // offered, and the gateway picks among them from the signal it polls.
-    let scoring_strategy = if ctx.polling_metrics_signals {
+    let scoring_strategy = if ctx.signal_mode == SignalMode::Poll {
         crate::crd::grid_network::ScoringStrategy::NoMetrics
     } else {
         network

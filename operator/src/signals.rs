@@ -1,14 +1,11 @@
 //! Provider signals, collected by this operator and served for others to read.
 //!
-//! The operator already scrapes each provider to score it. This keeps what it
-//! parsed and serves it, so a peer or gateway reads a provider's signals
-//! without scraping it or holding its credentials.
-//!
-//! A multi-target exporter, not Prometheus federation: `target` picks one
-//! provider, `collect[]` picks signals by name.
-//!
-//! Held values expire rather than being marked stale, so absence is what says a
-//! writer stopped refreshing and no clock is compared against another's.
+//! The operator already scrapes each provider to score it; this keeps what it
+//! parsed and serves it, so a peer or gateway reads a provider's signals without
+//! scraping it or holding its credentials. A multi-target exporter, not
+//! Prometheus federation: `target` picks one provider, `collect[]` picks signals
+//! by name. Held values expire rather than being marked stale, so absence marks
+//! a stopped writer and no clock is compared against another's.
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -16,21 +13,15 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use futures::{StreamExt as _, future::BoxFuture};
+use futures::StreamExt as _;
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 
 use crate::metrics_scraper::{MetricsScrapeError, scrape_metrics};
 
-/// The single wire path the coarse rollup is served and polled on.
+/// The single mTLS path the coarse rollup is served and polled on.
 ///
-/// One mTLS path for both audiences: cross-site peers and the co-located
-/// gateway hit the same route, differing only by the certificate they present
-/// and how often they poll. Scope is decided from that certificate, never from
-/// the path, so there is no second path to widen a caller's view.
-///
-/// Singular `site`, not `sites`: the segment is not a collection to select one
-/// of many, it is this site serving its own rollup. Which site a caller reads
-/// as is its own mTLS certificate identity, never a path parameter.
+/// One path for peers and the local gateway. Scope comes from the caller's
+/// certificate, never the path, so no second path can widen a caller's view.
 pub const SIGNALS_PATH: &str = "/v1/site/signals";
 
 /// Label naming the site a sample was observed at.
@@ -46,8 +37,7 @@ fn is_aggregate_part(metric: &str) -> bool {
 
 /// One parsed sample, owned so labels can be attributed and ordering is stable.
 ///
-/// A `BTreeMap` rather than a hash map: label order then depends only on the
-/// labels, so two renders of the same sample are byte-identical.
+/// Labels are a `BTreeMap` so two renders of the same sample are byte-identical.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Observation {
     /// Metric name.
@@ -79,13 +69,11 @@ pub fn parse(text: &str) -> Vec<Observation> {
         .filter(|l| !l.trim_start().starts_with('#'))
         .filter_map(parse_sample)
         .filter(|o| {
-            // A counter relayed through a cache reports this process's restarts
-            // rather than the provider's, and an aggregate describes a
-            // distribution this operator did not observe and cannot recombine.
-            // Names catch the aggregates that arrive untyped.
+            // Gauges and untyped only: a relayed counter reports our restarts,
+            // and an aggregate we did not observe cannot be recombined. The name
+            // check catches aggregates that arrive untyped.
             matches!(types.get(o.metric.as_str()), None | Some(&("gauge" | "untyped")))
                 && !is_aggregate_part(&o.metric)
-                // The consumer ranks a non-finite score above every finite one.
                 && o.value.is_finite()
         })
         .collect()
@@ -93,10 +81,9 @@ pub fn parse(text: &str) -> Vec<Observation> {
 
 /// Parse one sample line: `name{label="v",...} value [timestamp]`.
 ///
-/// Written here rather than taken from a crate because the obvious ones match
-/// the name with `\w+`, which excludes the colon every vLLM metric uses, and
-/// delimit labels with `[^}]+`, which stops at a brace inside a quoted value.
-/// Both failures are silent: the line is skipped and the scrape looks short.
+/// Hand-written because common parsers match the name with `\w+` (excluding the
+/// colon in every vLLM metric) and delimit labels with `[^}]+` (stopping at a
+/// brace inside a quoted value); both drop the line silently.
 fn parse_sample(line: &str) -> Option<Observation> {
     let line = line.trim();
     let (metric, rest) = split_metric_name(line)?;
@@ -164,12 +151,9 @@ fn parse_label_value(s: &str) -> Option<(String, &str)> {
     }
 }
 
-/// Attach the labels this site is authoritative for.
-///
-/// A provider that already set one has its value preserved under an `exported_`
-/// name, which is what a scrape does when `honor_labels` is unset. Working on
-/// parsed labels rather than on text is what makes a duplicate label impossible
-/// to emit, and a duplicate would make a scraper reject the whole response.
+/// Attach the labels this site is authoritative for, preserving a provider's
+/// own value under an `exported_` name. Works on parsed labels so a duplicate
+/// label, which a scraper would reject, cannot be emitted.
 #[must_use]
 pub fn attribute(observations: Vec<Observation>, site: &str, provider: &str) -> Vec<Observation> {
     observations
@@ -192,9 +176,7 @@ struct Cached {
     /// Parsed samples, already attributed.
     samples: Arc<[Observation]>,
     /// When the value was collected, on this process's monotonic clock.
-    ///
-    /// Reported as `Age`, which is a duration rather than a time, so a reader
-    /// learns how old a value is without either clock being compared.
+    /// Reported as `Age` (a duration, not a time), so no two clocks are compared.
     collected_at: Instant,
     /// When this stops being served.
     expires_at: Instant,
@@ -205,15 +187,12 @@ struct Cached {
 pub struct SignalStore {
     /// Target to what is held for it.
     inner: Arc<RwLock<BTreeMap<String, Cached>>>,
-    /// Target to the selectors a reader must satisfy to be served it.
+    /// Maps each target to the selectors a reader must satisfy to be served it.
     ///
-    /// Every selector in the list applies, so routing permission and metrics
-    /// readability compose without either widening the other. Two selectors
-    /// demanding different values for one key deny everyone, which is what
-    /// asking for both should mean.
-    ///
-    /// Held apart from the samples because the two move at different rates: a
-    /// policy changes when its provider is edited, samples change every scrape.
+    /// Every selector applies, so routing permission and metric readability
+    /// compose without either widening the other. Held apart from the samples
+    /// because a policy changes only when its provider is edited, samples every
+    /// scrape.
     access: Arc<RwLock<AccessMap>>,
 }
 
@@ -236,21 +215,17 @@ pub struct PeerRecord {
     /// asserted its labels could assert past any policy written about it.
     pub labels: BTreeMap<String, String>,
 
-    /// Optional leaf fingerprints, from `spec.trust.canonicalFingerprints`.
+    /// Leaf fingerprints from `spec.trust.canonicalFingerprints`.
     ///
-    /// Empty is the normal case, and then the certificate's own name is what
-    /// identifies the caller. A pin narrows that to specific key material,
-    /// which is worth having where certificates are deliberately long lived and
-    /// a burden where they rotate, since every renewal changes the hash.
+    /// The caller's identity: a peer is whoever presents one of these. Empty
+    /// refuses the peer, so a site is served only once its pins are set.
     pub pins: Vec<String>,
 }
 
-/// Who may read, resolved from the certificate a caller presents.
+/// Who may read, keyed by site name.
 ///
-/// Keyed by site name, because that is what a certificate carries in its DNS
-/// SAN and what survives a renewal. Naming a caller therefore costs nothing
-/// when its key rotates, which is the difference between an identity and a
-/// maintenance burden.
+/// The name is the map key; a record's pins are what authorize a caller. A
+/// rotated key changes the pins, not the name, so the record survives renewal.
 #[derive(Clone, Debug, Default)]
 pub struct PeerIdentities {
     /// Site name to what is held for it.
@@ -280,11 +255,9 @@ impl PeerIdentities {
         held.get(site).map(|record| record.pins.clone()).unwrap_or_default()
     }
 
-    /// Whether this site refuses `site` outright.
-    ///
-    /// True when no record is held for the name, or the record refuses. Read
-    /// before polling as well as before serving, so a refusal stops traffic in
-    /// both directions.
+    /// Whether this site refuses `site` outright: no record, or a record with no
+    /// pins. Read before polling and before serving, so a refusal stops traffic
+    /// both ways.
     #[must_use]
     pub fn refuses(&self, site: &str) -> bool {
         let Ok(held) = self.inner.read() else {
@@ -295,28 +268,18 @@ impl PeerIdentities {
 
     /// Labels for a caller presenting `leaf_sha256`.
     ///
-    /// The declared key is the identity: a record names the fingerprints it will
-    /// accept, so a caller is whoever holds one of them. A key nobody declared
-    /// names nobody, which is what makes an unknown peer refused rather than
-    /// merely unprivileged.
-    ///
-    /// Preferred over reading a name out of the certificate because a stolen CA
-    /// can mint any name and cannot mint another site's key.
-    ///
-    /// Scans rather than indexes: a grid is sites, not endpoints, and the cost
-    /// is a handful of string comparisons on a connection that just completed a
-    /// TLS handshake.
+    /// A key nobody pinned names nobody, so an unknown peer is refused, not
+    /// merely unprivileged. Preferred over reading a name from the certificate
+    /// because a stolen CA can mint any name but not another site's key. Scans
+    /// rather than indexes: a grid is sites, not endpoints.
     #[must_use]
     pub fn resolve_by_key(&self, leaf_sha256: &str) -> Option<BTreeMap<String, String>> {
         let Ok(held) = self.inner.read() else {
             return None;
         };
-        let labels = held
-            .values()
+        held.values()
             .find(|record| record.pins.iter().any(|pin| pin == leaf_sha256))
-            .map(|record| record.labels.clone());
-        drop(held);
-        labels
+            .map(|record| record.labels.clone())
     }
 }
 
@@ -405,14 +368,11 @@ impl SignalStore {
 
     /// Render exposition for `target`, or for every target when it is `None`.
     ///
-    /// `reader` is the site labels the caller carries, established from the
-    /// connection rather than from a parameter. A target the reader may not see
-    /// is never rendered, so a denial withholds data rather than trimming it
-    /// afterwards. `collect` then narrows within what the reader is allowed,
-    /// which is why permission is read first and cannot be widened by asking.
-    ///
+    /// `reader` is the caller's site labels, from the connection not a parameter.
+    /// A denied target is never rendered, so permission withholds data rather
+    /// than trimming it after; `collect` narrows only within what is allowed.
     /// Returns the body and the age of its oldest value, so `Age` bounds the
-    /// whole response rather than describing it on average.
+    /// whole response.
     #[must_use]
     pub fn render(
         &self,
@@ -435,9 +395,8 @@ impl SignalStore {
             if denied.contains(name.as_str()) {
                 continue;
             }
-            // TTL is measured against a monotonic instant, immune to clock
-            // steps. Exposition wants epoch millis, so derive from the age
-            // rather than storing a wall clock that could move underneath us.
+            // TTL uses a monotonic instant; exposition wants epoch millis, so
+            // derive from the age rather than store a wall clock that can jump.
             let age = now.saturating_duration_since(held.collected_at);
             let collected_at_ms = wall_millis(now_wall, age);
             let mut used = false;
@@ -472,10 +431,7 @@ impl SignalStore {
 
 /// Render one observation as an exposition line, without a timestamp.
 fn render_sample(out: &mut String, o: &Observation, collected_at_ms: i64) {
-    // Written into the caller's buffer rather than returned. Building a string
-    // per label, collecting them, joining them and then formatting the result
-    // allocated once per label plus four more per sample, all of it discarded
-    // into a buffer that was going to be grown anyway.
+    // Written into the caller's buffer to avoid a per-label allocation.
     out.push_str(&o.metric);
     if !o.labels.is_empty() {
         out.push('{');
@@ -510,8 +466,7 @@ fn wall_millis(now: SystemTime, age: Duration) -> i64 {
 
 /// Escape a label value for exposition.
 fn escape_into(out: &mut String, value: &str) {
-    // One pass. The previous form ran replace three times, allocating a whole
-    // new string on each, for values that almost never contain any of them.
+    // Single pass, no intermediate allocation.
     for ch in value.chars() {
         match ch {
             '\\' => out.push_str(r"\\"),
@@ -531,11 +486,9 @@ pub struct PeerSite {
     pub url: String,
     /// Fingerprints this site declared for that peer.
     ///
-    /// The peer's certificate is verified against these rather than against the
-    /// name in the URL. Membership advertises an address and a certificate
-    /// carries a name, so the two rarely match, and the pin says the stronger
-    /// thing anyway: not that an authority signed for some name, but that this
-    /// is a key we wrote down.
+    /// The peer's certificate is verified against these, not the name in the
+    /// URL: a pin asserts a known key, not merely that some authority signed a
+    /// name (which need not match the advertised address anyway).
     pub pins: Vec<String>,
 }
 
@@ -569,29 +522,11 @@ where
 /// Everything outside the RFC 3986 unreserved set is escaped in a query value.
 const QUERY_VALUE: &AsciiSet = &NON_ALPHANUMERIC.remove(b'-').remove(b'_').remove(b'.').remove(b'~');
 
-/// Where another site's signals come from.
-///
-/// Grid replicates provider metrics through gossip today, and this design polls
-/// them instead. Both are ways of collecting the same data, so they sit behind
-/// one trait: choosing between them is configuration.
-pub trait PeerSignals: Send + Sync {
-    /// Name, as it would be written in configuration.
-    fn name(&self) -> &'static str;
-
-    /// Observations for each site, keyed by site name.
-    ///
-    /// A site that did not answer is absent rather than empty, so a caller can
-    /// tell silence from a site that genuinely has nothing to report.
-    fn collect<'poll>(&'poll self, sites: &'poll [PeerSite]) -> BoxFuture<'poll, BTreeMap<String, Vec<Observation>>>;
-}
-
 /// Why a poll ended, at the granularity a response differs by.
 ///
-/// Collapsing these into success and failure would leave the question that
-/// actually gets asked, why is this peer not being scored, unanswerable. A
-/// refused connection is a peer that is down. A TLS failure is a trust problem
-/// that will still be there in two hundred milliseconds. A 403 is the peer
-/// declining to answer a question it understood.
+/// Finer than success or failure, so "why is this peer not scored" is
+/// answerable: a refusal, a trust failure, and a 403 each call for a different
+/// response.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PollOutcome {
     /// The peer answered.
@@ -697,11 +632,9 @@ fn classify_transport(error: &(dyn std::error::Error + 'static)) -> PollOutcome 
 
 /// Delay before attempt `attempt`, counting the first retry as zero.
 ///
-/// Exponential, capped, and spread by a value derived from the peer's name
-/// rather than from a random source. Fifty sites that all failed on the same
-/// partition would otherwise retry in step and arrive together when it heals,
-/// which is the herd the whole design is trying not to build. Deriving the
-/// spread from the name decorrelates peers without making a run unrepeatable.
+/// Exponential and capped, spread by a value derived from the peer's name so
+/// peers that failed on one partition do not retry in step and herd when it
+/// heals. Deriving the spread from the name decorrelates peers repeatably.
 fn backoff(base: Duration, attempt: u32, peer: &str) -> Duration {
     let factor = 1_u32 << attempt.min(5);
     let scaled = base.saturating_mul(factor);
@@ -739,9 +672,8 @@ pub struct PeerTlsMaterial {
 
 /// A certificate and the key that goes with it.
 ///
-/// One type because the pair is the only legal shape: a certificate without
-/// its key cannot be presented, and the builder rejected the mixed case at
-/// runtime when the two were separate options.
+/// One type because the pair is the only legal shape: a certificate cannot be
+/// presented without its key.
 #[derive(Clone)]
 pub struct PeerClientIdentity {
     /// Certificate chain, PEM.
@@ -791,10 +723,8 @@ pub struct PollPeers {
     pub slow_after: Duration,
     /// Signal that the process is stopping.
     ///
-    /// A round can be in flight against a dozen peers when a pod is told to
-    /// terminate. Without this the only way to stop is to drop the future,
-    /// which stops it wherever it happens to be and leaves the accounting for
-    /// that poll half done.
+    /// Lets an in-flight round stand down cleanly; dropping the future instead
+    /// would stop it anywhere and leave a poll's accounting half done.
     pub shutdown: crate::shutdown::Shutdown,
 }
 
@@ -821,8 +751,8 @@ impl PollPeers {
     /// recorded either way, because a peer that is never reachable has to be
     /// distinguishable from one that has nothing to say.
     async fn poll_one(&self, peer: &str, url: &str, pins: &[String]) -> Option<String> {
-        // The guard owns the accounting, including the drop-mid-await path that
-        // used to leave the in-flight gauge counting a poll that had ended.
+        // The guard owns the accounting, including the drop-mid-await path where
+        // the in-flight gauge would otherwise count a poll that had ended.
         let mut guard = PollGuard::enter(peer, self.slow_after);
 
         // Once per peer, not per attempt: this parses a private key.
@@ -910,50 +840,44 @@ impl PollPeers {
         }
         (outcome, None)
     }
-}
 
-impl PeerSignals for PollPeers {
-    fn name(&self) -> &'static str {
-        "poll"
-    }
+    /// Observations for each site, keyed by site name.
+    ///
+    /// A site that did not answer is absent rather than empty, so a caller can
+    /// tell silence from a site that genuinely has nothing to report.
+    pub async fn collect(&self, sites: &[PeerSite]) -> BTreeMap<String, Vec<Observation>> {
+        let collect_query = self
+            .collect
+            .iter()
+            .map(|c| format!("collect[]={}", utf8_percent_encode(c, QUERY_VALUE)))
+            .collect::<Vec<_>>()
+            .join("&");
 
-    fn collect<'poll>(&'poll self, sites: &'poll [PeerSite]) -> BoxFuture<'poll, BTreeMap<String, Vec<Observation>>> {
-        Box::pin(async move {
-            let collect_query = self
-                .collect
-                .iter()
-                .map(|c| format!("collect[]={}", utf8_percent_encode(c, QUERY_VALUE)))
-                .collect::<Vec<_>>()
-                .join("&");
+        let fetches = peer_urls(sites, &collect_query)
+            .into_iter()
+            .map(|(peer, url, pins)| async move {
+                let body = self.poll_one(&peer, &url, &pins).await?;
+                let observations = retain_origin(parse(&body), &peer);
+                Some((peer, observations))
+            });
 
-            let fetches = peer_urls(sites, &collect_query)
-                .into_iter()
-                .map(|(peer, url, pins)| async move {
-                    let body = self.poll_one(&peer, &url, &pins).await?;
-                    let observations = retain_origin(parse(&body), &peer);
-                    Some((peer, observations))
-                });
-
-            // Bounded fan-out. A peer that fails is absent from the result
-            // rather than empty, so silence and nothing-to-report stay
-            // distinguishable to the store.
-            futures::stream::iter(fetches)
-                .buffer_unordered(self.concurrency.max(1))
-                .collect::<Vec<Option<(String, Vec<Observation>)>>>()
-                .await
-                .into_iter()
-                .flatten()
-                .collect()
-        })
+        // Bounded fan-out. A peer that fails is absent from the result
+        // rather than empty, so silence and nothing-to-report stay
+        // distinguishable to the store.
+        futures::stream::iter(fetches)
+            .buffer_unordered(self.concurrency.max(1))
+            .collect::<Vec<Option<(String, Vec<Observation>)>>>()
+            .await
+            .into_iter()
+            .flatten()
+            .collect()
     }
 }
 
 /// Owns the accounting for one poll, however that poll ends.
 ///
-/// A cancelled poll is recorded as cancelled rather than silently dropped,
-/// because a round that stopped because the process is stopping is not the same
-/// as a round that failed, and a graph that cannot tell them apart will show a
-/// deployment as an outage.
+/// A cancelled poll is recorded as cancelled, not dropped: a poll stopped by
+/// shutdown is not a failure, and conflating them shows a restart as an outage.
 struct PollGuard<'poll> {
     /// Peer being polled.
     peer: &'poll str,
@@ -995,9 +919,8 @@ impl<'poll> PollGuard<'poll> {
             bytes,
             self.slow_after,
         );
-        // Reachability is only claimed either way when the poll actually
-        // concluded. A cancelled poll learned nothing about the peer, and
-        // marking it down would turn a rolling restart into a false outage.
+        // Reachability is claimed only when the poll concluded: a cancelled
+        // poll learned nothing, and marking it down would fake an outage.
         if outcome != PollOutcome::Cancelled {
             crate::metrics::set_peer_collection_up(self.peer, outcome == PollOutcome::Ok, SystemTime::now());
         }
@@ -1096,8 +1019,8 @@ mod tests {
     #[test]
     fn a_peer_is_not_asked_for_a_target() {
         // target names one provider, and a peer serves from a store keyed by
-        // provider. Asking for a site by name matched nothing, so every peer
-        // answered with an empty body and no site ever relayed another.
+        // provider. A site name matches nothing, so the peer answers empty and
+        // no site relays another's data.
         let sites = vec![PeerSite {
             name: "pool-b".to_owned(),
             url: "http://10.0.0.2:9091/v1/site/signals".to_owned(),
@@ -1207,9 +1130,8 @@ mod tests {
 
     #[test]
     fn two_peers_failing_together_do_not_retry_together() {
-        // Fifty sites cut off by one partition would otherwise retry in step
-        // and arrive together when it heals, which is the herd the design is
-        // trying not to build.
+        // Peers cut off together would otherwise retry in step and herd when
+        // the partition heals.
         let base = Duration::from_millis(50);
         assert_ne!(
             backoff(base, 2, "east"),
@@ -1378,9 +1300,8 @@ mod tests {
 
     #[test]
     fn rotating_a_key_needs_the_record_updated() {
-        // The cost of the declared key being the identity, written down so it is
-        // a decision rather than a surprise. canonicalFingerprints takes two
-        // entries so an overlap can be declared before the switch.
+        // Rotating a key means updating the record. Two pins let an overlap be
+        // declared before the switch.
         let identities = PeerIdentities::new();
         identities.set(BTreeMap::from([(
             "site-c".to_owned(),

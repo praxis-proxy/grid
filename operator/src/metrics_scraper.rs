@@ -177,11 +177,8 @@ pub async fn scrape_metrics(
         })?
         .to_bytes();
 
-    // Vec::from reclaims the buffer when this Bytes uniquely owns it, which it
-    // does whenever the body arrived in one chunk or was aggregated into one.
-    // to_vec copied the whole body unconditionally, up to the megabyte cap,
-    // once per peer per round, to hand it straight to a validator that would
-    // have been happy to read it where it lay.
+    // Vec::from reclaims the buffer when this Bytes uniquely owns it (a body that
+    // arrived in one chunk), avoiding a copy of up to the full megabyte cap.
     String::from_utf8(Vec::from(body_bytes)).map_err(MetricsScrapeError::Encoding)
 }
 
@@ -354,14 +351,10 @@ fn pinned_verifier(
 
 /// Accepts a peer whose leaf certificate is one this site declared.
 ///
-/// Hostname verification is deliberately not performed. Membership advertises
-/// an IP and a site certificate carries a DNS name, so the two never match, and
-/// checking the name would add nothing once the exact key is known. The pin is
-/// the stronger statement: not "something the authority signed for this name"
-/// but "this key, which we wrote down".
-///
-/// This is the same rule the listener applies to callers, pointed the other
-/// way, so a site deals only with peers it has declared in both directions.
+/// Hostname verification is deliberately skipped: membership advertises an IP
+/// and a site certificate carries a DNS name, so the two never match, and the
+/// pin ("this key, which we wrote down") is the stronger statement anyway. The
+/// same rule the listener applies to callers, pointed the other way.
 #[derive(Debug)]
 pub(crate) struct PinnedPeer {
     /// Authorities the chain is verified against.
@@ -374,11 +367,9 @@ pub(crate) struct PinnedPeer {
 
 /// Decodes a declared fingerprint to the digest bytes it names.
 ///
-/// The CRD constrains these to lowercase hex, so the tolerance here is only so
-/// a hand-edited pin fails as a bad pin rather than as a rejected peer.
-/// Anything that is not 32 bytes of hex is an error: a pin that cannot be
-/// decoded can never match, and silently keeping it would refuse the peer for a
-/// reason nobody can see.
+/// The CRD constrains pins to lowercase hex. Anything not 32 bytes of hex is an
+/// error, because a pin that cannot decode can never match, and silently
+/// dropping it would refuse the peer for a reason nobody can see.
 fn decode_pin(pin: &str) -> Result<[u8; 32], MetricsScrapeError> {
     let hex: String = pin.chars().filter(|c| *c != ':').collect();
     let bytes: Vec<u8> = (0..hex.len())
@@ -1119,9 +1110,8 @@ mod pinned_peer_tests {
 
     #[test]
     fn a_declared_key_is_accepted_at_an_address_its_name_does_not_cover() {
-        // The whole design: a site is named by its key, so the cert's DNS SAN
-        // never has to match the address membership advertises. Verifying the
-        // chain through WebPkiServerVerifier would fail this on the name alone.
+        // A site is named by its key, so the cert's DNS SAN need not match the
+        // dialled address; the stock WebPkiServerVerifier would fail on the name.
         let (ca, site) = site();
         let pin = crate::signals::leaf_fingerprint(&leaf(&site));
         verify(&ca, &site, &[pin]).expect("a declared key is served at any address");

@@ -19,6 +19,11 @@ gridNetwork:
       minimumStateDuration: 10s
       recoveryHoldDown: 30s
     missingMetrics: existingOnly
+  # -- Grid-wide signal propagation mode: gossip (default) or poll. Omit for
+  # gossip (SWIM and CRDT overlay). poll propagates by direct mTLS pull. The
+  # operator reads this once at startup, so a change needs an operator restart.
+  # signalTransport:
+  #   mode: poll
 
 gridSite:
   name: ""

@@ -167,6 +167,35 @@ pub struct SelectionPolicyConfig {
     pub mode: SelectionMode,
 }
 
+/// How signals propagate across the sites of a grid.
+///
+/// The mode names the dissemination path, not the transport: SWIM membership
+/// runs in both modes. Only where the load signal travels changes.
+#[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SignalMode {
+    /// Propagate signals over the SWIM and CRDT dissemination overlay, with
+    /// local scoring on. The established behaviour.
+    #[default]
+    Gossip,
+    /// Propagate signals by direct mTLS pull of each peer's signals endpoint,
+    /// with local scoring off.
+    Poll,
+}
+
+/// Grid-wide signal transport.
+///
+/// A property of the grid, not of one operator: every site propagates the same
+/// way. Absent, the grid gossips, which is non-breaking. A mode change takes
+/// effect at operator start, so flipping it is an operator restart.
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct SignalTransportConfig {
+    /// Signal dissemination mode.
+    pub mode: SignalMode,
+}
+
 /// Explicit static provider-capacity placement strategy.
 #[derive(Clone, Copy, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -592,6 +621,15 @@ pub struct GridNetworkSpec {
     /// selection override and Praxis uses deterministic selection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selection_policy: Option<SelectionPolicyConfig>,
+
+    /// Grid-wide signal transport.
+    ///
+    /// **Default (absent):** `gossip`, the established SWIM and CRDT overlay
+    /// path. Set `mode: poll` to propagate signals by direct mTLS pull instead.
+    /// The mode is read at operator start, so a change requires an operator
+    /// restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal_transport: Option<SignalTransportConfig>,
 
     /// Optional static capacity-placement policy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2010,6 +2048,40 @@ mod tests {
             std::process::abort();
         };
         assert!(error.to_string().contains("unknown variant"));
+    }
+
+    #[test]
+    fn signal_transport_round_trips_and_rejects_unknown_mode() {
+        let spec: GridNetworkSpec = serde_json::from_value(serde_json::json!({
+            "seeds": [],
+            "signalTransport": { "mode": "poll" }
+        }))
+        .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(spec.signal_transport.map(|policy| policy.mode), Some(SignalMode::Poll));
+
+        // Absent policy resolves to the gossip default.
+        let bare: GridNetworkSpec =
+            serde_json::from_value(serde_json::json!({ "seeds": [] })).unwrap_or_else(|_| std::process::abort());
+        assert!(bare.signal_transport.is_none());
+        assert_eq!(SignalMode::default(), SignalMode::Gossip);
+
+        let Err(unknown_mode) = serde_json::from_value::<GridNetworkSpec>(serde_json::json!({
+            "seeds": [],
+            "signalTransport": { "mode": "not-a-mode" }
+        })) else {
+            std::process::abort();
+        };
+        assert!(unknown_mode.to_string().contains("unknown variant"));
+
+        // deny_unknown_fields: an extra key is rejected.
+        assert!(
+            serde_json::from_value::<GridNetworkSpec>(serde_json::json!({
+                "seeds": [],
+                "signalTransport": { "mode": "poll", "extra": true }
+            }))
+            .is_err(),
+            "unknown field in signalTransport must be rejected"
+        );
     }
 
     #[test]
