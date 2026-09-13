@@ -137,7 +137,7 @@ async fn main() {
 
     let signals_enabled = config.polling_metrics_signals;
     let swim_for_poller = swim.clone();
-    let ctx = Arc::new(OperatorCtx::new(client.clone(), swim));
+    let ctx = Arc::new(OperatorCtx::new(client.clone(), swim, signals_enabled));
 
     // A round of peer polls can be in flight when the pod is told to terminate;
     // the trigger lets it stand down cleanly rather than being dropped mid-await.

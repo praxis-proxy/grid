@@ -96,6 +96,7 @@ impl MetricsCache {
 }
 
 /// Metrics collected from a single scrape call, with scrape-level identity.
+#[derive(Default)]
 pub(crate) struct CollectedMetrics {
     /// Parsed metrics keyed by provider routing identity.
     pub(crate) metrics: HashMap<String, scoring::BackendMetrics>,

@@ -119,6 +119,15 @@ pub struct OperatorCtx {
     /// Filled by the local scraper from what the provider scrape observed, and
     /// read by the signals listener. Cloning it shares the same contents.
     pub(crate) signals: signals::SignalStore,
+
+    /// Whether the polling-metrics-signals feature is enabled.
+    ///
+    /// When set, load travels the signals path: the operator stops carrying
+    /// metric samples in gossip and stops scoring the overlay from them, so a
+    /// scrape no longer mutates replicated state and the gateway decides which
+    /// candidate takes a request from the signal it polls. Unset is the default
+    /// path, unchanged: signals ride gossip and the operator scores locally.
+    pub(crate) polling_metrics_signals: bool,
 }
 
 impl OperatorCtx {
@@ -127,7 +136,7 @@ impl OperatorCtx {
     /// This is the canonical constructor used by the operator binary so that
     /// the internal metrics cache type does not need to be exported from the
     /// library crate.
-    pub fn new(client: Client, swim: Option<Arc<SwimHandle>>) -> Self {
+    pub fn new(client: Client, swim: Option<Arc<SwimHandle>>, polling_metrics_signals: bool) -> Self {
         Self {
             client,
             swim,
@@ -137,6 +146,7 @@ impl OperatorCtx {
             peer_identities: signals::PeerIdentities::new(),
             peers: signals::SignalStore::new(),
             signals: signals::SignalStore::new(),
+            polling_metrics_signals,
         }
     }
 
@@ -577,24 +587,42 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
     // List providers once; share between routing overlay rendering and CRDT publishing.
     let providers = list_all_inference_providers(client).await?;
     let requeue_interval = requeue_interval_for_network(&network, &providers)?;
-    let collected = provider_metrics::collect_provider_metrics_with_refresh_interval(
-        name,
-        &providers,
-        &ctx.metrics_cache,
-        Instant::now(),
-        requeue_interval,
-        Some(client),
-    )
-    .await;
+    // With the polling-metrics-signals feature, load travels the signals path:
+    // the operator neither scrapes providers for scoring nor lets a metric
+    // sample reach gossip or the overlay. An empty collection makes the overlay
+    // score neutrally (no load-driven reordering, no ConfigMap churn per scrape)
+    // and makes `publish_real_provider_state` carry no metrics into the gossiped
+    // record, so a scrape no longer mutates replicated state.
+    let collected = if ctx.polling_metrics_signals {
+        provider_metrics::CollectedMetrics::default()
+    } else {
+        provider_metrics::collect_provider_metrics_with_refresh_interval(
+            name,
+            &providers,
+            &ctx.metrics_cache,
+            Instant::now(),
+            requeue_interval,
+            Some(client),
+        )
+        .await
+    };
     let raw_metrics = collected.metrics;
 
-    let scoring_strategy = network
-        .spec
-        .scoring_policy
-        .as_ref()
-        .map_or(crate::crd::grid_network::ScoringStrategy::NoMetrics, |policy| {
-            policy.strategy
-        });
+    // Admission is a controller decision held over time, not re-derived from a
+    // metric on every render. With the feature on there are no live metrics, so
+    // the strategy is `NoMetrics`: a provider present and not Unavailable is
+    // offered, and the gateway picks among them from the signal it polls.
+    let scoring_strategy = if ctx.polling_metrics_signals {
+        crate::crd::grid_network::ScoringStrategy::NoMetrics
+    } else {
+        network
+            .spec
+            .scoring_policy
+            .as_ref()
+            .map_or(crate::crd::grid_network::ScoringStrategy::NoMetrics, |policy| {
+                policy.strategy
+            })
+    };
     let admission_policy =
         provider_admission::Policy::from_config(network.spec.admission_policy.as_ref(), scoring_strategy.into())
             .map_err(OperatorError::InvalidResource)?;
