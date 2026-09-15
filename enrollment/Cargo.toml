@@ -1,0 +1,47 @@
+[package]
+name = "enrollment"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "enrollment"
+path = "src/main.rs"
+
+[features]
+# Reuse Kubernetes RBAC for operator authorization (TokenReview + SubjectAccessReview).
+# Off by default so the standalone, cluster-free deployment pulls in no Kubernetes
+# client. Enable in-cluster with `--features sar`.
+sar = ["dep:kube", "dep:k8s-openapi"]
+
+[dependencies]
+axum = { workspace = true }
+certs = { path = "../certs" }
+kube = { workspace = true, optional = true }
+k8s-openapi = { workspace = true, optional = true }
+rcgen = { workspace = true }
+serde = { workspace = true }
+ring = { workspace = true }
+sha2 = { workspace = true }
+sqlx = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true, features = ["parsing", "serde-well-known"] }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true, features = ["serde"] }
+axum-server = { version = "0.8.0", features = ["tls-rustls-no-provider"] }
+rustls.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+uuid = { workspace = true, features = ["serde"] }
+http-body-util = { workspace = true }
+rcgen = { workspace = true }
+time = { workspace = true }
+tower = { workspace = true }

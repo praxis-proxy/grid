@@ -15,6 +15,7 @@ endif
 
 .PHONY: all build release check clean \
 	test test-unit lint lint-extra fmt doc audit \
+	generate-api-types codegen-check \
 	coverage coverage-check \
 	mutants semver publish-dry-run \
 	require-container-engine \
@@ -71,6 +72,18 @@ fmt:
 
 doc:
 	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --document-private-items
+
+# -------------------------------------------------------------------
+# Codegen
+# -------------------------------------------------------------------
+
+# Regenerate the enrollment wire types from api/enrollment-v1alpha1.yaml.
+generate-api-types:
+	cargo run --quiet -p xtask -- generate-api-types
+
+# Fail if the checked-in wire types no longer match the spec.
+codegen-check:
+	cargo run --quiet -p xtask -- check-api-types
 
 audit:
 	cargo audit

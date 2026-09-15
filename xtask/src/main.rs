@@ -12,6 +12,7 @@
     reason = "xtask config generators use short closure params, port arithmetic, and index casts pervasively"
 )]
 
+mod api_codegen;
 mod env;
 
 use clap::{Parser, Subcommand};
@@ -31,6 +32,10 @@ pub(crate) struct Cli {
 
 /// Top-level subcommands.
 #[derive(Debug, Subcommand)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "top-level CLI enum parsed once; variant size does not matter"
+)]
 enum Command {
     /// Manage the multi-cluster test environment.
     Env {
@@ -38,12 +43,20 @@ enum Command {
         #[command(subcommand)]
         action: env::Action,
     },
+
+    /// Generate the enrollment wire types from the `OpenAPI` spec.
+    GenerateApiTypes,
+
+    /// Verify the generated enrollment wire types match the spec.
+    CheckApiTypes,
 }
 
 fn main() {
     let cli = Cli::parse();
     let result = match cli.command {
         Command::Env { action } => env::run(&action),
+        Command::GenerateApiTypes => api_codegen::generate(),
+        Command::CheckApiTypes => api_codegen::check(),
     };
     if let Err(e) = result {
         eprintln!("error: {e}");

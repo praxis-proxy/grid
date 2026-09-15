@@ -96,6 +96,7 @@ pub struct StaticFileProvider {
 
 impl StaticFileProvider {
     /// Create a new provider from file paths.
+    #[must_use]
     pub fn new(cert_path: PathBuf, key_path: PathBuf, ca_path: PathBuf, sans: Vec<String>) -> Self {
         Self {
             cert_path,

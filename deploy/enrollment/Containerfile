@@ -20,45 +20,39 @@ WORKDIR /src
 # ------------------------------------------------------------------------------
 
 COPY Cargo.toml Cargo.lock ./
+COPY enrollment/Cargo.toml enrollment/Cargo.toml
 COPY certs/Cargo.toml certs/Cargo.toml
-COPY crdt/Cargo.toml crdt/Cargo.toml
-COPY operator/Cargo.toml operator/Cargo.toml
-COPY scoring/Cargo.toml scoring/Cargo.toml
-COPY swim/Cargo.toml swim/Cargo.toml
 
-# Strip workspace members not needed for the operator binary so this image build
-# does not need their manifests or source.
-RUN sed -i '/enrollment/d; /forge/d; /mock-providers/d; /overlay-sync/d; /xtask/d' Cargo.toml
+# Strip workspace members this binary does not need. certs stays: it signs.
+RUN sed -i '/"crdt"/d; /"forge"/d; /"mock-providers"/d; /"operator"/d; /"overlay-sync"/d; /"scoring"/d; /"swim"/d; /"xtask"/d' Cargo.toml
 
-RUN mkdir -p certs/src crdt/src operator/src scoring/src swim/src \
-    && echo '//! stub' > certs/src/lib.rs \
-    && echo '//! stub' > crdt/src/lib.rs \
-    && echo '//! stub' > operator/src/lib.rs \
-    && echo '//! stub' > scoring/src/lib.rs \
-    && echo '//! stub' > swim/src/lib.rs \
-    && printf '//! stub\nfn main() {}\n' > operator/src/main.rs
+RUN mkdir -p enrollment/src certs/src \
+    && printf '//! stub\nfn main() {}\n' > enrollment/src/main.rs \
+    && printf '//! stub\n' > enrollment/src/lib.rs \
+    && printf '//! stub\n' > certs/src/lib.rs
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --release -p operator --bin operator
+    cargo build --release -p enrollment || true
 
 # ------------------------------------------------------------------------------
 # Build
 # ------------------------------------------------------------------------------
 
 COPY certs/src certs/src
-COPY crdt/src crdt/src
-COPY operator/src operator/src
-COPY scoring/src scoring/src
-COPY swim/src swim/src
+COPY enrollment/src enrollment/src
+COPY enrollment/db enrollment/db
 
-RUN find certs/src crdt/src operator/src scoring/src swim/src \
-    -name '*.rs' -exec touch {} +
+RUN find certs/src enrollment/src -name '*.rs' -exec touch {} +
 
+# Built without the sar feature, so this is the standalone local-token image.
+# ENROLLMENT_AUTHZ=kube needs a separate --features sar build that links the
+# Kubernetes client. Keeping it out here matches the service's Kubernetes-free
+# default and keeps the image small.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --release -p operator --bin operator \
-    && cp target/release/operator /usr/local/bin/operator
+    cargo build --release -p enrollment --bin enrollment \
+    && cp target/release/enrollment /usr/local/bin/enrollment
 
 # ------------------------------------------------------------------------------
 # Stage 2: Runtime
@@ -67,18 +61,18 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 FROM alpine:3.23
 
 LABEL org.opencontainers.image.source="https://github.com/praxis-proxy/grid" \
-    org.opencontainers.image.description="Grid operator for multi-site AI routing" \
-    org.opencontainers.image.licenses="MIT"
+    org.opencontainers.image.description="Grid enrollment service" \
+    org.opencontainers.image.licenses="Apache-2.0"
 
 RUN apk add --no-cache ca-certificates \
     && addgroup -S grid \
     && adduser -S -G grid -h /nonexistent -s /sbin/nologin grid
 
 COPY --from=builder --chown=root:root --chmod=0555 \
-    /usr/local/bin/operator /usr/local/bin/operator
+    /usr/local/bin/enrollment /usr/local/bin/enrollment
 
 USER 100:101
 
-EXPOSE 7946/udp
+EXPOSE 8080
 
-ENTRYPOINT ["operator"]
+ENTRYPOINT ["enrollment"]

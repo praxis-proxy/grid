@@ -14,6 +14,7 @@ COPY .cargo .cargo
 # Only mock-providers and xtask need full source; the others are manifest-only stubs.
 COPY certs/Cargo.toml certs/Cargo.toml
 COPY crdt/Cargo.toml crdt/Cargo.toml
+COPY enrollment/Cargo.toml enrollment/Cargo.toml
 COPY forge/Cargo.toml forge/Cargo.toml
 COPY operator/Cargo.toml operator/Cargo.toml
 COPY overlay-sync/Cargo.toml overlay-sync/Cargo.toml

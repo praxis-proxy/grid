@@ -127,6 +127,46 @@ pub fn generate_site_cert(ca: &CaCert, site_name: &str) -> Result<SiteCertOutput
     generate_dns_cert(ca, site_name, &dns_san)
 }
 
+/// Trust domain every site in this grid is named under.
+pub const SPIFFE_TRUST_DOMAIN: &str = "grid.internal";
+
+/// Generate a site certificate carrying extra DNS names.
+///
+/// A site is reached by more than one name. Peers dial it by its grid identity,
+/// and workloads inside its own cluster reach the same listener through a
+/// Service. One certificate has to answer to both, or the in-cluster caller
+/// fails hostname verification against a certificate that is otherwise correct.
+///
+/// # Errors
+///
+/// Returns [`GenerateError`] if any name is invalid or signing fails.
+pub fn generate_site_cert_with_names(
+    ca: &CaCert,
+    site_name: &str,
+    extra: &[String],
+) -> Result<SiteCertOutput, GenerateError> {
+    let primary = format!("{site_name}.grid.internal");
+    let mut params = build_site_params(site_name, &primary)?;
+    let mut sans = vec![primary];
+    for name in extra {
+        params
+            .subject_alt_names
+            .push(rcgen::SanType::DnsName(name.clone().try_into()?));
+        sans.push(name.clone());
+    }
+
+    let site_key = KeyPair::generate()?;
+    let issuer = Issuer::new(ca.params.clone(), &ca.key_pair);
+    let cert = params.signed_by(&site_key, &issuer)?;
+
+    Ok(SiteCertOutput {
+        cert_pem: cert.pem(),
+        key_pem: site_key.serialize_pem(),
+        organization: DEFAULT_ORGANIZATION.to_owned(),
+        sans,
+    })
+}
+
 /// Generate a certificate for an exact DNS name, signed by the given CA.
 ///
 /// Unlike [`generate_site_cert`], this function does not append the Grid
@@ -306,8 +346,17 @@ pub fn load_ca(common_name: &str, ca_key_pem: &str, ca_cert_pem: &str) -> Result
 /// Separated from [`generate_site_cert`] so tests can verify
 /// the distinguished name entries without generating a full
 /// signed certificate.
-fn build_site_params(site_name: &str, dns_san: &str) -> Result<CertificateParams, GenerateError> {
+pub(crate) fn build_site_params(site_name: &str, dns_san: &str) -> Result<CertificateParams, GenerateError> {
     build_site_params_with_org(site_name, dns_san, DEFAULT_ORGANIZATION)
+}
+
+/// The SPIFFE ID a site is known by inside the grid.
+///
+/// One trust domain per grid. The path names the site, so a verifier reads
+/// which site is calling from material the issuer signed.
+#[must_use]
+pub fn spiffe_id(site_name: &str) -> String {
+    format!("spiffe://{SPIFFE_TRUST_DOMAIN}/site/{site_name}")
 }
 
 /// Build certificate parameters for a site certificate with a specific org.
@@ -322,6 +371,14 @@ fn build_site_params_with_org(
     params
         .subject_alt_names
         .push(rcgen::SanType::DnsName(dns_san.to_owned().try_into()?));
+    // The site's name, bound by the signature rather than asserted beside it.
+    //
+    // An organization proves membership and a DNS name proves where to dial.
+    // Neither answers which site is calling, which is why a peer that holds a
+    // validly issued certificate has been able to claim another site's name.
+    params
+        .subject_alt_names
+        .push(rcgen::SanType::URI(spiffe_id(site_name).try_into()?));
     params.extended_key_usages.push(ExtendedKeyUsagePurpose::ServerAuth);
     params.extended_key_usages.push(ExtendedKeyUsagePurpose::ClientAuth);
     Ok(params)
@@ -333,6 +390,31 @@ fn build_site_params_with_org(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_site_certificate_can_answer_to_more_than_one_name() {
+        // Peers dial the grid identity; a workload in the site's own cluster
+        // reaches the same listener through a Service. One certificate, both
+        // names, or the in-cluster caller fails hostname verification against a
+        // certificate that is otherwise correct.
+        let ca = generate_ca("test-ca").unwrap_or_else(|_| std::process::abort());
+        let svc = "grid-operator-signals.grid-system.svc.cluster.local".to_owned();
+        let site = generate_site_cert_with_names(&ca, "pool-a", std::slice::from_ref(&svc))
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            site.sans,
+            vec!["pool-a.grid.internal".to_owned(), svc],
+            "the grid identity stays first and the Service name is added"
+        );
+    }
+
+    #[test]
+    fn no_extra_names_matches_the_plain_site_certificate() {
+        let ca = generate_ca("test-ca").unwrap_or_else(|_| std::process::abort());
+        let with = generate_site_cert_with_names(&ca, "pool-a", &[]).unwrap_or_else(|_| std::process::abort());
+        let plain = generate_site_cert(&ca, "pool-a").unwrap_or_else(|_| std::process::abort());
+        assert_eq!(with.sans, plain.sans, "adding nothing changes nothing");
+    }
     use super::*;
 
     #[test]
@@ -496,5 +578,39 @@ mod tests {
             matches!(result, Err(GenerateError::CaCertKeyMismatch)),
             "load_ca must return CaCertKeyMismatch when cert and key are from different CA pairs"
         );
+    }
+}
+
+#[cfg(test)]
+mod spiffe_id_tests {
+    use super::{generate_ca, generate_site_cert_with_names, spiffe_id};
+
+    /// A URI SAN is an `IA5String`, so the name appears verbatim in the DER the
+    /// CA signed. Checking the bytes avoids a parser dependency and still
+    /// asserts the thing that matters: the name is inside the signature.
+    #[test]
+    fn a_site_certificate_carries_the_site_name_in_its_signed_bytes() {
+        let ca = generate_ca("test-ca").unwrap_or_else(|_| std::process::abort());
+        let site = generate_site_cert_with_names(&ca, "pool-a", &["pool-a.grid-system".to_owned()])
+            .unwrap_or_else(|_| std::process::abort());
+        let der = pem::parse(&site.cert_pem).unwrap_or_else(|_| std::process::abort());
+        let bytes = der.contents();
+
+        let id = spiffe_id("pool-a");
+        assert!(
+            bytes.windows(id.len()).any(|w| w == id.as_bytes()),
+            "the name a peer routes on has to be signed, not asserted alongside"
+        );
+        let other = spiffe_id("pool-b");
+        assert!(
+            !bytes.windows(other.len()).any(|w| w == other.as_bytes()),
+            "and it must name one site"
+        );
+    }
+
+    #[test]
+    fn two_sites_are_told_apart_by_it() {
+        assert_ne!(spiffe_id("pool-a"), spiffe_id("pool-b"));
+        assert!(spiffe_id("pool-a").starts_with("spiffe://"));
     }
 }

@@ -13,7 +13,7 @@ stack-size-threshold = 20480
 avoid-breaking-exported-api = false
 msrv = "1.96"
 # ".." keeps clippy's built-in defaults; extend per project (product names, protocol acronyms)
-doc-valid-idents = ["..", "IPv4", "IPv6", "gRPC", "OpenTelemetry", "MiB", "GiB", "KiB"]
+doc-valid-idents = ["..", "MaaS", "IPv4", "IPv6", "gRPC", "OpenTelemetry", "MiB", "GiB", "KiB"]
 disallowed-methods = [
     { path = "std::thread::sleep", reason = "use tokio::time::sleep in async context" },
     { path = "std::io::stdin", reason = "a server must not read interactive input" },

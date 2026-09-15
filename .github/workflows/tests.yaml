@@ -64,6 +64,9 @@ jobs:
       - name: Lint
         run: make lint
 
+      - name: Check generated API types match the spec
+        run: make codegen-check
+
   # ----------------------------------------------------------------------------
   # Unit tests
   # ----------------------------------------------------------------------------

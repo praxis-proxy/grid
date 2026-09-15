@@ -20,7 +20,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY overlay-sync/Cargo.toml overlay-sync/Cargo.toml
 
 # Strip workspace members not needed for this binary.
-RUN sed -i '/certs/d; /crdt/d; /forge/d; /mock-providers/d; /operator/d; /scoring/d; /swim/d; /xtask/d' Cargo.toml
+RUN sed -i '/certs/d; /crdt/d; /enrollment/d; /forge/d; /mock-providers/d; /operator/d; /scoring/d; /swim/d; /xtask/d' Cargo.toml
 
 RUN mkdir -p overlay-sync/src \
     && printf '//! stub\nfn main() {}\n' > overlay-sync/src/main.rs

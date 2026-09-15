@@ -1132,7 +1132,9 @@ mod llmd_pool_metrics_demo_cli_tests {
         let mut args = vec!["xtask", "env", "run-grid-llmd-pool-metrics-demo"];
         args.extend_from_slice(extra_args);
         let cli = Cli::try_parse_from(args).expect("valid CLI invocation must parse");
-        let Command::Env { action } = cli.command;
+        let Command::Env { action } = cli.command else {
+            panic!("expected the env subcommand");
+        };
         match action {
             Action::RunGridLlmdPoolMetricsDemo { kv_cache, .. } => kv_cache,
             other => panic!("expected RunGridLlmdPoolMetricsDemo, got {other:?}"),

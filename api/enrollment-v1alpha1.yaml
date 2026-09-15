@@ -1,0 +1,270 @@
+openapi: 3.1.0
+info:
+  title: Grid Enrollment API
+  version: 1.0.0
+  description: |
+    Lets an inference provider join a grid.
+
+    A grid-admin mints a single-use token that pins a site name. The site
+    presents the token and a certificate signing request and receives a signed
+    certificate, the grid CA certificate, and an enrollment id in the same
+    response. There is no approval queue and no request lifecycle.
+
+    The grid assigns the name. The token pins it at mint, so a request only
+    carries a signing request and cannot name itself. Enrollment grants an
+    identity and nothing else.
+  contact:
+    name: AI Grid
+    url: https://github.com/praxis-proxy/grid
+servers:
+  - url: https://grid.example/enrollment/v1alpha1
+    description: A grid's enrollment endpoint.
+
+tags:
+  - name: enrollment
+    description: Redeeming a token for a grid identity.
+  - name: administration
+    description: Minting and revoking tokens. Requires a grid-admin credential.
+
+paths:
+  /enrollmenttokens:
+    post:
+      operationId: mintEnrollmentToken
+      tags: [administration]
+      summary: Mint a single-use enrollment token
+      description: |
+        Mints a one-time token that pins a site name. The token is returned
+        once; only its digest is stored. Minting is not self-service.
+      security:
+        - gridAdminAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EnrollmentTokenRequest'
+      responses:
+        '201':
+          description: The minted token, returned once.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EnrollmentToken'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /enrollmenttokens/{tokenId}:
+    delete:
+      operationId: revokeEnrollmentToken
+      tags: [administration]
+      summary: Revoke an unredeemed token
+      description: |
+        Revokes a token that has not been redeemed, a kill switch for one that
+        leaked. A redeemed token's row stays as issuance provenance, so revoking
+        it reports not found.
+      security:
+        - gridAdminAuth: []
+      parameters:
+        - $ref: '#/components/parameters/TokenId'
+      responses:
+        '204':
+          description: Revoked.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /enrollments:
+    post:
+      operationId: enroll
+      tags: [enrollment]
+      summary: Redeem a token for a certificate
+      description: |
+        Redeems a single-use token, presented in the Authorization Bearer
+        header, together with a certificate signing request. Returns the signed
+        certificate, the grid CA certificate, and an enrollment id. The token is
+        spent if and only if the certificate is issued.
+      security:
+        - siteTokenAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EnrollmentRequest'
+      responses:
+        '201':
+          description: The issued certificate and the grid CA.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Enrollment'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          description: The token is missing, unknown, expired, or already redeemed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: The pinned name is already held by an issued member.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+components:
+  securitySchemes:
+    gridAdminAuth:
+      type: http
+      scheme: bearer
+      description: A grid-admin credential. Minting and revoking are not self-service.
+    siteTokenAuth:
+      type: http
+      scheme: bearer
+      description: A single-use site token, minted by a grid-admin.
+
+  parameters:
+    TokenId:
+      name: tokenId
+      in: path
+      required: true
+      description: Identifier returned when the token was minted.
+      schema:
+        type: string
+        format: uuid
+
+  responses:
+    BadRequest:
+      description: The request was malformed or the signing request unusable.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Unauthorized:
+      description: No credential, or one that is not accepted.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Forbidden:
+      description: Authenticated, but not permitted the action.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    NotFound:
+      description: No such outstanding token.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+  schemas:
+    EnrollmentTokenRequest:
+      type: object
+      description: What a grid-admin submits to mint a token.
+      required: [siteName, gridNetworkRef]
+      properties:
+        siteName:
+          type: string
+          description: |
+            The name the token pins. The grid-admin chooses it, so the site
+            never names itself.
+          pattern: '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$'
+        gridNetworkRef:
+          type: string
+          description: The grid the site joins.
+          minLength: 1
+          maxLength: 253
+        expiresInSecs:
+          type: integer
+          description: |
+            How long the token stays usable, in seconds. A default applies when
+            unset. An explicit value must be greater than zero.
+
+    EnrollmentToken:
+      type: object
+      description: |
+        The token a grid-admin hands to a site. Returned once, at mint; only its
+        digest is stored after that.
+      required: [tokenId, token, siteName, expiresAt]
+      properties:
+        tokenId:
+          type: string
+          format: uuid
+          description: Identifier, for revoking the token before it is redeemed.
+        token:
+          type: string
+          description: The one-time token, presented once at enroll.
+        siteName:
+          type: string
+          description: The name the token pins.
+        expiresAt:
+          type: string
+          format: date-time
+          description: When the token stops being usable.
+
+    EnrollmentRequest:
+      type: object
+      description: |
+        What a site submits to enroll: a certificate signing request and nothing
+        else. The token pins the name, so a submission cannot assert one.
+      required: [csr]
+      properties:
+        csr:
+          type: string
+          description: |
+            PKCS#10 certificate signing request, PEM encoded. The private key
+            stays with the requester and is never sent.
+          maxLength: 16384
+
+    Enrollment:
+      type: object
+      description: The certificate issued to a site, returned inline from enroll.
+      required: [id, certificate, caCertificate, spiffeId, publicKeySha256]
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: |
+            The issued-enrollment row identifier. Additive: a future retrieval or
+            idempotent-replay lookup can key on it.
+        certificate:
+          type: string
+          description: The issued certificate, PEM encoded.
+        caCertificate:
+          type: string
+          description: |
+            The grid CA certificate, PEM encoded. Returned with the leaf so a
+            site holds the trust anchor without a separate fetch.
+        spiffeId:
+          type: string
+          description: |
+            The name the grid assigned, carried as a URI SAN on the certificate.
+          examples: ['spiffe://grid.internal/site/site-d']
+        publicKeySha256:
+          type: string
+          description: |
+            Lowercase hex SHA-256 over the request's public key.
+          pattern: '^[0-9a-f]{64}$'
+
+    Error:
+      type: object
+      description: A failure, described so a caller can act on it.
+      required: [error, message]
+      properties:
+        error:
+          type: string
+          description: Machine-readable code.
+          examples: ['name_taken']
+        message:
+          type: string
+          description: What went wrong, and what would fix it.
