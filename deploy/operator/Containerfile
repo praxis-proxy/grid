@@ -20,23 +20,42 @@ WORKDIR /src
 # ------------------------------------------------------------------------------
 
 COPY Cargo.toml Cargo.lock ./
+
+# Copy Cargo.toml for every workspace member so cargo can resolve the workspace.
+# Only the operator binary and its path dependencies need full source; the rest
+# are manifest-only stubs.
 COPY certs/Cargo.toml certs/Cargo.toml
+COPY common/Cargo.toml common/Cargo.toml
 COPY crdt/Cargo.toml crdt/Cargo.toml
+COPY enrollment/Cargo.toml enrollment/Cargo.toml
+COPY filter/Cargo.toml filter/Cargo.toml
+COPY forge/Cargo.toml forge/Cargo.toml
+COPY gateway/Cargo.toml gateway/Cargo.toml
+COPY mock-providers/Cargo.toml mock-providers/Cargo.toml
 COPY operator/Cargo.toml operator/Cargo.toml
+COPY overlay-sync/Cargo.toml overlay-sync/Cargo.toml
 COPY scoring/Cargo.toml scoring/Cargo.toml
 COPY swim/Cargo.toml swim/Cargo.toml
+COPY xtask/Cargo.toml xtask/Cargo.toml
 
-# Strip workspace members not needed for the operator binary so this image build
-# does not need their manifests or source.
-RUN sed -i '/enrollment/d; /forge/d; /mock-providers/d; /overlay-sync/d; /xtask/d' Cargo.toml
-
-RUN mkdir -p certs/src crdt/src operator/src scoring/src swim/src \
+# Create stub sources so cargo can validate each workspace member manifest
+# without compiling them. Only operator and its path deps are actually built.
+RUN mkdir -p certs/src common/src crdt/src filter/src forge/src gateway/src \
+             mock-providers/src operator/src overlay-sync/src scoring/src swim/src \
+             xtask/src \
     && echo '//! stub' > certs/src/lib.rs \
+    && echo '//! stub' > common/src/lib.rs \
     && echo '//! stub' > crdt/src/lib.rs \
+    && echo '//! stub' > filter/src/lib.rs \
+    && echo '//! stub' > forge/src/lib.rs \
     && echo '//! stub' > operator/src/lib.rs \
     && echo '//! stub' > scoring/src/lib.rs \
     && echo '//! stub' > swim/src/lib.rs \
-    && printf '//! stub\nfn main() {}\n' > operator/src/main.rs
+    && printf '//! stub\nfn main() {}\n' > gateway/src/main.rs \
+    && printf '//! stub\nfn main() {}\n' > mock-providers/src/main.rs \
+    && printf '//! stub\nfn main() {}\n' > operator/src/main.rs \
+    && printf '//! stub\nfn main() {}\n' > overlay-sync/src/main.rs \
+    && printf '//! stub\nfn main() {}\n' > xtask/src/main.rs
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \

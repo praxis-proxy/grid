@@ -1,0 +1,15 @@
+[package]
+name = "filter"
+description = "Grid data-plane filter primitives: live load-signal store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+common = { path = "../common" }
+dashmap = { workspace = true }
+
+[lints]
+workspace = true

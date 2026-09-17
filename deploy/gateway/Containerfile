@@ -4,8 +4,8 @@
 # Stage 1: Build
 # ------------------------------------------------------------------------------
 #
-# Copy workspace manifests first, build with stub sources to cache dependency
-# compilation, then copy real source and rebuild only project crates.
+# Copy workspace manifests first, build with a stub source to cache dependency
+# compilation, then copy real source and rebuild only the gateway crate.
 
 FROM rust:1.96-alpine AS builder
 
@@ -22,8 +22,7 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 
 # Copy Cargo.toml for every workspace member so cargo can resolve the workspace.
-# Only enrollment and certs (it signs) need full source; the rest are
-# manifest-only stubs.
+# Only gateway needs full source; the rest are manifest-only stubs.
 COPY certs/Cargo.toml certs/Cargo.toml
 COPY common/Cargo.toml common/Cargo.toml
 COPY crdt/Cargo.toml crdt/Cargo.toml
@@ -39,47 +38,33 @@ COPY swim/Cargo.toml swim/Cargo.toml
 COPY xtask/Cargo.toml xtask/Cargo.toml
 
 # Create stub sources so cargo can validate each workspace member manifest
-# without compiling them. Only enrollment and certs are actually built.
-RUN mkdir -p certs/src common/src crdt/src enrollment/src filter/src forge/src \
-             gateway/src mock-providers/src operator/src overlay-sync/src scoring/src \
-             swim/src xtask/src \
-    && echo '//! stub' > certs/src/lib.rs \
-    && echo '//! stub' > common/src/lib.rs \
-    && echo '//! stub' > crdt/src/lib.rs \
-    && echo '//! stub' > filter/src/lib.rs \
-    && echo '//! stub' > forge/src/lib.rs \
-    && echo '//! stub' > operator/src/lib.rs \
-    && echo '//! stub' > scoring/src/lib.rs \
-    && echo '//! stub' > swim/src/lib.rs \
-    && printf '//! stub\n' > enrollment/src/lib.rs \
-    && printf '//! stub\nfn main() {}\n' > enrollment/src/main.rs \
-    && printf '//! stub\nfn main() {}\n' > gateway/src/main.rs \
-    && printf '//! stub\nfn main() {}\n' > mock-providers/src/main.rs \
-    && printf '//! stub\nfn main() {}\n' > overlay-sync/src/main.rs \
-    && printf '//! stub\nfn main() {}\n' > xtask/src/main.rs
+# without compiling them. Only gateway is actually built.
+RUN mkdir -p certs/src common/src crdt/src filter/src forge/src operator/src \
+             scoring/src swim/src overlay-sync/src mock-providers/src xtask/src \
+             gateway/src \
+    && touch certs/src/lib.rs common/src/lib.rs crdt/src/lib.rs filter/src/lib.rs \
+             forge/src/lib.rs operator/src/lib.rs scoring/src/lib.rs swim/src/lib.rs \
+    && printf 'fn main() {}\n' > overlay-sync/src/main.rs \
+    && printf 'fn main() {}\n' > mock-providers/src/main.rs \
+    && printf 'fn main() {}\n' > xtask/src/main.rs \
+    && printf '//! stub\nfn main() {}\n' > gateway/src/main.rs
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --release -p enrollment || true
+    cargo build --release -p gateway --bin grid-gateway
 
 # ------------------------------------------------------------------------------
 # Build
 # ------------------------------------------------------------------------------
 
-COPY certs/src certs/src
-COPY enrollment/src enrollment/src
-COPY enrollment/db enrollment/db
+COPY gateway/src gateway/src
 
-RUN find certs/src enrollment/src -name '*.rs' -exec touch {} +
+RUN find gateway/src -name '*.rs' -exec touch {} +
 
-# Built without the sar feature, so this is the standalone local-token image.
-# ENROLLMENT_AUTHZ=kube needs a separate --features sar build that links the
-# Kubernetes client. Keeping it out here matches the service's Kubernetes-free
-# default and keeps the image small.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --release -p enrollment --bin enrollment \
-    && cp target/release/enrollment /usr/local/bin/enrollment
+    cargo build --release -p gateway --bin grid-gateway \
+    && cp target/release/grid-gateway /usr/local/bin/grid-gateway
 
 # ------------------------------------------------------------------------------
 # Stage 2: Runtime
@@ -88,7 +73,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 FROM alpine:3.23
 
 LABEL org.opencontainers.image.source="https://github.com/praxis-proxy/grid" \
-    org.opencontainers.image.description="Grid enrollment service" \
+    org.opencontainers.image.description="Praxis-based grid data-plane gateway" \
     org.opencontainers.image.licenses="Apache-2.0"
 
 RUN apk add --no-cache ca-certificates \
@@ -96,10 +81,8 @@ RUN apk add --no-cache ca-certificates \
     && adduser -S -G grid -h /nonexistent -s /sbin/nologin grid
 
 COPY --from=builder --chown=root:root --chmod=0555 \
-    /usr/local/bin/enrollment /usr/local/bin/enrollment
+    /usr/local/bin/grid-gateway /usr/local/bin/grid-gateway
 
 USER 100:101
 
-EXPOSE 8080
-
-ENTRYPOINT ["enrollment"]
+ENTRYPOINT ["grid-gateway"]

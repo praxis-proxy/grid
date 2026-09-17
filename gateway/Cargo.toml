@@ -1,0 +1,17 @@
+[package]
+name = "gateway"
+description = "Praxis-based grid data-plane gateway"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "grid-gateway"
+path = "src/main.rs"
+
+[dependencies]
+
+[lints]
+workspace = true

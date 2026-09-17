@@ -20,6 +20,7 @@ permissions: {}
 env:
   CARGO_TERM_COLOR: always
   OPERATOR_IMAGE_NAME: ghcr.io/praxis-proxy/grid-operator
+  GATEWAY_IMAGE_NAME: ghcr.io/praxis-proxy/grid-gateway
   MOCK_PROVIDERS_IMAGE_NAME: ghcr.io/praxis-proxy/grid-mock-providers
   OVERLAY_SYNC_IMAGE_NAME: ghcr.io/praxis-proxy/grid-overlay-sync
   ENROLLMENT_IMAGE_NAME: ghcr.io/praxis-proxy/grid-enrollment
@@ -113,6 +114,60 @@ jobs:
         run: |
           SHORT_SHA="${GITHUB_SHA::7}"
           docker push "${OPERATOR_IMAGE_NAME}:sha-${SHORT_SHA}"
+
+  # ----------------------------------------------------------------------------
+  # Build the gateway data-plane container image
+  # ----------------------------------------------------------------------------
+
+  gateway-image:
+    needs: changes
+    if: needs.changes.outputs.runtime == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@6190aa5fb88a88ee71c12769924bbe63a9ab152e # 1.96.0
+
+      - name: Cache Cargo registry and build artifacts
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-rust-1.96.0-gateway-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-rust-1.96.0-gateway-
+          save-always: true
+
+      - name: Build container image
+        run: |
+          SHORT_SHA="${GITHUB_SHA::7}"
+          docker build -f deploy/gateway/Containerfile \
+            -t "${GATEWAY_IMAGE_NAME}:sha-${SHORT_SHA}" \
+            .
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Push SHA image
+        if: github.event_name != 'pull_request'
+        run: |
+          SHORT_SHA="${GITHUB_SHA::7}"
+          docker push "${GATEWAY_IMAGE_NAME}:sha-${SHORT_SHA}"
 
   # ----------------------------------------------------------------------------
   # Build the mock-provider container image used by the executable demos

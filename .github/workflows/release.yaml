@@ -29,6 +29,7 @@ env:
   OFFICIAL_AI_IMAGE_DIGEST: sha256:ccd46f8772eebcbde2f41ad35c3234d23463b8314a5865083e32baf31eddd1a8
   OFFICIAL_AI_SOURCE_SHA: b44360afb4100c5543b1180ac8df16e482978fc8
   OPERATOR_IMAGE_NAME: ghcr.io/praxis-proxy/grid-operator
+  GATEWAY_IMAGE_NAME: ghcr.io/praxis-proxy/grid-gateway
   MOCK_PROVIDERS_IMAGE_NAME: ghcr.io/praxis-proxy/grid-mock-providers
   OVERLAY_SYNC_IMAGE_NAME: ghcr.io/praxis-proxy/grid-overlay-sync
 
@@ -132,6 +133,7 @@ jobs:
       packages: write
     outputs:
       operator_digest: ${{ steps.operator.outputs.digest }}
+      gateway_digest: ${{ steps.gateway.outputs.digest }}
       mock_providers_digest: ${{ steps.mock_providers.outputs.digest }}
       overlay_sync_digest: ${{ steps.overlay_sync.outputs.digest }}
       official_ai_digest: ${{ steps.official_ai.outputs.digest }}
@@ -195,6 +197,25 @@ jobs:
             org.opencontainers.image.version=${{ needs.validate.outputs.version }}
           cache-from: type=gha,scope=release-operator
           cache-to: type=gha,mode=max,scope=release-operator
+          provenance: mode=max
+          sbom: true
+
+      - name: Build and push gateway
+        id: gateway
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: deploy/gateway/Containerfile
+          push: true
+          tags: |
+            ${{ env.GATEWAY_IMAGE_NAME }}:${{ needs.validate.outputs.tag }}
+            ${{ env.GATEWAY_IMAGE_NAME }}:sha-${{ needs.validate.outputs.short_sha }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ needs.validate.outputs.source_sha }}
+            org.opencontainers.image.version=${{ needs.validate.outputs.version }}
+          cache-from: type=gha,scope=release-gateway
+          cache-to: type=gha,mode=max,scope=release-gateway
           provenance: mode=max
           sbom: true
 
@@ -344,6 +365,7 @@ jobs:
       - name: Write image manifest
         env:
           OPERATOR_DIGEST: ${{ needs.container.outputs.operator_digest }}
+          GATEWAY_DIGEST: ${{ needs.container.outputs.gateway_digest }}
           MOCK_PROVIDERS_DIGEST: ${{ needs.container.outputs.mock_providers_digest }}
           OVERLAY_SYNC_DIGEST: ${{ needs.container.outputs.overlay_sync_digest }}
           OFFICIAL_AI_DIGEST: ${{ needs.container.outputs.official_ai_digest }}
@@ -357,6 +379,7 @@ jobs:
           \`\`\`text
           ${OFFICIAL_AI_IMAGE_NAME}:${OFFICIAL_AI_IMAGE_TAG}@${OFFICIAL_AI_DIGEST}
           ${OPERATOR_IMAGE_NAME}@${OPERATOR_DIGEST}
+          ${GATEWAY_IMAGE_NAME}@${GATEWAY_DIGEST}
           ${MOCK_PROVIDERS_IMAGE_NAME}@${MOCK_PROVIDERS_DIGEST}
           ${OVERLAY_SYNC_IMAGE_NAME}@${OVERLAY_SYNC_DIGEST}
           \`\`\`
