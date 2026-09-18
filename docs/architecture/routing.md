@@ -965,3 +965,24 @@ another deployment-owned reload mechanism. See
 | `xtask/src/env/consumer.rs` | Local validation consumer gateway configuration. |
 | `xtask/src/env/gateway.rs` | Local validation provider gateway configuration. |
 | `xtask/src/env/operator.rs` | Local validation fixtures and overlay checks. |
+# Routing flow
+
+Routing starts with the request's eligible provider set, applies availability
+and policy filters, and then selects a provider using scoring and weighting.
+Provider draining is evaluated before selection so a provider leaving the pool
+does not receive new work.
+
+```mermaid
+flowchart LR
+    A[Request] --> B[Eligible providers]
+    B --> C{Available and allowed?}
+    C -->|no| D[Reject or retry]
+    C -->|yes| E[Score and weight]
+    E --> F[Select provider]
+    F --> G[Forward request]
+    G --> H[Record signals]
+    H --> E
+```
+
+See [provider selection and load balancing](provider-selection-and-load-balancing.md)
+for selection details; this page is the entry point for the request path.
