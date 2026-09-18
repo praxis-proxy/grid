@@ -1,11 +1,12 @@
-//! Certificate generation using [`rcgen`].
+//! Certificate generation.
 //!
-//! Produces a self-signed CA and per-site certificates for
-//! POC/testing. Production deployments use SPIFFE/SPIRE instead.
+//! Produces a self-signed CA and per-site certificates for POC/testing.
+//! Production deployments use SPIFFE/SPIRE instead. The crypto primitive is
+//! selected at compile time by the [`backend`] seam.
 
-use rcgen::{
-    BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose,
-};
+use time::{Duration, OffsetDateTime};
+
+use crate::backend::{self, BackendError, CertSpec};
 
 /// X.509 organization set on all generated site certificates.
 ///
@@ -22,9 +23,9 @@ pub const DEFAULT_ORGANIZATION: &str = "ai-grid";
 /// Errors from certificate generation.
 #[derive(Debug, thiserror::Error)]
 pub enum GenerateError {
-    /// `rcgen` certificate generation failed.
+    /// Key generation or signing failed in the crypto backend.
     #[error("certificate generation failed: {0}")]
-    Rcgen(#[from] rcgen::Error),
+    Backend(String),
 
     /// CA certificate PEM could not be decoded.
     ///
@@ -34,15 +35,30 @@ pub enum GenerateError {
 
     /// CA certificate and private key do not correspond to the same key pair.
     ///
-    /// Detected by [`load_ca`] by checking that the key's public bytes appear
-    /// in the certificate DER body.  Pass matching `ca_cert_pem` and
-    /// `ca_key_pem` (both written by [`generate_ca`] in the same call), or
-    /// run `cargo xtask env down && cargo xtask env up` to regenerate all
+    /// Detected by [`load_ca`]. Pass matching `ca_cert_pem` and `ca_key_pem`
+    /// (both written by [`generate_ca`] in the same call), or run
+    /// `cargo xtask env down && cargo xtask env up` to regenerate all
     /// certificates from a fresh CA.
     #[error(
         "CA certificate and private key do not match: regenerate with `cargo xtask env down && cargo xtask env up`"
     )]
     CaCertKeyMismatch,
+}
+
+/// Map a backend failure onto the generation error it stands for.
+fn map_backend(err: BackendError) -> GenerateError {
+    match err {
+        BackendError::CaCertKeyMismatch => GenerateError::CaCertKeyMismatch,
+        BackendError::InvalidCaCert => GenerateError::InvalidCaCert,
+        BackendError::KeyGen(msg) | BackendError::Sign(msg) | BackendError::InvalidCaKey(msg) => {
+            GenerateError::Backend(msg)
+        },
+        // No generate or load path produces a request-side failure.
+        BackendError::ParseCsr
+        | BackendError::CsrBadSignature
+        | BackendError::CsrUnsupportedExtension
+        | BackendError::BadSignature => GenerateError::Backend("unexpected backend error".to_owned()),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -53,7 +69,7 @@ pub enum GenerateError {
 #[derive(Debug)]
 #[expect(
     clippy::partial_pub_fields,
-    reason = "cert_pem/key_pem are public API; params/key_pair are internal for signing"
+    reason = "cert_pem/key_pem are public API; material is internal signing state"
 )]
 pub struct CaCert {
     /// PEM-encoded CA certificate.
@@ -62,11 +78,8 @@ pub struct CaCert {
     /// PEM-encoded CA private key.
     pub key_pem: String,
 
-    /// The certificate parameters (for signing site certs).
-    pub(crate) params: CertificateParams,
-
-    /// The CA key pair (for signing site certs).
-    pub(crate) key_pair: KeyPair,
+    /// Backend material for signing site certificates.
+    pub(crate) material: backend::CaMaterial,
 }
 
 /// Generate a self-signed CA certificate.
@@ -75,20 +88,21 @@ pub struct CaCert {
 ///
 /// Returns [`GenerateError`] if key generation or signing fails.
 pub fn generate_ca(common_name: &str) -> Result<CaCert, GenerateError> {
-    let mut params = CertificateParams::default();
-    params.distinguished_name.push(DnType::CommonName, common_name);
-    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    params.key_usages.push(KeyUsagePurpose::KeyCertSign);
-    params.key_usages.push(KeyUsagePurpose::CrlSign);
-
-    let key_pair = KeyPair::generate()?;
-    let cert = params.self_signed(&key_pair)?;
-
+    let (not_before, not_after) = default_ca_validity();
+    let spec = CertSpec {
+        common_name,
+        organization: None,
+        dns_sans: &[],
+        uri_sans: &[],
+        is_ca: true,
+        not_before,
+        not_after,
+    };
+    let ca = backend::generate_ca(&spec).map_err(map_backend)?;
     Ok(CaCert {
-        cert_pem: cert.pem(),
-        key_pem: key_pair.serialize_pem(),
-        params,
-        key_pair,
+        cert_pem: ca.cert_pem,
+        key_pem: ca.key_pem,
+        material: ca.material,
     })
 }
 
@@ -146,24 +160,16 @@ pub fn generate_site_cert_with_names(
     extra: &[String],
 ) -> Result<SiteCertOutput, GenerateError> {
     let primary = format!("{site_name}.grid.internal");
-    let mut params = build_site_params(site_name, &primary)?;
-    let mut sans = vec![primary];
-    for name in extra {
-        params
-            .subject_alt_names
-            .push(rcgen::SanType::DnsName(name.clone().try_into()?));
-        sans.push(name.clone());
-    }
+    let mut id = site_identity(site_name, &primary);
+    id.dns_sans.extend_from_slice(extra);
 
-    let site_key = KeyPair::generate()?;
-    let issuer = Issuer::new(ca.params.clone(), &ca.key_pair);
-    let cert = params.signed_by(&site_key, &issuer)?;
-
+    let (not_before, not_after) = default_leaf_validity();
+    let out = backend::issue_leaf(&ca.material, &id.spec(not_before, not_after)).map_err(map_backend)?;
     Ok(SiteCertOutput {
-        cert_pem: cert.pem(),
-        key_pem: site_key.serialize_pem(),
+        cert_pem: out.cert_pem,
+        key_pem: out.key_pem,
         organization: DEFAULT_ORGANIZATION.to_owned(),
-        sans,
+        sans: id.dns_sans,
     })
 }
 
@@ -178,15 +184,12 @@ pub fn generate_site_cert_with_names(
 /// Returns [`GenerateError`] if the DNS name is invalid or certificate
 /// generation fails.
 pub fn generate_dns_cert(ca: &CaCert, common_name: &str, dns_name: &str) -> Result<SiteCertOutput, GenerateError> {
-    let params = build_site_params(common_name, dns_name)?;
-
-    let site_key = KeyPair::generate()?;
-    let issuer = Issuer::new(ca.params.clone(), &ca.key_pair);
-    let cert = params.signed_by(&site_key, &issuer)?;
-
+    let id = site_identity(common_name, dns_name);
+    let (not_before, not_after) = default_leaf_validity();
+    let out = backend::issue_leaf(&ca.material, &id.spec(not_before, not_after)).map_err(map_backend)?;
     Ok(SiteCertOutput {
-        cert_pem: cert.pem(),
-        key_pem: site_key.serialize_pem(),
+        cert_pem: out.cert_pem,
+        key_pem: out.key_pem,
         organization: DEFAULT_ORGANIZATION.to_owned(),
         sans: vec![dns_name.to_owned()],
     })
@@ -209,13 +212,13 @@ pub fn generate_expired_dns_cert(
     common_name: &str,
     dns_name: &str,
 ) -> Result<SiteCertOutput, GenerateError> {
-    let now = time::OffsetDateTime::now_utc();
+    let now = OffsetDateTime::now_utc();
     generate_validity_bounded_dns_cert(
         ca,
         common_name,
         dns_name,
-        now - time::Duration::days(2),
-        now - time::Duration::days(1),
+        now - Duration::days(2),
+        now - Duration::days(1),
     )
 }
 
@@ -236,13 +239,13 @@ pub fn generate_not_yet_valid_dns_cert(
     common_name: &str,
     dns_name: &str,
 ) -> Result<SiteCertOutput, GenerateError> {
-    let now = time::OffsetDateTime::now_utc();
+    let now = OffsetDateTime::now_utc();
     generate_validity_bounded_dns_cert(
         ca,
         common_name,
         dns_name,
-        now + time::Duration::days(1),
-        now + time::Duration::days(2),
+        now + Duration::days(1),
+        now + Duration::days(2),
     )
 }
 
@@ -251,20 +254,14 @@ fn generate_validity_bounded_dns_cert(
     ca: &CaCert,
     common_name: &str,
     dns_name: &str,
-    not_before: time::OffsetDateTime,
-    not_after: time::OffsetDateTime,
+    not_before: OffsetDateTime,
+    not_after: OffsetDateTime,
 ) -> Result<SiteCertOutput, GenerateError> {
-    let mut params = build_site_params(common_name, dns_name)?;
-    params.not_before = not_before;
-    params.not_after = not_after;
-
-    let site_key = KeyPair::generate()?;
-    let issuer = Issuer::new(ca.params.clone(), &ca.key_pair);
-    let cert = params.signed_by(&site_key, &issuer)?;
-
+    let id = site_identity(common_name, dns_name);
+    let out = backend::issue_leaf(&ca.material, &id.spec(not_before, not_after)).map_err(map_backend)?;
     Ok(SiteCertOutput {
-        cert_pem: cert.pem(),
-        key_pem: site_key.serialize_pem(),
+        cert_pem: out.cert_pem,
+        key_pem: out.key_pem,
         organization: DEFAULT_ORGANIZATION.to_owned(),
         sans: vec![dns_name.to_owned()],
     })
@@ -282,15 +279,12 @@ fn generate_validity_bounded_dns_cert(
 /// Returns [`GenerateError`] if key generation or signing fails.
 pub fn generate_cert_with_org(ca: &CaCert, site_name: &str, org: &str) -> Result<SiteCertOutput, GenerateError> {
     let dns_san = format!("{site_name}.grid.internal");
-    let params = build_site_params_with_org(site_name, &dns_san, org)?;
-
-    let site_key = KeyPair::generate()?;
-    let issuer = Issuer::new(ca.params.clone(), &ca.key_pair);
-    let cert = params.signed_by(&site_key, &issuer)?;
-
+    let id = site_identity_with_org(site_name, &dns_san, org);
+    let (not_before, not_after) = default_leaf_validity();
+    let out = backend::issue_leaf(&ca.material, &id.spec(not_before, not_after)).map_err(map_backend)?;
     Ok(SiteCertOutput {
-        cert_pem: cert.pem(),
-        key_pem: site_key.serialize_pem(),
+        cert_pem: out.cert_pem,
+        key_pem: out.key_pem,
         organization: org.to_owned(),
         sans: vec![dns_san],
     })
@@ -299,56 +293,41 @@ pub fn generate_cert_with_org(ca: &CaCert, site_name: &str, org: &str) -> Result
 /// Load an existing CA from PEM files and reconstruct a [`CaCert`] for signing.
 ///
 /// Use this to reuse a CA that was previously generated and written to disk
-/// rather than calling [`generate_ca`] again.  The `common_name` must match
+/// rather than calling [`generate_ca`] again. The `common_name` must match
 /// what was used in the original [`generate_ca`] call so that the issuer `DN`
 /// in newly-signed site certificates is correct.
 ///
 /// The cert and key are validated to confirm they correspond to the same key
-/// pair: the key's public bytes must appear in the certificate DER body.  This
-/// catches the most common failure mode (mixed-up files after a partial
-/// regeneration) and fails with a clear error before any signing attempt.
+/// pair. This catches the most common failure mode (mixed-up files after a
+/// partial regeneration) and fails with a clear error before any signing.
 ///
 /// # Errors
 ///
-/// Returns [`GenerateError::Rcgen`] if the key PEM is malformed.
+/// Returns [`GenerateError::Backend`] if the key PEM is malformed.
 /// Returns [`GenerateError::InvalidCaCert`] if the cert PEM cannot be decoded.
 /// Returns [`GenerateError::CaCertKeyMismatch`] if cert and key do not match.
 pub fn load_ca(common_name: &str, ca_key_pem: &str, ca_cert_pem: &str) -> Result<CaCert, GenerateError> {
-    let key_pair = KeyPair::from_pem(ca_key_pem)?;
-
-    // Validate that the cert corresponds to this key by checking that the
-    // key's raw public bytes (uncompressed SEC1 point for ECDSA P-256:
-    // `04 || X || Y`) appear as a subsequence in the certificate DER.  This
-    // uses only the `pem` crate — already a transitive dep of `rcgen` — to
-    // parse the PEM to DER without requiring the `x509-parser` feature.
-    let cert_der = pem::parse(ca_cert_pem).map_err(|_pem_err| GenerateError::InvalidCaCert)?;
-    let key_bytes = key_pair.public_key_raw();
-    if !cert_der.contents().windows(key_bytes.len()).any(|w| w == key_bytes) {
-        return Err(GenerateError::CaCertKeyMismatch);
-    }
-
-    let mut params = CertificateParams::default();
-    params.distinguished_name.push(DnType::CommonName, common_name);
-    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    params.key_usages.push(KeyUsagePurpose::KeyCertSign);
-    params.key_usages.push(KeyUsagePurpose::CrlSign);
-
+    let (not_before, not_after) = default_ca_validity();
+    let spec = CertSpec {
+        common_name,
+        organization: None,
+        dns_sans: &[],
+        uri_sans: &[],
+        is_ca: true,
+        not_before,
+        not_after,
+    };
+    let material = backend::load_ca(&spec, ca_key_pem, ca_cert_pem).map_err(map_backend)?;
     Ok(CaCert {
         cert_pem: ca_cert_pem.to_owned(),
         key_pem: ca_key_pem.to_owned(),
-        params,
-        key_pair,
+        material,
     })
 }
 
-/// Build the certificate parameters for a site certificate.
-///
-/// Separated from [`generate_site_cert`] so tests can verify
-/// the distinguished name entries without generating a full
-/// signed certificate.
-pub(crate) fn build_site_params(site_name: &str, dns_san: &str) -> Result<CertificateParams, GenerateError> {
-    build_site_params_with_org(site_name, dns_san, DEFAULT_ORGANIZATION)
-}
+// ---------------------------------------------------------------------------
+// Identity
+// ---------------------------------------------------------------------------
 
 /// The SPIFFE ID a site is known by inside the grid.
 ///
@@ -359,29 +338,73 @@ pub fn spiffe_id(site_name: &str) -> String {
     format!("spiffe://{SPIFFE_TRUST_DOMAIN}/site/{site_name}")
 }
 
-/// Build certificate parameters for a site certificate with a specific org.
-fn build_site_params_with_org(
-    site_name: &str,
-    dns_san: &str,
-    organization: &str,
-) -> Result<CertificateParams, GenerateError> {
-    let mut params = CertificateParams::default();
-    params.distinguished_name.push(DnType::CommonName, site_name);
-    params.distinguished_name.push(DnType::OrganizationName, organization);
-    params
-        .subject_alt_names
-        .push(rcgen::SanType::DnsName(dns_san.to_owned().try_into()?));
-    // The site's name, bound by the signature rather than asserted beside it.
-    //
-    // An organization proves membership and a DNS name proves where to dial.
-    // Neither answers which site is calling, which is why a peer that holds a
-    // validly issued certificate has been able to claim another site's name.
-    params
-        .subject_alt_names
-        .push(rcgen::SanType::URI(spiffe_id(site_name).try_into()?));
-    params.extended_key_usages.push(ExtendedKeyUsagePurpose::ServerAuth);
-    params.extended_key_usages.push(ExtendedKeyUsagePurpose::ClientAuth);
-    Ok(params)
+/// The identity a site certificate binds: subject name, organization, and SANs.
+///
+/// An organization proves membership and a DNS name proves where to dial.
+/// Neither answers which site is calling, which is why the SPIFFE URI SAN names
+/// the site, bound by the signature rather than asserted beside it.
+pub(crate) struct SiteIdentity {
+    /// Subject common name (the site name).
+    pub(crate) common_name: String,
+    /// Subject organization, proving membership.
+    pub(crate) organization: String,
+    /// DNS SANs, naming where to dial the site.
+    pub(crate) dns_sans: Vec<String>,
+    /// SPIFFE URI SANs, naming which site is calling.
+    pub(crate) uri_sans: Vec<String>,
+}
+
+impl SiteIdentity {
+    /// The certificate spec for this identity over the given validity window.
+    pub(crate) fn spec(&self, not_before: OffsetDateTime, not_after: OffsetDateTime) -> CertSpec<'_> {
+        CertSpec {
+            common_name: &self.common_name,
+            organization: Some(&self.organization),
+            dns_sans: &self.dns_sans,
+            uri_sans: &self.uri_sans,
+            is_ca: false,
+            not_before,
+            not_after,
+        }
+    }
+}
+
+/// Build the identity for a site certificate under [`DEFAULT_ORGANIZATION`].
+pub(crate) fn site_identity(site_name: &str, dns_san: &str) -> SiteIdentity {
+    site_identity_with_org(site_name, dns_san, DEFAULT_ORGANIZATION)
+}
+
+/// Build the identity for a site certificate with a specific organization.
+pub(crate) fn site_identity_with_org(site_name: &str, dns_san: &str, organization: &str) -> SiteIdentity {
+    SiteIdentity {
+        common_name: site_name.to_owned(),
+        organization: organization.to_owned(),
+        dns_sans: vec![dns_san.to_owned()],
+        uri_sans: vec![spiffe_id(site_name)],
+    }
+}
+
+/// Validity window for a generated leaf certificate.
+///
+/// Backdated slightly so a verifier whose clock runs behind does not refuse a
+/// certificate issued moments ago.
+#[expect(
+    clippy::arithmetic_side_effects,
+    reason = "now +/- a fixed span cannot overflow OffsetDateTime"
+)]
+fn default_leaf_validity() -> (OffsetDateTime, OffsetDateTime) {
+    let now = OffsetDateTime::now_utc();
+    (now - Duration::minutes(5), now + Duration::days(365))
+}
+
+/// Validity window for a generated CA certificate.
+#[expect(
+    clippy::arithmetic_side_effects,
+    reason = "now +/- a fixed span cannot overflow OffsetDateTime"
+)]
+fn default_ca_validity() -> (OffsetDateTime, OffsetDateTime) {
+    let now = OffsetDateTime::now_utc();
+    (now - Duration::minutes(5), now + Duration::days(3650))
 }
 
 // ---------------------------------------------------------------------------
@@ -416,6 +439,46 @@ mod tests {
         assert_eq!(with.sans, plain.sans, "adding nothing changes nothing");
     }
     use super::*;
+
+    /// Site the interop fixtures are minted for.
+    #[cfg(test)]
+    const INTEROP_FIXTURE_SITE: &str = "alpha";
+
+    /// Fixture directory for the backend this binary was built with.
+    #[cfg(feature = "fips")]
+    const INTEROP_FIXTURE_DIR: &str = "tests/fixtures/openssl";
+    /// Fixture directory for the backend this binary was built with.
+    #[cfg(not(feature = "fips"))]
+    const INTEROP_FIXTURE_DIR: &str = "tests/fixtures/rcgen";
+
+    /// Regenerate this backend's interop fixtures under `tests/fixtures/<backend>/`.
+    ///
+    /// Ignored in normal runs. Run once per backend to refresh the committed PEM.
+    ///
+    /// ```text
+    /// cargo test -p certs -- --ignored regenerate_interop_fixtures
+    /// cargo test -p certs --no-default-features --features fips -- --ignored regenerate_interop_fixtures
+    /// ```
+    ///
+    /// The leaf is dated far ahead so the committed fixture does not expire.
+    #[test]
+    #[ignore = "writes fixtures to disk, run explicitly to regenerate"]
+    fn regenerate_interop_fixtures() -> Result<(), Box<dyn std::error::Error>> {
+        let ca = generate_ca("grid-ca")?;
+        let now = OffsetDateTime::now_utc();
+        let dns = format!("{INTEROP_FIXTURE_SITE}.grid.internal");
+        let leaf = generate_validity_bounded_dns_cert(
+            &ca,
+            INTEROP_FIXTURE_SITE,
+            &dns,
+            now - Duration::days(1),
+            now + Duration::days(36_500),
+        )?;
+        std::fs::create_dir_all(INTEROP_FIXTURE_DIR)?;
+        std::fs::write(format!("{INTEROP_FIXTURE_DIR}/ca.pem"), &ca.cert_pem)?;
+        std::fs::write(format!("{INTEROP_FIXTURE_DIR}/leaf.pem"), &leaf.cert_pem)?;
+        Ok(())
+    }
 
     #[test]
     fn generate_ca_produces_pem() {
@@ -466,23 +529,17 @@ mod tests {
     }
 
     #[test]
-    fn site_params_contain_correct_distinguished_name() {
-        let params =
-            build_site_params("cluster-a", "cluster-a.grid.internal").unwrap_or_else(|_| std::process::abort());
-        let dn = &params.distinguished_name;
-
-        let cn = dn.get(&DnType::CommonName);
+    fn site_identity_contains_correct_common_name_and_org() {
+        let id = site_identity("cluster-a", "cluster-a.grid.internal");
+        assert_eq!(id.common_name, "cluster-a", "CommonName should be the site name");
         assert_eq!(
-            cn,
-            Some(&rcgen::DnValue::Utf8String("cluster-a".to_owned())),
-            "CommonName should be the site name"
-        );
-
-        let org = dn.get(&DnType::OrganizationName);
-        assert_eq!(
-            org,
-            Some(&rcgen::DnValue::Utf8String(DEFAULT_ORGANIZATION.to_owned())),
+            id.organization, DEFAULT_ORGANIZATION,
             "OrganizationName should be DEFAULT_ORGANIZATION"
+        );
+        assert_eq!(
+            id.uri_sans,
+            vec![spiffe_id("cluster-a")],
+            "the SPIFFE URI SAN names the site"
         );
     }
 
@@ -497,15 +554,10 @@ mod tests {
     }
 
     #[test]
-    fn custom_site_params_contain_requested_organization() {
-        let params = build_site_params_with_org("cluster-a", "cluster-a.grid.internal", "not-ai-grid")
-            .unwrap_or_else(|_| std::process::abort());
-        let dn = &params.distinguished_name;
-
-        let org = dn.get(&DnType::OrganizationName);
+    fn custom_site_identity_contains_requested_organization() {
+        let id = site_identity_with_org("cluster-a", "cluster-a.grid.internal", "not-ai-grid");
         assert_eq!(
-            org,
-            Some(&rcgen::DnValue::Utf8String("not-ai-grid".to_owned())),
+            id.organization, "not-ai-grid",
             "OrganizationName should match the requested organization"
         );
     }

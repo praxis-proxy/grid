@@ -1,19 +1,16 @@
 //! Signing certificate requests from enrollees.
 //!
-//! [`generate_site_cert`](crate::generate_site_cert) mints a key and a
-//! certificate together, which suits a site the grid operates itself. An
-//! enrollee is different: it holds a private key the grid must never see, so it
-//! sends a certificate signing request and the grid signs the public half.
-//!
-//! The request contributes exactly one thing, the public key. Every name on the
-//! issued certificate is rebuilt from the site name the grid assigned, so a
-//! request cannot influence the identity it is granted.
+//! An enrollee holds a private key the grid never sees and sends a request for
+//! the grid to sign the public half. The request contributes only its key, and
+//! every name is rebuilt from the assigned site name, so a request cannot choose
+//! the identity it is granted.
 
-use rcgen::{CertificateSigningRequestParams, Issuer};
-use sha2::{Digest as _, Sha256};
 use time::{Duration, OffsetDateTime};
 
-use crate::generate::{CaCert, GenerateError, build_site_params, spiffe_id};
+use crate::{
+    backend::{self, BackendError},
+    generate::{CaCert, site_identity, spiffe_id},
+};
 
 /// Longest accepted site name, matching the DNS label limit.
 const MAX_SITE_NAME_LEN: usize = 63;
@@ -22,14 +19,11 @@ const MAX_SITE_NAME_LEN: usize = 63;
 /// does not reject a certificate issued moments ago.
 const CLOCK_SKEW_ALLOWANCE: Duration = Duration::minutes(5);
 
-/// How long an issued certificate lasts when a caller does not say.
+/// Default issued-certificate lifetime.
 ///
-/// Finite, because expiry is the only thing that removes a member: a grid has no
-/// revocation list, so a certificate is trusted until it lapses.
-///
-/// Deliberately not the hours-long lifetime this should eventually have. Nothing
-/// renews yet, so a short lifetime would strand every site the first time one
-/// lapsed. Shorten this once renewal exists.
+/// Finite, because expiry is the only way to remove a member (no revocation
+/// list). Longer than it should be until renewal exists, so a lapse cannot
+/// strand a site.
 pub const DEFAULT_SITE_CERT_LIFETIME: Duration = Duration::days(30);
 
 /// When a certificate is valid.
@@ -155,9 +149,8 @@ pub fn validate_site_name(site_name: &str) -> Result<(), EnrollError> {
 /// so an enrollee asking to be `site-a` receives whatever the approver assigned
 /// instead.
 ///
-/// `validity` is explicit rather than defaulted, because the alternative is
-/// rcgen's own default, which runs to the year 4096. A certificate that never
-/// expires cannot be taken away from a member.
+/// `validity` is explicit rather than defaulted, because a certificate that
+/// never expires cannot be taken away from a member.
 ///
 /// # Errors
 ///
@@ -170,76 +163,54 @@ pub fn sign_csr(ca: &CaCert, site_name: &str, csr_pem: &str, validity: Validity)
         return Err(EnrollError::TooLarge);
     }
 
-    // Parsing also verifies the request's self-signature, which is what proves
-    // the requester holds the private half of the key it presents.
-    let mut csr = CertificateSigningRequestParams::from_pem(csr_pem).map_err(|err| map_parse_error(&err))?;
-
-    let public_key_sha256 = key_fingerprint(&csr.public_key);
-
-    // Everything the request asked for is dropped here. The public key is the
-    // only field carried forward, and the names below are the grid's own.
+    // The request's names are dropped, keeping only its public key.
     let primary = format!("{site_name}.{}", crate::SPIFFE_TRUST_DOMAIN);
-    let mut params = build_site_params(site_name, &primary).map_err(|err| signing_failed(&err))?;
-    params.not_before = validity.not_before;
-    params.not_after = validity.not_after;
-    csr.params = params;
+    let id = site_identity(site_name, &primary);
+    let spec = id.spec(validity.not_before, validity.not_after);
 
-    let issuer = Issuer::new(ca.params.clone(), &ca.key_pair);
-    let cert = csr
-        .signed_by(&issuer)
-        .map_err(|err| signing_failed(&GenerateError::Rcgen(err)))?;
+    let signed = backend::sign_csr(&ca.material, &spec, csr_pem).map_err(map_backend_error)?;
 
     Ok(EnrolledCert {
-        cert_pem: cert.pem(),
+        cert_pem: signed.cert_pem,
         spiffe_id: spiffe_id(site_name),
         sans: vec![primary],
-        public_key_sha256,
+        public_key_sha256: hex(&backend::sha256(&signed.public_key_der)),
     })
 }
 
 /// Verify a certificate signing request and return its key fingerprint.
 ///
-/// Parsing verifies the request self-signature, so a request whose signature
-/// does not match its key is refused. No name is involved and no certificate is
-/// issued. This is the possession check run at submit, before an operator has
-/// pinned a name. Issuance happens later in [`sign_csr`] under the assigned name.
+/// Verifying the request self-signature refuses a request whose signature does
+/// not match its key. No name is involved and no certificate is issued. This is
+/// the possession check run at submit, before an operator has pinned a name.
+/// Issuance happens later in [`sign_csr`] under the assigned name.
 ///
 /// # Errors
 ///
 /// [`EnrollError::TooLarge`] past [`MAX_CSR_PEM_BYTES`], and
-/// [`EnrollError::BadSignature`], [`EnrollError::UnsupportedExtension`], or
-/// [`EnrollError::Malformed`] when the request does not parse.
+/// [`EnrollError::BadSignature`] or [`EnrollError::Malformed`] when the request
+/// does not verify or parse.
 pub fn verify_csr(csr_pem: &str) -> Result<String, EnrollError> {
     if csr_pem.len() > MAX_CSR_PEM_BYTES {
         return Err(EnrollError::TooLarge);
     }
-    let csr = CertificateSigningRequestParams::from_pem(csr_pem).map_err(|err| map_parse_error(&err))?;
-    Ok(key_fingerprint(&csr.public_key))
+    let public_key_der = backend::csr_spki_der(csr_pem).map_err(map_backend_error)?;
+    Ok(hex(&backend::sha256(&public_key_der)))
 }
 
-/// Map an rcgen request-parse failure onto the request-side error it stands for.
-///
-/// An invalid self-signature is the one that matters: it means the caller does
-/// not hold the private half, so the request is refused rather than issued.
-fn map_parse_error(err: &rcgen::Error) -> EnrollError {
-    if *err == rcgen::Error::InvalidCertificationRequestSignature {
-        EnrollError::BadSignature
-    } else if *err == rcgen::Error::UnsupportedExtension {
-        EnrollError::UnsupportedExtension
-    } else {
-        EnrollError::Malformed
+/// Map a backend request failure onto the request-side error it stands for.
+fn map_backend_error(err: BackendError) -> EnrollError {
+    match err {
+        BackendError::CsrBadSignature => EnrollError::BadSignature,
+        BackendError::CsrUnsupportedExtension => EnrollError::UnsupportedExtension,
+        BackendError::ParseCsr => EnrollError::Malformed,
+        BackendError::KeyGen(msg) | BackendError::Sign(msg) | BackendError::InvalidCaKey(msg) => {
+            EnrollError::Signing(msg)
+        },
+        BackendError::InvalidCaCert | BackendError::CaCertKeyMismatch | BackendError::BadSignature => {
+            EnrollError::Signing("signing failed".to_owned())
+        },
     }
-}
-
-/// Lowercase hex SHA-256 over a request's `SubjectPublicKeyInfo`.
-fn key_fingerprint(public_key: &rcgen::PublicKey) -> String {
-    use rcgen::PublicKeyData as _;
-    hex(&Sha256::digest(public_key.der_bytes()))
-}
-
-/// Wrap a generation failure, which is a grid-side fault rather than a bad request.
-fn signing_failed(err: &GenerateError) -> EnrollError {
-    EnrollError::Signing(err.to_string())
 }
 
 /// Lowercase hex encoding.
@@ -443,6 +414,37 @@ mod tests {
         let (other_csr, _other) = plain_csr();
         let other = sign_csr(&ca, "site-d", &other_csr, Validity::default()).expect("sign other");
         assert_ne!(first.public_key_sha256, other.public_key_sha256);
+    }
+
+    /// The submit-time possession check, exercised on its own.
+    #[test]
+    fn verify_csr_accepts_a_valid_request_and_names_its_key() {
+        let (csr, _key) = plain_csr();
+        let fingerprint = verify_csr(&csr).expect("a well-formed request must verify");
+        assert_eq!(fingerprint.len(), 64);
+        assert!(
+            fingerprint
+                .chars()
+                .all(|ch| ch.is_ascii_hexdigit() && !ch.is_ascii_uppercase())
+        );
+
+        // The submit fingerprint must match the one issuance records.
+        let ca = generate_ca("test-ca").expect("ca");
+        let issued = sign_csr(&ca, "site-d", &csr, Validity::default()).expect("sign");
+        assert_eq!(fingerprint, issued.public_key_sha256);
+    }
+
+    #[test]
+    fn verify_csr_refuses_a_tampered_or_malformed_request() {
+        let (csr, _key) = plain_csr();
+        let der = pem::parse(&csr).expect("pem");
+        let mut bytes = der.contents().to_vec();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xFF;
+        let tampered = pem::encode(&pem::Pem::new("CERTIFICATE REQUEST", bytes));
+
+        assert!(matches!(verify_csr(&tampered), Err(EnrollError::BadSignature)));
+        assert!(matches!(verify_csr("not a pem file"), Err(EnrollError::Malformed)));
     }
 
     /// An enrolled site and a grid-operated one have to look the same to a verifier.

@@ -10,6 +10,7 @@ publish = false
 [features]
 default = ["tls-rustls"]
 tls-rustls = [
+    "certs/rcgen",
     "reqwest/rustls-no-provider",
     "rmcp/reqwest-tls-no-provider",
     "kube/rustls-tls",
@@ -19,6 +20,7 @@ tls-rustls = [
     "dep:tokio-rustls",
 ]
 fips = [
+    "certs/fips",
     "reqwest/native-tls",
     "rmcp/reqwest-native-tls",
     "kube/openssl-tls",
@@ -32,7 +34,7 @@ fips = [
 axum = { workspace = true }
 bytes = { workspace = true }
 clap = { workspace = true, features = ["env"] }
-certs = { path = "../certs" }
+certs = { path = "../certs", default-features = false }
 crdt = { path = "../crdt" }
 swim = { path = "../swim" }
 futures = { workspace = true }

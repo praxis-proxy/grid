@@ -6,13 +6,25 @@ rust-version.workspace = true
 license.workspace = true
 publish = false
 
+[features]
+default = ["rcgen"]
+rcgen = ["dep:rcgen", "dep:sha2", "x509-parser/verify"]
+fips = ["dep:openssl"]
+
 [dependencies]
 pem = "4"
-rcgen = { workspace = true, features = ["x509-parser"] }
-sha2 = { workspace = true }
+# x509-parser/verify is the only ring path; the rcgen feature gates it.
+x509-parser = { workspace = true }
+rcgen = { workspace = true, features = ["x509-parser"], optional = true }
+openssl = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
 thiserror = { workspace = true }
 time = { workspace = true }
-x509-parser = { workspace = true }
+
+[dev-dependencies]
+# Interop tests exercise both backends, so a fips test build still needs rcgen.
+rcgen = { workspace = true, features = ["x509-parser"] }
+x509-parser = { workspace = true, features = ["verify"] }
 
 [lints]
 workspace = true

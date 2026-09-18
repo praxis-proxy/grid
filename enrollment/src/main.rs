@@ -7,6 +7,13 @@ use enrollment::{AppState, GridAdmins, Store, authz::Authorizer, router};
 use sqlx::postgres::{PgConnectOptions, PgSslMode};
 use tokio::signal;
 
+/// Server TLS config: rustls by default, system openssl under `fips`.
+#[cfg(not(feature = "fips"))]
+type TlsConfig = axum_server::tls_rustls::RustlsConfig;
+/// Server TLS config: rustls by default, system openssl under `fips`.
+#[cfg(feature = "fips")]
+type TlsConfig = axum_server::tls_openssl::OpenSSLConfig;
+
 /// How long in-flight requests are given to finish once a shutdown signal lands.
 /// Kept below the Kubernetes default 30s termination grace period, so the drain
 /// has margin before SIGKILL rather than racing it.
@@ -82,12 +89,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let addr: SocketAddr = listen.parse()?;
     tracing::info!(%addr, "enrollment service listening over https");
-    Box::pin(
-        axum_server::bind_rustls(addr, tls)
-            .handle(handle)
-            .serve(router(state).into_make_service()),
-    )
-    .await?;
+    #[cfg(not(feature = "fips"))]
+    let server = axum_server::bind_rustls(addr, tls);
+    #[cfg(feature = "fips")]
+    let server = axum_server::bind_openssl(addr, tls);
+    Box::pin(server.handle(handle).serve(router(state).into_make_service())).await?;
     Ok(())
 }
 
@@ -134,12 +140,17 @@ async fn shutdown_signal(handle: Handle<SocketAddr>) {
     clippy::infinite_loop,
     reason = "a background reloader runs for the life of the process"
 )]
-async fn reload_tls(config: axum_server::tls_rustls::RustlsConfig, cert_path: String, key_path: String) {
+async fn reload_tls(config: TlsConfig, cert_path: String, key_path: String) {
     let mut ticker = tokio::time::interval(TLS_RELOAD_INTERVAL);
     ticker.tick().await;
     loop {
         ticker.tick().await;
-        if let Err(err) = config.reload_from_pem_file(&cert_path, &key_path).await {
+        // rustls reloads asynchronously, the openssl acceptor reload synchronously.
+        #[cfg(not(feature = "fips"))]
+        let reloaded = config.reload_from_pem_file(&cert_path, &key_path).await;
+        #[cfg(feature = "fips")]
+        let reloaded = config.reload_from_pem_file(&cert_path, &key_path);
+        if let Err(err) = reloaded {
             tracing::warn!(%err, "server certificate reload failed, keeping the current certificate");
         }
     }
@@ -150,13 +161,26 @@ async fn reload_tls(config: axum_server::tls_rustls::RustlsConfig, cert_path: St
 /// The service signs CSRs with the grid CA, so it must not serve in the clear. A
 /// missing certificate or key returns an error here, before any socket is bound,
 /// the same fail-closed posture as the CA material.
-async fn load_tls(cert: &str, key: &str) -> Result<axum_server::tls_rustls::RustlsConfig, Box<dyn std::error::Error>> {
+#[cfg(not(feature = "fips"))]
+async fn load_tls(cert: &str, key: &str) -> Result<TlsConfig, Box<dyn std::error::Error>> {
     // Install the ring provider process-wide, as the operator does, before rustls
     // builds any configuration.
     if rustls::crypto::ring::default_provider().install_default().is_err() {
         tracing::debug!("a rustls crypto provider was already installed");
     }
     Ok(Box::pin(axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key)).await?)
+}
+
+/// Load the mandatory server TLS material through system openssl (fips build).
+///
+/// The openssl acceptor builds synchronously, with no provider to install.
+#[cfg(feature = "fips")]
+#[expect(
+    clippy::unused_async,
+    reason = "matches the default build's async load_tls signature"
+)]
+async fn load_tls(cert: &str, key: &str) -> Result<TlsConfig, Box<dyn std::error::Error>> {
+    Ok(axum_server::tls_openssl::OpenSSLConfig::from_pem_file(cert, key)?)
 }
 
 /// Open the store the enrollment record lives in.
@@ -185,9 +209,10 @@ async fn open_store() -> Result<Store, Box<dyn std::error::Error>> {
 ///
 /// The store holds token digests, pinned names, and grid-admin identities, so the
 /// database hop must be encrypted. sslmode disable, allow, and prefer permit a
-/// plaintext fallback and are rejected before any connection. require and
-/// verify-ca encrypt without fully verifying the server, so they pass with a
-/// warning that verify-full is the intended posture.
+/// plaintext fallback and are rejected before any connection. A fips build then
+/// requires verify-full and fails closed on anything less, since the FIPS posture
+/// rests on a fully verified server. A default build accepts require and verify-ca
+/// with a warning that verify-full is the intended posture.
 fn require_db_tls(url: &str) -> Result<(), Box<dyn std::error::Error>> {
     let mode = PgConnectOptions::from_str(url)?.get_ssl_mode();
     if matches!(mode, PgSslMode::Disable | PgSslMode::Allow | PgSslMode::Prefer) {
@@ -197,6 +222,12 @@ fn require_db_tls(url: &str) -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
     if !matches!(mode, PgSslMode::VerifyFull) {
+        #[cfg(feature = "fips")]
+        return Err(format!(
+            "{DB_CONNECTION_URL} must set sslmode=verify-full in a fips build: a lesser mode leaves the server certificate unverified"
+        )
+        .into());
+        #[cfg(not(feature = "fips"))]
         tracing::warn!(
             "Postgres TLS is on but the server certificate is not fully verified. Set sslmode=verify-full with a CA bundle to close a man-in-the-middle path"
         );
@@ -298,13 +329,38 @@ mod tests {
     }
 
     #[test]
-    fn a_url_that_requires_tls_is_accepted() {
+    fn verify_full_is_accepted() {
+        assert!(
+            require_db_tls("postgres://u:p@h/db?sslmode=verify-full").is_ok(),
+            "verify-full fully verifies the server and must be accepted in every build"
+        );
+    }
+
+    #[cfg(not(feature = "fips"))]
+    #[test]
+    fn a_partially_verified_url_is_accepted_outside_fips() {
         for url in [
             "postgres://u:p@h/db?sslmode=require",
             "postgres://u:p@h/db?sslmode=verify-ca",
-            "postgres://u:p@h/db?sslmode=verify-full",
         ] {
-            assert!(require_db_tls(url).is_ok(), "{url} requires TLS and must be accepted");
+            assert!(
+                require_db_tls(url).is_ok(),
+                "{url} encrypts the hop and must be accepted in a default build"
+            );
+        }
+    }
+
+    #[cfg(feature = "fips")]
+    #[test]
+    fn a_partially_verified_url_is_refused_under_fips() {
+        for url in [
+            "postgres://u:p@h/db?sslmode=require",
+            "postgres://u:p@h/db?sslmode=verify-ca",
+        ] {
+            assert!(
+                require_db_tls(url).is_err(),
+                "{url} leaves the server unverified and a fips build must fail closed"
+            );
         }
     }
 }

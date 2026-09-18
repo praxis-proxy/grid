@@ -83,8 +83,7 @@ pub fn verify_site_cert(ca_cert_pem: &str, leaf_pem: &str, claimed_site: &str) -
     if leaf.issuer() != ca.subject() {
         return Err(VerifyError::WrongIssuer);
     }
-    leaf.verify_signature(Some(ca.public_key()))
-        .map_err(|_bad| VerifyError::BadSignature)?;
+    crate::backend::verify_leaf_signature(ca_cert_pem, leaf_pem).map_err(|_bad| VerifyError::BadSignature)?;
     if !leaf.validity().is_valid() {
         return Err(VerifyError::NotCurrentlyValid);
     }
@@ -112,14 +111,12 @@ pub fn verify_site_cert(ca_cert_pem: &str, leaf_pem: &str, claimed_site: &str) -
 ///
 /// Returns [`VerifyError`] if the certificate is oversized or unparseable.
 pub fn canonical_fingerprint(cert_pem: &str) -> Result<String, VerifyError> {
-    use sha2::{Digest as _, Sha256};
-
     if cert_pem.len() > MAX_CERT_PEM_BYTES {
         return Err(VerifyError::TooLarge);
     }
     let der = pem::parse(cert_pem).map_err(|_bad| VerifyError::Malformed)?;
 
-    Ok(Sha256::digest(der.contents())
+    Ok(crate::backend::sha256(der.contents())
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect())

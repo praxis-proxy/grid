@@ -10,8 +10,6 @@
 
 use std::collections::HashMap;
 
-use sha2::{Digest as _, Sha256};
-
 /// Grid-admins allowed to mint and revoke site tokens.
 #[derive(Debug, Default)]
 pub struct GridAdmins {
@@ -65,8 +63,11 @@ impl GridAdmins {
 }
 
 /// Lowercase hex SHA-256 of a token.
+///
+/// Routed through certs so a fips build hashes this credential in the validated
+/// module rather than on the sha2 crate.
 pub(crate) fn digest(token: &str) -> String {
-    Sha256::digest(token.as_bytes())
+    certs::sha256(token.as_bytes())
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
@@ -111,10 +112,7 @@ mod tests {
     fn the_debug_view_shows_names_not_tokens() {
         let admins = GridAdmins::from_table("alice: s3cret\n");
         let debug = format!("{admins:?}");
-        let expected: String = Sha256::digest(b"s3cret")
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect();
+        let expected = digest("s3cret");
         assert!(!debug.contains("s3cret"), "the token itself is not in the debug view");
         assert!(debug.contains(&expected), "the digest is what is held");
         assert!(debug.contains("alice"), "the grid-admin name is not a secret");
@@ -123,10 +121,7 @@ mod tests {
     #[test]
     fn a_token_is_held_as_its_digest() {
         let admins = GridAdmins::from_table("alice: s3cret\n");
-        let expected: String = Sha256::digest(b"s3cret")
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect();
+        let expected = digest("s3cret");
         assert!(
             admins.resolve(&expected).is_none(),
             "the digest is not itself a valid token"

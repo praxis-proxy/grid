@@ -442,13 +442,26 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
 
 /// A fresh one-time site token: 256 bits from the system CSPRNG, hex encoded.
 ///
-/// ring's `SystemRandom`, the same source the gossip signing path uses, and never
-/// `SmallRng`. Hex keeps it header-safe with no padding.
+/// The default build draws from ring's `SystemRandom`. A fips build draws from
+/// system openssl so the entropy source stays in the validated module. Hex keeps
+/// it header-safe with no padding.
 fn generate_token() -> Result<String, ApiError> {
-    use ring::rand::SecureRandom as _;
     let mut bytes = [0_u8; 32];
-    ring::rand::SystemRandom::new()
-        .fill(&mut bytes)
-        .map_err(|_unspecified| ApiError::Internal("system random source unavailable".to_owned()))?;
+    fill_random(&mut bytes)?;
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+/// Fill a buffer from ring's system CSPRNG.
+#[cfg(not(feature = "fips"))]
+fn fill_random(bytes: &mut [u8]) -> Result<(), ApiError> {
+    use ring::rand::SecureRandom as _;
+    ring::rand::SystemRandom::new()
+        .fill(bytes)
+        .map_err(|_unspecified| ApiError::Internal("system random source unavailable".to_owned()))
+}
+
+/// Fill a buffer from system openssl, keeping the entropy source in the module.
+#[cfg(feature = "fips")]
+fn fill_random(bytes: &mut [u8]) -> Result<(), ApiError> {
+    openssl::rand::rand_bytes(bytes).map_err(|_err| ApiError::Internal("system random source unavailable".to_owned()))
 }

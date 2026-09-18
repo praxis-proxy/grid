@@ -9,6 +9,11 @@
 //! Storage is a backend enum, so a MaaS deployment can point this at the Postgres
 //! it already runs while a standalone grid brings its own.
 
+#[cfg(all(feature = "tls-rustls", feature = "fips"))]
+compile_error!("features `tls-rustls` and `fips` are mutually exclusive");
+#[cfg(not(any(feature = "tls-rustls", feature = "fips")))]
+compile_error!("one of `tls-rustls` or `fips` must be enabled");
+
 pub mod api;
 pub mod auth;
 pub mod authz;

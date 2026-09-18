@@ -144,17 +144,21 @@ jobs:
       # operator tls_probe.rs.
       - name: Clippy (fips)
         run: |
+          cargo clippy -p certs --no-default-features --features fips --all-targets -- -D warnings
+          cargo clippy -p enrollment --no-default-features --features fips --all-targets -- -D warnings
           cargo clippy --manifest-path operator/Cargo.toml --no-default-features --features fips --lib --bins -- -D warnings
           cargo clippy --manifest-path overlay-sync/Cargo.toml --no-default-features --features fips --bins -- -D warnings
 
       - name: Unit tests (fips)
         run: |
+          cargo test -p certs --no-default-features --features fips
+          cargo test -p enrollment --no-default-features --features fips
           cargo test --manifest-path operator/Cargo.toml --no-default-features --features fips
           cargo test --manifest-path overlay-sync/Cargo.toml --no-default-features --features fips
 
       # fips must exclude rustls: TLS routes through system OpenSSL. ring stays
-      # present (rcgen cert setup, swim gossip), outside the TLS boundary, so it
-      # is not asserted here.
+      # present at the operator level (swim gossip), outside the TLS boundary, so
+      # it is asserted per-crate for certs, not operator-wide.
       - name: Assert fips build excludes rustls
         run: |
           for m in operator/Cargo.toml overlay-sync/Cargo.toml; do
@@ -164,3 +168,53 @@ jobs:
             fi
           done
           echo "no rustls in fips builds"
+
+      # certs is the crypto identity crate: its fips build must carry no ring and
+      # no sha2 (EVP keygen/sign, no rcgen, x509-parser verify off, OpenSSL EVP
+      # digest). Match on tree content, not exit code: certs' own dev-deps keep
+      # both in the resolve, so `-i` exits 0 even when no non-dev edge reaches them.
+      - name: Assert fips build of certs excludes ring and sha2
+        run: |
+          for pkg in ring sha2; do
+            if cargo tree -p certs --no-default-features --features fips -e no-dev 2>/dev/null | grep -q "$pkg v"; then
+              echo "fips build of certs unexpectedly links $pkg"
+              cargo tree -p certs --no-default-features --features fips -e no-dev -i "$pkg"
+              exit 1
+            fi
+          done
+          echo "no ring or sha2 in certs fips build"
+
+      # enrollment is the production CA signer: its fips build routes TLS (listener
+      # and Postgres transport), keygen/signing, RNG, and the token digest through
+      # system openssl, so it carries no ring and no rustls. sqlx-postgres still
+      # links sha2/md-5 for Postgres password auth, unused under client-cert auth.
+      - name: Assert fips build of enrollment excludes ring and rustls
+        run: |
+          for pkg in ring rustls; do
+            if cargo tree -p enrollment --no-default-features --features fips -e no-dev 2>/dev/null | grep -q "$pkg v"; then
+              echo "fips build of enrollment unexpectedly links $pkg"
+              cargo tree -p enrollment --no-default-features --features fips -e no-dev -i "$pkg"
+              exit 1
+            fi
+          done
+          echo "no ring or rustls in enrollment fips build"
+
+      # A vendored openssl (openssl-src) statically links a NON-validated module while
+      # every ring/rustls assertion above still passes, silently breaking FIPS. The
+      # openssl crate must link the system libssl/libcrypto, so openssl-src must be
+      # absent from every fips build.
+      - name: Assert fips builds link no vendored openssl
+        run: |
+          for pkg in certs enrollment; do
+            if cargo tree -p "$pkg" --no-default-features --features fips -e no-dev 2>/dev/null | grep -q 'openssl-src'; then
+              echo "fips build of $pkg unexpectedly vendors openssl (openssl-src)"
+              exit 1
+            fi
+          done
+          for m in operator/Cargo.toml overlay-sync/Cargo.toml; do
+            if cargo tree --manifest-path "$m" --no-default-features --features fips -e no-dev 2>/dev/null | grep -q 'openssl-src'; then
+              echo "fips build of $m unexpectedly vendors openssl (openssl-src)"
+              exit 1
+            fi
+          done
+          echo "no vendored openssl in fips builds"
