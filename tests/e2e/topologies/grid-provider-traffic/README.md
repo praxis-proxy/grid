@@ -154,14 +154,18 @@ cargo test -p xtask provider_traffic --locked
 ```console
 export GRID_XTASK_OPERATOR_IMAGE=grid-operator:provider-traffic-qualification
 export GRID_XTASK_GATEWAY_IMAGE=praxis-ai:provider-traffic-qualification
-export GRID_XTASK_VCR_IMAGE=ghcr.io/neuralmagic/vllm-vcr:vllm0.23
+export GRID_XTASK_SIM_IMAGE=ghcr.io/neuralmagic/vllm-vcr:vllm0.23
 export GRID_XTASK_IMAGE_PULL_POLICY=Never
 
 cargo xtask env run-grid-provider-traffic-qualification \
   --forge-config tests/e2e/topologies/grid-provider-traffic/forge.yaml \
-  --quick \
+  --full \
   --teardown
 ```
+
+The provider-traffic qualification has one complete six-scenario proof set.
+Use `--full` for release qualification; `--quick` remains available for the
+same focused proof when a bounded diagnostic run is preferred.
 
 For registry-hosted images, use immutable tags or digests and set
 `GRID_XTASK_IMAGE_PULL_POLICY=IfNotPresent`. Do not reuse evidence from a run

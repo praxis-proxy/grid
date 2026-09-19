@@ -1,6 +1,7 @@
 # Provider gateway fixture for the static-weighted qualification.
 insecure_options:
   allow_private_endpoints: true
+  allow_private_upstreams: true
 
 listeners:
   - name: provider

@@ -256,7 +256,7 @@ fn resolved_images() -> Result<ResolvedImages, String> {
         env::var("GRID_XTASK_GATEWAY_IMAGE").ok(),
         env::var("GRID_XTASK_OPERATOR_IMAGE").ok(),
         env::var("GRID_XTASK_OVERLAY_SYNC_IMAGE").ok(),
-        env::var("GRID_XTASK_VCR_IMAGE").ok(),
+        env::var("GRID_XTASK_SIM_IMAGE").ok(),
         env::var("GRID_XTASK_IMAGE_PULL_POLICY").ok(),
     )
 }

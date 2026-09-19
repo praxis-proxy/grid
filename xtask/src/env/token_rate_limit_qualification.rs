@@ -928,7 +928,7 @@ fn load_images(session: &Session) -> Result<(), Box<dyn std::error::Error>> {
     load_image(&format!("praxis-ai:{tag}"))?;
     load_image(&format!("grid-operator:{tag}"))?;
     load_image(&format!("grid-overlay-sync:{tag}"))?;
-    load_image(&crate::env::image_overrides::vcr_image())?;
+    load_image(&crate::env::image_overrides::sim_image())?;
     Ok(())
 }
 

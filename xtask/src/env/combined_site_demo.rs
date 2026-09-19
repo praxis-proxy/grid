@@ -3774,7 +3774,7 @@ fn load_images_into_clusters(forge_bin: &Path, resolved_config: &Path) -> Result
         std::env::var("GRID_XTASK_GATEWAY_IMAGE").unwrap_or_else(|_| "ghcr.io/praxis-proxy/ai:0.3.0".to_owned());
     let operator = std::env::var("GRID_XTASK_OPERATOR_IMAGE")
         .unwrap_or_else(|_| "ghcr.io/praxis-proxy/grid-operator:v0.1.4".to_owned());
-    let vcr = crate::env::image_overrides::vcr_image();
+    let vcr = crate::env::image_overrides::sim_image();
 
     for image in [&gateway, &operator, &vcr] {
         require_local_image(image)?;
@@ -4679,7 +4679,7 @@ fn apply_image_overrides(config: &mut serde_yaml::Value) {
         std::env::var("GRID_XTASK_GATEWAY_IMAGE").unwrap_or_else(|_| "ghcr.io/praxis-proxy/ai:0.3.0".to_owned());
     let operator_image = std::env::var("GRID_XTASK_OPERATOR_IMAGE")
         .unwrap_or_else(|_| "ghcr.io/praxis-proxy/grid-operator:v0.1.4".to_owned());
-    let vcr_image = crate::env::image_overrides::vcr_image();
+    let vcr_image = crate::env::image_overrides::sim_image();
     let image_pull_policy = std::env::var("GRID_XTASK_IMAGE_PULL_POLICY").unwrap_or_else(|_| "IfNotPresent".to_owned());
 
     let (gateway_repo, gateway_tag) = parse_image_ref(&gateway_image);
@@ -4772,6 +4772,9 @@ fn authorize_discovered_sites() -> Result<(), Box<dyn std::error::Error>> {
     const TRUST_TIMEOUT: Duration = Duration::from_secs(120);
     const GRID_NETWORK: &str = "grid-combined-site";
 
+    eprintln!("  waiting for all remote GridSites before trust authorization");
+    wait_for_all_discovered_sites(GRID_NETWORK, TRUST_TIMEOUT)?;
+
     for local in CLUSTERS {
         let context = format!("kind-grid-combined-{local}");
         eprintln!();
@@ -4791,6 +4794,66 @@ fn authorize_discovered_sites() -> Result<(), Box<dyn std::error::Error>> {
     }
     eprintln!("  [OK] All auto-discovered remote GridSites authorized and Active");
     Ok(())
+}
+
+/// Wait until every operator has an endpoint for both remote GridSites.
+///
+/// This is a global barrier: trust patching must not begin while another
+/// cluster is still waiting for its provider gateway endpoint to be
+/// advertised through SWIM.
+#[expect(
+    clippy::too_many_lines,
+    reason = "bounded polling loop reports each missing cluster/site pair"
+)]
+fn wait_for_all_discovered_sites(network: &str, timeout: Duration) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let mut missing = Vec::new();
+        for local in CLUSTERS {
+            let context = format!("kind-grid-combined-{local}");
+            for remote in CLUSTERS {
+                if local == remote {
+                    continue;
+                }
+                let name = format!("{network}-{remote}");
+                let output = Command::new("kubectl")
+                    .args([
+                        "--context",
+                        &context,
+                        "get",
+                        "gridsites",
+                        &name,
+                        "-o",
+                        "jsonpath={.spec.gridNetworkRef}/{.spec.egress.address}",
+                        "--ignore-not-found",
+                    ])
+                    .output()?;
+                let raw = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+                if !gridsite_endpoint_is_ready(&raw, network) {
+                    missing.push(format!("{local}/{name}"));
+                }
+            }
+        }
+        if missing.is_empty() {
+            eprintln!("  [OK] all six remote GridSites discovered with endpoints");
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "timeout waiting for all remote GridSites with endpoints; missing: {}",
+                missing.join(", ")
+            )
+            .into());
+        }
+        #[expect(clippy::disallowed_methods, reason = "bounded polling wait for operator discovery")]
+        std::thread::sleep(Duration::from_secs(2));
+    }
+}
+
+/// Check the compact `network/address` observation returned by kubectl.
+fn gridsite_endpoint_is_ready(observation: &str, expected_network: &str) -> bool {
+    let (network, address) = observation.split_once('/').unwrap_or((observation, ""));
+    network == expected_network && !address.is_empty()
 }
 
 /// Deploy the combined-site environment.
@@ -5649,7 +5712,7 @@ fn create_external_inference_provider(
 )]
 fn deploy_secondary_mock_provider(site: &str) -> Result<(), Box<dyn std::error::Error>> {
     let context = format!("kind-grid-combined-{site}");
-    let vcr_image = crate::env::image_overrides::vcr_image();
+    let vcr_image = crate::env::image_overrides::sim_image();
     let image_pull_policy = std::env::var("GRID_XTASK_IMAGE_PULL_POLICY").unwrap_or_else(|_| "Never".to_owned());
     let deploy_name = format!("vcr-inference-{site}-secondary");
     let provider_name = format!("vcr-{site}-provider-secondary");
@@ -7548,6 +7611,32 @@ fn collect_external_provider_evidence(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discovery_barrier_rejects_missing_gridsite() {
+        assert!(!gridsite_endpoint_is_ready("", "grid-combined-site"));
+    }
+
+    #[test]
+    fn discovery_barrier_rejects_gridsite_without_endpoint() {
+        assert!(!gridsite_endpoint_is_ready("grid-combined-site/", "grid-combined-site"));
+    }
+
+    #[test]
+    fn discovery_barrier_accepts_expected_gridsite_endpoint() {
+        assert!(gridsite_endpoint_is_ready(
+            "grid-combined-site/172.18.255.212:8443",
+            "grid-combined-site"
+        ));
+    }
+
+    #[test]
+    fn discovery_barrier_rejects_wrong_network() {
+        assert!(!gridsite_endpoint_is_ready(
+            "other-network/172.18.255.212:8443",
+            "grid-combined-site"
+        ));
+    }
 
     #[test]
     fn deployment_zero_accepts_omitted_status_counters() {

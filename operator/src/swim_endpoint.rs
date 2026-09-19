@@ -304,7 +304,6 @@ where
     Ok(result.addresses)
 }
 
-
 /// Resolve an endpoint with an injectable resolver for deterministic tests.
 ///
 /// # Errors

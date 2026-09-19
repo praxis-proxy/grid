@@ -1312,7 +1312,7 @@ fn load_images_into_clusters() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|_| "praxis-ai:static-weighted-qualification".to_owned());
     let operator = std::env::var("GRID_XTASK_OPERATOR_IMAGE")
         .unwrap_or_else(|_| "grid-operator:static-weighted-qualification".to_owned());
-    let vcr = crate::env::image_overrides::vcr_image();
+    let vcr = crate::env::image_overrides::sim_image();
 
     for image in [&gateway, &operator, &vcr] {
         require_local_image(image)?;
@@ -2292,7 +2292,7 @@ fn apply_image_overrides(config: &mut serde_yaml::Value) {
         .unwrap_or_else(|_| "praxis-ai:static-weighted-qualification".to_owned());
     let operator_image = std::env::var("GRID_XTASK_OPERATOR_IMAGE")
         .unwrap_or_else(|_| "grid-operator:static-weighted-qualification".to_owned());
-    let vcr_image = crate::env::image_overrides::vcr_image();
+    let vcr_image = crate::env::image_overrides::sim_image();
     let image_pull_policy = std::env::var("GRID_XTASK_IMAGE_PULL_POLICY").unwrap_or_else(|_| "Never".to_owned());
 
     let (gateway_repo, gateway_tag) = parse_image_ref(&gateway_image);
@@ -2993,14 +2993,14 @@ mod static_phase_policy_tests {
     }
 }
 
-/// Run the quick-mode proof scenarios using the assertion framework.
+/// Run the static-weighted proof scenarios using the assertion framework.
 ///
 /// Run the infrastructure checks and three focused static-weighted phases.
 #[expect(
     clippy::too_many_lines,
     reason = "The focused demo presents its six proof phases in order."
 )]
-fn run_quick_scenarios() -> (BTreeMap<String, ProofResult>, Vec<StaticPhaseEvidence>) {
+fn run_static_weighted_scenarios() -> (BTreeMap<String, ProofResult>, Vec<StaticPhaseEvidence>) {
     let mut results = BTreeMap::new();
     let mut scenario_num: usize = 0;
     let mut scenario = || {
@@ -3009,7 +3009,7 @@ fn run_quick_scenarios() -> (BTreeMap<String, ProofResult>, Vec<StaticPhaseEvide
     };
 
     eprintln!();
-    eprintln!("=== QUICK MODE SCENARIOS ===");
+    eprintln!("=== STATIC WEIGHTED SCENARIOS ===");
     eprintln!();
 
     eprintln!("[SCENARIO {}] Verify three provider clusters are healthy", scenario());
@@ -3539,16 +3539,13 @@ fn write_evidence(path: &Path, evidence: &Evidence) -> Result<(), Box<dyn std::e
     Ok(())
 }
 
-/// Run the focused static-weighted qualification.
+/// Run the static-weighted qualification.
 #[expect(
     clippy::too_many_lines,
     reason = "The public demo entrypoint keeps setup, proof, evidence, and teardown visible."
 )]
 pub(crate) fn run(forge_config: &Path, options: &GlbDemoOptions) -> Result<(), Box<dyn std::error::Error>> {
-    if options.mode() != DemoMode::Quick {
-        return Err("static-weighted supports only the focused quick proof".into());
-    }
-    let mode = DemoMode::Quick;
+    let mode = options.mode();
     let run_id = format_utc_timestamp();
     drop(RUN_NAME.set(format!("{BASE_RUN_NAME}-{run_id}")));
     let wall_start = Instant::now();
@@ -3566,7 +3563,7 @@ pub(crate) fn run(forge_config: &Path, options: &GlbDemoOptions) -> Result<(), B
     let proof_results = match &setup_ctx {
         Ok(context) => {
             eprintln!("{OUTPUT_RULE}");
-            eprintln!("Grid Provider Traffic Qualification");
+            eprintln!("Grid Static Weighted Qualification");
             eprintln!("Mode: {}", if mode == DemoMode::Quick { "quick" } else { "full" });
             eprintln!("Config: {}", forge_config.display());
             eprintln!("{OUTPUT_RULE}");
@@ -3586,7 +3583,7 @@ pub(crate) fn run(forge_config: &Path, options: &GlbDemoOptions) -> Result<(), B
                     eprintln!("ENVIRONMENT READY - Starting proof scenarios");
                     eprintln!("{OUTPUT_RULE}");
 
-                    let (scenario_results, phase_evidence) = run_quick_scenarios();
+                    let (scenario_results, phase_evidence) = run_static_weighted_scenarios();
                     static_phases = phase_evidence;
 
                     let failed_proofs: Vec<&str> = scenario_results

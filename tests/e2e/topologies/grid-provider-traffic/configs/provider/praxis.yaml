@@ -58,3 +58,8 @@ filter_chains:
 admin:
   address: "127.0.0.1:9901"
 shutdown_timeout_secs: 5
+
+# The qualification routes to an in-cluster VCR service.
+insecure_options:
+  allow_private_endpoints: true
+  allow_private_upstreams: true

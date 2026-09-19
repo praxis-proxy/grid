@@ -99,7 +99,7 @@ defaults; release validation should provide unique references through the
 
 Supported overrides are `GRID_XTASK_GATEWAY_IMAGE`,
 `GRID_XTASK_OPERATOR_IMAGE`, `GRID_XTASK_OVERLAY_SYNC_IMAGE`,
-`GRID_XTASK_VCR_IMAGE`, and `GRID_XTASK_IMAGE_PULL_POLICY`. Explicit image
+`GRID_XTASK_SIM_IMAGE`, and `GRID_XTASK_IMAGE_PULL_POLICY`. Explicit image
 references are materialized into the Forge configuration, loaded into Kind
 when the policy is `Never`, and recorded in qualification evidence. The runner
 fails before deployment if an explicit reference is malformed, missing, or
@@ -113,7 +113,7 @@ cargo build -p forge
 export GRID_XTASK_GATEWAY_IMAGE=praxis-ai:single-cluster-qualification-$RUN_ID
 export GRID_XTASK_OPERATOR_IMAGE=grid-operator:single-cluster-qualification-$RUN_ID
 export GRID_XTASK_OVERLAY_SYNC_IMAGE=grid-overlay-sync:single-cluster-qualification-$RUN_ID
-export GRID_XTASK_VCR_IMAGE=ghcr.io/neuralmagic/vllm-vcr:vllm0.23
+export GRID_XTASK_SIM_IMAGE=ghcr.io/neuralmagic/vllm-vcr:vllm0.23
 export GRID_XTASK_IMAGE_PULL_POLICY=Never
 
 docker build -f deploy/operator/Containerfile \

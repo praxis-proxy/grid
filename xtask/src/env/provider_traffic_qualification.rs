@@ -1000,7 +1000,7 @@ fn load_images_into_clusters(forge_bin: &Path, resolved_config: &Path) -> Result
         .unwrap_or_else(|_| "praxis-ai:provider-traffic-qualification".to_owned());
     let operator = std::env::var("GRID_XTASK_OPERATOR_IMAGE")
         .unwrap_or_else(|_| "grid-operator:provider-traffic-qualification".to_owned());
-    let vcr = crate::env::image_overrides::vcr_image();
+    let vcr = crate::env::image_overrides::sim_image();
 
     for image in [&gateway, &operator, &vcr] {
         require_local_image(image)?;
@@ -1931,7 +1931,7 @@ fn apply_image_overrides(config: &mut serde_yaml::Value) {
         .unwrap_or_else(|_| "praxis-ai:provider-traffic-qualification".to_owned());
     let operator_image = std::env::var("GRID_XTASK_OPERATOR_IMAGE")
         .unwrap_or_else(|_| "grid-operator:provider-traffic-qualification".to_owned());
-    let vcr_image = crate::env::image_overrides::vcr_image();
+    let vcr_image = crate::env::image_overrides::sim_image();
     let image_pull_policy = std::env::var("GRID_XTASK_IMAGE_PULL_POLICY").unwrap_or_else(|_| "Never".to_owned());
 
     let (gateway_repo, gateway_tag) = parse_image_ref(&gateway_image);
@@ -2266,14 +2266,14 @@ fn capture_stack_failure(cluster: &str, stack: &str) {
 // Demo Scenarios
 // -----------------------------------------------------------------------------
 
-/// Run the quick-mode proof scenarios using the assertion framework.
+/// Run the provider-traffic proof scenarios using the assertion framework.
 ///
 /// Run the six focused provider-traffic proof scenarios.
 #[expect(
     clippy::too_many_lines,
     reason = "The focused demo presents its six proof phases in order."
 )]
-fn run_quick_scenarios() -> BTreeMap<String, ProofResult> {
+fn run_provider_traffic_scenarios() -> BTreeMap<String, ProofResult> {
     let mut results = BTreeMap::new();
     let mut scenario_num: usize = 0;
     let mut scenario = || {
@@ -2282,7 +2282,7 @@ fn run_quick_scenarios() -> BTreeMap<String, ProofResult> {
     };
 
     eprintln!();
-    eprintln!("=== QUICK MODE SCENARIOS ===");
+    eprintln!("=== PROVIDER TRAFFIC SCENARIOS ===");
     eprintln!();
 
     eprintln!("[SCENARIO {}] Verify three provider clusters are healthy", scenario());
@@ -2683,10 +2683,7 @@ fn teardown_environment(context: &ProviderTrafficContext) -> Result<(), Box<dyn 
     reason = "The public demo entrypoint keeps setup, proof, evidence, and teardown visible."
 )]
 pub(crate) fn run(forge_config: &Path, options: &GlbDemoOptions) -> Result<(), Box<dyn std::error::Error>> {
-    if options.mode() != DemoMode::Quick {
-        return Err("provider-traffic supports only the focused quick proof".into());
-    }
-    let mode = DemoMode::Quick;
+    let mode = options.mode();
     let run_id = format_utc_timestamp();
     let wall_start = Instant::now();
     let _started_at = format_utc_iso();
@@ -2723,7 +2720,7 @@ pub(crate) fn run(forge_config: &Path, options: &GlbDemoOptions) -> Result<(), B
                     eprintln!("ENVIRONMENT READY - Starting proof scenarios");
                     eprintln!("{OUTPUT_RULE}");
 
-                    let scenario_results = run_quick_scenarios();
+                    let scenario_results = run_provider_traffic_scenarios();
 
                     let failed_proofs: Vec<&str> = scenario_results
                         .iter()
