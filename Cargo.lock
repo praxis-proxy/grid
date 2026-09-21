@@ -4745,7 +4745,7 @@ dependencies = [
  "pem 4.0.0",
  "prettyplease",
  "rand 0.9.5",
- "schemars 0.8.22",
+ "schemars 1.2.2",
  "serde",
  "serde_json",
  "serde_yaml",

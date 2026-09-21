@@ -22,7 +22,7 @@ thiserror = { workspace = true }
 typify = { version = "0.8.0", default-features = false }
 prettyplease = "0.3.0"
 syn = "3.0.5"
-schemars = "0.8"
+schemars = "1.2"
 
 [lints]
 workspace = true
