@@ -5,9 +5,9 @@ inference backends across Kubernetes clusters, cloud
 providers, and third-party APIs into a single routable
 mesh. It figures out where models are, which backends
 are healthy, and which one should handle the next
-request - then tells the
-[Praxis](https://github.com/praxis-proxy/praxis)
-gateway how to route.
+request - then tells the [Praxis] gateway how to route.
+
+[Praxis]:https://github.com/praxis-proxy/praxis
 
 ## How It Works
 
