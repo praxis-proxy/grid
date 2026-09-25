@@ -478,6 +478,115 @@ spec:
                         - caSecretRef
                       type: object
                   type: object
+                modelDiscovery:
+                  description: |-
+                    Where to discover the models this provider serves.
+                
+                    When set, the operator polls the backend on a fixed cadence and holds
+                    the served-model set in memory, expiring it when polls stop succeeding.
+                    When absent, no discovery runs.
+                  nullable: true
+                  oneOf:
+                    - required:
+                        - openAiModels
+                  properties:
+                    openAiModels:
+                      description: |-
+                        OpenAI-compatible `GET /v1/models` (vLLM, `KServe`, `OpenAI`).
+                
+                        Reads `data[].id` from the response. The response is rejected as a
+                        whole when it is not valid JSON, has a blank, overlong, or duplicate
+                        id, or lists more models than the operator's cap. A rejected response
+                        never clears the previously discovered set.
+                      properties:
+                        endpoint:
+                          description: Base URL; defaults to `spec.endpoint`.
+                          minLength: 1
+                          nullable: true
+                          type: string
+                        path:
+                          default: /v1/models
+                          description: Path appended to the base URL.
+                          type: string
+                        tls:
+                          description: |-
+                            TLS configuration for the model-listing endpoint.
+                
+                            When absent, system root certificates are used.
+                          nullable: true
+                          properties:
+                            caSecretRef:
+                              description: |-
+                                Reference to a Secret containing the CA certificate PEM for server
+                                verification.
+                
+                                The Secret must contain the PEM-encoded CA certificate under the key
+                                `ca.crt` (or the key specified by `key`).  When this CA is
+                                set, the scraper trusts **only** this CA — system root certificates
+                                are not consulted.
+                              properties:
+                                key:
+                                  description: |-
+                                    Key within the Secret's `data` map.
+                
+                                    Required when the Secret holds multiple keys (e.g. credential references
+                                    in `InferenceProvider.spec.auth.secretRef`).  Omit only when the entire
+                                    Secret is consumed (e.g. TLS `ca_secret_ref`).
+                                  minLength: 1
+                                  nullable: true
+                                  type: string
+                                name:
+                                  description: Secret name.
+                                  minLength: 1
+                                  type: string
+                                namespace:
+                                  description: Secret namespace.
+                                  minLength: 1
+                                  type: string
+                              required:
+                                - name
+                                - namespace
+                              type: object
+                            clientCertificateSecretRef:
+                              description: |-
+                                Reference to a Secret containing the client certificate and private
+                                key for mutual TLS.
+                
+                                When set, the scraper presents this identity during the TLS handshake.
+                                The Secret must contain `tls.crt` (or `certificate_key`) and
+                                `tls.key` (or `private_key_key`) in PEM format.
+                
+                                When absent, the scraper performs one-way TLS only (server verification
+                                with the CA from `ca_secret_ref`, no client certificate).
+                              nullable: true
+                              properties:
+                                certificateKey:
+                                  default: tls.crt
+                                  description: Key within `Secret.data` holding the PEM-encoded client certificate.
+                                  minLength: 1
+                                  type: string
+                                name:
+                                  description: Secret name.
+                                  minLength: 1
+                                  type: string
+                                namespace:
+                                  description: Secret namespace.
+                                  minLength: 1
+                                  type: string
+                                privateKeyKey:
+                                  default: tls.key
+                                  description: Key within `Secret.data` holding the PEM-encoded private key.
+                                  minLength: 1
+                                  type: string
+                              required:
+                                - name
+                                - namespace
+                              type: object
+                          required:
+                            - caSecretRef
+                          type: object
+                      type: object
+                  type: object
                 models:
                   default: []
                   description: Models served by this provider.

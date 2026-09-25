@@ -40,7 +40,7 @@ use crate::{
         tls_backend::ServerTlsConfig,
         trust_bundle::{self, CertPemStatus},
     },
-    signals,
+    served_models, signals,
     swim::{MemberStatus, MembershipSnapshot},
     swim_endpoint::{SeedResolution, resolve_endpoint_list_partial},
     swim_runtime::SwimHandle,
@@ -108,6 +108,9 @@ pub struct OperatorCtx {
     /// This site's scraped signals, served to gateways and peers.
     pub(crate) signals: signals::SignalStore,
 
+    /// Served-model sets discovered from this site's providers.
+    pub(crate) served_models: served_models::ServedModelStore,
+
     /// Signal transport resolved once at startup: gossip or poll.
     ///
     /// Under poll the operator stops carrying metrics in gossip and scoring the
@@ -167,6 +170,7 @@ impl OperatorCtx {
             peer_identities: signals::PeerIdentities::new(),
             peers: signals::SignalStore::new(),
             signals: signals::SignalStore::new(),
+            served_models: served_models::ServedModelStore::new(),
             signal_mode,
             serving_writes: WriteGate::default(),
             peer_settings: PeerSettings::default(),
@@ -269,6 +273,23 @@ pub async fn refresh_signals(ctx: &OperatorCtx, client: &Client, network_name: &
     let collected = provider_metrics::collect_provider_signals(network_name, &providers, Some(client)).await;
     publish_signals(ctx, collected);
     Ok(())
+}
+
+/// Poll this site's providers once and hold the models they serve.
+///
+/// Called from its own loop rather than from reconcile, like
+/// [`refresh_signals`]: a served set must expire on its own cadence, not wait
+/// for a declaration change.
+///
+/// # Errors
+///
+/// Returns [`OperatorError`] when providers cannot be listed.
+pub async fn refresh_served_models(
+    ctx: &OperatorCtx,
+    client: &Client,
+    config: &served_models::DiscoveryConfig,
+) -> Result<(), OperatorError> {
+    served_models::discover(&ctx.served_models, client, config).await
 }
 
 /// Refresh who may read from the currently approved sites.
