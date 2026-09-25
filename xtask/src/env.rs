@@ -7056,7 +7056,10 @@ fn env_verify_agenttoolprovider_convergence(
     config: &Path,
     site: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use operator::{AGENT_TOOL_TEST_PROVIDER_HEALTHY, AGENT_TOOL_TEST_PROVIDER_UNREACHABLE, STATUS_POLL_TIMEOUT};
+    use operator::{
+        AGENT_TOOL_TEST_GATEWAY, AGENT_TOOL_TEST_NETWORK, AGENT_TOOL_TEST_PROVIDER_HEALTHY,
+        AGENT_TOOL_TEST_PROVIDER_UNREACHABLE, CONFIGMAP_POLL_TIMEOUT, STATUS_POLL_TIMEOUT,
+    };
 
     let cfg = EnvConfig::from_file(config)?;
     let site_name = resolve_operator_site_name(&cfg, site)?;
@@ -7065,13 +7068,13 @@ fn env_verify_agenttoolprovider_convergence(
     eprintln!("verify-agenttoolprovider-convergence: context={context}");
 
     // ── Step 1: setup ────────────────────────────────────────────────────
-    eprintln!("verify-agenttoolprovider-convergence: [1/5] setup");
+    eprintln!("verify-agenttoolprovider-convergence: [1/6] setup");
     operator::install_grid_crds(&context)?;
     operator::cleanup_agent_tool_provider_test_resources(&context);
     kind::delete_mock_mcp_server(&context);
 
     // ── Step 2: deploy the real mock MCP server ─────────────────────────
-    eprintln!("verify-agenttoolprovider-convergence: [2/5] deploying mock MCP server...");
+    eprintln!("verify-agenttoolprovider-convergence: [2/6] deploying mock MCP server...");
     let mock_tools = ["read_file", "list_directory"];
     kind::deploy_mock_mcp_server(&context, &cluster_name, &mock_tools.join(","), None)?;
     // The operator under test runs as a local out-of-cluster process (see
@@ -7085,7 +7088,7 @@ fn env_verify_agenttoolprovider_convergence(
     let mock_endpoint = format!("http://{mock_node_ip}:{mock_node_port}/mcp");
 
     // ── Step 3: apply GridNetwork + GridSite + healthy AgentToolProvider ─
-    eprintln!("verify-agenttoolprovider-convergence: [3/5] applying fixtures...");
+    eprintln!("verify-agenttoolprovider-convergence: [3/6] applying fixtures...");
     operator::apply_agent_tool_provider_network_fixtures(&context)?;
     operator::apply_agent_tool_provider(&context, AGENT_TOOL_TEST_PROVIDER_HEALTHY, &mock_endpoint)?;
     // A Service name that cannot resolve — DNS failure, not a refused
@@ -7101,7 +7104,7 @@ fn env_verify_agenttoolprovider_convergence(
 
     let result: Result<(), Box<dyn std::error::Error>> = (|| {
         // ── Step 4: healthy path — Pending -> Available, tools discovered ─
-        eprintln!("verify-agenttoolprovider-convergence: [4/5] waiting for healthy convergence...");
+        eprintln!("verify-agenttoolprovider-convergence: [4/6] waiting for healthy convergence...");
         operator::wait_for_agent_tool_provider_phase(
             &context,
             AGENT_TOOL_TEST_PROVIDER_HEALTHY,
@@ -7118,7 +7121,7 @@ fn env_verify_agenttoolprovider_convergence(
         eprintln!("  [OK] discoveredTools = {discovered:?}");
 
         // ── Step 5: unreachable path — Unavailable + populated reason ────
-        eprintln!("verify-agenttoolprovider-convergence: [5/5] waiting for unreachable-endpoint failure...");
+        eprintln!("verify-agenttoolprovider-convergence: [5/6] waiting for unreachable-endpoint failure...");
         operator::wait_for_agent_tool_provider_phase(
             &context,
             AGENT_TOOL_TEST_PROVIDER_UNREACHABLE,
@@ -7130,6 +7133,20 @@ fn env_verify_agenttoolprovider_convergence(
             return Err("expected a populated status.reason for the unreachable-endpoint AgentToolProvider".into());
         }
         eprintln!("  [OK] unreachable endpoint reason = {reason:?}");
+
+        // ── Step 6: verify mcp_tool candidates in routing overlay ────────
+        eprintln!("verify-agenttoolprovider-convergence: [6/6] checking overlay for mcp_tool candidates...");
+        operator::wait_for_overlay_configmap(
+            &context,
+            AGENT_TOOL_TEST_NETWORK,
+            AGENT_TOOL_TEST_GATEWAY,
+            "default",
+            CONFIGMAP_POLL_TIMEOUT,
+        )?;
+        let overlay =
+            operator::read_overlay_configmap(&context, AGENT_TOOL_TEST_NETWORK, AGENT_TOOL_TEST_GATEWAY, "default")?;
+        operator::verify_tool_provider_overlay(&overlay, &mock_tools)?;
+
         Ok(())
     })();
 
@@ -7142,7 +7159,8 @@ fn env_verify_agenttoolprovider_convergence(
 
     eprintln!(
         "verify-agenttoolprovider-convergence: PASS — Pending -> Available with discoveredTools populated \
-         against a real mock MCP server, and the unreachable-endpoint path lands on Unavailable with a reason"
+         against a real mock MCP server, unreachable-endpoint path lands on Unavailable with a reason, \
+         and routing overlay contains mcp_tool candidates"
     );
     Ok(())
 }

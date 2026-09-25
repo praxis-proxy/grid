@@ -25,6 +25,7 @@ use tracing::info;
 
 use crate::{
     crd::{
+        agent_tool_provider::AgentToolProvider,
         grid_network::{
             ConsumerConfig, ConsumerConfigPhase, ConsumerConfigStatus, GatewayRef, GridNetwork, GridNetworkPhase,
             GridNetworkStatus, OverlayPhase, OverlayRevisionStatus, SignalMode, TenantBudgetStatus, TransportMode,
@@ -648,10 +649,14 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
 
     let scoring_weights = crate::crd::grid_network::resolve_scoring_weights(network.spec.scoring_policy.as_ref());
 
+    // List tool providers once; shared between overlay rendering and CRDT publishing.
+    let tool_providers = list_all_agent_tool_providers(client).await?;
+
     let (consumer_config_statuses, overlay_statuses) = reconcile_routing_overlay_inner(
         &network,
         client,
         &providers,
+        &tool_providers,
         &remote_crdt_providers,
         &raw_metrics,
         &scoring_weights,
@@ -666,9 +671,9 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
         GridNetworkPhase::Degraded
     };
 
-    // Publish real InferenceProvider-derived CRDT state so peers learn this site's providers.
+    // Publish provider CRDT state so peers learn this site's providers.
     let distributed_provider_count = if let Some(swim) = ctx.swim.as_ref().filter(|handle| handle.is_running()) {
-        publish_real_provider_state(swim, name, &grid_id, &providers, &raw_metrics);
+        publish_real_provider_state(swim, name, &grid_id, &providers, &tool_providers, &raw_metrics);
         count_remote_provider_records(swim, name)
     } else {
         0
@@ -1136,6 +1141,7 @@ async fn reconcile_routing_overlay_inner(
     network: &GridNetwork,
     client: &Client,
     providers: &[InferenceProvider],
+    tool_providers: &[AgentToolProvider],
     remote_crdt_providers: &[crdt::ProviderState],
     raw_metrics: &HashMap<String, scoring::BackendMetrics>,
     scoring_weights: &scoring::ScoringWeights,
@@ -1187,6 +1193,7 @@ async fn reconcile_routing_overlay_inner(
             network,
             &sites,
             providers,
+            tool_providers,
             &eligible_remote_owned,
             local_site,
             metrics_arg,
@@ -1444,6 +1451,13 @@ fn retained_overlay_status(
 /// List all [`InferenceProvider`] resources cluster-wide.
 async fn list_all_inference_providers(client: &Client) -> Result<Vec<InferenceProvider>, OperatorError> {
     let api: Api<InferenceProvider> = Api::all(client.clone());
+    let list = api.list(&ListParams::default()).await?;
+    Ok(list.items)
+}
+
+/// List all [`AgentToolProvider`] resources cluster-wide.
+async fn list_all_agent_tool_providers(client: &Client) -> Result<Vec<AgentToolProvider>, OperatorError> {
+    let api: Api<AgentToolProvider> = Api::all(client.clone());
     let list = api.list(&ListParams::default()).await?;
     Ok(list.items)
 }
@@ -1854,25 +1868,20 @@ fn provider_state_from_kube(
     let models = provider.spec.models.iter().map(|m| m.name.clone()).collect();
     let phase = crdt_phase_from_provider(provider.status.as_ref().map(|s| &s.phase));
     let revision = provider_revision(provider);
-    let capacity_weight = provider
-        .spec
-        .capacity_weight
-        .filter(|weight| crdt::is_valid_capacity_weight(*weight))
-        .unwrap_or(crdt::MIN_CAPACITY_WEIGHT);
-
+    let capacity_weight = provider_capacity_weight(provider);
     tracing::info!(
         site_id,
         provider_id,
         capacity_weight,
         "published local provider CRDT capacity"
     );
-
     Some(crdt::ProviderState {
         network_id: network_id.to_owned(),
         site_id: site_id.to_owned(),
         provider_id: provider_id.to_owned(),
         routing_cluster,
         models,
+        tools: Vec::new(),
         backend_kind: provider.spec.backend_kind.clone(),
         capacity_weight,
         phase,
@@ -1898,11 +1907,76 @@ fn provider_revision(provider: &InferenceProvider) -> u64 {
         .unwrap_or(0)
 }
 
-/// Publish real [`InferenceProvider`] records as a CRDT state broadcast over SWIM.
+/// Resolve the CRDT capacity weight from `spec.capacityWeight`, clamping
+/// to `MIN_CAPACITY_WEIGHT` when absent or out of range.
+fn provider_capacity_weight(provider: &InferenceProvider) -> u32 {
+    provider
+        .spec
+        .capacity_weight
+        .filter(|weight| crdt::is_valid_capacity_weight(*weight))
+        .unwrap_or(crdt::MIN_CAPACITY_WEIGHT)
+}
+
+/// Convert an [`AgentToolProvider`] into a [`crdt::ProviderState`] for SWIM broadcast.
 ///
-/// Builds a [`crdt::GridStateSnapshot`] from all providers belonging to
-/// `network_name`, attaches live metrics where configured, and sends the
-/// snapshot to SWIM peers via [`SwimHandle::publish_state_broadcast`].  When a
+/// Returns `None` when the provider lacks a `metadata.name` (shouldn't happen
+/// for server-generated resources).
+///
+/// Tool providers carry no models and no metrics.  `backend_kind` is empty
+/// because `AgentToolProvider` has no `spec.backendKind` field.
+/// The `tools` field is populated from `status.discoveredTools` (live probe
+/// results), falling back to `spec.tools` names when the status is empty.
+fn tool_provider_state_from_kube(
+    provider: &AgentToolProvider,
+    network_id: &str,
+    site_id: &str,
+) -> Option<crdt::ProviderState> {
+    let provider_id = provider.metadata.name.as_deref()?;
+    let tools = tool_names_from_agent_tool_provider(provider);
+    let phase = crdt_phase_from_provider(provider.status.as_ref().map(|s| &s.phase));
+    let revision = provider
+        .metadata
+        .resource_version
+        .as_deref()
+        .and_then(|rv| rv.parse::<u64>().ok())
+        .or_else(|| provider.metadata.generation.and_then(|g| u64::try_from(g).ok()))
+        .unwrap_or(0);
+    Some(crdt::ProviderState {
+        network_id: network_id.to_owned(),
+        site_id: site_id.to_owned(),
+        provider_id: provider_id.to_owned(),
+        routing_cluster: provider_id.to_owned(),
+        models: Vec::new(),
+        tools,
+        backend_kind: String::new(),
+        capacity_weight: crdt::MIN_CAPACITY_WEIGHT,
+        phase,
+        metrics: crdt::ProviderMetricsSnapshot::default(),
+        access_policy: access_policy_to_crdt(&provider.spec.access_policy),
+        revision,
+        writer_id: site_id.to_owned(),
+    })
+}
+
+/// Extract tool names from an [`AgentToolProvider`], preferring
+/// `status.discoveredTools` over `spec.tools[].name`.
+fn tool_names_from_agent_tool_provider(provider: &AgentToolProvider) -> Vec<String> {
+    provider
+        .status
+        .as_ref()
+        .filter(|s| !s.discovered_tools.is_empty())
+        .map_or_else(
+            || provider.spec.tools.iter().map(|t| t.name.clone()).collect(),
+            |s| s.discovered_tools.clone(),
+        )
+}
+
+/// Publish real provider records as a CRDT state broadcast over SWIM.
+///
+/// Builds a [`crdt::GridStateSnapshot`] from all [`InferenceProvider`] and
+/// [`AgentToolProvider`] resources belonging to `network_name`, attaches
+/// live metrics where configured (inference only), and sends the snapshot
+/// to SWIM peers via [`SwimHandle::publish_state_broadcast`].  When a
 /// gateway address is configured, a broadcast is sent even if the snapshot has
 /// no providers so peers can discover the data-plane address before providers
 /// are created.
@@ -1916,48 +1990,75 @@ fn provider_revision(provider: &InferenceProvider) -> u64 {
 /// the broadcast so a signature over this `GridNetwork`'s state cannot be
 /// replayed as valid for a different `GridNetwork` sharing the same
 /// cluster's `SwimHandle` — see [`swim::StateBroadcast::grid_id`].
+/// Upsert a CRDT provider state into the snapshot, registering its
+/// capabilities (models and/or tools) and advancing `max_revision`.
+fn upsert_provider_with_capabilities(
+    snap: &mut crdt::GridStateSnapshot,
+    max_revision: &mut u64,
+    state: crdt::ProviderState,
+) {
+    *max_revision = (*max_revision).max(state.revision);
+    for model in &state.models {
+        if !model.is_empty() {
+            snap.add_capability(crdt::Capability::Model(model.clone()));
+        }
+    }
+    for tool in &state.tools {
+        if !tool.is_empty() {
+            snap.add_capability(crdt::Capability::Tool(tool.clone()));
+        }
+    }
+    snap.upsert_provider(state);
+}
+
+/// Publish provider records as a CRDT state broadcast over SWIM.
+///
+/// Builds a [`crdt::GridStateSnapshot`] from all [`InferenceProvider`] and
+/// [`AgentToolProvider`] resources belonging to `network_name`, attaches
+/// live metrics where configured (inference only), and sends the snapshot
+/// to SWIM peers via [`SwimHandle::publish_state_broadcast`].
+#[expect(
+    clippy::too_many_arguments,
+    reason = "tool_providers is the new distinct input alongside existing inference parameters"
+)]
 fn publish_real_provider_state(
     swim: &SwimHandle,
     network_name: &str,
     grid_id: &str,
     providers: &[InferenceProvider],
+    tool_providers: &[AgentToolProvider],
     raw_metrics: &HashMap<String, scoring::BackendMetrics>,
 ) {
-    use crdt::{Capability, GridStateSnapshot};
-    use swim::StateBroadcast;
-
     let site_name = swim.site_name();
-    let mut snap = GridStateSnapshot::new(site_name.to_owned());
+    let mut snap = crdt::GridStateSnapshot::new(site_name.to_owned());
     let mut max_revision: u64 = 0;
 
     for provider in providers {
         if provider.spec.grid_network_ref != network_name {
             continue;
         }
-        // Key by routing identity so the metrics map lookup matches.
         let routing_id = routing_overlay::routing_identity(provider).unwrap_or("");
         let metrics = raw_metrics.get(routing_id).copied();
         if let Some(state) = provider_state_from_kube(provider, network_name, site_name, metrics) {
-            max_revision = max_revision.max(state.revision);
-            for model in &state.models {
-                if !model.is_empty() {
-                    snap.add_capability(Capability::Model(model.clone()));
-                }
-            }
-            snap.upsert_provider(state);
+            upsert_provider_with_capabilities(&mut snap, &mut max_revision, state);
+        }
+    }
+
+    for tool_provider in tool_providers {
+        if tool_provider.spec.grid_network_ref != network_name {
+            continue;
+        }
+        if let Some(state) = tool_provider_state_from_kube(tool_provider, network_name, site_name) {
+            upsert_provider_with_capabilities(&mut snap, &mut max_revision, state);
         }
     }
 
     let gateway_address = swim.gateway_address();
     if snap.providers.is_empty() && gateway_address.is_none() {
-        // No providers and no gateway address — nothing to broadcast.
         return;
     }
 
-    // Use the highest provider revision as this origin's broadcast revision.
-    // Duplicate unchanged broadcasts are idempotent; newer Kubernetes writes
-    // advance resourceVersion and therefore advance the broadcast revision.
-    let bc = StateBroadcast::new(site_name.to_owned(), max_revision, snap, gateway_address)
+    let bc = swim::StateBroadcast::new(site_name.to_owned(), max_revision, snap, gateway_address)
         .with_grid_id(Some(grid_id.to_owned()));
     if let Err(e) = swim.publish_state_broadcast(bc) {
         tracing::debug!(error = %e, "CRDT broadcast channel unavailable — runtime not yet receiving");
@@ -3184,6 +3285,7 @@ mod tests {
             provider_id: provider_id.to_owned(),
             routing_cluster: site_id.to_owned(),
             models: vec!["model-x".to_owned()],
+            tools: Vec::new(),
             backend_kind: "local".to_owned(),
             capacity_weight: 1,
             phase: crdt::ProviderPhase::Available,
@@ -3205,6 +3307,7 @@ mod tests {
             provider_id: provider_id.to_owned(),
             routing_cluster: site_id.to_owned(),
             models: vec!["model-x".to_owned()],
+            tools: Vec::new(),
             backend_kind: "local".to_owned(),
             capacity_weight: 1,
             phase,
@@ -3556,11 +3659,12 @@ mod tests {
             provider_id: "prov-1".to_owned(),
             routing_cluster: site_id.to_owned(),
             models: vec!["model-x".to_owned()],
+            tools: Vec::new(),
             backend_kind: "remote".to_owned(),
             capacity_weight: 1,
             phase,
             metrics: crdt::ProviderMetricsSnapshot::default(),
-            access_policy: crdt::ProviderAccessPolicy::default(), // Empty policy = allow all
+            access_policy: crdt::ProviderAccessPolicy::default(),
             revision: 1,
             writer_id: "writer-1".to_owned(),
         }
@@ -5129,6 +5233,7 @@ mod tests {
             provider_id: "prov".to_owned(),
             routing_cluster: site_id.to_owned(),
             models: vec!["model-x".to_owned()],
+            tools: Vec::new(),
             backend_kind: "local".to_owned(),
             capacity_weight: 1,
             phase: crdt::ProviderPhase::Available,
@@ -5486,5 +5591,161 @@ mod tests {
             parse_metrics_refresh_interval("18446744073709551615s").is_err(),
             "overflow value must be rejected"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // tool_provider_state_from_kube
+    // -----------------------------------------------------------------------
+
+    fn make_agent_tool_provider(name: &str, network: &str, tools: &[&str]) -> AgentToolProvider {
+        let tools_json: Vec<serde_json::Value> = tools.iter().map(|t| serde_json::json!({ "name": t })).collect();
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "kind": "AgentToolProvider",
+            "metadata": { "name": name, "resourceVersion": "100" },
+            "spec": {
+                "gridNetworkRef": network,
+                "endpoint": "http://localhost:9090",
+                "tools": tools_json
+            }
+        }))
+        .unwrap_or_else(|_| std::process::abort())
+    }
+
+    fn make_agent_tool_provider_with_discovered(
+        name: &str,
+        network: &str,
+        spec_tools: &[&str],
+        discovered: &[&str],
+    ) -> AgentToolProvider {
+        let tools_json: Vec<serde_json::Value> = spec_tools.iter().map(|t| serde_json::json!({ "name": t })).collect();
+        let discovered_json: Vec<&str> = discovered.to_vec();
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "kind": "AgentToolProvider",
+            "metadata": { "name": name, "resourceVersion": "200" },
+            "spec": {
+                "gridNetworkRef": network,
+                "endpoint": "http://localhost:9090",
+                "tools": tools_json
+            },
+            "status": {
+                "discoveredTools": discovered_json,
+                "phase": "Available",
+                "matchingSites": [],
+                "observedGeneration": 1
+            }
+        }))
+        .unwrap_or_else(|_| std::process::abort())
+    }
+
+    #[test]
+    fn tool_provider_state_from_kube_uses_spec_tools_when_no_status() {
+        let provider = make_agent_tool_provider("mcp-server", "net", &["search", "translate"]);
+        let state = tool_provider_state_from_kube(&provider, "net", "site-a").unwrap_or_else(|| std::process::abort());
+        assert_eq!(state.tools, vec!["search", "translate"]);
+        assert!(state.models.is_empty(), "tool provider must have no models");
+        assert_eq!(state.provider_id, "mcp-server");
+        assert_eq!(state.network_id, "net");
+        assert_eq!(state.site_id, "site-a");
+        assert!(
+            state.backend_kind.is_empty(),
+            "tool provider backend_kind must be empty"
+        );
+    }
+
+    #[test]
+    fn tool_provider_state_from_kube_prefers_discovered_tools() {
+        let provider = make_agent_tool_provider_with_discovered(
+            "mcp-server",
+            "net",
+            &["spec-tool"],
+            &["discovered-a", "discovered-b"],
+        );
+        let state = tool_provider_state_from_kube(&provider, "net", "site-a").unwrap_or_else(|| std::process::abort());
+        assert_eq!(state.tools, vec!["discovered-a", "discovered-b"]);
+    }
+
+    #[test]
+    fn tool_provider_state_from_kube_falls_back_to_spec_when_discovered_empty() {
+        let provider = make_agent_tool_provider_with_discovered("mcp-server", "net", &["fallback-tool"], &[]);
+        let state = tool_provider_state_from_kube(&provider, "net", "site-a").unwrap_or_else(|| std::process::abort());
+        assert_eq!(state.tools, vec!["fallback-tool"]);
+    }
+
+    #[test]
+    fn tool_provider_state_from_kube_parses_resource_version_as_revision() {
+        let provider = make_agent_tool_provider("mcp-server", "net", &["tool-a"]);
+        let state = tool_provider_state_from_kube(&provider, "net", "site-a").unwrap_or_else(|| std::process::abort());
+        assert_eq!(state.revision, 100, "resourceVersion=100 must parse to revision=100");
+    }
+
+    #[test]
+    fn tool_provider_state_routing_cluster_equals_provider_name() {
+        let provider = make_agent_tool_provider("my-mcp", "net", &["tool-a"]);
+        let state = tool_provider_state_from_kube(&provider, "net", "site-a").unwrap_or_else(|| std::process::abort());
+        assert_eq!(
+            state.routing_cluster, "my-mcp",
+            "routing_cluster must equal provider name"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // upsert_provider_with_capabilities
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn upsert_tool_provider_registers_tool_capabilities() {
+        let mut snap = crdt::GridStateSnapshot::new("site-a".to_owned());
+        let mut max_rev = 0_u64;
+        let state = crdt::ProviderState {
+            network_id: "net".to_owned(),
+            site_id: "site-a".to_owned(),
+            provider_id: "tool-prov".to_owned(),
+            routing_cluster: "tool-prov".to_owned(),
+            models: Vec::new(),
+            tools: vec!["search".to_owned(), "calc".to_owned()],
+            backend_kind: String::new(),
+            capacity_weight: 1,
+            phase: crdt::ProviderPhase::Available,
+            metrics: crdt::ProviderMetricsSnapshot::default(),
+            access_policy: crdt::ProviderAccessPolicy::default(),
+            revision: 5,
+            writer_id: "site-a".to_owned(),
+        };
+        upsert_provider_with_capabilities(&mut snap, &mut max_rev, state);
+        assert_eq!(max_rev, 5);
+        assert!(
+            snap.capabilities.contains(&crdt::Capability::Tool("search".to_owned())),
+            "search tool capability must be registered"
+        );
+        assert!(
+            snap.capabilities.contains(&crdt::Capability::Tool("calc".to_owned())),
+            "calc tool capability must be registered"
+        );
+    }
+
+    #[test]
+    fn upsert_mixed_provider_registers_both_model_and_tool_capabilities() {
+        let mut snap = crdt::GridStateSnapshot::new("site-a".to_owned());
+        let mut max_rev = 0_u64;
+        let state = crdt::ProviderState {
+            network_id: "net".to_owned(),
+            site_id: "site-a".to_owned(),
+            provider_id: "hybrid".to_owned(),
+            routing_cluster: "hybrid".to_owned(),
+            models: vec!["llama".to_owned()],
+            tools: vec!["search".to_owned()],
+            backend_kind: "local".to_owned(),
+            capacity_weight: 1,
+            phase: crdt::ProviderPhase::Available,
+            metrics: crdt::ProviderMetricsSnapshot::default(),
+            access_policy: crdt::ProviderAccessPolicy::default(),
+            revision: 3,
+            writer_id: "site-a".to_owned(),
+        };
+        upsert_provider_with_capabilities(&mut snap, &mut max_rev, state);
+        assert!(snap.capabilities.contains(&crdt::Capability::Model("llama".to_owned())));
+        assert!(snap.capabilities.contains(&crdt::Capability::Tool("search".to_owned())));
     }
 }

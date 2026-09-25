@@ -351,6 +351,7 @@ mod tests {
             provider_id: "provider-1".to_owned(),
             routing_cluster: site.to_owned(),
             models: vec!["model-x".to_owned()],
+            tools: Vec::new(),
             backend_kind: "local".to_owned(),
             capacity_weight: 1,
             phase: ProviderPhase::Available,
