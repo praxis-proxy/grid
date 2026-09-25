@@ -701,6 +701,51 @@ metricsConfig:
 Grid does not normalize raw queue counts. Exporters should publish
 `queueDepth` as a normalized `0.0`–`1.0` gauge before the operator scrapes it.
 
+### Model discovery
+
+`spec.modelDiscovery` makes the operator poll the backend for the models it
+serves. Discovery does not yet affect routing or gossip; `spec.models`
+remains the routing source.
+
+```yaml
+modelDiscovery:
+  openAiModels:                 # GET {endpoint}{path}, reads data[].id
+    endpoint: http://vllm:8000  # optional; defaults to spec.endpoint
+    path: /v1/models            # default
+    tls: {...}                  # optional; same shape as metricsConfig.tls
+```
+
+The bearer token comes from `spec.auth`. With `auth.manual`, requests carry no
+credentials.
+
+Discovery runs in its own loop, like the signals scraper, not in reconcile.
+Discovered sets are held in memory per provider:
+
+- A successful poll replaces the set and renews its deadline; an empty list is
+  a valid result.
+- A failed poll keeps the set; its deadline is not renewed.
+- A set not renewed within the TTL expires. Absence is the staleness signal,
+  so a stale set fails closed and no clocks are compared.
+- A provider that is deleted or drops `modelDiscovery` loses its set on the
+  next round.
+- The response is rejected as a whole, never partially applied, when it:
+  - is not a 2xx, or exceeds 1 MiB;
+  - is not JSON with `data[].id`;
+  - has a blank id, an id over 256 bytes, or an id with control characters;
+  - repeats an id (duplicates are treated as malformed, not deduplicated);
+  - lists more than 256 models.
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `GRID_MODEL_DISCOVERY_INTERVAL_SECS` | `60` | time between rounds |
+| `GRID_MODEL_DISCOVERY_TIMEOUT_SECS` | `5` | bound on one provider poll |
+| `GRID_MODEL_DISCOVERY_TTL_SECS` | `180` | how long a set survives without a successful poll; at least interval + timeout |
+| `GRID_MODEL_DISCOVERY_CONCURRENCY` | `8` | providers polled at once |
+
+Each poll increments `grid_model_discovery_total{provider,outcome}`, where
+`outcome` is one of `ok`, `credential`, `tls`, `config`, `unreachable`,
+`timeout`, `http_status`, `invalid_response`. Failures are also logged.
+
 ## AgentToolProvider
 
 Represents MCP tool servers available over the grid.

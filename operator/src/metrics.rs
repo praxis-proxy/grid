@@ -45,6 +45,8 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
         .unwrap_or_else(|_| std::process::abort());
     r.register(Box::new(PEER_POLLS_IN_FLIGHT.clone()))
         .unwrap_or_else(|_| std::process::abort());
+    r.register(Box::new(MODEL_DISCOVERY_TOTAL.clone()))
+        .unwrap_or_else(|_| std::process::abort());
     r
 });
 
@@ -223,6 +225,15 @@ static MCP_PROBE_DURATION: LazyLock<Histogram> = LazyLock::new(|| {
     .unwrap_or_else(|_| std::process::abort())
 });
 
+/// Served-model discovery polls by provider and outcome.
+static MODEL_DISCOVERY_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    IntCounterVec::new(
+        Opts::new("grid_model_discovery_total", "Served-model discovery polls by outcome"),
+        &["provider", "outcome"],
+    )
+    .unwrap_or_else(|_| std::process::abort())
+});
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -249,6 +260,16 @@ pub(crate) fn record_agent_tool_provider_phase_transition(from: &str, to: &str, 
 pub(crate) fn record_mcp_probe(outcome: &str, duration: Duration) {
     MCP_PROBE_TOTAL.with_label_values(&[outcome]).inc();
     MCP_PROBE_DURATION.observe(duration.as_secs_f64());
+}
+
+/// Record a successful served-model discovery poll.
+pub(crate) fn record_model_discovery_success(provider: &str) {
+    MODEL_DISCOVERY_TOTAL.with_label_values(&[provider, "ok"]).inc();
+}
+
+/// Record a failed served-model discovery poll; `reason` must be bounded.
+pub(crate) fn record_model_discovery_failure(provider: &str, reason: &str) {
+    MODEL_DISCOVERY_TOTAL.with_label_values(&[provider, reason]).inc();
 }
 
 /// Record a finished peer poll, retries included.

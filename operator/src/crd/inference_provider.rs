@@ -74,6 +74,14 @@ pub struct InferenceProviderSpec {
     #[serde(default)]
     pub models: Vec<ModelInfo>,
 
+    /// Where to discover the models this provider serves.
+    ///
+    /// When set, the operator polls the backend on a fixed cadence and holds
+    /// the served-model set in memory, expiring it when polls stop succeeding.
+    /// When absent, no discovery runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_discovery: Option<ModelDiscoveryConfig>,
+
     /// Inference provider type.
     pub provider_kind: String,
 
@@ -433,6 +441,51 @@ pub struct HealthCheckConfig {
 }
 
 // ---------------------------------------------------------------------------
+// Model Discovery
+// ---------------------------------------------------------------------------
+
+/// Served-model discovery source. Exactly one variant must be set.
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ModelDiscoveryConfig {
+    /// OpenAI-compatible `GET /v1/models` (vLLM, `KServe`, `OpenAI`).
+    ///
+    /// Reads `data[].id` from the response. The response is rejected as a
+    /// whole when it is not valid JSON, has a blank, overlong, or duplicate
+    /// id, or lists more models than the operator's cap. A rejected response
+    /// never clears the previously discovered set.
+    OpenAiModels(OpenAiModelsSource),
+}
+
+/// OpenAI-compatible model-listing source.
+///
+/// Uses `spec.auth` for the bearer token. With `auth.manual`, requests are
+/// sent without credentials.
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenAiModelsSource {
+    /// Base URL; defaults to `spec.endpoint`.
+    #[schemars(length(min = 1))]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+
+    /// Path appended to the base URL.
+    #[serde(default = "default_models_path")]
+    pub path: String,
+
+    /// TLS configuration for the model-listing endpoint.
+    ///
+    /// When absent, system root certificates are used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<EndpointTlsConfig>,
+}
+
+/// Default OpenAI-compatible model-listing path.
+fn default_models_path() -> String {
+    "/v1/models".to_owned()
+}
+
+// ---------------------------------------------------------------------------
 // Status
 // ---------------------------------------------------------------------------
 
@@ -497,6 +550,17 @@ mod tests {
 
     fn crd_json() -> serde_json::Value {
         serde_json::to_value(InferenceProvider::crd()).unwrap_or_else(|_| std::process::abort())
+    }
+
+    #[test]
+    fn model_discovery_defaults() {
+        let json = serde_json::json!({ "openAiModels": {} });
+
+        let config: ModelDiscoveryConfig = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
+
+        let ModelDiscoveryConfig::OpenAiModels(source) = &config;
+        assert_eq!(source.path, "/v1/models", "default path");
+        assert!(source.endpoint.is_none(), "endpoint defaults to spec.endpoint");
     }
 
     #[test]

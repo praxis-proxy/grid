@@ -74,6 +74,7 @@ use operator::{
     },
     gateway,
     resources::tls_backend::{self, ServerTlsConfig},
+    served_models,
     swim_endpoint::{SwimEndpoint, resolve_endpoint, resolve_endpoint_list_partial},
     swim_runtime::{self, RevisionLease, SwimConfig},
 };
@@ -168,6 +169,7 @@ async fn main() {
             shutdown.clone(),
         ),
         run_local_scraper(signals_enabled, Arc::clone(&ctx), client.clone()),
+        run_model_discovery(Arc::clone(&ctx), client.clone()),
     );
 
     if let Err(e) = result {
@@ -1092,6 +1094,55 @@ async fn run_local_scraper(
                 tracing::warn!(network, %error, "local signals refresh failed");
             }
         }
+    }
+}
+
+/// Poll providers that opt into model discovery and hold what they serve.
+///
+/// Separate from reconcile: a served set must expire on its own cadence.
+async fn run_model_discovery(
+    ctx: Arc<OperatorCtx>,
+    client: Client,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let config = model_discovery_config();
+    tracing::info!(
+        interval_secs = config.interval.as_secs(),
+        ttl_secs = config.ttl.as_secs(),
+        "model discovery started"
+    );
+
+    let mut ticker = tokio::time::interval(config.interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    #[expect(
+        clippy::infinite_loop,
+        reason = "runs for the process lifetime alongside the controllers"
+    )]
+    loop {
+        ticker.tick().await;
+        if let Err(error) = grid_network::refresh_served_models(&ctx, &client, &config).await {
+            tracing::warn!(%error, "model discovery round failed");
+        }
+    }
+}
+
+/// Discovery cadence from `GRID_MODEL_DISCOVERY_*`.
+///
+/// The TTL is raised to at least one interval plus one timeout, so a set that
+/// is renewed on schedule never expires between rounds.
+fn model_discovery_config() -> served_models::DiscoveryConfig {
+    let defaults = served_models::DiscoveryConfig::default();
+    let secs =
+        |var, default: std::time::Duration| std::time::Duration::from_secs(parse_env_or(var, default.as_secs()).max(1));
+
+    let interval = secs("GRID_MODEL_DISCOVERY_INTERVAL_SECS", defaults.interval);
+    let timeout = secs("GRID_MODEL_DISCOVERY_TIMEOUT_SECS", defaults.timeout);
+    let ttl = secs("GRID_MODEL_DISCOVERY_TTL_SECS", defaults.ttl).max(interval + timeout);
+
+    served_models::DiscoveryConfig {
+        interval,
+        timeout,
+        ttl,
+        concurrency: parse_env_or("GRID_MODEL_DISCOVERY_CONCURRENCY", defaults.concurrency),
     }
 }
 

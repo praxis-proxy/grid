@@ -37,6 +37,7 @@ pub mod metrics_parser;
 pub mod metrics_scraper;
 /// Kubernetes resource builders.
 pub mod resources;
+pub mod served_models;
 
 pub use resources::{tls_backend::init_process_crypto, trust_bundle::sha256_fingerprint};
 /// Provider gateway address self-discovery.
