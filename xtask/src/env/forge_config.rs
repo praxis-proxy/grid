@@ -159,74 +159,76 @@ mod tests {
         clippy::too_many_lines,
         reason = "A test fixture should fail at the exact missing quota-contract field."
     )]
-    fn quota_consumers_use_the_upstream_limiter_schema_and_shared_rule() {
+    fn quota_consumers_expose_one_subject_keyed_application_listener() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tests/e2e/topologies/grid-token-rate-limit");
-        let configs = [
-            root.join("configs/consumer/praxis-valkey-a.yaml"),
-            root.join("configs/consumer/praxis-valkey-b.yaml"),
+        let gateways = [
+            ("configs/consumer/praxis-valkey-a.yaml", "consumer-gateway-a"),
+            ("configs/consumer/praxis-valkey-b.yaml", "consumer-gateway-b"),
         ];
-        let mut quota_contract = None;
-
-        for path in configs {
+        for (rel, gateway) in gateways {
+            let path = root.join(rel);
             let source = fs::read_to_string(&path).expect("read quota consumer config");
-            for removed in ["reservationTimeout", "token_budgets", "estimation", "identity.user_id"] {
+            for removed in [
+                "identity_projection",
+                "trusted_quota_group",
+                "x-grid-quota-group",
+                "identity.user_id",
+            ] {
                 assert!(
                     !source.contains(removed),
-                    "{} still contains legacy field {removed}",
+                    "{} still references {removed}",
+                    path.display()
+                );
+            }
+            for user in ["application-a", "application-b", "application-c"] {
+                assert!(
+                    source.contains(&format!("username: {user}")),
+                    "{} missing {user}",
                     path.display()
                 );
             }
             assert!(
-                !source.contains("username: bob"),
-                "{} must remain a single-principal qualification",
+                source.contains(gateway),
+                "{} must name its own gateway {gateway}",
                 path.display()
             );
-
             let config: serde_yaml::Value = serde_yaml::from_str(&source).expect("parse quota consumer config");
-            let filters = config["filter_chains"][0]["filters"]
-                .as_sequence()
-                .expect("filter chain must contain filters");
-            let limiter = filters
-                .iter()
-                .find(|filter| filter["filter"].as_str() == Some("token_rate_limit"))
-                .expect("token_rate_limit filter must exist");
-            let contract = (
-                limiter["backend"]["namespace"].as_str().expect("namespace").to_owned(),
-                limiter["rules"][0]["name"].as_str().expect("rule name").to_owned(),
-                limiter["rules"][0]["algorithm"].as_str().expect("algorithm").to_owned(),
-                limiter["rules"][0]["window"].as_str().expect("window").to_owned(),
-                limiter["rules"][0]["capacity"].as_u64().expect("capacity"),
-                limiter["rules"][0]["reserved_tokens"]
-                    .as_u64()
-                    .expect("reserved tokens"),
-                limiter["rules"][0]["reservation_timeout"]
-                    .as_str()
-                    .expect("reservation timeout")
-                    .to_owned(),
-            );
-            assert_eq!(
-                contract,
-                (
-                    "praxis:grid-token-rate-limit".to_owned(),
-                    "alice-shared-budget".to_owned(),
-                    "sliding_window".to_owned(),
-                    "60s".to_owned(),
-                    60,
-                    15,
-                    "30s".to_owned(),
-                )
-            );
-            assert_eq!(
-                limiter["rules"][0]["match"]["headers"]["x-model"].as_str(),
-                Some("Qwen/Qwen3-0.6B"),
-                "quota must apply only to the validated inference model"
-            );
-
-            if let Some(expected) = quota_contract.as_ref() {
-                assert_eq!(&contract, expected, "both consumers must address the same Valkey rule");
-            } else {
-                quota_contract = Some(contract);
+            assert_eq!(config["listeners"].as_sequence().map(Vec::len), Some(1));
+            let chains = config["filter_chains"].as_sequence().expect("filter chains");
+            let mut contracts = Vec::new();
+            for chain in chains {
+                let filters = chain["filters"].as_sequence().expect("chain filters");
+                let Some(limiter) = filters
+                    .iter()
+                    .find(|f| f["filter"].as_str() == Some("token_rate_limit"))
+                else {
+                    continue;
+                };
+                let rule = &limiter["rules"][0];
+                assert_eq!(rule["algorithm"].as_str(), Some("sliding_window"));
+                assert_eq!(rule["window"].as_str(), Some("60s"));
+                assert_eq!(rule["capacity"].as_u64(), Some(60));
+                assert_eq!(rule["reserved_tokens"].as_u64(), Some(15));
+                assert_eq!(rule["reservation_timeout"].as_str(), Some("30s"));
+                assert_eq!(limiter["key"].as_str(), Some("authenticated_subject"));
+                assert_eq!(
+                    rule["match"]["headers"]["x-model"].as_str(),
+                    Some("Qwen/Qwen3-0.6B"),
+                    "quota applies only to the validated inference model"
+                );
+                contracts.push((
+                    limiter["backend"]["namespace"].as_str().expect("namespace").to_owned(),
+                    rule["name"].as_str().expect("rule name").to_owned(),
+                ));
             }
+            assert_eq!(
+                contracts,
+                [(
+                    "praxis:grid-token-rate-limit".to_owned(),
+                    "per-application-budget".to_owned()
+                )],
+                "each gateway must expose one shared rule partitioned by authenticated subject"
+            );
         }
     }
 }

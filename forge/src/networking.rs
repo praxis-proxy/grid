@@ -56,11 +56,12 @@ pub fn create_network(
     binary: &str,
     net_name: &str,
     env_name: &str,
+    subnet: Option<&str>,
 ) -> Result<(), ForgeError> {
     if network_exists(runner, binary, net_name)? {
         return verify_ownership(runner, binary, net_name, env_name);
     }
-    let spec = create_spec(binary, net_name, env_name);
+    let spec = create_spec(binary, net_name, env_name, subnet);
     let output = runner.run(&spec)?;
     check_success(&output, "network create")
 }
@@ -173,18 +174,23 @@ fn missing_label(net_name: &str, key: &str) -> ForgeError {
 // ---------------------------------------------------------------
 
 /// Build a `<binary> network create` command spec with labels.
-fn create_spec(binary: &str, net_name: &str, env_name: &str) -> CommandSpec {
+fn create_spec(binary: &str, net_name: &str, env_name: &str, subnet: Option<&str>) -> CommandSpec {
+    let mut args = vec![
+        "network".into(),
+        "create".into(),
+        "--label".into(),
+        "forge.managed=true".into(),
+        "--label".into(),
+        format!("forge.environment={env_name}").into(),
+    ];
+    if let Some(subnet) = subnet {
+        args.push("--subnet".into());
+        args.push(subnet.into());
+    }
+    args.push(net_name.into());
     CommandSpec {
         program: binary.into(),
-        args: vec![
-            "network".into(),
-            "create".into(),
-            "--label".into(),
-            "forge.managed=true".into(),
-            "--label".into(),
-            format!("forge.environment={env_name}").into(),
-            net_name.into(),
-        ],
+        args,
         env: BTreeMap::default(),
         stdin: None,
         redact: Vec::new(),
@@ -274,7 +280,7 @@ fn parse_ipam_config(stdout: &str) -> Result<String, ForgeError> {
 }
 
 /// Validate an IPv4 CIDR without accepting host-only or IPv6 forms.
-fn validate_ipv4_cidr(cidr: &str) -> Result<(), ForgeError> {
+pub(crate) fn validate_ipv4_cidr(cidr: &str) -> Result<(), ForgeError> {
     let (address, prefix) = cidr
         .split_once('/')
         .ok_or_else(|| ForgeError::State(format!("network subnet is not CIDR: {cidr:?}")))?;
@@ -365,10 +371,24 @@ mod tests {
         runner.respond("docker network inspect test-net", not_found());
         runner.respond("docker", ok());
 
-        create_network(&runner, "docker", "test-net", "test").unwrap_or_else(|_| std::process::abort());
+        create_network(&runner, "docker", "test-net", "test", None).unwrap_or_else(|_| std::process::abort());
         assert!(runner.was_called("network create"), "should call network create");
         assert!(runner.was_called("forge.managed=true"), "should include managed label");
         assert!(runner.was_called("forge.environment=test"), "should include env label");
+    }
+
+    #[test]
+    fn create_uses_explicit_subnet() {
+        let mut runner = MockRunner::new();
+        runner.respond("docker network inspect test-net", not_found());
+        runner.respond("docker", ok());
+
+        create_network(&runner, "docker", "test-net", "test", Some("10.251.0.0/16"))
+            .unwrap_or_else(|_| std::process::abort());
+        assert!(
+            runner.was_called("--subnet 10.251.0.0/16"),
+            "should pass configured subnet"
+        );
     }
 
     #[test]
@@ -380,7 +400,7 @@ mod tests {
             owned_labels("test"),
         );
 
-        create_network(&runner, "docker", "test-net", "test").unwrap_or_else(|_| std::process::abort());
+        create_network(&runner, "docker", "test-net", "test", None).unwrap_or_else(|_| std::process::abort());
         assert!(
             !runner.was_called("network create"),
             "should not create existing network"
@@ -396,7 +416,7 @@ mod tests {
             owned_labels("other-env"),
         );
 
-        let result = create_network(&runner, "docker", "test-net", "test");
+        let result = create_network(&runner, "docker", "test-net", "test", None);
         let Err(err) = result else {
             std::process::abort();
         };
@@ -416,7 +436,7 @@ mod tests {
             foreign_labels(),
         );
 
-        let result = create_network(&runner, "docker", "test-net", "test");
+        let result = create_network(&runner, "docker", "test-net", "test", None);
         assert!(result.is_err(), "should reject unmanaged network");
     }
 
@@ -589,7 +609,7 @@ mod tests {
         runner.respond("podman network inspect test-net", not_found());
         runner.respond("podman", ok());
 
-        create_network(&runner, "podman", "test-net", "test").unwrap_or_else(|_| std::process::abort());
+        create_network(&runner, "podman", "test-net", "test", None).unwrap_or_else(|_| std::process::abort());
         assert!(runner.was_called("podman"), "should use podman binary");
     }
 }

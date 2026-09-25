@@ -64,6 +64,7 @@ AI image; these values may advance independently.
 | `commonLabels` | object | `{}` | Labels added to all resources. |
 | `podLabels` | object | `{}` | Additional pod labels. Selector labels cannot be overridden. |
 | `podAnnotations` | object | `{}` | Pod annotations. |
+| `terminationGracePeriodSeconds` | integer | `null` | Optional maximum termination grace period for gateway pods. Qualification topologies set this explicitly. |
 | `podSecurityContext` | object | `{}` | Extra pod securityContext (`runAsUser`, `runAsGroup`, `fsGroup`, `supplementalGroups`). |
 | `args` | list | `["--config", "/etc/praxis/praxis.yaml"]` | Container arguments. |
 | `config.existingConfigMap` | string | **required** | Name of an existing ConfigMap with the Praxis config. |

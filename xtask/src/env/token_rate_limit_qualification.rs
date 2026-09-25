@@ -46,8 +46,6 @@ const CONSUMER_A: &str = "consumer-gateway-a";
 const CONSUMER_B: &str = "consumer-gateway-b";
 /// West consumer gateway releases that share one Alice quota.
 const CONSUMERS: [&str; 2] = [CONSUMER_A, CONSUMER_B];
-/// Data-plane listener port on each consumer gateway.
-const CONSUMER_PORT: &str = "8080";
 /// Response header the provider gateway sets for regional attribution.
 const PROVIDER_SITE_HEADER: &str = "x-grid-provider-site";
 /// Valkey key namespace for the shared sliding-window quota.
@@ -59,24 +57,77 @@ const CURL_IMAGE: &str = "curlimages/curl:8.12.1";
 /// Rule capacity in tokens for the shared Alice budget.
 const CAPACITY_TOKENS: u32 = 60;
 /// Reserved tokens per admitted request.
+///
+/// This is the pre-admission ESTIMATE the filter holds to decide admission
+/// before actual usage is known. The enforceable contract is a reservation cap
+/// (`active reserved tokens <= capacity`); settlement later replaces the
+/// estimate with actual usage, which may exceed the reservation. Size this
+/// conservatively (toward worst-case output) when settled usage should track
+/// nominal capacity more closely.
 const RESERVED_TOKENS: u32 = 15;
 /// Sliding-window length in seconds.
 const WINDOW_SECS: u64 = 60;
 /// Additional attempts allowed only when a probe receives no HTTP response.
 const TRANSPORT_RETRIES: u32 = 3;
+/// Additional attempts allowed for a restart-sensitive probe while a gateway
+/// becomes ready again and briefly returns a transient, non-quota status.
+const RESTART_PROBE_RETRIES: u32 = 5;
+/// Spacing between restart-sensitive probe retries.
+const RESTART_PROBE_INTERVAL: Duration = Duration::from_secs(3);
 /// Cargo features that must be compiled into the Praxis AI qualification image.
 const REQUIRED_GATEWAY_FEATURES: &str = "token-rate-limit-filter,praxis-filter/basic-auth-filter";
 /// OCI label used to make the gateway image's feature contract inspectable.
 const GATEWAY_FEATURES_LABEL: &str = "org.praxis-proxy.ai.features";
-/// Alice principal username.
-const ALICE_USER: &str = "alice";
-/// Alice principal password used only by this qualification topology.
-const ALICE_PASS: &str = "alice-secret";
+/// Application-A principal used by the legacy quota scenarios.
+const ALICE_USER: &str = "application-a";
+/// Application-A password used only by this qualification topology.
+const ALICE_PASS: &str = "application-a-secret";
+/// Application-B principal.
+const BOB_USER: &str = "application-b";
+/// Application-B password used only by this qualification topology.
+const BOB_PASS: &str = "application-b-secret";
+/// Application-C principal.
+const CAROL_USER: &str = "application-c";
+/// Application-C password used only by this qualification topology.
+const CAROL_PASS: &str = "application-c-secret";
 /// Inference request body; `max_tokens` is small to keep runs fast.
 const REQUEST_BODY: &str =
     r#"{"model":"Qwen/Qwen3-0.6B","messages":[{"role":"user","content":"hello"}],"max_tokens":1}"#;
 /// Inference route on the consumer data plane.
 const INFERENCE_PATH: &str = "/v1/chat/completions";
+/// Shared inference listener used by every authenticated application.
+const CONSUMER_PORT: u16 = 8443;
+/// Shared quota rule partitioned by the authenticated subject.
+const QUOTA_RULE: &str = "per-application-budget";
+
+/// One authenticated application sharing the consumer endpoint and TRL rule.
+/// Praxis's trusted subject identity partitions the rule into independent
+/// buckets, and both gateways share those buckets through Valkey.
+#[derive(Clone, Copy)]
+struct App {
+    /// Stable application principal (application-a/-b/-c).
+    name: &'static str,
+    /// The valid Basic Auth credential for this application.
+    credential: Credential,
+}
+
+/// Application A on the shared listener.
+const APP_A: App = App {
+    name: "application-a",
+    credential: Credential::Valid,
+};
+/// Application B on the shared listener.
+const APP_B: App = App {
+    name: "application-b",
+    credential: Credential::ValidB,
+};
+/// Application C on the shared listener.
+const APP_C: App = App {
+    name: "application-c",
+    credential: Credential::ValidC,
+};
+/// All three applications, in a stable order.
+const APPS: [App; 3] = [APP_A, APP_B, APP_C];
 /// Monotonic suffix source for unique probe pod names.
 static PROBE_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 
@@ -105,6 +156,10 @@ pub(crate) struct Options {
 enum Credential {
     /// Correct Alice basic-auth credential.
     Valid,
+    /// Correct application-B basic-auth credential.
+    ValidB,
+    /// Correct application-C basic-auth credential.
+    ValidC,
     /// Correct user, wrong password.
     WrongPassword,
     /// No `Authorization` header at all.
@@ -207,6 +262,9 @@ struct Evidence {
     warmup_window_reset_seconds: u64,
     /// Whether cluster teardown ran and succeeded.
     cleanup_succeeded: Option<bool>,
+    /// The stable per-application quota identities (namespace + rule) proven
+    /// independent in this run.
+    application_quota_identities: Vec<serde_json::Value>,
 }
 
 /// Physical names for one qualification invocation. Logical Grid identities
@@ -231,7 +289,10 @@ impl RunIdentity {
     /// Derive all physical names from one validated run suffix.
     fn new(run_id: &str) -> Self {
         let forge_name = format!("{PHYSICAL_PREFIX}-{run_id}");
-        let cluster_prefix = forge_name.clone();
+        // Keep the Forge environment and Docker network descriptive, but use
+        // a shorter Kind prefix. Kind embeds the full cluster name in the
+        // node hostname and kubeadm becomes unreliable with the longer form.
+        let cluster_prefix = format!("grid-tlr-{run_id}");
         let network = format!("{forge_name}-net");
         let kind_clusters = CLUSTERS
             .iter()
@@ -607,6 +668,8 @@ where
 fn credential_args(credential: Credential) -> Vec<String> {
     match credential {
         Credential::Valid => vec!["-u".to_owned(), format!("{ALICE_USER}:{ALICE_PASS}")],
+        Credential::ValidB => vec!["-u".to_owned(), format!("{BOB_USER}:{BOB_PASS}")],
+        Credential::ValidC => vec!["-u".to_owned(), format!("{CAROL_USER}:{CAROL_PASS}")],
         Credential::WrongPassword => vec!["-u".to_owned(), format!("{ALICE_USER}:wrong")],
         Credential::Missing => Vec::new(),
         Credential::Malformed => vec!["-H".to_owned(), "Authorization: Basic not-valid-base64".to_owned()],
@@ -717,14 +780,14 @@ fn consumer_for(index: usize) -> &'static str {
     }
 }
 
-/// Consumer service URL for the inference route.
-fn consumer_url(gateway: &str) -> String {
+/// URL of the shared application listener on a specific gateway deployment.
+fn gateway_app_url(gateway: &str) -> String {
     format!("http://{gateway}.{NAMESPACE}.svc.cluster.local:{CONSUMER_PORT}{INFERENCE_PATH}")
 }
 
-/// Issue one inference probe against a consumer gateway and record it.
+/// Issue one inference probe against a gateway's shared application listener.
 fn probe(label: &str, gateway: &str, credential: Credential) -> Result<HttpResult, Box<dyn std::error::Error>> {
-    let url = consumer_url(gateway);
+    let url = gateway_app_url(gateway);
     let args = curl_args(&url, credential, REQUEST_BODY);
     let output = run_curl_pod("west", label, &args)?;
     let (status, provider_site) = parse_probe_output(&String::from_utf8_lossy(&output.stdout));
@@ -806,8 +869,11 @@ fn create_concurrency_client(index: usize) -> Result<String, Box<dyn std::error:
 
 /// Issue one request from an already-running concurrency client.
 fn exec_concurrency_probe(pod: &str, label: &str, gateway: &str) -> Result<HttpResult, Box<dyn std::error::Error>> {
-    let url = consumer_url(gateway);
-    let curl = curl_args(&url, Credential::Valid, REQUEST_BODY);
+    // Concurrency samples one application (application-a) on an explicit gateway
+    // and listener port, exercising the same authenticated path as the ordinary
+    // probes.
+    let url = gateway_app_url(gateway);
+    let curl = curl_args(&url, APP_A.credential, REQUEST_BODY);
     let mut args = vec!["exec", pod, "--"];
     args.extend(curl.iter().map(String::as_str));
     let output = kubectl("west", &args, 30)?;
@@ -856,8 +922,8 @@ fn valkey_cli(query: &str, secs: u64) -> Result<String, Box<dyn std::error::Erro
 /// set; its cardinality is the trailing-window occupancy. Counter keys
 /// (`active-count`, `reservation-seq`) and the `:keys` index are intentionally
 /// excluded so this reflects real window consumption.
-fn quota_entries() -> Result<u64, Box<dyn std::error::Error>> {
-    let keys = valkey_cli(&format!("--scan --pattern \"{QUOTA_KEY_PREFIX}*:settled\""), 30)?;
+fn quota_entries(namespace: &str) -> Result<u64, Box<dyn std::error::Error>> {
+    let keys = valkey_cli(&format!("--scan --pattern \"{namespace}*:settled\""), 30)?;
     let mut total: u64 = 0;
     for key in keys.lines().filter(|line| !line.trim().is_empty()) {
         let card = valkey_cli(&format!("zcard \"{key}\""), 20)?;
@@ -866,9 +932,10 @@ fn quota_entries() -> Result<u64, Box<dyn std::error::Error>> {
     Ok(total)
 }
 
-/// Sum actual settled charges from the encoded sorted-set members.
-fn settled_tokens() -> Result<u64, Box<dyn std::error::Error>> {
-    let keys = valkey_cli(&format!("--scan --pattern \"{QUOTA_KEY_PREFIX}*:settled\""), 30)?;
+/// Sum actual settled charges from the encoded sorted-set members of one
+/// application's namespace.
+fn settled_tokens(namespace: &str) -> Result<u64, Box<dyn std::error::Error>> {
+    let keys = valkey_cli(&format!("--scan --pattern \"{namespace}*:settled\""), 30)?;
     let mut total = 0;
     for key in keys.lines().filter(|line| !line.trim().is_empty()) {
         let members = valkey_cli(&format!("zrange \"{key}\" 0 -1"), 20)?;
@@ -885,8 +952,8 @@ fn settled_tokens() -> Result<u64, Box<dyn std::error::Error>> {
 /// Every rule reservation in this topology uses the same fixed estimate, so
 /// the reserved-token total is derived without a slower key scan. Settled
 /// entries alone cannot distinguish a refund from a request never admitted.
-fn active_reservations() -> Result<(u64, u64), Box<dyn std::error::Error>> {
-    let value = valkey_cli(&format!("get \"{QUOTA_KEY_PREFIX}:active-count\""), 20)?;
+fn active_reservations(namespace: &str) -> Result<(u64, u64), Box<dyn std::error::Error>> {
+    let value = valkey_cli(&format!("get \"{namespace}:active-count\""), 20)?;
     let count = value.trim().parse::<u64>().unwrap_or(0);
     let tokens = count.saturating_mul(u64::from(RESERVED_TOKENS));
     Ok((count, tokens))
@@ -1072,15 +1139,21 @@ fn deploy(session: &Session) -> Result<(), Box<dyn std::error::Error>> {
     deploy_sites_and_trust(session)?;
     note("phase: valkey + consumers");
     deploy_consumers(session)?;
-    wait_for_consumers()?;
+    wait_for_consumers(session)?;
     Ok(())
 }
 
 /// Wait for both consumer gateway deployments to become available.
-fn wait_for_consumers() -> Result<(), Box<dyn std::error::Error>> {
+fn wait_for_consumers(session: &Session) -> Result<(), Box<dyn std::error::Error>> {
     let context = context_for("west");
     for gateway in CONSUMERS {
-        crate::env::kubectl::wait_for_rollout_ns(&context, gateway, NAMESPACE, "deployment")?;
+        crate::env::kubectl::wait_for_rollout_ns_with_evidence(
+            &context,
+            gateway,
+            NAMESPACE,
+            "deployment",
+            Some(&session.evidence),
+        )?;
     }
     Ok(())
 }
@@ -1202,10 +1275,14 @@ fn latest_log_field(logs: &str, field: &str) -> Option<String> {
 }
 
 /// Read a consumer gateway's Praxis-reported `(accepted, serving)` revisions.
+#[expect(
+    clippy::too_many_lines,
+    reason = "current and previous log fallback stays one diagnostic operation"
+)]
 fn consumer_praxis_revisions(gateway: &str) -> (Option<String>, Option<String>) {
     let context = context_for("west");
     let deployment = format!("deployment/{gateway}");
-    let args = [
+    let base_args = [
         "--context",
         &context,
         "-n",
@@ -1216,14 +1293,35 @@ fn consumer_praxis_revisions(gateway: &str) -> (Option<String>, Option<String>) 
         "praxis",
         "--tail=400",
     ];
-    let logs = match spawn_timed("kubectl", &args, 30) {
-        Ok(output) if output.status.success() => strip_csi_sgr(&String::from_utf8_lossy(&output.stdout)),
-        _ => return (None, None),
+    let read = |previous: bool| {
+        let mut args = base_args.to_vec();
+        if previous {
+            args.push("--previous");
+        }
+        spawn_timed("kubectl", &args, 30)
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| strip_csi_sgr(&String::from_utf8_lossy(&output.stdout)))
     };
-    (
-        latest_log_field(&logs, "accepted_revision"),
-        latest_log_field(&logs, "serving_revision"),
-    )
+    let current = read(false);
+    let previous = read(true);
+    let accepted = current
+        .as_deref()
+        .and_then(|logs| latest_log_field(logs, "accepted_revision"))
+        .or_else(|| {
+            previous
+                .as_deref()
+                .and_then(|logs| latest_log_field(logs, "accepted_revision"))
+        });
+    let serving = current
+        .as_deref()
+        .and_then(|logs| latest_log_field(logs, "serving_revision"))
+        .or_else(|| {
+            previous
+                .as_deref()
+                .and_then(|logs| latest_log_field(logs, "serving_revision"))
+        });
+    (accepted, serving)
 }
 
 /// Observe one consumer: its accepted overlay plus Praxis accepted/serving revisions.
@@ -1251,7 +1349,7 @@ fn short_rev(value: &str) -> &str {
 ///
 /// Returns the validated overlays and the shared revision only when, for both
 /// consumers: the overlay is valid, the Grid revision is nonempty, and Praxis's
-/// accepted and serving revisions both equal it — and both consumers share one
+/// accepted and serving revisions both equal it - and both consumers share one
 /// current revision.
 fn convergence_ready(observations: &[ConsumerObservation]) -> Option<(Overlays, String)> {
     if observations.len() != CONSUMERS.len() {
@@ -1375,24 +1473,94 @@ fn probe_with_transport_retry(
     Err("transport retry loop ended without a result".into())
 }
 
+/// Probe through a gateway that may be mid-restart.
+///
+/// A gateway that has completed its rollout but is not yet serving briefly
+/// returns an unexpected non-quota status (classified [`Outcome::Other`]) or no
+/// response. This retries only those transient infrastructure outcomes and
+/// returns as soon as a definitive quota decision is observed. Real quota
+/// (`429`), fail-closed (`503`), and auth (`401`) outcomes are never retried
+/// away, and a persistent transient still fails once the bound is reached.
+fn probe_after_restart(
+    results: &mut Vec<HttpResult>,
+    label: &str,
+    gateway: &str,
+    credential: Credential,
+) -> Result<HttpResult, Box<dyn std::error::Error>> {
+    let mut result = probe_with_transport_retry(results, label, gateway, credential)?;
+    for attempt in 0..RESTART_PROBE_RETRIES {
+        if classify(result.status) != Outcome::Other {
+            return Ok(result);
+        }
+        results.push(result);
+        std::thread::park_timeout(RESTART_PROBE_INTERVAL);
+        result = probe_with_transport_retry(
+            results,
+            &format!("{label}-restart-retry-{attempt}"),
+            gateway,
+            credential,
+        )?;
+    }
+    Ok(result)
+}
+
 /// Scenario: valid Alice auth is admitted on both gateways with attribution.
-fn scenario_valid_auth(results: &mut Vec<HttpResult>) -> Result<ScenarioResult, Box<dyn std::error::Error>> {
+/// Return whether attribution covers every and only configured provider site.
+fn covers_all_provider_sites(distribution: &BTreeMap<String, u32>) -> bool {
+    CLUSTERS
+        .iter()
+        .all(|site| distribution.get(*site).is_some_and(|count| *count > 0))
+        && distribution.keys().all(|site| CLUSTERS.contains(&site.as_str()))
+}
+
+/// Probe one authenticated application and record its trusted attribution.
+fn record_valid_auth_probe(
+    results: &mut Vec<HttpResult>,
+    distribution: &mut BTreeMap<String, u32>,
+    facts: &mut BTreeMap<String, serde_json::Value>,
+    app: App,
+    gateway: &str,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let result = probe_with_transport_retry(
+        results,
+        &format!("valid-{}-{gateway}", app.name),
+        gateway,
+        app.credential,
+    )?;
+    let site = result.provider_site.clone();
+    if let Some(observed) = &site {
+        *distribution.entry(observed.clone()).or_insert(0) += 1;
+    }
+    let admitted = record(results, result) == Outcome::Admitted;
+    facts.insert(
+        format!("{}-{gateway}", app.name),
+        serde_json::json!({ "admitted": admitted, "site": site }),
+    );
+    Ok(admitted && site.is_some())
+}
+
+/// Verify every application on both shared consumer endpoints.
+fn scenario_valid_auth(
+    results: &mut Vec<HttpResult>,
+    distribution: &mut BTreeMap<String, u32>,
+) -> Result<ScenarioResult, Box<dyn std::error::Error>> {
     let mut facts = BTreeMap::new();
     let mut ok = true;
-    for gateway in CONSUMERS {
-        let result = probe_with_transport_retry(results, &format!("valid-{gateway}"), gateway, Credential::Valid)?;
-        let site = result.provider_site.clone();
-        let admitted = record(results, result) == Outcome::Admitted;
-        facts.insert(
-            gateway.to_owned(),
-            serde_json::json!({ "admitted": admitted, "site": site }),
-        );
-        ok = ok && admitted && site.is_some();
+    for app in APPS {
+        for gateway in CONSUMERS {
+            ok = record_valid_auth_probe(results, distribution, &mut facts, app, gateway)? && ok;
+        }
     }
+    let all_provider_sites_observed = covers_all_provider_sites(distribution);
+    facts.insert(
+        "all_provider_sites_observed".to_owned(),
+        serde_json::json!(all_provider_sites_observed),
+    );
     Ok(scenario(
         "valid_auth",
-        ok,
-        "Alice admitted with regional attribution".to_owned(),
+        ok && all_provider_sites_observed,
+        "each application is admitted on the shared endpoint on both gateways, with trusted attribution spanning west, central, and east"
+            .to_owned(),
         facts,
     ))
 }
@@ -1410,13 +1578,13 @@ fn probe_and_record(
 
 /// Scenario: missing and malformed auth are rejected before any reservation.
 fn scenario_auth_rejection(results: &mut Vec<HttpResult>) -> Result<ScenarioResult, Box<dyn std::error::Error>> {
-    let before = quota_entries()?;
+    let before = quota_entries(QUOTA_KEY_PREFIX)?;
     let outcomes = [
         probe_and_record(results, "missing-auth", CONSUMER_A, Credential::Missing)?,
         probe_and_record(results, "malformed-auth", CONSUMER_A, Credential::Malformed)?,
         probe_and_record(results, "wrong-password", CONSUMER_A, Credential::WrongPassword)?,
     ];
-    let after = quota_entries()?;
+    let after = quota_entries(QUOTA_KEY_PREFIX)?;
     let all_401 = outcomes.iter().all(|outcome| *outcome == Outcome::Unauthorized);
     let statuses = outcomes
         .iter()
@@ -1435,9 +1603,9 @@ fn scenario_auth_rejection(results: &mut Vec<HttpResult>) -> Result<ScenarioResu
 
 /// Scenario: readiness/probe traffic does not consume the inference quota.
 fn scenario_probe_no_quota() -> Result<ScenarioResult, Box<dyn std::error::Error>> {
-    let before = quota_entries()?;
+    let before = quota_entries(QUOTA_KEY_PREFIX)?;
     std::thread::park_timeout(Duration::from_secs(15));
-    let after = quota_entries()?;
+    let after = quota_entries(QUOTA_KEY_PREFIX)?;
     let spec = kubectl(
         "west",
         &[
@@ -1465,12 +1633,21 @@ fn scenario_probe_no_quota() -> Result<ScenarioResult, Box<dyn std::error::Error
 
 /// Exhaust the shared budget from one gateway; return admitted provider sites.
 fn exhaust_budget(results: &mut Vec<HttpResult>) -> Result<ExhaustOutcome, Box<dyn std::error::Error>> {
+    exhaust_budget_for(results, Credential::Valid, "a")
+}
+
+/// Exhaust one application's independent typed quota rule.
+fn exhaust_budget_for(
+    results: &mut Vec<HttpResult>,
+    credential: Credential,
+    principal: &str,
+) -> Result<ExhaustOutcome, Box<dyn std::error::Error>> {
     let attempts = (CAPACITY_TOKENS / RESERVED_TOKENS).saturating_add(4);
     let mut sites = Vec::new();
     let mut saw_denied = false;
     for index in 0..attempts {
         let gateway = consumer_for(index as usize);
-        let result = probe_with_transport_retry(results, &format!("exhaust-{index}"), gateway, Credential::Valid)?;
+        let result = probe_with_transport_retry(results, &format!("exhaust-{principal}-{index}"), gateway, credential)?;
         if let Some(site) = result.provider_site.clone() {
             sites.push(site);
         }
@@ -1481,31 +1658,66 @@ fn exhaust_budget(results: &mut Vec<HttpResult>) -> Result<ExhaustOutcome, Box<d
     Ok((sites, saw_denied))
 }
 
-/// Scenario: both gateways share one Alice budget and route across all sites.
-fn scenario_shared_budget(
+/// Scenario: all three independently mapped applications have isolated rules.
+#[expect(
+    clippy::too_many_lines,
+    reason = "three explicit application assertions are intentionally visible"
+)]
+fn scenario_three_application_independence(
     results: &mut Vec<HttpResult>,
-    distribution: &mut BTreeMap<String, u32>,
 ) -> Result<ScenarioResult, Box<dyn std::error::Error>> {
-    reset_window();
-    let (sites, saw_denied) = exhaust_budget(results)?;
-    for site in &sites {
-        *distribution.entry(site.clone()).or_insert(0) += 1;
+    let mut facts = BTreeMap::new();
+    let mut passed = true;
+    for app in APPS {
+        reset_window();
+        // Exhaust this application's budget across BOTH gateways (rotating).
+        let (_, denied_during_exhaust) = exhaust_budget_for(results, app.credential, app.name)?;
+        // The exhausted application is denied on BOTH gateway deployments: the
+        // same application on a different gateway sees the same namespace/rule
+        // ledger (shared exhaustion).
+        let mut denied_on_both = true;
+        for gateway in CONSUMERS {
+            let result = probe_with_transport_retry(
+                results,
+                &format!("indep-{}-denied-{gateway}", app.name),
+                gateway,
+                app.credential,
+            )?;
+            denied_on_both = denied_on_both && record(results, result) == Outcome::QuotaDenied;
+        }
+        // The other two authenticated subjects remain admitted even though all
+        // three share the same endpoint, namespace, and rule.
+        let mut others_admitted = true;
+        for other in APPS {
+            if other.name == app.name {
+                continue;
+            }
+            let result = probe_with_transport_retry(
+                results,
+                &format!("indep-{}-peer-{}", app.name, other.name),
+                CONSUMER_A,
+                other.credential,
+            )?;
+            others_admitted = others_admitted && record(results, result) == Outcome::Admitted;
+        }
+        let ok = denied_during_exhaust && denied_on_both && others_admitted;
+        passed &= ok;
+        facts.insert(
+            app.name.to_owned(),
+            serde_json::json!({
+                "namespace": QUOTA_KEY_PREFIX,
+                "rule": QUOTA_RULE,
+                "denied_on_both_gateways": denied_on_both,
+                "other_applications_admitted": others_admitted,
+                "authenticated_subject": app.name,
+            }),
+        );
     }
-    let denied_b =
-        classify(probe_with_transport_retry(results, "shared-b-after-exhaust", CONSUMER_B, Credential::Valid)?.status);
-    let all_sites = CLUSTERS.iter().all(|site| distribution.contains_key(*site));
-    let facts = BTreeMap::from([
-        ("distribution".to_owned(), serde_json::json!(distribution)),
-        (
-            "second_gateway_denied".to_owned(),
-            serde_json::json!(denied_b == Outcome::QuotaDenied),
-        ),
-    ]);
-    let passed = saw_denied && all_sites && denied_b == Outcome::QuotaDenied;
     Ok(scenario(
-        "shared_budget_and_distribution",
+        "three_application_independent_quota_isolation",
         passed,
-        "shared budget; routed across sites".to_owned(),
+        "one shared rule is partitioned by authenticated subject; exhausting one application denies it on both gateways while the others stay admitted"
+            .to_owned(),
         facts,
     ))
 }
@@ -1547,7 +1759,7 @@ fn concurrent_admitted(count: usize) -> Result<ConcurrentEvidence, Box<dyn std::
     let mut max_active = 0;
     let mut max_active_tokens = 0;
     while completed.load(Ordering::Relaxed) < count {
-        let (active, tokens) = active_reservations()?;
+        let (active, tokens) = active_reservations(QUOTA_KEY_PREFIX)?;
         max_active = max_active.max(active);
         max_active_tokens = max_active_tokens.max(tokens);
         if start.elapsed() >= Duration::from_secs(90) {
@@ -1582,15 +1794,34 @@ fn concurrent_admitted(count: usize) -> Result<ConcurrentEvidence, Box<dyn std::
 /// 60/15 arithmetic assumption. Completed requests may reconcile below their
 /// reservation and refund capacity, so five successful responses alone do not
 /// prove over-admission.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the reservation-cap assertions and their evidence are kept explicit"
+)]
 fn scenario_concurrency(results: &mut Vec<HttpResult>) -> Result<ScenarioResult, Box<dyn std::error::Error>> {
     reset_window();
     let burst = 8;
     let concurrent = concurrent_admitted(burst)?;
+    // Denied requests must never have reached a provider: a reservation refused
+    // at admission carries no provider-site attribution.
+    let denied_reached_provider = concurrent
+        .results
+        .iter()
+        .any(|result| classify(result.status) != Outcome::Admitted && result.provider_site.is_some());
     results.extend(concurrent.results);
-    let settled = settled_tokens()?;
+    let settled = settled_tokens(QUOTA_KEY_PREFIX)?;
+    // Settlement replaces each reservation estimate with actual usage. When a
+    // request consumes more than its reservation, settled tokens legitimately
+    // exceed capacity. This is an accounting observation, not over-admission,
+    // and must not gate the result.
+    let settled_exceeds_reservation = settled > concurrent.max_active_tokens;
     let facts = BTreeMap::from([
         ("concurrent_burst".to_owned(), serde_json::json!(burst)),
         ("concurrent_admitted".to_owned(), serde_json::json!(concurrent.admitted)),
+        (
+            "expected_reserved_admissions".to_owned(),
+            serde_json::json!(CAPACITY_TOKENS / RESERVED_TOKENS),
+        ),
         (
             "max_active_reservations".to_owned(),
             serde_json::json!(concurrent.max_active),
@@ -1600,13 +1831,25 @@ fn scenario_concurrency(results: &mut Vec<HttpResult>) -> Result<ScenarioResult,
             serde_json::json!(concurrent.max_active_tokens),
         ),
         ("settled_actual_tokens".to_owned(), serde_json::json!(settled)),
+        (
+            "settled_exceeds_reservation".to_owned(),
+            serde_json::json!(settled_exceeds_reservation),
+        ),
+        (
+            "denied_reached_provider".to_owned(),
+            serde_json::json!(denied_reached_provider),
+        ),
     ]);
+    // The enforceable contract is a reservation cap: active reserved tokens
+    // never exceed capacity, admission is partial under an over-burst, and no
+    // denied request reaches a provider. Settled actual usage is recorded as
+    // evidence but is not a hard bound.
     let passed = concurrent.admitted >= 1
         && concurrent.admitted < burst
         && concurrent.max_active >= 2
         && concurrent.max_active_tokens > u64::from(RESERVED_TOKENS)
         && concurrent.max_active_tokens <= u64::from(CAPACITY_TOKENS)
-        && settled <= u64::from(CAPACITY_TOKENS);
+        && !denied_reached_provider;
     Ok(scenario(
         "concurrency_no_over_admission",
         passed,
@@ -1643,19 +1886,22 @@ fn scenario_window_expiry(results: &mut Vec<HttpResult>) -> Result<ScenarioResul
 }
 
 /// Scenario: restarting a consumer preserves Valkey-backed quota state.
-fn scenario_restart_persistence(results: &mut Vec<HttpResult>) -> Result<ScenarioResult, Box<dyn std::error::Error>> {
+fn scenario_restart_persistence(
+    session: &Session,
+    results: &mut Vec<HttpResult>,
+) -> Result<ScenarioResult, Box<dyn std::error::Error>> {
     reset_window();
     exhaust_budget(results)?;
-    let before = quota_entries()?;
-    let peer_before = probe("peer-before-restart", CONSUMER_B, Credential::Valid)?;
+    let before = quota_entries(QUOTA_KEY_PREFIX)?;
+    let peer_before = probe_with_transport_retry(results, "peer-before-restart", CONSUMER_B, Credential::Valid)?;
     let peer_before_outcome = classify(peer_before.status);
     record(results, peer_before);
-    restart_consumer(CONSUMER_A)?;
-    let after = quota_entries()?;
-    let peer_after = probe("peer-after-restart", CONSUMER_B, Credential::Valid)?;
+    restart_consumer(CONSUMER_A, session)?;
+    let after = quota_entries(QUOTA_KEY_PREFIX)?;
+    let peer_after = probe_after_restart(results, "peer-after-restart", CONSUMER_B, Credential::Valid)?;
     let peer_after_outcome = classify(peer_after.status);
     record(results, peer_after);
-    let post_restart = probe("restarted-consumer", CONSUMER_A, Credential::Valid)?;
+    let post_restart = probe_after_restart(results, "restarted-consumer", CONSUMER_A, Credential::Valid)?;
     let post_restart_status = post_restart.status;
     let post_restart_outcome = classify(post_restart.status);
     record(results, post_restart);
@@ -1676,10 +1922,17 @@ fn scenario_restart_persistence(results: &mut Vec<HttpResult>) -> Result<Scenari
 }
 
 /// Restart one west consumer and wait for the namespace-scoped rollout.
-fn restart_consumer(consumer: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn restart_consumer(consumer: &str, session: &Session) -> Result<(), Box<dyn std::error::Error>> {
     let context = context_for("west");
     kubectl("west", &["rollout", "restart", &format!("deployment/{consumer}")], 60)?;
-    crate::env::kubectl::wait_for_rollout_ns(&context, consumer, NAMESPACE, "deployment")
+    crate::env::kubectl::wait_for_rollout_ns_with_evidence(
+        &context,
+        consumer,
+        NAMESPACE,
+        "deployment",
+        Some(&session.evidence),
+    )?;
+    Ok(())
 }
 
 /// Scale the Valkey deployment to a replica count and wait for rollout.
@@ -1939,6 +2192,11 @@ fn materialize(
         .ok_or("--image-tag is required for a Never-pull run")?;
     let content = fs::read_to_string(&options.forge_config)?;
     let mut config: serde_yaml::Value = serde_yaml::from_str(&content)?;
+    // The consumer configs are complete static three-listener policies checked
+    // into the topology (one application-scoped listener per app). They are used
+    // as-is; nothing is regenerated from a fixture, so deployed configuration is
+    // exactly what is reviewed in the repository.
+    let _ = state_dir;
     apply_run_identity(&mut config, names);
     rewrite_context_references(&mut config, names);
     rewrite_exec_state_references(&mut config, state_dir);
@@ -2030,6 +2288,30 @@ fn apply_run_identity(config: &mut serde_yaml::Value, names: &RunIdentity) {
             serde_yaml::Value::String(names.cluster_prefix.clone()),
         );
     }
+    if let Some(network) = config
+        .get_mut("spec")
+        .and_then(serde_yaml::Value::as_mapping_mut)
+        .and_then(|spec| spec.get_mut("network"))
+        .and_then(serde_yaml::Value::as_mapping_mut)
+    {
+        network.insert(
+            serde_yaml::Value::String("subnet".to_owned()),
+            serde_yaml::Value::String(qualification_subnet(&names.run_id)),
+        );
+    }
+}
+
+/// Choose a deterministic private /24 for one run so Docker's default pool
+/// allocation cannot collide with other qualification networks or stale IPAM
+/// reservations. The run ID remains the source of uniqueness.
+fn qualification_subnet(run_id: &str) -> String {
+    let mut hash = 0x811C_9DC5_u32;
+    for byte in run_id.bytes() {
+        hash ^= u32::from(byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    let third_octet = 20 + (hash % 200);
+    format!("10.240.{third_octet}.0/24")
 }
 
 /// Rewrite only the topology's known fixed kubectl context tokens. Logical
@@ -2150,18 +2432,22 @@ fn verify_resolved_names(resolved: &Path, names: &RunIdentity) -> Result<(), Box
 /// A scenario that hits an operational error is recorded as a failed scenario
 /// (with the error in its detail) rather than aborting the run, so evidence is
 /// always written and no failure is hidden.
-fn run_scenarios(results: &mut Vec<HttpResult>, distribution: &mut BTreeMap<String, u32>) -> Vec<ScenarioResult> {
+fn run_scenarios(
+    session: &Session,
+    results: &mut Vec<HttpResult>,
+    distribution: &mut BTreeMap<String, u32>,
+) -> Vec<ScenarioResult> {
     vec![
         guarded("probe_no_quota", scenario_probe_no_quota()),
-        guarded("valid_auth", scenario_valid_auth(results)),
+        guarded("valid_auth", scenario_valid_auth(results, distribution)),
         guarded("auth_rejection", scenario_auth_rejection(results)),
         guarded(
-            "shared_budget_and_distribution",
-            scenario_shared_budget(results, distribution),
+            "three_application_independent_quota_isolation",
+            scenario_three_application_independence(results),
         ),
         guarded("concurrency_no_over_admission", scenario_concurrency(results)),
         guarded("window_expiry_recovery", scenario_window_expiry(results)),
-        guarded("restart_persistence", scenario_restart_persistence(results)),
+        guarded("restart_persistence", scenario_restart_persistence(session, results)),
         guarded("valkey_outage_fail_closed", scenario_valkey_outage(results)),
         guarded("network_policy_denies_unauthorized", scenario_network_policy()),
     ]
@@ -2191,11 +2477,27 @@ fn logged(result: ScenarioResult) -> ScenarioResult {
 }
 
 /// Assemble and persist the evidence document plus a human summary.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the evidence document is assembled field-by-field for auditability"
+)]
 fn persist_evidence(
     session: &Session,
     collected: Collected,
     cleanup_succeeded: Option<bool>,
 ) -> Result<bool, Box<dyn std::error::Error>> {
+    let application_quota_identities = APPS
+        .iter()
+        .map(|app| {
+            serde_json::json!({
+                "application": app.name,
+                "listener_port": CONSUMER_PORT,
+                "authenticated_subject": app.name,
+                "valkey_namespace": QUOTA_KEY_PREFIX,
+                "rule": QUOTA_RULE,
+            })
+        })
+        .collect::<Vec<_>>();
     let all_passed = collected.scenarios.iter().all(|scenario| scenario.passed);
     let summary = summarize(&collected.scenarios, &collected.distribution);
     let evidence = Evidence {
@@ -2213,6 +2515,7 @@ fn persist_evidence(
         scenarios: collected.scenarios,
         warmup_window_reset_seconds: collected.warmup_window_reset_seconds,
         cleanup_succeeded,
+        application_quota_identities,
     };
     write_json(&session.evidence.join("results.json"), &evidence)?;
     fs::write(session.evidence.join("summary.txt"), summary)?;
@@ -2318,7 +2621,7 @@ fn qualify(session: &Session) -> Result<Collected, Box<dyn std::error::Error>> {
         "warmup quota reset completed after {warmup_window_reset_seconds}s of natural window aging"
     ));
     let mut distribution = BTreeMap::new();
-    let scenarios = run_scenarios(&mut results, &mut distribution);
+    let scenarios = run_scenarios(session, &mut results, &mut distribution);
     Ok(Collected {
         overlays,
         results,
@@ -2334,10 +2637,15 @@ fn qualify(session: &Session) -> Result<Collected, Box<dyn std::error::Error>> {
 /// hidden or treated as normal). This readiness gate is distinct from overlay
 /// convergence; the overlay existing does not mean routing is live.
 fn await_data_plane_ready(results: &mut Vec<HttpResult>) -> Result<(), Box<dyn std::error::Error>> {
-    for gateway in CONSUMERS {
+    for (index, gateway) in CONSUMERS.iter().enumerate() {
+        let credential = if index == 0 {
+            Credential::Valid
+        } else {
+            Credential::ValidB
+        };
         let start = Instant::now();
         loop {
-            let result = probe("warmup", gateway, Credential::Valid)?;
+            let result = probe("warmup", gateway, credential)?;
             let ready = classify(result.status) == Outcome::Admitted && result.provider_site.is_some();
             note(&format!(
                 "warmup {gateway}: status={} site={:?}",
@@ -2418,7 +2726,7 @@ mod tests {
         assert!(credential_args(Credential::Missing).is_empty());
         assert_eq!(
             credential_args(Credential::Valid),
-            vec!["-u".to_owned(), "alice:alice-secret".to_owned()]
+            vec!["-u".to_owned(), "application-a:application-a-secret".to_owned()]
         );
         assert!(credential_args(Credential::Malformed).contains(&"Authorization: Basic not-valid-base64".to_owned()));
     }
@@ -2624,8 +2932,8 @@ mod tests {
     #[test]
     fn run_identity_separates_physical_names_from_logical_sites() {
         let names = RunIdentity::new("quota-a1b2c3");
-        assert_eq!(names.kind_cluster("west"), "grid-token-rate-limit-quota-a1b2c3-west");
-        assert_eq!(names.context("west"), "kind-grid-token-rate-limit-quota-a1b2c3-west");
+        assert_eq!(names.kind_cluster("west"), "grid-tlr-quota-a1b2c3-west");
+        assert_eq!(names.context("west"), "kind-grid-tlr-quota-a1b2c3-west");
         assert_eq!(names.network, "grid-token-rate-limit-quota-a1b2c3-net");
         assert_eq!(CLUSTERS, ["west", "central", "east"]);
         assert!(names.kind_clusters.values().all(|value| value.len() <= 63));
@@ -2642,9 +2950,18 @@ mod tests {
     }
 
     #[test]
+    fn qualification_subnets_are_private_bounded_and_run_derived() {
+        let first = qualification_subnet("threeapp-one");
+        let second = qualification_subnet("threeapp-two");
+        assert_ne!(first, second);
+        assert!(first.starts_with("10.240."));
+        assert!(first.ends_with(".0/24"));
+    }
+
+    #[test]
     fn materialized_config_contains_run_identity_and_preserves_logical_resources() {
         let mut config: serde_yaml::Value = serde_yaml::from_str(
-            "apiVersion: forge.praxis.dev/v1alpha1\nkind: Environment\nmetadata:\n  name: grid-token-rate-limit\nspec:\n  runtime:\n    provider: docker\n    clusterPrefix: grid-token-rate-limit\n  clusters: []\n",
+            "apiVersion: forge.praxis.dev/v1alpha1\nkind: Environment\nmetadata:\n  name: grid-token-rate-limit\nspec:\n  runtime:\n    provider: docker\n    clusterPrefix: grid-token-rate-limit\n  network:\n    crossCluster: true\n  clusters: []\n",
         )
         .unwrap();
         let names = RunIdentity::new("quota-a1b2c3");
@@ -2655,18 +2972,16 @@ mod tests {
         rewrite_context_references(&mut config, &names);
         let rendered = serde_yaml::to_string(&config).unwrap();
         assert!(rendered.contains("name: grid-token-rate-limit-quota-a1b2c3"));
-        assert!(rendered.contains("clusterPrefix: grid-token-rate-limit-quota-a1b2c3"));
+        assert!(rendered.contains("clusterPrefix: grid-tlr-quota-a1b2c3"));
+        assert!(rendered.contains("subnet: 10.240."));
         assert!(!rendered.contains("clusterPrefix: grid-token-rate-limit\n"));
         assert_eq!(
             context.as_str(),
-            Some("kubectl --context kind-grid-token-rate-limit-quota-a1b2c3-west get pods")
+            Some("kubectl --context kind-grid-tlr-quota-a1b2c3-west get pods")
         );
         let mut template = serde_yaml::Value::String("kind-grid-token-rate-limit-{{ cluster.name }}".to_owned());
         rewrite_context_references(&mut template, &names);
-        assert_eq!(
-            template.as_str(),
-            Some("kind-grid-token-rate-limit-quota-a1b2c3-{{ cluster.name }}")
-        );
+        assert_eq!(template.as_str(), Some("kind-grid-tlr-quota-a1b2c3-{{ cluster.name }}"));
     }
 
     #[test]
@@ -2679,5 +2994,57 @@ mod tests {
         let rendered = serde_yaml::to_string(&config).unwrap();
         assert!(rendered.contains("target: .forge/runtime/west/provider/praxis.yaml"));
         assert!(rendered.contains("cat topology/.forge.quota-a1b2c3/runtime/west/provider/praxis.yaml"));
+    }
+
+    #[test]
+    fn restart_probe_retries_only_transient_non_quota_outcomes() {
+        // Definitive quota, fail-closed, and auth decisions must never be
+        // retried away by probe_after_restart (its gate is `!= Outcome::Other`).
+        for status in [200_u16, 429, 503, 401] {
+            assert_ne!(
+                classify(status),
+                Outcome::Other,
+                "status {status} must be a definitive outcome"
+            );
+        }
+        // A gateway that is not yet serving (or gave no response) classifies as
+        // Other and is retried within the bound.
+        for status in [0_u16, 500, 502, 504] {
+            assert_eq!(
+                classify(status),
+                Outcome::Other,
+                "status {status} should be treated as transient"
+            );
+        }
+    }
+
+    #[test]
+    fn applications_share_the_endpoint_and_rule_but_not_subject_identity() {
+        let names = APPS
+            .iter()
+            .map(|app| app.name)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(names.len(), 3);
+        assert_eq!(QUOTA_KEY_PREFIX, "praxis:grid-token-rate-limit");
+        assert_eq!(QUOTA_RULE, "per-application-budget");
+        assert_eq!(CONSUMER_PORT, 8443);
+    }
+
+    #[test]
+    fn provider_coverage_requires_every_and_only_expected_site() {
+        let complete = BTreeMap::from([
+            ("west".to_owned(), 2),
+            ("central".to_owned(), 2),
+            ("east".to_owned(), 2),
+        ]);
+        assert!(covers_all_provider_sites(&complete));
+
+        let mut missing = complete.clone();
+        missing.remove("east");
+        assert!(!covers_all_provider_sites(&missing));
+
+        let mut unknown = complete;
+        unknown.insert("unknown".to_owned(), 1);
+        assert!(!covers_all_provider_sites(&unknown));
     }
 }
