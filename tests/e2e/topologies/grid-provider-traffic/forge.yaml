@@ -20,12 +20,12 @@ spec:
         region: provider-a
         role: combined
         siteName: provider-a
-        gatewayImage: "ghcr.io/praxis-proxy/ai:0.3.0"
+        gatewayImage: "ghcr.io/praxis-proxy/ai:0.4.0"
         operatorImage: "ghcr.io/praxis-proxy/grid-operator:v0.1.4"
         vcrImage: "ghcr.io/neuralmagic/vllm-vcr:vllm0.23"
         imagePullPolicy: IfNotPresent
         gatewayImageRepo: "ghcr.io/praxis-proxy/ai"
-        gatewayImageTag: "0.3.0"
+        gatewayImageTag: "0.4.0"
         operatorImageRepo: "ghcr.io/praxis-proxy/grid-operator"
         operatorImageTag: "v0.1.4"
 
@@ -35,12 +35,12 @@ spec:
         region: provider-b
         role: combined
         siteName: provider-b
-        gatewayImage: "ghcr.io/praxis-proxy/ai:0.3.0"
+        gatewayImage: "ghcr.io/praxis-proxy/ai:0.4.0"
         operatorImage: "ghcr.io/praxis-proxy/grid-operator:v0.1.4"
         vcrImage: "ghcr.io/neuralmagic/vllm-vcr:vllm0.23"
         imagePullPolicy: IfNotPresent
         gatewayImageRepo: "ghcr.io/praxis-proxy/ai"
-        gatewayImageTag: "0.3.0"
+        gatewayImageTag: "0.4.0"
         operatorImageRepo: "ghcr.io/praxis-proxy/grid-operator"
         operatorImageTag: "v0.1.4"
 
@@ -50,12 +50,12 @@ spec:
         region: provider-c
         role: combined
         siteName: provider-c
-        gatewayImage: "ghcr.io/praxis-proxy/ai:0.3.0"
+        gatewayImage: "ghcr.io/praxis-proxy/ai:0.4.0"
         operatorImage: "ghcr.io/praxis-proxy/grid-operator:v0.1.4"
         vcrImage: "ghcr.io/neuralmagic/vllm-vcr:vllm0.23"
         imagePullPolicy: IfNotPresent
         gatewayImageRepo: "ghcr.io/praxis-proxy/ai"
-        gatewayImageTag: "0.3.0"
+        gatewayImageTag: "0.4.0"
         operatorImageRepo: "ghcr.io/praxis-proxy/grid-operator"
         operatorImageTag: "v0.1.4"
 

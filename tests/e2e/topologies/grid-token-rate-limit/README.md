@@ -162,26 +162,25 @@ flush Valkey to simulate recovery.
 
 ## Gateway Build Features
 
-The Praxis AI gateway image must enable both experimental filters used by this
-topology:
+The Praxis AI gateway image must enable the optional token quota filter used
+by this topology. Praxis AI 0.4.0 already includes the Basic Auth filter:
 
 ```text
-token-rate-limit-filter,praxis-filter/basic-auth-filter
+token-rate-limit-filter
 ```
 
 > **Published-image limitation:** The standard
-> `ghcr.io/praxis-proxy/ai:0.3.0` image does not contain these optional
-> filters because they are experimental, so it cannot run this qualification.
-> Supply a feature-enabled Praxis AI image explicitly. Grid publishes no
-> alternate AI rollup.
+> `ghcr.io/praxis-proxy/ai:0.4.0` image includes Basic Auth but does not contain
+> the optional `token-rate-limit-filter`, so it cannot run this qualification.
+> The standard image depends on Praxis core 0.7.0; that is distinct from the
+> Praxis AI image version 0.4.0. Grid publishes no alternate AI rollup.
 
-The second entry enables Basic Auth in AI's released `praxis-filter`
-dependency. It does not require a Praxis source checkout, Cargo patch, Git
-revision, or fork pin. Build AI from its own clean source tree and committed
-lockfile. Basic Auth stores the qualification credential in configuration and
-is not the production identity mechanism proposed by Grid issue 101.
+For a separate custom-image qualification, enable `token-rate-limit-filter`
+while building AI from its own clean source tree and committed lockfile. Basic
+Auth stores the qualification credential in configuration and is not the
+production identity mechanism proposed by Grid issue 101.
 
-AI v0.3.0's `Containerfile` does not expose a Cargo-feature build argument.
+AI v0.4.0's `Containerfile` does not expose a Cargo-feature build argument.
 Prepare a temporary Containerfile outside the AI worktree that adds the exact
 feature expression to both build-stage `cargo build` commands, then label the
 result so the qualification can verify its contract before creating clusters:
@@ -190,7 +189,7 @@ result so the qualification can verify its contract before creating clusters:
 AI_REPO=/path/to/clean/praxis-proxy-ai
 BUILD_DIR="$EVIDENCE_DIR/ai-image"
 mkdir -p "$BUILD_DIR"
-sed 's/cargo build --release -p praxis-ai-proxy/cargo build --release -p praxis-ai-proxy --features token-rate-limit-filter,praxis-filter\/basic-auth-filter/' \
+sed 's/cargo build --release -p praxis-ai-proxy/cargo build --release -p praxis-ai-proxy --features token-rate-limit-filter/' \
   "$AI_REPO/Containerfile" > "$BUILD_DIR/Containerfile"
 
 docker build \

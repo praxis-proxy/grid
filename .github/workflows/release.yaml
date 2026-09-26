@@ -25,9 +25,9 @@ env:
   CARGO_TERM_COLOR: always
   NIGHTLY_RUSTFMT: nightly-2026-03-28
   OFFICIAL_AI_IMAGE_NAME: ghcr.io/praxis-proxy/ai
-  OFFICIAL_AI_IMAGE_TAG: 0.3.0
-  OFFICIAL_AI_IMAGE_DIGEST: sha256:ccd46f8772eebcbde2f41ad35c3234d23463b8314a5865083e32baf31eddd1a8
-  OFFICIAL_AI_SOURCE_SHA: b44360afb4100c5543b1180ac8df16e482978fc8
+  OFFICIAL_AI_IMAGE_TAG: 0.4.0
+  OFFICIAL_AI_IMAGE_DIGEST: sha256:0f619d4a0b533093f94a76921cfbba0ecdec51557dffee1615a29721ee1fc878
+  OFFICIAL_AI_SOURCE_SHA: ca3e760c790a34293c03d2314a3c7cfbf73836b3
   OPERATOR_IMAGE_NAME: ghcr.io/praxis-proxy/grid-operator
   GATEWAY_IMAGE_NAME: ghcr.io/praxis-proxy/grid-gateway
   MOCK_PROVIDERS_IMAGE_NAME: ghcr.io/praxis-proxy/grid-mock-providers
@@ -413,8 +413,8 @@ jobs:
           Grid publishes the routing topology and qualification for distributed
           token quotas, but the standard Praxis AI ${OFFICIAL_AI_IMAGE_TAG}
           container does not include the optional \`token-rate-limit-filter\`
-          and \`praxis-filter/basic-auth-filter\` features. Deployments using the
-          quota example must supply a Praxis AI image built with both features.
+          feature. Basic Auth is present, but deployments using the quota example
+          must supply a Praxis AI image built with the token-rate-limit filter.
           Grid does not publish a replacement AI rollup.
           EOF
 

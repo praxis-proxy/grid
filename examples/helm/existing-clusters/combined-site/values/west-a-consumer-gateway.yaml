@@ -10,7 +10,7 @@ fullnameOverride: consumer-gateway
 
 image:
   repository: ghcr.io/praxis-proxy/ai
-  tag: 0.3.0
+  tag: 0.4.0
   pullPolicy: IfNotPresent
 
 config:

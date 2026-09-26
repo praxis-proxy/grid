@@ -11,7 +11,7 @@ cargo xtask env run-grid-combined-site-demo \
 ```
 
 The default configuration pulls
-`ghcr.io/praxis-proxy/ai:0.3.0`, which contains the provider-side
+`ghcr.io/praxis-proxy/ai:0.4.0`, which contains the provider-side
 filters used by this topology. For local development, set
 `GRID_XTASK_GATEWAY_IMAGE` to an AI image containing
 [`provider_route`](https://github.com/praxis-proxy/ai/pull/386) and set

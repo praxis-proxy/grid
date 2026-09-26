@@ -1382,7 +1382,6 @@ mod tests {
         store
     }
 
-
     #[test]
     fn removing_the_declared_key_refuses_the_peer() {
         let identities = PeerIdentities::new();
@@ -1515,7 +1514,6 @@ mod tests {
             "and its declared key is served"
         );
     }
-
 
     #[test]
     fn a_fingerprint_is_stable_and_distinguishing() {

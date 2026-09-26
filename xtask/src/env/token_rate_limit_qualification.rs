@@ -37,7 +37,7 @@ const LOGICAL_NETWORK: &str = "grid-token-rate-limit";
 /// Prefix for physical Forge and Kind resources.
 const PHYSICAL_PREFIX: &str = "grid-token-rate-limit";
 /// Maximum explicit run suffix length.
-const MAX_RUN_ID_LEN: usize = 24;
+const MAX_RUN_ID_LEN: usize = 18;
 /// Maximum generated suffix attempts before failing safely.
 const GENERATED_RUN_ID_ATTEMPTS: usize = 8;
 /// West consumer gateway A release name.
@@ -519,7 +519,14 @@ fn generated_run_id(attempt: usize) -> Result<String, Box<dyn std::error::Error>
     let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
     let pid = std::process::id();
     let id = format!("q{nanos:x}{pid:x}{attempt:x}");
-    let id = id.chars().take(MAX_RUN_ID_LEN).collect::<String>();
+    let id = id
+        .chars()
+        .rev()
+        .take(MAX_RUN_ID_LEN)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
     validate_run_id(&id)?;
     Ok(id)
 }
@@ -928,7 +935,7 @@ fn load_images(session: &Session) -> Result<(), Box<dyn std::error::Error>> {
     load_image(&format!("praxis-ai:{tag}"))?;
     load_image(&format!("grid-operator:{tag}"))?;
     load_image(&format!("grid-overlay-sync:{tag}"))?;
-    load_image(&crate::env::image_overrides::vcr_image())?;
+    load_image(&crate::env::image_overrides::sim_image())?;
     Ok(())
 }
 
@@ -2615,7 +2622,7 @@ mod tests {
             "Upper",
             "has_under",
             "a.b",
-            "1234567890123456789012345",
+            "1234567890123456789",
         ] {
             assert!(validate_run_id(invalid).is_err(), "{invalid} must be rejected");
         }
@@ -2639,6 +2646,13 @@ mod tests {
         validate_run_id(&first).unwrap();
         validate_run_id(&second).unwrap();
         assert_ne!(first, second);
+        let names = RunIdentity::new(&first);
+        assert!(
+            names
+                .kind_clusters
+                .values()
+                .all(|cluster| format!("{cluster}-control-plane").len() <= 63)
+        );
     }
 
     #[test]

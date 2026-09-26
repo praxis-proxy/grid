@@ -1,6 +1,7 @@
 # Provider gateway fixture used by the provider-traffic xtask tests.
 insecure_options:
   allow_private_endpoints: true
+  allow_private_upstreams: true
 
 listeners:
   - name: provider

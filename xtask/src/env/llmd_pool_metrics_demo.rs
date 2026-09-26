@@ -114,7 +114,7 @@ const GRID_NETWORK_NAME: &str = "grid-llmd-pool-metrics";
 /// combined-site demo. Both require the `peer_identity_trust`,
 /// `provider_route`, `credential_inject`, and `intelligent_route` filters
 /// which are built into the published Grid AI rollup.
-const DEFAULT_GATEWAY_IMAGE: &str = "ghcr.io/praxis-proxy/ai:0.3.0";
+const DEFAULT_GATEWAY_IMAGE: &str = "ghcr.io/praxis-proxy/ai:0.4.0";
 
 /// Default operator image tag.
 const DEFAULT_OPERATOR_IMAGE: &str = "ghcr.io/praxis-proxy/grid-operator:v0.1.4";
@@ -219,6 +219,8 @@ impl ScoringFlavor {
 struct DemoContext {
     /// Path to the resolved Forge config.
     resolved_config: PathBuf,
+    /// Per-run Forge state directory, kept beside the run's evidence.
+    forge_state_dir: PathBuf,
     /// Path to the forge binary.
     forge_bin: PathBuf,
     /// Resolved container images.
@@ -395,7 +397,13 @@ pub(crate) fn run(
     eprintln!("Demo root:    {}", demo_root.display());
     eprintln!("{OUTPUT_RULE}");
 
-    let context = prepare_setup(forge_config, metrics_transport, scoring_flavor)?;
+    let context = prepare_setup(
+        forge_config,
+        &evidence_dir.join("forge-state"),
+        &run_id,
+        metrics_transport,
+        scoring_flavor,
+    )?;
     let mut teardown_success = false;
     let mut run_error: Option<String> = None;
 
@@ -541,6 +549,8 @@ fn write_transition_timeline(
 /// Resolve inputs before creating clusters.
 fn prepare_setup(
     forge_config: &Path,
+    forge_state_dir: &Path,
+    run_id: &str,
     metrics_transport: MetricsTransport,
     scoring_flavor: ScoringFlavor,
 ) -> Result<DemoContext, Box<dyn std::error::Error>> {
@@ -549,10 +559,13 @@ fn prepare_setup(
 
     let resolved_config = materialize_config_with_images(
         forge_config,
-        metrics_transport,
-        scoring_flavor,
-        images.nginx.as_deref(),
-        Some(&images),
+        &MaterializeConfigOptions {
+            metrics_transport,
+            scoring_flavor,
+            nginx_image: images.nginx.as_deref(),
+            images: Some(&images),
+            run_id: Some(run_id),
+        },
     )?;
     verify_materialized_images(&resolved_config, &images)?;
     let forge_bin = glb::resolve_forge_binary()
@@ -561,6 +574,7 @@ fn prepare_setup(
 
     Ok(DemoContext {
         resolved_config,
+        forge_state_dir: forge_state_dir.to_path_buf(),
         forge_bin,
         images,
         metrics_transport,
@@ -573,7 +587,7 @@ fn resolve_images(metrics_transport: MetricsTransport) -> Result<ResolvedImages,
     let gateway = std::env::var("GRID_XTASK_GATEWAY_IMAGE").unwrap_or_else(|_| DEFAULT_GATEWAY_IMAGE.to_owned());
     let operator = std::env::var("GRID_XTASK_OPERATOR_IMAGE").unwrap_or_else(|_| DEFAULT_OPERATOR_IMAGE.to_owned());
     let epp = std::env::var("GRID_XTASK_EPP_IMAGE").unwrap_or_else(|_| DEFAULT_EPP_IMAGE.to_owned());
-    let vcr = std::env::var("GRID_XTASK_VCR_IMAGE").unwrap_or_else(|_| DEFAULT_VCR_IMAGE.to_owned());
+    let vcr = std::env::var("GRID_XTASK_SIM_IMAGE").unwrap_or_else(|_| DEFAULT_VCR_IMAGE.to_owned());
     let overlay_sync =
         std::env::var("GRID_XTASK_OVERLAY_SYNC_IMAGE").unwrap_or_else(|_| DEFAULT_OVERLAY_SYNC_IMAGE.to_owned());
     let nginx = (metrics_transport == MetricsTransport::MtlsProxy)
@@ -721,7 +735,12 @@ fn deploy_setup(context: &DemoContext) -> Result<(), Box<dyn std::error::Error>>
         next(),
         total
     );
-    run_forge(&context.forge_bin, &context.resolved_config, &["up"])?;
+    run_forge(
+        &context.forge_bin,
+        &context.resolved_config,
+        &context.forge_state_dir,
+        &["up"],
+    )?;
 
     // Phase 4: Load images into clusters
     eprintln!();
@@ -733,9 +752,9 @@ fn deploy_setup(context: &DemoContext) -> Result<(), Box<dyn std::error::Error>>
     eprintln!("[SETUP {}/{}] Installing MetalLB and Grid operators", next(), total);
     for cluster in CLUSTERS {
         let ctx = kind_context(cluster);
-        run_forge_stack(&context.forge_bin, &context.resolved_config, cluster, "metallb")?;
+        run_forge_stack(context, cluster, "metallb")?;
         let op_stack = format!("{cluster}-operator-base");
-        run_forge_stack(&context.forge_bin, &context.resolved_config, cluster, &op_stack)?;
+        run_forge_stack(context, cluster, &op_stack)?;
         eprintln!("  [OK] {cluster}: MetalLB and operator ready");
         drop(ctx);
     }
@@ -770,7 +789,7 @@ fn deploy_setup(context: &DemoContext) -> Result<(), Box<dyn std::error::Error>>
     );
     for cluster in CLUSTERS {
         let llmd_stack = format!("llmd-{cluster}");
-        run_forge_stack(&context.forge_bin, &context.resolved_config, cluster, &llmd_stack)?;
+        run_forge_stack(context, cluster, &llmd_stack)?;
         eprintln!("  [OK] {cluster}: vcr-1, vcr-2, and EPP running");
     }
 
@@ -788,22 +807,12 @@ fn deploy_setup(context: &DemoContext) -> Result<(), Box<dyn std::error::Error>>
     );
     for cluster in CLUSTERS {
         let site_stack = format!("{cluster}-site");
-        run_forge_stack(&context.forge_bin, &context.resolved_config, cluster, &site_stack)?;
-        run_forge_stack(
-            &context.forge_bin,
-            &context.resolved_config,
-            cluster,
-            "provider-gateway",
-        )?;
+        run_forge_stack(context, cluster, &site_stack)?;
+        run_forge_stack(context, cluster, "provider-gateway")?;
         eprintln!("  [OK] {cluster}: site and provider-gateway deployed");
     }
     for cluster in CLUSTERS {
-        run_forge_stack(
-            &context.forge_bin,
-            &context.resolved_config,
-            cluster,
-            "consumer-gateway",
-        )?;
+        run_forge_stack(context, cluster, "consumer-gateway")?;
         eprintln!("  [OK] {cluster}: consumer-gateway deployed");
     }
 
@@ -1046,6 +1055,7 @@ fn proof_pressure_and_flip(context: &DemoContext, table_start: Instant) -> Proof
     let deadline = Instant::now() + DATA_PLANE_WAIT;
     let mut last_reconcile_trigger = Instant::now();
     let mut last_route = String::from("-");
+    let mut last_probe_result = None::<String>;
     let mut pressure_announced = false;
 
     while Instant::now() < deadline {
@@ -1093,42 +1103,59 @@ fn proof_pressure_and_flip(context: &DemoContext, table_start: Instant) -> Proof
             );
             eprintln!("  [FAILOVER] Pool B is now preferred; sending verification request");
             let probe_ctx = kind_context("pool-a");
-            if let Ok(resp) = send_inference_request(&probe_ctx, VCR_MODEL) {
-                last_route = if resp.provider_gateway.contains("pool-b") {
-                    "pool-b".to_owned()
-                } else {
-                    "pool-a".to_owned()
-                };
-                if resp.provider_gateway.contains("pool-b") && resp.demo_attribution.contains("pool-b") {
-                    eprintln!("  [TRAFFIC SHIFT] Request attributed to pool-b");
-                    print_scorecard_with_cause(
-                        "FAILOVER",
-                        &[&row_a, &row_b],
-                        "CLUSTER B",
-                        &updated_candidates,
-                        "Pool A pressure lowered its queue/KV scores, so Pool B became rank 0.",
-                    );
-                    observations.push(format!(
-                        "flip: pool-b rank=0 score={:.2}, pool-a rank={} score={:.2} (gap={:.2})",
-                        row_b.score, row_a.rank, row_a.score, score_gap
-                    ));
-                    observations.push(format!(
-                        "pool-a: queue={:.1}/{:.0} kv={:.2}",
-                        row_a.queue, row_a.capacity, row_a.kv_cache
-                    ));
-                    observations.push(format!(
-                        "attribution: gateway={} provider={}",
-                        resp.provider_gateway, resp.demo_attribution
-                    ));
-                    observations
-                        .push("Grid rerouted: gateway-routed load caused A\u{2192}B preference change".to_owned());
-                    return ProofResult {
-                        success: true,
-                        description: "Gateway-routed load drove A\u{2192}B routing with visible attribution shift"
-                            .to_owned(),
-                        observations,
+            match send_inference_request(&probe_ctx, VCR_MODEL) {
+                Ok(resp) => {
+                    last_route = if resp.provider_gateway.contains("pool-b") {
+                        "pool-b".to_owned()
+                    } else {
+                        "pool-a".to_owned()
                     };
-                }
+                    let result = format!(
+                        "request attribution: gateway={} provider={}",
+                        resp.provider_gateway, resp.demo_attribution
+                    );
+                    if last_probe_result.as_deref() != Some(result.as_str()) {
+                        eprintln!("  [FAILOVER] {result}");
+                    }
+                    last_probe_result = Some(result);
+                    if resp.provider_gateway.contains("pool-b") && resp.demo_attribution.contains("pool-b") {
+                        eprintln!("  [TRAFFIC SHIFT] Request attributed to pool-b");
+                        print_scorecard_with_cause(
+                            "FAILOVER",
+                            &[&row_a, &row_b],
+                            "CLUSTER B",
+                            &updated_candidates,
+                            "Pool A pressure lowered its queue/KV scores, so Pool B became rank 0.",
+                        );
+                        observations.push(format!(
+                            "flip: pool-b rank=0 score={:.2}, pool-a rank={} score={:.2} (gap={:.2})",
+                            row_b.score, row_a.rank, row_a.score, score_gap
+                        ));
+                        observations.push(format!(
+                            "pool-a: queue={:.1}/{:.0} kv={:.2}",
+                            row_a.queue, row_a.capacity, row_a.kv_cache
+                        ));
+                        observations.push(format!(
+                            "attribution: gateway={} provider={}",
+                            resp.provider_gateway, resp.demo_attribution
+                        ));
+                        observations
+                            .push("Grid rerouted: gateway-routed load caused A\u{2192}B preference change".to_owned());
+                        return ProofResult {
+                            success: true,
+                            description: "Gateway-routed load drove A\u{2192}B routing with visible attribution shift"
+                                .to_owned(),
+                            observations,
+                        };
+                    }
+                },
+                Err(error) => {
+                    let result = format!("verification request failed: {error}");
+                    if last_probe_result.as_deref() != Some(result.as_str()) {
+                        eprintln!("  [FAILOVER] {result}");
+                    }
+                    last_probe_result = Some(result);
+                },
             }
         }
 
@@ -1136,6 +1163,9 @@ fn proof_pressure_and_flip(context: &DemoContext, table_start: Instant) -> Proof
     }
 
     observations.push("A\u{2192}B flip did not converge in data plane within timeout".to_owned());
+    if let Some(result) = last_probe_result {
+        observations.push(format!("last probe result: {result}"));
+    }
     ProofResult {
         success: false,
         description: "Gateway-routed load drove A\u{2192}B routing with visible attribution shift".to_owned(),
@@ -1167,6 +1197,7 @@ fn proof_recovery(context: &DemoContext, table_start: Instant) -> ProofResult {
     let deadline = Instant::now() + DATA_PLANE_WAIT;
     let mut last_reconcile_trigger = Instant::now();
     let mut last_route = String::from("-");
+    let mut last_probe_result = None::<String>;
 
     for cluster in CLUSTERS {
         trigger_gridnetwork_reconcile(cluster);
@@ -1199,36 +1230,54 @@ fn proof_recovery(context: &DemoContext, table_start: Instant) -> ProofResult {
                 epp_a.queue_size, epp_a.kv_cache
             );
             let probe_ctx = kind_context("pool-a");
-            if let Ok(resp) = send_inference_request(&probe_ctx, VCR_MODEL) {
-                last_route = if resp.provider_gateway.contains("pool-a") {
-                    "pool-a".to_owned()
-                } else {
-                    "pool-b".to_owned()
-                };
-                if resp.provider_gateway.contains("pool-a") && resp.demo_attribution.contains("pool-a") {
-                    eprintln!("  [RECOVERED] Pool A is preferred again; request attributed to pool-a");
-                    print_scorecard_with_cause(
-                        "RECOVERED",
-                        &[&row_a, &row_b],
-                        "CLUSTER A",
-                        &candidates,
-                        "Pressure stopped; Pool A drained and regained rank 0.",
-                    );
-                    observations.push(format!(
-                        "recovery: pool-a queue={:.2} kv={:.2} score={:.2} rank=0",
-                        row_a.queue, row_a.kv_cache, row_a.score
-                    ));
-                    observations.push(format!(
-                        "attribution: gateway={} provider={}",
-                        resp.provider_gateway, resp.demo_attribution
-                    ));
-                    observations.push("pool-a recovered to rank 0, pool-a attribution confirmed".to_owned());
-                    return ProofResult {
-                        success: true,
-                        description: "Recovery: measured queue drain restores pool-a, attribution confirmed".to_owned(),
-                        observations,
+            match send_inference_request(&probe_ctx, VCR_MODEL) {
+                Ok(resp) => {
+                    last_route = if resp.provider_gateway.contains("pool-a") {
+                        "pool-a".to_owned()
+                    } else {
+                        "pool-b".to_owned()
                     };
-                }
+                    let result = format!(
+                        "request attribution: gateway={} provider={}",
+                        resp.provider_gateway, resp.demo_attribution
+                    );
+                    if last_probe_result.as_deref() != Some(result.as_str()) {
+                        eprintln!("  [RECOVERY] {result}");
+                    }
+                    last_probe_result = Some(result);
+                    if resp.provider_gateway.contains("pool-a") && resp.demo_attribution.contains("pool-a") {
+                        eprintln!("  [RECOVERED] Pool A is preferred again; request attributed to pool-a");
+                        print_scorecard_with_cause(
+                            "RECOVERED",
+                            &[&row_a, &row_b],
+                            "CLUSTER A",
+                            &candidates,
+                            "Pressure stopped; Pool A drained and regained rank 0.",
+                        );
+                        observations.push(format!(
+                            "recovery: pool-a queue={:.2} kv={:.2} score={:.2} rank=0",
+                            row_a.queue, row_a.kv_cache, row_a.score
+                        ));
+                        observations.push(format!(
+                            "attribution: gateway={} provider={}",
+                            resp.provider_gateway, resp.demo_attribution
+                        ));
+                        observations.push("pool-a recovered to rank 0, pool-a attribution confirmed".to_owned());
+                        return ProofResult {
+                            success: true,
+                            description: "Recovery: measured queue drain restores pool-a, attribution confirmed"
+                                .to_owned(),
+                            observations,
+                        };
+                    }
+                },
+                Err(error) => {
+                    let result = format!("verification request failed: {error}");
+                    if last_probe_result.as_deref() != Some(result.as_str()) {
+                        eprintln!("  [RECOVERY] {result}");
+                    }
+                    last_probe_result = Some(result);
+                },
             }
         }
 
@@ -1236,6 +1285,9 @@ fn proof_recovery(context: &DemoContext, table_start: Instant) -> ProofResult {
     }
 
     observations.push("pool-a did not recover with confirmed routing within timeout".to_owned());
+    if let Some(result) = last_probe_result {
+        observations.push(format!("last probe result: {result}"));
+    }
     ProofResult {
         success: false,
         description: "Recovery: measured queue drain restores pool-a, attribution confirmed".to_owned(),
@@ -2323,9 +2375,16 @@ fn collect_image_evidence(resolved: &ResolvedImages) -> Result<BTreeMap<String, 
 // ---------------------------------------------------------------------------
 
 /// Run a forge command.
-fn run_forge(forge_bin: &Path, config: &Path, args: &[&str]) -> Result<(), Box<dyn std::error::Error>> {
+fn run_forge(
+    forge_bin: &Path,
+    config: &Path,
+    state_dir: &Path,
+    args: &[&str],
+) -> Result<(), Box<dyn std::error::Error>> {
     let output = Command::new(forge_bin)
         .args(["--config", &config.display().to_string(), "--non-interactive"])
+        .args(["--state-dir", &state_dir.display().to_string()])
+        .env("FORGE_STATE_DIR", state_dir)
         .args(args)
         .output()?;
     if output.status.success() {
@@ -2336,13 +2395,13 @@ fn run_forge(forge_bin: &Path, config: &Path, args: &[&str]) -> Result<(), Box<d
 }
 
 /// Run a specific forge stack on a cluster.
-fn run_forge_stack(
-    forge_bin: &Path,
-    config: &Path,
-    cluster: &str,
-    stack: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    run_forge(forge_bin, config, &["stack", "apply", cluster, stack])?;
+fn run_forge_stack(context: &DemoContext, cluster: &str, stack: &str) -> Result<(), Box<dyn std::error::Error>> {
+    run_forge(
+        &context.forge_bin,
+        &context.resolved_config,
+        &context.forge_state_dir,
+        &["stack", "apply", cluster, stack],
+    )?;
     Ok(())
 }
 
@@ -2370,7 +2429,16 @@ fn materialize_config(
     scoring_flavor: ScoringFlavor,
     nginx_image: Option<&str>,
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    materialize_config_with_images(forge_config, metrics_transport, scoring_flavor, nginx_image, None)
+    materialize_config_with_images(
+        forge_config,
+        &MaterializeConfigOptions {
+            metrics_transport,
+            scoring_flavor,
+            nginx_image,
+            images: None,
+            run_id: None,
+        },
+    )
 }
 
 /// Materialize a Forge config and inject all explicitly selected images.
@@ -2379,15 +2447,35 @@ fn materialize_config(
 /// overlay-sync sidecar values. Keeping this injection here ensures the image
 /// references used by Forge, Kind loading, and the environment variables are
 /// identical before any cluster is created.
+#[derive(Clone, Copy)]
+struct MaterializeConfigOptions<'inputs> {
+    /// Metrics transport to render into the resolved Forge config.
+    metrics_transport: MetricsTransport,
+    /// Scoring implementation selected by this qualification.
+    scoring_flavor: ScoringFlavor,
+    /// Optional nginx image used by the metrics TLS proxy manifests.
+    nginx_image: Option<&'inputs str>,
+    /// Optional explicitly resolved image set to materialize.
+    images: Option<&'inputs ResolvedImages>,
+    /// Optional run ID used to isolate generated manifest paths.
+    run_id: Option<&'inputs str>,
+}
+
+/// Materialize a Forge config with optional image and run-specific overrides.
 fn materialize_config_with_images(
     forge_config: &Path,
-    metrics_transport: MetricsTransport,
-    scoring_flavor: ScoringFlavor,
-    nginx_image: Option<&str>,
-    images: Option<&ResolvedImages>,
+    options: &MaterializeConfigOptions<'_>,
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let MaterializeConfigOptions {
+        metrics_transport,
+        scoring_flavor,
+        nginx_image,
+        images,
+        run_id,
+    } = *options;
     let dir = forge_config.parent().unwrap_or_else(|| Path::new("."));
-    let resolved = dir.join(".forge.resolved.yaml");
+    let run_suffix = run_id.map_or_else(String::new, |id| format!(".{id}"));
+    let resolved = dir.join(format!(".forge.resolved{run_suffix}.yaml"));
     let mut result = fs::read_to_string(forge_config)?;
     if let Some(images) = images {
         let image_pull_policy =
@@ -2454,7 +2542,7 @@ fn materialize_config_with_images(
         // the exact image loaded into Kind; do not rely on a host-only alias.
         for pool in CLUSTERS {
             let source = dir.join(format!("resources/{pool}/vcr-deployment.yaml"));
-            let resolved_name = format!(".forge.resolved.{pool}-vcr-deployment.yaml");
+            let resolved_name = format!(".forge.resolved.{pool}-vcr-deployment{run_suffix}.yaml");
             let destination = dir.join(&resolved_name);
             let manifest = fs::read_to_string(&source)?;
             let resolved_manifest = checked_replace(
@@ -2488,7 +2576,7 @@ fn materialize_config_with_images(
         // Create resolved mTLS deployment manifests with injected nginx image
         for pool in CLUSTERS {
             let src = dir.join(format!("resources/{pool}/epp-deployment-mtls.yaml"));
-            let resolved_name = format!(".forge.resolved.{pool}-epp-deployment-mtls.yaml");
+            let resolved_name = format!(".forge.resolved.{pool}-epp-deployment-mtls{run_suffix}.yaml");
             let dst = dir.join(&resolved_name);
             let manifest = fs::read_to_string(&src)?;
             let patched = checked_replace(
@@ -2668,7 +2756,12 @@ fn fnv1a_hex8(input: &str) -> String {
 fn teardown_environment(context: &DemoContext) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!();
     eprintln!("[TEARDOWN] Removing Kind clusters");
-    run_forge(&context.forge_bin, &context.resolved_config, &["down"])?;
+    run_forge(
+        &context.forge_bin,
+        &context.resolved_config,
+        &context.forge_state_dir,
+        &["down"],
+    )?;
     eprintln!("  [OK] Teardown complete");
     Ok(())
 }
@@ -3911,7 +4004,92 @@ fn proof_tls_routing() -> ProofResult {
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "tests")]
 mod tests {
+    use std::collections::BTreeSet;
+
+    use serde::Deserialize as _;
+
     use super::*;
+
+    #[test]
+    fn pool_metrics_topology_uses_deterministic_selection_for_pressure_recovery()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let config_source = include_str!("../../../tests/e2e/topologies/grid-llmd-pool-metrics/forge.yaml");
+        let config: serde_yaml::Value = serde_yaml::from_str(config_source)?;
+
+        for site in ["pool-a-site", "pool-b-site"] {
+            let selection_mode = config
+                .get("spec")
+                .and_then(|spec| spec.get("stacks"))
+                .and_then(|stacks| stacks.get(site))
+                .and_then(|site| site.get("steps"))
+                .and_then(|steps| steps.get(0))
+                .and_then(|step| step.get("values"))
+                .and_then(|values| values.get("gridNetwork"))
+                .and_then(|network| network.get("selectionPolicy"))
+                .and_then(|policy| policy.get("mode"))
+                .and_then(serde_yaml::Value::as_str);
+            assert_eq!(
+                selection_mode,
+                Some("deterministic"),
+                "{site} must use deterministic selection because this qualification asserts rank-0 preference, not equal-turn round robin"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn pool_metrics_simulator_backends_use_the_same_dummy_tokenizer_mode() -> Result<(), Box<dyn std::error::Error>> {
+        for source in [
+            include_str!("../../../tests/e2e/topologies/grid-llmd-pool-metrics/resources/pool-a/vcr-deployment.yaml"),
+            include_str!("../../../tests/e2e/topologies/grid-llmd-pool-metrics/resources/pool-b/vcr-deployment.yaml"),
+        ] {
+            let mut deployments = BTreeSet::new();
+            for document in serde_yaml::Deserializer::from_str(source) {
+                let value = serde_yaml::Value::deserialize(document)?;
+                if value.get("kind").and_then(serde_yaml::Value::as_str) != Some("Deployment") {
+                    continue;
+                }
+                let Some(name) = value
+                    .get("metadata")
+                    .and_then(|metadata| metadata.get("name"))
+                    .and_then(serde_yaml::Value::as_str)
+                else {
+                    continue;
+                };
+                let args = value
+                    .get("spec")
+                    .and_then(|spec| spec.get("template"))
+                    .and_then(|template| template.get("spec"))
+                    .and_then(|spec| spec.get("containers"))
+                    .and_then(|containers| containers.get(0))
+                    .and_then(|container| container.get("args"))
+                    .and_then(serde_yaml::Value::as_sequence)
+                    .ok_or_else(|| std::io::Error::other(format!("{name} simulator args must be a YAML sequence")))?;
+                assert!(
+                    args.iter().any(|arg| arg.as_str() == Some("--force-dummy-tokenizer")),
+                    "{name} must use dummy tokenization; otherwise llm-d-inference-sim calls its absent localhost:8082 renderer"
+                );
+                deployments.insert(name.to_owned());
+            }
+            assert_eq!(deployments, BTreeSet::from(["vcr-1".to_owned(), "vcr-2".to_owned()]));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn pool_metrics_topology_reads_generated_config_from_isolated_forge_state() {
+        let config = include_str!("../../../tests/e2e/topologies/grid-llmd-pool-metrics/forge.yaml");
+
+        for component in ["provider", "consumer"] {
+            let expected = format!(
+                "--from-file=praxis.yaml=${{FORGE_STATE_DIR:-.forge}}/runtime/{{{{ cluster.name }}}}/{component}/praxis.yaml"
+            );
+            assert!(
+                config.contains(&expected),
+                "the {component} configmap command must read generated files from the active Forge state directory"
+            );
+        }
+    }
 
     #[test]
     fn utc_timestamp_format_is_valid() {

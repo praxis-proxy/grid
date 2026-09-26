@@ -13,7 +13,7 @@ pub(crate) fn materialize(source: &Path, output: Option<&Path>) -> Result<PathBu
         gateway: image_overrides::gateway_image(),
         operator: image_overrides::operator_image(),
         overlay_sync: image_overrides::overlay_sync_image(),
-        vcr: image_overrides::vcr_image(),
+        vcr: image_overrides::sim_image(),
         pull_policy: image_overrides::image_pull_policy(),
     };
     if images.pull_policy == "Never"

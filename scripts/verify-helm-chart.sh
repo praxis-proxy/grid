@@ -7,7 +7,7 @@ KIND_CLUSTER=""
 
 OPERATOR_IMAGE="ghcr.io/praxis-proxy/grid-operator"
 OPERATOR_TAG="${GRID_OPERATOR_CI_TAG:-v0.1.4}"
-DEFAULT_GATEWAY_IMAGE="ghcr.io/praxis-proxy/ai:0.3.0"
+DEFAULT_GATEWAY_IMAGE="ghcr.io/praxis-proxy/ai:0.4.0"
 
 # ── Helpers ────────────────────────────────────────────────────────────
 

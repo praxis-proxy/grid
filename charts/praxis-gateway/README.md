@@ -18,7 +18,7 @@ release ownership exist. Do not treat this as a permanent Grid responsibility.
 - Kubernetes >= 1.26
 - Helm >= 3.12
 - A Praxis configuration ConfigMap already created in the target namespace
-- A compatible Praxis AI gateway image (default: Praxis AI 0.3.0)
+- A compatible Praxis AI gateway image (default: Praxis AI 0.4.0)
 
 ## Install
 
@@ -34,16 +34,18 @@ helm install edge-gateway charts/praxis-gateway \
   --set config.existingConfigMap=edge-gateway-config
 ```
 
-The default image is the official Praxis AI 0.3.0 gateway. Override
-`image.repository`, `image.tag`, or `image.digest` to install another compatible
-gateway image. Prefer a digest when reproducing a validated deployment.
+The default image reference is the official Praxis AI 0.4.0 gateway tag.
+`image.digest` defaults to empty so an `image.tag` override remains effective.
+For immutable deployments, set `image.digest` explicitly to
+`sha256:0f619d4a0b533093f94a76921cfbba0ecdec51557dffee1615a29721ee1fc878`.
+Praxis AI 0.4.0 depends on Praxis core 0.7.0; these are separate release
+versions.
 
-The standard Praxis AI 0.3.0 image supports Grid provider selection and load
-balancing. It does not include the optional `token-rate-limit-filter` and
-`praxis-filter/basic-auth-filter` features required by the distributed token
-quota qualification. That qualification requires an explicitly supplied Praxis
-AI image built with both features; Grid does not publish a replacement AI
-rollup.
+The standard Praxis AI 0.4.0 image supports Grid provider selection and load
+balancing and includes Basic Auth. It does not include the optional
+`token-rate-limit-filter` required by the distributed token quota qualification.
+That qualification is not supported by this default image; Grid does not
+publish a replacement AI rollup.
 
 The chart uses [Semantic Versioning](https://semver.org/). Its `version`
 identifies the chart package, while `appVersion` identifies the default Praxis
@@ -55,7 +57,7 @@ AI image; these values may advance independently.
 |-----|------|---------|-------------|
 | `replicaCount` | int | `1` | Gateway replicas. |
 | `image.repository` | string | `ghcr.io/praxis-proxy/ai` | Image repository. |
-| `image.tag` | string | `0.3.0` | Image tag. |
+| `image.tag` | string | `0.4.0` | Image tag (ignored when `image.digest` is set). |
 | `image.digest` | string | `""` | Immutable digest (sha256:…). When set, tag is ignored. |
 | `image.pullPolicy` | string | `IfNotPresent` | Image pull policy. |
 | `imagePullSecrets` | list | `[]` | Pull secrets for private registries. |

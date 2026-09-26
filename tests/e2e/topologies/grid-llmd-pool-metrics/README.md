@@ -24,7 +24,7 @@ separate real EPP/VCR smoke coverage remains useful for availability and
 provider-boundary checks.
 
 The default gateway image is
-`ghcr.io/praxis-proxy/ai:0.3.0`, which contains the provider-side filters used
+`ghcr.io/praxis-proxy/ai:0.4.0`, which contains the provider-side filters used
 by this topology. For local development, set
 `GRID_XTASK_GATEWAY_IMAGE` to an AI image containing
 [`provider_route`](https://github.com/praxis-proxy/ai/pull/386) and set

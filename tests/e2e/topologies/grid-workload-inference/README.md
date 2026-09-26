@@ -15,7 +15,7 @@ cargo xtask env run-grid-glb-demo \
 ```
 
 The reused GLB configuration defaults to
-`ghcr.io/praxis-proxy/ai:0.3.0`. For local development, set
+`ghcr.io/praxis-proxy/ai:0.4.0`. For local development, set
 `GRID_XTASK_GATEWAY_IMAGE` to an AI image containing
 [`provider_route`](https://github.com/praxis-proxy/ai/pull/386) and set
 `GRID_XTASK_IMAGE_PULL_POLICY=Never` explicitly.

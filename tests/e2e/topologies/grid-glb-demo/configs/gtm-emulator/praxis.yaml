@@ -1,3 +1,7 @@
+insecure_options:
+  allow_private_endpoints: true
+  allow_private_upstreams: true
+
 listeners:
   - name: public-https
     address: "0.0.0.0:8443"

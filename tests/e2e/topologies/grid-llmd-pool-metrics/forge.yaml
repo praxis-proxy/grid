@@ -20,13 +20,13 @@ spec:
         region: pool-a
         role: combined
         siteName: pool-a
-        gatewayImage: "ghcr.io/praxis-proxy/ai:0.3.0"
+        gatewayImage: "ghcr.io/praxis-proxy/ai:0.4.0"
         operatorImage: "ghcr.io/praxis-proxy/grid-operator:v0.1.4"
         eppImage: "ghcr.io/llm-d/llm-d-router-endpoint-picker:v0.9.0"
         vcrImage: "llm-d-inference-sim:deterministic"
         imagePullPolicy: IfNotPresent
         gatewayImageRepo: "ghcr.io/praxis-proxy/ai"
-        gatewayImageTag: "0.3.0"
+        gatewayImageTag: "0.4.0"
         operatorImageRepo: "ghcr.io/praxis-proxy/grid-operator"
         operatorImageTag: "v0.1.4"
         eppImageRepo: "ghcr.io/llm-d/llm-d-router-endpoint-picker"
@@ -41,13 +41,13 @@ spec:
         region: pool-b
         role: combined
         siteName: pool-b
-        gatewayImage: "ghcr.io/praxis-proxy/ai:0.3.0"
+        gatewayImage: "ghcr.io/praxis-proxy/ai:0.4.0"
         operatorImage: "ghcr.io/praxis-proxy/grid-operator:v0.1.4"
         eppImage: "ghcr.io/llm-d/llm-d-router-endpoint-picker:v0.9.0"
         vcrImage: "llm-d-inference-sim:deterministic"
         imagePullPolicy: IfNotPresent
         gatewayImageRepo: "ghcr.io/praxis-proxy/ai"
-        gatewayImageTag: "0.3.0"
+        gatewayImageTag: "0.4.0"
         operatorImageRepo: "ghcr.io/praxis-proxy/grid-operator"
         operatorImageTag: "v0.1.4"
         eppImageRepo: "ghcr.io/llm-d/llm-d-router-endpoint-picker"
@@ -236,6 +236,8 @@ spec:
               routingPolicy: scoreFirst
               scoringPolicy:
                 strategy: queueDepth
+              selectionPolicy:
+                mode: deterministic
               # Ten seconds is the periodic fallback. The harness also forces
               # reconciles while waiting for deterministic pressure transitions.
               metricsRefreshInterval: "10s"
@@ -311,6 +313,8 @@ spec:
               routingPolicy: scoreFirst
               scoringPolicy:
                 strategy: queueDepth
+              selectionPolicy:
+                mode: deterministic
               # Ten seconds is the periodic fallback. The harness also forces
               # reconciles while waiting for deterministic pressure transitions.
               metricsRefreshInterval: "10s"
@@ -380,7 +384,7 @@ spec:
             - >-
               kubectl --context kind-grid-llmd-pm-{{ cluster.name }} -n grid-system
               create configmap provider-gateway-config
-              --from-file=praxis.yaml=.forge/runtime/{{ cluster.name }}/provider/praxis.yaml
+              --from-file=praxis.yaml=${FORGE_STATE_DIR:-.forge}/runtime/{{ cluster.name }}/provider/praxis.yaml
               --dry-run=client -o yaml |
               kubectl --context kind-grid-llmd-pm-{{ cluster.name }} apply -f -
         - type: helm
@@ -458,7 +462,7 @@ spec:
             - >-
               kubectl --context kind-grid-llmd-pm-{{ cluster.name }} -n grid-system
               create configmap consumer-gateway-config
-              --from-file=praxis.yaml=.forge/runtime/{{ cluster.name }}/consumer/praxis.yaml
+              --from-file=praxis.yaml=${FORGE_STATE_DIR:-.forge}/runtime/{{ cluster.name }}/consumer/praxis.yaml
               --dry-run=client -o yaml |
               kubectl --context kind-grid-llmd-pm-{{ cluster.name }} apply -f -
         - type: helm

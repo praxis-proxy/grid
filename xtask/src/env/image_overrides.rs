@@ -23,8 +23,8 @@ const MOCK_EPP_IMAGE_ENV: &str = "GRID_XTASK_MOCK_EPP_IMAGE";
 /// generic environments.
 const MOCK_PROVIDER_IMAGE_ENV: &str = "GRID_XTASK_MOCK_PROVIDER_IMAGE";
 
-/// Environment variable to override the VCR image.
-const VCR_IMAGE_ENV: &str = "GRID_XTASK_VCR_IMAGE";
+/// Environment variable to override the simulator image.
+const SIM_IMAGE_ENV: &str = "GRID_XTASK_SIM_IMAGE";
 
 /// Environment variable to override the operator image.
 const OPERATOR_IMAGE_ENV: &str = "GRID_XTASK_OPERATOR_IMAGE";
@@ -55,16 +55,16 @@ const DEFAULT_OPERATOR_IMAGE: &str = "grid-operator:latest";
 const DEFAULT_OVERLAY_SYNC_IMAGE: &str = "grid-overlay-sync:latest";
 
 /// Default gateway image used by the GLB demo.
-const DEFAULT_GLB_GATEWAY_IMAGE: &str = "ghcr.io/praxis-proxy/ai:0.3.0";
+const DEFAULT_GLB_GATEWAY_IMAGE: &str = "ghcr.io/praxis-proxy/ai:0.4.0";
 
-/// Default VCR image used by forge-based demos.
-const DEFAULT_VCR_IMAGE: &str = "ghcr.io/neuralmagic/vllm-vcr:vllm0.23";
+/// Default simulator image used by forge-based demos.
+const DEFAULT_SIM_IMAGE: &str = "ghcr.io/neuralmagic/vllm-vcr:vllm0.23";
 
 /// Default operator image used by the GLB demo.
 const DEFAULT_GLB_OPERATOR_IMAGE: &str = "ghcr.io/praxis-proxy/grid-operator:v0.1.4";
 
 /// Default gateway image for workload-inference demos.
-const DEFAULT_WORKLOAD_GATEWAY_IMAGE: &str = "ghcr.io/praxis-proxy/ai:0.3.0";
+const DEFAULT_WORKLOAD_GATEWAY_IMAGE: &str = "ghcr.io/praxis-proxy/ai:0.4.0";
 
 /// Default operator image for workload-inference demos.
 const DEFAULT_WORKLOAD_OPERATOR_IMAGE: &str = "ghcr.io/praxis-proxy/grid-operator:v0.1.4";
@@ -107,9 +107,9 @@ pub(crate) fn overlay_sync_image() -> String {
     env::var(OVERLAY_SYNC_IMAGE_ENV).unwrap_or_else(|_| DEFAULT_OVERLAY_SYNC_IMAGE.to_owned())
 }
 
-/// Get the VCR image name, respecting environment overrides.
-pub(crate) fn vcr_image() -> String {
-    env::var(VCR_IMAGE_ENV).unwrap_or_else(|_| DEFAULT_VCR_IMAGE.to_owned())
+/// Get the simulator image name, respecting environment overrides.
+pub(crate) fn sim_image() -> String {
+    env::var(SIM_IMAGE_ENV).unwrap_or_else(|_| DEFAULT_SIM_IMAGE.to_owned())
 }
 
 /// Get the demo gateway image for the given ingress mode.
@@ -188,10 +188,10 @@ mod tests {
         assert_eq!(DEFAULT_MOCK_EPP_IMAGE, "localhost/praxis-ai-mock-epp:latest");
         assert_eq!(DEFAULT_OPERATOR_IMAGE, "grid-operator:latest");
         assert_eq!(DEFAULT_OVERLAY_SYNC_IMAGE, "grid-overlay-sync:latest");
-        assert_eq!(DEFAULT_GLB_GATEWAY_IMAGE, "ghcr.io/praxis-proxy/ai:0.3.0");
+        assert_eq!(DEFAULT_GLB_GATEWAY_IMAGE, "ghcr.io/praxis-proxy/ai:0.4.0");
         assert_eq!(DEFAULT_GLB_OPERATOR_IMAGE, "ghcr.io/praxis-proxy/grid-operator:v0.1.4");
         assert_eq!(DEFAULT_IMAGE_PULL_POLICY, "Never");
-        assert_eq!(DEFAULT_WORKLOAD_GATEWAY_IMAGE, "ghcr.io/praxis-proxy/ai:0.3.0");
+        assert_eq!(DEFAULT_WORKLOAD_GATEWAY_IMAGE, "ghcr.io/praxis-proxy/ai:0.4.0");
         assert_eq!(
             DEFAULT_WORKLOAD_OPERATOR_IMAGE,
             "ghcr.io/praxis-proxy/grid-operator:v0.1.4"

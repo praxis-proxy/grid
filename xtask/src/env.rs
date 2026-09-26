@@ -1070,7 +1070,7 @@ pub(crate) enum Action {
     /// the ordinary provider-traffic round-robin qualification.
     RunGridStaticWeightedQualification {
         /// Path to the static-weighted Forge topology.
-        #[arg(default_value = "tests/e2e/topologies/grid-static-weighted/forge.yaml")]
+        #[arg(long, default_value = "tests/e2e/topologies/grid-static-weighted/forge.yaml")]
         forge_config: PathBuf,
         /// Run mode and teardown options.
         #[command(flatten)]
@@ -1149,6 +1149,53 @@ mod llmd_pool_metrics_demo_cli_tests {
     #[test]
     fn kv_cache_flag_parses_when_passed() {
         assert!(parsed_kv_cache_flag(&["--kv-cache"]));
+    }
+}
+
+#[cfg(test)]
+#[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, reason = "tests")]
+mod static_weighted_qualification_cli_tests {
+    use std::path::PathBuf;
+
+    use clap::Parser as _;
+
+    use super::Action;
+    use crate::{Cli, Command};
+
+    #[test]
+    fn forge_config_is_accepted_as_a_named_option() {
+        let cli = Cli::try_parse_from([
+            "xtask",
+            "env",
+            "run-grid-static-weighted-qualification",
+            "--forge-config",
+            "custom/topology.yaml",
+        ])
+        .expect("static weighted accepts --forge-config like the other qualification commands");
+        let Command::Env { action } = cli.command else {
+            panic!("expected the env subcommand");
+        };
+        let Action::RunGridStaticWeightedQualification { forge_config, .. } = action else {
+            panic!("expected the static weighted qualification action");
+        };
+        assert_eq!(forge_config, PathBuf::from("custom/topology.yaml"));
+    }
+
+    #[test]
+    fn forge_config_defaults_to_the_static_weighted_topology() {
+        let cli = Cli::try_parse_from(["xtask", "env", "run-grid-static-weighted-qualification"])
+            .expect("static weighted default invocation must parse");
+        let Command::Env { action } = cli.command else {
+            panic!("expected the env subcommand");
+        };
+        let Action::RunGridStaticWeightedQualification { forge_config, .. } = action else {
+            panic!("expected the static weighted qualification action");
+        };
+        assert_eq!(
+            forge_config,
+            PathBuf::from("tests/e2e/topologies/grid-static-weighted/forge.yaml")
+        );
     }
 }
 

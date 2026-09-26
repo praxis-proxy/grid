@@ -79,6 +79,7 @@ The full two-run handoff is in `STATIC_WEIGHTED_E2E_HANDOFF.md`.
 
 ```bash
 export GRID_XTASK_IMAGE_PULL_POLICY=Never
+export GRID_XTASK_SIM_IMAGE=ghcr.io/llm-d/llm-d-inference-sim:v0.10.2
 cargo xtask env run-grid-static-weighted-qualification \
   --forge-config tests/e2e/topologies/grid-static-weighted/forge.yaml \
   --quick --teardown \

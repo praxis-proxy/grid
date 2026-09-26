@@ -469,7 +469,7 @@ fn print_runtime_images(ingress_mode: IngressMode) {
         "  operator:      {}",
         image_overrides::demo_operator_image(ingress_mode)
     );
-    eprintln!("  vcr:           {}", image_overrides::vcr_image());
+    eprintln!("  simulator:     {}", image_overrides::sim_image());
     eprintln!(
         "  pull policy:   {}",
         image_overrides::demo_image_pull_policy(ingress_mode)
@@ -2165,7 +2165,7 @@ fn validate_image_contract_for_mode(ingress_mode: IngressMode) -> Result<(), Box
             "GRID_XTASK_OPERATOR_IMAGE",
             image_overrides::demo_operator_image(ingress_mode),
         ),
-        ("GRID_XTASK_VCR_IMAGE", image_overrides::vcr_image()),
+        ("GRID_XTASK_SIM_IMAGE", image_overrides::sim_image()),
     ] {
         if image.is_empty() || image.chars().any(char::is_whitespace) {
             return Err(format!("{name} must be a non-empty image reference without whitespace").into());
@@ -2207,7 +2207,7 @@ fn set_cluster_image_properties_for_mode(
         for (key, value) in [
             ("gatewayImage", gateway_image.clone()),
             ("operatorImage", operator_image.clone()),
-            ("vcrImage", image_overrides::vcr_image()),
+            ("vcrImage", image_overrides::sim_image()),
             ("imagePullPolicy", image_overrides::demo_image_pull_policy(ingress_mode)),
             ("gatewayImageRepo", gw_repo.clone()),
             ("gatewayImageTag", gw_tag.clone()),
@@ -2231,7 +2231,7 @@ fn load_local_images_if_required(
     }
     let operator = image_overrides::demo_operator_image(ingress_mode);
     let gateway = image_overrides::demo_gateway_image(ingress_mode);
-    let vcr = image_overrides::vcr_image();
+    let vcr = image_overrides::sim_image();
     let probe = "curlimages/curl:8.10.1";
     for image in [&operator, &gateway, &vcr, &probe.to_owned()] {
         require_local_image(image)?;
@@ -2521,7 +2521,7 @@ mod setup_tests {
             let rendered = render_config(&fs::read_to_string(source)?, IngressMode::Global, None)?;
             assert!(rendered.contains(&image_overrides::demo_gateway_image(IngressMode::Global)));
             assert!(rendered.contains(&image_overrides::demo_operator_image(IngressMode::Global)));
-            assert!(rendered.contains(&image_overrides::vcr_image()));
+            assert!(rendered.contains(&image_overrides::sim_image()));
             assert!(rendered.contains(&image_overrides::demo_image_pull_policy(IngressMode::Global)));
             assert!(!rendered.contains("grid-overlay-sync"));
             Ok(())
