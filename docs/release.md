@@ -6,8 +6,11 @@ Grid uses [Semantic Versioning][semver]. The workspace version is defined in
 `workspace.package.version` in the root `Cargo.toml`. Workspace crates inherit
 that version.
 
-Each Helm chart has its own `version`, which must match the Grid release. The
-`appVersion` for Grid-owned workloads also matches the Grid tag. The
+The four charts published by this release (`grid-operator`, `grid-site`,
+`praxis-gateway`, and `grid-mock-providers`) have versions matching the Grid
+release. Other charts, including `grid-enrollment`, are independently
+versioned and are not published by this workflow. The `appVersion` for
+Grid-owned workloads in the release charts also matches the Grid tag. The
 `praxis-gateway` chart is different: its `appVersion` identifies the default
 Praxis AI image and may advance independently of Grid.
 
@@ -51,8 +54,8 @@ silently substitute a Grid-owned AI build.
 Before opening a release preparation pull request:
 
 - [ ] Update the workspace version in `Cargo.toml` and regenerate `Cargo.lock`.
-- [ ] Update every Helm chart `version`.
-- [ ] Update Grid workload chart `appVersion` values to the Grid tag.
+- [ ] Update the four release-chart versions listed above.
+- [ ] Update their Grid workload `appVersion` values to the Grid tag.
 - [ ] Verify the `praxis-gateway` `appVersion` and default image match the
       intended official Praxis AI release.
 - [ ] Confirm the release workflow builds
@@ -66,7 +69,7 @@ Before opening a release preparation pull request:
 - [ ] Run `make test`, `make doc`, and `make lint`.
 - [ ] Run `git diff --check` and validate the release workflow with
       `actionlint`.
-- [ ] Lint and render all Helm charts with their required values.
+- [ ] Lint and render the four release charts with their required values.
 - [ ] Validate affected Forge topologies.
 - [ ] Run the relevant integration qualifications when routing, overlay, or
       gateway compatibility changes.
@@ -82,8 +85,10 @@ clean up their resources.
 
 Run the individual qualification commands below against fresh source builds
 and fresh, uniquely tagged images. There is deliberately no aggregate release
-qualification command. Run the commands sequentially because several use Kind
-clusters and Docker networks whose names can otherwise collide.
+qualification command. Run the commands sequentially in a dedicated checkout:
+several use shared Forge state, Kind cluster names, or Docker network names.
+Until Forge teardown is run-scoped, a concurrent run using the same state
+directory can lose its clusters even when it uses a different config file.
 
 | Area | Command | Topology/config path | Classification | Required when | Feature docs |
 |---|---|---|---|---|---|
@@ -140,7 +145,10 @@ In the current qualification tooling, `GRID_XTASK_GATEWAY_IMAGE` names the
 Praxis AI gateway image used by the fixtures. It does not refer to the
 project-owned `grid-gateway` operand.
 
-The distributed token-quota qualification requires Praxis AI built with:
+The distributed token-quota qualification requires the optional Praxis AI
+`token-rate-limit-filter`. Praxis AI 0.4.0 already includes Basic Auth; a
+custom quota image only needs to enable the token filter. The qualification's
+image label still declares both available filters:
 
 ```text
 token-rate-limit-filter,praxis-filter/basic-auth-filter
@@ -159,9 +167,10 @@ Create a new UTC-stamped evidence directory for every run, normally beneath
 digest is not valid for the current release. Generated evidence must not be
 committed.
 
-Every command must be run with its teardown option and must clean only the
-clusters, processes, port-forwards, pods, and Docker networks it owns. A
-missing prerequisite, unavailable image, missing Forge binary, or failed
+Use `--teardown` where the command accepts it; the quota and single-cluster
+qualifications clean up by default unless `--keep` is set. Verify the actual
+cleanup results and ownership before removing anything manually. A missing
+prerequisite, unavailable image, missing Forge binary, or failed
 readiness/convergence check is **BLOCKED** or **FAIL**, never PASS. Preserve
 non-2xx responses and first failures in the evidence; do not hide them with
 retries or reinterpret them as successful routing.
@@ -179,13 +188,13 @@ notes, run it and report its evidence independently.
 
 | Area | Behavior proved | Images and overrides | Evidence, runtime, and cleanup | Feature docs |
 |---|---|---|---|---|
-| Provider traffic selection and round-robin | Grid publishes stable provider candidates and groups; Praxis AI accepts the overlay and returns trusted attribution while eligible providers receive round-robin traffic. | Official compatible Praxis AI gateway image, plus the locally built Grid operator, overlay-sync, mock-provider, and VCR images. Use the `GRID_XTASK_*_IMAGE` overrides above when validating unreleased Grid code. | Write to the run's UTC-stamped `EVIDENCE_DIR`; the full run is typically several minutes. `--teardown` removes run-owned resources. | [README](../tests/e2e/topologies/grid-provider-traffic/README.md) |
-| Distributed token quota | Basic Auth precedes admission; Alice's sliding-window budget is shared across consumers; routing spans sites; concurrency, expiry, restart persistence, Valkey fail-closed behavior, recovery, and NetworkPolicy are exercised. | Praxis AI must be built with `token-rate-limit-filter,praxis-filter/basic-auth-filter`; use `--image-tag` and the exact feature-enabled local AI image, with local Grid operator/overlay-sync/VCR images as required by the README. | Record structured quota and routing evidence under `EVIDENCE_DIR`; runtime is variable and materially longer than a smoke test. The command cleans up on completion or failure; do not use `--keep` for release evidence. | [README](../tests/e2e/topologies/grid-token-rate-limit/README.md) |
+| Provider traffic selection and round-robin | Grid publishes stable provider candidates and groups; Praxis AI accepts the overlay and returns trusted attribution while eligible providers receive round-robin traffic. | Official compatible Praxis AI gateway image, plus the locally built Grid operator, overlay-sync, mock-provider, and VCR images. Use the `GRID_XTASK_*_IMAGE` overrides above when validating unreleased Grid code. | Write to the run's UTC-stamped `EVIDENCE_DIR`; the full run is typically several minutes. Verify teardown against the run inventory. | [README](../tests/e2e/topologies/grid-provider-traffic/README.md) |
+| Distributed token quota | Basic Auth precedes admission; Alice's sliding-window budget is shared across consumers; routing spans sites; concurrency, expiry, restart persistence, Valkey fail-closed behavior, recovery, and NetworkPolicy are exercised. | Praxis AI 0.4.0 includes Basic Auth; a custom quota image must enable `token-rate-limit-filter` and declare both available filters in its image label. Use `--image-tag` and the exact image required by the README. | Record structured quota and routing evidence under `EVIDENCE_DIR`; runtime is variable and materially longer than a smoke test. The command cleans up by default; do not use `--keep` for release evidence. | [README](../tests/e2e/topologies/grid-token-rate-limit/README.md) |
 | Single-cluster multi-gateway | Two consumer gateways independently accept and serve the same three-provider overlay inside one Kubernetes cluster and one GridSite; attributed round-robin selection, provider withdrawal/restoration, consumer failure/recovery, concurrent traffic, and NetworkPolicy boundaries are exercised. | The fixed `grid-operator:single-cluster-qualification`, `grid-overlay-sync:single-cluster-qualification`, and `praxis-ai:single-cluster-qualification` references are local-development defaults. Release validation should set `GRID_XTASK_OPERATOR_IMAGE`, `GRID_XTASK_OVERLAY_SYNC_IMAGE`, and `GRID_XTASK_GATEWAY_IMAGE` to unique references; set `GRID_XTASK_SIM_IMAGE` as needed. All resolved references are loaded into Kind under `imagePullPolicy: Never`. | The command records timestamped structured evidence and performs automatic cleanup unless `--keep` is explicitly supplied. It does not claim multi-site SWIM, WAN behavior, or a globally shared round-robin cursor. | [README](../tests/e2e/topologies/grid-single-cluster-multi-gateway/README.md) |
-| Combined-site lifecycle | Combined-site bootstrap, trusted round-robin, provider drain and restoration, secondary add/remove/re-add, session fallback, revision convergence, and lifecycle cleanup. | Official compatible Praxis AI image plus local Grid operator, overlay-sync, mock-provider, and VCR images through the overrides above. | Save lifecycle timelines and request attribution under `EVIDENCE_DIR`; a full run is typically on the order of tens of minutes. `--teardown` performs bounded cleanup of owned clusters, pods, processes, and networks. | [README](../tests/e2e/topologies/grid-combined-site/README.md) |
-| GLB | Global load-balancing and network-boundary behavior, including provider attribution and the configured ingress path. | Official compatible Praxis AI image plus the topology's required local Grid/operator/mock-provider/VCR images; use the listed overrides and `Never` pull policy for local images. | Save results under `EVIDENCE_DIR`; use `--quick` for bounded diagnostics or `--full` for qualification. `--teardown` removes only run-owned resources. | [README](../tests/e2e/topologies/grid-glb-demo/README.md) |
-| Workload inference / no ingress | Workload inference through the no-ingress path and its provider/network behavior. This reuses the GLB command with `--no-ingress`; it is not a separate invented CLI command. | Same image set and overrides as GLB, with any optional AI features required by that topology's README. | Save no-ingress evidence under `EVIDENCE_DIR`; use `--quick` for diagnostics or `--full` for qualification. `--teardown` removes only run-owned resources. | [README](../tests/e2e/topologies/grid-workload-inference/README.md) |
-| llm-d pool metrics pressure and recovery | Pool-metrics observation, pressure-aware placement, availability during transitions, and recovery after metrics return below threshold. | Official compatible Praxis AI image plus local Grid operator/overlay-sync and the llm-d/EPP images required by its README; `--metrics-mtls` and `--kv-cache` are optional command flags when the topology enables them. | Save metric, overlay, reload, request, and recovery timelines under `EVIDENCE_DIR`; runtime is variable and may be long. `--teardown` performs bounded owned-resource cleanup. | [README](../tests/e2e/topologies/grid-llmd-pool-metrics/README.md) |
+| Combined-site lifecycle | Combined-site bootstrap, trusted round-robin, provider drain and restoration, secondary add/remove/re-add, session fallback, revision convergence, and lifecycle cleanup. | Official compatible Praxis AI image plus local Grid operator, overlay-sync, mock-provider, and VCR images through the overrides above. | Save lifecycle timelines and request attribution under `EVIDENCE_DIR`; a full run is typically on the order of tens of minutes. Run alone and verify teardown against the run inventory. | [README](../tests/e2e/topologies/grid-combined-site/README.md) |
+| GLB | Global load-balancing and network-boundary behavior, including provider attribution and the configured ingress path. | Official compatible Praxis AI image plus the topology's required local Grid/operator/mock-provider/VCR images; use the listed overrides and `Never` pull policy for local images. | Save results under `EVIDENCE_DIR`; use `--quick` for bounded diagnostics or `--full` for qualification. Run alone and verify teardown against the run inventory. | [README](../tests/e2e/topologies/grid-glb-demo/README.md) |
+| Workload inference / no ingress | Workload inference through the no-ingress path and its provider/network behavior. This reuses the GLB command with `--no-ingress`; it is not a separate invented CLI command. | Same image set and overrides as GLB, with any optional AI features required by that topology's README. | Save no-ingress evidence under `EVIDENCE_DIR`; use `--quick` for diagnostics or `--full` for qualification. Run alone and verify teardown against the run inventory. | [README](../tests/e2e/topologies/grid-workload-inference/README.md) |
+| llm-d pool metrics pressure and recovery | Pool-metrics observation, pressure-aware placement, availability during transitions, and recovery after metrics return below threshold. | Official compatible Praxis AI image plus local Grid operator/overlay-sync and the llm-d/EPP images required by its README; `--metrics-mtls` and `--kv-cache` are optional command flags when the topology enables them. | Save metric, overlay, reload, request, and recovery timelines under `EVIDENCE_DIR`; runtime is variable and may be long. Run alone and verify teardown against the run inventory. | [README](../tests/e2e/topologies/grid-llmd-pool-metrics/README.md) |
 
 ## Tagging A Release
 
@@ -212,7 +221,7 @@ Pushing a valid release tag triggers the **Release** workflow. The workflow:
 3. verifies the pinned official Praxis AI image and provenance;
 4. builds and publishes the version-tagged Grid container images, including
    `grid-gateway`, with SBOM and provenance attestations;
-5. validates, packages, and publishes all Helm charts; and
+5. validates, packages, and publishes the four release charts; and
 6. creates the GitHub Release with generated notes and immutable digests.
 
 The workflow can also be dispatched for an existing immutable release tag. A
