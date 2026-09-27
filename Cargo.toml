@@ -5,7 +5,6 @@ members = [
     "crdt",
     "enrollment",
     "forge",
-    "gateway",
     "mock-providers",
     "operator",
     "overlay-sync",

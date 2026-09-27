@@ -1,21 +1,29 @@
 //! `grid-gateway`: the grid data-plane operand.
 //!
-//! A Praxis gateway assembled in the grid repo. It runs the grid-only live
-//! signals filter (deliberately not shipped in the upstream `praxis-ai-filters`
-//! crate) on top of the generic Praxis routing filters, and is deployed and
-//! configured by the grid operator. Operator is the control plane; this binary
-//! is the operand it manages.
+//! A Praxis gateway assembled in the grid repo, deployed and configured by the
+//! grid operator. Operator is the control plane. This binary is the operand it
+//! manages.
 //!
-//! This is a stub: the artifact, its image, and its build wiring are in place,
-//! but the Praxis assembly is not yet linked. Wiring it needs three
-//! dependencies the grid workspace does not carry today: the `praxis-filter`
-//! `FilterRegistry` from praxis-core, the generic routing filters from
-//! `praxis-ai-filters`, and the grid live-signals filter registered on top.
-//! See `deploy/gateway/Containerfile` and the `gateway-image` make target.
+//! It links the Praxis library, registers the generic routing filters over the
+//! builtin registry, and runs the Praxis server on the operator-supplied config.
+//! The grid live-signals filter registers at the routing milestone. This crate
+//! is its own Cargo workspace so praxis-proxy 0.7.0 resolves independently of the
+//! operator's Kubernetes client stack. See `deploy/gateway/Containerfile` and the
+//! `gateway-image` make target.
 
 fn main() {
-    // TODO(grid-gateway): build a `FilterRegistry::with_builtins()`, register the
-    // generic routing filters via `register_ai_filters`, register the grid
-    // live-signals filter, then run the Praxis server bound to the
-    // operator-generated config. Tracked with the gateway-operand design.
+    // Install the crypto provider before anything builds a TLS config.
+    praxis::install_crypto_provider();
+
+    let mut registry = praxis_filter::FilterRegistry::with_builtins();
+    praxis_ai_filters::register_ai_filters(&mut registry, None);
+
+    // The operator writes the config. The path is the first argument, else the
+    // default search path.
+    let explicit = std::env::args().nth(1);
+    let config_path = praxis::resolve_config_path(explicit.as_deref());
+    let config = praxis::load_config(explicit.as_deref()).unwrap_or_else(|err| praxis::fatal(&err));
+
+    // Runs the Pingora server and never returns.
+    praxis::run_server_with_registry(config, registry, config_path, None);
 }
