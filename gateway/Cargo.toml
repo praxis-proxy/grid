@@ -308,17 +308,11 @@ name = "grid-gateway"
 path = "src/main.rs"
 
 [dependencies]
-# Released crates.io versions; ai-filters pinned to a released tag (no git SHA).
-# This crate is its own workspace so praxis-proxy 0.7.0 (smallvec 1.16) resolves
-# independently of the grid operator's kube 4.2.0 (smallvec <1.16).
 praxis-proxy = "0.7.0"
 praxis-proxy-filter = "0.7.0"
 praxis-ai-filters = { git = "https://github.com/praxis-proxy/ai.git", tag = "v0.4.1" }
 
-# praxis-proxy and praxis-proxy-filter are used under their library names
-# (`praxis`, `praxis_filter`), which differ from the package names, so
-# cargo-machete cannot see the use. praxis-proxy-core is intentionally not a
-# direct dependency; it resolves transitively.
+# machete can't see these: used as `praxis` / `praxis_filter`, not their package names.
 [package.metadata.cargo-machete]
 ignored = ["praxis-proxy", "praxis-proxy-filter"]
 
