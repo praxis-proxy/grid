@@ -13,10 +13,7 @@ use praxis_filter::{FilterAction, FilterError, HttpFilter, HttpFilterContext, Re
 use serde::Deserialize;
 
 use crate::{
-    descriptor::{
-        AdmissionState, CandidateConfig, CapabilityKind, RouteCandidate, validate_candidates, validate_local_site,
-        validate_model_header,
-    },
+    descriptor::{AdmissionState, CapabilityKind, RouteCandidate, validate_model_header},
     snapshot::RouteSnapshot,
 };
 
@@ -25,25 +22,24 @@ fn default_model_header() -> String {
     "X-Model".to_owned()
 }
 
-/// `grid_site_route` configuration as written in the gateway config.
+/// `grid_site_route` configuration as written in the praxis filter section.
+///
+/// Only the model header lives here. The candidate topology and the poller
+/// settings live in the grid serving config the gateway reads, and the snapshot
+/// is injected, so the data plane parses nothing about the control plane.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GridSiteRouteConfig {
     /// Request header naming the model (default `X-Model`).
     #[serde(default = "default_model_header")]
     model_header: String,
-
-    /// This gateway's own site identifier.
-    local_site: String,
-
-    /// The candidate topology: which sites serve which capabilities.
-    candidates: Vec<CandidateConfig>,
 }
 
 /// Routes a request to a cross-site cluster by model, honouring live-load order.
 #[derive(Debug)]
 pub(crate) struct GridSiteRouteFilter {
-    /// The resolved, pre-ordered candidate snapshot, swapped by the control step.
+    /// The resolved, pre-ordered candidate snapshot the control step swaps. Shared
+    /// with the refresh loop, so every request reads the latest ordering.
     snapshot: Arc<ArcSwap<RouteSnapshot>>,
 
     /// Header the request carries the model name in.
@@ -51,23 +47,20 @@ pub(crate) struct GridSiteRouteFilter {
 }
 
 impl GridSiteRouteFilter {
-    /// Build the filter from its config section.
+    /// Build the filter from its config section over an injected snapshot.
+    ///
+    /// The gateway owns `snapshot` and its refresh loop, and the filter only reads it.
     ///
     /// # Errors
     ///
-    /// Returns [`FilterError`] if the config fails to parse or any identifier,
-    /// model header, or candidate entry is invalid.
-    pub(crate) fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
+    /// Returns [`FilterError`] if the config fails to parse or the model header is
+    /// invalid.
+    pub(crate) fn from_config(
+        config: &serde_yaml::Value,
+        snapshot: Arc<ArcSwap<RouteSnapshot>>,
+    ) -> Result<Box<dyn HttpFilter>, FilterError> {
         let cfg: GridSiteRouteConfig = parse_filter_config("grid_site_route", config)?;
-        validate_local_site(&cfg.local_site)?;
         let model_header = validate_model_header(&cfg.model_header)?;
-        let candidates = validate_candidates(cfg.candidates)?;
-        let local_site: Arc<str> = Arc::from(cfg.local_site.as_str());
-        // Config-order snapshot to start. The gateway's refresh step swaps in a
-        // live-load-ordered one once signals arrive.
-        let snapshot = Arc::new(ArcSwap::from_pointee(RouteSnapshot::from_static(
-            candidates, local_site,
-        )));
         Ok(Box::new(Self { snapshot, model_header }))
     }
 }
@@ -141,6 +134,7 @@ fn is_admitted_for_new_request(state: AdmissionState) -> bool {
 )]
 mod tests {
     use super::*;
+    use crate::descriptor::{CandidateConfig, validate_candidates};
 
     /// A validated one-candidate list for `model` at `site`/`cluster`.
     fn one(model: &str, site: &str, cluster: &str, admission: AdmissionState) -> Vec<RouteCandidate> {

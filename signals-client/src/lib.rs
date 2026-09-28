@@ -11,6 +11,6 @@ mod scrape;
 
 pub use mtls::{MtlsError, PeerScraper};
 pub use poller::{
-    FetchError, PinnedTls, PollHandle, PollerConfig, Scrape, SignalSource, build_url, spawn, spawn_from_config,
-    spawn_on_thread,
+    FetchError, PinnedTls, PollHandle, PollerConfig, Scrape, SignalSource, build_url, deserialize_interval_ms, spawn,
+    spawn_from_config, spawn_on_thread,
 };

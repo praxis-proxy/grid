@@ -83,9 +83,9 @@ impl AdmissionState {
 ///     site: site-b
 ///     cluster: grid-site-b
 /// ```
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct CandidateConfig {
+pub struct CandidateConfig {
     /// Cluster name to select when this candidate is chosen.
     pub cluster: String,
 
@@ -117,7 +117,10 @@ fn default_fresh() -> bool {
 /// Created by [`validate_candidates`] from raw config entries. All string
 /// fields are bounded and non-blank. The Grid-owned fields (`admission_state`,
 /// `rank`, `selection_tier`) are populated after validation from live signals.
-#[derive(Debug)]
+///
+/// `Clone` is cheap: every owned field is an `Arc<str>`. The refresh step clones
+/// the base set each poll cycle to re-order it by live load.
+#[derive(Clone, Debug)]
 pub struct RouteCandidate {
     /// Grid-operator admission state.
     pub admission_state: AdmissionState,

@@ -10,6 +10,10 @@ publish = false
 [dependencies]
 praxis-filter = { version = "0.7.0", package = "praxis-proxy-filter" }
 grid-signals = { path = "../../signals" }
+# The gateway wiring spawns the pollers and builds their mTLS scrapers, so the
+# poller and cert issuance are real dependencies, not just test ones.
+grid-signals-client = { path = "../../signals-client" }
+certs = { path = "../../certs", default-features = false, features = ["verifier", "rcgen"] }
 serde = { version = "1", features = ["derive"] }
 # praxis-proxy-filter 0.7 renamed its YAML crate to the yaml_serde fork and
 # aliases it as serde_yaml; match it so filter config types line up.
@@ -18,15 +22,11 @@ arc-swap = "1"
 async-trait = "0.1"
 tracing = "0.1"
 http = "1"
+rustls = { version = "0.23", features = ["ring"] }
 
 [dev-dependencies]
-# The flow tests drive the real scrape -> store -> route path, so they pull the
-# poller (grid-signals-client) and cert issuance (certs) across the workspace,
-# the same way the crate already path-deps grid-signals.
-grid-signals-client = { path = "../../signals-client" }
-certs = { path = "../../certs", default-features = false, features = ["verifier", "rcgen"] }
+# The flow tests bind a mock TLS peer to drive the real scrape path.
 tokio = { version = "1", features = ["macros", "net", "rt", "rt-multi-thread", "io-util", "time"] }
-rustls = { version = "0.23", features = ["ring"] }
 tokio-rustls = "0.26"
 
 [lints]

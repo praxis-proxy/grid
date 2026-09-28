@@ -120,8 +120,14 @@ where
 ///
 /// The loop passes `interval_ms` to `tokio::time::interval`, which panics on a
 /// zero duration, so a config of `interval_ms: 0` would abort the poller thread
-/// on its first tick. Rejecting it here turns that into a config error.
-fn deserialize_interval_ms<'de, D>(deserializer: D) -> Result<u64, D::Error>
+/// on its first tick. Rejecting it here turns that into a config error. Exported
+/// so any config carrying a poll interval, including the grid serving config,
+/// guards it the same way.
+///
+/// # Errors
+///
+/// Returns the deserializer's error if the value is not a `u64` or is zero.
+pub fn deserialize_interval_ms<'de, D>(deserializer: D) -> Result<u64, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -222,7 +228,7 @@ where
     S: SignalSource + Send + Sync + 'static,
 {
     let (stop, rx) = watch::channel(false);
-    tokio::spawn(poll_loop(store, source, interval, rx));
+    tokio::spawn(poll_loop(store, source, interval, rx, |_store: &LoadStore| {}));
     PollHandle { stop }
 }
 
@@ -257,9 +263,15 @@ where
 /// # Errors
 ///
 /// Returns the OS error if the poller thread cannot be spawned.
-pub fn spawn_on_thread<S>(store: Arc<LoadStore>, config: &PollerConfig, source: S) -> std::io::Result<PollHandle>
+pub fn spawn_on_thread<S, F>(
+    store: Arc<LoadStore>,
+    config: &PollerConfig,
+    source: S,
+    on_cycle: F,
+) -> std::io::Result<PollHandle>
 where
     S: SignalSource + Send + Sync + 'static,
+    F: Fn(&LoadStore) + Send + 'static,
 {
     let (stop, rx) = watch::channel(false);
     let interval = Duration::from_millis(config.interval_ms);
@@ -279,18 +291,28 @@ where
                     return;
                 },
             };
-            runtime.block_on(poll_loop(store, source, interval, rx));
+            runtime.block_on(poll_loop(store, source, interval, rx, on_cycle));
         })?;
     Ok(PollHandle { stop })
 }
 
-/// Poll until stopped, feeding every response into `store`.
-async fn poll_loop<S: SignalSource + Send + Sync>(
+/// Poll until stopped, feeding every response into `store` and running
+/// `on_cycle` after each poll.
+///
+/// `on_cycle` runs on the poll cycle, right after the store is updated, so a
+/// caller can rebuild derived state (the routing snapshot) on one clock with no
+/// drift between "store updated" and "state rebuilt". It stays generic over the
+/// store: the poller never names the caller's derived type.
+async fn poll_loop<S, F>(
     store: Arc<LoadStore>,
     source: S,
     interval: Duration,
     mut stop: watch::Receiver<bool>,
-) {
+    on_cycle: F,
+) where
+    S: SignalSource + Send + Sync,
+    F: Fn(&LoadStore) + Send,
+{
     let mut ticker = tokio::time::interval(interval);
     // A slow poll delays the next tick instead of firing a burst to catch up.
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -304,7 +326,10 @@ async fn poll_loop<S: SignalSource + Send + Sync>(
                     return;
                 }
             },
-            _ = ticker.tick() => poll_once(&source, &store).await,
+            _ = ticker.tick() => {
+                poll_once(&source, &store).await;
+                on_cycle(&store);
+            },
         }
     }
 }
@@ -497,7 +522,7 @@ mod tests {
         };
         let cfg: PollerConfig =
             serde_yaml::from_str("endpoint: https://operator:9091/v1/site/signals\ninterval_ms: 5\n").expect("cfg");
-        let handle = spawn_on_thread(Arc::clone(&store), &cfg, source).expect("poller thread spawns");
+        let handle = spawn_on_thread(Arc::clone(&store), &cfg, source, |_store| {}).expect("poller thread spawns");
         // Poll until the sample lands, bounded by a deadline and yielding to the
         // poller thread rather than sleeping a fixed span.
         let key = LoadStore::key("east", "pool-a");
