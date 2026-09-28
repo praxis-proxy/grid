@@ -1,0 +1,23 @@
+[package]
+name = "ai-grid-filters"
+description = "Grid data-plane routing filters (grid_site_route) for the Praxis gateway"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+praxis-filter = { version = "0.7.0", package = "praxis-proxy-filter" }
+grid-signals = { path = "../../signals" }
+serde = { version = "1", features = ["derive"] }
+# praxis-proxy-filter 0.7 renamed its YAML crate to the yaml_serde fork and
+# aliases it as serde_yaml; match it so filter config types line up.
+serde_yaml = { version = "0.10", package = "yaml_serde" }
+arc-swap = "1"
+async-trait = "0.1"
+tracing = "0.1"
+http = "1"
+
+[lints]
+workspace = true
