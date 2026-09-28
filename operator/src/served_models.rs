@@ -78,11 +78,29 @@ impl Default for DiscoveryConfig {
 /// A provider's served-model set and when it stops being held.
 #[derive(Debug)]
 struct ServedModel {
-    /// Sorted model names.
+    /// Validated model names.
     models: Arc<[String]>,
 
     /// Deadline after which the set is no longer served.
     expires_at: Instant,
+}
+
+/// The result of polling one named provider.
+struct ProviderPoll {
+    /// `InferenceProvider` name.
+    name: String,
+
+    /// Models reported, or a failed poll.
+    outcome: PollOutcome,
+}
+
+/// What one provider poll reported.
+enum PollOutcome {
+    /// The validated served-model set, including an empty set.
+    Served(ServedModels),
+
+    /// Polling failed; the last good set may remain held.
+    Failed,
 }
 
 /// Served-model sets keyed by `InferenceProvider` name.
@@ -101,7 +119,7 @@ impl ServedModelStore {
         Self::default()
     }
 
-    /// Sorted models `provider` serves, or `None` when unknown or expired.
+    /// Models `provider` serves, or `None` when unknown or expired.
     #[must_use]
     pub fn models(&self, provider: &str) -> Option<Arc<[String]>> {
         let now = Instant::now();
@@ -114,46 +132,45 @@ impl ServedModelStore {
 
     /// Apply one round of poll results.
     ///
-    /// `polled` holds every provider polled this round: `Some` replaces its
-    /// set, `None` (failed poll) keeps it until it expires. Providers absent
-    /// from `polled` are no longer configured and are dropped.
+    /// `updated` holds every provider polled this round: a served set replaces
+    /// the old one, while a failed poll keeps it until expiry. Providers absent
+    /// from `updated` are no longer configured and are dropped.
     ///
-    /// Transitions (changed, expired, dropped) are logged at `debug`, so e2e
+    /// Refreshes, expirations, and drops are logged at `debug`, so e2e
     /// tests can observe them without a status field.
-    fn refresh(&self, polled: BTreeMap<String, Option<ServedModels>>, now: Instant, ttl: Duration) {
-        let Ok(mut guard) = self.inner.write() else {
+    fn refresh(&self, updated: Vec<ProviderPoll>, now: Instant, ttl: Duration) {
+        let Ok(mut map) = self.inner.write() else {
             return;
         };
 
-        guard.retain(|provider, served| {
-            if !polled.contains_key(provider) {
+        // Remove dropped from map.
+        map.retain(|provider: &String, served| {
+            let dropped_from_round = updated.iter().all(|u| u.name.as_str() != provider);
+            if dropped_from_round {
                 tracing::debug!(provider, "served models dropped");
-                return false;
-            }
-
-            if served.expires_at <= now {
+                false
+            } else if served.expires_at <= now {
                 tracing::debug!(provider, "served models expired");
-                return false;
+                false
+            } else {
+                true
             }
-
-            true
         });
 
-        for (provider, models) in polled {
-            let Some(models) = models else {
-                continue;
-            };
+        for provider in updated {
+            if let PollOutcome::Served(models) = provider.outcome {
+                let name = provider.name;
+                let models: Arc<[String]> = models.into_names().into();
+                tracing::debug!(name, ?models, "served models refreshed");
 
-            let models: Arc<[String]> = models.into_names().into();
-            if guard.get(&provider).is_none_or(|served| served.models != models) {
-                tracing::debug!(provider, ?models, "served models changed");
+                map.insert(
+                    name,
+                    ServedModel {
+                        models,
+                        expires_at: now + ttl,
+                    },
+                );
             }
-
-            let served = ServedModel {
-                models,
-                expires_at: now + ttl,
-            };
-            guard.insert(provider, served);
         }
     }
 }
@@ -176,18 +193,15 @@ pub(crate) async fn discover(
     let api: Api<InferenceProvider> = Api::all(client.clone());
     let providers = api.list(&ListParams::default()).await?.items;
 
-    let discoverable = providers.iter().filter_map(|p| {
-        let name = p.metadata.name.as_ref()?;
-        let source = p.spec.model_discovery.as_ref()?;
-        Some((name, p, source))
+    let discoverable = providers.iter().filter_map(|provider| {
+        let source = provider.spec.model_discovery.as_ref()?;
+        Some((provider, source))
     });
     let polled = stream::iter(discoverable)
-        .map(|(name, provider, source)| async move {
-            let models = poll(name, provider, source, client, config.timeout).await;
-            (name.to_owned(), models)
-        })
+        .map(|(provider, source)| async move { poll(provider, source, client, config.timeout).await })
         .buffer_unordered(config.concurrency.max(1))
-        .collect()
+        .filter_map(|polled| async move { polled })
+        .collect::<Vec<_>>()
         .await;
 
     store.refresh(polled, Instant::now(), config.ttl);
@@ -233,29 +247,31 @@ impl PollError {
 
 /// Query one provider's discovery source and record the outcome.
 ///
-/// `None` when the poll failed; the error is logged and counted.
+/// `None` when the provider has no name. Poll failures are logged and counted.
 async fn poll(
-    name: &str,
     provider: &InferenceProvider,
     config: &ModelDiscoveryConfig,
     client: &Client,
     timeout: Duration,
-) -> Option<ServedModels> {
+) -> Option<ProviderPoll> {
+    let name = provider.metadata.name.as_deref()?.to_owned();
     let result = match config {
         ModelDiscoveryConfig::OpenAiModels(openai) => query_openai(provider, openai, client, timeout).await,
     };
 
-    match result {
+    let outcome = match result {
         Ok(models) => {
-            metrics::record_model_discovery_success(name);
-            Some(models)
+            metrics::record_model_discovery_success(&name);
+            PollOutcome::Served(models)
         },
         Err(error) => {
-            metrics::record_model_discovery_failure(name, error.as_reason());
-            tracing::warn!(provider = name, %error, "model discovery failed");
-            None
+            metrics::record_model_discovery_failure(&name, error.as_reason());
+            tracing::warn!(provider = %name, %error, "model discovery failed");
+            PollOutcome::Failed
         },
-    }
+    };
+
+    Some(ProviderPoll { name, outcome })
 }
 
 /// Build an [`OpenAiModels`] source and list its models.
@@ -413,15 +429,21 @@ mod tests {
     // Test Utilities
     // -----------------------------------------------------------------------
 
-    fn round(entries: &[(&str, Option<&[&str]>)]) -> BTreeMap<String, Option<ServedModels>> {
+    fn round(entries: &[(&str, Option<&[&str]>)]) -> Vec<ProviderPoll> {
         entries
             .iter()
             .map(|&(provider, models)| {
-                let models = models.map(|m| {
-                    ServedModels::try_from_names(m.iter().map(|&n| n.to_owned()))
-                        .unwrap_or_else(|_| std::process::abort())
-                });
-                (provider.to_owned(), models)
+                let outcome = match models {
+                    Some(names) => PollOutcome::Served(
+                        ServedModels::try_from_names(names.iter().map(|&name| name.to_owned()))
+                            .unwrap_or_else(|_| std::process::abort()),
+                    ),
+                    None => PollOutcome::Failed,
+                };
+                ProviderPoll {
+                    name: provider.to_owned(),
+                    outcome,
+                }
             })
             .collect()
     }
@@ -431,6 +453,10 @@ mod tests {
     }
 
     fn names(store: &ServedModelStore, provider: &str) -> Option<Vec<String>> {
-        store.models(provider).map(|m| m.to_vec())
+        store.models(provider).map(|models| {
+            let mut names = models.to_vec();
+            names.sort_unstable();
+            names
+        })
     }
 }

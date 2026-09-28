@@ -1,7 +1,5 @@
 //! Validated served-model names and sets.
 
-use std::collections::BTreeSet;
-
 // ---------------------------------------------------------------------------
 // Limits
 // ---------------------------------------------------------------------------
@@ -54,7 +52,7 @@ pub(crate) enum ServedModelsError {
 // ---------------------------------------------------------------------------
 
 /// A served-model name that passed validation.
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ModelName(String);
 
 impl TryFrom<String> for ModelName {
@@ -81,14 +79,16 @@ impl TryFrom<String> for ModelName {
 // ServedModels
 // ---------------------------------------------------------------------------
 
-/// The set of models a provider serves: bounded, unique, sorted.
+/// The set of models a provider serves: bounded and unique.
 ///
 /// ```ignore
 /// let models = ServedModels::try_from_names(["b".to_owned(), "a".to_owned()])?;
-/// assert_eq!(models.into_names(), ["a", "b"]);
+/// let mut names = models.into_names();
+/// names.sort_unstable();
+/// assert_eq!(names, ["a", "b"]);
 /// ```
 #[derive(Debug, Default, Eq, PartialEq)]
-pub(crate) struct ServedModels(BTreeSet<ModelName>);
+pub(crate) struct ServedModels(Vec<ModelName>);
 
 impl ServedModels {
     /// Validate `names` as a whole; one bad name rejects the whole list.
@@ -101,23 +101,24 @@ impl ServedModels {
     where
         I: IntoIterator<Item = String>,
     {
-        let mut set = BTreeSet::new();
+        let mut validated = Vec::new();
 
         for name in names {
-            if set.len() == MAX_SERVED_MODELS {
+            if validated.len() == MAX_SERVED_MODELS {
                 return Err(ServedModelsError::TooMany);
             }
 
             let name = ModelName::try_from(name)?;
-            if let Some(dup) = set.replace(name) {
-                return Err(ServedModelsError::Duplicate(dup.0));
+            if validated.contains(&name) {
+                return Err(ServedModelsError::Duplicate(name.0));
             }
+            validated.push(name);
         }
 
-        Ok(Self(set))
+        Ok(Self(validated))
     }
 
-    /// Sorted model names.
+    /// Validated model names.
     pub(crate) fn into_names(self) -> Vec<String> {
         self.0.into_iter().map(|name| name.0).collect()
     }
@@ -132,13 +133,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn names_are_sorted() {
-        let models = ServedModels::try_from_names(names(&["b", "a", "c"]));
+    fn names_are_returned() {
+        let models = ServedModels::try_from_names(names(&["b", "a", "c"])).map(|models| {
+            let mut names = models.into_names();
+            names.sort_unstable();
+            names
+        });
 
         assert_eq!(
-            models.map(ServedModels::into_names),
+            models,
             Ok(names(&["a", "b", "c"])),
-            "names should be sorted"
+            "all validated names should be returned"
         );
     }
 

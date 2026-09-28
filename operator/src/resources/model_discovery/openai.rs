@@ -190,12 +190,16 @@ mod tests {
     async fn lists_served_models() {
         let url = serve(|| async { r#"{"object":"list","data":[{"id":"b","object":"model"},{"id":"a"}]}"# }).await;
 
-        let models = source(&url, None).served_models().await.map(ServedModels::into_names);
+        let models = source(&url, None).served_models().await.map(|models| {
+            let mut names = models.into_names();
+            names.sort_unstable();
+            names
+        });
 
         assert_eq!(
             models.ok(),
             Some(vec!["a".to_owned(), "b".to_owned()]),
-            "should list sorted ids"
+            "should list all ids"
         );
     }
 
