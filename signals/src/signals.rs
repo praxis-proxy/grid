@@ -58,7 +58,7 @@ const MAX_CLOCK_SKEW_MS: i64 = 5_000;
 const MAX_RELAY_AGE_MS: i64 = 24 * 60 * 60 * 1000;
 
 /// A no-skew reference-and-local clock for tests: it sits above the small stamps
-/// the tests use and well within [`MAX_RELAY_AGE_MS`] of them, so [`rebase_age`]
+/// the tests use and well within [`MAX_RELAY_AGE_MS`] of them, so `rebase_age`
 /// restamps each sample onto its own value (an identity).
 #[cfg(test)]
 const NO_SKEW_NOW_MS: i64 = 1_000_000;
@@ -219,7 +219,7 @@ impl LoadStore {
 
     /// Absorb an exposition response with no clock skew, attributing to the
     /// body's own first site. Test-only: reference and local now coincide above
-    /// the small stamps these tests use, so [`rebase_age`] is an identity and a
+    /// the small stamps these tests use, so `rebase_age` is an identity and a
     /// sample reads back at the stamp it carried. The poll path uses
     /// [`Self::ingest_at`] with the peer's `Date`, the local clock, and the
     /// crypto-verified owner, so no production path bypasses the anchor or the
@@ -235,7 +235,7 @@ impl LoadStore {
     /// `reference_ms` is the peer's own clock (its `Date` header) and
     /// `local_now_ms` is this gateway's clock. A sample stamped implausibly far
     /// past the peer's `Date` is dropped, then each surviving sample's age is
-    /// re-expressed on the local clock ([`rebase_age`]) so [`Self::window_worst`]
+    /// re-expressed on the local clock (`rebase_age`) so [`Self::window_worst`]
     /// compares every sample against one clock.
     ///
     /// `owner` is the peer's crypto-verified site (from mTLS): attribution keys on

@@ -114,7 +114,7 @@ fn default_fresh() -> bool {
 
 /// A validated route candidate ready for runtime matching.
 ///
-/// Created by [`validate_candidates`] from raw config entries. All string
+/// Created by `validate_candidates` from raw config entries. All string
 /// fields are bounded and non-blank. The Grid-owned fields (`admission_state`,
 /// `rank`, `selection_tier`) are populated after validation from live signals.
 ///
