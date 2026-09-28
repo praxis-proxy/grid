@@ -22,8 +22,8 @@ pub use enroll::{
 };
 pub use generate::{
     CaCert, DEFAULT_ORGANIZATION, GenerateError, SPIFFE_TRUST_DOMAIN, SiteCertOutput, generate_ca,
-    generate_cert_with_org, generate_dns_cert, generate_expired_dns_cert, generate_not_yet_valid_dns_cert,
-    generate_site_cert, generate_site_cert_with_names, load_ca, spiffe_id,
+    generate_cert_with_org, generate_dns_cert, generate_dns_only_cert, generate_expired_dns_cert,
+    generate_not_yet_valid_dns_cert, generate_site_cert, generate_site_cert_with_names, load_ca, spiffe_id,
 };
 pub use provider::{CertificateProvider, ProviderError, SiteCertificate, StaticFileProvider, TrustBundle};
 pub use verify::{MAX_CERT_PEM_BYTES, VerifyError, canonical_fingerprint, csr_public_key, verify_site_cert};

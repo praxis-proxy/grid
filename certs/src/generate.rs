@@ -158,8 +158,40 @@ pub fn generate_site_cert_with_names(
     site_name: &str,
     extra: &[String],
 ) -> Result<SiteCertOutput, GenerateError> {
-    let primary = format!("{site_name}.grid.internal");
-    let mut id = site_identity(site_name, &primary);
+    issue_leaf_cert(ca, site_name, extra, true)
+}
+
+/// Generate a leaf carrying only DNS SANs and no SPIFFE identity.
+///
+/// For infrastructure endpoints (a database, a serving listener) that are not
+/// peer-mesh members. Omitting the SPIFFE SAN keeps them out of the grid site
+/// identity space, so the peer verifier never accepts an infra cert as a site.
+///
+/// # Errors
+///
+/// Returns [`GenerateError`] if any name is invalid or signing fails.
+pub fn generate_dns_only_cert(
+    ca: &CaCert,
+    common_name: &str,
+    dns_names: &[String],
+) -> Result<SiteCertOutput, GenerateError> {
+    issue_leaf_cert(ca, common_name, dns_names, false)
+}
+
+/// Issue a leaf for `common_name` with `extra` DNS SANs, carrying its SPIFFE site
+/// identity only when `spiffe` is set. The primary `<name>.grid.internal` DNS SAN
+/// is always present.
+fn issue_leaf_cert(
+    ca: &CaCert,
+    common_name: &str,
+    extra: &[String],
+    spiffe: bool,
+) -> Result<SiteCertOutput, GenerateError> {
+    let primary = format!("{common_name}.grid.internal");
+    let mut id = site_identity(common_name, &primary);
+    if !spiffe {
+        id.uri_sans.clear();
+    }
     id.dns_sans.extend_from_slice(extra);
 
     let (not_before, not_after) = default_leaf_validity();
@@ -633,7 +665,7 @@ mod tests {
 
 #[cfg(test)]
 mod spiffe_id_tests {
-    use super::{generate_ca, generate_site_cert_with_names, spiffe_id};
+    use super::{generate_ca, generate_dns_only_cert, generate_site_cert_with_names, spiffe_id};
 
     /// A URI SAN is an `IA5String`, so the name appears verbatim in the DER the
     /// CA signed. Checking the bytes avoids a parser dependency and still
@@ -662,5 +694,27 @@ mod spiffe_id_tests {
     fn two_sites_are_told_apart_by_it() {
         assert_ne!(spiffe_id("pool-a"), spiffe_id("pool-b"));
         assert!(spiffe_id("pool-a").starts_with("spiffe://"));
+    }
+
+    /// An infra cert keeps its DNS SAN for hostname verification but carries no
+    /// SPIFFE name, so the peer verifier never accepts it as a grid site.
+    #[test]
+    fn a_dns_only_certificate_carries_no_spiffe_name() {
+        let ca = generate_ca("test-ca").unwrap_or_else(|_| std::process::abort());
+        let cert = generate_dns_only_cert(&ca, "grid-enrollment-db", &["grid-enrollment-db.ns.svc".to_owned()])
+            .unwrap_or_else(|_| std::process::abort());
+        let der = pem::parse(&cert.cert_pem).unwrap_or_else(|_| std::process::abort());
+        let bytes = der.contents();
+
+        let id = spiffe_id("grid-enrollment-db");
+        assert!(
+            !bytes.windows(id.len()).any(|window| window == id.as_bytes()),
+            "an infra cert must not carry a grid-site SPIFFE identity"
+        );
+        let dns = b"grid-enrollment-db.ns.svc";
+        assert!(
+            bytes.windows(dns.len()).any(|window| window == dns),
+            "the DNS SAN the caller asked for has to be present for hostname verification"
+        );
     }
 }
