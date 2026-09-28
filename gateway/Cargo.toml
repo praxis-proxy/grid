@@ -311,6 +311,7 @@ path = "src/main.rs"
 praxis-proxy = "0.7.0"
 praxis-proxy-filter = "0.7.0"
 praxis-ai-filters = { git = "https://github.com/praxis-proxy/ai.git", tag = "v0.4.1" }
+ai-grid-filters = { path = "ai-grid-filters" }
 
 # machete can't see these: used as `praxis` / `praxis_filter`, not their package names.
 [package.metadata.cargo-machete]

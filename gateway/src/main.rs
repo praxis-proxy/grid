@@ -17,6 +17,7 @@ fn main() {
 
     let mut registry = praxis_filter::FilterRegistry::with_builtins();
     praxis_ai_filters::register_ai_filters(&mut registry, None);
+    ai_grid_filters::register_grid_filters(&mut registry);
 
     // The operator writes the config. The path is the first argument, else the
     // default search path.
