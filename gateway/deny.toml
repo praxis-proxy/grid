@@ -1,0 +1,45 @@
+# cargo-deny policy for the gateway workspace. Mirrors the root deny.toml
+# (licenses, bans, registry sources) with two gateway-specific deltas: the
+# gateway depends on praxis-ai via git, and its rustls stack pulls an
+# unmaintained transitive crate the root graph does not.
+
+[advisories]
+unmaintained = "all"
+maximum-db-staleness = "P30D"
+ignore = [
+    # rustls-pemfile is unmaintained (RUSTSEC-2025-0134); it is a transitive
+    # dependency of the gateway's rustls/Pingora TLS stack with no upstream
+    # replacement wired yet.
+    { id = "RUSTSEC-2025-0134", reason = "transitive via rustls; no upstream fix available" },
+]
+
+[licenses]
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Unlicense",
+    "Zlib",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+highlight = "all"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# The gateway consumes praxis-ai (apis + filters) as a pinned git dependency;
+# this is the workspace split that took the gateway out of the root graph.
+allow-git = ["https://github.com/praxis-proxy/ai.git"]
