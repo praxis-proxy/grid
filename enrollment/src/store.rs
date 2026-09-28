@@ -156,6 +156,15 @@ impl Store {
         }
     }
 
+    /// Whether the backend is reachable, for the readiness probe. The in-memory
+    /// store is always ready, and the Postgres store pings its pool.
+    pub async fn ready(&self) -> bool {
+        match self {
+            Self::Memory(_) => true,
+            Self::Postgres(store) => store.ready().await,
+        }
+    }
+
     /// Redeem a token by digest and issue the certificate, as one step.
     ///
     /// The token is consumed and the certificate signed and recorded in a single

@@ -7,6 +7,12 @@ use enrollment::{AppState, GridAdmins, Store, authz::Authorizer, router};
 use sqlx::postgres::{PgConnectOptions, PgSslMode};
 use tokio::signal;
 
+/// The `enrollment bootstrap` subcommand: mint or load the Grid CA and write it
+/// as Secrets for a pre-install Job. Off by default so the serving binary carries
+/// no CLI or Kubernetes client.
+#[cfg(feature = "bootstrap")]
+mod bootstrap;
+
 /// Server TLS config: rustls by default, system openssl under `fips`.
 #[cfg(not(feature = "fips"))]
 type TlsConfig = axum_server::tls_rustls::RustlsConfig;
@@ -51,6 +57,15 @@ const DB_CONNECTION_URL: &str = "DB_CONNECTION_URL";
 )]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
+
+    // `enrollment bootstrap` runs the one-shot CA/serving-Secret init and exits.
+    // No server is started.
+    #[cfg(feature = "bootstrap")]
+    if std::env::args_os().nth(1).is_some_and(|arg| arg == "bootstrap") {
+        return Box::pin(bootstrap::run())
+            .await
+            .map_err(|err| -> Box<dyn std::error::Error> { err });
+    }
 
     let ca_cert_path = std::env::var(CA_CERT_PATH)?;
     let ca_key_path = std::env::var(CA_KEY_PATH)?;

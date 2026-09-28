@@ -160,6 +160,11 @@ impl PgStore {
         tx.commit().await.map_err(backend)?;
         Ok((enrollment_id, issued))
     }
+
+    /// Ping the pool, for the readiness probe.
+    pub(super) async fn ready(&self) -> bool {
+        sqlx::query("SELECT 1").execute(&self.pool).await.is_ok()
+    }
 }
 
 /// Whether an error is the unique index refusing a duplicate.

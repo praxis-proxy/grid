@@ -885,6 +885,7 @@ dependencies = [
  "axum",
  "axum-server",
  "certs",
+ "clap",
  "http-body-util",
  "k8s-openapi",
  "kube",
@@ -902,6 +903,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "x509-parser",
 ]
 
 [[package]]

@@ -13,7 +13,7 @@ use axum::{
     http::{HeaderMap, Method, StatusCode, request::Parts},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{delete as delete_route, post},
+    routing::{delete as delete_route, get, post},
 };
 use certs::{CaCert, EnrollError, MAX_CSR_PEM_BYTES, Validity, sign_csr, validate_site_name, verify_csr};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -247,9 +247,26 @@ fn signing_error(err: EnrollError) -> ApiError {
     }
 }
 
+/// Liveness: the process is up and serving. Always 200.
+async fn healthz() -> StatusCode {
+    StatusCode::OK
+}
+
+/// Readiness: the store backend is reachable, else 503 so the pod is pulled from
+/// endpoints until the database is up.
+async fn readyz(State(state): State<Arc<AppState>>) -> StatusCode {
+    if state.store.ready().await {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    }
+}
+
 /// The routes, with a body limit sized for a certificate request.
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
+        .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
         .route("/v1alpha1/enrollmenttokens", post(mint_site_token))
         .route("/v1alpha1/enrollmenttokens/{token_id}", delete_route(revoke_site_token))
         .route("/v1alpha1/enrollments", post(enroll))

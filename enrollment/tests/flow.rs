@@ -328,6 +328,37 @@ async fn a_malformed_csr_is_refused_on_enroll() {
     let (status, body) = enroll(&app, &token, "not a csr").await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "a malformed request is refused");
     assert_eq!(body["error"], "invalid_csr");
+
+    // The CSR is verified before the token is touched, so a bad one cannot spend it.
+    let (retry, _) = enroll(&app, &token, &plain_csr()).await;
+    assert_eq!(retry, StatusCode::CREATED, "a malformed CSR does not spend the token");
+}
+
+/// An issued site certificate must not be a CA, or a compromised site could mint
+/// sub-certificates for names it was never granted.
+#[tokio::test]
+async fn an_issued_site_cert_is_not_a_ca() {
+    let app = service();
+    let (token, _id) = mint(&app, "site-leaf").await;
+
+    let (_status, issued) = enroll(&app, &token, &plain_csr()).await;
+    let pem = issued["certificate"].as_str().expect("certificate");
+    let (_rest, block) = x509_parser::pem::parse_x509_pem(pem.as_bytes()).expect("pem");
+    let cert = block.parse_x509().expect("x509");
+    let is_ca = cert.basic_constraints().ok().flatten().is_some_and(|ext| ext.value.ca);
+    assert!(!is_ca, "an issued site cert must not be a CA");
+}
+
+/// Liveness and readiness both report OK against the in-memory store.
+#[tokio::test]
+async fn health_and_readiness_report_ok() {
+    let app = service();
+
+    let (health, _) = call(&app, "GET", "/healthz", None).await;
+    assert_eq!(health, StatusCode::OK, "liveness is up");
+
+    let (ready, _) = call(&app, "GET", "/readyz", None).await;
+    assert_eq!(ready, StatusCode::OK, "the in-memory store is always ready");
 }
 
 #[tokio::test]

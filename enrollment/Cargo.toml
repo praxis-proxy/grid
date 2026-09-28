@@ -18,6 +18,9 @@ tls-rustls = [
     "dep:ring",
     "axum-server/tls-rustls-no-provider",
     "sqlx/tls-rustls-ring",
+    # kube's client needs a TLS backend to reach the API server; rustls off ring
+    # on the non-fips path. Only bites when kube is enabled (sar or bootstrap).
+    "kube?/rustls-tls",
 ]
 # sqlx still links sha2/md-5 for Postgres password auth, unused under the client-cert auth fips uses.
 fips = [
@@ -25,15 +28,22 @@ fips = [
     "dep:openssl",
     "axum-server/tls-openssl",
     "sqlx/tls-native-tls",
+    # kube's TLS backend must be openssl under fips, not rustls/ring.
+    "kube?/openssl-tls",
 ]
 # Reuse Kubernetes RBAC for operator authorization (TokenReview + SubjectAccessReview).
 # Off by default so the standalone, cluster-free deployment pulls in no Kubernetes
 # client. Enable in-cluster with `--features sar`.
 sar = ["dep:kube", "dep:k8s-openapi"]
+# The `enrollment bootstrap` subcommand: mint the Grid CA + serving Secrets + the
+# gossip key. Off by default so the serving binary carries no CLI or Kubernetes
+# client.
+bootstrap = ["dep:clap", "dep:kube", "dep:k8s-openapi"]
 
 [dependencies]
 axum = { workspace = true }
 certs = { path = "../certs", default-features = false }
+clap = { workspace = true, optional = true }
 kube = { workspace = true, optional = true }
 k8s-openapi = { workspace = true, optional = true }
 serde = { workspace = true }
@@ -59,3 +69,4 @@ http-body-util = { workspace = true }
 rcgen = { workspace = true }
 time = { workspace = true }
 tower = { workspace = true }
+x509-parser = { workspace = true }
