@@ -1,0 +1,72 @@
+{{- if not (eq (include "grid-enrollment.caProvided" .) "true") }}
+{{/*
+RBAC for the CA bootstrap Job: it reads and writes the CA, bundle, serving, and
+(for the builtin DB) the DB serving Secrets in this namespace only. get+create
+cover generate-if-absent; update covers ca.forceRegenerate (replace-in-place, no
+absent window).
+*/}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "grid-enrollment.bootstrapServiceAccountName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "grid-enrollment.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "-10"
+    helm.sh/hook-delete-policy: before-hook-creation
+{{- with .Values.imagePullSecrets }}
+imagePullSecrets:
+  {{- toYaml . | nindent 2 }}
+{{- end }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "grid-enrollment.bootstrapServiceAccountName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "grid-enrollment.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "-10"
+    helm.sh/hook-delete-policy: before-hook-creation
+rules:
+  # create cannot be resourceName-scoped (the object does not exist yet).
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create"]
+  # get/update restricted to exactly the three Secrets the bootstrap manages,
+  # so this SA cannot read any other Secret in the namespace.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames:
+      - {{ .Values.ca.keySecretName | quote }}
+      - {{ .Values.ca.bundleSecretName | quote }}
+      - {{ .Values.serving.secretName | quote }}
+      {{- if eq .Values.db.type "builtin" }}
+      - {{ .Values.db.builtin.tls.servingSecretName | quote }}
+      {{- end }}
+    verbs: ["get", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "grid-enrollment.bootstrapServiceAccountName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "grid-enrollment.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "-10"
+    helm.sh/hook-delete-policy: before-hook-creation
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "grid-enrollment.bootstrapServiceAccountName" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "grid-enrollment.bootstrapServiceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

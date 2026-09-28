@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "properties": {
+    "image": {
+      "type": "object",
+      "properties": {
+        "repository": { "type": "string" },
+        "tag": { "type": "string" },
+        "pullPolicy": { "type": "string" }
+      }
+    },
+    "ca": {
+      "type": "object",
+      "properties": {
+        "method": { "type": "string", "enum": ["builtin", "provided"] },
+        "commonName": { "type": "string" },
+        "keySecretName": { "type": "string" },
+        "bundleSecretName": { "type": "string" },
+        "forceRegenerate": { "type": "boolean" },
+        "provided": {
+          "type": "object",
+          "properties": { "keySecretRef": { "type": "string" } }
+        }
+      },
+      "required": ["method", "commonName", "keySecretName", "bundleSecretName"]
+    },
+    "serving": {
+      "type": "object",
+      "properties": {
+        "secretName": { "type": "string" },
+        "existingSecretRef": { "type": "string" },
+        "extraDnsNames": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "enrollment": {
+      "type": "object",
+      "properties": {
+        "authz": { "type": "string", "enum": ["local", "kube"] },
+        "listenAddr": { "type": "string" }
+      }
+    },
+    "db": {
+      "type": "object",
+      "properties": {
+        "type": { "type": "string", "enum": ["builtin", "external"] },
+        "external": {
+          "type": "object",
+          "properties": {
+            "connectionUrlSecretRef": { "type": "string" },
+            "connectionUrlSecretKey": { "type": "string" }
+          }
+        }
+      },
+      "required": ["type"],
+      "if": { "properties": { "type": { "const": "external" } } },
+      "then": {
+        "properties": {
+          "external": {
+            "properties": {
+              "connectionUrlSecretRef": { "type": "string", "minLength": 1 }
+            },
+            "required": ["connectionUrlSecretRef"]
+          }
+        }
+      }
+    }
+  },
+  "required": ["image", "ca", "serving", "enrollment", "db"]
+}
