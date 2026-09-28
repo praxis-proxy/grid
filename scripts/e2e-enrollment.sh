@@ -22,16 +22,25 @@ PG_IMAGE="quay.io/sclorg/postgresql-16-c9s"
 CHART="$(cd "$(dirname "$0")/.." && pwd)/charts/grid-enrollment"
 K="kubectl --context ${CTX} -n ${NS}"
 WORK="$(mktemp -d)"
-trap '[ "${KEEP:-0}" = "1" ] || kind delete cluster --name "${CLUSTER}" >/dev/null 2>&1 || true; rm -rf "${WORK}"' EXIT
+# Until this run creates the cluster, the only thing to clean up is the workdir.
+# The cluster-teardown trap is armed after create, so a refused run never deletes
+# a cluster it does not own.
+trap 'rm -rf "${WORK}"' EXIT
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 pass() { echo "PASS: $*"; }
 
 echo "== cluster + images =="
+# Refuse to touch a cluster we do not own: fail on a name collision rather than
+# deleting a user's pre-existing cluster. Only a cluster this run creates is torn down.
+if kind get clusters 2>/dev/null | grep -qx "${CLUSTER}"; then
+  fail "kind cluster '${CLUSTER}' already exists; refusing to clobber it. Delete it or set CLUSTER=<unique-name>."
+fi
 # KIND_CREATE_PREFIX lets a rootless-podman host pass the systemd Delegate wrapper;
 # empty in CI (docker), where plain `kind create` works.
-kind delete cluster --name "${CLUSTER}" >/dev/null 2>&1 || true
 ${KIND_CREATE_PREFIX:-} kind create cluster --name "${CLUSTER}"
+# We own the cluster now: arm teardown (skipped when KEEP=1).
+trap '[ "${KEEP:-0}" = "1" ] || kind delete cluster --name "${CLUSTER}" >/dev/null 2>&1 || true; rm -rf "${WORK}"' EXIT
 kind load docker-image "${IMAGE_REPO}:${IMAGE_TAG}" --name "${CLUSTER}"
 docker pull "${PG_IMAGE}" 2>/dev/null || podman pull "${PG_IMAGE}"
 kind load docker-image "${PG_IMAGE}" --name "${CLUSTER}"

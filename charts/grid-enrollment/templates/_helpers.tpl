@@ -118,6 +118,8 @@ Secret holding DB_CONNECTION_URL. External ref wins; builtin uses the generated 
 {{- define "grid-enrollment.dbUrlSecret" -}}
 {{- if eq .Values.db.type "external" -}}
 {{- required "db.external.connectionUrlSecretRef is required when db.type=external" .Values.db.external.connectionUrlSecretRef -}}
+{{- else if .Values.db.builtin.auth.existingSecretRef -}}
+{{- .Values.db.builtin.auth.existingSecretRef -}}
 {{- else -}}
 {{- printf "%s-db" (include "grid-enrollment.fullname" .) | trunc 63 | trimSuffix "-" -}}
 {{- end }}

@@ -1,22 +1,28 @@
 {{- if and (eq (include "grid-enrollment.caProvided" .) "true") (eq .Values.db.type "builtin") }}
 {{- fail "ca.method=provided (or ca.provided.keySecretRef) requires db.type=external: the builtin Postgres TLS cert is issued by the bootstrap Job, which a provided CA skips, so the builtin DB would serve plaintext and the service refuses it" }}
 {{- end }}
-{{- if and (eq .Values.db.type "builtin") (not .Values.db.builtin.auth.existingSecretRef) }}
+{{- if eq .Values.db.type "builtin" }}
 {{/*
-Builtin Postgres: a Secret carrying the password and the full DB_CONNECTION_URL
-the service reads, a PVC, a Service, and the Deployment. Password is generated
-once and preserved across upgrades via lookup.
+Builtin Postgres: a PVC, a Service, and the Deployment, plus a generated Secret
+(password + the full DB_CONNECTION_URL the service reads) UNLESS the operator
+brings their own via db.builtin.auth.existingSecretRef. The Postgres resources
+render either way; only the generated Secret is conditional, so a BYO secret
+still gets a running Postgres. The generated password is preserved across
+upgrades via lookup.
 
 TLS ($tls): serves over TLS with the grid-CA-issued cert the bootstrap Job mints
 (grid-db-serving-tls), so the enrollment client can connect verify-full; the
 binary refuses a plaintext DB. Active on the generated-CA path (the Job runs);
-with a provided CA use an external DB.
+with a provided CA use an external DB. A BYO DB secret must carry a
+DB_CONNECTION_URL that requires TLS to this Postgres (sslmode=verify-full).
 */}}
 {{- $tls := ne (include "grid-enrollment.caProvided" .) "true" }}
 {{- $dbName := include "grid-enrollment.dbHost" . }}
-{{- $secretName := printf "%s-db" (include "grid-enrollment.fullname" .) }}
 {{- $user := .Values.db.builtin.auth.username }}
 {{- $database := .Values.db.builtin.auth.database }}
+{{- $byo := .Values.db.builtin.auth.existingSecretRef }}
+{{- $secretName := $byo | default (printf "%s-db" (include "grid-enrollment.fullname" .)) }}
+{{- if not $byo }}
 {{- $existing := lookup "v1" "Secret" .Release.Namespace $secretName }}
 {{- $password := "" }}
 {{- if $existing }}
@@ -42,8 +48,9 @@ type: Opaque
 data:
   password: {{ $password | b64enc }}
   DB_CONNECTION_URL: {{ $url | b64enc }}
-{{- if $tls }}
 ---
+{{- end }}
+{{- if $tls }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -57,8 +64,8 @@ data:
     ssl = on
     ssl_cert_file = '/tls/server.crt'
     ssl_key_file = '/tls/server.key'
-{{- end }}
 ---
+{{- end }}
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
