@@ -50,6 +50,19 @@ const TLS_KEY_PATH: &str = "ENROLLMENT_TLS_KEY";
 /// secret, so a deployment beside MaaS points at the database already there.
 const DB_CONNECTION_URL: &str = "DB_CONNECTION_URL";
 
+/// Reject `enrollment bootstrap` on a serve-only build instead of degrading to serve.
+#[cfg(not(feature = "bootstrap"))]
+fn reject_bootstrap_without_feature(
+    args: impl IntoIterator<Item = std::ffi::OsString>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if args.into_iter().nth(1).is_some_and(|arg| arg == "bootstrap") {
+        return Err("`enrollment bootstrap` is unavailable: this image was built \
+                    without --features bootstrap (use deploy/enrollment/Containerfile)"
+            .into());
+    }
+    Ok(())
+}
+
 #[tokio::main]
 #[expect(
     clippy::too_many_lines,
@@ -66,9 +79,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await
             .map_err(|err| -> Box<dyn std::error::Error> { err });
     }
+    #[cfg(not(feature = "bootstrap"))]
+    reject_bootstrap_without_feature(std::env::args_os())?;
 
-    let ca_cert_path = std::env::var(CA_CERT_PATH)?;
-    let ca_key_path = std::env::var(CA_KEY_PATH)?;
+    let ca_cert_path = std::env::var(CA_CERT_PATH).map_err(|error| format!("{CA_CERT_PATH}: {error}"))?;
+    let ca_key_path = std::env::var(CA_KEY_PATH).map_err(|error| format!("{CA_KEY_PATH}: {error}"))?;
     let common_name = std::env::var(CA_COMMON_NAME).unwrap_or_else(|_unset| "grid-ca".to_owned());
     let listen = std::env::var(LISTEN_ADDR).unwrap_or_else(|_unset| "0.0.0.0:8443".to_owned());
 
@@ -326,7 +341,27 @@ async fn build_authorizer() -> Result<Authorizer, Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(feature = "bootstrap"))]
+    use super::reject_bootstrap_without_feature;
     use super::require_db_tls;
+
+    #[cfg(not(feature = "bootstrap"))]
+    #[test]
+    fn bootstrap_without_the_feature_is_rejected() {
+        let args = ["enrollment", "bootstrap"].map(std::ffi::OsString::from);
+        let result = reject_bootstrap_without_feature(args);
+        assert!(
+            matches!(&result, Err(error) if error.to_string().contains("--features bootstrap")),
+            "a serve-only build must reject bootstrap and name the feature: {result:?}"
+        );
+    }
+
+    #[cfg(not(feature = "bootstrap"))]
+    #[test]
+    fn a_non_bootstrap_invocation_is_allowed() -> Result<(), Box<dyn std::error::Error>> {
+        let args = ["enrollment"].map(std::ffi::OsString::from);
+        reject_bootstrap_without_feature(args)
+    }
 
     #[test]
     fn a_url_that_permits_plaintext_is_refused() {
