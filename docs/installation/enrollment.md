@@ -59,21 +59,22 @@ also settable when a deployment needs to override it.
 `0.0.0.0:8443`, and the chart derives the Service port from it. No separate
 `enrollment.service.port` key exists.
 
-`enrollment.authz` chooses the grid-admin authorization backend, `local` or
-`kube`:
+`enrollment.authz` chooses the grid-admin authorization backend, `kube` or
+`local`:
 
-- `local` (default): a bearer-token table for grid-admins. Set
-  `enrollment.gridAdminTokens.generate=true` to have the chart generate one,
-  or bring your own with `enrollment.gridAdminTokens.existingSecretRef`, a
-  Secret whose `tokens` key holds one `name:token` line per grid-admin.
-- `kube`: Kubernetes RBAC. The service authenticates the caller with
-  `TokenReview` and authorizes with `SubjectAccessReview` against the
+- `kube` (default): Kubernetes RBAC. The service authenticates the caller
+  with `TokenReview` and authorizes with `SubjectAccessReview` against the
   `enrollmenttokens` resource in the `grid.praxis-proxy.io` API group. No CRD
   is required, only ordinary `Role` or `ClusterRole` objects. Set
   `enrollment.serviceAccount.create=true` (and optionally
   `enrollment.serviceAccount.name`) so the pod runs as a `ServiceAccount`
   bound to `system:auth-delegator`, which is what lets the review calls
   succeed.
+- `local`: an opt-in bearer-token table for grid-admins, for clusters with no
+  Kubernetes credential to delegate to. Set `enrollment.authz=local` and
+  `enrollment.gridAdminTokens.generate=true` to have the chart generate one,
+  or bring your own with `enrollment.gridAdminTokens.existingSecretRef`, a
+  Secret whose `tokens` key holds one `name:token` line per grid-admin.
 
 `db.type` chooses the Postgres backend, `builtin` or `external`:
 
@@ -98,15 +99,29 @@ serving in the clear.
 
 ## 2. Mint a token
 
-A grid-admin mints a single-use token that pins the site name. `$GRID_ADMIN_TOKEN`
-is the token half of a `name:token` line in the grid-admin-tokens Secret, the
-one `enrollment.gridAdminTokens.generate` created or
-`enrollment.gridAdminTokens.existingSecretRef` pointed at. The minted site
-token is usable once and only its digest is stored, so it cannot be
-recovered later.
+A grid-admin mints a single-use token that pins the site name. With the
+default `enrollment.authz=kube`, `$GRID_ADMIN_TOKEN` is a Kubernetes
+ServiceAccount token for an identity RBAC authorizes against the
+`enrollmenttokens` resource, reviewed with `TokenReview` and
+`SubjectAccessReview`. Under the `enrollment.authz=local` override,
+`$GRID_ADMIN_TOKEN` is instead the token half of a `name:token` line in the
+grid-admin-tokens Secret, the one `enrollment.gridAdminTokens.generate`
+created or `enrollment.gridAdminTokens.existingSecretRef` pointed at. The
+minted site token is usable once and only its digest is stored, so it
+cannot be recovered later.
+
+Every call below verifies the enrollment service's certificate against the
+grid CA before sending a bearer token. Extract the CA certificate from the
+`grid-ca-bundle` Secret and pass it with `--cacert`:
 
 ```bash
-curl -sk -X POST https://enrollment.grid.internal/v1alpha1/enrollmenttokens \
+kubectl -n grid get secret grid-ca-bundle -o jsonpath='{.data.ca\.crt}' \
+  | base64 -d > grid-ca-bundle.crt
+```
+
+```bash
+curl -s -X POST https://enrollment.grid.internal/v1alpha1/enrollmenttokens \
+  --cacert grid-ca-bundle.crt \
   -H "Authorization: Bearer $GRID_ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"siteName": "east2", "gridNetworkRef": "my-grid"}'
@@ -123,11 +138,12 @@ Response:
 }
 ```
 
-Hand the `token` value to the site out of band. To revoke it before it is
-redeemed:
+Hand the `token` value and the `grid-ca-bundle.crt` file to the site out of
+band. To revoke the token before it is redeemed:
 
 ```bash
-curl -sk -X DELETE https://enrollment.grid.internal/v1alpha1/enrollmenttokens/$TOKEN_ID \
+curl -s -X DELETE https://enrollment.grid.internal/v1alpha1/enrollmenttokens/$TOKEN_ID \
+  --cacert grid-ca-bundle.crt \
   -H "Authorization: Bearer $GRID_ADMIN_TOKEN"
 ```
 
@@ -144,11 +160,14 @@ openssl req -new -key site.key -subj "/CN=east2" -out site.csr
 
 ## 4. Enroll
 
-Submit the token and the CSR to the enrollment endpoint:
+Submit the token and the CSR to the enrollment endpoint. Verify the server
+against the `grid-ca-bundle.crt` handed over out of band with the token,
+before sending `$SITE_TOKEN`:
 
 ```bash
 jq -n --rawfile csr site.csr '{csr: $csr}' \
-  | curl -sk -X POST https://enrollment.grid.internal/v1alpha1/enrollments \
+  | curl -s -X POST https://enrollment.grid.internal/v1alpha1/enrollments \
+      --cacert grid-ca-bundle.crt \
       -H "Authorization: Bearer $SITE_TOKEN" \
       -H "Content-Type: application/json" \
       -d @-
