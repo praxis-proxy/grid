@@ -114,7 +114,7 @@ impl HttpFilter for GridSiteRouteFilter {
 /// The list is pre-ordered (least-loaded first), so the front match is the
 /// chosen target. This is the reused selection: a linear first-match, never a
 /// score computed here.
-fn select_admitted<'list>(
+pub(crate) fn select_admitted<'list>(
     candidates: &'list [RouteCandidate],
     kind: CapabilityKind,
     name: &str,

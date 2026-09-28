@@ -6,6 +6,8 @@
 //! contribution is ordering the candidates by live load off the request path.
 
 mod descriptor;
+#[cfg(test)]
+mod flow;
 mod metadata;
 mod route;
 mod snapshot;

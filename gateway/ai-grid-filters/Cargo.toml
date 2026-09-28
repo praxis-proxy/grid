@@ -19,5 +19,15 @@ async-trait = "0.1"
 tracing = "0.1"
 http = "1"
 
+[dev-dependencies]
+# The flow tests drive the real scrape -> store -> route path, so they pull the
+# poller (grid-signals-client) and cert issuance (certs) across the workspace,
+# the same way the crate already path-deps grid-signals.
+grid-signals-client = { path = "../../signals-client" }
+certs = { path = "../../certs", default-features = false, features = ["verifier", "rcgen"] }
+tokio = { version = "1", features = ["macros", "net", "rt", "rt-multi-thread", "io-util", "time"] }
+rustls = { version = "0.23", features = ["ring"] }
+tokio-rustls = "0.26"
+
 [lints]
 workspace = true

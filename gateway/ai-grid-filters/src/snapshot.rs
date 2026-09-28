@@ -13,7 +13,7 @@ use grid_signals::LoadStore;
 use crate::descriptor::RouteCandidate;
 
 /// Load metric that orders candidates. Lower queue depth is a better target.
-const LOAD_METRIC: &str = "inference_pool_average_queue_size";
+pub(crate) const LOAD_METRIC: &str = "inference_pool_average_queue_size";
 
 /// Lower load is a better routing target.
 const LOWER_IS_BETTER: bool = true;
