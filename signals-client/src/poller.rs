@@ -10,7 +10,7 @@
 
 use std::{sync::Arc, time::Duration};
 
-use grid_signals::LoadStore;
+use grid_signals::{LoadStore, now_ms};
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use serde::Deserialize;
 use tokio::sync::watch;
@@ -62,8 +62,9 @@ pub struct PollerConfig {
     /// attribution requires one site per scrape, so a relay carrying many sites is
     /// not supported without per-site signed signals. See CROSS-SITE-POLLER.md.
     pub endpoint: String,
-    /// Poll interval, in milliseconds.
-    #[serde(default = "default_interval_ms")]
+    /// Poll interval, in milliseconds. Rejected when zero: the loop hands this
+    /// to `tokio::time::interval`, which panics on a zero duration.
+    #[serde(default = "default_interval_ms", deserialize_with = "deserialize_interval_ms")]
     pub interval_ms: u64,
     /// Retention per series, in seconds.
     #[serde(default = "default_window_secs")]
@@ -111,6 +112,22 @@ where
     let value = i64::deserialize(deserializer)?;
     if value < 0 {
         return Err(serde::de::Error::custom("max_age_ms must not be negative"));
+    }
+    Ok(value)
+}
+
+/// Reject a zero poll interval at parse time.
+///
+/// The loop passes `interval_ms` to `tokio::time::interval`, which panics on a
+/// zero duration, so a config of `interval_ms: 0` would abort the poller thread
+/// on its first tick. Rejecting it here turns that into a config error.
+fn deserialize_interval_ms<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = u64::deserialize(deserializer)?;
+    if value == 0 {
+        return Err(serde::de::Error::custom("interval_ms must be greater than zero"));
     }
     Ok(value)
 }
@@ -298,7 +315,7 @@ async fn poll_loop<S: SignalSource + Send + Sync>(
 async fn poll_once<S: SignalSource + Sync>(source: &S, store: &LoadStore) {
     match source.fetch().await {
         Ok(scrape) => match owner_site(&scrape.peer_identity) {
-            Some(owner) => store.ingest_at(&scrape.body, scrape.date_ms, owner),
+            Some(owner) => store.ingest_at(&scrape.body, scrape.date_ms, now_ms(), owner),
             None => {
                 tracing::warn!(id = %scrape.peer_identity, "scrape peer id is not a grid site id; dropping");
             },
@@ -347,6 +364,12 @@ mod tests {
     fn a_negative_max_age_is_rejected_at_parse() {
         let err = cfg("endpoint: https://o/s\nmax_age_ms: -1\n").expect_err("must reject");
         assert!(err.to_string().contains("must not be negative"), "{err}");
+    }
+
+    #[test]
+    fn a_zero_interval_is_rejected_at_parse() {
+        let err = cfg("endpoint: https://o/s\ninterval_ms: 0\n").expect_err("must reject");
+        assert!(err.to_string().contains("must be greater than zero"), "{err}");
     }
 
     #[test]
@@ -421,7 +444,7 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(
             store
-                .window_worst(&LoadStore::key("east", "pool-a"), "queue_depth", 1_000, 5_000, true)
+                .window_worst(&LoadStore::key("east", "pool-a"), "queue_depth", now_ms(), 5_000, true)
                 .is_some(),
             "the scraped sample should be queryable"
         );
@@ -447,13 +470,13 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(
             store
-                .window_worst(&LoadStore::key("west", "pool-a"), "queue_depth", 1_000, 5_000, true)
+                .window_worst(&LoadStore::key("west", "pool-a"), "queue_depth", now_ms(), 5_000, true)
                 .is_none(),
             "the spoofed west series must not exist"
         );
         assert!(
             store
-                .window_worst(&LoadStore::key("east", "pool-a"), "queue_depth", 1_000, 5_000, true)
+                .window_worst(&LoadStore::key("east", "pool-a"), "queue_depth", now_ms(), 5_000, true)
                 .is_none(),
             "and it is not silently rebound to east either"
         );
@@ -481,7 +504,7 @@ mod tests {
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         let mut found = false;
         while std::time::Instant::now() < deadline {
-            if store.window_worst(&key, "queue_depth", 1_000, 5_000, true).is_some() {
+            if store.window_worst(&key, "queue_depth", now_ms(), 5_000, true).is_some() {
                 found = true;
                 break;
             }
@@ -512,7 +535,7 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(
             store
-                .window_worst(&LoadStore::key("east", "pool-a"), "queue_depth", 2_000, 5_000, true)
+                .window_worst(&LoadStore::key("east", "pool-a"), "queue_depth", now_ms(), 5_000, true)
                 .is_some(),
             "the loop recovers and ingests after a failed tick"
         );

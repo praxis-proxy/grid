@@ -11,10 +11,11 @@
 use std::{
     borrow::Cow,
     collections::HashMap,
+    sync::atomic::{AtomicUsize, Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use dashmap::DashMap;
+use dashmap::{DashMap, mapref::entry::Entry};
 
 use crate::exposition::{self, PROVIDER_LABEL, SITE_LABEL};
 
@@ -50,6 +51,17 @@ const MAX_KEY_INPUT_BYTES: usize = 256;
 /// wedge the series head against the later corrected samples `Series::push`
 /// drops.
 const MAX_CLOCK_SKEW_MS: i64 = 5_000;
+
+/// Largest relayed-sample age treated as plausible, one day. A larger apparent
+/// age means the peer's clock is skewed or the stamp is garbage, so the sample is
+/// restamped fresh rather than trusted to be that old.
+const MAX_RELAY_AGE_MS: i64 = 24 * 60 * 60 * 1000;
+
+/// A no-skew reference-and-local clock for tests: it sits above the small stamps
+/// the tests use and well within [`MAX_RELAY_AGE_MS`] of them, so [`rebase_age`]
+/// restamps each sample onto its own value (an identity).
+#[cfg(test)]
+const NO_SKEW_NOW_MS: i64 = 1_000_000;
 
 /// One observation of a series.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -113,8 +125,13 @@ pub struct LoadStore {
     /// Verified owner to the count of providers it holds, for the per-owner cap.
     /// Keyed on the crypto-verified owner, never a self-reported value, so one
     /// authenticated peer maps to exactly one entry. That is what makes the sub-cap
-    /// a real per-tenant bound; a refactor must not key this on a body label.
+    /// a real per-tenant bound, and a refactor must not key this on a body label.
     owner_providers: DashMap<Box<str>, usize>,
+    /// Count of admitted providers, for the global cap. Providers are retained,
+    /// never evicted, so this only grows. An atomic check-and-increment bounds it
+    /// exactly under concurrent pollers, which a `providers.len()` check followed
+    /// by a separate insert cannot.
+    admitted: AtomicUsize,
     /// Retention per series.
     window: Duration,
 }
@@ -126,6 +143,7 @@ impl LoadStore {
         Self {
             providers: DashMap::new(),
             owner_providers: DashMap::new(),
+            admitted: AtomicUsize::new(0),
             window,
         }
     }
@@ -199,37 +217,39 @@ impl LoadStore {
         self.providers.len()
     }
 
-    /// Absorb an exposition response using the local clock as the freshness
-    /// reference, attributing to the body's own first site. Test-only: the poll
-    /// path uses [`Self::ingest_at`] with the operator's own clock and the
-    /// crypto-verified owner, so no production path bypasses the `Date` anchor or
-    /// the owner binding. The binding itself is covered by the `ingest_at` owner
-    /// tests.
+    /// Absorb an exposition response with no clock skew, attributing to the
+    /// body's own first site. Test-only: reference and local now coincide above
+    /// the small stamps these tests use, so [`rebase_age`] is an identity and a
+    /// sample reads back at the stamp it carried. The poll path uses
+    /// [`Self::ingest_at`] with the peer's `Date`, the local clock, and the
+    /// crypto-verified owner, so no production path bypasses the anchor or the
+    /// owner binding, which the `ingest_at` tests cover.
     #[cfg(test)]
     pub fn ingest(&self, text: &str) {
-        self.ingest_at(text, now_ms(), first_grid_site(text));
+        self.ingest_at(text, NO_SKEW_NOW_MS, NO_SKEW_NOW_MS, first_grid_site(text));
     }
 
     /// Absorb an exposition response, skipping lines that do not parse so one bad
-    /// line does not cost the rest. `reference_ms` is the operator's own clock
-    /// (its `Date` header): a sample stamped implausibly far past it is dropped,
-    /// so a future stamp cannot wedge the series head.
+    /// line does not cost the rest.
+    ///
+    /// `reference_ms` is the peer's own clock (its `Date` header) and
+    /// `local_now_ms` is this gateway's clock. A sample stamped implausibly far
+    /// past the peer's `Date` is dropped, then each surviving sample's age is
+    /// re-expressed on the local clock ([`rebase_age`]) so [`Self::window_worst`]
+    /// compares every sample against one clock.
     ///
     /// `owner` is the peer's crypto-verified site (from mTLS): attribution keys on
     /// it, never the self-reported `grid_site` label. A line whose label disagrees
-    /// is a cross-site spoof and is dropped; a line without the label is attributed
-    /// to `owner`. The body can never choose the key.
+    /// is a cross-site spoof and is dropped, and a line without the label is
+    /// attributed to `owner`. The body can never choose the key.
     ///
-    /// Assumes one poll loop per owner (the gateway dedups poll targets), so the
-    /// per-owner provider count has a single writer and cannot overshoot its cap.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "one pass: parse, clock-skew, owner binding, per-owner + global caps, push"
-    )]
-    pub fn ingest_at(&self, text: &str, reference_ms: i64, owner: &str) {
+    /// New-provider admission is atomic against both caps, so concurrent pollers
+    /// cannot drive the retained-provider count past the global or per-owner
+    /// bound.
+    pub fn ingest_at(&self, text: &str, reference_ms: i64, local_now_ms: i64, owner: &str) {
         let horizon = reference_ms.saturating_add(MAX_CLOCK_SKEW_MS);
         for line in text.lines() {
-            let Some(observation) = parse_sample(line) else {
+            let Some(mut observation) = parse_sample(line) else {
                 continue;
             };
             if observation.sample.at_ms > horizon {
@@ -240,38 +260,81 @@ impl LoadStore {
             if observation.site.as_deref().is_some_and(|site| site != owner) {
                 continue;
             }
+            observation.sample.at_ms = rebase_age(reference_ms, observation.sample.at_ms, local_now_ms);
+
             let key = Self::key(owner, observation.cluster.as_ref());
-            if !self.providers.contains_key(&key) {
-                // A new provider: enforce the global cap and the per-owner sub-cap,
-                // so one verified owner cannot exhaust the global budget and lock
-                // out other sites (R1). Scope the owner-count guard so it is dropped
-                // before the providers lock is taken.
-                if self.providers.len() >= MAX_PROVIDERS {
-                    continue;
-                }
-                {
-                    let mut held = self.owner_providers.entry(owner.into()).or_insert(0);
-                    if *held >= MAX_PROVIDERS_PER_OWNER {
-                        continue;
+            match self.providers.entry(key) {
+                Entry::Occupied(mut occupied) => push_observation(occupied.get_mut(), &observation, self.window),
+                Entry::Vacant(vacant) => {
+                    // A new key: admit it against both caps while its shard is
+                    // locked, so the check and the insert cannot race a
+                    // concurrent poller into overshooting a cap.
+                    if self.admit_new_provider(owner) {
+                        let mut provider = Provider::default();
+                        push_observation(&mut provider, &observation, self.window);
+                        vacant.insert(provider);
                     }
-                    *held = held.saturating_add(1);
-                }
-            }
-            let mut provider = self.providers.entry(key).or_default();
-            // Probe by borrow so a known metric neither hashes twice nor allocates
-            // an owned key; only the first sample of a new metric owns its name,
-            // and only if it fits under the per-provider cap that bounds a peer
-            // flooding unique names.
-            if let Some(series) = provider.metrics.get_mut(observation.metric) {
-                series.push(observation.sample, self.window);
-            } else if provider.metrics.len() < MAX_METRICS_PER_PROVIDER {
-                provider
-                    .metrics
-                    .entry(observation.metric.into())
-                    .or_default()
-                    .push(observation.sample, self.window);
+                },
             }
         }
+    }
+
+    /// Reserve a global and a per-owner slot for one new provider, atomically.
+    ///
+    /// Returns `false`, holding no reservation, when either cap is already met.
+    /// The global reservation is an atomic check-and-increment on
+    /// [`Self::admitted`]. The per-owner reservation runs under the owner's entry
+    /// lock, so two concurrent inserts for one owner cannot both pass the check.
+    fn admit_new_provider(&self, owner: &str) -> bool {
+        if self
+            .admitted
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                (count < MAX_PROVIDERS).then(|| count.saturating_add(1))
+            })
+            .is_err()
+        {
+            return false;
+        }
+        let mut held = self.owner_providers.entry(owner.into()).or_insert(0);
+        if *held >= MAX_PROVIDERS_PER_OWNER {
+            drop(held);
+            self.admitted.fetch_sub(1, Ordering::SeqCst);
+            return false;
+        }
+        *held = held.saturating_add(1);
+        true
+    }
+}
+
+/// Push `observation`'s sample into `provider`, bounding the distinct metric
+/// names it holds. A known metric neither re-hashes nor allocates. A new metric
+/// owns its name only if it fits under the per-provider cap, which bounds a peer
+/// flooding unique names.
+fn push_observation(provider: &mut Provider, observation: &Observation<'_>, window: Duration) {
+    if let Some(series) = provider.metrics.get_mut(observation.metric) {
+        series.push(observation.sample, window);
+    } else if provider.metrics.len() < MAX_METRICS_PER_PROVIDER {
+        provider
+            .metrics
+            .entry(observation.metric.into())
+            .or_default()
+            .push(observation.sample, window);
+    }
+}
+
+/// Re-express a peer sample's age on the local clock.
+///
+/// The peer's `Date` and the sample stamp are both on the peer clock, so their
+/// difference is skew-free, and restamping that age onto `local_now_ms` puts the
+/// sample on the reader's clock. An implausible age (a garbage stamp, a badly
+/// skewed peer, or a stamp ahead of the peer's own `Date`) is treated as fresh
+/// rather than trusted, so it never reads as stale or far-future.
+fn rebase_age(reference_ms: i64, sample_at_ms: i64, local_now_ms: i64) -> i64 {
+    let age = reference_ms.saturating_sub(sample_at_ms);
+    if (0..=MAX_RELAY_AGE_MS).contains(&age) {
+        local_now_ms.saturating_sub(age)
+    } else {
+        local_now_ms
     }
 }
 
@@ -600,13 +663,15 @@ mod tests {
 
     #[test]
     fn a_future_sample_is_dropped_and_does_not_wedge_the_series() {
-        // Reference is the operator's clock at 1_000. A stamp beyond the skew
-        // tolerance is implausible and must not enter the series head, or the
-        // later corrected sample would be dropped as older.
+        // The peer's Date is 2_000. A stamp beyond the skew tolerance ahead of it
+        // is implausible and must not enter the series head, or the later
+        // corrected sample would be dropped as older. Reference and local now
+        // coincide (no skew), so the corrected sample keeps its own stamp.
         let store = store();
-        let future = 1_000 + MAX_CLOCK_SKEW_MS + 10_000;
-        store.ingest_at(&line("east", "pool-a", 9.0, future), 1_000, "east");
-        store.ingest_at(&line("east", "pool-a", 3.0, 2_000), 1_000, "east");
+        let date = 2_000;
+        let future = date + MAX_CLOCK_SKEW_MS + 10_000;
+        store.ingest_at(&line("east", "pool-a", 9.0, future), date, date, "east");
+        store.ingest_at(&line("east", "pool-a", 3.0, date), date, date, "east");
         let sample = store
             .latest(&LoadStore::key("east", "pool-a"), QUEUE)
             .expect("the corrected sample lands");
@@ -705,14 +770,24 @@ mod tests {
         let store = store();
         for idx in 0..MAX_PROVIDERS {
             let owner = format!("site-{idx}");
-            store.ingest_at(&line(&owner, "pool-a", 1.0, 1_000), 1_000, &owner);
+            store.ingest_at(
+                &line(&owner, "pool-a", 1.0, 1_000),
+                NO_SKEW_NOW_MS,
+                NO_SKEW_NOW_MS,
+                &owner,
+            );
         }
         assert_eq!(
             store.provider_count(),
             MAX_PROVIDERS,
             "filled to the global cap across owners"
         );
-        store.ingest_at(&line("late", "pool-a", 9.0, 1_000), 1_000, "late");
+        store.ingest_at(
+            &line("late", "pool-a", 9.0, 1_000),
+            NO_SKEW_NOW_MS,
+            NO_SKEW_NOW_MS,
+            "late",
+        );
         assert!(
             store.latest(&LoadStore::key("late", "pool-a"), QUEUE).is_none(),
             "the global cap still refuses a new owner once full"
@@ -766,7 +841,12 @@ mod tests {
     #[test]
     fn a_matching_body_site_is_attributed_to_the_owner() {
         let store = store();
-        store.ingest_at(&line("east", "pool-a", 3.0, 1_000), 1_000, "east");
+        store.ingest_at(
+            &line("east", "pool-a", 3.0, 1_000),
+            NO_SKEW_NOW_MS,
+            NO_SKEW_NOW_MS,
+            "east",
+        );
         assert_eq!(
             store
                 .latest(&LoadStore::key("east", "pool-a"), QUEUE)
@@ -780,7 +860,12 @@ mod tests {
     fn a_disagreeing_body_site_is_dropped() {
         let store = store();
         // A verified "east" peer claims "west" in the body: the cross-site spoof.
-        store.ingest_at(&line("west", "pool-a", 9.0, 1_000), 1_000, "east");
+        store.ingest_at(
+            &line("west", "pool-a", 9.0, 1_000),
+            NO_SKEW_NOW_MS,
+            NO_SKEW_NOW_MS,
+            "east",
+        );
         assert_eq!(store.provider_count(), 0, "a disagreeing label is dropped, not stored");
         assert!(
             store.latest(&LoadStore::key("west", "pool-a"), QUEUE).is_none(),
@@ -796,7 +881,12 @@ mod tests {
     fn an_absent_body_site_is_stamped_with_the_owner() {
         let store = store();
         // A line with grid_provider but no grid_site: attributed to the verified owner.
-        store.ingest_at(&format!(r#"{QUEUE}{{grid_provider="pool-a"}} 7 1000"#), 1_000, "east");
+        store.ingest_at(
+            &format!(r#"{QUEUE}{{grid_provider="pool-a"}} 7 1000"#),
+            NO_SKEW_NOW_MS,
+            NO_SKEW_NOW_MS,
+            "east",
+        );
         assert_eq!(
             store
                 .latest(&LoadStore::key("east", "pool-a"), QUEUE)
@@ -814,7 +904,7 @@ mod tests {
             line("east", "pool-a", 3.0, 1_000),
             line("west", "pool-b", 9.0, 1_000),
         );
-        store.ingest_at(&body, 1_000, "east");
+        store.ingest_at(&body, NO_SKEW_NOW_MS, NO_SKEW_NOW_MS, "east");
         assert_eq!(store.provider_count(), 1, "only the owner's line lands");
         assert_eq!(
             store
@@ -826,6 +916,76 @@ mod tests {
         assert!(
             store.latest(&LoadStore::key("west", "pool-b"), QUEUE).is_none(),
             "the disagreeing line is dropped per line"
+        );
+    }
+
+    #[test]
+    fn rebase_age_restamps_a_sample_onto_the_local_clock() {
+        // A sample 3s old on the peer clock lands 3s old on the local clock,
+        // whatever the absolute skew between the two clocks.
+        assert_eq!(
+            rebase_age(100_000, 97_000, 5_000),
+            2_000,
+            "3s old, restamped onto local now"
+        );
+        // A stamp ahead of the peer's own Date is implausible, so it reads fresh.
+        assert_eq!(
+            rebase_age(100_000, 101_000, 5_000),
+            5_000,
+            "a future-on-peer stamp is fresh"
+        );
+        // An age beyond a day is implausible, so the sample reads fresh, not old.
+        assert_eq!(
+            rebase_age(MAX_RELAY_AGE_MS.saturating_add(10), 0, 5_000),
+            5_000,
+            "an implausible age is stamped fresh"
+        );
+    }
+
+    #[test]
+    fn a_skewed_peer_sample_still_reads_fresh_on_the_local_clock() {
+        // The peer's clock runs far ahead of ours: its Date is 9_000_000 and its
+        // sample is 1s old on that clock. window_worst uses our clock. Stored raw,
+        // the sample would sit ~9_000_000ms ahead of our clock and be skipped.
+        // Rebased, it is 1s old locally and inside the window.
+        let store = store();
+        let local_now = 5_000;
+        store.ingest_at(&line("east", "pool-a", 4.0, 8_999_000), 9_000_000, local_now, "east");
+        let worst = store.window_worst(&LoadStore::key("east", "pool-a"), QUEUE, local_now, 30_000, true);
+        assert_eq!(worst, Some(4.0), "a skewed peer's fresh sample still routes");
+    }
+
+    #[test]
+    fn concurrent_admission_holds_the_per_owner_cap_exactly() {
+        // Many threads race to insert distinct new providers for one owner, more
+        // than the per-owner cap. Admission is atomic, so the retained count lands
+        // exactly on the cap. A check-then-insert would overshoot under this race.
+        let store = std::sync::Arc::new(store());
+        let workers: usize = 8;
+        let per_worker = MAX_PROVIDERS_PER_OWNER / 4;
+        let handles: Vec<_> = (0..workers)
+            .map(|worker| {
+                let store = std::sync::Arc::clone(&store);
+                std::thread::spawn(move || {
+                    for slot in 0..per_worker {
+                        let cluster = format!("pool-{worker}-{slot}");
+                        let text = line("east", &cluster, 1.0, 1_000);
+                        store.ingest_at(&text, NO_SKEW_NOW_MS, NO_SKEW_NOW_MS, "east");
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().expect("worker thread");
+        }
+        assert!(
+            workers.saturating_mul(per_worker) > MAX_PROVIDERS_PER_OWNER,
+            "the test must attempt more than the cap"
+        );
+        assert_eq!(
+            store.provider_count(),
+            MAX_PROVIDERS_PER_OWNER,
+            "concurrent admission bounds one owner exactly at its cap"
         );
     }
 }

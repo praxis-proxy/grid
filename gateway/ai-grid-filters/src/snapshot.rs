@@ -114,8 +114,8 @@ mod tests {
     fn the_least_loaded_site_sorts_first() {
         let store = LoadStore::new(Duration::from_secs(60));
         // Same model on two sites: east is busy (90), west is idle (10).
-        store.ingest_at(&line("east", "pool-a", 90.0, 1_000), 1_000, "east");
-        store.ingest_at(&line("west", "pool-b", 10.0, 1_000), 1_000, "west");
+        store.ingest_at(&line("east", "pool-a", 90.0, 1_000), 1_000, 1_000, "east");
+        store.ingest_at(&line("west", "pool-b", 10.0, 1_000), 1_000, 1_000, "west");
 
         let candidates =
             validate_candidates(vec![cand("llama", "east", "pool-a"), cand("llama", "west", "pool-b")]).unwrap();
@@ -131,7 +131,7 @@ mod tests {
     #[test]
     fn an_unmeasured_candidate_sorts_after_a_measured_one() {
         let store = LoadStore::new(Duration::from_secs(60));
-        store.ingest_at(&line("east", "pool-a", 50.0, 1_000), 1_000, "east");
+        store.ingest_at(&line("east", "pool-a", 50.0, 1_000), 1_000, 1_000, "east");
         // west has no sample at all.
 
         let candidates =

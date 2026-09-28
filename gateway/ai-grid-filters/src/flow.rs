@@ -186,7 +186,12 @@ fn candidates(model: &str, sites: &[(&str, &str)]) -> Vec<RouteCandidate> {
 /// the poller would.
 async fn scrape_into(store: &LoadStore, peer: &PeerScraper) {
     let scrape = peer.fetch().await.expect("scrape ok");
-    store.ingest_at(&scrape.body, scrape.date_ms, &owner_of(&scrape.peer_identity));
+    store.ingest_at(
+        &scrape.body,
+        scrape.date_ms,
+        scrape.date_ms,
+        &owner_of(&scrape.peer_identity),
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -242,7 +247,12 @@ async fn the_scrape_hop_is_mutually_authenticated_then_routes() {
     );
 
     let store = LoadStore::new(Duration::from_secs(60));
-    store.ingest_at(&scrape.body, scrape.date_ms, &owner_of(&scrape.peer_identity));
+    store.ingest_at(
+        &scrape.body,
+        scrape.date_ms,
+        scrape.date_ms,
+        &owner_of(&scrape.peer_identity),
+    );
     let snapshot = RouteSnapshot::from_store(
         candidates("llama", &[("east", "pool-a")]),
         Arc::from("local"),
@@ -369,7 +379,7 @@ async fn an_untrusted_peer_is_refused_and_contributes_no_reading() {
     // With no reading, the candidate sorts last and cannot be chosen over a
     // measured peer.
     let store = LoadStore::new(Duration::from_secs(60));
-    store.ingest_at(&line("west", "pool-b", 50.0), 1_000, "west");
+    store.ingest_at(&line("west", "pool-b", 50.0), 1_000, 1_000, "west");
     let snapshot = RouteSnapshot::from_store(
         candidates("llama", &[("east", "pool-a"), ("west", "pool-b")]),
         Arc::from("local"),
