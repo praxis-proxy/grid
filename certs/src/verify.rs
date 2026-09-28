@@ -58,6 +58,21 @@ pub enum VerifyError {
         /// The name the sender claimed.
         claimed: String,
     },
+
+    /// The SPIFFE name is not in this grid's trust domain.
+    #[cfg(feature = "verifier")]
+    #[error("certificate names {found}, not the {expected} trust domain")]
+    WrongTrustDomain {
+        /// The SPIFFE name bound into the certificate.
+        found: String,
+        /// The trust domain this grid expects.
+        expected: String,
+    },
+
+    /// The peer presented no certificate to extract an identity from.
+    #[cfg(feature = "verifier")]
+    #[error("peer presented no certificate")]
+    NoPeerCertificate,
 }
 
 /// Check that `leaf_pem` was issued by this grid to `claimed_site`.
@@ -146,7 +161,7 @@ pub fn csr_public_key(csr_pem: &str) -> Result<Vec<u8>, VerifyError> {
 }
 
 /// The one SPIFFE URI name on a certificate, when there is exactly one.
-fn single_spiffe_name(leaf: &X509Certificate<'_>) -> Option<String> {
+pub(crate) fn single_spiffe_name(leaf: &X509Certificate<'_>) -> Option<String> {
     let san = leaf.subject_alternative_name().ok().flatten()?;
     let mut uris = san.value.general_names.iter().filter_map(|name| {
         if let GeneralName::URI(uri) = name {

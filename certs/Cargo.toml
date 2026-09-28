@@ -10,6 +10,12 @@ publish = false
 default = ["rcgen"]
 rcgen = ["dep:rcgen", "dep:sha2", "x509-parser/verify"]
 fips = ["dep:openssl"]
+# The rustls peer-mTLS verifier (GridSpiffe{Server,Client}Verifier). Off by
+# default; a consumer that dials or terminates grid mTLS enables it. rustls is
+# pulled without a crypto provider: the verifier takes its signature-verification
+# algorithms from the provider the consumer installs, so FIPS follows that
+# provider rather than a build flag, and there is no ring path to leak.
+verifier = ["dep:rustls"]
 
 [dependencies]
 pem = "4"
@@ -20,11 +26,15 @@ openssl = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
 thiserror = { workspace = true }
 time = { workspace = true }
+# No provider feature: algorithms come from the consumer's installed provider.
+rustls = { workspace = true, optional = true }
 
 [dev-dependencies]
 # Interop tests exercise both backends, so a fips test build still needs rcgen.
 rcgen = { workspace = true, features = ["x509-parser"] }
 x509-parser = { workspace = true, features = ["verify"] }
+# The verifier tests need a crypto provider to source algorithms; ring is test-only.
+rustls = { workspace = true, features = ["ring"] }
 # Integration tests decode and re-encode request PEM; a normal dep is not visible there.
 pem = "4"
 

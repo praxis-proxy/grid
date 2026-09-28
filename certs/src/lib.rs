@@ -13,6 +13,8 @@ compile_error!("one of `rcgen` or `fips` must be enabled");
 mod backend;
 mod enroll;
 mod generate;
+#[cfg(feature = "verifier")]
+mod grid_verifier;
 mod provider;
 mod verify;
 
@@ -25,6 +27,8 @@ pub use generate::{
     generate_cert_with_org, generate_dns_cert, generate_dns_only_cert, generate_expired_dns_cert,
     generate_not_yet_valid_dns_cert, generate_site_cert, generate_site_cert_with_names, load_ca, spiffe_id,
 };
+#[cfg(feature = "verifier")]
+pub use grid_verifier::{DEFAULT_TRUST_DOMAIN, GridSpiffeClientVerifier, GridSpiffeServerVerifier};
 pub use provider::{CertificateProvider, ProviderError, SiteCertificate, StaticFileProvider, TrustBundle};
 pub use verify::{MAX_CERT_PEM_BYTES, VerifyError, canonical_fingerprint, csr_public_key, verify_site_cert};
 
