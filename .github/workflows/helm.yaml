@@ -95,7 +95,7 @@ jobs:
         run: helm plugin install https://github.com/helm-unittest/helm-unittest --version "${HELM_UNITTEST_VERSION}"
 
       - name: Chart template unit tests
-        run: helm unittest charts/grid-site charts/grid-operator
+        run: helm unittest charts/grid-site charts/grid-operator charts/grid-enrollment
 
       - name: Validate charts (static)
         run: ./scripts/verify-helm-chart.sh
@@ -175,6 +175,65 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: kind-test-logs
+          path: /tmp/helm-kind-logs/
+          if-no-files-found: ignore
+          retention-days: 5
+
+  # ----------------------------------------------------------------------------
+  # Enrollment e2e: helm reproducibility plus the real enroll flow (mint, CSR,
+  # signed cert with the pinned SPIFFE name), against the deployed service.
+  # ----------------------------------------------------------------------------
+
+  kind-enrollment:
+    needs: changes
+    if: needs.changes.outputs.runtime == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Helm
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      - name: Install Kind
+        run: |
+          curl -fsSL -o /tmp/kind \
+            "https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}/kind-linux-amd64"
+          echo "50030de23cf40a18505f20426f6a8506bedf13c6e509244bd1fa9463721b0f54  /tmp/kind" | sha256sum -c
+          sudo install -m 0755 /tmp/kind /usr/local/bin/kind
+          rm /tmp/kind
+          kind version
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - name: Build enrollment image for Kind
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: deploy/enrollment/Containerfile
+          push: false
+          load: true
+          tags: ghcr.io/praxis-proxy/grid-enrollment:ci
+          cache-from: type=gha,scope=helm-kind-enrollment
+          cache-to: type=gha,mode=max,scope=helm-kind-enrollment
+
+      - name: Run enrollment e2e (helm reproducibility and the enroll flow)
+        run: |
+          IMAGE_REPO=ghcr.io/praxis-proxy/grid-enrollment IMAGE_TAG=ci \
+            ./scripts/e2e-enrollment.sh
+
+      - name: Upload e2e logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: enrollment-e2e-logs
           path: /tmp/helm-kind-logs/
           if-no-files-found: ignore
           retention-days: 5
