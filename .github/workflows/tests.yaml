@@ -67,6 +67,9 @@ jobs:
       - name: Check generated API types match the spec
         run: make codegen-check
 
+      - name: Check CRD manifests match the Rust CRD types
+        run: make crds-check
+
   # ----------------------------------------------------------------------------
   # Unit tests
   # ----------------------------------------------------------------------------

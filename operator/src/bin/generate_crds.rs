@@ -1,7 +1,7 @@
 #![expect(
     clippy::print_stdout,
     clippy::print_stderr,
-    reason = "generate-crds is a CLI tool that prints to the terminal"
+    reason = "generate_crds is a CLI tool that prints to the terminal"
 )]
 //! Generate Grid operator CRD manifests as a JSON `List` for `kubectl apply`.
 //!
@@ -9,7 +9,7 @@
 //! install or update the CRDs in a cluster:
 //!
 //! ```text
-//! cargo run -p operator --bin generate-crds | kubectl apply -f -
+//! cargo run -p operator --bin generate_crds | kubectl apply -f -
 //! ```
 //!
 //! The output is a single JSON `v1/List` containing all CRDs required by the

@@ -5,7 +5,6 @@ metadata:
 spec:
   group: grid.praxis-proxy.io
   names:
-    categories: []
     kind: InferenceProvider
     plural: inferenceproviders
     shortNames:

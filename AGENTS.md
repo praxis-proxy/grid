@@ -47,6 +47,7 @@ scoring model, and auth framework. See
   `imports_granularity` are nightly-only)
 - `cargo-audit`, `cargo-deny` (supply chain safety)
 - `cargo-machete` (unused dependency detection)
+- `jq` and `yq` v4 (CRD manifest generation)
 - Docker or Podman (for mock servers and kind)
 - kind (for integration testing)
 
@@ -66,6 +67,9 @@ make lint-extra     # typos + taplo + shellcheck
                     #   + actionlint
 make doc            # rustdoc -D warnings, private
 make audit          # cargo audit + cargo deny check
+make generate-crds  # regenerate CRD manifests from
+                    #   operator/src/crd
+make crds-check     # fail if CRD manifests are stale
 make all            # build + fmt + lint + test + audit
 ```
 

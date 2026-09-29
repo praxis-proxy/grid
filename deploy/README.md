@@ -28,8 +28,11 @@ direction as a separate `praxis-forge` CLI.
 Custom Resource Definitions are generated from the operator source code:
 
 ```bash
-# Regenerate CRDs after schema changes
-./scripts/generate-deployment-crds.sh
+# Regenerate CRDs after schema changes (writes deploy/crds and charts/grid-operator/crds)
+make generate-crds
+
+# Check that the committed CRDs match the Rust types (runs in CI)
+make crds-check
 
 # Validate CRD syntax
 kubectl --dry-run=server create -k deploy/crds/

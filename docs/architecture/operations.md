@@ -77,8 +77,12 @@ kubectl apply -k deploy/operator/
 For regenerating CRDs after schema changes:
 
 ```console
-./scripts/generate-deployment-crds.sh
+make generate-crds
 ```
+
+This writes both `deploy/crds/` and `charts/grid-operator/crds/`. CI runs
+`make crds-check`, which fails when the committed CRDs no longer match the
+Rust types.
 
 **Container image pattern**: The operator Containerfile uses a
 `rust:1.96-alpine` builder with BuildKit cache mounts, and an `alpine:3.23`

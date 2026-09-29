@@ -5,7 +5,6 @@ metadata:
 spec:
   group: grid.praxis-proxy.io
   names:
-    categories: []
     kind: GridSite
     plural: gridsites
     shortNames:
@@ -156,7 +155,10 @@ spec:
                       type: boolean
                   type: object
                 lastProbeTime:
-                  description: Timestamp of the last data-plane gateway health evaluation.
+                  description: |-
+                    Timestamp of the last probe that changed an observable status field.
+
+                    Advances only on a status write, so a stuck-operator check must use phase.
                   nullable: true
                   type: string
                 lastTransitionTime:

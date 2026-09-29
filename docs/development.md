@@ -6,6 +6,7 @@ Development and validation guidance for AI Grid Network (AGN).
 
 - Rust stable 1.96+
 - Rust nightly (for `rustfmt`)
+- `jq` and `yq` v4 (for generating CRD manifests)
 
 ## Conventions
 
@@ -73,6 +74,28 @@ Rustdoc warnings are denied globally via
 `.cargo/config.toml` (`rustdocflags = ["-D", "warnings"]`),
 so `cargo doc` always enforces doc quality even
 outside Make.
+
+### CRD Manifests
+
+The CRD manifests in `deploy/crds/` and
+`charts/grid-operator/crds/` are generated from the Rust
+types in `operator/src/crd/`. Do not edit them directly.
+
+After changing a CRD type, regenerate the manifests and
+commit them together with the Rust change:
+
+```console
+make generate-crds  # write deploy/crds and the chart CRDs
+make crds-check     # fail if they do not match the Rust types
+```
+
+This includes changes to doc comments. The field
+descriptions in the CRDs come from the `///` comments on
+the Rust fields, so a comment-only change also changes
+the CRDs.
+
+CI runs `make crds-check` and fails the pull request when
+the committed manifests are out of date.
 
 ### Coverage
 

@@ -5,7 +5,6 @@ metadata:
 spec:
   group: grid.praxis-proxy.io
   names:
-    categories: []
     kind: GridNetwork
     plural: gridnetworks
     shortNames:
@@ -338,12 +337,8 @@ spec:
                   nullable: true
                   pattern: ^([1-9][0-9]*s|[1-9][0-9]{3,}ms)$
                   type: string
-                region:
-                  description: Region where this site is deployed.
-                  nullable: true
-                  type: string
                 placementPolicy:
-                  description: Static provider-capacity placement policy.
+                  description: Optional static capacity-placement policy.
                   nullable: true
                   properties:
                     strategy:
@@ -354,6 +349,10 @@ spec:
                   required:
                     - strategy
                   type: object
+                region:
+                  description: Region where this site is deployed.
+                  nullable: true
+                  type: string
                 routingPolicy:
                   description: |-
                     Candidate ordering policy for the routing overlay.
@@ -393,7 +392,7 @@ spec:
                   type: object
                 seeds:
                   default: []
-                  description: Initial SWIM seed peer endpoints in host:port form. Literal IPv4, bracketed IPv6, and DNS hostnames are accepted.
+                  description: Initial SWIM seed peers in host:port form. Accepts literal IPv4, bracketed IPv6, and DNS hostnames.
                   items:
                     type: string
                   type: array

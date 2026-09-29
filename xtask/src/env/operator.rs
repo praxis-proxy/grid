@@ -6,7 +6,7 @@
 //! context, so no container image build or push is required.
 //!
 //! Validation sequence:
-//! 1. Install Grid CRDs via `generate-crds` binary piped to `kubectl apply`.
+//! 1. Install Grid CRDs via `generate_crds` binary piped to `kubectl apply`.
 //! 2. Apply test `GridNetwork` and `InferenceProvider` fixtures.
 //! 3. Spawn operator (`cargo run -p operator`) in the background.
 //! 4. Poll provider status until reconciled (up to 60 s).
@@ -632,7 +632,7 @@ pub(crate) const STALE_GC_ABSENT_POLL_TIMEOUT: Duration = Duration::from_secs(45
 
 /// Generate Grid CRD manifests and apply them to `context`.
 ///
-/// Spawns `cargo run -p operator --bin generate-crds` to produce a JSON
+/// Spawns `cargo run -p operator --bin generate_crds` to produce a JSON
 /// `v1/List`, then pipes the output to `kubectl apply -f -`.
 pub(crate) fn install_grid_crds(context: &str) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("  generating Grid CRDs...");
@@ -914,13 +914,13 @@ pub(crate) fn kubectl_auth_can_i(
     Ok(stdout.trim() == "yes")
 }
 
-/// Run the `generate-crds` binary and return its stdout as a `String`.
+/// Run the `generate_crds` binary and return its stdout as a `String`.
 fn generate_crd_json() -> Result<String, Box<dyn std::error::Error>> {
     let out = Command::new("cargo")
         .args(["run", "--quiet", "-p", "operator", "--bin", "generate_crds"])
         .output()?;
     if !out.status.success() {
-        return Err(format!("generate-crds failed: {}", String::from_utf8_lossy(&out.stderr)).into());
+        return Err(format!("generate_crds failed: {}", String::from_utf8_lossy(&out.stderr)).into());
     }
     Ok(String::from_utf8(out.stdout)?)
 }
