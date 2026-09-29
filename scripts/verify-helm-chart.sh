@@ -547,6 +547,14 @@ if [ "${KIND:-}" = "1" ] || [ "${1:-}" = "--kind" ]; then
     fi
   done
 
+  for short in gnw infpvd; do
+    if kubectl --context "$KCTX" get "$short" >/dev/null 2>&1; then
+      pass "kind: kubectl get $short"
+    else
+      fail "kind: kubectl get $short does not resolve"
+    fi
+  done
+
   if kubectl --context "$KCTX" -n grid-system rollout status deployment/grid-operator --timeout=90s 2>&1; then
     pass "kind: operator deployment ready"
   else

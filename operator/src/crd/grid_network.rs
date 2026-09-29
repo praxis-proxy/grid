@@ -538,6 +538,7 @@ pub fn resolve_budget_statuses(
     version = "v1alpha1",
     kind = "GridNetwork",
     plural = "gridnetworks",
+    shortname = "gnw",
     status = "GridNetworkStatus",
     namespaced = false,
     printcolumn = r#"{"name":"Grid ID","type":"string","jsonPath":".status.gridId"}"#,
@@ -1221,6 +1222,7 @@ impl Default for SwimConfig {
 
 #[cfg(test)]
 mod tests {
+    use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
     use kube::CustomResourceExt as _;
 
     use super::*;
@@ -1318,6 +1320,28 @@ mod tests {
                 .unwrap_or_else(|| std::process::abort()),
             "GridNetwork",
             "wrong kind name"
+        );
+    }
+
+    #[test]
+    fn grid_network_crd_has_short_name() {
+        let crd = crd_json();
+        assert_eq!(
+            crd.pointer("/spec/names/shortNames"),
+            Some(&serde_json::json!(["gnw"])),
+            "kubectl get gnw needs this short name"
+        );
+    }
+
+    #[test]
+    fn chart_crd_manifest_has_generated_short_names() {
+        let manifest: CustomResourceDefinition =
+            serde_yaml::from_str(include_str!("../../../charts/grid-operator/crds/gridnetwork.yaml"))
+                .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            manifest.spec.names.short_names,
+            GridNetwork::crd().spec.names.short_names,
+            "chart CRD manifest and Rust definition must have the same short names"
         );
     }
 

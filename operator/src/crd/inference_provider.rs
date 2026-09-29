@@ -25,6 +25,7 @@ use super::{
     version = "v1alpha1",
     kind = "InferenceProvider",
     plural = "inferenceproviders",
+    shortname = "infpvd",
     status = "InferenceProviderStatus",
     namespaced = false,
     printcolumn = r#"{"name":"Provider","type":"string","jsonPath":".spec.providerKind"}"#,
@@ -491,6 +492,7 @@ pub enum ProviderPhase {
 
 #[cfg(test)]
 mod tests {
+    use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
     use kube::CustomResourceExt as _;
 
     use super::*;
@@ -579,6 +581,29 @@ mod tests {
                 .unwrap_or_else(|| std::process::abort()),
             "InferenceProvider",
             "wrong kind name"
+        );
+    }
+
+    #[test]
+    fn inference_provider_crd_has_short_name() {
+        let crd = crd_json();
+        assert_eq!(
+            crd.pointer("/spec/names/shortNames"),
+            Some(&serde_json::json!(["infpvd"])),
+            "kubectl get infpvd needs this short name"
+        );
+    }
+
+    #[test]
+    fn chart_crd_manifest_has_generated_short_names() {
+        let manifest: CustomResourceDefinition = serde_yaml::from_str(include_str!(
+            "../../../charts/grid-operator/crds/inferenceprovider.yaml"
+        ))
+        .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            manifest.spec.names.short_names,
+            InferenceProvider::crd().spec.names.short_names,
+            "chart CRD manifest and Rust definition must have the same short names"
         );
     }
 

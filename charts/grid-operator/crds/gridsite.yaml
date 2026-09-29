@@ -8,7 +8,8 @@ spec:
     categories: []
     kind: GridSite
     plural: gridsites
-    shortNames: []
+    shortNames:
+      - gs
     singular: gridsite
   scope: Cluster
   versions:

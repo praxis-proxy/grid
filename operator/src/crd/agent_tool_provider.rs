@@ -22,6 +22,7 @@ use super::{
     version = "v1alpha1",
     kind = "AgentToolProvider",
     plural = "agenttoolproviders",
+    shortname = "atp",
     status = "AgentToolProviderStatus",
     namespaced = false,
     printcolumn = r#"{"name":"Protocol","type":"string","jsonPath":".spec.protocol"}"#,

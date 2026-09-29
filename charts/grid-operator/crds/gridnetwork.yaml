@@ -8,7 +8,8 @@ spec:
     categories: []
     kind: GridNetwork
     plural: gridnetworks
-    shortNames: []
+    shortNames:
+      - gnw
     singular: gridnetwork
   scope: Cluster
   versions:

@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
     version = "v1alpha1",
     kind = "GridSite",
     plural = "gridsites",
+    shortname = "gs",
     status = "GridSiteStatus",
     namespaced = false,
     printcolumn = r#"{"name":"Phase","type":"string","jsonPath":".status.phase"}"#,

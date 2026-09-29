@@ -8,7 +8,8 @@ spec:
     categories: []
     kind: InferenceProvider
     plural: inferenceproviders
-    shortNames: []
+    shortNames:
+      - infpvd
     singular: inferenceprovider
   scope: Cluster
   versions:
