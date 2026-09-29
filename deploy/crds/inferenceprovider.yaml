@@ -509,6 +509,7 @@ spec:
                         path:
                           default: /v1/models
                           description: Path appended to the base URL.
+                          minLength: 1
                           type: string
                         tls:
                           description: |-

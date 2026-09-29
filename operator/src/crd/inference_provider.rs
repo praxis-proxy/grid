@@ -473,6 +473,7 @@ pub struct OpenAiModelsSource {
     pub endpoint: Option<String>,
 
     /// Path appended to the base URL.
+    #[schemars(length(min = 1))]
     #[serde(default = "default_models_path")]
     pub path: String,
 
