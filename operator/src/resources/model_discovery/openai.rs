@@ -15,7 +15,7 @@ use serde::Deserialize;
 use super::{DiscoveryError, ModelSource, ServedModels};
 use crate::resources::{
     credentials::BearerToken,
-    tls_backend::{ClientTlsConfig, build_custom_tls_connector, build_native_connector},
+    tls_backend::{ClientTlsConfig, HttpsConnector, build_custom_tls_connector, build_native_connector},
 };
 
 // ---------------------------------------------------------------------------
@@ -61,8 +61,8 @@ pub(crate) struct OpenAiModels {
     /// Pre-built `Authorization` header, marked sensitive.
     authorization: Option<HeaderValue>,
 
-    /// Custom TLS configuration; system roots when `None`.
-    tls: Option<ClientTlsConfig>,
+    /// Client reused across requests to this source.
+    client: Client<HttpsConnector, Empty<Bytes>>,
 
     /// Bound on the whole poll, including reading the body.
     timeout: Duration,
@@ -75,7 +75,8 @@ impl OpenAiModels {
     ///
     /// Returns [`DiscoveryError::Config`] when `url` is not `http`/`https`,
     /// when `tls` is set on a plain-HTTP URL, or when `token` is not a valid
-    /// header value.
+    /// header value. Returns [`DiscoveryError::Transport`] if the connector
+    /// cannot be built.
     pub(crate) fn new(
         url: &str,
         token: Option<&BearerToken>,
@@ -94,26 +95,26 @@ impl OpenAiModels {
         }
 
         let authorization = token.map(bearer_header).transpose()?;
-
-        Ok(Self {
-            url,
-            authorization,
-            tls,
-            timeout,
-        })
-    }
-
-    /// Send the request and parse the response, without a timeout.
-    async fn fetch(&self) -> Result<ServedModels, DiscoveryError> {
-        let connector = match &self.tls {
+        let connector = match &tls {
             Some(config) => build_custom_tls_connector(config),
             None => build_native_connector(),
         }
         .map_err(|e| DiscoveryError::Transport(e.into()))?;
         let client = Client::builder(TokioExecutor::new()).build(connector);
 
+        Ok(Self {
+            url,
+            authorization,
+            client,
+            timeout,
+        })
+    }
+
+    /// Send the request and parse the response, without a timeout.
+    async fn fetch(&self) -> Result<ServedModels, DiscoveryError> {
         // Redirects are not followed: a 3xx is reported as a status error.
-        let response = client
+        let response = self
+            .client
             .request(self.request()?)
             .await
             .map_err(|e| DiscoveryError::Transport(e.into()))?;

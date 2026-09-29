@@ -246,7 +246,7 @@ impl PollError {
 }
 
 /// Query one provider's discovery source and record the outcome.
-///
+/// 
 /// `None` when the provider has no name. Poll failures are logged and counted.
 async fn poll(
     provider: &InferenceProvider,
