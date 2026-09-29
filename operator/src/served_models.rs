@@ -86,13 +86,12 @@ struct ServedModel {
 }
 
 /// The result of polling one named provider.
-struct ProviderPoll {
-    /// `InferenceProvider` name.
-    name: String,
-
+struct ProviderPoll(
     /// Models reported, or a failed poll.
-    outcome: PollOutcome,
-}
+    PollOutcome,
+    /// `InferenceProvider` name.
+    String,
+);
 
 /// What one provider poll reported.
 enum PollOutcome {
@@ -136,31 +135,18 @@ impl ServedModelStore {
     /// the old one, while a failed poll keeps it until expiry. Providers absent
     /// from `updated` are no longer configured and are dropped.
     ///
-    /// Refreshes, expirations, and drops are logged at `debug`, so e2e
+    /// Changes, expirations, and drops are logged at `debug`, so e2e
     /// tests can observe them without a status field.
     fn refresh(&self, updated: Vec<ProviderPoll>, now: Instant, ttl: Duration) {
         let Ok(mut map) = self.inner.write() else {
             return;
         };
 
-        // Remove dropped from map.
-        map.retain(|provider: &String, served| {
-            let dropped_from_round = updated.iter().all(|u| u.name.as_str() != provider);
-            if dropped_from_round {
-                tracing::debug!(provider, "served models dropped");
-                false
-            } else if served.expires_at <= now {
-                tracing::debug!(provider, "served models expired");
-                false
-            } else {
-                true
-            }
-        });
+        prune_before_refresh(&mut map, &updated, now);
 
-        for provider in updated {
-            if let PollOutcome::Served(models) = provider.outcome {
-                let name = provider.name;
-                let models: Arc<[String]> = models.into_names().into();
+        for ProviderPoll(outcome, name) in updated {
+            if let PollOutcome::Served(discovered) = outcome {
+                let models: Arc<[String]> = discovered.into_names().into();
                 tracing::debug!(name, ?models, "served models refreshed");
 
                 map.insert(
@@ -173,6 +159,23 @@ impl ServedModelStore {
             }
         }
     }
+}
+
+/// Remove unpolled and expired entries before applying successful results.
+fn prune_before_refresh(map: &mut BTreeMap<String, ServedModel>, updated: &[ProviderPoll], now: Instant) {
+    map.retain(
+        |provider: &String, served| match updated.iter().find(|ProviderPoll(_, p)| *p == *provider) {
+            None => {
+                tracing::debug!(provider, "served models dropped");
+                false
+            },
+            Some(ProviderPoll(PollOutcome::Failed, _)) if served.expires_at <= now => {
+                tracing::debug!(provider, "served models expired");
+                false
+            },
+            Some(_) => served.expires_at > now,
+        },
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -246,7 +249,7 @@ impl PollError {
 }
 
 /// Query one provider's discovery source and record the outcome.
-/// 
+///
 /// `None` when the provider has no name. Poll failures are logged and counted.
 async fn poll(
     provider: &InferenceProvider,
@@ -271,7 +274,7 @@ async fn poll(
         },
     };
 
-    Some(ProviderPoll { name, outcome })
+    Some(ProviderPoll(outcome, name))
 }
 
 /// Build an [`OpenAiModels`] source and list its models.
@@ -311,7 +314,7 @@ async fn openai_source(
         .await
         .map_err(|(_, message)| PollError::Tls(message))?;
 
-    Ok(OpenAiModels::new(&url, token.as_ref(), tls, timeout)?)
+    Ok(OpenAiModels::new(&url, token.as_ref(), tls.as_ref(), timeout)?)
 }
 
 /// Join a base URL and a path with exactly one `/` between them.
@@ -440,10 +443,7 @@ mod tests {
                     ),
                     None => PollOutcome::Failed,
                 };
-                ProviderPoll {
-                    name: provider.to_owned(),
-                    outcome,
-                }
+                ProviderPoll(outcome, provider.to_owned())
             })
             .collect()
     }

@@ -80,7 +80,7 @@ impl OpenAiModels {
     pub(crate) fn new(
         url: &str,
         token: Option<&BearerToken>,
-        tls: Option<ClientTlsConfig>,
+        tls: Option<&ClientTlsConfig>,
         timeout: Duration,
     ) -> Result<Self, DiscoveryError> {
         let url: Uri = url
@@ -95,7 +95,7 @@ impl OpenAiModels {
         }
 
         let authorization = token.map(bearer_header).transpose()?;
-        let connector = match &tls {
+        let connector = match tls {
             Some(config) => build_custom_tls_connector(config),
             None => build_native_connector(),
         }
