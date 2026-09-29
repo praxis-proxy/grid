@@ -646,6 +646,10 @@ pub(crate) fn sites_matching_selector(provider: &InferenceProvider, sites: &[Gri
     clippy::too_many_arguments,
     reason = "all parameters are distinct reconcile outputs; no logical grouping reduces them"
 )]
+#[expect(
+    clippy::too_many_lines,
+    reason = "constructing and comparing reconcile-owned status fields belongs with the patch"
+)]
 async fn update_status(
     provider: &InferenceProvider,
     client: &Client,
@@ -666,13 +670,18 @@ async fn update_status(
     });
     let status = InferenceProviderStatus {
         matching_sites,
+        model_discovery_error: None,
         model_discovery_url,
         observed_generation,
         phase,
         reason,
     };
 
-    if provider.status.as_ref() == Some(&status) {
+    if provider
+        .status
+        .as_ref()
+        .is_some_and(|current| current.matches_reconciler_status(&status))
+    {
         return Ok(());
     }
 
@@ -703,6 +712,7 @@ mod tests {
     fn provider_status_update_is_skipped_when_semantically_unchanged() {
         let baseline = InferenceProviderStatus {
             matching_sites: vec!["site-a".to_owned()],
+            model_discovery_error: None,
             model_discovery_url: None,
             observed_generation: 2,
             phase: ProviderPhase::Available,

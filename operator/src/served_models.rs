@@ -25,7 +25,7 @@ use std::{
 use futures::{StreamExt as _, stream};
 use kube::{
     Client,
-    api::{Api, ListParams},
+    api::{Api, ListParams, Patch, PatchParams},
 };
 
 use crate::{
@@ -99,7 +99,17 @@ enum PollOutcome {
     Served(ServedModels),
 
     /// Polling failed; the last good set may remain held.
-    Failed,
+    Failed(PollError),
+}
+
+impl PollOutcome {
+    /// Bounded failure reason, absent after a successful poll.
+    fn failure_reason(&self) -> Option<&'static str> {
+        match self {
+            Self::Served(_) => None,
+            Self::Failed(error) => Some(error.as_reason()),
+        }
+    }
 }
 
 /// Served-model sets keyed by `InferenceProvider` name.
@@ -135,22 +145,19 @@ impl ServedModelStore {
     /// the old one, while a failed poll keeps it until expiry. Providers absent
     /// from `updated` are no longer configured and are dropped.
     ///
-    /// Changes, expirations, and drops are logged at `debug`, so e2e
-    /// tests can observe them without a status field.
-    fn refresh(&self, updated: Vec<ProviderPoll>, now: Instant, ttl: Duration) {
+    /// Changes, expirations, and drops are logged at `debug`.
+    fn refresh(&self, updated: &[ProviderPoll], now: Instant, ttl: Duration) {
         let Ok(mut map) = self.inner.write() else {
             return;
         };
 
-        prune_before_refresh(&mut map, &updated, now);
-
+        prune_before_refresh(&mut map, updated, now);
         for ProviderPoll(outcome, name) in updated {
             if let PollOutcome::Served(discovered) = outcome {
-                let models: Arc<[String]> = discovered.into_names().into();
+                let models: Arc<[String]> = discovered.clone().into_names().into();
                 tracing::debug!(name, ?models, "served models refreshed");
-
                 map.insert(
-                    name,
+                    name.clone(),
                     ServedModel {
                         models,
                         expires_at: now + ttl,
@@ -169,7 +176,7 @@ fn prune_before_refresh(map: &mut BTreeMap<String, ServedModel>, updated: &[Prov
                 tracing::debug!(provider, "served models dropped");
                 false
             },
-            Some(ProviderPoll(PollOutcome::Failed, _)) if served.expires_at <= now => {
+            Some(ProviderPoll(PollOutcome::Failed(_), _)) if served.expires_at <= now => {
                 tracing::debug!(provider, "served models expired");
                 false
             },
@@ -182,12 +189,15 @@ fn prune_before_refresh(map: &mut BTreeMap<String, ServedModel>, updated: &[Prov
 // Discovery round
 // ---------------------------------------------------------------------------
 
+/// Field manager for discovery-owned status fields.
+const DISCOVERY_FIELD_MANAGER: &str = "grid-model-discovery";
+
 /// Poll every provider that opts into discovery and refresh `store`.
 ///
 /// # Errors
 ///
-/// Returns [`OperatorError`] when providers cannot be listed; `store` is
-/// left untouched, so held sets expire on their own.
+/// Returns [`OperatorError`] when providers cannot be listed or their
+/// discovery status cannot be patched. A list failure leaves `store` untouched.
 pub(crate) async fn discover(
     store: &ServedModelStore,
     client: &Client,
@@ -207,7 +217,57 @@ pub(crate) async fn discover(
         .collect::<Vec<_>>()
         .await;
 
-    store.refresh(polled, Instant::now(), config.ttl);
+    store.refresh(&polled, Instant::now(), config.ttl);
+    publish_discovery_status(&api, &providers, &polled).await?;
+    Ok(())
+}
+
+/// Patch changed discovery errors and clear them after success or when disabled.
+async fn publish_discovery_status(
+    api: &Api<InferenceProvider>,
+    providers: &[InferenceProvider],
+    polled: &[ProviderPoll],
+) -> Result<(), OperatorError> {
+    for provider in providers {
+        if let Some(name) = provider.metadata.name.as_deref() {
+            let incoming_error = polled
+                .iter()
+                .find(|ProviderPoll(_, polled_name)| polled_name == name)
+                .and_then(|ProviderPoll(outcome, _)| outcome.failure_reason());
+            let current_error = provider
+                .status
+                .as_ref()
+                .and_then(|status| status.model_discovery_error.as_deref());
+            if current_error != incoming_error {
+                patch_discovery_status(api, name, incoming_error).await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Apply only the discovery-owned status field.
+async fn patch_discovery_status(
+    api: &Api<InferenceProvider>,
+    name: &str,
+    error: Option<&str>,
+) -> Result<(), OperatorError> {
+    let discovery_status = match error {
+        Some(error) => serde_json::json!({ "modelDiscoveryError": error }),
+        None => serde_json::json!({}),
+    };
+    let patch = serde_json::json!({
+        "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+        "kind": "InferenceProvider",
+        "metadata": { "name": name },
+        "status": discovery_status
+    });
+    api.patch_status(
+        name,
+        &PatchParams::apply(DISCOVERY_FIELD_MANAGER).force(),
+        &Patch::Apply(patch),
+    )
+    .await?;
     Ok(())
 }
 
@@ -268,9 +328,10 @@ async fn poll(
             PollOutcome::Served(models)
         },
         Err(error) => {
-            metrics::record_model_discovery_failure(&name, error.as_reason());
+            let reason = error.as_reason();
+            metrics::record_model_discovery_failure(&name, reason);
             tracing::warn!(provider = %name, %error, "model discovery failed");
-            PollOutcome::Failed
+            PollOutcome::Failed(error)
         },
     };
 
@@ -331,8 +392,8 @@ mod tests {
     fn success_replaces_set() {
         let store = ServedModelStore::new();
 
-        store.refresh(round(&[("p", Some(&["old"]))]), Instant::now(), TTL);
-        store.refresh(round(&[("p", Some(&["b", "a"]))]), Instant::now(), TTL);
+        store.refresh(&round(&[("p", Some(&["old"]))]), Instant::now(), TTL);
+        store.refresh(&round(&[("p", Some(&["b", "a"]))]), Instant::now(), TTL);
 
         assert_eq!(
             names(&store, "p"),
@@ -345,8 +406,8 @@ mod tests {
     fn empty_success_is_held() {
         let store = ServedModelStore::new();
 
-        store.refresh(round(&[("p", Some(&["a"]))]), Instant::now(), TTL);
-        store.refresh(round(&[("p", Some(&[]))]), Instant::now(), TTL);
+        store.refresh(&round(&[("p", Some(&["a"]))]), Instant::now(), TTL);
+        store.refresh(&round(&[("p", Some(&[]))]), Instant::now(), TTL);
 
         assert_eq!(names(&store, "p"), Some(Vec::new()), "empty success should be held");
     }
@@ -355,8 +416,8 @@ mod tests {
     fn failure_keeps_last_good_set() {
         let store = ServedModelStore::new();
 
-        store.refresh(round(&[("p", Some(&["a"]))]), Instant::now(), TTL);
-        store.refresh(round(&[("p", None)]), Instant::now(), TTL);
+        store.refresh(&round(&[("p", Some(&["a"]))]), Instant::now(), TTL);
+        store.refresh(&round(&[("p", None)]), Instant::now(), TTL);
 
         assert_eq!(names(&store, "p"), Some(owned(&["a"])), "failure should keep set");
     }
@@ -365,7 +426,7 @@ mod tests {
     fn unrenewed_set_expires() {
         let store = ServedModelStore::new();
 
-        store.refresh(round(&[("p", Some(&["a"]))]), Instant::now(), Duration::ZERO);
+        store.refresh(&round(&[("p", Some(&["a"]))]), Instant::now(), Duration::ZERO);
 
         assert_eq!(names(&store, "p"), None, "expired set should not be served");
     }
@@ -374,8 +435,8 @@ mod tests {
     fn unpolled_provider_is_dropped() {
         let store = ServedModelStore::new();
 
-        store.refresh(round(&[("p", Some(&["a"])), ("q", Some(&["b"]))]), Instant::now(), TTL);
-        store.refresh(round(&[("q", None)]), Instant::now(), TTL);
+        store.refresh(&round(&[("p", Some(&["a"])), ("q", Some(&["b"]))]), Instant::now(), TTL);
+        store.refresh(&round(&[("q", None)]), Instant::now(), TTL);
 
         assert_eq!(names(&store, "p"), None, "unconfigured provider should be dropped");
         assert_eq!(
@@ -432,7 +493,7 @@ mod tests {
                         ServedModels::try_from_names(names.iter().map(|&name| name.to_owned()))
                             .unwrap_or_else(|_| std::process::abort()),
                     ),
-                    None => PollOutcome::Failed,
+                    None => PollOutcome::Failed(PollError::Credential(String::new())),
                 };
                 ProviderPoll(outcome, provider.to_owned())
             })

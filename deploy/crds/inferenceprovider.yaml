@@ -673,6 +673,10 @@ spec:
                   items:
                     type: string
                   type: array
+                modelDiscoveryError:
+                  description: Bounded reason for the latest model-discovery failure, absent after a successful poll.
+                  nullable: true
+                  type: string
                 modelDiscoveryUrl:
                   description: |-
                     Effective model-listing URL when discovery is configured.

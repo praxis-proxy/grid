@@ -723,6 +723,12 @@ The effective request URL appears in `status.modelDiscoveryUrl`. It reflects
 the configured endpoint and path, regardless of whether a poll succeeds, and
 is absent when model discovery is not configured.
 
+A failed poll sets `status.modelDiscoveryError` to the bounded failure category
+used by `grid_model_discovery_total`. A successful poll clears it. The discovery
+loop owns this field separately from the provider's routing phase and clears
+it when discovery is disabled. The field reports the latest poll error; the
+held model set still follows its TTL independently.
+
 The bearer token comes from `spec.auth`. With `auth.manual`, requests carry no
 credentials.
 

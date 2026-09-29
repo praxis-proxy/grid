@@ -509,6 +509,10 @@ pub struct InferenceProviderStatus {
     #[serde(default)]
     pub matching_sites: Vec<String>,
 
+    /// Bounded reason for the latest model-discovery failure, absent after a successful poll.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_discovery_error: Option<String>,
+
     /// Effective model-listing URL when discovery is configured.
     ///
     /// This is the requested URL, not an indication that polling succeeded.
@@ -537,6 +541,17 @@ pub struct InferenceProviderStatus {
     ///   `HealthCheckTlsIdentityMismatch`
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+}
+
+impl InferenceProviderStatus {
+    /// Compare the fields written by provider reconciliation, excluding the discovery poller's error.
+    pub(crate) fn matches_reconciler_status(&self, desired: &Self) -> bool {
+        self.matching_sites == desired.matching_sites
+            && self.model_discovery_url == desired.model_discovery_url
+            && self.observed_generation == desired.observed_generation
+            && self.phase == desired.phase
+            && self.reason == desired.reason
+    }
 }
 
 /// Lifecycle phase of a provider resource.

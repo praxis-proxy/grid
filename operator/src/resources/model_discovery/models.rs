@@ -88,7 +88,7 @@ impl TryFrom<String> for ModelName {
 /// names.sort_unstable();
 /// assert_eq!(names, ["a", "b"]);
 /// ```
-#[derive(Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ServedModels(Vec<ModelName>);
 
 impl ServedModels {
