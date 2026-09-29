@@ -51,7 +51,7 @@ pub(crate) enum ServedModelsError {
 // ModelName
 // ---------------------------------------------------------------------------
 
-/// A served-model name that passed validation.
+/// A served-model name with surrounding whitespace removed and validated.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ModelName(String);
 
@@ -59,7 +59,8 @@ impl TryFrom<String> for ModelName {
     type Error = ServedModelsError;
 
     fn try_from(name: String) -> Result<Self, Self::Error> {
-        if name.trim().is_empty() {
+        let name = name.trim();
+        if name.is_empty() {
             return Err(ServedModelsError::Blank);
         }
 
@@ -68,10 +69,10 @@ impl TryFrom<String> for ModelName {
         }
 
         if name.chars().any(char::is_control) {
-            return Err(ServedModelsError::ControlChar(name));
+            return Err(ServedModelsError::ControlChar(name.to_owned()));
         }
 
-        Ok(Self(name))
+        Ok(Self(name.to_owned()))
     }
 }
 
