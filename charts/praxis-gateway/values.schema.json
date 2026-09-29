@@ -4,6 +4,14 @@
   "additionalProperties": false,
   "required": ["config"],
   "properties": {
+    "enabled": {
+      "type": "boolean",
+      "description": "Subchart toggle set by a parent chart's dependency condition."
+    },
+    "global": {
+      "type": "object",
+      "description": "Global values Helm passes to every subchart."
+    },
     "replicaCount": {
       "type": "integer",
       "minimum": 1,

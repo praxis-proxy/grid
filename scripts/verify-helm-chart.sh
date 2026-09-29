@@ -148,6 +148,7 @@ try_reject "$CHART_DIR" "invalid digest" --set image.digest=invalid
 try_reject "$CHART_DIR" "port zero" --set metrics.service.port=0
 try_reject "$CHART_DIR" "invalid SWIM type" --set swim.service.type=ExternalName
 try_reject "$CHART_DIR" "unknown key" --set typoField=true
+try_template "$CHART_DIR" "subchart keys" --set enabled=true --set global.foo=bar
 
 # ── Metrics-dependent resource coherence ────────────────────────────
 echo ""
@@ -327,6 +328,7 @@ try_reject "$GW_DIR" "missing config" --set image.tag=v0.1.0-test --namespace gr
 try_reject "$GW_DIR" "invalid digest (gw)" "${GW_REQ[@]}" --set image.digest=invalid
 try_reject "$GW_DIR" "invalid service type (gw)" "${GW_REQ[@]}" --set service.type=ExternalName
 try_reject "$GW_DIR" "unknown key (gw)" "${GW_REQ[@]}" --set typoField=true
+try_template "$GW_DIR" "subchart keys (gw)" "${GW_REQ[@]}" --set enabled=true --set global.foo=bar
 try_reject "$GW_DIR" "runAsNonRoot override" "${GW_REQ[@]}" --set podSecurityContext.runAsNonRoot=false
 try_reject "$GW_DIR" "overlay enabled no name" "${GW_REQ[@]}" --set overlay.enabled=true
 try_reject "$GW_DIR" "tls enabled no secret" "${GW_REQ[@]}" --set tls.enabled=true
