@@ -673,6 +673,13 @@ spec:
                   items:
                     type: string
                   type: array
+                modelDiscoveryUrl:
+                  description: |-
+                    Effective model-listing URL when discovery is configured.
+
+                    This is the requested URL, not an indication that polling succeeded.
+                  nullable: true
+                  type: string
                 observedGeneration:
                   default: 0
                   description: Last observed generation.

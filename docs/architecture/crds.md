@@ -719,6 +719,10 @@ modelDiscovery:
     tls: {...}                  # optional; same shape as metricsConfig.tls
 ```
 
+The effective request URL appears in `status.modelDiscoveryUrl`. It reflects
+the configured endpoint and path, regardless of whether a poll succeeds, and
+is absent when model discovery is not configured.
+
 The bearer token comes from `spec.auth`. With `auth.manual`, requests carry no
 credentials.
 

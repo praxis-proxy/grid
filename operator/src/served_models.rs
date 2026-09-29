@@ -296,8 +296,7 @@ async fn openai_source(
     timeout: Duration,
 ) -> Result<OpenAiModels, PollError> {
     let name = provider.metadata.name.as_deref().unwrap_or("?");
-    let base = openai.endpoint.as_deref().unwrap_or(&provider.spec.endpoint);
-    let url = join_url(base, &openai.path);
+    let url = openai.effective_url(&provider.spec.endpoint);
 
     let token = match credentials::credential_plan_from_auth(provider.spec.auth.as_ref()) {
         Ok(CredentialPlan::Bearer(secret_ref)) => Some(
@@ -315,14 +314,6 @@ async fn openai_source(
         .map_err(|(_, message)| PollError::Tls(message))?;
 
     Ok(OpenAiModels::new(&url, token.as_ref(), tls.as_ref(), timeout)?)
-}
-
-/// Join a base URL and a path with exactly one `/` between them.
-///
-/// `("http://h/", "/v1/models")` and `("http://h", "v1/models")` both yield
-/// `"http://h/v1/models"`.
-fn join_url(base: &str, path: &str) -> String {
-    format!("{}/{}", base.trim_end_matches('/'), path.trim_start_matches('/'))
 }
 
 // ---------------------------------------------------------------------------
@@ -415,17 +406,17 @@ mod tests {
 
     #[test]
     fn urls_are_joined_with_one_slash() {
-        assert_eq!(
-            join_url("http://h/", "/v1/models"),
-            "http://h/v1/models",
-            "both slashes"
-        );
-        assert_eq!(join_url("http://h", "v1/models"), "http://h/v1/models", "no slashes");
-        assert_eq!(
-            join_url("http://h/api", "/v1/models"),
-            "http://h/api/v1/models",
-            "base path"
-        );
+        let url = |base: &str, path: &str| {
+            OpenAiModelsSource {
+                endpoint: Some(base.to_owned()),
+                path: path.to_owned(),
+                tls: None,
+            }
+            .effective_url("unused")
+        };
+        assert_eq!(url("http://h/", "/v1/models"), "http://h/v1/models", "both slashes");
+        assert_eq!(url("http://h", "v1/models"), "http://h/v1/models", "no slashes");
+        assert_eq!(url("http://h/api", "/v1/models"), "http://h/api/v1/models", "base path");
     }
 
     // -----------------------------------------------------------------------

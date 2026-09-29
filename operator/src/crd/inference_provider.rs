@@ -484,6 +484,14 @@ pub struct OpenAiModelsSource {
     pub tls: Option<EndpointTlsConfig>,
 }
 
+impl OpenAiModelsSource {
+    /// Full model-listing URL after applying the endpoint and path defaults.
+    pub(crate) fn effective_url(&self, provider_endpoint: &str) -> String {
+        let base = self.endpoint.as_deref().unwrap_or(provider_endpoint);
+        format!("{}/{}", base.trim_end_matches('/'), self.path.trim_start_matches('/'))
+    }
+}
+
 /// Default OpenAI-compatible model-listing path.
 fn default_models_path() -> String {
     "/v1/models".to_owned()
@@ -500,6 +508,12 @@ pub struct InferenceProviderStatus {
     /// Sites matched by the site selector.
     #[serde(default)]
     pub matching_sites: Vec<String>,
+
+    /// Effective model-listing URL when discovery is configured.
+    ///
+    /// This is the requested URL, not an indication that polling succeeded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_discovery_url: Option<String>,
 
     /// Last observed generation.
     #[serde(default)]

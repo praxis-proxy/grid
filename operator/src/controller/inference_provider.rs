@@ -70,7 +70,8 @@ use crate::{
         grid_network::GridNetwork,
         grid_site::GridSite,
         inference_provider::{
-            HealthCheckConfig, InferenceProvider, InferenceProviderSpec, InferenceProviderStatus, ProviderPhase,
+            HealthCheckConfig, InferenceProvider, InferenceProviderSpec, InferenceProviderStatus, ModelDiscoveryConfig,
+            ProviderPhase,
         },
     },
     error::OperatorError,
@@ -660,14 +661,18 @@ async fn update_status(
         .unwrap_or_else(|| std::process::abort());
 
     let api: Api<InferenceProvider> = Api::all(client.clone());
+    let model_discovery_url = provider.spec.model_discovery.as_ref().map(|source| match source {
+        ModelDiscoveryConfig::OpenAiModels(openai) => openai.effective_url(&provider.spec.endpoint),
+    });
     let status = InferenceProviderStatus {
         matching_sites,
+        model_discovery_url,
         observed_generation,
         phase,
         reason,
     };
 
-    if !inference_provider_status_needs_update(provider.status.as_ref(), &status) {
+    if provider.status.as_ref() == Some(&status) {
         return Ok(());
     }
 
@@ -684,14 +689,6 @@ async fn update_status(
     Ok(())
 }
 
-/// Return whether the status subresource differs from the desired status.
-fn inference_provider_status_needs_update(
-    current: Option<&InferenceProviderStatus>,
-    desired: &InferenceProviderStatus,
-) -> bool {
-    current != Some(desired)
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -706,6 +703,7 @@ mod tests {
     fn provider_status_update_is_skipped_when_semantically_unchanged() {
         let baseline = InferenceProviderStatus {
             matching_sites: vec!["site-a".to_owned()],
+            model_discovery_url: None,
             observed_generation: 2,
             phase: ProviderPhase::Available,
             reason: None,
@@ -2608,5 +2606,13 @@ mod tests {
             traffic_policy: None,
             site_selector: crate::crd::auth::SelectorConfig::default(),
         }
+    }
+
+    /// Return whether the status subresource differs from the desired status.
+    fn inference_provider_status_needs_update(
+        current: Option<&InferenceProviderStatus>,
+        desired: &InferenceProviderStatus,
+    ) -> bool {
+        current != Some(desired)
     }
 }
