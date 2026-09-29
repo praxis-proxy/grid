@@ -729,8 +729,9 @@ loop owns this field separately from the provider's routing phase and clears
 it when discovery is disabled. The field reports the latest poll error; the
 held model set still follows its TTL independently.
 
-The bearer token comes from `spec.auth`. With `auth.manual`, requests carry no
-credentials.
+The bearer token comes from `spec.auth`. A model-discovery URL must use HTTPS
+when a bearer token is configured. With `auth.manual`, requests carry no
+credentials, so plain HTTP remains available.
 
 Discovery runs in its own loop, like the signals scraper, not in reconcile.
 Discovered sets are held in memory per provider:

@@ -74,9 +74,9 @@ impl OpenAiModels {
     /// # Errors
     ///
     /// Returns [`DiscoveryError::Config`] when `url` is not `http`/`https`,
-    /// when `tls` is set on a plain-HTTP URL, or when `token` is not a valid
-    /// header value. Returns [`DiscoveryError::Transport`] if the connector
-    /// cannot be built.
+    /// when a bearer token or TLS configuration is used with plain HTTP, or
+    /// when `token` is not a valid header value. Returns
+    /// [`DiscoveryError::Transport`] if the connector cannot be built.
     pub(crate) fn new(
         url: &str,
         token: Option<&BearerToken>,
@@ -89,6 +89,9 @@ impl OpenAiModels {
 
         match url.scheme_str() {
             Some("https") => {},
+            Some("http") if token.is_some() => {
+                return Err(DiscoveryError::Config("bearer token requires HTTPS".to_owned()));
+            },
             Some("http") if tls.is_none() => {},
             Some("http") => return Err(DiscoveryError::Config("TLS configured on a plain-HTTP URL".to_owned())),
             _ => return Err(DiscoveryError::Config("URL scheme must be http or https".to_owned())),
@@ -213,25 +216,19 @@ mod tests {
         assert_eq!(models.ok(), Some(ServedModels::default()), "empty list should succeed");
     }
 
-    #[tokio::test]
-    async fn sends_bearer_token() {
-        let url = serve(|headers: http::HeaderMap| async move {
-            if headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()) == Some("Bearer s3cret") {
-                (StatusCode::OK, r#"{"data":[{"id":"a"}]}"#)
-            } else {
-                (StatusCode::UNAUTHORIZED, "")
-            }
-        })
-        .await;
+    #[test]
+    fn bearer_token_over_http_is_rejected() {
         let token = BearerToken::new("s3cret".to_owned());
+        let result = OpenAiModels::new(
+            "http://example.com/v1/models",
+            Some(&token),
+            None,
+            Duration::from_secs(5),
+        );
 
-        let with_token = source(&url, Some(&token)).served_models().await;
-        let without_token = source(&url, None).served_models().await;
-
-        assert!(with_token.is_ok(), "token should be accepted");
         assert!(
-            matches!(without_token, Err(DiscoveryError::Status(StatusCode::UNAUTHORIZED))),
-            "missing token should be a status error"
+            matches!(result, Err(DiscoveryError::Config(message)) if message == "bearer token requires HTTPS"),
+            "HTTP must be rejected when a bearer token is configured"
         );
     }
 
