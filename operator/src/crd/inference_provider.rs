@@ -79,6 +79,8 @@ pub struct InferenceProviderSpec {
     ///
     /// When set, the operator polls the backend on a fixed cadence and holds
     /// the served-model set in memory, expiring it when polls stop succeeding.
+    /// Discovery does not yet affect routing or gossip; `spec.models` remains
+    /// the routing source.
     /// When absent, no discovery runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_discovery: Option<ModelDiscoveryConfig>,
