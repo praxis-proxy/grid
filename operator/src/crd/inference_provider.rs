@@ -278,7 +278,7 @@ pub struct EndpointTlsConfig {
     ///
     /// The Secret must contain the PEM-encoded CA certificate under the key
     /// `ca.crt` (or the key specified by `key`).  When this CA is
-    /// set, the scraper trusts **only** this CA — system root certificates
+    /// set, the scraper trusts **only** this CA; system root certificates
     /// are not consulted.
     pub ca_secret_ref: SecretRef,
 
