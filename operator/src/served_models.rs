@@ -229,21 +229,35 @@ async fn publish_discovery_status(
     polled: &[ProviderPoll],
 ) -> Result<(), OperatorError> {
     for provider in providers {
-        if let Some(name) = provider.metadata.name.as_deref() {
-            let incoming_error = polled
-                .iter()
-                .find(|ProviderPoll(_, polled_name)| polled_name == name)
-                .and_then(|ProviderPoll(outcome, _)| outcome.failure_reason());
-            let current_error = provider
-                .status
-                .as_ref()
-                .and_then(|status| status.model_discovery_error.as_deref());
-            if current_error != incoming_error {
-                patch_discovery_status(api, name, incoming_error).await?;
-            }
+        if let Some((name, incoming_error)) = discovery_error_patch_for_provider(provider, polled) {
+            patch_discovery_status(api, name, incoming_error).await?;
         }
     }
     Ok(())
+}
+
+/// Decide whether one provider's discovery error needs a status patch.
+///
+/// `None` means no patch; `Some((name, None))` clears the field; and
+/// `Some((name, Some(reason)))` sets it.
+fn discovery_error_patch_for_provider<'provider>(
+    provider: &'provider InferenceProvider,
+    polled: &[ProviderPoll],
+) -> Option<(&'provider str, Option<&'static str>)> {
+    let provider_name = provider.metadata.name.as_deref()?;
+    let incoming_error = polled
+        .iter()
+        .find(|ProviderPoll(_, name)| name == provider_name)
+        .and_then(|ProviderPoll(outcome, _)| outcome.failure_reason());
+    let current_error = provider
+        .status
+        .as_ref()
+        .and_then(|status| status.model_discovery_error.as_deref());
+    if current_error == incoming_error {
+        None
+    } else {
+        Some((provider_name, incoming_error))
+    }
 }
 
 /// Apply only the discovery-owned status field.
@@ -466,6 +480,49 @@ mod tests {
     }
 
     #[test]
+    fn discovery_error_patch_sets_failure_and_skips_unchanged_error() {
+        let provider_name = "provider-a";
+        let provider_without_status = test_provider(provider_name, None);
+        let provider_with_error = test_provider(provider_name, Some("credential"));
+        let failed = vec![ProviderPoll(
+            PollOutcome::Failed(PollError::Credential(String::new())),
+            provider_name.to_owned(),
+        )];
+        assert_eq!(
+            discovery_error_patch_for_provider(&provider_without_status, &failed),
+            Some((provider_name, Some("credential"))),
+            "a failed poll should set its reason"
+        );
+        assert_eq!(
+            discovery_error_patch_for_provider(&provider_with_error, &failed),
+            None,
+            "an unchanged error should not be patched"
+        );
+    }
+
+    #[test]
+    fn discovery_error_patch_clears_after_success_or_disabled_source() {
+        let provider_name = "provider-a";
+        let provider_with_error = test_provider(provider_name, Some("credential"));
+        assert_eq!(
+            discovery_error_patch_for_provider(
+                &provider_with_error,
+                &[ProviderPoll(
+                    PollOutcome::Served(ServedModels::default()),
+                    provider_name.to_owned(),
+                )],
+            ),
+            Some((provider_name, None)),
+            "a successful poll should clear the previous error"
+        );
+        assert_eq!(
+            discovery_error_patch_for_provider(&provider_with_error, &[]),
+            Some((provider_name, None)),
+            "removing model discovery should clear the previous error"
+        );
+    }
+
+    #[test]
     fn urls_are_joined_with_one_slash() {
         let url = |base: &str, path: &str| {
             OpenAiModelsSource {
@@ -483,6 +540,23 @@ mod tests {
     // -----------------------------------------------------------------------
     // Test Utilities
     // -----------------------------------------------------------------------
+
+    fn test_provider(name: &str, discovery_error: Option<&str>) -> InferenceProvider {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "kind": "InferenceProvider",
+            "metadata": { "name": name },
+            "spec": {
+                "gridNetworkRef": "net",
+                "providerKind": "self_hosted",
+                "backendKind": "local",
+                "endpoint": "http://provider",
+                "models": [{ "name": "model-a" }]
+            },
+            "status": discovery_error.map(|error| serde_json::json!({ "modelDiscoveryError": error }))
+        }))
+        .unwrap_or_else(|_| std::process::abort())
+    }
 
     fn round(entries: &[(&str, Option<&[&str]>)]) -> Vec<ProviderPoll> {
         entries
