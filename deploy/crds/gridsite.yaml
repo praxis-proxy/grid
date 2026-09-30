@@ -156,9 +156,10 @@ spec:
                   type: object
                 lastProbeTime:
                   description: |-
-                    Timestamp of the last probe that changed an observable status field.
+                    Timestamp of the last probe whose resulting status was persisted.
 
-                    Advances only on a status write, so a stuck-operator check must use phase.
+                    This is not a liveness heartbeat; it may remain unchanged when a probe
+                    produces no status changes.
                   nullable: true
                   type: string
                 lastTransitionTime:

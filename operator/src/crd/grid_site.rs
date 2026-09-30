@@ -158,9 +158,10 @@ pub struct GridSiteStatus {
     #[serde(default)]
     pub capabilities: SiteCapabilities,
 
-    /// Timestamp of the last probe that changed an observable status field.
+    /// Timestamp of the last probe whose resulting status was persisted.
     ///
-    /// Advances only on a status write, so a stuck-operator check must use phase.
+    /// This is not a liveness heartbeat; it may remain unchanged when a probe
+    /// produces no status changes.
     pub last_probe_time: Option<String>,
 
     /// Timestamp of the last phase transition.
