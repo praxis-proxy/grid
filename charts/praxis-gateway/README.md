@@ -121,6 +121,10 @@ helm upgrade --install praxis-gateway charts/praxis-gateway \
   --namespace praxis --set config.existingConfigMap=praxis-config
 ```
 
+In BYO mode, a live Helm install checks that ConfigMap `config.existingConfigMap` already exists in the release namespace. 
+If it is missing, the install fails before creating the Deployment. Offline `helm template` does not require a
+cluster.
+
 Set `config.key` when the configuration lives under another key. The chart
 does not manage this ConfigMap, so editing it does not restart the pods. The
 default Praxis AI image watches its configuration file and reloads routes and

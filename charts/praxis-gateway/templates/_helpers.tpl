@@ -191,6 +191,15 @@ Validate required config ConfigMap name.
 {{- include "praxis-gateway.validateBackends" . }}
 {{- else if not .Values.config.existingConfigMap }}
 {{- include "praxis-gateway.validateInlineConfig" . }}
+{{- else }}
+{{- /* In a live cluster, require the BYO ConfigMap; skip this for offline rendering. */}}
+{{- $liveCluster := lookup "v1" "Namespace" "" "kube-system" }}
+{{- if $liveCluster }}
+{{- $configMap := lookup "v1" "ConfigMap" .Release.Namespace .Values.config.existingConfigMap }}
+{{- if not $configMap }}
+{{- fail (printf "ConfigMap %q not found in namespace %q. Create it before installing grid-gateway." .Values.config.existingConfigMap .Release.Namespace) }}
+{{- end }}
+{{- end }}
 {{- end }}
 {{- end }}
 
