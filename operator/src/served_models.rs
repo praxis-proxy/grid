@@ -199,8 +199,8 @@ const DISCOVERY_FIELD_MANAGER: &str = "grid-model-discovery";
 ///
 /// # Errors
 ///
-/// Returns [`OperatorError`] when providers cannot be listed or their
-/// discovery status cannot be patched. A list failure leaves `store` untouched.
+/// Returns [`OperatorError`] when providers cannot be listed. A list failure
+/// leaves `store` untouched. Status patch failures are logged per provider.
 pub(crate) async fn discover(
     store: &ServedModelStore,
     client: &Client,
@@ -221,7 +221,7 @@ pub(crate) async fn discover(
         .await;
 
     store.refresh(&polled, Instant::now(), config.ttl);
-    publish_discovery_status(&api, &providers, &polled).await?;
+    publish_discovery_status(&api, &providers, &polled).await;
     Ok(())
 }
 
@@ -230,13 +230,14 @@ async fn publish_discovery_status(
     api: &Api<InferenceProvider>,
     providers: &[InferenceProvider],
     polled: &[ProviderPoll],
-) -> Result<(), OperatorError> {
+) {
     for provider in providers {
-        if let Some((name, incoming_error)) = discovery_error_patch_for_provider(provider, polled) {
-            patch_discovery_status(api, name, incoming_error).await?;
+        if let Some((name, incoming_error)) = discovery_error_patch_for_provider(provider, polled)
+            && let Err(error) = patch_discovery_status(api, name, incoming_error).await
+        {
+            tracing::warn!(provider = %name, %error, "failed to patch model discovery status");
         }
     }
-    Ok(())
 }
 
 /// Decide whether one provider's discovery error needs a status patch.
