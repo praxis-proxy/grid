@@ -126,7 +126,9 @@ impl OpenAiModels {
         }
 
         let body = read_bounded(response.into_body()).await?;
-        parse_model_list(&body)
+        let list: ModelList = serde_json::from_slice(&body)?;
+        let models = ServedModels::try_from_names(list.data.into_iter().map(|entry| entry.id))?;
+        Ok(models)
     }
 
     /// Build the `GET` request, with the bearer token when configured.
@@ -168,15 +170,6 @@ fn bearer_header(token: &BearerToken) -> Result<HeaderValue, DiscoveryError> {
         .map_err(|_invalid| DiscoveryError::Config("bearer token is not a valid header value".to_owned()))?;
     value.set_sensitive(true);
     Ok(value)
-}
-
-/// Parse an OpenAI-compatible model list into a validated served-model set.
-///
-/// `{"data":[{"id":"a"},{"id":"b"}]}` yields `["a", "b"]`.
-fn parse_model_list(body: &[u8]) -> Result<ServedModels, DiscoveryError> {
-    let list: ModelList = serde_json::from_slice(body)?;
-    let models = ServedModels::try_from_names(list.data.into_iter().map(|entry| entry.id))?;
-    Ok(models)
 }
 
 // ---------------------------------------------------------------------------
