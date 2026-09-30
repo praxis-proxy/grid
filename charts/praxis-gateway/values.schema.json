@@ -16,11 +16,6 @@
       "type": "object",
       "additionalProperties": false,
       "description": "Secure-by-default rendered gateway config (praxis.yaml + policy.yaml). Never emits insecure_options.",
-      "if": { "properties": { "render": { "const": true } }, "required": ["render"] },
-      "then": {
-        "required": ["model", "backends"],
-        "properties": { "model": { "minLength": 1, "pattern": "\\S" }, "backends": { "minItems": 1 } }
-      },
       "properties": {
         "render": { "type": "boolean", "description": "Render praxis.yaml + policy.yaml from these values instead of a BYO ConfigMap." },
         "localSite": { "type": "string", "pattern": "\\S", "maxLength": 256, "description": "Non-blank, at most 256 characters." },

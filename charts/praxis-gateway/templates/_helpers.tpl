@@ -83,8 +83,8 @@ Validate required config ConfigMap name.
 */}}
 {{- define "praxis-gateway.validateConfig" -}}
 {{- if .Values.gatewayConfig.render }}
-{{- if not .Values.gatewayConfig.model }}
-{{- fail "gatewayConfig.model is required when gatewayConfig.render is true" }}
+{{- if not (trim (toString .Values.gatewayConfig.model)) }}
+{{- fail "gatewayConfig.model is required when gatewayConfig.render is true, and cannot be blank" }}
 {{- end }}
 {{- if not .Values.gatewayConfig.backends }}
 {{- fail "gatewayConfig.backends needs at least one backend when gatewayConfig.render is true" }}

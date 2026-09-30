@@ -52,13 +52,14 @@ try_reject() {
   fi
 }
 
-# try_reject_msg <chart> <label> <substring> <args...>: the render must fail with substring.
+# try_reject_msg <chart> <label> <ERE> <args...>: the render must fail with output matching ERE.
+# Match field paths both Helm 3 (a.b.0) and Helm 4 (/a/b/0) print.
 try_reject_msg() {
   local chart="$1" label="$2" want="$3" out
   shift 3
   if out=$(helm template "verify-reject" "$chart" "$@" 2>&1 >/dev/null); then
     fail "schema should reject: $label"
-  elif [[ $out == *"$want"* ]]; then
+  elif grep -qE -- "$want" <<<"$out"; then
     pass "schema rejects: $label"
   else
     fail "schema rejects $label for the wrong reason: $(echo "$out" | head -3 | tr '\n' ' ')"
@@ -475,24 +476,24 @@ try_reject_msg "$GW_DIR" "networkPolicy from ipBlock ::/0 (gw)" "admits every ad
 BK1=(--set "gatewayConfig.backends[0].cluster=a" --set "gatewayConfig.backends[0].endpoints[0]=1.2.3.4:8000"
   --set "gatewayConfig.backends[0].transport.mode=plaintext")
 R0=(--set gatewayConfig.render=true --set gatewayConfig.model=q --set gatewayConfig.auth.mode=none --namespace grid-system)
-try_reject_msg "$GW_DIR" "backend without cluster (gw)" "missing property 'cluster'" "${R0[@]}" \
+try_reject_msg "$GW_DIR" "backend without cluster (gw)" "backends[./]0.*cluster" "${R0[@]}" \
   --set "gatewayConfig.backends[0].endpoints[0]=1.2.3.4:8000"
-try_reject_msg "$GW_DIR" "backend without endpoints (gw)" "missing property 'endpoints'" "${R0[@]}" \
+try_reject_msg "$GW_DIR" "backend without endpoints (gw)" "backends[./]0.*endpoints" "${R0[@]}" \
   --set "gatewayConfig.backends[0].cluster=a"
 try_reject_msg "$GW_DIR" "duplicate backend cluster (gw)" "listed twice" "${R0[@]}" "${BK1[@]}" \
   --set "gatewayConfig.backends[1].cluster=a" --set "gatewayConfig.backends[1].endpoints[0]=1.2.3.5:8000" \
   --set "gatewayConfig.backends[1].transport.mode=plaintext"
-try_reject_msg "$GW_DIR" "blank localSite (gw)" "/gatewayConfig/localSite" "${R0[@]}" "${BK1[@]}" --set gatewayConfig.localSite=""
-try_reject_msg "$GW_DIR" "blank model (gw)" "/gatewayConfig/model" "${R0[@]}" "${BK1[@]}" --set-string "gatewayConfig.model= "
-try_reject_msg "$GW_DIR" "unknown healthCheck key (gw)" "/healthCheck" "${R0[@]}" "${BK1[@]}" \
+try_reject_msg "$GW_DIR" "blank localSite (gw)" "localSite" "${R0[@]}" "${BK1[@]}" --set gatewayConfig.localSite=""
+try_reject_msg "$GW_DIR" "blank model (gw)" "gatewayConfig.model is required" "${R0[@]}" "${BK1[@]}" --set-string "gatewayConfig.model= "
+try_reject_msg "$GW_DIR" "unknown healthCheck key (gw)" "healthCheck" "${R0[@]}" "${BK1[@]}" \
   --set "gatewayConfig.backends[0].healthCheck.bogus=1"
 try_reject_msg "$GW_DIR" "api-key on the default image (gw)" "unsupported on the default image" "${R0[@]}" "${BK1[@]}" \
   --set gatewayConfig.auth.mode=api-key --set gatewayConfig.auth.validateUrl=https://maas/validate
 try_reject_msg "$GW_DIR" "api-key on the default image via an empty tag (gw)" "unsupported on the default image" "${R0[@]}" "${BK1[@]}" \
   --set image.tag="" --set gatewayConfig.auth.mode=api-key --set gatewayConfig.auth.validateUrl=https://maas/validate
-try_reject_msg "$GW_DIR" "validateUrl without a host (gw)" "/gatewayConfig/auth/validateUrl" "${R0[@]}" "${BK1[@]}" \
+try_reject_msg "$GW_DIR" "validateUrl without a host (gw)" "validateUrl" "${R0[@]}" "${BK1[@]}" \
   --set image.tag=verify-api-key --set gatewayConfig.auth.mode=api-key --set gatewayConfig.auth.validateUrl=https:///v
-try_reject_msg "$GW_DIR" "blank backend endpoint (gw)" "/endpoints/0" "${R0[@]}" --set "gatewayConfig.backends[0].cluster=a" \
+try_reject_msg "$GW_DIR" "blank backend endpoint (gw)" "endpoints[./]0" "${R0[@]}" --set "gatewayConfig.backends[0].cluster=a" \
   --set-string "gatewayConfig.backends[0].endpoints[0]= " --set "gatewayConfig.backends[0].transport.mode=plaintext"
 try_reject_msg "$GW_DIR" "networkPolicy from an empty peer (gw)" "empty peer" "${GW_REQ[@]}" \
   --set networkPolicy.enabled=true --set-json 'networkPolicy.from=[{}]' --namespace grid-system
@@ -521,10 +522,10 @@ if helm template v-probe "$GW_DIR" "${GW_REQ[@]}" --set health.readiness.httpGet
 else
   pass "an httpGet readiness probe drops the default tcpSocket"
 fi
-try_reject_msg "$GW_DIR" "render without model (gw)" "/gatewayConfig/model" \
+try_reject_msg "$GW_DIR" "render without model (gw)" "gatewayConfig.model is required" \
   --set gatewayConfig.render=true --set gatewayConfig.auth.mode=none --set gatewayConfig.backends[0].cluster=a \
   --set gatewayConfig.backends[0].endpoints[0]=1.2.3.4:8000 --namespace grid-system
-try_reject_msg "$GW_DIR" "render without backends (gw)" "/gatewayConfig/backends" \
+try_reject_msg "$GW_DIR" "render without backends (gw)" "gatewayConfig.backends needs at least one backend" \
   --set gatewayConfig.render=true --set gatewayConfig.auth.mode=none --set gatewayConfig.model=q --namespace grid-system
 try_reject_msg "$GW_DIR" "mutual_tls without sni (gw)" "sets no transport.sni" \
   --set gatewayConfig.render=true --set gatewayConfig.auth.mode=none --set gatewayConfig.model=q \
