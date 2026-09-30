@@ -82,8 +82,60 @@ Validate image digest format when provided.
 Validate required config ConfigMap name.
 */}}
 {{- define "praxis-gateway.validateConfig" -}}
-{{- if not .Values.config.existingConfigMap }}
-{{- fail "config.existingConfigMap is required" }}
+{{- if .Values.gatewayConfig.render }}
+{{- if not .Values.gatewayConfig.model }}
+{{- fail "gatewayConfig.model is required when gatewayConfig.render is true" }}
+{{- end }}
+{{- if not .Values.gatewayConfig.backends }}
+{{- fail "gatewayConfig.backends needs at least one backend when gatewayConfig.render is true" }}
+{{- end }}
+{{- $auth := .Values.gatewayConfig.auth }}
+{{- if not $auth.mode }}
+{{- fail "gatewayConfig.auth.mode is required when gatewayConfig.render is true: api-key (needs an image with praxis-policy 0.4 or later) or none (only behind an authenticating front)" }}
+{{- end }}
+{{- if and (eq $auth.mode "none") .Values.service.enabled (has .Values.service.type (list "LoadBalancer" "NodePort")) (not $auth.allowUnauthenticatedExposure) }}
+{{- fail (printf "gatewayConfig.auth.mode none with a %s Service exposes unauthenticated inference; use api-key, a ClusterIP Service behind an authenticating front, or set gatewayConfig.auth.allowUnauthenticatedExposure" .Values.service.type) }}
+{{- end }}
+{{- if and $auth.validateCA.configMap $auth.validateCA.secret }}
+{{- fail "gatewayConfig.auth.validateCA: set configMap or secret, not both" }}
+{{- end }}
+{{- if eq $auth.mode "api-key" }}
+{{- if not .Values.gatewayConfig.auth.validateUrl }}
+{{- fail "gatewayConfig.auth.validateUrl is required when gatewayConfig.auth.mode is api-key" }}
+{{- end }}
+{{- if not (hasPrefix "https://" .Values.gatewayConfig.auth.validateUrl) }}
+{{- fail "gatewayConfig.auth.validateUrl must be https: a plaintext validate call ships the credential in the clear" }}
+{{- end }}
+{{- end }}
+{{- include "praxis-gateway.validateBackends" . }}
+{{- else if not .Values.config.existingConfigMap }}
+{{- fail "config.existingConfigMap is required (or set gatewayConfig.render: true)" }}
+{{- end }}
+{{- end }}
+
+{{/*
+Validate each backend's effective transport. mutual_tls presents the gateway's
+grid identity (the tls mount) and needs a sni naming the peer; plaintext must not
+carry a sni.
+*/}}
+{{- define "praxis-gateway.validateBackends" -}}
+{{- $tlsEnabled := .Values.tls.enabled }}
+{{- range .Values.gatewayConfig.backends }}
+{{- $mode := (.transport).mode | default (ternary "mutual_tls" "plaintext" $tlsEnabled) }}
+{{- if eq $mode "mutual_tls" }}
+{{- if not $tlsEnabled }}
+{{- fail (printf "backend %q uses mutual_tls but tls.enabled is false: no grid identity is mounted to present" .cluster) }}
+{{- end }}
+{{- if not (.transport).sni }}
+{{- fail (printf "backend %q uses mutual_tls but sets no transport.sni to verify the peer against" .cluster) }}
+{{- end }}
+{{- else if eq $mode "plaintext" }}
+{{- if (.transport).sni }}
+{{- fail (printf "backend %q is plaintext but sets transport.sni; sni belongs to mutual_tls" .cluster) }}
+{{- end }}
+{{- else }}
+{{- fail (printf "backend %q transport.mode must be mutual_tls or plaintext, got %q" .cluster $mode) }}
+{{- end }}
 {{- end }}
 {{- end }}
 
@@ -103,4 +155,26 @@ Validate enabled mounts have a non-empty resource name.
 {{- if and .Values.tls.enabled (not .Values.tls.existingSecret) }}
 {{- fail "tls.existingSecret is required when tls.enabled is true" }}
 {{- end }}
+{{- if and .Values.gatewayConfig.listenerTls.enabled (not .Values.gatewayConfig.listenerTls.existingSecret) }}
+{{- fail "gatewayConfig.listenerTls.existingSecret is required when gatewayConfig.listenerTls.enabled is true" }}
+{{- end }}
+{{- end }}
+
+{{/*
+Listener port name: port.name when set, else https when the listener terminates TLS.
+*/}}
+{{- define "praxis-gateway.portName" -}}
+{{- .Values.port.name | default (ternary "https" "http" .Values.gatewayConfig.listenerTls.enabled) -}}
+{{- end }}
+
+{{/*
+Probe with an empty tcpSocket pointed at the listener port.
+*/}}
+{{- define "praxis-gateway.probe" -}}
+{{- $probe := deepCopy (index . 0) -}}
+{{- $root := index . 1 -}}
+{{- if and (hasKey $probe "tcpSocket") (not (($probe.tcpSocket | default dict).port)) -}}
+{{- $_ := set $probe "tcpSocket" (dict "port" (include "praxis-gateway.portName" $root)) -}}
+{{- end -}}
+{{- toYaml $probe -}}
 {{- end }}

@@ -17,7 +17,8 @@ imagePullSecrets: []
 
 # -- Override the chart name used in resource names.
 nameOverride: ""
-# -- Override the fully qualified app name.
+# -- Override the fully qualified app name. Left empty so naming stays release-based;
+# a grid install pins it (fullnameOverride at install) for the operator's discovery.
 fullnameOverride: ""
 # -- Labels added to all chart-managed resources.
 commonLabels: {}
@@ -50,12 +51,96 @@ config:
   # -- Key within the ConfigMap that holds praxis.yaml.
   key: "praxis.yaml"
 
+# Secure-by-default gateway config. When render is true the chart emits praxis.yaml
+# + policy.yaml (the auth chain) and never emits insecure_options; endpoints are values.
+gatewayConfig:
+  # -- Render praxis.yaml + policy.yaml from these values instead of a BYO ConfigMap.
+  render: false
+  # -- Local site name for intelligent_route locality scoring.
+  localSite: "hub"
+  # -- Model advertised on the routing candidates.
+  model: ""
+  auth:
+    # -- Caller authentication, required when render is true. api-key validates the
+    # caller's key against validateUrl and needs an image whose policy engine registers
+    # identity/api-key (praxis-policy 0.4 or later); the default image does not. none
+    # renders no policy filter and belongs only behind an authenticating front.
+    # TODO: default to api-key once the default image carries praxis-policy 0.4.
+    mode: ""
+    # -- With mode none, allow a LoadBalancer or NodePort Service. Without it the render
+    # fails, since that exposes unauthenticated inference.
+    allowUnauthenticatedExposure: false
+    # -- Remove the caller's Authorization header before routing, in either mode. The
+    # key authenticates this hop only. Forwarded grid hops authenticate by mTLS identity.
+    stripAuthorization: true
+    # -- identity/validate endpoint URL (a backend answering the validate contract: POST {"key":...} returns {"valid":...}). Must be https, or the render fails, since a plaintext validate call ships the credential in the clear.
+    validateUrl: ""
+    # -- Let the validate call reach a private address (an in-cluster Service). Sets the
+    # policy filter's allow_private_idp, which is engine-wide: every policy callout may then
+    # reach any private, loopback, or link-local address, not only validateUrl.
+    allowPrivateEndpoint: false
+    # -- CA that signs the validate endpoint's certificate (for example the OpenShift
+    # service CA). Mounted and set as SSL_CERT_FILE, which REPLACES the platform trust
+    # store for the process, so it must hold every CA the gateway's platform-trusted TLS
+    # needs. Set configMap or secret, not both. Empty keeps the platform store.
+    validateCA:
+      # -- ConfigMap holding the bundle (for example one annotated
+      # service.beta.openshift.io/inject-cabundle, key service-ca.crt).
+      configMap: ""
+      # -- Secret holding the bundle.
+      secret: ""
+      # -- Key holding the PEM bundle.
+      key: "ca.crt"
+      # -- Mount path for the bundle.
+      mountPath: "/etc/praxis/validate-ca"
+    # -- Credential prefix the resolver strips before lookup.
+    prefix: "Bearer "
+    # -- Validate call timeout (seconds).
+    timeoutSecs: 5
+  # -- CA bundle for backend TLS without a per-cluster CA. Sets praxis upstream_ca_file,
+  # which replaces the system trust store for proxied upstreams. It does not apply to the
+  # api-key validate call; use auth.validateCA for that.
+  upstreamCA:
+    # -- Existing Secret holding the CA bundle. Empty keeps the system trust store.
+    secretName: ""
+    # -- Key within the Secret that holds the PEM bundle.
+    key: "ca.crt"
+    # -- Mount path for the CA bundle.
+    mountPath: "/etc/praxis/upstream-ca"
+  # -- Backend clusters. Each renders a health_check so a literal ClusterIP routes without
+  # allow_private_upstreams, plus an explicit transport. A backend omitting transport
+  # defaults to mutual_tls when the grid identity is mounted (tls.enabled), else plaintext.
+  # mutual_tls presents that identity (tls.mountPath tls.crt/tls.key, verified against its
+  # ca.crt) and needs a sni naming the peer. plaintext is cleartext. The health_check type
+  # defaults to tcp for mutual_tls (the active http probe is plaintext and cannot reach a
+  # TLS peer) and http for plaintext. Override per backend with healthCheck.type.
+  backends: []
+  #  - cluster: site-a
+  #    endpoints: ["172.30.202.42:8000"]
+  #    healthCheck: { type: http, path: /health, intervalMs: 5000, timeoutMs: 2000 }
+  #    transport: { mode: mutual_tls, sni: site-a.grid.internal }  # or { mode: plaintext }
+  # -- Inbound TLS on the gateway listener. The default posture assumes an inbound TLS
+  # front (an OpenShift Route or a Gateway) terminates TLS and forwards to this plaintext
+  # listener. Enable to terminate TLS at the gateway itself from a mounted server cert
+  # (tls.crt/tls.key in the Secret). Works with render and with a BYO config, which must
+  # reference mountPath (a BYO config moving off tls.enabled must change its listener
+  # cert paths to it). Enabling it names the container port https. On OpenShift, set
+  # service.annotations service.beta.openshift.io/serving-cert-secret-name to the Secret
+  # name and the service CA issues the cert.
+  listenerTls:
+    # -- Terminate TLS at the gateway listener instead of at an inbound front.
+    enabled: false
+    # -- Existing Secret holding the server certificate (tls.crt) and key (tls.key).
+    existingSecret: ""
+    # -- Mount path for the listener certificate.
+    mountPath: "/etc/praxis/listener-tls"
+
 # -- Primary listener port configuration.
 port:
   # -- Container port number.
   containerPort: 8080
-  # -- Port name.
-  name: "http"
+  # -- Port name. Empty: https when gatewayConfig.listenerTls.enabled, else http.
+  name: ""
   # -- Port protocol.
   protocol: "TCP"
 
@@ -137,15 +222,14 @@ credentials: []
 # -- Probe configuration.
 health:
   # -- Readiness probe settings. Set to null to disable.
+  # A tcpSocket without a port targets the listener port.
   readiness:
-    tcpSocket:
-      port: "http"
+    tcpSocket: {}
     initialDelaySeconds: 3
     periodSeconds: 5
   # -- Liveness probe settings. Set to null to disable.
   liveness:
-    tcpSocket:
-      port: "http"
+    tcpSocket: {}
     initialDelaySeconds: 5
     periodSeconds: 10
 

@@ -70,10 +70,22 @@ AI image; these values may advance independently.
 | `podAnnotations` | object | `{}` | Pod annotations. |
 | `podSecurityContext` | object | `{}` | Extra pod securityContext (`runAsUser`, `runAsGroup`, `fsGroup`, `supplementalGroups`). |
 | `args` | list | `["--config", "/etc/praxis/praxis.yaml"]` | Container arguments. |
-| `config.existingConfigMap` | string | **required** | Name of an existing ConfigMap with the Praxis config. |
+| `config.existingConfigMap` | string | **required** unless `gatewayConfig.render` | Name of an existing ConfigMap with the Praxis config. |
 | `config.key` | string | `praxis.yaml` | Key in the ConfigMap. |
+| `gatewayConfig.render` | bool | `false` | Render praxis.yaml from these values instead of a BYO ConfigMap. Never emits `insecure_options`. |
+| `gatewayConfig.model` | string | **required** when rendered | Model advertised on the routing candidates. |
+| `gatewayConfig.backends` | list | **required** when rendered | Backend clusters (`cluster`, `endpoints`, `healthCheck`, `transport`). |
+| `gatewayConfig.localSite` | string | `hub` | Local site for locality scoring. |
+| `gatewayConfig.auth.mode` | string | **required** when rendered | `api-key` validates the caller's key and needs an image that registers `identity/api-key` (praxis-policy 0.4 or later). `none` renders no policy filter, for use only behind an authenticating front. |
+| `gatewayConfig.auth.allowUnauthenticatedExposure` | bool | `false` | With `none`, allow a LoadBalancer or NodePort Service. Without it the render fails. |
+| `gatewayConfig.auth.stripAuthorization` | bool | `true` | Remove the caller's `Authorization` before routing, in either mode. Forwarded grid hops authenticate by mTLS identity. |
+| `gatewayConfig.auth.validateUrl` | string | **required** for `api-key` | https validate endpoint. |
+| `gatewayConfig.auth.allowPrivateEndpoint` | bool | `false` | Sets `allow_private_idp`, which is engine-wide: every policy callout may reach private, loopback, and link-local addresses, not only `validateUrl`. |
+| `gatewayConfig.auth.validateCA` | object | empty | CA for the validate call (`configMap` or `secret`, `key`). Set as `SSL_CERT_FILE`, which replaces the platform trust store, so the bundle must hold every CA that platform-trusted TLS needs. |
+| `gatewayConfig.upstreamCA.secretName` | string | `""` | CA bundle for backend TLS without a per-cluster CA (`upstream_ca_file`). |
+| `gatewayConfig.listenerTls.enabled` | bool | `false` | Terminate TLS at the listener from `existingSecret`, in render or BYO mode. Names the port `https`. The cert mounts at `listenerTls.mountPath` (`/etc/praxis/listener-tls`), so a BYO config moving off `tls.enabled` must point its listener `cert_path`/`key_path` there. On OpenShift, annotate the Service with `service.beta.openshift.io/serving-cert-secret-name`. |
 | `port.containerPort` | int | `8080` | Container port. |
-| `port.name` | string | `http` | Port name. |
+| `port.name` | string | `""` | Port name. Empty: `https` with `gatewayConfig.listenerTls.enabled`, else `http`. |
 | `port.protocol` | string | `TCP` | Port protocol. |
 | `service.enabled` | bool | `true` | Create a Service. |
 | `service.type` | string | `ClusterIP` | Service type. |
@@ -96,8 +108,8 @@ AI image; these values may advance independently.
 | `tls.existingSecret` | string | `""` | Name of the TLS Secret. |
 | `tls.mountPath` | string | `/etc/praxis/tls` | Mount path for TLS files. |
 | `credentials` | list | `[]` | Credential Secret mounts (name, mountPath, optional). |
-| `health.readiness` | object | TCP socket on port `http` | Readiness probe. Set to null to disable. |
-| `health.liveness` | object | TCP socket on port `http` | Liveness probe. Set to null to disable. |
+| `health.readiness` | object | TCP socket on the listener port | Readiness probe. A `tcpSocket` without a port targets the listener port. Set to null to disable. |
+| `health.liveness` | object | TCP socket on the listener port | Liveness probe. Set to null to disable. |
 | `resources` | object | `{}` | Container resource requests and limits. |
 | `nodeSelector` | object | `{}` | Node selector. |
 | `affinity` | object | `{}` | Pod affinity rules. |

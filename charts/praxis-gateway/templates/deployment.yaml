@@ -147,9 +147,17 @@ spec:
           args:
             {{- toYaml . | nindent 12 }}
           {{- end }}
-          {{- with .Values.env }}
+          {{- $validateCA := .Values.gatewayConfig.auth.validateCA }}
+          {{- $withCA := and .Values.gatewayConfig.render (or $validateCA.configMap $validateCA.secret) }}
+          {{- if or .Values.env $withCA }}
           env:
+            {{- with .Values.env }}
             {{- toYaml . | nindent 12 }}
+            {{- end }}
+            {{- if $withCA }}
+            - name: SSL_CERT_FILE
+              value: {{ printf "%s/%s" $validateCA.mountPath $validateCA.key | quote }}
+            {{- end }}
           {{- end }}
           securityContext:
             runAsNonRoot: true
@@ -159,16 +167,16 @@ spec:
                 - ALL
             readOnlyRootFilesystem: true
           ports:
-            - name: {{ .Values.port.name }}
+            - name: {{ include "praxis-gateway.portName" . }}
               containerPort: {{ .Values.port.containerPort }}
               protocol: {{ .Values.port.protocol | quote }}
           {{- with .Values.health.readiness }}
           readinessProbe:
-            {{- toYaml . | nindent 12 }}
+            {{- include "praxis-gateway.probe" (list . $) | nindent 12 }}
           {{- end }}
           {{- with .Values.health.liveness }}
           livenessProbe:
-            {{- toYaml . | nindent 12 }}
+            {{- include "praxis-gateway.probe" (list . $) | nindent 12 }}
           {{- end }}
           {{- with .Values.resources }}
           resources:
@@ -188,6 +196,21 @@ spec:
               mountPath: {{ .Values.tls.mountPath | quote }}
               readOnly: true
             {{- end }}
+            {{- if .Values.gatewayConfig.upstreamCA.secretName }}
+            - name: upstream-ca
+              mountPath: {{ .Values.gatewayConfig.upstreamCA.mountPath | quote }}
+              readOnly: true
+            {{- end }}
+            {{- if .Values.gatewayConfig.listenerTls.enabled }}
+            - name: listener-tls
+              mountPath: {{ .Values.gatewayConfig.listenerTls.mountPath | quote }}
+              readOnly: true
+            {{- end }}
+            {{- if $withCA }}
+            - name: validate-ca
+              mountPath: {{ $validateCA.mountPath | quote }}
+              readOnly: true
+            {{- end }}
             {{- range .Values.credentials }}
             - name: credential-{{ .name }}
               mountPath: {{ .mountPath | quote }}
@@ -196,10 +219,21 @@ spec:
       volumes:
         - name: config
           configMap:
+            {{- if .Values.gatewayConfig.render }}
+            name: {{ include "praxis-gateway.fullname" . }}-config
+            items:
+              - key: "praxis.yaml"
+                path: "praxis.yaml"
+              {{- if eq (.Values.gatewayConfig.auth.mode | default "none") "api-key" }}
+              - key: "policy.yaml"
+                path: "policy.yaml"
+              {{- end }}
+            {{- else }}
             name: {{ .Values.config.existingConfigMap | quote }}
             items:
               - key: {{ .Values.config.key | quote }}
                 path: "praxis.yaml"
+            {{- end }}
         {{- if .Values.overlay.enabled }}
         {{- if .Values.overlay.sidecar.enabled }}
         - name: overlay
@@ -235,6 +269,26 @@ spec:
         - name: tls
           secret:
             secretName: {{ .Values.tls.existingSecret | quote }}
+        {{- end }}
+        {{- if .Values.gatewayConfig.upstreamCA.secretName }}
+        - name: upstream-ca
+          secret:
+            secretName: {{ .Values.gatewayConfig.upstreamCA.secretName | quote }}
+        {{- end }}
+        {{- $validateCA := .Values.gatewayConfig.auth.validateCA }}
+        {{- if and .Values.gatewayConfig.render $validateCA.configMap }}
+        - name: validate-ca
+          configMap:
+            name: {{ $validateCA.configMap | quote }}
+        {{- else if and .Values.gatewayConfig.render $validateCA.secret }}
+        - name: validate-ca
+          secret:
+            secretName: {{ $validateCA.secret | quote }}
+        {{- end }}
+        {{- if .Values.gatewayConfig.listenerTls.enabled }}
+        - name: listener-tls
+          secret:
+            secretName: {{ .Values.gatewayConfig.listenerTls.existingSecret | quote }}
         {{- end }}
         {{- range .Values.credentials }}
         - name: credential-{{ .name }}

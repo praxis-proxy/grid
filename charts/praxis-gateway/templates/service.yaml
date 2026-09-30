@@ -15,9 +15,9 @@ spec:
   loadBalancerIP: {{ .Values.service.loadBalancerIP | quote }}
   {{- end }}
   ports:
-    - name: {{ .Values.port.name }}
+    - name: {{ include "praxis-gateway.portName" . }}
       port: {{ .Values.service.port }}
-      targetPort: {{ .Values.port.name }}
+      targetPort: {{ include "praxis-gateway.portName" . }}
       protocol: {{ .Values.port.protocol | quote }}
   selector:
     {{- include "praxis-gateway.selectorLabels" . | nindent 4 }}
