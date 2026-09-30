@@ -1059,6 +1059,16 @@ CR_EOF
   echo ""
   echo "=== Praxis Gateway Kind lifecycle (chart wiring, not runtime) ==="
 
+  if helm install test-gateway-missing "$GW_DIR" \
+    --namespace grid-system \
+    --kube-context "$KCTX" \
+    --set config.existingConfigMap=missing-gateway-config \
+    --set nameOverride=test-gateway-missing 2>&1; then
+    fail "kind: BYO mode accepts a missing ConfigMap"
+  else
+    pass "kind: BYO mode fails when ConfigMap is missing"
+  fi
+
   kubectl --context "$KCTX" -n grid-system create configmap test-gateway-config \
     --from-literal=praxis.yaml='admin: {address: "0.0.0.0:9901"}' 2>/dev/null || true
 
