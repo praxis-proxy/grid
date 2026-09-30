@@ -576,7 +576,8 @@ pub struct GridNetworkSpec {
     #[serde(default)]
     pub grid_id: String,
 
-    /// Initial SWIM seed peers in host:port form. Accepts literal IPv4, bracketed IPv6, and DNS hostnames.
+    /// Initial SWIM seed peer endpoints in host:port form. Literal IPv4, bracketed
+    /// IPv6, and DNS hostnames are accepted.
     #[serde(default)]
     pub seeds: Vec<String>,
 

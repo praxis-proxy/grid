@@ -405,7 +405,9 @@ spec:
                   type: object
                 seeds:
                   default: []
-                  description: Initial SWIM seed peers in host:port form. Accepts literal IPv4, bracketed IPv6, and DNS hostnames.
+                  description: |-
+                    Initial SWIM seed peer endpoints in host:port form. Literal IPv4, bracketed
+                    IPv6, and DNS hostnames are accepted.
                   items:
                     type: string
                   type: array
