@@ -709,7 +709,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn provider_status_update_is_skipped_when_semantically_unchanged() {
+    fn reconciler_status_matches_only_reconciler_fields() {
         let baseline = InferenceProviderStatus {
             matching_sites: vec!["site-a".to_owned()],
             model_discovery_error: None,
@@ -718,14 +718,25 @@ mod tests {
             phase: ProviderPhase::Available,
             reason: None,
         };
-        assert!(!inference_provider_status_needs_update(Some(&baseline), &baseline));
+        assert!(baseline.matches_reconciler_status(&baseline));
 
-        let changed = InferenceProviderStatus {
+        let changed_phase = InferenceProviderStatus {
             phase: ProviderPhase::Degraded,
             ..baseline.clone()
         };
-        assert!(inference_provider_status_needs_update(Some(&baseline), &changed));
-        assert!(inference_provider_status_needs_update(None, &baseline));
+        assert!(!baseline.matches_reconciler_status(&changed_phase));
+
+        let changed_discovery_error = InferenceProviderStatus {
+            model_discovery_error: Some("poll failed".to_owned()),
+            ..baseline.clone()
+        };
+        assert!(baseline.matches_reconciler_status(&changed_discovery_error));
+
+        let changed_discovery_url = InferenceProviderStatus {
+            model_discovery_url: Some("https://example.com/v1/models".to_owned()),
+            ..baseline.clone()
+        };
+        assert!(!baseline.matches_reconciler_status(&changed_discovery_url));
     }
 
     // -----------------------------------------------------------------------
@@ -2616,13 +2627,5 @@ mod tests {
             traffic_policy: None,
             site_selector: crate::crd::auth::SelectorConfig::default(),
         }
-    }
-
-    /// Return whether the status subresource differs from the desired status.
-    fn inference_provider_status_needs_update(
-        current: Option<&InferenceProviderStatus>,
-        desired: &InferenceProviderStatus,
-    ) -> bool {
-        current != Some(desired)
     }
 }
