@@ -192,7 +192,7 @@ spec:
 
                             The Secret must contain the PEM-encoded CA certificate under the key
                             `ca.crt` (or the key specified by `key`).  When this CA is
-                            set, the scraper trusts **only** this CA — system root certificates
+                            set, the scraper trusts **only** this CA; system root certificates
                             are not consulted.
                           properties:
                             key:
@@ -414,7 +414,7 @@ spec:
 
                             The Secret must contain the PEM-encoded CA certificate under the key
                             `ca.crt` (or the key specified by `key`).  When this CA is
-                            set, the scraper trusts **only** this CA — system root certificates
+                            set, the scraper trusts **only** this CA; system root certificates
                             are not consulted.
                           properties:
                             key:
@@ -481,7 +481,7 @@ spec:
                 modelDiscovery:
                   description: |-
                     Where to discover the models this provider serves.
-                
+
                     When set, the operator polls the backend on a fixed cadence and holds
                     the served-model set in memory, expiring it when polls stop succeeding.
                     Discovery does not yet affect routing or gossip; `spec.models` remains
@@ -495,7 +495,7 @@ spec:
                     openAiModels:
                       description: |-
                         OpenAI-compatible `GET /v1/models` (vLLM, `KServe`, `OpenAI`).
-                
+
                         Reads `data[].id` from the response. The response is rejected as a
                         whole when it is not valid JSON, has a blank, overlong, or duplicate
                         id, or lists more models than the operator's cap. A rejected response
@@ -514,7 +514,7 @@ spec:
                         tls:
                           description: |-
                             TLS configuration for the model-listing endpoint.
-                
+
                             When absent, system root certificates are used.
                           nullable: true
                           properties:
@@ -522,16 +522,16 @@ spec:
                               description: |-
                                 Reference to a Secret containing the CA certificate PEM for server
                                 verification.
-                
+
                                 The Secret must contain the PEM-encoded CA certificate under the key
                                 `ca.crt` (or the key specified by `key`).  When this CA is
-                                set, the scraper trusts **only** this CA — system root certificates
+                                set, the scraper trusts **only** this CA; system root certificates
                                 are not consulted.
                               properties:
                                 key:
                                   description: |-
                                     Key within the Secret's `data` map.
-                
+
                                     Required when the Secret holds multiple keys (e.g. credential references
                                     in `InferenceProvider.spec.auth.secretRef`).  Omit only when the entire
                                     Secret is consumed (e.g. TLS `ca_secret_ref`).
@@ -554,11 +554,11 @@ spec:
                               description: |-
                                 Reference to a Secret containing the client certificate and private
                                 key for mutual TLS.
-                
+
                                 When set, the scraper presents this identity during the TLS handshake.
                                 The Secret must contain `tls.crt` (or `certificate_key`) and
                                 `tls.key` (or `private_key_key`) in PEM format.
-                
+
                                 When absent, the scraper performs one-way TLS only (server verification
                                 with the CA from `ca_secret_ref`, no client certificate).
                               nullable: true
