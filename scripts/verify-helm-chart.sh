@@ -52,6 +52,19 @@ try_reject() {
   fi
 }
 
+# try_reject_msg <chart> <label> <substring> <args...>: the render must fail with substring.
+try_reject_msg() {
+  local chart="$1" label="$2" want="$3" out
+  shift 3
+  if out=$(helm template "verify-reject" "$chart" "$@" 2>&1 >/dev/null); then
+    fail "schema should reject: $label"
+  elif [[ $out == *"$want"* ]]; then
+    pass "schema rejects: $label"
+  else
+    fail "schema rejects $label for the wrong reason: $(echo "$out" | head -3 | tr '\n' ' ')"
+  fi
+}
+
 # ======================================================================
 # Grid Operator Chart
 # ======================================================================
@@ -342,7 +355,7 @@ echo "=== Secure gateway config (gateway) ==="
 SECURE_ARGS=(
   --set gatewayConfig.render=true
   --set gatewayConfig.model=qwen3
-  --set gatewayConfig.auth.mode=api-key
+  --set gatewayConfig.auth.mode=api-key --set image.tag=verify-api-key
   --set gatewayConfig.auth.validateUrl=https://maas-api.svc:8443/internal/v1/api-keys/validate
   --set gatewayConfig.upstreamCA.secretName=upstream-ca
   --set tls.enabled=true --set tls.existingSecret=grid-identity
@@ -401,6 +414,15 @@ if echo "$CA_RENDER" | grep -A1 'name: SSL_CERT_FILE' | grep -q '/etc/praxis/val
 else
   fail "secure config: validateCA should mount the bundle and set SSL_CERT_FILE"
 fi
+NP_GW=$(helm template verify-np "$GW_DIR" "${GW_RENDER[@]}" --set networkPolicy.enabled=true \
+  --set-json 'networkPolicy.from=[{"podSelector":{"matchLabels":{"app":"front"}}}]' \
+  --show-only templates/networkpolicy.yaml --namespace grid-system 2>&1)
+if echo "$NP_GW" | grep -q 'kind: NetworkPolicy' && echo "$NP_GW" | grep -q 'app: front' \
+    && echo "$NP_GW" | grep -q 'port: 8080'; then
+  pass "networkPolicy: limits listener ingress to the listed peers"
+else
+  fail "networkPolicy: should limit listener ingress to the listed peers"
+fi
 try_template "$GW_DIR" "none + LoadBalancer with allowUnauthenticatedExposure (gw)" "${GW_RENDER[@]}" \
   --set service.type=LoadBalancer --set gatewayConfig.auth.allowUnauthenticatedExposure=true --namespace grid-system
 if echo "$SECURE_RENDER" | grep -q 'sni: "site-a.grid.internal"' && echo "$SECURE_RENDER" | grep -q 'verify: true'; then
@@ -431,35 +453,92 @@ else
   fail "secure config: plaintext backend health_check should default to http"
 fi
 
-try_reject "$GW_DIR" "http validateUrl (gw)" "${GW_RENDER[@]}" \
-  --set gatewayConfig.auth.mode=api-key --set gatewayConfig.auth.validateUrl=http://maas/validate --namespace grid-system
-try_reject "$GW_DIR" "api-key without validateUrl (gw)" "${GW_RENDER[@]}" \
+try_reject_msg "$GW_DIR" "http validateUrl (gw)" "https://" "${GW_RENDER[@]}" \
+  --set image.tag=verify-api-key --set gatewayConfig.auth.mode=api-key --set gatewayConfig.auth.validateUrl=http://maas/validate --namespace grid-system
+try_reject_msg "$GW_DIR" "api-key without validateUrl (gw)" "validateUrl is required" "${GW_RENDER[@]}" \
   --set gatewayConfig.auth.mode=api-key --namespace grid-system
-try_reject "$GW_DIR" "render without auth.mode (gw)" \
+try_reject_msg "$GW_DIR" "render without auth.mode (gw)" "auth.mode is required" \
   --set gatewayConfig.render=true --set gatewayConfig.model=q --set "gatewayConfig.backends[0].cluster=a" \
   --set "gatewayConfig.backends[0].endpoints[0]=1.2.3.4:8000" --namespace grid-system
-try_reject "$GW_DIR" "none + LoadBalancer (gw)" "${GW_RENDER[@]}" --set service.type=LoadBalancer --namespace grid-system
-try_reject "$GW_DIR" "none + NodePort (gw)" "${GW_RENDER[@]}" --set service.type=NodePort --namespace grid-system
-try_reject "$GW_DIR" "validateCA configMap and secret (gw)" "${SECURE_ARGS[@]}" \
+try_reject_msg "$GW_DIR" "none + LoadBalancer (gw)" "exposes unauthenticated inference" "${GW_RENDER[@]}" --set service.type=LoadBalancer --namespace grid-system
+try_reject_msg "$GW_DIR" "none + NodePort (gw)" "exposes unauthenticated inference" "${GW_RENDER[@]}" --set service.type=NodePort --namespace grid-system
+try_reject_msg "$GW_DIR" "validateCA configMap and secret (gw)" "set configMap or secret, not both" "${SECURE_ARGS[@]}" \
   --set gatewayConfig.auth.validateCA.configMap=a --set gatewayConfig.auth.validateCA.secret=b --namespace grid-system
-try_reject "$GW_DIR" "render without model (gw)" \
+try_reject_msg "$GW_DIR" "networkPolicy enabled without from (gw)" "needs at least one peer" "${GW_REQ[@]}" \
+  --set networkPolicy.enabled=true --namespace grid-system
+try_reject_msg "$GW_DIR" "networkPolicy from an empty namespaceSelector (gw)" "admits every pod in every namespace" "${GW_REQ[@]}" \
+  --set networkPolicy.enabled=true --set-json 'networkPolicy.from=[{"namespaceSelector":{},"podSelector":{}}]' \
+  --namespace grid-system
+try_reject_msg "$GW_DIR" "networkPolicy from ipBlock ::/0 (gw)" "admits every address" "${GW_REQ[@]}" \
+  --set networkPolicy.enabled=true --set-json 'networkPolicy.from=[{"ipBlock":{"cidr":"::/0"}}]' \
+  --namespace grid-system
+BK1=(--set "gatewayConfig.backends[0].cluster=a" --set "gatewayConfig.backends[0].endpoints[0]=1.2.3.4:8000"
+  --set "gatewayConfig.backends[0].transport.mode=plaintext")
+R0=(--set gatewayConfig.render=true --set gatewayConfig.model=q --set gatewayConfig.auth.mode=none --namespace grid-system)
+try_reject_msg "$GW_DIR" "backend without cluster (gw)" "missing property 'cluster'" "${R0[@]}" \
+  --set "gatewayConfig.backends[0].endpoints[0]=1.2.3.4:8000"
+try_reject_msg "$GW_DIR" "backend without endpoints (gw)" "missing property 'endpoints'" "${R0[@]}" \
+  --set "gatewayConfig.backends[0].cluster=a"
+try_reject_msg "$GW_DIR" "duplicate backend cluster (gw)" "listed twice" "${R0[@]}" "${BK1[@]}" \
+  --set "gatewayConfig.backends[1].cluster=a" --set "gatewayConfig.backends[1].endpoints[0]=1.2.3.5:8000" \
+  --set "gatewayConfig.backends[1].transport.mode=plaintext"
+try_reject_msg "$GW_DIR" "blank localSite (gw)" "/gatewayConfig/localSite" "${R0[@]}" "${BK1[@]}" --set gatewayConfig.localSite=""
+try_reject_msg "$GW_DIR" "blank model (gw)" "/gatewayConfig/model" "${R0[@]}" "${BK1[@]}" --set-string "gatewayConfig.model= "
+try_reject_msg "$GW_DIR" "unknown healthCheck key (gw)" "/healthCheck" "${R0[@]}" "${BK1[@]}" \
+  --set "gatewayConfig.backends[0].healthCheck.bogus=1"
+try_reject_msg "$GW_DIR" "api-key on the default image (gw)" "unsupported on the default image" "${R0[@]}" "${BK1[@]}" \
+  --set gatewayConfig.auth.mode=api-key --set gatewayConfig.auth.validateUrl=https://maas/validate
+try_reject_msg "$GW_DIR" "api-key on the default image via an empty tag (gw)" "unsupported on the default image" "${R0[@]}" "${BK1[@]}" \
+  --set image.tag="" --set gatewayConfig.auth.mode=api-key --set gatewayConfig.auth.validateUrl=https://maas/validate
+try_reject_msg "$GW_DIR" "validateUrl without a host (gw)" "/gatewayConfig/auth/validateUrl" "${R0[@]}" "${BK1[@]}" \
+  --set image.tag=verify-api-key --set gatewayConfig.auth.mode=api-key --set gatewayConfig.auth.validateUrl=https:///v
+try_reject_msg "$GW_DIR" "blank backend endpoint (gw)" "/endpoints/0" "${R0[@]}" --set "gatewayConfig.backends[0].cluster=a" \
+  --set-string "gatewayConfig.backends[0].endpoints[0]= " --set "gatewayConfig.backends[0].transport.mode=plaintext"
+try_reject_msg "$GW_DIR" "networkPolicy from an empty peer (gw)" "empty peer" "${GW_REQ[@]}" \
+  --set networkPolicy.enabled=true --set-json 'networkPolicy.from=[{}]' --namespace grid-system
+try_template "$GW_DIR" "networkPolicy from all addresses with except (gw)" "${GW_REQ[@]}" --set networkPolicy.enabled=true \
+  --set-json 'networkPolicy.from=[{"ipBlock":{"cidr":"0.0.0.0/0","except":["10.0.0.0/8"]}}]' --namespace grid-system
+try_reject_msg "$GW_DIR" "api-key validateUrl IP literal (gw)" "not an IP address" "${R0[@]}" "${BK1[@]}" \
+  --set image.tag=verify-api-key --set gatewayConfig.auth.mode=api-key --set gatewayConfig.auth.validateUrl=https://10.0.0.1:8443/v
+try_reject_msg "$GW_DIR" "networkPolicy from ipBlock 0.0.0.0/0 (gw)" "admits every address" "${GW_REQ[@]}" \
+  --set networkPolicy.enabled=true --set-json 'networkPolicy.from=[{"ipBlock":{"cidr":"0.0.0.0/0"}}]' --namespace grid-system
+try_reject_msg "$GW_DIR" "networkPolicy from a bare namespaceSelector (gw)" "admits every pod in every namespace" "${GW_REQ[@]}" \
+  --set networkPolicy.enabled=true --set-json 'networkPolicy.from=[{"namespaceSelector":{}}]' --namespace grid-system
+if helm template v-hc "$GW_DIR" "${R0[@]}" "${BK1[@]}" --set "gatewayConfig.backends[0].healthCheck.type=tcp" \
+    --show-only templates/gateway-config.yaml | awk '/health_check:/{f=1} f&&/path:/{print; exit}' | grep -q path; then
+  fail "tcp health_check should carry no path"
+else
+  pass "tcp health_check carries no path"
+fi
+if [ "$(helm template v-ca "$GW_DIR" "${R0[@]}" "${BK1[@]}" --set gatewayConfig.auth.validateCA.configMap=x | grep -c 'SSL_CERT_FILE')" = 0 ]; then
+  pass "validateCA is ignored outside api-key"
+else
+  fail "validateCA should apply only with api-key"
+fi
+if helm template v-probe "$GW_DIR" "${GW_REQ[@]}" --set health.readiness.httpGet.path=/ --set health.readiness.httpGet.port=http \
+    --show-only templates/deployment.yaml --namespace grid-system | sed -n '/readinessProbe/,/livenessProbe/p' | grep -q tcpSocket; then
+  fail "an httpGet readiness probe should drop the default tcpSocket"
+else
+  pass "an httpGet readiness probe drops the default tcpSocket"
+fi
+try_reject_msg "$GW_DIR" "render without model (gw)" "/gatewayConfig/model" \
   --set gatewayConfig.render=true --set gatewayConfig.auth.mode=none --set gatewayConfig.backends[0].cluster=a \
   --set gatewayConfig.backends[0].endpoints[0]=1.2.3.4:8000 --namespace grid-system
-try_reject "$GW_DIR" "render without backends (gw)" \
+try_reject_msg "$GW_DIR" "render without backends (gw)" "/gatewayConfig/backends" \
   --set gatewayConfig.render=true --set gatewayConfig.auth.mode=none --set gatewayConfig.model=q --namespace grid-system
-try_reject "$GW_DIR" "mutual_tls without sni (gw)" \
+try_reject_msg "$GW_DIR" "mutual_tls without sni (gw)" "sets no transport.sni" \
   --set gatewayConfig.render=true --set gatewayConfig.auth.mode=none --set gatewayConfig.model=q \
   --set tls.enabled=true --set tls.existingSecret=id \
   --set gatewayConfig.backends[0].cluster=a --set gatewayConfig.backends[0].endpoints[0]=1.2.3.4:8000 --namespace grid-system
-try_reject "$GW_DIR" "mutual_tls without grid identity (gw)" \
+try_reject_msg "$GW_DIR" "mutual_tls without grid identity (gw)" "tls.enabled is false" \
   --set gatewayConfig.render=true --set gatewayConfig.auth.mode=none --set gatewayConfig.model=q \
   --set gatewayConfig.backends[0].cluster=a --set gatewayConfig.backends[0].endpoints[0]=1.2.3.4:8000 \
   --set gatewayConfig.backends[0].transport.mode=mutual_tls --set gatewayConfig.backends[0].transport.sni=a.grid --namespace grid-system
-try_reject "$GW_DIR" "plaintext with sni (gw)" \
+try_reject_msg "$GW_DIR" "plaintext with sni (gw)" "sni belongs to mutual_tls" \
   --set gatewayConfig.render=true --set gatewayConfig.auth.mode=none --set gatewayConfig.model=q \
   --set gatewayConfig.backends[0].cluster=a --set gatewayConfig.backends[0].endpoints[0]=1.2.3.4:8000 \
   --set gatewayConfig.backends[0].transport.mode=plaintext --set gatewayConfig.backends[0].transport.sni=x --namespace grid-system
-try_reject "$GW_DIR" "listenerTls enabled no secret (gw)" "${GW_REQ[@]}" \
+try_reject_msg "$GW_DIR" "listenerTls enabled no secret (gw)" "listenerTls.existingSecret is required" "${GW_REQ[@]}" \
   --set gatewayConfig.listenerTls.enabled=true --namespace grid-system
 
 # listenerTls names the port https (render or BYO); probes follow the port name.

@@ -19,11 +19,11 @@
       "if": { "properties": { "render": { "const": true } }, "required": ["render"] },
       "then": {
         "required": ["model", "backends"],
-        "properties": { "model": { "minLength": 1 }, "backends": { "minItems": 1 } }
+        "properties": { "model": { "minLength": 1, "pattern": "\\S" }, "backends": { "minItems": 1 } }
       },
       "properties": {
         "render": { "type": "boolean", "description": "Render praxis.yaml + policy.yaml from these values instead of a BYO ConfigMap." },
-        "localSite": { "type": "string" },
+        "localSite": { "type": "string", "pattern": "\\S", "maxLength": 256, "description": "Non-blank, at most 256 characters." },
         "model": { "type": "string" },
         "auth": {
           "type": "object",
@@ -43,7 +43,7 @@
                 "mountPath": { "type": "string" }
               }
             },
-            "validateUrl": { "type": "string", "pattern": "^(https://.*)?$" },
+            "validateUrl": { "type": "string", "pattern": "^(https://[^/?#\\s]+.*)?$" },
             "allowPrivateEndpoint": { "type": "boolean", "description": "Sets allow_private_idp: every policy callout may reach private, loopback, and link-local addresses." },
             "prefix": { "type": "string" },
             "timeoutSecs": { "type": "integer" }
@@ -64,10 +64,22 @@
           "items": {
             "type": "object",
             "additionalProperties": false,
+            "required": ["cluster", "endpoints"],
             "properties": {
-              "cluster": { "type": "string" },
-              "endpoints": { "type": "array", "items": { "type": "string" } },
-              "healthCheck": { "type": "object" },
+              "cluster": { "type": "string", "minLength": 1, "pattern": "\\S" },
+              "endpoints": { "type": "array", "minItems": 1, "items": { "type": "string", "pattern": "^\\S+:[0-9]+$" } },
+              "healthCheck": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "type": { "enum": ["http", "tcp"] },
+                  "path": { "type": "string" },
+                  "intervalMs": { "type": "integer", "minimum": 1 },
+                  "timeoutMs": { "type": "integer", "minimum": 1 },
+                  "healthyThreshold": { "type": "integer", "minimum": 1 },
+                  "unhealthyThreshold": { "type": "integer", "minimum": 1 }
+                }
+              },
               "transport": {
                 "type": "object",
                 "additionalProperties": false,
@@ -90,6 +102,15 @@
             "mountPath": { "type": "string" }
           }
         }
+      }
+    },
+    "networkPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "NetworkPolicy limiting ingress to the listener port.",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "from": { "type": "array", "items": { "type": "object" } }
       }
     },
     "replicaCount": {

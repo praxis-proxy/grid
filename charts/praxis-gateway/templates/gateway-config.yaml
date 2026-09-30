@@ -77,8 +77,11 @@ data:
                   {{- end }}
                 health_check:
                   {{- /* mutual_tls defaults to a tcp probe. The active http probe is plaintext and cannot reach a TLS peer. A tcp connect works and still satisfies the present-health_check SSRF-skip guard. */}}
-                  type: {{ $hc.type | default (ternary "tcp" "http" (eq $mode "mutual_tls")) | quote }}
+                  {{- $hcType := $hc.type | default (ternary "tcp" "http" (eq $mode "mutual_tls")) }}
+                  type: {{ $hcType | quote }}
+                  {{- if eq $hcType "http" }}
                   path: {{ $hc.path | default "/health" | quote }}
+                  {{- end }}
                   interval_ms: {{ $hc.intervalMs | default 5000 }}
                   timeout_ms: {{ $hc.timeoutMs | default 2000 }}
                   healthy_threshold: {{ $hc.healthyThreshold | default 1 }}

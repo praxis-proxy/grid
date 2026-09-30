@@ -36,3 +36,25 @@ Credential mounts:
   - {{ .name }} -> {{ .mountPath }}{{ if .optional }} (optional){{ end }}
 {{- end }}
 {{- end }}
+{{- if and .Values.gatewayConfig.render (not .Values.gatewayConfig.auth.stripAuthorization) }}
+
+WARNING: gatewayConfig.auth.stripAuthorization is false. The caller's Authorization
+header reaches every backend and cross-site peer. Use this only when the backend
+validates that same credential.
+{{- end }}
+{{- $sameNsAll := false }}
+{{- range .Values.networkPolicy.from }}
+{{- if and (hasKey . "podSelector") (include "praxis-gateway.selectsAll" .podSelector) (not (hasKey . "namespaceSelector")) (not .ipBlock) }}
+{{- $sameNsAll = true }}
+{{- end }}
+{{- end }}
+{{- if and .Values.gatewayConfig.render (eq .Values.gatewayConfig.auth.mode "none") (or (not .Values.networkPolicy.enabled) $sameNsAll) }}
+
+NOTE: gatewayConfig.auth.mode is none and
+{{- if .Values.networkPolicy.enabled }} networkPolicy.from admits every pod in this namespace
+({podSelector: {}}).
+{{- else }} no NetworkPolicy limits ingress.
+{{- end }}
+Anything that exposes the pod outside this chart serves unauthenticated inference.
+Limit networkPolicy.from to the authenticating front.
+{{- end }}

@@ -106,6 +106,13 @@ Validate required config ConfigMap name.
 {{- if not (hasPrefix "https://" .Values.gatewayConfig.auth.validateUrl) }}
 {{- fail "gatewayConfig.auth.validateUrl must be https: a plaintext validate call ships the credential in the clear" }}
 {{- end }}
+{{- if regexMatch "^https://(\\[|[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+([:/]|$))" .Values.gatewayConfig.auth.validateUrl }}
+{{- fail "gatewayConfig.auth.validateUrl must name a host, not an IP address: https to an IP literal has no SNI to verify" }}
+{{- end }}
+{{- /* The chart-default image predates praxis-policy 0.4, which adds identity/api-key. */}}
+{{- if eq (include "praxis-gateway.image" .) "ghcr.io/praxis-proxy/ai:0.4.0" }}
+{{- fail "gatewayConfig.auth.mode api-key is unsupported on the default image ghcr.io/praxis-proxy/ai:0.4.0: its policy engine lacks identity/api-key (praxis-policy 0.4 or later). Set image to a build that registers it, or use auth.mode none behind an authenticating front." }}
+{{- end }}
 {{- end }}
 {{- include "praxis-gateway.validateBackends" . }}
 {{- else if not .Values.config.existingConfigMap }}
@@ -120,7 +127,12 @@ carry a sni.
 */}}
 {{- define "praxis-gateway.validateBackends" -}}
 {{- $tlsEnabled := .Values.tls.enabled }}
+{{- $seen := dict }}
 {{- range .Values.gatewayConfig.backends }}
+{{- if hasKey $seen .cluster }}
+{{- fail (printf "gatewayConfig.backends: cluster %q is listed twice; cluster names must be unique" .cluster) }}
+{{- end }}
+{{- $_ := set $seen .cluster true }}
 {{- $mode := (.transport).mode | default (ternary "mutual_tls" "plaintext" $tlsEnabled) }}
 {{- if eq $mode "mutual_tls" }}
 {{- if not $tlsEnabled }}
@@ -173,8 +185,21 @@ Probe with an empty tcpSocket pointed at the listener port.
 {{- define "praxis-gateway.probe" -}}
 {{- $probe := deepCopy (index . 0) -}}
 {{- $root := index . 1 -}}
-{{- if and (hasKey $probe "tcpSocket") (not (($probe.tcpSocket | default dict).port)) -}}
+{{- if or $probe.httpGet $probe.exec $probe.grpc -}}
+{{- $_ := unset $probe "tcpSocket" -}}
+{{- else if and (hasKey $probe "tcpSocket") (not (($probe.tcpSocket | default dict).port)) -}}
 {{- $_ := set $probe "tcpSocket" (dict "port" (include "praxis-gateway.portName" $root)) -}}
 {{- end -}}
 {{- toYaml $probe -}}
+{{- end }}
+
+{{/*
+Whether a label selector matches everything: absent, {}, or empty matchLabels and
+matchExpressions. Emits "true" or nothing.
+*/}}
+{{- define "praxis-gateway.selectsAll" -}}
+{{- $sel := . | default dict -}}
+{{- if and (not $sel.matchLabels) (not $sel.matchExpressions) -}}
+true
+{{- end -}}
 {{- end }}

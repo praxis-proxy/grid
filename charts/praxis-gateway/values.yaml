@@ -63,15 +63,19 @@ gatewayConfig:
   auth:
     # -- Caller authentication, required when render is true. api-key validates the
     # caller's key against validateUrl and needs an image whose policy engine registers
-    # identity/api-key (praxis-policy 0.4 or later); the default image does not. none
+    # identity/api-key (praxis-policy 0.4 or later); the render refuses it on the default
+    # ai:0.4.0 image. none
     # renders no policy filter and belongs only behind an authenticating front.
     # TODO: default to api-key once the default image carries praxis-policy 0.4.
     mode: ""
     # -- With mode none, allow a LoadBalancer or NodePort Service. Without it the render
-    # fails, since that exposes unauthenticated inference.
+    # fails, since that exposes unauthenticated inference. The guard only sees this chart's
+    # Service; see networkPolicy for exposure created outside the chart.
     allowUnauthenticatedExposure: false
     # -- Remove the caller's Authorization header before routing, in either mode. The
     # key authenticates this hop only. Forwarded grid hops authenticate by mTLS identity.
+    # false forwards the caller's key or bearer to every backend and cross-site peer; use
+    # it only when the backend validates that same credential.
     stripAuthorization: true
     # -- identity/validate endpoint URL (a backend answering the validate contract: POST {"key":...} returns {"valid":...}). Must be https, or the render fails, since a plaintext validate call ships the credential in the clear.
     validateUrl: ""
@@ -81,8 +85,11 @@ gatewayConfig:
     allowPrivateEndpoint: false
     # -- CA that signs the validate endpoint's certificate (for example the OpenShift
     # service CA). Mounted and set as SSL_CERT_FILE, which REPLACES the platform trust
-    # store for the process, so it must hold every CA the gateway's platform-trusted TLS
-    # needs. Set configMap or secret, not both. Empty keeps the platform store.
+    # store for the process: the validate call and https backends without a per-backend CA
+    # or upstreamCA use it; mutual_tls backends and upstreamCA do not. Build the bundle as
+    # the image's /etc/ssl/certs/ca-certificates.crt plus the service CA, or set upstreamCA
+    # for public https backends. Set configMap or secret, not both. Empty keeps the
+    # platform store.
     validateCA:
       # -- ConfigMap holding the bundle (for example one annotated
       # service.beta.openshift.io/inject-cabundle, key service-ca.crt).
@@ -143,6 +150,22 @@ port:
   name: ""
   # -- Port protocol.
   protocol: "TCP"
+
+# -- NetworkPolicy that limits which pods can reach the listener port, where the CNI
+# enforces NetworkPolicy. It is not authentication. With auth.mode none it narrows
+# exposure the Service guard cannot see (oc expose, another Service, an HTTPRoute): list
+# only the authenticating front. Node and host-network traffic handling is CNI-specific
+# (OVN-Kubernetes: the policy-group.network.openshift.io/host-network namespace label), and
+# a LoadBalancer with externalTrafficPolicy Cluster can SNAT clients to node IPs.
+networkPolicy:
+  # -- Render the NetworkPolicy.
+  enabled: false
+  # -- NetworkPolicyPeer entries allowed to reach the listener. Required when enabled.
+  # {podSelector: {}} admits every pod in this namespace. An empty namespaceSelector and an
+  # ipBlock of 0.0.0.0/0 or ::/0 admit everyone and fail the render.
+  from: []
+  # - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: redhat-ai-gateway-infra}}
+  #   podSelector: {matchLabels: {app: authenticating-front}}
 
 # -- Gateway Service configuration.
 service:

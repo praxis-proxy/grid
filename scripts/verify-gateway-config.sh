@@ -14,7 +14,11 @@ set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 GW_DIR="$ROOT/charts/praxis-gateway"
-DEFAULT_GATEWAY_IMAGE=${DEFAULT_GATEWAY_IMAGE:-ghcr.io/praxis-proxy/ai:0.4.0}
+# The chart's own default image, so the check tracks the chart.
+chart_image() {
+  helm show values "$GW_DIR" | awk '/^image:/{f=1; next} f&&/^[^ ]/{exit} f&&/repository:/{r=$2} f&&/tag:/{t=$2} END{gsub(/"/,"",r); gsub(/"/,"",t); print r":"t}'
+}
+DEFAULT_GATEWAY_IMAGE=${DEFAULT_GATEWAY_IMAGE:-$(chart_image)}
 API_KEY_IMAGE=${API_KEY_IMAGE:-}
 API_KEY_IMAGE_CONFIG_FLAG=${API_KEY_IMAGE_CONFIG_FLAG---config}
 FIXTURE_IMAGE=${FIXTURE_IMAGE:-docker.io/library/python:3.12-alpine}
@@ -88,6 +92,7 @@ wait_up() {
     code=$(chat "$port" "$@")
     case $code in 000 | 502 | 503) sleep 1 ;; *) return 0 ;; esac
   done
+  return 1
 }
 
 seen_auth() { grep -o '"authorization": [^}]*' "$WORK/out" || true; }
@@ -121,13 +126,13 @@ else
   fail "none: rejected by $DEFAULT_GATEWAY_IMAGE: $(tail -1 "$WORK/none.log")"
 fi
 port=$(gateway none "$DEFAULT_GATEWAY_IMAGE" --config "$WORK/none")
-wait_up "$port"
+wait_up "$port" || fail "none: gateway never answered"
 check "none: request reaches the backend" 200 "$(chat "$port" -H 'Authorization: Bearer caller')"
 check "none: backend never sees Authorization" '"authorization": null' "$(seen_auth)"
 
 render "$WORK/keep" "${BASE[@]}" --set gatewayConfig.auth.mode=none --set gatewayConfig.auth.stripAuthorization=false
 port=$(gateway keep "$DEFAULT_GATEWAY_IMAGE" --config "$WORK/keep")
-wait_up "$port"
+wait_up "$port" || fail "keep: gateway never answered"
 chat "$port" -H 'Authorization: Bearer caller' >/dev/null
 check "none, stripAuthorization=false: backend sees Authorization (the echo is live)" \
   '"authorization": "Bearer caller"' "$(seen_auth)"
@@ -156,17 +161,24 @@ class H(http.server.BaseHTTPRequestHandler):
         body = json.dumps({"valid": key == "sk-good", "username": "u", "groups": []}).encode()
         self.send_response(200); self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
-server = http.server.HTTPServer(("0.0.0.0", 9443), H)
 ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); ctx.load_cert_chain("/ca/tls.crt", "/ca/tls.key")
-server.socket = ctx.wrap_socket(server.socket, server_side=True)
-server.serve_forever()' >/dev/null
-  APIKEY=(--set gatewayConfig.auth.mode=api-key --set gatewayConfig.auth.allowPrivateEndpoint=true
+class S(http.server.HTTPServer):
+    def get_request(self):
+        sock, addr = self.socket.accept()
+        try:
+            return ctx.wrap_socket(sock, server_side=True), addr
+        except ssl.SSLError as e:
+            print("handshake failed:", e, flush=True)
+            raise
+S(("0.0.0.0", 9443), H).serve_forever()' >/dev/null
+  # A non-default tag: the chart refuses api-key on its default image.
+  APIKEY=(--set image.tag=api-key-image --set gatewayConfig.auth.mode=api-key --set gatewayConfig.auth.allowPrivateEndpoint=true
     --set gatewayConfig.auth.validateUrl=https://validate:9443/v)
 
   render "$WORK/apikey" "${BASE[@]}" "${APIKEY[@]}" \
     --set gatewayConfig.auth.validateCA.configMap=service-ca --set gatewayConfig.auth.validateCA.key=service-ca.crt
   port=$(gateway apikey "$API_KEY_IMAGE" "$API_KEY_IMAGE_CONFIG_FLAG" "$WORK/apikey" "$ca")
-  wait_up "$port" -H 'Authorization: Bearer sk-good'
+  wait_up "$port" -H 'Authorization: Bearer sk-good' || fail "api-key: gateway never answered"
   check "api-key: no key gets 401" 401 "$(chat "$port")"
   check "api-key: bad key gets 401" 401 "$(chat "$port" -H 'Authorization: Bearer sk-bad')"
   check "api-key: good key gets 200 over https with validateCA" 200 "$(chat "$port" -H 'Authorization: Bearer sk-good')"
@@ -174,9 +186,17 @@ server.serve_forever()' >/dev/null
 
   render "$WORK/noca" "${BASE[@]}" "${APIKEY[@]}"
   port=$(gateway noca "$API_KEY_IMAGE" "$API_KEY_IMAGE_CONFIG_FLAG" "$WORK/noca")
-  wait_up "$port"
+  wait_up "$port" || fail "api-key without validateCA: gateway never answered"
+  before=$("$CRT" logs "$NET-validate" 2>&1 | grep -c 'handshake failed' || true)
   check "api-key: without validateCA the private-CA validator is refused" 401 \
     "$(chat "$port" -H 'Authorization: Bearer sk-good')"
+  # The stub logs each refused handshake, so the 401 is the TLS verify, not a stub answer.
+  after=$("$CRT" logs "$NET-validate" 2>&1 | grep -c 'handshake failed' || true)
+  if [ "$after" -gt "$before" ]; then
+    pass "api-key: the refusal is the gateway rejecting the validator's certificate"
+  else
+    fail "api-key: 401 without a TLS handshake failure at the validator"
+  fi
 fi
 
 echo "gateway config runtime: $PASS passed, $FAIL failed"

@@ -148,7 +148,7 @@ spec:
             {{- toYaml . | nindent 12 }}
           {{- end }}
           {{- $validateCA := .Values.gatewayConfig.auth.validateCA }}
-          {{- $withCA := and .Values.gatewayConfig.render (or $validateCA.configMap $validateCA.secret) }}
+          {{- $withCA := and .Values.gatewayConfig.render (eq .Values.gatewayConfig.auth.mode "api-key") (or $validateCA.configMap $validateCA.secret) }}
           {{- if or .Values.env $withCA }}
           env:
             {{- with .Values.env }}
@@ -276,11 +276,12 @@ spec:
             secretName: {{ .Values.gatewayConfig.upstreamCA.secretName | quote }}
         {{- end }}
         {{- $validateCA := .Values.gatewayConfig.auth.validateCA }}
-        {{- if and .Values.gatewayConfig.render $validateCA.configMap }}
+        {{- $apiKeyRender := and .Values.gatewayConfig.render (eq .Values.gatewayConfig.auth.mode "api-key") }}
+        {{- if and $apiKeyRender $validateCA.configMap }}
         - name: validate-ca
           configMap:
             name: {{ $validateCA.configMap | quote }}
-        {{- else if and .Values.gatewayConfig.render $validateCA.secret }}
+        {{- else if and $apiKeyRender $validateCA.secret }}
         - name: validate-ca
           secret:
             secretName: {{ $validateCA.secret | quote }}

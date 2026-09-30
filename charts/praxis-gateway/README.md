@@ -76,12 +76,14 @@ AI image; these values may advance independently.
 | `gatewayConfig.model` | string | **required** when rendered | Model advertised on the routing candidates. |
 | `gatewayConfig.backends` | list | **required** when rendered | Backend clusters (`cluster`, `endpoints`, `healthCheck`, `transport`). |
 | `gatewayConfig.localSite` | string | `hub` | Local site for locality scoring. |
-| `gatewayConfig.auth.mode` | string | **required** when rendered | `api-key` validates the caller's key and needs an image that registers `identity/api-key` (praxis-policy 0.4 or later). `none` renders no policy filter, for use only behind an authenticating front. |
-| `gatewayConfig.auth.allowUnauthenticatedExposure` | bool | `false` | With `none`, allow a LoadBalancer or NodePort Service. Without it the render fails. |
-| `gatewayConfig.auth.stripAuthorization` | bool | `true` | Remove the caller's `Authorization` before routing, in either mode. Forwarded grid hops authenticate by mTLS identity. |
+| `gatewayConfig.auth.mode` | string | **required** when rendered | `api-key` validates the caller's key and needs an image that registers `identity/api-key` (praxis-policy 0.4 or later); the render refuses it on the default `ai:0.4.0` image (by effective reference; a digest pin of that same image is not detected). `none` renders no policy filter, for use only behind an authenticating front. |
+| `gatewayConfig.auth.allowUnauthenticatedExposure` | bool | `false` | With `none`, allow a LoadBalancer or NodePort Service. Without it the render fails. The guard sees only this chart's Service, not `oc expose`, another Service selecting the pod labels, an HTTPRoute, or a hand-made Service with `service.enabled=false`. Use `networkPolicy` for those. |
+| `gatewayConfig.auth.stripAuthorization` | bool | `true` | Remove the caller's `Authorization` before routing, in either mode. Forwarded grid hops authenticate by mTLS identity. `false` forwards the caller's key or bearer to every backend and cross-site peer, so use it only when the backend validates that same credential. |
 | `gatewayConfig.auth.validateUrl` | string | **required** for `api-key` | https validate endpoint. |
 | `gatewayConfig.auth.allowPrivateEndpoint` | bool | `false` | Sets `allow_private_idp`, which is engine-wide: every policy callout may reach private, loopback, and link-local addresses, not only `validateUrl`. |
-| `gatewayConfig.auth.validateCA` | object | empty | CA for the validate call (`configMap` or `secret`, `key`). Set as `SSL_CERT_FILE`, which replaces the platform trust store, so the bundle must hold every CA that platform-trusted TLS needs. |
+| `gatewayConfig.auth.validateCA` | object | empty | CA for the validate call (`configMap` or `secret`, `key`). Set as `SSL_CERT_FILE`, which replaces the platform trust store for the validate call and https backends without a per-backend CA or `upstreamCA`. mutual_tls backends and `upstreamCA` are unaffected. See the recipe below. |
+| `networkPolicy.enabled` | bool | `false` | Render a NetworkPolicy that limits which pods can reach the listener port, where the CNI enforces NetworkPolicy. It is not authentication. Node and host-network traffic handling is CNI-specific (OVN-Kubernetes: the `policy-group.network.openshift.io/host-network` label), and a LoadBalancer with `externalTrafficPolicy: Cluster` can SNAT clients to node IPs. |
+| `networkPolicy.from` | list | `[]` | NetworkPolicyPeer entries allowed in. Required when enabled. With `auth.mode: none`, list only the authenticating front. `{podSelector: {}}` admits every pod in this namespace. An empty `namespaceSelector` and an `ipBlock` of `0.0.0.0/0` or `::/0` admit everyone and fail the render. An all-address `ipBlock` with `except` entries is allowed. The check reads selector emptiness and the cidr only, so `matchExpressions` that happen to select every pod pass. A provider gateway behind a LoadBalancer that SNATs clients to node IPs needs `ipBlock` peers for those node addresses. |
 | `gatewayConfig.upstreamCA.secretName` | string | `""` | CA bundle for backend TLS without a per-cluster CA (`upstream_ca_file`). |
 | `gatewayConfig.listenerTls.enabled` | bool | `false` | Terminate TLS at the listener from `existingSecret`, in render or BYO mode. Names the port `https`. The cert mounts at `listenerTls.mountPath` (`/etc/praxis/listener-tls`), so a BYO config moving off `tls.enabled` must point its listener `cert_path`/`key_path` there. On OpenShift, annotate the Service with `service.beta.openshift.io/serving-cert-secret-name`. |
 | `port.containerPort` | int | `8080` | Container port. |
@@ -116,6 +118,20 @@ AI image; these values may advance independently.
 | `tolerations` | list | `[]` | Pod tolerations. |
 | `topologySpreadConstraints` | list | `[]` | Topology spread constraints. |
 | `priorityClassName` | string | `""` | Pod priority class. |
+
+### validateCA bundle recipe
+
+The bundle replaces the platform store, so include the image's roots with the private CA:
+
+```sh
+podman run --rm --entrypoint cat <gateway image> /etc/ssl/certs/ca-certificates.crt > bundle.pem
+cat service-ca.crt >> bundle.pem
+kubectl create configmap gateway-validate-ca --from-file=ca.crt=bundle.pem
+```
+
+Then set `gatewayConfig.auth.validateCA.configMap=gateway-validate-ca`. If only the validate
+call and mutual_tls backends make TLS calls, the service CA alone is enough. Public https
+backends can instead take `upstreamCA`.
 
 ## Security
 
