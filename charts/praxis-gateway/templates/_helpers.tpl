@@ -79,44 +79,53 @@ Validate image digest format when provided.
 {{- end }}
 
 {{/*
-Validate required config ConfigMap name.
+Validate the praxis.yaml source and the values it needs.
+praxisConfig.source picks who writes praxis.yaml:
+  byo:      the user creates the ConfigMap named in praxisConfig.configMapName.
+  operator: the Grid operator creates it, from a GridNetwork gatewayRef with
+            consumerConfig.enabled. praxisConfig.configMapName must match its configMapName,
+            and defaults to the operator's default name.
+  render:   this chart creates it from praxisConfig.render.
 */}}
 {{- define "praxis-gateway.validateConfig" -}}
-{{- if .Values.gatewayConfig.render }}
-{{- if not (trim (toString .Values.gatewayConfig.model)) }}
-{{- fail "gatewayConfig.model is required when gatewayConfig.render is true, and cannot be blank" }}
+{{- if not (has .Values.praxisConfig.source (list "byo" "operator" "render")) }}
+{{- fail (printf "praxisConfig.source %q is not supported. Use byo, operator, or render." (toString .Values.praxisConfig.source)) }}
 {{- end }}
-{{- if not .Values.gatewayConfig.backends }}
-{{- fail "gatewayConfig.backends needs at least one backend when gatewayConfig.render is true" }}
+{{- if eq .Values.praxisConfig.source "render" }}
+{{- if not (trim (toString .Values.praxisConfig.render.model)) }}
+{{- fail "praxisConfig.render.model is required when praxisConfig.source is render, and cannot be blank" }}
 {{- end }}
-{{- $auth := .Values.gatewayConfig.auth }}
+{{- if not .Values.praxisConfig.render.backends }}
+{{- fail "praxisConfig.render.backends needs at least one backend when praxisConfig.source is render" }}
+{{- end }}
+{{- $auth := .Values.praxisConfig.render.auth }}
 {{- if not $auth.mode }}
-{{- fail "gatewayConfig.auth.mode is required when gatewayConfig.render is true: api-key (needs an image with praxis-policy 0.4 or later) or none (only behind an authenticating front)" }}
+{{- fail "praxisConfig.render.auth.mode is required when praxisConfig.source is render: api-key (needs an image with praxis-policy 0.4 or later) or none (only behind an authenticating front)" }}
 {{- end }}
 {{- if and (eq $auth.mode "none") .Values.service.enabled (has .Values.service.type (list "LoadBalancer" "NodePort")) (not $auth.allowUnauthenticatedExposure) }}
-{{- fail (printf "gatewayConfig.auth.mode none with a %s Service exposes unauthenticated inference; use api-key, a ClusterIP Service behind an authenticating front, or set gatewayConfig.auth.allowUnauthenticatedExposure" .Values.service.type) }}
+{{- fail (printf "praxisConfig.render.auth.mode none with a %s Service exposes unauthenticated inference; use api-key, a ClusterIP Service behind an authenticating front, or set praxisConfig.render.auth.allowUnauthenticatedExposure" .Values.service.type) }}
 {{- end }}
 {{- if and $auth.validateCA.configMap $auth.validateCA.secret }}
-{{- fail "gatewayConfig.auth.validateCA: set configMap or secret, not both" }}
+{{- fail "praxisConfig.render.auth.validateCA: set configMap or secret, not both" }}
 {{- end }}
 {{- if eq $auth.mode "api-key" }}
-{{- if not .Values.gatewayConfig.auth.validateUrl }}
-{{- fail "gatewayConfig.auth.validateUrl is required when gatewayConfig.auth.mode is api-key" }}
+{{- if not .Values.praxisConfig.render.auth.validateUrl }}
+{{- fail "praxisConfig.render.auth.validateUrl is required when praxisConfig.render.auth.mode is api-key" }}
 {{- end }}
-{{- if not (hasPrefix "https://" .Values.gatewayConfig.auth.validateUrl) }}
-{{- fail "gatewayConfig.auth.validateUrl must be https: a plaintext validate call ships the credential in the clear" }}
+{{- if not (hasPrefix "https://" .Values.praxisConfig.render.auth.validateUrl) }}
+{{- fail "praxisConfig.render.auth.validateUrl must be https: a plaintext validate call ships the credential in the clear" }}
 {{- end }}
-{{- if regexMatch "^https://(\\[|[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+([:/]|$))" .Values.gatewayConfig.auth.validateUrl }}
-{{- fail "gatewayConfig.auth.validateUrl must name a host, not an IP address: https to an IP literal has no SNI to verify" }}
+{{- if regexMatch "^https://(\\[|[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+([:/]|$))" .Values.praxisConfig.render.auth.validateUrl }}
+{{- fail "praxisConfig.render.auth.validateUrl must name a host, not an IP address: https to an IP literal has no SNI to verify" }}
 {{- end }}
 {{- /* The chart-default image predates praxis-policy 0.4, which adds identity/api-key. */}}
 {{- if eq (include "praxis-gateway.image" .) "ghcr.io/praxis-proxy/ai:0.4.0" }}
-{{- fail "gatewayConfig.auth.mode api-key is unsupported on the default image ghcr.io/praxis-proxy/ai:0.4.0: its policy engine lacks identity/api-key (praxis-policy 0.4 or later). Set image to a build that registers it, or use auth.mode none behind an authenticating front." }}
+{{- fail "praxisConfig.render.auth.mode api-key is unsupported on the default image ghcr.io/praxis-proxy/ai:0.4.0: its policy engine lacks identity/api-key (praxis-policy 0.4 or later). Set image to a build that registers it, or use auth.mode none behind an authenticating front." }}
 {{- end }}
 {{- end }}
 {{- include "praxis-gateway.validateBackends" . }}
-{{- else if not .Values.config.existingConfigMap }}
-{{- fail "config.existingConfigMap is required (or set gatewayConfig.render: true)" }}
+{{- else if and (eq .Values.praxisConfig.source "byo") (not .Values.praxisConfig.configMapName) }}
+{{- fail "praxisConfig.configMapName is required when praxisConfig.source is byo. Set it to the ConfigMap that holds praxis.yaml, or use praxisConfig.source: operator or render." }}
 {{- end }}
 {{- end }}
 
@@ -128,9 +137,9 @@ carry a sni.
 {{- define "praxis-gateway.validateBackends" -}}
 {{- $tlsEnabled := .Values.tls.enabled }}
 {{- $seen := dict }}
-{{- range .Values.gatewayConfig.backends }}
+{{- range .Values.praxisConfig.render.backends }}
 {{- if hasKey $seen .cluster }}
-{{- fail (printf "gatewayConfig.backends: cluster %q is listed twice; cluster names must be unique" .cluster) }}
+{{- fail (printf "praxisConfig.render.backends: cluster %q is listed twice; cluster names must be unique" .cluster) }}
 {{- end }}
 {{- $_ := set $seen .cluster true }}
 {{- $mode := (.transport).mode | default (ternary "mutual_tls" "plaintext" $tlsEnabled) }}
@@ -171,8 +180,8 @@ Validate enabled mounts have a non-empty resource name.
 {{- if and .Values.tls.enabled (not .Values.tls.existingSecret) }}
 {{- fail "tls.existingSecret is required when tls.enabled is true" }}
 {{- end }}
-{{- if and .Values.gatewayConfig.listenerTls.enabled (not .Values.gatewayConfig.listenerTls.existingSecret) }}
-{{- fail "gatewayConfig.listenerTls.existingSecret is required when gatewayConfig.listenerTls.enabled is true" }}
+{{- if and .Values.listenerTls.enabled (not .Values.listenerTls.existingSecret) }}
+{{- fail "listenerTls.existingSecret is required when listenerTls.enabled is true" }}
 {{- end }}
 {{- end }}
 
@@ -180,7 +189,7 @@ Validate enabled mounts have a non-empty resource name.
 Listener port name: port.name when set, else https when the listener terminates TLS.
 */}}
 {{- define "praxis-gateway.portName" -}}
-{{- .Values.port.name | default (ternary "https" "http" .Values.gatewayConfig.listenerTls.enabled) -}}
+{{- .Values.port.name | default (ternary "https" "http" .Values.listenerTls.enabled) -}}
 {{- end }}
 
 {{/*
@@ -217,4 +226,21 @@ SNI for a tls backend: transport.sni, else the first endpoint's host.
 {{- else -}}
 {{- regexReplaceAll ":[0-9]+$" (first .endpoints) "" -}}
 {{- end -}}
+{{- end }}
+
+{{/*
+Name of the praxis.yaml ConfigMap the pod mounts.
+render: the ConfigMap this chart creates, <fullname>-config.
+operator: defaults to praxis-consumer-config, the Grid operator's default
+consumerConfig.configMapName.
+byo: praxisConfig.configMapName.
+*/}}
+{{- define "praxis-gateway.configMapName" -}}
+{{- if eq .Values.praxisConfig.source "render" }}
+{{- printf "%s-config" (include "praxis-gateway.fullname" .) }}
+{{- else if eq .Values.praxisConfig.source "operator" }}
+{{- .Values.praxisConfig.configMapName | default "praxis-consumer-config" }}
+{{- else }}
+{{- .Values.praxisConfig.configMapName }}
+{{- end }}
 {{- end }}

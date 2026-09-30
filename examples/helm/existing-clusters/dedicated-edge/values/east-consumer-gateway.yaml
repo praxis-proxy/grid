@@ -13,8 +13,8 @@ image:
   tag: 0.4.0
   pullPolicy: IfNotPresent
 
-config:
-  existingConfigMap: consumer-praxis-config
+praxisConfig:
+  configMapName: consumer-praxis-config
   key: praxis.yaml
 
 overlay:

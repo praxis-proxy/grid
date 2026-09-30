@@ -3,7 +3,7 @@ Praxis gateway installed.
   Release:   {{ .Release.Name }}
   Namespace: {{ .Release.Namespace }}
   Image:     {{ include "praxis-gateway.image" . }}
-  Config:    {{ .Values.config.existingConfigMap }}
+  Config:    {{ include "praxis-gateway.configMapName" . }}
 
 TEMPORARY CHART: This chart deploys the Praxis process directly as a
 Kubernetes workload. It is not an operator. Long-term ownership moves to
@@ -36,9 +36,16 @@ Credential mounts:
   - {{ .name }} -> {{ .mountPath }}{{ if .optional }} (optional){{ end }}
 {{- end }}
 {{- end }}
-{{- if and .Values.gatewayConfig.render (not .Values.gatewayConfig.auth.stripAuthorization) }}
+{{- if eq .Values.praxisConfig.source "operator" }}
 
-WARNING: gatewayConfig.auth.stripAuthorization is false. The caller's Authorization
+NOTE: praxisConfig.source is operator. The pod starts once the Grid operator writes
+ConfigMap {{ include "praxis-gateway.configMapName" . }} in namespace {{ .Release.Namespace }}. This needs a GridNetwork
+gatewayRef for this namespace with consumerConfig.enabled: true and
+configMapName: {{ include "praxis-gateway.configMapName" . }}.
+{{- end }}
+{{- if and (eq .Values.praxisConfig.source "render") (not .Values.praxisConfig.render.auth.stripAuthorization) }}
+
+WARNING: praxisConfig.render.auth.stripAuthorization is false. The caller's Authorization
 header reaches every backend and cross-site peer. Use this only when the backend
 validates that same credential.
 {{- end }}
@@ -48,9 +55,9 @@ validates that same credential.
 {{- $sameNsAll = true }}
 {{- end }}
 {{- end }}
-{{- if and .Values.gatewayConfig.render (eq .Values.gatewayConfig.auth.mode "none") (or (not .Values.networkPolicy.enabled) $sameNsAll) }}
+{{- if and (eq .Values.praxisConfig.source "render") (eq .Values.praxisConfig.render.auth.mode "none") (or (not .Values.networkPolicy.enabled) $sameNsAll) }}
 
-NOTE: gatewayConfig.auth.mode is none and
+NOTE: praxisConfig.render.auth.mode is none and
 {{- if .Values.networkPolicy.enabled }} networkPolicy.from admits every pod in this namespace
 ({podSelector: {}}).
 {{- else }} no NetworkPolicy limits ingress.

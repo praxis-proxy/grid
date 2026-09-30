@@ -408,8 +408,8 @@ spec:
               limits:
                 cpu: 500m
                 memory: 256Mi
-            config:
-              existingConfigMap: "provider-gateway-config"
+            praxisConfig:
+              configMapName: "provider-gateway-config"
             port:
               containerPort: 8443
               name: "https-mtls"
@@ -486,8 +486,8 @@ spec:
               limits:
                 cpu: 500m
                 memory: 256Mi
-            config:
-              existingConfigMap: "consumer-gateway-config"
+            praxisConfig:
+              configMapName: "consumer-gateway-config"
             service:
               type: "LoadBalancer"
             overlay:

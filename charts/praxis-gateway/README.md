@@ -19,7 +19,7 @@ responsibility of this repository.
 
 - Kubernetes >= 1.26
 - Helm >= 3.12
-- A Praxis configuration ConfigMap already created in the target namespace
+- A way to provide `praxis.yaml`, see [Where praxis.yaml comes from](#where-praxisyaml-comes-from)
 - A compatible Praxis AI gateway image (default: Praxis AI 0.4.0)
 
 ## Install
@@ -33,8 +33,77 @@ kubectl create configmap edge-gateway-config \
 
 helm install edge-gateway charts/praxis-gateway \
   --namespace grid-system \
-  --set config.existingConfigMap=edge-gateway-config
+  --set praxisConfig.configMapName=edge-gateway-config
 ```
+
+### Where praxis.yaml comes from
+
+`praxisConfig.source` picks who writes the gateway's `praxis.yaml`: `byo`
+(default), `operator`, or `render`. Each part below shows the minimal settings.
+
+#### byo: you write praxis.yaml
+
+Create the ConfigMap with a `praxis.yaml` key, then point the chart at it:
+
+```bash
+kubectl create configmap my-praxis-config --from-file=praxis.yaml=./praxis.yaml -n grid-system
+```
+
+```yaml
+praxisConfig:
+  source: byo
+  configMapName: my-praxis-config
+```
+
+Set `praxisConfig.key` only when your ConfigMap uses a key other than
+`praxis.yaml`.
+
+#### operator: the Grid operator writes praxis.yaml
+
+Enable `consumerConfig` for this gateway in the GridNetwork:
+
+```yaml
+apiVersion: grid.praxis-proxy.io/v1alpha1
+kind: GridNetwork
+metadata:
+  name: my-network
+spec:
+  gatewayRefs:
+    - name: edge-gateway
+      namespace: grid-system
+      consumerConfig:
+        enabled: true
+```
+
+```yaml
+praxisConfig:
+  source: operator
+```
+
+The operator writes the ConfigMap `praxis-consumer-config`, and the pod starts
+once it exists. If the GridNetwork sets another `consumerConfig.configMapName`,
+set the same name in `praxisConfig.configMapName`.
+Every provider cluster the gateway routes to also needs a
+`consumerConfig.clusterEndpoints` entry, or the operator does not write the
+ConfigMap.
+
+#### render: this chart writes praxis.yaml
+
+```yaml
+praxisConfig:
+  source: render
+  render:
+    model: my-model
+    auth:
+      mode: none
+    backends:
+      - cluster: vllm
+        endpoints: ["10.0.0.5:8000"]
+```
+
+`model`, `auth.mode` and at least one backend are required. `auth.mode: none`
+has no caller authentication, so use it only behind an authenticating front. Use
+`api-key` with `auth.validateUrl` to check caller keys.
 
 The default image reference is the official Praxis AI 0.4.0 gateway tag.
 `image.digest` defaults to empty so an `image.tag` override remains effective.
@@ -70,25 +139,25 @@ AI image; these values may advance independently.
 | `podAnnotations` | object | `{}` | Pod annotations. |
 | `podSecurityContext` | object | `{}` | Extra pod securityContext (`runAsUser`, `runAsGroup`, `fsGroup`, `supplementalGroups`). |
 | `args` | list | `["--config", "/etc/praxis/praxis.yaml"]` | Container arguments. |
-| `config.existingConfigMap` | string | **required** unless `gatewayConfig.render` | Name of an existing ConfigMap with the Praxis config. |
-| `config.key` | string | `praxis.yaml` | Key in the ConfigMap. |
-| `gatewayConfig.render` | bool | `false` | Render praxis.yaml from these values instead of a BYO ConfigMap. Never emits `insecure_options`. |
-| `gatewayConfig.model` | string | **required** when rendered | Model advertised on the routing candidates. |
-| `gatewayConfig.backends` | list | **required** when rendered | Backend clusters (`cluster`, `endpoints`, `healthCheck`, `transport`). |
-| `gatewayConfig.backends[].transport` | object | `mutual_tls` with `tls.enabled`, else `plaintext` | `mode`: `mutual_tls` presents the grid identity, `tls` verifies the server cert with no client cert, `plaintext` is cleartext. `sni` names the peer cert (required for `mutual_tls` and for `tls` to an IP endpoint). `ca` (`configMap` or `secret`, `key`) is the CA for a `tls` backend. A `tls` backend trusts, first match wins: `transport.ca`, then `upstreamCA`, then the process store, which is the `auth.validateCA` bundle when that is set. |
-| `gatewayConfig.localSite` | string | `hub` | Local site for locality scoring. |
-| `gatewayConfig.auth.mode` | string | **required** when rendered | `api-key` validates the caller's key and needs an image that registers `identity/api-key` (praxis-policy 0.4 or later); the render refuses it on the default `ai:0.4.0` image (by effective reference; a digest pin of that same image is not detected). `none` renders no policy filter, for use only behind an authenticating front. |
-| `gatewayConfig.auth.allowUnauthenticatedExposure` | bool | `false` | With `none`, allow a LoadBalancer or NodePort Service. Without it the render fails. The guard sees only this chart's Service, not `oc expose`, another Service selecting the pod labels, an HTTPRoute, or a hand-made Service with `service.enabled=false`. Use `networkPolicy` for those. |
-| `gatewayConfig.auth.stripAuthorization` | bool | `true` | Remove the caller's `Authorization` before routing, in either mode. Forwarded grid hops authenticate by mTLS identity. `false` forwards the caller's key or bearer to every backend and cross-site peer, so use it only when the backend validates that same credential. |
-| `gatewayConfig.auth.validateUrl` | string | **required** for `api-key` | https validate endpoint. |
-| `gatewayConfig.auth.allowPrivateEndpoint` | bool | `false` | Sets `allow_private_idp`, which is engine-wide: every policy callout may reach private, loopback, and link-local addresses, not only `validateUrl`. |
-| `gatewayConfig.auth.validateCA` | object | empty | CA for the validate call (`configMap` or `secret`, `key`). Set as `SSL_CERT_FILE`, which replaces the platform trust store for the validate call and https backends without a per-backend CA or `upstreamCA`. mutual_tls backends and `upstreamCA` are unaffected. See the recipe below. |
+| `praxisConfig.source` | string | `byo` | Who writes praxis.yaml: `byo` (you create the ConfigMap), `operator` (the Grid operator creates it from a GridNetwork `gatewayRef` with `consumerConfig.enabled`), or `render` (this chart creates it from `praxisConfig.render`). |
+| `praxisConfig.configMapName` | string | **required** for `byo`; `praxis-consumer-config` for `operator` | Name of the ConfigMap with praxis.yaml. For `operator`, must match the `configMapName` in the GridNetwork. Not used with `render`. |
+| `praxisConfig.key` | string | `praxis.yaml` | Key in the ConfigMap, for `byo` only. `operator` always uses `praxis.yaml`. |
+| `praxisConfig.render.model` | string | **required** when rendered | Model advertised on the routing candidates. |
+| `praxisConfig.render.backends` | list | **required** when rendered | Backend clusters (`cluster`, `endpoints`, `healthCheck`, `transport`). |
+| `praxisConfig.render.backends[].transport` | object | `mutual_tls` with `tls.enabled`, else `plaintext` | `mode`: `mutual_tls` presents the grid identity, `tls` verifies the server cert with no client cert, `plaintext` is cleartext. `sni` names the peer cert (required for `mutual_tls` and for `tls` to an IP endpoint). `ca` (`configMap` or `secret`, `key`) is the CA for a `tls` backend. A `tls` backend trusts, first match wins: `transport.ca`, then `upstreamCA`, then the process store, which is the `auth.validateCA` bundle when that is set. |
+| `praxisConfig.render.localSite` | string | `hub` | Local site for locality scoring. |
+| `praxisConfig.render.auth.mode` | string | **required** when rendered | `api-key` validates the caller's key and needs an image that registers `identity/api-key` (praxis-policy 0.4 or later); the render refuses it on the default `ai:0.4.0` image (by effective reference; a digest pin of that same image is not detected). `none` renders no policy filter, for use only behind an authenticating front. |
+| `praxisConfig.render.auth.allowUnauthenticatedExposure` | bool | `false` | With `none`, allow a LoadBalancer or NodePort Service. Without it the render fails. The guard sees only this chart's Service, not `oc expose`, another Service selecting the pod labels, an HTTPRoute, or a hand-made Service with `service.enabled=false`. Use `networkPolicy` for those. |
+| `praxisConfig.render.auth.stripAuthorization` | bool | `true` | Remove the caller's `Authorization` before routing, in either mode. Forwarded grid hops authenticate by mTLS identity. `false` forwards the caller's key or bearer to every backend and cross-site peer, so use it only when the backend validates that same credential. |
+| `praxisConfig.render.auth.validateUrl` | string | **required** for `api-key` | https validate endpoint. |
+| `praxisConfig.render.auth.allowPrivateEndpoint` | bool | `false` | Sets `allow_private_idp`, which is engine-wide: every policy callout may reach private, loopback, and link-local addresses, not only `validateUrl`. |
+| `praxisConfig.render.auth.validateCA` | object | empty | CA for the validate call (`configMap` or `secret`, `key`). Set as `SSL_CERT_FILE`, which replaces the platform trust store for the validate call and https backends without a per-backend CA or `upstreamCA`. mutual_tls backends and `upstreamCA` are unaffected. See the recipe below. |
 | `networkPolicy.enabled` | bool | `false` | Render a NetworkPolicy that limits which pods can reach the listener port, where the CNI enforces NetworkPolicy. It is not authentication. Node and host-network traffic handling is CNI-specific (OVN-Kubernetes: the `policy-group.network.openshift.io/host-network` label), and a LoadBalancer with `externalTrafficPolicy: Cluster` can SNAT clients to node IPs. |
 | `networkPolicy.from` | list | `[]` | NetworkPolicyPeer entries allowed in. Required when enabled. With `auth.mode: none`, list only the authenticating front. `{podSelector: {}}` admits every pod in this namespace. An empty `namespaceSelector` and an `ipBlock` of `0.0.0.0/0` or `::/0` admit everyone and fail the render. An all-address `ipBlock` with `except` entries is allowed. The check reads selector emptiness and the cidr only, so `matchExpressions` that happen to select every pod pass. A provider gateway behind a LoadBalancer that SNATs clients to node IPs needs `ipBlock` peers for those node addresses. |
-| `gatewayConfig.upstreamCA.secretName` | string | `""` | CA bundle for backend TLS without a per-cluster CA (`upstream_ca_file`). |
-| `gatewayConfig.listenerTls.enabled` | bool | `false` | Terminate TLS at the listener from `existingSecret`, in render or BYO mode. Names the port `https`. The cert mounts at `listenerTls.mountPath` (`/etc/praxis/listener-tls`), so a BYO config moving off `tls.enabled` must point its listener `cert_path`/`key_path` there. On OpenShift, annotate the Service with `service.beta.openshift.io/serving-cert-secret-name`. |
+| `praxisConfig.render.upstreamCA.secretName` | string | `""` | CA bundle for backend TLS without a per-cluster CA (`upstream_ca_file`). |
+| `listenerTls.enabled` | bool | `false` | Terminate TLS at the listener from `existingSecret`, in render or BYO mode. Names the port `https`. The cert mounts at `listenerTls.mountPath` (`/etc/praxis/listener-tls`), so a BYO config moving off `tls.enabled` must point its listener `cert_path`/`key_path` there. On OpenShift, annotate the Service with `service.beta.openshift.io/serving-cert-secret-name`. |
 | `port.containerPort` | int | `8080` | Container port. |
-| `port.name` | string | `""` | Port name. Empty: `https` with `gatewayConfig.listenerTls.enabled`, else `http`. |
+| `port.name` | string | `""` | Port name. Empty: `https` with `listenerTls.enabled`, else `http`. |
 | `port.protocol` | string | `TCP` | Port protocol. |
 | `service.enabled` | bool | `true` | Create a Service. |
 | `service.type` | string | `ClusterIP` | Service type. |
@@ -128,14 +197,16 @@ hostname that resolves to a private address. Set `sni` to the Service DNS name, 
 the cert carries, and trust the service CA that OpenShift injects into every namespace:
 
 ```yaml
-gatewayConfig:
-  backends:
-    - cluster: local-qwen3
-      endpoints: ["172.30.12.34:8000"]   # kubectl get svc qwen3-kserve-workload-svc -o jsonpath='{.spec.clusterIP}'
-      transport:
-        mode: tls
-        sni: qwen3-kserve-workload-svc.llm.svc
-        ca: { configMap: openshift-service-ca.crt, key: service-ca.crt }
+praxisConfig:
+  source: render
+  render:
+    backends:
+      - cluster: local-qwen3
+        endpoints: ["172.30.12.34:8000"]   # kubectl get svc qwen3-kserve-workload-svc -o jsonpath='{.spec.clusterIP}'
+        transport:
+          mode: tls
+          sni: qwen3-kserve-workload-svc.llm.svc
+          ca: { configMap: openshift-service-ca.crt, key: service-ca.crt }
 ```
 
 The health check defaults to `tcp` for TLS backends.
@@ -150,7 +221,7 @@ cat service-ca.crt >> bundle.pem
 kubectl create configmap gateway-validate-ca --from-file=ca.crt=bundle.pem
 ```
 
-Then set `gatewayConfig.auth.validateCA.configMap=gateway-validate-ca`. If only the validate
+Then set `praxisConfig.render.auth.validateCA.configMap=gateway-validate-ca`. If only the validate
 call and mutual_tls backends make TLS calls, the service CA alone is enough. Public https
 backends can instead take `upstreamCA`.
 
