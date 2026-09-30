@@ -147,22 +147,25 @@ impl ServedModelStore {
     ///
     /// Changes, expirations, and drops are logged at `debug`.
     fn refresh(&self, updated: &[ProviderPoll], now: Instant, ttl: Duration) {
+        let expires_at = now.checked_add(ttl);
         let Ok(mut map) = self.inner.write() else {
             return;
         };
 
         prune_before_refresh(&mut map, updated, now);
         for ProviderPoll(outcome, name) in updated {
-            if let PollOutcome::Served(discovered) = outcome {
-                let models: Arc<[String]> = discovered.clone().into_names().into();
-                tracing::debug!(name, ?models, "served models refreshed");
-                map.insert(
-                    name.clone(),
-                    ServedModel {
-                        models,
-                        expires_at: now + ttl,
+            match outcome {
+                PollOutcome::Served(discovered) => match expires_at {
+                    Some(expires_at) => {
+                        let models: Arc<[String]> = discovered.clone().into_names().into();
+                        tracing::debug!(name, ?models, "served models refreshed");
+                        map.insert(name.clone(), ServedModel { models, expires_at });
                     },
-                );
+                    None => {
+                        tracing::warn!(name, ?ttl, "model discovery TTL exceeds the monotonic clock range");
+                    },
+                },
+                PollOutcome::Failed(_) => {},
             }
         }
     }

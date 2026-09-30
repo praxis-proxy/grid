@@ -2052,10 +2052,12 @@ async fn run_model_discovery(
     }
 }
 
+/// Maximum amount of time to retain a discovered model set.
+const MAX_MODEL_DISCOVERY_TTL: std::time::Duration = std::time::Duration::from_secs(365 * 24 * 60 * 60);
+
 /// Discovery cadence from `GRID_MODEL_DISCOVERY_*`.
 ///
-/// The TTL is raised to at least one interval plus one timeout, so a set that
-/// is renewed on schedule never expires between rounds.
+/// The TTL is raised to cover one interval plus one timeout, up to one year.
 fn model_discovery_config() -> served_models::DiscoveryConfig {
     let defaults = served_models::DiscoveryConfig::default();
     let secs =
@@ -2063,7 +2065,19 @@ fn model_discovery_config() -> served_models::DiscoveryConfig {
 
     let interval = secs("GRID_MODEL_DISCOVERY_INTERVAL_SECS", defaults.interval);
     let timeout = secs("GRID_MODEL_DISCOVERY_TIMEOUT_SECS", defaults.timeout);
-    let ttl = secs("GRID_MODEL_DISCOVERY_TTL_SECS", defaults.ttl).max(interval + timeout);
+    let requested_ttl = secs("GRID_MODEL_DISCOVERY_TTL_SECS", defaults.ttl);
+    let minimum_ttl = interval.saturating_add(timeout);
+    let unclamped_ttl = requested_ttl.max(minimum_ttl);
+    let ttl = unclamped_ttl.min(MAX_MODEL_DISCOVERY_TTL);
+    if unclamped_ttl > MAX_MODEL_DISCOVERY_TTL {
+        tracing::warn!(
+            requested_ttl_secs = requested_ttl.as_secs(),
+            minimum_ttl_secs = minimum_ttl.as_secs(),
+            applied_ttl_secs = ttl.as_secs(),
+            max_ttl_secs = MAX_MODEL_DISCOVERY_TTL.as_secs(),
+            "model discovery TTL exceeds the supported maximum; clamping"
+        );
+    }
 
     served_models::DiscoveryConfig {
         interval,
