@@ -674,6 +674,8 @@ try_reject_msg "$GW_DIR" "transport.ca outside tls (gw)" "transport/mode': value
   --set "praxisConfig.render.backends[0].transport.ca.configMap=a"
 try_reject_msg "$GW_DIR" "listenerTls enabled no secret (gw)" "listenerTls.existingSecret is required" "${GW_REQ[@]}" \
   --set listenerTls.enabled=true --namespace grid-system
+try_reject_msg "$GW_DIR" "listenerTls with source operator (gw)" "not supported with praxisConfig.source operator" \
+  --set praxisConfig.source=operator --set listenerTls.enabled=true --set listenerTls.existingSecret=l --namespace grid-system
 
 # listenerTls names the port https (render or BYO); probes follow the port name.
 for mode in render byo; do

@@ -183,6 +183,10 @@ Validate enabled mounts have a non-empty resource name.
 {{- if and .Values.listenerTls.enabled (not .Values.listenerTls.existingSecret) }}
 {{- fail "listenerTls.existingSecret is required when listenerTls.enabled is true" }}
 {{- end }}
+{{- /* The operator's praxis.yaml has no listener TLS, so the listener would stay plaintext on an https port. */}}
+{{- if and .Values.listenerTls.enabled (eq .Values.praxisConfig.source "operator") }}
+{{- fail "listenerTls.enabled is not supported with praxisConfig.source operator: the Grid operator's praxis.yaml has no listener TLS. Terminate TLS in front of the gateway, or use source byo or render." }}
+{{- end }}
 {{- end }}
 
 {{/*

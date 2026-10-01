@@ -151,9 +151,10 @@ praxisConfig:
 # -- Inbound TLS on the gateway listener. The default posture assumes an inbound TLS
 # front (an OpenShift Route or a Gateway) terminates TLS and forwards to this plaintext
 # listener. Enable to terminate TLS at the gateway itself from a mounted server cert
-# (tls.crt/tls.key in the Secret). Works with every praxisConfig.source. A byo or operator config must
-# reference mountPath (a BYO config moving off tls.enabled must change its listener
-# cert paths to it). Enabling it names the container port https. On OpenShift, set
+# (tls.crt/tls.key in the Secret). Works with praxisConfig.source render and byo. A byo
+# config must reference mountPath (a BYO config moving off tls.enabled must change its
+# listener cert paths to it). Not supported with source operator: the operator's
+# praxis.yaml has no listener TLS, so the install fails. Enabling it names the container port https. On OpenShift, set
 # service.annotations service.beta.openshift.io/serving-cert-secret-name to the Secret
 # name and the service CA issues the cert.
 listenerTls:
