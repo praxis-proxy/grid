@@ -27,6 +27,8 @@ pub mod cli;
 pub mod controller;
 /// Custom resource definitions.
 pub mod crd;
+/// Site auto-enroll on startup.
+pub mod enroll;
 /// Operator error types.
 pub mod error;
 /// Prometheus metrics for gateway probe and phase-transition observability.

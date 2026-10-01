@@ -2,7 +2,7 @@
 
 use clap::Parser;
 
-use crate::gateway;
+use crate::{enroll, gateway};
 
 /// grid-operator command-line interface.
 #[derive(Parser, Debug, Clone)]
@@ -11,6 +11,10 @@ pub struct Cli {
     /// Gateway self-discovery options.
     #[command(flatten)]
     pub gateway: gateway::Config,
+
+    /// Site auto-enroll options.
+    #[command(flatten)]
+    pub enrollment: enroll::Config,
 }
 
 #[cfg(test)]

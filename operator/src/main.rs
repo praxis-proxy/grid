@@ -107,6 +107,16 @@ async fn main() {
         },
     };
 
+    let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let metrics_server = tokio::spawn(run_metrics_server(Arc::clone(&ready)));
+
+    if config.enrollment.enabled
+        && let Err(error) = Box::pin(operator::enroll::ensure_enrolled(&client, &config.enrollment)).await
+    {
+        tracing::error!(%error, "site enrollment failed");
+        std::process::exit(1);
+    }
+
     let swim = match maybe_start_swim(&client, &config.gateway).await {
         Ok(swim) => swim,
         Err(error) => {
@@ -114,6 +124,7 @@ async fn main() {
             std::process::exit(1);
         },
     };
+    ready.store(true, std::sync::atomic::Ordering::Release);
 
     if let Some(handle) = &swim {
         tokio::spawn(gateway::run_discovery_poller(
@@ -150,7 +161,7 @@ async fn main() {
         run_site_controller(client.clone()),
         run_provider_controller(client.clone()),
         run_agent_tool_provider_controller(client.clone()),
-        run_metrics_server(),
+        async { metrics_server.await? },
         run_signals_server(
             signals_enabled,
             client.clone(),
@@ -172,6 +183,7 @@ async fn main() {
 
     if let Err(e) = result {
         tracing::error!(error = %e, "controller error");
+        std::process::exit(1);
     }
 }
 
@@ -658,12 +670,17 @@ async fn run_agent_tool_provider_controller(client: Client) -> Result<(), Box<dy
 }
 
 /// Serve Prometheus metrics and health endpoints.
-async fn run_metrics_server() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn run_metrics_server(
+    ready: Arc<std::sync::atomic::AtomicBool>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let addr = std::env::var("GRID_METRICS_ADDR").unwrap_or_else(|_| "0.0.0.0:9090".to_owned());
     let app = axum::Router::new()
         .route("/metrics", axum::routing::get(metrics_handler))
         .route("/healthz", axum::routing::get(health_handler))
-        .route("/readyz", axum::routing::get(health_handler));
+        .route(
+            "/readyz",
+            axum::routing::get(move || std::future::ready(readiness(&ready))),
+        );
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     let bound_addr = listener.local_addr().map_or_else(|_| addr.clone(), |a| a.to_string());
     tracing::info!(addr = %bound_addr, "metrics server started");
@@ -680,9 +697,18 @@ async fn metrics_handler() -> impl axum::response::IntoResponse {
     )
 }
 
-/// Health check handler for liveness and readiness probes.
+/// Liveness handler.
 async fn health_handler() -> &'static str {
     "ok"
+}
+
+/// Not ready until enrollment and SWIM startup have finished.
+fn readiness(ready: &std::sync::atomic::AtomicBool) -> (http::StatusCode, &'static str) {
+    if ready.load(std::sync::atomic::Ordering::Acquire) {
+        (http::StatusCode::OK, "ok")
+    } else {
+        (http::StatusCode::SERVICE_UNAVAILABLE, "starting")
+    }
 }
 
 // ---------------------------------------------------------------------------
