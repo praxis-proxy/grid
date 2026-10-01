@@ -40,7 +40,7 @@ const GRID_SYSTEM_NS: &str = "grid-system";
 /// Overlay `ConfigMap` name created by the Grid operator for consumer gateways.
 const OVERLAY_CONFIGMAP: &str = "grid-overlay-grid-provider-traffic-consumer-gateway";
 
-/// Provider credential secret name (matches Helm `credentials[0].name`).
+/// Provider credential secret name (matches Helm `providerCredentials[0].secretName`).
 const VCR_INFERENCE_CREDENTIAL: &str = "vcr-inference-credential";
 
 /// Stable terminal separator that also remains readable in captured logs.

@@ -43,7 +43,7 @@ const GRID_SYSTEM_NS: &str = "grid-system";
 /// Overlay `ConfigMap` name created by the Grid operator for consumer gateways.
 const BASE_RUN_NAME: &str = "grid-static-weighted";
 
-/// Provider credential secret name (matches Helm `credentials[0].name`).
+/// Provider credential secret name (matches Helm `providerCredentials[0].secretName`).
 const VCR_INFERENCE_CREDENTIAL: &str = "vcr-inference-credential";
 
 /// Stable terminal separator that also remains readable in captured logs.
