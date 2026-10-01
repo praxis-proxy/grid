@@ -481,11 +481,11 @@ Each provider uses a separate credential Secret and a separate mount
 path. In the provider gateway Helm values:
 
 ```yaml
-credentials:
-  - name: mock-credential-a
+providerCredentials:
+  - secretName: mock-credential-a
     mountPath: /etc/praxis/credentials/mock-credential-a
     optional: false
-  - name: mock-credential-b
+  - secretName: mock-credential-b
     mountPath: /etc/praxis/credentials/mock-credential-b
     optional: false
 ```
@@ -762,8 +762,8 @@ Mount credentials only in the provider gateway:
 
 ```yaml
 # provider-gateway-overrides.yaml
-credentials:
-  - name: openai-credential
+providerCredentials:
+  - secretName: openai-credential
     mountPath: /etc/praxis/credentials/openai
     optional: false
 ```

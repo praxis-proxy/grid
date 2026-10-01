@@ -410,22 +410,22 @@
         }
       }
     },
-    "credentials": {
+    "providerCredentials": {
       "type": "array",
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["name", "mountPath"],
+        "required": ["secretName"],
         "properties": {
-          "name": {
+          "secretName": {
             "type": "string",
             "minLength": 1,
-            "description": "Secret name."
+            "description": "Existing Secret with the provider credential."
           },
           "mountPath": {
             "type": "string",
             "minLength": 1,
-            "description": "Mount path for the credential Secret."
+            "description": "Mount path. Defaults to /run/secrets/grid-credentials/<secretName>."
           },
           "optional": {
             "type": "boolean",
@@ -433,7 +433,7 @@
           }
         }
       },
-      "description": "Credential Secret mounts."
+      "description": "Provider credential Secrets mounted into the gateway."
     },
     "health": {
       "type": "object",

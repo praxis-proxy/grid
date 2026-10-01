@@ -253,3 +253,12 @@ byo: praxisConfig.configMapName.
 {{- .Values.praxisConfig.configMapName }}
 {{- end }}
 {{- end }}
+
+{{/*
+Mount path for one providerCredentials entry. Defaults to
+/run/secrets/grid-credentials/<secretName>, which matches the Grid operator's default
+consumerConfig.credentialMountBase, so operator-written praxis.yaml finds the file.
+*/}}
+{{- define "praxis-gateway.providerCredentialPath" -}}
+{{- .mountPath | default (printf "/run/secrets/grid-credentials/%s" .secretName) -}}
+{{- end }}

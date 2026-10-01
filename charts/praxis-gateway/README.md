@@ -206,7 +206,7 @@ AI image; these values may advance independently.
 | `tls.enabled` | bool | `false` | Mount a TLS Secret. |
 | `tls.existingSecret` | string | `""` | Name of the TLS Secret. |
 | `tls.mountPath` | string | `/etc/praxis/tls` | Mount path for TLS files. |
-| `credentials` | list | `[]` | Credential Secret mounts (name, mountPath, optional). |
+| `providerCredentials` | list | `[]` | Provider credential Secrets to mount (`secretName`, `mountPath`, `optional`). You create the Secrets. `mountPath` defaults to `/run/secrets/grid-credentials/<secretName>`, the operator's default `credentialMountBase`; with `byo`, set it to the path your praxis.yaml uses. |
 | `health.readiness` | object | TCP socket on the listener port | Readiness probe. A `tcpSocket` without a port targets the listener port. Set to null to disable. |
 | `health.liveness` | object | TCP socket on the listener port | Liveness probe. Set to null to disable. |
 | `resources` | object | `{}` | Container resource requests and limits. |

@@ -221,9 +221,9 @@ spec:
               mountPath: {{ $validateCA.mountPath | quote }}
               readOnly: true
             {{- end }}
-            {{- range .Values.credentials }}
-            - name: credential-{{ .name }}
-              mountPath: {{ .mountPath | quote }}
+            {{- range .Values.providerCredentials }}
+            - name: credential-{{ .secretName }}
+              mountPath: {{ include "praxis-gateway.providerCredentialPath" . | quote }}
               readOnly: true
             {{- end }}
       volumes:
@@ -316,10 +316,10 @@ spec:
           secret:
             secretName: {{ .Values.listenerTls.secretName | quote }}
         {{- end }}
-        {{- range .Values.credentials }}
-        - name: credential-{{ .name }}
+        {{- range .Values.providerCredentials }}
+        - name: credential-{{ .secretName }}
           secret:
-            secretName: {{ .name | quote }}
+            secretName: {{ .secretName | quote }}
             optional: {{ .optional | default false }}
         {{- end }}
       {{- with .Values.nodeSelector }}

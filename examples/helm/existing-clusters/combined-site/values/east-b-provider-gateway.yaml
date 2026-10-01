@@ -21,8 +21,8 @@ tls:
   enabled: true
   existingSecret: provider-tls
 
-credentials:
-  - name: mock-inference-credential
+providerCredentials:
+  - secretName: mock-inference-credential
     mountPath: /etc/praxis/credentials/mock-inference
     optional: false
 

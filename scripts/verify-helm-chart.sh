@@ -360,10 +360,10 @@ try_template "$GW_DIR" "gtm emulator" "${GW_REQ[@]}" \
 try_template "$GW_DIR" "service disabled" "${GW_REQ[@]}" --set service.enabled=false
 try_template "$GW_DIR" "custom image" "${GW_REQ[@]}" \
   --set image.repository=praxis-ai --set image.tag=glb-demo --set image.pullPolicy=Never
-try_template "$GW_DIR" "gateway with credentials" "${GW_REQ[@]}" \
-  --set 'credentials[0].name=cred-a' --set 'credentials[0].mountPath=/etc/praxis/credentials/a' \
-  --set 'credentials[1].name=cred-b' --set 'credentials[1].mountPath=/etc/praxis/credentials/b' \
-  --set 'credentials[1].optional=true'
+try_template "$GW_DIR" "gateway with providerCredentials" "${GW_REQ[@]}" \
+  --set 'providerCredentials[0].secretName=cred-a' --set 'providerCredentials[0].mountPath=/etc/praxis/credentials/a' \
+  --set 'providerCredentials[1].secretName=cred-b' --set 'providerCredentials[1].mountPath=/etc/praxis/credentials/b' \
+  --set 'providerCredentials[1].optional=true'
 try_template "$GW_DIR" "hostile podLabels gateway" "${GW_REQ[@]}" \
   --set-string 'podLabels.app\.kubernetes\.io/name=hostile'
 

@@ -441,8 +441,8 @@ spec:
             tls:
               enabled: true
               existingSecret: "provider-gateway-tls"
-            credentials:
-              - name: "vcr-inference-credential"
+            providerCredentials:
+              - secretName: "vcr-inference-credential"
                 mountPath: "/etc/praxis/credentials/vcr-inference"
             podLabels:
               grid.praxis-proxy.io/backend-access: "provider-gateway"

@@ -29,11 +29,11 @@ Overlay ConfigMap: {{ .Values.overlay.existingConfigMap }}
 TLS Secret: {{ .Values.tls.existingSecret }}
   Mount path: {{ .Values.tls.mountPath }}
 {{- end }}
-{{- if .Values.credentials }}
+{{- if .Values.providerCredentials }}
 
-Credential mounts:
-{{- range .Values.credentials }}
-  - {{ .name }} -> {{ .mountPath }}{{ if .optional }} (optional){{ end }}
+Provider credential mounts:
+{{- range .Values.providerCredentials }}
+  - {{ .secretName }} -> {{ include "praxis-gateway.providerCredentialPath" . }}{{ if .optional }} (optional){{ end }}
 {{- end }}
 {{- end }}
 {{- if eq .Values.praxisConfig.source "operator" }}

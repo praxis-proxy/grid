@@ -274,14 +274,19 @@ tls:
   # -- Mount path for TLS files.
   mountPath: "/etc/praxis/tls"
 
-# -- Credential Secret mounts for provider gateways. Each entry mounts an
-# existing Secret at the specified path.
-credentials: []
-# - name: mock-inference-credential
+# -- Provider credential Secrets (API keys, tokens) mounted into the gateway, for
+# provider gateways. You create each Secret; the chart only mounts it. praxis.yaml
+# reads the key from a file under mountPath:
+#   operator: the operator writes <credentialMountBase>/<secret>/<key> into
+#             praxis.yaml. The default mountPath matches the default
+#             credentialMountBase (/run/secrets/grid-credentials).
+#   byo:      set mountPath to the path your praxis.yaml uses.
+#   render:   not read; the chart's renderer has no credential injection.
+providerCredentials: []
+# - secretName: openai-api-key
+#   # mountPath defaults to /run/secrets/grid-credentials/openai-api-key
+# - secretName: mock-inference-credential
 #   mountPath: /etc/praxis/credentials/mock-inference
-#   optional: false
-# - name: mock-inference-secondary-credential
-#   mountPath: /etc/praxis/credentials/mock-inference-secondary
 #   optional: true
 
 # -- Probe configuration.

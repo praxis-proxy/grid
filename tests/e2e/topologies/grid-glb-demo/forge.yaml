@@ -360,10 +360,10 @@ spec:
             tls:
               enabled: true
               existingSecret: "provider-gateway-tls"
-            credentials:
-              - name: "vcr-inference-credential"
+            providerCredentials:
+              - secretName: "vcr-inference-credential"
                 mountPath: "/etc/praxis/credentials/vcr-inference"
-              - name: "vcr-inference-secondary-credential"
+              - secretName: "vcr-inference-secondary-credential"
                 mountPath: "/etc/praxis/credentials/vcr-inference-secondary"
                 optional: true
             podLabels:
