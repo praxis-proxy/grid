@@ -579,7 +579,7 @@
       "type": "integer",
       "minimum": 0,
       "maximum": 25,
-      "description": "Seconds a terminating pod keeps serving before Praxis gets SIGTERM, as a preStop sleep. 0 disables it."
+      "description": "Seconds a terminating pod keeps serving before Praxis gets SIGTERM, as a preStop sleep. 0 disables it, which an image without a sleep binary needs."
     },
     "resources": {
       "type": "object",

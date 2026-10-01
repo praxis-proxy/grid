@@ -261,7 +261,7 @@ Praxis AI image; these values may advance independently.
 | `credentials` | list | `[]` | Existing Secrets mounted read-only (`name`, `mountPath`, `optional`), for example upstream credentials. |
 | `health.readiness` | object | TCP socket on the listener port | Readiness probe. A `tcpSocket` without a port targets the listener port. Set to null to disable. |
 | `health.liveness` | object | TCP socket on the listener port | Liveness probe. Set to null to disable. |
-| `shutdownDelaySeconds` | int | `5` | Seconds a terminating pod keeps serving before Praxis gets SIGTERM, so Service endpoints drop it first and rollouts do not refuse requests. Runs the image's `sleep` as a preStop hook. `0` disables it. |
+| `shutdownDelaySeconds` | int | `5` | Seconds a terminating pod keeps serving before Praxis gets SIGTERM, so Service endpoints drop it first and rollouts do not refuse requests. Runs the image's `sleep` as a preStop hook. `0` disables it, which an image without `sleep` (distroless or scratch) needs. |
 | `resources` | object | `{}` | Container resource requests and limits. |
 | `nodeSelector` | object | `{}` | Node selector. |
 | `affinity` | object | `{}` | Pod affinity rules. |

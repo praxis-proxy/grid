@@ -399,7 +399,8 @@ health:
 # closes its listener as soon as it gets SIGTERM, but Service endpoints take a moment
 # to drop the pod, so without a delay every rollout refuses a few requests. Runs the
 # image's sleep binary as a preStop hook and counts against the pod's 30 second
-# termination grace period. 0 disables it.
+# termination grace period. 0 disables it, which an image without sleep (distroless or
+# scratch) needs.
 shutdownDelaySeconds: 5
 
 # -- Container resource requests and limits.
