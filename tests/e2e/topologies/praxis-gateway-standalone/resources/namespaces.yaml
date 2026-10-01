@@ -1,0 +1,17 @@
+# Both namespaces enforce the restricted Pod Security Standard, so the gateway
+# chart and its helm test pod have to meet it with their default values.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: praxis
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: praxis-backends
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest

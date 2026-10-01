@@ -1241,8 +1241,9 @@ CR_EOF
   # Scope: chart install/upgrade/uninstall wiring and Kubernetes
   # resource creation. Uses pause:3.9 by default because no Praxis
   # binary is available in Kind CI; probes are disabled accordingly.
-  # Real Praxis runtime behavior (mTLS, routing, overlay) is proven
-  # by the multi-cluster GLB demo (cargo xtask env glb-demo --quick).
+  # Real Praxis runtime behavior is proven elsewhere: the standalone
+  # chart by scripts/e2e-praxis-gateway.sh, and mTLS, routing, and
+  # overlays by the multi-cluster GLB demo (cargo xtask env glb-demo --quick).
   echo ""
   echo "=== Praxis Gateway Kind lifecycle (chart wiring, not runtime) ==="
 
