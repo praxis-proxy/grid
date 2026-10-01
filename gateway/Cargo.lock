@@ -1475,7 +1475,9 @@ dependencies = [
  "ai-grid-filters",
  "praxis-ai-filters",
  "praxis-proxy",
+ "praxis-proxy-core",
  "praxis-proxy-filter",
+ "tracing",
 ]
 
 [[package]]

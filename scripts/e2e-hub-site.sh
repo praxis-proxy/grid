@@ -46,6 +46,8 @@ export KIND_EXPERIMENTAL_PODMAN_NETWORK=${KIND_EXPERIMENTAL_PODMAN_NETWORK:-$PRE
 WORK=$(mktemp -d)
 PF_PID=""
 FAILED=0
+# Start of the deliberate-refusal checks; assert_health allows gateway handshake rejections after it.
+REFUSALS_FROM=""
 CREATED=0
 MODE=""
 
@@ -459,6 +461,7 @@ assert_serving() {
     fail "hub identity over mTLS: HTTP $code $(head -c 300 "$WORK/direct.body" 2>/dev/null)"
   fi
 
+  REFUSALS_FROM=$(date -u +%Y-%m-%dT%H:%M:%S)
   code=$(chat_body | site_call "$WORK/nocert" /v1/chat/completions -d @-)
   if tls_refused "$WORK/nocert"; then
     pass "anonymous caller: TLS alert, curl exit $(cat "$WORK/nocert.rc") ($(tr '\n' ' ' <"$WORK/nocert.err" | cut -c1-100))"
@@ -505,7 +508,12 @@ assert_health() {
       continue
     fi
     dir="$ARTIFACTS/$MODE/$ctx"
-    hits=$(cat "$dir"/*.log | strip_ansi | grep -E ' (ERROR)|panic|fatal' | sort -u || true)
+    # Pingora logs refused handshakes at ERROR: gateway TCP probes always, and the
+    # deliberate-refusal checks from REFUSALS_FROM on.
+    hits=$(cat "$dir"/*.log | strip_ansi | grep -E ' (ERROR)|panic|fatal' \
+      | awk -v from="$REFUSALS_FROM" '/^\[pod\/grid-gateway-[^\/]+\/praxis\] .*Downstream handshake error / {
+          if ($0 ~ /tls handshake eof$/ || (from != "" && substr($2, 1, 19) >= from)) next
+        } { print }' | sort -u || true)
     warns=$(cat "$dir"/*.log | strip_ansi | grep -E ' WARN' | sort -u || true)
     if [[ -n $warns ]]; then
       printf 'WARN [%s] %s: %s distinct WARN lines\n%s\n' "$MODE" "$ctx" "$(wc -l <<<"$warns")" "$warns"
@@ -530,6 +538,7 @@ cmd_test() {
   MODE=setup
   plan_addresses
   for MODE in $MODES; do
+    REFUSALS_FROM=""
     log "[$MODE] resetting the $NS namespace on both clusters"
     rm -rf "${ARTIFACTS:?}/$MODE"
     reset_grid

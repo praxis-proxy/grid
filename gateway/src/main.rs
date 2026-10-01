@@ -8,13 +8,39 @@
 //! registry, and runs the Praxis server on the operator-supplied config. When
 //! the operator sets `GRID_SERVING_CONFIG`, it also starts the cross-site pollers
 //! and registers `grid_site_route` over the snapshot they keep fresh. This crate
-//! is its own Cargo workspace so praxis-proxy 0.7.0 resolves independently of the
-//! operator's Kubernetes client stack. See `deploy/gateway/Containerfile` and the
+//! is its own Cargo workspace so Praxis resolves independently of the operator's
+//! Kubernetes client stack. See `deploy/gateway/Containerfile` and the
 //! `gateway-image` make target.
 
-fn main() {
+use std::process::ExitCode;
+
+use praxis_core::config::{Config, ConfigFile, DEFAULT_CONFIG};
+use tracing::info;
+
+/// Log line emitted once tracing is up; the startup test waits for it.
+const STARTUP_MESSAGE: &str = "starting grid-gateway";
+
+fn main() -> ExitCode {
     // Install the crypto provider before anything builds a TLS config.
     praxis::install_crypto_provider();
+
+    // The operator writes the config. The path is `--config <path>` or the
+    // positional argument, else the default search path. Read it once so the
+    // reload watcher baselines on the bytes that run.
+    let explicit = config_arg(std::env::args().skip(1)).unwrap_or_else(|err| praxis::fatal(&err));
+    let config_file = praxis::resolve_config_path(explicit.as_deref())
+        .as_deref()
+        .map(ConfigFile::read)
+        .transpose()
+        .unwrap_or_else(|err| praxis::fatal(&err));
+    let config = praxis::with_bootstrap_logging(|| Config::from_config_file_or(config_file.as_ref(), DEFAULT_CONFIG))
+        .unwrap_or_else(|err| praxis::fatal(&err));
+
+    // Without a subscriber every log line, including reload results, is dropped.
+    let tracing_guard = praxis::init_tracing(&config).unwrap_or_else(|err| praxis::fatal(&err));
+    let log_level = Some(tracing_guard.log_level_state());
+    let log_output = config.runtime.logging.output;
+    info!(version = env!("CARGO_PKG_VERSION"), "{STARTUP_MESSAGE}");
 
     let mut registry = praxis_filter::FilterRegistry::with_builtins();
     praxis_ai_filters::register_ai_filters(&mut registry, None);
@@ -22,25 +48,37 @@ fn main() {
     // Grid cross-site routing is wired when the operator provides a serving
     // config. spawn_grid_routing starts one poller per peer and returns the
     // runtime holding their handles. grid_site_route registers over the snapshot
-    // the pollers refresh. The runtime is bound for the process's life: dropping
-    // it stops the pollers, and run_server never returns, so the binding lives as
-    // long as the server.
-    let _grid_runtime = std::env::var("GRID_SERVING_CONFIG").ok().map(|path| {
-        let config = ai_grid_filters::load_serving_config(&path).unwrap_or_else(|err| praxis::fatal(&err));
-        let runtime = ai_grid_filters::spawn_grid_routing(&config).unwrap_or_else(|err| praxis::fatal(&err));
-        ai_grid_filters::register_grid_filters(&mut registry, runtime.snapshot())
-            .unwrap_or_else(|err| praxis::fatal(&err));
-        runtime
-    });
+    // the pollers refresh. Dropping the runtime stops the pollers, so it is
+    // bound until the server returns.
+    let grid_runtime = match std::env::var("GRID_SERVING_CONFIG")
+        .ok()
+        .map(|path| start_grid_routing(&path, &mut registry))
+    {
+        Some(Err(err)) => return praxis::report_fatal(&err, log_output),
+        Some(Ok(runtime)) => Some(runtime),
+        None => None,
+    };
 
-    // The operator writes the config. The path is `--config <path>` or the
-    // positional argument, else the default search path.
-    let explicit = config_arg(std::env::args().skip(1)).unwrap_or_else(|err| praxis::fatal(&err));
-    let config_path = praxis::resolve_config_path(explicit.as_deref());
-    let config = praxis::load_config(explicit.as_deref()).unwrap_or_else(|err| praxis::fatal(&err));
+    // Returning instead of exiting drops the guard, flushing queued log lines.
+    let result = praxis::try_run_server_with_registry(config, registry, config_file, log_level);
+    drop(grid_runtime);
+    result.map_or_else(|err| praxis::report_fatal(&err, log_output), |()| ExitCode::SUCCESS)
+}
 
-    // Runs the Pingora server and never returns.
-    praxis::run_server_with_registry(config, registry, config_path, None);
+/// Start the cross-site pollers and register `grid_site_route` over their snapshot.
+///
+/// # Errors
+///
+/// Returns the error from loading the serving config, starting the pollers, or
+/// registering the filters.
+fn start_grid_routing(
+    path: &str,
+    registry: &mut praxis_filter::FilterRegistry,
+) -> Result<ai_grid_filters::GridRuntime, praxis_filter::FilterError> {
+    let config = ai_grid_filters::load_serving_config(path)?;
+    let runtime = ai_grid_filters::spawn_grid_routing(&config)?;
+    ai_grid_filters::register_grid_filters(registry, runtime.snapshot())?;
+    Ok(runtime)
 }
 
 /// Usage line for a malformed command line.
