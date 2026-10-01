@@ -112,6 +112,9 @@ jobs:
             helm template validate-schema "$chart" --namespace grid-system "${EXTRA_ARGS[@]}" \
               | kubeconform -strict -kubernetes-version 1.30.0 -skip CustomResourceDefinition -summary
           done
+          echo "--- Validating charts/praxis-gateway (standalone, no values) ---"
+          helm template validate-schema charts/praxis-gateway --namespace praxis \
+            | kubeconform -strict -kubernetes-version 1.30.0 -summary
 
       - name: Upload rendered manifests
         if: always()
