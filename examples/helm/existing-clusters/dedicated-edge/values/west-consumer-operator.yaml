@@ -19,6 +19,4 @@ swim:
     type: LoadBalancer
     port: 7946
 
-gateway:
-  serviceName: consumer-gateway
-  port: "8080"
+# No provider gateway runs on this consumer-only cluster.

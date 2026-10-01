@@ -673,27 +673,31 @@ imagePullSecrets:
 
 ### Service Names
 
-Set `fullnameOverride` to control the exact Service name. The AGN Operator's
-`gateway.serviceName` must match:
+Set `fullnameOverride` to control the provider gateway Service name. The AGN
+Operator's `gateway.serviceName` must match that provider Service:
 
 ```yaml
-# consumer-gateway-overrides.yaml
-fullnameOverride: consumer-gateway
+# provider-gateway-overrides.yaml
+fullnameOverride: provider-gateway
 
 # operator-overrides.yaml
 gateway:
-  serviceName: consumer-gateway
+  serviceName: provider-gateway
 ```
 
 ### Service Type and Ports
 
 ```yaml
 service:
-  type: NodePort        # or LoadBalancer
-  port: 8080
+  type: LoadBalancer    # automatic provider-gateway discovery needs this
+  port: 8443
   annotations:
     service.beta.kubernetes.io/aws-load-balancer-type: nlb
 ```
+
+With a `ClusterIP` or `NodePort` provider Service, set the operator's
+`gateway.address` to a reachable `host:port` instead; the operator cannot
+derive a cross-site address from those Service types.
 
 ### SWIM Addresses
 
@@ -838,15 +842,15 @@ kubectl delete crd gridnetworks.grid.praxis.fast \
 
 ### Service name does not match operator expectation
 
-**Symptom:** Operator logs show it cannot find the consumer gateway
+**Symptom:** Operator logs show it cannot find the provider gateway
 Service.
 
 **Cause:** Helm's fullname template produces `{release}-praxis-gateway`
 by default. If the operator's `gateway.serviceName` expects
-`consumer-gateway`, the names don't match.
+`provider-gateway`, the names don't match.
 
-**Fix:** Set `fullnameOverride: consumer-gateway` in the consumer
-gateway values and `gateway.serviceName: consumer-gateway` in the
+**Fix:** Set `fullnameOverride: provider-gateway` in the provider
+gateway values and `gateway.serviceName: provider-gateway` in the
 operator values.
 
 ### Overlay ConfigMap not created
