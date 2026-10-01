@@ -1261,14 +1261,17 @@ CR_EOF
   echo ""
   echo "=== Praxis Gateway Kind lifecycle (chart wiring, not runtime) ==="
 
-  if helm install test-gateway-missing "$GW_DIR" \
+  if MISSING_OUT=$(helm install test-gateway-missing "$GW_DIR" \
     --namespace grid-system \
     --kube-context "$KCTX" \
     --set config.existingConfigMap=missing-gateway-config \
-    --set nameOverride=test-gateway-missing 2>&1; then
+    --set nameOverride=test-gateway-missing 2>&1); then
     fail "kind: BYO mode accepts a missing ConfigMap"
-  else
+    helm uninstall test-gateway-missing --namespace grid-system --kube-context "$KCTX" >/dev/null 2>&1 || true
+  elif echo "$MISSING_OUT" | grep -Fq 'ConfigMap "missing-gateway-config" not found in namespace "grid-system"'; then
     pass "kind: BYO mode fails when ConfigMap is missing"
+  else
+    fail "kind: BYO mode failed without the missing ConfigMap error: $MISSING_OUT"
   fi
 
   kubectl --context "$KCTX" -n grid-system create configmap test-gateway-config \

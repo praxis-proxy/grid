@@ -121,7 +121,7 @@ helm upgrade --install praxis-gateway charts/praxis-gateway \
   --namespace praxis --set config.existingConfigMap=praxis-config
 ```
 
-In BYO mode, a live Helm install checks that ConfigMap `config.existingConfigMap` already exists in the release namespace. 
+In BYO mode, a live Helm install checks that ConfigMap `config.existingConfigMap` already exists in the release namespace.
 If it is missing, the install fails before creating the Deployment. Offline `helm template` does not require a
 cluster.
 
