@@ -581,6 +581,11 @@
       "maximum": 25,
       "description": "Seconds a terminating pod keeps serving before Praxis gets SIGTERM, as a preStop sleep. 0 disables it, which an image without a sleep binary needs."
     },
+    "terminationGracePeriodSeconds": {
+      "type": ["integer", "null"],
+      "minimum": 1,
+      "description": "Seconds Kubernetes gives a terminating pod before killing it. Null: 30 plus shutdownDelaySeconds."
+    },
     "resources": {
       "type": "object",
       "description": "Container resource requests and limits."

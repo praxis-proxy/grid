@@ -398,10 +398,16 @@ health:
 # -- Seconds a terminating pod keeps serving before Praxis is told to stop. Praxis
 # closes its listener as soon as it gets SIGTERM, but Service endpoints take a moment
 # to drop the pod, so without a delay every rollout refuses a few requests. Runs the
-# image's sleep binary as a preStop hook and counts against the pod's 30 second
-# termination grace period. 0 disables it, which an image without sleep (distroless or
+# image's sleep binary as a preStop hook, and the default terminationGracePeriodSeconds
+# grows to cover it. 0 disables it, which an image without sleep (distroless or
 # scratch) needs.
 shutdownDelaySeconds: 5
+
+# -- Seconds Kubernetes gives a terminating pod before killing it. Empty: 30 plus
+# shutdownDelaySeconds, so Praxis still gets its default 30 seconds
+# (shutdown_timeout_secs) to drain in-flight requests after the delay. Raise it if your
+# Praxis config sets a longer shutdown_timeout_secs. Must exceed shutdownDelaySeconds.
+terminationGracePeriodSeconds: null
 
 # -- Container resource requests and limits.
 resources: {}

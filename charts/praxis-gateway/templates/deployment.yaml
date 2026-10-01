@@ -32,6 +32,15 @@ spec:
     spec:
       enableServiceLinks: false
       automountServiceAccountToken: false
+      {{- /* The preStop delay comes out of the grace period, so add it on top of Praxis's drain time. */}}
+      {{- $delay := int (.Values.shutdownDelaySeconds | default 0) }}
+      {{- $grace := .Values.terminationGracePeriodSeconds }}
+      {{- if kindIs "invalid" $grace }}
+      {{- $grace = add 30 $delay }}
+      {{- else if le (int $grace) $delay }}
+      {{- fail "terminationGracePeriodSeconds must be longer than shutdownDelaySeconds, or the pod is killed before Praxis can drain" }}
+      {{- end }}
+      terminationGracePeriodSeconds: {{ $grace }}
       {{- if and .Values.overlay.enabled .Values.overlay.sidecar.enabled }}
       serviceAccountName: {{ include "praxis-gateway.fullname" . }}-overlay-sync
       {{- end }}
