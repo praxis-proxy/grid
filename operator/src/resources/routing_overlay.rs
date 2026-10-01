@@ -1723,7 +1723,12 @@ pub fn build_overlay_configmap(
 /// The total of the hash-suffixed form is always ≤ 63 characters:
 /// `"grid-overlay-"` (13) + 20 + `"-"` + 20 + `"-"` + 8 = 63.
 pub(crate) fn overlay_configmap_name(network_name: &str, gateway_name: &str) -> String {
-    let raw = format!("grid-overlay-{network_name}-{gateway_name}");
+    scoped_configmap_name("grid-overlay", network_name, gateway_name)
+}
+
+/// `{kind}-{network}-{gateway}`, hash-suffixed past 63 characters for a `kind` of up to 12.
+pub(crate) fn scoped_configmap_name(kind: &str, network_name: &str, gateway_name: &str) -> String {
+    let raw = format!("{kind}-{network_name}-{gateway_name}");
     if raw.len() <= MAX_K8S_NAME {
         return raw;
     }
@@ -1731,7 +1736,7 @@ pub(crate) fn overlay_configmap_name(network_name: &str, gateway_name: &str) -> 
     let hash = fnv1a_hex8(&format!("{network_name}/{gateway_name}"));
     let net_prefix: String = network_name.chars().take(MAX_COMPONENT_PREFIX).collect();
     let gw_prefix: String = gateway_name.chars().take(MAX_COMPONENT_PREFIX).collect();
-    format!("grid-overlay-{net_prefix}-{gw_prefix}-{hash}")
+    format!("{kind}-{net_prefix}-{gw_prefix}-{hash}")
 }
 
 /// FNV-1a 32-bit hash, returned as 8 lowercase hexadecimal digits.
@@ -1753,7 +1758,7 @@ pub(crate) fn fnv1a_hex8(input: &str) -> String {
 }
 
 /// Build the standard labels for an overlay `ConfigMap`.
-fn overlay_labels(network_name: &str, gateway_name: &str) -> BTreeMap<String, String> {
+pub(crate) fn overlay_labels(network_name: &str, gateway_name: &str) -> BTreeMap<String, String> {
     BTreeMap::from([
         ("app.kubernetes.io/managed-by".to_owned(), "grid-operator".to_owned()),
         ("grid.praxis-proxy.io/gateway".to_owned(), gateway_name.to_owned()),

@@ -102,6 +102,10 @@ pub struct PeerServingConfig {
 
     /// PEM file the client private key is read from.
     pub client_key_path: String,
+
+    /// Leaf SHA-256 digests the peer must also match, rendered under pin trust only.
+    #[serde(default)]
+    pub pins: Vec<String>,
 }
 
 /// The running control plane: the shared snapshot the filter reads and the
@@ -254,6 +258,7 @@ fn build_scraper(peer: &PeerServingConfig) -> Result<PeerScraper, FilterError> {
         Duration::from_millis(peer.connect_timeout_ms),
         Duration::from_millis(peer.request_timeout_ms),
     )
+    .map(|scraper| scraper.with_pins(&peer.pins))
     .map_err(|error| -> FilterError { format!("grid: building scraper for {}: {error}", peer.site).into() })
 }
 
@@ -368,6 +373,33 @@ peers:
         assert_eq!(config.candidates.len(), 1);
     }
 
+    #[test]
+    fn the_operator_rendered_config_parses_and_validates() {
+        // Rendered by the operator's serving_config golden test.
+        let json = include_str!("../testdata/serving-config.json");
+        let config: GridServingConfig = serde_yaml::from_str(json).expect("operator output parses");
+        validate_local_site(&config.local_site).expect("local site");
+        validate_candidates(config.candidates).expect("candidates");
+        for peer in &config.peers {
+            validate_peer(peer).expect("peer");
+            ServerName::try_from(peer.server_name.clone()).expect("server name");
+        }
+    }
+
+    #[test]
+    fn declared_pins_parse_and_default_to_none() {
+        let peer = |extra: &str| {
+            format!(
+                "site: east\naddr: 10.0.0.1:9091\nserver_name: east.grid.internal\nauthority: east.grid.internal\n\
+                 grid_ca_path: /ca\nclient_cert_path: /crt\nclient_key_path: /key\n{extra}"
+            )
+        };
+        let pinned: PeerServingConfig = serde_yaml::from_str(&peer("pins: [abcd]\n")).expect("pinned parses");
+        assert_eq!(pinned.pins, ["abcd"]);
+        let bare: PeerServingConfig = serde_yaml::from_str(&peer("")).expect("bare parses");
+        assert!(bare.pins.is_empty(), "SPIFFE only without pins");
+    }
+
     fn valid_peer() -> PeerServingConfig {
         PeerServingConfig {
             site: "east".to_owned(),
@@ -381,6 +413,7 @@ peers:
             grid_ca_path: "/etc/grid/ca.pem".to_owned(),
             client_cert_path: "/etc/grid/tls.crt".to_owned(),
             client_key_path: "/etc/grid/tls.key".to_owned(),
+            pins: Vec::new(),
         }
     }
 

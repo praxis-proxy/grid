@@ -37,6 +37,8 @@ pub(crate) mod provider_metrics;
 pub mod routing_overlay;
 /// Secret builders for grid TLS certificates.
 pub mod secret;
+/// Grid serving config the gateway's cross-site pollers read.
+pub(crate) mod serving_config;
 /// Shared Kubernetes Secret test doubles, reused by `secret`/`endpoint_tls`
 /// unit tests instead of each keeping its own copy of the same mock.
 #[cfg(test)]

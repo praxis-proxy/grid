@@ -277,7 +277,7 @@ pub fn build_overlay_envelope(
 
 /// Encode a byte slice as lowercase hexadecimal.
 #[expect(clippy::let_underscore_must_use, reason = "writing to String is infallible")]
-fn hex_encode(bytes: &[u8]) -> String {
+pub(crate) fn hex_encode(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for &b in bytes {
         let _ = write!(s, "{b:02x}");

@@ -74,6 +74,14 @@ pub struct SignalsArgs {
     )]
     pub max_per_peer: usize,
 
+    /// This site's own signals endpoint, for its gateway.
+    #[arg(
+        long = "signals-local-addr",
+        env = "GRID_SIGNALS_LOCAL_ADDR",
+        value_parser = parse_local_signals_endpoint
+    )]
+    pub local_addr: Option<String>,
+
     /// Local provider scrape interval, seconds.
     #[arg(
         long = "signals-scrape-interval-secs",
@@ -162,6 +170,14 @@ fn parse_signals_endpoint(text: &str) -> Result<String, String> {
         .ok_or_else(|| format!("{text:?} is not ip:port, [ipv6]:port, or dns-name:port"))
 }
 
+/// [`parse_signals_endpoint`], keeping a blank value as unset.
+fn parse_local_signals_endpoint(text: &str) -> Result<String, String> {
+    if text.trim().is_empty() {
+        return Ok(String::new());
+    }
+    parse_signals_endpoint(text)
+}
+
 impl SignalsArgs {
     /// Local scrape interval, floored at 50ms.
     #[must_use]
@@ -187,6 +203,12 @@ impl SignalsArgs {
             .filter(|name| !name.is_empty())
             .map(str::to_owned)
             .collect()
+    }
+
+    /// This site's own signals endpoint, `None` when blank.
+    #[must_use]
+    pub fn local_addr(&self) -> Option<String> {
+        self.local_addr.clone().filter(|addr| !addr.trim().is_empty())
     }
 }
 
@@ -228,6 +250,23 @@ mod tests {
             Some("east.example:9091")
         );
         for bad in ["fd00::1", "x@169.254.169.254:443", "evil.example/x?:9091"] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
+    }
+
+    /// The local signals endpoint is parsed strictly; blank stays unset.
+    #[test]
+    fn signals_local_addr_is_strict() {
+        let parse = |value: &str| {
+            Cli::try_parse_from(["grid-operator", "--signals-local-addr", value]).map(|cli| cli.signals.local_addr())
+        };
+        assert_eq!(
+            parse("East.Example:9091").ok().flatten().as_deref(),
+            Some("east.example:9091"),
+            "normalized"
+        );
+        assert_eq!(parse(" ").ok().flatten(), None, "blank is unset");
+        for bad in ["east.example", "east.example:9091/x"] {
             assert!(parse(bad).is_err(), "{bad}");
         }
     }

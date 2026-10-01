@@ -133,7 +133,11 @@ async fn main() {
         },
     };
     let signals_enabled = matches!(signal_mode, SignalMode::Poll);
-    let peer_settings = grid_network::PeerSettings { trust };
+    let peer_settings = grid_network::PeerSettings {
+        local_signals_addr: config.signals.local_addr(),
+        trust,
+        peer_port: config.signals.peer_port,
+    };
     let ctx = Arc::new(
         OperatorCtx::new(client.clone(), None, signal_mode)
             .with_peer_settings(peer_settings)

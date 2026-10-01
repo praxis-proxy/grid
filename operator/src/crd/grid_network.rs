@@ -927,8 +927,11 @@ fn default_consumer_config_map_name() -> String {
 }
 
 /// Default TLS certificate mount path inside the consumer pod.
+pub(crate) const DEFAULT_TLS_CERT_MOUNT_PATH: &str = "/etc/praxis/tls";
+
+/// Default TLS certificate mount path inside the consumer pod.
 fn default_tls_cert_mount_path() -> String {
-    "/etc/praxis/tls".to_owned()
+    DEFAULT_TLS_CERT_MOUNT_PATH.to_owned()
 }
 
 /// Default HTTP listener port for the generated consumer Praxis config.
