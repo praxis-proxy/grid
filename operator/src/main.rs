@@ -16,12 +16,14 @@
 //! `GridNetwork.status.connectedSites` and `distributedProviderCount` remain
 //! 0, and the phase stays `Pending`/`Initializing` based on TLS configuration
 //! only.
+//! `GRID_SWIM_SERVICE_NAME` advertises that Service's `LoadBalancer` address instead.
 //!
 //! # SWIM encryption (environment variable)
 //!
-//! Set `GRID_SWIM_ENCRYPT_KEY` to a 64-character lowercase hex string (32 bytes)
+//! Set `GRID_SWIM_ENCRYPT_KEY` to a 64-character hex string (32 bytes)
 //! to enable AES-256-GCM encryption for all SWIM gossip packets.  When set,
-//! packets from peers without the same key are silently dropped.
+//! packets from peers without the same key are dropped.
+//! A malformed value stops the operator.
 //!
 //! This is the environment-variable path, intended for local development and
 //! Kind-based testing.  Environment variables are visible to same-host process
@@ -29,6 +31,7 @@
 //! `GridNetwork.spec.tls.swimKeyRef` to source the key from a Kubernetes
 //! Secret; the `GridNetwork` controller loads it and calls
 //! `SwimHandle::set_swim_key` at reconcile time.
+//! SWIM holds all traffic until a key loads or no `GridNetwork` declares one.
 //!
 //! The key value is **never** written to logs or tracing spans.
 //!
@@ -53,7 +56,7 @@ use std::{
 use axum::response::IntoResponse as _;
 use clap::Parser as _;
 use futures::StreamExt as _;
-use k8s_openapi::api::core::v1::ConfigMap;
+use k8s_openapi::api::core::v1::{ConfigMap, Service};
 use kube::{
     Api, Client,
     api::{ObjectMeta, PostParams},
@@ -74,6 +77,7 @@ use operator::{
     },
     gateway,
     resources::tls_backend::{self, ServerTlsConfig},
+    swim_advertise,
     swim_endpoint::{SwimEndpoint, resolve_endpoint, resolve_endpoint_list_partial},
     swim_runtime::{self, RevisionLease, SwimConfig},
 };
@@ -107,6 +111,7 @@ async fn main() {
         },
     };
 
+    // Probes answer during enrollment and the LoadBalancer wait.
     let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let metrics_server = tokio::spawn(run_metrics_server(Arc::clone(&ready)));
 
@@ -117,23 +122,6 @@ async fn main() {
         std::process::exit(1);
     }
 
-    let swim = match maybe_start_swim(&client, &config.gateway).await {
-        Ok(swim) => swim,
-        Err(error) => {
-            tracing::error!(%error, "SWIM startup failed");
-            std::process::exit(1);
-        },
-    };
-    ready.store(true, std::sync::atomic::Ordering::Release);
-
-    if let Some(handle) = &swim {
-        tokio::spawn(gateway::run_discovery_poller(
-            client.clone(),
-            Arc::clone(handle),
-            config.gateway.clone(),
-        ));
-    }
-
     let signal_mode = match resolve_signal_mode(&client).await {
         Ok(mode) => mode,
         Err(error) => {
@@ -142,8 +130,10 @@ async fn main() {
         },
     };
     let signals_enabled = matches!(signal_mode, SignalMode::Poll);
-    let swim_for_poller = swim.clone();
-    let ctx = Arc::new(OperatorCtx::new(client.clone(), swim, signal_mode));
+    let ctx = Arc::new(OperatorCtx::new(client.clone(), None, signal_mode).hold_membership());
+
+    // Controllers run now. Only SWIM and what dials peers wait on the advertise address.
+    let (swim_tx, swim_rx) = tokio::sync::watch::channel(SwimStage::Starting);
 
     // A round of peer polls can be in flight when the pod is told to terminate;
     // the trigger lets it stand down cleanly rather than being dropped mid-await.
@@ -157,13 +147,21 @@ async fn main() {
     }
 
     let result = tokio::try_join!(
-        run_network_controller(client.clone(), Arc::clone(&ctx)),
+        start_swim(
+            client.clone(),
+            config.clone(),
+            Arc::clone(&ctx),
+            Arc::clone(&ready),
+            swim_tx,
+        ),
+        run_network_controller(client.clone(), Arc::clone(&ctx), swim_rx.clone()),
         run_site_controller(client.clone()),
         run_provider_controller(client.clone()),
         run_agent_tool_provider_controller(client.clone()),
         async { metrics_server.await? },
         run_signals_server(
             signals_enabled,
+            swim_rx.clone(),
             client.clone(),
             Published {
                 site: ctx.signals(),
@@ -174,7 +172,7 @@ async fn main() {
         run_peer_poller(
             signals_enabled,
             Arc::clone(&ctx),
-            swim_for_poller,
+            swim_rx,
             client.clone(),
             shutdown.clone(),
         ),
@@ -184,6 +182,87 @@ async fn main() {
     if let Err(e) = result {
         tracing::error!(error = %e, "controller error");
         std::process::exit(1);
+    }
+}
+
+/// Where SWIM startup stands.
+#[derive(Clone)]
+enum SwimStage {
+    /// Waiting for the advertise address or the runtime.
+    Starting,
+    /// Done: the runtime, or `None` when SWIM is not configured.
+    Settled(Option<Arc<swim_runtime::SwimHandle>>),
+}
+
+/// SWIM startup progress, watched by what waits on the advertise address.
+type SwimStartup = tokio::sync::watch::Receiver<SwimStage>;
+
+/// Start SWIM off the controllers' path, marking ready once it runs or is not configured.
+///
+/// # Errors
+///
+/// Returns the reason SWIM cannot start, which stops the operator.
+async fn start_swim(
+    client: Client,
+    cli: Cli,
+    ctx: Arc<OperatorCtx>,
+    ready: Arc<std::sync::atomic::AtomicBool>,
+    started: tokio::sync::watch::Sender<SwimStage>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let swim = Box::pin(maybe_start_swim(&client, &cli))
+        .await
+        .map_err(|error| format!("SWIM startup failed: {error}"))?;
+    if let Some(handle) = &swim {
+        ctx.set_swim(Arc::clone(handle));
+        tokio::spawn(gateway::run_discovery_poller(
+            client.clone(),
+            Arc::clone(handle),
+            cli.gateway.clone(),
+        ));
+        let (handle, ctx) = (Arc::clone(handle), Arc::clone(&ctx));
+        tokio::spawn(async move {
+            let members = || !handle.snapshot().members.is_empty();
+            converged(members, handle.reconciliation_events(), MEMBERSHIP_GRACE).await;
+            ctx.release_membership();
+        });
+    } else {
+        ctx.release_membership();
+    }
+    started.send_replace(SwimStage::Settled(swim));
+    ready.store(true, std::sync::atomic::Ordering::Release);
+    Ok(())
+}
+
+/// Longest wait for a first peer before membership-derived writes run without one.
+const MEMBERSHIP_GRACE: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Wait until `has_members` holds, rechecked on each `changes` item, or `grace` passes.
+async fn converged(
+    has_members: impl Fn() -> bool,
+    changes: impl futures::Stream<Item = ()>,
+    grace: std::time::Duration,
+) {
+    let mut changes = std::pin::pin!(changes);
+    let deadline = tokio::time::sleep(grace);
+    let mut deadline = std::pin::pin!(deadline);
+    while !has_members() {
+        tokio::select! {
+            () = &mut deadline => return,
+            next = changes.next() => if next.is_none() { return },
+        }
+    }
+}
+
+/// The SWIM runtime once startup settles, `None` when none runs.
+async fn swim_settled(mut startup: SwimStartup) -> Option<Arc<swim_runtime::SwimHandle>> {
+    let stage = startup
+        .wait_for(|stage| matches!(stage, SwimStage::Settled(_)))
+        .await
+        .ok()?
+        .clone();
+    match stage {
+        SwimStage::Settled(swim) => swim,
+        SwimStage::Starting => None,
     }
 }
 
@@ -239,42 +318,21 @@ async fn resolve_signal_mode(client: &Client) -> Result<SignalMode, String> {
     clippy::large_stack_frames,
     reason = "sequential env-var parsing + runtime startup; splitting would obscure the startup sequence"
 )]
-async fn maybe_start_swim(
-    client: &Client,
-    config: &gateway::Config,
-) -> Result<Option<Arc<swim_runtime::SwimHandle>>, String> {
+async fn maybe_start_swim(client: &Client, cli: &Cli) -> Result<Option<Arc<swim_runtime::SwimHandle>>, String> {
     let Some(addr_str) = std::env::var("GRID_SWIM_BIND_ADDR").ok() else {
         return Ok(None);
     };
-    let bind_addr = match addr_str.parse() {
+    let bind_addr: SocketAddr = match addr_str.parse() {
         Ok(a) => a,
         Err(e) => {
             tracing::error!(addr = %addr_str, error = %e, "GRID_SWIM_BIND_ADDR not a valid socket address");
             return Err(format!("GRID_SWIM_BIND_ADDR is not a valid socket address: {e}"));
         },
     };
-    let advertise_addr = match std::env::var("GRID_SWIM_ADVERTISE_ADDR") {
-        Ok(value) => {
-            let endpoint = match value.parse::<SwimEndpoint>() {
-                Ok(endpoint) => endpoint,
-                Err(error) => {
-                    tracing::error!(env = "GRID_SWIM_ADVERTISE_ADDR", value = %value, %error, "invalid SWIM endpoint");
-                    return Err(format!("GRID_SWIM_ADVERTISE_ADDR is invalid: {error}"));
-                },
-            };
-            match resolve_endpoint(&endpoint, "GRID_SWIM_ADVERTISE_ADDR").await {
-                Ok(addresses) => {
-                    let resolved = addresses.first().copied();
-                    if let Some(address) = resolved {
-                        tracing::info!(configured = %endpoint.as_text(), %address, "resolved SWIM advertise endpoint");
-                    }
-                    resolved
-                },
-                Err(error) => return Err(format!("cannot resolve GRID_SWIM_ADVERTISE_ADDR: {error}")),
-            }
-        },
-        Err(_) => None,
-    };
+    let (advertise_addr, lb_watch) = swim_advertise_addr(client, bind_addr).await?;
+    if advertise_addr.unwrap_or(bind_addr).ip().is_unspecified() {
+        return Err("refusing to advertise an unspecified SWIM address; set GRID_SWIM_ADVERTISE_ADDR".to_owned());
+    }
     let seed_values = std::env::var("GRID_SWIM_SEEDS").unwrap_or_default();
     let seed_values: Vec<String> = seed_values.split(',').map(str::to_owned).collect();
     let seed_resolution = resolve_endpoint_list_partial(&seed_values, "GRID_SWIM_SEEDS").await;
@@ -295,14 +353,17 @@ async fn maybe_start_swim(
     }
     let seeds = seed_resolution.addresses;
     let site_name = std::env::var("GRID_SWIM_SITE_NAME").unwrap_or_else(|_| hostname_or_default());
-    let gateway_address = match gateway::resolve(client, config).await {
+    let gateway_address = match gateway::resolve(client, &cli.gateway).await {
         Ok(addr) => addr,
         Err(e) => {
             tracing::error!(error = %e, "gateway address discovery failed; continuing without");
             None
         },
     };
-    let swim_key = parse_swim_key_env("GRID_SWIM_ENCRYPT_KEY");
+    let (key, retry_key) = match parse_swim_key_env("GRID_SWIM_ENCRYPT_KEY")? {
+        Some(key) => (swim_runtime::KeyState::Key(Arc::new(key)), false),
+        None => startup_key_state(client, cli.swim.require_key).await,
+    };
     let revision_lease = match reserve_revision_lease(client, &site_name).await {
         Ok(lease) => lease,
         Err(error) => {
@@ -316,12 +377,22 @@ async fn maybe_start_swim(
         site_name: site_name.clone(),
         seeds,
         gateway_address,
-        swim_key,
+        key,
         revision_lease,
     };
     match swim_runtime::start(cfg).await {
         Ok(handle) => {
             tracing::info!(addr = %addr_str, "SWIM runtime started");
+            if let Some(watch) = lb_watch {
+                tokio::spawn(watch.restart_on_change(Arc::clone(&handle)));
+            }
+            if retry_key {
+                tokio::spawn(retry_startup_key(
+                    client.clone(),
+                    Arc::clone(&handle),
+                    cli.swim.require_key,
+                ));
+            }
             Ok(Some(handle))
         },
         Err(e) => {
@@ -329,6 +400,238 @@ async fn maybe_start_swim(
             Ok(None)
         },
     }
+}
+
+/// What the `GridNetwork`s declare about the SWIM key.
+#[derive(Clone, Debug)]
+enum DeclaredKey {
+    /// No `GridNetwork` exists yet.
+    NoNetwork,
+    /// A `GridNetwork` exists and names no key.
+    None,
+    /// The first `swimKeyRef` found.
+    Ref(operator::crd::grid_network::SecretRef),
+}
+
+/// SWIM key state before the first send, and whether listing failed and must be retried.
+async fn startup_key_state(client: &Client, require_key: bool) -> (swim_runtime::KeyState, bool) {
+    match declared_swim_key(client).await {
+        Ok(declared) => (key_state_for(client, &declared, require_key).await, false),
+        Err(error) => {
+            tracing::warn!(%error, "cannot list GridNetworks at SWIM startup; holding and retrying");
+            (swim_runtime::KeyState::Pending, true)
+        },
+    }
+}
+
+/// The state `declared` calls for: held for an unloaded key, or for no network when one is required.
+async fn key_state_for(client: &Client, declared: &DeclaredKey, require_key: bool) -> swim_runtime::KeyState {
+    use swim_runtime::KeyState;
+    let key_ref = match unkeyed_state(declared, require_key) {
+        Ok(state) => return state,
+        Err(key_ref) => key_ref,
+    };
+    match operator::resources::secret::read_swim_key(client, key_ref).await {
+        Ok(Some(key)) => return KeyState::Key(Arc::new(key)),
+        Ok(None) => tracing::warn!(secret = %key_ref.name, "swimKeyRef holds no valid key yet; holding SWIM"),
+        Err(error) => tracing::warn!(secret = %key_ref.name, %error, "swimKeyRef not readable yet; holding SWIM"),
+    }
+    KeyState::Pending
+}
+
+/// The state when no key is to be read, else the key reference to read.
+fn unkeyed_state(
+    declared: &DeclaredKey,
+    require_key: bool,
+) -> Result<swim_runtime::KeyState, &operator::crd::grid_network::SecretRef> {
+    match declared {
+        DeclaredKey::NoNetwork if require_key => Ok(swim_runtime::KeyState::Pending),
+        DeclaredKey::NoNetwork | DeclaredKey::None => Ok(swim_runtime::KeyState::Plain),
+        DeclaredKey::Ref(key_ref) => Err(key_ref),
+    }
+}
+
+/// Retry the startup key decision until `GridNetwork`s list, then apply it.
+async fn retry_startup_key(client: Client, handle: Arc<swim_runtime::SwimHandle>, require_key: bool) {
+    for delay in startup_retry_delays() {
+        tokio::time::sleep(delay).await;
+        match declared_swim_key(&client).await {
+            Ok(declared) => {
+                match key_state_for(&client, &declared, require_key).await {
+                    swim_runtime::KeyState::Key(key) => drop(handle.set_swim_key(*key)),
+                    swim_runtime::KeyState::Plain => drop(handle.release_plain()),
+                    swim_runtime::KeyState::Pending => {},
+                }
+                tracing::info!(?declared, "SWIM startup key decision applied");
+                return;
+            },
+            Err(error) => tracing::warn!(%error, ?delay, "still cannot list GridNetworks for the SWIM key"),
+        }
+    }
+}
+
+/// Backoff between startup key retries: doubling from one second, capped at a minute.
+fn startup_retry_delays() -> impl Iterator<Item = std::time::Duration> {
+    std::iter::successors(Some(std::time::Duration::from_secs(1)), |delay| {
+        Some((*delay * 2).min(STARTUP_RETRY_MAX))
+    })
+}
+
+/// Longest wait between startup key retries.
+const STARTUP_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// What the `GridNetwork`s declare about the SWIM key, listed under [`STARTUP_LIST_TIMEOUT`].
+async fn declared_swim_key(client: &Client) -> Result<DeclaredKey, String> {
+    let networks: Api<GridNetwork> = Api::all(client.clone());
+    let list = tokio::time::timeout(STARTUP_LIST_TIMEOUT, networks.list(&kube::api::ListParams::default()))
+        .await
+        .map_err(|_elapsed| "timed out".to_owned())?
+        .map_err(|error| error.to_string())?;
+    Ok(declared_of(&list.items))
+}
+
+/// The key declaration across `networks`.
+fn declared_of(networks: &[GridNetwork]) -> DeclaredKey {
+    if networks.is_empty() {
+        return DeclaredKey::NoNetwork;
+    }
+    networks
+        .iter()
+        .find_map(|n| n.spec.tls.swim_key_ref.clone())
+        .map_or(DeclaredKey::None, DeclaredKey::Ref)
+}
+
+/// Bound on each startup API call.
+const STARTUP_LIST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The SWIM advertise address, and the `LoadBalancer` to watch when it was discovered.
+async fn swim_advertise_addr(
+    client: &Client,
+    bind_addr: SocketAddr,
+) -> Result<(Option<SocketAddr>, Option<LbWatch>), String> {
+    let text = match swim_advertise::plan(
+        std::env::var("GRID_SWIM_ADVERTISE_ADDR").ok(),
+        std::env::var("GRID_SWIM_ADVERTISE_FALLBACK").ok(),
+        std::env::var("GRID_SWIM_SERVICE_NAME").ok(),
+    ) {
+        swim_advertise::Plan::Explicit(value) => value,
+        swim_advertise::Plan::Pod(chart) => std::env::var("POD_IP")
+            .ok()
+            .and_then(|ip| swim_advertise::pod_endpoint(&ip, bind_addr.port()))
+            .unwrap_or(chart),
+        swim_advertise::Plan::Local => return Ok((None, None)),
+        swim_advertise::Plan::LoadBalancer(service) => {
+            let watch = LbWatch::discover(client, service, bind_addr.port()).await?;
+            return Ok((Some(watch.addr), Some(watch)));
+        },
+    };
+    let endpoint = text
+        .parse::<SwimEndpoint>()
+        .map_err(|error| format!("GRID_SWIM_ADVERTISE_ADDR is invalid: {error}"))?;
+    let addresses = resolve_endpoint(&endpoint, "GRID_SWIM_ADVERTISE_ADDR")
+        .await
+        .map_err(|error| format!("cannot resolve GRID_SWIM_ADVERTISE_ADDR: {error}"))?;
+    let resolved = addresses.first().copied();
+    if let Some(address) = resolved {
+        tracing::info!(configured = %endpoint.as_text(), %address, "resolved SWIM advertise endpoint");
+    }
+    Ok((resolved, None))
+}
+
+/// The SWIM Service whose `LoadBalancer` address this site advertises.
+struct LbWatch {
+    /// Services in the operator namespace.
+    services: Api<Service>,
+    /// SWIM Service name.
+    service: String,
+    /// SWIM bind port, to pick the Service port.
+    port: u16,
+    /// Address advertised at startup.
+    addr: SocketAddr,
+    /// Ingress text `addr` was resolved from, watched for change.
+    text: String,
+}
+
+/// Wait for a leave to reach peers before exiting.
+const LEAVE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+impl LbWatch {
+    /// Wait for the Service's `LoadBalancer` address, however long it takes.
+    async fn discover(client: &Client, service: String, port: u16) -> Result<Self, String> {
+        let watch = Self {
+            services: Api::default_namespaced(client.clone()),
+            service,
+            port,
+            addr: SocketAddr::from(([0, 0, 0, 0], 0)),
+            text: String::new(),
+        };
+        tracing::info!(service = %watch.service, "waiting for SWIM Service LoadBalancer address");
+        let (advertised, addr) = swim_advertise::wait_for_lb(
+            || watch.resolved(),
+            swim_advertise::LB_POLL_INTERVAL,
+            swim_advertise::LB_PATIENCE,
+        )
+        .await?;
+        tracing::info!(lb = %advertised, %addr, "discovered SWIM advertise address");
+        Ok(Self {
+            addr,
+            text: advertised,
+            ..watch
+        })
+    }
+
+    /// The Service, refused when it is not a `LoadBalancer`.
+    async fn load_balancer(&self) -> Result<Option<Service>, swim_advertise::LookupError> {
+        let svc = self
+            .services
+            .get_opt(&self.service)
+            .await
+            .map_err(|error| swim_advertise::LookupError::Retry(error.to_string()))?;
+        svc.as_ref().map(swim_advertise::require_load_balancer).transpose()?;
+        Ok(svc)
+    }
+
+    /// The address text and its first resolution, retried while a hostname has no DNS.
+    async fn resolved(&self) -> Result<Option<(String, SocketAddr)>, swim_advertise::LookupError> {
+        let Some(text) = self
+            .load_balancer()
+            .await?
+            .and_then(|svc| swim_advertise::lb_endpoint(&svc, self.port))
+        else {
+            return Ok(None);
+        };
+        let addresses = resolve_text(&text).await.map_err(swim_advertise::LookupError::Retry)?;
+        Ok(addresses.first().map(|addr| (text, *addr)))
+    }
+
+    /// Every ingress endpoint the Service lists now, unresolved.
+    async fn ingress(&self) -> Result<Option<Vec<String>>, swim_advertise::LookupError> {
+        Ok(self
+            .load_balancer()
+            .await?
+            .map(|svc| swim_advertise::lb_endpoints(&svc, self.port)))
+    }
+
+    /// Leave the cluster and exit once the advertised address changes.
+    async fn restart_on_change(self, swim: Arc<swim_runtime::SwimHandle>) {
+        let current =
+            swim_advertise::watch_lb(|| self.ingress(), &self.text, swim_advertise::LB_SLOW_POLL_INTERVAL).await;
+        tracing::warn!(
+            advertised = %self.text,
+            ?current,
+            "SWIM Service LoadBalancer address changed; leaving to advertise the new one"
+        );
+        swim.leave(LEAVE_WAIT).await;
+        std::process::exit(0);
+    }
+}
+
+/// Resolve one `host:port` endpoint text.
+async fn resolve_text(text: &str) -> Result<Vec<SocketAddr>, String> {
+    let endpoint = text
+        .parse::<SwimEndpoint>()
+        .map_err(|error| format!("{text}: {error}"))?;
+    resolve_endpoint(&endpoint, "GRID_SWIM_SERVICE_NAME").await
 }
 
 /// Number of revisions reserved durably for each operator process.
@@ -494,44 +797,41 @@ fn unix_nanos() -> Result<u64, String> {
 
 /// Parse `GRID_SWIM_ENCRYPT_KEY` as a 32-byte AES-256-GCM key from 64 hex characters.
 ///
-/// Returns `None` when the env var is absent (no encryption).
-/// Logs an error and returns `None` when the value is present but malformed.
+/// Absent is `Ok(None)`. Present but malformed is an error, never a silent fallback to plaintext.
 ///
 /// # Security invariant
 ///
 /// The decoded key bytes are never written to logs or tracing spans.
-fn parse_swim_key_env(name: &str) -> Option<swim::crypto::SwimKey> {
-    let hex = std::env::var(name).ok()?;
+fn parse_swim_key_env(name: &str) -> Result<Option<swim::crypto::SwimKey>, String> {
+    let Ok(hex) = std::env::var(name) else {
+        return Ok(None);
+    };
+    let key = parse_swim_key(&hex).map_err(|reason| format!("{name} {reason}"))?;
+    tracing::info!(env = name, "SWIM encryption key loaded from environment");
+    Ok(Some(key))
+}
+
+/// Decode 64 hex characters into a 32-byte key.
+fn parse_swim_key(hex: &str) -> Result<swim::crypto::SwimKey, &'static str> {
     let hex = hex.trim();
     if hex.len() != 64 {
-        tracing::error!(
-            env = name,
-            len = hex.len(),
-            "SWIM encryption key must be a 64-character hex string (32 bytes); ignoring"
-        );
-        return None;
+        return Err("must be 64 hex characters (32 bytes)");
     }
-    // Parse hex byte-by-byte using char::to_digit to avoid string slice indexing.
-    // to_digit(16) returns 0..=15 as u32; cast to u8 is safe and done immediately.
-    let hex_nibbles: Vec<u8> = hex
+    // to_digit(16) yields 0..=15, so the cast to u8 cannot truncate.
+    let nibbles: Vec<u8> = hex
         .chars()
         .filter_map(|c| c.to_digit(16).and_then(|n| u8::try_from(n).ok()))
         .collect();
-    if hex_nibbles.len() != 64 {
-        tracing::error!(
-            env = name,
-            "SWIM encryption key contains invalid hex character; ignoring"
-        );
-        return None;
+    if nibbles.len() != 64 {
+        return Err("contains a character that is not hex");
     }
     let mut key = [0_u8; 32];
-    for (i, byte) in key.iter_mut().enumerate() {
-        let hi = hex_nibbles.get(i * 2).copied().unwrap_or(0);
-        let lo = hex_nibbles.get(i * 2 + 1).copied().unwrap_or(0);
-        *byte = (hi << 4) | lo;
+    for (byte, pair) in key.iter_mut().zip(nibbles.chunks_exact(2)) {
+        if let [hi, lo] = pair {
+            *byte = (hi << 4) | lo;
+        }
     }
-    tracing::info!(env = name, "SWIM encryption key loaded from environment");
-    Some(key)
+    Ok(key)
 }
 
 /// Return the machine hostname or a safe fallback.
@@ -556,13 +856,10 @@ fn hostname_or_default() -> String {
 /// Metrics TLS rotation is detected by bounded requeue rather than a
 /// cluster-wide Secret watch — the operator only reads referenced
 /// Secrets by explicit namespace/name during reconciliation.
-#[expect(
-    clippy::too_many_lines,
-    reason = "controller setup with two cross-resource watches and optional SWIM"
-)]
 async fn run_network_controller(
     client: Client,
     ctx: Arc<OperatorCtx>,
+    swim: SwimStartup,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let api = Api::<GridNetwork>::all(client.clone());
     let provider_api = Api::<InferenceProvider>::all(client.clone());
@@ -579,22 +876,49 @@ async fn run_network_controller(
             watcher::Config::default(),
             grid_network::network_refs_from_grid_site,
         );
-    let controller = if let Some(swim) = ctx.swim.as_ref() {
-        controller.reconcile_all_on(swim.reconciliation_events())
-    } else {
-        controller
-    };
+    // Reconcile everything once SWIM starts, then on every membership change.
+    let swim_events = futures::stream::once(swim_settled(swim))
+        .filter_map(std::future::ready)
+        .flat_map(|handle| futures::stream::once(std::future::ready(())).chain(handle.reconciliation_events()));
     controller
+        .reconcile_all_on(swim_events)
         .run(grid_network::reconcile, grid_network::error_policy, ctx)
         .for_each(|result| async {
             match result {
                 Ok((obj, _action)) => tracing::info!(%obj, "reconciled GridNetwork"),
-                Err(e) => tracing::error!(error = ?e, "GridNetwork watch error"),
+                Err(e) => log_controller_error("GridNetwork", &e),
             }
         })
         .await;
 
     Ok(())
+}
+
+/// Log a controller error, an expired watch at debug since kube-runtime relists.
+fn log_controller_error<R: std::fmt::Debug>(kind: &str, error: &kube::runtime::controller::Error<R, watcher::Error>) {
+    if watch_expired(error) {
+        tracing::debug!(kind, ?error, "watch expired; relisting");
+    } else {
+        tracing::error!(error = ?error, "{kind} watch error");
+    }
+}
+
+/// Whether a controller error is the apiserver expiring a watch's resource version.
+fn watch_expired<R>(error: &kube::runtime::controller::Error<R, watcher::Error>) -> bool {
+    let kube::runtime::controller::Error::QueueError(queue) = error else {
+        return false;
+    };
+    let code = match queue {
+        watcher::Error::WatchError(status)
+        | watcher::Error::WatchFailed(kube::Error::Api(status))
+        | watcher::Error::WatchStartFailed(kube::Error::Api(status))
+        | watcher::Error::InitialListFailed(kube::Error::Api(status)) => status.code,
+        watcher::Error::WatchFailed(_)
+        | watcher::Error::WatchStartFailed(_)
+        | watcher::Error::InitialListFailed(_)
+        | watcher::Error::NoResourceVersion => return false,
+    };
+    code == http::StatusCode::GONE.as_u16()
 }
 
 /// Run the [`GridSite`] controller.
@@ -607,7 +931,7 @@ async fn run_site_controller(client: Client) -> Result<(), Box<dyn std::error::E
         .for_each(|result| async {
             match result {
                 Ok((obj, _action)) => tracing::info!(%obj, "reconciled GridSite"),
-                Err(e) => tracing::error!(error = ?e, "GridSite watch error"),
+                Err(e) => log_controller_error("GridSite", &e),
             }
         })
         .await;
@@ -635,7 +959,7 @@ async fn run_provider_controller(client: Client) -> Result<(), Box<dyn std::erro
         .for_each(|result| async {
             match result {
                 Ok((obj, _action)) => tracing::info!(%obj, "reconciled InferenceProvider"),
-                Err(e) => tracing::error!(error = ?e, "InferenceProvider watch error"),
+                Err(e) => log_controller_error("InferenceProvider", &e),
             }
         })
         .await;
@@ -661,7 +985,7 @@ async fn run_agent_tool_provider_controller(client: Client) -> Result<(), Box<dy
         .for_each(|result| async {
             match result {
                 Ok((obj, _action)) => tracing::info!(%obj, "reconciled AgentToolProvider"),
-                Err(e) => tracing::error!(error = ?e, "AgentToolProvider watch error"),
+                Err(e) => log_controller_error("AgentToolProvider", &e),
             }
         })
         .await;
@@ -702,7 +1026,7 @@ async fn health_handler() -> &'static str {
     "ok"
 }
 
-/// Not ready until enrollment and SWIM startup have finished.
+/// Not ready until enrollment and SWIM startup, including any `LoadBalancer` wait, have finished.
 fn readiness(ready: &std::sync::atomic::AtomicBool) -> (http::StatusCode, &'static str) {
     if ready.load(std::sync::atomic::Ordering::Acquire) {
         (http::StatusCode::OK, "ok")
@@ -792,6 +1116,7 @@ struct Published {
 /// fixes the verifier at build time.
 async fn run_signals_server(
     enabled: bool,
+    swim: SwimStartup,
     client: Client,
     published: Published,
     peer_identities: operator::signals::PeerIdentities,
@@ -799,6 +1124,8 @@ async fn run_signals_server(
     if !enabled {
         return Ok(());
     }
+    // Peers learn this listener from the advertised address, so it waits for SWIM to settle.
+    drop(swim_settled(swim).await);
     let addr = std::env::var("GRID_SIGNALS_ADDR").unwrap_or_else(|_| "0.0.0.0:9091".to_owned());
     let app = axum::Router::new()
         .route(operator::signals::SIGNALS_PATH, axum::routing::get(signals_handler))
@@ -1141,14 +1468,14 @@ fn scrape_interval() -> std::time::Duration {
 async fn run_peer_poller(
     enabled: bool,
     ctx: Arc<OperatorCtx>,
-    swim: Option<Arc<swim_runtime::SwimHandle>>,
+    swim: SwimStartup,
     client: Client,
     shutdown: operator::shutdown::Shutdown,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if !enabled {
         return Ok(());
     }
-    let Some(swim) = swim else {
+    let Some(swim) = swim_settled(swim).await else {
         tracing::info!("peer signals poller disabled: SWIM is not running");
         return Ok(());
     };
@@ -1362,6 +1689,127 @@ mod tests {
             own_key: Some("0".repeat(64)),
         };
         assert_eq!(caller_for(Some(&leaf), &stranger, addr), Caller::Peer(None));
+    }
+
+    /// A queue error carrying an apiserver status with `code`.
+    fn queue_status(code: u16, as_event: bool) -> kube::runtime::controller::Error<std::io::Error, watcher::Error> {
+        let mut status = kube::core::Status::failure("gone", "Expired");
+        status.code = code;
+        let status = Box::new(status);
+        kube::runtime::controller::Error::QueueError(if as_event {
+            watcher::Error::WatchError(status)
+        } else {
+            watcher::Error::WatchFailed(kube::Error::Api(status))
+        })
+    }
+
+    #[test]
+    fn only_an_expired_watch_is_routine() {
+        let cases = [
+            ("watch event 410", queue_status(410, true), true),
+            ("watch stream 410", queue_status(410, false), true),
+            ("watch event 500", queue_status(500, true), false),
+            (
+                "no resource version",
+                kube::runtime::controller::Error::QueueError(watcher::Error::NoResourceVersion),
+                false,
+            ),
+        ];
+        for (label, error, want) in cases {
+            assert_eq!(watch_expired(&error), want, "{label}");
+        }
+    }
+
+    #[test]
+    fn the_startup_key_holds_until_a_network_declares_none() {
+        let network = |key: Option<&str>| {
+            let tls = key.map_or_else(
+                || serde_json::json!({}),
+                |name| serde_json::json!({"swimKeyRef": {"name": name, "namespace": "grid"}}),
+            );
+            let spec = serde_json::from_value(serde_json::json!({"seeds": [], "tls": tls}));
+            GridNetwork::new("net", spec.unwrap_or_else(|_| std::process::abort()))
+        };
+        let state = |networks: &[GridNetwork], require_key: bool| {
+            unkeyed_state(&declared_of(networks), require_key)
+                .map(|state| format!("{state:?}"))
+                .ok()
+        };
+        assert_eq!(
+            state(&[], true),
+            Some("Pending".to_owned()),
+            "no network yet holds by default"
+        );
+        assert_eq!(state(&[], false), Some("Plain".to_owned()), "opted out");
+        assert_eq!(
+            state(&[network(None)], true),
+            Some("Plain".to_owned()),
+            "declares no key"
+        );
+        let declared = declared_of(&[network(None), network(Some("swim-key"))]);
+        assert!(
+            matches!(unkeyed_state(&declared, true), Err(key_ref) if key_ref.name == "swim-key"),
+            "reads the key"
+        );
+    }
+
+    #[tokio::test]
+    async fn gated_tasks_wait_for_swim_to_settle() {
+        let (started, startup) = tokio::sync::watch::channel(SwimStage::Starting);
+        let mut settled = Box::pin(swim_settled(startup));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut settled)
+                .await
+                .is_err(),
+            "still starting"
+        );
+        started.send_replace(SwimStage::Settled(None));
+        assert!(settled.await.is_none(), "settled without SWIM");
+        assert!(readiness(&std::sync::atomic::AtomicBool::new(false)).0 == http::StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn membership_writes_wait_for_a_peer_or_the_grace() {
+        let seen = std::sync::atomic::AtomicBool::new(false);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let changes = futures::stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|()| ((), rx)) });
+        let wait = converged(
+            || seen.load(std::sync::atomic::Ordering::Acquire),
+            changes,
+            MEMBERSHIP_GRACE,
+        );
+        let mut wait = std::pin::pin!(wait);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), &mut wait)
+                .await
+                .is_err(),
+            "no peer yet"
+        );
+        seen.store(true, std::sync::atomic::Ordering::Release);
+        tx.send(()).unwrap_or_else(|_| std::process::abort());
+        let started = tokio::time::Instant::now();
+        wait.await;
+        assert!(started.elapsed() < MEMBERSHIP_GRACE, "a peer releases before the grace");
+
+        let alone = tokio::time::Instant::now();
+        converged(|| false, futures::stream::pending(), MEMBERSHIP_GRACE).await;
+        assert_eq!(alone.elapsed(), MEMBERSHIP_GRACE, "a lone site writes after the grace");
+    }
+
+    #[test]
+    fn startup_key_retries_back_off_to_a_bound() {
+        let delays: Vec<u64> = startup_retry_delays().take(9).map(|d| d.as_secs()).collect();
+        assert_eq!(delays, [1, 2, 4, 8, 16, 32, 60, 60, 60]);
+    }
+
+    #[test]
+    fn a_malformed_env_key_is_an_error_not_plaintext() {
+        let good = "ab".repeat(32);
+        assert_eq!(parse_swim_key(&good), Ok([0xAB; 32]));
+        assert_eq!(parse_swim_key(&format!(" {good}\n")), Ok([0xAB; 32]), "trimmed");
+        for bad in ["", "ab", &"zz".repeat(32), &"ab".repeat(33)] {
+            assert!(parse_swim_key(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

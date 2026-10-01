@@ -52,6 +52,8 @@ pub mod signals;
 /// Pure data layer for peer discovery; the live UDP runtime is implemented in
 /// [`swim_runtime`].
 pub mod swim;
+/// SWIM advertise endpoint selection and Service `LoadBalancer` discovery.
+pub mod swim_advertise;
 /// SWIM endpoint parsing and bounded DNS resolution.
 pub mod swim_endpoint;
 /// Live SWIM membership runtime (foca-backed UDP event loop).

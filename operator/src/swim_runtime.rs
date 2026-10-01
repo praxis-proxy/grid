@@ -98,28 +98,125 @@ pub struct SwimConfig {
     /// `GridSite.spec.egress.address` instead of the SWIM UDP endpoint.
     pub gateway_address: Option<String>,
 
-    /// AES-256-GCM encryption key for SWIM UDP packets.
-    ///
-    /// When `Some`, every outgoing SWIM packet is encrypted and authenticated
-    /// with this key.  Incoming packets that do not authenticate with this key
-    /// are silently dropped — the SWIM state machine never sees them.
-    ///
-    /// When `None`, SWIM traffic is sent as plaintext (backward-compatible local
-    /// and development behavior).
-    ///
-    /// Configuring a key via `GridNetwork.spec.tls.swimKeyRef` is the preferred
-    /// production path.  This field is also used for testing: the operator reads
-    /// the env var `GRID_SWIM_ENCRYPT_KEY` (64 hex chars = 32 bytes) at startup
-    /// and stores the decoded key here.
-    ///
-    /// # Security invariant
-    ///
-    /// The key value must **never** appear in logs, tracing spans, error messages,
-    /// Kubernetes resources, or process output.
-    pub swim_key: Option<swim::crypto::SwimKey>,
+    /// SWIM packet protection at startup, never logged.
+    pub key: KeyState,
 
     /// Revision range and node generation reserved durably before startup.
     pub revision_lease: RevisionLease,
+}
+
+/// SWIM packet protection.
+#[derive(Clone)]
+pub enum KeyState {
+    /// A key is required but not loaded: nothing is sent or received.
+    Pending,
+    /// No key configured: plaintext.
+    Plain,
+    /// Encrypt and authenticate with this key.
+    Key(Arc<swim::crypto::SwimKey>),
+}
+
+impl std::fmt::Debug for KeyState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Pending => "Pending",
+            Self::Plain => "Plain",
+            Self::Key(_) => "Key(<redacted>)",
+        })
+    }
+}
+
+/// The bytes to send for `data` under `key`, `None` when the packet is dropped.
+fn wire_payload<'data>(key: &KeyState, data: &'data [u8], addr: SocketAddr) -> Option<std::borrow::Cow<'data, [u8]>> {
+    match key {
+        KeyState::Key(key) => swim::crypto::encrypt(key, data)
+            .inspect_err(|e| tracing::warn!(error = %e, %addr, "SWIM encrypt failed, dropping packet"))
+            .ok()
+            .map(std::borrow::Cow::Owned),
+        KeyState::Plain => Some(std::borrow::Cow::Borrowed(data)),
+        KeyState::Pending => {
+            tracing::debug!(%addr, "SWIM key pending; holding send");
+            None
+        },
+    }
+}
+
+/// The plaintext of an inbound packet under `key`.
+fn wire_plaintext<'data>(key: &KeyState, data: &'data [u8]) -> Result<std::borrow::Cow<'data, [u8]>, Rejected> {
+    match key {
+        KeyState::Key(key) => swim::crypto::decrypt(key, data)
+            .map(std::borrow::Cow::Owned)
+            .map_err(|_e| Rejected::Unauthenticated),
+        KeyState::Plain => Ok(std::borrow::Cow::Borrowed(data)),
+        KeyState::Pending => Err(Rejected::Pending),
+    }
+}
+
+/// Inbound drops while the key is pending, warned once per hold.
+#[derive(Default)]
+struct PendingDrops {
+    /// Whether this hold has warned.
+    warned: bool,
+}
+
+impl PendingDrops {
+    /// Track the hold gauge, rearming the warning once a hold ends.
+    fn observe(&mut self, key: &KeyState) {
+        let pending = matches!(key, KeyState::Pending);
+        crate::metrics::set_swim_key_pending(pending);
+        if !pending {
+            self.warned = false;
+        }
+    }
+
+    /// Count one dropped packet.
+    fn dropped(&mut self, from: SocketAddr) {
+        crate::metrics::record_swim_pending_drop();
+        if std::mem::replace(&mut self.warned, true) {
+            tracing::debug!(addr = %from, "SWIM key pending; dropped packet");
+        } else {
+            tracing::warn!(addr = %from, "SWIM key pending; dropping packets until it loads");
+        }
+    }
+}
+
+/// Inbound packets that failed authentication, warned at most once per [`UNAUTHENTICATED_WARN_EVERY`].
+#[derive(Default)]
+struct UnauthenticatedDrops {
+    /// When the last warning was logged.
+    warned_at: Option<Instant>,
+    /// Drops since that warning.
+    suppressed: u64,
+}
+
+/// Least time between warnings about unauthenticated packets.
+const UNAUTHENTICATED_WARN_EVERY: Duration = Duration::from_secs(60);
+
+impl UnauthenticatedDrops {
+    /// Count one dropped packet, returning whether it was warned.
+    fn dropped(&mut self, from: SocketAddr, bytes: usize, now: Instant) -> bool {
+        let quiet = self
+            .warned_at
+            .is_some_and(|at| now.saturating_duration_since(at) < UNAUTHENTICATED_WARN_EVERY);
+        if quiet {
+            self.suppressed = self.suppressed.saturating_add(1);
+            tracing::debug!(addr = %from, bytes, "SWIM: dropped packet (authentication failed)");
+            return false;
+        }
+        let suppressed = std::mem::take(&mut self.suppressed);
+        self.warned_at = Some(now);
+        tracing::warn!(addr = %from, bytes, suppressed, "SWIM: dropped packet (authentication failed)");
+        true
+    }
+}
+
+/// Why an inbound packet was dropped.
+#[derive(Debug, PartialEq, Eq)]
+enum Rejected {
+    /// The key is not loaded yet.
+    Pending,
+    /// The packet did not authenticate under the key.
+    Unauthenticated,
 }
 
 impl std::fmt::Debug for SwimConfig {
@@ -130,7 +227,7 @@ impl std::fmt::Debug for SwimConfig {
             .field("site_name", &self.site_name)
             .field("seeds", &self.seeds)
             .field("gateway_address", &self.gateway_address)
-            .field("swim_key", &self.swim_key.map(|_| "<redacted>"))
+            .field("key", &self.key)
             .field("revision_lease", &self.revision_lease)
             .finish()
     }
@@ -140,34 +237,13 @@ impl std::fmt::Debug for SwimConfig {
 // Internal runtime member tracking
 // ---------------------------------------------------------------------------
 
-/// Runtime-internal member state that extends [`MemberRecord`] with an
-/// age-tracking instant.
-///
-/// The public [`MemberRecord`] type carries an `age_secs` field but the SWIM
-/// runtime previously always set it to `0`.  This private struct holds the
-/// `status_changed_at` instant required to compute a real elapsed age at
-/// snapshot time.
-///
-/// Conversion to [`MemberRecord`] happens in [`members_snapshot`] by computing
-/// `now.saturating_duration_since(status_changed_at).as_secs()`.
+/// One site's mirrored identities, Alive while any is, reached at the highest live generation.
 struct TrackedMember {
-    /// Opaque site identity — mirrors [`MemberRecord::site_id`].
+    /// Opaque site identity, mirrors [`MemberRecord::site_id`].
     site_id: String,
-    /// Advertised SWIM listener address — mirrors [`MemberRecord::endpoint`].
-    endpoint: String,
-    /// Incarnation counter — mirrors [`MemberRecord::incarnation`].
-    incarnation: u64,
-    /// Membership status — mirrors [`MemberRecord::status`].
-    status: MemberStatus,
-    /// Instant when `status` first transitioned to [`MemberStatus::Dead`] or
-    /// [`MemberStatus::Suspect`].  `None` for [`MemberStatus::Alive`] members
-    /// and for members that have never been dead/suspect.
-    ///
-    /// Semantics:
-    /// - Set (or preserved) on the **first** Dead/Suspect transition.
-    /// - Cleared on a [`MemberStatus::Alive`] (Joined) event.
-    /// - Repeated Dead/Suspect events with an existing timestamp are ignored so the age grows monotonically from the
-    ///   initial transition time.
+    /// Each identity by `(generation, address)`: `None` while up, else when it went down.
+    identities: BTreeMap<(u64, SocketAddr), Option<Instant>>,
+    /// When the site lost its last live identity, `None` while Alive.
     status_changed_at: Option<Instant>,
 
     /// Data-plane gateway address for this member.
@@ -185,17 +261,81 @@ struct TrackedMember {
 }
 
 impl TrackedMember {
-    /// Convert to a public [`MemberRecord`], computing `age_secs` from
-    /// `status_changed_at` relative to `now`.
-    ///
-    /// `age_secs` is non-zero only for Dead/Suspect members; Alive members
-    /// always report `0`.
+    /// A site with no identities yet.
+    fn new(site_id: String) -> Self {
+        Self {
+            site_id,
+            identities: BTreeMap::new(),
+            status_changed_at: None,
+            gateway_address: None,
+            site_cert_pem: None,
+        }
+    }
+
+    /// Whether any identity is up.
+    fn is_alive(&self) -> bool {
+        self.identities.values().any(Option::is_none)
+    }
+
+    /// Alive or Dead, from the identities held.
+    fn status(&self) -> MemberStatus {
+        if self.is_alive() {
+            MemberStatus::Alive
+        } else {
+            MemberStatus::Dead
+        }
+    }
+
+    /// The identity peers reach: the highest live generation, else the highest held.
+    fn current(&self) -> Option<(u64, SocketAddr)> {
+        self.identities
+            .iter()
+            .rev()
+            .find(|(_, down)| down.is_none())
+            .or_else(|| self.identities.iter().next_back())
+            .map(|(identity, _)| *identity)
+    }
+
+    /// Mark `identity` up or down at `now`, `false` when it is new and the site is full.
+    fn record(&mut self, identity: (u64, SocketAddr), up: bool, now: Instant) -> bool {
+        if !self.identities.contains_key(&identity) && self.identities.len() >= MAX_IDENTITIES_PER_SITE {
+            let oldest_down = self
+                .identities
+                .iter()
+                .filter_map(|(held, down)| down.map(|at| (at, *held)))
+                .min()
+                .map(|(_, held)| held);
+            let Some(oldest_down) = oldest_down else {
+                return false;
+            };
+            self.identities.remove(&oldest_down);
+        }
+        let down = self.identities.entry(identity).or_insert(Some(now));
+        if up {
+            *down = None;
+        } else if down.is_none() {
+            *down = Some(now);
+        }
+        self.refresh_status(now);
+        true
+    }
+
+    /// Start the Dead clock when the last identity goes down, clear it on any up.
+    fn refresh_status(&mut self, now: Instant) {
+        if self.is_alive() {
+            self.status_changed_at = None;
+        } else if self.status_changed_at.is_none() {
+            self.status_changed_at = Some(now);
+        }
+    }
+
+    /// Convert to a public [`MemberRecord`], aging only a Dead site.
     fn to_member_record(&self, now: Instant) -> MemberRecord {
         MemberRecord {
             site_id: self.site_id.clone(),
-            endpoint: self.endpoint.clone(),
-            incarnation: self.incarnation,
-            status: self.status.clone(),
+            endpoint: self.current().map(|(_, addr)| addr.to_string()).unwrap_or_default(),
+            incarnation: 0,
+            status: self.status(),
             age_secs: self
                 .status_changed_at
                 .map_or(0, |t| now.saturating_duration_since(t).as_secs()),
@@ -237,9 +377,7 @@ fn members_snapshot(
 
 /// Return true when any tracked member needs age recomputation in snapshots.
 fn has_aging_members(tracked: &HashMap<String, TrackedMember>) -> bool {
-    tracked
-        .values()
-        .any(|t| t.status_changed_at.is_some() && matches!(t.status, MemberStatus::Dead | MemberStatus::Suspect))
+    tracked.values().any(|t| t.status_changed_at.is_some())
 }
 
 /// Internal channels owned by the SWIM runtime loop.
@@ -265,6 +403,9 @@ struct RuntimeChannels {
     /// Populated by [`SwimHandle::announce_seeds`].  Each batch is
     /// announced via [`SwimNode::announce`] on the next event loop turn.
     seed_rx: mpsc::Receiver<Vec<SocketAddr>>,
+
+    /// Asks the loop to leave the cluster and stop.
+    leave_rx: mpsc::Receiver<()>,
 }
 
 /// Period between bounded anti-entropy publications of local provider state.
@@ -276,12 +417,12 @@ const STATE_REPUBLISH_INTERVAL: Duration = Duration::from_secs(30);
 /// ample time for the full Alive → Suspect → Dead lifecycle and peer
 /// convergence before cleanup.  Override with `GRID_SWIM_DEAD_MEMBER_TTL_SECS`.
 const DEFAULT_DEAD_MEMBER_TTL_SECS: u64 = 300;
-/// Suspect entries that fail to transition are removed after this bound.
-const SUSPECT_MEMBER_TTL: Duration = Duration::from_secs(120);
 /// Maximum membership records retained by the operator-side mirror.
 const MAX_TRACKED_MEMBERS: usize = 1_024;
-/// Maximum suspect and dead records retained inside the total member bound.
+/// Maximum dead records retained inside the total member bound.
 const MAX_NON_ALIVE_MEMBERS: usize = 512;
+/// Identities held per site, enough for a rolling update and its leftovers.
+const MAX_IDENTITIES_PER_SITE: usize = 16;
 
 /// Process-local allocator over a range reserved durably before startup.
 struct RevisionClock {
@@ -491,25 +632,8 @@ pub struct SwimHandle {
     /// Channel for queuing seed addresses to announce at runtime.
     seed_tx: mpsc::Sender<Vec<SocketAddr>>,
 
-    /// Watch sender for the SWIM encryption key.
-    ///
-    /// Send `Some(key)` to enable encryption; the run loop starts encrypting
-    /// outgoing packets and drops non-authenticating inbound packets.
-    ///
-    /// The initial value is `None` (no encryption) when no env-var key is
-    /// configured.  `set_swim_key` sends `Some(key)` once at reconcile time;
-    /// sending `None` after a key has been set is not an intended runtime
-    /// path and no production code does so.
-    ///
-    /// Key changes after the initial send require an operator restart because the
-    /// old key immediately loses the ability to decrypt in-flight packets from
-    /// peers that have not yet received the new key.
-    ///
-    /// # Security invariant
-    ///
-    /// The key value must **never** appear in logs, spans, error messages, or
-    /// status fields.
-    key_tx: watch::Sender<Option<Arc<swim::crypto::SwimKey>>>,
+    /// SWIM packet protection, a key never logged.
+    key_tx: watch::Sender<KeyState>,
 
     /// Watch sender for updating the data-plane gateway address at runtime.
     ///
@@ -520,6 +644,9 @@ pub struct SwimHandle {
 
     /// Runtime liveness published by the task monitor.
     runtime_tx: watch::Sender<bool>,
+
+    /// Asks the runtime to leave the cluster and stop.
+    leave_tx: mpsc::Sender<()>,
 }
 
 impl SwimHandle {
@@ -625,7 +752,7 @@ impl SwimHandle {
     /// retained because stale-candidate TTL processing depends on it.
     ///
     /// [`GridNetwork`]: crate::crd::grid_network::GridNetwork
-    pub fn reconciliation_events(&self) -> impl Stream<Item = ()> + Send + Sync + 'static {
+    pub fn reconciliation_events(&self) -> impl Stream<Item = ()> + Send + Sync + use<> {
         let membership_rx = self.snapshot_rx.clone();
         let state_rx = self.state_rx.clone();
         let runtime_rx = self.runtime_tx.subscribe();
@@ -692,8 +819,40 @@ impl SwimHandle {
     /// Returns [`SetKeyError::RuntimeGone`] if the SWIM runtime has exited.
     pub fn set_swim_key(&self, key: swim::crypto::SwimKey) -> Result<(), SetKeyError> {
         self.key_tx
-            .send(Some(Arc::new(key)))
+            .send(KeyState::Key(Arc::new(key)))
             .map_err(|_e| SetKeyError::RuntimeGone)
+    }
+
+    /// Leave the cluster so peers drop this site at once, waiting up to `wait` for the runtime to stop.
+    pub async fn leave(&self, wait: Duration) {
+        let mut running = self.runtime_tx.subscribe();
+        if self.leave_tx.try_send(()).is_err() {
+            return;
+        }
+        drop(tokio::time::timeout(wait, running.wait_for(|running| !running)).await);
+    }
+
+    /// Release a pending hold to plaintext, never a loaded key, returning whether it was pending.
+    pub fn release_plain(&self) -> bool {
+        self.key_tx.send_if_modified(|state| {
+            let pending = matches!(state, KeyState::Pending);
+            if pending {
+                *state = KeyState::Plain;
+            }
+            pending
+        })
+    }
+
+    /// Whether SWIM is held for a key not yet decided.
+    #[must_use]
+    pub fn is_key_pending(&self) -> bool {
+        matches!(*self.key_tx.borrow(), KeyState::Pending)
+    }
+
+    /// Whether gossip is encrypted.
+    #[must_use]
+    pub fn is_encrypted(&self) -> bool {
+        matches!(*self.key_tx.borrow(), KeyState::Key(_))
     }
 }
 
@@ -802,13 +961,13 @@ pub async fn start(config: SwimConfig) -> Result<Arc<SwimHandle>, SwimRuntimeErr
 
     let site_name = config.site_name.clone();
     let gateway_address = config.gateway_address.clone();
-    let initial_key: Option<Arc<swim::crypto::SwimKey>> = config.swim_key.map(Arc::new);
     let (snapshot_tx, snapshot_rx) = watch::channel(MembershipSnapshot::default());
     let (state_tx, state_rx) = watch::channel(GridStateSnapshot::new(site_name.clone()));
     let (timer_tx, timer_rx) = mpsc::channel::<TimerEvent>(256);
     let (broadcast_tx, broadcast_rx) = mpsc::channel::<swim::StateBroadcast>(32);
     let (seed_tx, seed_rx) = mpsc::channel::<Vec<SocketAddr>>(16);
-    let (key_tx, key_rx) = watch::channel(initial_key);
+    let (leave_tx, leave_rx) = mpsc::channel::<()>(1);
+    let (key_tx, key_rx) = watch::channel(config.key.clone());
     let (gateway_tx, gateway_loop_rx) = watch::channel(gateway_address);
     let (runtime_tx, _) = watch::channel(true);
     let channels = RuntimeChannels {
@@ -817,6 +976,7 @@ pub async fn start(config: SwimConfig) -> Result<Arc<SwimHandle>, SwimRuntimeErr
         timer_rx,
         broadcast_rx,
         seed_rx,
+        leave_rx,
     };
 
     tracing::info!(
@@ -824,7 +984,7 @@ pub async fn start(config: SwimConfig) -> Result<Arc<SwimHandle>, SwimRuntimeErr
         advertise_addr = %advertise_addr,
         site_name = %config.site_name,
         seeds = config.seeds.len(),
-        encrypted = config.swim_key.is_some(),
+        key = ?config.key,
         "SWIM runtime starting"
     );
 
@@ -857,6 +1017,7 @@ pub async fn start(config: SwimConfig) -> Result<Arc<SwimHandle>, SwimRuntimeErr
         key_tx,
         gateway_tx,
         runtime_tx,
+        leave_tx,
     }))
 }
 
@@ -886,7 +1047,7 @@ async fn run_loop(
     advertise_addr: SocketAddr,
     mut channels: RuntimeChannels,
     state_tx: watch::Sender<GridStateSnapshot>,
-    mut key_rx: watch::Receiver<Option<Arc<swim::crypto::SwimKey>>>,
+    mut key_rx: watch::Receiver<KeyState>,
     mut gateway_loop_rx: watch::Receiver<Option<String>>,
     mut revisions: RevisionClock,
 ) {
@@ -901,6 +1062,8 @@ async fn run_loop(
     let mut tracked: HashMap<String, TrackedMember> = HashMap::new();
     let mut buf = vec![0_u8; 65_536];
     let mut age_tick = tokio::time::interval(Duration::from_secs(1));
+    let mut pending_drops = PendingDrops::default();
+    let mut unauthenticated_drops = UnauthenticatedDrops::default();
     let mut seed_addrs = config.seeds.clone();
     let mut next_seed_announce_at = Instant::now() + Duration::from_secs(5);
     let mut gateway_address = config.gateway_address.clone();
@@ -923,8 +1086,7 @@ async fn run_loop(
     }
 
     // Announce to seed peers.  Errors are logged inside SwimNode::announce.
-    // Read the initial key (from SwimConfig, if any) for the startup seed sends.
-    let startup_key: Option<Arc<swim::crypto::SwimKey>> = key_rx.borrow_and_update().clone();
+    let startup_key = key_rx.borrow_and_update().clone();
     for &seed_addr in &seed_addrs {
         let seed_id = NodeId::seed(seed_addr);
         let output = node.announce(seed_id);
@@ -936,44 +1098,33 @@ async fn run_loop(
             &channels.snapshot_tx,
             &node.gateway_addrs(),
             &node.cert_pems(),
-            startup_key.as_deref(),
+            &startup_key,
         )
         .await;
     }
 
     loop {
-        // Snapshot the current key for this iteration.  The key is set once and
-        // never changes, so this borrow-and-clone is cheap and branch-free after
-        // the first successful key load.
-        let current_key: Option<Arc<swim::crypto::SwimKey>> = key_rx.borrow_and_update().clone();
+        let key = key_rx.borrow_and_update().clone();
+        pending_drops.observe(&key);
 
         tokio::select! {
             result = socket.recv_from(&mut buf) => {
                 match result {
                     Ok((n, from)) => {
                         let raw = buf.get(..n).unwrap_or(&[]);
-
-                        // Decrypt and authenticate when a key is configured.
-                        // On failure, drop the packet silently — do not pass
-                        // unauthenticated bytes to foca.
-                        let plaintext_buf: Vec<u8>;
-                        let data: &[u8] = if let Some(key) = &current_key {
-                            if let Ok(plain) = swim::crypto::decrypt(key.as_ref(), raw) {
-                                plaintext_buf = plain;
-                                &plaintext_buf
-                            } else {
-                                tracing::warn!(
-                                    addr = %from,
-                                    bytes = n,
-                                    "SWIM: dropped packet (authentication failed)"
-                                );
+                        let data = match wire_plaintext(&key, raw) {
+                            Ok(data) => data,
+                            Err(Rejected::Pending) => {
+                                pending_drops.dropped(from);
                                 continue;
-                            }
-                        } else {
-                            raw
+                            },
+                            Err(Rejected::Unauthenticated) => {
+                                unauthenticated_drops.dropped(from, n, Instant::now());
+                                continue;
+                            },
                         };
 
-                        let output = node.handle_data(data);
+                        let output = node.handle_data(&data);
                         tracing::trace!(from = %from, bytes = n, "SWIM UDP received");
                         drain_output(
                             output,
@@ -983,7 +1134,7 @@ async fn run_loop(
                             &channels.snapshot_tx,
                             &node.gateway_addrs(),
                             &node.cert_pems(),
-                            current_key.as_deref(),
+                            &key,
                         )
                         .await;
                         // Publish updated CRDT state after every incoming UDP packet.
@@ -1018,7 +1169,7 @@ async fn run_loop(
                                     &channels.snapshot_tx,
                                     &node.gateway_addrs(),
                                     &node.cert_pems(),
-                                    current_key.as_deref(),
+                                    &key,
                                 )
                                 .await;
                                 drop(state_tx.send(node.state_snapshot()));
@@ -1039,7 +1190,7 @@ async fn run_loop(
                     &channels.snapshot_tx,
                     &node.gateway_addrs(),
                     &node.cert_pems(),
-                    current_key.as_deref(),
+                    &key,
                 )
                 .await;
             }
@@ -1078,11 +1229,27 @@ async fn run_loop(
                         &channels.snapshot_tx,
                         &node.gateway_addrs(),
                         &node.cert_pems(),
-                        current_key.as_deref(),
+                        &key,
                     )
                     .await;
                 }
                 drop(state_tx.send(node.state_snapshot()));
+            }
+            Some(()) = channels.leave_rx.recv() => {
+                let output = node.leave();
+                drain_output(
+                    output,
+                    &socket,
+                    &channels.timer_tx,
+                    &mut tracked,
+                    &channels.snapshot_tx,
+                    &node.gateway_addrs(),
+                    &node.cert_pems(),
+                    &key,
+                )
+                .await;
+                tracing::info!("SWIM left the cluster");
+                return;
             }
             Some(seeds) = channels.seed_rx.recv() => {
                 // Announce to CRD-declared seed peers at runtime.
@@ -1099,7 +1266,7 @@ async fn run_loop(
                         &channels.snapshot_tx,
                         &node.gateway_addrs(),
                         &node.cert_pems(),
-                        current_key.as_deref(),
+                        &key,
                     )
                     .await;
                 }
@@ -1125,7 +1292,7 @@ async fn run_loop(
                                 &channels.snapshot_tx,
                                 &node.gateway_addrs(),
                                 &node.cert_pems(),
-                                current_key.as_deref(),
+                                &key,
                             )
                             .await;
                         }
@@ -1147,19 +1314,23 @@ async fn run_loop(
                             &channels.snapshot_tx,
                             &node.gateway_addrs(),
                             &node.cert_pems(),
-                            current_key.as_deref(),
+                            &key,
                         )
                         .await;
                     }
                     next_seed_announce_at = now + Duration::from_secs(5);
                 }
                 let evicted = prune_tracked_members(&mut tracked, now, dead_member_ttl);
-                for origin in &evicted {
+                let changed = !evicted.is_empty();
+                let live: Vec<&NodeId> = node.live_identities().collect();
+                let gone = restore_from_foca(evicted, &mut tracked, &live, now);
+                let adopted = adopt_live_identities(&mut tracked, &live, now);
+                for origin in &gone {
                     node.evict_origin(origin);
                 }
                 // Republish while age changes or after eviction so readers see
                 // a coherent bounded membership view.
-                if has_aging_members(&tracked) || !evicted.is_empty() {
+                if has_aging_members(&tracked) || changed || adopted {
                     drop(channels.snapshot_tx.send(members_snapshot(
                         &tracked,
                         now,
@@ -1191,7 +1362,7 @@ async fn run_loop(
                         &channels.snapshot_tx,
                         &node.gateway_addrs(),
                         &node.cert_pems(),
-                        current_key.as_deref(),
+                        &key,
                     )
                     .await;
                     drop(state_tx.send(node.state_snapshot()));
@@ -1234,19 +1405,14 @@ fn publish_gateway_address_broadcast(node: &mut SwimNode, site_name: &str, revis
 
 /// Send outbound messages, schedule timers, apply membership events.
 ///
-/// Uses [`Instant::now()`] for age tracking so Dead/Suspect transitions record
+/// Uses [`Instant::now()`] for age tracking so Dead transitions record
 /// an accurate wall-clock start time.  The same `now` value is used for all
 /// events processed in a single call, ensuring consistency within one gossip round.
 ///
-/// When `swim_key` is `Some`, every outgoing SWIM packet is encrypted with
-/// AES-256-GCM before being written to the socket.
+/// Each packet is encrypted, sent plain, or held per [`KeyState`].
 #[expect(
     clippy::too_many_arguments,
     reason = "distinct runtime state pointers; a wrapper struct would obscure the data-flow"
-)]
-#[expect(
-    clippy::too_many_lines,
-    reason = "encrypt error handling match block added 5 lines; splitting would separate the send and encrypt logic"
 )]
 async fn drain_output(
     output: swim::AccumulatedOutput,
@@ -1256,20 +1422,11 @@ async fn drain_output(
     snapshot_tx: &watch::Sender<MembershipSnapshot>,
     gateway_addrs: &BTreeMap<String, String>,
     cert_pems: &BTreeMap<String, String>,
-    swim_key: Option<&swim::crypto::SwimKey>,
+    key: &KeyState,
 ) {
     for msg in output.messages {
-        // Encrypt outgoing packet when a key is configured.
-        let payload: std::borrow::Cow<'_, [u8]> = if let Some(key) = swim_key {
-            match swim::crypto::encrypt(key, &msg.data) {
-                Ok(encrypted) => std::borrow::Cow::Owned(encrypted),
-                Err(e) => {
-                    tracing::warn!(error = %e, addr = %msg.addr, "SWIM encrypt failed, dropping packet");
-                    continue;
-                },
-            }
-        } else {
-            std::borrow::Cow::Borrowed(&msg.data)
+        let Some(payload) = wire_payload(key, &msg.data, msg.addr) else {
+            continue;
         };
         if let Err(e) = socket.send_to(&payload, msg.addr).await {
             tracing::warn!(error = %e, addr = %msg.addr, "SWIM UDP send error");
@@ -1298,26 +1455,9 @@ async fn drain_output(
     }
 }
 
-/// Apply a membership event to the internal tracked-member table.
-///
-/// `now` is the instant at which the event is being processed.  Pass
-/// [`Instant::now()`] in production; pass a synthetic past instant in tests to
-/// verify age computation without sleeping.
-///
-/// # Age-tracking semantics
-///
-/// | Event | `status_changed_at` | `status` |
-/// |-------|---------------------|---------|
-/// | `Joined` | Cleared (`None`) | `Alive` |
-/// | `Suspect` (first time or was `Alive`) | Set to `now` | `Suspect` |
-/// | `Suspect` (already `Suspect`/`Dead`) | Preserved (age grows monotonically) | `Suspect` |
-/// | `Left` / unknown (`Dead`) | Set to `now` if not already set | `Dead` |
+/// Apply a membership event to the tracked table, bounded by [`MAX_TRACKED_MEMBERS`].
 fn apply_member_event_bounded(event: MemberEvent, tracked: &mut HashMap<String, TrackedMember>, now: Instant) {
-    let site_name = match &event {
-        MemberEvent::Joined { site_name, .. }
-        | MemberEvent::Left { site_name }
-        | MemberEvent::Suspect { site_name } => site_name,
-    };
+    let (site_name, ..) = event_identity(&event);
     if !tracked.contains_key(site_name) && tracked.len() >= MAX_TRACKED_MEMBERS {
         tracing::warn!(
             max_members = MAX_TRACKED_MEMBERS,
@@ -1328,122 +1468,161 @@ fn apply_member_event_bounded(event: MemberEvent, tracked: &mut HashMap<String, 
     apply_member_event(event, tracked, now);
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "exhaustive match over all member-event variants with per-event age-tracking logic; splitting would obscure the status-change semantics"
-)]
-/// Apply one membership event without enforcing the outer table capacity.
+/// Mark the named identity up or down, ignoring a down for an identity a known site never reported.
 fn apply_member_event(event: MemberEvent, tracked: &mut HashMap<String, TrackedMember>, now: Instant) {
-    match event {
-        MemberEvent::Joined { site_name, addr } => {
-            tracing::info!(site = %site_name, addr = %addr, "SWIM member joined");
-            // Joined always creates/replaces with Alive and clears age tracking.
-            tracked.insert(
-                site_name.clone(),
-                TrackedMember {
-                    site_id: site_name,
-                    endpoint: addr.to_string(),
-                    incarnation: 0,
-                    status: MemberStatus::Alive,
-                    status_changed_at: None,
-                    gateway_address: None,
-                    site_cert_pem: None,
-                },
-            );
-        },
-        MemberEvent::Left { site_name } => {
-            tracing::info!(site = %site_name, "SWIM member left");
-            apply_left_event(site_name, tracked, now);
-        },
-        MemberEvent::Suspect { site_name } => {
-            tracing::warn!(site = %site_name, "SWIM member suspected");
-            if let Some(t) = tracked.get_mut(&site_name) {
-                let was_healthy = t.status == MemberStatus::Alive;
-                t.status = MemberStatus::Suspect;
-                // Only record status_changed_at on the first transition from Alive.
-                // Repeated Suspect events preserve the original timestamp so age
-                // grows monotonically from the initial failure.
-                if was_healthy {
-                    t.status_changed_at = Some(now);
-                }
-            }
-        },
-    }
-}
-
-/// Apply a member-left/down event as a Dead tombstone with age tracking.
-fn apply_left_event(site_name: String, tracked: &mut HashMap<String, TrackedMember>, now: Instant) {
-    if let Some(t) = tracked.get_mut(&site_name) {
-        let was_not_dead = t.status != MemberStatus::Dead;
-        t.status = MemberStatus::Dead;
-        // Only set status_changed_at on the first Dead transition; preserve
-        // the original Suspect timestamp if already suspect so age is continuous.
-        if was_not_dead && t.status_changed_at.is_none() {
-            t.status_changed_at = Some(now);
-        }
+    let (up, site, addr, generation) = into_identity(event);
+    if is_from_the_future(generation, unix_nanos_now()) {
+        tracing::warn!(site, %addr, generation, "ignoring a SWIM identity with a generation from the future");
         return;
     }
-    // Unknown member declared Dead — create a tombstone with age tracking from now.
-    tracked.insert(
-        site_name.clone(),
-        TrackedMember {
-            site_id: site_name,
-            endpoint: String::new(),
-            incarnation: 0,
-            status: MemberStatus::Dead,
-            status_changed_at: Some(now),
-            gateway_address: None,
-            site_cert_pem: None,
-        },
-    );
+    let outcome = if let Some(member) = tracked.get_mut(&site) {
+        if !up && !member.identities.contains_key(&(generation, addr)) {
+            "ignored an untracked down"
+        } else if member.record((generation, addr), up, now) {
+            "applied"
+        } else {
+            "ignored a join past the identity bound"
+        }
+    } else {
+        let mut member = TrackedMember::new(site.clone());
+        member.record((generation, addr), up, now);
+        tracked.insert(site.clone(), member);
+        "applied"
+    };
+    tracing::info!(site, %addr, generation, up, outcome, "SWIM membership event");
 }
 
-/// Remove expired or excess non-alive records and return their origins.
-#[expect(
-    clippy::too_many_lines,
-    reason = "age expiry and deterministic capacity eviction share one candidate ordering"
-)]
+/// Whether the event is a join, and the site, address, and generation it names.
+fn into_identity(event: MemberEvent) -> (bool, String, SocketAddr, u64) {
+    match event {
+        MemberEvent::Joined {
+            site_name,
+            addr,
+            generation,
+        } => (true, site_name, addr, generation),
+        MemberEvent::Left {
+            site_name,
+            addr,
+            generation,
+        } => (false, site_name, addr, generation),
+    }
+}
+
+/// The site, address, and generation an event names.
+fn event_identity(event: &MemberEvent) -> (&str, SocketAddr, u64) {
+    match event {
+        MemberEvent::Joined {
+            site_name,
+            addr,
+            generation,
+        }
+        | MemberEvent::Left {
+            site_name,
+            addr,
+            generation,
+        } => (site_name, *addr, *generation),
+    }
+}
+
+/// Whether `generation` lies past `now_nanos` by more than [`swim::identity::MAX_LEASE_SKEW`].
+fn is_from_the_future(generation: u64, now_nanos: u64) -> bool {
+    swim::identity::is_future_generation(generation, now_nanos)
+}
+
+/// Wall-clock nanoseconds, the unit generations are reserved in.
+fn unix_nanos_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| u64::try_from(since.as_nanos()).unwrap_or(u64::MAX))
+}
+
+/// Drop identities down past `dead_ttl` and excess Dead sites, returning the sites emptied.
 fn prune_tracked_members(
     tracked: &mut HashMap<String, TrackedMember>,
     now: Instant,
     dead_ttl: Duration,
 ) -> Vec<String> {
-    let mut candidates: Vec<(Instant, String)> = tracked
-        .iter()
+    let mut emptied: Vec<(Instant, String)> = tracked
+        .iter_mut()
         .filter_map(|(site, member)| {
-            let changed_at = member.status_changed_at?;
-            let expired = match member.status {
-                MemberStatus::Alive => false,
-                MemberStatus::Suspect => now.saturating_duration_since(changed_at) >= SUSPECT_MEMBER_TTL,
-                MemberStatus::Dead => now.saturating_duration_since(changed_at) >= dead_ttl,
-            };
-            expired.then(|| (changed_at, site.clone()))
+            member
+                .identities
+                .retain(|_, down| down.is_none_or(|at| now.saturating_duration_since(at) < dead_ttl));
+            member
+                .identities
+                .is_empty()
+                .then(|| (member.status_changed_at.unwrap_or(now), site.clone()))
         })
         .collect();
 
-    let non_alive_count = tracked
-        .values()
-        .filter(|member| member.status != MemberStatus::Alive)
-        .count();
-    if non_alive_count > MAX_NON_ALIVE_MEMBERS {
-        let mut non_alive: Vec<(Instant, String)> = tracked
-            .iter()
-            .filter_map(|(site, member)| {
-                (member.status != MemberStatus::Alive)
-                    .then_some((member.status_changed_at.unwrap_or(now), site.clone()))
-            })
-            .collect();
-        non_alive.sort();
-        candidates.extend(non_alive.into_iter().take(non_alive_count - MAX_NON_ALIVE_MEMBERS));
+    let mut dead: Vec<(Instant, String)> = tracked
+        .iter()
+        .filter(|(_, member)| !member.identities.is_empty() && !member.is_alive())
+        .map(|(site, member)| (member.status_changed_at.unwrap_or(now), site.clone()))
+        .collect();
+    let excess = dead.len().saturating_sub(MAX_NON_ALIVE_MEMBERS);
+    if excess > 0 {
+        dead.sort();
+        emptied.extend(dead.into_iter().take(excess));
     }
 
-    candidates.sort();
-    candidates.dedup_by(|left, right| left.1 == right.1);
-    let evicted: Vec<String> = candidates.into_iter().map(|(_, site)| site).collect();
+    emptied.sort();
+    let evicted: Vec<String> = emptied.into_iter().map(|(_, site)| site).collect();
     for site in &evicted {
         tracked.remove(site);
     }
     evicted
+}
+
+/// Rebuild each evicted site foca still holds live, returning the ones to evict for good.
+fn restore_from_foca(
+    evicted: Vec<String>,
+    tracked: &mut HashMap<String, TrackedMember>,
+    live: &[&NodeId],
+    now: Instant,
+) -> Vec<String> {
+    let now_nanos = unix_nanos_now();
+    evicted
+        .into_iter()
+        .filter(|site| {
+            let mut member = TrackedMember::new(site.clone());
+            for id in live.iter().filter(|id| id.site_name() == site) {
+                if !is_from_the_future(id.generation(), now_nanos) {
+                    member.record((id.generation(), id.socket_addr()), true, now);
+                }
+            }
+            if member.identities.is_empty() {
+                return true;
+            }
+            tracing::info!(site = %site, "SWIM mirror lost a site foca still holds live; rebuilt it");
+            tracked.insert(site.clone(), member);
+            false
+        })
+        .collect()
+}
+
+/// Mirror each foca-live identity the mirror lacks, such as a join refused while from the future.
+fn adopt_live_identities(tracked: &mut HashMap<String, TrackedMember>, live: &[&NodeId], now: Instant) -> bool {
+    let now_nanos = unix_nanos_now();
+    let mut adopted = false;
+    for id in live {
+        let identity = (id.generation(), id.socket_addr());
+        let known = tracked.get(id.site_name());
+        if is_from_the_future(identity.0, now_nanos)
+            || known.is_some_and(|member| member.identities.contains_key(&identity))
+            || (known.is_none() && tracked.len() >= MAX_TRACKED_MEMBERS)
+        {
+            continue;
+        }
+        let member = tracked
+            .entry(id.site_name().to_owned())
+            .or_insert_with(|| TrackedMember::new(id.site_name().to_owned()));
+        if member.record(identity, true, now) {
+            tracing::info!(site = %id.site_name(), generation = identity.0, "SWIM mirror adopted a live identity it missed");
+            adopted = true;
+        }
+    }
+    adopted
 }
 
 // ---------------------------------------------------------------------------
@@ -1451,31 +1630,162 @@ fn prune_tracked_members(
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
+#[allow(clippy::expect_used, reason = "tests")]
 mod tests {
     use futures::StreamExt as _;
 
     use super::*;
 
+    #[test]
+    fn a_pending_key_holds_both_directions() {
+        let addr = SocketAddr::from(([127, 0, 0, 1], 7946));
+        let key = KeyState::Key(Arc::new([7_u8; 32]));
+        let sealed = wire_payload(&key, b"ping", addr).expect("encrypts").into_owned();
+        assert!(wire_payload(&KeyState::Pending, b"ping", addr).is_none(), "send held");
+        assert_eq!(
+            wire_plaintext(&KeyState::Pending, &sealed).map(|_| ()),
+            Err(Rejected::Pending),
+            "receive dropped"
+        );
+        assert_eq!(wire_plaintext(&key, &sealed).expect("opens").as_ref(), b"ping");
+        assert_eq!(
+            wire_plaintext(&key, b"ping").map(|_| ()),
+            Err(Rejected::Unauthenticated)
+        );
+        assert_eq!(
+            wire_plaintext(&KeyState::Plain, b"ping").expect("plain").as_ref(),
+            b"ping"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pending_hold_releases_to_plain_but_never_drops_a_key() {
+        let handle = start(SwimConfig {
+            key: KeyState::Pending,
+            ..test_config(110_000)
+        })
+        .await
+        .expect("start");
+        assert!(handle.release_plain(), "pending released");
+        assert!(!handle.release_plain(), "already plain");
+        handle.set_swim_key([7_u8; 32]).expect("runtime alive");
+        assert!(!handle.release_plain(), "a loaded key stays");
+        assert!(handle.is_encrypted());
+    }
+
+    #[tokio::test]
+    async fn a_pending_hold_stays_until_the_key_loads() {
+        let handle = start(SwimConfig {
+            key: KeyState::Pending,
+            ..test_config(120_000)
+        })
+        .await
+        .expect("start");
+        assert!(!handle.is_encrypted(), "held, not encrypted");
+        handle.set_swim_key([7_u8; 32]).expect("runtime alive");
+        assert!(handle.is_encrypted());
+    }
+
     // -----------------------------------------------------------------------
     // apply_member_event
     // -----------------------------------------------------------------------
 
+    const POD_ADDR: &str = "10.0.0.1:7946";
+
     fn joined(site_name: &str) -> MemberEvent {
-        MemberEvent::Joined {
-            site_name: site_name.to_owned(),
-            addr: "10.0.0.1:7946".parse().unwrap_or_else(|_| std::process::abort()),
-        }
+        joined_at(site_name, POD_ADDR, 1)
     }
 
     fn left(site_name: &str) -> MemberEvent {
-        MemberEvent::Left {
+        left_at(site_name, POD_ADDR, 1)
+    }
+
+    fn joined_at(site_name: &str, addr: &str, generation: u64) -> MemberEvent {
+        MemberEvent::Joined {
             site_name: site_name.to_owned(),
+            addr: addr.parse().expect("addr"),
+            generation,
         }
     }
 
-    fn suspect(site_name: &str) -> MemberEvent {
-        MemberEvent::Suspect {
+    fn left_at(site_name: &str, addr: &str, generation: u64) -> MemberEvent {
+        MemberEvent::Left {
             site_name: site_name.to_owned(),
+            addr: addr.parse().expect("addr"),
+            generation,
+        }
+    }
+
+    #[test]
+    #[expect(clippy::too_many_lines, reason = "case table")]
+    fn a_stale_identity_never_downs_the_current_one() {
+        let lb = "203.0.113.7:7946";
+        let status = |events: Vec<MemberEvent>| {
+            let mut tracked = HashMap::new();
+            for event in events {
+                apply_member_event(event, &mut tracked, now());
+            }
+            let record = tracked.get("site-a").expect("tracked").to_member_record(now());
+            (record.status, record.endpoint)
+        };
+        let alive_at_lb = (MemberStatus::Alive, lb.to_owned());
+        let cases = [
+            (
+                "old pod identity leaves after the LB one joins",
+                vec![
+                    joined_at("site-a", POD_ADDR, 1),
+                    joined_at("site-a", lb, 2),
+                    left_at("site-a", POD_ADDR, 1),
+                ],
+                alive_at_lb.clone(),
+            ),
+            (
+                "a late join for the old identity is ignored",
+                vec![joined_at("site-a", lb, 2), joined_at("site-a", POD_ADDR, 1)],
+                alive_at_lb.clone(),
+            ),
+            (
+                "a leave for another address is ignored",
+                vec![joined_at("site-a", lb, 2), left_at("site-a", POD_ADDR, 3)],
+                alive_at_lb,
+            ),
+            (
+                "the last identity leaving downs the site",
+                vec![
+                    joined_at("site-a", POD_ADDR, 1),
+                    joined_at("site-a", lb, 2),
+                    left_at("site-a", POD_ADDR, 1),
+                    left_at("site-a", lb, 2),
+                ],
+                (MemberStatus::Dead, lb.to_owned()),
+            ),
+            (
+                "a rolling update whose new pod dies keeps the old one",
+                vec![
+                    joined_at("site-a", POD_ADDR, 1),
+                    joined_at("site-a", lb, 2),
+                    left_at("site-a", lb, 2),
+                ],
+                (MemberStatus::Alive, POD_ADDR.to_owned()),
+            ),
+            (
+                "a forged identity going silent leaves the real one",
+                vec![
+                    joined_at("site-a", POD_ADDR, 5),
+                    joined_at("site-a", lb, 9),
+                    left_at("site-a", lb, 9),
+                ],
+                (MemberStatus::Alive, POD_ADDR.to_owned()),
+            ),
+            (
+                "a forged generation from the future is ignored",
+                vec![joined_at("site-a", POD_ADDR, 1), joined_at("site-a", lb, u64::MAX)],
+                (MemberStatus::Alive, POD_ADDR.to_owned()),
+            ),
+        ];
+        for (label, events, want) in cases {
+            assert_eq!(status(events), want, "{label}");
         }
     }
 
@@ -1511,6 +1821,19 @@ mod tests {
         Instant::now()
     }
 
+    /// A loopback, seedless, plaintext config.
+    fn test_config(seed: u64) -> SwimConfig {
+        SwimConfig {
+            bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            advertise_addr: None,
+            site_name: "test-node".to_owned(),
+            seeds: Vec::new(),
+            gateway_address: None,
+            key: KeyState::Plain,
+            revision_lease: test_revision_lease(seed),
+        }
+    }
+
     fn test_revision_lease(seed: u64) -> RevisionLease {
         RevisionLease {
             first_revision: seed,
@@ -1526,7 +1849,7 @@ mod tests {
         apply_member_event(joined("site-a"), &mut tracked, now());
         assert!(tracked.contains_key("site-a"), "member must be inserted");
         assert_eq!(
-            tracked.get("site-a").unwrap_or_else(|| std::process::abort()).status,
+            tracked.get("site-a").unwrap_or_else(|| std::process::abort()).status(),
             MemberStatus::Alive,
             "joined member must be Alive"
         );
@@ -1538,7 +1861,7 @@ mod tests {
         apply_member_event(joined("site-a"), &mut tracked, now());
         apply_member_event(left("site-a"), &mut tracked, now());
         assert_eq!(
-            tracked.get("site-a").unwrap_or_else(|| std::process::abort()).status,
+            tracked.get("site-a").unwrap_or_else(|| std::process::abort()).status(),
             MemberStatus::Dead,
             "member must be marked Dead after Left event"
         );
@@ -1549,29 +1872,10 @@ mod tests {
         let mut tracked = HashMap::new();
         apply_member_event(left("site-a"), &mut tracked, now());
         assert_eq!(
-            tracked.get("site-a").unwrap_or_else(|| std::process::abort()).status,
+            tracked.get("site-a").unwrap_or_else(|| std::process::abort()).status(),
             MemberStatus::Dead,
             "unknown Left event must preserve a Dead tombstone"
         );
-    }
-
-    #[test]
-    fn suspect_event_marks_member_suspect() {
-        let mut tracked = HashMap::new();
-        apply_member_event(joined("site-a"), &mut tracked, now());
-        apply_member_event(suspect("site-a"), &mut tracked, now());
-        assert_eq!(
-            tracked.get("site-a").unwrap_or_else(|| std::process::abort()).status,
-            MemberStatus::Suspect,
-            "member status must be Suspect after suspect event"
-        );
-    }
-
-    #[test]
-    fn suspect_event_for_unknown_member_is_ignored() {
-        let mut tracked = HashMap::new();
-        apply_member_event(suspect("nonexistent"), &mut tracked, now());
-        assert!(tracked.is_empty(), "suspect for unknown member must not insert");
     }
 
     #[test]
@@ -1582,16 +1886,6 @@ mod tests {
         apply_member_event(joined("site-b"), &mut tracked, t);
         let snap = members_snapshot(&tracked, t, &BTreeMap::new(), &BTreeMap::new());
         assert_eq!(snap.connected_count(), 2, "two Alive members must give count=2");
-    }
-
-    #[test]
-    fn suspect_member_not_counted_as_connected() {
-        let t = now();
-        let mut tracked = HashMap::new();
-        apply_member_event(joined("site-a"), &mut tracked, t);
-        apply_member_event(suspect("site-a"), &mut tracked, t);
-        let snap = members_snapshot(&tracked, t, &BTreeMap::new(), &BTreeMap::new());
-        assert_eq!(snap.connected_count(), 0, "Suspect member must not count as connected");
     }
 
     #[test]
@@ -1610,26 +1904,176 @@ mod tests {
     }
 
     #[test]
-    fn has_aging_members_true_for_suspect_and_dead_members() {
-        let t = now();
-        let mut suspect_tracked = HashMap::new();
-        apply_member_event(joined("site-a"), &mut suspect_tracked, t);
-        apply_member_event(suspect("site-a"), &mut suspect_tracked, t);
-        assert!(
-            has_aging_members(&suspect_tracked),
-            "Suspect member must require age republish"
-        );
-
+    fn has_aging_members_true_for_dead_members() {
         let mut dead_tracked = HashMap::new();
-        apply_member_event(left("site-b"), &mut dead_tracked, t);
+        apply_member_event(left("site-b"), &mut dead_tracked, now());
         assert!(
             has_aging_members(&dead_tracked),
             "Dead member must require age republish"
         );
     }
 
+    #[test]
+    fn a_generation_past_the_skew_is_from_the_future() {
+        let now_nanos = 1_000_000_000_000_000_000;
+        let skew = u64::try_from(swim::identity::MAX_LEASE_SKEW.as_nanos()).expect("fits");
+        let cases = [
+            ("now", now_nanos, false),
+            ("inside the skew", now_nanos + skew, false),
+            ("past the skew", now_nanos + skew + 1, true),
+            ("forged maximum", u64::MAX, true),
+        ];
+        for (label, generation, want) in cases {
+            assert_eq!(is_from_the_future(generation, now_nanos), want, "{label}");
+        }
+        assert!(
+            !is_from_the_future(unix_nanos_now(), unix_nanos_now()),
+            "the live clock"
+        );
+    }
+
+    #[test]
+    fn repeated_left_preserves_the_original_timestamp() {
+        let t0 = now();
+        let mut tracked = HashMap::new();
+        apply_member_event(joined("site-a"), &mut tracked, t0);
+        apply_member_event(left("site-a"), &mut tracked, t0 + Duration::from_secs(10));
+        apply_member_event(left("site-a"), &mut tracked, t0 + Duration::from_secs(50));
+        let snap = members_snapshot(
+            &tracked,
+            t0 + Duration::from_secs(70),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        );
+        let m = snap.members.first().expect("member");
+        assert_eq!(m.age_secs, 60, "a repeated leave must not reset the age clock");
+    }
+
+    #[test]
+    #[expect(clippy::too_many_lines, reason = "fills a site, then frees one slot")]
+    fn identities_per_site_are_bounded() {
+        let t0 = now();
+        let mut tracked = HashMap::new();
+        for index in 0..MAX_IDENTITIES_PER_SITE {
+            let generation = u64::try_from(index).expect("small");
+            apply_member_event(joined_at("site-a", POD_ADDR, generation), &mut tracked, t0);
+        }
+        apply_member_event(joined_at("site-a", POD_ADDR, 1_000), &mut tracked, t0);
+        let member = tracked.get("site-a").expect("tracked");
+        assert_eq!(
+            member.identities.len(),
+            MAX_IDENTITIES_PER_SITE,
+            "full of live identities"
+        );
+        assert!(
+            !member
+                .identities
+                .contains_key(&(1_000, POD_ADDR.parse().expect("addr")))
+        );
+
+        apply_member_event(left_at("site-a", POD_ADDR, 0), &mut tracked, t0);
+        apply_member_event(joined_at("site-a", POD_ADDR, 1_000), &mut tracked, t0);
+        let made_room = tracked.get("site-a").expect("tracked");
+        assert_eq!(
+            made_room.identities.len(),
+            MAX_IDENTITIES_PER_SITE,
+            "a down identity made room"
+        );
+        assert!(
+            made_room
+                .identities
+                .contains_key(&(1_000, POD_ADDR.parse().expect("addr")))
+        );
+    }
+
+    #[test]
+    fn pruning_expires_each_identity_and_keeps_a_live_site() {
+        let ttl = Duration::from_secs(300);
+        let t0 = now();
+        let lb = "203.0.113.7:7946";
+        let mut tracked = HashMap::new();
+        apply_member_event(joined_at("site-a", POD_ADDR, 1), &mut tracked, t0);
+        apply_member_event(joined_at("site-a", lb, 2), &mut tracked, t0);
+        apply_member_event(left_at("site-a", POD_ADDR, 1), &mut tracked, t0);
+        assert!(
+            prune_tracked_members(&mut tracked, t0 + ttl, ttl).is_empty(),
+            "the site stays"
+        );
+        let member = tracked.get("site-a").expect("tracked");
+        assert_eq!(member.identities.len(), 1, "only the dead identity expired");
+        assert_eq!(member.to_member_record(t0).endpoint, lb);
+    }
+
+    #[test]
+    fn an_emptied_site_foca_still_holds_is_rebuilt_not_evicted() {
+        let t0 = now();
+        let addr: SocketAddr = POD_ADDR.parse().expect("addr");
+        let live_a = NodeId::with_generation("site-a".to_owned(), addr, 7);
+        let forged = NodeId::with_generation("site-a".to_owned(), "10.0.0.9:7946".parse().expect("addr"), u64::MAX);
+        let other = NodeId::with_generation("site-c".to_owned(), addr, 1);
+        let mut tracked = HashMap::new();
+        let gone = restore_from_foca(
+            vec!["site-a".to_owned(), "site-b".to_owned()],
+            &mut tracked,
+            &[&live_a, &forged, &other],
+            t0,
+        );
+        assert_eq!(gone, vec!["site-b".to_owned()], "only the site foca no longer holds");
+        let record = tracked.get("site-a").expect("rebuilt").to_member_record(t0);
+        assert_eq!(
+            (record.status, record.endpoint),
+            (MemberStatus::Alive, POD_ADDR.to_owned())
+        );
+        assert_eq!(
+            tracked.get("site-a").expect("rebuilt").identities.len(),
+            1,
+            "forged skipped"
+        );
+    }
+
+    #[test]
+    fn a_join_refused_from_the_future_is_adopted_once_it_passes_the_cap() {
+        let t0 = now();
+        let addr: SocketAddr = POD_ADDR.parse().expect("addr");
+        let soon = unix_nanos_now() + u64::try_from(swim::identity::MAX_LEASE_SKEW.as_nanos()).expect("fits") * 2;
+        let mut tracked = HashMap::new();
+        apply_member_event(joined_at("site-a", POD_ADDR, soon), &mut tracked, t0);
+        assert!(tracked.is_empty(), "refused while from the future");
+        let ahead = NodeId::with_generation("site-a".to_owned(), addr, soon);
+        assert!(!adopt_live_identities(&mut tracked, &[&ahead], t0), "still ahead");
+
+        let caught_up = NodeId::with_generation("site-a".to_owned(), addr, unix_nanos_now());
+        let forged = NodeId::with_generation("site-b".to_owned(), addr, u64::MAX);
+        assert!(
+            adopt_live_identities(&mut tracked, &[&caught_up, &forged], t0),
+            "adopted"
+        );
+        let record = tracked.get("site-a").expect("adopted").to_member_record(t0);
+        assert_eq!(
+            (record.status, record.endpoint),
+            (MemberStatus::Alive, POD_ADDR.to_owned())
+        );
+        assert!(!tracked.contains_key("site-b"), "a forged identity stays out");
+        assert!(
+            !adopt_live_identities(&mut tracked, &[&caught_up], t0),
+            "already mirrored"
+        );
+    }
+
+    #[test]
+    fn unauthenticated_drops_warn_once_per_window() {
+        let t0 = now();
+        let from = SocketAddr::from(([10, 0, 0, 1], 7946));
+        let mut drops = UnauthenticatedDrops::default();
+        assert!(drops.dropped(from, 10, t0), "first drop warns");
+        assert!(!drops.dropped(from, 10, t0 + Duration::from_secs(1)), "then quiet");
+        assert!(!drops.dropped(from, 10, t0 + Duration::from_secs(59)));
+        assert!(drops.dropped(from, 10, t0 + UNAUTHENTICATED_WARN_EVERY), "warns again");
+        assert_eq!(drops.suppressed, 0, "the count resets on a warning");
+    }
+
     // -----------------------------------------------------------------------
-    // SWIM age tracking — deterministic tests using synthetic instants
+    // SWIM age tracking with synthetic instants
     // -----------------------------------------------------------------------
 
     #[test]
@@ -1640,52 +2084,6 @@ mod tests {
         let snap = members_snapshot(&tracked, t, &BTreeMap::new(), &BTreeMap::new());
         let m = snap.members.first().unwrap_or_else(|| std::process::abort());
         assert_eq!(m.age_secs, 0, "Alive member must have age_secs=0");
-    }
-
-    #[test]
-    fn suspect_event_starts_age_clock() {
-        // Simulate: join at t0, become suspect at t0+30s, snapshot at t0+30s.
-        let t0 = now();
-        let t_suspect = t0 + Duration::from_secs(30);
-        let mut tracked = HashMap::new();
-        apply_member_event(joined("site-a"), &mut tracked, t0);
-        apply_member_event(suspect("site-a"), &mut tracked, t_suspect);
-        let snap = members_snapshot(&tracked, t_suspect, &BTreeMap::new(), &BTreeMap::new());
-        let m = snap.members.first().unwrap_or_else(|| std::process::abort());
-        assert_eq!(m.status, MemberStatus::Suspect);
-        assert_eq!(m.age_secs, 0, "age at the moment of transition must be 0");
-    }
-
-    #[test]
-    fn suspect_age_grows_over_time() {
-        let t0 = now();
-        let t_suspect = t0 + Duration::from_secs(10);
-        let t_snap = t0 + Duration::from_secs(70);
-        let mut tracked = HashMap::new();
-        apply_member_event(joined("site-a"), &mut tracked, t0);
-        apply_member_event(suspect("site-a"), &mut tracked, t_suspect);
-        let snap = members_snapshot(&tracked, t_snap, &BTreeMap::new(), &BTreeMap::new());
-        let m = snap.members.first().unwrap_or_else(|| std::process::abort());
-        assert_eq!(m.status, MemberStatus::Suspect);
-        assert_eq!(m.age_secs, 60, "age must be elapsed since transition (70s - 10s = 60s)");
-    }
-
-    #[test]
-    fn repeated_suspect_preserves_original_timestamp() {
-        // First Suspect at t+10s, second at t+50s. Age at t+70s must be 60s (t+70 - t+10).
-        let t0 = now();
-        let mut tracked = HashMap::new();
-        apply_member_event(joined("site-a"), &mut tracked, t0);
-        apply_member_event(suspect("site-a"), &mut tracked, t0 + Duration::from_secs(10));
-        apply_member_event(suspect("site-a"), &mut tracked, t0 + Duration::from_secs(50));
-        let snap = members_snapshot(
-            &tracked,
-            t0 + Duration::from_secs(70),
-            &BTreeMap::new(),
-            &BTreeMap::new(),
-        );
-        let m = snap.members.first().unwrap_or_else(|| std::process::abort());
-        assert_eq!(m.age_secs, 60, "repeated Suspect must not reset age clock");
     }
 
     #[test]
@@ -1700,28 +2098,6 @@ mod tests {
         let m = snap.members.first().unwrap_or_else(|| std::process::abort());
         assert_eq!(m.status, MemberStatus::Dead);
         assert_eq!(m.age_secs, 60, "dead age must be 80s - 20s = 60s");
-    }
-
-    #[test]
-    fn suspect_to_dead_preserves_original_suspect_timestamp() {
-        // Suspect at t+10s, then Dead at t+40s. Age at t+70s = 70-10 = 60s.
-        let t0 = now();
-        let mut tracked = HashMap::new();
-        apply_member_event(joined("site-a"), &mut tracked, t0);
-        apply_member_event(suspect("site-a"), &mut tracked, t0 + Duration::from_secs(10));
-        apply_member_event(left("site-a"), &mut tracked, t0 + Duration::from_secs(40));
-        let snap = members_snapshot(
-            &tracked,
-            t0 + Duration::from_secs(70),
-            &BTreeMap::new(),
-            &BTreeMap::new(),
-        );
-        let m = snap.members.first().unwrap_or_else(|| std::process::abort());
-        assert_eq!(m.status, MemberStatus::Dead);
-        assert_eq!(
-            m.age_secs, 60,
-            "dead after suspect must use original suspect timestamp (60s), not dead transition time (30s)"
-        );
     }
 
     #[test]
@@ -1769,7 +2145,7 @@ mod tests {
         let (state_tx, state_rx) = watch::channel(GridStateSnapshot::new("test".to_owned()));
         let (broadcast_tx, _broadcast_rx) = mpsc::channel(1);
         let (seed_tx, _seed_rx) = mpsc::channel(16);
-        let (key_tx, _key_rx) = watch::channel(None);
+        let (key_tx, _key_rx) = watch::channel(KeyState::Plain);
         let (gateway_tx, _gateway_rx) = watch::channel(None);
         let handle = SwimHandle {
             site_name: "test".to_owned(),
@@ -1781,6 +2157,7 @@ mod tests {
             key_tx,
             gateway_tx,
             runtime_tx: watch::channel(true).0,
+            leave_tx: mpsc::channel(1).0,
         };
         (handle, snapshot_tx, state_tx)
     }
@@ -1933,7 +2310,7 @@ mod tests {
         let (state_tx, state_rx) = watch::channel(GridStateSnapshot::new("test".to_owned()));
         let (broadcast_tx, _broadcast_rx) = mpsc::channel(1);
         let (seed_tx, _seed_rx) = mpsc::channel(16);
-        let (key_tx, _key_rx) = watch::channel(None);
+        let (key_tx, _key_rx) = watch::channel(KeyState::Plain);
         let (gateway_tx, _gateway_rx) = watch::channel(Some("127.0.0.1:19080".to_owned()));
         let handle = SwimHandle {
             site_name: "test".to_owned(),
@@ -1945,6 +2322,7 @@ mod tests {
             key_tx,
             gateway_tx,
             runtime_tx: watch::channel(true).0,
+            leave_tx: mpsc::channel(1).0,
         };
         drop((snapshot_tx, state_tx));
 
@@ -1961,7 +2339,7 @@ mod tests {
         let (_state_tx, state_rx) = watch::channel(GridStateSnapshot::new("test".to_owned()));
         let (broadcast_tx, _broadcast_rx) = mpsc::channel(1);
         let (seed_tx, _seed_rx) = mpsc::channel(16);
-        let (key_tx, _key_rx) = watch::channel(None);
+        let (key_tx, _key_rx) = watch::channel(KeyState::Plain);
         let (gateway_tx, _gateway_rx) = watch::channel(None);
         let handle = SwimHandle {
             site_name: "test".to_owned(),
@@ -1973,6 +2351,7 @@ mod tests {
             key_tx,
             gateway_tx,
             runtime_tx: watch::channel(true).0,
+            leave_tx: mpsc::channel(1).0,
         };
 
         let result = handle.set_gateway_address(Some("10.0.0.5:8080".to_owned()));
@@ -1990,7 +2369,7 @@ mod tests {
         let (_state_tx, state_rx) = watch::channel(GridStateSnapshot::new("test".to_owned()));
         let (broadcast_tx, _broadcast_rx) = mpsc::channel(1);
         let (seed_tx, _seed_rx) = mpsc::channel(16);
-        let (key_tx, _key_rx) = watch::channel(None);
+        let (key_tx, _key_rx) = watch::channel(KeyState::Plain);
         let (gateway_tx, gateway_rx) = watch::channel(None);
         let handle = SwimHandle {
             site_name: "test".to_owned(),
@@ -2002,6 +2381,7 @@ mod tests {
             key_tx,
             gateway_tx,
             runtime_tx: watch::channel(false).0,
+            leave_tx: mpsc::channel(1).0,
         };
         drop(gateway_rx);
 
@@ -2222,7 +2602,7 @@ mod tests {
         let (state_tx, state_rx) = watch::channel(GridStateSnapshot::new("test".to_owned()));
         let (broadcast_tx, _broadcast_rx) = mpsc::channel(1);
         let (seed_tx, mut seed_rx) = mpsc::channel(16);
-        let (key_tx, _key_rx) = watch::channel(None);
+        let (key_tx, _key_rx) = watch::channel(KeyState::Plain);
         let (gateway_tx, _gateway_rx) = watch::channel(None);
         let handle = SwimHandle {
             site_name: "test".to_owned(),
@@ -2234,6 +2614,7 @@ mod tests {
             key_tx,
             gateway_tx,
             runtime_tx: watch::channel(true).0,
+            leave_tx: mpsc::channel(1).0,
         };
         drop((snapshot_tx, state_tx));
 
@@ -2251,7 +2632,7 @@ mod tests {
         let (_state_tx, state_rx) = watch::channel(GridStateSnapshot::new("test".to_owned()));
         let (broadcast_tx, _broadcast_rx) = mpsc::channel(1);
         let (seed_tx, seed_rx) = mpsc::channel::<Vec<SocketAddr>>(16);
-        let (key_tx, _key_rx) = watch::channel(None);
+        let (key_tx, _key_rx) = watch::channel(KeyState::Plain);
         let (gateway_tx, _gateway_rx) = watch::channel(None);
         let handle = SwimHandle {
             site_name: "test".to_owned(),
@@ -2263,6 +2644,7 @@ mod tests {
             key_tx,
             gateway_tx,
             runtime_tx: watch::channel(true).0,
+            leave_tx: mpsc::channel(1).0,
         };
         drop(seed_rx);
 
@@ -2286,7 +2668,7 @@ mod tests {
             site_name: "test-node".to_owned(),
             seeds: Vec::new(),
             gateway_address: None,
-            swim_key: None,
+            key: KeyState::Plain,
             revision_lease: test_revision_lease(1),
         };
         let handle = start(cfg).await;
@@ -2309,7 +2691,7 @@ mod tests {
             site_name: "test".to_owned(),
             seeds: Vec::new(),
             gateway_address: None,
-            swim_key: None,
+            key: KeyState::Plain,
             revision_lease: test_revision_lease(20_000),
         };
         let result = start(cfg).await;
@@ -2329,7 +2711,7 @@ mod tests {
             site_name: "node-1".to_owned(),
             seeds: Vec::new(),
             gateway_address: None,
-            swim_key: None,
+            key: KeyState::Plain,
             revision_lease: test_revision_lease(40_000),
         };
         let handle1 = start(cfg1).await.unwrap_or_else(|_| std::process::abort());
@@ -2340,13 +2722,51 @@ mod tests {
             site_name: "node-2".to_owned(),
             seeds: vec![addr1],
             gateway_address: None,
-            swim_key: None,
+            key: KeyState::Plain,
             revision_lease: test_revision_lease(60_000),
         };
         let handle2 = start(cfg2).await.unwrap_or_else(|_| std::process::abort());
 
         wait_until_member_alive(&handle1, "node-2").await;
         drop(handle2);
+    }
+
+    #[tokio::test]
+    #[expect(clippy::too_many_lines, reason = "two real runtimes, a join, and a leave")]
+    async fn a_leaving_runtime_stops_and_its_peer_sees_it_dead() {
+        let addr1 = reserve_local_addr().await;
+        let addr2 = reserve_local_addr().await;
+        let handle1 = start(SwimConfig {
+            bind_addr: addr1,
+            advertise_addr: Some(addr1),
+            site_name: "node-1".to_owned(),
+            ..test_config(130_000)
+        })
+        .await
+        .expect("start");
+        let handle2 = start(SwimConfig {
+            bind_addr: addr2,
+            advertise_addr: Some(addr2),
+            site_name: "node-2".to_owned(),
+            seeds: vec![addr1],
+            ..test_config(140_000)
+        })
+        .await
+        .expect("start");
+        wait_until_member_alive(&handle1, "node-2").await;
+
+        handle2.leave(Duration::from_secs(5)).await;
+        assert!(!handle2.is_running(), "the runtime stopped");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while handle1
+            .snapshot()
+            .members
+            .iter()
+            .any(|m| m.site_id == "node-2" && m.status == MemberStatus::Alive)
+        {
+            assert!(tokio::time::Instant::now() < deadline, "the peer saw the leave");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     /// Poll a handle's `state_snapshot()` until a tenant's converged spend
@@ -2398,7 +2818,7 @@ mod tests {
             site_name: "site-a".to_owned(),
             seeds: Vec::new(),
             gateway_address: None,
-            swim_key: None,
+            key: KeyState::Plain,
             revision_lease: test_revision_lease(80_000),
         })
         .await
@@ -2410,7 +2830,7 @@ mod tests {
             site_name: "site-b".to_owned(),
             seeds: vec![addr_a],
             gateway_address: None,
-            swim_key: None,
+            key: KeyState::Plain,
             revision_lease: test_revision_lease(90_000),
         })
         .await
@@ -2445,7 +2865,7 @@ mod tests {
             site_name: "site-c".to_owned(),
             seeds: vec![addr_a],
             gateway_address: None,
-            swim_key: None,
+            key: KeyState::Plain,
             revision_lease: test_revision_lease(100_000),
         })
         .await
@@ -2534,28 +2954,6 @@ mod tests {
     }
 
     #[test]
-    fn suspect_member_is_bounded_by_ttl() {
-        let ttl = Duration::from_secs(300);
-        let t0 = now();
-        let t_suspect = t0 + Duration::from_secs(5);
-
-        let mut tracked = HashMap::new();
-        apply_member_event(joined("site-a"), &mut tracked, t0);
-        apply_member_event(suspect("site-a"), &mut tracked, t_suspect);
-        let just_before_ttl = (t_suspect + SUSPECT_MEMBER_TTL)
-            .checked_sub(Duration::from_secs(1))
-            .unwrap_or(t0);
-        assert!(
-            prune_tracked_members(&mut tracked, just_before_ttl, ttl).is_empty(),
-            "suspect member must remain before its TTL"
-        );
-        assert_eq!(
-            prune_tracked_members(&mut tracked, t_suspect + SUSPECT_MEMBER_TTL, ttl),
-            vec!["site-a".to_owned()]
-        );
-    }
-
-    #[test]
     fn evicted_site_can_rejoin() {
         let ttl = Duration::from_secs(300);
         let t0 = now();
@@ -2574,7 +2972,7 @@ mod tests {
         apply_member_event(joined("site-a"), &mut tracked, t_rejoin);
         assert_eq!(tracked.len(), 1, "rejoined site must create fresh entry");
         let member = tracked.get("site-a").unwrap_or_else(|| std::process::abort());
-        assert_eq!(member.status, MemberStatus::Alive, "rejoined member must be Alive");
+        assert_eq!(member.status(), MemberStatus::Alive, "rejoined member must be Alive");
         assert!(
             member.status_changed_at.is_none(),
             "rejoined member must have no age tracking"

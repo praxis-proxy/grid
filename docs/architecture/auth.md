@@ -363,13 +363,13 @@ before the UDP socket processes packets, but environment variables are visible
 to same-host process inspectors.  Use Kubernetes Secret references for the
 production configuration path.
 
-**Startup plaintext window:** when the operator process starts, the SWIM UDP
-socket begins receiving immediately.  If only `swimKeyRef` is configured (no
-`GRID_SWIM_ENCRYPT_KEY` env var), the runtime has no key until the first
-`GridNetwork` reconcile loads it from the Secret.  During this window — typically
-a few seconds — the SWIM socket accepts plaintext packets.  The env var path
-closes this window at startup because the key is loaded before the UDP socket
-begins processing.  This is a known limitation of the CRD-only key path.
+**Startup hold:** the operator reads the `GridNetwork` key before its first
+SWIM send. Until a key loads, SWIM sends and receives nothing. Only a network
+that declares no `swimKeyRef` releases the hold to plaintext. The hold also
+covers the time before any network exists. Set `GRID_SWIM_REQUIRE_KEY=false`
+to skip that part. If the startup list fails, the operator retries it in the
+background. A malformed `GRID_SWIM_ENCRYPT_KEY` stops the operator. The
+`grid_swim_key_pending` gauge reads 1 while held.
 
 **What SWIM encryption protects:** gossip membership messages, gateway address
 and public certificate broadcasts, and CRDT provider state.  It does not protect
@@ -377,6 +377,9 @@ data-plane request traffic (that is Praxis/Praxis AI's responsibility).
 
 **Key rotation:** changing the key requires an operator restart.  Multi-key
 keyring support (allowing zero-downtime rotation) is not yet implemented.
+
+**What the key does not stop:** any holder of the SWIM key can still mark a
+site down or evict it from membership. Identities are not yet signed per site.
 
 ## Grid mTLS Identity
 

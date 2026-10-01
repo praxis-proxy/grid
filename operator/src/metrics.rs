@@ -6,8 +6,8 @@
 use std::{sync::LazyLock, time::Duration};
 
 use prometheus::{
-    Encoder as _, Histogram, HistogramOpts, HistogramVec, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry,
-    TextEncoder, proto::MetricFamily,
+    Encoder as _, Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts,
+    Registry, TextEncoder, proto::MetricFamily,
 };
 
 // ---------------------------------------------------------------------------
@@ -45,7 +45,26 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
         .unwrap_or_else(|_| std::process::abort());
     r.register(Box::new(PEER_POLLS_IN_FLIGHT.clone()))
         .unwrap_or_else(|_| std::process::abort());
+    r.register(Box::new(SWIM_KEY_PENDING.clone()))
+        .unwrap_or_else(|_| std::process::abort());
+    r.register(Box::new(SWIM_PENDING_DROPS.clone()))
+        .unwrap_or_else(|_| std::process::abort());
     r
+});
+
+/// 1 while SWIM holds traffic for a key that has not loaded.
+static SWIM_KEY_PENDING: LazyLock<IntGauge> = LazyLock::new(|| {
+    IntGauge::new("grid_swim_key_pending", "1 while SWIM holds traffic for its key")
+        .unwrap_or_else(|_| std::process::abort())
+});
+
+/// Inbound SWIM packets dropped while the key is pending.
+static SWIM_PENDING_DROPS: LazyLock<IntCounter> = LazyLock::new(|| {
+    IntCounter::new(
+        "grid_swim_key_pending_dropped_total",
+        "Inbound SWIM packets dropped while the key is pending",
+    )
+    .unwrap_or_else(|_| std::process::abort())
 });
 
 // ---------------------------------------------------------------------------
@@ -293,6 +312,16 @@ pub(crate) fn set_peer_collection_up(peer: &str, up: bool, at: std::time::System
 /// Move the in-flight count, so the worker pool's saturation is visible.
 pub(crate) fn peer_polls_in_flight(delta: i64) {
     PEER_POLLS_IN_FLIGHT.add(delta);
+}
+
+/// Set whether SWIM is holding traffic for its key.
+pub(crate) fn set_swim_key_pending(pending: bool) {
+    SWIM_KEY_PENDING.set(i64::from(pending));
+}
+
+/// Count an inbound SWIM packet dropped while the key is pending.
+pub(crate) fn record_swim_pending_drop() {
+    SWIM_PENDING_DROPS.inc();
 }
 
 /// Gather all registered metrics for serialization.

@@ -133,6 +133,19 @@ impl SwimNode {
         self.origin_state.remove_origin(origin);
     }
 
+    /// Identities foca currently holds as active, suspect ones included.
+    pub fn live_identities(&self) -> impl Iterator<Item = &NodeId> {
+        self.foca.iter_members().map(foca::Member::id)
+    }
+
+    /// Announce that this node is leaving.
+    pub fn leave(&mut self) -> AccumulatedOutput {
+        if let Err(err) = self.foca.leave_cluster(&mut self.runtime) {
+            tracing::warn!(error = %err, "foca leave error");
+        }
+        self.runtime.take_output()
+    }
+
     /// Pin `origin` to a bounded set of accepted raw ECDSA P-256 public keys.
     ///
     /// If `origin` has no existing pin (or its existing pin is empty),
@@ -656,6 +669,29 @@ mod tests {
             }
         }
         (out_a, from_b)
+    }
+
+    #[test]
+    fn a_leaving_node_is_dropped_from_the_peer_live_identities() {
+        let id_a = local_id("site-a", 19_240);
+        let id_b = local_id("site-b", 19_241);
+        let (mut node_a, _) = make_node("site-a", 19_240);
+        let (mut node_b, _) = make_node("site-b", 19_241);
+        establish_membership(&mut node_a, &mut node_b, &id_a, &id_b);
+        let live = |node: &SwimNode| node.live_identities().any(|id| id.site_name() == "site-a");
+        assert!(live(&node_b), "joined");
+
+        let mut left = false;
+        for msg in node_a.leave().messages {
+            if msg.addr == id_b.socket_addr() {
+                left |=
+                    node_b.handle_data(&msg.data).events.iter().any(
+                        |event| matches!(event, crate::MemberEvent::Left { site_name, .. } if site_name == "site-a"),
+                    );
+            }
+        }
+        assert!(left, "the peer saw the leave");
+        assert!(!live(&node_b), "no longer live");
     }
 
     /// Prove that foca carries the CRDT state payload to a peer via gossip.

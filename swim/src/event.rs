@@ -21,18 +21,21 @@ pub enum MemberEvent {
 
         /// Network address.
         addr: SocketAddr,
+
+        /// Process generation of this identity.
+        generation: u64,
     },
 
     /// A site has left the grid (graceful or timeout).
     Left {
         /// Site name.
         site_name: String,
-    },
 
-    /// A site is suspected of being unreachable.
-    Suspect {
-        /// Site name.
-        site_name: String,
+        /// Address of the identity that left.
+        addr: SocketAddr,
+
+        /// Process generation of the identity that left.
+        generation: u64,
     },
 }
 
@@ -49,6 +52,7 @@ mod tests {
         let event = MemberEvent::Joined {
             site_name: "cluster-a".to_owned(),
             addr: "10.0.0.1:7946".parse().unwrap_or_else(|_| std::process::abort()),
+            generation: 1,
         };
         let debug = format!("{event:?}");
         assert!(debug.contains("cluster-a"), "should contain site name");
@@ -58,29 +62,11 @@ mod tests {
     fn event_clone() {
         let event = MemberEvent::Left {
             site_name: "cluster-b".to_owned(),
+            addr: "10.0.0.2:7946".parse().unwrap_or_else(|_| std::process::abort()),
+            generation: 1,
         };
         let cloned = event.clone();
         assert!(matches!(cloned, MemberEvent::Left { .. }), "should clone correctly");
-        assert_eq!(
-            format!("{event:?}"),
-            format!("{cloned:?}"),
-            "clone must be independently equal to the original, not just the same variant shape"
-        );
-    }
-
-    #[test]
-    fn suspect_event_debug_format() {
-        let event = MemberEvent::Suspect {
-            site_name: "site-x".to_owned(),
-        };
-        let debug = format!("{event:?}");
-        assert!(debug.contains("site-x"), "Suspect debug must contain site name");
-        assert!(debug.contains("Suspect"), "Suspect debug must contain variant name");
-        let cloned = event.clone();
-        assert!(
-            matches!(cloned, MemberEvent::Suspect { .. }),
-            "Suspect must clone correctly"
-        );
         assert_eq!(
             format!("{event:?}"),
             format!("{cloned:?}"),

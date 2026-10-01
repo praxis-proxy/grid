@@ -1,6 +1,6 @@
 //! Command-line interface, parsed once at startup from flags/environment.
 
-use clap::Parser;
+use clap::{Args, Parser};
 
 use crate::{enroll, gateway};
 
@@ -15,6 +15,25 @@ pub struct Cli {
     /// Site auto-enroll options.
     #[command(flatten)]
     pub enrollment: enroll::Config,
+
+    /// SWIM runtime options.
+    #[command(flatten)]
+    pub swim: SwimArgs,
+}
+
+/// SWIM runtime options.
+#[derive(Args, Debug, Clone)]
+#[group(id = "swim")]
+pub struct SwimArgs {
+    /// Hold all SWIM traffic until a `GridNetwork` loads the key or declares none.
+    #[arg(
+        long = "swim-require-key",
+        env = "GRID_SWIM_REQUIRE_KEY",
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    pub require_key: bool,
 }
 
 #[cfg(test)]

@@ -205,6 +205,9 @@ granted for `secrets` and `configmaps`.  `delete` and
 |---|---|---|
 | `events` | `create`, `patch` | Published on `GridSite` phase/reason transitions with action `GatewayProbe` |
 
+`GridSite` is cluster-scoped, so its events land in the operator namespace:
+`kubectl -n <operator namespace> get events --field-selector involvedObject.kind=GridSite`.
+
 **Core resources (namespaced, `grid-operator-resources`):**
 
 | Resource | Verbs | Why |
@@ -307,6 +310,9 @@ unrelated address.
 |---|---|
 | `GRID_SWIM_BIND_ADDR` | UDP address to bind the SWIM listener |
 | `GRID_SWIM_ADVERTISE_ADDR` | Advertised SWIM endpoint; accepts `ip:port`, `[ipv6]:port`, or `hostname:port` and defaults to `$(POD_IP):7946` |
+| `GRID_SWIM_SERVICE_NAME` | SWIM Service in the operator namespace, which must be type LoadBalancer. The operator advertises its LoadBalancer address, waiting for it without a fallback and reporting not ready until then. Controllers run during the wait, and writes derived from membership wait for a first peer or a 15 second grace. When three polls in a row no longer list the advertised hostname or IP, the operator leaves the cluster and exits, so the restarted pod advertises the new one |
+| `GRID_SWIM_ADVERTISE_FALLBACK` | Marks a `GRID_SWIM_ADVERTISE_ADDR` equal to it as the Pod IP default. The operator then builds the Pod IP endpoint itself, bracketing IPv6, or discovers the LoadBalancer address when `GRID_SWIM_SERVICE_NAME` names a Service. An older operator ignores it and advertises the Pod IP |
+| `GRID_SWIM_REQUIRE_KEY` | Hold all SWIM traffic until the `GridNetwork` key loads or the network declares none. Defaults to `true`. With `false`, SWIM is plaintext while no network exists |
 | `GRID_SWIM_SITE_NAME` | Unique site identity for this operator instance |
 | `GRID_SWIM_SEEDS` | Comma-separated SWIM seed endpoints; accepts `ip:port`, `[ipv6]:port`, or `hostname:port` |
 | `GRID_GATEWAY_ADDRESS` | Explicit gateway address override (skips self-discovery) |

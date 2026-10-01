@@ -174,7 +174,7 @@ fn log_discovery_result(service: &str, namespace: &str, addr: Option<&String>) {
 
 /// Extract the first `LoadBalancer` ingress address as `"<host>:<port>"`.
 ///
-/// Prefers `.ip` over `.hostname`; `None` when there is no ingress.
+/// Prefers `.ip` over `.hostname`, bracketing IPv6, and is `None` without ingress.
 pub fn extract_lb_address(svc: &Service, port: u16) -> Option<String> {
     let ingress = svc.status.as_ref()?.load_balancer.as_ref()?.ingress.as_ref()?;
     let first = ingress.first()?;
@@ -183,7 +183,10 @@ pub fn extract_lb_address(svc: &Service, port: u16) -> Option<String> {
         .as_deref()
         .or(first.hostname.as_deref())
         .filter(|s| !s.is_empty())?;
-    Some(format!("{host}:{port}"))
+    Some(match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => std::net::SocketAddr::new(ip, port).to_string(),
+        Err(_) => format!("{host}:{port}"),
+    })
 }
 
 #[cfg(test)]
@@ -293,6 +296,37 @@ mod tests {
     #[test]
     fn no_ingress_returns_none() {
         assert_eq!(extract_lb_address(&svc_no_ingress(), 8080), None);
+    }
+
+    #[test]
+    fn ingress_with_vip_ip_mode_is_usable() {
+        let svc = Service {
+            status: Some(ServiceStatus {
+                load_balancer: Some(LoadBalancerStatus {
+                    ingress: Some(vec![LoadBalancerIngress {
+                        ip: Some("192.168.1.150".to_owned()),
+                        ip_mode: Some("VIP".to_owned()),
+                        ..Default::default()
+                    }]),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            extract_lb_address(&svc, 7946).as_deref(),
+            Some("192.168.1.150:7946"),
+            "a VIP ipMode ingress is usable"
+        );
+    }
+
+    #[test]
+    fn ipv6_ingress_is_bracketed() {
+        assert_eq!(
+            extract_lb_address(&svc_with_ip("fd00::1"), 8080).as_deref(),
+            Some("[fd00::1]:8080"),
+            "IPv6 is bracketed"
+        );
     }
 
     #[test]

@@ -56,6 +56,14 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 // Reconcile
 // ---------------------------------------------------------------------------
 
+/// The event reference for a cluster-scoped site, placed in `namespace`.
+fn event_reference(site: &GridSite, namespace: &str) -> ObjectReference {
+    ObjectReference {
+        namespace: Some(namespace.to_owned()),
+        ..site.object_ref(&())
+    }
+}
+
 /// Reconcile a [`GridSite`] resource.
 ///
 /// # Errors
@@ -74,7 +82,7 @@ pub async fn reconcile(site: Arc<GridSite>, client: Arc<Client>) -> Result<Actio
         controller: "grid-site-controller".into(),
         instance: None,
     };
-    let object_ref = site.object_ref(&());
+    let object_ref = event_reference(&site, client.default_namespace());
     let recorder = Recorder::new(client.as_ref().clone(), reporter);
 
     info!(name, "reconciling GridSite");
@@ -728,6 +736,14 @@ mod tests {
                 ..Default::default()
             }),
         }
+    }
+
+    #[test]
+    fn site_events_go_to_the_operator_namespace() {
+        let reference = event_reference(&site_no_egress(None), "grid");
+        assert_eq!(reference.namespace.as_deref(), Some("grid"), "not default");
+        assert_eq!(reference.name.as_deref(), Some("test-site"), "still names the site");
+        assert_eq!(reference.kind.as_deref(), Some("GridSite"), "references a GridSite");
     }
 
     fn site_no_egress(phase: Option<GridSitePhase>) -> GridSite {

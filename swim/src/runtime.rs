@@ -130,9 +130,12 @@ impl foca::Runtime<NodeId> for GridRuntime {
             foca::Notification::MemberUp(id) => MemberEvent::Joined {
                 site_name: id.site_name().to_owned(),
                 addr: id.socket_addr(),
+                generation: id.generation(),
             },
             foca::Notification::MemberDown(id) => MemberEvent::Left {
                 site_name: id.site_name().to_owned(),
+                addr: id.socket_addr(),
+                generation: id.generation(),
             },
             // Rename(old, new): a member restarted with a higher generation at
             // the same address.  Emit Left for the old identity and Joined for
@@ -140,10 +143,13 @@ impl foca::Runtime<NodeId> for GridRuntime {
             foca::Notification::Rename(old, new) => {
                 self.output.events.push(MemberEvent::Left {
                     site_name: old.site_name().to_owned(),
+                    addr: old.socket_addr(),
+                    generation: old.generation(),
                 });
                 MemberEvent::Joined {
                     site_name: new.site_name().to_owned(),
                     addr: new.socket_addr(),
+                    generation: new.generation(),
                 }
             },
             foca::Notification::Active

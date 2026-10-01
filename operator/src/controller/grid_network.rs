@@ -58,17 +58,14 @@ use crate::{
 /// to its existing static phase logic.
 #[expect(
     clippy::partial_pub_fields,
-    reason = "client and swim are public API; metrics_cache and last_seeds are crate-internal"
+    reason = "client is public API; the SWIM handle and caches are reached through methods"
 )]
 pub struct OperatorCtx {
     /// Kubernetes API client.
     pub client: Client,
 
-    /// Optional handle to the live SWIM membership runtime.
-    ///
-    /// `None` when the operator is started without a SWIM bind address
-    /// configured (e.g. in single-node or test environments).
-    pub swim: Option<Arc<SwimHandle>>,
+    /// The live SWIM runtime once started, empty without a SWIM bind address.
+    swim: std::sync::OnceLock<Arc<SwimHandle>>,
 
     /// Cross-reconcile cache of recently-scraped provider metrics.
     ///
@@ -115,7 +112,13 @@ pub struct OperatorCtx {
     /// Under poll the operator stops carrying metrics in gossip and scoring the
     /// overlay, and the gateway ranks from the signal it pulls instead.
     pub(crate) signal_mode: SignalMode,
+
+    /// Whether membership-derived writes may run, cleared while SWIM converges.
+    membership_ready: std::sync::atomic::AtomicBool,
 }
+
+/// Requeue for a reconcile held while SWIM membership converges.
+const MEMBERSHIP_HOLD_REQUEUE: Duration = Duration::from_secs(5);
 
 impl OperatorCtx {
     /// Create a new [`OperatorCtx`] with an empty metrics cache.
@@ -126,7 +129,7 @@ impl OperatorCtx {
     pub fn new(client: Client, swim: Option<Arc<SwimHandle>>, signal_mode: SignalMode) -> Self {
         Self {
             client,
-            swim,
+            swim: swim.map(std::sync::OnceLock::from).unwrap_or_default(),
             metrics_cache: Mutex::new(provider_metrics::MetricsCache::new()),
             admission_memory: Mutex::new(provider_admission::AdmissionMemory::default()),
             last_seeds: std::sync::Mutex::new(HashMap::new()),
@@ -134,7 +137,38 @@ impl OperatorCtx {
             peers: signals::SignalStore::new(),
             signals: signals::SignalStore::new(),
             signal_mode,
+            membership_ready: std::sync::atomic::AtomicBool::new(true),
         }
+    }
+
+    /// Hold membership-derived writes until [`release_membership`](Self::release_membership).
+    #[must_use]
+    pub fn hold_membership(self) -> Self {
+        self.membership_ready.store(false, std::sync::atomic::Ordering::Release);
+        self
+    }
+
+    /// Let membership-derived writes run once SWIM has settled and converged.
+    pub fn release_membership(&self) {
+        self.membership_ready.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// The requeue for a reconcile held while membership converges, `None` once released.
+    #[must_use]
+    pub fn membership_hold(&self) -> Option<Action> {
+        (!self.membership_ready.load(std::sync::atomic::Ordering::Acquire))
+            .then(|| Action::requeue(MEMBERSHIP_HOLD_REQUEUE))
+    }
+
+    /// The SWIM runtime, `None` until it starts or without one.
+    #[must_use]
+    pub fn swim(&self) -> Option<&Arc<SwimHandle>> {
+        self.swim.get()
+    }
+
+    /// Install the SWIM runtime once it starts, `false` if one already was.
+    pub fn set_swim(&self, handle: Arc<SwimHandle>) -> bool {
+        self.swim.set(handle).is_ok()
     }
 
     /// A handle to what this site publishes, for the signals listener.
@@ -249,7 +283,7 @@ fn signal_access(providers: &[InferenceProvider]) -> signals::AccessMap {
 /// is known. A provider that set it itself keeps its value under an exported
 /// name, so what a reader sees as the origin is what this site says it is.
 fn publish_signals(ctx: &OperatorCtx, collected: HashMap<String, Vec<signals::Observation>>) {
-    let site = ctx.swim.as_ref().map(|s| s.site_name().to_owned()).unwrap_or_default();
+    let site = ctx.swim().map(|s| s.site_name().to_owned()).unwrap_or_default();
     let attributed = collected
         .into_iter()
         .map(|(provider, observations)| {
@@ -492,7 +526,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
     let client = &ctx.client;
     ensure_tls_secrets(&network, client).await?;
 
-    if let Some(swim) = ctx.swim.as_ref() {
+    if let Some(swim) = ctx.swim() {
         // When a GridNetwork configures a SWIM key Secret, resolve and apply it
         // before any reconcile-triggered SWIM send.  If the key cannot be
         // loaded, fail this reconcile before announcing CRD seeds or publishing
@@ -522,6 +556,12 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
                 tracing::warn!(network = name, error = %e, "failed to publish site cert broadcast");
             }
         }
+    }
+
+    // Rendering before membership converges would drop remote entries.
+    if let Some(hold) = ctx.membership_hold() {
+        tracing::info!(network = name, "holding membership-derived writes until SWIM converges");
+        return Ok(hold);
     }
 
     // List providers once; share between routing overlay rendering and CRDT publishing.
@@ -623,16 +663,15 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
     }
 
     let remote_crdt_providers: Vec<crdt::ProviderState> = ctx
-        .swim
-        .as_ref()
+        .swim()
         .map(|swim| collect_remote_crdt_providers(swim, name))
         .unwrap_or_default();
 
     // Obtain a live membership snapshot here - used both for staleness override below
     // and for phase determination after the overlay step.
     // When swim is None (runtime not configured), falls through to static phase logic.
-    let swim_runtime_running = ctx.swim.as_ref().is_none_or(|handle| handle.is_running());
-    let membership = ctx.swim.as_ref().map(|h| h.snapshot());
+    let swim_runtime_running = ctx.swim().is_none_or(|handle| handle.is_running());
+    let membership = ctx.swim().map(|h| h.snapshot());
 
     // Downgrade providers from Dead/Suspect SWIM members to Degraded so the overlay
     // emits fresh=false for their candidates.  The record is kept (not excluded) so
@@ -667,7 +706,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
     };
 
     // Publish real InferenceProvider-derived CRDT state so peers learn this site's providers.
-    let distributed_provider_count = if let Some(swim) = ctx.swim.as_ref().filter(|handle| handle.is_running()) {
+    let distributed_provider_count = if let Some(swim) = ctx.swim().filter(|handle| handle.is_running()) {
         publish_real_provider_state(swim, name, &grid_id, &providers, &raw_metrics);
         count_remote_provider_records(swim, name)
     } else {
@@ -679,8 +718,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
     // indistinguishable here from "no spend recorded" — resolve_budget_statuses
     // still emits a zero-spend entry for every policy-declared tenant.
     let tenant_spend = ctx
-        .swim
-        .as_ref()
+        .swim()
         .map(|swim| swim.state_snapshot().tenant_spend)
         .unwrap_or_default();
     let budget_statuses =
@@ -709,7 +747,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
         .as_ref()
         .and_then(|l| l.get(LABEL_AUTO_DISCOVER_SITES))
         .is_some_and(|v| v == "true");
-    if auto_discover_enabled && let (Some(swim), Some(snapshot)) = (ctx.swim.as_ref(), membership.as_ref()) {
+    if auto_discover_enabled && let (Some(swim), Some(snapshot)) = (ctx.swim(), membership.as_ref()) {
         let plaintext = network_uses_plaintext_egress(&network);
         reconcile_local_site(name, swim.site_name(), client).await?;
         reconcile_discovered_sites(name, swim.site_name(), snapshot, client, plaintext).await?;
@@ -774,10 +812,10 @@ async fn apply_configured_swim_key(
     client: &Client,
     swim: &SwimHandle,
 ) -> Result<(), OperatorError> {
-    let Some(swim_key_ref) = &network.spec.tls.swim_key_ref else {
-        return Ok(());
-    };
     let network_name = network.metadata.name.as_deref().unwrap_or("<unknown>");
+    let Some(swim_key_ref) = &network.spec.tls.swim_key_ref else {
+        return release_plain_if_undeclared(client, swim, network_name).await;
+    };
 
     let key = secret::read_swim_key(client, swim_key_ref)
         .await
@@ -795,6 +833,30 @@ async fn apply_configured_swim_key(
     swim.set_swim_key(key)
         .map_err(|e| OperatorError::SwimKeyConfig(format!("failed to apply swimKeyRef for {network_name}: {e}")))?;
     Ok(())
+}
+
+/// Release a pending hold to plaintext once no `GridNetwork` declares a SWIM key.
+async fn release_plain_if_undeclared(client: &Client, swim: &SwimHandle, network: &str) -> Result<(), OperatorError> {
+    if !swim.is_key_pending() {
+        return Ok(());
+    }
+    let networks = Api::<GridNetwork>::all(client.clone())
+        .list(&ListParams::default())
+        .await?
+        .items;
+    if !declares_swim_key(&networks) && swim.release_plain() {
+        tracing::warn!(
+            network,
+            "no GridNetwork declares a swimKeyRef; SWIM gossip is plaintext"
+        );
+    }
+    Ok(())
+}
+
+/// Whether any of `networks` declares a SWIM key.
+#[must_use]
+pub fn declares_swim_key(networks: &[GridNetwork]) -> bool {
+    networks.iter().any(|network| network.spec.tls.swim_key_ref.is_some())
 }
 
 /// Return a monotonic-ish revision for public-cert metadata broadcasts.
@@ -1239,18 +1301,23 @@ async fn reconcile_routing_overlay_inner(
         // (non-empty) ConfigMap remains in place until a provider becomes
         // available again.
         if overlay.candidates.is_empty() {
-            tracing::warn!(
-                network = network_name,
-                gateway = %gw_ref.name,
-                "routing overlay has no candidates; skipping ConfigMap apply \
-                 to prevent invalid Praxis intelligent_route config"
-            );
+            // Warn once on entering the state.
+            if already_empty(network, gw_ref) {
+                tracing::debug!(network = network_name, gateway = %gw_ref.name, "routing overlay still has no candidates");
+            } else {
+                tracing::warn!(
+                    network = network_name,
+                    gateway = %gw_ref.name,
+                    "routing overlay has no candidates; skipping ConfigMap apply \
+                     to prevent invalid Praxis intelligent_route config"
+                );
+            }
             overlay_statuses.push(retained_overlay_status(
                 network,
                 gw_ref,
                 observed_generation,
                 Some(&render),
-                "EmptyCandidates",
+                EMPTY_CANDIDATES,
                 "no candidates available",
             ));
             continue;
@@ -1325,6 +1392,19 @@ async fn reconcile_routing_overlay_inner(
         }
     }
     Ok((consumer_statuses, overlay_statuses))
+}
+
+/// Overlay status reason while a gateway has no candidates.
+const EMPTY_CANDIDATES: &str = "EmptyCandidates";
+
+/// Whether the last recorded status for this gateway already had no candidates.
+fn already_empty(network: &GridNetwork, gw_ref: &GatewayRef) -> bool {
+    network.status.as_ref().is_some_and(|status| {
+        status
+            .overlay_status
+            .iter()
+            .any(|e| e.gateway_name == gw_ref.name && e.namespace == gw_ref.namespace && e.reason == EMPTY_CANDIDATES)
+    })
 }
 
 /// Find the last successfully distributed overlay status for a gateway.
@@ -2943,9 +3023,62 @@ mod tests {
         .unwrap_or_else(|_| std::process::abort())
     }
 
+    #[test]
+    fn empty_overlay_warns_only_on_entering_the_state() {
+        let gw: GatewayRef = serde_json::from_value(serde_json::json!({"name": "gw", "namespace": "ns"}))
+            .unwrap_or_else(|_| std::process::abort());
+        let with_reason = |reason: &str| {
+            let mut network = base_network();
+            network.status = Some(
+                serde_json::from_value(serde_json::json!({"overlayStatus": [{
+                    "gatewayName": "gw", "namespace": "ns", "configMapName": "c", "schemaVersion": "v",
+                    "renderedRevision": "r", "distributedRevision": "r", "contentDigest": "r", "reason": reason,
+                }]}))
+                .unwrap_or_else(|_| std::process::abort()),
+            );
+            network
+        };
+        let cases = [
+            ("no status yet", base_network(), false),
+            ("was distributed", with_reason(""), false),
+            ("was already empty", with_reason("EmptyCandidates"), true),
+        ];
+        for (label, network, want) in cases {
+            assert_eq!(already_empty(&network, &gw), want, "{label}");
+        }
+    }
+
     // -----------------------------------------------------------------------
     // reject_invalid_budget_policy
     // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn membership_writes_hold_until_released() {
+        let client = crate::resources::test_doubles::mock_kube_client_with_secrets(HashMap::new());
+        let open = OperatorCtx::new(client.clone(), None, SignalMode::default());
+        assert!(open.membership_hold().is_none(), "tests and static mode write at once");
+        let held = OperatorCtx::new(client, None, SignalMode::default()).hold_membership();
+        assert_eq!(held.membership_hold(), Some(Action::requeue(MEMBERSHIP_HOLD_REQUEUE)));
+        held.release_membership();
+        assert!(held.membership_hold().is_none(), "released");
+    }
+
+    #[test]
+    fn a_keyless_network_releases_plaintext_only_when_no_network_declares_a_key() {
+        let keyless = base_network();
+        let mut keyed = base_network();
+        keyed.spec.tls.swim_key_ref = Some(crate::crd::grid_network::SecretRef {
+            name: "swim-key".to_owned(),
+            namespace: "grid".to_owned(),
+            key: None,
+        });
+        assert!(
+            !declares_swim_key(std::slice::from_ref(&keyless)),
+            "alone it may release"
+        );
+        assert!(declares_swim_key(&[keyless, keyed]), "a keyed sibling keeps the hold");
+        assert!(!declares_swim_key(&[]), "no network declares one");
+    }
 
     fn network_with_budget_policy(tenants: Vec<TenantBudgetConfig>) -> GridNetwork {
         let mut network = base_network();

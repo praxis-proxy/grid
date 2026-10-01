@@ -11,6 +11,9 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
+/// Skew tolerated on a peer's clock-seeded generation or revision before it counts as forged.
+pub const MAX_LEASE_SKEW: Duration = Duration::from_secs(600);
+
 // ---------------------------------------------------------------------------
 // Node Identity
 // ---------------------------------------------------------------------------
@@ -118,6 +121,12 @@ impl NodeId {
     pub fn socket_addr(&self) -> SocketAddr {
         self.addr
     }
+
+    /// Return the process generation. A higher one supersedes a lower one.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
 }
 
 impl PartialEq for NodeId {
@@ -148,8 +157,27 @@ impl foca::Identity for NodeId {
     }
 
     fn win_addr_conflict(&self, other: &Self) -> bool {
-        self.generation > other.generation
+        let now = initial_generation();
+        match (
+            is_future_generation(self.generation, now),
+            is_future_generation(other.generation, now),
+        ) {
+            (false, true) => true,
+            (true, false) => false,
+            _ => self.generation > other.generation,
+        }
     }
+}
+
+/// [`MAX_LEASE_SKEW`] in nanoseconds, the unit generations are seeded in.
+fn skew_nanos() -> u64 {
+    u64::try_from(MAX_LEASE_SKEW.as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// Whether `generation` lies past `now_nanos` by more than [`MAX_LEASE_SKEW`].
+#[must_use]
+pub fn is_future_generation(generation: u64, now_nanos: u64) -> bool {
+    generation > now_nanos.saturating_add(skew_nanos())
 }
 
 /// Default generation limit for identities decoded from the wire.
@@ -214,6 +242,20 @@ mod tests {
         let new = old.renew().unwrap_or_else(|| std::process::abort());
         assert!(new.win_addr_conflict(&old), "newer should win");
         assert!(!old.win_addr_conflict(&new), "older should lose");
+    }
+
+    #[test]
+    fn a_generation_from_the_future_never_wins_a_conflict() {
+        let addr = "127.0.0.1:7946".parse().unwrap_or_else(|_| std::process::abort());
+        let live = NodeId::new("test".to_owned(), addr);
+        let forged = NodeId::with_generation("test".to_owned(), addr, u64::MAX);
+        assert!(
+            live.win_addr_conflict(&forged),
+            "the live identity beats a forged future one"
+        );
+        assert!(!forged.win_addr_conflict(&live), "the forged identity loses");
+        let near = NodeId::with_generation("test".to_owned(), addr, live.generation + skew_nanos() / 2);
+        assert!(near.win_addr_conflict(&live), "within the skew, higher still wins");
     }
 
     #[test]
