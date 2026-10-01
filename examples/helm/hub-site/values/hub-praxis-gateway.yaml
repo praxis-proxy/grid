@@ -1,0 +1,16 @@
+# Consumer gateway on the hub, routing on its static site backends.
+gatewayConfig:
+  localSite: hub
+  model: my-model
+  auth:
+    # none only behind a trusted authenticating front. In production use api-key with the
+    # maas-api validate URL, which needs praxis-policy 0.4.
+    mode: none
+  backends:
+    site-a:
+      endpoint: 203.0.113.20:8080
+# Pods in this namespace only.
+networkPolicy:
+  enabled: true
+  from:
+    - podSelector: {}

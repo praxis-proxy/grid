@@ -449,6 +449,33 @@ for f in "$EXAMPLE_DIR"/combined-site/values/*-grid-mock-providers.yaml; do
   try_template "charts/grid-mock-providers" "$LABEL" --namespace grid-system -f "$f"
 done
 
+# Hub and site example: each values file as the README installs it.
+HS_VALUES="examples/helm/hub-site/values"
+HS_DIGEST=$(printf 'a%.0s' $(seq 64))
+try_template "charts/grid-enrollment" "example hub-site hub-grid-enrollment" --namespace grid \
+  -f "$HS_VALUES/hub-grid-enrollment.yaml"
+try_template "charts/grid-enrollment" "example hub-site hub-grid-enrollment route" --namespace grid \
+  -f "$HS_VALUES/hub-grid-enrollment.yaml" --set route.enabled=true --set-string route.host=enroll.apps.example.com
+# The digest placeholders fail closed until replaced.
+HS_PINNED=(--set "peers.hub.digest=$HS_DIGEST")
+HS_GW_PINNED=(--set "gatewayConfig.peerTrust.digest=$HS_DIGEST")
+for side in hub site; do
+  try_template "$CHART_DIR" "example hub-site $side-grid-operator" --namespace grid -f "$HS_VALUES/$side-grid-operator.yaml"
+done
+try_template "charts/grid-site" "example hub-site hub-grid-site" --namespace grid -f "$HS_VALUES/hub-grid-site.yaml"
+try_template "charts/grid-site" "example hub-site site-grid-site" --namespace grid -f "$HS_VALUES/site-grid-site.yaml" \
+  "${HS_PINNED[@]}"
+try_template "$GW_DIR" "example hub-site hub-praxis-gateway" --namespace grid -f "$HS_VALUES/hub-praxis-gateway.yaml"
+try_template "$GW_DIR" "example hub-site site-praxis-gateway" --namespace grid -f "$HS_VALUES/site-praxis-gateway.yaml" \
+  "${HS_GW_PINNED[@]}"
+try_template "$GW_DIR" "example hub-site site-praxis-gateway spiffe" --namespace grid \
+  -f "$HS_VALUES/site-praxis-gateway.yaml" --set gatewayConfig.peerTrust.mode=spiffe --set gatewayConfig.peerTrust.digest="" \
+  --set gatewayConfig.peerTrust.spiffeId=spiffe://grid.internal/site/hub
+try_reject_msg "$GW_DIR" "example hub-site site gateway with the digest placeholder" "digest" --namespace grid \
+  -f "$HS_VALUES/site-praxis-gateway.yaml"
+try_reject_msg "charts/grid-site" "example hub-site site grid-site with the digest placeholder" "digest" \
+  --namespace grid -f "$HS_VALUES/site-grid-site.yaml"
+
 # ── Verify fullnameOverride ──────────────────────────────────────────
 echo ""
 echo "=== fullnameOverride (gateway) ==="
@@ -1633,6 +1660,66 @@ if [ "$(helm template v-enroll "$ENROLL_DIR" --namespace grid-system --show-only
 else
   fail "enrollment: bootstrap RBAC should carry hook-succeeded"
 fi
+
+# ======================================================================
+# GitOps Determinism
+# ======================================================================
+
+echo ""
+echo "======================================================================"
+echo "  GitOps Determinism"
+echo "======================================================================"
+
+# Argo CD renders with helm template, no cluster access, on every sync.
+echo ""
+echo "=== No cluster lookups or render-varying functions ==="
+NONDET='\b(lookup|randAlphaNum|randAlpha|randNumeric|randAscii|randBytes|randInt|shuffle|uuidv4|now|htpasswd|bcrypt|encryptAES|genCA|genPrivateKey|genSelfSignedCert|genSignedCert)\b|\.Release\.Revision'
+for chart in charts/*/; do
+  # A YAML # comment still executes its template actions, so only template comments are skipped.
+  hits=$(grep -rnE "$NONDET" "$chart/templates" | grep -vE '^[^:]+:[0-9]+:\s*(#[^{]*$|\{\{-? */\*)' || true)
+  if [ -z "$hits" ]; then
+    pass "deterministic functions only: $chart"
+  else
+    fail "render-varying template code in $chart: $(echo "$hits" | head -3 | tr '\n' ' ')"
+  fi
+done
+
+echo ""
+echo "=== Renders twice to identical bytes ==="
+# same_render <label> <helm template args...>
+same_render() {
+  local label="$1" first second
+  shift
+  if first=$(helm template v-det "$@" 2>&1) && second=$(helm template v-det "$@" 2>&1) && [ "$first" = "$second" ]; then
+    pass "identical renders: $label"
+  else
+    fail "renders differ or fail: $label"
+  fi
+}
+same_render "grid-operator defaults" "$CHART_DIR"
+same_render "grid-site defaults" charts/grid-site --set gridNetwork.name=grid --set gridSite.name=site-a
+same_render "grid-enrollment defaults" charts/grid-enrollment
+same_render "grid-enrollment local authz" charts/grid-enrollment --set enrollment.authz=local
+same_render "praxis-gateway defaults" "$GW_DIR" --set config.existingConfigMap=cfg
+same_render "grid-mock-providers defaults" charts/grid-mock-providers
+for f in "$HS_VALUES"/*.yaml; do
+  role=$(basename "$f" .yaml)
+  extra=()
+  case $role in
+    *-grid-enrollment) chart=charts/grid-enrollment ;;
+    *-grid-operator) chart=$CHART_DIR ;;
+    hub-grid-site) chart=charts/grid-site ;;
+    site-grid-site)
+      chart=charts/grid-site
+      extra=("${HS_PINNED[@]}")
+      ;;
+    *-praxis-gateway)
+      chart=$GW_DIR
+      extra=("${HS_GW_PINNED[@]}")
+      ;;
+  esac
+  same_render "example hub-site $role" "$chart" --namespace grid -f "$f" "${extra[@]}"
+done
 
 # ── Summary ──────────────────────────────────────────────────────────
 echo ""

@@ -1,0 +1,13 @@
+# Provider gateway on site-a. It admits only the hub.
+image:
+  repository: ghcr.io/praxis-proxy/grid-gateway
+  tag: v0.1.4
+gatewayConfig:
+  role: provider
+  localSite: site-a
+  peerTrust:
+    digest: <hub leaf digest>
+  backends:
+    local:
+      # The model Service ClusterIP: praxis refuses a hostname that resolves privately.
+      endpoint: 10.96.0.20:8000

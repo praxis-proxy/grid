@@ -1,0 +1,55 @@
+apiVersion: forge.praxis.dev/v1alpha1
+kind: Environment
+
+metadata:
+  name: grid-hub-site
+
+spec:
+  runtime:
+    provider: docker
+    clusterPrefix: grid-hub-site
+
+  network:
+    crossCluster: true
+    dnsZone: grid-hub-site.test
+
+  # Infrastructure only: scripts/e2e-hub-site.sh installs the grid with helm.
+  clusters:
+    - name: hub
+      stacks: [metallb]
+
+    - name: site
+      stacks: [metallb, vcr-backend]
+      properties:
+        vcrImage: "ghcr.io/neuralmagic/vllm-vcr:vllm0.23"
+        imagePullPolicy: IfNotPresent
+
+  stacks:
+    metallb:
+      description: MetalLB load balancer with auto-configured address pool
+      steps:
+        - type: url
+          url: https://raw.githubusercontent.com/metallb/metallb/v0.14.9/config/manifests/metallb-native.yaml
+          sha256: 951065e85692aa106f1bb5d5a487d9306154923a794ab1d82122881cbaf588e4
+        - type: wait
+          resource: deployment/controller
+          namespace: metallb-system
+          condition: available
+          timeout: "120s"
+        - type: metallb-auto-pool
+          name: forge-pool
+
+    vcr-backend:
+      description: vllm-vcr mock model the site provider gateway forwards to
+      steps:
+        - type: manifest
+          path: resources/model-namespace.yaml
+        - type: template-manifest
+          path: resources/vcr-workload.yaml
+        - type: manifest
+          path: resources/vcr-network-policy.yaml
+        - type: wait
+          resource: deployment/vcr-inference-{{ cluster.name }}
+          namespace: model
+          condition: available
+          timeout: "300s"

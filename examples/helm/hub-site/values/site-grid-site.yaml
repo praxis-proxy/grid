@@ -1,0 +1,11 @@
+# GridNetwork and GridSite for site-a, with the hub as a peer.
+gridNetwork:
+  gridId: grid-1
+gridSite:
+  name: site-a
+peers:
+  hub:
+    digest: <hub leaf digest>
+inferenceProviders:
+  my-model:
+    endpoint: http://10.96.0.20:8000

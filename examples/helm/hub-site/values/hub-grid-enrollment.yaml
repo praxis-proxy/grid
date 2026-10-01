@@ -1,0 +1,7 @@
+# grid-enrollment on the hub, in its own namespace. The README sets these with --set.
+host: enroll.grid.example.com
+invites:
+  hub:
+    network: grid
+  site-a:
+    network: grid

@@ -1,0 +1,7 @@
+# grid-operator on site-a, enrolled through the hub enrollment URL.
+swim:
+  siteName: site-a
+  seeds: 203.0.113.11:7946
+enrollment:
+  enabled: true
+  url: https://enroll.grid.example.com:8443

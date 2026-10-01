@@ -1,0 +1,5 @@
+# grid-operator on the hub. Enrollment defaults to the in-cluster grid-enrollment Service.
+swim:
+  siteName: hub
+enrollment:
+  enabled: true
