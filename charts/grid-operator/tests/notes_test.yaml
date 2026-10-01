@@ -15,3 +15,13 @@ tests:
     asserts:
       - notMatchRegexRaw:
           pattern: get, create, and patch on Secrets
+  - it: says the platform owns the CRDs when crds.enabled is false
+    set:
+      crds.enabled: false
+    asserts:
+      - matchRegexRaw:
+          pattern: the platform installs the Grid CRDs
+  - it: points at the release-managed CRDs by default
+    asserts:
+      - matchRegexRaw:
+          pattern: CRDs install and upgrade with this release and stay on uninstall

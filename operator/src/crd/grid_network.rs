@@ -1362,9 +1362,9 @@ mod tests {
     }
 
     #[test]
-    fn chart_crd_manifest_has_generated_short_names() {
+    fn deploy_crd_manifest_has_generated_short_names() {
         let manifest: CustomResourceDefinition =
-            serde_yaml::from_str(include_str!("../../../charts/grid-operator/crds/gridnetwork.yaml"))
+            serde_yaml::from_str(include_str!("../../../deploy/crds/gridnetwork.yaml"))
                 .unwrap_or_else(|_| std::process::abort());
         assert_eq!(
             manifest.spec.names.short_names,

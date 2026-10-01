@@ -109,7 +109,7 @@ jobs:
               EXTRA_ARGS=(--set config.existingConfigMap=schema-check --set image.tag=v0.1.0-ci)
             fi
             helm template validate-schema "$chart" --namespace grid-system "${EXTRA_ARGS[@]}" \
-              | kubeconform -strict -kubernetes-version 1.30.0 -summary
+              | kubeconform -strict -kubernetes-version 1.30.0 -skip CustomResourceDefinition -summary
           done
 
       - name: Upload rendered manifests

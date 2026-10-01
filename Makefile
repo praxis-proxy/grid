@@ -85,7 +85,7 @@ generate-api-types:
 codegen-check:
 	cargo run --quiet -p xtask -- check-api-types
 
-# Regenerate the CRD manifests in deploy/crds and charts/grid-operator/crds
+# Regenerate the CRD manifests in deploy/crds and charts/grid-operator/templates/crds
 # from the Rust types in operator/src/crd.
 generate-crds:
 	./scripts/generate-deployment-crds.sh

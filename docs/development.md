@@ -77,9 +77,9 @@ outside Make.
 
 ### CRD Manifests
 
-The CRD manifests in `deploy/crds/` and
-`charts/grid-operator/crds/` are generated from the Rust
-types in `operator/src/crd/`. Do not edit them directly.
+`make generate-crds` writes the CRD manifests in `deploy/crds/` and
+`charts/grid-operator/templates/crds/` from the Rust types in
+`operator/src/crd/`. Do not edit them directly.
 
 After changing a CRD type, regenerate the manifests and
 commit them together with the Rust change:

@@ -6,9 +6,7 @@ kind: Kustomization
 
 resources:
   # CRDs must be applied first
-  - crds/gridnetwork.yaml
-  - crds/gridsite.yaml
-  - crds/inferenceprovider.yaml
+  - crds/
   # Operator resources
   - operator/
 

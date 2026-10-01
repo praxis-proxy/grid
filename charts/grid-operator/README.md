@@ -48,7 +48,7 @@ the chart and operator ship together.
 ## Verify
 
 ```bash
-kubectl get crd gridnetworks.grid.praxis-proxy.io
+kubectl api-resources --api-group=grid.praxis-proxy.io
 kubectl get deployment grid-operator -n grid-system
 helm test grid-operator -n grid-system
 ```
@@ -59,17 +59,13 @@ helm test grid-operator -n grid-system
 helm uninstall grid-operator -n grid-system
 ```
 
-Helm removes all namespaced resources (Deployment, ServiceAccount, Services,
-RoleBindings) but **does not remove CRDs**. This is standard Helm CRD
-behavior. Custom resources (GridNetworks, GridSites, InferenceProviders)
-created by other chart releases (e.g., grid-site) are not affected by
-operator uninstall.
-
-To remove CRDs and all custom resources:
+Helm removes the namespaced resources and, with `crds.keep: true` (the
+default), keeps the CRDs and every custom resource. To remove CRDs and all
+custom resources:
 
 ```bash
-kubectl delete crd gridnetworks.grid.praxis-proxy.io \
-  gridsites.grid.praxis-proxy.io \
+kubectl delete crd agenttoolproviders.grid.praxis-proxy.io \
+  gridnetworks.grid.praxis-proxy.io gridsites.grid.praxis-proxy.io \
   inferenceproviders.grid.praxis-proxy.io
 ```
 
@@ -89,38 +85,42 @@ The operator looks for the gateway Service in the release namespace unless
 `grid-system`. If the release is outside `grid-system` and the gateway runs
 there, set `gateway.namespace=grid-system` when you upgrade.
 
-### CRD upgrades
+### CRDs
 
-Helm installs CRDs on first install but **does not upgrade them** on
-`helm upgrade`. When upgrading to a version with changed CRDs, apply the
-new CRDs before upgrading the chart.
+The CRDs are chart templates, so `helm upgrade` and an Argo CD sync upgrade
+them. Set `crds.enabled: false` when a platform owns them, such as the RHOAI
+`aiGrid` component, or for a second release in the same cluster.
 
-From the OCI chart artifact:
-
-```bash
-helm pull oci://ghcr.io/praxis-proxy/charts/grid-operator --version <new-version> --untar
-kubectl apply -f grid-operator/crds/
-```
-
-From the source repository:
+Releases before this chart version installed the CRDs from `crds/`, so Helm
+does not own them yet. First check that no other release owns them. The
+release annotation must be empty or this release:
 
 ```bash
-kubectl apply -f https://raw.githubusercontent.com/praxis-proxy/grid/v<new-version>/deploy/crds/gridnetwork.yaml
-kubectl apply -f https://raw.githubusercontent.com/praxis-proxy/grid/v<new-version>/deploy/crds/gridsite.yaml
-kubectl apply -f https://raw.githubusercontent.com/praxis-proxy/grid/v<new-version>/deploy/crds/inferenceprovider.yaml
+kubectl get crd agenttoolproviders.grid.praxis-proxy.io gridnetworks.grid.praxis-proxy.io \
+  gridsites.grid.praxis-proxy.io inferenceproviders.grid.praxis-proxy.io \
+  -o custom-columns='NAME:.metadata.name,RELEASE:.metadata.annotations.meta\.helm\.sh/release-name'
 ```
 
-Then upgrade the chart:
+Then adopt them once. With Helm 3.17 or later:
 
 ```bash
 helm upgrade grid-operator oci://ghcr.io/praxis-proxy/charts/grid-operator \
-  --version <new-version> --namespace grid-system
+  --version <new-version> --namespace grid-system --take-ownership
+```
+
+With an older Helm, mark them as owned by the release, then upgrade as usual:
+
+```bash
+RELEASE=grid-operator; NAMESPACE=grid-system; for crd in agenttoolproviders gridnetworks gridsites inferenceproviders; do kubectl label crd "${crd}.grid.praxis-proxy.io" app.kubernetes.io/managed-by=Helm --overwrite; kubectl annotate crd "${crd}.grid.praxis-proxy.io" meta.helm.sh/release-name="${RELEASE}" meta.helm.sh/release-namespace="${NAMESPACE}" --overwrite; done
 ```
 
 ## Values
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
+| `crds.enabled` | bool | `true` | Install and upgrade the Grid CRDs. `false` when a platform owns them. |
+| `crds.keep` | bool | `true` | Keep the CRDs on `helm uninstall` and an Argo CD delete or prune. |
+| `rbac.enrollmentNamespace` | string | `""` | The grid-enrollment namespace. The render fails if the operator would get Secret access there. |
 | `replicaCount` | int | `1` | Operator replicas. Must be 1 (schema-enforced). |
 | `image.repository` | string | `ghcr.io/praxis-proxy/grid-operator` | Image repository. |
 | `image.tag` | string | `""` | Image tag. Defaults to chart appVersion. |

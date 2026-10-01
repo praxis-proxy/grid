@@ -1,3 +1,10 @@
+# -- Grid CRDs.
+crds:
+  # -- Install and upgrade the CRDs. Set false when the platform owns them, or for a second release in the cluster.
+  enabled: true
+  # -- Keep the CRDs on helm uninstall and an Argo CD delete or prune.
+  keep: true
+
 # -- Number of operator replicas. Must be 1 until multi-replica operation
 # is qualified.
 replicaCount: 1

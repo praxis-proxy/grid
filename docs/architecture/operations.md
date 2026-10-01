@@ -29,14 +29,9 @@ helm upgrade grid-operator \
   --namespace grid-system
 ```
 
-Helm installs CRDs on first install but does not upgrade them. When upgrading
-to a version with changed CRDs, apply the new CRDs before the chart upgrade:
-
-```console
-kubectl apply -f charts/grid-operator/crds/
-helm upgrade grid-operator oci://ghcr.io/praxis-proxy/charts/grid-operator \
-  --version <new-version> --namespace grid-system
-```
+The chart installs and upgrades the CRDs. A platform that owns them sets
+`crds.enabled: false`. The chart README covers adopting CRDs that an older
+release installed.
 
 Uninstalling the chart removes namespaced resources but retains CRDs.
 Custom resources created by other chart releases (e.g., grid-site) are
@@ -58,9 +53,7 @@ kubectl apply -k deploy/operator/
 
 ```console
 # Apply CRDs first
-kubectl apply -f deploy/crds/gridnetwork.yaml
-kubectl apply -f deploy/crds/gridsite.yaml
-kubectl apply -f deploy/crds/inferenceprovider.yaml
+kubectl apply -k deploy/crds/
 
 # Apply operator resources with Kustomize
 kubectl apply -k deploy/operator/
@@ -80,7 +73,7 @@ For regenerating CRDs after schema changes:
 make generate-crds
 ```
 
-This writes both `deploy/crds/` and `charts/grid-operator/crds/`. CI runs
+This writes `deploy/crds/` and `charts/grid-operator/templates/crds/`. CI runs
 `make crds-check`, which fails when the committed CRDs no longer match the
 Rust types.
 

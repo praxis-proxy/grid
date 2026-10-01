@@ -98,17 +98,31 @@ fi
 # ── CRD synchronization ─────────────────────────────────────────────
 echo ""
 echo "=== CRD synchronization ==="
+# Chart CRDs are deploy/crds plus the chart's lifecycle annotations.
+crd_body() { yq -o json 'del(.metadata.annotations)' | jq -S .; }
 for crd in agenttoolprovider gridnetwork gridsite inferenceprovider; do
-  if diff -q "$DEPLOY_CRDS/${crd}.yaml" "$CHART_DIR/crds/${crd}.yaml" >/dev/null 2>&1; then
+  if render v-crds "$CHART_DIR" --show-only "templates/crds/${crd}.yaml" \
+    && diff -q <(crd_body <<<"$RENDERED") <(crd_body <"$DEPLOY_CRDS/${crd}.yaml") >/dev/null; then
     pass "crd sync: ${crd}.yaml"
   else
-    fail "crd sync: ${crd}.yaml differs from $DEPLOY_CRDS/${crd}.yaml"
+    fail "crd sync: templates/crds/${crd}.yaml differs from $DEPLOY_CRDS/${crd}.yaml"
   fi
 done
+CRD_TEMPLATES=("$CHART_DIR"/templates/crds/*.yaml)
+if [ "${#CRD_TEMPLATES[@]}" -eq 4 ] && [ ! -d "$CHART_DIR/crds" ]; then
+  pass "crds ship only as templates gated by crds.enabled"
+else
+  fail "unexpected CRD files: ${CRD_TEMPLATES[*]} $([ -d "$CHART_DIR/crds" ] && echo "$CHART_DIR/crds")"
+fi
+if render v-crds "$CHART_DIR" --set crds.enabled=false && ! grep -q 'kind: CustomResourceDefinition' <<<"$RENDERED"; then
+  pass "crds.enabled=false renders no CRD"
+else
+  fail "crds.enabled=false still renders a CRD"
+fi
 
 # A CRD missing from the kustomization is silently dropped by kustomize consumers.
 listed=$(sed -n 's/^  - //p' "$DEPLOY_CRDS/kustomization.yaml" | sort)
-present=$(cd "$DEPLOY_CRDS" && ls -1 *.yaml | grep -vx kustomization.yaml | sort)
+present=$(cd "$DEPLOY_CRDS" && printf '%s\n' *.yaml | grep -vx kustomization.yaml | sort)
 if [ "$listed" = "$present" ]; then
   pass "crd kustomization lists every CRD"
 else
@@ -311,8 +325,8 @@ TGZ=$(echo "$PKG_OUT" | grep -oP '/tmp/\S+\.tgz')
 if [ -f "$TGZ" ]; then
   pass "helm package: $(basename "$TGZ") ($(stat -c%s "$TGZ") bytes)"
   CONTENTS=$(tar tzf "$TGZ" 2>&1)
-  for f in Chart.yaml values.yaml values.schema.json templates/deployment.yaml crds/agenttoolprovider.yaml \
-    crds/gridnetwork.yaml crds/gridsite.yaml crds/inferenceprovider.yaml; do
+  for f in Chart.yaml values.yaml values.schema.json templates/deployment.yaml templates/crds/agenttoolprovider.yaml \
+    templates/crds/gridnetwork.yaml templates/crds/gridsite.yaml templates/crds/inferenceprovider.yaml; do
     if echo "$CONTENTS" | grep -q "$f"; then
       pass "package contains: $f"
     else

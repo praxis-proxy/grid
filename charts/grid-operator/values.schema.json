@@ -11,6 +11,20 @@
       "type": "object",
       "description": "Global values Helm passes to every subchart."
     },
+    "crds": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Install and upgrade the Grid CRDs. Set false when the platform owns them."
+        },
+        "keep": {
+          "type": "boolean",
+          "description": "Keep the CRDs on helm uninstall and an Argo CD delete or prune."
+        }
+      }
+    },
     "replicaCount": {
       "type": "integer",
       "minimum": 1,
