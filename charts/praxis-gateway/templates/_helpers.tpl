@@ -230,8 +230,17 @@ OpenShift. Emits "true" or nothing.
 {{- define "praxis-gateway.applyImageUser" -}}
 {{- $psc := .Values.podSecurityContext | default dict -}}
 {{- $e := toString (.Values.imageUser | default dict).enabled -}}
-{{- $openshift := .Capabilities.APIVersions.Has "security.openshift.io/v1" -}}
-{{- if and (not (hasKey $psc "runAsUser")) (not (hasKey $psc "runAsGroup")) (or (eq $e "true") (and (eq $e "auto") (not $openshift))) -}}
+{{- if and (not (hasKey $psc "runAsUser")) (not (hasKey $psc "runAsGroup")) (or (eq $e "true") (and (eq $e "auto") (not (include "praxis-gateway.openshift" .)))) -}}
+true
+{{- end -}}
+{{- end }}
+
+{{/*
+Whether the cluster is OpenShift, where the restricted SCC assigns pod UIDs from the
+namespace range and rejects fixed ones outside it. Emits "true" or nothing.
+*/}}
+{{- define "praxis-gateway.openshift" -}}
+{{- if .Capabilities.APIVersions.Has "security.openshift.io/v1" -}}
 true
 {{- end -}}
 {{- end }}
