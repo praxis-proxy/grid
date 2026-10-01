@@ -294,9 +294,8 @@ spec:
                   port: "https-mtls"
                 initialDelaySeconds: 5
                 periodSeconds: 10
-            tls:
-              enabled: true
-              existingSecret: "consumer-gateway-tls"
+            gridIdentity:
+              secretName: "consumer-gateway-tls"
             providerCredentials:
               - secretName: "vcr-inference-credential"
                 mountPath: "/etc/praxis/credentials/vcr-inference"
@@ -358,9 +357,8 @@ spec:
                   port: "https-mtls"
                 initialDelaySeconds: 5
                 periodSeconds: 10
-            tls:
-              enabled: true
-              existingSecret: "consumer-gateway-tls"
+            gridIdentity:
+              secretName: "consumer-gateway-tls"
             providerCredentials:
               - secretName: "vcr-inference-credential"
                 mountPath: "/etc/praxis/credentials/vcr-inference"
@@ -421,9 +419,8 @@ spec:
                   port: "https-mtls"
                 initialDelaySeconds: 5
                 periodSeconds: 10
-            tls:
-              enabled: true
-              existingSecret: "consumer-gateway-tls"
+            gridIdentity:
+              secretName: "consumer-gateway-tls"
             providerCredentials:
               - secretName: "vcr-inference-credential"
                 mountPath: "/etc/praxis/credentials/vcr-inference"
@@ -480,9 +477,8 @@ spec:
             overlay:
               enabled: true
               existingConfigMap: "grid-overlay-grid-single-cluster--consumer-gateway-a-db750bac"
-            tls:
-              enabled: true
-              existingSecret: "consumer-gateway-tls"
+            gridIdentity:
+              secretName: "consumer-gateway-tls"
             podLabels:
               grid.praxis-proxy.io/consumer-site: "{{ cluster.name }}"
         - type: wait
@@ -534,9 +530,8 @@ spec:
             overlay:
               enabled: true
               existingConfigMap: "grid-overlay-grid-single-cluster--consumer-gateway-b-de751065"
-            tls:
-              enabled: true
-              existingSecret: "consumer-gateway-tls"
+            gridIdentity:
+              secretName: "consumer-gateway-tls"
             podLabels:
               grid.praxis-proxy.io/consumer-site: "{{ cluster.name }}"
         - type: wait

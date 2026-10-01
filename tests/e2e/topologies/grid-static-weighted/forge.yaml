@@ -438,9 +438,8 @@ spec:
                   port: "https-mtls"
                 initialDelaySeconds: 5
                 periodSeconds: 10
-            tls:
-              enabled: true
-              existingSecret: "provider-gateway-tls"
+            gridIdentity:
+              secretName: "provider-gateway-tls"
             providerCredentials:
               - secretName: "vcr-inference-credential"
                 mountPath: "/etc/praxis/credentials/vcr-inference"
@@ -504,9 +503,8 @@ spec:
             overlay:
               enabled: true
               existingConfigMap: "grid-overlay-grid-static-weighted-consumer-gateway"
-            tls:
-              enabled: true
-              existingSecret: "consumer-gateway-tls"
+            gridIdentity:
+              secretName: "consumer-gateway-tls"
             podLabels:
               grid.praxis-proxy.io/consumer-site: "{{ cluster.name }}"
         - type: wait

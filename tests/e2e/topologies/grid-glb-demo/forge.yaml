@@ -357,9 +357,8 @@ spec:
                   port: "https-mtls"
                 initialDelaySeconds: 5
                 periodSeconds: 10
-            tls:
-              enabled: true
-              existingSecret: "provider-gateway-tls"
+            gridIdentity:
+              secretName: "provider-gateway-tls"
             providerCredentials:
               - secretName: "vcr-inference-credential"
                 mountPath: "/etc/praxis/credentials/vcr-inference"
@@ -433,9 +432,8 @@ spec:
             overlay:
               enabled: true
               existingConfigMap: "grid-overlay-glb-demo-edge-gateway"
-            tls:
-              enabled: true
-              existingSecret: "edge-gateway-tls"
+            gridIdentity:
+              secretName: "edge-gateway-tls"
             podLabels:
               grid.praxis-proxy.io/edge-site: "{{ cluster.name }}"
         - type: wait
@@ -509,9 +507,8 @@ spec:
             service:
               type: "LoadBalancer"
               port: 8443
-            tls:
-              enabled: true
-              existingSecret: "gtm-emulator-tls"
+            gridIdentity:
+              secretName: "gtm-emulator-tls"
         - type: wait
           resource: deployment/gtm-emulator
           namespace: grid-system

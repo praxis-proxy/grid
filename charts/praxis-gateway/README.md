@@ -171,7 +171,7 @@ AI image; these values may advance independently.
 | `praxisConfig.key` | string | `praxis.yaml` | Key in the ConfigMap, for `byo` only. `operator` always uses `praxis.yaml`. |
 | `praxisConfig.render.model` | string | **required** when rendered | Model advertised on the routing candidates. |
 | `praxisConfig.render.backends` | list | **required** when rendered | Backend clusters (`cluster`, `endpoints`, `healthCheck`, `transport`). |
-| `praxisConfig.render.backends[].transport` | object | `mutual_tls` with `tls.enabled`, else `plaintext` | `mode`: `mutual_tls` presents the grid identity, `tls` verifies the server cert with no client cert, `plaintext` is cleartext. `sni` names the peer cert (required for `mutual_tls` and for `tls` to an IP endpoint). `ca` (`configMap` or `secret`, `key`) is the CA for a `tls` backend. A `tls` backend trusts, first match wins: `transport.ca`, then `upstreamCA`, then the process store, which is the `auth.validateCA` bundle when that is set. |
+| `praxisConfig.render.backends[].transport` | object | `mutual_tls` with `gridIdentity.secretName`, else `plaintext` | `mode`: `mutual_tls` presents the grid identity, `tls` verifies the server cert with no client cert, `plaintext` is cleartext. `sni` names the peer cert (required for `mutual_tls` and for `tls` to an IP endpoint). `ca` (`configMap` or `secret`, `key`) is the CA for a `tls` backend. A `tls` backend trusts, first match wins: `transport.ca`, then `upstreamCA`, then the process store, which is the `auth.validateCA` bundle when that is set. |
 | `praxisConfig.render.localSite` | string | `hub` | Local site for locality scoring. |
 | `praxisConfig.render.auth.mode` | string | **required** when rendered | `api-key` validates the caller's key and needs an image that registers `identity/api-key` (praxis-policy 0.4 or later); the render refuses it on the default `ai:0.4.0` image (by effective reference; a digest pin of that same image is not detected). `none` renders no policy filter, for use only behind an authenticating front. |
 | `praxisConfig.render.auth.allowUnauthenticatedExposure` | bool | `false` | With `none`, allow a LoadBalancer or NodePort Service. Without it the render fails. The guard sees only this chart's Service, not `oc expose`, another Service selecting the pod labels, an HTTPRoute, or a hand-made Service with `service.enabled=false`. Use `networkPolicy` for those. |
@@ -203,9 +203,8 @@ AI image; these values may advance independently.
 | `overlay.sidecar.expectedNetwork` | string | `""` | Required GridNetwork scope when the sidecar is enabled. |
 | `overlay.sidecar.expectedLocalSite` | string | `""` | Required local-site scope when the sidecar is enabled. |
 | `overlay.sidecar.resources` | object | small requests and limits | Resources for both the one-shot init container and continuous sidecar. |
-| `tls.enabled` | bool | `false` | Mount a TLS Secret. |
-| `tls.existingSecret` | string | `""` | Name of the TLS Secret. |
-| `tls.mountPath` | string | `/etc/praxis/tls` | Mount path for TLS files. |
+| `gridIdentity.secretName` | string | `""` | Grid identity Secret (`tls.crt`, `tls.key`, `ca.crt`) for mTLS to backends and peers. Set it to mount the Secret. You create the Secret. |
+| `gridIdentity.mountPath` | string | `/etc/praxis/tls` | Mount path for TLS files. |
 | `providerCredentials` | list | `[]` | Provider credential Secrets to mount (`secretName`, `mountPath`, `optional`): one entry for each Secret referenced in an InferenceProvider CR's `spec.auth.secretRef`. You create the Secrets, in the release namespace. `mountPath` defaults to `/run/secrets/grid-credentials/<secretName>`, the operator's default `credentialMountBase`; with `byo`, set it to the path your praxis.yaml uses. |
 | `health.readiness` | object | TCP socket on the listener port | Readiness probe. A `tcpSocket` without a port targets the listener port. Set to null to disable. |
 | `health.liveness` | object | TCP socket on the listener port | Liveness probe. Set to null to disable. |

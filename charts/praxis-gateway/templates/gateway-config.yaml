@@ -58,16 +58,16 @@ data:
           - filter: load_balancer
             clusters:
               {{- range $i, $backend := $cfg.backends }}
-              {{- $mode := (.transport).mode | default (ternary "mutual_tls" "plaintext" $.Values.tls.enabled) }}
+              {{- $mode := (.transport).mode | default (ternary "mutual_tls" "plaintext" (not (empty $.Values.gridIdentity.secretName))) }}
               {{- $hc := .healthCheck | default dict }}
               - name: {{ .cluster | quote }}
                 {{- if eq $mode "mutual_tls" }}
                 tls:
                   ca:
-                    ca_path: {{ printf "%s/ca.crt" $.Values.tls.mountPath | quote }}
+                    ca_path: {{ printf "%s/ca.crt" $.Values.gridIdentity.mountPath | quote }}
                   client_cert:
-                    cert_path: {{ printf "%s/tls.crt" $.Values.tls.mountPath | quote }}
-                    key_path: {{ printf "%s/tls.key" $.Values.tls.mountPath | quote }}
+                    cert_path: {{ printf "%s/tls.crt" $.Values.gridIdentity.mountPath | quote }}
+                    key_path: {{ printf "%s/tls.key" $.Values.gridIdentity.mountPath | quote }}
                   sni: {{ (.transport).sni | quote }}
                   verify: true
                 {{- else if eq $mode "tls" }}

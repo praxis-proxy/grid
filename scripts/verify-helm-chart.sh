@@ -346,17 +346,17 @@ try_template "$GW_DIR" "edge gateway" "${GW_REQ[@]}" \
   --set nameOverride=edge-gateway \
   --set service.type=LoadBalancer \
   --set overlay.enabled=true --set overlay.existingConfigMap=grid-overlay \
-  --set tls.enabled=true --set tls.existingSecret=edge-tls
+  --set gridIdentity.secretName=edge-tls
 try_template "$GW_DIR" "provider gateway" "${GW_REQ[@]}" \
   --set nameOverride=provider-gateway \
   --set port.containerPort=8443 --set port.name=https-mtls \
   --set service.type=LoadBalancer --set service.port=8443 \
-  --set tls.enabled=true --set tls.existingSecret=provider-tls
+  --set gridIdentity.secretName=provider-tls
 try_template "$GW_DIR" "gtm emulator" "${GW_REQ[@]}" \
   --set nameOverride=gtm-emulator \
   --set port.containerPort=8443 --set port.name=https \
   --set service.type=LoadBalancer --set service.port=8443 \
-  --set tls.enabled=true --set tls.existingSecret=gtm-tls
+  --set gridIdentity.secretName=gtm-tls
 try_template "$GW_DIR" "service disabled" "${GW_REQ[@]}" --set service.enabled=false
 try_template "$GW_DIR" "custom image" "${GW_REQ[@]}" \
   --set image.repository=praxis-ai --set image.tag=glb-demo --set image.pullPolicy=Never
@@ -447,7 +447,7 @@ try_reject "$GW_DIR" "unknown key (gw)" "${GW_REQ[@]}" --set typoField=true
 try_template "$GW_DIR" "subchart keys (gw)" "${GW_REQ[@]}" --set enabled=true --set global.foo=bar
 try_reject "$GW_DIR" "runAsNonRoot override" "${GW_REQ[@]}" --set podSecurityContext.runAsNonRoot=false
 try_reject "$GW_DIR" "overlay enabled no name" "${GW_REQ[@]}" --set overlay.enabled=true
-try_reject "$GW_DIR" "tls enabled no secret" "${GW_REQ[@]}" --set tls.enabled=true
+try_reject_msg "$GW_DIR" "tls is renamed to gridIdentity (gw)" "additional properties 'tls' not allowed" "${GW_REQ[@]}" --set tls.secretName=x
 
 # ── Secure gateway config (render) ──────────────────────────────────
 GW_RENDER=(--set praxisConfig.source=render --set praxisConfig.render.model=q --set praxisConfig.render.auth.mode=none
@@ -461,7 +461,7 @@ SECURE_ARGS=(
   --set praxisConfig.render.auth.mode=api-key --set image.tag=verify-api-key
   --set praxisConfig.render.auth.validateUrl=https://maas-api.svc:8443/internal/v1/api-keys/validate
   --set upstreamCA.secretName=upstream-ca
-  --set tls.enabled=true --set tls.existingSecret=grid-identity
+  --set gridIdentity.secretName=grid-identity
   --set listenerTls.secretName=listener-cert
   --set "praxisConfig.render.backends[0].cluster=site-a"
   --set "praxisConfig.render.backends[0].endpoints[0]=172.30.202.42:8000"
@@ -631,9 +631,9 @@ try_reject_msg "$GW_DIR" "render without backends (gw)" "praxisConfig.render.bac
   --set praxisConfig.source=render --set praxisConfig.render.auth.mode=none --set praxisConfig.render.model=q --namespace grid-system
 try_reject_msg "$GW_DIR" "mutual_tls without sni (gw)" "sets no transport.sni" \
   --set praxisConfig.source=render --set praxisConfig.render.auth.mode=none --set praxisConfig.render.model=q \
-  --set tls.enabled=true --set tls.existingSecret=id \
+  --set gridIdentity.secretName=id \
   --set praxisConfig.render.backends[0].cluster=a --set praxisConfig.render.backends[0].endpoints[0]=1.2.3.4:8000 --namespace grid-system
-try_reject_msg "$GW_DIR" "mutual_tls without grid identity (gw)" "tls.enabled is false" \
+try_reject_msg "$GW_DIR" "mutual_tls without grid identity (gw)" "gridIdentity.secretName is not set" \
   --set praxisConfig.source=render --set praxisConfig.render.auth.mode=none --set praxisConfig.render.model=q \
   --set praxisConfig.render.backends[0].cluster=a --set praxisConfig.render.backends[0].endpoints[0]=1.2.3.4:8000 \
   --set praxisConfig.render.backends[0].transport.mode=mutual_tls --set praxisConfig.render.backends[0].transport.sni=a.grid --namespace grid-system
@@ -718,9 +718,9 @@ probe_port_matches() {
   fi
 }
 probe_port_matches "provider gateway" --set port.containerPort=8443 --set port.name=https-mtls \
-  --set tls.enabled=true --set tls.existingSecret=provider-tls
+  --set gridIdentity.secretName=provider-tls
 probe_port_matches "gtm emulator" --set port.containerPort=8443 --set port.name=https \
-  --set tls.enabled=true --set tls.existingSecret=gtm-tls
+  --set gridIdentity.secretName=gtm-tls
 for f in "$EXAMPLE_DIR"/{combined-site,dedicated-edge}/values/*-provider-gateway.yaml; do
   probe_port_matches "$(basename "$f" .yaml)" -f "$f"
 done

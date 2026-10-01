@@ -22,9 +22,8 @@ overlay:
   # Name: grid-overlay-{GridNetwork name}-{gateway service name}
   existingConfigMap: grid-overlay-NETWORK-consumer-gateway
 
-tls:
-  enabled: true
-  existingSecret: consumer-tls
+gridIdentity:
+  secretName: consumer-tls
 
 service:
   enabled: true

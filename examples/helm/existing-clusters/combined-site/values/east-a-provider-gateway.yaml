@@ -19,9 +19,8 @@ praxisConfig:
   configMapName: provider-praxis-config
   key: praxis.yaml
 
-tls:
-  enabled: true
-  existingSecret: provider-tls
+gridIdentity:
+  secretName: provider-tls
 
 providerCredentials:
   - secretName: mock-inference-credential

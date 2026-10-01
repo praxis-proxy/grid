@@ -225,7 +225,7 @@
                   "transport": {
                     "type": "object",
                     "additionalProperties": false,
-                    "description": "Upstream transport. Defaults to mutual_tls when tls.enabled, else plaintext.",
+                    "description": "Upstream transport. Defaults to mutual_tls when gridIdentity.secretName is set, else plaintext.",
                     "properties": {
                       "mode": { "type": "string", "enum": ["mutual_tls", "tls", "plaintext"] },
                       "sni": { "type": "string" },
@@ -392,17 +392,13 @@
         }
       }
     },
-    "tls": {
+    "gridIdentity": {
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "enabled": {
-          "type": "boolean",
-          "description": "Enable TLS Secret mount."
-        },
-        "existingSecret": {
+        "secretName": {
           "type": "string",
-          "description": "Name of the existing TLS Secret."
+          "description": "Existing Secret with the grid identity (tls.crt, tls.key, ca.crt). Set it to mount the Secret."
         },
         "mountPath": {
           "type": "string",

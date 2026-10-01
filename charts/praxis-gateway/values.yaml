@@ -114,8 +114,8 @@ praxisConfig:
       timeoutSecs: 5
     # -- Backend clusters. Each renders a health_check so a literal ClusterIP routes without
     # allow_private_upstreams, plus an explicit transport. A backend omitting transport
-    # defaults to mutual_tls when the grid identity is mounted (tls.enabled), else plaintext.
-    # mutual_tls presents that identity (tls.mountPath tls.crt/tls.key, verified against its
+    # defaults to mutual_tls when the grid identity is mounted (gridIdentity.secretName), else plaintext.
+    # mutual_tls presents that identity (gridIdentity.mountPath tls.crt/tls.key, verified against its
     # ca.crt) and needs a sni naming the peer. tls verifies the backend's server cert with
     # no client cert: sni defaults to the endpoint host. Its trust, first match wins:
     # transport.ca (a ConfigMap or Secret), then upstreamCA (upstream_ca_file), then the
@@ -265,12 +265,12 @@ overlay:
         cpu: 50m
         memory: 32Mi
 
-# -- TLS Secret mount.
-tls:
-  # -- Enable TLS Secret mount.
-  enabled: false
-  # -- Name of the existing TLS Secret.
-  existingSecret: ""
+# -- Grid identity: the gateway's mTLS cert for backends and cross-site peers.
+# Set secretName to mount it. The Secret holds tls.crt, tls.key and ca.crt.
+# You create it; the chart only mounts it.
+gridIdentity:
+  # -- Existing Secret with the grid identity. Empty: nothing is mounted.
+  secretName: ""
   # -- Mount path for TLS files.
   mountPath: "/etc/praxis/tls"
 

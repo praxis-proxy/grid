@@ -24,10 +24,10 @@ Run Helm tests:
 Overlay ConfigMap: {{ .Values.overlay.existingConfigMap }}
   Mount path: {{ .Values.overlay.mountPath }}
 {{- end }}
-{{- if .Values.tls.enabled }}
+{{- if .Values.gridIdentity.secretName }}
 
-TLS Secret: {{ .Values.tls.existingSecret }}
-  Mount path: {{ .Values.tls.mountPath }}
+Grid identity Secret: {{ .Values.gridIdentity.secretName }}
+  Mount path: {{ .Values.gridIdentity.mountPath }}
 {{- end }}
 {{- if .Values.providerCredentials }}
 

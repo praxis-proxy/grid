@@ -135,7 +135,7 @@ grid identity (the tls mount) and needs a sni naming the peer; plaintext must no
 carry a sni.
 */}}
 {{- define "praxis-gateway.validateBackends" -}}
-{{- $tlsEnabled := .Values.tls.enabled }}
+{{- $tlsEnabled := not (empty .Values.gridIdentity.secretName) }}
 {{- $seen := dict }}
 {{- range .Values.praxisConfig.render.backends }}
 {{- if hasKey $seen .cluster }}
@@ -145,7 +145,7 @@ carry a sni.
 {{- $mode := (.transport).mode | default (ternary "mutual_tls" "plaintext" $tlsEnabled) }}
 {{- if eq $mode "mutual_tls" }}
 {{- if not $tlsEnabled }}
-{{- fail (printf "backend %q uses mutual_tls but tls.enabled is false: no grid identity is mounted to present" .cluster) }}
+{{- fail (printf "backend %q uses mutual_tls but gridIdentity.secretName is not set: no grid identity is mounted to present" .cluster) }}
 {{- end }}
 {{- if not (.transport).sni }}
 {{- fail (printf "backend %q uses mutual_tls but sets no transport.sni to verify the peer against" .cluster) }}
@@ -176,9 +176,6 @@ Validate enabled mounts have a non-empty resource name.
 {{- end }}
 {{- if and .Values.overlay.enabled .Values.overlay.sidecar.enabled (not .Values.overlay.sidecar.expectedLocalSite) }}
 {{- fail "overlay.sidecar.expectedLocalSite is required when overlay sidecar is enabled" }}
-{{- end }}
-{{- if and .Values.tls.enabled (not .Values.tls.existingSecret) }}
-{{- fail "tls.existingSecret is required when tls.enabled is true" }}
 {{- end }}
 {{- /*
 The operator's praxis.yaml has no listener TLS and no upstream_ca_file, so these

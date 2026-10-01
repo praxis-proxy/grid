@@ -192,9 +192,9 @@ spec:
               mountPath: {{ .Values.overlay.mountPath | quote }}
               readOnly: true
             {{- end }}
-            {{- if .Values.tls.enabled }}
+            {{- if .Values.gridIdentity.secretName }}
             - name: tls
-              mountPath: {{ .Values.tls.mountPath | quote }}
+              mountPath: {{ .Values.gridIdentity.mountPath | quote }}
               readOnly: true
             {{- end }}
             {{- if .Values.upstreamCA.secretName }}
@@ -276,10 +276,10 @@ spec:
             {{- end }}
         {{- end }}
         {{- end }}
-        {{- if .Values.tls.enabled }}
+        {{- if .Values.gridIdentity.secretName }}
         - name: tls
           secret:
-            secretName: {{ .Values.tls.existingSecret | quote }}
+            secretName: {{ .Values.gridIdentity.secretName | quote }}
         {{- end }}
         {{- if .Values.upstreamCA.secretName }}
         - name: upstream-ca
