@@ -25,7 +25,7 @@ spec:
     spec:
       enableServiceLinks: false
       automountServiceAccountToken: false
-      {{- if and .Values.overlay.configMapName .Values.overlay.sidecar.enabled }}
+      {{- if .Values.overlay.configMapName }}
       serviceAccountName: {{ include "praxis-gateway.fullname" . }}-overlay-sync
       {{- end }}
       {{- with .Values.imagePullSecrets }}
@@ -49,7 +49,7 @@ spec:
         {{- end }}
         seccompProfile:
           type: RuntimeDefault
-      {{- if and .Values.overlay.configMapName .Values.overlay.sidecar.enabled }}
+      {{- if .Values.overlay.configMapName }}
       initContainers:
         - name: overlay-sync-init
           image: {{ include "praxis-gateway.overlaySyncImage" . }}
@@ -90,7 +90,7 @@ spec:
               readOnly: true
       {{- end }}
       containers:
-        {{- if and .Values.overlay.configMapName .Values.overlay.sidecar.enabled }}
+        {{- if .Values.overlay.configMapName }}
         - name: overlay-sync
           image: {{ include "praxis-gateway.overlaySyncImage" . }}
           imagePullPolicy: {{ .Values.overlay.sidecar.image.pullPolicy | quote }}
@@ -246,7 +246,6 @@ spec:
                 path: "praxis.yaml"
             {{- end }}
         {{- if .Values.overlay.configMapName }}
-        {{- if .Values.overlay.sidecar.enabled }}
         - name: overlay
           emptyDir:
             sizeLimit: "10Mi"
@@ -266,15 +265,6 @@ spec:
                     - path: namespace
                       fieldRef:
                         fieldPath: metadata.namespace
-        {{- else }}
-        - name: overlay
-          configMap:
-            name: {{ .Values.overlay.configMapName | quote }}
-            {{- with .Values.overlay.items }}
-            items:
-              {{- toYaml . | nindent 14 }}
-            {{- end }}
-        {{- end }}
         {{- end }}
         {{- if .Values.gridIdentity.secretName }}
         - name: tls

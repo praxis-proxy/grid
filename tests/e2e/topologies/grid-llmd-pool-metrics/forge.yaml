@@ -495,7 +495,6 @@ spec:
             overlay:
               configMapName: "grid-overlay-grid-llmd-pool-metrics-consumer-gateway"
               sidecar:
-                enabled: true
                 image:
                   repository: "ghcr.io/praxis-proxy/grid-overlay-sync"
                   tag: "v0.1.4"

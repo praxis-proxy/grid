@@ -171,11 +171,11 @@ carry a sni.
 Validate enabled mounts have a non-empty resource name.
 */}}
 {{- define "praxis-gateway.validateMounts" -}}
-{{- if and .Values.overlay.configMapName .Values.overlay.sidecar.enabled (not .Values.grid.networkName) }}
-{{- fail "grid.networkName is required when overlay.sidecar.enabled is true: the sidecar checks the overlay belongs to this GridNetwork" }}
+{{- if and .Values.overlay.configMapName (not .Values.grid.networkName) }}
+{{- fail "grid.networkName is required when overlay.configMapName is set: the overlay sidecar checks the overlay belongs to this GridNetwork" }}
 {{- end }}
-{{- if and .Values.overlay.configMapName .Values.overlay.sidecar.enabled (not .Values.grid.siteName) }}
-{{- fail "grid.siteName is required when overlay.sidecar.enabled is true: the sidecar checks the overlay belongs to this site" }}
+{{- if and .Values.overlay.configMapName (not .Values.grid.siteName) }}
+{{- fail "grid.siteName is required when overlay.configMapName is set: the overlay sidecar checks the overlay belongs to this site" }}
 {{- end }}
 {{- /*
 The operator's praxis.yaml has no listener TLS and no upstream_ca_file, so these

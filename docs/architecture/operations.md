@@ -771,10 +771,6 @@ metrics become visible
   + Praxis file-watch reload
 ```
 
-Use `overlay.sidecar.enabled=false` for the direct ConfigMap projection
-fallback. Do not use that mode when a demo or production SLO assumes prompt
-metrics-driven route changes.
-
 ## 9. Workloads Consume Providers
 
 Workloads send requests to the Praxis Gateway.

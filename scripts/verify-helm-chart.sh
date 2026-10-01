@@ -345,7 +345,7 @@ fi
 try_template "$GW_DIR" "edge gateway" "${GW_REQ[@]}" \
   --set nameOverride=edge-gateway \
   --set service.type=LoadBalancer \
-  --set overlay.configMapName=grid-overlay \
+  --set overlay.configMapName=grid-overlay --set grid.networkName=n --set grid.siteName=s \
   --set gridIdentity.secretName=edge-tls
 try_template "$GW_DIR" "provider gateway" "${GW_REQ[@]}" \
   --set nameOverride=provider-gateway \
@@ -589,10 +589,14 @@ try_reject_msg "$GW_DIR" "duplicate backend cluster (gw)" "listed twice" "${R0[@
   --set "praxisConfig.render.backends[1].transport.mode=plaintext"
 try_reject_msg "$GW_DIR" "blank grid.siteName (gw)" "grid.siteName is required" "${R0[@]}" "${BK1[@]}" --set grid.siteName=" "
 try_reject_msg "$GW_DIR" "render.localSite is removed (gw)" "additional properties 'localSite' not allowed" "${R0[@]}" "${BK1[@]}" --set praxisConfig.render.localSite=x
-try_reject_msg "$GW_DIR" "sidecar without grid.networkName (gw)" "grid.networkName is required" "${GW_REQ[@]}" \
-  --set overlay.configMapName=o --set overlay.sidecar.enabled=true --set grid.siteName=s
-try_reject_msg "$GW_DIR" "sidecar without grid.siteName (gw)" "grid.siteName is required" "${GW_REQ[@]}" \
-  --set overlay.configMapName=o --set overlay.sidecar.enabled=true --set grid.networkName=n
+try_reject_msg "$GW_DIR" "overlay without grid.networkName (gw)" "grid.networkName is required" "${GW_REQ[@]}" \
+  --set overlay.configMapName=o --set grid.siteName=s
+try_reject_msg "$GW_DIR" "overlay without grid.siteName (gw)" "grid.siteName is required" "${GW_REQ[@]}" \
+  --set overlay.configMapName=o --set grid.networkName=n
+try_reject_msg "$GW_DIR" "overlay.sidecar.enabled is removed (gw)" "additional properties 'enabled' not allowed" "${GW_REQ[@]}" \
+  --set overlay.sidecar.enabled=true
+try_reject_msg "$GW_DIR" "overlay.items is removed (gw)" "additional properties 'items' not allowed" "${GW_REQ[@]}" \
+  --set 'overlay.items[0].key=a' --set 'overlay.items[0].path=a'
 try_reject_msg "$GW_DIR" "blank model (gw)" "praxisConfig.render.model is required" "${R0[@]}" "${BK1[@]}" --set-string "praxisConfig.render.model= "
 try_reject_msg "$GW_DIR" "unknown healthCheck key (gw)" "healthCheck" "${R0[@]}" "${BK1[@]}" \
   --set "praxisConfig.render.backends[0].healthCheck.bogus=1"

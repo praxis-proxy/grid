@@ -977,10 +977,6 @@ last-known-good retention, delivery health, and revision metrics at the handoff
 boundary. See [Architecture Overview](overview.md#configmap-handoff) and the
 [Praxis gateway chart](../../charts/praxis-gateway/README.md#routing-overlay-delivery).
 
-Direct ConfigMap projection remains available when
-`overlay.sidecar.enabled=false`, but its delivery latency is controlled by the
-kubelet and it does not provide the sidecar's validation or delivery status.
-
 Consumers that do not enable overlay-file reload still require a rollout or
 another deployment-owned reload mechanism. See
 [Consumer Config](consumer-config.md#reload-and-rollout).

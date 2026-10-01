@@ -46,11 +46,11 @@ env: []
 # -- Which GridNetwork and site this gateway belongs to.
 grid:
   # -- GridNetwork name. Used only by the overlay sidecar: it refuses an overlay
-  # written for another GridNetwork. Required when overlay.sidecar.enabled.
+  # written for another GridNetwork. Required when overlay.configMapName is set.
   networkName: ""
   # -- This gateway's site name. Used by render (local_site in praxis.yaml) and by
   # the overlay sidecar (it refuses an overlay written for another site).
-  # Required when praxisConfig.source is render or overlay.sidecar.enabled.
+  # Required when praxisConfig.source is render or overlay.configMapName is set.
   siteName: ""
 
 # -- Praxis configuration (praxis.yaml).
@@ -231,29 +231,26 @@ service:
   # -- Static IP for LoadBalancer type.
   loadBalancerIP: ""
 
-# -- Optional operator-produced overlay ConfigMap mount (edge gateways).
+# -- Operator-produced routing overlay (edge gateways). When configMapName is set,
+# the overlay-sync sidecar watches the ConfigMap through the Kubernetes API, checks
+# it belongs to grid.networkName and grid.siteName, and writes routing-overlay.json
+# into a shared emptyDir at mountPath. A bad overlay is refused and the last good
+# one is kept. grid.networkName and grid.siteName are then required.
 overlay:
   # -- Name of the existing overlay ConfigMap. The operator creates it.
-  # Empty (the default) turns the overlay mount off.
+  # Empty (the default) turns the overlay off.
   configMapName: ""
-  # -- Mount path for overlay files.
+  # -- Path where praxis reads the overlay files.
   mountPath: "/etc/praxis/routing"
-  # -- Items to project from the ConfigMap (used when sidecar is disabled).
-  items:
-    - key: "routing-overlay.json"
-      path: "routing-overlay.json"
-  # -- Overlay sync sidecar settings. When enabled, the sidecar watches the
-  # ConfigMap via the Kubernetes API and writes validated overlays to a shared
-  # emptyDir, replacing the kubelet volume sync.
+  # -- Overlay-sync sidecar settings.
   sidecar:
-    # -- Enable the overlay-sync sidecar.
-    enabled: false
     # -- Sidecar container image.
     image:
       # -- Image repository.
       repository: ghcr.io/praxis-proxy/grid-overlay-sync
-      # -- Image tag. Defaults to the chart appVersion when empty.
-      tag: ""
+      # -- Image tag. Empty uses the chart appVersion, which is the praxis version,
+      # not a grid-overlay-sync tag, so keep this set.
+      tag: "v0.1.4"
       # -- Image pull policy.
       pullPolicy: IfNotPresent
     # -- ConfigMap data key containing the overlay envelope.

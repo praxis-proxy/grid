@@ -474,6 +474,9 @@ spec:
               configMapName: "consumer-gateway-a-config"
             service:
               type: "ClusterIP"
+            grid:
+              networkName: "grid-single-cluster-multi-gateway"
+              siteName: "{{ cluster.name }}"
             overlay:
               configMapName: "grid-overlay-grid-single-cluster--consumer-gateway-a-db750bac"
             gridIdentity:
@@ -526,6 +529,9 @@ spec:
               configMapName: "consumer-gateway-b-config"
             service:
               type: "ClusterIP"
+            grid:
+              networkName: "grid-single-cluster-multi-gateway"
+              siteName: "{{ cluster.name }}"
             overlay:
               configMapName: "grid-overlay-grid-single-cluster--consumer-gateway-b-de751065"
             gridIdentity:

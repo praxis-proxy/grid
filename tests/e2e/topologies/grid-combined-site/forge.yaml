@@ -488,6 +488,9 @@ spec:
               configMapName: "consumer-gateway-config"
             service:
               type: "LoadBalancer"
+            grid:
+              networkName: "grid-combined-site"
+              siteName: "{{ cluster.name }}"
             overlay:
               configMapName: "grid-overlay-grid-combined-site-consumer-gateway"
             gridIdentity:

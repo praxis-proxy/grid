@@ -714,7 +714,6 @@ spec:
             overlay:
               configMapName: "grid-overlay-grid-token-rate-limit-consumer-gateway-a"
               sidecar:
-                enabled: true
                 image:
                   repository: "{{ cluster.properties.overlaySyncImageRepo }}"
                   tag: "{{ cluster.properties.overlaySyncImageTag }}"
@@ -778,7 +777,6 @@ spec:
             overlay:
               configMapName: "grid-overlay-grid-token-rate-limit-consumer-gateway-b"
               sidecar:
-                enabled: true
                 image:
                   repository: "{{ cluster.properties.overlaySyncImageRepo }}"
                   tag: "{{ cluster.properties.overlaySyncImageTag }}"

@@ -429,6 +429,9 @@ spec:
               configMapName: "edge-gateway-config"
             service:
               type: "LoadBalancer"
+            grid:
+              networkName: "glb-demo"
+              siteName: "{{ cluster.name }}"
             overlay:
               configMapName: "grid-overlay-glb-demo-edge-gateway"
             gridIdentity:

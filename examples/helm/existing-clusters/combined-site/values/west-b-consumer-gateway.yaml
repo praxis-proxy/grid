@@ -17,6 +17,10 @@ praxisConfig:
   configMapName: consumer-praxis-config
   key: praxis.yaml
 
+grid:
+  networkName: NETWORK   # the GridNetwork name
+  siteName: west-b
+
 overlay:
   # Name: grid-overlay-{GridNetwork name}-{gateway service name}
   configMapName: grid-overlay-NETWORK-consumer-gateway

@@ -339,34 +339,17 @@
       "properties": {
         "configMapName": {
           "type": "string",
-          "description": "Name of the existing overlay ConfigMap. Set it to mount the overlay; empty turns it off."
+          "description": "Name of the existing overlay ConfigMap. Set it to deliver the overlay through the overlay-sync sidecar; empty turns the overlay off."
         },
         "mountPath": {
           "type": "string",
           "description": "Mount path for overlay files."
-        },
-        "items": {
-          "type": "array",
-          "items": {
-            "type": "object",
-            "additionalProperties": false,
-            "required": ["key", "path"],
-            "properties": {
-              "key": { "type": "string" },
-              "path": { "type": "string" }
-            }
-          },
-          "description": "Items to project from the ConfigMap."
         },
         "sidecar": {
           "type": "object",
           "additionalProperties": false,
           "description": "Overlay sync sidecar settings.",
           "properties": {
-            "enabled": {
-              "type": "boolean",
-              "description": "Enable the overlay-sync sidecar."
-            },
             "image": {
               "type": "object",
               "additionalProperties": false,
