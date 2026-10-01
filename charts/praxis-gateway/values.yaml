@@ -217,8 +217,9 @@ overlay:
     image:
       # -- Image repository.
       repository: ghcr.io/praxis-proxy/grid-overlay-sync
-      # -- Image tag. Defaults to the chart appVersion when empty.
-      tag: ""
+      # -- Image tag. Empty uses the chart appVersion, which is the praxis version,
+      # not a grid-overlay-sync tag, so keep this set.
+      tag: "v0.1.4"
       # -- Image pull policy.
       pullPolicy: IfNotPresent
     # -- ConfigMap data key containing the overlay envelope.
