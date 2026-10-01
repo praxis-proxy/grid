@@ -76,6 +76,9 @@ const DYNAMIC_SAMPLE_SIZE: u32 = 1600;
 /// Existing weighted-affinity sessions replayed after the pressure transition.
 const DYNAMIC_AFFINITY_SESSION_COUNT: u32 = 32;
 
+/// New unbound requests used to prove no-provider rejection after total signal loss.
+const NO_PROVIDER_DENIAL_SAMPLE_SIZE: u32 = 20;
+
 /// One-degree-of-freedom Pearson chi-square threshold at 99% confidence.
 const DYNAMIC_CHI_SQUARE_CRITICAL: f64 = 6.635;
 
@@ -1324,11 +1327,20 @@ fn run_proof_scenarios(context: &DemoContext, mode: DemoMode) -> BTreeMap<String
 }
 
 /// Run baseline, deterministic pressure, and recovery through polled signals.
+fn run_dynamic_weighted_scenarios(context: &DemoContext) -> BTreeMap<String, ProofResult> {
+    let mut results = run_dynamic_weighted_scenarios_inner(context);
+    results
+        .entry("total_signal_loss_fail_closed".to_owned())
+        .or_insert_with(|| skipped_proof("Total signal-loss gate: an earlier required phase did not complete"));
+    results
+}
+
+/// Run the ordered pressure and recovery proof before the total signal-loss gate.
 #[expect(
     clippy::too_many_lines,
-    reason = "The qualification sequence is deliberately explicit and preserves each dependent phase result."
+    reason = "The dynamic qualification sequence records each dependent phase explicitly."
 )]
-fn run_dynamic_weighted_scenarios(context: &DemoContext) -> BTreeMap<String, ProofResult> {
+fn run_dynamic_weighted_scenarios_inner(context: &DemoContext) -> BTreeMap<String, ProofResult> {
     let mut results = BTreeMap::new();
     let client_context = kind_context("pool-a");
     if let Err(error) = ensure_dynamic_client_pod(&client_context, &context.run_id) {
@@ -1720,7 +1732,482 @@ fn run_dynamic_weighted_scenarios(context: &DemoContext) -> BTreeMap<String, Pro
         },
     );
     results.insert("recovery".to_owned(), recovery_proof);
+
+    let signal_loss = prove_total_signal_loss_fails_closed(context, &signals);
+    results.insert("total_signal_loss_fail_closed".to_owned(), signal_loss);
     results
+}
+
+/// Stop both run-owned EPP signal sources and prove Grid publishes and Praxis serves no route.
+#[expect(
+    clippy::too_many_lines,
+    reason = "This bounded runtime gate records the signal, overlay, serving, request, and restoration boundaries."
+)]
+fn prove_total_signal_loss_fails_closed(context: &DemoContext, signals: &SignalsPortForward) -> ProofResult {
+    let mut timeline = Vec::new();
+    let mut original_replicas: BTreeMap<String, i64> = BTreeMap::new();
+    let mut touched_clusters: Vec<String> = Vec::new();
+    let mut prior_revisions: BTreeMap<String, String> = BTreeMap::new();
+    let mut last_revisions: BTreeMap<String, String> = BTreeMap::new();
+    let result: TotalSignalLossResult = (|| {
+        for &cluster in CLUSTERS {
+            let (overlay, accepted, serving) = observe_serving_state(&kind_context(cluster))?;
+            if overlay.candidates.is_empty()
+                || accepted != overlay.semantic_revision
+                || serving != overlay.semantic_revision
+            {
+                return Err(format!(
+                    "{cluster}: pre-loss route was not active: candidates={}, Grid={}, accepted={}, serving={}",
+                    overlay.candidates.len(),
+                    overlay.semantic_revision,
+                    accepted,
+                    serving
+                )
+                .into());
+            }
+            prior_revisions.insert(cluster.to_owned(), overlay.semantic_revision);
+        }
+
+        for &cluster in CLUSTERS {
+            let replicas = deployment_replicas(cluster, "llmd-epp")?;
+            original_replicas.insert(cluster.to_owned(), replicas);
+            touched_clusters.push(cluster.to_owned());
+            scale_deployment(cluster, "llmd-epp", 0)?;
+            timeline.push(
+                serde_json::json!({
+                    "at": format_utc_iso(),
+                    "event": "epp_scaled_down",
+                    "cluster": cluster,
+                    "previous_replicas": replicas,
+                    "replicas": 0,
+                })
+                .to_string(),
+            );
+        }
+        for &cluster in CLUSTERS {
+            wait_for_deployment_replicas(cluster, "llmd-epp", 0, Duration::from_secs(60))?;
+        }
+
+        let selected_metric = match context.scoring_flavor {
+            ScoringFlavor::QueueDepth => "grid_routing_queue_pressure",
+            ScoringFlavor::KvCachePressure => "grid_routing_kv_cache_pressure",
+        };
+        let deadline = Instant::now() + Duration::from_secs(240);
+        let required_stable_duration = dynamic_state_stability_window();
+        let mut stable_signature: Option<String> = None;
+        let mut stable_since: Option<Instant> = None;
+        let mut stable_observations = 0_u8;
+        let mut last_detail = String::from("signal loss has not converged");
+        while Instant::now() < deadline {
+            for &cluster in CLUSTERS {
+                trigger_gridnetwork_reconcile(cluster);
+            }
+            let exposition = signals.read_exposition()?;
+            let samples = parse_dynamic_signal_samples(&exposition, selected_metric);
+            let source_signals_absent = !samples.iter().any(|sample| {
+                (sample.site == "pool-a" && sample.provider == "llmd-pool-a-provider")
+                    || (sample.site == "pool-b" && sample.provider == "llmd-pool-b-provider")
+            });
+            let mut gateway_states = BTreeMap::new();
+            let mut all_empty_and_serving = true;
+            for &cluster in CLUSTERS {
+                match observe_serving_state(&kind_context(cluster)) {
+                    Ok((overlay, accepted, serving)) => {
+                        let revision_changed = prior_revisions
+                            .get(cluster)
+                            .is_some_and(|previous| previous != &overlay.semantic_revision);
+                        let revision_served =
+                            accepted == overlay.semantic_revision && serving == overlay.semantic_revision;
+                        all_empty_and_serving &= overlay.candidates.is_empty() && revision_changed && revision_served;
+                        last_revisions.insert(cluster.to_owned(), overlay.semantic_revision.clone());
+                        gateway_states.insert(
+                            cluster.to_owned(),
+                            serde_json::json!({
+                                "grid_revision": overlay.semantic_revision,
+                                "accepted_revision": accepted,
+                                "serving_revision": serving,
+                                "candidate_count": overlay.candidates.len(),
+                                "changed_from_prior": revision_changed,
+                                "revision_served": revision_served,
+                            }),
+                        );
+                    },
+                    Err(error) => {
+                        all_empty_and_serving = false;
+                        gateway_states.insert(cluster.to_owned(), serde_json::json!({"error": error.to_string()}));
+                    },
+                }
+            }
+            let state = serde_json::json!({
+                "at": format_utc_iso(),
+                "event": "signal_loss_observation",
+                "selected_metric": selected_metric,
+                "selected_metric_samples": samples,
+                "source_signals_absent": source_signals_absent,
+                "gateways": gateway_states,
+            });
+            timeline.push(state.to_string());
+            let ready = source_signals_absent && all_empty_and_serving;
+            if ready {
+                let signature = serde_json::to_string(&last_revisions)?;
+                if stable_signature.as_deref() == Some(signature.as_str()) {
+                    stable_observations = stable_observations.saturating_add(1);
+                } else {
+                    stable_signature = Some(signature);
+                    stable_since = Some(Instant::now());
+                    stable_observations = 1;
+                }
+                let stable_duration = stable_since.map_or(Duration::ZERO, |started| started.elapsed());
+                if stable_observations >= 2 && stable_duration >= required_stable_duration {
+                    let requests = sample_no_provider_denials(&kind_context("pool-a"), context.run_id.as_str())?;
+                    timeline.push(
+                        serde_json::json!({
+                            "at": format_utc_iso(),
+                            "event": "denial_sample_completed",
+                            "request_count": requests.request_count,
+                            "denied_404": requests.denied_404,
+                            "transport_failures": requests.transport_failures,
+                            "http_failures": requests.http_failures,
+                            "attribution_failures": requests.attribution_failures,
+                            "stable_observations": stable_observations,
+                            "stable_duration_ms": stable_duration.as_millis(),
+                            "required_stable_duration_ms": required_stable_duration.as_millis(),
+                        })
+                        .to_string(),
+                    );
+                    let revisions = last_revisions
+                        .iter()
+                        .map(|(cluster, revision)| (cluster.clone(), revision.clone()))
+                        .collect();
+                    return Ok((revisions, requests));
+                }
+                last_detail = format!(
+                    "all selected pressure signals absent and empty revisions served; stable observations={stable_observations}, stable_ms={}, required_ms={}",
+                    stable_duration.as_millis(),
+                    required_stable_duration.as_millis()
+                );
+            } else {
+                stable_signature = None;
+                stable_since = None;
+                stable_observations = 0;
+                last_detail = format!(
+                    "source_signals_absent={source_signals_absent}, all_empty_and_serving={all_empty_and_serving}, gateway_revisions={last_revisions:?}"
+                );
+            }
+            std::thread::sleep(Duration::from_secs(2));
+        }
+        Err(format!("total signal-loss convergence timed out: {last_detail}").into())
+    })();
+
+    let mut restore_failures = Vec::new();
+    for cluster in &touched_clusters {
+        if let Some(replicas) = original_replicas.get(cluster) {
+            if let Err(error) = scale_deployment(cluster, "llmd-epp", *replicas) {
+                restore_failures.push(format!("{cluster}: scale restore failed: {error}"));
+                continue;
+            }
+            if let Err(error) = wait_for_deployment_replicas(cluster, "llmd-epp", *replicas, Duration::from_secs(60)) {
+                restore_failures.push(format!("{cluster}: readiness restore failed: {error}"));
+            }
+            timeline.push(
+                serde_json::json!({
+                    "at": format_utc_iso(),
+                    "event": "epp_replica_count_restored",
+                    "cluster": cluster,
+                    "replicas": replicas,
+                })
+                .to_string(),
+            );
+        }
+    }
+
+    let (success, description, mut observations, revisions, requests) = match result {
+        Ok((revisions, requests)) => {
+            let sample_passed = requests.request_count == NO_PROVIDER_DENIAL_SAMPLE_SIZE
+                && requests.denied_404 == NO_PROVIDER_DENIAL_SAMPLE_SIZE
+                && requests.transport_failures == 0
+                && requests.http_failures == 0
+                && requests.attribution_failures == 0;
+            (
+                sample_passed && restore_failures.is_empty(),
+                "Total signal loss: Grid distributed an empty overlay, Praxis served the new revision, and unbound requests failed closed".to_owned(),
+                vec![format!("empty overlay revisions served by both gateways: {revisions:?}"), requests.summary()],
+                revisions,
+                Some(requests),
+            )
+        },
+        Err(error) => (
+            false,
+            "Total signal loss: fail-closed serving state was not proven".to_owned(),
+            vec![error.to_string()],
+            last_revisions,
+            None,
+        ),
+    };
+    if !restore_failures.is_empty() {
+        observations.push(format!(
+            "run-owned EPP restoration failures: {}",
+            restore_failures.join("; ")
+        ));
+    }
+
+    let evidence_write = (|| -> Result<(), Box<dyn std::error::Error>> {
+        fs::write(
+            context.evidence_dir.join("signal-loss-timeline.jsonl"),
+            format!("{}\n", timeline.join("\n")),
+        )?;
+        if let Some(requests) = &requests {
+            fs::write(
+                context.evidence_dir.join("signal-loss-requests.jsonl"),
+                format!("{}\n", requests.raw_lines.join("\n")),
+            )?;
+        }
+        fs::write(
+            context.evidence_dir.join("signal-loss-summary.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "prior_revisions": prior_revisions,
+                "empty_serving_revisions": revisions,
+                "request_sample": requests.as_ref().map(NoProviderDenialSample::as_json),
+                "restored_replicas": original_replicas,
+                "restore_failures": restore_failures,
+                "timeline_entries": timeline.len(),
+            }))?,
+        )?;
+        Ok(())
+    })();
+    if let Err(error) = evidence_write {
+        observations.push(format!("signal-loss evidence write failed: {error}"));
+        return failed_proof(&description, observations.join("; "));
+    }
+    ProofResult {
+        success,
+        description,
+        observations,
+    }
+}
+
+/// Classification and raw records for one non-retried no-provider request sample.
+struct NoProviderDenialSample {
+    /// Number of requests issued exactly once.
+    request_count: u32,
+    /// Requests that received an HTTP 404 without provider attribution.
+    denied_404: u32,
+    /// Requests that failed to complete an HTTP exchange.
+    transport_failures: u32,
+    /// Requests that completed with a status other than 404.
+    http_failures: u32,
+    /// HTTP 404 responses that still carried provider attribution.
+    attribution_failures: u32,
+    /// Sanitized per-request results retained for run evidence.
+    raw_lines: Vec<String>,
+}
+
+/// Result of the total-signal-loss gate, including the new-request sample.
+type TotalSignalLossResult = Result<(BTreeMap<String, String>, NoProviderDenialSample), Box<dyn std::error::Error>>;
+
+impl NoProviderDenialSample {
+    /// Summarize the request outcome counts for the proof report.
+    fn summary(&self) -> String {
+        format!(
+            "new unbound requests={} denied_404={} transport_failures={} http_failures={} attribution_failures={}",
+            self.request_count, self.denied_404, self.transport_failures, self.http_failures, self.attribution_failures
+        )
+    }
+
+    /// Serialize count fields for the run summary artifact.
+    fn as_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "request_count": self.request_count,
+            "denied_404": self.denied_404,
+            "transport_failures": self.transport_failures,
+            "http_failures": self.http_failures,
+            "attribution_failures": self.attribution_failures,
+        })
+    }
+}
+
+/// Run each new unbound request once and require an AI-generated 404 with no provider attribution.
+fn sample_no_provider_denials(
+    context: &str,
+    run_id: &str,
+) -> Result<NoProviderDenialSample, Box<dyn std::error::Error>> {
+    let script = format!(
+        r#"ordinal=1
+while [ "$ordinal" -le {NO_PROVIDER_DENIAL_SAMPLE_SIZE} ]; do
+  request_id="{run_id}-no-provider-$ordinal"
+  out=$(curl --silent --show-error --connect-timeout 5 --max-time 20 -o /dev/null -w '%{{http_code}}|%header{{X-Grid-LlmD-Provider-Gateway}}|%header{{x-ai-demo-provider-gateway}}' -H 'Content-Type: application/json' -X POST 'http://consumer-gateway.grid-system.svc.cluster.local:8080/v1/chat/completions' -d '{{"model":"{VCR_MODEL}","messages":[{{"role":"user","content":"no-provider fail-closed qualification"}}],"max_tokens":2}}' 2>/dev/null)
+  rc=$?
+  printf 'DENY|%s|%s|%s\n' "$request_id" "$rc" "$out"
+  ordinal=$((ordinal + 1))
+done"#
+    );
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            context,
+            "-n",
+            GRID_SYSTEM_NS,
+            "exec",
+            "dynamic-weighted-client",
+            "--",
+            "sh",
+            "-c",
+            &script,
+        ])
+        .output()?;
+    let mut sample = NoProviderDenialSample {
+        request_count: 0,
+        denied_404: 0,
+        transport_failures: 0,
+        http_failures: 0,
+        attribution_failures: 0,
+        raw_lines: Vec::new(),
+    };
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let Some(rest) = line.strip_prefix("DENY|") else {
+            continue;
+        };
+        let mut fields = rest.splitn(4, '|');
+        let request_id = fields.next().unwrap_or("unknown");
+        let curl_exit_code = fields.next().and_then(|value| value.parse::<i32>().ok()).unwrap_or(-1);
+        let response = fields.next().unwrap_or("");
+        let mut response_fields = response.splitn(3, '|');
+        let http_status = response_fields.next().and_then(|value| value.parse::<u16>().ok());
+        let provider_gateway = response_fields.next().unwrap_or("");
+        let provider_attribution = response_fields.next().unwrap_or("");
+        sample.request_count = sample.request_count.saturating_add(1);
+        let classification = if curl_exit_code != 0 || http_status.is_none() {
+            sample.transport_failures = sample.transport_failures.saturating_add(1);
+            "transport_failure"
+        } else if http_status != Some(404) {
+            sample.http_failures = sample.http_failures.saturating_add(1);
+            "unexpected_http_status"
+        } else if !provider_gateway.is_empty() || !provider_attribution.is_empty() {
+            sample.attribution_failures = sample.attribution_failures.saturating_add(1);
+            "unexpected_provider_attribution"
+        } else {
+            sample.denied_404 = sample.denied_404.saturating_add(1);
+            "denied_404"
+        };
+        sample.raw_lines.push(
+            serde_json::json!({
+                "request_id": request_id,
+                "curl_exit_code": curl_exit_code,
+                "http_status": http_status,
+                "provider_gateway": provider_gateway,
+                "provider_attribution": provider_attribution,
+                "classification": classification,
+            })
+            .to_string(),
+        );
+    }
+    if !output.status.success() {
+        sample.raw_lines.push(
+            serde_json::json!({
+                "classification": "client_exec_failure",
+                "stderr": safe_truncate_str(String::from_utf8_lossy(&output.stderr).trim(), 240),
+            })
+            .to_string(),
+        );
+        sample.transport_failures = sample.transport_failures.saturating_add(1);
+    }
+    Ok(sample)
+}
+
+/// Read the desired replica count for a run-owned deployment.
+fn deployment_replicas(cluster: &str, deployment: &str) -> Result<i64, Box<dyn std::error::Error>> {
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            &kind_context(cluster),
+            "-n",
+            GRID_SYSTEM_NS,
+            "get",
+            "deployment",
+            deployment,
+            "-o",
+            "json",
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!("{cluster}: cannot read deployment/{deployment} replicas").into());
+    }
+    let deployment_json: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    deployment_json
+        .pointer("/spec/replicas")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| format!("{cluster}: deployment/{deployment} has no desired replica count").into())
+}
+
+/// Change a run-owned deployment replica count with exact cluster scoping.
+fn scale_deployment(cluster: &str, deployment: &str, replicas: i64) -> Result<(), Box<dyn std::error::Error>> {
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            &kind_context(cluster),
+            "-n",
+            GRID_SYSTEM_NS,
+            "scale",
+            &format!("deployment/{deployment}"),
+            &format!("--replicas={replicas}"),
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "{cluster}: scaling deployment/{deployment} to {replicas} failed: {}",
+            safe_truncate_str(String::from_utf8_lossy(&output.stderr).trim(), 240)
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Wait until the deployment's desired and ready replica counts match the requested count.
+fn wait_for_deployment_replicas(
+    cluster: &str,
+    deployment: &str,
+    expected: i64,
+    timeout: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + timeout;
+    let mut last = String::from("no status observed");
+    while Instant::now() < deadline {
+        let output = Command::new("kubectl")
+            .args([
+                "--context",
+                &kind_context(cluster),
+                "-n",
+                GRID_SYSTEM_NS,
+                "get",
+                "deployment",
+                deployment,
+                "-o",
+                "json",
+            ])
+            .output()?;
+        if output.status.success() {
+            let deployment_json: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+            let desired = deployment_json
+                .pointer("/spec/replicas")
+                .and_then(serde_json::Value::as_i64);
+            let ready = deployment_json
+                .pointer("/status/readyReplicas")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0);
+            let actual = deployment_json
+                .pointer("/status/replicas")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0);
+            if desired == Some(expected) && ready == expected && actual == expected {
+                return Ok(());
+            }
+            last = format!("desired={desired:?}, actual={actual}, ready={ready}");
+        } else {
+            last = safe_truncate_str(String::from_utf8_lossy(&output.stderr).trim(), 240);
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    Err(format!("{cluster}: deployment/{deployment} replicas did not reach {expected}: {last}").into())
 }
 
 /// Build a failed evidence result with the first concrete boundary error.
@@ -8087,6 +8574,20 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
         assert_eq!(overlay.resource_version, "55");
         assert_eq!(overlay.candidates.len(), 1);
         assert_eq!(overlay.candidates[0].traffic_weight, 500);
+
+        let empty = serde_json::json!({
+            "metadata": {
+                "resourceVersion": "56",
+                "annotations": {"grid.praxis-proxy.io/overlay-revision": "sha256:empty-revision"}
+            },
+            "data": {"routing-config.json": serde_json::json!({
+                "selection_policy": {"mode": "weightedRandom"},
+                "candidates": []
+            }).to_string()}
+        });
+        let empty_overlay = parse_dynamic_overlay_json(&serde_json::to_vec(&empty)?)?;
+        assert_eq!(empty_overlay.semantic_revision, "sha256:empty-revision");
+        assert_eq!(empty_overlay.candidates.len(), 0);
         Ok(())
     }
 

@@ -280,13 +280,15 @@ When `enabled: false` or `consumerConfig` is absent, this gateway behaves as bef
 ## GridSite
 
 Represents another site in the grid. Created manually
-for seed peers or automatically by SWIM discovery.
+for seed peers or automatically by SWIM discovery. Its resource name is also
+used to bind local trust and routing state to a SWIM identity, so manual seed
+resources must use the same canonical network-prefixed name as discovery.
 
 ```yaml
 apiVersion: grid.praxis-proxy.io/v1alpha1
 kind: GridSite
 metadata:
-  name: cluster-b
+  name: production-cluster-b
   labels:
     grid.praxis-proxy.io/network: production
 spec:
@@ -303,6 +305,12 @@ spec:
   zone: us-east-1a
   sovereigntyZone: us
 ```
+
+This example assumes `gridNetworkRef: production` and SWIM site ID `cluster-b`.
+Grid derives the canonical resource name by sanitizing
+`<gridNetworkRef>-<SWIM site ID>`. Arbitrary display names are not supported:
+without a separate site-identity field, the operator cannot safely associate
+one with a peer's trust pins or provider records.
 
 **Phases**: Pending → Discovered → Connecting → Active → Unreachable → Left
 

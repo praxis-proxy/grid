@@ -1350,28 +1350,6 @@ async fn reconcile_routing_overlay_inner(
                 continue;
             },
         };
-        // Praxis intelligent_route rejects an empty candidates list at config load
-        // time, which would cause a hot-reload error rather than a clean
-        // "no routes" state.  Skip the apply and warn so the previous
-        // (non-empty) ConfigMap remains in place until a provider becomes
-        // available again.
-        if overlay.candidates.is_empty() {
-            tracing::warn!(
-                network = network_name,
-                gateway = %gw_ref.name,
-                "routing overlay has no candidates; skipping ConfigMap apply \
-                 to prevent invalid Praxis intelligent_route config"
-            );
-            overlay_statuses.push(retained_overlay_status(
-                network,
-                gw_ref,
-                observed_generation,
-                Some(&render),
-                "EmptyCandidates",
-                "no candidates available",
-            ));
-            continue;
-        }
         let resource_version = match distribute_overlay_configmap(&overlay, &render, network_name, gw_ref, client).await
         {
             Ok(rv) => rv,
@@ -1399,22 +1377,13 @@ async fn reconcile_routing_overlay_inner(
             &resource_version,
             &render.rendered_at,
         );
-        overlay_statuses.push(OverlayRevisionStatus {
-            gateway_name: gw_ref.name.clone(),
-            namespace: gw_ref.namespace.clone(),
-            config_map_name: render.config_map_name,
-            schema_version: render.schema_version,
-            rendered_revision: render.revision_hex.clone(),
-            distributed_revision: render.revision_hex.clone(),
-            content_digest: render.revision_hex,
-            config_map_resource_version: resource_version,
+        overlay_statuses.push(distributed_overlay_status(
+            gw_ref,
+            render,
+            resource_version,
             rendered_at,
-            candidate_count: render.candidate_count,
-            phase: OverlayPhase::Distributed,
-            reason: String::new(),
-            message: String::new(),
             observed_generation,
-        });
+        ));
 
         // Opt-in: generate and apply the consumer Praxis config when enabled.
         // Render/apply errors are recorded as per-gateway status and do NOT
@@ -1632,6 +1601,33 @@ pub(crate) struct OverlayRenderResult {
     pub(crate) candidate_count: u32,
     /// The built envelope, carried forward for distribution.
     pub(crate) envelope: overlay_envelope::OverlayEnvelope,
+}
+
+/// Build status for a successfully distributed overlay, including an
+/// intentional empty weighted overlay that means no provider is eligible.
+fn distributed_overlay_status(
+    gw_ref: &GatewayRef,
+    render: OverlayRenderResult,
+    resource_version: String,
+    rendered_at: String,
+    observed_generation: i64,
+) -> OverlayRevisionStatus {
+    OverlayRevisionStatus {
+        gateway_name: gw_ref.name.clone(),
+        namespace: gw_ref.namespace.clone(),
+        config_map_name: render.config_map_name,
+        schema_version: render.schema_version,
+        rendered_revision: render.revision_hex.clone(),
+        distributed_revision: render.revision_hex.clone(),
+        content_digest: render.revision_hex,
+        config_map_resource_version: resource_version,
+        rendered_at,
+        candidate_count: render.candidate_count,
+        phase: OverlayPhase::Distributed,
+        reason: String::new(),
+        message: String::new(),
+        observed_generation,
+    }
 }
 
 /// Build the overlay envelope without distributing it.
@@ -4755,7 +4751,7 @@ mod tests {
             ..GridNetworkStatus::default()
         });
 
-        let status = retained_overlay_status(&network, &gw, 5, None, "EmptyCandidates", "no candidates available");
+        let status = retained_overlay_status(&network, &gw, 5, None, "OverlayApplyFailed", "apply failed");
 
         assert_eq!(status.phase, OverlayPhase::Retained);
         assert_eq!(status.rendered_revision, prior.rendered_revision);
@@ -4764,7 +4760,7 @@ mod tests {
         assert_eq!(status.config_map_resource_version, prior.config_map_resource_version);
         assert_eq!(status.candidate_count, prior.candidate_count);
         assert_eq!(status.rendered_at, prior.rendered_at);
-        assert_eq!(status.reason, "EmptyCandidates");
+        assert_eq!(status.reason, "OverlayApplyFailed");
         assert!(status.message.contains("previous valid overlay retained"));
         assert_eq!(status.observed_generation, 5);
     }
@@ -4817,12 +4813,12 @@ mod tests {
             ..GridNetworkStatus::default()
         });
 
-        let status = retained_overlay_status(&network, &gw, 2, None, "EmptyCandidates", "no candidates available");
+        let status = retained_overlay_status(&network, &gw, 2, None, "OverlayApplyFailed", "apply failed");
 
         assert_eq!(status.phase, OverlayPhase::Error);
         assert!(status.rendered_revision.is_empty());
         assert!(status.distributed_revision.is_empty());
-        assert_eq!(status.reason, "EmptyCandidates");
+        assert_eq!(status.reason, "OverlayApplyFailed");
     }
 
     // -----------------------------------------------------------------------
@@ -4983,25 +4979,6 @@ mod tests {
     }
 
     #[test]
-    fn retained_status_empty_candidates_retains_prior_distribution() {
-        let gw = make_gw_ref("gw", "grid-system");
-        let prior = rendered_overlay_status(&gw);
-        let mut network = base_network();
-        network.status = Some(GridNetworkStatus {
-            overlay_status: vec![prior.clone()],
-            ..GridNetworkStatus::default()
-        });
-        let render = make_render_result(&"c".repeat(64), 0);
-
-        let status = retained_overlay_status(&network, &gw, 6, Some(&render), "EmptyCandidates", "no candidates");
-
-        assert_eq!(status.rendered_revision, "c".repeat(64));
-        assert_eq!(status.distributed_revision, prior.distributed_revision);
-        assert_eq!(status.candidate_count, 0);
-        assert_eq!(status.phase, OverlayPhase::Retained);
-    }
-
-    #[test]
     fn retained_status_render_failure_preserves_all_prior_evidence() {
         let gw = make_gw_ref("gw", "grid-system");
         let prior = rendered_overlay_status(&gw);
@@ -5050,6 +5027,25 @@ mod tests {
             status.rendered_revision, status.distributed_revision,
             "success path must set rendered == distributed"
         );
+    }
+
+    #[test]
+    fn empty_overlay_can_be_reported_as_successfully_distributed() {
+        let gw = make_gw_ref("gw", "grid-system");
+        let revision = "e".repeat(64);
+        let status = distributed_overlay_status(
+            &gw,
+            make_render_result(&revision, 0),
+            "101".to_owned(),
+            "2026-07-29T01:00:00Z".to_owned(),
+            7,
+        );
+
+        assert_eq!(status.phase, OverlayPhase::Distributed);
+        assert_eq!(status.rendered_revision, revision);
+        assert_eq!(status.distributed_revision, status.rendered_revision);
+        assert_eq!(status.candidate_count, 0);
+        assert!(status.reason.is_empty());
     }
 
     #[test]

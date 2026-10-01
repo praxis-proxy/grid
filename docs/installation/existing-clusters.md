@@ -229,11 +229,17 @@ Without this label, the operator finds no matching sites for the
 InferenceProvider, produces zero overlay candidates, and never creates
 the overlay ConfigMap.
 
+For a manually seeded remote site, `metadata.name` must use the canonical
+network-prefixed name derived from `<gridNetworkRef>-<SWIM site ID>`. In this
+example, the network is `my-grid` and the remote SWIM site ID is `east2`, so
+the GridSite name is `my-grid-east2`; the provider-site label still uses the
+site ID `east2`.
+
 ```yaml
 apiVersion: grid.praxis-proxy.io/v1alpha1
 kind: GridSite
 metadata:
-  name: east2
+  name: my-grid-east2
   labels:
     grid.praxis-proxy.io/provider-site: east2
 spec:

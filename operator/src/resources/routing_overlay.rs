@@ -1387,6 +1387,24 @@ fn render_routing_overlay_inner(
 
     enrich_candidates(&mut candidates, local_site, sites, network_name, &admission_map);
     candidates.retain(|c| c.admission_state != Some(AdmissionState::Excluded));
+    if let Some((signal_values, ..)) = placement_context.as_ref() {
+        candidates.retain(|candidate| {
+            let source_site = candidate.signal_origin_site.as_deref().unwrap_or(&candidate.site);
+            let key = SignalKey {
+                site: source_site.to_owned(),
+                provider: candidate.cluster.clone(),
+            };
+            let has_signal = signal_values.contains_key(&key);
+            if !has_signal {
+                tracing::warn!(
+                    provider = %candidate.cluster,
+                    site = source_site,
+                    "omitting pressure-weighted candidate without a fresh signal"
+                );
+            }
+            has_signal
+        });
+    }
 
     let policy = network
         .spec
@@ -2336,7 +2354,7 @@ mod tests {
     }
 
     #[test]
-    fn pressure_weighted_overlay_rejects_missing_or_wrong_origin_signal() {
+    fn pressure_weighted_overlay_omits_candidate_with_wrong_origin_signal() {
         let network = test_pressure_weighted_network("net");
         let local = test_provider("provider-a", "net", &["model"]);
         let mut wrong_site = HashMap::new();
@@ -2362,9 +2380,140 @@ mod tests {
             &mut PlacementState::default(),
         );
         assert!(
-            result.is_err(),
+            result.unwrap().candidates.is_empty(),
             "a signal from another origin must not be joined to this provider"
         );
+    }
+
+    #[test]
+    fn peer_signal_loss_omits_degraded_peer_and_retains_other_candidates() {
+        let network = test_pressure_weighted_network("net");
+        let local = test_provider("provider-a", "net", &["model"]);
+        let peer = make_crdt_provider("site-b", "provider-b", crdt::ProviderPhase::Available, &["model"]);
+        let initial_signals = HashMap::from([
+            (
+                SignalKey {
+                    site: "site-a".to_owned(),
+                    provider: "provider-a".to_owned(),
+                },
+                0.0,
+            ),
+            (
+                SignalKey {
+                    site: "site-b".to_owned(),
+                    provider: "provider-b".to_owned(),
+                },
+                0.0,
+            ),
+        ]);
+        let mut placement_state = PlacementState::default();
+        let initial_overlay = render_routing_overlay_with_pressure(
+            &network,
+            &[],
+            std::slice::from_ref(&local),
+            std::slice::from_ref(&peer),
+            "consumer-site",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+            None,
+            &initial_signals,
+            "site-a",
+            &mut placement_state,
+        )
+        .unwrap();
+
+        assert_eq!(
+            initial_overlay.candidates.len(),
+            2,
+            "both signaled providers start eligible"
+        );
+        assert!(
+            initial_overlay
+                .candidates
+                .iter()
+                .any(|candidate| candidate.cluster == "provider-b")
+        );
+
+        let degraded_peer = make_crdt_provider("site-b", "provider-b", crdt::ProviderPhase::Degraded, &["model"]);
+        let remaining_signals = HashMap::from([(
+            SignalKey {
+                site: "site-a".to_owned(),
+                provider: "provider-a".to_owned(),
+            },
+            0.0,
+        )]);
+        let next_overlay = render_routing_overlay_with_pressure(
+            &network,
+            &[],
+            &[local],
+            &[degraded_peer],
+            "consumer-site",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+            None,
+            &remaining_signals,
+            "site-a",
+            &mut placement_state,
+        )
+        .unwrap();
+
+        assert_eq!(next_overlay.candidates.len(), 1);
+        assert_eq!(next_overlay.candidates[0].cluster, "provider-a");
+        assert_eq!(next_overlay.candidates[0].traffic_weight, Some(1000));
+    }
+
+    #[test]
+    fn all_missing_pressure_signals_render_empty_envelope_and_consumer_candidates() {
+        let network = test_pressure_weighted_network("net");
+        let local = test_provider("provider-a", "net", &["model"]);
+        let peer = make_crdt_provider("site-b", "provider-b", crdt::ProviderPhase::Available, &["model"]);
+
+        let overlay = render_routing_overlay_with_pressure(
+            &network,
+            &[],
+            &[local],
+            &[peer],
+            "consumer-site",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+            None,
+            &HashMap::new(),
+            "site-a",
+            &mut PlacementState::default(),
+        )
+        .unwrap();
+
+        assert!(overlay.candidates.is_empty());
+        let built = crate::resources::overlay_envelope::build_overlay_envelope(
+            &overlay,
+            "consumer-gateway",
+            "grid-system",
+            "network-uid",
+            1,
+            "2026-10-01T00:00:00Z",
+        )
+        .unwrap();
+        let serialized = serde_json::to_string(&built.envelope).unwrap();
+        let decoded: crate::resources::overlay_envelope::OverlayEnvelope = serde_json::from_str(&serialized).unwrap();
+        assert!(decoded.overlay.candidates.is_empty());
+        assert_eq!(
+            decoded.revision.value,
+            crate::resources::overlay_envelope::compute_semantic_digest(&decoded.overlay).unwrap()
+        );
+
+        let consumer_yaml = crate::resources::consumer_config::generate_consumer_praxis_config(
+            &overlay,
+            "/run/secrets/grid",
+            &[],
+            "/etc/praxis/tls",
+            8080,
+        )
+        .unwrap();
+        assert!(consumer_yaml.contains("       candidates:\n         []"));
+        assert!(!consumer_yaml.contains("         - kind:"));
     }
 
     #[test]
@@ -3123,10 +3272,9 @@ mod tests {
     #[test]
     fn all_providers_unavailable_produces_empty_overlay() {
         // If every provider in the network is Unavailable, the renderer produces
-        // an empty candidate list without returning an error.  The reconcile-loop
-        // guard (in grid_network controller) skips applying an empty overlay to
-        // prevent Praxis hot-reload errors — that guard is covered at the
-        // controller integration level.  This test covers the renderer contract.
+        // an empty candidate list without returning an error. The controller
+        // distributes this state as an empty weighted overlay, which Praxis AI
+        // handles as an explicit no-provider state.
         let network = test_network("empty-net");
         let p1 = test_provider_with_phase("prov-a", "empty-net", &["model-a"], "Unavailable");
         let p2 = test_provider_with_phase("prov-b", "empty-net", &["model-b"], "Unavailable");

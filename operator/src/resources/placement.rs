@@ -129,7 +129,12 @@ pub(crate) fn pressure_weights(
     }
 
     let floor = f64::from(config.availability_floor_percent) / 100.0;
-    let mut next_availability = state.availability.clone();
+    let policy_changed = state.policy.as_ref().is_none_or(|previous| previous != config);
+    let mut next_availability = if policy_changed {
+        HashMap::new()
+    } else {
+        state.availability.clone()
+    };
     let mut by_group: BTreeMap<u32, Vec<(usize, f64)>> = BTreeMap::new();
     let mut active_state_ids = BTreeSet::new();
 
@@ -276,7 +281,6 @@ pub(crate) fn pressure_weights(
         }
     }
 
-    let policy_changed = state.policy.as_ref().is_none_or(|previous| previous != config);
     let threshold = f64::from(config.change_threshold_percent) / 100.0;
     let material = policy_changed
         || proposed.iter().any(|(id, weight)| {
@@ -508,6 +512,30 @@ mod tests {
 
         assert_eq!(updated.values().sum::<u32>(), cfg.maximum_weight);
         assert!(updated.values().all(|weight| *weight >= cfg.minimum_weight));
+    }
+
+    #[test]
+    fn changing_pressure_signal_resets_ewma_history() {
+        let mut cfg = config();
+        cfg.smoothing_factor = 0.35;
+        let mut state = PlacementState::default();
+        let _initial = pressure_weights(
+            &[input("a", 0, 1, Some(0.9)), input("b", 0, 1, Some(0.0))],
+            &cfg,
+            &mut state,
+        )
+        .unwrap();
+
+        cfg.signal = PressureSignal::KvCacheUtilization;
+        let new_inputs = [input("a", 0, 1, Some(0.0)), input("b", 0, 1, Some(0.9))];
+        let updated = pressure_weights(&new_inputs, &cfg, &mut state).unwrap();
+        let fresh = pressure_weights(&new_inputs, &cfg, &mut PlacementState::default()).unwrap();
+
+        assert_eq!(
+            updated, fresh,
+            "a new signal must not inherit the previous signal's EWMA"
+        );
+        assert!(updated["0:a"] > updated["0:b"]);
     }
 
     #[test]

@@ -69,9 +69,23 @@ placementPolicy:
 Grid normalizes queue depth using the provider's configured pool and queue
 capacity, scopes observations by their originating site and provider identity,
 and bounds their age before calculating weights. Missing, stale, conflicting,
-or invalid pressure for any eligible candidate prevents that reconcile from
-publishing new weights; the last published overlay remains active. This avoids
-silently treating an unknown signal as zero pressure, but it also means stale
-weights can remain in service until valid samples return or operators change
-eligibility. This policy is experimental; the deterministic pressure/recovery
-qualification is documented in the [llm-d pool-metrics topology](../../tests/e2e/topologies/grid-llmd-pool-metrics/README.md).
+or invalid pressure removes only the affected candidate from the next overlay;
+other candidates and provider-state changes can still publish. A missing
+signal is never treated as zero pressure. If no candidate has a usable signal,
+Grid distributes an empty `weightedRandom` overlay as an explicit
+no-provider-eligible state. Praxis AI accepts that state, advances its serving
+revision, and rejects new model requests with HTTP 404 until an eligible
+candidate is published again. Empty candidate lists in other selection modes
+remain invalid. This policy is experimental; the deterministic
+pressure/recovery qualification is documented in the
+[llm-d pool-metrics topology](../../tests/e2e/topologies/grid-llmd-pool-metrics/README.md).
+
+Pressure telemetry and health are different signals. A missing queue or
+KV-cache observation means Grid cannot calculate a trustworthy dynamic weight
+for that provider; it does **not** mean its pod, node, or site has failed. Grid
+omits that candidate from new pressure-weighted routing, while provider health
+and SWIM membership continue to determine whether the provider or site is
+actually unavailable. If every pressure observation is missing, the empty
+overlay rejects new model requests; it does not mark every site failed. An
+availability fallback based on static capacity would require an explicit
+policy and independent health checks, not an implicit reuse of old weights.
