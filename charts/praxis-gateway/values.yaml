@@ -60,13 +60,47 @@ args:
 # -- credentials and other deployment-managed secrets.
 env: []
 
-# -- Required Praxis configuration.
+# -- Praxis configuration (praxis.yaml). The first source that is set wins:
+# gatewayConfig.render, then config.existingConfigMap, then config.inline. render also
+# turns on by itself when existingConfigMap is empty and gatewayConfig configures grid
+# routing (backends, role provider, or gridServing).
 config:
-  # -- Name of an existing ConfigMap containing the Praxis configuration.
-  # The chart does not create or manage this ConfigMap.
+  # -- Name of an existing ConfigMap holding the Praxis configuration. The chart mounts
+  # it but does not manage it, so editing it does not restart the pods.
   existingConfigMap: ""
-  # -- Key within the ConfigMap that holds praxis.yaml.
+  # -- Key within existingConfigMap that holds praxis.yaml.
   key: "praxis.yaml"
+  # -- Praxis configuration the chart stores in its own ConfigMap when neither
+  # existingConfigMap nor gatewayConfig.render is set. Changing it rolls the pods. Keep
+  # the listener address on port.containerPort. The default answers GET / with a small
+  # JSON status and everything else with 404, so a bare install serves traffic. Replace
+  # it with your own listeners, routes, and clusters, for example with
+  # --set-file config.inline=praxis.yaml.
+  inline: |
+    admin:
+      address: "127.0.0.1:9901"
+    listeners:
+      - name: default
+        address: "0.0.0.0:8080"
+        filter_chains: [default]
+    filter_chains:
+      - name: default
+        filters:
+          - filter: static_response
+            status: 200
+            headers:
+              - name: Content-Type
+                value: application/json
+            body: '{"status": "ok", "server": "praxis"}'
+            conditions:
+              - when:
+                  path: "/"
+          - filter: static_response
+            status: 404
+            headers:
+              - name: Content-Type
+                value: application/json
+            body: '{"error": "not found"}'
 
 # Secure-by-default gateway config. When render is true the chart emits praxis.yaml
 # + policy.yaml (the auth chain) and never emits insecure_options; endpoints are values.

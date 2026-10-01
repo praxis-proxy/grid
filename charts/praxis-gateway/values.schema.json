@@ -348,16 +348,19 @@
     "config": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["existingConfigMap"],
       "properties": {
         "existingConfigMap": {
           "type": "string",
-          "description": "Name of an existing ConfigMap containing the Praxis configuration."
+          "description": "Name of an existing ConfigMap containing the Praxis configuration. Takes precedence over inline."
         },
         "key": {
           "type": "string",
           "minLength": 1,
           "description": "Key within the ConfigMap that holds praxis.yaml."
+        },
+        "inline": {
+          "type": "string",
+          "description": "Praxis configuration stored in a chart-managed ConfigMap when neither existingConfigMap nor gatewayConfig.render is set."
         }
       }
     },

@@ -74,9 +74,10 @@ AI image; these values may advance independently.
 | `imageUser.uid` | int | `100` | Numeric user of the official Praxis images, which declare the named user `praxis`. |
 | `imageUser.gid` | int | `101` | Numeric group of the official Praxis images. |
 | `args` | list | `["--config", "/etc/praxis/praxis.yaml"]` | Container arguments. |
-| `config.existingConfigMap` | string | `""` | Name of an existing ConfigMap with the Praxis config. Without it, the chart renders the config. |
+| `config.existingConfigMap` | string | `""` | Name of an existing ConfigMap with the Praxis config. Takes precedence over `config.inline`. Editing it does not restart the pods. |
 | `config.key` | string | `praxis.yaml` | Key in the ConfigMap. |
-| `gatewayConfig.render` | bool | `false` | Render the Praxis config from these values instead of a BYO ConfigMap, also on when `config.existingConfigMap` is empty. Never emits `insecure_options`. |
+| `config.inline` | string | answers `GET /` with a JSON status, else 404 | Praxis config stored in a chart-managed ConfigMap when neither `config.existingConfigMap` nor `gatewayConfig.render` applies. Changing it rolls the pods. |
+| `gatewayConfig.render` | bool | `false` | Render the Praxis config from these values instead of a BYO ConfigMap. Also on when `config.existingConfigMap` is empty and the values configure grid routing (`gatewayConfig.backends`, `role: provider`, or `gridServing`). Never emits `insecure_options`. |
 | `gatewayConfig.model` | string | **required** for a consumer without `gridServing` | Model advertised on the routing candidates. |
 | `gatewayConfig.backends` | map | **required** when rendered | Backends keyed by site, each with `endpoint` and optional `healthCheck` and `transport`. A consumer's key is the site it reaches over mutual TLS. A provider's `local` key is its one plaintext backend. The older list of `cluster`, `endpoints` entries still renders. |
 | `gatewayConfig.backends[].site` | string | `localSite` | Grid site the backend serves. A consumer's remote `mutual_tls` backend must name it, and it must differ from `localSite`. Its `transport.sni` defaults to `<site>.grid.internal`. |

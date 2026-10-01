@@ -4,7 +4,8 @@ Praxis gateway installed.
   Release:   {{ .Release.Name }}
   Namespace: {{ .Release.Namespace }}
   Image:     {{ include "praxis-gateway.image" . }}
-  Config:    {{ .Values.config.existingConfigMap }}
+{{- $configSource := include "praxis-gateway.configSource" . }}
+  Config:    {{ if eq $configSource "existing" }}ConfigMap {{ .Values.config.existingConfigMap }} (key {{ .Values.config.key }}){{ else if eq $configSource "render" }}rendered from gatewayConfig{{ else }}config.inline (ConfigMap {{ include "praxis-gateway.fullname" . }}-config){{ end }}
 
 TEMPORARY CHART: This chart deploys the Praxis process directly as a
 Kubernetes workload. It is not an operator. Long-term ownership moves to

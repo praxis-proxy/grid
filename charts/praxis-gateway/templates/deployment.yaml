@@ -19,7 +19,13 @@ spec:
         {{- $selectorLabels := include "praxis-gateway.selectorLabels" . | fromYaml }}
         {{- $podLabels := mustMergeOverwrite (dict "app.kubernetes.io/component" "gateway") (.Values.podLabels | default dict) $selectorLabels }}
         {{- toYaml $podLabels | nindent 8 }}
-      {{- with .Values.podAnnotations }}
+      {{- $configSource := include "praxis-gateway.configSource" . }}
+      {{- $podAnnotations := deepCopy (.Values.podAnnotations | default dict) }}
+      {{- if eq $configSource "inline" }}
+      {{- /* A changed config.inline must reach new pods: the hash rolls the Deployment. */}}
+      {{- $_ := set $podAnnotations "checksum/config" (toString .Values.config.inline | sha256sum) }}
+      {{- end }}
+      {{- with $podAnnotations }}
       annotations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
@@ -252,10 +258,15 @@ spec:
               - key: "policy.yaml"
                 path: "policy.yaml"
               {{- end }}
-            {{- else }}
+            {{- else if eq $configSource "existing" }}
             name: {{ .Values.config.existingConfigMap | quote }}
             items:
               - key: {{ .Values.config.key | quote }}
+                path: "praxis.yaml"
+            {{- else }}
+            name: {{ include "praxis-gateway.fullname" . }}-config
+            items:
+              - key: "praxis.yaml"
                 path: "praxis.yaml"
             {{- end }}
         {{- if .Values.overlay.enabled }}
