@@ -167,6 +167,10 @@ spec:
           {{- end }}
           securityContext:
             runAsNonRoot: true
+            {{- if include "praxis-gateway.applyImageUser" . }}
+            runAsUser: {{ .Values.imageUser.uid }}
+            runAsGroup: {{ .Values.imageUser.gid }}
+            {{- end }}
             allowPrivilegeEscalation: false
             capabilities:
               drop:

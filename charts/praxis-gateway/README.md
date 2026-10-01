@@ -70,6 +70,9 @@ AI image; these values may advance independently.
 | `podLabels` | object | `{}` | Additional pod labels. Selector labels cannot be overridden. |
 | `podAnnotations` | object | `{}` | Pod annotations. |
 | `podSecurityContext` | object | `{}` | Extra pod securityContext (`runAsUser`, `runAsGroup`, `fsGroup`, `supplementalGroups`). |
+| `imageUser.enabled` | string or bool | `auto` | Set `imageUser.uid` and `imageUser.gid` as the Praxis container's `runAsUser` and `runAsGroup` when `podSecurityContext` sets neither. `auto` skips them on OpenShift (`security.openshift.io/v1`), where the SCC assigns IDs. |
+| `imageUser.uid` | int | `100` | Numeric user of the official Praxis images, which declare the named user `praxis`. |
+| `imageUser.gid` | int | `101` | Numeric group of the official Praxis images. |
 | `args` | list | `["--config", "/etc/praxis/praxis.yaml"]` | Container arguments. |
 | `config.existingConfigMap` | string | `""` | Name of an existing ConfigMap with the Praxis config. Without it, the chart renders the config. |
 | `config.key` | string | `praxis.yaml` | Key in the ConfigMap. |

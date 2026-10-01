@@ -192,6 +192,20 @@ Validate required config ConfigMap name.
 {{- end }}
 
 {{/*
+Whether the Praxis container gets imageUser's numeric IDs: only when podSecurityContext
+sets neither runAsUser nor runAsGroup, and imageUser.enabled is true, or auto off
+OpenShift. Emits "true" or nothing.
+*/}}
+{{- define "praxis-gateway.applyImageUser" -}}
+{{- $psc := .Values.podSecurityContext | default dict -}}
+{{- $e := toString (.Values.imageUser | default dict).enabled -}}
+{{- $openshift := .Capabilities.APIVersions.Has "security.openshift.io/v1" -}}
+{{- if and (not (hasKey $psc "runAsUser")) (not (hasKey $psc "runAsGroup")) (or (eq $e "true") (and (eq $e "auto") (not $openshift))) -}}
+true
+{{- end -}}
+{{- end }}
+
+{{/*
 Validate each backend's effective transport. mutual_tls presents the gateway's
 grid identity (the tls mount) and needs a sni naming the peer; plaintext must not
 carry a sni.

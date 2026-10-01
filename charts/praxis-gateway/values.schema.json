@@ -284,6 +284,28 @@
         }
       }
     },
+    "imageUser": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Numeric runAsUser and runAsGroup for the Praxis container when podSecurityContext sets neither.",
+      "required": ["uid", "gid"],
+      "properties": {
+        "enabled": {
+          "enum": [true, false, "true", "false", "auto"],
+          "description": "auto applies uid and gid except when security.openshift.io/v1 is served."
+        },
+        "uid": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "runAsUser for the Praxis container."
+        },
+        "gid": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "runAsGroup for the Praxis container."
+        }
+      }
+    },
     "args": {
       "type": "array",
       "items": { "type": "string" },
