@@ -266,12 +266,21 @@ overlay:
         cpu: 50m
         memory: 32Mi
 
-# -- Grid identity: the gateway's mTLS cert for backends and cross-site peers.
-# Set secretName to mount it. The Secret holds tls.crt, tls.key and ca.crt.
-# You create it; the chart only mounts it.
+# -- Grid identity: the gateway's client cert for mTLS to backends and cross-site
+# peers. The Secret holds tls.crt, tls.key and ca.crt. You create it; the chart
+# only mounts it at mountPath. Works with every praxisConfig.source. What uses
+# it depends on who writes praxis.yaml:
+#   operator: each GridNetwork consumerConfig.clusterEndpoints[] entry sets
+#             transport.mode (MutualTls or Plaintext). MutualTls clusters use
+#             this mount. Set secretName if any cluster uses MutualTls.
+#   byo:      up to you. Point the cluster tls block of your praxis.yaml at
+#             mountPath (ca.crt, tls.crt, tls.key).
+#   render:   each render.backends[] entry picks transport.mode: mutual_tls
+#             (uses this mount), tls (server cert only) or plaintext. A backend
+#             with no mode gets mutual_tls when secretName is set, else plaintext.
 gridIdentity:
   # -- Existing Secret with the grid identity. The chart does not create it.
-  # Empty (the default) turns the grid identity off: backends default to plaintext.
+  # Empty (the default) turns the grid identity off.
   secretName: ""
   # -- Mount path for TLS files.
   mountPath: "/etc/praxis/tls"
