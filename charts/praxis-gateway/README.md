@@ -159,6 +159,18 @@ built on Praxis 0.7.0; these are separate release versions.
 For immutable deployments, set `image.digest` explicitly to
 `sha256:0f619d4a0b533093f94a76921cfbba0ecdec51557dffee1615a29721ee1fc878`.
 
+Other Praxis builds work as long as they accept `--config <path>`, which the
+chart passes through `args`. The core Praxis image's entrypoint already names
+its own config path, so replace the entrypoint with `command`:
+
+```bash
+helm upgrade --install praxis-gateway charts/praxis-gateway \
+  --namespace praxis --create-namespace \
+  --set image.repository=ghcr.io/praxis-proxy/praxis \
+  --set image.tag=0.7.1 \
+  --set 'command={praxis}'
+```
+
 The chart uses [Semantic Versioning](https://semver.org/). Its `version`
 identifies the chart package, while `appVersion` identifies the default
 Praxis AI image; these values may advance independently.
@@ -183,6 +195,7 @@ Praxis AI image; these values may advance independently.
 | `imageUser.enabled` | string or bool | `auto` | Set `imageUser.uid` and `imageUser.gid` as the Praxis container's `runAsUser` and `runAsGroup` when `podSecurityContext` sets neither. `auto` skips them on OpenShift (`security.openshift.io/v1`), where the SCC assigns IDs. |
 | `imageUser.uid` | int | `100` | Numeric user of the official Praxis images, which declare the named user `praxis`. |
 | `imageUser.gid` | int | `101` | Numeric group of the official Praxis images. |
+| `command` | list | `[]` | Container command, replacing the image entrypoint. Empty keeps the entrypoint. |
 | `args` | list | `["--config", "/etc/praxis/praxis.yaml"]` | Container arguments. |
 | `config.existingConfigMap` | string | `""` | Name of an existing ConfigMap with the Praxis config. Takes precedence over `config.inline`. Editing it does not restart the pods. |
 | `config.key` | string | `praxis.yaml` | Key in the ConfigMap. |

@@ -52,6 +52,11 @@ imageUser:
   # -- runAsGroup for the Praxis container.
   gid: 101
 
+# -- Container command, replacing the image entrypoint. Empty keeps the entrypoint.
+# Set it for images whose entrypoint already passes a config path, for example
+# ["praxis"] for the core image ghcr.io/praxis-proxy/praxis.
+command: []
+
 # -- Container arguments. Defaults to the config file path.
 args:
   - "--config"
