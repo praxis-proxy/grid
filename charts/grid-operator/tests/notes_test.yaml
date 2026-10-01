@@ -1,0 +1,17 @@
+suite: install notes
+templates:
+  - templates/NOTES.txt
+tests:
+  - it: names the Secret permissions auto-enroll needs without chart RBAC
+    set:
+      rbac.create: false
+      enrollment.enabled: true
+    asserts:
+      - matchRegexRaw:
+          pattern: get, create, and patch on Secrets
+  - it: says nothing extra with chart RBAC
+    set:
+      enrollment.enabled: true
+    asserts:
+      - notMatchRegexRaw:
+          pattern: get, create, and patch on Secrets

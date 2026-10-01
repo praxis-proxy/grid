@@ -143,6 +143,24 @@ try_template "$CHART_DIR" "SWIM advertise address" \
   --set swim.advertiseAddress=swim.example.com:7946
 try_template "$CHART_DIR" "scheduling" \
   --set nodeSelector.zone=us-east-1 --set priorityClassName=high-priority
+ENROLL_SET=(--set enrollment.enabled=true --set enrollment.url=https://enroll.example.com
+  --set enrollment.siteName=site-d --set enrollment.tokenSecretRef.name=grid-invite-site-d)
+try_template "$CHART_DIR" "auto-enroll with a ConfigMap CA" "${ENROLL_SET[@]}" \
+  --set enrollment.caBundle.configMap=grid-ca
+try_template "$CHART_DIR" "auto-enroll with a Secret CA" "${ENROLL_SET[@]}" \
+  --set enrollment.caBundle.secret=grid-ca-bundle
+try_reject_msg "$CHART_DIR" "auto-enroll without a CA bundle" 'enrollment.caBundle needs a configMap or a secret' "${ENROLL_SET[@]}"
+try_reject_msg "$CHART_DIR" "auto-enroll with a nulled CA bundle" 'enrollment.caBundle needs a configMap or a secret' \
+  "${ENROLL_SET[@]}" --set enrollment.caBundle=null
+try_reject_msg "$CHART_DIR" "auto-enroll site name past 51 characters" 'siteName' "${ENROLL_SET[@]}" \
+  --set enrollment.caBundle.secret=grid-ca-bundle --set enrollment.siteName="$(printf 'a%.0s' {1..52})"
+try_reject_msg "$CHART_DIR" "auto-enroll over plaintext" 'enrollment[./]url' "${ENROLL_SET[@]}" \
+  --set enrollment.caBundle.secret=grid-ca-bundle --set enrollment.url=http://enroll.example.com
+try_template "$CHART_DIR" "auto-enroll with a separate grid CA anchor" "${ENROLL_SET[@]}" \
+  --set enrollment.caBundle.configMap=route-ca --set enrollment.gridCaBundle.secret=grid-ca-bundle
+try_reject_msg "$CHART_DIR" "auto-enroll with two grid CA sources" 'gridCaBundle' "${ENROLL_SET[@]}" \
+  --set enrollment.caBundle.configMap=route-ca --set enrollment.gridCaBundle.secret=a \
+  --set enrollment.gridCaBundle.configMap=b
 try_template "$CHART_DIR" "SA annotations" \
   --set-string 'serviceAccount.annotations.eks\.amazonaws\.com/role-arn=arn:aws:iam::123456789012:role/grid'
 try_template "$CHART_DIR" "hostile podLabels" \
@@ -1435,6 +1453,12 @@ try_reject "$ENROLL_DIR" "route.host not DNS-1123" --namespace grid-system "${OC
 try_reject "$ENROLL_DIR" "local authz with no grid-admin tokens" --namespace grid-system \
   --set enrollment.authz=local --set enrollment.gridAdminTokens.generate=false
 try_reject "$ENROLL_DIR" "route.enabled not true, false, or auto" --namespace grid-system --set route.enabled=maybe
+try_template "$ENROLL_DIR" "enrollment: site invites" --namespace grid-system \
+  --set-json 'invites=[{"siteName":"site-d","gridNetworkRef":"grid","expiresInSecs":600}]'
+try_reject_msg "$ENROLL_DIR" "enrollment: invites under local authz" 'enrollment.authz=kube' --namespace grid-system \
+  --set enrollment.authz=local --set-json 'invites=[{"siteName":"site-d","gridNetworkRef":"grid"}]'
+try_reject_msg "$ENROLL_DIR" "enrollment: invite without gridNetworkRef" 'gridNetworkRef' --namespace grid-system \
+  --set-json 'invites=[{"siteName":"site-d"}]'
 
 echo ""
 echo "=== Route + serving-cert SAN auto-wire (enrollment) ==="

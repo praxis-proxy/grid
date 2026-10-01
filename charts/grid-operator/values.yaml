@@ -151,3 +151,34 @@ tolerations: []
 topologySpreadConstraints: []
 # -- Priority class for the operator pod.
 priorityClassName: ""
+
+# -- Site auto-enroll on startup.
+enrollment:
+  # -- Enroll when the site identity Secret is absent.
+  enabled: false
+  # -- Enrollment service https base URL.
+  url: ""
+  # -- Site name the token pins, at most 51 characters.
+  siteName: ""
+  # -- CA pinning the enrollment server, and the grid CA by default.
+  caBundle:
+    # -- ConfigMap holding the bundle. Set this or secret.
+    configMap: ""
+    # -- Secret holding the bundle.
+    secret: ""
+    # -- Key holding the PEM bundle.
+    key: ca.crt
+  # -- Grid CA anchor, when it differs from caBundle.
+  gridCaBundle:
+    # -- ConfigMap holding the grid CA. Set this or secret.
+    configMap: ""
+    # -- Secret holding the grid CA.
+    secret: ""
+    # -- Key holding the PEM bundle.
+    key: ca.crt
+  # -- Secret holding the one-time site token.
+  tokenSecretRef:
+    # -- Secret name.
+    name: ""
+    # -- Key holding the token.
+    key: token

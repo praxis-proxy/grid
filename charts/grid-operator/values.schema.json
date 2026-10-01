@@ -327,6 +327,116 @@
     "priorityClassName": {
       "type": "string",
       "description": "Priority class for the operator pod."
+    },
+    "enrollment": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Site auto-enroll on startup.",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Enroll on startup when the site identity Secret is absent."
+        },
+        "url": {
+          "type": "string",
+          "pattern": "^(https://[^\\s]+)?$",
+          "description": "Enrollment service base URL (https)."
+        },
+        "siteName": {
+          "type": "string",
+          "pattern": "^([a-z0-9]([-a-z0-9]{0,49}[a-z0-9])?)?$",
+          "description": "Site name the token pins, a DNS label of at most 51 characters."
+        },
+        "caBundle": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "CA bundle that pins the enrollment server, from at most one of configMap and secret.",
+          "properties": {
+            "configMap": {
+              "type": "string",
+              "pattern": "^([a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?)?$",
+              "description": "ConfigMap holding the bundle."
+            },
+            "secret": {
+              "type": "string",
+              "pattern": "^([a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?)?$",
+              "description": "Secret holding the bundle."
+            },
+            "key": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Key holding the PEM bundle."
+            }
+          },
+          "not": {
+            "required": [
+              "configMap",
+              "secret"
+            ],
+            "properties": {
+              "configMap": {
+                "minLength": 1
+              },
+              "secret": {
+                "minLength": 1
+              }
+            }
+          }
+        },
+        "gridCaBundle": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Grid CA the returned CA must match, from at most one of configMap and secret.",
+          "properties": {
+            "configMap": {
+              "type": "string",
+              "pattern": "^([a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?)?$",
+              "description": "ConfigMap holding the bundle."
+            },
+            "secret": {
+              "type": "string",
+              "pattern": "^([a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?)?$",
+              "description": "Secret holding the bundle."
+            },
+            "key": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Key holding the PEM bundle."
+            }
+          },
+          "not": {
+            "required": [
+              "configMap",
+              "secret"
+            ],
+            "properties": {
+              "configMap": {
+                "minLength": 1
+              },
+              "secret": {
+                "minLength": 1
+              }
+            }
+          }
+        },
+        "tokenSecretRef": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Secret holding the one-time site token.",
+          "properties": {
+            "name": {
+              "type": "string",
+              "pattern": "^([a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?)?$",
+              "description": "Secret name."
+            },
+            "key": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Key holding the token."
+            }
+          }
+        }
+      }
     }
   }
 }

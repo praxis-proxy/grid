@@ -61,3 +61,8 @@ Resource access granted in additional namespaces:
   - {{ . }}
 {{- end }}
 {{- end }}
+{{- if and (.Values.enrollment | default dict).enabled (not .Values.rbac.create) }}
+
+Auto-enroll is on with rbac.create=false: grant the operator ServiceAccount
+get, create, and patch on Secrets in {{ .Release.Namespace }}.
+{{- end }}

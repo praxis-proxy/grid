@@ -151,6 +151,24 @@
           }
         }
       }
+    },
+    "invites": {
+      "type": "array",
+      "description": "Site invites minted after install or upgrade into Secrets grid-invite-<siteName>.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["siteName", "gridNetworkRef"],
+        "properties": {
+          "siteName": {
+            "type": "string",
+            "description": "Site name the token pins, a DNS label short enough for the Secret name.",
+            "pattern": "^[a-z0-9]([-a-z0-9]{0,49}[a-z0-9])?$"
+          },
+          "gridNetworkRef": { "type": "string", "minLength": 1 },
+          "expiresInSecs": { "type": "integer", "minimum": 1, "maximum": 604800 }
+        }
+      }
     }
   },
   "required": ["image", "ca", "serving", "enrollment", "db"]

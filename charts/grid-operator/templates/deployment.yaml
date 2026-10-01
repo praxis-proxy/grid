@@ -1,4 +1,5 @@
 {{- include "grid-operator.validateDigest" . }}
+{{- include "grid-operator.enrollment.validate" . }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -81,6 +82,13 @@ spec:
               value: {{ .Values.metrics.bindAddress | quote }}
             - name: RUST_LOG
               value: {{ .Values.log.level | quote }}
+            {{- with include "grid-operator.enrollment.env" . | trim }}
+            {{- . | nindent 12 }}
+            {{- end }}
+          {{- with include "grid-operator.enrollment.volumeMounts" . | trim }}
+          volumeMounts:
+            {{- . | nindent 12 }}
+          {{- end }}
           ports:
             - name: swim-udp
               containerPort: {{ splitList ":" .Values.swim.bindAddress | last }}
@@ -104,6 +112,10 @@ spec:
           resources:
             {{- toYaml . | nindent 12 }}
           {{- end }}
+      {{- with include "grid-operator.enrollment.volumes" . | trim }}
+      volumes:
+        {{- . | nindent 8 }}
+      {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

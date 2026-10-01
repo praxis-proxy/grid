@@ -74,6 +74,10 @@ Each override takes a Secret reference, so no key material is inlined in values.
 | `enrollment.authz` | `kube` (SAR, needs the sar-feature image) | `local` (standalone grid-admin token table) |
 | `enrollment.gridAdminTokens.existingSecretRef` | generated (local authz) | pre-created token Secret (name:token lines) |
 
+## Site invites
+
+Each `invites` entry (`siteName`, `gridNetworkRef`, optional `expiresInSecs` up to 604800) has a post-install and post-upgrade Job mint a one-time site token into Secret `grid-invite-<siteName>` (key `token`). The Job skips sites whose Secret already exists, so an upgrade mints only for new sites. Invites need `enrollment.authz=kube`. Before Helm 3.19, a failed invite run leaves its hook RBAC in place until the next run. [Site Enrollment](../../docs/installation/enrollment.md#invite-a-site-on-the-hub) covers delivery and revocation.
+
 ## Limitations
 
 The builtin Postgres serves TLS with a cert the bootstrap Job issues from the

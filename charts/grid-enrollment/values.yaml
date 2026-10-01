@@ -174,3 +174,6 @@ db:
     # sslrootcert=/etc/grid-db-ca/<key>.
     caConfigMapName: ""
     caConfigMapKey: ca.crt
+
+# -- Sites to invite. Each run skips sites whose invite Secret exists.
+invites: []
