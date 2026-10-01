@@ -144,6 +144,14 @@ pub struct ProviderState {
     /// Models served by this provider.
     pub models: Vec<String>,
 
+    /// MCP tools served by this provider.
+    ///
+    /// Non-empty for tool providers reconciled from `AgentToolProvider` CRDs.
+    /// Empty for inference providers. `#[serde(default)]` preserves
+    /// backward-compatible deserialization from peers that predate this field.
+    #[serde(default)]
+    pub tools: Vec<String>,
+
     /// Backend locality kind (`local`, `remote`, `cloud_managed`, `api_provider`).
     pub backend_kind: String,
 
@@ -416,6 +424,7 @@ mod tests {
             provider_id: provider_id.to_owned(),
             routing_cluster: site.to_owned(),
             models: vec!["model-x".to_owned()],
+            tools: Vec::new(),
             backend_kind: "local".to_owned(),
             capacity_weight: 1,
             phase: ProviderPhase::Available,
@@ -701,6 +710,85 @@ mod tests {
         assert_eq!(
             provider.capacity_weight, 1,
             "missing capacity_weight must retain equal-capacity behavior"
+        );
+    }
+
+    #[test]
+    fn tools_field_defaults_to_empty_when_absent() {
+        let json_without_tools = r#"{
+            "network_id": "net",
+            "site_id": "site-old",
+            "provider_id": "legacy-prov",
+            "routing_cluster": "site-old",
+            "models": ["model-a"],
+            "backend_kind": "local",
+            "phase": "Available",
+            "metrics": {},
+            "revision": 1,
+            "writer_id": "site-old"
+        }"#;
+        let provider: ProviderState =
+            serde_json::from_str(json_without_tools).unwrap_or_else(|_| std::process::abort());
+        assert!(
+            provider.tools.is_empty(),
+            "missing tools field must deserialize to empty Vec (backward compat)"
+        );
+    }
+
+    #[test]
+    fn tools_field_survives_json_round_trip() {
+        let state = ProviderState {
+            network_id: "net".to_owned(),
+            site_id: "site-a".to_owned(),
+            provider_id: "tool-prov".to_owned(),
+            routing_cluster: "site-a".to_owned(),
+            models: Vec::new(),
+            tools: vec!["search".to_owned(), "calculator".to_owned()],
+            backend_kind: String::new(),
+            capacity_weight: 1,
+            phase: ProviderPhase::Available,
+            metrics: ProviderMetricsSnapshot::default(),
+            access_policy: ProviderAccessPolicy::default(),
+            revision: 1,
+            writer_id: "site-a".to_owned(),
+        };
+        let json = serde_json::to_string(&state).unwrap_or_else(|_| std::process::abort());
+        let restored: ProviderState = serde_json::from_str(&json).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            restored.tools,
+            vec!["search", "calculator"],
+            "tools must survive JSON round-trip"
+        );
+    }
+
+    #[test]
+    fn tools_field_survives_bincode_round_trip() {
+        let mut snap = GridStateSnapshot::new("site-a".to_owned());
+        let mut state = provider("site-a", "tool-prov", 1, 0.0);
+        state.tools = vec!["web-search".to_owned(), "code-exec".to_owned()];
+        state.models = Vec::new();
+        snap.add_capability(Capability::Tool("web-search".to_owned()));
+        snap.upsert_provider(state);
+
+        let bytes =
+            bincode::serde::encode_to_vec(&snap, bincode::config::standard()).unwrap_or_else(|_| std::process::abort());
+        let (restored, _len): (GridStateSnapshot, usize) =
+            bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
+                .unwrap_or_else(|_| std::process::abort());
+
+        let restored_provider = restored
+            .provider("net", "site-a", "tool-prov")
+            .unwrap_or_else(|| std::process::abort());
+        assert_eq!(
+            restored_provider.tools,
+            vec!["web-search", "code-exec"],
+            "tools must survive bincode round-trip"
+        );
+        assert!(
+            restored
+                .capabilities
+                .contains(&Capability::Tool("web-search".to_owned())),
+            "Tool capability must survive bincode round-trip"
         );
     }
 

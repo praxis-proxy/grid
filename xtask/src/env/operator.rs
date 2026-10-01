@@ -54,6 +54,8 @@ pub(crate) const AGENT_TOOL_TEST_SITE: &str = "op-e2e-agent-tool-site";
 pub(crate) const AGENT_TOOL_TEST_PROVIDER_HEALTHY: &str = "op-e2e-agent-tool-healthy";
 /// Name of the `AgentToolProvider` pointed at a deliberately-unreachable endpoint.
 pub(crate) const AGENT_TOOL_TEST_PROVIDER_UNREACHABLE: &str = "op-e2e-agent-tool-unreachable";
+/// Gateway reference name for the `AgentToolProvider` convergence overlay check.
+pub(crate) const AGENT_TOOL_TEST_GATEWAY: &str = "op-e2e-agent-tool-gw";
 /// Name of the `InferenceProvider` with a blank endpoint (expected: reconciles to `Unavailable`).
 pub(crate) const TEST_PROVIDER_INVALID: &str = "op-e2e-invalid";
 /// Name of the `InferenceProvider` whose health probe returns non-2xx (expected: `Degraded`).
@@ -1038,16 +1040,22 @@ fn provider_fixture_json(
 /// Apply the minimal `GridNetwork` + `GridSite` fixtures the
 /// `AgentToolProvider` convergence check needs.
 ///
-/// Neither resource needs a `gatewayRef` or labels: `AgentToolProvider`'s
-/// default `siteSelector` matches every `GridSite` referencing the network,
-/// so a bare `GridSite` is enough to clear site-matching once the network
-/// exists.
+/// The `GridNetwork` includes a `gatewayRef` so the operator renders
+/// a routing overlay `ConfigMap` that the convergence check can
+/// inspect for `mcp_tool` candidates (grid#187).
 pub(crate) fn apply_agent_tool_provider_network_fixtures(context: &str) -> Result<(), Box<dyn std::error::Error>> {
     let network = serde_json::to_string_pretty(&serde_json::json!({
         "apiVersion": "grid.praxis-proxy.io/v1alpha1",
         "kind": "GridNetwork",
         "metadata": { "name": AGENT_TOOL_TEST_NETWORK },
-        "spec": {}
+        "spec": {
+            "seeds": [],
+            "gatewayRefs": [{
+                "name": AGENT_TOOL_TEST_GATEWAY,
+                "namespace": "default",
+                "localSiteName": AGENT_TOOL_TEST_SITE
+            }]
+        }
     }))
     .unwrap_or_else(|e| {
         eprintln!("AgentToolProvider GridNetwork fixture serialization failed: {e}");
@@ -1096,11 +1104,13 @@ pub(crate) fn apply_agent_tool_provider(
 ///
 /// Best-effort: errors are ignored, matching [`cleanup_validation_resources`].
 pub(crate) fn cleanup_agent_tool_provider_test_resources(context: &str) {
+    let overlay_cm = format!("grid-overlay-{AGENT_TOOL_TEST_NETWORK}-{AGENT_TOOL_TEST_GATEWAY}");
     for (kind, name) in [
         ("agenttoolproviders", AGENT_TOOL_TEST_PROVIDER_HEALTHY),
         ("agenttoolproviders", AGENT_TOOL_TEST_PROVIDER_UNREACHABLE),
         ("gridsites", AGENT_TOOL_TEST_SITE),
         ("gridnetworks", AGENT_TOOL_TEST_NETWORK),
+        ("configmaps", overlay_cm.as_str()),
     ] {
         drop(
             Command::new("kubectl")
@@ -2437,6 +2447,43 @@ pub(crate) fn verify_overlay(
         }
     }
     eprintln!("  [OK] overlay: {healthy_cluster} present, {excluded_cluster} absent");
+    Ok(())
+}
+
+/// Verify the overlay contains `mcp_tool` candidates matching `expected_tools`.
+///
+/// Asserts that each expected tool name appears as a candidate with
+/// `kind = "mcp_tool"` and that no unexpected `mcp_tool` candidates
+/// are present.
+pub(crate) fn verify_tool_provider_overlay(
+    overlay: &serde_json::Value,
+    expected_tools: &[&str],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let candidates = overlay["candidates"]
+        .as_array()
+        .ok_or("overlay missing candidates array")?;
+    let mcp_candidates: Vec<&serde_json::Value> = candidates
+        .iter()
+        .filter(|c| c["kind"].as_str() == Some("mcp_tool"))
+        .collect();
+    if mcp_candidates.is_empty() {
+        return Err("no mcp_tool candidates found in overlay".into());
+    }
+    let mut found: Vec<&str> = mcp_candidates.iter().filter_map(|c| c["name"].as_str()).collect();
+    found.sort_unstable();
+    let mut expected: Vec<&str> = expected_tools.to_vec();
+    expected.sort_unstable();
+    if found != expected {
+        return Err(format!("mcp_tool candidates mismatch: expected {expected:?}, got {found:?}").into());
+    }
+    for c in &mcp_candidates {
+        for field in &["kind", "name", "site", "cluster", "fresh"] {
+            if c.get(field).is_none() {
+                return Err(format!("mcp_tool candidate missing required field '{field}'").into());
+            }
+        }
+    }
+    eprintln!("  [OK] overlay contains mcp_tool candidates: {found:?}");
     Ok(())
 }
 

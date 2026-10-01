@@ -49,6 +49,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     crd::{
+        agent_tool_provider::AgentToolProvider,
         auth::{AccessPolicy, AuthStrategy},
         grid_network::GridNetwork,
         grid_site::GridSite,
@@ -70,6 +71,9 @@ const MAX_COMPONENT_PREFIX: usize = 20;
 
 /// Candidate kind identifier for inference model entries.
 const CANDIDATE_KIND: &str = "inference_model";
+
+/// Candidate kind identifier for MCP tool entries.
+const CANDIDATE_KIND_MCP_TOOL: &str = "mcp_tool";
 
 /// Fallback locality score when `backend_kind` is absent or unrecognised.
 ///
@@ -237,47 +241,57 @@ fn finite_or(value: Option<f64>, default: f64) -> f64 {
     value.filter(|v| v.is_finite()).unwrap_or(default)
 }
 
-/// Convert one remote CRDT provider record to [`RoutingCandidate`]s, one per model.
+/// Build a [`RoutingCandidate`] with no score, credential, or enrichment
+/// fields and `capacity_weight = 1`.
 ///
-/// Returns an empty `Vec` when the provider phase is
-/// [`crdt::ProviderPhase::Unavailable`] (excluded from routing) or when
-/// the provider has no models configured.
+/// Shared by [`remote_crdt_provider_to_candidates`] and
+/// [`candidates_from_tool_provider`] to avoid duplicating the
+/// [`RoutingCandidate`] field list.  Callers that need a different
+/// `capacity_weight` can override the field after construction.
+fn bare_candidate(kind: &str, name: &str, site: &str, cluster: &str, fresh: bool) -> RoutingCandidate {
+    RoutingCandidate {
+        kind: kind.to_owned(),
+        name: name.to_owned(),
+        site: site.to_owned(),
+        cluster: cluster.to_owned(),
+        fresh,
+        credential: None,
+        stable_id: None,
+        admission_state: None,
+        selection_tier: None,
+        score: None,
+        score_breakdown: None,
+        rank: None,
+        selection_group: None,
+        traffic_weight: None,
+        capacity_weight: 1,
+    }
+}
+
+/// Convert one remote CRDT provider record to [`RoutingCandidate`]s.
 ///
-/// The `site` and `cluster` fields are taken directly from the CRDT record:
-/// `site_id` → `candidate.site`; `routing_cluster` → `candidate.cluster`.
-///
-/// Remote CRDT providers do not carry credential references; `credential` is
-/// always `None`.  Credentials are a local-operator concern derived from
-/// `InferenceProvider.spec.auth`.
+/// Produces one candidate per model (`inference_model`) and one per
+/// tool (`mcp_tool`).  Returns an empty `Vec` when the provider phase
+/// is [`crdt::ProviderPhase::Unavailable`] or has no models/tools.
 pub(crate) fn remote_crdt_provider_to_candidates(provider: &crdt::ProviderState) -> Vec<RoutingCandidate> {
     let Some(fresh) = crdt_phase_to_fresh(&provider.phase) else {
         return Vec::new();
     };
-    let capacity_weight = if crdt::is_valid_capacity_weight(provider.capacity_weight) {
+    let cw = if crdt::is_valid_capacity_weight(provider.capacity_weight) {
         provider.capacity_weight
     } else {
         1
     };
+    let make = |kind: &str, name: &str| {
+        let mut c = bare_candidate(kind, name, &provider.site_id, &provider.routing_cluster, fresh);
+        c.capacity_weight = cw;
+        c
+    };
     provider
         .models
         .iter()
-        .map(|model| RoutingCandidate {
-            kind: CANDIDATE_KIND.to_owned(),
-            name: model.clone(),
-            site: provider.site_id.clone(),
-            cluster: provider.routing_cluster.clone(),
-            fresh,
-            credential: None,
-            stable_id: None,
-            admission_state: None,
-            selection_tier: None,
-            score: None,
-            score_breakdown: None,
-            rank: None,
-            selection_group: None,
-            traffic_weight: None,
-            capacity_weight,
-        })
+        .map(|m| make(CANDIDATE_KIND, m))
+        .chain(provider.tools.iter().map(|t| make(CANDIDATE_KIND_MCP_TOOL, t)))
         .collect()
 }
 
@@ -1191,12 +1205,13 @@ fn assign_selection_groups(candidates: &mut [RoutingCandidate], policy: crate::c
 /// [`InferenceProvider`]: crate::crd::inference_provider::InferenceProvider
 #[expect(
     clippy::too_many_arguments,
-    reason = "seven parameters represent distinct overlay inputs; a wrapper struct would obscure the data flow"
+    reason = "ten parameters represent distinct overlay inputs; a wrapper struct would obscure the data flow"
 )]
 pub fn render_routing_overlay(
     network: &GridNetwork,
     sites: &[GridSite],
     providers: &[InferenceProvider],
+    tool_providers: &[AgentToolProvider],
     remote_crdt_providers: &[crdt::ProviderState],
     local_site: &str,
     metrics: Option<&HashMap<&str, scoring::BackendMetrics>>,
@@ -1207,6 +1222,7 @@ pub fn render_routing_overlay(
         network,
         sites,
         providers,
+        tool_providers,
         remote_crdt_providers,
         local_site,
         metrics,
@@ -1226,7 +1242,7 @@ pub fn render_routing_overlay(
 /// metadata required to construct a valid routing candidate.
 #[expect(
     clippy::too_many_arguments,
-    reason = "admission states are a distinct control-plane input"
+    reason = "admission states and tool_providers are distinct control-plane inputs"
 )]
 #[expect(
     clippy::too_many_lines,
@@ -1236,6 +1252,7 @@ pub fn render_routing_overlay_with_admission(
     network: &GridNetwork,
     sites: &[GridSite],
     providers: &[InferenceProvider],
+    tool_providers: &[AgentToolProvider],
     remote_crdt_providers: &[crdt::ProviderState],
     local_site: &str,
     metrics: Option<&HashMap<&str, scoring::BackendMetrics>>,
@@ -1273,6 +1290,13 @@ pub fn render_routing_overlay_with_admission(
         .and_then(|site| site.metadata.labels.as_ref());
 
     let mut candidates = collect_candidates(network_name, sites, providers, consumer_site_labels)?;
+    candidates.extend(collect_tool_candidates(
+        network_name,
+        sites,
+        tool_providers,
+        consumer_site_labels,
+    ));
+
     for provider in remote_crdt_providers {
         let access_policy = crdt_access_policy_to_operator(&provider.access_policy);
         let access_result = evaluate_access_policy(&access_policy, consumer_site_labels);
@@ -1481,6 +1505,44 @@ fn collect_candidates(
     Ok(all)
 }
 
+/// Collect [`RoutingCandidate`]s from local [`AgentToolProvider`] resources.
+///
+/// Mirrors [`collect_candidates`] for inference providers: filters by
+/// network, evaluates access policy, and delegates per-provider candidate
+/// generation to [`candidates_from_tool_provider`].
+fn collect_tool_candidates(
+    network_name: &str,
+    sites: &[GridSite],
+    tool_providers: &[AgentToolProvider],
+    consumer_site_labels: Option<&BTreeMap<String, String>>,
+) -> Vec<RoutingCandidate> {
+    let network_sites: Vec<&GridSite> = sites
+        .iter()
+        .filter(|s| s.spec.grid_network_ref == network_name)
+        .collect();
+
+    let mut all = Vec::new();
+    for tool_provider in tool_providers {
+        if tool_provider.spec.grid_network_ref != network_name {
+            continue;
+        }
+        let access_result = evaluate_access_policy(&tool_provider.spec.access_policy, consumer_site_labels);
+        match access_result {
+            AccessPolicyResult::Allow | AccessPolicyResult::Unknown => {
+                all.extend(candidates_from_tool_provider(tool_provider, &network_sites));
+            },
+            AccessPolicyResult::Deny => {
+                tracing::debug!(
+                    provider = tool_provider.metadata.name.as_deref().unwrap_or("?"),
+                    network = network_name,
+                    "local tool provider access policy denied: consumer site labels do not match"
+                );
+            },
+        }
+    }
+    all
+}
+
 /// Resolve matching sites for a provider against the network site inventory.
 ///
 /// Returns [`SiteResolution::Unavailable`] when no site inventory exists,
@@ -1608,6 +1670,81 @@ fn is_explicitly_unavailable(provider: &InferenceProvider) -> bool {
         .status
         .as_ref()
         .is_some_and(|s| s.phase == ProviderPhase::Unavailable)
+}
+
+/// Extract tool names from an [`AgentToolProvider`], preferring
+/// `status.discoveredTools` over `spec.tools[].name`.
+fn tool_names_from_provider(provider: &AgentToolProvider) -> Vec<&str> {
+    provider
+        .status
+        .as_ref()
+        .filter(|s| !s.discovered_tools.is_empty())
+        .map_or_else(
+            || provider.spec.tools.iter().map(|t| t.name.as_str()).collect(),
+            |s| s.discovered_tools.iter().map(String::as_str).collect(),
+        )
+}
+
+/// Build [`RoutingCandidate`]s for a local [`AgentToolProvider`].
+///
+/// One candidate per `(tool, site)` pair with `kind = "mcp_tool"`.
+/// Tool names come from `status.discoveredTools` (live MCP probe),
+/// falling back to `spec.tools[].name`.
+/// Providers with [`ProviderPhase::Unavailable`] are excluded.
+fn candidates_from_tool_provider(provider: &AgentToolProvider, network_sites: &[&GridSite]) -> Vec<RoutingCandidate> {
+    let is_unavailable = provider
+        .status
+        .as_ref()
+        .is_some_and(|s| s.phase == ProviderPhase::Unavailable);
+    if is_unavailable {
+        return Vec::new();
+    }
+    let Some(provider_name) = provider.metadata.name.as_deref() else {
+        return Vec::new();
+    };
+    let tools = tool_names_from_provider(provider);
+    if tools.is_empty() {
+        return Vec::new();
+    }
+    let sites = resolve_tool_provider_sites(provider, provider_name, network_sites);
+    if sites.is_empty() {
+        return Vec::new();
+    }
+    // fresh is always true: Unavailable providers are excluded by the early return above.
+    sites
+        .iter()
+        .flat_map(|site| {
+            tools
+                .iter()
+                .map(move |tool| bare_candidate(CANDIDATE_KIND_MCP_TOOL, tool, site, provider_name, true))
+        })
+        .collect()
+}
+
+/// Resolve matching site names for an [`AgentToolProvider`].
+///
+/// When no sites are in the inventory, falls back to `provider_name`
+/// (Phase 1 self-hosted fallback). Returns an empty `Vec` when the
+/// selector matched nothing.
+fn resolve_tool_provider_sites<'prov>(
+    provider: &'prov AgentToolProvider,
+    provider_name: &'prov str,
+    network_sites: &[&GridSite],
+) -> Vec<String> {
+    if network_sites.is_empty() {
+        return vec![provider_name.to_owned()];
+    }
+    let selector = &provider.spec.site_selector.match_labels;
+    network_sites
+        .iter()
+        .filter(|site| {
+            let site_labels = site.metadata.labels.as_ref();
+            selector
+                .iter()
+                .all(|(k, v)| site_labels.is_some_and(|labels| labels.get(k).is_some_and(|sv| sv == v)))
+        })
+        .filter_map(|site| site.metadata.name.clone())
+        .collect()
 }
 
 /// Returns `true` when this provider's candidate data is considered fresh.
@@ -2020,6 +2157,7 @@ mod tests {
             &[],
             &[provider],
             &[],
+            &[],
             "site-a",
             None,
             None,
@@ -2045,6 +2183,7 @@ mod tests {
             &network,
             &[],
             &providers,
+            &[],
             &[],
             "site-a",
             None,
@@ -2078,6 +2217,7 @@ mod tests {
                 &network,
                 &[],
                 &[provider],
+                &[],
                 &[],
                 "site-a",
                 None,
@@ -2371,6 +2511,7 @@ mod tests {
             &[],
             &[api_prov, local_prov],
             &[],
+            &[],
             "test-site",
             None,
             None,
@@ -2397,6 +2538,7 @@ mod tests {
             &[],
             &[costly_prov, free_prov],
             &[],
+            &[],
             "test-site",
             None,
             None,
@@ -2420,6 +2562,7 @@ mod tests {
             &network,
             &[],
             &[p_z, p_a],
+            &[],
             &[],
             "test-site",
             None,
@@ -2449,6 +2592,7 @@ mod tests {
             &[],
             &[cloud, unknown],
             &[],
+            &[],
             "test-site",
             None,
             None,
@@ -2473,6 +2617,7 @@ mod tests {
             &network,
             &[],
             &[api, self_hosted],
+            &[],
             &[],
             "test-site",
             None,
@@ -2499,6 +2644,7 @@ mod tests {
             &[],
             &[local.clone(), api.clone()],
             &[],
+            &[],
             "test-site",
             None,
             None,
@@ -2509,6 +2655,7 @@ mod tests {
             &network,
             &[],
             &[api, local],
+            &[],
             &[],
             "test-site",
             None,
@@ -2536,6 +2683,7 @@ mod tests {
             &network,
             &[],
             &[remote, local],
+            &[],
             &[],
             "test-site",
             None,
@@ -2610,6 +2758,7 @@ mod tests {
             &[],
             &[remote_prov, local_prov],
             &[],
+            &[],
             "site-a",
             None,
             None,
@@ -2653,6 +2802,7 @@ mod tests {
             &[],
             &[local_down, api_fallback],
             &[],
+            &[],
             "site-a",
             None,
             None,
@@ -2694,6 +2844,7 @@ mod tests {
             &network,
             &[],
             &[api_ok, local_degraded],
+            &[],
             &[],
             "site-a",
             None,
@@ -2741,6 +2892,7 @@ mod tests {
             &[],
             &[api, cloud, remote, self_hosted],
             &[],
+            &[],
             "site-a",
             None,
             None,
@@ -2779,6 +2931,7 @@ mod tests {
             &[],
             &[local_down, api_always_available.clone()],
             &[],
+            &[],
             "site-a",
             None,
             None,
@@ -2802,6 +2955,7 @@ mod tests {
             &network,
             &[],
             &[local_up, api_always_available],
+            &[],
             &[],
             "site-a",
             None,
@@ -2836,6 +2990,7 @@ mod tests {
             &[],
             &[p1, p2],
             &[],
+            &[],
             "site-a",
             None,
             None,
@@ -2864,6 +3019,7 @@ mod tests {
             &network,
             &[],
             &[local_prov, api_prov],
+            &[],
             &[],
             "site-a",
             None,
@@ -2988,6 +3144,7 @@ mod tests {
             &[],
             &[api_prov, local_prov],
             &[],
+            &[],
             "test-site",
             None,
             None,
@@ -3014,6 +3171,7 @@ mod tests {
             &[],
             &[api, cloud, remote, local],
             &[],
+            &[],
             "test-site",
             None,
             None,
@@ -3039,6 +3197,7 @@ mod tests {
             &[],
             &[p_z, p_a],
             &[],
+            &[],
             "test-site",
             None,
             None,
@@ -3062,6 +3221,7 @@ mod tests {
             &[],
             &[local.clone(), api.clone()],
             &[],
+            &[],
             "test-site",
             None,
             None,
@@ -3072,6 +3232,7 @@ mod tests {
             &network,
             &[],
             &[api, local],
+            &[],
             &[],
             "test-site",
             None,
@@ -3099,6 +3260,7 @@ mod tests {
             &[],
             &[cloud, unknown],
             &[],
+            &[],
             "test-site",
             None,
             None,
@@ -3124,6 +3286,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
             "test-site",
             None,
             None,
@@ -3141,6 +3304,7 @@ mod tests {
             &network,
             &[],
             &[provider],
+            &[],
             &[],
             "test-site",
             None,
@@ -3163,6 +3327,7 @@ mod tests {
             &[],
             &[provider],
             &[],
+            &[],
             "test-site",
             None,
             None,
@@ -3181,6 +3346,7 @@ mod tests {
             &network,
             &[],
             &[p1, p2],
+            &[],
             &[],
             "test-site",
             None,
@@ -3208,6 +3374,7 @@ mod tests {
             &[],
             &[p1, p2],
             &[],
+            &[],
             "test-site",
             None,
             None,
@@ -3232,6 +3399,7 @@ mod tests {
             &[],
             &[p1.clone(), p2.clone()],
             &[],
+            &[],
             "test-site",
             None,
             None,
@@ -3242,6 +3410,7 @@ mod tests {
             &network,
             &[],
             &[p2, p1],
+            &[],
             &[],
             "test-site",
             None,
@@ -3266,6 +3435,7 @@ mod tests {
             &[],
             &[provider],
             &[],
+            &[],
             "test-site",
             None,
             None,
@@ -3288,6 +3458,7 @@ mod tests {
             &network,
             &[site_a, site_b],
             &[provider],
+            &[],
             &[],
             "test-site",
             None,
@@ -3316,6 +3487,7 @@ mod tests {
             &[matching_site, non_matching_site],
             &[provider],
             &[],
+            &[],
             "test-site",
             None,
             None,
@@ -3342,6 +3514,7 @@ mod tests {
             &network,
             &[site_other],
             &[provider],
+            &[],
             &[],
             "test-site",
             None,
@@ -3374,6 +3547,7 @@ mod tests {
             &[site_cpu],
             &[provider],
             &[],
+            &[],
             "test-site",
             None,
             None,
@@ -3398,6 +3572,7 @@ mod tests {
             &network,
             &[site],
             &[p1, p2],
+            &[],
             &[],
             "test-site",
             None,
@@ -3424,6 +3599,7 @@ mod tests {
             &network,
             &[site],
             &[provider],
+            &[],
             &[],
             "test-site",
             None,
@@ -3488,6 +3664,7 @@ mod tests {
             &[],
             &[provider],
             &[],
+            &[],
             "test-site",
             None,
             None,
@@ -3505,6 +3682,7 @@ mod tests {
             &network,
             &[],
             &[provider],
+            &[],
             &[],
             "test-site",
             None,
@@ -3527,6 +3705,7 @@ mod tests {
             &network,
             &[],
             &[provider],
+            &[],
             &[],
             "test-site",
             None,
@@ -3554,6 +3733,7 @@ mod tests {
             &[],
             &[provider],
             &[],
+            &[],
             "test-site",
             None,
             None,
@@ -3579,6 +3759,7 @@ mod tests {
             &network,
             &[],
             &[provider],
+            &[],
             &[],
             "test-site",
             None,
@@ -3607,6 +3788,7 @@ mod tests {
             &[],
             &[provider],
             &[],
+            &[],
             "test-site",
             None,
             None,
@@ -3631,6 +3813,7 @@ mod tests {
             &network,
             &[],
             &[available, degraded],
+            &[],
             &[],
             "test-site",
             None,
@@ -3664,6 +3847,7 @@ mod tests {
             &[],
             &[provider],
             &[],
+            &[],
             "test-site",
             None,
             None,
@@ -3694,6 +3878,7 @@ mod tests {
             &network,
             &[site_a, site_b],
             &[provider],
+            &[],
             &[],
             "test-site",
             None,
@@ -3726,6 +3911,7 @@ mod tests {
             &network,
             &[],
             &[stale, healthy],
+            &[],
             &[],
             "test-site",
             None,
@@ -3761,6 +3947,7 @@ mod tests {
             &[],
             &[stale],
             &[],
+            &[],
             "test-site",
             None,
             None,
@@ -3791,6 +3978,7 @@ mod tests {
             &network,
             &[],
             &[local_healthy],
+            &[],
             &[remote_stale],
             "test-site",
             None,
@@ -3819,6 +4007,7 @@ mod tests {
             &[],
             &[stale.clone(), healthy.clone()],
             &[],
+            &[],
             "test-site",
             None,
             None,
@@ -3830,6 +4019,7 @@ mod tests {
             &network,
             &[],
             &[healthy, stale],
+            &[],
             &[],
             "test-site",
             None,
@@ -3868,6 +4058,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
             "test-site",
             None,
             None,
@@ -3887,6 +4078,7 @@ mod tests {
         let network = test_network("net");
         let overlay = render_routing_overlay(
             &network,
+            &[],
             &[],
             &[],
             &[],
@@ -3920,6 +4112,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
             "test-site",
             None,
             None,
@@ -3941,6 +4134,7 @@ mod tests {
         let network = test_network("net");
         let overlay = render_routing_overlay(
             &network,
+            &[],
             &[],
             &[],
             &[],
@@ -4007,6 +4201,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
             "site-a",
             None,
             None,
@@ -4027,6 +4222,7 @@ mod tests {
         let network = test_network("my-net");
         let overlay = render_routing_overlay(
             &network,
+            &[],
             &[],
             &[],
             &[],
@@ -4052,6 +4248,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
             "site-a",
             None,
             None,
@@ -4060,6 +4257,7 @@ mod tests {
         .unwrap_or_else(|_| std::process::abort());
         let overlay_b = render_routing_overlay(
             &network,
+            &[],
             &[],
             &[],
             &[],
@@ -4085,6 +4283,7 @@ mod tests {
             &network,
             &[],
             &[provider],
+            &[],
             &[],
             "test-site",
             None,
@@ -4130,6 +4329,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
             "local",
             None,
             None,
@@ -4159,6 +4359,7 @@ mod tests {
             &network,
             &[],
             &[provider],
+            &[],
             &[],
             "local",
             None,
@@ -4282,6 +4483,7 @@ mod tests {
             &[],
             &[a, b],
             &[],
+            &[],
             "gw",
             Some(&metrics),
             None,
@@ -4322,6 +4524,7 @@ mod tests {
             &[],
             &[a, b],
             &[],
+            &[],
             "gw",
             Some(&metrics),
             None,
@@ -4359,6 +4562,7 @@ mod tests {
             &[],
             &[remote, local],
             &[],
+            &[],
             "prov-local",
             Some(&metrics),
             None,
@@ -4394,6 +4598,7 @@ mod tests {
             &[],
             &[saturated, healthy],
             &[],
+            &[],
             "gw",
             Some(&metrics),
             None,
@@ -4423,6 +4628,7 @@ mod tests {
             &network,
             &[],
             &[available, unavailable],
+            &[],
             &[],
             "gw",
             None,
@@ -4459,6 +4665,7 @@ mod tests {
             &network,
             &[],
             &[a, b],
+            &[],
             &[],
             "gw",
             Some(&metrics),
@@ -4504,6 +4711,7 @@ mod tests {
             &[],
             &[busy, idle],
             &[],
+            &[],
             "local-gw",
             Some(&metrics),
             None,
@@ -4534,6 +4742,7 @@ mod tests {
             &[],
             &[api.clone(), local.clone()],
             &[],
+            &[],
             "gw",
             None,
             None,
@@ -4545,6 +4754,7 @@ mod tests {
             &network,
             &[],
             &[api, local],
+            &[],
             &[],
             "gw",
             Some(&HashMap::new()),
@@ -4584,6 +4794,7 @@ mod tests {
             &network,
             &[],
             &[known, unmapped],
+            &[],
             &[],
             "gw",
             Some(&metrics),
@@ -4665,6 +4876,7 @@ mod tests {
             &[],
             &[local, remote],
             &[],
+            &[],
             "gw",
             Some(&metrics),
             None,
@@ -4700,6 +4912,7 @@ mod tests {
             &[],
             &[local, remote],
             &[],
+            &[],
             "gw",
             Some(&metrics),
             None,
@@ -4724,6 +4937,7 @@ mod tests {
             &network,
             &[],
             &[local, api],
+            &[],
             &[],
             "gw",
             None,
@@ -4761,6 +4975,7 @@ mod tests {
             &network,
             &[],
             &[saturated, healthy],
+            &[],
             &[],
             "gw",
             Some(&metrics),
@@ -4801,6 +5016,7 @@ mod tests {
             &network,
             &[],
             &[local],
+            &[],
             &[],
             "gw",
             Some(&metrics),
@@ -4846,6 +5062,7 @@ mod tests {
             &[],
             &providers,
             &[],
+            &[],
             "gw",
             None,
             None,
@@ -4856,6 +5073,7 @@ mod tests {
             &geo_policy,
             &[],
             &providers,
+            &[],
             &[],
             "gw",
             None,
@@ -4892,6 +5110,7 @@ mod tests {
             &network,
             &[],
             &[local, remote],
+            &[],
             &[],
             "local-site",
             Some(&metrics),
@@ -4974,6 +5193,7 @@ mod tests {
             &[],
             &[provider],
             &[],
+            &[],
             "test-site",
             None,
             None,
@@ -4997,6 +5217,7 @@ mod tests {
             &network,
             &[],
             &[provider],
+            &[],
             &[],
             "test-site",
             None,
@@ -5033,6 +5254,7 @@ mod tests {
             &[],
             &[provider],
             &[],
+            &[],
             "test-site",
             None,
             None,
@@ -5058,6 +5280,7 @@ mod tests {
             &network,
             &[],
             &[p1, p2],
+            &[],
             &[],
             "test-site",
             None,
@@ -5095,6 +5318,7 @@ mod tests {
             &[],
             &[provider],
             &[],
+            &[],
             "test-site",
             None,
             None,
@@ -5129,6 +5353,7 @@ mod tests {
             &network,
             &[],
             &[provider],
+            &[],
             &[],
             "test-site",
             None,
@@ -5170,6 +5395,7 @@ mod tests {
             &network,
             &[],
             &[api_provider, local_with_ref],
+            &[],
             &[],
             "test-site",
             None,
@@ -5258,6 +5484,7 @@ mod tests {
             provider_id: "prov-1".to_owned(),
             routing_cluster: routing_cluster.to_owned(),
             models: models.iter().map(|m| (*m).to_owned()).collect(),
+            tools: Vec::new(),
             backend_kind: "local".to_owned(),
             capacity_weight: 1,
             phase,
@@ -5500,6 +5727,7 @@ mod tests {
             &network,
             &[],
             &[],
+            &[],
             &[remote],
             "local-site",
             None,
@@ -5533,6 +5761,7 @@ mod tests {
         );
         let overlay = render_routing_overlay(
             &network,
+            &[],
             &[],
             &[],
             &[unavailable],
@@ -5653,6 +5882,7 @@ mod tests {
             &[],
             &[provider],
             &[],
+            &[],
             "site-a",
             None,
             None,
@@ -5678,6 +5908,7 @@ mod tests {
             &network,
             &[],
             &[provider],
+            &[],
             &[],
             "site-a",
             None,
@@ -5718,6 +5949,7 @@ mod tests {
             &[],
             &[provider],
             &[],
+            &[],
             "site-a",
             None,
             None,
@@ -5745,6 +5977,7 @@ mod tests {
             &network,
             &[],
             &[provider],
+            &[],
             &[],
             "site-a",
             None,
@@ -5897,6 +6130,7 @@ mod tests {
             provider_id: "prov".to_owned(),
             routing_cluster: site_id.to_owned(),
             models: vec!["model".to_owned()],
+            tools: Vec::new(),
             backend_kind: "remote".to_owned(),
             capacity_weight: 1,
             phase: crdt::ProviderPhase::Available,
@@ -6103,6 +6337,7 @@ mod tests {
             &[],
             &[local_prov],
             &[],
+            &[],
             "local-site",
             None,
             None,
@@ -6157,6 +6392,7 @@ mod tests {
             provider_id: provider_id.to_owned(),
             routing_cluster: provider_id.to_owned(),
             models: vec!["model-remote".to_owned()],
+            tools: Vec::new(),
             backend_kind: "remote".to_owned(),
             capacity_weight: 1,
             phase: crdt::ProviderPhase::Available,
@@ -6321,6 +6557,7 @@ mod tests {
             &[site_prod.clone(), site_staging.clone()],
             std::slice::from_ref(&provider),
             &[],
+            &[],
             "site-prod",
             None,
             None,
@@ -6341,6 +6578,7 @@ mod tests {
             &network,
             &[site_prod, site_staging],
             &[provider],
+            &[],
             &[],
             "site-staging",
             None,
@@ -6371,6 +6609,7 @@ mod tests {
             &[site_prod.clone(), site_staging.clone()],
             std::slice::from_ref(&provider),
             &[],
+            &[],
             "site-prod",
             None,
             None,
@@ -6392,6 +6631,7 @@ mod tests {
             &network,
             &[site_prod, site_staging],
             &[provider],
+            &[],
             &[],
             "site-staging",
             None,
@@ -6426,6 +6666,7 @@ mod tests {
             std::slice::from_ref(&site_prod),
             std::slice::from_ref(&provider),
             &[],
+            &[],
             "site-prod",
             None,
             None,
@@ -6444,6 +6685,7 @@ mod tests {
             &[site_prod.clone(), site_wrong_env.clone()],
             std::slice::from_ref(&provider),
             &[],
+            &[],
             "site-staging",
             None,
             None,
@@ -6461,6 +6703,7 @@ mod tests {
             &network,
             &[site_prod, site_wrong_env, site_wrong_team],
             &[provider],
+            &[],
             &[],
             "site-other",
             None,
@@ -6489,6 +6732,7 @@ mod tests {
             &network,
             &[site],
             &[provider_restricted, provider_unrestricted],
+            &[],
             &[],
             "unknown-site",
             None,
@@ -6537,6 +6781,7 @@ mod tests {
                 provider_platform_only.clone(),
             ],
             &[],
+            &[],
             "site-prod",
             None,
             None,
@@ -6565,6 +6810,7 @@ mod tests {
             &network,
             &[site_staging],
             &[provider_unrestricted, provider_prod_only, provider_platform_only],
+            &[],
             &[],
             "site-staging",
             None,
@@ -6609,6 +6855,7 @@ mod tests {
             &[site_prod],
             std::slice::from_ref(&provider),
             &[],
+            &[],
             "site-prod",
             None,
             None,
@@ -6638,6 +6885,7 @@ mod tests {
             std::slice::from_ref(&site_prod),
             std::slice::from_ref(&provider),
             &[],
+            &[],
             "site-prod",
             None,
             None,
@@ -6655,6 +6903,7 @@ mod tests {
             &network,
             &[site_prod, site_staging],
             std::slice::from_ref(&provider),
+            &[],
             &[],
             "site-staging",
             None,
@@ -6686,6 +6935,7 @@ mod tests {
             &[site_wrong],
             std::slice::from_ref(&provider),
             &[],
+            &[],
             "site-wrong",
             None,
             None,
@@ -6713,6 +6963,7 @@ mod tests {
             &network,
             &[site],
             &[provider_restricted, provider_unrestricted],
+            &[],
             &[],
             "unknown-site",
             None,
@@ -6744,6 +6995,7 @@ mod tests {
         let overlay = render_routing_overlay(
             &network,
             &[site_prod],
+            &[],
             &[],
             std::slice::from_ref(&remote_provider),
             "site-prod",
@@ -6778,6 +7030,7 @@ mod tests {
             &network,
             std::slice::from_ref(&site_prod),
             &[],
+            &[],
             std::slice::from_ref(&remote_provider),
             "site-prod",
             None,
@@ -6795,6 +7048,7 @@ mod tests {
         let overlay_denied = render_routing_overlay(
             &network,
             &[site_prod, site_staging],
+            &[],
             &[],
             std::slice::from_ref(&remote_provider),
             "site-staging",
@@ -6825,6 +7079,7 @@ mod tests {
             &network,
             &[site_wrong],
             &[],
+            &[],
             std::slice::from_ref(&remote_provider),
             "site-wrong",
             None,
@@ -6852,6 +7107,7 @@ mod tests {
         let overlay = render_routing_overlay(
             &network,
             &[site],
+            &[],
             &[],
             &[remote_restricted, remote_unrestricted],
             "unknown-site",
@@ -6949,6 +7205,7 @@ mod tests {
             &[site_a, site_b, site_c],
             &[prov_local, prov_remote],
             &[],
+            &[],
             "site-a",
             Some(&metrics),
             None,
@@ -6993,6 +7250,7 @@ mod tests {
             &network,
             &[site_a, site_b, site_c],
             &[prov_a, prov_b, prov_c],
+            &[],
             &[],
             "site-a",
             Some(&metrics),
@@ -7042,6 +7300,7 @@ mod tests {
             &[site_a, site_b],
             &[prov_healthy, prov_dead],
             &[],
+            &[],
             "site-a",
             Some(&metrics),
             None,
@@ -7066,6 +7325,7 @@ mod tests {
             &network,
             &[],
             &[prov_local, prov_api],
+            &[],
             &[],
             "local-gw",
             None,
@@ -7107,6 +7367,7 @@ mod tests {
             &[site_a, site_b, site_c],
             &[prov_a, prov_b, prov_c],
             &[],
+            &[],
             "site-a",
             None,
             None,
@@ -7138,6 +7399,7 @@ mod tests {
             &network,
             &[site_a],
             &[prov],
+            &[],
             &[],
             "site-a",
             None,
@@ -7206,6 +7468,7 @@ mod tests {
             &[],
             &[prov],
             &[],
+            &[],
             "net",
             None,
             Some(ts),
@@ -7237,6 +7500,7 @@ mod tests {
             &network,
             &[site_a, site_b],
             &[prov],
+            &[],
             &[],
             "site-a",
             None,
@@ -7273,6 +7537,7 @@ mod tests {
             &[site_a],
             &[prov],
             &[],
+            &[],
             "site-a",
             Some(&metrics),
             None,
@@ -7292,5 +7557,567 @@ mod tests {
             Some("existing_only"),
             "ExistingOnly must serialize as existing_only"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // AgentToolProvider: test fixtures
+    // -----------------------------------------------------------------------
+
+    /// Build an [`AgentToolProvider`] with spec-defined tools and no status.
+    fn test_tool_provider(name: &str, network: &str, tools: &[&str]) -> AgentToolProvider {
+        let tools_json: Vec<serde_json::Value> = tools.iter().map(|t| serde_json::json!({ "name": t })).collect();
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "kind": "AgentToolProvider",
+            "metadata": { "name": name },
+            "spec": {
+                "gridNetworkRef": network,
+                "endpoint": "http://localhost:9090",
+                "tools": tools_json
+            }
+        }))
+        .unwrap_or_else(|_| std::process::abort())
+    }
+
+    /// Build an [`AgentToolProvider`] with discovered tools in status.
+    fn test_tool_provider_with_discovered(
+        name: &str,
+        network: &str,
+        spec_tools: &[&str],
+        discovered: &[&str],
+    ) -> AgentToolProvider {
+        let tools_json: Vec<serde_json::Value> = spec_tools.iter().map(|t| serde_json::json!({ "name": t })).collect();
+        let discovered_json: Vec<&str> = discovered.to_vec();
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "kind": "AgentToolProvider",
+            "metadata": { "name": name },
+            "spec": {
+                "gridNetworkRef": network,
+                "endpoint": "http://localhost:9090",
+                "tools": tools_json
+            },
+            "status": {
+                "discoveredTools": discovered_json,
+                "phase": "Available",
+                "matchingSites": [],
+                "observedGeneration": 1
+            }
+        }))
+        .unwrap_or_else(|_| std::process::abort())
+    }
+
+    /// Build an [`AgentToolProvider`] with a specific phase.
+    fn test_tool_provider_with_phase(name: &str, network: &str, tools: &[&str], phase: &str) -> AgentToolProvider {
+        let tools_json: Vec<serde_json::Value> = tools.iter().map(|t| serde_json::json!({ "name": t })).collect();
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "kind": "AgentToolProvider",
+            "metadata": { "name": name },
+            "spec": {
+                "gridNetworkRef": network,
+                "endpoint": "http://localhost:9090",
+                "tools": tools_json
+            },
+            "status": {
+                "discoveredTools": [],
+                "phase": phase,
+                "matchingSites": [],
+                "observedGeneration": 1
+            }
+        }))
+        .unwrap_or_else(|_| std::process::abort())
+    }
+
+    /// Build an [`AgentToolProvider`] with a site selector.
+    fn test_tool_provider_with_selector(
+        name: &str,
+        network: &str,
+        tools: &[&str],
+        selector: &[(&str, &str)],
+    ) -> AgentToolProvider {
+        let tools_json: Vec<serde_json::Value> = tools.iter().map(|t| serde_json::json!({ "name": t })).collect();
+        let match_labels: serde_json::Map<String, serde_json::Value> = selector
+            .iter()
+            .map(|(k, v)| (k.to_string(), serde_json::Value::String(v.to_string())))
+            .collect();
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "kind": "AgentToolProvider",
+            "metadata": { "name": name },
+            "spec": {
+                "gridNetworkRef": network,
+                "endpoint": "http://localhost:9090",
+                "tools": tools_json,
+                "siteSelector": { "matchLabels": match_labels }
+            }
+        }))
+        .unwrap_or_else(|_| std::process::abort())
+    }
+
+    /// Build an [`AgentToolProvider`] with an access policy.
+    fn test_tool_provider_with_access_policy(
+        name: &str,
+        network: &str,
+        tools: &[&str],
+        access_policy_labels: &[(&str, &str)],
+    ) -> AgentToolProvider {
+        let tools_json: Vec<serde_json::Value> = tools.iter().map(|t| serde_json::json!({ "name": t })).collect();
+        let match_labels: serde_json::Map<String, serde_json::Value> = access_policy_labels
+            .iter()
+            .map(|(k, v)| (k.to_string(), serde_json::Value::String(v.to_string())))
+            .collect();
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "kind": "AgentToolProvider",
+            "metadata": { "name": name },
+            "spec": {
+                "gridNetworkRef": network,
+                "endpoint": "http://localhost:9090",
+                "tools": tools_json,
+                "accessPolicy": { "siteSelector": { "matchLabels": match_labels } }
+            }
+        }))
+        .unwrap_or_else(|_| std::process::abort())
+    }
+
+    // -----------------------------------------------------------------------
+    // remote_crdt_provider_to_candidates — tool candidates
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn crdt_provider_with_tools_emits_mcp_tool_candidates() {
+        let provider = crdt::ProviderState {
+            network_id: "net".to_owned(),
+            site_id: "site-a".to_owned(),
+            provider_id: "tool-prov".to_owned(),
+            routing_cluster: "tool-prov".to_owned(),
+            models: Vec::new(),
+            tools: vec!["search".to_owned(), "calculator".to_owned()],
+            backend_kind: String::new(),
+            capacity_weight: 1,
+            phase: crdt::ProviderPhase::Available,
+            metrics: crdt::ProviderMetricsSnapshot::default(),
+            access_policy: crdt::ProviderAccessPolicy::default(),
+            revision: 1,
+            writer_id: "site-a".to_owned(),
+        };
+        let candidates = remote_crdt_provider_to_candidates(&provider);
+        assert_eq!(candidates.len(), 2, "one candidate per tool");
+        assert!(
+            candidates.iter().all(|c| c.kind == CANDIDATE_KIND_MCP_TOOL),
+            "all candidates must be mcp_tool kind"
+        );
+        let names: Vec<&str> = candidates.iter().map(|c| c.name.as_str()).collect();
+        assert!(names.contains(&"search"), "must include search tool");
+        assert!(names.contains(&"calculator"), "must include calculator tool");
+        assert!(
+            candidates
+                .iter()
+                .all(|c| c.site == "site-a" && c.cluster == "tool-prov"),
+            "site and cluster must come from CRDT record"
+        );
+    }
+
+    #[test]
+    fn crdt_provider_with_models_and_tools_emits_both_kinds() {
+        let provider = crdt::ProviderState {
+            network_id: "net".to_owned(),
+            site_id: "site-b".to_owned(),
+            provider_id: "hybrid-prov".to_owned(),
+            routing_cluster: "hybrid-prov".to_owned(),
+            models: vec!["llama-3".to_owned()],
+            tools: vec!["web-search".to_owned()],
+            backend_kind: "local".to_owned(),
+            capacity_weight: 1,
+            phase: crdt::ProviderPhase::Available,
+            metrics: crdt::ProviderMetricsSnapshot::default(),
+            access_policy: crdt::ProviderAccessPolicy::default(),
+            revision: 1,
+            writer_id: "site-b".to_owned(),
+        };
+        let candidates = remote_crdt_provider_to_candidates(&provider);
+        assert_eq!(candidates.len(), 2, "one model + one tool");
+        assert_eq!(candidates[0].kind, CANDIDATE_KIND, "first must be inference_model");
+        assert_eq!(candidates[0].name, "llama-3");
+        assert_eq!(candidates[1].kind, CANDIDATE_KIND_MCP_TOOL, "second must be mcp_tool");
+        assert_eq!(candidates[1].name, "web-search");
+    }
+
+    #[test]
+    fn crdt_provider_unavailable_emits_no_tool_candidates() {
+        let provider = crdt::ProviderState {
+            network_id: "net".to_owned(),
+            site_id: "site-a".to_owned(),
+            provider_id: "dead-prov".to_owned(),
+            routing_cluster: "dead-prov".to_owned(),
+            models: Vec::new(),
+            tools: vec!["tool-x".to_owned()],
+            backend_kind: String::new(),
+            capacity_weight: 1,
+            phase: crdt::ProviderPhase::Unavailable,
+            metrics: crdt::ProviderMetricsSnapshot::default(),
+            access_policy: crdt::ProviderAccessPolicy::default(),
+            revision: 1,
+            writer_id: "site-a".to_owned(),
+        };
+        let candidates = remote_crdt_provider_to_candidates(&provider);
+        assert!(candidates.is_empty(), "unavailable provider must produce no candidates");
+    }
+
+    #[test]
+    fn crdt_provider_capacity_weight_propagates_to_tool_candidates() {
+        let provider = crdt::ProviderState {
+            network_id: "net".to_owned(),
+            site_id: "site-a".to_owned(),
+            provider_id: "weighted-prov".to_owned(),
+            routing_cluster: "weighted-prov".to_owned(),
+            models: Vec::new(),
+            tools: vec!["tool-y".to_owned()],
+            backend_kind: String::new(),
+            capacity_weight: 42,
+            phase: crdt::ProviderPhase::Available,
+            metrics: crdt::ProviderMetricsSnapshot::default(),
+            access_policy: crdt::ProviderAccessPolicy::default(),
+            revision: 1,
+            writer_id: "site-a".to_owned(),
+        };
+        let candidates = remote_crdt_provider_to_candidates(&provider);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            candidates[0].capacity_weight, 42,
+            "capacity_weight must propagate from CRDT record"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // candidates_from_tool_provider — local tool provider candidates
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn local_tool_provider_emits_mcp_tool_candidates_from_spec() {
+        let provider = test_tool_provider("mcp-server", "net", &["search", "translate"]);
+        let site = test_site("site-a", "net");
+        let candidates = candidates_from_tool_provider(&provider, &[&site]);
+        assert_eq!(candidates.len(), 2, "one candidate per tool");
+        assert!(
+            candidates.iter().all(|c| c.kind == CANDIDATE_KIND_MCP_TOOL),
+            "all must be mcp_tool"
+        );
+        let names: Vec<&str> = candidates.iter().map(|c| c.name.as_str()).collect();
+        assert!(names.contains(&"search"));
+        assert!(names.contains(&"translate"));
+    }
+
+    #[test]
+    fn local_tool_provider_prefers_discovered_tools_over_spec() {
+        let provider = test_tool_provider_with_discovered(
+            "mcp-server",
+            "net",
+            &["spec-tool-a", "spec-tool-b"],
+            &["discovered-x", "discovered-y", "discovered-z"],
+        );
+        let site = test_site("site-a", "net");
+        let candidates = candidates_from_tool_provider(&provider, &[&site]);
+        assert_eq!(candidates.len(), 3, "must use discovered tools, not spec");
+        let names: Vec<&str> = candidates.iter().map(|c| c.name.as_str()).collect();
+        assert!(names.contains(&"discovered-x"));
+        assert!(names.contains(&"discovered-y"));
+        assert!(names.contains(&"discovered-z"));
+    }
+
+    #[test]
+    fn local_tool_provider_falls_back_to_spec_when_discovered_empty() {
+        let provider = test_tool_provider_with_discovered("mcp-server", "net", &["fallback-tool"], &[]);
+        let site = test_site("site-a", "net");
+        let candidates = candidates_from_tool_provider(&provider, &[&site]);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].name, "fallback-tool", "must fall back to spec.tools");
+    }
+
+    #[test]
+    fn local_tool_provider_unavailable_excluded() {
+        let provider = test_tool_provider_with_phase("dead-mcp", "net", &["tool-a"], "Unavailable");
+        let site = test_site("site-a", "net");
+        let candidates = candidates_from_tool_provider(&provider, &[&site]);
+        assert!(candidates.is_empty(), "unavailable tool provider must be excluded");
+    }
+
+    #[test]
+    fn local_tool_provider_no_tools_emits_nothing() {
+        let provider = test_tool_provider("empty-mcp", "net", &[]);
+        let site = test_site("site-a", "net");
+        let candidates = candidates_from_tool_provider(&provider, &[&site]);
+        assert!(
+            candidates.is_empty(),
+            "provider with no tools must produce no candidates"
+        );
+    }
+
+    #[test]
+    fn local_tool_provider_candidates_are_always_fresh() {
+        let provider = test_tool_provider("mcp-server", "net", &["tool-a"]);
+        let site = test_site("site-a", "net");
+        let candidates = candidates_from_tool_provider(&provider, &[&site]);
+        assert_eq!(candidates.len(), 1);
+        assert!(
+            candidates[0].fresh,
+            "non-unavailable tool provider must produce fresh candidates"
+        );
+    }
+
+    #[test]
+    fn local_tool_provider_site_selector_matches_labelled_site() {
+        let provider = test_tool_provider_with_selector("mcp-server", "net", &["tool-a"], &[("region", "us-west")]);
+        let site_match = test_site_with_labels("site-west", "net", &[("region", "us-west")]);
+        let site_miss = test_site_with_labels("site-east", "net", &[("region", "us-east")]);
+        let candidates = candidates_from_tool_provider(&provider, &[&site_match, &site_miss]);
+        assert_eq!(candidates.len(), 1, "must match only the labelled site");
+        assert_eq!(candidates[0].site, "site-west");
+    }
+
+    #[test]
+    fn local_tool_provider_emits_candidate_per_site_per_tool() {
+        let provider = test_tool_provider("mcp-server", "net", &["tool-a", "tool-b"]);
+        let site_a = test_site("site-a", "net");
+        let site_b = test_site("site-b", "net");
+        let candidates = candidates_from_tool_provider(&provider, &[&site_a, &site_b]);
+        assert_eq!(candidates.len(), 4, "2 tools x 2 sites = 4 candidates");
+    }
+
+    // -----------------------------------------------------------------------
+    // collect_tool_candidates — access policy filtering
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn collect_tool_candidates_unrestricted_allows_all() {
+        let site = test_site_with_labels("site-a", "net", &[("env", "prod")]);
+        let provider = test_tool_provider("mcp-server", "net", &["tool-a"]);
+        let consumer_labels = test_site_labels(&[("env", "prod")]);
+        let candidates = collect_tool_candidates("net", &[site], &[provider], Some(&consumer_labels));
+        assert_eq!(
+            candidates.len(),
+            1,
+            "unrestricted tool provider must allow all consumers"
+        );
+    }
+
+    #[test]
+    fn collect_tool_candidates_denied_by_access_policy() {
+        let site = test_site_with_labels("site-a", "net", &[("env", "prod")]);
+        let provider = test_tool_provider_with_access_policy("mcp-server", "net", &["tool-a"], &[("env", "staging")]);
+        let consumer_labels = test_site_labels(&[("env", "prod")]);
+        let candidates = collect_tool_candidates("net", &[site], &[provider], Some(&consumer_labels));
+        assert!(candidates.is_empty(), "denied consumer must get no tool candidates");
+    }
+
+    #[test]
+    fn collect_tool_candidates_allowed_by_matching_policy() {
+        let site = test_site_with_labels("site-a", "net", &[("env", "prod")]);
+        let provider = test_tool_provider_with_access_policy("mcp-server", "net", &["tool-a"], &[("env", "prod")]);
+        let consumer_labels = test_site_labels(&[("env", "prod")]);
+        let candidates = collect_tool_candidates("net", &[site], &[provider], Some(&consumer_labels));
+        assert_eq!(candidates.len(), 1, "matching access policy must allow consumer");
+    }
+
+    #[test]
+    fn collect_tool_candidates_skips_wrong_network() {
+        let site = test_site("site-a", "net");
+        let provider = test_tool_provider("mcp-server", "other-net", &["tool-a"]);
+        let candidates = collect_tool_candidates("net", &[site], &[provider], None);
+        assert!(
+            candidates.is_empty(),
+            "tool provider on different network must be skipped"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // render_routing_overlay — full pipeline with tool providers
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn overlay_includes_mcp_tool_candidates_from_local_tool_provider() {
+        let network = test_network("net");
+        let site = test_site("site-a", "net");
+        let tool_provider = test_tool_provider("mcp-server", "net", &["search", "translate"]);
+        let overlay = render_routing_overlay(
+            &network,
+            &[site],
+            &[],
+            &[tool_provider],
+            &[],
+            "site-a",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(overlay.candidates.len(), 2, "one candidate per tool");
+        assert!(
+            overlay.candidates.iter().all(|c| c.kind == CANDIDATE_KIND_MCP_TOOL),
+            "all candidates must have kind mcp_tool"
+        );
+    }
+
+    #[test]
+    fn overlay_mixes_inference_and_tool_candidates() {
+        let network = test_network("net");
+        let site = test_site("site-a", "net");
+        let inference_provider = test_provider("inf-prov", "net", &["llama-3"]);
+        let tool_provider = test_tool_provider("mcp-server", "net", &["search"]);
+        let overlay = render_routing_overlay(
+            &network,
+            &[site],
+            &[inference_provider],
+            &[tool_provider],
+            &[],
+            "site-a",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(overlay.candidates.len(), 2, "one inference + one tool");
+        let kinds: Vec<&str> = overlay.candidates.iter().map(|c| c.kind.as_str()).collect();
+        assert!(kinds.contains(&CANDIDATE_KIND), "must contain inference_model");
+        assert!(kinds.contains(&CANDIDATE_KIND_MCP_TOOL), "must contain mcp_tool");
+    }
+
+    #[test]
+    fn overlay_tool_candidate_json_has_correct_kind_field() {
+        let network = test_network("net");
+        let site = test_site("site-a", "net");
+        let tool_provider = test_tool_provider("mcp-server", "net", &["code-exec"]);
+        let overlay = render_routing_overlay(
+            &network,
+            &[site],
+            &[],
+            &[tool_provider],
+            &[],
+            "site-a",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        let json: serde_json::Value = serde_json::to_value(&overlay).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            json["candidates"][0]["kind"].as_str(),
+            Some("mcp_tool"),
+            "JSON serialization must produce kind=mcp_tool"
+        );
+        assert_eq!(
+            json["candidates"][0]["name"].as_str(),
+            Some("code-exec"),
+            "tool name must appear in serialized overlay"
+        );
+    }
+
+    #[test]
+    fn overlay_remote_crdt_tool_provider_produces_mcp_tool_candidates() {
+        let network = test_network("net");
+        let remote_tool = crdt::ProviderState {
+            network_id: "net".to_owned(),
+            site_id: "site-remote".to_owned(),
+            provider_id: "remote-mcp".to_owned(),
+            routing_cluster: "remote-mcp".to_owned(),
+            models: Vec::new(),
+            tools: vec!["remote-search".to_owned()],
+            backend_kind: String::new(),
+            capacity_weight: 1,
+            phase: crdt::ProviderPhase::Available,
+            metrics: crdt::ProviderMetricsSnapshot::default(),
+            access_policy: crdt::ProviderAccessPolicy::default(),
+            revision: 1,
+            writer_id: "site-remote".to_owned(),
+        };
+        let overlay = render_routing_overlay(
+            &network,
+            &[],
+            &[],
+            &[],
+            &[remote_tool],
+            "site-local",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(overlay.candidates.len(), 1);
+        assert_eq!(overlay.candidates[0].kind, CANDIDATE_KIND_MCP_TOOL);
+        assert_eq!(overlay.candidates[0].name, "remote-search");
+        assert_eq!(overlay.candidates[0].site, "site-remote");
+    }
+
+    #[test]
+    fn overlay_unavailable_tool_provider_excluded() {
+        let network = test_network("net");
+        let site = test_site("site-a", "net");
+        let provider = test_tool_provider_with_phase("dead-mcp", "net", &["tool-a"], "Unavailable");
+        let overlay = render_routing_overlay(
+            &network,
+            &[site],
+            &[],
+            &[provider],
+            &[],
+            "site-a",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        assert!(
+            overlay.candidates.is_empty(),
+            "unavailable tool provider must not appear in overlay"
+        );
+    }
+
+    #[test]
+    fn overlay_tool_provider_access_policy_denies_consumer() {
+        let network = test_network("net");
+        let site_prod = test_site_with_labels("site-prod", "net", &[("env", "prod")]);
+        let site_staging = test_site_with_labels("site-staging", "net", &[("env", "staging")]);
+        let provider = test_tool_provider_with_access_policy("restricted-mcp", "net", &["tool-a"], &[("env", "prod")]);
+        // Consumer from staging - should be denied
+        let overlay = render_routing_overlay(
+            &network,
+            &[site_prod, site_staging],
+            &[],
+            &[provider],
+            &[],
+            "site-staging",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        assert!(
+            overlay.candidates.is_empty(),
+            "staging consumer must be denied by env=prod access policy"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // bare_candidate — helper validation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn bare_candidate_sets_default_capacity_weight_to_one() {
+        let c = bare_candidate("mcp_tool", "search", "site-a", "cluster-a", true);
+        assert_eq!(c.capacity_weight, 1, "bare_candidate must default to capacity_weight=1");
+        assert_eq!(c.kind, "mcp_tool");
+        assert_eq!(c.name, "search");
+        assert_eq!(c.site, "site-a");
+        assert_eq!(c.cluster, "cluster-a");
+        assert!(c.fresh);
+        assert!(c.credential.is_none());
+        assert!(c.stable_id.is_none());
+        assert!(c.admission_state.is_none());
+        assert!(c.selection_tier.is_none());
+        assert!(c.score.is_none());
+        assert!(c.score_breakdown.is_none());
+        assert!(c.rank.is_none());
+        assert!(c.selection_group.is_none());
+        assert!(c.traffic_weight.is_none());
     }
 }
