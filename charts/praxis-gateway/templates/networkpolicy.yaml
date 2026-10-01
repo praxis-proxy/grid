@@ -1,3 +1,4 @@
+{{- include "praxis-gateway.normalize" . }}
 {{- if .Values.networkPolicy.enabled }}
 {{- if not .Values.networkPolicy.from }}
 {{- fail "networkPolicy.from needs at least one peer when networkPolicy.enabled is true" }}

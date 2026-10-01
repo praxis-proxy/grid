@@ -61,27 +61,38 @@ AI image; these values may advance independently.
 | `image.repository` | string | `ghcr.io/praxis-proxy/ai` | Image repository. |
 | `image.tag` | string | `0.4.0` | Image tag (ignored when `image.digest` is set). |
 | `image.digest` | string | `""` | Immutable digest (sha256:…). When set, tag is ignored. |
+| `image.flavor` | string | `ai` | `ai` or `grid-gateway`, the grid build that `gatewayConfig.role: provider` and `gridServing` need. A repository ending in `/grid-gateway` sets it. |
 | `image.pullPolicy` | string | `IfNotPresent` | Image pull policy. |
 | `imagePullSecrets` | list | `[]` | Pull secrets for private registries. |
 | `nameOverride` | string | `""` | Override chart name. |
-| `fullnameOverride` | string | `""` | Override fully qualified app name. |
+| `fullnameOverride` | string | `""` | Override fully qualified app name. A grid gateway, a provider or a consumer with site backends, takes its release name. |
 | `commonLabels` | object | `{}` | Labels added to all resources. |
 | `podLabels` | object | `{}` | Additional pod labels. Selector labels cannot be overridden. |
 | `podAnnotations` | object | `{}` | Pod annotations. |
 | `podSecurityContext` | object | `{}` | Extra pod securityContext (`runAsUser`, `runAsGroup`, `fsGroup`, `supplementalGroups`). |
 | `args` | list | `["--config", "/etc/praxis/praxis.yaml"]` | Container arguments. |
-| `config.existingConfigMap` | string | **required** unless `gatewayConfig.render` | Name of an existing ConfigMap with the Praxis config. |
+| `config.existingConfigMap` | string | `""` | Name of an existing ConfigMap with the Praxis config. Without it, the chart renders the config. |
 | `config.key` | string | `praxis.yaml` | Key in the ConfigMap. |
-| `gatewayConfig.render` | bool | `false` | Render praxis.yaml from these values instead of a BYO ConfigMap. Never emits `insecure_options`. |
-| `gatewayConfig.model` | string | **required** when rendered | Model advertised on the routing candidates. |
-| `gatewayConfig.backends` | list | **required** when rendered | Backend clusters (`cluster`, `endpoints`, `healthCheck`, `transport`). |
+| `gatewayConfig.render` | bool | `false` | Render the Praxis config from these values instead of a BYO ConfigMap, also on when `config.existingConfigMap` is empty. Never emits `insecure_options`. |
+| `gatewayConfig.model` | string | **required** for a consumer without `gridServing` | Model advertised on the routing candidates. |
+| `gatewayConfig.backends` | map | **required** when rendered | Backends keyed by site, each with `endpoint` and optional `healthCheck` and `transport`. A consumer's key is the site it reaches over mutual TLS. A provider's `local` key is its one plaintext backend. The older list of `cluster`, `endpoints` entries still renders. |
+| `gatewayConfig.backends[].site` | string | `localSite` | Grid site the backend serves. A consumer's remote `mutual_tls` backend must name it, and it must differ from `localSite`. Its `transport.sni` defaults to `<site>.grid.internal`. |
 | `gatewayConfig.backends[].transport` | object | `mutual_tls` with `tls.enabled`, else `plaintext` | `mode`: `mutual_tls` presents the grid identity, `tls` verifies the server cert with no client cert, `plaintext` is cleartext. `sni` names the peer cert (required for `mutual_tls` and for `tls` to an IP endpoint). `ca` (`configMap` or `secret`, `key`) is the CA for a `tls` backend. A `tls` backend trusts, first match wins: `transport.ca`, then `upstreamCA`, then the process store, which is the `auth.validateCA` bundle when that is set. |
-| `gatewayConfig.localSite` | string | `hub` | Local site for locality scoring. |
+| `gatewayConfig.backends[].connectTimeoutMs` | int | praxis default | Connect timeout, at most `totalConnectTimeoutMs` when you set both. |
+| `gatewayConfig.backends[].trustPrivate` | bool | `false` | Let the backend's hostname endpoints resolve to private addresses. Needs a praxis build with `trusted_private_endpoints`, which 0.7.x lacks. Over plaintext it also needs `allowPlaintextTrust`. |
+| `gatewayConfig.role` | string | `consumer` | `provider` serves grid peers on the grid identity and forwards to one local backend. |
+| `gatewayConfig.peerTrust.mode` | string | `pin` | Provider peer allowlist. The grid-site `gridNetwork.peerTrust.mode` is the source of truth, and this must match it. `pin` lists leaf certificate digests in `certDigests`. `spiffe` lists SPIFFE IDs in `spiffeIds` and needs X.509-SVID leaves. |
+| `gatewayConfig.peerTrust.digest` | string | `""` | Pin mode: lowercase hex SHA-256 of the allowed peer's DER leaf. `nextDigest` adds the next one during a rotation. |
+| `gatewayConfig.peerTrust.certDigests` | list | `[]` | Pin mode: more allowed digests. |
+| `gatewayConfig.peerTrust.spiffeId` | string | `""` | SPIFFE mode: an allowed SPIFFE ID. `spiffeIds` takes more. The render needs one unless `allowAnyGridSite`. |
+| `gatewayConfig.peerTrust.allowAnyGridSite` | bool | `false` | SPIFFE mode with no IDs: accept any enrolled site. |
+| `gatewayConfig.provider.allowedPaths` | list | chat, completions, models, embeddings | Exact paths a provider forwards, GET and POST only. Other paths get a 404, other methods a 405. |
+| `gatewayConfig.localSite` | string | **required** when rendered | This gateway's site name. A consumer scores locality with it, and a provider returns it in `X-Grid-Provider-Site`. |
 | `gatewayConfig.auth.mode` | string | **required** when rendered | `api-key` validates the caller's key and needs an image that registers `identity/api-key` (praxis-policy 0.4 or later); the render refuses it on the default `ai:0.4.0` image (by effective reference; a digest pin of that same image is not detected). `none` renders no policy filter, for use only behind an authenticating front. |
 | `gatewayConfig.auth.allowUnauthenticatedExposure` | bool | `false` | With `none`, allow a LoadBalancer or NodePort Service. Without it the render fails. The guard sees only this chart's Service, not `oc expose`, another Service selecting the pod labels, an HTTPRoute, or a hand-made Service with `service.enabled=false`. Use `networkPolicy` for those. |
 | `gatewayConfig.auth.stripAuthorization` | bool | `true` | Remove the caller's `Authorization` before routing, in either mode. Forwarded grid hops authenticate by mTLS identity. `false` forwards the caller's key or bearer to every backend and cross-site peer, so use it only when the backend validates that same credential. |
 | `gatewayConfig.auth.validateUrl` | string | **required** for `api-key` | https validate endpoint. |
-| `gatewayConfig.auth.allowPrivateEndpoint` | bool | `false` | Sets `allow_private_idp`, which is engine-wide: every policy callout may reach private, loopback, and link-local addresses, not only `validateUrl`. |
+| `gatewayConfig.auth.allowPrivateEndpoint` | bool | `false` | Sets `allow_private_idp`, which is engine-wide: every policy callout in this gateway, not only `validateUrl`, may then reach private, loopback, link-local, and cloud metadata addresses. Turn it on only when every policy in the gateway is yours. |
 | `gatewayConfig.auth.validateCA` | object | empty | CA for the validate call (`configMap` or `secret`, `key`). Set as `SSL_CERT_FILE`, which replaces the platform trust store for the validate call and https backends without a per-backend CA or `upstreamCA`. mutual_tls backends and `upstreamCA` are unaffected. See the recipe below. |
 | `networkPolicy.enabled` | bool | `false` | Render a NetworkPolicy that limits which pods can reach the listener port, where the CNI enforces NetworkPolicy. It is not authentication. Node and host-network traffic handling is CNI-specific (OVN-Kubernetes: the `policy-group.network.openshift.io/host-network` label), and a LoadBalancer with `externalTrafficPolicy: Cluster` can SNAT clients to node IPs. |
 | `networkPolicy.from` | list | `[]` | NetworkPolicyPeer entries allowed in. Required when enabled. With `auth.mode: none`, list only the authenticating front. `{podSelector: {}}` admits every pod in this namespace. An empty `namespaceSelector` and an `ipBlock` of `0.0.0.0/0` or `::/0` admit everyone and fail the render. An all-address `ipBlock` with `except` entries is allowed. The check reads selector emptiness and the cidr only, so `matchExpressions` that happen to select every pod pass. A provider gateway behind a LoadBalancer that SNATs clients to node IPs needs `ipBlock` peers for those node addresses. |
@@ -91,10 +102,12 @@ AI image; these values may advance independently.
 | `port.name` | string | `""` | Port name. Empty: `https` with `gatewayConfig.listenerTls.enabled`, else `http`. |
 | `port.protocol` | string | `TCP` | Port protocol. |
 | `service.enabled` | bool | `true` | Create a Service. |
-| `service.type` | string | `ClusterIP` | Service type. |
+| `service.type` | string | `""` | Service type. Empty: `LoadBalancer` for a provider, else `ClusterIP`. |
 | `service.port` | int | `8080` | Service port. |
 | `service.annotations` | object | `{}` | Service annotations. |
 | `service.loadBalancerIP` | string | `""` | Static IP for LoadBalancer. |
+| `route.enabled` | bool | `false` | Render an OpenShift Route to the Service. Needs TLS at the gateway and `route.host`. |
+| `route.tls.termination` | string | `passthrough` | `passthrough`, or `reencrypt` with `route.tls.destinationCACertificate`. A provider allows only `passthrough`. |
 | `overlay.enabled` | bool | `false` | Mount an overlay ConfigMap. |
 | `overlay.existingConfigMap` | string | `""` | Name of the overlay ConfigMap. |
 | `overlay.mountPath` | string | `/etc/praxis/routing` | Mount path for overlay files. |
@@ -107,8 +120,14 @@ AI image; these values may advance independently.
 | `overlay.sidecar.expectedNetwork` | string | `""` | Required GridNetwork scope when the sidecar is enabled. |
 | `overlay.sidecar.expectedLocalSite` | string | `""` | Required local-site scope when the sidecar is enabled. |
 | `overlay.sidecar.resources` | object | small requests and limits | Resources for both the one-shot init container and continuous sidecar. |
+| `gridServing.enabled` | bool | `false` | Mount the operator's serving config, set `GRID_SERVING_CONFIG`, and route with `grid_site_route`. Consumer role and `image.flavor: grid-gateway` only. Needs `tls.enabled`, `tls.existingSecret`, and `tls.caSecret`. |
+| `gridServing.network` | string | `""` | GridNetwork name, which with `gatewayRef` names the operator's ConfigMap. |
+| `gridServing.gatewayRef` | string | release fullname | This gateway's gatewayRef name in the GridNetwork. |
+| `gridServing.configMap` | string | `""` | Overrides the derived `grid-serving-<network>-<gatewayRef>`. Needed when that name passes 63 characters. |
+| `gridServing.mountPath` | string | `/etc/praxis/grid-serving` | Mount directory for the ConfigMap. |
 | `tls.enabled` | bool | `false` | Mount a TLS Secret. |
-| `tls.existingSecret` | string | `""` | Name of the TLS Secret. |
+| `tls.existingSecret` | string | `grid-site-identity` | Name of the TLS Secret, the site identity the grid operator writes. |
+| `tls.caSecret` | string | `""` | Secret holding the Grid CA (`ca.crt`), projected beside `existingSecret`. A provider defaults to `grid-ca`. |
 | `tls.mountPath` | string | `/etc/praxis/tls` | Mount path for TLS files. |
 | `credentials` | list | `[]` | Credential Secret mounts (name, mountPath, optional). |
 | `health.readiness` | object | TCP socket on the listener port | Readiness probe. A `tcpSocket` without a port targets the listener port. Set to null to disable. |
@@ -255,6 +274,36 @@ with different values:
 - Helm release name must match the mock-providers
   `networkPolicy.providerGateway.instanceLabel` (default: `provider-gateway`)
   so the NetworkPolicy allows traffic
+
+## Cross-Site Routing
+
+With `gridServing.enabled`, the consumer gateway reads the serving config the
+grid operator writes (under `signalTransport: poll`) and polls each peer's
+`/v1/site/signals` over mTLS with the grid identity at `tls.mountPath`. It routes
+each model to the least-loaded admitted site. The chosen candidate's cluster must
+name a `gatewayConfig.backends` cluster, so give each backend the operator's
+candidate cluster (the provider's `routingClusterRef`, else its name).
+
+The gateway reads the file only at start. When the ConfigMap's
+`grid.praxis-proxy.io/serving-digest` annotation changes, restart the gateway
+(`kubectl rollout restart`).
+
+Known limits:
+
+- `grid_site_route` does not check provider health, so it can pick a site whose
+  provider gateway is down. That request fails rather than failing over.
+- The gateway matches a candidate's cluster to `gatewayConfig.backends` by name only.
+  Nothing checks that the backend serves the candidate's site.
+- Site certificates last 30 days and nothing renews them. The gateway reads its
+  client certificate and the signals pollers read theirs once, at start, and a
+  `pin` digest changes on renewal. After re-enrolling, update the digests and
+  restart the gateways.
+
+## Upgrading
+
+- A rendered config requires `gatewayConfig.localSite`. It no longer defaults to `hub`.
+- `gatewayConfig.role: provider` and `gridServing` require `image.flavor: grid-gateway`.
+- A consumer without `gridServing` still requires `gatewayConfig.model`. A provider no longer does.
 
 ## Resource Names
 

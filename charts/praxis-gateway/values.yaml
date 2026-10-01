@@ -11,6 +11,8 @@ image:
   digest: ""
   # -- Image pull policy.
   pullPolicy: "IfNotPresent"
+  # -- ai (praxis-proxy/ai) or grid-gateway, the grid build that role provider and gridServing need.
+  flavor: ai
 
 # -- Pull secrets for private registries.
 imagePullSecrets: []
@@ -56,9 +58,37 @@ config:
 gatewayConfig:
   # -- Render praxis.yaml + policy.yaml from these values instead of a BYO ConfigMap.
   render: false
-  # -- Local site name for intelligent_route locality scoring.
-  localSite: "hub"
-  # -- Model advertised on the routing candidates.
+  # -- consumer routes callers. provider serves grid peers on the grid identity and forwards to one backend.
+  role: consumer
+  # -- Grid peers a provider accepts, each with a Grid-CA client certificate.
+  peerTrust:
+    # -- pin (certDigests) or spiffe (spiffeIds, experimental). Match the GridNetwork peerTrust.mode.
+    mode: pin
+    # -- pin mode: lowercase hex SHA-256 of each allowed peer's leaf certificate (DER).
+    certDigests: []
+    # -- pin mode: one allowed leaf digest, added to certDigests.
+    digest: ""
+    # -- pin mode: the next leaf digest during a rotation.
+    nextDigest: ""
+    # -- spiffe mode: allowed peer SPIFFE IDs (spiffe://grid.internal/site/<name>).
+    spiffeIds: []
+    # -- spiffe mode: one allowed SPIFFE ID, added to spiffeIds.
+    spiffeId: ""
+    # -- spiffe mode with no spiffeIds: accept any site the Grid CA signed.
+    allowAnyGridSite: false
+    # -- Optional inbound budget shared by all peers, for example { rate: 20, burst: 40 }.
+    rateLimit: {}
+  # -- Provider role settings.
+  provider:
+    # -- Exact paths forwarded to the local backend, GET and POST only. Other paths get a 404.
+    allowedPaths:
+      - /v1/chat/completions
+      - /v1/completions
+      - /v1/models
+      - /v1/embeddings
+  # -- This gateway's site name, required when render is true.
+  localSite: ""
+  # -- Model advertised on the routing candidates. A consumer without gridServing needs it.
   model: ""
   auth:
     # -- Caller authentication, required when render is true. api-key validates the
@@ -128,8 +158,16 @@ gatewayConfig:
   # The health_check type defaults to tcp for TLS transports (the active http probe is
   # plaintext and cannot reach a TLS peer) and http for plaintext. Override per backend
   # with healthCheck.type.
-  backends: []
+  # Keyed by site. For a provider, local is its one local backend. The older list of
+  # {cluster, endpoints, ...} still renders.
+  # backends:
+  #   site-a:
+  #     endpoint: 203.0.113.20:8080        # transport mutual_tls, sni site-a.grid.internal
+  #   local:                               # provider role
+  #     endpoint: 10.96.0.20:8000
+  # The older list form:
   #  - cluster: site-a
+  #    site: site-a                     # the grid site it serves; required for a remote backend
   #    endpoints: ["172.30.202.42:8000"]
   #    healthCheck: { type: http, path: /health, intervalMs: 5000, timeoutMs: 2000 }
   #    transport: { mode: mutual_tls, sni: site-a.grid.internal }  # or { mode: plaintext }
@@ -184,14 +222,28 @@ networkPolicy:
 service:
   # -- Create a Service for the gateway.
   enabled: true
-  # -- Service type.
-  type: "ClusterIP"
+  # -- Service type. Empty: LoadBalancer for a provider, which peers dial, else ClusterIP.
+  type: ""
   # -- Service port number.
   port: 8080
   # -- Service annotations.
   annotations: {}
   # -- Static IP for LoadBalancer type.
   loadBalancerIP: ""
+
+# -- OpenShift Route to the Service, for a stable HTTPS name. The gateway terminates TLS.
+route:
+  # -- Render the Route. Needs the route.openshift.io/v1 API.
+  enabled: false
+  # -- External hostname, a name on the gateway certificate. Required when enabled.
+  host: ""
+  # -- Route annotations.
+  annotations: {}
+  tls:
+    # -- passthrough keeps TLS and client certificates end to end. reencrypt terminates at the router.
+    termination: passthrough
+    # -- PEM CA that signed the gateway certificate. Required for reencrypt.
+    destinationCACertificate: ""
 
 # -- Optional operator-produced overlay ConfigMap mount (edge gateways).
 overlay:
@@ -237,12 +289,27 @@ overlay:
         cpu: 50m
         memory: 32Mi
 
+# -- Operator-rendered serving config for grid_site_route. See the README Cross-Site Routing section.
+gridServing:
+  # -- Mount the serving config and set GRID_SERVING_CONFIG.
+  enabled: false
+  # -- GridNetwork name, which with gatewayRef names the operator's ConfigMap.
+  network: ""
+  # -- This gateway's gatewayRef name in the GridNetwork. Defaults to the release fullname.
+  gatewayRef: ""
+  # -- The operator's ConfigMap, overriding grid-serving-<network>-<gatewayRef>.
+  configMap: ""
+  # -- Mount directory for the ConfigMap.
+  mountPath: "/etc/praxis/grid-serving"
+
 # -- TLS Secret mount.
 tls:
   # -- Enable TLS Secret mount.
   enabled: false
-  # -- Name of the existing TLS Secret.
-  existingSecret: ""
+  # -- Name of the existing TLS Secret, the site identity the grid operator writes.
+  existingSecret: grid-site-identity
+  # -- Secret holding the Grid CA (ca.crt), projected beside existingSecret. A provider defaults to grid-ca.
+  caSecret: ""
   # -- Mount path for TLS files.
   mountPath: "/etc/praxis/tls"
 

@@ -16,7 +16,10 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 GW_DIR="$ROOT/charts/praxis-gateway"
 # The chart's own default image, so the check tracks the chart.
 chart_image() {
-  helm show values "$GW_DIR" | awk '/^image:/{f=1; next} f&&/^[^ ]/{exit} f&&/repository:/{r=$2} f&&/tag:/{t=$2} END{gsub(/"/,"",r); gsub(/"/,"",t); print r":"t}'
+  local values
+  # Captured first: awk exits early, which would SIGPIPE helm under pipefail.
+  values=$(helm show values "$GW_DIR")
+  awk '/^image:/{f=1; next} f&&/^[^ ]/{exit} f&&/repository:/{r=$2} f&&/tag:/{t=$2} END{gsub(/"/,"",r); gsub(/"/,"",t); print r":"t}' <<<"$values"
 }
 DEFAULT_GATEWAY_IMAGE=${DEFAULT_GATEWAY_IMAGE:-$(chart_image)}
 API_KEY_IMAGE=${API_KEY_IMAGE:-}
@@ -112,7 +115,7 @@ class H(http.server.BaseHTTPRequestHandler):
         self.reply({"authorization": self.headers.get("Authorization")})
 http.server.HTTPServer(("0.0.0.0", 8000), H).serve_forever()' >/dev/null
 BASE=(
-  --set gatewayConfig.render=true --set gatewayConfig.model=qwen3
+  --set gatewayConfig.render=true --set gatewayConfig.localSite=hub --set gatewayConfig.model=qwen3
   --set "gatewayConfig.backends[0].cluster=site-a"
   --set "gatewayConfig.backends[0].transport.mode=plaintext"
   --set "gatewayConfig.backends[0].endpoints[0]=$(ip "$NET-backend"):8000"
@@ -161,7 +164,7 @@ ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); ctx.load_cert_chain("/ca/tls.crt"
 server = http.server.HTTPServer(("0.0.0.0", 8443), H)
 server.socket = ctx.wrap_socket(server.socket, server_side=True)
 server.serve_forever()' >/dev/null
-TLS_BACKEND=(--set gatewayConfig.render=true --set gatewayConfig.model=qwen3 --set gatewayConfig.auth.mode=none
+TLS_BACKEND=(--set gatewayConfig.render=true --set gatewayConfig.localSite=hub --set gatewayConfig.model=qwen3 --set gatewayConfig.auth.mode=none
   --set "gatewayConfig.backends[0].cluster=kserve" --set "gatewayConfig.backends[0].endpoints[0]=$(ip "$NET-tls-backend"):8443"
   --set "gatewayConfig.backends[0].transport.mode=tls" --set "gatewayConfig.backends[0].transport.sni=tls-backend")
 render "$WORK/tls" "${TLS_BACKEND[@]}" \

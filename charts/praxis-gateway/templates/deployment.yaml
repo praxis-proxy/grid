@@ -1,3 +1,4 @@
+{{- include "praxis-gateway.normalize" . }}
 {{- include "praxis-gateway.validateDigest" . }}
 {{- include "praxis-gateway.validateConfig" . }}
 {{- include "praxis-gateway.validateMounts" . }}
@@ -16,7 +17,7 @@ spec:
     metadata:
       labels:
         {{- $selectorLabels := include "praxis-gateway.selectorLabels" . | fromYaml }}
-        {{- $podLabels := mustMergeOverwrite (dict) (.Values.podLabels | default dict) $selectorLabels }}
+        {{- $podLabels := mustMergeOverwrite (dict "app.kubernetes.io/component" "gateway") (.Values.podLabels | default dict) $selectorLabels }}
         {{- toYaml $podLabels | nindent 8 }}
       {{- with .Values.podAnnotations }}
       annotations:
@@ -150,10 +151,14 @@ spec:
           {{- end }}
           {{- $validateCA := .Values.gatewayConfig.auth.validateCA }}
           {{- $withCA := and .Values.gatewayConfig.render (eq .Values.gatewayConfig.auth.mode "api-key") (or $validateCA.configMap $validateCA.secret) }}
-          {{- if or .Values.env $withCA }}
+          {{- if or .Values.env $withCA (.Values.gridServing).enabled }}
           env:
             {{- with .Values.env }}
             {{- toYaml . | nindent 12 }}
+            {{- end }}
+            {{- if (.Values.gridServing).enabled }}
+            - name: GRID_SERVING_CONFIG
+              value: {{ printf "%s/serving-config.json" .Values.gridServing.mountPath | quote }}
             {{- end }}
             {{- if $withCA }}
             - name: SSL_CERT_FILE
@@ -197,13 +202,18 @@ spec:
               mountPath: {{ .Values.tls.mountPath | quote }}
               readOnly: true
             {{- end }}
+            {{- if (.Values.gridServing).enabled }}
+            - name: grid-serving
+              mountPath: {{ .Values.gridServing.mountPath | quote }}
+              readOnly: true
+            {{- end }}
             {{- if .Values.gatewayConfig.upstreamCA.secretName }}
             - name: upstream-ca
               mountPath: {{ .Values.gatewayConfig.upstreamCA.mountPath | quote }}
               readOnly: true
             {{- end }}
             {{- if .Values.gatewayConfig.render }}
-            {{- range $i, $backend := .Values.gatewayConfig.backends }}
+            {{- range $i, $backend := .Values.gatewayConfig.backends | default list }}
             {{- if (.transport).ca }}
             - name: backend-ca-{{ $i }}
               mountPath: /etc/praxis/backend-ca/{{ $i }}
@@ -277,8 +287,25 @@ spec:
         {{- end }}
         {{- if .Values.tls.enabled }}
         - name: tls
+          {{- if include "praxis-gateway.caSecret" . }}
+          projected:
+            sources:
+              - secret:
+                  name: {{ .Values.tls.existingSecret | quote }}
+                  items: [{ key: tls.crt, path: tls.crt }, { key: tls.key, path: tls.key }]
+              - secret:
+                  name: {{ include "praxis-gateway.caSecret" . | quote }}
+                  items: [{ key: ca.crt, path: ca.crt }]
+          {{- else }}
           secret:
             secretName: {{ .Values.tls.existingSecret | quote }}
+          {{- end }}
+        {{- end }}
+        {{- if (.Values.gridServing).enabled }}
+        - name: grid-serving
+          configMap:
+            name: {{ include "praxis-gateway.servingConfigMap" . | quote }}
+            optional: false
         {{- end }}
         {{- if .Values.gatewayConfig.upstreamCA.secretName }}
         - name: upstream-ca
@@ -286,7 +313,7 @@ spec:
             secretName: {{ .Values.gatewayConfig.upstreamCA.secretName | quote }}
         {{- end }}
         {{- if .Values.gatewayConfig.render }}
-        {{- range $i, $backend := .Values.gatewayConfig.backends }}
+        {{- range $i, $backend := .Values.gatewayConfig.backends | default list }}
         {{- with (.transport).ca }}
         - name: backend-ca-{{ $i }}
           {{- if .configMap }}
