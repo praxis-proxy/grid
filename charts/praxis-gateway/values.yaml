@@ -46,11 +46,11 @@ env: []
 # -- Which GridNetwork and site this gateway belongs to.
 grid:
   # -- GridNetwork name. Used only by the overlay sidecar: it refuses an overlay
-  # written for another GridNetwork. Required when overlay.configMapName is set.
+  # written for another GridNetwork. Required when the overlay sidecar is on.
   networkName: ""
   # -- This gateway's site name. Used by render (local_site in praxis.yaml) and by
   # the overlay sidecar (it refuses an overlay written for another site).
-  # Required when praxisConfig.source is render or overlay.configMapName is set.
+  # Required when praxisConfig.source is render or the overlay sidecar is on.
   siteName: ""
 
 # -- Praxis configuration (praxis.yaml).
@@ -232,10 +232,17 @@ service:
   loadBalancerIP: ""
 
 # -- Operator-produced routing overlay (edge gateways). When configMapName is set,
-# the overlay-sync sidecar watches the ConfigMap through the Kubernetes API, checks
-# it belongs to grid.networkName and grid.siteName, and writes routing-overlay.json
-# into a shared emptyDir at mountPath. A bad overlay is refused and the last good
-# one is kept. grid.networkName and grid.siteName are then required.
+# the overlay-sync sidecar (on by default) watches the ConfigMap through the
+# Kubernetes API, checks it belongs to grid.networkName and grid.siteName, and
+# writes routing-overlay.json into a shared emptyDir at mountPath. A bad overlay
+# is refused and the last good one is kept. grid.networkName and grid.siteName
+# are then required. The sidecar also checks the overlay is for this gateway by
+# its name, so the chart fullname (set fullnameOverride) must equal the
+# GridNetwork gatewayRefs[].name. If not, the pod never starts. With sidecar.enabled false, the ConfigMap is mounted
+# directly instead: updates are slower (kubelet sync, about a minute) and not checked.
+# Only for praxisConfig.source byo, where your praxis.yaml sets overlay_file to
+# mountPath/routing-overlay.json. Operator and render put the candidates straight
+# into praxis.yaml, so the chart fails if this is set with those sources.
 overlay:
   # -- Name of the existing overlay ConfigMap. The operator creates it.
   # Empty (the default) turns the overlay off.
@@ -244,6 +251,9 @@ overlay:
   mountPath: "/etc/praxis/routing"
   # -- Overlay-sync sidecar settings.
   sidecar:
+    # -- Run the overlay-sync sidecar. Set false to mount the ConfigMap directly,
+    # for example when you cannot create the sidecar's ServiceAccount and Role.
+    enabled: true
     # -- Sidecar container image.
     image:
       # -- Image repository.

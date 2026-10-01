@@ -171,11 +171,11 @@ carry a sni.
 Validate enabled mounts have a non-empty resource name.
 */}}
 {{- define "praxis-gateway.validateMounts" -}}
-{{- if and .Values.overlay.configMapName (not .Values.grid.networkName) }}
-{{- fail "grid.networkName is required when overlay.configMapName is set: the overlay sidecar checks the overlay belongs to this GridNetwork" }}
+{{- if and .Values.overlay.configMapName .Values.overlay.sidecar.enabled (not .Values.grid.networkName) }}
+{{- fail "grid.networkName is required when the overlay sidecar is on: it checks the overlay belongs to this GridNetwork. Set it, or set overlay.sidecar.enabled false." }}
 {{- end }}
-{{- if and .Values.overlay.configMapName (not .Values.grid.siteName) }}
-{{- fail "grid.siteName is required when overlay.configMapName is set: the overlay sidecar checks the overlay belongs to this site" }}
+{{- if and .Values.overlay.configMapName .Values.overlay.sidecar.enabled (not .Values.grid.siteName) }}
+{{- fail "grid.siteName is required when the overlay sidecar is on: it checks the overlay belongs to this site. Set it, or set overlay.sidecar.enabled false." }}
 {{- end }}
 {{- /*
 The operator's praxis.yaml has no listener TLS and no upstream_ca_file, so these
@@ -188,6 +188,13 @@ mounts would do nothing. Fail instead of serving plaintext on an https port.
 {{- if .Values.upstreamCA.secretName }}
 {{- fail "upstreamCA.secretName is not supported with praxisConfig.source operator: the Grid operator's praxis.yaml has no upstream_ca_file. Use source byo or render." }}
 {{- end }}
+{{- end }}
+{{- /*
+Only a byo praxis.yaml can point overlay_file at the synced file. Operator and
+render put the candidates straight into praxis.yaml, so the sidecar would do nothing.
+*/}}
+{{- if and .Values.overlay.configMapName (ne .Values.praxisConfig.source "byo") }}
+{{- fail (printf "overlay.configMapName is only used with praxisConfig.source byo: with source %s, praxis.yaml never reads the overlay file. Remove overlay.configMapName, or use source byo." .Values.praxisConfig.source) }}
 {{- end }}
 {{- end }}
 

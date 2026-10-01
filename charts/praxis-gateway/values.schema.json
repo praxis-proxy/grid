@@ -339,7 +339,7 @@
       "properties": {
         "configMapName": {
           "type": "string",
-          "description": "Name of the existing overlay ConfigMap. Set it to deliver the overlay through the overlay-sync sidecar; empty turns the overlay off."
+          "description": "Name of the existing overlay ConfigMap. Set it to deliver the overlay; empty turns the overlay off."
         },
         "mountPath": {
           "type": "string",
@@ -350,6 +350,10 @@
           "additionalProperties": false,
           "description": "Overlay sync sidecar settings.",
           "properties": {
+            "enabled": {
+              "type": "boolean",
+              "description": "Run the overlay-sync sidecar (default true). False mounts the overlay ConfigMap straight into the praxis container: updates are slower and not checked."
+            },
             "image": {
               "type": "object",
               "additionalProperties": false,

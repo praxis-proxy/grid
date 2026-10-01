@@ -747,6 +747,10 @@ not appropriate as the delivery mechanism for short-lived routing changes.
 The sidecar watches the API directly, so a published revision does not wait for
 the kubelet's projected-volume polling cycle.
 
+Keep the sidecar on in production. Set `overlay.sidecar.enabled=false` only
+when you cannot run it. The ConfigMap is then mounted directly: updates take
+about a minute and are not checked.
+
 The sidecar adds correctness controls as well as lower latency:
 
 - an init container blocks Praxis startup until the first valid overlay exists;

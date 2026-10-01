@@ -168,8 +168,8 @@ AI image; these values may advance independently.
 | `podAnnotations` | object | `{}` | Pod annotations. |
 | `podSecurityContext` | object | `{}` | Extra pod securityContext (`runAsUser`, `runAsGroup`, `fsGroup`, `supplementalGroups`). |
 | `args` | list | `["--config", "/etc/praxis/praxis.yaml"]` | Container arguments. |
-| `grid.networkName` | string | `""` | GridNetwork name. Used only by the overlay sidecar, which refuses an overlay written for another GridNetwork. Required when `overlay.configMapName` is set. Must match the GridNetwork CR name. |
-| `grid.siteName` | string | `""` | This gateway's site. Used by `render` (written as `local_site`) and by the overlay sidecar (refuses an overlay written for another site). Required with `source: render` or when `overlay.configMapName` is set. |
+| `grid.networkName` | string | `""` | GridNetwork name. Used only by the overlay sidecar, which refuses an overlay written for another GridNetwork. Required when the overlay sidecar is on. Must match the GridNetwork CR name. |
+| `grid.siteName` | string | `""` | This gateway's site. Used by `render` (written as `local_site`) and by the overlay sidecar (refuses an overlay written for another site). Required with `source: render` or when the overlay sidecar is on. |
 | `praxisConfig.source` | string | `byo` | Who writes praxis.yaml: `byo` (you create the ConfigMap), `operator` (the Grid operator creates it from a GridNetwork `gatewayRef` with `consumerConfig.enabled`), or `render` (this chart creates it from `praxisConfig.render`). |
 | `praxisConfig.configMapName` | string | **required** for `byo`; `praxis-consumer-config` for `operator` | Name of the ConfigMap with praxis.yaml. For `operator`, must match the `configMapName` in the GridNetwork. Not used with `render`. |
 | `praxisConfig.key` | string | `praxis.yaml` | Key in the ConfigMap, for `byo` only. `operator` always uses `praxis.yaml`. |
@@ -194,8 +194,9 @@ AI image; these values may advance independently.
 | `service.port` | int | `8080` | Service port. |
 | `service.annotations` | object | `{}` | Service annotations. |
 | `service.loadBalancerIP` | string | `""` | Static IP for LoadBalancer. |
-| `overlay.configMapName` | string | `""` | Name of the overlay ConfigMap. Set it to deliver the overlay through the overlay-sync sidecar; empty (the default) turns the overlay off. Needs `grid.networkName` and `grid.siteName`. |
+| `overlay.configMapName` | string | `""` | Name of the overlay ConfigMap. Set it to deliver the overlay; empty (the default) turns the overlay off. With the sidecar on (the default), needs `grid.networkName` and `grid.siteName`. Only for `source: byo`; the chart fails with `operator` or `render`. |
 | `overlay.mountPath` | string | `/etc/praxis/routing` | Path where praxis reads the overlay files. |
+| `overlay.sidecar.enabled` | bool | `true` | Run the overlay-sync sidecar. `false` mounts the ConfigMap directly: slower kubelet updates, no checks, no ServiceAccount or Role. |
 | `overlay.sidecar.image.repository` | string | `grid-overlay-sync` | Overlay-sync image repository. Use a published or locally built image appropriate to the deployment. |
 | `overlay.sidecar.image.tag` | string | `v0.1.4` | Overlay-sync image tag. Use an immutable published tag for reproducible deployments. |
 | `overlay.sidecar.image.pullPolicy` | string | `IfNotPresent` | Overlay-sync image pull policy. |
@@ -260,7 +261,7 @@ The chart enforces Kubernetes restricted security defaults:
 - `seccompProfile.type: RuntimeDefault`
 - `automountServiceAccountToken: false`
 
-When `overlay.configMapName` is set, the pod uses a dedicated ServiceAccount, but
+When the overlay sidecar is on, the pod uses a dedicated ServiceAccount, but
 automatic token mounting remains disabled. A short-lived projected token is
 mounted only into the overlay-sync init and sidecar containers. The Praxis
 container has no Kubernetes API credential and mounts the delivered overlay
@@ -274,7 +275,12 @@ cycle. That delay can be longer than a temporary provider-pressure event, so a
 gateway may continue serving an old preference even though AGN has already
 published a new overlay.
 
-The chart delivers the overlay through the `grid-overlay-sync` sidecar:
+The overlay is only for `praxisConfig.source: byo`, where your praxis.yaml sets
+`overlay_file: /etc/praxis/routing/routing-overlay.json`. With `operator` and
+`render`, praxis.yaml lists the candidates itself and never reads the file, so
+the chart fails if `overlay.configMapName` is set.
+
+By default the chart delivers the overlay through the `grid-overlay-sync` sidecar:
 
 ```text
 AGN Operator updates ConfigMap
@@ -308,7 +314,13 @@ overlay:
     dataKey: routing-overlay.json
 ```
 
-When `overlay.configMapName` is set, the chart creates:
+The sidecar also checks the overlay was written for this gateway. It compares
+the chart fullname with the `gatewayRefs[].name` in the GridNetwork, so set
+`fullnameOverride` to that name. If they differ, the init container refuses
+every overlay and the pod never starts; its logs show
+`gateway "<name>" != expected "<fullname>"`.
+
+With the sidecar on, the chart creates:
 
 - an `overlay-sync-init` init container that waits for the first valid overlay
   before Praxis starts;
@@ -327,6 +339,13 @@ ConfigMap. Total route-change time still includes metrics publication, the
 provider scrape, AGN reconciliation, ConfigMap application, sidecar delivery,
 and Praxis hot reload. Overlay-sync does not change the scrape or reconcile
 intervals.
+
+With `overlay.sidecar.enabled: false`, the chart mounts `dataKey` from the
+ConfigMap directly at `mountPath`. Use it when you cannot run the sidecar, for
+example when you may not create its ServiceAccount and Role. The kubelet then
+refreshes the file, which can take about a minute, and nothing checks the
+overlay before Praxis reads it. No init container, ServiceAccount or Role is
+created, and `grid.networkName` is not required.
 
 ## Edge vs Provider Gateway
 

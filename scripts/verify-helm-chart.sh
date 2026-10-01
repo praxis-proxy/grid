@@ -347,6 +347,19 @@ try_template "$GW_DIR" "edge gateway" "${GW_REQ[@]}" \
   --set service.type=LoadBalancer \
   --set overlay.configMapName=grid-overlay --set grid.networkName=n --set grid.siteName=s \
   --set gridIdentity.secretName=edge-tls
+if render v-plain "$GW_DIR" "${GW_REQ[@]}" --set overlay.configMapName=grid-overlay \
+  --set overlay.sidecar.enabled=false --namespace grid-system; then
+  if grep -q 'overlay-sync' <<<"$RENDERED"; then
+    fail "overlay without sidecar: must render no overlay-sync containers, ServiceAccount or Role"
+  else
+    pass "overlay without sidecar: no overlay-sync containers, ServiceAccount or Role"
+  fi
+  if grep -A5 'name: "grid-overlay"' <<<"$RENDERED" | grep -q 'path: "routing-overlay.json"'; then
+    pass "overlay without sidecar: mounts routing-overlay.json from the ConfigMap"
+  else
+    fail "overlay without sidecar: must mount routing-overlay.json from the ConfigMap"
+  fi
+fi
 try_template "$GW_DIR" "provider gateway" "${GW_REQ[@]}" \
   --set nameOverride=provider-gateway \
   --set port.containerPort=8443 --set port.name=https-mtls \
@@ -593,8 +606,10 @@ try_reject_msg "$GW_DIR" "overlay without grid.networkName (gw)" "grid.networkNa
   --set overlay.configMapName=o --set grid.siteName=s
 try_reject_msg "$GW_DIR" "overlay without grid.siteName (gw)" "grid.siteName is required" "${GW_REQ[@]}" \
   --set overlay.configMapName=o --set grid.networkName=n
-try_reject_msg "$GW_DIR" "overlay.sidecar.enabled is removed (gw)" "additional properties 'enabled' not allowed" "${GW_REQ[@]}" \
-  --set overlay.sidecar.enabled=true
+try_reject_msg "$GW_DIR" "overlay with source operator (gw)" "overlay.configMapName is only used with praxisConfig.source byo" \
+  --set praxisConfig.source=operator --set overlay.configMapName=o --set grid.networkName=n --set grid.siteName=s
+try_reject_msg "$GW_DIR" "overlay with source render (gw)" "overlay.configMapName is only used with praxisConfig.source byo" "${R0[@]}" "${BK1[@]}" \
+  --set overlay.configMapName=o --set grid.networkName=n
 try_reject_msg "$GW_DIR" "overlay.items is removed (gw)" "additional properties 'items' not allowed" "${GW_REQ[@]}" \
   --set 'overlay.items[0].key=a' --set 'overlay.items[0].path=a'
 try_reject_msg "$GW_DIR" "blank model (gw)" "praxisConfig.render.model is required" "${R0[@]}" "${BK1[@]}" --set-string "praxisConfig.render.model= "

@@ -1,4 +1,4 @@
-{{- if .Values.overlay.configMapName }}
+{{- if and .Values.overlay.configMapName .Values.overlay.sidecar.enabled }}
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
