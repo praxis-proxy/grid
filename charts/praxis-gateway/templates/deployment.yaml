@@ -179,7 +179,9 @@ spec:
             runAsNonRoot: true
             {{- if include "praxis-gateway.applyImageUser" . }}
             runAsUser: {{ .Values.imageUser.uid }}
+            {{- if not (hasKey (.Values.podSecurityContext | default dict) "runAsGroup") }}
             runAsGroup: {{ .Values.imageUser.gid }}
+            {{- end }}
             {{- end }}
             allowPrivilegeEscalation: false
             capabilities:

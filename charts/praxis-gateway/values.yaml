@@ -38,9 +38,10 @@ podSecurityContext: {}
 # runAsGroup: 101
 
 # -- Numeric user and group for the Praxis container when podSecurityContext sets
-# neither runAsUser nor runAsGroup. The official Praxis images run as the named user
-# praxis (100:101). The kubelet can only enforce runAsNonRoot against a numeric user,
-# and refuses to start the container when it has none.
+# no runAsUser; a podSecurityContext runAsGroup still replaces gid. The official
+# Praxis images run as the named user praxis (100:101). The kubelet can only enforce
+# runAsNonRoot against a numeric user, and refuses to start the container when it has
+# none.
 imageUser:
   # -- auto applies uid and gid except on OpenShift (security.openshift.io/v1 is
   # served), where the restricted SCC assigns IDs from the namespace range. true or

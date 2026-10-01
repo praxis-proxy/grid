@@ -224,13 +224,14 @@ Fail early on a blank or unparseable config.inline instead of a crash-looping po
 
 {{/*
 Whether the Praxis container gets imageUser's numeric IDs: only when podSecurityContext
-sets neither runAsUser nor runAsGroup, and imageUser.enabled is true, or auto off
-OpenShift. Emits "true" or nothing.
+sets no runAsUser, and imageUser.enabled is true, or auto off OpenShift. The kubelet
+needs a numeric user to enforce runAsNonRoot, and a pod runAsGroup does not provide
+one. Emits "true" or nothing.
 */}}
 {{- define "praxis-gateway.applyImageUser" -}}
 {{- $psc := .Values.podSecurityContext | default dict -}}
 {{- $e := toString (.Values.imageUser | default dict).enabled -}}
-{{- if and (not (hasKey $psc "runAsUser")) (not (hasKey $psc "runAsGroup")) (or (eq $e "true") (and (eq $e "auto") (not (include "praxis-gateway.openshift" .)))) -}}
+{{- if and (not (hasKey $psc "runAsUser")) (or (eq $e "true") (and (eq $e "auto") (not (include "praxis-gateway.openshift" .)))) -}}
 true
 {{- end -}}
 {{- end }}

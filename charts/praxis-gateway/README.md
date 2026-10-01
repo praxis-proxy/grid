@@ -192,7 +192,7 @@ Praxis AI image; these values may advance independently.
 | `podLabels` | object | `{}` | Additional pod labels. Selector labels cannot be overridden. |
 | `podAnnotations` | object | `{}` | Pod annotations. |
 | `podSecurityContext` | object | `{}` | Extra pod securityContext (`runAsUser`, `runAsGroup`, `fsGroup`, `supplementalGroups`). |
-| `imageUser.enabled` | string or bool | `auto` | Set `imageUser.uid` and `imageUser.gid` as the Praxis container's `runAsUser` and `runAsGroup` when `podSecurityContext` sets neither. `auto` skips them on OpenShift (`security.openshift.io/v1`), where the SCC assigns IDs. |
+| `imageUser.enabled` | string or bool | `auto` | Set `imageUser.uid` and `imageUser.gid` as the Praxis container's `runAsUser` and `runAsGroup` when `podSecurityContext` sets no `runAsUser`. A `podSecurityContext.runAsGroup` replaces `imageUser.gid`. `auto` skips them on OpenShift (`security.openshift.io/v1`), where the SCC assigns IDs. |
 | `imageUser.uid` | int | `100` | Numeric user of the official Praxis images, which declare the named user `praxis`. |
 | `imageUser.gid` | int | `101` | Numeric group of the official Praxis images. |
 | `command` | list | `[]` | Container command, replacing the image entrypoint. Empty keeps the entrypoint. |
@@ -272,8 +272,8 @@ Praxis AI image; these values may advance independently.
 The chart enforces Kubernetes restricted security defaults:
 
 - `runAsNonRoot: true`, running as the image's numeric user (`imageUser`, 100:101)
-  unless `podSecurityContext` sets IDs or the cluster is OpenShift, where the SCC
-  assigns them
+  unless `podSecurityContext` sets `runAsUser` or the cluster is OpenShift, where
+  the SCC assigns IDs
 - `readOnlyRootFilesystem: true`
 - `allowPrivilegeEscalation: false`
 - All Linux capabilities dropped
