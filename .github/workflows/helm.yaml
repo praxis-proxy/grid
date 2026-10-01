@@ -27,6 +27,14 @@ env:
   # schema, which the pinned Helm v3.17.3 cannot load. v0.8.2 is the last
   # release using the command/hooks schema Helm 3.17 supports.
   HELM_UNITTEST_VERSION: v0.8.2
+  HELM_SHA256: ee88b3c851ae6466a3de507f7be73fe94d54cbf2987cbaa3d1a3832ea331f2cd
+  # The charts' documented floor (Helm >= 3.12).
+  HELM_FLOOR_VERSION: v3.12.3
+  HELM_FLOOR_SHA256: 1b2313cd198d45eab00cc37c38f6b1ca0a948ba279c29e322bdf426d406129b5
+  # Informational Helm 4 leg only. Helm 4 refuses unsigned plugins, so it
+  # installs the helm-unittest release tarball pinned by digest.
+  HELM4_UNITTEST_VERSION: 1.1.2
+  HELM4_UNITTEST_SHA256: f3f6e4bcfbb73bf573434444af4ea506caaeb6f71dbb9891b499758574dd3161
 
 jobs:
   # ------------------------------------------------------------------------------
@@ -69,10 +77,22 @@ jobs:
   # ----------------------------------------------------------------------------
 
   validate:
+    name: validate (helm ${{ matrix.helm }}${{ matrix.informational && ', informational' || '' }})
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    # The charts support Helm 3 only; the Helm 4 leg reports forward
+    # compatibility and never fails the run.
+    continue-on-error: ${{ matrix.informational == true }}
     permissions:
       contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - helm: v3.17.3
+          - helm: v3.12.3
+          - helm: v4.3.0
+            informational: true
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -81,7 +101,7 @@ jobs:
       - name: Install Helm
         uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
         with:
-          version: ${{ env.HELM_VERSION }}
+          version: ${{ matrix.helm }}
 
       - name: Install kubeconform
         run: |
@@ -93,10 +113,22 @@ jobs:
           kubeconform -v
 
       - name: Install helm-unittest
-        run: helm plugin install https://github.com/helm-unittest/helm-unittest --version "${HELM_UNITTEST_VERSION}"
+        env:
+          HELM: ${{ matrix.helm }}
+        run: |
+          if [[ "${HELM}" == v3.* ]]; then
+            helm plugin install https://github.com/helm-unittest/helm-unittest --version "${HELM_UNITTEST_VERSION}"
+          else
+            curl -fsSL -o /tmp/unittest.tgz \
+              "https://github.com/helm-unittest/helm-unittest/releases/download/v${HELM4_UNITTEST_VERSION}/unittest-${HELM4_UNITTEST_VERSION}.tgz"
+            echo "${HELM4_UNITTEST_SHA256}  /tmp/unittest.tgz" | sha256sum -c
+            helm plugin install /tmp/unittest.tgz --verify=false
+          fi
 
       - name: Chart template unit tests
-        run: helm unittest charts/grid-site charts/grid-operator charts/grid-enrollment charts/praxis-gateway
+        run: |
+          mapfile -t charts < <(find charts -mindepth 2 -maxdepth 2 -name tests -type d -printf '%h\n' | sort)
+          helm unittest "${charts[@]}"
 
       - name: Validate charts (static)
         run: ./scripts/verify-helm-chart.sh
@@ -117,7 +149,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: rendered-manifests
+          name: rendered-manifests-${{ matrix.helm }}
           path: /tmp/helm-rendered-*.yaml
           if-no-files-found: ignore
           retention-days: 5
@@ -177,7 +209,7 @@ jobs:
   # ----------------------------------------------------------------------------
 
   publish:
-    needs: [images, kind, kind-enrollment, kind-hub-site]
+    needs: [images, kind, kind-enrollment, kind-hub-site, upgrade]
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -258,6 +290,84 @@ jobs:
         with:
           name: kind-test-logs
           path: /tmp/helm-kind-logs/
+          if-no-files-found: ignore
+          retention-days: 5
+
+  # ----------------------------------------------------------------------------
+  # Chart upgrade: install from the base ref, `helm upgrade` to this commit;
+  # CRDs and CRs must survive. 3.17.3 adopts CRDs with --take-ownership; the
+  # 3.12 floor predates the flag and runs the documented manual adoption.
+  # ----------------------------------------------------------------------------
+
+  upgrade:
+    name: upgrade (helm ${{ matrix.helm }})
+    needs: changes
+    if: needs.changes.outputs.runtime == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {helm: v3.17.3, take_ownership: "1"}
+          - {helm: v3.12.3, take_ownership: "0"}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Helm
+        env:
+          HELM: ${{ matrix.helm }}
+        run: |
+          case "${HELM}" in
+            "${HELM_VERSION}") sha="${HELM_SHA256}" ;;
+            "${HELM_FLOOR_VERSION}") sha="${HELM_FLOOR_SHA256}" ;;
+            *) echo "no pinned digest for ${HELM}"; exit 1 ;;
+          esac
+          curl -fsSL -o /tmp/helm.tgz "https://get.helm.sh/helm-${HELM}-linux-amd64.tar.gz"
+          echo "${sha}  /tmp/helm.tgz" | sha256sum -c
+          tar xzf /tmp/helm.tgz -C /tmp linux-amd64/helm
+          sudo install -m 0755 /tmp/linux-amd64/helm /usr/local/bin/helm
+          helm version --short
+
+      - name: Install Kind
+        run: |
+          curl -fsSL -o /tmp/kind \
+            "https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}/kind-linux-amd64"
+          echo "50030de23cf40a18505f20426f6a8506bedf13c6e509244bd1fa9463721b0f54  /tmp/kind" | sha256sum -c
+          sudo install -m 0755 /tmp/kind /usr/local/bin/kind
+          rm /tmp/kind
+
+      - name: Run chart upgrade e2e
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          MQ_BASE: ${{ github.event.merge_group.base_sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          TAKE_OWNERSHIP: ${{ matrix.take_ownership }}
+        run: |
+          case "${EVENT_NAME}" in
+            pull_request) base="${PR_BASE}" ;;
+            merge_group) base="${MQ_BASE}" ;;
+            *) base="${PUSH_BEFORE}" ;;
+          esac
+          if ! git cat-file -e "${base}^{commit}" 2>/dev/null; then base="$(git rev-parse HEAD^)"; fi
+          BASE_REF="${base}" KEEP=1 CLUSTER=grid-helm-upgrade ./scripts/e2e-helm-upgrade.sh
+
+      - name: Export Kind logs
+        if: failure()
+        run: kind export logs /tmp/helm-upgrade-logs --name grid-helm-upgrade || true
+
+      - name: Upload Kind logs
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: helm-upgrade-logs-${{ matrix.helm }}
+          path: /tmp/helm-upgrade-logs/
           if-no-files-found: ignore
           retention-days: 5
 

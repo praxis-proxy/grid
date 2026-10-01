@@ -801,11 +801,15 @@ try_reject_msg "$GW_DIR" "rendered config without localSite (gw)" "localSite" "$
   --set gatewayConfig.localSite=""
 try_reject_msg "$GW_DIR" "provider spiffe without an allowlist (gw)" "peerTrust" "${PROVIDER[@]}" "${SPIFFE[@]}"
 try_reject_msg "$GW_DIR" "provider pin without digests (gw)" "peerTrust" "${PROVIDER[@]}" --set gatewayConfig.peerTrust.certDigests=null
-# The template guards hold without the schema (Helm 3.16+ --skip-schema-validation).
-try_reject_msg "$GW_DIR" "provider spiffe without an allowlist, schema skipped (gw)" "allowAnyGridSite true" \
-  --skip-schema-validation "${PROVIDER[@]}" "${SPIFFE[@]}"
-try_reject_msg "$GW_DIR" "provider pin without digests, schema skipped (gw)" "pin mode needs certDigests" \
-  --skip-schema-validation "${PROVIDER[@]}" --set gatewayConfig.peerTrust.certDigests=null
+# The template guards hold without the schema. The flag needs Helm 3.16+.
+if helm template --help | grep -q -- --skip-schema-validation; then
+  try_reject_msg "$GW_DIR" "provider spiffe without an allowlist, schema skipped (gw)" "allowAnyGridSite true" \
+    --skip-schema-validation "${PROVIDER[@]}" "${SPIFFE[@]}"
+  try_reject_msg "$GW_DIR" "provider pin without digests, schema skipped (gw)" "pin mode needs certDigests" \
+    --skip-schema-validation "${PROVIDER[@]}" --set gatewayConfig.peerTrust.certDigests=null
+else
+  echo "  SKIP: template guards without the schema (needs Helm 3.16+)"
+fi
 try_reject_msg "$GW_DIR" "provider on the ai image flavor (gw)" "image.flavor grid-gateway" "${PROVIDER[@]}" --set image.flavor=ai
 try_reject_msg "$GW_DIR" "provider pin with a malformed digest (gw)" "certDigests" "${PROVIDER[@]}" \
   --set-json 'gatewayConfig.peerTrust.certDigests=["ABC"]'
