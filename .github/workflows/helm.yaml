@@ -11,6 +11,7 @@ on:
     branches: [main]
   merge_group:
     branches: [main]
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -57,7 +58,7 @@ jobs:
           fi
 
           changed_files="$(git diff --name-only "${BASE_SHA}...${GITHUB_SHA}")"
-          if printf '%s\n' "${changed_files}" | grep -qvE '(^docs/|(^|/)README[^/]*$|\.md$)'; then
+          if grep -qvE '(^docs/|(^|/)README[^/]*$|\.md$)' <<<"${changed_files}"; then
             echo "runtime=true" >> "${GITHUB_OUTPUT}"
           else
             echo "runtime=false" >> "${GITHUB_OUTPUT}"
@@ -122,12 +123,98 @@ jobs:
           retention-days: 5
 
   # ----------------------------------------------------------------------------
+  # Build each image once per commit; every kind job loads it from an artifact.
+  # Artifacts work for fork PRs, which cannot push to a registry. Only main
+  # writes the layer cache, so a PR cannot seed layers that main reads.
+  # ----------------------------------------------------------------------------
+
+  images:
+    needs: changes
+    if: needs.changes.outputs.runtime == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {name: operator, file: deploy/operator/Containerfile}
+          - {name: gateway, file: deploy/gateway/Containerfile}
+          - {name: enrollment, file: deploy/enrollment/Containerfile}
+          - {name: mock-providers, file: mock-providers/Containerfile}
+          - {name: overlay-sync, file: overlay-sync/Containerfile}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build ${{ matrix.name }} image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: ${{ matrix.file }}
+          push: false
+          tags: ghcr.io/praxis-proxy/grid-${{ matrix.name }}:ci
+          outputs: type=docker,dest=/tmp/grid-${{ matrix.name }}.tar
+          cache-from: type=gha,scope=img-${{ matrix.name }}
+          cache-to: ${{ github.event_name == 'push' && format('type=gha,mode=max,scope=img-{0}', matrix.name) || '' }}
+
+      - name: Upload ${{ matrix.name }} image
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: image-${{ matrix.name }}
+          path: /tmp/grid-${{ matrix.name }}.tar
+          if-no-files-found: error
+          retention-days: 1
+
+  # ----------------------------------------------------------------------------
+  # Publish the tested images as sha-<short> tags. Push and dispatch only: this is
+  # the one job with packages:write, and it runs no build steps.
+  # ----------------------------------------------------------------------------
+
+  publish:
+    needs: [images, kind, kind-enrollment, kind-hub-site]
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Download images
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: image-*
+          path: /tmp/images
+          merge-multiple: true
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Push sha-<short> tags
+        run: |
+          for name in operator gateway enrollment mock-providers overlay-sync; do
+            docker load -i "/tmp/images/grid-${name}.tar"
+            ref="ghcr.io/praxis-proxy/grid-${name}"
+            docker tag "${ref}:ci" "${ref}:sha-${GITHUB_SHA::7}"
+            docker push "${ref}:sha-${GITHUB_SHA::7}"
+          done
+
+  # ----------------------------------------------------------------------------
   # Kind chart lifecycle test (install/upgrade/uninstall wiring with pause:3.9;
   # real Praxis runtime behavior is proven by the GLB demo)
   # ----------------------------------------------------------------------------
 
   kind:
-    needs: changes
+    needs: [changes, images]
     if: needs.changes.outputs.runtime == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -152,19 +239,14 @@ jobs:
           rm /tmp/kind
           kind version
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
-
-      - name: Build operator image for Kind
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+      - name: Download operator image
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          context: .
-          file: deploy/operator/Containerfile
-          push: false
-          load: true
-          tags: ghcr.io/praxis-proxy/grid-operator:ci
-          cache-from: type=gha,scope=helm-kind-operator
-          cache-to: type=gha,mode=max,scope=helm-kind-operator
+          name: image-operator
+          path: /tmp/images
+
+      - name: Load operator image
+        run: docker load -i /tmp/images/grid-operator.tar
 
       - name: Run Kind lifecycle tests
         run: |
@@ -185,7 +267,7 @@ jobs:
   # ----------------------------------------------------------------------------
 
   kind-enrollment:
-    needs: changes
+    needs: [changes, images]
     if: needs.changes.outputs.runtime == 'true'
     runs-on: ubuntu-24.04
     strategy:
@@ -214,19 +296,14 @@ jobs:
           rm /tmp/kind
           kind version
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
-
-      - name: Build enrollment image for Kind
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+      - name: Download enrollment image
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          context: .
-          file: deploy/enrollment/Containerfile
-          push: false
-          load: true
-          tags: ghcr.io/praxis-proxy/grid-enrollment:ci
-          cache-from: type=gha,scope=helm-kind-enrollment
-          cache-to: type=gha,mode=max,scope=helm-kind-enrollment
+          name: image-enrollment
+          path: /tmp/images
+
+      - name: Load enrollment image
+        run: docker load -i /tmp/images/grid-enrollment.tar
 
       - name: Run enrollment e2e (helm reproducibility and the enroll flow)
         env:
@@ -250,7 +327,7 @@ jobs:
   # ----------------------------------------------------------------------------
 
   kind-hub-site:
-    needs: changes
+    needs: [changes, images]
     if: needs.changes.outputs.runtime == 'true'
     runs-on: ubuntu-24.04
     strategy:
@@ -282,61 +359,34 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@6190aa5fb88a88ee71c12769924bbe63a9ab152e # 1.96.0
 
-      - name: Cache Cargo registry and build artifacts
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      # Per-job key, dependencies only; PRs restore main's cache and never save.
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-            target
-          key: ${{ runner.os }}-rust-1.96.0-forge-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-rust-1.96.0-forge-
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Build forge
         run: cargo build -p forge --bin praxis-forge
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
-
-      - name: Build operator image for Kind
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+      - name: Download images
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          context: .
-          file: deploy/operator/Containerfile
-          push: false
-          load: true
-          tags: localhost/grid-operator:e2e
-          cache-from: type=gha,scope=helm-kind-operator
-          cache-to: type=gha,mode=max,scope=helm-kind-operator
+          pattern: image-*
+          path: /tmp/images
+          merge-multiple: true
 
-      - name: Build gateway image for Kind
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
-        with:
-          context: .
-          file: deploy/gateway/Containerfile
-          push: false
-          load: true
-          tags: localhost/grid-gateway:e2e
-          cache-from: type=gha,scope=helm-kind-gateway
-          cache-to: type=gha,mode=max,scope=helm-kind-gateway
-
-      - name: Build enrollment image for Kind
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
-        with:
-          context: .
-          file: deploy/enrollment/Containerfile
-          push: false
-          load: true
-          tags: localhost/grid-enrollment:e2e
-          cache-from: type=gha,scope=helm-kind-enrollment
-          cache-to: type=gha,mode=max,scope=helm-kind-enrollment
+      - name: Load images
+        run: |
+          for name in operator gateway enrollment; do
+            docker load -i "/tmp/images/grid-${name}.tar"
+          done
 
       - name: Run hub and site install e2e
         env:
           MODES: ${{ matrix.peer-trust-mode }}
           SKIP_BUILD: "1"
+          IMAGE_PREFIX: ghcr.io/praxis-proxy/grid-
+          IMAGE_TAG: ci
           FORGE_BIN: ${{ github.workspace }}/target/debug/praxis-forge
           ARTIFACTS: /tmp/grid-hub-site-e2e
         run: ./scripts/e2e-hub-site.sh

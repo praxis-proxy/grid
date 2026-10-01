@@ -20,11 +20,48 @@ concurrency:
 permissions: {}
 
 jobs:
+  # ------------------------------------------------------------------------------
+  # Skip the Rust jobs for documentation-only pull requests.
+  # ------------------------------------------------------------------------------
+
+  changes:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      runtime: ${{ steps.changed.outputs.runtime }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Detect runtime changes
+        id: changed
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+
+          if [ "${EVENT_NAME}" != "pull_request" ]; then
+            echo "runtime=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          changed_files="$(git diff --name-only "${BASE_SHA}...${GITHUB_SHA}")"
+          if grep -qvE '(^docs/|(^|/)README[^/]*$|\.md$)' <<<"${changed_files}"; then
+            echo "runtime=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "runtime=false" >> "${GITHUB_OUTPUT}"
+          fi
+
   # ----------------------------------------------------------------------------
   # Code Coverage Gate
   # ----------------------------------------------------------------------------
 
   coverage:
+    needs: changes
+    if: needs.changes.outputs.runtime == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -51,18 +88,12 @@ jobs:
         if: steps.cache-llvm-cov.outputs.cache-hit != 'true'
         run: cargo install cargo-llvm-cov --locked
 
-      - name: Cache Cargo registry and build artifacts
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      # Per-job key, dependencies only; PRs restore main's cache and never save.
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-            target/llvm-cov-target
-          key: ${{ runner.os }}-rust-1.96.0-coverage-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-rust-1.96.0-coverage-
-          save-always: true
+          workspaces: . -> target/llvm-cov-target
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Check coverage (>=80% lines)
         run: make coverage-check

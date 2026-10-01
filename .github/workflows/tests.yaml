@@ -23,11 +23,48 @@ env:
   NIGHTLY_RUSTFMT: nightly-2026-03-28
 
 jobs:
+  # ------------------------------------------------------------------------------
+  # Skip the Rust jobs for documentation-only pull requests.
+  # ------------------------------------------------------------------------------
+
+  changes:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      runtime: ${{ steps.changed.outputs.runtime }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Detect runtime changes
+        id: changed
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+
+          if [ "${EVENT_NAME}" != "pull_request" ]; then
+            echo "runtime=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          changed_files="$(git diff --name-only "${BASE_SHA}...${GITHUB_SHA}")"
+          if grep -qvE '(^docs/|(^|/)README[^/]*$|\.md$)' <<<"${changed_files}"; then
+            echo "runtime=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "runtime=false" >> "${GITHUB_OUTPUT}"
+          fi
+
   # ----------------------------------------------------------------------------
   # Lint (fmt + clippy + machete)
   # ----------------------------------------------------------------------------
 
   lint:
+    needs: changes
+    if: needs.changes.outputs.runtime == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -45,18 +82,11 @@ jobs:
         with:
           components: clippy
 
-      - name: Cache Cargo registry and build artifacts
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      # Per-job key, dependencies only; PRs restore main's cache and never save.
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-            target
-          key: ${{ runner.os }}-rust-1.96.0-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-rust-1.96.0-cargo-
-          save-always: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install cargo-machete
         run: cargo install cargo-machete --locked
@@ -75,6 +105,8 @@ jobs:
   # ----------------------------------------------------------------------------
 
   test:
+    needs: changes
+    if: needs.changes.outputs.runtime == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -87,18 +119,11 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@6190aa5fb88a88ee71c12769924bbe63a9ab152e # 1.96.0
 
-      - name: Cache Cargo registry and build artifacts
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      # Per-job key, dependencies only; PRs restore main's cache and never save.
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-            target
-          key: ${{ runner.os }}-rust-1.96.0-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-rust-1.96.0-cargo-
-          save-always: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Unit tests
         run: make test-unit
@@ -108,6 +133,8 @@ jobs:
   # ----------------------------------------------------------------------------
 
   fips:
+    needs: changes
+    if: needs.changes.outputs.runtime == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -128,18 +155,11 @@ jobs:
         with:
           components: clippy
 
-      - name: Cache Cargo registry and build artifacts
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      # Per-job key, dependencies only; PRs restore main's cache and never save.
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-            target
-          key: ${{ runner.os }}-rust-1.96.0-cargo-fips-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-rust-1.96.0-cargo-fips-
-          save-always: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # --manifest-path: overlay-sync resolves as its own workspace, so
       # -p ... --features is rejected. Scope to lib+bins (operator has a lib,

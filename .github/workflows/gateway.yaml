@@ -55,18 +55,12 @@ jobs:
         with:
           components: clippy
 
-      - name: Cache Cargo registry and build artifacts
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      # Per-job key, dependencies only; PRs restore main's cache and never save.
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-            gateway/target
-          key: ${{ runner.os }}-rust-1.96.0-gateway-${{ hashFiles('gateway/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-rust-1.96.0-gateway-
-          save-always: true
+          workspaces: gateway -> target
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install cargo-machete
         run: cargo install cargo-machete --locked
@@ -97,18 +91,12 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@6190aa5fb88a88ee71c12769924bbe63a9ab152e # 1.96.0
 
-      - name: Cache Cargo registry and build artifacts
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      # Per-job key, dependencies only; PRs restore main's cache and never save.
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-            gateway/target
-          key: ${{ runner.os }}-rust-1.96.0-gateway-${{ hashFiles('gateway/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-rust-1.96.0-gateway-
-          save-always: true
+          workspaces: gateway -> target
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Unit tests
         run: cargo test --manifest-path gateway/Cargo.toml

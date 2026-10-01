@@ -153,9 +153,9 @@ kubectl set image deployment/grid-operator \
 
 **Registry namespace:** the image is published under `ghcr.io/praxis-proxy/`.
 
-**CI publishing setup:** the
-`.github/workflows/operator-image.yaml` publishes source-SHA images from
-`main`. `.github/workflows/release.yaml` publishes version and source-SHA tags
+**CI publishing setup:** the `publish` job in
+`.github/workflows/helm.yaml` publishes source-SHA images from `main`, using
+the images the e2e jobs tested. `.github/workflows/release.yaml` publishes version and source-SHA tags
 after the tagged source passes release gates.
 
 **Security:** the operator image contains only the
