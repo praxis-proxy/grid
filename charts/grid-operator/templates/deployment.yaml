@@ -79,6 +79,8 @@ spec:
               value: {{ .Values.gateway.port | default "8080" | quote }}
             - name: GRID_METRICS_ADDR
               value: {{ .Values.metrics.bindAddress | quote }}
+            - name: GRID_SIGNALS_ADDR
+              value: "0.0.0.0:9091"
             - name: RUST_LOG
               value: {{ .Values.log.level | quote }}
           ports:
@@ -87,6 +89,9 @@ spec:
               protocol: UDP
             - name: metrics
               containerPort: {{ splitList ":" .Values.metrics.bindAddress | last }}
+              protocol: TCP
+            - name: signals-tcp
+              containerPort: 9091
               protocol: TCP
           livenessProbe:
             httpGet:

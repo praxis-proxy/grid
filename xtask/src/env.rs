@@ -1055,6 +1055,16 @@ pub(crate) enum Action {
         kv_cache: bool,
     },
 
+    /// Qualify pressure-weighted routing from poll-mode Grid signals end to end.
+    RunGridDynamicWeightedQualification {
+        /// Path to the llm-d pool-metrics Forge topology.
+        #[arg(long, default_value = "tests/e2e/topologies/grid-llmd-pool-metrics/forge.yaml")]
+        forge_config: PathBuf,
+        /// Full qualification lifecycle and evidence options.
+        #[command(flatten)]
+        options: GlbDemoOptions,
+    },
+
     /// Qualify the provider-gateway traffic topology, proving equal
     /// selection across its active provider group.
     RunGridProviderTrafficQualification {
@@ -1199,6 +1209,43 @@ mod static_weighted_qualification_cli_tests {
     }
 }
 
+#[cfg(test)]
+#[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, reason = "tests")]
+mod dynamic_weighted_qualification_cli_tests {
+    use clap::Parser as _;
+
+    use super::Action;
+    use crate::{Cli, Command};
+
+    #[test]
+    fn dynamic_weighted_command_defaults_to_pool_metrics_topology_and_accepts_full_teardown() {
+        let cli = Cli::try_parse_from([
+            "xtask",
+            "env",
+            "run-grid-dynamic-weighted-qualification",
+            "--full",
+            "--teardown",
+            "--evidence-dir",
+            "evidence/run-1",
+        ])
+        .expect("dynamic weighted CLI invocation must parse");
+        let Command::Env { action } = cli.command else {
+            panic!("expected env command");
+        };
+        let Action::RunGridDynamicWeightedQualification { forge_config, options } = action else {
+            panic!("expected dynamic weighted action");
+        };
+        assert_eq!(
+            forge_config,
+            std::path::PathBuf::from("tests/e2e/topologies/grid-llmd-pool-metrics/forge.yaml")
+        );
+        assert!(options.teardown);
+        assert!(options.mode_options.full);
+        assert_eq!(options.evidence_dir, Some(std::path::PathBuf::from("evidence/run-1")));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Execution
 // ---------------------------------------------------------------------------
@@ -1310,6 +1357,9 @@ pub(crate) fn run(action: &Action) -> Result<(), Box<dyn std::error::Error>> {
             metrics_mtls,
             kv_cache,
         } => llmd_pool_metrics_demo::run(forge_config, options, *metrics_mtls, *kv_cache),
+        Action::RunGridDynamicWeightedQualification { forge_config, options } => {
+            llmd_pool_metrics_demo::run_dynamic_weighted(forge_config, options)
+        },
         Action::RunGridProviderTrafficQualification { forge_config, options } => {
             provider_traffic_qualification::run(forge_config, options)
         },

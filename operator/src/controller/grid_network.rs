@@ -35,7 +35,7 @@ use crate::{
     error::OperatorError,
     resources::{
         consumer_config::{self, ConsumerConfigError},
-        overlay_envelope, provider_admission, provider_metrics, routing_overlay, secret,
+        overlay_envelope, placement, provider_admission, provider_metrics, routing_overlay, secret,
         tls_backend::ServerTlsConfig,
         trust_bundle::{self, CertPemStatus},
     },
@@ -88,6 +88,9 @@ pub struct OperatorCtx {
     /// state is copied into the overlay. It is never consulted by a request.
     pub(crate) admission_memory: Mutex<provider_admission::AdmissionMemory>,
 
+    /// Pressure smoothing state, keyed by `GridNetwork` and gateway identity.
+    pub(crate) placement_states: std::sync::Mutex<HashMap<String, placement::PlacementState>>,
+
     /// Tracks the seed set announced on the last reconcile per `GridNetwork`.
     ///
     /// Keyed by `GridNetwork` name.  On each reconcile, the new seed set is
@@ -129,6 +132,7 @@ impl OperatorCtx {
             swim,
             metrics_cache: Mutex::new(provider_metrics::MetricsCache::new()),
             admission_memory: Mutex::new(provider_admission::AdmissionMemory::default()),
+            placement_states: std::sync::Mutex::new(HashMap::new()),
             last_seeds: std::sync::Mutex::new(HashMap::new()),
             peer_identities: signals::PeerIdentities::new(),
             peers: signals::SignalStore::new(),
@@ -185,31 +189,56 @@ fn site_signals_ttl() -> Duration {
 pub async fn refresh_signals(ctx: &OperatorCtx, client: &Client, network_name: &str) -> Result<(), OperatorError> {
     let providers = list_all_inference_providers(client).await?;
     ctx.signals.set_access(signal_access(&providers));
-    Box::pin(register_peers(ctx, client)).await?;
+    Box::pin(register_peers(ctx, client, network_name)).await?;
     let collected = provider_metrics::collect_provider_signals(network_name, &providers, Some(client)).await;
     publish_signals(ctx, collected);
     Ok(())
 }
 
 /// Refresh who may read from the currently approved sites.
-async fn register_peers(ctx: &OperatorCtx, client: &Client) -> Result<(), OperatorError> {
+async fn register_peers(ctx: &OperatorCtx, client: &Client, network_name: &str) -> Result<(), OperatorError> {
     let sites = list_all_grid_sites(client).await?;
-    ctx.peer_identities.set(peer_identities(&sites));
+    let membership = ctx
+        .swim
+        .as_ref()
+        .map_or_else(MembershipSnapshot::default, |swim| swim.snapshot());
+    let local_site = ctx.swim.as_ref().map_or("", |swim| swim.site_name());
+    ctx.peer_identities
+        .set(peer_identities(&sites, network_name, local_site, &membership));
     Ok(())
 }
 
 /// What this site holds about each peer it knows.
 ///
-/// Keyed by `GridSite` name, which is the name a peer's certificate carries in
-/// its DNS SAN. The SAN survives renewal, so a peer stays named through a key
-/// rotation. `status` is deliberately not read: it is populated from gossip,
-/// and a member could advertise its own certificate under another site's name.
-/// The labels are the local object's for the same reason.
-fn peer_identities(sites: &[GridSite]) -> std::collections::BTreeMap<String, signals::PeerRecord> {
+/// Keyed by SWIM site ID, which is what the peer poller looks up. Auto-discovered
+/// `GridSite` resource names are network-prefixed, so using `metadata.name`
+/// directly would fail closed before polling. The canonical discovered name
+/// binds each local trust record to its SWIM identity. `status` is deliberately
+/// not read: it is populated from gossip, and a member could advertise its own
+/// certificate under another site's name. The labels are local for the same
+/// reason.
+fn peer_identities(
+    sites: &[GridSite],
+    network_name: &str,
+    local_site: &str,
+    membership: &MembershipSnapshot,
+) -> std::collections::BTreeMap<String, signals::PeerRecord> {
     sites
         .iter()
         .filter_map(|site| {
-            let name = site.metadata.name.clone()?;
+            if site.spec.grid_network_ref != network_name {
+                return None;
+            }
+            let resource_name = site.metadata.name.as_deref()?;
+            let mut matching_members = membership.members.iter().filter(|member| {
+                member.site_id != local_site && discovered_site_k8s_name(network_name, &member.site_id) == resource_name
+            });
+            let member = matching_members.next()?;
+            // Sanitization in the Kubernetes resource name is lossy; if two
+            // SWIM IDs map to one name, neither identity may inherit its pins.
+            if matching_members.next().is_some() {
+                return None;
+            }
             let record = signals::PeerRecord {
                 labels: site.metadata.labels.clone().unwrap_or_default(),
                 pins: site
@@ -222,7 +251,7 @@ fn peer_identities(sites: &[GridSite]) -> std::collections::BTreeMap<String, sig
                     .map(|fp| signals::canonical_fingerprint(fp))
                     .collect(),
             };
-            Some((name, record))
+            Some((member.site_id.clone(), record))
         })
         .collect()
 }
@@ -447,6 +476,22 @@ fn reject_invalid_budget_policy(network: &GridNetwork) -> Result<(), OperatorErr
         .map_err(|error| OperatorError::InvalidResource(format!("invalid budgetPolicy: {error}")))
 }
 
+/// Pressure-weighted placement consumes the operator's live poll-mode stores;
+/// reject it rather than silently reverting to static or scoring behavior.
+fn reject_invalid_placement_mode(network: &GridNetwork, running_mode: SignalMode) -> Result<(), OperatorError> {
+    let pressure_weighted = network
+        .spec
+        .placement_policy
+        .as_ref()
+        .is_some_and(|policy| policy.strategy == crate::crd::grid_network::PlacementStrategy::PressureWeighted);
+    if pressure_weighted && running_mode != SignalMode::Poll {
+        return Err(OperatorError::InvalidResource(
+            "pressureWeighted placement requires the operator to run with signalTransport.mode=poll; restart the operator after changing the mode".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Reconcile
 // ---------------------------------------------------------------------------
@@ -469,6 +514,7 @@ fn reject_invalid_budget_policy(network: &GridNetwork) -> Result<(), OperatorErr
 pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Result<Action, OperatorError> {
     let name = grid_network_name(&network)?;
     reject_invalid_budget_policy(&network)?;
+    reject_invalid_placement_mode(&network, ctx.signal_mode)?;
 
     info!(name, "reconciling GridNetwork");
 
@@ -650,6 +696,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
 
     let (consumer_config_statuses, overlay_statuses) = reconcile_routing_overlay_inner(
         &network,
+        &ctx,
         client,
         &providers,
         &remote_crdt_providers,
@@ -1130,10 +1177,11 @@ async fn apply_site_secret(
 )]
 #[expect(
     clippy::too_many_arguments,
-    reason = "scoring_weights is threaded through overlay rendering without hiding the selected strategy"
+    reason = "pre-fetched reconcile inputs and controller context are passed explicitly to the overlay renderer"
 )]
 async fn reconcile_routing_overlay_inner(
     network: &GridNetwork,
+    ctx: &OperatorCtx,
     client: &Client,
     providers: &[InferenceProvider],
     remote_crdt_providers: &[crdt::ProviderState],
@@ -1152,6 +1200,49 @@ async fn reconcile_routing_overlay_inner(
     } else {
         Some(&metrics_by_str)
     };
+
+    let pressure_config = network
+        .spec
+        .placement_policy
+        .as_ref()
+        .filter(|policy| policy.strategy == crate::crd::grid_network::PlacementStrategy::PressureWeighted)
+        .and_then(|policy| policy.pressure_weighted.as_ref());
+    let pressure_metric = pressure_config.map(|config| match config.signal {
+        crate::crd::grid_network::PressureSignal::QueueDepth => placement::QUEUE_PRESSURE_METRIC,
+        crate::crd::grid_network::PressureSignal::KvCacheUtilization => placement::KV_CACHE_PRESSURE_METRIC,
+    });
+    let pressure_values = pressure_metric.map_or_else(HashMap::new, |metric| {
+        let collect = [metric.to_owned()];
+        let (local, _) = ctx.signals.render_unrestricted(None, &collect);
+        let (peers, _) = ctx.peers.render_unrestricted(None, &collect);
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+            .unwrap_or(i64::MAX);
+        let max_age = Duration::from_secs(u64::from(
+            pressure_config.map_or(120, |config| config.stale_signal_seconds),
+        ));
+        placement::fresh_signal_values(&local, &peers, metric, now_ms, max_age)
+    });
+    let signal_origin_site = ctx
+        .swim
+        .as_ref()
+        .map_or_else(String::new, |swim| swim.site_name().to_owned());
+
+    if pressure_config.is_some() {
+        let active_state_keys: BTreeSet<String> = network
+            .spec
+            .gateway_refs
+            .iter()
+            .map(|gateway| format!("{network_name}/{}/{}", gateway.namespace, gateway.name))
+            .collect();
+        let mut states = ctx
+            .placement_states
+            .lock()
+            .map_err(|error| OperatorError::InvalidResource(format!("placement state lock poisoned: {error}")))?;
+        states.retain(|key, _| active_state_keys.contains(key));
+    }
 
     let observed_generation = network.metadata.generation.unwrap_or(0);
     let mut consumer_statuses: Vec<ConsumerConfigStatus> = Vec::new();
@@ -1183,17 +1274,43 @@ async fn reconcile_routing_overlay_inner(
         }
 
         let timestamp = rfc3339_now();
-        let overlay = match routing_overlay::render_routing_overlay_with_admission(
-            network,
-            &sites,
-            providers,
-            &eligible_remote_owned,
-            local_site,
-            metrics_arg,
-            timestamp.as_deref(),
-            scoring_weights,
-            Some(admission_states),
-        ) {
+        let render_result = if pressure_config.is_some() {
+            let state_key = format!("{network_name}/{}/{}", gw_ref.namespace, gw_ref.name);
+            let mut states = ctx
+                .placement_states
+                .lock()
+                .map_err(|error| OperatorError::InvalidResource(format!("placement state lock poisoned: {error}")))?;
+            let state = states.entry(state_key).or_default();
+            let rendered = routing_overlay::render_routing_overlay_with_pressure(
+                network,
+                &sites,
+                providers,
+                &eligible_remote_owned,
+                local_site,
+                metrics_arg,
+                timestamp.as_deref(),
+                scoring_weights,
+                Some(admission_states),
+                &pressure_values,
+                &signal_origin_site,
+                state,
+            );
+            drop(states);
+            rendered
+        } else {
+            routing_overlay::render_routing_overlay_with_admission(
+                network,
+                &sites,
+                providers,
+                &eligible_remote_owned,
+                local_site,
+                metrics_arg,
+                timestamp.as_deref(),
+                scoring_weights,
+                Some(admission_states),
+            )
+        };
+        let overlay = match render_result {
             Ok(overlay) => overlay,
             Err(error) => {
                 tracing::warn!(
@@ -1233,28 +1350,6 @@ async fn reconcile_routing_overlay_inner(
                 continue;
             },
         };
-        // Praxis intelligent_route rejects an empty candidates list at config load
-        // time, which would cause a hot-reload error rather than a clean
-        // "no routes" state.  Skip the apply and warn so the previous
-        // (non-empty) ConfigMap remains in place until a provider becomes
-        // available again.
-        if overlay.candidates.is_empty() {
-            tracing::warn!(
-                network = network_name,
-                gateway = %gw_ref.name,
-                "routing overlay has no candidates; skipping ConfigMap apply \
-                 to prevent invalid Praxis intelligent_route config"
-            );
-            overlay_statuses.push(retained_overlay_status(
-                network,
-                gw_ref,
-                observed_generation,
-                Some(&render),
-                "EmptyCandidates",
-                "no candidates available",
-            ));
-            continue;
-        }
         let resource_version = match distribute_overlay_configmap(&overlay, &render, network_name, gw_ref, client).await
         {
             Ok(rv) => rv,
@@ -1282,22 +1377,13 @@ async fn reconcile_routing_overlay_inner(
             &resource_version,
             &render.rendered_at,
         );
-        overlay_statuses.push(OverlayRevisionStatus {
-            gateway_name: gw_ref.name.clone(),
-            namespace: gw_ref.namespace.clone(),
-            config_map_name: render.config_map_name,
-            schema_version: render.schema_version,
-            rendered_revision: render.revision_hex.clone(),
-            distributed_revision: render.revision_hex.clone(),
-            content_digest: render.revision_hex,
-            config_map_resource_version: resource_version,
+        overlay_statuses.push(distributed_overlay_status(
+            gw_ref,
+            render,
+            resource_version,
             rendered_at,
-            candidate_count: render.candidate_count,
-            phase: OverlayPhase::Distributed,
-            reason: String::new(),
-            message: String::new(),
             observed_generation,
-        });
+        ));
 
         // Opt-in: generate and apply the consumer Praxis config when enabled.
         // Render/apply errors are recorded as per-gateway status and do NOT
@@ -1515,6 +1601,33 @@ pub(crate) struct OverlayRenderResult {
     pub(crate) candidate_count: u32,
     /// The built envelope, carried forward for distribution.
     pub(crate) envelope: overlay_envelope::OverlayEnvelope,
+}
+
+/// Build status for a successfully distributed overlay, including an
+/// intentional empty weighted overlay that means no provider is eligible.
+fn distributed_overlay_status(
+    gw_ref: &GatewayRef,
+    render: OverlayRenderResult,
+    resource_version: String,
+    rendered_at: String,
+    observed_generation: i64,
+) -> OverlayRevisionStatus {
+    OverlayRevisionStatus {
+        gateway_name: gw_ref.name.clone(),
+        namespace: gw_ref.namespace.clone(),
+        config_map_name: render.config_map_name,
+        schema_version: render.schema_version,
+        rendered_revision: render.revision_hex.clone(),
+        distributed_revision: render.revision_hex.clone(),
+        content_digest: render.revision_hex,
+        config_map_resource_version: resource_version,
+        rendered_at,
+        candidate_count: render.candidate_count,
+        phase: OverlayPhase::Distributed,
+        reason: String::new(),
+        message: String::new(),
+        observed_generation,
+    }
 }
 
 /// Build the overlay envelope without distributing it.
@@ -2845,6 +2958,32 @@ mod tests {
         .unwrap_or_else(|_| std::process::abort())
     }
 
+    #[test]
+    fn peer_identity_uses_swim_site_id_for_network_prefixed_grid_site() {
+        let mut site = make_grid_site("net-pool-b", "net");
+        site.spec.trust = Some(crate::crd::grid_site::GridSiteTrustPolicy {
+            canonical_fingerprints: Some(vec!["AB".to_owned()]),
+            ..Default::default()
+        });
+        let membership = MembershipSnapshot {
+            members: vec![
+                make_member("pool-a", "127.0.0.1:7946", MemberStatus::Alive),
+                make_member("pool-b", "127.0.0.2:7946", MemberStatus::Alive),
+            ],
+        };
+
+        let records = peer_identities(&[site], "net", "pool-a", &membership);
+        let identities = signals::PeerIdentities::new();
+        identities.set(records);
+
+        assert!(!identities.refuses("pool-b"), "poller addresses peers by SWIM site ID");
+        assert_eq!(identities.pins_for("pool-b"), vec!["ab"]);
+        assert!(
+            identities.refuses("net-pool-b"),
+            "the Kubernetes GridSite name is not the SWIM peer lookup key"
+        );
+    }
+
     fn ref_name(refs: Option<ObjectRef<GridNetwork>>) -> String {
         refs.unwrap_or_else(|| std::process::abort()).name
     }
@@ -3020,6 +3159,31 @@ mod tests {
                 "non-finite capUsd ({bad_cap}) must be rejected"
             );
         }
+    }
+
+    #[test]
+    fn pressure_weighted_placement_requires_poll_mode_at_operator_startup() {
+        let mut network = base_network();
+        network.spec.selection_policy = Some(crate::crd::grid_network::SelectionPolicyConfig {
+            mode: crate::crd::grid_network::SelectionMode::WeightedRandom,
+        });
+        network.spec.placement_policy = Some(crate::crd::grid_network::PlacementPolicyConfig {
+            strategy: crate::crd::grid_network::PlacementStrategy::PressureWeighted,
+            pressure_weighted: Some(crate::crd::grid_network::PressureWeightedConfig {
+                signal: crate::crd::grid_network::PressureSignal::QueueDepth,
+                minimum_weight: 1,
+                maximum_weight: 1000,
+                availability_floor_percent: 5,
+                smoothing_factor: 0.35,
+                change_threshold_percent: 5,
+                stale_signal_seconds: 120,
+            }),
+        });
+        assert!(
+            matches!(reject_invalid_placement_mode(&network, SignalMode::Poll), Ok(())),
+            "pressure-weighted placement is valid with poll transport"
+        );
+        assert!(reject_invalid_placement_mode(&network, SignalMode::Gossip).is_err());
     }
 
     fn alive_snapshot(count: usize) -> MembershipSnapshot {
@@ -4587,7 +4751,7 @@ mod tests {
             ..GridNetworkStatus::default()
         });
 
-        let status = retained_overlay_status(&network, &gw, 5, None, "EmptyCandidates", "no candidates available");
+        let status = retained_overlay_status(&network, &gw, 5, None, "OverlayApplyFailed", "apply failed");
 
         assert_eq!(status.phase, OverlayPhase::Retained);
         assert_eq!(status.rendered_revision, prior.rendered_revision);
@@ -4596,7 +4760,7 @@ mod tests {
         assert_eq!(status.config_map_resource_version, prior.config_map_resource_version);
         assert_eq!(status.candidate_count, prior.candidate_count);
         assert_eq!(status.rendered_at, prior.rendered_at);
-        assert_eq!(status.reason, "EmptyCandidates");
+        assert_eq!(status.reason, "OverlayApplyFailed");
         assert!(status.message.contains("previous valid overlay retained"));
         assert_eq!(status.observed_generation, 5);
     }
@@ -4649,12 +4813,12 @@ mod tests {
             ..GridNetworkStatus::default()
         });
 
-        let status = retained_overlay_status(&network, &gw, 2, None, "EmptyCandidates", "no candidates available");
+        let status = retained_overlay_status(&network, &gw, 2, None, "OverlayApplyFailed", "apply failed");
 
         assert_eq!(status.phase, OverlayPhase::Error);
         assert!(status.rendered_revision.is_empty());
         assert!(status.distributed_revision.is_empty());
-        assert_eq!(status.reason, "EmptyCandidates");
+        assert_eq!(status.reason, "OverlayApplyFailed");
     }
 
     // -----------------------------------------------------------------------
@@ -4815,25 +4979,6 @@ mod tests {
     }
 
     #[test]
-    fn retained_status_empty_candidates_retains_prior_distribution() {
-        let gw = make_gw_ref("gw", "grid-system");
-        let prior = rendered_overlay_status(&gw);
-        let mut network = base_network();
-        network.status = Some(GridNetworkStatus {
-            overlay_status: vec![prior.clone()],
-            ..GridNetworkStatus::default()
-        });
-        let render = make_render_result(&"c".repeat(64), 0);
-
-        let status = retained_overlay_status(&network, &gw, 6, Some(&render), "EmptyCandidates", "no candidates");
-
-        assert_eq!(status.rendered_revision, "c".repeat(64));
-        assert_eq!(status.distributed_revision, prior.distributed_revision);
-        assert_eq!(status.candidate_count, 0);
-        assert_eq!(status.phase, OverlayPhase::Retained);
-    }
-
-    #[test]
     fn retained_status_render_failure_preserves_all_prior_evidence() {
         let gw = make_gw_ref("gw", "grid-system");
         let prior = rendered_overlay_status(&gw);
@@ -4882,6 +5027,25 @@ mod tests {
             status.rendered_revision, status.distributed_revision,
             "success path must set rendered == distributed"
         );
+    }
+
+    #[test]
+    fn empty_overlay_can_be_reported_as_successfully_distributed() {
+        let gw = make_gw_ref("gw", "grid-system");
+        let revision = "e".repeat(64);
+        let status = distributed_overlay_status(
+            &gw,
+            make_render_result(&revision, 0),
+            "101".to_owned(),
+            "2026-07-29T01:00:00Z".to_owned(),
+            7,
+        );
+
+        assert_eq!(status.phase, OverlayPhase::Distributed);
+        assert_eq!(status.rendered_revision, revision);
+        assert_eq!(status.distributed_revision, status.rendered_revision);
+        assert_eq!(status.candidate_count, 0);
+        assert!(status.reason.is_empty());
     }
 
     #[test]

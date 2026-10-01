@@ -24,6 +24,13 @@ spec:
       port: {{ .Values.swim.service.port }}
       targetPort: swim-udp
       protocol: UDP
+    # Poll-mode peers use the same externally advertised operator address for
+    # the mTLS signals endpoint. This listener is bound only when poll mode is
+    # selected and fails closed without its GridNetwork TLS identity.
+    - name: signals-tcp
+      port: 9091
+      targetPort: signals-tcp
+      protocol: TCP
   selector:
     {{- include "grid-operator.selectorLabels" . | nindent 4 }}
 {{- end }}

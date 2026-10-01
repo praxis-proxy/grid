@@ -30,6 +30,60 @@ by this topology. For local development, set
 [`provider_route`](https://github.com/praxis-proxy/ai/pull/386) and set
 `GRID_XTASK_IMAGE_PULL_POLICY=Never` explicitly.
 
+### Experimental poll-mode pressure weighting
+
+The score-based command above exercises the legacy metrics-to-score path. It
+does not qualify weighted traffic distribution. The separate experimental
+command below materializes `signalTransport.mode: poll` together with the
+explicit `pressureWeighted` placement policy, then checks the full
+baseline-to-pressure-to-recovery path through EPP metrics, local and polled
+signals, published overlay weights, Praxis accepted/serving revisions, and
+provider-attributed requests. Poll mode alone does not enable pressure-based
+weights.
+
+Each phase samples 1,600 new unbound requests. The qualification uses a
+predeclared 99% Pearson chi-square threshold of 6.635 for the two-provider
+distribution, requires at least a 12 percentage-point measured shift from
+baseline under pressure, and requires pool A to recover to at least 45% of
+requests. The sample size gives the recovery floor roughly a one-sided 99%
+normal-approximation margin when the published recovery share is 48.1%; none
+of the acceptance thresholds were relaxed. HTTP and attribution failures are
+recorded, not retried.
+
+The dynamic qualification also binds 32 affinity sessions before the pressure
+transition and replays them after the overlay weight change; every session must
+stay with its original eligible provider. It restarts both run-owned operators
+while pressure remains asserted and requires polling, weights, and served
+revisions to reconverge. Finally, it pauses those operators, injects malformed
+overlay JSON into the run-owned ConfigMap, and verifies overlay-sync rejects the
+update, the gateway snapshot and serving revision remain unchanged, and a new
+request still succeeds. The original ConfigMap and operator replicas are restored
+before recovery begins.
+
+```bash
+export GRID_XTASK_GATEWAY_IMAGE='praxis-ai:dynamic-weighted-<run-id>'
+export GRID_XTASK_GATEWAY_REVISION='<full-ai-worktree-sha>'
+export GRID_XTASK_GATEWAY_CONTENT_SHA256='<full-ai-worktree-diff-sha256>'
+export GRID_XTASK_IMAGE_PULL_POLICY=Never
+export GRID_XTASK_SIM_IMAGE=ghcr.io/llm-d/llm-d-inference-sim:v0.10.2
+cargo xtask env run-grid-dynamic-weighted-qualification \
+  --forge-config tests/e2e/topologies/grid-llmd-pool-metrics/forge.yaml \
+  --full --teardown \
+  --evidence-dir tests/e2e/topologies/grid-llmd-pool-metrics/evidence/dynamic-run-1
+```
+
+For this source-built qualification, the gateway image must carry the supplied
+SHA in `org.opencontainers.image.revision`. Before teardown, the xtask compares
+that revision, the first eight hexadecimal characters of the worktree-diff
+SHA-256 (an explicit prefix check) against the image version suffix, and the
+Docker-save OCI config digest with every running Praxis gateway container's
+requested image and runtime image ID. It records generated resolved Forge files
+separately from the source-content hash; their contents are hashed into
+`generated-artifacts.json` and are not treated as source.
+
+This is a distinct experimental qualification; the existing score-based and
+static-weighted qualifications remain separate compatibility checks.
+
 ### Flags
 
 - `--metrics-mtls` — protect EPP metrics scraping with an nginx mTLS proxy

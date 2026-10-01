@@ -49,14 +49,18 @@ const WRONG_ORG_CERT_NAME: &str = "wrong-org-client";
 ///
 /// Returns an error if certificate generation or file writes fail.
 pub(crate) fn generate_all(cluster_names: &[String]) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let dir = PathBuf::from(CERTS_DIR);
-    std::fs::create_dir_all(&dir)?;
+    generate_all_in_dir(cluster_names, Path::new(CERTS_DIR))
+}
+
+/// Generate a CA and per-cluster certificates in a caller-owned directory.
+pub(crate) fn generate_all_in_dir(cluster_names: &[String], dir: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    std::fs::create_dir_all(dir)?;
 
     let ca_was_complete = dir.join("ca.pem").exists() && dir.join("ca-key.pem").exists();
-    let ca = load_or_generate_ca(&dir)?;
+    let ca = load_or_generate_ca(dir)?;
 
     for name in cluster_names {
-        if ca_was_complete && identity_exists(&dir, name) {
+        if ca_was_complete && identity_exists(dir, name) {
             restrict_private_key(&dir.join(format!("{name}-key.pem")))?;
             eprintln!("  reusing cert for {name}");
             continue;
@@ -67,9 +71,9 @@ pub(crate) fn generate_all(cluster_names: &[String]) -> Result<PathBuf, Box<dyn 
         eprintln!("  generated cert for {name} (SAN: {})", site.sans.join(", "));
     }
 
-    ensure_wrong_org_identity(&dir, &ca, cluster_names, ca_was_complete)?;
+    ensure_wrong_org_identity(dir, &ca, cluster_names, ca_was_complete)?;
 
-    Ok(dir)
+    Ok(dir.to_path_buf())
 }
 
 /// Generate a dedicated CA and certificates for metrics endpoint mTLS.
@@ -196,7 +200,15 @@ pub(crate) fn certificate_sha256(cert_path: &Path) -> Result<String, Box<dyn std
 
 /// Compute the canonical fingerprint for a generated site certificate.
 pub(crate) fn site_certificate_fingerprint(site: &str) -> Result<String, Box<dyn std::error::Error>> {
-    certificate_sha256(&Path::new(CERTS_DIR).join(format!("{site}-cert.pem")))
+    site_certificate_fingerprint_in_dir(site, Path::new(CERTS_DIR))
+}
+
+/// Compute a generated site certificate fingerprint from a caller-owned directory.
+pub(crate) fn site_certificate_fingerprint_in_dir(
+    site: &str,
+    dir: &Path,
+) -> Result<String, Box<dyn std::error::Error>> {
+    certificate_sha256(&dir.join(format!("{site}-cert.pem")))
 }
 
 /// Compute the canonical fingerprint from a PEM certificate string.
