@@ -549,6 +549,7 @@ mod tests {
             name: name.to_owned(),
             site: site.to_owned(),
             cluster: cluster.to_owned(),
+            signal_origin_site: None,
             fresh,
             credential: None,
             stable_id: None,
@@ -577,6 +578,7 @@ mod tests {
             name: name.to_owned(),
             site: site.to_owned(),
             cluster: cluster.to_owned(),
+            signal_origin_site: None,
             fresh: true,
             credential: Some(ProjectedCredential {
                 strategy: "bearer_token".to_owned(),

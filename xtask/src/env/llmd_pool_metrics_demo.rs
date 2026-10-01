@@ -18,14 +18,17 @@
 use std::{
     collections::{BTreeMap, HashMap},
     fs,
+    net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
+    sync::OnceLock,
     time::{Duration, Instant},
 };
 
 use serde::Serialize;
+use sha2::{Digest as _, Sha256};
 
-use super::{DemoMode, GlbDemoOptions, certs, glb, kubectl, operator};
+use super::{DemoMode, GlbDemoOptions, certs, glb, kubectl, operator, safe_truncate_str};
 
 /// Directory where generated TLS certificates are stored.
 const CERTS_DIR: &str = "tests/env/certs";
@@ -63,6 +66,25 @@ const SETUP_PHASES_MTLS: usize = 11;
 
 /// Number of setup phases in direct-HTTP mode (no metrics TLS secrets phase).
 const SETUP_PHASES_DIRECT: usize = 10;
+
+/// Additional setup phase for the operator restart after creating a poll-mode GridNetwork.
+const SETUP_PHASES_DYNAMIC: usize = 11;
+
+/// Requests per phase for dynamic weighted placement qualification.
+const DYNAMIC_SAMPLE_SIZE: u32 = 1600;
+
+/// Existing weighted-affinity sessions replayed after the pressure transition.
+const DYNAMIC_AFFINITY_SESSION_COUNT: u32 = 32;
+
+/// One-degree-of-freedom Pearson chi-square threshold at 99% confidence.
+const DYNAMIC_CHI_SQUARE_CRITICAL: f64 = 6.635;
+
+/// Minimum measured change between phases; 1,600 requests keep the
+/// 12-point shift criterion conservative relative to binomial sampling error.
+const DYNAMIC_MIN_PRESSURE_SHIFT: f64 = 0.12;
+
+/// Minimum recovered pool-a share after returning pressure to baseline.
+const DYNAMIC_MIN_RECOVERY_SHARE: f64 = 0.45;
 
 /// Primary model name served by the deterministic llm-d-sim backends.
 const VCR_MODEL: &str = "Qwen/Qwen3-0.6B";
@@ -107,6 +129,9 @@ const SIMULATOR_CONFIGMAP: &str = "vcr-1-config";
 
 /// GridNetwork resource name.
 const GRID_NETWORK_NAME: &str = "grid-llmd-pool-metrics";
+
+/// Run-specific Kind/Forge prefix; unset in unit tests.
+static RUN_PREFIX: OnceLock<String> = OnceLock::new();
 
 /// Default gateway image tag.
 ///
@@ -185,6 +210,28 @@ enum ScoringFlavor {
     KvCachePressure,
 }
 
+/// Internal mode and image inputs shared by the score and pressure runs.
+#[derive(Clone, Copy)]
+struct PlacementRunOptions {
+    /// EPP metrics transport.
+    metrics_transport: MetricsTransport,
+    /// Signal selected for the score-based demo or pressure adapter.
+    scoring_flavor: ScoringFlavor,
+    /// Enable the separately qualified poll-mode weighted adapter.
+    pressure_weighted: bool,
+}
+
+/// Paths owned by one run while preparing its resolved Forge configuration.
+#[derive(Clone, Copy)]
+struct SetupPaths<'paths> {
+    /// Isolated Forge state root.
+    forge_state: &'paths Path,
+    /// Run-owned site identity and trust material directory.
+    certificates: &'paths Path,
+    /// Evidence root for setup artifacts.
+    evidence: &'paths Path,
+}
+
 impl ScoringFlavor {
     /// Selects the flavor from the `--kv-cache` CLI flag.
     fn from_kv_cache_flag(kv_cache: bool) -> Self {
@@ -217,6 +264,8 @@ impl ScoringFlavor {
 
 /// Demo execution context holding resolved paths.
 struct DemoContext {
+    /// Unique run identifier.
+    run_id: String,
     /// Path to the resolved Forge config.
     resolved_config: PathBuf,
     /// Per-run Forge state directory, kept beside the run's evidence.
@@ -229,6 +278,12 @@ struct DemoContext {
     metrics_transport: MetricsTransport,
     /// Selected scoring flavor (which signal drives routing).
     scoring_flavor: ScoringFlavor,
+    /// Whether this run calculates placement weights from polled signals.
+    pressure_weighted: bool,
+    /// Run-owned certificate directory.
+    certs_dir: PathBuf,
+    /// Run-specific evidence directory.
+    evidence_dir: PathBuf,
 }
 
 /// Resolved container image references.
@@ -262,6 +317,10 @@ struct Evidence {
     metrics_transport: String,
     /// Scoring strategy: "queue-depth" or "kv-cache-pressure".
     scoring_strategy: String,
+    /// Placement strategy used by this run.
+    placement_strategy: String,
+    /// Unique run identifier used for clusters, generated files, and evidence.
+    run_id: String,
     /// UTC timestamp when the run started.
     started_at: String,
     /// Wall-clock duration in seconds.
@@ -285,6 +344,47 @@ struct SetupEvidence {
     clusters: Vec<String>,
     /// Image tags used.
     images: BTreeMap<String, String>,
+    /// Requested container references and immutable IDs observed in live pods.
+    pod_images: Vec<PodImageEvidence>,
+}
+
+/// Image provenance reported by a running Kubernetes container.
+#[derive(Serialize)]
+struct PodImageEvidence {
+    /// Logical pool/Kind cluster that contains the pod.
+    cluster: String,
+    /// Kubernetes pod name.
+    pod: String,
+    /// Container name within the pod.
+    container: String,
+    /// Reference requested in the pod spec.
+    requested_image: String,
+    /// Runtime-reported immutable image identifier.
+    image_id: String,
+    /// Whether Kubernetes reports this container ready.
+    ready: bool,
+    /// Restart count observed before teardown.
+    restart_count: u32,
+}
+
+/// Inputs for the runtime identity proof for the locally selected Praxis AI image.
+struct GatewayImageIdentity<'identity> {
+    /// Selected local image reference.
+    image: &'identity str,
+    /// Expected OCI image config digest.
+    config_id: &'identity str,
+    /// OCI source repository label.
+    source: &'identity str,
+    /// OCI source revision label.
+    revision: &'identity str,
+    /// Expected AI worktree revision.
+    expected_revision: Option<&'identity str>,
+    /// Expected full hash of the AI worktree's uncommitted diff.
+    expected_content_hash: Option<&'identity str>,
+    /// OCI image version label.
+    version: &'identity str,
+    /// Runtime image evidence captured from Kubernetes.
+    pods: &'identity [PodImageEvidence],
 }
 
 /// Single proof scenario result.
@@ -346,9 +446,174 @@ struct OverlayCandidate {
     fresh: bool,
     /// Admission state string.
     admission_state: String,
+    /// Selection group used for group-first routing.
+    selection_group: Option<u32>,
+    /// Published relative traffic weight, when weighted selection is active.
+    traffic_weight: Option<u32>,
     /// Score breakdown from the production scoring engine.
     breakdown: Option<super::operator_overlay::ScoreBreakdown>,
 }
+
+/// One normalized provider signal read from the operator's mTLS endpoint.
+#[derive(Clone, Debug, Serialize)]
+struct DynamicSignalSample {
+    /// Source Grid site that measured this provider.
+    site: String,
+    /// Provider routing identity assigned by Grid.
+    provider: String,
+    /// Normalized pressure in `[0, 1]`.
+    value: f64,
+    /// Sample timestamp rendered by the signal service, in Unix milliseconds.
+    timestamp_ms: Option<i64>,
+}
+
+/// Overlay snapshot observed after a Grid reconciliation.
+#[derive(Clone, Debug, Serialize)]
+struct DynamicOverlaySnapshot {
+    /// Semantic digest published by Grid.
+    semantic_revision: String,
+    /// resourceVersion for diagnostics only; not compared across clusters.
+    resource_version: String,
+    /// Two active candidates in the first eligible selection group.
+    candidates: Vec<DynamicCandidateWeight>,
+}
+
+/// Published provider weight and identity relevant to this test.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct DynamicCandidateWeight {
+    /// Provider site represented by this candidate.
+    site: String,
+    /// Provider routing identity.
+    provider: String,
+    /// Stable identity used for weight state.
+    stable_id: String,
+    /// AI selection group for this candidate.
+    selection_group: u32,
+    /// Published positive traffic weight.
+    traffic_weight: u32,
+    /// Candidate freshness published by Grid.
+    fresh: bool,
+    /// Candidate admission state published by Grid.
+    admission_state: String,
+}
+
+/// Statistical outcomes from one complete phase sample.
+#[derive(Clone, Debug, Serialize)]
+struct DynamicTrafficSample {
+    /// Number of raw response records observed.
+    request_count: u32,
+    /// Attributed successful response count per provider.
+    counts: BTreeMap<String, u32>,
+    /// Measured share of attributed responses per provider.
+    observed_fraction: BTreeMap<String, f64>,
+    /// Expected share calculated from published weights.
+    expected_fraction: BTreeMap<String, f64>,
+    /// Pearson chi-square statistic for the observed distribution.
+    chi_square: f64,
+    /// Predeclared critical chi-square value.
+    chi_square_critical_value: f64,
+    /// Whether request and statistical acceptance criteria passed.
+    accepted: bool,
+    /// Requests that did not produce an HTTP response.
+    transport_failures: u32,
+    /// Requests that produced a non-200 response.
+    http_failures: u32,
+    /// Successful HTTP responses missing trusted provider attribution.
+    attribution_failures: u32,
+}
+
+/// One non-retried request made while binding or replaying weighted affinity.
+#[derive(Clone, Debug, Serialize)]
+struct DynamicAffinitySample {
+    /// Whether this request created or replayed the session binding.
+    stage: String,
+    /// Run-local session ordinal; the synthetic session key is not recorded.
+    session_ordinal: u32,
+    /// curl exit status (zero means transport completed).
+    curl_exit_code: i32,
+    /// HTTP status, if one was received.
+    http_status: Option<u16>,
+    /// Provider gateway returned by the trusted response attribution header.
+    provider_gateway: String,
+    /// Independent provider attribution returned by the demo backend.
+    provider_attribution: String,
+}
+
+/// Deployment pod identities captured across an intentional operator restart.
+#[derive(Clone, Debug, Serialize)]
+struct DynamicOperatorRestart {
+    /// Run-owned Kind cluster name.
+    cluster: String,
+    /// Operator pod UIDs before the restart.
+    before_pod_uids: Vec<String>,
+    /// Operator pod UIDs after the rollout completed.
+    after_pod_uids: Vec<String>,
+}
+
+/// Runtime evidence for the complete baseline/pressure/recovery chain.
+#[derive(Clone, Debug, Serialize)]
+struct DynamicPhaseEvidence {
+    /// Baseline, pressure, or recovery phase name.
+    phase: String,
+    /// Requested deterministic simulator queue value.
+    requested_waiting_requests: u32,
+    /// Simulator deployment generation per pool.
+    simulator_generation: BTreeMap<String, i64>,
+    /// Simulator pod UID per deployment.
+    simulator_pod_uids: BTreeMap<String, String>,
+    /// Queue values observed from EPP per pool.
+    epp_queue_size: BTreeMap<String, f64>,
+    /// Fresh normalized provider signal observations.
+    normalized_signals: Vec<DynamicSignalSample>,
+    /// Per-gateway Grid overlays and their Praxis accepted/serving revisions.
+    gateways: BTreeMap<String, DynamicGatewayState>,
+    /// Consecutive matching full-state observations before traffic began.
+    stable_observations: u8,
+    /// Duration the full state remained unchanged before traffic began.
+    stable_duration_ms: u128,
+    /// Required quiet period, derived from the peer-signal poll interval.
+    required_stable_duration_ms: u128,
+    /// Attributed request sample and statistical result.
+    traffic: DynamicTrafficSample,
+}
+
+/// One gateway's overlay and the exact AI revisions accepted and served there.
+#[derive(Clone, Debug, Serialize)]
+struct DynamicGatewayState {
+    /// Grid's local-site-specific overlay.
+    overlay: DynamicOverlaySnapshot,
+    /// Revision accepted by Praxis on this gateway.
+    accepted_revision: String,
+    /// Revision currently served by Praxis on this gateway.
+    serving_revision: String,
+}
+
+/// Snapshot returned when Grid, signal, and both gateway states agree.
+struct DynamicStateSnapshot {
+    /// Per-gateway overlays; semantic revisions need not match across sites.
+    gateways: BTreeMap<String, DynamicGatewayState>,
+    /// Fresh normalized provider signal samples.
+    signal_samples: Vec<DynamicSignalSample>,
+    /// EPP queue values observed for both pools.
+    epp_queue_size: BTreeMap<String, f64>,
+    /// Consecutive matching full-state observations before returning.
+    stable_observations: u8,
+    /// Duration the full state remained unchanged before returning.
+    stable_duration: Duration,
+    /// Required quiet period derived from the peer-signal poll interval.
+    required_stable_duration: Duration,
+    /// Raw sampled signal exposition for troubleshooting.
+    signal_lines: Vec<String>,
+}
+
+/// Complete traffic result, including raw rows and sample-window timestamps.
+type DynamicTrafficResult = (DynamicTrafficSample, Vec<String>, String, String);
+
+/// Result and bounded-heap evidence returned by one dynamic phase.
+type DynamicPhaseResult = Result<(ProofResult, Box<DynamicPhaseEvidence>), Box<dyn std::error::Error>>;
+
+/// Simulator deployment generations and pod UIDs captured before sampling.
+type SimulatorRuntimeIdentity = (BTreeMap<String, i64>, BTreeMap<String, String>);
 
 /// Parsed inference response with gateway attribution.
 struct InferenceResponse {
@@ -373,39 +638,99 @@ pub(crate) fn run(
     metrics_mtls: bool,
     kv_cache: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    run_with_placement(
+        forge_config,
+        options,
+        PlacementRunOptions {
+            metrics_transport: if metrics_mtls {
+                MetricsTransport::MtlsProxy
+            } else {
+                MetricsTransport::DirectHttp
+            },
+            scoring_flavor: ScoringFlavor::from_kv_cache_flag(kv_cache),
+            pressure_weighted: false,
+        },
+    )
+}
+
+/// Run the dedicated full poll-mode pressure-weighted qualification.
+pub(crate) fn run_dynamic_weighted(
+    forge_config: &Path,
+    options: &GlbDemoOptions,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if options.mode() != DemoMode::Full {
+        return Err("dynamic weighted qualification requires --full".into());
+    }
+    run_with_placement(
+        forge_config,
+        options,
+        PlacementRunOptions {
+            metrics_transport: MetricsTransport::DirectHttp,
+            scoring_flavor: ScoringFlavor::QueueDepth,
+            pressure_weighted: true,
+        },
+    )
+}
+
+/// Execute the existing pool-metrics lifecycle with the selected placement policy.
+fn run_with_placement(
+    forge_config: &Path,
+    options: &GlbDemoOptions,
+    placement: PlacementRunOptions,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mode = options.mode();
-    let metrics_transport = if metrics_mtls {
-        MetricsTransport::MtlsProxy
-    } else {
-        MetricsTransport::DirectHttp
-    };
-    let scoring_flavor = ScoringFlavor::from_kv_cache_flag(kv_cache);
-    let run_id = format_utc_timestamp();
+    let PlacementRunOptions {
+        metrics_transport,
+        scoring_flavor,
+        pressure_weighted,
+    } = placement;
+    let run_id = format_run_id(&format_utc_timestamp(), std::process::id());
+    drop(RUN_PREFIX.set(format!("grid-llmd-pm-{run_id}")));
     let started_at = format_utc_iso();
     let wall_start = Instant::now();
 
     let evidence_dir = resolve_evidence_dir(forge_config, options, &run_id)?;
     fs::create_dir_all(&evidence_dir)?;
+    let certs_dir = Path::new(CERTS_DIR).join(format!("grid-llmd-pm-{run_id}"));
 
     let demo_root = super::demo_root(forge_config);
     eprintln!("{OUTPUT_RULE}");
-    eprintln!("Grid llm-d Pool-Metrics Routing Demo");
+    eprintln!(
+        "{}",
+        if pressure_weighted {
+            "Grid Dynamic Weighted Routing Qualification"
+        } else {
+            "Grid llm-d Pool-Metrics Routing Demo"
+        }
+    );
     eprintln!("Mode: {}", if mode == DemoMode::Quick { "quick" } else { "full" });
     eprintln!("Metrics transport: {}", metrics_transport.label());
     eprintln!("Scoring strategy:  {}", scoring_flavor.label());
+    eprintln!(
+        "Placement mode:    {}",
+        if pressure_weighted {
+            "pressureWeighted"
+        } else {
+            "score preference"
+        }
+    );
     eprintln!("Forge config: {}", forge_config.display());
     eprintln!("Demo root:    {}", demo_root.display());
     eprintln!("{OUTPUT_RULE}");
 
     let context = prepare_setup(
         forge_config,
-        &evidence_dir.join("forge-state"),
         &run_id,
-        metrics_transport,
-        scoring_flavor,
+        placement,
+        SetupPaths {
+            forge_state: &evidence_dir.join("forge-state"),
+            certificates: &certs_dir,
+            evidence: &evidence_dir,
+        },
     )?;
     let mut teardown_success = false;
     let mut run_error: Option<String> = None;
+    let mut pod_images = Vec::new();
 
     let proof_results = match deploy_setup(&context) {
         Ok(()) => {
@@ -414,14 +739,43 @@ pub(crate) fn run(
             eprintln!("ENVIRONMENT READY - Starting proof scenarios");
             eprintln!("{OUTPUT_RULE}");
 
-            let results = run_proof_scenarios(&context, mode);
+            let mut results = run_proof_scenarios(&context, mode);
+
+            match collect_pod_image_evidence() {
+                Ok(captured) => {
+                    fs::write(
+                        evidence_dir.join("pod-images.json"),
+                        serde_json::to_vec_pretty(&captured)?,
+                    )?;
+                    pod_images = captured;
+                    if pressure_weighted {
+                        let expected_revision = std::env::var("GRID_XTASK_GATEWAY_REVISION").ok();
+                        let expected_content_hash = std::env::var("GRID_XTASK_GATEWAY_CONTENT_SHA256").ok();
+                        let image_proof = verify_gateway_image_identity(
+                            &context.images.gateway,
+                            expected_revision.as_deref(),
+                            expected_content_hash.as_deref(),
+                            &pod_images,
+                        );
+                        if !image_proof.success {
+                            append_run_error(&mut run_error, "gateway image identity verification failed".to_owned());
+                        }
+                        results.insert("gateway_image_identity".to_owned(), image_proof);
+                    }
+                },
+                Err(error) => {
+                    if run_error.is_none() {
+                        run_error = Some(format!("pod image evidence capture failed: {error}"));
+                    }
+                },
+            }
 
             let failed: Vec<&str> = results
                 .iter()
                 .filter_map(|(name, proof)| (!proof.success).then_some(name.as_str()))
                 .collect();
             if !failed.is_empty() {
-                run_error = Some(format!("proofs failed: {}", failed.join(", ")));
+                append_run_error(&mut run_error, format!("proofs failed: {}", failed.join(", ")));
             }
 
             if options.teardown && (run_error.is_none() || !options.keep_on_failure) {
@@ -443,11 +797,28 @@ pub(crate) fn run(
             eprintln!("[FAIL] Environment setup failed: {e}");
             run_error = Some(format!("setup failed: {e}"));
 
-            if options.teardown
-                && !options.keep_on_failure
-                && let Err(te) = teardown_environment(&context)
-            {
-                eprintln!("[WARN]  Cleanup after setup failure: {te}");
+            match collect_pod_image_evidence() {
+                Ok(captured) => {
+                    if let Err(error) = fs::write(
+                        evidence_dir.join("pod-images.json"),
+                        serde_json::to_vec_pretty(&captured)?,
+                    ) {
+                        append_run_error(&mut run_error, format!("pod image evidence write failed: {error}"));
+                    } else {
+                        pod_images = captured;
+                    }
+                },
+                Err(error) => append_run_error(&mut run_error, format!("pod image evidence capture failed: {error}")),
+            }
+
+            if options.teardown && !options.keep_on_failure {
+                match teardown_environment(&context) {
+                    Ok(()) => teardown_success = true,
+                    Err(te) => {
+                        eprintln!("[WARN]  Cleanup after setup failure: {te}");
+                        append_run_error(&mut run_error, format!("teardown failed: {te}"));
+                    },
+                }
             }
 
             BTreeMap::new()
@@ -456,6 +827,7 @@ pub(crate) fn run(
 
     let wall_secs = wall_start.elapsed().as_secs_f64();
     let images = collect_image_evidence(&context.images)?;
+    write_run_provenance(&evidence_dir, &context, &images, &pod_images)?;
     let success = run_error.is_none();
 
     write_transition_timeline(&evidence_dir, &proof_results, context.scoring_flavor, wall_secs)?;
@@ -464,13 +836,23 @@ pub(crate) fn run(
         mode: format!("{mode:?}").to_lowercase(),
         metrics_transport: metrics_transport.label().to_owned(),
         scoring_strategy: scoring_flavor.label().to_owned(),
+        placement_strategy: if pressure_weighted {
+            "pressureWeighted".to_owned()
+        } else {
+            "score preference".to_owned()
+        },
+        run_id,
         started_at,
         wall_secs,
         success,
         error: run_error.clone(),
         setup: SetupEvidence {
-            clusters: CLUSTERS.iter().map(|s| (*s).to_owned()).collect(),
+            clusters: CLUSTERS
+                .iter()
+                .map(|cluster| format!("{}-{cluster}", forge_cluster_prefix()))
+                .collect(),
             images,
+            pod_images,
         },
         proofs: proof_results,
         lifecycle: LifecycleRecord {
@@ -549,11 +931,20 @@ fn write_transition_timeline(
 /// Resolve inputs before creating clusters.
 fn prepare_setup(
     forge_config: &Path,
-    forge_state_dir: &Path,
     run_id: &str,
-    metrics_transport: MetricsTransport,
-    scoring_flavor: ScoringFlavor,
+    placement: PlacementRunOptions,
+    paths: SetupPaths<'_>,
 ) -> Result<DemoContext, Box<dyn std::error::Error>> {
+    let PlacementRunOptions {
+        metrics_transport,
+        scoring_flavor,
+        pressure_weighted,
+    } = placement;
+    let SetupPaths {
+        forge_state: forge_state_dir,
+        certificates: certs_dir,
+        evidence: evidence_dir,
+    } = paths;
     let images = resolve_images(metrics_transport)?;
     verify_images(&images)?;
 
@@ -565,6 +956,7 @@ fn prepare_setup(
             nginx_image: images.nginx.as_deref(),
             images: Some(&images),
             run_id: Some(run_id),
+            pressure_weighted,
         },
     )?;
     verify_materialized_images(&resolved_config, &images)?;
@@ -573,12 +965,16 @@ fn prepare_setup(
         .into();
 
     Ok(DemoContext {
+        run_id: run_id.to_owned(),
         resolved_config,
         forge_state_dir: forge_state_dir.to_path_buf(),
         forge_bin,
         images,
         metrics_transport,
         scoring_flavor,
+        pressure_weighted,
+        certs_dir: certs_dir.to_path_buf(),
+        evidence_dir: evidence_dir.to_path_buf(),
     })
 }
 
@@ -685,7 +1081,13 @@ fn tag_images_for_forge(images: &ResolvedImages) -> Result<(), Box<dyn std::erro
 /// Deploy the two-cluster environment.
 fn deploy_setup(context: &DemoContext) -> Result<(), Box<dyn std::error::Error>> {
     let mtls = context.metrics_transport == MetricsTransport::MtlsProxy;
-    let total = if mtls { SETUP_PHASES_MTLS } else { SETUP_PHASES_DIRECT };
+    let total = if context.pressure_weighted {
+        SETUP_PHASES_DYNAMIC
+    } else if mtls {
+        SETUP_PHASES_MTLS
+    } else {
+        SETUP_PHASES_DIRECT
+    };
     let mut phase = 0_usize;
     let mut next = || {
         phase += 1;
@@ -716,7 +1118,7 @@ fn deploy_setup(context: &DemoContext) -> Result<(), Box<dyn std::error::Error>>
             next(),
             total
         );
-        stage_certificates()?;
+        stage_certificates(&context.certs_dir)?;
     } else {
         eprintln!(
             "[SETUP {}/{}] Generating TLS certificates (gateway only)",
@@ -724,7 +1126,7 @@ fn deploy_setup(context: &DemoContext) -> Result<(), Box<dyn std::error::Error>>
             total
         );
         let clusters: Vec<String> = CLUSTERS.iter().map(|s| (*s).to_owned()).collect();
-        certs::generate_all(&clusters)?;
+        certs::generate_all_in_dir(&clusters, &context.certs_dir)?;
         eprintln!("  [OK] TLS certificates generated for pool-a, pool-b");
     }
 
@@ -796,7 +1198,7 @@ fn deploy_setup(context: &DemoContext) -> Result<(), Box<dyn std::error::Error>>
     // Phase 8/9: Install provider trust and credentials
     eprintln!();
     eprintln!("[SETUP {}/{}] Installing provider trust and credentials", next(), total);
-    install_provider_trust()?;
+    install_provider_trust(&context.certs_dir)?;
 
     // Phase 9/10: Deploy Grid site resources and gateways
     eprintln!();
@@ -811,6 +1213,17 @@ fn deploy_setup(context: &DemoContext) -> Result<(), Box<dyn std::error::Error>>
         run_forge_stack(context, cluster, "provider-gateway")?;
         eprintln!("  [OK] {cluster}: site and provider-gateway deployed");
     }
+    if context.pressure_weighted {
+        eprintln!();
+        eprintln!(
+            "[SETUP {}/{}] Restarting operators to resolve the already-created poll-mode GridNetwork",
+            next(),
+            total
+        );
+        for cluster in CLUSTERS {
+            restart_operator_for_poll_mode(cluster)?;
+        }
+    }
     for cluster in CLUSTERS {
         run_forge_stack(context, cluster, "consumer-gateway")?;
         eprintln!("  [OK] {cluster}: consumer-gateway deployed");
@@ -819,11 +1232,52 @@ fn deploy_setup(context: &DemoContext) -> Result<(), Box<dyn std::error::Error>>
     // Phase 10/11: Wait for overlay convergence
     eprintln!();
     eprintln!("[SETUP {}/{}] Waiting for overlay convergence", next(), total);
-    authorize_discovered_sites()?;
-    wait_for_overlay_convergence()?;
+    authorize_discovered_sites(&context.certs_dir)?;
+    wait_for_overlay_convergence(context)?;
 
     eprintln!();
     eprintln!("[READY] Environment deployed");
+    Ok(())
+}
+
+/// Restart a freshly installed operator only after the poll-mode GridNetwork exists.
+fn restart_operator_for_poll_mode(cluster: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let context = kind_context(cluster);
+    let debug = Command::new("kubectl")
+        .args([
+            "--context",
+            &context,
+            "-n",
+            GRID_SYSTEM_NS,
+            "set",
+            "env",
+            "deployment/grid-operator",
+            "RUST_LOG=debug",
+        ])
+        .output()?;
+    if !debug.status.success() {
+        return Err(format!(
+            "{cluster}: enabling bounded signal diagnostics failed: {}",
+            String::from_utf8_lossy(&debug.stderr)
+        )
+        .into());
+    }
+    let status = Command::new("kubectl")
+        .args([
+            "--context",
+            &context,
+            "-n",
+            GRID_SYSTEM_NS,
+            "rollout",
+            "status",
+            "deployment/grid-operator",
+            "--timeout=120s",
+        ])
+        .status()?;
+    if !status.success() {
+        return Err(format!("{cluster}: operator did not become ready in poll mode").into());
+    }
+    eprintln!("  [OK] {cluster}: operator restarted with poll-mode signals and debug diagnostics enabled");
     Ok(())
 }
 
@@ -838,6 +1292,11 @@ fn run_proof_scenarios(context: &DemoContext, mode: DemoMode) -> BTreeMap<String
 
     // Proof 1: Provenance — image digests and config verification
     results.insert("provenance".to_owned(), proof_provenance(mtls));
+
+    if context.pressure_weighted {
+        results.extend(run_dynamic_weighted_scenarios(context));
+        return results;
+    }
 
     // Proof 2: Baseline — early state scorecard with production scores
     results.insert("baseline".to_owned(), proof_baseline(context));
@@ -862,6 +1321,2217 @@ fn run_proof_scenarios(context: &DemoContext, mode: DemoMode) -> BTreeMap<String
     }
 
     results
+}
+
+/// Run baseline, deterministic pressure, and recovery through polled signals.
+#[expect(
+    clippy::too_many_lines,
+    reason = "The qualification sequence is deliberately explicit and preserves each dependent phase result."
+)]
+fn run_dynamic_weighted_scenarios(context: &DemoContext) -> BTreeMap<String, ProofResult> {
+    let mut results = BTreeMap::new();
+    let client_context = kind_context("pool-a");
+    if let Err(error) = ensure_dynamic_client_pod(&client_context, &context.run_id) {
+        results.insert(
+            "baseline".to_owned(),
+            failed_proof("Baseline: persistent traffic client unavailable", error.to_string()),
+        );
+        results.insert(
+            "pressure_and_flip".to_owned(),
+            skipped_proof("Pressure: baseline phase did not complete"),
+        );
+        results.insert(
+            "recovery".to_owned(),
+            skipped_proof("Recovery: baseline phase did not complete"),
+        );
+        results.insert(
+            "weighted_affinity".to_owned(),
+            skipped_proof("Affinity: baseline phase did not complete"),
+        );
+        results.insert(
+            "operator_restart_persistence".to_owned(),
+            skipped_proof("Operator restart: baseline phase did not complete"),
+        );
+        results.insert(
+            "invalid_overlay_last_known_good".to_owned(),
+            skipped_proof("Invalid overlay: baseline phase did not complete"),
+        );
+        return results;
+    }
+
+    let mut signals = match SignalsPortForward::start(&client_context, &context.certs_dir) {
+        Ok(signals) => signals,
+        Err(error) => {
+            results.insert(
+                "baseline".to_owned(),
+                failed_proof("Baseline: signals mTLS endpoint unavailable", error.to_string()),
+            );
+            results.insert(
+                "pressure_and_flip".to_owned(),
+                skipped_proof("Pressure: baseline phase did not complete"),
+            );
+            results.insert(
+                "recovery".to_owned(),
+                skipped_proof("Recovery: baseline phase did not complete"),
+            );
+            results.insert(
+                "weighted_affinity".to_owned(),
+                skipped_proof("Affinity: signal endpoint unavailable"),
+            );
+            results.insert(
+                "operator_restart_persistence".to_owned(),
+                skipped_proof("Operator restart: signal endpoint unavailable"),
+            );
+            results.insert(
+                "invalid_overlay_last_known_good".to_owned(),
+                skipped_proof("Invalid overlay: signal endpoint unavailable"),
+            );
+            return results;
+        },
+    };
+
+    let baseline_evidence = match run_dynamic_phase(context, &signals, "baseline", 0, None) {
+        Ok((proof, evidence)) => {
+            let passed = proof.success;
+            results.insert("baseline".to_owned(), proof);
+            if !passed {
+                results.insert(
+                    "pressure_and_flip".to_owned(),
+                    skipped_proof("Pressure: baseline phase did not complete"),
+                );
+                results.insert(
+                    "recovery".to_owned(),
+                    skipped_proof("Recovery: baseline phase did not complete"),
+                );
+                results.insert(
+                    "weighted_affinity".to_owned(),
+                    skipped_proof("Affinity: baseline phase did not complete"),
+                );
+                results.insert(
+                    "operator_restart_persistence".to_owned(),
+                    skipped_proof("Operator restart: baseline phase did not complete"),
+                );
+                results.insert(
+                    "invalid_overlay_last_known_good".to_owned(),
+                    skipped_proof("Invalid overlay: baseline phase did not complete"),
+                );
+                return results;
+            }
+            evidence
+        },
+        Err(error) => {
+            results.insert(
+                "baseline".to_owned(),
+                failed_proof("Baseline: equal idle weights and sampling", error.to_string()),
+            );
+            results.insert(
+                "pressure_and_flip".to_owned(),
+                skipped_proof("Pressure: baseline phase did not complete"),
+            );
+            results.insert(
+                "recovery".to_owned(),
+                skipped_proof("Recovery: baseline phase did not complete"),
+            );
+            results.insert(
+                "weighted_affinity".to_owned(),
+                skipped_proof("Affinity: baseline phase did not complete"),
+            );
+            results.insert(
+                "operator_restart_persistence".to_owned(),
+                skipped_proof("Operator restart: baseline phase did not complete"),
+            );
+            results.insert(
+                "invalid_overlay_last_known_good".to_owned(),
+                skipped_proof("Invalid overlay: baseline phase did not complete"),
+            );
+            return results;
+        },
+    };
+
+    let affinity_bindings = match sample_dynamic_affinity(&client_context, &context.run_id, "bind") {
+        Ok(samples) => {
+            let evidence_error = write_dynamic_affinity_samples(&context.evidence_dir, "bind", &samples)
+                .err()
+                .map(|error| error.to_string());
+            let valid = affinity_bind_samples_valid(&samples) && evidence_error.is_none();
+            let bindings = samples
+                .iter()
+                .filter(|sample| sample.curl_exit_code == 0 && sample.http_status == Some(200))
+                .map(|sample| (sample.session_ordinal, sample.provider_gateway.clone()))
+                .collect::<BTreeMap<_, _>>();
+            results.insert(
+                "weighted_affinity".to_owned(),
+                if valid {
+                    ProofResult {
+                        success: true,
+                        description: "Affinity: new session bindings established before the pressure transition".to_owned(),
+                        observations: vec![format!(
+                            "{} unique sessions bound across both eligible providers; raw outcomes in affinity-bind.jsonl",
+                            samples.len()
+                        )],
+                    }
+                } else {
+                    failed_proof(
+                        "Affinity: baseline session bindings",
+                        evidence_error.unwrap_or_else(|| format!(
+                            "{} session binding requests did not produce valid attributed 200 responses on both providers",
+                            samples.len()
+                        )),
+                    )
+                },
+            );
+            valid.then_some(bindings)
+        },
+        Err(error) => {
+            results.insert(
+                "weighted_affinity".to_owned(),
+                failed_proof("Affinity: baseline session bindings", error.to_string()),
+            );
+            None
+        },
+    };
+
+    let baseline_revisions = dynamic_semantic_revisions(&baseline_evidence.gateways);
+    let pressure = run_dynamic_phase(context, &signals, "pressure", 9, Some(&baseline_revisions));
+    let pressure_ok = pressure.as_ref().is_ok_and(|phase| phase.0.success);
+    let pressure_evidence = pressure.as_ref().ok().map(|phase| phase.1.clone());
+    let pressure_proof = pressure.map_or_else(
+        |error| failed_proof("Pressure: signal-driven weight shift and sampling", error.to_string()),
+        |phase| phase.0,
+    );
+    let pressure_proof = match pressure_evidence.as_ref() {
+        Some(evidence) => {
+            let baseline_share = baseline_evidence
+                .traffic
+                .observed_fraction
+                .get("pool-a")
+                .copied()
+                .unwrap_or(0.0);
+            let pressure_share = evidence.traffic.observed_fraction.get("pool-a").copied().unwrap_or(0.0);
+            if baseline_share - pressure_share >= DYNAMIC_MIN_PRESSURE_SHIFT {
+                pressure_proof
+            } else {
+                failed_proof(
+                    "Pressure: signal-driven weight shift and sampling",
+                    format!(
+                        "pool-a traffic share shifted by {shift:.3}, below the predeclared {DYNAMIC_MIN_PRESSURE_SHIFT:.2} minimum",
+                        shift = baseline_share - pressure_share,
+                    ),
+                )
+            }
+        },
+        None => pressure_proof,
+    };
+    results.insert("pressure_and_flip".to_owned(), pressure_proof);
+    if !pressure_ok || pressure_evidence.is_none() {
+        results.insert(
+            "affinity_replay".to_owned(),
+            skipped_proof("Affinity replay: pressure phase did not complete"),
+        );
+        results.insert(
+            "operator_restart_persistence".to_owned(),
+            skipped_proof("Operator restart: pressure phase did not complete"),
+        );
+        results.insert(
+            "invalid_overlay_last_known_good".to_owned(),
+            skipped_proof("Invalid overlay: pressure phase did not complete"),
+        );
+        results.insert(
+            "recovery".to_owned(),
+            skipped_proof("Recovery: pressure phase did not complete"),
+        );
+        return results;
+    }
+    let Some(pressure_evidence) = pressure_evidence else {
+        results.insert(
+            "recovery".to_owned(),
+            skipped_proof("Recovery: pressure phase did not complete"),
+        );
+        return results;
+    };
+
+    if let Some(bindings) = affinity_bindings {
+        match sample_dynamic_affinity(&client_context, &context.run_id, "replay") {
+            Ok(samples) => {
+                let evidence_error = write_dynamic_affinity_samples(&context.evidence_dir, "replay", &samples)
+                    .err()
+                    .map(|error| error.to_string());
+                let matches = affinity_replay_matches(&bindings, &samples) && evidence_error.is_none();
+                results.insert(
+                    "affinity_replay".to_owned(),
+                    if matches {
+                        ProofResult {
+                            success: true,
+                            description: "Affinity: every bound session retained its provider after weights changed".to_owned(),
+                            observations: vec![format!(
+                                "{} of {} replayed sessions retained the original provider; pressure weights had shifted to {} / {}",
+                                samples.len(),
+                                bindings.len(),
+                                pressure_evidence.traffic.counts.get("pool-a").copied().unwrap_or(0),
+                                pressure_evidence.traffic.counts.get("pool-b").copied().unwrap_or(0),
+                            )],
+                        }
+                    } else {
+                        failed_proof(
+                            "Affinity: provider binding changed after weights changed",
+                            evidence_error.unwrap_or_else(|| format!(
+                                "{} session outcomes did not preserve their baseline attribution",
+                                samples.len()
+                            )),
+                        )
+                    },
+                );
+            },
+            Err(error) => {
+                results.insert(
+                    "affinity_replay".to_owned(),
+                    failed_proof("Affinity replay failed", error.to_string()),
+                );
+            },
+        }
+    } else {
+        results.insert(
+            "affinity_replay".to_owned(),
+            skipped_proof("Affinity replay: baseline bindings were not valid"),
+        );
+    }
+
+    // Restart both run-owned operators while pressure remains asserted. The new
+    // operator instances must repoll the signals and preserve the effective
+    // pressure preference through a fresh overlay/serving-revision gate.
+    drop(signals);
+    let operator_restarts = restart_dynamic_operators();
+    let mut operator_restart_evidence = None;
+    match SignalsPortForward::start(&client_context, &context.certs_dir) {
+        Ok(restarted_signals) => signals = restarted_signals,
+        Err(error) => {
+            results.insert(
+                "operator_restart_persistence".to_owned(),
+                failed_proof("Operator restart: poll endpoint did not recover", error.to_string()),
+            );
+            results.insert(
+                "invalid_overlay_last_known_good".to_owned(),
+                skipped_proof("Invalid overlay: operator signal endpoint did not recover"),
+            );
+            results.insert(
+                "recovery".to_owned(),
+                skipped_proof("Recovery: operator signal endpoint did not recover"),
+            );
+            return results;
+        },
+    }
+    match run_dynamic_phase(context, &signals, "operator-restart", 9, None) {
+        Ok((phase_proof, phase_evidence)) => {
+            operator_restart_evidence = Some(phase_evidence.clone());
+            let mut observations = match &operator_restarts {
+                Ok(records) => records
+                    .iter()
+                    .map(|record| {
+                        format!(
+                            "{} operator pod UIDs {:?} -> {:?}",
+                            record.cluster, record.before_pod_uids, record.after_pod_uids
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                Err(error) => vec![format!("operator restart failed: {error}")],
+            };
+            observations.extend(phase_proof.observations);
+            let success = operator_restarts.is_ok() && phase_proof.success;
+            let mut proof = ProofResult {
+                success,
+                description: "Operator restart: pressure signals, weights, and serving revision persist after restart"
+                    .to_owned(),
+                observations,
+            };
+            let evidence_write = serde_json::to_vec_pretty(&serde_json::json!({
+                "operator_pods": operator_restarts.as_ref().ok(),
+                "phase": phase_evidence,
+                "proof": proof.clone(),
+            }))
+            .map_err(|error| error.to_string())
+            .and_then(|bytes| {
+                fs::write(context.evidence_dir.join("operator-restart.json"), bytes).map_err(|error| error.to_string())
+            });
+            if let Err(error) = evidence_write {
+                proof.success = false;
+                proof
+                    .observations
+                    .push(format!("operator restart evidence could not be written: {error}"));
+            }
+            results.insert("operator_restart_persistence".to_owned(), proof);
+        },
+        Err(error) => {
+            let proof = failed_operator_restart_proof(error.as_ref(), &operator_restarts, &context.evidence_dir);
+            results.insert("operator_restart_persistence".to_owned(), proof);
+        },
+    }
+
+    // Pause both operators so the deliberately malformed run-owned ConfigMap
+    // cannot be repaired before overlay-sync and Praxis demonstrate LKG safety.
+    drop(signals);
+    let lkg_reference = operator_restart_evidence.as_ref().unwrap_or(&pressure_evidence);
+    let lkg = prove_invalid_overlay_last_known_good(context, lkg_reference);
+    results.insert("invalid_overlay_last_known_good".to_owned(), lkg);
+    match SignalsPortForward::start(&client_context, &context.certs_dir) {
+        Ok(recovered_signals) => signals = recovered_signals,
+        Err(error) => {
+            results.insert(
+                "recovery".to_owned(),
+                failed_proof(
+                    "Recovery: poll endpoint did not recover after LKG test",
+                    error.to_string(),
+                ),
+            );
+            return results;
+        },
+    }
+
+    let pressure_revisions = dynamic_semantic_revisions(&pressure_evidence.gateways);
+    let recovery = run_dynamic_phase(context, &signals, "recovery", 0, Some(&pressure_revisions));
+    let recovery_proof = recovery.map_or_else(
+        |error| failed_proof("Recovery: restored weights and traffic", error.to_string()),
+        |phase| {
+            let recovered_share = phase
+                .1
+                .traffic
+                .observed_fraction
+                .get("pool-a")
+                .copied()
+                .unwrap_or(0.0);
+            let pressure_share = pressure_evidence
+                .traffic
+                .observed_fraction
+                .get("pool-a")
+                .copied()
+                .unwrap_or(0.0);
+            if phase.0.success
+                && recovered_share >= DYNAMIC_MIN_RECOVERY_SHARE
+                && recovered_share - pressure_share >= DYNAMIC_MIN_PRESSURE_SHIFT
+            {
+                phase.0
+            } else {
+                failed_proof(
+                    "Recovery: restored weights and traffic",
+                    format!(
+                        "pool-a recovered share={recovered_share:.3}, pressure share={pressure_share:.3}; required recovery >= {DYNAMIC_MIN_RECOVERY_SHARE:.2} and rebound >= {DYNAMIC_MIN_PRESSURE_SHIFT:.2}"
+                    ),
+                )
+            }
+        },
+    );
+    results.insert("recovery".to_owned(), recovery_proof);
+    results
+}
+
+/// Build a failed evidence result with the first concrete boundary error.
+fn failed_proof(description: &str, error: String) -> ProofResult {
+    ProofResult {
+        success: false,
+        description: description.to_owned(),
+        observations: vec![error],
+    }
+}
+
+/// Preserve the operator pod replacement and phase failure even when convergence fails.
+fn failed_operator_restart_proof(
+    phase_error: &dyn std::error::Error,
+    restarts: &Result<Vec<DynamicOperatorRestart>, Box<dyn std::error::Error>>,
+    evidence_dir: &Path,
+) -> ProofResult {
+    let mut proof = failed_proof(
+        "Operator restart: pressure state did not reconverge",
+        phase_error.to_string(),
+    );
+    if let Ok(records) = restarts {
+        proof.observations.extend(records.iter().map(|record| {
+            format!(
+                "{} operator pod UIDs {:?} -> {:?}",
+                record.cluster, record.before_pod_uids, record.after_pod_uids
+            )
+        }));
+    } else if let Err(restart_error) = restarts {
+        proof
+            .observations
+            .push(format!("operator rollout failed: {restart_error}"));
+    }
+    let evidence = serde_json::json!({
+        "operator_pods": restarts.as_ref().ok(),
+        "phase_error": phase_error.to_string(),
+        "proof": proof.clone(),
+    });
+    if let Err(write_error) = serde_json::to_vec_pretty(&evidence)
+        .map_err(|serde_error| serde_error.to_string())
+        .and_then(|bytes| {
+            fs::write(evidence_dir.join("operator-restart.json"), bytes).map_err(|io_error| io_error.to_string())
+        })
+    {
+        proof.observations.push(format!(
+            "operator restart failure evidence could not be written: {write_error}"
+        ));
+    }
+    proof
+}
+
+/// Mark a later phase as not run after a required earlier phase failed.
+fn skipped_proof(description: &str) -> ProofResult {
+    ProofResult {
+        success: false,
+        description: description.to_owned(),
+        observations: vec!["not run because a required prior phase failed".to_owned()],
+    }
+}
+
+/// A host-side mTLS tunnel to one operator's poll-mode signal endpoint.
+struct SignalsPortForward {
+    /// Owned kubectl process; dropped after authenticated reads finish.
+    child: Option<Child>,
+    /// Host loopback port forwarded to the operator's TLS signal listener.
+    local_port: u16,
+    /// Run-specific certificate directory used for authenticated reads.
+    certs_dir: PathBuf,
+}
+
+impl SignalsPortForward {
+    /// Start a run-owned port-forward and wait until the authenticated endpoint answers.
+    fn start(context: &str, certs_dir: &Path) -> Result<Self, Box<dyn std::error::Error>> {
+        let socket = TcpListener::bind("127.0.0.1:0")?;
+        let local_port = socket.local_addr()?.port();
+        drop(socket);
+        let child = Command::new("kubectl")
+            .args([
+                "--context",
+                context,
+                "-n",
+                GRID_SYSTEM_NS,
+                "port-forward",
+                "--address=127.0.0.1",
+                "service/grid-operator-swim",
+                &format!("{local_port}:9091"),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+        let mut forward = Self {
+            child: Some(child),
+            local_port,
+            certs_dir: certs_dir.to_path_buf(),
+        };
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut last_error = String::from("port-forward did not become ready");
+        while Instant::now() < deadline {
+            if let Some(port_forward_process) = forward.child.as_mut()
+                && port_forward_process.try_wait()?.is_some()
+            {
+                return Err("signals port-forward exited before readiness".into());
+            }
+            if TcpStream::connect(("127.0.0.1", local_port)).is_ok() {
+                match forward.read_exposition() {
+                    Ok(body) if body.contains("# TYPE") || body.lines().any(|line| line.contains("grid_site=")) => {
+                        return Ok(forward);
+                    },
+                    Ok(_) => "signals endpoint returned no exposition yet".clone_into(&mut last_error),
+                    Err(error) => last_error = error.to_string(),
+                }
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        Err(format!("signals endpoint did not become ready: {last_error}").into())
+    }
+
+    /// Fetch the authenticated rollup for the selected pressure metric.
+    fn read_exposition(&self) -> Result<String, Box<dyn std::error::Error>> {
+        let ca = self.certs_dir.join("ca.pem");
+        let cert = self.certs_dir.join("pool-a-cert.pem");
+        let key = self.certs_dir.join("pool-a-key.pem");
+        let authority = format!("pool-a.grid.internal:{}:127.0.0.1", self.local_port);
+        let url = format!("https://pool-a.grid.internal:{}/v1/site/signals", self.local_port);
+        let output = Command::new("curl")
+            .args([
+                "--silent",
+                "--show-error",
+                "--fail",
+                "--max-time",
+                "8",
+                "--cacert",
+                ca.to_str().ok_or("CA path is not UTF-8")?,
+                "--cert",
+                cert.to_str().ok_or("site certificate path is not UTF-8")?,
+                "--key",
+                key.to_str().ok_or("site key path is not UTF-8")?,
+                "--resolve",
+                &authority,
+                "--get",
+                "--data-urlencode",
+                "collect[]=grid_routing_queue_pressure",
+                "--data-urlencode",
+                "collect[]=grid_routing_kv_cache_pressure",
+                &url,
+            ])
+            .output()?;
+        if !output.status.success() {
+            return Err(format!(
+                "mTLS signals query failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )
+            .into());
+        }
+        Ok(String::from_utf8(output.stdout)?)
+    }
+}
+
+impl Drop for SignalsPortForward {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            drop(child.kill());
+            drop(child.wait());
+        }
+    }
+}
+
+/// Create the persistent request source used throughout the three phases.
+fn ensure_dynamic_client_pod(context: &str, run_id: &str) -> Result<(), Box<dyn std::error::Error>> {
+    const POD: &str = "dynamic-weighted-client";
+    let get = Command::new("kubectl")
+        .args(["--context", context, "-n", GRID_SYSTEM_NS, "get", &format!("pod/{POD}")])
+        .output()?;
+    if !get.status.success() {
+        let overrides = serde_json::json!({
+            "metadata": {"labels": {"grid.praxis-proxy.io/run-id": run_id}},
+            "spec": {
+                "automountServiceAccountToken": false,
+                "securityContext": {"runAsNonRoot": true, "seccompProfile": {"type": "RuntimeDefault"}},
+                "containers": [{
+                    "name": POD,
+                    "image": "curlimages/curl:8.12.1",
+                    "command": ["sleep", "3600"],
+                    "securityContext": {
+                        "runAsUser": 100,
+                        "allowPrivilegeEscalation": false,
+                        "readOnlyRootFilesystem": true,
+                        "capabilities": {"drop": ["ALL"]}
+                    }
+                }]
+            }
+        })
+        .to_string();
+        let create = Command::new("kubectl")
+            .args([
+                "--context",
+                context,
+                "-n",
+                GRID_SYSTEM_NS,
+                "run",
+                POD,
+                "--image=curlimages/curl:8.12.1",
+                "--restart=Never",
+                "--overrides",
+                &overrides,
+            ])
+            .output()?;
+        if !create.status.success() {
+            return Err(format!(
+                "persistent request client creation failed: {}",
+                String::from_utf8_lossy(&create.stderr).trim()
+            )
+            .into());
+        }
+    }
+    let ready = Command::new("kubectl")
+        .args([
+            "--context",
+            context,
+            "-n",
+            GRID_SYSTEM_NS,
+            "wait",
+            "--for=condition=Ready",
+            &format!("pod/{POD}"),
+            "--timeout=120s",
+        ])
+        .output()?;
+    if !ready.status.success() {
+        return Err(format!(
+            "persistent request client did not become Ready: {}",
+            String::from_utf8_lossy(&ready.stderr).trim()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// One full dynamic qualification phase, from simulator config through attributed traffic.
+#[expect(
+    clippy::too_many_lines,
+    reason = "This function records and checks every boundary of one end-to-end phase."
+)]
+fn run_dynamic_phase(
+    context: &DemoContext,
+    signals: &SignalsPortForward,
+    phase: &str,
+    waiting_requests: u32,
+    previous_revisions: Option<&BTreeMap<String, String>>,
+) -> DynamicPhaseResult {
+    let evidence_dir = &context.evidence_dir;
+    let mtls = context.metrics_transport == MetricsTransport::MtlsProxy;
+    eprintln!("\n  [DYNAMIC {phase}] Set simulator waiting-requests={waiting_requests}");
+    set_simulator_waiting_requests("pool-a", waiting_requests, context.scoring_flavor, mtls)?;
+    let (simulator_generation, simulator_pod_uids) = simulator_runtime_identity("pool-a")?;
+    let state = wait_for_dynamic_state(context, signals, phase, waiting_requests, previous_revisions)?;
+    let overlay = state
+        .gateways
+        .get("pool-a")
+        .ok_or("pool-a gateway state missing after convergence")?
+        .overlay
+        .clone();
+    fs::write(
+        evidence_dir.join(format!("signals-{phase}.jsonl")),
+        format!("{}\n", state.signal_lines.join("\n")),
+    )?;
+    fs::write(
+        evidence_dir.join(format!("overlay-{phase}.json")),
+        serde_json::to_vec_pretty(&overlay)?,
+    )?;
+    fs::write(
+        evidence_dir.join(format!("overlays-{phase}.json")),
+        serde_json::to_vec_pretty(&state.gateways)?,
+    )?;
+    let (traffic, request_lines, sample_started, sample_completed) =
+        sample_dynamic_traffic(&kind_context("pool-a"), phase, &overlay)?;
+    fs::write(
+        evidence_dir.join(format!("requests-{phase}.jsonl")),
+        format!("{}\n", request_lines.join("\n")),
+    )?;
+    let served_states = CLUSTERS
+        .iter()
+        .map(|cluster| -> Result<_, Box<dyn std::error::Error>> {
+            let (observed, accepted, serving) = observe_serving_state(&kind_context(cluster))?;
+            Ok(((*cluster).to_owned(), observed, accepted, serving))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let stable_during_sample = served_states.iter().all(|(cluster, observed, accepted, serving)| {
+        state.gateways.get(cluster).is_some_and(|expected| {
+            observed.semantic_revision == expected.overlay.semantic_revision
+                && observed.candidates == expected.overlay.candidates
+                && accepted == &expected.accepted_revision
+                && serving == &expected.serving_revision
+        })
+    });
+    let phase_success = traffic.accepted && stable_during_sample;
+    let phase_evidence = DynamicPhaseEvidence {
+        phase: phase.to_owned(),
+        requested_waiting_requests: waiting_requests,
+        simulator_generation: simulator_generation.clone(),
+        simulator_pod_uids: simulator_pod_uids.clone(),
+        epp_queue_size: state.epp_queue_size.clone(),
+        normalized_signals: state.signal_samples.clone(),
+        gateways: state.gateways.clone(),
+        stable_observations: state.stable_observations,
+        stable_duration_ms: state.stable_duration.as_millis(),
+        required_stable_duration_ms: state.required_stable_duration.as_millis(),
+        traffic: traffic.clone(),
+    };
+    fs::write(
+        evidence_dir.join(format!("phase-{phase}.json")),
+        serde_json::to_vec_pretty(&phase_evidence)?,
+    )?;
+    let grid_revisions = dynamic_semantic_revisions(&state.gateways);
+    let accepted_revisions = dynamic_accepted_revisions(&state.gateways);
+    let serving_revisions = dynamic_serving_revisions(&state.gateways);
+    let summary = serde_json::json!({
+        "phase": phase,
+        "sample_started_at": sample_started,
+        "sample_completed_at": sample_completed,
+        "grid_revisions": grid_revisions,
+        "accepted_revisions": accepted_revisions,
+        "serving_revisions": serving_revisions,
+        "published_weights": overlay.candidates,
+        "stable_observations": state.stable_observations,
+        "stable_duration_ms": state.stable_duration.as_millis(),
+        "required_stable_duration_ms": state.required_stable_duration.as_millis(),
+        "statistical_sample": traffic,
+        "overlay_stable_during_sample": stable_during_sample,
+    });
+    append_dynamic_timeline(evidence_dir, &summary)?;
+    let mut observations = vec![
+        format!("simulator generation/pod UIDs: {simulator_generation:?} / {simulator_pod_uids:?}"),
+        format!("EPP queue observations: {:?}", state.epp_queue_size),
+        format!(
+            "normalized site/provider signals: {:?}",
+            phase_evidence.normalized_signals
+        ),
+        format!(
+            "per-gateway Grid/accepted/serving revisions: {grid_revisions:?} / {accepted_revisions:?} / {serving_revisions:?}"
+        ),
+        format!(
+            "state stability before sampling: {} matching observations over {}ms (required {}ms)",
+            state.stable_observations,
+            state.stable_duration.as_millis(),
+            state.required_stable_duration.as_millis()
+        ),
+        format!("published traffic weights: {:?}", overlay.candidates),
+        format!(
+            "{} requests; provider counts={:?}; chi-square={:.4} (critical {:.3})",
+            traffic.request_count, traffic.counts, traffic.chi_square, traffic.chi_square_critical_value
+        ),
+        format!("sample window: {sample_started} through {sample_completed}"),
+    ];
+    if !traffic.accepted {
+        observations.push(format!(
+            "sample failures: transport={}, HTTP={}, attribution={}",
+            traffic.transport_failures, traffic.http_failures, traffic.attribution_failures
+        ));
+    }
+    if !stable_during_sample {
+        observations.push("overlay or accepted/serving revision changed during traffic sample".to_owned());
+    }
+    Ok((
+        ProofResult {
+            success: phase_success,
+            description: format!("{phase}: dynamic Grid weights, served revision, and attributed traffic"),
+            observations,
+        },
+        Box::new(phase_evidence),
+    ))
+}
+
+/// Wait for fresh EPP signals, published weights, and both AI serving revisions to agree.
+#[expect(
+    clippy::too_many_lines,
+    reason = "This state gate validates EPP, signal, overlay, and data-plane convergence together."
+)]
+fn wait_for_dynamic_state(
+    context: &DemoContext,
+    signals: &SignalsPortForward,
+    phase: &str,
+    waiting_requests: u32,
+    previous_revisions: Option<&BTreeMap<String, String>>,
+) -> Result<DynamicStateSnapshot, Box<dyn std::error::Error>> {
+    let metric = match context.scoring_flavor {
+        ScoringFlavor::QueueDepth => "grid_routing_queue_pressure",
+        ScoringFlavor::KvCachePressure => "grid_routing_kv_cache_pressure",
+    };
+    let deadline = Instant::now() + DATA_PLANE_WAIT;
+    let mut last_trigger = Instant::now();
+    let mut stable_signature: Option<String> = None;
+    let mut stable_observations = 0_u8;
+    let mut stable_since: Option<Instant> = None;
+    let required_stable_duration = dynamic_state_stability_window();
+    let mut last_detail = String::from("no state observed yet");
+    let mut signal_lines = Vec::new();
+    while Instant::now() < deadline {
+        if last_trigger.elapsed() >= Duration::from_secs(5) {
+            for cluster in CLUSTERS {
+                trigger_gridnetwork_reconcile(cluster);
+            }
+            last_trigger = Instant::now();
+        }
+        let epp_a = kubectl_exec_epp_metrics("pool-a", false)
+            .ok()
+            .and_then(|text| parse_required_epp_metrics(&text).ok());
+        let epp_b = kubectl_exec_epp_metrics("pool-b", false)
+            .ok()
+            .and_then(|text| parse_required_epp_metrics(&text).ok());
+        let exposition = signals.read_exposition();
+        match (epp_a, epp_b, exposition) {
+            (Some(epp_a), Some(epp_b), Ok(exposition)) => {
+                let samples = parse_dynamic_signal_samples(&exposition, metric);
+                let poll_line = serde_json::json!({
+                    "observed_at": format_utc_iso(),
+                    "phase": phase,
+                    "pool_a_epp_queue": epp_a.queue_size,
+                    "pool_b_epp_queue": epp_b.queue_size,
+                    "signal_samples": samples,
+                    "pool_a_overlay": read_dynamic_overlay("pool-a").ok(),
+                    "pool_b_overlay": read_dynamic_overlay("pool-b").ok(),
+                });
+                signal_lines.push(poll_line.to_string());
+                let signals_ok =
+                    signal_matches(
+                        &samples,
+                        "pool-a",
+                        "llmd-pool-a-provider",
+                        waiting_requests,
+                        context.scoring_flavor,
+                    ) && signal_matches(&samples, "pool-b", "llmd-pool-b-provider", 0, context.scoring_flavor);
+                let epp_ok = epp_matches(epp_a.queue_size, waiting_requests, context.scoring_flavor)
+                    && epp_matches(epp_b.queue_size, 0, context.scoring_flavor);
+                let overlay_a = read_dynamic_overlay("pool-a");
+                let overlay_b = read_dynamic_overlay("pool-b");
+                if let (Ok(overlay_a), Ok(overlay_b)) = (overlay_a, overlay_b) {
+                    let weights_ok = dynamic_overlays_match_phase(&overlay_a, &overlay_b, phase);
+                    let revision_changed = dynamic_revisions_changed(&overlay_a, &overlay_b, previous_revisions);
+                    if signals_ok && epp_ok && weights_ok && revision_changed {
+                        let (accepted_a, serving_a) =
+                            match wait_for_gateway_revision("pool-a", &overlay_a.semantic_revision) {
+                                Ok(revisions) => revisions,
+                                Err(error) => {
+                                    stable_signature = None;
+                                    stable_observations = 0;
+                                    stable_since = None;
+                                    last_detail = error.to_string();
+                                    std::thread::sleep(Duration::from_secs(2));
+                                    continue;
+                                },
+                            };
+                        let (accepted_b, serving_b) =
+                            match wait_for_gateway_revision("pool-b", &overlay_b.semantic_revision) {
+                                Ok(revisions) => revisions,
+                                Err(error) => {
+                                    stable_signature = None;
+                                    stable_observations = 0;
+                                    stable_since = None;
+                                    last_detail = error.to_string();
+                                    std::thread::sleep(Duration::from_secs(2));
+                                    continue;
+                                },
+                            };
+                        let gateway_states = BTreeMap::from([
+                            (
+                                "pool-a".to_owned(),
+                                DynamicGatewayState {
+                                    overlay: overlay_a.clone(),
+                                    accepted_revision: accepted_a,
+                                    serving_revision: serving_a,
+                                },
+                            ),
+                            (
+                                "pool-b".to_owned(),
+                                DynamicGatewayState {
+                                    overlay: overlay_b.clone(),
+                                    accepted_revision: accepted_b,
+                                    serving_revision: serving_b,
+                                },
+                            ),
+                        ]);
+                        let signature = serde_json::to_string(&gateway_states)?;
+                        if stable_signature.as_deref() == Some(signature.as_str()) {
+                            stable_observations = stable_observations.saturating_add(1);
+                        } else {
+                            stable_signature = Some(signature);
+                            stable_observations = 1;
+                            stable_since = Some(Instant::now());
+                        }
+                        let stable_duration = stable_since.map_or(Duration::ZERO, |since| since.elapsed());
+                        let queue_map = BTreeMap::from([
+                            ("pool-a".to_owned(), epp_a.queue_size),
+                            ("pool-b".to_owned(), epp_b.queue_size),
+                        ]);
+                        if dynamic_state_stability_satisfied(
+                            stable_observations,
+                            stable_duration,
+                            required_stable_duration,
+                        ) {
+                            fs::write(
+                                context.evidence_dir.join(format!("signals-raw-{phase}.txt")),
+                                exposition,
+                            )?;
+                            return Ok(DynamicStateSnapshot {
+                                gateways: gateway_states,
+                                signal_samples: samples,
+                                epp_queue_size: queue_map,
+                                stable_observations,
+                                stable_duration,
+                                required_stable_duration,
+                                signal_lines,
+                            });
+                        }
+                    } else {
+                        stable_signature = None;
+                        stable_observations = 0;
+                        stable_since = None;
+                        last_detail = format!(
+                            "epp_ok={epp_ok}, signals_ok={signals_ok}, weights_ok={weights_ok}, revisions_changed={revision_changed}, a_revision={}, b_revision={}, a={:?}, b={:?}",
+                            overlay_a.semantic_revision,
+                            overlay_b.semantic_revision,
+                            overlay_a.candidates,
+                            overlay_b.candidates
+                        );
+                    }
+                } else {
+                    "one or both Grid overlay ConfigMaps are not readable".clone_into(&mut last_detail);
+                }
+            },
+            (epp_a, epp_b, exposition) => {
+                last_detail = format!(
+                    "EPP/signal boundary unavailable: pool_a={}, pool_b={}, signals={}",
+                    epp_a.is_some(),
+                    epp_b.is_some(),
+                    exposition.is_ok()
+                );
+            },
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+    fs::write(
+        context.evidence_dir.join(format!("signals-{phase}.jsonl")),
+        format!("{}\n", signal_lines.join("\n")),
+    )?;
+    Err(format!(
+        "{phase}: dynamic signals/overlay/revision gate timed out: {last_detail}; stable observations={stable_observations}, required quiet window={}ms",
+        required_stable_duration.as_millis()
+    )
+    .into())
+}
+
+/// Require one full peer polling interval, plus a short margin, with no served-state change.
+fn dynamic_state_stability_window() -> Duration {
+    let peer_poll_seconds = std::env::var("GRID_SIGNALS_PEER_INTERVAL_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(30)
+        .max(1);
+    Duration::from_secs(peer_poll_seconds.saturating_add(2))
+}
+
+/// State-based stability barrier used before starting the statistical sample.
+fn dynamic_state_stability_satisfied(observations: u8, stable_for: Duration, required: Duration) -> bool {
+    observations >= 2 && stable_for >= required
+}
+
+/// Check that EPP exposes the deterministic simulator queue value for a phase.
+fn epp_matches(observed_queue: f64, requested_waiting: u32, flavor: ScoringFlavor) -> bool {
+    let (queue, _) = simulator_metrics(requested_waiting, flavor);
+    (observed_queue - f64::from(queue)).abs() < f64::EPSILON
+}
+
+/// Check that a fresh normalized signal belongs to the requested provider.
+fn signal_matches(
+    samples: &[DynamicSignalSample],
+    site: &str,
+    provider: &str,
+    waiting_requests: u32,
+    flavor: ScoringFlavor,
+) -> bool {
+    let expected = match flavor {
+        ScoringFlavor::QueueDepth => (f64::from(waiting_requests) / QUEUE_CAPACITY).clamp(0.0, 1.0),
+        ScoringFlavor::KvCachePressure => simulator_metrics(waiting_requests, flavor).1,
+    };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok());
+    samples.iter().any(|sample| {
+        sample.site == site
+            && sample.provider == provider
+            && (sample.value - expected).abs() < 0.000_001
+            && sample
+                .timestamp_ms
+                .zip(now_ms)
+                .is_some_and(|(stamp, now)| now >= stamp && now.saturating_sub(stamp) <= 120_000)
+    })
+}
+
+/// Check phase-specific positive weights, group, freshness, and admission.
+fn dynamic_weights_match_phase(overlay: &DynamicOverlaySnapshot, phase: &str) -> bool {
+    let pool_a = overlay.candidates.iter().find(|candidate| candidate.site == "pool-a");
+    let pool_b = overlay.candidates.iter().find(|candidate| candidate.site == "pool-b");
+    let (Some(pool_a), Some(pool_b)) = (pool_a, pool_b) else {
+        return false;
+    };
+    if overlay.candidates.len() != 2
+        || pool_a.selection_group != pool_b.selection_group
+        || pool_a.selection_group != 0
+        || !pool_a.fresh
+        || !pool_b.fresh
+        || pool_a.admission_state != "new_and_existing"
+        || pool_b.admission_state != "new_and_existing"
+        || pool_a.traffic_weight == 0
+        || pool_b.traffic_weight == 0
+        || pool_a.traffic_weight + pool_b.traffic_weight != 1000
+    {
+        return false;
+    }
+    match phase {
+        "baseline" => pool_a.traffic_weight == 500 && pool_b.traffic_weight == 500,
+        "pressure" | "operator-restart" => pool_a.traffic_weight <= 300 && pool_b.traffic_weight >= 700,
+        "recovery" => pool_a.traffic_weight >= 450 && pool_b.traffic_weight <= 550,
+        _ => false,
+    }
+}
+
+/// Compare the contract on both gateways without requiring their local overlays
+/// or candidate ordering to have identical semantic revisions.
+fn dynamic_overlays_match_phase(pool_a: &DynamicOverlaySnapshot, pool_b: &DynamicOverlaySnapshot, phase: &str) -> bool {
+    dynamic_weights_match_phase(pool_a, phase)
+        && dynamic_weights_match_phase(pool_b, phase)
+        && dynamic_candidate_identities_match_unordered(pool_a, pool_b)
+}
+
+/// Compare shared candidate identity, not weights maintained by each operator.
+/// Each gateway smooths its independently timed fresh signal snapshot; phase
+/// bounds are checked separately for both overlays above.
+fn dynamic_candidate_identities_match_unordered(left: &DynamicOverlaySnapshot, right: &DynamicOverlaySnapshot) -> bool {
+    let identities = |overlay: &DynamicOverlaySnapshot| {
+        let mut candidates = overlay
+            .candidates
+            .iter()
+            .map(|candidate| {
+                (
+                    candidate.site.clone(),
+                    candidate.provider.clone(),
+                    candidate.stable_id.clone(),
+                    candidate.selection_group,
+                    candidate.fresh,
+                    candidate.admission_state.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_unstable();
+        candidates
+    };
+    identities(left) == identities(right)
+}
+
+/// Every gateway must publish a new semantic revision after a phase transition.
+fn dynamic_revisions_changed(
+    pool_a: &DynamicOverlaySnapshot,
+    pool_b: &DynamicOverlaySnapshot,
+    previous: Option<&BTreeMap<String, String>>,
+) -> bool {
+    previous.is_none_or(|revisions| {
+        revisions
+            .get("pool-a")
+            .is_some_and(|revision| revision != &pool_a.semantic_revision)
+            && revisions
+                .get("pool-b")
+                .is_some_and(|revision| revision != &pool_b.semantic_revision)
+    })
+}
+
+/// Extract each gateway's own Grid semantic revision for the next phase gate.
+fn dynamic_semantic_revisions(gateways: &BTreeMap<String, DynamicGatewayState>) -> BTreeMap<String, String> {
+    gateways
+        .iter()
+        .map(|(cluster, state)| (cluster.clone(), state.overlay.semantic_revision.clone()))
+        .collect()
+}
+
+/// Extract the Praxis-accepted revision from each gateway state.
+fn dynamic_accepted_revisions(gateways: &BTreeMap<String, DynamicGatewayState>) -> BTreeMap<String, String> {
+    gateways
+        .iter()
+        .map(|(cluster, state)| (cluster.clone(), state.accepted_revision.clone()))
+        .collect()
+}
+
+/// Extract the revision currently serving requests on each gateway.
+fn dynamic_serving_revisions(gateways: &BTreeMap<String, DynamicGatewayState>) -> BTreeMap<String, String> {
+    gateways
+        .iter()
+        .map(|(cluster, state)| (cluster.clone(), state.serving_revision.clone()))
+        .collect()
+}
+
+/// Parse one metric's site/provider labels and timestamp from exposition.
+fn parse_dynamic_signal_samples(text: &str, metric: &str) -> Vec<DynamicSignalSample> {
+    text.lines()
+        .filter_map(|line| {
+            let (name_and_labels, fields) = line.split_once('}')?;
+            let (name, labels) = name_and_labels.split_once('{')?;
+            if name != metric {
+                return None;
+            }
+            let mut fields = fields.split_whitespace();
+            Some(DynamicSignalSample {
+                site: prometheus_label(labels, "grid_site")?,
+                provider: prometheus_label(labels, "grid_provider")?,
+                value: fields.next()?.parse().ok()?,
+                timestamp_ms: fields.next().and_then(|value| value.parse().ok()),
+            })
+        })
+        .filter(|sample: &DynamicSignalSample| sample.value.is_finite() && (0.0..=1.0).contains(&sample.value))
+        .collect()
+}
+
+/// Extract one quoted label value from a parsed exposition label list.
+fn prometheus_label(labels: &str, name: &str) -> Option<String> {
+    let marker = format!("{name}=\"");
+    let start = labels.find(&marker)?.checked_add(marker.len())?;
+    let rest = labels.get(start..)?;
+    let end = rest.find('"')?;
+    Some(rest.get(..end)?.to_owned())
+}
+
+/// Read the dynamic-weight overlay ConfigMap from a named demo cluster.
+fn read_dynamic_overlay(cluster: &str) -> Result<DynamicOverlaySnapshot, Box<dyn std::error::Error>> {
+    let context = kind_context(cluster);
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            &context,
+            "-n",
+            GRID_SYSTEM_NS,
+            "get",
+            "configmap",
+            OVERLAY_CONFIGMAP,
+            "-o",
+            "json",
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!("{cluster}: overlay ConfigMap unavailable").into());
+    }
+    parse_dynamic_overlay_json(&output.stdout).map_err(|error| format!("{cluster}: {error}").into())
+}
+
+/// Parse the weighted routing config and semantic revision from a ConfigMap.
+fn parse_dynamic_overlay_json(bytes: &[u8]) -> Result<DynamicOverlaySnapshot, Box<dyn std::error::Error>> {
+    let configmap: serde_json::Value = serde_json::from_slice(bytes)?;
+    let semantic_revision = configmap
+        .pointer("/metadata/annotations/grid.praxis-proxy.io~1overlay-revision")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("overlay semantic revision missing")?
+        .to_owned();
+    let resource_version = configmap
+        .pointer("/metadata/resourceVersion")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown")
+        .to_owned();
+    let routing: serde_json::Value = serde_json::from_str(
+        configmap
+            .pointer("/data/routing-config.json")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("routing config missing")?,
+    )?;
+    if routing
+        .pointer("/selection_policy/mode")
+        .and_then(serde_json::Value::as_str)
+        != Some("weightedRandom")
+    {
+        return Err("overlay is not weightedRandom".into());
+    }
+    let candidates = routing
+        .get("candidates")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("overlay candidates missing")?
+        .iter()
+        .filter_map(|candidate| {
+            Some(DynamicCandidateWeight {
+                site: candidate.get("site")?.as_str()?.to_owned(),
+                provider: candidate.get("cluster")?.as_str()?.to_owned(),
+                stable_id: candidate.get("stable_id")?.as_str()?.to_owned(),
+                selection_group: u32::try_from(candidate.get("selection_group")?.as_u64()?).ok()?,
+                traffic_weight: u32::try_from(candidate.get("traffic_weight")?.as_u64()?).ok()?,
+                fresh: candidate.get("fresh")?.as_bool()?,
+                admission_state: candidate.get("admission_state")?.as_str()?.to_owned(),
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(DynamicOverlaySnapshot {
+        semantic_revision,
+        resource_version,
+        candidates,
+    })
+}
+
+/// Wait until Praxis accepts and serves the exact expected overlay revision.
+fn wait_for_gateway_revision(cluster: &str, revision: &str) -> Result<(String, String), Box<dyn std::error::Error>> {
+    let context = kind_context(cluster);
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let mut last_observed = None;
+    let mut last_error = None;
+    while Instant::now() < deadline {
+        match observe_serving_state(&context) {
+            Ok((overlay, accepted, serving)) => {
+                if accepted == revision && serving == revision {
+                    return Ok((accepted, serving));
+                }
+                last_observed = Some((overlay.semantic_revision, accepted, serving));
+                last_error = None;
+            },
+            Err(error) => last_error = Some(error.to_string()),
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+    let observed = last_observed.map_or_else(
+        || "no complete Grid/Praxis revision observation".to_owned(),
+        |(grid, accepted, serving)| format!("last observed Grid={grid}, accepted={accepted}, serving={serving}"),
+    );
+    let observer_error = last_error.map_or_else(String::new, |error| format!("; last read error={error}"));
+    Err(
+        format!("{cluster}: Praxis did not accept and serve Grid revision {revision}; {observed}{observer_error}")
+            .into(),
+    )
+}
+
+/// Read one gateway's overlay plus its latest accepted and serving revisions.
+fn observe_serving_state(
+    context: &str,
+) -> Result<(DynamicOverlaySnapshot, String, String), Box<dyn std::error::Error>> {
+    let overlay = read_dynamic_overlay_for_context(context)?;
+    let (accepted, serving) = read_praxis_revisions(context)?;
+    Ok((overlay, accepted, serving))
+}
+
+/// Read the latest accepted and serving revision fields from the Praxis gateway logs.
+fn read_praxis_revisions(context: &str) -> Result<(String, String), Box<dyn std::error::Error>> {
+    let logs = Command::new("kubectl")
+        .args([
+            "--context",
+            context,
+            "-n",
+            GRID_SYSTEM_NS,
+            "logs",
+            "deployment/consumer-gateway",
+            "-c",
+            "praxis",
+            "--tail=300",
+        ])
+        .output()?;
+    if !logs.status.success() {
+        return Err(format!("failed to read Praxis gateway logs in {context}").into());
+    }
+    let logs = String::from_utf8_lossy(&logs.stdout);
+    let accepted = latest_dynamic_log_field(&logs, "accepted_revision").ok_or("accepted revision not logged")?;
+    let serving = latest_dynamic_log_field(&logs, "serving_revision").ok_or("serving revision not logged")?;
+    Ok((accepted, serving))
+}
+
+/// Read an overlay ConfigMap using an explicit Kubernetes context.
+fn read_dynamic_overlay_for_context(context: &str) -> Result<DynamicOverlaySnapshot, Box<dyn std::error::Error>> {
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            context,
+            "-n",
+            GRID_SYSTEM_NS,
+            "get",
+            "configmap",
+            OVERLAY_CONFIGMAP,
+            "-o",
+            "json",
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err("consumer overlay ConfigMap unavailable".into());
+    }
+    parse_dynamic_overlay_json(&output.stdout)
+}
+
+/// Extract the latest structured revision field from Praxis logs.
+fn latest_dynamic_log_field(logs: &str, field: &str) -> Option<String> {
+    strip_dynamic_csi_sgr(logs).lines().rev().find_map(|line| {
+        let marker = format!("{field}=");
+        line.match_indices(&marker).find_map(|(index, _)| {
+            let at_boundary = index == 0
+                || line
+                    .get(..index)
+                    .and_then(|value| value.chars().next_back())
+                    .is_some_and(char::is_whitespace);
+            if !at_boundary {
+                return None;
+            }
+            let value = line.get(index + marker.len()..)?;
+            let value = value.strip_prefix('"').map_or_else(
+                || value.split_whitespace().next().unwrap_or(""),
+                |quoted| quoted.split('"').next().unwrap_or(""),
+            );
+            (!value.is_empty()).then(|| value.to_owned())
+        })
+    })
+}
+
+/// Remove ANSI SGR styling from structured tracing logs before parsing fields.
+fn strip_dynamic_csi_sgr(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(character) = chars.next() {
+        if character == '\x1b' {
+            if chars.next() == Some('[') {
+                for final_byte in chars.by_ref() {
+                    if final_byte.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+        } else {
+            output.push(character);
+        }
+    }
+    output
+}
+
+/// Collect a sessionless weighted sample from four concurrent loops in one persistent client pod.
+#[expect(
+    clippy::too_many_lines,
+    reason = "The sampler classifies every request once and writes the raw, non-retried outcome."
+)]
+fn sample_dynamic_traffic(
+    context: &str,
+    phase: &str,
+    overlay: &DynamicOverlaySnapshot,
+) -> Result<DynamicTrafficResult, Box<dyn std::error::Error>> {
+    const WORKERS: u32 = 4;
+    let sample_started = format_utc_iso();
+    debug_assert_eq!(
+        WORKERS * (DYNAMIC_SAMPLE_SIZE / WORKERS),
+        DYNAMIC_SAMPLE_SIZE,
+        "all configured requests must be assigned to sampler workers"
+    );
+    let script = dynamic_sample_script(phase);
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            context,
+            "-n",
+            GRID_SYSTEM_NS,
+            "exec",
+            "dynamic-weighted-client",
+            "--",
+            "sh",
+            "-c",
+            &script,
+        ])
+        .output()?;
+    let sample_completed = format_utc_iso();
+    let mut raw = Vec::new();
+    let mut counts = BTreeMap::from([("pool-a".to_owned(), 0_u32), ("pool-b".to_owned(), 0_u32)]);
+    let mut transport_failures = 0_u32;
+    let mut http_failures = 0_u32;
+    let mut attribution_failures = 0_u32;
+    let mut received = 0_u32;
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let Some(rest) = line.strip_prefix("DYN|") else {
+            continue;
+        };
+        let mut fields = rest.splitn(6, '|');
+        let request_id = fields.next().unwrap_or("unknown");
+        let curl_exit = fields.next().and_then(|value| value.parse::<i32>().ok()).unwrap_or(-1);
+        let status = fields
+            .next()
+            .and_then(|value| value.parse::<u16>().ok())
+            .filter(|status| *status != 0);
+        let provider_gateway = fields.next().unwrap_or("");
+        let provider_attribution = fields.next().unwrap_or("");
+        let latency = fields.next().unwrap_or("");
+        received = received.saturating_add(1);
+        let category = if curl_exit != 0 || status.is_none() {
+            transport_failures = transport_failures.saturating_add(1);
+            "transport_failure"
+        } else if status != Some(200) {
+            http_failures = http_failures.saturating_add(1);
+            "http_failure"
+        } else if provider_gateway.contains("pool-a") && provider_attribution.contains("pool-a") {
+            *counts.entry("pool-a".to_owned()).or_default() += 1;
+            "attributed_pool_a"
+        } else if provider_gateway.contains("pool-b") && provider_attribution.contains("pool-b") {
+            *counts.entry("pool-b".to_owned()).or_default() += 1;
+            "attributed_pool_b"
+        } else {
+            attribution_failures = attribution_failures.saturating_add(1);
+            "attribution_failure"
+        };
+        raw.push(
+            serde_json::json!({
+                "request_id": request_id,
+                "phase": phase,
+                "http_status": status,
+                "curl_exit_code": curl_exit,
+                "provider_gateway": provider_gateway,
+                "provider_attribution": provider_attribution,
+                "latency_seconds": latency,
+                "classification": category,
+            })
+            .to_string(),
+        );
+    }
+    if !output.status.success() {
+        raw.push(
+            serde_json::json!({
+                "phase": phase,
+                "classification": "sampler_transport_failure",
+                "stderr": safe_truncate_str(String::from_utf8_lossy(&output.stderr).trim(), 240),
+            })
+            .to_string(),
+        );
+    }
+    if received < DYNAMIC_SAMPLE_SIZE {
+        transport_failures = transport_failures.saturating_add(DYNAMIC_SAMPLE_SIZE - received);
+    }
+    let pool_a = overlay
+        .candidates
+        .iter()
+        .find(|candidate| candidate.site == "pool-a")
+        .ok_or("pool-a weight absent")?;
+    let pool_b = overlay
+        .candidates
+        .iter()
+        .find(|candidate| candidate.site == "pool-b")
+        .ok_or("pool-b weight absent")?;
+    let observed_a = counts.get("pool-a").copied().ok_or("pool-a count missing")?;
+    let observed_b = counts.get("pool-b").copied().ok_or("pool-b count missing")?;
+    let total = f64::from(observed_a.saturating_add(observed_b)).max(1.0);
+    let expected_total = f64::from(pool_a.traffic_weight + pool_b.traffic_weight);
+    let expected_a = f64::from(pool_a.traffic_weight) / expected_total;
+    let expected_b = f64::from(pool_b.traffic_weight) / expected_total;
+    let chi_square = dynamic_chi_square([pool_a.traffic_weight, pool_b.traffic_weight], [observed_a, observed_b]);
+    let accepted = received == DYNAMIC_SAMPLE_SIZE
+        && transport_failures == 0
+        && http_failures == 0
+        && attribution_failures == 0
+        && (observed_a + observed_b) == DYNAMIC_SAMPLE_SIZE
+        && chi_square <= DYNAMIC_CHI_SQUARE_CRITICAL;
+    Ok((
+        DynamicTrafficSample {
+            request_count: received,
+            counts,
+            observed_fraction: BTreeMap::from([
+                ("pool-a".to_owned(), f64::from(observed_a) / total),
+                ("pool-b".to_owned(), f64::from(observed_b) / total),
+            ]),
+            expected_fraction: BTreeMap::from([("pool-a".to_owned(), expected_a), ("pool-b".to_owned(), expected_b)]),
+            chi_square,
+            chi_square_critical_value: DYNAMIC_CHI_SQUARE_CRITICAL,
+            accepted,
+            transport_failures,
+            http_failures,
+            attribution_failures,
+        },
+        raw,
+        sample_started,
+        sample_completed,
+    ))
+}
+
+/// Bind independent sessions before pressure and replay those same keys later.
+/// Every curl executes once; HTTP and attribution failures are recorded, never retried.
+fn sample_dynamic_affinity(
+    context: &str,
+    run_id: &str,
+    stage: &str,
+) -> Result<Vec<DynamicAffinitySample>, Box<dyn std::error::Error>> {
+    const SCRIPT: &str = r#"
+run_id="$1"
+stage="$2"
+total="$3"
+ordinal=1
+while [ "$ordinal" -le "$total" ]; do
+  session_id="${run_id}-weighted-affinity-${ordinal}"
+  out=$(curl --silent --show-error --connect-timeout 5 --max-time 20 -o /dev/null -w '%{http_code}|%header{X-Grid-LlmD-Provider-Gateway}|%header{x-ai-demo-provider-gateway}' -H 'Content-Type: application/json' -H "X-Session-Id: ${session_id}" -X POST 'http://consumer-gateway.grid-system.svc.cluster.local:8080/v1/chat/completions' -d '{"model":"Qwen/Qwen3-0.6B","messages":[{"role":"user","content":"weighted affinity qualification"}],"max_tokens":2}' 2>/dev/null)
+  rc=$?
+  printf 'AFF|%s|%s|%s|%s\n' "$stage" "$ordinal" "$rc" "$out"
+  ordinal=$((ordinal + 1))
+done
+"#;
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            context,
+            "-n",
+            GRID_SYSTEM_NS,
+            "exec",
+            "dynamic-weighted-client",
+            "--",
+            "sh",
+            "-c",
+            SCRIPT,
+            "affinity",
+            run_id,
+            stage,
+            &DYNAMIC_AFFINITY_SESSION_COUNT.to_string(),
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "affinity {stage} requests could not run: {}",
+            safe_truncate_str(String::from_utf8_lossy(&output.stderr).trim(), 240)
+        )
+        .into());
+    }
+
+    let mut samples = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let mut fields = line.splitn(5, '|');
+        if fields.next() != Some("AFF") {
+            continue;
+        }
+        let Some(observed_stage) = fields.next() else { continue };
+        let Some(session_ordinal) = fields.next().and_then(|value| value.parse::<u32>().ok()) else {
+            continue;
+        };
+        let curl_exit_code = fields.next().and_then(|value| value.parse::<i32>().ok()).unwrap_or(-1);
+        let mut response = fields.next().unwrap_or("").splitn(3, '|');
+        samples.push(DynamicAffinitySample {
+            stage: observed_stage.to_owned(),
+            session_ordinal,
+            curl_exit_code,
+            http_status: response
+                .next()
+                .and_then(|value| value.parse::<u16>().ok())
+                .filter(|value| *value != 0),
+            provider_gateway: response.next().unwrap_or("").to_owned(),
+            provider_attribution: response.next().unwrap_or("").to_owned(),
+        });
+    }
+    Ok(samples)
+}
+
+/// Persist every affinity request result without exposing the synthetic session key.
+fn write_dynamic_affinity_samples(
+    evidence_dir: &Path,
+    stage: &str,
+    samples: &[DynamicAffinitySample],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut lines = samples
+        .iter()
+        .map(serde_json::to_string)
+        .collect::<Result<Vec<_>, _>>()?;
+    if lines.is_empty() {
+        lines.push(serde_json::json!({"stage": stage, "classification": "no_samples"}).to_string());
+    }
+    fs::write(
+        evidence_dir.join(format!("affinity-{stage}.jsonl")),
+        format!("{}\n", lines.join("\n")),
+    )?;
+    Ok(())
+}
+
+/// Require a complete baseline binding sample with trusted attribution to both providers.
+fn affinity_bind_samples_valid(samples: &[DynamicAffinitySample]) -> bool {
+    samples.len() == usize::try_from(DYNAMIC_AFFINITY_SESSION_COUNT).unwrap_or(usize::MAX)
+        && samples.iter().all(|sample| {
+            sample.stage == "bind"
+                && sample.curl_exit_code == 0
+                && sample.http_status == Some(200)
+                && sample.provider_gateway == sample.provider_attribution
+                && matches!(sample.provider_gateway.as_str(), "pool-a" | "pool-b")
+        })
+        && samples.iter().any(|sample| sample.provider_gateway == "pool-a")
+        && samples.iter().any(|sample| sample.provider_gateway == "pool-b")
+}
+
+/// Require every replay to return its original provider after the overlay weights change.
+fn affinity_replay_matches(bindings: &BTreeMap<u32, String>, samples: &[DynamicAffinitySample]) -> bool {
+    samples.len() == bindings.len()
+        && samples.iter().all(|sample| {
+            sample.stage == "replay"
+                && sample.curl_exit_code == 0
+                && sample.http_status == Some(200)
+                && sample.provider_gateway == sample.provider_attribution
+                && bindings.get(&sample.session_ordinal) == Some(&sample.provider_gateway)
+        })
+}
+
+/// Restart the run-owned Grid operators and record deployment pod replacement.
+fn restart_dynamic_operators() -> Result<Vec<DynamicOperatorRestart>, Box<dyn std::error::Error>> {
+    let mut before = BTreeMap::new();
+    for cluster in CLUSTERS {
+        before.insert(
+            (*cluster).to_owned(),
+            dynamic_operator_pod_uids(&kind_context(cluster))?,
+        );
+    }
+    for cluster in CLUSTERS {
+        let context = kind_context(cluster);
+        let restart = Command::new("kubectl")
+            .args([
+                "--context",
+                &context,
+                "-n",
+                GRID_SYSTEM_NS,
+                "rollout",
+                "restart",
+                "deployment/grid-operator",
+            ])
+            .output()?;
+        if !restart.status.success() {
+            return Err(format!(
+                "{cluster}: operator rollout restart failed: {}",
+                safe_truncate_str(String::from_utf8_lossy(&restart.stderr).trim(), 240)
+            )
+            .into());
+        }
+    }
+    let mut records = Vec::new();
+    for cluster in CLUSTERS {
+        let context = kind_context(cluster);
+        let rollout = Command::new("kubectl")
+            .args([
+                "--context",
+                &context,
+                "-n",
+                GRID_SYSTEM_NS,
+                "rollout",
+                "status",
+                "deployment/grid-operator",
+                "--timeout=180s",
+            ])
+            .output()?;
+        if !rollout.status.success() {
+            return Err(format!(
+                "{cluster}: operator rollout did not become ready: {}",
+                safe_truncate_str(String::from_utf8_lossy(&rollout.stderr).trim(), 240)
+            )
+            .into());
+        }
+        let after_pod_uids = dynamic_operator_pod_uids(&context)?;
+        let before_pod_uids = before
+            .remove(*cluster)
+            .ok_or("operator pre-restart pod snapshot missing")?;
+        if before_pod_uids == after_pod_uids {
+            return Err(format!("{cluster}: operator rollout completed without replacing its pod").into());
+        }
+        if before_pod_uids.iter().any(|uid| after_pod_uids.contains(uid)) {
+            return Err(format!("{cluster}: pre-restart operator pod is still Ready after rollout").into());
+        }
+        records.push(DynamicOperatorRestart {
+            cluster: (*cluster).to_owned(),
+            before_pod_uids,
+            after_pod_uids,
+        });
+    }
+    Ok(records)
+}
+
+/// Return UIDs for the Grid operator Deployment's run-owned pods.
+fn dynamic_operator_pod_uids(context: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let output = Command::new("kubectl")
+        .args(["--context", context, "-n", GRID_SYSTEM_NS, "get", "pods", "-o", "json"])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!("could not list operator pods in {context}").into());
+    }
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    let items = value
+        .get("items")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("pod list items missing")?;
+    let uids = active_dynamic_operator_pod_uids(items);
+    if uids.is_empty() {
+        return Err(format!("no Ready, non-terminating Grid operator pod found in {context}").into());
+    }
+    Ok(uids)
+}
+
+/// Return Ready, non-terminating Grid operator pod UIDs from a Kubernetes pod list.
+fn active_dynamic_operator_pod_uids(pods: &[serde_json::Value]) -> Vec<String> {
+    let mut uids = pods
+        .iter()
+        .filter(|pod| {
+            pod.pointer("/metadata/name")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|name| name.starts_with("grid-operator-"))
+                && pod
+                    .pointer("/metadata/deletionTimestamp")
+                    .and_then(serde_json::Value::as_str)
+                    .is_none()
+                && pod
+                    .pointer("/status/conditions")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|conditions| {
+                        conditions.iter().any(|condition| {
+                            condition.get("type").and_then(serde_json::Value::as_str) == Some("Ready")
+                                && condition.get("status").and_then(serde_json::Value::as_str) == Some("True")
+                        })
+                    })
+        })
+        .filter_map(|pod| {
+            pod.pointer("/metadata/uid")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .collect::<Vec<_>>();
+    uids.sort();
+    uids
+}
+
+/// Return Grid operator pod UIDs, including the empty state during a scale-down.
+fn dynamic_operator_pod_uids_allow_empty(context: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let output = Command::new("kubectl")
+        .args(["--context", context, "-n", GRID_SYSTEM_NS, "get", "pods", "-o", "json"])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!("could not list operator pods in {context}").into());
+    }
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    let items = value
+        .get("items")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("pod list items missing")?;
+    let mut uids = items
+        .iter()
+        .filter(|pod| {
+            pod.pointer("/metadata/name")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|name| name.starts_with("grid-operator-"))
+        })
+        .filter_map(|pod| {
+            pod.pointer("/metadata/uid")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .collect::<Vec<_>>();
+    uids.sort();
+    Ok(uids)
+}
+
+/// One HTTP request made while the invalid overlay is being rejected.
+#[derive(Clone, Debug, Serialize)]
+struct DynamicLkgProbe {
+    /// curl exit status (zero means transport completed).
+    curl_exit_code: i32,
+    /// HTTP response status, when received.
+    http_status: Option<u16>,
+    /// Trusted provider gateway response attribution.
+    provider_gateway: String,
+    /// Independent provider attribution from the backend.
+    provider_attribution: String,
+}
+
+/// Result of the invalid-overlay interval before the run-owned state is restored.
+type DynamicLkgCheck = (String, (String, String), bool, DynamicLkgProbe);
+
+/// Fallible result for the invalid-overlay interval.
+type DynamicLkgCheckResult = Result<DynamicLkgCheck, Box<dyn std::error::Error>>;
+
+/// Inject one malformed run-owned overlay and prove both LKG retention and live routing.
+fn prove_invalid_overlay_last_known_good(context: &DemoContext, expected: &DynamicPhaseEvidence) -> ProofResult {
+    const OVERLAY_FILE: &str = "/etc/praxis/routing/routing-overlay.json";
+    const INVALID_OVERLAY: &str = "{";
+    const OVERLAY_KEY: &str = "routing-overlay.json";
+    let cluster_context = kind_context("pool-a");
+    let original_overlay = match read_overlay_configmap_value(&cluster_context, OVERLAY_KEY) {
+        Ok(value) => value,
+        Err(error) => {
+            return failed_proof(
+                "Invalid overlay LKG: original ConfigMap could not be captured",
+                error.to_string(),
+            );
+        },
+    };
+    let expected_gateway = expected.gateways.get("pool-a");
+    let Some(expected_gateway) = expected_gateway else {
+        return failed_proof(
+            "Invalid overlay LKG: pressure-phase gateway evidence is missing",
+            "pool-a state absent".to_owned(),
+        );
+    };
+    let expected_revision = expected_gateway.overlay.semantic_revision.clone();
+    let (accepted_before, serving_before) = match read_praxis_revisions(&cluster_context) {
+        Ok(revisions) => revisions,
+        Err(error) => return failed_proof("Invalid overlay LKG: Praxis revisions unavailable", error.to_string()),
+    };
+    let file_before = match read_gateway_overlay_file(&cluster_context, OVERLAY_FILE) {
+        Ok(contents) => contents,
+        Err(error) => {
+            return failed_proof(
+                "Invalid overlay LKG: active route snapshot unavailable",
+                error.to_string(),
+            );
+        },
+    };
+    if accepted_before != expected_revision || serving_before != expected_revision {
+        return failed_proof(
+            "Invalid overlay LKG: gateway was not serving the pressure revision before injection",
+            format!("expected={expected_revision}, accepted={accepted_before}, serving={serving_before}"),
+        );
+    }
+
+    let mut operators_scale_touched = false;
+    let mut configmap_touched = false;
+    let test_result = (|| -> DynamicLkgCheckResult {
+        operators_scale_touched = true;
+        for cluster in CLUSTERS {
+            scale_dynamic_operator(cluster, 0)?;
+        }
+        for cluster in CLUSTERS {
+            wait_for_dynamic_operator_count(cluster, 0)?;
+        }
+
+        // Mark as touched before invoking kubectl so restoration is attempted even
+        // if the API server reports an ambiguous patch outcome.
+        configmap_touched = true;
+        patch_overlay_configmap_value(&cluster_context, OVERLAY_KEY, INVALID_OVERLAY)?;
+        let rejection = wait_for_overlay_rejection(&cluster_context, "malformed")?;
+        let revisions = read_praxis_revisions(&cluster_context)?;
+        let file_after = read_gateway_overlay_file(&cluster_context, OVERLAY_FILE)?;
+        let live_overlay_unchanged = file_before.trim_end() == file_after.trim_end();
+        let request = run_dynamic_lkg_probe(&cluster_context)?;
+        let provider_matches = request.provider_gateway == request.provider_attribution
+            && matches!(request.provider_gateway.as_str(), "pool-a" | "pool-b");
+        if revisions.0 != accepted_before
+            || revisions.1 != serving_before
+            || !live_overlay_unchanged
+            || request.curl_exit_code != 0
+            || request.http_status != Some(200)
+            || !provider_matches
+        {
+            return Err(format!(
+                "last-known-good check failed: revisions={revisions:?}, file_unchanged={live_overlay_unchanged}, request={request:?}"
+            )
+            .into());
+        }
+        Ok((rejection, revisions, live_overlay_unchanged, request))
+    })();
+
+    let mut restoration_errors = Vec::new();
+    if configmap_touched
+        && let Err(error) = patch_overlay_configmap_value(&cluster_context, OVERLAY_KEY, &original_overlay)
+    {
+        restoration_errors.push(format!("restore original overlay ConfigMap data: {error}"));
+    }
+    if operators_scale_touched {
+        for cluster in CLUSTERS {
+            if let Err(error) = scale_dynamic_operator(cluster, 1) {
+                restoration_errors.push(format!("restore {cluster} operator replica: {error}"));
+            }
+        }
+        for cluster in CLUSTERS {
+            if let Err(error) = wait_for_dynamic_operator_count(cluster, 1) {
+                restoration_errors.push(format!("wait for {cluster} operator recovery: {error}"));
+            }
+        }
+    }
+
+    let (test_error, details) = match test_result {
+        Ok(result) => (None, Some(result)),
+        Err(error) => (Some(error.to_string()), None),
+    };
+    let (rejection, revisions, live_overlay_unchanged, request) = details.map_or((None, None, None, None), |result| {
+        (Some(result.0), Some(result.1), Some(result.2), Some(result.3))
+    });
+    let restoration_succeeded = restoration_errors.is_empty();
+    let evidence_write = serde_json::to_vec_pretty(&serde_json::json!({
+        "expected_pressure_revision": expected_revision,
+        "accepted_before": accepted_before,
+        "serving_before": serving_before,
+        "invalid_payload_class": "malformed JSON object",
+        "invalid_payload": INVALID_OVERLAY,
+        "overlay_sync_rejection": &rejection,
+        "accepted_after": revisions.as_ref().map(|value| &value.0),
+        "serving_after": revisions.as_ref().map(|value| &value.1),
+        "live_route_file_unchanged": live_overlay_unchanged,
+        "request": &request,
+        "test_error": &test_error,
+        "restoration_errors": restoration_errors.clone(),
+    }))
+    .map_err(|error| error.to_string())
+    .and_then(|bytes| {
+        fs::write(context.evidence_dir.join("invalid-overlay-last-known-good.json"), bytes)
+            .map_err(|error| error.to_string())
+    });
+    let success = evidence_write.is_ok() && test_error.is_none() && restoration_succeeded;
+    ProofResult {
+        success,
+        description: "Invalid overlay: overlay-sync and Praxis retain and serve the last-known-good snapshot"
+            .to_owned(),
+        observations: vec![
+            rejection.map_or_else(
+                || "overlay-sync malformed-overlay rejection was not observed".to_owned(),
+                |line| format!("overlay-sync rejected invalid update: {line}"),
+            ),
+            revisions.map_or_else(
+                || "Praxis post-injection revision state unavailable".to_owned(),
+                |(accepted, serving)| format!("accepted={accepted}, serving={serving}"),
+            ),
+            live_overlay_unchanged.map_or_else(
+                || "active route file was not compared".to_owned(),
+                |unchanged| format!("active route file unchanged={unchanged}"),
+            ),
+            request.map_or_else(
+                || "post-injection request not completed".to_owned(),
+                |result| {
+                    format!(
+                        "post-injection request status={:?}, gateway={}, backend={}",
+                        result.http_status, result.provider_gateway, result.provider_attribution
+                    )
+                },
+            ),
+            test_error.unwrap_or_else(|| "invalid-overlay runtime assertions passed".to_owned()),
+            if restoration_errors.is_empty() {
+                "original ConfigMap data restored and both operators Ready".to_owned()
+            } else {
+                format!("restoration errors: {}", restoration_errors.join("; "))
+            },
+        ],
+    }
+}
+
+/// Read one ConfigMap data field without emitting its payload to logs.
+fn read_overlay_configmap_value(context: &str, key: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            context,
+            "-n",
+            GRID_SYSTEM_NS,
+            "get",
+            "configmap",
+            OVERLAY_CONFIGMAP,
+            "-o",
+            "json",
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err("consumer overlay ConfigMap unavailable".into());
+    }
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    value
+        .pointer(&format!("/data/{key}"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| format!("overlay ConfigMap data key {key} is missing").into())
+}
+
+/// Patch a single run-owned ConfigMap data field using JSON-encoded input.
+fn patch_overlay_configmap_value(context: &str, key: &str, value: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let patch = serde_json::json!({"data": {key: value}}).to_string();
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            context,
+            "-n",
+            GRID_SYSTEM_NS,
+            "patch",
+            "configmap",
+            OVERLAY_CONFIGMAP,
+            "--type=merge",
+            "-p",
+            &patch,
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "overlay ConfigMap patch failed: {}",
+            safe_truncate_str(String::from_utf8_lossy(&output.stderr).trim(), 240)
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Read the active overlay file inside the run-owned Praxis gateway container.
+fn read_gateway_overlay_file(context: &str, path: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            context,
+            "-n",
+            GRID_SYSTEM_NS,
+            "exec",
+            "deployment/consumer-gateway",
+            "-c",
+            "praxis",
+            "--",
+            "cat",
+            path,
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err("could not read the active Praxis overlay snapshot".into());
+    }
+    Ok(String::from_utf8(output.stdout)?)
+}
+
+/// Read bounded overlay-sync logs and return the matching malformed rejection line.
+fn wait_for_overlay_rejection(context: &str, reason: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + Duration::from_secs(45);
+    let mut last_error = String::from("overlay-sync rejection log was not observed");
+    while Instant::now() < deadline {
+        let output = Command::new("kubectl")
+            .args([
+                "--context",
+                context,
+                "-n",
+                GRID_SYSTEM_NS,
+                "logs",
+                "deployment/consumer-gateway",
+                "-c",
+                "overlay-sync",
+                "--since=2m",
+                "--tail=500",
+            ])
+            .output()?;
+        if output.status.success() {
+            let logs = String::from_utf8_lossy(&output.stdout);
+            if let Some(line) = logs
+                .lines()
+                .rev()
+                .find(|line| line.contains("overlay_rejected") && line.contains(reason))
+            {
+                return Ok(safe_truncate_str(line.trim(), 400));
+            }
+            "overlay-sync logs did not contain the expected rejection reason".clone_into(&mut last_error);
+        } else {
+            last_error = safe_truncate_str(String::from_utf8_lossy(&output.stderr).trim(), 240);
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    Err(last_error.into())
+}
+
+/// Make exactly one fresh, sessionless request during the invalid-overlay window.
+fn run_dynamic_lkg_probe(context: &str) -> Result<DynamicLkgProbe, Box<dyn std::error::Error>> {
+    const SCRIPT: &str = r#"
+out=$(curl --silent --show-error --connect-timeout 5 --max-time 20 -o /dev/null -w '%{http_code}|%header{X-Grid-LlmD-Provider-Gateway}|%header{x-ai-demo-provider-gateway}' -H 'Content-Type: application/json' -X POST 'http://consumer-gateway.grid-system.svc.cluster.local:8080/v1/chat/completions' -d '{"model":"Qwen/Qwen3-0.6B","messages":[{"role":"user","content":"invalid overlay LKG qualification"}],"max_tokens":2}' 2>/dev/null)
+rc=$?
+printf 'LKG|%s|%s\n' "$rc" "$out"
+"#;
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            context,
+            "-n",
+            GRID_SYSTEM_NS,
+            "exec",
+            "dynamic-weighted-client",
+            "--",
+            "sh",
+            "-c",
+            SCRIPT,
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "last-known-good probe could not run: {}",
+            safe_truncate_str(String::from_utf8_lossy(&output.stderr).trim(), 240)
+        )
+        .into());
+    }
+    let line = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find(|line| line.starts_with("LKG|"))
+        .ok_or("last-known-good probe produced no result line")?
+        .to_owned();
+    let mut fields = line.splitn(3, '|');
+    let _prefix = fields.next();
+    let curl_exit_code = fields.next().and_then(|value| value.parse::<i32>().ok()).unwrap_or(-1);
+    let mut response = fields.next().unwrap_or("").splitn(3, '|');
+    Ok(DynamicLkgProbe {
+        curl_exit_code,
+        http_status: response
+            .next()
+            .and_then(|value| value.parse::<u16>().ok())
+            .filter(|value| *value != 0),
+        provider_gateway: response.next().unwrap_or("").to_owned(),
+        provider_attribution: response.next().unwrap_or("").to_owned(),
+    })
+}
+
+/// Scale an operator in its run-owned cluster.
+fn scale_dynamic_operator(cluster: &str, replicas: u32) -> Result<(), Box<dyn std::error::Error>> {
+    let context = kind_context(cluster);
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            &context,
+            "-n",
+            GRID_SYSTEM_NS,
+            "scale",
+            "deployment/grid-operator",
+            &format!("--replicas={replicas}"),
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "{cluster}: scaling Grid operator to {replicas} replicas failed: {}",
+            safe_truncate_str(String::from_utf8_lossy(&output.stderr).trim(), 240)
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Wait for the requested run-owned operator pod count; require rollout readiness at one replica.
+fn wait_for_dynamic_operator_count(cluster: &str, expected: usize) -> Result<(), Box<dyn std::error::Error>> {
+    let context = kind_context(cluster);
+    let deadline = Instant::now() + Duration::from_secs(180);
+    loop {
+        let uids = dynamic_operator_pod_uids_allow_empty(&context)?;
+        if uids.len() == expected {
+            if expected == 0 {
+                return Ok(());
+            }
+            let rollout = Command::new("kubectl")
+                .args([
+                    "--context",
+                    &context,
+                    "-n",
+                    GRID_SYSTEM_NS,
+                    "rollout",
+                    "status",
+                    "deployment/grid-operator",
+                    "--timeout=5s",
+                ])
+                .output()?;
+            if rollout.status.success() {
+                return Ok(());
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("{cluster}: operator did not reach pod count {expected}").into());
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+/// Build one non-retrying, sessionless concurrent request batch.
+fn dynamic_sample_script(phase: &str) -> String {
+    const PER_WORKER: u32 = DYNAMIC_SAMPLE_SIZE / 4;
+    const URL: &str = "http://consumer-gateway.grid-system.svc.cluster.local:8080/v1/chat/completions";
+    format!(
+        r#"for worker in 1 2 3 4; do (ordinal=1; while [ "$ordinal" -le {PER_WORKER} ]; do id="{phase}-$worker-$ordinal"; out=$(curl --silent --show-error --connect-timeout 5 --max-time 20 -o /dev/null -w '%{{http_code}}|%header{{X-Grid-LlmD-Provider-Gateway}}|%header{{x-ai-demo-provider-gateway}}|%{{time_total}}' -H 'Content-Type: application/json' -X POST '{URL}' -d '{{"model":"{VCR_MODEL}","messages":[{{"role":"user","content":"weighted qualification"}}],"max_tokens":2}}' 2>/dev/null); rc=$?; printf 'DYN|%s|%s|%s\n' "$id" "$rc" "$out"; ordinal=$((ordinal + 1)); done) & done; wait"#
+    )
+}
+
+/// Calculate Pearson chi-square against the published two-provider weights.
+fn dynamic_chi_square(weights: [u32; 2], observed: [u32; 2]) -> f64 {
+    let observed_total = f64::from(observed[0].saturating_add(observed[1]));
+    let weight_total = f64::from(weights[0].saturating_add(weights[1]));
+    if observed_total <= 0.0 || weight_total <= 0.0 {
+        return f64::INFINITY;
+    }
+    weights.into_iter().zip(observed).fold(0.0, |sum, (weight, count)| {
+        let expected = observed_total * f64::from(weight) / weight_total;
+        if expected < 5.0 {
+            f64::INFINITY
+        } else {
+            sum + (f64::from(count) - expected).powi(2) / expected
+        }
+    })
+}
+
+/// Capture deployment generations and pod UIDs for deterministic simulators.
+fn simulator_runtime_identity(cluster: &str) -> Result<SimulatorRuntimeIdentity, Box<dyn std::error::Error>> {
+    let context = kind_context(cluster);
+    let mut generations = BTreeMap::new();
+    let mut uids = BTreeMap::new();
+    for deployment in SIMULATOR_DEPLOYMENTS {
+        generations.insert(deployment.to_string(), deployment_generation(&context, deployment)?);
+        let output = Command::new("kubectl")
+            .args([
+                "--context",
+                &context,
+                "-n",
+                GRID_SYSTEM_NS,
+                "get",
+                "pods",
+                "-l",
+                &format!("instance={deployment}"),
+                "-o",
+                "jsonpath={.items[0].metadata.uid}",
+            ])
+            .output()?;
+        if !output.status.success() {
+            return Err(format!("{cluster}/{deployment}: unable to read simulator pod UID").into());
+        }
+        let uid = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        if uid.is_empty() {
+            return Err(format!("{cluster}/{deployment}: simulator pod UID is empty").into());
+        }
+        uids.insert(deployment.to_string(), uid);
+    }
+    Ok((generations, uids))
+}
+
+/// Append one timestamped observation to the run's phase timeline.
+fn append_dynamic_timeline(path: &Path, value: &serde_json::Value) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Write as _;
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path.join("dynamic-timeline.jsonl"))?;
+    writeln!(file, "{value}")?;
+    Ok(())
 }
 
 /// Proof 1: Image digests and VCR configuration verification.
@@ -1316,13 +3986,18 @@ fn set_simulator_waiting_requests(
         .map_err(|e| format!("apply persistent simulator config on {cluster}: {e}"))?;
 
     for deployment in SIMULATOR_DEPLOYMENTS {
+        let requested_value = waiting_requests.to_string();
+        let current_value = simulator_waiting_requests_annotation(&ctx, deployment)?;
+        if !simulator_annotation_needs_rollout(current_value.as_deref(), &requested_value) {
+            continue;
+        }
         let before = deployment_generation(&ctx, deployment)?;
         let patch = serde_json::json!({
             "spec": {
                 "template": {
                     "metadata": {
                         "annotations": {
-                            "grid.praxis-proxy.io/fake-waiting-requests": waiting_requests.to_string()
+                            "grid.praxis-proxy.io/fake-waiting-requests": requested_value.as_str()
                         }
                     }
                 }
@@ -1377,6 +4052,45 @@ fn set_simulator_waiting_requests(
         std::thread::sleep(DATA_PLANE_INTERVAL);
     }
     Err(format!("{cluster}: simulator did not expose waiting-requests={waiting_requests} within timeout").into())
+}
+
+/// Read the desired deterministic pressure from one simulator Deployment.
+fn simulator_waiting_requests_annotation(
+    context: &str,
+    deployment: &str,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    const ANNOTATION: &str = "grid.praxis-proxy.io/fake-waiting-requests";
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            context,
+            "-n",
+            GRID_SYSTEM_NS,
+            "get",
+            &format!("deployment/{deployment}"),
+            "-o",
+            "json",
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "read simulator deployment/{deployment} pressure annotation: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    Ok(value
+        .pointer("/spec/template/metadata/annotations")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|annotations| annotations.get(ANNOTATION))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned))
+}
+
+/// A matching simulator value is already active, so no rollout is needed.
+fn simulator_annotation_needs_rollout(current: Option<&str>, requested: &str) -> bool {
+    current != Some(requested)
 }
 
 /// Render the complete simulator startup configuration for a queue value.
@@ -1617,6 +4331,14 @@ fn read_overlay_candidates(cluster: &str) -> Vec<OverlayCandidate> {
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("unknown")
                 .to_owned();
+            let selection_group = c
+                .get("selection_group")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|value| u32::try_from(value).ok());
+            let traffic_weight = c
+                .get("traffic_weight")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|value| u32::try_from(value).ok());
             let breakdown = c
                 .get("score_breakdown")
                 .and_then(|v| serde_json::from_value(v.clone()).ok());
@@ -1626,6 +4348,8 @@ fn read_overlay_candidates(cluster: &str) -> Vec<OverlayCandidate> {
                 score,
                 fresh,
                 admission_state: admission,
+                selection_group,
+                traffic_weight,
                 breakdown,
             })
         })
@@ -2031,9 +4755,9 @@ fn seed_swim_membership() -> Result<(), Box<dyn std::error::Error>> {
 // ---------------------------------------------------------------------------
 
 /// Generate TLS certificates for both clusters and metrics TLS.
-fn stage_certificates() -> Result<(), Box<dyn std::error::Error>> {
+fn stage_certificates(certs_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let clusters: Vec<String> = CLUSTERS.iter().map(|s| (*s).to_owned()).collect();
-    certs::generate_all(&clusters)?;
+    certs::generate_all_in_dir(&clusters, certs_dir)?;
     eprintln!("  [OK] TLS certificates generated for pool-a, pool-b");
 
     certs::generate_metrics_certs(METRICS_CA_CN, METRICS_SERVER_DNS)?;
@@ -2045,9 +4769,7 @@ fn stage_certificates() -> Result<(), Box<dyn std::error::Error>> {
 ///
 /// Metrics TLS secrets are installed earlier in phase 7 (before EPP
 /// deployment) since the nginx sidecar mounts them at startup.
-fn install_provider_trust() -> Result<(), Box<dyn std::error::Error>> {
-    let certs_dir = Path::new(CERTS_DIR);
-
+fn install_provider_trust(certs_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     for cluster in CLUSTERS {
         let ctx = kind_context(cluster);
 
@@ -2217,7 +4939,7 @@ fn apply_credential_secret(context: &str, secret_name: &str, token: &str) -> Res
 }
 
 /// Authorize auto-discovered remote GridSites with identity trust.
-fn authorize_discovered_sites() -> Result<(), Box<dyn std::error::Error>> {
+fn authorize_discovered_sites(certs_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     const TRUST_TIMEOUT: Duration = Duration::from_secs(120);
     const GRID_NETWORK: &str = "grid-llmd-pool-metrics";
 
@@ -2230,7 +4952,7 @@ fn authorize_discovered_sites() -> Result<(), Box<dyn std::error::Error>> {
             }
             let site_name = format!("{GRID_NETWORK}-{remote}");
             operator::wait_for_auto_gridsite(&context, &site_name, GRID_NETWORK, TRUST_TIMEOUT)?;
-            let canonical_fp = certs::site_certificate_fingerprint(remote)?;
+            let canonical_fp = certs::site_certificate_fingerprint_in_dir(remote, certs_dir)?;
             operator::wait_for_expected_site_certificate(&context, &site_name, &canonical_fp, TRUST_TIMEOUT)?;
             let server_name = format!("{remote}.grid.internal");
             operator::patch_gridsite_identity_trust(&context, &site_name, &canonical_fp, &server_name)?;
@@ -2242,7 +4964,7 @@ fn authorize_discovered_sites() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Wait for overlay convergence on both consumer gateways.
-fn wait_for_overlay_convergence() -> Result<(), Box<dyn std::error::Error>> {
+fn wait_for_overlay_convergence(context: &DemoContext) -> Result<(), Box<dyn std::error::Error>> {
     let deadline = Instant::now() + DATA_PLANE_WAIT;
     for cluster in CLUSTERS {
         let ctx = kind_context(cluster);
@@ -2257,11 +4979,200 @@ fn wait_for_overlay_convergence() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         if !converged {
-            return Err(format!("{cluster}: overlay did not converge within timeout").into());
+            let diagnostics = capture_overlay_timeout_diagnostics(context)?;
+            return Err(format!(
+                "{cluster}: overlay did not converge within timeout; diagnostics: {}",
+                diagnostics.display()
+            )
+            .into());
         }
         eprintln!("  [OK] {cluster}: overlay converged with both providers");
     }
     Ok(())
+}
+
+/// Save bounded signal-path state before setup-failure teardown removes the clusters.
+fn capture_overlay_timeout_diagnostics(context: &DemoContext) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let mut clusters = serde_json::Map::new();
+    for cluster in CLUSTERS {
+        let kube_context = kind_context(cluster);
+        let logs = diagnostic_kubectl(
+            &kube_context,
+            &["logs", "deployment/grid-operator", "--since=10m", "--tail=1000"],
+        );
+        let relevant_logs: Vec<String> = logs
+            .lines()
+            .filter(|line| {
+                let line = line.to_ascii_lowercase();
+                line.contains("signals:")
+                    || line.contains("peer signals")
+                    || line.contains("peer poll")
+                    || line.contains("pressure-weighted")
+                    || line.contains("routing overlay render failed")
+                    || line.contains("no fresh grid_routing_")
+            })
+            .take(200)
+            .map(|line| safe_truncate_str(line, 512))
+            .collect();
+        let metrics = diagnostic_kubectl(
+            &kube_context,
+            &[
+                "exec",
+                "deployment/grid-operator",
+                "--",
+                "/bin/busybox",
+                "wget",
+                "-qO-",
+                "http://llmd-epp-metrics.grid-system.svc.cluster.local:9090/metrics",
+            ],
+        );
+        let relevant_metrics: Vec<&str> = metrics
+            .lines()
+            .filter(|line| {
+                [
+                    "inference_pool_average_queue_size",
+                    "inference_pool_average_kv_cache_utilization",
+                    "inference_pool_ready_pods",
+                ]
+                .iter()
+                .any(|metric| line.starts_with(metric))
+            })
+            .take(100)
+            .collect();
+        let operator_metrics = diagnostic_kubectl(
+            &kube_context,
+            &[
+                "exec",
+                "deployment/grid-operator",
+                "--",
+                "/bin/busybox",
+                "wget",
+                "-qO-",
+                "http://127.0.0.1:9090/metrics",
+            ],
+        );
+        let relevant_peer_metrics: Vec<&str> = operator_metrics
+            .lines()
+            .filter(|line| {
+                [
+                    "grid_peer_poll_total",
+                    "grid_peer_poll_retries_total",
+                    "grid_peer_poll_duration_seconds",
+                    "grid_peer_poll_slow_total",
+                    "grid_peer_response_bytes_total",
+                    "grid_collection_up",
+                    "grid_peer_last_success_timestamp_seconds",
+                    "grid_peer_polls_in_flight",
+                ]
+                .iter()
+                .any(|metric| line.starts_with(metric))
+            })
+            .take(100)
+            .collect();
+        let providers = diagnostic_kubectl(&kube_context, &["get", "inferenceproviders", "-o", "json"]);
+        let networks = diagnostic_kubectl(&kube_context, &["get", "gridnetworks", "-o", "json"]);
+        let overlay_raw = diagnostic_kubectl(&kube_context, &["get", "configmap", OVERLAY_CONFIGMAP, "-o", "json"]);
+        let overlay = serde_json::from_str::<serde_json::Value>(&overlay_raw)
+            .ok()
+            .and_then(|value| value.pointer("/data/routing-config.json").cloned())
+            .unwrap_or_else(|| serde_json::json!({"unavailable": safe_truncate_str(&overlay_raw, 512)}));
+        clusters.insert(
+            (*cluster).to_owned(),
+            serde_json::json!({
+                "operator_signal_logs": relevant_logs,
+                "operator_peer_metrics": relevant_peer_metrics,
+                "epp_metrics": relevant_metrics,
+                "inference_providers": diagnostic_provider_summary(&providers),
+                "grid_networks": diagnostic_network_summary(&networks),
+                "routing_overlay": overlay,
+            }),
+        );
+    }
+    let path = context.evidence_dir.join("overlay-convergence-diagnostics.json");
+    fs::write(&path, serde_json::to_vec_pretty(&serde_json::Value::Object(clusters))?)?;
+    Ok(path)
+}
+
+/// Run a short best-effort kubectl command for sanitized failure evidence.
+fn diagnostic_kubectl(context: &str, args: &[&str]) -> String {
+    let output = Command::new("timeout")
+        .arg("20s")
+        .arg("kubectl")
+        .arg("--context")
+        .arg(context)
+        .arg("-n")
+        .arg(GRID_SYSTEM_NS)
+        .args(args)
+        .output();
+    match output {
+        Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout).into_owned(),
+        Ok(output) => format!(
+            "command failed ({}): {}",
+            output.status,
+            safe_truncate_str(String::from_utf8_lossy(&output.stderr).trim(), 512)
+        ),
+        Err(error) => format!("command could not run: {error}"),
+    }
+}
+
+/// Keep only non-secret provider identity, pressure configuration, and phase fields.
+fn diagnostic_provider_summary(raw: &str) -> serde_json::Value {
+    let Ok(document) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return serde_json::json!({"unavailable": safe_truncate_str(raw.trim(), 512)});
+    };
+    let providers: Vec<serde_json::Value> = document
+        .get("items")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|provider| {
+            let metrics = provider.pointer("/spec/metricsConfig");
+            serde_json::json!({
+                "name": provider.pointer("/metadata/name"),
+                "gridNetworkRef": provider.pointer("/spec/gridNetworkRef"),
+                "poolName": metrics.and_then(|value| value.get("poolName")),
+                "queueCapacity": metrics.and_then(|value| value.get("queueCapacity")),
+                "signalNames": metrics.and_then(|value| value.get("signalNames")),
+                "phase": provider.pointer("/status/phase"),
+                "reason": provider.pointer("/status/reason"),
+            })
+        })
+        .collect();
+    serde_json::json!(providers)
+}
+
+/// Keep GridNetwork generation, transport, placement policy, and status evidence.
+fn diagnostic_network_summary(raw: &str) -> serde_json::Value {
+    let Ok(document) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return serde_json::json!({"unavailable": safe_truncate_str(raw.trim(), 512)});
+    };
+    let networks: Vec<serde_json::Value> = document
+        .get("items")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|network| {
+            serde_json::json!({
+                "name": network.pointer("/metadata/name"),
+                "generation": network.pointer("/metadata/generation"),
+                "signalTransport": network.pointer("/spec/signalTransport"),
+                "placementPolicy": network.pointer("/spec/placementPolicy"),
+                "status": network.get("status"),
+            })
+        })
+        .collect();
+    serde_json::json!(networks)
+}
+
+/// Append one secondary evidence/cleanup error without losing the first failure.
+fn append_run_error(error: &mut Option<String>, additional: String) {
+    match error {
+        Some(primary) => {
+            primary.push_str("; ");
+            primary.push_str(&additional);
+        },
+        None => *error = Some(additional),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2289,7 +5200,7 @@ fn load_images_into_clusters(context: &DemoContext) -> Result<(), Box<dyn std::e
         tags.push(nginx);
     }
     for cluster in CLUSTERS {
-        let kind_name = format!("grid-llmd-pm-{cluster}");
+        let kind_name = format!("{}-{cluster}", forge_cluster_prefix());
         for image_tag in &tags {
             load_docker_image_into_kind(image_tag, &kind_name)?;
         }
@@ -2370,6 +5281,435 @@ fn collect_image_evidence(resolved: &ResolvedImages) -> Result<BTreeMap<String, 
     Ok(images)
 }
 
+/// Verify the dynamic qualification ran the gateway image built from the expected AI worktree.
+fn verify_gateway_image_identity(
+    image: &str,
+    expected_revision: Option<&str>,
+    expected_content_hash: Option<&str>,
+    pods: &[PodImageEvidence],
+) -> ProofResult {
+    let config_id = match local_image_config_id(image) {
+        Ok(config_id) => config_id,
+        Err(error) => {
+            return ProofResult {
+                success: false,
+                description: "Gateway pods ran the selected source-built Praxis AI image".to_owned(),
+                observations: vec![error.to_string()],
+            };
+        },
+    };
+    let labels = match local_image_labels(image) {
+        Ok(labels) => labels,
+        Err(error) => {
+            return ProofResult {
+                success: false,
+                description: "Gateway pods ran the selected source-built Praxis AI image".to_owned(),
+                observations: vec![error.to_string()],
+            };
+        },
+    };
+    let source = labels
+        .get("org.opencontainers.image.source")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let revision = labels
+        .get("org.opencontainers.image.revision")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let version = labels
+        .get("org.opencontainers.image.version")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    gateway_image_identity_proof(&GatewayImageIdentity {
+        image,
+        config_id: &config_id,
+        source,
+        revision,
+        expected_revision,
+        expected_content_hash,
+        version,
+        pods,
+    })
+}
+
+/// Read the local image's OCI config digest from the Docker save manifest.
+///
+/// With Docker's containerd image store, `docker inspect .Id` can name the OCI
+/// index while Kubernetes reports the platform image config digest. The save
+/// manifest supplies the config digest that can be compared directly.
+fn local_image_config_id(image: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let mut save = Command::new("docker")
+        .args(["save", image])
+        .stdout(Stdio::piped())
+        .spawn()?;
+    let save_stdout = save.stdout.take().ok_or("docker save did not provide stdout")?;
+    let manifest = Command::new("tar")
+        .args(["-xOf", "-", "manifest.json"])
+        .stdin(save_stdout)
+        .output()?;
+    let save_status = save.wait()?;
+    if !save_status.success() {
+        return Err(format!("docker save failed for {image}").into());
+    }
+    if !manifest.status.success() {
+        return Err(format!("unable to read Docker save manifest for {image}").into());
+    }
+    config_digest_from_save_manifest(&manifest.stdout, image).map_err(Into::into)
+}
+
+/// Extract a selected image's config digest from Docker's `manifest.json` output.
+fn config_digest_from_save_manifest(manifest: &[u8], image: &str) -> Result<String, String> {
+    let entries: Vec<serde_json::Value> = serde_json::from_slice(manifest).map_err(|error| error.to_string())?;
+    let entry = entries
+        .iter()
+        .find(|entry| {
+            entry
+                .get("RepoTags")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|tags| tags.iter().any(|tag| tag.as_str() == Some(image)))
+        })
+        .ok_or_else(|| format!("Docker save manifest does not contain selected image {image}"))?;
+    let config_path = entry
+        .get("Config")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "Docker save manifest has no config path".to_owned())?;
+    let filename = Path::new(config_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "Docker save config path is invalid".to_owned())?;
+    if filename.len() != 64 || !filename.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("Docker save config path does not contain a SHA-256 digest".to_owned());
+    }
+    Ok(format!("sha256:{filename}"))
+}
+
+/// Read OCI labels from the exact local image selected for deployment.
+fn local_image_labels(image: &str) -> Result<serde_json::Map<String, serde_json::Value>, Box<dyn std::error::Error>> {
+    let output = Command::new("docker")
+        .args(["image", "inspect", "--format", "{{json .Config.Labels}}", image])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!("unable to inspect selected gateway image {image}").into());
+    }
+    let labels: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    labels
+        .as_object()
+        .cloned()
+        .ok_or_else(|| "selected gateway image has no OCI labels".into())
+}
+
+/// Pure validation for selected-image reference, runtime config digest, and source revision.
+fn gateway_image_identity_proof(input: &GatewayImageIdentity<'_>) -> ProofResult {
+    let image = input.image;
+    let config_id = input.config_id;
+    let source = input.source;
+    let revision = input.revision;
+    let expected_revision = input.expected_revision;
+    let expected_content_hash = input.expected_content_hash;
+    let version = input.version;
+    let pods = input.pods;
+    let mut observations = vec![
+        format!("selected image: {image}"),
+        format!("local OCI config digest: {config_id}"),
+    ];
+    let mut success = true;
+    if source != "https://github.com/praxis-proxy/ai" {
+        success = false;
+        observations.push(format!("unexpected OCI source label: {source:?}"));
+    }
+    if revision.is_empty() {
+        success = false;
+        observations.push("OCI source revision label is missing".to_owned());
+    } else {
+        observations.push(format!("OCI source revision: {revision}"));
+    }
+    match expected_revision.filter(|expected| !expected.is_empty()) {
+        Some(expected) if revision == expected => {
+            observations.push(format!("expected AI worktree revision matched: {expected}"));
+        },
+        Some(expected) => {
+            success = false;
+            observations.push(format!(
+                "AI source revision mismatch: expected {expected}, image has {revision}"
+            ));
+        },
+        None => {
+            success = false;
+            observations.push("GRID_XTASK_GATEWAY_REVISION must name the expected AI worktree SHA".to_owned());
+        },
+    }
+    let dirty_hash_matches = expected_content_hash
+        .filter(|hash| hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .and_then(|hash| hash.get(..8).map(|prefix| (hash, prefix)));
+    match dirty_hash_matches {
+        Some((full_hash, short_hash)) if version.ends_with(&format!("-{short_hash}")) => {
+            observations.push(format!(
+                "AI worktree diff SHA-256: {full_hash}; image version suffix matched its 8-character hash prefix"
+            ));
+        },
+        Some((_, short_hash)) => {
+            success = false;
+            observations.push(format!(
+                "AI worktree diff SHA-256 prefix {short_hash} does not match image version label {version:?}"
+            ));
+        },
+        None => {
+            success = false;
+            observations
+                .push("GRID_XTASK_GATEWAY_CONTENT_SHA256 must contain the full AI worktree diff SHA-256".to_owned());
+        },
+    }
+
+    let gateways: Vec<&PodImageEvidence> = pods.iter().filter(|pod| pod.container == "praxis").collect();
+    if gateways.is_empty() {
+        success = false;
+        observations.push("no Praxis gateway containers were captured".to_owned());
+    }
+    for gateway in &gateways {
+        let runtime_config_id = gateway
+            .image_id
+            .strip_prefix("containerd://")
+            .or_else(|| gateway.image_id.strip_prefix("docker://"))
+            .unwrap_or(&gateway.image_id);
+        if gateway.requested_image != image {
+            success = false;
+            observations.push(format!(
+                "{} / {} requested {}, expected {image}",
+                gateway.cluster, gateway.pod, gateway.requested_image
+            ));
+        }
+        if !gateway.ready {
+            success = false;
+            observations.push(format!(
+                "{} / {} Praxis container was not Ready",
+                gateway.cluster, gateway.pod
+            ));
+        }
+        if runtime_config_id != config_id {
+            success = false;
+            observations.push(format!(
+                "{} / {} runtime image ID {} does not match selected image config {config_id}",
+                gateway.cluster, gateway.pod, gateway.image_id
+            ));
+        }
+    }
+    for pool in CLUSTERS {
+        let found = gateways.iter().any(|gateway| {
+            gateway.cluster.ends_with(&format!("-{pool}"))
+                && gateway.requested_image == image
+                && gateway.ready
+                && gateway
+                    .image_id
+                    .strip_prefix("containerd://")
+                    .or_else(|| gateway.image_id.strip_prefix("docker://"))
+                    .unwrap_or(&gateway.image_id)
+                    == config_id
+        });
+        if !found {
+            success = false;
+            observations.push(format!("no verified Praxis gateway image was captured in {pool}"));
+        }
+    }
+    observations.push(format!("verified gateway containers: {}", gateways.len()));
+    ProofResult {
+        success,
+        description: "Gateway pods ran the selected source-built Praxis AI image".to_owned(),
+        observations,
+    }
+}
+
+/// Capture pod image references and immutable runtime IDs from each isolated cluster.
+fn collect_pod_image_evidence() -> Result<Vec<PodImageEvidence>, Box<dyn std::error::Error>> {
+    let mut captured = Vec::new();
+    for cluster in CLUSTERS {
+        let context = kind_context(cluster);
+        let output = Command::new("kubectl")
+            .args(["--context", &context, "-n", GRID_SYSTEM_NS, "get", "pods", "-o", "json"])
+            .output()?;
+        if !output.status.success() {
+            return Err(format!("{cluster}: unable to capture pod image IDs").into());
+        }
+        let pods: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+        for pod in pods
+            .get("items")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let pod_name = pod
+                .pointer("/metadata/name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown-pod");
+            let spec_containers = pod
+                .pointer("/spec/containers")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten();
+            let statuses = pod
+                .pointer("/status/containerStatuses")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .map(|status| {
+                    (
+                        status.get("name").and_then(serde_json::Value::as_str).unwrap_or(""),
+                        status,
+                    )
+                })
+                .collect::<HashMap<_, _>>();
+            for container in spec_containers {
+                let name = container
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown-container");
+                let status = statuses.get(name).copied();
+                captured.push(PodImageEvidence {
+                    cluster: context.clone(),
+                    pod: pod_name.to_owned(),
+                    container: name.to_owned(),
+                    requested_image: container
+                        .get("image")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("")
+                        .to_owned(),
+                    image_id: status
+                        .and_then(|status| status.get("imageID"))
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("")
+                        .to_owned(),
+                    ready: status
+                        .and_then(|status| status.get("ready"))
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false),
+                    restart_count: status
+                        .and_then(|status| status.get("restartCount"))
+                        .and_then(serde_json::Value::as_u64)
+                        .and_then(|count| u32::try_from(count).ok())
+                        .unwrap_or(0),
+                });
+            }
+        }
+    }
+    Ok(captured)
+}
+
+/// Write reproducible Grid worktree and image-label provenance beside the run evidence.
+fn write_run_provenance(
+    evidence_dir: &Path,
+    context: &DemoContext,
+    image_ids: &BTreeMap<String, String>,
+    pod_images: &[PodImageEvidence],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let head = Command::new("git").args(["rev-parse", "HEAD"]).output()?;
+    if !head.status.success() {
+        return Err("unable to record Grid source SHA".into());
+    }
+    let grid_sha = String::from_utf8_lossy(&head.stdout).trim().to_owned();
+    let tracked_diff = Command::new("git").args(["diff", "--binary", "HEAD", "--"]).output()?;
+    if !tracked_diff.status.success() {
+        return Err("unable to hash Grid tracked changes".into());
+    }
+    let untracked = Command::new("git")
+        .args(["ls-files", "--others", "--exclude-standard"])
+        .output()?;
+    if !untracked.status.success() {
+        return Err("unable to list untracked Grid source files".into());
+    }
+    let mut source_hasher = Sha256::new();
+    source_hasher.update(b"tracked-diff\0");
+    source_hasher.update(u64::try_from(tracked_diff.stdout.len())?.to_be_bytes());
+    source_hasher.update(&tracked_diff.stdout);
+    let mut source_paths = Vec::new();
+    let mut generated_artifacts = BTreeMap::new();
+    let mut other_untracked_paths = Vec::new();
+    for relative in String::from_utf8_lossy(&untracked.stdout).lines() {
+        let path = Path::new(relative);
+        if !path.is_file() {
+            continue;
+        }
+        let bytes = fs::read(path)?;
+        if is_untracked_source_file(path) {
+            source_hasher.update(b"source-file\0");
+            source_hasher.update(u64::try_from(relative.len())?.to_be_bytes());
+            source_hasher.update(relative.as_bytes());
+            source_hasher.update(u64::try_from(bytes.len())?.to_be_bytes());
+            source_hasher.update(&bytes);
+            source_paths.push(relative.to_owned());
+        } else if is_generated_resolved_yaml(path) {
+            generated_artifacts.insert(relative.to_owned(), format!("{:x}", Sha256::digest(&bytes)));
+        } else {
+            other_untracked_paths.push(relative.to_owned());
+        }
+    }
+    source_paths.sort();
+    other_untracked_paths.sort();
+    let content_hash = format!("{:x}", source_hasher.finalize());
+    let generated_json = serde_json::to_vec_pretty(&generated_artifacts)?;
+    let generated_manifest_hash = format!("{:x}", Sha256::digest(&generated_json));
+    fs::write(evidence_dir.join("generated-artifacts.json"), generated_json)?;
+
+    let mut selected_images = BTreeMap::from([
+        ("gateway", context.images.gateway.as_str()),
+        ("operator", context.images.operator.as_str()),
+        ("epp", context.images.epp.as_str()),
+        ("simulator", context.images.vcr.as_str()),
+        ("overlay_sync", context.images.overlay_sync.as_str()),
+    ]);
+    if let Some(nginx) = context.images.nginx.as_deref() {
+        selected_images.insert("nginx", nginx);
+    }
+    let mut labels = BTreeMap::new();
+    for (role, image) in selected_images {
+        let output = Command::new("docker")
+            .args(["inspect", "--format", "{{json .Config.Labels}}", image])
+            .output()?;
+        let parsed = if output.status.success() {
+            serde_json::from_slice(&output.stdout).unwrap_or(serde_json::Value::Null)
+        } else {
+            serde_json::Value::Null
+        };
+        labels.insert(role, serde_json::json!({"image": image, "labels": parsed}));
+    }
+    let provenance_markdown = format!(
+        "# Run provenance\n\n- Run ID: `{}`\n- Grid HEAD: `{grid_sha}`\n- Tracked diff plus untracked source SHA-256: `{content_hash}`\n- Untracked source files included: `{}`\n- Generated resolved artifacts excluded from source hash: {} files; manifest SHA-256 `{generated_manifest_hash}` (see `generated-artifacts.json`).\n- Other untracked files excluded from source hash: `{}`\n\n## Selected image references and OCI labels\n\n```json\n{}\n```\n\n## Docker image IDs\n\n```json\n{}\n```\n\n## Runtime pod image IDs\n\nSee `pod-images.json` ({} container records captured before teardown). For the source-built dynamic run, `gateway_image_identity` in `evidence.json` compares every running Praxis container's runtime config digest and requested reference with the selected local image, and checks its source revision and worktree-diff hash against the image labels.\n",
+        context.run_id,
+        source_paths.join(", "),
+        generated_artifacts.len(),
+        other_untracked_paths.join(", "),
+        serde_json::to_string_pretty(&labels)?,
+        serde_json::to_string_pretty(image_ids)?,
+        pod_images.len(),
+    );
+    fs::write(evidence_dir.join("PROVENANCE.md"), provenance_markdown)?;
+    Ok(())
+}
+
+/// Whether an untracked path is source or test input that belongs in the source-content hash.
+fn is_untracked_source_file(path: &Path) -> bool {
+    let rust_source = path.extension().and_then(|extension| extension.to_str()) == Some("rs")
+        && [
+            "operator/src/",
+            "xtask/src/",
+            "overlay-sync/src/",
+            "crdt/src/",
+            "swim/src/",
+        ]
+        .iter()
+        .any(|root| path.starts_with(root));
+    let chart_test = path.extension().and_then(|extension| extension.to_str()) == Some("yaml")
+        && path.starts_with("charts/grid-operator/tests/");
+    rust_source || chart_test
+}
+
+/// Identify generated per-run Forge YAML without reading its contents into source provenance.
+fn is_generated_resolved_yaml(path: &Path) -> bool {
+    path.extension().and_then(|extension| extension.to_str()) == Some("yaml")
+        && path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.contains(".resolved"))
+}
+
 // ---------------------------------------------------------------------------
 // Forge helpers
 // ---------------------------------------------------------------------------
@@ -2437,6 +5777,7 @@ fn materialize_config(
             nginx_image,
             images: None,
             run_id: None,
+            pressure_weighted: false,
         },
     )
 }
@@ -2459,6 +5800,8 @@ struct MaterializeConfigOptions<'inputs> {
     images: Option<&'inputs ResolvedImages>,
     /// Optional run ID used to isolate generated manifest paths.
     run_id: Option<&'inputs str>,
+    /// Render poll-mode signal transport and pressure-weighted placement.
+    pressure_weighted: bool,
 }
 
 /// Materialize a Forge config with optional image and run-specific overrides.
@@ -2472,11 +5815,28 @@ fn materialize_config_with_images(
         nginx_image,
         images,
         run_id,
+        pressure_weighted,
     } = *options;
     let dir = forge_config.parent().unwrap_or_else(|| Path::new("."));
     let run_suffix = run_id.map_or_else(String::new, |id| format!(".{id}"));
     let resolved = dir.join(format!(".forge.resolved{run_suffix}.yaml"));
     let mut result = fs::read_to_string(forge_config)?;
+    if let Some(run_id) = run_id {
+        result = checked_replace(
+            &result,
+            "clusterPrefix: grid-llmd-pm",
+            &format!("clusterPrefix: grid-llmd-pm-{run_id}"),
+            1,
+            "run-specific Kind cluster prefix",
+        )?;
+        result = checked_replace(
+            &result,
+            "kind-grid-llmd-pm-{{ cluster.name }}",
+            &format!("kind-grid-llmd-pm-{run_id}-{{{{ cluster.name }}}}"),
+            4,
+            "run-specific kubectl contexts",
+        )?;
+    }
     if let Some(images) = images {
         let image_pull_policy =
             std::env::var("GRID_XTASK_IMAGE_PULL_POLICY").unwrap_or_else(|_| "IfNotPresent".to_owned());
@@ -2657,6 +6017,21 @@ fn materialize_config_with_images(
         }
     }
 
+    if pressure_weighted {
+        let selected_strategy = scoring_flavor.strategy_yaml();
+        let signal = match scoring_flavor {
+            ScoringFlavor::QueueDepth => "queueDepth",
+            ScoringFlavor::KvCachePressure => "kvCacheUtilization",
+        };
+        let current = format!(
+            "              scoringPolicy:\n                strategy: {selected_strategy}\n              selectionPolicy:\n                mode: deterministic"
+        );
+        let configured = format!(
+            "              scoringPolicy:\n                strategy: noMetrics\n              signalTransport:\n                mode: poll\n              selectionPolicy:\n                mode: weightedRandom\n              placementPolicy:\n                strategy: pressureWeighted\n                pressureWeighted:\n                  signal: {signal}\n                  minimumWeight: 1\n                  maximumWeight: 1000\n                  availabilityFloorPercent: 5\n                  smoothingFactor: 0.35\n                  changeThresholdPercent: 5\n                  staleSignalSeconds: 120"
+        );
+        result = checked_replace(&result, &current, &configured, 2, "poll-mode pressure-weighted policy")?;
+    }
+
     fs::write(&resolved, result)?;
     Ok(resolved)
 }
@@ -2762,6 +6137,14 @@ fn teardown_environment(context: &DemoContext) -> Result<(), Box<dyn std::error:
         &context.forge_state_dir,
         &["down"],
     )?;
+    let cert_root = Path::new(CERTS_DIR);
+    if context.certs_dir.starts_with(cert_root) && context.certs_dir != cert_root {
+        if context.certs_dir.exists() {
+            fs::remove_dir_all(&context.certs_dir)?;
+        }
+    } else {
+        return Err("refusing certificate cleanup outside the run-owned llm-d certificate directory".into());
+    }
     eprintln!("  [OK] Teardown complete");
     Ok(())
 }
@@ -2821,6 +6204,11 @@ fn format_utc_timestamp() -> String {
     format!("{y:04}{m:02}{d:02}T{hours:02}{minutes:02}{seconds:02}Z")
 }
 
+/// Build a run ID that is valid in Kubernetes labels and Kind cluster names.
+fn format_run_id(timestamp: &str, process_id: u32) -> String {
+    format!("{}-{process_id}", timestamp.to_ascii_lowercase())
+}
+
 /// Format a UTC ISO-8601 timestamp.
 fn format_utc_iso() -> String {
     let ts = format_utc_timestamp();
@@ -2842,7 +6230,12 @@ fn is_leap(y: i64) -> bool {
 
 /// Format a Kind cluster context name.
 fn kind_context(cluster: &str) -> String {
-    format!("kind-grid-llmd-pm-{cluster}")
+    format!("kind-{}-{cluster}", forge_cluster_prefix())
+}
+
+/// Return the current run's unique Forge cluster prefix.
+fn forge_cluster_prefix() -> &'static str {
+    RUN_PREFIX.get().map_or("grid-llmd-pm", String::as_str)
 }
 
 /// Annotate the GridNetwork to trigger operator re-reconciliation.
@@ -4103,6 +7496,54 @@ mod tests {
     }
 
     #[test]
+    fn run_id_is_valid_in_kind_cluster_names() {
+        let run_id = format_run_id("20260930T202802Z", 788_430);
+        assert_eq!(run_id, "20260930t202802z-788430");
+        assert!(
+            run_id
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        );
+    }
+
+    #[test]
+    fn provider_diagnostic_summary_excludes_credentials_and_endpoints() {
+        let raw = serde_json::json!({
+            "items": [{
+                "metadata": {"name": "provider-a"},
+                "spec": {
+                    "gridNetworkRef": "network-a",
+                    "endpoint": "http://private-endpoint.invalid",
+                    "auth": {"token": "do-not-emit"},
+                    "metricsConfig": {
+                        "poolName": "pool-a",
+                        "queueCapacity": 4,
+                        "signalNames": {"queueDepth": "inference_pool_average_queue_size"}
+                    }
+                },
+                "status": {"phase": "Available", "reason": "Ready"}
+            }]
+        });
+
+        let summary = diagnostic_provider_summary(&raw.to_string()).to_string();
+        assert!(summary.contains("provider-a"));
+        assert!(summary.contains("pool-a"));
+        assert!(summary.contains("inference_pool_average_queue_size"));
+        assert!(!summary.contains("do-not-emit"));
+        assert!(!summary.contains("private-endpoint"));
+    }
+
+    #[test]
+    fn append_run_error_preserves_primary_failure_and_adds_cleanup_failure() {
+        let mut error = Some("setup failed: overlay timeout".to_owned());
+        append_run_error(&mut error, "teardown failed: cluster still exists".to_owned());
+        assert_eq!(
+            error.as_deref(),
+            Some("setup failed: overlay timeout; teardown failed: cluster still exists")
+        );
+    }
+
+    #[test]
     fn utc_iso_format_has_separators() {
         let iso = format_utc_iso();
         assert!(iso.contains('-'), "ISO format must contain dashes");
@@ -4191,6 +7632,8 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
             mode: "quick".to_owned(),
             metrics_transport: "direct-http".to_owned(),
             scoring_strategy: ScoringFlavor::QueueDepth.label().to_owned(),
+            placement_strategy: "score preference".to_owned(),
+            run_id: "test-run".to_owned(),
             started_at: "2026-01-01T00:00:00Z".to_owned(),
             wall_secs: 42.0,
             success: true,
@@ -4198,6 +7641,7 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
             setup: SetupEvidence {
                 clusters: vec!["pool-a".to_owned(), "pool-b".to_owned()],
                 images: BTreeMap::new(),
+                pod_images: Vec::new(),
             },
             proofs: BTreeMap::new(),
             lifecycle: LifecycleRecord {
@@ -4298,6 +7742,355 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
     }
 
     #[test]
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "the exposition fixture yields exactly one matching sample"
+    )]
+    fn dynamic_signal_parser_keeps_source_site_provider_and_timestamp() {
+        let exposition = concat!(
+            "# TYPE grid_routing_queue_pressure gauge\n",
+            "grid_routing_queue_pressure{grid_site=\"pool-a\",grid_provider=\"llmd-pool-a-provider\"} 0.75 1790731200123\n",
+            "other_metric{grid_site=\"pool-b\",grid_provider=\"ignored\"} 0.25 1790731200123\n",
+        );
+        let parsed = parse_dynamic_signal_samples(exposition, "grid_routing_queue_pressure");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].site, "pool-a");
+        assert_eq!(parsed[0].provider, "llmd-pool-a-provider");
+        assert!((parsed[0].value - 0.75).abs() < f64::EPSILON);
+        assert_eq!(parsed[0].timestamp_ms, Some(1_790_731_200_123));
+    }
+
+    #[test]
+    fn dynamic_state_stability_waits_for_peer_poll_window_and_matching_observations() {
+        let peer_poll_window = Duration::from_secs(32);
+        assert!(!dynamic_state_stability_satisfied(
+            1,
+            Duration::from_secs(40),
+            peer_poll_window
+        ));
+        assert!(!dynamic_state_stability_satisfied(
+            2,
+            Duration::from_secs(31),
+            peer_poll_window
+        ));
+        assert!(dynamic_state_stability_satisfied(2, peer_poll_window, peer_poll_window));
+    }
+
+    #[test]
+    fn dynamic_phase_gate_requires_two_fresh_positive_group_zero_weights() {
+        let candidate = |site: &str, weight| DynamicCandidateWeight {
+            site: site.to_owned(),
+            provider: format!("llmd-{site}-provider"),
+            stable_id: format!("stable-{site}"),
+            selection_group: 0,
+            traffic_weight: weight,
+            fresh: true,
+            admission_state: "new_and_existing".to_owned(),
+        };
+        let baseline = DynamicOverlaySnapshot {
+            semantic_revision: "baseline".to_owned(),
+            resource_version: "10".to_owned(),
+            candidates: vec![candidate("pool-a", 500), candidate("pool-b", 500)],
+        };
+        assert!(dynamic_weights_match_phase(&baseline, "baseline"));
+        let pressure = DynamicOverlaySnapshot {
+            semantic_revision: "pressure".to_owned(),
+            resource_version: "11".to_owned(),
+            candidates: vec![candidate("pool-a", 250), candidate("pool-b", 750)],
+        };
+        assert!(dynamic_weights_match_phase(&pressure, "pressure"));
+        let invalid_zero = DynamicOverlaySnapshot {
+            candidates: vec![candidate("pool-a", 0), candidate("pool-b", 1000)],
+            ..pressure
+        };
+        assert!(!dynamic_weights_match_phase(&invalid_zero, "pressure"));
+        let invalid_group = DynamicOverlaySnapshot {
+            candidates: vec![
+                candidate("pool-a", 500),
+                DynamicCandidateWeight {
+                    selection_group: 1,
+                    ..candidate("pool-b", 500)
+                },
+            ],
+            ..baseline
+        };
+        assert!(!dynamic_weights_match_phase(&invalid_group, "baseline"));
+    }
+
+    #[test]
+    fn dynamic_gate_allows_site_specific_revisions_and_candidate_order() {
+        let candidate = |site: &str| DynamicCandidateWeight {
+            site: site.to_owned(),
+            provider: format!("llmd-{site}-provider"),
+            stable_id: format!("stable-{site}"),
+            selection_group: 0,
+            traffic_weight: 500,
+            fresh: true,
+            admission_state: "new_and_existing".to_owned(),
+        };
+        let pool_a = DynamicOverlaySnapshot {
+            semantic_revision: "pool-a-revision".to_owned(),
+            resource_version: "10".to_owned(),
+            candidates: vec![candidate("pool-a"), candidate("pool-b")],
+        };
+        let pool_b = DynamicOverlaySnapshot {
+            semantic_revision: "pool-b-revision".to_owned(),
+            resource_version: "22".to_owned(),
+            candidates: vec![candidate("pool-b"), candidate("pool-a")],
+        };
+
+        assert!(dynamic_overlays_match_phase(&pool_a, &pool_b, "baseline"));
+        assert!(dynamic_revisions_changed(&pool_a, &pool_b, None));
+
+        let previous = BTreeMap::from([
+            ("pool-a".to_owned(), "old-pool-a-revision".to_owned()),
+            ("pool-b".to_owned(), "old-pool-b-revision".to_owned()),
+        ]);
+        assert!(dynamic_revisions_changed(&pool_a, &pool_b, Some(&previous)));
+        let partially_unchanged = BTreeMap::from([
+            ("pool-a".to_owned(), "old-pool-a-revision".to_owned()),
+            ("pool-b".to_owned(), "pool-b-revision".to_owned()),
+        ]);
+        assert!(!dynamic_revisions_changed(&pool_a, &pool_b, Some(&partially_unchanged)));
+    }
+
+    #[test]
+    fn dynamic_gate_allows_independently_smoothed_weights_within_phase_bounds() {
+        let candidate = |site: &str, traffic_weight| DynamicCandidateWeight {
+            site: site.to_owned(),
+            provider: format!("llmd-{site}-provider"),
+            stable_id: format!("stable-{site}"),
+            selection_group: 0,
+            traffic_weight,
+            fresh: true,
+            admission_state: "new_and_existing".to_owned(),
+        };
+        let pool_a = DynamicOverlaySnapshot {
+            semantic_revision: "pool-a-recovery".to_owned(),
+            resource_version: "10".to_owned(),
+            candidates: vec![candidate("pool-a", 481), candidate("pool-b", 519)],
+        };
+        let pool_b = DynamicOverlaySnapshot {
+            semantic_revision: "pool-b-recovery".to_owned(),
+            resource_version: "22".to_owned(),
+            candidates: vec![candidate("pool-b", 500), candidate("pool-a", 500)],
+        };
+
+        assert!(dynamic_overlays_match_phase(&pool_a, &pool_b, "recovery"));
+
+        let outside_recovery_bounds = DynamicOverlaySnapshot {
+            candidates: vec![candidate("pool-a", 449), candidate("pool-b", 551)],
+            ..pool_b
+        };
+        assert!(!dynamic_overlays_match_phase(
+            &pool_a,
+            &outside_recovery_bounds,
+            "recovery"
+        ));
+    }
+
+    #[test]
+    fn operator_restart_snapshot_excludes_terminating_unready_and_unrelated_pods() {
+        let pods = vec![
+            serde_json::json!({
+                "metadata": {
+                    "name": "grid-operator-old",
+                    "uid": "old-uid",
+                    "deletionTimestamp": "2026-09-30T23:00:00Z"
+                },
+                "status": {"conditions": [{"type": "Ready", "status": "True"}]}
+            }),
+            serde_json::json!({
+                "metadata": {"name": "grid-operator-current", "uid": "current-uid"},
+                "status": {"conditions": [{"type": "Ready", "status": "True"}]}
+            }),
+            serde_json::json!({
+                "metadata": {"name": "grid-operator-pending", "uid": "pending-uid"},
+                "status": {"conditions": [{"type": "Ready", "status": "False"}]}
+            }),
+            serde_json::json!({
+                "metadata": {"name": "consumer-gateway", "uid": "gateway-uid"},
+                "status": {"conditions": [{"type": "Ready", "status": "True"}]}
+            }),
+        ];
+
+        assert_eq!(active_dynamic_operator_pod_uids(&pods), ["current-uid"]);
+    }
+
+    #[test]
+    fn simulator_annotation_avoids_a_noop_rollout() {
+        assert!(!simulator_annotation_needs_rollout(Some("9"), "9"));
+        assert!(simulator_annotation_needs_rollout(Some("0"), "9"));
+        assert!(simulator_annotation_needs_rollout(None, "9"));
+    }
+
+    #[test]
+    fn dynamic_revision_log_parser_does_not_match_serving_revision_suffixes() {
+        let logs = concat!(
+            "INFO overlay initialized accepted_revision=INITIAL serving_revision=INITIAL\n",
+            "INFO overlay reloaded accepted_revision=NEW serving_revision=NEW previous_serving_revision=INITIAL\n",
+            "ERROR overlay reload failed retained_serving_revision=NEW\n",
+        );
+        assert_eq!(
+            latest_dynamic_log_field(logs, "accepted_revision").as_deref(),
+            Some("NEW")
+        );
+        assert_eq!(
+            latest_dynamic_log_field(logs, "serving_revision").as_deref(),
+            Some("NEW")
+        );
+        assert_eq!(
+            latest_dynamic_log_field(logs, "previous_serving_revision").as_deref(),
+            Some("INITIAL")
+        );
+    }
+
+    #[test]
+    fn dynamic_revision_log_parser_handles_quoted_values_and_requires_field_boundary() {
+        let logs = concat!(
+            "INFO serving_revision=OLD\n",
+            "INFO accepted_revision=\"new revision\" serving_revision=\"new revision\"\n",
+            "ERROR retained_serving_revision=STALE\n",
+        );
+        assert_eq!(
+            latest_dynamic_log_field(logs, "serving_revision").as_deref(),
+            Some("new revision")
+        );
+        assert_eq!(
+            latest_dynamic_log_field(logs, "accepted_revision").as_deref(),
+            Some("new revision")
+        );
+    }
+
+    #[test]
+    fn dynamic_revision_log_parser_handles_ansi_between_field_and_value() {
+        let logs = concat!(
+            "\x1b[2mINFO\x1b[0m overlay reloaded ",
+            "\x1b[3maccepted_revision\x1b[0m\x1b[2m=\x1b[0mrevision-a ",
+            "\x1b[3mserving_revision\x1b[0m\x1b[2m=\x1b[0mrevision-a ",
+            "\x1b[3mprevious_serving_revision\x1b[0m\x1b[2m=\x1b[0mrevision-old",
+        );
+        assert_eq!(
+            latest_dynamic_log_field(logs, "accepted_revision").as_deref(),
+            Some("revision-a")
+        );
+        assert_eq!(
+            latest_dynamic_log_field(logs, "serving_revision").as_deref(),
+            Some("revision-a")
+        );
+        assert_eq!(
+            latest_dynamic_log_field(logs, "previous_serving_revision").as_deref(),
+            Some("revision-old")
+        );
+    }
+
+    #[test]
+    fn dynamic_weighted_sample_uses_new_sessionless_requests_and_no_retries() {
+        let script = dynamic_sample_script("pressure");
+        assert!(script.contains("pressure-$worker-$ordinal"));
+        assert!(script.contains("-le 400"));
+        assert_eq!(DYNAMIC_SAMPLE_SIZE, 1600);
+        assert!(script.contains("--max-time 20"));
+        assert!(script.contains("%header{X-Grid-LlmD-Provider-Gateway}"));
+        assert!(script.contains("%header{x-ai-demo-provider-gateway}"));
+        assert!(!script.contains("%{header:"));
+        assert!(!script.contains("--retry"));
+        assert!(!script.contains("X-Session-Id"));
+    }
+
+    #[test]
+    fn weighted_affinity_requires_both_provider_bindings_and_exact_replay() {
+        let bound = (1..=DYNAMIC_AFFINITY_SESSION_COUNT)
+            .map(|ordinal| DynamicAffinitySample {
+                stage: "bind".to_owned(),
+                session_ordinal: ordinal,
+                curl_exit_code: 0,
+                http_status: Some(200),
+                provider_gateway: if ordinal.is_multiple_of(2) { "pool-a" } else { "pool-b" }.to_owned(),
+                provider_attribution: if ordinal.is_multiple_of(2) { "pool-a" } else { "pool-b" }.to_owned(),
+            })
+            .collect::<Vec<_>>();
+        assert!(affinity_bind_samples_valid(&bound));
+        let bindings = bound
+            .iter()
+            .map(|sample| (sample.session_ordinal, sample.provider_gateway.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let replay = bound
+            .iter()
+            .map(|sample| DynamicAffinitySample {
+                stage: "replay".to_owned(),
+                ..sample.clone()
+            })
+            .collect::<Vec<_>>();
+        assert!(affinity_replay_matches(&bindings, &replay));
+
+        let mut moved = replay;
+        let Some(first) = moved.first_mut() else {
+            return;
+        };
+        first.provider_gateway = if first.provider_gateway == "pool-a" {
+            "pool-b"
+        } else {
+            "pool-a"
+        }
+        .to_owned();
+        first.provider_attribution.clone_from(&first.provider_gateway);
+        assert!(!affinity_replay_matches(&bindings, &moved));
+
+        let mut incomplete = bound;
+        incomplete.pop();
+        assert!(!affinity_bind_samples_valid(&incomplete));
+    }
+
+    #[test]
+    fn dynamic_chi_square_uses_published_probabilities() {
+        assert!(dynamic_chi_square([500, 500], [200, 200]).abs() < f64::EPSILON);
+        assert!(dynamic_chi_square([300, 700], [120, 280]) < DYNAMIC_CHI_SQUARE_CRITICAL);
+        assert!(dynamic_chi_square([300, 700], [220, 180]) > DYNAMIC_CHI_SQUARE_CRITICAL);
+        assert!(dynamic_chi_square([1, 999], [1, 399]).is_infinite());
+    }
+
+    #[test]
+    fn dynamic_sample_size_supports_recovery_floor_without_relaxing_it() {
+        let expected_recovery_share = 0.481_f64;
+        let standard_error =
+            (expected_recovery_share * (1.0 - expected_recovery_share) / f64::from(DYNAMIC_SAMPLE_SIZE)).sqrt();
+        let one_sided_99_percent_lower_bound = expected_recovery_share - (2.326 * standard_error);
+        assert!(one_sided_99_percent_lower_bound >= DYNAMIC_MIN_RECOVERY_SHARE);
+        assert!((DYNAMIC_MIN_RECOVERY_SHARE - 0.45).abs() < f64::EPSILON);
+        assert_eq!(DYNAMIC_SAMPLE_SIZE, 1600);
+    }
+
+    #[test]
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "the overlay fixture contains exactly one candidate"
+    )]
+    fn dynamic_overlay_parser_requires_weighted_contract_and_reads_revision() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let json = serde_json::json!({
+            "metadata": {
+                "resourceVersion": "55",
+                "annotations": {"grid.praxis-proxy.io/overlay-revision": "sha256:revision"}
+            },
+            "data": {"routing-config.json": serde_json::json!({
+                "selection_policy": {"mode": "weightedRandom"},
+                "candidates": [{
+                    "site": "pool-a", "cluster": "llmd-pool-a-provider", "stable_id": "id-a",
+                    "selection_group": 0, "traffic_weight": 500, "fresh": true,
+                    "admission_state": "new_and_existing"
+                }]
+            }).to_string()}
+        });
+        let overlay = parse_dynamic_overlay_json(&serde_json::to_vec(&json)?)?;
+        assert_eq!(overlay.semantic_revision, "sha256:revision");
+        assert_eq!(overlay.resource_version, "55");
+        assert_eq!(overlay.candidates.len(), 1);
+        assert_eq!(overlay.candidates[0].traffic_weight, 500);
+        Ok(())
+    }
+
+    #[test]
     #[expect(clippy::float_cmp, reason = "exact literal round-trips in test assertions")]
     fn parse_epp_metrics_falls_back_to_inference_pool_metric_names() {
         // Older llm-d-inference-scheduler builds expose only inference_pool_*.
@@ -4393,6 +8186,8 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
             mode: "quick".to_owned(),
             metrics_transport: MetricsTransport::DirectHttp.label().to_owned(),
             scoring_strategy: ScoringFlavor::QueueDepth.label().to_owned(),
+            placement_strategy: "score preference".to_owned(),
+            run_id: "test-run".to_owned(),
             started_at: "2026-01-01T00:00:00Z".to_owned(),
             wall_secs: 10.0,
             success: true,
@@ -4400,6 +8195,7 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
             setup: SetupEvidence {
                 clusters: vec!["pool-a".to_owned()],
                 images: BTreeMap::new(),
+                pod_images: Vec::new(),
             },
             proofs: BTreeMap::new(),
             lifecycle: LifecycleRecord {
@@ -4420,6 +8216,8 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
             mode: "quick".to_owned(),
             metrics_transport: MetricsTransport::MtlsProxy.label().to_owned(),
             scoring_strategy: ScoringFlavor::QueueDepth.label().to_owned(),
+            placement_strategy: "score preference".to_owned(),
+            run_id: "test-run".to_owned(),
             started_at: "2026-01-01T00:00:00Z".to_owned(),
             wall_secs: 10.0,
             success: true,
@@ -4427,6 +8225,7 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
             setup: SetupEvidence {
                 clusters: vec!["pool-a".to_owned()],
                 images: BTreeMap::new(),
+                pod_images: Vec::new(),
             },
             proofs: BTreeMap::new(),
             lifecycle: LifecycleRecord {
@@ -4536,6 +8335,38 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
             !content.contains("caSecretRef"),
             "direct-HTTP must not include TLS secret references"
         );
+        drop(fs::remove_dir_all(&dir));
+    }
+
+    #[test]
+    fn materialize_run_id_updates_kind_contexts_with_cluster_prefix() {
+        let dir = std::env::temp_dir().join(format!("grid-test-materialize-run-context-{}", std::process::id()));
+        drop(fs::create_dir_all(&dir));
+        let forge_path = dir.join("forge.yaml");
+        fs::write(
+            &forge_path,
+            include_str!("../../../tests/e2e/topologies/grid-llmd-pool-metrics/forge.yaml"),
+        )
+        .unwrap();
+
+        let resolved = materialize_config_with_images(
+            &forge_path,
+            &MaterializeConfigOptions {
+                metrics_transport: MetricsTransport::DirectHttp,
+                scoring_flavor: ScoringFlavor::QueueDepth,
+                nginx_image: None,
+                images: None,
+                run_id: Some("20260930t203319z-795499"),
+                pressure_weighted: false,
+            },
+        )
+        .unwrap();
+        let content = fs::read_to_string(resolved).unwrap();
+        let expected_context = "kind-grid-llmd-pm-20260930t203319z-795499-{{ cluster.name }}";
+
+        assert!(content.contains("clusterPrefix: grid-llmd-pm-20260930t203319z-795499"));
+        assert_eq!(content.matches(expected_context).count(), 4);
+        assert!(!content.contains("kind-grid-llmd-pm-{{ cluster.name }}"));
         drop(fs::remove_dir_all(&dir));
     }
 
@@ -4725,5 +8556,110 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
         let images = resolve_images(MetricsTransport::MtlsProxy).unwrap();
         assert!(images.nginx.is_some(), "mTLS must resolve nginx image");
         assert_eq!(images.nginx.unwrap(), DEFAULT_NGINX_IMAGE);
+    }
+
+    #[test]
+    fn source_hash_classifies_only_source_and_generated_resolved_files() {
+        assert!(is_untracked_source_file(Path::new(
+            "operator/src/resources/placement.rs"
+        )));
+        assert!(is_untracked_source_file(Path::new(
+            "charts/grid-operator/tests/service-swim_test.yaml"
+        )));
+        assert!(!is_untracked_source_file(Path::new(
+            "tests/e2e/topologies/grid-llmd-pool-metrics/.forge.resolved.run.yaml"
+        )));
+        assert!(is_generated_resolved_yaml(Path::new(
+            "tests/e2e/topologies/grid-llmd-pool-metrics/.forge.resolved.run.yaml"
+        )));
+        assert!(is_generated_resolved_yaml(Path::new(
+            "tests/e2e/topologies/grid-single-cluster-multi-gateway/.grid-run.resolved.yaml"
+        )));
+        assert!(!is_generated_resolved_yaml(Path::new(
+            "operator/src/resources/placement.rs"
+        )));
+    }
+
+    #[test]
+    fn docker_save_manifest_yields_the_config_digest_not_the_index_digest() {
+        let manifest = br#"[{"Config":"blobs/sha256/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","RepoTags":["praxis-ai:test"],"Layers":[]}]"#;
+        assert_eq!(
+            config_digest_from_save_manifest(manifest, "praxis-ai:test").unwrap(),
+            format!("sha256:{}", "a".repeat(64))
+        );
+        assert_eq!(
+            config_digest_from_save_manifest(manifest, "praxis-ai:other").unwrap_err(),
+            "Docker save manifest does not contain selected image praxis-ai:other"
+        );
+    }
+
+    fn gateway_image_pod(cluster: &str, image: &str, image_id: &str) -> PodImageEvidence {
+        PodImageEvidence {
+            cluster: cluster.to_owned(),
+            pod: "consumer-gateway-abc".to_owned(),
+            container: "praxis".to_owned(),
+            requested_image: image.to_owned(),
+            image_id: image_id.to_owned(),
+            ready: true,
+            restart_count: 0,
+        }
+    }
+
+    #[test]
+    fn gateway_image_identity_requires_source_sha_and_each_cluster_runtime_digest() {
+        let image = "praxis-ai:test";
+        let config_id = format!("sha256:{}", "a".repeat(64));
+        let pods = vec![
+            gateway_image_pod("kind-grid-pool-a", image, &config_id),
+            gateway_image_pod("kind-grid-pool-b", image, &config_id),
+        ];
+        let revision = "0123456789abcdef";
+        let content_hash = "a".repeat(64);
+        let version = format!("0.4.1-test-{}", &content_hash[..8]);
+        let valid_proof = gateway_image_identity_proof(&GatewayImageIdentity {
+            image,
+            config_id: &config_id,
+            source: "https://github.com/praxis-proxy/ai",
+            revision,
+            expected_revision: Some(revision),
+            expected_content_hash: Some(&content_hash),
+            version: &version,
+            pods: &pods,
+        });
+        assert!(valid_proof.success);
+        assert!(
+            valid_proof
+                .observations
+                .iter()
+                .any(|observation| observation.contains("8-character hash prefix"))
+        );
+
+        assert!(
+            !gateway_image_identity_proof(&GatewayImageIdentity {
+                image,
+                config_id: &config_id,
+                source: "https://github.com/praxis-proxy/ai",
+                revision,
+                expected_revision: None,
+                expected_content_hash: Some(&content_hash),
+                version: &version,
+                pods: &pods,
+            })
+            .success
+        );
+        let wrong_image = vec![gateway_image_pod("kind-grid-pool-a", "praxis-ai:stale", "sha256:stale")];
+        assert!(
+            !gateway_image_identity_proof(&GatewayImageIdentity {
+                image,
+                config_id: &config_id,
+                source: "https://github.com/praxis-proxy/ai",
+                revision,
+                expected_revision: Some(revision),
+                expected_content_hash: Some(&content_hash),
+                version: &version,
+                pods: &wrong_image,
+            })
+            .success
+        );
     }
 }

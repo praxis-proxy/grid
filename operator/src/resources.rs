@@ -27,6 +27,8 @@ pub mod credentials;
 pub mod overlay_bridge;
 /// Versioned overlay envelope for content-addressed revision tracking.
 pub mod overlay_envelope;
+/// Pressure-derived provider placement and normalized signal handling.
+pub(crate) mod placement;
 /// Stateful provider admission and pressure-recovery evaluator.
 pub(crate) mod provider_admission;
 /// Provider metrics collection for the [`GridNetwork`] overlay renderer.

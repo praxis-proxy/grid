@@ -1,0 +1,35 @@
+suite: SWIM and poll-mode signals Service
+templates:
+  - templates/service-swim.yaml
+tests:
+  - it: exposes SWIM over UDP and the mTLS signals endpoint over TCP
+    set:
+      swim:
+        service:
+          enabled: true
+          type: LoadBalancer
+          port: 7946
+    asserts:
+      - contains:
+          path: spec.ports
+          content:
+            name: swim-udp
+            port: 7946
+            targetPort: swim-udp
+            protocol: UDP
+      - contains:
+          path: spec.ports
+          content:
+            name: signals-tcp
+            port: 9091
+            targetPort: signals-tcp
+            protocol: TCP
+
+  - it: renders nothing when the SWIM Service is disabled
+    set:
+      swim:
+        service:
+          enabled: false
+    asserts:
+      - hasDocuments:
+          count: 0

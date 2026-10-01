@@ -157,7 +157,18 @@ async fn scrape_provider_signals(
             tracing::debug!(provider = identity, error = %e, "signals: provider scrape failed; last value left to expire");
         })
         .ok()?;
-    let observations = crate::signals::parse(&text)
+    let observations = provider_signal_observations(identity, &wanted, mc, &text);
+    Some((identity.to_owned(), observations))
+}
+
+/// Keep configured source observations and add normalized EPP pressure signals.
+fn provider_signal_observations(
+    identity: &str,
+    wanted: &std::collections::BTreeSet<String>,
+    config: &crate::crd::inference_provider::MetricsConfig,
+    exposition: &str,
+) -> Vec<crate::signals::Observation> {
+    let observations: Vec<crate::signals::Observation> = crate::signals::parse(exposition)
         .into_iter()
         .filter(|o| wanted.contains(o.metric.as_str()))
         // A local sample's freshness is its collection time, so drop any trailing
@@ -167,7 +178,56 @@ async fn scrape_provider_signals(
             o
         })
         .collect();
-    Some((identity.to_owned(), observations))
+    let mut observations = observations;
+    let normalized = normalized_pressure_observations(config, exposition);
+    log_signal_scrape_summary(identity, observations.len(), &normalized);
+    observations.extend(normalized);
+    observations
+}
+
+/// Log the names and counts of normalized samples without logging metric values.
+fn log_signal_scrape_summary(identity: &str, source_count: usize, normalized: &[crate::signals::Observation]) {
+    tracing::debug!(
+        provider = identity,
+        source_observations = source_count,
+        normalized_observations = ?normalized.iter().map(|observation| observation.metric.as_str()).collect::<Vec<_>>(),
+        "signals: provider metrics scrape parsed"
+    );
+}
+
+/// Add canonical normalized pressure samples while preserving the configured
+/// source metrics already published for signal consumers.
+fn normalized_pressure_observations(
+    config: &crate::crd::inference_provider::MetricsConfig,
+    exposition: &str,
+) -> Vec<crate::signals::Observation> {
+    let names = metric_names_from_config(&config.signal_names, config.pool_name.as_deref(), config.queue_capacity);
+    let parsed = match parse_prometheus_text(exposition, &names) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            tracing::debug!(%error, "signals: unable to normalize provider pressure metrics");
+            return Vec::new();
+        },
+    };
+    [
+        (parsed.queue_depth, crate::resources::placement::QUEUE_PRESSURE_METRIC),
+        (
+            parsed.kv_cache_utilization,
+            crate::resources::placement::KV_CACHE_PRESSURE_METRIC,
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(value, metric)| {
+        value
+            .filter(|value| value.is_finite() && (0.0..=1.0).contains(value))
+            .map(|value| crate::signals::Observation {
+                metric: metric.to_owned(),
+                labels: std::collections::BTreeMap::new(),
+                value,
+                timestamp_ms: None,
+            })
+    })
+    .collect()
 }
 
 /// The scrape target for a provider's coarse signals, if it is eligible.
@@ -888,6 +948,151 @@ mod tests {
         let names = metric_names_from_config(&cfg, Some("my-pool"), Some(100));
         assert_eq!(names.pool_name.as_deref(), Some("my-pool"));
         assert_eq!(names.queue_capacity, Some(100.0));
+    }
+
+    #[test]
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "the fixture has exactly two normalized observations in asserted order"
+    )]
+    #[expect(
+        clippy::float_cmp,
+        reason = "normalization of small integer inputs yields exact binary fractions"
+    )]
+    fn normalized_pressure_samples_respect_pool_and_queue_capacity() {
+        let config = MetricsConfig {
+            pool_name: Some("pool-a".to_owned()),
+            queue_capacity: Some(4),
+            signal_names: MetricSignalNames {
+                queue_depth: Some("epp_queue".to_owned()),
+                kv_cache_utilization: Some("epp_kv".to_owned()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let exposition = concat!(
+            "# TYPE epp_queue gauge\n",
+            "epp_queue{name=\"pool-a\"} 2\n",
+            "epp_queue{name=\"pool-b\"} 4\n",
+            "# TYPE epp_kv gauge\n",
+            "epp_kv{name=\"pool-a\"} 0.75\n",
+            "epp_kv{name=\"pool-b\"} 0.1\n",
+        );
+        let normalized = normalized_pressure_observations(&config, exposition);
+        assert_eq!(normalized.len(), 2);
+        assert_eq!(normalized[0].metric, crate::resources::placement::QUEUE_PRESSURE_METRIC);
+        assert_eq!(normalized[0].value, 0.5);
+        assert_eq!(
+            normalized[1].metric,
+            crate::resources::placement::KV_CACHE_PRESSURE_METRIC
+        );
+        assert_eq!(normalized[1].value, 0.75);
+    }
+
+    #[test]
+    #[expect(
+        clippy::float_cmp,
+        reason = "these decimal fixtures parse to the exact asserted f64 values"
+    )]
+    fn normalized_pressure_accepts_llm_d_epp_pool_gauges() {
+        let config = MetricsConfig {
+            pool_name: Some("pool-a".to_owned()),
+            queue_capacity: Some(4),
+            signal_names: MetricSignalNames {
+                queue_depth: Some("inference_pool_average_queue_size".to_owned()),
+                kv_cache_utilization: Some("inference_pool_average_kv_cache_utilization".to_owned()),
+                healthy: Some("inference_pool_ready_pods".to_owned()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let exposition = concat!(
+            "# TYPE inference_pool_average_queue_size gauge\n",
+            "inference_pool_average_queue_size{name=\"pool-a\"} 2\n",
+            "inference_pool_average_queue_size{name=\"pool-b\"} 4\n",
+            "# TYPE inference_pool_average_kv_cache_utilization gauge\n",
+            "inference_pool_average_kv_cache_utilization{name=\"pool-a\"} 0.75\n",
+            "inference_pool_average_kv_cache_utilization{name=\"pool-b\"} 0.1\n",
+            "# TYPE inference_pool_ready_pods gauge\n",
+            "inference_pool_ready_pods{name=\"pool-a\"} 2\n",
+        );
+
+        let normalized = normalized_pressure_observations(&config, exposition);
+        assert_eq!(normalized.len(), 2);
+        let queue = normalized.first().unwrap_or_else(|| std::process::abort());
+        let kv_cache = normalized.get(1).unwrap_or_else(|| std::process::abort());
+        assert_eq!(queue.metric, crate::resources::placement::QUEUE_PRESSURE_METRIC);
+        assert_eq!(queue.value, 0.5);
+        assert_eq!(kv_cache.metric, crate::resources::placement::KV_CACHE_PRESSURE_METRIC);
+        assert_eq!(kv_cache.value, 0.75);
+    }
+
+    #[tokio::test]
+    #[expect(clippy::float_cmp, reason = "normalization uses exact fixture values")]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "this test exercises the complete HTTP scrape-to-canonical-signal path with a representative EPP exposition"
+    )]
+    async fn collect_provider_signals_publishes_canonical_llm_d_pressure_samples() {
+        let exposition = concat!(
+            "# TYPE inference_pool_average_queue_size gauge\n",
+            "inference_pool_average_queue_size{name=\"pool-a\"} 2\n",
+            "inference_pool_average_queue_size{name=\"pool-b\"} 4\n",
+            "# TYPE inference_pool_average_kv_cache_utilization gauge\n",
+            "inference_pool_average_kv_cache_utilization{name=\"pool-a\"} 0.75\n",
+            "inference_pool_average_kv_cache_utilization{name=\"pool-b\"} 0.1\n",
+            "# TYPE inference_pool_ready_pods gauge\n",
+            "inference_pool_ready_pods{name=\"pool-a\"} 2\n",
+        );
+        let endpoint = start_test_server(ok_response(exposition)).await;
+        let config = MetricsConfig {
+            path: "/metrics".to_owned(),
+            timeout: "2s".to_owned(),
+            signal_names: MetricSignalNames {
+                queue_depth: Some("inference_pool_average_queue_size".to_owned()),
+                kv_cache_utilization: Some("inference_pool_average_kv_cache_utilization".to_owned()),
+                healthy: Some("inference_pool_ready_pods".to_owned()),
+                ..Default::default()
+            },
+            stale_metrics_seconds: None,
+            metrics_endpoint: None,
+            pool_name: Some("pool-a".to_owned()),
+            queue_capacity: Some(4),
+            tls: None,
+        };
+        let provider = provider_fixture("llmd-pool-a-provider", &endpoint, Some(config));
+
+        let collected = collect_provider_signals("net", &[provider], None).await;
+        let observations = collected
+            .get("llmd-pool-a-provider")
+            .unwrap_or_else(|| std::process::abort());
+        let queue = observations
+            .iter()
+            .find(|observation| observation.metric == crate::resources::placement::QUEUE_PRESSURE_METRIC)
+            .unwrap_or_else(|| std::process::abort());
+        let kv_cache = observations
+            .iter()
+            .find(|observation| observation.metric == crate::resources::placement::KV_CACHE_PRESSURE_METRIC)
+            .unwrap_or_else(|| std::process::abort());
+        assert_eq!(queue.value, 0.5);
+        assert_eq!(kv_cache.value, 0.75);
+    }
+
+    #[test]
+    fn normalized_pressure_omits_missing_or_out_of_range_unscaled_signals() {
+        let config = MetricsConfig {
+            signal_names: MetricSignalNames {
+                queue_depth: Some("epp_queue".to_owned()),
+                kv_cache_utilization: Some("epp_kv".to_owned()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let normalized = normalized_pressure_observations(
+            &config,
+            "# TYPE epp_queue gauge\nepp_queue 2\n# TYPE epp_kv gauge\nepp_kv 1.2\n",
+        );
+        assert!(normalized.is_empty());
     }
 
     // -----------------------------------------------------------------------

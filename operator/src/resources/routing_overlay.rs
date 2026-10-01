@@ -54,7 +54,10 @@ use crate::{
         grid_site::GridSite,
         inference_provider::{InferenceProvider, ProviderPhase},
     },
-    resources::geography::{AdmissionState, LocalityTier},
+    resources::{
+        geography::{AdmissionState, LocalityTier},
+        placement::{self, PlacementState, PressureInput, SignalKey},
+    },
     swim::{MemberStatus, MembershipSnapshot},
 };
 
@@ -266,6 +269,7 @@ pub(crate) fn remote_crdt_provider_to_candidates(provider: &crdt::ProviderState)
             name: model.clone(),
             site: provider.site_id.clone(),
             cluster: provider.routing_cluster.clone(),
+            signal_origin_site: Some(provider.site_id.clone()),
             fresh,
             credential: None,
             stable_id: None,
@@ -841,6 +845,10 @@ pub struct RoutingCandidate {
     /// [`InferenceProvider`]: crate::crd::inference_provider::InferenceProvider
     pub cluster: String,
 
+    /// Site that owns the signal sample for this candidate; control-plane only.
+    #[serde(skip)]
+    pub signal_origin_site: Option<String>,
+
     /// Whether this candidate should be treated as fresh by the data plane.
     ///
     /// Local candidates are `false` only when the provider status is
@@ -1228,10 +1236,6 @@ pub fn render_routing_overlay(
     clippy::too_many_arguments,
     reason = "admission states are a distinct control-plane input"
 )]
-#[expect(
-    clippy::too_many_lines,
-    reason = "sequential render steps: ordering, collect, enrich, filter, sort, dedup, rank; splitting would hide the pipeline"
-)]
 pub fn render_routing_overlay_with_admission(
     network: &GridNetwork,
     sites: &[GridSite],
@@ -1242,6 +1246,81 @@ pub fn render_routing_overlay_with_admission(
     generated_at: Option<&str>,
     weights: &scoring::ScoringWeights,
     precomputed_admission: Option<&HashMap<String, AdmissionState>>,
+) -> Result<RoutingOverlay, String> {
+    render_routing_overlay_inner(
+        network,
+        sites,
+        providers,
+        remote_crdt_providers,
+        local_site,
+        metrics,
+        generated_at,
+        weights,
+        precomputed_admission,
+        None,
+    )
+}
+
+/// Pressure values, origin attribution, and mutable smoothing state for one overlay render.
+type PlacementContext<'snapshot> = (
+    &'snapshot HashMap<SignalKey, f64>,
+    &'snapshot str,
+    &'snapshot mut PlacementState,
+);
+
+/// Render with the current poll-mode signal snapshot and retained EWMA state.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "pressure inputs and state are distinct control-plane data"
+)]
+pub(crate) fn render_routing_overlay_with_pressure(
+    network: &GridNetwork,
+    sites: &[GridSite],
+    providers: &[InferenceProvider],
+    remote_crdt_providers: &[crdt::ProviderState],
+    local_site: &str,
+    metrics: Option<&HashMap<&str, scoring::BackendMetrics>>,
+    generated_at: Option<&str>,
+    weights: &scoring::ScoringWeights,
+    precomputed_admission: Option<&HashMap<String, AdmissionState>>,
+    pressure_values: &HashMap<SignalKey, f64>,
+    signal_origin_site: &str,
+    placement_state: &mut PlacementState,
+) -> Result<RoutingOverlay, String> {
+    render_routing_overlay_inner(
+        network,
+        sites,
+        providers,
+        remote_crdt_providers,
+        local_site,
+        metrics,
+        generated_at,
+        weights,
+        precomputed_admission,
+        Some((pressure_values, signal_origin_site, placement_state)),
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "distinct overlay inputs make the controller-to-renderer contract explicit"
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "sequential render steps: ordering, collect, enrich, filter, sort, dedup, rank, placement"
+)]
+/// Build one overlay from current provider state and optional pressure inputs.
+fn render_routing_overlay_inner(
+    network: &GridNetwork,
+    sites: &[GridSite],
+    providers: &[InferenceProvider],
+    remote_crdt_providers: &[crdt::ProviderState],
+    local_site: &str,
+    metrics: Option<&HashMap<&str, scoring::BackendMetrics>>,
+    generated_at: Option<&str>,
+    weights: &scoring::ScoringWeights,
+    precomputed_admission: Option<&HashMap<String, AdmissionState>>,
+    mut placement_context: Option<PlacementContext<'_>>,
 ) -> Result<RoutingOverlay, String> {
     let network_name = network
         .metadata
@@ -1272,7 +1351,10 @@ pub fn render_routing_overlay_with_admission(
         .find(|site| site.metadata.name.as_deref() == Some(local_site) && site.spec.grid_network_ref == network_name)
         .and_then(|site| site.metadata.labels.as_ref());
 
-    let mut candidates = collect_candidates(network_name, sites, providers, consumer_site_labels)?;
+    let signal_origin_site = placement_context
+        .as_ref()
+        .map_or(local_site, |(_, signal_site, _)| *signal_site);
+    let mut candidates = collect_candidates(network_name, sites, providers, consumer_site_labels, signal_origin_site)?;
     for provider in remote_crdt_providers {
         let access_policy = crdt_access_policy_to_operator(&provider.access_policy);
         let access_result = evaluate_access_policy(&access_policy, consumer_site_labels);
@@ -1360,22 +1442,12 @@ pub fn render_routing_overlay_with_admission(
     // Praxis compatibility behavior.
     let selection_policy = network.spec.selection_policy.clone();
 
-    if matches!(
-        selection_policy.as_ref().map(|p| p.mode),
-        Some(crate::crd::grid_network::SelectionMode::WeightedRandom)
-    ) {
-        if !matches!(
-            network.spec.placement_policy.as_ref().map(|p| p.strategy),
-            Some(crate::crd::grid_network::PlacementStrategy::Static)
-        ) {
-            return Err("weightedRandom requires placementPolicy.strategy=static".to_owned());
-        }
-        for candidate in &mut candidates {
-            // Publish configured relative capacity directly. Ratios are
-            // preserved without a lossy or overflowing presentation scale.
-            candidate.traffic_weight = Some(candidate.capacity_weight);
-        }
-    }
+    apply_traffic_weights(
+        &mut candidates,
+        network,
+        selection_policy.as_ref(),
+        &mut placement_context,
+    )?;
 
     Ok(RoutingOverlay {
         network: network_name.to_owned(),
@@ -1384,6 +1456,105 @@ pub fn render_routing_overlay_with_admission(
         selection_policy,
         generated_at: generated_at.map(str::to_owned),
     })
+}
+
+/// Apply the configured static or pressure-derived weight contract.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one strategy dispatch validates the common placement contract before applying static or pressure-derived weights"
+)]
+fn apply_traffic_weights(
+    candidates: &mut [RoutingCandidate],
+    network: &GridNetwork,
+    selection_policy: Option<&crate::crd::grid_network::SelectionPolicyConfig>,
+    placement_context: &mut Option<PlacementContext<'_>>,
+) -> Result<(), String> {
+    use crate::crd::grid_network::{PlacementStrategy, PressureSignal, SelectionMode, SignalMode};
+
+    let weighted = selection_policy.is_some_and(|policy| policy.mode == SelectionMode::WeightedRandom);
+    let Some(policy) = network.spec.placement_policy.as_ref() else {
+        if weighted {
+            return Err("weightedRandom requires placementPolicy".to_owned());
+        }
+        return Ok(());
+    };
+    if !weighted {
+        return Err("placementPolicy requires selectionPolicy.mode=weightedRandom".to_owned());
+    }
+
+    match policy.strategy {
+        PlacementStrategy::Static => {
+            if policy.pressure_weighted.is_some() {
+                return Err("pressureWeighted configuration requires pressureWeighted strategy".to_owned());
+            }
+            for candidate in candidates {
+                candidate.traffic_weight = Some(candidate.capacity_weight);
+            }
+        },
+        PlacementStrategy::PressureWeighted => {
+            let Some(config) = policy.pressure_weighted.as_ref() else {
+                return Err("pressureWeighted strategy requires pressureWeighted configuration".to_owned());
+            };
+            if !network
+                .spec
+                .signal_transport
+                .as_ref()
+                .is_some_and(|transport| transport.mode == SignalMode::Poll)
+            {
+                return Err("pressureWeighted placement requires signalTransport.mode=poll".to_owned());
+            }
+            let Some((signal_values, _, state)) = placement_context.as_mut() else {
+                return Err("pressureWeighted placement requires current poll-mode signals".to_owned());
+            };
+            let metric = match config.signal {
+                PressureSignal::QueueDepth => placement::QUEUE_PRESSURE_METRIC,
+                PressureSignal::KvCacheUtilization => placement::KV_CACHE_PRESSURE_METRIC,
+            };
+            let stable_ids: Vec<String> = candidates
+                .iter()
+                .map(|candidate| {
+                    candidate.stable_id.clone().unwrap_or_else(|| {
+                        super::geography::compute_stable_id(
+                            &candidate.kind,
+                            &candidate.name,
+                            &candidate.site,
+                            &candidate.cluster,
+                        )
+                    })
+                })
+                .collect();
+            let inputs: Vec<PressureInput<'_>> = candidates
+                .iter()
+                .zip(&stable_ids)
+                .map(|(candidate, stable_id)| {
+                    let source_site = candidate.signal_origin_site.as_deref().unwrap_or(&candidate.site);
+                    let key = SignalKey {
+                        site: source_site.to_owned(),
+                        provider: candidate.cluster.clone(),
+                    };
+                    let pressure = signal_values.get(&key).copied();
+                    if pressure.is_none() {
+                        return Err(format!(
+                            "candidate {} at site {} has no fresh {metric} signal",
+                            candidate.cluster, source_site
+                        ));
+                    }
+                    Ok(PressureInput {
+                        stable_id,
+                        selection_group: candidate.selection_group.unwrap_or_default(),
+                        capacity_weight: candidate.capacity_weight,
+                        pressure,
+                    })
+                })
+                .collect::<Result<_, String>>()?;
+            let effective = placement::pressure_weights(&inputs, config, state)?;
+            for (candidate, stable_id) in candidates.iter_mut().zip(&stable_ids) {
+                let group = candidate.selection_group.unwrap_or_default();
+                candidate.traffic_weight = effective.get(&placement::weight_key(stable_id, group)).copied();
+            }
+        },
+    }
+    Ok(())
 }
 
 /// Convert a CRDT `ProviderAccessPolicy` to an operator `AccessPolicy` for evaluation.
@@ -1454,6 +1625,7 @@ fn collect_candidates(
     sites: &[GridSite],
     providers: &[InferenceProvider],
     consumer_site_labels: Option<&BTreeMap<String, String>>,
+    signal_origin_site: &str,
 ) -> Result<Vec<RoutingCandidate>, String> {
     // Pre-filter sites to those in this network.
     let network_sites: Vec<&GridSite> = sites
@@ -1476,7 +1648,7 @@ fn collect_candidates(
         }
 
         let resolution = resolve_sites(provider, &network_sites);
-        all.extend(candidates_from_provider(provider, &resolution)?);
+        all.extend(candidates_from_provider(provider, &resolution, signal_origin_site)?);
     }
     Ok(all)
 }
@@ -1531,6 +1703,7 @@ fn resolve_sites(provider: &InferenceProvider, network_sites: &[&GridSite]) -> S
 fn candidates_from_provider(
     provider: &InferenceProvider,
     site_resolution: &SiteResolution,
+    signal_origin_site: &str,
 ) -> Result<Vec<RoutingCandidate>, String> {
     let provider_name = provider
         .metadata
@@ -1575,6 +1748,7 @@ fn candidates_from_provider(
                 name: model.name.clone(),
                 site: (*site).to_owned(),
                 cluster: cluster.to_owned(),
+                signal_origin_site: Some(signal_origin_site.to_owned()),
                 fresh,
                 credential: credential.clone(),
                 stable_id: None,
@@ -1815,6 +1989,27 @@ mod tests {
         .unwrap_or_else(|_| std::process::abort())
     }
 
+    fn test_pressure_weighted_network(name: &str) -> GridNetwork {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "kind": "GridNetwork",
+            "metadata": { "name": name },
+            "spec": {
+                "seeds": [],
+                "signalTransport": { "mode": "poll" },
+                "selectionPolicy": { "mode": "weightedRandom" },
+                "placementPolicy": {
+                    "strategy": "pressureWeighted",
+                    "pressureWeighted": {
+                        "signal": "queueDepth",
+                        "smoothingFactor": 1.0
+                    }
+                }
+            }
+        }))
+        .unwrap_or_else(|_| std::process::abort())
+    }
+
     #[expect(
         clippy::too_many_arguments,
         reason = "Test fixture mirrors all grouping dimensions explicitly."
@@ -1833,6 +2028,7 @@ mod tests {
             name: name.to_owned(),
             site: site.to_owned(),
             cluster: cluster.to_owned(),
+            signal_origin_site: None,
             fresh,
             credential: None,
             stable_id: None,
@@ -2065,6 +2261,109 @@ mod tests {
                 ("provider-b", Some(100)),
                 ("provider-c", Some(1_000))
             ]
+        );
+    }
+
+    #[test]
+    fn pressure_weighted_overlay_joins_local_and_peer_signals_by_origin_and_identity() {
+        let network = test_pressure_weighted_network("net");
+        let mut local = test_provider("provider-a", "net", &["model"]);
+        local.spec.capacity_weight = Some(2);
+        let peer = make_crdt_provider("site-b", "provider-b", crdt::ProviderPhase::Available, &["model"]);
+        let providers = [local];
+        let peers = [peer];
+        let mut signals = HashMap::new();
+        signals.insert(
+            SignalKey {
+                site: "site-a".to_owned(),
+                provider: "provider-a".to_owned(),
+            },
+            0.5,
+        );
+        signals.insert(
+            SignalKey {
+                site: "site-b".to_owned(),
+                provider: "provider-b".to_owned(),
+            },
+            0.0,
+        );
+        let mut state = PlacementState::default();
+        let render = |signal_values: &HashMap<SignalKey, f64>, placement_state: &mut PlacementState| {
+            render_routing_overlay_with_pressure(
+                &network,
+                &[],
+                &providers,
+                &peers,
+                "consumer-site",
+                None,
+                None,
+                &scoring::ScoringWeights::default(),
+                None,
+                signal_values,
+                "site-a",
+                placement_state,
+            )
+        };
+
+        let baseline = render(&signals, &mut state).unwrap();
+        let baseline_weights: HashMap<&str, u32> = baseline
+            .candidates
+            .iter()
+            .map(|candidate| (candidate.cluster.as_str(), candidate.traffic_weight.unwrap()))
+            .collect();
+        assert_eq!(baseline_weights["provider-a"], 500);
+        assert_eq!(baseline_weights["provider-b"], 500);
+
+        signals.insert(
+            SignalKey {
+                site: "site-a".to_owned(),
+                provider: "provider-a".to_owned(),
+            },
+            1.0,
+        );
+        let pressure = render(&signals, &mut state).unwrap();
+        let pressure_weights: HashMap<&str, u32> = pressure
+            .candidates
+            .iter()
+            .map(|candidate| (candidate.cluster.as_str(), candidate.traffic_weight.unwrap()))
+            .collect();
+        assert!(pressure_weights["provider-a"] < baseline_weights["provider-a"]);
+        assert!(pressure_weights["provider-b"] > baseline_weights["provider-b"]);
+        assert_eq!(pressure_weights["provider-a"] + pressure_weights["provider-b"], 1000);
+        let serialized = serde_json::to_string(&pressure).unwrap();
+        assert!(serialized.contains("\"traffic_weight\""));
+        assert!(!serialized.contains("signal_origin_site"));
+    }
+
+    #[test]
+    fn pressure_weighted_overlay_rejects_missing_or_wrong_origin_signal() {
+        let network = test_pressure_weighted_network("net");
+        let local = test_provider("provider-a", "net", &["model"]);
+        let mut wrong_site = HashMap::new();
+        wrong_site.insert(
+            SignalKey {
+                site: "another-site".to_owned(),
+                provider: "provider-a".to_owned(),
+            },
+            0.0,
+        );
+        let result = render_routing_overlay_with_pressure(
+            &network,
+            &[],
+            &[local],
+            &[],
+            "consumer-site",
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+            None,
+            &wrong_site,
+            "site-a",
+            &mut PlacementState::default(),
+        );
+        assert!(
+            result.is_err(),
+            "a signal from another origin must not be joined to this provider"
         );
     }
 
