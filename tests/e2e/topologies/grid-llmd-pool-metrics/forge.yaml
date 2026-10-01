@@ -489,6 +489,9 @@ spec:
               configMapName: "consumer-gateway-config"
             service:
               type: "LoadBalancer"
+            grid:
+              networkName: "grid-llmd-pool-metrics"
+              siteName: "{{ cluster.name }}"
             overlay:
               configMapName: "grid-overlay-grid-llmd-pool-metrics-consumer-gateway"
               sidecar:
@@ -497,8 +500,6 @@ spec:
                   repository: "ghcr.io/praxis-proxy/grid-overlay-sync"
                   tag: "v0.1.4"
                   pullPolicy: "IfNotPresent"
-                expectedNetwork: "grid-llmd-pool-metrics"
-                expectedLocalSite: "{{ cluster.name }}"
             gridIdentity:
               secretName: "consumer-gateway-tls"
             podLabels:

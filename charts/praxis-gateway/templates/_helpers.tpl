@@ -95,6 +95,9 @@ praxisConfig.source picks who writes praxis.yaml:
 {{- if not (trim (toString .Values.praxisConfig.render.model)) }}
 {{- fail "praxisConfig.render.model is required when praxisConfig.source is render, and cannot be blank" }}
 {{- end }}
+{{- if not (trim (toString .Values.grid.siteName)) }}
+{{- fail "grid.siteName is required when praxisConfig.source is render, and cannot be blank: it is written as local_site in praxis.yaml" }}
+{{- end }}
 {{- if not .Values.praxisConfig.render.backends }}
 {{- fail "praxisConfig.render.backends needs at least one backend when praxisConfig.source is render" }}
 {{- end }}
@@ -168,11 +171,11 @@ carry a sni.
 Validate enabled mounts have a non-empty resource name.
 */}}
 {{- define "praxis-gateway.validateMounts" -}}
-{{- if and .Values.overlay.configMapName .Values.overlay.sidecar.enabled (not .Values.overlay.sidecar.expectedNetwork) }}
-{{- fail "overlay.sidecar.expectedNetwork is required when overlay sidecar is enabled" }}
+{{- if and .Values.overlay.configMapName .Values.overlay.sidecar.enabled (not .Values.grid.networkName) }}
+{{- fail "grid.networkName is required when overlay.sidecar.enabled is true: the sidecar checks the overlay belongs to this GridNetwork" }}
 {{- end }}
-{{- if and .Values.overlay.configMapName .Values.overlay.sidecar.enabled (not .Values.overlay.sidecar.expectedLocalSite) }}
-{{- fail "overlay.sidecar.expectedLocalSite is required when overlay sidecar is enabled" }}
+{{- if and .Values.overlay.configMapName .Values.overlay.sidecar.enabled (not .Values.grid.siteName) }}
+{{- fail "grid.siteName is required when overlay.sidecar.enabled is true: the sidecar checks the overlay belongs to this site" }}
 {{- end }}
 {{- /*
 The operator's praxis.yaml has no listener TLS and no upstream_ca_file, so these

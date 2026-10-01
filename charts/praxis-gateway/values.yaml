@@ -43,6 +43,16 @@ args:
 # -- credentials and other deployment-managed secrets.
 env: []
 
+# -- Which GridNetwork and site this gateway belongs to.
+grid:
+  # -- GridNetwork name. Used only by the overlay sidecar: it refuses an overlay
+  # written for another GridNetwork. Required when overlay.sidecar.enabled.
+  networkName: ""
+  # -- This gateway's site name. Used by render (local_site in praxis.yaml) and by
+  # the overlay sidecar (it refuses an overlay written for another site).
+  # Required when praxisConfig.source is render or overlay.sidecar.enabled.
+  siteName: ""
+
 # -- Praxis configuration (praxis.yaml).
 praxisConfig:
   # -- Who writes praxis.yaml:
@@ -64,8 +74,6 @@ praxisConfig:
   # emits praxis.yaml + policy.yaml (the auth chain) and never emits insecure_options;
   # endpoints are values.
   render:
-    # -- Local site name for intelligent_route locality scoring.
-    localSite: "hub"
     # -- Model advertised on the routing candidates.
     model: ""
     auth:
@@ -250,10 +258,6 @@ overlay:
       pullPolicy: IfNotPresent
     # -- ConfigMap data key containing the overlay envelope.
     dataKey: "routing-overlay.json"
-    # -- Expected GridNetwork name for scope validation.
-    expectedNetwork: ""
-    # -- Expected local site name for scope validation.
-    expectedLocalSite: ""
     # -- Sidecar resource requests and limits.
     resources:
       requests:

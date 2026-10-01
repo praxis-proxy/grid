@@ -50,10 +50,10 @@ data:
             header: X-Gateway-Model-Name
           - filter: intelligent_route
             model_header: X-Gateway-Model-Name
-            local_site: {{ $cfg.localSite | quote }}
+            local_site: {{ $.Values.grid.siteName | quote }}
             candidates:
               {{- range $cfg.backends }}
-              - { kind: inference_model, name: {{ $cfg.model | quote }}, site: {{ $cfg.localSite | quote }}, cluster: {{ .cluster | quote }} }
+              - { kind: inference_model, name: {{ $cfg.model | quote }}, site: {{ $.Values.grid.siteName | quote }}, cluster: {{ .cluster | quote }} }
               {{- end }}
           - filter: load_balancer
             clusters:

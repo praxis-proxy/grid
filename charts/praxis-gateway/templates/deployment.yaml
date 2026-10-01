@@ -64,11 +64,11 @@ spec:
             - "--output"
             - {{ printf "%s/%s" .Values.overlay.mountPath .Values.overlay.sidecar.dataKey | quote }}
             - "--expected-network"
-            - {{ .Values.overlay.sidecar.expectedNetwork | quote }}
+            - {{ .Values.grid.networkName | quote }}
             - "--expected-gateway"
             - {{ include "praxis-gateway.fullname" . | quote }}
             - "--expected-local-site"
-            - {{ .Values.overlay.sidecar.expectedLocalSite | quote }}
+            - {{ .Values.grid.siteName | quote }}
             - "--once"
           securityContext:
             runAsNonRoot: true
@@ -104,11 +104,11 @@ spec:
             - "--output"
             - {{ printf "%s/%s" .Values.overlay.mountPath .Values.overlay.sidecar.dataKey | quote }}
             - "--expected-network"
-            - {{ .Values.overlay.sidecar.expectedNetwork | quote }}
+            - {{ .Values.grid.networkName | quote }}
             - "--expected-gateway"
             - {{ include "praxis-gateway.fullname" . | quote }}
             - "--expected-local-site"
-            - {{ .Values.overlay.sidecar.expectedLocalSite | quote }}
+            - {{ .Values.grid.siteName | quote }}
             - "--health-addr"
             - "0.0.0.0:9091"
           securityContext:

@@ -708,6 +708,9 @@ spec:
                     name: valkey-auth
                     key: url
             service: { type: LoadBalancer }
+            grid:
+              networkName: "grid-token-rate-limit"
+              siteName: "{{ cluster.name }}"
             overlay:
               configMapName: "grid-overlay-grid-token-rate-limit-consumer-gateway-a"
               sidecar:
@@ -716,8 +719,6 @@ spec:
                   repository: "{{ cluster.properties.overlaySyncImageRepo }}"
                   tag: "{{ cluster.properties.overlaySyncImageTag }}"
                   pullPolicy: "{{ cluster.properties.imagePullPolicy }}"
-                expectedNetwork: "grid-token-rate-limit"
-                expectedLocalSite: "{{ cluster.name }}"
             gridIdentity:
               secretName: consumer-gateway-tls
             podLabels:
@@ -771,6 +772,9 @@ spec:
                     name: valkey-auth
                     key: url
             service: { type: LoadBalancer }
+            grid:
+              networkName: "grid-token-rate-limit"
+              siteName: "{{ cluster.name }}"
             overlay:
               configMapName: "grid-overlay-grid-token-rate-limit-consumer-gateway-b"
               sidecar:
@@ -779,8 +783,6 @@ spec:
                   repository: "{{ cluster.properties.overlaySyncImageRepo }}"
                   tag: "{{ cluster.properties.overlaySyncImageTag }}"
                   pullPolicy: "{{ cluster.properties.imagePullPolicy }}"
-                expectedNetwork: "grid-token-rate-limit"
-                expectedLocalSite: "{{ cluster.name }}"
             gridIdentity:
               secretName: consumer-gateway-tls
             podLabels:

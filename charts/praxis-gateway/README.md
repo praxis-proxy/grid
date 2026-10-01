@@ -117,6 +117,8 @@ of the gateway.
 #### render: this chart writes praxis.yaml
 
 ```yaml
+grid:
+  siteName: us-east
 praxisConfig:
   source: render
   render:
@@ -128,7 +130,7 @@ praxisConfig:
         endpoints: ["10.0.0.5:8000"]
 ```
 
-`model`, `auth.mode` and at least one backend are required. `auth.mode: none`
+`grid.siteName`, `model`, `auth.mode` and at least one backend are required. `auth.mode: none`
 has no caller authentication, so use it only behind an authenticating front. Use
 `api-key` with `auth.validateUrl` to check caller keys.
 
@@ -166,13 +168,14 @@ AI image; these values may advance independently.
 | `podAnnotations` | object | `{}` | Pod annotations. |
 | `podSecurityContext` | object | `{}` | Extra pod securityContext (`runAsUser`, `runAsGroup`, `fsGroup`, `supplementalGroups`). |
 | `args` | list | `["--config", "/etc/praxis/praxis.yaml"]` | Container arguments. |
+| `grid.networkName` | string | `""` | GridNetwork name. Used only by the overlay sidecar, which refuses an overlay written for another GridNetwork. Required when `overlay.sidecar.enabled`. Must match the GridNetwork CR name. |
+| `grid.siteName` | string | `""` | This gateway's site. Used by `render` (written as `local_site`) and by the overlay sidecar (refuses an overlay written for another site). Required with `source: render` or `overlay.sidecar.enabled`. |
 | `praxisConfig.source` | string | `byo` | Who writes praxis.yaml: `byo` (you create the ConfigMap), `operator` (the Grid operator creates it from a GridNetwork `gatewayRef` with `consumerConfig.enabled`), or `render` (this chart creates it from `praxisConfig.render`). |
 | `praxisConfig.configMapName` | string | **required** for `byo`; `praxis-consumer-config` for `operator` | Name of the ConfigMap with praxis.yaml. For `operator`, must match the `configMapName` in the GridNetwork. Not used with `render`. |
 | `praxisConfig.key` | string | `praxis.yaml` | Key in the ConfigMap, for `byo` only. `operator` always uses `praxis.yaml`. |
 | `praxisConfig.render.model` | string | **required** when rendered | Model advertised on the routing candidates. |
 | `praxisConfig.render.backends` | list | **required** when rendered | Backend clusters (`cluster`, `endpoints`, `healthCheck`, `transport`). |
 | `praxisConfig.render.backends[].transport` | object | `mutual_tls` with `gridIdentity.secretName`, else `plaintext` | `mode`: `mutual_tls` presents the grid identity, `tls` verifies the server cert with no client cert, `plaintext` is cleartext. `sni` names the peer cert (required for `mutual_tls` and for `tls` to an IP endpoint). `ca` (`configMapName` or `secretName`, `key`) is the CA for a `tls` backend. A `tls` backend trusts, first match wins: `transport.ca`, then `upstreamCA`, then the process store, which is the `auth.validateCA` bundle when that is set. |
-| `praxisConfig.render.localSite` | string | `hub` | Local site for locality scoring. |
 | `praxisConfig.render.auth.mode` | string | **required** when rendered | `api-key` validates the caller's key and needs an image that registers `identity/api-key` (praxis-policy 0.4 or later); the render refuses it on the default `ai:0.4.0` image (by effective reference; a digest pin of that same image is not detected). `none` renders no policy filter, for use only behind an authenticating front. |
 | `praxisConfig.render.auth.allowUnauthenticatedExposure` | bool | `false` | With `none`, allow a LoadBalancer or NodePort Service. Without it the render fails. The guard sees only this chart's Service, not `oc expose`, another Service selecting the pod labels, an HTTPRoute, or a hand-made Service with `service.enabled=false`. Use `networkPolicy` for those. |
 | `praxisConfig.render.auth.stripAuthorization` | bool | `true` | Remove the caller's `Authorization` before routing, in either mode. Forwarded grid hops authenticate by mTLS identity. `false` forwards the caller's key or bearer to every backend and cross-site peer, so use it only when the backend validates that same credential. |
@@ -199,8 +202,6 @@ AI image; these values may advance independently.
 | `overlay.sidecar.image.tag` | string | `latest` | Overlay-sync image tag. Use an immutable published tag for reproducible deployments. |
 | `overlay.sidecar.image.pullPolicy` | string | `IfNotPresent` | Overlay-sync image pull policy. |
 | `overlay.sidecar.dataKey` | string | `routing-overlay.json` | Content-addressed envelope key in the overlay ConfigMap. |
-| `overlay.sidecar.expectedNetwork` | string | `""` | Required GridNetwork scope when the sidecar is enabled. |
-| `overlay.sidecar.expectedLocalSite` | string | `""` | Required local-site scope when the sidecar is enabled. |
 | `overlay.sidecar.resources` | object | small requests and limits | Resources for both the one-shot init container and continuous sidecar. |
 | `gridIdentity.secretName` | string | `""` | Grid identity Secret (`tls.crt`, `tls.key`, `ca.crt`) for mTLS to backends and peers. Set it to turn the grid identity on; empty (the default) turns it off. You create the Secret. Works with every `praxisConfig.source`. `operator`: each GridNetwork `consumerConfig.clusterEndpoints[].transport.mode` picks `MutualTls` (uses this mount) or `Plaintext`. `byo`: your praxis.yaml decides; point its cluster `tls` block at `gridIdentity.mountPath`. `render`: each `render.backends[].transport.mode` picks `mutual_tls`, `tls` or `plaintext`; with no mode, `mutual_tls` when `secretName` is set, else `plaintext`. |
 | `gridIdentity.mountPath` | string | `/etc/praxis/tls` | Mount path for TLS files. |
@@ -295,6 +296,9 @@ AGN Operator updates ConfigMap
 Example values:
 
 ```yaml
+grid:
+  networkName: production
+  siteName: us-east-edge
 overlay:
   configMapName: grid-overlay-production-consumer-gateway
   mountPath: /etc/praxis/routing
@@ -305,8 +309,6 @@ overlay:
       tag: <version>
       pullPolicy: IfNotPresent
     dataKey: routing-overlay.json
-    expectedNetwork: production
-    expectedLocalSite: us-east-edge
 ```
 
 When enabled, the chart creates:

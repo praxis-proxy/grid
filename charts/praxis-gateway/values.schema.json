@@ -151,6 +151,15 @@
       },
       "description": "Environment variables passed to the Praxis container."
     },
+    "grid": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Which GridNetwork and site this gateway belongs to.",
+      "properties": {
+        "networkName": { "type": "string", "description": "GridNetwork name. Used only by the overlay sidecar scope check." },
+        "siteName": { "type": "string", "maxLength": 256, "description": "Site name. Used by render (local_site) and the overlay sidecar scope check." }
+      }
+    },
     "praxisConfig": {
       "type": "object",
       "additionalProperties": false,
@@ -175,7 +184,6 @@
           "additionalProperties": false,
           "description": "Secure-by-default rendered gateway config (praxis.yaml + policy.yaml), used when source is render. Never emits insecure_options.",
           "properties": {
-            "localSite": { "type": "string", "pattern": "\\S", "maxLength": 256, "description": "Non-blank, at most 256 characters." },
             "model": { "type": "string" },
             "auth": {
               "type": "object",
@@ -371,14 +379,6 @@
             "dataKey": {
               "type": "string",
               "description": "ConfigMap data key containing the overlay envelope."
-            },
-            "expectedNetwork": {
-              "type": "string",
-              "description": "Expected GridNetwork name for scope validation."
-            },
-            "expectedLocalSite": {
-              "type": "string",
-              "description": "Expected local site name for scope validation."
             },
             "resources": {
               "type": "object",
