@@ -112,16 +112,6 @@ praxisConfig:
       prefix: "Bearer "
       # -- Validate call timeout (seconds).
       timeoutSecs: 5
-    # -- CA bundle for backend TLS without a per-cluster CA. Sets praxis upstream_ca_file,
-    # which replaces the system trust store for proxied upstreams. It does not apply to the
-    # api-key validate call; use auth.validateCA for that.
-    upstreamCA:
-      # -- Existing Secret holding the CA bundle. Empty keeps the system trust store.
-      secretName: ""
-      # -- Key within the Secret that holds the PEM bundle.
-      key: "ca.crt"
-      # -- Mount path for the CA bundle.
-      mountPath: "/etc/praxis/upstream-ca"
     # -- Backend clusters. Each renders a health_check so a literal ClusterIP routes without
     # allow_private_upstreams, plus an explicit transport. A backend omitting transport
     # defaults to mutual_tls when the grid identity is mounted (tls.enabled), else plaintext.
@@ -148,20 +138,49 @@ praxisConfig:
     #      sni: qwen3-kserve-workload-svc.llm.svc
     #      ca: { configMap: openshift-service-ca.crt, key: service-ca.crt }
 
-# -- Inbound TLS on the gateway listener. The default posture assumes an inbound TLS
-# front (an OpenShift Route or a Gateway) terminates TLS and forwards to this plaintext
-# listener. Enable to terminate TLS at the gateway itself from a mounted server cert
-# (tls.crt/tls.key in the Secret). Works with praxisConfig.source render and byo. A byo
-# config must reference mountPath (a BYO config moving off tls.enabled must change its
-# listener cert paths to it). Not supported with source operator: the operator's
-# praxis.yaml has no listener TLS, so the install fails. Enabling it names the container port https. On OpenShift, set
-# service.annotations service.beta.openshift.io/serving-cert-secret-name to the Secret
-# name and the service CA issues the cert.
+# -- CA bundle the gateway uses to verify backend TLS certs (outbound), for backends
+# without a per-cluster CA. Empty secretName keeps the system trust store. It replaces
+# the system trust store for proxied upstreams, and does not apply to the api-key
+# validate call (use praxisConfig.render.auth.validateCA for that).
+#   render:   create the Secret and set secretName. The chart mounts it and writes
+#             upstream_ca_file into praxis.yaml.
+#   byo:      you must do all three:
+#             1. create the Secret, with the PEM bundle under `key`:
+#                kubectl create secret generic my-ca --from-file=ca.crt=./ca.crt
+#             2. set secretName: my-ca. The chart mounts it at mountPath.
+#             3. in your praxis.yaml, set
+#                runtime.upstream_ca_file: /etc/praxis/upstream-ca/ca.crt
+#                (mountPath/key). Without this the mount is not used.
+#   operator: not supported. Setting secretName fails the install.
+upstreamCA:
+  # -- Existing Secret holding the CA bundle. The chart does not create it.
+  secretName: ""
+  # -- Key within the Secret that holds the PEM bundle.
+  key: "ca.crt"
+  # -- Mount path for the CA bundle.
+  mountPath: "/etc/praxis/upstream-ca"
+
+# -- Server cert for TLS on the gateway listener (inbound). Empty secretName keeps a
+# plaintext listener, for when an inbound TLS front (an OpenShift Route or a Gateway)
+# terminates TLS. Setting secretName also names the container port https; the probes
+# and Service follow it.
+#   render:   create the Secret and set secretName. The chart mounts it and writes
+#             the listener cert paths into praxis.yaml.
+#   byo:      you must do all three:
+#             1. create the Secret, with tls.crt and tls.key:
+#                kubectl create secret tls my-listener-cert --cert=tls.crt --key=tls.key
+#             2. set secretName: my-listener-cert. The chart mounts it at mountPath.
+#             3. in your praxis.yaml, give the listener a tls block with
+#                cert_path: /etc/praxis/listener-tls/tls.crt
+#                key_path:  /etc/praxis/listener-tls/tls.key
+#                Without this the gateway serves plaintext on the https port.
+#   operator: not supported. Setting secretName fails the install.
+# On OpenShift, the service CA can issue the cert: set service.annotations
+# service.beta.openshift.io/serving-cert-secret-name to the Secret name.
 listenerTls:
-  # -- Terminate TLS at the gateway listener instead of at an inbound front.
-  enabled: false
   # -- Existing Secret holding the server certificate (tls.crt) and key (tls.key).
-  existingSecret: ""
+  # The chart does not create it.
+  secretName: ""
   # -- Mount path for the listener certificate.
   mountPath: "/etc/praxis/listener-tls"
 
@@ -169,7 +188,7 @@ listenerTls:
 port:
   # -- Container port number.
   containerPort: 8080
-  # -- Port name. Empty: https when listenerTls.enabled, else http.
+  # -- Port name. Empty: https when listenerTls.secretName is set, else http.
   name: ""
   # -- Port protocol.
   protocol: "TCP"

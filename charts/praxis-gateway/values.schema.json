@@ -201,16 +201,6 @@
                 "timeoutSecs": { "type": "integer" }
               }
             },
-            "upstreamCA": {
-              "type": "object",
-              "additionalProperties": false,
-              "description": "CA bundle for backend TLS without a per-cluster CA. Sets praxis upstream_ca_file; the api-key validate call uses the platform trust store.",
-              "properties": {
-                "secretName": { "type": "string" },
-                "key": { "type": "string" },
-                "mountPath": { "type": "string" }
-              }
-            },
             "backends": {
               "type": "array",
               "items": {
@@ -265,13 +255,22 @@
         }
       }
     },
+    "upstreamCA": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "CA bundle for backend TLS (outbound). Set secretName to turn it on. render and byo; not operator.",
+      "properties": {
+        "secretName": { "type": "string" },
+        "key": { "type": "string" },
+        "mountPath": { "type": "string" }
+      }
+    },
     "listenerTls": {
       "type": "object",
       "additionalProperties": false,
-      "description": "Optional inbound TLS on the gateway listener. Default posture assumes an inbound TLS front terminates TLS.",
+      "description": "Server cert for TLS on the gateway listener (inbound). Set secretName to turn it on. render and byo; not operator.",
       "properties": {
-        "enabled": { "type": "boolean" },
-        "existingSecret": { "type": "string" },
+        "secretName": { "type": "string" },
         "mountPath": { "type": "string" }
       }
     },
@@ -287,7 +286,7 @@
         },
         "name": {
           "type": "string",
-          "description": "Port name. Empty: https when listenerTls.enabled, else http."
+          "description": "Port name. Empty: https when listenerTls.secretName is set, else http."
         },
         "protocol": {
           "type": "string",

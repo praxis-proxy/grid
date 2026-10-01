@@ -58,17 +58,20 @@ praxisConfig:
 Set `praxisConfig.key` only when your ConfigMap uses a key other than
 `praxis.yaml`.
 
-To terminate TLS at the gateway, mount the server cert and point your listener
-at it:
+To terminate TLS at the gateway, or to trust a private CA for backend TLS, the
+chart mounts the Secrets and your praxis.yaml points at the files:
 
 ```yaml
 listenerTls:
-  enabled: true
-  existingSecret: my-listener-cert   # Secret with tls.crt and tls.key
+  secretName: my-listener-cert   # Secret with tls.crt and tls.key
+upstreamCA:
+  secretName: my-ca              # Secret with ca.crt
 ```
 
 ```yaml
 # in your praxis.yaml
+runtime:
+  upstream_ca_file: /etc/praxis/upstream-ca/ca.crt
 listeners:
   - name: gateway
     address: "0.0.0.0:8080"
@@ -107,8 +110,9 @@ Every provider cluster the gateway routes to also needs a
 `consumerConfig.clusterEndpoints` entry, or the operator does not write the
 ConfigMap.
 
-Listener TLS is not supported in this mode. Terminate TLS in front of the
-gateway.
+`listenerTls` and `upstreamCA` are not supported in this mode: the install
+fails, because the operator's praxis.yaml uses neither. Terminate TLS in front
+of the gateway.
 
 #### render: this chart writes praxis.yaml
 
@@ -177,10 +181,10 @@ AI image; these values may advance independently.
 | `praxisConfig.render.auth.validateCA` | object | empty | CA for the validate call (`configMap` or `secret`, `key`). Set as `SSL_CERT_FILE`, which replaces the platform trust store for the validate call and https backends without a per-backend CA or `upstreamCA`. mutual_tls backends and `upstreamCA` are unaffected. See the recipe below. |
 | `networkPolicy.enabled` | bool | `false` | Render a NetworkPolicy that limits which pods can reach the listener port, where the CNI enforces NetworkPolicy. It is not authentication. Node and host-network traffic handling is CNI-specific (OVN-Kubernetes: the `policy-group.network.openshift.io/host-network` label), and a LoadBalancer with `externalTrafficPolicy: Cluster` can SNAT clients to node IPs. |
 | `networkPolicy.from` | list | `[]` | NetworkPolicyPeer entries allowed in. Required when enabled. With `auth.mode: none`, list only the authenticating front. `{podSelector: {}}` admits every pod in this namespace. An empty `namespaceSelector` and an `ipBlock` of `0.0.0.0/0` or `::/0` admit everyone and fail the render. An all-address `ipBlock` with `except` entries is allowed. The check reads selector emptiness and the cidr only, so `matchExpressions` that happen to select every pod pass. A provider gateway behind a LoadBalancer that SNATs clients to node IPs needs `ipBlock` peers for those node addresses. |
-| `praxisConfig.render.upstreamCA.secretName` | string | `""` | CA bundle for backend TLS without a per-cluster CA (`upstream_ca_file`). |
-| `listenerTls.enabled` | bool | `false` | Terminate TLS at the listener from `existingSecret`, in render or BYO mode. Not supported with `operator`: the install fails, since the operator's praxis.yaml has no listener TLS. Names the port `https`. The cert mounts at `listenerTls.mountPath` (`/etc/praxis/listener-tls`), so a BYO config moving off `tls.enabled` must point its listener `cert_path`/`key_path` there. On OpenShift, annotate the Service with `service.beta.openshift.io/serving-cert-secret-name`. |
+| `listenerTls.secretName` | string | `""` | Server cert Secret (`tls.crt`, `tls.key`) for TLS on the listener. Set it to turn listener TLS on. Works with `render` and `byo`; `render` writes the listener cert paths, a byo config must point its listener `cert_path`/`key_path` at `listenerTls.mountPath` (`/etc/praxis/listener-tls`). Names the port `https`. Not supported with `operator`: the install fails. On OpenShift, annotate the Service with `service.beta.openshift.io/serving-cert-secret-name`. |
+| `upstreamCA.secretName` | string | `""` | CA bundle Secret for backend TLS without a per-cluster CA. Set it to turn it on. Works with `render` and `byo`; `render` writes `upstream_ca_file`, a byo config must set `runtime.upstream_ca_file` to `upstreamCA.mountPath`/`upstreamCA.key` (`/etc/praxis/upstream-ca/ca.crt`). Not supported with `operator`: the install fails. |
 | `port.containerPort` | int | `8080` | Container port. |
-| `port.name` | string | `""` | Port name. Empty: `https` with `listenerTls.enabled`, else `http`. |
+| `port.name` | string | `""` | Port name. Empty: `https` when `listenerTls.secretName` is set, else `http`. |
 | `port.protocol` | string | `TCP` | Port protocol. |
 | `service.enabled` | bool | `true` | Create a Service. |
 | `service.type` | string | `ClusterIP` | Service type. |

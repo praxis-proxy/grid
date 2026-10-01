@@ -197,9 +197,9 @@ spec:
               mountPath: {{ .Values.tls.mountPath | quote }}
               readOnly: true
             {{- end }}
-            {{- if and (eq .Values.praxisConfig.source "render") .Values.praxisConfig.render.upstreamCA.secretName }}
+            {{- if .Values.upstreamCA.secretName }}
             - name: upstream-ca
-              mountPath: {{ .Values.praxisConfig.render.upstreamCA.mountPath | quote }}
+              mountPath: {{ .Values.upstreamCA.mountPath | quote }}
               readOnly: true
             {{- end }}
             {{- if eq .Values.praxisConfig.source "render" }}
@@ -211,7 +211,7 @@ spec:
             {{- end }}
             {{- end }}
             {{- end }}
-            {{- if .Values.listenerTls.enabled }}
+            {{- if .Values.listenerTls.secretName }}
             - name: listener-tls
               mountPath: {{ .Values.listenerTls.mountPath | quote }}
               readOnly: true
@@ -281,10 +281,10 @@ spec:
           secret:
             secretName: {{ .Values.tls.existingSecret | quote }}
         {{- end }}
-        {{- if and (eq .Values.praxisConfig.source "render") .Values.praxisConfig.render.upstreamCA.secretName }}
+        {{- if .Values.upstreamCA.secretName }}
         - name: upstream-ca
           secret:
-            secretName: {{ .Values.praxisConfig.render.upstreamCA.secretName | quote }}
+            secretName: {{ .Values.upstreamCA.secretName | quote }}
         {{- end }}
         {{- if eq .Values.praxisConfig.source "render" }}
         {{- range $i, $backend := .Values.praxisConfig.render.backends }}
@@ -311,10 +311,10 @@ spec:
           secret:
             secretName: {{ $validateCA.secret | quote }}
         {{- end }}
-        {{- if .Values.listenerTls.enabled }}
+        {{- if .Values.listenerTls.secretName }}
         - name: listener-tls
           secret:
-            secretName: {{ .Values.listenerTls.existingSecret | quote }}
+            secretName: {{ .Values.listenerTls.secretName | quote }}
         {{- end }}
         {{- range .Values.credentials }}
         - name: credential-{{ .name }}

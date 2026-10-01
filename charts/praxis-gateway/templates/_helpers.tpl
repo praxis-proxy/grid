@@ -180,12 +180,17 @@ Validate enabled mounts have a non-empty resource name.
 {{- if and .Values.tls.enabled (not .Values.tls.existingSecret) }}
 {{- fail "tls.existingSecret is required when tls.enabled is true" }}
 {{- end }}
-{{- if and .Values.listenerTls.enabled (not .Values.listenerTls.existingSecret) }}
-{{- fail "listenerTls.existingSecret is required when listenerTls.enabled is true" }}
+{{- /*
+The operator's praxis.yaml has no listener TLS and no upstream_ca_file, so these
+mounts would do nothing. Fail instead of serving plaintext on an https port.
+*/}}
+{{- if eq .Values.praxisConfig.source "operator" }}
+{{- if .Values.listenerTls.secretName }}
+{{- fail "listenerTls.secretName is not supported with praxisConfig.source operator: the Grid operator's praxis.yaml has no listener TLS. Terminate TLS in front of the gateway, or use source byo or render." }}
 {{- end }}
-{{- /* The operator's praxis.yaml has no listener TLS, so the listener would stay plaintext on an https port. */}}
-{{- if and .Values.listenerTls.enabled (eq .Values.praxisConfig.source "operator") }}
-{{- fail "listenerTls.enabled is not supported with praxisConfig.source operator: the Grid operator's praxis.yaml has no listener TLS. Terminate TLS in front of the gateway, or use source byo or render." }}
+{{- if .Values.upstreamCA.secretName }}
+{{- fail "upstreamCA.secretName is not supported with praxisConfig.source operator: the Grid operator's praxis.yaml has no upstream_ca_file. Use source byo or render." }}
+{{- end }}
 {{- end }}
 {{- end }}
 
@@ -193,7 +198,7 @@ Validate enabled mounts have a non-empty resource name.
 Listener port name: port.name when set, else https when the listener terminates TLS.
 */}}
 {{- define "praxis-gateway.portName" -}}
-{{- .Values.port.name | default (ternary "https" "http" .Values.listenerTls.enabled) -}}
+{{- .Values.port.name | default (ternary "https" "http" (not (empty .Values.listenerTls.secretName))) -}}
 {{- end }}
 
 {{/*

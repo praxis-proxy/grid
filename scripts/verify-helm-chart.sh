@@ -460,9 +460,9 @@ SECURE_ARGS=(
   --set praxisConfig.render.model=qwen3
   --set praxisConfig.render.auth.mode=api-key --set image.tag=verify-api-key
   --set praxisConfig.render.auth.validateUrl=https://maas-api.svc:8443/internal/v1/api-keys/validate
-  --set praxisConfig.render.upstreamCA.secretName=upstream-ca
+  --set upstreamCA.secretName=upstream-ca
   --set tls.enabled=true --set tls.existingSecret=grid-identity
-  --set listenerTls.enabled=true --set listenerTls.existingSecret=listener-cert
+  --set listenerTls.secretName=listener-cert
   --set "praxisConfig.render.backends[0].cluster=site-a"
   --set "praxisConfig.render.backends[0].endpoints[0]=172.30.202.42:8000"
   --set "praxisConfig.render.backends[0].transport.sni=site-a.grid.internal"
@@ -672,16 +672,26 @@ try_reject_msg "$GW_DIR" "tls backend: empty ca (gw)" "transport[./]ca.*oneOf" "
 try_reject_msg "$GW_DIR" "transport.ca outside tls (gw)" "transport/mode': value must be 'tls'|transport: Must validate \"then\"" "${TLS1[@]}" \
   --set "praxisConfig.render.backends[0].endpoints[0]=172.30.1.2:8000" --set "praxisConfig.render.backends[0].transport.mode=plaintext" \
   --set "praxisConfig.render.backends[0].transport.ca.configMap=a"
-try_reject_msg "$GW_DIR" "listenerTls enabled no secret (gw)" "listenerTls.existingSecret is required" "${GW_REQ[@]}" \
+try_reject_msg "$GW_DIR" "listenerTls.enabled is removed (gw)" "additional properties 'enabled' not allowed" "${GW_REQ[@]}" \
   --set listenerTls.enabled=true --namespace grid-system
-try_reject_msg "$GW_DIR" "listenerTls with source operator (gw)" "not supported with praxisConfig.source operator" \
-  --set praxisConfig.source=operator --set listenerTls.enabled=true --set listenerTls.existingSecret=l --namespace grid-system
+try_reject_msg "$GW_DIR" "listenerTls with source operator (gw)" "listenerTls.secretName is not supported with praxisConfig.source operator" \
+  --set praxisConfig.source=operator --set listenerTls.secretName=l --namespace grid-system
+try_reject_msg "$GW_DIR" "upstreamCA with source operator (gw)" "upstreamCA.secretName is not supported with praxisConfig.source operator" \
+  --set praxisConfig.source=operator --set upstreamCA.secretName=ca --namespace grid-system
+# byo mounts upstreamCA; the user's praxis.yaml points upstream_ca_file at it.
+BYO_CA=$(helm template v-byo-ca "$GW_DIR" "${GW_REQ[@]}" --set upstreamCA.secretName=my-ca --namespace grid-system 2>&1)
+if echo "$BYO_CA" | grep -A2 'name: upstream-ca' | grep -q 'secretName: "my-ca"' \
+    && echo "$BYO_CA" | grep -q 'mountPath: "/etc/praxis/upstream-ca"'; then
+  pass "upstreamCA (byo): Secret mounted at mountPath"
+else
+  fail "upstreamCA (byo): Secret should be mounted at mountPath"
+fi
 
 # listenerTls names the port https (render or BYO); probes follow the port name.
 for mode in render byo; do
   if [ "$mode" = render ]; then args=("${GW_RENDER[@]}"); else args=(--set praxisConfig.configMapName=byo); fi
-  out=$(helm template v-port "$GW_DIR" "${args[@]}" --set listenerTls.enabled=true \
-    --set listenerTls.existingSecret=l --namespace grid-system)
+  out=$(helm template v-port "$GW_DIR" "${args[@]}" --set listenerTls.secretName=l \
+    --namespace grid-system)
   if [ "$(echo "$out" | grep -cE 'name: https|port: https|targetPort: https')" = 5 ]; then
     pass "listenerTls ($mode): port, probes, and Service target https"
   else

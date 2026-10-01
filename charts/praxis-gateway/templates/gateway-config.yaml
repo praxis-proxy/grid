@@ -14,16 +14,16 @@ metadata:
     {{- include "praxis-gateway.labels" . | nindent 4 }}
 data:
   praxis.yaml: |
-    {{- with $cfg.upstreamCA.secretName }}
+    {{- with $.Values.upstreamCA.secretName }}
     runtime:
-      upstream_ca_file: {{ printf "%s/%s" $cfg.upstreamCA.mountPath ($cfg.upstreamCA.key | default "ca.crt") | quote }}
+      upstream_ca_file: {{ printf "%s/%s" $.Values.upstreamCA.mountPath ($.Values.upstreamCA.key | default "ca.crt") | quote }}
     {{- end }}
     admin:
       address: "127.0.0.1:9901"
     listeners:
       - name: gateway
         address: "0.0.0.0:{{ .Values.port.containerPort }}"
-        {{- if $.Values.listenerTls.enabled }}
+        {{- if $.Values.listenerTls.secretName }}
         tls:
           certificates:
             - cert_path: {{ printf "%s/tls.crt" $.Values.listenerTls.mountPath | quote }}
