@@ -118,12 +118,14 @@ Validate required config ConfigMap name.
 {{- else if not .Values.config.existingConfigMap }}
 {{- fail "config.existingConfigMap is required (or set gatewayConfig.render: true)" }}
 {{- else }}
-{{- /* In a live cluster, require the BYO ConfigMap; skip this for offline rendering. */}}
-{{- $liveCluster := lookup "v1" "Namespace" "" "kube-system" }}
-{{- if $liveCluster }}
-{{- $configMap := lookup "v1" "ConfigMap" .Release.Namespace .Values.config.existingConfigMap }}
-{{- if not $configMap }}
-{{- fail (printf "ConfigMap %q not found in namespace %q. Create it before installing grid-gateway." .Values.config.existingConfigMap .Release.Namespace) }}
+{{- /*
+In a live cluster, require the BYO ConfigMap; skip this for offline rendering.
+Look up the ConfigMap first, so an existing one needs only namespace access.
+Only when it is missing, the kube-system lookup tells a live cluster from helm template.
+*/}}
+{{- if not (lookup "v1" "ConfigMap" .Release.Namespace .Values.config.existingConfigMap) }}
+{{- if lookup "v1" "Namespace" "" "kube-system" }}
+{{- fail (printf "ConfigMap %q not found in namespace %q. Create it before installing praxis-gateway." .Values.config.existingConfigMap .Release.Namespace) }}
 {{- end }}
 {{- end }}
 {{- end }}
