@@ -34,5 +34,5 @@ port:
 
 service:
   enabled: true
-  type: ClusterIP
+  type: LoadBalancer
   port: 8443

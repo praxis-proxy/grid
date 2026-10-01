@@ -31,14 +31,15 @@ Each site has five values files:
 
 | File | Helm chart | Description |
 |------|-----------|-------------|
-| `<site>-operator.yaml` | `grid-operator` | SWIM identity, seeds, consumer gateway discovery |
+| `<site>-operator.yaml` | `grid-operator` | SWIM identity, seeds, provider gateway discovery |
 | `<site>-grid-site.yaml` | `grid-site` | GridNetwork, GridSite, InferenceProvider CRs |
 | `<site>-grid-mock-providers.yaml` | `grid-mock-providers` | Mock backends, Services, NetworkPolicy |
 | `<site>-consumer-gateway.yaml` | `praxis-gateway` | Consumer role, overlay, port 8080 |
 | `<site>-provider-gateway.yaml` | `praxis-gateway` | Provider role, credentials, port 8443 |
 
-The operator discovers the consumer gateway for routing overlay
-delivery. AGN topology CRs and mock inference backends are
+The operator discovers and advertises the provider gateway for remote
+sites. GridNetwork gateway references identify the consumer gateway for
+routing overlay delivery. AGN topology CRs and mock inference backends are
 managed by their own Helm releases for lifecycle independence.
 
 ## Installation

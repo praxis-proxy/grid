@@ -20,5 +20,5 @@ swim:
     port: 7946
 
 gateway:
-  serviceName: consumer-gateway
-  port: "8080"
+  serviceName: provider-gateway
+  port: "8443"

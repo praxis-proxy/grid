@@ -171,7 +171,7 @@ RELEASE=grid-operator; NAMESPACE=grid-system; for crd in agenttoolproviders grid
 | `signals.enabled` | bool | `false` | For signalTransport poll. Adds a TCP port named `signals` to the SWIM Service and points this site's gateway at it. Needs `swim.service.enabled`. A LoadBalancer must support mixed UDP and TCP ports. |
 | `signals.port` | int | `9091` | Signals port on the SWIM Service. Peers learn the LoadBalancer address and this port over gossip. |
 | `signals.advertiseAddress` | string | `""` | Signals endpoint gossiped to peers. Set it with `swim.advertiseAddress` or a NodePort Service, where the operator discovers no LoadBalancer address. |
-| `gateway.address` | string | `""` | Advertised gateway address override. Maps to `GRID_GATEWAY_ADDRESS`. |
+| `gateway.address` | string | `""` | Advertised provider gateway `host:port` override. Use it when the provider Service is not a LoadBalancer. Maps to `GRID_GATEWAY_ADDRESS`. |
 | `gateway.serviceName` | string | `""` | Provider gateway Service name the operator resolves and advertises to remote sites. Maps to `GRID_GATEWAY_SERVICE_NAME`. |
 | `gateway.namespace` | string | `""` | Namespace of the provider gateway Service. Empty uses the release namespace. Outside the resource namespaces, the operator gets only `get` on that one Service there. Maps to `GRID_GATEWAY_NAMESPACE`. |
 | `gateway.allowSystemNamespace` | bool | `false` | Allow `gateway.namespace` to be `default`, `kube-*`, or `openshift-*`. |
