@@ -36,6 +36,10 @@ helm install edge-gateway charts/praxis-gateway \
   --set config.existingConfigMap=edge-gateway-config
 ```
 
+In BYO mode, a live Helm install checks that ConfigMap `config.existingConfigMap` already exists in the release namespace.
+If it is missing, the install fails before creating the Deployment. Offline `helm template` does not require a
+cluster.
+
 The default image reference is the official Praxis AI 0.4.0 gateway tag.
 `image.digest` defaults to empty so an `image.tag` override remains effective.
 For immutable deployments, set `image.digest` explicitly to
