@@ -157,6 +157,7 @@ jobs:
         run: |
           cargo test -p certs --no-default-features --features fips
           cargo test -p enrollment --no-default-features --features fips
+          cargo test -p enrollment --no-default-features --features fips,sar,bootstrap --bins
           cargo test --manifest-path operator/Cargo.toml --no-default-features --features fips
           cargo test --manifest-path overlay-sync/Cargo.toml --no-default-features --features fips
 

@@ -907,6 +907,7 @@ dependencies = [
  "kube",
  "openssl",
  "rcgen",
+ "reqwest",
  "ring",
  "rustls",
  "serde",
@@ -920,6 +921,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "x509-parser",
+ "zeroize",
 ]
 
 [[package]]

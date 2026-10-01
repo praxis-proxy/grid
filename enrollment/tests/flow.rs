@@ -221,21 +221,19 @@ async fn a_redeemed_token_cannot_be_revoked() {
 }
 
 #[tokio::test]
-async fn an_explicit_zero_expiry_is_refused() {
+async fn an_expiry_outside_one_second_to_seven_days_is_refused() {
     let app = service();
-    let (status, body) = call_as_admin(
-        &app,
-        "POST",
-        "/v1alpha1/enrollmenttokens",
-        Some(json!({ "siteName": "site-ttl", "gridNetworkRef": "demo-grid", "expiresInSecs": 0 })),
-    )
-    .await;
-    assert_eq!(
-        status,
-        StatusCode::BAD_REQUEST,
-        "an explicit zero expiry is refused, not defaulted"
-    );
-    assert_eq!(body["error"], "invalid_token_ttl");
+    for secs in [0, 604_801] {
+        let (status, body) = call_as_admin(
+            &app,
+            "POST",
+            "/v1alpha1/enrollmenttokens",
+            Some(json!({ "siteName": "site-ttl", "gridNetworkRef": "demo-grid", "expiresInSecs": secs })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{secs}s is refused, not defaulted");
+        assert_eq!(body["error"], "invalid_token_ttl", "{secs}s");
+    }
 }
 
 #[tokio::test]

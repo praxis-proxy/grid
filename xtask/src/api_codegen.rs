@@ -87,9 +87,9 @@ const HEADER: &str = "\
 ///
 /// typify resolves `$ref` as `#/definitions/<name>`, not the `OpenAPI`
 /// `#/components/schemas/<name>`, maps `format: date-time` to chrono, and does
-/// not model the 3.1 `examples`. String constraints are dropped so constrained
-/// fields become plain `String` rather than validated newtypes that pull in
-/// regress. Validation stays in the handler, as in model.rs.
+/// not model the 3.1 `examples`. String and numeric constraints are dropped so
+/// constrained fields keep plain types rather than validated newtypes (regress,
+/// `NonZeroU64`). Validation stays in the handler, as in model.rs.
 fn normalize(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::Object(map) => {
@@ -101,7 +101,7 @@ fn normalize(value: &mut serde_json::Value) {
             if map.get("format").and_then(serde_json::Value::as_str) == Some("date-time") {
                 map.remove("format");
             }
-            for key in ["pattern", "minLength", "maxLength", "examples"] {
+            for key in ["pattern", "minLength", "maxLength", "minimum", "maximum", "examples"] {
                 map.remove(key);
             }
             for child in map.values_mut() {

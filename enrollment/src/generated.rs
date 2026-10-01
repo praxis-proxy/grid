@@ -64,7 +64,8 @@ pub struct EnrollmentToken {
 #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug, Eq, PartialEq)]
 pub struct EnrollmentTokenRequest {
     /**How long the token stays usable, in seconds. A default applies when
-unset. An explicit value must be greater than zero.
+unset. An explicit value must be greater than zero and at most
+604800 (seven days).
 */
     #[serde(
         rename = "expiresInSecs",

@@ -188,7 +188,10 @@ components:
           type: integer
           description: |
             How long the token stays usable, in seconds. A default applies when
-            unset. An explicit value must be greater than zero.
+            unset. An explicit value must be greater than zero and at most
+            604800 (seven days).
+          minimum: 1
+          maximum: 604800
 
     EnrollmentToken:
       type: object

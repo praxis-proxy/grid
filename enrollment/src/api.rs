@@ -30,6 +30,9 @@ use crate::{
 /// How long a token stays usable when the grid-admin names no expiry.
 const DEFAULT_TOKEN_TTL_SECS: i64 = 24 * 60 * 60;
 
+/// Longest token lifetime a grid-admin may ask for.
+const MAX_TOKEN_TTL_SECS: i64 = 7 * 24 * 60 * 60;
+
 /// How long a single request may run before it is cut off. Bounds the time a slow
 /// caller holds a task, the way the body limit bounds the bytes.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -324,10 +327,10 @@ async fn mint_site_token(
     // is reserved for an unset expiry.
     let ttl_secs = match input.expires_in_secs {
         None => DEFAULT_TOKEN_TTL_SECS,
-        Some(secs) if secs <= 0 => {
+        Some(secs) if !(1..=MAX_TOKEN_TTL_SECS).contains(&secs) => {
             return Err(ApiError::BadRequest {
                 code: "invalid_token_ttl",
-                message: "expiresInSecs must be greater than zero".to_owned(),
+                message: format!("expiresInSecs must be between 1 and {MAX_TOKEN_TTL_SECS}"),
             });
         },
         Some(secs) => secs,

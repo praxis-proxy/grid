@@ -12,6 +12,9 @@ use tokio::signal;
 /// no CLI or Kubernetes client.
 #[cfg(feature = "bootstrap")]
 mod bootstrap;
+/// The `enrollment invite` subcommand.
+#[cfg(feature = "bootstrap")]
+mod invite;
 
 /// Server TLS config: rustls by default, system openssl under `fips`.
 #[cfg(not(feature = "fips"))]
@@ -50,15 +53,22 @@ const TLS_KEY_PATH: &str = "ENROLLMENT_TLS_KEY";
 /// secret, so a deployment beside MaaS points at the database already there.
 const DB_CONNECTION_URL: &str = "DB_CONNECTION_URL";
 
-/// Reject `enrollment bootstrap` on a serve-only build instead of degrading to serve.
+/// Reject a hook subcommand on a serve-only build.
 #[cfg(not(feature = "bootstrap"))]
 fn reject_bootstrap_without_feature(
     args: impl IntoIterator<Item = std::ffi::OsString>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if args.into_iter().nth(1).is_some_and(|arg| arg == "bootstrap") {
-        return Err("`enrollment bootstrap` is unavailable: this image was built \
-                    without --features bootstrap (use deploy/enrollment/Containerfile)"
-            .into());
+    if let Some(command) = args
+        .into_iter()
+        .nth(1)
+        .filter(|arg| arg == "bootstrap" || arg == "invite")
+    {
+        return Err(format!(
+            "`enrollment {}` is unavailable: this image was built \
+             without --features bootstrap (use deploy/enrollment/Containerfile)",
+            command.to_string_lossy()
+        )
+        .into());
     }
     Ok(())
 }
@@ -76,6 +86,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "bootstrap")]
     if std::env::args_os().nth(1).is_some_and(|arg| arg == "bootstrap") {
         return Box::pin(bootstrap::run())
+            .await
+            .map_err(|err| -> Box<dyn std::error::Error> { err });
+    }
+    #[cfg(feature = "bootstrap")]
+    if std::env::args_os().nth(1).is_some_and(|arg| arg == "invite") {
+        return Box::pin(invite::run())
             .await
             .map_err(|err| -> Box<dyn std::error::Error> { err });
     }
