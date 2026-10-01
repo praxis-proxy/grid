@@ -1,5 +1,7 @@
 //! Validated served-model names and sets.
 
+use std::collections::HashSet;
+
 // ---------------------------------------------------------------------------
 // Limits
 // ---------------------------------------------------------------------------
@@ -52,7 +54,7 @@ pub(crate) enum ServedModelsError {
 // ---------------------------------------------------------------------------
 
 /// A served-model name with surrounding whitespace removed and validated.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct ModelName(String);
 
 impl TryFrom<String> for ModelName {
@@ -103,6 +105,7 @@ impl ServedModels {
         I: IntoIterator<Item = String>,
     {
         let mut validated = Vec::new();
+        let mut unique = HashSet::with_capacity(MAX_SERVED_MODELS);
 
         for name in names {
             if validated.len() == MAX_SERVED_MODELS {
@@ -110,7 +113,7 @@ impl ServedModels {
             }
 
             let name = ModelName::try_from(name)?;
-            if validated.contains(&name) {
+            if !unique.insert(name.clone()) {
                 return Err(ServedModelsError::Duplicate(name.0));
             }
             validated.push(name);

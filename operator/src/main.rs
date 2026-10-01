@@ -77,8 +77,7 @@ use operator::{
     },
     gateway,
     resources::tls_backend::{self, ServerTlsConfig},
-    served_models,
-    swim_advertise,
+    served_models, swim_advertise,
     swim_endpoint::{SwimEndpoint, resolve_endpoint, resolve_endpoint_list_partial},
     swim_runtime::{self, RevisionLease, SwimConfig},
 };
@@ -2055,17 +2054,46 @@ async fn run_model_discovery(
 /// Maximum amount of time to retain a discovered model set.
 const MAX_MODEL_DISCOVERY_TTL: std::time::Duration = std::time::Duration::from_secs(365 * 24 * 60 * 60);
 
+/// Maximum delay between model-discovery rounds.
+const MAX_MODEL_DISCOVERY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30 * 24 * 60 * 60);
+
+/// Maximum time allowed for one model-discovery request.
+const MAX_MODEL_DISCOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
 /// Discovery cadence from `GRID_MODEL_DISCOVERY_*`.
 ///
-/// The TTL is raised to cover one interval plus one timeout, up to one year.
+/// Interval and timeout are bounded; the TTL covers both and is capped at one
+/// year.
 fn model_discovery_config() -> served_models::DiscoveryConfig {
     let defaults = served_models::DiscoveryConfig::default();
-    let secs =
-        |var, default: std::time::Duration| std::time::Duration::from_secs(parse_env_or(var, default.as_secs()).max(1));
+    let interval = bounded_discovery_duration(
+        "GRID_MODEL_DISCOVERY_INTERVAL_SECS",
+        defaults.interval,
+        MAX_MODEL_DISCOVERY_INTERVAL,
+    );
+    let timeout = bounded_discovery_duration(
+        "GRID_MODEL_DISCOVERY_TIMEOUT_SECS",
+        defaults.timeout,
+        MAX_MODEL_DISCOVERY_TIMEOUT,
+    );
+    let ttl = bounded_model_discovery_ttl(interval, timeout, defaults.ttl);
 
-    let interval = secs("GRID_MODEL_DISCOVERY_INTERVAL_SECS", defaults.interval);
-    let timeout = secs("GRID_MODEL_DISCOVERY_TIMEOUT_SECS", defaults.timeout);
-    let requested_ttl = secs("GRID_MODEL_DISCOVERY_TTL_SECS", defaults.ttl);
+    served_models::DiscoveryConfig {
+        interval,
+        timeout,
+        ttl,
+        concurrency: parse_env_or("GRID_MODEL_DISCOVERY_CONCURRENCY", defaults.concurrency),
+    }
+}
+
+/// Derive a TTL that covers one poll round and remains within its supported cap.
+fn bounded_model_discovery_ttl(
+    interval: std::time::Duration,
+    timeout: std::time::Duration,
+    default: std::time::Duration,
+) -> std::time::Duration {
+    let requested_ttl =
+        std::time::Duration::from_secs(parse_env_or("GRID_MODEL_DISCOVERY_TTL_SECS", default.as_secs()).max(1));
     let minimum_ttl = interval.saturating_add(timeout);
     let unclamped_ttl = requested_ttl.max(minimum_ttl);
     let ttl = unclamped_ttl.min(MAX_MODEL_DISCOVERY_TTL);
@@ -2078,13 +2106,25 @@ fn model_discovery_config() -> served_models::DiscoveryConfig {
             "model discovery TTL exceeds the supported maximum; clamping"
         );
     }
+    ttl
+}
 
-    served_models::DiscoveryConfig {
-        interval,
-        timeout,
-        ttl,
-        concurrency: parse_env_or("GRID_MODEL_DISCOVERY_CONCURRENCY", defaults.concurrency),
+/// Parse one discovery duration, enforcing a positive value and maximum.
+fn bounded_discovery_duration(
+    name: &str,
+    default: std::time::Duration,
+    maximum: std::time::Duration,
+) -> std::time::Duration {
+    let requested = std::time::Duration::from_secs(parse_env_or(name, default.as_secs()).max(1));
+    if requested > maximum {
+        tracing::warn!(
+            setting = name,
+            requested_secs = requested.as_secs(),
+            applied_secs = maximum.as_secs(),
+            "model discovery duration exceeds the supported maximum; clamping"
+        );
     }
+    requested.min(maximum)
 }
 
 /// Parse an environment variable, using `default` when it is absent or invalid.

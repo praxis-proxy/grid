@@ -93,6 +93,14 @@ struct ProviderPoll(
     String,
 );
 
+/// The status-relevant outcome of one provider poll.
+struct ProviderPollStatus {
+    /// `InferenceProvider` name.
+    name: String,
+    /// Failure reason, or `None` after a successful poll.
+    failure_reason: Option<&'static str>,
+}
+
 /// What one provider poll reported.
 enum PollOutcome {
     /// The validated served-model set, including an empty set.
@@ -146,18 +154,18 @@ impl ServedModelStore {
     /// from `updated` are no longer configured and are dropped.
     ///
     /// Changes, expirations, and drops are logged at `debug`.
-    fn refresh(&self, updated: &[ProviderPoll], now: Instant, ttl: Duration) {
+    fn refresh(&self, updated: Vec<ProviderPoll>, now: Instant, ttl: Duration) {
         let expires_at = now.checked_add(ttl);
         let Ok(mut map) = self.inner.write() else {
             return;
         };
 
-        prune_before_refresh(&mut map, updated, now);
+        prune_before_refresh(&mut map, &updated, now);
         for ProviderPoll(outcome, name) in updated {
             match outcome {
                 PollOutcome::Served(discovered) => match expires_at {
                     Some(expires_at) => {
-                        let models: Arc<[String]> = discovered.clone().into_names().into();
+                        let models: Arc<[String]> = discovered.into_names().into();
                         tracing::debug!(name, ?models, "served models refreshed");
                         map.insert(name.clone(), ServedModel { models, expires_at });
                     },
@@ -220,8 +228,15 @@ pub(crate) async fn discover(
         .collect::<Vec<_>>()
         .await;
 
-    store.refresh(&polled, Instant::now(), config.ttl);
-    publish_discovery_status(&api, &providers, &polled).await;
+    let status_updates = polled
+        .iter()
+        .map(|ProviderPoll(outcome, name)| ProviderPollStatus {
+            name: name.clone(),
+            failure_reason: outcome.failure_reason(),
+        })
+        .collect::<Vec<_>>();
+    store.refresh(polled, Instant::now(), config.ttl);
+    publish_discovery_status(&api, &providers, &status_updates).await;
     Ok(())
 }
 
@@ -229,7 +244,7 @@ pub(crate) async fn discover(
 async fn publish_discovery_status(
     api: &Api<InferenceProvider>,
     providers: &[InferenceProvider],
-    polled: &[ProviderPoll],
+    polled: &[ProviderPollStatus],
 ) {
     for provider in providers {
         if let Some((name, incoming_error)) = discovery_error_patch_for_provider(provider, polled)
@@ -246,13 +261,13 @@ async fn publish_discovery_status(
 /// `Some((name, Some(reason)))` sets it.
 fn discovery_error_patch_for_provider<'provider>(
     provider: &'provider InferenceProvider,
-    polled: &[ProviderPoll],
+    polled: &[ProviderPollStatus],
 ) -> Option<(&'provider str, Option<&'static str>)> {
     let provider_name = provider.metadata.name.as_deref()?;
     let incoming_error = polled
         .iter()
-        .find(|ProviderPoll(_, name)| name == provider_name)
-        .and_then(|ProviderPoll(outcome, _)| outcome.failure_reason());
+        .find(|status| status.name == provider_name)
+        .and_then(|status| status.failure_reason);
     let current_error = provider
         .status
         .as_ref()
@@ -410,8 +425,8 @@ mod tests {
     fn success_replaces_set() {
         let store = ServedModelStore::new();
 
-        store.refresh(&round(&[("p", Some(&["old"]))]), Instant::now(), TTL);
-        store.refresh(&round(&[("p", Some(&["b", "a"]))]), Instant::now(), TTL);
+        store.refresh(round(&[("p", Some(&["old"]))]), Instant::now(), TTL);
+        store.refresh(round(&[("p", Some(&["b", "a"]))]), Instant::now(), TTL);
 
         assert_eq!(
             names(&store, "p"),
@@ -424,8 +439,8 @@ mod tests {
     fn empty_success_is_held() {
         let store = ServedModelStore::new();
 
-        store.refresh(&round(&[("p", Some(&["a"]))]), Instant::now(), TTL);
-        store.refresh(&round(&[("p", Some(&[]))]), Instant::now(), TTL);
+        store.refresh(round(&[("p", Some(&["a"]))]), Instant::now(), TTL);
+        store.refresh(round(&[("p", Some(&[]))]), Instant::now(), TTL);
 
         assert_eq!(names(&store, "p"), Some(Vec::new()), "empty success should be held");
     }
@@ -434,8 +449,8 @@ mod tests {
     fn failure_keeps_last_good_set() {
         let store = ServedModelStore::new();
 
-        store.refresh(&round(&[("p", Some(&["a"]))]), Instant::now(), TTL);
-        store.refresh(&round(&[("p", None)]), Instant::now(), TTL);
+        store.refresh(round(&[("p", Some(&["a"]))]), Instant::now(), TTL);
+        store.refresh(round(&[("p", None)]), Instant::now(), TTL);
 
         assert_eq!(names(&store, "p"), Some(owned(&["a"])), "failure should keep set");
     }
@@ -444,7 +459,7 @@ mod tests {
     fn unrenewed_set_expires() {
         let store = ServedModelStore::new();
 
-        store.refresh(&round(&[("p", Some(&["a"]))]), Instant::now(), Duration::ZERO);
+        store.refresh(round(&[("p", Some(&["a"]))]), Instant::now(), Duration::ZERO);
 
         assert_eq!(names(&store, "p"), None, "expired set should not be served");
     }
@@ -453,8 +468,8 @@ mod tests {
     fn unpolled_provider_is_dropped() {
         let store = ServedModelStore::new();
 
-        store.refresh(&round(&[("p", Some(&["a"])), ("q", Some(&["b"]))]), Instant::now(), TTL);
-        store.refresh(&round(&[("q", None)]), Instant::now(), TTL);
+        store.refresh(round(&[("p", Some(&["a"])), ("q", Some(&["b"]))]), Instant::now(), TTL);
+        store.refresh(round(&[("q", None)]), Instant::now(), TTL);
 
         assert_eq!(names(&store, "p"), None, "unconfigured provider should be dropped");
         assert_eq!(
@@ -488,10 +503,10 @@ mod tests {
         let provider_name = "provider-a";
         let provider_without_status = test_provider(provider_name, None);
         let provider_with_error = test_provider(provider_name, Some("credential"));
-        let failed = vec![ProviderPoll(
-            PollOutcome::Failed(PollError::Credential(String::new())),
-            provider_name.to_owned(),
-        )];
+        let failed = vec![ProviderPollStatus {
+            name: provider_name.to_owned(),
+            failure_reason: Some("credential"),
+        }];
         assert_eq!(
             discovery_error_patch_for_provider(&provider_without_status, &failed),
             Some((provider_name, Some("credential"))),
@@ -511,10 +526,10 @@ mod tests {
         assert_eq!(
             discovery_error_patch_for_provider(
                 &provider_with_error,
-                &[ProviderPoll(
-                    PollOutcome::Served(ServedModels::default()),
-                    provider_name.to_owned(),
-                )],
+                &[ProviderPollStatus {
+                    name: provider_name.to_owned(),
+                    failure_reason: None,
+                }],
             ),
             Some((provider_name, None)),
             "a successful poll should clear the previous error"
