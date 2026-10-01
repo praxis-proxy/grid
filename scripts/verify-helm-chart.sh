@@ -510,7 +510,7 @@ else
   fail "secure config: auth.mode none should strip Authorization by default"
 fi
 CA_RENDER=$(helm template verify-ca "$GW_DIR" "${SECURE_ARGS[@]}" --namespace grid-system \
-  --set praxisConfig.render.auth.validateCA.configMap=service-ca --set praxisConfig.render.auth.validateCA.key=service-ca.crt)
+  --set praxisConfig.render.auth.validateCA.configMapName=service-ca --set praxisConfig.render.auth.validateCA.key=service-ca.crt)
 if echo "$CA_RENDER" | grep -A1 'name: SSL_CERT_FILE' | grep -q '/etc/praxis/validate-ca/service-ca.crt' \
     && echo "$CA_RENDER" | grep -q 'mountPath: "/etc/praxis/validate-ca"'; then
   pass "secure config: validateCA mounts the bundle and sets SSL_CERT_FILE"
@@ -565,8 +565,10 @@ try_reject_msg "$GW_DIR" "render without auth.mode (gw)" "auth.mode is required"
   --set "praxisConfig.render.backends[0].endpoints[0]=1.2.3.4:8000" --namespace grid-system
 try_reject_msg "$GW_DIR" "none + LoadBalancer (gw)" "exposes unauthenticated inference" "${GW_RENDER[@]}" --set service.type=LoadBalancer --namespace grid-system
 try_reject_msg "$GW_DIR" "none + NodePort (gw)" "exposes unauthenticated inference" "${GW_RENDER[@]}" --set service.type=NodePort --namespace grid-system
-try_reject_msg "$GW_DIR" "validateCA configMap and secret (gw)" "set configMap or secret, not both" "${SECURE_ARGS[@]}" \
-  --set praxisConfig.render.auth.validateCA.configMap=a --set praxisConfig.render.auth.validateCA.secret=b --namespace grid-system
+try_reject_msg "$GW_DIR" "validateCA configMapName and secretName (gw)" "set configMapName or secretName, not both" "${SECURE_ARGS[@]}" \
+  --set praxisConfig.render.auth.validateCA.configMapName=a --set praxisConfig.render.auth.validateCA.secretName=b --namespace grid-system
+try_reject_msg "$GW_DIR" "validateCA.configMap is renamed (gw)" "additional properties 'configMap' not allowed" "${SECURE_ARGS[@]}" \
+  --set praxisConfig.render.auth.validateCA.configMap=a --namespace grid-system
 try_reject_msg "$GW_DIR" "networkPolicy enabled without from (gw)" "needs at least one peer" "${GW_REQ[@]}" \
   --set networkPolicy.enabled=true --namespace grid-system
 try_reject_msg "$GW_DIR" "networkPolicy from an empty namespaceSelector (gw)" "admits every pod in every namespace" "${GW_REQ[@]}" \
@@ -613,7 +615,7 @@ if helm template v-hc "$GW_DIR" "${R0[@]}" "${BK1[@]}" --set "praxisConfig.rende
 else
   pass "tcp health_check carries no path"
 fi
-if [ "$(helm template v-ca "$GW_DIR" "${R0[@]}" "${BK1[@]}" --set praxisConfig.render.auth.validateCA.configMap=x | grep -c 'SSL_CERT_FILE')" = 0 ]; then
+if [ "$(helm template v-ca "$GW_DIR" "${R0[@]}" "${BK1[@]}" --set praxisConfig.render.auth.validateCA.configMapName=x | grep -c 'SSL_CERT_FILE')" = 0 ]; then
   pass "validateCA is ignored outside api-key"
 else
   fail "validateCA should apply only with api-key"
@@ -646,7 +648,7 @@ TLS1=(--set praxisConfig.source=render --set praxisConfig.render.auth.mode=none 
   --set "praxisConfig.render.backends[0].cluster=kserve" --set "praxisConfig.render.backends[0].transport.mode=tls" --namespace grid-system)
 TLS_RENDER=$(helm template v-tls "$GW_DIR" "${TLS1[@]}" --set "praxisConfig.render.backends[0].endpoints[0]=172.30.1.2:8000" \
   --set "praxisConfig.render.backends[0].transport.sni=qwen3-kserve-workload-svc.llm.svc" \
-  --set "praxisConfig.render.backends[0].transport.ca.configMap=openshift-service-ca.crt" \
+  --set "praxisConfig.render.backends[0].transport.ca.configMapName=openshift-service-ca.crt" \
   --set "praxisConfig.render.backends[0].transport.ca.key=service-ca.crt" 2>&1)
 if echo "$TLS_RENDER" | grep -q 'ca_path: "/etc/praxis/backend-ca/0/service-ca.crt"' \
     && echo "$TLS_RENDER" | grep -q 'sni: "qwen3-kserve-workload-svc.llm.svc"' \
@@ -663,15 +665,15 @@ else
 fi
 try_reject_msg "$GW_DIR" "tls backend: IP endpoint without sni (gw)" "without transport.sni" "${TLS1[@]}" \
   --set "praxisConfig.render.backends[0].endpoints[0]=172.30.1.2:8000"
-try_reject_msg "$GW_DIR" "tls backend: ca with configMap and secret (gw)" "transport[./]ca.*oneOf" "${TLS1[@]}" \
+try_reject_msg "$GW_DIR" "tls backend: ca with configMapName and secretName (gw)" "transport[./]ca.*oneOf" "${TLS1[@]}" \
   --set "praxisConfig.render.backends[0].endpoints[0]=172.30.1.2:8000" --set "praxisConfig.render.backends[0].transport.sni=h" \
-  --set "praxisConfig.render.backends[0].transport.ca.configMap=a" --set "praxisConfig.render.backends[0].transport.ca.secret=b"
+  --set "praxisConfig.render.backends[0].transport.ca.configMapName=a" --set "praxisConfig.render.backends[0].transport.ca.secretName=b"
 try_reject_msg "$GW_DIR" "tls backend: empty ca (gw)" "transport[./]ca.*oneOf" "${TLS1[@]}" \
   --set "praxisConfig.render.backends[0].endpoints[0]=172.30.1.2:8000" --set "praxisConfig.render.backends[0].transport.sni=h" \
   --set-json 'praxisConfig.render.backends[0].transport.ca={}'
 try_reject_msg "$GW_DIR" "transport.ca outside tls (gw)" "transport/mode': value must be 'tls'|transport: Must validate \"then\"" "${TLS1[@]}" \
   --set "praxisConfig.render.backends[0].endpoints[0]=172.30.1.2:8000" --set "praxisConfig.render.backends[0].transport.mode=plaintext" \
-  --set "praxisConfig.render.backends[0].transport.ca.configMap=a"
+  --set "praxisConfig.render.backends[0].transport.ca.configMapName=a"
 try_reject_msg "$GW_DIR" "listenerTls.enabled is removed (gw)" "additional properties 'enabled' not allowed" "${GW_REQ[@]}" \
   --set listenerTls.enabled=true --namespace grid-system
 try_reject_msg "$GW_DIR" "listenerTls with source operator (gw)" "listenerTls.secretName is not supported with praxisConfig.source operator" \

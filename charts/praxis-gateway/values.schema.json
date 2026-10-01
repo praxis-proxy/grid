@@ -189,8 +189,8 @@
                   "additionalProperties": false,
                   "description": "CA for the validate call, set as SSL_CERT_FILE (replaces the platform trust store).",
                   "properties": {
-                    "configMap": { "type": "string" },
-                    "secret": { "type": "string" },
+                    "configMapName": { "type": "string" },
+                    "secretName": { "type": "string" },
                     "key": { "type": "string" },
                     "mountPath": { "type": "string" }
                   }
@@ -234,13 +234,13 @@
                         "additionalProperties": false,
                         "description": "tls only: CA bundle that verifies this backend.",
                         "properties": {
-                          "configMap": { "type": "string" },
-                          "secret": { "type": "string" },
+                          "configMapName": { "type": "string" },
+                          "secretName": { "type": "string" },
                           "key": { "type": "string" }
                         },
                         "oneOf": [
-                          { "required": ["configMap"], "properties": { "configMap": { "minLength": 1 }, "secret": { "maxLength": 0 } } },
-                          { "required": ["secret"], "properties": { "secret": { "minLength": 1 }, "configMap": { "maxLength": 0 } } }
+                          { "required": ["configMapName"], "properties": { "configMapName": { "minLength": 1 }, "secretName": { "maxLength": 0 } } },
+                          { "required": ["secretName"], "properties": { "secretName": { "minLength": 1 }, "configMapName": { "maxLength": 0 } } }
                         ]
                       }
                     },

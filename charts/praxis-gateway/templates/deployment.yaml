@@ -149,7 +149,7 @@ spec:
             {{- toYaml . | nindent 12 }}
           {{- end }}
           {{- $validateCA := .Values.praxisConfig.render.auth.validateCA }}
-          {{- $withCA := and (eq .Values.praxisConfig.source "render") (eq .Values.praxisConfig.render.auth.mode "api-key") (or $validateCA.configMap $validateCA.secret) }}
+          {{- $withCA := and (eq .Values.praxisConfig.source "render") (eq .Values.praxisConfig.render.auth.mode "api-key") (or $validateCA.configMapName $validateCA.secretName) }}
           {{- if or .Values.env $withCA }}
           env:
             {{- with .Values.env }}
@@ -290,26 +290,26 @@ spec:
         {{- range $i, $backend := .Values.praxisConfig.render.backends }}
         {{- with (.transport).ca }}
         - name: backend-ca-{{ $i }}
-          {{- if .configMap }}
+          {{- if .configMapName }}
           configMap:
-            name: {{ .configMap | quote }}
+            name: {{ .configMapName | quote }}
           {{- else }}
           secret:
-            secretName: {{ .secret | quote }}
+            secretName: {{ .secretName | quote }}
           {{- end }}
         {{- end }}
         {{- end }}
         {{- end }}
         {{- $validateCA := .Values.praxisConfig.render.auth.validateCA }}
         {{- $apiKeyRender := and (eq .Values.praxisConfig.source "render") (eq .Values.praxisConfig.render.auth.mode "api-key") }}
-        {{- if and $apiKeyRender $validateCA.configMap }}
+        {{- if and $apiKeyRender $validateCA.configMapName }}
         - name: validate-ca
           configMap:
-            name: {{ $validateCA.configMap | quote }}
-        {{- else if and $apiKeyRender $validateCA.secret }}
+            name: {{ $validateCA.configMapName | quote }}
+        {{- else if and $apiKeyRender $validateCA.secretName }}
         - name: validate-ca
           secret:
-            secretName: {{ $validateCA.secret | quote }}
+            secretName: {{ $validateCA.secretName | quote }}
         {{- end }}
         {{- if .Values.listenerTls.secretName }}
         - name: listener-tls

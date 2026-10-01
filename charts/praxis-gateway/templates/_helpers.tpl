@@ -105,8 +105,8 @@ praxisConfig.source picks who writes praxis.yaml:
 {{- if and (eq $auth.mode "none") .Values.service.enabled (has .Values.service.type (list "LoadBalancer" "NodePort")) (not $auth.allowUnauthenticatedExposure) }}
 {{- fail (printf "praxisConfig.render.auth.mode none with a %s Service exposes unauthenticated inference; use api-key, a ClusterIP Service behind an authenticating front, or set praxisConfig.render.auth.allowUnauthenticatedExposure" .Values.service.type) }}
 {{- end }}
-{{- if and $auth.validateCA.configMap $auth.validateCA.secret }}
-{{- fail "praxisConfig.render.auth.validateCA: set configMap or secret, not both" }}
+{{- if and $auth.validateCA.configMapName $auth.validateCA.secretName }}
+{{- fail "praxisConfig.render.auth.validateCA: set configMapName or secretName, not both" }}
 {{- end }}
 {{- if eq $auth.mode "api-key" }}
 {{- if not .Values.praxisConfig.render.auth.validateUrl }}

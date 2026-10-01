@@ -96,14 +96,14 @@ praxisConfig:
       # store for the process: the validate call and https backends without a per-backend CA
       # or upstreamCA use it; mutual_tls backends and upstreamCA do not. Build the bundle as
       # the image's /etc/ssl/certs/ca-certificates.crt plus the service CA, or set upstreamCA
-      # for public https backends. Set configMap or secret, not both. Empty keeps the
+      # for public https backends. Set configMapName or secretName, not both. Empty keeps the
       # platform store.
       validateCA:
         # -- ConfigMap holding the bundle (for example one annotated
         # service.beta.openshift.io/inject-cabundle, key service-ca.crt).
-        configMap: ""
+        configMapName: ""
         # -- Secret holding the bundle.
-        secret: ""
+        secretName: ""
         # -- Key holding the PEM bundle.
         key: "ca.crt"
         # -- Mount path for the bundle.
@@ -136,7 +136,7 @@ praxisConfig:
     #    transport:
     #      mode: tls
     #      sni: qwen3-kserve-workload-svc.llm.svc
-    #      ca: { configMap: openshift-service-ca.crt, key: service-ca.crt }
+    #      ca: { configMapName: openshift-service-ca.crt, key: service-ca.crt }
 
 # -- CA bundle the gateway uses to verify backend TLS certs (outbound), for backends
 # without a per-cluster CA. Empty secretName keeps the system trust store. It replaces

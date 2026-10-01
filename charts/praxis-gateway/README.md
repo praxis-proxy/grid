@@ -171,14 +171,14 @@ AI image; these values may advance independently.
 | `praxisConfig.key` | string | `praxis.yaml` | Key in the ConfigMap, for `byo` only. `operator` always uses `praxis.yaml`. |
 | `praxisConfig.render.model` | string | **required** when rendered | Model advertised on the routing candidates. |
 | `praxisConfig.render.backends` | list | **required** when rendered | Backend clusters (`cluster`, `endpoints`, `healthCheck`, `transport`). |
-| `praxisConfig.render.backends[].transport` | object | `mutual_tls` with `gridIdentity.secretName`, else `plaintext` | `mode`: `mutual_tls` presents the grid identity, `tls` verifies the server cert with no client cert, `plaintext` is cleartext. `sni` names the peer cert (required for `mutual_tls` and for `tls` to an IP endpoint). `ca` (`configMap` or `secret`, `key`) is the CA for a `tls` backend. A `tls` backend trusts, first match wins: `transport.ca`, then `upstreamCA`, then the process store, which is the `auth.validateCA` bundle when that is set. |
+| `praxisConfig.render.backends[].transport` | object | `mutual_tls` with `gridIdentity.secretName`, else `plaintext` | `mode`: `mutual_tls` presents the grid identity, `tls` verifies the server cert with no client cert, `plaintext` is cleartext. `sni` names the peer cert (required for `mutual_tls` and for `tls` to an IP endpoint). `ca` (`configMapName` or `secretName`, `key`) is the CA for a `tls` backend. A `tls` backend trusts, first match wins: `transport.ca`, then `upstreamCA`, then the process store, which is the `auth.validateCA` bundle when that is set. |
 | `praxisConfig.render.localSite` | string | `hub` | Local site for locality scoring. |
 | `praxisConfig.render.auth.mode` | string | **required** when rendered | `api-key` validates the caller's key and needs an image that registers `identity/api-key` (praxis-policy 0.4 or later); the render refuses it on the default `ai:0.4.0` image (by effective reference; a digest pin of that same image is not detected). `none` renders no policy filter, for use only behind an authenticating front. |
 | `praxisConfig.render.auth.allowUnauthenticatedExposure` | bool | `false` | With `none`, allow a LoadBalancer or NodePort Service. Without it the render fails. The guard sees only this chart's Service, not `oc expose`, another Service selecting the pod labels, an HTTPRoute, or a hand-made Service with `service.enabled=false`. Use `networkPolicy` for those. |
 | `praxisConfig.render.auth.stripAuthorization` | bool | `true` | Remove the caller's `Authorization` before routing, in either mode. Forwarded grid hops authenticate by mTLS identity. `false` forwards the caller's key or bearer to every backend and cross-site peer, so use it only when the backend validates that same credential. |
 | `praxisConfig.render.auth.validateUrl` | string | **required** for `api-key` | https validate endpoint. |
 | `praxisConfig.render.auth.allowPrivateEndpoint` | bool | `false` | Sets `allow_private_idp`, which is engine-wide: every policy callout may reach private, loopback, and link-local addresses, not only `validateUrl`. |
-| `praxisConfig.render.auth.validateCA` | object | empty | CA for the validate call (`configMap` or `secret`, `key`). Set as `SSL_CERT_FILE`, which replaces the platform trust store for the validate call and https backends without a per-backend CA or `upstreamCA`. mutual_tls backends and `upstreamCA` are unaffected. See the recipe below. |
+| `praxisConfig.render.auth.validateCA` | object | empty | CA for the validate call (`configMapName` or `secretName`, `key`). Set as `SSL_CERT_FILE`, which replaces the platform trust store for the validate call and https backends without a per-backend CA or `upstreamCA`. mutual_tls backends and `upstreamCA` are unaffected. See the recipe below. |
 | `networkPolicy.enabled` | bool | `false` | Render a NetworkPolicy that limits which pods can reach the listener port, where the CNI enforces NetworkPolicy. It is not authentication. Node and host-network traffic handling is CNI-specific (OVN-Kubernetes: the `policy-group.network.openshift.io/host-network` label), and a LoadBalancer with `externalTrafficPolicy: Cluster` can SNAT clients to node IPs. |
 | `networkPolicy.from` | list | `[]` | NetworkPolicyPeer entries allowed in. Required when enabled. With `auth.mode: none`, list only the authenticating front. `{podSelector: {}}` admits every pod in this namespace. An empty `namespaceSelector` and an `ipBlock` of `0.0.0.0/0` or `::/0` admit everyone and fail the render. An all-address `ipBlock` with `except` entries is allowed. The check reads selector emptiness and the cidr only, so `matchExpressions` that happen to select every pod pass. A provider gateway behind a LoadBalancer that SNATs clients to node IPs needs `ipBlock` peers for those node addresses. |
 | `listenerTls.secretName` | string | `""` | Server cert Secret (`tls.crt`, `tls.key`) for TLS on the listener. Set it to turn listener TLS on; empty (the default) turns it off. Works with `render` and `byo`; `render` writes the listener cert paths, a byo config must point its listener `cert_path`/`key_path` at `listenerTls.mountPath` (`/etc/praxis/listener-tls`). Names the port `https`. Not supported with `operator`: the install fails. On OpenShift, annotate the Service with `service.beta.openshift.io/serving-cert-secret-name`. |
@@ -232,7 +232,7 @@ praxisConfig:
         transport:
           mode: tls
           sni: qwen3-kserve-workload-svc.llm.svc
-          ca: { configMap: openshift-service-ca.crt, key: service-ca.crt }
+          ca: { configMapName: openshift-service-ca.crt, key: service-ca.crt }
 ```
 
 The health check defaults to `tcp` for TLS backends.
@@ -247,7 +247,7 @@ cat service-ca.crt >> bundle.pem
 kubectl create configmap gateway-validate-ca --from-file=ca.crt=bundle.pem
 ```
 
-Then set `praxisConfig.render.auth.validateCA.configMap=gateway-validate-ca`. If only the validate
+Then set `praxisConfig.render.auth.validateCA.configMapName=gateway-validate-ca`. If only the validate
 call and mutual_tls backends make TLS calls, the service CA alone is enough. Public https
 backends can instead take `upstreamCA`.
 
