@@ -308,7 +308,7 @@ name = "grid-gateway"
 path = "src/main.rs"
 
 [dependencies]
-praxis-proxy = "0.7.0"
+praxis-proxy = { version = "0.7.0", features = ["spiffe"] }
 praxis-proxy-filter = "0.7.0"
 praxis-ai-filters = { git = "https://github.com/praxis-proxy/ai.git", tag = "v0.4.1" }
 ai-grid-filters = { path = "ai-grid-filters" }
