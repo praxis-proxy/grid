@@ -19,8 +19,9 @@ imagePullSecrets: []
 
 # -- Override the chart name used in resource names.
 nameOverride: ""
-# -- Override the fully qualified app name. Left empty so naming stays release-based;
-# a grid install pins it (fullnameOverride at install) for the operator's discovery.
+# -- Override the fully qualified app name, which also names the Service. Empty keeps
+# the release-based name: {release}-praxis-gateway, or the release name when it already
+# contains the chart name or the gateway is a grid gateway.
 fullnameOverride: ""
 # -- Labels added to all chart-managed resources.
 commonLabels: {}
@@ -102,10 +103,12 @@ config:
                 value: application/json
             body: '{"error": "not found"}'
 
-# Secure-by-default gateway config. When render is true the chart emits praxis.yaml
-# + policy.yaml (the auth chain) and never emits insecure_options; endpoints are values.
+# Optional AI Grid Network (AGN) routing config. When render is true the chart emits
+# praxis.yaml + policy.yaml (the auth chain) from these values instead of config, and
+# never emits insecure_options; endpoints are values. Most installs leave this off.
 gatewayConfig:
-  # -- Render praxis.yaml + policy.yaml from these values instead of a BYO ConfigMap.
+  # -- Render praxis.yaml + policy.yaml from these values instead of config. Also on
+  # when config.existingConfigMap is empty and backends, role provider, or gridServing is set.
   render: false
   # -- consumer routes callers. provider serves grid peers on the grid identity and forwards to one backend.
   role: consumer
@@ -264,7 +267,7 @@ networkPolicy:
   # {podSelector: {}} admits every pod in this namespace. An empty namespaceSelector and an
   # ipBlock of 0.0.0.0/0 or ::/0 admit everyone and fail the render.
   from: []
-  # - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: redhat-ai-gateway-infra}}
+  # - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: ingress}}
   #   podSelector: {matchLabels: {app: authenticating-front}}
 
 # -- Gateway Service configuration.
@@ -294,7 +297,8 @@ route:
     # -- PEM CA that signed the gateway certificate. Required for reencrypt.
     destinationCACertificate: ""
 
-# -- Optional operator-produced overlay ConfigMap mount (edge gateways).
+# -- Optional routing overlay ConfigMap mount, as published by the AGN operator for
+# its edge gateways.
 overlay:
   # -- Enable overlay ConfigMap mount.
   enabled: false
@@ -351,7 +355,8 @@ gridServing:
   # -- Mount directory for the ConfigMap.
   mountPath: "/etc/praxis/grid-serving"
 
-# -- TLS Secret mount.
+# -- Optional TLS Secret mounted at tls.mountPath: the grid site identity, or a client
+# identity for upstream mTLS that the Praxis config references.
 tls:
   # -- Enable TLS Secret mount.
   enabled: false
@@ -362,15 +367,12 @@ tls:
   # -- Mount path for TLS files.
   mountPath: "/etc/praxis/tls"
 
-# -- Credential Secret mounts for provider gateways. Each entry mounts an
-# existing Secret at the specified path.
+# -- Existing Secrets mounted read-only into the Praxis container, for example
+# upstream API credentials that the Praxis config references.
 credentials: []
-# - name: mock-inference-credential
-#   mountPath: /etc/praxis/credentials/mock-inference
+# - name: upstream-api-key
+#   mountPath: /etc/praxis/credentials/upstream
 #   optional: false
-# - name: mock-inference-secondary-credential
-#   mountPath: /etc/praxis/credentials/mock-inference-secondary
-#   optional: true
 
 # -- Probe configuration.
 health:
