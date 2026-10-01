@@ -70,7 +70,8 @@ env: []
 # -- Praxis configuration (praxis.yaml). The first source that is set wins:
 # gatewayConfig.render, then config.existingConfigMap, then config.inline. render also
 # turns on by itself when existingConfigMap is empty and gatewayConfig configures grid
-# routing (backends, role provider, or gridServing).
+# routing (backends, role provider, or gridServing). Setting gatewayConfig.localSite or
+# model without any of those fails the install rather than serving config.inline.
 config:
   # -- Name of an existing ConfigMap holding the Praxis configuration. The chart mounts
   # it but does not manage it, so editing it does not restart the pods.

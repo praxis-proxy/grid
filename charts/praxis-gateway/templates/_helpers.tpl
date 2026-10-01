@@ -209,9 +209,15 @@ inline
 {{- end }}
 
 {{/*
-Fail early on a blank or unparseable config.inline instead of a crash-looping pod.
+Fail early on a blank or unparseable config.inline instead of a crash-looping pod, and
+on grid settings that only the rendered config reads, which inline would drop quietly.
 */}}
 {{- define "praxis-gateway.validateInlineConfig" -}}
+{{- range $key := list "localSite" "model" }}
+{{- if get $.Values.gatewayConfig $key }}
+{{- fail (printf "gatewayConfig.%s is set but config.inline is serving, and inline ignores it: add gatewayConfig.backends, role provider, or gridServing to render the grid config, or unset gatewayConfig.%s" $key $key) }}
+{{- end }}
+{{- end }}
 {{- $inline := toString (.Values.config.inline | default "") }}
 {{- if not (trim $inline) }}
 {{- fail "config.inline is empty: set it to a Praxis configuration, or set config.existingConfigMap" }}

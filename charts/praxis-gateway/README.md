@@ -45,6 +45,8 @@ first source that is set wins:
    values (see [AI Grid Network](#ai-grid-network-agn)). It also turns on by
    itself when there is no existing ConfigMap and the values set
    `gatewayConfig.backends`, `gatewayConfig.role: provider`, or `gridServing`.
+   Setting `gatewayConfig.localSite` or `gatewayConfig.model` without any of
+   those fails the install instead of quietly serving `config.inline`.
 2. `config.existingConfigMap` mounts a ConfigMap you create and manage.
 3. `config.inline` holds the configuration in the values. The chart stores it
    in its own ConfigMap. This is the default.

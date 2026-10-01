@@ -146,6 +146,23 @@ tests:
       - failedTemplate:
           errorPattern: config.inline is not a valid YAML mapping
 
+  - it: fails grid settings that config.inline would ignore
+    template: templates/deployment.yaml
+    set:
+      gatewayConfig.localSite: hub
+      gatewayConfig.model: qwen3
+    asserts:
+      - failedTemplate:
+          errorPattern: gatewayConfig.localSite is set but config.inline is serving
+
+  - it: fails a model without any grid routing to render it
+    template: templates/deployment.yaml
+    set:
+      gatewayConfig.model: qwen3
+    asserts:
+      - failedTemplate:
+          errorPattern: gatewayConfig.model is set but config.inline is serving
+
   - it: writes install notes that stand on their own without Grid
     template: templates/NOTES.txt
     asserts:
