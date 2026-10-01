@@ -10,12 +10,15 @@
 # instead of the plain create below.
 #
 # Env: IMAGE_REPO (default localhost/grid-enrollment), IMAGE_TAG (default ci),
-#      CLUSTER (default grid-enrollment-e2e), KEEP=1 to skip teardown.
+#      CLUSTER (default grid-enrollment-e2e), KEEP=1 to skip teardown,
+#      AUTHZ=local|kube (default local; kube mints with an audience-bound SA token).
 set -euo pipefail
 
 IMAGE_REPO="${IMAGE_REPO:-localhost/grid-enrollment}"
 IMAGE_TAG="${IMAGE_TAG:-ci}"
 CLUSTER="${CLUSTER:-grid-enrollment-e2e}"
+AUTHZ="${AUTHZ:-local}"
+AUDIENCE=grid-enrollment
 CTX="kind-${CLUSTER}"
 NS=grid-enroll
 PG_IMAGE="quay.io/sclorg/postgresql-16-c9s"
@@ -45,10 +48,30 @@ kind load docker-image "${IMAGE_REPO}:${IMAGE_TAG}" --name "${CLUSTER}"
 docker pull "${PG_IMAGE}" 2>/dev/null || podman pull "${PG_IMAGE}"
 kind load docker-image "${PG_IMAGE}" --name "${CLUSTER}"
 
-echo "== helm install (authz=local so the e2e can mint with a grid-admin token) =="
+# Under kube the chart ships the grid-admin Role, SA and binding; grid-subj is
+# bound through gridAdmins.subjects.
+KUBE_ARGS=()
+if [ "${AUTHZ}" = "kube" ]; then
+  KUBE_ARGS=(--set enrollment.gridAdmins.serviceAccount.create=true
+    --set enrollment.gridAdmins.subjects[0].kind=ServiceAccount
+    --set enrollment.gridAdmins.subjects[0].name=grid-subj
+    --set "enrollment.gridAdmins.subjects[0].namespace=${NS}")
+fi
+if [ "${AUTHZ}" = "kube" ]; then
+  # A cluster-wide group as a grid-admin subject must fail the render.
+  if helm template grid-enrollment "${CHART}" -n "${NS}" --set enrollment.authz=kube \
+      --set enrollment.gridAdmins.subjects[0].kind=Group \
+      --set enrollment.gridAdmins.subjects[0].name=system:authenticated >/dev/null 2>"${WORK}/render.err"; then
+    fail "chart rendered system:authenticated as a grid-admin subject"
+  fi
+  # Schema or template guard; either names the subjects field.
+  grep -qE "gridAdmins[/.]subjects" "${WORK}/render.err" || fail "render failed for another reason: $(cat "${WORK}/render.err")"
+  pass "system:authenticated grid-admin subject fails the render"
+fi
+echo "== helm install (authz=${AUTHZ}) =="
 helm --kube-context "${CTX}" install grid-enrollment "${CHART}" -n "${NS}" --create-namespace \
   --set "image.repository=${IMAGE_REPO}" --set "image.tag=${IMAGE_TAG}" --set image.pullPolicy=Never \
-  --set enrollment.authz=local --timeout 5m
+  --set "enrollment.authz=${AUTHZ}" --set "enrollment.tokenAudience=${AUDIENCE}" "${KUBE_ARGS[@]}" --timeout 5m
 ${K} rollout status deploy/grid-enrollment-db --timeout=180s
 ${K} rollout status deploy/grid-enrollment --timeout=240s
 
@@ -62,8 +85,45 @@ ${K} get secret grid-gossip-key >/dev/null 2>&1 && fail "vestigial grid-gossip-k
   || pass "no gossip Secret (identity-only)"
 
 echo "== enroll flow: mint -> CSR -> enroll -> verify =="
-ADMIN="$(${K} get secret grid-enrollment-grid-admin-tokens -o jsonpath='{.data.tokens}' | base64 -d | sed 's/^[^:]*://' | tr -d '\n')"
-[ -n "${ADMIN}" ] || fail "no grid-admin token generated"
+if [ "${AUTHZ}" = "kube" ]; then
+  # grid-admin and grid-subj: the chart's Role. grid-cadmin: a ClusterRole.
+  # grid-otherns: a Role in another namespace. grid-noperm: no grant.
+  for sa in grid-subj grid-cadmin grid-otherns grid-noperm; do ${K} create serviceaccount "${sa}"; done
+  # Applied as YAML: `kubectl create role --resource` needs discovery, and
+  # enrollmenttokens has no CRD (only the SubjectAccessReview sees it).
+  kubectl --context "${CTX}" create namespace grid-other
+  rbac() { # <kind> <namespace or ""> <binding sa>
+    local ns_meta="" role_kind="$1" bind_kind="$1Binding"
+    [ -n "$2" ] && ns_meta="namespace: $2"
+    kubectl --context "${CTX}" apply -f - <<YAML
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ${role_kind}
+metadata: {name: grid-enrollment-admin${ns_meta:+, ${ns_meta}}}
+rules:
+  - apiGroups: [grid.praxis-proxy.io]
+    resources: [enrollmenttokens]
+    verbs: [create, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ${bind_kind}
+metadata: {name: grid-enrollment-admin${ns_meta:+, ${ns_meta}}}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ${role_kind}, name: grid-enrollment-admin}
+subjects: [{kind: ServiceAccount, name: $3, namespace: ${NS}}]
+YAML
+  }
+  rbac Role grid-other grid-otherns
+  rbac ClusterRole "" grid-cadmin
+  sa_token() { ${K} create token "$1" --duration 10m "${@:2}"; }
+  ADMIN="$(sa_token grid-admin --audience "${AUDIENCE}")"
+  SUBJ="$(sa_token grid-subj --audience "${AUDIENCE}")"
+  CADMIN="$(sa_token grid-cadmin --audience "${AUDIENCE}")"
+  OTHER_NS="$(sa_token grid-otherns --audience "${AUDIENCE}")"
+  NO_PERM="$(sa_token grid-noperm --audience "${AUDIENCE}")"
+  NO_AUD="$(sa_token grid-admin)"
+else
+  ADMIN="$(${K} get secret grid-enrollment-grid-admin-tokens -o jsonpath='{.data.tokens}' | base64 -d | sed 's/^[^:]*://' | tr -d '\n')"
+fi
+[ -n "${ADMIN}" ] || fail "no grid-admin token"
 ${K} port-forward deploy/grid-enrollment 18443:8443 >"${WORK}/pf.log" 2>&1 &
 PF=$!; trap 'kill ${PF} 2>/dev/null || true; [ "${KEEP:-0}" = "1" ] || kind delete cluster --name "${CLUSTER}" >/dev/null 2>&1 || true; rm -rf "${WORK}"' EXIT
 sleep 4
@@ -75,12 +135,30 @@ code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:18
 curl -sk -o /dev/null -w '%{http_code}' "https://127.0.0.1:18443/readyz" | grep -q 200 \
   || fail "/readyz not 200 over TLS"; pass "/readyz 200 over TLS"
 
-MINT="$(curl -sk -X POST "https://127.0.0.1:18443/v1alpha1/enrollmenttokens" \
-  -H "Authorization: Bearer ${ADMIN}" -H "Content-Type: application/json" \
-  -d '{"siteName":"site-a","gridNetworkRef":"grid-1"}')"
+# mint <bearer> [site]: writes the body to mint.json, prints the HTTP status.
+mint() {
+  curl -sk -o "${WORK}/mint.json" -w '%{http_code}' -X POST "https://127.0.0.1:18443/v1alpha1/enrollmenttokens" \
+    -H "Authorization: Bearer $1" -H "Content-Type: application/json" \
+    -d "{\"siteName\":\"${2:-site-a}\",\"gridNetworkRef\":\"grid-1\"}"
+}
+expect_mint() { # <want> <bearer> <site> <what>
+  local code; code="$(mint "$2" "$3")"
+  [ "${code}" = "$1" ] || fail "$4 got HTTP ${code}, expected $1: $(cat "${WORK}/mint.json")"
+  pass "$4 ($1)"
+}
+if [ "${AUTHZ}" = "kube" ]; then
+  expect_mint 401 "${NO_AUD}" site-x "token without the ${AUDIENCE} audience refused"
+  expect_mint 403 "${NO_PERM}" site-x "audience-bound token without RBAC refused"
+  expect_mint 403 "${OTHER_NS}" site-x "Role in another namespace refused"
+  expect_mint 201 "${SUBJ}" site-s "chart gridAdmins.subjects grant mints"
+  expect_mint 201 "${CADMIN}" site-c "ClusterRole grant mints"
+fi
+code="$(mint "${ADMIN}")"
+[ "${code}" = "201" ] || fail "mint got HTTP ${code}: $(cat "${WORK}/mint.json")"
+MINT="$(cat "${WORK}/mint.json")"
 TOKEN="$(printf '%s' "${MINT}" | python3 -c "import sys,json;print(json.load(sys.stdin)['token'])")" \
   || fail "mint failed: ${MINT}"
-pass "minted site token pinning site-a"
+pass "minted site token pinning site-a (authz=${AUTHZ}, 201)"
 
 openssl ecparam -name prime256v1 -genkey -noout -out "${WORK}/site.key" 2>/dev/null
 openssl req -new -key "${WORK}/site.key" -subj "/CN=site-a" -out "${WORK}/site.csr" 2>/dev/null
@@ -103,4 +181,4 @@ openssl x509 -in "${WORK}/leaf.pem" -noout -ext subjectAltName 2>/dev/null | gre
   || fail "leaf SAN missing the pinned SPIFFE URI"
 pass "leaf SAN carries the pinned SPIFFE URI"
 
-echo "== e2e GREEN: helm reproducible + real enroll flow verified =="
+echo "== e2e GREEN (authz=${AUTHZ}): helm reproducible + real enroll flow verified =="

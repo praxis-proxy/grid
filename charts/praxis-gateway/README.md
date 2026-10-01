@@ -75,6 +75,7 @@ AI image; these values may advance independently.
 | `gatewayConfig.render` | bool | `false` | Render praxis.yaml from these values instead of a BYO ConfigMap. Never emits `insecure_options`. |
 | `gatewayConfig.model` | string | **required** when rendered | Model advertised on the routing candidates. |
 | `gatewayConfig.backends` | list | **required** when rendered | Backend clusters (`cluster`, `endpoints`, `healthCheck`, `transport`). |
+| `gatewayConfig.backends[].transport` | object | `mutual_tls` with `tls.enabled`, else `plaintext` | `mode`: `mutual_tls` presents the grid identity, `tls` verifies the server cert with no client cert, `plaintext` is cleartext. `sni` names the peer cert (required for `mutual_tls` and for `tls` to an IP endpoint). `ca` (`configMap` or `secret`, `key`) is the CA for a `tls` backend. A `tls` backend trusts, first match wins: `transport.ca`, then `upstreamCA`, then the process store, which is the `auth.validateCA` bundle when that is set. |
 | `gatewayConfig.localSite` | string | `hub` | Local site for locality scoring. |
 | `gatewayConfig.auth.mode` | string | **required** when rendered | `api-key` validates the caller's key and needs an image that registers `identity/api-key` (praxis-policy 0.4 or later); the render refuses it on the default `ai:0.4.0` image (by effective reference; a digest pin of that same image is not detected). `none` renders no policy filter, for use only behind an authenticating front. |
 | `gatewayConfig.auth.allowUnauthenticatedExposure` | bool | `false` | With `none`, allow a LoadBalancer or NodePort Service. Without it the render fails. The guard sees only this chart's Service, not `oc expose`, another Service selecting the pod labels, an HTTPRoute, or a hand-made Service with `service.enabled=false`. Use `networkPolicy` for those. |
@@ -118,6 +119,26 @@ AI image; these values may advance independently.
 | `tolerations` | list | `[]` | Pod tolerations. |
 | `topologySpreadConstraints` | list | `[]` | Topology spread constraints. |
 | `priorityClassName` | string | `""` | Pod priority class. |
+
+### KServe backend on OpenShift
+
+A KServe LLMInferenceService serves HTTPS on :8000 with a cert from the OpenShift
+service CA. Use the workload Service ClusterIP as the endpoint: praxis refuses a
+hostname that resolves to a private address. Set `sni` to the Service DNS name, which
+the cert carries, and trust the service CA that OpenShift injects into every namespace:
+
+```yaml
+gatewayConfig:
+  backends:
+    - cluster: local-qwen3
+      endpoints: ["172.30.12.34:8000"]   # kubectl get svc qwen3-kserve-workload-svc -o jsonpath='{.spec.clusterIP}'
+      transport:
+        mode: tls
+        sni: qwen3-kserve-workload-svc.llm.svc
+        ca: { configMap: openshift-service-ca.crt, key: service-ca.crt }
+```
+
+The health check defaults to `tcp` for TLS backends.
 
 ### validateCA bundle recipe
 

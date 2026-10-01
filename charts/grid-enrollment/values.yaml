@@ -10,7 +10,7 @@ commonLabels: {}
 
 image:
   # Enrollment app image. The same binary serves the API and runs the
-  # `enrollment bootstrap` Job (built with --features sar,bootstrap).
+  # `enrollment bootstrap` Job (the sar and bootstrap features, on by default).
   repository: quay.io/praxis-proxy/grid-enrollment
   tag: ""            # defaults to .Chart.AppVersion
   digest: ""         # sha256:<64 hex>; when set, tag is ignored
@@ -46,8 +46,45 @@ ca:
 # ------------------------------------------------------------------------------
 serving:
   secretName: enrollment-serving-tls  # kubernetes.io/tls: tls.crt + tls.key
-  existingSecretRef: ""               # BYO serving cert; else the bootstrap issues it
+  existingSecretRef: ""               # BYO serving cert; else the bootstrap issues it. With a Route, it must carry route.host
   extraDnsNames: []                   # extra SANs beyond the in-cluster Service DNS
+
+# ------------------------------------------------------------------------------
+# Route: enrollment is a cross-peer front door, so a Route ships by default on
+# OpenShift. Passthrough keeps the grid-CA serving cert end-to-end; the site validates
+# it with the out-of-band grid-CA bundle (--cacert). When a Route renders, route.host
+# is required for passthrough and is auto-added to the serving cert SAN. Reencrypt
+# is the opt-out for a trusted router cert. Edge is rejected.
+# ------------------------------------------------------------------------------
+route:
+  # -- auto renders the Route when the cluster serves route.openshift.io/v1; true or
+  # false forces it. helm template without --api-versions route.openshift.io/v1 renders
+  # auto as off.
+  enabled: auto
+  # -- External hostname. Required for passthrough when a Route renders (auto-added to
+  # the serving cert SAN). A DNS-1123 subdomain, no wildcard.
+  host: ""
+  # -- Extra Route annotations. They override rateLimit's annotations on a key clash.
+  annotations: {}
+  # -- Per-source-IP connection limits in the OpenShift router (they apply to
+  # passthrough). Clients behind one SNAT address share a limit.
+  rateLimit:
+    enabled: true
+    # -- Concurrent TCP connections per source IP.
+    concurrentTcp: 10
+    # -- TCP connection rate per source IP, in the router's rate window.
+    rateTcp: 20
+  tls:
+    # -- passthrough keeps the grid-CA cert and the one-time token end-to-end.
+    # reencrypt terminates at the router: it exposes the enrollment token to the
+    # ingress and breaks the site's out-of-band grid-CA pin. edge is rejected,
+    # since enrollment serves TLS only.
+    termination: passthrough
+    # -- Redirect or None. Allow is refused: plaintext would leak the token.
+    insecureEdgeTerminationPolicy: None
+    # -- PEM CA for reencrypt to verify the backend (grid-CA bundle, ca.crt from
+    # Secret grid-ca-bundle). Required for reencrypt.
+    destinationCACertificate: ""
 
 # ------------------------------------------------------------------------------
 # Enrollment service
@@ -60,6 +97,21 @@ enrollment:
   # (needs the sar-feature image and the auth-delegator RBAC this chart binds).
   # local: the standalone grid-admin-token table, for non-kube deploys.
   authz: kube                        # kube | local
+  # Audience a grid-admin token must be bound to under authz=kube, e.g.
+  # kubectl create token <sa> --audience grid-enrollment --duration 10m.
+  # Never an API-server audience (kubernetes, https://kubernetes.default.svc,
+  # or the cluster's service account issuer): every API token carries it.
+  tokenAudience: grid-enrollment
+  # Grid-admins under authz=kube. The chart always creates the
+  # <fullname>-grid-admin Role (create/delete on enrollmenttokens) in the release
+  # namespace and binds it to these subjects.
+  gridAdmins:
+    # RBAC subjects, e.g. [{kind: Group, name: grid-admins}].
+    subjects: []
+    serviceAccount:
+      # Create a ServiceAccount to mint grid-admin tokens from, and bind it.
+      create: false
+      name: grid-admin
   gridAdminTokens:
     generate: true                   # generate a grid-admin-token Secret on install
     existingSecretRef: ""            # BYO Secret with key "tokens" (name:token lines)
@@ -105,7 +157,8 @@ db:
     # bootstrap Job; the enrollment client connects sslmode=verify-full against
     # the grid CA bundle. The enrollment binary refuses a plaintext DB, so this
     # is not optional on the builtin path. Requires the generated CA
-    # (ca.method=builtin); with a provided CA, use an external DB.
+    # (ca.method=builtin); with a provided CA, use an external DB. Bootstrap
+    # rolls the builtin DB when it re-issues this cert.
     tls:
       servingSecretName: grid-db-serving-tls
   external:

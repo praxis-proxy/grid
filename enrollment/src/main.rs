@@ -3,7 +3,7 @@
 use std::{net::SocketAddr, str::FromStr as _, sync::Arc, time::Duration};
 
 use axum_server::Handle;
-use enrollment::{AppState, GridAdmins, Store, authz::Authorizer, router};
+use enrollment::{AppState, GridAdmins, SharedCa, Store, authz::Authorizer, router};
 use sqlx::postgres::{PgConnectOptions, PgSslMode};
 use tokio::signal;
 
@@ -101,7 +101,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let state = Arc::new(AppState {
         store: open_store().await?,
-        ca,
+        ca: SharedCa::new(ca),
         // Boxed: the Kubernetes-RBAC authorizer builds a large future under the sar
         // feature, kept off the startup stack frame.
         authorizer: Box::pin(build_authorizer()).await?,
@@ -111,6 +111,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Reload the server certificate on an interval so a rotated TLS secret is
     // served without a restart. A failed reload keeps the current certificate.
     tokio::spawn(reload_tls(tls.clone(), tls_cert, tls_key));
+    // Reload the signing CA the same way, so a regenerated or restored CA signs
+    // new site certificates without a restart.
+    tokio::spawn(reload_ca(Arc::clone(&state), common_name, ca_cert_path, ca_key_path));
 
     // Drain in-flight requests on SIGTERM or SIGINT rather than cutting them off,
     // so a rolling deploy does not abort an enrollment mid-issue.
@@ -172,9 +175,10 @@ async fn shutdown_signal(handle: Handle<SocketAddr>) {
 )]
 async fn reload_tls(config: TlsConfig, cert_path: String, key_path: String) {
     let mut ticker = tokio::time::interval(TLS_RELOAD_INTERVAL);
-    ticker.tick().await;
+    let mut last_expiry_warning: Option<std::time::Instant> = None;
     loop {
         ticker.tick().await;
+        warn_if_serving_cert_expiring(&cert_path, &mut last_expiry_warning).await;
         // rustls reloads asynchronously, the openssl acceptor reload synchronously.
         #[cfg(not(feature = "fips"))]
         let reloaded = config.reload_from_pem_file(&cert_path, &key_path).await;
@@ -183,6 +187,68 @@ async fn reload_tls(config: TlsConfig, cert_path: String, key_path: String) {
         if let Err(err) = reloaded {
             tracing::warn!(%err, "server certificate reload failed, keeping the current certificate");
         }
+    }
+}
+
+/// Reload the signing CA from disk on an interval, swapping it in when its
+/// certificate changes. A reload that fails keeps the current CA.
+#[expect(
+    clippy::infinite_loop,
+    reason = "a background reloader runs for the life of the process"
+)]
+async fn reload_ca(state: Arc<AppState>, common_name: String, cert_path: String, key_path: String) {
+    let mut ticker = tokio::time::interval(TLS_RELOAD_INTERVAL);
+    ticker.tick().await;
+    loop {
+        ticker.tick().await;
+        // A cert read mid-rotation that does not match its key fails the load and
+        // is retried on the next tick.
+        let material = async {
+            let cert = tokio::fs::read_to_string(&cert_path).await?;
+            let key = tokio::fs::read_to_string(&key_path).await?;
+            Ok::<_, std::io::Error>((cert, key))
+        }
+        .await;
+        let reloaded = match material {
+            Ok((cert, key)) => state
+                .ca
+                .reload(&common_name, &cert, &key)
+                .map_err(|err| err.to_string()),
+            Err(err) => Err(err.to_string()),
+        };
+        match reloaded {
+            Ok(Some((old, new))) => tracing::warn!(
+                old_fingerprint = %old,
+                new_fingerprint = %new,
+                "signing CA changed on disk; new site certificates are signed by the new CA"
+            ),
+            Ok(None) => {},
+            Err(err) => tracing::warn!(%err, "signing CA reload failed, keeping the current CA"),
+        }
+    }
+}
+
+/// Serving cert expiry this close raises a warning, matching bootstrap's renewal window.
+const EXPIRY_WARNING_WINDOW: time::Duration = time::Duration::days(30);
+/// Repeat the expiry warning at most this often.
+const EXPIRY_WARNING_EVERY: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Warn, at most daily, when the serving cert is within [`EXPIRY_WARNING_WINDOW`]
+/// of expiry: bootstrap renews it only on an install or upgrade.
+async fn warn_if_serving_cert_expiring(cert_path: &str, last: &mut Option<std::time::Instant>) {
+    if last.is_some_and(|at| at.elapsed() < EXPIRY_WARNING_EVERY) {
+        return;
+    }
+    let Ok(cert) = tokio::fs::read_to_string(cert_path).await else {
+        return;
+    };
+    if certs::cert_expires_within(&cert, EXPIRY_WARNING_WINDOW).unwrap_or(false) {
+        let not_after = certs::cert_issuer_and_expiry(&cert).map_or_else(|_bad| "unknown".to_owned(), |(_, at)| at);
+        tracing::warn!(
+            %not_after,
+            "enrollment serving certificate expires within 30 days; run helm upgrade to renew it"
+        );
+        *last = Some(std::time::Instant::now());
     }
 }
 
@@ -326,10 +392,16 @@ async fn build_authorizer() -> Result<Authorizer, Box<dyn std::error::Error>> {
         Some("kube") => {
             #[cfg(feature = "sar")]
             {
-                let kube = enrollment::authz::KubeAuthorizer::connect()
+                let audience = std::env::var("ENROLLMENT_TOKEN_AUDIENCE")
+                    .unwrap_or_else(|_| enrollment::authz::DEFAULT_TOKEN_AUDIENCE.to_owned());
+                let kube = enrollment::authz::KubeAuthorizer::connect(audience.clone())
                     .await
                     .map_err(std::io::Error::other)?;
-                tracing::info!("grid-admin authorization: Kubernetes RBAC (SubjectAccessReview)");
+                tracing::info!(
+                    %audience,
+                    namespace = kube.namespace(),
+                    "grid-admin authorization: Kubernetes RBAC (SubjectAccessReview)"
+                );
                 Ok(Authorizer::Kube(kube))
             }
             #[cfg(not(feature = "sar"))]

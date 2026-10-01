@@ -102,6 +102,11 @@ gateway:
   # -- Gateway Kubernetes Service name for the operator to discover. Maps to
   # GRID_GATEWAY_SERVICE_NAME.
   serviceName: ""
+  # -- Namespace of the gateway Service. Empty uses the release namespace. Maps
+  # to GRID_GATEWAY_NAMESPACE.
+  namespace: ""
+  # -- Allow gateway.namespace to be default, kube-*, or openshift-*.
+  allowSystemNamespace: false
   # -- Gateway port for operator-to-gateway discovery. Maps to
   # GRID_GATEWAY_PORT.
   port: ""

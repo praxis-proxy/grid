@@ -188,6 +188,10 @@ jobs:
     needs: changes
     if: needs.changes.outputs.runtime == 'true'
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        authz: [local, kube]
     timeout-minutes: 30
     permissions:
       contents: read
@@ -225,6 +229,8 @@ jobs:
           cache-to: type=gha,mode=max,scope=helm-kind-enrollment
 
       - name: Run enrollment e2e (helm reproducibility and the enroll flow)
+        env:
+          AUTHZ: ${{ matrix.authz }}
         run: |
           IMAGE_REPO=ghcr.io/praxis-proxy/grid-enrollment IMAGE_TAG=ci \
             ./scripts/e2e-enrollment.sh
@@ -233,7 +239,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: enrollment-e2e-logs
+          name: enrollment-e2e-logs-${{ matrix.authz }}
           path: /tmp/helm-kind-logs/
           if-no-files-found: ignore
           retention-days: 5

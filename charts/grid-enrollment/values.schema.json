@@ -2,6 +2,37 @@
   "$schema": "https://json-schema.org/draft-07/schema#",
   "type": "object",
   "properties": {
+    "route": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "enum": [true, false, "true", "false", "auto"],
+          "description": "auto renders the Route when route.openshift.io/v1 is served."
+        },
+        "host": {
+          "type": "string",
+          "maxLength": 253,
+          "pattern": "^$|^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)*$",
+          "description": "DNS-1123 subdomain, no wildcard: it becomes a serving cert SAN."
+        },
+        "rateLimit": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "concurrentTcp": { "type": "integer", "minimum": 1 },
+            "rateTcp": { "type": "integer", "minimum": 1 }
+          }
+        },
+        "tls": {
+          "type": "object",
+          "properties": {
+            "termination": { "enum": ["passthrough", "reencrypt"] },
+            "insecureEdgeTerminationPolicy": { "enum": ["None", "Redirect", "Allow", ""] }
+          }
+        }
+      }
+    },
     "image": {
       "type": "object",
       "properties": {
@@ -41,6 +72,45 @@
       "type": "object",
       "properties": {
         "authz": { "type": "string", "enum": ["local", "kube"] },
+        "gridAdmins": {
+          "type": "object",
+          "properties": {
+            "subjects": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["kind", "name"],
+                "properties": {
+                  "kind": { "type": "string", "enum": ["User", "Group", "ServiceAccount"] },
+                  "name": { "type": "string", "minLength": 1, "not": { "pattern": "^system:(masters|authenticated|unauthenticated|serviceaccounts)(:.*)?$" } },
+                  "namespace": { "type": "string", "pattern": "^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$" }
+                },
+                "additionalProperties": false
+              }
+            },
+            "serviceAccount": {
+              "type": "object",
+              "properties": {
+                "create": { "type": "boolean" },
+                "name": { "type": "string", "pattern": "^[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?$" }
+              }
+            }
+          }
+        },
+        "tokenAudience": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^\\S+$",
+          "not": {
+            "enum": [
+              "kubernetes",
+              "https://kubernetes.default.svc",
+              "https://kubernetes.default.svc/",
+              "https://kubernetes.default.svc.cluster.local",
+              "https://kubernetes.default.svc.cluster.local/"
+            ]
+          }
+        },
         "listenAddr": { "type": "string" }
       }
     },

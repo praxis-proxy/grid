@@ -80,9 +80,25 @@
                 "additionalProperties": false,
                 "description": "Upstream transport. Defaults to mutual_tls when tls.enabled, else plaintext.",
                 "properties": {
-                  "mode": { "type": "string", "enum": ["mutual_tls", "plaintext"] },
-                  "sni": { "type": "string" }
-                }
+                  "mode": { "type": "string", "enum": ["mutual_tls", "tls", "plaintext"] },
+                  "sni": { "type": "string" },
+                  "ca": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "description": "tls only: CA bundle that verifies this backend.",
+                    "properties": {
+                      "configMap": { "type": "string" },
+                      "secret": { "type": "string" },
+                      "key": { "type": "string" }
+                    },
+                    "oneOf": [
+                      { "required": ["configMap"], "properties": { "configMap": { "minLength": 1 }, "secret": { "maxLength": 0 } } },
+                      { "required": ["secret"], "properties": { "secret": { "minLength": 1 }, "configMap": { "maxLength": 0 } } }
+                    ]
+                  }
+                },
+                "if": { "required": ["ca"] },
+                "then": { "required": ["mode"], "properties": { "mode": { "const": "tls" } } }
               }
             }
           }

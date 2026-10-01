@@ -14,10 +14,9 @@ FROM rust:1.96-alpine AS builder
 
 ENV OPENSSL_STATIC=1
 
-# Both features are needed and independent: sar builds the Kubernetes-RBAC
-# authorizer (the ENROLLMENT_AUTHZ=kube default), bootstrap builds the
-# `enrollment bootstrap` subcommand. Each pulls the kube client.
-ARG CARGO_FEATURES="sar,bootstrap"
+# The default features build the Kubernetes-RBAC authorizer (sar) and the
+# `enrollment bootstrap` subcommand. CARGO_FEATURES adds more.
+ARG CARGO_FEATURES=""
 
 RUN apk add --no-cache musl-dev openssl-dev openssl-libs-static pkgconf cmake make g++
 

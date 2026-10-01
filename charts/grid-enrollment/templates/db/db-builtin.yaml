@@ -116,6 +116,7 @@ spec:
         {{- include "grid-enrollment.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: db
     spec:
+      enableServiceLinks: false
       securityContext:
         {{- toYaml .Values.enrollment.podSecurityContext | nindent 8 }}
       {{- if $tls }}

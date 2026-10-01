@@ -12,7 +12,7 @@ up a site ready to enroll.
 
 ## Install
 
-Batteries included, no values required:
+Batteries included. Off OpenShift no values are required:
 
 ```bash
 helm install grid charts/grid-enrollment --namespace grid-enroll --create-namespace
@@ -22,6 +22,27 @@ The default install generates the Grid CA and the endpoint serving cert through 
 pre-install hook, deploys Postgres, and runs the service over TLS. Under
 `enrollment.authz=local` it also generates a grid-admin token. `helm install
 --dry-run` and the NOTES output show the endpoint and the trust anchor.
+
+## Route
+
+`route.enabled` defaults to `auto`: the chart renders a passthrough Route only when
+the cluster serves `route.openshift.io/v1`, and `true` or `false` forces it. A
+rendered passthrough Route needs `route.host`, which the bootstrap adds to the
+serving cert SAN:
+
+```bash
+helm install grid charts/grid-enrollment --namespace grid-enroll --create-namespace \
+  --set route.host=enrollment.apps.<cluster-domain>
+```
+
+The bootstrap Job's RBAC is removed once the hook finishes, whether it succeeded or
+failed, so retry a failed bootstrap with `helm upgrade`, not by re-running the Job.
+
+`helm template` sees no cluster APIs, so `auto` renders no Route there. GitOps
+renders for OpenShift pass `--api-versions route.openshift.io/v1` (Argo CD passes
+the cluster's APIs itself). `reencrypt` terminates at the router and breaks the
+site's grid-CA pin, so keep `passthrough`. `edge` is rejected: enrollment serves
+TLS only.
 
 ## Topology
 
@@ -60,6 +81,17 @@ generated CA, and the service refuses a plaintext DB. A provided CA
 (`ca.method=provided`) does not run the bootstrap Job, so it issues no DB cert.
 Provided-CA installs must therefore use an external DB (`db.type=external`) whose
 URL sets `sslmode` (verify-full for FIPS).
+
+Postgres reads its serving cert at pod start. Each bootstrap run compares the
+builtin DB Deployment's `grid.praxis-proxy.io/db-serving-cert-sha256` pod
+annotation with the cert in its Secret and rolls the Deployment when they
+differ, for example after a re-issue or a CA regeneration. A sync that replaces
+the Deployment (Argo CD `Replace=true`) drops the annotation, so the next
+bootstrap run restarts Postgres once more, harmlessly.
+
+After a CA change, the enrollment service's first DB reconnect can fail
+verify-full until the grid-ca-bundle mount refreshes, typically within 1-2
+minutes. The connection pool retries on its own.
 
 ## Security
 

@@ -15,11 +15,12 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{delete as delete_route, get, post},
 };
-use certs::{CaCert, EnrollError, MAX_CSR_PEM_BYTES, Validity, sign_csr, validate_site_name, verify_csr};
+use certs::{EnrollError, MAX_CSR_PEM_BYTES, Validity, sign_csr, validate_site_name, verify_csr};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 
 use crate::{
+    SharedCa,
     auth::digest,
     authz::{Authorizer, AuthzError, Operation},
     generated::{Enrollment, EnrollmentRequest, EnrollmentToken, EnrollmentTokenRequest, Error as ErrorBody},
@@ -39,8 +40,8 @@ pub struct AppState {
     /// Where tokens and enrollments are kept.
     pub store: Store,
 
-    /// The CA that signs enrolled certificates.
-    pub ca: CaCert,
+    /// The CA that signs enrolled certificates, reloaded when its Secret changes.
+    pub ca: SharedCa,
 
     /// How minting and revoking are authorized (grid-admin token table, or RBAC).
     pub authorizer: Authorizer,
@@ -399,9 +400,11 @@ async fn enroll(
 
     let csr = input.csr;
     let validity = Validity::starting_now(state.cert_lifetime);
+    // One snapshot, so the certificate and the CA returned with it always match.
+    let ca = state.ca.current();
     let (enrollment_id, issued) = Box::pin(state.store.redeem_and_issue(&token_sha256, |pin: &Pin| {
         // Signed under the pinned name, with every SAN rebuilt from it.
-        sign_csr(&state.ca, &pin.site_name, &csr, validity)
+        sign_csr(&ca, &pin.site_name, &csr, validity)
             .map(|cert| Issued {
                 certificate: cert.cert_pem,
                 spiffe_id: cert.spiffe_id,
@@ -419,7 +422,7 @@ async fn enroll(
             certificate: issued.certificate,
             // The grid CA rides back with the certificate, so a site holds the
             // trust anchor without a separate fetch it could not yet verify.
-            ca_certificate: state.ca.cert_pem.clone(),
+            ca_certificate: ca.cert_pem.clone(),
             spiffe_id: issued.spiffe_id,
             public_key_sha256: issued.public_key_sha256,
         }),

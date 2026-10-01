@@ -23,6 +23,7 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
     spec:
+      enableServiceLinks: false
       automountServiceAccountToken: false
       {{- if and .Values.overlay.enabled .Values.overlay.sidecar.enabled }}
       serviceAccountName: {{ include "praxis-gateway.fullname" . }}-overlay-sync
@@ -201,6 +202,15 @@ spec:
               mountPath: {{ .Values.gatewayConfig.upstreamCA.mountPath | quote }}
               readOnly: true
             {{- end }}
+            {{- if .Values.gatewayConfig.render }}
+            {{- range $i, $backend := .Values.gatewayConfig.backends }}
+            {{- if (.transport).ca }}
+            - name: backend-ca-{{ $i }}
+              mountPath: /etc/praxis/backend-ca/{{ $i }}
+              readOnly: true
+            {{- end }}
+            {{- end }}
+            {{- end }}
             {{- if .Values.gatewayConfig.listenerTls.enabled }}
             - name: listener-tls
               mountPath: {{ .Values.gatewayConfig.listenerTls.mountPath | quote }}
@@ -274,6 +284,20 @@ spec:
         - name: upstream-ca
           secret:
             secretName: {{ .Values.gatewayConfig.upstreamCA.secretName | quote }}
+        {{- end }}
+        {{- if .Values.gatewayConfig.render }}
+        {{- range $i, $backend := .Values.gatewayConfig.backends }}
+        {{- with (.transport).ca }}
+        - name: backend-ca-{{ $i }}
+          {{- if .configMap }}
+          configMap:
+            name: {{ .configMap | quote }}
+          {{- else }}
+          secret:
+            secretName: {{ .secret | quote }}
+          {{- end }}
+        {{- end }}
+        {{- end }}
         {{- end }}
         {{- $validateCA := .Values.gatewayConfig.auth.validateCA }}
         {{- $apiKeyRender := and .Values.gatewayConfig.render (eq .Values.gatewayConfig.auth.mode "api-key") }}

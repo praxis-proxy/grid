@@ -134,6 +134,46 @@ DB_CONNECTION_URL
 {{- end }}
 
 {{/*
+Whether a Route renders: route.enabled true or false, or auto when the cluster serves
+route.openshift.io/v1. Emits "true" or nothing.
+*/}}
+{{- define "grid-enrollment.routeEnabled" -}}
+{{- $e := .Values.route.enabled -}}
+{{- if or (eq (toString $e) "true") (and (eq (toString $e) "auto") (.Capabilities.APIVersions.Has "route.openshift.io/v1")) -}}
+true
+{{- end -}}
+{{- end }}
+
+{{/*
+Fail closed: passthrough needs route.host so the serving cert SAN can cover it.
+An ingress-generated host cannot be pinned, so the enrolling site (--cacert grid-ca)
+would hit a SAN mismatch.
+*/}}
+{{- define "grid-enrollment.validateRoute" -}}
+{{- $route := include "grid-enrollment.routeEnabled" . }}
+{{- if and $route (eq .Values.route.tls.termination "passthrough") (not .Values.route.host) }}
+{{- fail "route.host is required when a passthrough Route renders, so the serving cert SAN covers it: set route.host=<name>.apps.<cluster-domain>, or route.enabled=false (prefix both with the subchart name under an umbrella chart)" }}
+{{- end }}
+{{- if and $route (eq .Values.route.tls.termination "reencrypt") (not .Values.route.tls.destinationCACertificate) }}
+{{- fail "reencrypt needs route.tls.destinationCACertificate (the grid CA bundle, ca.crt from Secret grid-ca-bundle); passthrough is recommended" }}
+{{- end }}
+{{- if and $route (eq .Values.route.tls.insecureEdgeTerminationPolicy "Allow") }}
+{{- fail "route.tls.insecureEdgeTerminationPolicy=Allow is refused: it would serve the one-time enrollment token over plaintext. Use Redirect or None." }}
+{{- end }}
+{{- end }}
+
+{{/*
+Fail closed: local authz reads grid-admin tokens from a Secret the chart generates or
+the user provides; with neither, the pod would mount a Secret that does not exist.
+*/}}
+{{- define "grid-enrollment.validateAuthz" -}}
+{{- $tokens := .Values.enrollment.gridAdminTokens }}
+{{- if and (eq .Values.enrollment.authz "local") (not $tokens.generate) (not $tokens.existingSecretRef) }}
+{{- fail "enrollment.authz=local needs grid-admin tokens: set enrollment.gridAdminTokens.generate=true or enrollment.gridAdminTokens.existingSecretRef" }}
+{{- end }}
+{{- end }}
+
+{{/*
 Enrollment image: repository@digest when image.digest is set, else repository:tag.
 */}}
 {{- define "grid-enrollment.image" -}}

@@ -22,6 +22,9 @@ spec:
       {{- end }}
     spec:
       serviceAccountName: {{ include "grid-operator.serviceAccountName" . }}
+      # Service link env vars (a grid-gateway Service injects GRID_GATEWAY_PORT)
+      # would collide with the operator's GRID_* settings.
+      enableServiceLinks: false
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
@@ -70,10 +73,10 @@ spec:
             - name: GRID_GATEWAY_SERVICE_NAME
               value: {{ .Values.gateway.serviceName | quote }}
             {{- end }}
-            {{- if .Values.gateway.port }}
+            - name: GRID_GATEWAY_NAMESPACE
+              value: {{ .Values.gateway.namespace | default .Release.Namespace | quote }}
             - name: GRID_GATEWAY_PORT
-              value: {{ .Values.gateway.port | quote }}
-            {{- end }}
+              value: {{ .Values.gateway.port | default "8080" | quote }}
             - name: GRID_METRICS_ADDR
               value: {{ .Values.metrics.bindAddress | quote }}
             - name: RUST_LOG

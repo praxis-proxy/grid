@@ -57,7 +57,7 @@ data:
               {{- end }}
           - filter: load_balancer
             clusters:
-              {{- range $cfg.backends }}
+              {{- range $i, $backend := $cfg.backends }}
               {{- $mode := (.transport).mode | default (ternary "mutual_tls" "plaintext" $.Values.tls.enabled) }}
               {{- $hc := .healthCheck | default dict }}
               - name: {{ .cluster | quote }}
@@ -70,14 +70,22 @@ data:
                     key_path: {{ printf "%s/tls.key" $.Values.tls.mountPath | quote }}
                   sni: {{ (.transport).sni | quote }}
                   verify: true
+                {{- else if eq $mode "tls" }}
+                tls:
+                  {{- with (.transport).ca }}
+                  ca:
+                    ca_path: {{ printf "/etc/praxis/backend-ca/%d/%s" $i (.key | default "ca.crt") | quote }}
+                  {{- end }}
+                  sni: {{ include "praxis-gateway.backendSni" . | quote }}
+                  verify: true
                 {{- end }}
                 endpoints:
                   {{- range .endpoints }}
                   - {{ . | quote }}
                   {{- end }}
                 health_check:
-                  {{- /* mutual_tls defaults to a tcp probe. The active http probe is plaintext and cannot reach a TLS peer. A tcp connect works and still satisfies the present-health_check SSRF-skip guard. */}}
-                  {{- $hcType := $hc.type | default (ternary "tcp" "http" (eq $mode "mutual_tls")) }}
+                  {{- /* TLS backends default to a tcp probe. The active http probe is plaintext and cannot reach a TLS peer. A tcp connect works and still satisfies the present-health_check SSRF-skip guard. */}}
+                  {{- $hcType := $hc.type | default (ternary "http" "tcp" (eq $mode "plaintext")) }}
                   type: {{ $hcType | quote }}
                   {{- if eq $hcType "http" }}
                   path: {{ $hc.path | default "/health" | quote }}

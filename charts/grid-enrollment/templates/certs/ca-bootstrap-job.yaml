@@ -26,6 +26,7 @@ spec:
       labels:
         {{- include "grid-enrollment.selectorLabels" . | nindent 8 }}
     spec:
+      enableServiceLinks: false
       restartPolicy: Never
       serviceAccountName: {{ include "grid-enrollment.bootstrapServiceAccountName" . }}
       {{- with .Values.imagePullSecrets }}
@@ -50,6 +51,10 @@ spec:
             - "{{ .Values.ca.keySecretName }}"
             - "--ca-bundle-secret"
             - "{{ .Values.ca.bundleSecretName }}"
+            {{- if .Values.serving.existingSecretRef }}
+            {{- /* A BYO serving cert serves; issue none. */}}
+            - "--skip-serving"
+            {{- else }}
             - "--serving-secret"
             - "{{ .Values.serving.secretName }}"
             - "--serving-dns"
@@ -58,6 +63,12 @@ spec:
             - "--serving-dns"
             - "{{ . }}"
             {{- end }}
+            {{- if and (include "grid-enrollment.routeEnabled" .) .Values.route.host }}
+            {{- /* auto-add the Route host so passthrough validates against the serving cert SAN */}}
+            - "--serving-dns"
+            - "{{ .Values.route.host }}"
+            {{- end }}
+            {{- end }}
             {{- if eq .Values.db.type "builtin" }}
             - "--db-serving-secret"
             - "{{ .Values.db.builtin.tls.servingSecretName }}"
@@ -65,6 +76,8 @@ spec:
             - "{{ include "grid-enrollment.dbHost" . }}"
             - "--db-dns"
             - "{{ include "grid-enrollment.dbHost" . }}.{{ .Release.Namespace }}.svc"
+            - "--db-deployment"
+            - "{{ include "grid-enrollment.dbHost" . }}"
             {{- end }}
             {{- if .Values.ca.forceRegenerate }}
             - "--force-regenerate"

@@ -33,10 +33,8 @@ fn request_spki_der(csr_pem: &str) -> Result<Vec<u8>, BackendError> {
 
 /// Material for signing site certificates under a CA.
 pub(crate) struct CaMaterial {
-    /// CA subject parameters, reused as the issuer for leaves.
-    params: CertificateParams,
-    /// CA signing key.
-    key_pair: KeyPair,
+    /// The CA as issuer: its subject name, key usages, and signing key.
+    issuer: Issuer<'static, KeyPair>,
 }
 
 impl std::fmt::Debug for CaMaterial {
@@ -89,7 +87,9 @@ pub(crate) fn generate_ca(spec: &CertSpec<'_>) -> Result<GeneratedCa, BackendErr
     Ok(GeneratedCa {
         cert_pem: cert.pem(),
         key_pem: key_pair.serialize_pem(),
-        material: CaMaterial { params, key_pair },
+        material: CaMaterial {
+            issuer: Issuer::new(params, key_pair),
+        },
     })
 }
 
@@ -97,9 +97,8 @@ pub(crate) fn generate_ca(spec: &CertSpec<'_>) -> Result<GeneratedCa, BackendErr
 pub(crate) fn issue_leaf(ca: &CaMaterial, spec: &CertSpec<'_>) -> Result<GeneratedCert, BackendError> {
     let params = params_from_spec(spec)?;
     let key = KeyPair::generate().map_err(|err| BackendError::KeyGen(err.to_string()))?;
-    let issuer = Issuer::new(ca.params.clone(), &ca.key_pair);
     let cert = params
-        .signed_by(&key, &issuer)
+        .signed_by(&key, &ca.issuer)
         .map_err(|err| BackendError::Sign(err.to_string()))?;
     Ok(GeneratedCert {
         cert_pem: cert.pem(),
@@ -115,9 +114,8 @@ pub(crate) fn sign_csr(ca: &CaMaterial, spec: &CertSpec<'_>, csr_pem: &str) -> R
     let spki_der = request_spki_der(csr_pem)?;
     let public_key = SubjectPublicKeyInfo::from_der(&spki_der).map_err(|err| BackendError::Sign(err.to_string()))?;
     let params = params_from_spec(spec)?;
-    let issuer = Issuer::new(ca.params.clone(), &ca.key_pair);
     let cert = params
-        .signed_by(&public_key, &issuer)
+        .signed_by(&public_key, &ca.issuer)
         .map_err(|err| BackendError::Sign(err.to_string()))?;
     Ok(SignedCsr {
         cert_pem: cert.pem(),
@@ -131,7 +129,10 @@ pub(crate) fn csr_spki_der(csr_pem: &str) -> Result<Vec<u8>, BackendError> {
 }
 
 /// Load CA material from a PEM key and cert, checking they correspond.
-pub(crate) fn load_ca(spec: &CertSpec<'_>, key_pem: &str, cert_pem: &str) -> Result<CaMaterial, BackendError> {
+///
+/// The issuer name comes from the stored cert, not `_spec`, so leaves keep
+/// chaining to it when the configured common name changes.
+pub(crate) fn load_ca(_spec: &CertSpec<'_>, key_pem: &str, cert_pem: &str) -> Result<CaMaterial, BackendError> {
     let key_pair = KeyPair::from_pem(key_pem).map_err(|err| BackendError::InvalidCaKey(err.to_string()))?;
 
     // Cert must certify this key: the point in its SPKI is the key pair's point.
@@ -141,8 +142,9 @@ pub(crate) fn load_ca(spec: &CertSpec<'_>, key_pem: &str, cert_pem: &str) -> Res
         return Err(BackendError::CaCertKeyMismatch);
     }
 
-    let params = params_from_spec(spec)?;
-    Ok(CaMaterial { params, key_pair })
+    let issuer = Issuer::from_ca_cert_der(&cert_der.contents().to_vec().into(), key_pair)
+        .map_err(|_bad| BackendError::InvalidCaCert)?;
+    Ok(CaMaterial { issuer })
 }
 
 /// Verify a leaf's signature against the CA public key.

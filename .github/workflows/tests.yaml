@@ -149,6 +149,7 @@ jobs:
         run: |
           cargo clippy -p certs --no-default-features --features fips --all-targets -- -D warnings
           cargo clippy -p enrollment --no-default-features --features fips --all-targets -- -D warnings
+          cargo clippy -p enrollment --no-default-features --features fips,sar,bootstrap --bins -- -D warnings
           cargo clippy --manifest-path operator/Cargo.toml --no-default-features --features fips --lib --bins -- -D warnings
           cargo clippy --manifest-path overlay-sync/Cargo.toml --no-default-features --features fips --bins -- -D warnings
 
@@ -191,16 +192,38 @@ jobs:
       # and Postgres transport), keygen/signing, RNG, and the token digest through
       # system openssl, so it carries no ring and no rustls. sqlx-postgres still
       # links sha2/md-5 for Postgres password auth, unused under client-cert auth.
-      - name: Assert fips build of enrollment excludes ring and rustls
+      # Also checked with sar,bootstrap, the shipped image features, which pull kube.
+      # Proves a FIPS build is possible; it does not mean a FIPS image ships.
+      # Capture the tree so a cargo failure aborts the step instead of passing on
+      # empty output, and require openssl so an empty tree cannot pass.
+      - name: Assert fips build of enrollment excludes ring, rustls and aws-lc-rs
         run: |
-          for pkg in ring rustls; do
-            if cargo tree -p enrollment --no-default-features --features fips -e no-dev 2>/dev/null | grep -q "$pkg v"; then
-              echo "fips build of enrollment unexpectedly links $pkg"
-              cargo tree -p enrollment --no-default-features --features fips -e no-dev -i "$pkg"
+          for features in fips fips,sar,bootstrap; do
+            tree=$(cargo tree --locked -p enrollment --no-default-features --features "$features" -e no-dev)
+            grep -qE "(^|[ ─])openssl v" <<<"$tree" || { echo "enrollment build with $features has no openssl"; exit 1; }
+            for pkg in ring rustls aws-lc-rs aws-lc-sys aws-lc-fips-sys; do
+              if grep -qE "(^|[ ─])$pkg v" <<<"$tree"; then
+                echo "enrollment build with $features unexpectedly links $pkg"
+                cargo tree -p enrollment --no-default-features --features "$features" -e no-dev -i "$pkg"
+                exit 1
+              fi
+            done
+          done
+          echo "no ring, rustls or aws-lc-rs in enrollment fips builds"
+
+      # The default image build (sar,bootstrap) uses ring; kube's rustls must not add aws-lc-rs.
+      - name: Assert enrollment image build excludes aws-lc-rs
+        run: |
+          tree=$(cargo tree --locked -p enrollment --features sar,bootstrap -e normal)
+          grep -qE "(^|[ ─])kube-client v" <<<"$tree" || { echo "enrollment build with sar,bootstrap has no kube-client"; exit 1; }
+          for pkg in aws-lc-rs aws-lc-sys aws-lc-fips-sys; do
+            if grep -qE "(^|[ ─])$pkg v" <<<"$tree"; then
+              echo "enrollment build with sar,bootstrap unexpectedly links $pkg"
+              cargo tree -p enrollment --features sar,bootstrap -e normal -i "$pkg"
               exit 1
             fi
           done
-          echo "no ring or rustls in enrollment fips build"
+          echo "no aws-lc-rs in enrollment image build"
 
       # A vendored openssl (openssl-src) statically links a NON-validated module while
       # every ring/rustls assertion above still passes, silently breaking FIPS. The

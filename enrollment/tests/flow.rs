@@ -13,7 +13,7 @@ use axum::{
     body::Body,
     http::{Request, StatusCode},
 };
-use enrollment::{AppState, GridAdmins, Store, authz::Authorizer, router};
+use enrollment::{AppState, GridAdmins, SharedCa, Store, authz::Authorizer, router};
 use http_body_util::BodyExt as _;
 use rcgen::{CertificateParams, DnType, KeyPair, SanType};
 use serde_json::{Value, json};
@@ -27,7 +27,7 @@ fn service() -> axum::Router {
     let ca = certs::generate_ca("test-grid-ca").expect("ca");
     router(Arc::new(AppState {
         store: Store::memory(),
-        ca,
+        ca: SharedCa::new(ca),
         authorizer: Authorizer::Local(GridAdmins::from_table("tester: t0ken\n")),
         cert_lifetime: certs::DEFAULT_SITE_CERT_LIFETIME,
     }))

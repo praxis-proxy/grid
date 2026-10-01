@@ -17,9 +17,11 @@ compile_error!("one of `tls-rustls` or `fips` must be enabled");
 pub mod api;
 pub mod auth;
 pub mod authz;
+pub mod ca;
 pub mod generated;
 pub mod store;
 
 pub use api::{AppState, router};
 pub use auth::GridAdmins;
+pub use ca::SharedCa;
 pub use store::{Issued, NewSiteToken, Pin, Store, StoreError};

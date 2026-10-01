@@ -85,13 +85,42 @@ pub enum VerifyError {
 /// Returns [`VerifyError`] if the certificate is unparseable, was not issued by
 /// this grid's CA, is outside its validity period, or names a different site.
 pub fn verify_site_cert(ca_cert_pem: &str, leaf_pem: &str, claimed_site: &str) -> Result<Vec<u8>, VerifyError> {
+    with_issued_leaf(ca_cert_pem, leaf_pem, |leaf| {
+        // The name has to be bound by the signature, not asserted next to it.
+        let expected = spiffe_id(claimed_site);
+        let found = single_spiffe_name(leaf).ok_or(VerifyError::NotOneSpiffeName)?;
+        if found != expected {
+            return Err(VerifyError::NameMismatch {
+                found,
+                claimed: expected,
+            });
+        }
+        Ok(leaf.public_key().subject_public_key.data.to_vec())
+    })
+}
+
+/// Check that `leaf_pem` was issued by the CA in `ca_cert_pem` and is currently
+/// valid, without any identity check.
+///
+/// # Errors
+///
+/// Returns [`VerifyError`] if either certificate is unparseable, the leaf was
+/// not signed by this CA, or it is outside its validity period.
+pub fn verify_issued_by(ca_cert_pem: &str, leaf_pem: &str) -> Result<(), VerifyError> {
+    with_issued_leaf(ca_cert_pem, leaf_pem, |_leaf| Ok(()))
+}
+
+/// Run `then` on the leaf once it is proven issued by the CA and currently valid.
+fn with_issued_leaf<T>(
+    ca_cert_pem: &str,
+    leaf_pem: &str,
+    then: impl FnOnce(&X509Certificate<'_>) -> Result<T, VerifyError>,
+) -> Result<T, VerifyError> {
     if leaf_pem.len() > MAX_CERT_PEM_BYTES {
         return Err(VerifyError::TooLarge);
     }
-
     let ca_der = pem::parse(ca_cert_pem).map_err(|_bad| VerifyError::MalformedCa)?;
     let (_after_ca, ca) = X509Certificate::from_der(ca_der.contents()).map_err(|_bad| VerifyError::MalformedCa)?;
-
     let leaf_der = pem::parse(leaf_pem).map_err(|_bad| VerifyError::Malformed)?;
     let (_after_leaf, leaf) = X509Certificate::from_der(leaf_der.contents()).map_err(|_bad| VerifyError::Malformed)?;
 
@@ -102,18 +131,36 @@ pub fn verify_site_cert(ca_cert_pem: &str, leaf_pem: &str, claimed_site: &str) -
     if !leaf.validity().is_valid() {
         return Err(VerifyError::NotCurrentlyValid);
     }
+    then(&leaf)
+}
 
-    // The name has to be bound by the signature, not asserted next to it.
-    let expected = spiffe_id(claimed_site);
-    let found = single_spiffe_name(&leaf).ok_or(VerifyError::NotOneSpiffeName)?;
-    if found != expected {
-        return Err(VerifyError::NameMismatch {
-            found,
-            claimed: expected,
-        });
+/// A certificate's issuer name and `notAfter`, for logging. Carries no key
+/// material.
+///
+/// # Errors
+///
+/// Returns [`VerifyError`] if the certificate is oversized or unparseable.
+pub fn cert_issuer_and_expiry(cert_pem: &str) -> Result<(String, String), VerifyError> {
+    if cert_pem.len() > MAX_CERT_PEM_BYTES {
+        return Err(VerifyError::TooLarge);
     }
+    let der = pem::parse(cert_pem).map_err(|_bad| VerifyError::Malformed)?;
+    let (_rest, cert) = X509Certificate::from_der(der.contents()).map_err(|_bad| VerifyError::Malformed)?;
+    Ok((cert.issuer().to_string(), cert.validity().not_after.to_string()))
+}
 
-    Ok(leaf.public_key().subject_public_key.data.to_vec())
+/// Whether a certificate has expired or expires within `window`.
+///
+/// # Errors
+///
+/// Returns [`VerifyError`] if the certificate is oversized or unparseable.
+pub fn cert_expires_within(cert_pem: &str, window: time::Duration) -> Result<bool, VerifyError> {
+    if cert_pem.len() > MAX_CERT_PEM_BYTES {
+        return Err(VerifyError::TooLarge);
+    }
+    let der = pem::parse(cert_pem).map_err(|_bad| VerifyError::Malformed)?;
+    let (_rest, cert) = X509Certificate::from_der(der.contents()).map_err(|_bad| VerifyError::Malformed)?;
+    Ok(cert.validity().time_to_expiration().is_none_or(|left| left < window))
 }
 
 /// The canonical fingerprint of a certificate: lowercase hex SHA-256 over its
@@ -135,6 +182,36 @@ pub fn canonical_fingerprint(cert_pem: &str) -> Result<String, VerifyError> {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect())
+}
+
+/// The DNS SANs on a certificate, as encoded. Case is not normalized, so the
+/// caller owns any case-insensitive comparison.
+///
+/// # Errors
+///
+/// Returns [`VerifyError`] if the certificate is oversized or unparseable.
+pub fn cert_dns_sans(cert_pem: &str) -> Result<Vec<String>, VerifyError> {
+    if cert_pem.len() > MAX_CERT_PEM_BYTES {
+        return Err(VerifyError::TooLarge);
+    }
+    let der = pem::parse(cert_pem).map_err(|_bad| VerifyError::Malformed)?;
+    let (_rest, cert) = X509Certificate::from_der(der.contents()).map_err(|_bad| VerifyError::Malformed)?;
+    let Some(san) = cert.subject_alternative_name().ok().flatten() else {
+        return Ok(Vec::new());
+    };
+    let names = san
+        .value
+        .general_names
+        .iter()
+        .filter_map(|name| {
+            if let GeneralName::DNSName(dns) = name {
+                Some((*dns).to_owned())
+            } else {
+                None
+            }
+        })
+        .collect();
+    Ok(names)
 }
 
 /// The public key a certificate request carries, as `SubjectPublicKeyInfo` DER.
@@ -201,6 +278,22 @@ mod tests {
         assert!(!spki.is_empty(), "the public key should come back for signature checks");
     }
 
+    #[test]
+    fn cert_dns_sans_lists_the_dns_names_as_encoded() {
+        let ca = generate_ca("grid-ca").expect("ca");
+        let names = vec!["a.grid.svc".to_owned(), "B.Apps.Example.com".to_owned()];
+        let leaf = crate::generate::generate_dns_only_cert(&ca, "grid-ca", &names).expect("leaf");
+        let sans = cert_dns_sans(&leaf.cert_pem).expect("sans");
+        assert!(
+            names.iter().all(|name| sans.contains(name)),
+            "every requested name, case kept: {sans:?}"
+        );
+        assert!(
+            cert_dns_sans("not a certificate").is_err(),
+            "garbage is an error, not empty"
+        );
+    }
+
     /// The claim being checked: a certificate cannot vouch for a name it does not carry.
     #[test]
     fn a_certificate_cannot_vouch_for_another_site() {
@@ -243,6 +336,84 @@ mod tests {
             verify_site_cert(&ours.cert_pem, &issued.cert_pem, "site-d"),
             Err(VerifyError::BadSignature),
             "matching the CA's name must not be enough"
+        );
+    }
+
+    #[test]
+    fn verify_issued_by_checks_issuer_signature_and_validity() {
+        let ca = generate_ca("grid-ca").expect("ca");
+        let other = generate_ca("grid-ca").expect("other ca");
+        let leaf = crate::generate_dns_only_cert(&ca, "grid-ca", &["enroll.grid.svc".to_owned()]).expect("leaf");
+        let expired = generate_expired_dns_cert(&ca, "grid-ca", "enroll.grid.svc").expect("expired");
+
+        assert_eq!(verify_issued_by(&ca.cert_pem, &leaf.cert_pem), Ok(()), "own leaf");
+        assert!(
+            matches!(
+                verify_issued_by(&other.cert_pem, &leaf.cert_pem),
+                Err(VerifyError::BadSignature | VerifyError::WrongIssuer)
+            ),
+            "a same-named CA with another key must not verify"
+        );
+        assert_eq!(
+            verify_issued_by(&ca.cert_pem, &expired.cert_pem),
+            Err(VerifyError::NotCurrentlyValid),
+            "expired leaf"
+        );
+        assert_eq!(
+            verify_issued_by(&ca.cert_pem, "not a cert"),
+            Err(VerifyError::Malformed),
+            "garbage leaf"
+        );
+        let (issuer, not_after) = cert_issuer_and_expiry(&leaf.cert_pem).expect("summary");
+        assert!(issuer.contains("grid-ca"), "issuer names the CA: {issuer}");
+        assert!(!not_after.is_empty(), "expiry is rendered");
+    }
+
+    #[test]
+    fn a_ca_loaded_under_another_common_name_issues_leaves_that_chain() {
+        let stored = generate_ca("grid-ca").expect("ca");
+        let loaded = crate::load_ca("renamed-ca", &stored.key_pem, &stored.cert_pem).expect("load");
+        let leaf = crate::generate_dns_only_cert(&loaded, "renamed-ca", &["enroll.grid.svc".to_owned()]).expect("leaf");
+        assert_eq!(
+            verify_issued_by(&stored.cert_pem, &leaf.cert_pem),
+            Ok(()),
+            "the issuer name follows the stored CA, not the configured common name"
+        );
+    }
+
+    #[test]
+    fn leaves_are_backdated_to_tolerate_clock_skew() {
+        let ca = generate_ca("grid-ca").expect("ca");
+        let leaf = crate::generate_dns_only_cert(&ca, "grid-ca", &["enroll.grid.svc".to_owned()]).expect("leaf");
+        let der = pem::parse(&leaf.cert_pem).expect("pem");
+        let (_rest, cert) = X509Certificate::from_der(der.contents()).expect("der");
+        let skew = time::OffsetDateTime::now_utc().unix_timestamp() - cert.validity().not_before.timestamp();
+        assert!(skew >= 55 * 60, "notBefore is backdated about an hour, got {skew}s");
+    }
+
+    #[test]
+    fn cert_expires_within_reports_the_renewal_window() {
+        let ca = generate_ca("grid-ca").expect("ca");
+        let now = time::OffsetDateTime::now_utc();
+        let short = crate::generate::generate_validity_bounded_dns_cert(
+            &ca,
+            "grid-ca",
+            "enroll.grid.svc",
+            now - time::Duration::minutes(5),
+            now + time::Duration::days(10),
+        )
+        .expect("short-lived");
+        let long = crate::generate_dns_only_cert(&ca, "grid-ca", &["enroll.grid.svc".to_owned()]).expect("leaf");
+        let expired = generate_expired_dns_cert(&ca, "grid-ca", "enroll.grid.svc").expect("expired");
+        let window = time::Duration::days(30);
+
+        assert_eq!(cert_expires_within(&short.cert_pem, window), Ok(true), "10 days left");
+        assert_eq!(cert_expires_within(&long.cert_pem, window), Ok(false), "a year left");
+        assert_eq!(cert_expires_within(&expired.cert_pem, window), Ok(true), "expired");
+        assert_eq!(
+            cert_expires_within("not a cert", window),
+            Err(VerifyError::Malformed),
+            "garbage"
         );
     }
 

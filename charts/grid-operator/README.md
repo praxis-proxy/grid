@@ -82,6 +82,13 @@ helm upgrade grid-operator \
   --namespace grid-system
 ```
 
+### Gateway namespace
+
+The operator looks for the gateway Service in the release namespace unless
+`gateway.namespace` is set. Earlier charts left it to the binary default,
+`grid-system`. If the release is outside `grid-system` and the gateway runs
+there, set `gateway.namespace=grid-system` when you upgrade.
+
 ### CRD upgrades
 
 Helm installs CRDs on first install but **does not upgrade them** on
@@ -147,7 +154,9 @@ helm upgrade grid-operator oci://ghcr.io/praxis-proxy/charts/grid-operator \
 | `swim.service.externalTrafficPolicy` | string | `""` | External traffic policy. Defaults to Local for LoadBalancer. |
 | `gateway.address` | string | `""` | Advertised gateway address override. Maps to `GRID_GATEWAY_ADDRESS`. |
 | `gateway.serviceName` | string | `""` | Provider gateway Service name the operator resolves and advertises to remote sites. Maps to `GRID_GATEWAY_SERVICE_NAME`. |
-| `gateway.port` | string | `""` | Provider gateway Service port advertised to remote sites. Maps to `GRID_GATEWAY_PORT`. |
+| `gateway.namespace` | string | `""` | Namespace of the provider gateway Service. Empty uses the release namespace. Outside the resource namespaces, the operator gets only `get` on that one Service there. Maps to `GRID_GATEWAY_NAMESPACE`. |
+| `gateway.allowSystemNamespace` | bool | `false` | Allow `gateway.namespace` to be `default`, `kube-*`, or `openshift-*`. |
+| `gateway.port` | string | `""` | Provider gateway Service port advertised to remote sites. Empty uses 8080. Maps to `GRID_GATEWAY_PORT`. |
 | `health.liveness.initialDelaySeconds` | int | `5` | Liveness probe initial delay. |
 | `health.liveness.periodSeconds` | int | `10` | Liveness probe period. |
 | `health.readiness.initialDelaySeconds` | int | `5` | Readiness probe initial delay. |

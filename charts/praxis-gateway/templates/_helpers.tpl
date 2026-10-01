@@ -143,10 +143,14 @@ carry a sni.
 {{- end }}
 {{- else if eq $mode "plaintext" }}
 {{- if (.transport).sni }}
-{{- fail (printf "backend %q is plaintext but sets transport.sni; sni belongs to mutual_tls" .cluster) }}
+{{- fail (printf "backend %q is plaintext but sets transport.sni; sni belongs to a TLS transport" .cluster) }}
+{{- end }}
+{{- else if eq $mode "tls" }}
+{{- if regexMatch "^(\\[|[0-9.]+$)" (include "praxis-gateway.backendSni" .) }}
+{{- fail (printf "backend %q uses tls to an IP endpoint without transport.sni: set transport.sni to a DNS name on the certificate, or use the Service hostname as the endpoint" .cluster) }}
 {{- end }}
 {{- else }}
-{{- fail (printf "backend %q transport.mode must be mutual_tls or plaintext, got %q" .cluster $mode) }}
+{{- fail (printf "backend %q transport.mode must be mutual_tls, tls, or plaintext, got %q" .cluster $mode) }}
 {{- end }}
 {{- end }}
 {{- end }}
@@ -201,5 +205,16 @@ matchExpressions. Emits "true" or nothing.
 {{- $sel := . | default dict -}}
 {{- if and (not $sel.matchLabels) (not $sel.matchExpressions) -}}
 true
+{{- end -}}
+{{- end }}
+
+{{/*
+SNI for a tls backend: transport.sni, else the first endpoint's host.
+*/}}
+{{- define "praxis-gateway.backendSni" -}}
+{{- if (.transport).sni -}}
+{{- .transport.sni -}}
+{{- else -}}
+{{- regexReplaceAll ":[0-9]+$" (first .endpoints) "" -}}
 {{- end -}}
 {{- end }}

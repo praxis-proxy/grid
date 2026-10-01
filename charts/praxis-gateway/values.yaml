@@ -118,14 +118,27 @@ gatewayConfig:
   # allow_private_upstreams, plus an explicit transport. A backend omitting transport
   # defaults to mutual_tls when the grid identity is mounted (tls.enabled), else plaintext.
   # mutual_tls presents that identity (tls.mountPath tls.crt/tls.key, verified against its
-  # ca.crt) and needs a sni naming the peer. plaintext is cleartext. The health_check type
-  # defaults to tcp for mutual_tls (the active http probe is plaintext and cannot reach a
-  # TLS peer) and http for plaintext. Override per backend with healthCheck.type.
+  # ca.crt) and needs a sni naming the peer. tls verifies the backend's server cert with
+  # no client cert: sni defaults to the endpoint host. Its trust, first match wins:
+  # transport.ca (a ConfigMap or Secret), then upstreamCA (upstream_ca_file), then the
+  # process store. With auth.validateCA set, SSL_CERT_FILE replaces the process store,
+  # so such a backend then trusts only that bundle. An in-cluster hostname
+  # resolves to a private address, which praxis refuses, so use the ClusterIP endpoint
+  # with sni set to the Service DNS name. plaintext is cleartext.
+  # The health_check type defaults to tcp for TLS transports (the active http probe is
+  # plaintext and cannot reach a TLS peer) and http for plaintext. Override per backend
+  # with healthCheck.type.
   backends: []
   #  - cluster: site-a
   #    endpoints: ["172.30.202.42:8000"]
   #    healthCheck: { type: http, path: /health, intervalMs: 5000, timeoutMs: 2000 }
   #    transport: { mode: mutual_tls, sni: site-a.grid.internal }  # or { mode: plaintext }
+  #  - cluster: local-qwen3            # KServe LLMInferenceService on OpenShift, HTTPS :8000
+  #    endpoints: ["172.30.12.34:8000"]  # the workload Service ClusterIP
+  #    transport:
+  #      mode: tls
+  #      sni: qwen3-kserve-workload-svc.llm.svc
+  #      ca: { configMap: openshift-service-ca.crt, key: service-ca.crt }
   # -- Inbound TLS on the gateway listener. The default posture assumes an inbound TLS
   # front (an OpenShift Route or a Gateway) terminates TLS and forwards to this plaintext
   # listener. Enable to terminate TLS at the gateway itself from a mounted server cert

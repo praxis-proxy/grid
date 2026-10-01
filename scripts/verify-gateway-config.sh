@@ -137,6 +137,60 @@ chat "$port" -H 'Authorization: Bearer caller' >/dev/null
 check "none, stripAuthorization=false: backend sees Authorization (the echo is live)" \
   '"authorization": "Bearer caller"' "$(seen_auth)"
 
+# tls backend: the server cert chains to a private CA and names the Service host, like a
+# KServe workload behind the OpenShift service CA. The endpoint is the literal IP (a
+# hostname resolving to a private address is refused), sni names the cert, CA via transport.ca.
+bca=$WORK/backend-ca && mkdir -p "$bca"
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 1 -subj /CN=backend-ca \
+  -keyout "$bca/ca.key" -out "$bca/ca.crt" 2>/dev/null
+openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -subj /CN=tls-backend \
+  -keyout "$bca/tls.key" -out "$bca/tls.csr" 2>/dev/null
+printf 'subjectAltName=DNS:tls-backend\nextendedKeyUsage=serverAuth\n' > "$bca/ext"
+openssl x509 -req -in "$bca/tls.csr" -CA "$bca/ca.crt" -CAkey "$bca/ca.key" -CAcreateserial -days 1 \
+  -extfile "$bca/ext" -out "$bca/tls.crt" 2>/dev/null
+cp "$bca/ca.crt" "$bca/service-ca.crt"
+chmod 644 "$bca"/*
+"$CRT" run -d --name "$NET-tls-backend" --network "$NET" --network-alias tls-backend -v "$bca:/ca:ro,z" \
+  "$FIXTURE_IMAGE" python3 -c '
+import http.server, ssl
+class H(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        self.send_response(200); self.send_header("Content-Length", "2"); self.end_headers(); self.wfile.write(b"{}")
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); ctx.load_cert_chain("/ca/tls.crt", "/ca/tls.key")
+server = http.server.HTTPServer(("0.0.0.0", 8443), H)
+server.socket = ctx.wrap_socket(server.socket, server_side=True)
+server.serve_forever()' >/dev/null
+TLS_BACKEND=(--set gatewayConfig.render=true --set gatewayConfig.model=qwen3 --set gatewayConfig.auth.mode=none
+  --set "gatewayConfig.backends[0].cluster=kserve" --set "gatewayConfig.backends[0].endpoints[0]=$(ip "$NET-tls-backend"):8443"
+  --set "gatewayConfig.backends[0].transport.mode=tls" --set "gatewayConfig.backends[0].transport.sni=tls-backend")
+render "$WORK/tls" "${TLS_BACKEND[@]}" \
+  --set "gatewayConfig.backends[0].transport.ca.configMap=service-ca" --set "gatewayConfig.backends[0].transport.ca.key=service-ca.crt"
+# Docker cannot create a mountpoint inside the read-only /etc/praxis mount.
+mkdir -p "$WORK/tls/backend-ca/0"
+if "$CRT" run --rm -v "$WORK/tls:/etc/praxis:ro,z" -v "$bca:/etc/praxis/backend-ca/0:ro,z" "$DEFAULT_GATEWAY_IMAGE" \
+    --config /etc/praxis/praxis.yaml --validate >"$WORK/tls.log" 2>&1; then
+  pass "tls backend: validates on $DEFAULT_GATEWAY_IMAGE"
+else
+  fail "tls backend: rejected by $DEFAULT_GATEWAY_IMAGE: $(tail -1 "$WORK/tls.log")"
+fi
+"$CRT" run -d --name "$NET-tls" --network "$NET" -p 127.0.0.1::8080 -v "$WORK/tls:/etc/praxis:ro,z" \
+  -v "$bca:/etc/praxis/backend-ca/0:ro,z" "$DEFAULT_GATEWAY_IMAGE" --config /etc/praxis/praxis.yaml >/dev/null
+port=$("$CRT" port "$NET-tls" 8080 | head -1 | sed 's/.*://')
+wait_up "$port" || fail "tls backend: gateway never answered"
+check "tls backend: verified by transport.ca and transport.sni" 200 "$(chat "$port")"
+render "$WORK/tls-noca" "${TLS_BACKEND[@]}"
+port=$(gateway tls-noca "$DEFAULT_GATEWAY_IMAGE" --config "$WORK/tls-noca")
+wait_up "$port" || true
+code=$(chat "$port")
+# A 502 alone could be routing; the log must show the certificate was refused.
+"$CRT" logs "$NET-tls-noca" >"$WORK/tls-noca.log" 2>&1 || true
+if [ "$code" = 502 ] && grep -qiE 'certificate|unknownissuer' "$WORK/tls-noca.log"; then
+  pass "tls backend: without transport.ca the private-CA certificate is refused (502)"
+else
+  fail "tls backend: without transport.ca, want 502 with a certificate error, got $code: $(grep -iE 'tls|upstream|error' "$WORK/tls-noca.log" | tail -2)"
+fi
+
 if [ -z "$API_KEY_IMAGE" ]; then
   echo "  SKIP: api-key runtime (set API_KEY_IMAGE to an image that registers identity/api-key)"
 else

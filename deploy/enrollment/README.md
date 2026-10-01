@@ -61,11 +61,14 @@ tokens. `local`, the default, reads a grid-admin token table from
 `ENROLLMENT_GRID_ADMIN_TOKENS`, one `name:token` line per grid-admin, where an
 empty table admits nobody and is the safe direction. `kube` defers to Kubernetes
 RBAC through TokenReview and SubjectAccessReview on the `enrollmenttokens`
-resource and needs a build with `--features sar`. An unknown value, or a backend
-this binary was not built with, fails closed rather than falling back to the
-token table.
+resource, through the `sar` feature. Under `kube`, a bearer must be bound to
+`ENROLLMENT_TOKEN_AUDIENCE` (default `grid-enrollment`), and reviews are scoped
+to the service's namespace: `POD_NAMESPACE`, else the in-cluster service account
+namespace. Out of cluster, `POD_NAMESPACE` is required and startup fails without
+it. An unknown value, or a backend this binary was not built with, fails closed
+rather than falling back to the token table.
 
-The image built by `deploy/enrollment/Containerfile` is the standalone build,
-without the `sar` feature, so `ENROLLMENT_AUTHZ=kube` fails closed at startup in
-it. A Kubernetes-RBAC image is a separate `--features sar` build, tracked as a
-follow-up.
+The `sar` and `bootstrap` features are on by default, so the image built by
+`deploy/enrollment/Containerfile` serves both backends and runs
+`enrollment bootstrap`. A `--no-default-features` build without them refuses
+`ENROLLMENT_AUTHZ=kube` and the `bootstrap` subcommand at startup.

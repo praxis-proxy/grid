@@ -218,7 +218,17 @@
         },
         "serviceName": {
           "type": "string",
-          "description": "Gateway Kubernetes Service name for discovery."
+          "pattern": "^([a-z]([-a-z0-9]{0,61}[a-z0-9])?)?$",
+          "description": "Gateway Kubernetes Service name for discovery; empty uses provider-gateway."
+        },
+        "namespace": {
+          "type": "string",
+          "pattern": "^([a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)?$",
+          "description": "Namespace of the gateway Service; empty uses the release namespace."
+        },
+        "allowSystemNamespace": {
+          "type": "boolean",
+          "description": "Allow gateway.namespace to be default, kube-*, or openshift-*."
         },
         "port": {
           "type": "string",

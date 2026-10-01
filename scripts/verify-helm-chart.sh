@@ -40,6 +40,15 @@ try_template() {
   fi
 }
 
+# render <helm template args...>: stdout into RENDERED. A failed render is a FAIL, never a pass.
+render() {
+  if RENDERED=$(helm template "$@"); then
+    return 0
+  fi
+  fail "render failed: helm template $*"
+  return 1
+}
+
 # Run a helm template command and expect failure (schema rejection).
 # Usage: try_reject <chart> <label> [helm-args...]
 try_reject() {
@@ -153,6 +162,99 @@ if [ "$POD_NAME_LABEL" = "grid-operator" ]; then
 else
   fail "selector: podLabels overrode app.kubernetes.io/name to '$POD_NAME_LABEL'"
 fi
+
+# ── Service link env vars ───────────────────────────────────────────
+echo ""
+echo "=== Service links ==="
+# A Service named grid-gateway injects GRID_GATEWAY_PORT=tcp://..., which clap
+# parses as --gateway-port and the operator crashes.
+if render verify-links "$CHART_DIR" --namespace grid-system --show-only templates/deployment.yaml; then
+  if grep -q 'enableServiceLinks: false' <<<"$RENDERED"; then
+    pass "operator pod disables service link env vars"
+  else
+    fail "operator pod must set enableServiceLinks: false"
+  fi
+  # Even with service links off, pin the port so no injected value can win.
+  if grep -A1 'name: GRID_GATEWAY_PORT' <<<"$RENDERED" | grep -q 'value: "8080"'; then
+    pass "operator pod sets GRID_GATEWAY_PORT by default"
+  else
+    fail "operator pod must set GRID_GATEWAY_PORT by default"
+  fi
+fi
+# Every grid workload pod disables service links, not just the operator.
+for spec in "charts/grid-enrollment:3" "charts/grid-mock-providers:1" \
+  "charts/praxis-gateway:1:--set-string config.existingConfigMap=verify"; do
+  IFS=: read -r chart want extra <<<"$spec"
+  # shellcheck disable=SC2086 # extra is a flag list
+  render verify-links "$chart" $extra || continue
+  got=$(grep -c 'enableServiceLinks: false' <<<"$RENDERED" || true)
+  if [ "$got" = "$want" ]; then
+    pass "$chart: all $want workload pods disable service links"
+  else
+    fail "$chart: expected $want pods with enableServiceLinks: false, got $got"
+  fi
+done
+
+# ── Gateway discovery namespace ─────────────────────────────────────
+echo ""
+echo "=== Gateway discovery namespace ==="
+# Without GRID_GATEWAY_NAMESPACE the operator reads the gateway Service in
+# grid-system and a release anywhere else gets a 403.
+if render verify-gwns "$CHART_DIR" --namespace release-ns --show-only templates/deployment.yaml; then
+  GW_NS=$(grep -A1 'name: GRID_GATEWAY_NAMESPACE' <<<"$RENDERED" | awk '/value:/{print $2}' | tr -d '"')
+  if [ "$GW_NS" = "release-ns" ]; then
+    pass "gateway namespace defaults to the release namespace"
+  else
+    fail "gateway namespace: expected release-ns, got '$GW_NS'"
+  fi
+fi
+if render verify-gwns "$CHART_DIR" --namespace release-ns --set-string gateway.namespace=edge-ns; then
+  GW_NS=$(grep -A1 'name: GRID_GATEWAY_NAMESPACE' <<<"$RENDERED" | awk '/value:/{print $2}' | tr -d '"')
+  if [ "$GW_NS" = "edge-ns" ]; then
+    pass "gateway.namespace override sets the env"
+  else
+    fail "gateway.namespace override: expected edge-ns, got '$GW_NS'"
+  fi
+  # In the gateway namespace the operator may only get the one gateway Service.
+  GW_ROLE=$(yq 'select(.kind == "Role" and .metadata.namespace == "edge-ns") | .rules' -o json <<<"$RENDERED" | jq -c .)
+  if [ "$GW_ROLE" = '[{"apiGroups":[""],"resources":["services"],"resourceNames":["provider-gateway"],"verbs":["get"]}]' ]; then
+    pass "gateway namespace Role grants only get on the gateway Service"
+  else
+    fail "gateway namespace Role: unexpected rules '$GW_ROLE'"
+  fi
+  if yq 'select(.kind == "RoleBinding" and .metadata.namespace == "edge-ns") | .roleRef.kind' <<<"$RENDERED" | grep -qx ClusterRole; then
+    fail "gateway namespace binds the resources ClusterRole"
+  else
+    pass "gateway namespace does not bind the resources ClusterRole"
+  fi
+fi
+if render verify-gwns "$CHART_DIR" --namespace release-ns --set-string gateway.namespace=release-ns; then
+  if yq 'select(.kind == "Role") | .metadata.name' <<<"$RENDERED" | grep -q gateway-discovery; then
+    fail "gateway namespace Role rendered where the resources Role already applies"
+  else
+    pass "no gateway namespace Role inside the resource namespaces"
+  fi
+fi
+if render verify-gwns "$CHART_DIR" --namespace release-ns --set-string gateway.namespace=edge-ns \
+  --set-string gateway.address=gw.example.com:443; then
+  if yq 'select(.kind == "Role") | .metadata.name' <<<"$RENDERED" | grep -q gateway-discovery; then
+    fail "gateway namespace Role rendered although gateway.address skips discovery"
+  else
+    pass "no gateway namespace Role when gateway.address is set"
+  fi
+fi
+try_reject_msg "$CHART_DIR" "gateway.address blank" "gateway.address must not be blank" \
+  --set-string gateway.namespace=edge-ns --set-string 'gateway.address=  '
+try_reject_msg "$CHART_DIR" "gateway.namespace kube-system" "is a system namespace" --set-string gateway.namespace=kube-system
+try_reject_msg "$CHART_DIR" "gateway.namespace openshift-ingress" "is a system namespace" --set-string gateway.namespace=openshift-ingress
+try_reject_msg "$CHART_DIR" "gateway.namespace default" "is a system namespace" --set-string gateway.namespace=default
+try_reject "$CHART_DIR" "gateway.namespace not DNS-1123" --set-string gateway.namespace=Edge_NS
+try_reject_msg "$CHART_DIR" "gateway.serviceName with whitespace" "gateway[./]serviceName" \
+  --set-string gateway.namespace=edge-ns --set-string 'gateway.serviceName= edge-gateway '
+try_template "$CHART_DIR" "gateway.namespace system with gateway.address" --set-string gateway.namespace=kube-system \
+  --set-string gateway.address=gw.example.com:443
+try_template "$CHART_DIR" "gateway.namespace system opt-in" --set-string gateway.namespace=kube-system \
+  --set gateway.allowSystemNamespace=true
 
 # ── Schema rejection ────────────────────────────────────────────────
 echo ""
@@ -535,10 +637,41 @@ try_reject_msg "$GW_DIR" "mutual_tls without grid identity (gw)" "tls.enabled is
   --set gatewayConfig.render=true --set gatewayConfig.auth.mode=none --set gatewayConfig.model=q \
   --set gatewayConfig.backends[0].cluster=a --set gatewayConfig.backends[0].endpoints[0]=1.2.3.4:8000 \
   --set gatewayConfig.backends[0].transport.mode=mutual_tls --set gatewayConfig.backends[0].transport.sni=a.grid --namespace grid-system
-try_reject_msg "$GW_DIR" "plaintext with sni (gw)" "sni belongs to mutual_tls" \
+try_reject_msg "$GW_DIR" "plaintext with sni (gw)" "sni belongs to a TLS transport" \
   --set gatewayConfig.render=true --set gatewayConfig.auth.mode=none --set gatewayConfig.model=q \
   --set gatewayConfig.backends[0].cluster=a --set gatewayConfig.backends[0].endpoints[0]=1.2.3.4:8000 \
   --set gatewayConfig.backends[0].transport.mode=plaintext --set gatewayConfig.backends[0].transport.sni=x --namespace grid-system
+# tls transport: server-verified backend with no client cert (a KServe workload).
+TLS1=(--set gatewayConfig.render=true --set gatewayConfig.auth.mode=none --set gatewayConfig.model=q
+  --set "gatewayConfig.backends[0].cluster=kserve" --set "gatewayConfig.backends[0].transport.mode=tls" --namespace grid-system)
+TLS_RENDER=$(helm template v-tls "$GW_DIR" "${TLS1[@]}" --set "gatewayConfig.backends[0].endpoints[0]=172.30.1.2:8000" \
+  --set "gatewayConfig.backends[0].transport.sni=qwen3-kserve-workload-svc.llm.svc" \
+  --set "gatewayConfig.backends[0].transport.ca.configMap=openshift-service-ca.crt" \
+  --set "gatewayConfig.backends[0].transport.ca.key=service-ca.crt" 2>&1)
+if echo "$TLS_RENDER" | grep -q 'ca_path: "/etc/praxis/backend-ca/0/service-ca.crt"' \
+    && echo "$TLS_RENDER" | grep -q 'sni: "qwen3-kserve-workload-svc.llm.svc"' \
+    && ! echo "$TLS_RENDER" | awk '/- name: "kserve"/{f=1} f&&/client_cert/{print; exit}' | grep -q client_cert \
+    && echo "$TLS_RENDER" | grep -A2 'name: backend-ca-0' | grep -q 'name: "openshift-service-ca.crt"'; then
+  pass "tls backend: server-verified with transport.ca and sni, no client cert"
+else
+  fail "tls backend: should render ca_path, sni, verify, no client_cert, and mount the CA"
+fi
+if echo "$TLS_RENDER" | awk '/- name: "kserve"/{f=1} f&&/type:/{print; exit}' | grep -q 'type: "tcp"'; then
+  pass "tls backend: health_check defaults to tcp"
+else
+  fail "tls backend: health_check should default to tcp"
+fi
+try_reject_msg "$GW_DIR" "tls backend: IP endpoint without sni (gw)" "without transport.sni" "${TLS1[@]}" \
+  --set "gatewayConfig.backends[0].endpoints[0]=172.30.1.2:8000"
+try_reject_msg "$GW_DIR" "tls backend: ca with configMap and secret (gw)" "transport[./]ca.*oneOf" "${TLS1[@]}" \
+  --set "gatewayConfig.backends[0].endpoints[0]=172.30.1.2:8000" --set "gatewayConfig.backends[0].transport.sni=h" \
+  --set "gatewayConfig.backends[0].transport.ca.configMap=a" --set "gatewayConfig.backends[0].transport.ca.secret=b"
+try_reject_msg "$GW_DIR" "tls backend: empty ca (gw)" "transport[./]ca.*oneOf" "${TLS1[@]}" \
+  --set "gatewayConfig.backends[0].endpoints[0]=172.30.1.2:8000" --set "gatewayConfig.backends[0].transport.sni=h" \
+  --set-json 'gatewayConfig.backends[0].transport.ca={}'
+try_reject_msg "$GW_DIR" "transport.ca outside tls (gw)" "transport/mode': value must be 'tls'|transport: Must validate \"then\"" "${TLS1[@]}" \
+  --set "gatewayConfig.backends[0].endpoints[0]=172.30.1.2:8000" --set "gatewayConfig.backends[0].transport.mode=plaintext" \
+  --set "gatewayConfig.backends[0].transport.ca.configMap=a"
 try_reject_msg "$GW_DIR" "listenerTls enabled no secret (gw)" "listenerTls.existingSecret is required" "${GW_REQ[@]}" \
   --set gatewayConfig.listenerTls.enabled=true --namespace grid-system
 
@@ -1258,6 +1391,91 @@ for topo in combined-site dedicated-edge; do
     fail "example values: $topo/values directory missing"
   fi
 done
+
+# ======================================================================
+# Grid Enrollment Chart
+# ======================================================================
+ENROLL_DIR="charts/grid-enrollment"
+
+echo ""
+echo "======================================================================"
+echo "  Grid Enrollment Chart ($ENROLL_DIR)"
+echo "======================================================================"
+
+echo ""
+echo "=== Helm lint (enrollment) ==="
+if helm lint "$ENROLL_DIR" --strict --set route.host=enroll.example.com 2>&1; then
+  pass "helm lint --strict (enrollment)"
+else
+  fail "helm lint --strict (enrollment)"
+fi
+
+echo ""
+echo "=== Template rendering (enrollment) ==="
+# route.enabled=auto renders a Route only where route.openshift.io/v1 is served.
+OCP=(--api-versions route.openshift.io/v1)
+try_template "$ENROLL_DIR" "enrollment: passthrough with route.host (OpenShift)" --namespace grid-system "${OCP[@]}" --set route.host=enroll.example.com
+try_reject_msg "$ENROLL_DIR" "enrollment: edge termination (TLS-only backend)" 'termination' --namespace grid-system "${OCP[@]}" --set route.tls.termination=edge
+try_template "$ENROLL_DIR" "enrollment: route disabled (OpenShift)" --namespace grid-system "${OCP[@]}" --set route.enabled=false
+try_template "$ENROLL_DIR" "enrollment: no Route API, no host" --namespace grid-system
+# The install gate: a rendered passthrough Route with no host must fail so an
+# ingress-generated host can never render a SAN-mismatched, unreachable Route.
+try_reject "$ENROLL_DIR" "passthrough route without host (OpenShift)" --namespace grid-system "${OCP[@]}"
+try_reject "$ENROLL_DIR" "route.enabled=true without host" --namespace grid-system --set route.enabled=true
+try_reject "$ENROLL_DIR" "insecureEdgeTerminationPolicy Allow (plaintext token)" --namespace grid-system "${OCP[@]}" --set route.host=h.example.com --set route.tls.insecureEdgeTerminationPolicy=Allow
+try_reject "$ENROLL_DIR" "reencrypt without destinationCACertificate" --namespace grid-system "${OCP[@]}" \
+  --set route.host=h.example.com --set route.tls.termination=reencrypt
+try_template "$ENROLL_DIR" "enrollment: reencrypt with a destination CA" --namespace grid-system \
+  "${OCP[@]}" --set route.host=h.example.com --set route.tls.termination=reencrypt \
+  --set-string route.tls.destinationCACertificate=placeholder-ca
+try_reject "$ENROLL_DIR" "wildcard route.host" --namespace grid-system "${OCP[@]}" --set 'route.host=*.apps.example.com'
+try_reject "$ENROLL_DIR" "route.host label over 63 characters" --namespace grid-system "${OCP[@]}" \
+  --set "route.host=$(printf 'a%.0s' $(seq 64)).example.com"
+try_reject "$ENROLL_DIR" "route.host not DNS-1123" --namespace grid-system "${OCP[@]}" --set route.host=Enroll.Example.com
+try_reject "$ENROLL_DIR" "local authz with no grid-admin tokens" --namespace grid-system \
+  --set enrollment.authz=local --set enrollment.gridAdminTokens.generate=false
+try_reject "$ENROLL_DIR" "route.enabled not true, false, or auto" --namespace grid-system --set route.enabled=maybe
+
+echo ""
+echo "=== Route + serving-cert SAN auto-wire (enrollment) ==="
+render v-enroll "$ENROLL_DIR" --namespace grid-system "${OCP[@]}" --set route.host=enroll.example.com || true
+ENROLL_RENDERED=$RENDERED
+if echo "$ENROLL_RENDERED" | grep -q 'kind: Route'; then
+  pass "enrollment: Route renders by default on OpenShift"
+else
+  fail "enrollment: Route not rendered on OpenShift"
+fi
+if echo "$ENROLL_RENDERED" | grep -A1 -- '--serving-dns' | grep -q 'enroll.example.com'; then
+  pass "enrollment: route.host auto-added to serving cert SAN"
+else
+  fail "enrollment: route.host not wired into serving cert SAN"
+fi
+if [ "$(echo "$ENROLL_RENDERED" | grep -c 'haproxy.router.openshift.io/rate-limit-connections')" = 3 ]; then
+  pass "enrollment: Route carries per-source-IP connection limits by default"
+else
+  fail "enrollment: Route should carry rate-limit-connections annotations"
+fi
+if render v-enroll "$ENROLL_DIR" --namespace grid-system "${OCP[@]}" --set route.host=enroll.example.com \
+    --set route.rateLimit.enabled=false; then
+  if echo "$RENDERED" | grep -q 'rate-limit-connections'; then
+    fail "enrollment: route.rateLimit.enabled=false should drop the annotations"
+  else
+    pass "enrollment: route.rateLimit.enabled=false drops the annotations"
+  fi
+fi
+if render v-enroll "$ENROLL_DIR" --namespace grid-system --set route.host=enroll.example.com; then
+  if echo "$RENDERED" | grep -q 'kind: Route' || echo "$RENDERED" | grep -A1 -- '--serving-dns' | grep -q 'enroll.example.com'; then
+    fail "enrollment: without the Route API, no Route and no Route SAN"
+  else
+    pass "enrollment: without the Route API, no Route and no Route SAN"
+  fi
+fi
+if [ "$(helm template v-enroll "$ENROLL_DIR" --namespace grid-system --show-only templates/certs/ca-bootstrap-rbac.yaml \
+    | grep -c 'hook-delete-policy: before-hook-creation,hook-succeeded,hook-failed')" = 3 ]; then
+  pass "enrollment: bootstrap RBAC is removed after the hook succeeds or fails"
+else
+  fail "enrollment: bootstrap RBAC should carry hook-succeeded"
+fi
 
 # ── Summary ──────────────────────────────────────────────────────────
 echo ""

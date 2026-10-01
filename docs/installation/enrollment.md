@@ -1,202 +1,102 @@
 # Site Enrollment
 
-A site joins a grid by presenting a token to the enrollment service and
-receiving back a signed certificate. The certificate carries a grid-assigned
-identity, not one the site requests.
+A site enrolls with a grid by redeeming a one-time token at the enrollment service, which returns a certificate carrying a grid-assigned identity. Enrollment does not provision the mesh. The GridNetwork carries the SWIM key and seed peers, as [CRD-driven SWIM seeds](../architecture/crds.md#crd-driven-swim-seeds) describes.
 
-This guide covers both sides of that exchange: standing up the enrollment
-service itself, then the site flow that redeems a token for a certificate.
+## Prerequisites
 
-## 1. Deploy the enrollment service
+- Kubernetes 1.26 or later, Helm 3.12 or later
+- etcd encryption at rest, since the CA signing key is stored in a Secret
+- An enrollment image with the default `sar` and `bootstrap` features (not a `--no-default-features` build)
 
-### Bootstrap the grid CA and serving certificates
-
-Before the service can start, its own key material has to exist: the grid
-CA, the enrollment service's serving certificate, and a serving certificate
-for its Postgres connection. The chart runs the `enrollment bootstrap`
-subcommand as a pre-install Job, so all three exist before the first pod
-starts. No separate `bootstrap.*` values key exists. The Job's flags come
-straight from the `ca.*`, `serving.*`, and `db.*` values below.
-
-| Values key | Job flag or effect |
-|---|---|
-| `ca.method` (`builtin` or `provided`) | `builtin` mints a self-signed CA, `provided` skips minting and loads `ca.provided.keySecretRef` instead |
-| `ca.commonName` | `--common-name`, default `grid-ca` |
-| `ca.keySecretName` | Secret the CA certificate and its signing key land in, default `grid-ca-key` |
-| `ca.bundleSecretName` | Secret the public CA certificate alone lands in, default `grid-ca-bundle` |
-| `ca.forceRegenerate` | `--force-regenerate` |
-| `ca.provided.keySecretRef` | An existing `tls.crt`/`tls.key` Secret to load, when `ca.method=provided` |
-| `serving.secretName` | Secret the enrollment service's own serving certificate lands in, default `enrollment-serving-tls` |
-| `serving.existingSecretRef` | Skip issuance and mount an existing serving certificate instead |
-| `serving.extraDnsNames` | `--serving-dns`, repeated |
-| `db.builtin.tls.servingSecretName` | Secret the Postgres serving certificate lands in, `--db-dns` derived from the built-in Postgres Service name, default `grid-db-serving-tls` |
-
-Every serving certificate the Job issues carries DNS names only. None
-carries a grid-site SPIFFE name, so they stay outside the identity space a
-peer verifier trusts and cannot get mistaken for a site.
-
-Bootstrap is idempotent. Re-running the Job on an upgrade keeps every
-existing Secret as is. Setting `ca.forceRegenerate` reissues everything,
-including the CA, which invalidates every certificate the current CA
-already signed.
-
-### Install the service
+## Install
 
 ```bash
 helm install grid-enrollment ./charts/grid-enrollment \
-  --namespace grid \
-  --set image.repository=quay.io/praxis-proxy/grid-enrollment \
-  --set enrollment.authz=kube \
-  --set enrollment.serviceAccount.create=true \
+  --namespace grid --create-namespace \
+  --set route.host=enrollment.apps.example.com \
   --set db.type=external \
-  --set db.external.connectionUrlSecretRef=maas-db-config
+  --set db.external.connectionUrlSecretRef=grid-enrollment-db
 ```
 
-`image.tag` defaults to the chart's `AppVersion`, and `image.pullPolicy` is
-also settable when a deployment needs to override it.
+On OpenShift the chart renders a passthrough Route for `route.host`, so remote sites can reach enrollment. `route.enabled` defaults to `auto`, which renders the Route only when the cluster serves `route.openshift.io/v1`. `true` or `false` forces it. Elsewhere, omit `route.host` and front the Service with your own ingress. For GitOps renders with `helm template`, pass `--api-versions route.openshift.io/v1` on OpenShift, or `auto` renders no Route.
 
-`enrollment.listenAddr` sets the address the service binds, default
-`0.0.0.0:8443`, and the chart derives the Service port from it. No separate
-`enrollment.service.port` key exists.
+A pre-install Job runs `enrollment bootstrap` to create the grid CA and the serving certificates for enrollment and its database. It is idempotent: on upgrade it keeps the CA and re-issues a serving certificate when a requested name, such as a new `route.host`, is missing, or when fewer than 30 days remain. `ca.forceRegenerate` replaces the CA and invalidates every certificate it signed.
 
-`enrollment.authz` chooses the grid-admin authorization backend, `kube` or
-`local`:
+## Configure
 
-- `kube` (default): Kubernetes RBAC. The service authenticates the caller
-  with `TokenReview` and authorizes with `SubjectAccessReview` against the
-  `enrollmenttokens` resource in the `grid.praxis-proxy.io` API group. No CRD
-  is required, only ordinary `Role` or `ClusterRole` objects. Set
-  `enrollment.serviceAccount.create=true` (and optionally
-  `enrollment.serviceAccount.name`) so the pod runs as a `ServiceAccount`
-  bound to `system:auth-delegator`, which is what lets the review calls
-  succeed.
-- `local`: an opt-in bearer-token table for grid-admins, for clusters with no
-  Kubernetes credential to delegate to. Set `enrollment.authz=local` and
-  `enrollment.gridAdminTokens.generate=true` to have the chart generate one,
-  or bring your own with `enrollment.gridAdminTokens.existingSecretRef`, a
-  Secret whose `tokens` key holds one `name:token` line per grid-admin.
+| Value | Decide |
+|---|---|
+| `route.host` | Required when a Route renders. Added to the issued serving certificate. A BYO certificate (`serving.existingSecretRef`) must already carry it. |
+| `route.tls.termination` | Keep `passthrough`. `reencrypt` terminates at the router and breaks the site's grid-CA pin. `edge` is rejected, since enrollment serves TLS only. |
+| `db.type` | `builtin` runs Postgres in the chart. `external` reads the connection URL from the Secret in `db.external.connectionUrlSecretRef`. |
+| `enrollment.authz` | `kube` (default) authorizes callers with Kubernetes RBAC on `enrollmenttokens` in the release namespace, so keep that namespace dedicated to enrollment. `local` uses a grid-admin token table. |
+| `image.repository`, `image.tag`, `image.digest` | The enrollment image. The tag defaults to the chart's `appVersion`; `image.digest` pins it. |
+| `db.builtin.image`, `db.builtin.imageDigest` | The builtin Postgres image, a pinned tag by default; `imageDigest` pins it. |
 
-`db.type` chooses the Postgres backend, `builtin` or `external`:
+The chart README and `values.yaml` cover the remaining values.
 
-- `builtin`: the chart deploys its own Postgres. `db.builtin.image` (a
-  pinned tag by default) and `db.builtin.imageDigest` choose the image,
-  `db.builtin.storage` sizes it, `db.builtin.auth.database` and
-  `db.builtin.auth.username` name the database and role, and
-  `db.builtin.auth.existingSecretRef` supplies the password. Its serving
-  certificate is the one bootstrap issues into
-  `db.builtin.tls.servingSecretName`.
-- `external`: the chart points at Postgres it does not manage.
-  `db.external.connectionUrlSecretRef` names the Secret, and
-  `db.external.connectionUrlSecretKey` (default `DB_CONNECTION_URL`) names
-  the key inside it holding the connection URL. `db.external.caConfigMapName`
-  and `db.external.caConfigMapKey` (default `ca.crt`) name the ConfigMap and
-  key holding the CA that signed the external server's certificate, so the
-  service can connect with `sslmode=verify-full`.
+## Verify
 
-The service refuses to start without TLS, and it refuses a database
-connection that does not require TLS. A deployment with no serving
-certificate, or a plaintext-capable `sslmode`, fails at startup rather than
-serving in the clear.
+Mint a token with the grid CA bundle:
 
-## 2. Mint a token
-
-A grid-admin mints a single-use token that pins the site name. With the
-default `enrollment.authz=kube`, `$GRID_ADMIN_TOKEN` is a Kubernetes
-ServiceAccount token for an identity RBAC authorizes against the
-`enrollmenttokens` resource, reviewed with `TokenReview` and
-`SubjectAccessReview`. Under the `enrollment.authz=local` override,
-`$GRID_ADMIN_TOKEN` is instead the token half of a `name:token` line in the
-grid-admin-tokens Secret, the one `enrollment.gridAdminTokens.generate`
-created or `enrollment.gridAdminTokens.existingSecretRef` pointed at. The
-minted site token is usable once and only its digest is stored, so it
-cannot be recovered later.
-
-Every call below verifies the enrollment service's certificate against the
-grid CA before sending a bearer token. Extract the CA certificate from the
-`grid-ca-bundle` Secret and pass it with `--cacert`:
+Under `kube`, the chart ships the grid-admin Role, `<release>-grid-enrollment-grid-admin`, with `create` and `delete` on `enrollmenttokens`. Bind it with `enrollment.gridAdmins.subjects`, or set `enrollment.gridAdmins.serviceAccount.create=true`. The bearer must be bound to `enrollment.tokenAudience` (default `grid-enrollment`); a general API token is refused. Mint a short-lived one:
 
 ```bash
-kubectl -n grid get secret grid-ca-bundle -o jsonpath='{.data.ca\.crt}' \
-  | base64 -d > grid-ca-bundle.crt
-```
+kubectl -n grid get secret grid-ca-bundle -o jsonpath='{.data.ca\.crt}' | base64 -d > grid-ca-bundle.crt
+GRID_ADMIN_SA=grid-admin  # a ServiceAccount bound to the grid-admin Role
+GRID_ADMIN_TOKEN=$(kubectl -n grid create token "$GRID_ADMIN_SA" --audience grid-enrollment --duration 10m)
+# printf is a builtin, so the token stays out of process arguments.
+(umask 077 && printf 'Authorization: Bearer %s\n' "$GRID_ADMIN_TOKEN" > admin.hdr)
 
-```bash
-curl -s -X POST https://enrollment.grid.internal/v1alpha1/enrollmenttokens \
+curl -s -X POST https://enrollment.apps.example.com/v1alpha1/enrollmenttokens \
   --cacert grid-ca-bundle.crt \
-  -H "Authorization: Bearer $GRID_ADMIN_TOKEN" \
+  -H @admin.hdr \
   -H "Content-Type: application/json" \
   -d '{"siteName": "east2", "gridNetworkRef": "my-grid"}'
 ```
 
-Response:
+The response returns `tokenId`, a single-use `token`, and `expiresAt`. Give `token` and `grid-ca-bundle.crt` to the site out of band. Revoke an unused token with `DELETE /v1alpha1/enrollmenttokens/$TOKEN_ID`.
 
-```json
-{
-  "tokenId": "b3f...",
-  "token": "b6a1...64-hex-chars",
-  "siteName": "east2",
-  "expiresAt": "2026-09-28T12:00:00Z"
-}
-```
-
-Hand the `token` value and the `grid-ca-bundle.crt` file to the site out of
-band. To revoke the token before it is redeemed:
-
-```bash
-curl -s -X DELETE https://enrollment.grid.internal/v1alpha1/enrollmenttokens/$TOKEN_ID \
-  --cacert grid-ca-bundle.crt \
-  -H "Authorization: Bearer $GRID_ADMIN_TOKEN"
-```
-
-## 3. Generate a keypair and CSR
-
-On the site, generate a key and a certificate signing request. The CSR's
-Subject Alternative Name, if it carries one, is ignored: the grid assigns the
-identity from the token, not from anything the site asserts.
+On the site, create a key and CSR, then redeem the token:
 
 ```bash
 openssl ecparam -genkey -name prime256v1 -noout -out site.key
 openssl req -new -key site.key -subj "/CN=east2" -out site.csr
-```
+read -rs SITE_TOKEN  # paste the token from the grid admin
+(umask 077 && printf 'Authorization: Bearer %s\n' "$SITE_TOKEN" > site.hdr)
 
-## 4. Enroll
-
-Submit the token and the CSR to the enrollment endpoint. Verify the server
-against the `grid-ca-bundle.crt` handed over out of band with the token,
-before sending `$SITE_TOKEN`:
-
-```bash
 jq -n --rawfile csr site.csr '{csr: $csr}' \
-  | curl -s -X POST https://enrollment.grid.internal/v1alpha1/enrollments \
+  | curl -s -X POST https://enrollment.apps.example.com/v1alpha1/enrollments \
       --cacert grid-ca-bundle.crt \
-      -H "Authorization: Bearer $SITE_TOKEN" \
+      -H @site.hdr \
       -H "Content-Type: application/json" \
       -d @-
 ```
 
-One response, no separate approval step:
+The response returns `certificate`, issued for the site name the token pinned (SANs in the CSR are ignored), `caCertificate`, and `spiffeId`, the identity the site presents to its peers.
 
-```json
-{
-  "id": "9e2...",
-  "certificate": "-----BEGIN CERTIFICATE-----...",
-  "caCertificate": "-----BEGIN CERTIFICATE-----...",
-  "spiffeId": "spiffe://grid.internal/site/east2",
-  "publicKeySha256": "…"
-}
-```
+## Monitoring the signing CA
 
-- `certificate` is signed under the name the token pinned, `east2`, regardless
-  of what the CSR asked for.
-- `spiffeId` is the identity this certificate carries, `spiffe://grid.internal/site/east2`.
-  It is the identity the site presents for mutual TLS to its peers, not a
-  claim that any peer has verified it yet.
-- `caCertificate` is the grid CA, the same certificate the `grid-ca-bundle`
-  Secret carries. Trust it to verify other sites' certificates.
+The enrollment service reloads the grid CA from its Secret every minute. When
+the CA changes, it logs `signing CA changed on disk` at warning level with the
+old and new fingerprints, and signs every later site certificate with the new
+CA. Alert on that message: an unplanned CA change splits trust between sites
+enrolled before and after it.
 
-## 5. Join the mesh
+## Certificate lifetimes
 
-Enrollment returns identity only. A site also needs the SWIM transport key
-and the seed peers to reach the rest of the mesh. The operator provisions
-those from the site's GridNetwork. The enrollment service never returns
-them.
+Bootstrap issues the enrollment and DB serving certificates for 365 days and
+renews each one when fewer than 30 days remain, but it runs only on
+`helm install` and `helm upgrade`, so renewal needs an upgrade inside that
+window. Run `helm upgrade` at least every 30 days, or when the enrollment pod
+logs its daily warning that the serving certificate is inside the window.
+
+The grid CA lasts 10 years. There is no CA rotation path yet: regenerating it
+(`ca.forceRegenerate`) re-issues every leaf and invalidates every enrolled
+site's trust anchor.
+
+## Troubleshooting
+
+- **`route.host is required`**: a passthrough Route is rendering without a host. Set `route.host` to `<name>.apps.<cluster-domain>`, or set `route.enabled=false`. Under an umbrella chart, prefix both with the subchart name.
+- **CA bootstrap Job fails with `built without --features bootstrap`**: the image was built with `--no-default-features`. Use a default build, which includes `sar` and `bootstrap`.
+- **`TokenReview` or `SubjectAccessReview` calls fail**: `enrollment.authz=kube` needs the `sar` feature and `enrollment.serviceAccount.create=true`, which binds the pod to `system:auth-delegator`.
