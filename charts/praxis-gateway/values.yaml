@@ -233,8 +233,6 @@ overlay:
   mountPath: "/etc/praxis/routing"
   # -- Items to project from the ConfigMap (used when sidecar is disabled).
   items:
-    - key: "routing-config.json"
-      path: "routing-config.json"
     - key: "routing-overlay.json"
       path: "routing-overlay.json"
   # -- Overlay sync sidecar settings. When enabled, the sidecar watches the

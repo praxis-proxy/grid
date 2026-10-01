@@ -194,7 +194,7 @@ AI image; these values may advance independently.
 | `overlay.enabled` | bool | `false` | Mount an overlay ConfigMap. |
 | `overlay.existingConfigMap` | string | `""` | Name of the overlay ConfigMap. |
 | `overlay.mountPath` | string | `/etc/praxis/routing` | Mount path for overlay files. |
-| `overlay.items` | list | routing-config.json, routing-overlay.json | Items to project. |
+| `overlay.items` | list | routing-overlay.json | Items to project. |
 | `overlay.sidecar.enabled` | bool | `false` | Deliver validated overlays through an API-watch sidecar instead of kubelet ConfigMap projection. |
 | `overlay.sidecar.image.repository` | string | `grid-overlay-sync` | Overlay-sync image repository. Use a published or locally built image appropriate to the deployment. |
 | `overlay.sidecar.image.tag` | string | `latest` | Overlay-sync image tag. Use an immutable published tag for reproducible deployments. |
