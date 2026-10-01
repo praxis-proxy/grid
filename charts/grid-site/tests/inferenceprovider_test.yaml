@@ -1,0 +1,49 @@
+suite: InferenceProviders
+templates:
+  - templates/inferenceprovider.yaml
+set:
+  gridSite.name: site-a
+tests:
+  - it: a keyed provider needs only its endpoint
+    set:
+      inferenceProviders.my-model.endpoint: http://10.96.0.20:8000
+    asserts:
+      - equal:
+          path: metadata.name
+          value: my-model
+      - equal:
+          path: spec.gridNetworkRef
+          value: grid
+      - equal:
+          path: spec.providerKind
+          value: vllm
+      - equal:
+          path: spec.backendKind
+          value: local_model
+      - equal:
+          path: spec.models
+          value:
+            - name: my-model
+              capabilities: [text_generation]
+
+  - it: a keyed provider takes a model name
+    set:
+      inferenceProviders.vcr.endpoint: http://10.96.0.20:8000
+      inferenceProviders.vcr.model: Qwen/Qwen3-0.6B
+    asserts:
+      - equal:
+          path: spec.models[0].name
+          value: Qwen/Qwen3-0.6B
+
+  - it: the older list still renders
+    set:
+      inferenceProviders:
+        - name: old
+          gridNetworkRef: grid
+          providerKind: vllm
+          backendKind: local_model
+          endpoint: http://10.0.0.1:8000
+    asserts:
+      - equal:
+          path: metadata.name
+          value: old

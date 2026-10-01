@@ -1,6 +1,9 @@
 gridNetwork:
-  name: ""
+  name: grid
   gridId: ""
+  # -- Create a GridSite for each SWIM peer and route to them. Unset, it is on when peers
+  # are listed, else off, which keeps the routingClusterRef overlay of existing networks.
+  # autoDiscoverSites: true
   region: ""
   zone: ""
   seeds: []
@@ -21,11 +24,17 @@ gridNetwork:
       minimumStateDuration: 10s
       recoveryHoldDown: 30s
     missingMetrics: existingOnly
+  # -- Local selection mode. Set to null to leave it to the gateway default, deterministic.
+  selectionPolicy:
+    mode: roundRobin
   # -- Grid-wide signal propagation mode: gossip (default) or poll. Omit for
   # gossip (SWIM and CRDT overlay). poll propagates by direct mTLS pull. The
   # operator reads this once at startup, so a change needs an operator restart.
   # signalTransport:
   #   mode: poll
+  # -- Grid-wide peer trust: pin (default) or spiffe. Read at operator start.
+  # peerTrust:
+  #   mode: spiffe
 
 gridSite:
   name: ""
@@ -34,7 +43,23 @@ gridSite:
   providerSiteLabel: ""
   egress: {}
 
-inferenceProviders: []
+# -- Remote sites this site trusts, keyed by site name, one GridSite <network>-<name>
+# each, the name the operator gives a peer it discovers. Listing peers also turns on
+# site discovery and the TLS Secrets the operator writes, unless those are set.
+# address is the peer gateway the operator probes, verifying serverName (default
+# <name>.grid.internal). digest pins the peer's leaf. To rotate, set nextDigest to the
+# new digest, then move it to digest once the peer is Active.
+peers: {}
+#   site-a:
+#     address: 203.0.113.20:8080
+#     digest: <64 lowercase hex>
+
+# -- InferenceProviders keyed by name. model defaults to the name, providerKind to vllm,
+# and backendKind to local_model. The older list of full InferenceProvider specs still
+# renders.
+# inferenceProviders:
+#   my-model:
+#     endpoint: http://10.96.0.20:8000
 
 nameOverride: ""
 fullnameOverride: ""

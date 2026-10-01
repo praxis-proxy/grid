@@ -69,12 +69,12 @@ Enable enrollment in the grid-operator chart:
 ```bash
 helm install grid-operator ./charts/grid-operator \
   --namespace grid-system \
+  --set swim.siteName=east2 \
   --set enrollment.enabled=true \
-  --set enrollment.url=https://enrollment.apps.example.com \
-  --set enrollment.siteName=east2 \
-  --set enrollment.caBundle.secret=grid-ca-bundle \
-  --set enrollment.tokenSecretRef.name=grid-invite-east2
+  --set enrollment.url=https://enrollment.apps.example.com
 ```
+
+The site name follows `swim.siteName`, the CA bundle defaults to Secret `grid-ca-bundle`, and the token to Secret `grid-invite-<siteName>`. On the hub itself, `enrollment.url` defaults to the in-cluster `grid-enrollment` Service.
 
 The GridNetwork's `spec.tls.siteSecretRef` and `caSecretRef` name the Secrets the operator writes, and both must be in the operator namespace. When the `siteSecretRef` Secret is absent at startup, the operator generates a key, redeems the token, and writes the grid CA (`ca.crt`) and the site identity (`tls.crt`, `tls.key`). The pod reports ready after enrollment finishes. The operator:
 

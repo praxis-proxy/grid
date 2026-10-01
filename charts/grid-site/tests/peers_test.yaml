@@ -1,0 +1,121 @@
+suite: peer GridSites
+templates:
+  - templates/peers.yaml
+  - templates/gridnetwork.yaml
+release:
+  namespace: grid
+set:
+  gridSite.name: site-a
+tests:
+  - it: renders no peer by default
+    template: templates/peers.yaml
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: renders one GridSite per peer in name order with its pins and probe target
+    template: templates/peers.yaml
+    set:
+      peers.site-b.address: 203.0.113.21:8080
+      peers.hub.digest: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      peers.hub.nextDigest: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+      peers.hub.region: us-east
+    asserts:
+      - hasDocuments:
+          count: 2
+      - equal:
+          path: metadata.name
+          value: grid-hub
+        documentIndex: 0
+      - equal:
+          path: spec
+          value:
+            gridNetworkRef: grid
+            region: us-east
+            trust:
+              canonicalFingerprints:
+                - aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+                - bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+        documentIndex: 0
+      - equal:
+          path: spec
+          value:
+            gridNetworkRef: grid
+            egress:
+              address: 203.0.113.21:8080
+              tls:
+                mode: Mutual
+                serverName: site-b.grid.internal
+        documentIndex: 1
+
+  - it: keeps an explicit probe server name
+    template: templates/peers.yaml
+    set:
+      peers.site-b.address: 203.0.113.21:8080
+      peers.site-b.serverName: gw.site-b.example.com
+    asserts:
+      - equal:
+          path: spec.egress.tls.serverName
+          value: gw.site-b.example.com
+
+  - it: refuses a malformed pin
+    template: templates/peers.yaml
+    set:
+      peers.hub.digest: AB:CD
+    asserts:
+      - failedTemplate: {}
+
+  - it: refuses this site as its own peer
+    template: templates/peers.yaml
+    set:
+      peers.site-a.address: 203.0.113.21:8080
+    asserts:
+      - failedTemplate:
+          errorPattern: this site's own gridSite.name
+
+  - it: names the GridSite as the operator names a discovered peer
+    template: templates/peers.yaml
+    set:
+      gridNetwork.name: Prod.Grid
+      peers.hub.digest: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    asserts:
+      - equal:
+          path: metadata.name
+          value: prod-grid-hub
+
+  - it: listing peers turns on discovery and the operator's TLS Secrets
+    template: templates/gridnetwork.yaml
+    set:
+      peers.hub.digest: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    asserts:
+      - equal:
+          path: metadata.labels["grid.praxis-proxy.io/auto-discover-sites"]
+          value: "true"
+      - equal:
+          path: spec.tls
+          value:
+            siteSecretRef: { name: grid-site-identity, namespace: grid }
+            caSecretRef: { name: grid-ca, namespace: grid }
+            swimKeyRef: { name: grid-swim-key, namespace: grid }
+
+  - it: keeps explicit discovery and TLS settings when peers are listed
+    template: templates/gridnetwork.yaml
+    set:
+      peers.hub.digest: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      gridNetwork.autoDiscoverSites: false
+      gridNetwork.tls.swimKeyRef: { name: k, namespace: other }
+    asserts:
+      - notExists:
+          path: metadata.labels["grid.praxis-proxy.io/auto-discover-sites"]
+      - equal:
+          path: spec.tls
+          value:
+            swimKeyRef: { name: k, namespace: other }
+
+  - it: without peers, sets no TLS and no discovery
+    template: templates/gridnetwork.yaml
+    asserts:
+      - notExists:
+          path: spec.tls
+      - notExists:
+          path: metadata.labels["grid.praxis-proxy.io/auto-discover-sites"]

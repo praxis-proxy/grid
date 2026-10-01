@@ -1,21 +1,14 @@
+{{- include "grid-site.normalize" . }}
 {{- if .Values.gridNetwork.name }}
-{{- $existing := lookup "grid.praxis-proxy.io/v1alpha1" "GridNetwork" .Release.Namespace .Values.gridNetwork.name }}
-{{- $configuredSelectionPolicy := .Values.gridNetwork.selectionPolicy }}
-{{- $existingSelectionPolicy := dig "spec" "selectionPolicy" nil $existing }}
-{{- $selectionPolicy := $configuredSelectionPolicy }}
-{{- if not $selectionPolicy }}
-  {{- if $existingSelectionPolicy }}
-    {{- $selectionPolicy = $existingSelectionPolicy }}
-  {{- else if not $existing }}
-    {{- $selectionPolicy = dict "mode" "roundRobin" }}
-  {{- end }}
-{{- end }}
 apiVersion: grid.praxis-proxy.io/v1alpha1
 kind: GridNetwork
 metadata:
   name: {{ .Values.gridNetwork.name }}
   labels:
     {{- include "grid-site.labels" . | nindent 4 }}
+    {{- if .Values.gridNetwork.autoDiscoverSites }}
+    grid.praxis-proxy.io/auto-discover-sites: "true"
+    {{- end }}
 spec:
   {{- /*
   gridId is always rendered (even when empty) so `spec` is never a null
@@ -52,7 +45,7 @@ spec:
   admissionPolicy:
     {{- toYaml . | nindent 4 }}
   {{- end }}
-  {{- with $selectionPolicy }}
+  {{- with .Values.gridNetwork.selectionPolicy }}
   {{- if .mode }}
   selectionPolicy:
     mode: {{ .mode | quote }}
@@ -63,6 +56,10 @@ spec:
   signalTransport:
     mode: {{ .mode | quote }}
   {{- end }}
+  {{- end }}
+  {{- with (.Values.gridNetwork.peerTrust).mode }}
+  peerTrust:
+    mode: {{ . | quote }}
   {{- end }}
   {{- with .Values.gridNetwork.metricsRefreshInterval }}
   {{- if . }}

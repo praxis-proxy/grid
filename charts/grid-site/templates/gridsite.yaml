@@ -1,3 +1,4 @@
+{{- include "grid-site.normalize" . }}
 {{- if .Values.gridSite.name }}
 apiVersion: grid.praxis-proxy.io/v1alpha1
 kind: GridSite

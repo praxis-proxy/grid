@@ -41,6 +41,25 @@ tests:
           path: spec.selectionPolicy.mode
           value: roundRobin
 
+  - it: omits selectionPolicy when unset, leaving the CRD default
+    set:
+      gridNetwork.name: prod-grid
+      gridSite.name: prod-site
+      gridNetwork.selectionPolicy: null
+    asserts:
+      - notExists:
+          path: spec.selectionPolicy
+
+  - it: renders the configured selectionPolicy
+    set:
+      gridNetwork.name: prod-grid
+      gridSite.name: prod-site
+      gridNetwork.selectionPolicy.mode: random
+    asserts:
+      - equal:
+          path: spec.selectionPolicy.mode
+          value: random
+
   - it: renders budgetPolicy.tenants verbatim when set
     set:
       gridNetwork.name: prod-grid
@@ -70,3 +89,39 @@ tests:
       - equal:
           path: spec.budgetPolicy.tenants
           value: []
+
+  - it: omits peerTrust by default
+    set:
+      gridNetwork.name: prod-grid
+      gridSite.name: prod-site
+    asserts:
+      - notExists:
+          path: spec.peerTrust
+
+  - it: renders peerTrust
+    set:
+      gridNetwork.name: prod-grid
+      gridSite.name: prod-site
+      gridNetwork.peerTrust.mode: spiffe
+    asserts:
+      - equal:
+          path: spec.peerTrust.mode
+          value: spiffe
+
+  - it: opts the network into site discovery
+    set:
+      gridNetwork.name: prod-grid
+      gridSite.name: prod-site
+      gridNetwork.autoDiscoverSites: true
+    asserts:
+      - equal:
+          path: metadata.labels["grid.praxis-proxy.io/auto-discover-sites"]
+          value: "true"
+
+  - it: leaves discovery off by default
+    set:
+      gridNetwork.name: prod-grid
+      gridSite.name: prod-site
+    asserts:
+      - notExists:
+          path: metadata.labels["grid.praxis-proxy.io/auto-discover-sites"]

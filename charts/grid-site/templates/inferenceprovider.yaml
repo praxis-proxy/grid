@@ -1,3 +1,4 @@
+{{- include "grid-site.normalize" . }}
 {{- range .Values.inferenceProviders }}
 ---
 apiVersion: grid.praxis-proxy.io/v1alpha1

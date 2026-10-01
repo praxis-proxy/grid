@@ -1,3 +1,4 @@
+{{- include "grid-operator.normalize" . }}
 {{- $gwNs := .Values.gateway.namespace }}
 {{- /* The operator trims the address, so blank would skip the Role yet still discover. */}}
 {{- if and .Values.gateway.address (eq (trim .Values.gateway.address) "") }}

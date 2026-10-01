@@ -152,6 +152,17 @@ try_template "$CHART_DIR" "SWIM ClusterIP" \
 try_template "$CHART_DIR" "SWIM LoadBalancer" \
   --set swim.service.enabled=true --set swim.service.type=LoadBalancer \
   --set swim.service.loadBalancerIP=10.0.0.1
+SIG_RENDER=$(helm template v-sig "$CHART_DIR" --namespace grid-system --set signals.enabled=true \
+  --set swim.service.enabled=true --set swim.service.type=LoadBalancer 2>&1 || true)
+if grep -q 'value: "v-sig-grid-operator-swim.grid-system.svc:9091"' <<<"$SIG_RENDER" \
+  && grep -A3 -- '- name: signals' <<<"$SIG_RENDER" | grep -q 'targetPort: signals'; then
+  pass "signals: TCP port on the SWIM Service and the local gateway address"
+else
+  fail "signals: unexpected render: $(grep -E 'SIGNALS|signals|Error' <<<"$SIG_RENDER" | head -3 | tr '\n' ' ')"
+fi
+try_reject_msg "$CHART_DIR" "signals without the SWIM Service" "needs swim.service.enabled" --set signals.enabled=true
+# --reuse-values from a release predating these keys leaves them absent.
+try_template "$CHART_DIR" "absent signals map" --set signals=null
 try_template "$CHART_DIR" "SWIM advertise address" \
   --set swim.service.enabled=true --set swim.service.type=LoadBalancer \
   --set swim.advertiseAddress=swim.example.com:7946
@@ -163,9 +174,13 @@ try_template "$CHART_DIR" "auto-enroll with a ConfigMap CA" "${ENROLL_SET[@]}" \
   --set enrollment.caBundle.configMap=grid-ca
 try_template "$CHART_DIR" "auto-enroll with a Secret CA" "${ENROLL_SET[@]}" \
   --set enrollment.caBundle.secret=grid-ca-bundle
-try_reject_msg "$CHART_DIR" "auto-enroll without a CA bundle" 'enrollment.caBundle needs a configMap or a secret' "${ENROLL_SET[@]}"
-try_reject_msg "$CHART_DIR" "auto-enroll with a nulled CA bundle" 'enrollment.caBundle needs a configMap or a secret' \
-  "${ENROLL_SET[@]}" --set enrollment.caBundle=null
+for nulled in "" --set=enrollment.caBundle=null; do
+  if render v-enroll "$CHART_DIR" "${ENROLL_SET[@]}" ${nulled:+"$nulled"} && grep -q 'secretName: "grid-ca-bundle"' <<<"$RENDERED"; then
+    pass "auto-enroll without a CA bundle pins the grid-ca-bundle Secret ${nulled:-(unset)}"
+  else
+    fail "auto-enroll without a CA bundle did not default to grid-ca-bundle ${nulled:-(unset)}"
+  fi
+done
 try_reject_msg "$CHART_DIR" "auto-enroll site name past 51 characters" 'siteName' "${ENROLL_SET[@]}" \
   --set enrollment.caBundle.secret=grid-ca-bundle --set enrollment.siteName="$(printf 'a%.0s' {1..52})"
 try_reject_msg "$CHART_DIR" "auto-enroll over plaintext" 'enrollment[./]url' "${ENROLL_SET[@]}" \
@@ -817,7 +832,7 @@ try_template "$SITE_DIR" "site with provider-site label" "${SITE_REQ[@]}" --name
 
 echo ""
 echo "=== Schema rejection (site) ==="
-try_reject "$SITE_DIR" "missing gridNetwork name" --set gridSite.name=test
+try_reject "$SITE_DIR" "blank gridNetwork name" --set gridSite.name=test --set gridNetwork.name=""
 try_reject "$SITE_DIR" "missing gridSite name" --set gridNetwork.name=test
 try_reject "$SITE_DIR" "unknown key (site)" "${SITE_REQ[@]}" --set typoField=true
 

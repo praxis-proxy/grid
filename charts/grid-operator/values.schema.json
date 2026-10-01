@@ -116,6 +116,10 @@
         "create": {
           "type": "boolean",
           "description": "Create ClusterRoles, ClusterRoleBindings, and RoleBindings."
+        },
+        "enrollmentNamespace": {
+          "type": "string",
+          "description": "The grid-enrollment namespace, which the render refuses to grant Secret access in."
         }
       }
     },
@@ -175,7 +179,11 @@
         },
         "advertiseAddress": {
           "type": "string",
-          "description": "Externally reachable SWIM advertise address. Defaults to Pod IP and bind port."
+          "description": "Externally reachable SWIM advertise address. Defaults to the SWIM Service LoadBalancer address when that Service is a LoadBalancer, else Pod IP and bind port."
+        },
+        "requireKey": {
+          "type": "boolean",
+          "description": "Hold SWIM traffic until the GridNetwork key loads or the network declares none. false opts out."
         },
         "siteName": {
           "type": "string",
@@ -211,14 +219,39 @@
             },
             "loadBalancerIP": {
               "type": "string",
-              "description": "Static IP for LoadBalancer type."
+              "description": "Static IP for LoadBalancer type. Deprecated in Kubernetes, so prefer an annotation such as metallb.io/loadBalancerIPs."
             },
             "externalTrafficPolicy": {
               "type": "string",
               "enum": ["", "Cluster", "Local"],
               "description": "External traffic policy for LoadBalancer or NodePort Services."
+            },
+            "loadBalancerSourceRanges": {
+              "type": "array",
+              "items": { "type": "string", "pattern": "^[0-9a-fA-F.:]+/[0-9]{1,3}$" },
+              "description": "CIDRs allowed to reach the SWIM and signals LoadBalancer."
             }
           }
+        }
+      }
+    },
+    "signals": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Serve the mTLS signals endpoint, expose it on the SWIM Service, and set GRID_SIGNALS_LOCAL_ADDR. For signalTransport poll."
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535,
+          "description": "Signals TCP port on the SWIM Service, gossiped to peers with its LoadBalancer address."
+        },
+        "advertiseAddress": {
+          "type": "string",
+          "description": "Signals endpoint gossiped to peers, ip:port, [ipv6]:port, or dns-name:port. Overrides the LoadBalancer discovery."
         }
       }
     },

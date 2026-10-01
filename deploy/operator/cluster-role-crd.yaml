@@ -7,12 +7,13 @@ metadata:
 rules:
   # ── Grid CRDs (cluster-scoped) ──────────────────────────────────────
   #
-  # The operator watches all three CRD types via kube-rs Controller::new
+  # The operator watches the Grid CRD types via kube-rs Controller::new
   # (requires list + watch).  It reads individual resources with get and
   # writes spec and status via server-side apply (patch).  Auto-discovery
   # of SWIM peers requires create + update on gridsites.
   - apiGroups: ["grid.praxis-proxy.io"]
     resources:
+      - agenttoolproviders
       - gridnetworks
       - inferenceproviders
     verbs: ["get", "list", "watch", "patch"]
@@ -24,6 +25,7 @@ rules:
   # Status subresources are authorized separately.
   - apiGroups: ["grid.praxis-proxy.io"]
     resources:
+      - agenttoolproviders/status
       - gridnetworks/status
       - gridsites/status
       - inferenceproviders/status

@@ -1,0 +1,37 @@
+{{- include "grid-site.normalize" . }}
+{{- $network := .Values.gridNetwork.name }}
+{{- range $name := keys (.Values.peers | default dict) | sortAlpha }}
+{{- $p := get $.Values.peers $name | default dict }}
+{{- if eq $name $.Values.gridSite.name }}
+{{- fail (printf "peers: %q is this site's own gridSite.name" $name) }}
+{{- end }}
+---
+apiVersion: grid.praxis-proxy.io/v1alpha1
+kind: GridSite
+metadata:
+  {{- /* The name the operator gives the peer it discovers over SWIM. */}}
+  name: {{ printf "%s-%s" (regexReplaceAll "[^a-z0-9]" ($network | lower) "-" | trimAll "-") $name }}
+  labels:
+    {{- include "grid-site.labels" $ | nindent 4 }}
+    grid.praxis-proxy.io/network: {{ $network | quote }}
+spec:
+  gridNetworkRef: {{ $network }}
+  {{- with $p.region }}
+  region: {{ . | quote }}
+  {{- end }}
+  {{- with $p.zone }}
+  zone: {{ . | quote }}
+  {{- end }}
+  {{- with $p.address }}
+  egress:
+    address: {{ . | quote }}
+    tls:
+      mode: Mutual
+      serverName: {{ $p.serverName | default (printf "%s.grid.internal" $name) | quote }}
+  {{- end }}
+  {{- with compact (list $p.digest $p.nextDigest) }}
+  trust:
+    canonicalFingerprints:
+      {{- toYaml . | nindent 6 }}
+  {{- end }}
+{{- end }}

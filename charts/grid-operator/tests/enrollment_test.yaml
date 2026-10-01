@@ -169,35 +169,66 @@ tests:
       - failedTemplate:
           errorPattern: enrollment.siteName is required
 
-  - it: requires a token Secret
+  - it: defaults the token Secret to grid-invite-<siteName>
     set:
       enrollment.enabled: true
       enrollment.tokenSecretRef.name: ""
     asserts:
-      - failedTemplate:
-          errorPattern: enrollment.tokenSecretRef.name is required
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: GRID_ENROLL_TOKEN_SECRET
+            value: grid-invite-site-d
 
-  - it: requires a CA bundle
+  - it: defaults the pinned bundle to the grid-ca-bundle Secret
     set:
       enrollment.enabled: true
       enrollment.caBundle.configMap: ""
     asserts:
-      - failedTemplate:
-          errorPattern: enrollment.caBundle needs a configMap or a secret
+      - equal:
+          path: spec.template.spec.volumes[?(@.name=="enroll-pin")].secret.secretName
+          value: grid-ca-bundle
 
-  - it: fails cleanly when the refs are nulled
+  - it: defaults both refs when they are nulled
     set:
       enrollment.enabled: true
       enrollment.caBundle: null
       enrollment.tokenSecretRef: null
     asserts:
-      - failedTemplate:
-          errorPattern: enrollment.tokenSecretRef.name is required
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: GRID_ENROLL_TOKEN_SECRET
+            value: grid-invite-site-d
+      - equal:
+          path: spec.template.spec.volumes[?(@.name=="enroll-pin")].secret.secretName
+          value: grid-ca-bundle
 
-  - it: fails cleanly when the pin is nulled
+  - it: names the SWIM site after the enrolling site
     set:
       enrollment.enabled: true
-      enrollment.caBundle: null
     asserts:
-      - failedTemplate:
-          errorPattern: enrollment.caBundle needs a configMap or a secret
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: GRID_SWIM_SITE_NAME
+            value: site-d
+
+  - it: keeps an explicit SWIM site name
+    set:
+      enrollment.enabled: true
+      swim.siteName: other
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: GRID_SWIM_SITE_NAME
+            value: other
+
+  - it: sets no SWIM site name from a disabled enrollment
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: GRID_SWIM_SITE_NAME
+            value: site-d

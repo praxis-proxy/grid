@@ -1,3 +1,4 @@
+{{- include "grid-operator.normalize" . }}
 {{- if .Values.serviceMonitor.enabled }}
 {{- if not .Values.metrics.service.enabled }}
 {{- fail "serviceMonitor.enabled requires metrics.service.enabled" }}

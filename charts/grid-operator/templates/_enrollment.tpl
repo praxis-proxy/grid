@@ -1,5 +1,19 @@
+{{/* Enrollment values with defaults: the grid-ca-bundle Secret and grid-invite-<siteName>. */}}
+{{- define "grid-operator.enrollment.settings" -}}
+{{- $e := deepCopy (.Values.enrollment | default dict) }}
+{{- $b := $e.caBundle | default dict }}
+{{- if not (or $b.configMap $b.secret) }}
+{{- $_ := set $e "caBundle" (merge (dict "secret" "grid-ca-bundle") $b) }}
+{{- end }}
+{{- $t := $e.tokenSecretRef | default dict }}
+{{- if and (not $t.name) $e.siteName }}
+{{- $_ := set $e "tokenSecretRef" (merge (dict "name" (printf "grid-invite-%s" $e.siteName)) $t) }}
+{{- end }}
+{{- toYaml $e }}
+{{- end }}
+
 {{- define "grid-operator.enrollment.validate" -}}
-{{- $e := .Values.enrollment | default dict }}
+{{- $e := include "grid-operator.enrollment.settings" . | fromYaml }}
 {{- if $e.enabled }}
 {{- if not (hasPrefix "https://" ($e.url | default "")) }}
 {{- fail "enrollment.url must be an https URL when enrollment.enabled is true" }}
@@ -18,14 +32,14 @@
 
 {{/* Emits "true" or nothing. */}}
 {{- define "grid-operator.enrollment.hasGridCa" -}}
-{{- $e := .Values.enrollment | default dict }}
+{{- $e := include "grid-operator.enrollment.settings" . | fromYaml }}
 {{- if or (dig "gridCaBundle" "configMap" "" $e) (dig "gridCaBundle" "secret" "" $e) -}}
 true
 {{- end -}}
 {{- end }}
 
 {{- define "grid-operator.enrollment.env" -}}
-{{- $e := .Values.enrollment | default dict }}
+{{- $e := include "grid-operator.enrollment.settings" . | fromYaml }}
 {{- if $e.enabled }}
 - name: GRID_ENROLL_ENABLED
   value: "true"
@@ -47,7 +61,7 @@ true
 {{- end }}
 
 {{- define "grid-operator.enrollment.volumeMounts" -}}
-{{- if (.Values.enrollment | default dict).enabled }}
+{{- if (include "grid-operator.enrollment.settings" . | fromYaml).enabled }}
 - name: enroll-pin
   mountPath: /etc/grid-enroll/pin
   readOnly: true
@@ -75,7 +89,7 @@ true
 {{- end }}
 
 {{- define "grid-operator.enrollment.volumes" -}}
-{{- $e := .Values.enrollment | default dict }}
+{{- $e := include "grid-operator.enrollment.settings" . | fromYaml }}
 {{- if $e.enabled }}
 {{ include "grid-operator.enrollment.bundleVolume" (dict "name" "enroll-pin" "bundle" $e.caBundle) }}
 {{- if include "grid-operator.enrollment.hasGridCa" . }}

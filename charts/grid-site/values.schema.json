@@ -41,6 +41,10 @@
         "gridId": {
           "type": "string"
         },
+        "autoDiscoverSites": {
+          "type": ["boolean", "null"],
+          "description": "Create a GridSite for each SWIM peer and route to them."
+        },
         "region": {
           "type": "string"
         },
@@ -123,6 +127,17 @@
             }
           }
         },
+        "peerTrust": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode"],
+          "properties": {
+            "mode": {
+              "type": "string",
+              "enum": ["pin", "spiffe"]
+            }
+          }
+        },
         "placementPolicy": {
           "type": "object",
           "additionalProperties": false,
@@ -199,8 +214,30 @@
         }
       }
     },
+    "peers": {
+      "type": "object",
+      "description": "Remote sites this site trusts, keyed by site name, one GridSite each.",
+      "propertyNames": { "pattern": "^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$" },
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "address": { "type": "string", "pattern": "^\\S+:[0-9]+$", "description": "Peer gateway host:port the operator probes." },
+          "serverName": { "type": "string", "minLength": 1, "maxLength": 253, "description": "Name the probe verifies. Defaults to <name>.grid.internal." },
+          "digest": { "type": "string", "pattern": "^[0-9a-f]{64}$", "description": "The peer's leaf certificate SHA-256 (DER)." },
+          "nextDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$", "description": "The next leaf digest during a rotation." },
+          "region": { "type": "string" },
+          "zone": { "type": "string" }
+        }
+      }
+    },
     "inferenceProviders": {
-      "type": "array",
+      "description": "InferenceProviders keyed by name, or the older list of full specs.",
+      "oneOf": [
+        { "type": "object", "propertyNames": { "pattern": "^[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?$" }, "additionalProperties": {"type": "object", "additionalProperties": true, "required": ["endpoint"], "properties": {"name": {"type": "string", "minLength": 1}, "gridNetworkRef": {"type": "string", "minLength": 1}, "providerKind": {"type": "string", "minLength": 1}, "backendKind": {"type": "string", "minLength": 1}, "endpoint": {"type": "string", "minLength": 1}, "routingClusterRef": {"type": "string"}, "gatewayRef": {"type": "string", "minLength": 1}, "trafficPolicy": {"type": "object", "additionalProperties": false, "properties": {"drain": {"type": "boolean", "default": false}}}, "capacityWeight": {"type": "integer", "minimum": 1, "maximum": 1000}, "model": {"type": "string", "minLength": 1, "description": "Model name. Defaults to the key."}}} },
+        { "type": "array" }
+      ],
+      "type": ["array", "object"],
       "items": {
         "type": "object",
         "additionalProperties": true,

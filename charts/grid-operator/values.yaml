@@ -48,6 +48,9 @@ serviceAccount:
 rbac:
   # -- Create ClusterRoles, ClusterRoleBindings, and RoleBindings.
   create: true
+  # -- The grid-enrollment namespace. The render fails if the operator would get Secret
+  # access there. Defaults to grid-enrollment with enrollment on.
+  enrollmentNamespace: ""
 
 # -- Additional namespaces where the operator needs Secret, ConfigMap,
 # Event, and Service access. The release namespace is always included.
@@ -78,36 +81,48 @@ metrics:
 swim:
   # -- SWIM bind address (host:port).
   bindAddress: "0.0.0.0:7946"
-  # -- Externally reachable SWIM advertise endpoint (ip:port, [ipv6]:port, or hostname:port). Defaults to
-  # Pod IP and bind port. Must be set when a LoadBalancer or NodePort Service
-  # fronts the SWIM port and remote peers connect through that address.
+  # -- SWIM advertise endpoint (ip:port, [ipv6]:port, or hostname:port). Defaults to the LoadBalancer SWIM Service address, else the Pod IP.
   advertiseAddress: ""
-  # -- Bootstrap SWIM site name override.
+  # -- Hold SWIM traffic until the GridNetwork key loads or the network declares none. false opts out.
+  requireKey: true
+  # -- Bootstrap SWIM site name. Defaults to enrollment.siteName when enrollment is on.
   siteName: ""
   # -- Bootstrap SWIM seed endpoints (comma-separated ip:port, [ipv6]:port, or hostname:port).
   seeds: ""
-  # -- SWIM Service (disabled by default).
+  # -- SWIM Service.
   service:
-    # -- Create a Service for the SWIM port.
-    enabled: false
-    # -- Service type: ClusterIP, LoadBalancer, or NodePort.
-    type: "ClusterIP"
+    # -- Create a Service for the SWIM port. Unset, it is on with enrollment, else off.
+    # enabled: true
+    # -- Service type: ClusterIP, LoadBalancer, or NodePort. Unset, LoadBalancer when
+    # enrollment turns the Service on, else ClusterIP.
+    # type: LoadBalancer
     # -- Service port number.
     port: 7946
     # -- Service annotations.
     annotations: {}
-    # -- Static IP for LoadBalancer type.
+    # -- Static LoadBalancer IP. Deprecated in Kubernetes, so prefer a metallb.io/loadBalancerIPs annotation.
     loadBalancerIP: ""
     # -- External traffic policy. Defaults to Local for LoadBalancer, omitted
     # for ClusterIP and NodePort.
     externalTrafficPolicy: ""
+    # -- Optional CIDRs allowed to reach the SWIM and signals LoadBalancer, where it enforces them.
+    loadBalancerSourceRanges: []
+
+# -- mTLS signals endpoint, for a GridNetwork with signalTransport poll.
+signals:
+  # -- Serve signals on the SWIM Service. Needs swim.service.enabled and, for a LoadBalancer, mixed UDP and TCP support.
+  enabled: false
+  # -- Signals TCP port on the SWIM Service, gossiped to peers with its LoadBalancer address.
+  port: 9091
+  # -- Signals endpoint gossiped to peers (ip:port, [ipv6]:port, or dns-name:port). Set it when swim.advertiseAddress is set or the Service is not a LoadBalancer.
+  advertiseAddress: ""
 
 # -- Advertised gateway address configuration.
 gateway:
   # -- Gateway address override.
   address: ""
   # -- Gateway Kubernetes Service name for the operator to discover. Maps to
-  # GRID_GATEWAY_SERVICE_NAME.
+  # GRID_GATEWAY_SERVICE_NAME. Defaults to grid-gateway with enrollment on.
   serviceName: ""
   # -- Namespace of the gateway Service. Empty uses the release namespace. Maps
   # to GRID_GATEWAY_NAMESPACE.
@@ -163,11 +178,12 @@ priorityClassName: ""
 enrollment:
   # -- Enroll when the site identity Secret is absent.
   enabled: false
-  # -- Enrollment service https base URL.
+  # -- Enrollment service https base URL. Defaults to the in-cluster grid-enrollment
+  # Service in rbac.enrollmentNamespace, the hub's own.
   url: ""
-  # -- Site name the token pins, at most 51 characters.
+  # -- Site name the token pins, at most 51 characters. Defaults to swim.siteName.
   siteName: ""
-  # -- CA pinning the enrollment server, and the grid CA by default.
+  # -- CA pinning the enrollment server, and the grid CA by default. With neither set, Secret grid-ca-bundle.
   caBundle:
     # -- ConfigMap holding the bundle. Set this or secret.
     configMap: ""
@@ -185,7 +201,7 @@ enrollment:
     key: ca.crt
   # -- Secret holding the one-time site token.
   tokenSecretRef:
-    # -- Secret name.
+    # -- Secret name. Defaults to grid-invite-<siteName>.
     name: ""
     # -- Key holding the token.
     key: token

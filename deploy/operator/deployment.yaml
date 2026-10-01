@@ -8,6 +8,9 @@ metadata:
     app.kubernetes.io/managed-by: grid-operator
 spec:
   replicas: 1
+  # One SWIM identity per site: a surge pod would gossip a second one.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app.kubernetes.io/name: grid-operator
@@ -17,6 +20,8 @@ spec:
         app.kubernetes.io/name: grid-operator
     spec:
       serviceAccountName: grid-operator
+      # Service link env vars would collide with the operator's GRID_* settings.
+      enableServiceLinks: false
       securityContext:
         runAsNonRoot: true
         seccompProfile:
@@ -43,12 +48,12 @@ spec:
               value: "0.0.0.0:7946"
             - name: GRID_SWIM_ADVERTISE_ADDR
               value: "$(POD_IP):7946"
-            - name: GRID_SWIM_SITE_NAME
-              value: ""
-            - name: GRID_SWIM_SEEDS
-              value: ""
-            - name: GRID_GATEWAY_ADDRESS
-              value: ""
+            - name: GRID_SWIM_ADVERTISE_FALLBACK
+              value: "$(POD_IP):7946"
+            - name: GRID_GATEWAY_NAMESPACE
+              value: "grid-system"
+            - name: GRID_GATEWAY_PORT
+              value: "8080"
             - name: GRID_METRICS_ADDR
               value: "0.0.0.0:9090"
             - name: RUST_LOG

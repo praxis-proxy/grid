@@ -1,3 +1,4 @@
+{{- include "grid-operator.normalize" . }}
 Grid operator installed.
 
   Release:   {{ .Release.Name }}
