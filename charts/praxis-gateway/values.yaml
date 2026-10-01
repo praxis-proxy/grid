@@ -154,6 +154,7 @@ praxisConfig:
 #   operator: not supported. Setting secretName fails the install.
 upstreamCA:
   # -- Existing Secret holding the CA bundle. The chart does not create it.
+  # Empty (the default) turns upstreamCA off.
   secretName: ""
   # -- Key within the Secret that holds the PEM bundle.
   key: "ca.crt"
@@ -179,7 +180,7 @@ upstreamCA:
 # service.beta.openshift.io/serving-cert-secret-name to the Secret name.
 listenerTls:
   # -- Existing Secret holding the server certificate (tls.crt) and key (tls.key).
-  # The chart does not create it.
+  # The chart does not create it. Empty (the default) turns listener TLS off.
   secretName: ""
   # -- Mount path for the listener certificate.
   mountPath: "/etc/praxis/listener-tls"
@@ -269,7 +270,8 @@ overlay:
 # Set secretName to mount it. The Secret holds tls.crt, tls.key and ca.crt.
 # You create it; the chart only mounts it.
 gridIdentity:
-  # -- Existing Secret with the grid identity. Empty: nothing is mounted.
+  # -- Existing Secret with the grid identity. The chart does not create it.
+  # Empty (the default) turns the grid identity off: backends default to plaintext.
   secretName: ""
   # -- Mount path for TLS files.
   mountPath: "/etc/praxis/tls"
