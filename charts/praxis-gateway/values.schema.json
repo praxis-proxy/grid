@@ -575,6 +575,12 @@
         }
       }
     },
+    "shutdownDelaySeconds": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 25,
+      "description": "Seconds a terminating pod keeps serving before Praxis gets SIGTERM, as a preStop sleep. 0 disables it."
+    },
     "resources": {
       "type": "object",
       "description": "Container resource requests and limits."

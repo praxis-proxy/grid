@@ -198,6 +198,12 @@ spec:
           livenessProbe:
             {{- include "praxis-gateway.probe" (list . $) | nindent 12 }}
           {{- end }}
+          {{- with .Values.shutdownDelaySeconds }}
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sleep", {{ . | quote }}]
+          {{- end }}
           {{- with .Values.resources }}
           resources:
             {{- toYaml . | nindent 12 }}

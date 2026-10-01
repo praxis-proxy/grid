@@ -393,6 +393,13 @@ health:
     initialDelaySeconds: 5
     periodSeconds: 10
 
+# -- Seconds a terminating pod keeps serving before Praxis is told to stop. Praxis
+# closes its listener as soon as it gets SIGTERM, but Service endpoints take a moment
+# to drop the pod, so without a delay every rollout refuses a few requests. Runs the
+# image's sleep binary as a preStop hook and counts against the pod's 30 second
+# termination grace period. 0 disables it.
+shutdownDelaySeconds: 5
+
 # -- Container resource requests and limits.
 resources: {}
 # -- Node selector for pod scheduling.
