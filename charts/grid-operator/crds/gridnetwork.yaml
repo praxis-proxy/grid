@@ -337,6 +337,19 @@ spec:
                   nullable: true
                   pattern: ^([1-9][0-9]*s|[1-9][0-9]{3,}ms)$
                   type: string
+                peerTrust:
+                  description: Grid-wide peer trust on the signals path, `pin` when absent, read at operator start.
+                  nullable: true
+                  properties:
+                    mode:
+                      description: Peer trust mode.
+                      enum:
+                        - pin
+                        - spiffe
+                      type: string
+                  required:
+                    - mode
+                  type: object
                 placementPolicy:
                   description: Optional static capacity-placement policy.
                   nullable: true

@@ -196,6 +196,26 @@ pub struct SignalTransportConfig {
     pub mode: SignalMode,
 }
 
+/// How a peer site proves its identity beyond chaining to the Grid CA.
+#[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PeerTrustMode {
+    /// Its leaf digest is declared on its `GridSite`.
+    #[default]
+    Pin,
+    /// Its leaf carries `spiffe://grid.internal/site/<site>`, and no pins are read.
+    Spiffe,
+}
+
+/// Grid-wide peer trust, the same at every site.
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct PeerTrustConfig {
+    /// Peer trust mode.
+    pub mode: PeerTrustMode,
+}
+
 /// Explicit static provider-capacity placement strategy.
 #[derive(Clone, Copy, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -634,6 +654,10 @@ pub struct GridNetworkSpec {
     /// restart.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signal_transport: Option<SignalTransportConfig>,
+
+    /// Grid-wide peer trust on the signals path, `pin` when absent, read at operator start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_trust: Option<PeerTrustConfig>,
 
     /// Optional static capacity-placement policy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2075,6 +2099,23 @@ mod tests {
             std::process::abort();
         };
         assert!(error.to_string().contains("unknown variant"));
+    }
+
+    #[test]
+    fn peer_trust_round_trips_and_rejects_unknown_mode() {
+        let spec: GridNetworkSpec =
+            serde_json::from_value(serde_json::json!({"seeds": [], "peerTrust": {"mode": "spiffe"}}))
+                .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(spec.peer_trust.map(|trust| trust.mode), Some(PeerTrustMode::Spiffe));
+        let bare: GridNetworkSpec =
+            serde_json::from_value(serde_json::json!({"seeds": []})).unwrap_or_else(|_| std::process::abort());
+        assert!(bare.peer_trust.is_none(), "absent stays absent");
+        assert_eq!(PeerTrustMode::default(), PeerTrustMode::Pin);
+        let Err(_unknown) =
+            serde_json::from_value::<GridNetworkSpec>(serde_json::json!({"seeds": [], "peerTrust": {"mode": "x"}}))
+        else {
+            std::process::abort();
+        };
     }
 
     #[test]

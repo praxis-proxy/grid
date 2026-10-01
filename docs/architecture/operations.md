@@ -315,11 +315,20 @@ unrelated address.
 | `GRID_SWIM_REQUIRE_KEY` | Hold all SWIM traffic until the `GridNetwork` key loads or the network declares none. Defaults to `true`. With `false`, SWIM is plaintext while no network exists |
 | `GRID_SWIM_SITE_NAME` | Unique site identity for this operator instance |
 | `GRID_SWIM_SEEDS` | Comma-separated SWIM seed endpoints; accepts `ip:port`, `[ipv6]:port`, or `hostname:port` |
+| `GRID_SIGNALS_ADDR` | Signals listener address. Defaults to `[::]:9091`, or `0.0.0.0:9091` on a host without IPv6 |
+| `GRID_SIGNALS_ADVERTISE_ADDR` | Signals endpoint gossiped to peers, as `ip:port`, `[ipv6]:port`, or `hostname:port`. Without it, a site advertising the SWIM LoadBalancer gossips that address on the Service port named `signals`, and any other site gossips none. A LoadBalancer site needs one of the two, and the Service port needs a LoadBalancer that serves UDP and TCP on one Service |
+| `GRID_SIGNALS_PEER_PORT` | Port dialed on a peer's SWIM host when the peer gossips no signals endpoint. Defaults to `9091` |
+| `GRID_SIGNALS_MAX_PER_PEER` | Concurrent authenticated signals connections one peer site may hold. Defaults to `8` |
 | `GRID_GATEWAY_ADDRESS` | Explicit gateway address override (skips self-discovery) |
 | `GRID_GATEWAY_SERVICE_NAME` | Service name for gateway self-discovery (default: `provider-gateway`) |
 | `GRID_GATEWAY_NAMESPACE` | Namespace for gateway Service lookup (default: `grid-system`) |
 | `GRID_GATEWAY_PORT` | Port appended to discovered address (default: `8080`) |
 | `GRID_GATEWAY_DISCOVERY_INTERVAL_MS` | Polling interval for gateway discovery (default: `5000`) |
+
+The signals listener caps handshakes per client source address. Behind a
+LoadBalancer, set `externalTrafficPolicy: Local` on the Service that carries
+the signals port. With `Cluster`, node SNAT gives many clients one source
+address, and they share its cap.
 
 `GRID_SWIM_ENCRYPT_KEY` is intentionally omitted from the
 `Deployment`.  Production SWIM encryption uses

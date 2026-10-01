@@ -5833,6 +5833,7 @@ mod tests {
             age_secs,
             gateway_address: None,
             site_cert_pem: None,
+            signals_address: None,
         }
     }
 

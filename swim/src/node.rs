@@ -67,6 +67,9 @@ pub struct SwimNode {
     /// carrying a `site_cert_pem` extension is received.
     cert_pems_rx: watch::Receiver<BTreeMap<String, String>>,
 
+    /// Watch receiver for the signals address map, keyed by origin site.
+    signals_addrs_rx: watch::Receiver<BTreeMap<String, String>>,
+
     /// Immediate control path for coordinated per-origin state eviction.
     origin_state: OriginStateHandle,
 
@@ -115,6 +118,7 @@ impl SwimNode {
         let state_rx = handler.subscribe();
         let gateway_addrs_rx = handler.subscribe_gateway_addrs();
         let cert_pems_rx = handler.subscribe_cert_pems();
+        let signals_addrs_rx = handler.subscribe_signals_addrs();
         let trust_store_tx = handler.trust_store_sender();
 
         Self {
@@ -123,6 +127,7 @@ impl SwimNode {
             state_rx,
             gateway_addrs_rx,
             cert_pems_rx,
+            signals_addrs_rx,
             origin_state,
             trust_store_tx,
         }
@@ -310,6 +315,29 @@ impl SwimNode {
     #[must_use]
     pub fn cert_pems(&self) -> BTreeMap<String, String> {
         self.cert_pems_rx.borrow().clone()
+    }
+
+    /// Run `read` over the gateway, certificate, and signals maps without cloning them.
+    pub fn with_peer_metadata<R, Read>(&self, read: Read) -> R
+    where
+        Read: FnOnce(&BTreeMap<String, String>, &BTreeMap<String, String>, &BTreeMap<String, String>) -> R,
+    {
+        read(
+            &self.gateway_addrs_rx.borrow(),
+            &self.cert_pems_rx.borrow(),
+            &self.signals_addrs_rx.borrow(),
+        )
+    }
+
+    /// Run `read` over the merged grid state without cloning it.
+    pub fn with_state<R, Read: FnOnce(&GridStateSnapshot) -> R>(&self, read: Read) -> R {
+        read(&self.state_rx.borrow())
+    }
+
+    /// Return the signals address each peer advertised, keyed by origin site.
+    #[must_use]
+    pub fn signals_addrs(&self) -> BTreeMap<String, String> {
+        self.signals_addrs_rx.borrow().clone()
     }
 }
 
@@ -931,6 +959,37 @@ mod tests {
             Some("10.0.0.2:19080"),
             "B must receive A's gateway address via SWIM custom broadcast"
         );
+    }
+
+    #[test]
+    fn signals_address_propagates_to_peer_via_gossip_broadcast() {
+        let id_a = local_id("site-a", 19_212);
+        let id_b = local_id("site-b", 19_213);
+        let (mut node_a, _) = make_node("site-a", 19_212);
+        let (mut node_b, _) = make_node("site-b", 19_213);
+        establish_membership(&mut node_a, &mut node_b, &id_a, &id_b);
+
+        let broadcast = StateBroadcast::new(
+            "site-a".to_owned(),
+            1,
+            GridStateSnapshot::new("site-a".to_owned()),
+            None,
+        )
+        .with_signals_address(Some("[2001:db8::7]:9091".to_owned()));
+        node_a
+            .publish_state_broadcast(&broadcast)
+            .unwrap_or_else(|_| std::process::abort());
+        for msg in &node_a.gossip().messages {
+            if msg.addr == id_b.socket_addr() {
+                drop(node_b.handle_data(&msg.data));
+            }
+        }
+
+        assert_eq!(
+            node_b.signals_addrs().get("site-a").map(String::as_str),
+            Some("[2001:db8::7]:9091")
+        );
+        assert!(node_b.gateway_addrs().is_empty(), "no gateway address was sent");
     }
 
     #[test]

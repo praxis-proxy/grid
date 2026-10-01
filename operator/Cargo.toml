@@ -60,6 +60,7 @@ sha2 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_json_canonicalizer = { workspace = true }
+socket2 = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true }
 tokio = { workspace = true }
@@ -75,6 +76,7 @@ zeroize = { workspace = true }
 # Server-side rmcp features, only for the mcp_probe integration tests, which
 # spin up a real Streamable HTTP MCP server to probe against.
 rmcp = { workspace = true, features = ["server", "transport-streamable-http-server"] }
+pem = { workspace = true }
 serde_yaml = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 tower = { workspace = true }

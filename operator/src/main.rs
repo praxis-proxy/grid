@@ -122,15 +122,23 @@ async fn main() {
         std::process::exit(1);
     }
 
-    let signal_mode = match resolve_signal_mode(&client).await {
-        Ok(mode) => mode,
+    let GridModes {
+        signal: signal_mode,
+        trust,
+    } = match resolve_grid_modes(&client).await {
+        Ok(modes) => modes,
         Err(error) => {
-            tracing::error!(%error, "failed to resolve signal transport");
+            tracing::error!(%error, "failed to resolve grid modes");
             std::process::exit(1);
         },
     };
     let signals_enabled = matches!(signal_mode, SignalMode::Poll);
-    let ctx = Arc::new(OperatorCtx::new(client.clone(), None, signal_mode).hold_membership());
+    let peer_settings = grid_network::PeerSettings { trust };
+    let ctx = Arc::new(
+        OperatorCtx::new(client.clone(), None, signal_mode)
+            .with_peer_settings(peer_settings)
+            .hold_membership(),
+    );
 
     // Controllers run now. Only SWIM and what dials peers wait on the advertise address.
     let (swim_tx, swim_rx) = tokio::sync::watch::channel(SwimStage::Starting);
@@ -160,23 +168,31 @@ async fn main() {
         run_agent_tool_provider_controller(client.clone()),
         async { metrics_server.await? },
         run_signals_server(
-            signals_enabled,
+            signals_enabled.then(|| SignalsListener {
+                bind: config.signals.addr,
+                client: client.clone(),
+                published: Published {
+                    site: ctx.signals(),
+                    peers: ctx.peers(),
+                },
+                peer_identities: ctx.peer_identities(),
+                trust,
+                max_per_peer: config.signals.max_per_peer,
+            }),
             swim_rx.clone(),
-            client.clone(),
-            Published {
-                site: ctx.signals(),
-                peers: ctx.peers(),
-            },
-            ctx.peer_identities(),
         ),
         run_peer_poller(
-            signals_enabled,
+            signals_enabled.then(|| config.signals.clone()),
             Arc::clone(&ctx),
             swim_rx,
             client.clone(),
             shutdown.clone(),
         ),
-        run_local_scraper(signals_enabled, Arc::clone(&ctx), client.clone()),
+        run_local_scraper(
+            signals_enabled.then(|| config.signals.scrape_interval()),
+            Arc::clone(&ctx),
+            client.clone(),
+        ),
     );
 
     if let Err(e) = result {
@@ -266,29 +282,47 @@ async fn swim_settled(mut startup: SwimStartup) -> Option<Arc<swim_runtime::Swim
     }
 }
 
-/// Resolve the grid-wide signal mode from the sole `GridNetwork` at startup.
-///
-/// One operator serves one grid, so more than one `GridNetwork` fails loud
-/// rather than picking a mode for a process-global serve and poll path. Absent
-/// defaults to gossip. Read once, so a change needs an operator restart.
-async fn resolve_signal_mode(client: &Client) -> Result<SignalMode, String> {
+/// Grid-wide modes read once from the `GridNetwork` at startup.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct GridModes {
+    /// Signal propagation.
+    signal: SignalMode,
+    /// Peer authorization on the signals path.
+    trust: operator::signals::PeerTrustMode,
+}
+
+impl GridModes {
+    /// The modes `network` declares, defaults for absent fields.
+    fn of(network: &GridNetwork) -> Self {
+        Self {
+            signal: network
+                .spec
+                .signal_transport
+                .as_ref()
+                .map(|t| t.mode)
+                .unwrap_or_default(),
+            trust: network.spec.peer_trust.as_ref().map(|t| t.mode).unwrap_or_default(),
+        }
+    }
+}
+
+/// Resolve the grid-wide modes from the sole `GridNetwork`, read once at startup.
+async fn resolve_grid_modes(client: &Client) -> Result<GridModes, String> {
     let networks: Api<GridNetwork> = Api::all(client.clone());
-    let modes: Vec<SignalMode> = networks
+    let items = networks
         .list(&kube::api::ListParams::default())
         .await
         .map_err(|e| format!("listing GridNetworks: {e}"))?
-        .items
-        .iter()
-        .map(|n| n.spec.signal_transport.as_ref().map(|t| t.mode).unwrap_or_default())
-        .collect();
-    match modes.as_slice() {
+        .items;
+    match items.as_slice() {
         [] => {
-            tracing::info!("no GridNetwork at startup; signals default to gossip");
-            Ok(SignalMode::default())
+            tracing::info!("no GridNetwork at startup; gossip signals, pin peer trust");
+            Ok(GridModes::default())
         },
-        [mode] => {
-            tracing::info!(?mode, "resolved grid-wide signal transport");
-            Ok(*mode)
+        [network] => {
+            let modes = GridModes::of(network);
+            tracing::info!(?modes, "resolved grid-wide modes");
+            Ok(modes)
         },
         many => Err(format!(
             "multiple GridNetworks unsupported: found {}; a process-global signals serve/poll path \
@@ -371,20 +405,29 @@ async fn maybe_start_swim(client: &Client, cli: &Cli) -> Result<Option<Arc<swim_
             return Ok(None);
         },
     };
+    let signals_address = match (&cli.signals.advertise_addr, &lb_watch) {
+        (Some(explicit), _) => Some(explicit.clone()),
+        (None, Some(watch)) => watch.signals.clone(),
+        (None, None) => None,
+    };
+    tracing::info!(signals = ?signals_address, "signals endpoint gossiped to peers");
     let cfg = SwimConfig {
         bind_addr,
         advertise_addr,
+        signals_address,
         site_name: site_name.clone(),
         seeds,
         gateway_address,
         key,
         revision_lease,
+        revision_renewer: Some(revision_renewer(client.clone(), site_name.clone())),
     };
     match swim_runtime::start(cfg).await {
         Ok(handle) => {
             tracing::info!(addr = %addr_str, "SWIM runtime started");
             if let Some(watch) = lb_watch {
-                tokio::spawn(watch.restart_on_change(Arc::clone(&handle)));
+                let track_signals = cli.signals.advertise_addr.is_none();
+                tokio::spawn(LbWatch { track_signals, ..watch }.restart_on_change(Arc::clone(&handle)));
             }
             if retry_key {
                 tokio::spawn(retry_startup_key(
@@ -550,6 +593,10 @@ struct LbWatch {
     addr: SocketAddr,
     /// Ingress text `addr` was resolved from, watched for change.
     text: String,
+    /// Signals endpoint on the Service's `LoadBalancer` address.
+    signals: Option<String>,
+    /// Whether `signals` is gossiped, so a change to it restarts.
+    track_signals: bool,
 }
 
 /// Wait for a leave to reach peers before exiting.
@@ -564,18 +611,21 @@ impl LbWatch {
             port,
             addr: SocketAddr::from(([0, 0, 0, 0], 0)),
             text: String::new(),
+            signals: None,
+            track_signals: true,
         };
         tracing::info!(service = %watch.service, "waiting for SWIM Service LoadBalancer address");
-        let (advertised, addr) = swim_advertise::wait_for_lb(
+        let (advertised, addr, signals) = swim_advertise::wait_for_lb(
             || watch.resolved(),
             swim_advertise::LB_POLL_INTERVAL,
             swim_advertise::LB_PATIENCE,
         )
         .await?;
-        tracing::info!(lb = %advertised, %addr, "discovered SWIM advertise address");
+        tracing::info!(lb = %advertised, %addr, ?signals, "discovered SWIM advertise address");
         Ok(Self {
             addr,
             text: advertised,
+            signals,
             ..watch
         })
     }
@@ -591,25 +641,29 @@ impl LbWatch {
         Ok(svc)
     }
 
-    /// The address text and its first resolution, retried while a hostname has no DNS.
-    async fn resolved(&self) -> Result<Option<(String, SocketAddr)>, swim_advertise::LookupError> {
-        let Some(text) = self
+    /// The address text, its first resolution, and the signals endpoint, retried while a hostname has no DNS.
+    async fn resolved(&self) -> Result<Option<(String, SocketAddr, Option<String>)>, swim_advertise::LookupError> {
+        let Some((text, signals)) = self
             .load_balancer()
             .await?
-            .and_then(|svc| swim_advertise::lb_endpoint(&svc, self.port))
+            .and_then(|svc| swim_advertise::lb_advertised(&svc, self.port))
         else {
             return Ok(None);
         };
         let addresses = resolve_text(&text).await.map_err(swim_advertise::LookupError::Retry)?;
-        Ok(addresses.first().map(|addr| (text, *addr)))
+        Ok(addresses.first().map(|addr| (text, *addr, signals)))
     }
 
-    /// Every ingress endpoint the Service lists now, unresolved.
+    /// Every ingress endpoint the Service lists now, unresolved, or none once a tracked signals endpoint moved.
     async fn ingress(&self) -> Result<Option<Vec<String>>, swim_advertise::LookupError> {
-        Ok(self
-            .load_balancer()
-            .await?
-            .map(|svc| swim_advertise::lb_endpoints(&svc, self.port)))
+        Ok(self.load_balancer().await?.map(|svc| {
+            let signals = swim_advertise::lb_signals_endpoint(&svc);
+            if self.track_signals && signals != self.signals {
+                tracing::warn!(gossiped = ?self.signals, current = ?signals, "SWIM Service signals endpoint changed");
+                return Vec::new();
+            }
+            swim_advertise::lb_endpoints(&svc, self.port)
+        }))
     }
 
     /// Leave the cluster and exit once the advertised address changes.
@@ -619,7 +673,7 @@ impl LbWatch {
         tracing::warn!(
             advertised = %self.text,
             ?current,
-            "SWIM Service LoadBalancer address changed; leaving to advertise the new one"
+            "SWIM Service LoadBalancer address or signals endpoint changed; leaving to advertise the new one"
         );
         swim.leave(LEAVE_WAIT).await;
         std::process::exit(0);
@@ -634,12 +688,8 @@ async fn resolve_text(text: &str) -> Result<Vec<SocketAddr>, String> {
     resolve_endpoint(&endpoint, "GRID_SWIM_SERVICE_NAME").await
 }
 
-/// Number of revisions reserved durably for each operator process.
-///
-/// At the current one-second metadata repair rate this covers more than a
-/// century. Exhaustion still causes the runtime to stop rather than reuse a
-/// published revision.
-const REVISION_LEASE_SIZE: u64 = 1_u64 << 32;
+/// Revisions reserved durably per lease, renewed as a process uses them.
+const REVISION_LEASE_SIZE: u64 = swim::state_broadcast::REVISION_LEASE_SPAN;
 /// Maximum in-process foca identity renewals reserved for one operator.
 const NODE_GENERATION_LEASE_SIZE: u64 = 1_u64 << 20;
 /// Maximum resource-version conflicts retried during one reservation.
@@ -650,49 +700,76 @@ const REVISION_HIGH_KEY: &str = "revisionHighWatermark";
 const NODE_GENERATION_HIGH_KEY: &str = "nodeGenerationHighWatermark";
 
 /// Reserve a disjoint transport-revision range and node generation.
-///
-/// The upper bound is written before any revision in the range can be
-/// published. `replace` includes the `ConfigMap`'s `resourceVersion`, so
-/// concurrent operator starts conflict and retry instead of overwriting one
-/// another.
+async fn reserve_revision_lease(client: &Client, site_name: &str) -> Result<RevisionLease, String> {
+    let lease = cas_revision_lease(client, site_name, |held| match held {
+        Some((revision, generation)) => next_revision_lease(revision, generation),
+        None => initial_revision_lease(),
+    })
+    .await?;
+    tracing::info!(
+        first_revision = lease.first_revision,
+        last_revision = lease.last_revision,
+        first_node_generation = lease.first_node_generation,
+        last_node_generation = lease.last_node_generation,
+        "reserved SWIM revision range"
+    );
+    Ok(lease)
+}
+
+/// Renewer that persists the next revision range past a process's own `last` before it is used.
+fn revision_renewer(client: Client, site_name: String) -> swim_runtime::RevisionRenewer {
+    Arc::new(move |last| {
+        let (client, site_name) = (client.clone(), site_name.clone());
+        Box::pin(async move {
+            let lease = cas_revision_lease(&client, &site_name, |held| {
+                let (revision, generation) = held.unwrap_or((last, 0));
+                let first = next_revision_start(revision.max(last), unix_millis()?);
+                Ok(RevisionLease {
+                    first_node_generation: generation,
+                    last_node_generation: generation,
+                    ..revision_range(first)?
+                })
+            })
+            .await?;
+            tracing::debug!(
+                first = lease.first_revision,
+                last = lease.last_revision,
+                "renewed SWIM revision range"
+            );
+            Ok((lease.first_revision, lease.last_revision))
+        })
+    })
+}
+
+/// Persist the lease `plan` makes from the held revision and generation marks, before any of it is used.
 #[expect(
     clippy::too_many_lines,
     clippy::large_stack_frames,
     reason = "the Kubernetes read/create/replace CAS loop keeps each conflict and fail-closed path explicit"
 )]
-async fn reserve_revision_lease(client: &Client, site_name: &str) -> Result<RevisionLease, String> {
+async fn cas_revision_lease(
+    client: &Client,
+    site_name: &str,
+    plan: impl Fn(Option<(u64, u64)>) -> Result<RevisionLease, String>,
+) -> Result<RevisionLease, String> {
     let api: Api<ConfigMap> = Api::default_namespaced(client.clone());
     let cm_name = format!("grid-swim-revision-hwm-{site_name}");
     for _attempt in 0..REVISION_RESERVATION_ATTEMPTS {
-        match api.get(&cm_name).await {
+        let written = match api.get(&cm_name).await {
             Ok(mut cm) => {
                 let data = cm.data.as_ref().ok_or_else(|| format!("{cm_name} has no data"))?;
-                let current_high = parse_revision_value(data, REVISION_HIGH_KEY)
+                let revision = parse_revision_value(data, REVISION_HIGH_KEY)
                     .or_else(|| parse_revision_value(data, "revision"))
                     .ok_or_else(|| format!("{cm_name} has no valid revision high-water mark"))?;
-                let current_generation_high = parse_revision_value(data, NODE_GENERATION_HIGH_KEY)
+                let generation = parse_revision_value(data, NODE_GENERATION_HIGH_KEY)
                     .or_else(|| parse_revision_value(data, "nodeGeneration"))
                     .unwrap_or(0);
-                let lease = next_revision_lease(current_high, current_generation_high)?;
+                let lease = plan(Some((revision, generation)))?;
                 cm.data = Some(revision_lease_data(&lease));
-                match api.replace(&cm_name, &PostParams::default(), &cm).await {
-                    Ok(_) => {
-                        tracing::info!(
-                            first_revision = lease.first_revision,
-                            last_revision = lease.last_revision,
-                            first_node_generation = lease.first_node_generation,
-                            last_node_generation = lease.last_node_generation,
-                            cm = %cm_name,
-                            "reserved SWIM revision range"
-                        );
-                        return Ok(lease);
-                    },
-                    Err(kube::Error::Api(conflict)) if conflict.code == 409 => {},
-                    Err(replace_err) => return Err(format!("replace {cm_name}: {replace_err}")),
-                }
+                api.replace(&cm_name, &PostParams::default(), &cm).await.map(|_| lease)
             },
             Err(kube::Error::Api(not_found)) if not_found.code == 404 => {
-                let lease = initial_revision_lease()?;
+                let lease = plan(None)?;
                 let cm = ConfigMap {
                     metadata: ObjectMeta {
                         name: Some(cm_name.clone()),
@@ -701,23 +778,14 @@ async fn reserve_revision_lease(client: &Client, site_name: &str) -> Result<Revi
                     data: Some(revision_lease_data(&lease)),
                     ..ConfigMap::default()
                 };
-                match api.create(&PostParams::default(), &cm).await {
-                    Ok(_) => {
-                        tracing::info!(
-                            first_revision = lease.first_revision,
-                            last_revision = lease.last_revision,
-                            first_node_generation = lease.first_node_generation,
-                            last_node_generation = lease.last_node_generation,
-                            cm = %cm_name,
-                            "created SWIM revision reservation"
-                        );
-                        return Ok(lease);
-                    },
-                    Err(kube::Error::Api(conflict)) if conflict.code == 409 => {},
-                    Err(create_err) => return Err(format!("create {cm_name}: {create_err}")),
-                }
+                api.create(&PostParams::default(), &cm).await.map(|_| lease)
             },
             Err(read_err) => return Err(format!("read {cm_name}: {read_err}")),
+        };
+        match written {
+            Ok(lease) => return Ok(lease),
+            Err(kube::Error::Api(conflict)) if conflict.code == 409 => {},
+            Err(write_err) => return Err(format!("write {cm_name}: {write_err}")),
         }
     }
     Err(format!(
@@ -743,37 +811,65 @@ fn revision_lease_data(lease: &RevisionLease) -> BTreeMap<String, String> {
 
 /// Build the first durable lease from wall-clock seeds.
 fn initial_revision_lease() -> Result<RevisionLease, String> {
-    let revision_seed = unix_millis()?;
-    let node_generation = unix_nanos()?;
-    lease_from_seeds(revision_seed, node_generation)
+    lease_from_seeds(unix_millis()?, unix_nanos()?)
 }
 
-/// Build the next lease strictly after persisted high-water marks.
+/// Build the next lease after persisted high-water marks.
 fn next_revision_lease(current_high: u64, current_generation_high: u64) -> Result<RevisionLease, String> {
-    let revision_seed = current_high
-        .checked_add(1)
-        .ok_or_else(|| "SWIM revision high-water mark exhausted".to_owned())?
-        .max(unix_millis()?);
+    plan_next_lease(current_high, current_generation_high, unix_millis()?, unix_nanos()?)
+}
+
+/// The next lease at `now_ms` and `now_nanos`, past the persisted marks.
+fn plan_next_lease(
+    current_high: u64,
+    current_generation_high: u64,
+    now_ms: u64,
+    now_nanos: u64,
+) -> Result<RevisionLease, String> {
     let node_generation = current_generation_high
         .checked_add(1)
         .ok_or_else(|| "SWIM node generation exhausted".to_owned())?
-        .max(unix_nanos()?);
-    lease_from_seeds(revision_seed, node_generation)
+        .max(now_nanos);
+    lease_from_seeds(next_revision_start(current_high, now_ms), node_generation)
+}
+
+/// First revision past `current_high` and the clock, reseeded at the clock when its lease would pass the peer cap.
+fn next_revision_start(current_high: u64, now_ms: u64) -> u64 {
+    let next = current_high.saturating_add(1).max(now_ms);
+    let last = next.saturating_add(REVISION_LEASE_SIZE - 1);
+    if last > swim::state_broadcast::max_leased_revision(now_ms) {
+        tracing::warn!(
+            current_high,
+            now_ms,
+            "SWIM revision mark is past every peer's cap; reseeding at the clock"
+        );
+        return now_ms;
+    }
+    next
 }
 
 /// Build bounded revision and generation ranges from inclusive first values.
 fn lease_from_seeds(first_revision: u64, node_generation: u64) -> Result<RevisionLease, String> {
-    let last_revision = first_revision
-        .checked_add(REVISION_LEASE_SIZE - 1)
-        .ok_or_else(|| "SWIM revision range exhausted".to_owned())?;
     let last_node_generation = node_generation
         .checked_add(NODE_GENERATION_LEASE_SIZE - 1)
         .ok_or_else(|| "SWIM node generation range exhausted".to_owned())?;
     Ok(RevisionLease {
-        first_revision,
-        last_revision,
         first_node_generation: node_generation,
         last_node_generation,
+        ..revision_range(first_revision)?
+    })
+}
+
+/// A lease of [`REVISION_LEASE_SIZE`] revisions from `first`, generations left zero.
+fn revision_range(first: u64) -> Result<RevisionLease, String> {
+    let last_revision = first
+        .checked_add(REVISION_LEASE_SIZE - 1)
+        .ok_or_else(|| "SWIM revision range exhausted".to_owned())?;
+    Ok(RevisionLease {
+        first_revision: first,
+        last_revision,
+        first_node_generation: 0,
+        last_node_generation: 0,
     })
 }
 
@@ -1095,8 +1191,10 @@ enum Caller {
 struct SignalsIdentity {
     /// Keys peers have declared, and the labels held for each.
     peers: operator::signals::PeerIdentities,
-    /// This site's own certificate fingerprint, when it has one.
-    own_key: Option<String>,
+    /// This site's own leaf, when it has one.
+    own: Option<grid_network::OwnLeaf>,
+    /// Whether callers are named by pinned key or by SPIFFE ID.
+    trust: operator::signals::PeerTrustMode,
 }
 
 /// Everything this operator publishes on the signals path.
@@ -1108,6 +1206,22 @@ struct Published {
     peers: operator::signals::SignalStore,
 }
 
+/// What the signals listener needs from startup.
+struct SignalsListener {
+    /// Explicit bind address, else [`SIGNALS_DEFAULT_V6`] with an IPv4 fallback.
+    bind: Option<SocketAddr>,
+    /// Kube client, for this site's TLS material.
+    client: Client,
+    /// What is served.
+    published: Published,
+    /// Keys peers have declared, and the labels held for each.
+    peer_identities: operator::signals::PeerIdentities,
+    /// Whether callers are named by pinned key or by SPIFFE ID.
+    trust: operator::signals::PeerTrustMode,
+    /// Authenticated connections one identity may hold.
+    max_per_peer: usize,
+}
+
 /// Serve the coarse signal rollup on the single mTLS wire path, fail closed.
 ///
 /// There is no plaintext branch: without verified TLS material the rollup is
@@ -1115,21 +1229,17 @@ struct Published {
 /// listener rebinds whenever this site's certificate changes, because rustls
 /// fixes the verifier at build time.
 async fn run_signals_server(
-    enabled: bool,
+    listener: Option<SignalsListener>,
     swim: SwimStartup,
-    client: Client,
-    published: Published,
-    peer_identities: operator::signals::PeerIdentities,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    if !enabled {
+    let Some(listener) = listener else {
         return Ok(());
-    }
+    };
     // Peers learn this listener from the advertised address, so it waits for SWIM to settle.
     drop(swim_settled(swim).await);
-    let addr = std::env::var("GRID_SIGNALS_ADDR").unwrap_or_else(|_| "0.0.0.0:9091".to_owned());
     let app = axum::Router::new()
         .route(operator::signals::SIGNALS_PATH, axum::routing::get(signals_handler))
-        .with_state(published);
+        .with_state(listener.published.clone());
 
     // The opt-in listener rebinds on every material change, so a transient
     // bind blip (a socket in TIME_WAIT across a rebind) must not be fatal to
@@ -1140,57 +1250,97 @@ async fn run_signals_server(
         reason = "serves for the process lifetime alongside the controllers"
     )]
     loop {
-        if let Err(error) = serve_signals_once(&addr, &app, &client, &peer_identities).await {
-            tracing::error!(%error, %addr, "signals listener error; retrying");
+        if let Err(error) = listener.serve_once(&app).await {
+            tracing::error!(%error, bind = ?listener.bind, "signals listener error; retrying");
             tokio::time::sleep(SIGNALS_TLS_POLL).await;
         }
     }
 }
 
-/// One resolve-and-serve cycle: serve until this site's material changes, or
-/// wait when material is unavailable. Fails closed, never serving plaintext.
-async fn serve_signals_once(
-    addr: &str,
-    app: &axum::Router,
-    client: &Client,
-    peer_identities: &operator::signals::PeerIdentities,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let (tls, own_key) = Box::pin(signals_identity(client)).await;
-    let Some(tls) = tls else {
-        tracing::warn!(%addr, "signals: TLS material unavailable; not serving the rollup (fail closed)");
-        tokio::time::sleep(SIGNALS_TLS_POLL).await;
-        return Ok(());
-    };
-    let identity = SignalsIdentity {
-        peers: peer_identities.clone(),
-        own_key: own_key.clone(),
-    };
-    serve_signals(
-        addr,
-        app.clone(),
-        tls,
-        identity,
-        material_changed(client.clone(), own_key),
-    )
-    .await?;
-    tracing::info!("signals TLS material changed; serving again");
-    Ok(())
+impl SignalsListener {
+    /// Serve until this site's TLS material changes, or wait while it is unavailable.
+    async fn serve_once(&self, app: &axum::Router) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let (tls, own) = Box::pin(signals_identity(&self.client)).await;
+        let Some(tls) = tls else {
+            tracing::warn!("signals: TLS material unavailable; not serving the rollup (fail closed)");
+            tokio::time::sleep(SIGNALS_TLS_POLL).await;
+            return Ok(());
+        };
+        let identity = SignalsIdentity {
+            peers: self.peer_identities.clone(),
+            own: own.clone(),
+            trust: self.trust,
+        };
+        let listener = bind_signals(self.bind).await?;
+        let bound = listener
+            .local_addr()
+            .map_or_else(|_| "unknown".to_owned(), |a| a.to_string());
+        tracing::info!(addr = %bound, tls = true, "signals server started");
+        let admission = Admission::new(self.max_per_peer);
+        let changed = material_changed(self.client.clone(), own);
+        let serving = Serving {
+            tls,
+            app: app.clone(),
+            identity,
+        };
+        serve_signals_tls(listener, serving, admission, changed).await?;
+        tracing::info!("signals TLS material changed; serving again");
+        Ok(())
+    }
 }
 
-/// Bind and serve the mTLS listener until `changed` resolves.
-async fn serve_signals(
-    addr: &str,
-    app: axum::Router,
-    tls: ServerTlsConfig,
-    identity: SignalsIdentity,
-    changed: impl Future<Output = ()> + Send + 'static,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    let bound = listener
-        .local_addr()
-        .map_or_else(|_| addr.to_owned(), |a| a.to_string());
-    tracing::info!(addr = %bound, tls = true, "signals server started");
-    serve_signals_tls(listener, app, tls, identity, changed).await
+/// Dual-stack signals listener address when `GRID_SIGNALS_ADDR` is unset.
+const SIGNALS_DEFAULT_V6: SocketAddr = SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), 9091);
+
+/// IPv4 signals listener address when the host has no IPv6.
+const SIGNALS_DEFAULT_V4: SocketAddr = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 9091);
+
+/// `EAFNOSUPPORT`, which std maps to no stable error kind.
+const EAFNOSUPPORT: i32 = if cfg!(target_os = "linux") { 97 } else { 47 };
+
+/// Bind `explicit`, else [`SIGNALS_DEFAULT_V6`], falling back to [`SIGNALS_DEFAULT_V4`] without IPv6.
+async fn bind_signals(explicit: Option<SocketAddr>) -> std::io::Result<tokio::net::TcpListener> {
+    bind_with_fallback(explicit, |addr| std::future::ready(bind_dual_stack(addr))).await
+}
+
+/// Bind `addr`, an IPv6 wildcard accepting IPv4 too even where `bindv6only` is set.
+fn bind_dual_stack(addr: SocketAddr) -> std::io::Result<tokio::net::TcpListener> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let socket = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
+    if addr.is_ipv6() && addr.ip().is_unspecified() {
+        socket.set_only_v6(false)?;
+    }
+    socket.set_reuse_address(true)?;
+    socket.set_nonblocking(true)?;
+    socket.bind(&addr.into())?;
+    socket.listen(1024)?;
+    tokio::net::TcpListener::from_std(socket.into())
+}
+
+/// Bind with `bind`, falling back to IPv4 only for the default address on a host without IPv6.
+async fn bind_with_fallback<Listener, Bind, Bound>(
+    explicit: Option<SocketAddr>,
+    bind: Bind,
+) -> std::io::Result<Listener>
+where
+    Bind: Fn(SocketAddr) -> Bound,
+    Bound: Future<Output = std::io::Result<Listener>>,
+{
+    if let Some(addr) = explicit {
+        return bind(addr).await;
+    }
+    match bind(SIGNALS_DEFAULT_V6).await {
+        Err(error) if lacks_ipv6(&error) => {
+            tracing::info!(%error, fallback = %SIGNALS_DEFAULT_V4, "no IPv6 for the signals listener; binding IPv4");
+            bind(SIGNALS_DEFAULT_V4).await
+        },
+        bound => bound,
+    }
+}
+
+/// Whether a bind failed because the host has no IPv6.
+fn lacks_ipv6(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::AddrNotAvailable || error.raw_os_error() == Some(EAFNOSUPPORT)
 }
 
 /// Resolves when this site's certificate definitely stops matching `serving`.
@@ -1198,11 +1348,11 @@ async fn serve_signals(
 /// A transient read failure is not a change: a momentary API-server hiccup must
 /// not tear down a healthy mTLS listener (or the poller) for a poll interval
 /// when the serving certificate never actually moved. Only a successfully
-/// observed key that differs, including a genuine removal, resolves.
-async fn material_changed(client: Client, serving: Option<String>) {
+/// read leaf that differs, including a genuine removal, resolves.
+async fn material_changed(client: Client, serving: Option<grid_network::OwnLeaf>) {
     loop {
         tokio::time::sleep(SIGNALS_TLS_POLL).await;
-        if let Some(observed) = Box::pin(observe_own_key(&client)).await
+        if let Some(observed) = Box::pin(observe_own_leaf(&client)).await
             && observed != serving
         {
             return;
@@ -1210,68 +1360,339 @@ async fn material_changed(client: Client, serving: Option<String>) {
     }
 }
 
-/// This site's own key as a change sentinel.
-///
-/// `None` means "could not read, treat as unchanged"; `Some(opt)` is a definite
-/// observation, with `opt` itself `None` when the material is genuinely absent.
-/// Separating the two is what keeps a transient read error from masquerading as
-/// a certificate change.
-async fn observe_own_key(client: &Client) -> Option<Option<String>> {
+/// This site's own leaf, `None` when unreadable.
+async fn observe_own_leaf(client: &Client) -> Option<Option<grid_network::OwnLeaf>> {
     let networks: Api<GridNetwork> = Api::all(client.clone());
     let list = networks.list(&kube::api::ListParams::default()).await.ok()?;
     let Some(network) = list.items.into_iter().next() else {
         return Some(None);
     };
-    grid_network::signals_own_key(&network, client).await.ok()
+    grid_network::own_leaf_identity(&network, client).await.ok()
+}
+
+/// What every connection on one listener is served with.
+#[derive(Clone)]
+struct Serving {
+    /// TLS for the handshake.
+    tls: ServerTlsConfig,
+    /// The signals routes.
+    app: axum::Router,
+    /// How callers are named.
+    identity: SignalsIdentity,
 }
 
 /// Accept signals connections, deciding scope from the certificate presented.
 async fn serve_signals_tls(
     listener: tokio::net::TcpListener,
-    app: axum::Router,
-    tls: ServerTlsConfig,
-    identity: SignalsIdentity,
+    serving: Serving,
+    admission: Admission,
     changed: impl Future<Output = ()> + Send,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut changed = std::pin::pin!(changed);
+    let mut shed_warned: Option<std::time::Instant> = None;
     loop {
         let accepted = tokio::select! {
             () = &mut changed => return Ok(()),
             accepted = listener.accept() => accepted,
         };
-        let Ok((stream, remote)) = accepted else {
+        let Some((stream, remote)) = accepted_or_backoff(accepted).await else {
             continue;
         };
-        tokio::spawn(serve_signals_connection(
-            Arc::clone(&tls),
-            app.clone(),
-            stream,
-            remote,
-            identity.clone(),
-        ));
+        let Some((slot, source)) = admission.admit(remote, &mut shed_warned) else {
+            continue;
+        };
+        let handshaking = Handshaking {
+            source,
+            peers: admission.peers.clone(),
+        };
+        let serve = Box::pin(serve_signals_connection(serving.clone(), stream, remote, handshaking));
+        tokio::spawn(async move {
+            serve.await;
+            drop(slot);
+        });
     }
 }
 
-/// Who a connection speaks for, decided from the key it presented.
-///
-/// Nothing is trusted for presenting nothing: a caller with no certificate, or
-/// one carrying a key nobody declared, is named so it is served nothing. Only
-/// this site's own certificate earns `Local`, so "no cert" is never as
-/// privileged as the site's own workload.
-fn caller_for(leaf: Option<&[u8]>, identity: &SignalsIdentity, remote: SocketAddr) -> Caller {
+/// Concurrent signals connections, where a poll round is one per peer.
+const SIGNALS_MAX_CONNECTIONS: usize = 256;
+
+/// Connections peers can never hold, kept for the co-located gateway.
+const SIGNALS_LOCAL_RESERVE: usize = 8;
+
+/// Concurrent handshakes from one source.
+const SIGNALS_MAX_PER_SOURCE: usize = 8;
+
+/// Concurrent handshakes from one global unicast IPv6 /48, across its /64s.
+const SIGNALS_MAX_PER_SOURCE_48: usize = 32;
+
+/// Pause after a failed accept.
+const SIGNALS_ACCEPT_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Least time between warnings about shed connections.
+const SIGNALS_SHED_WARN_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Bound on the TLS handshake.
+const SIGNALS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Bound on reading request headers, including between keep-alive requests.
+const SIGNALS_HEADER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Bound on a response write that makes no progress.
+const SIGNALS_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Age at which an authenticated connection is closed after its current request.
+const SIGNALS_MAX_CONNECTION_AGE: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// The accepted connection, or `None` after pausing on a failed accept.
+async fn accepted_or_backoff(
+    accepted: std::io::Result<(tokio::net::TcpStream, SocketAddr)>,
+) -> Option<(tokio::net::TcpStream, SocketAddr)> {
+    match accepted {
+        Ok(accepted) => Some(accepted),
+        Err(error) => {
+            // EMFILE fails every accept until a descriptor frees.
+            tracing::warn!(%error, "signals accept failed");
+            tokio::time::sleep(SIGNALS_ACCEPT_BACKOFF).await;
+            None
+        },
+    }
+}
+
+/// The connection caps one listener enforces.
+struct Admission {
+    /// Every open connection.
+    slots: Arc<tokio::sync::Semaphore>,
+    /// Handshakes in progress, per source.
+    sources: SourceSlots,
+    /// Authenticated peer connections, per site.
+    peers: PeerSlots,
+}
+
+impl Admission {
+    /// Caps for one listener, `max_per_peer` connections per site.
+    fn new(max_per_peer: usize) -> Self {
+        Self {
+            slots: Arc::new(tokio::sync::Semaphore::new(SIGNALS_MAX_CONNECTIONS)),
+            sources: SourceSlots::new(SIGNALS_MAX_PER_SOURCE, SIGNALS_MAX_PER_SOURCE_48),
+            peers: PeerSlots::new(
+                max_per_peer,
+                SIGNALS_MAX_CONNECTIONS.saturating_sub(SIGNALS_LOCAL_RESERVE),
+            ),
+        }
+    }
+
+    /// A connection slot and a handshake slot for `remote`, or `None` to shed it.
+    fn admit(
+        &self,
+        remote: SocketAddr,
+        warned: &mut Option<std::time::Instant>,
+    ) -> Option<(tokio::sync::OwnedSemaphorePermit, SourceSlot)> {
+        let held = match Arc::clone(&self.slots).try_acquire_owned() {
+            Ok(slot) => self
+                .sources
+                .acquire(remote.ip())
+                .map(|source| (slot, source))
+                .ok_or("source"),
+            Err(_) => Err("total"),
+        };
+        held.inspect_err(|limit| shed(remote, limit, warned)).ok()
+    }
+}
+
+/// Record a shed connection, warning at most once per [`SIGNALS_SHED_WARN_EVERY`].
+fn shed(remote: SocketAddr, limit: &str, warned: &mut Option<std::time::Instant>) {
+    operator::metrics::record_signals_shed(limit);
+    let quiet = warned.is_some_and(|at| at.elapsed() < SIGNALS_SHED_WARN_EVERY);
+    if quiet {
+        tracing::debug!(%remote, limit, "signals connection shed");
+    } else {
+        *warned = Some(std::time::Instant::now());
+        tracing::warn!(%remote, limit, "signals connection limit reached; shedding");
+    }
+}
+
+/// Open handshakes per source, each capped, with a second cap per global IPv6 /48.
+#[derive(Clone)]
+struct SourceSlots {
+    /// Open handshakes by source key.
+    open: Arc<std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, usize>>>,
+    /// Cap per source key.
+    limit: usize,
+    /// Cap per global unicast IPv6 /48.
+    limit_48: usize,
+}
+
+impl SourceSlots {
+    /// A tracker allowing `limit` handshakes per source and `limit_48` per IPv6 /48.
+    fn new(limit: usize, limit_48: usize) -> Self {
+        Self {
+            open: Arc::default(),
+            limit,
+            limit_48,
+        }
+    }
+
+    /// A slot for `ip`, released on drop, or `None` at either cap.
+    fn acquire(&self, ip: std::net::IpAddr) -> Option<SourceSlot> {
+        let (key, wider) = source_keys(ip);
+        let mut open = self.open.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let held = |counted: &std::net::IpAddr| open.get(counted).copied().unwrap_or_default();
+        if held(&key) >= self.limit || wider.is_some_and(|wider| held(&wider) >= self.limit_48) {
+            return None;
+        }
+        for counted in std::iter::once(key).chain(wider) {
+            let count = open.entry(counted).or_default();
+            *count = count.saturating_add(1);
+        }
+        drop(open);
+        Some(SourceSlot {
+            slots: self.clone(),
+            keys: (key, wider),
+        })
+    }
+}
+
+/// The keys a source counts against: a global unicast IPv6 /64 and its /48, else its own address.
+fn source_keys(ip: std::net::IpAddr) -> (std::net::IpAddr, Option<std::net::IpAddr>) {
+    let prefix = |v6: std::net::Ipv6Addr, bits: u32| -> std::net::IpAddr {
+        std::net::Ipv6Addr::from_bits(v6.to_bits() & (u128::MAX << (128 - bits))).into()
+    };
+    match ip.to_canonical() {
+        // 2000::/3 is the global unicast range.
+        std::net::IpAddr::V6(v6) if v6.to_bits() >> 125 == 0b001 => (prefix(v6, 64), Some(prefix(v6, 48))),
+        scoped @ (std::net::IpAddr::V4(_) | std::net::IpAddr::V6(_)) => (scoped, None),
+    }
+}
+
+/// One held handshake slot.
+struct SourceSlot {
+    /// The tracker to release into.
+    slots: SourceSlots,
+    /// The keys counted.
+    keys: (std::net::IpAddr, Option<std::net::IpAddr>),
+}
+
+impl Drop for SourceSlot {
+    fn drop(&mut self) {
+        let mut open = self
+            .slots
+            .open
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for key in std::iter::once(self.keys.0).chain(self.keys.1) {
+            if let Some(count) = open.get_mut(&key) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    open.remove(&key);
+                }
+            }
+        }
+    }
+}
+
+/// Open authenticated peer connections per site, under a cap across all peers.
+#[derive(Clone)]
+struct PeerSlots {
+    /// Open connections by site.
+    open: Arc<std::sync::Mutex<std::collections::HashMap<String, usize>>>,
+    /// Cap per site.
+    limit: usize,
+    /// Cap across every peer.
+    total: Arc<tokio::sync::Semaphore>,
+}
+
+impl PeerSlots {
+    /// A tracker allowing `limit` connections per site and `total` across them.
+    fn new(limit: usize, total: usize) -> Self {
+        Self {
+            open: Arc::default(),
+            limit: limit.max(1),
+            total: Arc::new(tokio::sync::Semaphore::new(total.max(1))),
+        }
+    }
+
+    /// A slot for `site`, released on drop, or `None` at either cap.
+    fn acquire(&self, site: &str) -> Option<PeerSlot> {
+        let permit = Arc::clone(&self.total).try_acquire_owned().ok()?;
+        let mut open = self.open.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let count = open.entry(site.to_owned()).or_default();
+        if *count >= self.limit {
+            return None;
+        }
+        *count = count.saturating_add(1);
+        drop(open);
+        Some(PeerSlot {
+            slots: self.clone(),
+            site: site.to_owned(),
+            _permit: permit,
+        })
+    }
+}
+
+/// One held authenticated slot.
+struct PeerSlot {
+    /// The tracker to release into.
+    slots: PeerSlots,
+    /// The site counted.
+    site: String,
+    /// The share of the cap across peers.
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl Drop for PeerSlot {
+    fn drop(&mut self) {
+        let mut open = self
+            .slots
+            .open
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(count) = open.get_mut(&self.site) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                open.remove(&self.site);
+            }
+        }
+    }
+}
+
+/// A connection still in its handshake: the source slot it holds, and the per-peer caps that follow.
+struct Handshaking {
+    /// Released once the handshake ends.
+    source: SourceSlot,
+    /// Where the authenticated connection is counted.
+    peers: PeerSlots,
+}
+
+/// Who a leaf speaks for and the site it counts against, `Local` only for this site's current leaf.
+fn caller_for(leaf: Option<&[u8]>, identity: &SignalsIdentity, remote: SocketAddr) -> (Caller, Option<String>) {
     let Some(leaf) = leaf else {
         tracing::debug!(%remote, "signals caller presented no certificate");
-        return Caller::Peer(None);
+        return (Caller::Peer(None), None);
     };
     let fingerprint = operator::signals::leaf_fingerprint(leaf);
-    if identity.own_key.as_deref() == Some(fingerprint.as_str()) {
-        return Caller::Local;
+    if identity.own.as_ref().is_some_and(|own| own.fingerprint == fingerprint) {
+        return (Caller::Local, None);
     }
-    let named = identity.peers.resolve_by_key(&fingerprint);
-    if named.is_none() {
-        tracing::debug!(%remote, "signals caller presented a key this site has not declared");
+    let named = match identity.trust {
+        operator::signals::PeerTrustMode::Pin => identity.peers.resolve_site_by_key(&fingerprint),
+        operator::signals::PeerTrustMode::Spiffe => site_by_spiffe(leaf, identity),
+    };
+    let Some((site, labels)) = named else {
+        tracing::debug!(%remote, "signals caller is not a site this one names");
+        return (Caller::Peer(None), None);
+    };
+    (Caller::Peer(Some(labels)), Some(site))
+}
+
+/// Spiffe mode: the site the leaf's SPIFFE ID names, with its labels, never this site's own.
+fn site_by_spiffe(leaf: &[u8], identity: &SignalsIdentity) -> Option<(String, BTreeMap<String, String>)> {
+    let spiffe = certs::leaf_spiffe_id(leaf)?;
+    let own_id = identity.own.as_ref().and_then(|own| own.spiffe.as_ref());
+    if own_id == Some(&spiffe) {
+        return None;
     }
-    Caller::Peer(named)
+    let site = certs::site_of_spiffe_id(&spiffe)?;
+    identity.peers.labels_for(site).map(|labels| (site.to_owned(), labels))
 }
 
 /// Handshake one connection, then serve it with the scope its certificate earns.
@@ -1280,29 +1701,173 @@ fn caller_for(leaf: Option<&[u8]>, identity: &SignalsIdentity, remote: SocketAdd
     expect(clippy::large_stack_frames, reason = "async future over a rustls handshake")
 )]
 async fn serve_signals_connection(
-    tls: ServerTlsConfig,
-    app: axum::Router,
-    stream: tokio::net::TcpStream,
+    serving: Serving,
+    tcp: tokio::net::TcpStream,
     remote: SocketAddr,
-    identity: SignalsIdentity,
+    handshaking: Handshaking,
 ) {
-    let Ok(stream) = tls_backend::accept(stream, &tls).await else {
-        tracing::debug!(%remote, "signals handshake failed");
+    let accepted = tokio::time::timeout(SIGNALS_HANDSHAKE_TIMEOUT, tls_backend::accept(tcp, &serving.tls)).await;
+    // The source cap covers only the unauthenticated phase.
+    drop(handshaking.source);
+    let Ok(Ok(stream)) = accepted else {
+        tracing::debug!(%remote, "signals handshake failed or timed out");
         return;
     };
-    let caller = caller_for(tls_backend::server_peer_leaf_der(&stream).as_deref(), &identity, remote);
+    let Some(leaf) = tls_backend::server_peer_leaf_der(&stream) else {
+        return;
+    };
+    let (caller, site) = caller_for(Some(&leaf), &serving.identity, remote);
+    let slot = match (&caller, site) {
+        (Caller::Local, _) => None,
+        (_, Some(site)) => {
+            let Some(slot) = handshaking.peers.acquire(&site) else {
+                operator::metrics::record_signals_shed("peer");
+                tracing::debug!(%remote, site, "signals site at its connection cap; answering 503");
+                Box::pin(serve_http(stream, unavailable(), Caller::Peer(None), remote)).await;
+                return;
+            };
+            Some(slot)
+        },
+        (_, None) => return,
+    };
+    Box::pin(serve_http(stream, serving.app, caller, remote)).await;
+    drop(slot);
+}
+
+/// Answers every request 503, for a caller shed at its cap.
+fn unavailable() -> axum::Router {
+    axum::Router::new().fallback(|| std::future::ready(http::StatusCode::SERVICE_UNAVAILABLE))
+}
+
+/// Serve HTTP on an authenticated stream with the scope `caller` earned, bounded by every signals timeout.
+#[cfg_attr(
+    not(feature = "fips"),
+    expect(
+        clippy::large_stack_frames,
+        reason = "async future over a rustls stream and a hyper connection"
+    )
+)]
+async fn serve_http(stream: tls_backend::ServerTlsStream, app: axum::Router, caller: Caller, remote: SocketAddr) {
+    // A shed caller gets one answer, then the connection closes.
+    let keep_alive = caller != Caller::Peer(None);
     let service = hyper::service::service_fn(move |request: http::Request<hyper::body::Incoming>| {
         use tower::Service as _;
         let mut request = request;
         request.extensions_mut().insert(caller.clone());
         app.clone().call(request)
     });
-    let io = hyper_util::rt::TokioIo::new(stream);
-    if let Err(error) = hyper::server::conn::http1::Builder::new()
-        .serve_connection(io, service)
-        .await
-    {
+    let io = hyper_util::rt::TokioIo::new(WriteDeadline::new(stream, SIGNALS_WRITE_TIMEOUT));
+    let connection = hyper::server::conn::http1::Builder::new()
+        .timer(hyper_util::rt::TokioTimer::new())
+        .header_read_timeout(SIGNALS_HEADER_READ_TIMEOUT)
+        .keep_alive(keep_alive)
+        .serve_connection(io, service);
+    if let Err(error) = serve_until_aged(connection, SIGNALS_MAX_CONNECTION_AGE).await {
         tracing::debug!(%remote, %error, "signals connection ended");
+    }
+}
+
+/// Serve `connection`, then let it finish its current request and close once it reaches `max_age`.
+async fn serve_until_aged<Io, Service>(
+    connection: hyper::server::conn::http1::Connection<Io, Service>,
+    max_age: std::time::Duration,
+) -> hyper::Result<()>
+where
+    Io: hyper::rt::Read + hyper::rt::Write + Unpin,
+    Service: hyper::service::HttpService<hyper::body::Incoming>,
+    Service::ResBody: 'static,
+    <Service::ResBody as hyper::body::Body>::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    let mut connection = std::pin::pin!(connection);
+    tokio::select! {
+        result = connection.as_mut() => return result,
+        () = tokio::time::sleep(max_age) => {},
+    }
+    connection.as_mut().graceful_shutdown();
+    tokio::time::timeout(SIGNALS_WRITE_TIMEOUT, connection)
+        .await
+        .unwrap_or(Ok(()))
+}
+
+/// A stream whose writes fail once they make no progress for `limit`.
+struct WriteDeadline<Stream> {
+    /// The wrapped stream.
+    inner: Stream,
+    /// Longest a write may stay pending.
+    limit: std::time::Duration,
+    /// Armed while a write is pending.
+    stalled: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl<Stream> WriteDeadline<Stream> {
+    /// Wrap `inner`, failing a write pending longer than `limit`.
+    fn new(inner: Stream, limit: std::time::Duration) -> Self {
+        Self {
+            inner,
+            limit,
+            stalled: None,
+        }
+    }
+
+    /// Track one write attempt, turning a stall past the limit into an error.
+    fn guard<Output>(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        attempt: std::task::Poll<std::io::Result<Output>>,
+    ) -> std::task::Poll<std::io::Result<Output>> {
+        if attempt.is_ready() {
+            self.stalled = None;
+            return attempt;
+        }
+        let limit = self.limit;
+        let stalled = self.stalled.get_or_insert_with(|| Box::pin(tokio::time::sleep(limit)));
+        match stalled.as_mut().poll(cx) {
+            std::task::Poll::Ready(()) => std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "signals response write stalled",
+            ))),
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+}
+
+impl<Stream: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for WriteDeadline<Stream> {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+    }
+}
+
+impl<Stream: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for WriteDeadline<Stream> {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        let attempt = std::pin::Pin::new(&mut this.inner).poll_write(cx, buf);
+        this.guard(cx, attempt)
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let attempt = std::pin::Pin::new(&mut this.inner).poll_flush(cx);
+        this.guard(cx, attempt)
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let attempt = std::pin::Pin::new(&mut this.inner).poll_shutdown(cx);
+        this.guard(cx, attempt)
     }
 }
 
@@ -1365,25 +1930,25 @@ fn served(body: String, oldest: std::time::Duration) -> axum::response::Response
         .into_response()
 }
 
-/// TLS material for the signals listener, and this site's own fingerprint.
-///
-/// Both resolve to `None` when the network declares no TLS or the material
-/// cannot be read; the serve loop treats either as "do not expose", so a load
-/// failure fails closed rather than downgrading to plaintext.
-async fn signals_identity(client: &Client) -> (Option<ServerTlsConfig>, Option<String>) {
-    let networks: Api<GridNetwork> = Api::all(client.clone());
-    let network = networks
-        .list(&kube::api::ListParams::default())
-        .await
-        .ok()
-        .and_then(|list| list.items.into_iter().next());
-    let Some(network) = network else {
+/// TLS for the signals listener, `None` when absent or unreadable, and this site's own leaf.
+async fn signals_identity(client: &Client) -> (Option<ServerTlsConfig>, Option<grid_network::OwnLeaf>) {
+    let Some(network) = sole_network(client).await else {
         return (None, None);
     };
     (
         Box::pin(signals_listener_tls(&network, client)).await,
-        Box::pin(signals_own_key(&network, client)).await,
+        Box::pin(own_leaf(&network, client)).await,
     )
+}
+
+/// The `GridNetwork` this operator serves, `None` when absent or unlistable.
+async fn sole_network(client: &Client) -> Option<GridNetwork> {
+    let networks: Api<GridNetwork> = Api::all(client.clone());
+    networks
+        .list(&kube::api::ListParams::default())
+        .await
+        .ok()
+        .and_then(|list| list.items.into_iter().next())
 }
 
 /// TLS for the listener, or `None` when unconfigured or unreadable.
@@ -1403,10 +1968,16 @@ async fn signals_listener_tls(network: &GridNetwork, client: &Client) -> Option<
     }
 }
 
-/// This site's own certificate fingerprint, for recognising its own workloads.
-async fn signals_own_key(network: &GridNetwork, client: &Client) -> Option<String> {
-    match grid_network::signals_own_key(network, client).await {
-        Ok(key) => key,
+/// This site's own leaf from the network this operator serves.
+async fn sole_own_leaf(client: &Client) -> Option<grid_network::OwnLeaf> {
+    let network = Box::pin(sole_network(client)).await?;
+    Box::pin(own_leaf(&network, client)).await
+}
+
+/// This site's own leaf, logging a read error.
+async fn own_leaf(network: &GridNetwork, client: &Client) -> Option<grid_network::OwnLeaf> {
+    match grid_network::own_leaf_identity(network, client).await {
+        Ok(own) => own,
         Err(error) => {
             tracing::warn!(%error, "this site's own certificate is unreadable; its workloads cannot be recognised");
             None
@@ -1419,14 +1990,13 @@ async fn signals_own_key(network: &GridNetwork, client: &Client) -> Option<Strin
 /// Separate from reconcile, which runs on an interval sized for declarations
 /// and is two orders of magnitude slower than these values move.
 async fn run_local_scraper(
-    enabled: bool,
+    interval: Option<std::time::Duration>,
     ctx: Arc<OperatorCtx>,
     client: Client,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    if !enabled {
+    let Some(interval) = interval else {
         return Ok(());
-    }
-    let interval = scrape_interval();
+    };
     tracing::info!(interval_ms = interval.as_millis(), "local signals scraper started");
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1448,33 +2018,21 @@ async fn run_local_scraper(
     }
 }
 
-/// How often this site reads its own providers.
-///
-/// `GRID_SIGNALS_SCRAPE_INTERVAL_MS` wins when set, since the seconds form
-/// bottoms out at one and this scrape never leaves the node. Floors at 50ms.
-fn scrape_interval() -> std::time::Duration {
-    let ms = parse_env_or(
-        "GRID_SIGNALS_SCRAPE_INTERVAL_MS",
-        parse_env_or("GRID_SIGNALS_SCRAPE_INTERVAL_SECS", 5_u64).saturating_mul(1_000),
-    );
-    std::time::Duration::from_millis(ms.max(50))
-}
-
 /// Poll every alive peer's signals endpoint on a coarse interval, fail closed.
 ///
 /// The wire path is mTLS only, so a round requires verified client material.
 /// Without it the poller idles rather than polling peers in plaintext, and it
 /// rebuilds when this site's certificate changes.
 async fn run_peer_poller(
-    enabled: bool,
+    settings: Option<operator::cli::SignalsArgs>,
     ctx: Arc<OperatorCtx>,
     swim: SwimStartup,
     client: Client,
     shutdown: operator::shutdown::Shutdown,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    if !enabled {
+    let Some(settings) = settings else {
         return Ok(());
-    }
+    };
     let Some(swim) = swim_settled(swim).await else {
         tracing::info!("peer signals poller disabled: SWIM is not running");
         return Ok(());
@@ -1483,8 +2041,7 @@ async fn run_peer_poller(
         ctx,
         swim,
         client,
-        port: parse_env_or("GRID_SIGNALS_PEER_PORT", 9091_u16),
-        interval: std::time::Duration::from_secs(parse_env_or("GRID_SIGNALS_PEER_INTERVAL_SECS", 30_u64)),
+        settings,
         shutdown,
     }
     .run()
@@ -1500,10 +2057,8 @@ struct PeerPoller {
     swim: Arc<swim_runtime::SwimHandle>,
     /// Kube client, for resolving this site's TLS material.
     client: Client,
-    /// Port each peer's signals endpoint is dialled on.
-    port: u16,
-    /// How often a round runs.
-    interval: std::time::Duration,
+    /// Poll cadence, timeouts, and what to collect.
+    settings: operator::cli::SignalsArgs,
     /// Lets an in-flight round stand down when the process is stopping.
     shutdown: operator::shutdown::Shutdown,
 }
@@ -1517,18 +2072,24 @@ impl PeerPoller {
 
     /// One build-and-poll cycle; `false` means shutdown arrived while idle.
     async fn cycle(&self) -> bool {
-        let own_key = Box::pin(signals_identity(&self.client)).await.1;
-        let Some(source) = Box::pin(peer_source(&self.client, self.shutdown.clone())).await else {
+        let own = Box::pin(sole_own_leaf(&self.client)).await;
+        let Some(source) = Box::pin(peer_source(
+            &self.client,
+            self.shutdown.clone(),
+            self.ctx.peer_settings().trust,
+            &self.settings,
+        ))
+        .await
+        else {
             tracing::warn!("peer signals poller idle: TLS material unavailable (fail closed)");
             return self.idle_until_retry().await;
         };
         tracing::info!(
-            self.port,
-            interval_secs = self.interval.as_secs(),
+            interval_secs = self.settings.peer_interval_secs,
             source = "poll",
             "peer signals poller started"
         );
-        self.poll_until_changed(&source, material_changed(self.client.clone(), own_key))
+        self.poll_until_changed(&source, material_changed(self.client.clone(), own))
             .await;
         true
     }
@@ -1548,7 +2109,7 @@ impl PeerPoller {
         source: &operator::signals::PollPeers,
         changed: impl Future<Output = ()> + Send,
     ) {
-        let mut ticker = tokio::time::interval(self.interval);
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(self.settings.peer_interval_secs));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut changed = std::pin::pin!(changed);
         loop {
@@ -1567,51 +2128,86 @@ impl PeerPoller {
 
     /// Collect from every alive peer and replace what is published for them.
     async fn poll_once(&self, source: &operator::signals::PollPeers) {
-        // A refusal is symmetric: one we will not answer is one we do not read.
-        let identities = self.ctx.peer_identities();
-        let snapshot = self.swim.snapshot();
-        let alive = snapshot
-            .members
-            .iter()
-            .filter(|m| m.status == operator::swim::MemberStatus::Alive)
-            .filter(|m| !identities.refuses(&m.site_id))
-            .map(|m| (m.site_id.as_str(), m.endpoint.as_str()));
-        // Verified against the keys declared for that peer, not any key the CA signed.
-        let mut sites = operator::signals::peer_sites(alive, self.swim.site_name(), self.port, "https");
-        for site in &mut sites {
-            site.pins = identities.pins_for(&site.name);
-        }
-        if sites.is_empty() {
+        let targets = poll_targets(
+            &self.swim.snapshot(),
+            &self.ctx.peer_identities(),
+            source.trust,
+            self.swim.is_encrypted(),
+            self.swim.site_name(),
+            self.settings.peer_port,
+        );
+        let Some(sites) = targets.filter(|sites| !sites.is_empty()) else {
             return;
-        }
-        let collected = source.collect(&sites).await;
-        self.ctx.peers().refresh(collected, peer_signals_ttl());
+        };
+        // Each peer lands as it answers, so one slow peer cannot age out the rest.
+        let peers = self.ctx.peers();
+        let ttl = self.settings.peer_ttl();
+        source
+            .collect_each(&sites, |peer, observations| {
+                peers.refresh(BTreeMap::from([(peer, observations)]), ttl);
+            })
+            .await;
     }
 }
 
-/// Build the peer poller source from verified TLS material, or `None` when absent.
-async fn peer_source(client: &Client, shutdown: operator::shutdown::Shutdown) -> Option<operator::signals::PollPeers> {
-    let tls = peer_tls(client).await?;
-    Some(operator::signals::PollPeers {
-        timeout: std::time::Duration::from_secs(parse_env_or("GRID_SIGNALS_PEER_TIMEOUT_SECS", 5_u64)),
-        tls: Some(tls),
-        collect: parse_peer_collect(),
-        concurrency: parse_env_or("GRID_SIGNALS_PEER_CONCURRENCY", 8_usize),
-        attempts: parse_env_or("GRID_SIGNALS_PEER_ATTEMPTS", 3_u32),
-        backoff: std::time::Duration::from_millis(parse_env_or("GRID_SIGNALS_PEER_BACKOFF_MS", 50_u64)),
-        budget: std::time::Duration::from_secs(parse_env_or("GRID_SIGNALS_PEER_BUDGET_SECS", 10_u64)),
-        slow_after: std::time::Duration::from_millis(parse_env_or("GRID_SIGNALS_PEER_SLOW_MS", 1_000_u64)),
-        shutdown,
-    })
+/// Alive peers this site would name under `trust`, `None` in SPIFFE mode over plaintext gossip.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "membership, trust, and addressing inputs of one round"
+)]
+fn poll_targets(
+    snapshot: &operator::swim::MembershipSnapshot,
+    identities: &operator::signals::PeerIdentities,
+    trust: operator::signals::PeerTrustMode,
+    encrypted: bool,
+    local_site: &str,
+    fallback_port: u16,
+) -> Option<Vec<operator::signals::PeerSite>> {
+    let pinned = trust == operator::signals::PeerTrustMode::Pin;
+    if !pinned && !encrypted {
+        tracing::debug!("SPIFFE peer polling waits for encrypted gossip");
+        return None;
+    }
+    let alive = snapshot
+        .members
+        .iter()
+        .filter(|m| m.status == operator::swim::MemberStatus::Alive)
+        .filter(|m| {
+            if pinned {
+                !identities.refuses(&m.site_id)
+            } else {
+                identities.labels_for(&m.site_id).is_some()
+            }
+        });
+    let mut sites = operator::signals::peer_sites(alive, local_site, "https", fallback_port);
+    if pinned {
+        for site in &mut sites {
+            site.pins = identities.pins_for(&site.name);
+        }
+    }
+    Some(sites)
 }
 
-/// How long a polled peer signal is served before it expires.
-///
-/// Coarser than the local store because a peer is polled across a cluster
-/// boundary and on a longer interval, so a couple of missed rounds must not
-/// erase it.
-fn peer_signals_ttl() -> std::time::Duration {
-    std::time::Duration::from_secs(parse_env_or("GRID_SIGNALS_PEER_TTL_SECS", 120_u64).max(1))
+/// Build the peer poller source from verified TLS material, or `None` when absent.
+async fn peer_source(
+    client: &Client,
+    shutdown: operator::shutdown::Shutdown,
+    trust: operator::signals::PeerTrustMode,
+    settings: &operator::cli::SignalsArgs,
+) -> Option<operator::signals::PollPeers> {
+    let tls = peer_tls(client).await?;
+    Some(operator::signals::PollPeers {
+        timeout: std::time::Duration::from_secs(settings.peer_timeout_secs),
+        tls: Some(tls),
+        collect: settings.peer_collect(),
+        concurrency: settings.peer_concurrency,
+        attempts: settings.peer_attempts,
+        backoff: std::time::Duration::from_millis(settings.peer_backoff_ms),
+        budget: std::time::Duration::from_secs(settings.peer_budget_secs),
+        slow_after: std::time::Duration::from_millis(settings.peer_slow_ms),
+        shutdown,
+        trust,
+    })
 }
 
 /// Client TLS for peer polling, or `None` when unconfigured or unreadable.
@@ -1635,33 +2231,9 @@ async fn peer_tls(client: &Client) -> Option<Arc<operator::signals::PeerTlsMater
     }
 }
 
-/// Signals asked of each peer, from `GRID_SIGNALS_PEER_COLLECT`.
-///
-/// Newline-separated metric names. Empty asks a peer for everything it holds.
-fn parse_peer_collect() -> Vec<String> {
-    std::env::var("GRID_SIGNALS_PEER_COLLECT")
-        .map(|raw| {
-            raw.lines()
-                .map(str::trim)
-                .filter(|l| !l.is_empty())
-                .map(str::to_owned)
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// Read an environment variable, falling back when unset or unparseable.
-fn parse_env_or<T: std::str::FromStr + std::fmt::Display + Copy>(name: &str, fallback: T) -> T {
-    match std::env::var(name) {
-        Ok(raw) => raw.parse().unwrap_or_else(|_| {
-            tracing::warn!(var = name, value = raw, default = %fallback, "unparseable; using default");
-            fallback
-        }),
-        Err(_) => fallback,
-    }
-}
-
 #[cfg(test)]
+#[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
+#[allow(clippy::expect_used, reason = "tests")]
 mod tests {
     use super::*;
 
@@ -1672,23 +2244,455 @@ mod tests {
     fn signals_caller_scope_requires_a_positive_credential() {
         let addr = SocketAddr::from(([127, 0, 0, 1], 0));
         let leaf = [1_u8, 2, 3, 4];
-        let own_key = operator::signals::leaf_fingerprint(&leaf);
+        let own = |fingerprint: String| {
+            Some(grid_network::OwnLeaf {
+                fingerprint,
+                spiffe: None,
+            })
+        };
 
         let owner = SignalsIdentity {
             peers: operator::signals::PeerIdentities::new(),
-            own_key: Some(own_key),
+            own: own(operator::signals::leaf_fingerprint(&leaf)),
+            trust: operator::signals::PeerTrustMode::Pin,
         };
         // A caller that presents no certificate is served nothing, never Local.
-        assert_eq!(caller_for(None, &owner, addr), Caller::Peer(None));
+        assert_eq!(caller_for(None, &owner, addr), (Caller::Peer(None), None));
         // This site's own certificate is the only key that earns Local.
-        assert_eq!(caller_for(Some(&leaf), &owner, addr), Caller::Local);
+        assert_eq!(caller_for(Some(&leaf), &owner, addr), (Caller::Local, None));
 
         // A certificate this site has not declared is served nothing, not Local.
         let stranger = SignalsIdentity {
             peers: operator::signals::PeerIdentities::new(),
-            own_key: Some("0".repeat(64)),
+            own: own("0".repeat(64)),
+            trust: operator::signals::PeerTrustMode::Pin,
         };
-        assert_eq!(caller_for(Some(&leaf), &stranger, addr), Caller::Peer(None));
+        assert_eq!(caller_for(Some(&leaf), &stranger, addr), (Caller::Peer(None), None));
+    }
+
+    /// DER of a Grid-CA site certificate for `site`.
+    fn site_der(site: &str) -> Vec<u8> {
+        let ca = certs::generate_ca("grid-ca").expect("fixture");
+        let cert = certs::generate_site_cert(&ca, site).expect("fixture");
+        pem_der(&cert.cert_pem)
+    }
+
+    /// DER of the first PEM block.
+    fn pem_der(pem: &str) -> Vec<u8> {
+        pem::parse(pem).expect("fixture").into_contents()
+    }
+
+    /// Labels held for every known site in these tests.
+    fn gpu() -> BTreeMap<String, String> {
+        BTreeMap::from([("tier".to_owned(), "gpu".to_owned())])
+    }
+
+    /// A listener for site `hub` under `trust`, knowing `east` (pinned to `east_der`) and `west` (no pins).
+    fn hub_identity(trust: operator::signals::PeerTrustMode, own: &[u8], east_der: &[u8]) -> SignalsIdentity {
+        let record = |pins: Vec<String>| operator::signals::PeerRecord { labels: gpu(), pins };
+        let peers = operator::signals::PeerIdentities::new();
+        peers.set(BTreeMap::from([
+            (
+                "east".to_owned(),
+                record(vec![operator::signals::leaf_fingerprint(east_der)]),
+            ),
+            ("west".to_owned(), record(Vec::new())),
+        ]));
+        SignalsIdentity {
+            peers,
+            own: Some(grid_network::OwnLeaf {
+                fingerprint: operator::signals::leaf_fingerprint(own),
+                spiffe: Some(certs::spiffe_id("hub")),
+            }),
+            trust,
+        }
+    }
+
+    /// The same callers under both trust modes.
+    #[test]
+    #[expect(clippy::too_many_lines, reason = "case table")]
+    fn signals_caller_by_trust_mode() {
+        let addr = SocketAddr::from(([127, 0, 0, 1], 0));
+        let (own, east, west, stranger) = (site_der("hub"), site_der("east"), site_der("west"), site_der("nowhere"));
+        let reissued = site_der("hub");
+        let pin = hub_identity(operator::signals::PeerTrustMode::Pin, &own, &east);
+        let spiffe = hub_identity(operator::signals::PeerTrustMode::Spiffe, &own, &east);
+        let named = || Caller::Peer(Some(gpu()));
+        let cases = [
+            ("own cert", Some(own.as_slice()), &pin, Caller::Local),
+            ("pinned peer", Some(east.as_slice()), &pin, named()),
+            ("unpinned peer", Some(west.as_slice()), &pin, Caller::Peer(None)),
+            (
+                "own site, another leaf",
+                Some(reissued.as_slice()),
+                &pin,
+                Caller::Peer(None),
+            ),
+            ("own spiffe id", Some(own.as_slice()), &spiffe, Caller::Local),
+            (
+                "own spiffe id, another leaf",
+                Some(reissued.as_slice()),
+                &spiffe,
+                Caller::Peer(None),
+            ),
+            ("known site", Some(east.as_slice()), &spiffe, named()),
+            ("known site without pins", Some(west.as_slice()), &spiffe, named()),
+            ("unknown site", Some(stranger.as_slice()), &spiffe, Caller::Peer(None)),
+            ("junk leaf", Some(b"junk".as_slice()), &spiffe, Caller::Peer(None)),
+            ("no certificate", None, &spiffe, Caller::Peer(None)),
+        ];
+        for (label, leaf, listener, want) in cases {
+            let (caller, site) = caller_for(leaf, listener, addr);
+            assert_eq!(caller, want, "{label}");
+            let counted = matches!(want, Caller::Peer(Some(_)))
+                .then(|| if leaf == Some(west.as_slice()) { "west" } else { "east" });
+            assert_eq!(site.as_deref(), counted, "{label}: counted against the resolved site");
+        }
+    }
+
+    /// Fresh caps, and a handshake slot for loopback against them.
+    fn handshaking(sources: &SourceSlots, peers: &PeerSlots) -> Handshaking {
+        Handshaking {
+            source: sources
+                .acquire(std::net::IpAddr::from([127, 0, 0, 1]))
+                .expect("a free slot"),
+            peers: peers.clone(),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[expect(clippy::too_many_lines, reason = "server TLS setup and a silent client")]
+    async fn a_silent_client_is_dropped_at_the_handshake_timeout() {
+        let ca = certs::generate_ca("grid-ca").expect("fixture");
+        let site = certs::generate_site_cert(&ca, "east").expect("fixture");
+        let tls = tls_backend::build_server_config(
+            ca.cert_pem.as_bytes(),
+            site.cert_pem.as_bytes(),
+            site.key_pem.as_bytes(),
+        )
+        .expect("fixture");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("fixture");
+        let addr = listener.local_addr().expect("fixture");
+        // Connects and never speaks.
+        let _silent = tokio::net::TcpStream::connect(addr).await.expect("fixture");
+        let (stream, remote) = listener.accept().await.expect("fixture");
+        let identity = SignalsIdentity {
+            peers: operator::signals::PeerIdentities::new(),
+            own: None,
+            trust: operator::signals::PeerTrustMode::Pin,
+        };
+        let sources = SourceSlots::new(1, 1);
+        let started = tokio::time::Instant::now();
+        let serving = Serving {
+            tls,
+            app: axum::Router::new(),
+            identity,
+        };
+        let serve = Box::pin(serve_signals_connection(
+            serving,
+            stream,
+            remote,
+            handshaking(&sources, &PeerSlots::new(1, 8)),
+        ));
+        tokio::time::timeout(SIGNALS_HANDSHAKE_TIMEOUT * 2, serve)
+            .await
+            .expect("released by the handshake bound");
+        assert_eq!(
+            started.elapsed(),
+            SIGNALS_HANDSHAKE_TIMEOUT,
+            "released exactly at the bound"
+        );
+        assert!(
+            sources.acquire(remote.ip()).is_some(),
+            "a failed handshake frees its source slot"
+        );
+    }
+
+    /// A rustls client presenting `client` (a Grid-CA site cert) to a server named `east`.
+    #[cfg(not(feature = "fips"))]
+    fn site_client(ca: &certs::CaCert, client: &certs::SiteCertOutput) -> tokio_rustls::TlsConnector {
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject as _};
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(CertificateDer::from_pem_slice(ca.cert_pem.as_bytes()).expect("fixture"))
+            .expect("fixture");
+        let chain = vec![CertificateDer::from_pem_slice(client.cert_pem.as_bytes()).expect("fixture")];
+        let key = PrivateKeyDer::from_pem_slice(client.key_pem.as_bytes()).expect("fixture");
+        let config = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .expect("fixture")
+            .with_root_certificates(roots)
+            .with_client_auth_cert(chain, key)
+            .expect("fixture");
+        tokio_rustls::TlsConnector::from(Arc::new(config))
+    }
+
+    /// A Grid CA, a server `east`, and a client `west`.
+    #[cfg(not(feature = "fips"))]
+    struct Mesh {
+        /// The Grid CA.
+        ca: certs::CaCert,
+        /// The listening site.
+        east: certs::SiteCertOutput,
+        /// The calling site.
+        west: certs::SiteCertOutput,
+    }
+
+    #[cfg(not(feature = "fips"))]
+    impl Mesh {
+        fn new() -> Self {
+            let ca = certs::generate_ca("grid-ca").expect("fixture");
+            let east = certs::generate_site_cert(&ca, "east").expect("fixture");
+            let west = certs::generate_site_cert(&ca, "west").expect("fixture");
+            Self { ca, east, west }
+        }
+
+        /// A listener on which `west` is this site's own, Local, caller.
+        fn west_is_local(&self) -> SignalsIdentity {
+            SignalsIdentity {
+                peers: operator::signals::PeerIdentities::new(),
+                own: Some(grid_network::OwnLeaf {
+                    fingerprint: operator::signals::leaf_fingerprint(&pem_der(&self.west.cert_pem)),
+                    spiffe: None,
+                }),
+                trust: operator::signals::PeerTrustMode::Pin,
+            }
+        }
+
+        /// A listener that pins `west` as a peer.
+        fn west_is_pinned(&self) -> SignalsIdentity {
+            let peers = operator::signals::PeerIdentities::new();
+            peers.set(BTreeMap::from([(
+                "west".to_owned(),
+                operator::signals::PeerRecord {
+                    labels: gpu(),
+                    pins: vec![operator::signals::leaf_fingerprint(&pem_der(&self.west.cert_pem))],
+                },
+            )]));
+            SignalsIdentity {
+                peers,
+                own: None,
+                trust: operator::signals::PeerTrustMode::Pin,
+            }
+        }
+
+        /// Serve `connections` connections as `east`, each with a fresh handshake slot.
+        async fn serve(
+            &self,
+            identity: SignalsIdentity,
+            app: axum::Router,
+            (sources, peers): (&SourceSlots, &PeerSlots),
+            connections: usize,
+        ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+            let tls = tls_backend::build_server_config(
+                self.ca.cert_pem.as_bytes(),
+                self.east.cert_pem.as_bytes(),
+                self.east.key_pem.as_bytes(),
+            )
+            .expect("fixture");
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("fixture");
+            let addr = listener.local_addr().expect("fixture");
+            let (sources, peers) = (sources.clone(), peers.clone());
+            let server = tokio::spawn(async move {
+                let mut served = tokio::task::JoinSet::new();
+                for _ in 0..connections {
+                    let (stream, remote) = listener.accept().await.expect("fixture");
+                    let handshaking = handshaking(&sources, &peers);
+                    let serving = Serving {
+                        tls: Arc::clone(&tls),
+                        app: app.clone(),
+                        identity: identity.clone(),
+                    };
+                    served.spawn(serve_signals_connection(serving, stream, remote, handshaking));
+                }
+                served.join_all().await;
+            });
+            (addr, server)
+        }
+
+        /// Connect to `addr` as `west`.
+        async fn connect(&self, addr: SocketAddr) -> tokio_rustls::client::TlsStream<tokio::net::TcpStream> {
+            let tcp = tokio::net::TcpStream::connect(addr).await.expect("fixture");
+            let name = rustls::pki_types::ServerName::try_from("east.grid.internal").expect("fixture");
+            site_client(&self.ca, &self.west)
+                .connect(name, tcp)
+                .await
+                .expect("handshake")
+        }
+    }
+
+    /// One request on `conn`, returning the start of the response, empty once the server hung up.
+    #[cfg(not(feature = "fips"))]
+    async fn get(conn: &mut tokio_rustls::client::TlsStream<tokio::net::TcpStream>) -> Vec<u8> {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        if conn
+            .write_all(b"GET /v1/site/signals HTTP/1.1\r\nHost: east\r\n\r\n")
+            .await
+            .is_err()
+        {
+            return Vec::new();
+        }
+        let mut answer = vec![0_u8; 512];
+        let read = conn.read(&mut answer).await.unwrap_or(0);
+        answer.truncate(read);
+        answer
+    }
+
+    /// An app answering `ok` on the signals path.
+    #[cfg(not(feature = "fips"))]
+    fn ok_app() -> axum::Router {
+        axum::Router::new().route(operator::signals::SIGNALS_PATH, axum::routing::get(|| async { "ok" }))
+    }
+
+    /// An unnamed caller is closed after the handshake without an HTTP answer.
+    #[cfg(not(feature = "fips"))]
+    #[tokio::test]
+    async fn an_unnamed_caller_is_closed_unanswered() {
+        use tokio::io::AsyncReadExt as _;
+        let mesh = Mesh::new();
+        let identity = SignalsIdentity {
+            peers: operator::signals::PeerIdentities::new(),
+            own: None,
+            trust: operator::signals::PeerTrustMode::Pin,
+        };
+        let (sources, peers) = (SourceSlots::new(1, 1), PeerSlots::new(1, 8));
+        let (addr, server) = mesh.serve(identity, ok_app(), (&sources, &peers), 1).await;
+        let mut conn = mesh.connect(addr).await;
+        let mut rest = Vec::new();
+        let read = tokio::time::timeout(std::time::Duration::from_secs(5), conn.read_to_end(&mut rest)).await;
+        assert!(read.is_ok() && rest.is_empty(), "closed with no answer");
+        tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .expect("server finished")
+            .expect("server task");
+    }
+
+    /// An authenticated caller's idle keep-alive connection closes at the header read bound.
+    #[cfg(not(feature = "fips"))]
+    #[tokio::test]
+    async fn an_idle_peer_connection_closes_at_the_header_read_bound() {
+        use tokio::io::AsyncReadExt as _;
+        let mesh = Mesh::new();
+        let (sources, peers) = (SourceSlots::new(1, 1), PeerSlots::new(1, 8));
+        let (addr, server) = mesh.serve(mesh.west_is_local(), ok_app(), (&sources, &peers), 1).await;
+        let mut conn = mesh.connect(addr).await;
+        let head = get(&mut conn).await;
+        assert!(head.starts_with(b"HTTP/1.1 200"), "{}", String::from_utf8_lossy(&head));
+        assert!(
+            sources.acquire(std::net::IpAddr::from([127, 0, 0, 1])).is_some(),
+            "an authenticated connection holds no source slot"
+        );
+        // Real time for the handshake, virtual time for the idle wait.
+        tokio::time::pause();
+        let idle = tokio::time::Instant::now();
+        let mut rest = Vec::new();
+        let closed = tokio::time::timeout(SIGNALS_HEADER_READ_TIMEOUT * 2, conn.read_to_end(&mut rest)).await;
+        assert!(closed.is_ok(), "the server kept an idle connection open");
+        assert!(idle.elapsed() >= SIGNALS_HEADER_READ_TIMEOUT, "held until the bound");
+        server.await.expect("server task");
+    }
+
+    /// A site past its cap is answered 503 and closed, while its first connection serves.
+    #[cfg(not(feature = "fips"))]
+    #[tokio::test]
+    async fn a_peer_site_is_capped_after_the_handshake() {
+        use tokio::io::AsyncReadExt as _;
+        let mesh = Mesh::new();
+        let (sources, peers) = (SourceSlots::new(8, 8), PeerSlots::new(1, 8));
+        let (addr, _server) = mesh.serve(mesh.west_is_pinned(), ok_app(), (&sources, &peers), 2).await;
+        let mut first = mesh.connect(addr).await;
+        assert!(
+            get(&mut first).await.starts_with(b"HTTP/1.1 200"),
+            "the first connection serves"
+        );
+        let mut second = mesh.connect(addr).await;
+        let head = get(&mut second).await;
+        assert!(head.starts_with(b"HTTP/1.1 503"), "{}", String::from_utf8_lossy(&head));
+        let mut rest = Vec::new();
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(5), second.read_to_end(&mut rest)).await;
+        assert!(closed.is_ok(), "then closed");
+        assert!(
+            get(&mut first).await.starts_with(b"HTTP/1.1 200"),
+            "the first still serves"
+        );
+    }
+
+    #[test]
+    #[expect(clippy::significant_drop_tightening, reason = "slots are held to reach the cap")]
+    fn peers_never_take_the_local_reserve() {
+        let peers = PeerSlots::new(2, 3);
+        let held: Vec<PeerSlot> = ["a", "b", "c"].iter().filter_map(|site| peers.acquire(site)).collect();
+        assert_eq!(held.len(), 3, "one per site up to the peer total");
+        assert!(peers.acquire("d").is_none(), "the peer total holds");
+        drop(held);
+        let same: Vec<PeerSlot> = (0..3).filter_map(|_| peers.acquire("a")).collect();
+        assert_eq!(same.len(), 2, "per site");
+        let admission = Admission::new(4);
+        assert_eq!(
+            admission.peers.total.available_permits(),
+            SIGNALS_MAX_CONNECTIONS - SIGNALS_LOCAL_RESERVE,
+            "the gateway keeps its reserve"
+        );
+    }
+
+    /// A caller that keeps asking is closed once the connection reaches its maximum age.
+    #[tokio::test(start_paused = true)]
+    async fn a_busy_connection_closes_at_its_maximum_age() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let (mut client, server_io) = tokio::io::duplex(4096);
+        let service = hyper::service::service_fn(|_request: http::Request<hyper::body::Incoming>| {
+            std::future::ready(Ok::<_, std::convert::Infallible>(http::Response::new(
+                http_body_util::Full::new(bytes::Bytes::from_static(b"ok")),
+            )))
+        });
+        let connection = hyper::server::conn::http1::Builder::new()
+            .timer(hyper_util::rt::TokioTimer::new())
+            .header_read_timeout(SIGNALS_HEADER_READ_TIMEOUT)
+            .serve_connection(hyper_util::rt::TokioIo::new(server_io), service);
+        let server = tokio::spawn(serve_until_aged(connection, SIGNALS_MAX_CONNECTION_AGE));
+        let opened = tokio::time::Instant::now();
+        let mut answer = [0_u8; 256];
+        loop {
+            let asked = client.write_all(b"GET / HTTP/1.1\r\nHost: east\r\n\r\n").await;
+            let read = client.read(&mut answer).await.unwrap_or(0);
+            if asked.is_err() || read == 0 {
+                break;
+            }
+            assert!(opened.elapsed() <= SIGNALS_MAX_CONNECTION_AGE, "outlived its age");
+            tokio::time::sleep(SIGNALS_HEADER_READ_TIMEOUT / 2).await;
+        }
+        assert!(
+            opened.elapsed() >= SIGNALS_MAX_CONNECTION_AGE,
+            "closed at its age, not before"
+        );
+        assert!(server.await.expect("server task").is_ok(), "a graceful close");
+    }
+
+    /// A caller that stops reading a large response is dropped at the write bound.
+    #[cfg(not(feature = "fips"))]
+    #[tokio::test]
+    async fn a_stalled_reader_is_dropped_at_the_write_timeout() {
+        use tokio::io::AsyncWriteExt as _;
+        let mesh = Mesh::new();
+        let body = "x".repeat(64 << 20);
+        let app = axum::Router::new().route(
+            operator::signals::SIGNALS_PATH,
+            axum::routing::get(move || std::future::ready(body.clone())),
+        );
+        let (sources, peers) = (SourceSlots::new(1, 1), PeerSlots::new(1, 8));
+        let (addr, server) = mesh.serve(mesh.west_is_local(), app, (&sources, &peers), 1).await;
+        let mut conn = mesh.connect(addr).await;
+        conn.write_all(b"GET /v1/site/signals HTTP/1.1\r\nHost: east\r\n\r\n")
+            .await
+            .expect("request");
+        tokio::time::pause();
+        let started = tokio::time::Instant::now();
+        tokio::time::timeout(SIGNALS_WRITE_TIMEOUT * 3, server)
+            .await
+            .expect("the stalled connection was dropped")
+            .expect("server task");
+        assert!(started.elapsed() >= SIGNALS_WRITE_TIMEOUT, "held until the write bound");
+        drop(conn);
     }
 
     /// A queue error carrying an apiserver status with `code`.
@@ -1813,6 +2817,178 @@ mod tests {
     }
 
     #[test]
+    fn handshake_sources_are_keyed_by_address_scope() {
+        let ip = |text: &str| text.parse::<std::net::IpAddr>().expect("ip");
+        let cases = [
+            ("ipv4 per address", "10.0.0.1", "10.0.0.1", None),
+            ("mapped ipv4 is ipv4", "::ffff:10.0.0.1", "10.0.0.1", None),
+            (
+                "global ipv6 per /64 and /48",
+                "2001:db8:1:2::1",
+                "2001:db8:1:2::",
+                Some("2001:db8:1::"),
+            ),
+            ("unique-local per address", "fd00::1", "fd00::1", None),
+            ("link-local per address", "fe80::1", "fe80::1", None),
+        ];
+        for (label, source, key, wider) in cases {
+            assert_eq!(source_keys(ip(source)), (ip(key), wider.map(ip)), "{label}");
+        }
+    }
+
+    #[test]
+    fn handshake_slots_cap_a_source_and_a_global_48() {
+        let slots = SourceSlots::new(1, 2);
+        let ip = |text: &str| text.parse::<std::net::IpAddr>().expect("ip");
+        let first = slots.acquire(ip("2001:db8:1:1::1"));
+        assert!(first.is_some());
+        assert!(slots.acquire(ip("2001:db8:1:1::ffff")).is_none(), "same /64");
+        let second = slots.acquire(ip("2001:db8:1:2::1"));
+        assert!(second.is_some(), "another /64");
+        assert!(slots.acquire(ip("2001:db8:1:3::1")).is_none(), "the /48 is full");
+        assert!(slots.acquire(ip("2001:db8:2:1::1")).is_some(), "another /48");
+        assert!(
+            slots.acquire(ip("fd00::1")).is_some() && slots.acquire(ip("fd00::2")).is_some(),
+            "ULA per address"
+        );
+        drop(first);
+        assert!(
+            slots.acquire(ip("2001:db8:1:3::1")).is_some(),
+            "a released slot frees the /48"
+        );
+        drop(second);
+    }
+
+    #[test]
+    #[expect(clippy::significant_drop_tightening, reason = "slots are held to reach the cap")]
+    fn peer_slots_cap_one_site_and_release_on_drop() {
+        let slots = PeerSlots::new(2, 8);
+        let first = slots.acquire("aa");
+        let second = slots.acquire("aa");
+        assert!(first.is_some() && second.is_some(), "up to the cap");
+        assert!(slots.acquire("aa").is_none(), "past the cap");
+        assert!(slots.acquire("bb").is_some(), "another leaf is unaffected");
+        drop(first);
+        assert!(slots.acquire("aa").is_some(), "a closed connection frees its slot");
+    }
+
+    #[tokio::test]
+    async fn the_ipv6_wildcard_accepts_ipv4() {
+        let bound = bind_dual_stack(SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0)));
+        if bound.as_ref().is_err_and(lacks_ipv6) {
+            return;
+        }
+        let listener = bound.expect("bind");
+        assert_eq!(socket2::SockRef::from(&listener).only_v6().ok(), Some(false));
+        let port = listener.local_addr().expect("addr").port();
+        let connect = tokio::net::TcpStream::connect(SocketAddr::from(([127, 0, 0, 1], port)));
+        let (connected, accepted) = tokio::join!(connect, listener.accept());
+        assert!(
+            connected.is_ok() && accepted.is_ok(),
+            "an IPv4 client reaches the wildcard"
+        );
+    }
+
+    #[tokio::test]
+    #[expect(clippy::too_many_lines, reason = "every bind outcome against one fake binder")]
+    async fn the_default_bind_falls_back_to_ipv4_without_ipv6() {
+        let refuse_v6 = |kind: Option<std::io::ErrorKind>, raw: Option<i32>| {
+            move |addr: SocketAddr| {
+                std::future::ready(match (addr.is_ipv6(), kind, raw) {
+                    (true, Some(kind), _) => Err(std::io::Error::from(kind)),
+                    (true, None, Some(raw)) => Err(std::io::Error::from_raw_os_error(raw)),
+                    _ => Ok(addr),
+                })
+            }
+        };
+        let none = refuse_v6(None, None);
+        assert_eq!(
+            bind_with_fallback(None, none).await.ok(),
+            Some(SIGNALS_DEFAULT_V6),
+            "dual stack"
+        );
+        let no_family = refuse_v6(None, Some(EAFNOSUPPORT));
+        assert_eq!(bind_with_fallback(None, no_family).await.ok(), Some(SIGNALS_DEFAULT_V4));
+        let no_addr = refuse_v6(Some(std::io::ErrorKind::AddrNotAvailable), None);
+        assert_eq!(bind_with_fallback(None, no_addr).await.ok(), Some(SIGNALS_DEFAULT_V4));
+        let in_use = refuse_v6(Some(std::io::ErrorKind::AddrInUse), None);
+        assert!(
+            bind_with_fallback(None, in_use).await.is_err(),
+            "only a missing family falls back"
+        );
+        let explicit = SocketAddr::from(([10, 0, 0, 1], 9443));
+        let still_no_addr = refuse_v6(Some(std::io::ErrorKind::AddrNotAvailable), None);
+        assert_eq!(
+            bind_with_fallback(Some(explicit), still_no_addr).await.ok(),
+            Some(explicit),
+            "explicit as given"
+        );
+        let listener = bind_signals(Some(SocketAddr::from(([127, 0, 0, 1], 0))))
+            .await
+            .expect("bind");
+        assert!(listener.local_addr().expect("addr").is_ipv4());
+    }
+
+    #[test]
+    #[expect(clippy::too_many_lines, reason = "membership and identities for both trust modes")]
+    fn peers_are_polled_only_when_this_site_would_name_them() {
+        let member = |site: &str, endpoint: &str| operator::swim::MemberRecord {
+            site_id: site.to_owned(),
+            endpoint: endpoint.to_owned(),
+            incarnation: 0,
+            status: operator::swim::MemberStatus::Alive,
+            age_secs: 0,
+            gateway_address: None,
+            site_cert_pem: None,
+            signals_address: None,
+        };
+        let snapshot = operator::swim::MembershipSnapshot {
+            members: vec![
+                member("hub", "10.0.0.1:7946"),
+                member("east", "10.0.0.2:7946"),
+                member("west", "10.0.0.3:7946"),
+                member("stranger", "10.0.0.4:7946"),
+            ],
+        };
+        let identities = operator::signals::PeerIdentities::new();
+        identities.set(BTreeMap::from([
+            (
+                "east".to_owned(),
+                operator::signals::PeerRecord {
+                    labels: gpu(),
+                    pins: vec!["aa".to_owned()],
+                },
+            ),
+            (
+                "west".to_owned(),
+                operator::signals::PeerRecord {
+                    labels: gpu(),
+                    pins: Vec::new(),
+                },
+            ),
+        ]));
+        let names = |trust, encrypted| {
+            poll_targets(&snapshot, &identities, trust, encrypted, "hub", 9091)
+                .map(|sites| sites.into_iter().map(|site| site.name).collect::<Vec<_>>())
+        };
+        let (pin, spiffe) = (
+            operator::signals::PeerTrustMode::Pin,
+            operator::signals::PeerTrustMode::Spiffe,
+        );
+        assert_eq!(
+            names(pin, false),
+            Some(vec!["east".to_owned()]),
+            "pins guard plaintext gossip"
+        );
+        assert_eq!(names(spiffe, false), None, "SPIFFE waits for encrypted gossip");
+        assert_eq!(
+            names(spiffe, true),
+            Some(vec!["east".to_owned(), "west".to_owned()]),
+            "named sites only"
+        );
+    }
+
+    #[test]
     fn lease_from_seeds_reserves_full_disjoint_block() {
         let first = lease_from_seeds(100, 7).unwrap_or_else(|_| std::process::abort());
         let second = lease_from_seeds(
@@ -1834,19 +3010,54 @@ mod tests {
 
     #[test]
     fn persisted_values_win_when_clock_is_behind() {
-        let future_revision = 10_000_000_000_000_u64;
-        let future_generation = 10_000_000_000_000_000_000_u64;
-        let lease = next_revision_lease(future_revision, future_generation).unwrap_or_else(|_| std::process::abort());
-        assert_eq!(lease.first_revision, future_revision + 1);
-        assert_eq!(lease.first_node_generation, future_generation + 1);
+        let now_ms = 1_800_000_000_000_u64;
+        let now_nanos = now_ms * 1_000_000;
+        let ahead = now_ms + 60_000;
+        let lease = plan_next_lease(ahead, now_nanos + 5, now_ms, now_nanos).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(lease.first_revision, ahead + 1, "a mark within the cap is respected");
+        assert_eq!(lease.first_node_generation, now_nanos + 6);
     }
 
     #[test]
-    fn exhausted_revision_or_generation_fails_closed() {
-        assert!(
-            next_revision_lease(u64::MAX, 1).is_err(),
-            "u64::MAX revision must overflow"
+    fn back_to_back_restarts_stay_under_every_peer_cap() {
+        let now_ms = 1_800_000_000_000_u64;
+        let now_nanos = now_ms * 1_000_000;
+        let mut lease = lease_from_seeds(now_ms, now_nanos).unwrap_or_else(|_| std::process::abort());
+        for restart in 0..2_000 {
+            let next = plan_next_lease(lease.last_revision, lease.last_node_generation, now_ms, now_nanos)
+                .unwrap_or_else(|_| std::process::abort());
+            assert!(
+                next.first_revision > lease.last_revision,
+                "restart {restart} reuses no revision"
+            );
+            assert!(
+                next.last_revision <= swim::state_broadcast::max_leased_revision(now_ms),
+                "restart {restart} stays under the cap"
+            );
+            assert!(
+                !swim::identity::is_future_generation(next.last_node_generation, now_nanos),
+                "restart {restart} keeps its generation in the skew"
+            );
+            lease = next;
+        }
+    }
+
+    #[test]
+    fn a_mark_from_unbounded_leases_reseeds_at_the_clock() {
+        let now_ms = 1_800_000_000_000_u64;
+        for far in [now_ms + (1 << 32) * 5, u64::MAX] {
+            let lease = plan_next_lease(far, 1, now_ms, 7).unwrap_or_else(|_| std::process::abort());
+            assert_eq!(lease.first_revision, now_ms, "{far} reseeds");
+        }
+        assert_eq!(
+            next_revision_start(now_ms - 5, now_ms),
+            now_ms,
+            "never behind the clock"
         );
+    }
+
+    #[test]
+    fn exhausted_generation_fails_closed() {
         assert!(
             next_revision_lease(1, u64::MAX).is_err(),
             "u64::MAX generation must overflow"

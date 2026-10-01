@@ -408,6 +408,24 @@ SPIFFE URI SAN, and the site's DNS SAN. A provider gateway in SPIFFE mode refuse
 those extensions. Certificates issued before this profile lack them, so
 re-enroll those sites before switching a provider to SPIFFE mode.
 
+SPIFFE mode, `spec.peerTrust.mode: spiffe` on the `GridNetwork`, reads no pins.
+It admits any site the Grid CA signed, auto-discovered sites included, and it
+cannot revoke one short of rotating the Grid CA and the SWIM key.
+
+On the signals listener, only this site's current leaf, matched by digest,
+reads unscoped as the co-located gateway, in either mode. The listener refuses
+a reissued leaf for the same site. In SPIFFE mode the operator polls only sites
+it holds a `GridSite` for. It also waits for encrypted SWIM gossip, since gossip
+carries the addresses it dials. The listener caps handshakes per source address
+and per global IPv6 /64 and /48. It names the caller before it counts the
+connection. It closes a caller it cannot name right after the handshake. It
+caps authenticated connections per named site and answers 503 past that cap.
+Peers together never hold the last eight connections, which stay free for the
+co-located gateway. The caps start over when the listener reloads its TLS
+material. It closes a connection whose response write stalls or that outlives
+five minutes. Restrict who can reach the listener with
+`loadBalancerSourceRanges` on its Service or with a NetworkPolicy.
+
 ### Authentication vs authorization
 
 Authentication answers: "is this peer really the AGN site or gateway it claims

@@ -49,7 +49,21 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
         .unwrap_or_else(|_| std::process::abort());
     r.register(Box::new(SWIM_PENDING_DROPS.clone()))
         .unwrap_or_else(|_| std::process::abort());
+    r.register(Box::new(SIGNALS_SHED.clone()))
+        .unwrap_or_else(|_| std::process::abort());
     r
+});
+
+/// Signals connections shed at accept, by the limit that shed them.
+static SIGNALS_SHED: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "grid_signals_connections_shed_total",
+            "Signals connections shed at accept",
+        ),
+        &["limit"],
+    )
+    .unwrap_or_else(|_| std::process::abort())
 });
 
 /// 1 while SWIM holds traffic for a key that has not loaded.
@@ -66,6 +80,7 @@ static SWIM_PENDING_DROPS: LazyLock<IntCounter> = LazyLock::new(|| {
     )
     .unwrap_or_else(|_| std::process::abort())
 });
+
 
 // ---------------------------------------------------------------------------
 // Peer polling
@@ -322,6 +337,11 @@ pub(crate) fn set_swim_key_pending(pending: bool) {
 /// Count an inbound SWIM packet dropped while the key is pending.
 pub(crate) fn record_swim_pending_drop() {
     SWIM_PENDING_DROPS.inc();
+}
+
+/// Count a signals connection shed by `limit`, `total` or `source`.
+pub fn record_signals_shed(limit: &str) {
+    SIGNALS_SHED.with_label_values(&[limit]).inc();
 }
 
 /// Gather all registered metrics for serialization.

@@ -42,6 +42,7 @@ k8s-openapi = { version = "0.28.0", features = ["v1_32"] }
 kube = { version = "4.2.0", default-features = false, features = ["client", "derive", "runtime"] }
 openssl = "0.10"
 openssl-sys = "0.9"
+pem = "4.0.0"
 percent-encoding = "2.3"
 prometheus = "0.14"
 rcgen = "0.14.9"
@@ -58,6 +59,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 serde_json_canonicalizer = "0.3"
 serde_yaml = "0.9"
+socket2 = "0.6.5"
 spiffe = { version = "0.16.1", default-features = false, features = ["x509"] }
 # TLS backend left to the consumer (enrollment picks rustls or system openssl).
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "postgres", "uuid", "time", "json", "migrate"] }

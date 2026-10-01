@@ -124,8 +124,8 @@ pub(crate) struct OpensslClientConfig {
     ca_roots: Vec<X509>,
     /// Optional mTLS client identity: certificate chain and private key.
     identity: Option<(Vec<X509>, PKey<Private>)>,
-    /// Declared leaf digests for a pinned peer, empty for ordinary trust.
-    pins: Vec<[u8; 32]>,
+    /// Peer identity rule beyond the chain, `None` for ordinary name trust.
+    rule: Option<LeafRule>,
     /// The connector built from the fields above, shared by every connection.
     /// Built lazily so a config derived with different pins caches its own.
     connector: OnceLock<SslConnector>,
@@ -139,7 +139,7 @@ impl std::fmt::Debug for OpensslClientConfig {
         f.debug_struct("OpensslClientConfig")
             .field("ca_roots", &self.ca_roots.len())
             .field("has_identity", &self.identity.is_some())
-            .field("pins", &self.pins.len())
+            .field("rule", &self.rule)
             .finish()
     }
 }
@@ -156,11 +156,9 @@ impl OpensslClientConfig {
             store.add_cert(ca.clone())?;
         }
         builder.set_cert_store(store.build());
-        if self.pins.is_empty() {
-            builder.set_verify(SslVerifyMode::PEER);
-        } else {
-            let pins = self.pins.clone();
-            builder.set_verify_callback(SslVerifyMode::PEER, move |ok, ctx| verify_pinned_leaf(ok, ctx, &pins));
+        match self.rule.clone() {
+            None => builder.set_verify(SslVerifyMode::PEER),
+            Some(rule) => builder.set_verify_callback(SslVerifyMode::PEER, move |ok, ctx| verify_leaf(ok, ctx, &rule)),
         }
         builder.set_min_proto_version(Some(SslVersion::TLS1_2))?;
         if let Some((certs, key)) = &self.identity {
@@ -192,9 +190,9 @@ impl OpensslClientConfig {
         Ok(self.connector.get_or_init(|| connector))
     }
 
-    /// Whether this config pins a peer's leaf key rather than trusting any name.
-    fn is_pinned(&self) -> bool {
-        !self.pins.is_empty()
+    /// Whether a leaf rule, not the name, identifies the peer.
+    fn has_leaf_rule(&self) -> bool {
+        self.rule.is_some()
     }
 }
 
@@ -425,7 +423,7 @@ pub(crate) fn build_tls_config(
     let config = OpensslClientConfig {
         ca_roots: roots,
         identity,
-        pins: Vec::new(),
+        rule: None,
         connector: OnceLock::new(),
     };
     config
@@ -693,7 +691,7 @@ pub(crate) fn build_tls_client_config(
     let config = OpensslClientConfig {
         ca_roots,
         identity,
-        pins: Vec::new(),
+        rule: None,
         connector: OnceLock::new(),
     };
     config
@@ -757,15 +755,79 @@ pub(crate) fn build_custom_tls_connector(config: &ClientTlsConfig) -> Result<Htt
     http.enforce_http(false);
     let mut connector = hyper_openssl::client::legacy::HttpsConnector::with_connector(http, builder)
         .map_err(|e| MetricsScrapeError::Transport(e.into()))?;
-    if config.is_pinned() {
-        // A pin identifies the peer by key, so the advertised IP never matches
-        // the certificate name. The pin callback is the identity check instead.
+    if config.has_leaf_rule() {
+        // The leaf rule, not the certificate name, identifies the peer.
         connector.set_callback(|cfg, _uri| {
             cfg.set_verify_hostname(false);
             Ok(())
         });
     }
     Ok(connector)
+}
+
+/// What a peer's leaf must satisfy once it chains to the grid roots.
+#[derive(Clone, Debug)]
+pub(crate) enum LeafRule {
+    /// Leaf digest is one this site declared.
+    Pins(Vec<[u8; 32]>),
+    /// Leaf carries exactly this SPIFFE ID.
+    Spiffe(String),
+}
+
+impl LeafRule {
+    /// Whether the DER leaf satisfies the rule.
+    fn accepts(&self, leaf_der: &[u8]) -> bool {
+        match self {
+            Self::Pins(pins) => pins.contains(&sha256(leaf_der)),
+            Self::Spiffe(id) => certs::leaf_spiffe_id(leaf_der).as_deref() == Some(id.as_str()),
+        }
+    }
+
+    /// The pin rule from declared fingerprints, refusing the peer when empty.
+    fn from_pins(pins: &[String]) -> Result<Self, MetricsScrapeError> {
+        if pins.is_empty() {
+            return Err(MetricsScrapeError::TlsMaterial(
+                "no declared fingerprints for this peer".to_owned(),
+            ));
+        }
+        Ok(Self::Pins(
+            pins.iter().map(|pin| decode_pin(pin)).collect::<Result<_, _>>()?,
+        ))
+    }
+}
+
+/// Client config for a peer that must present `spiffe_id`, chained to the grid roots.
+///
+/// # Errors
+///
+/// Returns [`MetricsScrapeError::TlsMaterial`] when the material cannot be parsed.
+pub(crate) fn build_spiffe_client_config(
+    ca_pem: &[u8],
+    client_cert_pem: Option<&[u8]>,
+    client_key_pem: Option<&[u8]>,
+    spiffe_id: &str,
+) -> Result<ClientTlsConfig, MetricsScrapeError> {
+    build_rule_client_config(
+        ca_pem,
+        client_cert_pem,
+        client_key_pem,
+        LeafRule::Spiffe(spiffe_id.to_owned()),
+    )
+}
+
+/// Build a client config that accepts only the leaf keys declared for one peer.
+///
+/// # Errors
+///
+/// Returns [`MetricsScrapeError::TlsMaterial`] when the material cannot be
+/// parsed, or when `pins` is empty (an undeclared peer is refused).
+pub(crate) fn build_pinned_client_config(
+    ca_pem: &[u8],
+    client_cert_pem: Option<&[u8]>,
+    client_key_pem: Option<&[u8]>,
+    pins: &[String],
+) -> Result<ClientTlsConfig, MetricsScrapeError> {
+    build_rule_client_config(ca_pem, client_cert_pem, client_key_pem, LeafRule::from_pins(pins)?)
 }
 
 /// Decode a declared fingerprint into the 32 digest bytes it names.
@@ -784,41 +846,27 @@ fn decode_pin(pin: &str) -> Result<[u8; 32], MetricsScrapeError> {
     })
 }
 
-/// Build a client config that accepts only the leaf keys declared for one peer.
-///
-/// Verifies the chain against the grid roots, then requires the leaf to match a
-/// declared pin. Hostname verification is deliberately skipped: peers are
-/// dialled at an advertised IP, so the pin, not the name, is the identity.
-///
-/// # Errors
-///
-/// Returns [`MetricsScrapeError::TlsMaterial`] when the material cannot be
-/// parsed, or when `pins` is empty (an undeclared peer is refused).
+/// Verify the chain against the grid roots and the leaf against `rule`, not the hostname.
 #[cfg(not(feature = "fips"))]
-pub(crate) fn build_pinned_client_config(
+fn build_rule_client_config(
     ca_pem: &[u8],
     client_cert_pem: Option<&[u8]>,
     client_key_pem: Option<&[u8]>,
-    pins: &[String],
+    rule: LeafRule,
 ) -> Result<ClientTlsConfig, MetricsScrapeError> {
-    if pins.is_empty() {
-        return Err(MetricsScrapeError::TlsMaterial(
-            "no declared fingerprints for this peer".to_owned(),
-        ));
-    }
     let mut config = build_tls_client_config(ca_pem, client_cert_pem, client_key_pem)?;
-    let verifier = pinned_verifier(ca_pem, pins, config.crypto_provider().signature_verification_algorithms)?;
+    let verifier = leaf_rule_verifier(ca_pem, rule, config.crypto_provider().signature_verification_algorithms)?;
     config.dangerous().set_certificate_verifier(Arc::new(verifier));
     Ok(Arc::new(config))
 }
 
-/// The verifier [`build_pinned_client_config`] installs.
+/// The verifier [`build_rule_client_config`] installs.
 #[cfg(not(feature = "fips"))]
-fn pinned_verifier(
+fn leaf_rule_verifier(
     ca_pem: &[u8],
-    pins: &[String],
+    rule: LeafRule,
     algorithms: rustls::crypto::WebPkiSupportedAlgorithms,
-) -> Result<PinnedPeer, MetricsScrapeError> {
+) -> Result<LeafRuleVerifier, MetricsScrapeError> {
     let mut roots = rustls::RootCertStore::empty();
     for cert in CertificateDer::pem_slice_iter(ca_pem) {
         let cert = cert.map_err(|e| MetricsScrapeError::TlsMaterial(format!("CA PEM parse failed: {e}")))?;
@@ -826,33 +874,27 @@ fn pinned_verifier(
             .add(cert)
             .map_err(|e| MetricsScrapeError::TlsMaterial(format!("CA rejected: {e}")))?;
     }
-    let pins = pins.iter().map(|pin| decode_pin(pin)).collect::<Result<_, _>>()?;
-    Ok(PinnedPeer {
+    Ok(LeafRuleVerifier {
         roots: Arc::new(roots),
         algorithms,
-        pins,
+        rule,
     })
 }
 
-/// Accepts a peer whose leaf certificate is one this site declared.
-///
-/// The chain is verified against the grid roots, then the leaf digest must be a
-/// declared pin. Hostname verification is not performed: membership advertises
-/// an IP and a site certificate carries a DNS name, so the two never match, and
-/// the pin is the stronger statement anyway.
+/// Accepts a peer whose chain verifies and whose leaf satisfies its [`LeafRule`], never checking the hostname.
 #[cfg(not(feature = "fips"))]
 #[derive(Debug)]
-pub(crate) struct PinnedPeer {
+pub(crate) struct LeafRuleVerifier {
     /// Authorities the chain is verified against.
     roots: Arc<rustls::RootCertStore>,
     /// Algorithms the chain and its signatures may use.
     algorithms: rustls::crypto::WebPkiSupportedAlgorithms,
-    /// Digests this site declared for the peer, decoded once.
-    pins: Vec<[u8; 32]>,
+    /// What the leaf must satisfy.
+    rule: LeafRule,
 }
 
 #[cfg(not(feature = "fips"))]
-impl rustls::client::danger::ServerCertVerifier for PinnedPeer {
+impl rustls::client::danger::ServerCertVerifier for LeafRuleVerifier {
     fn verify_server_cert(
         &self,
         end_entity: &CertificateDer<'_>,
@@ -869,12 +911,11 @@ impl rustls::client::danger::ServerCertVerifier for PinnedPeer {
             now,
             self.algorithms.all,
         )?;
-        let presented = sha256(end_entity);
-        if self.pins.contains(&presented) {
+        if self.rule.accepts(end_entity) {
             return Ok(rustls::client::danger::ServerCertVerified::assertion());
         }
         Err(rustls::Error::General(
-            "peer presented a certificate this site has not declared".to_owned(),
+            "peer presented a certificate this site does not accept for it".to_owned(),
         ))
     }
 
@@ -901,51 +942,30 @@ impl rustls::client::danger::ServerCertVerifier for PinnedPeer {
     }
 }
 
-/// Build a client config that accepts only the leaf keys declared for one peer.
-///
-/// Verifies the chain against the grid roots, then requires the leaf to match a
-/// declared pin. Hostname verification is deliberately skipped: peers are
-/// dialled at an advertised IP, so the pin, not the name, is the identity.
-///
-/// # Errors
-///
-/// Returns [`MetricsScrapeError::TlsMaterial`] when the material cannot be
-/// parsed, or when `pins` is empty (an undeclared peer is refused).
+/// Verify the chain against the grid roots and the leaf against `rule`, not the hostname.
 #[cfg(feature = "fips")]
-pub(crate) fn build_pinned_client_config(
+fn build_rule_client_config(
     ca_pem: &[u8],
     client_cert_pem: Option<&[u8]>,
     client_key_pem: Option<&[u8]>,
-    pins: &[String],
+    rule: LeafRule,
 ) -> Result<ClientTlsConfig, MetricsScrapeError> {
-    if pins.is_empty() {
-        return Err(MetricsScrapeError::TlsMaterial(
-            "no declared fingerprints for this peer".to_owned(),
-        ));
-    }
     let base = build_tls_client_config(ca_pem, client_cert_pem, client_key_pem)?;
-    let pins = pins.iter().map(|pin| decode_pin(pin)).collect::<Result<_, _>>()?;
-    // A fresh cache: the pins change the verify callback, so this config must
-    // build its own connector rather than inherit the unpinned base's.
+    // A fresh cache: the rule changes the verify callback.
     Ok(Arc::new(OpensslClientConfig {
-        pins,
+        rule: Some(rule),
         connector: OnceLock::new(),
         ..base
     }))
 }
 
-/// Verify callback for a pinned peer: standard chain checks, plus the leaf
-/// digest must be a declared pin.
-///
-/// `preverify_ok` already carries the trust-anchor and validity result because
-/// no verification hostname is set, so a match here means the chain is valid and
-/// the leaf is one this site declared.
+/// Verify callback for a peer: `preverify_ok` carries the chain result with no hostname set, then the leaf rule.
 #[cfg(feature = "fips")]
 #[expect(
     clippy::needless_pass_by_ref_mut,
     reason = "the &mut is dictated by openssl's set_verify_callback signature"
 )]
-fn verify_pinned_leaf(preverify_ok: bool, ctx: &mut X509StoreContextRef, pins: &[[u8; 32]]) -> bool {
+fn verify_leaf(preverify_ok: bool, ctx: &mut X509StoreContextRef, rule: &LeafRule) -> bool {
     if !preverify_ok {
         return false;
     }
@@ -958,8 +978,7 @@ fn verify_pinned_leaf(preverify_ok: bool, ctx: &mut X509StoreContextRef, pins: &
     let Ok(der) = cert.to_der() else {
         return false;
     };
-    let digest = sha256(&der);
-    pins.contains(&digest)
+    rule.accepts(&der)
 }
 
 /// Perform the client TLS handshake over an established TCP stream.
@@ -998,9 +1017,8 @@ pub(crate) async fn connect(
     let ssl = connector
         .configure()
         .and_then(|mut c| {
-            // A pinned config identifies the peer by key, not name, so the
-            // config alone determines this regardless of the call path.
-            if config.is_pinned() {
+            // The leaf rule, not the name, identifies the peer on every call path.
+            if config.has_leaf_rule() {
                 c.set_verify_hostname(false);
             }
             c.into_ssl(server_name.as_str())
@@ -1060,6 +1078,8 @@ pub struct OpensslServerConfig {
     chain: Vec<X509>,
     /// Private key for `leaf`.
     key: PKey<Private>,
+    /// Whether a client certificate is required.
+    require_client: bool,
     /// The acceptor built from the fields above, shared by every connection.
     acceptor: OnceLock<SslAcceptor>,
 }
@@ -1077,8 +1097,7 @@ impl std::fmt::Debug for OpensslServerConfig {
 
 #[cfg(feature = "fips")]
 impl OpensslServerConfig {
-    /// Build an acceptor with the site identity and client auth that is optional
-    /// but verified against the grid roots when a certificate is presented.
+    /// Build an acceptor with the site identity, requiring a client certificate from the grid roots.
     fn acceptor_builder(&self) -> Result<SslAcceptorBuilder, openssl::error::ErrorStack> {
         let mut builder = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls_server())?;
         builder.set_private_key(&self.key)?;
@@ -1092,10 +1111,13 @@ impl OpensslServerConfig {
             store.add_cert(ca.clone())?;
         }
         builder.set_verify_cert_store(store.build())?;
-        // PEER without FAIL_IF_NO_PEER_CERT: no certificate is allowed (the
-        // gateway and peers differ by which one they present), but a presented
-        // certificate must verify.
-        builder.set_verify(SslVerifyMode::PEER);
+        // Anonymous callers would only hold slots.
+        let mode = if self.require_client {
+            SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT
+        } else {
+            SslVerifyMode::PEER
+        };
+        builder.set_verify(mode);
         Ok(builder)
     }
 
@@ -1117,16 +1139,33 @@ impl OpensslServerConfig {
 
 /// Build the signals listener TLS config from PEM material.
 ///
-/// Client auth is not forced at the TLS layer: the co-located gateway and a
-/// peer each present their own certificate, and the scope rule reads the
-/// difference. A presented certificate is verified against the grid roots. A
-/// caller presenting none, or an unpinned one, is refused by the scope rule.
+/// A Grid-CA client certificate is required, and the scope rule reads whose it is.
 ///
 /// # Errors
 ///
 /// Returns a description when the CA, certificate, or key cannot be parsed.
-#[cfg(not(feature = "fips"))]
 pub fn build_server_config(ca_pem: &[u8], cert_pem: &[u8], key_pem: &[u8]) -> Result<ServerTlsConfig, String> {
+    server_config(ca_pem, cert_pem, key_pem, true)
+}
+
+/// Like [`build_server_config`] with the client certificate optional, for test servers.
+#[cfg(test)]
+pub(crate) fn build_server_config_optional_client(
+    ca_pem: &[u8],
+    cert_pem: &[u8],
+    key_pem: &[u8],
+) -> Result<ServerTlsConfig, String> {
+    server_config(ca_pem, cert_pem, key_pem, false)
+}
+
+/// Server TLS from PEM material, a Grid-CA client certificate required when `require_client`.
+#[cfg(not(feature = "fips"))]
+fn server_config(
+    ca_pem: &[u8],
+    cert_pem: &[u8],
+    key_pem: &[u8],
+    require_client: bool,
+) -> Result<ServerTlsConfig, String> {
     let mut roots = rustls::RootCertStore::empty();
     for cert in CertificateDer::pem_slice_iter(ca_pem) {
         let cert = cert.map_err(|e| format!("signals TLS: CA is not valid PEM: {e}"))?;
@@ -1136,10 +1175,14 @@ pub fn build_server_config(ca_pem: &[u8], cert_pem: &[u8], key_pem: &[u8]) -> Re
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| format!("signals TLS: certificate is not valid PEM: {e}"))?;
     let key = PrivateKeyDer::from_pem_slice(key_pem).map_err(|e| format!("signals TLS: key is not valid PEM: {e}"))?;
-    let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
-        .allow_unauthenticated()
-        .build()
-        .map_err(|e| format!("signals TLS: client verifier: {e}"))?;
+    let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots));
+    let verifier = if require_client {
+        verifier
+    } else {
+        verifier.allow_unauthenticated()
+    }
+    .build()
+    .map_err(|e| format!("signals TLS: client verifier: {e}"))?;
     rustls::ServerConfig::builder()
         .with_client_cert_verifier(verifier)
         .with_single_cert(chain, key)
@@ -1147,19 +1190,14 @@ pub fn build_server_config(ca_pem: &[u8], cert_pem: &[u8], key_pem: &[u8]) -> Re
         .map_err(|e| format!("signals TLS: server config: {e}"))
 }
 
-/// Build the signals listener TLS config from PEM material.
-///
-/// Client auth is not forced at the TLS layer: the co-located gateway and a
-/// peer each present their own certificate, and the scope rule reads the
-/// difference. A presented certificate is verified against the grid roots. A
-/// caller presenting none, or an unpinned one, is refused by the scope rule.
-///
-/// # Errors
-///
-/// Returns a description when the CA, certificate, or key cannot be parsed, or
-/// when the certificate PEM carries no certificate.
+/// Server TLS from PEM material, a Grid-CA client certificate required when `require_client`.
 #[cfg(feature = "fips")]
-pub fn build_server_config(ca_pem: &[u8], cert_pem: &[u8], key_pem: &[u8]) -> Result<ServerTlsConfig, String> {
+fn server_config(
+    ca_pem: &[u8],
+    cert_pem: &[u8],
+    key_pem: &[u8],
+    require_client: bool,
+) -> Result<ServerTlsConfig, String> {
     let ca_roots = X509::stack_from_pem(ca_pem).map_err(|e| format!("signals TLS: CA is not valid PEM: {e}"))?;
     if ca_roots.is_empty() {
         return Err("signals TLS: CA PEM contains no certificates".to_owned());
@@ -1177,6 +1215,7 @@ pub fn build_server_config(ca_pem: &[u8], cert_pem: &[u8], key_pem: &[u8]) -> Re
         leaf,
         chain,
         key,
+        require_client,
         acceptor: OnceLock::new(),
     };
     config

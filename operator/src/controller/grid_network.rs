@@ -113,8 +113,18 @@ pub struct OperatorCtx {
     /// overlay, and the gateway ranks from the signal it pulls instead.
     pub(crate) signal_mode: SignalMode,
 
+    /// Peer addressing and trust, resolved once at startup.
+    pub(crate) peer_settings: PeerSettings,
+
     /// Whether membership-derived writes may run, cleared while SWIM converges.
     membership_ready: std::sync::atomic::AtomicBool,
+}
+
+/// Peer addressing and trust, resolved once at startup.
+#[derive(Clone, Debug, Default)]
+pub struct PeerSettings {
+    /// How peers prove their identity.
+    pub trust: signals::PeerTrustMode,
 }
 
 /// Requeue for a reconcile held while SWIM membership converges.
@@ -137,6 +147,7 @@ impl OperatorCtx {
             peers: signals::SignalStore::new(),
             signals: signals::SignalStore::new(),
             signal_mode,
+            peer_settings: PeerSettings::default(),
             membership_ready: std::sync::atomic::AtomicBool::new(true),
         }
     }
@@ -169,6 +180,19 @@ impl OperatorCtx {
     /// Install the SWIM runtime once it starts, `false` if one already was.
     pub fn set_swim(&self, handle: Arc<SwimHandle>) -> bool {
         self.swim.set(handle).is_ok()
+    }
+
+    /// Peer settings resolved at startup.
+    #[must_use]
+    pub fn peer_settings(&self) -> &PeerSettings {
+        &self.peer_settings
+    }
+
+    /// Replace the peer settings resolved at startup.
+    #[must_use]
+    pub fn with_peer_settings(mut self, settings: PeerSettings) -> Self {
+        self.peer_settings = settings;
+        self
     }
 
     /// A handle to what this site publishes, for the signals listener.
@@ -228,7 +252,8 @@ pub async fn refresh_signals(ctx: &OperatorCtx, client: &Client, network_name: &
 /// Refresh who may read from the currently approved sites.
 async fn register_peers(ctx: &OperatorCtx, client: &Client) -> Result<(), OperatorError> {
     let sites = list_all_grid_sites(client).await?;
-    ctx.peer_identities.set(peer_identities(&sites));
+    ctx.peer_identities
+        .set(peer_identities(&sites, ctx.peer_settings.trust));
     Ok(())
 }
 
@@ -239,7 +264,11 @@ async fn register_peers(ctx: &OperatorCtx, client: &Client) -> Result<(), Operat
 /// rotation. `status` is deliberately not read: it is populated from gossip,
 /// and a member could advertise its own certificate under another site's name.
 /// The labels are the local object's for the same reason.
-fn peer_identities(sites: &[GridSite]) -> std::collections::BTreeMap<String, signals::PeerRecord> {
+fn peer_identities(
+    sites: &[GridSite],
+    trust: signals::PeerTrustMode,
+) -> std::collections::BTreeMap<String, signals::PeerRecord> {
+    let pinned = trust == signals::PeerTrustMode::Pin;
     sites
         .iter()
         .filter_map(|site| {
@@ -250,7 +279,8 @@ fn peer_identities(sites: &[GridSite]) -> std::collections::BTreeMap<String, sig
                     .spec
                     .trust
                     .as_ref()
-                    .and_then(|trust| trust.canonical_fingerprints.as_deref())
+                    .filter(|_| pinned)
+                    .and_then(|site_trust| site_trust.canonical_fingerprints.as_deref())
                     .unwrap_or_default()
                     .iter()
                     .map(|fp| signals::canonical_fingerprint(fp))
@@ -345,22 +375,31 @@ pub async fn signals_server_config(network: &GridNetwork, client: &Client) -> Re
     crate::resources::tls_backend::build_server_config(&ca_pem, &cert_pem, &key_pem).map(Some)
 }
 
-/// This site's own certificate fingerprint, for recognising its own workloads.
-///
-/// The gateway shares the site's identity: it presents the same certificate the
-/// operator serves with, so recognising that key needs no declaration.
+/// This site's own leaf, as its co-located gateway presents it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OwnLeaf {
+    /// SHA-256 of the leaf DER.
+    pub fingerprint: String,
+    /// The leaf's grid SPIFFE ID, when it carries one.
+    pub spiffe: Option<String>,
+}
+
+/// This site's own leaf, for recognising its own workloads, `None` without TLS.
 ///
 /// # Errors
 ///
 /// Returns a message when the configured material cannot be read or parsed.
-pub async fn signals_own_key(network: &GridNetwork, client: &Client) -> Result<Option<String>, String> {
+pub async fn own_leaf_identity(network: &GridNetwork, client: &Client) -> Result<Option<OwnLeaf>, String> {
     let Some(site) = &network.spec.tls.site_secret_ref else {
         return Ok(None);
     };
     let cert_pem = read_signals_pem(client, site, "tls.crt").await?;
     let pem = std::str::from_utf8(&cert_pem).map_err(|_e| "signals TLS: certificate is not valid UTF-8".to_owned())?;
     let der = crate::resources::tls_backend::first_cert_der_from_pem(pem).map_err(str::to_owned)?;
-    Ok(Some(signals::leaf_fingerprint(&der)))
+    Ok(Some(OwnLeaf {
+        fingerprint: signals::leaf_fingerprint(&der),
+        spiffe: certs::leaf_spiffe_id(&der),
+    }))
 }
 
 /// Read one PEM value out of a Secret.
@@ -520,6 +559,15 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
             ?desired,
             running = ?ctx.signal_mode,
             "signalTransport.mode differs from the mode resolved at startup; restart the operator to apply"
+        );
+    }
+    let desired_trust = network.spec.peer_trust.as_ref().map(|t| t.mode).unwrap_or_default();
+    if desired_trust != ctx.peer_settings.trust {
+        tracing::warn!(
+            network = name,
+            desired = ?desired_trust,
+            running = ?ctx.peer_settings.trust,
+            "peerTrust.mode differs from the mode resolved at startup; restart the operator to apply"
         );
     }
 
@@ -3166,6 +3214,7 @@ mod tests {
                     age_secs: 0,
                     gateway_address: None,
                     site_cert_pem: None,
+                    signals_address: None,
                 })
                 .collect(),
         }
@@ -3181,6 +3230,7 @@ mod tests {
                 age_secs: 5,
                 gateway_address: None,
                 site_cert_pem: None,
+                signals_address: None,
             }],
         }
     }
@@ -3709,6 +3759,7 @@ mod tests {
                 age_secs: 0,
                 gateway_address: None,
                 site_cert_pem: None,
+                signals_address: None,
             }],
         }
     }
@@ -3838,6 +3889,7 @@ mod tests {
                     age_secs: 0,
                     gateway_address: None,
                     site_cert_pem: None,
+                    signals_address: None,
                 },
                 MemberRecord {
                     site_id: "site-east".to_owned(),
@@ -3847,6 +3899,7 @@ mod tests {
                     age_secs: 0,
                     gateway_address: None,
                     site_cert_pem: None,
+                    signals_address: None,
                 },
             ],
         };
@@ -3972,6 +4025,7 @@ mod tests {
             age_secs: 0,
             gateway_address: None,
             site_cert_pem: None,
+            signals_address: None,
         }
     }
 
@@ -4049,6 +4103,7 @@ mod tests {
             age_secs: 0,
             gateway_address: Some("10.0.0.2:19080".to_owned()),
             site_cert_pem: None,
+            signals_address: None,
         }]);
         let sites = discovered_sites_from_swim("net", "local", &snap);
         assert_eq!(sites.len(), 1, "exactly one remote Alive member");
@@ -4069,6 +4124,7 @@ mod tests {
             age_secs: 0,
             gateway_address: None,
             site_cert_pem: None,
+            signals_address: None,
         }]);
         let sites = discovered_sites_from_swim("net", "local", &snap);
         assert_eq!(sites.len(), 1, "exactly one remote Alive member");
@@ -4090,6 +4146,7 @@ mod tests {
             age_secs: 0,
             gateway_address: Some("10.0.0.2:8080".to_owned()),
             site_cert_pem: Some(sentinel_cert.to_owned()),
+            signals_address: None,
         }]);
         let sites = discovered_sites_from_swim("net", "local", &snap);
         let site = sites.first().unwrap_or_else(|| std::process::abort());
@@ -4110,6 +4167,7 @@ mod tests {
             age_secs: 0,
             gateway_address: None,
             site_cert_pem: None,
+            signals_address: None,
         }]);
         let sites = discovered_sites_from_swim("net", "local", &snap);
         let site = sites.first().unwrap_or_else(|| std::process::abort());
@@ -4133,6 +4191,7 @@ mod tests {
             age_secs: 0,
             gateway_address: Some("10.0.0.2:8080".to_owned()),
             site_cert_pem: Some(sentinel_cert.to_owned()),
+            signals_address: None,
         }]);
         let sites = discovered_sites_from_swim("net", "local", &snap);
         let site = sites.first().unwrap_or_else(|| std::process::abort());

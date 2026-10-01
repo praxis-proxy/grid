@@ -158,7 +158,7 @@ async fn serve_conn(tls: tls_backend::ServerTlsConfig, app: Router, stream: toki
 /// Serve `mock` on `listener` in the background.
 fn serve_on(mock: &Arc<Mock>, listener: tokio::net::TcpListener) {
     let server = certs::generate_dns_cert(&mock.ca, "localhost", "localhost").expect("server cert");
-    let tls = tls_backend::build_server_config(
+    let tls = tls_backend::build_server_config_optional_client(
         mock.ca.cert_pem.as_bytes(),
         server.cert_pem.as_bytes(),
         server.key_pem.as_bytes(),

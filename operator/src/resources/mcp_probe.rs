@@ -53,7 +53,7 @@ use crate::{
 /// `169.254.169.254`, which the 169.254.0.0/16 link-local check already
 /// blocks) since Alibaba's metadata service sits in RFC 6598 shared address
 /// space, not the link-local range.
-const ALIBABA_CLOUD_METADATA_V4: Ipv4Addr = Ipv4Addr::new(100, 100, 100, 200);
+pub(crate) const ALIBABA_CLOUD_METADATA_V4: Ipv4Addr = Ipv4Addr::new(100, 100, 100, 200);
 
 /// Stable `status.reason` for any of `attach_tls_client_identity`'s three
 /// client-identity failure modes (unparseable cert, unparseable key, or a
@@ -366,7 +366,7 @@ pub(crate) fn validate_probe_url(url: &str) -> McpUrlValidation {
 }
 
 /// Hostnames that resolve to loopback without a DNS lookup.
-fn is_blocked_hostname(host: &str) -> bool {
+pub(crate) fn is_blocked_hostname(host: &str) -> bool {
     let lower = host.to_ascii_lowercase();
     lower == "localhost" || lower.ends_with(".localhost")
 }

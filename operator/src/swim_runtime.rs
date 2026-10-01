@@ -35,13 +35,13 @@ use std::{
 };
 
 use crdt::GridStateSnapshot;
-use futures::{Stream, stream};
+use futures::{Stream, future::BoxFuture, stream};
 use swim::{MemberEvent, NodeId, SwimNode, runtime::TimerEvent};
 use tokio::{
     net::UdpSocket,
     sync::{
         mpsc::{self, error::TrySendError},
-        watch,
+        oneshot, watch,
     },
 };
 
@@ -91,6 +91,9 @@ pub struct SwimConfig {
     /// announce to this node to join.
     pub seeds: Vec<SocketAddr>,
 
+    /// Signals `host:port` advertised to peers, `None` when this site serves none.
+    pub signals_address: Option<String>,
+
     /// Data-plane gateway address to advertise in SWIM state broadcasts.
     ///
     /// When set, this address is included in outbound `StateBroadcast` messages
@@ -103,7 +106,16 @@ pub struct SwimConfig {
 
     /// Revision range and node generation reserved durably before startup.
     pub revision_lease: RevisionLease,
+
+    /// Persists the next revision range as the lease runs low, `None` to stop at its end.
+    pub revision_renewer: Option<RevisionRenewer>,
 }
+
+/// Persists a revision range past the given last revision before any of it is used, returning its bounds.
+pub type RevisionRenewer = Arc<dyn Fn(u64) -> BoxFuture<'static, RenewedRange> + Send + Sync>;
+
+/// Inclusive bounds of a persisted revision range, or why it was not.
+pub type RenewedRange = Result<(u64, u64), String>;
 
 /// SWIM packet protection.
 #[derive(Clone)]
@@ -227,8 +239,10 @@ impl std::fmt::Debug for SwimConfig {
             .field("site_name", &self.site_name)
             .field("seeds", &self.seeds)
             .field("gateway_address", &self.gateway_address)
+            .field("signals_address", &self.signals_address)
             .field("key", &self.key)
             .field("revision_lease", &self.revision_lease)
+            .field("revision_renewer", &self.revision_renewer.is_some())
             .finish()
     }
 }
@@ -341,38 +355,92 @@ impl TrackedMember {
                 .map_or(0, |t| now.saturating_duration_since(t).as_secs()),
             gateway_address: self.gateway_address.clone(),
             site_cert_pem: self.site_cert_pem.clone(),
+            signals_address: None,
         }
     }
 }
 
-/// Build a [`MembershipSnapshot`] from the current tracked member table.
+/// Per-site metadata received over gossip, keyed by site, borrowed from the node.
+#[derive(Clone, Copy)]
+struct PeerMetadata<'meta> {
+    /// Data-plane gateway addresses.
+    gateway_addrs: &'meta BTreeMap<String, String>,
+    /// Public site certificate PEMs.
+    cert_pems: &'meta BTreeMap<String, String>,
+    /// Signals addresses.
+    signals_addrs: &'meta BTreeMap<String, String>,
+}
+
+/// No metadata, for a snapshot before any gossip.
+static NO_METADATA: BTreeMap<String, String> = BTreeMap::new();
+
+impl Default for PeerMetadata<'static> {
+    fn default() -> Self {
+        Self {
+            gateway_addrs: &NO_METADATA,
+            cert_pems: &NO_METADATA,
+            signals_addrs: &NO_METADATA,
+        }
+    }
+}
+
+/// Build a [`MembershipSnapshot`] from the tracked members and gossiped metadata, ordered by site.
 ///
-/// `now` is injected so callers can use a fixed [`Instant`] for deterministic
-/// testing without sleeps.  In production, pass [`Instant::now()`].
-///
-/// `gateway_addrs` is a map of site names to their data-plane gateway addresses,
-/// obtained from the [`StateBroadcastHandler`].  `cert_pems` is a map of site
-/// names to their public site certificate PEMs.  Both maps are used to enrich
-/// each [`MemberRecord`] in the returned snapshot.
-///
-/// [`StateBroadcastHandler`]: swim::StateBroadcastHandler
+/// `now` is injected so tests can use a fixed [`Instant`].
 fn members_snapshot(
     tracked: &HashMap<String, TrackedMember>,
     now: Instant,
-    gateway_addrs: &BTreeMap<String, String>,
-    cert_pems: &BTreeMap<String, String>,
+    metadata: &PeerMetadata<'_>,
 ) -> MembershipSnapshot {
-    MembershipSnapshot {
-        members: tracked
-            .values()
-            .map(|t| {
-                let mut record = t.to_member_record(now);
-                record.gateway_address = gateway_addrs.get(&t.site_id).cloned();
-                record.site_cert_pem = cert_pems.get(&t.site_id).cloned();
-                record
-            })
-            .collect(),
-    }
+    let mut members: Vec<MemberRecord> = tracked
+        .values()
+        .map(|t| {
+            let mut record = t.to_member_record(now);
+            record.gateway_address = metadata.gateway_addrs.get(&t.site_id).cloned();
+            record.site_cert_pem = metadata.cert_pems.get(&t.site_id).cloned();
+            record.signals_address = metadata.signals_addrs.get(&t.site_id).cloned();
+            record
+        })
+        .collect();
+    members.sort_by(|left, right| left.site_id.cmp(&right.site_id));
+    MembershipSnapshot { members }
+}
+
+/// Publish the membership view, waking readers only when it changed.
+fn publish_members(
+    snapshot_tx: &watch::Sender<MembershipSnapshot>,
+    tracked: &HashMap<String, TrackedMember>,
+    now: Instant,
+    node: &SwimNode,
+) {
+    let snapshot = node.with_peer_metadata(|gateway_addrs, cert_pems, signals_addrs| {
+        let metadata = PeerMetadata {
+            gateway_addrs,
+            cert_pems,
+            signals_addrs,
+        };
+        members_snapshot(tracked, now, &metadata)
+    });
+    snapshot_tx.send_if_modified(|current| {
+        let changed = *current != snapshot;
+        if changed {
+            *current = snapshot;
+        }
+        changed
+    });
+}
+
+/// Publish the merged grid state, cloning and waking readers only when it changed.
+fn publish_state(state_tx: &watch::Sender<GridStateSnapshot>, node: &SwimNode) {
+    node.with_state(|state| {
+        state_tx.send_if_modified(|current| {
+            let changed = current != state;
+            if changed {
+                current.clone_from(state);
+            }
+            changed
+        })
+    });
 }
 
 /// Return true when any tracked member needs age recomputation in snapshots.
@@ -424,17 +492,26 @@ const MAX_NON_ALIVE_MEMBERS: usize = 512;
 /// Identities held per site, enough for a rolling update and its leftovers.
 const MAX_IDENTITIES_PER_SITE: usize = 16;
 
-/// Process-local allocator over a range reserved durably before startup.
+/// Wait before retrying a failed revision renewal.
+const RENEWAL_RETRY: Duration = Duration::from_secs(5);
+
+/// Process-local allocator over durably reserved ranges, renewed before the current one runs out.
 struct RevisionClock {
-    /// Next unused revision in this process's durable lease.
+    /// Next unused revision in the current range.
     next: u64,
-    /// Inclusive upper bound of this process's durable lease.
+    /// Inclusive upper bound of the current range.
     last: u64,
+    /// Persists the next range, `None` to stop at the end of this one.
+    renewer: Option<RevisionRenewer>,
+    /// The renewal in flight.
+    renewal: Option<oneshot::Receiver<RenewedRange>>,
+    /// No renewal starts before this, after a failure.
+    retry_at: Option<Instant>,
 }
 
 impl RevisionClock {
     /// Validate and initialize an allocator over a durable lease.
-    fn new(lease: &RevisionLease) -> Result<Self, SwimRuntimeError> {
+    fn new(lease: &RevisionLease, renewer: Option<RevisionRenewer>) -> Result<Self, SwimRuntimeError> {
         if lease.first_revision == 0 || lease.first_revision > lease.last_revision {
             return Err(SwimRuntimeError::InvalidRevisionLease {
                 first: lease.first_revision,
@@ -444,17 +521,57 @@ impl RevisionClock {
         Ok(Self {
             next: lease.first_revision,
             last: lease.last_revision,
+            renewer,
+            renewal: None,
+            retry_at: None,
         })
     }
 
-    /// Return the next reserved revision, or `None` after lease exhaustion.
+    /// Return the next reserved revision, or `None` while no range has one left.
     fn take(&mut self) -> Option<u64> {
-        let revision = self.next;
-        if revision > self.last {
-            return None;
+        self.adopt_renewal();
+        let revision = (self.next <= self.last).then_some(self.next);
+        self.next = self.next.saturating_add(u64::from(revision.is_some()));
+        if self.last.saturating_sub(self.next) < swim::state_broadcast::REVISION_LEASE_SPAN / 2 {
+            self.renew();
         }
-        self.next = self.next.saturating_add(1);
-        Some(revision)
+        revision
+    }
+
+    /// Switch to a renewed range once it is persisted.
+    fn adopt_renewal(&mut self) {
+        let Some(renewal) = self.renewal.as_mut() else {
+            return;
+        };
+        let outcome = match renewal.try_recv() {
+            Err(oneshot::error::TryRecvError::Empty) => return,
+            Ok(Ok((first, last))) if first != 0 && first <= last => {
+                (self.next, self.last) = (first, last);
+                None
+            },
+            Ok(Ok((first, last))) => Some(format!("invalid range {first}..={last}")),
+            Ok(Err(error)) => Some(error),
+            Err(oneshot::error::TryRecvError::Closed) => Some("renewal task stopped".to_owned()),
+        };
+        self.renewal = None;
+        if let Some(error) = outcome {
+            tracing::warn!(%error, "SWIM revision renewal failed; retrying");
+            self.retry_at = Some(Instant::now() + RENEWAL_RETRY);
+        }
+    }
+
+    /// Start persisting the next range unless one is in flight or a retry is pending.
+    fn renew(&mut self) {
+        if self.renewal.is_some() || self.retry_at.is_some_and(|at| Instant::now() < at) {
+            return;
+        }
+        let Some(renewer) = &self.renewer else {
+            return;
+        };
+        let (done, renewal) = oneshot::channel();
+        let pending = renewer(self.last);
+        tokio::spawn(async move { drop(done.send(pending.await)) });
+        self.renewal = Some(renewal);
     }
 }
 
@@ -884,6 +1001,8 @@ struct ReconciliationMember {
     gateway_address: Option<String>,
     /// Peer public certificate.
     site_cert_pem: Option<String>,
+    /// Peer signals address.
+    signals_address: Option<String>,
 }
 
 /// Build the deduplicated view used by [`SwimHandle::reconciliation_events`].
@@ -907,6 +1026,7 @@ fn reconciliation_view(
             non_alive_age_secs: (member.status != MemberStatus::Alive).then_some(member.age_secs / 5),
             gateway_address: member.gateway_address.clone(),
             site_cert_pem: member.site_cert_pem.clone(),
+            signals_address: member.signals_address.clone(),
         })
         .collect();
     members.sort();
@@ -939,7 +1059,7 @@ fn reconciliation_view(
     reason = "channel setup, socket bind, runtime spawn — linear startup sequence"
 )]
 pub async fn start(config: SwimConfig) -> Result<Arc<SwimHandle>, SwimRuntimeError> {
-    let revisions = RevisionClock::new(&config.revision_lease)?;
+    let revisions = RevisionClock::new(&config.revision_lease, config.revision_renewer.clone())?;
     if config.revision_lease.first_node_generation == 0
         || config.revision_lease.first_node_generation > config.revision_lease.last_node_generation
     {
@@ -1081,9 +1201,13 @@ async fn run_loop(
             .unwrap_or(DEFAULT_DEAD_MEMBER_TTL_SECS),
     );
 
-    if let Some(addr) = gateway_address.as_deref() {
-        publish_gateway_address_broadcast(&mut node, &site_name, gateway_address_revision, addr);
-    }
+    publish_address_broadcast(
+        &mut node,
+        &site_name,
+        gateway_address_revision,
+        gateway_address.as_deref(),
+        config.signals_address.as_deref(),
+    );
 
     // Announce to seed peers.  Errors are logged inside SwimNode::announce.
     let startup_key = key_rx.borrow_and_update().clone();
@@ -1096,8 +1220,7 @@ async fn run_loop(
             &channels.timer_tx,
             &mut tracked,
             &channels.snapshot_tx,
-            &node.gateway_addrs(),
-            &node.cert_pems(),
+            &node,
             &startup_key,
         )
         .await;
@@ -1132,49 +1255,48 @@ async fn run_loop(
                             &channels.timer_tx,
                             &mut tracked,
                             &channels.snapshot_tx,
-                            &node.gateway_addrs(),
-                            &node.cert_pems(),
+                            &node,
                             &key,
                         )
                         .await;
                         // Publish updated CRDT state after every incoming UDP packet.
                         // Broadcasts are received inside handle_data, so the snapshot
                         // may have advanced.
-                        drop(state_tx.send(node.state_snapshot()));
+                        publish_state(&state_tx, &node);
                         // Gateway-address-only broadcasts update the node's gateway-address
                         // map but may not emit a membership event.  Republish the
                         // membership snapshot after every inbound packet so callers see the
                         // latest gateway address attached to already-known members.
-                        drop(channels.snapshot_tx.send(members_snapshot(&tracked, Instant::now(), &node.gateway_addrs(), &node.cert_pems())));
-                        if let Some(gateway_address) = gateway_address.as_deref() {
-                            let now = Instant::now();
-                            if now >= next_gateway_republish_at {
-                                let Some(revision) = revisions.take() else {
-                                    tracing::error!("SWIM revision lease exhausted during gateway republish");
-                                    return;
-                                };
-                                gateway_address_revision = revision;
-                                publish_gateway_address_broadcast(
-                                    &mut node,
-                                    &site_name,
-                                    gateway_address_revision,
-                                    gateway_address,
-                                );
-                                let gossip_output = node.gossip();
-                                drain_output(
-                                    gossip_output,
-                                    &socket,
-                                    &channels.timer_tx,
-                                    &mut tracked,
-                                    &channels.snapshot_tx,
-                                    &node.gateway_addrs(),
-                                    &node.cert_pems(),
-                                    &key,
-                                )
-                                .await;
-                                drop(state_tx.send(node.state_snapshot()));
+                        publish_members(&channels.snapshot_tx, &tracked, Instant::now(), &node);
+                        let now = Instant::now();
+                        let advertises = gateway_address.is_some() || config.signals_address.is_some();
+                        if advertises && now >= next_gateway_republish_at {
+                            let Some(revision) = revisions.take() else {
+                                tracing::warn!("SWIM revisions exhausted; address republish waits for renewal");
                                 next_gateway_republish_at = now + Duration::from_secs(1);
-                            }
+                                continue;
+                            };
+                            gateway_address_revision = revision;
+                            publish_address_broadcast(
+                                &mut node,
+                                &site_name,
+                                gateway_address_revision,
+                                gateway_address.as_deref(),
+                                config.signals_address.as_deref(),
+                            );
+                            let gossip_output = node.gossip();
+                            drain_output(
+                                gossip_output,
+                                &socket,
+                                &channels.timer_tx,
+                                &mut tracked,
+                                &channels.snapshot_tx,
+                                &node,
+                                &key,
+                            )
+                            .await;
+                            publish_state(&state_tx, &node);
+                            next_gateway_republish_at = now + Duration::from_secs(1);
                         }
                     }
                     Err(e) => tracing::warn!(error = %e, "SWIM UDP recv error"),
@@ -1188,8 +1310,7 @@ async fn run_loop(
                     &channels.timer_tx,
                     &mut tracked,
                     &channels.snapshot_tx,
-                    &node.gateway_addrs(),
-                    &node.cert_pems(),
+                    &node,
                     &key,
                 )
                 .await;
@@ -1197,8 +1318,12 @@ async fn run_loop(
             Some(mut bc) = channels.broadcast_rx.recv() => {
                 if bc.carries_grid_state() {
                     let Some(revision) = revisions.take() else {
-                        tracing::error!("SWIM revision lease exhausted during state publication");
-                        return;
+                        tracing::warn!("SWIM revisions exhausted; state publishes on repair after renewal");
+                        if let Ok((retained, _)) = RetainedStateBroadcast::update(retained_state_broadcast.take(), bc, 0) {
+                            retained_state_broadcast = Some(retained);
+                        }
+                        next_state_republish_at = Instant::now();
+                        continue;
                     };
                     match RetainedStateBroadcast::update(retained_state_broadcast.take(), bc, revision) {
                         Ok((retained, Some(outbound))) => {
@@ -1227,13 +1352,12 @@ async fn run_loop(
                         &channels.timer_tx,
                         &mut tracked,
                         &channels.snapshot_tx,
-                        &node.gateway_addrs(),
-                        &node.cert_pems(),
+                        &node,
                         &key,
                     )
                     .await;
                 }
-                drop(state_tx.send(node.state_snapshot()));
+                publish_state(&state_tx, &node);
             }
             Some(()) = channels.leave_rx.recv() => {
                 let output = node.leave();
@@ -1243,8 +1367,7 @@ async fn run_loop(
                     &channels.timer_tx,
                     &mut tracked,
                     &channels.snapshot_tx,
-                    &node.gateway_addrs(),
-                    &node.cert_pems(),
+                    &node,
                     &key,
                 )
                 .await;
@@ -1264,8 +1387,7 @@ async fn run_loop(
                         &channels.timer_tx,
                         &mut tracked,
                         &channels.snapshot_tx,
-                        &node.gateway_addrs(),
-                        &node.cert_pems(),
+                        &node,
                         &key,
                     )
                     .await;
@@ -1274,11 +1396,8 @@ async fn run_loop(
             _ = age_tick.tick() => {
                 let now = Instant::now();
                 if now >= next_state_republish_at {
-                    if let Some(retained) = retained_state_broadcast.as_mut() {
-                        let Some(revision) = revisions.take() else {
-                            tracing::error!("SWIM revision lease exhausted during state repair");
-                            return;
-                        };
+                    let revision = retained_state_broadcast.as_ref().and_then(|_| revisions.take());
+                    if let (Some(retained), Some(revision)) = (retained_state_broadcast.as_mut(), revision) {
                         let bc = retained.republish(revision);
                         if let Err(e) = node.publish_state_broadcast(&bc) {
                             tracing::warn!(error = %e, "failed to encode retained state broadcast");
@@ -1290,14 +1409,16 @@ async fn run_loop(
                                 &channels.timer_tx,
                                 &mut tracked,
                                 &channels.snapshot_tx,
-                                &node.gateway_addrs(),
-                                &node.cert_pems(),
+                                &node,
                                 &key,
                             )
                             .await;
                         }
                     }
-                    next_state_republish_at = now + STATE_REPUBLISH_INTERVAL;
+                    // Without a revision the repair retries on the next tick.
+                    if retained_state_broadcast.is_none() || revision.is_some() {
+                        next_state_republish_at = now + STATE_REPUBLISH_INTERVAL;
+                    }
                 }
                 if now >= next_seed_announce_at {
                     // Seed discovery is retried so serial startup, transient
@@ -1312,8 +1433,7 @@ async fn run_loop(
                             &channels.timer_tx,
                             &mut tracked,
                             &channels.snapshot_tx,
-                            &node.gateway_addrs(),
-                            &node.cert_pems(),
+                            &node,
                             &key,
                         )
                         .await;
@@ -1331,27 +1451,23 @@ async fn run_loop(
                 // Republish while age changes or after eviction so readers see
                 // a coherent bounded membership view.
                 if has_aging_members(&tracked) || changed || adopted {
-                    drop(channels.snapshot_tx.send(members_snapshot(
-                        &tracked,
-                        now,
-                        &node.gateway_addrs(),
-                        &node.cert_pems(),
-                    )));
+                    publish_members(&channels.snapshot_tx, &tracked, now, &node);
                 }
             }
             Ok(()) = gateway_loop_rx.changed() => {
                 gateway_address.clone_from(&gateway_loop_rx.borrow_and_update());
                 if let Some(addr) = gateway_address.as_deref() {
                     let Some(revision) = revisions.take() else {
-                        tracing::error!("SWIM revision lease exhausted during gateway update");
-                        return;
+                        tracing::warn!("SWIM revisions exhausted; the address change waits for renewal");
+                        continue;
                     };
                     gateway_address_revision = revision;
-                    publish_gateway_address_broadcast(
+                    publish_address_broadcast(
                         &mut node,
                         &site_name,
                         gateway_address_revision,
-                        addr,
+                        Some(addr),
+                        config.signals_address.as_deref(),
                     );
                     let gossip_out = node.gossip();
                     drain_output(
@@ -1360,12 +1476,11 @@ async fn run_loop(
                         &channels.timer_tx,
                         &mut tracked,
                         &channels.snapshot_tx,
-                        &node.gateway_addrs(),
-                        &node.cert_pems(),
+                        &node,
                         &key,
                     )
                     .await;
-                    drop(state_tx.send(node.state_snapshot()));
+                    publish_state(&state_tx, &node);
                     tracing::info!(addr = %addr, "gateway address updated at runtime");
                 }
             }
@@ -1380,26 +1495,26 @@ fn canonical_state_payload(broadcast: &swim::StateBroadcast) -> Result<Vec<u8>, 
     canonical.encode().map_err(|error| error.to_string())
 }
 
-/// Queue a gateway-address-only state broadcast.
-///
-/// This is published at startup and re-published after SWIM activity so a node
-/// that joins before it has any local `GridNetwork` can still advertise its
-/// data-plane gateway address to peers.  The broadcast carries an empty CRDT
-/// snapshot and only updates the peer gateway-address map.
-///
-/// Deliberately leaves [`swim::StateBroadcast::grid_id`] as `None`: this
-/// broadcast can fire before the node has joined any `GridNetwork`, so no
-/// `grid_id` is available yet here. `publish_real_provider_state` in the
-/// `grid_network` controller attaches `grid_id` once a `GridNetwork` exists.
-fn publish_gateway_address_broadcast(node: &mut SwimNode, site_name: &str, revision: u64, gateway_address: &str) {
+/// Queue a broadcast of this site's gateway and signals addresses, without `grid_id`.
+fn publish_address_broadcast(
+    node: &mut SwimNode,
+    site_name: &str,
+    revision: u64,
+    gateway_address: Option<&str>,
+    signals_address: Option<&str>,
+) {
+    if gateway_address.is_none() && signals_address.is_none() {
+        return;
+    }
     let broadcast = swim::StateBroadcast::new(
         site_name.to_owned(),
         revision,
         GridStateSnapshot::new(site_name.to_owned()),
-        Some(gateway_address.to_owned()),
-    );
+        gateway_address.map(str::to_owned),
+    )
+    .with_signals_address(signals_address.map(str::to_owned));
     if let Err(e) = node.publish_state_broadcast(&broadcast) {
-        tracing::warn!(error = %e, "failed to encode gateway address broadcast");
+        tracing::warn!(error = %e, "failed to encode address broadcast");
     }
 }
 
@@ -1420,8 +1535,7 @@ async fn drain_output(
     timer_tx: &mpsc::Sender<TimerEvent>,
     tracked: &mut HashMap<String, TrackedMember>,
     snapshot_tx: &watch::Sender<MembershipSnapshot>,
-    gateway_addrs: &BTreeMap<String, String>,
-    cert_pems: &BTreeMap<String, String>,
+    node: &SwimNode,
     key: &KeyState,
 ) {
     for msg in output.messages {
@@ -1451,7 +1565,7 @@ async fn drain_output(
         changed = true;
     }
     if changed {
-        drop(snapshot_tx.send(members_snapshot(tracked, now, gateway_addrs, cert_pems)));
+        publish_members(snapshot_tx, tracked, now, node);
     }
 }
 
@@ -1828,9 +1942,11 @@ mod tests {
             advertise_addr: None,
             site_name: "test-node".to_owned(),
             seeds: Vec::new(),
+            signals_address: None,
             gateway_address: None,
             key: KeyState::Plain,
             revision_lease: test_revision_lease(seed),
+            revision_renewer: None,
         }
     }
 
@@ -1884,7 +2000,7 @@ mod tests {
         let mut tracked = HashMap::new();
         apply_member_event(joined("site-a"), &mut tracked, t);
         apply_member_event(joined("site-b"), &mut tracked, t);
-        let snap = members_snapshot(&tracked, t, &BTreeMap::new(), &BTreeMap::new());
+        let snap = members_snapshot(&tracked, t, &PeerMetadata::default());
         assert_eq!(snap.connected_count(), 2, "two Alive members must give count=2");
     }
 
@@ -1901,6 +2017,37 @@ mod tests {
             !has_aging_members(&tracked),
             "Alive members must not require age republish"
         );
+    }
+
+    #[test]
+    fn an_unchanged_view_wakes_no_reader() {
+        let node = SwimNode::new(NodeId::with_generation(
+            "local".to_owned(),
+            POD_ADDR.parse().expect("addr"),
+            1,
+        ));
+        let (snapshot_tx, mut snapshot_rx) = watch::channel(MembershipSnapshot::default());
+        let (state_tx, mut state_rx) = watch::channel(GridStateSnapshot::new("local".to_owned()));
+        let t0 = now();
+        let mut tracked = HashMap::new();
+        apply_member_event(joined("site-b"), &mut tracked, t0);
+        apply_member_event(joined("site-a"), &mut tracked, t0);
+
+        publish_members(&snapshot_tx, &tracked, t0, &node);
+        assert!(snapshot_rx.has_changed().expect("open"), "a new member wakes");
+        let sites: Vec<String> = snapshot_rx
+            .borrow_and_update()
+            .members
+            .iter()
+            .map(|m| m.site_id.clone())
+            .collect();
+        assert_eq!(sites, ["site-a", "site-b"], "ordered by site");
+        publish_members(&snapshot_tx, &tracked, t0, &node);
+        assert!(!snapshot_rx.has_changed().expect("open"), "the same view stays quiet");
+
+        state_rx.mark_unchanged();
+        publish_state(&state_tx, &node);
+        assert!(!state_rx.has_changed().expect("open"), "the same state stays quiet");
     }
 
     #[test]
@@ -1939,12 +2086,7 @@ mod tests {
         apply_member_event(joined("site-a"), &mut tracked, t0);
         apply_member_event(left("site-a"), &mut tracked, t0 + Duration::from_secs(10));
         apply_member_event(left("site-a"), &mut tracked, t0 + Duration::from_secs(50));
-        let snap = members_snapshot(
-            &tracked,
-            t0 + Duration::from_secs(70),
-            &BTreeMap::new(),
-            &BTreeMap::new(),
-        );
+        let snap = members_snapshot(&tracked, t0 + Duration::from_secs(70), &PeerMetadata::default());
         let m = snap.members.first().expect("member");
         assert_eq!(m.age_secs, 60, "a repeated leave must not reset the age clock");
     }
@@ -2081,7 +2223,7 @@ mod tests {
         let t = now();
         let mut tracked = HashMap::new();
         apply_member_event(joined("site-a"), &mut tracked, t);
-        let snap = members_snapshot(&tracked, t, &BTreeMap::new(), &BTreeMap::new());
+        let snap = members_snapshot(&tracked, t, &PeerMetadata::default());
         let m = snap.members.first().unwrap_or_else(|| std::process::abort());
         assert_eq!(m.age_secs, 0, "Alive member must have age_secs=0");
     }
@@ -2094,7 +2236,7 @@ mod tests {
         let mut tracked = HashMap::new();
         apply_member_event(joined("site-a"), &mut tracked, t0);
         apply_member_event(left("site-a"), &mut tracked, t_dead);
-        let snap = members_snapshot(&tracked, t_snap, &BTreeMap::new(), &BTreeMap::new());
+        let snap = members_snapshot(&tracked, t_snap, &PeerMetadata::default());
         let m = snap.members.first().unwrap_or_else(|| std::process::abort());
         assert_eq!(m.status, MemberStatus::Dead);
         assert_eq!(m.age_secs, 60, "dead age must be 80s - 20s = 60s");
@@ -2108,12 +2250,7 @@ mod tests {
         apply_member_event(left("site-a"), &mut tracked, t0 + Duration::from_secs(10));
         // Rejoin clears status_changed_at → age=0.
         apply_member_event(joined("site-a"), &mut tracked, t0 + Duration::from_secs(50));
-        let snap = members_snapshot(
-            &tracked,
-            t0 + Duration::from_secs(70),
-            &BTreeMap::new(),
-            &BTreeMap::new(),
-        );
+        let snap = members_snapshot(&tracked, t0 + Duration::from_secs(70), &PeerMetadata::default());
         let m = snap.members.first().unwrap_or_else(|| std::process::abort());
         assert_eq!(m.status, MemberStatus::Alive);
         assert_eq!(m.age_secs, 0, "rejoined Alive member must have age=0");
@@ -2126,7 +2263,7 @@ mod tests {
         let t_snap = t0 + Duration::from_secs(75);
         let mut tracked = HashMap::new();
         apply_member_event(left("unknown-site"), &mut tracked, t_dead);
-        let snap = members_snapshot(&tracked, t_snap, &BTreeMap::new(), &BTreeMap::new());
+        let snap = members_snapshot(&tracked, t_snap, &PeerMetadata::default());
         let m = snap.members.first().unwrap_or_else(|| std::process::abort());
         assert_eq!(m.status, MemberStatus::Dead);
         assert_eq!(m.age_secs, 60, "unknown Left tombstone age must be 75s - 15s = 60s");
@@ -2171,6 +2308,7 @@ mod tests {
             age_secs,
             gateway_address: Some("10.0.0.1:8443".to_owned()),
             site_cert_pem: Some("-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----".to_owned()),
+            signals_address: None,
         }
     }
 
@@ -2405,11 +2543,59 @@ mod tests {
             first_node_generation: 7,
             last_node_generation: 8,
         };
-        let mut clock = RevisionClock::new(&lease).unwrap_or_else(|_| std::process::abort());
+        let mut clock = RevisionClock::new(&lease, None).unwrap_or_else(|_| std::process::abort());
         assert_eq!(clock.take(), Some(41));
         assert_eq!(clock.take(), Some(42));
         assert_eq!(clock.take(), None);
         assert_eq!(clock.take(), None);
+    }
+
+    #[tokio::test]
+    async fn revision_clock_renews_before_the_range_runs_out() {
+        let span = swim::state_broadcast::REVISION_LEASE_SPAN;
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = Arc::clone(&asked);
+        let renewer: RevisionRenewer = Arc::new(move |last| {
+            seen.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(last);
+            Box::pin(async move { Ok((last + 1_000, last + 1_000 + span - 1)) })
+        });
+        let lease = RevisionLease {
+            first_revision: 1,
+            last_revision: span,
+            first_node_generation: 7,
+            last_node_generation: 8,
+        };
+        let mut clock = RevisionClock::new(&lease, Some(renewer)).unwrap_or_else(|_| std::process::abort());
+        let mut taken = Vec::new();
+        for _ in 0..span {
+            taken.extend(clock.take());
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            asked.lock().unwrap_or_else(std::sync::PoisonError::into_inner).first(),
+            Some(&span),
+            "renewed past the persisted end before running out"
+        );
+        assert!(taken.is_sorted_by(|a, b| a < b), "strictly increasing");
+        assert!(taken.contains(&(span + 1_000)), "moved to the renewed range");
+    }
+
+    #[tokio::test]
+    async fn revision_clock_waits_out_a_failed_renewal() {
+        let renewer: RevisionRenewer = Arc::new(|_| Box::pin(async { Err("apiserver down".to_owned()) }));
+        let lease = RevisionLease {
+            first_revision: 5,
+            last_revision: 5,
+            first_node_generation: 7,
+            last_node_generation: 8,
+        };
+        let mut clock = RevisionClock::new(&lease, Some(renewer)).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(clock.take(), Some(5));
+        tokio::task::yield_now().await;
+        assert_eq!(clock.take(), None, "exhausted, not reused");
+        assert!(clock.retry_at.is_some(), "retries later");
     }
 
     #[test]
@@ -2422,7 +2608,7 @@ mod tests {
         };
         assert!(
             matches!(
-                RevisionClock::new(&lease),
+                RevisionClock::new(&lease, None),
                 Err(SwimRuntimeError::InvalidRevisionLease { .. })
             ),
             "runtime must reject an empty reserved range"
@@ -2524,6 +2710,7 @@ mod tests {
                 age_secs: 0,
                 gateway_address: None,
                 site_cert_pem: None,
+                signals_address: None,
             }],
         };
         drop(snapshot_tx.send(snap_with_member));
@@ -2667,9 +2854,11 @@ mod tests {
             advertise_addr: None,
             site_name: "test-node".to_owned(),
             seeds: Vec::new(),
+            signals_address: None,
             gateway_address: None,
             key: KeyState::Plain,
             revision_lease: test_revision_lease(1),
+            revision_renewer: None,
         };
         let handle = start(cfg).await;
         assert!(handle.is_ok(), "start must succeed with an available port");
@@ -2690,9 +2879,11 @@ mod tests {
             advertise_addr: None,
             site_name: "test".to_owned(),
             seeds: Vec::new(),
+            signals_address: None,
             gateway_address: None,
             key: KeyState::Plain,
             revision_lease: test_revision_lease(20_000),
+            revision_renewer: None,
         };
         let result = start(cfg).await;
         assert!(result.is_err(), "start on an already-bound port must fail");
@@ -2710,9 +2901,11 @@ mod tests {
             advertise_addr: Some(addr1),
             site_name: "node-1".to_owned(),
             seeds: Vec::new(),
+            signals_address: None,
             gateway_address: None,
             key: KeyState::Plain,
             revision_lease: test_revision_lease(40_000),
+            revision_renewer: None,
         };
         let handle1 = start(cfg1).await.unwrap_or_else(|_| std::process::abort());
 
@@ -2721,9 +2914,11 @@ mod tests {
             advertise_addr: Some(addr2),
             site_name: "node-2".to_owned(),
             seeds: vec![addr1],
+            signals_address: None,
             gateway_address: None,
             key: KeyState::Plain,
             revision_lease: test_revision_lease(60_000),
+            revision_renewer: None,
         };
         let handle2 = start(cfg2).await.unwrap_or_else(|_| std::process::abort());
 
@@ -2817,9 +3012,11 @@ mod tests {
             advertise_addr: Some(addr_a),
             site_name: "site-a".to_owned(),
             seeds: Vec::new(),
+            signals_address: None,
             gateway_address: None,
             key: KeyState::Plain,
             revision_lease: test_revision_lease(80_000),
+            revision_renewer: None,
         })
         .await
         .unwrap_or_else(|_| std::process::abort());
@@ -2829,9 +3026,11 @@ mod tests {
             advertise_addr: Some(addr_b),
             site_name: "site-b".to_owned(),
             seeds: vec![addr_a],
+            signals_address: None,
             gateway_address: None,
             key: KeyState::Plain,
             revision_lease: test_revision_lease(90_000),
+            revision_renewer: None,
         })
         .await
         .unwrap_or_else(|_| std::process::abort());
@@ -2864,9 +3063,11 @@ mod tests {
             advertise_addr: Some(addr_c),
             site_name: "site-c".to_owned(),
             seeds: vec![addr_a],
+            signals_address: None,
             gateway_address: None,
             key: KeyState::Plain,
             revision_lease: test_revision_lease(100_000),
+            revision_renewer: None,
         })
         .await
         .unwrap_or_else(|_| std::process::abort());

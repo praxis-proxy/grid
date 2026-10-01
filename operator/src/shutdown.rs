@@ -51,8 +51,9 @@ impl Shutdown {
     /// Tests and one-shot tools have no signal to give and should not invent one.
     #[must_use]
     pub fn never() -> Self {
-        let (_, rx) = watch::channel(false);
-        Self { rx }
+        /// Never sends, and lives for the process.
+        static NEVER: std::sync::LazyLock<watch::Sender<bool>> = std::sync::LazyLock::new(|| watch::channel(false).0);
+        Self { rx: NEVER.subscribe() }
     }
 
     /// Whether the signal has already been given.
@@ -114,6 +115,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_shutdown_that_never_fires_does_not_report_one() {
-        assert!(!Shutdown::never().is_triggered());
+        let never = Shutdown::never();
+        assert!(!never.is_triggered(), "starts untriggered");
+        let waited = tokio::time::timeout(std::time::Duration::from_millis(50), never.triggered()).await;
+        assert!(waited.is_err(), "never resolves");
     }
 }

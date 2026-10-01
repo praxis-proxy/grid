@@ -49,7 +49,7 @@ pub enum MemberStatus {
 /// All fields are provided by the SWIM runtime at snapshot time.  This struct
 /// carries no live handles — it is safe to clone, serialize, or pass across
 /// thread boundaries.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MemberRecord {
     /// Opaque site identity.
     ///
@@ -88,6 +88,9 @@ pub struct MemberRecord {
     /// Contains only the public certificate — never a private key.
     /// `None` when the peer has not yet broadcast its site certificate.
     pub site_cert_pem: Option<String>,
+
+    /// Signals `host:port` advertised by this peer, `None` for an older peer.
+    pub signals_address: Option<String>,
 }
 
 impl MemberRecord {
@@ -119,7 +122,7 @@ impl MemberRecord {
 ///
 /// [`connected_count`]: MembershipSnapshot::connected_count
 /// [`phase_hint`]: MembershipSnapshot::phase_hint
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MembershipSnapshot {
     /// All known member records at the time of the snapshot.
     pub members: Vec<MemberRecord>,
@@ -177,6 +180,7 @@ mod tests {
             age_secs: 0,
             gateway_address: None,
             site_cert_pem: None,
+            signals_address: None,
         }
     }
 

@@ -33,7 +33,8 @@ use hyper_util::{client::legacy::Client as HyperClient, rt::TokioExecutor};
 
 use crate::resources::tls_backend::ClientTlsConfig;
 pub(crate) use crate::resources::tls_backend::{
-    build_custom_tls_connector, build_native_connector, build_pinned_client_config, build_tls_client_config,
+    build_custom_tls_connector, build_native_connector, build_pinned_client_config, build_spiffe_client_config,
+    build_tls_client_config,
 };
 
 // ---------------------------------------------------------------------------
@@ -119,10 +120,6 @@ pub(crate) async fn scrape_metrics(
 ///
 /// The peer poller uses the date to re-express a relayed sample's age on one
 /// clock.
-#[expect(
-    clippy::too_many_lines,
-    reason = "URL parse + scheme check + client build + request + body read: sequential steps"
-)]
 pub(crate) async fn scrape_metrics_with_date(
     url: &str,
     timeout: Duration,
@@ -156,10 +153,18 @@ pub(crate) async fn scrape_metrics_with_date(
         .body(Empty::<Bytes>::new())
         .map_err(|e| MetricsScrapeError::Transport(e.into()))?;
 
-    let response = tokio::time::timeout(timeout, client.request(req))
+    // One deadline covers the body too, so a stalled peer cannot hold the caller.
+    tokio::time::timeout(timeout, read_response(client.request(req), url))
         .await
         .map_err(|_elapsed| MetricsScrapeError::Timeout(timeout))?
-        .map_err(|e| MetricsScrapeError::Transport(e.into()))?;
+}
+
+/// Await `request`, then read a 2xx body from `url` and its `Date` header.
+async fn read_response(
+    request: hyper_util::client::legacy::ResponseFuture,
+    url: &str,
+) -> Result<(String, Option<SystemTime>), MetricsScrapeError> {
+    let response = request.await.map_err(|e| MetricsScrapeError::Transport(e.into()))?;
 
     let status = response.status().as_u16();
     if !(200..300).contains(&status) {
@@ -726,6 +731,20 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn spiffe_scrape_authorizes_by_site_id_not_pin() {
+        let ca = certs::generate_ca("test-ca").unwrap();
+        let server_cert = certs::generate_site_cert(&ca, "east").unwrap();
+        let body = b"HTTP/1.1 200 OK\r\nContent-Length: 16\r\n\r\ntest_metric 3.0\n".to_vec();
+        for (label, site, accepted) in [("the dialed site", "east", true), ("another site", "west", false)] {
+            let url = start_tls_test_server(&server_cert.cert_pem, &server_cert.key_pem, None, body.clone()).await;
+            let config =
+                build_spiffe_client_config(ca.cert_pem.as_bytes(), None, None, &certs::spiffe_id(site)).unwrap();
+            let result = scrape_metrics(&url, Duration::from_secs(5), Some(config)).await;
+            assert_eq!(result.is_ok(), accepted, "{label}: {result:?}");
+        }
+    }
+
     #[test]
     fn pinned_config_without_declared_pins_is_refused() {
         let ca = certs::generate_ca("test-ca").unwrap();
@@ -739,6 +758,34 @@ mod tests {
     // -----------------------------------------------------------------------
     // Server-side seam (signals listener)
     // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn server_accept_refuses_an_anonymous_client() {
+        use crate::resources::tls_backend::{accept, build_server_config, connect, parse_server_name};
+
+        let ca = certs::generate_ca("test-ca").unwrap();
+        let server_cert = certs::generate_dns_cert(&ca, "server", "localhost").unwrap();
+        let server_tls = build_server_config(
+            ca.cert_pem.as_bytes(),
+            server_cert.cert_pem.as_bytes(),
+            server_cert.key_pem.as_bytes(),
+        )
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            accept(tcp, &server_tls).await.is_ok()
+        });
+        let anonymous = Arc::new(build_tls_client_config(ca.cert_pem.as_bytes(), None, None).unwrap());
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let name = parse_server_name("localhost").unwrap();
+        drop(connect(tcp, &anonymous, &name).await);
+        assert!(
+            !server.await.unwrap(),
+            "a client without a certificate must fail the handshake"
+        );
+    }
 
     #[tokio::test]
     #[expect(clippy::too_many_lines, reason = "server + client handshake round-trip setup")]

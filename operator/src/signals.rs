@@ -9,6 +9,7 @@
 
 use std::{
     collections::{BTreeMap, HashMap},
+    net::{IpAddr, Ipv6Addr},
     sync::{Arc, RwLock},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -16,9 +17,11 @@ use std::{
 use futures::StreamExt as _;
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 
+pub use crate::crd::grid_network::PeerTrustMode;
 use crate::{
     metrics_scraper::{MetricsScrapeError, scrape_metrics_with_date},
     resources::tls_backend::{self, ClientTlsConfig},
+    swim::MemberRecord,
 };
 
 /// The single mTLS path the coarse rollup is served and polled on.
@@ -296,6 +299,12 @@ impl PeerIdentities {
         held.get(site).is_none_or(|record| record.pins.is_empty())
     }
 
+    /// Labels held for `site`, whether or not it declared pins.
+    #[must_use]
+    pub fn labels_for(&self, site: &str) -> Option<BTreeMap<String, String>> {
+        self.inner.read().ok()?.get(site).map(|record| record.labels.clone())
+    }
+
     /// Labels for a caller presenting `leaf_sha256`.
     ///
     /// A key nobody pinned names nobody, so an unknown peer is refused, not
@@ -304,12 +313,18 @@ impl PeerIdentities {
     /// rather than indexes: a grid is sites, not endpoints.
     #[must_use]
     pub fn resolve_by_key(&self, leaf_sha256: &str) -> Option<BTreeMap<String, String>> {
+        self.resolve_site_by_key(leaf_sha256).map(|(_, labels)| labels)
+    }
+
+    /// The site pinned to `leaf_sha256`, with its labels.
+    #[must_use]
+    pub fn resolve_site_by_key(&self, leaf_sha256: &str) -> Option<(String, BTreeMap<String, String>)> {
         let Ok(held) = self.inner.read() else {
             return None;
         };
-        held.values()
-            .find(|record| record.pins.iter().any(|pin| pin == leaf_sha256))
-            .map(|record| record.labels.clone())
+        held.iter()
+            .find(|(_, record)| record.pins.iter().any(|pin| pin == leaf_sha256))
+            .map(|(site, record)| (site.clone(), record.labels.clone()))
     }
 }
 
@@ -548,31 +563,180 @@ pub struct PeerSite {
     pub pins: Vec<String>,
 }
 
-/// Alive peers other than this site, addressed at their signals port.
-///
-/// Takes the name and advertised address of each member rather than a
-/// membership snapshot, so deriving an address stays independent of how
-/// membership is discovered.
-pub fn peer_sites<'member, Members>(members: Members, local_site: &str, port: u16, scheme: &str) -> Vec<PeerSite>
+/// Members other than this site, addressed at their dialable signals endpoint.
+pub fn peer_sites<'member, Members>(
+    members: Members,
+    local_site: &str,
+    scheme: &str,
+    fallback_port: u16,
+) -> Vec<PeerSite>
 where
-    Members: Iterator<Item = (&'member str, &'member str)>,
+    Members: Iterator<Item = &'member MemberRecord>,
 {
     members
-        .filter(|(site, _)| *site != local_site)
-        .filter_map(|(site, endpoint)| {
-            // The advertised address is the membership listener, so only its
-            // host is meaningful here.
-            let host = match endpoint.rsplit_once(':') {
-                Some((host, _)) if !host.is_empty() => host,
-                _ => return None,
-            };
+        .filter(|member| member.site_id != local_site)
+        .filter_map(|member| {
             Some(PeerSite {
-                name: site.to_owned(),
-                url: format!("{scheme}://{host}:{port}{SIGNALS_PATH}"),
+                name: member.site_id.clone(),
+                url: dialable_signals_endpoint(member, fallback_port)?.url(scheme)?,
                 pins: Vec::new(),
             })
         })
         .collect()
+}
+
+/// Signals port dialed for a peer that gossips no signals endpoint, unless configured.
+pub const DEFAULT_PEER_PORT: u16 = 9091;
+
+/// A peer signals endpoint: an IP literal or a DNS name, and a port.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SignalsEndpoint {
+    /// Where to connect.
+    host: EndpointHost,
+    /// TCP port, never zero.
+    port: u16,
+}
+
+/// The host half of a [`SignalsEndpoint`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum EndpointHost {
+    /// An IP literal.
+    Ip(IpAddr),
+    /// A lowercase DNS name.
+    Dns(String),
+}
+
+impl SignalsEndpoint {
+    /// Parse `SocketAddr` text or `dns-name:port`, refusing anything that could carry a URL part.
+    #[must_use]
+    pub fn parse(text: &str) -> Option<Self> {
+        if let Ok(addr) = text.parse::<std::net::SocketAddr>() {
+            return (addr.port() != 0).then(|| Self {
+                host: EndpointHost::Ip(addr.ip()),
+                port: addr.port(),
+            });
+        }
+        let (host, port) = text.rsplit_once(':')?;
+        if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) || !is_dns_name(host) {
+            return None;
+        }
+        let port = port.parse::<u16>().ok().filter(|port| *port != 0)?;
+        Some(Self {
+            host: EndpointHost::Dns(host.to_ascii_lowercase()),
+            port,
+        })
+    }
+
+    /// The same host on `port`.
+    #[must_use]
+    pub fn with_port(self, port: u16) -> Self {
+        Self { port, ..self }
+    }
+
+    /// `host:port`, IPv6 bracketed.
+    #[must_use]
+    pub fn authority(&self) -> String {
+        match &self.host {
+            EndpointHost::Ip(ip) => std::net::SocketAddr::new(*ip, self.port).to_string(),
+            EndpointHost::Dns(name) => format!("{name}:{}", self.port),
+        }
+    }
+
+    /// Whether it stays off loopback, link-local, and cloud metadata addresses.
+    #[must_use]
+    pub fn is_dialable(&self) -> bool {
+        match &self.host {
+            EndpointHost::Ip(ip) => is_dialable_ip(*ip),
+            EndpointHost::Dns(name) => !crate::resources::mcp_probe::is_blocked_hostname(name),
+        }
+    }
+
+    /// The signals URL under `scheme`, built from validated parts.
+    #[must_use]
+    pub fn url(&self, scheme: &str) -> Option<String> {
+        http::Uri::builder()
+            .scheme(scheme)
+            .authority(self.authority())
+            .path_and_query(SIGNALS_PATH)
+            .build()
+            .ok()
+            .map(|uri| uri.to_string())
+    }
+}
+
+/// A DNS name of letter, digit, and hyphen labels, not ending in an all-digit label.
+fn is_dns_name(host: &str) -> bool {
+    let label_ok = |label: &str| {
+        (1..=63).contains(&label.len())
+            && label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+    };
+    (1..=253).contains(&host.len())
+        && host.split('.').all(label_ok)
+        && !host
+            .rsplit('.')
+            .next()
+            .is_some_and(|last| last.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// A member's dialable signals endpoint, gossiped else its SWIM host on `fallback_port`, refusals warned once.
+#[must_use]
+pub fn dialable_signals_endpoint(member: &MemberRecord, fallback_port: u16) -> Option<SignalsEndpoint> {
+    let (text, endpoint) = match &member.signals_address {
+        Some(advertised) => (advertised.as_str(), SignalsEndpoint::parse(advertised)),
+        None => (
+            member.endpoint.as_str(),
+            SignalsEndpoint::parse(&member.endpoint).map(|swim| swim.with_port(fallback_port)),
+        ),
+    };
+    let endpoint = endpoint.filter(SignalsEndpoint::is_dialable);
+    if endpoint.is_none() {
+        warn_refused_once(&member.site_id, text);
+    }
+    endpoint
+}
+
+/// Refused `(site, endpoint)` pairs already warned, bounded.
+static REFUSED_WARNED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<(String, String)>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Refused pairs remembered before the set starts over.
+const REFUSED_WARNED_MAX: usize = 1_024;
+
+/// Warn about a refused endpoint the first time a peer gossips it, `true` when warned.
+fn warn_refused_once(site: &str, endpoint: &str) -> bool {
+    let endpoint: String = endpoint.chars().take(128).collect();
+    let mut warned = REFUSED_WARNED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if warned.len() >= REFUSED_WARNED_MAX {
+        warned.clear();
+    }
+    let first = warned.insert((site.to_owned(), endpoint.clone()));
+    drop(warned);
+    if first {
+        tracing::warn!(site, endpoint, "refusing a peer's signals endpoint");
+    } else {
+        tracing::debug!(site, endpoint, "refusing a peer's signals endpoint");
+    }
+    first
+}
+
+/// AWS instance metadata over IPv6, inside the unique-local range peers may use.
+const AWS_METADATA_V6: Ipv6Addr = Ipv6Addr::new(0xFD00, 0x0EC2, 0, 0, 0, 0, 0, 0x0254);
+
+/// Whether a peer IP may be dialed: anything but local and metadata addresses.
+fn is_dialable_ip(ip: IpAddr) -> bool {
+    match ip.to_canonical() {
+        IpAddr::V4(v4) => {
+            !(v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4 == crate::resources::mcp_probe::ALIBABA_CLOUD_METADATA_V4)
+        },
+        IpAddr::V6(v6) => {
+            !(v6.is_loopback() || v6.is_unspecified() || v6.is_unicast_link_local() || v6 == AWS_METADATA_V6)
+        },
+    }
 }
 
 /// Everything outside the RFC 3986 unreserved set is escaped in a query value.
@@ -703,14 +867,21 @@ fn backoff(base: Duration, attempt: u32, peer: &str) -> Duration {
     scaled.saturating_add(jitter)
 }
 
-/// One peer's client config, verifying against the keys declared for it.
-fn peer_client_config(material: &PeerTlsMaterial, pins: &[String]) -> Result<ClientTlsConfig, MetricsScrapeError> {
-    crate::metrics_scraper::build_pinned_client_config(
-        &material.ca,
-        material.identity.as_ref().map(|id| id.cert.as_slice()),
-        material.identity.as_ref().map(|id| id.key.as_slice()),
-        pins,
-    )
+/// One peer's client config under `mode`: its declared pins, or its SPIFFE ID.
+fn peer_client_config(
+    material: &PeerTlsMaterial,
+    mode: PeerTrustMode,
+    peer: &str,
+    pins: &[String],
+) -> Result<ClientTlsConfig, MetricsScrapeError> {
+    let cert = material.identity.as_ref().map(|id| id.cert.as_slice());
+    let key = material.identity.as_ref().map(|id| id.key.as_slice());
+    match mode {
+        PeerTrustMode::Pin => crate::metrics_scraper::build_pinned_client_config(&material.ca, cert, key, pins),
+        PeerTrustMode::Spiffe => {
+            crate::metrics_scraper::build_spiffe_client_config(&material.ca, cert, key, &certs::spiffe_id(peer))
+        },
+    }
 }
 
 /// PEM material a peer client is built from.
@@ -781,6 +952,8 @@ pub struct PollPeers {
     /// Lets an in-flight round stand down cleanly; dropping the future instead
     /// would stop it anywhere and leave a poll's accounting half done.
     pub shutdown: crate::shutdown::Shutdown,
+    /// How each peer's certificate is authorized.
+    pub trust: PeerTrustMode,
 }
 
 impl Default for PollPeers {
@@ -795,6 +968,7 @@ impl Default for PollPeers {
             budget: Duration::from_secs(5),
             slow_after: Duration::from_secs(1),
             shutdown: crate::shutdown::Shutdown::never(),
+            trust: PeerTrustMode::Pin,
         }
     }
 }
@@ -811,7 +985,7 @@ impl PollPeers {
         let mut guard = PollGuard::enter(peer, self.slow_after);
 
         // Once per peer, not per attempt: this parses a private key.
-        let tls = match self.tls.as_ref().map(|m| peer_client_config(m, pins)) {
+        let tls = match self.tls.as_ref().map(|m| peer_client_config(m, self.trust, peer, pins)) {
             Some(Ok(config)) => Some(config),
             Some(Err(error)) => {
                 tracing::warn!(peer, %error, "peer client config unusable; not polling");
@@ -820,7 +994,10 @@ impl PollPeers {
             },
             None => None,
         };
-        let (outcome, result) = self.attempt_until(peer, url, tls.as_ref(), guard.started).await;
+        let (outcome, result) =
+            tokio::time::timeout(self.budget, self.attempt_until(peer, url, tls.as_ref(), guard.started))
+                .await
+                .unwrap_or((PollOutcome::Timeout, None));
         guard.finish(outcome, result.as_ref().map_or(0, |(body, _)| body.len()));
         result
     }
@@ -901,6 +1078,19 @@ impl PollPeers {
     /// A site that did not answer is absent rather than empty, so a caller can
     /// tell silence from a site that genuinely has nothing to report.
     pub async fn collect(&self, sites: &[PeerSite]) -> BTreeMap<String, Vec<Observation>> {
+        let mut collected = BTreeMap::new();
+        self.collect_each(sites, |peer, observations| {
+            collected.insert(peer, observations);
+        })
+        .await;
+        collected
+    }
+
+    /// Hand each site's observations to `publish` as its poll completes.
+    pub async fn collect_each<Publish>(&self, sites: &[PeerSite], mut publish: Publish)
+    where
+        Publish: FnMut(String, Vec<Observation>),
+    {
         let collect_query = self
             .collect
             .iter()
@@ -918,16 +1108,13 @@ impl PollPeers {
                 Some((peer, observations))
             });
 
-        // Bounded fan-out. A peer that fails is absent from the result
-        // rather than empty, so silence and nothing-to-report stay
-        // distinguishable to the store.
-        futures::stream::iter(fetches)
-            .buffer_unordered(self.concurrency.max(1))
-            .collect::<Vec<Option<(String, Vec<Observation>)>>>()
-            .await
-            .into_iter()
-            .flatten()
-            .collect()
+        // A failed peer is absent, not empty, so silence stays distinct from nothing to report.
+        let mut done = futures::stream::iter(fetches).buffer_unordered(self.concurrency.max(1));
+        while let Some(result) = done.next().await {
+            if let Some((peer, observations)) = result {
+                publish(peer, observations);
+            }
+        }
     }
 }
 
@@ -999,15 +1186,23 @@ impl Drop for PollGuard<'_> {
 fn peer_urls(sites: &[PeerSite], collect_query: &str) -> Vec<(String, String, Vec<String>)> {
     sites
         .iter()
-        .map(|site| {
+        .filter_map(|site| {
             let url = if collect_query.is_empty() {
                 site.url.clone()
             } else {
-                format!("{}?{collect_query}", site.url)
+                with_query(&site.url, collect_query)?
             };
-            (site.name.clone(), url, site.pins.clone())
+            Some((site.name.clone(), url, site.pins.clone()))
         })
         .collect()
+}
+
+/// `url` with its query replaced by `query`, rebuilt through the URI parser.
+fn with_query(url: &str, query: &str) -> Option<String> {
+    let mut parts = url.parse::<http::Uri>().ok()?.into_parts();
+    let path = parts.path_and_query.as_ref().map_or("/", http::uri::PathAndQuery::path);
+    parts.path_and_query = Some(format!("{path}?{query}").parse().ok()?);
+    http::Uri::from_parts(parts).ok().map(|uri| uri.to_string())
 }
 
 /// Keep only the observations a peer made itself.
@@ -1060,6 +1255,179 @@ fn reexpress_peer_ages(observations: &mut [Observation], date: Option<SystemTime
 #[expect(clippy::expect_used, reason = "tests")]
 mod tests {
     use super::*;
+
+    #[test]
+    fn peers_are_dialed_at_a_dialable_signals_endpoint() {
+        let member = |site: &str, endpoint: &str, signals: Option<&str>| MemberRecord {
+            site_id: site.to_owned(),
+            endpoint: endpoint.to_owned(),
+            incarnation: 0,
+            status: crate::swim::MemberStatus::Alive,
+            age_secs: 0,
+            gateway_address: None,
+            site_cert_pem: None,
+            signals_address: signals.map(str::to_owned),
+        };
+        let members = [
+            member("hub", "10.0.0.1:7946", None),
+            member("lb", "10.0.0.2:7946", Some("203.0.113.7:9443")),
+            member("older", "[fd00::2]:7946", None),
+            member("loop", "127.0.0.1:7946", None),
+            member("meta", "10.0.0.3:7946", Some("[fd00:ec2::254]:9091")),
+            member("named", "10.0.0.4:7946", Some("East.Example:9091")),
+        ];
+        let urls: Vec<String> = peer_sites(members.iter(), "hub", "https", 9191)
+            .into_iter()
+            .map(|site| site.url)
+            .collect();
+        assert_eq!(
+            urls,
+            [
+                "https://203.0.113.7:9443/v1/site/signals",
+                "https://[fd00::2]:9191/v1/site/signals",
+                "https://east.example:9091/v1/site/signals"
+            ]
+        );
+    }
+
+    /// A plain HTTP peer for `site` that answers once `release` fires.
+    async fn held_peer(site: &'static str, release: tokio::sync::oneshot::Receiver<()>) -> PeerSite {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut request = [0_u8; 1024];
+            drop(stream.read(&mut request).await);
+            drop(release.await);
+            let body = format!("load{{grid_site=\"{site}\"}} 1\n");
+            let response = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+            drop(stream.write_all(response.as_bytes()).await);
+        });
+        PeerSite {
+            name: site.to_owned(),
+            url: format!("http://{addr}{SIGNALS_PATH}"),
+            pins: Vec::new(),
+        }
+    }
+
+    /// The slow peer answers only after the fast one is published, so a round that waited would hang.
+    #[tokio::test]
+    async fn a_slow_peer_does_not_hold_back_a_fast_one() {
+        crate::init_process_crypto();
+        let (release_fast, fast_gate) = tokio::sync::oneshot::channel();
+        let (release_slow, slow_gate) = tokio::sync::oneshot::channel();
+        let sites = [held_peer("slow", slow_gate).await, held_peer("fast", fast_gate).await];
+        release_fast.send(()).unwrap_or(());
+        let poll = PollPeers {
+            attempts: 1,
+            ..PollPeers::default()
+        };
+        let mut release_slow = Some(release_slow);
+        let mut order = Vec::new();
+        let round = poll.collect_each(&sites, |peer, observations| {
+            assert_eq!(observations.len(), 1, "{peer}");
+            if let Some(release) = release_slow.take() {
+                release.send(()).unwrap_or(());
+            }
+            order.push(peer);
+        });
+        tokio::time::timeout(Duration::from_secs(10), round)
+            .await
+            .expect("the fast peer was published before the slow one answered");
+        assert_eq!(order, ["fast", "slow"]);
+    }
+
+    /// A peer that sends headers promising a body, then stalls.
+    async fn stalled_peer(site: &str) -> PeerSite {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut request = [0_u8; 1024];
+            drop(stream.read(&mut request).await);
+            drop(
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\n\r\nload")
+                    .await,
+            );
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+        PeerSite {
+            name: site.to_owned(),
+            url: format!("http://{addr}{SIGNALS_PATH}"),
+            pins: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_peer_stalled_mid_body_does_not_hold_the_round() {
+        crate::init_process_crypto();
+        for (label, timeout, budget) in [
+            ("request deadline", Duration::from_millis(200), Duration::from_secs(5)),
+            ("peer budget", Duration::from_secs(20), Duration::from_millis(300)),
+        ] {
+            let (release, gate) = tokio::sync::oneshot::channel();
+            release.send(()).unwrap_or(());
+            let sites = [stalled_peer("stalled").await, held_peer("live", gate).await];
+            let poll = PollPeers {
+                attempts: 1,
+                timeout,
+                budget,
+                ..PollPeers::default()
+            };
+            let round = tokio::time::timeout(Duration::from_secs(5), poll.collect(&sites))
+                .await
+                .expect(label);
+            assert_eq!(round.keys().collect::<Vec<_>>(), ["live"], "{label}");
+        }
+    }
+
+    #[test]
+    fn only_strict_endpoint_text_parses() {
+        let cases = [
+            ("ipv4", "10.0.0.1:9091", Some("10.0.0.1:9091")),
+            ("bracketed ipv6", "[fd00::1]:9091", Some("[fd00::1]:9091")),
+            ("dns name", "east.grid.example:9091", Some("east.grid.example:9091")),
+            ("bare ipv6", "fd00::1", None),
+            ("unbracketed ipv6 with a port", "fd00::1:9091", None),
+            ("userinfo", "x@169.254.169.254:443", None),
+            ("path and query", "evil.example/x?:9091", None),
+            ("fragment", "evil.example#x:9091", None),
+            ("percent", "evil%2eexample:9091", None),
+            ("no port", "east.example", None),
+            ("empty port", "east.example:", None),
+            ("signed port", "east.example:+9091", None),
+            ("port zero", "10.0.0.1:0", None),
+            ("port overflow", "east.example:70000", None),
+            ("leading hyphen", "-east.example:9091", None),
+            ("ipv4-looking name", "999.1.1.1:9091", None),
+            ("empty", "", None),
+        ];
+        for (label, text, want) in cases {
+            let got = SignalsEndpoint::parse(text).map(|endpoint| endpoint.authority());
+            assert_eq!(got.as_deref(), want, "{label}");
+        }
+    }
+
+    #[test]
+    fn refused_endpoints_are_warned_once_per_peer() {
+        let (site, endpoint) = ("warn-once-site", "x@169.254.169.254:443");
+        assert!(warn_refused_once(site, endpoint), "first refusal warns");
+        assert!(!warn_refused_once(site, endpoint), "the same refusal is quiet");
+        assert!(warn_refused_once(site, "127.0.0.1:9091"), "a new value warns");
+    }
+
+    #[test]
+    fn a_collect_query_is_rebuilt_through_the_uri_parser() {
+        let url = "https://[fd00::1]:9091/v1/site/signals";
+        assert_eq!(
+            with_query(url, "collect[]=a").as_deref(),
+            Some("https://[fd00::1]:9091/v1/site/signals?collect[]=a")
+        );
+        assert_eq!(with_query(url, "a b"), None, "an invalid query is refused");
+    }
 
     #[test]
     fn a_colon_in_a_metric_name_is_a_name_not_a_delimiter() {

@@ -103,6 +103,30 @@ fn host_port(host: &str, port: u16) -> String {
     }
 }
 
+/// Named signals port on the chart's Service.
+const SIGNALS_PORT_NAME: &str = "signals";
+
+/// `"<lb>:<port>"` for the Service port named `signals`, `None` without that port or ingress.
+#[must_use]
+pub fn lb_signals_endpoint(svc: &Service) -> Option<String> {
+    let port = svc
+        .spec
+        .as_ref()?
+        .ports
+        .as_ref()?
+        .iter()
+        .find(|p| p.name.as_deref() == Some(SIGNALS_PORT_NAME))?
+        .port;
+    let text = preferred_endpoint(svc, u16::try_from(port).ok()?)?;
+    crate::signals::SignalsEndpoint::parse(&text).map(|endpoint| endpoint.authority())
+}
+
+/// The SWIM endpoint and the signals endpoint from one read of the Service, `None` until it has ingress.
+#[must_use]
+pub fn lb_advertised(svc: &Service, bind_port: u16) -> Option<(String, Option<String>)> {
+    Some((lb_endpoint(svc, bind_port)?, lb_signals_endpoint(svc)))
+}
+
 /// Every ingress as `"<lb>:<port>"` on the SWIM port, in Service order.
 #[must_use]
 pub fn lb_endpoints(svc: &Service, bind_port: u16) -> Vec<String> {
@@ -478,7 +502,7 @@ mod tests {
 
     #[test]
     fn an_ip_ingress_is_preferred_over_an_earlier_hostname() {
-        let mut service = svc(&[(Some("swim-udp"), 7946)], None);
+        let mut service = svc(&[(Some("swim-udp"), 7946), (Some("signals"), 9091)], None);
         if let Some(lb) = service.status.as_mut().and_then(|status| status.load_balancer.as_mut()) {
             lb.ingress = Some(vec![
                 LoadBalancerIngress {
@@ -492,6 +516,7 @@ mod tests {
             ]);
         }
         assert_eq!(lb_endpoint(&service, 7946).as_deref(), Some("10.0.0.9:7946"));
+        assert_eq!(lb_signals_endpoint(&service).as_deref(), Some("10.0.0.9:9091"));
     }
 
     #[tokio::test(start_paused = true)]
@@ -562,6 +587,46 @@ mod tests {
                 "{kind:?} accepted"
             );
         }
+    }
+
+    #[test]
+    fn the_signals_endpoint_is_the_service_port_on_the_lb_address() {
+        let cases = [
+            (
+                "named signals port, not the swim one",
+                svc(&[(Some("swim-udp"), 7946), (Some("signals"), 19091)], Some("10.0.0.9")),
+                Some("10.0.0.9:19091"),
+            ),
+            (
+                "ipv6 ingress",
+                svc(&[(Some("signals"), 9091)], Some("fd00::9")),
+                Some("[fd00::9]:9091"),
+            ),
+            (
+                "no signals port",
+                svc(&[(Some("swim-udp"), 7946)], Some("10.0.0.9")),
+                None,
+            ),
+            ("no ingress yet", svc(&[(Some("signals"), 9091)], None), None),
+        ];
+        for (name, service, want) in cases {
+            assert_eq!(lb_signals_endpoint(&service).as_deref(), want, "{name}");
+        }
+    }
+
+    #[test]
+    fn the_signals_endpoint_is_read_with_the_swim_one() {
+        let ports = [(Some("swim-udp"), 7946), (Some("signals"), 9091)];
+        assert_eq!(lb_advertised(&svc(&ports, None), 7946), None, "waits for ingress");
+        assert_eq!(
+            lb_advertised(&svc(&ports, Some("10.0.0.9")), 7946),
+            Some(("10.0.0.9:7946".to_owned(), Some("10.0.0.9:9091".to_owned())))
+        );
+        assert_eq!(
+            lb_advertised(&svc(&ports[..1], Some("10.0.0.9")), 7946),
+            Some(("10.0.0.9:7946".to_owned(), None)),
+            "no signals port"
+        );
     }
 
     #[test]
