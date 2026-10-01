@@ -1,3 +1,4 @@
+{{- include "grid-enrollment.normalize" . }}
 {{- include "grid-enrollment.validateAuthz" . }}
 apiVersion: apps/v1
 kind: Deployment
@@ -150,7 +151,7 @@ spec:
         {{- if eq .Values.enrollment.authz "local" }}
         - name: grid-admin-tokens
           secret:
-            secretName: {{ if .Values.enrollment.gridAdminTokens.existingSecretRef }}{{ .Values.enrollment.gridAdminTokens.existingSecretRef }}{{ else }}{{ include "grid-enrollment.fullname" . }}-grid-admin-tokens{{ end }}
+            secretName: {{ .Values.enrollment.gridAdminTokens.existingSecretRef | default (include "grid-enrollment.adminTokensSecret" .) }}
         {{- end }}
       {{- with .Values.enrollment.nodeSelector }}
       nodeSelector:

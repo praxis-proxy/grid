@@ -194,3 +194,59 @@ Builtin Postgres image, pinned by imageDigest when set.
 {{- .Values.db.builtin.image }}
 {{- end }}
 {{- end }}
+
+{{/*
+Generated Secrets the bootstrap Job creates once. Each emits "true" or nothing.
+*/}}
+{{- define "grid-enrollment.generatesDbCredentials" -}}
+{{- if and (eq .Values.db.type "builtin") (not .Values.db.builtin.auth.existingSecretRef) -}}
+true
+{{- end -}}
+{{- end }}
+
+{{- define "grid-enrollment.generatesAdminTokens" -}}
+{{- $t := .Values.enrollment.gridAdminTokens -}}
+{{- if and (eq .Values.enrollment.authz "local") $t.generate (not $t.existingSecretRef) -}}
+true
+{{- end -}}
+{{- end }}
+
+{{/*
+The bootstrap Job runs to generate the CA or a credentials Secret. Emits "true" or nothing.
+*/}}
+{{- define "grid-enrollment.bootstrapRuns" -}}
+{{- if or (ne (include "grid-enrollment.caProvided" .) "true") (include "grid-enrollment.generatesAdminTokens" .) -}}
+true
+{{- end -}}
+{{- end }}
+
+{{- define "grid-enrollment.adminTokensSecret" -}}
+{{- printf "%s-grid-admin-tokens" (include "grid-enrollment.fullname" .) -}}
+{{- end }}
+
+{{/*
+Normalize values once per render, in place and idempotently: host becomes a serving
+name and the default Route host, and invites keyed by site become the list the invite
+Job reads, keys in sorted order.
+*/}}
+{{- define "grid-enrollment.normalize" -}}
+{{- $v := .Values }}
+{{- if not $v.enrollment.service.type }}
+{{- $lb := and $v.host (not (include "grid-enrollment.routeEnabled" .)) }}
+{{- $_ := set $v.enrollment.service "type" (ternary "LoadBalancer" "ClusterIP" (not (not $lb))) }}
+{{- end }}
+{{- with $v.host }}
+{{- $_ := set $v.serving "extraDnsNames" (append ($v.serving.extraDnsNames | default list) . | uniq) }}
+{{- if not $v.route.host }}{{- $_ := set $v.route "host" . }}{{- end }}
+{{- end }}
+{{- if kindIs "map" $v.invites }}
+{{- $list := list }}
+{{- range $site := keys $v.invites | sortAlpha }}
+{{- $i := get $v.invites $site | default dict }}
+{{- $entry := dict "siteName" $site "gridNetworkRef" ($i.network | default "grid") }}
+{{- with $i.expiresInSecs }}{{- $_ := set $entry "expiresInSecs" (int .) }}{{- end }}
+{{- $list = append $list $entry }}
+{{- end }}
+{{- $_ := set $v "invites" $list }}
+{{- end }}
+{{- end }}

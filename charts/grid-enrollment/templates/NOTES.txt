@@ -1,3 +1,4 @@
+{{- include "grid-enrollment.normalize" . }}
 {{- $ns := .Release.Namespace -}}
 {{- $route := and (include "grid-enrollment.routeEnabled" .) .Values.route.host -}}
 {{- $url := printf "https://%s:%s" (include "grid-enrollment.serviceDns" .) (include "grid-enrollment.listenPort" .) -}}

@@ -460,12 +460,21 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
 }
 
 /// A fresh one-time site token: 256 bits from the system CSPRNG, hex encoded.
+fn generate_token() -> Result<String, ApiError> {
+    random_hex(32)
+}
+
+/// `len` bytes from the system CSPRNG, hex encoded.
 ///
 /// The default build draws from ring's `SystemRandom`. A fips build draws from
 /// system openssl so the entropy source stays in the validated module. Hex keeps
 /// it header-safe with no padding.
-fn generate_token() -> Result<String, ApiError> {
-    let mut bytes = [0_u8; 32];
+///
+/// # Errors
+///
+/// Returns [`ApiError::Internal`] when the system random source fails.
+pub fn random_hex(len: usize) -> Result<String, ApiError> {
+    let mut bytes = vec![0_u8; len];
     fill_random(&mut bytes)?;
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }

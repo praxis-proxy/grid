@@ -2,6 +2,8 @@
 //!
 //! Mints or loads the Grid CA and issues the enrollment endpoint's serving
 //! certificate, then writes them as Kubernetes Secrets for a pre-install Job.
+//! Also creates the builtin Postgres credentials and the local grid-admin token
+//! table once, so the chart renders the same on every run.
 //! Compiled with the `bootstrap` feature, on by default.
 //!
 //! Key separation is deliberate: the signing key lives only in the CA-key Secret
@@ -18,6 +20,7 @@ type BoxError = Box<dyn Error + Send + Sync>;
 
 /// Arguments for `bootstrap`.
 #[derive(Parser)]
+#[expect(clippy::struct_excessive_bools, reason = "independent clap switches")]
 #[command(name = "bootstrap", about = "Mint or load the Grid CA and write it as Secrets")]
 struct BootstrapArgs {
     /// Namespace to read and write Secrets in. Defaults to `POD_NAMESPACE`, then
@@ -56,6 +59,27 @@ struct BootstrapArgs {
     /// Regenerate every certificate and the CA even if the Secrets exist.
     #[arg(long)]
     force_regenerate: bool,
+    /// Leave the CA and every certificate alone: a provided CA serves instead.
+    #[arg(long)]
+    skip_ca: bool,
+    /// Secret for the builtin Postgres credentials, created once with a generated password.
+    #[arg(long)]
+    db_credentials_secret: Option<String>,
+    /// Postgres user in the generated connection URL.
+    #[arg(long, default_value = "enrollment")]
+    db_user: String,
+    /// Postgres database in the generated connection URL.
+    #[arg(long, default_value = "enrollment")]
+    db_database: String,
+    /// Postgres host in the generated connection URL.
+    #[arg(long, default_value = "grid-enrollment-db")]
+    db_host: String,
+    /// CA bundle path the service verifies Postgres against.
+    #[arg(long, default_value = "/etc/grid-ca-bundle/ca.crt")]
+    db_ca_path: String,
+    /// Secret for the local grid-admin token table, created once with a generated token.
+    #[arg(long)]
+    admin_tokens_secret: Option<String>,
 }
 
 /// Run the `bootstrap` subcommand.
@@ -85,6 +109,10 @@ async fn bootstrap(args: &BootstrapArgs) -> Result<(), BoxError> {
     let client = kube::Client::try_default().await?;
     let secrets: Api<Secret> = Api::namespaced(client.clone(), &namespace);
 
+    ensure_credentials(&secrets, args).await?;
+    if args.skip_ca {
+        return Ok(());
+    }
     let ca = resolve_ca(&secrets, args).await?;
     write_opaque_secret(&secrets, &args.ca_bundle_secret, "ca.crt", &ca.cert_pem).await?;
     if !args.skip_serving {
@@ -97,6 +125,71 @@ async fn bootstrap(args: &BootstrapArgs) -> Result<(), BoxError> {
         Box::pin(reconcile_db_roll(client, &namespace, deployment, &fingerprint)).await?;
     }
     Ok(())
+}
+
+/// Create the builtin Postgres credentials and the grid-admin token table, if asked and absent.
+async fn ensure_credentials(
+    secrets: &kube::api::Api<k8s_openapi::api::core::v1::Secret>,
+    args: &BootstrapArgs,
+) -> Result<(), BoxError> {
+    if let Some(name) = &args.db_credentials_secret {
+        let password = enrollment::api::random_hex(16)?;
+        create_if_absent(secrets, name, db_credentials(args, &password)).await?;
+    }
+    if let Some(name) = &args.admin_tokens_secret {
+        let token = enrollment::api::random_hex(20)?;
+        create_if_absent(secrets, name, admin_tokens(&token)).await?;
+    }
+    Ok(())
+}
+
+/// Builtin Postgres credentials: the password and the verify-full connection URL.
+fn db_credentials(args: &BootstrapArgs, password: &str) -> std::collections::BTreeMap<String, String> {
+    let url = format!(
+        "postgres://{}:{password}@{}:5432/{}?sslmode=verify-full&sslrootcert={}",
+        args.db_user, args.db_host, args.db_database, args.db_ca_path
+    );
+    std::collections::BTreeMap::from([
+        ("password".to_owned(), password.to_owned()),
+        ("DB_CONNECTION_URL".to_owned(), url),
+    ])
+}
+
+/// A one-line grid-admin token table.
+fn admin_tokens(token: &str) -> std::collections::BTreeMap<String, String> {
+    std::collections::BTreeMap::from([("tokens".to_owned(), format!("admin:{token}\n"))])
+}
+
+/// Argo CD sync options that keep a Secret no manifest renders.
+const ARGO_KEEP: &str = "Prune=false,Delete=false";
+
+/// Create an `Opaque` Secret unless one exists, then mark it so Argo CD never
+/// prunes it. An existing Secret is never rotated, whoever wrote it.
+async fn create_if_absent(
+    secrets: &kube::api::Api<k8s_openapi::api::core::v1::Secret>,
+    name: &str,
+    string_data: std::collections::BTreeMap<String, String>,
+) -> Result<(), BoxError> {
+    use kube::api::{Patch, PatchParams};
+
+    match apply_secret(secrets, name, Some("Opaque"), string_data, false).await {
+        Err(error) if is_conflict(error.as_ref()) => {},
+        result => result?,
+    }
+    secrets
+        .patch_metadata(name, &PatchParams::default(), &Patch::Merge(argo_keep_patch()))
+        .await?;
+    Ok(())
+}
+
+/// The merge patch that marks a Secret for Argo CD to keep.
+fn argo_keep_patch() -> serde_json::Value {
+    serde_json::json!({ "metadata": { "annotations": { "argocd.argoproj.io/sync-options": ARGO_KEEP } } })
+}
+
+/// Whether `error` is a create that lost a race to another writer.
+fn is_conflict(error: &(dyn Error + Send + Sync + 'static)) -> bool {
+    matches!(error.downcast_ref::<kube::Error>(), Some(kube::Error::Api(response)) if response.code == 409)
 }
 
 /// Load the CA from its Secret, or generate and persist a fresh one.
@@ -449,9 +542,56 @@ async fn apply_secret(
 mod tests {
     use std::{collections::BTreeMap, sync::LazyLock};
 
+    use clap::Parser as _;
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, OwnerReference};
 
-    use super::{MANAGED_BY, ServingCert, foreign_manager, needs_roll, roll_patch, serving_cert, serving_needs_issue};
+    use super::{
+        BootstrapArgs, MANAGED_BY, ServingCert, admin_tokens, argo_keep_patch, db_credentials, foreign_manager,
+        needs_roll, roll_patch, serving_cert, serving_needs_issue,
+    };
+
+    #[test]
+    fn db_credentials_match_the_chart_connection_url() {
+        let args = BootstrapArgs::parse_from([
+            "bootstrap",
+            "--db-credentials-secret",
+            "grid-enrollment-db",
+            "--db-host",
+            "grid-enrollment-db",
+        ]);
+        let data = db_credentials(&args, "s3cret");
+        assert_eq!(data.get("password").map(String::as_str), Some("s3cret"));
+        assert_eq!(
+            data.get("DB_CONNECTION_URL").map(String::as_str),
+            Some(
+                "postgres://enrollment:s3cret@grid-enrollment-db:5432/enrollment\
+                 ?sslmode=verify-full&sslrootcert=/etc/grid-ca-bundle/ca.crt"
+            )
+        );
+    }
+
+    #[test]
+    fn argo_keep_patch_touches_only_the_sync_options_annotation() {
+        assert_eq!(
+            argo_keep_patch(),
+            serde_json::json!({
+                "metadata": { "annotations": { "argocd.argoproj.io/sync-options": "Prune=false,Delete=false" } }
+            })
+        );
+    }
+
+    #[test]
+    fn admin_tokens_is_one_name_token_line() {
+        let data = admin_tokens("abc");
+        assert_eq!(data.get("tokens").map(String::as_str), Some("admin:abc\n"));
+    }
+
+    #[test]
+    fn generated_values_are_hex_of_the_requested_length() {
+        let value = enrollment::api::random_hex(16).expect("random");
+        assert_eq!(value.len(), 32);
+        assert!(value.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    }
 
     #[test]
     fn serving_cert_needs_both_halves() {

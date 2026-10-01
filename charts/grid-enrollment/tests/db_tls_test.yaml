@@ -40,9 +40,7 @@ tests:
           path: spec.template.spec.containers[0].env[?(@.name=="POSTGRESQL_PASSWORD")].valueFrom.secretKeyRef.name
           value: my-db-secret
 
-  - it: with a BYO db secret, no chart-generated DB Secret is rendered (only ConfigMap+PVC+Service+Deployment)
-    set:
-      db.builtin.auth.existingSecretRef: my-db-secret
+  - it: renders no DB Secret, which the bootstrap Job creates (only ConfigMap+PVC+Service+Deployment)
     asserts:
       - hasDocuments:
           count: 4

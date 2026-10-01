@@ -1,14 +1,12 @@
+{{- include "grid-enrollment.normalize" . }}
 {{- if and (eq (include "grid-enrollment.caProvided" .) "true") (eq .Values.db.type "builtin") }}
 {{- fail "ca.method=provided (or ca.provided.keySecretRef) requires db.type=external: the builtin Postgres TLS cert is issued by the bootstrap Job, which a provided CA skips, so the builtin DB would serve plaintext and the service refuses it" }}
 {{- end }}
 {{- if eq .Values.db.type "builtin" }}
 {{/*
-Builtin Postgres: a PVC, a Service, and the Deployment, plus a generated Secret
-(password + the full DB_CONNECTION_URL the service reads) UNLESS the operator
-brings their own via db.builtin.auth.existingSecretRef. The Postgres resources
-render either way; only the generated Secret is conditional, so a BYO secret
-still gets a running Postgres. The generated password is preserved across
-upgrades via lookup.
+Builtin Postgres: a PVC, a Service, and the Deployment. The bootstrap Job creates
+the credentials Secret (password + the full DB_CONNECTION_URL the service reads)
+once, unless db.builtin.auth.existingSecretRef brings one.
 
 TLS ($tls): serves over TLS with the grid-CA-issued cert the bootstrap Job mints
 (grid-db-serving-tls), so the enrollment client can connect verify-full; the
@@ -20,36 +18,7 @@ DB_CONNECTION_URL that requires TLS to this Postgres (sslmode=verify-full).
 {{- $dbName := include "grid-enrollment.dbHost" . }}
 {{- $user := .Values.db.builtin.auth.username }}
 {{- $database := .Values.db.builtin.auth.database }}
-{{- $byo := .Values.db.builtin.auth.existingSecretRef }}
-{{- $secretName := $byo | default (printf "%s-db" (include "grid-enrollment.fullname" .)) }}
-{{- if not $byo }}
-{{- $existing := lookup "v1" "Secret" .Release.Namespace $secretName }}
-{{- $password := "" }}
-{{- if $existing }}
-{{- $password = index $existing.data "password" | b64dec }}
-{{- else }}
-{{- $password = randAlphaNum 32 }}
-{{- end }}
-{{- $sslParams := "" }}
-{{- if $tls }}
-{{- $sslParams = "?sslmode=verify-full&sslrootcert=/etc/grid-ca-bundle/ca.crt" }}
-{{- end }}
-{{- $url := printf "postgres://%s:%s@%s:5432/%s%s" $user $password $dbName $database $sslParams }}
-apiVersion: v1
-kind: Secret
-metadata:
-  name: {{ $secretName }}
-  namespace: {{ .Release.Namespace }}
-  labels:
-    {{- include "grid-enrollment.labels" . | nindent 4 }}
-  annotations:
-    helm.sh/resource-policy: keep
-type: Opaque
-data:
-  password: {{ $password | b64enc }}
-  DB_CONNECTION_URL: {{ $url | b64enc }}
----
-{{- end }}
+{{- $secretName := include "grid-enrollment.dbUrlSecret" . }}
 {{- if $tls }}
 apiVersion: v1
 kind: ConfigMap

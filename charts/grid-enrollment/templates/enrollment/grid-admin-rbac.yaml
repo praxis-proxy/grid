@@ -1,3 +1,4 @@
+{{- include "grid-enrollment.normalize" . }}
 {{- if eq .Values.enrollment.authz "kube" }}
 {{- $fullname := include "grid-enrollment.fullname" . }}
 {{- $admins := .Values.enrollment.gridAdmins }}

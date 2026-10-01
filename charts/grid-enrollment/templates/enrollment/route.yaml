@@ -1,3 +1,4 @@
+{{- include "grid-enrollment.normalize" . }}
 {{- include "grid-enrollment.validateRoute" . }}
 {{- if include "grid-enrollment.routeEnabled" . }}
 {{- /*

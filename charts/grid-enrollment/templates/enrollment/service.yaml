@@ -1,3 +1,4 @@
+{{- include "grid-enrollment.normalize" . }}
 apiVersion: v1
 kind: Service
 metadata:
@@ -8,6 +9,9 @@ metadata:
     app.kubernetes.io/component: enrollment
 spec:
   type: {{ .Values.enrollment.service.type }}
+  {{- if and (eq .Values.enrollment.service.type "LoadBalancer") .Values.enrollment.service.loadBalancerIP }}
+  loadBalancerIP: {{ .Values.enrollment.service.loadBalancerIP | quote }}
+  {{- end }}
   selector:
     {{- include "grid-enrollment.enrollmentSelectorLabels" . | nindent 4 }}
   ports:

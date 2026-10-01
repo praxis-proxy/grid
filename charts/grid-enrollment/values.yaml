@@ -4,6 +4,10 @@
 # deploys Postgres, generates a grid-admin token, and runs the enrollment
 # service over TLS. Every escape hatch below overrides one of those defaults.
 
+# -- The enrollment name sites connect to. It joins the serving cert names and is the
+# default route.host.
+host: ""
+
 nameOverride: ""
 fullnameOverride: ""
 commonLabels: {}
@@ -39,6 +43,8 @@ ca:
   bootstrap:
     # The `enrollment bootstrap` subcommand runs as the pre-install Job.
     resources: {}
+    # Seconds a finished bootstrap Job is kept for its logs. Null keeps it until the next hook.
+    ttlSecondsAfterFinished: 86400
 
 # ------------------------------------------------------------------------------
 # Enrollment endpoint serving cert (in-process TLS). Default: issued from the
@@ -113,14 +119,17 @@ enrollment:
       create: false
       name: grid-admin
   gridAdminTokens:
-    generate: true                   # generate a grid-admin-token Secret on install
+    generate: true                   # the bootstrap Job creates a grid-admin-token Secret once
     existingSecretRef: ""            # BYO Secret with key "tokens" (name:token lines)
   serviceAccount:
     create: true
     name: ""
   service:
     # Port is derived from listenAddr (single source of truth); set the type only.
-    type: ClusterIP
+    # Empty: LoadBalancer when host is set and no Route renders, else ClusterIP.
+    type: ""
+    # Static LoadBalancer address, so the enrollment URL is known before install.
+    loadBalancerIP: ""
   resources: {}
   podSecurityContext:
     runAsNonRoot: true
@@ -151,7 +160,7 @@ db:
     auth:
       database: enrollment
       username: enrollment
-      # Password auto-generated into the release DB Secret if not provided.
+      # Without it, the bootstrap Job creates <fullname>-db once with a generated password.
       existingSecretRef: ""          # Secret with keys: password, DB_CONNECTION_URL
     # Builtin Postgres serves TLS with a grid-CA-issued cert minted by the
     # bootstrap Job; the enrollment client connects sslmode=verify-full against
@@ -175,5 +184,9 @@ db:
     caConfigMapName: ""
     caConfigMapKey: ca.crt
 
-# -- Sites to invite. Each run skips sites whose invite Secret exists.
-invites: []
+# -- Sites to invite, keyed by site name: network (default grid) and expiresInSecs. Each
+# run skips sites whose invite Secret exists. The older list of {siteName,
+# gridNetworkRef, expiresInSecs} still renders.
+# invites:
+#   site-a:
+#     network: grid

@@ -1,14 +1,17 @@
-{{- if not (eq (include "grid-enrollment.caProvided" .) "true") }}
+{{- include "grid-enrollment.normalize" . }}
+{{- if include "grid-enrollment.bootstrapRuns" . }}
 {{/*
 Generate the Grid CA (if absent), derive the public bundle, and issue the
-enrollment serving and DB serving certs, before the service starts. Runs
+enrollment serving and DB serving certs, before the service starts. Also creates
+the builtin DB credentials and the local grid-admin token table once. Runs
 `enrollment bootstrap` in the app image (bootstrap feature). Idempotent: it loads
-an existing CA rather than regenerate unless ca.forceRegenerate is set.
+an existing CA rather than regenerate unless ca.forceRegenerate is set, and never
+rotates a credentials Secret.
 */}}
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: {{ include "grid-enrollment.fullname" . }}-ca-bootstrap-{{ .Release.Revision }}
+  name: {{ include "grid-enrollment.fullname" . }}-ca-bootstrap
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "grid-enrollment.labels" . | nindent 4 }}
@@ -16,10 +19,13 @@ metadata:
   annotations:
     helm.sh/hook: pre-install,pre-upgrade
     helm.sh/hook-weight: "-5"
-    # Keep the succeeded Job (deleted before the next install) so its logs are
-    # collectable for the smoke/e2e panic-scan.
+    # Kept for its logs until the next hook run or its TTL.
     helm.sh/hook-delete-policy: before-hook-creation
 spec:
+  {{- $ttl := ((.Values.ca).bootstrap).ttlSecondsAfterFinished }}
+  {{- if not (kindIs "invalid" $ttl) }}
+  ttlSecondsAfterFinished: {{ $ttl }}
+  {{- end }}
   backoffLimit: 2
   template:
     metadata:
@@ -45,6 +51,23 @@ spec:
           args:
             - "--namespace"
             - "{{ .Release.Namespace }}"
+            {{- if include "grid-enrollment.generatesDbCredentials" . }}
+            - "--db-credentials-secret"
+            - "{{ include "grid-enrollment.dbUrlSecret" . }}"
+            - "--db-user"
+            - "{{ .Values.db.builtin.auth.username }}"
+            - "--db-database"
+            - "{{ .Values.db.builtin.auth.database }}"
+            - "--db-host"
+            - "{{ include "grid-enrollment.dbHost" . }}"
+            {{- end }}
+            {{- if include "grid-enrollment.generatesAdminTokens" . }}
+            - "--admin-tokens-secret"
+            - "{{ include "grid-enrollment.adminTokensSecret" . }}"
+            {{- end }}
+            {{- if eq (include "grid-enrollment.caProvided" .) "true" }}
+            - "--skip-ca"
+            {{- else }}
             - "--common-name"
             - "{{ .Values.ca.commonName }}"
             - "--ca-key-secret"
@@ -81,6 +104,7 @@ spec:
             {{- end }}
             {{- if .Values.ca.forceRegenerate }}
             - "--force-regenerate"
+            {{- end }}
             {{- end }}
           {{- with .Values.ca.bootstrap.resources }}
           resources:

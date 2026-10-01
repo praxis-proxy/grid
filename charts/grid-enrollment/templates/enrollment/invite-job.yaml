@@ -1,3 +1,4 @@
+{{- include "grid-enrollment.normalize" . }}
 {{- if .Values.invites }}
 {{- if ne .Values.enrollment.authz "kube" }}
 {{- fail "invites need enrollment.authz=kube: the invite Job authenticates with an audience-bound ServiceAccount token" }}
