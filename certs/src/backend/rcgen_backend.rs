@@ -15,7 +15,7 @@ use x509_parser::{
     prelude::{FromDer as _, X509Certificate},
 };
 
-use super::{BackendError, CertSpec, GeneratedCa, GeneratedCert, SignedCsr};
+use super::{BackendError, CertSpec, GeneratedCa, GeneratedCert, GeneratedCsr, SignedCsr};
 
 /// Parse a request, verify its self-signature, and return its
 /// `SubjectPublicKeyInfo` DER.
@@ -90,6 +90,20 @@ pub(crate) fn generate_ca(spec: &CertSpec<'_>) -> Result<GeneratedCa, BackendErr
         material: CaMaterial {
             issuer: Issuer::new(params, key_pair),
         },
+    })
+}
+
+/// Generate a key and a CSR naming only `common_name`.
+pub(crate) fn generate_csr(common_name: &str) -> Result<GeneratedCsr, BackendError> {
+    let mut params = CertificateParams::default();
+    params.distinguished_name.push(DnType::CommonName, common_name);
+    let key = KeyPair::generate().map_err(|err| BackendError::KeyGen(err.to_string()))?;
+    let csr = params
+        .serialize_request(&key)
+        .map_err(|err| BackendError::Sign(err.to_string()))?;
+    Ok(GeneratedCsr {
+        csr_pem: csr.pem().map_err(|err| BackendError::Sign(err.to_string()))?,
+        key_pem: key.serialize_pem(),
     })
 }
 

@@ -17,7 +17,7 @@ use openssl::{
     },
 };
 
-use super::{BackendError, CertSpec, GeneratedCa, GeneratedCert, SignedCsr};
+use super::{BackendError, CertSpec, GeneratedCa, GeneratedCert, GeneratedCsr, SignedCsr};
 
 /// Material for signing site certificates under a CA.
 pub(crate) struct CaMaterial {
@@ -204,6 +204,29 @@ pub(crate) fn generate_ca(spec: &CertSpec<'_>) -> Result<GeneratedCa, BackendErr
         cert_pem: to_pem(&cert)?,
         key_pem: key_to_pem(&key)?,
         material: CaMaterial { cert, key },
+    })
+}
+
+/// Generate a key and a CSR naming only `common_name`.
+pub(crate) fn generate_csr(common_name: &str) -> Result<GeneratedCsr, BackendError> {
+    let key = generate_p256()?;
+    let mut subject = X509NameBuilder::new().map_err(|err| sign_err(&err))?;
+    subject
+        .append_entry_by_text("CN", common_name)
+        .map_err(|err| sign_err(&err))?;
+    let subject = subject.build();
+    let mut builder = X509Req::builder().map_err(|err| sign_err(&err))?;
+    builder.set_subject_name(&subject).map_err(|err| sign_err(&err))?;
+    builder.set_pubkey(&key).map_err(|err| sign_err(&err))?;
+    builder
+        .sign(&key, MessageDigest::sha256())
+        .map_err(|err| sign_err(&err))?;
+    let req = builder.build();
+    let csr_pem = String::from_utf8(req.to_pem().map_err(|err| sign_err(&err))?)
+        .map_err(|err| BackendError::Sign(err.to_string()))?;
+    Ok(GeneratedCsr {
+        csr_pem,
+        key_pem: key_to_pem(&key)?,
     })
 }
 

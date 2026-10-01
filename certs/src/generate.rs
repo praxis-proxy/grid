@@ -105,6 +105,27 @@ pub fn generate_ca(common_name: &str) -> Result<CaCert, GenerateError> {
     })
 }
 
+/// A CSR and its private key.
+pub struct GeneratedCsr {
+    /// PEM-encoded PKCS#10 request.
+    pub csr_pem: String,
+    /// PEM-encoded private key.
+    pub key_pem: zeroize::Zeroizing<String>,
+}
+
+/// Generate a key and a CSR naming only `common_name`.
+///
+/// # Errors
+///
+/// Returns [`GenerateError`] if key generation or signing fails.
+pub fn generate_csr(common_name: &str) -> Result<GeneratedCsr, GenerateError> {
+    let out = backend::generate_csr(common_name).map_err(map_backend)?;
+    Ok(GeneratedCsr {
+        csr_pem: out.csr_pem,
+        key_pem: zeroize::Zeroizing::new(out.key_pem),
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Site certificate generation
 // ---------------------------------------------------------------------------

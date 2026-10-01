@@ -23,16 +23,17 @@ pub use enroll::{
     verify_csr,
 };
 pub use generate::{
-    CaCert, DEFAULT_ORGANIZATION, GenerateError, SPIFFE_TRUST_DOMAIN, SiteCertOutput, generate_ca,
-    generate_cert_with_org, generate_dns_cert, generate_dns_only_cert, generate_expired_dns_cert,
+    CaCert, DEFAULT_ORGANIZATION, GenerateError, GeneratedCsr, SPIFFE_TRUST_DOMAIN, SiteCertOutput, generate_ca,
+    generate_cert_with_org, generate_csr, generate_dns_cert, generate_dns_only_cert, generate_expired_dns_cert,
     generate_not_yet_valid_dns_cert, generate_site_cert, generate_site_cert_with_names, load_ca, spiffe_id,
 };
 #[cfg(feature = "verifier")]
 pub use grid_verifier::{DEFAULT_TRUST_DOMAIN, GridSpiffeClientVerifier, GridSpiffeServerVerifier};
 pub use provider::{CertificateProvider, ProviderError, SiteCertificate, StaticFileProvider, TrustBundle};
 pub use verify::{
-    MAX_CERT_PEM_BYTES, VerifyError, canonical_fingerprint, cert_dns_sans, cert_expires_within, cert_issuer_and_expiry,
-    csr_public_key, verify_issued_by, verify_site_cert,
+    MAX_CERT_PEM_BYTES, VerifyError, anchored_ca, bundle_within, canonical_fingerprint, cert_dns_sans,
+    cert_expires_within, cert_issuer_and_expiry, cert_public_key, csr_public_key, has_svid_profile, leaf_only,
+    verify_issued_by, verify_site_cert,
 };
 
 /// SHA-256 through the active backend: the sha2 crate by default, system openssl

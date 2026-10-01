@@ -13,14 +13,14 @@ use time::OffsetDateTime;
 mod rcgen_backend;
 #[cfg(feature = "rcgen")]
 pub(crate) use rcgen_backend::{
-    CaMaterial, csr_spki_der, generate_ca, issue_leaf, load_ca, sha256, sign_csr, verify_leaf_signature,
+    CaMaterial, csr_spki_der, generate_ca, generate_csr, issue_leaf, load_ca, sha256, sign_csr, verify_leaf_signature,
 };
 
 #[cfg(feature = "fips")]
 mod openssl_backend;
 #[cfg(feature = "fips")]
 pub(crate) use openssl_backend::{
-    CaMaterial, csr_spki_der, generate_ca, issue_leaf, load_ca, sha256, sign_csr, verify_leaf_signature,
+    CaMaterial, csr_spki_der, generate_ca, generate_csr, issue_leaf, load_ca, sha256, sign_csr, verify_leaf_signature,
 };
 
 /// What a certificate should say, independent of the backend that mints it.
@@ -58,6 +58,14 @@ pub(crate) struct GeneratedCa {
 pub(crate) struct GeneratedCert {
     /// PEM-encoded certificate.
     pub cert_pem: String,
+    /// PEM-encoded private key.
+    pub key_pem: String,
+}
+
+/// A CSR and its private key.
+pub(crate) struct GeneratedCsr {
+    /// PEM-encoded PKCS#10 request.
+    pub csr_pem: String,
     /// PEM-encoded private key.
     pub key_pem: String,
 }

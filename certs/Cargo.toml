@@ -26,6 +26,7 @@ openssl = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
 thiserror = { workspace = true }
 time = { workspace = true }
+zeroize = { workspace = true }
 # No provider feature: algorithms come from the consumer's installed provider.
 rustls = { workspace = true, optional = true }
 

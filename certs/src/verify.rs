@@ -50,6 +50,14 @@ pub enum VerifyError {
     #[error("certificate does not carry exactly one SPIFFE URI name")]
     NotOneSpiffeName,
 
+    /// The CA is not a pinned anchor.
+    #[error("CA certificate is not one of the pinned grid CAs")]
+    NotAnchored,
+
+    /// The certificate is not a self-signed CA.
+    #[error("certificate is not a self-signed CA")]
+    NotSelfSignedCa,
+
     /// The certificate names a different site than the one claiming it.
     #[error("certificate names {found}, but {claimed} is claiming it")]
     NameMismatch {
@@ -141,12 +149,9 @@ fn with_issued_leaf<T>(
 ///
 /// Returns [`VerifyError`] if the certificate is oversized or unparseable.
 pub fn cert_issuer_and_expiry(cert_pem: &str) -> Result<(String, String), VerifyError> {
-    if cert_pem.len() > MAX_CERT_PEM_BYTES {
-        return Err(VerifyError::TooLarge);
-    }
-    let der = pem::parse(cert_pem).map_err(|_bad| VerifyError::Malformed)?;
-    let (_rest, cert) = X509Certificate::from_der(der.contents()).map_err(|_bad| VerifyError::Malformed)?;
-    Ok((cert.issuer().to_string(), cert.validity().not_after.to_string()))
+    with_cert(cert_pem, |cert| {
+        (cert.issuer().to_string(), cert.validity().not_after.to_string())
+    })
 }
 
 /// Whether a certificate has expired or expires within `window`.
@@ -155,12 +160,9 @@ pub fn cert_issuer_and_expiry(cert_pem: &str) -> Result<(String, String), Verify
 ///
 /// Returns [`VerifyError`] if the certificate is oversized or unparseable.
 pub fn cert_expires_within(cert_pem: &str, window: time::Duration) -> Result<bool, VerifyError> {
-    if cert_pem.len() > MAX_CERT_PEM_BYTES {
-        return Err(VerifyError::TooLarge);
-    }
-    let der = pem::parse(cert_pem).map_err(|_bad| VerifyError::Malformed)?;
-    let (_rest, cert) = X509Certificate::from_der(der.contents()).map_err(|_bad| VerifyError::Malformed)?;
-    Ok(cert.validity().time_to_expiration().is_none_or(|left| left < window))
+    with_cert(cert_pem, |cert| {
+        cert.validity().time_to_expiration().is_none_or(|left| left < window)
+    })
 }
 
 /// The canonical fingerprint of a certificate: lowercase hex SHA-256 over its
@@ -191,27 +193,22 @@ pub fn canonical_fingerprint(cert_pem: &str) -> Result<String, VerifyError> {
 ///
 /// Returns [`VerifyError`] if the certificate is oversized or unparseable.
 pub fn cert_dns_sans(cert_pem: &str) -> Result<Vec<String>, VerifyError> {
-    if cert_pem.len() > MAX_CERT_PEM_BYTES {
-        return Err(VerifyError::TooLarge);
-    }
-    let der = pem::parse(cert_pem).map_err(|_bad| VerifyError::Malformed)?;
-    let (_rest, cert) = X509Certificate::from_der(der.contents()).map_err(|_bad| VerifyError::Malformed)?;
-    let Some(san) = cert.subject_alternative_name().ok().flatten() else {
-        return Ok(Vec::new());
-    };
-    let names = san
-        .value
-        .general_names
-        .iter()
-        .filter_map(|name| {
-            if let GeneralName::DNSName(dns) = name {
-                Some((*dns).to_owned())
-            } else {
-                None
-            }
-        })
-        .collect();
-    Ok(names)
+    with_cert(cert_pem, |cert| {
+        let Some(san) = cert.subject_alternative_name().ok().flatten() else {
+            return Vec::new();
+        };
+        san.value
+            .general_names
+            .iter()
+            .filter_map(|name| {
+                if let GeneralName::DNSName(dns) = name {
+                    Some((*dns).to_owned())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    })
 }
 
 /// The public key a certificate request carries, as `SubjectPublicKeyInfo` DER.
@@ -235,6 +232,120 @@ pub fn csr_public_key(csr_pem: &str) -> Result<Vec<u8>, VerifyError> {
     let (_rest, csr) = X509CertificationRequest::from_der(der.contents()).map_err(|_bad| VerifyError::Malformed)?;
 
     Ok(csr.certification_request_info.subject_pki.raw.to_vec())
+}
+
+/// The certificate's `SubjectPublicKeyInfo` DER.
+///
+/// # Errors
+///
+/// Returns [`VerifyError`] if the certificate is oversized or unparseable.
+pub fn cert_public_key(cert_pem: &str) -> Result<Vec<u8>, VerifyError> {
+    with_cert(cert_pem, |cert| cert.public_key().raw.to_vec())
+}
+
+/// Whether a leaf has the X.509-SVID constraints and key usage.
+///
+/// # Errors
+///
+/// Returns [`VerifyError`] if the certificate is oversized or unparseable.
+pub fn has_svid_profile(cert_pem: &str) -> Result<bool, VerifyError> {
+    with_cert(cert_pem, |cert| {
+        let not_ca = cert
+            .basic_constraints()
+            .ok()
+            .flatten()
+            .is_some_and(|bc| bc.critical && !bc.value.ca);
+        let signs_only = cert.key_usage().ok().flatten().is_some_and(|ku| {
+            ku.critical && ku.value.digital_signature() && !ku.value.key_cert_sign() && !ku.value.crl_sign()
+        });
+        not_ca && signs_only
+    })
+}
+
+/// Apply `read` to the size-checked, parsed `cert_pem`.
+fn with_cert<T>(cert_pem: &str, read: impl FnOnce(&X509Certificate<'_>) -> T) -> Result<T, VerifyError> {
+    if cert_pem.len() > MAX_CERT_PEM_BYTES {
+        return Err(VerifyError::TooLarge);
+    }
+    let der = pem::parse(cert_pem).map_err(|_bad| VerifyError::Malformed)?;
+    let (_rest, cert) = X509Certificate::from_der(der.contents()).map_err(|_bad| VerifyError::Malformed)?;
+    Ok(read(&cert))
+}
+
+/// The single CA in `ca_pem` if it is a pinned, self-signed CA.
+///
+/// # Errors
+///
+/// Returns [`VerifyError`] if it is unpinned, invalid, or unparseable.
+pub fn anchored_ca(ca_pem: &str, anchors_pem: &str) -> Result<String, VerifyError> {
+    if ca_pem.len() > MAX_CERT_PEM_BYTES {
+        return Err(VerifyError::TooLarge);
+    }
+    let [ca_der] = cert_ders(ca_pem)
+        .map_err(|_bad| VerifyError::MalformedCa)?
+        .try_into()
+        .map_err(|_many: Vec<_>| VerifyError::MalformedCa)?;
+    if !cert_ders(anchors_pem)?.contains(&ca_der) {
+        return Err(VerifyError::NotAnchored);
+    }
+    let (_rest, ca) = X509Certificate::from_der(&ca_der).map_err(|_bad| VerifyError::MalformedCa)?;
+    if !ca.is_ca() || ca.issuer() != ca.subject() {
+        return Err(VerifyError::NotSelfSignedCa);
+    }
+    if !ca.validity().is_valid() {
+        return Err(VerifyError::NotCurrentlyValid);
+    }
+    let pem = encode_cert(ca_der);
+    crate::backend::verify_leaf_signature(&pem, &pem).map_err(|_bad| VerifyError::NotSelfSignedCa)?;
+    Ok(pem)
+}
+
+/// The certificate in the first PEM block of `cert_pem`, re-encoded alone.
+///
+/// # Errors
+///
+/// Returns [`VerifyError`] if the certificate is oversized or unparseable.
+pub fn leaf_only(cert_pem: &str) -> Result<String, VerifyError> {
+    if cert_pem.len() > MAX_CERT_PEM_BYTES {
+        return Err(VerifyError::TooLarge);
+    }
+    let block = pem::parse(cert_pem).map_err(|_bad| VerifyError::Malformed)?;
+    let der = block.contents();
+    let (rest, _cert) = X509Certificate::from_der(der).map_err(|_bad| VerifyError::Malformed)?;
+    let used = der.len().saturating_sub(rest.len());
+    Ok(encode_cert(der.get(..used).unwrap_or_default().to_vec()))
+}
+
+/// `der` as one LF-ended `CERTIFICATE` block.
+fn encode_cert(der: Vec<u8>) -> String {
+    pem::encode_config(
+        &pem::Pem::new("CERTIFICATE", der),
+        pem::EncodeConfig::new().set_line_ending(pem::LineEnding::LF),
+    )
+}
+
+/// Whether `bundle_pem` is non-empty and all in `anchors_pem`.
+///
+/// # Errors
+///
+/// Errors if either is oversized or holds a malformed PEM block.
+pub fn bundle_within(bundle_pem: &str, anchors_pem: &str) -> Result<bool, VerifyError> {
+    if bundle_pem.len() > MAX_CERT_PEM_BYTES || anchors_pem.len() > MAX_CERT_PEM_BYTES {
+        return Err(VerifyError::TooLarge);
+    }
+    let anchors = cert_ders(anchors_pem)?;
+    let bundle = cert_ders(bundle_pem)?;
+    Ok(!bundle.is_empty() && bundle.iter().all(|der| anchors.contains(der)))
+}
+
+/// The DER of each certificate in `bundle_pem`.
+fn cert_ders(bundle_pem: &str) -> Result<Vec<Vec<u8>>, VerifyError> {
+    Ok(pem::parse_many(bundle_pem)
+        .map_err(|_bad| VerifyError::Malformed)?
+        .into_iter()
+        .filter(|block| block.tag() == "CERTIFICATE")
+        .map(pem::Pem::into_contents)
+        .collect())
 }
 
 /// The one SPIFFE URI name on a certificate, when there is exactly one.
@@ -267,6 +378,110 @@ mod tests {
         let key = rcgen::KeyPair::generate().expect("key");
         let params = rcgen::CertificateParams::default();
         params.serialize_request(&key).expect("csr").pem().expect("pem")
+    }
+
+    #[test]
+    fn a_returned_ca_is_trusted_only_when_pinned() {
+        let ca = generate_ca("grid-ca").expect("ca");
+        let other = generate_ca("grid-ca").expect("other ca");
+        let bundle = format!("{}{}", other.cert_pem, ca.cert_pem);
+        let pinned = anchored_ca(&ca.cert_pem, &bundle).expect("a pinned CA is accepted");
+        assert!(
+            bundle_within(&pinned, &ca.cert_pem).expect("pem"),
+            "the same cert comes back"
+        );
+        assert_eq!(
+            anchored_ca(&ca.cert_pem, &other.cert_pem),
+            Err(VerifyError::NotAnchored),
+            "a CA outside the anchors is refused"
+        );
+        assert_eq!(
+            anchored_ca(&bundle, &bundle),
+            Err(VerifyError::MalformedCa),
+            "exactly one CA certificate is accepted"
+        );
+        let leaf = generate_site_cert(&ca, "site-d").expect("leaf");
+        assert_eq!(
+            anchored_ca(&leaf.cert_pem, &leaf.cert_pem),
+            Err(VerifyError::NotSelfSignedCa),
+            "a pinned leaf is not a CA"
+        );
+    }
+
+    #[test]
+    fn leaf_only_keeps_the_first_certificate_alone() {
+        let ca = generate_ca("grid-ca").expect("ca");
+        let leaf = generate_site_cert(&ca, "site-d").expect("leaf").cert_pem;
+        let padded = format!("{leaf}{}trailing junk\n", ca.cert_pem);
+        let only = leaf_only(&padded).expect("first block parses");
+        assert_eq!(pem::parse_many(&only).expect("pem").len(), 1, "one block is kept");
+        assert_eq!(bundle_within(&only, &leaf), Ok(true), "the first certificate is kept");
+        assert_eq!(leaf_only("not pem"), Err(VerifyError::Malformed), "non-PEM is refused");
+    }
+
+    #[test]
+    fn a_bundle_is_within_the_anchors_only_when_every_cert_is() {
+        let ca = generate_ca("grid-ca").expect("ca").cert_pem;
+        let other = generate_ca("other").expect("other ca").cert_pem;
+        let both = format!("{ca}{other}");
+        for (bundle, anchors, within) in [
+            (ca.as_str(), both.as_str(), true),
+            (both.as_str(), both.as_str(), true),
+            (both.as_str(), ca.as_str(), false),
+            (other.as_str(), ca.as_str(), false),
+            ("", ca.as_str(), false),
+        ] {
+            assert_eq!(bundle_within(bundle, anchors), Ok(within), "{bundle} in {anchors}");
+        }
+        let oversized = "x".repeat(MAX_CERT_PEM_BYTES + 1);
+        assert_eq!(
+            bundle_within(&oversized, &ca),
+            Err(VerifyError::TooLarge),
+            "an oversized bundle"
+        );
+        assert_eq!(
+            bundle_within(&ca, &oversized),
+            Err(VerifyError::TooLarge),
+            "oversized anchors"
+        );
+    }
+
+    #[test]
+    fn the_svid_profile_needs_critical_ca_false_and_signing_only() {
+        let leaf = |explicit: bool| {
+            let mut params = rcgen::CertificateParams::default();
+            if explicit {
+                params.is_ca = rcgen::IsCa::ExplicitNoCa;
+                params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
+            }
+            let key = rcgen::KeyPair::generate().expect("key");
+            params.self_signed(&key).expect("cert").pem()
+        };
+        assert_eq!(has_svid_profile(&leaf(true)), Ok(true), "SVID profile");
+        assert_eq!(
+            has_svid_profile(&leaf(false)),
+            Ok(false),
+            "no basic constraints or key usage"
+        );
+        let ca = generate_ca("grid-ca").expect("ca").cert_pem;
+        assert_eq!(has_svid_profile(&ca), Ok(false), "a CA is not a leaf");
+    }
+
+    #[test]
+    fn cert_and_csr_keys_compare_as_spki() {
+        let ca = generate_ca("grid-ca").expect("ca");
+        let csr = csr_for("site-d");
+        let issued = sign_csr(&ca, "site-d", &csr, crate::Validity::default()).expect("sign");
+        assert_eq!(
+            cert_public_key(&issued.cert_pem).expect("cert key"),
+            csr_public_key(&csr).expect("csr key"),
+            "an issued leaf carries the request's key"
+        );
+        assert_ne!(
+            cert_public_key(&issued.cert_pem).expect("cert key"),
+            csr_public_key(&csr_for("site-d")).expect("csr key"),
+            "another request's key does not match"
+        );
     }
 
     #[test]
