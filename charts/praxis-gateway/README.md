@@ -194,7 +194,7 @@ Praxis AI image; these values may advance independently.
 | `podLabels` | object | `{}` | Additional pod labels. Selector labels cannot be overridden. |
 | `podAnnotations` | object | `{}` | Pod annotations. |
 | `podSecurityContext` | object | `{}` | Extra pod securityContext (`runAsUser`, `runAsGroup`, `fsGroup`, `supplementalGroups`). |
-| `imageUser.enabled` | string or bool | `auto` | Set `imageUser.uid` and `imageUser.gid` as the Praxis container's `runAsUser` and `runAsGroup` when `podSecurityContext` sets no `runAsUser`. A `podSecurityContext.runAsGroup` replaces `imageUser.gid`. `auto` skips them on OpenShift (`security.openshift.io/v1`), where the SCC assigns IDs. |
+| `imageUser.enabled` | string or bool | `auto` | Set `imageUser.uid` and `imageUser.gid` as the Praxis container's `runAsUser` and `runAsGroup` when `podSecurityContext` sets no `runAsUser`. A `podSecurityContext.runAsGroup` replaces `imageUser.gid`. `auto` applies them only to the official `praxis-proxy` `ai`, `praxis`, and `grid-gateway` images or mirrors that keep that path, not their `-fips` tags, which run as 1001:1001, and not on OpenShift (`security.openshift.io/v1`), where the SCC assigns IDs. Other images keep the user they declare. `true` forces them for any image, such as one built `FROM` the official images that keeps the named user `praxis`. |
 | `imageUser.uid` | int | `100` | Numeric user of the official Praxis images, which declare the named user `praxis`. |
 | `imageUser.gid` | int | `101` | Numeric group of the official Praxis images. |
 | `command` | list | `[]` | Container command, replacing the image entrypoint. Empty keeps the entrypoint. |
@@ -274,9 +274,10 @@ Praxis AI image; these values may advance independently.
 
 The chart enforces Kubernetes restricted security defaults:
 
-- `runAsNonRoot: true`, running as the image's numeric user (`imageUser`, 100:101)
-  unless `podSecurityContext` sets `runAsUser` or the cluster is OpenShift, where
-  the SCC assigns IDs
+- `runAsNonRoot: true`, running the official images as their numeric user
+  (`imageUser`, 100:101) unless `podSecurityContext` sets `runAsUser` or the
+  cluster is OpenShift, where the SCC assigns IDs. Other images keep the user
+  they declare.
 - `readOnlyRootFilesystem: true`
 - `allowPrivilegeEscalation: false`
 - All Linux capabilities dropped

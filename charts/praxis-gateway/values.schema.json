@@ -292,7 +292,7 @@
       "properties": {
         "enabled": {
           "enum": [true, false, "true", "false", "auto"],
-          "description": "auto applies uid and gid except when security.openshift.io/v1 is served."
+          "description": "auto applies uid and gid to the official praxis-proxy ai, praxis, and grid-gateway images (not -fips tags), except when security.openshift.io/v1 is served. true applies them to any image."
         },
         "uid": {
           "type": "integer",

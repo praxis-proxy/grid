@@ -57,6 +57,46 @@ tests:
       - notExists:
           path: spec.template.spec.containers[?(@.name == "praxis")].securityContext.runAsUser
 
+  - it: keeps a custom image's own user
+    template: templates/deployment.yaml
+    set:
+      image.repository: registry.example.com/team/gateway
+    asserts:
+      - notExists:
+          path: spec.template.spec.containers[?(@.name == "praxis")].securityContext.runAsUser
+      - notExists:
+          path: spec.template.spec.containers[?(@.name == "praxis")].securityContext.runAsGroup
+
+  - it: applies the image user to a mirror of an official image
+    template: templates/deployment.yaml
+    set:
+      image.repository: registry.example.com/mirror/praxis-proxy/praxis
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[?(@.name == "praxis")].securityContext.runAsUser
+          value: 100
+
+  - it: keeps the numeric user of a -fips image
+    template: templates/deployment.yaml
+    set:
+      image.tag: 0.4.0-fips
+    asserts:
+      - notExists:
+          path: spec.template.spec.containers[?(@.name == "praxis")].securityContext.runAsUser
+
+  - it: forces the image user on a custom image when imageUser.enabled is true
+    template: templates/deployment.yaml
+    set:
+      image.repository: registry.example.com/team/gateway
+      imageUser.enabled: true
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[?(@.name == "praxis")].securityContext.runAsUser
+          value: 100
+      - equal:
+          path: spec.template.spec.containers[?(@.name == "praxis")].securityContext.runAsGroup
+          value: 101
+
   - it: defers to podSecurityContext IDs
     template: templates/deployment.yaml
     set:

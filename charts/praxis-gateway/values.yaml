@@ -43,10 +43,13 @@ podSecurityContext: {}
 # runAsNonRoot against a numeric user, and refuses to start the container when it has
 # none.
 imageUser:
-  # -- auto applies uid and gid except on OpenShift (security.openshift.io/v1 is
-  # served), where the restricted SCC assigns IDs from the namespace range. true or
-  # false forces it. helm template without --api-versions security.openshift.io/v1
-  # renders auto as true.
+  # -- auto applies uid and gid only to the official praxis-proxy ai, praxis, and
+  # grid-gateway images (mirrors that keep that path count), not their -fips tags,
+  # which run as 1001:1001, and not on OpenShift (security.openshift.io/v1 is served),
+  # where the restricted SCC assigns IDs from the namespace range. Other images keep
+  # the user they declare. true forces it for any image, such as one built FROM the
+  # official images that keeps the named user praxis; false never applies it. helm
+  # template without --api-versions security.openshift.io/v1 renders auto as on.
   enabled: auto
   # -- runAsUser for the Praxis container.
   uid: 100

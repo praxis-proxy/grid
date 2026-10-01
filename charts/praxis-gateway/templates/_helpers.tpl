@@ -241,14 +241,27 @@ on grid settings that only the rendered config reads, which inline would drop qu
 
 {{/*
 Whether the Praxis container gets imageUser's numeric IDs: only when podSecurityContext
-sets no runAsUser, and imageUser.enabled is true, or auto off OpenShift. The kubelet
-needs a numeric user to enforce runAsNonRoot, and a pod runAsGroup does not provide
-one. Emits "true" or nothing.
+sets no runAsUser, and imageUser.enabled is true, or auto on an official image off
+OpenShift. The kubelet needs a numeric user to enforce runAsNonRoot, and a pod
+runAsGroup does not provide one. Emits "true" or nothing.
 */}}
 {{- define "praxis-gateway.applyImageUser" -}}
 {{- $psc := .Values.podSecurityContext | default dict -}}
 {{- $e := toString (.Values.imageUser | default dict).enabled -}}
-{{- if and (not (hasKey $psc "runAsUser")) (or (eq $e "true") (and (eq $e "auto") (not (include "praxis-gateway.openshift" .)))) -}}
+{{- $auto := and (eq $e "auto") (include "praxis-gateway.officialImageUser" .) (not (include "praxis-gateway.openshift" .)) -}}
+{{- if and (not (hasKey $psc "runAsUser")) (or (eq $e "true") $auto) -}}
+true
+{{- end -}}
+{{- end }}
+
+{{/*
+Whether the image is one whose user imageUser's defaults describe: the official
+praxis-proxy ai, praxis, or grid-gateway repository, or a mirror that keeps that path.
+-fips tags are left out, since their UBI build runs as 1001:1001. Any other image keeps
+the user it declares. Emits "true" or nothing.
+*/}}
+{{- define "praxis-gateway.officialImageUser" -}}
+{{- if and (regexMatch "(^|/)praxis-proxy/(ai|praxis|grid-gateway)$" .Values.image.repository) (not (hasSuffix "-fips" (toString .Values.image.tag))) -}}
 true
 {{- end -}}
 {{- end }}
