@@ -40,6 +40,19 @@ spec:
           path: resources/namespaces.yaml
         - type: manifest
           path: resources/backends.yaml
+        # A new namespace gets its default ServiceAccount a moment after it is
+        # created, and until then a bare Pod is rejected outright, so wait for it.
+        - type: exec
+          command:
+            - kubectl
+            - --context
+            - "{{ cluster.properties.kubeContext }}"
+            - --namespace
+            - praxis
+            - wait
+            - --for=create
+            - serviceaccount/default
+            - --timeout=60s
         - type: manifest
           path: resources/client.yaml
         - type: wait
