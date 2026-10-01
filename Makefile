@@ -56,14 +56,14 @@ clean:
 test: test-unit
 
 test-unit:
-	cargo test --workspace $(_NOCAPTURE)
+	cargo test --locked --workspace $(_NOCAPTURE)
 
 # -------------------------------------------------------------------
 # Quality
 # -------------------------------------------------------------------
 
 lint:
-	cargo clippy --workspace --all-targets -- -D warnings
+	cargo clippy --locked --workspace --all-targets -- -D warnings
 	cargo +$(NIGHTLY_RUSTFMT) fmt --all -- --check
 	cargo machete
 

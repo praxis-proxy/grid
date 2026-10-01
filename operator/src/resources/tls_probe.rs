@@ -429,7 +429,7 @@ mod tests {
         let config = ProbeConfig {
             address: "10.0.0.1:8443".to_owned(),
             tls_config,
-            server_name: ServerName::try_from("test-site.grid.internal").unwrap(),
+            server_name: tls_backend::parse_server_name("test-site.grid.internal").unwrap(),
             pins: vec![fp],
             advertised_leaf_der: None,
         };
@@ -583,7 +583,7 @@ mod tests {
         let config = ProbeConfig {
             address: "127.0.0.1:1".to_owned(),
             tls_config: client_tls_config(&ca, &client),
-            server_name: ServerName::try_from("test-site.grid.internal").unwrap(),
+            server_name: tls_backend::parse_server_name("test-site.grid.internal").unwrap(),
             pins: vec![pin],
             advertised_leaf_der: None,
         };
