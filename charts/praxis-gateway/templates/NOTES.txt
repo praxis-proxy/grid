@@ -19,9 +19,9 @@ Run Helm tests:
 
   helm test {{ .Release.Name }} -n {{ .Release.Namespace }}
 {{- end }}
-{{- if .Values.overlay.enabled }}
+{{- if .Values.overlay.configMapName }}
 
-Overlay ConfigMap: {{ .Values.overlay.existingConfigMap }}
+Overlay ConfigMap: {{ .Values.overlay.configMapName }}
   Mount path: {{ .Values.overlay.mountPath }}
 {{- end }}
 {{- if .Values.gridIdentity.secretName }}

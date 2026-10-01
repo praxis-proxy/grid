@@ -18,9 +18,8 @@ praxisConfig:
   key: praxis.yaml
 
 overlay:
-  enabled: true
   # Name: grid-overlay-{GridNetwork name}-{gateway service name}
-  existingConfigMap: grid-overlay-NETWORK-consumer-gateway
+  configMapName: grid-overlay-NETWORK-consumer-gateway
 
 gridIdentity:
   secretName: consumer-tls

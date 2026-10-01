@@ -329,13 +329,9 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "enabled": {
-          "type": "boolean",
-          "description": "Enable overlay ConfigMap mount."
-        },
-        "existingConfigMap": {
+        "configMapName": {
           "type": "string",
-          "description": "Name of the existing overlay ConfigMap."
+          "description": "Name of the existing overlay ConfigMap. Set it to mount the overlay; empty turns it off."
         },
         "mountPath": {
           "type": "string",

@@ -490,8 +490,7 @@ spec:
             service:
               type: "LoadBalancer"
             overlay:
-              enabled: true
-              existingConfigMap: "grid-overlay-grid-llmd-pool-metrics-consumer-gateway"
+              configMapName: "grid-overlay-grid-llmd-pool-metrics-consumer-gateway"
               sidecar:
                 enabled: true
                 image:

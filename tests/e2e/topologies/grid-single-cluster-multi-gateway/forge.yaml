@@ -475,8 +475,7 @@ spec:
             service:
               type: "ClusterIP"
             overlay:
-              enabled: true
-              existingConfigMap: "grid-overlay-grid-single-cluster--consumer-gateway-a-db750bac"
+              configMapName: "grid-overlay-grid-single-cluster--consumer-gateway-a-db750bac"
             gridIdentity:
               secretName: "consumer-gateway-tls"
             podLabels:
@@ -528,8 +527,7 @@ spec:
             service:
               type: "ClusterIP"
             overlay:
-              enabled: true
-              existingConfigMap: "grid-overlay-grid-single-cluster--consumer-gateway-b-de751065"
+              configMapName: "grid-overlay-grid-single-cluster--consumer-gateway-b-de751065"
             gridIdentity:
               secretName: "consumer-gateway-tls"
             podLabels:

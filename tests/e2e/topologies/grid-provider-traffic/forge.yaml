@@ -489,8 +489,7 @@ spec:
             service:
               type: "LoadBalancer"
             overlay:
-              enabled: true
-              existingConfigMap: "grid-overlay-grid-provider-traffic-consumer-gateway"
+              configMapName: "grid-overlay-grid-provider-traffic-consumer-gateway"
             gridIdentity:
               secretName: "consumer-gateway-tls"
             podLabels:

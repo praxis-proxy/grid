@@ -225,10 +225,9 @@ service:
 
 # -- Optional operator-produced overlay ConfigMap mount (edge gateways).
 overlay:
-  # -- Enable overlay ConfigMap mount.
-  enabled: false
-  # -- Name of the existing overlay ConfigMap.
-  existingConfigMap: ""
+  # -- Name of the existing overlay ConfigMap. The operator creates it.
+  # Empty (the default) turns the overlay mount off.
+  configMapName: ""
   # -- Mount path for overlay files.
   mountPath: "/etc/praxis/routing"
   # -- Items to project from the ConfigMap (used when sidecar is disabled).

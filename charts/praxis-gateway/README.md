@@ -191,8 +191,7 @@ AI image; these values may advance independently.
 | `service.port` | int | `8080` | Service port. |
 | `service.annotations` | object | `{}` | Service annotations. |
 | `service.loadBalancerIP` | string | `""` | Static IP for LoadBalancer. |
-| `overlay.enabled` | bool | `false` | Mount an overlay ConfigMap. |
-| `overlay.existingConfigMap` | string | `""` | Name of the overlay ConfigMap. |
+| `overlay.configMapName` | string | `""` | Name of the overlay ConfigMap. Set it to mount the overlay; empty (the default) turns it off. |
 | `overlay.mountPath` | string | `/etc/praxis/routing` | Mount path for overlay files. |
 | `overlay.items` | list | routing-overlay.json | Items to project. |
 | `overlay.sidecar.enabled` | bool | `false` | Deliver validated overlays through an API-watch sidecar instead of kubelet ConfigMap projection. |
@@ -297,8 +296,7 @@ Example values:
 
 ```yaml
 overlay:
-  enabled: true
-  existingConfigMap: grid-overlay-production-consumer-gateway
+  configMapName: grid-overlay-production-consumer-gateway
   mountPath: /etc/praxis/routing
   sidecar:
     enabled: true

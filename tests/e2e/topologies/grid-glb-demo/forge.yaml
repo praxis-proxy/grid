@@ -430,8 +430,7 @@ spec:
             service:
               type: "LoadBalancer"
             overlay:
-              enabled: true
-              existingConfigMap: "grid-overlay-glb-demo-edge-gateway"
+              configMapName: "grid-overlay-glb-demo-edge-gateway"
             gridIdentity:
               secretName: "edge-gateway-tls"
             podLabels:

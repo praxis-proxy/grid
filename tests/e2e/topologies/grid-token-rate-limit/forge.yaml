@@ -709,8 +709,7 @@ spec:
                     key: url
             service: { type: LoadBalancer }
             overlay:
-              enabled: true
-              existingConfigMap: "grid-overlay-grid-token-rate-limit-consumer-gateway-a"
+              configMapName: "grid-overlay-grid-token-rate-limit-consumer-gateway-a"
               sidecar:
                 enabled: true
                 image:
@@ -773,8 +772,7 @@ spec:
                     key: url
             service: { type: LoadBalancer }
             overlay:
-              enabled: true
-              existingConfigMap: "grid-overlay-grid-token-rate-limit-consumer-gateway-b"
+              configMapName: "grid-overlay-grid-token-rate-limit-consumer-gateway-b"
               sidecar:
                 enabled: true
                 image:

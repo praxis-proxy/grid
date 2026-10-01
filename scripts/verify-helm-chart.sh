@@ -345,7 +345,7 @@ fi
 try_template "$GW_DIR" "edge gateway" "${GW_REQ[@]}" \
   --set nameOverride=edge-gateway \
   --set service.type=LoadBalancer \
-  --set overlay.enabled=true --set overlay.existingConfigMap=grid-overlay \
+  --set overlay.configMapName=grid-overlay \
   --set gridIdentity.secretName=edge-tls
 try_template "$GW_DIR" "provider gateway" "${GW_REQ[@]}" \
   --set nameOverride=provider-gateway \
@@ -446,7 +446,7 @@ try_reject "$GW_DIR" "invalid service type (gw)" "${GW_REQ[@]}" --set service.ty
 try_reject "$GW_DIR" "unknown key (gw)" "${GW_REQ[@]}" --set typoField=true
 try_template "$GW_DIR" "subchart keys (gw)" "${GW_REQ[@]}" --set enabled=true --set global.foo=bar
 try_reject "$GW_DIR" "runAsNonRoot override" "${GW_REQ[@]}" --set podSecurityContext.runAsNonRoot=false
-try_reject "$GW_DIR" "overlay enabled no name" "${GW_REQ[@]}" --set overlay.enabled=true
+try_reject_msg "$GW_DIR" "overlay.enabled is removed (gw)" "additional properties 'enabled' not allowed" "${GW_REQ[@]}" --set overlay.enabled=true
 try_reject_msg "$GW_DIR" "tls is renamed to gridIdentity (gw)" "additional properties 'tls' not allowed" "${GW_REQ[@]}" --set tls.secretName=x
 
 # ── Secure gateway config (render) ──────────────────────────────────

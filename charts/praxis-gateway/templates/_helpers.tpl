@@ -168,13 +168,10 @@ carry a sni.
 Validate enabled mounts have a non-empty resource name.
 */}}
 {{- define "praxis-gateway.validateMounts" -}}
-{{- if and .Values.overlay.enabled (not .Values.overlay.existingConfigMap) }}
-{{- fail "overlay.existingConfigMap is required when overlay.enabled is true" }}
-{{- end }}
-{{- if and .Values.overlay.enabled .Values.overlay.sidecar.enabled (not .Values.overlay.sidecar.expectedNetwork) }}
+{{- if and .Values.overlay.configMapName .Values.overlay.sidecar.enabled (not .Values.overlay.sidecar.expectedNetwork) }}
 {{- fail "overlay.sidecar.expectedNetwork is required when overlay sidecar is enabled" }}
 {{- end }}
-{{- if and .Values.overlay.enabled .Values.overlay.sidecar.enabled (not .Values.overlay.sidecar.expectedLocalSite) }}
+{{- if and .Values.overlay.configMapName .Values.overlay.sidecar.enabled (not .Values.overlay.sidecar.expectedLocalSite) }}
 {{- fail "overlay.sidecar.expectedLocalSite is required when overlay sidecar is enabled" }}
 {{- end }}
 {{- /*
