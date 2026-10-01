@@ -142,7 +142,7 @@ if [[ -n "$CONSUMER_SITE" ]]; then
   TEST_MODEL=$(kubectl --context "$CONTEXT" -n grid-system \
     get configmap -l grid.praxis-proxy.io/network \
     -o jsonpath='{.items[0].data.routing-config\.json}' 2>/dev/null \
-    | jq -r '.candidates[0].models[0] // empty' 2>/dev/null || echo "")
+    | jq -r '.candidates[0].name // empty' 2>/dev/null || echo "")
   if [[ -z "$TEST_MODEL" ]]; then
     TEST_MODEL="sim-model-v1"
   fi
