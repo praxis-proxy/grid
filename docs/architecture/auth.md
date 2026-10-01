@@ -401,6 +401,13 @@ cert identities are stable, as organization matching
 is weaker — any cert signed by a trusted CA with the
 correct `O=` value is accepted.
 
+Site certificates follow the X.509-SVID leaf profile. Each carries a
+critical CA:FALSE basic constraint and a critical key usage of digital
+signature only. Each also carries server and client authentication, one
+SPIFFE URI SAN, and the site's DNS SAN. A provider gateway in SPIFFE mode refuses a leaf without
+those extensions. Certificates issued before this profile lack them, so
+re-enroll those sites before switching a provider to SPIFFE mode.
+
 ### Authentication vs authorization
 
 Authentication answers: "is this peer really the AGN site or gateway it claims

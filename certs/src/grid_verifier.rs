@@ -22,34 +22,8 @@ use rustls::{
     pki_types::{CertificateDer, ServerName, UnixTime, pem::PemObject as _},
     server::danger::{ClientCertVerified, ClientCertVerifier},
 };
-use x509_parser::prelude::{FromDer as _, X509Certificate};
 
-use crate::{VerifyError, generate::SPIFFE_TRUST_DOMAIN, verify::single_spiffe_name};
-
-/// The trust domain part of a SPIFFE id: `spiffe://<domain>/...`.
-fn trust_domain_of(spiffe: &str) -> Option<&str> {
-    spiffe
-        .strip_prefix("spiffe://")
-        .and_then(|rest| rest.split('/').next())
-        .filter(|domain| !domain.is_empty())
-}
-
-/// The one in-domain SPIFFE id on a leaf, or a reason there is not exactly one.
-///
-/// The single rule the handshake enforces and the post-handshake extraction
-/// re-derives, so the id a caller authorizes is the id the verifier
-/// authenticated. Parses the leaf DER for its SAN only, running no crypto.
-pub(crate) fn grid_spiffe_id(leaf_der: &CertificateDer<'_>, expected_domain: &str) -> Result<String, VerifyError> {
-    let (_rest, leaf) = X509Certificate::from_der(leaf_der).map_err(|_bad| VerifyError::Malformed)?;
-    let name = single_spiffe_name(&leaf).ok_or(VerifyError::NotOneSpiffeName)?;
-    match trust_domain_of(&name) {
-        Some(domain) if domain == expected_domain => Ok(name),
-        _wrong_or_absent => Err(VerifyError::WrongTrustDomain {
-            found: name,
-            expected: expected_domain.to_owned(),
-        }),
-    }
-}
+use crate::{VerifyError, generate::SPIFFE_TRUST_DOMAIN, verify::grid_spiffe_id};
 
 /// The trust decision shared by both verifier faces.
 #[derive(Debug)]

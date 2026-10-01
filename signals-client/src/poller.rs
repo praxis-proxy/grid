@@ -339,7 +339,7 @@ async fn poll_loop<S, F>(
 /// payload's self-reported `grid_site` (the #160 binding).
 async fn poll_once<S: SignalSource + Sync>(source: &S, store: &LoadStore) {
     match source.fetch().await {
-        Ok(scrape) => match owner_site(&scrape.peer_identity) {
+        Ok(scrape) => match certs::site_of_spiffe_id(&scrape.peer_identity) {
             Some(owner) => store.ingest_at(&scrape.body, scrape.date_ms, now_ms(), owner),
             None => {
                 tracing::warn!(id = %scrape.peer_identity, "scrape peer id is not a grid site id; dropping");
@@ -347,17 +347,6 @@ async fn poll_once<S: SignalSource + Sync>(source: &S, store: &LoadStore) {
         },
         Err(error) => tracing::debug!(%error, "signals poll failed; keeping last values"),
     }
-}
-
-/// The site name from a verified SPIFFE id, anchored to the issuance contract
-/// `spiffe://<trust-domain>/site/<name>`. `None` when the id does not match that
-/// shape, so a change to the id format fails closed rather than mis-attributing.
-fn owner_site(peer_identity: &str) -> Option<&str> {
-    peer_identity
-        .strip_prefix("spiffe://")
-        .and_then(|rest| rest.strip_prefix(certs::DEFAULT_TRUST_DOMAIN))
-        .and_then(|rest| rest.strip_prefix("/site/"))
-        .filter(|name| !name.is_empty() && !name.contains('/'))
 }
 
 #[cfg(test)]

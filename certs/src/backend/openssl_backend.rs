@@ -99,15 +99,28 @@ fn append_ca_extensions(builder: &mut X509Builder) -> Result<(), BackendError> {
     builder.append_extension(usage).map_err(|err| sign_err(&err))
 }
 
-/// Append the leaf extensions: basic-constraints, server/client EKU, and SANs.
+/// Append the X.509-SVID leaf constraints: critical CA:FALSE and digitalSignature only.
+fn append_svid_leaf_extensions(builder: &mut X509Builder) -> Result<(), BackendError> {
+    let constraints = BasicConstraints::new()
+        .critical()
+        .build()
+        .map_err(|err| sign_err(&err))?;
+    builder.append_extension(constraints).map_err(|err| sign_err(&err))?;
+    let usage = KeyUsage::new()
+        .critical()
+        .digital_signature()
+        .build()
+        .map_err(|err| sign_err(&err))?;
+    builder.append_extension(usage).map_err(|err| sign_err(&err))
+}
+
+/// Append the leaf extensions: the X.509-SVID constraints, server/client EKU, and SANs.
 fn append_leaf_extensions(
     builder: &mut X509Builder,
     spec: &CertSpec<'_>,
     issuer_cert: Option<&X509Ref>,
 ) -> Result<(), BackendError> {
-    builder
-        .append_extension(BasicConstraints::new().build().map_err(|err| sign_err(&err))?)
-        .map_err(|err| sign_err(&err))?;
+    append_svid_leaf_extensions(builder)?;
     let eku = ExtendedKeyUsage::new()
         .server_auth()
         .client_auth()

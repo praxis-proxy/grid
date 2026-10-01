@@ -46,13 +46,9 @@ fn material(cert_pem: &str, key_pem: &str) -> (Vec<CertificateDer<'static>>, Pri
     (chain, key)
 }
 
-/// The site an owner-verified SPIFFE id names, mirroring the poller's binding
-/// so the store key matches the route candidate's site.
+/// The site an owner-verified SPIFFE id names, as the poller binds it.
 fn owner_of(peer_identity: &str) -> String {
-    peer_identity
-        .strip_prefix("spiffe://")
-        .and_then(|rest| rest.strip_prefix(DEFAULT_TRUST_DOMAIN))
-        .and_then(|rest| rest.strip_prefix("/site/"))
+    certs::site_of_spiffe_id(peer_identity)
         .expect("a grid SPIFFE id")
         .to_owned()
 }

@@ -11,7 +11,7 @@
 
 use x509_parser::prelude::{FromDer as _, GeneralName, X509Certificate};
 
-use crate::generate::spiffe_id;
+use crate::generate::{SPIFFE_TRUST_DOMAIN, spiffe_id};
 
 /// Largest certificate this will look at, before parsing.
 pub const MAX_CERT_PEM_BYTES: usize = 16 * 1024;
@@ -68,7 +68,6 @@ pub enum VerifyError {
     },
 
     /// The SPIFFE name is not in this grid's trust domain.
-    #[cfg(feature = "verifier")]
     #[error("certificate names {found}, not the {expected} trust domain")]
     WrongTrustDomain {
         /// The SPIFFE name bound into the certificate.
@@ -348,6 +347,50 @@ fn cert_ders(bundle_pem: &str) -> Result<Vec<Vec<u8>>, VerifyError> {
         .collect())
 }
 
+/// The trust domain part of a SPIFFE id: `spiffe://<domain>/...`.
+fn trust_domain_of(spiffe: &str) -> Option<&str> {
+    spiffe
+        .strip_prefix("spiffe://")
+        .and_then(|rest| rest.split('/').next())
+        .filter(|domain| !domain.is_empty())
+}
+
+/// The one in-domain SPIFFE id on a leaf, the rule the handshake and later extraction share.
+pub(crate) fn grid_spiffe_id(leaf_der: &[u8], expected_domain: &str) -> Result<String, VerifyError> {
+    let (_rest, leaf) = X509Certificate::from_der(leaf_der).map_err(|_bad| VerifyError::Malformed)?;
+    let name = single_spiffe_name(&leaf).ok_or(VerifyError::NotOneSpiffeName)?;
+    match trust_domain_of(&name) {
+        Some(domain) if domain == expected_domain => Ok(name),
+        _wrong_or_absent => Err(VerifyError::WrongTrustDomain {
+            found: name,
+            expected: expected_domain.to_owned(),
+        }),
+    }
+}
+
+/// The one grid-domain SPIFFE ID on a DER leaf whose chain the caller verified.
+#[must_use]
+pub fn leaf_spiffe_id(leaf_der: &[u8]) -> Option<String> {
+    grid_spiffe_id(leaf_der, SPIFFE_TRUST_DOMAIN).ok()
+}
+
+/// The site a grid SPIFFE ID names, `None` for any other shape.
+#[must_use]
+pub fn site_of_spiffe_id(id: &str) -> Option<&str> {
+    id.strip_prefix("spiffe://")
+        .and_then(|rest| rest.strip_prefix(SPIFFE_TRUST_DOMAIN))
+        .and_then(|rest| rest.strip_prefix("/site/"))
+        .filter(|site| is_spiffe_segment(site))
+}
+
+/// A SPIFFE path segment: `[A-Za-z0-9._-]+`, neither `.` nor `..`.
+fn is_spiffe_segment(segment: &str) -> bool {
+    !matches!(segment, "" | "." | "..")
+        && segment
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
 /// The one SPIFFE URI name on a certificate, when there is exactly one.
 pub(crate) fn single_spiffe_name(leaf: &X509Certificate<'_>) -> Option<String> {
     let san = leaf.subject_alternative_name().ok().flatten()?;
@@ -491,6 +534,39 @@ mod tests {
 
         let spki = verify_site_cert(&ca.cert_pem, &issued.cert_pem, "site-d").expect("should verify");
         assert!(!spki.is_empty(), "the public key should come back for signature checks");
+    }
+
+    #[test]
+    fn leaf_spiffe_id_reads_the_site_name_or_none() {
+        let ca = generate_ca("grid-ca").expect("ca");
+        let site = generate_site_cert(&ca, "east").expect("site");
+        let der = pem::parse(&site.cert_pem).expect("pem");
+        assert_eq!(
+            leaf_spiffe_id(der.contents()).as_deref(),
+            Some("spiffe://grid.internal/site/east")
+        );
+        let infra = crate::generate::generate_dns_only_cert(&ca, "grid-ca", &["a.svc".to_owned()]).expect("leaf");
+        let infra_der = pem::parse(&infra.cert_pem).expect("pem");
+        assert_eq!(leaf_spiffe_id(infra_der.contents()), None, "no SPIFFE name");
+        assert_eq!(leaf_spiffe_id(b"junk"), None, "unparseable");
+    }
+
+    #[test]
+    fn site_of_spiffe_id_reads_only_grid_site_ids() {
+        let cases = [
+            ("spiffe://grid.internal/site/east", Some("east")),
+            ("spiffe://other.domain/site/east", None),
+            ("spiffe://grid.internal/site/", None),
+            ("spiffe://grid.internal/site/east/extra", None),
+            ("spiffe://grid.internal/site/east?query", None),
+            ("spiffe://grid.internal/site/east#fragment", None),
+            ("spiffe://grid.internal/site/..", None),
+            ("spiffe://grid.internal/workload/east", None),
+            ("https://grid.internal/site/east", None),
+        ];
+        for (id, want) in cases {
+            assert_eq!(site_of_spiffe_id(id), want, "{id}");
+        }
     }
 
     #[test]

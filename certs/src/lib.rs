@@ -33,7 +33,7 @@ pub use provider::{CertificateProvider, ProviderError, SiteCertificate, StaticFi
 pub use verify::{
     MAX_CERT_PEM_BYTES, VerifyError, anchored_ca, bundle_within, canonical_fingerprint, cert_dns_sans,
     cert_expires_within, cert_issuer_and_expiry, cert_public_key, csr_public_key, has_svid_profile, leaf_only,
-    verify_issued_by, verify_site_cert,
+    leaf_spiffe_id, site_of_spiffe_id, verify_issued_by, verify_site_cert,
 };
 
 /// SHA-256 through the active backend: the sha2 crate by default, system openssl
