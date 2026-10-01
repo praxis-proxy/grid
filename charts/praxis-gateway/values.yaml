@@ -79,8 +79,8 @@ config:
   # -- Key within existingConfigMap that holds praxis.yaml.
   key: "praxis.yaml"
   # -- Praxis configuration the chart stores in its own ConfigMap when neither
-  # existingConfigMap nor gatewayConfig.render is set. Changing it rolls the pods. Keep
-  # the listener address on port.containerPort. The default answers GET / with a small
+  # existingConfigMap nor gatewayConfig.render is set. Changing it rolls the pods. One
+  # listener must bind port.containerPort, or the install fails. The default answers GET / with a small
   # JSON status and everything else with 404, so a bare install serves traffic. Replace
   # it with your own listeners, routes, and clusters, for example with
   # --set-file config.inline=praxis.yaml.

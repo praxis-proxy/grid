@@ -209,7 +209,8 @@ inline
 {{- end }}
 
 {{/*
-Fail early on a blank or unparseable config.inline instead of a crash-looping pod, and
+Fail early on a blank or unparseable config.inline, or one with no listener on
+port.containerPort, instead of a pod that crash-loops or never turns ready. Also fail
 on grid settings that only the rendered config reads, which inline would drop quietly.
 */}}
 {{- define "praxis-gateway.validateInlineConfig" -}}
@@ -225,6 +226,16 @@ on grid settings that only the rendered config reads, which inline would drop qu
 {{- $parsed := fromYaml $inline }}
 {{- if hasKey $parsed "Error" }}
 {{- fail (printf "config.inline is not a valid YAML mapping: %s" (get $parsed "Error")) }}
+{{- end }}
+{{- $port := int .Values.port.containerPort }}
+{{- $listeners := $parsed.listeners }}
+{{- if not (kindIs "slice" $listeners) }}{{- $listeners = list }}{{- end }}
+{{- $bound := false }}
+{{- range $listeners }}
+{{- if and (kindIs "map" .) (hasSuffix (printf ":%d" $port) (toString .address)) }}{{- $bound = true }}{{- end }}
+{{- end }}
+{{- if not $bound }}
+{{- fail (printf "config.inline has no listener on port.containerPort %d, where the Service and probes connect: bind a listener address to port %d, or change port.containerPort" $port $port) }}
 {{- end }}
 {{- end }}
 

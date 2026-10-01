@@ -31,14 +31,14 @@ tests:
   - it: mounts the chart-managed config and rolls pods when it changes
     template: templates/deployment.yaml
     set:
-      config.inline: "a: b"
+      config.inline: 'listeners: [{name: default, address: "0.0.0.0:8080"}]'
     asserts:
       - equal:
           path: spec.template.spec.volumes[?(@.name == "config")].configMap.name
           value: praxis-gateway-config
       - equal:
           path: spec.template.metadata.annotations["checksum/config"]
-          value: 75cd1899337ffbc9341398f7456f1027e2fc4b2658f9f0555a7a965cb309c6dd
+          value: a57d7f9e283ac1782f59ef0fdd09f136e368b10093eef3bb5be3ab463a1fb779
 
   - it: keeps user pod annotations next to the config checksum
     template: templates/deployment.yaml
@@ -145,6 +145,22 @@ tests:
     asserts:
       - failedTemplate:
           errorPattern: config.inline is not a valid YAML mapping
+
+  - it: fails a config.inline with no listener on port.containerPort
+    template: templates/deployment.yaml
+    set:
+      port.containerPort: 9090
+    asserts:
+      - failedTemplate:
+          errorPattern: config.inline has no listener on port.containerPort 9090
+
+  - it: accepts a config.inline listener on a custom port.containerPort
+    template: templates/deployment.yaml
+    set:
+      port.containerPort: 9090
+      config.inline: 'listeners: [{name: default, address: "[::]:9090"}]'
+    asserts:
+      - notFailedTemplate: {}
 
   - it: fails grid settings that config.inline would ignore
     template: templates/deployment.yaml
