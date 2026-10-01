@@ -27,7 +27,7 @@ A pre-install Job runs `enrollment bootstrap` to create the grid CA and the serv
 | Value | Decide |
 |---|---|
 | `route.host` | Required when a Route renders. Added to the issued serving certificate. A BYO certificate (`serving.existingSecretRef`) must already carry it. |
-| `route.tls.termination` | Keep `passthrough`. `reencrypt` terminates at the router and breaks the site's grid-CA pin. `edge` is rejected, since enrollment serves TLS only. |
+| `route.tls.termination` | Keep `passthrough`, the only mode that keeps the site token end to end. `reencrypt` terminates at the router, which then sees the bearer token and the CSR. When the Route CA is not the grid CA, also set `enrollment.gridCaBundle` to the grid CA. The chart rejects `edge`, since enrollment serves TLS only. |
 | `db.type` | `builtin` runs Postgres in the chart. `external` reads the connection URL from the Secret in `db.external.connectionUrlSecretRef`. |
 | `enrollment.authz` | `kube` (default) authorizes callers with Kubernetes RBAC on `enrollmenttokens` in the release namespace, so keep that namespace dedicated to enrollment. `local` uses a grid-admin token table. |
 | `image.repository`, `image.tag`, `image.digest` | The enrollment image. The tag defaults to the chart's `appVersion`; `image.digest` pins it. |
@@ -35,45 +35,63 @@ A pre-install Job runs `enrollment bootstrap` to create the grid CA and the serv
 
 The chart README and `values.yaml` cover the remaining values.
 
-## Verify
+## Enroll a site
 
-Mint a token with the grid CA bundle:
+The hub mints a one-time token for each site, and the site's grid-operator redeems it on startup. Clients that do not run the grid-operator chart enroll through the enrollment API, specified in the repository's `api` directory.
 
-Under `kube`, the chart ships the grid-admin Role, `<release>-grid-enrollment-grid-admin`, with `create` and `delete` on `enrollmenttokens`. Bind it with `enrollment.gridAdmins.subjects`, or set `enrollment.gridAdmins.serviceAccount.create=true`. The bearer must be bound to `enrollment.tokenAudience` (default `grid-enrollment`); a general API token is refused. Mint a short-lived one:
+### Invite a site on the hub
 
-```bash
-kubectl -n grid get secret grid-ca-bundle -o jsonpath='{.data.ca\.crt}' | base64 -d > grid-ca-bundle.crt
-GRID_ADMIN_SA=grid-admin  # a ServiceAccount bound to the grid-admin Role
-GRID_ADMIN_TOKEN=$(kubectl -n grid create token "$GRID_ADMIN_SA" --audience grid-enrollment --duration 10m)
-# printf is a builtin, so the token stays out of process arguments.
-(umask 077 && printf 'Authorization: Bearer %s\n' "$GRID_ADMIN_TOKEN" > admin.hdr)
+Add the site to the enrollment chart's `invites` value and run `helm upgrade`. Invites need `enrollment.authz=kube`. `expiresInSecs` is capped at 604800 (seven days).
 
-curl -s -X POST https://enrollment.apps.example.com/v1alpha1/enrollmenttokens \
-  --cacert grid-ca-bundle.crt \
-  -H @admin.hdr \
-  -H "Content-Type: application/json" \
-  -d '{"siteName": "east2", "gridNetworkRef": "my-grid"}'
+```yaml
+invites:
+  - siteName: east2
+    gridNetworkRef: my-grid
+    expiresInSecs: 86400
 ```
 
-The response returns `tokenId`, a single-use `token`, and `expiresAt`. Give `token` and `grid-ca-bundle.crt` to the site out of band. Revoke an unused token with `DELETE /v1alpha1/enrollmenttokens/$TOKEN_ID`.
+After each install or upgrade, a Job mints a token for each entry into Secret `grid-invite-<siteName>` (key `token`) in the release namespace. The Job skips entries whose Secret already exists, so an upgrade mints only for new sites. The Job retries an unreachable service for about four minutes per run, not per site, then fails naming every site it did not invite. If the service may start slowly, pass `--timeout 10m`, since connect timeouts can stretch that past Helm's default five-minute hook timeout. Before Helm 3.19, a failed invite run leaves its hook RBAC in place until the next run.
 
-On the site, create a key and CSR, then redeem the token:
+The Job pins the service with the `ca.bundleSecretName` Secret. A serving certificate you bring (`serving.existingSecretRef`) must chain to that bundle and carry `<fullname>.<namespace>.svc`.
+
+Deliver `grid-invite-<siteName>` and the grid CA bundle (`ca.crt` from Secret `grid-ca-bundle`) to the site's operator namespace, by hand or with a policy engine such as ACM.
+
+Treat invite Secrets as credentials:
+
+- Anyone who can get Secrets in the release namespace can read them, the same users who can read the CA signing key.
+- Removing an entry from `invites` or deleting its Secret does not revoke the token. Revoke it as a grid-admin with `DELETE /v1alpha1/enrollmenttokens/<id>`, using the id in the Secret's `grid.praxis-proxy.io/token-id` annotation. The chart's `<release>-grid-enrollment-grid-admin` Role grants that.
+- `helm uninstall` leaves invite Secrets behind. Delete them by hand.
+
+### Enroll on the site
+
+Enable enrollment in the grid-operator chart:
 
 ```bash
-openssl ecparam -genkey -name prime256v1 -noout -out site.key
-openssl req -new -key site.key -subj "/CN=east2" -out site.csr
-read -rs SITE_TOKEN  # paste the token from the grid admin
-(umask 077 && printf 'Authorization: Bearer %s\n' "$SITE_TOKEN" > site.hdr)
-
-jq -n --rawfile csr site.csr '{csr: $csr}' \
-  | curl -s -X POST https://enrollment.apps.example.com/v1alpha1/enrollments \
-      --cacert grid-ca-bundle.crt \
-      -H @site.hdr \
-      -H "Content-Type: application/json" \
-      -d @-
+helm install grid-operator ./charts/grid-operator \
+  --namespace grid-system \
+  --set enrollment.enabled=true \
+  --set enrollment.url=https://enrollment.apps.example.com \
+  --set enrollment.siteName=east2 \
+  --set enrollment.caBundle.secret=grid-ca-bundle \
+  --set enrollment.tokenSecretRef.name=grid-invite-east2
 ```
 
-The response returns `certificate`, issued for the site name the token pinned (SANs in the CSR are ignored), `caCertificate`, and `spiffeId`, the identity the site presents to its peers.
+The GridNetwork's `spec.tls.siteSecretRef` and `caSecretRef` name the Secrets the operator writes, and both must be in the operator namespace. When the `siteSecretRef` Secret is absent at startup, the operator generates a key, redeems the token, and writes the grid CA (`ca.crt`) and the site identity (`tls.crt`, `tls.key`). The pod reports ready after enrollment finishes. The operator:
+
+- Skips enrollment when the `siteSecretRef` Secret exists, so a restart never spends a token.
+- Pins TLS to `enrollment.caBundle`.
+- Refuses a token Secret whose `grid.praxis-proxy.io/site` label names another site.
+- Dry-runs both Secret writes and checks any existing CA Secret before it sends the token, so missing RBAC, an admission refusal, or a different CA fails without spending it.
+- Stores the identity only when the returned CA matches the pinned grid CA and the certificate names the site and carries the operator's key.
+
+If a `reencrypt` or publicly trusted Route fronts enrollment, pin that Route's CA in `enrollment.caBundle` and set `enrollment.gridCaBundle` to the grid CA.
+
+The operator retries connect failures for about five minutes and gives up after 15 minutes, then exits so Kubernetes restarts it. It never resends a request the hub may have received.
+
+### Recovery
+
+- An expired or revoked token fails at once with `site token rejected`. Delete `grid-invite-<siteName>` on the hub, run `helm upgrade` with the site still in `invites`, and deliver the new token to the site.
+- Known limit: a redeemed token holds its site name, and the hub cannot release a name yet. A site that spent its token without storing an identity enrolls again only under a new site name or after the enrollment database is reset. Reinstalling the chart does not reset an external database.
 
 ## Monitoring the signing CA
 
@@ -97,6 +115,12 @@ site's trust anchor.
 
 ## Troubleshooting
 
+- **Operator logs `site token rejected`**: Delete `grid-invite-<siteName>` on the hub, run `helm upgrade` with the site still in `invites`, and deliver the new token to the site.
+- **Operator logs `site name already enrolled`**: an earlier attempt spent a token for this name. Enroll under a new site name, as the known limit in Recovery describes.
+- **Operator logs `reaching the enrollment service failed after 10 attempts`**: make `enrollment.url` reachable from the site.
+- **Operator logs `TLS to the enrollment service failed`**: set `enrollment.caBundle` to the CA that issued the enrollment serving certificate.
+- **Operator logs `returned CA is not the pinned grid CA`**: set `enrollment.gridCaBundle` to the grid CA. The attempt spent the token, so enroll under a new site name.
+- **Operator logs `possible interception, contact the hub`**: the certificate names another site or key. Tell the hub admin before enrolling again.
 - **`route.host is required`**: a passthrough Route is rendering without a host. Set `route.host` to `<name>.apps.<cluster-domain>`, or set `route.enabled=false`. Under an umbrella chart, prefix both with the subchart name.
 - **CA bootstrap Job fails with `built without --features bootstrap`**: the image was built with `--no-default-features`. Use a default build, which includes `sar` and `bootstrap`.
 - **`TokenReview` or `SubjectAccessReview` calls fail**: `enrollment.authz=kube` needs the `sar` feature and `enrollment.serviceAccount.create=true`, which binds the pod to `system:auth-delegator`.
