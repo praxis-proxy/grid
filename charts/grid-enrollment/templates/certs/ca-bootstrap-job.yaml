@@ -1,4 +1,5 @@
 {{- include "grid-enrollment.normalize" . }}
+{{- include "grid-enrollment.validateHubSite" . }}
 {{- if include "grid-enrollment.bootstrapRuns" . }}
 {{/*
 Generate the Grid CA (if absent), derive the public bundle, and issue the
@@ -102,10 +103,25 @@ spec:
             - "--db-deployment"
             - "{{ include "grid-enrollment.dbHost" . }}"
             {{- end }}
+            {{- with .Values.hubSite.name }}
+            - "--site-name"
+            - "{{ . }}"
+            - "--site-namespace"
+            - "{{ $.Values.hubSite.namespace }}"
+            - "--site-secret"
+            - "{{ $.Values.hubSite.identitySecretName }}"
+            - "--site-ca-secret"
+            - "{{ $.Values.hubSite.caSecretName }}"
+            {{- end }}
             {{- if .Values.ca.forceRegenerate }}
             - "--force-regenerate"
             {{- end }}
             {{- end }}
+          {{- if and .Values.hubSite.name .Values.enrollment.certLifetimeSecs }}
+          env:
+            - name: ENROLLMENT_CERT_LIFETIME_SECS
+              value: {{ .Values.enrollment.certLifetimeSecs | quote }}
+          {{- end }}
           {{- with .Values.ca.bootstrap.resources }}
           resources:
             {{- toYaml . | nindent 12 }}

@@ -472,6 +472,33 @@
         }
       ]
     },
+    "hubSite": {
+      "description": "Issue the hub's own site identity straight from the grid CA, so the hub never enrolls.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "description": "Site name of the hub. Empty disables it.",
+          "type": "string",
+          "pattern": "^$|^[a-z0-9]([-a-z0-9]{0,49}[a-z0-9])?$"
+        },
+        "namespace": {
+          "description": "Namespace of the hub's grid operator, where the identity Secrets go.",
+          "type": "string",
+          "pattern": "^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$"
+        },
+        "identitySecretName": {
+          "description": "Secret for the site identity.",
+          "type": "string",
+          "minLength": 1
+        },
+        "caSecretName": {
+          "description": "Secret for the grid CA beside the identity.",
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
     "nameOverride": {
       "type": "string"
     },

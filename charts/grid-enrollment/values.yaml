@@ -190,3 +190,16 @@ db:
 # invites:
 #   site-a:
 #     network: grid
+
+# -- The hub's own site identity, issued by the bootstrap Job straight from the grid
+# CA, so the hub never enrolls or needs an invite. Created once and never rotated:
+# peers pin its digest. Delete the Secret, or set ca.forceRegenerate, to re-issue.
+hubSite:
+  # -- Hub site name. Empty disables it. Must not also be invited.
+  name: ""
+  # -- Namespace of the hub's grid operator.
+  namespace: grid
+  # -- Secret the site identity is written to.
+  identitySecretName: grid-site-identity
+  # -- Secret the grid CA is written to beside it.
+  caSecretName: grid-ca
