@@ -261,7 +261,7 @@ tests:
       - notExists:
           path: spec.template.spec.containers[0].env
 
-  - it: grants the bootstrap only its two Secrets in the hub namespace
+  - it: grants the bootstrap only its Secrets in the hub namespace
     template: templates/certs/ca-bootstrap-rbac.yaml
     set:
       hubSite.name: hub
@@ -279,7 +279,7 @@ tests:
           content:
             apiGroups: [""]
             resources: ["secrets"]
-            resourceNames: ["grid-site-identity", "grid-ca"]
+            resourceNames: ["grid-site-identity", "grid-ca", "grid-swim-key"]
             verbs: ["get", "update"]
         documentIndex: 3
       - equal:
@@ -296,3 +296,13 @@ tests:
     asserts:
       - failedTemplate:
           errorPattern: hubSite.name "hub" is also invited
+
+  - it: creates the SWIM key with the hub identity, unless its name is empty
+    template: templates/certs/ca-bootstrap-job.yaml
+    set:
+      hubSite.name: hub
+      hubSite.swimKeySecretName: ""
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].args
+          content: --swim-key-secret

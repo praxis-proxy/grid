@@ -58,6 +58,9 @@ rules:
       {{- if include "grid-enrollment.generatesAdminTokens" . }}
       - {{ include "grid-enrollment.adminTokensSecret" . | quote }}
       {{- end }}
+      {{- if and .Values.hubSite.name .Values.hubSite.swimKeySecretName }}
+      - {{ .Values.hubSite.swimKeySecretName | quote }}
+      {{- end }}
     verbs: ["get", "update"]
   {{- if or (include "grid-enrollment.generatesDbCredentials" .) (include "grid-enrollment.generatesAdminTokens" .) }}
   # patch marks the generated credentials so Argo CD never prunes them.
@@ -126,6 +129,9 @@ rules:
     resourceNames:
       - {{ $.Values.hubSite.identitySecretName | quote }}
       - {{ $.Values.hubSite.caSecretName | quote }}
+      {{- with $.Values.hubSite.swimKeySecretName }}
+      - {{ . | quote }}
+      {{- end }}
     verbs: ["get", "update"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1

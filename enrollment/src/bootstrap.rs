@@ -94,6 +94,10 @@ struct BootstrapArgs {
     /// Secret for the grid CA (`ca.crt`) beside the site identity.
     #[arg(long, default_value = "grid-ca")]
     site_ca_secret: String,
+    /// Secret for the grid's SWIM key (`key`, 32 bytes), created once and copied to
+    /// `--site-namespace` when `--site-name` is set.
+    #[arg(long)]
+    swim_key_secret: Option<String>,
 }
 
 /// Run the `bootstrap` subcommand.
@@ -131,6 +135,7 @@ async fn bootstrap(args: &BootstrapArgs) -> Result<(), BoxError> {
     let ca = resolve_ca(&secrets, args).await?;
     write_opaque_secret(&secrets, &args.ca_bundle_secret, "ca.crt", &ca.cert_pem).await?;
     Box::pin(ensure_site_identity(&client, &ca, args)).await?;
+    Box::pin(ensure_swim_key(&client, &secrets, args)).await?;
     if !args.skip_serving {
         ensure_serving(&secrets, &ca, args).await?;
     }
@@ -141,6 +146,90 @@ async fn bootstrap(args: &BootstrapArgs) -> Result<(), BoxError> {
         Box::pin(reconcile_db_roll(client, &namespace, deployment, &fingerprint)).await?;
     }
     Ok(())
+}
+
+/// Length of a SWIM key, the operator's `SwimKey`.
+const SWIM_KEY_LEN: usize = 32;
+
+/// Create the SWIM key once, then copy that same key beside the site identity.
+async fn ensure_swim_key(
+    client: &kube::Client,
+    secrets: &kube::api::Api<k8s_openapi::api::core::v1::Secret>,
+    args: &BootstrapArgs,
+) -> Result<(), BoxError> {
+    let Some(name) = args.swim_key_secret.as_deref() else {
+        return Ok(());
+    };
+    let fresh = zeroize::Zeroizing::new(enrollment::api::random_bytes(SWIM_KEY_LEN)?);
+    let key = match Box::pin(create_key_secret(secrets, name, &fresh)).await? {
+        Some(existing) => existing,
+        None => fresh,
+    };
+    if key.len() != SWIM_KEY_LEN {
+        return Err(format!(
+            "Secret {name} holds a SWIM key of {} bytes, not {SWIM_KEY_LEN}",
+            key.len()
+        )
+        .into());
+    }
+    if args.site_name.is_some() {
+        let site_secrets = kube::api::Api::namespaced(client.clone(), &args.site_namespace);
+        if let Some(copy) = Box::pin(create_key_secret(&site_secrets, name, &key)).await?
+            && copy != key
+        {
+            return Err(format!(
+                "Secret {name} in {} holds a different SWIM key; delete one so both namespaces share it",
+                args.site_namespace
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+/// Create `name` with `key` unless it exists, returning the key it already held.
+async fn create_key_secret(
+    secrets: &kube::api::Api<k8s_openapi::api::core::v1::Secret>,
+    name: &str,
+    key: &[u8],
+) -> Result<Option<zeroize::Zeroizing<Vec<u8>>>, BoxError> {
+    use k8s_openapi::{ByteString, api::core::v1::Secret, apimachinery::pkg::apis::meta::v1::ObjectMeta};
+    use kube::api::PostParams;
+
+    let secret = Box::new(Secret {
+        metadata: ObjectMeta {
+            name: Some(name.to_owned()),
+            labels: Some(std::collections::BTreeMap::from([(
+                "app.kubernetes.io/managed-by".to_owned(),
+                MANAGED_BY.to_owned(),
+            )])),
+            ..ObjectMeta::default()
+        },
+        type_: Some("Opaque".to_owned()),
+        data: Some(std::collections::BTreeMap::from([(
+            "key".to_owned(),
+            ByteString(key.to_vec()),
+        )])),
+        ..Secret::default()
+    });
+    match secrets.create(&PostParams::default(), &secret).await {
+        Ok(_) => Ok(None),
+        Err(kube::Error::Api(response)) if response.code == 409 => Ok(Some(Box::pin(held_key(secrets, name)).await?)),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// The `key` an existing Secret holds, zeroizing whatever else it carries.
+async fn held_key(
+    secrets: &kube::api::Api<k8s_openapi::api::core::v1::Secret>,
+    name: &str,
+) -> Result<zeroize::Zeroizing<Vec<u8>>, BoxError> {
+    let mut data = secrets.get(name).await?.data.unwrap_or_default();
+    let held = data.remove("key").map(|bytes| bytes.0).unwrap_or_default();
+    for other in data.values_mut() {
+        zeroize::Zeroize::zeroize(&mut other.0);
+    }
+    Ok(zeroize::Zeroizing::new(held))
 }
 
 /// Refuse a bad `--site-name` before anything is written.
@@ -756,6 +845,19 @@ mod tests {
         );
         assert_eq!(issued.spiffe_id, certs::spiffe_id("hub"), "SPIFFE ID");
         assert!(key_pem.contains("PRIVATE KEY"), "key returned");
+    }
+
+    #[test]
+    fn the_swim_key_is_opt_in_and_sized_for_the_operator() {
+        assert_eq!(BootstrapArgs::parse_from(["bootstrap"]).swim_key_secret, None);
+        let args = BootstrapArgs::parse_from(["bootstrap", "--swim-key-secret", "grid-swim-key"]);
+        assert_eq!(args.swim_key_secret.as_deref(), Some("grid-swim-key"));
+        assert_eq!(
+            enrollment::api::random_bytes(super::SWIM_KEY_LEN)
+                .expect("random")
+                .len(),
+            32
+        );
     }
 
     #[test]

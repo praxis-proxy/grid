@@ -112,6 +112,10 @@ spec:
             - "{{ $.Values.hubSite.identitySecretName }}"
             - "--site-ca-secret"
             - "{{ $.Values.hubSite.caSecretName }}"
+            {{- with $.Values.hubSite.swimKeySecretName }}
+            - "--swim-key-secret"
+            - "{{ . }}"
+            {{- end }}
             {{- end }}
             {{- if .Values.ca.forceRegenerate }}
             - "--force-regenerate"

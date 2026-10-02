@@ -484,9 +484,18 @@ fn generate_token() -> Result<String, ApiError> {
 ///
 /// Returns [`ApiError::Internal`] when the system random source fails.
 pub fn random_hex(len: usize) -> Result<String, ApiError> {
+    Ok(random_bytes(len)?.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+/// `len` bytes from the same CSPRNG as [`random_hex`].
+///
+/// # Errors
+///
+/// Returns [`ApiError::Internal`] when the system random source fails.
+pub fn random_bytes(len: usize) -> Result<Vec<u8>, ApiError> {
     let mut bytes = vec![0_u8; len];
     fill_random(&mut bytes)?;
-    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+    Ok(bytes)
 }
 
 /// Fill a buffer from ring's system CSPRNG.

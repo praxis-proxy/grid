@@ -496,6 +496,10 @@
           "description": "Secret for the grid CA beside the identity.",
           "type": "string",
           "minLength": 1
+        },
+        "swimKeySecretName": {
+          "description": "Secret for the grid's SWIM key, created once in the release and hub namespaces. Empty skips it.",
+          "type": "string"
         }
       }
     },

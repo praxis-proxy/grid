@@ -203,3 +203,5 @@ hubSite:
   identitySecretName: grid-site-identity
   # -- Secret the grid CA is written to beside it.
   caSecretName: grid-ca
+  # -- Secret for the grid's SWIM key, created once here and in hubSite.namespace. Empty skips it.
+  swimKeySecretName: grid-swim-key
