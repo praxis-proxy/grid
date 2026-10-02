@@ -8,6 +8,10 @@ unchanged by the project-name update.
 
 All CRDs are cluster-scoped.
 
+The 0.1.x field renames are not converted automatically. Migrate existing
+resources before the updated operator reconciles them; see the
+[0.1.x CRD field migration guide](../installation/migration-0.1-crd-field-renames.md).
+
 ## GridNetwork
 
 The AGN logical network and top-level tenancy scope. A single
@@ -253,7 +257,7 @@ Praxis `ConfigMap` generation.
 
 | Field | Default | Meaning |
 |---|---|---|
-| `enabled` | `false` | Set to `true` to enable consumer config generation for this gateway. |
+| `generate` | `false` | Set to `true` to enable consumer config generation for this gateway. |
 | `credentialMountPath` | `/run/secrets/grid-credentials` | Base directory where credential Secrets are mounted inside the consumer pod. |
 | `configMapName` | `praxis-consumer-config` | Name of the generated `ConfigMap` in the gateway namespace. |
 | `clusterEndpoints[]` | `[]` | Endpoint topology for `load_balancer` clusters. Each entry maps a candidate cluster name to an address with explicit `transport` configuration. Missing transport fails closed. |
@@ -262,7 +266,7 @@ Praxis `ConfigMap` generation.
 | `tlsCertMountPath` | `/etc/praxis/tls` | Base path for mounted TLS files used when a `clusterEndpoints[]` entry uses `mutual_tls` transport. |
 | `listenerPort` | `8080` | HTTP port for the generated `listeners[0].address` (`0.0.0.0:{listenerPort}`). |
 
-When `enabled: true`, the `GridNetwork` controller renders a `praxis.yaml`-keyed
+When `generate: true`, the `GridNetwork` controller renders a `praxis.yaml`-keyed
 `ConfigMap` in the gateway namespace on each reconcile.  The generated config is a
 complete, runnable Praxis config containing:
 
@@ -289,7 +293,7 @@ The `credential_inject` filter is a Praxis AI runtime dependency. The AGN
 operator can render the config shape, but the deployed Praxis AI image must
 include that filter for the generated config to start successfully.
 
-When `enabled: false` or `praxisConfig` is absent, this gateway behaves as before
+When `generate: false` or `praxisConfig` is absent, this gateway behaves as before
 — only the routing overlay `ConfigMap` is applied.
 
 ## GridSite

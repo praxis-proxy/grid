@@ -90,7 +90,7 @@ The generated config requires a Praxis AI image that contains the
 credential references today; deployments must ensure the selected Praxis AI image
 includes the matching request-time filter.
 
-See [`docs/architecture/crds.md`](crds.md#gatewayrefconsumerconfig) for the full
+See [`docs/architecture/crds.md`](crds.md#gatewayrefpraxisconfig) for the full
 field reference.
 
 ## Operational diagnostics
