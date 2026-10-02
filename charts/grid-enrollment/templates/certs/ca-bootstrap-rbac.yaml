@@ -58,10 +58,15 @@ rules:
       {{- if include "grid-enrollment.generatesAdminTokens" . }}
       - {{ include "grid-enrollment.adminTokensSecret" . | quote }}
       {{- end }}
-      {{- if and .Values.hubSite.name .Values.hubSite.swimKeySecretName }}
-      - {{ .Values.hubSite.swimKeySecretName | quote }}
-      {{- end }}
     verbs: ["get", "update"]
+  {{- if and .Values.hubSite.name .Values.hubSite.swimKeySecretName }}
+  # The SWIM key is created once and only read back, never replaced.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames:
+      - {{ .Values.hubSite.swimKeySecretName | quote }}
+    verbs: ["get"]
+  {{- end }}
   {{- if or (include "grid-enrollment.generatesDbCredentials" .) (include "grid-enrollment.generatesAdminTokens" .) }}
   # patch marks the generated credentials so Argo CD never prunes them.
   - apiGroups: [""]
@@ -129,10 +134,14 @@ rules:
     resourceNames:
       - {{ $.Values.hubSite.identitySecretName | quote }}
       - {{ $.Values.hubSite.caSecretName | quote }}
-      {{- with $.Values.hubSite.swimKeySecretName }}
-      - {{ . | quote }}
-      {{- end }}
     verbs: ["get", "update"]
+  {{- with $.Values.hubSite.swimKeySecretName }}
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames:
+      - {{ . | quote }}
+    verbs: ["get"]
+  {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

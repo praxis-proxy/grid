@@ -279,7 +279,7 @@ tests:
           content:
             apiGroups: [""]
             resources: ["secrets"]
-            resourceNames: ["grid-site-identity", "grid-ca", "grid-swim-key"]
+            resourceNames: ["grid-site-identity", "grid-ca"]
             verbs: ["get", "update"]
         documentIndex: 3
       - equal:
@@ -306,3 +306,18 @@ tests:
       - notContains:
           path: spec.template.spec.containers[0].args
           content: --swim-key-secret
+
+  - it: only reads the SWIM key back in the hub namespace
+    template: templates/certs/ca-bootstrap-rbac.yaml
+    set:
+      hubSite.name: hub
+      hubSite.namespace: grid-system
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["secrets"]
+            resourceNames: ["grid-swim-key"]
+            verbs: ["get"]
+        documentIndex: 3
