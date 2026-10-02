@@ -35,11 +35,11 @@ gateway can use inference, so keep the Service ClusterIP behind an authenticatin
 
 mTLS to backends: if the operator's praxis.yaml uses mutual_tls, it reads tls.crt, tls.key
 and ca.crt from the GridNetwork's consumerConfig.tlsCertMountPath (default /etc/praxis/tls).
-Set the identity Secret, and set caSecretName if the Grid CA is separate:
+Set both Secrets:
   gridIdentity.tlsSecretName: the site identity Secret containing tls.crt and tls.key
   gridIdentity.caSecretName: the Grid CA Secret containing ca.crt
   gridIdentity.mountPath: the same path as tlsCertMountPath
-If caSecretName is empty, the chart expects ca.crt in the identity Secret.
+If one Secret holds all three files, set both names to it.
 {{- if not .Values.gridIdentity.tlsSecretName }}
 
 gridIdentity.tlsSecretName is empty, so no TLS files are mounted.
