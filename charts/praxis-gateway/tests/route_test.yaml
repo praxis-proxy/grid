@@ -116,3 +116,30 @@ tests:
     asserts:
       - failedTemplate:
           errorPattern: reencrypt drops the peer client certificate
+
+  - it: reencrypts to a service-ca listener cert with no destination CA
+    set:
+      route.enabled: true
+      route.host: gw.apps.example.com
+      route.tls.termination: reencrypt
+      service.annotations:
+        service.beta.openshift.io/serving-cert-secret-name: listener-tls
+      gatewayConfig.auth.allowUnauthenticatedExposure: true
+    asserts:
+      - equal:
+          path: spec.tls.termination
+          value: reencrypt
+      - notExists:
+          path: spec.tls.destinationCACertificate
+
+  - it: still needs the destination CA when the annotation names another Secret
+    set:
+      route.enabled: true
+      route.host: gw.apps.example.com
+      route.tls.termination: reencrypt
+      service.annotations:
+        service.beta.openshift.io/serving-cert-secret-name: other-tls
+      gatewayConfig.auth.allowUnauthenticatedExposure: true
+    asserts:
+      - failedTemplate:
+          errorPattern: needs route.tls.destinationCACertificate

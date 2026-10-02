@@ -306,7 +306,8 @@ route:
   tls:
     # -- passthrough keeps TLS and client certificates end to end. reencrypt terminates at the router.
     termination: passthrough
-    # -- PEM CA that signed the gateway certificate. Required for reencrypt.
+    # -- PEM CA that signed the gateway certificate. Required for reencrypt, unless the
+    # listener cert is the one the Service's serving-cert-secret-name annotation issues.
     destinationCACertificate: ""
 
 # -- Optional routing overlay ConfigMap mount, as published by the AGN operator for
