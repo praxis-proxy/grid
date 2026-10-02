@@ -18,12 +18,15 @@ praxisConfig:
     configMapName: provider-praxis-config
     key: praxis.yaml
 
-tls:
-  enabled: true
-  existingSecret: provider-tls
+grid:
+  siteName: west-b
 
-credentials:
-  - name: mock-inference-credential
+gridIdentity:
+  secretName: provider-tls
+  caSecretName: grid-ca
+
+providerCredentials:
+  - secretName: mock-inference-credential
     mountPath: /etc/praxis/credentials/mock-inference
     optional: false
 

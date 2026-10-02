@@ -8,10 +8,9 @@ release:
 set:
   image.flavor: grid-gateway
   praxisConfig.source: render
-  praxisConfig.render.localSite: east
-  tls.enabled: true
-  tls.existingSecret: grid-site-identity
-  tls.caSecret: grid-ca
+  grid.siteName: east
+  gridIdentity.secretName: grid-site-identity
+  gridIdentity.caSecretName: grid-ca
   praxisConfig.render.role: provider
   praxisConfig.render.peerTrust.certDigests: ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
   praxisConfig.render.backends:
@@ -91,7 +90,7 @@ tests:
           path: data["praxis.yaml"]
           pattern: cert_digest
 
-  - it: projects the identity and the Grid CA into one directory
+  - it: projects the site identity and only the public Grid CA
     template: templates/deployment.yaml
     asserts:
       - contains:
@@ -102,10 +101,16 @@ tests:
               sources:
                 - secret:
                     name: grid-site-identity
-                    items: [{ key: tls.crt, path: tls.crt }, { key: tls.key, path: tls.key }]
+                    items:
+                      - key: tls.crt
+                        path: tls.crt
+                      - key: tls.key
+                        path: tls.key
                 - secret:
                     name: grid-ca
-                    items: [{ key: ca.crt, path: ca.crt }]
+                    items:
+                      - key: ca.crt
+                        path: ca.crt
 
   - it: does not require a model on a provider
     template: templates/gateway-config.yaml
@@ -164,7 +169,7 @@ tests:
     template: templates/gateway-config.yaml
     set:
       praxisConfig.render.role: consumer
-      praxisConfig.render.localSite: hub
+      grid.siteName: hub
       praxisConfig.render.model: m
       praxisConfig.render.auth.mode: none
       praxisConfig.render.peerTrust.certDigests: []
@@ -185,7 +190,7 @@ tests:
     template: templates/deployment.yaml
     set:
       praxisConfig.render.role: consumer
-      praxisConfig.render.localSite: hub
+      grid.siteName: hub
       praxisConfig.render.model: m
       praxisConfig.render.auth.mode: none
       praxisConfig.render.peerTrust.certDigests: []
@@ -201,7 +206,7 @@ tests:
     template: templates/deployment.yaml
     set:
       praxisConfig.render.role: consumer
-      praxisConfig.render.localSite: hub
+      grid.siteName: hub
       praxisConfig.render.model: m
       praxisConfig.render.auth.mode: none
       praxisConfig.render.peerTrust.certDigests: []
@@ -218,7 +223,7 @@ tests:
     template: templates/gateway-config.yaml
     set:
       praxisConfig.render.role: consumer
-      praxisConfig.render.localSite: hub
+      grid.siteName: hub
       praxisConfig.render.model: m
       praxisConfig.render.auth.mode: none
       praxisConfig.render.peerTrust.certDigests: []
@@ -231,11 +236,11 @@ tests:
           path: data["praxis.yaml"]
           pattern: 'sni: "site-a.grid.internal"'
 
-  - it: a provider mounts the default identity and grid-ca
+  - it: a provider mounts the configured identity and CA Secrets
     template: templates/deployment.yaml
     set:
-      tls.existingSecret: grid-site-identity
-      tls.caSecret: null
+      gridIdentity.secretName: grid-site-identity
+      gridIdentity.caSecretName: grid-ca
     asserts:
       - contains:
           path: spec.template.spec.volumes
@@ -245,7 +250,26 @@ tests:
               sources:
                 - secret:
                     name: grid-site-identity
-                    items: [{ key: tls.crt, path: tls.crt }, { key: tls.key, path: tls.key }]
+                    items:
+                      - key: tls.crt
+                        path: tls.crt
+                      - key: tls.key
+                        path: tls.key
                 - secret:
                     name: grid-ca
-                    items: [{ key: ca.crt, path: ca.crt }]
+                    items:
+                      - key: ca.crt
+                        path: ca.crt
+
+  - it: mounts provider credentials at the operator default path
+    template: templates/deployment.yaml
+    set:
+      providerCredentials:
+        - secretName: model-api-key
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: credential-model-api-key
+            mountPath: /run/secrets/grid-credentials/model-api-key
+            readOnly: true

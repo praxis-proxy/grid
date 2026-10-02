@@ -1,8 +1,8 @@
 # Consumer gateway on the hub, routing on its static site backends.
+fullnameOverride: grid-gateway
 praxisConfig:
   source: render
   render:
-    localSite: hub
     model: my-model
     auth:
       # none only behind a trusted authenticating front. In production use api-key with the
@@ -11,6 +11,11 @@ praxisConfig:
     backends:
       site-a:
         endpoint: 203.0.113.20:8080
+grid:
+  siteName: hub
+gridIdentity:
+  secretName: grid-site-identity
+  caSecretName: grid-ca
 # Pods in this namespace only.
 networkPolicy:
   enabled: true

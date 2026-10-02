@@ -6,14 +6,16 @@ release:
   name: praxis-gateway
   namespace: grid
 tests:
-  - it: a hub consumer needs only localSite, model, auth, and one site endpoint
+  - it: a hub consumer renders a site endpoint with its identity and Grid CA
     template: templates/gateway-config.yaml
     set:
       praxisConfig.source: render
-      praxisConfig.render.localSite: hub
+      grid.siteName: hub
       praxisConfig.render.model: my-model
       praxisConfig.render.auth.mode: none
       praxisConfig.render.backends.site-a.endpoint: 203.0.113.20:8080
+      gridIdentity.secretName: grid-site-identity
+      gridIdentity.caSecretName: grid-ca
     asserts:
       - matchRegex:
           path: data["praxis.yaml"]
@@ -26,10 +28,12 @@ tests:
     template: templates/deployment.yaml
     set:
       praxisConfig.source: render
-      praxisConfig.render.localSite: hub
+      grid.siteName: hub
       praxisConfig.render.model: my-model
       praxisConfig.render.auth.mode: none
       praxisConfig.render.backends.site-a.endpoint: 203.0.113.20:8080
+      gridIdentity.secretName: grid-site-identity
+      gridIdentity.caSecretName: grid-ca
     asserts:
       - equal:
           path: spec.template.spec.volumes[?(@.name=="tls")].projected.sources[1].secret.name
@@ -39,7 +43,7 @@ tests:
     template: templates/gateway-config.yaml
     set:
       praxisConfig.source: render
-      praxisConfig.render.localSite: hub
+      grid.siteName: hub
       praxisConfig.render.model: my-model
       praxisConfig.render.auth.mode: none
       praxisConfig.render.backends.site-b.endpoint: 203.0.113.21:8080
@@ -49,13 +53,15 @@ tests:
           path: data["praxis.yaml"]
           pattern: '(?s)cluster: "site-a" \}.*cluster: "site-b" \}'
 
-  - it: a provider needs only role, localSite, a digest, and its local endpoint
+  - it: a provider renders its local endpoint with its identity and Grid CA
     template: templates/gateway-config.yaml
     set:
       image.repository: ghcr.io/praxis-proxy/grid-gateway
       praxisConfig.source: render
       praxisConfig.render.role: provider
-      praxisConfig.render.localSite: site-a
+      grid.siteName: site-a
+      gridIdentity.secretName: grid-site-identity
+      gridIdentity.caSecretName: grid-ca
       praxisConfig.render.peerTrust.digest: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
       praxisConfig.render.peerTrust.nextDigest: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
       praxisConfig.render.backends.local.endpoint: 10.96.0.20:8000
@@ -76,7 +82,9 @@ tests:
       image.repository: ghcr.io/praxis-proxy/grid-gateway
       praxisConfig.source: render
       praxisConfig.render.role: provider
-      praxisConfig.render.localSite: site-a
+      grid.siteName: site-a
+      gridIdentity.secretName: grid-site-identity
+      gridIdentity.caSecretName: grid-ca
       praxisConfig.render.peerTrust.mode: spiffe
       praxisConfig.render.peerTrust.spiffeId: spiffe://grid.internal/site/hub
       praxisConfig.render.backends.local.endpoint: 10.96.0.20:8000
@@ -89,7 +97,7 @@ tests:
     template: templates/gateway-config.yaml
     set:
       praxisConfig.source: render
-      praxisConfig.render.localSite: hub
+      grid.siteName: hub
       praxisConfig.render.model: my-model
       praxisConfig.render.auth.mode: none
       praxisConfig.render.backends:

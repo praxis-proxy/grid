@@ -44,7 +44,7 @@ const DEFAULT_GATEWAY_IMAGE: &str = "ghcr.io/praxis-proxy/ai:0.7.0";
 /// Ordered cluster names in the combined-site scenario environment.
 const CLUSTERS: &[&str] = &["west", "central", "east"];
 
-/// Consumer gateway TLS secret name (matches Helm `existingSecret` reference).
+/// Consumer gateway identity Secret name (matches Helm `gridIdentity.secretName`).
 const CONSUMER_TLS_SECRET: &str = "consumer-gateway-tls";
 
 /// Evidence JSON schema version.
@@ -56,7 +56,7 @@ const GRID_SYSTEM_NS: &str = "grid-system";
 /// Overlay ConfigMap name created by the Grid operator for consumer gateways.
 const OVERLAY_CONFIGMAP: &str = "grid-overlay-grid-combined-site-consumer-gateway";
 
-/// Provider credential secret name (matches Helm `credentials[0].name`).
+/// Provider credential Secret name (matches Helm `providerCredentials[0].secretName`).
 const VCR_INFERENCE_CREDENTIAL: &str = "vcr-inference-credential";
 
 /// Stable terminal separator that also remains readable in captured logs.
@@ -68,7 +68,7 @@ const PROVIDER_GATEWAY_SERVICE: &str = "provider-gateway";
 /// Provider gateway port advertised via SWIM for cross-site discovery.
 const PROVIDER_GATEWAY_PORT: &str = "8443";
 
-/// Provider gateway TLS secret name (matches Helm `existingSecret` reference).
+/// Provider gateway identity Secret name (matches Helm `gridIdentity.secretName`).
 const PROVIDER_TLS_SECRET: &str = "provider-gateway-tls";
 
 /// Same-CA client identity with an organization rejected by `peer_identity_trust`.

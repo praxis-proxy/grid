@@ -7,15 +7,15 @@ set:
     source: render
     render:
       model: m
-      localSite: hub
       auth: {mode: none}
       backends:
         - cluster: c
           endpoints: ["10.0.0.1:8000"]
           transport: {mode: plaintext}
+  grid:
+    siteName: hub
   listenerTls:
-    enabled: true
-    existingSecret: listener-tls
+    secretName: listener-tls
 tests:
   - it: renders nothing by default
     asserts:
@@ -65,7 +65,7 @@ tests:
     set:
       route.enabled: true
       route.host: gw.apps.example.com
-      listenerTls.enabled: false
+      listenerTls.secretName: ""
     asserts:
       - failedTemplate:
           errorPattern: route needs TLS at the gateway
@@ -108,12 +108,10 @@ tests:
       route.tls.destinationCACertificate: PEM
       image.flavor: grid-gateway
       praxisConfig.render.role: provider
-      listenerTls.enabled: false
+      listenerTls.secretName: ""
       praxisConfig.render.peerTrust.certDigests: ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
-      tls:
-        enabled: true
-        existingSecret: grid-site-identity
-        caSecret: grid-ca
+      gridIdentity.secretName: grid-site-identity
+      gridIdentity.caSecretName: grid-ca
     asserts:
       - failedTemplate:
           errorPattern: reencrypt drops the peer client certificate
