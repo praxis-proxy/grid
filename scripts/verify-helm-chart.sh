@@ -221,11 +221,11 @@ if render verify-links "$CHART_DIR" --namespace grid-system --show-only template
   else
     fail "operator pod must set enableServiceLinks: false"
   fi
-  # Even with service links off, pin the port so no injected value can win.
-  if grep -A1 'name: GRID_GATEWAY_PORT' <<<"$RENDERED" | grep -q 'value: "8080"'; then
-    pass "operator pod sets GRID_GATEWAY_PORT by default"
+  # Leave the port unset so the operator can read it from the gateway Service.
+  if ! grep -q 'name: GRID_GATEWAY_PORT' <<<"$RENDERED"; then
+    pass "operator pod leaves GRID_GATEWAY_PORT unset for Service-port discovery"
   else
-    fail "operator pod must set GRID_GATEWAY_PORT by default"
+    fail "operator pod must leave GRID_GATEWAY_PORT unset for Service-port discovery"
   fi
 fi
 # Every grid workload pod disables service links, not just the operator.

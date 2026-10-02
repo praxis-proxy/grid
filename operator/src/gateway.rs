@@ -69,14 +69,15 @@ pub struct Config {
     )]
     pub namespace: String,
 
-    /// Port appended to the discovered address.
+    /// Port appended to the discovered address. When unset, use the gateway
+    /// Service's declared port; if several are present, use the first entry
+    /// in `spec.ports`.
     #[arg(
         long = "gateway-port",
         env = "GRID_GATEWAY_PORT",
-        default_value_t = 8080,
         value_parser = clap::value_parser!(u16).range(1..=65535)
     )]
-    pub port: u16,
+    pub port: Option<u16>,
 
     /// Discovery poll interval, milliseconds.
     ///
@@ -190,9 +191,25 @@ impl Discovery {
 async fn discover_from_service(client: &Client, config: &Config) -> Result<Discovery, kube::Error> {
     let api: Api<Service> = Api::namespaced(client.clone(), &config.namespace);
     Ok(match api.get_opt(&config.service_name).await? {
-        Some(svc) => extract_lb_address(&svc, config.port).map_or(Discovery::NoAddress, Discovery::Found),
+        Some(svc) => {
+            extract_lb_address(&svc, gateway_port(&svc, config.port)).map_or(Discovery::NoAddress, Discovery::Found)
+        },
         None => Discovery::NoService,
     })
+}
+
+/// Select the configured port, the first Service port, or the compatibility default.
+fn gateway_port(service: &Service, configured: Option<u16>) -> u16 {
+    configured
+        .or_else(|| {
+            service
+                .spec
+                .as_ref()
+                .and_then(|spec| spec.ports.as_ref())
+                .and_then(|ports| ports.first())
+                .and_then(|port| u16::try_from(port.port).ok())
+        })
+        .unwrap_or(8080)
 }
 
 /// Whether `next` differs from the `last` outcome, so a steady state logs once.
@@ -248,7 +265,9 @@ pub fn extract_lb_address(svc: &Service, port: u16) -> Option<String> {
 )]
 mod tests {
     use clap::Parser as _;
-    use k8s_openapi::api::core::v1::{LoadBalancerIngress, LoadBalancerStatus, ServiceStatus};
+    use k8s_openapi::api::core::v1::{
+        LoadBalancerIngress, LoadBalancerStatus, ServicePort, ServiceSpec, ServiceStatus,
+    };
 
     use super::*;
 
@@ -298,6 +317,19 @@ mod tests {
 
     fn svc_no_status() -> Service {
         Service::default()
+    }
+
+    fn svc_with_port(port: i32) -> Service {
+        Service {
+            spec: Some(ServiceSpec {
+                ports: Some(vec![ServicePort {
+                    port,
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
     }
 
     /// Parse a `Config` in isolation for validation tests.
@@ -407,12 +439,27 @@ mod tests {
 
     #[test]
     fn port_and_interval_default() {
-        assert!(matches!(parse_gateway(&[]), Ok(g) if g.port == 8080 && g.discovery_interval_ms == 5000));
+        assert!(matches!(parse_gateway(&[]), Ok(g) if g.port.is_none() && g.discovery_interval_ms == 5000));
     }
 
     #[test]
     fn valid_port_accepted() {
-        assert!(matches!(parse_gateway(&["--gateway-port", "443"]), Ok(g) if g.port == 443));
+        assert!(matches!(parse_gateway(&["--gateway-port", "443"]), Ok(g) if g.port == Some(443)));
+    }
+
+    #[test]
+    fn service_port_is_used_when_no_override_is_set() {
+        assert_eq!(gateway_port(&svc_with_port(8443), None), 8443);
+    }
+
+    #[test]
+    fn configured_port_overrides_service_port() {
+        assert_eq!(gateway_port(&svc_with_port(8443), Some(8080)), 8080);
+    }
+
+    #[test]
+    fn missing_service_port_uses_compatibility_default() {
+        assert_eq!(gateway_port(&svc_no_status(), None), 8080);
     }
 
     #[test]

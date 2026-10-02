@@ -73,6 +73,16 @@ tests:
             name: GRID_GATEWAY_DISCOVERY_ENABLED
             value: "false"
 
+  - it: leaves the gateway port unset for Service-port discovery
+    template: templates/deployment.yaml
+    set:
+      gateway.port: null
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: GRID_GATEWAY_PORT
+
   - it: enables gateway discovery when the value is null
     template: templates/deployment.yaml
     set:
