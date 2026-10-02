@@ -1,9 +1,9 @@
-# 0.1.x CRD Field Migration
+# 0.1.4 to 0.1.5 CRD Field Migration
 
-The 0.1.x CRD field renames keep the `grid.praxis-proxy.io/v1alpha1` API
-version, but the updated operator does not read the previous field names. There
-is no automatic conversion. Update existing custom resources and `grid-site`
-Helm values before the updated operator reconciles them.
+The 0.1.5 CRD field renames keep the `grid.praxis-proxy.io/v1alpha1` API
+version, but the updated operator does not read the 0.1.4 field names. There is
+no automatic conversion. Update existing custom resources and `grid-site` Helm
+values before the 0.1.5 operator reconciles them.
 
 ## Field mapping
 
@@ -39,8 +39,8 @@ Helm values before the updated operator reconciles them.
 3. Install the updated CRD schemas.
 4. Apply the updated custom resources and upgrade `grid-site` with its updated
    values.
-5. Start or upgrade the operator to the matching 0.1.x release. Do not let the
-   updated operator reconcile the old field names.
+5. Start or upgrade the operator to 0.1.5. Do not let it reconcile resources
+   with old field names.
 
 Pause the operator before installing the updated schemas and keep it paused
 until the migrated resources are applied. The old and new operator versions do

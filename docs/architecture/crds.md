@@ -44,9 +44,9 @@ pending, so a redeemed token currently issues a certificate inline.
 The chart stores token Secrets in its release namespace by default. Configure a
 dedicated namespace in the chart values to separate access to those credentials.
 
-The 0.1.x field renames are not converted automatically. Migrate existing
-resources before the updated operator reconciles them; see the
-[0.1.x CRD field migration guide](../installation/migration-0.1-crd-field-renames.md).
+The 0.1.4 to 0.1.5 field renames are not converted automatically. Migrate
+existing resources before the updated operator reconciles them. See the
+[0.1.4 to 0.1.5 CRD field migration guide](../installation/migration-0.1.4-to-0.1.5.md).
 
 ## GridNetwork
 
