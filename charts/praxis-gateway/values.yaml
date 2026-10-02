@@ -75,6 +75,7 @@ env: []
 # turns on by itself when existingConfigMap is empty and gatewayConfig configures grid
 # routing (backends, role provider, or gridServing). Setting gatewayConfig.localSite or
 # model without any of those fails the install rather than serving config.inline.
+# Changing a config the chart renders (render or inline) rolls the pods.
 config:
   # -- Name of an existing ConfigMap holding the Praxis configuration. The chart mounts
   # it but does not manage it, so editing it does not restart the pods.
@@ -119,6 +120,7 @@ config:
 gatewayConfig:
   # -- Render praxis.yaml + policy.yaml from these values instead of config. Also on
   # when config.existingConfigMap is empty and backends, role provider, or gridServing is set.
+  # Changing the rendered config rolls the pods.
   render: false
   # -- consumer routes callers. provider serves grid peers on the grid identity and forwards to one backend.
   role: consumer

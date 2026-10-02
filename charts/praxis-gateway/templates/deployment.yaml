@@ -21,9 +21,11 @@ spec:
         {{- toYaml $podLabels | nindent 8 }}
       {{- $configSource := include "praxis-gateway.configSource" . }}
       {{- $podAnnotations := deepCopy (.Values.podAnnotations | default dict) }}
+      {{- /* A changed chart-rendered config must reach new pods: the hash rolls the Deployment. */}}
       {{- if eq $configSource "inline" }}
-      {{- /* A changed config.inline must reach new pods: the hash rolls the Deployment. */}}
       {{- $_ := set $podAnnotations "checksum/config" (toString .Values.config.inline | sha256sum) }}
+      {{- else if eq $configSource "render" }}
+      {{- $_ := set $podAnnotations "checksum/config" (include "praxis-gateway.gatewayConfigData" . | sha256sum) }}
       {{- end }}
       {{- with $podAnnotations }}
       annotations:
