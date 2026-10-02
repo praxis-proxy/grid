@@ -203,7 +203,7 @@ changing callers:
 
 ### Manual Override
 
-Any provider can set `auth.manual: true`. When
+Any provider can set `auth.credentialsManagedExternally: true`. When
 enabled, the operator does not inject credentials
 and the user manages authentication externally.
 

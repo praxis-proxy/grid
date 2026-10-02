@@ -653,7 +653,7 @@ spec:
   endpoint: https://{hostname}
   models:
     - name: {model}
-  routingClusterRef: {routing_cluster}
+  clusterName: {routing_cluster}
   siteSelector:
     matchLabels:
       grid.praxis-proxy.io/provider-site: east-provider
@@ -666,7 +666,7 @@ spec:
       name: {secret_name}
       namespace: grid-system
       key: {secret_key}
-    manual: true",
+    credentialsManagedExternally: true",
         name = OPENAI_PROVIDER,
         provider_kind = ext.provider_kind,
         backend_kind = ext.backend_kind,
@@ -5166,7 +5166,7 @@ clusters:
             .unwrap_or_else(|_| std::process::abort());
         for expected in [
             "name: vcr-east-provider-secondary",
-            "routingClusterRef: vcr-east-provider-secondary",
+            "clusterName: vcr-east-provider-secondary",
             "grid.praxis-proxy.io/provider-site: east-provider",
             "name: Qwen/Qwen3-0.6B",
         ] {

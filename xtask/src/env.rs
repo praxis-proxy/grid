@@ -207,7 +207,7 @@ pub(crate) enum Action {
         /// Kubernetes context containing the provider resources.
         #[arg(long)]
         context: String,
-        /// Explicit provider-gateway identity from `spec.gatewayRef`.
+        /// Explicit provider-gateway identity from `spec.providerGateway`.
         #[arg(long, conflicts_with = "provider")]
         gateway: Option<String>,
         /// Drain or restore one named `InferenceProvider`.
@@ -2183,13 +2183,13 @@ fn run_operator_reconcile(context: &str) -> Result<PathBuf, Box<dyn std::error::
     // GridNetwork is created first; providers follow so the operator resolves gridNetworkRef immediately.
     // api_provider is last to prove scoring is score-driven, not input-order-driven.
     //
-    // routingClusterRef controls overlay candidate identity:
-    // - op-e2e-healthy:       routingClusterRef="site-a"           → candidate.site="site-a"
-    // - op-e2e-degraded:      routingClusterRef="site-a"           → fresh=false
+    // clusterName controls overlay candidate identity:
+    // - op-e2e-healthy:       clusterName="site-a"           → candidate.site="site-a"
+    // - op-e2e-degraded:      clusterName="site-a"           → fresh=false
     // - op-e2e-invalid:       blank endpoint                       → Unavailable, excluded
-    // - op-e2e-api-fallback:  no routingClusterRef                 → cluster="op-e2e-api-fallback"
-    // - op-e2e-metrics-idle:  routingClusterRef="site-metrics-idle" → metrics scraped (queue=0.1)
-    // - op-e2e-metrics-busy:  routingClusterRef="site-metrics-busy" → metrics scraped (queue=0.9)
+    // - op-e2e-api-fallback:  no clusterName                 → cluster="op-e2e-api-fallback"
+    // - op-e2e-metrics-idle:  clusterName="site-metrics-idle" → metrics scraped (queue=0.1)
+    // - op-e2e-metrics-busy:  clusterName="site-metrics-busy" → metrics scraped (queue=0.9)
     let healthy_endpoint = "http://mock-openai-provider.default.svc:8080";
     let api_endpoint = "https://api.anthropic.com";
     operator::apply_test_fixtures(context, healthy_endpoint)?;
@@ -2291,8 +2291,8 @@ fn env_verify_operator_reconcile(config: &Path, site: Option<&str>) -> Result<()
 ///
 /// # Invariants
 /// - `providers` must contain at least two entries (caller's responsibility).
-/// - Each `(site_name, models)` pair becomes one `InferenceProvider` with `routingClusterRef = site_name` and the given
-///   model list.
+/// - Each `(site_name, models)` pair becomes one `InferenceProvider` with `clusterName = site_name` and the given model
+///   list.
 #[expect(
     clippy::too_many_lines,
     reason = "sequential reconcile steps: CRD install, fixtures, operator spawn, poll, verify, export"
@@ -3071,8 +3071,8 @@ fn env_verify_swim_encryption(config: &Path, site: Option<&str>) -> Result<(), B
 
 /// Prove that CRDT/SWIM-distributed provider records appear in the routing overlay.
 ///
-/// Starts two SWIM-enabled operator processes, applies a `GridNetwork` with a
-/// `gatewayRef` and one `InferenceProvider`, waits for SWIM convergence and
+/// Starts two SWIM-enabled operator processes, applies a `GridNetwork` with
+/// a `consumerGateways` entry and one `InferenceProvider`, waits for SWIM convergence and
 /// distributed state propagation, then reads the overlay `ConfigMap` and asserts
 /// that at least one candidate has a `site` value originating from the remote
 /// operator (not the primary site).
@@ -3107,7 +3107,7 @@ fn env_verify_swim_overlay(config: &Path, site: Option<&str>) -> Result<(), Box<
     // Step 4: wait for SWIM gossip to converge.
     operator::wait_for_swim_convergence(SWIM_CONVERGENCE_WAIT);
 
-    // Step 5: apply the GridNetwork with a gatewayRef and one InferenceProvider.
+    // Step 5: apply the GridNetwork with a consumer gateway and one InferenceProvider.
     // Both operators reconcile on watch; each publishes the InferenceProvider
     // as CRDT state.  After convergence each operator's state_snapshot contains
     // the remote peer's provider record.
@@ -3287,8 +3287,8 @@ fn env_verify_swim_routing(config: &Path) -> Result<(), Box<dyn std::error::Erro
     eprintln!("verify-swim-routing: [4/6] waiting for SWIM convergence then applying fixtures...");
     operator::wait_for_swim_convergence(SWIM_CONVERGENCE_WAIT);
 
-    // Apply east fixtures (GridNetwork with gatewayRef + east InferenceProvider).
-    // Apply west fixtures (GridNetwork without gatewayRef + west InferenceProvider).
+    // Apply east fixtures (GridNetwork with a consumer gateway + east InferenceProvider).
+    // Apply west fixtures (GridNetwork without a consumer gateway + west InferenceProvider).
     operator::apply_swim_routing_east_fixtures(&east_ctx, east_site, &east_model)?;
     operator::apply_swim_routing_west_fixtures(&west_ctx, west_site, &west_model)?;
 
@@ -5671,7 +5671,7 @@ const REQUIRED_CRD_FIELDS: &[(&str, &str)] = &[
     // InferenceProvider spec fields
     (
         "inferenceproviders",
-        "/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties/routingClusterRef",
+        "/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties/clusterName",
     ),
     (
         "inferenceproviders",
@@ -5939,7 +5939,7 @@ fn env_verify_operator_install_rbac(config: &Path, site: Option<&str>) -> Result
             "models": [{ "name": "model-rbac-test" }],
             "backendKind": "SelfHosted",
             "providerKind": "SelfHosted",
-            "routingClusterRef": test_site_name,
+            "clusterName": test_site_name,
             "endpoint": "http://localhost:10099"
         }
     }))

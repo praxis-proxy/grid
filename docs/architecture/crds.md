@@ -602,8 +602,8 @@ feeds the resulting `BackendMetrics` into overlay scoring.
 
 | Field | Default | Meaning |
 |-------|---------|---------|
-| `metricsEndpoint` | absent | Optional metrics-service base URL. When set, it replaces `spec.endpoint` as the scrape base; `path` is appended to the selected base. |
-| `path` | `/metrics` | HTTP path, relative to `metricsEndpoint` when set, otherwise `spec.endpoint`. |
+| `metricsConfig.endpoint` | absent | Optional metrics-service base URL. When set, it replaces `spec.endpoint` as the scrape base; `path` is appended to the selected base. |
+| `path` | `/metrics` | HTTP path, relative to `metricsConfig.endpoint` when set, otherwise `spec.endpoint`. |
 | `timeout` | `2s` | Scrape timeout. `s` and `ms` suffixes are recognized. |
 | `poolName` | absent | Selects samples whose Prometheus `name` label matches this pool. When set, the scrape must contain at least one configured signal for that pool. |
 | `queueCapacity` | absent | For raw queue-depth counts, divide by this positive capacity and clamp the normalized value to `0.0..1.0`. Without it, queue depth must already be normalized. |
@@ -730,7 +730,7 @@ it when discovery is disabled. The field reports the latest poll error; the
 held model set still follows its TTL independently.
 
 The bearer token comes from `spec.auth`. A model-discovery URL must use HTTPS
-when a bearer token is configured. With `auth.manual`, requests carry no
+when a bearer token is configured. With `auth.credentialsManagedExternally`, requests carry no
 credentials, so plain HTTP remains available.
 
 Discovery runs in its own loop, like the signals scraper, not in reconcile.

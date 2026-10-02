@@ -121,7 +121,7 @@ has a real provider-level signal with defined freshness and normalization.
 ## Metrics Configuration
 
 `InferenceProvider.spec.metricsConfig` enables Prometheus text-format scraping.
-Use `metricsEndpoint` when metrics are exposed by an llm-d EPP service rather
+Use `metricsConfig.endpoint` when metrics are exposed by an llm-d EPP service rather
 than the inference endpoint:
 
 The signal names below are illustrative. Match them to the deployed exporter's
@@ -132,7 +132,7 @@ different names. They are not guaranteed defaults for every llm-d deployment.
 spec:
   endpoint: http://inference-pool.inference.svc:8000
   metricsConfig:
-    metricsEndpoint: http://llmd-epp-metrics.inference.svc:9090
+    endpoint: http://llmd-epp-metrics.inference.svc:9090
     path: /metrics
     timeout: 2s
     poolName: llama-70b-east
@@ -146,7 +146,7 @@ spec:
 
 | Field | Purpose |
 |---|---|
-| `metricsEndpoint` | Optional base URL for a dedicated metrics service. |
+| `metricsConfig.endpoint` | Optional base URL for a dedicated metrics service. |
 | `path` | Metrics path, default `/metrics`. |
 | `timeout` | Per-scrape timeout. |
 | `poolName` | Selects samples for the intended EPP pool. |

@@ -6,7 +6,7 @@ spec:
   gridNetworkRef: glb-demo
   providerKind: vllm-vcr
   backendKind: local
-  routingClusterRef: vcr-east-provider-secondary
+  clusterName: vcr-east-provider-secondary
   endpoint: http://vcr-inference-secondary.grid-system.svc.cluster.local:8000
   models:
     - name: Qwen/Qwen3-0.6B

@@ -2,7 +2,7 @@
 #
 # Two kind clusters:
 #   site-a    — provider cluster; runs mock-openai backend and Praxis provider gateway.
-#               InferenceProvider fixtures set routingClusterRef="site-a" so operator-
+#               InferenceProvider fixtures set clusterName="site-a" so operator-
 #               generated overlay candidates carry site="site-a" and cluster="site-a".
 #               The consumer gateway load_balancer maps gateway-site-a to this cluster.
 #   consumer  — receives the operator-exported overlay and routes model requests to

@@ -97,7 +97,7 @@ pub enum CredentialPlan {
     /// `spec.auth` is absent — no credential injection.
     Absent,
 
-    /// `auth.manual = true` — the user manages credentials; the operator does not inject.
+    /// `auth.credentials_managed_externally = true` — the user manages credentials; the operator does not inject.
     Manual,
 
     /// `auth.strategy = bearer_token` — resolve a bearer token from the referenced Secret.
@@ -266,7 +266,7 @@ pub fn credential_plan_from_auth(auth: Option<&AuthConfig>) -> Result<Credential
         return Ok(CredentialPlan::Absent);
     };
 
-    if auth.manual {
+    if auth.credentials_managed_externally {
         return Ok(CredentialPlan::Manual);
     }
 
@@ -296,7 +296,7 @@ pub fn credential_plan_from_auth(auth: Option<&AuthConfig>) -> Result<Credential
         // patterns that are not yet wired).
         AuthStrategy::ApiKey | AuthStrategy::Custom => Err(OperatorError::NotFound(format!(
             "auth strategy {:?} is not yet supported for controller-driven \
-                 credential projection; use auth.manual = true to manage manually",
+                 credential projection; use auth.credentials_managed_externally = true to manage manually",
             auth.strategy
         ))),
     }
@@ -314,7 +314,7 @@ pub fn credential_failure_reason_for_auth(auth: Option<&AuthConfig>) -> Credenti
         // here is a caller logic error.  Return a safe default.
         return CredentialFailureReason::CredentialSecretRefInvalid;
     };
-    if auth.manual {
+    if auth.credentials_managed_externally {
         // credential_plan_from_auth(manual=true) always returns Ok(Manual).
         return CredentialFailureReason::CredentialSecretRefInvalid;
     }
@@ -442,7 +442,7 @@ mod tests {
 
     fn bearer_auth(name: &str, ns: &str, key: &str) -> AuthConfig {
         AuthConfig {
-            manual: false,
+            credentials_managed_externally: false,
             strategy: AuthStrategy::BearerToken,
             secret_ref: Some(SecretRef {
                 name: name.to_owned(),
@@ -469,7 +469,7 @@ mod tests {
     #[test]
     fn manual_when_manual_flag_is_true() {
         let auth = AuthConfig {
-            manual: true,
+            credentials_managed_externally: true,
             strategy: AuthStrategy::BearerToken,
             secret_ref: None,
         };
@@ -484,7 +484,7 @@ mod tests {
     #[test]
     fn manual_beats_strategy_even_with_secret_ref() {
         let auth = AuthConfig {
-            manual: true,
+            credentials_managed_externally: true,
             strategy: AuthStrategy::BearerToken,
             secret_ref: Some(SecretRef {
                 name: "s".to_owned(),
@@ -521,7 +521,7 @@ mod tests {
     #[test]
     fn bearer_without_secret_ref_is_error() {
         let auth = AuthConfig {
-            manual: false,
+            credentials_managed_externally: false,
             strategy: AuthStrategy::BearerToken,
             secret_ref: None,
         };
@@ -535,7 +535,7 @@ mod tests {
     #[test]
     fn bearer_with_blank_secret_name_is_error() {
         let auth = AuthConfig {
-            manual: false,
+            credentials_managed_externally: false,
             strategy: AuthStrategy::BearerToken,
             secret_ref: Some(SecretRef {
                 name: "  ".to_owned(),
@@ -550,7 +550,7 @@ mod tests {
     #[test]
     fn bearer_with_blank_namespace_is_error() {
         let auth = AuthConfig {
-            manual: false,
+            credentials_managed_externally: false,
             strategy: AuthStrategy::BearerToken,
             secret_ref: Some(SecretRef {
                 name: "my-secret".to_owned(),
@@ -565,7 +565,7 @@ mod tests {
     #[test]
     fn bearer_with_missing_key_is_error() {
         let auth = AuthConfig {
-            manual: false,
+            credentials_managed_externally: false,
             strategy: AuthStrategy::BearerToken,
             secret_ref: Some(SecretRef {
                 name: "my-secret".to_owned(),
@@ -580,7 +580,7 @@ mod tests {
     #[test]
     fn bearer_with_blank_key_is_error() {
         let auth = AuthConfig {
-            manual: false,
+            credentials_managed_externally: false,
             strategy: AuthStrategy::BearerToken,
             secret_ref: Some(SecretRef {
                 name: "my-secret".to_owned(),
@@ -599,7 +599,7 @@ mod tests {
     #[test]
     fn sigv4_strategy_is_unsupported() {
         let auth = AuthConfig {
-            manual: false,
+            credentials_managed_externally: false,
             strategy: AuthStrategy::Sigv4,
             secret_ref: None,
         };
@@ -610,7 +610,7 @@ mod tests {
     #[test]
     fn oauth2_strategy_is_unsupported() {
         let auth = AuthConfig {
-            manual: false,
+            credentials_managed_externally: false,
             strategy: AuthStrategy::Oauth2,
             secret_ref: None,
         };
@@ -621,7 +621,7 @@ mod tests {
     #[test]
     fn api_key_strategy_is_unsupported_for_controller_projection() {
         let auth = AuthConfig {
-            manual: false,
+            credentials_managed_externally: false,
             strategy: AuthStrategy::ApiKey,
             secret_ref: None,
         };
@@ -636,7 +636,7 @@ mod tests {
     #[test]
     fn mtls_only_strategy_returns_absent() {
         let auth = AuthConfig {
-            manual: false,
+            credentials_managed_externally: false,
             strategy: AuthStrategy::MtlsOnly,
             secret_ref: None,
         };
@@ -736,7 +736,7 @@ mod tests {
     #[test]
     fn credential_failure_reason_for_auth_unsupported_strategy() {
         let auth = AuthConfig {
-            manual: false,
+            credentials_managed_externally: false,
             strategy: AuthStrategy::Sigv4,
             secret_ref: None,
         };
@@ -747,7 +747,7 @@ mod tests {
     #[test]
     fn credential_failure_reason_for_auth_bearer_with_bad_ref() {
         let auth = AuthConfig {
-            manual: false,
+            credentials_managed_externally: false,
             strategy: AuthStrategy::BearerToken,
             secret_ref: None,
         };

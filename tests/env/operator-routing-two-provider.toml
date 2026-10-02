@@ -4,7 +4,7 @@
 # site-west: provider cluster B (model-west served by mock-openai).
 # consumer:  consumer cluster (routes to both providers).
 #
-# Both providers use routingClusterRef so overlay candidates carry site names
+# Both providers use clusterName so overlay candidates carry site names
 # that the consumer gateway load_balancer can map to distinct gateway clusters.
 #
 # Setup:

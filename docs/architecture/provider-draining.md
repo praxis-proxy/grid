@@ -15,7 +15,7 @@ candidate ID, selection group, and rank are preserved while only effective
 admission changes affect the semantic overlay revision.
 
 Provider membership for administrative operations is explicit through
-`spec.gatewayRef`. It is not inferred from endpoint strings. A gateway-wide
+`spec.providerGateway`. It is not inferred from endpoint strings. A gateway-wide
 operation selects every provider with the requested reference, prints the
 sorted selection, supports `--dry-run`, applies the change idempotently, and
 waits for the requested state to be observed. AGN remains entirely outside
@@ -35,10 +35,10 @@ cargo xtask env provider-drain --context kind-example --provider provider-one --
 ```
 
 The command requires exactly one of `--provider` or `--gateway`. Gateway-wide
-selection uses the explicit `spec.gatewayRef` field; it never guesses from an
+selection uses the explicit `spec.providerGateway` field; it never guesses from an
 endpoint URL.
 
-`gatewayRef` is administrative grouping metadata; the operator does not
+`providerGateway` is administrative grouping metadata; the operator does not
 interpret it. The xtask selects and patches matching providers client-side.
 Gateway-wide mutation is a bounded fan-out and is not transactional: partial
 failures are reported and best-effort restoration is attempted. When

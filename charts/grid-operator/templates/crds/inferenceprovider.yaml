@@ -58,7 +58,7 @@ spec:
                   description: Authentication configuration.
                   nullable: true
                   properties:
-                    manual:
+                    credentialsManagedExternally:
                       default: false
                       description: |-
                         Whether the user manages credentials manually.
@@ -116,6 +116,24 @@ spec:
                   minimum: 1.0
                   nullable: true
                   type: integer
+                clusterName:
+                  description: |-
+                    Optional routing identity used in overlay candidate `site` and `cluster` fields.
+
+                    When set, routing overlay candidates produced for this provider use this value
+                    instead of `metadata.name`:
+
+                    - In Phase 1 (no [`GridSite`] inventory), both `candidate.site` and `candidate.cluster` are set to this value.
+                    - When [`GridSite`] resources are present, only `candidate.cluster` is overridden; `candidate.site` is derived
+                      from the matched `GridSite`.
+
+                    Use this to align the provider's routing identity with an upstream cluster
+                    name already configured in the consumer gateway, such as a Praxis
+                    `load_balancer` cluster entry.  When absent, `metadata.name` is used.
+
+                    [`GridSite`]: crate::crd::grid_site::GridSite
+                  nullable: true
+                  type: string
                 cost:
                   description: Cost information.
                   nullable: true
@@ -133,16 +151,6 @@ spec:
                   type: object
                 endpoint:
                   description: HTTP endpoint URL.
-                  type: string
-                gatewayRef:
-                  description: |-
-                    Stable provider-gateway identity used by administrative operations.
-
-                    Providers with the same value are drained together by the gateway-wide
-                    operation. It is an explicit control-plane relationship; the operator
-                    never infers it from endpoint URLs.
-                  minLength: 1
-                  nullable: true
                   type: string
                 gridNetworkRef:
                   description: |-
@@ -276,11 +284,11 @@ spec:
                     [`GridNetwork`]: crate::crd::grid_network::GridNetwork
                   nullable: true
                   properties:
-                    metricsEndpoint:
+                    endpoint:
                       description: |-
                         Base URL for the metrics endpoint, independent of `spec.endpoint`.
 
-                        When set, the scrape URL is `{metrics_endpoint}{path}` instead of
+                        When set, the scrape URL is `{endpoint}{path}` instead of
                         `{spec.endpoint}{path}`.  This allows scraping metrics from a separate
                         service (such as an llm-d EPP) while the provider inference endpoint
                         points at the pool's request path.
@@ -294,7 +302,7 @@ spec:
                       description: |-
                         HTTP path for the Prometheus metrics endpoint.
 
-                        Appended to `metrics_endpoint` (when set) or `spec.endpoint`.
+                        Appended to `endpoint` (when set) or `spec.endpoint`.
                         Defaults to `"/metrics"` when absent.
                       type: string
                     poolName:
@@ -617,26 +625,18 @@ spec:
                       - name
                     type: object
                   type: array
+                providerGateway:
+                  description: |-
+                    Stable provider-gateway identity used by administrative operations.
+
+                    Providers with the same value are drained together by the gateway-wide
+                    operation. It is an explicit control-plane relationship; the operator
+                    never infers it from endpoint URLs.
+                  minLength: 1
+                  nullable: true
+                  type: string
                 providerKind:
                   description: Inference provider type.
-                  type: string
-                routingClusterRef:
-                  description: |-
-                    Optional routing identity used in overlay candidate `site` and `cluster` fields.
-
-                    When set, routing overlay candidates produced for this provider use this value
-                    instead of `metadata.name`:
-
-                    - In Phase 1 (no [`GridSite`] inventory), both `candidate.site` and `candidate.cluster` are set to this value.
-                    - When [`GridSite`] resources are present, only `candidate.cluster` is overridden; `candidate.site` is derived
-                      from the matched `GridSite`.
-
-                    Use this to align the provider's routing identity with an upstream cluster
-                    name already configured in the consumer gateway, such as a Praxis
-                    `load_balancer` cluster entry.  When absent, `metadata.name` is used.
-
-                    [`GridSite`]: crate::crd::grid_site::GridSite
-                  nullable: true
                   type: string
                 siteSelector:
                   default:
