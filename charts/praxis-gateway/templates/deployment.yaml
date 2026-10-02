@@ -321,7 +321,7 @@ spec:
                     - key: tls.key
                       path: tls.key
               - secret:
-                  name: {{ (.Values.gridIdentity.caSecretName | default .Values.gridIdentity.tlsSecretName) | quote }}
+                  name: {{ .Values.gridIdentity.caSecretName | quote }}
                   items:
                     - key: ca.crt
                       path: ca.crt

@@ -399,17 +399,17 @@ try_template "$GW_DIR" "edge gateway" "${GW_REQ[@]}" \
   --set fullnameOverride=edge-gateway \
   --set service.type=LoadBalancer \
   --set overlay.configMapName=grid-overlay --set grid.networkName=example --set grid.siteName=edge \
-  --set gridIdentity.tlsSecretName=edge-tls
+  --set gridIdentity.tlsSecretName=edge-tls --set gridIdentity.caSecretName=grid-ca
 try_template "$GW_DIR" "provider gateway" "${GW_REQ[@]}" \
   --set nameOverride=provider-gateway \
   --set port.containerPort=8443 --set port.name=https-mtls \
   --set service.type=LoadBalancer --set service.port=8443 \
-  --set gridIdentity.tlsSecretName=provider-tls
+  --set gridIdentity.tlsSecretName=provider-tls --set gridIdentity.caSecretName=grid-ca
 try_template "$GW_DIR" "gtm emulator" "${GW_REQ[@]}" \
   --set nameOverride=gtm-emulator \
   --set port.containerPort=8443 --set port.name=https \
   --set service.type=LoadBalancer --set service.port=8443 \
-  --set gridIdentity.tlsSecretName=gtm-tls
+  --set gridIdentity.tlsSecretName=gtm-tls --set gridIdentity.caSecretName=grid-ca
 try_template "$GW_DIR" "service disabled" "${GW_REQ[@]}" --set service.enabled=false
 try_template "$GW_DIR" "custom image" "${GW_REQ[@]}" \
   --set image.repository=praxis-ai --set image.tag=glb-demo --set image.pullPolicy=Never
@@ -686,7 +686,7 @@ try_template "$GW_DIR" "source operator with a LoadBalancer and allowUnauthentic
 try_reject_msg "$GW_DIR" "source operator with a Route (gw)" "route is not supported with praxisConfig.source operator" \
   --set praxisConfig.source=operator --set route.enabled=true --set route.host=gw.example.com --namespace grid-system
 try_reject_msg "$GW_DIR" "render settings with source byo (gw)" "praxisConfig.source is byo, which ignores it" \
-  --set grid.siteName=hub --namespace grid-system
+  --set praxisConfig.render.model=x --namespace grid-system
 try_reject_msg "$GW_DIR" "old config key (gw)" "[Aa]dditional propert(y|ies).*config.*not allowed" --set config.existingConfigMap=x --namespace grid-system
 try_reject_msg "$GW_DIR" "old gatewayConfig key (gw)" "[Aa]dditional propert(y|ies).*gatewayConfig.*not allowed" --set gatewayConfig.render=true --namespace grid-system
 BK1=(--set "praxisConfig.render.backends[0].cluster=a" --set "praxisConfig.render.backends[0].endpoints[0]=1.2.3.4:8000"
@@ -865,6 +865,7 @@ SERVING=(--set praxisConfig.source=render --set grid.siteName=hub --set praxisCo
   --set gridIdentity.tlsSecretName=grid-site-identity --set gridIdentity.caSecretName=grid-ca
   --set praxisConfig.render.gridServing.enabled=true --set praxisConfig.render.gridServing.configMapName=grid-serving-grid-gw
   --set "praxisConfig.render.backends[0].cluster=pool-b" --set "praxisConfig.render.backends[0].endpoints[0]=203.0.113.7:8443"
+  --set "praxisConfig.render.backends[0].transport.mode=mutual_tls"
   --set "praxisConfig.render.backends[0].transport.sni=site-b.grid.internal")
 try_reject "$GW_DIR" "removed gridServing.configMap key" "${SERVING[@]}" \
   --set praxisConfig.render.gridServing.configMap=grid-serving-grid-gw
@@ -922,9 +923,9 @@ probe_port_matches() {
   fi
 }
 probe_port_matches "provider gateway" --set port.containerPort=8443 --set port.name=https-mtls \
-  --set gridIdentity.tlsSecretName=provider-tls
+  --set gridIdentity.tlsSecretName=provider-tls --set gridIdentity.caSecretName=grid-ca
 probe_port_matches "gtm emulator" --set port.containerPort=8443 --set port.name=https \
-  --set gridIdentity.tlsSecretName=gtm-tls
+  --set gridIdentity.tlsSecretName=gtm-tls --set gridIdentity.caSecretName=grid-ca
 for f in "$EXAMPLE_DIR"/{combined-site,dedicated-edge}/values/*-provider-gateway.yaml; do
   probe_port_matches "$(basename "$f" .yaml)" -f "$f"
 done

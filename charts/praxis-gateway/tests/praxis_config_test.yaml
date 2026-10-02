@@ -87,6 +87,22 @@ tests:
       - failedTemplate:
           errorPattern: gridIdentity.tlsSecretName is required when gridIdentity.caSecretName is set
 
+  - it: rejects an identity Secret without a Grid CA Secret
+    template: templates/deployment.yaml
+    set:
+      gridIdentity.tlsSecretName: grid-site-identity
+    asserts:
+      - failedTemplate:
+          errorPattern: gridIdentity.caSecretName is required when gridIdentity.tlsSecretName is set
+
+  - it: accepts one Secret named for both identity and CA
+    template: templates/deployment.yaml
+    set:
+      gridIdentity.tlsSecretName: combined
+      gridIdentity.caSecretName: combined
+    asserts:
+      - notFailedTemplate: {}
+
   - it: byo accepts listenerTls
     template: templates/deployment.yaml
     set:

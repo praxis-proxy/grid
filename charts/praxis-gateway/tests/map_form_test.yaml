@@ -48,10 +48,36 @@ tests:
       praxisConfig.render.auth.mode: none
       praxisConfig.render.backends.site-b.endpoint: 203.0.113.21:8080
       praxisConfig.render.backends.site-a.endpoint: 203.0.113.20:8080
+      gridIdentity.tlsSecretName: grid-site-identity
+      gridIdentity.caSecretName: grid-ca
     asserts:
       - matchRegex:
           path: data["praxis.yaml"]
           pattern: '(?s)cluster: "site-a" \}.*cluster: "site-b" \}'
+
+  - it: rejects a site backend that would silently use plaintext
+    template: templates/deployment.yaml
+    set:
+      praxisConfig.source: render
+      grid.siteName: hub
+      praxisConfig.render.model: my-model
+      praxisConfig.render.auth.mode: none
+      praxisConfig.render.backends.site-a.endpoint: 203.0.113.20:8080
+    asserts:
+      - failedTemplate:
+          errorPattern: serves the remote site "site-a" but gridIdentity.tlsSecretName is empty
+
+  - it: accepts a site backend that sets plaintext on purpose
+    template: templates/deployment.yaml
+    set:
+      praxisConfig.source: render
+      grid.siteName: hub
+      praxisConfig.render.model: my-model
+      praxisConfig.render.auth.mode: none
+      praxisConfig.render.backends.site-a.endpoint: 203.0.113.20:8080
+      praxisConfig.render.backends.site-a.transport.mode: plaintext
+    asserts:
+      - notFailedTemplate: {}
 
   - it: a provider renders its local endpoint with its identity and Grid CA
     template: templates/gateway-config.yaml
