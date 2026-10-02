@@ -236,7 +236,7 @@ Praxis AI image; these values may advance independently.
 | `image.repository` | string | `ghcr.io/praxis-proxy/ai` | Image repository. |
 | `image.tag` | string | `0.7.0` | Image tag (ignored when `image.digest` is set). |
 | `image.digest` | string | `""` | Immutable digest (sha256:...). When set, tag is ignored. |
-| `image.flavor` | string | `ai` | `ai` or `grid-gateway`, the grid build that `praxisConfig.render.role: provider`, `gridServing`, and telemetry need. A repository ending in `/grid-gateway` sets it. |
+| `image.flavor` | string | `ai` | `ai` or `grid-gateway`, the grid build that `praxisConfig.render.role: provider`, `praxisConfig.render.gridServing`, and telemetry need. A repository ending in `/grid-gateway` sets it. |
 | `image.pullPolicy` | string | `IfNotPresent` | Image pull policy. |
 | `imagePullSecrets` | list | `[]` | Pull secrets for private registries. |
 | `log.level` | string | `""` | Level for every module, rendered as RUST_LOG on the gateway and overlay-sync: off, error, warn, info, debug, or trace, in any case. Empty leaves RUST_LOG unset, so the binaries use their info default. An `env` entry named RUST_LOG takes precedence on the gateway. |
@@ -263,7 +263,7 @@ Praxis AI image; these values may advance independently.
 | `praxisConfig.render.telemetry.samplingRate` | number | unset | Root sampling probability, from `0.0` through `1.0`. |
 | `praxisConfig.render.telemetry.serviceName` / `serviceVersion` / `environment` | string | unset | OpenTelemetry resource attributes. |
 | `praxisConfig.render.telemetry.batchIntervalSecs` / `batchSize` | int | unset | OTLP batch export interval from 1 through 300 seconds and maximum batch size from 1 through 65,536 spans. |
-| `praxisConfig.render.model` | string | **required** for a consumer without `gridServing` | Model advertised on the routing candidates. |
+| `praxisConfig.render.model` | string | **required** for a consumer without `praxisConfig.render.gridServing` | Model advertised on the routing candidates. |
 | `praxisConfig.render.backends` | map | **required** when rendered | Backends keyed by site, each with `endpoint` and optional `healthCheck` and `transport`. A consumer's key is the site it reaches over mutual TLS. A provider's `local` key is its one plaintext backend. The older list of `cluster`, `endpoints` entries still renders. |
 | `praxisConfig.render.backends[].site` | string | `grid.siteName` | Grid site the backend serves. A consumer's remote `mutual_tls` backend must name it, and it must differ from `grid.siteName`. Its `transport.sni` defaults to `<site>.grid.internal`. |
 | `praxisConfig.render.backends[].transport` | object | `mutual_tls` with `gridIdentity.secretName`, else `plaintext` | `mode`: `mutual_tls` presents the grid identity and verifies with `gridIdentity.caSecretName` (defaults to `secretName`); `tls` verifies the server cert with no client cert; `plaintext` is cleartext. `sni` names the peer cert (required for `mutual_tls` and for `tls` to an IP endpoint). `ca` (`configMapName` or `secretName`, `key`) is the CA for a `tls` backend. A `tls` backend trusts, first match wins: `transport.ca`, then `upstreamCA`, then the process store, which is the `auth.validateCA` bundle when that is set. |
@@ -323,18 +323,18 @@ Praxis AI image; these values may advance independently.
 | `overlay.sidecar.image.pullPolicy` | string | `IfNotPresent` | Overlay-sync image pull policy. |
 | `overlay.sidecar.dataKey` | string | `routing-overlay.json` | Content-addressed envelope key in the overlay ConfigMap. |
 | `overlay.sidecar.resources` | object | small requests and limits | Resources for both the one-shot init container and continuous sidecar. |
-| `gridServing.enabled` | bool | `false` | Mount the operator's serving config, set `GRID_SERVING_CONFIG`, and route with `grid_site_route`. Consumer role and `image.flavor: grid-gateway` only. Needs `gridIdentity.secretName`; set `gridIdentity.caSecretName` when the Grid CA is separate. |
-| `gridServing.network` | string | `""` | GridNetwork name, which with `gatewayRef` names the operator's ConfigMap. |
-| `gridServing.gatewayRef` | string | release fullname | This gateway's gatewayRef name in the GridNetwork. |
-| `gridServing.configMap` | string | `""` | Overrides the derived `grid-serving-<network>-<gatewayRef>`. Needed when that name passes 63 characters. |
-| `gridServing.mountPath` | string | `/etc/praxis/grid-serving` | Mount directory for the ConfigMap. |
-| `gridServing.siteRoute.availability` | object | `{}` | Site availability, rendered into the `grid_site_route` filter block with keys snake_case as the filter reads them (`shedding`, `smoothing`, `ceiling_floor`, `explore_floor`, `full_after_ms`, `room_after_ms`, `queue_full`). Every field defaults and `shedding` is the one switch. See `examples/gateway/grid-site-route.yaml`. |
-| `gridServing.siteRoute.prefixAffinity` | object | `{}` | Prefix affinity tuning rendered as the filter's `prefix_affinity` (`enabled`, `threshold`, `exploration`, `capacity`, `ttl_secs`, `prefill_tokens_per_second`, `queued_request_seconds`, `tag_key_path`). Cache limits default to 16384 entries per backend cluster and a 600-second lifetime after confirmation; both require positive integers. |
+| `praxisConfig.render.gridServing.enabled` | bool | `false` | Mount the operator's serving config, set `GRID_SERVING_CONFIG`, and route with `grid_site_route`. Consumer role and `image.flavor: grid-gateway` only. Needs `gridIdentity.secretName`; set `gridIdentity.caSecretName` when the Grid CA is separate. |
+| `praxisConfig.render.gridServing.networkName` | string | `""` | GridNetwork name, which with `gatewayRefName` names the operator's ConfigMap. |
+| `praxisConfig.render.gridServing.gatewayRefName` | string | release fullname | This gateway's name in the GridNetwork `gatewayRefs`. |
+| `praxisConfig.render.gridServing.configMapName` | string | `""` | Overrides `grid-serving-<networkName>-<gatewayRefName>`. Needed when that name passes 63 characters. |
+| `praxisConfig.render.gridServing.mountPath` | string | `/etc/praxis/grid-serving` | Mount directory for the ConfigMap. |
+| `praxisConfig.render.gridServing.siteRoute.availability` | object | `{}` | Site availability, rendered into the `grid_site_route` filter block with keys snake_case as the filter reads them (`shedding`, `smoothing`, `ceiling_half_life_ms`, `ceiling_floor`, `explore_floor`, `full_after_ms`, `room_after_ms`, `queue_full`). Every field defaults and `shedding` is the one switch. See `examples/gateway/grid-site-route.yaml`. |
+| `praxisConfig.render.gridServing.siteRoute.prefixAffinity` | object | `{}` | Prefix affinity tuning rendered as the filter's `prefix_affinity` (`enabled`, `threshold`, `exploration`, `capacity`, `ttl_secs`, `prefill_tokens_per_second`, `queued_request_seconds`, `tag_key_path`). Cache limits default to 16384 entries per backend cluster and a 600-second lifetime after confirmation; both require positive integers. |
 | `gridIdentity.secretName` | string | `""` | Secret with `tls.crt` and `tls.key`. Non-empty mounts the identity and makes implicit render transports use mTLS. |
 | `gridIdentity.caSecretName` | string | `""` | Secret with public `ca.crt`. Empty uses `gridIdentity.secretName`; set it when the Grid CA is separate. |
 | `gridIdentity.mountPath` | string | `/etc/praxis/tls` | Directory where the identity and CA keys are projected. For operator mTLS, match `consumerConfig.tlsCertMountPath`. |
 | `providerCredentials` | list | `[]` | Provider credential Secrets (`secretName`, optional `mountPath`, `optional`). `mountPath` defaults to `/run/secrets/grid-credentials/<secretName>`, matching the operator. |
-| `health.readiness` | object | admin `/ready`, else TCP on the listener port | Readiness probe. A `tcpSocket` without a port runs an HTTP check against the admin listener when the chart sees a loopback admin listener in its rendered config or `praxisConfig.byo.inline`, and otherwise targets the listener port. It asks `/healthy` when the gateway forwards to backends (rendered backends, `gridServing`, or inline clusters), since `/ready` fails while any backend is down, and `/ready` otherwise. The check runs `/bin/sh` with `curl` or `wget`, whichever the image has; set `health.adminProbeCommand` for an image with neither. The chart refuses that fallback when a BYO inline listener serves TLS, since a TCP connect fails a TLS handshake on every probe. With a BYO ConfigMap the chart cannot see the listener, so give the probes an `httpGet` or `exec` handler when it serves TLS. Give `tcpSocket` a port or another handler to keep your own probe. Set to null to disable. |
+| `health.readiness` | object | admin `/ready`, else TCP on the listener port | Readiness probe. A `tcpSocket` without a port runs an HTTP check against the admin listener when the chart sees a loopback admin listener in its rendered config or `praxisConfig.byo.inline`, and otherwise targets the listener port. It asks `/healthy` when the gateway forwards to backends (rendered backends, `praxisConfig.render.gridServing`, or inline clusters), since `/ready` fails while any backend is down, and `/ready` otherwise. The check runs `/bin/sh` with `curl` or `wget`, whichever the image has; set `health.adminProbeCommand` for an image with neither. The chart refuses that fallback when a BYO inline listener serves TLS, since a TCP connect fails a TLS handshake on every probe. With a BYO ConfigMap the chart cannot see the listener, so give the probes an `httpGet` or `exec` handler when it serves TLS. Give `tcpSocket` a port or another handler to keep your own probe. Set to null to disable. |
 | `health.liveness` | object | admin `/healthy`, else TCP on the listener port | Liveness probe, chosen the same way against `/healthy`. Set to null to disable. |
 | `health.adminProbeCommand` | list | `[]` | Command for the admin-listener probe; the URL is appended. Empty runs `/bin/sh` with `curl` or `wget`. |
 | `shutdownDelaySeconds` | int | `5` | Seconds a terminating pod keeps serving before Praxis gets SIGTERM, so Service endpoints drop it first and rollouts do not refuse requests. Runs the image's `sleep` as a preStop hook. `0` disables it, which an image without `sleep` (distroless or scratch) needs. |
@@ -424,7 +424,7 @@ settings exist for that integration:
 - `praxisConfig.render.role: provider` serves grid peers on the site identity, admits
   them by `peerTrust`, and forwards to one local backend. It needs
   `image.flavor: grid-gateway`.
-- `gridServing` routes each model to the least-loaded site from the operator's
+- `praxisConfig.render.gridServing` routes each model to the least-loaded site from the operator's
   serving config (see [Cross-site routing in AGN](#cross-site-routing-in-agn)).
 - `overlay.configMapName` mounts the routing overlay the AGN Operator publishes
   for BYO `praxis.yaml`; the overlay-sync sidecar validates and delivers it.
@@ -587,16 +587,16 @@ mounts. Secret rotation triggers a rollout based on resource versions.
 applied; check `mountReconciliationStatus: Ready` before treating the gateway
 as ready.
 
-When `gridServing.enabled` is set, Helm keeps its read-only TLS projection at
+When `praxisConfig.render.gridServing.enabled` is set, Helm keeps its read-only TLS projection at
 `/etc/praxis/tls` through both handoff phases because the signals poller reads
 those files. The GridNetwork's `tls.caSecretRef` and `tls.siteSecretRef` must
-match the chart's `tls.caSecret` and `tls.existingSecret`; Grid validates the
+match the chart's `gridIdentity.caSecretName` and `gridIdentity.secretName`; Grid validates the
 mounted Secret keys and rolls the gateway when their resource versions change.
-The chart rejects a different `tls.mountPath` for Grid serving.
+The chart rejects a different `gridIdentity.mountPath` for Grid serving.
 
 ### Cross-site routing in AGN
 
-With `gridServing.enabled`, the consumer gateway reads the serving config the
+With `praxisConfig.render.gridServing.enabled`, the consumer gateway reads the serving config the
 grid operator writes (under `signalTransport: poll`) and polls its local operator's
 `/v1/site/signals` over mTLS with the grid identity at `gridIdentity.mountPath`, which
 relays every site the operator collects from. It routes
@@ -783,6 +783,11 @@ Migrate the values before `helm upgrade`:
 | `praxisConfig.render.backends[].transport.ca.configMap` / `.secret` | `.configMapName` / `.secretName` |
 | `overlay.enabled` + `overlay.existingConfigMap` | `overlay.configMapName` |
 | `overlay.sidecar.expectedNetwork` / `expectedLocalSite` | `grid.networkName` / `grid.siteName` |
+| `gridServing.enabled` | `praxisConfig.render.gridServing.enabled` |
+| `gridServing.network` | `praxisConfig.render.gridServing.networkName` |
+| `gridServing.gatewayRef` | `praxisConfig.render.gridServing.gatewayRefName` |
+| `gridServing.configMap` | `praxisConfig.render.gridServing.configMapName` |
+| `gridServing.mountPath` | `praxisConfig.render.gridServing.mountPath` |
 
 `gridIdentity.secretName` names the identity Secret (`tls.crt`, `tls.key`);
 `gridIdentity.caSecretName` names the public CA Secret (`ca.crt`); if empty, the
@@ -806,7 +811,7 @@ Behavior changes:
   targets the gateway Service by name.
 - `overlay.items` is removed. The chart mounts only `routing-overlay.json`;
   update any BYO `overlay_file` path that names `routing-config.json`.
-- `praxisConfig.render.role: provider` and `gridServing` require
+- `praxisConfig.render.role: provider` and `praxisConfig.render.gridServing` require
   `image.flavor: grid-gateway`.
 
 ## Where this chart lives
