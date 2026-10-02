@@ -66,7 +66,7 @@ use operator::{
     cli::Cli,
     controller::{
         agent_tool_provider,
-        grid_network::{self, OperatorCtx},
+        grid_network::{self, GridModes, OperatorCtx},
         grid_site, inference_provider,
     },
     crd::{
@@ -125,7 +125,7 @@ async fn main() {
     let GridModes {
         signal: signal_mode,
         trust,
-    } = match resolve_grid_modes(&client).await {
+    } = match resolve_grid_modes(&client, config.enrollment.enabled).await {
         Ok(modes) => modes,
         Err(error) => {
             tracing::error!(%error, "failed to resolve grid modes");
@@ -287,32 +287,8 @@ async fn swim_settled(mut startup: SwimStartup) -> Option<Arc<swim_runtime::Swim
     }
 }
 
-/// Grid-wide modes read once from the `GridNetwork` at startup.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct GridModes {
-    /// Signal propagation.
-    signal: SignalMode,
-    /// Peer authorization on the signals path.
-    trust: operator::signals::PeerTrustMode,
-}
-
-impl GridModes {
-    /// The modes `network` declares, defaults for absent fields.
-    fn of(network: &GridNetwork) -> Self {
-        Self {
-            signal: network
-                .spec
-                .signal_transport
-                .as_ref()
-                .map(|t| t.mode)
-                .unwrap_or_default(),
-            trust: network.spec.peer_trust.as_ref().map(|t| t.mode).unwrap_or_default(),
-        }
-    }
-}
-
 /// Resolve the grid-wide modes from the sole `GridNetwork`, read once at startup.
-async fn resolve_grid_modes(client: &Client) -> Result<GridModes, String> {
+async fn resolve_grid_modes(client: &Client, enrolled: bool) -> Result<GridModes, String> {
     let networks: Api<GridNetwork> = Api::all(client.clone());
     let items = networks
         .list(&kube::api::ListParams::default())
@@ -321,8 +297,9 @@ async fn resolve_grid_modes(client: &Client) -> Result<GridModes, String> {
         .items;
     match items.as_slice() {
         [] => {
-            tracing::info!("no GridNetwork at startup; gossip signals, pin peer trust");
-            Ok(GridModes::default())
+            let identity = if enrolled { " (enrolled identity)" } else { "" };
+            tracing::info!("no GridNetwork yet; peer trust spiffe{identity}, signal transport unset until one exists");
+            Ok(GridModes::WITHOUT_NETWORK)
         },
         [network] => {
             let modes = GridModes::of(network);

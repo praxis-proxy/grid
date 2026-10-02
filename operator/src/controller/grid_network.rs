@@ -27,7 +27,8 @@ use crate::{
     crd::{
         grid_network::{
             ConsumerConfig, ConsumerConfigPhase, ConsumerConfigStatus, GatewayRef, GridNetwork, GridNetworkPhase,
-            GridNetworkStatus, OverlayPhase, OverlayRevisionStatus, SignalMode, TenantBudgetStatus, TransportMode,
+            GridNetworkStatus, OverlayPhase, OverlayRevisionStatus, PeerTrustMode, SignalMode, TenantBudgetStatus,
+            TransportMode,
         },
         grid_site::{GridSite, GridSitePhase, GridSiteStatus},
         inference_provider::InferenceProvider,
@@ -127,13 +128,50 @@ pub struct OperatorCtx {
     membership_ready: std::sync::atomic::AtomicBool,
 }
 
+/// Grid-wide modes, fixed for the life of the process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GridModes {
+    /// Signal propagation.
+    pub signal: SignalMode,
+    /// Peer authorization on the signals path.
+    pub trust: PeerTrustMode,
+}
+
+impl GridModes {
+    /// Without a `GridNetwork`: SPIFFE trust in the Grid CA identity, never an implicit pin.
+    pub const WITHOUT_NETWORK: Self = Self {
+        signal: SignalMode::Gossip,
+        trust: PeerTrustMode::Spiffe,
+    };
+
+    /// The modes `network` declares, defaults for absent fields.
+    #[must_use]
+    pub fn of(network: &GridNetwork) -> Self {
+        Self {
+            signal: network
+                .spec
+                .signal_transport
+                .as_ref()
+                .map(|t| t.mode)
+                .unwrap_or_default(),
+            trust: network.spec.peer_trust.as_ref().map(|t| t.mode).unwrap_or_default(),
+        }
+    }
+
+    /// The modes to restart into when `network` declares other than `self`, the running modes.
+    #[must_use]
+    pub fn restart_for(self, network: Option<&GridNetwork>) -> Option<Self> {
+        network.map(Self::of).filter(|declared| *declared != self)
+    }
+}
+
 /// Peer addressing and trust, resolved once at startup.
 #[derive(Clone, Debug)]
 pub struct PeerSettings {
     /// This site's own signals endpoint, for its gateway.
     pub local_signals_addr: Option<String>,
     /// How peers prove their identity.
-    pub trust: signals::PeerTrustMode,
+    pub trust: PeerTrustMode,
     /// Port dialed for a peer that gossips no signals endpoint.
     pub peer_port: u16,
 }
@@ -142,7 +180,7 @@ impl Default for PeerSettings {
     fn default() -> Self {
         Self {
             local_signals_addr: None,
-            trust: signals::PeerTrustMode::default(),
+            trust: PeerTrustMode::default(),
             peer_port: signals::DEFAULT_PEER_PORT,
         }
     }
@@ -309,9 +347,9 @@ async fn register_peers(ctx: &OperatorCtx, client: &Client) -> Result<(), Operat
 /// The labels are the local object's for the same reason.
 fn peer_identities(
     sites: &[GridSite],
-    trust: signals::PeerTrustMode,
+    trust: PeerTrustMode,
 ) -> std::collections::BTreeMap<String, signals::PeerRecord> {
-    let pinned = trust == signals::PeerTrustMode::Pin;
+    let pinned = trust == PeerTrustMode::Pin;
     sites
         .iter()
         .filter_map(|site| {
@@ -588,30 +626,21 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
 
     info!(name, "reconciling GridNetwork");
 
-    // Mode is resolved once at start and never re-resolved live, so warn on a
-    // spec-versus-running divergence rather than diverge silently.
-    let desired = network
-        .spec
-        .signal_transport
-        .as_ref()
-        .map(|t| t.mode)
-        .unwrap_or_default();
-    if desired != ctx.signal_mode {
-        tracing::warn!(
-            network = name,
-            ?desired,
-            running = ?ctx.signal_mode,
-            "signalTransport.mode differs from the mode resolved at startup; restart the operator to apply"
+    // Modes are fixed at startup, so a change restarts the pod to apply it.
+    let running = GridModes {
+        signal: ctx.signal_mode,
+        trust: ctx.peer_settings.trust,
+    };
+    if let Some(next) = running.restart_for(Some(&network)) {
+        tracing::info!(
+            "GridNetwork {name} sets signalTransport={:?} peerTrust={:?}; running {:?}/{:?}; restarting to apply",
+            next.signal,
+            next.trust,
+            running.signal,
+            running.trust
         );
-    }
-    let desired_trust = network.spec.peer_trust.as_ref().map(|t| t.mode).unwrap_or_default();
-    if desired_trust != ctx.peer_settings.trust {
-        tracing::warn!(
-            network = name,
-            desired = ?desired_trust,
-            running = ?ctx.peer_settings.trust,
-            "peerTrust.mode differs from the mode resolved at startup; restart the operator to apply"
-        );
+        #[expect(clippy::exit, reason = "modes apply only at startup; Kubernetes restarts the pod")]
+        std::process::exit(0);
     }
 
     let client = &ctx.client;
@@ -3076,6 +3105,42 @@ fn parse_metrics_refresh_interval(value: &str) -> Result<Duration, OperatorError
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn network_with_modes(spec: &serde_json::Value) -> GridNetwork {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "grid.praxis.fast/v1alpha1",
+            "kind": "GridNetwork",
+            "metadata": {"name": "grid"},
+            "spec": spec,
+        }))
+        .unwrap_or_else(|_| std::process::abort())
+    }
+
+    #[test]
+    fn modes_restart_only_when_a_grid_network_declares_others() {
+        let running = GridModes::WITHOUT_NETWORK;
+        assert_eq!(running.restart_for(None), None, "no GridNetwork, no restart");
+
+        let same = network_with_modes(&serde_json::json!({"peerTrust": {"mode": "spiffe"}}));
+        assert_eq!(running.restart_for(Some(&same)), None, "same modes, no restart");
+
+        let poll = network_with_modes(&serde_json::json!({
+            "peerTrust": {"mode": "spiffe"},
+            "signalTransport": {"mode": "poll"},
+        }));
+        assert_eq!(
+            running.restart_for(Some(&poll)),
+            Some(GridModes {
+                signal: SignalMode::Poll,
+                trust: PeerTrustMode::Spiffe,
+            })
+        );
+        assert_eq!(
+            GridModes::of(&poll).restart_for(Some(&poll)),
+            None,
+            "the restarted process runs what it declares, so it never loops"
+        );
+    }
     use crate::swim_endpoint::EndpointResolutionFailure;
 
     fn seed_addr(value: &str) -> SocketAddr {
