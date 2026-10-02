@@ -14,7 +14,7 @@ praxisConfig:
 grid:
   siteName: hub
 gridIdentity:
-  secretName: grid-site-identity
+  tlsSecretName: grid-site-identity
   caSecretName: grid-ca
 # Pods in this namespace only.
 networkPolicy:

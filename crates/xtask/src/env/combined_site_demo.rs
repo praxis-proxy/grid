@@ -44,7 +44,7 @@ const DEFAULT_GATEWAY_IMAGE: &str = "ghcr.io/praxis-proxy/ai:0.7.0";
 /// Ordered cluster names in the combined-site scenario environment.
 const CLUSTERS: &[&str] = &["west", "central", "east"];
 
-/// Consumer gateway identity Secret name (matches Helm `gridIdentity.secretName`).
+/// Consumer gateway identity Secret name (matches Helm `gridIdentity.tlsSecretName`).
 const CONSUMER_TLS_SECRET: &str = "consumer-gateway-tls";
 
 /// Evidence JSON schema version.
@@ -68,7 +68,7 @@ const PROVIDER_GATEWAY_SERVICE: &str = "provider-gateway";
 /// Provider gateway port advertised via SWIM for cross-site discovery.
 const PROVIDER_GATEWAY_PORT: &str = "8443";
 
-/// Provider gateway identity Secret name (matches Helm `gridIdentity.secretName`).
+/// Provider gateway identity Secret name (matches Helm `gridIdentity.tlsSecretName`).
 const PROVIDER_TLS_SECRET: &str = "provider-gateway-tls";
 
 /// Same-CA client identity with an organization rejected by `peer_identity_trust`.

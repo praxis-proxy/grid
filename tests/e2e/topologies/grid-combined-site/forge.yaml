@@ -428,7 +428,7 @@ spec:
                 initialDelaySeconds: 5
                 periodSeconds: 10
             gridIdentity:
-              secretName: "provider-gateway-tls"
+              tlsSecretName: "provider-gateway-tls"
               caSecretName: "grid-ca"
             providerCredentials:
               - secretName: "vcr-inference-credential"
@@ -497,7 +497,7 @@ spec:
             overlay:
               configMapName: "grid-overlay-grid-combined-site-consumer-gateway"
             gridIdentity:
-              secretName: "consumer-gateway-tls"
+              tlsSecretName: "consumer-gateway-tls"
               caSecretName: "grid-ca"
             podLabels:
               grid.praxis.fast/consumer-site: "{{ cluster.name }}"
