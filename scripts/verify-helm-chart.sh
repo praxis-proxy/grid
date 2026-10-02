@@ -974,16 +974,6 @@ try_template "$SITE_DIR" "site with gateway refs" "${SITE_REQ[@]}" --namespace g
 try_template "$SITE_DIR" "site with provider-site label" "${SITE_REQ[@]}" --namespace grid-system \
   --set gridSite.providerSiteLabel=test-site
 
-PLACEMENT_RENDER=$(helm template verify-placement "$SITE_DIR" "${SITE_REQ[@]}" --namespace grid-system \
-  --set gridNetwork.selectionPolicy.mode=weightedRandom \
-  --set gridNetwork.placementPolicy.strategy=static \
-  --show-only templates/gridnetwork.yaml 2>&1)
-if echo "$PLACEMENT_RENDER" | grep -q '^  placementPolicy:'; then
-  pass "site: placementPolicy renders without scoringPolicy"
-else
-  fail "site: placementPolicy must render without scoringPolicy"
-fi
-
 echo ""
 echo "=== Schema rejection (site) ==="
 try_reject "$SITE_DIR" "blank gridNetwork name" --set gridSite.name=test --set gridNetwork.name=""

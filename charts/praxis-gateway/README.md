@@ -363,15 +363,15 @@ AGN runs this chart in two roles with different values:
 ### Resource names for the AGN Operator
 
 The chart's fullname template produces `{release}-praxis-gateway` by
-default (e.g., release `consumer-gateway` → Service name
-`consumer-gateway-praxis-gateway`). Set `fullnameOverride` to control
+default (e.g., release `provider-gateway` → Service name
+`provider-gateway-praxis-gateway`). Set `fullnameOverride` to control
 the exact Service name:
 
 ```yaml
-fullnameOverride: consumer-gateway   # Service name = consumer-gateway
+fullnameOverride: provider-gateway   # Service name = provider-gateway
 ```
 
-The AGN Operator's `gateway.serviceName` must match the consumer
+The AGN Operator's `gateway.serviceName` must match the provider
 gateway's Service name. When using `fullnameOverride`, set
 `gateway.serviceName` to the same value in the operator Helm values.
 
