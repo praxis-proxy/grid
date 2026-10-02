@@ -13,10 +13,17 @@ pub mod agent_tool_provider;
 /// Authentication strategy types shared across providers.
 pub mod auth;
 
+/// Status conditions in the `metav1.Condition` shape.
+pub mod condition;
+
 /// [`GridNetwork`] — the grid itself, top-level tenancy boundary.
 ///
 /// [`GridNetwork`]: grid_network::GridNetwork
 pub mod grid_network;
+/// [`GridOperator`]: this cluster's operator health.
+///
+/// [`GridOperator`]: grid_operator::GridOperator
+pub mod grid_operator;
 
 /// [`GridSite`] — a remote site in the grid.
 ///

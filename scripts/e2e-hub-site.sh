@@ -209,6 +209,7 @@ reset_grid() {
     if kubectl --context "$ctx" get crd gridsites.grid.praxis.fast >/dev/null 2>&1; then
       k "$ctx" delete gridsites,gridnetworks,inferenceproviders --all --wait --timeout 2m >/dev/null || true
     fi
+    k "$ctx" delete gridoperators --all --ignore-not-found >/dev/null 2>&1 || true
     uninstall "$ctx" "$NS" grid-operator
     uninstall "$ctx" "$ENS" grid-enrollment
     kubectl --context "$ctx" delete namespace "$NS" "$ENS" --ignore-not-found --wait --timeout 5m >/dev/null \
@@ -365,6 +366,11 @@ overlay_distributed() {
     | select(.gatewayName == "grid-gateway" and .phase == "Distributed" and .candidateCount >= 1)] | length == 1'
 }
 
+gridoperator_available() { # <context>
+  k "$1" get gridoperator cluster -o json | jq -e '[.status.conditions[]
+    | select((.type == "Available" and .status == "True") or (.type == "Degraded" and .status == "False"))] | length == 2'
+}
+
 assert_membership() {
   local ctx name
   for ctx in "$HUB_CTX" "$SITE_CTX"; do
@@ -382,6 +388,8 @@ assert_membership() {
   eventually "hub GridNetwork Active with >=1 connected site" network_active "$HUB_CTX" || true
   # Operator state only: the hub gateway routes on its static backends, not this overlay.
   eventually "operator renders the hub overlay with a remote candidate" overlay_distributed || true
+  eventually "hub GridOperator cluster Available, not Degraded" gridoperator_available "$HUB_CTX" || true
+  eventually "site GridOperator cluster Available, not Degraded" gridoperator_available "$SITE_CTX" || true
 }
 
 # site_call <out prefix> <path> [curl args...]: direct TLS call to the site gateway, the

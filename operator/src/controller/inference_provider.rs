@@ -116,6 +116,9 @@ const DEFAULT_HEALTH_PATH: &str = "/health";
 ///
 /// [`InferenceProvider`]: crate::crd::inference_provider::InferenceProvider
 pub async fn reconcile(provider: Arc<InferenceProvider>, client: Arc<Client>) -> Result<Action, OperatorError> {
+    if crate::controller::grid_operator::unmanaged() {
+        return Ok(Action::requeue(crate::controller::grid_operator::REFRESH_INTERVAL));
+    }
     let name = provider
         .metadata
         .name

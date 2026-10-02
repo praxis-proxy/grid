@@ -43,6 +43,17 @@ rules:
     resourceNames: ["provider-gateway", "grid-operator-swim"]
     verbs: ["get"]
 
+  # ── Deployments (namespaced) ────────────────────────────────────────
+  #
+  # Read paths:
+  #   - Gateway Deployment named by each GatewayRef, for the
+  #     GridOperator GatewayProgressing condition
+  #
+  # Only get is required; no write, list, or watch.
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get"]
+
   # ── Events (namespaced) ────────────────────────────────────────────
   #
   # Write paths:

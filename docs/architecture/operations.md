@@ -191,6 +191,8 @@ granted for `secrets` and `configmaps`.  `delete` and
 | `gridsites/status` | `get`, `patch` | Phase, reason, publicCertPem, observedGeneration |
 | `inferenceproviders` | `get`, `list`, `watch`, `patch` | Controller watch; site-selector matching |
 | `inferenceproviders/status` | `get`, `patch` | Phase, matchingSites, observedGeneration |
+| `gridoperators` | `get`, `list`, `watch`, `create` | Create the `cluster` singleton when it is missing |
+| `gridoperators/status` | `get`, `patch` | Conditions |
 
 **Events (`events.k8s.io`, `grid-operator-resources`):**
 
@@ -207,6 +209,7 @@ granted for `secrets` and `configmaps`.  `delete` and
 |---|---|---|
 | `secrets` | `get`, `create`, `patch` | Read TLS certs, SWIM key, credential refs; SSA-create CA and site cert `Secrets` |
 | `configmaps` | `create`, `patch` | SSA-create routing overlay and consumer config `ConfigMaps` |
+| `deployments` (`apps`) | `get` | Read each gateway `Deployment` for the `GridOperator` `GatewayProgressing` condition |
 
 The `grid-operator-resources` `ClusterRole` is never bound
 cluster-wide.  It takes effect only in namespaces where a
@@ -342,6 +345,24 @@ and negative `kubectl auth can-i` checks (including
 namespace-scope proofs), then waits for the
 in-cluster `Deployment` to reconcile a test `GridNetwork`
 using only the installed `ServiceAccount`.
+
+Once the operator runs, check its health in one place:
+
+```console
+kubectl get gridoperator cluster
+kubectl get gridoperator cluster -o jsonpath='{.status.conditions}'
+```
+
+`Degraded=True` names the failure this cluster owns. Peer sites show only in
+the `GridSitesAvailable` message. To raise verbosity without
+a restart, or to pause reconciling:
+
+```console
+kubectl patch gridoperator cluster --type merge -p '{"spec":{"operatorLogLevel":"Debug"}}'
+kubectl patch gridoperator cluster --type merge -p '{"spec":{"managementState":"Unmanaged"}}'
+```
+
+See [GridOperator](crds.md#gridoperator).
 
 ## 2. Create a GridNetwork
 

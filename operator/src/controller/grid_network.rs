@@ -621,6 +621,9 @@ fn reject_invalid_budget_policy(network: &GridNetwork) -> Result<(), OperatorErr
     reason = "sequential reconcile steps with cert broadcast; extracting cert into a helper would obscure the security boundary"
 )]
 pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Result<Action, OperatorError> {
+    if crate::controller::grid_operator::unmanaged() {
+        return Ok(Action::requeue(crate::controller::grid_operator::REFRESH_INTERVAL));
+    }
     let name = grid_network_name(&network)?;
     reject_invalid_budget_policy(&network)?;
 
@@ -812,6 +815,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
         consumer_statuses: consumer_config_statuses,
         overlay_statuses,
         serving_retry,
+        site_readiness,
     } = reconcile_routing_overlay_inner(
         &network,
         client,
@@ -850,6 +854,42 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
     let budget_statuses =
         crate::crd::grid_network::resolve_budget_statuses(network.spec.budget_policy.as_ref(), &tenant_spend);
 
+    // Computed once: the same values feed this network's status and the GridOperator's.
+    let cert_expiring = match &network.spec.tls.site_secret_ref {
+        Some(site) => read_signals_pem(client, site, "tls.crt")
+            .await
+            .ok()
+            .and_then(|pem| String::from_utf8(pem).ok())
+            .is_some_and(|pem| {
+                certs::cert_expires_within(&pem, super::grid_operator::CERT_EXPIRY_WARNING).unwrap_or(false)
+            }),
+        None => false,
+    };
+    super::grid_operator::observe(
+        name,
+        super::grid_operator::NetworkObservation {
+            phase: phase.clone(),
+            overlays: overlay_statuses.clone(),
+            consumers: consumer_config_statuses.clone(),
+            gateways: network
+                .spec
+                .gateway_refs
+                .iter()
+                .map(|gw| (gw.namespace.clone(), gw.name.clone()))
+                .collect(),
+            sites: site_readiness,
+            providers: providers
+                .iter()
+                .filter(|p| p.spec.grid_network_ref == name)
+                .filter_map(|p| {
+                    let provider_phase = p.status.as_ref().map(|s| s.phase.clone()).unwrap_or_default();
+                    p.metadata.name.clone().map(|n| (n, provider_phase))
+                })
+                .collect(),
+            gossip_lost: !swim_runtime_running,
+            cert_expiring,
+        },
+    );
     update_status(
         &network,
         client,
@@ -862,6 +902,9 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
         budget_statuses,
     )
     .await?;
+    if let Err(error) = super::grid_operator::publish(client).await {
+        tracing::warn!(network = name, %error, "GridOperator status publish failed");
+    }
 
     // Auto-create or update GridSite records for remote Alive SWIM members.
     // Only runs when the GridNetwork explicitly opts in via LABEL_AUTO_DISCOVER_SITES.
@@ -1527,10 +1570,27 @@ async fn reconcile_routing_overlay_inner(
             consumer_statuses.push(consumer_config_status_disabled(gw_ref, cc, observed_generation));
         }
     }
+    // A local site is never probed, so it never turns Active.
+    let local: Vec<&str> = network
+        .spec
+        .gateway_refs
+        .iter()
+        .map(|gw| gw.local_site_name.as_deref().unwrap_or(network_name))
+        .collect();
+    let site_readiness = sites
+        .iter()
+        .filter(|site| site.spec.grid_network_ref == network_name)
+        .filter_map(|site| {
+            let name = site.metadata.name.clone()?;
+            let phase = site.status.as_ref().map(|s| s.phase.clone()).unwrap_or_default();
+            (!local.contains(&name.as_str())).then_some((name, phase))
+        })
+        .collect();
     Ok(OverlayOutcome {
         consumer_statuses,
         overlay_statuses,
         serving_retry,
+        site_readiness,
     })
 }
 
@@ -1545,6 +1605,8 @@ struct OverlayOutcome {
     overlay_statuses: Vec<OverlayRevisionStatus>,
     /// Soonest a deferred serving config write can land.
     serving_retry: Option<Duration>,
+    /// Each remote site of the network and whether it is `Active`.
+    site_readiness: Vec<(String, GridSitePhase)>,
 }
 
 /// Gossip the serving config renders from, present only under poll.

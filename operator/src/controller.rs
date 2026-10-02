@@ -10,6 +10,11 @@ pub mod agent_tool_provider;
 /// [`GridNetwork`]: crate::crd::grid_network::GridNetwork
 pub mod grid_network;
 
+/// [`GridOperator`] status, this cluster's operator health.
+///
+/// [`GridOperator`]: crate::crd::grid_operator::GridOperator
+pub mod grid_operator;
+
 /// [`GridSite`] controller.
 ///
 /// [`GridSite`]: crate::crd::grid_site::GridSite

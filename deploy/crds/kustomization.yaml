@@ -3,5 +3,6 @@ kind: Kustomization
 resources:
   - agenttoolprovider.yaml
   - gridnetwork.yaml
+  - gridoperator.yaml
   - gridsite.yaml
   - inferenceprovider.yaml

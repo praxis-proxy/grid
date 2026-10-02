@@ -148,15 +148,17 @@ async fn scrape_provider_signals(
             if mc.tls.is_some() {
                 tracing::warn!(provider = identity, error = %e, "signals: provider metrics TLS unavailable; not scraping in plaintext");
             }
+            crate::controller::grid_operator::record_scrape(identity, false);
             return None;
         },
     };
-    let text = scrape_metrics(&url, parse_metrics_timeout(&mc.timeout), tls_config)
+    let scraped = scrape_metrics(&url, parse_metrics_timeout(&mc.timeout), tls_config)
         .await
         .inspect_err(|e| {
             tracing::debug!(provider = identity, error = %e, "signals: provider scrape failed; last value left to expire");
-        })
-        .ok()?;
+        });
+    crate::controller::grid_operator::record_scrape(identity, scraped.is_ok());
+    let text = scraped.ok()?;
     let observations = crate::signals::parse(&text)
         .into_iter()
         .filter(|o| wanted.contains(o.metric.as_str()))
@@ -421,6 +423,7 @@ pub(crate) async fn collect_provider_metrics_with_refresh_interval(
         let tls_config = match resolve_tls_config(mc.tls.as_ref(), client, identity).await {
             Ok(cfg) => cfg,
             Err((_reason, e)) => {
+                crate::controller::grid_operator::record_scrape(identity, false);
                 let used_cache = try_cached_metrics(
                     identity,
                     mc.stale_metrics_seconds,
@@ -461,6 +464,7 @@ pub(crate) async fn collect_provider_metrics_with_refresh_interval(
             Ok(text) => parse_prometheus_text(text, &names),
             Err(e) => Err(e.to_string()),
         };
+        crate::controller::grid_operator::record_scrape(identity, parse_result.is_ok());
         match parse_result {
             Ok(parsed) => {
                 let bm = parsed.into_backend_metrics();

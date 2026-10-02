@@ -1,0 +1,8 @@
+# The operator creates this singleton itself. Apply it only to change the settings.
+apiVersion: grid.praxis.fast/v1alpha1
+kind: GridOperator
+metadata:
+  name: cluster
+spec:
+  managementState: Managed
+  operatorLogLevel: Normal

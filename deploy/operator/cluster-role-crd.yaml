@@ -27,6 +27,11 @@ rules:
     resources:
       - agenttoolproviders/status
       - gridnetworks/status
+      - gridoperators/status
       - gridsites/status
       - inferenceproviders/status
     verbs: ["get", "patch"]
+  - apiGroups: ["grid.praxis.fast"]
+    resources:
+      - gridoperators
+    verbs: ["get", "list", "watch", "create"]

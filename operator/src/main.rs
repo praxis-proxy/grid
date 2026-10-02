@@ -81,6 +81,7 @@ use operator::{
     swim_endpoint::{SwimEndpoint, resolve_endpoint, resolve_endpoint_list_partial},
     swim_runtime::{self, RevisionLease, SwimConfig},
 };
+use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _};
 
 // ---------------------------------------------------------------------------
 // Main
@@ -94,7 +95,13 @@ use operator::{
               SWIM bootstrap, controller fan-out) reads clearer sequential than split further"
 )]
 async fn main() {
-    tracing_subscriber::fmt::init();
+    let (filter, log_reload) =
+        tracing_subscriber::reload::Layer::new(tracing_subscriber::EnvFilter::from_default_env());
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(tracing_subscriber::fmt::layer())
+        .init();
+    operator::controller::grid_operator::set_log_reload(log_reload);
     tracing::info!("starting grid-operator");
 
     // Install the process-wide crypto provider the TLS stack requires, once,
@@ -114,6 +121,9 @@ async fn main() {
     // Probes answer during enrollment and the LoadBalancer wait.
     let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let metrics_server = tokio::spawn(run_metrics_server(Arc::clone(&ready)));
+
+    // The status object reports the enrollment wait, so it must exist before it.
+    tokio::spawn(operator::controller::grid_operator::run_publisher(client.clone()));
 
     if config.enrollment.enabled
         && let Err(error) = Box::pin(operator::enroll::ensure_enrolled(&client, &config.enrollment)).await
@@ -156,6 +166,11 @@ async fn main() {
         tokio::spawn(watch_for_termination(trigger));
     } else {
         drop(trigger);
+    }
+
+    // Learn managementState before any controller reconciles.
+    if let Err(error) = operator::controller::grid_operator::publish(&client).await {
+        tracing::warn!(%error, "GridOperator status publish failed");
     }
 
     let result = tokio::try_join!(

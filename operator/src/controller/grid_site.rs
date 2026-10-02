@@ -76,6 +76,9 @@ fn event_reference(site: &GridSite, namespace: &str) -> ObjectReference {
               splitting hides the reconciliation flow"
 )]
 pub async fn reconcile(site: Arc<GridSite>, client: Arc<Client>) -> Result<Action, OperatorError> {
+    if crate::controller::grid_operator::unmanaged() {
+        return Ok(Action::requeue(crate::controller::grid_operator::REFRESH_INTERVAL));
+    }
     let name = site.metadata.name.as_deref().unwrap_or_else(|| std::process::abort());
 
     let reporter = Reporter {

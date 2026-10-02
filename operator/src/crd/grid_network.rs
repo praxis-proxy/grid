@@ -1157,7 +1157,7 @@ pub enum OverlayPhase {
 /// `rendered_revision`, `distributed_revision`, and `content_digest` are
 /// SHA-256 hex digests — they do not contain credential token bytes.
 /// `message` must never contain credential bytes.
-#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OverlayRevisionStatus {
     /// Name of the `GatewayRef` this status entry corresponds to.

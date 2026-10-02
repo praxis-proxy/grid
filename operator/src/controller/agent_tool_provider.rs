@@ -79,7 +79,11 @@ const FIELD_MANAGER: &str = "grid-operator";
 /// # Errors
 ///
 /// Returns [`OperatorError`] on Kubernetes API errors.
+#[expect(clippy::too_many_lines, reason = "the Unmanaged gate plus the reconciliation flow")]
 pub async fn reconcile(provider: Arc<AgentToolProvider>, client: Arc<Client>) -> Result<Action, OperatorError> {
+    if crate::controller::grid_operator::unmanaged() {
+        return Ok(Action::requeue(crate::controller::grid_operator::REFRESH_INTERVAL));
+    }
     let name = provider
         .metadata
         .name

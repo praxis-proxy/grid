@@ -5716,6 +5716,16 @@ const REQUIRED_CRD_FIELDS: &[(&str, &str)] = &[
         "gridsites",
         "/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties/gridNetworkRef",
     ),
+    // GridOperator singleton and status
+    (
+        "gridoperators",
+        "/spec/versions/0/schema/openAPIV3Schema/x-kubernetes-validations",
+    ),
+    ("gridoperators", "/spec/versions/0/subresources/status"),
+    (
+        "gridoperators",
+        "/spec/versions/0/schema/openAPIV3Schema/properties/status/properties/conditions",
+    ),
 ];
 
 /// Verify required fields are present in the generated CRD JSON.
@@ -5782,24 +5792,29 @@ fn env_verify_crd_schema() -> Result<(), Box<dyn std::error::Error>> {
 /// positive and negative permission expectations, then spawns an out-of-cluster
 /// operator to prove RBAC is sufficient for a minimal reconcile.
 /// Positive `kubectl auth can-i` checks for the installed operator RBAC.
+const RBAC_CAN_I: &[(&str, &str, Option<&str>)] = &[
+    ("patch", "gridnetworks.grid.praxis.fast", None),
+    ("patch", "gridnetworks.grid.praxis.fast/status", None),
+    ("get", "gridnetworks.grid.praxis.fast", None),
+    ("list", "gridnetworks.grid.praxis.fast", None),
+    ("watch", "gridnetworks.grid.praxis.fast", None),
+    ("patch", "gridsites.grid.praxis.fast", None),
+    ("patch", "gridsites.grid.praxis.fast/status", None),
+    ("list", "inferenceproviders.grid.praxis.fast", None),
+    ("patch", "inferenceproviders.grid.praxis.fast/status", None),
+    ("create", "gridoperators.grid.praxis.fast", None),
+    ("patch", "gridoperators.grid.praxis.fast/status", None),
+    ("get", "secrets", Some("default")),
+    ("create", "secrets", Some("default")),
+    ("patch", "secrets", Some("default")),
+    ("create", "configmaps", Some("default")),
+    ("patch", "configmaps", Some("default")),
+    ("get", "deployments.apps", Some("default")),
+];
+
+/// Run [`RBAC_CAN_I`] against `context`.
 fn rbac_can_i_checks(context: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let checks: &[(&str, &str, Option<&str>)] = &[
-        ("patch", "gridnetworks.grid.praxis.fast", None),
-        ("patch", "gridnetworks.grid.praxis.fast/status", None),
-        ("get", "gridnetworks.grid.praxis.fast", None),
-        ("list", "gridnetworks.grid.praxis.fast", None),
-        ("watch", "gridnetworks.grid.praxis.fast", None),
-        ("patch", "gridsites.grid.praxis.fast", None),
-        ("patch", "gridsites.grid.praxis.fast/status", None),
-        ("list", "inferenceproviders.grid.praxis.fast", None),
-        ("patch", "inferenceproviders.grid.praxis.fast/status", None),
-        ("get", "secrets", Some("default")),
-        ("create", "secrets", Some("default")),
-        ("patch", "secrets", Some("default")),
-        ("create", "configmaps", Some("default")),
-        ("patch", "configmaps", Some("default")),
-    ];
-    for (verb, resource, ns) in checks {
+    for (verb, resource, ns) in RBAC_CAN_I {
         let allowed = operator::kubectl_auth_can_i(context, verb, resource, *ns)?;
         if !allowed {
             return Err(format!(

@@ -1,0 +1,118 @@
+{{- if .Values.crds.enabled }}
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: gridoperators.grid.praxis.fast
+  annotations:
+    {{- if .Values.crds.keep }}
+    helm.sh/resource-policy: keep
+    argocd.argoproj.io/sync-options: Prune=false,Delete=false,ServerSideApply=true
+    {{- else }}
+    argocd.argoproj.io/sync-options: ServerSideApply=true
+    {{- end }}
+spec:
+  group: grid.praxis.fast
+  names:
+    categories:
+      - grid
+    kind: GridOperator
+    plural: gridoperators
+    shortNames:
+      - gop
+    singular: gridoperator
+  scope: Cluster
+  versions:
+    - additionalPrinterColumns:
+        - jsonPath: .status.conditions[?(@.type=="Available")].status
+          name: Available
+          type: string
+        - jsonPath: .status.conditions[?(@.type=="Progressing")].status
+          name: Progressing
+          type: string
+        - jsonPath: .status.conditions[?(@.type=="Degraded")].status
+          name: Degraded
+          type: string
+      name: v1alpha1
+      schema:
+        openAPIV3Schema:
+          description: Auto-generated derived type for GridOperatorSpec via `CustomResource`
+          properties:
+            spec:
+              description: Specification for the [`GridOperator`].
+              properties:
+                managementState:
+                  default: Managed
+                  description: '`Unmanaged` stops every grid controller from reconciling until set back to `Managed`.'
+                  enum:
+                    - Managed
+                    - Unmanaged
+                  type: string
+                operatorLogLevel:
+                  default: Normal
+                  description: Operator log verbosity, applied without a restart.
+                  enum:
+                    - Normal
+                    - Debug
+                    - Trace
+                    - TraceAll
+                  type: string
+              type: object
+            status:
+              description: Observed state of this cluster's grid operator.
+              nullable: true
+              properties:
+                conditions:
+                  description: |-
+                    `GridSites*`, `Providers*`, `GatewayConfig*`, and `SiteCertificateDegraded`, plus `Available`,
+                    `Progressing`, and `Degraded` derived from them by type suffix.
+                  items:
+                    description: One observed condition, keyed by `type`.
+                    properties:
+                      lastTransitionTime:
+                        description: RFC 3339 time the status last changed.
+                        type: string
+                      message:
+                        default: ""
+                        description: Human-readable detail.
+                        type: string
+                      observedGeneration:
+                        default: 0
+                        description: The `metadata.generation` this condition was computed from.
+                        format: int64
+                        type: integer
+                      reason:
+                        description: Machine-readable reason.
+                        type: string
+                      status:
+                        description: Whether the condition holds.
+                        enum:
+                          - "True"
+                          - "False"
+                          - Unknown
+                        type: string
+                      type:
+                        description: Condition type, unique within the list.
+                        type: string
+                    required:
+                      - lastTransitionTime
+                      - reason
+                      - status
+                      - type
+                    type: object
+                  type: array
+                  x-kubernetes-list-map-keys:
+                    - type
+                  x-kubernetes-list-type: map
+              type: object
+          required:
+            - spec
+          title: GridOperator
+          type: object
+          x-kubernetes-validations:
+            - message: the GridOperator is a singleton named cluster
+              rule: self.metadata.name == 'cluster'
+      served: true
+      storage: true
+      subresources:
+        status: {}
+{{- end }}

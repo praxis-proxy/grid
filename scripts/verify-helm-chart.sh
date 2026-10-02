@@ -100,7 +100,7 @@ echo ""
 echo "=== CRD synchronization ==="
 # Chart CRDs are deploy/crds plus the chart's lifecycle annotations.
 crd_body() { yq -o json 'del(.metadata.annotations)' | jq -S .; }
-for crd in agenttoolprovider gridnetwork gridsite inferenceprovider; do
+for crd in agenttoolprovider gridnetwork gridoperator gridsite inferenceprovider; do
   if render v-crds "$CHART_DIR" --show-only "templates/crds/${crd}.yaml" \
     && diff -q <(crd_body <<<"$RENDERED") <(crd_body <"$DEPLOY_CRDS/${crd}.yaml") >/dev/null; then
     pass "crd sync: ${crd}.yaml"
@@ -109,7 +109,7 @@ for crd in agenttoolprovider gridnetwork gridsite inferenceprovider; do
   fi
 done
 CRD_TEMPLATES=("$CHART_DIR"/templates/crds/*.yaml)
-if [ "${#CRD_TEMPLATES[@]}" -eq 4 ] && [ ! -d "$CHART_DIR/crds" ]; then
+if [ "${#CRD_TEMPLATES[@]}" -eq 5 ] && [ ! -d "$CHART_DIR/crds" ]; then
   pass "crds ship only as templates gated by crds.enabled"
 else
   fail "unexpected CRD files: ${CRD_TEMPLATES[*]} $([ -d "$CHART_DIR/crds" ] && echo "$CHART_DIR/crds")"
@@ -341,7 +341,7 @@ if [ -f "$TGZ" ]; then
   pass "helm package: $(basename "$TGZ") ($(stat -c%s "$TGZ") bytes)"
   CONTENTS=$(tar tzf "$TGZ" 2>&1)
   for f in Chart.yaml values.yaml values.schema.json templates/deployment.yaml templates/crds/agenttoolprovider.yaml \
-    templates/crds/gridnetwork.yaml templates/crds/gridsite.yaml templates/crds/inferenceprovider.yaml; do
+    templates/crds/gridnetwork.yaml templates/crds/gridoperator.yaml templates/crds/gridsite.yaml templates/crds/inferenceprovider.yaml; do
     if echo "$CONTENTS" | grep -q "$f"; then
       pass "package contains: $f"
     else
@@ -1137,7 +1137,7 @@ if [ "${KIND:-}" = "1" ] || [ "${1:-}" = "--kind" ]; then
     fail "kind: operator install"
   fi
 
-  for crd in agenttoolproviders.grid.praxis.fast gridnetworks.grid.praxis.fast gridsites.grid.praxis.fast \
+  for crd in agenttoolproviders.grid.praxis.fast gridnetworks.grid.praxis.fast gridoperators.grid.praxis.fast gridsites.grid.praxis.fast \
     inferenceproviders.grid.praxis.fast; do
     if kubectl --context "$KCTX" get crd "$crd" >/dev/null 2>&1; then
       pass "kind: crd $crd established"
@@ -1226,7 +1226,7 @@ CR_EOF
     fail "kind: operator uninstall"
   fi
 
-  for crd in agenttoolproviders.grid.praxis.fast gridnetworks.grid.praxis.fast gridsites.grid.praxis.fast \
+  for crd in agenttoolproviders.grid.praxis.fast gridnetworks.grid.praxis.fast gridoperators.grid.praxis.fast gridsites.grid.praxis.fast \
     inferenceproviders.grid.praxis.fast; do
     if kubectl --context "$KCTX" get crd "$crd" >/dev/null 2>&1; then
       pass "kind: crd $crd retained after uninstall"

@@ -3,6 +3,7 @@ kind: Kustomization
 
 resources:
   - gridnetwork.yaml
+  - gridoperator.yaml
   - gridsite.yaml
   - inference-provider.yaml
 

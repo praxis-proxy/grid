@@ -500,6 +500,58 @@ Tools and automation **must not** depend on a
 `conditions[]` field existing.  Match on `phase` for
 coarse state and on `reason` for specific probe outcomes.
 
+## GridOperator
+
+`GridOperator` reports this cluster's operator health and holds its process
+settings. It is a cluster-scoped singleton: a CEL rule admits only the name
+`cluster`. The operator creates it when it is missing and writes only its status.
+
+```console
+$ kubectl get gridoperator cluster
+NAME      AVAILABLE   PROGRESSING   DEGRADED
+cluster   True        False         False
+```
+
+### Spec fields
+
+| Field | Values | Effect |
+|---|---|---|
+| `managementState` | `Managed` (default), `Unmanaged` | `Unmanaged` stops every grid controller from reconciling. Status still publishes |
+| `operatorLogLevel` | `Normal` (default), `Debug`, `Trace`, `TraceAll` | `Normal` keeps the startup `RUST_LOG` filter. The others set `debug` or `trace` without a restart |
+
+The operator reads the spec at startup and on every status refresh, at most 30
+seconds apart.
+
+### Conditions
+
+Each specific condition covers one thing this cluster owns. The top-level
+`Available`, `Progressing`, and `Degraded` are their union by type suffix, and
+take the reason and message of the first contributing condition:
+
+* `Available` is `False` when any `*Available` is not `True`.
+* `Progressing` is `True` when any `*Progressing` is `True`.
+* `Degraded` is `True` when any `*Degraded` is `True`.
+
+| Type | Reasons | Meaning |
+|---|---|---|
+| `GridSitesAvailable` | `Connected`, `Isolated`, `Joining`, `NoGridNetwork` | `True` when joined and seeing a peer, or when the grid has no other site. `False` only when SWIM shows no known peer. `Unknown` with no `GridNetwork`, naming the enrolled identity once enrolled |
+| `GridSitesProgressing` | `WaitingForGridNetwork`, `Enrolling`, `JoiningGrid`, `NoGridNetwork`, `AsExpected` | `True` while enrollment waits or runs, with the last retry error in the message, or joins over SWIM. `Unknown` when no `GridNetwork` exists |
+| `GridSitesDegraded` | `GossipJoinLost`, `AsExpected` | This site's SWIM runtime stopped |
+| `ProvidersAvailable` | `Ready`, `NoneReady` | `False` only when local providers exist and none is ready |
+| `ProvidersDegraded` | `ProbeOrScrapeFailing`, `AsExpected` | A local provider is `Degraded` or `Unavailable`, or its metrics scrape fails |
+| `GatewayProgressing` | `RollingOut`, `AsExpected` | A gateway's `Deployment`, named by its `gatewayRefs` entry, has not converged on its current spec. A gateway with no readable `Deployment` is not an error |
+| `GatewayConfigDegraded` | `RenderFailing`, `AsExpected` | A gateway overlay or consumer config fails to render |
+| `SiteCertificateDegraded` | `ExpiresSoon`, `AsExpected` | This site's certificate expires within seven days |
+
+A `*Degraded` condition turns `True` only after its failure lasts 300 seconds.
+Peer health never sets `Degraded`. It shows in the `GridSitesAvailable` message,
+for example `1 of 2 sites are available, 1 degraded (site-b)`.
+
+The status holds only conditions. Counts and gateway revisions are in the
+messages: `ProvidersAvailable` reads `1 of 2 local providers are ready`, and a
+healthy `GatewayConfigDegraded` reads `grid/grid-gateway revision 3f2a rendered
+with 2 candidates`.
+
 ## InferenceProvider
 
 Represents an inference backend available over the
