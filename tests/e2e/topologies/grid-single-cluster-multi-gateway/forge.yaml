@@ -275,8 +275,9 @@ spec:
               limits:
                 cpu: 500m
                 memory: 256Mi
-            config:
-              existingConfigMap: "provider-gateway-a-config"
+            praxisConfig:
+              byo:
+                configMapName: "provider-gateway-a-config"
             port:
               containerPort: 8443
               name: "https-mtls"
@@ -339,8 +340,9 @@ spec:
               limits:
                 cpu: 500m
                 memory: 256Mi
-            config:
-              existingConfigMap: "provider-gateway-b-config"
+            praxisConfig:
+              byo:
+                configMapName: "provider-gateway-b-config"
             port:
               containerPort: 8443
               name: "https-mtls"
@@ -402,8 +404,9 @@ spec:
               limits:
                 cpu: 500m
                 memory: 256Mi
-            config:
-              existingConfigMap: "provider-gateway-c-config"
+            praxisConfig:
+              byo:
+                configMapName: "provider-gateway-c-config"
             port:
               containerPort: 8443
               name: "https-mtls"
@@ -473,8 +476,9 @@ spec:
               limits:
                 cpu: 500m
                 memory: 256Mi
-            config:
-              existingConfigMap: "consumer-gateway-a-config"
+            praxisConfig:
+              byo:
+                configMapName: "consumer-gateway-a-config"
             service:
               type: "ClusterIP"
             overlay:
@@ -527,8 +531,9 @@ spec:
               limits:
                 cpu: 500m
                 memory: 256Mi
-            config:
-              existingConfigMap: "consumer-gateway-b-config"
+            praxisConfig:
+              byo:
+                configMapName: "consumer-gateway-b-config"
             service:
               type: "ClusterIP"
             overlay:

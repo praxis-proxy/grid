@@ -264,8 +264,8 @@ install_hub() {
   helm_on "$HUB_CTX" "$NS" grid-site grid-site "${HUB_SITE_ARGS[@]}" || die "install hub grid-site"
   images gateway
   helm_on "$HUB_CTX" "$NS" grid-gateway praxis-gateway \
-    --set gatewayConfig.localSite=hub --set gatewayConfig.model="$MODEL" --set gatewayConfig.auth.mode=none \
-    --set "gatewayConfig.backends.$SITE.endpoint=$SITE_GW_IP:8080" "${IMG[@]}" || die "install hub grid-gateway"
+    --set praxisConfig.source=render --set praxisConfig.render.localSite=hub --set praxisConfig.render.model="$MODEL" --set praxisConfig.render.auth.mode=none \
+    --set "praxisConfig.render.backends.$SITE.endpoint=$SITE_GW_IP:8080" "${IMG[@]}" || die "install hub grid-gateway"
   eventually "hub operator enrolled from its own invite through the in-cluster Service" enrolled "$HUB_CTX" \
     || die "hub not enrolled"
   HUB_DIGEST=$(leaf_digest "$HUB_CTX")
@@ -322,13 +322,13 @@ install_site() {
     --set gridNetwork.gridId="$PREFIX-e2e" --set "gridSite.name=$SITE" --set "peers.hub.digest=$HUB_DIGEST" \
     --set "inferenceProviders.vcr.endpoint=http://$MODEL_IP:8000" \
     --set "inferenceProviders.vcr.model=$MODEL" --set gridNetwork.peerTrust.mode="$MODE" || die "install site grid-site"
-  trust=(--set "gatewayConfig.peerTrust.digest=$HUB_DIGEST")
-  [[ $MODE == pin ]] || trust=(--set gatewayConfig.peerTrust.mode=spiffe
-    --set gatewayConfig.peerTrust.spiffeId=spiffe://grid.internal/site/hub)
+  trust=(--set "praxisConfig.render.peerTrust.digest=$HUB_DIGEST")
+  [[ $MODE == pin ]] || trust=(--set praxisConfig.render.peerTrust.mode=spiffe
+    --set praxisConfig.render.peerTrust.spiffeId=spiffe://grid.internal/site/hub)
   images gateway
   helm_on "$SITE_CTX" "$NS" grid-gateway praxis-gateway \
-    --set gatewayConfig.role=provider --set "gatewayConfig.localSite=$SITE" "${trust[@]}" \
-    --set "gatewayConfig.backends.local.endpoint=$MODEL_IP:8000" \
+    --set praxisConfig.source=render --set praxisConfig.render.role=provider --set "praxisConfig.render.localSite=$SITE" "${trust[@]}" \
+    --set "praxisConfig.render.backends.local.endpoint=$MODEL_IP:8000" \
     "${IMG[@]}" --set service.loadBalancerIP="$SITE_GW_IP" || die "install site grid-gateway"
   eventually "site operator enrolled from its copied invite through the hub enrollment URL" enrolled "$SITE_CTX" \
     || die "site not enrolled"

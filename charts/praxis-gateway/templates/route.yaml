@@ -7,16 +7,19 @@
 {{- if not .Values.route.host }}
 {{- fail "route.host is required when route.enabled is true: it must be a name on the gateway certificate" }}
 {{- end }}
-{{- if .Values.gatewayConfig.render }}
-{{- $provider := eq (.Values.gatewayConfig.role | default "consumer") "provider" }}
-{{- if not (or $provider .Values.gatewayConfig.listenerTls.enabled) }}
-{{- fail "route needs TLS at the gateway: set gatewayConfig.listenerTls or use the provider role" }}
+{{- if eq .Values.praxisConfig.source "operator" }}
+{{- fail "route is not supported with praxisConfig.source operator: the operator's praxis.yaml listens on plaintext HTTP, and a Route here passes TLS through or re-encrypts to it. Expose the Service through an ingress that terminates TLS" }}
+{{- end }}
+{{- if eq .Values.praxisConfig.source "render" }}
+{{- $provider := eq (.Values.praxisConfig.render.role | default "consumer") "provider" }}
+{{- if not (or $provider .Values.listenerTls.enabled) }}
+{{- fail "route needs TLS at the gateway: set listenerTls or use the provider role" }}
 {{- end }}
 {{- if and $provider (eq $termination "reencrypt") }}
 {{- fail "route.tls.termination reencrypt drops the peer client certificate a provider requires; use passthrough" }}
 {{- end }}
-{{- if and (not $provider) (eq .Values.gatewayConfig.auth.mode "none") (not .Values.gatewayConfig.auth.allowUnauthenticatedExposure) }}
-{{- fail "gatewayConfig.auth.mode none with a Route exposes unauthenticated inference; use api-key or set gatewayConfig.auth.allowUnauthenticatedExposure" }}
+{{- if and (not $provider) (eq .Values.praxisConfig.render.auth.mode "none") (not .Values.praxisConfig.render.auth.allowUnauthenticatedExposure) }}
+{{- fail "praxisConfig.render.auth.mode none with a Route exposes unauthenticated inference; use api-key or set praxisConfig.render.auth.allowUnauthenticatedExposure" }}
 {{- end }}
 {{- end }}
 {{- if and (eq $termination "reencrypt") (not .Values.route.tls.destinationCACertificate) }}
