@@ -156,7 +156,8 @@ gateway:
   # -- Gateway address override.
   address: ""
   # -- Gateway Kubernetes Service name for the operator to discover. Maps to
-  # GRID_GATEWAY_SERVICE_NAME. Defaults to grid-gateway with enrollment on.
+  # GRID_GATEWAY_SERVICE_NAME. Defaults to grid-gateway with enrollment on or grid.id,
+  # which also names it in the GridNetwork's gatewayRefs.
   serviceName: ""
   # -- Namespace of the gateway Service. Empty uses the release namespace. Maps
   # to GRID_GATEWAY_NAMESPACE.

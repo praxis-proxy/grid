@@ -38,6 +38,8 @@ tests:
             seeds: ["192.0.2.10:7946"]
             signalTransport: {mode: poll}
             peerTrust: {mode: spiffe}
+            gatewayRefs:
+              - {name: grid-gateway, namespace: grid, localSiteName: east}
             tls:
               siteSecretRef: {name: grid-site-identity, namespace: grid}
               caSecretRef: {name: grid-ca, namespace: grid}
