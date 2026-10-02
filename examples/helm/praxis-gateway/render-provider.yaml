@@ -1,0 +1,21 @@
+# Provider gateway (source render): serves grid peers over mTLS and forwards to one local backend.
+fullnameOverride: grid-gateway
+image:
+  repository: ghcr.io/praxis-proxy/grid-gateway
+  tag: v0.1.4
+grid:
+  siteName: site-a
+praxisConfig:
+  source: render
+  render:
+    role: provider
+    peerTrust:
+      # Replace with the SHA-256 of the peer's leaf certificate. The render fails until you do.
+      digest: <peer leaf digest>
+    backends:
+      local:
+        # Use the model Service ClusterIP. Praxis refuses a hostname that resolves privately.
+        endpoint: 10.96.0.20:8000
+gridIdentity:
+  tlsSecretName: grid-site-identity
+  caSecretName: grid-ca
