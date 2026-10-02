@@ -2108,13 +2108,13 @@ fn add_openai_credential_mount(spec: &mut serde_yaml::Mapping) -> Result<(), Box
                 .ok_or("provider-gateway Helm values not found")?;
 
             let credentials = values
-                .entry("credentials".into())
+                .entry("providerCredentials".into())
                 .or_insert_with(|| serde_yaml::Value::Sequence(Vec::new()))
                 .as_sequence_mut()
-                .ok_or("credentials is not a sequence")?;
+                .ok_or("providerCredentials is not a sequence")?;
 
             for cred in credentials.iter() {
-                if let Some(name) = cred.get("name").and_then(|v| v.as_str())
+                if let Some(name) = cred.get("secretName").and_then(|v| v.as_str())
                     && name == "openai-api-key"
                 {
                     return Err("OpenAI credential mount already exists".into());
@@ -2123,7 +2123,7 @@ fn add_openai_credential_mount(spec: &mut serde_yaml::Mapping) -> Result<(), Box
 
             let openai_credential = serde_yaml::Value::Mapping(
                 [
-                    ("name".into(), "openai-api-key".into()),
+                    ("secretName".into(), "openai-api-key".into()),
                     ("mountPath".into(), "/etc/praxis/credentials/openai".into()),
                     ("optional".into(), false.into()),
                 ]
