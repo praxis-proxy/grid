@@ -26,7 +26,7 @@ helm install gw charts/praxis-gateway -f examples/helm/praxis-gateway/byo.yaml
 - `auth.mode: none` is only safe behind an authenticating front. The example
   limits access with a `networkPolicy`.
 - Put your sites under `praxisConfig.render.backends`.
-- Set `gridIdentity.tlsSecretName` and `caSecretName` to your Grid TLS Secrets.
+- Set `gridIdentity.tlsSecretName` and `gridIdentity.caSecretName` to your Grid TLS Secrets.
 
 ## render-provider.yaml
 
