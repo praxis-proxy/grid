@@ -917,8 +917,8 @@ pub struct RoutingOverlay {
     /// Local site identifier.
     ///
     /// Supplied per gateway by the controller as
-    /// `gw_ref.local_site_name.as_deref().unwrap_or(network_name)`.
-    /// Each `GatewayRef` may declare its own `localSiteName`, allowing
+    /// `gw_ref.site_name.as_deref().unwrap_or(network_name)`.
+    /// Each `GatewayRef` may declare its own `siteName`, allowing
     /// multi-gateway networks to produce overlays with distinct
     /// `local_site` values.  Falls back to the network name for
     /// single-site networks.
@@ -1125,7 +1125,7 @@ fn assign_selection_groups(candidates: &mut [RoutingCandidate], policy: crate::c
 /// than remote candidates.  The caller is responsible for computing
 /// `local_site` per gateway:
 /// ```text
-/// local_site = gw_ref.local_site_name.as_deref().unwrap_or(network_name)
+/// local_site = gw_ref.site_name.as_deref().unwrap_or(network_name)
 /// ```
 ///
 /// Provider access policy enforcement: Each provider's `spec.accessPolicy`

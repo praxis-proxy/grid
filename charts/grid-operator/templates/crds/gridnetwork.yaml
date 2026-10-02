@@ -159,18 +159,24 @@ spec:
                         type: object
                       type: array
                   type: object
-                gatewayRefs:
+                consumerGateways:
                   default: []
                   description: References to Praxis Gateways that participate in this grid.
                   items:
                     description: Reference to a Praxis Gateway that participates in this grid.
                     properties:
-                      consumerConfig:
+                      name:
+                        description: Gateway name.
+                        type: string
+                      namespace:
+                        description: Gateway namespace.
+                        type: string
+                      praxisConfig:
                         description: |-
                           Opt-in configuration for operator-managed consumer Praxis config generation.
 
-                          When absent or `enabled: false`, this gateway behaves exactly as before —
-                          only the routing overlay `ConfigMap` is applied.  When `enabled: true`, the
+                          When absent or `generate: false`, this gateway behaves exactly as before —
+                          only the routing overlay `ConfigMap` is applied.  When `generate: true`, the
                           operator additionally renders a consumer Praxis `ConfigMap` containing the
                           `intelligent_route` candidates (with credential `secretRef` data), a
                           `credential_inject` section for credential-bearing candidates, and a
@@ -258,17 +264,17 @@ spec:
 
                               Default: `praxis-consumer-config`.
                             type: string
-                          credentialMountBase:
+                          credentialMountPath:
                             default: /run/secrets/grid-credentials
                             description: |-
                               Base directory for mounted credential Secret files inside the consumer pod.
 
                               Each credential Secret is expected to be mounted at
-                              `{credentialMountBase}/{secret-name}/{secret-key}`.
+                              `{credentialMountPath}/{secret-name}/{secret-key}`.
 
                               Default: `/run/secrets/grid-credentials`.
                             type: string
-                          enabled:
+                          generate:
                             default: false
                             description: |-
                               Enable operator-managed consumer Praxis config generation for this gateway.
@@ -299,7 +305,7 @@ spec:
                               Default: `/etc/praxis/tls`.
                             type: string
                         type: object
-                      localSiteName:
+                      siteName:
                         description: |-
                           Local site name for the `intelligent_route` overlay generated for this gateway.
 
@@ -315,12 +321,6 @@ spec:
                           [`GridSite`]: crate::crd::grid_site::GridSite
                           [`GridNetwork`]: crate::crd::grid_network::GridNetwork
                         nullable: true
-                        type: string
-                      name:
-                        description: Gateway name.
-                        type: string
-                      namespace:
-                        description: Gateway namespace.
                         type: string
                     required:
                       - name
@@ -515,7 +515,7 @@ spec:
                   default:
                     caSecretRef: null
                     siteSecretRef: null
-                    swimKeyRef: null
+                    swimKeySecretRef: null
                   description: TLS secret references for grid certificate management.
                   properties:
                     caSecretRef:
@@ -570,7 +570,7 @@ spec:
                         - name
                         - namespace
                       type: object
-                    swimKeyRef:
+                    swimKeySecretRef:
                       description: Secret storing the SWIM encryption key.
                       nullable: true
                       properties:
@@ -657,20 +657,38 @@ spec:
                   format: uint32
                   minimum: 0.0
                   type: integer
-                consumerConfigStatus:
+                gridId:
+                  default: ""
+                  description: The negotiated grid ID.
+                  type: string
+                observedGeneration:
+                  default: 0
+                  description: Last observed generation.
+                  format: int64
+                  type: integer
+                phase:
+                  default: Pending
+                  description: Current lifecycle phase.
+                  enum:
+                    - Pending
+                    - Initializing
+                    - Active
+                    - Degraded
+                  type: string
+                praxisConfigStatus:
                   description: |-
                     Per-gateway consumer Praxis config render and apply status.
 
-                    Populated for every gateway reference that has `consumerConfig.enabled: true`.
-                    Gateways without `consumerConfig` are omitted.  Use this field to
+                    Populated for every gateway reference that has `praxisConfig.generate: true`.
+                    Gateways without `praxisConfig` are omitted.  Use this field to
                     determine whether the operator successfully rendered and applied a
                     consumer `ConfigMap` for each opted-in gateway.
                   items:
                     description: |-
                       Per-gateway status for operator-managed consumer Praxis config generation.
 
-                      Reported in [`GridNetworkStatus::consumer_config_status`] for each gateway
-                      reference with `consumerConfig.enabled: true`.
+                      Reported in [`GridNetworkStatus::praxis_config_status`] for each gateway
+                      reference with `praxisConfig.generate: true`.
 
                       # Security
 
@@ -683,7 +701,7 @@ spec:
                         description: |-
                           Name of the generated `ConfigMap`.
 
-                          Populated from `consumerConfig.configMapName`; empty for `Disabled` entries.
+                          Populated from `praxisConfig.configMapName`; empty for `Disabled` entries.
                         type: string
                       gatewayName:
                         description: Name of the `GatewayRef` this status entry corresponds to.
@@ -717,8 +735,8 @@ spec:
 
                           `""` when `phase` is `Rendered`.
                           One of `MissingClusterEndpoint`, `MissingTransport`, `MissingSni`,
-                          `PlaintextWithSni`, `ConsumerConfigRenderFailed`,
-                          `ConsumerConfigApplyFailed`, `ConsumerConfigDisabled` otherwise.
+                          `PlaintextWithSni`, `PraxisConfigRenderFailed`,
+                          `PraxisConfigApplyFailed`, `PraxisConfigDisabled` otherwise.
                         type: string
                     required:
                       - gatewayName
@@ -726,7 +744,7 @@ spec:
                       - phase
                     type: object
                   type: array
-                distributedProviderCount:
+                remoteProviderCount:
                   default: 0
                   description: |-
                     Number of remote provider records received for this network via CRDT state broadcasts.
@@ -738,16 +756,7 @@ spec:
                   format: uint32
                   minimum: 0.0
                   type: integer
-                gridId:
-                  default: ""
-                  description: The negotiated grid ID.
-                  type: string
-                observedGeneration:
-                  default: 0
-                  description: Last observed generation.
-                  format: int64
-                  type: integer
-                overlayStatus:
+                routingMapStatus:
                   description: |-
                     Per-gateway overlay revision status.
 
@@ -759,7 +768,7 @@ spec:
                     description: |-
                       Per-gateway overlay revision status for observability.
 
-                      Reported in [`GridNetworkStatus::overlay_status`] for each gateway
+                      Reported in [`GridNetworkStatus::routing_map_status`] for each gateway
                       after each reconcile attempt.
 
                       # Security
@@ -843,15 +852,6 @@ spec:
                       - schemaVersion
                     type: object
                   type: array
-                phase:
-                  default: Pending
-                  description: Current lifecycle phase.
-                  enum:
-                    - Pending
-                    - Initializing
-                    - Active
-                    - Degraded
-                  type: string
               type: object
           required:
             - spec

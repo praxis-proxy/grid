@@ -23,13 +23,13 @@ spec:
   gridId: ""                    # auto-generated on first join
   seeds:
     - "10.0.0.5:7946"
-  gatewayRefs:
+  consumerGateways:
     - name: inference-gw
       namespace: praxis-system
-      localSiteName: cluster-east   # optional; defaults to network name
-      consumerConfig:               # optional; opt-in consumer Praxis config generation
-        enabled: true
-        credentialMountBase: /run/secrets/grid-credentials
+      siteName: cluster-east   # optional; defaults to network name
+      praxisConfig:               # optional; opt-in consumer Praxis config generation
+        generate: true
+        credentialMountPath: /run/secrets/grid-credentials
         configMapName: praxis-consumer-config
         tlsCertMountPath: /etc/praxis/tls
         clusterEndpoints:           # endpoint topology for load_balancer
@@ -55,7 +55,7 @@ spec:
     siteSecretRef:
       name: grid-site-cert
       namespace: praxis-system
-    swimKeyRef:
+    swimKeySecretRef:
       name: swim-key
       namespace: praxis-system
   budgetPolicy:                   # optional; absent means no tenants are tracked
@@ -89,15 +89,15 @@ not part of this CRD.
 
 **Phases**: Pending → Initializing → Active → Degraded
 
-**Status fields**: `gridId`, `connectedSites`, `distributedProviderCount`,
-`observedGeneration`, `phase`, `consumerConfigStatus[]`, `budgetStatus[]`
+**Status fields**: `gridId`, `connectedSites`, `remoteProviderCount`,
+`observedGeneration`, `phase`, `praxisConfigStatus[]`, `budgetStatus[]`
 
-`distributedProviderCount` reflects the number of remote `InferenceProvider`
+`remoteProviderCount` reflects the number of remote `InferenceProvider`
 records received from peer sites via CRDT broadcast.  Local providers and records
 from other `GridNetwork`s are excluded from the count.
 
-`consumerConfigStatus[]` is populated for each gateway with
-`consumerConfig.enabled: true`, reporting the outcome of the most recent
+`praxisConfigStatus[]` is populated for each gateway with
+`praxisConfig.generate: true`, reporting the outcome of the most recent
 render/apply attempt.
 
 ### Tenant budget tracking
@@ -135,7 +135,7 @@ options under consideration if per-tenant confidentiality is required.
 | `namespace` | string | Namespace of the gateway and generated `ConfigMap` |
 | `configMapName` | string | Name of the generated `ConfigMap` |
 | `phase` | enum | `Rendered` \| `Error` \| `Disabled` |
-| `reason` | string | Machine-readable reason (`MissingClusterEndpoint`, `ConsumerConfigRenderFailed`, `ConsumerConfigApplyFailed`) — empty when `Rendered` |
+| `reason` | string | Machine-readable reason (`MissingClusterEndpoint`, `PraxisConfigRenderFailed`, `PraxisConfigApplyFailed`) — empty when `Rendered` |
 | `message` | string | Human-readable diagnostic; never contains token bytes |
 | `observedGeneration` | integer | `GridNetwork` generation when this entry was last updated |
 
@@ -146,7 +146,7 @@ status:
   phase: Active
   gridId: grid-abc123
   connectedSites: 2
-  consumerConfigStatus:
+  praxisConfigStatus:
     - gatewayName: inference-gw
       namespace: praxis-system
       configMapName: praxis-consumer-config
@@ -158,7 +158,7 @@ status:
       namespace: default
       configMapName: op-e2e-consumer-config
       phase: Error
-      reason: ConsumerConfigRenderFailed
+      reason: PraxisConfigRenderFailed
       message: "consumer config render: overlay local_site must not be blank"
       observedGeneration: 7
 ```
@@ -193,14 +193,14 @@ table.  Provider CRDT state remains scoped per network.
 **Self-filtering:** The operator removes its own SWIM bind address from
 `spec.seeds` before announcing, preventing self-join loops.
 
-**`spec.tls.swimKeyRef`:** References a Kubernetes Secret containing the 32-byte
+**`spec.tls.swimKeySecretRef`:** References a Kubernetes Secret containing the 32-byte
 AES-256-GCM key for SWIM transport authentication.  When configured, the
 `GridNetwork` controller reads the key from the Secret and configures the
 SWIM runtime to encrypt all outgoing UDP packets and reject incoming packets
 that fail authentication before it announces CRD seeds or publishes
 certificate/provider state for that reconcile.
 
-The Secret must contain a `"key"` field (or the field named by `swimKeyRef.key`)
+The Secret must contain a `"key"` field (or the field named by `swimKeySecretRef.key`)
 with exactly 32 bytes.  If the Secret is absent, unreadable, or has the wrong
 length, the reconcile fails before CRD seed announcement and state broadcast.
 The process-global SWIM runtime keeps any previously loaded key until restart;
@@ -231,15 +231,15 @@ candidates are evicted from the rendered overlay.
 Local and healthy remote candidates are never evicted.  CRDT storage records
 are not deleted by this mechanism.
 
-### GatewayRef.consumerConfig
+### GatewayRef.praxisConfig
 
-`spec.gatewayRefs[].consumerConfig` opts a gateway into operator-managed consumer
+`spec.consumerGateways[].praxisConfig` opts a gateway into operator-managed consumer
 Praxis `ConfigMap` generation.
 
 | Field | Default | Meaning |
 |---|---|---|
 | `enabled` | `false` | Set to `true` to enable consumer config generation for this gateway. |
-| `credentialMountBase` | `/run/secrets/grid-credentials` | Base directory where credential Secrets are mounted inside the consumer pod. |
+| `credentialMountPath` | `/run/secrets/grid-credentials` | Base directory where credential Secrets are mounted inside the consumer pod. |
 | `configMapName` | `praxis-consumer-config` | Name of the generated `ConfigMap` in the gateway namespace. |
 | `clusterEndpoints[]` | `[]` | Endpoint topology for `load_balancer` clusters. Each entry maps a candidate cluster name to an address with explicit `transport` configuration. Missing transport fails closed. |
 | `clusterEndpoints[].transport.mode` | _(required)_ | `mutual_tls` (mTLS with CA/client cert/SNI/verify) or `plaintext` (no TLS, insecure/dev-only). |
@@ -274,7 +274,7 @@ The `credential_inject` filter is a Praxis AI runtime dependency. The AGN
 operator can render the config shape, but the deployed Praxis AI image must
 include that filter for the generated config to start successfully.
 
-When `enabled: false` or `consumerConfig` is absent, this gateway behaves as before
+When `enabled: false` or `praxisConfig` is absent, this gateway behaves as before
 — only the routing overlay `ConfigMap` is applied.
 
 ## GridSite

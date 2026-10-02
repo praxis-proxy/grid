@@ -59,7 +59,7 @@ writes. inferenceProviders keyed by name become the list the template reads.
 {{- $_ := set $net "tls" (dict
   "siteSecretRef" (dict "name" "grid-site-identity" "namespace" $ns)
   "caSecretRef" (dict "name" "grid-ca" "namespace" $ns)
-  "swimKeyRef" (dict "name" "grid-swim-key" "namespace" $ns)) }}
+  "swimKeySecretRef" (dict "name" "grid-swim-key" "namespace" $ns)) }}
 {{- end }}
 {{- end }}
 {{- if kindIs "map" $v.inferenceProviders }}

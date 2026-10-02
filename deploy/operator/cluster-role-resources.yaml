@@ -9,7 +9,7 @@ rules:
   #
   # Read paths:
   #   - TLS site certificate (tls.crt, tls.key for mTLS client auth)
-  #   - SWIM encryption key (swimKeyRef)
+  #   - SWIM encryption key (swimKeySecretRef)
   #   - Credential Secrets (existence + key validation only)
   #   - Metrics TLS CA and client certificate Secrets
   #
@@ -59,7 +59,7 @@ rules:
   #
   # Write paths:
   #   - Routing overlay ConfigMap (grid-overlay-{network}-{gateway})
-  #   - Consumer Praxis config ConfigMap (consumerConfig.configMapName)
+  #   - Consumer Praxis config ConfigMap (praxisConfig.configMapName)
   #   - SWIM revision reservation (read and resourceVersion update)
   #
   # Overlay/config writes use server-side apply. The revision reservation uses

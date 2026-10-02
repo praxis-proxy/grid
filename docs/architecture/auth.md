@@ -183,7 +183,7 @@ ownership for credential Secret placement and rotation:
   into the final-hop gateway or provider-side component that is authorized to
   make the final backend call.  The Secret can be created by users, platform
   automation, or an external secret manager.
-- **Operator-owned consumer config generation**: `GatewayRef.consumerConfig`
+- **Operator-owned consumer config generation**: `GatewayRef.praxisConfig`
   can render the consumer Praxis `ConfigMap` from routing overlay data,
   including `credential_inject` file references for direct API-provider
   routes.
@@ -328,28 +328,28 @@ workload's identity and access policies.
 
 SWIM gossip carries membership packets, gateway address broadcasts, public
 certificate PEM broadcasts, and CRDT provider state.  When
-`GridNetwork.spec.tls.swimKeyRef` is configured and the referenced Secret
+`GridNetwork.spec.tls.swimKeySecretRef` is configured and the referenced Secret
 resolves to a valid 32-byte key, the AGN Operator applies the key before
 announcing CRD seeds or publishing certificate/provider state for that
 `GridNetwork`.  Authenticated SWIM traffic uses AES-256-GCM.  Incoming packets
 that do not authenticate are silently dropped before reaching the membership
 state machine.
 
-**Secret contract:** `swimKeyRef` points to a Kubernetes Secret in a specified
+**Secret contract:** `swimKeySecretRef` points to a Kubernetes Secret in a specified
 namespace.  The Secret must contain a key named `"key"` (or the value of
-`swimKeyRef.key` if set) with exactly 32 bytes of key material.  The key is
+`swimKeySecretRef.key` if set) with exactly 32 bytes of key material.  The key is
 loaded at `GridNetwork` reconcile time.
 
 ```yaml
 spec:
   tls:
-    swimKeyRef:
+    swimKeySecretRef:
       name: grid-swim-key
       namespace: praxis-system
       key: key          # default when absent
 ```
 
-**Configured-key behavior:** when `swimKeyRef` is configured but the Secret is
+**Configured-key behavior:** when `swimKeySecretRef` is configured but the Secret is
 missing, unreadable, or contains a key of the wrong length, the reconcile fails
 before CRD seed announcement and certificate/provider broadcasts.  The operator
 does not silently degrade that configured reconcile to plaintext.  Because the
@@ -365,7 +365,7 @@ production configuration path.
 
 **Startup hold:** the operator reads the `GridNetwork` key before its first
 SWIM send. Until a key loads, SWIM sends and receives nothing. Only a network
-that declares no `swimKeyRef` releases the hold to plaintext. The hold also
+that declares no `swimKeySecretRef` releases the hold to plaintext. The hold also
 covers the time before any network exists. Set `GRID_SWIM_REQUIRE_KEY=false`
 to skip that part. If the startup list fails, the operator retries it in the
 background. A malformed `GRID_SWIM_ENCRYPT_KEY` stops the operator. The

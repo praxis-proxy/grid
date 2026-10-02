@@ -431,12 +431,12 @@ pub(crate) enum Action {
     /// cluster.  Each operator publishes real `InferenceProvider`-derived state
     /// as a CRDT `GridStateSnapshot` on `GridNetwork` reconcile.  After SWIM
     /// gossip convergence the remote operator's provider-state broadcast arrives and
-    /// `GridNetwork.status.distributedProviderCount` becomes ≥ 1.
+    /// `GridNetwork.status.remoteProviderCount` becomes ≥ 1.
     ///
     /// Proves that:
     /// - Operators use real foca UDP custom broadcasts (not direct injection).
     /// - The `StateBroadcastHandler` receives and merges remote state.
-    /// - `GridNetworkStatus.distributedProviderCount` reflects the merged state.
+    /// - `GridNetworkStatus.remoteProviderCount` reflects the merged state.
     ///
     /// Requires a kind cluster.  Run `env up` + `env load-gateway-images` first.
     /// Safe to rerun: the `GridNetwork` and `InferenceProvider` fixtures are
@@ -636,7 +636,7 @@ pub(crate) enum Action {
     /// - Node C: seeds B only — not A (leaf).
     ///
     /// After SWIM gossip, A learns about C transitively through B.  The test proves:
-    /// 1. A's `distributedProviderCount >= 2` (received CRDT from both B and C).
+    /// 1. A's `remoteProviderCount >= 2` (received CRDT from both B and C).
     /// 2. C's candidate is absent from A's overlay before C's `GridSite` is `Active`.
     /// 3. After `Active`, C's candidate appears in A's overlay.
     /// 4. Wrong-network provider records are absent from A's correct-network overlay.
@@ -1702,7 +1702,7 @@ fn env_verify_api_fallback_native(config: &Path, site: Option<&str>) -> Result<(
     )?;
 
     let healthy_endpoint = "http://mock-openai-provider.default.svc:8080";
-    // Use the consumer-config fixture variant: enables GatewayRef.consumerConfig so
+    // Use the consumer-config fixture variant: enables GatewayRef.praxisConfig so
     // the operator renders a consumer Praxis ConfigMap for shape validation.
     // Pass the API provider mock address so the operator-generated consumer ConfigMap
     // includes a full (plain HTTP) cluster entry for the API fallback route.
@@ -1734,7 +1734,7 @@ fn env_verify_api_fallback_native(config: &Path, site: Option<&str>) -> Result<(
         eprintln!("  [OK] overlay contains api_provider candidate with credential secretRef");
 
         // Wait for and validate the operator-generated consumer ConfigMap.
-        // This ConfigMap is rendered because GatewayRef.consumerConfig.enabled = true.
+        // This ConfigMap is rendered because GatewayRef.praxisConfig.generate = true.
         // The live consumer pod is deployed from this exact rendered config below.
         eprintln!("  waiting for operator-generated consumer ConfigMap {TEST_CONSUMER_CONFIGMAP_NAME}...");
         operator::wait_for_consumer_configmap(
@@ -1783,7 +1783,7 @@ fn env_verify_api_fallback_native(config: &Path, site: Option<&str>) -> Result<(
     verify_token_absent_from_overlay(&overlay_json, &api_token);
 
     // Shape-validate the operator-generated consumer ConfigMap.  The ConfigMap was
-    // rendered because GatewayRef.consumerConfig.enabled = true in the fixture.
+    // rendered because GatewayRef.praxisConfig.generate = true in the fixture.
     // It lives in the provider cluster's namespace (gw_ref.namespace = TEST_GATEWAY_NS).
     operator::verify_operator_consumer_configmap(
         &context,
@@ -2577,7 +2577,7 @@ fn env_verify_swim_crd_seeds(config: &Path, site: Option<&str>) -> Result<(), Bo
 /// Prove that live CRDT state propagates between two SWIM-enabled operators via foca broadcast.
 ///
 /// Proves real `InferenceProvider`-derived CRDT state propagates over SWIM gossip.
-/// After convergence each operator's `distributedProviderCount` reflects remote provider records.
+/// After convergence each operator's `remoteProviderCount` reflects remote provider records.
 #[expect(
     clippy::too_many_lines,
     reason = "sequential SWIM state kind steps: CRD install, two operator spawns, fixture apply, convergence wait, poll, cleanup"
@@ -2612,7 +2612,7 @@ fn env_verify_swim_state(config: &Path, site: Option<&str>) -> Result<(), Box<dy
     // publish_real_provider_state which publishes the real provider record as
     // a crdt::ProviderState (provider_id=SWIM_TEST_PROVIDER, models=[SWIM_TEST_PROVIDER_MODEL])
     // over SWIM gossip.  The remote operator receives and merges it, raising
-    // distributedProviderCount >= 1.
+    // remoteProviderCount >= 1.
     operator::apply_swim_test_network(&context)?;
     operator::apply_swim_test_provider(&context)?;
     eprintln!(
@@ -2620,7 +2620,7 @@ fn env_verify_swim_state(config: &Path, site: Option<&str>) -> Result<(), Box<dy
     );
     eprintln!("  awaiting real provider state propagation via SWIM custom broadcast...");
 
-    // Poll for distributedProviderCount > 0 (proves real InferenceProvider-derived state arrived).
+    // Poll for remoteProviderCount > 0 (proves real InferenceProvider-derived state arrived).
     let distributed_result =
         operator::wait_for_gridnetwork_distributed_state(&context, SWIM_TEST_NETWORK, SWIM_STATUS_POLL_TIMEOUT);
 
@@ -2639,7 +2639,7 @@ fn env_verify_swim_state(config: &Path, site: Option<&str>) -> Result<(), Box<dy
     eprintln!(
         "verify-swim-state: PASS — real InferenceProvider state propagated via SWIM \
          (provider={SWIM_TEST_PROVIDER}, model={SWIM_TEST_PROVIDER_MODEL}, \
-         distributedProviderCount={distributed_count})"
+         remoteProviderCount={distributed_count})"
     );
     Ok(())
 }
@@ -2729,7 +2729,7 @@ fn env_verify_swim_dns_hostnames(config: &Path, site: Option<&str>) -> Result<()
         eprintln!(
             "verify-swim-dns-hostnames: PASS (configured DNS endpoints {advertise1}, {advertise2}; \
              resolved {bind1}, {bind2}; provider={SWIM_TEST_PROVIDER}; model={SWIM_TEST_PROVIDER_MODEL}; \
-             connectedSites={connected}; distributedProviderCount={distributed})"
+             connectedSites={connected}; remoteProviderCount={distributed})"
         );
         Ok(())
     })();
@@ -2760,28 +2760,28 @@ fn hostname_for_swim_addr(addr: &str) -> Result<String, Box<dyn std::error::Erro
 /// Five scenarios tested sequentially:
 ///
 /// **A. Positive — env-keyed peers converge:** operators A and B share the same key;
-/// B's CRDT provider state propagates to A's `GridNetwork.status.distributedProviderCount`.
+/// B's CRDT provider state propagates to A's `GridNetwork.status.remoteProviderCount`.
 ///
 /// **B. Positive — SecretRef-keyed peers converge:** operators A and B start
 /// without `GRID_SWIM_ENCRYPT_KEY`.  The `GridNetwork` references a Kubernetes
-/// Secret via `spec.tls.swimKeyRef`; after reconcile, A uses a CRD-declared seed
+/// Secret via `spec.tls.swimKeySecretRef`; after reconcile, A uses a CRD-declared seed
 /// to join B with the Secret-backed key.
 ///
 /// **C. Negative — wrong-key peer rejected:** A is keyed; C has a different key
 /// and seeds A's address.  A drops all of C's packets, so C is never admitted
 /// to A's SWIM membership.  During the observation window, A's `connectedSites == 0`
-/// and `distributedProviderCount == 0`.
+/// and `remoteProviderCount == 0`.
 ///
 /// **D. Negative — plaintext peer rejected:** A is keyed; D has no key.  A drops
 /// D's unencrypted packets for the same reason.  During the observation window,
-/// A's `connectedSites == 0` and `distributedProviderCount == 0`.
+/// A's `connectedSites == 0` and `remoteProviderCount == 0`.
 ///
 /// **E. Negative — missing Secret prevents plaintext sends:** A and B start
-/// without `GRID_SWIM_ENCRYPT_KEY`.  The `GridNetwork` configures `swimKeyRef`
+/// without `GRID_SWIM_ENCRYPT_KEY`.  The `GridNetwork` configures `swimKeySecretRef`
 /// pointing to a Secret that does not exist.  Both operators' reconcile fails
 /// before seed announcement or provider broadcast.  During the observation
-/// window, A's `connectedSites == 0` and `distributedProviderCount == 0`.
-/// This proves fail-closed behavior: a configured `swimKeyRef` with a missing
+/// window, A's `connectedSites == 0` and `remoteProviderCount == 0`.
+/// This proves fail-closed behavior: a configured `swimKeySecretRef` with a missing
 /// Secret does not silently degrade to plaintext.
 ///
 /// All five scenarios are **hard failures** — they fail the test, not emit warnings.
@@ -2857,7 +2857,7 @@ fn env_verify_swim_encryption(config: &Path, site: Option<&str>) -> Result<(), B
     eprintln!("  [PASS] keyed peers A + B converged: connectedSites={connected}");
 
     // ── Scenario B: Secret-backed CRD key peers converge (positive) ───────────
-    eprintln!("verify-swim-encryption: [2/5] positive — swimKeyRef Secret peers A + B converge...");
+    eprintln!("verify-swim-encryption: [2/5] positive — swimKeySecretRef Secret peers A + B converge...");
     operator::cleanup_swim_encrypt_test_resources(&context)?;
 
     let (bind_secret_a, bind_secret_b) = reserve_swim_bind_addrs()?;
@@ -2902,7 +2902,7 @@ fn env_verify_swim_encryption(config: &Path, site: Option<&str>) -> Result<(), B
     operator::cleanup_swim_encrypt_test_resources(&context)?;
 
     let secret_connected = secret_convergence_result?;
-    eprintln!("  [PASS] swimKeyRef Secret peers A + B converged: connectedSites={secret_connected}");
+    eprintln!("  [PASS] swimKeySecretRef Secret peers A + B converged: connectedSites={secret_connected}");
 
     // ── Scenario C: Wrong-key peer cannot join (negative) ─────────────────────
     eprintln!("verify-swim-encryption: [3/5] negative — wrong-key peer C is rejected by A...");
@@ -3025,14 +3025,14 @@ fn env_verify_swim_encryption(config: &Path, site: Option<&str>) -> Result<(), B
     )?;
     let mut op_e_b_guard = ProcGuard(Some(op_e_b), "encrypt-op-e-b");
 
-    // Apply fixtures with swimKeyRef enabled but do NOT create the Secret.
+    // Apply fixtures with swimKeySecretRef enabled but do NOT create the Secret.
     // Both operators' reconcile should fail at apply_configured_swim_key before
     // announcing CRD seeds or publishing provider broadcasts.
     operator::apply_swim_encrypt_test_fixtures_with_options(
         &context,
         SWIM_ENCRYPT_NODE_A,
         std::slice::from_ref(&bind_e_b),
-        true, // swimKeyRef → points at non-existent Secret
+        true, // swimKeySecretRef → points at non-existent Secret
     )?;
 
     let missing_secret_error_result = operator::wait_for_operator_log_contains(
@@ -3063,7 +3063,7 @@ fn env_verify_swim_encryption(config: &Path, site: Option<&str>) -> Result<(), B
     missing_secret_result?;
 
     eprintln!(
-        "verify-swim-encryption: PASS — env-keyed peers converge; swimKeyRef Secret peers converge; \
+        "verify-swim-encryption: PASS — env-keyed peers converge; swimKeySecretRef Secret peers converge; \
          wrong-key peer rejected; plaintext peer rejected; missing Secret prevents plaintext sends"
     );
     Ok(())
@@ -3117,7 +3117,7 @@ fn env_verify_swim_overlay(config: &Path, site: Option<&str>) -> Result<(), Box<
          waiting for distributed state propagation..."
     );
 
-    // Step 6: poll for distributedProviderCount > 0 (proves remote CRDT state arrived).
+    // Step 6: poll for remoteProviderCount > 0 (proves remote CRDT state arrived).
     let distributed_result =
         operator::wait_for_gridnetwork_distributed_state(&context, SWIM_OVERLAY_NETWORK, SWIM_STATUS_POLL_TIMEOUT);
 
@@ -3296,16 +3296,16 @@ fn env_verify_swim_routing(config: &Path) -> Result<(), Box<dyn std::error::Erro
     //
     // The first reconcile wave (triggered by fixture application) races the west
     // operator's CRDT broadcast by tens of milliseconds: east often reconciles
-    // before west's broadcast arrives, recording distributedProviderCount=0.
+    // before west's broadcast arrives, recording remoteProviderCount=0.
     // After the settle period both operators have exchanged CRDT state via SWIM
     // gossip.  Patching a timestamp annotation on the east GridNetwork forces a
     // fresh reconcile that reads the updated state_snapshot() and records the
-    // correct distributedProviderCount.
+    // correct remoteProviderCount.
     eprintln!("verify-swim-routing: [5/6] settling CRDT then bumping east GridNetwork...");
     operator::wait_for_swim_convergence(Duration::from_secs(5)); // settle for CRDT exchange
     operator::bump_gridnetwork(&east_ctx, SWIM_ROUTING_NETWORK)?;
 
-    // Poll for distributedProviderCount > 0 on the east cluster: proves that
+    // Poll for remoteProviderCount > 0 on the east cluster: proves that
     // the west operator's model-west CRDT broadcast arrived at the east operator.
     let distributed_result =
         operator::wait_for_gridnetwork_distributed_state(&east_ctx, SWIM_ROUTING_NETWORK, SWIM_STATUS_POLL_TIMEOUT);
@@ -3393,7 +3393,7 @@ fn reserve_three_swim_bind_addrs() -> Result<(String, String, String), Box<dyn s
 /// A seeds nobody; B seeds A; C seeds B only.  A learns about C transitively.
 ///
 /// What this proves:
-/// 1. `distributedProviderCount >= 2` on A: CRDT state from both B and C arrived.
+/// 1. `remoteProviderCount >= 2` on A: CRDT state from both B and C arrived.
 /// 2. C's overlay candidate is absent before C's `GridSite` is `Active`.
 /// 3. After `Active`, C's candidate appears in A's overlay.
 /// 4. A wrong-network `GridNetwork` and `InferenceProvider` are applied and their model is confirmed absent from A's
@@ -3453,7 +3453,7 @@ fn env_verify_swim_mesh_three_node(config: &Path, site: Option<&str>) -> Result<
     operator::apply_swim_mesh_wrong_network_fixtures(&context)?;
 
     // ── Step 6: Prove transitive state propagation — A has CRDT from both B and C ─
-    // `distributedProviderCount >= 2` means A received provider records from at
+    // `remoteProviderCount >= 2` means A received provider records from at
     // least two remote sites.  Since C only seeded B, A must have learned C's
     // record through B.
     eprintln!("verify-swim-mesh-three-node: [6] waiting for A to receive CRDT from B AND C...");
@@ -3462,7 +3462,7 @@ fn env_verify_swim_mesh_three_node(config: &Path, site: Option<&str>) -> Result<
 
     let cm_result = count_result.and_then(|count| {
         eprintln!(
-            "  [PASS] transitive CRDT propagation: A distributedProviderCount={count} \
+            "  [PASS] transitive CRDT propagation: A remoteProviderCount={count} \
              (>= 2 — received from B and C through the mesh)"
         );
         // ── Step 7: Wait for A's overlay ConfigMap ───────────────────────────
@@ -3541,7 +3541,7 @@ fn env_verify_swim_mesh_three_node(config: &Path, site: Option<&str>) -> Result<
     eprintln!(
         "verify-swim-mesh-three-node: PASS — \
          A→B→C transitive discovery proven; \
-         C's CRDT state reached A through B (distributedProviderCount >= 2); \
+         C's CRDT state reached A through B (remoteProviderCount >= 2); \
          C absent before Active; C present after Active; \
          wrong-network model absent from A's overlay"
     );
@@ -4951,7 +4951,7 @@ fn env_verify_failover_under_lost_peer(config: &Path) -> Result<(), Box<dyn std:
 
     let dist = operator::wait_for_gridnetwork_distributed_state(&east_ctx, FAILOVER_NETWORK, SWIM_STATUS_POLL_TIMEOUT)?;
     eprintln!(
-        "  [OK] east GridNetwork {FAILOVER_NETWORK:?}: distributedProviderCount={dist} \
+        "  [OK] east GridNetwork {FAILOVER_NETWORK:?}: remoteProviderCount={dist} \
          (west CRDT provider arrived)"
     );
 
@@ -5315,7 +5315,7 @@ fn env_verify_stale_gc_ttl(config: &Path) -> Result<(), Box<dyn std::error::Erro
     operator::bump_gridnetwork(&east_ctx, STALE_GC_NETWORK)?;
 
     let dist = operator::wait_for_gridnetwork_distributed_state(&east_ctx, STALE_GC_NETWORK, SWIM_STATUS_POLL_TIMEOUT)?;
-    eprintln!("  [OK] CRDT distributed state: distributedProviderCount={dist}");
+    eprintln!("  [OK] CRDT distributed state: remoteProviderCount={dist}");
 
     // ── Step 5: Verify initial overlay (both candidates fresh=true) ───────────
     eprintln!("verify-stale-gc-ttl: [5/7] verifying initial overlay (west fresh=true before kill)...");
@@ -5628,7 +5628,7 @@ fn env_validate_all(config: &Path, site: Option<&str>) -> Result<(), Box<dyn std
     // Step 4: verify-swim-state
     eprintln!("validate-all: [4/5] verify-swim-state...");
     match env_verify_swim_state(config, site) {
-        Ok(()) => results.push(StepResult::pass("verify-swim-state", "distributedProviderCount=1")),
+        Ok(()) => results.push(StepResult::pass("verify-swim-state", "remoteProviderCount=1")),
         Err(e) => results.push(StepResult::fail("verify-swim-state", e.as_ref())),
     }
 
@@ -5666,7 +5666,7 @@ const REQUIRED_CRD_FIELDS: &[(&str, &str)] = &[
     ),
     (
         "gridnetworks",
-        "/spec/versions/0/schema/openAPIV3Schema/properties/status/properties/distributedProviderCount",
+        "/spec/versions/0/schema/openAPIV3Schema/properties/status/properties/remoteProviderCount",
     ),
     // InferenceProvider spec fields
     (
@@ -5917,7 +5917,7 @@ fn env_verify_operator_install_rbac(config: &Path, site: Option<&str>) -> Result
                     "namespace": "default"
                 }
             },
-            "gatewayRefs": [{
+            "consumerGateways": [{
                 "name": gw_name,
                 "namespace": "default"
             }]
@@ -7251,11 +7251,11 @@ fn env_verify_gridsite_trust_fingerprint(config: &Path, site: Option<&str>) -> R
     operator::apply_swim_trust_test_fixtures(&context, SWIM_TRUST_SITE_A)?;
     eprintln!("  fixtures applied; waiting for B's CRDT state via SWIM...");
 
-    // ── Step 4: Wait for distributedProviderCount > 0 ─────────────────────────
+    // ── Step 4: Wait for remoteProviderCount > 0 ─────────────────────────
     let b_site_k8s_name = operator::auto_discovered_gridsite_name(SWIM_TRUST_NETWORK, SWIM_TRUST_SITE_B);
     let result: Result<(), Box<dyn std::error::Error>> = (|| {
         operator::wait_for_distributed_state_count(&context, SWIM_TRUST_NETWORK, 1, SWIM_STATUS_POLL_TIMEOUT)?;
-        eprintln!("  [OK] CRDT from B received by A (distributedProviderCount >= 1)");
+        eprintln!("  [OK] CRDT from B received by A (remoteProviderCount >= 1)");
 
         // ── Step 5: Bind TCP listener and apply plaintext egress ──────────────
         let listener =

@@ -186,7 +186,7 @@ granted for `secrets` and `configmaps`.  `delete` and
 | Resource | Verbs | Why |
 |---|---|---|
 | `gridnetworks` | `get`, `list`, `watch`, `patch` | Controller watch loop; SSA spec/status writes |
-| `gridnetworks/status` | `get`, `patch` | Phase, connectedSites, distributedProviderCount |
+| `gridnetworks/status` | `get`, `patch` | Phase, connectedSites, remoteProviderCount |
 | `gridsites` | `get`, `list`, `watch`, `patch` | Controller watch; auto-creation from SWIM Alive members |
 | `gridsites/status` | `get`, `patch` | Phase, reason, publicCertPem, observedGeneration |
 | `inferenceproviders` | `get`, `list`, `watch`, `patch` | Controller watch; site-selector matching |
@@ -222,7 +222,7 @@ across namespaces or list `Secrets`.
 |---|---|---|
 | `spec.tls.siteSecretRef` | `tls.crt`, `tls.key` (client cert + private key for mTLS gateway probes; key bytes wrapped in `Zeroizing`) | `tls.crt`, `tls.key` (create-if-absent via SSA patch) |
 | `spec.tls.caSecretRef` | `ca.crt` (existence check) | `ca.crt`, `ca.key` (create-if-absent via SSA patch) |
-| `spec.tls.swimKeyRef` | `key` (or custom key field) | — |
+| `spec.tls.swimKeySecretRef` | `key` (or custom key field) | — |
 | `spec.auth.secretRef` | existence + UTF-8 validation | — |
 
 Secret writes use SSA `patch` with field manager
@@ -238,7 +238,7 @@ overlays, status fields, or logs.
 | `ConfigMap` | Naming | Data key | Namespace |
 |---|---|---|---|
 | Routing overlay | `grid-overlay-{network}-{gateway}` | `routing-overlay.json`, `routing-config.json` | `GatewayRef.namespace` |
-| Consumer config | `consumerConfig.configMapName` | `praxis.yaml` | `GatewayRef.namespace` |
+| Consumer config | `praxisConfig.configMapName` | `praxis.yaml` | `GatewayRef.namespace` |
 
 ### What is not granted
 
@@ -276,7 +276,7 @@ roleRef:
 
 Add one `RoleBinding` per namespace referenced by
 `GatewayRef.namespace`, `tls.caSecretRef.namespace`,
-`tls.siteSecretRef.namespace`, `tls.swimKeyRef.namespace`,
+`tls.siteSecretRef.namespace`, `tls.swimKeySecretRef.namespace`,
 and `auth.secretRef.namespace` in your CRD specs.
 
 ### Deployment configuration
@@ -325,7 +325,7 @@ address, and they share its cap.
 
 `GRID_SWIM_ENCRYPT_KEY` is intentionally omitted from the
 `Deployment`.  Production SWIM encryption uses
-`GridNetwork.spec.tls.swimKeyRef` to reference a
+`GridNetwork.spec.tls.swimKeySecretRef` to reference a
 Kubernetes `Secret`.  The env var exists for local
 development and testing only.
 
@@ -353,7 +353,7 @@ metadata:
 spec:
   seeds:
     - "10.0.0.5:7946"
-  gatewayRefs:
+  consumerGateways:
     - name: inference-gw
       namespace: praxis-system
   tls:
@@ -423,17 +423,17 @@ unqualified rolling update.
 **Transport-security contract**
 
 SWIM is the AGN control-plane membership and state broadcast channel. When
-`spec.tls.swimKeyRef` is configured and the referenced Secret resolves to a
+`spec.tls.swimKeySecretRef` is configured and the referenced Secret resolves to a
 valid 32-byte key, reconcile applies the key before announcing CRD seeds or
 publishing certificate/provider state.  From that point, outgoing SWIM UDP
 packets are encrypted and authenticated with AES-256-GCM.  Incoming packets
 that fail authentication are silently dropped; the foca membership state
 machine never sees them.
 
-When `swimKeyRef` is absent, SWIM traffic is sent and received as cleartext
+When `swimKeySecretRef` is absent, SWIM traffic is sent and received as cleartext
 (backward-compatible local and development behavior).
 
-If `swimKeyRef` is configured but the Secret is missing, unreadable, or not a
+If `swimKeySecretRef` is configured but the Secret is missing, unreadable, or not a
 valid 32-byte key, the reconcile fails before CRD seed announcement and
 certificate/provider broadcasts for that `GridNetwork`.  The SWIM runtime is
 process-global, so a previously loaded key remains active until restart; the
@@ -442,7 +442,7 @@ operator does not switch to plaintext for that configured reconcile.
 `GRID_SWIM_ENCRYPT_KEY` is the local and Kind validation path for startup-time
 enforcement because it is available before the UDP socket starts.  It is
 process environment material and should not be treated as the production Secret
-delivery mechanism.  With CRD-backed `swimKeyRef`, the key is applied at
+delivery mechanism.  With CRD-backed `swimKeySecretRef`, the key is applied at
 `GridNetwork` reconcile time; use the environment key as well when startup-time
 plaintext acceptance must be avoided before CRD preload support exists.
 
@@ -500,7 +500,7 @@ the SWIM runtime reports at least one `Alive` peer in
 its `MembershipSnapshot`.  `Degraded` is set when peers
 are known but all are `Suspect` or `Dead`.
 `connectedSites` reflects the live SWIM `Alive` peer
-count; `distributedProviderCount` reflects remote
+count; `remoteProviderCount` reflects remote
 `InferenceProvider` records received via SWIM CRDT
 broadcast.
 
@@ -998,7 +998,7 @@ includes `gridsites/status` with verbs `get` and `patch`.
 
 ## Consumer Config
 
-When `GatewayRef.consumerConfig.enabled: true`, the AGN Operator applies a
+When `GatewayRef.praxisConfig.generate: true`, the AGN Operator applies a
 `ConfigMap` in the gateway's namespace on every reconcile.  The
 `grid-operator-resources` `ClusterRole` includes `configmaps` with verbs
 `create` and `patch`.  A `RoleBinding` in the gateway's namespace is required
@@ -1107,7 +1107,7 @@ desired revision
   -> Praxis accepted/serving revision
 ```
 
-`GridNetwork.status.consumerConfigStatus=Rendered` reports successful desired
+`GridNetwork.status.praxisConfigStatus=Rendered` reports successful desired
 config rendering and apply. It does not report that the gateway loaded the
 overlay. The production contract requires gateway status for the accepted
 revision, digest, acceptance time, age, and last rejection reason. That
@@ -1275,7 +1275,7 @@ maps the `InferenceProvider` CRD to a
 `StateBroadcast` over foca's custom-broadcast path. The
 receiver merges the `GridStateSnapshot`, and subsequent
 status reconciliation reflects remote provider state in
-`GridNetwork.status.distributedProviderCount`.
+`GridNetwork.status.remoteProviderCount`.
 
 **Provider fields propagated over SWIM:**
 
@@ -1292,7 +1292,7 @@ status reconciliation reflects remote provider state in
 | `revision` | `metadata.resourceVersion`, falling back to `metadata.generation` |
 | `writer_id` | local SWIM site identity |
 
-`distributedProviderCount` in `GridNetworkStatus`
+`remoteProviderCount` in `GridNetworkStatus`
 reflects received remote provider records for the
 current `GridNetwork`; local records and records from
 other `GridNetwork`s are excluded. The local validation
@@ -1310,7 +1310,7 @@ This command starts three SWIM-enabled operator processes in a linear topology:
 node A (no seeds), node B (seeds A), and node C (seeds B only — not A).  It proves:
 
 1. **Transitive discovery** — A learns about C through B.  After gossip convergence,
-   `GridNetwork.status.distributedProviderCount >= 2` on A, confirming CRDT state from
+   `GridNetwork.status.remoteProviderCount >= 2` on A, confirming CRDT state from
    both B and C reached A transitively.
 
 2. **Routing eligibility before Active** — C's CRDT provider is present in A's

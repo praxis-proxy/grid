@@ -13,7 +13,7 @@
 //! hostnames are accepted; DNS is resolved once, with a bounded timeout, before
 //! the runtime starts. When `GRID_SWIM_BIND_ADDR` is absent
 //! the operator runs in static mode (`membership = None`);
-//! `GridNetwork.status.connectedSites` and `distributedProviderCount` remain
+//! `GridNetwork.status.connectedSites` and `remoteProviderCount` remain
 //! 0, and the phase stays `Pending`/`Initializing` based on TLS configuration
 //! only.
 //! `GRID_SWIM_SERVICE_NAME` advertises that Service's `LoadBalancer` address instead.
@@ -28,7 +28,7 @@
 //! This is the environment-variable path, intended for local development and
 //! Kind-based testing.  Environment variables are visible to same-host process
 //! inspectors, so the production configuration path uses
-//! `GridNetwork.spec.tls.swimKeyRef` to source the key from a Kubernetes
+//! `GridNetwork.spec.tls.swimKeySecretRef` to source the key from a Kubernetes
 //! Secret; the `GridNetwork` controller loads it and calls
 //! `SwimHandle::set_swim_key` at reconcile time.
 //! SWIM holds all traffic until a key loads or no `GridNetwork` declares one.
@@ -457,7 +457,7 @@ enum DeclaredKey {
     NoNetwork,
     /// A `GridNetwork` exists and names no key.
     None,
-    /// The first `swimKeyRef` found.
+    /// The first `swimKeySecretRef` found.
     Ref(operator::crd::grid_network::SecretRef),
 }
 
@@ -481,8 +481,8 @@ async fn key_state_for(client: &Client, declared: &DeclaredKey, require_key: boo
     };
     match operator::resources::secret::read_swim_key(client, key_ref).await {
         Ok(Some(key)) => return KeyState::Key(Arc::new(key)),
-        Ok(None) => tracing::warn!(secret = %key_ref.name, "swimKeyRef holds no valid key yet; holding SWIM"),
-        Err(error) => tracing::warn!(secret = %key_ref.name, %error, "swimKeyRef not readable yet; holding SWIM"),
+        Ok(None) => tracing::warn!(secret = %key_ref.name, "swimKeySecretRef holds no valid key yet; holding SWIM"),
+        Err(error) => tracing::warn!(secret = %key_ref.name, %error, "swimKeySecretRef not readable yet; holding SWIM"),
     }
     KeyState::Pending
 }
@@ -545,7 +545,7 @@ fn declared_of(networks: &[GridNetwork]) -> DeclaredKey {
     }
     networks
         .iter()
-        .find_map(|n| n.spec.tls.swim_key_ref.clone())
+        .find_map(|n| n.spec.tls.swim_key_secret_ref.clone())
         .map_or(DeclaredKey::None, DeclaredKey::Ref)
 }
 
@@ -2878,7 +2878,7 @@ mod tests {
         let network = |key: Option<&str>| {
             let tls = key.map_or_else(
                 || serde_json::json!({}),
-                |name| serde_json::json!({"swimKeyRef": {"name": name, "namespace": "grid"}}),
+                |name| serde_json::json!({"swimKeySecretRef": {"name": name, "namespace": "grid"}}),
             );
             let spec = serde_json::from_value(serde_json::json!({"seeds": [], "tls": tls}));
             GridNetwork::new("net", spec.unwrap_or_else(|_| std::process::abort()))
