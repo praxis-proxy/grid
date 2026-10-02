@@ -316,8 +316,11 @@ unrelated address.
 | `GRID_GATEWAY_DISCOVERY_ENABLED` | Whether to discover and advertise a gateway address. Defaults to `true`; set `false` for a consumer-only site |
 | `GRID_GATEWAY_SERVICE_NAME` | Service name for gateway self-discovery (default: `provider-gateway`) |
 | `GRID_GATEWAY_NAMESPACE` | Namespace for gateway Service lookup (default: `grid-system`) |
-| `GRID_GATEWAY_PORT` | Port appended to discovered address (default: `8080`) |
+| `GRID_GATEWAY_PORT` | Optional port override appended to the discovered address; when unset, the operator uses the gateway Service's declared port, or the first `spec.ports` entry when several exist |
 | `GRID_GATEWAY_DISCOVERY_INTERVAL_MS` | Polling interval for gateway discovery (default: `5000`) |
+
+Gateway port discovery reads only the gateway Service's `spec.ports`; Pod health
+probes and metrics endpoints are not used for this selection.
 
 The signals listener caps handshakes per client source address. Behind a
 LoadBalancer, set `externalTrafficPolicy: Local` on the Service that carries

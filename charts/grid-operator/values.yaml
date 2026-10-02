@@ -204,8 +204,9 @@ gateway:
   namespace: ""
   # -- Allow gateway.namespace to be default, kube-*, or openshift-*.
   allowSystemNamespace: false
-  # -- Site gateway Service port advertised to remote sites. Empty uses
-  # 8080. Maps to GRID_GATEWAY_PORT.
+  # -- Site gateway Service port advertised to remote sites. Empty uses the
+  # Service's declared port; if several are present, the first spec.ports entry
+  # is used. Maps to GRID_GATEWAY_PORT.
   port: ""
 
 # -- Probe timing configuration.
