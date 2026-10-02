@@ -1,3 +1,30 @@
+# -- This site. name defaults swim.siteName, and through it enrollment.siteName.
+site:
+  # -- Site name, a DNS label.
+  name: ""
+  # -- Deployment region.
+  region: ""
+  # -- Availability zone.
+  zone: ""
+
+# -- The grid this site joins. Setting id renders the GridNetwork and this site's
+# GridSite, with site discovery on. They need the grid CRDs first, so plain Helm sets id
+# on an upgrade after the first install; Argo CD orders them by sync wave.
+grid:
+  # -- GridNetwork name.
+  network: grid
+  # -- Grid identifier. Empty renders no GridNetwork or GridSite.
+  id: ""
+  # -- Peer trust, pin or spiffe. Empty keeps the GridNetwork default, pin.
+  peerTrust: ""
+  # -- Signal transport, gossip or poll. poll also serves signals on the SWIM Service.
+  # Empty keeps the GridNetwork default, gossip.
+  signals: ""
+  # -- SWIM seed endpoints (ip:port, [ipv6]:port, or hostname:port). Defaults swim.seeds.
+  seeds: []
+  # -- Secret holding the grid's SWIM key (key, 32 bytes). Empty runs SWIM without one.
+  swimKeySecretName: grid-swim-key
+
 # -- Grid CRDs.
 crds:
   # -- Install and upgrade the CRDs. Set false when the platform owns them, or for a second release in the cluster.

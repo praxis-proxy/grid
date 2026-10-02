@@ -1,0 +1,97 @@
+suite: grid values
+templates:
+  - templates/gridnetwork.yaml
+  - templates/gridsite.yaml
+  - templates/deployment.yaml
+  - templates/service-swim.yaml
+tests:
+  - it: renders no grid resources without grid.id
+    templates:
+      - templates/gridnetwork.yaml
+      - templates/gridsite.yaml
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: renders the GridNetwork from the flat grid values, after the CRDs
+    template: templates/gridnetwork.yaml
+    set:
+      site.name: east
+      grid.id: lab
+      grid.peerTrust: spiffe
+      grid.signals: poll
+      grid.seeds: ["192.0.2.10:7946"]
+    release:
+      namespace: grid
+    asserts:
+      - equal:
+          path: metadata.labels["grid.praxis.fast/auto-discover-sites"]
+          value: "true"
+      - equal:
+          path: metadata.annotations["argocd.argoproj.io/sync-options"]
+          value: SkipDryRunOnMissingResource=true
+      - equal:
+          path: spec
+          value:
+            gridId: lab
+            seeds: ["192.0.2.10:7946"]
+            signalTransport: {mode: poll}
+            peerTrust: {mode: spiffe}
+            tls:
+              siteSecretRef: {name: grid-site-identity, namespace: grid}
+              caSecretRef: {name: grid-ca, namespace: grid}
+              swimKeyRef: {name: grid-swim-key, namespace: grid}
+
+  - it: renders this site's GridSite named after it
+    template: templates/gridsite.yaml
+    set:
+      site: {name: east, region: us-east, zone: us-east-1a}
+      grid.id: lab
+    asserts:
+      - equal:
+          path: metadata.name
+          value: east
+      - equal:
+          path: spec
+          value: {gridNetworkRef: grid, region: us-east, zone: us-east-1a}
+
+  - it: maps the flat values onto the SWIM and signals knobs
+    template: templates/deployment.yaml
+    set:
+      site.name: east
+      grid.id: lab
+      grid.signals: poll
+      grid.seeds: ["192.0.2.10:7946", "192.0.2.11:7946"]
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content: {name: GRID_SWIM_SITE_NAME, value: east}
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content: {name: GRID_SWIM_SEEDS, value: "192.0.2.10:7946,192.0.2.11:7946"}
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content: {name: GRID_SIGNALS_LOCAL_ADDR, value: "RELEASE-NAME-grid-operator-swim.NAMESPACE.svc:9091"}
+
+  - it: keeps the old keys when both are set
+    template: templates/deployment.yaml
+    set:
+      site.name: east
+      swim.siteName: legacy
+      swim.seeds: "198.51.100.1:7946"
+      grid.seeds: ["192.0.2.10:7946"]
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content: {name: GRID_SWIM_SITE_NAME, value: legacy}
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content: {name: GRID_SWIM_SEEDS, value: "198.51.100.1:7946"}
+
+  - it: refuses a grid without a site name
+    template: templates/gridnetwork.yaml
+    set:
+      grid.id: lab
+    asserts:
+      - failedTemplate:
+          errorPattern: grid.id needs site.name

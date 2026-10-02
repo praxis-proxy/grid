@@ -200,6 +200,23 @@ RELEASE=grid-operator; NAMESPACE=grid-system; for crd in agenttoolproviders grid
 | `enrollment.identitySecretName` | string | `grid-site-identity` | Secret the site identity is written to when no `GridNetwork` names one. Installing the operator alone enrolls the site; no `GridNetwork` is needed. |
 | `enrollment.caSecretName` | string | `grid-ca` | Secret the grid CA is written to when no `GridNetwork` names one. |
 
+## Join a grid
+
+`site` and `grid` describe the site and the grid it joins in a few values:
+
+```yaml
+site: {name: east, region: us-east, zone: us-east-1a}
+grid: {id: lab, peerTrust: spiffe, signals: poll, seeds: ["198.51.100.10:7946"]}
+enrollment: {enabled: true, url: https://enroll.example.com}
+```
+
+`grid.id` renders the GridNetwork, with site discovery on and its TLS Secrets pointed at
+the site identity, the grid CA, and `grid.swimKeySecretName`, plus this site's GridSite.
+`site.name` and `grid.seeds` default `swim.siteName` and `swim.seeds`, which win when set,
+and `grid.signals: poll` serves signals on the SWIM Service. The CRs need the grid CRDs
+first. Argo CD applies them a sync wave after the CRDs. Plain Helm cannot map them on the
+first install, so set `grid.id` on an upgrade after it, or install the grid-site chart.
+
 ## Auto-enroll
 
 With `enrollment.enabled`, the operator enrolls on startup when the site identity Secret is absent, and reports ready after it enrolls. No `GridNetwork` is needed: the token pins the grid. The operator writes to the Secrets a `GridNetwork`'s `spec.tls.siteSecretRef` and `caSecretRef` name when one exists, and otherwise to `enrollment.identitySecretName` and `enrollment.caSecretName`. Both must be in the release namespace. With `rbac.create=false`, grant the operator get, create, and patch on Secrets. [Site Enrollment](../../docs/installation/enrollment.md#enroll-a-site) covers the hub and site steps.
