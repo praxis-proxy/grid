@@ -535,7 +535,7 @@ take the reason and message of the first contributing condition:
 | Type | Reasons | Meaning |
 |---|---|---|
 | `GridSitesAvailable` | `Connected`, `Isolated`, `Joining`, `NoGridNetwork` | `True` when joined and seeing a peer, or when the grid has no other site. `False` only when SWIM shows no known peer. `Unknown` with no `GridNetwork`, naming the enrolled identity once enrolled |
-| `GridSitesProgressing` | `WaitingForGridNetwork`, `Enrolling`, `JoiningGrid`, `NoGridNetwork`, `AsExpected` | `True` while enrollment waits or runs, with the last retry error in the message, or joins over SWIM. `Unknown` when no `GridNetwork` exists |
+| `GridSitesProgressing` | `RestartingForModes`, `WaitingForGridNetwork`, `Enrolling`, `JoiningGrid`, `NoGridNetwork`, `AsExpected` | `True` before a restart into new grid modes, while enrollment waits or runs, with the last retry error in the message, or joins over SWIM. `Unknown` when no `GridNetwork` exists |
 | `GridSitesDegraded` | `GossipJoinLost`, `AsExpected` | This site's SWIM runtime stopped |
 | `ProvidersAvailable` | `Ready`, `NoneReady` | `False` only when local providers exist and none is ready |
 | `ProvidersDegraded` | `ProbeOrScrapeFailing`, `AsExpected` | A local provider is `Degraded` or `Unavailable`, or its metrics scrape fails |

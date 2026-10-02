@@ -112,6 +112,8 @@ pub(crate) struct HealthBoard {
     enrollment: Option<Enrollment>,
     /// The SPIFFE ID this site enrolled as.
     enrolled: Option<String>,
+    /// Why the process is about to restart into new grid modes.
+    restarting: Option<String>,
 }
 
 /// Where pre-start enrollment is.
@@ -287,6 +289,14 @@ pub fn enrollment_retry(reason: String) {
     REPUBLISH.notify_one();
 }
 
+/// Report that the process restarts into new grid modes, publishing before it exits.
+pub(crate) async fn restarting_for_modes(client: &Client, message: String) {
+    with_board(|board| board.restarting = Some(message));
+    if let Err(error) = publish(client).await {
+        tracing::warn!(%error, "GridOperator status publish failed");
+    }
+}
+
 /// Record the outcome of scraping a provider's metrics.
 pub(crate) fn record_scrape(provider: &str, ok: bool) {
     with_board(|board| board.mark(format!("provider {provider} scrape"), !ok, Instant::now()));
@@ -404,6 +414,9 @@ fn grid_sites_progressing(board: &HealthBoard) -> Observed {
     let yes = |reason: &str, message: String| {
         Observed::new(GRID_SITES_PROGRESSING, ConditionStatus::True, reason).with_message(message)
     };
+    if let Some(message) = &board.restarting {
+        return yes("RestartingForModes", message.clone());
+    }
     if let Some(stage) = &board.enrollment {
         return enrollment_progressing(stage);
     }
@@ -1068,5 +1081,17 @@ mod tests {
         assert_eq!(get(&enrolled, AVAILABLE).status, ConditionStatus::False);
         assert_eq!(get(&enrolled, DEGRADED).status, ConditionStatus::False);
         assert_conforms(&enrolled);
+    }
+
+    #[test]
+    fn a_mode_restart_is_progress() {
+        let board = HealthBoard {
+            restarting: Some("GridNetwork grid sets signalTransport=Poll peerTrust=Spiffe".to_owned()),
+            ..HealthBoard::default()
+        };
+        let observed = derive(&board, &[], Instant::now());
+        assert_eq!(get(&observed, GRID_SITES_PROGRESSING).reason, "RestartingForModes");
+        assert_eq!(get(&observed, PROGRESSING).status, ConditionStatus::True);
+        assert_conforms(&observed);
     }
 }

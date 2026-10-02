@@ -635,13 +635,12 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
         trust: ctx.peer_settings.trust,
     };
     if let Some(next) = running.restart_for(Some(&network)) {
-        tracing::info!(
+        let message = format!(
             "GridNetwork {name} sets signalTransport={:?} peerTrust={:?}; running {:?}/{:?}; restarting to apply",
-            next.signal,
-            next.trust,
-            running.signal,
-            running.trust
+            next.signal, next.trust, running.signal, running.trust
         );
+        tracing::info!("{message}");
+        super::grid_operator::restarting_for_modes(&ctx.client, message).await;
         #[expect(clippy::exit, reason = "modes apply only at startup; Kubernetes restarts the pod")]
         std::process::exit(0);
     }
