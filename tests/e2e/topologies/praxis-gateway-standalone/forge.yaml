@@ -101,7 +101,7 @@ spec:
             CORE_IMAGE: "{{ cluster.properties.coreImageRepo }}:{{ cluster.properties.coreImageTag }}"
 
     gateway-inline-v1:
-      description: config.inline proxies to backend-a by Service name
+      description: praxisConfig.byo.inline proxies to backend-a by Service name
       steps:
         - type: helm
           release: praxis-gateway
@@ -109,35 +109,36 @@ spec:
           version: "0.1.4"
           namespace: praxis
           values:
-            config:
-              inline: |
-                insecure_options:
-                  allow_private_upstreams: true
-                listeners:
-                  - name: default
-                    address: "0.0.0.0:8080"
-                    filter_chains: [main]
-                filter_chains:
-                  - name: main
-                    filters:
-                      - filter: router
-                        routes:
-                          - path_prefix: "/"
-                            cluster: backend-a
-                      - filter: headers
-                        response_set:
-                          - name: X-Config-Version
-                            value: v1
-                      - filter: load_balancer
-                        clusters:
-                          - name: backend-a
-                            endpoints: ["backend-a.praxis-backends.svc:8080"]
+            praxisConfig:
+              byo:
+                inline: |
+                  insecure_options:
+                    allow_private_upstreams: true
+                  listeners:
+                    - name: default
+                      address: "0.0.0.0:8080"
+                      filter_chains: [main]
+                  filter_chains:
+                    - name: main
+                      filters:
+                        - filter: router
+                          routes:
+                            - path_prefix: "/"
+                              cluster: backend-a
+                        - filter: headers
+                          response_set:
+                            - name: X-Config-Version
+                              value: v1
+                        - filter: load_balancer
+                          clusters:
+                            - name: backend-a
+                              endpoints: ["backend-a.praxis-backends.svc:8080"]
         - type: exec
           command: [bash, verify.sh, inline-v1]
           env: *verify-env
 
     gateway-inline-v2:
-      description: A changed config.inline moves / to backend-b and adds a static route
+      description: A changed praxisConfig.byo.inline moves / to backend-b and adds a static route
       steps:
         - type: helm
           release: praxis-gateway
@@ -145,41 +146,42 @@ spec:
           version: "0.1.4"
           namespace: praxis
           values:
-            config:
-              inline: |
-                insecure_options:
-                  allow_private_upstreams: true
-                listeners:
-                  - name: default
-                    address: "0.0.0.0:8080"
-                    filter_chains: [main]
-                filter_chains:
-                  - name: main
-                    filters:
-                      - filter: static_response
-                        status: 200
-                        body: "static from praxis"
-                        conditions:
-                          - when:
-                              path_prefix: "/static"
-                      - filter: router
-                        routes:
-                          - path_prefix: "/"
-                            cluster: backend-b
-                      - filter: headers
-                        response_set:
-                          - name: X-Config-Version
-                            value: v2
-                      - filter: load_balancer
-                        clusters:
-                          - name: backend-b
-                            endpoints: ["backend-b.praxis-backends.svc:8080"]
+            praxisConfig:
+              byo:
+                inline: |
+                  insecure_options:
+                    allow_private_upstreams: true
+                  listeners:
+                    - name: default
+                      address: "0.0.0.0:8080"
+                      filter_chains: [main]
+                  filter_chains:
+                    - name: main
+                      filters:
+                        - filter: static_response
+                          status: 200
+                          body: "static from praxis"
+                          conditions:
+                            - when:
+                                path_prefix: "/static"
+                        - filter: router
+                          routes:
+                            - path_prefix: "/"
+                              cluster: backend-b
+                        - filter: headers
+                          response_set:
+                            - name: X-Config-Version
+                              value: v2
+                        - filter: load_balancer
+                          clusters:
+                            - name: backend-b
+                              endpoints: ["backend-b.praxis-backends.svc:8080"]
         - type: exec
           command: [bash, verify.sh, inline-v2]
           env: *verify-env
 
     gateway-existing-configmap:
-      description: config.existingConfigMap with a non-default key replaces config.inline
+      description: praxisConfig.byo.configMapName with a non-default key replaces praxisConfig.byo.inline
       steps:
         - type: manifest
           path: resources/existing-config.yaml
@@ -189,9 +191,10 @@ spec:
           version: "0.1.4"
           namespace: praxis
           values:
-            config:
-              existingConfigMap: praxis-config
-              key: gateway.yaml
+            praxisConfig:
+              byo:
+                configMapName: praxis-config
+                key: gateway.yaml
         - type: exec
           command: [bash, verify.sh, existing]
           env: *verify-env
@@ -209,29 +212,30 @@ spec:
               repository: "{{ cluster.properties.coreImageRepo }}"
               tag: "{{ cluster.properties.coreImageTag }}"
             command: [praxis]
-            config:
-              inline: |
-                insecure_options:
-                  allow_private_upstreams: true
-                listeners:
-                  - name: default
-                    address: "0.0.0.0:8080"
-                    filter_chains: [main]
-                filter_chains:
-                  - name: main
-                    filters:
-                      - filter: router
-                        routes:
-                          - path_prefix: "/"
-                            cluster: backend-b
-                      - filter: headers
-                        response_set:
-                          - name: X-Config-Version
-                            value: core
-                      - filter: load_balancer
-                        clusters:
-                          - name: backend-b
-                            endpoints: ["backend-b.praxis-backends.svc:8080"]
+            praxisConfig:
+              byo:
+                inline: |
+                  insecure_options:
+                    allow_private_upstreams: true
+                  listeners:
+                    - name: default
+                      address: "0.0.0.0:8080"
+                      filter_chains: [main]
+                  filter_chains:
+                    - name: main
+                      filters:
+                        - filter: router
+                          routes:
+                            - path_prefix: "/"
+                              cluster: backend-b
+                        - filter: headers
+                          response_set:
+                            - name: X-Config-Version
+                              value: core
+                        - filter: load_balancer
+                          clusters:
+                            - name: backend-b
+                              endpoints: ["backend-b.praxis-backends.svc:8080"]
         - type: exec
           command: [bash, verify.sh, core-image]
           env: *verify-env

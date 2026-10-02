@@ -2,7 +2,7 @@
 The data of the chart-rendered gateway ConfigMap, also hashed into checksum/config.
 */}}
 {{- define "praxis-gateway.gatewayConfigData" }}
-{{- $cfg := .Values.gatewayConfig }}
+{{- $cfg := .Values.praxisConfig.render }}
 {{- $provider := eq ($cfg.role | default "consumer") "provider" }}
 {{- $apiKey := and (not $provider) (eq ($cfg.auth.mode | default "none") "api-key") }}
 {{- $telemetry := $cfg.telemetry | default dict }}
@@ -66,11 +66,11 @@ The data of the chart-rendered gateway ConfigMap, also hashed into checksum/conf
           {{- else }}
           client_cert_mode: require
           {{- end }}
-        {{- else if $cfg.listenerTls.enabled }}
+        {{- else if $.Values.listenerTls.enabled }}
         tls:
           certificates:
-            - cert_path: {{ printf "%s/tls.crt" $cfg.listenerTls.mountPath | quote }}
-              key_path: {{ printf "%s/tls.key" $cfg.listenerTls.mountPath | quote }}
+            - cert_path: {{ printf "%s/tls.crt" $.Values.listenerTls.mountPath | quote }}
+              key_path: {{ printf "%s/tls.key" $.Values.listenerTls.mountPath | quote }}
         {{- end }}
         filter_chains: [main]
     filter_chains:

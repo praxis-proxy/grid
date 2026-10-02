@@ -25,9 +25,9 @@ and `verify.sh` checks the result before the next stage starts.
 | Stage | Chart values | Checks |
 |-------|--------------|--------|
 | `default` | none, after uninstalling any earlier release | `GET /` returns the built-in JSON status, other paths return 404, Praxis runs as UID 100 |
-| `inline-v1` | `config.inline` routing to backend-a | `GET /` reaches backend-a with `X-Config-Version: v1` |
-| `inline-v2` | changed `config.inline` | `GET /` moves to backend-b with `v2`, `/static` is answered by Praxis |
-| `existing` | `config.existingConfigMap` with key `gateway.yaml` | `GET /` reaches backend-a with `existing`, the chart's ConfigMap is gone |
+| `inline-v1` | `praxisConfig.byo.inline` routing to backend-a | `GET /` reaches backend-a with `X-Config-Version: v1` |
+| `inline-v2` | changed `praxisConfig.byo.inline` | `GET /` moves to backend-b with `v2`, `/static` is answered by Praxis |
+| `existing` | `praxisConfig.byo.configMapName` with key `gateway.yaml` | `GET /` reaches backend-a with `existing`, the chart's ConfigMap is gone |
 | `core-image` | core `ghcr.io/praxis-proxy/praxis` image with `command: [praxis]` | the core build serves its config |
 | `release` | none | `helm test` passes, the release holds only a ConfigMap, Deployment, and Service, no Grid CRDs or other workloads exist, and the notes and description do not assume Grid |
 

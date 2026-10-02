@@ -31,7 +31,7 @@ tests:
   - it: mounts the chart-managed config and rolls pods when it changes
     template: templates/deployment.yaml
     set:
-      config.inline: 'listeners: [{name: default, address: "0.0.0.0:8080"}]'
+      praxisConfig.byo.inline: 'listeners: [{name: default, address: "0.0.0.0:8080"}]'
     asserts:
       - equal:
           path: spec.template.spec.volumes[?(@.name == "config")].configMap.name
@@ -80,10 +80,10 @@ tests:
           path: spec.template.spec.serviceAccountName
         template: templates/deployment.yaml
 
-  - it: prefers an existing ConfigMap over config.inline
+  - it: prefers an existing ConfigMap over praxisConfig.byo.inline
     set:
-      config.existingConfigMap: my-praxis
-      config.key: gateway.yaml
+      praxisConfig.byo.configMapName: my-praxis
+      praxisConfig.byo.key: gateway.yaml
     asserts:
       - hasDocuments:
           count: 0
@@ -100,14 +100,14 @@ tests:
           path: spec.template.metadata.annotations["checksum/config"]
         template: templates/deployment.yaml
 
-  - it: leaves config to gatewayConfig when render is on
+  - it: leaves the config to praxisConfig.render when source is render
     template: templates/configmap.yaml
     set:
-      gatewayConfig.render: true
-      gatewayConfig.localSite: hub
-      gatewayConfig.model: m
-      gatewayConfig.auth.mode: none
-      gatewayConfig.backends:
+      praxisConfig.source: render
+      praxisConfig.render.localSite: hub
+      praxisConfig.render.model: m
+      praxisConfig.render.auth.mode: none
+      praxisConfig.render.backends:
         - cluster: a
           endpoints: ["10.0.0.1:8000"]
           transport: { mode: plaintext }
@@ -115,75 +115,72 @@ tests:
       - hasDocuments:
           count: 0
 
-  - it: still renders the Grid config when backends are set without render
-    set:
-      gatewayConfig.localSite: hub
-      gatewayConfig.model: m
-      gatewayConfig.auth.mode: none
-      gatewayConfig.backends.site-a.endpoint: 203.0.113.20:8080
-    asserts:
-      - hasDocuments:
-          count: 0
-        template: templates/configmap.yaml
-      - matchRegex:
-          path: data["praxis.yaml"]
-          pattern: "filter: intelligent_route"
-        template: templates/gateway-config.yaml
-
-  - it: fails a blank config.inline
+  - it: fails backends set while the source is not render
     template: templates/deployment.yaml
     set:
-      config.inline: "  "
+      praxisConfig.source: byo
+      praxisConfig.render.localSite: hub
+      praxisConfig.render.model: m
+      praxisConfig.render.auth.mode: none
+      praxisConfig.render.backends.site-a.endpoint: 203.0.113.20:8080
     asserts:
       - failedTemplate:
-          errorPattern: config.inline is empty
+          errorPattern: praxisConfig.source is byo, which ignores it
 
-  - it: fails a config.inline that is not a YAML mapping
+  - it: fails a blank praxisConfig.byo.inline
     template: templates/deployment.yaml
     set:
-      config.inline: not-a-mapping
+      praxisConfig.byo.inline: "  "
     asserts:
       - failedTemplate:
-          errorPattern: config.inline is not a valid YAML mapping
+          errorPattern: praxisConfig.byo.inline is empty
 
-  - it: fails a config.inline with no listener on port.containerPort
+  - it: fails a praxisConfig.byo.inline that is not a YAML mapping
+    template: templates/deployment.yaml
+    set:
+      praxisConfig.byo.inline: not-a-mapping
+    asserts:
+      - failedTemplate:
+          errorPattern: praxisConfig.byo.inline is not a valid YAML mapping
+
+  - it: fails a praxisConfig.byo.inline with no listener on port.containerPort
     template: templates/deployment.yaml
     set:
       port.containerPort: 9090
     asserts:
       - failedTemplate:
-          errorPattern: config.inline has no listener on port.containerPort 9090
+          errorPattern: praxisConfig.byo.inline has no listener on port.containerPort 9090
 
-  - it: accepts a config.inline listener on a custom port.containerPort
+  - it: accepts a praxisConfig.byo.inline listener on a custom port.containerPort
     template: templates/deployment.yaml
     set:
       port.containerPort: 9090
-      config.inline: 'listeners: [{name: default, address: "[::]:9090"}]'
+      praxisConfig.byo.inline: 'listeners: [{name: default, address: "[::]:9090"}]'
     asserts:
       - notFailedTemplate: {}
 
-  - it: fails grid settings that config.inline would ignore
+  - it: fails grid settings that praxisConfig.byo.inline would ignore
     template: templates/deployment.yaml
     set:
-      gatewayConfig.localSite: hub
-      gatewayConfig.model: qwen3
+      praxisConfig.render.localSite: hub
+      praxisConfig.render.model: qwen3
     asserts:
       - failedTemplate:
-          errorPattern: gatewayConfig.localSite is set but config.inline is serving
+          errorPattern: praxisConfig.render.localSite is set but praxisConfig.source is byo
 
-  - it: fails a model without any grid routing to render it
+  - it: fails a model while the source is not render
     template: templates/deployment.yaml
     set:
-      gatewayConfig.model: qwen3
+      praxisConfig.render.model: qwen3
     asserts:
       - failedTemplate:
-          errorPattern: gatewayConfig.model is set but config.inline is serving
+          errorPattern: praxisConfig.render.model is set but praxisConfig.source is byo
 
   - it: writes install notes that stand on their own without Grid
     template: templates/NOTES.txt
     asserts:
       - matchRegexRaw:
-          pattern: "Config:    config.inline \\(ConfigMap praxis-gateway-config\\)"
+          pattern: "Config:    praxisConfig.byo.inline \\(ConfigMap praxis-gateway-config\\)"
       - matchRegexRaw:
           pattern: port-forward service/praxis-gateway 8080:8080
       - notMatchRegexRaw:
@@ -192,7 +189,7 @@ tests:
   - it: tells existing ConfigMap users how to load an edited config
     template: templates/NOTES.txt
     set:
-      config.existingConfigMap: my-praxis
+      praxisConfig.byo.configMapName: my-praxis
     asserts:
       - matchRegexRaw:
           pattern: rollout restart deployment/praxis-gateway

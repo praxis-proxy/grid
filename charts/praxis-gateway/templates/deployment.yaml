@@ -29,8 +29,9 @@ spec:
       {{- $configSource := include "praxis-gateway.configSource" . }}
       {{- $podAnnotations := deepCopy (.Values.podAnnotations | default dict) }}
       {{- /* A changed chart-rendered config must reach new pods: the hash rolls the Deployment. */}}
-      {{- if eq $configSource "inline" }}
-      {{- $_ := set $podAnnotations "checksum/config" (toString .Values.config.inline | sha256sum) }}
+      {{- if eq $configSource "byoInline" }}
+      {{- /* A changed praxisConfig.byo.inline must reach new pods: the hash rolls the Deployment. */}}
+      {{- $_ := set $podAnnotations "checksum/config" (toString .Values.praxisConfig.byo.inline | sha256sum) }}
       {{- else if eq $configSource "render" }}
       {{- $_ := set $podAnnotations "checksum/config" (include "praxis-gateway.gatewayConfigData" . | sha256sum) }}
       {{- end }}
@@ -191,8 +192,8 @@ spec:
           args:
             {{- toYaml . | nindent 12 }}
           {{- end }}
-          {{- $validateCA := .Values.gatewayConfig.auth.validateCA }}
-          {{- $withCA := and .Values.gatewayConfig.render (eq .Values.gatewayConfig.auth.mode "api-key") (or $validateCA.configMap $validateCA.secret) }}
+          {{- $validateCA := .Values.praxisConfig.render.auth.validateCA }}
+          {{- $withCA := and (eq .Values.praxisConfig.source "render") (eq .Values.praxisConfig.render.auth.mode "api-key") (or $validateCA.configMap $validateCA.secret) }}
           {{- /* A user RUST_LOG in env wins: a duplicate name fails server-side apply. */ -}}
           {{- $userLog := false }}
           {{- range .Values.env }}{{- if eq .name "RUST_LOG" }}{{- $userLog = true }}{{- end }}{{- end }}
@@ -287,13 +288,13 @@ spec:
               mountPath: {{ .Values.gridServing.mountPath | quote }}
               readOnly: true
             {{- end }}
-            {{- if .Values.gatewayConfig.upstreamCA.secretName }}
+            {{- if and (eq .Values.praxisConfig.source "render") .Values.praxisConfig.render.upstreamCA.secretName }}
             - name: upstream-ca
-              mountPath: {{ .Values.gatewayConfig.upstreamCA.mountPath | quote }}
+              mountPath: {{ .Values.praxisConfig.render.upstreamCA.mountPath | quote }}
               readOnly: true
             {{- end }}
-            {{- if .Values.gatewayConfig.render }}
-            {{- range $i, $backend := .Values.gatewayConfig.backends | default list }}
+            {{- if eq .Values.praxisConfig.source "render" }}
+            {{- range $i, $backend := .Values.praxisConfig.render.backends | default list }}
             {{- if (.transport).ca }}
             - name: backend-ca-{{ $i }}
               mountPath: /etc/praxis/backend-ca/{{ $i }}
@@ -301,9 +302,9 @@ spec:
             {{- end }}
             {{- end }}
             {{- end }}
-            {{- if .Values.gatewayConfig.listenerTls.enabled }}
+            {{- if .Values.listenerTls.enabled }}
             - name: listener-tls
-              mountPath: {{ .Values.gatewayConfig.listenerTls.mountPath | quote }}
+              mountPath: {{ .Values.listenerTls.mountPath | quote }}
               readOnly: true
             {{- end }}
             {{- if .Values.metricsListener.enabled }}
@@ -324,26 +325,15 @@ spec:
       volumes:
         - name: config
           configMap:
-            {{- if .Values.gatewayConfig.render }}
-            name: {{ include "praxis-gateway.fullname" . }}-config
+            name: {{ include "praxis-gateway.configMapName" . | quote }}
             items:
-              - key: "praxis.yaml"
+              {{- /* The chart and the Grid operator both write the praxis.yaml key. */}}
+              - key: {{ ternary (.Values.praxisConfig.byo.key | default "praxis.yaml") "praxis.yaml" (eq $configSource "byoConfigMap") | quote }}
                 path: "praxis.yaml"
-              {{- if eq (.Values.gatewayConfig.auth.mode | default "none") "api-key" }}
+              {{- if and (eq $configSource "render") (eq (.Values.praxisConfig.render.auth.mode | default "none") "api-key") }}
               - key: "policy.yaml"
                 path: "policy.yaml"
               {{- end }}
-            {{- else if eq $configSource "existing" }}
-            name: {{ .Values.config.existingConfigMap | quote }}
-            items:
-              - key: {{ .Values.config.key | quote }}
-                path: "praxis.yaml"
-            {{- else }}
-            name: {{ include "praxis-gateway.fullname" . }}-config
-            items:
-              - key: "praxis.yaml"
-                path: "praxis.yaml"
-            {{- end }}
         {{- if .Values.overlay.enabled }}
         {{- if .Values.overlay.sidecar.enabled }}
         - name: overlay
@@ -397,13 +387,13 @@ spec:
             name: {{ include "praxis-gateway.servingConfigMap" . | quote }}
             optional: false
         {{- end }}
-        {{- if .Values.gatewayConfig.upstreamCA.secretName }}
+        {{- if and (eq .Values.praxisConfig.source "render") .Values.praxisConfig.render.upstreamCA.secretName }}
         - name: upstream-ca
           secret:
-            secretName: {{ .Values.gatewayConfig.upstreamCA.secretName | quote }}
+            secretName: {{ .Values.praxisConfig.render.upstreamCA.secretName | quote }}
         {{- end }}
-        {{- if .Values.gatewayConfig.render }}
-        {{- range $i, $backend := .Values.gatewayConfig.backends | default list }}
+        {{- if eq .Values.praxisConfig.source "render" }}
+        {{- range $i, $backend := .Values.praxisConfig.render.backends | default list }}
         {{- with (.transport).ca }}
         - name: backend-ca-{{ $i }}
           {{- if .configMap }}
@@ -416,8 +406,8 @@ spec:
         {{- end }}
         {{- end }}
         {{- end }}
-        {{- $validateCA := .Values.gatewayConfig.auth.validateCA }}
-        {{- $apiKeyRender := and .Values.gatewayConfig.render (eq .Values.gatewayConfig.auth.mode "api-key") }}
+        {{- $validateCA := .Values.praxisConfig.render.auth.validateCA }}
+        {{- $apiKeyRender := and (eq .Values.praxisConfig.source "render") (eq .Values.praxisConfig.render.auth.mode "api-key") }}
         {{- if and $apiKeyRender $validateCA.configMap }}
         - name: validate-ca
           configMap:
@@ -427,10 +417,10 @@ spec:
           secret:
             secretName: {{ $validateCA.secret | quote }}
         {{- end }}
-        {{- if .Values.gatewayConfig.listenerTls.enabled }}
+        {{- if .Values.listenerTls.enabled }}
         - name: listener-tls
           secret:
-            secretName: {{ .Values.gatewayConfig.listenerTls.existingSecret | quote }}
+            secretName: {{ .Values.listenerTls.existingSecret | quote }}
         {{- end }}
         {{- if .Values.metricsListener.enabled }}
         - name: metrics-tls
