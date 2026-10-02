@@ -179,6 +179,16 @@ pub(crate) fn site_phase_next(
             "AwaitingDiscovery".to_owned(),
             "site record created; waiting for SWIM discovery to advance to Discovered".to_owned(),
         ),
+        GridSitePhase::Discovered | GridSitePhase::Connecting | GridSitePhase::Active | GridSitePhase::Unreachable
+            if gossip_address_refused(site) =>
+        {
+            (
+                GridSitePhase::Discovered,
+                "GossipedAddressRefused".to_owned(),
+                "gossiped gateway address is not a dialable literal IP:port; declare the GridSite with spec.egress.address"
+                    .to_owned(),
+            )
+        },
         GridSitePhase::Discovered => {
             if has_egress_address {
                 (
@@ -231,6 +241,10 @@ async fn evaluate_gateway(site: &GridSite, client: &Client, network: &GridNetwor
     let Some(addr) = probe_addr else {
         return GatewayProbeOutcome::AddressMissing;
     };
+    // Never dial a gossiped address the guard refuses.
+    if gossip_address_refused(site) {
+        return GatewayProbeOutcome::AddressMissing;
+    }
 
     if is_plaintext_transport(site) {
         return if tcp_probe(addr).await {
@@ -244,6 +258,25 @@ async fn evaluate_gateway(site: &GridSite, client: &Client, network: &GridNetwor
         Ok(config) => probe_gateway(&config).await,
         Err(outcome) => outcome,
     }
+}
+
+/// Whether a gossiped address is a literal `IP:port` off loopback, link-local, unspecified, and metadata.
+fn is_dialable_gossip(addr: &str) -> bool {
+    addr.parse::<std::net::SocketAddr>()
+        .is_ok_and(|socket| socket.port() != 0 && crate::signals::is_dialable_ip(socket.ip()))
+}
+
+/// Whether this is a discovered stub whose gossiped address the dial guard refuses.
+///
+/// A declared `GridSite` may name a host; a stub's address is copied from gossip.
+fn gossip_address_refused(site: &GridSite) -> bool {
+    let stub = grid_network::peer_site_key(site).is_some_and(|(_, enrolled)| !enrolled);
+    stub && site
+        .spec
+        .egress
+        .as_ref()
+        .map(|egress| egress.address.as_str())
+        .is_some_and(|addr| !addr.trim().is_empty() && !is_dialable_gossip(addr))
 }
 
 /// SWIM-advertised leaf DER, or `None` when absent or unparseable.
@@ -1390,6 +1423,65 @@ mod tests {
                 ..Default::default()
             }),
         }
+    }
+
+    /// `site_with_egress`, as discovery writes it: an auto-discovered stub carrying the bare site id.
+    fn discovered_stub(phase: Option<GridSitePhase>, egress: &str) -> GridSite {
+        let mut site = site_with_egress(phase, egress);
+        site.metadata.annotations = Some(std::collections::BTreeMap::from([(
+            grid_network::ANNOTATION_SITE_ID.to_owned(),
+            "test-site".to_owned(),
+        )]));
+        site
+    }
+
+    #[test]
+    fn only_a_literal_remote_ip_port_is_dialable_gossip() {
+        for (addr, ok) in [
+            ("203.0.113.20:8443", true),
+            ("[2001:db8::1]:8443", true),
+            ("10.0.0.2:8443", true),
+            ("127.0.0.1:8443", false),
+            ("[::1]:8443", false),
+            ("0.0.0.0:8443", false),
+            ("169.254.169.254:80", false),
+            ("[fe80::1]:8443", false),
+            ("[fd00:ec2::254]:80", false),
+            ("[::ffff:127.0.0.1]:8443", false),
+            ("203.0.113.20:0", false),
+            ("gw.example.com:8443", false),
+            ("kubernetes.default.svc:443", false),
+        ] {
+            assert_eq!(is_dialable_gossip(addr), ok, "{addr}");
+        }
+    }
+
+    #[test]
+    fn a_stub_with_an_undialable_gossiped_address_is_never_probed() {
+        for phase in [
+            GridSitePhase::Discovered,
+            GridSitePhase::Connecting,
+            GridSitePhase::Active,
+            GridSitePhase::Unreachable,
+        ] {
+            let stub = discovered_stub(Some(phase.clone()), "169.254.169.254:80");
+            assert!(gossip_address_refused(&stub));
+            let (next, reason, _) = site_phase_next(&phase, &stub, Some(&GatewayProbeOutcome::Verified));
+            assert_eq!(next, GridSitePhase::Discovered, "{phase:?}");
+            assert_eq!(reason, "GossipedAddressRefused", "{phase:?}");
+        }
+    }
+
+    #[test]
+    fn a_declared_site_keeps_a_hostname_and_a_stub_a_dialable_ip() {
+        assert!(!gossip_address_refused(&site_with_egress(None, "gw.example.com:8443")));
+        assert!(!gossip_address_refused(&discovered_stub(None, "203.0.113.20:8443")));
+        let (next, ..) = site_phase_next(
+            &GridSitePhase::Discovered,
+            &discovered_stub(None, "203.0.113.20:8443"),
+            None,
+        );
+        assert_eq!(next, GridSitePhase::Connecting);
     }
 
     fn valid_pin() -> String {

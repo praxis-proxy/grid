@@ -2665,6 +2665,43 @@ pub(crate) fn discovered_sites_from_swim(
         .collect()
 }
 
+/// Most `GridSite` objects auto discovery creates for one network, bounding what a gossiping peer can mint.
+const MAX_AUTO_CREATED_SITES: usize = 256;
+
+/// Names of the auto-discovered `GridSite` objects that already belong to `network_name`.
+async fn auto_discovered_stubs(api: &Api<GridSite>, network_name: &str) -> Result<BTreeSet<String>, OperatorError> {
+    let selector = format!("grid.praxis-proxy.io/auto-discovered=true,grid.praxis-proxy.io/network={network_name}");
+    Ok(api
+        .list(&ListParams::default().labels(&selector))
+        .await?
+        .items
+        .into_iter()
+        .filter_map(|stub| stub.metadata.name)
+        .collect())
+}
+
+/// Log the members [`admit_stub`] left out this round.
+fn warn_capped(network_name: &str, capped: usize) {
+    if capped > 0 {
+        tracing::warn!(
+            network = %network_name,
+            capped,
+            "SWIM members not adopted: {MAX_AUTO_CREATED_SITES} auto-discovered GridSites reached"
+        );
+    }
+}
+
+/// Whether discovery may apply `name`: an existing stub always, a new one only under [`MAX_AUTO_CREATED_SITES`].
+fn admit_stub(stubs: &mut BTreeSet<String>, name: &str) -> bool {
+    if stubs.contains(name) {
+        return true;
+    }
+    if stubs.len() >= MAX_AUTO_CREATED_SITES {
+        return false;
+    }
+    stubs.insert(name.to_owned())
+}
+
 /// Derive a Kubernetes resource name for an auto-discovered `GridSite`.
 ///
 /// The name is `"{network}-{site_id}"` (both sanitised).  Using the composite
@@ -2954,8 +2991,14 @@ async fn reconcile_discovered_sites(
     }
 
     let api: Api<GridSite> = Api::all(client.clone());
+    let mut stubs = auto_discovered_stubs(&api, network_name).await?;
+    let mut capped = 0_usize;
 
     for site in &sites {
+        if !admit_stub(&mut stubs, &site.name) {
+            capped += 1;
+            continue;
+        }
         // Server-side apply the spec.  Creating on first call; updating on subsequent
         // calls is a no-op when the spec has not changed.
         let spec_doc = discovered_site_spec(site, network_name, plaintext);
@@ -3024,6 +3067,7 @@ async fn reconcile_discovered_sites(
         );
     }
 
+    warn_capped(network_name, capped);
     Ok(())
 }
 
@@ -4498,6 +4542,18 @@ mod tests {
             let record = identities.get("remote").unwrap_or_else(|| std::process::abort());
             assert_eq!(record.labels.get("from").map(String::as_str), Some("enrolled"));
         }
+    }
+
+    #[test]
+    fn discovery_creates_no_stub_past_the_cap_but_keeps_reconciling_existing_ones() {
+        let mut stubs: BTreeSet<String> = (0..MAX_AUTO_CREATED_SITES).map(|i| format!("net-s{i}")).collect();
+        assert!(admit_stub(&mut stubs, "net-s0"), "an existing stub still reconciles");
+        assert!(!admit_stub(&mut stubs, "net-new"), "no new stub past the cap");
+        assert_eq!(stubs.len(), MAX_AUTO_CREATED_SITES);
+
+        let mut room = BTreeSet::new();
+        assert!(admit_stub(&mut room, "net-a"));
+        assert!(room.contains("net-a"), "an admitted stub counts against the cap");
     }
 
     #[test]

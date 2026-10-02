@@ -725,7 +725,7 @@ fn warn_refused_once(site: &str, endpoint: &str) -> bool {
 const AWS_METADATA_V6: Ipv6Addr = Ipv6Addr::new(0xFD00, 0x0EC2, 0, 0, 0, 0, 0, 0x0254);
 
 /// Whether a peer IP may be dialed: anything but local and metadata addresses.
-fn is_dialable_ip(ip: IpAddr) -> bool {
+pub(crate) fn is_dialable_ip(ip: IpAddr) -> bool {
     match ip.to_canonical() {
         IpAddr::V4(v4) => {
             !(v4.is_loopback()
