@@ -2,9 +2,6 @@
 # operator creates the ConfigMap. The operator's praxis.yaml has no caller authentication,
 # so keep the Service ClusterIP and put an authenticating front in front of it.
 fullnameOverride: consumer-gateway
-grid:
-  networkName: example-network
-  siteName: west-a
 praxisConfig:
   source: operator
   operator:
