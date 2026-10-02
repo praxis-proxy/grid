@@ -415,7 +415,7 @@ async fn maybe_start_swim(client: &Client, cli: &Cli) -> Result<Option<Arc<swim_
         (None, Some(watch)) => watch.signals.clone(),
         (None, None) => None,
     };
-    tracing::info!(signals = ?signals_address, "signals endpoint gossiped to peers");
+    tracing::debug!(signals = ?signals_address, "signals endpoint to advertise");
     let cfg = SwimConfig {
         bind_addr,
         advertise_addr,
@@ -1259,7 +1259,9 @@ async fn run_signals_server(
         return Ok(());
     };
     // Peers learn this listener from the advertised address, so it waits for SWIM to settle.
-    drop(swim_settled(swim).await);
+    let advertised = swim_settled(swim)
+        .await
+        .and_then(|handle| handle.signals_address().map(str::to_owned));
     let app = axum::Router::new()
         .route(operator::signals::SIGNALS_PATH, axum::routing::get(signals_handler))
         .with_state(listener.published.clone());
@@ -1273,7 +1275,7 @@ async fn run_signals_server(
         reason = "serves for the process lifetime alongside the controllers"
     )]
     loop {
-        if let Err(error) = listener.serve_once(&app).await {
+        if let Err(error) = listener.serve_once(&app, advertised.as_deref()).await {
             tracing::error!(%error, bind = ?listener.bind, "signals listener error; retrying");
             tokio::time::sleep(SIGNALS_TLS_POLL).await;
         }
@@ -1282,7 +1284,11 @@ async fn run_signals_server(
 
 impl SignalsListener {
     /// Serve until this site's TLS material changes, or wait while it is unavailable.
-    async fn serve_once(&self, app: &axum::Router) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn serve_once(
+        &self,
+        app: &axum::Router,
+        advertised: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let (tls, own) = Box::pin(signals_identity(&self.client)).await;
         let Some(tls) = tls else {
             tracing::warn!("signals: TLS material unavailable; not serving the rollup (fail closed)");
@@ -1298,7 +1304,7 @@ impl SignalsListener {
         let bound = listener
             .local_addr()
             .map_or_else(|_| "unknown".to_owned(), |a| a.to_string());
-        tracing::info!(addr = %bound, tls = true, "signals server started");
+        tracing::info!(addr = %bound, advertised = ?advertised, tls = true, "signals server serving; peers poll the advertised endpoint");
         let admission = Admission::new(self.max_per_peer);
         let changed = material_changed(self.client.clone(), own);
         let serving = Serving {

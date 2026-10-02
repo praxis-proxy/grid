@@ -152,8 +152,10 @@ async fn poll_loop(client: &Client, swim: &SwimHandle, interval: Duration, confi
 enum Discovery {
     /// The Service has a `LoadBalancer` address.
     Found(String),
-    /// The Service exists without a `LoadBalancer` address.
+    /// The `LoadBalancer` Service has no address yet.
     NoAddress,
+    /// The Service is another type, such as `ClusterIP` behind a Route, so it never gets one.
+    NotLoadBalancer(String),
     /// The Service does not exist.
     NoService,
 }
@@ -163,7 +165,7 @@ impl Discovery {
     fn into_address(self) -> Option<String> {
         match self {
             Self::Found(addr) => Some(addr),
-            Self::NoAddress | Self::NoService => None,
+            Self::NoAddress | Self::NotLoadBalancer(_) | Self::NoService => None,
         }
     }
 }
@@ -172,9 +174,17 @@ impl Discovery {
 async fn discover_from_service(client: &Client, config: &Config) -> Result<Discovery, kube::Error> {
     let api: Api<Service> = Api::namespaced(client.clone(), &config.namespace);
     Ok(match api.get_opt(&config.service_name).await? {
-        Some(svc) => extract_lb_address(&svc, config.port).map_or(Discovery::NoAddress, Discovery::Found),
+        Some(svc) => classify(&svc, config.port),
         None => Discovery::NoService,
     })
+}
+
+/// What a gateway Service offers: a `LoadBalancer` address, none yet, or none by type.
+fn classify(svc: &Service, port: u16) -> Discovery {
+    match svc.spec.as_ref().and_then(|spec| spec.type_.as_deref()) {
+        Some(kind) if kind != "LoadBalancer" => Discovery::NotLoadBalancer(kind.to_owned()),
+        _ => extract_lb_address(svc, port).map_or(Discovery::NoAddress, Discovery::Found),
+    }
 }
 
 /// Whether `next` differs from the `last` outcome, so a steady state logs once.
@@ -197,12 +207,19 @@ fn log_discovery_change(discovery: &Discovery, service: &str, namespace: &str) {
         Discovery::Found(addr) => {
             tracing::info!(%service, %namespace, %addr, "discovered gateway address from Service");
         },
-        Discovery::NoAddress => {
-            tracing::warn!(%service, %namespace, "gateway Service has no LoadBalancer address yet");
-        },
         Discovery::NoService => {
             tracing::warn!(%service, %namespace, "gateway Service not found; address unavailable");
         },
+        Discovery::NoAddress | Discovery::NotLoadBalancer(_) => log_no_address(discovery, service, namespace),
+    }
+}
+
+/// Log a Service without an address: a pending `LoadBalancer` warns, another type is a steady state.
+fn log_no_address(discovery: &Discovery, service: &str, namespace: &str) {
+    if let Discovery::NotLoadBalancer(kind) = discovery {
+        tracing::info!(%service, %namespace, %kind, "gateway Service is not a LoadBalancer; advertising no gateway address");
+    } else {
+        tracing::warn!(%service, %namespace, "gateway Service has no LoadBalancer address yet");
     }
 }
 
@@ -280,6 +297,35 @@ mod tests {
 
     fn svc_no_status() -> Service {
         Service::default()
+    }
+
+    #[test]
+    fn a_service_without_a_load_balancer_type_is_its_own_outcome() {
+        let typed = |kind: &str, svc: Service| Service {
+            spec: Some(k8s_openapi::api::core::v1::ServiceSpec {
+                type_: Some(kind.to_owned()),
+                ..Default::default()
+            }),
+            ..svc
+        };
+        assert_eq!(
+            classify(&typed("ClusterIP", svc_no_status()), 8080),
+            Discovery::NotLoadBalancer("ClusterIP".to_owned()),
+            "a ClusterIP gateway is a steady state, not a missing address"
+        );
+        assert_eq!(
+            classify(&typed("LoadBalancer", svc_no_ingress()), 8080),
+            Discovery::NoAddress
+        );
+        assert_eq!(
+            classify(&typed("LoadBalancer", svc_with_ip("192.0.2.1")), 8080),
+            Discovery::Found("192.0.2.1:8080".to_owned())
+        );
+        assert_eq!(
+            classify(&svc_no_ingress(), 8080),
+            Discovery::NoAddress,
+            "an unset type keeps the old reading"
+        );
     }
 
     /// Parse a `Config` in isolation for validation tests.

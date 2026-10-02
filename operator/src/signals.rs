@@ -1060,7 +1060,7 @@ impl PollPeers {
                 Err(error) => {
                     outcome = classify(&error);
                     if attempt + 1 >= attempts || !outcome.is_retryable() {
-                        tracing::warn!(site = %peer, outcome = outcome.as_str(), %error, "peer poll failed");
+                        tracing::warn!(site = %peer, %url, outcome = outcome.as_str(), %error, "peer poll failed");
                         break;
                     }
                     crate::metrics::record_peer_retry(peer, outcome.as_str());

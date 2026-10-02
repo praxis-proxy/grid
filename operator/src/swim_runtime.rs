@@ -734,6 +734,9 @@ pub struct SwimHandle {
     /// before calling [`SwimHandle::announce_seeds`].
     advertise_addr: SocketAddr,
 
+    /// Signals endpoint gossiped to peers, if this site serves one.
+    signals_address: Option<String>,
+
     /// Watch channel receiver for SWIM membership snapshots.
     snapshot_rx: watch::Receiver<MembershipSnapshot>,
 
@@ -767,6 +770,12 @@ pub struct SwimHandle {
 }
 
 impl SwimHandle {
+    /// Return the signals endpoint gossiped to peers, if any.
+    #[must_use]
+    pub fn signals_address(&self) -> Option<&str> {
+        self.signals_address.as_deref()
+    }
+
     /// Return the local site identity advertised to SWIM peers.
     #[must_use]
     pub fn site_name(&self) -> &str {
@@ -1108,6 +1117,7 @@ pub async fn start(config: SwimConfig) -> Result<Arc<SwimHandle>, SwimRuntimeErr
         "SWIM runtime starting"
     );
 
+    let signals_address = config.signals_address.clone();
     let run_loop_handle = tokio::spawn(run_loop(
         Arc::new(socket),
         config,
@@ -1130,6 +1140,7 @@ pub async fn start(config: SwimConfig) -> Result<Arc<SwimHandle>, SwimRuntimeErr
     Ok(Arc::new(SwimHandle {
         site_name,
         advertise_addr,
+        signals_address,
         snapshot_rx,
         state_rx,
         broadcast_tx,
@@ -2287,6 +2298,7 @@ mod tests {
         let handle = SwimHandle {
             site_name: "test".to_owned(),
             advertise_addr: "127.0.0.1:7946".parse().unwrap_or_else(|_| std::process::abort()),
+            signals_address: None,
             snapshot_rx,
             state_rx,
             broadcast_tx,
@@ -2453,6 +2465,7 @@ mod tests {
         let handle = SwimHandle {
             site_name: "test".to_owned(),
             advertise_addr: "127.0.0.1:7946".parse().unwrap_or_else(|_| std::process::abort()),
+            signals_address: None,
             snapshot_rx,
             state_rx,
             broadcast_tx,
@@ -2482,6 +2495,7 @@ mod tests {
         let handle = SwimHandle {
             site_name: "test".to_owned(),
             advertise_addr: "127.0.0.1:7946".parse().unwrap_or_else(|_| std::process::abort()),
+            signals_address: None,
             snapshot_rx,
             state_rx,
             broadcast_tx,
@@ -2512,6 +2526,7 @@ mod tests {
         let handle = SwimHandle {
             site_name: "test".to_owned(),
             advertise_addr: "127.0.0.1:7946".parse().unwrap_or_else(|_| std::process::abort()),
+            signals_address: None,
             snapshot_rx,
             state_rx,
             broadcast_tx,
@@ -2794,6 +2809,7 @@ mod tests {
         let handle = SwimHandle {
             site_name: "test".to_owned(),
             advertise_addr: "127.0.0.1:7946".parse().unwrap_or_else(|_| std::process::abort()),
+            signals_address: None,
             snapshot_rx,
             state_rx,
             broadcast_tx,
@@ -2824,6 +2840,7 @@ mod tests {
         let handle = SwimHandle {
             site_name: "test".to_owned(),
             advertise_addr: "127.0.0.1:7946".parse().unwrap_or_else(|_| std::process::abort()),
+            signals_address: None,
             snapshot_rx,
             state_rx,
             broadcast_tx,
