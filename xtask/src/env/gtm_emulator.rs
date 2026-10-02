@@ -643,7 +643,7 @@ mod tests {
             .unwrap_or_else(|_| std::process::abort());
 
         assert!(!forge.contains("overlay-sync"));
-        assert!(west_network.contains("localSiteName: west-edge"));
+        assert!(west_network.contains("siteName: west-edge"));
         assert!(edge_deployment.contains("name: grid-overlay-glb-demo-edge-gateway"));
         assert!(edge_deployment.contains("mountPath: /etc/praxis/routing"));
     }

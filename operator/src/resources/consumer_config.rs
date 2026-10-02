@@ -15,7 +15,7 @@
 //! # Security invariants
 //!
 //! - Token values are **never** emitted.  Credential entries use `file:` sources under
-//!   `ConsumerConfig::credential_mount_base`.
+//!   `ConsumerConfig::credential_mount_path`.
 //! - The `credential.secretRef` locating information (name, namespace, key) is included in the `intelligent_route`
 //!   candidate block and in the `credential_inject` entry.  This is reference data, not credential bytes.
 //!
@@ -50,8 +50,8 @@ pub enum ConsumerConfigError {
     #[error("overlay local_site must not be blank")]
     BlankLocalSite,
 
-    /// The `credential_mount_base` path is blank.
-    #[error("credential_mount_base must not be blank")]
+    /// The `credential_mount_path` path is blank.
+    #[error("credential_mount_path must not be blank")]
     BlankMountBase,
 
     /// A candidate has a blank cluster name.
@@ -124,8 +124,8 @@ pub enum ConsumerConfigError {
 ///
 /// # Parameters
 ///
-/// - `overlay` - the routing overlay produced by the Grid operator for this gateway.
-/// - `credential_mount_base` - base directory where credential Secrets are mounted inside the consumer pod (e.g.
+/// - `overlay` — the routing overlay produced by the Grid operator for this gateway.
+/// - `credential_mount_path` — base directory where credential Secrets are mounted inside the consumer pod (e.g.
 ///   `/run/secrets/grid-credentials`).
 /// - `cluster_endpoints` - explicit endpoint topology for the `load_balancer` section. Every inference cluster must
 ///   have a matching endpoint entry with explicit transport configuration.
@@ -137,23 +137,23 @@ pub enum ConsumerConfigError {
 ///
 /// Returns [`ConsumerConfigError`] when:
 /// - `overlay.local_site` is blank.
-/// - `credential_mount_base` is blank.
+/// - `credential_mount_path` is blank.
+/// - Any candidate has a blank cluster name.
+/// - Any candidate cluster has no matching endpoint in `cluster_endpoints`.
 /// - The overlay has no inference candidates.
-/// - Any inference candidate has a blank cluster name.
-/// - Any inference cluster has no matching endpoint in `cluster_endpoints`.
 /// - Any cluster endpoint has no `transport` configuration.
 /// - Any `mutual_tls` endpoint has no (or blank) `sni`.
 #[cfg(test)]
 pub(crate) fn generate_consumer_praxis_config(
     overlay: &RoutingOverlay,
-    credential_mount_base: &str,
+    credential_mount_path: &str,
     cluster_endpoints: &[ClusterEndpointConfig],
     tls_cert_mount_path: &str,
     listener_port: u16,
 ) -> Result<String, ConsumerConfigError> {
     generate_consumer_praxis_config_with_telemetry(
         overlay,
-        credential_mount_base,
+        credential_mount_path,
         cluster_endpoints,
         tls_cert_mount_path,
         listener_port,
@@ -180,7 +180,7 @@ pub(crate) fn generate_consumer_praxis_config(
 )]
 pub(crate) fn generate_consumer_praxis_config_with_telemetry(
     overlay: &RoutingOverlay,
-    credential_mount_base: &str,
+    credential_mount_path: &str,
     cluster_endpoints: &[ClusterEndpointConfig],
     tls_cert_mount_path: &str,
     listener_port: u16,
@@ -189,7 +189,7 @@ pub(crate) fn generate_consumer_praxis_config_with_telemetry(
     if overlay.local_site.trim().is_empty() {
         return Err(ConsumerConfigError::BlankLocalSite);
     }
-    if credential_mount_base.trim().is_empty() {
+    if credential_mount_path.trim().is_empty() {
         return Err(ConsumerConfigError::BlankMountBase);
     }
 
@@ -222,7 +222,7 @@ pub(crate) fn generate_consumer_praxis_config_with_telemetry(
         ""
     };
 
-    let credential_inject_section = render_credential_inject(&inference_candidates, credential_mount_base);
+    let credential_inject_section = render_credential_inject(&inference_candidates, credential_mount_path);
     let load_balancer_section = render_load_balancer(&inference_candidates, cluster_endpoints, tls_cert_mount_path)?;
 
     // Listeners section: one public listener referencing the consumer filter chain.
@@ -458,7 +458,7 @@ fn render_credential_reference(cred: &crate::resources::routing_overlay::Project
     clippy::too_many_lines,
     reason = "BTreeMap collection + format strings for each credential field"
 )]
-fn render_credential_inject(candidates: &[&RoutingCandidate], credential_mount_base: &str) -> Option<String> {
+fn render_credential_inject(candidates: &[&RoutingCandidate], credential_mount_path: &str) -> Option<String> {
     // Collect unique (strategy, name, namespace, key) → rendered entry.
     // BTreeMap provides deterministic sorted order by key.
     let mut entries: BTreeMap<(String, String, String, String), String> = BTreeMap::new();
@@ -477,7 +477,7 @@ fn render_credential_inject(candidates: &[&RoutingCandidate], credential_mount_b
             continue;
         }
 
-        let file_path = credential_file_path(credential_mount_base, &cred.secret_ref.name, &cred.secret_ref.key);
+        let file_path = credential_file_path(credential_mount_path, &cred.secret_ref.name, &cred.secret_ref.key);
         let entry = format!(
             "          - name: {}\n\
              \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20  namespace: {}\n\
@@ -609,7 +609,7 @@ fn render_cluster_entry(
 
 /// Compute the `file:` path for a credential entry.
 ///
-/// Uses `{credential_mount_base}/{secret-name}/{secret-key}`.
+/// Uses `{credential_mount_path}/{secret-name}/{secret-key}`.
 /// The secret name is sanitized to be DNS-label-safe before use.
 fn credential_file_path(mount_base: &str, secret_name: &str, secret_key: &str) -> String {
     let safe_name = dns_safe(secret_name);
@@ -1413,7 +1413,7 @@ mod tests {
         let overlay = simple_overlay(vec![]);
         assert!(
             generate_consumer_praxis_config(&overlay, "", &[], "/etc/praxis/tls", 8080).is_err(),
-            "blank credential_mount_base must return error"
+            "blank credential_mount_path must return error"
         );
     }
 

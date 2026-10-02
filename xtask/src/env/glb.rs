@@ -2752,10 +2752,11 @@ fn check_overlay_metadata() -> Result<String, Box<dyn std::error::Error>> {
 
     let config_map_resource_version =
         kubectl_jsonpath(&context, "configmap", OVERLAY_CONFIGMAP, "{.metadata.resourceVersion}")?;
-    let overlay_status_raw = kubectl_jsonpath(&context, "gridnetwork", GRID_NETWORK_NAME, "{.status.overlayStatus}")?;
-    let overlay_status: serde_json::Value = serde_json::from_str(&overlay_status_raw)
-        .map_err(|e| format!("GridNetwork overlayStatus is not valid JSON: {e}"))?;
-    let gateway_status = overlay_status
+    let overlay_status_raw =
+        kubectl_jsonpath(&context, "gridnetwork", GRID_NETWORK_NAME, "{.status.routingMapStatus}")?;
+    let routing_map_status: serde_json::Value = serde_json::from_str(&overlay_status_raw)
+        .map_err(|e| format!("GridNetwork routingMapStatus is not valid JSON: {e}"))?;
+    let gateway_status = routing_map_status
         .as_array()
         .and_then(|entries| {
             entries
@@ -2808,7 +2809,7 @@ fn check_overlay_metadata() -> Result<String, Box<dyn std::error::Error>> {
 /// reconcile hot-loop with three independent unconditional-write sources —
 /// `distribute_overlay_configmap`'s overlay `ConfigMap` apply, the `GridSite`
 /// cert-PEM status patch, and (discovered during live helios08 validation of
-/// the first two fixes) the `GridNetwork`'s own `status.overlayStatus[].renderedAt`
+/// the first two fixes) the `GridNetwork`'s own `status.routingMapStatus[].renderedAt`
 /// timestamp, which was refreshed from a new clock read on every reconcile
 /// tick regardless of whether the distributed content actually changed.
 /// Each write bumped its object's `resourceVersion` and fired a watch event
