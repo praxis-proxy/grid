@@ -677,8 +677,8 @@ try_reject_msg "$GW_DIR" "source operator with a Route (gw)" "route is not suppo
   --set praxisConfig.source=operator --set route.enabled=true --set route.host=gw.example.com --namespace grid-system
 try_reject_msg "$GW_DIR" "render settings with source byo (gw)" "praxisConfig.source is byo, which ignores it" \
   --set praxisConfig.render.localSite=hub --namespace grid-system
-try_reject_msg "$GW_DIR" "old config key (gw)" "additional properties 'config' not allowed" --set config.existingConfigMap=x --namespace grid-system
-try_reject_msg "$GW_DIR" "old gatewayConfig key (gw)" "additional properties 'gatewayConfig' not allowed" --set gatewayConfig.render=true --namespace grid-system
+try_reject_msg "$GW_DIR" "old config key (gw)" "[Aa]dditional propert(y|ies).*config.*not allowed" --set config.existingConfigMap=x --namespace grid-system
+try_reject_msg "$GW_DIR" "old gatewayConfig key (gw)" "[Aa]dditional propert(y|ies).*gatewayConfig.*not allowed" --set gatewayConfig.render=true --namespace grid-system
 BK1=(--set "praxisConfig.render.backends[0].cluster=a" --set "praxisConfig.render.backends[0].endpoints[0]=1.2.3.4:8000"
   --set "praxisConfig.render.backends[0].transport.mode=plaintext")
 R0=(--set praxisConfig.source=render --set praxisConfig.render.localSite=hub --set praxisConfig.render.model=q --set praxisConfig.render.auth.mode=none --namespace grid-system)
