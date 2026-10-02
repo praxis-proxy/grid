@@ -24,6 +24,13 @@ grid:
   seeds: []
   # -- Secret holding the grid's SWIM key (key, 32 bytes). Empty runs SWIM without one.
   swimKeySecretName: grid-swim-key
+  # -- InferenceProviders this site serves, keyed by name, as in the grid-site chart.
+  # model defaults to the name, providerKind to vllm, and backendKind to local_model.
+  providers: {}
+  #   qwen3:
+  #     model: Qwen3-Coder-30B-A3B
+  #     endpoint: http://qwen3-epp-service.llm-d.svc:80
+  #     routingClusterRef: site-d
 
 # -- Grid CRDs.
 crds:
