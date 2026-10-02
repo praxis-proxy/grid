@@ -213,11 +213,6 @@ RELEASE=grid-operator; NAMESPACE=grid-system; for crd in agenttoolproviders grid
 | `health.readiness.periodSeconds` | int | `10` | Readiness probe period. |
 | `serviceMonitor.enabled` | bool | `false` | Create a Prometheus ServiceMonitor. |
 | `serviceMonitor.labels` | object | `{}` | Additional ServiceMonitor labels. |
-
-When enrollment is enabled and `gateway.serviceName` is empty, the chart
-normalizes it to `grid-gateway`. A consumer-only enrolled site without that
-Service should set `gateway.discoveryEnabled: false`.
-
 | `serviceMonitor.namespace` | string | `""` | ServiceMonitor namespace override. |
 | `serviceMonitor.interval` | string | `30s` | Prometheus scrape interval. Empty leaves the Prometheus default. |
 | `serviceMonitor.scrapeTimeout` | string | `10s` | Prometheus scrape timeout. Empty leaves the Prometheus default. |
@@ -259,6 +254,10 @@ first install, so set `grid.id` on an upgrade after it, or install the grid-site
 `grid.signals` and `grid.peerTrust` also set the modes the operator starts in before any
 GridNetwork exists, with or without `grid.id`. Set them to match the grid's GridNetwork,
 wherever it comes from, and the operator never restarts when that network appears.
+
+When enrollment is enabled and `gateway.serviceName` is empty, the chart
+normalizes it to `grid-gateway`. A consumer-only enrolled site without that
+Service should set `gateway.discoveryEnabled: false`.
 
 ## Auto-enroll
 
