@@ -342,9 +342,16 @@ fn peer_identities(
 /// The bare `site_id` a peer is keyed by, and whether the object is enrolled
 /// rather than a discovered stub carrying [`ANNOTATION_SITE_ID`].
 pub(crate) fn peer_site_key(site: &GridSite) -> Option<(String, bool)> {
+    let discovered = site
+        .metadata
+        .labels
+        .as_ref()
+        .is_some_and(|labels| labels.get(LABEL_AUTO_DISCOVERED).is_some_and(|v| v == "true"));
+    // Only discovery's own stubs speak for another id; any other object is its name.
     site.metadata
         .annotations
         .as_ref()
+        .filter(|_| discovered)
         .and_then(|annotations| annotations.get(ANNOTATION_SITE_ID))
         .filter(|id| !id.trim().is_empty())
         .map(|id| (id.clone(), false))
@@ -505,6 +512,9 @@ const FIELD_MANAGER: &str = "grid-operator";
 /// This opt-in gate prevents auto-discovery from changing the overlay generation
 /// semantics for networks that were not designed with it in mind.
 pub const LABEL_AUTO_DISCOVER_SITES: &str = "grid.praxis-proxy.io/auto-discover-sites";
+
+/// Marks a `GridSite` that discovery created from SWIM membership.
+pub const LABEL_AUTO_DISCOVERED: &str = "grid.praxis-proxy.io/auto-discovered";
 
 /// Bare SWIM `site_id` on an auto-discovered `GridSite`, whose name carries a network prefix.
 ///
@@ -2670,7 +2680,7 @@ const MAX_AUTO_CREATED_SITES: usize = 256;
 
 /// Names of the auto-discovered `GridSite` objects that already belong to `network_name`.
 async fn auto_discovered_stubs(api: &Api<GridSite>, network_name: &str) -> Result<BTreeSet<String>, OperatorError> {
-    let selector = format!("grid.praxis-proxy.io/auto-discovered=true,grid.praxis-proxy.io/network={network_name}");
+    let selector = format!("{LABEL_AUTO_DISCOVERED}=true,grid.praxis-proxy.io/network={network_name}");
     Ok(api
         .list(&ListParams::default().labels(&selector))
         .await?
@@ -2949,7 +2959,7 @@ fn discovered_site_spec(site: &DiscoveredSite, network_name: &str, plaintext: bo
             "name": site.name,
             "labels": {
                 "grid.praxis-proxy.io/network": network_name,
-                "grid.praxis-proxy.io/auto-discovered": "true"
+                LABEL_AUTO_DISCOVERED: "true"
             },
             "annotations": { ANNOTATION_SITE_ID: site.site_id }
         },
@@ -4373,6 +4383,10 @@ mod tests {
             let mut annotations = serde_json::Map::new();
             annotations.insert(ANNOTATION_SITE_ID.to_owned(), id.into());
             metadata.insert("annotations".to_owned(), serde_json::Value::Object(annotations));
+            metadata.insert(
+                "labels".to_owned(),
+                serde_json::json!({ LABEL_AUTO_DISCOVERED: "true" }),
+            );
         }
         let mut spec = serde_json::Map::new();
         spec.insert("gridNetworkRef".to_owned(), "net".into());
@@ -4511,6 +4525,35 @@ mod tests {
             spec.pointer("/spec/egress/tls"),
             Some(&serde_json::json!({ "mode": "Plaintext" }))
         );
+    }
+
+    #[test]
+    fn a_hand_made_site_cannot_claim_another_sites_key_by_annotation() {
+        let mut impostor = peer_grid_site("impostor", Some("victim"), &["pin-x"]);
+        impostor.metadata.labels = None;
+        let victim = peer_grid_site("victim", None, &[]);
+        assert_eq!(peer_site_key(&impostor), Some(("impostor".to_owned(), true)));
+        for (trust, order) in [
+            (signals::PeerTrustMode::Pin, vec![impostor.clone(), victim.clone()]),
+            (signals::PeerTrustMode::Spiffe, vec![victim, impostor]),
+        ] {
+            let identities = peer_identities(&order, trust);
+            let record = identities.get("victim").unwrap_or_else(|| std::process::abort());
+            assert!(
+                record.pins.is_empty(),
+                "{trust:?}: the impostor's pins never land on victim"
+            );
+            assert!(
+                identities.contains_key("impostor"),
+                "{trust:?}: it keys by its own name"
+            );
+        }
+    }
+
+    #[test]
+    fn an_auto_discovered_stub_still_keys_by_its_bare_id() {
+        let stub = peer_grid_site("net-remote", Some("remote"), &[]);
+        assert_eq!(peer_site_key(&stub), Some(("remote".to_owned(), false)));
     }
 
     #[test]

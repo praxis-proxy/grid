@@ -1432,6 +1432,10 @@ mod tests {
             grid_network::ANNOTATION_SITE_ID.to_owned(),
             "test-site".to_owned(),
         )]));
+        site.metadata.labels = Some(std::collections::BTreeMap::from([(
+            grid_network::LABEL_AUTO_DISCOVERED.to_owned(),
+            "true".to_owned(),
+        )]));
         site
     }
 
