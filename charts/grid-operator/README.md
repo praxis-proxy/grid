@@ -191,16 +191,18 @@ RELEASE=grid-operator; NAMESPACE=grid-system; for crd in agenttoolproviders grid
 | `tolerations` | list | `[]` | Pod tolerations. |
 | `topologySpreadConstraints` | list | `[]` | Topology spread constraints. |
 | `priorityClassName` | string | `""` | Pod priority class. |
-| `enrollment.enabled` | bool | `false` | Enroll on startup when the GridNetwork's `siteSecretRef` Secret is absent. |
+| `enrollment.enabled` | bool | `false` | Enroll on startup when the site identity Secret is absent. |
 | `enrollment.url` | string | `""` | Enrollment service base URL (https). |
 | `enrollment.siteName` | string | `""` | Site name the token pins, at most 51 characters. |
 | `enrollment.caBundle` | object | `{configMap: "", secret: "", key: ca.crt}` | CA bundle that pins the enrollment server, from exactly one of `configMap` and `secret`. |
 | `enrollment.gridCaBundle` | object | `{configMap: "", secret: "", key: ca.crt}` | Grid CA the returned CA must match, from at most one source. Defaults to `caBundle`. |
 | `enrollment.tokenSecretRef` | object | `{name: "", key: token}` | Secret in the release namespace holding the one-time site token. |
+| `enrollment.identitySecretName` | string | `grid-site-identity` | Secret the site identity is written to when no `GridNetwork` names one. Installing the operator alone enrolls the site; no `GridNetwork` is needed. |
+| `enrollment.caSecretName` | string | `grid-ca` | Secret the grid CA is written to when no `GridNetwork` names one. |
 
 ## Auto-enroll
 
-With `enrollment.enabled`, the operator enrolls on startup when the GridNetwork's `spec.tls.siteSecretRef` Secret is absent, and reports ready after it enrolls. That Secret and `caSecretRef` must be in the release namespace. With `rbac.create=false`, grant the operator get, create, and patch on Secrets. [Site Enrollment](../../docs/installation/enrollment.md#enroll-a-site) covers the hub and site steps.
+With `enrollment.enabled`, the operator enrolls on startup when the site identity Secret is absent, and reports ready after it enrolls. No `GridNetwork` is needed: the token pins the grid. The operator writes to the Secrets a `GridNetwork`'s `spec.tls.siteSecretRef` and `caSecretRef` name when one exists, and otherwise to `enrollment.identitySecretName` and `enrollment.caSecretName`. Both must be in the release namespace. With `rbac.create=false`, grant the operator get, create, and patch on Secrets. [Site Enrollment](../../docs/installation/enrollment.md#enroll-a-site) covers the hub and site steps.
 
 ## RBAC and namespace access
 

@@ -74,7 +74,7 @@ helm install grid-operator ./charts/grid-operator \
 
 The site name follows `swim.siteName`, the CA bundle defaults to Secret `grid-ca-bundle`, and the token to Secret `grid-invite-<siteName>`. On the hub itself, `enrollment.url` defaults to the in-cluster `grid-enrollment` Service.
 
-The GridNetwork's `spec.tls.siteSecretRef` and `caSecretRef` name the Secrets the operator writes, and both must be in the operator namespace. When the `siteSecretRef` Secret is absent at startup, the operator generates a key, redeems the token, and writes the grid CA (`ca.crt`) and the site identity (`tls.crt`, `tls.key`). The pod reports ready after enrollment finishes. The operator:
+Enrollment needs no GridNetwork, because the token pins the grid. The operator writes to the Secrets a GridNetwork's `spec.tls.siteSecretRef` and `caSecretRef` name when one exists, and otherwise to `GRID_ENROLL_IDENTITY_SECRET` (default `grid-site-identity`) and `GRID_ENROLL_CA_SECRET` (default `grid-ca`), the names the grid-site chart uses. Both must be in the operator namespace. Until a GridNetwork exists, the operator idles the grid-dependent work: no SWIM join and no overlay. When the identity Secret is absent at startup, the operator generates a key, redeems the token, and writes the grid CA (`ca.crt`) and the site identity (`tls.crt`, `tls.key`). The pod reports ready after enrollment finishes. The operator:
 
 - Skips enrollment when the `siteSecretRef` Secret exists, so a restart never spends a token.
 - Pins TLS to `enrollment.caBundle`.

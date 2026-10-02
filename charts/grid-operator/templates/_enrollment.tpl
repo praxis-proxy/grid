@@ -57,6 +57,10 @@ true
   value: {{ dig "tokenSecretRef" "name" "" $e | quote }}
 - name: GRID_ENROLL_TOKEN_SECRET_KEY
   value: {{ dig "tokenSecretRef" "key" "token" $e | quote }}
+- name: GRID_ENROLL_IDENTITY_SECRET
+  value: {{ $e.identitySecretName | default "grid-site-identity" | quote }}
+- name: GRID_ENROLL_CA_SECRET
+  value: {{ $e.caSecretName | default "grid-ca" | quote }}
 {{- end }}
 {{- end }}
 

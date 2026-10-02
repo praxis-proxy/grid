@@ -199,6 +199,10 @@ enrollment:
     secret: ""
     # -- Key holding the PEM bundle.
     key: ca.crt
+  # -- Secret the site identity is written to when no GridNetwork names one.
+  identitySecretName: grid-site-identity
+  # -- Secret the grid CA is written to when no GridNetwork names one.
+  caSecretName: grid-ca
   # -- Secret holding the one-time site token.
   tokenSecretRef:
     # -- Secret name. Defaults to grid-invite-<siteName>.
