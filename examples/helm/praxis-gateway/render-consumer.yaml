@@ -18,7 +18,11 @@ praxisConfig:
 gridIdentity:
   tlsSecretName: grid-site-identity
   caSecretName: grid-ca
+# Only pods labeled app=authenticating-front can reach the gateway. With auth.mode none
+# this is the only access control, so replace the label with your front's own.
 networkPolicy:
   enabled: true
   from:
-    - podSelector: {}
+    - podSelector:
+        matchLabels:
+          app: authenticating-front
