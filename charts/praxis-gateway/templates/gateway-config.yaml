@@ -16,9 +16,9 @@ metadata:
     {{- include "praxis-gateway.labels" . | nindent 4 }}
 data:
   praxis.yaml: |
-    {{- with $cfg.upstreamCA.secretName }}
+    {{- with $.Values.upstreamCA.secretName }}
     runtime:
-      upstream_ca_file: {{ printf "%s/%s" $cfg.upstreamCA.mountPath ($cfg.upstreamCA.key | default "ca.crt") | quote }}
+      upstream_ca_file: {{ printf "%s/%s" $.Values.upstreamCA.mountPath ($.Values.upstreamCA.key | default "ca.crt") | quote }}
     {{- end }}
     admin:
       address: "127.0.0.1:9901"
@@ -28,10 +28,10 @@ data:
         {{- if $provider }}
         tls:
           certificates:
-            - cert_path: {{ printf "%s/tls.crt" .Values.tls.mountPath | quote }}
-              key_path: {{ printf "%s/tls.key" .Values.tls.mountPath | quote }}
+            - cert_path: {{ printf "%s/tls.crt" $.Values.gridIdentity.mountPath | quote }}
+              key_path: {{ printf "%s/tls.key" $.Values.gridIdentity.mountPath | quote }}
           client_ca:
-            ca_path: {{ printf "%s/ca.crt" .Values.tls.mountPath | quote }}
+            ca_path: {{ printf "%s/ca.crt" $.Values.gridIdentity.mountPath | quote }}
           {{- if eq (($cfg.peerTrust).mode | default "pin") "spiffe" }}
           client_cert_mode: require_named
           {{- with ($cfg.peerTrust).spiffeIds }}
@@ -43,7 +43,7 @@ data:
           {{- else }}
           client_cert_mode: require
           {{- end }}
-        {{- else if $.Values.listenerTls.enabled }}
+        {{- else if $.Values.listenerTls.secretName }}
         tls:
           certificates:
             - cert_path: {{ printf "%s/tls.crt" $.Values.listenerTls.mountPath | quote }}
@@ -82,7 +82,7 @@ data:
           - filter: headers
             response_set:
               - name: X-Grid-Provider-Site
-                value: {{ $cfg.localSite | quote }}
+                value: {{ $.Values.grid.siteName | quote }}
           {{- else }}
           {{- if $apiKey }}
           - filter: policy
@@ -105,26 +105,26 @@ data:
           {{- else }}
           - filter: intelligent_route
             model_header: X-Gateway-Model-Name
-            local_site: {{ $cfg.localSite | quote }}
+            local_site: {{ $.Values.grid.siteName | quote }}
             candidates:
               {{- range $cfg.backends }}
-              - { kind: inference_model, name: {{ $cfg.model | quote }}, site: {{ .site | default $cfg.localSite | quote }}, cluster: {{ .cluster | quote }} }
+              - { kind: inference_model, name: {{ $cfg.model | quote }}, site: {{ .site | default $.Values.grid.siteName | quote }}, cluster: {{ .cluster | quote }} }
               {{- end }}
           {{- end }}
           {{- end }}
           - filter: load_balancer
             clusters:
               {{- range $i, $backend := $cfg.backends }}
-              {{- $mode := (.transport).mode | default (ternary "mutual_tls" "plaintext" $.Values.tls.enabled) }}
+              {{- $mode := (.transport).mode | default (ternary "mutual_tls" "plaintext" (not (empty $.Values.gridIdentity.secretName))) }}
               {{- $hc := .healthCheck | default dict }}
               - name: {{ .cluster | quote }}
                 {{- if eq $mode "mutual_tls" }}
                 tls:
                   ca:
-                    ca_path: {{ printf "%s/ca.crt" $.Values.tls.mountPath | quote }}
+                    ca_path: {{ printf "%s/ca.crt" $.Values.gridIdentity.mountPath | quote }}
                   client_cert:
-                    cert_path: {{ printf "%s/tls.crt" $.Values.tls.mountPath | quote }}
-                    key_path: {{ printf "%s/tls.key" $.Values.tls.mountPath | quote }}
+                    cert_path: {{ printf "%s/tls.crt" $.Values.gridIdentity.mountPath | quote }}
+                    key_path: {{ printf "%s/tls.key" $.Values.gridIdentity.mountPath | quote }}
                   sni: {{ include "praxis-gateway.backendSni" . | quote }}
                   verify: true
                 {{- else if eq $mode "tls" }}

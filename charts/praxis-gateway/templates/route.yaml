@@ -12,7 +12,7 @@
 {{- end }}
 {{- if eq .Values.praxisConfig.source "render" }}
 {{- $provider := eq (.Values.praxisConfig.render.role | default "consumer") "provider" }}
-{{- if not (or $provider .Values.listenerTls.enabled) }}
+{{- if not (or $provider .Values.listenerTls.secretName) }}
 {{- fail "route needs TLS at the gateway: set listenerTls or use the provider role" }}
 {{- end }}
 {{- if and $provider (eq $termination "reencrypt") }}

@@ -74,17 +74,23 @@ tests:
     template: templates/deployment.yaml
     set:
       praxisConfig.source: operator
-      listenerTls.enabled: true
-      listenerTls.existingSecret: listener-tls
+      listenerTls.secretName: listener-tls
     asserts:
       - failedTemplate:
-          errorPattern: listenerTls is not supported with praxisConfig.source operator
+          errorPattern: listenerTls.secretName is not supported with praxisConfig.source operator
+
+  - it: rejects a Grid CA Secret without an identity Secret
+    template: templates/deployment.yaml
+    set:
+      gridIdentity.caSecretName: grid-ca
+    asserts:
+      - failedTemplate:
+          errorPattern: gridIdentity.secretName is required when gridIdentity.caSecretName is set
 
   - it: byo accepts listenerTls
     template: templates/deployment.yaml
     set:
-      listenerTls.enabled: true
-      listenerTls.existingSecret: listener-tls
+      listenerTls.secretName: listener-tls
     asserts:
       - notFailedTemplate: {}
 
@@ -92,36 +98,36 @@ tests:
     template: templates/gateway-config.yaml
     set:
       praxisConfig.source: render
-      praxisConfig.render.localSite: hub
+      grid.siteName: hub
       praxisConfig.render.model: m
       praxisConfig.render.auth.mode: none
       praxisConfig.render.backends:
         - cluster: a
           endpoints: ["10.0.0.1:8000"]
           transport: { mode: plaintext }
-      listenerTls.enabled: true
-      listenerTls.existingSecret: listener-tls
+      listenerTls.secretName: listener-tls
     asserts:
       - matchRegex:
           path: data["praxis.yaml"]
           pattern: 'cert_path: "/etc/praxis/listener-tls/tls.crt"'
 
-  - it: upstreamCA is mounted only with source render
+  - it: upstreamCA mounts for BYO when named
     template: templates/deployment.yaml
     set:
-      praxisConfig.render.upstreamCA.secretName: my-ca
+      upstreamCA.secretName: my-ca
     asserts:
-      - notExists:
-          path: spec.template.spec.volumes[?(@.name == "upstream-ca")]
+      - equal:
+          path: spec.template.spec.volumes[?(@.name == "upstream-ca")].secret.secretName
+          value: my-ca
 
   - it: upstreamCA is mounted with source render
     template: templates/deployment.yaml
     set:
       praxisConfig.source: render
-      praxisConfig.render.localSite: hub
+      grid.siteName: hub
       praxisConfig.render.model: m
       praxisConfig.render.auth.mode: none
-      praxisConfig.render.upstreamCA.secretName: my-ca
+      upstreamCA.secretName: my-ca
       praxisConfig.render.backends:
         - cluster: a
           endpoints: ["10.0.0.1:8000"]
@@ -130,6 +136,15 @@ tests:
       - equal:
           path: spec.template.spec.volumes[?(@.name == "upstream-ca")].secret.secretName
           value: my-ca
+
+  - it: operator rejects upstreamCA because its praxis.yaml has no upstream_ca_file
+    template: templates/deployment.yaml
+    set:
+      praxisConfig.source: operator
+      upstreamCA.secretName: my-ca
+    asserts:
+      - failedTemplate:
+          errorPattern: upstreamCA.secretName is not supported with praxisConfig.source operator
 
   - it: operator rejects a LoadBalancer Service without the exposure opt-in
     template: templates/deployment.yaml

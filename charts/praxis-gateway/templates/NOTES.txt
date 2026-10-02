@@ -1,7 +1,7 @@
 {{- include "praxis-gateway.normalize" . }}
 {{- $fullname := include "praxis-gateway.fullname" . }}
 {{- $configSource := include "praxis-gateway.configSource" . }}
-{{- $scheme := ternary "https" "http" .Values.listenerTls.enabled -}}
+{{- $scheme := ternary "https" "http" (not (empty .Values.listenerTls.secretName)) -}}
 Praxis gateway installed.
 
   Release:   {{ .Release.Name }}
@@ -35,14 +35,14 @@ gateway can use inference, so keep the Service ClusterIP behind an authenticatin
 
 mTLS to backends: if the operator's praxis.yaml uses mutual_tls, it reads tls.crt, tls.key
 and ca.crt from the GridNetwork's consumerConfig.tlsCertMountPath (default /etc/praxis/tls).
-The chart mounts those files only when tls.enabled is true. Set:
-  tls.enabled: true
-  tls.existingSecret: the Secret with tls.crt and tls.key
-  tls.caSecret: the Secret with ca.crt (leave empty if ca.crt is in existingSecret)
-  tls.mountPath: the same path as tlsCertMountPath
-{{- if not .Values.tls.enabled }}
+Set the identity Secret, and set caSecretName if the Grid CA is separate:
+  gridIdentity.secretName: the site identity Secret containing tls.crt and tls.key
+  gridIdentity.caSecretName: the Grid CA Secret containing ca.crt
+  gridIdentity.mountPath: the same path as tlsCertMountPath
+If caSecretName is empty, the chart expects ca.crt in the identity Secret.
+{{- if not .Values.gridIdentity.secretName }}
 
-tls.enabled is false, so no TLS files are mounted.
+gridIdentity.secretName is empty, so no TLS files are mounted.
 {{- end }}
 {{- else if eq $configSource "byoInline" }}
 
@@ -56,21 +56,21 @@ restart the pods to load it right away:
 
   kubectl -n {{ .Release.Namespace }} rollout restart deployment/{{ $fullname }}
 {{- end }}
-{{- if .Values.overlay.enabled }}
+{{- if .Values.overlay.configMapName }}
 
-Overlay ConfigMap: {{ .Values.overlay.existingConfigMap }}
+Overlay ConfigMap: {{ .Values.overlay.configMapName }}
   Mount path: {{ .Values.overlay.mountPath }}
 {{- end }}
-{{- if .Values.tls.enabled }}
+{{- if .Values.gridIdentity.secretName }}
 
-TLS Secret: {{ .Values.tls.existingSecret }}
-  Mount path: {{ .Values.tls.mountPath }}
+Grid identity Secret: {{ .Values.gridIdentity.secretName }}
+  Mount path: {{ .Values.gridIdentity.mountPath }}
 {{- end }}
-{{- if .Values.credentials }}
+{{- if .Values.providerCredentials }}
 
-Credential mounts:
-{{- range .Values.credentials }}
-  - {{ .name }} -> {{ .mountPath }}{{ if .optional }} (optional){{ end }}
+Provider credential mounts:
+{{- range .Values.providerCredentials }}
+  - {{ .secretName }} -> {{ include "praxis-gateway.providerCredentialPath" . }}{{ if .optional }} (optional){{ end }}
 {{- end }}
 {{- end }}
 {{- if and (eq .Values.praxisConfig.source "render") (not .Values.praxisConfig.render.auth.stripAuthorization) }}
