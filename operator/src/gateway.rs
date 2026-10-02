@@ -35,6 +35,16 @@ fn parse_non_blank(raw: &str) -> Result<String, String> {
 #[derive(Args, Debug, Clone)]
 #[group(id = "gateway")]
 pub struct Config {
+    /// Whether to discover and advertise a gateway address from Kubernetes.
+    #[arg(
+        long = "gateway-discovery-enabled",
+        env = "GRID_GATEWAY_DISCOVERY_ENABLED",
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    pub discovery_enabled: bool,
+
     /// Explicit gateway address (host:port); skips discovery when set.
     ///
     /// Blank means unset here, unlike the discovery fields.
@@ -105,6 +115,10 @@ pub async fn resolve(client: &Client, config: &Config) -> Result<Option<String>,
         tracing::info!(addr = %addr, "using explicit gateway address override");
         return Ok(Some(addr.to_owned()));
     }
+    if !config.discovery_enabled {
+        tracing::info!("gateway address discovery disabled");
+        return Ok(None);
+    }
     let discovery = discover_from_service(client, config).await?;
     log_discovery(&discovery, config, true);
     Ok(discovery.into_address())
@@ -114,6 +128,10 @@ pub async fn resolve(client: &Client, config: &Config) -> Result<Option<String>,
 ///
 /// No-op when an explicit address override is set.
 pub async fn run_discovery_poller(client: Client, swim: Arc<SwimHandle>, config: Config) {
+    if !config.discovery_enabled {
+        tracing::info!("gateway address discovery disabled; skipping discovery poller");
+        return;
+    }
     if config.address_override().is_some() {
         tracing::info!("gateway address override set; skipping discovery poller");
         return;
@@ -523,6 +541,39 @@ mod tests {
             matches!(parsed, Ok(g) if g.service_name == "provider-gateway" && g.namespace == "grid-system"),
             "defaults still apply when the flags are not supplied"
         );
+    }
+
+    #[test]
+    fn discovery_enabled_by_default() {
+        assert!(matches!(parse_gateway(&[]), Ok(g) if g.discovery_enabled));
+    }
+
+    #[test]
+    fn discovery_can_be_disabled() {
+        assert!(matches!(
+            parse_gateway(&["--gateway-discovery-enabled", "false"]),
+            Ok(g) if !g.discovery_enabled
+        ));
+    }
+
+    // Use a child process so this test can set the environment without affecting
+    // other tests running in parallel.
+    #[test]
+    fn discovery_environment_can_be_disabled() -> Result<(), Box<dyn std::error::Error>> {
+        let status = std::process::Command::new(std::env::current_exe()?)
+            .args(["--exact", "gateway::tests::discovery_environment_child", "--nocapture"])
+            .env("GRID_GATEWAY_DISCOVERY_ENABLED", "false")
+            .status()?;
+        assert!(status.success(), "child parser test failed");
+        Ok(())
+    }
+
+    #[test]
+    fn discovery_environment_child() {
+        if std::env::var("GRID_GATEWAY_DISCOVERY_ENABLED").ok().as_deref() != Some("false") {
+            return;
+        }
+        assert!(matches!(parse_gateway(&[]), Ok(g) if !g.discovery_enabled));
     }
 
     #[test]

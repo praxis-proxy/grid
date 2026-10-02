@@ -94,6 +94,8 @@ spec:
               value: {{ .Values.gateway.namespace | default .Release.Namespace | quote }}
             - name: GRID_GATEWAY_PORT
               value: {{ .Values.gateway.port | default "8080" | quote }}
+            - name: GRID_GATEWAY_DISCOVERY_ENABLED
+              value: {{ (ne (toString .Values.gateway.discoveryEnabled) "false") | quote }}
             {{- /* Start in the modes the install declares, so its GridNetwork appearing restarts nothing. */}}
             {{- with (.Values.grid).signals }}
             - name: GRID_SIGNAL_TRANSPORT

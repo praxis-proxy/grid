@@ -468,6 +468,10 @@
         "port": {
           "type": "string",
           "description": "Gateway port for discovery."
+        },
+        "discoveryEnabled": {
+          "type": "boolean",
+          "description": "Discover and advertise a LoadBalancer address for the site gateway."
         }
       }
     },

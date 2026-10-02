@@ -21,4 +21,6 @@ swim:
     type: LoadBalancer
     port: 7946
 
-# No provider gateway runs on this consumer-only cluster.
+# Consumer-only sites have no local provider gateway to advertise.
+gateway:
+  discoveryEnabled: false

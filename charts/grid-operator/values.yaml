@@ -188,21 +188,23 @@ signals:
   # -- Signals endpoint gossiped to peers (ip:port, [ipv6]:port, or dns-name:port). Set it when swim.advertiseAddress is set or the Service is not a LoadBalancer.
   advertiseAddress: ""
 
-# -- Advertised provider gateway address configuration.
+# -- Advertised site gateway address configuration.
 gateway:
-  # -- Reachable provider gateway host:port override. Set this for ClusterIP or
-  # NodePort provider Services; otherwise the operator discovers a LoadBalancer address.
+  # -- Discover and advertise a LoadBalancer address for the site gateway.
+  discoveryEnabled: true
+  # -- Reachable site gateway host:port override. Set this for ClusterIP or
+  # NodePort Services; otherwise the operator discovers a LoadBalancer address.
   address: ""
   # -- Site gateway Kubernetes Service name for the operator to discover. Defaults
   # to grid-gateway with enrollment enabled or grid.id set; it also names the
   # gateway in GridNetwork gatewayRefs. Maps to GRID_GATEWAY_SERVICE_NAME.
   serviceName: ""
-  # -- Namespace of the provider gateway Service. Empty uses the release
+  # -- Namespace of the site gateway Service. Empty uses the release
   # namespace. Maps to GRID_GATEWAY_NAMESPACE.
   namespace: ""
   # -- Allow gateway.namespace to be default, kube-*, or openshift-*.
   allowSystemNamespace: false
-  # -- Provider gateway Service port advertised to remote sites. Empty uses
+  # -- Site gateway Service port advertised to remote sites. Empty uses
   # 8080. Maps to GRID_GATEWAY_PORT.
   port: ""
 
