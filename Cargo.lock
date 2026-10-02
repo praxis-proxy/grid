@@ -2351,6 +2351,7 @@ dependencies = [
  "pem 4.0.0",
  "percent-encoding",
  "prometheus",
+ "rcgen",
  "reqwest",
  "rmcp",
  "rustls",

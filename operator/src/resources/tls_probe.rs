@@ -815,6 +815,71 @@ mod tests {
         );
     }
 
+    /// A grid-CA leaf for `site` carrying every SPIFFE ID in `ids`.
+    fn leaf_with_spiffe_ids(ca: &certs::CaCert, site: &str, ids: &[&str]) -> certs::SiteCertOutput {
+        use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, Issuer, KeyPair, SanType, string::Ia5String};
+        let issuer = Issuer::from_ca_cert_pem(&ca.cert_pem, KeyPair::from_pem(&ca.key_pem).unwrap()).unwrap();
+        let key = KeyPair::generate().unwrap();
+        let mut params = CertificateParams::new(vec![format!("{site}.grid.internal")]).unwrap();
+        for id in ids {
+            params
+                .subject_alt_names
+                .push(SanType::URI(Ia5String::try_from(*id).unwrap()));
+        }
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth, ExtendedKeyUsagePurpose::ClientAuth];
+        certs::SiteCertOutput {
+            cert_pem: params.signed_by(&key, &issuer).unwrap().pem(),
+            key_pem: key.serialize_pem(),
+            organization: String::new(),
+            sans: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn spiffe_leaf_with_two_spiffe_ids_is_refused() {
+        let ca = test_ca();
+        let client = test_site(&ca, "client-site");
+        let own = leaf_with_spiffe_ids(&ca, "test-site", &[&certs::spiffe_id("test-site")]);
+        let own_addr = start_tls_server(&own, &ca);
+        assert_eq!(
+            probe_gateway(&spiffe_probe_config(own_addr, &ca, &client, "test-site")).await,
+            GatewayProbeOutcome::Verified,
+            "control: the same leaf with one SPIFFE ID verifies"
+        );
+
+        let server = leaf_with_spiffe_ids(
+            &ca,
+            "test-site",
+            &[&certs::spiffe_id("test-site"), &certs::spiffe_id("victim")],
+        );
+        let addr = start_tls_server(&server, &ca);
+
+        let outcome = probe_gateway(&spiffe_probe_config(addr, &ca, &client, "test-site")).await;
+        assert_eq!(
+            outcome,
+            GatewayProbeOutcome::IdentityMismatch,
+            "a leaf naming its own site and another is neither"
+        );
+    }
+
+    #[tokio::test]
+    async fn spiffe_wrong_server_name_is_refused() {
+        let ca = test_ca();
+        let server = test_site(&ca, "test-site");
+        let client = test_site(&ca, "client-site");
+        let addr = start_tls_server(&server, &ca);
+
+        let config = ProbeConfig {
+            identity: PeerIdentity::Spiffe(certs::spiffe_id("test-site")),
+            ..make_probe_config(addr, &ca, &client, "wrong-name.grid.internal", vec![])
+        };
+        assert_eq!(
+            probe_gateway(&config).await,
+            GatewayProbeOutcome::IdentityMismatch,
+            "the SPIFFE ID never stands in for the server name check"
+        );
+    }
+
     #[tokio::test]
     async fn spiffe_other_sites_id_is_refused() {
         let ca = test_ca();
