@@ -313,6 +313,7 @@ unrelated address.
 | `GRID_SIGNALS_PEER_PORT` | Port dialed on a peer's SWIM host when the peer gossips no signals endpoint. Defaults to `9091` |
 | `GRID_SIGNALS_MAX_PER_PEER` | Concurrent authenticated signals connections one peer site may hold. Defaults to `8` |
 | `GRID_GATEWAY_ADDRESS` | Explicit gateway address override (skips self-discovery) |
+| `GRID_GATEWAY_DISCOVERY_ENABLED` | Whether to discover and advertise a gateway address. Defaults to `true`; set `false` for a consumer-only site |
 | `GRID_GATEWAY_SERVICE_NAME` | Service name for gateway self-discovery (default: `provider-gateway`) |
 | `GRID_GATEWAY_NAMESPACE` | Namespace for gateway Service lookup (default: `grid-system`) |
 | `GRID_GATEWAY_PORT` | Port appended to discovered address (default: `8080`) |
@@ -877,6 +878,9 @@ runtime via a watch channel.
 
 **Explicit override:** Set `GRID_GATEWAY_ADDRESS` to skip the self-discovery
 poller entirely.
+
+Set `GRID_GATEWAY_DISCOVERY_ENABLED=false` on a consumer-only site that has no
+local gateway address to advertise. The default is `true` for compatibility.
 
 ```bash
 # Self-discovery (default): operator discovers from provider-gateway Service
