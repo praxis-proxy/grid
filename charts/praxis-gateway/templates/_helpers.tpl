@@ -196,8 +196,8 @@ Validate praxisConfig: the source, and that each source gets only the settings i
 {{- if ne .Values.image.flavor "grid-gateway" }}
 {{- fail "praxisConfig.render.role provider needs image.flavor grid-gateway" }}
 {{- end }}
-{{- if not .Values.gridIdentity.secretName }}
-{{- fail "praxisConfig.render.role provider needs gridIdentity.secretName for its client identity and Grid CA" }}
+{{- if not .Values.gridIdentity.tlsSecretName }}
+{{- fail "praxisConfig.render.role provider needs gridIdentity.tlsSecretName for its client identity and Grid CA" }}
 {{- end }}
 {{- if ne (len .Values.praxisConfig.render.backends) 1 }}
 {{- fail "praxisConfig.render.role provider routes to exactly one local backend" }}
@@ -335,7 +335,7 @@ grid identity and needs a sni naming the peer; plaintext must not
 carry a sni.
 */}}
 {{- define "praxis-gateway.validateBackends" -}}
-{{- $tlsEnabled := not (empty .Values.gridIdentity.secretName) }}
+{{- $tlsEnabled := not (empty .Values.gridIdentity.tlsSecretName) }}
 {{- $seen := dict }}
 {{- range .Values.praxisConfig.render.backends | default list }}
 {{- if hasKey $seen .cluster }}
@@ -345,7 +345,7 @@ carry a sni.
 {{- $mode := (.transport).mode | default (ternary "mutual_tls" "plaintext" $tlsEnabled) }}
 {{- if eq $mode "mutual_tls" }}
 {{- if not $tlsEnabled }}
-{{- fail (printf "backend %q uses mutual_tls but gridIdentity.secretName is empty: no grid identity is mounted to present" .cluster) }}
+{{- fail (printf "backend %q uses mutual_tls but gridIdentity.tlsSecretName is empty: no grid identity is mounted to present" .cluster) }}
 {{- end }}
 {{- if not (or (.transport).sni .site) }}
 {{- fail (printf "backend %q uses mutual_tls but sets no transport.sni or site to verify the peer against" .cluster) }}
@@ -389,8 +389,8 @@ carry a sni.
 Validate enabled mounts have a non-empty resource name.
 */}}
 {{- define "praxis-gateway.validateMounts" -}}
-{{- if and .Values.gridIdentity.caSecretName (not .Values.gridIdentity.secretName) }}
-{{- fail "gridIdentity.secretName is required when gridIdentity.caSecretName is set" }}
+{{- if and .Values.gridIdentity.caSecretName (not .Values.gridIdentity.tlsSecretName) }}
+{{- fail "gridIdentity.tlsSecretName is required when gridIdentity.caSecretName is set" }}
 {{- end }}
 {{- if and .Values.overlay.configMapName .Values.overlay.sidecar.enabled (not .Values.grid.networkName) }}
 {{- fail "grid.networkName is required when the overlay sidecar is on: set it, or set overlay.sidecar.enabled false." }}
@@ -410,8 +410,8 @@ Validate enabled mounts have a non-empty resource name.
 {{- if gt (len $name) 63 }}
 {{- fail (printf "praxisConfig.render.gridServing: the operator hash-suffixes %s; set configMapName to the ConfigMap labeled grid.praxis.fast/gateway" $name) }}
 {{- end }}
-{{- if not $.Values.gridIdentity.secretName }}
-{{- fail "praxisConfig.render.gridServing polls peers with the grid identity: set gridIdentity.secretName" }}
+{{- if not $.Values.gridIdentity.tlsSecretName }}
+{{- fail "praxisConfig.render.gridServing polls peers with the grid identity: set gridIdentity.tlsSecretName" }}
 {{- end }}
 {{- if eq ($.Values.praxisConfig.render.role | default "consumer") "provider" }}
 {{- fail "praxisConfig.render.gridServing routes callers across sites; it applies to the consumer role only" }}

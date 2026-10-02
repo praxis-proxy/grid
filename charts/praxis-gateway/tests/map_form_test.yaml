@@ -14,7 +14,7 @@ tests:
       praxisConfig.render.model: my-model
       praxisConfig.render.auth.mode: none
       praxisConfig.render.backends.site-a.endpoint: 203.0.113.20:8080
-      gridIdentity.secretName: grid-site-identity
+      gridIdentity.tlsSecretName: grid-site-identity
       gridIdentity.caSecretName: grid-ca
     asserts:
       - matchRegex:
@@ -32,7 +32,7 @@ tests:
       praxisConfig.render.model: my-model
       praxisConfig.render.auth.mode: none
       praxisConfig.render.backends.site-a.endpoint: 203.0.113.20:8080
-      gridIdentity.secretName: grid-site-identity
+      gridIdentity.tlsSecretName: grid-site-identity
       gridIdentity.caSecretName: grid-ca
     asserts:
       - equal:
@@ -60,7 +60,7 @@ tests:
       praxisConfig.source: render
       praxisConfig.render.role: provider
       grid.siteName: site-a
-      gridIdentity.secretName: grid-site-identity
+      gridIdentity.tlsSecretName: grid-site-identity
       gridIdentity.caSecretName: grid-ca
       praxisConfig.render.peerTrust.digest: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
       praxisConfig.render.peerTrust.nextDigest: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
@@ -83,7 +83,7 @@ tests:
       praxisConfig.source: render
       praxisConfig.render.role: provider
       grid.siteName: site-a
-      gridIdentity.secretName: grid-site-identity
+      gridIdentity.tlsSecretName: grid-site-identity
       gridIdentity.caSecretName: grid-ca
       praxisConfig.render.peerTrust.mode: spiffe
       praxisConfig.render.peerTrust.spiffeId: spiffe://grid.internal/site/hub

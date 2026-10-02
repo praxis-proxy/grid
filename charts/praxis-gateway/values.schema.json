@@ -456,7 +456,7 @@
                       "transport": {
                         "type": "object",
                         "additionalProperties": false,
-                        "description": "Upstream transport. Defaults to mutual_tls when gridIdentity.secretName is set, else plaintext. mutual_tls also needs gridIdentity.caSecretName.",
+                        "description": "Upstream transport. Defaults to mutual_tls when gridIdentity.tlsSecretName is set, else plaintext. mutual_tls also needs gridIdentity.caSecretName.",
                         "properties": {
                           "mode": {
                             "type": "string",
@@ -632,7 +632,7 @@
                   "transport": {
                     "type": "object",
                     "additionalProperties": false,
-                    "description": "Upstream transport. Defaults to mutual_tls when gridIdentity.secretName is set, else plaintext. mutual_tls also needs gridIdentity.caSecretName.",
+                    "description": "Upstream transport. Defaults to mutual_tls when gridIdentity.tlsSecretName is set, else plaintext. mutual_tls also needs gridIdentity.caSecretName.",
                     "properties": {
                       "mode": {
                         "type": "string",
@@ -1333,13 +1333,13 @@
       "additionalProperties": false,
       "description": "Grid identity Secret with tls.crt and tls.key. The CA may be in a separate Secret.",
       "properties": {
-        "secretName": {
+        "tlsSecretName": {
           "type": "string",
           "description": "Secret holding the client certificate and key."
         },
         "caSecretName": {
           "type": "string",
-          "description": "Secret holding ca.crt. Defaults to secretName when empty."
+          "description": "Secret holding ca.crt. Defaults to tlsSecretName when empty."
         },
         "mountPath": {
           "type": "string",

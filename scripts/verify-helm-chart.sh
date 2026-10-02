@@ -450,17 +450,17 @@ try_template "$GW_DIR" "edge gateway" "${GW_REQ[@]}" \
   --set fullnameOverride=edge-gateway \
   --set service.type=LoadBalancer \
   --set overlay.configMapName=grid-overlay --set grid.networkName=example --set grid.siteName=edge \
-  --set gridIdentity.secretName=edge-tls
+  --set gridIdentity.tlsSecretName=edge-tls
 try_template "$GW_DIR" "provider gateway" "${GW_REQ[@]}" \
   --set nameOverride=provider-gateway \
   --set port.containerPort=8443 --set port.name=https-mtls \
   --set service.type=LoadBalancer --set service.port=8443 \
-  --set gridIdentity.secretName=provider-tls
+  --set gridIdentity.tlsSecretName=provider-tls
 try_template "$GW_DIR" "gtm emulator" "${GW_REQ[@]}" \
   --set nameOverride=gtm-emulator \
   --set port.containerPort=8443 --set port.name=https \
   --set service.type=LoadBalancer --set service.port=8443 \
-  --set gridIdentity.secretName=gtm-tls
+  --set gridIdentity.tlsSecretName=gtm-tls
 try_template "$GW_DIR" "service disabled" "${GW_REQ[@]}" --set service.enabled=false
 try_template "$GW_DIR" "custom image" "${GW_REQ[@]}" \
   --set image.repository=praxis-ai --set image.tag=glb-demo --set image.pullPolicy=Never
@@ -611,7 +611,7 @@ SECURE_ARGS=(
   --set praxisConfig.render.auth.mode=api-key --set image.tag=verify-api-key
   --set praxisConfig.render.auth.validateUrl=https://maas-api.svc:8443/internal/v1/api-keys/validate
   --set upstreamCA.secretName=upstream-ca
-  --set gridIdentity.secretName=grid-identity --set gridIdentity.caSecretName=grid-ca
+  --set gridIdentity.tlsSecretName=grid-identity --set gridIdentity.caSecretName=grid-ca
   --set listenerTls.secretName=listener-cert
   --set "praxisConfig.render.backends[0].cluster=site-a"
   --set "praxisConfig.render.backends[0].endpoints[0]=172.30.202.42:8000"
@@ -802,9 +802,9 @@ try_reject_msg "$GW_DIR" "render without backends (gw)" "praxisConfig.render.bac
   --set praxisConfig.source=render --set grid.siteName=hub --set praxisConfig.render.auth.mode=none --set praxisConfig.render.model=q --namespace grid-system
 try_reject_msg "$GW_DIR" "mutual_tls without sni (gw)" "sets no transport.sni" \
   --set praxisConfig.source=render --set grid.siteName=hub --set praxisConfig.render.auth.mode=none --set praxisConfig.render.model=q \
-  --set gridIdentity.secretName=id --set gridIdentity.caSecretName=grid-ca \
+  --set gridIdentity.tlsSecretName=id --set gridIdentity.caSecretName=grid-ca \
   --set praxisConfig.render.backends[0].cluster=a --set praxisConfig.render.backends[0].endpoints[0]=1.2.3.4:8000 --namespace grid-system
-try_reject_msg "$GW_DIR" "mutual_tls without grid identity (gw)" "gridIdentity.secretName is empty" \
+try_reject_msg "$GW_DIR" "mutual_tls without grid identity (gw)" "gridIdentity.tlsSecretName is empty" \
   --set praxisConfig.source=render --set grid.siteName=hub --set praxisConfig.render.auth.mode=none --set praxisConfig.render.model=q \
   --set praxisConfig.render.backends[0].cluster=a --set praxisConfig.render.backends[0].endpoints[0]=1.2.3.4:8000 \
   --set praxisConfig.render.backends[0].transport.mode=mutual_tls --set praxisConfig.render.backends[0].transport.sni=a.grid --namespace grid-system
@@ -863,7 +863,7 @@ try_reject_msg "$GW_DIR" "trustPrivate over plaintext without allowPlaintextTrus
 DIGEST=$(printf 'a%.0s' $(seq 64))
 PROVIDER=(--set praxisConfig.source=render --set grid.siteName=hub --set praxisConfig.render.role=provider --namespace grid-system
   --set image.flavor=grid-gateway
-  --set gridIdentity.secretName=grid-site-identity --set gridIdentity.caSecretName=grid-ca
+  --set gridIdentity.tlsSecretName=grid-site-identity --set gridIdentity.caSecretName=grid-ca
   --set "praxisConfig.render.backends[0].cluster=local" --set "praxisConfig.render.backends[0].transport.mode=plaintext"
   --set "praxisConfig.render.backends[0].endpoints[0]=m.ns.svc.cluster.local.:8000" --set "praxisConfig.render.backends[0].trustPrivate=true"
   --set "praxisConfig.render.backends[0].allowPlaintextTrust=true" --set-json "praxisConfig.render.peerTrust.certDigests=[\"$DIGEST\"]")
@@ -920,7 +920,7 @@ try_reject_msg "$GW_DIR" "peerTrust.rateLimit missing burst (gw)" "burst" "${PRO
 # gridServing: operator serving config mounted as a directory, routed by grid_site_route.
 SERVING=(--set praxisConfig.source=render --set grid.siteName=hub --set praxisConfig.render.auth.mode=none --namespace grid-system
   --set image.repository=quay.io/example/grid-gateway --set image.tag=t --set image.flavor=grid-gateway
-  --set gridIdentity.secretName=grid-site-identity --set gridIdentity.caSecretName=grid-ca
+  --set gridIdentity.tlsSecretName=grid-site-identity --set gridIdentity.caSecretName=grid-ca
   --set praxisConfig.render.gridServing.enabled=true --set praxisConfig.render.gridServing.configMapName=grid-serving-grid-gw
   --set "praxisConfig.render.backends[0].cluster=pool-b" --set "praxisConfig.render.backends[0].endpoints[0]=203.0.113.7:8443"
   --set "praxisConfig.render.backends[0].transport.sni=site-b.grid.internal")
@@ -942,7 +942,7 @@ if helm template v-serv "$GW_DIR" "${SERVING[@]}" --set praxisConfig.render.grid
 else
   fail "gridServing: did not derive grid-serving-grid-gw"
 fi
-try_reject_msg "$GW_DIR" "gridServing without the Grid identity (gw)" "gridIdentity.secretName" "${SERVING[@]}" --set gridIdentity.secretName=""
+try_reject_msg "$GW_DIR" "gridServing without the Grid identity (gw)" "gridIdentity.tlsSecretName" "${SERVING[@]}" --set gridIdentity.tlsSecretName=""
 try_reject_msg "$GW_DIR" "gridServing on the provider role (gw)" "consumer role only" "${SERVING[@]}" --set praxisConfig.render.role=provider \
   --set-json "praxisConfig.render.peerTrust.certDigests=[\"$DIGEST\"]"
 try_reject_msg "$GW_DIR" "gridServing on the ai image flavor (gw)" "praxisConfig.render.gridServing needs image.flavor grid-gateway" "${SERVING[@]}" \
@@ -984,9 +984,9 @@ probe_port_matches() {
   fi
 }
 probe_port_matches "provider gateway" --set port.containerPort=8443 --set port.name=https-mtls \
-  --set gridIdentity.secretName=provider-tls
+  --set gridIdentity.tlsSecretName=provider-tls
 probe_port_matches "gtm emulator" --set port.containerPort=8443 --set port.name=https \
-  --set gridIdentity.secretName=gtm-tls
+  --set gridIdentity.tlsSecretName=gtm-tls
 for f in "$EXAMPLE_DIR"/{combined-site,dedicated-edge}/values/*-provider-gateway.yaml; do
   probe_port_matches "$(basename "$f" .yaml)" -f "$f"
 done

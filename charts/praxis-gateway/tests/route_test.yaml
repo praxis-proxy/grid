@@ -110,7 +110,7 @@ tests:
       praxisConfig.render.role: provider
       listenerTls.secretName: ""
       praxisConfig.render.peerTrust.certDigests: ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
-      gridIdentity.secretName: grid-site-identity
+      gridIdentity.tlsSecretName: grid-site-identity
       gridIdentity.caSecretName: grid-ca
     asserts:
       - failedTemplate:
