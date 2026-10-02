@@ -22,8 +22,9 @@ use tracing::info;
 use zeroize::Zeroizing;
 
 use crate::{
+    controller::grid_network,
     crd::{
-        grid_network::GridNetwork,
+        grid_network::{GridNetwork, PeerTrustMode},
         grid_site::{EgressTlsMode, GridSite, GridSitePhase, GridSiteStatus},
     },
     error::OperatorError,
@@ -33,8 +34,8 @@ use crate::{
         },
         secret::read_secret_bytes,
         tls_probe::{
-            build_tls_config, first_cert_der_from_pem, parse_ca_roots, parse_client_certs, parse_private_key,
-            probe_gateway,
+            PeerIdentity, build_tls_config, first_cert_der_from_pem, parse_ca_roots, parse_client_certs,
+            parse_private_key, probe_gateway,
         },
     },
 };
@@ -328,16 +329,26 @@ async fn build_probe_config_from_secrets(
     let server_name =
         crate::resources::tls_backend::parse_server_name(server_name_str).map_err(|_err| O::TrustMaterialInvalid)?;
 
-    let pins = resolve_pins(site)?;
-
-    let advertised = advertised_leaf_der(site);
+    let identity = match network
+        .spec
+        .peer_trust
+        .as_ref()
+        .map(|trust| trust.mode)
+        .unwrap_or_default()
+    {
+        PeerTrustMode::Pin => PeerIdentity::Pins(resolve_pins(site)?),
+        PeerTrustMode::Spiffe => {
+            let (site_id, _) = grid_network::peer_site_key(site).ok_or(O::TrustMaterialMissing)?;
+            PeerIdentity::Spiffe(certs::spiffe_id(&site_id))
+        },
+    };
 
     Ok(crate::resources::tls_probe::ProbeConfig {
         address: addr.to_owned(),
         tls_config,
         server_name,
-        pins,
-        advertised_leaf_der: advertised,
+        identity,
+        advertised_leaf_der: advertised_leaf_der(site),
     })
 }
 

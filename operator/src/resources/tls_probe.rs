@@ -47,12 +47,20 @@ pub(crate) struct ProbeConfig {
     /// Expected DNS server name for SNI and SAN verification.
     pub server_name: ServerName,
 
-    /// Canonical DER fingerprint pins (1–2 entries).
-    pub pins: Vec<CanonicalFingerprint>,
+    /// What the verified leaf must additionally prove.
+    pub identity: PeerIdentity,
 
     /// Optional SWIM-advertised leaf cert DER, compared with the configured
     /// rotation pins for diagnostics only.
     pub advertised_leaf_der: Option<Vec<u8>>,
+}
+
+/// How a probed leaf is bound to the site, beyond the CA chain and server name.
+pub(crate) enum PeerIdentity {
+    /// Canonical DER fingerprint pins (1–2 entries).
+    Pins(Vec<CanonicalFingerprint>),
+    /// The exact SPIFFE ID the leaf must carry.
+    Spiffe(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -64,7 +72,7 @@ pub(crate) struct ProbeConfig {
 /// 1. TCP connect with [`CONNECT_TIMEOUT`].
 /// 2. TLS handshake under [`PROBE_DEADLINE`] (total, including connect).
 /// 3. Extract peer leaf certificate DER.
-/// 4. Validate canonical fingerprint pin.
+/// 4. Validate the canonical fingerprint pin, or under SPIFFE the leaf's SPIFFE ID.
 /// 5. If present, compare the SWIM-advertised leaf with the pins and record a mismatch without failing the verified
 ///    connection.
 ///
@@ -119,14 +127,29 @@ fn verify_peer_certificate(tls_stream: &tls_backend::ClientTlsStream, config: &P
         return GatewayProbeOutcome::TlsProtocolError;
     };
 
-    let leaf_fp = CanonicalFingerprint::from_der(leaf_der);
-    if !fingerprint_matches_any(&leaf_fp, &config.pins) {
+    verify_identity(leaf_der, config)
+}
+
+/// Bind a chain-verified leaf to the site: its pins, or its exact SPIFFE ID.
+fn verify_identity(leaf_der: &[u8], config: &ProbeConfig) -> GatewayProbeOutcome {
+    let pins = match &config.identity {
+        PeerIdentity::Pins(pins) => pins,
+        PeerIdentity::Spiffe(expected) => {
+            return if certs::leaf_spiffe_id(leaf_der).as_ref() == Some(expected) {
+                GatewayProbeOutcome::Verified
+            } else {
+                GatewayProbeOutcome::IdentityMismatch
+            };
+        },
+    };
+
+    if !fingerprint_matches_any(&CanonicalFingerprint::from_der(leaf_der), pins) {
         return GatewayProbeOutcome::PinMismatch;
     }
 
     if let Some(advertised) = config.advertised_leaf_der.as_ref() {
         let advertised_fp = CanonicalFingerprint::from_der(advertised);
-        if !fingerprint_matches_any(&advertised_fp, &config.pins) {
+        if !fingerprint_matches_any(&advertised_fp, pins) {
             return GatewayProbeOutcome::AdvertisedCertificateMismatch;
         }
     }
@@ -430,12 +453,15 @@ mod tests {
             address: "10.0.0.1:8443".to_owned(),
             tls_config,
             server_name: tls_backend::parse_server_name("test-site.grid.internal").unwrap(),
-            pins: vec![fp],
+            identity: PeerIdentity::Pins(vec![fp]),
             advertised_leaf_der: None,
         };
 
         assert!(!config.address.contains("PRIVATE KEY"), "address must not leak keys");
-        assert_eq!(config.pins.len(), 1, "pins configured");
+        assert!(
+            matches!(&config.identity, PeerIdentity::Pins(pins) if pins.len() == 1),
+            "pins configured"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -460,7 +486,7 @@ mod tests {
             address: addr.to_string(),
             tls_config: client_tls_config(ca, client),
             server_name: ServerName::try_from(server_name.to_owned()).unwrap(),
-            pins,
+            identity: PeerIdentity::Pins(pins),
             advertised_leaf_der: None,
         }
     }
@@ -584,7 +610,7 @@ mod tests {
             address: "127.0.0.1:1".to_owned(),
             tls_config: client_tls_config(&ca, &client),
             server_name: tls_backend::parse_server_name("test-site.grid.internal").unwrap(),
-            pins: vec![pin],
+            identity: PeerIdentity::Pins(vec![pin]),
             advertised_leaf_der: None,
         };
         let outcome = probe_gateway(&config).await;
@@ -760,6 +786,74 @@ mod tests {
             GatewayProbeOutcome::PinMismatch,
             "empty pin set must fail closed"
         );
+    }
+
+    fn spiffe_probe_config(
+        addr: std::net::SocketAddr,
+        ca: &certs::CaCert,
+        client: &certs::SiteCertOutput,
+        site: &str,
+    ) -> ProbeConfig {
+        ProbeConfig {
+            identity: PeerIdentity::Spiffe(certs::spiffe_id(site)),
+            ..make_probe_config(addr, ca, client, &format!("{site}.grid.internal"), vec![])
+        }
+    }
+
+    #[tokio::test]
+    async fn spiffe_matching_id_verifies_without_pins() {
+        let ca = test_ca();
+        let server = test_site(&ca, "test-site");
+        let client = test_site(&ca, "client-site");
+        let addr = start_tls_server(&server, &ca);
+
+        let outcome = probe_gateway(&spiffe_probe_config(addr, &ca, &client, "test-site")).await;
+        assert_eq!(
+            outcome,
+            GatewayProbeOutcome::Verified,
+            "CA chain plus the site's SPIFFE ID verifies"
+        );
+    }
+
+    #[tokio::test]
+    async fn spiffe_other_sites_id_is_refused() {
+        let ca = test_ca();
+        let server = test_site(&ca, "test-site");
+        let client = test_site(&ca, "client-site");
+        let addr = start_tls_server(&server, &ca);
+
+        let config = ProbeConfig {
+            identity: PeerIdentity::Spiffe(certs::spiffe_id("other-site")),
+            ..make_probe_config(addr, &ca, &client, "test-site.grid.internal", vec![])
+        };
+        assert_eq!(probe_gateway(&config).await, GatewayProbeOutcome::IdentityMismatch);
+    }
+
+    #[tokio::test]
+    async fn spiffe_leaf_without_a_spiffe_id_is_refused() {
+        let ca = test_ca();
+        let server = certs::generate_dns_only_cert(&ca, "test-site", &[]).unwrap();
+        let client = test_site(&ca, "client-site");
+        let addr = start_tls_server(&server, &ca);
+
+        let outcome = probe_gateway(&spiffe_probe_config(addr, &ca, &client, "test-site")).await;
+        assert_eq!(
+            outcome,
+            GatewayProbeOutcome::IdentityMismatch,
+            "a grid-CA infra leaf with the site's DNS name is not the site"
+        );
+    }
+
+    #[tokio::test]
+    async fn spiffe_wrong_ca_is_refused() {
+        let ca = test_ca();
+        let wrong_ca = certs::generate_ca("wrong-ca").unwrap();
+        let server = test_site(&ca, "test-site");
+        let client = test_site(&wrong_ca, "client-site");
+        let addr = start_tls_server(&server, &ca);
+
+        let outcome = probe_gateway(&spiffe_probe_config(addr, &wrong_ca, &client, "test-site")).await;
+        assert_eq!(outcome, GatewayProbeOutcome::UntrustedIssuer);
     }
 
     #[tokio::test]
