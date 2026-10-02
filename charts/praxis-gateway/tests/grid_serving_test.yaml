@@ -7,15 +7,15 @@ release:
   namespace: grid
 set:
   image.flavor: grid-gateway
-  gatewayConfig.render: true
-  gatewayConfig.localSite: hub
-  gatewayConfig.auth.mode: none
+  praxisConfig.source: render
+  praxisConfig.render.localSite: hub
+  praxisConfig.render.auth.mode: none
   tls.enabled: true
   tls.existingSecret: grid-site-identity
   tls.caSecret: grid-ca
   gridServing.enabled: true
   gridServing.network: grid
-  gatewayConfig.backends:
+  praxisConfig.render.backends:
     - cluster: pool-b
       endpoints: ["203.0.113.7:8443"]
       transport: { mode: mutual_tls, sni: site-b.grid.internal }

@@ -1,5 +1,5 @@
 # A Praxis config managed outside the chart, under a non-default key, for the
-# config.existingConfigMap stage.
+# praxisConfig.byo.configMapName stage.
 apiVersion: v1
 kind: ConfigMap
 metadata:

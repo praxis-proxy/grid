@@ -48,7 +48,7 @@ OPERATOR_ARGS=(--set image.repository=registry.k8s.io/pause --set image.tag=3.9)
 # grid.id without enrollment renders a GridNetwork and GridSite, set once the CRDs exist.
 GRID_ARGS=(--set grid.id=upgrade --set grid.network=upgrade-op --set site.name=upgrade-op-site)
 SITE_ARGS=(--set gridNetwork.name=upgrade --set gridSite.name=upgrade-site)
-GATEWAY_ARGS=(--set config.existingConfigMap=upgrade-gateway --set image.tag=v0.1.0-ci)
+GATEWAY_ARGS=(--set praxisConfig.byo.configMapName=upgrade-gateway --set image.tag=v0.1.0-ci)
 RELEASES=(grid-operator grid-site praxis-gateway grid-mock-providers)
 
 release_args() { # <release>: prints the extra args, one per line

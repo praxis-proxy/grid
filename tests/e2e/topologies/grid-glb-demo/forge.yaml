@@ -338,8 +338,9 @@ spec:
               limits:
                 cpu: 500m
                 memory: 256Mi
-            config:
-              existingConfigMap: "provider-gateway-config"
+            praxisConfig:
+              byo:
+                configMapName: "provider-gateway-config"
             port:
               containerPort: 8443
               name: "https-mtls"
@@ -426,8 +427,9 @@ spec:
               limits:
                 cpu: 500m
                 memory: 256Mi
-            config:
-              existingConfigMap: "edge-gateway-config"
+            praxisConfig:
+              byo:
+                configMapName: "edge-gateway-config"
             service:
               type: "LoadBalancer"
             overlay:
@@ -490,8 +492,9 @@ spec:
               limits:
                 cpu: 500m
                 memory: 256Mi
-            config:
-              existingConfigMap: "gtm-emulator-config"
+            praxisConfig:
+              byo:
+                configMapName: "gtm-emulator-config"
             health:
               readiness:
                 tcpSocket:
