@@ -24,7 +24,7 @@ grid:
   siteName: east-a
 
 gridIdentity:
-  secretName: provider-tls
+  tlsSecretName: provider-tls
   caSecretName: grid-ca
 
 providerCredentials:

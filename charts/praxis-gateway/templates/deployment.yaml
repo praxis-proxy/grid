@@ -288,7 +288,7 @@ spec:
               mountPath: {{ .Values.overlay.mountPath | quote }}
               readOnly: true
             {{- end }}
-            {{- if and .Values.gridIdentity.secretName (or (not .Values.mountReconciliation.enabled) (not .Values.mountReconciliation.releaseHelmMounts) .Values.praxisConfig.render.gridServing.enabled) }}
+            {{- if and .Values.gridIdentity.tlsSecretName (or (not .Values.mountReconciliation.enabled) (not .Values.mountReconciliation.releaseHelmMounts) .Values.praxisConfig.render.gridServing.enabled) }}
             - name: tls
               mountPath: {{ .Values.gridIdentity.mountPath | quote }}
               readOnly: true
@@ -376,19 +376,19 @@ spec:
                 path: {{ .Values.overlay.sidecar.dataKey | quote }}
         {{- end }}
         {{- end }}
-        {{- if and .Values.gridIdentity.secretName (or (not .Values.mountReconciliation.enabled) (not .Values.mountReconciliation.releaseHelmMounts) .Values.praxisConfig.render.gridServing.enabled) }}
+        {{- if and .Values.gridIdentity.tlsSecretName (or (not .Values.mountReconciliation.enabled) (not .Values.mountReconciliation.releaseHelmMounts) .Values.praxisConfig.render.gridServing.enabled) }}
         - name: tls
           projected:
             sources:
               - secret:
-                  name: {{ .Values.gridIdentity.secretName | quote }}
+                  name: {{ .Values.gridIdentity.tlsSecretName | quote }}
                   items:
                     - key: tls.crt
                       path: tls.crt
                     - key: tls.key
                       path: tls.key
               - secret:
-                  name: {{ (.Values.gridIdentity.caSecretName | default .Values.gridIdentity.secretName) | quote }}
+                  name: {{ (.Values.gridIdentity.caSecretName | default .Values.gridIdentity.tlsSecretName) | quote }}
                   items:
                     - key: ca.crt
                       path: ca.crt

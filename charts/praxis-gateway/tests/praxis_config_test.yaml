@@ -85,7 +85,7 @@ tests:
       gridIdentity.caSecretName: grid-ca
     asserts:
       - failedTemplate:
-          errorPattern: gridIdentity.secretName is required when gridIdentity.caSecretName is set
+          errorPattern: gridIdentity.tlsSecretName is required when gridIdentity.caSecretName is set
 
   - it: byo accepts listenerTls
     template: templates/deployment.yaml

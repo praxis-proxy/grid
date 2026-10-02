@@ -16,5 +16,5 @@ praxisConfig:
 grid:
   siteName: site-a
 gridIdentity:
-  secretName: grid-site-identity
+  tlsSecretName: grid-site-identity
   caSecretName: grid-ca

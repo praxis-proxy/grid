@@ -22,7 +22,7 @@ grid:
   siteName: west-b
 
 gridIdentity:
-  secretName: provider-tls
+  tlsSecretName: provider-tls
   caSecretName: grid-ca
 
 providerCredentials:

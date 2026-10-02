@@ -31,7 +31,7 @@ const CLUSTERS: &[&str] = &["provider-a", "provider-b", "provider-c"];
 /// The single consumer gateway used by the focused request-routing proof.
 const CONSUMER_SITE: &str = "provider-a";
 
-/// Consumer gateway identity Secret name (matches Helm `gridIdentity.secretName`).
+/// Consumer gateway identity Secret name (matches Helm `gridIdentity.tlsSecretName`).
 const CONSUMER_TLS_SECRET: &str = "consumer-gateway-tls";
 
 /// Evidence JSON schema version.
@@ -83,7 +83,7 @@ const PROVIDER_RESOURCES: &[(&str, &str)] = &[
     ("provider-c", "vcr-provider-c-provider"),
 ];
 
-/// Provider gateway identity Secret name (matches Helm `gridIdentity.secretName`).
+/// Provider gateway identity Secret name (matches Helm `gridIdentity.tlsSecretName`).
 const PROVIDER_TLS_SECRET: &str = "provider-gateway-tls";
 
 /// Same-CA client identity with an organization rejected by `peer_identity_trust`.
