@@ -228,11 +228,11 @@ Add the new credential mount:
 
 ```yaml
 # {site}-provider-gateway.yaml
-credentials:
-  - name: existing-credential
+providerCredentials:
+  - secretName: existing-credential
     mountPath: /etc/praxis/credentials/existing-credential
     optional: false
-  - name: my-new-credential              # new
+  - secretName: my-new-credential        # new
     mountPath: /etc/praxis/credentials/my-new-credential
     optional: false
 ```

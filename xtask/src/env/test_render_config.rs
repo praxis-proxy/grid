@@ -20,8 +20,8 @@ spec:
         - type: helm
           release: provider-gateway
           values:
-            credentials:
-              - name: mock-credential
+            providerCredentials:
+              - secretName: mock-credential
                 mountPath: /etc/praxis/credentials/mock
 ";
 
@@ -47,10 +47,10 @@ fn normal_mode_no_openai() {
             && step_map.get("release").and_then(|v| v.as_str()) == Some("provider-gateway")
         {
             let values = step_map.get("values").unwrap().as_mapping().unwrap();
-            let credentials = values.get("credentials").unwrap().as_sequence().unwrap();
+            let credentials = values.get("providerCredentials").unwrap().as_sequence().unwrap();
 
             for cred in credentials {
-                let name = cred.get("name").unwrap().as_str().unwrap();
+                let name = cred.get("secretName").unwrap().as_str().unwrap();
                 assert_ne!(name, "openai-api-key");
             }
         }
@@ -86,10 +86,10 @@ fn openai_mode_creates_required_credential() {
             && step_map.get("release").and_then(|v| v.as_str()) == Some("provider-gateway")
         {
             let values = step_map.get("values").unwrap().as_mapping().unwrap();
-            let credentials = values.get("credentials").unwrap().as_sequence().unwrap();
+            let credentials = values.get("providerCredentials").unwrap().as_sequence().unwrap();
 
             for cred in credentials {
-                let name = cred.get("name").unwrap().as_str().unwrap();
+                let name = cred.get("secretName").unwrap().as_str().unwrap();
                 if name == "openai-api-key" {
                     assert!(!found_openai_credential);
                     found_openai_credential = true;
@@ -134,10 +134,10 @@ fn normal_stack_unchanged_in_openai_mode() {
             && step_map.get("release").and_then(|v| v.as_str()) == Some("provider-gateway")
         {
             let values = step_map.get("values").unwrap().as_mapping().unwrap();
-            let credentials = values.get("credentials").unwrap().as_sequence().unwrap();
+            let credentials = values.get("providerCredentials").unwrap().as_sequence().unwrap();
 
             for cred in credentials {
-                let name = cred.get("name").unwrap().as_str().unwrap();
+                let name = cred.get("secretName").unwrap().as_str().unwrap();
                 assert_ne!(name, "openai-api-key");
             }
         }
@@ -226,7 +226,7 @@ spec:
         - type: helm
           release: provider-gateway
           values:
-            credentials: []
+            providerCredentials: []
     vcr-backend-openai:
       description: Existing stack
 ";
