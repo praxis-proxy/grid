@@ -23,7 +23,7 @@ use tokio::sync::Mutex;
 
 use crate::{
     crd::inference_provider::{EndpointTlsConfig, InferenceProvider, MetricSignalNames},
-    metrics_parser::{MetricNames, parse_prometheus_text},
+    metrics_parser::{MetricNames, PartialMetrics, parse_prometheus_text},
     metrics_scraper::{self, scrape_metrics},
     resources::routing_overlay::routing_identity,
 };
@@ -259,6 +259,17 @@ pub(crate) fn metric_names_from_config(
 // Timeout parsing
 // ---------------------------------------------------------------------------
 
+/// Parse a scrape, scoring neutrally when the provider's pool matched no configured signal.
+///
+/// A missing pool series is a configuration gap, not a failed scrape, so the provider
+/// stays routable, as it would with no `poolName`.
+fn parse_or_neutral(text: &str, names: &MetricNames, provider: &str) -> PartialMetrics {
+    parse_prometheus_text(text, names).unwrap_or_else(|error| {
+        tracing::warn!(provider, %error, "no configured signal for the provider's pool; scoring neutrally");
+        PartialMetrics::default()
+    })
+}
+
 /// Parse a timeout string (`"2s"`, `"500ms"`) to a [`Duration`].
 ///
 /// Supports `s` and `ms` suffixes only; minutes and bare numbers are not
@@ -458,7 +469,7 @@ pub(crate) async fn collect_provider_metrics_with_refresh_interval(
 
         let scrape_result = scrape_metrics(&url, timeout, tls_config).await;
         let parse_result = match &scrape_result {
-            Ok(text) => parse_prometheus_text(text, &names),
+            Ok(text) => Ok(parse_or_neutral(text, &names, identity)),
             Err(e) => Err(e.to_string()),
         };
         match parse_result {
@@ -653,6 +664,27 @@ pub(crate) fn classify_scrape_error(err: &metrics_scraper::MetricsScrapeError) -
 #[cfg(test)]
 mod tests {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    #[test]
+    fn a_pool_with_no_configured_signal_scores_neutrally() {
+        let names = MetricNames {
+            queue_depth: Some("llm_d_epp_average_queue_size".to_owned()),
+            pool_name: Some("pool-a".to_owned()),
+            ..Default::default()
+        };
+        let other_pool = "llm_d_epp_average_queue_size{name=\"pool-b\"} 7\n";
+        assert_eq!(
+            parse_or_neutral(other_pool, &names, "p"),
+            PartialMetrics::default(),
+            "a pool miss keeps the provider, with neutral metrics"
+        );
+        let own_pool = "llm_d_epp_average_queue_size{name=\"pool-a\"} 3\n";
+        assert_eq!(
+            parse_or_neutral(own_pool, &names, "p").queue_depth,
+            Some(3.0),
+            "a pool hit keeps its signal"
+        );
+    }
 
     use super::*;
     use crate::crd::inference_provider::MetricsConfig;
