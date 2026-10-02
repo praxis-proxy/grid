@@ -94,7 +94,7 @@
               "type": "object",
               "additionalProperties": false,
               "properties": {
-                "mode": { "type": "string", "enum": ["", "none", "api-key"], "description": "Caller authentication, required when render is true. api-key needs an image that registers identity/api-key." },
+                "mode": { "type": "string", "enum": ["", "none", "api-key"], "description": "Caller authentication, required when praxisConfig.source is render. api-key needs an image that registers identity/api-key." },
                 "allowUnauthenticatedExposure": { "type": "boolean", "description": "With mode none, allow a LoadBalancer or NodePort Service." },
                 "stripAuthorization": { "type": "boolean", "description": "Remove the caller's Authorization header before routing." },
                 "validateCA": {
