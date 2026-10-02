@@ -1,0 +1,24 @@
+# Consumer gateway (source render): callers send requests here and the chart routes them to grid sites.
+# The chart writes praxis.yaml from these values.
+fullnameOverride: grid-gateway
+grid:
+  siteName: hub
+praxisConfig:
+  source: render
+  render:
+    role: consumer
+    model: my-model
+    auth:
+      # none belongs only behind an authenticating front. Prefer api-key when the image
+      # supports it.
+      mode: none
+    backends:
+      site-a:
+        endpoint: 203.0.113.20:8080
+gridIdentity:
+  tlsSecretName: grid-site-identity
+  caSecretName: grid-ca
+networkPolicy:
+  enabled: true
+  from:
+    - podSelector: {}

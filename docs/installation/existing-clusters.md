@@ -190,7 +190,8 @@ Both topologies use the same charts:
 - `charts/grid-operator` -- AGN Operator with SWIM, CRD management
 - `charts/grid-site` -- AGN topology CRs (`GridNetwork`, `GridSite`, `InferenceProvider`)
 - `charts/grid-mock-providers` -- Mock inference backends, Services, NetworkPolicy
-- `charts/praxis-gateway` -- Praxis AI Gateway (consumer or provider role)
+- `charts/praxis-gateway` -- Praxis AI Gateway (consumer or provider role).
+  For standalone values, see `examples/helm/praxis-gateway/`.
 
 ## Security Boundary
 

@@ -477,6 +477,15 @@ try_template "$GW_DIR" "example hub-site site-praxis-gateway" --namespace grid -
 try_template "$GW_DIR" "example hub-site site-praxis-gateway spiffe" --namespace grid \
   -f "$HS_VALUES/site-praxis-gateway.yaml" --set praxisConfig.render.peerTrust.mode=spiffe --set praxisConfig.render.peerTrust.digest="" \
   --set praxisConfig.render.peerTrust.spiffeId=spiffe://grid.internal/site/hub
+# Single-gateway examples.
+GWX_VALUES="examples/helm/praxis-gateway"
+try_template "$GW_DIR" "example praxis-gateway byo" --namespace grid -f "$GWX_VALUES/byo.yaml"
+try_template "$GW_DIR" "example praxis-gateway render-consumer" --namespace grid -f "$GWX_VALUES/render-consumer.yaml"
+try_template "$GW_DIR" "example praxis-gateway render-provider" --namespace grid -f "$GWX_VALUES/render-provider.yaml" \
+  "${HS_GW_PINNED[@]}"
+try_template "$GW_DIR" "example praxis-gateway operator" --namespace grid -f "$GWX_VALUES/operator.yaml"
+try_reject_msg "$GW_DIR" "example praxis-gateway render-provider with the digest placeholder" "digest" --namespace grid \
+  -f "$GWX_VALUES/render-provider.yaml"
 try_reject_msg "$GW_DIR" "example hub-site site gateway with the digest placeholder" "digest" --namespace grid \
   -f "$HS_VALUES/site-praxis-gateway.yaml"
 try_reject_msg "charts/grid-site" "example hub-site site grid-site with the digest placeholder" "digest" \
