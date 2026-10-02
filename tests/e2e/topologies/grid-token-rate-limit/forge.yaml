@@ -408,7 +408,7 @@ spec:
               region: west
               zone: west-1
               providerSiteLabel: west
-              egress:
+              gatewayEndpoint:
                 address: "{{ captures.west.provider-gateway-ip }}:8443"
                 tls:
                   mode: Mutual
@@ -479,7 +479,7 @@ spec:
               region: central
               zone: central-1
               providerSiteLabel: central
-              egress:
+              gatewayEndpoint:
                 address: "{{ captures.central.provider-gateway-ip }}:8443"
                 tls:
                   mode: Mutual
@@ -550,7 +550,7 @@ spec:
               region: east
               zone: east-1
               providerSiteLabel: east
-              egress:
+              gatewayEndpoint:
                 address: "{{ captures.east.provider-gateway-ip }}:8443"
                 tls:
                   mode: Mutual

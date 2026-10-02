@@ -513,7 +513,7 @@ pub(crate) const SITE_JOIN_LABEL_KEY: &str = "grid.praxis-proxy.io/sjd-site";
 
 /// Egress address for the primary site (Kind east-cluster node IP + TLS port).
 ///
-/// This is metadata used to populate `GridSite.spec.egress.address` in the
+/// This is metadata used to populate `GridSite.spec.gatewayEndpoint.address` in the
 /// validation harness.  It is not connected to during the test.
 pub(crate) const SITE_JOIN_PRIMARY_EGRESS: &str = "172.18.0.4:8443";
 
@@ -4135,7 +4135,7 @@ pub(crate) fn apply_tls_verified_gridsite_for_eligibility(
     let spec_patch = serde_json::json!({
         "spec": {
             "gridNetworkRef": network_ref,
-            "egress": {
+            "gatewayEndpoint": {
                 "address": egress_addr,
                 "tls": { "mode": "Mutual", "serverName": server_name }
             },
@@ -4161,7 +4161,7 @@ pub(crate) fn apply_tls_verified_gridsite_for_eligibility(
             "metadata": { "name": site_k8s_name },
             "spec": {
                 "gridNetworkRef": network_ref,
-                "egress": {
+                "gatewayEndpoint": {
                     "address": egress_addr,
                     "tls": { "mode": "Mutual", "serverName": server_name }
                 },
@@ -5409,7 +5409,7 @@ pub(crate) fn apply_gridsite_egress(
         "metadata": { "name": site_k8s_name },
         "spec": {
             "gridNetworkRef": network_ref,
-            "egress": { "address": egress_addr, "tls": tls }
+            "gatewayEndpoint": { "address": egress_addr, "tls": tls }
         }
     }))
     .unwrap_or_else(|e| {
@@ -6143,7 +6143,7 @@ pub(crate) fn apply_gridsite(
         },
         "spec": {
             "gridNetworkRef": network_ref,
-            "egress": {
+            "gatewayEndpoint": {
                 "address": egress_addr,
                 "tls": { "mode": "Mutual" }
             }
@@ -6269,7 +6269,7 @@ pub(crate) fn wait_for_gridsite_phase(
 
 /// Verify that a `GridSite` has the expected routing-relevant spec fields set.
 ///
-/// Checks `spec.gridNetworkRef` and `spec.egress.address`, which together
+/// Checks `spec.gridNetworkRef` and `spec.gatewayEndpoint.address`, which together
 /// provide the network identity and data-plane endpoint needed for routing.
 /// The `status.phase` value is reported but not asserted here — call
 /// [`wait_for_gridsite_phase`] separately to assert the lifecycle state.
@@ -6291,7 +6291,7 @@ pub(crate) fn verify_gridsite_routing_data(
             "gridsites",
             site_name,
             "-o",
-            "jsonpath={.spec.gridNetworkRef}/{.spec.egress.address}/{.status.phase}",
+            "jsonpath={.spec.gridNetworkRef}/{.spec.gatewayEndpoint.address}/{.status.phase}",
         ])
         .output()?;
     if !out.status.success() {
@@ -6591,7 +6591,7 @@ pub(crate) fn wait_for_auto_gridsite(
                 "gridsites",
                 site_name,
                 "-o",
-                "jsonpath={.spec.gridNetworkRef}/{.spec.egress.address}",
+                "jsonpath={.spec.gridNetworkRef}/{.spec.gatewayEndpoint.address}",
                 "--ignore-not-found",
             ])
             .output()
@@ -6622,7 +6622,7 @@ pub(crate) fn wait_for_auto_gridsite(
 
 /// Verify spec and status fields of an auto-discovered `GridSite`.
 ///
-/// Checks `spec.gridNetworkRef`, `spec.egress.address`, and `status.phase`.
+/// Checks `spec.gridNetworkRef`, `spec.gatewayEndpoint.address`, and `status.phase`.
 /// The expected phase is supplied by the caller; use [`wait_for_gridsite_phase`]
 /// before calling this to ensure the operator has had time to advance the phase.
 ///
@@ -6648,7 +6648,7 @@ pub(crate) fn verify_auto_gridsite_fields(
             "gridsites",
             site_name,
             "-o",
-            "jsonpath={.spec.gridNetworkRef}/{.spec.egress.address}/{.status.phase}",
+            "jsonpath={.spec.gridNetworkRef}/{.spec.gatewayEndpoint.address}/{.status.phase}",
         ])
         .output()?;
     if !out.status.success() {
@@ -6673,7 +6673,7 @@ pub(crate) fn verify_auto_gridsite_fields(
     }
     if egress.is_empty() {
         return Err(format!(
-            "auto-discovered GridSite {site_name:?}: spec.egress.address is empty; \
+            "auto-discovered GridSite {site_name:?}: spec.gatewayEndpoint.address is empty; \
              expected the advertised gateway address"
         )
         .into());
@@ -6692,7 +6692,7 @@ pub(crate) fn verify_auto_gridsite_fields(
     Ok(())
 }
 
-/// Assert that a `GridSite`'s `spec.egress.address` equals the expected gateway address
+/// Assert that a `GridSite`'s `spec.gatewayEndpoint.address` equals the expected gateway address
 /// and is distinct from the SWIM UDP bind address.
 ///
 /// Hard-fails if the egress address equals the SWIM UDP address — that would indicate
@@ -6716,7 +6716,7 @@ pub(crate) fn verify_auto_gridsite_egress(
             "gridsites",
             site_name,
             "-o",
-            "jsonpath={.spec.egress.address}",
+            "jsonpath={.spec.gatewayEndpoint.address}",
         ])
         .output()?;
     if !out.status.success() {
@@ -6729,14 +6729,14 @@ pub(crate) fn verify_auto_gridsite_egress(
     let actual = String::from_utf8_lossy(&out.stdout).trim().to_owned();
     if actual.is_empty() {
         return Err(format!(
-            "GridSite {site_name:?}: spec.egress.address is empty; \
+            "GridSite {site_name:?}: spec.gatewayEndpoint.address is empty; \
              expected gateway address {expected_gateway_addr:?}"
         )
         .into());
     }
     if actual == swim_udp_addr {
         return Err(format!(
-            "GridSite {site_name:?}: spec.egress.address={actual:?} equals the SWIM UDP address; \
+            "GridSite {site_name:?}: spec.gatewayEndpoint.address={actual:?} equals the SWIM UDP address; \
              expected gateway address {expected_gateway_addr:?} — \
              the data-plane gateway address was not propagated through SWIM"
         )
@@ -6744,7 +6744,7 @@ pub(crate) fn verify_auto_gridsite_egress(
     }
     if actual != expected_gateway_addr {
         return Err(format!(
-            "GridSite {site_name:?}: spec.egress.address={actual:?}; \
+            "GridSite {site_name:?}: spec.gatewayEndpoint.address={actual:?}; \
              expected {expected_gateway_addr:?}"
         )
         .into());
@@ -6901,7 +6901,7 @@ pub(crate) fn patch_gridsite_identity_trust(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let patch = serde_json::json!({
         "spec": {
-            "egress": { "tls": { "mode": "Mutual", "serverName": server_name } },
+            "gatewayEndpoint": { "tls": { "mode": "Mutual", "serverName": server_name } },
             "trust": { "canonicalFingerprints": [canonical_fp] }
         }
     })

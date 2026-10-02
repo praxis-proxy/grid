@@ -1127,7 +1127,7 @@ fn assert_site_auto_discovery() -> AssertionResult {
                         "-l", "grid.praxis-proxy.io/auto-discovered=true",
                         "--context", &context,
                         "-n", GRID_SYSTEM_NS,
-                        "-o", "jsonpath={range .items[*]}{.metadata.name}\t{.status.phase}\t{.status.reason}\t{.spec.egress.address}\t{.spec.egress.tls.serverName}\t{.spec.trust.canonicalFingerprints}\n{end}",
+                        "-o", "jsonpath={range .items[*]}{.metadata.name}\t{.status.phase}\t{.status.reason}\t{.spec.gatewayEndpoint.address}\t{.spec.gatewayEndpoint.tls.serverName}\t{.spec.trust.canonicalFingerprints}\n{end}",
                     ])
                     .output()?;
                 if !output.status.success() {
@@ -4766,7 +4766,7 @@ fn prepare_setup(
 ///
 /// For each local cluster, waits for the two remote auto-discovered GridSites,
 /// verifies the SWIM-advertised certificate matches the staged identity, then
-/// patches `spec.egress.tls.serverName` and `spec.trust.canonicalFingerprints`.
+/// patches `spec.gatewayEndpoint.tls.serverName` and `spec.trust.canonicalFingerprints`.
 /// The controller transitions the site to Active naturally after the patch.
 fn authorize_discovered_sites() -> Result<(), Box<dyn std::error::Error>> {
     const TRUST_TIMEOUT: Duration = Duration::from_secs(120);
@@ -4824,7 +4824,7 @@ fn wait_for_all_discovered_sites(network: &str, timeout: Duration) -> Result<(),
                         "gridsites",
                         &name,
                         "-o",
-                        "jsonpath={.spec.gridNetworkRef}/{.spec.egress.address}",
+                        "jsonpath={.spec.gridNetworkRef}/{.spec.gatewayEndpoint.address}",
                         "--ignore-not-found",
                     ])
                     .output()?;

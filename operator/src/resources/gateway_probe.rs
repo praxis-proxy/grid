@@ -144,7 +144,9 @@ pub(crate) fn probe_transition(current_phase: &GridSitePhase, outcome: &GatewayP
             "IdentityVerificationRequired",
             "TCP endpoint is reachable but did not provide identity-verified TLS",
         ),
-        O::AddressMissing => connectivity_failure(current_phase, "EgressMissing", "no egress address configured"),
+        O::AddressMissing => {
+            connectivity_failure(current_phase, "GatewayAddressMissing", "no gateway address configured")
+        },
         O::ConnectTimeout => connectivity_failure(current_phase, "ConnectTimeout", "TCP connect timed out"),
         O::HandshakeTimeout => trust_failure("HandshakeTimeout", "TLS handshake timed out"),
         O::ConnectionFailed => connectivity_failure(current_phase, "ConnectionFailed", "TCP connection failed"),

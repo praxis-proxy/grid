@@ -2951,7 +2951,7 @@ fn discovered_site_spec(site: &DiscoveredSite, network_name: &str, plaintext: bo
             })
         };
         fields.insert(
-            "egress".to_owned(),
+            "gatewayEndpoint".to_owned(),
             serde_json::json!({ "address": site.egress_address, "tls": tls }),
         );
     }

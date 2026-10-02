@@ -472,10 +472,10 @@ A non-empty `publicCertPem` with no private-key rejection indicates:
 - The remote site is authenticated or authorized for routing.
 - The mTLS handshake has succeeded.
 
-**Identity-aware gateway verification:** For `spec.egress.tls.mode: Mutual`,
+**Identity-aware gateway verification:** For `spec.gatewayEndpoint.tls.mode: Mutual`,
 the operator performs an mTLS handshake with the advertised gateway. It verifies
 the server chain against `GridNetwork.spec.tls.caSecretRef`, verifies the DNS SAN
-against `spec.egress.tls.serverName`, proves possession of the server private key
+against `spec.gatewayEndpoint.tls.serverName`, proves possession of the server private key
 through the handshake, and checks the live leaf certificate against
 `spec.trust.canonicalFingerprints`.
 
@@ -486,7 +486,7 @@ or authorized a particular request.
 
 ```yaml
 spec:
-  egress:
+  gatewayEndpoint:
     address: provider.example.com:8443
     tls:
       mode: Mutual
