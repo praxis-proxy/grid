@@ -104,7 +104,7 @@ tests:
     template: templates/configmap.yaml
     set:
       praxisConfig.source: render
-      praxisConfig.render.localSite: hub
+      grid.siteName: hub
       praxisConfig.render.model: m
       praxisConfig.render.auth.mode: none
       praxisConfig.render.backends:
@@ -119,7 +119,7 @@ tests:
     template: templates/deployment.yaml
     set:
       praxisConfig.source: byo
-      praxisConfig.render.localSite: hub
+      grid.siteName: hub
       praxisConfig.render.model: m
       praxisConfig.render.auth.mode: none
       praxisConfig.render.backends.site-a.endpoint: 203.0.113.20:8080
@@ -159,14 +159,12 @@ tests:
     asserts:
       - notFailedTemplate: {}
 
-  - it: fails grid settings that praxisConfig.byo.inline would ignore
+  - it: accepts grid.siteName in BYO mode for overlay scope
     template: templates/deployment.yaml
     set:
-      praxisConfig.render.localSite: hub
-      praxisConfig.render.model: qwen3
+      grid.siteName: hub
     asserts:
-      - failedTemplate:
-          errorPattern: praxisConfig.render.localSite is set but praxisConfig.source is byo
+      - notFailedTemplate: {}
 
   - it: fails a model while the source is not render
     template: templates/deployment.yaml

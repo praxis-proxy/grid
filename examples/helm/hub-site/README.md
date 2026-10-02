@@ -41,7 +41,9 @@ head -c 32 /dev/urandom | kubectl -n grid create secret generic grid-swim-key --
 helm upgrade --install grid-site charts/grid-site -n grid \
   --set gridNetwork.gridId=grid-1 --set gridSite.name=hub --set peers.site-a.address=203.0.113.20:8080
 helm upgrade --install grid-gateway charts/praxis-gateway -n grid \
-  --set praxisConfig.source=render --set praxisConfig.render.localSite=hub --set praxisConfig.render.model=my-model --set praxisConfig.render.auth.mode=none \
+  --set fullnameOverride=grid-gateway --set praxisConfig.source=render --set grid.siteName=hub \
+  --set gridIdentity.secretName=grid-site-identity --set gridIdentity.caSecretName=grid-ca \
+  --set praxisConfig.render.model=my-model --set praxisConfig.render.auth.mode=none \
   --set praxisConfig.render.backends.site-a.endpoint=203.0.113.20:8080
 ```
 
@@ -67,7 +69,8 @@ helm upgrade --install grid-site charts/grid-site -n grid \
   --set inferenceProviders.my-model.endpoint=http://10.96.0.20:8000
 helm upgrade --install grid-gateway charts/praxis-gateway -n grid \
   --set image.repository=ghcr.io/praxis-proxy/grid-gateway --set image.tag=v0.1.4 \
-  --set praxisConfig.source=render --set praxisConfig.render.role=provider --set praxisConfig.render.localSite=site-a \
+  --set fullnameOverride=grid-gateway --set praxisConfig.source=render --set praxisConfig.render.role=provider --set grid.siteName=site-a \
+  --set gridIdentity.secretName=grid-site-identity --set gridIdentity.caSecretName=grid-ca \
   --set praxisConfig.render.peerTrust.digest="$HUB_DIGEST" --set praxisConfig.render.backends.local.endpoint=10.96.0.20:8000
 ```
 
@@ -82,7 +85,7 @@ An invite expires after a day by default, and an unredeemed one stays in place. 
 - grid-enrollment: `host` joins the serving cert names, is the default Route host, and makes the enrollment Service a LoadBalancer when no Route renders. An invite's `network` defaults to `grid`.
 - grid-operator with `enrollment.enabled`: the site name follows `swim.siteName`, the URL is the in-cluster grid-enrollment Service, the CA bundle is Secret `grid-ca-bundle`, the token is `grid-invite-<site>`, the SWIM Service is a LoadBalancer, the gateway Service is `grid-gateway`, and the render refuses Secret access in `grid-enrollment`.
 - grid-site: the network is `grid`. Listing `peers` turns on site discovery and the TLS Secrets the operator writes. A peer's probe name is `<name>.grid.internal`.
-- praxis-gateway: it renders its own config without a BYO ConfigMap. A grid gateway, a provider or a consumer with site backends, mounts `grid-site-identity` and `grid-ca` and takes its release name. A site backend uses mutual TLS to `<site>.grid.internal`. A provider's Service is a LoadBalancer, and `local` is its one plaintext backend.
+- praxis-gateway: it renders its own config without a BYO ConfigMap. Set `gridIdentity.secretName` to `grid-site-identity` and `gridIdentity.caSecretName` to `grid-ca` for mTLS. A site backend uses mutual TLS to `<site>.grid.internal`. A provider's Service is a LoadBalancer, and `local` is its one plaintext backend.
 
 ## Credential Delivery
 

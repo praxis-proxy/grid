@@ -19,9 +19,8 @@ imagePullSecrets: []
 
 # -- Override the chart name used in resource names.
 nameOverride: ""
-# -- Override the fully qualified app name, which also names the Service. Empty keeps
-# the release-based name: {release}-praxis-gateway, or the release name when it already
-# contains the chart name or the gateway is a grid gateway.
+# -- Override the fully qualified app name, which also names the Service. Set this to
+# the GridNetwork gatewayRefs[].name when using the overlay sidecar.
 fullnameOverride: ""
 # -- Labels added to all chart-managed resources.
 commonLabels: {}
@@ -79,6 +78,13 @@ log:
   level: ""
   # -- Full RUST_LOG directive, such as "info,praxis_filter=debug". When set, it replaces level.
   filter: ""
+
+# -- GridNetwork and local site used by render and the overlay sidecar.
+grid:
+  # -- GridNetwork name. Required when the overlay sidecar is enabled.
+  networkName: ""
+  # -- This gateway's site. Required for render and when the overlay sidecar is enabled.
+  siteName: ""
 
 # -- Praxis configuration (praxis.yaml). source selects who writes the file. Render is
 # explicit; Grid routing values do not change the selected source.
@@ -185,8 +191,6 @@ praxisConfig:
         - /v1/completions
         - /v1/models
         - /v1/embeddings
-    # -- This gateway's site name, required when source is render.
-    localSite: ""
     # -- Model advertised on the routing candidates. A consumer without gridServing needs it.
     model: ""
     auth:
@@ -217,14 +221,14 @@ praxisConfig:
       # store for the process: the validate call and https backends without a per-backend CA
       # or upstreamCA use it; mutual_tls backends and upstreamCA do not. Build the bundle as
       # the image's /etc/ssl/certs/ca-certificates.crt plus the service CA, or set upstreamCA
-      # for public https backends. Set configMap or secret, not both. Empty keeps the
+      # for public https backends. Set configMapName or secretName, not both. Empty keeps the
       # platform store.
       validateCA:
         # -- ConfigMap holding the bundle (for example one annotated
         # service.beta.openshift.io/inject-cabundle, key service-ca.crt).
-        configMap: ""
+        configMapName: ""
         # -- Secret holding the bundle.
-        secret: ""
+        secretName: ""
         # -- Key holding the PEM bundle.
         key: "ca.crt"
         # -- Mount path for the bundle.
@@ -233,20 +237,10 @@ praxisConfig:
       prefix: "Bearer "
       # -- Validate call timeout (seconds).
       timeoutSecs: 5
-    # -- CA bundle for backend TLS without a per-cluster CA. Sets praxis upstream_ca_file,
-    # which replaces the system trust store for proxied upstreams. It does not apply to the
-    # api-key validate call; use auth.validateCA for that.
-    upstreamCA:
-      # -- Existing Secret holding the CA bundle. Empty keeps the system trust store.
-      secretName: ""
-      # -- Key within the Secret that holds the PEM bundle.
-      key: "ca.crt"
-      # -- Mount path for the CA bundle.
-      mountPath: "/etc/praxis/upstream-ca"
     # -- Backend clusters. Each renders a health_check so a literal ClusterIP routes without
     # allow_private_upstreams, plus an explicit transport. A backend omitting transport
-    # defaults to mutual_tls when the grid identity is mounted (tls.enabled), else plaintext.
-    # mutual_tls presents that identity (tls.mountPath tls.crt/tls.key, verified against its
+    # defaults to mutual_tls when gridIdentity.secretName is set, else plaintext.
+    # mutual_tls presents that identity (gridIdentity.mountPath tls.crt/tls.key, verified against its
     # ca.crt) and needs a sni naming the peer. tls verifies the backend's server cert with
     # no client cert: sni defaults to the endpoint host. Its trust, first match wins:
     # transport.ca (a ConfigMap or Secret), then upstreamCA (upstream_ca_file), then the
@@ -275,22 +269,30 @@ praxisConfig:
     #    transport:
     #      mode: tls
     #      sni: qwen3-kserve-workload-svc.llm.svc
-    #      ca: { configMap: openshift-service-ca.crt, key: service-ca.crt }
+    #      ca: { configMapName: openshift-service-ca.crt, key: service-ca.crt }
+
+# -- CA bundle for backend TLS without a per-cluster CA. Empty secretName keeps the system
+# trust store. `render` writes upstream_ca_file; with `byo`, set runtime.upstream_ca_file in
+# your praxis.yaml. Not supported with `operator`.
+upstreamCA:
+  # -- Secret holding the CA bundle. Empty turns upstreamCA off.
+  secretName: ""
+  # -- Key within the Secret that holds the PEM bundle.
+  key: "ca.crt"
+  # -- Mount path for the CA bundle.
+  mountPath: "/etc/praxis/upstream-ca"
 
 # -- Inbound TLS on the gateway listener. The default posture assumes an inbound TLS
 # front (an OpenShift Route or a Gateway) terminates TLS and forwards to this plaintext
-# listener. Enable to terminate TLS at the gateway itself from a mounted server cert
-# (tls.crt/tls.key in the Secret). Works with source render and with a BYO config, which
-# must reference mountPath (a BYO config moving off tls.enabled must change its listener
-# cert paths to it). Not supported with source operator: the operator's praxis.yaml has
-# no listener TLS. Enabling it names the container port https. On OpenShift, set
+# listener. Set secretName to terminate TLS from a mounted server cert (tls.crt/tls.key).
+# Works with source render and BYO; a BYO praxis.yaml must reference mountPath. Not
+# supported with source operator. A non-empty secretName names the container port https.
+# On OpenShift, set
 # service.annotations service.beta.openshift.io/serving-cert-secret-name to the Secret
 # name and the service CA issues the cert.
 listenerTls:
-  # -- Terminate TLS at the gateway listener instead of at an inbound front.
-  enabled: false
-  # -- Existing Secret holding the server certificate (tls.crt) and key (tls.key).
-  existingSecret: ""
+  # -- Secret holding the server certificate and key. Empty keeps the listener plaintext.
+  secretName: ""
   # -- Mount path for the listener certificate.
   mountPath: "/etc/praxis/listener-tls"
 
@@ -298,7 +300,7 @@ listenerTls:
 port:
   # -- Container port number.
   containerPort: 8080
-  # -- Port name. Empty: https when listenerTls.enabled, else http.
+  # -- Port name. Empty: https when listenerTls.secretName is set, else http.
   name: ""
   # -- Port protocol.
   protocol: "TCP"
@@ -375,27 +377,18 @@ route:
     # listener cert is the one the Service's serving-cert-secret-name annotation issues.
     destinationCACertificate: ""
 
-# -- Optional routing overlay ConfigMap mount, as published by the AGN operator for
-# its edge gateways.
+# -- Optional operator-produced routing overlay for BYO praxis.yaml. Setting configMapName
+# turns it on; render and operator sources reject overlays because their praxis.yaml does
+# not read overlay_file.
 overlay:
-  # -- Enable overlay ConfigMap mount.
-  enabled: false
-  # -- Name of the existing overlay ConfigMap.
-  existingConfigMap: ""
-  # -- Mount path for overlay files.
+  # -- Name of the operator-produced overlay ConfigMap. Empty turns overlay delivery off.
+  configMapName: ""
+  # -- Directory where praxis.yaml reads routing-overlay.json.
   mountPath: "/etc/praxis/routing"
-  # -- Items to project from the ConfigMap (used when sidecar is disabled).
-  items:
-    - key: "routing-config.json"
-      path: "routing-config.json"
-    - key: "routing-overlay.json"
-      path: "routing-overlay.json"
-  # -- Overlay sync sidecar settings. When enabled, the sidecar watches the
-  # ConfigMap via the Kubernetes API and writes validated overlays to a shared
-  # emptyDir, replacing the kubelet volume sync.
+  # -- Overlay sync sidecar settings.
   sidecar:
-    # -- Enable the overlay-sync sidecar.
-    enabled: false
+    # -- Run overlay-sync. False mounts routing-overlay.json directly, without validation or RBAC.
+    enabled: true
     # -- Sidecar container image.
     image:
       # -- Image repository.
@@ -407,10 +400,6 @@ overlay:
       pullPolicy: IfNotPresent
     # -- ConfigMap data key containing the overlay envelope.
     dataKey: "routing-overlay.json"
-    # -- Expected GridNetwork name for scope validation.
-    expectedNetwork: ""
-    # -- Expected local site name for scope validation.
-    expectedLocalSite: ""
     # -- Sidecar resource requests and limits.
     resources:
       requests:
@@ -440,23 +429,21 @@ gridServing:
     # -- Prefix affinity.
     prefixAffinity: {}
 
-# -- Optional TLS Secret mounted at tls.mountPath: the grid site identity, or a client
-# identity for upstream mTLS that the Praxis config references.
-tls:
-  # -- Enable TLS Secret mount.
-  enabled: false
-  # -- Name of the existing TLS Secret, the site identity the grid operator writes.
-  existingSecret: grid-site-identity
-  # -- Secret holding the Grid CA (ca.crt), projected beside existingSecret. A provider defaults to grid-ca.
-  caSecret: ""
+# -- Grid identity Secret used for mTLS to backends and peer gateways. It must contain
+# tls.crt and tls.key. Empty turns the identity off. The Grid operator keeps the public
+# CA in a separate Secret; set caSecretName to that Secret name.
+gridIdentity:
+  # -- Secret holding the client certificate and key.
+  secretName: ""
+  # -- Secret holding ca.crt. Defaults to secretName; set this when the Grid CA is separate.
+  caSecretName: ""
   # -- Mount path for TLS files.
   mountPath: "/etc/praxis/tls"
 
-# -- Existing Secrets mounted read-only into the Praxis container, for example
-# upstream API credentials that the Praxis config references.
-credentials: []
-# - name: upstream-api-key
-#   mountPath: /etc/praxis/credentials/upstream
+# -- Provider credential Secrets referenced by InferenceProvider CRs.
+providerCredentials: []
+# - secretName: openai-api-key
+#   # mountPath defaults to /run/secrets/grid-credentials/openai-api-key
 #   optional: false
 
 # -- Probe configuration.

@@ -21,35 +21,6 @@
       "required": [
         "source"
       ],
-      "allOf": [
-        {
-          "if": {
-            "required": [
-              "source"
-            ],
-            "properties": {
-              "source": {
-                "const": "render"
-              }
-            }
-          },
-          "then": {
-            "properties": {
-              "render": {
-                "required": [
-                  "localSite"
-                ],
-                "properties": {
-                  "localSite": {
-                    "minLength": 1,
-                    "pattern": "\\S"
-                  }
-                }
-              }
-            }
-          }
-        }
-      ],
       "properties": {
         "source": {
           "type": "string",
@@ -347,11 +318,6 @@
                 }
               }
             },
-            "localSite": {
-              "type": "string",
-              "maxLength": 256,
-              "description": "This gateway's site name, required when render is true."
-            },
             "model": {
               "type": "string"
             },
@@ -381,10 +347,10 @@
                   "additionalProperties": false,
                   "description": "CA for the validate call, set as SSL_CERT_FILE (replaces the platform trust store).",
                   "properties": {
-                    "configMap": {
+                    "configMapName": {
                       "type": "string"
                     },
-                    "secret": {
+                    "secretName": {
                       "type": "string"
                     },
                     "key": {
@@ -411,22 +377,6 @@
                 }
               }
             },
-            "upstreamCA": {
-              "type": "object",
-              "additionalProperties": false,
-              "description": "CA bundle for backend TLS without a per-cluster CA. Sets praxis upstream_ca_file; the api-key validate call uses the platform trust store.",
-              "properties": {
-                "secretName": {
-                  "type": "string"
-                },
-                "key": {
-                  "type": "string"
-                },
-                "mountPath": {
-                  "type": "string"
-                }
-              }
-            },
             "backends": {
               "description": "Backends keyed by site, local for a provider's backend, or the older list of {cluster, endpoints}.",
               "oneOf": [
@@ -448,7 +398,7 @@
                       "site": {
                         "type": "string",
                         "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$",
-                        "description": "Grid site this backend serves. Required for a consumer's remote mutual_tls backend. Defaults to localSite."
+                        "description": "Grid site this backend serves. Required for a consumer's remote mutual_tls backend. Defaults to grid.siteName."
                       },
                       "endpoints": {
                         "type": "array",
@@ -506,7 +456,7 @@
                       "transport": {
                         "type": "object",
                         "additionalProperties": false,
-                        "description": "Upstream transport. Defaults to mutual_tls when tls.enabled, else plaintext.",
+                        "description": "Upstream transport. Defaults to mutual_tls when gridIdentity.secretName is set, else plaintext. mutual_tls also needs gridIdentity.caSecretName.",
                         "properties": {
                           "mode": {
                             "type": "string",
@@ -524,10 +474,10 @@
                             "additionalProperties": false,
                             "description": "tls only: CA bundle that verifies this backend.",
                             "properties": {
-                              "configMap": {
+                              "configMapName": {
                                 "type": "string"
                               },
-                              "secret": {
+                              "secretName": {
                                 "type": "string"
                               },
                               "key": {
@@ -537,26 +487,26 @@
                             "oneOf": [
                               {
                                 "required": [
-                                  "configMap"
+                                  "configMapName"
                                 ],
                                 "properties": {
-                                  "configMap": {
+                                  "configMapName": {
                                     "minLength": 1
                                   },
-                                  "secret": {
+                                  "secretName": {
                                     "maxLength": 0
                                   }
                                 }
                               },
                               {
                                 "required": [
-                                  "secret"
+                                  "secretName"
                                 ],
                                 "properties": {
-                                  "secret": {
+                                  "secretName": {
                                     "minLength": 1
                                   },
-                                  "configMap": {
+                                  "configMapName": {
                                     "maxLength": 0
                                   }
                                 }
@@ -624,7 +574,7 @@
                   "site": {
                     "type": "string",
                     "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$",
-                    "description": "Grid site this backend serves. Required for a consumer's remote mutual_tls backend. Defaults to localSite."
+                    "description": "Grid site this backend serves. Required for a consumer's remote mutual_tls backend. Defaults to grid.siteName."
                   },
                   "endpoints": {
                     "type": "array",
@@ -682,7 +632,7 @@
                   "transport": {
                     "type": "object",
                     "additionalProperties": false,
-                    "description": "Upstream transport. Defaults to mutual_tls when tls.enabled, else plaintext.",
+                    "description": "Upstream transport. Defaults to mutual_tls when gridIdentity.secretName is set, else plaintext. mutual_tls also needs gridIdentity.caSecretName.",
                     "properties": {
                       "mode": {
                         "type": "string",
@@ -700,10 +650,10 @@
                         "additionalProperties": false,
                         "description": "tls only: CA bundle that verifies this backend.",
                         "properties": {
-                          "configMap": {
+                          "configMapName": {
                             "type": "string"
                           },
-                          "secret": {
+                          "secretName": {
                             "type": "string"
                           },
                           "key": {
@@ -713,26 +663,26 @@
                         "oneOf": [
                           {
                             "required": [
-                              "configMap"
+                              "configMapName"
                             ],
                             "properties": {
-                              "configMap": {
+                              "configMapName": {
                                 "minLength": 1
                               },
-                              "secret": {
+                              "secretName": {
                                 "maxLength": 0
                               }
                             }
                           },
                           {
                             "required": [
-                              "secret"
+                              "secretName"
                             ],
                             "properties": {
-                              "secret": {
+                              "secretName": {
                                 "minLength": 1
                               },
-                              "configMap": {
+                              "configMapName": {
                                 "maxLength": 0
                               }
                             }
@@ -766,12 +716,41 @@
     "listenerTls": {
       "type": "object",
       "additionalProperties": false,
-      "description": "Optional inbound TLS on the gateway listener. Default posture assumes an inbound TLS front terminates TLS.",
+      "description": "Optional inbound TLS on the gateway listener. A non-empty secretName turns it on.",
       "properties": {
-        "enabled": {
-          "type": "boolean"
+        "secretName": {
+          "type": "string"
         },
-        "existingSecret": {
+        "mountPath": {
+          "type": "string"
+        }
+      }
+    },
+    "grid": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "networkName": {
+          "type": "string",
+          "pattern": "^([a-z0-9]([-a-z0-9]*[a-z0-9])?)?$",
+          "description": "GridNetwork name used by the overlay sidecar."
+        },
+        "siteName": {
+          "type": "string",
+          "pattern": "^([a-z0-9]([-a-z0-9]*[a-z0-9])?)?$",
+          "description": "This gateway's Grid site name."
+        }
+      }
+    },
+    "upstreamCA": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "CA bundle for backend TLS without a per-cluster CA. Not used with operator source.",
+      "properties": {
+        "secretName": {
+          "type": "string"
+        },
+        "key": {
           "type": "string"
         },
         "mountPath": {
@@ -1107,7 +1086,7 @@
         },
         "name": {
           "type": "string",
-          "description": "Port name. Empty: https when listenerTls.enabled, else http."
+          "description": "Port name. Empty: https when listenerTls.secretName is set, else http."
         },
         "protocol": {
           "type": "string",
@@ -1199,37 +1178,13 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "enabled": {
-          "type": "boolean",
-          "description": "Enable overlay ConfigMap mount."
-        },
-        "existingConfigMap": {
+        "configMapName": {
           "type": "string",
-          "description": "Name of the existing overlay ConfigMap."
+          "description": "Name of the operator-produced overlay ConfigMap. A non-empty name enables overlay delivery; only for BYO source."
         },
         "mountPath": {
           "type": "string",
-          "description": "Mount path for overlay files."
-        },
-        "items": {
-          "type": "array",
-          "items": {
-            "type": "object",
-            "additionalProperties": false,
-            "required": [
-              "key",
-              "path"
-            ],
-            "properties": {
-              "key": {
-                "type": "string"
-              },
-              "path": {
-                "type": "string"
-              }
-            }
-          },
-          "description": "Items to project from the ConfigMap."
+          "description": "Directory where praxis reads routing-overlay.json."
         },
         "sidecar": {
           "type": "object",
@@ -1266,14 +1221,6 @@
             "dataKey": {
               "type": "string",
               "description": "ConfigMap data key containing the overlay envelope."
-            },
-            "expectedNetwork": {
-              "type": "string",
-              "description": "Expected GridNetwork name for scope validation."
-            },
-            "expectedLocalSite": {
-              "type": "string",
-              "description": "Expected local site name for scope validation."
             },
             "resources": {
               "type": "object",
@@ -1380,22 +1327,18 @@
         }
       }
     },
-    "tls": {
+    "gridIdentity": {
       "type": "object",
       "additionalProperties": false,
+      "description": "Grid identity Secret with tls.crt and tls.key. The CA may be in a separate Secret.",
       "properties": {
-        "enabled": {
-          "type": "boolean",
-          "description": "Enable TLS Secret mount."
-        },
-        "existingSecret": {
+        "secretName": {
           "type": "string",
-          "description": "Name of the existing TLS Secret."
+          "description": "Secret holding the client certificate and key."
         },
-        "caSecret": {
+        "caSecretName": {
           "type": "string",
-          "pattern": "^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*)?$",
-          "description": "Secret holding ca.crt (the Grid CA), projected beside existingSecret."
+          "description": "Secret holding ca.crt. Defaults to secretName when empty."
         },
         "mountPath": {
           "type": "string",
@@ -1403,17 +1346,16 @@
         }
       }
     },
-    "credentials": {
+    "providerCredentials": {
       "type": "array",
       "items": {
         "type": "object",
         "additionalProperties": false,
         "required": [
-          "name",
-          "mountPath"
+          "secretName"
         ],
         "properties": {
-          "name": {
+          "secretName": {
             "type": "string",
             "minLength": 1,
             "description": "Secret name."
@@ -1421,7 +1363,7 @@
           "mountPath": {
             "type": "string",
             "minLength": 1,
-            "description": "Mount path for the credential Secret."
+            "description": "Mount path for the credential Secret. Defaults to /run/secrets/grid-credentials/<secretName>."
           },
           "optional": {
             "type": "boolean",

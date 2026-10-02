@@ -115,7 +115,7 @@ class H(http.server.BaseHTTPRequestHandler):
         self.reply({"authorization": self.headers.get("Authorization")})
 http.server.HTTPServer(("0.0.0.0", 8000), H).serve_forever()' >/dev/null
 BASE=(
-  --set praxisConfig.source=render --set praxisConfig.render.localSite=hub --set praxisConfig.render.model=qwen3
+  --set praxisConfig.source=render --set grid.siteName=hub --set praxisConfig.render.model=qwen3
   --set "praxisConfig.render.backends[0].cluster=site-a"
   --set "praxisConfig.render.backends[0].transport.mode=plaintext"
   --set "praxisConfig.render.backends[0].endpoints[0]=$(ip "$NET-backend"):8000"
@@ -164,11 +164,11 @@ ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); ctx.load_cert_chain("/ca/tls.crt"
 server = http.server.HTTPServer(("0.0.0.0", 8443), H)
 server.socket = ctx.wrap_socket(server.socket, server_side=True)
 server.serve_forever()' >/dev/null
-TLS_BACKEND=(--set praxisConfig.source=render --set praxisConfig.render.localSite=hub --set praxisConfig.render.model=qwen3 --set praxisConfig.render.auth.mode=none
+TLS_BACKEND=(--set praxisConfig.source=render --set grid.siteName=hub --set praxisConfig.render.model=qwen3 --set praxisConfig.render.auth.mode=none
   --set "praxisConfig.render.backends[0].cluster=kserve" --set "praxisConfig.render.backends[0].endpoints[0]=$(ip "$NET-tls-backend"):8443"
   --set "praxisConfig.render.backends[0].transport.mode=tls" --set "praxisConfig.render.backends[0].transport.sni=tls-backend")
 render "$WORK/tls" "${TLS_BACKEND[@]}" \
-  --set "praxisConfig.render.backends[0].transport.ca.configMap=service-ca" --set "praxisConfig.render.backends[0].transport.ca.key=service-ca.crt"
+  --set "praxisConfig.render.backends[0].transport.ca.configMapName=service-ca" --set "praxisConfig.render.backends[0].transport.ca.key=service-ca.crt"
 # Docker cannot create a mountpoint inside the read-only /etc/praxis mount.
 mkdir -p "$WORK/tls/backend-ca/0"
 if "$CRT" run --rm -v "$WORK/tls:/etc/praxis:ro,z" -v "$bca:/etc/praxis/backend-ca/0:ro,z" "$DEFAULT_GATEWAY_IMAGE" \
@@ -233,7 +233,7 @@ S(("0.0.0.0", 9443), H).serve_forever()' >/dev/null
     --set praxisConfig.render.auth.validateUrl=https://validate:9443/v)
 
   render "$WORK/apikey" "${BASE[@]}" "${APIKEY[@]}" \
-    --set praxisConfig.render.auth.validateCA.configMap=service-ca --set praxisConfig.render.auth.validateCA.key=service-ca.crt
+    --set praxisConfig.render.auth.validateCA.configMapName=service-ca --set praxisConfig.render.auth.validateCA.key=service-ca.crt
   port=$(gateway apikey "$API_KEY_IMAGE" "$API_KEY_IMAGE_CONFIG_FLAG" "$WORK/apikey" "$ca")
   wait_up "$port" -H 'Authorization: Bearer sk-good' || fail "api-key: gateway never answered"
   check "api-key: no key gets 401" 401 "$(chat "$port")"

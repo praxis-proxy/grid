@@ -597,7 +597,7 @@ spec:
         - type: helm
           release: provider-gateway
           chart: charts/praxis-gateway
-          version: "0.1.0"
+          version: "0.1.5"
           namespace: grid-system
           values:
             fullnameOverride: "provider-gateway"
@@ -635,11 +635,11 @@ spec:
                   port: "https-mtls"
                 initialDelaySeconds: 5
                 periodSeconds: 10
-            tls:
-              enabled: true
-              existingSecret: "provider-gateway-tls"
-            credentials:
-              - name: "vcr-inference-credential"
+            gridIdentity:
+              secretName: "provider-gateway-tls"
+              caSecretName: "grid-ca"
+            providerCredentials:
+              - secretName: "vcr-inference-credential"
                 mountPath: "/etc/praxis/credentials/vcr-inference"
             podLabels:
               grid.praxis.fast/backend-access: "provider-gateway"
@@ -687,7 +687,7 @@ spec:
         - type: helm
           release: consumer-gateway-a
           chart: charts/praxis-gateway
-          version: "0.1.0"
+          version: "0.1.5"
           namespace: grid-system
           values:
             fullnameOverride: "consumer-gateway-a"
@@ -711,20 +711,20 @@ spec:
                     name: valkey-auth
                     key: url
             service: { type: LoadBalancer }
+            grid:
+              networkName: grid-token-rate-limit
+              siteName: "{{ cluster.name }}"
             overlay:
-              enabled: true
-              existingConfigMap: "grid-overlay-grid-token-rate-limit-consumer-gateway-a"
+              configMapName: "grid-overlay-grid-token-rate-limit-consumer-gateway-a"
               sidecar:
                 enabled: true
                 image:
                   repository: "{{ cluster.properties.overlaySyncImageRepo }}"
                   tag: "{{ cluster.properties.overlaySyncImageTag }}"
                   pullPolicy: "{{ cluster.properties.imagePullPolicy }}"
-                expectedNetwork: "grid-token-rate-limit"
-                expectedLocalSite: "{{ cluster.name }}"
-            tls:
-              enabled: true
-              existingSecret: consumer-gateway-tls
+            gridIdentity:
+              secretName: consumer-gateway-tls
+              caSecretName: "grid-ca"
             podLabels:
               grid.praxis.fast/consumer-site: "{{ cluster.name }}"
               grid.praxis.fast/quota-client: "true"
@@ -753,7 +753,7 @@ spec:
         - type: helm
           release: consumer-gateway-b
           chart: charts/praxis-gateway
-          version: "0.1.0"
+          version: "0.1.5"
           namespace: grid-system
           values:
             fullnameOverride: "consumer-gateway-b"
@@ -777,20 +777,20 @@ spec:
                     name: valkey-auth
                     key: url
             service: { type: LoadBalancer }
+            grid:
+              networkName: grid-token-rate-limit
+              siteName: "{{ cluster.name }}"
             overlay:
-              enabled: true
-              existingConfigMap: "grid-overlay-grid-token-rate-limit-consumer-gateway-b"
+              configMapName: "grid-overlay-grid-token-rate-limit-consumer-gateway-b"
               sidecar:
                 enabled: true
                 image:
                   repository: "{{ cluster.properties.overlaySyncImageRepo }}"
                   tag: "{{ cluster.properties.overlaySyncImageTag }}"
                   pullPolicy: "{{ cluster.properties.imagePullPolicy }}"
-                expectedNetwork: "grid-token-rate-limit"
-                expectedLocalSite: "{{ cluster.name }}"
-            tls:
-              enabled: true
-              existingSecret: consumer-gateway-tls
+            gridIdentity:
+              secretName: consumer-gateway-tls
+              caSecretName: "grid-ca"
             podLabels:
               grid.praxis.fast/consumer-site: "{{ cluster.name }}"
               grid.praxis.fast/quota-client: "true"

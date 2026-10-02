@@ -8,11 +8,10 @@ release:
 set:
   image.flavor: grid-gateway
   praxisConfig.source: render
-  praxisConfig.render.localSite: hub
+  grid.siteName: hub
   praxisConfig.render.auth.mode: none
-  tls.enabled: true
-  tls.existingSecret: grid-site-identity
-  tls.caSecret: grid-ca
+  gridIdentity.secretName: grid-site-identity
+  gridIdentity.caSecretName: grid-ca
   gridServing.enabled: true
   gridServing.network: grid
   praxisConfig.render.backends:
