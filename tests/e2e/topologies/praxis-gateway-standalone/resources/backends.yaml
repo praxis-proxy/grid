@@ -1,0 +1,145 @@
+# Two plain HTTP backends that answer every request with their own name, so a
+# response shows which backend the gateway picked.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: backend-a
+  namespace: praxis-backends
+data:
+  index.html: |
+    backend-a
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend-a
+  namespace: praxis-backends
+  labels:
+    app: backend-a
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: backend-a
+  template:
+    metadata:
+      labels:
+        app: backend-a
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: httpd
+          image: docker.io/library/busybox:1.37
+          command: ["httpd", "-f", "-v", "-p", "8080", "-h", "/www"]
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 2
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: www
+              mountPath: /www
+              readOnly: true
+      volumes:
+        - name: www
+          configMap:
+            name: backend-a
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend-a
+  namespace: praxis-backends
+spec:
+  selector:
+    app: backend-a
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: backend-b
+  namespace: praxis-backends
+data:
+  index.html: |
+    backend-b
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend-b
+  namespace: praxis-backends
+  labels:
+    app: backend-b
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: backend-b
+  template:
+    metadata:
+      labels:
+        app: backend-b
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: httpd
+          image: docker.io/library/busybox:1.37
+          command: ["httpd", "-f", "-v", "-p", "8080", "-h", "/www"]
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 2
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: www
+              mountPath: /www
+              readOnly: true
+      volumes:
+        - name: www
+          configMap:
+            name: backend-b
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend-b
+  namespace: praxis-backends
+spec:
+  selector:
+    app: backend-b
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http

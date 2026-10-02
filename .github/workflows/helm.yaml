@@ -144,6 +144,9 @@ jobs:
             helm template validate-schema "$chart" --namespace grid-system "${EXTRA_ARGS[@]}" \
               | kubeconform -strict -kubernetes-version 1.30.0 -skip CustomResourceDefinition -summary
           done
+          echo "--- Validating charts/praxis-gateway (standalone, no values) ---"
+          helm template validate-schema charts/praxis-gateway --namespace praxis \
+            | kubeconform -strict -kubernetes-version 1.30.0 -summary
 
       - name: Upload rendered manifests
         if: always()
@@ -242,7 +245,7 @@ jobs:
 
   # ----------------------------------------------------------------------------
   # Kind chart lifecycle test (install/upgrade/uninstall wiring with pause:3.9;
-  # real Praxis runtime behavior is proven by the GLB demo)
+  # real Praxis runtime behavior is proven by gateway-standalone and the GLB demo)
   # ----------------------------------------------------------------------------
 
   kind:
@@ -368,6 +371,66 @@ jobs:
         with:
           name: helm-upgrade-logs-${{ matrix.helm }}
           path: /tmp/helm-upgrade-logs/
+          if-no-files-found: ignore
+          retention-days: 5
+
+  # ----------------------------------------------------------------------------
+  # Standalone praxis-gateway e2e: Forge brings up a Kind cluster with no Grid
+  # components, installs the chart with no values, reconfigures it several
+  # ways, and checks real requests through Praxis after every change.
+  # ----------------------------------------------------------------------------
+
+  gateway-standalone:
+    needs: changes
+    if: needs.changes.outputs.runtime == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@6190aa5fb88a88ee71c12769924bbe63a9ab152e # 1.96.0
+
+      # Per-job key, dependencies only; PRs restore main's cache and never save.
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build forge
+        run: cargo build -p forge --bin praxis-forge
+
+      - name: Install Helm
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      - name: Install Kind
+        run: |
+          curl -fsSL -o /tmp/kind \
+            "https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}/kind-linux-amd64"
+          echo "50030de23cf40a18505f20426f6a8506bedf13c6e509244bd1fa9463721b0f54  /tmp/kind" | sha256sum -c
+          sudo install -m 0755 /tmp/kind /usr/local/bin/kind
+          rm /tmp/kind
+          kind version
+
+      - name: Run the standalone gateway e2e through Forge
+        env:
+          FORGE_BIN: ${{ github.workspace }}/target/debug/praxis-forge
+        run: ./scripts/e2e-praxis-gateway.sh
+
+      - name: Upload e2e logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: gateway-standalone-e2e
+          path: |
+            target/forge/praxis-gateway-standalone/verify.log
+            target/forge/praxis-gateway-standalone/diagnostics/
           if-no-files-found: ignore
           retention-days: 5
 

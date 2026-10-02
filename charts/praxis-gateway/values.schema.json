@@ -284,6 +284,33 @@
         }
       }
     },
+    "imageUser": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Numeric runAsUser and runAsGroup for the Praxis container when podSecurityContext sets no runAsUser. A podSecurityContext runAsGroup replaces gid.",
+      "required": ["uid", "gid"],
+      "properties": {
+        "enabled": {
+          "enum": [true, false, "true", "false", "auto"],
+          "description": "auto applies uid and gid to the official praxis-proxy ai, praxis, and grid-gateway images (not -fips tags), except when security.openshift.io/v1 is served. true applies them to any image."
+        },
+        "uid": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "runAsUser for the Praxis container."
+        },
+        "gid": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "runAsGroup for the Praxis container."
+        }
+      }
+    },
+    "command": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "description": "Container command, replacing the image entrypoint. Empty keeps the entrypoint."
+    },
     "args": {
       "type": "array",
       "items": { "type": "string" },
@@ -326,16 +353,19 @@
     "config": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["existingConfigMap"],
       "properties": {
         "existingConfigMap": {
           "type": "string",
-          "description": "Name of an existing ConfigMap containing the Praxis configuration."
+          "description": "Name of an existing ConfigMap containing the Praxis configuration. Takes precedence over inline."
         },
         "key": {
           "type": "string",
           "minLength": 1,
           "description": "Key within the ConfigMap that holds praxis.yaml."
+        },
+        "inline": {
+          "type": "string",
+          "description": "Praxis configuration stored in a chart-managed ConfigMap when neither existingConfigMap nor gatewayConfig.render is set."
         }
       }
     },
@@ -544,6 +574,17 @@
           "description": "Liveness probe settings. Null to disable."
         }
       }
+    },
+    "shutdownDelaySeconds": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 25,
+      "description": "Seconds a terminating pod keeps serving before Praxis gets SIGTERM, as a preStop sleep. 0 disables it, which an image without a sleep binary needs."
+    },
+    "terminationGracePeriodSeconds": {
+      "type": ["integer", "null"],
+      "minimum": 1,
+      "description": "Seconds Kubernetes gives a terminating pod before killing it. Null: 30 plus shutdownDelaySeconds."
     },
     "resources": {
       "type": "object",

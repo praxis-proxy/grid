@@ -1,0 +1,244 @@
+apiVersion: forge.praxis.dev/v1alpha1
+kind: Environment
+
+# One Kind cluster with no Grid components: the praxis-gateway chart on its own,
+# reconfigured stage by stage, with real requests checked after every change.
+# Run it with scripts/e2e-praxis-gateway.sh from the repository root, which
+# runs `up` to create the cluster and `apply gateway` to run the stacks.
+
+metadata:
+  name: praxis-gateway-standalone
+
+spec:
+  runtime:
+    provider: auto
+    clusterPrefix: praxis-standalone
+
+  network:
+    crossCluster: false
+
+  clusters:
+    - name: gateway
+      stacks:
+        - backends
+        - gateway-default
+        - gateway-inline-v1
+        - gateway-inline-v2
+        - gateway-existing-configmap
+        - gateway-core-image
+        - release-checks
+      properties:
+        kubeContext: kind-praxis-standalone-gateway
+        coreImageRepo: ghcr.io/praxis-proxy/praxis
+        coreImageTag: "0.7.1"
+
+  stacks:
+    backends:
+      description: Two plain HTTP backends and a client pod under restricted pod security
+      steps:
+        - type: manifest
+          path: resources/namespaces.yaml
+        - type: manifest
+          path: resources/backends.yaml
+        # A new namespace gets its default ServiceAccount a moment after it is
+        # created, and until then a bare Pod is rejected outright, so wait for it.
+        - type: exec
+          command:
+            - kubectl
+            - --context
+            - "{{ cluster.properties.kubeContext }}"
+            - --namespace
+            - praxis
+            - wait
+            - --for=create
+            - serviceaccount/default
+            - --timeout=60s
+        - type: manifest
+          path: resources/client.yaml
+        - type: wait
+          resource: deployment/backend-a
+          namespace: praxis-backends
+          condition: available
+          timeout: "180s"
+        - type: wait
+          resource: deployment/backend-b
+          namespace: praxis-backends
+          condition: available
+          timeout: "180s"
+        - type: wait
+          resource: pod/praxis-client
+          namespace: praxis
+          condition: Ready
+          timeout: "180s"
+
+    gateway-default:
+      description: A bare helm install with no values serves the built-in config
+      steps:
+        # helm upgrade with no values reuses the last release's values, so start
+        # from nothing to keep this a real bare install on a reused cluster.
+        - type: exec
+          command:
+            - helm
+            - --kube-context
+            - "{{ cluster.properties.kubeContext }}"
+            - --namespace
+            - praxis
+            - uninstall
+            - praxis-gateway
+            - --ignore-not-found
+            - --wait
+        - type: helm
+          release: praxis-gateway
+          chart: charts/praxis-gateway
+          version: "0.1.4"
+          namespace: praxis
+        - type: exec
+          command: [bash, verify.sh, default]
+          env: &verify-env
+            KUBE_CONTEXT: "{{ cluster.properties.kubeContext }}"
+            GATEWAY_NAMESPACE: praxis
+            RELEASE: praxis-gateway
+            CORE_IMAGE: "{{ cluster.properties.coreImageRepo }}:{{ cluster.properties.coreImageTag }}"
+
+    gateway-inline-v1:
+      description: config.inline proxies to backend-a by Service name
+      steps:
+        - type: helm
+          release: praxis-gateway
+          chart: charts/praxis-gateway
+          version: "0.1.4"
+          namespace: praxis
+          values:
+            config:
+              inline: |
+                insecure_options:
+                  allow_private_upstreams: true
+                listeners:
+                  - name: default
+                    address: "0.0.0.0:8080"
+                    filter_chains: [main]
+                filter_chains:
+                  - name: main
+                    filters:
+                      - filter: router
+                        routes:
+                          - path_prefix: "/"
+                            cluster: backend-a
+                      - filter: headers
+                        response_set:
+                          - name: X-Config-Version
+                            value: v1
+                      - filter: load_balancer
+                        clusters:
+                          - name: backend-a
+                            endpoints: ["backend-a.praxis-backends.svc:8080"]
+        - type: exec
+          command: [bash, verify.sh, inline-v1]
+          env: *verify-env
+
+    gateway-inline-v2:
+      description: A changed config.inline moves / to backend-b and adds a static route
+      steps:
+        - type: helm
+          release: praxis-gateway
+          chart: charts/praxis-gateway
+          version: "0.1.4"
+          namespace: praxis
+          values:
+            config:
+              inline: |
+                insecure_options:
+                  allow_private_upstreams: true
+                listeners:
+                  - name: default
+                    address: "0.0.0.0:8080"
+                    filter_chains: [main]
+                filter_chains:
+                  - name: main
+                    filters:
+                      - filter: static_response
+                        status: 200
+                        body: "static from praxis"
+                        conditions:
+                          - when:
+                              path_prefix: "/static"
+                      - filter: router
+                        routes:
+                          - path_prefix: "/"
+                            cluster: backend-b
+                      - filter: headers
+                        response_set:
+                          - name: X-Config-Version
+                            value: v2
+                      - filter: load_balancer
+                        clusters:
+                          - name: backend-b
+                            endpoints: ["backend-b.praxis-backends.svc:8080"]
+        - type: exec
+          command: [bash, verify.sh, inline-v2]
+          env: *verify-env
+
+    gateway-existing-configmap:
+      description: config.existingConfigMap with a non-default key replaces config.inline
+      steps:
+        - type: manifest
+          path: resources/existing-config.yaml
+        - type: helm
+          release: praxis-gateway
+          chart: charts/praxis-gateway
+          version: "0.1.4"
+          namespace: praxis
+          values:
+            config:
+              existingConfigMap: praxis-config
+              key: gateway.yaml
+        - type: exec
+          command: [bash, verify.sh, existing]
+          env: *verify-env
+
+    gateway-core-image:
+      description: The core Praxis image runs through the command override
+      steps:
+        - type: helm
+          release: praxis-gateway
+          chart: charts/praxis-gateway
+          version: "0.1.4"
+          namespace: praxis
+          values:
+            image:
+              repository: "{{ cluster.properties.coreImageRepo }}"
+              tag: "{{ cluster.properties.coreImageTag }}"
+            command: [praxis]
+            config:
+              inline: |
+                insecure_options:
+                  allow_private_upstreams: true
+                listeners:
+                  - name: default
+                    address: "0.0.0.0:8080"
+                    filter_chains: [main]
+                filter_chains:
+                  - name: main
+                    filters:
+                      - filter: router
+                        routes:
+                          - path_prefix: "/"
+                            cluster: backend-b
+                      - filter: headers
+                        response_set:
+                          - name: X-Config-Version
+                            value: core
+                      - filter: load_balancer
+                        clusters:
+                          - name: backend-b
+                            endpoints: ["backend-b.praxis-backends.svc:8080"]
+        - type: exec
+          command: [bash, verify.sh, core-image]
+          env: *verify-env
+
+    release-checks:
+      description: helm test, and proof the release needs nothing from Grid
+      steps:
+        - type: exec
+          command: [bash, verify.sh, release]
+          env: *verify-env

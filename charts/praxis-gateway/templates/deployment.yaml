@@ -19,13 +19,28 @@ spec:
         {{- $selectorLabels := include "praxis-gateway.selectorLabels" . | fromYaml }}
         {{- $podLabels := mustMergeOverwrite (dict "app.kubernetes.io/component" "gateway") (.Values.podLabels | default dict) $selectorLabels }}
         {{- toYaml $podLabels | nindent 8 }}
-      {{- with .Values.podAnnotations }}
+      {{- $configSource := include "praxis-gateway.configSource" . }}
+      {{- $podAnnotations := deepCopy (.Values.podAnnotations | default dict) }}
+      {{- if eq $configSource "inline" }}
+      {{- /* A changed config.inline must reach new pods: the hash rolls the Deployment. */}}
+      {{- $_ := set $podAnnotations "checksum/config" (toString .Values.config.inline | sha256sum) }}
+      {{- end }}
+      {{- with $podAnnotations }}
       annotations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
     spec:
       enableServiceLinks: false
       automountServiceAccountToken: false
+      {{- /* The preStop delay comes out of the grace period, so add it on top of Praxis's drain time. */}}
+      {{- $delay := int (.Values.shutdownDelaySeconds | default 0) }}
+      {{- $grace := .Values.terminationGracePeriodSeconds }}
+      {{- if kindIs "invalid" $grace }}
+      {{- $grace = add 30 $delay }}
+      {{- else if le (int $grace) $delay }}
+      {{- fail "terminationGracePeriodSeconds must be longer than shutdownDelaySeconds, or the pod is killed before Praxis can drain" }}
+      {{- end }}
+      terminationGracePeriodSeconds: {{ $grace }}
       {{- if and .Values.overlay.enabled .Values.overlay.sidecar.enabled }}
       serviceAccountName: {{ include "praxis-gateway.fullname" . }}-overlay-sync
       {{- end }}
@@ -145,6 +160,10 @@ spec:
         - name: praxis
           image: {{ include "praxis-gateway.image" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy | quote }}
+          {{- with .Values.command }}
+          command:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           {{- with .Values.args }}
           args:
             {{- toYaml . | nindent 12 }}
@@ -167,6 +186,12 @@ spec:
           {{- end }}
           securityContext:
             runAsNonRoot: true
+            {{- if include "praxis-gateway.applyImageUser" . }}
+            runAsUser: {{ .Values.imageUser.uid }}
+            {{- if not (hasKey (.Values.podSecurityContext | default dict) "runAsGroup") }}
+            runAsGroup: {{ .Values.imageUser.gid }}
+            {{- end }}
+            {{- end }}
             allowPrivilegeEscalation: false
             capabilities:
               drop:
@@ -183,6 +208,12 @@ spec:
           {{- with .Values.health.liveness }}
           livenessProbe:
             {{- include "praxis-gateway.probe" (list . $) | nindent 12 }}
+          {{- end }}
+          {{- with .Values.shutdownDelaySeconds }}
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sleep", {{ . | quote }}]
           {{- end }}
           {{- with .Values.resources }}
           resources:
@@ -248,10 +279,15 @@ spec:
               - key: "policy.yaml"
                 path: "policy.yaml"
               {{- end }}
-            {{- else }}
+            {{- else if eq $configSource "existing" }}
             name: {{ .Values.config.existingConfigMap | quote }}
             items:
               - key: {{ .Values.config.key | quote }}
+                path: "praxis.yaml"
+            {{- else }}
+            name: {{ include "praxis-gateway.fullname" . }}-config
+            items:
+              - key: "praxis.yaml"
                 path: "praxis.yaml"
             {{- end }}
         {{- if .Values.overlay.enabled }}

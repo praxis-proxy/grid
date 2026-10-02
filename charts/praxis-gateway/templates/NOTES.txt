@@ -1,24 +1,39 @@
 {{- include "praxis-gateway.normalize" . }}
+{{- $fullname := include "praxis-gateway.fullname" . }}
+{{- $configSource := include "praxis-gateway.configSource" . }}
+{{- $scheme := ternary "https" "http" .Values.gatewayConfig.listenerTls.enabled -}}
 Praxis gateway installed.
 
   Release:   {{ .Release.Name }}
   Namespace: {{ .Release.Namespace }}
   Image:     {{ include "praxis-gateway.image" . }}
-  Config:    {{ .Values.config.existingConfigMap }}
+  Config:    {{ if eq $configSource "existing" }}ConfigMap {{ .Values.config.existingConfigMap }} (key {{ .Values.config.key }}){{ else if eq $configSource "render" }}rendered from gatewayConfig{{ else }}config.inline (ConfigMap {{ $fullname }}-config){{ end }}
 
-TEMPORARY CHART: This chart deploys the Praxis process directly as a
-Kubernetes workload. It is not an operator. Long-term ownership moves to
-the Praxis/Gateway Operator repository when that deployment API exists.
+Wait for the rollout:
 
-Verify the gateway is running:
-
-  kubectl get deployment {{ include "praxis-gateway.fullname" . }} -n {{ .Release.Namespace }}
-  kubectl get pods -n {{ .Release.Namespace }} -l app.kubernetes.io/name={{ include "praxis-gateway.name" . }},app.kubernetes.io/instance={{ .Release.Name }}
+  kubectl -n {{ .Release.Namespace }} rollout status deployment/{{ $fullname }}
 {{- if .Values.service.enabled }}
 
-Run Helm tests:
+Send a request through the gateway:
+
+  kubectl -n {{ .Release.Namespace }} port-forward service/{{ $fullname }} 8080:{{ .Values.service.port }}
+  curl {{ if eq $scheme "https" }}-k {{ end }}{{ $scheme }}://127.0.0.1:8080/
+
+Run the chart's connectivity test:
 
   helm test {{ .Release.Name }} -n {{ .Release.Namespace }}
+{{- end }}
+{{- if eq $configSource "inline" }}
+
+Change the configuration by setting config.inline (for example with
+--set-file config.inline=praxis.yaml) and running helm upgrade. The pods
+roll to pick it up.
+{{- else if eq $configSource "existing" }}
+
+The chart does not manage ConfigMap {{ .Values.config.existingConfigMap }}. After editing it,
+restart the pods to load it right away:
+
+  kubectl -n {{ .Release.Namespace }} rollout restart deployment/{{ $fullname }}
 {{- end }}
 {{- if .Values.overlay.enabled }}
 

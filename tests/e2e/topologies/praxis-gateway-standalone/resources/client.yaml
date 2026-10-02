@@ -1,0 +1,28 @@
+# A long-lived pod in the gateway namespace that sends requests through the
+# gateway's Service, the way an in-cluster caller would.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: praxis-client
+  namespace: praxis
+  labels:
+    app: praxis-client
+spec:
+  automountServiceAccountToken: false
+  terminationGracePeriodSeconds: 1
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65534
+    runAsGroup: 65534
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: client
+      image: docker.io/library/busybox:1.37
+      command: ["sleep", "2147483647"]
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop:
+            - ALL
+        readOnlyRootFilesystem: true

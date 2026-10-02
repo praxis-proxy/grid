@@ -1,0 +1,30 @@
+# A Praxis config managed outside the chart, under a non-default key, for the
+# config.existingConfigMap stage.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: praxis-config
+  namespace: praxis
+data:
+  gateway.yaml: |
+    insecure_options:
+      allow_private_upstreams: true
+    listeners:
+      - name: default
+        address: "0.0.0.0:8080"
+        filter_chains: [main]
+    filter_chains:
+      - name: main
+        filters:
+          - filter: router
+            routes:
+              - path_prefix: "/"
+                cluster: backend-a
+          - filter: headers
+            response_set:
+              - name: X-Config-Version
+                value: existing
+          - filter: load_balancer
+            clusters:
+              - name: backend-a
+                endpoints: ["backend-a.praxis-backends.svc:8080"]

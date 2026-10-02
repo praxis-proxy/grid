@@ -376,6 +376,12 @@ if helm lint "$GW_DIR" --strict "${GW_REQ[@]}" 2>&1; then
 else
   fail "helm lint --strict (gateway)"
 fi
+# The release workflow lints with no values, so the standalone default must lint clean.
+if helm lint "$GW_DIR" --strict 2>&1; then
+  pass "helm lint --strict (gateway, no values)"
+else
+  fail "helm lint --strict (gateway, no values)"
+fi
 
 # ── Default template rendering ───────────────────────────────────────
 echo ""
@@ -514,7 +520,10 @@ fi
 # ── Schema rejection ────────────────────────────────────────────────
 echo ""
 echo "=== Schema rejection (gateway) ==="
-try_reject "$GW_DIR" "missing config" --set image.tag=v0.1.0-test --namespace grid-system
+try_template "$GW_DIR" "standalone default (no values)" --namespace praxis
+try_reject_msg "$GW_DIR" "blank config.inline" "config.inline is empty" --set-string 'config.inline= ' --namespace praxis
+try_reject_msg "$GW_DIR" "config.inline not a mapping" "config.inline is not a valid YAML mapping" \
+  --set-string config.inline=not-a-mapping --namespace praxis
 try_reject "$GW_DIR" "invalid digest (gw)" "${GW_REQ[@]}" --set image.digest=invalid
 try_reject "$GW_DIR" "invalid service type (gw)" "${GW_REQ[@]}" --set service.type=ExternalName
 try_reject "$GW_DIR" "unknown key (gw)" "${GW_REQ[@]}" --set typoField=true
@@ -1236,8 +1245,9 @@ CR_EOF
   # Scope: chart install/upgrade/uninstall wiring and Kubernetes
   # resource creation. Uses pause:3.9 by default because no Praxis
   # binary is available in Kind CI; probes are disabled accordingly.
-  # Real Praxis runtime behavior (mTLS, routing, overlay) is proven
-  # by the multi-cluster GLB demo (cargo xtask env glb-demo --quick).
+  # Real Praxis runtime behavior is proven elsewhere: the standalone
+  # chart by scripts/e2e-praxis-gateway.sh, and mTLS, routing, and
+  # overlays by the multi-cluster GLB demo (cargo xtask env glb-demo --quick).
   echo ""
   echo "=== Praxis Gateway Kind lifecycle (chart wiring, not runtime) ==="
 

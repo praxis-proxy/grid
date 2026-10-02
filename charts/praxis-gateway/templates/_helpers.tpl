@@ -1,7 +1,9 @@
 {{/*
 Normalize values once per render, in place and idempotently: backends keyed by site
 become the list the templates read, keys in sorted order. A provider, or a consumer
-with a site backend, gets the grid identity. render follows a missing BYO config.
+with a site backend, gets the grid identity. render follows a missing BYO config when
+the values configure grid routing (backends, the provider role, or gridServing);
+otherwise config.inline serves.
 */}}
 {{- define "praxis-gateway.normalize" -}}
 {{- $v := .Values }}
@@ -30,7 +32,8 @@ with a site backend, gets the grid identity. render follows a missing BYO config
 {{- $_ := set $v.tls "enabled" true }}
 {{- if not $v.tls.caSecret }}{{- $_ := set $v.tls "caSecret" "grid-ca" }}{{- end }}
 {{- end }}
-{{- if not ($v.config).existingConfigMap }}{{- $_ := set $cfg "render" true }}{{- end }}
+{{- $gridRouting := or $cfg.backends $provider ($v.gridServing).enabled }}
+{{- if and (not ($v.config).existingConfigMap) $gridRouting }}{{- $_ := set $cfg "render" true }}{{- end }}
 {{- if not $v.service.type }}{{- $_ := set $v.service "type" (ternary "LoadBalancer" "ClusterIP" $provider) }}{{- end }}
 {{- if hasSuffix "/grid-gateway" $v.image.repository }}{{- $_ := set $v.image "flavor" "grid-gateway" }}{{- end }}
 {{- $t := $cfg.peerTrust | default dict }}
@@ -187,8 +190,90 @@ Validate required config ConfigMap name.
 {{- end }}
 {{- include "praxis-gateway.validateBackends" . }}
 {{- else if not .Values.config.existingConfigMap }}
-{{- fail "config.existingConfigMap is required (or set gatewayConfig.render: true)" }}
+{{- include "praxis-gateway.validateInlineConfig" . }}
 {{- end }}
+{{- end }}
+
+{{/*
+Where praxis.yaml comes from: render (gatewayConfig.render), existing
+(config.existingConfigMap), or inline (config.inline in a chart-managed ConfigMap).
+*/}}
+{{- define "praxis-gateway.configSource" -}}
+{{- if .Values.gatewayConfig.render -}}
+render
+{{- else if .Values.config.existingConfigMap -}}
+existing
+{{- else -}}
+inline
+{{- end -}}
+{{- end }}
+
+{{/*
+Fail early on a blank or unparseable config.inline, or one with no listener on
+port.containerPort, instead of a pod that crash-loops or never turns ready. Also fail
+on grid settings that only the rendered config reads, which inline would drop quietly.
+*/}}
+{{- define "praxis-gateway.validateInlineConfig" -}}
+{{- range $key := list "localSite" "model" }}
+{{- if get $.Values.gatewayConfig $key }}
+{{- fail (printf "gatewayConfig.%s is set but config.inline is serving, and inline ignores it: add gatewayConfig.backends, role provider, or gridServing to render the grid config, or unset gatewayConfig.%s" $key $key) }}
+{{- end }}
+{{- end }}
+{{- $inline := toString (.Values.config.inline | default "") }}
+{{- if not (trim $inline) }}
+{{- fail "config.inline is empty: set it to a Praxis configuration, or set config.existingConfigMap" }}
+{{- end }}
+{{- $parsed := fromYaml $inline }}
+{{- if hasKey $parsed "Error" }}
+{{- fail (printf "config.inline is not a valid YAML mapping: %s" (get $parsed "Error")) }}
+{{- end }}
+{{- $port := int .Values.port.containerPort }}
+{{- $listeners := $parsed.listeners }}
+{{- if not (kindIs "slice" $listeners) }}{{- $listeners = list }}{{- end }}
+{{- $bound := false }}
+{{- range $listeners }}
+{{- if and (kindIs "map" .) (hasSuffix (printf ":%d" $port) (toString .address)) }}{{- $bound = true }}{{- end }}
+{{- end }}
+{{- if not $bound }}
+{{- fail (printf "config.inline has no listener on port.containerPort %d, where the Service and probes connect: bind a listener address to port %d, or change port.containerPort" $port $port) }}
+{{- end }}
+{{- end }}
+
+{{/*
+Whether the Praxis container gets imageUser's numeric IDs: only when podSecurityContext
+sets no runAsUser, and imageUser.enabled is true, or auto on an official image off
+OpenShift. The kubelet needs a numeric user to enforce runAsNonRoot, and a pod
+runAsGroup does not provide one. Emits "true" or nothing.
+*/}}
+{{- define "praxis-gateway.applyImageUser" -}}
+{{- $psc := .Values.podSecurityContext | default dict -}}
+{{- $e := toString (.Values.imageUser | default dict).enabled -}}
+{{- $auto := and (eq $e "auto") (include "praxis-gateway.officialImageUser" .) (not (include "praxis-gateway.openshift" .)) -}}
+{{- if and (not (hasKey $psc "runAsUser")) (or (eq $e "true") $auto) -}}
+true
+{{- end -}}
+{{- end }}
+
+{{/*
+Whether the image is one whose user imageUser's defaults describe: the official
+praxis-proxy ai, praxis, or grid-gateway repository, or a mirror that keeps that path.
+-fips tags are left out, since their UBI build runs as 1001:1001. Any other image keeps
+the user it declares. Emits "true" or nothing.
+*/}}
+{{- define "praxis-gateway.officialImageUser" -}}
+{{- if and (regexMatch "(^|/)praxis-proxy/(ai|praxis|grid-gateway)$" .Values.image.repository) (not (hasSuffix "-fips" (toString .Values.image.tag))) -}}
+true
+{{- end -}}
+{{- end }}
+
+{{/*
+Whether the cluster is OpenShift, where the restricted SCC assigns pod UIDs from the
+namespace range and rejects fixed ones outside it. Emits "true" or nothing.
+*/}}
+{{- define "praxis-gateway.openshift" -}}
+{{- if .Capabilities.APIVersions.Has "security.openshift.io/v1" -}}
+true
+{{- end -}}
 {{- end }}
 
 {{/*
