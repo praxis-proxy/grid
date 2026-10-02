@@ -1445,12 +1445,6 @@ async fn reconcile_routing_overlay_inner(
                 continue;
             },
         };
-        let rendered_at = stable_rendered_at(
-            find_prior_overlay(network, gw_ref),
-            &render.revision_hex,
-            &resource_version,
-            &render.rendered_at,
-        );
         overlay_statuses.push(OverlayRevisionStatus {
             gateway_name: gw_ref.name.clone(),
             namespace: gw_ref.namespace.clone(),
@@ -1460,7 +1454,7 @@ async fn reconcile_routing_overlay_inner(
             distributed_revision: render.revision_hex.clone(),
             content_digest: render.revision_hex,
             config_map_resource_version: resource_version,
-            rendered_at,
+            rendered_at: render.rendered_at,
             candidate_count: render.candidate_count,
             phase: OverlayPhase::Distributed,
             reason: String::new(),
@@ -1649,33 +1643,35 @@ fn find_prior_overlay<'net>(network: &'net GridNetwork, gw_ref: &GatewayRef) -> 
     })
 }
 
-/// Decide the `rendered_at` timestamp to record for a freshly-successful
-/// overlay distribution.
-///
-/// `fresh_rendered_at` is derived from a new timestamp taken on every
-/// reconcile tick (see `rfc3339_now` in `reconcile_overlays_and_consumer_configs`),
-/// so using it unconditionally would make every `OverlayRevisionStatus`
-/// compare as changed even when the overlay's actual content (distributed
-/// revision, `ConfigMap` `resourceVersion`) is byte-for-byte identical to
-/// what is already recorded — silently defeating
-/// [`grid_network_status_needs_update`]'s equality check and reproducing the
-/// same class of reconcile hot-loop as grid#42, just against the
-/// `GridNetwork` object's own status subresource instead of `GridSite` or
-/// the overlay `ConfigMap`. Reuse the prior timestamp whenever nothing
-/// observable changed; only advance it when the distributed revision or
-/// `ConfigMap` `resourceVersion` actually moved.
-fn stable_rendered_at(
-    prior: Option<&OverlayRevisionStatus>,
-    revision_hex: &str,
-    resource_version: &str,
-    fresh_rendered_at: &str,
-) -> String {
-    match prior {
-        Some(p) if p.distributed_revision == revision_hex && p.config_map_resource_version == resource_version => {
-            p.rendered_at.clone()
-        },
-        _ => fresh_rendered_at.to_owned(),
-    }
+/// Keep each prior `rendered_at` when only timestamps changed, so a status write never retriggers reconcile.
+fn keep_rendered_at(
+    current: Option<&GridNetworkStatus>,
+    desired: Vec<OverlayRevisionStatus>,
+) -> Vec<OverlayRevisionStatus> {
+    let prior = current.map_or(&[][..], |status| status.overlay_status.as_slice());
+    desired
+        .into_iter()
+        .map(|mut entry| {
+            if let Some(p) = prior
+                .iter()
+                .find(|p| p.gateway_name == entry.gateway_name && p.namespace == entry.namespace)
+                && same_rendered_content(p, &entry)
+            {
+                entry.rendered_at.clone_from(&p.rendered_at);
+            }
+            entry
+        })
+        .collect()
+}
+
+/// Whether two entries differ at most in `rendered_at` and `observed_generation`.
+fn same_rendered_content(prior: &OverlayRevisionStatus, desired: &OverlayRevisionStatus) -> bool {
+    let normalized = OverlayRevisionStatus {
+        rendered_at: desired.rendered_at.clone(),
+        observed_generation: desired.observed_generation,
+        ..prior.clone()
+    };
+    normalized == *desired
 }
 
 /// Resolve rendered-side evidence from render result, prior status, or defaults.
@@ -2406,7 +2402,7 @@ async fn update_status(
         observed_generation: network.metadata.generation.unwrap_or(0),
         phase: phase.clone(),
         consumer_config_status: consumer_config_statuses,
-        overlay_status: overlay_statuses,
+        overlay_status: keep_rendered_at(network.status.as_ref(), overlay_statuses),
         budget_status: budget_statuses,
     };
 
@@ -5033,63 +5029,143 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // stable_rendered_at (grid#42: GridNetwork status resourceVersion churn)
+    // keep_rendered_at: status-only churn must not retrigger reconcile
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn stable_rendered_at_reuses_prior_when_nothing_changed() {
-        let gw = make_gw_ref("gw", "grid-system");
-        let prior = rendered_overlay_status(&gw);
+    const FRESH: &str = "2026-10-01T12:00:00Z";
 
-        let rendered_at = stable_rendered_at(
-            Some(&prior),
-            &prior.distributed_revision,
-            &prior.config_map_resource_version,
-            "2026-08-12T04:37:55.488097906Z",
-        );
+    fn only_overlay(status: &GridNetworkStatus) -> &OverlayRevisionStatus {
+        status.overlay_status.first().unwrap_or_else(|| std::process::abort())
+    }
 
-        assert_eq!(
-            rendered_at, prior.rendered_at,
-            "identical revision and resourceVersion must not advance rendered_at, or every \
-             reconcile tick bumps GridNetwork's own resourceVersion forever (grid#42)"
-        );
+    fn network_with_overlay(prior: OverlayRevisionStatus) -> GridNetwork {
+        let mut network = base_network();
+        network.status = Some(GridNetworkStatus {
+            overlay_status: vec![prior],
+            ..GridNetworkStatus::default()
+        });
+        network
+    }
+
+    fn desired_with_overlay(network: &GridNetwork, overlay: OverlayRevisionStatus) -> GridNetworkStatus {
+        GridNetworkStatus {
+            overlay_status: keep_rendered_at(network.status.as_ref(), vec![overlay]),
+            ..network.status.clone().unwrap_or_default()
+        }
     }
 
     #[test]
-    fn stable_rendered_at_advances_when_revision_changes() {
+    fn unchanged_distributed_overlay_writes_no_status() {
         let gw = make_gw_ref("gw", "grid-system");
         let prior = rendered_overlay_status(&gw);
-        let fresh = "2026-08-12T04:37:55.488097906Z";
+        let network = network_with_overlay(prior.clone());
+        let rerendered = OverlayRevisionStatus {
+            rendered_at: FRESH.to_owned(),
+            ..prior.clone()
+        };
 
-        let rendered_at = stable_rendered_at(Some(&prior), &"b".repeat(64), &prior.config_map_resource_version, fresh);
+        let desired = desired_with_overlay(&network, rerendered);
 
-        assert_eq!(
-            rendered_at, fresh,
-            "a genuinely new distributed revision must advance rendered_at"
-        );
+        assert_eq!(only_overlay(&desired).rendered_at, prior.rendered_at);
+        assert!(!grid_network_status_needs_update(network.status.as_ref(), &desired));
     }
 
     #[test]
-    fn stable_rendered_at_advances_when_configmap_resource_version_changes() {
+    fn unchanged_empty_candidates_overlay_writes_no_status() {
         let gw = make_gw_ref("gw", "grid-system");
-        let prior = rendered_overlay_status(&gw);
-        let fresh = "2026-08-12T04:37:55.488097906Z";
+        let mut network = network_with_overlay(rendered_overlay_status(&gw));
+        let first_render = make_render_result(&"c".repeat(64), 0);
+        let first = retained_overlay_status(&network, &gw, 4, Some(&first_render), EMPTY_CANDIDATES, "no candidates");
+        let first = desired_with_overlay(&network, first);
+        network.status = Some(first.clone());
+        let mut next_render = make_render_result(&"c".repeat(64), 0);
+        FRESH.clone_into(&mut next_render.rendered_at);
 
-        let rendered_at = stable_rendered_at(Some(&prior), &prior.distributed_revision, "43", fresh);
+        let next = retained_overlay_status(&network, &gw, 4, Some(&next_render), EMPTY_CANDIDATES, "no candidates");
+        let desired = desired_with_overlay(&network, next);
 
-        assert_eq!(
-            rendered_at, fresh,
-            "a genuinely new ConfigMap resourceVersion must advance rendered_at"
-        );
+        assert_eq!(only_overlay(&desired).rendered_at, only_overlay(&first).rendered_at);
+        assert!(!grid_network_status_needs_update(network.status.as_ref(), &desired));
     }
 
     #[test]
-    fn stable_rendered_at_uses_fresh_value_with_no_prior() {
-        let fresh = "2026-08-12T04:37:55.488097906Z";
-        let rendered_at = stable_rendered_at(None, &"a".repeat(64), "42", fresh);
+    fn unchanged_overlay_without_prior_distribution_writes_no_status() {
+        let gw = make_gw_ref("gw", "grid-system");
+        let mut network = base_network();
+        let first_render = make_render_result(&"c".repeat(64), 0);
+        let first = retained_overlay_status(&network, &gw, 1, Some(&first_render), EMPTY_CANDIDATES, "no candidates");
+        network.status = Some(desired_with_overlay(&network, first));
+        let mut next_render = make_render_result(&"c".repeat(64), 0);
+        FRESH.clone_into(&mut next_render.rendered_at);
+
+        let next = retained_overlay_status(&network, &gw, 1, Some(&next_render), EMPTY_CANDIDATES, "no candidates");
+        let desired = desired_with_overlay(&network, next);
+
+        assert_eq!(only_overlay(&desired).phase, OverlayPhase::Error);
+        assert!(!grid_network_status_needs_update(network.status.as_ref(), &desired));
+    }
+
+    #[test]
+    fn content_change_advances_rendered_at() {
+        let gw = make_gw_ref("gw", "grid-system");
+        let prior = rendered_overlay_status(&gw);
+        let network = network_with_overlay(prior.clone());
+        let new_digest = OverlayRevisionStatus {
+            content_digest: "b".repeat(64),
+            rendered_revision: "b".repeat(64),
+            distributed_revision: "b".repeat(64),
+            rendered_at: FRESH.to_owned(),
+            ..prior.clone()
+        };
+        let new_resource_version = OverlayRevisionStatus {
+            config_map_resource_version: "43".to_owned(),
+            rendered_at: FRESH.to_owned(),
+            ..prior.clone()
+        };
+        let new_reason = OverlayRevisionStatus {
+            phase: OverlayPhase::Retained,
+            reason: EMPTY_CANDIDATES.to_owned(),
+            message: "no candidates".to_owned(),
+            rendered_at: FRESH.to_owned(),
+            ..prior
+        };
+
+        for changed in [new_digest, new_resource_version, new_reason] {
+            let desired = desired_with_overlay(&network, changed);
+            assert_eq!(only_overlay(&desired).rendered_at, FRESH);
+            assert!(grid_network_status_needs_update(network.status.as_ref(), &desired));
+        }
+    }
+
+    #[test]
+    fn generation_bump_keeps_rendered_at() {
+        let gw = make_gw_ref("gw", "grid-system");
+        let prior = rendered_overlay_status(&gw);
+        let network = network_with_overlay(prior.clone());
+        let bumped = OverlayRevisionStatus {
+            rendered_at: FRESH.to_owned(),
+            observed_generation: prior.observed_generation + 1,
+            ..prior.clone()
+        };
+
+        let desired = desired_with_overlay(&network, bumped);
+
+        assert_eq!(only_overlay(&desired).rendered_at, prior.rendered_at);
+        assert!(grid_network_status_needs_update(network.status.as_ref(), &desired));
+    }
+
+    #[test]
+    fn first_render_uses_fresh_rendered_at() {
+        let gw = make_gw_ref("gw", "grid-system");
+        let fresh = OverlayRevisionStatus {
+            rendered_at: FRESH.to_owned(),
+            ..rendered_overlay_status(&gw)
+        };
         assert_eq!(
-            rendered_at, fresh,
-            "first-ever distribution has no prior to compare against"
+            keep_rendered_at(None, vec![fresh])
+                .first()
+                .map(|e| e.rendered_at.as_str()),
+            Some(FRESH)
         );
     }
 

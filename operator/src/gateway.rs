@@ -105,7 +105,9 @@ pub async fn resolve(client: &Client, config: &Config) -> Result<Option<String>,
         tracing::info!(addr = %addr, "using explicit gateway address override");
         return Ok(Some(addr.to_owned()));
     }
-    discover_from_service(client, config).await
+    let discovery = discover_from_service(client, config).await?;
+    log_discovery(&discovery, config, true);
+    Ok(discovery.into_address())
 }
 
 /// Poll for the gateway Service address and re-announce it via SWIM.
@@ -124,16 +126,20 @@ pub async fn run_discovery_poller(client: Client, swim: Arc<SwimHandle>, config:
 
 /// Inner polling loop; separated to satisfy clippy complexity lints.
 async fn poll_loop(client: &Client, swim: &SwimHandle, interval: Duration, config: &Config) -> ! {
+    let mut last: Option<Discovery> = None;
     loop {
         tokio::time::sleep(interval).await;
         match discover_from_service(client, config).await {
-            // Re-announce even if unchanged: a peer may have joined since.
-            Ok(Some(addr)) => {
-                if let Err(e) = swim.set_gateway_address(Some(addr.clone())) {
+            Ok(discovery) => {
+                log_discovery(&discovery, config, is_new(last.as_ref(), &discovery));
+                // Re-announce even if unchanged: a peer may have joined since.
+                if let Discovery::Found(addr) = &discovery
+                    && let Err(e) = swim.set_gateway_address(Some(addr.clone()))
+                {
                     tracing::warn!(error = %e, "failed to update gateway address on SWIM handle");
                 }
+                last = Some(discovery);
             },
-            Ok(_) => {},
             Err(e) => {
                 tracing::warn!(error = %e, "gateway discovery poll failed; will retry");
             },
@@ -141,34 +147,62 @@ async fn poll_loop(client: &Client, swim: &SwimHandle, interval: Duration, confi
     }
 }
 
-/// Look up the gateway Service and extract its `LoadBalancer` address.
-async fn discover_from_service(client: &Client, config: &Config) -> Result<Option<String>, kube::Error> {
-    let api: Api<Service> = Api::namespaced(client.clone(), &config.namespace);
-    if let Some(svc) = api.get_opt(&config.service_name).await? {
-        let addr = extract_lb_address(&svc, config.port);
-        log_discovery_result(&config.service_name, &config.namespace, addr.as_ref());
-        Ok(addr)
-    } else {
-        tracing::info!(
-            service = %config.service_name,
-            namespace = %config.namespace,
-            "gateway Service not found; address unavailable"
-        );
-        Ok(None)
+/// Outcome of one gateway Service lookup.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum Discovery {
+    /// The Service has a `LoadBalancer` address.
+    Found(String),
+    /// The Service exists without a `LoadBalancer` address.
+    NoAddress,
+    /// The Service does not exist.
+    NoService,
+}
+
+impl Discovery {
+    /// The discovered address, if any.
+    fn into_address(self) -> Option<String> {
+        match self {
+            Self::Found(addr) => Some(addr),
+            Self::NoAddress | Self::NoService => None,
+        }
     }
 }
 
-/// Log the outcome of Service-based discovery.
-fn log_discovery_result(service: &str, namespace: &str, addr: Option<&String>) {
-    if let Some(a) = addr {
-        tracing::info!(
-            service = %service,
-            namespace = %namespace,
-            addr = %a,
-            "discovered gateway address from Service"
-        );
+/// Look up the gateway Service and extract its `LoadBalancer` address.
+async fn discover_from_service(client: &Client, config: &Config) -> Result<Discovery, kube::Error> {
+    let api: Api<Service> = Api::namespaced(client.clone(), &config.namespace);
+    Ok(match api.get_opt(&config.service_name).await? {
+        Some(svc) => extract_lb_address(&svc, config.port).map_or(Discovery::NoAddress, Discovery::Found),
+        None => Discovery::NoService,
+    })
+}
+
+/// Whether `next` differs from the `last` outcome, so a steady state logs once.
+fn is_new(last: Option<&Discovery>, next: &Discovery) -> bool {
+    last != Some(next)
+}
+
+/// Log a discovery outcome, at debug unless it `changed`.
+fn log_discovery(discovery: &Discovery, config: &Config, changed: bool) {
+    if changed {
+        log_discovery_change(discovery, &config.service_name, &config.namespace);
     } else {
-        tracing::info!(service = %service, namespace = %namespace, "gateway Service has no LoadBalancer address yet");
+        tracing::debug!(service = %config.service_name, ?discovery, "gateway discovery unchanged");
+    }
+}
+
+/// Log entry into a new discovery outcome.
+fn log_discovery_change(discovery: &Discovery, service: &str, namespace: &str) {
+    match discovery {
+        Discovery::Found(addr) => {
+            tracing::info!(%service, %namespace, %addr, "discovered gateway address from Service");
+        },
+        Discovery::NoAddress => {
+            tracing::warn!(%service, %namespace, "gateway Service has no LoadBalancer address yet");
+        },
+        Discovery::NoService => {
+            tracing::warn!(%service, %namespace, "gateway Service not found; address unavailable");
+        },
     }
 }
 
@@ -256,6 +290,17 @@ mod tests {
             gateway: Config,
         }
         Cli::try_parse_from(std::iter::once("test").chain(args.iter().copied())).map(|c| c.gateway)
+    }
+
+    #[test]
+    fn steady_discovery_outcome_logs_once() {
+        let waiting = Discovery::NoAddress;
+        assert!(is_new(None, &waiting), "first outcome logs");
+        assert!(!is_new(Some(&waiting), &waiting), "a repeated wait does not log");
+        let found = Discovery::Found("10.0.0.1:8080".to_owned());
+        assert!(is_new(Some(&waiting), &found), "an address arriving logs");
+        assert!(!is_new(Some(&found), &found), "a repeated address does not log");
+        assert!(is_new(Some(&found), &Discovery::NoService), "losing the Service logs");
     }
 
     #[test]
