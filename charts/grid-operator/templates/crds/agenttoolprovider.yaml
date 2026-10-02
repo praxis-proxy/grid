@@ -58,7 +58,7 @@ spec:
                   description: Authentication configuration.
                   nullable: true
                   properties:
-                    manual:
+                    credentialsManagedExternally:
                       default: false
                       description: |-
                         Whether the user manages credentials manually.

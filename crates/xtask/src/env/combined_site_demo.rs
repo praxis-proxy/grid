@@ -4040,7 +4040,7 @@ fn read_cluster_overlay(cluster: &str) -> Result<OverlayData, Box<dyn std::error
 /// expectation from the descriptor.
 ///
 /// The overlay indexes candidates by their `cluster` field, which is the
-/// `routingClusterRef` from the `InferenceProvider` CRD, not the K8s
+/// `clusterName` from the `InferenceProvider` CRD, not the K8s
 /// resource name. The returned `ExpectedExternalCandidate` carries the
 /// routing_cluster, model, and site so that convergence validation can
 /// assert field-level agreement.
@@ -5717,7 +5717,7 @@ spec:
       contextWindow: 200000
   auth:
     strategy: api_key
-    manual: true
+    credentialsManagedExternally: true
     secretRef:
       name: {secret_name}
       namespace: grid-system
@@ -5732,7 +5732,7 @@ spec:
     path: /v1/models
     interval: "60s"
     timeout: "10s"
-  routingClusterRef: {routing_cluster}
+  clusterName: {routing_cluster}
 "#,
         resource_name = external_provider.resource_name(),
         provider_kind = external_provider.provider_kind,
@@ -5901,7 +5901,7 @@ spec:
   accessPolicy:
     siteSelector:
       matchLabels: {{}}
-  routingClusterRef: {routing_cluster}
+  clusterName: {routing_cluster}
   healthCheck:
     path: /health
     interval: "30s"

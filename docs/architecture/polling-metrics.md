@@ -123,7 +123,7 @@ The larger, so an EPP restart that zeroes its count does not make the site look
 idle. The per-endpoint count carries no pool label, so an EPP serving several
 pools falls back to the averages alone. A site with no fresh endpoint publishes
 nothing, since its averages are frozen, and the gateway reads it as unknown.
-Point `metricsConfig.metricsEndpoint` at the EPP Service: a pod or headless
+Point `metricsConfig.endpoint` at the EPP Service: a pod or headless
 address can reach a standby replica, which reports no series.
 
 On a prefill/decode pool the EPP counts a request on both endpoints, so the value

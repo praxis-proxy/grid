@@ -63,7 +63,7 @@ pub struct InferenceProviderSpec {
     /// never infers it from endpoint URLs.
     #[schemars(length(min = 1))]
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub gateway_ref: Option<String>,
+    pub provider_gateway: Option<String>,
 
     /// Relative capacity used by an opt-in placement policy.
     #[schemars(range(min = 1, max = 1000))]
@@ -119,7 +119,7 @@ pub struct InferenceProviderSpec {
     /// `load_balancer` cluster entry.  When absent, `metadata.name` is used.
     ///
     /// [`GridSite`]: crate::crd::grid_site::GridSite
-    pub routing_cluster_ref: Option<String>,
+    pub cluster_name: Option<String>,
 
     /// Which sites host this provider.
     #[serde(default)]
@@ -161,7 +161,7 @@ pub struct TrafficPolicy {
 
 /// Prometheus metrics scraping configuration for an `InferenceProvider`.
 ///
-/// The operator scrapes `{spec.endpoint}{path}` (or `{metrics_endpoint}{path}`
+/// The operator scrapes `{spec.endpoint}{path}` (or `{endpoint}{path}`
 /// when set) and parses the Prometheus text using the `signal_names` mapping.
 /// Signals without a configured name receive the neutral default (`0.5`) in
 /// scoring. Plaintext scrape failures retain neutral-scoring compatibility
@@ -173,7 +173,7 @@ pub struct TrafficPolicy {
 pub struct MetricsConfig {
     /// Base URL for the metrics endpoint, independent of `spec.endpoint`.
     ///
-    /// When set, the scrape URL is `{metrics_endpoint}{path}` instead of
+    /// When set, the scrape URL is `{endpoint}{path}` instead of
     /// `{spec.endpoint}{path}`.  This allows scraping metrics from a separate
     /// service (such as an llm-d EPP) while the provider inference endpoint
     /// points at the pool's request path.
@@ -181,11 +181,11 @@ pub struct MetricsConfig {
     /// When absent, the scrape URL uses `spec.endpoint` as before.
     #[schemars(length(min = 1))]
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub metrics_endpoint: Option<String>,
+    pub endpoint: Option<String>,
 
     /// HTTP path for the Prometheus metrics endpoint.
     ///
-    /// Appended to `metrics_endpoint` (when set) or `spec.endpoint`.
+    /// Appended to `endpoint` (when set) or `spec.endpoint`.
     /// Defaults to `"/metrics"` when absent.
     #[serde(default = "default_metrics_path")]
     pub path: String,
@@ -579,7 +579,7 @@ pub enum ModelDiscoveryConfig {
 
 /// OpenAI-compatible model-listing source.
 ///
-/// Uses `spec.auth` for the bearer token. With `auth.manual`, requests are
+/// Uses `spec.auth` for the bearer token. With `auth.credentialsManagedExternally`, requests are
 /// sent without credentials.
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -790,16 +790,16 @@ mod tests {
         });
         let spec: InferenceProviderSpec = serde_json::from_value(base).unwrap_or_else(|_| std::process::abort());
         let serialized = serde_json::to_value(&spec).unwrap_or_else(|_| std::process::abort());
-        assert!(serialized.get("gatewayRef").is_none());
+        assert!(serialized.get("providerGateway").is_none());
         assert!(serialized.get("trafficPolicy").is_none());
 
         let drained: InferenceProviderSpec = serde_json::from_value(serde_json::json!({
             "gridNetworkRef": "production", "providerKind": "self_hosted",
             "backendKind": "local", "endpoint": "http://backend:8080",
-            "gatewayRef": "provider-gateway-a", "trafficPolicy": {"drain": true}
+            "providerGateway": "provider-gateway-a", "trafficPolicy": {"drain": true}
         }))
         .unwrap_or_else(|_| std::process::abort());
-        assert_eq!(drained.gateway_ref.as_deref(), Some("provider-gateway-a"));
+        assert_eq!(drained.provider_gateway.as_deref(), Some("provider-gateway-a"));
         assert!(drained.traffic_policy.as_ref().is_some_and(|p| p.drain));
     }
 
@@ -810,7 +810,7 @@ mod tests {
             .pointer("/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties")
             .and_then(serde_json::Value::as_object)
             .unwrap_or_else(|| std::process::abort());
-        assert!(properties.contains_key("gatewayRef"));
+        assert!(properties.contains_key("providerGateway"));
         assert!(properties.contains_key("trafficPolicy"));
     }
 
@@ -1053,7 +1053,7 @@ mod tests {
             timeout: "2s".to_owned(),
             signal_names: MetricSignalNames::default(),
             stale_metrics_seconds: None,
-            metrics_endpoint: None,
+            endpoint: None,
             pool_name: None,
             queue_capacity: None,
             tls: None,

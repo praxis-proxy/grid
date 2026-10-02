@@ -234,7 +234,7 @@
     "inferenceProviders": {
       "description": "InferenceProviders keyed by name, or the older list of full specs.",
       "oneOf": [
-        { "type": "object", "propertyNames": { "pattern": "^[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?$" }, "additionalProperties": {"type": "object", "additionalProperties": true, "required": ["endpoint"], "properties": {"name": {"type": "string", "minLength": 1}, "gridNetworkRef": {"type": "string", "minLength": 1}, "providerKind": {"type": "string", "minLength": 1}, "backendKind": {"type": "string", "minLength": 1}, "endpoint": {"type": "string", "minLength": 1}, "routingClusterRef": {"type": "string"}, "gatewayRef": {"type": "string", "minLength": 1}, "trafficPolicy": {"type": "object", "additionalProperties": false, "properties": {"drain": {"type": "boolean", "default": false}}}, "capacityWeight": {"type": "integer", "minimum": 1, "maximum": 1000}, "model": {"type": "string", "minLength": 1, "description": "Model name. Defaults to the key."}}} },
+        { "type": "object", "propertyNames": { "pattern": "^[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?$" }, "additionalProperties": {"type": "object", "additionalProperties": true, "required": ["endpoint"], "properties": {"name": {"type": "string", "minLength": 1}, "gridNetworkRef": {"type": "string", "minLength": 1}, "providerKind": {"type": "string", "minLength": 1}, "backendKind": {"type": "string", "minLength": 1}, "endpoint": {"type": "string", "minLength": 1}, "clusterName": {"type": "string"}, "providerGateway": {"type": "string", "minLength": 1}, "trafficPolicy": {"type": "object", "additionalProperties": false, "properties": {"drain": {"type": "boolean", "default": false}}}, "capacityWeight": {"type": "integer", "minimum": 1, "maximum": 1000}, "model": {"type": "string", "minLength": 1, "description": "Model name. Defaults to the key."}}} },
         { "type": "array" }
       ],
       "type": ["array", "object"],
@@ -248,8 +248,8 @@
           "providerKind": { "type": "string", "minLength": 1 },
           "backendKind": { "type": "string", "minLength": 1 },
           "endpoint": { "type": "string", "minLength": 1 },
-          "routingClusterRef": { "type": "string" },
-          "gatewayRef": { "type": "string", "minLength": 1 },
+          "clusterName": { "type": "string" },
+          "providerGateway": { "type": "string", "minLength": 1 },
           "trafficPolicy": {
             "type": "object",
             "additionalProperties": false,

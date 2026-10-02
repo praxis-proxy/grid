@@ -51,7 +51,7 @@ grid_provider_config_generation row per qualified batch to scope learning to a
 [provider revision](architecture/polling-metrics.md#provider-revisions).
 Fresh pressure remains usable without this row, but learning stays disabled.
 
-The EPP exposes load samples at /metrics. Point metricsConfig.metricsEndpoint at
+The EPP exposes load samples at /metrics. Point metricsConfig.endpoint at
 the EPP Service. A pod address can reach a standby replica that reports nothing.
 The gateway keeps no count of its own requests.
 

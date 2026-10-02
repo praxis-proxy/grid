@@ -228,7 +228,7 @@ static Praxis configuration.
 ## Derived endpoint topology
 
 `praxisConfig.deriveTopology.fromProviders` lists the routing identities (a
-provider's `routingClusterRef`, else its `metadata.name`) whose declarations the
+provider's `clusterName`, else its `metadata.name`) whose declarations the
 operator may use to fill `clusterEndpoints[]` for candidates that have no
 entry. An empty list derives nothing. An `InferenceProvider` is cluster scoped
 and its `gridNetworkRef` is self asserted, so only the allowlist decides where a
@@ -463,7 +463,7 @@ The operator could not apply the `ConfigMap`.  Common causes:
 
 The overlay data produced a structural error.  Check that `siteName` is set
 on the `GatewayRef` (or that the `GridNetwork` name is a valid site identity) and
-that all provider `routingClusterRef` values are non-empty.
+that all provider `clusterName` values are non-empty.
 
 **A model answers 503 and the `Rendered` message says `withdrew`**
 

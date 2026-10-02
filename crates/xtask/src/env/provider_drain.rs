@@ -1,6 +1,6 @@
 //! Administrative provider drain operations.
 //!
-//! Selection is based only on the explicit `spec.gatewayRef` relationship.
+//! Selection is based only on the explicit `spec.providerGateway` relationship.
 //! This command changes desired Kubernetes state; Grid still performs the
 //! asynchronous overlay reconciliation and never participates in requests.
 
@@ -40,7 +40,7 @@ struct Metadata {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Spec {
-    gateway_ref: Option<String>,
+    provider_gateway: Option<String>,
 }
 
 /// Drain or restore all providers assigned to one explicit gateway identity.
@@ -62,7 +62,7 @@ pub(crate) fn run(
     validate_selector(gateway, provider)?;
     let selector = gateway.map_or_else(
         || format!("provider={:?}", provider.unwrap_or_default()),
-        |value| format!("gatewayRef={value:?}"),
+        |value| format!("providerGateway={value:?}"),
     );
     let selected = if let Some(name) = provider {
         select_provider(context, name)?
@@ -148,7 +148,7 @@ fn select(context: &str, gateway: &str) -> Result<Vec<String>, Box<dyn std::erro
     let mut names: Vec<_> = list
         .items
         .into_iter()
-        .filter(|p| p.spec.gateway_ref.as_deref() == Some(gateway))
+        .filter(|p| p.spec.provider_gateway.as_deref() == Some(gateway))
         .filter_map(|p| p.metadata.name)
         .collect();
     names.sort();
@@ -428,15 +428,15 @@ mod tests {
     #[test]
     fn provider_selection_uses_explicit_gateway_ref() {
         let list: ProviderList = serde_json::from_value(serde_json::json!({"items":[
-            {"metadata":{"name":"b"},"spec":{"gatewayRef":"gw"}},
-            {"metadata":{"name":"a"},"spec":{"gatewayRef":"gw"}},
-            {"metadata":{"name":"other"},"spec":{"gatewayRef":"other"}}
+            {"metadata":{"name":"b"},"spec":{"providerGateway":"gw"}},
+            {"metadata":{"name":"a"},"spec":{"providerGateway":"gw"}},
+            {"metadata":{"name":"other"},"spec":{"providerGateway":"other"}}
         ]}))
         .unwrap_or_else(|_| std::process::abort());
         let mut names: Vec<_> = list
             .items
             .into_iter()
-            .filter(|p| p.spec.gateway_ref.as_deref() == Some("gw"))
+            .filter(|p| p.spec.provider_gateway.as_deref() == Some("gw"))
             .filter_map(|p| p.metadata.name)
             .collect();
         names.sort();
@@ -447,7 +447,7 @@ mod tests {
     fn omitted_gateway_ref_does_not_match() {
         let provider: Provider = serde_json::from_value(serde_json::json!({"metadata":{"name":"p"},"spec":{}}))
             .unwrap_or_else(|_| std::process::abort());
-        assert_ne!(provider.spec.gateway_ref.as_deref(), Some("gw"));
+        assert_ne!(provider.spec.provider_gateway.as_deref(), Some("gw"));
     }
 
     #[test]
@@ -472,15 +472,15 @@ mod tests {
     #[test]
     fn gateway_membership_requires_an_exact_reference() {
         let list: ProviderList = serde_json::from_value(serde_json::json!({"items":[
-            {"metadata":{"name":"prefix"},"spec":{"gatewayRef":"gateway-a-extra"}},
-            {"metadata":{"name":"match"},"spec":{"gatewayRef":"gateway-a"}},
-            {"metadata":{"name":"suffix"},"spec":{"gatewayRef":"x-gateway-a"}}
+            {"metadata":{"name":"prefix"},"spec":{"providerGateway":"gateway-a-extra"}},
+            {"metadata":{"name":"match"},"spec":{"providerGateway":"gateway-a"}},
+            {"metadata":{"name":"suffix"},"spec":{"providerGateway":"x-gateway-a"}}
         ]}))
         .unwrap_or_else(|_| std::process::abort());
         let names: Vec<_> = list
             .items
             .into_iter()
-            .filter(|provider| provider.spec.gateway_ref.as_deref() == Some("gateway-a"))
+            .filter(|provider| provider.spec.provider_gateway.as_deref() == Some("gateway-a"))
             .filter_map(|provider| provider.metadata.name)
             .collect();
         assert_eq!(names, ["match"]);
