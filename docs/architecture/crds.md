@@ -44,6 +44,10 @@ pending, so a redeemed token currently issues a certificate inline.
 The chart stores token Secrets in its release namespace by default. Configure a
 dedicated namespace in the chart values to separate access to those credentials.
 
+The 0.1.x field renames are not converted automatically. Migrate existing
+resources before the updated operator reconciles them; see the
+[0.1.x CRD field migration guide](../installation/migration-0.1-crd-field-renames.md).
+
 ## GridNetwork
 
 The AGN logical network and top-level tenancy scope. `GridNetwork` is a
@@ -426,7 +430,7 @@ are incompatible. Upgrade and roll out the consumers before deploying this
 Grid version. Malformed or undeliverable updates still retain the last valid
 revision; an authoritative empty candidate set does not.
 
-When `enabled: true`, the `GridNetwork` controller renders a `praxis.yaml`-keyed
+When `generate: true`, the `GridNetwork` controller renders a `praxis.yaml`-keyed
 `ConfigMap` in the gateway namespace on each reconcile.  The generated config is a
 complete, runnable Praxis config containing:
 

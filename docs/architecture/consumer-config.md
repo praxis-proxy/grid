@@ -187,7 +187,7 @@ the credential filter is already running and the matching Secret is mounted
 under `{credentialMountPath}/{namespace}/{name}`. If that Secret projection
 is not mounted, the request fails closed until the consumer installs it.
 
-See [`docs/architecture/crds.md`](crds.md#gatewayrefconsumerconfig) for the full
+See [`docs/architecture/crds.md`](crds.md#gatewayrefpraxisconfig) for the full
 field reference.
 
 ## Grid-managed live-routing consumers

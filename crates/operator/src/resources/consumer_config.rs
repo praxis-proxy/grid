@@ -56,9 +56,9 @@ pub enum ConsumerConfigError {
     #[error("overlay local_site must not be blank")]
     BlankLocalSite,
 
-    /// The `credential_mount_path` path is blank.
+    /// The `credential_mount_path` field is blank.
     #[error("credential_mount_path must not be blank")]
-    BlankMountBase,
+    BlankMountPath,
 
     /// A required Grid CA Secret reference was not configured.
     #[error("mutual TLS requires tls.caSecretRef")]
@@ -338,7 +338,7 @@ pub(crate) fn generate_consumer_praxis_config_with_telemetry(
         return Err(ConsumerConfigError::BlankLocalSite);
     }
     if credential_mount_path.trim().is_empty() {
-        return Err(ConsumerConfigError::BlankMountBase);
+        return Err(ConsumerConfigError::BlankMountPath);
     }
 
     let inference_candidates: Vec<&RoutingCandidate> = overlay
@@ -2683,7 +2683,7 @@ mod tests {
     }
 
     #[test]
-    fn blank_mount_base_returns_error() {
+    fn blank_mount_path_returns_error() {
         let overlay = simple_overlay(vec![]);
         assert!(
             generate_consumer_praxis_config(&overlay, "", &[], "/etc/praxis/tls", 8080).is_err(),
