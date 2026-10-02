@@ -204,7 +204,7 @@
         "providerSiteLabel": {
           "type": "string"
         },
-        "egress": {
+        "gatewayEndpoint": {
           "type": "object",
           "additionalProperties": true,
           "properties": {

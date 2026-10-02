@@ -1067,7 +1067,7 @@ fn assert_site_auto_discovery() -> AssertionResult {
                         "-l", "grid.praxis.fast/auto-discovered=true",
                         "--context", &context,
                         "-n", GRID_SYSTEM_NS,
-                        "-o", "jsonpath={range .items[*]}{.metadata.name}\t{.status.phase}\t{.status.reason}\t{.spec.egress.address}\t{.spec.egress.tls.serverName}\t{.spec.trust.canonicalFingerprints}\n{end}",
+                        "-o", "jsonpath={range .items[*]}{.metadata.name}\t{.status.phase}\t{.status.reason}\t{.spec.gatewayEndpoint.address}\t{.spec.gatewayEndpoint.tls.serverName}\t{.spec.trust.canonicalFingerprints}\n{end}",
                     ])
                     .output()?;
                 if !output.status.success() {
@@ -2435,7 +2435,7 @@ fn forge_command(context: &ProviderTrafficContext) -> Command {
 ///
 /// For each local cluster, waits for the two remote auto-discovered `GridSites`,
 /// verifies the SWIM-advertised certificate matches the staged identity, then
-/// patches `spec.egress.tls.serverName` and `spec.trust.canonicalFingerprints`.
+/// patches `spec.gatewayEndpoint.tls.serverName` and `spec.trust.canonicalFingerprints`.
 /// The controller transitions the site to Active naturally after the patch.
 fn authorize_discovered_sites(certs_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     const TRUST_TIMEOUT: Duration = Duration::from_secs(120);
@@ -3361,7 +3361,7 @@ fn embedded_serving_gateway_ref(endpoints: &[serde_json::Value]) -> serde_json::
     serde_json::json!({
         "name": GRID_SERVING_GATEWAY,
         "namespace": GRID_SYSTEM_NS,
-        "localSiteName": CONSUMER_SITE,
+        "siteName": CONSUMER_SITE,
         "providerHopEndpoints": provider_hop_endpoints,
         "praxisConfig": {
             "generate": false,

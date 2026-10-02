@@ -42,7 +42,7 @@ gridSite:
   region: ""
   zone: ""
   providerSiteLabel: ""
-  egress: {}
+  gatewayEndpoint: {}
 
 # -- Remote sites this site trusts, keyed by site name, one GridSite <network>-<name>
 # each, the name the operator gives a peer it discovers. Listing peers also turns on

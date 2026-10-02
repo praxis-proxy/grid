@@ -300,7 +300,7 @@ fn derive_local(
 /// Derive a remote provider-hop entry from the provider site's `GridSite`.
 fn derive_remote(cluster: &str, site: &str, sites: &[GridSite], network_name: &str) -> Result<Resolved, Refusal> {
     let site = probed_site(site, sites, network_name)?;
-    let egress = site.spec.egress.as_ref().ok_or(Refusal::NoEgress)?;
+    let egress = site.spec.gateway_endpoint.as_ref().ok_or(Refusal::NoEgress)?;
     let address = egress.address.trim();
     if address.is_empty() {
         return Err(Refusal::NoEgress);

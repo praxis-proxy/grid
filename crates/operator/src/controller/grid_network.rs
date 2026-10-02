@@ -5904,7 +5904,7 @@ fn stub_changed(existing: Option<&GridSite>, site: &DiscoveredSite) -> bool {
     };
     let egress = existing
         .spec
-        .egress
+        .gateway_endpoint
         .as_ref()
         .map_or("", |egress| egress.address.as_str());
     let cert = existing
@@ -6150,7 +6150,7 @@ fn discovered_site_spec(site: &DiscoveredSite, network_name: &str, plaintext: bo
             })
         };
         fields.insert(
-            "egress".to_owned(),
+            "gatewayEndpoint".to_owned(),
             serde_json::json!({ "address": site.egress_address, "tls": tls }),
         );
     }
@@ -8746,7 +8746,8 @@ mod tests {
         };
         let spec = discovered_site_spec(&site, "net", false);
         assert_eq!(
-            spec.pointer("/spec/egress/tls/serverName").and_then(Value::as_str),
+            spec.pointer("/spec/gatewayEndpoint/tls/serverName")
+                .and_then(Value::as_str),
             Some("remote.grid.internal")
         );
         assert_eq!(

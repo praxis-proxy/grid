@@ -98,7 +98,7 @@ pub struct SwimConfig {
     ///
     /// When set, this address is included in outbound `StateBroadcast` messages
     /// as the `gateway_address` field, and remote peers will use it for
-    /// `GridSite.spec.egress.address` instead of the SWIM UDP endpoint.
+    /// `GridSite.spec.gatewayEndpoint.address` instead of the SWIM UDP endpoint.
     pub gateway_address: Option<String>,
 
     /// SWIM packet protection at startup, never logged.

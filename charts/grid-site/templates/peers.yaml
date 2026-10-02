@@ -23,7 +23,7 @@ spec:
   zone: {{ . | quote }}
   {{- end }}
   {{- with $p.address }}
-  egress:
+  gatewayEndpoint:
     address: {{ . | quote }}
     tls:
       mode: Mutual

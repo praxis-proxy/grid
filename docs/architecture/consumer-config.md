@@ -247,9 +247,9 @@ the next render.
 | Local site | `transport.mode` | `tls` for `https`, `plaintext` for `http` |
 | Local site | `transport.sni` | `deriveTopology.transport.sni`, else the endpoint host; an IP address or a host that is not a DNS hostname is refused |
 | Local site | `transport.caSecretRef` | `deriveTopology.transport.caSecretRef`, else the process trust store |
-| Remote site (`GridSite` must be `Active`) | `address` | `spec.egress.address` |
+| Remote site (`GridSite` must be `Active`) | `address` | `spec.gatewayEndpoint.address` |
 | Remote site | `transport.mode` | `mutual_tls` for `Mutual`, `plaintext` for `Plaintext` |
-| Remote site | `transport.sni` | `spec.egress.tls.serverName` |
+| Remote site | `transport.sni` | `spec.gatewayEndpoint.tls.serverName` |
 
 `deriveTopology.transport` declares backend trust once per gateway, for every
 derived local `https` endpoint. Providers behind one shared serving gateway

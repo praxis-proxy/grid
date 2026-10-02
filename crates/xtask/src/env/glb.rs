@@ -3154,7 +3154,7 @@ fn parse_gridsite_egress(
             .ok_or_else(|| format!("missing Forge capture for {provider} provider gateway"))?;
         let addr = find_gridsite_egress(items, provider)?;
         if addr.is_empty() {
-            return Err(format!("GridSite for {provider} has no egress address").into());
+            return Err(format!("GridSite for {provider} has no gateway endpoint address").into());
         }
         verify_expected_gateway_addr(provider, "GridSite egress", addr, expected)?;
         verified.push(format!("{provider}={addr}"));
@@ -3178,7 +3178,7 @@ fn find_gridsite_egress<'cfg>(
         return Err(format!("GridSite for {provider} not found on edge cluster").into());
     };
     Ok(site
-        .pointer("/spec/egress/address")
+        .pointer("/spec/gatewayEndpoint/address")
         .and_then(serde_json::Value::as_str)
         .unwrap_or(""))
 }
@@ -6583,11 +6583,11 @@ clusters:
             "items": [
                 {
                     "metadata": {"name": "glb-demo-west-provider"},
-                    "spec": {"egress": {"address": "172.18.0.5:8443"}}
+                    "spec": {"gatewayEndpoint": {"address": "172.18.0.5:8443"}}
                 },
                 {
                     "metadata": {"name": "glb-demo-east-provider"},
-                    "spec": {"egress": {"address": "172.18.0.6:8443"}}
+                    "spec": {"gatewayEndpoint": {"address": "172.18.0.6:8443"}}
                 }
             ]
         });
@@ -6608,11 +6608,11 @@ clusters:
             "items": [
                 {
                     "metadata": {"name": "glb-demo-west-provider"},
-                    "spec": {"egress": {"address": ""}}
+                    "spec": {"gatewayEndpoint": {"address": ""}}
                 },
                 {
                     "metadata": {"name": "glb-demo-east-provider"},
-                    "spec": {"egress": {"address": "172.18.0.6:8443"}}
+                    "spec": {"gatewayEndpoint": {"address": "172.18.0.6:8443"}}
                 }
             ]
         });
@@ -6633,11 +6633,11 @@ clusters:
             "items": [
                 {
                     "metadata": {"name": "glb-demo-west-provider"},
-                    "spec": {"egress": {"address": "172.18.0.5:8443"}}
+                    "spec": {"gatewayEndpoint": {"address": "172.18.0.5:8443"}}
                 },
                 {
                     "metadata": {"name": "glb-demo-east-provider"},
-                    "spec": {"egress": {"address": "172.18.0.6:8443"}}
+                    "spec": {"gatewayEndpoint": {"address": "172.18.0.6:8443"}}
                 }
             ]
         });

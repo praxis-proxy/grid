@@ -39,8 +39,8 @@ spec:
                 Describes a remote site's egress endpoint, region, and
                 grid membership.
               properties:
-                egress:
-                  description: Egress endpoint for data-plane connectivity.
+                gatewayEndpoint:
+                  description: Gateway endpoint for data-plane connectivity.
                   nullable: true
                   properties:
                     address:
