@@ -433,7 +433,7 @@ grid operator writes (under `signalTransport: poll`) and polls each peer's
 `/v1/site/signals` over mTLS with the grid identity at `tls.mountPath`. It routes
 each model to the least-loaded admitted site. The chosen candidate's cluster must
 name a `gatewayConfig.backends` cluster, so give each backend the operator's
-candidate cluster (the provider's `routingClusterRef`, else its name).
+candidate cluster (the provider's `clusterName`, else its name).
 
 A `grid-gateway` built from the current source re-reads `serving-config.json`
 every five seconds after the kubelet updates the mounted ConfigMap. It applies

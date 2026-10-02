@@ -398,10 +398,10 @@ fn filter_overlay_for_local_providers(
     let mut kept = Vec::new();
     for c in &overlay.candidates {
         // Accept the candidate when either the `site` field or the `cluster` field matches a
-        // known local provider.  The `cluster` field (derived from `routingClusterRef`) is the
+        // known local provider.  The `cluster` field (derived from `clusterName`) is the
         // stable routing identity; `site` may differ when auto-discovered `GridSite` resources
         // are present, causing the overlay renderer to use the `GridSite` name as the site field
-        // instead of `routingClusterRef`.
+        // instead of `clusterName`.
         if known_sites.contains(&c.site.as_str()) || known_sites.contains(&c.cluster.as_str()) {
             kept.push(c.clone());
         } else {
@@ -419,7 +419,7 @@ fn filter_overlay_for_local_providers(
         return Err(format!(
             "no overlay candidates have a matching local provider endpoint; \
              known provider sites: [{}]; \
-             hint: set spec.routingClusterRef on InferenceProvider resources \
+             hint: set spec.clusterName on InferenceProvider resources \
              to match a local provider site name",
             known_sites.join(", ")
         )
@@ -458,7 +458,7 @@ fn validate_overlay_sites_supported(
                 "overlay candidate model=\"{}\" site=\"{}\" cluster=\"{}\" \
                  has no matching local provider endpoint\n\
                  known provider sites: [{}]\n\
-                 hint: set spec.routingClusterRef on the InferenceProvider \
+                 hint: set spec.clusterName on the InferenceProvider \
                  to a site name from the environment config",
                 c.name,
                 c.site,

@@ -286,7 +286,7 @@ spec:
                   path: /metrics
                   timeout: "2s"
                   staleMetricsSeconds: 20
-                  metricsEndpoint: "http://llmd-epp-metrics.grid-system.svc.cluster.local:9090"
+                  endpoint: "http://llmd-epp-metrics.grid-system.svc.cluster.local:9090"
                   poolName: "{{ cluster.properties.poolName }}"
                   queueCapacity: 4
                   signalNames:
@@ -363,7 +363,7 @@ spec:
                   path: /metrics
                   timeout: "2s"
                   staleMetricsSeconds: 20
-                  metricsEndpoint: "http://llmd-epp-metrics.grid-system.svc.cluster.local:9090"
+                  endpoint: "http://llmd-epp-metrics.grid-system.svc.cluster.local:9090"
                   poolName: "{{ cluster.properties.poolName }}"
                   queueCapacity: 4
                   signalNames:

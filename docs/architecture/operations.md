@@ -693,7 +693,7 @@ spec:
 ## 8. Routing Configuration
 
 The `GridNetwork` controller renders routing overlay
-`ConfigMap`s from CRD data. For each `gatewayRef` in the
+`ConfigMap`s from CRD data. For each `consumerGateways` entry in the
 `GridNetwork`, it server-side applies a `ConfigMap`
 named `grid-overlay-{network}-{gateway}` containing:
 
@@ -734,7 +734,7 @@ The overlay shape is compatible with the Praxis
 ```
 
 **Cluster naming:** `candidate.cluster` uses
-`spec.routingClusterRef` when set, otherwise the
+`spec.clusterName` when set, otherwise the
 `InferenceProvider` metadata name.  The Praxis
 `load_balancer` cluster serving that provider must use
 the same identity.
@@ -1249,7 +1249,7 @@ through the consumer gateway.
 
 The validation covers provider health classification,
 candidate ordering, metrics-aware ordering,
-`routingClusterRef` identity mapping, overlay export,
+`clusterName` identity mapping, overlay export,
 consumer gateway deployment, successful routing for a
 known model, and clean failure for an unknown model.
 
@@ -1300,7 +1300,7 @@ status reconciliation reflects remote provider state in
 | `network_id` | owning `GridNetwork.metadata.name` |
 | `site_id` | local SWIM site identity |
 | `provider_id` | `metadata.name` |
-| `routing_cluster` | `spec.routingClusterRef` or `metadata.name` |
+| `routing_cluster` | `spec.clusterName` or `metadata.name` |
 | `models` | `spec.models[*].name` |
 | `backend_kind` | `spec.backendKind` |
 | `phase` | `status.phase` (including `Unavailable`) |

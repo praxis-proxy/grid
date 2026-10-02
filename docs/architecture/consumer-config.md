@@ -167,7 +167,7 @@ The operator could not apply the `ConfigMap`.  Common causes:
 
 The overlay data produced a structural error.  Check that `siteName` is set
 on the `GatewayRef` (or that the `GridNetwork` name is a valid site identity) and
-that all provider `routingClusterRef` values are non-empty.
+that all provider `clusterName` values are non-empty.
 
 **Phase is `Error` / reason `MissingClusterEndpoint`**
 

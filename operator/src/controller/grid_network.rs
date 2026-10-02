@@ -993,7 +993,7 @@ const WITHDRAWAL_PUBLICATION_TIMEOUT: Duration = Duration::from_secs(5);
 /// When this label is present with value `"true"`, the `GridNetwork` controller
 /// creates `GridSite` resources for remote Alive SWIM members automatically.
 /// Networks without this label are unaffected — their overlay generation uses
-/// the existing `routingClusterRef`-based (Phase 1) fallback.
+/// the existing `clusterName`-based (Phase 1) fallback.
 ///
 /// This opt-in gate prevents auto-discovery from changing the overlay generation
 /// semantics for networks that were not designed with it in mind.
@@ -1510,7 +1510,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
     // Auto-create or update GridSite records for remote Alive SWIM members.
     // Only runs when the GridNetwork explicitly opts in via LABEL_AUTO_DISCOVER_SITES.
     // This gate prevents auto-discovery from changing overlay generation semantics
-    // for networks that use the existing routingClusterRef-based (Phase 1) path.
+    // for networks that use the existing clusterName-based (Phase 1) path.
     let auto_discover_enabled = network
         .metadata
         .labels
@@ -2022,7 +2022,7 @@ fn site_phases(sites: &[GridSite]) -> impl Iterator<Item = (&str, &'static str)>
 /// Reconcile routing overlay `ConfigMap`s for a [`GridNetwork`].
 ///
 /// Lists all [`InferenceProvider`]s and [`GridSite`]s cluster-wide, then
-/// renders one overlay `ConfigMap` per `gatewayRef`.  Each gateway may
+/// renders one overlay `ConfigMap` per `consumerGateways` entry.  Each gateway may
 /// declare its own `siteName` — the `local_site` in the overlay for
 /// gateway G is `G.siteName ?? network_name`.  This ensures that in a
 /// multi-gateway network each gateway's overlay identifies the correct local
@@ -5422,7 +5422,7 @@ mod tests {
                 "backendKind": "local",
                 "endpoint": "http://localhost:8080",
                 "models": [{ "name": "model-x" }],
-                "routingClusterRef": routing_ref
+                "clusterName": routing_ref
             }
         }))
         .unwrap_or_else(|_| std::process::abort())
@@ -5475,7 +5475,7 @@ mod tests {
         let state = provider_state_from_kube(&p, "net", "site-a", None).unwrap_or_else(|| std::process::abort());
         assert_eq!(
             state.routing_cluster, "site-override",
-            "routingClusterRef must override metadata.name"
+            "clusterName must override metadata.name"
         );
     }
 
