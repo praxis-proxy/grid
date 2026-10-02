@@ -35,6 +35,16 @@ fn parse_non_blank(raw: &str) -> Result<String, String> {
 #[derive(Args, Debug, Clone)]
 #[group(id = "gateway")]
 pub struct Config {
+    /// Whether to discover and advertise a gateway address from Kubernetes.
+    #[arg(
+        long = "gateway-discovery-enabled",
+        env = "GRID_GATEWAY_DISCOVERY_ENABLED",
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    pub discovery_enabled: bool,
+
     /// Explicit gateway address (host:port); skips discovery when set.
     ///
     /// Blank means unset here, unlike the discovery fields.
@@ -59,14 +69,15 @@ pub struct Config {
     )]
     pub namespace: String,
 
-    /// Port appended to the discovered address.
+    /// Port appended to the discovered address. When unset, use the gateway
+    /// Service's declared port; if several are present, use the first entry
+    /// in `spec.ports`.
     #[arg(
         long = "gateway-port",
         env = "GRID_GATEWAY_PORT",
-        default_value_t = 8080,
         value_parser = clap::value_parser!(u16).range(1..=65535)
     )]
-    pub port: u16,
+    pub port: Option<u16>,
 
     /// Discovery poll interval, milliseconds.
     ///
@@ -105,6 +116,10 @@ pub async fn resolve(client: &Client, config: &Config) -> Result<Option<String>,
         tracing::info!(addr = %addr, "using explicit gateway address override");
         return Ok(Some(addr.to_owned()));
     }
+    if !config.discovery_enabled {
+        tracing::info!("gateway address discovery disabled");
+        return Ok(None);
+    }
     let discovery = discover_from_service(client, config).await?;
     log_discovery(&discovery, config, true);
     Ok(discovery.into_address())
@@ -114,6 +129,10 @@ pub async fn resolve(client: &Client, config: &Config) -> Result<Option<String>,
 ///
 /// No-op when an explicit address override is set.
 pub async fn run_discovery_poller(client: Client, swim: Arc<SwimHandle>, config: Config) {
+    if !config.discovery_enabled {
+        tracing::info!("gateway address discovery disabled; skipping discovery poller");
+        return;
+    }
     if config.address_override().is_some() {
         tracing::info!("gateway address override set; skipping discovery poller");
         return;
@@ -172,9 +191,25 @@ impl Discovery {
 async fn discover_from_service(client: &Client, config: &Config) -> Result<Discovery, kube::Error> {
     let api: Api<Service> = Api::namespaced(client.clone(), &config.namespace);
     Ok(match api.get_opt(&config.service_name).await? {
-        Some(svc) => extract_lb_address(&svc, config.port).map_or(Discovery::NoAddress, Discovery::Found),
+        Some(svc) => {
+            extract_lb_address(&svc, gateway_port(&svc, config.port)).map_or(Discovery::NoAddress, Discovery::Found)
+        },
         None => Discovery::NoService,
     })
+}
+
+/// Select the configured port, the first Service port, or the compatibility default.
+fn gateway_port(service: &Service, configured: Option<u16>) -> u16 {
+    configured
+        .or_else(|| {
+            service
+                .spec
+                .as_ref()
+                .and_then(|spec| spec.ports.as_ref())
+                .and_then(|ports| ports.first())
+                .and_then(|port| u16::try_from(port.port).ok())
+        })
+        .unwrap_or(8080)
 }
 
 /// Whether `next` differs from the `last` outcome, so a steady state logs once.
@@ -230,7 +265,9 @@ pub fn extract_lb_address(svc: &Service, port: u16) -> Option<String> {
 )]
 mod tests {
     use clap::Parser as _;
-    use k8s_openapi::api::core::v1::{LoadBalancerIngress, LoadBalancerStatus, ServiceStatus};
+    use k8s_openapi::api::core::v1::{
+        LoadBalancerIngress, LoadBalancerStatus, ServicePort, ServiceSpec, ServiceStatus,
+    };
 
     use super::*;
 
@@ -280,6 +317,19 @@ mod tests {
 
     fn svc_no_status() -> Service {
         Service::default()
+    }
+
+    fn svc_with_port(port: i32) -> Service {
+        Service {
+            spec: Some(ServiceSpec {
+                ports: Some(vec![ServicePort {
+                    port,
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
     }
 
     /// Parse a `Config` in isolation for validation tests.
@@ -389,12 +439,27 @@ mod tests {
 
     #[test]
     fn port_and_interval_default() {
-        assert!(matches!(parse_gateway(&[]), Ok(g) if g.port == 8080 && g.discovery_interval_ms == 5000));
+        assert!(matches!(parse_gateway(&[]), Ok(g) if g.port.is_none() && g.discovery_interval_ms == 5000));
     }
 
     #[test]
     fn valid_port_accepted() {
-        assert!(matches!(parse_gateway(&["--gateway-port", "443"]), Ok(g) if g.port == 443));
+        assert!(matches!(parse_gateway(&["--gateway-port", "443"]), Ok(g) if g.port == Some(443)));
+    }
+
+    #[test]
+    fn service_port_is_used_when_no_override_is_set() {
+        assert_eq!(gateway_port(&svc_with_port(8443), None), 8443);
+    }
+
+    #[test]
+    fn configured_port_overrides_service_port() {
+        assert_eq!(gateway_port(&svc_with_port(8443), Some(8080)), 8080);
+    }
+
+    #[test]
+    fn missing_service_port_uses_compatibility_default() {
+        assert_eq!(gateway_port(&svc_no_status(), None), 8080);
     }
 
     #[test]
@@ -477,6 +542,39 @@ mod tests {
             matches!(parsed, Ok(g) if g.service_name == "provider-gateway" && g.namespace == "grid-system"),
             "defaults still apply when the flags are not supplied"
         );
+    }
+
+    #[test]
+    fn discovery_enabled_by_default() {
+        assert!(matches!(parse_gateway(&[]), Ok(g) if g.discovery_enabled));
+    }
+
+    #[test]
+    fn discovery_can_be_disabled() {
+        assert!(matches!(
+            parse_gateway(&["--gateway-discovery-enabled", "false"]),
+            Ok(g) if !g.discovery_enabled
+        ));
+    }
+
+    // Use a child process so this test can set the environment without affecting
+    // other tests running in parallel.
+    #[test]
+    fn discovery_environment_can_be_disabled() -> Result<(), Box<dyn std::error::Error>> {
+        let status = std::process::Command::new(std::env::current_exe()?)
+            .args(["--exact", "gateway::tests::discovery_environment_child", "--nocapture"])
+            .env("GRID_GATEWAY_DISCOVERY_ENABLED", "false")
+            .status()?;
+        assert!(status.success(), "child parser test failed");
+        Ok(())
+    }
+
+    #[test]
+    fn discovery_environment_child() {
+        if std::env::var("GRID_GATEWAY_DISCOVERY_ENABLED").ok().as_deref() != Some("false") {
+            return;
+        }
+        assert!(matches!(parse_gateway(&[]), Ok(g) if !g.discovery_enabled));
     }
 
     #[test]

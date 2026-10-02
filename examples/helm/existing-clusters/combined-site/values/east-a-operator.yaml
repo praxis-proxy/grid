@@ -1,6 +1,5 @@
 # Grid Operator values for the east-a combined site.
-# The operator discovers the consumer gateway on this cluster.
-# The provider gateway is a separate Praxis release on the same cluster.
+# The operator advertises the provider gateway on this cluster.
 #
 # Install:
 #   helm upgrade --install grid-operator ../../../../charts/grid-operator \
@@ -22,5 +21,5 @@ swim:
     port: 7946
 
 gateway:
-  serviceName: consumer-gateway
-  port: "8080"
+  serviceName: provider-gateway
+  port: "8443"

@@ -62,6 +62,38 @@ tests:
             name: GRID_SWIM_SERVICE_NAME
             value: grid-grid-operator-swim
 
+  - it: disables gateway address discovery when requested
+    template: templates/deployment.yaml
+    set:
+      gateway.discoveryEnabled: false
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: GRID_GATEWAY_DISCOVERY_ENABLED
+            value: "false"
+
+  - it: leaves the gateway port unset for Service-port discovery
+    template: templates/deployment.yaml
+    set:
+      gateway.port: null
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: GRID_GATEWAY_PORT
+
+  - it: enables gateway discovery when the value is null
+    template: templates/deployment.yaml
+    set:
+      gateway.discoveryEnabled: null
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: GRID_GATEWAY_DISCOVERY_ENABLED
+            value: "true"
+
   - it: NodePort keeps the Pod IP default
     template: templates/deployment.yaml
     set:

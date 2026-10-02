@@ -21,7 +21,6 @@ swim:
     type: LoadBalancer
     port: 7946
 
+# Consumer-only sites have no local provider gateway to advertise.
 gateway:
-  # The Praxis consumer gateway Service name in the same namespace.
-  serviceName: consumer-gateway
-  port: "8080"
+  discoveryEnabled: false

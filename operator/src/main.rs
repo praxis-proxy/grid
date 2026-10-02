@@ -349,8 +349,8 @@ async fn resolve_grid_modes(client: &Client) -> Result<GridModes, String> {
 /// configured bind or advertise endpoint is invalid or cannot be resolved.
 ///
 /// Gateway address resolution uses [`operator::gateway::resolve`]:
-/// `GRID_GATEWAY_ADDRESS` env var wins; otherwise the operator discovers
-/// its own provider gateway Service `LoadBalancer` IP from Kubernetes.
+/// `GRID_GATEWAY_ADDRESS` env var wins; otherwise enabled discovery reads the
+/// site's gateway Service `LoadBalancer` IP from Kubernetes.
 #[expect(
     clippy::too_many_lines,
     clippy::cognitive_complexity,

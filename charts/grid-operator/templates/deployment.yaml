@@ -91,8 +91,12 @@ spec:
             {{- end }}
             - name: GRID_GATEWAY_NAMESPACE
               value: {{ .Values.gateway.namespace | default .Release.Namespace | quote }}
+            {{- with .Values.gateway.port }}
             - name: GRID_GATEWAY_PORT
-              value: {{ .Values.gateway.port | default "8080" | quote }}
+              value: {{ . | quote }}
+            {{- end }}
+            - name: GRID_GATEWAY_DISCOVERY_ENABLED
+              value: {{ (ne (toString .Values.gateway.discoveryEnabled) "false") | quote }}
             {{- if (.Values.signals).enabled }}
             - name: GRID_SIGNALS_LOCAL_ADDR
               value: {{ printf "%s-swim.%s.svc:%v" (include "grid-operator.fullname" .) .Release.Namespace .Values.signals.port | quote }}
