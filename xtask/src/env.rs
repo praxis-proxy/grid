@@ -4546,7 +4546,7 @@ fn env_verify_metrics_routing(config: &Path) -> Result<(), Box<dyn std::error::E
 /// **Auto-discovery proof (step 3):** after SWIM convergence, the primary operator creates
 /// a `GridSite` for the joining SWIM member without any harness-assisted `kubectl apply`.
 /// The created `GridSite` is named after the SWIM `site_id` and has `spec.gridNetworkRef` and
-/// `spec.egress.address` populated from the SWIM membership record.
+/// `spec.gatewayEndpoint.address` populated from the SWIM membership record.
 ///
 /// **Lifecycle proof (step 5):** a separate harness-created `GridSite` is advanced through
 /// `Pending → Discovered → Connecting → Active`.  Only `Discovered` is harness-patched;
@@ -4658,7 +4658,7 @@ fn env_verify_site_join_discovery(config: &Path) -> Result<(), Box<dyn std::erro
     operator::wait_for_gridsite_phase(&east_ctx, &auto_site_name, "Connecting", SITE_JOIN_PHASE_POLL_TIMEOUT)?;
     operator::verify_auto_gridsite_fields(&east_ctx, &auto_site_name, SITE_JOIN_NETWORK, "Connecting")?;
 
-    // Hard assertion: spec.egress.address must equal the gateway address, NOT the SWIM UDP address.
+    // Hard assertion: spec.gatewayEndpoint.address must equal the gateway address, NOT the SWIM UDP address.
     // This proves that auto-discovered GridSites carry the data-plane gateway address
     // separately from the SWIM membership endpoint.
     operator::verify_auto_gridsite_egress(&east_ctx, &auto_site_name, &joining_gw_addr, &bind_joining)?;
@@ -4717,7 +4717,7 @@ fn env_verify_site_join_discovery(config: &Path) -> Result<(), Box<dyn std::erro
     operator::patch_gridsite_phase(&east_ctx, SITE_JOIN_JOINING_SITE, "Discovered")?;
     operator::bump_gridsite(&east_ctx, SITE_JOIN_JOINING_SITE)?;
     // The GridSite controller now drives Discovered → Connecting automatically when
-    // spec.egress.address is non-empty and reachable by TCP.
+    // spec.gatewayEndpoint.address is non-empty and reachable by TCP.
     // Wait for Connecting — do NOT wait for Discovered, which would be immediately
     // superseded by the operator's automated transition.
     operator::wait_for_gridsite_phase(

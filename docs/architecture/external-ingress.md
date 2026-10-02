@@ -376,7 +376,7 @@ Gateway addresses and provider state use independent SWIM broadcast lanes. A
 gateway-only update is accepted independently of the last provider-state
 revision, so a Service port or address change cannot remain hidden behind a
 higher, unrelated CRDT revision. The receiving operator reconciles the updated
-address into the auto-discovered `GridSite.spec.egress.address`.
+address into the auto-discovered `GridSite.spec.gatewayEndpoint.address`.
 
 Provider backends are private Services. Network policy admits inference
 traffic from provider-gateway workloads and explicitly authorized health

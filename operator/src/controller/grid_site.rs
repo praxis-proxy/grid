@@ -170,7 +170,11 @@ pub(crate) fn site_phase_next(
     site: &GridSite,
     outcome: Option<&GatewayProbeOutcome>,
 ) -> (GridSitePhase, String, String) {
-    let has_egress_address = site.spec.egress.as_ref().is_some_and(|e| !e.address.trim().is_empty());
+    let has_egress_address = site
+        .spec
+        .gateway_endpoint
+        .as_ref()
+        .is_some_and(|e| !e.address.trim().is_empty());
 
     match current {
         GridSitePhase::Pending => (
@@ -229,7 +233,7 @@ pub(crate) fn site_phase_next(
 ///
 /// Never leaks private key material in the returned outcome.
 async fn evaluate_gateway(site: &GridSite, client: &Client, network: &GridNetwork) -> GatewayProbeOutcome {
-    let probe_addr = site.spec.egress.as_ref().and_then(|e| {
+    let probe_addr = site.spec.gateway_endpoint.as_ref().and_then(|e| {
         if e.address.trim().is_empty() {
             None
         } else {
@@ -353,7 +357,7 @@ async fn build_probe_config_from_secrets(
 
     let server_name_str = site
         .spec
-        .egress
+        .gateway_endpoint
         .as_ref()
         .and_then(|e| e.tls.server_name.as_deref())
         .ok_or(O::TrustMaterialMissing)?;
@@ -436,7 +440,7 @@ pub(crate) fn phase_label(phase: &GridSitePhase) -> &'static str {
 /// Whether the site's egress transport is plaintext (no TLS).
 fn is_plaintext_transport(site: &GridSite) -> bool {
     site.spec
-        .egress
+        .gateway_endpoint
         .as_ref()
         .is_some_and(|e| e.tls.mode == EgressTlsMode::Plaintext)
 }
@@ -766,7 +770,7 @@ mod tests {
             },
             spec: GridSiteSpec {
                 grid_network_ref: "test-net".to_owned(),
-                egress: Some(EgressConfig {
+                gateway_endpoint: Some(EgressConfig {
                     address: egress.to_owned(),
                     tls: EgressTls::default(),
                 }),
@@ -799,7 +803,7 @@ mod tests {
             },
             spec: GridSiteSpec {
                 grid_network_ref: "test-net".to_owned(),
-                egress: None,
+                gateway_endpoint: None,
                 region: None,
                 sovereignty_zone: None,
                 zone: None,
@@ -954,7 +958,7 @@ mod tests {
             GridSitePhase::Unreachable,
             "Active without egress cannot remain Active"
         );
-        assert_eq!(reason, "EgressMissing");
+        assert_eq!(reason, "GatewayAddressMissing");
     }
 
     #[test]
@@ -995,7 +999,7 @@ mod tests {
             GridSitePhase::Unreachable,
             "Unreachable without gateway must stay Unreachable"
         );
-        assert_eq!(reason, "EgressMissing");
+        assert_eq!(reason, "GatewayAddressMissing");
     }
 
     #[test]
@@ -1194,7 +1198,7 @@ mod tests {
             },
             spec: GridSiteSpec {
                 grid_network_ref: "test-net".to_owned(),
-                egress: Some(EgressConfig {
+                gateway_endpoint: Some(EgressConfig {
                     address: egress.to_owned(),
                     tls: EgressTls {
                         mode: EgressTlsMode::Plaintext,
@@ -1409,7 +1413,7 @@ mod tests {
             },
             spec: GridSiteSpec {
                 grid_network_ref: "test-net".to_owned(),
-                egress: Some(EgressConfig {
+                gateway_endpoint: Some(EgressConfig {
                     address: egress.to_owned(),
                     tls: EgressTls::default(),
                 }),

@@ -36,8 +36,8 @@ pub struct GridSiteSpec {
     /// [`GridNetwork`]: crate::crd::grid_network::GridNetwork
     pub grid_network_ref: String,
 
-    /// Egress endpoint for data-plane connectivity.
-    pub egress: Option<EgressConfig>,
+    /// Gateway endpoint for data-plane connectivity.
+    pub gateway_endpoint: Option<EgressConfig>,
 
     /// Deployment region.
     pub region: Option<String>,
@@ -291,7 +291,7 @@ mod tests {
     fn spec_serde_round_trip() {
         let json = serde_json::json!({
             "gridNetworkRef": "production",
-            "egress": {
+            "gatewayEndpoint": {
                 "address": "egress.cluster-b:8443",
                 "tls": {"mode": "Mutual"}
             },
@@ -431,7 +431,7 @@ mod tests {
     fn backward_compatible_spec_without_new_fields() {
         let json = serde_json::json!({
             "gridNetworkRef": "production",
-            "egress": {
+            "gatewayEndpoint": {
                 "address": "egress.cluster-b:8443",
                 "tls": {"mode": "Mutual"}
             },
@@ -441,7 +441,7 @@ mod tests {
         });
         let spec: GridSiteSpec = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
         assert_eq!(spec.grid_network_ref, "production", "network ref");
-        let egress = spec.egress.unwrap_or_else(|| std::process::abort());
+        let egress = spec.gateway_endpoint.unwrap_or_else(|| std::process::abort());
         assert_eq!(egress.tls.mode, EgressTlsMode::Mutual, "mode");
         assert!(egress.tls.server_name.is_none(), "no server_name in legacy spec");
         let trust = spec.trust.unwrap_or_else(|| std::process::abort());
@@ -470,7 +470,7 @@ mod tests {
 
         let server_name = crd
             .pointer(
-                "/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties/egress/properties/tls/properties/serverName",
+                "/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties/gatewayEndpoint/properties/tls/properties/serverName",
             )
             .unwrap_or_else(|| std::process::abort());
         assert_eq!(

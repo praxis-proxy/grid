@@ -306,7 +306,7 @@ metadata:
     grid.praxis.fast/network: production
 spec:
   gridNetworkRef: production
-  egress:
+  gatewayEndpoint:
     address: egress.cluster-b.example.com:8443
     tls:
       mode: Mutual
@@ -341,7 +341,7 @@ A discovered SWIM peer is not automatically authorized for routing.
 |---|---|---|
 | `Pending` | Resource created (manually or by auto-discovery) | Initial default |
 | `Discovered` | SWIM peer observed as Alive | `GridNetwork` controller writes on first observation |
-| `Connecting` | Gateway address known (`spec.egress.address` non-empty) | `GridSite` controller advances from Discovered; performs identity-aware probe |
+| `Connecting` | Gateway address known (`spec.gatewayEndpoint.address` non-empty) | `GridSite` controller advances from Discovered; performs identity-aware probe |
 | `Active` | `TlsVerified` | `GridSite` controller promotes from Connecting only after identity-verified TLS succeeds |
 | `Unreachable` | Connectivity failure while Active | `GridSite` controller moves Active → Unreachable when the endpoint cannot be reached |
 | `Left` | Set on graceful site departure | Preserved by operator once set |
@@ -353,8 +353,7 @@ A discovered SWIM peer is not automatically authorized for routing.
 | `AwaitingDiscovery` | Pending | Site record exists; SWIM has not yet observed the peer as Alive |
 | `SWIMDiscovered` | Discovered | Peer observed as Alive in SWIM membership; gateway address propagating |
 | `GatewayAddressKnown` | Connecting | Gateway address received; advancing to Connecting |
-| `GatewayAddressMissing` | Discovered | No gateway address known; see `GRID_GATEWAY_ADDRESS` |
-| `EgressMissing` | Connecting or Unreachable | A previously probed site has no egress address |
+| `GatewayAddressMissing` | Discovered, Connecting, or Unreachable | No gateway address known (see `GRID_GATEWAY_ADDRESS`), or a previously probed site lost it |
 | `TlsVerified` | Active | TLS handshake succeeded; certificate chain, identity, and configured pin verified |
 | `IdentityVerificationRequired` | Connecting | TCP endpoint is reachable, but plaintext cannot establish the gateway identity |
 | `PlaintextUnreachable` | Connecting or Unreachable | TCP probe failed (explicit Plaintext mode) |
@@ -374,7 +373,7 @@ A discovered SWIM peer is not automatically authorized for routing.
   peer is first observed as Alive (requires `grid.praxis.fast/auto-discover-sites: "true"`
   label on the `GridNetwork`).
 - Discovered → Connecting: the `GridSite` controller advances automatically when
-  `spec.egress.address` is non-empty. For auto-discovered sites, the egress address comes from
+  `spec.gatewayEndpoint.address` is non-empty. For auto-discovered sites, the egress address comes from
   the remote operator's `GRID_GATEWAY_ADDRESS` env var, propagated via SWIM state broadcast.
   If the remote operator has not configured `GRID_GATEWAY_ADDRESS`, the egress address is empty
   and the site stays Discovered with reason `GatewayAddressMissing`.
@@ -397,11 +396,11 @@ updates on every `GridNetwork` reconcile, and drops a site's series once its `Gr
 is gone. Cardinality is six series per site. `grid_site_phase_transition_total`
 still counts the transitions by phase and reason.
 
-**`spec.egress.address` source:** For auto-discovered sites, the egress address is sourced from
+**`spec.gatewayEndpoint.address` source:** For auto-discovered sites, the egress address is sourced from
 the remote operator's `GRID_GATEWAY_ADDRESS` environment variable, propagated through the SWIM
 state broadcast.  If the remote operator has not configured `GRID_GATEWAY_ADDRESS`, the field
 is empty and the site stays Discovered.  For manually-applied `GridSite` resources, set
-`spec.egress.address` explicitly to the data-plane gateway endpoint.
+`spec.gatewayEndpoint.address` explicitly to the data-plane gateway endpoint.
 
 **`status.publicCertPem`:** The public site certificate PEM received from the remote site via
 SWIM state broadcast.  Before storage, the operator performs a structural check:
@@ -420,7 +419,7 @@ structural check passed.  It does **not** mean:
 Private keys, bearer tokens, provider credentials, and Kubernetes Secret contents must never
 be written to status.
 
-**`spec.egress.tls` fields:**
+**`spec.gatewayEndpoint.tls` fields:**
 
 | Field | Meaning |
 |---|---|
@@ -458,7 +457,7 @@ block local serving:** local `InferenceProvider`s are eligible regardless of
 "Routing eligibility" above). Do not add SWIM seeds or extra operator replicas to
 try to force the site `Active` - there is no second site to discover, and a lone
 operator legitimately runs a single-node mesh with zero peers. The `Active` phase
-and its mTLS gateway probe (`spec.egress` + `spec.trust`) apply to reaching
+and its mTLS gateway probe (`spec.gatewayEndpoint` + `spec.trust`) apply to reaching
 *remote* sites, or a manually-configured peer gateway endpoint. See
 [Architecture Overview -> Single-Site and Combined Deployments](overview.md#single-site-and-combined-deployments).
 

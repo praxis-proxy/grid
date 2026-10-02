@@ -545,14 +545,14 @@ The trust bootstrap for a remote site progresses through these steps:
 2. **Gateway address known** — the remote operator advertises its resolved gateway
    address via SWIM state broadcast.  The address is resolved by the self-discovery
    poller (Service LoadBalancer lookup) or from the `GRID_GATEWAY_ADDRESS` override.
-   The local operator stores it in `GridSite.spec.egress.address`.
+   The local operator stores it in `GridSite.spec.gatewayEndpoint.address`.
    Phase: `Connecting`.  No trust established.
 
 3. **Public cert material received** — the remote operator broadcasts its public site
    certificate PEM.  The operator validates the PEM structure (rejects private-key markers;
    checks for `CERTIFICATE` header) and stores it in `GridSite.status.publicCertPem`.
 
-4. **Identity policy configured** — set `spec.egress.tls.serverName` to the
+4. **Identity policy configured** — set `spec.gatewayEndpoint.tls.serverName` to the
    expected DNS SAN and set `spec.trust.canonicalFingerprints` to one or two
    independently verified DER-certificate SHA-256 pins. Configure
    `GridNetwork.spec.tls.caSecretRef` and `siteSecretRef` for server and client
@@ -565,7 +565,7 @@ The trust bootstrap for a remote site progresses through these steps:
 
    ```yaml
    spec:
-     egress:
+     gatewayEndpoint:
        address: provider.example.com:8443
        tls:
          mode: Mutual
@@ -624,12 +624,12 @@ gateway independently authorizes peer identity on every data-plane request.
 ## 5. Connectivity Verification
 
 The `GridSite` controller verifies gateway reachability and identity against
-`spec.egress.address`.
+`spec.gatewayEndpoint.address`.
 
 | Condition | Current check |
 |-----------|---------------|
 | `SWIMReachable` | SWIM membership reports the peer Alive |
-| `GatewayAddressKnown` | `spec.egress.address` is non-empty |
+| `GatewayAddressKnown` | `spec.gatewayEndpoint.address` is non-empty |
 | `TlsVerified` | Mutual TLS handshake, chain, SAN, and live-leaf pin all verify |
 | `IdentityVerificationRequired` | Plaintext endpoint accepts TCP, but remains ineligible because its identity is not verified |
 
@@ -869,7 +869,7 @@ public certificate (`tls.crt`) from the site Secret, not the private key (`tls.k
 
 The operator resolves and advertises its data-plane gateway address to SWIM
 peers. This address is propagated through SWIM state broadcasts and used by
-receiving operators to populate `GridSite.spec.egress.address` for
+receiving operators to populate `GridSite.spec.gatewayEndpoint.address` for
 auto-discovered sites.
 
 **Self-discovery (default):** A background poller periodically looks up the
@@ -903,9 +903,9 @@ GRID_GATEWAY_ADDRESS=10.0.0.4:8080 ./operator
 
 **Requirements:**
 - Format: `host:port` or `IP:port` (any non-empty string is accepted; the remote
-  operator stores it verbatim in `GridSite.spec.egress.address`)
+  operator stores it verbatim in `GridSite.spec.gatewayEndpoint.address`)
 - When absent or empty and no LoadBalancer Service exists: auto-discovered
-  `GridSite` records have empty `spec.egress.address` and stay in `Discovered`
+  `GridSite` records have empty `spec.gatewayEndpoint.address` and stay in `Discovered`
   phase until the Service appears
 - This address is separate from `GRID_SWIM_BIND_ADDR` — the SWIM gossip endpoint
   and the data-plane gateway address are distinct
@@ -917,7 +917,7 @@ SNI, address scope, and generation;
 arbitrary or ambiguous advertised strings do not become routable endpoints.
 
 **Probe behavior:** In Mutual mode, the `GridSite` controller performs a bounded
-mTLS connection to `spec.egress.address`. It verifies the configured CA,
+mTLS connection to `spec.gatewayEndpoint.address`. It verifies the configured CA,
 `serverName`, and the canonical live-certificate pin. A successful probe reports
 `reason: TlsVerified`. Connection failures move an Active site to `Unreachable`;
 identity or trust failures move it to `Connecting`.
@@ -958,7 +958,7 @@ kubectl get gridsite <name> -o jsonpath='{.status.phase}/{.status.reason}: {.sta
 |---|---|---|
 | (new) | Pending | Resource created |
 | Pending | Discovered | `GridNetwork` controller observes SWIM Alive member |
-| Discovered | Connecting | `GridSite` controller: `spec.egress.address` non-empty |
+| Discovered | Connecting | `GridSite` controller: `spec.gatewayEndpoint.address` non-empty |
 | Connecting | Active | `GridSite` controller: configured Mutual TLS identity probe succeeds |
 | Active | Connecting | TLS identity or trust verification fails, or the endpoint is changed to plaintext |
 | Active | Unreachable | Gateway address is missing, times out, or refuses the connection |
@@ -977,7 +977,7 @@ separate steps.
 
 **Phase stays Discovered (not advancing to Connecting)**
 
-- The site has no `spec.egress.address`.  Verify the remote operator's
+- The site has no `spec.gatewayEndpoint.address`.  Verify the remote operator's
   `provider-gateway` LoadBalancer Service exists and has an external IP assigned,
   or set `GRID_GATEWAY_ADDRESS` as an explicit override.  The self-discovery poller
   will propagate the address through SWIM once discovered.
@@ -1002,7 +1002,7 @@ separate steps.
 
 **Phase is Active, site became Unreachable**
 
-- The connection to `spec.egress.address` failed. When connectivity returns,
+- The connection to `spec.gatewayEndpoint.address` failed. When connectivity returns,
   the complete configured identity probe must pass before the site returns to
   Active.
 

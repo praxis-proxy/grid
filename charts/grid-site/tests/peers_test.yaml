@@ -41,7 +41,7 @@ tests:
           path: spec
           value:
             gridNetworkRef: grid
-            egress:
+            gatewayEndpoint:
               address: 203.0.113.21:8080
               tls:
                 mode: Mutual
@@ -55,7 +55,7 @@ tests:
       peers.site-b.serverName: gw.site-b.example.com
     asserts:
       - equal:
-          path: spec.egress.tls.serverName
+          path: spec.gatewayEndpoint.tls.serverName
           value: gw.site-b.example.com
 
   - it: refuses a malformed pin
