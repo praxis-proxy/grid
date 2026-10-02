@@ -5,6 +5,9 @@ metadata:
   name: {{ include "grid-operator.fullname" . }}-test
   labels:
     {{- include "grid-operator.labels" . | nindent 4 }}
+    {{- if include "grid-operator.networkPolicy.enabled" . }}
+    app.kubernetes.io/component: helm-test
+    {{- end }}
   annotations:
     helm.sh/hook: test
     helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
@@ -17,6 +20,12 @@ spec:
         - sh
         - -c
         - |
+          {{- if include "grid-operator.metricsTls.enabled" . }}
+          # Checks readiness. The ServiceMonitor verifies the certificate.
+          wget -qO- --timeout=5 --no-check-certificate \
+            https://{{ include "grid-operator.fullname" . }}-metrics:{{ .Values.metrics.service.port }}/readyz
+          {{- else }}
           wget -qO- --timeout=5 \
             http://{{ include "grid-operator.fullname" . }}-metrics:{{ .Values.metrics.service.port }}/readyz
+          {{- end }}
 {{- end }}

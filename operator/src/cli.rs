@@ -32,6 +32,10 @@ pub struct Cli {
     /// Grid-wide modes to start in before a `GridNetwork` exists.
     #[command(flatten)]
     pub grid: GridArgs,
+
+    /// Metrics and health listener options.
+    #[command(flatten)]
+    pub metrics: MetricsArgs,
 }
 
 /// Grid-wide modes the install declares, used until its `GridNetwork` exists.
@@ -45,6 +49,23 @@ pub struct GridArgs {
     /// Peer trust to start in with no `GridNetwork`, the chart's grid.peerTrust.
     #[arg(long = "grid-peer-trust", env = "GRID_PEER_TRUST", value_enum)]
     pub peer_trust: Option<PeerTrustMode>,
+}
+
+/// Metrics and health listener options.
+#[derive(Args, Debug, Clone)]
+#[group(id = "metrics")]
+pub struct MetricsArgs {
+    /// PEM certificate the listener serves. With the key, the listener is TLS only.
+    #[arg(long = "metrics-tls-cert", env = "GRID_METRICS_TLS_CERT")]
+    pub cert: Option<std::path::PathBuf>,
+
+    /// PEM private key for the listener certificate.
+    #[arg(long = "metrics-tls-key", env = "GRID_METRICS_TLS_KEY")]
+    pub key: Option<std::path::PathBuf>,
+
+    /// Serve the site identity Secret in the operator namespace instead, once enrollment writes it.
+    #[arg(long = "metrics-tls-site-secret", env = "GRID_METRICS_TLS_SITE_SECRET")]
+    pub site_identity_secret: Option<String>,
 }
 
 /// SWIM runtime options.

@@ -99,6 +99,21 @@ annotation, which `crds.keep` set at that time.
 - The signals listener binds `[::]:9091`, or `0.0.0.0:9091` without IPv6.
 - Unparseable `GRID_SIGNALS_*` settings fail at startup.
 
+### Metrics over TLS
+
+This chart version has no upgrade path from earlier ones; reinstall it. What changes:
+
+- `metrics.tls.enabled: auto` serves `/metrics`, `/healthz`, and `/readyz` over HTTPS on
+  OpenShift (service CA) and on any grid site (`grid.id` or `enrollment.enabled`, site
+  identity). A scrape that still uses `http` fails. The chart's ServiceMonitor follows;
+  update a hand-written one, or set `metrics.tls.enabled: false`.
+- On OpenShift, `networkPolicy.enabled: auto` admits only the monitoring namespaces in
+  `networkPolicy.metricsFrom` to the metrics and health port. Outside OpenShift no
+  NetworkPolicy is rendered, so the port has no authentication; restrict it yourself or set
+  `networkPolicy.enabled: true`.
+- Under `siteIdentity` the port listens only after enrollment writes the identity, so the
+  scrape target is down until then. Do not alert on it during enrollment.
+
 ### Gateway namespace
 
 The operator looks for the gateway Service in the release namespace unless
@@ -164,6 +179,10 @@ RELEASE=grid-operator; NAMESPACE=grid-system; for crd in agenttoolproviders grid
 | `metrics.service.enabled` | bool | `true` | Create a metrics ClusterIP Service. |
 | `metrics.service.port` | int | `9090` | Metrics Service port. |
 | `metrics.service.annotations` | object | `{}` | Metrics Service annotations. |
+| `metrics.tls.enabled` | bool or `auto` | `auto` | Serve `/metrics`, `/healthz`, and `/readyz` over TLS from `metrics.tls.source`. `false` serves plaintext. The probes switch to HTTPS, and the certificate reloads when it rotates. |
+| `metrics.tls.source` | string | `auto` | `serviceCA`, `siteIdentity`, or `existingSecret`. `auto` picks `existingSecret` when set, else `serviceCA` on OpenShift, else `siteIdentity` when `grid.id` or `enrollment.enabled` is set. So every grid site serves HTTPS, and only an install with no grid identity serves plaintext. `siteIdentity` serves the enrolled `grid-site-identity` (`enrollment.identitySecretName`), read once enrollment writes it, so the port listens only after enrollment. An offline render without `--api-versions security.openshift.io/v1` picks `siteIdentity` rather than `serviceCA`. |
+| `metrics.tls.existingSecret` | string | `""` | Secret holding `tls.crt` and `tls.key` for source `existingSecret`. For `serviceCA`, the metrics Service asks the OpenShift service CA for `<fullname>-metrics-tls`. |
+| `metrics.tls.mountPath` | string | `/etc/grid/metrics-tls` | Mount path for the certificate and key. |
 | `swim.bindAddress` | string | `0.0.0.0:7946` | SWIM protocol bind address. |
 | `swim.advertiseAddress` | string | `""` | Externally reachable SWIM address. Defaults to the SWIM Service LoadBalancer address, else Pod IP. |
 | `swim.requireKey` | bool | `true` | Hold SWIM traffic until the GridNetwork key loads or the network declares none. |
@@ -186,13 +205,18 @@ RELEASE=grid-operator; NAMESPACE=grid-system; for crd in agenttoolproviders grid
 | `gateway.port` | string | `""` | Provider gateway Service port advertised to remote sites. Empty uses 8080. Maps to `GRID_GATEWAY_PORT`. |
 | `health.liveness.initialDelaySeconds` | int | `5` | Liveness probe initial delay. |
 | `health.liveness.periodSeconds` | int | `10` | Liveness probe period. |
+| `health.startup.periodSeconds` | int | `10` | Startup probe period, for `metrics.tls.source` `siteIdentity`. |
+| `health.startup.failureThreshold` | int | `96` | Startup probe failures before a restart. The window outlasts the 15-minute enrollment deadline, so a restart never interrupts enrollment. |
 | `health.readiness.initialDelaySeconds` | int | `5` | Readiness probe initial delay. |
 | `health.readiness.periodSeconds` | int | `10` | Readiness probe period. |
 | `serviceMonitor.enabled` | bool | `false` | Create a Prometheus ServiceMonitor. |
 | `serviceMonitor.labels` | object | `{}` | Additional ServiceMonitor labels. |
 | `serviceMonitor.namespace` | string | `""` | ServiceMonitor namespace override. |
-| `serviceMonitor.interval` | string | `""` | Prometheus scrape interval. |
-| `serviceMonitor.scrapeTimeout` | string | `""` | Prometheus scrape timeout. |
+| `serviceMonitor.interval` | string | `30s` | Prometheus scrape interval. Empty leaves the Prometheus default. |
+| `serviceMonitor.scrapeTimeout` | string | `10s` | Prometheus scrape timeout. Empty leaves the Prometheus default. |
+| `networkPolicy.enabled` | bool or `auto` | `auto` | Render a NetworkPolicy for the operator pod. `auto` turns it on where OpenShift runs. SWIM and signals stay open to every peer. |
+| `networkPolicy.metricsFrom` | list | the OpenShift user-workload and platform monitoring namespaces | NetworkPolicyPeer entries allowed to reach the metrics and health port. Kubelet probes are unaffected on OpenShift. Must not be empty. |
+| `serviceMonitor.tlsConfig` | object | `{}` | Scrape TLS settings when `metrics.tls` is on. Empty: the OpenShift service CA and the Service DNS name for `serviceCA`, or the grid CA Secret and `<site>.grid.internal` for `siteIdentity`. Required with `existingSecret`. |
 | `resources` | object | `{}` | Container resource requests and limits. |
 | `nodeSelector` | object | `{}` | Node selector for scheduling. |
 | `affinity` | object | `{}` | Pod affinity rules. |

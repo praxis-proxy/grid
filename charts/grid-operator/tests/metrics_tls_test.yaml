@@ -1,0 +1,251 @@
+suite: metrics TLS
+templates:
+  - templates/deployment.yaml
+  - templates/service-metrics.yaml
+  - templates/servicemonitor.yaml
+  - templates/tests/operator-ready.yaml
+release:
+  name: gop
+  namespace: grid
+tests:
+  - it: an install with no grid identity has no certificate, so stays plaintext
+    template: templates/deployment.yaml
+    asserts:
+      - notExists:
+          path: spec.template.spec.containers[0].livenessProbe.httpGet.scheme
+      - notExists:
+          path: spec.template.spec.volumes
+
+  - it: an explicit false serves plaintext on a grid site
+    template: templates/deployment.yaml
+    set:
+      metrics.tls.enabled: false
+      enrollment.enabled: true
+      swim.siteName: site-d
+    asserts:
+      - notExists:
+          path: spec.template.spec.containers[0].livenessProbe.httpGet.scheme
+      - notExists:
+          path: spec.template.spec.containers[0].startupProbe
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content: { name: GRID_METRICS_TLS_SITE_SECRET, value: grid-site-identity }
+
+  - it: serves the service CA certificate on OpenShift
+    template: templates/deployment.yaml
+    capabilities:
+      apiVersions: [security.openshift.io/v1]
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].livenessProbe.httpGet.scheme
+          value: HTTPS
+      - equal:
+          path: spec.template.spec.containers[0].readinessProbe.httpGet.scheme
+          value: HTTPS
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content: { name: GRID_METRICS_TLS_CERT, value: /etc/grid/metrics-tls/tls.crt }
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content: { name: GRID_METRICS_TLS_KEY, value: /etc/grid/metrics-tls/tls.key }
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content: { name: metrics-tls, mountPath: /etc/grid/metrics-tls, readOnly: true }
+      - contains:
+          path: spec.template.spec.volumes
+          content: { name: metrics-tls, secret: { secretName: gop-grid-operator-metrics-tls, defaultMode: 0440 } }
+      - notExists:
+          path: spec.template.spec.containers[0].startupProbe
+
+  - it: asks the service CA for the certificate through the Service annotation
+    template: templates/service-metrics.yaml
+    capabilities:
+      apiVersions: [security.openshift.io/v1]
+    set:
+      metrics.service.annotations: { example.com/team: grid }
+    asserts:
+      - equal:
+          path: metadata.annotations["service.beta.openshift.io/serving-cert-secret-name"]
+          value: gop-grid-operator-metrics-tls
+      - equal:
+          path: metadata.annotations["example.com/team"]
+          value: grid
+
+  - it: an enrolled spoke serves its site identity, read once enrollment writes it
+    template: templates/deployment.yaml
+    set:
+      enrollment.enabled: true
+      swim.siteName: site-d
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content: { name: GRID_METRICS_TLS_SITE_SECRET, value: grid-site-identity }
+      - notContains:
+          path: spec.template.spec.volumes
+          content: { name: metrics-tls, secret: { secretName: gop-grid-operator-metrics-tls, defaultMode: 0440 } }
+      - equal:
+          path: spec.template.spec.containers[0].livenessProbe.httpGet.scheme
+          value: HTTPS
+      - equal:
+          path: spec.template.spec.containers[0].startupProbe
+          value:
+            httpGet: { path: /healthz, port: metrics, scheme: HTTPS }
+            periodSeconds: 10
+            failureThreshold: 96
+
+  - it: a site with a grid id serves its site identity, under the name the GridNetwork uses
+    template: templates/deployment.yaml
+    set:
+      grid.id: grid-a
+      enrollment.identitySecretName: east-identity
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content: { name: GRID_METRICS_TLS_SITE_SECRET, value: east-identity }
+
+  - it: an existing Secret wins over the service CA
+    capabilities:
+      apiVersions: [security.openshift.io/v1]
+    set:
+      metrics.tls.existingSecret: my-metrics-tls
+    asserts:
+      - contains:
+          path: spec.template.spec.volumes
+          content: { name: metrics-tls, secret: { secretName: my-metrics-tls, defaultMode: 0440 } }
+        template: templates/deployment.yaml
+      - notExists:
+          path: metadata.annotations
+        template: templates/service-metrics.yaml
+
+  - it: an explicit false stays plaintext on OpenShift
+    template: templates/service-metrics.yaml
+    capabilities:
+      apiVersions: [security.openshift.io/v1]
+    set:
+      metrics.tls.enabled: false
+    asserts:
+      - notExists:
+          path: metadata.annotations
+
+  - it: the ServiceMonitor scrapes over HTTPS with the service CA
+    template: templates/servicemonitor.yaml
+    capabilities:
+      apiVersions: [security.openshift.io/v1]
+    set:
+      serviceMonitor.enabled: true
+    asserts:
+      - equal:
+          path: spec.endpoints[0].scheme
+          value: https
+      - equal:
+          path: spec.endpoints[0].tlsConfig
+          value:
+            ca: { configMap: { name: openshift-service-ca.crt, key: service-ca.crt } }
+            serverName: gop-grid-operator-metrics.grid.svc
+
+  - it: the ServiceMonitor trusts the grid CA for the site identity
+    template: templates/servicemonitor.yaml
+    set:
+      enrollment.enabled: true
+      swim.siteName: site-d
+      serviceMonitor.enabled: true
+    asserts:
+      - equal:
+          path: spec.endpoints[0].tlsConfig
+          value:
+            ca: { secret: { name: grid-ca, key: ca.crt } }
+            serverName: site-d.grid.internal
+
+  - it: the ServiceMonitor names the site from enrollment.siteName
+    template: templates/servicemonitor.yaml
+    set:
+      enrollment.enabled: true
+      enrollment.siteName: site-e
+      serviceMonitor.enabled: true
+    asserts:
+      - equal:
+          path: spec.endpoints[0].tlsConfig.serverName
+          value: site-e.grid.internal
+
+  - it: the site identity ServiceMonitor must live beside the grid CA Secret
+    template: templates/servicemonitor.yaml
+    set:
+      enrollment.enabled: true
+      swim.siteName: site-d
+      serviceMonitor.enabled: true
+      serviceMonitor.namespace: monitoring
+    asserts:
+      - failedTemplate:
+          errorMessage: "serviceMonitor.namespace differs from the release namespace, where the grid CA Secret lives: set serviceMonitor.tlsConfig"
+
+  - it: the ServiceMonitor takes a given tlsConfig for an existing Secret
+    template: templates/servicemonitor.yaml
+    set:
+      metrics.tls.existingSecret: my-metrics-tls
+      serviceMonitor.enabled: true
+      serviceMonitor.tlsConfig: { ca: { secret: { name: my-ca, key: ca.crt } }, serverName: metrics.example }
+    asserts:
+      - equal:
+          path: spec.endpoints[0].tlsConfig.serverName
+          value: metrics.example
+
+  - it: the ServiceMonitor refuses to guess the CA for an existing Secret
+    template: templates/servicemonitor.yaml
+    set:
+      metrics.tls.existingSecret: my-metrics-tls
+      serviceMonitor.enabled: true
+    asserts:
+      - failedTemplate:
+          errorMessage: serviceMonitor.tlsConfig is required for metrics.tls with an existingSecret
+
+  - it: a grid id site's ServiceMonitor checks the certificate the operator issues for its site
+    template: templates/servicemonitor.yaml
+    set:
+      grid.id: grid-a
+      swim.siteName: east
+      serviceMonitor.enabled: true
+    asserts:
+      - equal:
+          path: spec.endpoints[0].tlsConfig.serverName
+          value: east.grid.internal
+
+  - it: the helm test reads readiness over HTTPS when TLS is on
+    template: templates/tests/operator-ready.yaml
+    set:
+      enrollment.enabled: true
+      swim.siteName: site-d
+    asserts:
+      - matchRegex:
+          path: spec.containers[0].command[2]
+          pattern: "--no-check-certificate"
+      - matchRegex:
+          path: spec.containers[0].command[2]
+          pattern: "https://gop-grid-operator-metrics:9090/readyz"
+
+  - it: the helm test reads readiness over HTTP when TLS is off
+    template: templates/tests/operator-ready.yaml
+    asserts:
+      - matchRegex:
+          path: spec.containers[0].command[2]
+          pattern: "http://gop-grid-operator-metrics:9090/readyz"
+      - notMatchRegex:
+          path: spec.containers[0].command[2]
+          pattern: "https://"
+
+  - it: an enrolled poll site serves metrics TLS on the metrics port and signals on its own port
+    template: templates/deployment.yaml
+    set:
+      swim.siteName: hub
+      enrollment.enabled: true
+      grid.signals: poll
+      signals.enabled: true
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content: { name: GRID_METRICS_TLS_SITE_SECRET, value: grid-site-identity }
+      - contains:
+          path: spec.template.spec.containers[0].ports
+          content: { name: metrics, containerPort: 9090, protocol: TCP }
+      - contains:
+          path: spec.template.spec.containers[0].ports
+          content: { name: signals, containerPort: 9091, protocol: TCP }

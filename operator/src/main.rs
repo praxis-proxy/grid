@@ -111,9 +111,22 @@ async fn main() {
         },
     };
 
-    // Probes answer during enrollment and the LoadBalancer wait.
+    // Probes answer during enrollment and the LoadBalancer wait, except under site identity TLS, which waits for
+    // enrollment.
     let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let metrics_server = tokio::spawn(run_metrics_server(Arc::clone(&ready)));
+    let metrics_tls = match operator::metrics_tls::MetricsTls::from_args(
+        config.metrics.cert.clone(),
+        config.metrics.key.clone(),
+        config.metrics.site_identity_secret.clone(),
+        &client,
+    ) {
+        Ok(tls) => tls,
+        Err(error) => {
+            tracing::error!(%error, "invalid metrics TLS settings");
+            std::process::exit(1);
+        },
+    };
+    let metrics_server = tokio::spawn(run_metrics_server(Arc::clone(&ready), metrics_tls));
 
     if config.enrollment.enabled
         && let Err(error) = Box::pin(operator::enroll::ensure_enrolled(&client, &config.enrollment)).await
@@ -164,6 +177,7 @@ async fn main() {
             .with_peer_settings(peer_settings)
             .with_declared_trust(declared_trust)
             .with_rotation(rotation_running)
+            .with_site_name(std::env::var("GRID_SWIM_SITE_NAME").ok())
             .hold_membership(),
     );
 
@@ -1116,6 +1130,7 @@ async fn run_agent_tool_provider_controller(client: Client) -> Result<(), Box<dy
 /// Serve Prometheus metrics and health endpoints.
 async fn run_metrics_server(
     ready: Arc<std::sync::atomic::AtomicBool>,
+    tls: Option<operator::metrics_tls::MetricsTls>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let addr = std::env::var("GRID_METRICS_ADDR").unwrap_or_else(|_| "0.0.0.0:9090".to_owned());
     let app = axum::Router::new()
@@ -1125,12 +1140,18 @@ async fn run_metrics_server(
             "/readyz",
             axum::routing::get(move || std::future::ready(readiness(&ready))),
         );
+    if let Some(tls) = tls {
+        return operator::metrics_tls::serve_metrics_tls(&addr, app, tls, METRICS_TLS_RELOAD).await;
+    }
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     let bound_addr = listener.local_addr().map_or_else(|_| addr.clone(), |a| a.to_string());
-    tracing::info!(addr = %bound_addr, "metrics server started");
+    tracing::info!(addr = %bound_addr, tls = false, "metrics server started");
     axum::serve(listener, app).await?;
     Ok(())
 }
+
+/// How often the metrics listener checks its certificate for rotation.
+const METRICS_TLS_RELOAD: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Prometheus text-format metrics handler.
 async fn metrics_handler() -> impl axum::response::IntoResponse {

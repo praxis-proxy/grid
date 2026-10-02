@@ -713,13 +713,17 @@ gateway_rolled_to() {
   [[ $(tr -d ':' <<<"${got,,}") == "$want" ]]
 }
 
-# poll_counts <context> <port>: this operator's peer polls, as outcome=count lines.
+# poll_counts <context> <port>: this operator's peer polls, as outcome=count lines. The
+# enrolled operator serves metrics over TLS from its site identity.
 poll_counts() {
-  local pid rc=0
+  local pid rc=0 name=hub
+  [[ $1 == "$HUB_CTX" ]] || name=$SITE
+  k "$HUB_CTX" get secret grid-ca -o jsonpath='{.data.ca\.crt}' | base64 -d >"$WORK/grid-ca.crt" || return 1
   k "$1" port-forward deployment/grid-operator "$2:9090" >/dev/null 2>&1 &
   pid=$!
   sleep 2
-  curl -sS --max-time 5 "http://127.0.0.1:$2/metrics" \
+  curl -sS --max-time 5 --cacert "$WORK/grid-ca.crt" --resolve "$name.grid.internal:$2:127.0.0.1" \
+    "https://$name.grid.internal:$2/metrics" \
     | awk -F'[{}]' '/^grid_peer_poll_total\{/ { split($2, l, ","); for (i in l) if (l[i] ~ /^outcome=/) { o = l[i]; gsub(/outcome=|"/, "", o) } ; n[o] += $3 } END { for (o in n) print o "=" n[o] }' \
     | sort || rc=1
   kill "$pid" 2>/dev/null || true

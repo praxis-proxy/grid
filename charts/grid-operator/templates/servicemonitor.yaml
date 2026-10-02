@@ -32,4 +32,31 @@ spec:
       {{- with .Values.serviceMonitor.scrapeTimeout }}
       scrapeTimeout: {{ . | quote }}
       {{- end }}
+      {{- if include "grid-operator.metricsTls.enabled" . }}
+      scheme: https
+      tlsConfig:
+        {{- if .Values.serviceMonitor.tlsConfig }}
+        {{- toYaml .Values.serviceMonitor.tlsConfig | nindent 8 }}
+        {{- else if include "grid-operator.metricsTls.serviceCa" . }}
+        ca:
+          configMap:
+            name: openshift-service-ca.crt
+            key: service-ca.crt
+        serverName: {{ printf "%s-metrics.%s.svc" (include "grid-operator.fullname" .) .Release.Namespace }}
+        {{- else if eq (include "grid-operator.metricsTls.source" .) "siteIdentity" }}
+        {{- if not .Values.swim.siteName }}
+        {{- fail "serviceMonitor with the site identity needs swim.siteName or enrollment.siteName, the name its certificate carries" }}
+        {{- end }}
+        {{- if and .Values.serviceMonitor.namespace (ne .Values.serviceMonitor.namespace .Release.Namespace) }}
+        {{- fail "serviceMonitor.namespace differs from the release namespace, where the grid CA Secret lives: set serviceMonitor.tlsConfig" }}
+        {{- end }}
+        ca:
+          secret:
+            name: {{ (.Values.enrollment).caSecretName | default "grid-ca" | quote }}
+            key: ca.crt
+        serverName: {{ printf "%s.grid.internal" .Values.swim.siteName }}
+        {{- else }}
+        {{- fail "serviceMonitor.tlsConfig is required for metrics.tls with an existingSecret" }}
+        {{- end }}
+      {{- end }}
 {{- end }}

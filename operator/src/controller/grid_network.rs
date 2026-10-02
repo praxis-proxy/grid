@@ -132,6 +132,9 @@ pub struct OperatorCtx {
 
     /// Whether this process runs the site identity rotation loop.
     rotation: bool,
+
+    /// This site's name, which a certificate the operator issues itself carries.
+    site_name: Option<String>,
 }
 
 /// Send `declared` to `sender`, returning whether it changed, so a repeat wakes nobody.
@@ -250,6 +253,7 @@ impl OperatorCtx {
             membership_ready: std::sync::atomic::AtomicBool::new(true),
             declared_trust: None,
             rotation: false,
+            site_name: None,
         }
     }
 
@@ -314,6 +318,19 @@ impl OperatorCtx {
     #[must_use]
     pub fn with_peer_settings(mut self, settings: PeerSettings) -> Self {
         self.peer_settings = settings;
+        self
+    }
+
+    /// Name the certificate the operator issues itself after this site, not the network.
+    #[must_use]
+    pub fn with_site_name(mut self, site_name: Option<String>) -> Self {
+        self.site_name = site_name.filter(|name| match certs::validate_site_name(name) {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(site = %name, %error, "site name is not a valid label; certificates name the network");
+                false
+            },
+        });
         self
     }
 
@@ -754,7 +771,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
     ctx.publish_declared_trust(&network);
 
     let client = &ctx.client;
-    ensure_tls_secrets(&network, client).await?;
+    ensure_tls_secrets(&network, client, ctx.site_name.as_deref()).await?;
 
     if let Some(swim) = ctx.swim() {
         // When a GridNetwork configures a SWIM key Secret, resolve and apply it
@@ -1363,7 +1380,11 @@ fn tls_secrets_action(ca_exists: bool, site_exists: bool) -> TlsSecrets {
     clippy::cognitive_complexity,
     reason = "decide, then create the CA and the identity it signs, as one step"
 )]
-async fn ensure_tls_secrets(network: &GridNetwork, client: &Client) -> Result<(), OperatorError> {
+async fn ensure_tls_secrets(
+    network: &GridNetwork,
+    client: &Client,
+    this_site: Option<&str>,
+) -> Result<(), OperatorError> {
     let tls = &network.spec.tls;
     let (Some(ca_ref), Some(site_ref)) = (&tls.ca_secret_ref, &tls.site_secret_ref) else {
         return Ok(());
@@ -1391,7 +1412,7 @@ async fn ensure_tls_secrets(network: &GridNetwork, client: &Client) -> Result<()
         return Ok(());
     }
 
-    let site_name = network_site_name(network);
+    let site_name = issued_site_name(network, this_site);
     let ca = certs::generate_ca("grid-ca")?;
     let site_cert = certs::generate_site_cert(&ca, &site_name)?;
 
@@ -2797,6 +2818,11 @@ pub(crate) fn consumer_config_status_error(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// The site a self-issued certificate names: this site when known, else the network.
+fn issued_site_name(network: &GridNetwork, site: Option<&str>) -> String {
+    site.map_or_else(|| network_site_name(network), str::to_owned)
+}
 
 /// Derive the site name from the `GridNetwork` metadata.
 fn network_site_name(network: &GridNetwork) -> String {
@@ -4698,6 +4724,17 @@ mod tests {
     // -----------------------------------------------------------------------
     // network_site_name — fallback helper
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_self_issued_certificate_names_this_site_not_the_network() {
+        let network = base_network();
+        assert_eq!(issued_site_name(&network, Some("east")), "east");
+        assert_eq!(
+            issued_site_name(&network, None),
+            "net",
+            "no site name falls back to the network"
+        );
+    }
 
     #[test]
     fn network_site_name_returns_metadata_name_when_present() {

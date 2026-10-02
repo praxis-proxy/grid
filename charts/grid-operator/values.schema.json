@@ -269,6 +269,74 @@
               "description": "Annotations on the metrics Service."
             }
           }
+        },
+        "tls": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "description": "false serves plaintext. auto and true serve TLS from metrics.tls.source.",
+              "oneOf": [
+                {
+                  "type": "boolean"
+                },
+                {
+                  "type": "string",
+                  "enum": [
+                    "auto"
+                  ]
+                }
+              ]
+            },
+            "source": {
+              "type": "string",
+              "enum": [
+                "auto",
+                "serviceCA",
+                "siteIdentity",
+                "existingSecret"
+              ],
+              "description": "Where the certificate comes from. auto picks one or fails the render."
+            },
+            "existingSecret": {
+              "type": "string",
+              "pattern": "^([a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?)?$",
+              "description": "Secret holding tls.crt and tls.key."
+            },
+            "mountPath": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Mount path for the certificate and key."
+            }
+          }
+        }
+      }
+    },
+    "networkPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "description": "auto, true, or false. auto turns it on where OpenShift runs.",
+          "oneOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "string",
+              "enum": [
+                "auto"
+              ]
+            }
+          ]
+        },
+        "metricsFrom": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object"
+          },
+          "description": "NetworkPolicyPeer entries allowed to reach the metrics port."
         }
       }
     },
@@ -419,6 +487,22 @@
             }
           }
         },
+        "startup": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "periodSeconds": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Period between startup probes."
+            },
+            "failureThreshold": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Failures allowed before restart."
+            }
+          }
+        },
         "readiness": {
           "type": "object",
           "additionalProperties": false,
@@ -463,6 +547,10 @@
         "scrapeTimeout": {
           "type": "string",
           "description": "Prometheus scrape timeout."
+        },
+        "tlsConfig": {
+          "type": "object",
+          "description": "ServiceMonitor endpoint tlsConfig when metrics.tls is on."
         }
       }
     },

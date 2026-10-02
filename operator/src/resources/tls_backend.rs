@@ -1066,20 +1066,31 @@ pub(crate) fn peer_chain_der(tls_stream: &ClientTlsStream) -> Option<Vec<Cow<'_,
     chain.iter().map(|cert| cert.to_der().ok().map(Cow::Owned)).collect()
 }
 
-/// Parsed OpenSSL server material: the site identity plus the grid roots that
-/// verify a client certificate.
+/// Whether and how a server asks for a client certificate.
+#[cfg(feature = "fips")]
+enum ClientAuth {
+    /// Ask for none.
+    None,
+    /// Verify one against `roots`, refusing a caller without one when `required`.
+    Verify {
+        /// Grid CA certificates a presented client certificate is verified against.
+        roots: Vec<X509>,
+        /// Whether a client certificate is required.
+        required: bool,
+    },
+}
+
+/// Parsed OpenSSL server material: the server identity and its client authentication.
 #[cfg(feature = "fips")]
 pub struct OpensslServerConfig {
-    /// Grid CA certificates a presented client certificate is verified against.
-    ca_roots: Vec<X509>,
+    /// How a client certificate is requested and verified.
+    client: ClientAuth,
     /// The server leaf certificate.
     leaf: X509,
     /// Intermediate certificates sent after the leaf.
     chain: Vec<X509>,
     /// Private key for `leaf`.
     key: PKey<Private>,
-    /// Whether a client certificate is required.
-    require_client: bool,
     /// The acceptor built from the fields above, shared by every connection.
     acceptor: OnceLock<SslAcceptor>,
 }
@@ -1089,7 +1100,13 @@ impl std::fmt::Debug for OpensslServerConfig {
     /// Redacts key material: reports only certificate counts.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OpensslServerConfig")
-            .field("ca_roots", &self.ca_roots.len())
+            .field(
+                "client_roots",
+                &match &self.client {
+                    ClientAuth::None => 0,
+                    ClientAuth::Verify { roots, .. } => roots.len(),
+                },
+            )
             .field("chain", &(self.chain.len() + 1))
             .finish()
     }
@@ -1097,7 +1114,7 @@ impl std::fmt::Debug for OpensslServerConfig {
 
 #[cfg(feature = "fips")]
 impl OpensslServerConfig {
-    /// Build an acceptor with the site identity, requiring a client certificate from the grid roots.
+    /// Build an acceptor with the server identity and its client authentication.
     fn acceptor_builder(&self) -> Result<SslAcceptorBuilder, openssl::error::ErrorStack> {
         let mut builder = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls_server())?;
         builder.set_private_key(&self.key)?;
@@ -1106,13 +1123,17 @@ impl OpensslServerConfig {
             builder.add_extra_chain_cert(extra.clone())?;
         }
         builder.check_private_key()?;
+        let ClientAuth::Verify { roots, required } = &self.client else {
+            builder.set_verify(SslVerifyMode::NONE);
+            return Ok(builder);
+        };
         let mut store = X509StoreBuilder::new()?;
-        for ca in &self.ca_roots {
+        for ca in roots {
             store.add_cert(ca.clone())?;
         }
         builder.set_verify_cert_store(store.build())?;
         // Anonymous callers would only hold slots.
-        let mode = if self.require_client {
+        let mode = if *required {
             SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT
         } else {
             SslVerifyMode::PEER
@@ -1211,16 +1232,65 @@ fn server_config(
     let chain = certs.collect();
     let key = PKey::private_key_from_pem(key_pem).map_err(|e| format!("signals TLS: key is not valid PEM: {e}"))?;
     let config = OpensslServerConfig {
-        ca_roots,
+        client: ClientAuth::Verify {
+            roots: ca_roots,
+            required: require_client,
+        },
         leaf,
         chain,
         key,
-        require_client,
         acceptor: OnceLock::new(),
     };
     config
         .acceptor_builder()
         .map_err(|e| format!("signals TLS: server config: {e}"))?;
+    Ok(Arc::new(config))
+}
+
+/// Server TLS from a certificate and key alone, asking for no client certificate.
+///
+/// # Errors
+///
+/// Returns a description when the certificate or key cannot be parsed or do not match.
+#[cfg(not(feature = "fips"))]
+pub fn build_server_only_config(cert_pem: &[u8], key_pem: &[u8]) -> Result<ServerTlsConfig, String> {
+    let chain = CertificateDer::pem_slice_iter(cert_pem)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("certificate is not valid PEM: {e}"))?;
+    if chain.is_empty() {
+        return Err("certificate PEM contains no certificates".to_owned());
+    }
+    let key = PrivateKeyDer::from_pem_slice(key_pem).map_err(|e| format!("key is not valid PEM: {e}"))?;
+    rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(chain, key)
+        .map(Arc::new)
+        .map_err(|e| format!("server config: {e}"))
+}
+
+/// Server TLS from a certificate and key alone, asking for no client certificate.
+///
+/// # Errors
+///
+/// Returns a description when the certificate or key cannot be parsed or do not match.
+#[cfg(feature = "fips")]
+pub fn build_server_only_config(cert_pem: &[u8], key_pem: &[u8]) -> Result<ServerTlsConfig, String> {
+    let mut certs = X509::stack_from_pem(cert_pem)
+        .map_err(|e| format!("certificate is not valid PEM: {e}"))?
+        .into_iter();
+    let leaf = certs
+        .next()
+        .ok_or_else(|| "certificate PEM contains no certificates".to_owned())?;
+    let chain = certs.collect();
+    let key = PKey::private_key_from_pem(key_pem).map_err(|e| format!("key is not valid PEM: {e}"))?;
+    let config = OpensslServerConfig {
+        client: ClientAuth::None,
+        leaf,
+        chain,
+        key,
+        acceptor: OnceLock::new(),
+    };
+    config.acceptor_builder().map_err(|e| format!("server config: {e}"))?;
     Ok(Arc::new(config))
 }
 

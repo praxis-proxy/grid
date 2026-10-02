@@ -6,7 +6,11 @@ metadata:
   name: {{ include "grid-operator.fullname" . }}-metrics
   labels:
     {{- include "grid-operator.labels" . | nindent 4 }}
-  {{- with .Values.metrics.service.annotations }}
+  {{- $annotations := deepCopy (.Values.metrics.service.annotations | default dict) }}
+  {{- if include "grid-operator.metricsTls.serviceCa" . }}
+  {{- $_ := set $annotations "service.beta.openshift.io/serving-cert-secret-name" (include "grid-operator.metricsTls.secret" .) }}
+  {{- end }}
+  {{- with $annotations }}
   annotations:
     {{- toYaml . | nindent 4 }}
   {{- end }}

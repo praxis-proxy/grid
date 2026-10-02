@@ -115,6 +115,33 @@ metrics:
     port: 9090
     # -- Service annotations.
     annotations: {}
+  # -- TLS on the metrics and health port.
+  tls:
+    # -- false serves plaintext. auto and true serve TLS from source.
+    enabled: auto
+    # -- auto picks existingSecret when set, else serviceCA on OpenShift, else siteIdentity
+    # when grid.id or enrollment.enabled is set. An install with none of these, which
+    # is no grid site, serves plaintext.
+    # siteIdentity serves the enrolled grid-site-identity, read once enrollment writes it.
+    source: auto
+    # -- Secret holding tls.crt and tls.key for source existingSecret.
+    existingSecret: ""
+    # -- Mount path for the certificate and key.
+    mountPath: "/etc/grid/metrics-tls"
+
+# -- NetworkPolicy for the operator pod. SWIM and signals stay open, and the
+# metrics and health port admits only metricsFrom. Kubelet probes are unaffected on OpenShift.
+networkPolicy:
+  # -- auto: on where OpenShift runs. true or false forces it.
+  enabled: auto
+  # -- NetworkPolicyPeer entries allowed to reach the metrics port. Must not be empty.
+  metricsFrom:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: openshift-user-workload-monitoring
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: openshift-monitoring
 
 # -- SWIM protocol configuration.
 swim:
@@ -181,6 +208,13 @@ health:
     initialDelaySeconds: 5
     # -- Period between liveness probes.
     periodSeconds: 10
+  # -- Startup probe for source siteIdentity, which listens only once enrollment finishes.
+  startup:
+    # -- Period between startup probes.
+    periodSeconds: 10
+    # -- Failures allowed before restart. Keep the window past the operator's
+    # 15 minute enrollment deadline, so a restart never lands mid-enrollment.
+    failureThreshold: 96
   # -- Readiness probe settings.
   readiness:
     # -- Initial delay before the first readiness probe.
@@ -197,9 +231,11 @@ serviceMonitor:
   # -- ServiceMonitor namespace override.
   namespace: ""
   # -- Prometheus scrape interval.
-  interval: ""
+  interval: "30s"
   # -- Prometheus scrape timeout.
-  scrapeTimeout: ""
+  scrapeTimeout: "10s"
+  # -- Scrape TLS settings when metrics.tls is on. Empty: the service CA for serviceCA, the grid CA Secret for siteIdentity, and a render error for existingSecret, which needs it set.
+  tlsConfig: {}
 
 # -- Container resource requests and limits.
 resources: {}

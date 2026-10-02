@@ -1,0 +1,20 @@
+suite: metrics TLS errors
+templates:
+  - templates/deployment.yaml
+release:
+  name: gop
+  namespace: grid
+tests:
+  - it: the service CA source needs OpenShift
+    set:
+      metrics.tls.source: serviceCA
+    asserts:
+      - failedTemplate:
+          errorMessage: metrics.tls.source serviceCA needs OpenShift, where the service CA issues the certificate
+
+  - it: the existing Secret source needs a Secret
+    set:
+      metrics.tls.source: existingSecret
+    asserts:
+      - failedTemplate:
+          errorMessage: metrics.tls.source existingSecret needs metrics.tls.existingSecret
