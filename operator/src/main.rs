@@ -368,6 +368,7 @@ async fn maybe_start_swim(client: &Client, cli: &Cli) -> Result<Option<Arc<swim_
             return Err(format!("GRID_SWIM_BIND_ADDR is not a valid socket address: {e}"));
         },
     };
+    let site_name = swim_site_name(std::env::var("GRID_SWIM_SITE_NAME").ok())?;
     let (advertise_addr, lb_watch) = swim_advertise_addr(client, bind_addr).await?;
     if advertise_addr.unwrap_or(bind_addr).ip().is_unspecified() {
         return Err("refusing to advertise an unspecified SWIM address; set GRID_SWIM_ADVERTISE_ADDR".to_owned());
@@ -391,7 +392,6 @@ async fn maybe_start_swim(client: &Client, cli: &Cli) -> Result<Option<Arc<swim_
         );
     }
     let seeds = seed_resolution.addresses;
-    let site_name = std::env::var("GRID_SWIM_SITE_NAME").unwrap_or_else(|_| hostname_or_default());
     let gateway_address = match gateway::resolve(client, &cli.gateway).await {
         Ok(addr) => addr,
         Err(e) => {
@@ -933,6 +933,24 @@ fn parse_swim_key(hex: &str) -> Result<swim::crypto::SwimKey, &'static str> {
         }
     }
     Ok(key)
+}
+
+/// The SWIM site name, `configured` or else the hostname, refused unless it is a DNS label.
+///
+/// The name keys the revision-lease `ConfigMap` and the `GridSite`, so an empty or
+/// invalid one would leave SWIM off rather than fail.
+///
+/// # Errors
+///
+/// Returns the reason when the name is not a lowercase DNS label.
+fn swim_site_name(configured: Option<String>) -> Result<String, String> {
+    let name = configured.unwrap_or_else(hostname_or_default);
+    certs::validate_site_name(&name).map_err(|_invalid| {
+        format!(
+            "SWIM site name {name:?} is not a lowercase DNS label; set GRID_SWIM_SITE_NAME (swim.siteName or site.name)"
+        )
+    })?;
+    Ok(name)
 }
 
 /// Return the machine hostname or a safe fallback.
@@ -2353,6 +2371,14 @@ async fn peer_tls(client: &Client) -> Option<Arc<operator::signals::PeerTlsMater
 #[allow(clippy::expect_used, reason = "tests")]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_swim_site_name_must_be_a_dns_label() {
+        for bad in ["", " ", "East", "east_1", "-east"] {
+            assert!(swim_site_name(Some(bad.to_owned())).is_err(), "{bad:?} is refused");
+        }
+        assert_eq!(swim_site_name(Some("east-1".to_owned())), Ok("east-1".to_owned()));
+    }
 
     /// A caller is scoped from its certificate, and nothing is trusted for
     /// presenting nothing: only this site's own certificate earns `Local`, and
