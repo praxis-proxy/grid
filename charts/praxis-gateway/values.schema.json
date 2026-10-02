@@ -708,6 +708,104 @@
                   }
                 }
               }
+            },
+            "gridServing": {
+              "type": "object",
+              "additionalProperties": false,
+              "description": "Operator serving data used only with praxisConfig.source render.",
+              "properties": {
+                "enabled": {
+                  "type": "boolean",
+                  "description": "Mount the operator's serving config, set GRID_SERVING_CONFIG, and route with grid_site_route."
+                },
+                "networkName": {
+                  "type": "string",
+                  "pattern": "^([a-z0-9]([-a-z0-9]*[a-z0-9])?)?$",
+                  "description": "GridNetwork name."
+                },
+                "gatewayRefName": {
+                  "type": "string",
+                  "pattern": "^([a-z0-9]([-a-z0-9]*[a-z0-9])?)?$",
+                  "description": "This gateway's name in GridNetwork gatewayRefs. Defaults to the release fullname."
+                },
+                "configMapName": {
+                  "type": "string",
+                  "pattern": "^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*)?$",
+                  "description": "Overrides grid-serving-<networkName>-<gatewayRefName>."
+                },
+                "mountPath": {
+                  "type": "string",
+                  "pattern": "^/",
+                  "description": "Directory the ConfigMap is mounted at."
+                },
+                "siteRoute": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "description": "grid_site_route tuning, rendered into its filter block with the keys the filter reads.",
+                  "properties": {
+                    "availability": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "properties": {
+                        "smoothing": {
+                          "type": "number"
+                        },
+                        "ceiling_half_life_ms": {
+                          "type": "integer"
+                        },
+                        "ceiling_floor": {
+                          "type": "number"
+                        },
+                        "explore_floor": {
+                          "type": "number"
+                        },
+                        "queue_full": {
+                          "type": "number"
+                        },
+                        "shedding": {
+                          "type": "boolean"
+                        },
+                        "full_after_ms": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "room_after_ms": {
+                          "type": "integer",
+                          "minimum": 0
+                        }
+                      }
+                    },
+                    "prefixAffinity": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "description": "Rendered as the filter's prefix_affinity.",
+                      "properties": {
+                        "enabled": {
+                          "type": "boolean"
+                        },
+                        "threshold": {
+                          "type": "number"
+                        },
+                        "exploration": {
+                          "type": "number"
+                        },
+                        "prefill_tokens_per_second": {
+                          "type": "number"
+                        },
+                        "queued_request_seconds": {
+                          "type": "number"
+                        },
+                        "tag_key_path": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        }
+                      }
+                    }
+                  }
+                }
+              }
             }
           }
         }
@@ -873,7 +971,7 @@
             "ai",
             "grid-gateway"
           ],
-          "description": "ai is praxis-proxy/ai. grid-gateway is the grid build with the provider and gridServing filters."
+          "description": "ai is praxis-proxy/ai. grid-gateway is the grid build with the provider and praxisConfig.render.gridServing filters."
         }
       }
     },
@@ -1225,103 +1323,6 @@
             "resources": {
               "type": "object",
               "description": "Sidecar resource requests and limits."
-            }
-          }
-        }
-      }
-    },
-    "gridServing": {
-      "type": "object",
-      "additionalProperties": false,
-      "properties": {
-        "enabled": {
-          "type": "boolean",
-          "description": "Mount the operator's serving config, set GRID_SERVING_CONFIG, and route with grid_site_route."
-        },
-        "network": {
-          "type": "string",
-          "pattern": "^([a-z0-9]([-a-z0-9]*[a-z0-9])?)?$",
-          "description": "GridNetwork name."
-        },
-        "gatewayRef": {
-          "type": "string",
-          "pattern": "^([a-z0-9]([-a-z0-9]*[a-z0-9])?)?$",
-          "description": "This gateway's gatewayRef name. Defaults to the release fullname."
-        },
-        "configMap": {
-          "type": "string",
-          "pattern": "^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*)?$",
-          "description": "Overrides grid-serving-<network>-<gatewayRef>."
-        },
-        "mountPath": {
-          "type": "string",
-          "pattern": "^/",
-          "description": "Directory the ConfigMap is mounted at."
-        },
-        "siteRoute": {
-          "type": "object",
-          "additionalProperties": false,
-          "description": "grid_site_route tuning, rendered into its filter block with the keys the filter reads.",
-          "properties": {
-            "availability": {
-              "type": "object",
-              "additionalProperties": false,
-              "properties": {
-                "smoothing": {
-                  "type": "number"
-                },
-                "ceiling_half_life_ms": {
-                  "type": "integer"
-                },
-                "ceiling_floor": {
-                  "type": "number"
-                },
-                "explore_floor": {
-                  "type": "number"
-                },
-                "queue_full": {
-                  "type": "number"
-                },
-                "shedding": {
-                  "type": "boolean"
-                },
-                "full_after_ms": {
-                  "type": "integer",
-                  "minimum": 0
-                },
-                "room_after_ms": {
-                  "type": "integer",
-                  "minimum": 0
-                }
-              }
-            },
-            "prefixAffinity": {
-              "type": "object",
-              "additionalProperties": false,
-              "description": "Rendered as the filter's prefix_affinity.",
-              "properties": {
-                "enabled": {
-                  "type": "boolean"
-                },
-                "threshold": {
-                  "type": "number"
-                },
-                "exploration": {
-                  "type": "number"
-                },
-                "prefill_tokens_per_second": {
-                  "type": "number"
-                },
-                "queued_request_seconds": {
-                  "type": "number"
-                },
-                "tag_key_path": {
-                  "type": [
-                    "string",
-                    "null"
-                  ]
-                }
-              }
             }
           }
         }

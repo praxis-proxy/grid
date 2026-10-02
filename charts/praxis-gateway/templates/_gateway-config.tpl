@@ -134,10 +134,10 @@ The data of the chart-rendered gateway ConfigMap, also hashed into checksum/conf
           {{- end }}
           - filter: model_to_header
             header: X-Gateway-Model-Name
-          {{- if ($.Values.gridServing).enabled }}
+          {{- if ($.Values.praxisConfig.render.gridServing).enabled }}
           - filter: grid_site_route
             model_header: X-Gateway-Model-Name
-            {{- with ($.Values.gridServing).siteRoute }}
+            {{- with ($.Values.praxisConfig.render.gridServing).siteRoute }}
             {{- with .availability }}
             availability:
               {{- toYaml . | nindent 14 }}

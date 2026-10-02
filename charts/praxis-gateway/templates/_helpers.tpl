@@ -159,8 +159,8 @@ Validate praxisConfig: the source, and that each source gets only the settings i
 {{- fail (printf "praxisConfig.render.%s is set but praxisConfig.source is %s, which ignores it: set praxisConfig.source to render, or unset it" $key $source) }}
 {{- end }}
 {{- end }}
-{{- if or $render.backends $render.auth.mode $render.telemetry.enabled (eq ($render.role | default "consumer") "provider") (.Values.gridServing).enabled }}
-{{- fail (printf "praxisConfig.render backends, auth.mode, role provider, or gridServing is set but praxisConfig.source is %s, which ignores it: set praxisConfig.source to render, or unset them" $source) }}
+{{- if or $render.backends $render.auth.mode $render.telemetry.enabled (eq ($render.role | default "consumer") "provider") ($render.gridServing).enabled }}
+{{- fail (printf "praxisConfig.render settings are set but praxisConfig.source is %s, which ignores them: set praxisConfig.source to render, or unset them" $source) }}
 {{- end }}
 {{- end }}
 {{- if eq $source "operator" }}
@@ -181,8 +181,8 @@ Validate praxisConfig: the source, and that each source gets only the settings i
 {{- if not (trim (toString .Values.grid.siteName)) }}
 {{- fail "grid.siteName is required when praxisConfig.source is render, and cannot be blank" }}
 {{- end }}
-{{- if and $consumer (not (.Values.gridServing).enabled) (not (trim (toString .Values.praxisConfig.render.model))) }}
-{{- fail "praxisConfig.render.model is required for a consumer without gridServing, and cannot be blank" }}
+{{- if and $consumer (not (.Values.praxisConfig.render.gridServing).enabled) (not (trim (toString .Values.praxisConfig.render.model))) }}
+{{- fail "praxisConfig.render.model is required for a consumer without praxisConfig.render.gridServing, and cannot be blank" }}
 {{- end }}
 {{- if not (.Values.praxisConfig.render.backends | default list) }}
 {{- fail "praxisConfig.render.backends needs at least one backend when praxisConfig.source is render" }}
@@ -361,7 +361,7 @@ carry a sni.
 {{- else }}
 {{- fail (printf "backend %q transport.mode must be mutual_tls, tls, or plaintext, got %q" .cluster $mode) }}
 {{- end }}
-{{- if and (eq $mode "mutual_tls") (ne ($.Values.praxisConfig.render.role | default "consumer") "provider") (not ($.Values.gridServing).enabled) }}
+{{- if and (eq $mode "mutual_tls") (ne ($.Values.praxisConfig.render.role | default "consumer") "provider") (not ($.Values.praxisConfig.render.gridServing).enabled) }}
 {{- if not .site }}
 {{- fail (printf "backend %q is a remote site over mutual_tls: set its site, the grid site name it serves" .cluster) }}
 {{- end }}
@@ -401,37 +401,37 @@ Validate enabled mounts have a non-empty resource name.
 {{- if and .Values.overlay.configMapName (ne .Values.praxisConfig.source "byo") }}
 {{- fail (printf "overlay.configMapName is only supported with praxisConfig.source byo; source %s writes candidates directly into praxis.yaml" .Values.praxisConfig.source) }}
 {{- end }}
-{{- with (.Values.gridServing | default dict) }}
+{{- with (.Values.praxisConfig.render.gridServing | default dict) }}
 {{- if .enabled }}
 {{- $name := include "praxis-gateway.servingConfigMap" $ }}
 {{- if not $name }}
-{{- fail "gridServing needs gridServing.network, the GridNetwork name, or gridServing.configMap" }}
+{{- fail "praxisConfig.render.gridServing needs networkName or configMapName" }}
 {{- end }}
 {{- if gt (len $name) 63 }}
-{{- fail (printf "gridServing: the operator hash-suffixes %s; set gridServing.configMap to the ConfigMap labeled grid.praxis.fast/gateway" $name) }}
+{{- fail (printf "praxisConfig.render.gridServing: the operator hash-suffixes %s; set configMapName to the ConfigMap labeled grid.praxis.fast/gateway" $name) }}
 {{- end }}
 {{- if not $.Values.gridIdentity.secretName }}
-{{- fail "gridServing polls peers with the grid identity: set gridIdentity.secretName" }}
+{{- fail "praxisConfig.render.gridServing polls peers with the grid identity: set gridIdentity.secretName" }}
 {{- end }}
 {{- if eq ($.Values.praxisConfig.render.role | default "consumer") "provider" }}
-{{- fail "gridServing routes callers across sites; it applies to the consumer role only" }}
+{{- fail "praxisConfig.render.gridServing routes callers across sites; it applies to the consumer role only" }}
 {{- end }}
 {{- if ne $.Values.image.flavor "grid-gateway" }}
-{{- fail "gridServing needs image.flavor grid-gateway" }}
+{{- fail "praxisConfig.render.gridServing needs image.flavor grid-gateway" }}
 {{- end }}
 {{- end }}
 {{- end }}
 {{- end }}
 
 {{/*
-The operator's serving config ConfigMap for this gateway: grid-serving-<network>-<gatewayRef>.
+The operator's serving config ConfigMap for this gateway: grid-serving-<networkName>-<gatewayRefName>.
 */}}
 {{- define "praxis-gateway.servingConfigMap" -}}
-{{- $serving := .Values.gridServing | default dict -}}
-{{- if $serving.configMap -}}
-{{- $serving.configMap -}}
-{{- else if $serving.network -}}
-{{- printf "grid-serving-%s-%s" $serving.network ($serving.gatewayRef | default (include "praxis-gateway.fullname" .)) -}}
+{{- $serving := .Values.praxisConfig.render.gridServing | default dict -}}
+{{- if $serving.configMapName -}}
+{{- $serving.configMapName -}}
+{{- else if $serving.networkName -}}
+{{- printf "grid-serving-%s-%s" $serving.networkName ($serving.gatewayRefName | default (include "praxis-gateway.fullname" .)) -}}
 {{- end -}}
 {{- end }}
 

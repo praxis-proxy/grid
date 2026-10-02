@@ -10,7 +10,7 @@ metadata:
   name: {{ include "praxis-gateway.fullname" . }}
   labels:
     {{- include "praxis-gateway.labels" . | nindent 4 }}
-  {{- if (.Values.gridServing).enabled }}
+  {{- if (.Values.praxisConfig.render.gridServing).enabled }}
   annotations:
     {{- /* The operator writes the serving ConfigMap only after the grid CRs (wave 1) exist. */}}
     argocd.argoproj.io/sync-wave: "2"
@@ -198,7 +198,7 @@ spec:
           {{- $userLog := false }}
           {{- range .Values.env }}{{- if eq .name "RUST_LOG" }}{{- $userLog = true }}{{- end }}{{- end }}
           {{- $rustLog := and (not $userLog) (include "praxis-gateway.rustLog" .) }}
-          {{- if or $rustLog .Values.env (.Values.gridServing).enabled $withCA (.Values.metricsListener).enabled }}
+          {{- if or $rustLog .Values.env (.Values.praxisConfig.render.gridServing).enabled $withCA (.Values.metricsListener).enabled }}
           env:
             {{- if $rustLog }}
             - name: RUST_LOG
@@ -207,9 +207,9 @@ spec:
             {{- with .Values.env }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
-            {{- if (.Values.gridServing).enabled }}
+            {{- if (.Values.praxisConfig.render.gridServing).enabled }}
             - name: GRID_SERVING_CONFIG
-              value: {{ printf "%s/serving-config.json" .Values.gridServing.mountPath | quote }}
+              value: {{ printf "%s/serving-config.json" .Values.praxisConfig.render.gridServing.mountPath | quote }}
             {{- end }}
             {{- if $withCA }}
             - name: SSL_CERT_FILE
@@ -283,9 +283,9 @@ spec:
               mountPath: {{ .Values.gridIdentity.mountPath | quote }}
               readOnly: true
             {{- end }}
-            {{- if (.Values.gridServing).enabled }}
+            {{- if (.Values.praxisConfig.render.gridServing).enabled }}
             - name: grid-serving
-              mountPath: {{ .Values.gridServing.mountPath | quote }}
+              mountPath: {{ .Values.praxisConfig.render.gridServing.mountPath | quote }}
               readOnly: true
             {{- end }}
             {{- if .Values.upstreamCA.secretName }}
@@ -381,7 +381,7 @@ spec:
                     - key: ca.crt
                       path: ca.crt
         {{- end }}
-        {{- if (.Values.gridServing).enabled }}
+        {{- if (.Values.praxisConfig.render.gridServing).enabled }}
         - name: grid-serving
           configMap:
             name: {{ include "praxis-gateway.servingConfigMap" . | quote }}
