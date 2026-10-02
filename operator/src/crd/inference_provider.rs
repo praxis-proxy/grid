@@ -343,21 +343,27 @@ fn default_private_key_key() -> String {
 #[serde(rename_all = "camelCase")]
 pub struct MetricSignalNames {
     /// Metric name for normalised queue depth (0.0–1.0).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub queue_depth: Option<String>,
 
     /// Metric name for KV-cache utilisation (0.0–1.0).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub kv_cache_utilization: Option<String>,
 
     /// Metric name for P99 request latency in milliseconds (pre-computed gauge).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub latency_p99_ms: Option<String>,
 
     /// Metric name for prefix-cache hit ratio (0.0–1.0).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub prefix_cache_hit_ratio: Option<String>,
 
     /// Metric name for normalised error rate (0.0–1.0).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub error_rate: Option<String>,
 
     /// Metric name for a health gauge (any positive value = healthy).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub healthy: Option<String>,
 }
 
@@ -579,6 +585,21 @@ pub enum ProviderPhase {
 mod tests {
     use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
     use kube::CustomResourceExt as _;
+
+    #[test]
+    fn omitted_signal_names_serialize_as_omitted() {
+        let none = serde_json::to_value(MetricSignalNames::default()).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(none, serde_json::json!({}), "no null keys for unset signals");
+        let one = MetricSignalNames {
+            queue_depth: Some("q".to_owned()),
+            ..MetricSignalNames::default()
+        };
+        assert_eq!(
+            serde_json::to_value(one).unwrap_or_else(|_| std::process::abort()),
+            serde_json::json!({"queueDepth": "q"}),
+            "only the set signal appears"
+        );
+    }
 
     use super::*;
 

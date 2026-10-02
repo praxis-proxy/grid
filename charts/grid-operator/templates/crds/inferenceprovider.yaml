@@ -331,13 +331,7 @@ spec:
                       nullable: true
                       type: integer
                     signalNames:
-                      default:
-                        errorRate: null
-                        healthy: null
-                        kvCacheUtilization: null
-                        latencyP99Ms: null
-                        prefixCacheHitRatio: null
-                        queueDepth: null
+                      default: {}
                       description: |-
                         Mapping from scoring signal names to Prometheus metric names.
 
