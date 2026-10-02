@@ -183,11 +183,6 @@ RELEASE=grid-operator; NAMESPACE=grid-system; for crd in agenttoolproviders grid
 | `health.readiness.periodSeconds` | int | `10` | Readiness probe period. |
 | `serviceMonitor.enabled` | bool | `false` | Create a Prometheus ServiceMonitor. |
 | `serviceMonitor.labels` | object | `{}` | Additional ServiceMonitor labels. |
-
-When enrollment is enabled and `gateway.serviceName` is empty, the chart
-normalizes it to `grid-gateway`. A consumer-only enrolled site without that
-Service should set `gateway.discoveryEnabled: false`.
-
 | `serviceMonitor.namespace` | string | `""` | ServiceMonitor namespace override. |
 | `serviceMonitor.interval` | string | `""` | Prometheus scrape interval. |
 | `serviceMonitor.scrapeTimeout` | string | `""` | Prometheus scrape timeout. |
@@ -203,6 +198,10 @@ Service should set `gateway.discoveryEnabled: false`.
 | `enrollment.caBundle` | object | `{configMap: "", secret: "", key: ca.crt}` | CA bundle that pins the enrollment server, from exactly one of `configMap` and `secret`. |
 | `enrollment.gridCaBundle` | object | `{configMap: "", secret: "", key: ca.crt}` | Grid CA the returned CA must match, from at most one source. Defaults to `caBundle`. |
 | `enrollment.tokenSecretRef` | object | `{name: "", key: token}` | Secret in the release namespace holding the one-time site token. |
+
+When enrollment is enabled and `gateway.serviceName` is empty, the chart
+normalizes it to `grid-gateway`. A consumer-only enrolled site without that
+Service should set `gateway.discoveryEnabled: false`.
 
 ## Auto-enroll
 
