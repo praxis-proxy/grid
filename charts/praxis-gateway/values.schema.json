@@ -176,6 +176,18 @@
                   }
                 }
               }
+            },
+            "gridServing": {
+              "type": "object",
+              "additionalProperties": false,
+              "description": "Operator serving data used only with praxisConfig.source render.",
+              "properties": {
+                "enabled": { "type": "boolean", "description": "Mount the operator's serving config, set GRID_SERVING_CONFIG, and route with grid_site_route." },
+                "networkName": { "type": "string", "pattern": "^([a-z0-9]([-a-z0-9]*[a-z0-9])?)?$", "description": "GridNetwork name." },
+                "gatewayRefName": { "type": "string", "pattern": "^([a-z0-9]([-a-z0-9]*[a-z0-9])?)?$", "description": "This gateway's name in GridNetwork gatewayRefs. Defaults to the release fullname." },
+                "configMapName": { "type": "string", "pattern": "^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*)?$", "description": "Overrides grid-serving-<networkName>-<gatewayRefName>." },
+                "mountPath": { "type": "string", "pattern": "^/", "description": "Directory the ConfigMap is mounted at." }
+              }
             }
           }
         }
@@ -248,7 +260,7 @@
         "flavor": {
           "type": "string",
           "enum": ["ai", "grid-gateway"],
-          "description": "ai is praxis-proxy/ai. grid-gateway is the grid build with the provider and gridServing filters."
+          "description": "ai is praxis-proxy/ai. grid-gateway is the grid build with the provider and praxisConfig.render.gridServing filters."
         }
       }
     },
@@ -487,17 +499,6 @@
             }
           }
         }
-      }
-    },
-    "gridServing": {
-      "type": "object",
-      "additionalProperties": false,
-      "properties": {
-        "enabled": { "type": "boolean", "description": "Mount the operator's serving config, set GRID_SERVING_CONFIG, and route with grid_site_route." },
-        "network": { "type": "string", "pattern": "^([a-z0-9]([-a-z0-9]*[a-z0-9])?)?$", "description": "GridNetwork name." },
-        "gatewayRef": { "type": "string", "pattern": "^([a-z0-9]([-a-z0-9]*[a-z0-9])?)?$", "description": "This gateway's gatewayRef name. Defaults to the release fullname." },
-        "configMap": { "type": "string", "pattern": "^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*)?$", "description": "Overrides grid-serving-<network>-<gatewayRef>." },
-        "mountPath": { "type": "string", "pattern": "^/", "description": "Directory the ConfigMap is mounted at." }
       }
     },
     "gridIdentity": {

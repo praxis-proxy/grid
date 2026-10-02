@@ -106,7 +106,7 @@ Each operator routes to a peer only once a probe of its gateway, at the peer `ad
 
 ## Operations
 
-A gateway with `gridServing` reads the operator's serving config only at start. After you add a site or rotate a pin, run `kubectl -n grid rollout restart deploy/grid-gateway` once the `grid.praxis-proxy.io/serving-digest` annotation on its `grid-serving-*` ConfigMap changes. The static install in this example rolls the gateway through its own chart upgrade.
+A gateway with `praxisConfig.render.gridServing` reads the operator's serving config only at start. After you add a site or rotate a pin, run `kubectl -n grid rollout restart deploy/grid-gateway` once the `grid.praxis-proxy.io/serving-digest` annotation on its `grid-serving-*` ConfigMap changes. The static install in this example rolls the gateway through its own chart upgrade.
 
 ### Remove a Site
 

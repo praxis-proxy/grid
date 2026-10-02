@@ -99,7 +99,7 @@ data:
           {{- end }}
           - filter: model_to_header
             header: X-Gateway-Model-Name
-          {{- if ($.Values.gridServing).enabled }}
+          {{- if ($.Values.praxisConfig.render.gridServing).enabled }}
           - filter: grid_site_route
             model_header: X-Gateway-Model-Name
           {{- else }}

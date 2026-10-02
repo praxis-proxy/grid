@@ -531,6 +531,7 @@ try_template "$GW_DIR" "subchart keys (gw)" "${GW_REQ[@]}" --set enabled=true --
 try_reject "$GW_DIR" "runAsNonRoot override" "${GW_REQ[@]}" --set podSecurityContext.runAsNonRoot=false
 try_reject "$GW_DIR" "removed overlay.enabled key" "${GW_REQ[@]}" --set overlay.enabled=true
 try_reject "$GW_DIR" "removed tls.enabled key" "${GW_REQ[@]}" --set tls.enabled=true
+try_reject "$GW_DIR" "removed root gridServing key" "${GW_REQ[@]}" --set gridServing.enabled=true
 
 # ── Secure gateway config (render) ──────────────────────────────────
 GW_RENDER=(--set praxisConfig.source=render --set grid.siteName=hub --set praxisConfig.render.model=q --set praxisConfig.render.auth.mode=none
@@ -853,9 +854,11 @@ try_reject_msg "$GW_DIR" "peerTrust.rateLimit missing burst (gw)" "burst" "${PRO
 SERVING=(--set praxisConfig.source=render --set grid.siteName=hub --set praxisConfig.render.auth.mode=none --namespace grid-system
   --set image.repository=quay.io/example/grid-gateway --set image.tag=t --set image.flavor=grid-gateway
   --set gridIdentity.secretName=grid-site-identity --set gridIdentity.caSecretName=grid-ca
-  --set gridServing.enabled=true --set gridServing.configMap=grid-serving-grid-gw
+  --set praxisConfig.render.gridServing.enabled=true --set praxisConfig.render.gridServing.configMapName=grid-serving-grid-gw
   --set "praxisConfig.render.backends[0].cluster=pool-b" --set "praxisConfig.render.backends[0].endpoints[0]=203.0.113.7:8443"
   --set "praxisConfig.render.backends[0].transport.sni=site-b.grid.internal")
+try_reject "$GW_DIR" "removed gridServing.configMap key" "${SERVING[@]}" \
+  --set praxisConfig.render.gridServing.configMap=grid-serving-grid-gw
 SERV_RENDER=$(helm template v-serv "$GW_DIR" "${SERVING[@]}" 2>&1 || true)
 if grep -q 'filter: grid_site_route' <<<"$SERV_RENDER" && ! grep -q 'intelligent_route' <<<"$SERV_RENDER" \
   && grep -q 'value: "/etc/praxis/grid-serving/serving-config.json"' <<<"$SERV_RENDER" \
@@ -864,20 +867,21 @@ if grep -q 'filter: grid_site_route' <<<"$SERV_RENDER" && ! grep -q 'intelligent
 else
   fail "gridServing: unexpected render: $(grep -E 'route|GRID_SERVING|grid-serving|Error' <<<"$SERV_RENDER" | head -3 | tr '\n' ' ')"
 fi
-try_reject_msg "$GW_DIR" "gridServing without network or configMap (gw)" "gridServing.network" "${SERVING[@]}" --set gridServing.configMap=""
-if helm template v-serv "$GW_DIR" "${SERVING[@]}" --set gridServing.configMap="" --set gridServing.network=grid \
-  --set fullnameOverride=gw 2>&1 | grep -q 'name: "grid-serving-grid-gw"'; then
-  pass "gridServing: derives the operator's ConfigMap name from network and gatewayRef"
+try_reject_msg "$GW_DIR" "gridServing without networkName or ConfigMap (gw)" "praxisConfig.render.gridServing" "${SERVING[@]}" --set praxisConfig.render.gridServing.configMapName=""
+if helm template v-serv "$GW_DIR" "${SERVING[@]}" --set praxisConfig.render.gridServing.configMapName="" \
+  --set praxisConfig.render.gridServing.networkName=grid --set praxisConfig.render.gridServing.gatewayRefName=gw \
+  2>&1 | grep -q 'name: "grid-serving-grid-gw"'; then
+  pass "gridServing: derives the operator ConfigMap name from networkName and gatewayRefName"
 else
   fail "gridServing: did not derive grid-serving-grid-gw"
 fi
 try_reject_msg "$GW_DIR" "gridServing without the Grid identity (gw)" "gridIdentity.secretName" "${SERVING[@]}" --set gridIdentity.secretName=""
 try_reject_msg "$GW_DIR" "gridServing on the provider role (gw)" "consumer role only" "${SERVING[@]}" --set praxisConfig.render.role=provider \
   --set-json "praxisConfig.render.peerTrust.certDigests=[\"$DIGEST\"]"
-try_reject_msg "$GW_DIR" "gridServing on the ai image flavor (gw)" "image.flavor grid-gateway" "${SERVING[@]}" \
+try_reject_msg "$GW_DIR" "gridServing on the ai image flavor (gw)" "praxisConfig.render.gridServing needs image.flavor grid-gateway" "${SERVING[@]}" \
   --set image.repository=quay.io/example/ai --set image.flavor=ai
 # --reuse-values from a release predating these keys leaves them absent.
-try_template "$GW_DIR" "absent gridServing and peerTrust maps (gw)" "${GW_REQ[@]}" --set gridServing=null \
+try_template "$GW_DIR" "absent gridServing and peerTrust maps (gw)" "${GW_REQ[@]}" --set praxisConfig.render.gridServing=null \
   --set praxisConfig.render.peerTrust=null
 # listenerTls names the port https (render or BYO); probes follow the port name.
 for mode in render byo; do

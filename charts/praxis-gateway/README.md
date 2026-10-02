@@ -223,7 +223,7 @@ Praxis AI image; these values may advance independently.
 | `image.repository` | string | `ghcr.io/praxis-proxy/ai` | Image repository. |
 | `image.tag` | string | `0.4.0` | Image tag (ignored when `image.digest` is set). |
 | `image.digest` | string | `""` | Immutable digest (sha256:…). When set, tag is ignored. |
-| `image.flavor` | string | `ai` | `ai` or `grid-gateway`, the grid build that `praxisConfig.render.role: provider` and `gridServing` need. A repository ending in `/grid-gateway` sets it. |
+| `image.flavor` | string | `ai` | `ai` or `grid-gateway`, the grid build that `praxisConfig.render.role: provider` and `praxisConfig.render.gridServing` need. A repository ending in `/grid-gateway` sets it. |
 | `image.pullPolicy` | string | `IfNotPresent` | Image pull policy. |
 | `imagePullSecrets` | list | `[]` | Pull secrets for private registries. |
 | `nameOverride` | string | `""` | Override chart name. |
@@ -243,7 +243,7 @@ Praxis AI image; these values may advance independently.
 | `praxisConfig.byo.inline` | string | answers `GET /` with a JSON status, else 404 | Praxis config stored in a chart-managed ConfigMap when `praxisConfig.byo.configMapName` is empty. Changing it rolls the pods. |
 | `praxisConfig.operator.configMapName` | string | `""` | Operator-created ConfigMap. Empty uses `praxis-consumer-config`. |
 | `praxisConfig.operator.allowUnauthenticatedExposure` | bool | `false` | Allow a LoadBalancer or NodePort Service for the operator's unauthenticated `praxis.yaml`. |
-| `praxisConfig.render.model` | string | **required** for a consumer without `gridServing` | Model advertised on the routing candidates. |
+| `praxisConfig.render.model` | string | **required** for a consumer without `praxisConfig.render.gridServing` | Model advertised on the routing candidates. |
 | `praxisConfig.render.backends` | map | **required** when rendered | Backends keyed by site, each with `endpoint` and optional `healthCheck` and `transport`. A consumer's key is the site it reaches over mutual TLS. A provider's `local` key is its one plaintext backend. The older list of `cluster`, `endpoints` entries still renders. |
 | `praxisConfig.render.backends[].site` | string | `grid.siteName` | Grid site the backend serves. A consumer's remote `mutual_tls` backend must name it, and it must differ from `grid.siteName`. Its `transport.sni` defaults to `<site>.grid.internal`. |
 | `praxisConfig.render.backends[].transport` | object | `mutual_tls` with `gridIdentity.secretName`, else `plaintext` | `mode`: `mutual_tls` presents the grid identity and verifies with `gridIdentity.caSecretName` (defaults to `secretName`); `tls` verifies the server cert with no client cert; `plaintext` is cleartext. `sni` names the peer cert (required for `mutual_tls` and for `tls` to an IP endpoint). `ca` (`configMapName` or `secretName`, `key`) is the CA for a `tls` backend. A `tls` backend trusts, first match wins: `transport.ca`, then `upstreamCA`, then the process store, which is the `auth.validateCA` bundle when that is set. |
@@ -286,11 +286,11 @@ Praxis AI image; these values may advance independently.
 | `overlay.sidecar.image.pullPolicy` | string | `IfNotPresent` | Overlay-sync image pull policy. |
 | `overlay.sidecar.dataKey` | string | `routing-overlay.json` | Content-addressed envelope key in the overlay ConfigMap. |
 | `overlay.sidecar.resources` | object | small requests and limits | Resources for both the one-shot init container and continuous sidecar. |
-| `gridServing.enabled` | bool | `false` | Mount the operator's serving config, set `GRID_SERVING_CONFIG`, and route with `grid_site_route`. Consumer role and `image.flavor: grid-gateway` only. Needs `gridIdentity.secretName`; set `gridIdentity.caSecretName` when the Grid CA is separate. |
-| `gridServing.network` | string | `""` | GridNetwork name, which with `gatewayRef` names the operator's ConfigMap. |
-| `gridServing.gatewayRef` | string | release fullname | This gateway's gatewayRef name in the GridNetwork. |
-| `gridServing.configMap` | string | `""` | Overrides the derived `grid-serving-<network>-<gatewayRef>`. Needed when that name passes 63 characters. |
-| `gridServing.mountPath` | string | `/etc/praxis/grid-serving` | Mount directory for the ConfigMap. |
+| `praxisConfig.render.gridServing.enabled` | bool | `false` | Mount the operator's serving config, set `GRID_SERVING_CONFIG`, and route with `grid_site_route`. Consumer role and `image.flavor: grid-gateway` only. Needs `gridIdentity.secretName`; set `gridIdentity.caSecretName` when the Grid CA is separate. |
+| `praxisConfig.render.gridServing.networkName` | string | `""` | GridNetwork name, which with `gatewayRefName` names the operator's ConfigMap. |
+| `praxisConfig.render.gridServing.gatewayRefName` | string | release fullname | This gateway's name in the GridNetwork `gatewayRefs`. |
+| `praxisConfig.render.gridServing.configMapName` | string | `""` | Overrides `grid-serving-<networkName>-<gatewayRefName>`. Needed when that name passes 63 characters. |
+| `praxisConfig.render.gridServing.mountPath` | string | `/etc/praxis/grid-serving` | Mount directory for the ConfigMap. |
 | `gridIdentity.secretName` | string | `""` | Secret with `tls.crt` and `tls.key`. Non-empty mounts the identity and makes implicit render transports use mTLS. |
 | `gridIdentity.caSecretName` | string | `""` | Secret with public `ca.crt`. Empty uses `gridIdentity.secretName`; set it when the Grid CA is separate. |
 | `gridIdentity.mountPath` | string | `/etc/praxis/tls` | Directory where the identity and CA keys are projected. For operator mTLS, match `consumerConfig.tlsCertMountPath`. |
@@ -365,7 +365,7 @@ settings exist for that integration:
 - `praxisConfig.render.role: provider` serves grid peers on the site identity, admits
   them by `peerTrust`, and forwards to one local backend. It needs
   `image.flavor: grid-gateway`.
-- `gridServing` routes each model to the least-loaded site from the operator's
+- `praxisConfig.render.gridServing` routes each model to the least-loaded site from the operator's
   serving config (see [Cross-site routing in AGN](#cross-site-routing-in-agn)).
 - `overlay.configMapName` mounts the routing overlay the AGN Operator publishes
   for BYO `praxis.yaml`; the overlay-sync sidecar validates and delivers it.
@@ -411,7 +411,7 @@ gateway's Service name. When using `fullnameOverride`, set
 
 ### Cross-site routing in AGN
 
-With `gridServing.enabled`, the consumer gateway reads the serving config the
+With `praxisConfig.render.gridServing.enabled`, the consumer gateway reads the serving config the
 grid operator writes (under `signalTransport: poll`) and polls each peer's
 `/v1/site/signals` over mTLS with the grid identity at `gridIdentity.mountPath`. It routes
 each model to the least-loaded admitted site. The chosen candidate's cluster must
@@ -571,6 +571,11 @@ Migrate the values before `helm upgrade`:
 | `praxisConfig.render.backends[].transport.ca.configMap` / `.secret` | `.configMapName` / `.secretName` |
 | `overlay.enabled` + `overlay.existingConfigMap` | `overlay.configMapName` |
 | `overlay.sidecar.expectedNetwork` / `expectedLocalSite` | `grid.networkName` / `grid.siteName` |
+| `gridServing.enabled` | `praxisConfig.render.gridServing.enabled` |
+| `gridServing.network` | `praxisConfig.render.gridServing.networkName` |
+| `gridServing.gatewayRef` | `praxisConfig.render.gridServing.gatewayRefName` |
+| `gridServing.configMap` | `praxisConfig.render.gridServing.configMapName` |
+| `gridServing.mountPath` | `praxisConfig.render.gridServing.mountPath` |
 
 `gridIdentity.secretName` names the identity Secret (`tls.crt`, `tls.key`);
 `gridIdentity.caSecretName` names the public CA Secret (`ca.crt`); if empty, the
@@ -594,7 +599,7 @@ Behavior changes:
   targets the gateway Service by name.
 - `overlay.items` is removed. The chart mounts only `routing-overlay.json`;
   update any BYO `overlay_file` path that names `routing-config.json`.
-- `praxisConfig.render.role: provider` and `gridServing` require
+- `praxisConfig.render.role: provider` and `praxisConfig.render.gridServing` require
   `image.flavor: grid-gateway`.
 
 ## Where this chart lives
