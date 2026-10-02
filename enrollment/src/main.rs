@@ -43,6 +43,8 @@ const CA_COMMON_NAME: &str = "ENROLLMENT_CA_COMMON_NAME";
 const GRID_ADMIN_TOKENS: &str = "ENROLLMENT_GRID_ADMIN_TOKENS";
 /// How many seconds an issued certificate lasts.
 const CERT_LIFETIME_SECS: &str = "ENROLLMENT_CERT_LIFETIME_SECS";
+/// Comma-separated site names issued outside enrollment, refused at mint and redeem.
+const RESERVED_SITES: &str = "ENROLLMENT_RESERVED_SITES";
 /// Server certificate presented to callers, PEM.
 const TLS_CERT_PATH: &str = "ENROLLMENT_TLS_CERT";
 /// Private key for the server certificate, PEM.
@@ -122,6 +124,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // feature, kept off the startup stack frame.
         authorizer: Box::pin(build_authorizer()).await?,
         cert_lifetime: load_cert_lifetime(),
+        reserved_sites: load_reserved_sites()?,
     });
 
     // Reload the server certificate on an interval so a rotated TLS secret is
@@ -345,6 +348,24 @@ fn require_db_tls(url: &str) -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     Ok(())
+}
+
+/// Read the reserved site names, refusing one that is not a valid site name.
+fn load_reserved_sites() -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let raw = std::env::var(RESERVED_SITES).unwrap_or_default();
+    let sites: Vec<String> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|site| !site.is_empty())
+        .map(str::to_owned)
+        .collect();
+    for site in &sites {
+        certs::validate_site_name(site).map_err(|err| format!("{RESERVED_SITES} entry {site:?}: {err}"))?;
+    }
+    if !sites.is_empty() {
+        tracing::info!(?sites, "site names reserved from enrollment");
+    }
+    Ok(sites)
 }
 
 /// Read how long issued certificates should last.
