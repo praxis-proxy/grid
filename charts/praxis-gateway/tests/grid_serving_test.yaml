@@ -7,15 +7,14 @@ release:
   namespace: grid
 set:
   image.flavor: grid-gateway
-  gatewayConfig.render: true
-  gatewayConfig.localSite: hub
-  gatewayConfig.auth.mode: none
-  tls.enabled: true
-  tls.existingSecret: grid-site-identity
-  tls.caSecret: grid-ca
-  gridServing.enabled: true
-  gridServing.network: grid
-  gatewayConfig.backends:
+  praxisConfig.source: render
+  grid.siteName: hub
+  praxisConfig.render.auth.mode: none
+  gridIdentity.tlsSecretName: grid-site-identity
+  gridIdentity.caSecretName: grid-ca
+  praxisConfig.render.gridServing.enabled: true
+  praxisConfig.render.gridServing.networkName: grid
+  praxisConfig.render.backends:
     - cluster: pool-b
       endpoints: ["203.0.113.7:8443"]
       transport: { mode: mutual_tls, sni: site-b.grid.internal }
@@ -49,7 +48,7 @@ tests:
   - it: an explicit configMap overrides the derived name
     template: templates/deployment.yaml
     set:
-      gridServing.configMap: custom
+      praxisConfig.render.gridServing.configMapName: custom
     asserts:
       - contains:
           path: spec.template.spec.volumes
@@ -59,18 +58,32 @@ tests:
               name: custom
               optional: false
 
+  - it: derives the serving ConfigMap from gatewayRefName
+    template: templates/deployment.yaml
+    set:
+      praxisConfig.render.gridServing.configMapName: ""
+      praxisConfig.render.gridServing.gatewayRefName: gateway-a
+    asserts:
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: grid-serving
+            configMap:
+              name: grid-serving-grid-gateway-a
+              optional: false
+
   - it: needs the grid-gateway flavor
     template: templates/deployment.yaml
     set:
       image.flavor: ai
     asserts:
       - failedTemplate:
-          errorPattern: "gridServing needs image.flavor grid-gateway"
+          errorPattern: "praxisConfig.render.gridServing needs image.flavor grid-gateway"
 
   - it: refuses a derived name the operator would hash
     template: templates/deployment.yaml
     set:
-      gridServing.network: a-network-name-long-enough-to-push-the-configmap-name-past-63
+      praxisConfig.render.gridServing.networkName: a-network-name-long-enough-to-push-the-configmap-name-past-63
     asserts:
       - failedTemplate:
-          errorPattern: "set gridServing.configMap"
+          errorPattern: "set configMapName"

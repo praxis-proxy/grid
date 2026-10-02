@@ -88,20 +88,20 @@ stage_default() {
 
 stage_inline_v1() {
   rollout
-  expect "config.inline v1 proxies / to backend-a" / 'HTTP/1\.1 200' 'backend-a' 'x-config-version: v1'
+  expect "praxisConfig.byo.inline v1 proxies / to backend-a" / 'HTTP/1\.1 200' 'backend-a' 'x-config-version: v1'
 }
 
 stage_inline_v2() {
   rollout
-  expect "config.inline v2 proxies / to backend-b" / 'HTTP/1\.1 200' 'backend-b' 'x-config-version: v2'
-  expect "config.inline v2 answers /static itself" /static 'HTTP/1\.1 200' 'static from praxis'
+  expect "praxisConfig.byo.inline v2 proxies / to backend-b" / 'HTTP/1\.1 200' 'backend-b' 'x-config-version: v2'
+  expect "praxisConfig.byo.inline v2 answers /static itself" /static 'HTTP/1\.1 200' 'static from praxis'
 }
 
 stage_existing() {
   rollout
   expect "the existing ConfigMap proxies / to backend-a" / 'HTTP/1\.1 200' 'backend-a' 'x-config-version: existing'
   if k get configmap "$RELEASE-config" >/dev/null 2>&1; then
-    fail "configmap/$RELEASE-config should be gone once config.existingConfigMap is set"
+    fail "configmap/$RELEASE-config should be gone once praxisConfig.byo.configMapName is set"
   fi
   pass "the chart removed its own ConfigMap"
 }

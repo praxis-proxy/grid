@@ -1,0 +1,13 @@
+# Gateway whose praxis.yaml is written by the Grid operator. The pod waits until the
+# operator creates the ConfigMap. The operator's praxis.yaml has no caller authentication,
+# so keep the Service ClusterIP and put an authenticating front in front of it.
+fullnameOverride: consumer-gateway
+praxisConfig:
+  source: operator
+  operator:
+    configMapName: ""
+gridIdentity:
+  tlsSecretName: consumer-tls
+  caSecretName: grid-ca
+service:
+  type: ClusterIP

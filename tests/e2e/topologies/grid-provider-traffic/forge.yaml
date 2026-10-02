@@ -389,7 +389,7 @@ spec:
         - type: helm
           release: provider-gateway
           chart: charts/praxis-gateway
-          version: "0.1.0"
+          version: "0.1.5"
           namespace: grid-system
           values:
             fullnameOverride: "provider-gateway"
@@ -407,8 +407,9 @@ spec:
               limits:
                 cpu: 500m
                 memory: 256Mi
-            config:
-              existingConfigMap: "provider-gateway-config"
+            praxisConfig:
+              byo:
+                configMapName: "provider-gateway-config"
             port:
               containerPort: 8443
               name: "https-mtls"
@@ -426,11 +427,11 @@ spec:
                   port: "https-mtls"
                 initialDelaySeconds: 5
                 periodSeconds: 10
-            tls:
-              enabled: true
-              existingSecret: "provider-gateway-tls"
-            credentials:
-              - name: "vcr-inference-credential"
+            gridIdentity:
+              tlsSecretName: "provider-gateway-tls"
+              caSecretName: "grid-ca"
+            providerCredentials:
+              - secretName: "vcr-inference-credential"
                 mountPath: "/etc/praxis/credentials/vcr-inference"
             podLabels:
               grid.praxis-proxy.io/backend-access: "provider-gateway"
@@ -467,7 +468,7 @@ spec:
         - type: helm
           release: consumer-gateway
           chart: charts/praxis-gateway
-          version: "0.1.0"
+          version: "0.1.5"
           namespace: grid-system
           values:
             fullnameOverride: "consumer-gateway"
@@ -485,16 +486,19 @@ spec:
               limits:
                 cpu: 500m
                 memory: 256Mi
-            config:
-              existingConfigMap: "consumer-gateway-config"
+            praxisConfig:
+              byo:
+                configMapName: "consumer-gateway-config"
             service:
               type: "LoadBalancer"
+            grid:
+              networkName: grid-provider-traffic
+              siteName: "{{ cluster.name }}"
             overlay:
-              enabled: true
-              existingConfigMap: "grid-overlay-grid-provider-traffic-consumer-gateway"
-            tls:
-              enabled: true
-              existingSecret: "consumer-gateway-tls"
+              configMapName: "grid-overlay-grid-provider-traffic-consumer-gateway"
+            gridIdentity:
+              tlsSecretName: "consumer-gateway-tls"
+              caSecretName: "grid-ca"
             podLabels:
               grid.praxis-proxy.io/consumer-site: "{{ cluster.name }}"
         - type: wait

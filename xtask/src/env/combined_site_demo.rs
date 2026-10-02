@@ -41,7 +41,7 @@ const CERTS_DIR: &str = "tests/env/certs";
 /// Ordered cluster names in the combined-site scenario environment.
 const CLUSTERS: &[&str] = &["west", "central", "east"];
 
-/// Consumer gateway TLS secret name (matches Helm `existingSecret` reference).
+/// Consumer gateway identity Secret name (matches Helm `gridIdentity.tlsSecretName`).
 const CONSUMER_TLS_SECRET: &str = "consumer-gateway-tls";
 
 /// Evidence JSON schema version.
@@ -53,7 +53,7 @@ const GRID_SYSTEM_NS: &str = "grid-system";
 /// Overlay ConfigMap name created by the Grid operator for consumer gateways.
 const OVERLAY_CONFIGMAP: &str = "grid-overlay-grid-combined-site-consumer-gateway";
 
-/// Provider credential secret name (matches Helm `credentials[0].name`).
+/// Provider credential Secret name (matches Helm `providerCredentials[0].secretName`).
 const VCR_INFERENCE_CREDENTIAL: &str = "vcr-inference-credential";
 
 /// Stable terminal separator that also remains readable in captured logs.
@@ -65,7 +65,7 @@ const PROVIDER_GATEWAY_SERVICE: &str = "provider-gateway";
 /// Provider gateway port advertised via SWIM for cross-site discovery.
 const PROVIDER_GATEWAY_PORT: &str = "8443";
 
-/// Provider gateway TLS secret name (matches Helm `existingSecret` reference).
+/// Provider gateway identity Secret name (matches Helm `gridIdentity.tlsSecretName`).
 const PROVIDER_TLS_SECRET: &str = "provider-gateway-tls";
 
 /// Same-CA client identity with an organization rejected by `peer_identity_trust`.
@@ -4602,15 +4602,15 @@ fn materialize_external_provider_stack(
         })
         .ok_or("provider-gateway stack has no helm step with release 'provider-gateway'")?;
 
-    let credentials = helm_step
+    let provider_credentials = helm_step
         .get_mut("values")
-        .and_then(|v| v.get_mut("credentials"))
+        .and_then(|v| v.get_mut("providerCredentials"))
         .and_then(|c| c.as_sequence_mut())
-        .ok_or("provider-gateway helm step missing values.credentials")?;
+        .ok_or("provider-gateway helm step missing values.providerCredentials")?;
 
-    let has_ext_cred = credentials
+    let has_ext_cred = provider_credentials
         .iter()
-        .any(|c| c.get("name").and_then(|n| n.as_str()) == Some(external_provider.secret_name));
+        .any(|c| c.get("secretName").and_then(|n| n.as_str()) == Some(external_provider.secret_name));
     if has_ext_cred {
         return Err(format!(
             "base stack already contains credential '{}'",
@@ -4621,7 +4621,7 @@ fn materialize_external_provider_stack(
 
     let mut entry = serde_yaml::Mapping::new();
     entry.insert(
-        serde_yaml::Value::String("name".to_owned()),
+        serde_yaml::Value::String("secretName".to_owned()),
         serde_yaml::Value::String(external_provider.secret_name.to_owned()),
     );
     entry.insert(
@@ -4632,7 +4632,7 @@ fn materialize_external_provider_stack(
         serde_yaml::Value::String("optional".to_owned()),
         serde_yaml::Value::Bool(false),
     );
-    credentials.push(serde_yaml::Value::Mapping(entry));
+    provider_credentials.push(serde_yaml::Value::Mapping(entry));
 
     stacks.insert(ext_key, cloned);
 
@@ -8067,8 +8067,8 @@ spec:
           chart: charts/praxis-gateway
           namespace: grid-system
           values:
-            credentials:
-              - name: "vcr-inference-credential"
+            providerCredentials:
+              - secretName: "vcr-inference-credential"
                 mountPath: "/etc/praxis/credentials/vcr-inference"
     consumer-gateway:
       description: test consumer gateway
@@ -8147,10 +8147,12 @@ spec:
         let rendered = render_config(&yaml, Some(&ext), Some("west")).unwrap();
         let config: serde_yaml::Value = serde_yaml::from_str(&rendered).unwrap();
         let cloned = &config["spec"]["stacks"][EXTERNAL_STACK_NAME];
-        let creds = cloned["steps"][0]["values"]["credentials"].as_sequence().unwrap();
+        let creds = cloned["steps"][0]["values"]["providerCredentials"]
+            .as_sequence()
+            .unwrap();
         assert_eq!(creds.len(), 2);
-        assert_eq!(creds[0]["name"].as_str().unwrap(), "vcr-inference-credential");
-        assert_eq!(creds[1]["name"].as_str().unwrap(), ext.secret_name);
+        assert_eq!(creds[0]["secretName"].as_str().unwrap(), "vcr-inference-credential");
+        assert_eq!(creds[1]["secretName"].as_str().unwrap(), ext.secret_name);
         assert_eq!(creds[1]["mountPath"].as_str().unwrap(), ext.mount_path);
         assert_eq!(creds[1]["optional"].as_bool(), Some(false));
     }
@@ -8163,9 +8165,9 @@ spec:
         let rendered = render_config(&yaml, Some(&ext), Some("west")).unwrap();
         let config: serde_yaml::Value = serde_yaml::from_str(&rendered).unwrap();
         let base = &config["spec"]["stacks"]["provider-gateway"];
-        let creds = base["steps"][0]["values"]["credentials"].as_sequence().unwrap();
+        let creds = base["steps"][0]["values"]["providerCredentials"].as_sequence().unwrap();
         assert_eq!(creds.len(), 1);
-        assert_eq!(creds[0]["name"].as_str().unwrap(), "vcr-inference-credential");
+        assert_eq!(creds[0]["secretName"].as_str().unwrap(), "vcr-inference-credential");
     }
 
     #[test]
@@ -8213,7 +8215,7 @@ spec:
         let resolved = dir.path().join(".forge.resolved.yaml");
         let content = fs::read_to_string(&resolved).unwrap();
         let config: serde_yaml::Value = serde_yaml::from_str(&content).unwrap();
-        let creds = config["spec"]["stacks"][EXTERNAL_STACK_NAME]["steps"][0]["values"]["credentials"]
+        let creds = config["spec"]["stacks"][EXTERNAL_STACK_NAME]["steps"][0]["values"]["providerCredentials"]
             .as_sequence()
             .unwrap();
         assert_eq!(creds.len(), 2);
@@ -8234,7 +8236,7 @@ spec:
         let yaml = minimal_forge_yaml().replace(
             "mountPath: \"/etc/praxis/credentials/vcr-inference\"",
             &format!(
-                "mountPath: \"/etc/praxis/credentials/vcr-inference\"\n              - name: \"{}\"\n                mountPath: \"{}\"",
+                "mountPath: \"/etc/praxis/credentials/vcr-inference\"\n              - secretName: \"{}\"\n                mountPath: \"{}\"",
                 ext.secret_name, ext.mount_path,
             ),
         );
