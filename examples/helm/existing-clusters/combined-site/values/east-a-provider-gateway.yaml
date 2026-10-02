@@ -15,9 +15,10 @@ image:
   tag: 0.4.0
   pullPolicy: IfNotPresent
 
-config:
-  existingConfigMap: provider-praxis-config
-  key: praxis.yaml
+praxisConfig:
+  byo:
+    configMapName: provider-praxis-config
+    key: praxis.yaml
 
 tls:
   enabled: true

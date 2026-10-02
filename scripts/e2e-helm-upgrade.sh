@@ -46,7 +46,7 @@ pass() { echo "PASS: $*"; }
 # Values both sides install with; the operator and gateway never start.
 OPERATOR_ARGS=(--set image.repository=registry.k8s.io/pause --set image.tag=3.9)
 SITE_ARGS=(--set gridNetwork.name=upgrade --set gridSite.name=upgrade-site)
-GATEWAY_ARGS=(--set config.existingConfigMap=upgrade-gateway --set image.tag=v0.1.0-ci)
+GATEWAY_ARGS=(--set praxisConfig.byo.configMapName=upgrade-gateway --set image.tag=v0.1.0-ci)
 RELEASES=(grid-operator grid-site praxis-gateway grid-mock-providers)
 
 release_args() { # <release>: prints the extra args, one per line
