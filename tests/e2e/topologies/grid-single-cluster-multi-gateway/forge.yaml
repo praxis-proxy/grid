@@ -296,7 +296,7 @@ spec:
                 initialDelaySeconds: 5
                 periodSeconds: 10
             gridIdentity:
-              secretName: "consumer-gateway-tls"
+              tlsSecretName: "consumer-gateway-tls"
               caSecretName: "grid-ca"
             providerCredentials:
               - secretName: "vcr-inference-credential"
@@ -361,7 +361,7 @@ spec:
                 initialDelaySeconds: 5
                 periodSeconds: 10
             gridIdentity:
-              secretName: "consumer-gateway-tls"
+              tlsSecretName: "consumer-gateway-tls"
               caSecretName: "grid-ca"
             providerCredentials:
               - secretName: "vcr-inference-credential"
@@ -425,7 +425,7 @@ spec:
                 initialDelaySeconds: 5
                 periodSeconds: 10
             gridIdentity:
-              secretName: "consumer-gateway-tls"
+              tlsSecretName: "consumer-gateway-tls"
               caSecretName: "grid-ca"
             providerCredentials:
               - secretName: "vcr-inference-credential"
@@ -487,7 +487,7 @@ spec:
             overlay:
               configMapName: "grid-overlay-grid-single-cluster--consumer-gateway-a-db750bac"
             gridIdentity:
-              secretName: "consumer-gateway-tls"
+              tlsSecretName: "consumer-gateway-tls"
               caSecretName: "grid-ca"
             podLabels:
               grid.praxis-proxy.io/consumer-site: "{{ cluster.name }}"
@@ -544,7 +544,7 @@ spec:
             overlay:
               configMapName: "grid-overlay-grid-single-cluster--consumer-gateway-b-de751065"
             gridIdentity:
-              secretName: "consumer-gateway-tls"
+              tlsSecretName: "consumer-gateway-tls"
               caSecretName: "grid-ca"
             podLabels:
               grid.praxis-proxy.io/consumer-site: "{{ cluster.name }}"

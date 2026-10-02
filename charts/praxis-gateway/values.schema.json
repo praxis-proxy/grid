@@ -120,7 +120,7 @@
                 {
                   "type": "object",
                   "propertyNames": { "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$" },
-                  "additionalProperties": {"type": "object", "additionalProperties": false, "required": [], "properties": {"cluster": {"type": "string", "minLength": 1, "pattern": "\\S"}, "site": {"type": "string", "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$", "description": "Grid site this backend serves. Required for a consumer's remote mutual_tls backend. Defaults to grid.siteName."}, "endpoints": {"type": "array", "minItems": 1, "items": {"type": "string", "pattern": "^\\S+:[0-9]+$"}}, "trustPrivate": {"type": "boolean"}, "allowPlaintextTrust": {"type": "boolean"}, "connectTimeoutMs": {"type": "integer", "minimum": 1}, "totalConnectTimeoutMs": {"type": "integer", "minimum": 1}, "healthCheck": {"type": "object", "additionalProperties": false, "properties": {"type": {"enum": ["http", "tcp"]}, "path": {"type": "string"}, "intervalMs": {"type": "integer", "minimum": 1}, "timeoutMs": {"type": "integer", "minimum": 1}, "healthyThreshold": {"type": "integer", "minimum": 1}, "unhealthyThreshold": {"type": "integer", "minimum": 1}}}, "transport": {"type": "object", "additionalProperties": false, "description": "Upstream transport. Defaults to mutual_tls when gridIdentity.secretName is set, else plaintext. mutual_tls also needs gridIdentity.caSecretName.", "properties": {"mode": {"type": "string", "enum": ["mutual_tls", "tls", "plaintext"]}, "sni": {"type": "string"}, "ca": {"type": "object", "additionalProperties": false, "description": "tls only: CA bundle that verifies this backend.", "properties": {"configMapName": {"type": "string"}, "secretName": {"type": "string"}, "key": {"type": "string"}}, "oneOf": [{"required": ["configMapName"], "properties": {"configMapName": {"minLength": 1}, "secretName": {"maxLength": 0}}}, {"required": ["secretName"], "properties": {"secretName": {"minLength": 1}, "configMapName": {"maxLength": 0}}}]}}, "if": {"required": ["ca"]}, "then": {"required": ["mode"], "properties": {"mode": {"const": "tls"}}}}, "endpoint": {"type": "string", "pattern": "^\\S+:[0-9]+$", "description": "Backend endpoint host:port."}}, "anyOf": [{"required": ["endpoint"]}, {"required": ["endpoints"]}]}
+                  "additionalProperties": {"type": "object", "additionalProperties": false, "required": [], "properties": {"cluster": {"type": "string", "minLength": 1, "pattern": "\\S"}, "site": {"type": "string", "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$", "description": "Grid site this backend serves. Required for a consumer's remote mutual_tls backend. Defaults to grid.siteName."}, "endpoints": {"type": "array", "minItems": 1, "items": {"type": "string", "pattern": "^\\S+:[0-9]+$"}}, "trustPrivate": {"type": "boolean"}, "allowPlaintextTrust": {"type": "boolean"}, "connectTimeoutMs": {"type": "integer", "minimum": 1}, "totalConnectTimeoutMs": {"type": "integer", "minimum": 1}, "healthCheck": {"type": "object", "additionalProperties": false, "properties": {"type": {"enum": ["http", "tcp"]}, "path": {"type": "string"}, "intervalMs": {"type": "integer", "minimum": 1}, "timeoutMs": {"type": "integer", "minimum": 1}, "healthyThreshold": {"type": "integer", "minimum": 1}, "unhealthyThreshold": {"type": "integer", "minimum": 1}}}, "transport": {"type": "object", "additionalProperties": false, "description": "Upstream transport. Defaults to mutual_tls when gridIdentity.tlsSecretName is set, else plaintext. mutual_tls also needs gridIdentity.caSecretName.", "properties": {"mode": {"type": "string", "enum": ["mutual_tls", "tls", "plaintext"]}, "sni": {"type": "string"}, "ca": {"type": "object", "additionalProperties": false, "description": "tls only: CA bundle that verifies this backend.", "properties": {"configMapName": {"type": "string"}, "secretName": {"type": "string"}, "key": {"type": "string"}}, "oneOf": [{"required": ["configMapName"], "properties": {"configMapName": {"minLength": 1}, "secretName": {"maxLength": 0}}}, {"required": ["secretName"], "properties": {"secretName": {"minLength": 1}, "configMapName": {"maxLength": 0}}}]}}, "if": {"required": ["ca"]}, "then": {"required": ["mode"], "properties": {"mode": {"const": "tls"}}}}, "endpoint": {"type": "string", "pattern": "^\\S+:[0-9]+$", "description": "Backend endpoint host:port."}}, "anyOf": [{"required": ["endpoint"]}, {"required": ["endpoints"]}]}
                 },
                 { "type": "array" }
               ],
@@ -152,7 +152,7 @@
                   "transport": {
                     "type": "object",
                     "additionalProperties": false,
-                    "description": "Upstream transport. Defaults to mutual_tls when gridIdentity.secretName is set, else plaintext. mutual_tls also needs gridIdentity.caSecretName.",
+                    "description": "Upstream transport. Defaults to mutual_tls when gridIdentity.tlsSecretName is set, else plaintext. mutual_tls also needs gridIdentity.caSecretName.",
                     "properties": {
                       "mode": { "type": "string", "enum": ["mutual_tls", "tls", "plaintext"] },
                       "sni": { "type": "string" },
@@ -506,13 +506,13 @@
       "additionalProperties": false,
       "description": "Grid identity Secret with tls.crt and tls.key. The CA may be in a separate Secret.",
       "properties": {
-        "secretName": {
+        "tlsSecretName": {
           "type": "string",
           "description": "Secret holding the client certificate and key."
         },
         "caSecretName": {
           "type": "string",
-          "description": "Secret holding ca.crt. Defaults to secretName when empty."
+          "description": "Secret holding ca.crt. Defaults to tlsSecretName when empty."
         },
         "mountPath": {
           "type": "string",

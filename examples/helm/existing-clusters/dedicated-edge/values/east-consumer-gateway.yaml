@@ -27,7 +27,7 @@ grid:
   siteName: east-consumer
 
 gridIdentity:
-  secretName: consumer-tls
+  tlsSecretName: consumer-tls
   caSecretName: grid-ca
 
 service:

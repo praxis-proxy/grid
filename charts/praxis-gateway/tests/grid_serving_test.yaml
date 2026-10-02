@@ -10,7 +10,7 @@ set:
   praxisConfig.source: render
   grid.siteName: hub
   praxisConfig.render.auth.mode: none
-  gridIdentity.secretName: grid-site-identity
+  gridIdentity.tlsSecretName: grid-site-identity
   gridIdentity.caSecretName: grid-ca
   praxisConfig.render.gridServing.enabled: true
   praxisConfig.render.gridServing.networkName: grid

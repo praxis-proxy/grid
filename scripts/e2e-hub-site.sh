@@ -265,7 +265,7 @@ install_hub() {
   images gateway
   helm_on "$HUB_CTX" "$NS" grid-gateway praxis-gateway \
     --set fullnameOverride=grid-gateway --set praxisConfig.source=render --set grid.siteName=hub \
-    --set gridIdentity.secretName=grid-site-identity --set gridIdentity.caSecretName=grid-ca \
+    --set gridIdentity.tlsSecretName=grid-site-identity --set gridIdentity.caSecretName=grid-ca \
     --set praxisConfig.render.model="$MODEL" --set praxisConfig.render.auth.mode=none \
     --set "praxisConfig.render.backends.$SITE.endpoint=$SITE_GW_IP:8080" "${IMG[@]}" || die "install hub grid-gateway"
   eventually "hub operator enrolled from its own invite through the in-cluster Service" enrolled "$HUB_CTX" \
@@ -330,7 +330,7 @@ install_site() {
   images gateway
   helm_on "$SITE_CTX" "$NS" grid-gateway praxis-gateway \
     --set fullnameOverride=grid-gateway --set praxisConfig.source=render --set praxisConfig.render.role=provider \
-    --set "grid.siteName=$SITE" --set gridIdentity.secretName=grid-site-identity --set gridIdentity.caSecretName=grid-ca "${trust[@]}" \
+    --set "grid.siteName=$SITE" --set gridIdentity.tlsSecretName=grid-site-identity --set gridIdentity.caSecretName=grid-ca "${trust[@]}" \
     --set "praxisConfig.render.backends.local.endpoint=$MODEL_IP:8000" \
     "${IMG[@]}" --set service.loadBalancerIP="$SITE_GW_IP" || die "install site grid-gateway"
   eventually "site operator enrolled from its copied invite through the hub enrollment URL" enrolled "$SITE_CTX" \

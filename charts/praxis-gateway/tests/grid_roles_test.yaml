@@ -9,7 +9,7 @@ set:
   image.flavor: grid-gateway
   praxisConfig.source: render
   grid.siteName: east
-  gridIdentity.secretName: grid-site-identity
+  gridIdentity.tlsSecretName: grid-site-identity
   gridIdentity.caSecretName: grid-ca
   praxisConfig.render.role: provider
   praxisConfig.render.peerTrust.certDigests: ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
@@ -236,7 +236,7 @@ tests:
   - it: a provider mounts the configured identity and CA Secrets
     template: templates/deployment.yaml
     set:
-      gridIdentity.secretName: grid-site-identity
+      gridIdentity.tlsSecretName: grid-site-identity
       gridIdentity.caSecretName: grid-ca
     asserts:
       - contains:
