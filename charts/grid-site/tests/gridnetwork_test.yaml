@@ -60,6 +60,19 @@ tests:
           path: spec.selectionPolicy.mode
           value: random
 
+  - it: renders placementPolicy without scoringPolicy
+    set:
+      gridNetwork.name: prod-grid
+      gridSite.name: prod-site
+      gridNetwork.selectionPolicy.mode: weightedRandom
+      gridNetwork.placementPolicy.strategy: static
+    asserts:
+      - equal:
+          path: spec.placementPolicy.strategy
+          value: static
+      - notExists:
+          path: spec.scoringPolicy
+
   - it: renders budgetPolicy.tenants verbatim when set
     set:
       gridNetwork.name: prod-grid

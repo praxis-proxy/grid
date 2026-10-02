@@ -683,6 +683,7 @@ fullnameOverride: provider-gateway
 # operator-overrides.yaml
 gateway:
   serviceName: provider-gateway
+  port: "8443"
 ```
 
 ### Service Type and Ports
