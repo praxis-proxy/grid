@@ -245,7 +245,7 @@ Praxis AI image; these values may advance independently.
 | `gatewayConfig.auth.validateUrl` | string | **required** for `api-key` | https validate endpoint. |
 | `gatewayConfig.auth.allowPrivateEndpoint` | bool | `false` | Sets `allow_private_idp`, which is engine-wide: every policy callout in this gateway, not only `validateUrl`, may then reach private, loopback, link-local, and cloud metadata addresses. Turn it on only when every policy in the gateway is yours. |
 | `gatewayConfig.auth.validateCA` | object | empty | CA for the validate call (`configMap` or `secret`, `key`). Set as `SSL_CERT_FILE`, which replaces the platform trust store for the validate call and https backends without a per-backend CA or `upstreamCA`. mutual_tls backends and `upstreamCA` are unaffected. See the recipe below. |
-| `mountReconciliation.enabled` | bool | `false` | Explicitly delegate generated consumer Secret mounts and rollouts to the AGN Operator. Requires `mountReconciliation.network` and `config.existingConfigMap` matching `consumerConfig.configMapName`; supported for the consumer role. |
+| `mountReconciliation.enabled` | bool | `false` | Explicitly delegate generated consumer Secret mounts and rollouts to the AGN Operator. Requires `mountReconciliation.network` and `config.existingConfigMap` matching `praxisConfig.configMapName`; supported for the consumer role. |
 | `mountReconciliation.network` | string | `""` | GridNetwork name. Required when delegation is enabled. |
 | `mountReconciliation.gatewayRef` | string | release fullname | `GatewayRef.name` to bind the Deployment opt-in to. |
 | `mountReconciliation.releaseHelmMounts` | bool | `false` | Second handoff phase. After Grid reports `Ready`, set this true to release selected Helm credential mounts and, without Grid serving, the chart TLS mount. |
@@ -407,13 +407,13 @@ compatible release, before the next Grid release. Upgrade and roll every
 consumer of a Grid-managed overlay before deploying that Grid version.
 
 Generated consumer credentials use a separate two-step opt-in: set
-`consumerConfig.enableProjectedCredentials: true`, let Grid render the filter,
+`praxisConfig.enableProjectedCredentials: true`, let Grid render the filter,
 and roll out the consumer with the read-only Secret mounts. In this mode, mount
-each Secret at `{credentialMountBase}/{secret-namespace}/{secret-name}`, with
+each Secret at `{credentialMountPath}/{secret-namespace}/{secret-name}`, with
 its data keys as files (for example,
 `/run/secrets/grid-credentials/grid-system/provider-key/token`). Static `file:`
 entries continue to use their explicitly configured paths. Only then set
-`consumerConfig.supportsProjectedCredentials: true`; Grid retains credential-
+`praxisConfig.supportsProjectedCredentials: true`; Grid retains credential-
 bearing overlays until that readiness attestation is present.
 
 ### Edge and provider gateways in AGN
@@ -456,7 +456,7 @@ gateway's Service name. When using `fullnameOverride`, set
 Consumer config and Secret mount reconciliation is opt-in on both the
 `GridNetwork` and this chart. The `GatewayRef.name`, chart
 `mountReconciliation.gatewayRef`, chart Deployment name, and
-`consumerConfig.mountReconciliation.deploymentName` must agree. The operator
+`praxisConfig.mountReconciliation.deploymentName` must agree. The operator
 patches its reserved volumes, the delegated Praxis config volume source, the
 named container's mounts, and rollout annotations. It preserves other
 Deployment fields and Helm resources.
@@ -517,8 +517,8 @@ credentials:
 ```
 
 Before enabling delegation on an existing release, set
-`consumerConfig.credentialMountBase` and (when consumer mTLS is used without
-Grid serving) `consumerConfig.tlsCertMountPath` to paths that do not overlap
+`praxisConfig.credentialMountPath` and (when consumer mTLS is used without
+Grid serving) `praxisConfig.tlsCertMountPath` to paths that do not overlap
 the current chart mounts. The operator stages its new mounts at those paths,
 switches to a matching generated config in the same Pod-template update, and
 leaves the old Helm mounts in place. Older generated configs embedded
@@ -542,15 +542,15 @@ ready, Grid stages a generated config in an inactive ConfigMap slot and rolls
 it out with the required Secret mounts. Old pods keep their bootstrap config
 and mounts until the new rollout completes.
 
-Set `consumerConfig.mountReconciliation.enabled`, `deploymentName`, and
-`containerName` on the matching `GridNetwork.spec.gatewayRefs[]` entry. Keep
+Set `praxisConfig.mountReconciliation.enabled`, `deploymentName`, and
+`containerName` on the matching `GridNetwork.spec.consumerGateways[]` entry. Keep
 all referenced credential, Grid CA, site identity, and backend CA Secrets in
 the gateway namespace. Grid checks required Secret keys without copying their
 contents into config, status, or logs. It publishes reference-only mount
 requirements, applies the matching config and mounts in one Pod revision,
 waits for the old replicas to leave, and then removes obsolete Grid-owned
 mounts. Secret rotation triggers a rollout based on resource versions.
-`consumerConfigStatus: Rendered` means the config map was
+`praxisConfigStatus: Rendered` means the config map was
 applied; check `mountReconciliationStatus: Ready` before treating the gateway
 as ready.
 

@@ -1489,9 +1489,9 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
     // List providers once; share between routing overlay rendering and CRDT publishing.
     let providers = list_all_inference_providers(client).await?;
     let mut requeue_interval = requeue_interval_for_network(&network, &providers)?;
-    if network.spec.gateway_refs.iter().any(|gateway| {
-        gateway.consumer_config.as_ref().is_some_and(|config| {
-            config.enabled
+    if network.spec.consumer_gateways.iter().any(|gateway| {
+        gateway.praxis_config.as_ref().is_some_and(|config| {
+            config.generate
                 && config
                     .mount_reconciliation
                     .as_ref()
@@ -1667,7 +1667,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
     };
 
     // Publish provider CRDT state so peers learn this site's providers.
-    let distributed_provider_count = if let Some(swim) = ctx.swim().filter(|handle| handle.is_running()) {
+    let remote_provider_count = if let Some(swim) = ctx.swim().filter(|handle| handle.is_running()) {
         publish_real_provider_state(swim, name, &grid_id, &providers, &tool_providers, &raw_metrics);
         log_capacity_changes(&ctx.logged, name, &providers);
         count_remote_provider_records(swim, name)
@@ -1692,7 +1692,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
         &grid_id,
         &phase,
         membership.as_ref(),
-        distributed_provider_count,
+        remote_provider_count,
         consumer_config_statuses,
         mount_reconciliation_statuses,
         overlay_statuses,
@@ -1766,7 +1766,7 @@ async fn reconcile_local_site(network_name: &str, local_site: &str, client: &Cli
     Ok(())
 }
 
-/// Apply `spec.tls.swimKeyRef` before any reconcile-triggered SWIM send.
+/// Apply `spec.tls.swimKeySecretRef` before any reconcile-triggered SWIM send.
 ///
 /// A configured Secret reference is mandatory for that reconcile: missing
 /// Secret, missing key field, invalid key length, RBAC denial, or a stopped
@@ -1779,25 +1779,25 @@ async fn apply_configured_swim_key(
     swim: &SwimHandle,
 ) -> Result<(), OperatorError> {
     let network_name = network.metadata.name.as_deref().unwrap_or("<unknown>");
-    let Some(swim_key_ref) = &network.spec.tls.swim_key_ref else {
+    let Some(swim_key_secret_ref) = &network.spec.tls.swim_key_secret_ref else {
         return release_plain_if_undeclared(client, swim, network_name).await;
     };
 
-    let key = secret::read_swim_key(client, swim_key_ref)
+    let key = secret::read_swim_key(client, swim_key_secret_ref)
         .await
-        .map_err(|e| OperatorError::SwimKeyConfig(format!("failed to read swimKeyRef for {network_name}: {e}")))?
+        .map_err(|e| OperatorError::SwimKeyConfig(format!("failed to read swimKeySecretRef for {network_name}: {e}")))?
         .ok_or_else(|| {
             OperatorError::SwimKeyConfig(format!(
-                "swimKeyRef for {network_name} did not resolve to a valid 32-byte key \
+                "swimKeySecretRef for {network_name} did not resolve to a valid 32-byte key \
                  (secret={}/{}, key={})",
-                swim_key_ref.namespace,
-                swim_key_ref.name,
-                swim_key_ref.key.as_deref().unwrap_or("key")
+                swim_key_secret_ref.namespace,
+                swim_key_secret_ref.name,
+                swim_key_secret_ref.key.as_deref().unwrap_or("key")
             ))
         })?;
 
     swim.set_swim_key(key)
-        .map_err(|e| OperatorError::SwimKeyConfig(format!("failed to apply swimKeyRef for {network_name}: {e}")))?;
+        .map_err(|e| OperatorError::SwimKeyConfig(format!("failed to apply swimKeySecretRef for {network_name}: {e}")))?;
     Ok(())
 }
 
@@ -1813,7 +1813,7 @@ async fn release_plain_if_undeclared(client: &Client, swim: &SwimHandle, network
     if !declares_swim_key(&networks) && swim.release_plain() {
         tracing::warn!(
             network,
-            "no GridNetwork declares a swimKeyRef; SWIM gossip is plaintext"
+            "no GridNetwork declares a swimKeySecretRef; SWIM gossip is plaintext"
         );
     }
     Ok(())
@@ -1822,7 +1822,7 @@ async fn release_plain_if_undeclared(client: &Client, swim: &SwimHandle, network
 /// Whether any of `networks` declares a SWIM key.
 #[must_use]
 pub fn declares_swim_key(networks: &[GridNetwork]) -> bool {
-    networks.iter().any(|network| network.spec.tls.swim_key_ref.is_some())
+    networks.iter().any(|network| network.spec.tls.swim_key_secret_ref.is_some())
 }
 
 /// Return a monotonic-ish revision for public-cert metadata broadcasts.
@@ -2211,10 +2211,10 @@ fn site_phases(sites: &[GridSite]) -> impl Iterator<Item = (&str, &'static str)>
 ///
 /// Lists all [`InferenceProvider`]s and [`GridSite`]s cluster-wide, then
 /// renders one overlay `ConfigMap` per `gatewayRef`.  Each gateway may
-/// declare its own `localSiteName`: the `local_site` in the overlay for
-/// gateway G is `G.localSiteName ?? network_name`.  This ensures that in a
+/// declare its own `siteName`: the `local_site` in the overlay for
+/// gateway G is `G.siteName ?? network_name`.  This ensures that in a
 /// multi-gateway network each gateway's overlay identifies the correct local
-/// site.  A network with no `gatewayRefs` is a no-op.
+/// site.  A network with no `consumerGateways` is a no-op.
 ///
 /// Changes to [`InferenceProvider`] and [`GridSite`] resources trigger a
 /// [`GridNetwork`] reconcile via cross-resource watches in the controller
@@ -2281,10 +2281,10 @@ async fn reconcile_routing_overlay_inner(
     let mut overlay_statuses: Vec<OverlayRevisionStatus> = Vec::new();
     let mut serving_retry: Option<Duration> = None;
 
-    for gw_ref in &network.spec.gateway_refs {
+    for gw_ref in &network.spec.consumer_gateways {
         // Each gateway identifies its own local site.  Fall back to the
         // network name for single-site deployments where the two are equal.
-        let local_site = gw_ref.local_site_name.as_deref().unwrap_or(network_name);
+        let local_site = gw_ref.site_name.as_deref().unwrap_or(network_name);
 
         // Filter remote CRDT providers to those whose source GridSite is Active.
         // Providers from sites in any other phase (Discovered, Connecting, Pending,
@@ -2333,7 +2333,7 @@ async fn reconcile_routing_overlay_inner(
                     gw_ref,
                     observed_generation,
                     None,
-                    "OverlayRenderFailed",
+                    "RoutingMapRenderFailed",
                     "overlay render failed",
                 ));
                 continue;
@@ -2374,7 +2374,7 @@ async fn reconcile_routing_overlay_inner(
                     gw_ref,
                     observed_generation,
                     None,
-                    "OverlayRenderFailed",
+                    "RoutingMapRenderFailed",
                     "overlay envelope build failed",
                 ));
                 continue;
@@ -2393,7 +2393,7 @@ async fn reconcile_routing_overlay_inner(
             .iter()
             .any(|candidate| candidate.credential.is_some());
         if credential_bearing
-            && let Some(cc) = gw_ref.consumer_config.as_ref().filter(|cc| cc.enabled)
+            && let Some(cc) = gw_ref.praxis_config.as_ref().filter(|cc| cc.generate)
             && !cc.enable_projected_credentials
         {
             let error = OperatorError::ConsumerConfigRender(ConsumerConfigError::ProjectedCredentialsUnsupported);
@@ -2416,9 +2416,9 @@ async fn reconcile_routing_overlay_inner(
         let mut delegated_mount_reconciled = false;
         if !no_candidates
             && let Some(cc) = gw_ref
-                .consumer_config
+                .praxis_config
                 .as_ref()
-                .filter(|cc| cc.enabled && cc.mount_reconciliation.as_ref().is_some_and(|mounts| mounts.enabled))
+                .filter(|cc| cc.generate && cc.mount_reconciliation.as_ref().is_some_and(|mounts| mounts.enabled))
         {
             match Box::pin(apply_consumer_config_for_gateway(
                 &overlay,
@@ -2478,7 +2478,7 @@ async fn reconcile_routing_overlay_inner(
         }
 
         if credential_bearing
-            && let Some(cc) = gw_ref.consumer_config.as_ref().filter(|cc| cc.enabled)
+            && let Some(cc) = gw_ref.praxis_config.as_ref().filter(|cc| cc.generate)
             && !cc.supports_projected_credentials
         {
             let error = OperatorError::ConsumerConfigRender(ConsumerConfigError::ProjectedCredentialsUnsupported);
@@ -2509,7 +2509,7 @@ async fn reconcile_routing_overlay_inner(
                     gw_ref,
                     observed_generation,
                     Some(&render),
-                    "OverlayApplyFailed",
+                    "RoutingMapApplyFailed",
                     "overlay ConfigMap apply failed",
                 ));
                 continue;
@@ -2543,9 +2543,9 @@ async fn reconcile_routing_overlay_inner(
             }
         }
 
-        // Gateways with consumerConfig.enabled=false get a Disabled entry.
-        // Gateways without a consumerConfig block are omitted from status.
-        if !delegated_mount_reconciled && let Some(cc) = gw_ref.consumer_config.as_ref().filter(|cc| cc.enabled) {
+        // Gateways with praxisConfig.generate=false get a Disabled entry.
+        // Gateways without a praxisConfig block are omitted from status.
+        if !delegated_mount_reconciled && let Some(cc) = gw_ref.praxis_config.as_ref().filter(|cc| cc.generate) {
             match Box::pin(apply_consumer_config_for_gateway(
                 &overlay,
                 network_name,
@@ -2592,7 +2592,7 @@ async fn reconcile_routing_overlay_inner(
                     ));
                 },
             }
-        } else if let Some(cc) = gw_ref.consumer_config.as_ref().filter(|cc| !cc.enabled) {
+        } else if let Some(cc) = gw_ref.praxis_config.as_ref().filter(|cc| !cc.generate) {
             consumer_statuses.push(consumer_config_status_disabled(gw_ref, cc, observed_generation));
         }
     }
@@ -2603,6 +2603,10 @@ async fn reconcile_routing_overlay_inner(
         serving_retry,
     })
 }
+
+/// Legacy status reason used by retained-status compatibility tests.
+#[cfg(test)]
+const EMPTY_CANDIDATES: &str = "EmptyCandidates";
 
 /// What one routing overlay pass produced, per gateway.
 struct OverlayOutcome {
@@ -2648,7 +2652,7 @@ fn render_serving_text(
     gw_ref: &GatewayRef,
 ) -> Result<String, OperatorError> {
     let tls_mount = gw_ref
-        .consumer_config
+        .praxis_config
         .as_ref()
         .map_or(crate::crd::grid_network::DEFAULT_TLS_CERT_MOUNT_PATH, |cc| {
             cc.tls_cert_mount_path.as_str()
@@ -2772,11 +2776,22 @@ async fn apply_serving_config(
     Ok(None)
 }
 
+/// Whether the last recorded status for this gateway already had no candidates.
+#[cfg(test)]
+fn already_empty(network: &GridNetwork, gw_ref: &GatewayRef) -> bool {
+    network.status.as_ref().is_some_and(|status| {
+        status
+            .routing_map_status
+            .iter()
+            .any(|entry| entry.gateway_name == gw_ref.name && entry.namespace == gw_ref.namespace && entry.reason == EMPTY_CANDIDATES)
+    })
+}
+
 /// Find the last successfully distributed overlay status for a gateway.
 fn find_prior_overlay<'net>(network: &'net GridNetwork, gw_ref: &GatewayRef) -> Option<&'net OverlayRevisionStatus> {
     network.status.as_ref().and_then(|status| {
         status
-            .overlay_status
+            .routing_map_status
             .iter()
             .find(|e| e.gateway_name == gw_ref.name && e.namespace == gw_ref.namespace)
             .filter(|e| !e.distributed_revision.is_empty())
@@ -2788,7 +2803,7 @@ fn keep_rendered_at(
     current: Option<&GridNetworkStatus>,
     desired: Vec<OverlayRevisionStatus>,
 ) -> Vec<OverlayRevisionStatus> {
-    let prior = current.map_or(&[][..], |status| status.overlay_status.as_slice());
+    let prior = current.map_or(&[][..], |status| status.routing_map_status.as_slice());
     desired
         .into_iter()
         .map(|mut entry| {
@@ -2817,13 +2832,13 @@ fn keep_consumer_config_status_at(
     let prior = network
         .status
         .as_ref()
-        .map_or(&[][..], |status| status.consumer_config_status.as_slice());
+        .map_or(&[][..], |status| status.praxis_config_status.as_slice());
     let mut kept = Vec::new();
-    for gw_ref in &network.spec.gateway_refs {
-        let Some(cc) = gw_ref.consumer_config.as_ref() else {
+    for gw_ref in &network.spec.consumer_gateways {
+        let Some(cc) = gw_ref.praxis_config.as_ref() else {
             continue;
         };
-        if !cc.enabled {
+        if !cc.generate {
             kept.push(consumer_config_status_disabled(
                 gw_ref,
                 cc,
@@ -2859,8 +2874,8 @@ fn keep_mount_reconciliation_status_at(
         .as_ref()
         .map_or(&[][..], |status| status.mount_reconciliation_status.as_slice());
     let mut kept = Vec::new();
-    for gw_ref in &network.spec.gateway_refs {
-        let Some(cc) = gw_ref.consumer_config.as_ref().filter(|cc| cc.enabled) else {
+    for gw_ref in &network.spec.consumer_gateways {
+        let Some(cc) = gw_ref.praxis_config.as_ref().filter(|cc| cc.generate) else {
             continue;
         };
         let expected_deployment = cc
@@ -3063,7 +3078,7 @@ async fn apply_consumer_config_for_gateway(
 ) -> Result<ConsumerApplyOutcome, OperatorError> {
     let rendered = consumer_config::render_consumer_config_with_projected(
         overlay,
-        &cc.credential_mount_base,
+        &cc.credential_mount_path,
         cluster_endpoints,
         &cc.tls_cert_mount_path,
         cc.listener_port,
@@ -3159,7 +3174,7 @@ fn delegated_mount_requirements_document(
     if cc.tls_cert_mount_path != GRID_SERVING_TLS_MOUNT_PATH {
         return Err(mount_failure(
             "GridServingTlsPathMismatch",
-            format!("gridServing requires consumerConfig.tlsCertMountPath={GRID_SERVING_TLS_MOUNT_PATH:?}"),
+            format!("gridServing requires praxisConfig.tlsCertMountPath={GRID_SERVING_TLS_MOUNT_PATH:?}"),
         )
         .into());
     }
@@ -5173,10 +5188,10 @@ pub(crate) fn apply_swim_staleness_override(
 /// Patch the `GridNetwork` status subresource.
 ///
 /// `connected_sites` is derived from `membership`: count of peers with
-/// [`Alive`] status.  `distributed_provider_count` reflects providers received via
+/// [`Alive`] status.  `remote_provider_count` reflects providers received via
 /// CRDT state broadcasts.  Both are `0` when SWIM is disabled.
 /// `consumer_config_statuses` holds per-gateway render/apply outcomes for
-/// gateways with `consumerConfig.enabled: true`; empty when no gateways opted in.
+/// gateways with `praxisConfig.generate: true`; empty when no gateways opted in.
 /// `budget_statuses` holds per-tenant spend status derived from
 /// `spec.budgetPolicy` and merged CRDT spend state; empty when `budgetPolicy`
 /// is absent.
@@ -5192,7 +5207,7 @@ async fn update_status(
     grid_id: &str,
     phase: &GridNetworkPhase,
     membership: Option<&MembershipSnapshot>,
-    distributed_provider_count: u32,
+    remote_provider_count: u32,
     consumer_config_statuses: Vec<ConsumerConfigStatus>,
     mount_reconciliation_statuses: Vec<MountReconciliationStatus>,
     overlay_statuses: Vec<OverlayRevisionStatus>,
@@ -5209,13 +5224,13 @@ async fn update_status(
         gateway_age_reports: Vec::new(),
         gateway_age_report_overflow: false,
         connected_sites: membership.map_or(0, MembershipSnapshot::connected_count),
-        distributed_provider_count,
+        remote_provider_count,
         grid_id: grid_id.to_owned(),
         observed_generation: network.metadata.generation.unwrap_or(0),
         phase: phase.clone(),
-        consumer_config_status: keep_consumer_config_status_at(network, &consumer_config_statuses),
+        praxis_config_status: keep_consumer_config_status_at(network, &consumer_config_statuses),
         mount_reconciliation_status: keep_mount_reconciliation_status_at(network, &mount_reconciliation_statuses),
-        overlay_status: keep_rendered_at(network.status.as_ref(), overlay_statuses),
+        routing_map_status: keep_rendered_at(network.status.as_ref(), overlay_statuses),
         budget_status: budget_statuses,
         identity,
     };
@@ -5343,7 +5358,7 @@ fn gateway_cluster_endpoints<'gw>(
     Vec<derived_topology::Refused>,
 ) {
     // A disabled block renders nothing, so its gateway's overlay is not ours to withdraw from.
-    let Some(cc) = gw_ref.consumer_config.as_ref().filter(|cc| cc.enabled) else {
+    let Some(cc) = gw_ref.praxis_config.as_ref().filter(|cc| cc.generate) else {
         return (Cow::Borrowed(&[]), String::new(), Vec::new());
     };
     // Resolve even with nothing allowlisted, so a revoked derivation is withdrawn, not kept stale.
@@ -5425,7 +5440,7 @@ pub(crate) fn consumer_config_status_rendered(
 }
 
 /// Build a `Disabled` [`ConsumerConfigStatus`] for a gateway whose
-/// `consumerConfig.enabled` is `false`.
+/// `praxisConfig.generate` is `false`.
 pub(crate) fn consumer_config_status_disabled(
     gw_ref: &GatewayRef,
     cc: &ConsumerConfig,
@@ -5436,8 +5451,8 @@ pub(crate) fn consumer_config_status_disabled(
         namespace: gw_ref.namespace.clone(),
         config_map_name: cc.config_map_name.clone(),
         phase: ConsumerConfigPhase::Disabled,
-        reason: "ConsumerConfigDisabled".to_owned(),
-        message: "consumerConfig.enabled is false; no ConfigMap generated".to_owned(),
+        reason: "PraxisConfigDisabled".to_owned(),
+        message: "praxisConfig.generate is false; no ConfigMap generated".to_owned(),
         observed_generation,
     }
 }
@@ -5466,15 +5481,15 @@ pub(crate) fn consumer_config_status_error(
         OperatorError::ConsumerConfigRender(ConsumerConfigError::ProjectedCredentialsUnsupported) => {
             "ProjectedCredentialsUnsupported"
         },
-        OperatorError::ConsumerConfigRender(_) => "ConsumerConfigRenderFailed",
+        OperatorError::ConsumerConfigRender(_) => "PraxisConfigRenderFailed",
         OperatorError::MountReconciliation(failure) => failure.reason,
-        OperatorError::Kube(_) => "ConsumerConfigApplyFailed",
+        OperatorError::Kube(_) => "PraxisConfigApplyFailed",
         OperatorError::Certificate(_)
         | OperatorError::Json(_)
         | OperatorError::NotFound(_)
         | OperatorError::OverlayRender(_)
         | OperatorError::SwimKeyConfig(_)
-        | OperatorError::InvalidResource(_) => "ConsumerConfigError",
+        | OperatorError::InvalidResource(_) => "PraxisConfigError",
     };
     ConsumerConfigStatus {
         gateway_name: gw_ref.name.clone(),
@@ -5937,7 +5952,7 @@ pub(crate) fn discovered_site_k8s_name(network_name: &str, site_id: &str) -> Str
 
 /// Whether auto-discovered remote `GridSite` egress should use plaintext.
 ///
-/// Explicit `gatewayRefs[].consumerConfig.clusterEndpoints[].transport.mode`
+/// Explicit `consumerGateways[].praxisConfig.clusterEndpoints[].transport.mode`
 /// declarations are the source of truth when present.  If any endpoint is
 /// declared plaintext, auto-discovered `GridSite` egress is plaintext for this
 /// network.  This supports local/dev GLB demos where provider gateways are
@@ -5947,8 +5962,8 @@ pub(crate) fn discovered_site_k8s_name(network_name: &str, site_id: &str) -> Str
 /// TLS references: a network with no CA or site certificate refs is treated as
 /// plaintext, while a network with either TLS ref keeps mutual TLS.
 fn network_uses_plaintext_egress(network: &GridNetwork) -> bool {
-    let has_plaintext_endpoint = network.spec.gateway_refs.iter().any(|gw| {
-        gw.consumer_config.as_ref().is_some_and(|cc| {
+    let has_plaintext_endpoint = network.spec.consumer_gateways.iter().any(|gw| {
+        gw.praxis_config.as_ref().is_some_and(|cc| {
             cc.cluster_endpoints.iter().any(|ep| {
                 ep.transport
                     .as_ref()
@@ -6740,6 +6755,31 @@ mod tests {
         .unwrap_or_else(|_| std::process::abort())
     }
 
+    #[test]
+    fn empty_overlay_warns_only_on_entering_the_state() {
+        let gw: GatewayRef = serde_json::from_value(serde_json::json!({"name": "gw", "namespace": "ns"}))
+            .unwrap_or_else(|_| std::process::abort());
+        let with_reason = |reason: &str| {
+            let mut network = base_network();
+            network.status = Some(
+                serde_json::from_value(serde_json::json!({"routingMapStatus": [{
+                    "gatewayName": "gw", "namespace": "ns", "configMapName": "c", "schemaVersion": "v",
+                    "renderedRevision": "r", "distributedRevision": "r", "contentDigest": "r", "reason": reason,
+                }]}))
+                .unwrap_or_else(|_| std::process::abort()),
+            );
+            network
+        };
+        let cases = [
+            ("no status yet", base_network(), false),
+            ("was distributed", with_reason(""), false),
+            ("was already empty", with_reason("EmptyCandidates"), true),
+        ];
+        for (label, network, want) in cases {
+            assert_eq!(already_empty(&network, &gw), want, "{label}");
+        }
+    }
+
     // -----------------------------------------------------------------------
     // reject_invalid_budget_policy
     // -----------------------------------------------------------------------
@@ -6935,7 +6975,7 @@ mod tests {
     fn a_keyless_network_releases_plaintext_only_when_no_network_declares_a_key() {
         let keyless = base_network();
         let mut keyed = base_network();
-        keyed.spec.tls.swim_key_ref = Some(crate::crd::grid_network::SecretRef {
+        keyed.spec.tls.swim_key_secret_ref = Some(crate::crd::grid_network::SecretRef {
             name: "swim-key".to_owned(),
             namespace: "grid".to_owned(),
             key: None,
@@ -7330,7 +7370,7 @@ mod tests {
         let count = count_remote_provider_records_in_snapshot("site-local", "net", &snap);
         assert_eq!(
             count, 0,
-            "distributedProviderCount for one GridNetwork must not include records from another GridNetwork"
+            "remoteProviderCount for one GridNetwork must not include records from another GridNetwork"
         );
     }
 
@@ -8021,12 +8061,12 @@ mod tests {
             gateway_age_reports: Vec::new(),
             gateway_age_report_overflow: false,
             connected_sites: 2,
-            distributed_provider_count: 2,
+            remote_provider_count: 2,
             grid_id: "grid-id".to_owned(),
             observed_generation: 3,
             phase: GridNetworkPhase::Active,
-            consumer_config_status: Vec::new(),
-            overlay_status: Vec::new(),
+            praxis_config_status: Vec::new(),
+            routing_map_status: Vec::new(),
             budget_status: Vec::new(),
             identity: None,
             mount_reconciliation_status: Vec::new(),
@@ -8034,7 +8074,7 @@ mod tests {
         assert!(!grid_network_status_needs_update(Some(&baseline), &baseline));
 
         let changed = GridNetworkStatus {
-            distributed_provider_count: 1,
+            remote_provider_count: 1,
             ..baseline.clone()
         };
         assert!(grid_network_status_needs_update(Some(&baseline), &changed));
@@ -8883,11 +8923,11 @@ mod tests {
             "metadata": { "name": "glb-demo" },
             "spec": {
                 "gridId": "id",
-                "gatewayRefs": [{
+                "consumerGateways": [{
                     "name": "consumer-gateway",
                     "namespace": "grid-system",
-                    "consumerConfig": {
-                        "enabled": true,
+                    "praxisConfig": {
+                        "generate": true,
                         "clusterEndpoints": [{
                             "cluster": "sim-provider-us-west",
                             "address": "172.19.255.212:8080",
@@ -8898,7 +8938,7 @@ mod tests {
                 "tls": {
                     "caSecretRef": {"name": "ca", "namespace": "grid-system"},
                     "siteSecretRef": {"name": "site", "namespace": "grid-system"},
-                    "swimKeyRef": null
+                    "swimKeySecretRef": null
                 }
             }
         }))
@@ -9363,9 +9403,9 @@ mod tests {
         GatewayRef {
             name: name.to_owned(),
             namespace: ns.to_owned(),
-            local_site_name: None,
+            site_name: None,
             provider_hop_endpoints: Vec::new(),
-            consumer_config: None,
+            praxis_config: None,
         }
     }
 
@@ -9420,7 +9460,7 @@ mod tests {
 
     fn make_consumer_config(cm_name: &str) -> ConsumerConfig {
         ConsumerConfig {
-            enabled: true,
+            generate: true,
             config_map_name: cm_name.to_owned(),
             ..ConsumerConfig::default()
         }
@@ -9438,7 +9478,7 @@ mod tests {
                 namespace: "praxis-system".to_owned(),
                 key: None,
             }),
-            swim_key_ref: None,
+            swim_key_secret_ref: None,
         }
     }
 
@@ -9545,11 +9585,11 @@ mod tests {
         let prior = rendered_overlay_status(&gw);
         let mut network = base_network();
         network.status = Some(GridNetworkStatus {
-            overlay_status: vec![prior.clone()],
+            routing_map_status: vec![prior.clone()],
             ..GridNetworkStatus::default()
         });
 
-        let status = retained_overlay_status(&network, &gw, 5, None, "OverlayApplyFailed", "overlay apply failed");
+        let status = retained_overlay_status(&network, &gw, 5, None, "RoutingMapApplyFailed", "overlay apply failed");
 
         assert_eq!(status.phase, OverlayPhase::Retained);
         assert_eq!(status.rendered_revision, prior.rendered_revision);
@@ -9558,7 +9598,7 @@ mod tests {
         assert_eq!(status.config_map_resource_version, prior.config_map_resource_version);
         assert_eq!(status.candidate_count, prior.candidate_count);
         assert_eq!(status.rendered_at, prior.rendered_at);
-        assert_eq!(status.reason, "OverlayApplyFailed");
+        assert_eq!(status.reason, "RoutingMapApplyFailed");
         assert!(status.message.contains("previous valid overlay retained"));
         assert_eq!(status.observed_generation, 5);
     }
@@ -9573,7 +9613,7 @@ mod tests {
             &gw,
             1,
             None,
-            "OverlayApplyFailed",
+            "RoutingMapApplyFailed",
             "overlay ConfigMap apply failed",
         );
 
@@ -9582,7 +9622,7 @@ mod tests {
         assert!(status.distributed_revision.is_empty());
         assert!(status.content_digest.is_empty());
         assert!(status.config_map_resource_version.is_empty());
-        assert_eq!(status.reason, "OverlayApplyFailed");
+        assert_eq!(status.reason, "RoutingMapApplyFailed");
         assert!(status.message.contains("no valid overlay has been distributed"));
         assert_eq!(status.observed_generation, 1);
     }
@@ -9592,7 +9632,7 @@ mod tests {
         let gw = make_gw_ref("gw", "grid-system");
         let mut network = base_network();
         network.status = Some(GridNetworkStatus {
-            overlay_status: vec![OverlayRevisionStatus {
+            routing_map_status: vec![OverlayRevisionStatus {
                 gateway_name: gw.name.clone(),
                 namespace: gw.namespace.clone(),
                 config_map_name: "grid-overlay-net-gw".to_owned(),
@@ -9604,19 +9644,19 @@ mod tests {
                 rendered_at: String::new(),
                 candidate_count: 0,
                 phase: OverlayPhase::Error,
-                reason: "OverlayApplyFailed".to_owned(),
+                reason: "RoutingMapApplyFailed".to_owned(),
                 message: "no valid overlay has been distributed".to_owned(),
                 observed_generation: 1,
             }],
             ..GridNetworkStatus::default()
         });
 
-        let status = retained_overlay_status(&network, &gw, 2, None, "OverlayRenderFailed", "overlay render failed");
+        let status = retained_overlay_status(&network, &gw, 2, None, "RoutingMapRenderFailed", "overlay render failed");
 
         assert_eq!(status.phase, OverlayPhase::Error);
         assert!(status.rendered_revision.is_empty());
         assert!(status.distributed_revision.is_empty());
-        assert_eq!(status.reason, "OverlayRenderFailed");
+        assert_eq!(status.reason, "RoutingMapRenderFailed");
     }
 
     // -----------------------------------------------------------------------
@@ -9626,13 +9666,13 @@ mod tests {
     const FRESH: &str = "2026-10-01T12:00:00Z";
 
     fn only_overlay(status: &GridNetworkStatus) -> &OverlayRevisionStatus {
-        status.overlay_status.first().unwrap_or_else(|| std::process::abort())
+        status.routing_map_status.first().unwrap_or_else(|| std::process::abort())
     }
 
     fn network_with_overlay(prior: OverlayRevisionStatus) -> GridNetwork {
         let mut network = base_network();
         network.status = Some(GridNetworkStatus {
-            overlay_status: vec![prior],
+            routing_map_status: vec![prior],
             ..GridNetworkStatus::default()
         });
         network
@@ -9640,7 +9680,7 @@ mod tests {
 
     fn desired_with_overlay(network: &GridNetwork, overlay: OverlayRevisionStatus) -> GridNetworkStatus {
         GridNetworkStatus {
-            overlay_status: keep_rendered_at(network.status.as_ref(), vec![overlay]),
+            routing_map_status: keep_rendered_at(network.status.as_ref(), vec![overlay]),
             ..network.status.clone().unwrap_or_default()
         }
     }
@@ -9680,7 +9720,7 @@ mod tests {
         };
         let new_reason = OverlayRevisionStatus {
             phase: OverlayPhase::Error,
-            reason: "OverlayApplyFailed".to_owned(),
+            reason: "RoutingMapApplyFailed".to_owned(),
             message: "apply failed".to_owned(),
             rendered_at: FRESH.to_owned(),
             ..prior
@@ -9779,12 +9819,12 @@ mod tests {
         let prior = rendered_overlay_status(&gw);
         let mut network = base_network();
         network.status = Some(GridNetworkStatus {
-            overlay_status: vec![prior.clone()],
+            routing_map_status: vec![prior.clone()],
             ..GridNetworkStatus::default()
         });
         let render = make_render_result(&"b".repeat(64), 3);
 
-        let status = retained_overlay_status(&network, &gw, 5, Some(&render), "OverlayApplyFailed", "apply failed");
+        let status = retained_overlay_status(&network, &gw, 5, Some(&render), "RoutingMapApplyFailed", "apply failed");
 
         assert_eq!(
             status.rendered_revision,
@@ -9810,7 +9850,7 @@ mod tests {
         let network = base_network();
         let render = make_render_result(&"b".repeat(64), 2);
 
-        let status = retained_overlay_status(&network, &gw, 1, Some(&render), "OverlayApplyFailed", "apply failed");
+        let status = retained_overlay_status(&network, &gw, 1, Some(&render), "RoutingMapApplyFailed", "apply failed");
 
         assert_eq!(
             status.rendered_revision,
@@ -9828,11 +9868,11 @@ mod tests {
         let prior = rendered_overlay_status(&gw);
         let mut network = base_network();
         network.status = Some(GridNetworkStatus {
-            overlay_status: vec![prior.clone()],
+            routing_map_status: vec![prior.clone()],
             ..GridNetworkStatus::default()
         });
 
-        let status = retained_overlay_status(&network, &gw, 7, None, "OverlayRenderFailed", "render failed");
+        let status = retained_overlay_status(&network, &gw, 7, None, "RoutingMapRenderFailed", "render failed");
 
         assert_eq!(
             status.rendered_revision, prior.rendered_revision,
@@ -9914,7 +9954,7 @@ mod tests {
     fn without_derive_topology_typed_entries_pass_through_and_an_untyped_candidate_is_withdrawn() {
         let mut gw = make_gw_ref("inference-gw", "praxis-system");
         let typed = vec![typed_endpoint("prov-a", "a.example.invalid:8080")];
-        gw.consumer_config = Some(ConsumerConfig {
+        gw.praxis_config = Some(ConsumerConfig {
             cluster_endpoints: typed.clone(),
             ..make_consumer_config("praxis-consumer-config")
         });
@@ -9932,8 +9972,8 @@ mod tests {
     #[test]
     fn a_disabled_consumer_config_withdraws_nothing() {
         let mut gw = make_gw_ref("inference-gw", "praxis-system");
-        gw.consumer_config = Some(ConsumerConfig {
-            enabled: false,
+        gw.praxis_config = Some(ConsumerConfig {
+            generate: false,
             ..make_consumer_config("praxis-consumer-config")
         });
         let candidates = vec![topology_candidate("prov-b", "site-b")];
@@ -9948,7 +9988,7 @@ mod tests {
     #[test]
     fn an_mcp_tool_candidate_is_never_withdrawn() {
         let mut gw = make_gw_ref("inference-gw", "praxis-system");
-        gw.consumer_config = Some(make_consumer_config("praxis-consumer-config"));
+        gw.praxis_config = Some(make_consumer_config("praxis-consumer-config"));
         let mut tool = topology_candidate("prov-b", "site-b");
         tool.kind = "mcp_tool".to_owned();
         let mut overlay = routing_overlay::RoutingOverlay {
@@ -9974,7 +10014,7 @@ mod tests {
         // An empty allowlist reads as no provider; typed entries pass through.
         let mut gw = make_gw_ref("inference-gw", "praxis-system");
         let typed = vec![typed_endpoint("prov-a", "a.example.invalid:8080")];
-        gw.consumer_config = Some(ConsumerConfig {
+        gw.praxis_config = Some(ConsumerConfig {
             derive_topology: Some(crate::crd::grid_network::DeriveTopology {
                 from_providers: Vec::new(),
                 transport: None,
@@ -9994,7 +10034,7 @@ mod tests {
     #[test]
     fn with_derive_topology_an_unresolvable_candidate_leaves_the_topology_empty() {
         let mut gw = make_gw_ref("inference-gw", "praxis-system");
-        gw.consumer_config = Some(ConsumerConfig {
+        gw.praxis_config = Some(ConsumerConfig {
             derive_topology: Some(crate::crd::grid_network::DeriveTopology {
                 from_providers: vec!["prov-a".to_owned(), "prov-b".to_owned(), "prov-ghost".to_owned()],
                 transport: None,
@@ -10050,7 +10090,7 @@ mod tests {
         // The renderer emits every entry, so a later overlay can route to it without a new config.
         let mut gw = make_gw_ref("inference-gw", "praxis-system");
         let typed = vec![typed_endpoint("retired", "retired.example.invalid:8080")];
-        gw.consumer_config = Some(ConsumerConfig {
+        gw.praxis_config = Some(ConsumerConfig {
             derive_topology: Some(crate::crd::grid_network::DeriveTopology {
                 from_providers: vec!["prov-a".to_owned(), "prov-b".to_owned(), "prov-ghost".to_owned()],
                 transport: None,
@@ -10105,13 +10145,13 @@ mod tests {
         ];
         for (derive_topology, live) in steps {
             let mut gw = make_gw_ref("inference-gw", "praxis-system");
-            gw.local_site_name = Some("site-a".to_owned());
+            gw.site_name = Some("site-a".to_owned());
             let cc = ConsumerConfig {
                 derive_topology,
                 cluster_endpoints: vec![typed_endpoint("typed-c", "typed-c.models.svc:8000")],
                 ..make_consumer_config("praxis-consumer-config")
             };
-            gw.consumer_config = Some(cc.clone());
+            gw.praxis_config = Some(cc.clone());
             let mut overlay = routing_overlay::RoutingOverlay {
                 network: "net".to_owned(),
                 local_site: "site-a".to_owned(),
@@ -10128,7 +10168,7 @@ mod tests {
             withdraw_refused(&mut overlay, &refused);
             let render = consumer_config::render_consumer_config_with_projected(
                 &overlay,
-                &cc.credential_mount_base,
+                &cc.credential_mount_path,
                 &endpoints,
                 &cc.tls_cert_mount_path,
                 cc.listener_port,
@@ -10817,7 +10857,7 @@ mod tests {
         let err = OperatorError::ConsumerConfigRender(ConsumerConfigError::BlankLocalSite);
         let status = consumer_config_status_error(&gw, &cc, &err, 1);
         assert_eq!(
-            status.reason, "ConsumerConfigRenderFailed",
+            status.reason, "PraxisConfigRenderFailed",
             "render error must map to ConsumerConfigRenderFailed reason"
         );
     }
@@ -10922,11 +10962,11 @@ mod tests {
     fn consumer_config_status_disabled_has_disabled_phase() {
         let gw = make_gw_ref("gw", "ns");
         let mut cc = make_consumer_config("cm");
-        cc.enabled = false;
+        cc.generate = false;
         let status = consumer_config_status_disabled(&gw, &cc, 2);
         assert_eq!(status.phase, ConsumerConfigPhase::Disabled, "must set phase=Disabled");
         assert_eq!(
-            status.reason, "ConsumerConfigDisabled",
+            status.reason, "PraxisConfigDisabled",
             "must have ConsumerConfigDisabled reason"
         );
         assert!(!status.message.is_empty(), "must have a non-empty diagnostic message");
@@ -10976,7 +11016,7 @@ mod tests {
             namespace: "ns".to_owned(),
             config_map_name: "cm".to_owned(),
             phase: ConsumerConfigPhase::Error,
-            reason: "ConsumerConfigRenderFailed".to_owned(),
+            reason: "PraxisConfigRenderFailed".to_owned(),
             message: "error".to_owned(),
             observed_generation: 1,
         };

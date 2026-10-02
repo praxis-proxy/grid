@@ -25,7 +25,7 @@
 - [Enrollment](architecture/enrollment.md): how a site becomes a member: parties,
   the flow, trust boundaries, and the planned object-driven shape.
 - [Consumer Config](architecture/consumer-config.md): operator-generated
-  consumer Praxis `ConfigMap` and the `GatewayRef.consumerConfig` API.
+  consumer Praxis `ConfigMap` and the `GatewayRef.praxisConfig` API.
 - [OpenTelemetry](architecture/opentelemetry.md): exporter configuration,
   secret handling, image requirements, and the Praxis 0.7.1 trace-linkage limit.
 - [External Client Ingress](architecture/external-ingress.md): GTM/GLB edge

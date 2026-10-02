@@ -60,15 +60,15 @@ spec:
   gridId: ""                    # auto-generated on first join
   seeds:
     - "10.0.0.5:7946"
-  gatewayRefs:
+  consumerGateways:
     - name: inference-gw
       namespace: praxis-system
-      localSiteName: cluster-east   # optional; defaults to network name
-      consumerConfig:               # optional; opt-in consumer Praxis config generation
+      siteName: cluster-east   # optional; defaults to network name
+      praxisConfig:               # optional; opt-in consumer Praxis config generation
         enabled: true
         enableProjectedCredentials: true  # generate filter, then roll out consumer
         supportsProjectedCredentials: true # set only after that rollout
-        credentialMountBase: /run/secrets/grid-credentials
+        credentialMountPath: /run/secrets/grid-credentials
         configMapName: praxis-consumer-config
         tlsCertMountPath: /etc/praxis/tls
         mountReconciliation:
@@ -102,7 +102,7 @@ spec:
     siteSecretRef:
       name: grid-site-cert
       namespace: praxis-system
-    swimKeyRef:
+    swimKeySecretRef:
       name: swim-key
       namespace: praxis-system
   budgetPolicy:                   # optional; absent means no tenants are tracked
@@ -136,8 +136,8 @@ not part of this CRD.
 
 **Phases**: Pending → Initializing → Active → Degraded
 
-**Status fields**: `gridId`, `connectedSites`, `distributedProviderCount`,
-`observedGeneration`, `phase`, `conditions[]`, `consumerConfigStatus[]`,
+**Status fields**: `gridId`, `connectedSites`, `remoteProviderCount`,
+`observedGeneration`, `phase`, `conditions[]`, `praxisConfigStatus[]`,
 `mountReconciliationStatus[]`, `budgetStatus[]`, `gatewayAgeReports[]`,
 `gatewayAgeReportOverflow`
 
@@ -171,7 +171,7 @@ rejection during restart. Signal collection continues while this gate is held.
 A round begun while held cannot publish even if convergence finishes during
 collection; the next round uses the converged membership.
 
-`distributedProviderCount` reflects the number of remote `InferenceProvider`
+`remoteProviderCount` reflects the number of remote `InferenceProvider`
 records received from peer sites via CRDT broadcast.  Local providers and records
 from other `GridNetwork`s are excluded from the count.
 
@@ -209,18 +209,18 @@ restart. Clear it explicitly only after verifying reporter coverage. Inspect
 status with `kubectl get gridnetwork NAME -o yaml`; status edits require RBAC
 permission for the GridNetwork status subresource.
 
-`consumerConfigStatus[]` is populated for each gateway with
-`consumerConfig.enabled: true`, reporting the outcome of the most recent
+`praxisConfigStatus[]` is populated for each gateway with
+`praxisConfig.generate: true`, reporting the outcome of the most recent
 render/apply attempt.
 
-Set `consumerConfig.mountReconciliation.enabled: true` to delegate generated
+Set `praxisConfig.mountReconciliation.enabled: true` to delegate generated
 Secret mounts and coordinated Deployment rollouts to Grid. This requires an
 explicitly annotated Deployment in `GatewayRef.namespace`, and a Role in that
 namespace letting the operator `get` and `patch` that one Deployment; the
 praxis-gateway chart renders it, see
 [Deployment access](operations.md#deployment-access). The operator manages
 only its reserved projected volumes and the selected container's mounts. Secret
-references must be in the gateway namespace. `consumerConfigStatus[].phase` of
+references must be in the gateway namespace. `praxisConfigStatus[].phase` of
 `Rendered` describes the ConfigMap; only
 `mountReconciliationStatus[].phase: Ready` reports a ready gateway revision.
 With delegation disabled, the operator still publishes a reference-only
@@ -273,7 +273,7 @@ options under consideration if per-tenant confidentiality is required.
 | `namespace` | string | Namespace of the gateway and generated `ConfigMap` |
 | `configMapName` | string | Name of the generated `ConfigMap` |
 | `phase` | enum | `Rendered` \| `Error` \| `Disabled` |
-| `reason` | string | Machine-readable reason (`MissingClusterEndpoint`, `ConsumerConfigRenderFailed`, `ConsumerConfigApplyFailed`); empty when `Rendered` |
+| `reason` | string | Machine-readable reason (`MissingClusterEndpoint`, `PraxisConfigRenderFailed`, `PraxisConfigApplyFailed`); empty when `Rendered` |
 | `message` | string | Human-readable diagnostic; never contains token bytes |
 | `observedGeneration` | integer | `GridNetwork` generation when this entry was last updated |
 
@@ -290,7 +290,7 @@ status:
   phase: Active
   gridId: grid-abc123
   connectedSites: 2
-  consumerConfigStatus:
+  praxisConfigStatus:
     - gatewayName: inference-gw
       namespace: praxis-system
       configMapName: praxis-consumer-config
@@ -302,7 +302,7 @@ status:
       namespace: default
       configMapName: op-e2e-consumer-config
       phase: Error
-      reason: ConsumerConfigRenderFailed
+      reason: PraxisConfigRenderFailed
       message: "consumer config render: overlay local_site must not be blank"
       observedGeneration: 7
 ```
@@ -337,14 +337,14 @@ table.  Provider CRDT state remains scoped per network.
 **Self-filtering:** The operator removes its own SWIM bind address from
 `spec.seeds` before announcing, preventing self-join loops.
 
-**`spec.tls.swimKeyRef`:** References a Kubernetes Secret containing the 32-byte
+**`spec.tls.swimKeySecretRef`:** References a Kubernetes Secret containing the 32-byte
 AES-256-GCM key for SWIM transport authentication.  When configured, the
 `GridNetwork` controller reads the key from the Secret and configures the
 SWIM runtime to encrypt all outgoing UDP packets and reject incoming packets
 that fail authentication before it announces CRD seeds or publishes
 certificate/provider state for that reconcile.
 
-The Secret must contain a `"key"` field (or the field named by `swimKeyRef.key`)
+The Secret must contain a `"key"` field (or the field named by `swimKeySecretRef.key`)
 with exactly 32 bytes.  If the Secret is absent, unreadable, or has the wrong
 length, the reconcile fails before CRD seed announcement and state broadcast.
 The process-global SWIM runtime keeps any previously loaded key until restart;
@@ -392,25 +392,25 @@ mass departure.
 
 ### GatewayRef.providerHopEndpoints
 
-`spec.gatewayRefs[].providerHopEndpoints` independently configures the
+`spec.consumerGateways[].providerHopEndpoints` independently configures the
 provider-hop trust allowlist used by the embedded `grid-gateway`. Each entry
 names a provider cluster and declares its verified mTLS mode and SNI. The
 embedded gateway's startup upstream configuration must use that TLS identity.
-This field is independent of `consumerConfig`; absent or disabled generated
+This field is independent of `praxisConfig`; absent or disabled generated
 consumer Praxis config cannot make embedded serving fail validation or change
 its provider-hop allowlist.
 
-### GatewayRef.consumerConfig
+### GatewayRef.praxisConfig
 
-`spec.gatewayRefs[].consumerConfig` opts a gateway into operator-managed consumer
+`spec.consumerGateways[].praxisConfig` opts a gateway into operator-managed consumer
 Praxis `ConfigMap` generation.
 
 | Field | Default | Meaning |
 |---|---|---|
-| `enabled` | `false` | Set to `true` to enable consumer config generation for this gateway. |
+| `generate` | `false` | Set to `true` to enable consumer config generation for this gateway. |
 | `enableProjectedCredentials` | `false` | Generate the dynamic `credential_inject` filter and projected mount root, including with an empty candidate set. Roll out the consumer after enabling this. |
 | `supportsProjectedCredentials` | `false` | Attest that the consumer has loaded that filter/config and mounted its referenced Secrets. Until true, credential-bearing overlay revisions are retained with `ProjectedCredentialsUnsupported`. |
-| `credentialMountBase` | `/run/secrets/grid-credentials` | Base directory for projected credentials. In projected mode, mount each Secret at `{base}/{namespace}/{name}` with Secret keys as files. Static `file:` entries continue using their explicitly configured paths. |
+| `credentialMountPath` | `/run/secrets/grid-credentials` | Base directory for projected credentials. In projected mode, mount each Secret at `{base}/{namespace}/{name}` with Secret keys as files. Static `file:` entries continue using their explicitly configured paths. |
 | `configMapName` | `praxis-consumer-config` | Name of the generated `ConfigMap` in the gateway namespace. |
 | `clusterEndpoints[]` | `[]` | Endpoint topology for `load_balancer` clusters. Each entry maps a candidate cluster name to an address with explicit `transport` configuration. Missing transport fails closed. |
 | `clusterEndpoints[].transport.mode` | _(required)_ | `mutual_tls` (CA/client cert/SNI/verify), `tls` (server-authenticated TLS), or `plaintext` (no TLS, insecure/dev-only). |
@@ -474,7 +474,7 @@ are retained. In projected mode, the generated config uses an empty credential
 table and resolves the selected Secret reference at request time, failing
 closed when it cannot read it.
 
-When `enabled: false` or `consumerConfig` is absent, no generated consumer
+When `generate: false` or `praxisConfig` is absent, no generated consumer
 Praxis `ConfigMap` is applied. The routing overlay remains active, and the
 embedded gateway's serving config is controlled separately by
 `GatewayRef.providerHopEndpoints`.

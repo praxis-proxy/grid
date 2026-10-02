@@ -162,7 +162,7 @@ handshake, so a connect proves nothing.
 | Signals poll but gossip never converges | The SWIM Service got a Classic load balancer, which carries no UDP. Check `platform: aws`. |
 | No member is ever discovered, and `GRID_SWIM_SEEDS` holds the NAT addresses | The seeds came from `peers`, or from a `swim.seeds` that names the NAT addresses, and neither listens. Set `grid.seeds` to the other sites' SWIM Service hostnames, and clear `swim.seeds` if it is set, since it wins over `grid.seeds` for `GRID_SWIM_SEEDS`. |
 | Seeds are the SWIM hostnames, yet peers never answer | Source ranges list VPC CIDRs rather than NAT addresses. |
-| `swimKeyRef ... did not resolve to a valid 32-byte key` | The Secret is absent from the operator's namespace, or its `key` field is missing, or the value is not exactly 32 bytes. Reconciliation retries every 30 seconds, so correcting it is enough. |
+| `swimKeySecretRef ... did not resolve to a valid 32-byte key` | The Secret is absent from the operator's namespace, or its `key` field is missing, or the value is not exactly 32 bytes. Reconciliation retries every 30 seconds, so correcting it is enough. |
 | `no matches for kind "GridNetwork"` on a first install | The chart renders CRDs and their resources in one release. Apply the CRDs first, then install with `crds.enabled=false`. |
 | `cannot be imported into the current release: invalid ownership metadata` | CRDs applied by hand carry no Helm ownership. Install with `crds.enabled=false`. |
 | A site enrolls but the hub never starts SWIM | The hub takes `enrollment.enabled=false` and its identity from the bootstrap Job, a different path. Check the key is in its namespace and restart it. |

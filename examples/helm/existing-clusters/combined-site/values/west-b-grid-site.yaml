@@ -15,10 +15,10 @@ gridNetwork:
     probeInterval: 5s
     suspicionTimeout: 15s
     gossipNodes: 3
-  gatewayRefs:
+  consumerGateways:
     - name: consumer-gateway
       namespace: grid-system
-      localSiteName: west-b
+      siteName: west-b
 
 gridSite:
   name: west-b

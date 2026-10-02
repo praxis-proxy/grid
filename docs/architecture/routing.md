@@ -311,7 +311,7 @@ The contract distinguishes four observable stages:
 
 | Stage | Owner | Evidence |
 |---|---|---|
-| **Rendered** | AGN Operator | `GridNetwork.status.overlayStatus[].renderedRevision` |
+| **Rendered** | AGN Operator | `GridNetwork.status.routingMapStatus[].renderedRevision` |
 | **Distributed** | AGN Operator and Kubernetes | `distributedRevision` plus the applied `ConfigMap` `resourceVersion` |
 | **Accepted** | Praxis AI | Successful validation and atomic snapshot-load event |
 | **Serving** | Praxis AI request path | The selected immutable snapshot revision attached to provider-hop telemetry |

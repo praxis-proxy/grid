@@ -21,4 +21,4 @@ spec:
     siteSecretRef:
       name: provider-gateway-tls
       namespace: grid-system
-    swimKeyRef: null
+    swimKeySecretRef: null

@@ -78,8 +78,8 @@ spec:
   tls:
     {{- toYaml . | nindent 4 }}
   {{- end }}
-  {{- with .Values.gridNetwork.gatewayRefs }}
-  gatewayRefs:
+  {{- with .Values.gridNetwork.consumerGateways }}
+  consumerGateways:
     {{- toYaml . | nindent 4 }}
   {{- end }}
 {{- end }}

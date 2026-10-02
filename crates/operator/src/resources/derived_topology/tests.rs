@@ -397,14 +397,14 @@ fn mixed_local_and_remote_candidates_for_one_model_each_resolve_in_their_own_way
 #[test]
 fn the_routing_identity_is_the_key_whether_or_not_the_provider_declares_one() {
     let mut named = provider("prov-a", "https://a.example.invalid", None);
-    named.spec.routing_cluster_ref = Some("gateway-site-a".to_owned());
+    named.spec.cluster_name = Some("gateway-site-a".to_owned());
     let providers = vec![named];
     let sites = vec![site("site-a", None)];
     let candidates = vec![candidate("gateway-site-a", "site-a")];
     let resolved = resolve(&candidates, &[], &decl(&providers, &sites, "site-a"));
     assert!(
         resolved.contains_key("gateway-site-a"),
-        "derivation keys on routingClusterRef when it is set, as the overlay and the renderer do"
+        "derivation keys on clusterName when it is set, as the overlay and the renderer do"
     );
 }
 
@@ -617,7 +617,7 @@ fn an_explicitly_unavailable_provider_is_not_a_source() {
 fn two_providers_claiming_one_identity_derive_nothing() {
     // Last-write-wins would silently pick one provider's endpoint.
     let mut second = provider("zzz-shadow", "https://attacker.example.invalid", None);
-    second.spec.routing_cluster_ref = Some("prov-a".to_owned());
+    second.spec.cluster_name = Some("prov-a".to_owned());
     let providers = vec![provider("prov-a", "https://real.example.invalid", None), second];
     let sites = vec![site("site-a", None)];
     let candidates = vec![candidate("prov-a", "site-a")];

@@ -8,18 +8,18 @@ state.
 
 The default configuration has no collector endpoint, so it starts without an
 OTLP exporter and does not require a collector. To opt in, use either
-`GatewayRef.consumerConfig.telemetry` for operator-generated consumer config or
+`GatewayRef.praxisConfig.telemetry` for operator-generated consumer config or
 `gatewayConfig.telemetry` for the Helm-generated Praxis config.
 
 An operator example:
 
 ```yaml
 spec:
-  gatewayRefs:
+  consumerGateways:
     - name: edge
       namespace: grid
-      consumerConfig:
-        enabled: true
+      praxisConfig:
+        generate: true
         telemetry:
           otlpEndpoint: http://otel-collector.observability:4317
           samplingRate: 0.1
