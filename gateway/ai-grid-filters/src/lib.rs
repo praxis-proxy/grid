@@ -5,6 +5,7 @@
 //! reuses the descriptor data model and a first-admitted selection. The grid
 //! contribution is ordering the candidates by live load off the request path.
 
+mod control;
 mod descriptor;
 #[cfg(test)]
 mod flow;
@@ -16,6 +17,7 @@ mod snapshot;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
+pub use control::ReloadOutcome;
 // The routing model and the snapshot builder are the crate's control-plane API:
 // the gateway's refresh step orders candidates by live load and swaps the
 // snapshot. The request path only reads a snapshot.

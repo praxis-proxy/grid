@@ -3,22 +3,26 @@
 //! The operator writes a grid serving config (topology + peers). The gateway
 //! reads it, builds the load store and a cold-start snapshot, and spawns one
 //! poller per peer. Each poll cycle re-orders the candidate set by live load and
-//! swaps the shared snapshot, on one clock, so the data-plane filter only ever
-//! reads a resolved order. This is the control side of the control/data split:
-//! the poller and the refresh loop live here, not in the filter.
+//! swaps the shared snapshot, so the data-plane filter only ever reads a
+//! resolved order. A watch on the config file applies the operator's rewrites.
 
-use std::{fs, sync::Arc, time::Duration};
+use std::{
+    fs,
+    path::PathBuf,
+    sync::{Arc, Mutex, PoisonError},
+    time::Duration,
+};
 
 use arc_swap::ArcSwap;
 use certs::spiffe_id;
-use grid_signals::{LoadStore, now_ms};
-use grid_signals_client::{PeerScraper, PollHandle, PollerConfig, spawn_on_thread};
+use grid_signals_client::{PeerScraper, spawn_on_thread_held};
 use praxis_filter::FilterError;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, pem::PemObject as _};
 use serde::Deserialize;
 
 use crate::{
-    descriptor::{CandidateConfig, RouteCandidate, validate_candidates, validate_local_site},
+    control::{Control, ReloadOutcome, Watcher, watch},
+    descriptor::CandidateConfig,
     snapshot::RouteSnapshot,
 };
 
@@ -39,7 +43,7 @@ fn default_timeout_ms() -> u64 {
 
 /// The grid serving config the operator writes and the gateway reads directly,
 /// distinct from the praxis data-plane config.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct GridServingConfig {
     /// This gateway's own site.
@@ -59,7 +63,7 @@ pub struct GridServingConfig {
 }
 
 /// One peer this gateway polls, with the mTLS material to reach it.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct PeerServingConfig {
     /// The peer's mTLS-verified site (its SPIFFE name), the expected scrape target.
@@ -108,16 +112,16 @@ pub struct PeerServingConfig {
     pub pins: Vec<String>,
 }
 
-/// The running control plane: the shared snapshot the filter reads and the
-/// pollers that keep it fresh.
+/// The running control plane: the filter's snapshot, the pollers, and the config watch.
 pub struct GridRuntime {
-    /// The snapshot the refresh loop swaps and the filter reads.
+    /// The snapshot the refreshes swap and the filter reads.
     snapshot: Arc<ArcSwap<RouteSnapshot>>,
 
-    /// The running pollers. Held for their drop: dropping `GridRuntime` stops
-    /// every poller and lets the store drain.
-    #[expect(dead_code, reason = "held so the pollers keep running; drop stops them")]
-    pollers: Vec<PollHandle>,
+    /// The topology, store, and pollers. Dropping it stops every poller.
+    control: Arc<Mutex<Control>>,
+
+    /// The config file watch, stopped on drop.
+    watcher: Option<Watcher>,
 }
 
 impl GridRuntime {
@@ -125,6 +129,34 @@ impl GridRuntime {
     #[must_use]
     pub fn snapshot(&self) -> Arc<ArcSwap<RouteSnapshot>> {
         Arc::clone(&self.snapshot)
+    }
+
+    /// Apply a new serving config. `None` when it is already applied.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FilterError`] if the config is invalid or a poller cannot start, keeping the last good one.
+    pub fn reload(&self, config: &GridServingConfig) -> Result<Option<ReloadOutcome>, FilterError> {
+        self.control
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .apply(config)
+    }
+
+    /// Re-read `path` every `every` and apply it when it changes.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error if the watch thread cannot be spawned.
+    pub fn watch<P: Into<PathBuf>>(&mut self, path: P, every: Duration) -> std::io::Result<()> {
+        self.watcher = Some(watch(Arc::clone(&self.control), path.into(), every)?);
+        Ok(())
+    }
+
+    /// The running watch, for tests that wait on its counts.
+    #[cfg(test)]
+    pub(crate) fn watcher(&self) -> Option<&Watcher> {
+        self.watcher.as_ref()
     }
 }
 
@@ -140,7 +172,7 @@ pub fn load_serving_config(path: &str) -> Result<GridServingConfig, FilterError>
 }
 
 /// Build the control plane from `config`: the store, the cold-start snapshot, and
-/// one poller per peer whose refresh closure re-orders and swaps the snapshot.
+/// one poller per peer whose refresh re-orders and swaps the snapshot.
 ///
 /// # Errors
 ///
@@ -148,63 +180,26 @@ pub fn load_serving_config(path: &str) -> Result<GridServingConfig, FilterError>
 /// peer's certificate material cannot be read or parsed, or a poller thread
 /// cannot be spawned.
 pub fn spawn_grid_routing(config: &GridServingConfig) -> Result<GridRuntime, FilterError> {
-    validate_local_site(&config.local_site)?;
-    let local_site: Arc<str> = Arc::from(config.local_site.as_str());
-    let base: Arc<[RouteCandidate]> = Arc::from(validate_candidates(config.candidates.clone())?);
-    let store = Arc::new(LoadStore::new(Duration::from_secs(config.window_secs)));
-    // Cold start: config order until the first poll re-orders it by live load.
-    let cold_start = RouteSnapshot::from_static(base.iter().cloned().collect(), Arc::clone(&local_site));
-    let snapshot = Arc::new(ArcSwap::from_pointee(cold_start));
-
-    let mut pollers = Vec::with_capacity(config.peers.len());
-    for peer in &config.peers {
-        validate_peer(peer)?;
+    let start = Box::new(|peer: &PeerServingConfig, poller: &_, store, refresh| {
         let scraper = build_scraper(peer)?;
-        let poller_config = PollerConfig {
-            endpoint: peer.addr.clone(),
-            interval_ms: peer.interval_ms,
-            window_secs: config.window_secs,
-            max_age_ms: config.load_window_ms,
-            timeout_ms: peer.request_timeout_ms,
-            tls: None,
-        };
-        let refresh = make_refresh(
-            Arc::clone(&base),
-            Arc::clone(&local_site),
-            Arc::clone(&snapshot),
-            config.load_window_ms,
-            now_ms,
-        );
-        let handle = spawn_on_thread(Arc::clone(&store), &poller_config, scraper, refresh)
-            .map_err(|error| -> FilterError { format!("grid: spawning poller for {}: {error}", peer.site).into() })?;
-        pollers.push(handle);
-    }
-    Ok(GridRuntime { snapshot, pollers })
+        spawn_on_thread_held(store, poller, scraper, refresh)
+            .map_err(|error| -> FilterError { format!("grid: spawning poller for {}: {error}", peer.site).into() })
+    });
+    start_runtime(config, start)
 }
 
-/// The refresh closure: re-order the base candidate set by live load and swap it
-/// into the shared snapshot. Runs on each poll cycle, so the snapshot tracks the
-/// store on one clock.
-fn make_refresh<N>(
-    base: Arc<[RouteCandidate]>,
-    local_site: Arc<str>,
-    snapshot: Arc<ArcSwap<RouteSnapshot>>,
-    window_ms: i64,
-    now: N,
-) -> impl Fn(&LoadStore) + Send
-where
-    N: Fn() -> i64 + Send,
-{
-    move |store: &LoadStore| {
-        let ordered = RouteSnapshot::from_store(
-            base.iter().cloned().collect(),
-            Arc::clone(&local_site),
-            store,
-            now(),
-            window_ms,
-        );
-        snapshot.store(Arc::new(ordered));
-    }
+/// Build the runtime over `start`, the peer poller constructor.
+pub(crate) fn start_runtime(
+    config: &GridServingConfig,
+    start: crate::control::StartPeer,
+) -> Result<GridRuntime, FilterError> {
+    let mut control = Control::new(config, start)?;
+    control.apply(config)?;
+    Ok(GridRuntime {
+        snapshot: control.snapshot(),
+        control: Arc::new(Mutex::new(control)),
+        watcher: None,
+    })
 }
 
 /// Reject peer settings that would silently stop a poller.
@@ -218,12 +213,23 @@ where
 /// # Errors
 ///
 /// Returns [`FilterError`] if the interval or either timeout is zero.
-fn validate_peer(peer: &PeerServingConfig) -> Result<(), FilterError> {
+pub(crate) fn validate_peer(peer: &PeerServingConfig) -> Result<(), FilterError> {
     if peer.interval_ms == 0 {
         return Err(format!("grid: peer {} interval_ms must be greater than zero", peer.site).into());
     }
     if peer.connect_timeout_ms == 0 || peer.request_timeout_ms == 0 {
         return Err(format!("grid: peer {} timeouts must be greater than zero", peer.site).into());
+    }
+    ServerName::try_from(peer.server_name.as_str()).map_err(|error| -> FilterError {
+        format!("grid: peer {} server_name {}: {error}", peer.site, peer.server_name).into()
+    })?;
+    // A SHA-256 leaf digest, colons allowed.
+    let hex_digest = |pin: &String| {
+        let digits: Vec<char> = pin.chars().filter(|ch| *ch != ':').collect();
+        digits.len() == 64 && digits.iter().all(char::is_ascii_hexdigit)
+    };
+    if let Some(pin) = peer.pins.iter().find(|pin| !hex_digest(pin)) {
+        return Err(format!("grid: peer {} pin {pin} is not a SHA-256 hex digest", peer.site).into());
     }
     Ok(())
 }
@@ -271,81 +277,8 @@ fn build_scraper(peer: &PeerServingConfig) -> Result<PeerScraper, FilterError> {
     reason = "tests"
 )]
 mod tests {
-    use std::sync::atomic::{AtomicI64, Ordering};
-
     use super::*;
-    use crate::descriptor::CapabilityKind;
-
-    const LOAD_METRIC: &str = "inference_pool_average_queue_size";
-
-    fn cand(model: &str, site: &str, cluster: &str) -> CandidateConfig {
-        CandidateConfig {
-            cluster: cluster.to_owned(),
-            credential: None,
-            fresh: true,
-            kind: CapabilityKind::InferenceModel,
-            name: model.to_owned(),
-            site: site.to_owned(),
-        }
-    }
-
-    fn line(site: &str, cluster: &str, value: f64, at_ms: i64) -> String {
-        format!(r#"{LOAD_METRIC}{{grid_site="{site}",grid_provider="{cluster}"}} {value} {at_ms}"#)
-    }
-
-    /// A controllable clock, the shared snapshot, and the refresh closure over
-    /// them, wired for the load-change test.
-    type Wired = (Arc<AtomicI64>, Arc<ArcSwap<RouteSnapshot>>, Box<dyn Fn(&LoadStore)>);
-
-    /// Build the shared snapshot, a test clock, and the refresh closure that
-    /// re-orders the two-site topology over that clock.
-    fn wired_refresh() -> Wired {
-        let base: Arc<[RouteCandidate]> = Arc::from(
-            validate_candidates(vec![cand("llama", "east", "pool-a"), cand("llama", "west", "pool-b")])
-                .expect("candidates"),
-        );
-        let local_site: Arc<str> = Arc::from("local");
-        let snapshot = Arc::new(ArcSwap::from_pointee(RouteSnapshot::from_static(
-            base.iter().cloned().collect(),
-            Arc::clone(&local_site),
-        )));
-        let clock = Arc::new(AtomicI64::new(1_000));
-        let refresh = {
-            let clock = Arc::clone(&clock);
-            make_refresh(base, local_site, Arc::clone(&snapshot), 30_000, move || {
-                clock.load(Ordering::SeqCst)
-            })
-        };
-        (clock, snapshot, Box::new(refresh))
-    }
-
-    /// The front site the current snapshot would route to.
-    fn front(snapshot: &ArcSwap<RouteSnapshot>) -> Arc<str> {
-        Arc::clone(&snapshot.load().candidates[0].site)
-    }
-
-    #[test]
-    fn a_load_change_reorders_the_snapshot_without_a_config_rebuild() {
-        let (clock, snapshot, refresh) = wired_refresh();
-        let store = LoadStore::new(Duration::from_secs(600));
-
-        // East busy, west idle. One poll cycle orders west first.
-        store.ingest_at(&line("east", "pool-a", 90.0, 1_000), 1_000, 1_000, "east");
-        store.ingest_at(&line("west", "pool-b", 10.0, 1_000), 1_000, 1_000, "west");
-        refresh(&store);
-        assert_eq!(&*front(&snapshot), "west", "the idle site sorts first");
-
-        // The load flips at a later time, past the window of the first samples.
-        clock.store(40_000, Ordering::SeqCst);
-        store.ingest_at(&line("east", "pool-a", 5.0, 40_000), 40_000, 40_000, "east");
-        store.ingest_at(&line("west", "pool-b", 95.0, 40_000), 40_000, 40_000, "west");
-        refresh(&store);
-        assert_eq!(
-            &*front(&snapshot),
-            "east",
-            "the swap tracks the load change with no config rebuild"
-        );
-    }
+    use crate::descriptor::{validate_candidates, validate_local_site};
 
     #[test]
     fn a_serving_config_parses() {
@@ -415,6 +348,27 @@ peers:
             client_key_path: "/etc/grid/tls.key".to_owned(),
             pins: Vec::new(),
         }
+    }
+
+    #[test]
+    fn a_peer_with_a_bad_server_name_or_pin_is_refused_before_any_poller_starts() {
+        let mut bad_name = valid_peer();
+        bad_name.server_name = "not a name".to_owned();
+        assert!(
+            validate_peer(&bad_name).is_err(),
+            "server_name is checked from the config alone"
+        );
+
+        let mut short_pin = valid_peer();
+        short_pin.pins = vec!["ab:cd".to_owned()];
+        assert!(validate_peer(&short_pin).is_err(), "a truncated pin");
+
+        let mut pinned = valid_peer();
+        pinned.pins = vec!["AB".repeat(32), format!("{}ab", "ab:".repeat(31))];
+        assert!(
+            validate_peer(&pinned).is_ok(),
+            "hex digests with or without colons, any case"
+        );
     }
 
     #[test]

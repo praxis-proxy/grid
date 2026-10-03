@@ -55,7 +55,7 @@ pub(crate) async fn read_scrape_response(
 
     // Bound the body read in time, not just in bytes: a peer that sends headers
     // then dribbles the body would otherwise hold the poll open indefinitely
-    // (slowloris), and because poll_once is awaited inline it would also stall the
+    // (slowloris), and because the poll awaits the fetch inline it would also stall the
     // loop's stop/drain.
     let collected = tokio::time::timeout(
         read_timeout,
