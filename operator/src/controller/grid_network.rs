@@ -2484,7 +2484,8 @@ async fn reconcile_delegated_gateway(
         .await
         .map_err(|_error| mount_failure("DeploymentReadFailed", "could not read the delegated Deployment"))?
         .ok_or_else(|| mount_failure("DeploymentMissing", "the delegated Deployment does not exist"))?;
-    let chart_managed_serving_tls = validate_deployment_delegation(&deployment, network_name, gw_ref, delegation)?;
+    let chart_managed_serving_tls =
+        validate_deployment_delegation(&deployment, network_name, gw_ref, delegation, &cc.config_map_name)?;
     let requirements =
         delegated_mount_requirements_document(rendered, network_name, gw_ref, cc, tls, chart_managed_serving_tls)?;
     let requirements_revision = gateway_mounts::requirements_revision(&requirements)?;
@@ -2868,6 +2869,7 @@ fn validate_deployment_delegation(
     network_name: &str,
     gw_ref: &GatewayRef,
     delegation: &MountReconciliation,
+    config_map_name: &str,
 ) -> Result<bool, OperatorError> {
     let annotations = deployment.metadata.annotations.as_ref();
     let owns = annotations.is_some_and(|annotations| {
@@ -2888,23 +2890,89 @@ fn validate_deployment_delegation(
         )
         .into());
     }
-    let has_container = deployment
+    let pod_spec = deployment
         .spec
         .as_ref()
         .and_then(|spec| spec.template.spec.as_ref())
-        .is_some_and(|spec| {
-            spec.containers
-                .iter()
-                .any(|container| container.name == delegation.container_name)
-        });
-    if !has_container {
-        return Err(mount_failure("ContainerMissing", "the named Praxis container is absent").into());
-    }
+        .ok_or_else(|| mount_failure("DeploymentInvalid", "the delegated Deployment has no pod spec"))?;
+    let container = pod_spec
+        .containers
+        .iter()
+        .find(|container| container.name == delegation.container_name)
+        .ok_or_else(|| mount_failure("ContainerMissing", "the named Praxis container is absent"))?;
+    validate_deployment_config_source(pod_spec, container, config_map_name)?;
     Ok(annotations.is_some_and(|annotations| {
         annotations
             .get(GRID_SERVING_TLS_ANNOTATION)
             .is_some_and(|value| value == "chart-managed")
     }))
+}
+
+/// Verify that the selected container receives Grid's generated praxis.yaml.
+#[expect(
+    clippy::too_many_lines,
+    reason = "mount path, volume source, and key projection form one fail-closed config-source check"
+)]
+fn validate_deployment_config_source(
+    pod_spec: &k8s_openapi::api::core::v1::PodSpec,
+    container: &k8s_openapi::api::core::v1::Container,
+    config_map_name: &str,
+) -> Result<(), OperatorError> {
+    let mut config_mounts = container
+        .volume_mounts
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .filter(|mount| mount.mount_path == "/etc/praxis");
+    let config_mount = config_mounts.next().ok_or_else(|| {
+        mount_failure(
+            "ConfigSourceMismatch",
+            "the Praxis container has no /etc/praxis config mount",
+        )
+    })?;
+    if config_mounts.next().is_some()
+        || config_mount.sub_path.is_some()
+        || config_mount.sub_path_expr.is_some()
+        || container
+            .volume_mounts
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .any(|mount| mount.mount_path == "/etc/praxis/praxis.yaml")
+    {
+        return Err(mount_failure(
+            "ConfigSourceMismatch",
+            "the Praxis config mount is ambiguous or shadowed",
+        )
+        .into());
+    }
+    let config_map = pod_spec
+        .volumes
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .find(|volume| volume.name == config_mount.name)
+        .and_then(|volume| volume.config_map.as_ref())
+        .ok_or_else(|| {
+            mount_failure(
+                "ConfigSourceMismatch",
+                "the Praxis config mount is not a ConfigMap volume",
+            )
+        })?;
+    let projects_config = config_map.items.as_deref().is_none_or(|items| {
+        items.is_empty()
+            || items
+                .iter()
+                .any(|item| item.key == "praxis.yaml" && item.path == "praxis.yaml")
+    });
+    if config_map.name != config_map_name || config_map.optional == Some(true) || !projects_config {
+        return Err(mount_failure(
+            "ConfigSourceMismatch",
+            "the Praxis config mount does not project the generated praxis.yaml",
+        )
+        .into());
+    }
+    Ok(())
 }
 
 /// Read only Secret key presence and resource versions for a requirements document.
@@ -2995,15 +3063,17 @@ fn read_owned_mounts(deployment: &Deployment) -> Result<BTreeSet<String>, Operat
     Ok(names.into_iter().collect())
 }
 
-/// Check whether the current Deployment generation has ready updated replicas.
+/// Check whether the current Deployment generation has fully replaced old replicas.
 fn deployment_rollout_ready(deployment: &Deployment) -> bool {
     let replicas = deployment.spec.as_ref().and_then(|spec| spec.replicas).unwrap_or(1);
     let generation = deployment.metadata.generation.unwrap_or(0);
     deployment.status.as_ref().is_some_and(|status| {
         replicas > 0
             && status.observed_generation.unwrap_or(0) >= generation
-            && status.updated_replicas.unwrap_or(0) >= replicas
+            && status.updated_replicas.unwrap_or(0) == replicas
             && status.available_replicas.unwrap_or(0) >= replicas
+            && status.replicas.unwrap_or(0) == replicas
+            && status.unavailable_replicas.unwrap_or(0) == 0
     })
 }
 
@@ -7077,6 +7147,10 @@ mod tests {
 
     #[test]
     #[expect(
+        clippy::too_many_lines,
+        reason = "the rollout status transitions are exercised against one Deployment fixture"
+    )]
+    #[expect(
         clippy::expect_used,
         reason = "deserializing a fixed Deployment fixture must succeed"
     )]
@@ -7093,7 +7167,7 @@ mod tests {
                     "spec": {"containers": [{"name": "praxis", "image": "praxis"}]}
                 }
             },
-            "status": {"observedGeneration": 5, "updatedReplicas": 2, "availableReplicas": 2}
+            "status": {"observedGeneration": 5, "replicas": 2, "updatedReplicas": 2, "availableReplicas": 2}
         }))
         .expect("valid deployment fixture");
         assert!(deployment_rollout_ready(&deployment));
@@ -7107,6 +7181,110 @@ mod tests {
             status.observed_generation = Some(4);
         }
         assert!(!deployment_rollout_ready(&deployment));
+        if let Some(status) = deployment.status.as_mut() {
+            status.observed_generation = Some(5);
+            status.replicas = Some(3);
+        }
+        assert!(
+            !deployment_rollout_ready(&deployment),
+            "an old surge replica must block rollout completion"
+        );
+        if let Some(status) = deployment.status.as_mut() {
+            status.replicas = Some(2);
+            status.unavailable_replicas = Some(1);
+        }
+        assert!(
+            !deployment_rollout_ready(&deployment),
+            "unavailable replicas must block rollout completion"
+        );
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the Deployment fixture keeps the config volume and target container together"
+    )]
+    fn delegated_config_source_fixture() -> Value {
+        json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {
+                "name": "gateway",
+                "annotations": {
+                    "grid.praxis-proxy.io/mount-reconciliation": "enabled",
+                    "grid.praxis-proxy.io/network": "production",
+                    "grid.praxis-proxy.io/gateway": "gateway"
+                }
+            },
+            "spec": {
+                "selector": {"matchLabels": {"app": "gateway"}},
+                "template": {
+                    "metadata": {"labels": {"app": "gateway"}},
+                    "spec": {
+                        "containers": [{
+                            "name": "praxis",
+                            "image": "praxis:test",
+                            "volumeMounts": [{"name": "config", "mountPath": "/etc/praxis", "readOnly": true}]
+                        }],
+                        "volumes": [{
+                            "name": "config",
+                            "configMap": {
+                                "name": "praxis-consumer-config",
+                                "items": [{"key": "praxis.yaml", "path": "praxis.yaml"}]
+                            }
+                        }]
+                    }
+                }
+            }
+        })
+    }
+
+    fn delegated_config_source_check(value: Value) -> Result<bool, OperatorError> {
+        let deployment: Deployment = serde_json::from_value(value).unwrap_or_else(|_| std::process::abort());
+        let delegation = MountReconciliation {
+            enabled: true,
+            deployment_name: Some("gateway".to_owned()),
+            container_name: "praxis".to_owned(),
+        };
+        validate_deployment_delegation(
+            &deployment,
+            "production",
+            &make_gw_ref("gateway", "praxis-system"),
+            &delegation,
+            "praxis-consumer-config",
+        )
+    }
+
+    #[test]
+    fn delegated_config_source_requires_the_expected_config_map_and_projection() {
+        let valid = delegated_config_source_fixture();
+        assert!(matches!(delegated_config_source_check(valid.clone()), Ok(false)));
+
+        for (pointer, replacement) in [
+            (
+                "/spec/template/spec/volumes/0/configMap/name",
+                json!("old-praxis-config"),
+            ),
+            ("/spec/template/spec/containers/0/volumeMounts", json!([])),
+            (
+                "/spec/template/spec/volumes/0/configMap/items/0/key",
+                json!("other.yaml"),
+            ),
+            (
+                "/spec/template/spec/volumes/0/configMap/items/0/path",
+                json!("other.yaml"),
+            ),
+        ] {
+            let mut invalid = valid.clone();
+            let target = invalid.pointer_mut(pointer).unwrap_or_else(|| std::process::abort());
+            *target = replacement;
+            assert!(
+                matches!(
+                    delegated_config_source_check(invalid),
+                    Err(OperatorError::MountReconciliation(failure)) if failure.reason == "ConfigSourceMismatch"
+                ),
+                "invalid config source at {pointer} must fail closed"
+            );
+        }
     }
 
     #[expect(

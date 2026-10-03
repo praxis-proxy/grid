@@ -97,7 +97,8 @@ status reports the outcome under `status.consumerConfigStatus[]`.
 Secret mount management remains opt in. Set
 `consumerConfig.mountReconciliation.enabled: true` and name the exact Deployment
 and Praxis container. The operator verifies that the Deployment carries the
-matching explicit opt-in annotations before it patches volumes or mounts.
+matching explicit opt-in annotations and mounts the generated `praxis.yaml`
+ConfigMap at `/etc/praxis` before it patches volumes or mounts.
 `charts/praxis-gateway` can add those annotations with
 `mountReconciliation.enabled`; its `mountReconciliation.network` and
 `mountReconciliation.gatewayRef` must match the GridNetwork and `GatewayRef`.
@@ -158,8 +159,9 @@ generated ConfigMaps, status, or logs.
 applied. It does not mean the gateway has restarted or become ready. With mount
 reconciliation enabled, `mountReconciliationStatus[]` reports
 `MountsReconciling`, `WaitingForSecret`, `WaitingForRollout`, `Ready`, or
-`Error`. `Ready` requires the available Deployment pods to carry the config and
-Secret revisions reported by Grid. Secret resource versions are hashed before
+`Error`. `Ready` requires a completed Deployment rollout with no old replicas;
+the selected Praxis container must mount Grid's generated ConfigMap and
+`praxis.yaml` key at `/etc/praxis`. Secret resource versions are hashed before
 they are placed in pod annotations; Secret values are never used as rollout
 metadata.
 
