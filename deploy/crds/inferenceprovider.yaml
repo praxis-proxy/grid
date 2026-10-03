@@ -62,9 +62,15 @@ spec:
                   nullable: true
                   properties:
                     credentialsManagedExternally:
-                      default: false
                       description: |-
                         Whether the user manages credentials manually.
+
+                        When true, the operator does not inject credentials
+                        and the user is responsible for configuring auth.
+                      type: boolean
+                    manual:
+                      description: |-
+                        Deprecated in favor of `credentialsManagedExternally`; this legacy field will be removed in a future release. Whether the user manages credentials manually.
 
                         When true, the operator does not inject credentials
                         and the user is responsible for configuring auth.
@@ -109,6 +115,9 @@ spec:
                   required:
                     - strategy
                   type: object
+                  x-kubernetes-validations:
+                    - message: set only `manual` or `credentialsManagedExternally`, not both
+                      rule: '!(has(self.manual) && has(self.credentialsManagedExternally))'
                 backendKind:
                   description: Backend deployment category.
                   type: string
@@ -154,6 +163,16 @@ spec:
                   type: object
                 endpoint:
                   description: HTTP endpoint URL.
+                  type: string
+                gatewayRef:
+                  description: |-
+                    Deprecated in favor of `providerGateway`; this legacy field will be removed in a future release. Stable provider-gateway identity used by administrative operations.
+
+                    Providers with the same value are drained together by the gateway-wide
+                    operation. It is an explicit control-plane relationship; the operator
+                    never infers it from endpoint URLs.
+                  minLength: 1
+                  nullable: true
                   type: string
                 gridNetworkRef:
                   description: |-
@@ -335,6 +354,19 @@ spec:
                     endpoint:
                       description: |-
                         Base URL for the metrics endpoint, independent of `spec.endpoint`.
+
+                        When set, the scrape URL is `{endpoint}{path}` instead of
+                        `{spec.endpoint}{path}`.  This allows scraping metrics from a separate
+                        service (such as an llm-d EPP) while the provider inference endpoint
+                        points at the pool's request path.
+
+                        When absent, the scrape URL uses `spec.endpoint` as before.
+                      minLength: 1
+                      nullable: true
+                      type: string
+                    metricsEndpoint:
+                      description: |-
+                        Deprecated in favor of `endpoint`; this legacy field will be removed in a future release. Base URL for the metrics endpoint, independent of `spec.endpoint`.
 
                         When set, the scrape URL is `{endpoint}{path}` instead of
                         `{spec.endpoint}{path}`.  This allows scraping metrics from a separate
@@ -569,6 +601,9 @@ spec:
                         - message: set exactly one of caSecretRef and caConfigMapRef
                           rule: has(self.caSecretRef) != has(self.caConfigMapRef)
                   type: object
+                  x-kubernetes-validations:
+                    - message: set only `metricsEndpoint` or `endpoint`, not both
+                      rule: '!(has(self.metricsEndpoint) && has(self.endpoint))'
                 modelDiscovery:
                   description: |-
                     Where to discover the models this provider serves.
@@ -747,6 +782,24 @@ spec:
                 providerKind:
                   description: Inference provider type.
                   type: string
+                routingClusterRef:
+                  description: |-
+                    Deprecated in favor of `clusterName`; this legacy field will be removed in a future release. Optional routing identity used in overlay candidate `site` and `cluster` fields.
+
+                    When set, routing overlay candidates produced for this provider use this value
+                    instead of `metadata.name`:
+
+                    - In Phase 1 (no [`GridSite`] inventory), both `candidate.site` and `candidate.cluster` are set to this value.
+                    - When [`GridSite`] resources are present, only `candidate.cluster` is overridden; `candidate.site` is derived
+                      from the matched `GridSite`.
+
+                    Use this to align the provider's routing identity with an upstream cluster
+                    name already configured in the consumer gateway, such as a Praxis
+                    `load_balancer` cluster entry.  When absent, `metadata.name` is used.
+
+                    [`GridSite`]: crate::crd::grid_site::GridSite
+                  nullable: true
+                  type: string
                 siteSelector:
                   default:
                     matchLabels: {}
@@ -879,6 +932,11 @@ spec:
                 - gridNetworkRef
                 - providerKind
               type: object
+              x-kubernetes-validations:
+                - message: set only `gatewayRef` or `providerGateway`, not both
+                  rule: '!(has(self.gatewayRef) && has(self.providerGateway))'
+                - message: set only `routingClusterRef` or `clusterName`, not both
+                  rule: '!(has(self.routingClusterRef) && has(self.clusterName))'
             status:
               description: Observed status of an [`InferenceProvider`].
               nullable: true

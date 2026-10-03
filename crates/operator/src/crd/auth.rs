@@ -5,6 +5,11 @@ use serde::{Deserialize, Serialize};
 
 use super::grid_network::SecretRef;
 
+/// Add the deprecated authentication field to the generated schema.
+fn add_auth_config_legacy_fields(schema: &mut schemars::Schema) {
+    crate::crd::add_legacy_field_aliases(schema, &[("manual", "credentialsManagedExternally")]);
+}
+
 // ---------------------------------------------------------------------------
 // Auth Config
 // ---------------------------------------------------------------------------
@@ -15,13 +20,14 @@ use super::grid_network::SecretRef;
 /// The Grid Operator manages credential lifecycle and
 /// configures Praxis to inject them transparently.
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
+#[schemars(transform = add_auth_config_legacy_fields)]
 #[serde(rename_all = "camelCase")]
 pub struct AuthConfig {
     /// Whether the user manages credentials manually.
     ///
     /// When true, the operator does not inject credentials
     /// and the user is responsible for configuring auth.
-    #[serde(default)]
+    #[serde(default, alias = "manual")]
     pub credentials_managed_externally: bool,
 
     /// Reference to a Secret containing the credential.

@@ -188,8 +188,7 @@ pub(crate) fn site_phase_next(
             (
                 GridSitePhase::Discovered,
                 "GossipedAddressRefused".to_owned(),
-                "gossiped address is not a dialable literal IP:port; set spec.gatewayEndpoint.address"
-                    .to_owned(),
+                "gossiped address is not a dialable literal IP:port; set spec.gatewayEndpoint.address".to_owned(),
             )
         },
         GridSitePhase::Discovered => {

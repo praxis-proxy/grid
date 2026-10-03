@@ -13,6 +13,11 @@ use serde::{Deserialize, Serialize};
 // Spec
 // ---------------------------------------------------------------------------
 
+/// Add the deprecated `GridSite` endpoint field to the generated schema.
+fn add_grid_site_spec_legacy_fields(schema: &mut schemars::Schema) {
+    crate::crd::add_legacy_field_aliases(schema, &[("egress", "gatewayEndpoint")]);
+}
+
 /// Specification for a [`GridSite`].
 ///
 /// Describes a remote site's egress endpoint, region, and
@@ -30,6 +35,7 @@ use serde::{Deserialize, Serialize};
     printcolumn = r#"{"name":"Network","type":"string","jsonPath":".spec.gridNetworkRef"}"#
 )]
 #[serde(rename_all = "camelCase")]
+#[schemars(transform = add_grid_site_spec_legacy_fields)]
 pub struct GridSiteSpec {
     /// Name of the [`GridNetwork`] this site belongs to.
     ///
@@ -37,6 +43,7 @@ pub struct GridSiteSpec {
     pub grid_network_ref: String,
 
     /// Gateway endpoint for data-plane connectivity.
+    #[serde(alias = "egress")]
     pub gateway_endpoint: Option<EgressConfig>,
 
     /// Deployment region.
