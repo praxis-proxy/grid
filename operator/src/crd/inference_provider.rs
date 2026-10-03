@@ -545,6 +545,7 @@ pub struct InferenceProviderStatus {
     /// - `MetricsTlsSecretMissing`, `MetricsTlsKeyMissing`, `MetricsTlsMaterialInvalid`, `MetricsTlsIdentityMismatch`
     /// - `HealthCheckTlsSecretMissing`, `HealthCheckTlsKeyMissing`, `HealthCheckTlsMaterialInvalid`,
     ///   `HealthCheckTlsIdentityMismatch`
+    /// - `HealthCheckAuthCredentialUnavailable`, `HealthCheckAuthValueInvalid`
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
 }
@@ -770,6 +771,10 @@ mod tests {
             "healthCheck must include endpoint field"
         );
         assert!(hc_properties.contains_key("tls"), "healthCheck must include tls field");
+        assert!(
+            !hc_properties.contains_key("useProviderAuth"),
+            "healthCheck must not require a second provider auth setting"
+        );
         assert!(
             hc_properties.contains_key("path"),
             "healthCheck must include path field"

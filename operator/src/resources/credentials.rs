@@ -23,9 +23,8 @@
 //! [`BearerToken`](crate::resources::credentials::BearerToken) never appears in `Debug`
 //! output or `tracing` spans.
 //! Token values must not be written to Kubernetes resources (status, annotations,
-//! labels, ConfigMaps).  Pass
-//! [`BearerToken`](crate::resources::credentials::BearerToken) only to the
-//! data-plane config generator that injects it into Praxis filter configuration.
+//! labels, ConfigMaps). Expose the value only for an authorized health request
+//! or for data-plane credential injection.
 //!
 //! [`SecretRef`]: crate::crd::grid_network::SecretRef
 
@@ -125,8 +124,8 @@ pub struct BearerTokenRef {
 /// A resolved bearer token ready for data-plane injection.
 ///
 /// The token value is intentionally hidden from [`fmt::Debug`] to prevent
-/// accidental logging.  Pass this value only to the Praxis config generator
-/// that writes it into a Praxis filter pipeline at request time.
+/// accidental logging. Pass it only to authorized request construction or
+/// the Praxis config generator that writes it into a filter pipeline.
 ///
 /// **Do not write the token value to Kubernetes resources.**
 pub struct BearerToken(String);
@@ -138,9 +137,20 @@ impl BearerToken {
         Self(raw)
     }
 
+    /// Build a sensitive HTTP bearer header without exposing the token to callers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the token contains invalid HTTP header characters.
+    pub fn authorization_header(&self) -> Result<http::HeaderValue, http::header::InvalidHeaderValue> {
+        let mut header = http::HeaderValue::from_str(&format!("Bearer {}", self.0))?;
+        header.set_sensitive(true);
+        Ok(header)
+    }
+
     /// Return the token value.
     ///
-    /// Use only when the token is needed for config injection.
+    /// Use only when injecting config.
     /// Never log, store in status, or serialize to a Kubernetes resource.
     #[must_use]
     pub fn expose_secret(&self) -> &str {
@@ -663,6 +673,20 @@ mod tests {
     fn bearer_token_expose_secret_returns_value() {
         let token = BearerToken::new("my-token".to_owned());
         assert_eq!(token.expose_secret(), "my-token");
+    }
+
+    #[test]
+    fn bearer_token_header_is_sensitive_and_rejects_invalid_values() {
+        let token = BearerToken::new("my-token".to_owned());
+        let header = token.authorization_header().expect("valid token must produce a header");
+        assert_eq!(header, "Bearer my-token");
+        assert!(header.is_sensitive(), "bearer header must be marked sensitive");
+
+        let invalid = BearerToken::new("bad\nvalue".to_owned());
+        assert!(
+            invalid.authorization_header().is_err(),
+            "invalid token must be rejected"
+        );
     }
 
     // -----------------------------------------------------------------------

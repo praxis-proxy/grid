@@ -108,6 +108,12 @@ The `InferenceProvider` controller validates credentials during every reconcile:
   resources store only credential references, never token values.
 - The `CredentialResolver` trait and `KubernetesSecretResolver` v1 backend are
   in production operator code.
+- A health GET uses the resolved bearer token when `spec.auth` declares a
+  controller-managed bearer token and the target is HTTPS on the same origin
+  as `spec.endpoint`. This also applies to a same-origin
+  `healthCheck.endpoint` override. Other probes remain anonymous. Redirects
+  are not followed. Secret rotation is picked up on the next reconciliation
+  without copying the token into status or events.
 - **Credential reference projection into the routing overlay**: when a provider's
   `spec.auth` declares `strategy: bearer_token` with a valid `secretRef`, the
   operator includes a `credential` field in every routing candidate produced for

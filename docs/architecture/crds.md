@@ -531,12 +531,38 @@ spec:
     matchLabels: {}
 ```
 
-This external API example intentionally omits `healthCheck`: AGN probes health
-with an unauthenticated HTTP `GET`, which is not the provider's authenticated
-inference API. It also omits metrics scraping because the external API does not
-provide the provider-pool metrics used by AGN scoring. The referenced
-`openai-token` Secret must exist in `praxis-system` before controller-managed
+This external API example intentionally omits `healthCheck` because the API
+does not expose a suitable `GET /health` endpoint. It also omits metrics
+scraping because the external API does not provide the provider-pool metrics
+used by AGN scoring. The referenced `openai-token` Secret must exist in
+`praxis-system` before controller-managed
 credential projection can become available.
+
+To probe the provider's default `{spec.endpoint}/health` URL, add this to the
+provider spec:
+
+```yaml
+healthCheck: {}
+```
+
+When `spec.auth` declares a controller-managed bearer token, the operator
+automatically sends it on same-origin HTTPS health probes. If the endpoint
+uses a private CA, also configure `healthCheck.tls.caSecretRef`:
+
+```yaml
+healthCheck:
+  tls:
+    caSecretRef:
+      name: model-gateway-ca
+      namespace: praxis-system
+```
+
+The token comes from `spec.auth.secretRef` on each probe. The probe target must
+have the same scheme, host, and effective port as `spec.endpoint` to receive it.
+`healthCheck.path` changes the request path; `healthCheck.endpoint` can change
+the base URL within that origin. Probes to a different origin or over plain
+HTTP remain anonymous. Providers without controller-managed bearer auth also
+probe anonymously. Redirects are not followed; a 3xx response degrades health.
 
 **Phases**: Pending → Available → Degraded → Unavailable
 

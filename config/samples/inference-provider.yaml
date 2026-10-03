@@ -33,9 +33,10 @@ spec:
     siteSelector:
       matchLabels: {}
 
-  # Health check — enable only when the provider exposes a suitable
-  # unauthenticated health endpoint. Non-2xx responses mark the provider
-  # Degraded.
+  # Health check — enable only when the provider exposes a suitable endpoint.
+  # The operator sends the provider bearer token to the same-origin HTTPS
+  # endpoint when auth is managed; other probes are anonymous. Non-2xx
+  # responses mark the provider Degraded.
   # healthCheck:
   #   endpoint: https://provider-health.example.com
   #   path: /healthz
