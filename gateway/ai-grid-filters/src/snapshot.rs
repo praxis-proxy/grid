@@ -6,7 +6,7 @@
 //! ([`RouteSnapshot::from_store`]) run off the request path, so the hot path
 //! snapshots resolved order once rather than reading raw signals per request.
 
-use std::sync::Arc;
+use std::{collections::BTreeSet, sync::Arc};
 
 use grid_signals::LoadStore;
 
@@ -26,6 +26,9 @@ pub struct RouteSnapshot {
 
     /// This gateway's own site identifier.
     pub local_site: Arc<str>,
+
+    /// Clusters explicitly configured for authenticated provider-gateway hops.
+    pub provider_hop_clusters: Arc<BTreeSet<String>>,
 }
 
 impl RouteSnapshot {
@@ -34,7 +37,20 @@ impl RouteSnapshot {
     /// The order is whatever the caller supplies (config order). Used before
     /// any signals exist and as the cold-start fallback.
     pub fn from_static(candidates: Vec<RouteCandidate>, local_site: Arc<str>) -> Self {
-        Self { candidates, local_site }
+        Self::from_static_with_provider_hops(candidates, local_site, BTreeSet::new())
+    }
+
+    /// Wrap candidates and the explicit provider-hop allowlist without polling.
+    pub fn from_static_with_provider_hops(
+        candidates: Vec<RouteCandidate>,
+        local_site: Arc<str>,
+        provider_hop_clusters: BTreeSet<String>,
+    ) -> Self {
+        Self {
+            candidates,
+            local_site,
+            provider_hop_clusters: Arc::new(provider_hop_clusters),
+        }
     }
 
     /// Order candidates least-loaded-first from the live store, then wrap them.
@@ -52,6 +68,23 @@ impl RouteSnapshot {
         now_ms: i64,
         window_ms: i64,
     ) -> Self {
+        Self::from_store_with_provider_hops(candidates, local_site, store, now_ms, window_ms, BTreeSet::new())
+    }
+
+    /// Order candidates by load and keep the provider-hop allowlist in the same
+    /// immutable snapshot so route and trust decisions change atomically.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the immutable snapshot constructor takes all independent routing inputs explicitly"
+    )]
+    pub fn from_store_with_provider_hops(
+        candidates: Vec<RouteCandidate>,
+        local_site: Arc<str>,
+        store: &LoadStore,
+        now_ms: i64,
+        window_ms: i64,
+        provider_hop_clusters: BTreeSet<String>,
+    ) -> Self {
         // Score each candidate once, then sort the pairs: load_of allocates a
         // store key and scans a window, too costly to repeat inside sort_by.
         let mut scored: Vec<(f64, RouteCandidate)> = candidates
@@ -63,6 +96,7 @@ impl RouteSnapshot {
         Self {
             candidates: ordered,
             local_site,
+            provider_hop_clusters: Arc::new(provider_hop_clusters),
         }
     }
 
@@ -107,6 +141,7 @@ mod tests {
             kind: CapabilityKind::InferenceModel,
             name: name.to_owned(),
             site: site.to_owned(),
+            stable_id: None,
         }
     }
 

@@ -38,6 +38,7 @@ dependencies = [
  "praxis-proxy-filter",
  "rustls",
  "serde",
+ "sha2 0.10.9",
  "tokio",
  "tokio-rustls",
  "tracing",
@@ -1477,7 +1478,9 @@ dependencies = [
  "praxis-proxy",
  "praxis-proxy-core",
  "praxis-proxy-filter",
+ "serde",
  "tracing",
+ "yaml_serde",
 ]
 
 [[package]]
@@ -2821,8 +2824,8 @@ dependencies = [
 
 [[package]]
 name = "praxis-ai-apis"
-version = "0.4.1"
-source = "git+https://github.com/praxis-proxy/ai.git?tag=v0.4.1#b9d6016764888e02dc049ec088496b10b7e886c1"
+version = "0.5.0"
+source = "git+https://github.com/praxis-proxy/ai.git?tag=v0.5.0#2f8732c1389b889660bcb3495af4d4d28dd4e682"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -2831,6 +2834,7 @@ dependencies = [
  "http",
  "openssl",
  "percent-encoding",
+ "praxis-ai-store",
  "praxis-proxy-core",
  "praxis-proxy-filter",
  "praxis-proxy-tls",
@@ -2847,8 +2851,8 @@ dependencies = [
 
 [[package]]
 name = "praxis-ai-filters"
-version = "0.4.1"
-source = "git+https://github.com/praxis-proxy/ai.git?tag=v0.4.1#b9d6016764888e02dc049ec088496b10b7e886c1"
+version = "0.5.0"
+source = "git+https://github.com/praxis-proxy/ai.git?tag=v0.5.0#2f8732c1389b889660bcb3495af4d4d28dd4e682"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -2875,6 +2879,17 @@ dependencies = [
  "url",
  "yaml_serde",
  "zeroize",
+]
+
+[[package]]
+name = "praxis-ai-store"
+version = "0.5.0"
+source = "git+https://github.com/praxis-proxy/ai.git?tag=v0.5.0#2f8732c1389b889660bcb3495af4d4d28dd4e682"
+dependencies = [
+ "async-trait",
+ "dashmap",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -3099,9 +3114,9 @@ dependencies = [
 
 [[package]]
 name = "praxis-proxy"
-version = "0.7.1"
+version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "17129b0b04fc21f0d9d9687d1fd5c697eafa866fa0085b18b7aeaa2790080b44"
+checksum = "06f015b2b83fd515f687bb1fc6ba98e896064aac1faece462f69d646359bb486"
 dependencies = [
  "cargo_metadata",
  "clap",
@@ -3121,9 +3136,9 @@ dependencies = [
 
 [[package]]
 name = "praxis-proxy-core"
-version = "0.7.1"
+version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef5ed70124f3d5e89bcb61924fdcd0ad611f0c4c981a9b3e62bb45233bff8d53"
+checksum = "6cffb3c0fbf6b7219ef9a0fa4345151002d4a96c63d759d229b5acdfad6c9d9d"
 dependencies = [
  "bytes",
  "chrono",
@@ -3147,9 +3162,9 @@ dependencies = [
 
 [[package]]
 name = "praxis-proxy-filter"
-version = "0.7.1"
+version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "561a7bf857ff1c673ae74362e18ed8f4c2ce903406b0d9fe093dc43705572c87"
+checksum = "bf548330b43c624b8444d259a1d658cc157bc07cd77891b7c9472932fb094727"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -3181,9 +3196,9 @@ dependencies = [
 
 [[package]]
 name = "praxis-proxy-protocol"
-version = "0.7.1"
+version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "023dcec07bb35f9cc15c892aa1b3f6ca0e4f44b3fdb610a2b6e69abf2a4a697f"
+checksum = "b42873349f4235c8b645fe9927aedca8fc83eb2175b99802c1811b15c5ab423a"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -3210,9 +3225,9 @@ dependencies = [
 
 [[package]]
 name = "praxis-proxy-tls"
-version = "0.7.1"
+version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "99a3391cc07ff6061392a8a77f926451953ed557daaa7cc6b117a6b7bf0975c1"
+checksum = "82b53b8a6e26c0e6add1a8bd5f0fe74f701c3344d3bf7be6b00a24cbd656b98b"
 dependencies = [
  "arc-swap",
  "notify",
@@ -4542,9 +4557,9 @@ dependencies = [
 
 [[package]]
 name = "tokio-rustls"
-version = "0.26.5"
+version = "0.26.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b0c85f2c3ef0b1cd58b36682f4b17aaa995f0e5db534d85692b4903abce21f67"
+checksum = "c9cc2678c2cdd569ef8215e2afd7954ada2ae20b4fdd2c5fe6139a3b02d105db"
 dependencies = [
  "rustls",
  "tokio",
@@ -5214,9 +5229,9 @@ dependencies = [
 
 [[package]]
 name = "xxhash-rust"
-version = "0.8.18"
+version = "0.8.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aee1b19627c7c60102ab80d3a9cbe18de90bfe03bfa6c3715447681f0e8c8af6"
+checksum = "550a2b930b62486a393c52d5c3b84bff264b28aa437ed64694d31e93b1757af7"
 
 [[package]]
 name = "yaml_serde"
@@ -5260,14 +5275,14 @@ dependencies = [
 
 [[package]]
 name = "yoke-derive"
-version = "0.8.3"
+version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "33811428bee40dbceb6d545e95754741d17a6aef9a4849f0fd62e2ba4f412a78"
+checksum = "de844c262c8848816172cef550288e7dc6c7b7814b4ee56b3e1553f275f1858e"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 3.0.6",
- "synstructure 0.14.0",
+ "syn 2.0.119",
+ "synstructure 0.13.2",
 ]
 
 [[package]]

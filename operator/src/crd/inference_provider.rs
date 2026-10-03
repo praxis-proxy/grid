@@ -545,6 +545,8 @@ pub struct InferenceProviderStatus {
     /// - `MetricsTlsSecretMissing`, `MetricsTlsKeyMissing`, `MetricsTlsMaterialInvalid`, `MetricsTlsIdentityMismatch`
     /// - `HealthCheckTlsSecretMissing`, `HealthCheckTlsKeyMissing`, `HealthCheckTlsMaterialInvalid`,
     ///   `HealthCheckTlsIdentityMismatch`
+    /// - `NoMatchingSites`: this generation's selector matches no known `GridSite`; remote sites must not treat its
+    ///   `Pending` phase as routable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
 }

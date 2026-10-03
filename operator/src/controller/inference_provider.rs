@@ -260,6 +260,20 @@ pub fn phase_from_probe(outcome: ProbeOutcome, site_phase: ProviderPhase) -> Pro
 /// This function never returns [`ProviderPhase::Degraded`].
 /// `Degraded` is only reachable via [`phase_from_probe`] when a health
 /// probe returns a degraded response.
+/// Mark a current provider generation as withdrawn only when known site
+/// inventory exists and the provider selector matches none of it. With no
+/// inventory, the existing Phase 1 fallback remains eligible.
+fn selector_has_no_matches(site_count: usize, matching: &[String]) -> bool {
+    site_count > 0 && matching.is_empty()
+}
+
+/// Status reason that lets remote Grid sites distinguish intentional selector
+/// withdrawal from an uninitialized provider (`Pending`) or absent inventory.
+fn no_matching_sites_reason(has_no_matches: bool) -> Option<String> {
+    has_no_matches.then(|| "NoMatchingSites".to_owned())
+}
+
+/// Derive the initial provider phase from the current selector matches.
 pub(crate) fn phase_from_matching(matching: &[String]) -> ProviderPhase {
     if matching.is_empty() {
         ProviderPhase::Pending
@@ -527,7 +541,16 @@ async fn resolve_phase_and_sites(
     // Resolve matching sites.
     let sites = list_sites_for_network(client, network_ref).await?;
     let matching = sites_matching_selector(provider, &sites);
+    let selector_has_no_matches = selector_has_no_matches(sites.len(), &matching);
     let site_phase = phase_from_matching(&matching);
+
+    // A known-empty selector result is an authoritative withdrawal. Resolve it
+    // before health/TLS probes: an unrelated probe failure must not turn this
+    // provider back into Degraded, which remains routable as stale capacity in
+    // the cross-site CRDT.
+    if selector_has_no_matches {
+        return Ok((ProviderPhase::Pending, matching, no_matching_sites_reason(true)));
+    }
 
     // Resolve health check TLS config (if configured).  On failure, map
     // the error to a structured status reason and mark the provider Degraded.
@@ -571,6 +594,7 @@ async fn resolve_phase_and_sites(
         None => ProbeOutcome::NotProbed,
     };
     let phase = phase_from_probe(probe_result, site_phase);
+    let reason = no_matching_sites_reason(selector_has_no_matches);
 
     // Validate metrics TLS configuration.
     if phase == ProviderPhase::Available
@@ -586,7 +610,7 @@ async fn resolve_phase_and_sites(
         return Ok((ProviderPhase::Degraded, matching, Some(tls_reason)));
     }
 
-    Ok((phase, matching, None))
+    Ok((phase, matching, reason))
 }
 
 /// List all [`GridSite`]s whose `spec.gridNetworkRef` matches `network_ref`.
@@ -1082,6 +1106,25 @@ mod tests {
         // Item 6: valid config, no matching sites → Pending
         let phase = phase_from_matching(&[]);
         assert_eq!(phase, ProviderPhase::Pending, "empty matching → Pending");
+    }
+
+    #[test]
+    fn no_matching_sites_reason_takes_precedence_over_probe_phase() {
+        assert!(selector_has_no_matches(1, &[]));
+        assert!(
+            !selector_has_no_matches(0, &[]),
+            "no inventory preserves Phase 1 fallback"
+        );
+        assert!(!selector_has_no_matches(1, &["site-a".to_owned()]));
+        // The reason is based on authoritative selector inventory, not the
+        // eventual health-probe phase. resolve_phase_and_sites returns this
+        // Pending withdrawal before it can become Degraded.
+        assert_eq!(no_matching_sites_reason(true).as_deref(), Some("NoMatchingSites"));
+        assert_eq!(no_matching_sites_reason(false), None);
+        assert_eq!(
+            phase_from_probe(ProbeOutcome::Degraded, ProviderPhase::Pending),
+            ProviderPhase::Degraded
+        );
     }
 
     #[test]

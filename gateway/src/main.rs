@@ -12,9 +12,13 @@
 //! Kubernetes client stack. See `deploy/gateway/Containerfile` and the
 //! `gateway-image` make target.
 
-use std::process::ExitCode;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    process::ExitCode,
+};
 
 use praxis_core::config::{Config, ConfigFile, DEFAULT_CONFIG};
+use serde::Deserialize;
 use tracing::info;
 
 /// Log line emitted once tracing is up; the startup test waits for it.
@@ -52,7 +56,7 @@ fn main() -> ExitCode {
     // bound until the server returns.
     let grid_runtime = match std::env::var("GRID_SERVING_CONFIG")
         .ok()
-        .map(|path| start_grid_routing(&path, &mut registry))
+        .map(|path| start_grid_routing(&path, &config, &mut registry))
     {
         Some(Err(err)) => return praxis::report_fatal(&err, log_output),
         Some(Ok(runtime)) => Some(runtime),
@@ -60,7 +64,10 @@ fn main() -> ExitCode {
     };
 
     // Returning instead of exiting drops the guard, flushing queued log lines.
-    let result = praxis::try_run_server_with_registry(config, registry, config_file, log_level);
+    // The provider-hop TLS binding is checked against this loaded Praxis
+    // config. Keep it fixed while serving revisions hot-reload independently.
+    let watched_config_file = if grid_runtime.is_some() { None } else { config_file };
+    let result = praxis::try_run_server_with_registry(config, registry, watched_config_file, log_level);
     drop(grid_runtime);
     result.map_or_else(|err| praxis::report_fatal(&err, log_output), |()| ExitCode::SUCCESS)
 }
@@ -73,12 +80,109 @@ fn main() -> ExitCode {
 /// registering the filters.
 fn start_grid_routing(
     path: &str,
+    praxis_config: &Config,
     registry: &mut praxis_filter::FilterRegistry,
 ) -> Result<ai_grid_filters::GridRuntime, praxis_filter::FilterError> {
     let config = ai_grid_filters::load_serving_config(path)?;
-    let runtime = ai_grid_filters::spawn_grid_routing(&config)?;
+    let backends = provider_hop_backends(praxis_config)?;
+    let mut runtime = ai_grid_filters::spawn_grid_routing(&config, backends)?;
+    runtime.watch_config(path)?;
     ai_grid_filters::register_grid_filters(registry, runtime.snapshot())?;
     Ok(runtime)
+}
+
+/// Minimal view of Praxis's load-balancer filter config for trust validation.
+#[derive(Deserialize)]
+struct LoadBalancerBackends {
+    /// Configured cluster entries.
+    clusters: Vec<BackendCluster>,
+}
+
+/// One configured upstream cluster.
+#[derive(Deserialize)]
+struct BackendCluster {
+    /// Cluster identifier.
+    name: String,
+    /// Upstream TLS settings, absent for plaintext.
+    tls: Option<BackendTls>,
+}
+
+/// TLS properties required before a backend can carry provider-hop context.
+#[derive(Deserialize)]
+struct BackendTls {
+    /// Expected server name.
+    sni: String,
+    /// Certificate verification switch.
+    verify: bool,
+    /// Trusted CA bundle.
+    ca: Option<BackendCa>,
+    /// Mutual-TLS client identity.
+    client_cert: Option<BackendClientCert>,
+}
+
+/// CA trust input used by the load balancer.
+#[derive(Deserialize)]
+struct BackendCa {
+    /// CA certificate path.
+    ca_path: String,
+}
+
+/// Client identity used by the load balancer.
+#[derive(Deserialize)]
+struct BackendClientCert {
+    /// Client certificate path.
+    cert_path: String,
+    /// Client private key path.
+    key_path: String,
+}
+
+/// Read the effective load-balancer transport for the chain using Grid routing.
+/// Only verified mTLS backends can satisfy an operator provider-hop declaration.
+#[expect(clippy::too_many_lines, reason = "keeps the backend transport checks together")]
+fn provider_hop_backends(config: &Config) -> Result<BTreeMap<String, String>, praxis_filter::FilterError> {
+    let mut backends = BTreeMap::new();
+    let mut unverified = BTreeSet::new();
+    for chain in &config.filter_chains {
+        if !chain
+            .filters
+            .iter()
+            .any(|filter| filter.filter_type == "grid_site_route")
+        {
+            continue;
+        }
+        for filter in chain
+            .filters
+            .iter()
+            .filter(|filter| filter.filter_type == "load_balancer")
+        {
+            let parsed: LoadBalancerBackends =
+                serde_yaml::from_value(filter.config.clone()).map_err(|error| -> praxis_filter::FilterError {
+                    format!("grid: parsing load_balancer backends: {error}").into()
+                })?;
+            for backend in parsed.clusters {
+                let verified_sni = backend.tls.filter(|tls| {
+                    tls.verify
+                        && !tls.sni.trim().is_empty()
+                        && tls.ca.as_ref().is_some_and(|ca| !ca.ca_path.trim().is_empty())
+                        && tls
+                            .client_cert
+                            .as_ref()
+                            .is_some_and(|cert| !cert.cert_path.trim().is_empty() && !cert.key_path.trim().is_empty())
+                });
+                if let Some(tls) = verified_sni {
+                    if unverified.contains(&backend.name) || backends.insert(backend.name.clone(), tls.sni).is_some() {
+                        return Err(format!("grid: ambiguous provider-hop backend {:?}", backend.name).into());
+                    }
+                } else {
+                    if backends.contains_key(&backend.name) {
+                        return Err(format!("grid: ambiguous provider-hop backend {:?}", backend.name).into());
+                    }
+                    unverified.insert(backend.name);
+                }
+            }
+        }
+    }
+    Ok(backends)
 }
 
 /// Usage line for a malformed command line.
@@ -108,8 +212,62 @@ fn config_arg<I: IntoIterator<Item = String>>(args: I) -> Result<Option<String>,
 }
 
 #[cfg(test)]
+#[expect(clippy::expect_used, reason = "test fixtures use checked parsing")]
 mod tests {
-    use super::{USAGE, config_arg};
+    use praxis_core::config::{Config, DEFAULT_CONFIG, FilterChainConfig};
+
+    use super::{USAGE, config_arg, provider_hop_backends};
+
+    fn config_with_backend(backend: &str) -> Config {
+        let mut config = Config::from_yaml(DEFAULT_CONFIG).expect("default Praxis config");
+        let chain = format!(
+            "name: grid\nfilters:\n  - filter: grid_site_route\n  - filter: load_balancer\n    clusters:\n      - name: provider-a\n{backend}"
+        );
+        config.filter_chains = vec![serde_yaml::from_str::<FilterChainConfig>(&chain).expect("filter chain")];
+        config
+    }
+
+    #[test]
+    fn provider_hop_backends_require_verified_mutual_tls() {
+        let matching = config_with_backend(
+            "        tls:\n          sni: provider-a.grid.internal\n          verify: true\n          ca: { ca_path: /tls/ca.crt }\n          client_cert: { cert_path: /tls/tls.crt, key_path: /tls/tls.key }\n",
+        );
+        assert_eq!(
+            provider_hop_backends(&matching)
+                .expect("backends")
+                .get("provider-a")
+                .map(String::as_str),
+            Some("provider-a.grid.internal")
+        );
+        for backend in [
+            "        endpoints: [provider-a:80]\n",
+            "        tls: { sni: provider-a.grid.internal, verify: true }\n",
+            "        tls: { sni: provider-a.grid.internal, verify: false, ca: { ca_path: /tls/ca.crt }, client_cert: { cert_path: /tls/tls.crt, key_path: /tls/tls.key } }\n",
+        ] {
+            assert!(
+                provider_hop_backends(&config_with_backend(backend))
+                    .expect("backends")
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn provider_hop_backends_reject_verified_plaintext_name_collision() {
+        let verified = "        tls:\n          sni: provider-a.grid.internal\n          verify: true\n          ca: { ca_path: /tls/ca.crt }\n          client_cert: { cert_path: /tls/tls.crt, key_path: /tls/tls.key }\n";
+        let plaintext = "        endpoints: [provider-a:80]\n";
+        for (first, second) in [(verified, plaintext), (plaintext, verified)] {
+            let mut config = config_with_backend(first);
+            let mut other = config_with_backend(second).filter_chains.remove(0);
+            other.name = "other-grid".to_owned();
+            config.filter_chains.push(other);
+            assert!(
+                provider_hop_backends(&config)
+                    .err()
+                    .is_some_and(|error| error.to_string().contains("ambiguous provider-hop backend"))
+            );
+        }
+    }
 
     fn parse(args: &[&str]) -> Result<Option<String>, String> {
         config_arg(args.iter().map(|arg| (*arg).to_owned()))

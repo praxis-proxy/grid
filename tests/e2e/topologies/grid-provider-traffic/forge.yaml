@@ -492,6 +492,9 @@ spec:
             overlay:
               enabled: true
               existingConfigMap: "grid-overlay-grid-provider-traffic-consumer-gateway"
+            credentials:
+              - name: "vcr-inference-credential"
+                mountPath: "/run/secrets/grid-credentials/grid-system/vcr-inference-credential"
             tls:
               enabled: true
               existingSecret: "consumer-gateway-tls"

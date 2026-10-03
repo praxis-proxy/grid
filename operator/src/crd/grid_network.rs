@@ -742,16 +742,33 @@ pub struct GatewayRef {
     #[serde(default)]
     pub local_site_name: Option<String>,
 
+    /// Explicit mTLS provider-hop endpoints for the embedded `grid-gateway`
+    /// serving config. This allowlist is independent of `consumerConfig`, so a
+    /// missing or disabled generated Praxis config cannot alter embedded
+    /// serving behavior. Every entry must declare `mutual_tls` and a nonblank
+    /// SNI. The embedded gateway compares each declaration against the
+    /// loaded Praxis load-balancer's verified mTLS backend before it sends
+    /// provider-hop context. Changing Praxis backend transport requires a
+    /// gateway restart while `gridServing` is enabled.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_hop_endpoints: Vec<ProviderHopEndpointConfig>,
+
     /// Opt-in configuration for operator-managed consumer Praxis config generation.
     ///
-    /// When absent or `enabled: false`, this gateway behaves exactly as before —
-    /// only the routing overlay `ConfigMap` is applied.  When `enabled: true`, the
-    /// operator additionally renders a consumer Praxis `ConfigMap` containing the
-    /// `intelligent_route` candidates (with credential `secretRef` data), a
-    /// `credential_inject` section for credential-bearing candidates, and a
-    /// `load_balancer` section with one cluster entry per unique candidate cluster.
+    /// When absent or `enabled: false`, no generated consumer Praxis `ConfigMap`
+    /// is applied. The routing overlay is still applied, and embedded
+    /// `grid-gateway` serving behavior is configured independently through
+    /// `providerHopEndpoints`. When `enabled: true`, the operator additionally
+    /// renders a consumer Praxis `ConfigMap` whose
+    /// `intelligent_route` reads the versioned routing overlay from the gateway
+    /// namespace. The generated config includes `load_balancer` entries for the
+    /// full configured endpoint inventory. It includes `credential_inject` for
+    /// current credential references, or a dynamic projected-credential filter
+    /// when `enableProjectedCredentials` is true.
     ///
-    /// The generated `ConfigMap` contains no token bytes.
+    /// The generated `ConfigMap` contains no token bytes. Credential-bearing
+    /// overlays are withheld until the consumer has explicitly declared that its
+    /// compatible filter config is already running.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub consumer_config: Option<ConsumerConfig>,
 }
@@ -760,20 +777,35 @@ pub struct GatewayRef {
 ///
 /// When `enabled` is `true` on a [`GatewayRef`], the `GridNetwork` controller
 /// renders a `praxis.yaml`-keyed `ConfigMap` in the gateway namespace in addition
-/// to the normal routing overlay `ConfigMap`.  The generated config includes the
-/// `intelligent_route` candidates, `credential_inject` (when credential-bearing
-/// candidates are present), and a `load_balancer` section.
+/// to the normal routing overlay `ConfigMap`. The generated config reads route
+/// candidates and selection policy from that versioned overlay file, and
+/// preconfigures `load_balancer` entries from the complete static endpoint
+/// inventory. Set `enableProjectedCredentials` to render `credential_inject`
+/// with the projected mount root, roll out the consumer, and only then set
+/// `supportsProjectedCredentials` as a readiness attestation. The Grid
+/// controller does not own or restart the consumer Deployment. Until both are
+/// set, it retains credential-bearing overlay revisions. The
+/// consumer Deployment must mount the overlay `ConfigMap` at the documented path.
 ///
-/// Every cluster referenced by a routing candidate must have a matching
-/// `clusterEndpoints` entry.  Missing endpoint topology causes config generation
+/// Every potentially routable cluster must have a matching `clusterEndpoints`
+/// entry. Missing endpoint topology causes config generation
 /// to fail with status reason `MissingClusterEndpoint` instead of rendering an
 /// incomplete `load_balancer` cluster.
 ///
 /// # Security
 ///
-/// The generated `ConfigMap` never contains credential token bytes.  Credential
-/// entries use a `file:` source under `credentialMountBase`; the mounted
-/// Kubernetes Secret provides the token at runtime.
+/// The generated `ConfigMap` never contains credential token bytes. Credential
+/// entries use `file:` sources under `credentialMountBase`; the mounted
+/// Kubernetes Secret provides the token at runtime. With
+/// `enableProjectedCredentials: true`, the config starts with an empty table
+/// and resolves selected references from that mount at request time. Missing
+/// files fail closed with HTTP 503. Credential-bearing routes are not
+/// distributed until the consumer later attests readiness with
+/// `supportsProjectedCredentials: true`.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "consumer enablement and the two projected-credential rollout gates are independent opt-ins"
+)]
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConsumerConfig {
@@ -783,10 +815,32 @@ pub struct ConsumerConfig {
     #[serde(default)]
     pub enabled: bool,
 
+    /// Generate the dynamic `credential_inject` filter and projected mount
+    /// root, including when the current overlay has no credentials. Enable this
+    /// first, then roll out the generated config before asserting readiness
+    /// with `supportsProjectedCredentials`.
+    ///
+    /// Default: `false`.
+    #[serde(default)]
+    pub enable_projected_credentials: bool,
+
+    /// Declare that the running consumer has the dynamic `credential_inject`
+    /// filter configured with the projected Secret mount root. This is a
+    /// fail-closed capability gate for credential-bearing overlay revisions.
+    /// Set it only after the consumer has loaded a config containing that
+    /// filter; the Grid operator does not own or roll out the consumer
+    /// Deployment.
+    ///
+    /// Default: `false`.
+    #[serde(default)]
+    pub supports_projected_credentials: bool,
+
     /// Base directory for mounted credential Secret files inside the consumer pod.
     ///
-    /// Each credential Secret is expected to be mounted at
-    /// `{credentialMountBase}/{secret-name}/{secret-key}`.
+    /// In projected-credential mode, mount each Secret at
+    /// `{credentialMountBase}/{secret-namespace}/{secret-name}` with its data
+    /// keys as files. Static `file:` entries continue to use their explicit
+    /// paths and are not constrained by this directory layout.
     ///
     /// Default: `/run/secrets/grid-credentials`.
     #[serde(default = "default_credential_mount_base")]
@@ -800,10 +854,10 @@ pub struct ConsumerConfig {
 
     /// Endpoint topology for the generated `load_balancer` section.
     ///
-    /// Each entry maps a routing candidate cluster name to a reachable endpoint
-    /// address with explicit transport configuration.  Every cluster referenced
-    /// by a routing candidate must have a matching entry here with a non-`None`
-    /// `transport` field.
+    /// Each entry maps a potentially routable cluster name to a reachable
+    /// endpoint address with explicit transport configuration. Every cluster
+    /// referenced by an overlay candidate must have a matching entry here with
+    /// a non-`None` `transport` field.
     ///
     /// Missing endpoint topology causes config generation to fail with
     /// `MissingClusterEndpoint`.  Missing transport fails with
@@ -842,6 +896,8 @@ impl Default for ConsumerConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            enable_projected_credentials: false,
+            supports_projected_credentials: false,
             credential_mount_base: default_credential_mount_base(),
             config_map_name: default_consumer_config_map_name(),
             cluster_endpoints: Vec::new(),
@@ -886,11 +942,28 @@ pub struct EndpointTransport {
     pub sni: Option<String>,
 }
 
+/// Explicit verified-mTLS endpoint identity trusted for embedded provider-hop
+/// context. This does not configure the gateway's upstream TLS connection; the
+/// embedded gateway must separately use verified TLS with this SNI; the
+/// gateway checks the two configurations before serving hop traffic.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderHopEndpointConfig {
+    /// Cluster name used by the embedded gateway's `load_balancer` filter.
+    pub cluster: String,
+
+    /// TLS mode and SNI configured for that embedded gateway upstream.
+    pub transport: EndpointTransport,
+}
+
 /// Endpoint configuration for one consumer `load_balancer` cluster.
 ///
 /// Maps a routing candidate cluster name to a reachable provider gateway
-/// endpoint with explicit transport intent.  Every cluster referenced by
-/// a routing candidate must have a matching entry.
+/// endpoint with explicit transport intent. Every cluster referenced by a
+/// routing candidate must have a matching entry. Consumer config generation
+/// also treats `mutual_tls` entries as authenticated provider-gateway hops and
+/// emits their names in `intelligent_route.provider_hop_clusters` so the
+/// provider's `provider_route` filter receives its routing context.
 ///
 /// # Transport requirement
 ///
@@ -1466,6 +1539,8 @@ mod tests {
             "namespace": "ns",
             "consumerConfig": {
                 "enabled": true,
+                "enableProjectedCredentials": true,
+                "supportsProjectedCredentials": true,
                 "credentialMountBase": "/run/secrets/grid",
                 "configMapName": "my-consumer-config",
                 "tlsCertMountPath": "/etc/custom-tls",
@@ -1482,6 +1557,14 @@ mod tests {
         let gw: GatewayRef = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
         let cc = gw.consumer_config.unwrap_or_else(|| std::process::abort());
         assert!(cc.enabled, "enabled must round-trip");
+        assert!(
+            cc.enable_projected_credentials,
+            "projected filter opt-in must round-trip"
+        );
+        assert!(
+            cc.supports_projected_credentials,
+            "projected credential readiness must round-trip"
+        );
         assert_eq!(
             cc.credential_mount_base, "/run/secrets/grid",
             "credentialMountBase must round-trip"
@@ -1542,6 +1625,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "asserts every ConsumerConfig default as one contract"
+    )]
     fn consumer_config_defaults_when_subfields_absent() {
         let json = serde_json::json!({
             "name": "gw",
@@ -1551,6 +1638,14 @@ mod tests {
         let gw: GatewayRef = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
         let cc = gw.consumer_config.unwrap_or_else(|| std::process::abort());
         assert!(!cc.enabled, "enabled must default to false");
+        assert!(
+            !cc.enable_projected_credentials,
+            "projected filter opt-in must default off"
+        );
+        assert!(
+            !cc.supports_projected_credentials,
+            "projected credentials must default closed"
+        );
         assert_eq!(
             cc.credential_mount_base, "/run/secrets/grid-credentials",
             "credentialMountBase must use default"
@@ -1575,6 +1670,7 @@ mod tests {
             name: "gw".to_owned(),
             namespace: "ns".to_owned(),
             local_site_name: None,
+            provider_hop_endpoints: Vec::new(),
             consumer_config: None,
         };
         let json = serde_json::to_value(&gw).unwrap_or_else(|_| std::process::abort());
@@ -1594,6 +1690,10 @@ mod tests {
         assert!(
             gateway_ref_properties.contains_key("consumerConfig"),
             "CRD schema must include consumerConfig field on GatewayRef"
+        );
+        assert!(
+            gateway_ref_properties.contains_key("providerHopEndpoints"),
+            "CRD schema must include independent providerHopEndpoints on GatewayRef"
         );
         let consumer_config_properties = gateway_ref_properties
             .get("consumerConfig")

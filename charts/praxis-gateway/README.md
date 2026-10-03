@@ -343,6 +343,22 @@ balancing and includes Basic Auth. It does not include the optional
 qualification. That qualification is not supported by this default image; AGN
 does not publish a replacement AI rollup.
 
+The default image predates empty versioned routing snapshots and is not
+compatible with Grid's authoritative no-route publication. The paired Praxis AI
+change must be released, and this chart's default image must be updated to that
+compatible release, before the next Grid release. Upgrade and roll every
+consumer of a Grid-managed overlay before deploying that Grid version.
+
+Generated consumer credentials use a separate two-step opt-in: set
+`consumerConfig.enableProjectedCredentials: true`, let Grid render the filter,
+and roll out the consumer with the read-only Secret mounts. In this mode, mount
+each Secret at `{credentialMountBase}/{secret-namespace}/{secret-name}`, with
+its data keys as files (for example,
+`/run/secrets/grid-credentials/grid-system/provider-key/token`). Static `file:`
+entries continue to use their explicitly configured paths. Only then set
+`consumerConfig.supportsProjectedCredentials: true`; Grid retains credential-
+bearing overlays until that readiness attestation is present.
+
 ### Edge and provider gateways in AGN
 
 AGN runs this chart in two roles with different values:
@@ -384,9 +400,25 @@ each model to the least-loaded admitted site. The chosen candidate's cluster mus
 name a `gatewayConfig.backends` cluster, so give each backend the operator's
 candidate cluster (the provider's `routingClusterRef`, else its name).
 
-The gateway reads the file only at start. When the ConfigMap's
-`grid.praxis-proxy.io/serving-digest` annotation changes, restart the gateway
-(`kubectl rollout restart`).
+The gateway watches the projected serving file and applies valid candidate,
+provider-hop, and peer revisions without a restart. A valid empty candidate
+revision becomes an active no-route snapshot. Malformed updates retain the
+last working revision. Static Praxis configuration changes and serving
+settings that require a new runtime, such as `window_secs`, still require a
+gateway restart.
+
+Place `grid_site_route` before any other cluster-selecting filter for models
+managed by this serving config. A valid empty snapshot rejects model-bearing
+requests even if an earlier filter preselected a cluster. With a non-empty
+snapshot, an earlier selection retains normal pipeline precedence; ordering
+Grid routing first ensures later candidate withdrawals cannot be bypassed.
+
+For authenticated provider hops, `GatewayRef.providerHopEndpoints` and the
+corresponding `gatewayConfig.backends` entry must name the same cluster and
+TLS SNI. The embedded gateway verifies that the loaded backend has CA
+verification and a client certificate before enabling provider-hop context;
+a mismatch fails startup or rejects the serving revision. The Praxis backend
+configuration is fixed for the life of a `gridServing` gateway process.
 
 Known limits:
 

@@ -706,6 +706,8 @@ spec:
                     - `MetricsTlsSecretMissing`, `MetricsTlsKeyMissing`, `MetricsTlsMaterialInvalid`, `MetricsTlsIdentityMismatch`
                     - `HealthCheckTlsSecretMissing`, `HealthCheckTlsKeyMissing`, `HealthCheckTlsMaterialInvalid`,
                       `HealthCheckTlsIdentityMismatch`
+                    - `NoMatchingSites`: this generation's selector matches no known `GridSite`; remote sites must not treat its
+                      `Pending` phase as routable.
                   nullable: true
                   type: string
               type: object

@@ -23,6 +23,7 @@ async-trait = "0.1"
 tracing = "0.1"
 http = "1"
 rustls = { version = "0.23", features = ["ring"] }
+sha2 = "0.10"
 
 [dev-dependencies]
 # The flow tests bind a mock TLS peer to drive the real scrape path.
