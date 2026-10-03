@@ -331,6 +331,7 @@ mod live {
             ca: SharedCa::new(ca),
             authorizer: Authorizer::Local(GridAdmins::from_table("admin: good-admin\n")),
             cert_lifetime: certs::DEFAULT_SITE_CERT_LIFETIME,
+            reserved_sites: Vec::new(),
         });
         listen_after(port, after, serving, router(Arc::clone(&state))).await;
         (state, minter, admin)

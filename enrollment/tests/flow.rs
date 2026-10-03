@@ -13,7 +13,7 @@ use axum::{
     body::Body,
     http::{Request, StatusCode},
 };
-use enrollment::{AppState, GridAdmins, SharedCa, Store, authz::Authorizer, router};
+use enrollment::{AppState, GridAdmins, NewSiteToken, SharedCa, Store, authz::Authorizer, router};
 use http_body_util::BodyExt as _;
 use rcgen::{CertificateParams, DnType, KeyPair, SanType};
 use serde_json::{Value, json};
@@ -30,6 +30,19 @@ fn service() -> axum::Router {
         ca: SharedCa::new(ca),
         authorizer: Authorizer::Local(GridAdmins::from_table("tester: t0ken\n")),
         cert_lifetime: certs::DEFAULT_SITE_CERT_LIFETIME,
+        reserved_sites: Vec::new(),
+    }))
+}
+
+/// A service over `store` that reserves `reserved`, the hub's own name.
+fn service_reserving(store: Store, reserved: &str) -> axum::Router {
+    let ca = certs::generate_ca("test-grid-ca").expect("ca");
+    router(Arc::new(AppState {
+        store,
+        ca: SharedCa::new(ca),
+        authorizer: Authorizer::Local(GridAdmins::from_table("tester: t0ken\n")),
+        cert_lifetime: certs::DEFAULT_SITE_CERT_LIFETIME,
+        reserved_sites: vec![reserved.to_owned()],
     }))
 }
 
@@ -368,4 +381,47 @@ async fn the_ca_endpoint_is_gone() {
         StatusCode::NOT_FOUND,
         "the CA rides back in the enroll response, so there is no standalone CA endpoint"
     );
+}
+
+#[tokio::test]
+async fn a_reserved_name_cannot_be_minted() {
+    let app = service_reserving(Store::memory(), "hub");
+    let (status, body) = call_as_admin(
+        &app,
+        "POST",
+        "/v1alpha1/enrollmenttokens",
+        Some(json!({ "siteName": "hub", "gridNetworkRef": "demo-grid" })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "the hub's name is issued outside enrollment"
+    );
+    assert_eq!(body["error"], "name_taken");
+}
+
+#[tokio::test]
+async fn a_token_minted_before_the_reservation_cannot_claim_it() {
+    let store = Store::memory();
+    let token = "pre-reservation-token";
+    let token_sha256: String = certs::sha256(token.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    store
+        .mint_site_token(NewSiteToken {
+            token_sha256,
+            site_name: "hub".to_owned(),
+            grid_network_ref: "demo-grid".to_owned(),
+            issued_by: "tester".to_owned(),
+            expires_at: time::OffsetDateTime::now_utc() + time::Duration::hours(1),
+        })
+        .await
+        .expect("mint");
+    let app = service_reserving(store, "hub");
+
+    let (status, body) = enroll(&app, token, &plain_csr()).await;
+    assert_eq!(status, StatusCode::CONFLICT, "no second identity for the hub");
+    assert_eq!(body["error"], "name_taken");
 }

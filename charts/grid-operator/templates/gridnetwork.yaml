@@ -1,0 +1,48 @@
+{{- include "grid-operator.normalize" . }}
+{{- include "grid-operator.validateGrid" . }}
+{{- with .Values.grid }}
+{{- if .id }}
+apiVersion: grid.praxis.fast/v1alpha1
+kind: GridNetwork
+metadata:
+  name: {{ .network }}
+  labels:
+    {{- include "grid-operator.labels" $ | nindent 4 }}
+    grid.praxis.fast/auto-discover-sites: "true"
+  annotations:
+    {{- include "grid-operator.afterCrds" $ | nindent 4 }}
+spec:
+  gridId: {{ .id | quote }}
+  {{- with .seeds }}
+  seeds:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with .signals }}
+  signalTransport:
+    mode: {{ . | quote }}
+  {{- end }}
+  {{- with .peerTrust }}
+  peerTrust:
+    mode: {{ . | quote }}
+  {{- end }}
+  {{- with $.Values.gateway.serviceName }}
+  gatewayRefs:
+    - name: {{ . | quote }}
+      namespace: {{ $.Values.gateway.namespace | default $.Release.Namespace | quote }}
+      localSiteName: {{ $.Values.swim.siteName | quote }}
+  {{- end }}
+  {{- $e := $.Values.enrollment }}
+  tls:
+    siteSecretRef:
+      name: {{ $e.identitySecretName | default "grid-site-identity" | quote }}
+      namespace: {{ $.Release.Namespace | quote }}
+    caSecretRef:
+      name: {{ $e.caSecretName | default "grid-ca" | quote }}
+      namespace: {{ $.Release.Namespace | quote }}
+    {{- with .swimKeySecretName }}
+    swimKeyRef:
+      name: {{ . | quote }}
+      namespace: {{ $.Release.Namespace | quote }}
+    {{- end }}
+{{- end }}
+{{- end }}

@@ -128,3 +128,13 @@ tests:
       image.digest: latest
     asserts:
       - failedTemplate: {}
+
+  - it: reserves the hub's name so no token can claim it
+    set:
+      hubSite.name: hub
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: ENROLLMENT_RESERVED_SITES
+            value: hub

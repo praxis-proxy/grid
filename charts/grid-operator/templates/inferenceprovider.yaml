@@ -1,0 +1,66 @@
+{{- include "grid-operator.normalize" . }}
+{{- if .Values.grid.id }}
+{{- range $name := keys (.Values.grid.providers | default dict) | sortAlpha }}
+{{- $p := deepCopy (get $.Values.grid.providers $name | default dict) }}
+{{- $model := $p.model | default $name }}
+{{- $_ := unset $p "model" }}
+{{- $defaults := dict "name" $name "gridNetworkRef" $.Values.grid.network "providerKind" "vllm" "backendKind" "local_model" "models" (list (dict "name" $model "capabilities" (list "text_generation"))) }}
+{{- with merge $p $defaults }}
+---
+apiVersion: grid.praxis.fast/v1alpha1
+kind: InferenceProvider
+metadata:
+  name: {{ required "grid.providers.name is required" .name }}
+  labels:
+    {{- include "grid-operator.labels" $ | nindent 4 }}
+  annotations:
+    {{- include "grid-operator.afterCrds" $ | nindent 4 }}
+spec:
+  gridNetworkRef: {{ required "grid.providers.gridNetworkRef is required" .gridNetworkRef }}
+  providerKind: {{ required "grid.providers.providerKind is required" .providerKind }}
+  backendKind: {{ required "grid.providers.backendKind is required" .backendKind }}
+  endpoint: {{ required "grid.providers.endpoint is required" .endpoint | quote }}
+  {{- with .capacityWeight }}
+  capacityWeight: {{ . }}
+  {{- end }}
+  {{- with .routingClusterRef }}
+  routingClusterRef: {{ . | quote }}
+  {{- end }}
+  {{- with .siteSelector }}
+  siteSelector:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with .accessPolicy }}
+  accessPolicy:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with .models }}
+  models:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with .auth }}
+  auth:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with .cost }}
+  cost:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with .healthCheck }}
+  healthCheck:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with .metricsConfig }}
+  metricsConfig:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with .gatewayRef }}
+  gatewayRef: {{ . | quote }}
+  {{- end }}
+  {{- with .trafficPolicy }}
+  trafficPolicy:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{- end }}
+{{- end }}
+{{- end }}
