@@ -8,6 +8,15 @@ metadata:
   name: {{ include "praxis-gateway.fullname" . }}
   labels:
     {{- include "praxis-gateway.labels" . | nindent 4 }}
+  {{- if .Values.mountReconciliation.enabled }}
+  annotations:
+    grid.praxis-proxy.io/mount-reconciliation: "enabled"
+    grid.praxis-proxy.io/network: {{ .Values.mountReconciliation.network | quote }}
+    grid.praxis-proxy.io/gateway: {{ (.Values.mountReconciliation.gatewayRef | default (include "praxis-gateway.fullname" .)) | quote }}
+    {{- if .Values.gridServing.enabled }}
+    grid.praxis-proxy.io/grid-serving-tls: "chart-managed"
+    {{- end }}
+  {{- end }}
 spec:
   replicas: {{ .Values.replicaCount }}
   selector:
@@ -228,7 +237,7 @@ spec:
               mountPath: {{ .Values.overlay.mountPath | quote }}
               readOnly: true
             {{- end }}
-            {{- if .Values.tls.enabled }}
+            {{- if and .Values.tls.enabled (or (not .Values.mountReconciliation.enabled) (not .Values.mountReconciliation.releaseHelmMounts) .Values.gridServing.enabled) }}
             - name: tls
               mountPath: {{ .Values.tls.mountPath | quote }}
               readOnly: true
@@ -263,9 +272,11 @@ spec:
               readOnly: true
             {{- end }}
             {{- range .Values.credentials }}
+            {{- if or (not $.Values.mountReconciliation.enabled) (not $.Values.mountReconciliation.releaseHelmMounts) (not (has .name $.Values.mountReconciliation.managedCredentialNames)) }}
             - name: credential-{{ .name }}
               mountPath: {{ .mountPath | quote }}
               readOnly: true
+            {{- end }}
             {{- end }}
       volumes:
         - name: config
@@ -321,7 +332,7 @@ spec:
             {{- end }}
         {{- end }}
         {{- end }}
-        {{- if .Values.tls.enabled }}
+        {{- if and .Values.tls.enabled (or (not .Values.mountReconciliation.enabled) (not .Values.mountReconciliation.releaseHelmMounts) .Values.gridServing.enabled) }}
         - name: tls
           {{- if include "praxis-gateway.caSecret" . }}
           projected:
@@ -379,10 +390,12 @@ spec:
             secretName: {{ .Values.gatewayConfig.listenerTls.existingSecret | quote }}
         {{- end }}
         {{- range .Values.credentials }}
+        {{- if or (not $.Values.mountReconciliation.enabled) (not $.Values.mountReconciliation.releaseHelmMounts) (not (has .name $.Values.mountReconciliation.managedCredentialNames)) }}
         - name: credential-{{ .name }}
           secret:
             secretName: {{ .name | quote }}
             optional: {{ .optional | default false }}
+        {{- end }}
         {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:

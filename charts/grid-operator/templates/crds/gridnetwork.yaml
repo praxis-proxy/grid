@@ -212,9 +212,8 @@ spec:
 
                                 The `transport` field is required.  Missing transport fails closed
                                 during config rendering with status reason `MissingTransport`.
-                                When `transport.mode` is `mutual_tls`, `transport.sni` must also
-                                be present and non-blank; otherwise rendering fails with status
-                                reason `MissingSni`.
+                                Both TLS modes require nonblank `transport.sni`; otherwise rendering fails
+                                with status reason `MissingSni`. `tls` can declare a custom CA Secret.
                               properties:
                                 address:
                                   description: Reachable endpoint address (`host:port`).
@@ -231,16 +230,44 @@ spec:
                                     Missing transport fails closed during config rendering.
                                   nullable: true
                                   properties:
+                                    caSecretRef:
+                                      description: |-
+                                        Optional Secret supplying a custom CA bundle for `tls` transport.
+                                        The mounted path is `/run/secrets/grid-backend-ca/{secret-name}/{key}`;
+                                        the key defaults to `ca.crt`. Omitted uses the process trust store.
+                                      nullable: true
+                                      properties:
+                                        key:
+                                          description: |-
+                                            Key within the Secret's `data` map.
+
+                                            Required when the Secret holds multiple keys (e.g. credential references
+                                            in `InferenceProvider.spec.auth.secretRef`).  Omit only when the entire
+                                            Secret is consumed (e.g. TLS `ca_secret_ref`).
+                                          minLength: 1
+                                          nullable: true
+                                          type: string
+                                        name:
+                                          description: Secret name.
+                                          minLength: 1
+                                          type: string
+                                        namespace:
+                                          description: Secret namespace.
+                                          minLength: 1
+                                          type: string
+                                      required:
+                                        - name
+                                        - namespace
+                                      type: object
                                     mode:
-                                      description: 'Transport mode: `mutual_tls` or `plaintext`.'
+                                      description: 'Transport mode: `mutual_tls`, `tls`, or explicit `plaintext`.'
                                       enum:
                                         - mutual_tls
+                                        - tls
                                         - plaintext
                                       type: string
                                     sni:
-                                      description: |-
-                                        TLS Server Name Indication (required when mode is `mutual_tls`;
-                                        must not be set when mode is `plaintext`).
+                                      description: TLS Server Name Indication, required when mode is `mutual_tls` or `tls`.
                                       nullable: true
                                       type: string
                                   required:
@@ -287,6 +314,32 @@ spec:
                             maximum: 65535.0
                             minimum: 0.0
                             type: integer
+                          mountReconciliation:
+                            description: |-
+                              Opt in to validating Secret references and reconciling required mounts
+                              into a specifically delegated gateway Deployment.
+
+                              Disabled by default. When enabled, the named Deployment must carry the
+                              `grid.praxis-proxy.io/mount-reconciliation`, `.../network`, and
+                              `.../gateway` annotations emitted by `charts/praxis-gateway` (or set
+                              them explicitly on an externally managed Deployment).
+                            nullable: true
+                            properties:
+                              containerName:
+                                default: praxis
+                                description: Name of the Praxis container whose mounts Grid manages.
+                                minLength: 1
+                                type: string
+                              deploymentName:
+                                description: Name of the opted-in Deployment in the gateway namespace.
+                                minLength: 1
+                                nullable: true
+                                type: string
+                              enabled:
+                                default: false
+                                description: Enable delegated mount reconciliation. Defaults to `false`.
+                                type: boolean
+                            type: object
                           tlsCertMountPath:
                             default: /etc/praxis/tls
                             description: |-
@@ -742,6 +795,67 @@ spec:
                   default: ""
                   description: The negotiated grid ID.
                   type: string
+                mountReconciliationStatus:
+                  description: |-
+                    Per-gateway Secret requirements and optional mount reconciliation status.
+
+                    Populated for every gateway with `consumerConfig.enabled: true`. Without
+                    explicit mount reconciliation, the phase remains `RequirementsRendered`.
+                  items:
+                    description: Per-gateway progress for Secret mount reconciliation and gateway readiness.
+                    properties:
+                      appliedRevision:
+                        default: ""
+                        description: Digest last mounted and rolled out by Grid.
+                        type: string
+                      deploymentGeneration:
+                        default: 0
+                        description: Observed Deployment generation, or zero before it is observed.
+                        format: int64
+                        type: integer
+                      deploymentName:
+                        description: Delegated Deployment name. Absent when Grid only publishes requirements.
+                        nullable: true
+                        type: string
+                      gatewayName:
+                        description: Gateway reference name.
+                        type: string
+                      message:
+                        default: ""
+                        description: Human-readable diagnostic containing identifiers and paths only.
+                        type: string
+                      namespace:
+                        description: Namespace containing the Deployment and Secret references.
+                        type: string
+                      observedGeneration:
+                        default: 0
+                        description: Observed `GridNetwork` generation.
+                        format: int64
+                        type: integer
+                      phase:
+                        description: Current mount lifecycle phase.
+                        enum:
+                          - RequirementsRendered
+                          - WaitingForSecret
+                          - MountsReconciling
+                          - WaitingForRollout
+                          - Ready
+                          - Error
+                        type: string
+                      reason:
+                        default: ""
+                        description: Stable machine-readable cause; empty on `Ready`.
+                        type: string
+                      requirementsRevision:
+                        default: ""
+                        description: Digest of canonical requirements, containing no Secret bytes.
+                        type: string
+                    required:
+                      - gatewayName
+                      - namespace
+                      - phase
+                    type: object
+                  type: array
                 observedGeneration:
                   default: 0
                   description: Last observed generation.

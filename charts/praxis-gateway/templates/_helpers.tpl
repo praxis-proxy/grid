@@ -336,6 +336,26 @@ carry a sni.
 Validate enabled mounts have a non-empty resource name.
 */}}
 {{- define "praxis-gateway.validateMounts" -}}
+{{- if .Values.mountReconciliation.enabled }}
+{{- if not .Values.mountReconciliation.network }}
+{{- fail "mountReconciliation.network is required when mount reconciliation is enabled" }}
+{{- end }}
+{{- if ne (.Values.gatewayConfig.role | default "consumer") "consumer" }}
+{{- fail "mount reconciliation is supported for consumer gateways only" }}
+{{- end }}
+{{- if .Values.gatewayConfig.render }}
+{{- fail "mount reconciliation requires the operator-generated consumer ConfigMap, not gatewayConfig.render" }}
+{{- end }}
+{{- if not .Values.config.existingConfigMap }}
+{{- fail "config.existingConfigMap must name consumerConfig.configMapName when mount reconciliation is enabled" }}
+{{- end }}
+{{- if ne .Values.config.key "praxis.yaml" }}
+{{- fail "config.key must be praxis.yaml when mount reconciliation is enabled" }}
+{{- end }}
+{{- end }}
+{{- if and .Values.mountReconciliation.releaseHelmMounts (not .Values.mountReconciliation.enabled) }}
+{{- fail "mountReconciliation.releaseHelmMounts requires mountReconciliation.enabled" }}
+{{- end }}
 {{- if and .Values.overlay.enabled (not .Values.overlay.existingConfigMap) }}
 {{- fail "overlay.existingConfigMap is required when overlay.enabled is true" }}
 {{- end }}
@@ -350,6 +370,9 @@ Validate enabled mounts have a non-empty resource name.
 {{- end }}
 {{- with (.Values.gridServing | default dict) }}
 {{- if .enabled }}
+{{- if ne $.Values.tls.mountPath "/etc/praxis/tls" }}
+{{- fail "gridServing requires tls.mountPath=/etc/praxis/tls because its peer pollers read TLS files from that path" }}
+{{- end }}
 {{- $name := include "praxis-gateway.servingConfigMap" $ }}
 {{- if not $name }}
 {{- fail "gridServing needs gridServing.network, the GridNetwork name, or gridServing.configMap" }}

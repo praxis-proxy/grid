@@ -31,6 +31,24 @@ podLabels: {}
 # -- Annotations on the gateway pod template.
 podAnnotations: {}
 
+# -- Delegate generated Secret mounts to the Grid operator for an opted-in
+# GridNetwork gateway. Grid owns only its reserved volumes and mounts.
+mountReconciliation:
+  # -- Annotate this Deployment so the operator can verify explicit ownership.
+  enabled: false
+  # -- GridNetwork name that delegates this gateway's generated mounts.
+  network: ""
+  # -- GridNetwork gatewayRefs name. Defaults to this chart's Deployment name.
+  gatewayRef: ""
+  # -- Release selected Helm-managed credential mounts, and TLS mounts when
+  # gridServing is disabled, after Grid reports the generated config Ready.
+  # Keep false during the preparation rollout.
+  releaseHelmMounts: false
+  # -- Credential Secret names whose mounts Grid now owns. Other entries in
+  # credentials remain Helm-managed and are rendered as before. These mounts
+  # are omitted only when releaseHelmMounts is true.
+  managedCredentialNames: []
+
 # -- Extra pod-level securityContext fields (e.g. runAsUser, runAsGroup).
 # runAsNonRoot and seccompProfile are always set by the chart.
 podSecurityContext: {}
