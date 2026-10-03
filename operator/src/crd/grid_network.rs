@@ -225,7 +225,7 @@ pub enum PlacementStrategy {
 }
 
 /// Traffic placement policy. This static stack intentionally has no metric inputs.
-#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
 pub struct PlacementPolicyConfig {
@@ -548,6 +548,32 @@ pub fn resolve_budget_statuses(
 // Spec
 // ---------------------------------------------------------------------------
 
+/// Add deprecated top-level `GridNetwork` field names to the generated schema.
+fn add_grid_network_spec_legacy_fields(schema: &mut schemars::Schema) {
+    crate::crd::add_legacy_field_aliases(schema, &[("gatewayRefs", "consumerGateways")]);
+}
+
+/// Add deprecated gateway-reference field names to the generated schema.
+fn add_gateway_ref_legacy_fields(schema: &mut schemars::Schema) {
+    crate::crd::add_legacy_field_aliases(
+        schema,
+        &[("localSiteName", "siteName"), ("consumerConfig", "praxisConfig")],
+    );
+}
+
+/// Add deprecated Praxis config field names to the generated schema.
+fn add_consumer_config_legacy_fields(schema: &mut schemars::Schema) {
+    crate::crd::add_legacy_field_aliases(
+        schema,
+        &[("enabled", "generate"), ("credentialMountBase", "credentialMountPath")],
+    );
+}
+
+/// Add the deprecated SWIM key field to the generated schema.
+fn add_tls_config_legacy_fields(schema: &mut schemars::Schema) {
+    crate::crd::add_legacy_field_aliases(schema, &[("swimKeyRef", "swimKeySecretRef")]);
+}
+
 /// Specification for a [`GridNetwork`].
 ///
 /// Defines the grid's seed peers, gateway associations, SWIM
@@ -569,6 +595,7 @@ pub fn resolve_budget_statuses(
     "rule": "has(self.placementPolicy) == (has(self.selectionPolicy) && self.selectionPolicy.mode == 'weightedRandom')",
     "message": "placementPolicy must be set if and only if selectionPolicy.mode is weightedRandom"
 }]))]
+#[schemars(transform = add_grid_network_spec_legacy_fields)]
 #[serde(rename_all = "camelCase")]
 pub struct GridNetworkSpec {
     /// Grid ID for tenancy. Empty on creation; auto-generated
@@ -582,7 +609,7 @@ pub struct GridNetworkSpec {
     pub seeds: Vec<String>,
 
     /// References to Praxis Gateways that participate in this grid.
-    #[serde(default)]
+    #[serde(default, alias = "gatewayRefs")]
     pub consumer_gateways: Vec<GatewayRef>,
 
     /// Region where this site is deployed.
@@ -722,6 +749,7 @@ pub struct GridNetworkSpec {
 
 /// Reference to a Praxis Gateway that participates in this grid.
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
+#[schemars(transform = add_gateway_ref_legacy_fields)]
 #[serde(rename_all = "camelCase")]
 pub struct GatewayRef {
     /// Gateway name.
@@ -743,7 +771,7 @@ pub struct GatewayRef {
     ///
     /// [`GridSite`]: crate::crd::grid_site::GridSite
     /// [`GridNetwork`]: crate::crd::grid_network::GridNetwork
-    #[serde(default)]
+    #[serde(default, alias = "localSiteName")]
     pub site_name: Option<String>,
 
     /// Opt-in configuration for operator-managed consumer Praxis config generation.
@@ -758,7 +786,7 @@ pub struct GatewayRef {
     /// routing overlay for dedicated data-plane pipelines.
     ///
     /// The generated `ConfigMap` contains no token bytes.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, alias = "consumerConfig", skip_serializing_if = "Option::is_none")]
     pub praxis_config: Option<ConsumerConfig>,
 }
 
@@ -782,12 +810,13 @@ pub struct GatewayRef {
 /// entries use a `file:` source under `credentialMountPath`; the mounted
 /// Kubernetes Secret provides the token at runtime.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[schemars(transform = add_consumer_config_legacy_fields)]
 #[serde(rename_all = "camelCase")]
 pub struct ConsumerConfig {
     /// Enable operator-managed consumer Praxis config generation for this gateway.
     ///
     /// Default: `false`.  Set to `true` to opt in.
-    #[serde(default)]
+    #[serde(default, alias = "enabled")]
     pub generate: bool,
 
     /// Base directory for mounted credential Secret files inside the consumer pod.
@@ -796,7 +825,7 @@ pub struct ConsumerConfig {
     /// `{credentialMountPath}/{secret-name}/{secret-key}`.
     ///
     /// Default: `/run/secrets/grid-credentials`.
-    #[serde(default = "default_credential_mount_path")]
+    #[serde(default = "default_credential_mount_path", alias = "credentialMountBase")]
     pub credential_mount_path: String,
 
     /// Name of the generated consumer Praxis `ConfigMap`.
@@ -1095,6 +1124,7 @@ pub struct SwimConfig {
 
 /// TLS configuration for grid certificate management.
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema, Serialize)]
+#[schemars(transform = add_tls_config_legacy_fields)]
 #[serde(rename_all = "camelCase")]
 #[expect(
     clippy::struct_field_names,
@@ -1108,6 +1138,7 @@ pub struct TlsConfig {
     pub site_secret_ref: Option<SecretRef>,
 
     /// Secret storing the SWIM encryption key.
+    #[serde(alias = "swimKeyRef")]
     pub swim_key_secret_ref: Option<SecretRef>,
 }
 

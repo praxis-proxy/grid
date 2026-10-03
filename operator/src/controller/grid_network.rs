@@ -4111,21 +4111,21 @@ fn log_stub(site: &DiscoveredSite, network_name: &str, noteworthy: bool) {
     }
 }
 
-/// Whether applying `site` creates its stub or changes the egress or certificate the stub carries.
+/// Whether applying `site` creates its stub or changes the gateway endpoint or certificate the stub carries.
 fn stub_changed(existing: Option<&GridSite>, site: &DiscoveredSite) -> bool {
     let Some(existing) = existing else {
         return true;
     };
-    let egress = existing
+    let gateway_endpoint = existing
         .spec
-        .egress
+        .gateway_endpoint
         .as_ref()
-        .map_or("", |egress| egress.address.as_str());
+        .map_or("", |endpoint| endpoint.address.as_str());
     let cert = existing
         .status
         .as_ref()
         .and_then(|status| status.public_cert_pem.as_deref());
-    egress != site.egress_address || (site.site_cert_pem.is_some() && cert != site.site_cert_pem.as_deref())
+    gateway_endpoint != site.egress_address || (site.site_cert_pem.is_some() && cert != site.site_cert_pem.as_deref())
 }
 
 /// Derive a Kubernetes resource name for an auto-discovered `GridSite`.
@@ -6343,7 +6343,7 @@ mod tests {
         };
         let spec = discovered_site_spec(&site, "net", true);
         assert_eq!(
-            spec.pointer("/spec/egress/tls"),
+            spec.pointer("/spec/gatewayEndpoint/tls"),
             Some(&serde_json::json!({ "mode": "Plaintext" }))
         );
     }
@@ -6641,7 +6641,7 @@ mod tests {
         };
         let spec = discovered_site_spec(&site, "net", false);
         assert_eq!(
-            spec.pointer("/spec/egress/tls/serverName")
+            spec.pointer("/spec/gatewayEndpoint/tls/serverName")
                 .and_then(serde_json::Value::as_str),
             Some("remote.grid.internal")
         );

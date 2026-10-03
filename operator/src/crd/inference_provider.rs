@@ -23,6 +23,19 @@ use super::{
 // Spec
 // ---------------------------------------------------------------------------
 
+/// Add deprecated `InferenceProvider` field names to the generated schema.
+fn add_inference_provider_legacy_fields(schema: &mut schemars::Schema) {
+    crate::crd::add_legacy_field_aliases(
+        schema,
+        &[("gatewayRef", "providerGateway"), ("routingClusterRef", "clusterName")],
+    );
+}
+
+/// Add the deprecated metrics endpoint field to the generated schema.
+fn add_metrics_config_legacy_fields(schema: &mut schemars::Schema) {
+    crate::crd::add_legacy_field_aliases(schema, &[("metricsEndpoint", "endpoint")]);
+}
+
 /// Specification for an [`InferenceProvider`].
 #[derive(Clone, CustomResource, Debug, Deserialize, JsonSchema, Serialize)]
 #[kube(
@@ -40,6 +53,7 @@ use super::{
     printcolumn = r#"{"name":"Phase","type":"string","jsonPath":".status.phase","priority":1}"#
 )]
 #[serde(rename_all = "camelCase")]
+#[schemars(transform = add_inference_provider_legacy_fields)]
 pub struct InferenceProviderSpec {
     /// Name of the [`GridNetwork`] this provider belongs to.
     ///
@@ -62,7 +76,7 @@ pub struct InferenceProviderSpec {
     /// operation. It is an explicit control-plane relationship; the operator
     /// never infers it from endpoint URLs.
     #[schemars(length(min = 1))]
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, alias = "gatewayRef", skip_serializing_if = "Option::is_none")]
     pub provider_gateway: Option<String>,
 
     /// Relative capacity used by an opt-in placement policy.
@@ -119,6 +133,7 @@ pub struct InferenceProviderSpec {
     /// `load_balancer` cluster entry.  When absent, `metadata.name` is used.
     ///
     /// [`GridSite`]: crate::crd::grid_site::GridSite
+    #[serde(alias = "routingClusterRef")]
     pub cluster_name: Option<String>,
 
     /// Which sites host this provider.
@@ -169,6 +184,7 @@ pub struct TrafficPolicy {
 /// sample only within `stale_metrics_seconds`; after that the provider is
 /// marked unhealthy and excluded from routing.
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema, Serialize)]
+#[schemars(transform = add_metrics_config_legacy_fields)]
 #[serde(rename_all = "camelCase")]
 pub struct MetricsConfig {
     /// Base URL for the metrics endpoint, independent of `spec.endpoint`.
@@ -180,7 +196,7 @@ pub struct MetricsConfig {
     ///
     /// When absent, the scrape URL uses `spec.endpoint` as before.
     #[schemars(length(min = 1))]
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, alias = "metricsEndpoint", skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
 
     /// HTTP path for the Prometheus metrics endpoint.

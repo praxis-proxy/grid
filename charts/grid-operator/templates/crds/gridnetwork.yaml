@@ -160,11 +160,239 @@ spec:
                       type: array
                   type: object
                 consumerGateways:
-                  default: []
                   description: References to Praxis Gateways that participate in this grid.
                   items:
                     description: Reference to a Praxis Gateway that participates in this grid.
                     properties:
+                      consumerConfig:
+                        description: |-
+                          Deprecated in favor of `praxisConfig`; this legacy field will be removed in a future release. Opt-in configuration for operator-managed consumer Praxis config generation.
+
+                          When absent or `generate: false`, this gateway behaves exactly as before —
+                          only the routing overlay `ConfigMap` is applied.  When `generate: true`, the
+                          operator additionally renders a consumer Praxis `ConfigMap` containing the
+                          inference-model `intelligent_route` candidates (with credential
+                          `secretRef` data), a `credential_inject` section for credential-bearing
+                          inference candidates, and a `load_balancer` section with one cluster
+                          entry per unique inference cluster. Other capability kinds remain in the
+                          routing overlay for dedicated data-plane pipelines.
+
+                          The generated `ConfigMap` contains no token bytes.
+                        nullable: true
+                        properties:
+                          clusterEndpoints:
+                            default: []
+                            description: |-
+                              Endpoint topology for the generated `load_balancer` section.
+
+                              Each entry maps an inference candidate cluster name to a reachable endpoint
+                              address with explicit transport configuration. Every cluster referenced
+                              by a projected inference candidate must have a matching entry here with a
+                              non-`None` `transport` field.
+
+                              Missing endpoint topology causes config generation to fail with
+                              `MissingClusterEndpoint`.  Missing transport fails with
+                              `MissingTransport`.  Mutual-TLS transport without SNI fails with
+                              `MissingSni`.
+
+                              In production, this is populated by whoever manages the consumer gateway
+                              deployment (platform automation, the gateway operator, or a Helm chart).
+                              In local Kind validation, the xtask harness discovers `NodePort` addresses
+                              and populates this field in the test fixture.
+
+                              Default: empty. Supply entries before enabling generated consumer config
+                              for an overlay containing inference candidates.
+                            items:
+                              description: |-
+                                Endpoint configuration for one consumer `load_balancer` cluster.
+
+                                Maps an inference candidate cluster name to a reachable provider gateway
+                                endpoint with explicit transport intent. Every cluster referenced by a
+                                projected inference candidate must have a matching entry.
+
+                                # Transport requirement
+
+                                The `transport` field is required.  Missing transport fails closed
+                                during config rendering with status reason `MissingTransport`.
+                                When `transport.mode` is `mutual_tls`, `transport.sni` must also
+                                be present and non-blank; otherwise rendering fails with status
+                                reason `MissingSni`.
+                              properties:
+                                address:
+                                  description: Reachable endpoint address (`host:port`).
+                                  type: string
+                                cluster:
+                                  description: Cluster name - must match a projected inference `candidate.cluster` value.
+                                  type: string
+                                transport:
+                                  description: |-
+                                    Explicit transport configuration.
+
+                                    Required.  Use `mutual_tls` with `sni` for remote/provider-gateway
+                                    traffic.  Use `plaintext` only for local/dev-only endpoints.
+                                    Missing transport fails closed during config rendering.
+                                  nullable: true
+                                  properties:
+                                    mode:
+                                      description: 'Transport mode: `mutual_tls` or `plaintext`.'
+                                      enum:
+                                        - mutual_tls
+                                        - plaintext
+                                      type: string
+                                    sni:
+                                      description: |-
+                                        TLS Server Name Indication (required when mode is `mutual_tls`;
+                                        must not be set when mode is `plaintext`).
+                                      nullable: true
+                                      type: string
+                                  required:
+                                    - mode
+                                  type: object
+                              required:
+                                - address
+                                - cluster
+                              type: object
+                            type: array
+                          configMapName:
+                            default: praxis-consumer-config
+                            description: |-
+                              Name of the generated consumer Praxis `ConfigMap`.
+
+                              Default: `praxis-consumer-config`.
+                            type: string
+                          credentialMountBase:
+                            description: |-
+                              Deprecated in favor of `credentialMountPath`; this legacy field will be removed in a future release. Base directory for mounted credential Secret files inside the consumer pod.
+
+                              Each credential Secret is expected to be mounted at
+                              `{credentialMountPath}/{secret-name}/{secret-key}`.
+
+                              Default: `/run/secrets/grid-credentials`.
+                            type: string
+                          credentialMountPath:
+                            description: |-
+                              Base directory for mounted credential Secret files inside the consumer pod.
+
+                              Each credential Secret is expected to be mounted at
+                              `{credentialMountPath}/{secret-name}/{secret-key}`.
+
+                              Default: `/run/secrets/grid-credentials`.
+                            type: string
+                          enabled:
+                            description: |-
+                              Deprecated in favor of `generate`; this legacy field will be removed in a future release. Enable operator-managed consumer Praxis config generation for this gateway.
+
+                              Default: `false`.  Set to `true` to opt in.
+                            type: boolean
+                          generate:
+                            description: |-
+                              Enable operator-managed consumer Praxis config generation for this gateway.
+
+                              Default: `false`.  Set to `true` to opt in.
+                            type: boolean
+                          listenerPort:
+                            default: 8080
+                            description: |-
+                              HTTP port for the generated Praxis listener.
+
+                              The rendered `listeners[0].address` is `0.0.0.0:{listenerPort}`.
+
+                              Default: `8080`.
+                            format: uint16
+                            maximum: 65535.0
+                            minimum: 0.0
+                            type: integer
+                          telemetry:
+                            description: |-
+                              Optional OpenTelemetry exporter and sampling settings for this gateway.
+
+                              When present, the generated Praxis configuration opts into telemetry and
+                              adds the `trace_context` filter for outbound W3C header propagation.
+                              Collector authentication must be provided to the gateway Deployment via
+                              `OTEL_EXPORTER_OTLP_HEADERS` from a Secret; credentials are never copied
+                              into this `ConfigMap`.
+                            nullable: true
+                            properties:
+                              batchIntervalSecs:
+                                description: Batch exporter interval in seconds. Must be from 1 through 300 when set.
+                                format: uint64
+                                maximum: 300.0
+                                minimum: 1.0
+                                nullable: true
+                                type: integer
+                              batchSize:
+                                description: Maximum spans per export batch. Must be from 1 through 65,536 when set.
+                                format: uint
+                                maximum: 65536.0
+                                minimum: 1.0
+                                nullable: true
+                                type: integer
+                              environment:
+                                description: Deployment environment resource attribute.
+                                nullable: true
+                                pattern: ^.*\S.*$
+                                type: string
+                              otlpEndpoint:
+                                description: |-
+                                  OTLP collector endpoint, for example `http://otel-collector:4317`.
+
+                                  If omitted, Praxis can read `OTEL_EXPORTER_OTLP_ENDPOINT` from the
+                                  gateway Deployment. An empty string has the same meaning as omission.
+                                nullable: true
+                                pattern: ^(|https?://[^/?#@\s]+(:[0-9]+)?(/[^\s?#]*)?)$
+                                type: string
+                              samplingRate:
+                                description: Root trace sampling probability from `0.0` through `1.0`.
+                                format: double
+                                maximum: 1.0
+                                minimum: 0.0
+                                nullable: true
+                                type: number
+                              serviceName:
+                                description: OpenTelemetry `service.name` resource attribute.
+                                nullable: true
+                                pattern: ^.*\S.*$
+                                type: string
+                              serviceVersion:
+                                description: OpenTelemetry `service.version` resource attribute.
+                                nullable: true
+                                pattern: ^.*\S.*$
+                                type: string
+                            type: object
+                          tlsCertMountPath:
+                            default: /etc/praxis/tls
+                            description: |-
+                              Mount path for TLS certificates inside the consumer pod.
+
+                              Used when rendering mTLS cluster entries from `clusterEndpoints`.
+                              The operator expects the consumer pod to mount a TLS Secret at this path,
+                              containing `ca.crt`, `tls.crt`, and `tls.key`.
+
+                              Default: `/etc/praxis/tls`.
+                            type: string
+                        type: object
+                        x-kubernetes-validations:
+                          - message: set only `enabled` or `generate`, not both
+                            rule: '!(has(self.enabled) && has(self.generate))'
+                          - message: set only `credentialMountBase` or `credentialMountPath`, not both
+                            rule: '!(has(self.credentialMountBase) && has(self.credentialMountPath))'
+                      localSiteName:
+                        description: |-
+                          Deprecated in favor of `siteName`; this legacy field will be removed in a future release. Local site name for the `intelligent_route` overlay generated for this gateway.
+
+                          Identifies which [`GridSite`] this gateway's cluster represents.
+                          Praxis uses `local_site` to score candidates running on the same site
+                          higher than remote candidates.
+
+                          When absent, the [`GridNetwork`] metadata name is used as a fallback.
+                          This is correct for single-site networks where the network name and
+                          site name are the same.  Multi-site networks should set this to the
+                          [`GridSite`] name for the cluster hosting this gateway.
+
+                          [`GridSite`]: crate::crd::grid_site::GridSite
+                          [`GridNetwork`]: crate::crd::grid_network::GridNetwork
+                        nullable: true
+                        type: string
                       name:
                         description: Gateway name.
                         type: string
@@ -267,8 +495,16 @@ spec:
 
                               Default: `praxis-consumer-config`.
                             type: string
+                          credentialMountBase:
+                            description: |-
+                              Deprecated in favor of `credentialMountPath`; this legacy field will be removed in a future release. Base directory for mounted credential Secret files inside the consumer pod.
+
+                              Each credential Secret is expected to be mounted at
+                              `{credentialMountPath}/{secret-name}/{secret-key}`.
+
+                              Default: `/run/secrets/grid-credentials`.
+                            type: string
                           credentialMountPath:
-                            default: /run/secrets/grid-credentials
                             description: |-
                               Base directory for mounted credential Secret files inside the consumer pod.
 
@@ -277,8 +513,13 @@ spec:
 
                               Default: `/run/secrets/grid-credentials`.
                             type: string
+                          enabled:
+                            description: |-
+                              Deprecated in favor of `generate`; this legacy field will be removed in a future release. Enable operator-managed consumer Praxis config generation for this gateway.
+
+                              Default: `false`.  Set to `true` to opt in.
+                            type: boolean
                           generate:
-                            default: false
                             description: |-
                               Enable operator-managed consumer Praxis config generation for this gateway.
 
@@ -365,6 +606,11 @@ spec:
                               Default: `/etc/praxis/tls`.
                             type: string
                         type: object
+                        x-kubernetes-validations:
+                          - message: set only `enabled` or `generate`, not both
+                            rule: '!(has(self.enabled) && has(self.generate))'
+                          - message: set only `credentialMountBase` or `credentialMountPath`, not both
+                            rule: '!(has(self.credentialMountBase) && has(self.credentialMountPath))'
                       siteName:
                         description: |-
                           Local site name for the `intelligent_route` overlay generated for this gateway.
@@ -386,6 +632,490 @@ spec:
                       - name
                       - namespace
                     type: object
+                    x-kubernetes-validations:
+                      - message: set only `localSiteName` or `siteName`, not both
+                        rule: '!(has(self.localSiteName) && has(self.siteName))'
+                      - message: set only `consumerConfig` or `praxisConfig`, not both
+                        rule: '!(has(self.consumerConfig) && has(self.praxisConfig))'
+                  type: array
+                gatewayRefs:
+                  description: Deprecated in favor of `consumerGateways`; this legacy field will be removed in a future release. References to Praxis Gateways that participate in this grid.
+                  items:
+                    description: Reference to a Praxis Gateway that participates in this grid.
+                    properties:
+                      consumerConfig:
+                        description: |-
+                          Deprecated in favor of `praxisConfig`; this legacy field will be removed in a future release. Opt-in configuration for operator-managed consumer Praxis config generation.
+
+                          When absent or `generate: false`, this gateway behaves exactly as before —
+                          only the routing overlay `ConfigMap` is applied.  When `generate: true`, the
+                          operator additionally renders a consumer Praxis `ConfigMap` containing the
+                          inference-model `intelligent_route` candidates (with credential
+                          `secretRef` data), a `credential_inject` section for credential-bearing
+                          inference candidates, and a `load_balancer` section with one cluster
+                          entry per unique inference cluster. Other capability kinds remain in the
+                          routing overlay for dedicated data-plane pipelines.
+
+                          The generated `ConfigMap` contains no token bytes.
+                        nullable: true
+                        properties:
+                          clusterEndpoints:
+                            default: []
+                            description: |-
+                              Endpoint topology for the generated `load_balancer` section.
+
+                              Each entry maps an inference candidate cluster name to a reachable endpoint
+                              address with explicit transport configuration. Every cluster referenced
+                              by a projected inference candidate must have a matching entry here with a
+                              non-`None` `transport` field.
+
+                              Missing endpoint topology causes config generation to fail with
+                              `MissingClusterEndpoint`.  Missing transport fails with
+                              `MissingTransport`.  Mutual-TLS transport without SNI fails with
+                              `MissingSni`.
+
+                              In production, this is populated by whoever manages the consumer gateway
+                              deployment (platform automation, the gateway operator, or a Helm chart).
+                              In local Kind validation, the xtask harness discovers `NodePort` addresses
+                              and populates this field in the test fixture.
+
+                              Default: empty. Supply entries before enabling generated consumer config
+                              for an overlay containing inference candidates.
+                            items:
+                              description: |-
+                                Endpoint configuration for one consumer `load_balancer` cluster.
+
+                                Maps an inference candidate cluster name to a reachable provider gateway
+                                endpoint with explicit transport intent. Every cluster referenced by a
+                                projected inference candidate must have a matching entry.
+
+                                # Transport requirement
+
+                                The `transport` field is required.  Missing transport fails closed
+                                during config rendering with status reason `MissingTransport`.
+                                When `transport.mode` is `mutual_tls`, `transport.sni` must also
+                                be present and non-blank; otherwise rendering fails with status
+                                reason `MissingSni`.
+                              properties:
+                                address:
+                                  description: Reachable endpoint address (`host:port`).
+                                  type: string
+                                cluster:
+                                  description: Cluster name - must match a projected inference `candidate.cluster` value.
+                                  type: string
+                                transport:
+                                  description: |-
+                                    Explicit transport configuration.
+
+                                    Required.  Use `mutual_tls` with `sni` for remote/provider-gateway
+                                    traffic.  Use `plaintext` only for local/dev-only endpoints.
+                                    Missing transport fails closed during config rendering.
+                                  nullable: true
+                                  properties:
+                                    mode:
+                                      description: 'Transport mode: `mutual_tls` or `plaintext`.'
+                                      enum:
+                                        - mutual_tls
+                                        - plaintext
+                                      type: string
+                                    sni:
+                                      description: |-
+                                        TLS Server Name Indication (required when mode is `mutual_tls`;
+                                        must not be set when mode is `plaintext`).
+                                      nullable: true
+                                      type: string
+                                  required:
+                                    - mode
+                                  type: object
+                              required:
+                                - address
+                                - cluster
+                              type: object
+                            type: array
+                          configMapName:
+                            default: praxis-consumer-config
+                            description: |-
+                              Name of the generated consumer Praxis `ConfigMap`.
+
+                              Default: `praxis-consumer-config`.
+                            type: string
+                          credentialMountBase:
+                            description: |-
+                              Deprecated in favor of `credentialMountPath`; this legacy field will be removed in a future release. Base directory for mounted credential Secret files inside the consumer pod.
+
+                              Each credential Secret is expected to be mounted at
+                              `{credentialMountPath}/{secret-name}/{secret-key}`.
+
+                              Default: `/run/secrets/grid-credentials`.
+                            type: string
+                          credentialMountPath:
+                            description: |-
+                              Base directory for mounted credential Secret files inside the consumer pod.
+
+                              Each credential Secret is expected to be mounted at
+                              `{credentialMountPath}/{secret-name}/{secret-key}`.
+
+                              Default: `/run/secrets/grid-credentials`.
+                            type: string
+                          enabled:
+                            description: |-
+                              Deprecated in favor of `generate`; this legacy field will be removed in a future release. Enable operator-managed consumer Praxis config generation for this gateway.
+
+                              Default: `false`.  Set to `true` to opt in.
+                            type: boolean
+                          generate:
+                            description: |-
+                              Enable operator-managed consumer Praxis config generation for this gateway.
+
+                              Default: `false`.  Set to `true` to opt in.
+                            type: boolean
+                          listenerPort:
+                            default: 8080
+                            description: |-
+                              HTTP port for the generated Praxis listener.
+
+                              The rendered `listeners[0].address` is `0.0.0.0:{listenerPort}`.
+
+                              Default: `8080`.
+                            format: uint16
+                            maximum: 65535.0
+                            minimum: 0.0
+                            type: integer
+                          telemetry:
+                            description: |-
+                              Optional OpenTelemetry exporter and sampling settings for this gateway.
+
+                              When present, the generated Praxis configuration opts into telemetry and
+                              adds the `trace_context` filter for outbound W3C header propagation.
+                              Collector authentication must be provided to the gateway Deployment via
+                              `OTEL_EXPORTER_OTLP_HEADERS` from a Secret; credentials are never copied
+                              into this `ConfigMap`.
+                            nullable: true
+                            properties:
+                              batchIntervalSecs:
+                                description: Batch exporter interval in seconds. Must be from 1 through 300 when set.
+                                format: uint64
+                                maximum: 300.0
+                                minimum: 1.0
+                                nullable: true
+                                type: integer
+                              batchSize:
+                                description: Maximum spans per export batch. Must be from 1 through 65,536 when set.
+                                format: uint
+                                maximum: 65536.0
+                                minimum: 1.0
+                                nullable: true
+                                type: integer
+                              environment:
+                                description: Deployment environment resource attribute.
+                                nullable: true
+                                pattern: ^.*\S.*$
+                                type: string
+                              otlpEndpoint:
+                                description: |-
+                                  OTLP collector endpoint, for example `http://otel-collector:4317`.
+
+                                  If omitted, Praxis can read `OTEL_EXPORTER_OTLP_ENDPOINT` from the
+                                  gateway Deployment. An empty string has the same meaning as omission.
+                                nullable: true
+                                pattern: ^(|https?://[^/?#@\s]+(:[0-9]+)?(/[^\s?#]*)?)$
+                                type: string
+                              samplingRate:
+                                description: Root trace sampling probability from `0.0` through `1.0`.
+                                format: double
+                                maximum: 1.0
+                                minimum: 0.0
+                                nullable: true
+                                type: number
+                              serviceName:
+                                description: OpenTelemetry `service.name` resource attribute.
+                                nullable: true
+                                pattern: ^.*\S.*$
+                                type: string
+                              serviceVersion:
+                                description: OpenTelemetry `service.version` resource attribute.
+                                nullable: true
+                                pattern: ^.*\S.*$
+                                type: string
+                            type: object
+                          tlsCertMountPath:
+                            default: /etc/praxis/tls
+                            description: |-
+                              Mount path for TLS certificates inside the consumer pod.
+
+                              Used when rendering mTLS cluster entries from `clusterEndpoints`.
+                              The operator expects the consumer pod to mount a TLS Secret at this path,
+                              containing `ca.crt`, `tls.crt`, and `tls.key`.
+
+                              Default: `/etc/praxis/tls`.
+                            type: string
+                        type: object
+                        x-kubernetes-validations:
+                          - message: set only `enabled` or `generate`, not both
+                            rule: '!(has(self.enabled) && has(self.generate))'
+                          - message: set only `credentialMountBase` or `credentialMountPath`, not both
+                            rule: '!(has(self.credentialMountBase) && has(self.credentialMountPath))'
+                      localSiteName:
+                        description: |-
+                          Deprecated in favor of `siteName`; this legacy field will be removed in a future release. Local site name for the `intelligent_route` overlay generated for this gateway.
+
+                          Identifies which [`GridSite`] this gateway's cluster represents.
+                          Praxis uses `local_site` to score candidates running on the same site
+                          higher than remote candidates.
+
+                          When absent, the [`GridNetwork`] metadata name is used as a fallback.
+                          This is correct for single-site networks where the network name and
+                          site name are the same.  Multi-site networks should set this to the
+                          [`GridSite`] name for the cluster hosting this gateway.
+
+                          [`GridSite`]: crate::crd::grid_site::GridSite
+                          [`GridNetwork`]: crate::crd::grid_network::GridNetwork
+                        nullable: true
+                        type: string
+                      name:
+                        description: Gateway name.
+                        type: string
+                      namespace:
+                        description: Gateway namespace.
+                        type: string
+                      praxisConfig:
+                        description: |-
+                          Opt-in configuration for operator-managed consumer Praxis config generation.
+
+                          When absent or `generate: false`, this gateway behaves exactly as before —
+                          only the routing overlay `ConfigMap` is applied.  When `generate: true`, the
+                          operator additionally renders a consumer Praxis `ConfigMap` containing the
+                          inference-model `intelligent_route` candidates (with credential
+                          `secretRef` data), a `credential_inject` section for credential-bearing
+                          inference candidates, and a `load_balancer` section with one cluster
+                          entry per unique inference cluster. Other capability kinds remain in the
+                          routing overlay for dedicated data-plane pipelines.
+
+                          The generated `ConfigMap` contains no token bytes.
+                        nullable: true
+                        properties:
+                          clusterEndpoints:
+                            default: []
+                            description: |-
+                              Endpoint topology for the generated `load_balancer` section.
+
+                              Each entry maps an inference candidate cluster name to a reachable endpoint
+                              address with explicit transport configuration. Every cluster referenced
+                              by a projected inference candidate must have a matching entry here with a
+                              non-`None` `transport` field.
+
+                              Missing endpoint topology causes config generation to fail with
+                              `MissingClusterEndpoint`.  Missing transport fails with
+                              `MissingTransport`.  Mutual-TLS transport without SNI fails with
+                              `MissingSni`.
+
+                              In production, this is populated by whoever manages the consumer gateway
+                              deployment (platform automation, the gateway operator, or a Helm chart).
+                              In local Kind validation, the xtask harness discovers `NodePort` addresses
+                              and populates this field in the test fixture.
+
+                              Default: empty. Supply entries before enabling generated consumer config
+                              for an overlay containing inference candidates.
+                            items:
+                              description: |-
+                                Endpoint configuration for one consumer `load_balancer` cluster.
+
+                                Maps an inference candidate cluster name to a reachable provider gateway
+                                endpoint with explicit transport intent. Every cluster referenced by a
+                                projected inference candidate must have a matching entry.
+
+                                # Transport requirement
+
+                                The `transport` field is required.  Missing transport fails closed
+                                during config rendering with status reason `MissingTransport`.
+                                When `transport.mode` is `mutual_tls`, `transport.sni` must also
+                                be present and non-blank; otherwise rendering fails with status
+                                reason `MissingSni`.
+                              properties:
+                                address:
+                                  description: Reachable endpoint address (`host:port`).
+                                  type: string
+                                cluster:
+                                  description: Cluster name - must match a projected inference `candidate.cluster` value.
+                                  type: string
+                                transport:
+                                  description: |-
+                                    Explicit transport configuration.
+
+                                    Required.  Use `mutual_tls` with `sni` for remote/provider-gateway
+                                    traffic.  Use `plaintext` only for local/dev-only endpoints.
+                                    Missing transport fails closed during config rendering.
+                                  nullable: true
+                                  properties:
+                                    mode:
+                                      description: 'Transport mode: `mutual_tls` or `plaintext`.'
+                                      enum:
+                                        - mutual_tls
+                                        - plaintext
+                                      type: string
+                                    sni:
+                                      description: |-
+                                        TLS Server Name Indication (required when mode is `mutual_tls`;
+                                        must not be set when mode is `plaintext`).
+                                      nullable: true
+                                      type: string
+                                  required:
+                                    - mode
+                                  type: object
+                              required:
+                                - address
+                                - cluster
+                              type: object
+                            type: array
+                          configMapName:
+                            default: praxis-consumer-config
+                            description: |-
+                              Name of the generated consumer Praxis `ConfigMap`.
+
+                              Default: `praxis-consumer-config`.
+                            type: string
+                          credentialMountBase:
+                            description: |-
+                              Deprecated in favor of `credentialMountPath`; this legacy field will be removed in a future release. Base directory for mounted credential Secret files inside the consumer pod.
+
+                              Each credential Secret is expected to be mounted at
+                              `{credentialMountPath}/{secret-name}/{secret-key}`.
+
+                              Default: `/run/secrets/grid-credentials`.
+                            type: string
+                          credentialMountPath:
+                            description: |-
+                              Base directory for mounted credential Secret files inside the consumer pod.
+
+                              Each credential Secret is expected to be mounted at
+                              `{credentialMountPath}/{secret-name}/{secret-key}`.
+
+                              Default: `/run/secrets/grid-credentials`.
+                            type: string
+                          enabled:
+                            description: |-
+                              Deprecated in favor of `generate`; this legacy field will be removed in a future release. Enable operator-managed consumer Praxis config generation for this gateway.
+
+                              Default: `false`.  Set to `true` to opt in.
+                            type: boolean
+                          generate:
+                            description: |-
+                              Enable operator-managed consumer Praxis config generation for this gateway.
+
+                              Default: `false`.  Set to `true` to opt in.
+                            type: boolean
+                          listenerPort:
+                            default: 8080
+                            description: |-
+                              HTTP port for the generated Praxis listener.
+
+                              The rendered `listeners[0].address` is `0.0.0.0:{listenerPort}`.
+
+                              Default: `8080`.
+                            format: uint16
+                            maximum: 65535.0
+                            minimum: 0.0
+                            type: integer
+                          telemetry:
+                            description: |-
+                              Optional OpenTelemetry exporter and sampling settings for this gateway.
+
+                              When present, the generated Praxis configuration opts into telemetry and
+                              adds the `trace_context` filter for outbound W3C header propagation.
+                              Collector authentication must be provided to the gateway Deployment via
+                              `OTEL_EXPORTER_OTLP_HEADERS` from a Secret; credentials are never copied
+                              into this `ConfigMap`.
+                            nullable: true
+                            properties:
+                              batchIntervalSecs:
+                                description: Batch exporter interval in seconds. Must be from 1 through 300 when set.
+                                format: uint64
+                                maximum: 300.0
+                                minimum: 1.0
+                                nullable: true
+                                type: integer
+                              batchSize:
+                                description: Maximum spans per export batch. Must be from 1 through 65,536 when set.
+                                format: uint
+                                maximum: 65536.0
+                                minimum: 1.0
+                                nullable: true
+                                type: integer
+                              environment:
+                                description: Deployment environment resource attribute.
+                                nullable: true
+                                pattern: ^.*\S.*$
+                                type: string
+                              otlpEndpoint:
+                                description: |-
+                                  OTLP collector endpoint, for example `http://otel-collector:4317`.
+
+                                  If omitted, Praxis can read `OTEL_EXPORTER_OTLP_ENDPOINT` from the
+                                  gateway Deployment. An empty string has the same meaning as omission.
+                                nullable: true
+                                pattern: ^(|https?://[^/?#@\s]+(:[0-9]+)?(/[^\s?#]*)?)$
+                                type: string
+                              samplingRate:
+                                description: Root trace sampling probability from `0.0` through `1.0`.
+                                format: double
+                                maximum: 1.0
+                                minimum: 0.0
+                                nullable: true
+                                type: number
+                              serviceName:
+                                description: OpenTelemetry `service.name` resource attribute.
+                                nullable: true
+                                pattern: ^.*\S.*$
+                                type: string
+                              serviceVersion:
+                                description: OpenTelemetry `service.version` resource attribute.
+                                nullable: true
+                                pattern: ^.*\S.*$
+                                type: string
+                            type: object
+                          tlsCertMountPath:
+                            default: /etc/praxis/tls
+                            description: |-
+                              Mount path for TLS certificates inside the consumer pod.
+
+                              Used when rendering mTLS cluster entries from `clusterEndpoints`.
+                              The operator expects the consumer pod to mount a TLS Secret at this path,
+                              containing `ca.crt`, `tls.crt`, and `tls.key`.
+
+                              Default: `/etc/praxis/tls`.
+                            type: string
+                        type: object
+                        x-kubernetes-validations:
+                          - message: set only `enabled` or `generate`, not both
+                            rule: '!(has(self.enabled) && has(self.generate))'
+                          - message: set only `credentialMountBase` or `credentialMountPath`, not both
+                            rule: '!(has(self.credentialMountBase) && has(self.credentialMountPath))'
+                      siteName:
+                        description: |-
+                          Local site name for the `intelligent_route` overlay generated for this gateway.
+
+                          Identifies which [`GridSite`] this gateway's cluster represents.
+                          Praxis uses `local_site` to score candidates running on the same site
+                          higher than remote candidates.
+
+                          When absent, the [`GridNetwork`] metadata name is used as a fallback.
+                          This is correct for single-site networks where the network name and
+                          site name are the same.  Multi-site networks should set this to the
+                          [`GridSite`] name for the cluster hosting this gateway.
+
+                          [`GridSite`]: crate::crd::grid_site::GridSite
+                          [`GridNetwork`]: crate::crd::grid_network::GridNetwork
+                        nullable: true
+                        type: string
+                    required:
+                      - name
+                      - namespace
+                    type: object
+                    x-kubernetes-validations:
+                      - message: set only `localSiteName` or `siteName`, not both
+                        rule: '!(has(self.localSiteName) && has(self.siteName))'
+                      - message: set only `consumerConfig` or `praxisConfig`, not both
+                        rule: '!(has(self.consumerConfig) && has(self.praxisConfig))'
                   type: array
                 gridId:
                   default: ""
@@ -634,6 +1364,32 @@ spec:
                         - name
                         - namespace
                       type: object
+                    swimKeyRef:
+                      description: Deprecated in favor of `swimKeySecretRef`; this legacy field will be removed in a future release. Secret storing the SWIM encryption key.
+                      nullable: true
+                      properties:
+                        key:
+                          description: |-
+                            Key within the Secret's `data` map.
+
+                            Required when the Secret holds multiple keys (e.g. credential references
+                            in `InferenceProvider.spec.auth.secretRef`).  Omit only when the entire
+                            Secret is consumed (e.g. TLS `ca_secret_ref`).
+                          minLength: 1
+                          nullable: true
+                          type: string
+                        name:
+                          description: Secret name.
+                          minLength: 1
+                          type: string
+                        namespace:
+                          description: Secret namespace.
+                          minLength: 1
+                          type: string
+                      required:
+                        - name
+                        - namespace
+                      type: object
                     swimKeySecretRef:
                       description: Secret storing the SWIM encryption key.
                       nullable: true
@@ -661,6 +1417,9 @@ spec:
                         - namespace
                       type: object
                   type: object
+                  x-kubernetes-validations:
+                    - message: set only `swimKeyRef` or `swimKeySecretRef`, not both
+                      rule: '!(has(self.swimKeyRef) && has(self.swimKeySecretRef))'
                 zone:
                   description: Availability zone.
                   nullable: true
@@ -669,6 +1428,8 @@ spec:
               x-kubernetes-validations:
                 - message: placementPolicy must be set if and only if selectionPolicy.mode is weightedRandom
                   rule: has(self.placementPolicy) == (has(self.selectionPolicy) && self.selectionPolicy.mode == 'weightedRandom')
+                - message: set only `gatewayRefs` or `consumerGateways`, not both
+                  rule: '!(has(self.gatewayRefs) && has(self.consumerGateways))'
             status:
               description: Observed status of a [`GridNetwork`].
               nullable: true
