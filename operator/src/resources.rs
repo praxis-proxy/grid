@@ -9,6 +9,9 @@ pub(crate) mod geography;
 /// routing overlays.  Used when `GatewayRef.consumerConfig.enabled` is true.
 pub(crate) mod consumer_config;
 
+/// Deterministic projected volume layout and revision helpers for delegated mounts.
+pub(crate) mod gateway_mounts;
+
 /// Controller-owned credential resolution for API-provider authentication.
 ///
 /// Provides [`CredentialPlan`], [`CredentialResolver`], and the v1

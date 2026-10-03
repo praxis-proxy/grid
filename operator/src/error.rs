@@ -31,6 +31,10 @@ pub enum OperatorError {
     #[error("consumer config render: {0}")]
     ConsumerConfigRender(#[from] crate::resources::consumer_config::ConsumerConfigError),
 
+    /// Delegated gateway mount validation or reconciliation failed.
+    #[error("gateway mount reconciliation: {0}")]
+    MountReconciliation(#[from] GatewayMountFailure),
+
     /// SWIM encryption key configuration failed.
     #[error("swim key configuration: {0}")]
     SwimKeyConfig(String),
@@ -38,4 +42,25 @@ pub enum OperatorError {
     /// A watched resource is missing required metadata.
     #[error("invalid resource: {0}")]
     InvalidResource(String),
+}
+
+/// A sanitized gateway mount failure suitable for status reporting.
+#[derive(Clone, Debug, thiserror::Error)]
+#[error("{reason}: {message}")]
+pub struct GatewayMountFailure {
+    /// Stable status reason.
+    pub reason: &'static str,
+    /// Diagnostic with Secret identifiers and paths only.
+    pub message: String,
+}
+
+impl GatewayMountFailure {
+    /// Construct a sanitized mount reconciliation failure.
+    #[must_use]
+    pub fn new<M: Into<String>>(reason: &'static str, message: M) -> Self {
+        Self {
+            reason,
+            message: message.into(),
+        }
+    }
 }

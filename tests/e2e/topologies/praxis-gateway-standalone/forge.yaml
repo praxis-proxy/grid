@@ -90,7 +90,7 @@ spec:
         - type: helm
           release: praxis-gateway
           chart: charts/praxis-gateway
-          version: "0.1.4"
+          version: "0.1.5"
           namespace: praxis
         - type: exec
           command: [bash, verify.sh, default]
@@ -106,7 +106,7 @@ spec:
         - type: helm
           release: praxis-gateway
           chart: charts/praxis-gateway
-          version: "0.1.4"
+          version: "0.1.5"
           namespace: praxis
           values:
             config:
@@ -142,7 +142,7 @@ spec:
         - type: helm
           release: praxis-gateway
           chart: charts/praxis-gateway
-          version: "0.1.4"
+          version: "0.1.5"
           namespace: praxis
           values:
             config:
@@ -186,7 +186,7 @@ spec:
         - type: helm
           release: praxis-gateway
           chart: charts/praxis-gateway
-          version: "0.1.4"
+          version: "0.1.5"
           namespace: praxis
           values:
             config:
@@ -202,7 +202,7 @@ spec:
         - type: helm
           release: praxis-gateway
           chart: charts/praxis-gateway
-          version: "0.1.4"
+          version: "0.1.5"
           namespace: praxis
           values:
             image:

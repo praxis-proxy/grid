@@ -32,6 +32,10 @@ spec:
         credentialMountBase: /run/secrets/grid-credentials
         configMapName: praxis-consumer-config
         tlsCertMountPath: /etc/praxis/tls
+        mountReconciliation:
+          enabled: true
+          deploymentName: inference-gw
+          containerName: praxis
         clusterEndpoints:           # endpoint topology for load_balancer
           - cluster: site-a
             address: "10.0.0.4:30080"
@@ -90,7 +94,8 @@ not part of this CRD.
 **Phases**: Pending → Initializing → Active → Degraded
 
 **Status fields**: `gridId`, `connectedSites`, `distributedProviderCount`,
-`observedGeneration`, `phase`, `consumerConfigStatus[]`, `budgetStatus[]`
+`observedGeneration`, `phase`, `consumerConfigStatus[]`,
+`mountReconciliationStatus[]`, `budgetStatus[]`
 
 `distributedProviderCount` reflects the number of remote `InferenceProvider`
 records received from peer sites via CRDT broadcast.  Local providers and records
@@ -99,6 +104,22 @@ from other `GridNetwork`s are excluded from the count.
 `consumerConfigStatus[]` is populated for each gateway with
 `consumerConfig.enabled: true`, reporting the outcome of the most recent
 render/apply attempt.
+
+Set `consumerConfig.mountReconciliation.enabled: true` to delegate generated
+Secret mounts and coordinated Deployment rollouts to Grid. This requires an
+explicitly annotated Deployment in `GatewayRef.namespace`. The operator manages
+only its reserved projected volumes and the selected container's mounts. Secret
+references must be in the gateway namespace. `consumerConfigStatus[].phase` of
+`Rendered` describes the ConfigMap; only
+`mountReconciliationStatus[].phase: Ready` reports a ready gateway revision.
+With delegation disabled, the operator still publishes a reference-only
+`grid-mount-requirements-<hash>` ConfigMap with the document under
+`mount-requirements.json` for the gateway owner to consume.
+
+`clusterEndpoints[].transport.mode` accepts `mutual_tls`, `tls`, or `plaintext`.
+The optional `transport.caSecretRef` is valid for `tls` and names a custom CA
+Secret key (default `ca.crt`). `mutual_tls` uses `spec.tls.caSecretRef` and
+`spec.tls.siteSecretRef` and does not accept a custom CA override.
 
 ### Tenant budget tracking
 
@@ -138,6 +159,12 @@ options under consideration if per-tenant confidentiality is required.
 | `reason` | string | Machine-readable reason (`MissingClusterEndpoint`, `ConsumerConfigRenderFailed`, `ConsumerConfigApplyFailed`) — empty when `Rendered` |
 | `message` | string | Human-readable diagnostic; never contains token bytes |
 | `observedGeneration` | integer | `GridNetwork` generation when this entry was last updated |
+
+For a delegated gateway, `mountReconciliationStatus[]` reports the rendered
+requirements revision, the config revision last rolled out, the Deployment
+generation, and one of `RequirementsRendered`, `WaitingForSecret`,
+`MountsReconciling`, `WaitingForRollout`, `Ready`, or `Error`. Messages contain
+resource names and paths only. They never contain Secret data or private keys.
 
 Example status output:
 

@@ -70,3 +70,8 @@ rules:
   - apiGroups: [""]
     resources: ["configmaps"]
     verbs: ["get", "create", "patch", "update"]
+  # Delegated consumer gateway reconciliation reads one declared Deployment
+  # and patches only named volumes, mounts, and pod-template revision annotations.
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "patch"]

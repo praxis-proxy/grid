@@ -206,7 +206,8 @@ granted for `secrets` and `configmaps`.  `delete` and
 | Resource | Verbs | Why |
 |---|---|---|
 | `secrets` | `get`, `create`, `patch` | Read TLS certs, SWIM key, credential refs; SSA-create CA and site cert `Secrets` |
-| `configmaps` | `create`, `patch` | SSA-create routing overlay and consumer config `ConfigMaps` |
+| `configmaps` | `get`, `create`, `patch`, `update` | Routing overlay, consumer config, and Secret requirements `ConfigMaps`; SWIM revision reservations |
+| `deployments` | `get`, `patch` | Only when delegated mount reconciliation is enabled; verify explicit ownership and patch Grid-owned mounts and rollout annotations |
 
 The `grid-operator-resources` `ClusterRole` is never bound
 cluster-wide.  It takes effect only in namespaces where a
@@ -239,16 +240,17 @@ overlays, status fields, or logs.
 |---|---|---|---|
 | Routing overlay | `grid-overlay-{network}-{gateway}` | `routing-overlay.json`, `routing-config.json` | `GatewayRef.namespace` |
 | Consumer config | `consumerConfig.configMapName` | `praxis.yaml` | `GatewayRef.namespace` |
+| Mount requirements | `grid-mount-requirements-<hash>` | `mount-requirements.json` | `GatewayRef.namespace` |
 
 ### What is not granted
 
 Neither `ClusterRole` grants:
 
 - `pods`, `pods/exec`, `pods/log`, `pods/portforward`
-- `deployments`, `services`, `ingresses`
+- `services`, `ingresses`
 - `secrets` `delete`, `list`, `watch`
-- `configmaps` `get`, `delete`, `list`, `watch`
-- Any `update` verb (all mutations use SSA `patch`)
+- `configmaps` `delete`, `list`, `watch`
+- `deployments` `update`, `delete`, `list`, `watch`
 
 ### Adding namespaces
 
