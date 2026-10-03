@@ -236,7 +236,7 @@ Praxis AI image; these values may advance independently.
 | `service.annotations` | object | `{}` | Service annotations. |
 | `service.loadBalancerIP` | string | `""` | Static IP for LoadBalancer. |
 | `route.enabled` | bool | `false` | Render an OpenShift Route to the Service. Needs TLS at the gateway and `route.host`. |
-| `route.tls.termination` | string | `passthrough` | `passthrough`, or `reencrypt` with `route.tls.destinationCACertificate`. A provider allows only `passthrough`. |
+| `route.tls.termination` | string | `passthrough` | `passthrough`, or `reencrypt` with `route.tls.destinationCACertificate`. That CA can be omitted when `service.annotations` has `service.beta.openshift.io/serving-cert-secret-name` naming `gatewayConfig.listenerTls.existingSecret`, since the router trusts the service CA. A provider allows only `passthrough`. |
 | `overlay.enabled` | bool | `false` | Mount an AGN routing overlay ConfigMap. |
 | `overlay.existingConfigMap` | string | `""` | Name of the overlay ConfigMap. |
 | `overlay.mountPath` | string | `/etc/praxis/routing` | Mount path for overlay files. |

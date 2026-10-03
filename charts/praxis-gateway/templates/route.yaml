@@ -19,8 +19,10 @@
 {{- fail "gatewayConfig.auth.mode none with a Route exposes unauthenticated inference; use api-key or set gatewayConfig.auth.allowUnauthenticatedExposure" }}
 {{- end }}
 {{- end }}
-{{- if and (eq $termination "reencrypt") (not .Values.route.tls.destinationCACertificate) }}
-{{- fail "route.tls.termination reencrypt needs route.tls.destinationCACertificate, the CA that signed the gateway certificate" }}
+{{- /* A service-ca listener cert needs no destination CA: the router already trusts that CA. */}}
+{{- $serviceCa := and .Values.gatewayConfig.listenerTls.enabled (eq (get (.Values.service.annotations | default dict) "service.beta.openshift.io/serving-cert-secret-name" | default "") (.Values.gatewayConfig.listenerTls.existingSecret | default "-")) }}
+{{- if and (eq $termination "reencrypt") (not .Values.route.tls.destinationCACertificate) (not $serviceCa) }}
+{{- fail "route.tls.termination reencrypt needs route.tls.destinationCACertificate, the CA that signed the gateway certificate, unless the listener cert is the service-ca one the Service annotation issues" }}
 {{- end }}
 apiVersion: route.openshift.io/v1
 kind: Route
