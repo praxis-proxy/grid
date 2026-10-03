@@ -59,10 +59,14 @@ fn main() -> ExitCode {
         None => None,
     };
 
-    // Returning instead of exiting drops the guard, flushing queued log lines.
+    // Use the returning server path so both the routing runtime and tracing
+    // provider can shut down cleanly after the listeners stop.
     let result = praxis::try_run_server_with_registry(config, registry, config_file, log_level);
     drop(grid_runtime);
-    result.map_or_else(|err| praxis::report_fatal(&err, log_output), |()| ExitCode::SUCCESS)
+    let exit_code = result.map_or_else(|err| praxis::report_fatal(&err, log_output), |()| ExitCode::SUCCESS);
+    // The Praxis guard shuts down the OTLP provider and flushes queued spans.
+    drop(tracing_guard);
+    exit_code
 }
 
 /// Start the cross-site pollers and register `grid_site_route` over their snapshot.

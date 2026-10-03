@@ -774,7 +774,7 @@ pub struct GatewayRef {
 /// The generated `ConfigMap` never contains credential token bytes.  Credential
 /// entries use a `file:` source under `credentialMountBase`; the mounted
 /// Kubernetes Secret provides the token at runtime.
-#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConsumerConfig {
     /// Enable operator-managed consumer Praxis config generation for this gateway.
@@ -836,6 +836,118 @@ pub struct ConsumerConfig {
     /// Default: `8080`.
     #[serde(default = "default_listener_port")]
     pub listener_port: u16,
+
+    /// Optional OpenTelemetry exporter and sampling settings for this gateway.
+    ///
+    /// When present, the generated Praxis configuration opts into telemetry and
+    /// adds the `trace_context` filter for outbound W3C header propagation.
+    /// Collector authentication must be provided to the gateway Deployment via
+    /// `OTEL_EXPORTER_OTLP_HEADERS` from a Secret; credentials are never copied
+    /// into this `ConfigMap`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telemetry: Option<GatewayTelemetryConfig>,
+}
+
+/// Validated OpenTelemetry settings rendered into operator-generated Praxis YAML.
+///
+/// Secret material is intentionally not part of this type. Supply collector
+/// credentials through the gateway Deployment's `OTEL_EXPORTER_OTLP_HEADERS`
+/// environment variable using a Secret-backed `valueFrom` reference.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct GatewayTelemetryConfig {
+    /// OTLP collector endpoint, for example `http://otel-collector:4317`.
+    ///
+    /// If omitted, Praxis can read `OTEL_EXPORTER_OTLP_ENDPOINT` from the
+    /// gateway Deployment. An empty string has the same meaning as omission.
+    #[schemars(regex(pattern = r"^(|https?://[^/?#@\s]+(:[0-9]+)?(/[^\s?#]*)?)$"))]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub otlp_endpoint: Option<String>,
+
+    /// Root trace sampling probability from `0.0` through `1.0`.
+    #[schemars(range(min = 0.0, max = 1.0))]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sampling_rate: Option<f64>,
+
+    /// OpenTelemetry `service.name` resource attribute.
+    #[schemars(regex(pattern = r"^.*\S.*$"))]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_name: Option<String>,
+
+    /// OpenTelemetry `service.version` resource attribute.
+    #[schemars(regex(pattern = r"^.*\S.*$"))]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_version: Option<String>,
+
+    /// Deployment environment resource attribute.
+    #[schemars(regex(pattern = r"^.*\S.*$"))]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<String>,
+
+    /// Batch exporter interval in seconds. Must be positive when set.
+    #[schemars(range(min = 1))]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch_interval_secs: Option<u64>,
+
+    /// Maximum spans per export batch. Must be positive when set.
+    #[schemars(range(min = 1))]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch_size: Option<usize>,
+}
+
+impl GatewayTelemetryConfig {
+    /// Validate values before rendering them into the consumer configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an explanatory message for empty strings, invalid sampling
+    /// rates, or zero-valued batch settings.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "validates all telemetry settings before CRD rendering"
+    )]
+    pub fn validate(&self) -> Result<(), String> {
+        if self.otlp_endpoint.as_ref().is_some_and(|endpoint| {
+            if endpoint.is_empty() {
+                return false;
+            }
+            let endpoint = endpoint.trim();
+            let Some((scheme, rest)) = endpoint.split_once("://") else {
+                return true;
+            };
+            let authority = rest.split('/').next().unwrap_or_default();
+            !matches!(scheme, "http" | "https")
+                || authority.is_empty()
+                || authority.contains('@')
+                || endpoint.contains('?')
+                || endpoint.contains('#')
+                || endpoint.chars().any(char::is_whitespace)
+        }) {
+            return Err("telemetry.otlpEndpoint must be an http(s) URL without credentials".to_owned());
+        }
+        if let Some(rate) = self.sampling_rate
+            && (!rate.is_finite() || !(0.0..=1.0).contains(&rate))
+        {
+            return Err("telemetry.samplingRate must be between 0.0 and 1.0".to_owned());
+        }
+        if self.batch_interval_secs == Some(0) {
+            return Err("telemetry.batchIntervalSecs must be greater than zero".to_owned());
+        }
+        if self.batch_size == Some(0) {
+            return Err("telemetry.batchSize must be greater than zero".to_owned());
+        }
+        for (field, value) in [
+            ("serviceName", self.service_name.as_deref()),
+            ("serviceVersion", self.service_version.as_deref()),
+            ("environment", self.environment.as_deref()),
+        ] {
+            if value.is_some_and(|value| value.trim().is_empty()) {
+                return Err(format!("telemetry.{field} must not be blank"));
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Default for ConsumerConfig {
@@ -847,6 +959,7 @@ impl Default for ConsumerConfig {
             cluster_endpoints: Vec::new(),
             tls_cert_mount_path: default_tls_cert_mount_path(),
             listener_port: default_listener_port(),
+            telemetry: None,
         }
     }
 }
@@ -1476,7 +1589,12 @@ mod tests {
                         "mode": "mutual_tls",
                         "sni": "site-a.grid.internal"
                     }
-                }]
+                }],
+                "telemetry": {
+                    "otlpEndpoint": "http://otel-collector:4317",
+                    "samplingRate": 0.125,
+                    "serviceName": "grid-edge"
+                }
             }
         });
         let gw: GatewayRef = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
@@ -1508,6 +1626,14 @@ mod tests {
             transport.sni.as_deref(),
             Some("site-a.grid.internal"),
             "transport SNI must round-trip"
+        );
+        let telemetry = cc.telemetry.as_ref().unwrap_or_else(|| std::process::abort());
+        assert_eq!(telemetry.otlp_endpoint.as_deref(), Some("http://otel-collector:4317"));
+        assert_eq!(telemetry.sampling_rate, Some(0.125));
+        assert_eq!(telemetry.service_name.as_deref(), Some("grid-edge"));
+        assert!(
+            telemetry.validate().is_ok(),
+            "valid telemetry settings must pass validation"
         );
     }
 
@@ -1563,10 +1689,81 @@ mod tests {
             cc.cluster_endpoints.is_empty(),
             "clusterEndpoints must default to empty"
         );
+        assert!(cc.telemetry.is_none(), "telemetry must remain disabled by default");
         assert_eq!(
             cc.tls_cert_mount_path, "/etc/praxis/tls",
             "tlsCertMountPath must use default"
         );
+    }
+
+    #[test]
+    fn telemetry_config_rejects_embedded_headers() {
+        let with_headers = serde_json::json!({
+            "otlpEndpoint": "http://collector:4317",
+            "otlpHeaders": {"authorization": "test-value"}
+        });
+        assert!(
+            serde_json::from_value::<GatewayTelemetryConfig>(with_headers).is_err(),
+            "collector credentials must not be accepted as config fields"
+        );
+    }
+
+    #[test]
+    fn telemetry_config_accepts_empty_endpoint_fallback() {
+        let empty_endpoint = serde_json::from_value::<GatewayTelemetryConfig>(serde_json::json!({
+            "otlpEndpoint": ""
+        }))
+        .unwrap_or_else(|_| std::process::abort());
+        assert!(
+            empty_endpoint.validate().is_ok(),
+            "an empty endpoint must use the deployment environment fallback"
+        );
+    }
+
+    #[test]
+    fn telemetry_resource_attributes_reject_blank_values_at_admission_and_runtime() {
+        let crd = crd_json();
+        let telemetry_properties = crd
+            .pointer(
+                "/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties/gatewayRefs/items/properties/consumerConfig/properties/telemetry/properties",
+            )
+            .unwrap_or_else(|| std::process::abort());
+        for field in ["serviceName", "serviceVersion", "environment"] {
+            let pattern = telemetry_properties
+                .get(field)
+                .and_then(|property| property.get("pattern"))
+                .and_then(serde_json::Value::as_str);
+            assert_eq!(
+                pattern,
+                Some(r"^.*\S.*$"),
+                "{field} must reject blank values at admission"
+            );
+            let telemetry: GatewayTelemetryConfig =
+                serde_json::from_value(serde_json::json!({(field): ""})).unwrap_or_else(|_| std::process::abort());
+            assert!(
+                telemetry.validate().is_err(),
+                "{field} must reject blank values at runtime"
+            );
+        }
+    }
+
+    #[test]
+    fn telemetry_config_rejects_credentials_in_endpoint() {
+        for endpoint in [
+            "https://user:password@collector:4317",
+            "https://collector:4317?api_key=secret",
+            "https://collector:4317/otlp#token=secret",
+        ] {
+            let telemetry = serde_json::from_value::<GatewayTelemetryConfig>(serde_json::json!({
+                "otlpEndpoint": endpoint,
+                "samplingRate": 0.5
+            }))
+            .unwrap_or_else(|_| std::process::abort());
+            assert!(
+                telemetry.validate().is_err(),
+                "credentials in endpoint userinfo, query, or fragment must be rejected: {endpoint}"
+            );
+        }
     }
 
     #[test]
@@ -1585,6 +1782,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "asserts generated telemetry fields and all opt-in security boundaries"
+    )]
     fn grid_network_crd_has_consumer_config_field_on_gateway_ref() {
         let crd = crd_json();
         let gateway_ref_properties = crd
@@ -1607,6 +1808,47 @@ mod tests {
         assert!(
             consumer_config_properties.contains_key("tlsCertMountPath"),
             "CRD schema must include consumerConfig.tlsCertMountPath"
+        );
+        let telemetry_properties = consumer_config_properties
+            .get("telemetry")
+            .and_then(|v| v.pointer("/properties"))
+            .and_then(serde_json::Value::as_object)
+            .unwrap_or_else(|| std::process::abort());
+        let sampling_rate = telemetry_properties
+            .get("samplingRate")
+            .unwrap_or_else(|| std::process::abort());
+        assert_eq!(
+            sampling_rate.pointer("/minimum").and_then(serde_json::Value::as_f64),
+            Some(0.0),
+            "CRD schema must reject sampling rates below zero"
+        );
+        assert_eq!(
+            sampling_rate.pointer("/maximum").and_then(serde_json::Value::as_f64),
+            Some(1.0),
+            "CRD schema must reject sampling rates above one"
+        );
+        let endpoint_schema = telemetry_properties
+            .get("otlpEndpoint")
+            .unwrap_or_else(|| std::process::abort());
+        assert_eq!(
+            endpoint_schema.get("type").and_then(serde_json::Value::as_str),
+            Some("string"),
+            "OTLP endpoint remains an optional string"
+        );
+        assert!(
+            !telemetry_properties
+                .get("required")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|required| required.iter().any(|field| field.as_str() == Some("otlpEndpoint"))),
+            "omitted endpoint must remain valid for environment fallback"
+        );
+        let endpoint_pattern = endpoint_schema
+            .get("pattern")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_else(|| std::process::abort());
+        assert!(
+            endpoint_pattern.starts_with("^(|") && endpoint_pattern.contains("https?://"),
+            "CRD schema must accept empty environment fallback and explicit HTTP(S) URLs"
         );
     }
 

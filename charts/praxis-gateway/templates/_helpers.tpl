@@ -132,6 +132,15 @@ Validate image digest format when provided.
 Validate required config ConfigMap name.
 */}}
 {{- define "praxis-gateway.validateConfig" -}}
+{{- $telemetry := .Values.gatewayConfig.telemetry | default dict }}
+{{- if $telemetry.enabled }}
+{{- if ne .Values.image.flavor "grid-gateway" }}
+{{- fail "gatewayConfig.telemetry.enabled needs image.flavor grid-gateway, whose Grid gateway build includes the OTLP and AI routing span features" }}
+{{- end }}
+{{- if not .Values.gatewayConfig.render }}
+{{- fail "gatewayConfig.telemetry.enabled needs gatewayConfig.render true so the exporter settings are written to praxis.yaml" }}
+{{- end }}
+{{- end }}
 {{- if .Values.gatewayConfig.render }}
 {{- $consumer := ne (.Values.gatewayConfig.role | default "consumer") "provider" }}
 {{- if and $consumer (not (.Values.gridServing).enabled) (not (trim (toString .Values.gatewayConfig.model))) }}

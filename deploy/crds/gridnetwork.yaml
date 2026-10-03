@@ -279,6 +279,61 @@ spec:
                             maximum: 65535.0
                             minimum: 0.0
                             type: integer
+                          telemetry:
+                            description: |-
+                              Optional OpenTelemetry exporter and sampling settings for this gateway.
+
+                              When present, the generated Praxis configuration opts into telemetry and
+                              adds the `trace_context` filter for outbound W3C header propagation.
+                              Collector authentication must be provided to the gateway Deployment via
+                              `OTEL_EXPORTER_OTLP_HEADERS` from a Secret; credentials are never copied
+                              into this `ConfigMap`.
+                            nullable: true
+                            properties:
+                              batchIntervalSecs:
+                                description: Batch exporter interval in seconds. Must be positive when set.
+                                format: uint64
+                                minimum: 1.0
+                                nullable: true
+                                type: integer
+                              batchSize:
+                                description: Maximum spans per export batch. Must be positive when set.
+                                format: uint
+                                minimum: 1.0
+                                nullable: true
+                                type: integer
+                              environment:
+                                description: Deployment environment resource attribute.
+                                nullable: true
+                                pattern: ^.*\S.*$
+                                type: string
+                              otlpEndpoint:
+                                description: |-
+                                  OTLP collector endpoint, for example `http://otel-collector:4317`.
+
+                                  If omitted, Praxis can read `OTEL_EXPORTER_OTLP_ENDPOINT` from the
+                                  gateway Deployment. An empty string has the same meaning as omission.
+                                nullable: true
+                                pattern: ^(|https?://[^/?#@\s]+(:[0-9]+)?(/[^\s?#]*)?)$
+                                type: string
+                              samplingRate:
+                                description: Root trace sampling probability from `0.0` through `1.0`.
+                                format: double
+                                maximum: 1.0
+                                minimum: 0.0
+                                nullable: true
+                                type: number
+                              serviceName:
+                                description: OpenTelemetry `service.name` resource attribute.
+                                nullable: true
+                                pattern: ^.*\S.*$
+                                type: string
+                              serviceVersion:
+                                description: OpenTelemetry `service.version` resource attribute.
+                                nullable: true
+                                pattern: ^.*\S.*$
+                                type: string
+                            type: object
                           tlsCertMountPath:
                             default: /etc/praxis/tls
                             description: |-

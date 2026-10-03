@@ -109,4 +109,35 @@ mod tests {
         );
         Ok(())
     }
+
+    #[test]
+    fn server_pipeline_error_is_reported_before_tracing_guard_flush() -> TestResult {
+        let path = write_config("invalid-filter.yaml")?;
+        let yaml = std::fs::read_to_string(&path)?
+            .replace("filter: static_response", "filter: not_registered_for_startup_test");
+        std::fs::write(&path, yaml)?;
+        let (mut child, lines) = spawn(path, None)?;
+
+        // Both streams close on exit, which disconnects the channel.
+        let deadline = Instant::now() + TIMEOUT;
+        let mut output = Vec::new();
+        loop {
+            match lines.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok(line) => output.push(line),
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    child.kill()?;
+                    child.wait()?;
+                    return Err(format!("gateway still running after {TIMEOUT:?}").into());
+                },
+            }
+        }
+        let status = child.wait()?;
+        assert!(!status.success(), "an invalid pipeline filter must fail startup");
+        assert!(
+            output.iter().any(|line| line.contains("fatal error; exiting")),
+            "the server startup error was not logged before the tracing guard dropped: {output:#?}"
+        );
+        Ok(())
+    }
 }

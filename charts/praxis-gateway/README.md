@@ -185,7 +185,7 @@ Praxis AI image; these values may advance independently.
 | `image.repository` | string | `ghcr.io/praxis-proxy/ai` | Image repository. |
 | `image.tag` | string | `0.4.0` | Image tag (ignored when `image.digest` is set). |
 | `image.digest` | string | `""` | Immutable digest (sha256:…). When set, tag is ignored. |
-| `image.flavor` | string | `ai` | `ai` or `grid-gateway`, the grid build that `gatewayConfig.role: provider` and `gridServing` need. A repository ending in `/grid-gateway` sets it. |
+| `image.flavor` | string | `ai` | `ai` or `grid-gateway`, the grid build that `gatewayConfig.role: provider`, `gridServing`, and telemetry need. A repository ending in `/grid-gateway` sets it. |
 | `image.pullPolicy` | string | `IfNotPresent` | Image pull policy. |
 | `imagePullSecrets` | list | `[]` | Pull secrets for private registries. |
 | `nameOverride` | string | `""` | Override chart name. |
@@ -203,6 +203,11 @@ Praxis AI image; these values may advance independently.
 | `config.key` | string | `praxis.yaml` | Key in the ConfigMap. |
 | `config.inline` | string | answers `GET /` with a JSON status, else 404 | Praxis config stored in a chart-managed ConfigMap when neither `config.existingConfigMap` nor `gatewayConfig.render` applies. Changing it rolls the pods. |
 | `gatewayConfig.render` | bool | `false` | Render the Praxis config from these values instead of a BYO ConfigMap. Also on when `config.existingConfigMap` is empty and the values configure grid routing (`gatewayConfig.backends`, `role: provider`, or `gridServing`). Never emits `insecure_options`. See [AI Grid Network](#ai-grid-network-agn). |
+| `gatewayConfig.telemetry.enabled` | bool | `false` | Enable OTLP export and W3C header propagation in generated `praxis.yaml`. Requires `gatewayConfig.render: true` and `image.flavor: grid-gateway`. Configuration changes roll the pods. The tracked Grid build uses Praxis 0.7.1, which exports local HTTP and AI routing spans while forwarding W3C headers. Cross-gateway exported parentage requires the follow-up Praxis framework release described in [OpenTelemetry for Grid gateways](../../docs/architecture/opentelemetry.md). |
+| `gatewayConfig.telemetry.otlpEndpoint` | string | `""` | OTLP/gRPC endpoint without URL userinfo, query, or fragment credentials. Omitted or empty uses `OTEL_EXPORTER_OTLP_ENDPOINT` from the container environment. |
+| `gatewayConfig.telemetry.samplingRate` | number | unset | Root sampling probability, from `0.0` through `1.0`. |
+| `gatewayConfig.telemetry.serviceName` / `serviceVersion` / `environment` | string | unset | OpenTelemetry resource attributes. |
+| `gatewayConfig.telemetry.batchIntervalSecs` / `batchSize` | int | unset | Positive OTLP batch export interval and maximum batch size. |
 | `gatewayConfig.model` | string | **required** for a consumer without `gridServing` | Model advertised on the routing candidates. |
 | `gatewayConfig.backends` | map | **required** when rendered | Backends keyed by site, each with `endpoint` and optional `healthCheck` and `transport`. A consumer's key is the site it reaches over mutual TLS. A provider's `local` key is its one plaintext backend. The older list of `cluster`, `endpoints` entries still renders. |
 | `gatewayConfig.backends[].site` | string | `localSite` | Grid site the backend serves. A consumer's remote `mutual_tls` backend must name it, and it must differ from `localSite`. Its `transport.sni` defaults to `<site>.grid.internal`. |

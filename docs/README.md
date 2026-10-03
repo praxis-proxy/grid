@@ -19,6 +19,8 @@
   access policy, and trust model.
 - [Consumer Config](architecture/consumer-config.md) — operator-generated
   consumer Praxis `ConfigMap` and the `GatewayRef.consumerConfig` API.
+- [OpenTelemetry](architecture/opentelemetry.md) — exporter configuration,
+  secret handling, image requirements, and the Praxis 0.7.1 trace-linkage limit.
 - [External Client Ingress](architecture/external-ingress.md) — GTM/GLB edge
   selection, AGN provider routing, trust boundaries, affinity, snapshot
   delivery, and provider-boundary ownership.

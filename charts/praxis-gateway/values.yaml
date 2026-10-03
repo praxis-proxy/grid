@@ -120,6 +120,26 @@ gatewayConfig:
   # -- Render praxis.yaml + policy.yaml from these values instead of config. Also on
   # when config.existingConfigMap is empty and backends, role provider, or gridServing is set.
   render: false
+  # -- Opt in to OTLP tracing in the generated praxis.yaml. Requires
+  # image.flavor: grid-gateway, whose Grid image build includes the Praxis OTLP
+  # exporter and Praxis AI routing-span features. Credentials belong in env as
+  # Secret-backed OTEL_EXPORTER_OTLP_HEADERS, never here.
+  telemetry:
+    enabled: false
+    # -- OTLP/gRPC endpoint. Empty uses OTEL_EXPORTER_OTLP_ENDPOINT from env.
+    otlpEndpoint: ""
+    # -- Root sampling probability in the inclusive range 0.0..1.0.
+    samplingRate: null
+    # -- OpenTelemetry service.name resource attribute.
+    serviceName: ""
+    # -- OpenTelemetry service.version resource attribute.
+    serviceVersion: ""
+    # -- deployment.environment resource attribute.
+    environment: ""
+    # -- Batch export interval in seconds; must be positive.
+    batchIntervalSecs: null
+    # -- Maximum spans per export batch; must be positive.
+    batchSize: null
   # -- consumer routes callers. provider serves grid peers on the grid identity and forwards to one backend.
   role: consumer
   # -- Grid peers a provider accepts, each with a Grid-CA client certificate.

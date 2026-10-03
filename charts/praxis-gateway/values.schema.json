@@ -176,6 +176,21 @@
             "existingSecret": { "type": "string" },
             "mountPath": { "type": "string" }
           }
+        },
+        "telemetry": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Optional exporter settings for generated praxis.yaml. Collector credentials must come from deployment-managed Secret environment references.",
+          "properties": {
+            "enabled": { "type": "boolean", "description": "Enable OTLP export and the trace_context propagation filter." },
+            "otlpEndpoint": { "type": "string", "pattern": "^(|https?://[^/?#@\\s]+(:[0-9]+)?(/[^\\s?#]*)?)$", "description": "OTLP/gRPC endpoint without userinfo, query, or fragment credentials. Empty uses OTEL_EXPORTER_OTLP_ENDPOINT." },
+            "samplingRate": { "type": ["number", "null"], "minimum": 0, "maximum": 1, "description": "Root trace sampling probability from 0.0 through 1.0." },
+            "serviceName": { "type": "string", "pattern": "^(|.*\\S.*)$", "description": "OpenTelemetry service.name resource attribute." },
+            "serviceVersion": { "type": "string", "pattern": "^(|.*\\S.*)$", "description": "OpenTelemetry service.version resource attribute." },
+            "environment": { "type": "string", "pattern": "^(|.*\\S.*)$", "description": "deployment.environment resource attribute." },
+            "batchIntervalSecs": { "type": ["integer", "null"], "minimum": 1, "description": "Positive batch exporter interval in seconds." },
+            "batchSize": { "type": ["integer", "null"], "minimum": 1, "description": "Positive maximum spans per export batch." }
+          }
         }
       }
     },

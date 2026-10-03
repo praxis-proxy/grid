@@ -23,7 +23,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use k8s_openapi::api::core::v1::ConfigMap;
 
 use crate::{
-    crd::grid_network::{ClusterEndpointConfig, SelectionMode, TransportMode},
+    crd::grid_network::{ClusterEndpointConfig, GatewayTelemetryConfig, SelectionMode, TransportMode},
     resources::routing_overlay::{RoutingCandidate, RoutingOverlay},
 };
 
@@ -86,6 +86,10 @@ pub enum ConsumerConfigError {
         cluster: String,
     },
 
+    /// Telemetry configuration failed validation.
+    #[error("invalid telemetry configuration: {0}")]
+    InvalidTelemetry(String),
+
     /// JSON serialization failed.
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
@@ -123,16 +127,48 @@ pub enum ConsumerConfigError {
 /// - Any candidate cluster has no matching endpoint in `cluster_endpoints`.
 /// - Any cluster endpoint has no `transport` configuration.
 /// - Any `mutual_tls` endpoint has no (or blank) `sni`.
-#[expect(
-    clippy::too_many_lines,
-    reason = "sequential validation + three rendering passes; splitting would obscure the overall config shape"
-)]
+#[cfg(test)]
 pub(crate) fn generate_consumer_praxis_config(
     overlay: &RoutingOverlay,
     credential_mount_base: &str,
     cluster_endpoints: &[ClusterEndpointConfig],
     tls_cert_mount_path: &str,
     listener_port: u16,
+) -> Result<String, ConsumerConfigError> {
+    generate_consumer_praxis_config_with_telemetry(
+        overlay,
+        credential_mount_base,
+        cluster_endpoints,
+        tls_cert_mount_path,
+        listener_port,
+        None,
+    )
+}
+
+/// Generate the consumer config with optional process-level telemetry settings.
+///
+/// The telemetry block is emitted at the Praxis config root, beside listeners
+/// and admin settings. It is never copied into the routing overlay.
+///
+/// # Errors
+///
+/// Returns [`ConsumerConfigError`] when the overlay, endpoint topology, or
+/// optional telemetry settings are invalid.
+#[expect(
+    clippy::too_many_lines,
+    reason = "sequential validation + three rendering passes; splitting would obscure the overall config shape"
+)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "preserves the renderer's established inputs and adds optional telemetry"
+)]
+pub(crate) fn generate_consumer_praxis_config_with_telemetry(
+    overlay: &RoutingOverlay,
+    credential_mount_base: &str,
+    cluster_endpoints: &[ClusterEndpointConfig],
+    tls_cert_mount_path: &str,
+    listener_port: u16,
+    telemetry: Option<&GatewayTelemetryConfig>,
 ) -> Result<String, ConsumerConfigError> {
     if overlay.local_site.trim().is_empty() {
         return Err(ConsumerConfigError::BlankLocalSite);
@@ -148,10 +184,18 @@ pub(crate) fn generate_consumer_praxis_config(
             });
         }
     }
+    if let Some(telemetry) = telemetry {
+        telemetry.validate().map_err(ConsumerConfigError::InvalidTelemetry)?;
+    }
 
     let candidates_yaml = render_candidates(&overlay.candidates);
     let selection_policy_yaml = render_selection_policy(overlay.selection_policy.as_ref());
     let local_site = yaml_scalar(&overlay.local_site)?;
+    let trace_context_filter = if telemetry.is_some() {
+        "     - filter: trace_context\n"
+    } else {
+        ""
+    };
 
     let credential_inject_section = render_credential_inject(&overlay.candidates, credential_mount_base);
     let load_balancer_section = render_load_balancer(&overlay.candidates, cluster_endpoints, tls_cert_mount_path)?;
@@ -166,6 +210,7 @@ pub(crate) fn generate_consumer_praxis_config(
          filter_chains:\n\
          \x20 - name: consumer-chain\n\
          \x20   filters:\n\
+         {trace_context_filter}\
          \x20     - filter: json_body_field\n\
          \x20       field: model\n\
          \x20       header: X-Model\n\
@@ -183,10 +228,71 @@ pub(crate) fn generate_consumer_praxis_config(
 
     config.push_str(&load_balancer_section);
 
+    if let Some(telemetry) = telemetry {
+        config.push_str(&render_telemetry(telemetry)?);
+    }
+
     // Admin interface and graceful shutdown — standard constants for consumer gateways.
     config.push_str("\nadmin:\n  address: \"127.0.0.1:9901\"\nshutdown_timeout_secs: 5\n");
 
     Ok(config)
+}
+
+/// Render validated exporter settings without secret material.
+#[expect(
+    clippy::too_many_lines,
+    reason = "serializes every optional telemetry value in a stable YAML order"
+)]
+fn render_telemetry(telemetry: &GatewayTelemetryConfig) -> Result<String, ConsumerConfigError> {
+    if telemetry.otlp_endpoint.as_deref().is_none_or(str::is_empty)
+        && telemetry.sampling_rate.is_none()
+        && telemetry.service_name.is_none()
+        && telemetry.service_version.is_none()
+        && telemetry.environment.is_none()
+        && telemetry.batch_interval_secs.is_none()
+        && telemetry.batch_size.is_none()
+    {
+        return Ok("\ntelemetry: {}\n".to_owned());
+    }
+    let mut output = String::from("\ntelemetry:\n");
+    if let Some(endpoint) = telemetry
+        .otlp_endpoint
+        .as_deref()
+        .filter(|endpoint| !endpoint.is_empty())
+    {
+        output.push_str("  otlp_endpoint: ");
+        output.push_str(&yaml_scalar(endpoint)?);
+        output.push('\n');
+    }
+    if let Some(rate) = telemetry.sampling_rate {
+        output.push_str("  sampling_rate: ");
+        output.push_str(&rate.to_string());
+        output.push('\n');
+    }
+    for (name, value) in [
+        ("service_name", telemetry.service_name.as_deref()),
+        ("service_version", telemetry.service_version.as_deref()),
+        ("environment", telemetry.environment.as_deref()),
+    ] {
+        if let Some(value) = value {
+            output.push_str("  ");
+            output.push_str(name);
+            output.push_str(": ");
+            output.push_str(&yaml_scalar(value)?);
+            output.push('\n');
+        }
+    }
+    if let Some(interval) = telemetry.batch_interval_secs {
+        output.push_str("  batch_interval_secs: ");
+        output.push_str(&interval.to_string());
+        output.push('\n');
+    }
+    if let Some(size) = telemetry.batch_size {
+        output.push_str("  batch_size: ");
+        output.push_str(&size.to_string());
+        output.push('\n');
+    }
+    Ok(output)
 }
 
 /// Build the Kubernetes `ConfigMap` for the generated consumer Praxis config.
@@ -649,6 +755,162 @@ mod tests {
     // -----------------------------------------------------------------------
     // Renderer: basic structure
     // -----------------------------------------------------------------------
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "checks opt-in output, secret exclusion, and overlay separation"
+    )]
+    fn telemetry_is_opt_in_and_rendered_outside_routing_filters() {
+        let overlay = simple_overlay(vec![plain_candidate(
+            "inference_model",
+            "model-a",
+            "site-a",
+            "gateway-site-a",
+            true,
+        )]);
+        let endpoints = endpoint_coverage(&overlay);
+        let disabled = generate_consumer_praxis_config(&overlay, MOUNT_BASE, &endpoints, "/etc/praxis/tls", 8080)
+            .unwrap_or_else(|_| std::process::abort());
+        assert!(
+            !disabled.contains("telemetry:"),
+            "telemetry must remain absent by default"
+        );
+        assert!(
+            !disabled.contains("filter: trace_context"),
+            "propagation must remain opt-in"
+        );
+
+        let telemetry = GatewayTelemetryConfig {
+            otlp_endpoint: Some("http://collector.observability:4317".to_owned()),
+            sampling_rate: Some(0.25),
+            service_name: Some("grid-edge-site-a".to_owned()),
+            service_version: Some("0.1.4".to_owned()),
+            environment: Some("test".to_owned()),
+            batch_interval_secs: Some(3),
+            batch_size: Some(32),
+        };
+        let enabled = generate_consumer_praxis_config_with_telemetry(
+            &overlay,
+            MOUNT_BASE,
+            &endpoints,
+            "/etc/praxis/tls",
+            8080,
+            Some(&telemetry),
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        assert!(
+            enabled.contains("filter: trace_context"),
+            "telemetry must enable W3C propagation"
+        );
+        assert!(enabled.contains("telemetry:\n  otlp_endpoint: \"http://collector.observability:4317\""));
+        assert!(enabled.contains("  sampling_rate: 0.25"));
+        assert!(enabled.contains("  service_name: \"grid-edge-site-a\""));
+        assert!(enabled.contains("  batch_interval_secs: 3"));
+        assert!(
+            !enabled.contains("otlp_headers"),
+            "credentials must not be rendered into the ConfigMap"
+        );
+        assert!(
+            !enabled.contains("collector-secret-value"),
+            "secret values must not appear in generated YAML"
+        );
+        assert!(
+            !serde_json::to_string(&overlay)
+                .unwrap_or_else(|_| std::process::abort())
+                .contains("telemetry"),
+            "exporter settings must stay out of the routing overlay"
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "covers environment fallback, sampling boundaries, and credential rejection"
+    )]
+    fn telemetry_rejects_invalid_sampling_rates_and_credentials_in_endpoint() {
+        let overlay = simple_overlay(Vec::new());
+        let env_only = GatewayTelemetryConfig {
+            otlp_endpoint: None,
+            sampling_rate: None,
+            service_name: None,
+            service_version: None,
+            environment: None,
+            batch_interval_secs: None,
+            batch_size: None,
+        };
+        let env_config = generate_consumer_praxis_config_with_telemetry(
+            &overlay,
+            MOUNT_BASE,
+            &[],
+            "/etc/praxis/tls",
+            8080,
+            Some(&env_only),
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        assert!(
+            env_config.contains("telemetry: {}"),
+            "an environment-only exporter must render as an empty mapping, not null"
+        );
+
+        let empty_endpoint = GatewayTelemetryConfig {
+            otlp_endpoint: Some(String::new()),
+            ..env_only
+        };
+        assert!(
+            empty_endpoint.validate().is_ok(),
+            "an empty endpoint must use the deployment environment fallback"
+        );
+        let empty_config = generate_consumer_praxis_config_with_telemetry(
+            &overlay,
+            MOUNT_BASE,
+            &[],
+            "/etc/praxis/tls",
+            8080,
+            Some(&empty_endpoint),
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        assert!(empty_config.contains("telemetry: {}"));
+        assert!(!empty_config.contains("otlp_endpoint:"));
+
+        for rate in [-0.01, 1.01, f64::NAN, f64::INFINITY] {
+            let telemetry = GatewayTelemetryConfig {
+                sampling_rate: Some(rate),
+                ..valid_telemetry()
+            };
+            let result = generate_consumer_praxis_config_with_telemetry(
+                &overlay,
+                MOUNT_BASE,
+                &[],
+                "/etc/praxis/tls",
+                8080,
+                Some(&telemetry),
+            );
+            assert!(result.is_err(), "invalid sampling rate {rate:?} must be rejected");
+        }
+
+        let telemetry = GatewayTelemetryConfig {
+            otlp_endpoint: Some("https://user:password@collector:4317".to_owned()),
+            ..valid_telemetry()
+        };
+        assert!(
+            telemetry.validate().is_err(),
+            "collector authentication must use Secret-backed environment references"
+        );
+    }
+
+    /// Return a minimal valid telemetry setting for validation tests.
+    fn valid_telemetry() -> GatewayTelemetryConfig {
+        GatewayTelemetryConfig {
+            otlp_endpoint: Some("http://collector:4317".to_owned()),
+            sampling_rate: Some(0.5),
+            service_name: None,
+            service_version: None,
+            environment: None,
+            batch_interval_secs: None,
+            batch_size: None,
+        }
+    }
 
     #[test]
     fn plain_candidates_produce_intelligent_route_and_load_balancer() {

@@ -308,10 +308,10 @@ name = "grid-gateway"
 path = "src/main.rs"
 
 [dependencies]
-praxis-proxy = { version = "0.7.1", features = ["spiffe"] }
+praxis-proxy = { version = "0.7.1", features = ["otel", "spiffe"] }
 praxis-proxy-filter = "0.7.1"
 praxis-proxy-core = "0.7.1"
-praxis-ai-filters = { git = "https://github.com/praxis-proxy/ai.git", tag = "v0.4.1" }
+praxis-ai-filters = { git = "https://github.com/praxis-proxy/ai.git", tag = "v0.4.1", features = ["opentelemetry"] }
 ai-grid-filters = { path = "ai-grid-filters" }
 tracing = "0.1.44"
 

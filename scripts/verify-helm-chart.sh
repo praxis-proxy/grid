@@ -531,6 +531,21 @@ try_template "$GW_DIR" "subchart keys (gw)" "${GW_REQ[@]}" --set enabled=true --
 try_reject "$GW_DIR" "runAsNonRoot override" "${GW_REQ[@]}" --set podSecurityContext.runAsNonRoot=false
 try_reject "$GW_DIR" "overlay enabled no name" "${GW_REQ[@]}" --set overlay.enabled=true
 try_reject "$GW_DIR" "tls enabled no secret" "${GW_REQ[@]}" --set tls.enabled=true --set tls.existingSecret=""
+try_reject_msg "$GW_DIR" "telemetry sampling rate above one" \
+  "gatewayConfig[./]telemetry[./]samplingRate.*(less than or equal to 1|maximum: got 1\\.01)" \
+  --set gatewayConfig.telemetry.enabled=true --set-json gatewayConfig.telemetry.samplingRate=1.01
+try_reject_msg "$GW_DIR" "telemetry sampling rate below zero" \
+  "gatewayConfig[./]telemetry[./]samplingRate.*(greater than or equal to 0|minimum: got -0\\.01)" \
+  --set gatewayConfig.telemetry.enabled=true --set-json gatewayConfig.telemetry.samplingRate=-0.01
+try_reject_msg "$GW_DIR" "telemetry endpoint userinfo credentials" \
+  "gatewayConfig[./]telemetry[./]otlpEndpoint.*([Dd]oes not match pattern|does not match the regex)" \
+  "${GW_REQ[@]}" --set-string 'gatewayConfig.telemetry.otlpEndpoint=https://user:password@collector:4317'
+try_reject_msg "$GW_DIR" "telemetry endpoint query credentials" \
+  "gatewayConfig[./]telemetry[./]otlpEndpoint.*([Dd]oes not match pattern|does not match the regex)" \
+  "${GW_REQ[@]}" --set-string 'gatewayConfig.telemetry.otlpEndpoint=https://collector:4317?api_key=sentinel'
+try_reject_msg "$GW_DIR" "telemetry endpoint fragment credentials" \
+  "gatewayConfig[./]telemetry[./]otlpEndpoint.*([Dd]oes not match pattern|does not match the regex)" \
+  "${GW_REQ[@]}" --set-string 'gatewayConfig.telemetry.otlpEndpoint=https://collector:4317/otlp#token=sentinel'
 
 # ── Secure gateway config (render) ──────────────────────────────────
 GW_RENDER=(--set gatewayConfig.render=true --set gatewayConfig.localSite=hub --set gatewayConfig.model=q --set gatewayConfig.auth.mode=none

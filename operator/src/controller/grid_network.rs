@@ -1808,12 +1808,13 @@ async fn apply_consumer_config_for_gateway(
     cc: &ConsumerConfig,
     client: &Client,
 ) -> Result<(), OperatorError> {
-    let config_yaml = consumer_config::generate_consumer_praxis_config(
+    let config_yaml = consumer_config::generate_consumer_praxis_config_with_telemetry(
         overlay,
         &cc.credential_mount_base,
         &cc.cluster_endpoints,
         &cc.tls_cert_mount_path,
         cc.listener_port,
+        cc.telemetry.as_ref(),
     )?;
     let cm = consumer_config::build_consumer_config_map(
         &config_yaml,

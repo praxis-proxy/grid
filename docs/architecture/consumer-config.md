@@ -72,6 +72,14 @@ The generated config is a complete, runnable Praxis config containing:
 - `admin:` — admin listener at `127.0.0.1:9901`
 - `shutdown_timeout_secs: 5`
 
+Set `consumerConfig.telemetry` to add process-level OTLP settings and the
+`trace_context` propagation filter. These settings are written at the Praxis
+config root and never enter the routing overlay. The consumer ConfigMap does
+not contain collector headers; configure `OTEL_EXPORTER_OTLP_HEADERS` on the
+gateway Deployment with a Secret-backed environment reference. See
+[OpenTelemetry for Grid gateways](opentelemetry.md) for examples and the
+Praxis 0.7.1 trace-linkage limitation.
+
 This generated config covers the direct API-provider path where the consumer
 gateway is often also the final-hop gateway for the provider API call.  Remote
 provider sites follow the same SecretRef contract, but the provider credential
