@@ -2,14 +2,13 @@ gridNetwork:
   name: grid
   gridId: ""
   # -- Create a GridSite for each SWIM peer and route to them. Unset, it is on when peers
-  # are listed, else off, which keeps the routingClusterRef overlay of existing networks.
+  # are listed, else off, which keeps the clusterName overlay of existing networks.
   # autoDiscoverSites: true
   region: ""
   zone: ""
   seeds: []
   swim: {}
   tls: {}
-  gatewayRefs: []
   # New chart installations use stabilized admission parameters. Pressure
   # transitions require an active scoringPolicy and matching provider metrics
   # signalNames; otherwise admission remains new_and_existing. Omit this block
@@ -41,7 +40,6 @@ gridSite:
   region: ""
   zone: ""
   providerSiteLabel: ""
-  egress: {}
 
 # -- Remote sites this site trusts, keyed by site name, one GridSite <network>-<name>
 # each, the name the operator gives a peer it discovers. Listing peers also turns on

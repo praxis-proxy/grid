@@ -18,7 +18,7 @@
 - [Auth and Policy](architecture/auth.md) — provider authentication strategies,
   access policy, and trust model.
 - [Consumer Config](architecture/consumer-config.md) — operator-generated
-  consumer Praxis `ConfigMap` and the `GatewayRef.consumerConfig` API.
+  consumer Praxis `ConfigMap` and the `GatewayRef.praxisConfig` API.
 - [External Client Ingress](architecture/external-ingress.md) — GTM/GLB edge
   selection, AGN provider routing, trust boundaries, affinity, snapshot
   delivery, and provider-boundary ownership.
@@ -67,6 +67,8 @@ image preparation, execution, evidence, and cleanup.
 
 - [Existing-Cluster Helm Installation](installation/existing-clusters.md) —
   install AGN and Praxis on running Kubernetes clusters with Helm.
+- [0.1.5 to 0.1.6 CRD Field Migration](installation/migration-0.1.5-to-0.1.6.md) —
+  migrate deprecated field names before the 0.1.6 upgrade.
 
 ## Development
 

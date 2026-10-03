@@ -42,9 +42,9 @@ Key differences:
 - Missing `transport` fails closed — the operator will not render the cluster entry.
 - `plaintext` must not set `sni` (rejected as likely misconfiguration).
 
-## Implemented: GatewayRef.consumerConfig
+## Implemented: GatewayRef.praxisConfig
 
-When `spec.gatewayRefs[].consumerConfig.enabled: true`, the `GridNetwork`
+When `spec.consumerGateways[].praxisConfig.generate: true`, the `GridNetwork`
 controller renders a `praxis.yaml`-keyed `ConfigMap` in the gateway namespace on
 every reconcile.  The generated config includes:
 
@@ -65,7 +65,7 @@ The generated config is a complete, runnable Praxis config containing:
   - `credential_inject` entries using `file:` sources when credential-bearing
     candidates are present — token bytes are never written to the `ConfigMap`
   - `load_balancer` entries (one per unique candidate cluster). Every referenced
-    cluster must have a matching `consumerConfig.clusterEndpoints[]` entry with
+    cluster must have a matching `praxisConfig.clusterEndpoints[]` entry with
     endpoint address and explicit `transport` configuration (`mutual_tls` or
     `plaintext`).  Missing transport fails closed — the operator will not
     silently render a plain-HTTP cluster when transport intent is absent
@@ -82,18 +82,18 @@ The generated config requires a Praxis AI image that contains the
 credential references today; deployments must ensure the selected Praxis AI image
 includes the matching request-time filter.
 
-See [`docs/architecture/crds.md`](crds.md#gatewayrefconsumerconfig) for the full
+See [`docs/architecture/crds.md`](crds.md#gatewayrefpraxisconfig) for the full
 field reference.
 
 ## Operational diagnostics
 
-After enabling `consumerConfig.enabled: true` for a gateway, the `GridNetwork`
-status reports the outcome under `status.consumerConfigStatus[]`.
+After enabling `praxisConfig.generate: true` for a gateway, the `GridNetwork`
+status reports the outcome under `status.praxisConfigStatus[]`.
 
 ### Reading consumer config status
 
 ```console
-kubectl get gridnetwork production -o jsonpath='{.status.consumerConfigStatus}' | jq .
+kubectl get gridnetwork production -o jsonpath='{.status.praxisConfigStatus}' | jq .
 ```
 
 Example success output:
@@ -121,7 +121,7 @@ Example failure output:
     "namespace": "praxis-system",
     "configMapName": "praxis-consumer-config",
     "phase": "Error",
-    "reason": "ConsumerConfigApplyFailed",
+    "reason": "PraxisConfigApplyFailed",
     "message": "kube error: ...",
     "observedGeneration": 7
   }
@@ -133,38 +133,38 @@ Example failure output:
 | Reason | Phase | Meaning |
 |---|---|---|
 | _(empty)_ | `Rendered` | Config rendered and `ConfigMap` applied successfully |
-| `MissingClusterEndpoint` | `Error` | A candidate cluster is missing from `consumerConfig.clusterEndpoints[]` |
+| `MissingClusterEndpoint` | `Error` | A candidate cluster is missing from `praxisConfig.clusterEndpoints[]` |
 | `MissingTransport` | `Error` | A cluster endpoint has no `transport` configuration — the operator refuses to guess TLS vs plaintext |
 | `MissingSni` | `Error` | A `mutual_tls` cluster endpoint has no (or blank) `sni` — mTLS requires a server name |
 | `PlaintextWithSni` | `Error` | A `plaintext` cluster endpoint has `sni` set — `sni` does not enable TLS; use `mutual_tls` if TLS is intended |
-| `ConsumerConfigRenderFailed` | `Error` | Overlay data produced an unrenderable config (e.g. blank local site) |
-| `ConsumerConfigApplyFailed` | `Error` | Kubernetes API rejected the `ConfigMap` apply (e.g. RBAC, namespace not found) |
-| `ConsumerConfigError` | `Error` | Other error during render or apply |
+| `PraxisConfigRenderFailed` | `Error` | Overlay data produced an unrenderable config (e.g. blank local site) |
+| `PraxisConfigApplyFailed` | `Error` | Kubernetes API rejected the `ConfigMap` apply (e.g. RBAC, namespace not found) |
+| `PraxisConfigError` | `Error` | Other error during render or apply |
 
 ### Troubleshooting
 
-**Phase is `Error` / reason `ConsumerConfigApplyFailed`**
+**Phase is `Error` / reason `PraxisConfigApplyFailed`**
 
 The operator could not apply the `ConfigMap`.  Common causes:
 
 - Missing RBAC: the operator's `ServiceAccount` lacks `configmaps` `create`
   and `patch` in the gateway namespace.  See the
   [RBAC permissions](operations.md#rbac-permissions) in the operations guide.
-- The namespace does not exist.  Create it before enabling `consumerConfig`.
+- The namespace does not exist.  Create it before enabling `praxisConfig`.
 - Kubernetes API server is temporarily unavailable.  The reconcile will retry on
   the next requeue (default 5 minutes) or when the `GridNetwork` or any watched
   `InferenceProvider` changes.
 
-**Phase is `Error` / reason `ConsumerConfigRenderFailed`**
+**Phase is `Error` / reason `PraxisConfigRenderFailed`**
 
-The overlay data produced a structural error.  Check that `localSiteName` is set
+The overlay data produced a structural error.  Check that `siteName` is set
 on the `GatewayRef` (or that the `GridNetwork` name is a valid site identity) and
-that all provider `routingClusterRef` values are non-empty.
+that all provider `clusterName` values are non-empty.
 
 **Phase is `Error` / reason `MissingClusterEndpoint`**
 
 At least one route candidate references a cluster with no corresponding
-`consumerConfig.clusterEndpoints[]` entry.  Add an endpoint entry for the reported
+`praxisConfig.clusterEndpoints[]` entry.  Add an endpoint entry for the reported
 cluster before restarting or rolling out the consumer gateway.
 
 **Phase is `Error` / reason `MissingTransport`**
@@ -246,5 +246,5 @@ The generated `ConfigMap` never contains credential token bytes.  Credential
 entries reference a mounted Kubernetes Secret via a `file:` path.  The Secret
 must be provisioned in the cluster where the final-hop gateway or provider-side
 component that calls the backend runs.  The
-`status.consumerConfigStatus[].message` field also never contains token bytes —
+`status.praxisConfigStatus[].message` field also never contains token bytes —
 error messages describe structural failures only.

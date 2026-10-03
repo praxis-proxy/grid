@@ -186,7 +186,7 @@ granted for `secrets` and `configmaps`.  `delete` and
 | Resource | Verbs | Why |
 |---|---|---|
 | `gridnetworks` | `get`, `list`, `watch`, `patch` | Controller watch loop; SSA spec/status writes |
-| `gridnetworks/status` | `get`, `patch` | Phase, connectedSites, distributedProviderCount |
+| `gridnetworks/status` | `get`, `patch` | Phase, connectedSites, remoteProviderCount |
 | `gridsites` | `get`, `list`, `watch`, `patch` | Controller watch; auto-creation from SWIM Alive members |
 | `gridsites/status` | `get`, `patch` | Phase, reason, publicCertPem, observedGeneration |
 | `inferenceproviders` | `get`, `list`, `watch`, `patch` | Controller watch; site-selector matching |
@@ -222,7 +222,7 @@ across namespaces or list `Secrets`.
 |---|---|---|
 | `spec.tls.siteSecretRef` | `tls.crt`, `tls.key` (client cert + private key for mTLS gateway probes; key bytes wrapped in `Zeroizing`) | `tls.crt`, `tls.key` (create-if-absent via SSA patch) |
 | `spec.tls.caSecretRef` | `ca.crt` (existence check) | `ca.crt`, `ca.key` (create-if-absent via SSA patch) |
-| `spec.tls.swimKeyRef` | `key` (or custom key field) | — |
+| `spec.tls.swimKeySecretRef` | `key` (or custom key field) | — |
 | `spec.auth.secretRef` | existence + UTF-8 validation | — |
 
 Secret writes use SSA `patch` with field manager
@@ -238,7 +238,7 @@ overlays, status fields, or logs.
 | `ConfigMap` | Naming | Data key | Namespace |
 |---|---|---|---|
 | Routing overlay | `grid-overlay-{network}-{gateway}` | `routing-overlay.json`, `routing-config.json` | `GatewayRef.namespace` |
-| Consumer config | `consumerConfig.configMapName` | `praxis.yaml` | `GatewayRef.namespace` |
+| Consumer config | `praxisConfig.configMapName` | `praxis.yaml` | `GatewayRef.namespace` |
 
 ### What is not granted
 
@@ -276,7 +276,7 @@ roleRef:
 
 Add one `RoleBinding` per namespace referenced by
 `GatewayRef.namespace`, `tls.caSecretRef.namespace`,
-`tls.siteSecretRef.namespace`, `tls.swimKeyRef.namespace`,
+`tls.siteSecretRef.namespace`, `tls.swimKeySecretRef.namespace`,
 and `auth.secretRef.namespace` in your CRD specs.
 
 ### Deployment configuration
@@ -325,7 +325,7 @@ address, and they share its cap.
 
 `GRID_SWIM_ENCRYPT_KEY` is intentionally omitted from the
 `Deployment`.  Production SWIM encryption uses
-`GridNetwork.spec.tls.swimKeyRef` to reference a
+`GridNetwork.spec.tls.swimKeySecretRef` to reference a
 Kubernetes `Secret`.  The env var exists for local
 development and testing only.
 
@@ -353,7 +353,7 @@ metadata:
 spec:
   seeds:
     - "10.0.0.5:7946"
-  gatewayRefs:
+  consumerGateways:
     - name: inference-gw
       namespace: praxis-system
   tls:
@@ -423,17 +423,17 @@ unqualified rolling update.
 **Transport-security contract**
 
 SWIM is the AGN control-plane membership and state broadcast channel. When
-`spec.tls.swimKeyRef` is configured and the referenced Secret resolves to a
+`spec.tls.swimKeySecretRef` is configured and the referenced Secret resolves to a
 valid 32-byte key, reconcile applies the key before announcing CRD seeds or
 publishing certificate/provider state.  From that point, outgoing SWIM UDP
 packets are encrypted and authenticated with AES-256-GCM.  Incoming packets
 that fail authentication are silently dropped; the foca membership state
 machine never sees them.
 
-When `swimKeyRef` is absent, SWIM traffic is sent and received as cleartext
+When `swimKeySecretRef` is absent, SWIM traffic is sent and received as cleartext
 (backward-compatible local and development behavior).
 
-If `swimKeyRef` is configured but the Secret is missing, unreadable, or not a
+If `swimKeySecretRef` is configured but the Secret is missing, unreadable, or not a
 valid 32-byte key, the reconcile fails before CRD seed announcement and
 certificate/provider broadcasts for that `GridNetwork`.  The SWIM runtime is
 process-global, so a previously loaded key remains active until restart; the
@@ -442,7 +442,7 @@ operator does not switch to plaintext for that configured reconcile.
 `GRID_SWIM_ENCRYPT_KEY` is the local and Kind validation path for startup-time
 enforcement because it is available before the UDP socket starts.  It is
 process environment material and should not be treated as the production Secret
-delivery mechanism.  With CRD-backed `swimKeyRef`, the key is applied at
+delivery mechanism.  With CRD-backed `swimKeySecretRef`, the key is applied at
 `GridNetwork` reconcile time; use the environment key as well when startup-time
 plaintext acceptance must be avoided before CRD preload support exists.
 
@@ -500,7 +500,7 @@ the SWIM runtime reports at least one `Alive` peer in
 its `MembershipSnapshot`.  `Degraded` is set when peers
 are known but all are `Suspect` or `Dead`.
 `connectedSites` reflects the live SWIM `Alive` peer
-count; `distributedProviderCount` reflects remote
+count; `remoteProviderCount` reflects remote
 `InferenceProvider` records received via SWIM CRDT
 broadcast.
 
@@ -541,14 +541,14 @@ The trust bootstrap for a remote site progresses through these steps:
 2. **Gateway address known** — the remote operator advertises its resolved gateway
    address via SWIM state broadcast.  The address is resolved by the self-discovery
    poller (Service LoadBalancer lookup) or from the `GRID_GATEWAY_ADDRESS` override.
-   The local operator stores it in `GridSite.spec.egress.address`.
+   The local operator stores it in `GridSite.spec.gatewayEndpoint.address`.
    Phase: `Connecting`.  No trust established.
 
 3. **Public cert material received** — the remote operator broadcasts its public site
    certificate PEM.  The operator validates the PEM structure (rejects private-key markers;
    checks for `CERTIFICATE` header) and stores it in `GridSite.status.publicCertPem`.
 
-4. **Identity policy configured** — set `spec.egress.tls.serverName` to the
+4. **Identity policy configured** — set `spec.gatewayEndpoint.tls.serverName` to the
    expected DNS SAN and set `spec.trust.canonicalFingerprints` to one or two
    independently verified DER-certificate SHA-256 pins. Configure
    `GridNetwork.spec.tls.caSecretRef` and `siteSecretRef` for server and client
@@ -561,7 +561,7 @@ The trust bootstrap for a remote site progresses through these steps:
 
    ```yaml
    spec:
-     egress:
+     gatewayEndpoint:
        address: provider.example.com:8443
        tls:
          mode: Mutual
@@ -620,12 +620,12 @@ gateway independently authorizes peer identity on every data-plane request.
 ## 5. Connectivity Verification
 
 The `GridSite` controller verifies gateway reachability and identity against
-`spec.egress.address`.
+`spec.gatewayEndpoint.address`.
 
 | Condition | Current check |
 |-----------|---------------|
 | `SWIMReachable` | SWIM membership reports the peer Alive |
-| `GatewayAddressKnown` | `spec.egress.address` is non-empty |
+| `GatewayAddressKnown` | `spec.gatewayEndpoint.address` is non-empty |
 | `TlsVerified` | Mutual TLS handshake, chain, SAN, and live-leaf pin all verify |
 | `IdentityVerificationRequired` | Plaintext endpoint accepts TCP, but remains ineligible because its identity is not verified |
 
@@ -689,7 +689,7 @@ spec:
 ## 8. Routing Configuration
 
 The `GridNetwork` controller renders routing overlay
-`ConfigMap`s from CRD data. For each `gatewayRef` in the
+`ConfigMap`s from CRD data. For each `consumerGateways` entry in the
 `GridNetwork`, it server-side applies a `ConfigMap`
 named `grid-overlay-{network}-{gateway}` containing:
 
@@ -730,7 +730,7 @@ The overlay shape is compatible with the Praxis
 ```
 
 **Cluster naming:** `candidate.cluster` uses
-`spec.routingClusterRef` when set, otherwise the
+`spec.clusterName` when set, otherwise the
 `InferenceProvider` metadata name.  The Praxis
 `load_balancer` cluster serving that provider must use
 the same identity.
@@ -865,7 +865,7 @@ public certificate (`tls.crt`) from the site Secret, not the private key (`tls.k
 
 The operator resolves and advertises its data-plane gateway address to SWIM
 peers. This address is propagated through SWIM state broadcasts and used by
-receiving operators to populate `GridSite.spec.egress.address` for
+receiving operators to populate `GridSite.spec.gatewayEndpoint.address` for
 auto-discovered sites.
 
 **Self-discovery (default):** A background poller periodically looks up the
@@ -888,9 +888,9 @@ GRID_GATEWAY_ADDRESS=10.0.0.4:8080 ./operator
 
 **Requirements:**
 - Format: `host:port` or `IP:port` (any non-empty string is accepted; the remote
-  operator stores it verbatim in `GridSite.spec.egress.address`)
+  operator stores it verbatim in `GridSite.spec.gatewayEndpoint.address`)
 - When absent or empty and no LoadBalancer Service exists: auto-discovered
-  `GridSite` records have empty `spec.egress.address` and stay in `Discovered`
+  `GridSite` records have empty `spec.gatewayEndpoint.address` and stay in `Discovered`
   phase until the Service appears
 - This address is separate from `GRID_SWIM_BIND_ADDR` — the SWIM gossip endpoint
   and the data-plane gateway address are distinct
@@ -901,7 +901,7 @@ validated by host, named port, protocol, SNI, address scope, and generation;
 arbitrary or ambiguous advertised strings do not become routable endpoints.
 
 **Probe behavior:** In Mutual mode, the `GridSite` controller performs a bounded
-mTLS connection to `spec.egress.address`. It verifies the configured CA,
+mTLS connection to `spec.gatewayEndpoint.address`. It verifies the configured CA,
 `serverName`, and the canonical live-certificate pin. A successful probe reports
 `reason: TlsVerified`. Connection failures move an Active site to `Unreachable`;
 identity or trust failures move it to `Connecting`.
@@ -942,7 +942,7 @@ kubectl get gridsite <name> -o jsonpath='{.status.phase}/{.status.reason}: {.sta
 |---|---|---|
 | (new) | Pending | Resource created |
 | Pending | Discovered | `GridNetwork` controller observes SWIM Alive member |
-| Discovered | Connecting | `GridSite` controller: `spec.egress.address` non-empty |
+| Discovered | Connecting | `GridSite` controller: `spec.gatewayEndpoint.address` non-empty |
 | Connecting | Active | `GridSite` controller: configured Mutual TLS identity probe succeeds |
 | Active | Connecting | TLS identity or trust verification fails, or the endpoint is changed to plaintext |
 | Active | Unreachable | Gateway address is missing, times out, or refuses the connection |
@@ -961,7 +961,7 @@ separate steps.
 
 **Phase stays Discovered (not advancing to Connecting)**
 
-- The site has no `spec.egress.address`.  Verify the remote operator's
+- The site has no `spec.gatewayEndpoint.address`.  Verify the remote operator's
   `provider-gateway` LoadBalancer Service exists and has an external IP assigned,
   or set `GRID_GATEWAY_ADDRESS` as an explicit override.  The self-discovery poller
   will propagate the address through SWIM once discovered.
@@ -986,7 +986,7 @@ separate steps.
 
 **Phase is Active, site became Unreachable**
 
-- The connection to `spec.egress.address` failed. When connectivity returns,
+- The connection to `spec.gatewayEndpoint.address` failed. When connectivity returns,
   the complete configured identity probe must pass before the site returns to
   Active.
 
@@ -998,7 +998,7 @@ includes `gridsites/status` with verbs `get` and `patch`.
 
 ## Consumer Config
 
-When `GatewayRef.consumerConfig.enabled: true`, the AGN Operator applies a
+When `GatewayRef.praxisConfig.generate: true`, the AGN Operator applies a
 `ConfigMap` in the gateway's namespace on every reconcile.  The
 `grid-operator-resources` `ClusterRole` includes `configmaps` with verbs
 `create` and `patch`.  A `RoleBinding` in the gateway's namespace is required
@@ -1107,7 +1107,7 @@ desired revision
   -> Praxis accepted/serving revision
 ```
 
-`GridNetwork.status.consumerConfigStatus=Rendered` reports successful desired
+`GridNetwork.status.praxisConfigStatus=Rendered` reports successful desired
 config rendering and apply. It does not report that the gateway loaded the
 overlay. The production contract requires gateway status for the accepted
 revision, digest, acceptance time, age, and last rejection reason. That
@@ -1233,7 +1233,7 @@ through the consumer gateway.
 
 The validation covers provider health classification,
 candidate ordering, metrics-aware ordering,
-`routingClusterRef` identity mapping, overlay export,
+`clusterName` identity mapping, overlay export,
 consumer gateway deployment, successful routing for a
 known model, and clean failure for an unknown model.
 
@@ -1275,7 +1275,7 @@ maps the `InferenceProvider` CRD to a
 `StateBroadcast` over foca's custom-broadcast path. The
 receiver merges the `GridStateSnapshot`, and subsequent
 status reconciliation reflects remote provider state in
-`GridNetwork.status.distributedProviderCount`.
+`GridNetwork.status.remoteProviderCount`.
 
 **Provider fields propagated over SWIM:**
 
@@ -1284,7 +1284,7 @@ status reconciliation reflects remote provider state in
 | `network_id` | owning `GridNetwork.metadata.name` |
 | `site_id` | local SWIM site identity |
 | `provider_id` | `metadata.name` |
-| `routing_cluster` | `spec.routingClusterRef` or `metadata.name` |
+| `routing_cluster` | `spec.clusterName` or `metadata.name` |
 | `models` | `spec.models[*].name` |
 | `backend_kind` | `spec.backendKind` |
 | `phase` | `status.phase` (including `Unavailable`) |
@@ -1292,7 +1292,7 @@ status reconciliation reflects remote provider state in
 | `revision` | `metadata.resourceVersion`, falling back to `metadata.generation` |
 | `writer_id` | local SWIM site identity |
 
-`distributedProviderCount` in `GridNetworkStatus`
+`remoteProviderCount` in `GridNetworkStatus`
 reflects received remote provider records for the
 current `GridNetwork`; local records and records from
 other `GridNetwork`s are excluded. The local validation
@@ -1310,7 +1310,7 @@ This command starts three SWIM-enabled operator processes in a linear topology:
 node A (no seeds), node B (seeds A), and node C (seeds B only — not A).  It proves:
 
 1. **Transitive discovery** — A learns about C through B.  After gossip convergence,
-   `GridNetwork.status.distributedProviderCount >= 2` on A, confirming CRDT state from
+   `GridNetwork.status.remoteProviderCount >= 2` on A, confirming CRDT state from
    both B and C reached A transitively.
 
 2. **Routing eligibility before Active** — C's CRDT provider is present in A's

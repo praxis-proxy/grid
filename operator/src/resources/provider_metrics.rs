@@ -179,14 +179,14 @@ fn signal_scrape_plan(provider: &InferenceProvider) -> Option<(&str, String, std
     let mc = provider.spec.metrics_config.as_ref()?;
     let identity = routing_identity(provider)?;
     let endpoint = provider.spec.endpoint.trim();
-    if endpoint.is_empty() || mc.metrics_endpoint.as_deref().is_some_and(|ep| ep.trim().is_empty()) {
+    if endpoint.is_empty() || mc.endpoint.as_deref().is_some_and(|ep| ep.trim().is_empty()) {
         return None;
     }
     let wanted = signal_metric_names(&mc.signal_names);
     if wanted.is_empty() {
         return None;
     }
-    let url = metrics_url(mc.metrics_endpoint.as_deref().unwrap_or(endpoint), &mc.path);
+    let url = metrics_url(mc.endpoint.as_deref().unwrap_or(endpoint), &mc.path);
     Some((identity, url, wanted))
 }
 
@@ -303,7 +303,7 @@ pub(crate) fn parse_metrics_timeout(s: &str) -> Duration {
 /// so watch-triggered reconciles can reuse the current scrape generation.
 ///
 /// Returns a map from provider routing identity (the value of
-/// `spec.routingClusterRef`, or `metadata.name` when absent) to
+/// `spec.clusterName`, or `metadata.name` when absent) to
 /// [`scoring::BackendMetrics`].
 ///
 /// Providers without `metricsConfig` or with a blank endpoint are skipped and
@@ -397,12 +397,12 @@ pub(crate) async fn collect_provider_metrics_with_refresh_interval(
         if endpoint.is_empty() {
             continue;
         }
-        if let Some(ep) = mc.metrics_endpoint.as_deref()
+        if let Some(ep) = mc.endpoint.as_deref()
             && ep.trim().is_empty()
         {
             tracing::warn!(
                 provider = identity,
-                "metricsEndpoint is present but blank; skipping metrics collection"
+                "metricsConfig.endpoint is present but blank; skipping metrics collection"
             );
             continue;
         }
@@ -415,7 +415,7 @@ pub(crate) async fn collect_provider_metrics_with_refresh_interval(
             );
             continue;
         }
-        let base = mc.metrics_endpoint.as_deref().unwrap_or(endpoint);
+        let base = mc.endpoint.as_deref().unwrap_or(endpoint);
         let url = metrics_url(base, &mc.path);
         let timeout = parse_metrics_timeout(&mc.timeout);
         let names = metric_names_from_config(&mc.signal_names, mc.pool_name.as_deref(), mc.queue_capacity);
@@ -759,7 +759,7 @@ mod tests {
                 ..Default::default()
             },
             stale_metrics_seconds: None,
-            metrics_endpoint: None,
+            endpoint: None,
             pool_name: None,
             queue_capacity: None,
             tls: None,
@@ -775,7 +775,7 @@ mod tests {
                 ..Default::default()
             },
             stale_metrics_seconds: Some(ttl),
-            metrics_endpoint: None,
+            endpoint: None,
             pool_name: None,
             queue_capacity: None,
             tls: None,
@@ -983,7 +983,7 @@ mod tests {
                 "backendKind": "local",
                 "endpoint": base_url,
                 "models": [{"name": "model-a"}],
-                "routingClusterRef": "site-x",
+                "clusterName": "site-x",
                 "metricsConfig": {
                     "path": "/metrics",
                     "timeout": "2s",
@@ -996,11 +996,11 @@ mod tests {
         let result = collect_provider_metrics("net", &[provider], &empty_cache(), Instant::now(), None).await;
         assert!(
             result.metrics.contains_key("site-x"),
-            "metrics must be keyed by routingClusterRef, not metadata.name"
+            "metrics must be keyed by clusterName, not metadata.name"
         );
         assert!(
             !result.metrics.contains_key("prov-a"),
-            "metadata.name must not be used as key when routingClusterRef is set"
+            "metadata.name must not be used as key when clusterName is set"
         );
     }
 

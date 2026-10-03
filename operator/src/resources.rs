@@ -6,7 +6,7 @@ pub(crate) mod geography;
 /// Operator-owned consumer Praxis config renderer.
 ///
 /// Generates the `praxis.yaml` content for consumer gateway `ConfigMap`s from
-/// routing overlays.  Used when `GatewayRef.consumerConfig.enabled` is true.
+/// routing overlays.  Used when `GatewayRef.praxisConfig.generate` is true.
 pub(crate) mod consumer_config;
 
 /// Controller-owned credential resolution for API-provider authentication.

@@ -147,7 +147,7 @@ pub(crate) const FULL_GRID_MODEL_CLOUD: &str = "model-cloud";
 /// Model served by the API-provider in full-grid.
 pub(crate) const FULL_GRID_MODEL_API: &str = "model-api";
 
-/// The `routingClusterRef` set on the healthy provider fixture.
+/// The `clusterName` set on the healthy provider fixture.
 ///
 /// Matches the xtask topology site name `site-a` so that the operator-generated
 /// overlay candidate has `site: "site-a"` and `cluster: "site-a"`.  The xtask
@@ -155,7 +155,7 @@ pub(crate) const FULL_GRID_MODEL_API: &str = "model-api";
 /// `gateway-{site}`, so `gateway-site-a` routes to the site-a provider gateway.
 pub(crate) const TEST_HEALTHY_ROUTING_CLUSTER: &str = "site-a";
 
-/// The `routingClusterRef` set on the degraded provider fixture.
+/// The `clusterName` set on the degraded provider fixture.
 ///
 /// Routes through the same site-a provider gateway as the healthy fixture.
 /// The degraded candidate appears in the overlay with `fresh: false`; Praxis
@@ -178,9 +178,9 @@ pub(crate) const POD_READY_TIMEOUT: Duration = Duration::from_secs(60);
 pub(crate) const TEST_METRICS_IDLE_PROVIDER: &str = "op-e2e-metrics-idle";
 /// Name of the `InferenceProvider` fixture with a high (busy) queue depth metric.
 pub(crate) const TEST_METRICS_BUSY_PROVIDER: &str = "op-e2e-metrics-busy";
-/// `routingClusterRef` of the idle metrics provider; becomes `candidate.cluster` in the overlay.
+/// `clusterName` of the idle metrics provider; becomes `candidate.cluster` in the overlay.
 pub(crate) const TEST_METRICS_IDLE_ROUTING_CLUSTER: &str = "site-metrics-idle";
-/// `routingClusterRef` of the busy metrics provider; becomes `candidate.cluster` in the overlay.
+/// `clusterName` of the busy metrics provider; becomes `candidate.cluster` in the overlay.
 pub(crate) const TEST_METRICS_BUSY_ROUTING_CLUSTER: &str = "site-metrics-busy";
 /// Local port used when port-forwarding the idle metrics endpoint Pod to the operator host.
 pub(crate) const METRICS_IDLE_LOCAL_PORT: u16 = 18_501;
@@ -513,7 +513,7 @@ pub(crate) const SITE_JOIN_LABEL_KEY: &str = "grid.praxis-proxy.io/sjd-site";
 
 /// Egress address for the primary site (Kind east-cluster node IP + TLS port).
 ///
-/// This is metadata used to populate `GridSite.spec.egress.address` in the
+/// This is metadata used to populate `GridSite.spec.gatewayEndpoint.address` in the
 /// validation harness.  It is not connected to during the test.
 pub(crate) const SITE_JOIN_PRIMARY_EGRESS: &str = "172.18.0.4:8443";
 
@@ -932,7 +932,7 @@ fn generate_crd_json() -> Result<String, Box<dyn std::error::Error>> {
 /// Apply the Grid operator validation fixtures to `context`.
 ///
 /// Creates:
-/// - `GridNetwork` `op-e2e-net` with one `gatewayRef`
+/// - `GridNetwork` `op-e2e-net` with one `consumerGateways` entry
 /// - `InferenceProvider` `op-e2e-healthy` — valid endpoint → reconciles to `Pending`
 /// - `InferenceProvider` `op-e2e-invalid` — blank endpoint → reconciles to `Unavailable`
 pub(crate) fn apply_test_fixtures(context: &str, provider_endpoint: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -950,9 +950,9 @@ pub(crate) fn apply_test_fixtures_for_cluster(
     routing_cluster: &str,
     model: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // localSiteName must match the healthy/degraded/metrics fixtures'
-    // routingClusterRef so their overlay candidates resolve to
-    // LocalityTier::SameSite (grid#60): without it, GatewayRef.localSiteName
+    // siteName must match the healthy/degraded/metrics fixtures'
+    // clusterName so their overlay candidates resolve to
+    // LocalityTier::SameSite (grid#60): without it, GatewayRef.siteName
     // falls back to the network name, which matches no candidate's site, so
     // every candidate ties at LocalityTier::Unknown and GeographyFirst
     // ordering falls through to score (tied under the noMetrics default
@@ -970,24 +970,24 @@ pub(crate) fn apply_test_fixtures_for_cluster(
     kubectl::apply_manifest(context, &network)?;
     kubectl::apply_manifest(context, &healthy)?;
     kubectl::apply_manifest(context, &invalid)?;
-    eprintln!("  [OK] test fixtures applied (routingClusterRef={routing_cluster:?}, model={model:?})");
+    eprintln!("  [OK] test fixtures applied (clusterName={routing_cluster:?}, model={model:?})");
     Ok(())
 }
 
 /// Build a `GridNetwork` JSON fixture.
 ///
-/// `local_site_name` becomes `gatewayRefs[0].localSiteName` — the site the
+/// `site_name` becomes `consumerGateways[0].siteName` — the site the
 /// rendered overlay treats as "local" for `GeographyFirst` locality-tier
-/// ordering. Pass the `routingClusterRef` used by the fixtures that should
+/// ordering. Pass the `clusterName` used by the fixtures that should
 /// resolve to `LocalityTier::SameSite`.
-fn network_fixture_json(name: &str, gw_name: &str, gw_ns: &str, local_site_name: &str) -> String {
+fn network_fixture_json(name: &str, gw_name: &str, gw_ns: &str, site_name: &str) -> String {
     serde_json::to_string_pretty(&serde_json::json!({
         "apiVersion": "grid.praxis-proxy.io/v1alpha1",
         "kind": "GridNetwork",
         "metadata": { "name": name },
         "spec": {
             "seeds": [],
-            "gatewayRefs": [{ "name": gw_name, "namespace": gw_ns, "localSiteName": local_site_name }]
+            "consumerGateways": [{ "name": gw_name, "namespace": gw_ns, "siteName": site_name }]
         }
     }))
     .unwrap_or_else(|e| {
@@ -998,13 +998,13 @@ fn network_fixture_json(name: &str, gw_name: &str, gw_ns: &str, local_site_name:
 
 /// Build an `InferenceProvider` JSON fixture.
 ///
-/// When `routing_cluster_ref` is `Some(name)`, sets `spec.routingClusterRef`
+/// When `cluster_name` is `Some(name)`, sets `spec.clusterName`
 /// so that overlay candidates use `name` as both `site` and `cluster` (Phase 1).
 fn provider_fixture_json(
     name: &str,
     network_ref: &str,
     endpoint: &str,
-    routing_cluster_ref: Option<&str>,
+    cluster_name: Option<&str>,
     model: &str,
 ) -> String {
     let mut spec = serde_json::json!({
@@ -1014,10 +1014,10 @@ fn provider_fixture_json(
         "endpoint": endpoint,
         "models": [{ "name": model }]
     });
-    if let Some(r) = routing_cluster_ref
+    if let Some(r) = cluster_name
         && let Some(s) = spec.as_object_mut()
     {
-        s.insert("routingClusterRef".to_owned(), serde_json::Value::String(r.to_owned()));
+        s.insert("clusterName".to_owned(), serde_json::Value::String(r.to_owned()));
     }
     serde_json::to_string_pretty(&serde_json::json!({
         "apiVersion": "grid.praxis-proxy.io/v1alpha1",
@@ -1038,7 +1038,7 @@ fn provider_fixture_json(
 /// Apply the minimal `GridNetwork` + `GridSite` fixtures the
 /// `AgentToolProvider` convergence check needs.
 ///
-/// Neither resource needs a `gatewayRef` or labels: `AgentToolProvider`'s
+/// Neither resource needs a `providerGateway` or labels: `AgentToolProvider`'s
 /// default `siteSelector` matches every `GridSite` referencing the network,
 /// so a bare `GridSite` is enough to clear site-matching once the network
 /// exists.
@@ -1630,7 +1630,7 @@ fn operator_log_files(site_name: &str) -> Result<(std::fs::File, std::fs::File),
 /// The key value is passed to the child process via the environment — it is
 /// visible to other processes on the same host (standard Unix env var rules).
 /// In Kind-based tests this is acceptable; in production use
-/// `GridNetwork.spec.tls.swimKeyRef` instead.
+/// `GridNetwork.spec.tls.swimKeySecretRef` instead.
 #[expect(
     clippy::disallowed_methods,
     reason = "spawns a child operator process; sleep is deliberate startup pause"
@@ -1699,7 +1699,7 @@ pub(crate) fn wait_for_swim_convergence(duration: Duration) {
 
 /// Apply the bare `GridNetwork` resource used by the SWIM membership validation.
 ///
-/// No `gatewayRefs` or `InferenceProvider`s are needed — the test only
+/// No `consumerGateways` or `InferenceProvider`s are needed — the test only
 /// verifies that `status.connectedSites` and `status.phase` reflect the live
 /// SWIM snapshot from the running operators.
 pub(crate) fn apply_swim_test_network(context: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -1853,7 +1853,7 @@ pub(crate) fn wait_for_gridnetwork_active(
 ///
 /// - bumps the `GridNetwork` on every loop so the controller keeps reconciling;
 /// - waits until `status.observedGeneration` exists at least once;
-/// - fails immediately if `connectedSites` or `distributedProviderCount` becomes non-zero;
+/// - fails immediately if `connectedSites` or `remoteProviderCount` becomes non-zero;
 /// - fails if the overlay ever contains a candidate from `rejected_site`.
 ///
 /// # Errors
@@ -1898,13 +1898,12 @@ pub(crate) fn assert_swim_peer_stays_isolated(
             .into());
         }
 
-        let distributed_str =
-            kubectl_jsonpath(context, &resource, "{.status.distributedProviderCount}").unwrap_or_default();
-        let distributed_provider_count: u32 = distributed_str.parse().unwrap_or(0);
-        if distributed_provider_count != 0 {
+        let distributed_str = kubectl_jsonpath(context, &resource, "{.status.remoteProviderCount}").unwrap_or_default();
+        let remote_provider_count: u32 = distributed_str.parse().unwrap_or(0);
+        if remote_provider_count != 0 {
             return Err(format!(
                 "SWIM encryption negative proof failed: rejected site {rejected_site:?} changed \
-                 distributedProviderCount to {distributed_provider_count}"
+                 remoteProviderCount to {remote_provider_count}"
             )
             .into());
         }
@@ -1928,7 +1927,7 @@ pub(crate) fn assert_swim_peer_stays_isolated(
 
     eprintln!(
         "  [PASS] rejected peer {rejected_site:?} stayed isolated for {window:?}: \
-         connectedSites=0, distributedProviderCount=0, no overlay candidate"
+         connectedSites=0, remoteProviderCount=0, no overlay candidate"
     );
     Ok(())
 }
@@ -1939,10 +1938,10 @@ pub(crate) fn assert_swim_peer_stays_isolated(
 /// Unlike [`assert_swim_peer_stays_isolated`], this helper does NOT require
 /// `status.observedGeneration` to appear.  It is designed for scenarios where
 /// the reconcile itself fails before reaching `update_status()` — e.g., when
-/// `swimKeyRef` is configured but the referenced Secret does not exist.
+/// `swimKeySecretRef` is configured but the referenced Secret does not exist.
 ///
 /// The proof is: for the entire `window`, `connectedSites` and
-/// `distributedProviderCount` stay at zero (or absent), and no overlay
+/// `remoteProviderCount` stay at zero (or absent), and no overlay
 /// `ConfigMap` is generated.  The absence of `observedGeneration` is expected
 /// and is not treated as an error.
 ///
@@ -1976,12 +1975,11 @@ pub(crate) fn assert_reconcile_blocked_no_side_effects(
             .into());
         }
 
-        let distributed_str =
-            kubectl_jsonpath(context, &resource, "{.status.distributedProviderCount}").unwrap_or_default();
+        let distributed_str = kubectl_jsonpath(context, &resource, "{.status.remoteProviderCount}").unwrap_or_default();
         let distributed_count: u32 = distributed_str.parse().unwrap_or(0);
         if distributed_count != 0 {
             return Err(format!(
-                "reconcile-blocked proof failed: distributedProviderCount unexpectedly became {distributed_count}"
+                "reconcile-blocked proof failed: remoteProviderCount unexpectedly became {distributed_count}"
             )
             .into());
         }
@@ -2001,7 +1999,7 @@ pub(crate) fn assert_reconcile_blocked_no_side_effects(
 
     eprintln!(
         "  [PASS] reconcile blocked for {window:?}: no status written, no overlay generated, \
-         connectedSites=0, distributedProviderCount=0"
+         connectedSites=0, remoteProviderCount=0"
     );
     Ok(())
 }
@@ -2112,13 +2110,13 @@ pub(crate) fn verify_swim_status(phase: &str, connected_sites: u32) -> Result<()
 // distributed state validation helpers
 // ---------------------------------------------------------------------------
 
-/// Poll the `GridNetwork` status until `distributedProviderCount > 0`.
+/// Poll the `GridNetwork` status until `remoteProviderCount > 0`.
 /// Force an immediate `GridNetwork` reconcile by patching a timestamp annotation.
 ///
 /// The operator's `GridNetwork` controller has a long requeue interval (300 s)
 /// and a cross-watch that fires only when related objects change.  When the
 /// first reconcile wave races the peer's CRDT broadcast by milliseconds, the
-/// `distributedProviderCount` is recorded as 0.  Bumping an annotation creates
+/// `remoteProviderCount` is recorded as 0.  Bumping an annotation creates
 /// a watch event that triggers a fresh reconcile — by which point the CRDT
 /// broadcast has already been received and merged into `state_snapshot()`.
 ///
@@ -2180,7 +2178,7 @@ pub(crate) fn bump_gridsite(context: &str, name: &str) -> Result<(), Box<dyn std
 
 /// Each SWIM-enabled operator publishes real `InferenceProvider`-derived state
 /// as a CRDT `GridStateSnapshot` on reconcile.  After SWIM gossip convergence
-/// the remote operator's broadcast arrives and `distributedProviderCount`
+/// the remote operator's broadcast arrives and `remoteProviderCount`
 /// becomes ≥ 1.
 ///
 /// Returns the observed count on success or `Err` on timeout.
@@ -2198,29 +2196,29 @@ pub(crate) fn wait_for_gridnetwork_distributed_state(
         let count_str = kubectl_jsonpath(
             context,
             &format!("gridnetworks/{name}"),
-            "{.status.distributedProviderCount}",
+            "{.status.remoteProviderCount}",
         )
         .unwrap_or_default();
         let count: u32 = count_str.parse().unwrap_or(0);
 
         if count > 0 {
-            eprintln!("  [OK] GridNetwork {name}: distributedProviderCount={count}");
+            eprintln!("  [OK] GridNetwork {name}: remoteProviderCount={count}");
             return Ok(count);
         }
 
         if start.elapsed() >= timeout {
             return Err(format!(
-                "timeout waiting for GridNetwork {name} distributedProviderCount>0; last observed: {count}"
+                "timeout waiting for GridNetwork {name} remoteProviderCount>0; last observed: {count}"
             )
             .into());
         }
-        eprintln!("  waiting for GridNetwork {name} distributedProviderCount>0 (observed={count})...");
+        eprintln!("  waiting for GridNetwork {name} remoteProviderCount>0 (observed={count})...");
         bump_gridnetwork(context, name)?;
         std::thread::sleep(POLL_INTERVAL);
     }
 }
 
-/// Verify that `distributedProviderCount` is exactly 1 for the SWIM state validation.
+/// Verify that `remoteProviderCount` is exactly 1 for the SWIM state validation.
 ///
 /// The SWIM state test applies exactly one `InferenceProvider` to exactly one
 /// `GridNetwork`.  A count of 1 proves a single remote provider record arrived
@@ -2230,20 +2228,22 @@ pub(crate) fn wait_for_gridnetwork_distributed_state(
 /// unrelated network (e.g. leftover `op-e2e-net` resources) are bleeding into
 /// the SWIM test network's count.  This is a harness isolation failure and must
 /// be fixed before results are trusted.
-pub(crate) fn verify_distributed_state_received(
-    distributed_provider_count: u32,
-) -> Result<(), Box<dyn std::error::Error>> {
-    match distributed_provider_count {
-        0 => Err("distributed state validation failed: distributedProviderCount must be 1 (received 0 - state not propagated)".into()),
+pub(crate) fn verify_distributed_state_received(remote_provider_count: u32) -> Result<(), Box<dyn std::error::Error>> {
+    match remote_provider_count {
+        0 => Err(
+            "distributed state validation failed: remoteProviderCount must be 1 (received 0 - state not propagated)"
+                .into(),
+        ),
         1 => {
-            eprintln!("  [OK] distributed state received via SWIM broadcast: distributedProviderCount=1");
+            eprintln!("  [OK] distributed state received via SWIM broadcast: remoteProviderCount=1");
             Ok(())
         },
         n => Err(format!(
-            "distributed state validation failed: distributedProviderCount={n} but expected exactly 1; \
+            "distributed state validation failed: remoteProviderCount={n} but expected exactly 1; \
              cross-network state leakage suspected - ensure op-e2e-net resources are cleaned up before \
              running verify-swim-state"
-        ).into()),
+        )
+        .into()),
     }
 }
 
@@ -2408,7 +2408,7 @@ pub(crate) fn verify_overlay(
         .ok_or("overlay missing candidates array")?;
 
     // A site may have multiple candidates (e.g. healthy + degraded providers both at
-    // site-a with routingClusterRef="site-a").  We require that at least one has fresh=true.
+    // site-a with clusterName="site-a").  We require that at least one has fresh=true.
     let has_fresh = candidates
         .iter()
         .any(|c| c["cluster"].as_str() == Some(healthy_cluster) && c["fresh"].as_bool() == Some(true));
@@ -2733,7 +2733,7 @@ pub(crate) fn apply_metrics_provider_fixtures(
                 "backendKind": "local",
                 "endpoint": endpoint,
                 "models": [{ "name": "model-metrics" }],
-                "routingClusterRef": routing_cluster,
+                "clusterName": routing_cluster,
                 "metricsConfig": {
                     "path": "/metrics",
                     "timeout": "2s",
@@ -2797,7 +2797,7 @@ pub(crate) fn verify_metrics_ordering(
 /// Apply the `GridNetwork` and two `InferenceProvider` fixtures for metrics-routing.
 ///
 /// Both providers serve [`METRICS_ROUTING_MODEL`] so only the scraped queue-depth
-/// metric distinguishes them in overlay scoring.  `routingClusterRef` is set to the
+/// metric distinguishes them in overlay scoring.  `clusterName` is set to the
 /// real provider site so the overlay candidate routes to the actual provider gateway.
 ///
 /// `spec.endpoint` for each provider is `http://127.0.0.1:{east_port}` /
@@ -2818,7 +2818,7 @@ pub(crate) fn apply_metrics_routing_fixtures(
         "metadata": { "name": METRICS_ROUTING_NETWORK },
         "spec": {
             "seeds": [],
-            "gatewayRefs": [{ "name": METRICS_ROUTING_GW, "namespace": "default" }]
+            "consumerGateways": [{ "name": METRICS_ROUTING_GW, "namespace": "default" }]
         }
     }))
     .unwrap_or_else(|e| {
@@ -2841,7 +2841,7 @@ pub(crate) fn apply_metrics_routing_fixtures(
                 "backendKind": "local",
                 "endpoint": endpoint,
                 "models": [{ "name": METRICS_ROUTING_MODEL }],
-                "routingClusterRef": site,
+                "clusterName": site,
                 "metricsConfig": {
                     "path": "/metrics",
                     "timeout": "2s",
@@ -2954,7 +2954,7 @@ pub(crate) fn verify_metrics_routing_overlay(
         .as_array()
         .ok_or("overlay missing candidates array")?;
 
-    // The raw overlay JSON uses the `routingClusterRef` value as the cluster field
+    // The raw overlay JSON uses the `clusterName` value as the cluster field
     // (e.g. "site-east"), not the consumer-config cluster name ("gateway-site-east").
     // The gateway-{site} prefix is added later by `candidates_yaml` when the xtask
     // generates the Praxis consumer config.
@@ -3011,7 +3011,7 @@ pub(crate) fn apply_degraded_provider_fixture(context: &str, endpoint: &str) -> 
             "backendKind": "local",
             "endpoint": endpoint,
             "healthCheck": { "path": "/health", "timeout": "5s" },
-            "routingClusterRef": TEST_DEGRADED_ROUTING_CLUSTER,
+            "clusterName": TEST_DEGRADED_ROUTING_CLUSTER,
             "models": [{ "name": "model-y" }]
         }
     }))
@@ -3130,10 +3130,10 @@ pub(crate) fn apply_api_provider_fixture(context: &str, endpoint: &str) -> Resul
 /// endpoint topology for the operator-generated consumer `ConfigMap`.
 const PROVIDER_GATEWAY_SVC: &str = "praxis-provider";
 
-/// Apply the Grid operator validation fixtures with `consumerConfig` enabled.
+/// Apply the Grid operator validation fixtures with `praxisConfig` enabled.
 ///
 /// Identical to [`apply_test_fixtures`] but includes
-/// `GatewayRef.consumerConfig.enabled: true` with `clusterEndpoints` populated
+/// `GatewayRef.praxisConfig.generate: true` with `clusterEndpoints` populated
 /// from the provider cluster's `NodePort` address.  This allows the operator-
 /// generated consumer `ConfigMap` to include full `load_balancer` cluster entries
 /// (endpoint URL + mTLS config) instead of name-only stubs.
@@ -3180,7 +3180,7 @@ pub(crate) fn apply_test_fixtures_with_consumer_config(
     kubectl::apply_manifest(context, &network)?;
     kubectl::apply_manifest(context, &healthy)?;
     kubectl::apply_manifest(context, &invalid)?;
-    eprintln!("  [OK] test fixtures applied (consumerConfig.enabled: true, cluster_endpoints populated)");
+    eprintln!("  [OK] test fixtures applied (praxisConfig.generate: true, cluster_endpoints populated)");
     Ok(())
 }
 
@@ -3204,7 +3204,7 @@ fn discover_provider_cluster_endpoint(context: &str, cluster_name: &str) -> Opti
     }
 }
 
-/// Build the JSON value for `consumerConfig.clusterEndpoints`.
+/// Build the JSON value for `praxisConfig.clusterEndpoints`.
 ///
 /// - For the self-hosted provider (`provider_cluster`): uses `mutual_tls` transport when an address is available.
 /// - For the API provider (`api_cluster`): uses explicit `plaintext` transport.
@@ -3240,9 +3240,9 @@ fn build_consumer_cluster_endpoints(
     serde_json::Value::Array(endpoints)
 }
 
-/// Build a `GridNetwork` JSON fixture with `consumerConfig` enabled.
+/// Build a `GridNetwork` JSON fixture with `praxisConfig` enabled.
 ///
-/// The gateway reference includes `consumerConfig.enabled: true`, the given
+/// The gateway reference includes `praxisConfig.generate: true`, the given
 /// `config_map_name`, and the provided `cluster_endpoints` so the operator
 /// generates a consumer Praxis `ConfigMap` with full load-balancer entries where
 /// endpoint information is available.
@@ -3259,11 +3259,11 @@ fn network_fixture_with_consumer_config_json(
         "metadata": { "name": name },
         "spec": {
             "seeds": [],
-            "gatewayRefs": [{
+            "consumerGateways": [{
                 "name": gw_name,
                 "namespace": gw_ns,
-                "consumerConfig": {
-                    "enabled": true,
+                "praxisConfig": {
+                    "generate": true,
                     "configMapName": config_map_name,
                     "clusterEndpoints": cluster_endpoints
                 }
@@ -3418,7 +3418,7 @@ pub(crate) fn verify_consumer_praxis_yaml(
     Ok(())
 }
 
-/// Read the `status.consumerConfigStatus` JSON array from a `GridNetwork`.
+/// Read the `status.praxisConfigStatus` JSON array from a `GridNetwork`.
 ///
 /// Returns the raw JSON string (may be empty if the field is not yet populated).
 pub(crate) fn read_gridnetwork_consumer_config_status(
@@ -3432,7 +3432,7 @@ pub(crate) fn read_gridnetwork_consumer_config_status(
             "get",
             &format!("gridnetwork/{network_name}"),
             "-o",
-            "jsonpath={.status.consumerConfigStatus}",
+            "jsonpath={.status.praxisConfigStatus}",
         ])
         .output()?;
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
@@ -3440,7 +3440,7 @@ pub(crate) fn read_gridnetwork_consumer_config_status(
 
 /// Assert that the `GridNetwork` status reports `Rendered` for the expected consumer config.
 ///
-/// Reads `status.consumerConfigStatus[]` and asserts:
+/// Reads `status.praxisConfigStatus[]` and asserts:
 /// - An entry with `gatewayName == expected_gateway` exists.
 /// - Its `phase` is `"Rendered"`.
 /// - Its `configMapName` matches `expected_config_map`.
@@ -3460,7 +3460,7 @@ pub(crate) fn verify_consumer_config_status_rendered(
 
     if raw.is_empty() {
         return Err(format!(
-            "GridNetwork/{network_name} status.consumerConfigStatus is empty; \
+            "GridNetwork/{network_name} status.praxisConfigStatus is empty; \
              operator may not have reconciled yet or the field is not populated"
         )
         .into());
@@ -3470,24 +3470,24 @@ pub(crate) fn verify_consumer_config_status_rendered(
     if raw.contains(api_token) {
         return Err(format!(
             "SECURITY VIOLATION: token bytes found in GridNetwork/{network_name} \
-             status.consumerConfigStatus — status must never contain credential token bytes"
+             status.praxisConfigStatus — status must never contain credential token bytes"
         )
         .into());
     }
 
     let statuses: serde_json::Value = serde_json::from_str(&raw)
-        .map_err(|e| format!("failed to parse consumerConfigStatus JSON from {network_name}: {e}"))?;
+        .map_err(|e| format!("failed to parse praxisConfigStatus JSON from {network_name}: {e}"))?;
 
     let entries = statuses
         .as_array()
-        .ok_or_else(|| format!("GridNetwork/{network_name} status.consumerConfigStatus is not a JSON array"))?;
+        .ok_or_else(|| format!("GridNetwork/{network_name} status.praxisConfigStatus is not a JSON array"))?;
 
     let entry = entries
         .iter()
         .find(|e| e["gatewayName"].as_str() == Some(expected_gateway))
         .ok_or_else(|| {
             format!(
-                "no consumerConfigStatus entry for gateway {expected_gateway:?} in \
+                "no praxisConfigStatus entry for gateway {expected_gateway:?} in \
                  GridNetwork/{network_name}; entries: {raw}"
             )
         })?;
@@ -3511,14 +3511,14 @@ pub(crate) fn verify_consumer_config_status_rendered(
     }
 
     eprintln!(
-        "  [PASS] GridNetwork/{network_name} status.consumerConfigStatus: \
+        "  [PASS] GridNetwork/{network_name} status.praxisConfigStatus: \
          gateway={expected_gateway:?} phase=Rendered configMapName={expected_config_map:?}; \
          token absent from status JSON"
     );
     Ok(())
 }
 
-/// Poll until `GridNetwork.status.consumerConfigStatus[]` reports `Rendered`
+/// Poll until `GridNetwork.status.praxisConfigStatus[]` reports `Rendered`
 /// for the expected consumer config.
 #[expect(
     clippy::disallowed_methods,
@@ -3552,14 +3552,14 @@ pub(crate) fn wait_for_consumer_config_status_rendered(
 
         if start.elapsed() >= timeout {
             return Err(format!(
-                "timeout waiting for GridNetwork/{network_name} consumerConfigStatus \
+                "timeout waiting for GridNetwork/{network_name} praxisConfigStatus \
                  gateway={expected_gateway:?} phase=Rendered; last error: {last_err}"
             )
             .into());
         }
 
         eprintln!(
-            "  waiting for GridNetwork/{network_name} consumerConfigStatus \
+            "  waiting for GridNetwork/{network_name} praxisConfigStatus \
              gateway={expected_gateway:?} phase=Rendered ({last_err})..."
         );
         std::thread::sleep(POLL_INTERVAL);
@@ -3666,12 +3666,12 @@ pub(crate) fn verify_api_fallback_overlay(
 /// Apply the full-grid `GridNetwork` and all four `InferenceProvider` fixtures.
 ///
 /// Creates four providers in one `GridNetwork` [`FULL_GRID_NETWORK`]:
-/// - Local/self-hosted east: `backendKind = "local"`, `routingClusterRef = east_site`
-/// - Remote/self-hosted west: `backendKind = "remote"`, `routingClusterRef = west_site`
-/// - Cloud-managed: `backendKind = "cloud_managed"`, no `routingClusterRef`
-/// - API-provider: `backendKind = "api_provider"`, no `routingClusterRef`
+/// - Local/self-hosted east: `backendKind = "local"`, `clusterName = east_site`
+/// - Remote/self-hosted west: `backendKind = "remote"`, `clusterName = west_site`
+/// - Cloud-managed: `backendKind = "cloud_managed"`, no `clusterName`
+/// - API-provider: `backendKind = "api_provider"`, no `clusterName`
 ///
-/// Without a `routingClusterRef`, the cloud and api candidates use the provider
+/// Without a `clusterName`, the cloud and api candidates use the provider
 /// name (`op-e2e-fg-cloud`, `op-e2e-fg-api`) as both `site` and `cluster` in
 /// the Phase 1 fallback.
 ///
@@ -3699,7 +3699,7 @@ pub(crate) fn apply_full_grid_fixtures(
         "metadata": { "name": FULL_GRID_NETWORK },
         "spec": {
             "seeds": [],
-            "gatewayRefs": [{ "name": FULL_GRID_GW, "namespace": "default" }]
+            "consumerGateways": [{ "name": FULL_GRID_GW, "namespace": "default" }]
         }
     }))
     .unwrap_or_else(|e| {
@@ -3717,7 +3717,7 @@ pub(crate) fn apply_full_grid_fixtures(
             "backendKind": "local",
             "endpoint": east_endpoint,
             "models": [{ "name": FULL_GRID_MODEL_EAST }],
-            "routingClusterRef": east_site
+            "clusterName": east_site
         }
     }))
     .unwrap_or_else(|e| {
@@ -3735,7 +3735,7 @@ pub(crate) fn apply_full_grid_fixtures(
             "backendKind": "remote",
             "endpoint": west_endpoint,
             "models": [{ "name": FULL_GRID_MODEL_WEST }],
-            "routingClusterRef": west_site
+            "clusterName": west_site
         }
     }))
     .unwrap_or_else(|e| {
@@ -3928,8 +3928,8 @@ pub(crate) fn export_overlay_to_file(
 /// for the SWIM overlay validation.
 ///
 /// Creates:
-/// - `GridNetwork` [`SWIM_OVERLAY_NETWORK`] with one `gatewayRef` named [`SWIM_OVERLAY_GW`] in the `default` namespace,
-///   with `localSiteName` set to `primary_site_name`.
+/// - `GridNetwork` [`SWIM_OVERLAY_NETWORK`] with one `consumerGateways` entry named [`SWIM_OVERLAY_GW`] in the
+///   `default` namespace, with `siteName` set to `primary_site_name`.
 /// - `InferenceProvider` [`SWIM_OVERLAY_PROVIDER`] belonging to [`SWIM_OVERLAY_NETWORK`] serving
 ///   [`SWIM_OVERLAY_MODEL`].
 #[expect(
@@ -3946,10 +3946,10 @@ pub(crate) fn apply_swim_overlay_test_fixtures(
         "metadata": { "name": SWIM_OVERLAY_NETWORK },
         "spec": {
             "seeds": [],
-            "gatewayRefs": [{
+            "consumerGateways": [{
                 "name": SWIM_OVERLAY_GW,
                 "namespace": "default",
-                "localSiteName": primary_site_name
+                "siteName": primary_site_name
             }]
         }
     }))
@@ -4135,7 +4135,7 @@ pub(crate) fn apply_tls_verified_gridsite_for_eligibility(
     let spec_patch = serde_json::json!({
         "spec": {
             "gridNetworkRef": network_ref,
-            "egress": {
+            "gatewayEndpoint": {
                 "address": egress_addr,
                 "tls": { "mode": "Mutual", "serverName": server_name }
             },
@@ -4161,7 +4161,7 @@ pub(crate) fn apply_tls_verified_gridsite_for_eligibility(
             "metadata": { "name": site_k8s_name },
             "spec": {
                 "gridNetworkRef": network_ref,
-                "egress": {
+                "gatewayEndpoint": {
                     "address": egress_addr,
                     "tls": { "mode": "Mutual", "serverName": server_name }
                 },
@@ -4449,10 +4449,10 @@ pub(crate) fn apply_rotation_test_fixtures(context: &str, site_name: &str) -> Re
         "metadata": { "name": ROTATION_NETWORK },
         "spec": {
             "seeds": [],
-            "gatewayRefs": [{
+            "consumerGateways": [{
                 "name": ROTATION_GW,
                 "namespace": "default",
-                "localSiteName": site_name
+                "siteName": site_name
             }]
         }
     }))
@@ -4470,7 +4470,7 @@ pub(crate) fn apply_rotation_test_fixtures(context: &str, site_name: &str) -> Re
             "backendKind": "local",
             "endpoint": "http://mock-rotation.default.svc:8080",
             "models": [{ "name": ROTATION_MODEL }],
-            "routingClusterRef": site_name
+            "clusterName": site_name
         }
     }))
     .unwrap_or_else(|e| {
@@ -4501,7 +4501,7 @@ pub(crate) fn apply_rotation_remote_provider(context: &str) -> Result<(), Box<dy
             "backendKind": "local",
             "endpoint": "http://mock-rotation-remote.default.svc:8080",
             "models": [{ "name": ROTATION_REMOTE_MODEL }],
-            "routingClusterRef": ROTATION_REMOTE_SWIM_ID
+            "clusterName": ROTATION_REMOTE_SWIM_ID
         }
     }))
     .unwrap_or_else(|e| {
@@ -4549,10 +4549,10 @@ pub(crate) fn apply_convergence_test_fixtures(
         "metadata": { "name": CONVERGENCE_NETWORK },
         "spec": {
             "seeds": [],
-            "gatewayRefs": [{
+            "consumerGateways": [{
                 "name": CONVERGENCE_GW,
                 "namespace": "default",
-                "localSiteName": site_name
+                "siteName": site_name
             }]
         }
     }))
@@ -4570,7 +4570,7 @@ pub(crate) fn apply_convergence_test_fixtures(
             "backendKind": "local",
             "endpoint": "http://mock-convergence.default.svc:8080",
             "models": [{ "name": CONVERGENCE_MODEL }],
-            "routingClusterRef": site_name
+            "clusterName": site_name
         }
     }))
     .unwrap_or_else(|e| {
@@ -4779,7 +4779,7 @@ pub(crate) fn cleanup_swim_overlay_test_resources(context: &str) -> Result<(), B
 
 /// Apply test fixtures for the SWIM transport encryption E2E.
 ///
-/// Creates a `GridNetwork` with a single `gatewayRef` and an `InferenceProvider`
+/// Creates a `GridNetwork` with a single `consumerGateways` entry and an `InferenceProvider`
 /// for the keyed node.  The wrong-key and plaintext nodes should NOT have their
 /// providers appear in the overlay.
 pub(crate) fn apply_swim_encrypt_test_fixtures(
@@ -4802,7 +4802,7 @@ pub(crate) fn apply_swim_encrypt_test_fixtures_with_options(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let tls = if use_swim_key_ref {
         serde_json::json!({
-            "swimKeyRef": {
+            "swimKeySecretRef": {
                 "name": SWIM_ENCRYPT_KEY_SECRET,
                 "namespace": "default",
                 "key": "key"
@@ -4818,10 +4818,10 @@ pub(crate) fn apply_swim_encrypt_test_fixtures_with_options(
         "spec": {
             "seeds": seeds,
             "tls": tls,
-            "gatewayRefs": [{
+            "consumerGateways": [{
                 "name": SWIM_ENCRYPT_GW,
                 "namespace": "default",
-                "localSiteName": site_a_name
+                "siteName": site_a_name
             }]
         }
     }))
@@ -4853,7 +4853,7 @@ pub(crate) fn apply_swim_encrypt_test_fixtures_with_options(
     Ok(())
 }
 
-/// Apply a Secret suitable for `GridNetwork.spec.tls.swimKeyRef`.
+/// Apply a Secret suitable for `GridNetwork.spec.tls.swimKeySecretRef`.
 ///
 /// `key_material` must be exactly 32 UTF-8 bytes so Kubernetes stores a valid
 /// AES-256-GCM key in the Secret's `data.key` field.
@@ -4952,7 +4952,7 @@ pub(crate) fn verify_swim_overlay_candidates(
 // Three-node SWIM mesh helpers
 // ---------------------------------------------------------------------------
 
-/// Poll until `GridNetwork.status.distributedProviderCount >= min_count`.
+/// Poll until `GridNetwork.status.remoteProviderCount >= min_count`.
 ///
 /// Uses the same bump-per-poll pattern as [`wait_for_gridnetwork_distributed_state`]
 /// so the operator reconciles during each wait cycle.
@@ -4974,23 +4974,23 @@ pub(crate) fn wait_for_distributed_state_count(
         let count_str = kubectl_jsonpath(
             context,
             &format!("gridnetworks/{name}"),
-            "{.status.distributedProviderCount}",
+            "{.status.remoteProviderCount}",
         )
         .unwrap_or_default();
         let count: u32 = count_str.parse().unwrap_or(0);
         if count >= min_count {
-            eprintln!("  [OK] GridNetwork {name}: distributedProviderCount={count} (>= {min_count})");
+            eprintln!("  [OK] GridNetwork {name}: remoteProviderCount={count} (>= {min_count})");
             return Ok(count);
         }
         if start.elapsed() >= timeout {
             return Err(format!(
-                "timeout waiting for GridNetwork {name} distributedProviderCount >= {min_count}; \
+                "timeout waiting for GridNetwork {name} remoteProviderCount >= {min_count}; \
                  last observed: {count}"
             )
             .into());
         }
         eprintln!(
-            "  waiting for GridNetwork {name} distributedProviderCount >= {min_count} \
+            "  waiting for GridNetwork {name} remoteProviderCount >= {min_count} \
              (current={count})..."
         );
         std::thread::sleep(POLL_INTERVAL);
@@ -5097,8 +5097,8 @@ pub(crate) fn wait_for_no_site_candidate_in_overlay(
 
 /// Apply the three-node SWIM mesh `GridNetwork` and leaf-node `InferenceProvider` fixtures.
 ///
-/// The `GridNetwork` uses `localSiteName = site_a_name` so node A's operator renders the
-/// overlay `ConfigMap`.  The `InferenceProvider` has no `siteSelector` or `routingClusterRef`,
+/// The `GridNetwork` uses `siteName = site_a_name` so node A's operator renders the
+/// overlay `ConfigMap`.  The `InferenceProvider` has no `siteSelector` or `clusterName`,
 /// so each operator publishes it as CRDT with its own `site_id`.  The leaf node C's CRDT
 /// contribution (`site_id = site_c_name`) is the primary proof target.
 #[expect(
@@ -5117,10 +5117,10 @@ pub(crate) fn apply_swim_mesh_test_fixtures(
         "metadata": { "name": SWIM_MESH_NETWORK },
         "spec": {
             "seeds": [],
-            "gatewayRefs": [{
+            "consumerGateways": [{
                 "name": SWIM_MESH_GW,
                 "namespace": "default",
-                "localSiteName": site_a_name
+                "siteName": site_a_name
             }]
         }
     }))
@@ -5169,10 +5169,10 @@ pub(crate) fn apply_swim_mesh_wrong_network_fixtures(context: &str) -> Result<()
         "metadata": { "name": SWIM_MESH_WRONG_NETWORK },
         "spec": {
             "seeds": [],
-            "gatewayRefs": [{
+            "consumerGateways": [{
                 "name": SWIM_MESH_GW,
                 "namespace": "default",
-                "localSiteName": "swim-mesh-wrong"
+                "siteName": "swim-mesh-wrong"
             }]
         }
     }))
@@ -5264,7 +5264,7 @@ pub(crate) fn cleanup_swim_mesh_test_resources(context: &str) -> Result<(), Box<
 
 /// Apply the trust fingerprint test `GridNetwork` and `InferenceProvider` fixtures.
 ///
-/// The `GridNetwork` is configured with `localSiteName = site_a_name` so that
+/// The `GridNetwork` is configured with `siteName = site_a_name` so that
 /// node A's operator renders the overlay.  `spec.tls` references are set so that
 /// node B's operator generates a site certificate and broadcasts it via SWIM.
 #[expect(clippy::too_many_lines, reason = "sequential JSON fixture construction")]
@@ -5285,10 +5285,10 @@ pub(crate) fn apply_swim_trust_test_fixtures(
         },
         "spec": {
             "seeds": [],
-            "gatewayRefs": [{
+            "consumerGateways": [{
                 "name": SWIM_TRUST_GW,
                 "namespace": "default",
-                "localSiteName": site_a_name
+                "siteName": site_a_name
             }],
             "tls": {
                 "caSecretRef": {
@@ -5409,7 +5409,7 @@ pub(crate) fn apply_gridsite_egress(
         "metadata": { "name": site_k8s_name },
         "spec": {
             "gridNetworkRef": network_ref,
-            "egress": { "address": egress_addr, "tls": tls }
+            "gatewayEndpoint": { "address": egress_addr, "tls": tls }
         }
     }))
     .unwrap_or_else(|e| {
@@ -5551,11 +5551,11 @@ pub(crate) fn wait_for_gridsite_reason(
 /// Apply the east-side fixtures for the cross-cluster SWIM routing validation.
 ///
 /// Creates on the east cluster:
-/// - [`SWIM_ROUTING_NETWORK`] `GridNetwork` with a `gatewayRef` pointing to [`SWIM_ROUTING_GW`] and `localSiteName` set
-///   to `east_site_name`.  The primary operator writes the overlay `ConfigMap` to this cluster.
-/// - [`SWIM_ROUTING_EAST_PROVIDER`] `InferenceProvider` serving `east_model` with `routingClusterRef = east_site_name`.
+/// - [`SWIM_ROUTING_NETWORK`] `GridNetwork` with a `consumerGateways` entry pointing to [`SWIM_ROUTING_GW`] and
+///   `siteName` set to `east_site_name`.  The primary operator writes the overlay `ConfigMap` to this cluster.
+/// - [`SWIM_ROUTING_EAST_PROVIDER`] `InferenceProvider` serving `east_model` with `clusterName = east_site_name`.
 ///
-/// The `routingClusterRef` must match the east provider gateway's site name so
+/// The `clusterName` must match the east provider gateway's site name so
 /// that `candidates_yaml` maps the candidate to `gateway-{east_site_name}` in
 /// the consumer `load_balancer`.
 #[expect(
@@ -5573,10 +5573,10 @@ pub(crate) fn apply_swim_routing_east_fixtures(
         "metadata": { "name": SWIM_ROUTING_NETWORK },
         "spec": {
             "seeds": [],
-            "gatewayRefs": [{
+            "consumerGateways": [{
                 "name": SWIM_ROUTING_GW,
                 "namespace": "default",
-                "localSiteName": east_site_name
+                "siteName": east_site_name
             }]
         }
     }))
@@ -5594,7 +5594,7 @@ pub(crate) fn apply_swim_routing_east_fixtures(
             "backendKind": "local",
             "endpoint": "http://mock-openai-provider.default.svc:8080",
             "models": [{ "name": east_model }],
-            "routingClusterRef": east_site_name
+            "clusterName": east_site_name
             // No healthCheck: omitting health checks leaves the phase at
             // Pending, which is included in overlay candidates.  A configured
             // health check that fails from outside the cluster sets the phase
@@ -5612,7 +5612,7 @@ pub(crate) fn apply_swim_routing_east_fixtures(
     eprintln!(
         "  [OK] SWIM routing east fixtures applied \
          (network={SWIM_ROUTING_NETWORK}, provider={SWIM_ROUTING_EAST_PROVIDER}, \
-         model={east_model}, routingClusterRef={east_site_name})"
+         model={east_model}, clusterName={east_site_name})"
     );
     Ok(())
 }
@@ -5620,9 +5620,9 @@ pub(crate) fn apply_swim_routing_east_fixtures(
 /// Apply the west-side fixtures for the cross-cluster SWIM routing validation.
 ///
 /// Creates on the west cluster:
-/// - [`SWIM_ROUTING_NETWORK`] `GridNetwork` without a `gatewayRef` — the peer operator reconciles this to publish its
-///   CRDT state but does not write an overlay `ConfigMap` (only the east primary generates the overlay).
-/// - [`SWIM_ROUTING_WEST_PROVIDER`] `InferenceProvider` serving `west_model` with `routingClusterRef = west_site_name`.
+/// - [`SWIM_ROUTING_NETWORK`] `GridNetwork` without a `consumerGateways` entry — the peer operator reconciles this to
+///   publish its CRDT state but does not write an overlay `ConfigMap` (only the east primary generates the overlay).
+/// - [`SWIM_ROUTING_WEST_PROVIDER`] `InferenceProvider` serving `west_model` with `clusterName = west_site_name`.
 ///
 /// After SWIM gossip, the primary (east) operator reads the peer's CRDT state
 /// and adds a remote candidate for `west_model` to the east overlay.
@@ -5655,7 +5655,7 @@ pub(crate) fn apply_swim_routing_west_fixtures(
             "backendKind": "local",
             "endpoint": "http://mock-openai-provider.default.svc:8080",
             "models": [{ "name": west_model }],
-            "routingClusterRef": west_site_name
+            "clusterName": west_site_name
         }
     }))
     .unwrap_or_else(|e| {
@@ -5667,7 +5667,7 @@ pub(crate) fn apply_swim_routing_west_fixtures(
     eprintln!(
         "  [OK] SWIM routing west fixtures applied \
          (network={SWIM_ROUTING_NETWORK}, provider={SWIM_ROUTING_WEST_PROVIDER}, \
-         model={west_model}, routingClusterRef={west_site_name})"
+         model={west_model}, clusterName={west_site_name})"
     );
     Ok(())
 }
@@ -5709,7 +5709,7 @@ pub(crate) fn cleanup_auto_discovered_gridsites_for_network(context: &str, netwo
 /// Verify that `degraded_cluster` appears in overlay candidates with `fresh: false`.
 ///
 /// A site may have multiple candidates (e.g. both healthy and degraded providers sharing
-/// `routingClusterRef`).  We require that at least one candidate with `cluster =
+/// `clusterName`).  We require that at least one candidate with `cluster =
 /// degraded_cluster` carries `fresh = false`, confirming the Degraded provider is
 /// represented as stale in the overlay.
 ///
@@ -5765,7 +5765,7 @@ pub(crate) fn multi_provider_fixture_name(site: &str) -> String {
 ///
 /// `models` is taken from the site's config entry so the overlay candidates
 /// carry the correct model names for consumer-gateway routing.
-/// `routing_cluster` is set as `spec.routingClusterRef` so the operator
+/// `routing_cluster` is set as `spec.clusterName` so the operator
 /// generates overlay candidates with `site = cluster = routing_cluster`.
 fn multi_provider_fixture_json(
     name: &str,
@@ -5785,7 +5785,7 @@ fn multi_provider_fixture_json(
             "backendKind": "local",
             "endpoint": endpoint,
             "models": models_json,
-            "routingClusterRef": routing_cluster
+            "clusterName": routing_cluster
         }
     }))
     .unwrap_or_else(|e| {
@@ -5798,7 +5798,7 @@ fn multi_provider_fixture_json(
 ///
 /// No single site is "local" across multiple provider sites — this
 /// intentionally passes `TEST_NETWORK` (not a real site name) as
-/// `local_site`, preserving the prior behavior (`localSiteName` falls back to
+/// `local_site`, preserving the prior behavior (`siteName` falls back to
 /// the network name, which matches no candidate) since this validation
 /// checks candidate presence per site, not locality ordering.
 fn multi_provider_network_fixture_json() -> String {
@@ -5809,7 +5809,7 @@ fn multi_provider_network_fixture_json() -> String {
 ///
 /// Used in multi-provider mode instead of `apply_test_fixtures`.  Each
 /// provider gets a distinct fixture name (`op-e2e-{site}`) and
-/// `routingClusterRef = site` so the operator-generated overlay candidates
+/// `clusterName = site` so the operator-generated overlay candidates
 /// carry the correct site identity for consumer-gateway routing.
 ///
 /// The shared in-cluster `provider_endpoint` must be non-blank so providers
@@ -6068,9 +6068,9 @@ fn delete_resource(
 /// Apply the `GridNetwork` for the site-join-discovery validation.
 ///
 /// Creates `GridNetwork` [`SITE_JOIN_NETWORK`] on `context` with a single
-/// `gatewayRef` pointing at [`SITE_JOIN_GW`].  `local_site_name` is the
-/// `localSiteName` entry used by the operator to locate its own overlay slot.
-pub(crate) fn apply_site_join_network(context: &str, local_site_name: &str) -> Result<(), Box<dyn std::error::Error>> {
+/// `consumerGateways` entry pointing at [`SITE_JOIN_GW`].  `site_name` is the
+/// `siteName` entry used by the operator to locate its own overlay slot.
+pub(crate) fn apply_site_join_network(context: &str, site_name: &str) -> Result<(), Box<dyn std::error::Error>> {
     let manifest = serde_json::to_string_pretty(&serde_json::json!({
         "apiVersion": "grid.praxis-proxy.io/v1alpha1",
         "kind": "GridNetwork",
@@ -6082,10 +6082,10 @@ pub(crate) fn apply_site_join_network(context: &str, local_site_name: &str) -> R
         },
         "spec": {
             "seeds": [],
-            "gatewayRefs": [{
+            "consumerGateways": [{
                 "name": SITE_JOIN_GW,
                 "namespace": "default",
-                "localSiteName": local_site_name
+                "siteName": site_name
             }]
         }
     }))
@@ -6094,7 +6094,7 @@ pub(crate) fn apply_site_join_network(context: &str, local_site_name: &str) -> R
         std::process::exit(1);
     });
     kubectl::apply_manifest(context, &manifest)?;
-    eprintln!("  [OK] GridNetwork {SITE_JOIN_NETWORK:?} applied (localSiteName={local_site_name:?})");
+    eprintln!("  [OK] GridNetwork {SITE_JOIN_NETWORK:?} applied (siteName={site_name:?})");
     Ok(())
 }
 
@@ -6143,7 +6143,7 @@ pub(crate) fn apply_gridsite(
         },
         "spec": {
             "gridNetworkRef": network_ref,
-            "egress": {
+            "gatewayEndpoint": {
                 "address": egress_addr,
                 "tls": { "mode": "Mutual" }
             }
@@ -6269,7 +6269,7 @@ pub(crate) fn wait_for_gridsite_phase(
 
 /// Verify that a `GridSite` has the expected routing-relevant spec fields set.
 ///
-/// Checks `spec.gridNetworkRef` and `spec.egress.address`, which together
+/// Checks `spec.gridNetworkRef` and `spec.gatewayEndpoint.address`, which together
 /// provide the network identity and data-plane endpoint needed for routing.
 /// The `status.phase` value is reported but not asserted here — call
 /// [`wait_for_gridsite_phase`] separately to assert the lifecycle state.
@@ -6291,7 +6291,7 @@ pub(crate) fn verify_gridsite_routing_data(
             "gridsites",
             site_name,
             "-o",
-            "jsonpath={.spec.gridNetworkRef}/{.spec.egress.address}/{.status.phase}",
+            "jsonpath={.spec.gridNetworkRef}/{.spec.gatewayEndpoint.address}/{.status.phase}",
         ])
         .output()?;
     if !out.status.success() {
@@ -6329,7 +6329,7 @@ pub(crate) fn verify_gridsite_routing_data(
 /// `GridSite` only, so the overlay contains exactly one candidate per model.
 pub(crate) fn apply_site_join_primary_provider(
     context: &str,
-    local_site_name: &str,
+    site_name: &str,
     model: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let manifest = serde_json::to_string_pretty(&serde_json::json!({
@@ -6342,7 +6342,7 @@ pub(crate) fn apply_site_join_primary_provider(
             "backendKind": "local",
             "endpoint": "http://mock-openai-provider.default.svc:8080",
             "models": [{ "name": model }],
-            "routingClusterRef": local_site_name,
+            "clusterName": site_name,
             "siteSelector": {
                 "matchLabels": { SITE_JOIN_LABEL_KEY: "primary" }
             }
@@ -6380,7 +6380,7 @@ pub(crate) fn apply_site_join_joining_provider(
             "backendKind": "remote",
             "endpoint": "http://mock-openai-provider.default.svc:8080",
             "models": [{ "name": model }],
-            "routingClusterRef": joining_site_name,
+            "clusterName": joining_site_name,
             "siteSelector": {
                 "matchLabels": { SITE_JOIN_LABEL_KEY: "joining" }
             }
@@ -6413,7 +6413,7 @@ pub(crate) fn apply_site_join_wrong_provider(context: &str) -> Result<(), Box<dy
             "backendKind": "local",
             "endpoint": "http://mock-openai-provider.default.svc:8080",
             "models": [{ "name": "model-sjd-wrong" }],
-            "routingClusterRef": SITE_JOIN_WRONG_SITE
+            "clusterName": SITE_JOIN_WRONG_SITE
         }
     }))
     .unwrap_or_else(|e| {
@@ -6591,7 +6591,7 @@ pub(crate) fn wait_for_auto_gridsite(
                 "gridsites",
                 site_name,
                 "-o",
-                "jsonpath={.spec.gridNetworkRef}/{.spec.egress.address}",
+                "jsonpath={.spec.gridNetworkRef}/{.spec.gatewayEndpoint.address}",
                 "--ignore-not-found",
             ])
             .output()
@@ -6622,7 +6622,7 @@ pub(crate) fn wait_for_auto_gridsite(
 
 /// Verify spec and status fields of an auto-discovered `GridSite`.
 ///
-/// Checks `spec.gridNetworkRef`, `spec.egress.address`, and `status.phase`.
+/// Checks `spec.gridNetworkRef`, `spec.gatewayEndpoint.address`, and `status.phase`.
 /// The expected phase is supplied by the caller; use [`wait_for_gridsite_phase`]
 /// before calling this to ensure the operator has had time to advance the phase.
 ///
@@ -6648,7 +6648,7 @@ pub(crate) fn verify_auto_gridsite_fields(
             "gridsites",
             site_name,
             "-o",
-            "jsonpath={.spec.gridNetworkRef}/{.spec.egress.address}/{.status.phase}",
+            "jsonpath={.spec.gridNetworkRef}/{.spec.gatewayEndpoint.address}/{.status.phase}",
         ])
         .output()?;
     if !out.status.success() {
@@ -6673,7 +6673,7 @@ pub(crate) fn verify_auto_gridsite_fields(
     }
     if egress.is_empty() {
         return Err(format!(
-            "auto-discovered GridSite {site_name:?}: spec.egress.address is empty; \
+            "auto-discovered GridSite {site_name:?}: spec.gatewayEndpoint.address is empty; \
              expected the advertised gateway address"
         )
         .into());
@@ -6692,7 +6692,7 @@ pub(crate) fn verify_auto_gridsite_fields(
     Ok(())
 }
 
-/// Assert that a `GridSite`'s `spec.egress.address` equals the expected gateway address
+/// Assert that a `GridSite`'s `spec.gatewayEndpoint.address` equals the expected gateway address
 /// and is distinct from the SWIM UDP bind address.
 ///
 /// Hard-fails if the egress address equals the SWIM UDP address — that would indicate
@@ -6716,7 +6716,7 @@ pub(crate) fn verify_auto_gridsite_egress(
             "gridsites",
             site_name,
             "-o",
-            "jsonpath={.spec.egress.address}",
+            "jsonpath={.spec.gatewayEndpoint.address}",
         ])
         .output()?;
     if !out.status.success() {
@@ -6729,14 +6729,14 @@ pub(crate) fn verify_auto_gridsite_egress(
     let actual = String::from_utf8_lossy(&out.stdout).trim().to_owned();
     if actual.is_empty() {
         return Err(format!(
-            "GridSite {site_name:?}: spec.egress.address is empty; \
+            "GridSite {site_name:?}: spec.gatewayEndpoint.address is empty; \
              expected gateway address {expected_gateway_addr:?}"
         )
         .into());
     }
     if actual == swim_udp_addr {
         return Err(format!(
-            "GridSite {site_name:?}: spec.egress.address={actual:?} equals the SWIM UDP address; \
+            "GridSite {site_name:?}: spec.gatewayEndpoint.address={actual:?} equals the SWIM UDP address; \
              expected gateway address {expected_gateway_addr:?} — \
              the data-plane gateway address was not propagated through SWIM"
         )
@@ -6744,7 +6744,7 @@ pub(crate) fn verify_auto_gridsite_egress(
     }
     if actual != expected_gateway_addr {
         return Err(format!(
-            "GridSite {site_name:?}: spec.egress.address={actual:?}; \
+            "GridSite {site_name:?}: spec.gatewayEndpoint.address={actual:?}; \
              expected {expected_gateway_addr:?}"
         )
         .into());
@@ -6901,7 +6901,7 @@ pub(crate) fn patch_gridsite_identity_trust(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let patch = serde_json::json!({
         "spec": {
-            "egress": { "tls": { "mode": "Mutual", "serverName": server_name } },
+            "gatewayEndpoint": { "tls": { "mode": "Mutual", "serverName": server_name } },
             "trust": { "canonicalFingerprints": [canonical_fp] }
         }
     })
@@ -6935,7 +6935,7 @@ pub(crate) fn patch_gridsite_identity_trust(
 
 /// Apply east-cluster fixtures for the failover validation.
 ///
-/// Creates `GridNetwork` [`FAILOVER_NETWORK`] with a `gatewayRef` pointing at
+/// Creates `GridNetwork` [`FAILOVER_NETWORK`] with a `consumerGateways` entry pointing at
 /// [`FAILOVER_GW`] (the overlay is generated on the east/primary cluster) and
 /// `InferenceProvider` [`FAILOVER_EAST_PROVIDER`] with `backendKind: "local"`.
 #[expect(clippy::too_many_lines, reason = "two JSON manifests with full K8s structure")]
@@ -6950,10 +6950,10 @@ pub(crate) fn apply_failover_east_fixtures(
         "metadata": { "name": FAILOVER_NETWORK },
         "spec": {
             "seeds": [],
-            "gatewayRefs": [{
+            "consumerGateways": [{
                 "name": FAILOVER_GW,
                 "namespace": "default",
-                "localSiteName": east_site
+                "siteName": east_site
             }]
         }
     }))
@@ -6971,7 +6971,7 @@ pub(crate) fn apply_failover_east_fixtures(
             "backendKind": "local",
             "endpoint": "http://mock-openai-provider.default.svc:8080",
             "models": [{ "name": model }],
-            "routingClusterRef": east_site
+            "clusterName": east_site
         }
     }))
     .unwrap_or_else(|e| {
@@ -6982,7 +6982,7 @@ pub(crate) fn apply_failover_east_fixtures(
     kubectl::apply_manifest(context, &provider)?;
     eprintln!(
         "  [OK] failover east fixtures applied \
-         ({FAILOVER_EAST_PROVIDER}, model={model:?}, routingClusterRef={east_site:?})"
+         ({FAILOVER_EAST_PROVIDER}, model={model:?}, clusterName={east_site:?})"
     );
     Ok(())
 }
@@ -7170,7 +7170,7 @@ pub(crate) fn apply_failover_shared_east_provider(
             "backendKind": "local",
             "endpoint": "http://mock-openai-provider.default.svc:8080",
             "models": [{ "name": FAILOVER_SHARED_MODEL }],
-            "routingClusterRef": east_site
+            "clusterName": east_site
         }
     }))
     .unwrap_or_else(|e| {
@@ -7180,7 +7180,7 @@ pub(crate) fn apply_failover_shared_east_provider(
     kubectl::apply_manifest(context, &manifest)?;
     eprintln!(
         "  [OK] {FAILOVER_SHARED_EAST_PROVIDER:?} applied \
-         (backendKind=local, model={FAILOVER_SHARED_MODEL:?}, routingClusterRef={east_site:?})"
+         (backendKind=local, model={FAILOVER_SHARED_MODEL:?}, clusterName={east_site:?})"
     );
     Ok(())
 }
@@ -7218,7 +7218,7 @@ pub(crate) fn apply_failover_west_fixtures_with_shared(
                 { "name": FAILOVER_REMOTE_MODEL },
                 { "name": FAILOVER_SHARED_MODEL }
             ],
-            "routingClusterRef": west_site
+            "clusterName": west_site
         }
     }))
     .unwrap_or_else(|e| {
@@ -7230,7 +7230,7 @@ pub(crate) fn apply_failover_west_fixtures_with_shared(
     eprintln!(
         "  [OK] failover west fixtures (with-shared) applied \
          ({FAILOVER_WEST_PROVIDER}, models=[{FAILOVER_REMOTE_MODEL:?}, {FAILOVER_SHARED_MODEL:?}], \
-         routingClusterRef={west_site:?})"
+         clusterName={west_site:?})"
     );
     Ok(())
 }
@@ -7370,10 +7370,10 @@ pub(crate) fn apply_stale_gc_east_fixtures(
         "spec": {
             "seeds": [],
             "staleCandidateTtlSeconds": ttl_secs,
-            "gatewayRefs": [{
+            "consumerGateways": [{
                 "name": STALE_GC_GW,
                 "namespace": "default",
-                "localSiteName": east_site
+                "siteName": east_site
             }]
         }
     }))
@@ -7391,7 +7391,7 @@ pub(crate) fn apply_stale_gc_east_fixtures(
             "backendKind": "local",
             "endpoint": "http://mock-openai-provider.default.svc:8080",
             "models": [{ "name": STALE_GC_LOCAL_MODEL }],
-            "routingClusterRef": east_site
+            "clusterName": east_site
         }
     }))
     .unwrap_or_else(|e| {
@@ -7433,7 +7433,7 @@ pub(crate) fn apply_stale_gc_west_fixtures(context: &str, west_site: &str) -> Re
             "backendKind": "remote",
             "endpoint": "http://mock-openai-provider.default.svc:8080",
             "models": [{ "name": STALE_GC_REMOTE_MODEL }],
-            "routingClusterRef": west_site
+            "clusterName": west_site
         }
     }))
     .unwrap_or_else(|e| {
@@ -7444,7 +7444,7 @@ pub(crate) fn apply_stale_gc_west_fixtures(context: &str, west_site: &str) -> Re
     kubectl::apply_manifest(context, &provider)?;
     eprintln!(
         "  [OK] stale-GC west fixtures applied \
-         ({STALE_GC_WEST_PROVIDER}, routingClusterRef={west_site:?})"
+         ({STALE_GC_WEST_PROVIDER}, clusterName={west_site:?})"
     );
     Ok(())
 }
@@ -7555,7 +7555,7 @@ pub(crate) fn cleanup_stale_gc_west_resources(context: &str) -> Result<(), Box<d
 /// [`api_credential_plan_from_overlay`] (production path).
 #[derive(Debug, PartialEq)]
 pub(crate) enum ApiCredentialPlan {
-    /// `auth.manual = true` — the user manages credentials; the harness does not inject.
+    /// `auth.credentialsManagedExternally = true` — the user manages credentials; the harness does not inject.
     ///
     /// Constructed by `parse_api_credential_plan` (test-only); kept as a
     /// valid arm in [`resolve_api_credential`] for defensive completeness.
@@ -7611,7 +7611,11 @@ pub(crate) fn parse_api_credential_plan(
         return Ok(ApiCredentialPlan::Absent);
     }
 
-    if auth_json.get("manual").and_then(serde_json::Value::as_bool) == Some(true) {
+    if auth_json
+        .get("credentialsManagedExternally")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
         return Ok(ApiCredentialPlan::Manual);
     }
 
@@ -7846,7 +7850,7 @@ mod tests {
     // already asserted at the unit tier against the real renderer in
     // operator::resources::routing_overlay (score_ordered_local_ranks_before_api_provider,
     // no_metrics_geography_first_still_prefers_local). What broke was that
-    // this E2E fixture never gave the operator a `localSiteName` to compare
+    // this E2E fixture never gave the operator a `siteName` to compare
     // candidates against, so the live reconcile path silently stopped
     // exercising that business rule at all. This test guards the fixture's
     // contract so a future regression here is caught by `cargo test -p xtask`
@@ -7862,12 +7866,12 @@ mod tests {
             TEST_HEALTHY_ROUTING_CLUSTER,
         );
         let value: serde_json::Value = serde_json::from_str(&json).expect("fixture must be valid JSON");
-        let gw_ref = &value["spec"]["gatewayRefs"][0];
+        let gw_ref = &value["spec"]["consumerGateways"][0];
 
         assert_eq!(
-            gw_ref["localSiteName"].as_str(),
+            gw_ref["siteName"].as_str(),
             Some(TEST_HEALTHY_ROUTING_CLUSTER),
-            "grid#60: without localSiteName, the operator's local_site falls back to the network name, \
+            "grid#60: without siteName, the operator's local_site falls back to the network name, \
              which matches no candidate's site, silently disabling GeographyFirst locality-tier ordering"
         );
         assert_eq!(gw_ref["name"].as_str(), Some(TEST_GATEWAY_NAME));
@@ -7892,10 +7896,10 @@ mod tests {
             serde_json::from_str(&healthy).expect("provider fixture must be valid JSON");
 
         assert_eq!(
-            network_json["spec"]["gatewayRefs"][0]["localSiteName"].as_str(),
-            provider_json["spec"]["routingClusterRef"].as_str(),
-            "GridNetwork.gatewayRefs[0].localSiteName must match the healthy provider's \
-             routingClusterRef so its candidate resolves to LocalityTier::SameSite"
+            network_json["spec"]["consumerGateways"][0]["siteName"].as_str(),
+            provider_json["spec"]["clusterName"].as_str(),
+            "GridNetwork.consumerGateways[0].siteName must match the healthy provider's \
+             clusterName so its candidate resolves to LocalityTier::SameSite"
         );
     }
 
@@ -7905,9 +7909,9 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&json).expect("fixture must be valid JSON");
 
         assert_eq!(
-            value["spec"]["gatewayRefs"][0]["localSiteName"].as_str(),
+            value["spec"]["consumerGateways"][0]["siteName"].as_str(),
             Some(TEST_NETWORK),
-            "multi-provider validation has no single local site; localSiteName must stay TEST_NETWORK \
+            "multi-provider validation has no single local site; siteName must stay TEST_NETWORK \
              (matching no candidate) so candidate-presence checks aren't skewed by locality ordering — if this \
              ever changed to pass a real site name, locality ordering would silently re-engage with no signal"
         );
@@ -7982,7 +7986,7 @@ mod tests {
     #[test]
     fn verify_degraded_candidate_accepts_when_shared_site_has_fresh_false() {
         // Two candidates at the same site — healthy (fresh=true) and degraded (fresh=false).
-        // Two providers sharing routingClusterRef="site-a" produces two candidates at the same
+        // Two providers sharing clusterName="site-a" produces two candidates at the same
         // site: one healthy (fresh=true) and one degraded (fresh=false).  The degraded check must find the fresh=false
         // one.
         let overlay = make_overlay(&[("site-a", true), ("site-a", false)]);
@@ -8278,7 +8282,7 @@ mod tests {
     fn verify_distributed_count_exactly_one_passes() {
         assert!(
             verify_distributed_state_received(1).is_ok(),
-            "distributedProviderCount=1 must pass"
+            "remoteProviderCount=1 must pass"
         );
     }
 
@@ -8296,7 +8300,7 @@ mod tests {
         let err = verify_distributed_state_received(6).unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("distributedProviderCount=6"),
+            msg.contains("remoteProviderCount=6"),
             "error must include the observed count; got: {msg}"
         );
         assert!(
@@ -8310,7 +8314,7 @@ mod tests {
         // Exactly 1 is the only correct count; 2 means unexpected extra records.
         assert!(
             verify_distributed_state_received(2).is_err(),
-            "distributedProviderCount=2 must fail"
+            "remoteProviderCount=2 must fail"
         );
     }
 
@@ -8368,10 +8372,10 @@ mod tests {
         assert_eq!(
             parsed
                 .get("spec")
-                .and_then(|s| s.get("routingClusterRef"))
+                .and_then(|s| s.get("clusterName"))
                 .and_then(serde_json::Value::as_str),
             Some("site-east"),
-            "routingClusterRef must match site name"
+            "clusterName must match site name"
         );
     }
 
@@ -8412,15 +8416,15 @@ mod tests {
         let west: serde_json::Value = serde_json::from_str(&json_west).unwrap_or_else(|_| std::process::abort());
         let east_ref = east
             .get("spec")
-            .and_then(|s| s.get("routingClusterRef"))
+            .and_then(|s| s.get("clusterName"))
             .and_then(serde_json::Value::as_str);
         let west_ref = west
             .get("spec")
-            .and_then(|s| s.get("routingClusterRef"))
+            .and_then(|s| s.get("clusterName"))
             .and_then(serde_json::Value::as_str);
         assert_ne!(
             east_ref, west_ref,
-            "two provider sites must produce distinct routingClusterRef values"
+            "two provider sites must produce distinct clusterName values"
         );
     }
 
@@ -8672,7 +8676,7 @@ mod tests {
 
     #[test]
     fn credential_plan_manual_when_manual_is_true() {
-        let auth = serde_json::json!({ "manual": true, "strategy": "bearer_token" });
+        let auth = serde_json::json!({ "credentialsManagedExternally": true, "strategy": "bearer_token" });
         let plan = parse_api_credential_plan(&auth).unwrap();
         assert_eq!(
             plan,
@@ -9038,20 +9042,20 @@ mod tests {
         }]);
         let json_str = network_fixture_with_consumer_config_json("net", "gw", "ns", "my-cm", &endpoints);
         let value: serde_json::Value = serde_json::from_str(&json_str).unwrap();
-        let refs = &value["spec"]["gatewayRefs"];
+        let refs = &value["spec"]["consumerGateways"];
         let first = &refs[0];
         assert_eq!(
-            first["consumerConfig"]["enabled"].as_bool(),
+            first["praxisConfig"]["generate"].as_bool(),
             Some(true),
-            "consumerConfig.enabled must be true"
+            "praxisConfig.generate must be true"
         );
         assert_eq!(
-            first["consumerConfig"]["configMapName"].as_str(),
+            first["praxisConfig"]["configMapName"].as_str(),
             Some("my-cm"),
             "configMapName must be the provided name"
         );
         assert_eq!(
-            first["consumerConfig"]["clusterEndpoints"][0]["cluster"].as_str(),
+            first["praxisConfig"]["clusterEndpoints"][0]["cluster"].as_str(),
             Some("gateway-site-a"),
             "clusterEndpoints must be included"
         );

@@ -311,7 +311,7 @@ The contract distinguishes four observable stages:
 
 | Stage | Owner | Evidence |
 |---|---|---|
-| **Rendered** | AGN Operator | `GridNetwork.status.overlayStatus[].renderedRevision` |
+| **Rendered** | AGN Operator | `GridNetwork.status.routingMapStatus[].renderedRevision` |
 | **Distributed** | AGN Operator and Kubernetes | `distributedRevision` plus the applied `ConfigMap` `resourceVersion` |
 | **Accepted** | Praxis AI | Successful validation and atomic snapshot-load event |
 | **Serving** | Praxis AI request path | The selected immutable snapshot revision attached to provider-hop telemetry |
@@ -582,7 +582,7 @@ Multi-cluster model routing is the baseline AGN data-plane behavior:
 
 1. Each provider site declares the models it can serve through
    `InferenceProvider.spec.models`.
-2. `spec.routingClusterRef` names the Praxis upstream cluster that can reach
+2. `spec.clusterName` names the Praxis upstream cluster that can reach
    that provider site.
 3. The operator renders one overlay candidate per routable model/provider pair.
 4. The consumer Praxis gateway extracts the requested model and selects the

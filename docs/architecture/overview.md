@@ -357,7 +357,7 @@ Token bytes are never written into overlays, generated `ConfigMap`s, status, or
 logs.
 
 The AGN Operator reports the rendered revision and last successfully
-distributed revision separately in `GridNetwork.status.overlayStatus`. If an
+distributed revision separately in `GridNetwork.status.routingMapStatus`. If an
 apply fails, status preserves the last distributed revision while reporting the
 new render attempt. A `ConfigMap` annotation exposes the schema, revision, and
 digest without requiring an operator to parse its data.

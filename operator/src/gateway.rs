@@ -1,7 +1,7 @@
 //! Provider gateway address self-discovery.
 //!
 //! Resolves the data-plane gateway address this operator advertises to SWIM
-//! peers (populates `GridSite.spec.egress.address`): an explicit override wins,
+//! peers (populates `GridSite.spec.gatewayEndpoint.address`): an explicit override wins,
 //! else a background poller discovers the Service `LoadBalancer` address.
 
 use std::{sync::Arc, time::Duration};

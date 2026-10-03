@@ -15,10 +15,10 @@
 //!   selector matches all sites in the same [`GridNetwork`].
 //! - Each `(model, site)` pair becomes one `RoutingCandidate`.
 //! - `candidate.site` = the [`GridSite`] name (resolved via selector).
-//! - `candidate.cluster` = `spec.routingClusterRef` when set, otherwise the [`InferenceProvider`] metadata name. The
-//!   gateway uses this as the upstream cluster reference in its local routing configuration.
-//! - When no [`GridSite`]s are provided, the routing identity (`spec.routingClusterRef` or provider name) is used as
-//!   both `site` and `cluster` (Phase 1 self-hosted fallback).
+//! - `candidate.cluster` = `spec.clusterName` when set, otherwise the [`InferenceProvider`] metadata name. The gateway
+//!   uses this as the upstream cluster reference in its local routing configuration.
+//! - When no [`GridSite`]s are provided, the routing identity (`spec.clusterName` or provider name) is used as both
+//!   `site` and `cluster` (Phase 1 self-hosted fallback).
 //!
 //! # Spec-based vs status-based site derivation
 //!
@@ -106,7 +106,7 @@ pub(crate) fn backend_locality_score(backend_kind: &str) -> f64 {
 
 /// Return the routing identity for a provider.
 ///
-/// When `spec.routingClusterRef` is set and non-empty, returns that value;
+/// When `spec.clusterName` is set and non-empty, returns that value;
 /// otherwise falls back to `metadata.name`.  This name is used as
 /// `candidate.cluster` (and as `candidate.site` in Phase 1 when no
 /// [`GridSite`]s are configured), and as the [`scoring::BackendConfig`] name
@@ -114,7 +114,7 @@ pub(crate) fn backend_locality_score(backend_kind: &str) -> f64 {
 ///
 /// [`GridSite`]: crate::crd::grid_site::GridSite
 pub(crate) fn routing_identity(provider: &InferenceProvider) -> Option<&str> {
-    if let Some(r) = &provider.spec.routing_cluster_ref
+    if let Some(r) = &provider.spec.cluster_name
         && !r.trim().is_empty()
     {
         return Some(r.as_str());
@@ -126,11 +126,11 @@ pub(crate) fn routing_identity(provider: &InferenceProvider) -> Option<&str> {
 /// [`scoring::score_backends`].
 ///
 /// Returns `None` when:
-/// - The provider has no `metadata.name` and no `spec.routingClusterRef`.
+/// - The provider has no `metadata.name` and no `spec.clusterName`.
 /// - `spec.backendKind` does not match any [`scoring::BackendKind`] variant (locality is the primary scoring signal;
 ///   unknown kinds cannot be ranked).
 ///
-/// The `BackendConfig` name is [`routing_identity`] — `spec.routingClusterRef`
+/// The `BackendConfig` name is [`routing_identity`] — `spec.clusterName`
 /// if set, otherwise `metadata.name`.  Using the routing identity here ensures
 /// that score lookups in `render_routing_overlay` (which key on
 /// `candidate.cluster`, not `metadata.name`) resolve correctly.
@@ -284,7 +284,7 @@ pub(crate) fn remote_crdt_provider_to_candidates(provider: &crdt::ProviderState)
 /// Derive a [`ProjectedCredential`] from a provider's `spec.auth`.
 ///
 /// Returns `Some` only when all of the following hold:
-/// - `auth.manual` is `false`
+/// - `auth.credentialsManagedExternally` is `false`
 /// - `auth.strategy` is [`AuthStrategy::BearerToken`]
 /// - `auth.secretRef` is present with non-blank `name`, `namespace`, and `key`
 ///
@@ -295,7 +295,7 @@ pub(crate) fn remote_crdt_provider_to_candidates(provider: &crdt::ProviderState)
 /// reference when the ref is fully usable.
 pub(crate) fn projected_credential_from_provider(provider: &InferenceProvider) -> Option<ProjectedCredential> {
     let auth = provider.spec.auth.as_ref()?;
-    if auth.manual || auth.strategy != AuthStrategy::BearerToken {
+    if auth.credentials_managed_externally || auth.strategy != AuthStrategy::BearerToken {
         return None;
     }
     let secret_ref = auth.secret_ref.as_ref()?;
@@ -827,7 +827,7 @@ pub struct RoutingCandidate {
     ///
     /// Resolved via `spec.siteSelector.matchLabels` against [`GridSite`]
     /// metadata labels.  Falls back to the provider routing identity
-    /// (`spec.routingClusterRef`, or provider metadata name when absent)
+    /// (`spec.clusterName`, or provider metadata name when absent)
     /// when no [`GridSite`]s are passed (Phase 1 self-hosted fallback).
     ///
     /// [`GridSite`]: crate::crd::grid_site::GridSite
@@ -835,7 +835,7 @@ pub struct RoutingCandidate {
 
     /// Upstream cluster identifier.
     ///
-    /// Uses `spec.routingClusterRef` when set and non-empty, otherwise the
+    /// Uses `spec.clusterName` when set and non-empty, otherwise the
     /// [`InferenceProvider`] metadata name.
     ///
     /// [`InferenceProvider`]: crate::crd::inference_provider::InferenceProvider
@@ -917,8 +917,8 @@ pub struct RoutingOverlay {
     /// Local site identifier.
     ///
     /// Supplied per gateway by the controller as
-    /// `gw_ref.local_site_name.as_deref().unwrap_or(network_name)`.
-    /// Each `GatewayRef` may declare its own `localSiteName`, allowing
+    /// `gw_ref.site_name.as_deref().unwrap_or(network_name)`.
+    /// Each `GatewayRef` may declare its own `siteName`, allowing
     /// multi-gateway networks to produce overlays with distinct
     /// `local_site` values.  Falls back to the network name for
     /// single-site networks.
@@ -1125,7 +1125,7 @@ fn assign_selection_groups(candidates: &mut [RoutingCandidate], policy: crate::c
 /// than remote candidates.  The caller is responsible for computing
 /// `local_site` per gateway:
 /// ```text
-/// local_site = gw_ref.local_site_name.as_deref().unwrap_or(network_name)
+/// local_site = gw_ref.site_name.as_deref().unwrap_or(network_name)
 /// ```
 ///
 /// Provider access policy enforcement: Each provider's `spec.accessPolicy`
@@ -1162,7 +1162,7 @@ fn assign_selection_groups(candidates: &mut [RoutingCandidate], policy: crate::c
 /// to an equivalent same-scale locality estimate.
 ///
 /// The `metrics` parameter accepts a map from provider routing identity
-/// (the value of `spec.routingClusterRef`, or `metadata.name` when absent) to
+/// (the value of `spec.clusterName`, or `metadata.name` when absent) to
 /// [`scoring::BackendMetrics`] produced by scraping and parsing Prometheus
 /// `/metrics` endpoints.  When `Some`, providers present in the map receive
 /// live signal data (queue depth, KV-cache utilisation, latency P99,
@@ -1545,7 +1545,7 @@ fn candidates_from_provider(
     }
 
     // Use routing_identity for cluster (and site in Phase 1 fallback).
-    // When spec.routingClusterRef is set, it overrides metadata.name so that
+    // When spec.clusterName is set, it overrides metadata.name so that
     // overlay candidates reference the correct upstream cluster and site.
     let cluster = routing_identity(provider).unwrap_or(provider_name);
     let capacity_weight = provider.spec.capacity_weight.unwrap_or(1);
@@ -4913,7 +4913,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // routing_cluster_ref — overlay identity override
+    // cluster_name — overlay identity override
     // -----------------------------------------------------------------------
 
     fn test_provider_with_routing_cluster_ref(
@@ -4929,7 +4929,7 @@ mod tests {
             "models": [{ "name": "model-x" }]
         });
         if let Some(r) = routing_ref {
-            spec["routingClusterRef"] = serde_json::Value::String(r.to_owned());
+            spec["clusterName"] = serde_json::Value::String(r.to_owned());
         }
         serde_json::from_value(serde_json::json!({
             "apiVersion": "grid.praxis-proxy.io/v1alpha1",
@@ -4989,13 +4989,13 @@ mod tests {
         assert_eq!(
             overlay.candidates.first().map(|c| c.cluster.as_str()),
             Some("gateway-site-x"),
-            "candidate.cluster must equal routingClusterRef"
+            "candidate.cluster must equal clusterName"
         );
     }
 
     #[test]
     fn routing_cluster_ref_appears_in_candidate_site_phase1() {
-        // In Phase 1 (no GridSites), site = routingClusterRef.
+        // In Phase 1 (no GridSites), site = clusterName.
         let network = test_network("net");
         let provider = test_provider_with_routing_cluster_ref("prov-a", "net", Some("site-x"));
         let overlay = render_routing_overlay(
@@ -5012,7 +5012,7 @@ mod tests {
         assert_eq!(
             overlay.candidates.first().map(|c| c.site.as_str()),
             Some("site-x"),
-            "candidate.site must equal routingClusterRef in Phase 1 (no sites)"
+            "candidate.site must equal clusterName in Phase 1 (no sites)"
         );
     }
 
@@ -5028,7 +5028,7 @@ mod tests {
                 "providerKind": "self_hosted",
                 "backendKind": "local",
                 "endpoint": "http://localhost:8000",
-                "routingClusterRef": "gateway-site-x",
+                "clusterName": "gateway-site-x",
                 "models": [{ "name": "model-a" }, { "name": "model-b" }]
             }
         }))
@@ -5047,7 +5047,7 @@ mod tests {
         assert_eq!(overlay.candidates.len(), 2, "two model candidates");
         assert!(
             overlay.candidates.iter().all(|c| c.cluster == "gateway-site-x"),
-            "all candidates must use routingClusterRef"
+            "all candidates must use clusterName"
         );
     }
 
@@ -5089,7 +5089,7 @@ mod tests {
                 "providerKind": "self_hosted",
                 "backendKind": "local",
                 "endpoint": "http://localhost:8000",
-                "routingClusterRef": "site-x",
+                "clusterName": "site-x",
                 "models": [{ "name": "model-x" }]
             },
             "status": { "phase": "Unavailable", "matchingSites": [], "observedGeneration": 0 }
@@ -5108,7 +5108,7 @@ mod tests {
         .unwrap_or_else(|_| std::process::abort());
         assert!(
             overlay.candidates.is_empty(),
-            "Unavailable must be excluded even with routingClusterRef"
+            "Unavailable must be excluded even with clusterName"
         );
     }
 
@@ -5124,7 +5124,7 @@ mod tests {
                 "providerKind": "self_hosted",
                 "backendKind": "local",
                 "endpoint": "http://localhost:8000",
-                "routingClusterRef": "site-x",
+                "clusterName": "site-x",
                 "models": [{ "name": "model-x" }]
             },
             "status": { "phase": "Degraded", "matchingSites": [], "observedGeneration": 0 }
@@ -5149,13 +5149,13 @@ mod tests {
         assert_eq!(
             overlay.candidates.first().map(|c| c.cluster.as_str()),
             Some("site-x"),
-            "cluster must use routingClusterRef even for Degraded"
+            "cluster must use clusterName even for Degraded"
         );
     }
 
     #[test]
     fn scoring_order_works_with_routing_cluster_ref() {
-        // local provider with routingClusterRef "site-x" must still outscore api_provider.
+        // local provider with clusterName "site-x" must still outscore api_provider.
         let network = test_network("net");
         let local_with_ref = test_provider_with_routing_cluster_ref("prov-local", "net", Some("site-x"));
         let api_provider: InferenceProvider = serde_json::from_value(serde_json::json!({
@@ -5187,7 +5187,7 @@ mod tests {
         assert_eq!(
             overlay.candidates.first().map(|c| c.cluster.as_str()),
             Some("site-x"),
-            "local provider with routingClusterRef must rank before api_provider"
+            "local provider with clusterName must rank before api_provider"
         );
     }
 
@@ -5592,7 +5592,7 @@ mod tests {
                 "backendKind": "api_provider",
                 "endpoint": "https://api.openai.com",
                 "models": [{ "name": "gpt-4" }],
-                "auth": { "manual": true, "strategy": "bearer_token" }
+                "auth": { "credentialsManagedExternally": true, "strategy": "bearer_token" }
             }
         }))
         .unwrap_or_else(|_| std::process::abort())
