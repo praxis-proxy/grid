@@ -189,8 +189,7 @@ pub(crate) fn site_phase_next(
             (
                 GridSitePhase::Discovered,
                 "GossipedAddressRefused".to_owned(),
-                "gossiped address is not a dialable literal IP:port; set spec.gatewayEndpoint.address"
-                    .to_owned(),
+                "gossiped address is not a dialable literal IP:port; set spec.gatewayEndpoint.address".to_owned(),
             )
         },
         GridSitePhase::Discovered => {
@@ -277,7 +276,7 @@ fn gossip_address_refused(site: &GridSite) -> bool {
     let stub = grid_network::peer_site_key(site).is_some_and(|(_, enrolled)| !enrolled);
     stub && site
         .spec
-        .egress
+        .gateway_endpoint
         .as_ref()
         .map(|egress| egress.address.as_str())
         .is_some_and(|addr| !addr.trim().is_empty() && !is_dialable_gossip(addr))

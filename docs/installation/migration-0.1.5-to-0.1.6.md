@@ -1,9 +1,12 @@
-# 0.1.4 to 0.1.5 CRD Field Migration
+# 0.1.5 to 0.1.6 CRD Field Migration
 
-The 0.1.5 CRD field renames keep the `grid.praxis-proxy.io/v1alpha1` API
-version, but the updated operator does not read the 0.1.4 field names. There is
-no automatic conversion. Update existing custom resources and `grid-site` Helm
-values before the 0.1.5 operator reconciles them.
+The 0.1.5 release accepts both the previous and current names for CRD spec
+fields. The `grid-site` chart also translates previous value names when it
+renders resources. The previous names are deprecated and will be removed in
+0.1.6. Migrate custom resources and Helm values before upgrading to 0.1.6.
+
+Do not set both names for one field. The API schema and chart reject conflicting
+old and new names.
 
 ## Field mapping
 
@@ -32,25 +35,49 @@ values before the 0.1.5 operator reconciles them.
 | `grid-site` chart `inferenceProviders[].metricsConfig` | `metricsEndpoint` | `endpoint` |
 | `grid-site` chart `inferenceProviders[].auth` | `manual` | `credentialsManagedExternally` |
 
-## Upgrade sequence
+## Upgrade to 0.1.5
+
+You can upgrade to 0.1.5 with existing field names. Update manifests and
+`grid-site` values to the current names when convenient.
+
+## Before upgrading to 0.1.6
 
 1. Back up the affected custom resources and Helm values.
 2. Update manifests and Helm values using the mapping above.
-3. Install the updated CRD schemas.
+3. Pause the operator before installing the 0.1.6 CRD schemas.
 4. Apply the updated custom resources and upgrade `grid-site` with its updated
    values.
-5. Start or upgrade the operator to 0.1.5. Do not let it reconcile resources
-   with old field names.
+5. Start the 0.1.6 operator after all affected resources use the current names.
 
-Pause the operator before installing the updated schemas and keep it paused
-until the migrated resources are applied. The old and new operator versions do
-not share these field names.
+Status output uses the current names in 0.1.5; the compatibility window covers
+spec fields and chart values. Update scripts and dashboards that read status.
+Status is operator-owned and should not be edited by hand.
 
-## Status and reason names
+| Previous status field or reason | Current status field or reason |
+|---|---|
+| `distributedProviderCount` | `remoteProviderCount` |
+| `consumerConfigStatus` | `praxisConfigStatus` |
+| `overlayStatus` | `routingMapStatus` |
+| `OverlayRenderFailed` | `RoutingMapRenderFailed` |
+| `OverlayApplyFailed` | `RoutingMapApplyFailed` |
+| `ConsumerConfigRenderFailed` | `PraxisConfigRenderFailed` |
+| `ConsumerConfigApplyFailed` | `PraxisConfigApplyFailed` |
+| `ConsumerConfigError` | `PraxisConfigError` |
+| `ConsumerConfigDisabled` | `PraxisConfigDisabled` |
+| `EgressMissing` | `GatewayAddressMissing` |
 
-These fields are operator-owned output; do not edit them during migration.
-Update any scripts or dashboards that read them. The updated operator writes the
-current status fields.
+| Previous status field or reason | Current status field or reason |
+|---|---|
+| `distributedProviderCount` | `remoteProviderCount` |
+| `consumerConfigStatus` | `praxisConfigStatus` |
+| `overlayStatus` | `routingMapStatus` |
+| `OverlayRenderFailed` | `RoutingMapRenderFailed` |
+| `OverlayApplyFailed` | `RoutingMapApplyFailed` |
+| `ConsumerConfigRenderFailed` | `PraxisConfigRenderFailed` |
+| `ConsumerConfigApplyFailed` | `PraxisConfigApplyFailed` |
+| `ConsumerConfigError` | `PraxisConfigError` |
+| `ConsumerConfigDisabled` | `PraxisConfigDisabled` |
+| `EgressMissing` | `GatewayAddressMissing` |
 
 | Previous status field or reason | Current status field or reason |
 |---|---|

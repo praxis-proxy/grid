@@ -9,7 +9,6 @@ gridNetwork:
   seeds: []
   swim: {}
   tls: {}
-  consumerGateways: []
   # New chart installations use stabilized admission parameters. Pressure
   # transitions require an active scoringPolicy and matching provider metrics
   # signalNames; otherwise admission remains new_and_existing. Omit this block
@@ -41,7 +40,6 @@ gridSite:
   region: ""
   zone: ""
   providerSiteLabel: ""
-  gatewayEndpoint: {}
 
 # -- Remote sites this site trusts, keyed by site name, one GridSite <network>-<name>
 # each, the name the operator gives a peer it discovers. Listing peers also turns on

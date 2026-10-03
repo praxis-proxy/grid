@@ -4525,7 +4525,7 @@ mod tests {
         };
         let spec = discovered_site_spec(&site, "net", true);
         assert_eq!(
-            spec.pointer("/spec/egress/tls"),
+            spec.pointer("/spec/gatewayEndpoint/tls"),
             Some(&serde_json::json!({ "mode": "Plaintext" }))
         );
     }
@@ -4613,7 +4613,7 @@ mod tests {
         };
         let spec = discovered_site_spec(&site, "net", false);
         assert_eq!(
-            spec.pointer("/spec/egress/tls/serverName")
+            spec.pointer("/spec/gatewayEndpoint/tls/serverName")
                 .and_then(serde_json::Value::as_str),
             Some("remote.grid.internal")
         );
