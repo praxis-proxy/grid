@@ -142,6 +142,29 @@ spec:
                     [`InferenceProvider`]: crate::crd::inference_provider::InferenceProvider
                   nullable: true
                   properties:
+                    caConfigMapRef:
+                      description: |-
+                        Reference to a `ConfigMap` holding the CA certificate PEM, such as the
+                        platform service CA (`openshift-service-ca.crt`, key `service-ca.crt`).
+
+                        A CA bundle is public, so it may live in a `ConfigMap`. Like
+                        `ca_secret_ref`, it is the only trust consulted when set.
+                      nullable: true
+                      properties:
+                        key:
+                          description: Key within the `ConfigMap`'s `data`. Defaults to `ca.crt`.
+                          nullable: true
+                          type: string
+                        name:
+                          description: '`ConfigMap` name.'
+                          type: string
+                        namespace:
+                          description: '`ConfigMap` namespace.'
+                          type: string
+                      required:
+                        - name
+                        - namespace
+                      type: object
                     caSecretRef:
                       description: |-
                         Reference to a Secret containing the CA certificate PEM for server
@@ -150,7 +173,8 @@ spec:
                         The Secret must contain the PEM-encoded CA certificate under the key
                         `ca.crt` (or the key specified by `key`).  When this CA is
                         set, the scraper trusts **only** this CA; system root certificates
-                        are not consulted.
+                        are not consulted. Exactly one of this and `ca_config_map_ref` is set.
+                      nullable: true
                       properties:
                         key:
                           description: |-
@@ -209,9 +233,10 @@ spec:
                         - name
                         - namespace
                       type: object
-                  required:
-                    - caSecretRef
                   type: object
+                  x-kubernetes-validations:
+                    - message: set exactly one of caSecretRef and caConfigMapRef
+                      rule: has(self.caSecretRef) != has(self.caConfigMapRef)
                 tools:
                   default: []
                   description: Tool definitions (auto-discovered if omitted).

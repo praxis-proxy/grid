@@ -112,6 +112,42 @@ pub(crate) async fn read_secret_bytes(
     })
 }
 
+/// Read the non-empty value of `key_name` from a `ConfigMap`, as for a Secret.
+///
+/// Reads `data` then `binaryData`. A missing `ConfigMap` maps to `SecretMissing`
+/// so callers share one failure vocabulary.
+///
+/// # Errors
+///
+/// Returns [`kube::Error`] on Kubernetes API failures.
+pub(crate) async fn read_config_map_bytes(
+    client: &kube::Client,
+    config_map_ref: &crate::crd::inference_provider::ConfigMapKeyRef,
+    key_name: &str,
+) -> Result<SecretKeyLookup, kube::Error> {
+    let api: kube::Api<k8s_openapi::api::core::v1::ConfigMap> =
+        kube::Api::namespaced(client.clone(), &config_map_ref.namespace);
+    let Some(config_map) = api.get_opt(&config_map_ref.name).await? else {
+        return Ok(SecretKeyLookup::SecretMissing);
+    };
+    let text = config_map
+        .data
+        .as_ref()
+        .and_then(|data| data.get(key_name))
+        .map(|v| v.as_bytes().to_vec());
+    let binary = || {
+        config_map
+            .binary_data
+            .as_ref()
+            .and_then(|data| data.get(key_name))
+            .map(|v| v.0.clone())
+    };
+    Ok(match text.or_else(binary) {
+        Some(bytes) if !bytes.is_empty() => SecretKeyLookup::Found(bytes),
+        Some(_) | None => SecretKeyLookup::KeyMissing,
+    })
+}
+
 /// Extract public certificate PEM from `secret.data["tls.crt"]`.
 ///
 /// Returns `None` for missing, empty, invalid UTF-8, or private-key-looking

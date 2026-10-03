@@ -103,6 +103,21 @@ spec:
             - name: GRID_PEER_TRUST
               value: {{ . | quote }}
             {{- end }}
+            {{- if and .Values.rbac.create .Values.rbac.metricsScraper }}
+            - name: GRID_METRICS_SCRAPER_SERVICE_ACCOUNT
+              value: {{ printf "%s-metrics-scraper" (include "grid-operator.fullname" .) | quote }}
+            - name: GRID_METRICS_SCRAPER_NAMESPACE
+              value: {{ .Release.Namespace | quote }}
+            # Binds each scrape token to this pod, so it stops working when the pod goes.
+            - name: GRID_POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: GRID_POD_UID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
+            {{- end }}
             {{- if (.Values.signals).enabled }}
             - name: GRID_SIGNALS_LOCAL_ADDR
               value: {{ printf "%s-swim.%s.svc:%v" (include "grid-operator.fullname" .) .Release.Namespace .Values.signals.port | quote }}

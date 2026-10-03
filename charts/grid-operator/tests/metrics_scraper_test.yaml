@@ -1,0 +1,68 @@
+suite: metrics scraper identity
+templates:
+  - templates/metrics-scraper.yaml
+  - templates/deployment.yaml
+release:
+  namespace: grid
+tests:
+  - it: gives the scraper ServiceAccount only get on /metrics, and no mounted token
+    template: templates/metrics-scraper.yaml
+    asserts:
+      - hasDocuments:
+          count: 5
+      - equal:
+          path: automountServiceAccountToken
+          value: false
+        documentIndex: 0
+      - equal:
+          path: rules
+          value:
+            - nonResourceURLs: ["/metrics"]
+              verbs: ["get"]
+        documentIndex: 1
+      - equal:
+          path: subjects[0].name
+          value: RELEASE-NAME-grid-operator-metrics-scraper
+        documentIndex: 2
+
+  - it: lets the operator mint tokens for that one ServiceAccount only
+    template: templates/metrics-scraper.yaml
+    asserts:
+      - equal:
+          path: rules
+          value:
+            - apiGroups: [""]
+              resources: ["serviceaccounts/token"]
+              resourceNames: ["RELEASE-NAME-grid-operator-metrics-scraper"]
+              verbs: ["create"]
+        documentIndex: 3
+      - equal:
+          path: roleRef.name
+          value: RELEASE-NAME-grid-operator-metrics-scraper-token
+        documentIndex: 4
+
+  - it: renders nothing when metricsScraper is off
+    template: templates/metrics-scraper.yaml
+    set:
+      rbac.metricsScraper: false
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: names the scraper ServiceAccount to the operator
+    template: templates/deployment.yaml
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content: {name: GRID_METRICS_SCRAPER_SERVICE_ACCOUNT, value: RELEASE-NAME-grid-operator-metrics-scraper}
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content: {name: GRID_METRICS_SCRAPER_NAMESPACE, value: grid}
+
+  - it: renders nothing when rbac.create is false
+    template: templates/metrics-scraper.yaml
+    set:
+      rbac.create: false
+    asserts:
+      - hasDocuments:
+          count: 0

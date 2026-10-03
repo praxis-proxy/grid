@@ -87,6 +87,11 @@ rbac:
   # -- The grid-enrollment namespace. The render fails if the operator would get Secret
   # access there. Defaults to grid-enrollment with enrollment on.
   enrollmentNamespace: ""
+  # -- Create the metrics scraper ServiceAccount, allowed only GET on the nonResourceURL
+  # /metrics, and let the operator mint short-lived tokens for it. An llm-d EPP serving
+  # bearer-authenticated metrics (the default) admits a scrape with that token
+  # (metricsConfig.auth type serviceAccountToken). The operator never sends its own token.
+  metricsScraper: true
 
 # -- Additional namespaces where the operator needs Secret, ConfigMap,
 # Event, and Service access. The release namespace is always included.

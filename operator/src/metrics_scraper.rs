@@ -9,7 +9,7 @@
 //! ## Usage
 //!
 //! ```text
-//! let text = scrape_metrics("http://backend:9090/metrics", Duration::from_secs(5), None).await?;
+//! let text = scrape_metrics("http://backend:9090/metrics", Duration::from_secs(5), None, None).await?;
 //! let signals = parse_prometheus_text(&text, &names);
 //! let metrics = signals.into_backend_metrics();
 //! state.set_metrics(provider_name.to_owned(), metrics);
@@ -30,11 +30,15 @@ use std::time::{Duration, SystemTime};
 use bytes::Bytes;
 use http_body_util::{BodyExt as _, Empty, Limited};
 use hyper_util::{client::legacy::Client as HyperClient, rt::TokioExecutor};
+use zeroize::Zeroizing;
 
-use crate::resources::tls_backend::ClientTlsConfig;
 pub(crate) use crate::resources::tls_backend::{
     build_custom_tls_connector, build_native_connector, build_pinned_client_config, build_spiffe_client_config,
     build_tls_client_config,
+};
+use crate::{
+    crd::inference_provider::{MetricsAuth, MetricsAuthType},
+    resources::tls_backend::ClientTlsConfig,
 };
 
 // ---------------------------------------------------------------------------
@@ -83,6 +87,12 @@ pub enum MetricsScrapeError {
     /// TLS material could not be parsed or assembled into a valid configuration.
     #[error("metrics TLS material error: {0}")]
     TlsMaterial(String),
+    /// The scrape credential could not be read. Never carries the credential.
+    #[error("metrics credential unavailable: {0}")]
+    Credential(String),
+    /// A credential would have gone over plain HTTP without `allowPlaintext`.
+    #[error("refusing to send a metrics credential over plain http: {0}")]
+    PlaintextCredential(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -109,8 +119,20 @@ pub(crate) async fn scrape_metrics(
     url: &str,
     timeout: Duration,
     tls_config: Option<ClientTlsConfig>,
+    credential: Option<(&MetricsAuth, &kube::Client)>,
 ) -> Result<String, MetricsScrapeError> {
-    scrape_metrics_with_date(url, timeout, tls_config)
+    let bearer = match credential {
+        Some((auth, client)) => {
+            // Refuse before minting, so a bad URL or an unsafe target costs no TokenRequest.
+            let uri = url
+                .parse::<http::Uri>()
+                .map_err(|_invalid| MetricsScrapeError::InvalidUrl(url.to_owned()))?;
+            credential_allowed(&uri, tls_config.is_some(), auth.allow_plaintext, url)?;
+            Some(Bearer::for_auth(auth, client).await?)
+        },
+        None => None,
+    };
+    scrape(url, timeout, tls_config, bearer.as_ref())
         .await
         .map(|(body, _)| body)
 }
@@ -124,6 +146,16 @@ pub(crate) async fn scrape_metrics_with_date(
     url: &str,
     timeout: Duration,
     tls_config: Option<ClientTlsConfig>,
+) -> Result<(String, Option<SystemTime>), MetricsScrapeError> {
+    scrape(url, timeout, tls_config, None).await
+}
+
+/// GET `url`, presenting `bearer` when given.
+async fn scrape(
+    url: &str,
+    timeout: Duration,
+    tls_config: Option<ClientTlsConfig>,
+    bearer: Option<&Bearer>,
 ) -> Result<(String, Option<SystemTime>), MetricsScrapeError> {
     let uri = url
         .parse::<http::Uri>()
@@ -139,6 +171,9 @@ pub(crate) async fn scrape_metrics_with_date(
     if tls_config.is_some() && uri.scheme_str() != Some("https") {
         return Err(MetricsScrapeError::HttpWithTls(url.to_owned()));
     }
+    if let Some(bearer) = bearer {
+        credential_allowed(&uri, tls_config.is_some(), bearer.allow_plaintext, url)?;
+    }
 
     let connector = if let Some(config) = &tls_config {
         build_custom_tls_connector(config)?
@@ -147,16 +182,95 @@ pub(crate) async fn scrape_metrics_with_date(
     };
     let client: HyperClient<_, Empty<Bytes>> = HyperClient::builder(TokioExecutor::new()).build(connector);
 
-    let req = http::Request::builder()
-        .method(http::Method::GET)
-        .uri(uri.clone())
-        .body(Empty::<Bytes>::new())
-        .map_err(|e| MetricsScrapeError::Transport(e.into()))?;
+    let req = build_request(uri, bearer)?;
 
     // One deadline covers the body too, so a stalled peer cannot hold the caller.
     tokio::time::timeout(timeout, read_response(client.request(req), url))
         .await
         .map_err(|_elapsed| MetricsScrapeError::Timeout(timeout))?
+}
+
+/// A GET for `uri`, carrying `bearer` as a sensitive `Authorization` header when given.
+fn build_request(uri: http::Uri, bearer: Option<&Bearer>) -> Result<http::Request<Empty<Bytes>>, MetricsScrapeError> {
+    let mut req = http::Request::builder()
+        .method(http::Method::GET)
+        .uri(uri)
+        .body(Empty::<Bytes>::new())
+        .map_err(|e| MetricsScrapeError::Transport(e.into()))?;
+    if let Some(bearer) = bearer {
+        req.headers_mut().insert(http::header::AUTHORIZATION, bearer.header()?);
+    }
+    Ok(req)
+}
+
+/// Refuse to send `bearer` to `url` unless a CA the provider names proves the host, or plain HTTP is allowed.
+fn credential_allowed(
+    uri: &http::Uri,
+    named_ca: bool,
+    allow_plaintext: bool,
+    url: &str,
+) -> Result<(), MetricsScrapeError> {
+    match uri.scheme_str() {
+        // Never system roots: any host with a public certificate would receive the token.
+        Some("https") if !named_ca => Err(MetricsScrapeError::Credential(format!(
+            "a credential needs metricsConfig.tls to name the CA for {url}"
+        ))),
+        Some("https") => Ok(()),
+        _ if allow_plaintext => Ok(()),
+        _ => Err(MetricsScrapeError::PlaintextCredential(url.to_owned())),
+    }
+}
+
+/// Longest token accepted; a minted token is a few KiB.
+const MAX_TOKEN_BYTES: usize = 16 * 1024;
+
+/// A bearer credential for one scrape. Never printed.
+pub(crate) struct Bearer {
+    /// The token, wiped on drop.
+    token: Zeroizing<String>,
+    /// Whether it may travel over plain HTTP.
+    allow_plaintext: bool,
+}
+
+impl std::fmt::Debug for Bearer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Bearer(redacted)")
+    }
+}
+
+impl Bearer {
+    /// The credential `auth` names: a short-lived token for the metrics scraper `ServiceAccount`.
+    async fn for_auth(auth: &MetricsAuth, client: &kube::Client) -> Result<Self, MetricsScrapeError> {
+        match auth.kind {
+            MetricsAuthType::ServiceAccountToken => {
+                Self::new(crate::metrics_token::scraper_token(client).await?, auth.allow_plaintext)
+            },
+        }
+    }
+
+    /// Wrap `token`, which must be one bounded, printable word so it is a safe header value.
+    fn new(token: Zeroizing<String>, allow_plaintext: bool) -> Result<Self, MetricsScrapeError> {
+        if token.len() > MAX_TOKEN_BYTES {
+            return Err(MetricsScrapeError::Credential(format!(
+                "token exceeds {MAX_TOKEN_BYTES} bytes"
+            )));
+        }
+        if token.is_empty() || !token.bytes().all(|byte| byte.is_ascii_graphic()) {
+            return Err(MetricsScrapeError::Credential(
+                "token is empty or not a single printable word".to_owned(),
+            ));
+        }
+        Ok(Self { token, allow_plaintext })
+    }
+
+    /// `Authorization: Bearer <token>`, marked sensitive so it is never logged or indexed.
+    fn header(&self) -> Result<http::HeaderValue, MetricsScrapeError> {
+        let value = Zeroizing::new(format!("Bearer {}", self.token.as_str()));
+        let mut header = http::HeaderValue::from_str(&value)
+            .map_err(|_invalid| MetricsScrapeError::Credential("token is not a valid header value".to_owned()))?;
+        header.set_sensitive(true);
+        Ok(header)
+    }
 }
 
 /// Await `request`, then read a 2xx body from `url` and its `Date` header.
@@ -236,7 +350,7 @@ mod tests {
         let body = b"# HELP test_metric Test\ntest_metric 1.0\n";
         let response = b"HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 39\r\n\r\n# HELP test_metric Test\ntest_metric 1.0\n";
         let url = start_test_server(response).await;
-        let result = scrape_metrics(&url, Duration::from_secs(5), None).await;
+        let result = scrape_metrics(&url, Duration::from_secs(5), None, None).await;
         assert!(result.is_ok(), "HTTP 200 must succeed: {result:?}");
         let text = result.unwrap_or_else(|_| std::process::abort());
         assert!(text.contains("test_metric"), "body must be in scrape result");
@@ -247,7 +361,7 @@ mod tests {
     async fn scrape_returns_error_for_non_2xx() {
         let response = b"HTTP/1.0 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n";
         let url = start_test_server(response).await;
-        let result = scrape_metrics(&url, Duration::from_secs(5), None).await;
+        let result = scrape_metrics(&url, Duration::from_secs(5), None, None).await;
         assert!(result.is_err(), "HTTP 503 must return an error");
         assert!(
             matches!(result.unwrap_err(), MetricsScrapeError::NonOkStatus { status: 503, .. }),
@@ -272,7 +386,7 @@ mod tests {
             }
         });
         let url = format!("http://127.0.0.1:{port}/metrics");
-        let result = scrape_metrics(&url, Duration::from_millis(100), None).await;
+        let result = scrape_metrics(&url, Duration::from_millis(100), None, None).await;
         assert!(result.is_err(), "silent server must time out");
         assert!(
             matches!(result.unwrap_err(), MetricsScrapeError::Timeout(_)),
@@ -283,7 +397,7 @@ mod tests {
     #[tokio::test]
     async fn scrape_returns_error_for_connection_refused() {
         // Port 1 is never open on any standard OS.
-        let result = scrape_metrics("http://127.0.0.1:1/metrics", Duration::from_secs(5), None).await;
+        let result = scrape_metrics("http://127.0.0.1:1/metrics", Duration::from_secs(5), None, None).await;
         assert!(result.is_err(), "connection refused must return an error");
         assert!(
             matches!(result.unwrap_err(), MetricsScrapeError::Transport(_)),
@@ -293,7 +407,7 @@ mod tests {
 
     #[tokio::test]
     async fn scrape_returns_invalid_url_for_unsupported_scheme() {
-        let result = scrape_metrics("ftp://example.com/metrics", Duration::from_secs(5), None).await;
+        let result = scrape_metrics("ftp://example.com/metrics", Duration::from_secs(5), None, None).await;
         assert!(result.is_err(), "ftp:// must return an error");
         assert!(
             matches!(result.unwrap_err(), MetricsScrapeError::InvalidUrl(_)),
@@ -591,7 +705,7 @@ mod tests {
         .await;
 
         let tls_config = build_tls_client_config(ca.cert_pem.as_bytes(), None, None).unwrap();
-        let result = scrape_metrics(&url, Duration::from_secs(5), Some(Arc::new(tls_config))).await;
+        let result = scrape_metrics(&url, Duration::from_secs(5), Some(Arc::new(tls_config)), None).await;
         assert!(result.is_ok(), "TLS scrape with matching CA must succeed: {result:?}");
         assert!(
             result.unwrap().contains("test_metric"),
@@ -614,7 +728,7 @@ mod tests {
         .await;
 
         let tls_config = build_tls_client_config(ca_client.cert_pem.as_bytes(), None, None).unwrap();
-        let result = scrape_metrics(&url, Duration::from_secs(5), Some(Arc::new(tls_config))).await;
+        let result = scrape_metrics(&url, Duration::from_secs(5), Some(Arc::new(tls_config)), None).await;
         assert!(result.is_err(), "TLS scrape with wrong CA must fail");
         assert!(
             matches!(result.unwrap_err(), MetricsScrapeError::Transport(_)),
@@ -642,7 +756,7 @@ mod tests {
             Some(client_cert.key_pem.as_bytes()),
         )
         .unwrap();
-        let result = scrape_metrics(&url, Duration::from_secs(5), Some(Arc::new(tls_config))).await;
+        let result = scrape_metrics(&url, Duration::from_secs(5), Some(Arc::new(tls_config)), None).await;
         assert!(
             result.is_ok(),
             "mTLS scrape with valid client cert must succeed: {result:?}"
@@ -667,7 +781,7 @@ mod tests {
         .await;
 
         let tls_config = build_tls_client_config(ca.cert_pem.as_bytes(), None, None).unwrap();
-        let result = scrape_metrics(&url, Duration::from_secs(5), Some(Arc::new(tls_config))).await;
+        let result = scrape_metrics(&url, Duration::from_secs(5), Some(Arc::new(tls_config)), None).await;
         assert!(result.is_err(), "mTLS scrape without client cert must fail");
         assert!(
             matches!(result.unwrap_err(), MetricsScrapeError::Transport(_)),
@@ -701,7 +815,7 @@ mod tests {
 
         let pin = leaf_pin(&server_cert.cert_pem);
         let config = build_pinned_client_config(ca.cert_pem.as_bytes(), None, None, &[pin]).unwrap();
-        let result = scrape_metrics(&url, Duration::from_secs(5), Some(config)).await;
+        let result = scrape_metrics(&url, Duration::from_secs(5), Some(config), None).await;
         assert!(result.is_ok(), "a matching pin must accept the peer: {result:?}");
         assert!(result.unwrap().contains("test_metric"), "body must be returned");
     }
@@ -723,7 +837,7 @@ mod tests {
         let other = certs::generate_dns_cert(&ca, "other", "localhost").unwrap();
         let config =
             build_pinned_client_config(ca.cert_pem.as_bytes(), None, None, &[leaf_pin(&other.cert_pem)]).unwrap();
-        let result = scrape_metrics(&url, Duration::from_secs(5), Some(config)).await;
+        let result = scrape_metrics(&url, Duration::from_secs(5), Some(config), None).await;
         assert!(result.is_err(), "an undeclared leaf must be rejected");
         assert!(
             matches!(result.unwrap_err(), MetricsScrapeError::Transport(_)),
@@ -740,7 +854,7 @@ mod tests {
             let url = start_tls_test_server(&server_cert.cert_pem, &server_cert.key_pem, None, body.clone()).await;
             let config =
                 build_spiffe_client_config(ca.cert_pem.as_bytes(), None, None, &certs::spiffe_id(site)).unwrap();
-            let result = scrape_metrics(&url, Duration::from_secs(5), Some(config)).await;
+            let result = scrape_metrics(&url, Duration::from_secs(5), Some(config), None).await;
             assert_eq!(result.is_ok(), accepted, "{label}: {result:?}");
         }
     }
@@ -852,7 +966,7 @@ mod tests {
         .await;
 
         let tls_config = build_tls_client_config(ca.cert_pem.as_bytes(), None, None).unwrap();
-        let result = scrape_metrics(&url, Duration::from_secs(5), Some(Arc::new(tls_config))).await;
+        let result = scrape_metrics(&url, Duration::from_secs(5), Some(Arc::new(tls_config)), None).await;
         assert!(
             result.is_err(),
             "TLS scrape with hostname mismatch must fail (SAN has wrong.example.com, connecting to localhost)"
@@ -877,7 +991,7 @@ mod tests {
         .await;
 
         let tls_config = build_tls_client_config(ca.cert_pem.as_bytes(), None, None).unwrap();
-        let result = scrape_metrics(&url, Duration::from_secs(5), Some(Arc::new(tls_config))).await;
+        let result = scrape_metrics(&url, Duration::from_secs(5), Some(Arc::new(tls_config)), None).await;
         assert!(result.is_err(), "TLS scrape with expired server cert must fail");
         assert!(
             matches!(result.unwrap_err(), MetricsScrapeError::Transport(_)),
@@ -899,7 +1013,7 @@ mod tests {
         .await;
 
         let tls_config = build_tls_client_config(ca.cert_pem.as_bytes(), None, None).unwrap();
-        let result = scrape_metrics(&url, Duration::from_secs(5), Some(Arc::new(tls_config))).await;
+        let result = scrape_metrics(&url, Duration::from_secs(5), Some(Arc::new(tls_config)), None).await;
         assert!(result.is_err(), "TLS scrape with not-yet-valid server cert must fail");
         assert!(
             matches!(result.unwrap_err(), MetricsScrapeError::Transport(_)),
@@ -911,7 +1025,7 @@ mod tests {
     async fn scrape_401_returns_non_ok_status() {
         let response = b"HTTP/1.0 401 Unauthorized\r\nContent-Length: 0\r\n\r\n";
         let url = start_test_server(response).await;
-        let result = scrape_metrics(&url, Duration::from_secs(5), None).await;
+        let result = scrape_metrics(&url, Duration::from_secs(5), None, None).await;
         assert!(result.is_err(), "HTTP 401 must return an error");
         assert!(
             matches!(result.unwrap_err(), MetricsScrapeError::NonOkStatus { status: 401, .. }),
@@ -923,7 +1037,7 @@ mod tests {
     async fn scrape_403_returns_non_ok_status() {
         let response = b"HTTP/1.0 403 Forbidden\r\nContent-Length: 0\r\n\r\n";
         let url = start_test_server(response).await;
-        let result = scrape_metrics(&url, Duration::from_secs(5), None).await;
+        let result = scrape_metrics(&url, Duration::from_secs(5), None, None).await;
         assert!(result.is_err(), "HTTP 403 must return an error");
         assert!(
             matches!(result.unwrap_err(), MetricsScrapeError::NonOkStatus { status: 403, .. }),
@@ -955,7 +1069,7 @@ mod tests {
         });
 
         let url = format!("http://127.0.0.1:{port}/metrics");
-        let result = scrape_metrics(&url, Duration::from_secs(10), None).await;
+        let result = scrape_metrics(&url, Duration::from_secs(10), None, None).await;
         assert!(result.is_err(), "oversized response body must be rejected");
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("limit"), "error must mention size limit: {msg}");
@@ -1018,7 +1132,13 @@ mod tests {
     async fn scrape_rejects_http_url_with_tls_config() {
         let ca = certs::generate_ca("test-ca").unwrap();
         let config = Arc::new(build_tls_client_config(ca.cert_pem.as_bytes(), None, None).unwrap());
-        let result = scrape_metrics("http://127.0.0.1:9090/metrics", Duration::from_secs(5), Some(config)).await;
+        let result = scrape_metrics(
+            "http://127.0.0.1:9090/metrics",
+            Duration::from_secs(5),
+            Some(config),
+            None,
+        )
+        .await;
         assert!(result.is_err(), "HTTP URL with TLS config must fail");
         assert!(
             matches!(result.unwrap_err(), MetricsScrapeError::HttpWithTls(_)),
@@ -1033,7 +1153,7 @@ mod tests {
         let response = b"HTTP/1.0 200 OK\r\nContent-Length: 5\r\n\r\nhello";
         let url = start_tls_test_server(&server.cert_pem, &server.key_pem, None, response.to_vec()).await;
         let config = Arc::new(build_tls_client_config(ca.cert_pem.as_bytes(), None, None).unwrap());
-        let result = scrape_metrics(&url, Duration::from_secs(5), Some(config)).await;
+        let result = scrape_metrics(&url, Duration::from_secs(5), Some(config), None).await;
         assert!(result.is_ok(), "HTTPS URL with TLS config must succeed: {result:?}");
     }
 
@@ -1041,7 +1161,101 @@ mod tests {
     async fn scrape_allows_http_url_without_tls_config() {
         let response = b"HTTP/1.0 200 OK\r\nContent-Length: 5\r\n\r\nhello";
         let url = start_test_server(response).await;
-        let result = scrape_metrics(&url, Duration::from_secs(5), None).await;
+        let result = scrape_metrics(&url, Duration::from_secs(5), None, None).await;
         assert!(result.is_ok(), "HTTP URL without TLS config must succeed: {result:?}");
+    }
+
+    /// A plain HTTP server answering one request with `200 ok`, handing back what it received.
+    async fn capturing_server() -> (String, tokio::sync::oneshot::Receiver<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/metrics", listener.local_addr().unwrap());
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0_u8; 8192];
+                let read = stream.read(&mut buf).await.unwrap_or(0);
+                drop(tx.send(String::from_utf8_lossy(buf.get(..read).unwrap_or_default()).into_owned()));
+                drop(
+                    stream
+                        .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
+                        .await,
+                );
+            }
+        });
+        (url, rx)
+    }
+
+    fn bearer(token: &str, allow_plaintext: bool) -> Bearer {
+        Bearer::new(Zeroizing::new(token.to_owned()), allow_plaintext).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_bearer_is_sent_as_the_authorization_header() {
+        let bearer = bearer("eyJhbGciOi.tok-en_1", true);
+        let (url, request) = capturing_server().await;
+        let body = scrape(&url, Duration::from_secs(5), None, Some(&bearer))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(body, "ok");
+        let request = request.await.unwrap().to_ascii_lowercase();
+        assert!(
+            request.contains("authorization: bearer eyjhbgcioi.tok-en_1\r\n"),
+            "{request}"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_auth_sends_no_authorization_header() {
+        let (url, request) = capturing_server().await;
+        scrape_metrics(&url, Duration::from_secs(5), None, None).await.unwrap();
+        assert!(!request.await.unwrap().to_ascii_lowercase().contains("authorization:"));
+    }
+
+    #[tokio::test]
+    async fn a_bearer_is_never_sent_over_plain_http_unless_allowed() {
+        let bearer = bearer("secret-token", false);
+        let (url, request) = capturing_server().await;
+        let refused = scrape(&url, Duration::from_secs(5), None, Some(&bearer)).await;
+        assert!(matches!(refused, Err(MetricsScrapeError::PlaintextCredential(_))));
+        let not_contacted = tokio::time::timeout(Duration::from_millis(200), request).await;
+        assert!(not_contacted.is_err(), "the server is never contacted");
+    }
+
+    #[test]
+    fn an_unusable_token_is_refused_without_echoing_it() {
+        let oversized = "a".repeat(MAX_TOKEN_BYTES + 1);
+        for (label, token) in [
+            ("empty", ""),
+            ("two words", "not one-word"),
+            ("newline", "tok\nen"),
+            ("oversized", oversized.as_str()),
+        ] {
+            let error = Bearer::new(Zeroizing::new(token.to_owned()), false).unwrap_err();
+            assert!(matches!(error, MetricsScrapeError::Credential(_)), "{label}");
+            assert!(
+                !error.to_string().contains("one-word"),
+                "{label}: the token never reaches an error"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_bearer_is_never_sent_under_system_roots() {
+        let refused = scrape(
+            "https://example.com/metrics",
+            Duration::from_secs(5),
+            None,
+            Some(&bearer("t", false)),
+        )
+        .await;
+        assert!(matches!(refused, Err(MetricsScrapeError::Credential(_))), "{refused:?}");
+    }
+
+    #[test]
+    fn a_bearer_never_prints_its_token() {
+        let secret = bearer("super-secret", false);
+        assert_eq!(format!("{secret:?}"), "Bearer(redacted)");
+        assert!(secret.header().unwrap().is_sensitive());
     }
 }

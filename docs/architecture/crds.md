@@ -638,13 +638,15 @@ requests to this provider's metrics endpoint.
 
 | Field | Required | Meaning |
 |-------|----------|---------|
-| `tls.caSecretRef` | yes | Secret containing the CA certificate for server verification. Default key: `ca.crt`. |
+| `tls.caSecretRef` | one of | Secret containing the CA certificate for server verification. Default key: `ca.crt`. |
+| `tls.caConfigMapRef` | one of | ConfigMap containing the CA certificate, such as the platform service CA (`openshift-service-ca.crt`, key `service-ca.crt`). Default key: `ca.crt`. |
 | `tls.clientCertificateSecretRef` | no | Secret containing client certificate and private key for mTLS. |
 | `tls.clientCertificateSecretRef.certificateKey` | no | Key within `Secret.data` for the certificate PEM. Default: `tls.crt`. |
 | `tls.clientCertificateSecretRef.privateKeyKey` | no | Key within `Secret.data` for the private key PEM. Default: `tls.key`. |
 
-`caSecretRef` follows the same [`SecretRef`](#credential-projection) schema used by
-`spec.auth.secretRef`.  `clientCertificateSecretRef` adds explicit
+Set exactly one of `caSecretRef` and `caConfigMapRef`; the configured CA is the only
+trust used. `caSecretRef` follows the same [`SecretRef`](#credential-projection) schema used by
+`spec.auth.secretRef`. `caConfigMapRef` takes `name`, `namespace`, and an optional `key`.  `clientCertificateSecretRef` adds explicit
 `certificateKey` and `privateKeyKey` fields with serde defaults.
 
 **Failure behavior**: when TLS material cannot be resolved or parsed, the
@@ -698,6 +700,46 @@ metricsConfig:
       namespace: grid-system
       certificateKey: tls.crt
       privateKeyKey: tls.key
+```
+
+#### Bearer authentication
+
+An llm-d EPP serves `/metrics` behind TokenReview and SubjectAccessReview by
+default. `metricsConfig.auth` sends a credential the EPP can authorize.
+
+| Field | Meaning |
+|-------|---------|
+| `auth.type` | `serviceAccountToken`: a short-lived token for the grid metrics scraper ServiceAccount, sent as `Authorization: Bearer`. |
+| `auth.allowPlaintext` | Send the credential over `http://`. Default `false`. For a lab only. |
+
+Whoever runs the EPP receives the token, and it is valid against the API server, so
+the operator never sends its own token. The grid-operator chart creates a scraper
+ServiceAccount allowed only `get` on the nonResourceURL `/metrics`
+(`rbac.metricsScraper`, default `true`), and the operator mints a 10-minute token for it
+with the TokenRequest API, bound to the operator Pod, reusing it until two thirds of its
+lifetime has passed (about 400 seconds). The token is never logged.
+
+A credential goes only to a host proven by the CA `metricsConfig.tls` names: with
+`auth` set, an `https://` endpoint without `tls` is refused rather than trusted through
+the system roots, and an `http://` endpoint is refused unless `allowPlaintext` is set.
+
+Example (an EPP serving its metrics with the platform service CA):
+
+```yaml
+metricsConfig:
+  metricsEndpoint: https://qwen3-epp-service.ai-tenant-site-a.svc:9090
+  path: /metrics
+  poolName: qwen3-inference-pool
+  signalNames:
+    queueDepth: llm_d_epp_average_queue_size
+    kvCacheUtilization: llm_d_epp_average_kv_cache_utilization
+  tls:
+    caConfigMapRef:
+      name: openshift-service-ca.crt
+      namespace: grid
+      key: service-ca.crt
+  auth:
+    type: serviceAccountToken
 ```
 
 #### Queue depth normalization

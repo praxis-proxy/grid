@@ -212,6 +212,10 @@
         "enrollmentNamespace": {
           "type": "string",
           "description": "The grid-enrollment namespace, which the render refuses to grant Secret access in."
+        },
+        "metricsScraper": {
+          "type": "boolean",
+          "description": "Create the metrics scraper ServiceAccount (get on /metrics only) and let the operator mint its tokens."
         }
       }
     },

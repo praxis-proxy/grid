@@ -2051,11 +2051,9 @@ mod tests {
         .unwrap_or_else(|_| std::process::abort());
         let hc = spec.health_check.unwrap_or_else(|| std::process::abort());
         let tls = hc.tls.unwrap_or_else(|| std::process::abort());
-        assert_eq!(tls.ca_secret_ref.name, "backend-ca", "caSecretRef.name must round-trip");
-        assert_eq!(
-            tls.ca_secret_ref.namespace, "grid-system",
-            "caSecretRef.namespace must round-trip"
-        );
+        let ca = tls.ca_secret_ref.as_ref().unwrap_or_else(|| std::process::abort());
+        assert_eq!(ca.name, "backend-ca", "caSecretRef.name must round-trip");
+        assert_eq!(ca.namespace, "grid-system", "caSecretRef.namespace must round-trip");
         assert!(
             tls.client_certificate_secret_ref.is_none(),
             "absent clientCertificateSecretRef must be None"

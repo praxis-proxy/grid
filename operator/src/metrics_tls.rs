@@ -371,6 +371,7 @@ mod tests {
             &format!("https://localhost:{port}{path}"),
             Duration::from_secs(5),
             Some(Arc::new(client)),
+            None,
         )
         .await
         .map_err(|e| e.to_string())

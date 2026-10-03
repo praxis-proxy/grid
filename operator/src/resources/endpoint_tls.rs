@@ -11,9 +11,9 @@
 use std::sync::Arc;
 
 use crate::{
-    crd::inference_provider::{ClientCertificateSecretRef, EndpointTlsConfig},
+    crd::inference_provider::{CaSource, ClientCertificateSecretRef, EndpointTlsConfig},
     metrics_scraper,
-    resources::tls_backend::ClientTlsConfig,
+    resources::{secret::SecretKeyLookup, tls_backend::ClientTlsConfig},
 };
 
 // ---------------------------------------------------------------------------
@@ -108,7 +108,7 @@ pub(crate) async fn read_secret_bytes_for_tls(
     provider_identity: &str,
     material_desc: &str,
 ) -> Result<Vec<u8>, (TlsFailureReason, String)> {
-    use crate::resources::secret::{SecretKeyLookup, read_secret_bytes};
+    use crate::resources::secret::read_secret_bytes;
 
     match read_secret_bytes(client, secret_ref, key_name).await {
         Ok(SecretKeyLookup::Found(bytes)) => Ok(bytes),
@@ -134,6 +134,77 @@ pub(crate) async fn read_secret_bytes_for_tls(
             ),
         )),
     }
+}
+
+/// Read `tls`'s CA PEM from its one configured source, Secret or `ConfigMap`.
+///
+/// # Errors
+///
+/// Returns the failure reason and a message when neither or both sources are
+/// set, or the source cannot be read.
+pub(crate) async fn read_ca_for_tls(
+    client: &kube::Client,
+    tls: &EndpointTlsConfig,
+    provider_identity: &str,
+) -> Result<Vec<u8>, (TlsFailureReason, String)> {
+    match tls.ca_source() {
+        Some(CaSource::Secret(secret)) => {
+            let key = secret.key.as_deref().unwrap_or("ca.crt");
+            read_secret_bytes_for_tls(client, secret, key, provider_identity, "CA").await
+        },
+        Some(CaSource::ConfigMap(config_map)) => read_config_map_ca(client, config_map, provider_identity).await,
+        None => Err((
+            TlsFailureReason::MaterialInvalid,
+            format!("set exactly one of caSecretRef and caConfigMapRef for provider {provider_identity}"),
+        )),
+    }
+}
+
+/// Read a CA PEM from `config_map`, mapping a failure to its TLS reason.
+async fn read_config_map_ca(
+    client: &kube::Client,
+    config_map: &crate::crd::inference_provider::ConfigMapKeyRef,
+    provider_identity: &str,
+) -> Result<Vec<u8>, (TlsFailureReason, String)> {
+    let key = config_map.key.as_deref().unwrap_or("ca.crt");
+    let where_ = format!("ConfigMap {}/{}", config_map.namespace, config_map.name);
+    match crate::resources::secret::read_config_map_bytes(client, config_map, key).await {
+        Ok(SecretKeyLookup::Found(bytes)) => Ok(bytes),
+        Ok(SecretKeyLookup::KeyMissing) => Err((
+            TlsFailureReason::KeyMissing,
+            format!("CA key {key:?} in {where_} is absent or empty for provider {provider_identity}"),
+        )),
+        Ok(SecretKeyLookup::SecretMissing) => Err((
+            TlsFailureReason::SecretMissing,
+            format!("CA {where_} not found for provider {provider_identity}"),
+        )),
+        Err(e) => Err((
+            TlsFailureReason::MaterialInvalid,
+            format!("CA {where_} read failed for provider {provider_identity}: {e}"),
+        )),
+    }
+}
+
+/// [`read_ca_for_tls`] for validation: an API error is returned, a missing CA is a reason.
+async fn read_ca_for_verify(
+    client: &kube::Client,
+    tls: &EndpointTlsConfig,
+) -> Result<Result<Vec<u8>, TlsFailureReason>, crate::error::OperatorError> {
+    let lookup = match tls.ca_source() {
+        Some(CaSource::Secret(secret)) => {
+            return read_tls_secret_for_verify(client, secret, secret.key.as_deref().unwrap_or("ca.crt")).await;
+        },
+        Some(CaSource::ConfigMap(config_map)) => {
+            let key = config_map.key.as_deref().unwrap_or("ca.crt");
+            crate::resources::secret::read_config_map_bytes(client, config_map, key).await?
+        },
+        None => return Ok(Err(TlsFailureReason::MaterialInvalid)),
+    };
+    Ok(match lookup {
+        SecretKeyLookup::Found(bytes) => Ok(bytes),
+        SecretKeyLookup::SecretMissing => Err(TlsFailureReason::SecretMissing),
+        SecretKeyLookup::KeyMissing => Err(TlsFailureReason::KeyMissing),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -175,8 +246,7 @@ pub(crate) async fn resolve_tls_config(
         ));
     };
 
-    let ca_key = tls.ca_secret_ref.key.as_deref().unwrap_or("ca.crt");
-    let ca_pem = read_secret_bytes_for_tls(kube_client, &tls.ca_secret_ref, ca_key, provider_identity, "CA").await?;
+    let ca_pem = read_ca_for_tls(kube_client, tls, provider_identity).await?;
 
     let (client_cert_pem, client_key_pem) = if let Some(client_ref) = &tls.client_certificate_secret_ref {
         let cert_ref = secret_ref_from_client_cert(client_ref);
@@ -248,8 +318,7 @@ pub(crate) async fn verify_tls_accessible(
         return Ok(None);
     };
 
-    let ca_key = tls.ca_secret_ref.key.as_deref().unwrap_or("ca.crt");
-    let ca_pem = match read_tls_secret_for_verify(client, &tls.ca_secret_ref, ca_key).await? {
+    let ca_pem = match read_ca_for_verify(client, tls).await? {
         Ok(bytes) => bytes,
         Err(reason) => return Ok(Some(reason)),
     };
@@ -283,7 +352,7 @@ pub(crate) async fn verify_tls_accessible(
 ///
 /// Thin wrapper over [`read_secret_bytes`](crate::resources::secret::read_secret_bytes)
 /// that maps its
-/// [`SecretKeyLookup`](crate::resources::secret::SecretKeyLookup) result
+/// [`SecretKeyLookup`] result
 /// onto the [`TlsFailureReason`] this module's callers expect, so "Secret
 /// not found" and "key not found" map to the correct variant.
 ///
@@ -297,7 +366,7 @@ async fn read_tls_secret_for_verify(
     secret_ref: &crate::crd::grid_network::SecretRef,
     key_name: &str,
 ) -> Result<Result<Vec<u8>, TlsFailureReason>, crate::error::OperatorError> {
-    use crate::resources::secret::{SecretKeyLookup, read_secret_bytes};
+    use crate::resources::secret::read_secret_bytes;
 
     Ok(match read_secret_bytes(client, secret_ref, key_name).await? {
         SecretKeyLookup::Found(bytes) => Ok(bytes),
@@ -317,15 +386,18 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use crate::resources::test_doubles::{mock_kube_client_with_secrets, secret_with_key};
+    use crate::resources::test_doubles::{
+        config_map_with_key, mock_kube_client_with_config_maps, mock_kube_client_with_secrets, secret_with_key,
+    };
 
     fn test_tls_config(ca_secret_name: &str) -> EndpointTlsConfig {
         EndpointTlsConfig {
-            ca_secret_ref: crate::crd::grid_network::SecretRef {
+            ca_secret_ref: Some(crate::crd::grid_network::SecretRef {
                 name: ca_secret_name.to_owned(),
                 namespace: "default".to_owned(),
                 key: None,
-            },
+            }),
+            ca_config_map_ref: None,
             client_certificate_secret_ref: None,
         }
     }
@@ -443,11 +515,12 @@ mod tests {
     #[tokio::test]
     async fn resolve_tls_config_some_without_client_returns_err() {
         let tls = EndpointTlsConfig {
-            ca_secret_ref: crate::crd::grid_network::SecretRef {
+            ca_secret_ref: Some(crate::crd::grid_network::SecretRef {
                 name: "ca".to_owned(),
                 namespace: "ns".to_owned(),
                 key: None,
-            },
+            }),
+            ca_config_map_ref: None,
             client_certificate_secret_ref: None,
         };
         let result = resolve_tls_config(Some(&tls), None, "test-provider").await;
@@ -516,5 +589,61 @@ mod tests {
         let client = mock_kube_client_with_secrets(HashMap::new());
         let result = verify_tls_accessible(&client, None).await.expect("no API error");
         assert!(result.is_none(), "no TLS configured must skip validation");
+    }
+
+    fn service_ca_config(name: &str) -> EndpointTlsConfig {
+        EndpointTlsConfig {
+            ca_secret_ref: None,
+            ca_config_map_ref: Some(crate::crd::inference_provider::ConfigMapKeyRef {
+                name: name.to_owned(),
+                namespace: "grid".to_owned(),
+                key: Some("service-ca.crt".to_owned()),
+            }),
+            client_certificate_secret_ref: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_service_ca_config_map_is_the_trusted_ca() {
+        let ca = certs::generate_ca("service-serving-signer").unwrap();
+        let client = mock_kube_client_with_config_maps(HashMap::from([(
+            "openshift-service-ca.crt",
+            config_map_with_key("service-ca.crt", &ca.cert_pem),
+        )]));
+        let resolved =
+            resolve_tls_config(Some(&service_ca_config("openshift-service-ca.crt")), Some(&client), "p").await;
+        assert!(
+            matches!(resolved, Ok(Some(_))),
+            "the ConfigMap CA builds a client config"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_service_ca_config_map_or_key_fails_closed() {
+        let client =
+            mock_kube_client_with_config_maps(HashMap::from([("wrong-key", config_map_with_key("ca.crt", "x"))]));
+        let absent = resolve_tls_config(Some(&service_ca_config("absent")), Some(&client), "p").await;
+        assert!(matches!(absent, Err((TlsFailureReason::SecretMissing, _))));
+        let keyless = resolve_tls_config(Some(&service_ca_config("wrong-key")), Some(&client), "p").await;
+        assert!(matches!(keyless, Err((TlsFailureReason::KeyMissing, _))));
+        assert_eq!(
+            verify_tls_accessible(&client, Some(&service_ca_config("absent")))
+                .await
+                .unwrap(),
+            Some(TlsFailureReason::SecretMissing)
+        );
+    }
+
+    #[tokio::test]
+    async fn exactly_one_ca_source_is_required() {
+        let client = mock_kube_client_with_config_maps(HashMap::new());
+        let mut both = service_ca_config("x");
+        both.ca_secret_ref = test_tls_config("ca").ca_secret_ref;
+        let mut neither = service_ca_config("x");
+        neither.ca_config_map_ref = None;
+        for tls in [both, neither] {
+            let resolved = resolve_tls_config(Some(&tls), Some(&client), "p").await;
+            assert!(matches!(resolved, Err((TlsFailureReason::MaterialInvalid, _))));
+        }
     }
 }
