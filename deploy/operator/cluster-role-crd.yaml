@@ -10,7 +10,8 @@ rules:
   # The operator watches the Grid CRD types via kube-rs Controller::new
   # (requires list + watch).  It reads individual resources with get and
   # writes spec and status via server-side apply (patch).  Auto-discovery
-  # of SWIM peers requires create + update on gridsites.
+  # of SWIM peers requires create + update on gridsites, and delete to
+  # collect auto-discovered ones gone past staleCandidateTtlSeconds.
   - apiGroups: ["grid.praxis.fast"]
     resources:
       - agenttoolproviders
@@ -20,7 +21,7 @@ rules:
   - apiGroups: ["grid.praxis.fast"]
     resources:
       - gridsites
-    verbs: ["get", "list", "watch", "patch", "create", "update"]
+    verbs: ["get", "list", "watch", "patch", "create", "update", "delete"]
 
   # Status subresources are authorized separately.
   - apiGroups: ["grid.praxis.fast"]

@@ -231,6 +231,21 @@ candidates are evicted from the rendered overlay.
 Local and healthy remote candidates are never evicted.  CRDT storage records
 are not deleted by this mechanism.
 
+With site auto discovery on, the same TTL bounds auto-discovered GridSites. When
+gossip stops vouching for a stub's site (any SWIM state but `Dead`), the operator
+records `status.absentSince` and clears it if the site returns. Once that is at
+least `N` seconds old, the stub is deleted and no longer counts against the
+256-site discovery cap. The delete is conditional on the object being unchanged,
+so a site that rejoins first keeps its stub. Declared GridSites are never deleted.
+With the TTL absent, stubs use a 24-hour default, so the cap always drains; the
+overlay still keeps stale candidates.
+
+The operator judges no site absent until it has been up for one gossip
+verification window (a 10-minute record expiry plus convergence), so a restart
+never starts clocks or collects. A pass that would delete more than half the
+stubs, and more than 8, deletes none and logs a warning; a partition looks like
+mass departure.
+
 ### GatewayRef.consumerConfig
 
 `spec.gatewayRefs[].consumerConfig` opts a gateway into operator-managed consumer
@@ -308,7 +323,7 @@ spec:
 
 **Status fields**: `phase`, `reason`, `message`, `observedGeneration`,
 `publicCertPem`, `capabilities` (inference, agentTools, agentToAgent),
-`lastProbeTime`, `lastTransitionTime`
+`lastProbeTime`, `lastTransitionTime`, `absentSince` (auto-discovered sites only)
 
 ### GridSite lifecycle
 

@@ -17,7 +17,7 @@ use std::{
 use k8s_openapi::api::core::v1::ConfigMap;
 use kube::{
     Client,
-    api::{Api, ListParams, Patch, PatchParams},
+    api::{Api, DeleteParams, ListParams, Patch, PatchParams, Preconditions},
     runtime::{controller::Action, reflector::ObjectRef},
 };
 use tokio::{sync::Mutex, time::Duration};
@@ -138,6 +138,9 @@ pub struct OperatorCtx {
 
     /// The last value logged per state, so a pass logs at INFO only what changed.
     pub(crate) logged: ChangeLog,
+
+    /// When this operator started, so discovery never judges a site absent before gossip could vouch for it.
+    started: Instant,
 }
 
 /// The last value logged per key, so INFO fires on a change rather than on every pass.
@@ -280,6 +283,7 @@ impl OperatorCtx {
             rotation: false,
             site_name: None,
             logged: ChangeLog::default(),
+            started: Instant::now(),
         }
     }
 
@@ -1044,9 +1048,8 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
         .and_then(|l| l.get(LABEL_AUTO_DISCOVER_SITES))
         .is_some_and(|v| v == "true");
     if auto_discover_enabled && let (Some(swim), Some(snapshot)) = (ctx.swim(), membership.as_ref()) {
-        let plaintext = network_uses_plaintext_egress(&network);
         reconcile_local_site(name, swim.site_name(), client).await?;
-        reconcile_discovered_sites(name, swim.site_name(), snapshot, client, plaintext).await?;
+        reconcile_discovered_sites(&ctx, &network, name, swim.site_name(), snapshot).await?;
     }
 
     // A deferred serving write lands as soon as its spacing allows.
@@ -3036,16 +3039,215 @@ pub(crate) fn discovered_sites_from_swim(
 /// Most `GridSite` objects auto discovery creates for one network, bounding what a gossiping peer can mint.
 const MAX_AUTO_CREATED_SITES: usize = 256;
 
-/// Names of the auto-discovered `GridSite` objects that already belong to `network_name`.
-async fn auto_discovered_stubs(api: &Api<GridSite>, network_name: &str) -> Result<BTreeSet<String>, OperatorError> {
+/// The auto-discovered `GridSite` objects that already belong to `network_name`.
+async fn auto_discovered_stubs(api: &Api<GridSite>, network_name: &str) -> Result<Vec<GridSite>, OperatorError> {
     let selector = format!("{LABEL_AUTO_DISCOVERED}=true,grid.praxis.fast/network={network_name}");
-    Ok(api
-        .list(&ListParams::default().labels(&selector))
-        .await?
-        .items
-        .into_iter()
-        .filter_map(|stub| stub.metadata.name)
-        .collect())
+    let mut stubs = api.list(&ListParams::default().labels(&selector)).await?.items;
+    // A label is not ownership: only discovery's own objects for this network.
+    stubs.retain(|stub| stub.spec.grid_network_ref == network_name && is_stub(stub));
+    Ok(stubs)
+}
+
+/// Whether `site` is a stub discovery wrote: labeled auto-discovered and keyed by its site-id annotation.
+fn is_stub(site: &GridSite) -> bool {
+    peer_site_key(site).is_some_and(|(_, enrolled)| !enrolled)
+}
+
+/// How long a departed stub is kept, independent of overlay pruning so a short
+/// `staleCandidateTtlSeconds` never deletes a `GridSite`.
+const STUB_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// A gossiped record's lifetime without a refresh.
+const GOSSIP_RECORD_EXPIRY: Duration = Duration::from_secs(600);
+
+/// Time for membership to converge once records can expire.
+const GOSSIP_CONVERGENCE: Duration = Duration::from_secs(120);
+
+/// Uptime before discovery judges any site absent: one full verification window.
+const STUB_GC_WARMUP: Duration = GOSSIP_RECORD_EXPIRY.saturating_add(GOSSIP_CONVERGENCE);
+
+/// Whether gossip vouches for one site this pass.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Vouch {
+    /// Gossip vouches for it.
+    Vouched,
+    /// Gossip has had a full window to vouch for it and has not.
+    Absent,
+    /// Too soon after a start to tell, so it is neither marked nor collected.
+    Unchecked,
+}
+
+/// Who gossip vouches for this pass.
+struct Vouching<'snap> {
+    /// Every member not `Dead`.
+    vouched: std::collections::HashSet<&'snap str>,
+    /// Whether the operator has been up a full [`STUB_GC_WARMUP`].
+    settled: bool,
+}
+
+impl Vouching<'_> {
+    /// Whether gossip vouches for `site`.
+    fn of(&self, site: &str) -> Vouch {
+        if self.vouched.contains(site) {
+            Vouch::Vouched
+        } else if self.settled {
+            Vouch::Absent
+        } else {
+            Vouch::Unchecked
+        }
+    }
+}
+
+/// Who gossip vouches for after `uptime`.
+///
+/// The one place absence is judged, so per-origin verified-record times can replace SWIM liveness here.
+fn vouched_sites(snapshot: &MembershipSnapshot, uptime: Duration) -> Vouching<'_> {
+    Vouching {
+        vouched: snapshot
+            .members
+            .iter()
+            .filter(|member| member.status != MemberStatus::Dead)
+            .map(|member| member.site_id.as_str())
+            .collect(),
+        settled: uptime >= STUB_GC_WARMUP,
+    }
+}
+
+/// What the collection pass does with one stub.
+#[derive(Debug, Eq, PartialEq)]
+enum StubGc {
+    /// Nothing to write; it counts against the cap.
+    Keep,
+    /// Gossip stopped vouching for it; start the clock.
+    MarkAbsent,
+    /// Its site is back; stop the clock.
+    ClearAbsent,
+    /// Gone past the TTL; delete it. It no longer counts against the cap.
+    Collect,
+}
+
+/// Decide what to do with stub `site` given whether gossip vouches for it.
+fn stub_gc(site: &GridSite, vouch: Vouch, ttl: Duration, now: time::OffsetDateTime) -> StubGc {
+    let absent_since = site.status.as_ref().and_then(|status| status.absent_since.as_deref());
+    match (vouch, absent_since) {
+        (Vouch::Vouched, None) | (Vouch::Unchecked, _) => StubGc::Keep,
+        (Vouch::Vouched, Some(_)) => StubGc::ClearAbsent,
+        (Vouch::Absent, None) => StubGc::MarkAbsent,
+        (Vouch::Absent, Some(since)) => {
+            match time::OffsetDateTime::parse(since, &time::format_description::well_known::Rfc3339) {
+                Ok(since) if now - since >= ttl => StubGc::Collect,
+                Ok(_) => StubGc::Keep,
+                // An unreadable clock restarts rather than collects.
+                Err(_) => StubGc::MarkAbsent,
+            }
+        },
+    }
+}
+
+/// Each named stub with what the collection pass does to it.
+fn plan_stub_gc<'stub>(
+    stubs: &'stub [GridSite],
+    vouching: &Vouching<'_>,
+    ttl: Duration,
+    now: time::OffsetDateTime,
+) -> Vec<(&'stub GridSite, &'stub str, StubGc)> {
+    let mut plan: Vec<_> = stubs
+        .iter()
+        .filter_map(|stub| {
+            let name = stub.metadata.name.as_deref()?;
+            let (site_id, _) = peer_site_key(stub)?;
+            Some((stub, name, stub_gc(stub, vouching.of(&site_id), ttl, now)))
+        })
+        .collect();
+    brake(&mut plan);
+    plan
+}
+
+/// Collections a pass may always make, however few stubs there are.
+const COLLECT_BRAKE_FLOOR: usize = 8;
+
+/// Hold every collection in `plan` when it would delete more than half the stubs past the
+/// floor, or every stub of several.
+///
+/// A partition or a bug looks like mass departure; the held stubs are judged again next pass.
+fn brake(plan: &mut [(&GridSite, &str, StubGc)]) -> bool {
+    let collect = plan.iter().filter(|(_, _, gc)| *gc == StubGc::Collect).count();
+    let most = collect > COLLECT_BRAKE_FLOOR && collect.saturating_mul(2) > plan.len();
+    let all = plan.len() > 1 && collect == plan.len();
+    let braked = most || all;
+    if braked {
+        tracing::warn!(
+            collect,
+            stubs = plan.len(),
+            "refusing to collect most auto-discovered GridSites at once"
+        );
+        for (_, _, gc) in plan.iter_mut().filter(|(_, _, gc)| *gc == StubGc::Collect) {
+            *gc = StubGc::Keep;
+        }
+    }
+    braked
+}
+
+/// The stubs that count against [`MAX_AUTO_CREATED_SITES`]: every one not past the TTL.
+fn counted_stubs(plan: &[(&GridSite, &str, StubGc)]) -> BTreeSet<String> {
+    plan.iter()
+        .filter(|(_, _, gc)| *gc != StubGc::Collect)
+        .map(|(_, name, _)| (*name).to_owned())
+        .collect()
+}
+
+/// Collect stubs gone past `ttl` and track absence on the rest; returns the names that count against the cap.
+///
+/// Absence lives in status, written only on a transition, so a restart keeps the clock and an
+/// unchanged stub writes nothing.
+async fn collect_stale_stubs(
+    api: &Api<GridSite>,
+    network_name: &str,
+    vouching: &Vouching<'_>,
+    ttl: Duration,
+    stubs: &[GridSite],
+) -> Result<BTreeSet<String>, OperatorError> {
+    let plan = plan_stub_gc(stubs, vouching, ttl, time::OffsetDateTime::now_utc());
+    for (stub, name, gc) in &plan {
+        let since = match gc {
+            StubGc::Keep => continue,
+            StubGc::Collect => {
+                if delete_unchanged_stub(api, stub, name).await? {
+                    tracing::info!(
+                        name,
+                        network = network_name,
+                        "collected departed auto-discovered GridSite"
+                    );
+                }
+                continue;
+            },
+            StubGc::MarkAbsent => rfc3339_now(),
+            StubGc::ClearAbsent => None,
+        };
+        let patch = serde_json::json!({ "status": { "absentSince": since } });
+        api.patch_status(name, &PatchParams::default(), &Patch::Merge(&patch))
+            .await?;
+    }
+    Ok(counted_stubs(&plan))
+}
+
+/// Delete `stub` only if it is still the object judged stale, leaving finalizers to the API server.
+///
+/// Discovery re-applying a returning site bumps the resourceVersion, so the precondition fails and
+/// the stub survives instead of being deleted under it.
+async fn delete_unchanged_stub(api: &Api<GridSite>, stub: &GridSite, name: &str) -> Result<bool, OperatorError> {
+    if stub.metadata.deletion_timestamp.is_some() {
+        return Ok(false);
+    }
+    let params = DeleteParams::default().preconditions(Preconditions {
+        resource_version: stub.metadata.resource_version.clone(),
+        uid: stub.metadata.uid.clone(),
+    });
+    match api.delete(name, &params).await {
+        Ok(_) => Ok(true),
+        Err(kube::Error::Api(error)) if error.code == 404 || error.code == 409 => Ok(false),
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// Log the members [`admit_stub`] left out this round.
@@ -3379,19 +3581,21 @@ fn discovered_site_spec(site: &DiscoveredSite, network_name: &str, plaintext: bo
     reason = "async future over Kubernetes API types with serde_json values"
 )]
 async fn reconcile_discovered_sites(
+    ctx: &OperatorCtx,
+    network: &GridNetwork,
     network_name: &str,
     local_site: &str,
     snapshot: &MembershipSnapshot,
-    client: &Client,
-    plaintext: bool,
 ) -> Result<(), OperatorError> {
-    let sites = discovered_sites_from_swim(network_name, local_site, snapshot);
-    if sites.is_empty() {
-        return Ok(());
-    }
-
+    let client = &ctx.client;
+    let plaintext = network_uses_plaintext_egress(network);
+    let ttl = STUB_TTL;
     let api: Api<GridSite> = Api::all(client.clone());
-    let mut stubs = auto_discovered_stubs(&api, network_name).await?;
+    let present = auto_discovered_stubs(&api, network_name).await?;
+    let vouching = vouched_sites(snapshot, ctx.started.elapsed());
+    let mut stubs = collect_stale_stubs(&api, network_name, &vouching, ttl, &present).await?;
+
+    let sites = discovered_sites_from_swim(network_name, local_site, snapshot);
     let mut capped = 0_usize;
 
     for site in &sites {
@@ -5142,6 +5346,156 @@ mod tests {
     fn an_auto_discovered_stub_still_keys_by_its_bare_id() {
         let stub = peer_grid_site("net-remote", Some("remote"), &[]);
         assert_eq!(peer_site_key(&stub), Some(("remote".to_owned(), false)));
+    }
+
+    /// A stub for `site`, absent since `since` when given.
+    fn stub(site: &str, since: Option<&str>) -> GridSite {
+        let mut stub = peer_grid_site(&format!("net-{site}"), Some(site), &[]);
+        stub.status = since.map(|since| GridSiteStatus {
+            absent_since: Some(since.to_owned()),
+            ..GridSiteStatus::default()
+        });
+        stub
+    }
+
+    fn at(rfc3339: &str) -> time::OffsetDateTime {
+        time::OffsetDateTime::parse(rfc3339, &time::format_description::well_known::Rfc3339)
+            .unwrap_or_else(|_| std::process::abort())
+    }
+
+    /// [`stub_gc`] at noon for a stub absent since `since`, with a one-hour TTL, or a year when `ttl` is false.
+    fn gc(since: Option<&str>, vouched: bool, ttl: bool) -> StubGc {
+        let ttl = Duration::from_secs(if ttl { 3600 } else { 365 * 24 * 3600 });
+        let vouch = if vouched { Vouch::Vouched } else { Vouch::Absent };
+        stub_gc(&stub("a", since), vouch, ttl, at("2026-10-02T12:00:00Z"))
+    }
+
+    #[test]
+    fn the_absence_clock_starts_when_gossip_stops_vouching_and_clears_on_return() {
+        assert_eq!(gc(None, true, true), StubGc::Keep, "live");
+        assert_eq!(gc(None, false, true), StubGc::MarkAbsent, "just left");
+        assert_eq!(
+            gc(Some("2026-10-02T09:00:00Z"), true, true),
+            StubGc::ClearAbsent,
+            "back"
+        );
+        assert_eq!(
+            gc(Some("yesterday"), false, true),
+            StubGc::MarkAbsent,
+            "bad clock restarts"
+        );
+    }
+
+    #[test]
+    fn nothing_is_marked_or_collected_before_a_full_verification_window() {
+        let snapshot = make_snapshot(vec![make_member("here", "10.0.0.2:7946", MemberStatus::Alive)]);
+        let fresh = vouched_sites(&snapshot, STUB_GC_WARMUP.saturating_sub(Duration::from_secs(1)));
+        assert_eq!(fresh.of("here"), Vouch::Vouched, "presence is evidence at any uptime");
+        assert_eq!(fresh.of("gone"), Vouch::Unchecked);
+        assert_eq!(vouched_sites(&snapshot, STUB_GC_WARMUP).of("gone"), Vouch::Absent);
+
+        let now = at("2026-10-02T12:00:00Z");
+        let hour = Duration::from_secs(3600);
+        let old = stub("gone", Some("2026-01-01T00:00:00Z"));
+        assert_eq!(
+            stub_gc(&stub("gone", None), Vouch::Unchecked, hour, now),
+            StubGc::Keep,
+            "no clock starts"
+        );
+        assert_eq!(
+            stub_gc(&old, Vouch::Unchecked, hour, now),
+            StubGc::Keep,
+            "no collection"
+        );
+    }
+
+    #[test]
+    fn a_pass_never_collects_most_stubs_at_once() {
+        let now = at("2026-10-02T12:00:00Z");
+        let hour = Duration::from_secs(3600);
+        let gone = |n: usize| (0..n).map(|i| stub(&format!("g{i}"), Some("2026-10-02T09:00:00Z")));
+        let live = |n: usize| (0..n).map(|i| stub(&format!("l{i}"), None));
+        let snapshot = make_snapshot(
+            (0..20)
+                .map(|i| make_member(&format!("l{i}"), "10.0.0.2:7946", MemberStatus::Alive))
+                .collect(),
+        );
+        let vouching = vouched_sites(&snapshot, STUB_GC_WARMUP);
+        let collected = |stubs: &[GridSite]| {
+            plan_stub_gc(stubs, &vouching, hour, now)
+                .iter()
+                .filter(|(_, _, gc)| *gc == StubGc::Collect)
+                .count()
+        };
+        let partition: Vec<GridSite> = gone(9).chain(live(1)).collect();
+        assert_eq!(collected(&partition), 0, "9 of 10 departing at once is held");
+        let lone: Vec<GridSite> = gone(1).collect();
+        assert_eq!(collected(&lone), 1, "a small grid still collects");
+        let floor: Vec<GridSite> = gone(COLLECT_BRAKE_FLOOR).chain(live(1)).collect();
+        assert_eq!(collected(&floor), COLLECT_BRAKE_FLOOR, "up to the floor collects");
+        let minority: Vec<GridSite> = gone(9).chain(live(11)).collect();
+        assert_eq!(collected(&minority), 9, "under half collects");
+        let held = counted_stubs(&plan_stub_gc(&partition, &vouching, hour, now));
+        assert_eq!(held.len(), 10, "held stubs still count against the cap");
+    }
+
+    #[test]
+    fn a_long_partition_never_collects_every_stub_of_several() {
+        let now = at("2026-10-02T12:00:00Z");
+        let snapshot = make_snapshot(Vec::new());
+        let vouching = vouched_sites(&snapshot, STUB_GC_WARMUP);
+        let every: Vec<GridSite> = (0..COLLECT_BRAKE_FLOOR)
+            .map(|i| stub(&format!("g{i}"), Some("2026-10-02T09:00:00Z")))
+            .collect();
+        let plan = plan_stub_gc(&every, &vouching, Duration::from_secs(3600), now);
+        assert!(plan.iter().all(|(_, _, gc)| *gc == StubGc::Keep), "every stub is held");
+    }
+
+    #[test]
+    fn a_departed_stub_is_collected_only_past_the_ttl() {
+        assert_eq!(
+            gc(Some("2026-10-02T11:30:00Z"), false, true),
+            StubGc::Keep,
+            "inside ttl"
+        );
+        assert_eq!(
+            gc(Some("2026-10-02T10:59:59Z"), false, true),
+            StubGc::Collect,
+            "past ttl"
+        );
+        assert_eq!(gc(Some("2026-01-01T00:00:00Z"), false, false), StubGc::Keep, "no ttl");
+    }
+
+    #[test]
+    fn declared_sites_are_never_stubs() {
+        assert!(is_stub(&stub("a", None)));
+        assert!(!is_stub(&peer_grid_site("a", None, &[])), "declared, no label");
+        let mut annotated = peer_grid_site("net-a", Some("a"), &[]);
+        annotated.metadata.labels = None;
+        assert!(
+            !is_stub(&annotated),
+            "an annotation without the label is a declared site"
+        );
+    }
+
+    #[test]
+    fn a_new_peer_is_admitted_once_a_stale_stub_is_collected() {
+        let now = at("2026-10-02T12:00:00Z");
+        let hour = Duration::from_secs(3600);
+        let mut stubs: Vec<GridSite> = (1..MAX_AUTO_CREATED_SITES)
+            .map(|i| stub(&format!("s{i}"), None))
+            .collect();
+        stubs.push(stub("gone", Some("2026-10-02T09:00:00Z")));
+        let snapshot = make_snapshot(
+            (1..MAX_AUTO_CREATED_SITES)
+                .map(|i| make_member(&format!("s{i}"), "10.0.0.2:7946", MemberStatus::Alive))
+                .collect(),
+        );
+        let vouching = vouched_sites(&snapshot, STUB_GC_WARMUP);
+        let mut counted = counted_stubs(&plan_stub_gc(&stubs, &vouching, hour, now));
+        assert!(!counted.contains("net-gone"), "a collected stub no longer counts");
+        assert!(counted.contains("net-s1"), "a live stub still counts");
+        assert!(admit_stub(&mut counted, "net-new"), "the freed slot admits a new peer");
     }
 
     #[test]

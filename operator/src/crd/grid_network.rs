@@ -700,6 +700,10 @@ pub struct GridNetworkSpec {
     /// local candidates are never evicted.  CRDT provider records in storage
     /// are not deleted.
     ///
+    /// It does not delete `GridSite` objects: auto-discovered stubs that gossip
+    /// stops vouching for are collected after a fixed 24 hours, whatever this
+    /// field is. Declared `GridSite` objects are never deleted.
+    ///
     /// **Default (absent):** stale candidates are retained indefinitely —
     /// the same behaviour as before this field existed.
     ///

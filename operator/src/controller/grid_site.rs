@@ -510,6 +510,7 @@ async fn update_status(
         last_probe_time: probe_time,
         last_transition_time: transition_time,
         public_cert_pem: existing.and_then(|s| s.public_cert_pem.clone()),
+        absent_since: existing.and_then(|s| s.absent_since.clone()),
     };
 
     if !grid_site_status_needs_update(existing, &status) {
