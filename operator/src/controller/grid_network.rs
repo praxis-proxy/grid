@@ -7210,9 +7210,9 @@ mod tests {
             "metadata": {
                 "name": "gateway",
                 "annotations": {
-                    "grid.praxis-proxy.io/mount-reconciliation": "enabled",
-                    "grid.praxis-proxy.io/network": "production",
-                    "grid.praxis-proxy.io/gateway": "gateway"
+                    (MOUNT_OPT_IN_ANNOTATION): "enabled",
+                    (MOUNT_NETWORK_ANNOTATION): "production",
+                    (MOUNT_GATEWAY_ANNOTATION): "gateway"
                 }
             },
             "spec": {
