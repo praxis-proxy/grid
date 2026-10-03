@@ -86,7 +86,7 @@ pub async fn reconcile(provider: Arc<AgentToolProvider>, client: Arc<Client>) ->
         .as_deref()
         .unwrap_or_else(|| std::process::abort());
 
-    info!(name, "reconciling AgentToolProvider");
+    tracing::debug!(name, "reconciling AgentToolProvider");
 
     let reporter = Reporter {
         controller: "agent-tool-provider-controller".into(),

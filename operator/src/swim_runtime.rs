@@ -1156,6 +1156,22 @@ pub async fn start(config: SwimConfig) -> Result<Arc<SwimHandle>, SwimRuntimeErr
 // Event loop
 // ---------------------------------------------------------------------------
 
+/// `seeds` without this node's own addresses, so a site never announces to itself.
+///
+/// A seed list shared by every site, or a load balancer in front of this node,
+/// can name it; foca then refuses the reply as data from itself.
+fn foreign_seeds(mut seeds: Vec<SocketAddr>, own: &[Option<SocketAddr>]) -> Vec<SocketAddr> {
+    let before = seeds.len();
+    seeds.retain(|seed| !own.contains(&Some(*seed)));
+    if seeds.len() < before {
+        tracing::debug!(
+            dropped = before - seeds.len(),
+            "ignoring SWIM seeds that name this node"
+        );
+    }
+    seeds
+}
+
 /// Drive the SWIM node until the process exits.
 ///
 /// All errors are logged and the loop continues.
@@ -1195,7 +1211,8 @@ async fn run_loop(
     let mut age_tick = tokio::time::interval(Duration::from_secs(1));
     let mut pending_drops = PendingDrops::default();
     let mut unauthenticated_drops = UnauthenticatedDrops::default();
-    let mut seed_addrs = config.seeds.clone();
+    let own = [Some(advertise_addr), socket.local_addr().ok()];
+    let mut seed_addrs = foreign_seeds(config.seeds.clone(), &own);
     let mut next_seed_announce_at = Instant::now() + Duration::from_secs(5);
     let mut gateway_address = config.gateway_address.clone();
     let Some(mut gateway_address_revision) = revisions.take() else {
@@ -1388,7 +1405,7 @@ async fn run_loop(
             Some(seeds) = channels.seed_rx.recv() => {
                 // Announce to CRD-declared seed peers at runtime.
                 // Re-announcing to existing members is idempotent (foca ignores them).
-                seed_addrs = seeds;
+                seed_addrs = foreign_seeds(seeds, &own);
                 for &addr in &seed_addrs {
                     let seed_id = NodeId::seed(addr);
                     let output = node.announce(seed_id);
@@ -1466,6 +1483,7 @@ async fn run_loop(
                 }
             }
             Ok(()) = gateway_loop_rx.changed() => {
+                let previous = gateway_address.clone();
                 gateway_address.clone_from(&gateway_loop_rx.borrow_and_update());
                 if let Some(addr) = gateway_address.as_deref() {
                     let Some(revision) = revisions.take() else {
@@ -1492,7 +1510,12 @@ async fn run_loop(
                     )
                     .await;
                     publish_state(&state_tx, &node);
-                    tracing::info!(addr = %addr, "gateway address updated at runtime");
+                    // Discovery re-announces an unchanged address for late joiners; only a change is news.
+                    if previous.as_deref() == Some(addr) {
+                        tracing::debug!(addr = %addr, "gateway address re-announced");
+                    } else {
+                        tracing::info!(addr = %addr, "gateway address updated at runtime");
+                    }
                 }
             }
         }
@@ -2777,6 +2800,23 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    #[test]
+    fn a_seed_naming_this_node_is_never_announced() {
+        let own_lb: SocketAddr = "192.168.1.204:7946".parse().unwrap_or_else(|_| std::process::abort());
+        let bind: SocketAddr = "10.128.0.5:7946".parse().unwrap_or_else(|_| std::process::abort());
+        let peer: SocketAddr = "192.168.1.150:7946".parse().unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            foreign_seeds(vec![own_lb, peer, bind], &[Some(own_lb), Some(bind)]),
+            vec![peer],
+            "only the peer seed survives, never this node's advertised or bound address"
+        );
+        assert_eq!(
+            foreign_seeds(vec![own_lb], &[Some(own_lb), None]),
+            Vec::<SocketAddr>::new(),
+            "a seed list naming only this node announces to nobody"
+        );
+    }
+
     // SwimHandle::local_addr and announce_seeds
     // -----------------------------------------------------------------------
 

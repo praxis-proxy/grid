@@ -81,6 +81,10 @@ pub struct SwimArgs {
         value_parser = clap::builder::BoolishValueParser::new()
     )]
     pub require_key: bool,
+
+    /// This site's name, read once and used for SWIM, the certificate, and provider placement.
+    #[arg(id = "swim_site_name", long = "swim-site-name", env = "GRID_SWIM_SITE_NAME")]
+    pub site_name: Option<String>,
 }
 
 /// Signals serving and peer polling options, used under signalTransport poll.

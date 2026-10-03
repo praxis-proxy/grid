@@ -18,7 +18,6 @@ use kube::{
     },
 };
 use tokio::time::Duration;
-use tracing::info;
 use zeroize::Zeroizing;
 
 use crate::{
@@ -86,7 +85,7 @@ pub async fn reconcile(site: Arc<GridSite>, client: Arc<Client>) -> Result<Actio
     let object_ref = event_reference(&site, client.default_namespace());
     let recorder = Recorder::new(client.as_ref().clone(), reporter);
 
-    info!(name, "reconciling GridSite");
+    tracing::debug!(name, "reconciling GridSite");
 
     let network = fetch_network(&site, client.as_ref()).await?;
     let current_phase = site.status.as_ref().map_or(&GridSitePhase::Pending, |s| &s.phase);

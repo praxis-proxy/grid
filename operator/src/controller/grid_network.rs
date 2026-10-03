@@ -135,6 +135,31 @@ pub struct OperatorCtx {
 
     /// This site's name, which a certificate the operator issues itself carries.
     site_name: Option<String>,
+
+    /// The last value logged per state, so a pass logs at INFO only what changed.
+    pub(crate) logged: ChangeLog,
+}
+
+/// The last value logged per key, so INFO fires on a change rather than on every pass.
+#[derive(Debug, Default)]
+pub(crate) struct ChangeLog(std::sync::Mutex<HashMap<String, String>>);
+
+impl ChangeLog {
+    /// Whether `value` differs from the last one recorded for `key`, recording it.
+    pub(crate) fn changed(&self, key: &str, value: String) -> bool {
+        let mut held = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if held.get(key) == Some(&value) {
+            return false;
+        }
+        held.insert(key.to_owned(), value);
+        true
+    }
+
+    /// Forget every key under `prefix` not in `keep`, so departed objects do not grow the log.
+    pub(crate) fn retain_under(&self, prefix: &str, keep: &std::collections::HashSet<String>) {
+        let mut held = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        held.retain(|key, _| !key.starts_with(prefix) || keep.contains(key));
+    }
 }
 
 /// Send `declared` to `sender`, returning whether it changed, so a repeat wakes nobody.
@@ -254,6 +279,7 @@ impl OperatorCtx {
             declared_trust: None,
             rotation: false,
             site_name: None,
+            logged: ChangeLog::default(),
         }
     }
 
@@ -319,6 +345,12 @@ impl OperatorCtx {
     pub fn with_peer_settings(mut self, settings: PeerSettings) -> Self {
         self.peer_settings = settings;
         self
+    }
+
+    /// The configured site name, when the install sets a valid one.
+    #[must_use]
+    pub fn site_name(&self) -> Option<&str> {
+        self.site_name.as_deref()
     }
 
     /// Name the certificate the operator issues itself after this site, not the network.
@@ -750,7 +782,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
     let name = grid_network_name(&network)?;
     reject_invalid_budget_policy(&network)?;
 
-    info!(name, "reconciling GridNetwork");
+    tracing::debug!(name, "reconciling GridNetwork");
 
     // Modes are fixed at startup, so a change restarts the pod to apply it.
     let running = GridModes {
@@ -807,7 +839,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
 
     // Rendering before membership converges would drop remote entries.
     if let Some(hold) = ctx.membership_hold() {
-        tracing::info!(network = name, "holding membership-derived writes until SWIM converges");
+        tracing::debug!(network = name, "holding membership-derived writes until SWIM converges");
         return Ok(hold);
     }
 
@@ -970,6 +1002,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
     // Publish real InferenceProvider-derived CRDT state so peers learn this site's providers.
     let distributed_provider_count = if let Some(swim) = ctx.swim().filter(|handle| handle.is_running()) {
         publish_real_provider_state(swim, name, &grid_id, &providers, &raw_metrics);
+        log_capacity_changes(&ctx.logged, name, &providers);
         count_remote_provider_records(swim, name)
     } else {
         0
@@ -2002,22 +2035,11 @@ async fn apply_consumer_config_for_gateway(
     cc: &ConsumerConfig,
     client: &Client,
 ) -> Result<(), OperatorError> {
-    let config_yaml = consumer_config::generate_consumer_praxis_config(
-        overlay,
-        &cc.credential_mount_base,
-        &cc.cluster_endpoints,
-        &cc.tls_cert_mount_path,
-        cc.listener_port,
-    )?;
-    let cm = consumer_config::build_consumer_config_map(
-        &config_yaml,
-        &cc.config_map_name,
-        &gw_ref.namespace,
-        network_name,
-        &gw_ref.name,
-    );
-
+    let cm = consumer_config_map(overlay, network_name, gw_ref, cc)?;
     let api: Api<ConfigMap> = Api::namespaced(client.clone(), &gw_ref.namespace);
+    if Box::pin(config_map_current(&api, &cc.config_map_name, &cm)).await? {
+        return Ok(());
+    }
     api.patch(
         &cc.config_map_name,
         &PatchParams::apply(FIELD_MANAGER).force(),
@@ -2031,6 +2053,41 @@ async fn apply_consumer_config_for_gateway(
         "applied consumer Praxis config ConfigMap"
     );
     Ok(())
+}
+
+/// The consumer Praxis config `ConfigMap` for `gw_ref`, rendered from `overlay`.
+fn consumer_config_map(
+    overlay: &routing_overlay::RoutingOverlay,
+    network_name: &str,
+    gw_ref: &GatewayRef,
+    cc: &ConsumerConfig,
+) -> Result<ConfigMap, OperatorError> {
+    let config_yaml = consumer_config::generate_consumer_praxis_config(
+        overlay,
+        &cc.credential_mount_base,
+        &cc.cluster_endpoints,
+        &cc.tls_cert_mount_path,
+        cc.listener_port,
+    )?;
+    Ok(consumer_config::build_consumer_config_map(
+        &config_yaml,
+        &cc.config_map_name,
+        &gw_ref.namespace,
+        network_name,
+        &gw_ref.name,
+    ))
+}
+
+/// Whether `name` already holds `desired`'s data, so applying it would change nothing.
+async fn config_map_current(api: &Api<ConfigMap>, name: &str, desired: &ConfigMap) -> Result<bool, OperatorError> {
+    let current = api
+        .get_opt(name)
+        .await?
+        .is_some_and(|current| current.data == desired.data);
+    if current {
+        tracing::debug!(config_map = %name, "consumer Praxis config unchanged");
+    }
+    Ok(current)
 }
 
 /// Result of applying one routing overlay `ConfigMap` for a single gateway.
@@ -2368,6 +2425,39 @@ fn access_policy_to_crdt(access_policy: &crate::crd::auth::AccessPolicy) -> crdt
     }
 }
 
+/// The capacity weight a provider publishes: its declared weight when valid, else the minimum.
+fn effective_capacity_weight(provider: &InferenceProvider) -> u32 {
+    provider
+        .spec
+        .capacity_weight
+        .filter(|weight| crdt::is_valid_capacity_weight(*weight))
+        .unwrap_or(crdt::MIN_CAPACITY_WEIGHT)
+}
+
+/// Log at INFO each of `network`'s providers whose published capacity is new or changed.
+fn log_capacity_changes(logged: &ChangeLog, network: &str, providers: &[InferenceProvider]) {
+    let prefix = format!("capacity/{network}/");
+    let mut current = std::collections::HashSet::new();
+    for provider in providers.iter().filter(|p| p.spec.grid_network_ref == network) {
+        let Some(provider_id) = provider.metadata.name.as_deref() else {
+            continue;
+        };
+        let weight = effective_capacity_weight(provider);
+        let key = format!("{prefix}{provider_id}");
+        let changed = logged.changed(&key, weight.to_string());
+        current.insert(key);
+        if changed {
+            info!(
+                network,
+                provider_id,
+                capacity_weight = weight,
+                "published local provider CRDT capacity"
+            );
+        }
+    }
+    logged.retain_under(&prefix, &current);
+}
+
 /// Map one Kubernetes [`InferenceProvider`] to a CRDT [`crdt::ProviderState`].
 ///
 /// Returns `None` when the provider has no metadata name (invalid resource).
@@ -2387,18 +2477,7 @@ fn provider_state_from_kube(
     let models = provider.spec.models.iter().map(|m| m.name.clone()).collect();
     let phase = crdt_phase_from_provider(provider.status.as_ref().map(|s| &s.phase));
     let revision = provider_revision(provider);
-    let capacity_weight = provider
-        .spec
-        .capacity_weight
-        .filter(|weight| crdt::is_valid_capacity_weight(*weight))
-        .unwrap_or(crdt::MIN_CAPACITY_WEIGHT);
-
-    tracing::info!(
-        site_id,
-        provider_id,
-        capacity_weight,
-        "published local provider CRDT capacity"
-    );
+    let capacity_weight = effective_capacity_weight(provider);
 
     Some(crdt::ProviderState {
         network_id: network_id.to_owned(),
@@ -2991,6 +3070,38 @@ fn admit_stub(stubs: &mut BTreeSet<String>, name: &str) -> bool {
     stubs.insert(name.to_owned())
 }
 
+/// Log a reconciled stub at INFO when `noteworthy`, else at debug.
+fn log_stub(site: &DiscoveredSite, network_name: &str, noteworthy: bool) {
+    if noteworthy {
+        tracing::info!(
+            name = %site.name,
+            network = %network_name,
+            egress = %site.egress_address,
+            cert = site.site_cert_pem.is_some(),
+            "reconciled auto-discovered GridSite from SWIM Alive member"
+        );
+    } else {
+        tracing::debug!(name = %site.name, network = %network_name, "auto-discovered GridSite unchanged");
+    }
+}
+
+/// Whether applying `site` creates its stub or changes the egress or certificate the stub carries.
+fn stub_changed(existing: Option<&GridSite>, site: &DiscoveredSite) -> bool {
+    let Some(existing) = existing else {
+        return true;
+    };
+    let egress = existing
+        .spec
+        .egress
+        .as_ref()
+        .map_or("", |egress| egress.address.as_str());
+    let cert = existing
+        .status
+        .as_ref()
+        .and_then(|status| status.public_cert_pem.as_deref());
+    egress != site.egress_address || (site.site_cert_pem.is_some() && cert != site.site_cert_pem.as_deref())
+}
+
 /// Derive a Kubernetes resource name for an auto-discovered `GridSite`.
 ///
 /// The name is `"{network}-{site_id}"` (both sanitised).  Using the composite
@@ -3291,6 +3402,9 @@ async fn reconcile_discovered_sites(
         // Server-side apply the spec.  Creating on first call; updating on subsequent
         // calls is a no-op when the spec has not changed.
         let spec_doc = discovered_site_spec(site, network_name, plaintext);
+        // Read before the apply, which writes only spec, so status is the same either side of it.
+        let existing = api.get_opt(&site.name).await?;
+        let noteworthy = stub_changed(existing.as_ref(), site);
 
         api.patch(
             &site.name,
@@ -3307,7 +3421,7 @@ async fn reconcile_discovered_sites(
         // infinite reconcile hot-loop; checking against current state first
         // makes each write idempotent in practice, not just in intent (see
         // grid#42).
-        let existing_status = api.get(&site.name).await.ok().and_then(|s| s.status);
+        let existing_status = existing.and_then(|s| s.status);
 
         // Only write Discovered when the current phase is Pending.
         // If the GridSite controller has already advanced the phase (e.g. to
@@ -3347,13 +3461,7 @@ async fn reconcile_discovered_sites(
             reconcile_site_cert_pem(&api, &site.name, existing_status.as_ref(), cert_pem).await?;
         }
 
-        tracing::info!(
-            name = %site.name,
-            network = %network_name,
-            egress = %site.egress_address,
-            cert = site.site_cert_pem.is_some(),
-            "reconciled auto-discovered GridSite from SWIM Alive member"
-        );
+        log_stub(site, network_name, noteworthy);
     }
 
     warn_capped(network_name, capped);
@@ -5077,6 +5185,66 @@ mod tests {
         let mut room = BTreeSet::new();
         assert!(admit_stub(&mut room, "net-a"));
         assert!(room.contains("net-a"), "an admitted stub counts against the cap");
+    }
+
+    #[test]
+    fn a_second_identical_pass_logs_nothing_new() {
+        let logged = ChangeLog::default();
+        assert!(
+            logged.changed("capacity/net/qwen3", "1".to_owned()),
+            "first publish is news"
+        );
+        assert!(
+            !logged.changed("capacity/net/qwen3", "1".to_owned()),
+            "an identical pass is not"
+        );
+        assert!(
+            logged.changed("capacity/net/qwen3", "2".to_owned()),
+            "a capacity change is"
+        );
+        assert!(
+            logged.changed("capacity/net/other", "2".to_owned()),
+            "keys are independent"
+        );
+        let keep = std::collections::HashSet::from(["capacity/net/other".to_owned()]);
+        logged.retain_under("capacity/net/", &keep);
+        assert!(
+            logged.changed("capacity/net/qwen3", "2".to_owned()),
+            "a departed key is forgotten"
+        );
+        assert!(
+            !logged.changed("capacity/net/other", "2".to_owned()),
+            "a kept key is not"
+        );
+    }
+
+    #[test]
+    fn only_a_new_stub_or_a_changed_egress_or_cert_is_news() {
+        let site = DiscoveredSite {
+            name: "net-remote".to_owned(),
+            site_id: "remote".to_owned(),
+            grid_network_ref: "net".to_owned(),
+            egress_address: "10.0.0.2:19080".to_owned(),
+            site_cert_pem: Some("CERT".to_owned()),
+        };
+        let mut applied: GridSite =
+            serde_json::from_value(discovered_site_spec(&site, "net", false)).unwrap_or_else(|_| std::process::abort());
+        applied.status = Some(GridSiteStatus {
+            public_cert_pem: Some("CERT".to_owned()),
+            ..GridSiteStatus::default()
+        });
+        assert!(stub_changed(None, &site), "created");
+        assert!(!stub_changed(Some(&applied), &site), "an idle pass");
+        let moved = DiscoveredSite {
+            egress_address: "10.0.0.3:19080".to_owned(),
+            ..site.clone()
+        };
+        assert!(stub_changed(Some(&applied), &moved), "egress changed");
+        let renewed = DiscoveredSite {
+            site_cert_pem: Some("NEW".to_owned()),
+            ..site
+        };
+        assert!(stub_changed(Some(&applied), &renewed), "cert changed");
     }
 
     #[test]

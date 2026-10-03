@@ -177,7 +177,7 @@ async fn main() {
             .with_peer_settings(peer_settings)
             .with_declared_trust(declared_trust)
             .with_rotation(rotation_running)
-            .with_site_name(std::env::var("GRID_SWIM_SITE_NAME").ok())
+            .with_site_name(config.swim.site_name.clone())
             .hold_membership(),
     );
 
@@ -205,7 +205,7 @@ async fn main() {
         ),
         run_network_controller(client.clone(), Arc::clone(&ctx), swim_rx.clone()),
         run_site_controller(client.clone()),
-        run_provider_controller(client.clone()),
+        run_provider_controller(client.clone(), ctx.site_name().map(str::to_owned)),
         run_agent_tool_provider_controller(client.clone()),
         async { metrics_server.await? },
         run_signals_server(
@@ -383,7 +383,7 @@ async fn maybe_start_swim(client: &Client, cli: &Cli) -> Result<Option<Arc<swim_
             return Err(format!("GRID_SWIM_BIND_ADDR is not a valid socket address: {e}"));
         },
     };
-    let site_name = swim_site_name(std::env::var("GRID_SWIM_SITE_NAME").ok())?;
+    let site_name = swim_site_name(cli.swim.site_name.clone())?;
     let (advertise_addr, lb_watch) = swim_advertise_addr(client, bind_addr).await?;
     if advertise_addr.unwrap_or(bind_addr).ip().is_unspecified() {
         return Err("refusing to advertise an unspecified SWIM address; set GRID_SWIM_ADVERTISE_ADDR".to_owned());
@@ -1019,7 +1019,7 @@ async fn run_network_controller(
         .run(grid_network::reconcile, grid_network::error_policy, ctx)
         .for_each(|result| async {
             match result {
-                Ok((obj, _action)) => tracing::info!(%obj, "reconciled GridNetwork"),
+                Ok((obj, _action)) => tracing::debug!(%obj, "reconciled GridNetwork"),
                 Err(e) => log_controller_error("GridNetwork", &e),
             }
         })
@@ -1064,7 +1064,7 @@ async fn run_site_controller(client: Client) -> Result<(), Box<dyn std::error::E
         .run(grid_site::reconcile, grid_site::error_policy, Arc::new(client))
         .for_each(|result| async {
             match result {
-                Ok((obj, _action)) => tracing::info!(%obj, "reconciled GridSite"),
+                Ok((obj, _action)) => tracing::debug!(%obj, "reconciled GridSite"),
                 Err(e) => log_controller_error("GridSite", &e),
             }
         })
@@ -1081,18 +1081,21 @@ async fn run_site_controller(client: Client) -> Result<(), Box<dyn std::error::E
 /// reconciliation.
 ///
 /// [`InferenceProvider`]: operator::crd::inference_provider::InferenceProvider
-async fn run_provider_controller(client: Client) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn run_provider_controller(
+    client: Client,
+    local_site: Option<String>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let api = Api::<InferenceProvider>::all(client.clone());
 
     Controller::new(api, watcher::Config::default())
         .run(
             inference_provider::reconcile,
             inference_provider::error_policy,
-            Arc::new(client),
+            Arc::new(inference_provider::ProviderCtx { client, local_site }),
         )
         .for_each(|result| async {
             match result {
-                Ok((obj, _action)) => tracing::info!(%obj, "reconciled InferenceProvider"),
+                Ok((obj, _action)) => tracing::debug!(%obj, "reconciled InferenceProvider"),
                 Err(e) => log_controller_error("InferenceProvider", &e),
             }
         })
@@ -1118,7 +1121,7 @@ async fn run_agent_tool_provider_controller(client: Client) -> Result<(), Box<dy
         )
         .for_each(|result| async {
             match result {
-                Ok((obj, _action)) => tracing::info!(%obj, "reconciled AgentToolProvider"),
+                Ok((obj, _action)) => tracing::debug!(%obj, "reconciled AgentToolProvider"),
                 Err(e) => log_controller_error("AgentToolProvider", &e),
             }
         })
