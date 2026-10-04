@@ -20,7 +20,7 @@ endif
 	mutants semver publish-dry-run \
 	require-container-engine \
 	images container operator-image gateway-image \
-	mock-providers-image overlay-sync-image glb-demo-images \
+	mock-providers-image overlay-sync-image fleet-dashboard-image fleet-dashboard-web glb-demo-images \
 	kind-up kind-down \
 	dev-env dev-push dev-integration \
 	setup-hooks \
@@ -153,6 +153,15 @@ mock-providers-image: | require-container-engine
 overlay-sync-image: | require-container-engine
 	$(CONTAINER_ENGINE) build -f overlay-sync/Containerfile -t grid-overlay-sync:latest .
 
+fleet-dashboard-image: | require-container-engine
+	$(CONTAINER_ENGINE) build -f fleet-dashboard/Containerfile -t grid-fleet-dashboard:latest .
+
+# Builds the dashboard UI and stages it where fleet-dashboard/build.rs embeds it.
+fleet-dashboard-web:
+	npm --prefix fleet-dashboard/web ci --no-audit --no-fund
+	npm --prefix fleet-dashboard/web run build
+	rm -rf fleet-dashboard/webui/dist && mkdir -p fleet-dashboard/webui && cp -r fleet-dashboard/web/dist fleet-dashboard/webui/dist
+
 # GLB demo images — deterministic :glb-demo tags, no :latest dependency.
 glb-demo-images: | require-container-engine
 	$(CONTAINER_ENGINE) build -f deploy/operator/Containerfile -t grid-operator:glb-demo .
@@ -255,6 +264,8 @@ help:
 	@echo "  gateway-image        build gateway container image"
 	@echo "  mock-providers-image build mock-providers container image"
 	@echo "  overlay-sync-image   build overlay-sync sidecar image"
+	@echo "  fleet-dashboard-image build fleet dashboard image (opt-in hub web UI)"
+	@echo "  fleet-dashboard-web   build the dashboard UI and stage it for cargo build"
 	@echo "  glb-demo-images      build all Grid images tagged :glb-demo"
 	@echo ""
 	@echo "KIND:"

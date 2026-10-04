@@ -102,6 +102,7 @@ cargo xtask env status   # health of all components
 | `mock-providers` | Mock OpenAI, Anthropic, Bedrock, Vertex APIs |
 | `forge` | Generic development-environment orchestrator for Kubernetes |
 | `xtask` | Dev task runner for test environments |
+| `fleet-dashboard` | Opt-in hub web UI: fleet map and per-site health from each site's Prometheus (Axum + React) |
 
 ### scoring
 

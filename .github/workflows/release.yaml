@@ -32,6 +32,7 @@ env:
   GATEWAY_IMAGE_NAME: ghcr.io/praxis-proxy/grid-gateway
   MOCK_PROVIDERS_IMAGE_NAME: ghcr.io/praxis-proxy/grid-mock-providers
   OVERLAY_SYNC_IMAGE_NAME: ghcr.io/praxis-proxy/grid-overlay-sync
+  FLEET_DASHBOARD_IMAGE_NAME: ghcr.io/praxis-proxy/grid-fleet-dashboard
 
 jobs:
   # ----------------------------------------------------------------------------
@@ -254,6 +255,25 @@ jobs:
             org.opencontainers.image.version=${{ needs.validate.outputs.version }}
           cache-from: type=gha,scope=release-overlay-sync
           cache-to: type=gha,mode=max,scope=release-overlay-sync
+          provenance: mode=max
+          sbom: true
+
+      - name: Build and push fleet dashboard
+        id: fleet_dashboard
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: fleet-dashboard/Containerfile
+          push: true
+          tags: |
+            ${{ env.FLEET_DASHBOARD_IMAGE_NAME }}:${{ needs.validate.outputs.tag }}
+            ${{ env.FLEET_DASHBOARD_IMAGE_NAME }}:sha-${{ needs.validate.outputs.short_sha }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ needs.validate.outputs.source_sha }}
+            org.opencontainers.image.version=${{ needs.validate.outputs.version }}
+          cache-from: type=gha,scope=release-fleet-dashboard
+          cache-to: type=gha,mode=max,scope=release-fleet-dashboard
           provenance: mode=max
           sbom: true
 
