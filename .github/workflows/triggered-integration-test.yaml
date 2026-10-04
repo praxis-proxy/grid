@@ -42,6 +42,12 @@ env:
   #   docker inspect --format='{{index .RepoDigests 0}}' ghcr.io/praxis-proxy/ai:<tag>
   GATEWAY_IMAGE_REF: ghcr.io/praxis-proxy/ai:0.4.0
   GATEWAY_IMAGE_DIGEST: sha256:0f619d4a0b533093f94a76921cfbba0ecdec51557dffee1615a29721ee1fc878
+  # The GLB Forge topology runs with imagePullPolicy=Never, so materialize its
+  # simulator locally and pin it just like the gateway image.
+  SIM_IMAGE_REF: ghcr.io/neuralmagic/vllm-vcr@sha256:cf98f91f12210893f63b3afd3b1ea5bd3c35640379ce2bbf702a4cefddf9e5a4
+  SIM_IMAGE_TAG: ghcr.io/neuralmagic/vllm-vcr:vllm0.23
+  PROBE_IMAGE_REF: curlimages/curl@sha256:d9b4541e214bcd85196d6e92e2753ac6d0ea699f0af5741f8c6cccbfcf00ef4b
+  PROBE_IMAGE_TAG: curlimages/curl:8.10.1
   # Pinned identity/date/message-suffix for the local PR-merge reconstruction
   # in resolve-source's "Resolve source" step and glb-e2e's "Reconstruct PR
   # merge" step (see grid#66). Both jobs build a merge commit from the same
@@ -381,6 +387,34 @@ jobs:
           echo "sha=${DEMOS_SHA}" >> "${GITHUB_OUTPUT}"
           echo "Demos repo SHA: ${DEMOS_SHA}"
 
+      - name: Allow the GLB test's private backend endpoints
+        run: |
+          set -euo pipefail
+          DEMO_DIR="${GITHUB_WORKSPACE}/praxis-demos/demos/grid-glb-demo"
+          for provider in east-provider west-provider; do
+            config="${DEMO_DIR}/configs/${provider}/praxis.yaml"
+            if [[ ! -f "${config}" ]]; then
+              echo "::error::Missing GLB provider config: ${config}"
+              exit 1
+            fi
+
+            if grep -q '^insecure_options:' "${config}"; then
+              if ! grep -Eq '^  allow_private_endpoints:[[:space:]]*true[[:space:]]*(#.*)?$' "${config}" \
+                || ! grep -Eq '^  allow_private_upstreams:[[:space:]]*true[[:space:]]*(#.*)?$' "${config}"; then
+                echo "::error::${config} has an unexpected insecure_options block; refusing to rewrite it"
+                exit 1
+              fi
+            else
+              tmp_config="$(mktemp "${config}.XXXXXX")"
+              {
+                printf 'insecure_options:\n  allow_private_endpoints: true\n  allow_private_upstreams: true\n\n'
+                cat "${config}"
+              } > "${tmp_config}"
+              mv "${tmp_config}" "${config}"
+            fi
+            echo "Prepared private Kind backend allowances in configs/${provider}/praxis.yaml"
+          done
+
       - name: Validate immutable gateway input
         run: |
           set -euo pipefail
@@ -552,6 +586,33 @@ jobs:
           fi
           echo "Digest verification: PASS"
 
+      - name: Pull pinned simulator image
+        run: |
+          set -euo pipefail
+          docker pull "${SIM_IMAGE_REF}"
+          EXPECTED_DIGEST="${SIM_IMAGE_REF##*@}"
+          REPO_DIGESTS=$(docker image inspect --format='{{json .RepoDigests}}' "${SIM_IMAGE_REF}")
+          if ! jq -e --arg digest "${EXPECTED_DIGEST}" 'any(.[]; endswith($digest))' <<< "${REPO_DIGESTS}" > /dev/null; then
+            echo "::error::Pulled simulator does not report the pinned repository digest ${EXPECTED_DIGEST}: ${REPO_DIGESTS}"
+            exit 1
+          fi
+          docker tag "${SIM_IMAGE_REF}" "${SIM_IMAGE_TAG}"
+          ACTUAL_ID=$(docker image inspect --format='{{.Id}}' "${SIM_IMAGE_REF}")
+          echo "Simulator image verified: ${SIM_IMAGE_REF} (image ID ${ACTUAL_ID}), tagged locally as ${SIM_IMAGE_TAG}"
+
+      - name: Pull pinned probe image
+        run: |
+          set -euo pipefail
+          docker pull "${PROBE_IMAGE_REF}"
+          EXPECTED_DIGEST="${PROBE_IMAGE_REF##*@}"
+          REPO_DIGESTS=$(docker image inspect --format='{{json .RepoDigests}}' "${PROBE_IMAGE_REF}")
+          if ! jq -e --arg digest "${EXPECTED_DIGEST}" 'any(.[]; endswith($digest))' <<< "${REPO_DIGESTS}" > /dev/null; then
+            echo "::error::Pulled probe image does not report the pinned repository digest ${EXPECTED_DIGEST}: ${REPO_DIGESTS}"
+            exit 1
+          fi
+          docker tag "${PROBE_IMAGE_REF}" "${PROBE_IMAGE_TAG}"
+          echo "Probe image verified: ${PROBE_IMAGE_REF} (tagged locally as ${PROBE_IMAGE_TAG})"
+
       # ----------------------------------------------------------------------
       # Image verification
       # ----------------------------------------------------------------------
@@ -619,10 +680,19 @@ jobs:
             docker inspect --format='  ID: {{.Id}}' "${GATEWAY_IMAGE_REF}"
             echo "  Digest: ${RESOLVED_DIGEST}"
             echo ""
+            echo "${SIM_IMAGE_TAG}  (materialized from pinned GLB simulator ${SIM_IMAGE_REF})"
+            docker inspect --format='  ID: {{.Id}}' "${SIM_IMAGE_TAG}"
+            docker inspect --format='  Repository digests: {{json .RepoDigests}}' "${SIM_IMAGE_TAG}"
+            echo ""
+            echo "${PROBE_IMAGE_REF}  (pinned GLB probe image; local tag ${PROBE_IMAGE_TAG})"
+            docker inspect --format='  ID: {{.Id}}' "${PROBE_IMAGE_TAG}"
+            echo ""
             echo "=== Override Environment ==="
             echo "GRID_XTASK_OPERATOR_IMAGE=grid-operator:${TAG}"
             echo "GRID_XTASK_MOCK_PROVIDER_IMAGE=grid-mock-providers:${TAG}"
             echo "GRID_XTASK_GATEWAY_IMAGE=${GATEWAY_IMAGE_REF}"
+            echo "GRID_XTASK_SIM_IMAGE=${SIM_IMAGE_TAG}"
+            echo "  materialized from pinned ${SIM_IMAGE_REF}"
             echo "GRID_XTASK_IMAGE_PULL_POLICY=Never"
           } | tee "${GITHUB_WORKSPACE}/image-manifest.txt"
 
@@ -651,6 +721,7 @@ jobs:
           GRID_XTASK_OPERATOR_IMAGE: grid-operator:${{ steps.tags.outputs.tag }}
           GRID_XTASK_MOCK_PROVIDER_IMAGE: grid-mock-providers:${{ steps.tags.outputs.tag }}
           GRID_XTASK_GATEWAY_IMAGE: ${{ env.GATEWAY_IMAGE_REF }}
+          GRID_XTASK_SIM_IMAGE: ${{ env.SIM_IMAGE_TAG }}
           GRID_XTASK_IMAGE_PULL_POLICY: Never
         run: |
           set -euo pipefail
