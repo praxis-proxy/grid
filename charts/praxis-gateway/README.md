@@ -282,7 +282,7 @@ Praxis AI image; these values may advance independently.
 | `praxisConfig.render.provider.allowedPaths` | list | chat, completions, models, embeddings | Exact paths a provider forwards, GET and POST only. Other paths get a 404, other methods a 405. |
 | `grid.networkName` | string | `""` | GridNetwork name for overlay-sidecar scope validation. Required when the sidecar is on. |
 | `grid.siteName` | string | `""` | This gateway's site name. Required for render and when the overlay sidecar is on. A consumer scores locality with it; a provider returns it in `X-Grid-Provider-Site`. |
-| `praxisConfig.render.auth.mode` | string | **required** when rendered | `api-key` validates the caller's key and needs an image that registers `identity/api-key` (praxis-policy 0.4 or later); the render refuses it on the default `ai:0.4.0` image (by effective reference; a digest pin of that same image is not detected). `none` renders no policy filter, for use only behind an authenticating front. |
+| `praxisConfig.render.auth.mode` | string | **required** for a render consumer | `api-key` validates the caller's key and needs an image that registers `identity/api-key` (praxis-policy 0.4 or later); the render refuses it on the default `ai:0.4.0` image (by effective reference; a digest pin of that same image is not detected). `none` renders no policy filter, for use only behind an authenticating front. |
 | `praxisConfig.render.auth.allowUnauthenticatedExposure` | bool | `false` | With `none`, allow a LoadBalancer or NodePort Service. Without it the render fails. The guard sees only this chart's Service, not `oc expose`, another Service selecting the pod labels, an HTTPRoute, or a hand-made Service with `service.enabled=false`. Use `networkPolicy` for those. |
 | `praxisConfig.render.auth.stripAuthorization` | bool | `true` | Remove the caller's `Authorization` before routing, in either mode. Forwarded grid hops authenticate by mTLS identity. `false` forwards the caller's key or bearer to every backend and cross-site peer, so use it only when the backend validates that same credential. |
 | `praxisConfig.render.auth.validateUrl` | string | **required** for `api-key` | https validate endpoint. |
@@ -608,7 +608,7 @@ candidate cluster (the provider's `clusterName`, else its name).
 
 A `grid-gateway` built from the current source re-reads `serving-config.json`
 every five seconds after the kubelet updates the mounted ConfigMap. It applies
-candidate and operator address changes without a pod restart. Invalid updates
+candidate, peer, operator address, and pin changes without a pod restart. Invalid updates
 keep the last accepted serving settings and topology. Changes to mounted
 identity files can still restart signals pollers using those accepted settings.
 Check gateway logs and
@@ -622,7 +622,6 @@ operator renders `pins` the new gateway refuses, and an old gateway holds its la
 accepted config only while its pod keeps running. A gateway pod that restarts
 between the two rollouts exits at startup and crash-loops until the gateway
 rolls, so do not leave the two rollouts apart.
-
 The same watcher detects changes to the mounted CA, client certificate, and
 key, and rebuilds the signals pollers. This refreshes their mTLS identity; it
 does not renew certificates or change provider-listener TLS settings. Older
@@ -647,6 +646,7 @@ Known limits:
   re-enroll each site and update the peers' digests before its certificate expires.
   The serving watcher refreshes signals-poller identity files; provider-listener
   certificate reload depends on the Praxis build.
+
 ### Routing overlay delivery
 
 Praxis can hot-reload a routing overlay as soon as its file changes. A normal
@@ -764,8 +764,12 @@ is enough. Public https backends can instead take `upstreamCA`.
 
 ## Upgrading
 
-The chart now rejects previous gateway value names rather than ignoring them.
-Migrate the values before `helm upgrade`:
+The `praxis-gateway` chart changes from 0.1.4 to 0.1.5 reject previous gateway
+value names rather than ignoring them. Migrate the values before `helm upgrade`.
+These are gateway chart values; the separate CRD field rename is not part of
+this branch.
+
+Use this mapping:
 
 | Old | New |
 |---|---|
