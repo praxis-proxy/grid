@@ -1,0 +1,1 @@
+{"hub":null,"pollIntervalSeconds":15,"version":"2349fa2-dirty","thresholds":{"gpuUtilWarn":90,"queueWarn":50,"latencyWarnMs":5000},"user":null}

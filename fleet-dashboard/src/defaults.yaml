@@ -1,0 +1,12 @@
+# Default PromQL per key. Evaluated once per site. An empty value disables the key.
+readyEndpoints: max(llm_d_epp_ready_endpoints)
+gpuTotal: sum(kube_node_status_allocatable{resource="nvidia_com_gpu"})
+gpuUtil: avg(DCGM_FI_DEV_GPU_UTIL)
+gpuUtilFallback: avg(vllm:gpu_cache_usage_perc) * 100
+models: count by (model_name) (vllm:num_requests_running)
+rps: sum(rate(vllm:request_success_total[1m]))
+p50LatencyMs: histogram_quantile(0.5, sum by (le) (rate(vllm:e2e_request_latency_seconds_bucket[5m]))) * 1000
+tokensPerSec: sum(rate(vllm:generation_tokens_total[1m]))
+queueDepth: sum(vllm:num_requests_waiting)
+replicasDown: sum(kube_deployment_spec_replicas{deployment=~".*vllm.*"}) - sum(kube_deployment_status_replicas_available{deployment=~".*vllm.*"})
+tenants: ""

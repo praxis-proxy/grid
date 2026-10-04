@@ -1,0 +1,47 @@
+[package]
+name = "fleet-dashboard"
+build = "build.rs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "fleet-dashboard"
+path = "src/main.rs"
+
+[dependencies]
+axum = { workspace = true }
+clap = { workspace = true, features = ["env"] }
+futures = { workspace = true }
+k8s-openapi = { workspace = true }
+kube = { workspace = true, features = ["rustls-tls", "ring"] }
+prometheus = { workspace = true }
+promql-parser = { workspace = true }
+reqwest = { workspace = true, features = ["query", "rustls-no-provider"] }
+rustls = { workspace = true, features = ["ring"] }
+serde = { workspace = true }
+sha2 = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true, features = ["serde-well-known"] }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+bytes = { workspace = true }
+http = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true }
+percent-encoding = { workspace = true }
+tower = { workspace = true }
+axum-server = { version = "0.8.0", default-features = false, features = ["tls-rustls-no-provider"] }
+rcgen = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+time = { workspace = true, features = ["macros"] }

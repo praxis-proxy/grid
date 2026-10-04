@@ -4,6 +4,7 @@ members = [
     "certs",
     "crdt",
     "enrollment",
+    "fleet-dashboard",
     "forge",
     "mock-providers",
     "operator",
@@ -45,6 +46,7 @@ openssl-sys = "0.9"
 pem = "4.0.0"
 percent-encoding = "2.3"
 prometheus = "0.14"
+promql-parser = "0.11.0"
 rcgen = "0.14.9"
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "stream"] }
 ring = "0.17"
