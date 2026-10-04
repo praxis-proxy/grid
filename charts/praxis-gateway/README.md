@@ -121,9 +121,17 @@ helm upgrade --install praxis-gateway charts/praxis-gateway \
   --namespace praxis --set config.existingConfigMap=praxis-config
 ```
 
-In BYO mode, a live Helm install checks that ConfigMap `config.existingConfigMap` already exists in the release namespace.
-If it is missing, the install fails before creating the Deployment. Offline `helm template` does not require a
-cluster.
+With `config.existingConfigMap` set and `gatewayConfig.render: false`, a live
+Helm install or upgrade looks up that ConfigMap in the release namespace. If
+it is missing, the chart looks up the `kube-system` Namespace to detect a live
+cluster and then fails before creating the Deployment. Offline `helm template`
+skips this check. Inline defaults still work without an existing ConfigMap.
+
+The Helm client's credentials need `get` access to the named ConfigMap. When
+it is missing, they also need `get` access to Namespace `kube-system`. A denied
+lookup fails with the API permission error rather than the chart's missing
+ConfigMap message. This check runs during rendering; it does not monitor the
+ConfigMap after installation.
 
 Set `config.key` when the configuration lives under another key. The chart
 does not manage this ConfigMap, so editing it does not restart the pods. The
@@ -392,9 +400,18 @@ each model to the least-loaded admitted site. The chosen candidate's cluster mus
 name a `gatewayConfig.backends` cluster, so give each backend the operator's
 candidate cluster (the provider's `routingClusterRef`, else its name).
 
-The gateway reads the file only at start. When the ConfigMap's
-`grid.praxis.fast/serving-digest` annotation changes, restart the gateway
-(`kubectl rollout restart`).
+A `grid-gateway` built from the current source re-reads `serving-config.json`
+every five seconds after the kubelet updates the mounted ConfigMap. It applies
+candidate, peer, address, and pin changes without a pod restart. Invalid updates
+keep the last accepted topology and pollers. Check gateway logs and
+`grid_serving_config_reload_total{result="applied"}` for acceptance; the
+`grid.praxis.fast/serving-digest` annotation records publication, not acceptance.
+
+The same watcher detects changes to the mounted CA, client certificate, and
+key, and rebuilds the signals pollers. This refreshes their mTLS identity; it
+does not renew certificates or change provider-listener TLS settings. Older
+images without this watcher still need a rollout. Choose an image that includes
+the watcher before relying on live updates.
 
 Known limits:
 
@@ -402,10 +419,15 @@ Known limits:
   provider gateway is down. That request fails rather than failing over.
 - The gateway matches a candidate's cluster to `gatewayConfig.backends` by name only.
   Nothing checks that the backend serves the candidate's site.
-- Site certificates last 180 days. Under `spiffe` trust the operator rotates them
-  around day 120 and rolls the gateway Deployment, because the gateway reads its
-  upstream client certificate only at start. Under `pin` trust nothing rotates
-  them: re-enroll each site and update the peers' digests before it expires.
+- The serving watcher does not add load-balancer clusters to `praxis.yaml`.
+  Add each new candidate's backend there too. Listener changes and serving
+  `window_secs` changes require a restart.
+- Site certificates last 180 days by default. Under `spiffe` trust, the operator
+  rotates them around day 120 and rolls the gateway Deployment to refresh its
+  upstream mTLS client identity. Under `pin` trust, rotation is disabled:
+  re-enroll each site and update the peers' digests before its certificate expires.
+  The serving watcher refreshes signals-poller identity files; provider-listener
+  certificate reload depends on the Praxis build.
 
 ### Routing overlay delivery
 

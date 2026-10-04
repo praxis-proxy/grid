@@ -2,7 +2,10 @@
 
 A hub and one site, `site-a`, installed with `helm` from the grid charts. Each command sets only what differs per cluster: names, addresses, URLs, and digests. Chart defaults cover the rest. `values/` holds the same settings as values files, for reference.
 
-This install routes on static chart candidates: the hub gateway sends each request to the site backends it lists. The operator still computes the routing overlay, but the gateway does not read it yet. Dynamic routing from the operator follows once the gateway reloads its serving config.
+This install routes on static chart candidates: the hub gateway sends requests
+to the site backends listed in its Helm values. It enables neither routing
+overlay delivery nor operator serving data. The current `grid-gateway` supports
+live serving-data updates when that separate mode is enabled.
 
 ## Prerequisites
 
@@ -105,7 +108,15 @@ Only `spiffe` rotates site certificates. In `pin` mode rotation is off: before a
 
 ## Operations
 
-A gateway with `gridServing` reads the operator's serving config only at start. After you add a site or rotate a pin, run `kubectl -n grid rollout restart deploy/grid-gateway` once the `grid.praxis.fast/serving-digest` annotation on its `grid-serving-*` ConfigMap changes. The static install in this example rolls the gateway through its own chart upgrade.
+With `gridServing.enabled`, a current `grid-gateway` re-reads mounted
+serving data and signals-poller identity files every five seconds. Valid changes
+to peers, candidates, addresses, and pins apply without a pod restart after the
+kubelet refreshes the files. Invalid updates keep the last accepted state.
+Older images without the serving watcher need a rollout.
+
+The static install in this example still updates gateway backends through
+`helm upgrade`. See the chart's
+[serving-data behavior and limits](../../../charts/praxis-gateway/README.md#cross-site-routing-in-agn).
 
 ### Remove a Site
 

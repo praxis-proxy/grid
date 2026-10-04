@@ -188,13 +188,14 @@ transport does not enable TLS — it is almost certainly a misconfiguration.
 Either change the mode to `mutual_tls` (if TLS is intended) or remove `sni`
 from the endpoint.
 
-**Consumer pod does not reload generated static configuration**
+**Consumer pod has not applied an updated Praxis ConfigMap**
 
-Praxis gateways do not automatically reload the complete generated Praxis
-configuration from a changed `ConfigMap` volume mount. A pod restart, rollout,
-or explicit gateway reload is required after the operator updates that static
-configuration. The versioned routing overlay is a separate projected file that
-`intelligent_route` can validate and hot-reload in process. See
+The operator updates the ConfigMap; it does not restart gateway pods. A Praxis
+build with file watching reloads supported routes, filter pipelines, and
+load-balancer endpoints after the kubelet refreshes the mounted file. Mount the
+directory rather than a `subPath`, and check gateway logs for acceptance.
+Listener and other startup settings still require a restart. The routing
+overlay is a separate file that `intelligent_route` validates and reloads. See
 [Reload and rollout](#reload-and-rollout) below.
 
 ## Edge-ingress deployments
@@ -208,8 +209,10 @@ The key distinction for edge deployments is that the routing overlay data
 (candidate membership, ordering, freshness) changes more frequently than
 static endpoint/TLS topology.  The intended architecture separates these:
 
-- **Static topology** (listener config, endpoint addresses, TLS material,
-  filter chain structure): changes require a gateway reload or restart.
+- **Praxis topology** (`praxis.yaml` listeners, endpoints, and filter chains):
+  supported pipeline and endpoint changes use file reload; listener and other
+  startup settings require a restart. Certificate file reload depends on the
+  gateway image and the component reading the files.
 - **Dynamic overlay** (`routing-overlay.json` envelope): changes are consumable
   without a full restart through `intelligent_route` overlay-file hot reload.
 
@@ -229,16 +232,27 @@ The operator applies the consumer Praxis `ConfigMap` on every reconcile. The
 consumer gateway pod is not owned by the operator and is not automatically
 restarted when the complete generated Praxis configuration changes.
 
-To apply updated config to a running consumer pod, restart the `Deployment`:
+A Praxis build with file watching applies supported `praxis.yaml` changes
+after the mounted file refreshes. Invalid replacements retain the running
+pipelines. Listener changes and other startup settings need a rollout; so do
+images without file watching:
 
 ```console
 kubectl rollout restart deployment/praxis-consumer -n <namespace>
 ```
 
-The dynamic routing overlay can reload independently as described above.
-Deployment owners remain responsible for restarting or explicitly reloading
-the gateway when static listener, filter-pipeline, endpoint/TLS topology, or
-mounted Secret content changes.
+Check the [Praxis reload reference][praxis-reload] for settings supported by
+your image. Mounted Secret changes are separate from `praxis.yaml` changes;
+do not assume every filter reloads its credential or certificate files.
+
+The dynamic routing overlay reloads independently. The current `grid-gateway`
+also watches `serving-config.json` and the signals pollers' identity files every
+five seconds when `GRID_SERVING_CONFIG` is set. That watcher applies topology
+and poller changes, keeps the last accepted state on invalid updates, and does
+not update listener settings or add load-balancer clusters to `praxis.yaml`.
+See the [gateway chart serving guide](../../charts/praxis-gateway/README.md#cross-site-routing-in-agn).
+
+[praxis-reload]: https://github.com/praxis-proxy/praxis/blob/main/docs/operating/configuration.md#dynamic-configuration-reload
 
 ## Security
 
