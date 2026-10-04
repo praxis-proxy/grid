@@ -65,29 +65,3 @@ Status is operator-owned and should not be edited by hand.
 | `ConsumerConfigError` | `PraxisConfigError` |
 | `ConsumerConfigDisabled` | `PraxisConfigDisabled` |
 | `EgressMissing` | `GatewayAddressMissing` |
-
-| Previous status field or reason | Current status field or reason |
-|---|---|
-| `distributedProviderCount` | `remoteProviderCount` |
-| `consumerConfigStatus` | `praxisConfigStatus` |
-| `overlayStatus` | `routingMapStatus` |
-| `OverlayRenderFailed` | `RoutingMapRenderFailed` |
-| `OverlayApplyFailed` | `RoutingMapApplyFailed` |
-| `ConsumerConfigRenderFailed` | `PraxisConfigRenderFailed` |
-| `ConsumerConfigApplyFailed` | `PraxisConfigApplyFailed` |
-| `ConsumerConfigError` | `PraxisConfigError` |
-| `ConsumerConfigDisabled` | `PraxisConfigDisabled` |
-| `EgressMissing` | `GatewayAddressMissing` |
-
-| Previous status field or reason | Current status field or reason |
-|---|---|
-| `distributedProviderCount` | `remoteProviderCount` |
-| `consumerConfigStatus` | `praxisConfigStatus` |
-| `overlayStatus` | `routingMapStatus` |
-| `OverlayRenderFailed` | `RoutingMapRenderFailed` |
-| `OverlayApplyFailed` | `RoutingMapApplyFailed` |
-| `ConsumerConfigRenderFailed` | `PraxisConfigRenderFailed` |
-| `ConsumerConfigApplyFailed` | `PraxisConfigApplyFailed` |
-| `ConsumerConfigError` | `PraxisConfigError` |
-| `ConsumerConfigDisabled` | `PraxisConfigDisabled` |
-| `EgressMissing` | `GatewayAddressMissing` |
