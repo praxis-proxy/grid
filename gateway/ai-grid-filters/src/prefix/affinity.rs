@@ -165,8 +165,7 @@ impl Affinity<'_> {
         if explores(self.turn, self.settings.exploration) {
             return Outcome::Exploration;
         }
-        let clusters: Vec<&str> = sites.iter().map(|site| site.cluster).collect();
-        let depths = self.index.depths(keys, &clusters);
+        let depths = self.index.depths(keys, sites.iter().map(|site| site.cluster));
         let deepest = depths.iter().copied().max().unwrap_or(0);
         let total = keys.as_slice().len();
         let qualifies = deepest >= FLOOR_KEYS || share(deepest, total) >= self.settings.threshold;
@@ -174,24 +173,23 @@ impl Affinity<'_> {
             return Outcome::NoMatch;
         }
         // Deepest first, so a site holding only a shared system prompt cannot pull a conversation away.
-        let sticky: Vec<bool> = depths.iter().map(|&depth| depth == deepest).collect();
-        if self.overloaded(sites, &sticky, deepest, gate) {
+        if self.overloaded(sites, &depths, deepest, gate) {
             return Outcome::LoadOverride;
         }
-        for (slot, is) in keep.iter_mut().zip(sticky) {
-            *slot = *slot && is;
+        for (slot, depth) in keep.iter_mut().zip(depths) {
+            *slot = *slot && depth == deepest;
         }
         Outcome::Sticky
     }
 
     /// Whether load outweighs the match: the best sticky site is busier than the
     /// best other site by more than the prefill the match saves.
-    fn overloaded(&self, sites: &[Site<'_>], sticky: &[bool], depth: usize, gate: &impl LoadGate) -> bool {
+    fn overloaded(&self, sites: &[Site<'_>], depths: &[usize], depth: usize, gate: &impl LoadGate) -> bool {
         let best = |pick: bool| {
             sites
                 .iter()
-                .zip(sticky)
-                .filter(|(_, is)| **is == pick)
+                .zip(depths)
+                .filter(|(_, held)| (**held == depth) == pick)
                 .min_by(|left, right| left.0.queue.total_cmp(&right.0.queue))
                 .map(|(site, _)| *site)
         };

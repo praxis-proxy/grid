@@ -12,8 +12,9 @@ use std::{io, sync::Arc};
 pub use affinity::AffinitySettings;
 pub(crate) use affinity::{Affinity, QueueGate, Site};
 use arc_swap::{ArcSwap, ArcSwapOption};
+pub(crate) use canon::Responses;
 pub(crate) use index::PrefixIndex;
-use xxhash_rust::xxh64::xxh64;
+use xxhash_rust::xxh64::{Xxh64, xxh64};
 
 use crate::pin::TagKey;
 
@@ -126,6 +127,16 @@ impl PrefixKeys {
     }
 }
 
+/// A Responses create body, read once for both its pinning and its prompt.
+pub(crate) fn parse_responses(body: &[u8]) -> Option<Responses<'_>> {
+    serde_json::from_slice(body).ok()
+}
+
+/// The prefix keys of a parsed Responses request, as [`prefix_keys`] gives for its body.
+pub(crate) fn responses_keys(request: &Responses<'_>) -> Option<PrefixKeys> {
+    canon::responses(request, Chain::new)?.finish()
+}
+
 /// The prefix keys of `body` for `api`, before [`PrefixKeys::for_model`].
 ///
 /// `None` when the body has no prompt the gateway can read: invalid JSON, token
@@ -137,11 +148,9 @@ pub(crate) fn prefix_keys(api: Api, body: &[u8]) -> Option<PrefixKeys> {
 
 /// Hashes a canonical prompt stream into chained block keys without holding the stream.
 struct Chain {
-    /// The previous block's hash, the seed for the next.
-    last: u64,
-    /// The block being filled.
-    block: [u8; BLOCK],
-    /// Bytes in `block`.
+    /// The block being filled, hashed as it arrives and seeded by the previous block's hash.
+    hasher: Xxh64,
+    /// Bytes in the block being filled.
     filled: usize,
     /// Full blocks hashed so far.
     blocks: usize,
@@ -156,8 +165,7 @@ impl Chain {
     fn new(salt: Option<&str>) -> Self {
         let seed = salt.map_or(0, |salt| xxh64(salt.as_bytes(), SALTED));
         Self {
-            last: seed,
-            block: [0; BLOCK],
+            hasher: Xxh64::new(seed),
             filled: 0,
             blocks: 0,
             next_key: 1,
@@ -172,11 +180,12 @@ impl Chain {
 
     /// Hash the filled block into the chain and take a key if it falls on the schedule.
     fn close_block(&mut self) {
-        self.last = xxh64(&self.block, self.last);
+        let last = self.hasher.digest();
+        self.hasher.reset(last);
         self.filled = 0;
         self.blocks = self.blocks.saturating_add(1);
         if self.blocks == self.next_key {
-            self.keys.push(self.last);
+            self.keys.push(last);
             self.next_key = self.blocks.saturating_add(stride(self.keys.len()));
         }
     }
@@ -208,9 +217,7 @@ impl io::Write for Chain {
         while !rest.is_empty() && !self.full() {
             let room = BLOCK.saturating_sub(self.filled);
             let (now, later) = rest.split_at(room.min(rest.len()));
-            if let Some(slot) = self.block.get_mut(self.filled..self.filled.saturating_add(now.len())) {
-                slot.copy_from_slice(now);
-            }
+            self.hasher.update(now);
             self.filled = self.filled.saturating_add(now.len());
             if self.filled == BLOCK {
                 self.close_block();
@@ -245,6 +252,26 @@ mod tests {
         let mut chain = Chain::new(salt);
         chain.write_all(stream).unwrap();
         chain.finish().map(|keys| keys.for_model(model).0).unwrap_or_default()
+    }
+
+    #[test]
+    fn streamed_keys_match_a_one_shot_chain_whatever_the_writes() {
+        let stream: Vec<u8> = (0..(BLOCK * 5 + 17)).map(|i| u8::try_from(i % 251).unwrap()).collect();
+        let mut last = 0;
+        let want: Vec<u64> = stream
+            .chunks_exact(BLOCK)
+            .map(|block| {
+                last = xxh64(block, last);
+                last
+            })
+            .collect();
+        for write in [1, 7, BLOCK, BLOCK + 3, stream.len()] {
+            let mut chain = Chain::new(None);
+            for piece in stream.chunks(write) {
+                chain.write_all(piece).unwrap();
+            }
+            assert_eq!(chain.finish().unwrap().as_slice(), want, "writes of {write}");
+        }
     }
 
     #[test]

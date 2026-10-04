@@ -223,6 +223,19 @@ mod tests {
             "the site sees its own id: {sent}"
         );
 
+        // Past the inline limit the body is read on the blocking pool, and still comes back stripped.
+        let large = format!(
+            r#"{{"model":"llama","input":"{}","previous_response_id":"{id}"}}"#,
+            "words ".repeat(50_000)
+        );
+        let (large_status, large_answer) = gateway.send("POST", "/v1/responses", &large);
+        assert_eq!(large_status, 200, "{large_answer}");
+        let large_sent = seen.lock().expect("seen").remove(2).1;
+        assert!(
+            large_sent.ends_with(r#""previous_response_id":"resp_abc"}"#),
+            "the large body is stripped too"
+        );
+
         let (fetched_status, fetched) = gateway.send("GET", &format!("/v1/responses/{id}"), "");
         assert_eq!(fetched_status, 200, "{fetched}");
         assert_eq!(seen.lock().expect("seen")[2].0, "GET /v1/responses/resp_abc HTTP/1.1");

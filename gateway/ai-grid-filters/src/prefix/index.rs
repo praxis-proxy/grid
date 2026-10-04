@@ -65,13 +65,17 @@ impl PrefixIndex {
     /// A candidate's held keys form a prefix of any prompt it holds: keys chain,
     /// and a prompt's keys are inserted tail first, so its head is never older
     /// than its tail. A binary search finds the depth in about nine lookups.
-    pub(crate) fn depths(&self, keys: &PrefixKeys, candidates: &[&str]) -> Vec<usize> {
+    pub(crate) fn depths(
+        &self,
+        keys: &PrefixKeys,
+        candidates: impl IntoIterator<Item = impl AsRef<str>>,
+    ) -> Vec<usize> {
         let now = Instant::now();
         let index = self.inner.read().unwrap_or_else(PoisonError::into_inner);
         candidates
-            .iter()
+            .into_iter()
             .map(|candidate| {
-                index.get(*candidate).map_or(0, |held| {
+                index.get(candidate.as_ref()).map_or(0, |held| {
                     let held = held.read().unwrap_or_else(PoisonError::into_inner);
                     keys.as_slice()
                         .partition_point(|key| held.peek(key).is_some_and(|entry| entry.confirmed && now < entry.until))
@@ -110,13 +114,7 @@ impl PrefixIndex {
 
     /// The request sent to `candidate` failed: withdraw it, dropping keys nothing else holds.
     pub(crate) fn forget(&self, keys: &PrefixKeys, candidate: &str) {
-        let Some(held) = self
-            .inner
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(candidate)
-            .map(Arc::clone)
-        else {
+        let Some(held) = self.existing(candidate) else {
             return;
         };
         let mut held = held.write().unwrap_or_else(PoisonError::into_inner);
@@ -133,13 +131,7 @@ impl PrefixIndex {
 
     /// `candidate` refused or failed the request: drop its keys there, confirmed or not.
     pub(crate) fn evict(&self, keys: &PrefixKeys, candidate: &str) {
-        let Some(held) = self
-            .inner
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(candidate)
-            .map(Arc::clone)
-        else {
+        let Some(held) = self.existing(candidate) else {
             return;
         };
         let mut held = held.write().unwrap_or_else(PoisonError::into_inner);
@@ -169,6 +161,15 @@ impl PrefixIndex {
                 }
             }
         }
+    }
+
+    /// `candidate`'s keys, when it has any.
+    fn existing(&self, candidate: &str) -> Option<Keys> {
+        self.inner
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(candidate)
+            .map(Arc::clone)
     }
 
     /// `candidate`'s keys, created on first use.
@@ -229,16 +230,16 @@ mod tests {
     fn a_pending_key_is_not_a_match() {
         let index = PrefixIndex::default();
         index.record(&keys(0..5), &name("east"));
-        assert_eq!(index.depths(&keys(0..5), &["east"]), [0]);
+        assert_eq!(index.depths(&keys(0..5), ["east"]), [0]);
     }
 
     #[test]
     fn depth_is_the_matched_head() {
         let index = PrefixIndex::default();
         index.confirm(&keys(0..5), &name("east"));
-        assert_eq!(index.depths(&keys(0..8), &["east", "west"]), [5, 0]);
+        assert_eq!(index.depths(&keys(0..8), ["east", "west"]), [5, 0]);
         assert_eq!(
-            index.depths(&keys(100..108), &["east"]),
+            index.depths(&keys(100..108), ["east"]),
             [0],
             "another prompt matches nothing"
         );
@@ -264,7 +265,7 @@ mod tests {
         index.confirm(&keys(0..3), &east);
         index.record(&keys(0..6), &east);
         index.forget(&keys(0..6), &east);
-        assert_eq!(index.depths(&keys(0..6), &["east"]), [3], "the confirmed head stays");
+        assert_eq!(index.depths(&keys(0..6), ["east"]), [3], "the confirmed head stays");
     }
 
     #[test]
@@ -273,7 +274,7 @@ mod tests {
         let east = name("east");
         index.confirm(&keys(0..4), &east);
         index.evict(&keys(0..4), &east);
-        assert_eq!(index.depths(&keys(0..4), &["east"]), [0]);
+        assert_eq!(index.depths(&keys(0..4), ["east"]), [0]);
     }
 
     #[test]
@@ -283,7 +284,7 @@ mod tests {
         let cap = u64::try_from(CANDIDATE_KEYS.get()).unwrap();
         index.confirm(&keys(0..cap), &east);
         index.confirm(&keys(1_000_000..1_000_010), &east);
-        let depth = index.depths(&keys(0..cap), &["east"])[0];
+        let depth = index.depths(&keys(0..cap), ["east"])[0];
         assert_eq!(
             depth,
             CANDIDATE_KEYS.get() - 10,
@@ -299,7 +300,7 @@ mod tests {
         index.confirm(&keys(0..4), &east);
         index.confirm(&keys(0..4), &west);
         index.retain(&[Arc::clone(&east)]);
-        assert_eq!(index.depths(&keys(0..4), &["east", "west"]), [4, 0]);
+        assert_eq!(index.depths(&keys(0..4), ["east", "west"]), [4, 0]);
     }
 
     /// Index cost under load: 512-key prompts (the cap, 128 KiB and more) from 2,000

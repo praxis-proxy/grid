@@ -25,7 +25,7 @@ use serde::Deserialize;
 
 use crate::{
     descriptor::{AdmissionState, CapabilityKind, RouteCandidate, validate_model_header},
-    pin::{self, Collection, StatePath, TagKey, Tagger},
+    pin::{self, Collection, Pushed, StatePath, TagKey, Tagger},
     prefix::{self, Affinity, AffinitySettings, Api, PrefixAffinity, PrefixKeys, QueueGate, Site},
     snapshot::RouteSnapshot,
 };
@@ -291,8 +291,23 @@ impl HttpFilter for GridSiteRouteFilter {
     ) -> Result<FilterAction, FilterError> {
         if end_of_stream {
             let enabled = self.affinity.settings.load().enabled;
-            let key = self.affinity.tag_key.load();
-            let state = read_body(ctx.request.uri.path(), body, enabled, key.as_deref());
+            let key = self.affinity.tag_key.load_full();
+            let path = ctx.request.uri.path();
+            let state = if body.as_ref().is_some_and(|bytes| bytes.len() > INLINE_BODY) {
+                // A large body can take tens of milliseconds to key, too long for a request worker.
+                let (path, mut taken) = (path.to_owned(), body.take());
+                let read = tokio::task::spawn_blocking(move || {
+                    let state = read_body(&path, &mut taken, enabled, key.as_deref());
+                    (state, taken)
+                });
+                let (state, read_back) = read
+                    .await
+                    .map_err(|error| -> FilterError { error.to_string().into() })?;
+                *body = read_back;
+                state
+            } else {
+                read_body(path, body, enabled, key.as_deref())
+            };
             ctx.insert_filter_state(state);
         }
         Ok(FilterAction::Continue)
@@ -344,9 +359,9 @@ impl HttpFilter for GridSiteRouteFilter {
         if let Some(tagger) = ctx
             .get_filter_state_mut::<RouteState>()
             .and_then(|state| state.tagger.as_mut())
+            && let Pushed::Replaced(tagged) = tagger.push(body.as_deref().unwrap_or_default(), end_of_stream)
         {
-            let tagged = tagger.push(body.as_deref().unwrap_or_default(), end_of_stream);
-            *body = (!tagged.is_empty()).then(|| Bytes::from(tagged));
+            *body = (!tagged.is_empty()).then_some(tagged);
         }
         Ok(FilterAction::Continue)
     }
@@ -354,6 +369,10 @@ impl HttpFilter for GridSiteRouteFilter {
 
 /// Most of a request body the filter buffers to read its prompt, as `model_to_header` does.
 const BODY_LIMIT: usize = 10 << 20;
+
+/// Largest body keyed on the request worker. Keying one this size takes under a
+/// millisecond; 10 MiB of tiny messages takes about 30.
+const INLINE_BODY: usize = 256 << 10;
 
 /// Seconds a client should wait before retrying a request pinned to a site that admits none now.
 const RETRY_AFTER_SECS: &str = "5";
@@ -367,14 +386,19 @@ fn read_body(path: &str, body: &mut Option<Bytes>, affinity: bool, key: Option<&
     };
     if pin::state_path(path) == Some(StatePath::Create(Collection::Responses)) {
         state.responses = true;
-        if let Some(((site, mark), stripped)) = pin::pinned_body(bytes, key) {
-            *body = Some(Bytes::from(stripped));
-            state.pinned = Some(Holder {
-                site: Arc::from(site),
-                mark: Some(mark),
-            });
+        // One parse serves both pinning and the prompt's keys.
+        let Some(request) = prefix::parse_responses(bytes) else {
             return state;
+        };
+        let pinned = pin::pinned_fields(bytes, request.previous_response_id, request.conversation, key);
+        if pinned.is_none() && affinity {
+            state.keys = prefix::responses_keys(&request);
         }
+        if let Some(((site, mark), stripped)) = pinned {
+            *body = Some(Bytes::from(stripped));
+            state.pinned = Some(Holder { site, mark: Some(mark) });
+        }
+        return state;
     }
     state.keys = Api::from_path(path)
         .filter(|_| affinity)

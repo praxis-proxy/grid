@@ -80,7 +80,7 @@ fn messages(request: &Anthropic<'_>, chain: impl FnOnce(Option<&str>) -> Chain) 
 
 /// Tools, instructions, then the input. A request that continues a stored
 /// response or conversation is pinned to its site, so it gets no key.
-fn responses(request: &Responses<'_>, chain: impl FnOnce(Option<&str>) -> Chain) -> Option<Chain> {
+pub(super) fn responses(request: &Responses<'_>, chain: impl FnOnce(Option<&str>) -> Chain) -> Option<Chain> {
     if request.previous_response_id.is_some() || request.conversation.is_some() {
         return None;
     }
@@ -176,7 +176,7 @@ impl Out {
         let value: serde_json::Value = serde_json::from_str(value.get()).ok()?;
         self.raw(tag);
         self.raw(&[FIELD]);
-        self.sorted(&value);
+        self.sorted(value);
         self.raw(&[FIELD]);
         Some(())
     }
@@ -196,7 +196,7 @@ impl Out {
             Some(value) => {
                 self.raw(b"arguments");
                 self.raw(&[FIELD]);
-                self.sorted(&value);
+                self.sorted(value);
                 self.raw(&[FIELD]);
             },
             None => self.text(b"arguments", arguments),
@@ -212,37 +212,9 @@ impl Out {
     }
 
     /// Write `value` with object keys sorted, whatever order the map keeps.
-    fn sorted(&mut self, value: &serde_json::Value) {
-        match value {
-            serde_json::Value::Object(map) => {
-                let mut entries: Vec<_> = map.iter().collect();
-                entries.sort_unstable_by_key(|(key, _)| *key);
-                self.raw(b"{");
-                for (i, (key, item)) in entries.into_iter().enumerate() {
-                    if i > 0 {
-                        self.raw(b",");
-                    }
-                    self.serialize(key);
-                    self.raw(b":");
-                    self.sorted(item);
-                }
-                self.raw(b"}");
-            },
-            serde_json::Value::Array(items) => {
-                self.raw(b"[");
-                for (i, item) in items.iter().enumerate() {
-                    if i > 0 {
-                        self.raw(b",");
-                    }
-                    self.sorted(item);
-                }
-                self.raw(b"]");
-            },
-            scalar @ (serde_json::Value::Null
-            | serde_json::Value::Bool(_)
-            | serde_json::Value::Number(_)
-            | serde_json::Value::String(_)) => self.serialize(scalar),
-        }
+    fn sorted(&mut self, mut value: serde_json::Value) {
+        value.sort_all_objects();
+        self.serialize(&value);
     }
 
     /// A value in compact JSON form.
@@ -651,9 +623,9 @@ struct Source<'body> {
     file_id: Option<&'body RawValue>,
 }
 
-/// The Responses fields that make up the prompt.
+/// The Responses fields that make up the prompt, and the stored state it names.
 #[derive(Deserialize)]
-struct Responses<'body> {
+pub(crate) struct Responses<'body> {
     /// A string or input items.
     #[serde(borrow, default)]
     input: Option<&'body RawValue>,
@@ -665,10 +637,10 @@ struct Responses<'body> {
     tools: Option<&'body RawValue>,
     /// A stored response this one continues.
     #[serde(borrow, default)]
-    previous_response_id: Option<&'body RawValue>,
+    pub(crate) previous_response_id: Option<&'body RawValue>,
     /// A stored conversation this one continues.
     #[serde(borrow, default)]
-    conversation: Option<&'body RawValue>,
+    pub(crate) conversation: Option<&'body RawValue>,
     /// vLLM's per-tenant cache isolation, part of the seed.
     #[serde(borrow, default)]
     cache_salt: Option<Cow<'body, str>>,

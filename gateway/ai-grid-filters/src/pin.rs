@@ -5,6 +5,7 @@
 //! one goes only there. With a key, the mac authenticates the site and cluster,
 //! so a client cannot aim a request at a site it was never given.
 
+use bytes::{Bytes, BytesMut};
 use serde::Deserialize;
 use serde_json::value::RawValue;
 use xxhash_rust::xxh64::xxh64;
@@ -189,6 +190,7 @@ pub(crate) fn upstream_path(collection: Collection, upstream: &str, rest: &str) 
     format!("{}/{upstream}{rest}", collection.path())
 }
 
+#[cfg(test)]
 /// The fields of a Responses create body that name stored state.
 #[derive(Deserialize)]
 struct Continues<'body> {
@@ -212,9 +214,21 @@ struct ConversationRef<'body> {
 ///
 /// Each id field is decoded as JSON, so escapes match, and only that field's
 /// token is replaced. `None` when the body continues nothing tagged.
+#[cfg(test)]
 pub(crate) fn pinned_body(body: &[u8], key: Option<&TagKey>) -> Option<(BodyPin, Vec<u8>)> {
     let fields: Continues<'_> = serde_json::from_slice(body).ok()?;
-    let conversation = fields.conversation.and_then(|value| {
+    pinned_fields(body, fields.previous_response_id, fields.conversation, key)
+}
+
+/// [`pinned_body`] over the `previous_response_id` and `conversation` already read
+/// from `body`, so a body parsed for its prompt is not parsed again.
+pub(crate) fn pinned_fields<'body>(
+    body: &'body [u8],
+    previous_response_id: Option<&'body RawValue>,
+    conversation: Option<&'body RawValue>,
+    key: Option<&TagKey>,
+) -> Option<(BodyPin, Vec<u8>)> {
+    let conversation = conversation.and_then(|value| {
         serde_json::from_str::<ConversationRef<'_>>(value.get())
             .map(|reference| reference.id)
             .ok()
@@ -222,14 +236,14 @@ pub(crate) fn pinned_body(body: &[u8], key: Option<&TagKey>) -> Option<(BodyPin,
     });
     let mut site = None;
     let mut edits = Vec::new();
-    for token in [fields.previous_response_id, conversation].into_iter().flatten() {
-        let Ok(id) = serde_json::from_str::<String>(token.get()) else {
+    for token in [previous_response_id, conversation].into_iter().flatten() {
+        let Ok(id) = serde_json::from_str::<std::borrow::Cow<'_, str>>(token.get()) else {
             continue;
         };
         let Some(pinned) = untag(&id, key) else {
             continue;
         };
-        site.get_or_insert_with(|| (pinned.site.to_owned(), pinned.mark.to_owned()));
+        site.get_or_insert_with(|| (std::sync::Arc::from(pinned.site), pinned.mark.to_owned()));
         edits.push((span(body, token)?, serde_json::to_string(&pinned.upstream).ok()?));
     }
     let site = site?;
@@ -246,7 +260,7 @@ pub(crate) fn pinned_body(body: &[u8], key: Option<&TagKey>) -> Option<(BodyPin,
 }
 
 /// The site and cluster mark a create body is pinned to.
-pub(crate) type BodyPin = (String, String);
+pub(crate) type BodyPin = (std::sync::Arc<str>, String);
 
 /// Where `token`, borrowed from `body`, sits in it.
 fn span(body: &[u8], token: &RawValue) -> Option<std::ops::Range<usize>> {
@@ -264,8 +278,10 @@ fn span(body: &[u8], token: &RawValue) -> Option<std::ops::Range<usize>> {
 /// input or output, and text a model generates, are left alone.
 #[derive(Debug)]
 pub(crate) struct Tagger {
-    /// `<site>.`, inserted after the prefix.
+    /// `<site>.<mark>.<mac>.`, inserted after the prefix.
     tag: Vec<u8>,
+    /// Each of [`PREFIXES`] followed by `tag`, to tell an id already tagged.
+    tagged: [Vec<u8>; 2],
     /// The last byte outside a string that was not whitespace.
     last: u8,
     /// Whether the scanner is inside a string.
@@ -273,9 +289,9 @@ pub(crate) struct Tagger {
     /// Whether the previous byte in a string was an unescaped backslash.
     escaped: bool,
     /// The string being read, kept only while it could still be an id key.
-    current: Vec<u8>,
+    current: Short,
     /// The last string closed, when short enough to be an id key.
-    key: Option<Vec<u8>>,
+    key: Option<Short>,
     /// Bytes held back from the previous chunk.
     held: Vec<u8>,
     /// Open objects and arrays.
@@ -290,15 +306,60 @@ const OWN_KEYS: [&[u8]; 2] = [b"response", b"conversation"];
 /// The longest key worth remembering, the longest of [`ID_KEYS`].
 const KEY_LIMIT: usize = 20;
 
+/// A string of at most [`KEY_LIMIT`] bytes, kept without allocating.
+#[derive(Clone, Copy, Debug, Default)]
+struct Short {
+    /// The bytes.
+    bytes: [u8; KEY_LIMIT],
+    /// Bytes seen, past [`KEY_LIMIT`] when the string is too long to be a key.
+    len: usize,
+}
+
+impl Short {
+    /// Add `byte`, counting it once the string is too long to keep.
+    fn push(&mut self, byte: u8) {
+        if let Some(slot) = self.bytes.get_mut(self.len) {
+            *slot = byte;
+        }
+        self.len = self.len.saturating_add(1);
+    }
+
+    /// The string, `None` when it was too long to keep.
+    fn get(&self) -> Option<&[u8]> {
+        self.bytes.get(..self.len)
+    }
+}
+
+/// What tagging did to a chunk.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Pushed {
+    /// Nothing to tag and nothing held: send the chunk as it is.
+    Unchanged,
+    /// Send these bytes instead, empty when all of it is held back.
+    Replaced(Bytes),
+}
+
+/// Where a chunk takes a tag, and where the bytes held back for the next chunk begin.
+#[derive(Default)]
+struct Plan {
+    /// Offsets the tag goes in at.
+    inserts: Vec<usize>,
+    /// The offset from which the chunk is held back.
+    hold: Option<usize>,
+}
+
 impl Tagger {
     /// A tagger inserting `tag`, from [`tag`].
     pub(crate) fn new(tag: String) -> Self {
+        let tag = tag.into_bytes();
+        let tagged = PREFIXES.map(|prefix| [prefix.as_bytes(), &tag].concat());
         Self {
-            tag: tag.into_bytes(),
+            tag,
+            tagged,
             last: 0,
             in_string: false,
             escaped: false,
-            current: Vec::new(),
+            current: Short::default(),
             key: None,
             held: Vec::new(),
             depth: 0,
@@ -306,11 +367,83 @@ impl Tagger {
         }
     }
 
+    /// Tag the ids in `chunk`, holding back a possible partial match unless `end`.
+    /// A chunk with nothing to tag and nothing held before it is left as it is.
+    pub(crate) fn push(&mut self, chunk: &[u8], end: bool) -> Pushed {
+        if self.held.is_empty() {
+            let plan = self.scan(chunk, end);
+            if plan.inserts.is_empty() && plan.hold.is_none() {
+                return Pushed::Unchanged;
+            }
+            return Pushed::Replaced(self.emit(chunk, &plan));
+        }
+        let mut input = std::mem::take(&mut self.held);
+        input.extend_from_slice(chunk);
+        let plan = self.scan(&input, end);
+        Pushed::Replaced(self.emit(&input, &plan))
+    }
+
+    /// Follow `input`, noting where tags go in and where it must be held back.
+    fn scan(&mut self, input: &[u8], end: bool) -> Plan {
+        let mut plan = Plan::default();
+        let mut at = 0;
+        while let Some(&byte) = input.get(at) {
+            if !self.in_string && byte == b'"' {
+                let after = input.get(at.saturating_add(1)..).unwrap_or_default();
+                match self.open(after, end) {
+                    // The quote is read again with the next chunk.
+                    Open::Wait => {
+                        plan.hold = Some(at);
+                        return plan;
+                    },
+                    Open::Tag(prefix) => {
+                        at = at.saturating_add(1).saturating_add(prefix.len());
+                        plan.inserts.push(at);
+                    },
+                    Open::Plain => at = at.saturating_add(1),
+                }
+                self.in_string = true;
+                self.current = Short::default();
+                continue;
+            }
+            if self.in_string {
+                self.string_byte(byte);
+            } else if !byte.is_ascii_whitespace() {
+                self.nest(byte);
+                self.last = byte;
+            }
+            at = at.saturating_add(1);
+        }
+        plan
+    }
+
+    /// `input` with the tag at each insert, up to where it is held back, which is kept.
+    fn emit(&mut self, input: &[u8], plan: &Plan) -> Bytes {
+        let end = plan.hold.unwrap_or(input.len());
+        let mut out = BytesMut::with_capacity(end.saturating_add(plan.inserts.len().saturating_mul(self.tag.len())));
+        let mut from = 0;
+        for &at in &plan.inserts {
+            out.extend_from_slice(input.get(from..at).unwrap_or_default());
+            out.extend_from_slice(&self.tag);
+            from = at;
+        }
+        out.extend_from_slice(input.get(from..end).unwrap_or_default());
+        if let Some(hold) = plan.hold {
+            self.held = input.get(hold..).unwrap_or_default().to_vec();
+        }
+        out.freeze()
+    }
+
     /// Follow an object or array opening or closing outside a string.
     fn nest(&mut self, byte: u8) {
         match byte {
             b'{' | b'[' => {
-                let named = self.last == b':' && self.key.as_deref().is_some_and(|key| OWN_KEYS.contains(&key));
+                let named = self.last == b':'
+                    && self
+                        .key
+                        .as_ref()
+                        .and_then(Short::get)
+                        .is_some_and(|key| OWN_KEYS.contains(&key));
                 let own = self.depth == 0 || (self.own_depth == self.depth && named);
                 self.depth = self.depth.saturating_add(1);
                 if own {
@@ -327,53 +460,6 @@ impl Tagger {
         }
     }
 
-    /// Tag the ids in `chunk`, holding back a possible partial match unless `end`.
-    pub(crate) fn push(&mut self, chunk: &[u8], end: bool) -> Vec<u8> {
-        let mut input = std::mem::take(&mut self.held);
-        input.extend_from_slice(chunk);
-        let mut out = Vec::with_capacity(input.len().saturating_add(self.tag.len()));
-        let mut at = 0;
-        while let Some(&byte) = input.get(at) {
-            if !self.in_string && byte == b'"' {
-                let after = input.get(at.saturating_add(1)..).unwrap_or_default();
-                match self.open(after, end) {
-                    Open::Wait => {
-                        self.held = input.get(at..).unwrap_or_default().to_vec();
-                        return out;
-                    },
-                    open @ (Open::Tag(_) | Open::Plain) => {
-                        at = at.saturating_add(self.quote(&open, &mut out));
-                        continue;
-                    },
-                }
-            }
-            if self.in_string {
-                self.string_byte(byte);
-            } else if !byte.is_ascii_whitespace() {
-                self.nest(byte);
-                self.last = byte;
-            }
-            out.push(byte);
-            at = at.saturating_add(1);
-        }
-        out
-    }
-
-    /// Open a string, tagging it when `open` says so. Returns the input bytes consumed.
-    fn quote(&mut self, open: &Open, out: &mut Vec<u8>) -> usize {
-        self.in_string = true;
-        self.current.clear();
-        out.push(b'"');
-        match open {
-            &Open::Tag(prefix) => {
-                out.extend_from_slice(prefix);
-                out.extend_from_slice(&self.tag);
-                prefix.len().saturating_add(1)
-            },
-            Open::Wait | Open::Plain => 1,
-        }
-    }
-
     /// Follow one byte inside a string.
     fn string_byte(&mut self, byte: u8) {
         if self.escaped {
@@ -383,28 +469,31 @@ impl Tagger {
         } else if byte == b'"' {
             self.in_string = false;
             self.last = b'"';
-            self.key = (self.current.len() <= KEY_LIMIT).then(|| std::mem::take(&mut self.current));
+            self.key = Some(self.current);
             return;
         }
-        if self.current.len() <= KEY_LIMIT {
-            self.current.push(byte);
-        }
+        self.current.push(byte);
     }
 
     /// What to do with a string that opens before `after`.
     fn open(&self, after: &[u8], end: bool) -> Open {
         let own = self.depth > 0 && self.own_depth == self.depth;
-        let is_id_value = own && self.last == b':' && self.key.as_deref().is_some_and(|key| ID_KEYS.contains(&key));
+        let is_id_value = own
+            && self.last == b':'
+            && self
+                .key
+                .as_ref()
+                .and_then(Short::get)
+                .is_some_and(|key| ID_KEYS.contains(&key));
         if !is_id_value {
             return Open::Plain;
         }
-        for prefix in PREFIXES.map(str::as_bytes) {
-            let tagged = [prefix, &self.tag].concat();
+        for (prefix, tagged) in PREFIXES.iter().zip(&self.tagged) {
             // Wait until the bytes can tell an untagged id from one already tagged.
             if !end && after.len() < tagged.len() && tagged.starts_with(after) {
                 return Open::Wait;
             }
-            if after.starts_with(prefix) && !after.starts_with(&tagged) {
+            if after.starts_with(prefix.as_bytes()) && !after.starts_with(tagged) {
                 return Open::Tag(prefix);
             }
         }
@@ -417,7 +506,7 @@ enum Open {
     /// Too few bytes yet to decide.
     Wait,
     /// An untagged id value with this prefix: tag it.
-    Tag(&'static [u8]),
+    Tag(&'static str),
     /// Any other string.
     Plain,
 }
@@ -539,7 +628,7 @@ mod tests {
     fn the_body_loses_its_tags_but_user_text_keeps_them() {
         let body = t(r#"{"input":"I saw \"resp_east.a1\" earlier","previous_response_id":"resp_east.a1"}"#);
         let ((site, _), stripped) = pinned_body(body.as_bytes(), None).unwrap();
-        assert_eq!(site, "east");
+        assert_eq!(&*site, "east");
         assert_eq!(
             String::from_utf8(stripped).unwrap(),
             t(r#"{"input":"I saw \"resp_east.a1\" earlier","previous_response_id":"resp_a1"}"#)
@@ -550,23 +639,27 @@ mod tests {
     fn an_escaped_id_is_decoded_and_a_conversation_object_stripped() {
         let body = t(r#"{"previous_response_id":"resp_east.a1","conversation":{"id":"conv_east.c1"}}"#);
         let ((site, _), stripped) = pinned_body(body.as_bytes(), None).unwrap();
-        assert_eq!(site, "east");
+        assert_eq!(&*site, "east");
         assert_eq!(
             String::from_utf8(stripped).unwrap(),
             r#"{"previous_response_id":"resp_a1","conversation":{"id":"conv_c1"}}"#
         );
         let by_string = t(r#"{"input":"x","conversation":"conv_west.c9"}"#);
-        assert_eq!(pinned_body(by_string.as_bytes(), None).unwrap().0.0, "west");
+        assert_eq!(&*pinned_body(by_string.as_bytes(), None).unwrap().0.0, "west");
         assert!(pinned_body(br#"{"input":"x","previous_response_id":"resp_a1"}"#, None).is_none());
     }
 
     fn tag_all(site: &str, body: &[u8], split: usize) -> String {
         let mut tagger = Tagger::new(tag(site, "pool", None));
         let mut out = Vec::new();
+        let mut take = |chunk: &[u8], pushed: Pushed| match pushed {
+            Pushed::Unchanged => out.extend_from_slice(chunk),
+            Pushed::Replaced(bytes) => out.extend_from_slice(&bytes),
+        };
         for chunk in body.chunks(split.max(1)) {
-            out.extend(tagger.push(chunk, false));
+            take(chunk, tagger.push(chunk, false));
         }
-        out.extend(tagger.push(&[], true));
+        take(&[], tagger.push(&[], true));
         String::from_utf8(out).unwrap()
     }
 
@@ -623,6 +716,21 @@ mod tests {
         assert_eq!(
             tag_all("east", t(r#"{"id":"resp_east.a1"}"#).as_bytes(), 3),
             t(r#"{"id":"resp_east.a1"}"#)
+        );
+    }
+
+    #[test]
+    fn a_chunk_with_nothing_to_tag_is_sent_as_it_is() {
+        let mut tagger = Tagger::new(tag("east", "pool", None));
+        assert_eq!(tagger.push(br#"data: {"delta":"resp_q"}"#, false), Pushed::Unchanged);
+        assert_eq!(
+            tagger.push(br#"{"id":"re"#, false),
+            Pushed::Replaced(Bytes::from_static(br#"{"id":"#)),
+            "a possible prefix is held back"
+        );
+        assert_eq!(
+            tagger.push(br#"sp_a1"}"#, true),
+            Pushed::Replaced(Bytes::from(t(r#""resp_east.a1"}"#)))
         );
     }
 
