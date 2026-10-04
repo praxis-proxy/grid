@@ -18,6 +18,7 @@ use praxis_filter::FilterError;
 
 use crate::{
     descriptor::{RouteCandidate, validate_candidates, validate_local_site},
+    prefix::PrefixAffinity,
     serving::{GridServingConfig, PeerServingConfig, validate_peer},
     snapshot::RouteSnapshot,
 };
@@ -127,6 +128,9 @@ pub(crate) struct Control {
 
     /// Builds and spawns a peer's poller.
     start: StartPeer,
+
+    /// The prefix index and affinity settings, applied with each config.
+    affinity: Arc<PrefixAffinity>,
 }
 
 impl Control {
@@ -148,12 +152,30 @@ impl Control {
             applied: None,
             identity: None,
             start,
+            affinity: Arc::default(),
         })
     }
 
     /// The snapshot the filter reads.
     pub(crate) fn snapshot(&self) -> Arc<ArcSwap<RouteSnapshot>> {
         Arc::clone(&self.snapshot)
+    }
+
+    /// The prefix index and affinity settings the route filter reads.
+    pub(crate) fn affinity(&self) -> Arc<PrefixAffinity> {
+        Arc::clone(&self.affinity)
+    }
+
+    /// Make `config` the running one: its identity, its affinity settings, and only its clusters' prefixes.
+    fn adopt(&mut self, config: &GridServingConfig, identity: [u8; 32]) {
+        let clusters: Vec<Arc<str>> = config
+            .candidates
+            .iter()
+            .map(|candidate| Arc::from(candidate.cluster.as_str()))
+            .collect();
+        self.affinity.apply(config.prefix_affinity, &clusters);
+        self.applied = Some(config.clone());
+        self.identity = Some(identity);
     }
 
     /// Validate `config` fully, then swap it in. `None` when already applied.
@@ -195,8 +217,7 @@ impl Control {
         // The reload stands and its topology is published: only now may the new pollers write,
         // so their first refresh orders the new topology. Committing a kept poller is a no-op.
         self.peers.values().for_each(|running| running.handle.commit());
-        self.applied = Some(config.clone());
-        self.identity = Some(identity);
+        self.adopt(config, identity);
         Ok(Some(outcome))
     }
 
@@ -284,6 +305,10 @@ impl Control {
 /// The topology of `config`, refusing what no retry can fix: a bad candidate, peer, or duplicate site.
 fn validate_config(config: &GridServingConfig) -> Result<Topology, FilterError> {
     let topology = Topology::from_config(config)?;
+    config
+        .prefix_affinity
+        .validate()
+        .map_err(|error| -> FilterError { error.into() })?;
     let mut sites = std::collections::HashSet::with_capacity(config.peers.len());
     for peer in &config.peers {
         validate_peer(peer)?;
@@ -631,6 +656,7 @@ mod tests {
             load_window_ms: 30_000,
             candidates: sites.iter().map(|site| candidate(site)).collect(),
             peers: sites.iter().map(|site| peer(site)).collect(),
+            prefix_affinity: crate::prefix::AffinitySettings::default(),
         }
     }
 

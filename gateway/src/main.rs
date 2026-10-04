@@ -77,7 +77,7 @@ fn start_grid_routing(
 ) -> Result<ai_grid_filters::GridRuntime, praxis_filter::FilterError> {
     let config = ai_grid_filters::load_serving_config(path)?;
     let mut runtime = ai_grid_filters::spawn_grid_routing(&config)?;
-    ai_grid_filters::register_grid_filters(registry, runtime.snapshot())?;
+    ai_grid_filters::register_grid_filters(registry, runtime.snapshot(), runtime.affinity())?;
     // The operator rewrites the file on membership and topology changes.
     runtime
         .watch(path, SERVING_RELOAD_INTERVAL)

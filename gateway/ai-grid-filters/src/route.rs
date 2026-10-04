@@ -4,16 +4,29 @@
 //! the current snapshot, and sets `ctx.cluster` for the downstream load
 //! balancer. Selection is `select_admitted` over a pre-ordered list. The
 //! ordering by live load happens off the request path in `snapshot`.
+//!
+//! Among two or more admitted candidates, prefix affinity first narrows to the
+//! sites holding the request's prompt, unless their queue outweighs the match.
+//! A request naming a stored response or conversation goes to the site that
+//! stored it.
 
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
-use praxis_filter::{FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection, parse_filter_config};
+use bytes::Bytes;
+use praxis_filter::{
+    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection, parse_filter_config,
+};
 use serde::Deserialize;
 
 use crate::{
     descriptor::{AdmissionState, CapabilityKind, RouteCandidate, validate_model_header},
+    pin::{self, Collection, StatePath, Tagger},
+    prefix::{self, Affinity, AffinitySettings, Api, PrefixAffinity, PrefixKeys, QueueGate, Site},
     snapshot::RouteSnapshot,
 };
 
@@ -44,6 +57,12 @@ pub(crate) struct GridSiteRouteFilter {
 
     /// Header the request carries the model name in.
     model_header: http::header::HeaderName,
+
+    /// The replica's prefix index and the live affinity settings.
+    affinity: Arc<PrefixAffinity>,
+
+    /// Counts requests, so each draws its own exploration turn.
+    turn: AtomicUsize,
 }
 
 impl GridSiteRouteFilter {
@@ -58,10 +77,161 @@ impl GridSiteRouteFilter {
     pub(crate) fn from_config(
         config: &serde_yaml::Value,
         snapshot: Arc<ArcSwap<RouteSnapshot>>,
+        affinity: Arc<PrefixAffinity>,
     ) -> Result<Box<dyn HttpFilter>, FilterError> {
         let cfg: GridSiteRouteConfig = parse_filter_config("grid_site_route", config)?;
         let model_header = validate_model_header(&cfg.model_header)?;
-        Ok(Box::new(Self { snapshot, model_header }))
+        Ok(Box::new(Self {
+            snapshot,
+            model_header,
+            affinity,
+            turn: AtomicUsize::new(0),
+        }))
+    }
+
+    /// The candidate for `model`: the front admitted one, or among two or more,
+    /// the front one affinity keeps.
+    fn choose<'snap>(
+        &self,
+        snapshot: &'snap RouteSnapshot,
+        model: &str,
+        keys: Option<&PrefixKeys>,
+    ) -> Option<&'snap RouteCandidate> {
+        let settings = self.affinity.settings.load();
+        let front = select_admitted(&snapshot.candidates, CapabilityKind::InferenceModel, model);
+        if !settings.enabled {
+            return front;
+        }
+        let admitted: Vec<(&RouteCandidate, f64)> = snapshot
+            .candidates
+            .iter()
+            .zip(&snapshot.loads)
+            .filter(|(candidate, _)| admits(candidate, CapabilityKind::InferenceModel, model))
+            .map(|(candidate, load)| (candidate, *load))
+            .collect();
+        // With one site there is nothing to prefer, and no outcome to count.
+        if admitted.len() < 2 {
+            return front;
+        }
+        self.prefer(&admitted, keys, &settings)
+    }
+
+    /// The front of `admitted`, least loaded first, that affinity keeps for `keys`.
+    fn prefer<'snap>(
+        &self,
+        admitted: &[(&'snap RouteCandidate, f64)],
+        keys: Option<&PrefixKeys>,
+        settings: &AffinitySettings,
+    ) -> Option<&'snap RouteCandidate> {
+        let affinity = Affinity {
+            index: &self.affinity.index,
+            keys,
+            settings,
+            turn: self.turn.fetch_add(1, Ordering::Relaxed),
+        };
+        let sites: Vec<Site<'_>> = admitted
+            .iter()
+            .map(|(candidate, queue)| Site {
+                cluster: &candidate.cluster,
+                queue: *queue,
+            })
+            .collect();
+        let mut keep = vec![true; sites.len()];
+        let gate = QueueGate {
+            queued_request_seconds: settings.queued_request_seconds,
+        };
+        affinity.narrow(&sites, &mut keep, &gate).record();
+        admitted
+            .iter()
+            .zip(keep)
+            .find_map(|((candidate, _), kept)| kept.then_some(*candidate))
+    }
+
+    /// Route a request that names stored state to the site that stored it.
+    ///
+    /// `None` for a request that names none. A site no longer in the grid gets
+    /// 404, since the state lives only there. One that admits no new request now
+    /// gets 503.
+    fn pin(&self, ctx: &mut HttpFilterContext<'_>, model: Option<&str>) -> Option<FilterAction> {
+        let snapshot = self.snapshot.load();
+        let (site, rewrite) = match pinned_site(ctx, &snapshot)? {
+            Ok(pinned) => pinned,
+            Err(answer) => return Some(answer),
+        };
+        let candidate = match pinned_target(&snapshot, site.as_deref(), model) {
+            Target::Found(candidate) => candidate,
+            Target::Gone => {
+                tracing::debug!(site = ?site, "grid_site_route: the site holding the state left the grid");
+                return Some(FilterAction::Reject(Rejection::status(404)));
+            },
+            Target::Unavailable => {
+                tracing::debug!(site = ?site, "grid_site_route: the site holding the state admits no new request");
+                return Some(FilterAction::Reject(
+                    Rejection::status(503).with_header("retry-after", RETRY_AFTER_SECS),
+                ));
+            },
+        };
+        let cluster = Arc::clone(&candidate.cluster);
+        with_state(ctx, |state| {
+            state.responses = true;
+            state.site = Some(Arc::clone(&candidate.site));
+        });
+        ctx.cluster = Some(cluster);
+        ctx.rewritten_path = rewrite.or_else(|| ctx.rewritten_path.take());
+        // Ids are tagged in the body, so it must come back uncompressed.
+        ctx.request_headers_to_remove.push(http::header::ACCEPT_ENCODING);
+        Some(FilterAction::Continue)
+    }
+
+    /// Send the request to `candidate`, recording its prefix there for the response to confirm or withdraw.
+    fn route(&self, ctx: &mut HttpFilterContext<'_>, candidate: &RouteCandidate, keys: Option<PrefixKeys>) {
+        let mut responses = false;
+        with_state(ctx, |state| {
+            responses = state.responses;
+            state.site = Some(Arc::clone(&candidate.site));
+            if let Some(keys) = keys {
+                self.affinity.index.record(&keys, &candidate.cluster);
+                state.recorded = Some((keys, Arc::clone(&candidate.cluster)));
+            }
+        });
+        if responses {
+            // Ids are tagged in the body, so it must come back uncompressed.
+            ctx.request_headers_to_remove.push(http::header::ACCEPT_ENCODING);
+        }
+        ctx.cluster = Some(Arc::clone(&candidate.cluster));
+    }
+
+    /// Confirm or withdraw the recorded prefix by the response status, and start
+    /// tagging a Responses API answer's ids with the site that served it.
+    fn settle(&self, ctx: &mut HttpFilterContext<'_>) {
+        let status = ctx.response_header.as_deref().map(|response| response.status);
+        let success = status.is_some_and(|status| status.is_success());
+        let refused =
+            status.is_some_and(|status| status == http::StatusCode::TOO_MANY_REQUESTS || status.is_server_error());
+        let Some(state) = ctx.get_filter_state_mut::<RouteState>() else {
+            return;
+        };
+        // A success means the site took the request, not that it cached the prompt yet:
+        // headers can precede scheduling. A site that refused or failed loses the prefix.
+        if let Some((keys, cluster)) = state.recorded.take() {
+            if success {
+                self.affinity.index.confirm(&keys, &cluster);
+            } else if refused {
+                self.affinity.index.evict(&keys, &cluster);
+            } else {
+                self.affinity.index.forget(&keys, &cluster);
+            }
+        }
+        let tag = (state.responses && success)
+            .then(|| state.site.as_ref().map(|site| Tagger::new(site)))
+            .flatten();
+        let tagging = tag.is_some();
+        state.tagger = tag;
+        if let (true, Some(response)) = (tagging, ctx.response_header.as_mut()) {
+            // Tagging lengthens the body, so the length is no longer known up front.
+            response.headers.remove(http::header::CONTENT_LENGTH);
+            ctx.response_headers_modified = true;
+        }
     }
 }
 
@@ -75,31 +245,217 @@ impl HttpFilter for GridSiteRouteFilter {
         true
     }
 
+    fn request_body_access(&self) -> BodyAccess {
+        // Write, to strip the site tag from a stored-state id.
+        BodyAccess::ReadWrite
+    }
+
+    fn request_body_mode(&self) -> BodyMode {
+        BodyMode::StreamBuffer {
+            max_bytes: Some(BODY_LIMIT),
+        }
+    }
+
+    fn needs_request_context(&self) -> bool {
+        true
+    }
+
+    fn response_body_access(&self) -> BodyAccess {
+        BodyAccess::ReadWrite
+    }
+
+    async fn on_request_body(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        body: &mut Option<Bytes>,
+        end_of_stream: bool,
+    ) -> Result<FilterAction, FilterError> {
+        if end_of_stream {
+            let enabled = self.affinity.settings.load().enabled;
+            let state = read_body(ctx.request.uri.path(), body, enabled);
+            ctx.insert_filter_state(state);
+        }
+        Ok(FilterAction::Continue)
+    }
+
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         // An earlier cluster-selecting filter wins; never override its choice.
         if ctx.cluster.is_some() {
             return Ok(FilterAction::Continue);
         }
-        // Borrow the model header out of *ctx.request; that field is disjoint
-        // from the ctx.cluster write below, so no owned copy is needed.
-        let Some(model) = ctx
-            .request
+        // A copy of the request reference, so the model outlives writes to ctx.
+        let request = ctx.request;
+        let model = request
             .headers
             .get(&self.model_header)
-            .and_then(|value| value.to_str().ok())
-        else {
+            .and_then(|value| value.to_str().ok());
+        if let Some(action) = self.pin(ctx, model) {
+            return Ok(action);
+        }
+        let Some(model) = model else {
             // No model header: not ours to route, leave it for the next filter.
             return Ok(FilterAction::Continue);
         };
 
         let snapshot = self.snapshot.load();
-        let Some(candidate) = select_admitted(&snapshot.candidates, CapabilityKind::InferenceModel, model) else {
+        let keys = ctx
+            .get_filter_state_mut::<RouteState>()
+            .and_then(|state| state.keys.take())
+            .map(|keys| keys.for_model(model));
+        let Some(candidate) = self.choose(&snapshot, model, keys.as_ref()) else {
             tracing::debug!(model = %model, "grid_site_route: no admitted candidate");
             return Ok(FilterAction::Reject(Rejection::status(404)));
         };
-        ctx.cluster = Some(Arc::clone(&candidate.cluster));
+        self.route(ctx, candidate, keys);
         Ok(FilterAction::Continue)
     }
+
+    async fn on_response(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+        self.settle(ctx);
+        Ok(FilterAction::Continue)
+    }
+
+    fn on_response_body(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        body: &mut Option<Bytes>,
+        end_of_stream: bool,
+    ) -> Result<FilterAction, FilterError> {
+        if let Some(tagger) = ctx
+            .get_filter_state_mut::<RouteState>()
+            .and_then(|state| state.tagger.as_mut())
+        {
+            let tagged = tagger.push(body.as_deref().unwrap_or_default(), end_of_stream);
+            *body = (!tagged.is_empty()).then(|| Bytes::from(tagged));
+        }
+        Ok(FilterAction::Continue)
+    }
+}
+
+/// Most of a request body the filter buffers to read its prompt, as `model_to_header` does.
+const BODY_LIMIT: usize = 10 << 20;
+
+/// Seconds a client should wait before retrying a request pinned to a site that admits none now.
+const RETRY_AFTER_SECS: &str = "5";
+
+/// What the request body says: its prefix keys when `affinity` is on, or the
+/// site a stored response pins it to.
+fn read_body(path: &str, body: &mut Option<Bytes>, affinity: bool) -> RouteState {
+    let mut state = RouteState::default();
+    let Some(bytes) = body.as_ref() else {
+        return state;
+    };
+    if pin::state_path(path) == Some(StatePath::Create(Collection::Responses)) {
+        state.responses = true;
+        if let Some((site, stripped)) = pin::pinned_body(bytes) {
+            *body = Some(Bytes::from(stripped));
+            state.pinned = Some(Arc::from(site));
+            return state;
+        }
+    }
+    state.keys = Api::from_path(path)
+        .filter(|_| affinity)
+        .and_then(|api| prefix::prefix_keys(api, bytes));
+    state
+}
+
+/// This filter's per-request state. Praxis keeps one state per filter, so
+/// everything the response needs lives here.
+#[derive(Debug, Default)]
+struct RouteState {
+    /// The site the request went to, for tagging stored-state ids.
+    site: Option<Arc<str>>,
+    /// The prompt's keys, before the model is folded in.
+    keys: Option<PrefixKeys>,
+    /// The keys recorded at the chosen cluster, for the response to confirm or withdraw.
+    recorded: Option<(PrefixKeys, Arc<str>)>,
+    /// The site a stored response pins the request to.
+    pinned: Option<Arc<str>>,
+    /// Whether the answer carries Responses API ids to tag.
+    responses: bool,
+    /// Tags the answer's ids with the site that served it.
+    tagger: Option<Tagger>,
+}
+
+/// Run `change` on this request's state, created on first use.
+fn with_state(ctx: &mut HttpFilterContext<'_>, change: impl FnOnce(&mut RouteState)) {
+    if ctx.get_filter_state::<RouteState>().is_none() {
+        ctx.insert_filter_state(RouteState::default());
+    }
+    if let Some(state) = ctx.get_filter_state_mut::<RouteState>() {
+        change(state);
+    }
+}
+
+/// The site a request's stored state pins it to, and the path to send, or the
+/// answer when the path names an id with no site. A new conversation pins to
+/// no site, `None` inside, when the local site cannot take it, so it goes to
+/// the front site that can. `None` outside for a request naming no stored state.
+#[expect(clippy::type_complexity, reason = "one private call site")]
+fn pinned_site(
+    ctx: &HttpFilterContext<'_>,
+    snapshot: &RouteSnapshot,
+) -> Option<Result<(Option<Arc<str>>, Option<String>), FilterAction>> {
+    match pin::state_path(ctx.request.uri.path()) {
+        Some(StatePath::Stored { collection, id, rest }) => Some(pin::untag(id).map_or_else(
+            || {
+                tracing::debug!("grid_site_route: a stored id with no site tag");
+                Err(FilterAction::Reject(Rejection::status(404)))
+            },
+            |pinned| {
+                let rewrite = pin::upstream_path(collection, &pinned.upstream, rest);
+                Ok((Some(Arc::from(pinned.site)), Some(rewrite)))
+            },
+        )),
+        // A new conversation has no model to route by: keep it local when the local site can take it.
+        Some(StatePath::Create(Collection::Conversations)) => {
+            let local = pinned_target(snapshot, Some(&snapshot.local_site), None)
+                .found()
+                .is_some();
+            Some(Ok((local.then(|| Arc::clone(&snapshot.local_site)), None)))
+        },
+        _ => Some(Ok((Some(ctx.get_filter_state::<RouteState>()?.pinned.clone()?), None))),
+    }
+}
+
+/// Where a pinned request can go.
+enum Target<'snap> {
+    /// A candidate at the site that admits it.
+    Found(&'snap RouteCandidate),
+    /// The site serves nothing that matches: it left the grid.
+    Gone,
+    /// The site is in the grid but admits no new request now.
+    Unavailable,
+}
+
+impl<'snap> Target<'snap> {
+    /// The candidate, when found.
+    fn found(self) -> Option<&'snap RouteCandidate> {
+        match self {
+            Self::Found(candidate) => Some(candidate),
+            Self::Gone | Self::Unavailable => None,
+        }
+    }
+}
+
+/// The front candidate at `site`, any site when `None`, that admits a pinned
+/// request, for `model` when named.
+fn pinned_target<'snap>(snapshot: &'snap RouteSnapshot, site: Option<&str>, model: Option<&str>) -> Target<'snap> {
+    let mut at_site = snapshot
+        .candidates
+        .iter()
+        .filter(|candidate| {
+            site.is_none_or(|site| &*candidate.site == site)
+                && candidate.kind == CapabilityKind::InferenceModel
+                && model.is_none_or(|model| &*candidate.name == model)
+        })
+        .peekable();
+    if at_site.peek().is_none() {
+        return Target::Gone;
+    }
+    at_site
+        .find(|candidate| is_admitted_for_new_request(candidate.admission_state))
+        .map_or(Target::Unavailable, Target::Found)
 }
 
 /// The front candidate matching `kind` and `name` that admits new requests.
@@ -112,9 +468,12 @@ pub(crate) fn select_admitted<'list>(
     kind: CapabilityKind,
     name: &str,
 ) -> Option<&'list RouteCandidate> {
-    candidates.iter().find(|candidate| {
-        candidate.kind == kind && &*candidate.name == name && is_admitted_for_new_request(candidate.admission_state)
-    })
+    candidates.iter().find(|candidate| admits(candidate, kind, name))
+}
+
+/// Whether `candidate` serves `kind` `name` and admits a new request.
+fn admits(candidate: &RouteCandidate, kind: CapabilityKind, name: &str) -> bool {
+    candidate.kind == kind && &*candidate.name == name && is_admitted_for_new_request(candidate.admission_state)
 }
 
 /// Whether a candidate in this admission state accepts a new request.
@@ -149,6 +508,125 @@ mod tests {
         .unwrap();
         candidates[0].admission_state = admission;
         candidates
+    }
+
+    /// A filter over `snapshot` with affinity at `settings`.
+    fn filter(snapshot: RouteSnapshot, settings: AffinitySettings) -> GridSiteRouteFilter {
+        let affinity = PrefixAffinity::default();
+        affinity.settings.store(Arc::new(settings));
+        GridSiteRouteFilter {
+            snapshot: Arc::new(ArcSwap::from_pointee(snapshot)),
+            model_header: http::header::HeaderName::from_static("x-model"),
+            affinity: Arc::new(affinity),
+            turn: AtomicUsize::new(0),
+        }
+    }
+
+    /// `llama` at each `(site, queue, admission)`, ordered least-loaded first as the snapshot is.
+    fn queued(sites: &[(&str, f64, AdmissionState)]) -> RouteSnapshot {
+        let mut sorted = sites.to_vec();
+        sorted.sort_by(|left, right| left.1.total_cmp(&right.1));
+        let mut candidates = validate_candidates(
+            sorted
+                .iter()
+                .map(|(site, ..)| CandidateConfig {
+                    cluster: format!("pool-{site}"),
+                    credential: None,
+                    fresh: true,
+                    kind: CapabilityKind::InferenceModel,
+                    name: "llama".to_owned(),
+                    site: (*site).to_owned(),
+                })
+                .collect(),
+        )
+        .unwrap();
+        for (candidate, (_, _, admission)) in candidates.iter_mut().zip(&sorted) {
+            candidate.admission_state = *admission;
+        }
+        RouteSnapshot {
+            candidates,
+            loads: sorted.iter().map(|(_, queue, _)| *queue).collect(),
+            local_site: Arc::from("a"),
+        }
+    }
+
+    /// Affinity on, with no exploration so outcomes are deterministic.
+    fn steady() -> AffinitySettings {
+        AffinitySettings {
+            exploration: 0.0,
+            ..AffinitySettings::default()
+        }
+    }
+
+    /// The site `filter` picks for a request whose prompt site `a` holds, as 40 keys.
+    fn pick_for_a_prompt(filter: &GridSiteRouteFilter) -> Option<String> {
+        let keys = PrefixKeys::from_keys((0..40).collect());
+        filter.affinity.index.confirm(&keys, &Arc::from("pool-a"));
+        let snapshot = filter.snapshot.load();
+        filter
+            .choose(&snapshot, "llama", Some(&keys))
+            .map(|candidate| candidate.site.to_string())
+    }
+
+    const OPEN: AdmissionState = AdmissionState::NewAndExisting;
+
+    #[test]
+    fn a_conversation_stays_on_the_site_holding_its_prompt() {
+        let filter = filter(queued(&[("a", 0.1, OPEN), ("b", 0.0, OPEN)]), steady());
+        assert_eq!(
+            pick_for_a_prompt(&filter).as_deref(),
+            Some("a"),
+            "b is lighter but holds nothing"
+        );
+    }
+
+    #[test]
+    fn a_much_deeper_queue_gives_way_to_the_lighter_site() {
+        // 40 keys save 0.256s of prefill, 0.128 of a queued request at 2s each.
+        let filter = filter(queued(&[("a", 1.0, OPEN), ("b", 0.0, OPEN)]), steady());
+        assert_eq!(pick_for_a_prompt(&filter).as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn a_site_that_admits_nothing_never_takes_its_conversations() {
+        let filter = filter(
+            queued(&[("a", 0.0, AdmissionState::Excluded), ("b", 0.5, OPEN), ("c", 0.6, OPEN)]),
+            steady(),
+        );
+        assert_eq!(pick_for_a_prompt(&filter).as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn affinity_off_routes_on_load_alone() {
+        let off = AffinitySettings {
+            enabled: false,
+            ..steady()
+        };
+        let filter = filter(queued(&[("a", 0.1, OPEN), ("b", 0.0, OPEN)]), off);
+        assert_eq!(pick_for_a_prompt(&filter).as_deref(), Some("b"));
+        let mut body = Some(Bytes::from_static(br#"{"messages":[{"role":"user","content":"hi"}]}"#));
+        assert!(
+            read_body("/v1/chat/completions", &mut body, false).keys.is_none(),
+            "no prompt is read"
+        );
+    }
+
+    #[test]
+    fn a_pinned_site_that_left_is_gone_and_one_that_admits_nothing_is_unavailable() {
+        let snapshot = queued(&[("a", 0.0, OPEN), ("b", 0.0, AdmissionState::Excluded)]);
+        assert!(matches!(
+            pinned_target(&snapshot, Some("a"), Some("llama")),
+            Target::Found(candidate) if &*candidate.site == "a"
+        ));
+        assert!(matches!(
+            pinned_target(&snapshot, Some("b"), Some("llama")),
+            Target::Unavailable
+        ));
+        assert!(matches!(pinned_target(&snapshot, Some("gone"), None), Target::Gone));
+        assert!(matches!(
+            pinned_target(&snapshot, Some("a"), Some("granite")),
+            Target::Gone
+        ));
     }
 
     #[test]

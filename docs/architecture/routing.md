@@ -939,10 +939,10 @@ there is no usable last-known-good sample.
 
 ### KV-cache affinity
 
-Routing decisions based on KV-cache affinity — routing requests to backends
-that already hold relevant KV-cache entries — are not implemented in the current
-operator.  The `kv_cache_utilization` signal influences scoring but does not
-implement affinity-aware routing.
+The operator's scoring does not route by KV-cache affinity. The
+`kv_cache_utilization` signal influences scoring but does not implement
+affinity-aware routing. The grid gateway's `grid_site_route` filter prefers the
+site holding a request's prompt; see [Prefix Affinity](prefix-affinity.md).
 
 ## When the routing overlay regenerates
 

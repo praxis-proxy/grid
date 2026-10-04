@@ -183,7 +183,7 @@ pub(crate) fn validate_candidates(raw: Vec<CandidateConfig>) -> Result<Vec<Route
 
     for (index, cand) in raw.into_iter().enumerate() {
         validate_name(&format!("candidates[{index}].name"), &cand.name)?;
-        validate_name(&format!("candidates[{index}].site"), &cand.site)?;
+        validate_site(&format!("candidates[{index}].site"), &cand.site)?;
         validate_name(&format!("candidates[{index}].cluster"), &cand.cluster)?;
         validate_credential(index, cand.credential.as_ref())?;
 
@@ -267,7 +267,29 @@ pub(crate) fn validate_model_header(raw: &str) -> Result<http::header::HeaderNam
 ///
 /// Returns [`FilterError`] if blank or oversized.
 pub(crate) fn validate_local_site(value: &str) -> Result<(), FilterError> {
-    validate_name("local_site", value)
+    validate_site("local_site", value)
+}
+
+/// Validate a site name as a DNS-1123 label, as the operator names sites.
+///
+/// Site names go into stored-state ids and request paths, so a `.`, `/`, quote
+/// or backslash in one would break them.
+fn validate_site(field: &str, value: &str) -> Result<(), FilterError> {
+    let bytes = value.as_bytes();
+    let edge = |byte: Option<&u8>| byte.is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit());
+    let label = (1..=63).contains(&bytes.len())
+        && edge(bytes.first())
+        && edge(bytes.last())
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-');
+    if !label {
+        return Err(format!(
+            "grid: {field} must be a DNS-1123 label (lowercase letters, digits and '-', at most 63), got {value:?}"
+        )
+        .into());
+    }
+    Ok(())
 }
 
 /// Validate a bounded, non-blank identifier.
@@ -377,6 +399,26 @@ mod tests {
     fn reserved_prefix_model_header_rejected() {
         let err = validate_model_header("x-praxis-model").expect_err("should fail");
         assert!(err.to_string().contains("reserved"), "{err}");
+    }
+
+    #[test]
+    fn a_site_must_be_a_dns_label() {
+        for good in ["hub", "site-a", "a1", "x"] {
+            assert!(validate_site("site", good).is_ok(), "{good}");
+        }
+        for bad in [
+            "",
+            "site.a",
+            "site/a",
+            "Site",
+            "-a",
+            "a-",
+            "si\"te",
+            "a\\b",
+            &"a".repeat(64),
+        ] {
+            assert!(validate_site("site", bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

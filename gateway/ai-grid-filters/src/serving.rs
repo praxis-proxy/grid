@@ -23,6 +23,7 @@ use serde::Deserialize;
 use crate::{
     control::{Control, ReloadOutcome, Watcher, watch},
     descriptor::CandidateConfig,
+    prefix::{AffinitySettings, PrefixAffinity},
     snapshot::RouteSnapshot,
 };
 
@@ -43,7 +44,7 @@ fn default_timeout_ms() -> u64 {
 
 /// The grid serving config the operator writes and the gateway reads directly,
 /// distinct from the praxis data-plane config.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct GridServingConfig {
     /// This gateway's own site.
@@ -60,6 +61,10 @@ pub struct GridServingConfig {
 
     /// Peers to poll for live load.
     pub peers: Vec<PeerServingConfig>,
+
+    /// How strongly a conversation keeps to the site holding its prompt.
+    #[serde(default)]
+    pub prefix_affinity: AffinitySettings,
 }
 
 /// One peer this gateway polls, with the mTLS material to reach it.
@@ -122,9 +127,18 @@ pub struct GridRuntime {
 
     /// The config file watch, stopped on drop.
     watcher: Option<Watcher>,
+
+    /// The prefix index and affinity settings the route filter reads.
+    affinity: Arc<PrefixAffinity>,
 }
 
 impl GridRuntime {
+    /// The prefix index and affinity settings to register the filter over.
+    #[must_use]
+    pub fn affinity(&self) -> Arc<PrefixAffinity> {
+        Arc::clone(&self.affinity)
+    }
+
     /// The shared snapshot to register the filter over.
     #[must_use]
     pub fn snapshot(&self) -> Arc<ArcSwap<RouteSnapshot>> {
@@ -197,6 +211,7 @@ pub(crate) fn start_runtime(
     control.apply(config)?;
     Ok(GridRuntime {
         snapshot: control.snapshot(),
+        affinity: control.affinity(),
         control: Arc::new(Mutex::new(control)),
         watcher: None,
     })

@@ -24,6 +24,9 @@ pub struct RouteSnapshot {
     /// Candidates in priority order. `select_admitted` takes the front match.
     pub candidates: Vec<RouteCandidate>,
 
+    /// Each candidate's windowed worst queue depth, `+inf` when unmeasured, parallel to `candidates`.
+    pub loads: Vec<f64>,
+
     /// This gateway's own site identifier.
     pub local_site: Arc<str>,
 }
@@ -34,7 +37,12 @@ impl RouteSnapshot {
     /// The order is whatever the caller supplies (config order). Used before
     /// any signals exist and as the cold-start fallback.
     pub fn from_static(candidates: Vec<RouteCandidate>, local_site: Arc<str>) -> Self {
-        Self { candidates, local_site }
+        let loads = vec![f64::INFINITY; candidates.len()];
+        Self {
+            candidates,
+            loads,
+            local_site,
+        }
     }
 
     /// Order candidates least-loaded-first from the live store, then wrap them.
@@ -59,9 +67,10 @@ impl RouteSnapshot {
             .map(|candidate| (Self::load_of(store, &candidate, now_ms, window_ms), candidate))
             .collect();
         scored.sort_by(|(left, _), (right, _)| left.total_cmp(right));
-        let ordered = scored.into_iter().map(|(_, candidate)| candidate).collect();
+        let (loads, ordered) = scored.into_iter().unzip();
         Self {
             candidates: ordered,
+            loads,
             local_site,
         }
     }
