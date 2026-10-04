@@ -11,9 +11,11 @@ use std::{io, sync::Arc};
 
 pub use affinity::AffinitySettings;
 pub(crate) use affinity::{Affinity, QueueGate, Site};
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 pub(crate) use index::PrefixIndex;
 use xxhash_rust::xxh64::xxh64;
+
+use crate::pin::TagKey;
 
 /// Bytes of canonical prompt per block, the EPP estimate backend's 64 pseudo-tokens.
 pub(crate) const BLOCK: usize = 256;
@@ -38,6 +40,8 @@ pub struct PrefixAffinity {
     pub(crate) index: PrefixIndex,
     /// The settings from the current serving config.
     pub(crate) settings: ArcSwap<AffinitySettings>,
+    /// The key that authenticates stored-state tags, when the config names one.
+    pub(crate) tag_key: ArcSwapOption<TagKey>,
 }
 
 impl Default for PrefixAffinity {
@@ -45,14 +49,16 @@ impl Default for PrefixAffinity {
         Self {
             index: PrefixIndex::default(),
             settings: ArcSwap::from_pointee(AffinitySettings::default()),
+            tag_key: ArcSwapOption::empty(),
         }
     }
 }
 
 impl PrefixAffinity {
-    /// Take a serving config's settings, and forget clusters it no longer routes to.
-    pub(crate) fn apply(&self, settings: AffinitySettings, clusters: &[Arc<str>]) {
+    /// Take a serving config's settings and tag key, and forget clusters it no longer routes to.
+    pub(crate) fn apply(&self, settings: AffinitySettings, tag_key: Option<TagKey>, clusters: &[Arc<str>]) {
         self.settings.store(Arc::new(settings));
+        self.tag_key.store(tag_key.map(Arc::new));
         self.index.retain(clusters);
     }
 }

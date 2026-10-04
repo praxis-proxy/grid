@@ -50,3 +50,14 @@ pub use verify::{
 pub fn sha256(data: &[u8]) -> [u8; 32] {
     backend::sha256(data)
 }
+
+/// HMAC-SHA256 through the active backend, as [`sha256`] is.
+///
+/// # Panics
+///
+/// Under `fips`, panics if the OpenSSL EVP HMAC fails, since a FIPS-approved MAC
+/// failing means the crypto module is unusable.
+#[must_use]
+pub fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
+    backend::hmac_sha256(key, data)
+}

@@ -25,7 +25,7 @@ use serde::Deserialize;
 
 use crate::{
     descriptor::{AdmissionState, CapabilityKind, RouteCandidate, validate_model_header},
-    pin::{self, Collection, StatePath, Tagger},
+    pin::{self, Collection, StatePath, TagKey, Tagger},
     prefix::{self, Affinity, AffinitySettings, Api, PrefixAffinity, PrefixKeys, QueueGate, Site},
     snapshot::RouteSnapshot,
 };
@@ -154,18 +154,20 @@ impl GridSiteRouteFilter {
     /// gets 503.
     fn pin(&self, ctx: &mut HttpFilterContext<'_>, model: Option<&str>) -> Option<FilterAction> {
         let snapshot = self.snapshot.load();
-        let (site, rewrite) = match pinned_site(ctx, &snapshot)? {
+        let key = self.affinity.tag_key.load();
+        let (holder, rewrite) = match pinned_site(ctx, &snapshot, key.as_deref())? {
             Ok(pinned) => pinned,
             Err(answer) => return Some(answer),
         };
-        let candidate = match pinned_target(&snapshot, site.as_deref(), model) {
+        let site = holder.as_ref().map(|holder| &holder.site);
+        let candidate = match pinned_target(&snapshot, holder.as_ref(), model) {
             Target::Found(candidate) => candidate,
             Target::Gone => {
-                tracing::debug!(site = ?site, "grid_site_route: the site holding the state left the grid");
+                tracing::debug!(site = ?site, "grid_site_route: the cluster holding the state left the grid");
                 return Some(FilterAction::Reject(Rejection::status(404)));
             },
             Target::Unavailable => {
-                tracing::debug!(site = ?site, "grid_site_route: the site holding the state admits no new request");
+                tracing::debug!(site = ?site, "grid_site_route: the cluster holding the state admits no new request");
                 return Some(FilterAction::Reject(
                     Rejection::status(503).with_header("retry-after", RETRY_AFTER_SECS),
                 ));
@@ -174,7 +176,7 @@ impl GridSiteRouteFilter {
         let cluster = Arc::clone(&candidate.cluster);
         with_state(ctx, |state| {
             state.responses = true;
-            state.site = Some(Arc::clone(&candidate.site));
+            state.served = Some((Arc::clone(&candidate.site), Arc::clone(&candidate.cluster)));
         });
         ctx.cluster = Some(cluster);
         ctx.rewritten_path = rewrite.or_else(|| ctx.rewritten_path.take());
@@ -188,7 +190,7 @@ impl GridSiteRouteFilter {
         let mut responses = false;
         with_state(ctx, |state| {
             responses = state.responses;
-            state.site = Some(Arc::clone(&candidate.site));
+            state.served = Some((Arc::clone(&candidate.site), Arc::clone(&candidate.cluster)));
             if let Some(keys) = keys {
                 self.affinity.index.record(&keys, &candidate.cluster);
                 state.recorded = Some((keys, Arc::clone(&candidate.cluster)));
@@ -199,6 +201,16 @@ impl GridSiteRouteFilter {
             ctx.request_headers_to_remove.push(http::header::ACCEPT_ENCODING);
         }
         ctx.cluster = Some(Arc::clone(&candidate.cluster));
+    }
+
+    /// A tagger for the ids of the answer `state` was served by.
+    fn tagger(&self, state: &RouteState) -> Option<Tagger> {
+        let (site, cluster) = state.served.as_ref()?;
+        Some(Tagger::new(pin::tag(
+            site,
+            cluster,
+            self.affinity.tag_key.load().as_deref(),
+        )))
     }
 
     /// Confirm or withdraw the recorded prefix by the response status, and start
@@ -230,7 +242,7 @@ impl GridSiteRouteFilter {
             }
         }
         let tag = (state.responses && success && identity)
-            .then(|| state.site.as_ref().map(|site| Tagger::new(site)))
+            .then(|| self.tagger(state))
             .flatten();
         let tagging = tag.is_some();
         state.tagger = tag;
@@ -279,7 +291,8 @@ impl HttpFilter for GridSiteRouteFilter {
     ) -> Result<FilterAction, FilterError> {
         if end_of_stream {
             let enabled = self.affinity.settings.load().enabled;
-            let state = read_body(ctx.request.uri.path(), body, enabled);
+            let key = self.affinity.tag_key.load();
+            let state = read_body(ctx.request.uri.path(), body, enabled, key.as_deref());
             ctx.insert_filter_state(state);
         }
         Ok(FilterAction::Continue)
@@ -347,16 +360,19 @@ const RETRY_AFTER_SECS: &str = "5";
 
 /// What the request body says: its prefix keys when `affinity` is on, or the
 /// site a stored response pins it to.
-fn read_body(path: &str, body: &mut Option<Bytes>, affinity: bool) -> RouteState {
+fn read_body(path: &str, body: &mut Option<Bytes>, affinity: bool, key: Option<&TagKey>) -> RouteState {
     let mut state = RouteState::default();
     let Some(bytes) = body.as_ref() else {
         return state;
     };
     if pin::state_path(path) == Some(StatePath::Create(Collection::Responses)) {
         state.responses = true;
-        if let Some((site, stripped)) = pin::pinned_body(bytes) {
+        if let Some(((site, mark), stripped)) = pin::pinned_body(bytes, key) {
             *body = Some(Bytes::from(stripped));
-            state.pinned = Some(Arc::from(site));
+            state.pinned = Some(Holder {
+                site: Arc::from(site),
+                mark: Some(mark),
+            });
             return state;
         }
     }
@@ -370,14 +386,14 @@ fn read_body(path: &str, body: &mut Option<Bytes>, affinity: bool) -> RouteState
 /// everything the response needs lives here.
 #[derive(Debug, Default)]
 struct RouteState {
-    /// The site the request went to, for tagging stored-state ids.
-    site: Option<Arc<str>>,
+    /// The site and cluster the request went to, for tagging stored-state ids.
+    served: Option<(Arc<str>, Arc<str>)>,
     /// The prompt's keys, before the model is folded in.
     keys: Option<PrefixKeys>,
     /// The keys recorded at the chosen cluster, for the response to confirm or withdraw.
     recorded: Option<(PrefixKeys, Arc<str>)>,
-    /// The site a stored response pins the request to.
-    pinned: Option<Arc<str>>,
+    /// Where a stored response pins the request.
+    pinned: Option<Holder>,
     /// Whether the answer carries Responses API ids to tag.
     responses: bool,
     /// Tags the answer's ids with the site that served it.
@@ -394,32 +410,48 @@ fn with_state(ctx: &mut HttpFilterContext<'_>, change: impl FnOnce(&mut RouteSta
     }
 }
 
-/// The site a request's stored state pins it to, and the path to send, or the
-/// answer when the path names an id with no site. A new conversation pins to
-/// no site, `None` inside, when the local site cannot take it, so it goes to
-/// the front site that can. `None` outside for a request naming no stored state.
+/// Where stored state lives: its site, and its cluster's mark when an id names one.
+#[derive(Clone, Debug)]
+struct Holder {
+    /// The site.
+    site: Arc<str>,
+    /// The [`pin::cluster_mark`] of the cluster, `None` for any at the site.
+    mark: Option<String>,
+}
+
+/// Where a request's stored state pins it, and the path to send, or the answer
+/// when the path names an id without a valid tag. A new conversation pins
+/// nowhere, `None` inside, when the local site cannot take it, so it goes to the
+/// front site that can. `None` outside for a request naming no stored state.
 #[expect(clippy::type_complexity, reason = "one private call site")]
 fn pinned_site(
     ctx: &HttpFilterContext<'_>,
     snapshot: &RouteSnapshot,
-) -> Option<Result<(Option<Arc<str>>, Option<String>), FilterAction>> {
+    key: Option<&TagKey>,
+) -> Option<Result<(Option<Holder>, Option<String>), FilterAction>> {
     match pin::state_path(ctx.request.uri.path()) {
-        Some(StatePath::Stored { collection, id, rest }) => Some(pin::untag(id).map_or_else(
+        Some(StatePath::Stored { collection, id, rest }) => Some(pin::untag(id, key).map_or_else(
             || {
-                tracing::debug!("grid_site_route: a stored id with no site tag");
+                tracing::debug!("grid_site_route: a stored id without a valid tag");
                 Err(FilterAction::Reject(Rejection::status(404)))
             },
             |pinned| {
                 let rewrite = pin::upstream_path(collection, &pinned.upstream, rest);
-                Ok((Some(Arc::from(pinned.site)), Some(rewrite)))
+                let holder = Holder {
+                    site: Arc::from(pinned.site),
+                    mark: Some(pinned.mark.to_owned()),
+                };
+                Ok((Some(holder), Some(rewrite)))
             },
         )),
         // A new conversation has no model to route by: keep it local when the local site can take it.
         Some(StatePath::Create(Collection::Conversations)) => {
-            let local = pinned_target(snapshot, Some(&snapshot.local_site), None)
-                .found()
-                .is_some();
-            Some(Ok((local.then(|| Arc::clone(&snapshot.local_site)), None)))
+            let local = Holder {
+                site: Arc::clone(&snapshot.local_site),
+                mark: None,
+            };
+            let admits = pinned_target(snapshot, Some(&local), None).found().is_some();
+            Some(Ok((admits.then_some(local), None)))
         },
         _ => Some(Ok((Some(ctx.get_filter_state::<RouteState>()?.pinned.clone()?), None))),
     }
@@ -445,15 +477,20 @@ impl<'snap> Target<'snap> {
     }
 }
 
-/// The front candidate at `site`, any site when `None`, that admits a pinned
+/// The front candidate at `holder`, anywhere when `None`, that admits a pinned
 /// request, for `model` when named.
-fn pinned_target<'snap>(snapshot: &'snap RouteSnapshot, site: Option<&str>, model: Option<&str>) -> Target<'snap> {
+fn pinned_target<'snap>(snapshot: &'snap RouteSnapshot, holder: Option<&Holder>, model: Option<&str>) -> Target<'snap> {
     let mut at_site = snapshot
         .candidates
         .iter()
         .filter(|candidate| {
-            site.is_none_or(|site| &*candidate.site == site)
-                && candidate.kind == CapabilityKind::InferenceModel
+            holder.is_none_or(|holder| {
+                *candidate.site == *holder.site
+                    && holder
+                        .mark
+                        .as_deref()
+                        .is_none_or(|mark| pin::cluster_mark(&candidate.cluster) == mark)
+            }) && candidate.kind == CapabilityKind::InferenceModel
                 && model.is_none_or(|model| &*candidate.name == model)
         })
         .peekable();
@@ -613,26 +650,71 @@ mod tests {
         assert_eq!(pick_for_a_prompt(&filter).as_deref(), Some("b"));
         let mut body = Some(Bytes::from_static(br#"{"messages":[{"role":"user","content":"hi"}]}"#));
         assert!(
-            read_body("/v1/chat/completions", &mut body, false).keys.is_none(),
+            read_body("/v1/chat/completions", &mut body, false, None).keys.is_none(),
             "no prompt is read"
         );
+    }
+
+    /// `site`, at the cluster named `cluster` when given.
+    fn holder(site: &str, cluster: Option<&str>) -> Holder {
+        Holder {
+            site: Arc::from(site),
+            mark: cluster.map(pin::cluster_mark),
+        }
     }
 
     #[test]
     fn a_pinned_site_that_left_is_gone_and_one_that_admits_nothing_is_unavailable() {
         let snapshot = queued(&[("a", 0.0, OPEN), ("b", 0.0, AdmissionState::Excluded)]);
         assert!(matches!(
-            pinned_target(&snapshot, Some("a"), Some("llama")),
+            pinned_target(&snapshot, Some(&holder("a", Some("pool-a"))), Some("llama")),
             Target::Found(candidate) if &*candidate.site == "a"
         ));
         assert!(matches!(
-            pinned_target(&snapshot, Some("b"), Some("llama")),
+            pinned_target(&snapshot, Some(&holder("b", Some("pool-b"))), Some("llama")),
             Target::Unavailable
         ));
-        assert!(matches!(pinned_target(&snapshot, Some("gone"), None), Target::Gone));
         assert!(matches!(
-            pinned_target(&snapshot, Some("a"), Some("granite")),
+            pinned_target(&snapshot, Some(&holder("gone", None)), None),
             Target::Gone
+        ));
+        assert!(matches!(
+            pinned_target(&snapshot, Some(&holder("a", Some("pool-a"))), Some("granite")),
+            Target::Gone
+        ));
+        assert!(
+            matches!(
+                pinned_target(&snapshot, Some(&holder("a", Some("pool-left"))), None),
+                Target::Gone
+            ),
+            "the cluster that stored it left, though the site did not"
+        );
+    }
+
+    #[test]
+    fn a_pin_without_a_model_reaches_the_cluster_that_stored_it() {
+        let mut candidates = validate_candidates(
+            [("llama", "pool-llama"), ("granite", "pool-granite")]
+                .into_iter()
+                .map(|(name, cluster)| CandidateConfig {
+                    cluster: cluster.to_owned(),
+                    credential: None,
+                    fresh: true,
+                    kind: CapabilityKind::InferenceModel,
+                    name: name.to_owned(),
+                    site: "a".to_owned(),
+                })
+                .collect(),
+        )
+        .unwrap();
+        for candidate in &mut candidates {
+            candidate.admission_state = OPEN;
+        }
+        let snapshot = RouteSnapshot::from_static(candidates, Arc::from("a"));
+        let stored = holder("a", Some("pool-granite"));
+        assert!(matches!(
+            pinned_target(&snapshot, Some(&stored), None),
+            Target::Found(candidate) if &*candidate.cluster == "pool-granite"
         ));
     }
 

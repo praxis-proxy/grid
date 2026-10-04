@@ -58,6 +58,24 @@ pub(crate) fn sha256(data: &[u8]) -> [u8; 32] {
     out
 }
 
+/// HMAC-SHA256 through the OpenSSL EVP interface, so a fips host computes it in
+/// the validated provider.
+#[expect(
+    clippy::expect_used,
+    reason = "HMAC-SHA256 is FIPS-approved, so an EVP failure means the crypto module is unusable and the process must fail closed"
+)]
+pub(crate) fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
+    let key = PKey::hmac(key).expect("HMAC key setup failed, so the crypto module is unusable");
+    let mut signer = openssl::sign::Signer::new(MessageDigest::sha256(), &key)
+        .expect("HMAC-SHA256 EVP setup failed, so the crypto module is unusable");
+    let mac = signer
+        .sign_oneshot_to_vec(data)
+        .expect("HMAC-SHA256 EVP failed, so the crypto module is unusable");
+    let mut out = [0_u8; 32];
+    out.copy_from_slice(&mac);
+    out
+}
+
 /// Generate a P-256 key pair through EVP (the FIPS-enforced path).
 fn generate_p256() -> Result<PKey<Private>, BackendError> {
     let mut ctx = PkeyCtx::new_id(Id::EC).map_err(|err| keygen_err(&err))?;
@@ -400,6 +418,14 @@ mod tests {
             "CaMaterial { .. }",
             "the signing key must not appear in a debug rendering"
         );
+    }
+
+    #[test]
+    fn hmac_sha256_matches_rfc_4231() {
+        // RFC 4231 test case 2.
+        let mac = hmac_sha256(b"Jefe", b"what do ya want for nothing?");
+        let hex: String = mac.iter().map(|byte| format!("{byte:02x}")).collect();
+        assert_eq!(hex, "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843");
     }
 
     #[test]

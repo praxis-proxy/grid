@@ -207,6 +207,18 @@ pub(crate) fn verify_message(ca_cert_pem: &str, message: &[u8], signature: &[u8]
         .map_err(|_bad| BackendError::BadSignature)
 }
 
+/// HMAC-SHA256 (pure-Rust; the non-FIPS default path).
+#[expect(
+    clippy::expect_used,
+    reason = "HMAC takes a key of any length, so construction cannot fail"
+)]
+pub(crate) fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
+    use hmac::{Hmac, Mac};
+    let mut mac = <Hmac<sha2::Sha256> as Mac>::new_from_slice(key).expect("HMAC accepts any key length");
+    mac.update(data);
+    mac.finalize().into_bytes().into()
+}
+
 /// SHA-256 digest (pure-Rust; the non-FIPS default path).
 pub(crate) fn sha256(data: &[u8]) -> [u8; 32] {
     use sha2::{Digest as _, Sha256};
@@ -277,6 +289,14 @@ mod tests {
             vec![0x05, 0x00],
         ));
         params.serialize_request(&key).expect("csr").pem().expect("pem")
+    }
+
+    #[test]
+    fn hmac_sha256_matches_rfc_4231() {
+        // RFC 4231 test case 2.
+        let mac = hmac_sha256(b"Jefe", b"what do ya want for nothing?");
+        let hex: String = mac.iter().map(|byte| format!("{byte:02x}")).collect();
+        assert_eq!(hex, "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843");
     }
 
     #[test]

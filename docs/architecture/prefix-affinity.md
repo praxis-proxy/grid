@@ -42,11 +42,19 @@ so a second site learns a shared prompt.
 
 ## Stored responses and conversations
 
-Response and conversation ids leave the gateway tagged with the site that stored them, as
-`resp_<site>.<id>` and `conv_<site>.<id>`. A request naming one goes only to that site, with
-the tag stripped, and is not hashed. A site that left the grid answers 404. A site still in
-the grid that admits no new request answers 503 with `Retry-After: 5`. A new conversation
-stays on the local site when it admits requests. Pinning has no setting and is always on.
+Response and conversation ids leave the gateway tagged with the site and backend cluster
+that stored them, as `resp_<site>.<cluster>.<mac>.<id>` and `conv_<site>.<cluster>.<mac>.<id>`.
+The cluster is an 8-digit hex digest of its name. A request naming a tagged id goes only to
+that cluster, with the tag stripped, and is not hashed. A cluster that left the grid answers
+404. One still in the grid that admits no new request answers 503 with `Retry-After: 5`. A
+new conversation stays on the local site when it admits requests. Pinning is always on.
+
+With `tag_key_path` set, the mac is a 64-bit HMAC-SHA256 of the site and cluster under that
+key, and a tag without a valid mac answers 404, so a client cannot aim a request at a site
+or cluster it was never given. Without a key the mac is empty and any well-formed tag is
+accepted. A pinned request still passes admission, so it reaches only a cluster that could
+serve it anyway. Set a key in production. The gateway replicas of one site share the key
+through a mounted Secret, and a tagged id works only through the gateways holding it.
 
 Site names go into these ids, so the gateway refuses a serving config whose site names are
 not DNS-1123 labels.
@@ -63,6 +71,7 @@ every field has a default.
 | `exploration` | 0.02 | Share of requests that skip affinity. Higher spreads a shared prompt sooner and costs more cache misses. |
 | `prefill_tokens_per_second` | 10000 | Prices the prefill a match saves. Lower makes a match worth more queue. |
 | `queued_request_seconds` | 2 | Seconds one queued request adds to a new request's wait. Lower lets a sticky site queue deeper. |
+| `tag_key_path` | none | A file holding at least 32 bytes that authenticate stored-state tags. Set it in production. A changed file re-applies the config. |
 
 The operator writes no `prefix_affinity` block, so these defaults apply. These values do not
 change: 256-byte blocks and at most 512 keys per request. A 32-block run is always sticky,
@@ -99,3 +108,14 @@ restart. It matches on hashes of the request text, not on engine tokens, so two 
 that render to the same tokens through different templates or JSON escaping do not match.
 It sees only what this gateway routed. The load gate reads queue depth, the signal
 selection orders by. It does not see in-flight work that has not queued.
+
+The prefix index is shared by every client of a replica. A client that sends a guessed
+prompt and sees which site serves it learns whether someone sent that prompt recently.
+A `cache_salt` gives a tenant its own keys. The gateway does not seed keys with a tenant
+identity, since in MaaS mode it has none.
+
+A tagged id carries no tenant. Anyone holding a stored response's id can read, cancel or
+delete it at its site, as with the engine's own store, which keys responses by id alone.
+
+A provider-role gateway forwards only its allowed exact paths, so a stored response held
+at another site cannot be fetched by id through it.

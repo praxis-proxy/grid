@@ -41,7 +41,7 @@ impl LoadGate for QueueGate {
 }
 
 /// Prefix affinity settings from the grid serving config.
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct AffinitySettings {
     /// Whether selection prefers the site holding a request's prompt. Off routes on load alone.
@@ -54,6 +54,8 @@ pub struct AffinitySettings {
     pub prefill_tokens_per_second: f64,
     /// Seconds one queued request adds to a new request's wait, to turn that price into queue depth.
     pub queued_request_seconds: f64,
+    /// A file holding the key that authenticates stored-state tags. Without one, tags carry no mac.
+    pub tag_key_path: Option<String>,
 }
 
 impl Default for AffinitySettings {
@@ -64,6 +66,7 @@ impl Default for AffinitySettings {
             exploration: 0.02,
             prefill_tokens_per_second: 10_000.0,
             queued_request_seconds: 2.0,
+            tag_key_path: None,
         }
     }
 }
@@ -469,15 +472,21 @@ mod tests {
         let base = AffinitySettings::default();
         base.validate().expect("the defaults are valid");
         for bad in [
-            AffinitySettings { threshold: 0.0, ..base },
-            AffinitySettings { threshold: 1.5, ..base },
+            AffinitySettings {
+                threshold: 0.0,
+                ..base.clone()
+            },
+            AffinitySettings {
+                threshold: 1.5,
+                ..base.clone()
+            },
             AffinitySettings {
                 exploration: 2.0,
-                ..base
+                ..base.clone()
             },
             AffinitySettings {
                 prefill_tokens_per_second: 0.0,
-                ..base
+                ..base.clone()
             },
             AffinitySettings {
                 queued_request_seconds: f64::NAN,

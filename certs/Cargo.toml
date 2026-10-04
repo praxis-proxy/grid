@@ -8,7 +8,7 @@ publish = false
 
 [features]
 default = ["rcgen"]
-rcgen = ["dep:rcgen", "dep:sha2", "x509-parser/verify"]
+rcgen = ["dep:rcgen", "dep:sha2", "dep:hmac", "x509-parser/verify"]
 fips = ["dep:openssl"]
 # The rustls peer-mTLS verifier (GridSpiffe{Server,Client}Verifier). Off by
 # default; a consumer that dials or terminates grid mTLS enables it. rustls is
@@ -24,6 +24,7 @@ x509-parser = { workspace = true }
 rcgen = { workspace = true, features = ["x509-parser"], optional = true }
 openssl = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
+hmac = { workspace = true, optional = true }
 thiserror = { workspace = true }
 time = { workspace = true }
 zeroize = { workspace = true }

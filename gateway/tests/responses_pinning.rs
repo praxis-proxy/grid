@@ -113,10 +113,15 @@ mod tests {
         fn start(work: &std::path::Path, backend: u16) -> Self {
             std::fs::create_dir_all(work).expect("work dir");
             let (listen, admin) = (free_port(), free_port());
+            let key = work.join("tag.key");
+            std::fs::write(&key, [7_u8; 32]).expect("tag key");
             let serving = work.join("serving-config.json");
             std::fs::write(
                 &serving,
-                r#"{"local_site":"local","window_secs":60,"load_window_ms":30000,"candidates":[{"kind":"inference_model","name":"llama","site":"local","cluster":"pool-local"}],"peers":[]}"#,
+                format!(
+                    r#"{{"local_site":"local","window_secs":60,"load_window_ms":30000,"candidates":[{{"kind":"inference_model","name":"llama","site":"local","cluster":"pool-local"}}],"peers":[],"prefix_affinity":{{"tag_key_path":{:?}}}}}"#,
+                    key.display().to_string()
+                ),
             )
             .expect("serving config");
             let config = work.join("praxis.yaml");
@@ -181,6 +186,15 @@ mod tests {
         }
     }
 
+    /// The first id in `body` starting with `prefix`.
+    fn id_in(body: &str, prefix: &str) -> String {
+        let tail = body
+            .split(prefix)
+            .nth(1)
+            .unwrap_or_else(|| panic!("no {prefix} id in {body}"));
+        format!("{prefix}{}", tail.split('"').next().unwrap_or_default())
+    }
+
     #[test]
     fn response_ids_name_their_site_and_follow_ups_go_back_to_it() {
         let work = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("pinning-{}", std::process::id()));
@@ -190,16 +204,17 @@ mod tests {
 
         let (status, created) = gateway.send("POST", "/v1/responses", r#"{"model":"llama","input":"hi"}"#);
         assert_eq!(status, 200, "{created}");
+        let id = id_in(&created, "resp_local.");
         assert!(
-            created.contains(r#""id":"resp_local.abc""#),
-            "the id names its site: {created}"
+            id.ends_with(".abc") && id.split('.').count() == 4,
+            "site, cluster, mac, id: {id}"
         );
 
-        let follow_up = r#"{"model":"llama","input":"and then?","previous_response_id":"resp_local.abc"}"#;
-        let (continued_status, continued) = gateway.send("POST", "/v1/responses", follow_up);
+        let follow_up = format!(r#"{{"model":"llama","input":"and then?","previous_response_id":"{id}"}}"#);
+        let (continued_status, continued) = gateway.send("POST", "/v1/responses", &follow_up);
         assert_eq!(continued_status, 200, "{continued}");
         assert!(
-            continued.contains(r#""previous_response_id":"resp_local.abc""#),
+            continued.contains(&format!(r#""previous_response_id":"{id}""#)),
             "{continued}"
         );
         let sent = seen.lock().expect("seen")[1].1.clone();
@@ -208,12 +223,12 @@ mod tests {
             "the site sees its own id: {sent}"
         );
 
-        let (fetched_status, fetched) = gateway.send("GET", "/v1/responses/resp_local.abc", "");
+        let (fetched_status, fetched) = gateway.send("GET", &format!("/v1/responses/{id}"), "");
         assert_eq!(fetched_status, 200, "{fetched}");
         assert_eq!(seen.lock().expect("seen")[2].0, "GET /v1/responses/resp_abc HTTP/1.1");
-        assert!(fetched.contains(r#""id":"resp_local.abc""#), "{fetched}");
+        assert!(fetched.contains(&format!(r#""id":"{id}""#)), "{fetched}");
 
-        let (cancelled, _) = gateway.send("POST", "/v1/responses/resp_local.abc/cancel", "");
+        let (cancelled, _) = gateway.send("POST", &format!("/v1/responses/{id}/cancel"), "");
         assert_eq!(cancelled, 200);
         assert_eq!(
             seen.lock().expect("seen")[3].0,
@@ -222,18 +237,24 @@ mod tests {
 
         let (created_status, conversation) = gateway.send("POST", "/v1/conversations", "{}");
         assert_eq!(created_status, 200, "{conversation}");
-        assert!(conversation.contains(r#""id":"conv_local.c1""#), "{conversation}");
-        let (items, _) = gateway.send("POST", "/v1/conversations/conv_local.c1/items", "{}");
+        let conversation_id = id_in(&conversation, "conv_local.");
+        let (items, _) = gateway.send("POST", &format!("/v1/conversations/{conversation_id}/items"), "{}");
         assert_eq!(items, 200);
         assert_eq!(
             seen.lock().expect("seen")[5].0,
             "POST /v1/conversations/conv_c1/items HTTP/1.1"
         );
 
+        // A tag the gateway did not make, or one aimed at another site, is refused here.
+        let parts: Vec<&str> = id.split('.').collect();
+        let forged_mac = format!("{}.{}.{}.{}", parts[0], parts[1], "0".repeat(16), parts[3]);
+        let steered = id.replacen("resp_local.", "resp_mars.", 1);
         for unknown in [
             "/v1/responses/resp_abc",
             "/v1/responses/resp_mars.abc",
             "/v1/conversations/conv_c1",
+            &format!("/v1/responses/{forged_mac}"),
+            &format!("/v1/responses/{steered}"),
         ] {
             assert_eq!(gateway.send("GET", unknown, "").0, 404, "{unknown}");
         }

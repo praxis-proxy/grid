@@ -18,6 +18,7 @@ use praxis_filter::FilterError;
 
 use crate::{
     descriptor::{RouteCandidate, validate_candidates, validate_local_site},
+    pin::TagKey,
     prefix::PrefixAffinity,
     serving::{GridServingConfig, PeerServingConfig, validate_peer},
     snapshot::RouteSnapshot,
@@ -167,13 +168,13 @@ impl Control {
     }
 
     /// Make `config` the running one: its identity, its affinity settings, and only its clusters' prefixes.
-    fn adopt(&mut self, config: &GridServingConfig, identity: [u8; 32]) {
+    fn adopt(&mut self, config: &GridServingConfig, identity: [u8; 32], tag_key: Option<TagKey>) {
         let clusters: Vec<Arc<str>> = config
             .candidates
             .iter()
             .map(|candidate| Arc::from(candidate.cluster.as_str()))
             .collect();
-        self.affinity.apply(config.prefix_affinity, &clusters);
+        self.affinity.apply(config.prefix_affinity.clone(), tag_key, &clusters);
         self.applied = Some(config.clone());
         self.identity = Some(identity);
     }
@@ -199,6 +200,7 @@ impl Control {
         }
         // Validated before any poller starts, so an invalid config starts and drops nothing.
         let topology = Arc::new(validate_config(config)?);
+        let tag_key = load_tag_key(config)?;
         if config.window_secs != self.window_secs {
             tracing::warn!(
                 current = self.window_secs,
@@ -217,7 +219,7 @@ impl Control {
         // The reload stands and its topology is published: only now may the new pollers write,
         // so their first refresh orders the new topology. Committing a kept poller is a no-op.
         self.peers.values().for_each(|running| running.handle.commit());
-        self.adopt(config, identity);
+        self.adopt(config, identity, tag_key);
         Ok(Some(outcome))
     }
 
@@ -302,6 +304,19 @@ impl Control {
     }
 }
 
+/// The stored-state tag key `config` names, or `None` when it names none.
+fn load_tag_key(config: &GridServingConfig) -> Result<Option<TagKey>, FilterError> {
+    let Some(path) = config.prefix_affinity.tag_key_path.as_deref() else {
+        return Ok(None);
+    };
+    let bytes = std::fs::read(path)
+        .map(zeroize::Zeroizing::new)
+        .map_err(|error| -> FilterError { format!("grid: reading the tag key {path}: {error}").into() })?;
+    TagKey::new(bytes)
+        .map(Some)
+        .map_err(|error| -> FilterError { format!("grid: {error}").into() })
+}
+
 /// The topology of `config`, refusing what no retry can fix: a bad candidate, peer, or duplicate site.
 fn validate_config(config: &GridServingConfig) -> Result<Topology, FilterError> {
     let topology = Topology::from_config(config)?;
@@ -367,6 +382,8 @@ fn read_identity(config: &GridServingConfig) -> [u8; 32] {
         .iter()
         .flat_map(|peer| [&peer.grid_ca_path, &peer.client_cert_path, &peer.client_key_path])
         .map(String::as_str)
+        // A rotated tag key re-applies the config like a renewed certificate.
+        .chain(config.prefix_affinity.tag_key_path.as_deref())
         .collect();
     let mut material = Vec::new();
     for path in paths {
@@ -658,6 +675,24 @@ mod tests {
             peers: sites.iter().map(|site| peer(site)).collect(),
             prefix_affinity: crate::prefix::AffinitySettings::default(),
         }
+    }
+
+    #[test]
+    fn a_tag_key_must_exist_and_be_long_enough() {
+        let dir = std::env::temp_dir().join(format!("grid-tag-key-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("test io");
+        let mut config = config(&["east"]);
+        assert!(load_tag_key(&config).expect("loads").is_none(), "no path, no key");
+        let at = |name: &str| dir.join(name).display().to_string();
+        config.prefix_affinity.tag_key_path = Some(at("missing"));
+        assert!(load_tag_key(&config).is_err(), "a missing file is refused");
+        std::fs::write(dir.join("short"), [1_u8; 31]).expect("test io");
+        config.prefix_affinity.tag_key_path = Some(at("short"));
+        assert!(load_tag_key(&config).is_err(), "31 bytes is refused");
+        std::fs::write(dir.join("key"), [1_u8; 32]).expect("test io");
+        config.prefix_affinity.tag_key_path = Some(at("key"));
+        assert!(load_tag_key(&config).expect("loads").is_some());
+        let _removed = std::fs::remove_dir_all(&dir);
     }
 
     fn sites(snapshot: &RouteSnapshot) -> Vec<String> {

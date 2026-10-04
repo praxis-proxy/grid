@@ -1,10 +1,14 @@
 //! Stored-state pinning: a stored response or conversation lives on the site that made it.
 //!
-//! Ids leave the gateway tagged with that site, `resp_<site>.<id>` or
-//! `conv_<site>.<id>`, and come back stripped. A request naming one goes only there.
+//! Ids leave the gateway tagged with that site and its cluster,
+//! `resp_<site>.<cluster>.<mac>.<id>`, and come back stripped. A request naming
+//! one goes only there. With a key, the mac authenticates the site and cluster,
+//! so a client cannot aim a request at a site it was never given.
 
 use serde::Deserialize;
 use serde_json::value::RawValue;
+use xxhash_rust::xxh64::xxh64;
+use zeroize::Zeroizing;
 
 /// The id prefixes of stored state.
 const PREFIXES: [&str; 2] = ["resp_", "conv_"];
@@ -18,24 +22,116 @@ const ID_KEYS: [&[u8]; 5] = [
     b"conversation_id",
 ];
 
-/// A tagged id, split into the site and the id the site knows.
+/// The shortest tag key accepted: 256 bits.
+pub(crate) const MIN_KEY_BYTES: usize = 32;
+
+/// Hex digits of the cluster mark.
+const MARK_LEN: usize = 8;
+
+/// Hex digits of the mac: 64 bits.
+const MAC_LEN: usize = 16;
+
+/// Seeds the cluster mark.
+const MARK: u64 = 0x636C_7573_7465_7231;
+
+/// The key that authenticates the site and cluster in a tag. Never printed.
+pub(crate) struct TagKey(Zeroizing<Vec<u8>>);
+
+impl std::fmt::Debug for TagKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TagKey(..)")
+    }
+}
+
+impl TagKey {
+    /// A key from `bytes`, refused when shorter than [`MIN_KEY_BYTES`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a message naming the length when the key is too short.
+    pub(crate) fn new(bytes: Zeroizing<Vec<u8>>) -> Result<Self, String> {
+        if bytes.len() < MIN_KEY_BYTES {
+            return Err(format!(
+                "the stored-state tag key must be at least {MIN_KEY_BYTES} bytes, got {}",
+                bytes.len()
+            ));
+        }
+        Ok(Self(bytes))
+    }
+
+    /// The mac over `site` and `mark`, as hex.
+    fn mac(&self, site: &str, mark: &str) -> String {
+        let mut message = Vec::new();
+        message.extend_from_slice(site.as_bytes());
+        message.push(0);
+        message.extend_from_slice(mark.as_bytes());
+        hex(certs::hmac_sha256(&self.0, &message)
+            .get(..MAC_LEN / 2)
+            .unwrap_or_default())
+    }
+}
+
+/// `bytes` as lowercase hex.
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// The short mark naming `cluster` in a tag, since a cluster name may hold any character.
+pub(crate) fn cluster_mark(cluster: &str) -> String {
+    hex(xxh64(cluster.as_bytes(), MARK)
+        .to_be_bytes()
+        .get(..MARK_LEN / 2)
+        .unwrap_or_default())
+}
+
+/// The tag after an id's prefix, `<site>.<mark>.<mac>.`, the mac empty without a key.
+pub(crate) fn tag(site: &str, cluster: &str, key: Option<&TagKey>) -> String {
+    let mark = cluster_mark(cluster);
+    let mac = key.map(|key| key.mac(site, &mark)).unwrap_or_default();
+    format!("{site}.{mark}.{mac}.")
+}
+
+/// A tagged id, split into where it was stored and the id the site knows.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Pinned<'id> {
     /// The site that stored the state.
     pub(crate) site: &'id str,
-    /// The id without the site tag.
+    /// The [`cluster_mark`] of the cluster that stored it.
+    pub(crate) mark: &'id str,
+    /// The id without the tag.
     pub(crate) upstream: String,
 }
 
-/// Split a tagged id. `None` for an id the gateway did not tag.
-pub(crate) fn untag(id: &str) -> Option<Pinned<'_>> {
+/// Split a tagged id. `None` for an id the gateway did not tag, or, with `key`,
+/// one whose mac does not match.
+pub(crate) fn untag<'id>(id: &'id str, key: Option<&TagKey>) -> Option<Pinned<'id>> {
     PREFIXES.iter().find_map(|prefix| {
+        // Site names are DNS labels and marks and macs are hex, so the first three periods split it.
         let (site, rest) = id.strip_prefix(prefix)?.split_once('.')?;
-        (!site.is_empty() && !rest.is_empty()).then(|| Pinned {
+        let (mark, rest) = rest.split_once('.')?;
+        let (mac, rest) = rest.split_once('.')?;
+        let hex_of = |value: &str, len: usize| value.len() == len && value.bytes().all(|byte| byte.is_ascii_hexdigit());
+        let shaped = !site.is_empty() && !rest.is_empty() && hex_of(mark, MARK_LEN);
+        let authentic = match key {
+            Some(key) => constant_time_eq(mac.as_bytes(), key.mac(site, mark).as_bytes()),
+            None => mac.is_empty() || hex_of(mac, MAC_LEN),
+        };
+        (shaped && authentic).then(|| Pinned {
             site,
+            mark,
             upstream: format!("{prefix}{rest}"),
         })
     })
+}
+
+/// Whether `left` and `right` match, in time that does not depend on where they differ.
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .fold(0_u8, |differ, (left, right)| differ | (left ^ right))
+            == 0
 }
 
 /// Which stored-state API a request path names.
@@ -116,7 +212,7 @@ struct ConversationRef<'body> {
 ///
 /// Each id field is decoded as JSON, so escapes match, and only that field's
 /// token is replaced. `None` when the body continues nothing tagged.
-pub(crate) fn pinned_body(body: &[u8]) -> Option<(String, Vec<u8>)> {
+pub(crate) fn pinned_body(body: &[u8], key: Option<&TagKey>) -> Option<(BodyPin, Vec<u8>)> {
     let fields: Continues<'_> = serde_json::from_slice(body).ok()?;
     let conversation = fields.conversation.and_then(|value| {
         serde_json::from_str::<ConversationRef<'_>>(value.get())
@@ -130,10 +226,10 @@ pub(crate) fn pinned_body(body: &[u8]) -> Option<(String, Vec<u8>)> {
         let Ok(id) = serde_json::from_str::<String>(token.get()) else {
             continue;
         };
-        let Some(pinned) = untag(&id) else {
+        let Some(pinned) = untag(&id, key) else {
             continue;
         };
-        site.get_or_insert_with(|| pinned.site.to_owned());
+        site.get_or_insert_with(|| (pinned.site.to_owned(), pinned.mark.to_owned()));
         edits.push((span(body, token)?, serde_json::to_string(&pinned.upstream).ok()?));
     }
     let site = site?;
@@ -148,6 +244,9 @@ pub(crate) fn pinned_body(body: &[u8]) -> Option<(String, Vec<u8>)> {
     out.extend_from_slice(body.get(from..)?);
     Some((site, out))
 }
+
+/// The site and cluster mark a create body is pinned to.
+pub(crate) type BodyPin = (String, String);
 
 /// Where `token`, borrowed from `body`, sits in it.
 fn span(body: &[u8], token: &RawValue) -> Option<std::ops::Range<usize>> {
@@ -192,12 +291,10 @@ const OWN_KEYS: [&[u8]; 2] = [b"response", b"conversation"];
 const KEY_LIMIT: usize = 20;
 
 impl Tagger {
-    /// A tagger for state stored at `site`.
-    pub(crate) fn new(site: &str) -> Self {
-        let mut tag = site.as_bytes().to_vec();
-        tag.push(b'.');
+    /// A tagger inserting `tag`, from [`tag`].
+    pub(crate) fn new(tag: String) -> Self {
         Self {
-            tag,
+            tag: tag.into_bytes(),
             last: 0,
             in_string: false,
             escaped: false,
@@ -338,27 +435,70 @@ enum Open {
 mod tests {
     use super::*;
 
+    /// `text` with each `resp_<site>.` and `conv_<site>.` for east and west tagged as a
+    /// gateway with no key tags a response from cluster `pool`.
+    fn t(text: &str) -> String {
+        ["east", "west"].iter().fold(text.to_owned(), |text, site| {
+            let tagged = tag(site, "pool", None);
+            text.replace(&format!("resp_{site}."), &format!("resp_{tagged}"))
+                .replace(&format!("conv_{site}."), &format!("conv_{tagged}"))
+        })
+    }
+
+    fn key(byte: u8) -> TagKey {
+        TagKey::new(Zeroizing::new(vec![byte; MIN_KEY_BYTES])).unwrap()
+    }
+
     #[test]
-    fn a_tagged_id_splits_into_site_and_upstream_id() {
+    fn a_tagged_id_splits_into_site_cluster_and_upstream_id() {
+        let mark = cluster_mark("pool");
         assert_eq!(
-            untag("resp_east.abc123"),
+            untag(&t("resp_east.abc123"), None),
             Some(Pinned {
                 site: "east",
+                mark: &mark,
                 upstream: "resp_abc123".to_owned()
             })
         );
         assert_eq!(
-            untag("conv_west.c1").map(|pinned| pinned.upstream),
+            untag(&t("conv_west.c1"), None).map(|pinned| pinned.upstream),
             Some("conv_c1".to_owned())
         );
-        // Site names are DNS labels, so the first period ends the site and the id keeps the rest.
+        // The first three periods split the tag, so the id keeps the rest.
         assert_eq!(
-            untag("resp_east.a.b.c").map(|pinned| (pinned.site, pinned.upstream)),
+            untag(&t("resp_east.a.b.c"), None).map(|pinned| (pinned.site, pinned.upstream)),
             Some(("east", "resp_a.b.c".to_owned()))
         );
-        for untagged in ["resp_abc123", "msg_east.abc", "resp_.abc", "resp_east.", "abc"] {
-            assert_eq!(untag(untagged), None, "{untagged}");
+        let no_mark = format!("resp_east.zz{}..abc", mark.chars().skip(2).collect::<String>());
+        for untagged in [
+            "resp_abc123",
+            "msg_east.abc",
+            "resp_east.abc",
+            &no_mark,
+            &t("resp_.abc"),
+            "abc",
+        ] {
+            assert_eq!(untag(untagged, None), None, "{untagged}");
         }
+    }
+
+    #[test]
+    fn with_a_key_only_a_tag_it_made_is_accepted() {
+        let (ours, theirs) = (key(1), key(2));
+        let id = format!("resp_{}a1", tag("east", "pool", Some(&ours)));
+        assert_eq!(untag(&id, Some(&ours)).map(|pinned| pinned.site), Some("east"));
+        assert_eq!(untag(&id, Some(&theirs)), None, "another key's mac");
+        assert_eq!(untag(&t("resp_east.a1"), Some(&ours)), None, "no mac");
+        let steered = id.replacen("resp_east.", "resp_west.", 1);
+        assert_eq!(untag(&steered, Some(&ours)), None, "a mac for another site");
+        let parts: Vec<&str> = id.split('.').collect();
+        let swapped = format!("{}.{}.{}.{}", parts[0], cluster_mark("other"), parts[2], parts[3]);
+        assert_eq!(untag(&swapped, Some(&ours)), None, "a mark from another cluster");
+        assert_eq!(
+            TagKey::new(Zeroizing::new(vec![0; MIN_KEY_BYTES - 1])).map(drop).ok(),
+            None
+        );
+        assert_eq!(format!("{ours:?}"), "TagKey(..)");
     }
 
     #[test]
@@ -397,31 +537,31 @@ mod tests {
 
     #[test]
     fn the_body_loses_its_tags_but_user_text_keeps_them() {
-        let body = br#"{"input":"I saw \"resp_east.a1\" earlier","previous_response_id":"resp_east.a1"}"#;
-        let (site, stripped) = pinned_body(body).unwrap();
+        let body = t(r#"{"input":"I saw \"resp_east.a1\" earlier","previous_response_id":"resp_east.a1"}"#);
+        let ((site, _), stripped) = pinned_body(body.as_bytes(), None).unwrap();
         assert_eq!(site, "east");
         assert_eq!(
             String::from_utf8(stripped).unwrap(),
-            r#"{"input":"I saw \"resp_east.a1\" earlier","previous_response_id":"resp_a1"}"#
+            t(r#"{"input":"I saw \"resp_east.a1\" earlier","previous_response_id":"resp_a1"}"#)
         );
     }
 
     #[test]
     fn an_escaped_id_is_decoded_and_a_conversation_object_stripped() {
-        let body = br#"{"previous_response_id":"resp_east.a1","conversation":{"id":"conv_east.c1"}}"#;
-        let (site, stripped) = pinned_body(body).unwrap();
+        let body = t(r#"{"previous_response_id":"resp_east.a1","conversation":{"id":"conv_east.c1"}}"#);
+        let ((site, _), stripped) = pinned_body(body.as_bytes(), None).unwrap();
         assert_eq!(site, "east");
         assert_eq!(
             String::from_utf8(stripped).unwrap(),
             r#"{"previous_response_id":"resp_a1","conversation":{"id":"conv_c1"}}"#
         );
-        let by_string = br#"{"input":"x","conversation":"conv_west.c9"}"#;
-        assert_eq!(pinned_body(by_string).unwrap().0, "west");
-        assert!(pinned_body(br#"{"input":"x","previous_response_id":"resp_a1"}"#).is_none());
+        let by_string = t(r#"{"input":"x","conversation":"conv_west.c9"}"#);
+        assert_eq!(pinned_body(by_string.as_bytes(), None).unwrap().0.0, "west");
+        assert!(pinned_body(br#"{"input":"x","previous_response_id":"resp_a1"}"#, None).is_none());
     }
 
     fn tag_all(site: &str, body: &[u8], split: usize) -> String {
-        let mut tagger = Tagger::new(site);
+        let mut tagger = Tagger::new(tag(site, "pool", None));
         let mut out = Vec::new();
         for chunk in body.chunks(split.max(1)) {
             out.extend(tagger.push(chunk, false));
@@ -433,7 +573,9 @@ mod tests {
     #[test]
     fn ids_are_tagged_wherever_a_chunk_splits() {
         let body = br#"{"id": "resp_a1","object":"response","previous_response_id":"resp_z9","conversation":{"id":"conv_c1"},"output":[{"id":"msg_1","content":[{"text":"resp_x"}]}]}"#;
-        let want = r#"{"id": "resp_east.a1","object":"response","previous_response_id":"resp_east.z9","conversation":{"id":"conv_east.c1"},"output":[{"id":"msg_1","content":[{"text":"resp_x"}]}]}"#;
+        let want = t(
+            r#"{"id": "resp_east.a1","object":"response","previous_response_id":"resp_east.z9","conversation":{"id":"conv_east.c1"},"output":[{"id":"msg_1","content":[{"text":"resp_x"}]}]}"#,
+        );
         for split in 1..body.len() {
             assert_eq!(tag_all("east", body, split), want, "split every {split} bytes");
         }
@@ -445,25 +587,27 @@ mod tests {
         let tagged = tag_all("west", body, 5);
         assert!(tagged.contains(r#""delta":"resp_q""#), "{tagged}");
         assert!(tagged.contains(r#""text":"conv_r""#), "{tagged}");
-        assert!(tagged.contains(r#""response":{"id":"resp_west.a1"}"#), "{tagged}");
+        assert!(tagged.contains(&t(r#""response":{"id":"resp_west.a1"}"#)), "{tagged}");
         assert_eq!(tagged.matches("\n\n").count(), 2);
     }
 
     #[test]
     fn only_the_responses_own_ids_are_tagged() {
         let body = br#"{"id":"resp_a1","metadata":{"id":"resp_m","conversation":"conv_m"},"tools":[{"id":"resp_t"}],"input":[{"previous_response_id":"resp_i"}],"conversation":{"id":"conv_c1","metadata":{"id":"conv_n"}}}"#;
-        let want = r#"{"id":"resp_east.a1","metadata":{"id":"resp_m","conversation":"conv_m"},"tools":[{"id":"resp_t"}],"input":[{"previous_response_id":"resp_i"}],"conversation":{"id":"conv_east.c1","metadata":{"id":"conv_n"}}}"#;
+        let want = t(
+            r#"{"id":"resp_east.a1","metadata":{"id":"resp_m","conversation":"conv_m"},"tools":[{"id":"resp_t"}],"input":[{"previous_response_id":"resp_i"}],"conversation":{"id":"conv_east.c1","metadata":{"id":"conv_n"}}}"#,
+        );
         for split in 1..body.len() {
             assert_eq!(tag_all("east", body, split), want, "split every {split} bytes");
         }
         let event = b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_a1\",\"metadata\":{\"id\":\"resp_m\"}}}\n\ndata: {\"id\":\"resp_b2\"}\n\n";
         let tagged = tag_all("east", event, 4);
         assert!(
-            tagged.contains(r#""response":{"id":"resp_east.a1","metadata":{"id":"resp_m"}}"#),
+            tagged.contains(&t(r#""response":{"id":"resp_east.a1","metadata":{"id":"resp_m"}}"#)),
             "{tagged}"
         );
         assert!(
-            tagged.contains(r#"{"id":"resp_east.b2"}"#),
+            tagged.contains(&t(r#"{"id":"resp_east.b2"}"#)),
             "each event starts at the top: {tagged}"
         );
     }
@@ -477,8 +621,8 @@ mod tests {
     #[test]
     fn an_already_tagged_id_is_not_tagged_twice() {
         assert_eq!(
-            tag_all("east", br#"{"id":"resp_east.a1"}"#, 3),
-            r#"{"id":"resp_east.a1"}"#
+            tag_all("east", t(r#"{"id":"resp_east.a1"}"#).as_bytes(), 3),
+            t(r#"{"id":"resp_east.a1"}"#)
         );
     }
 
