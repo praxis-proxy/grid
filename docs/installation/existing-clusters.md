@@ -790,7 +790,9 @@ its TLS paths to `gridIdentity.mountPath`; the mount alone does not enable TLS.
 
 For server-only backend TLS, use `upstreamCA.secretName` or a backend's
 `transport.ca.secretName` or `transport.ca.configMapName`. BYO `praxis.yaml`
-must set `runtime.upstream_ca_file` to use the `upstreamCA` mount.
+must set `runtime.upstream_ca_file` to use the `upstreamCA` mount. This bundle
+replaces system trust roots. Include public and private roots when backends need
+both; a per-cluster CA overrides the global bundle for that cluster.
 
 Create a combined Grid identity and CA Secret with:
 
