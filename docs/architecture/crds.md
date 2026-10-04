@@ -9,8 +9,11 @@ unchanged by the project-name update.
 All CRDs are cluster-scoped.
 
 The 0.1.5 operator accepts both previous and current CRD spec field names. The
-previous names are removed in 0.1.6; see the
-[0.1.5 to 0.1.6 CRD field migration guide](../installation/migration-0.1.5-to-0.1.6.md).
+previous names are deprecated. Set only one name per field; setting both is
+rejected by the API schema. The `grid-site` chart translates previous value
+names into current CRD fields and also rejects both names together. See the
+[0.1.5 to 0.1.6 CRD field migration guide](../installation/migration-0.1.5-to-0.1.6.md)
+for the planned removal and upgrade steps.
 
 ## GridNetwork
 

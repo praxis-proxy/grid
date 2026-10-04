@@ -344,7 +344,7 @@ Candidate fields:
 |`site`|AGN site advertising the capability.|
 |`cluster`|Praxis load-balancer cluster identity used for upstream routing.|
 |`fresh`|Whether provider status is considered fresh enough for normal routing.|
-|`credential`|Optional. Projected when auth is non-manual `bearer_token` and the Secret reference has non-empty `name`, `namespace`, and `key`, regardless of `backendKind`. Contains only Secret locating information, never the token value.|
+|`credential`|Optional. Projected when `auth.credentialsManagedExternally` is false and `auth.strategy` is `bearer_token` and the Secret reference has non-empty `name`, `namespace`, and `key`, regardless of `backendKind`. Contains only Secret locating information, never the token value.|
 |`stable_id`|Optional. Deterministic FNV-1a hash of `{kind}/{name}/{site}/{cluster}`. Used as `candidate_id` in provider gateway `provider_route` configuration. This differs from InferenceProvider `.metadata.name`; it can also key consumer-side affinity.|
 |`admission_state`|Optional Praxis value: `new_and_existing`, `existing_only`, or `none`. AGN removes excluded candidates before serialization and does not currently emit `none`.|
 |`selection_tier`|Optional locality tier: `same_site`, `same_zone`, `same_region`, `cross_region`, or `unknown`. Derived from `GridSite` region and zone.|

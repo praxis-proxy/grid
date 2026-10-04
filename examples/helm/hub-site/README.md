@@ -108,7 +108,7 @@ Only `spiffe` rotates site certificates. In `pin` mode rotation is off: before a
 
 ## Operations
 
-With `gridServing.enabled`, a current `grid-gateway` re-reads mounted
+With `praxisConfig.render.gridServing.enabled`, a current `grid-gateway` re-reads mounted
 serving data and signals-poller identity files every five seconds. Valid changes
 to peers, candidates, addresses, and pins apply without a pod restart after the
 kubelet refreshes the files. Invalid serving-data updates keep the last accepted
