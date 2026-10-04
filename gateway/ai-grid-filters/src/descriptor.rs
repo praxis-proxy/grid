@@ -83,7 +83,7 @@ impl AdmissionState {
 ///     site: site-b
 ///     cluster: grid-site-b
 /// ```
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct CandidateConfig {
     /// Cluster name to select when this candidate is chosen.

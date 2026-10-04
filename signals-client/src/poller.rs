@@ -209,6 +209,16 @@ pub fn build_url(endpoint: &str, collect: &[String]) -> String {
 pub struct PollHandle {
     /// Sends the stop signal the loop selects on.
     stop: watch::Sender<bool>,
+
+    /// Opens the store to the loop. A held poller fetches but writes nothing until committed.
+    commit: watch::Sender<bool>,
+}
+
+impl PollHandle {
+    /// Let a held poller write the store and run its cycle hook.
+    pub fn commit(&self) {
+        self.commit.send_replace(true);
+    }
 }
 
 impl Drop for PollHandle {
@@ -228,8 +238,9 @@ where
     S: SignalSource + Send + Sync + 'static,
 {
     let (stop, rx) = watch::channel(false);
-    tokio::spawn(poll_loop(store, source, interval, rx, |_store: &LoadStore| {}));
-    PollHandle { stop }
+    let (commit, gate) = watch::channel(true);
+    tokio::spawn(poll_loop(store, source, interval, (rx, gate), |_store: &LoadStore| {}));
+    PollHandle { stop, commit }
 }
 
 /// Spawn a poll loop from a [`PollerConfig`], feeding `store` from `source`.
@@ -273,7 +284,43 @@ where
     S: SignalSource + Send + Sync + 'static,
     F: Fn(&LoadStore) + Send + 'static,
 {
+    spawn_thread(store, config, source, on_cycle, true)
+}
+
+/// [`spawn_on_thread`], held: the loop fetches but writes nothing and runs no
+/// cycle hook until [`PollHandle::commit`]. A reload starts its new pollers
+/// held, so a reload that is then rejected leaves the store untouched.
+///
+/// # Errors
+///
+/// Returns the OS error if the poller thread cannot be spawned.
+pub fn spawn_on_thread_held<S, F>(
+    store: Arc<LoadStore>,
+    config: &PollerConfig,
+    source: S,
+    on_cycle: F,
+) -> std::io::Result<PollHandle>
+where
+    S: SignalSource + Send + Sync + 'static,
+    F: Fn(&LoadStore) + Send + 'static,
+{
+    spawn_thread(store, config, source, on_cycle, false)
+}
+
+/// Spawn the loop on its own thread, its writes open when `committed`.
+fn spawn_thread<S, F>(
+    store: Arc<LoadStore>,
+    config: &PollerConfig,
+    source: S,
+    on_cycle: F,
+    committed: bool,
+) -> std::io::Result<PollHandle>
+where
+    S: SignalSource + Send + Sync + 'static,
+    F: Fn(&LoadStore) + Send + 'static,
+{
     let (stop, rx) = watch::channel(false);
+    let (commit, gate) = watch::channel(committed);
     let interval = Duration::from_millis(config.interval_ms);
     // The JoinHandle is dropped, detaching the thread on purpose. Cancellation
     // is the watch channel: the handle's drop stops the loop and the thread
@@ -291,9 +338,9 @@ where
                     return;
                 },
             };
-            runtime.block_on(poll_loop(store, source, interval, rx, on_cycle));
+            runtime.block_on(poll_loop(store, source, interval, (rx, gate), on_cycle));
         })?;
-    Ok(PollHandle { stop })
+    Ok(PollHandle { stop, commit })
 }
 
 /// Poll until stopped, feeding every response into `store` and running
@@ -307,7 +354,7 @@ async fn poll_loop<S, F>(
     store: Arc<LoadStore>,
     source: S,
     interval: Duration,
-    mut stop: watch::Receiver<bool>,
+    (mut stop, mut gate): (watch::Receiver<bool>, watch::Receiver<bool>),
     on_cycle: F,
 ) where
     S: SignalSource + Send + Sync,
@@ -327,18 +374,28 @@ async fn poll_loop<S, F>(
                 }
             },
             _ = ticker.tick() => {
-                poll_once(&source, &store).await;
+                // Stopping cancels an in-flight fetch, so a dropped poller writes nothing late.
+                let fetched = tokio::select! {
+                    biased;
+                    _ = stop.changed() => return,
+                    fetched = source.fetch() => fetched,
+                };
+                // A held poller waits for its reload to commit; a dropped handle ends it here.
+                if gate.wait_for(|open| *open).await.is_err() || *stop.borrow() {
+                    return;
+                }
+                absorb(fetched, &store);
                 on_cycle(&store);
             },
         }
     }
 }
 
-/// Fetch once and absorb the response, logging rather than propagating failure.
+/// Absorb one fetch, logging rather than propagating failure.
 /// Attribution keys on the crypto-verified owner from the scrape, never the
 /// payload's self-reported `grid_site` (the #160 binding).
-async fn poll_once<S: SignalSource + Sync>(source: &S, store: &LoadStore) {
-    match source.fetch().await {
+fn absorb(fetched: Result<Scrape, FetchError>, store: &LoadStore) {
+    match fetched {
         Ok(scrape) => match certs::site_of_spiffe_id(&scrape.peer_identity) {
             Some(owner) => store.ingest_at(&scrape.body, scrape.date_ms, now_ms(), owner),
             None => {
@@ -468,7 +525,7 @@ mod tests {
     #[tokio::test]
     async fn a_spoofed_site_in_the_body_is_not_attributed() {
         // The peer is verified as "east" but its body claims "west" (the #160
-        // cross-site spoof). poll_once keys on the verified owner, so the west
+        // cross-site spoof). the poll keys on the verified owner, so the west
         // series must never appear.
         let store = Arc::new(LoadStore::new(Duration::from_secs(30)));
         let source = FakeSource {
@@ -495,6 +552,103 @@ mod tests {
             "and it is not silently rebound to east either"
         );
         drop(handle);
+    }
+
+    /// Reports east once released, counting fetches that began.
+    struct GatedSource {
+        release: Arc<tokio::sync::Notify>,
+        entered: Arc<AtomicUsize>,
+    }
+
+    impl SignalSource for GatedSource {
+        async fn fetch(&self) -> Result<Scrape, FetchError> {
+            self.entered.fetch_add(1, Ordering::SeqCst);
+            self.release.notified().await;
+            Ok(Scrape {
+                body: line("east", "pool-a", 3.0, now_ms()),
+                date_ms: now_ms(),
+                peer_identity: Arc::from("spiffe://grid.internal/site/east"),
+            })
+        }
+    }
+
+    fn east(store: &LoadStore) -> Option<f64> {
+        store.window_worst(&LoadStore::key("east", "pool-a"), "queue_depth", now_ms(), 60_000, true)
+    }
+
+    #[tokio::test]
+    async fn a_dropped_poller_ignores_its_in_flight_fetch() {
+        let store = Arc::new(LoadStore::new(Duration::from_secs(30)));
+        let (release, entered) = (Arc::new(tokio::sync::Notify::new()), Arc::new(AtomicUsize::new(0)));
+        let source = GatedSource {
+            release: Arc::clone(&release),
+            entered: Arc::clone(&entered),
+        };
+        let handle = spawn(Arc::clone(&store), source, Duration::from_millis(10));
+        while entered.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        drop(handle);
+        release.notify_waiters();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(east(&store), None, "a fetch finishing after the drop writes nothing");
+    }
+
+    /// Reports east on every fetch, counting fetches.
+    struct CountingSource {
+        fetches: Arc<AtomicUsize>,
+    }
+
+    impl SignalSource for CountingSource {
+        async fn fetch(&self) -> Result<Scrape, FetchError> {
+            self.fetches.fetch_add(1, Ordering::SeqCst);
+            Ok(Scrape {
+                body: line("east", "pool-a", 3.0, now_ms()),
+                date_ms: now_ms(),
+                peer_identity: Arc::from("spiffe://grid.internal/site/east"),
+            })
+        }
+    }
+
+    /// Spin until `done`, failing after five seconds.
+    fn spin_until(what: &str, done: impl Fn() -> bool) {
+        let deadline = std::time::Instant::now()
+            .checked_add(Duration::from_secs(5))
+            .expect("deadline");
+        while !done() {
+            assert!(std::time::Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::yield_now();
+        }
+    }
+
+    /// A held poller on its own thread over a fresh store, with its fetch count.
+    fn held_poller() -> (Arc<LoadStore>, Arc<AtomicUsize>, PollHandle) {
+        let cfg: PollerConfig =
+            serde_yaml::from_str("endpoint: https://operator:9091/v1/site/signals\ninterval_ms: 5\n").expect("cfg");
+        let store = Arc::new(LoadStore::new(Duration::from_secs(30)));
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let source = CountingSource {
+            fetches: Arc::clone(&fetches),
+        };
+        let handle = spawn_on_thread_held(Arc::clone(&store), &cfg, source, |_store: &LoadStore| {}).expect("spawn");
+        (store, fetches, handle)
+    }
+
+    #[test]
+    fn a_held_poller_writes_only_once_committed() {
+        let (store, fetches, handle) = held_poller();
+        spin_until("a fetch while held", || fetches.load(Ordering::SeqCst) > 0);
+        assert_eq!(east(&store), None, "held: the fetch is not written");
+        handle.commit();
+        spin_until("the committed write", || east(&store).is_some());
+    }
+
+    #[test]
+    fn a_held_poller_dropped_before_commit_writes_nothing() {
+        let (store, fetches, handle) = held_poller();
+        spin_until("a fetch while held", || fetches.load(Ordering::SeqCst) > 0);
+        drop(handle);
+        assert_eq!(east(&store), None, "a rejected reload's poller never writes");
     }
 
     #[test]

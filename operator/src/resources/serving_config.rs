@@ -1,4 +1,4 @@
-//! Grid serving config the gateway reads from `GRID_SERVING_CONFIG` at start.
+//! Grid serving config the gateway reads from `GRID_SERVING_CONFIG` and re-reads on change.
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
