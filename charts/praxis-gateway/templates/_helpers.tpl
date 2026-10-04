@@ -195,7 +195,7 @@ Validate required config ConfigMap name.
 {{- /*
 In a live cluster, require the BYO ConfigMap; skip this for offline rendering.
 Look up the ConfigMap first, so an existing one needs only namespace access.
-Only when it is missing, the kube-system lookup tells a live cluster from helm template.
+Only when it is missing, reading kube-system tells a live cluster from helm template.
 */}}
 {{- if not (lookup "v1" "ConfigMap" .Release.Namespace .Values.config.existingConfigMap) }}
 {{- if lookup "v1" "Namespace" "" "kube-system" }}

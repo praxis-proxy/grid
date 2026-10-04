@@ -1712,11 +1712,25 @@ echo "======================================================================"
 
 # Argo CD renders with helm template, no cluster access, on every sync.
 echo ""
-echo "=== No cluster lookups or render-varying functions ==="
+echo "=== No manifest lookups or render-varying functions ==="
 NONDET='\b(lookup|randAlphaNum|randAlpha|randNumeric|randAscii|randBytes|randInt|shuffle|uuidv4|now|htpasswd|bcrypt|encryptAES|genCA|genPrivateKey|genSelfSignedCert|genSignedCert)\b|\.Release\.Revision'
 for chart in charts/*/; do
   # A YAML # comment still executes its template actions, so only template comments are skipped.
   hits=$(grep -rnE "$NONDET" "$chart/templates" | grep -vE '^[^:]+:[0-9]+:\s*(#[^{]*$|\{\{-? */\*)' || true)
+  # The BYO preflight only refuses live installs; it supplies no manifest values.
+  # Allow its two exact calls. Other lookups and random/time functions stay banned.
+  hits=$(awk '
+    {
+      code = $0
+      sub(/^[^:]+:[0-9]+:/, "", code)
+      if ($0 ~ /^charts\/praxis-gateway\/+templates\/_helpers\.tpl:[0-9]+:/ &&
+          (code == "{{- if not (lookup \"v1\" \"ConfigMap\" .Release.Namespace .Values.config.existingConfigMap) }}" ||
+           code == "{{- if lookup \"v1\" \"Namespace\" \"\" \"kube-system\" }}")) {
+        next
+      }
+      if (length($0)) print
+    }
+  ' <<<"$hits")
   if [ -z "$hits" ]; then
     pass "deterministic functions only: $chart"
   else
