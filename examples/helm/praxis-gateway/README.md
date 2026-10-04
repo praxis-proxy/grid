@@ -12,9 +12,11 @@ Small values files for the `charts/praxis-gateway` chart. Each file sets one
 
 ## byo.yaml
 
-The chart mounts your ConfigMap and does not manage it. Changing the ConfigMap does
-not restart the pods. This is the default source. It is also the only source that
-supports the `overlay` values.
+The chart mounts your ConfigMap and does not manage it. Changing the ConfigMap
+does not restart the pods; supported Praxis file watching applies routes and
+pipeline changes after the kubelet refreshes the mount. Listener changes still
+need a restart. BYO is the default source and the only source that supports
+`overlay` values.
 
 ```console
 kubectl create configmap my-praxis-config --from-file=praxis.yaml

@@ -281,7 +281,7 @@ Praxis AI image; these values may advance independently.
 | `praxisConfig.render.provider.allowedPaths` | list | chat, completions, models, embeddings | Exact paths a provider forwards, GET and POST only. Other paths get a 404, other methods a 405. |
 | `grid.networkName` | string | `""` | GridNetwork name for overlay-sidecar scope validation. Required when the sidecar is on. |
 | `grid.siteName` | string | `""` | This gateway's site name. Required for render and when the overlay sidecar is on. A consumer scores locality with it; a provider returns it in `X-Grid-Provider-Site`. |
-| `praxisConfig.render.auth.mode` | string | **required** when rendered | `api-key` validates the caller's key and needs an image that registers `identity/api-key` (praxis-policy 0.4 or later); the render refuses it on the default `ai:0.4.0` image (by effective reference; a digest pin of that same image is not detected). `none` renders no policy filter, for use only behind an authenticating front. |
+| `praxisConfig.render.auth.mode` | string | **required** for a render consumer | `api-key` validates the caller's key and needs an image that registers `identity/api-key` (praxis-policy 0.4 or later); the render refuses it on the default `ai:0.4.0` image (by effective reference; a digest pin of that same image is not detected). `none` renders no policy filter, for use only behind an authenticating front. |
 | `praxisConfig.render.auth.allowUnauthenticatedExposure` | bool | `false` | With `none`, allow a LoadBalancer or NodePort Service. Without it the render fails. The guard sees only this chart's Service, not `oc expose`, another Service selecting the pod labels, an HTTPRoute, or a hand-made Service with `service.enabled=false`. Use `networkPolicy` for those. |
 | `praxisConfig.render.auth.stripAuthorization` | bool | `true` | Remove the caller's `Authorization` before routing, in either mode. Forwarded grid hops authenticate by mTLS identity. `false` forwards the caller's key or bearer to every backend and cross-site peer, so use it only when the backend validates that same credential. |
 | `praxisConfig.render.auth.validateUrl` | string | **required** for `api-key` | https validate endpoint. |
@@ -467,9 +467,18 @@ each model to the least-loaded admitted site. The chosen candidate's cluster mus
 name a `praxisConfig.render.backends` cluster, so give each backend the operator's
 candidate cluster (the provider's `routingClusterRef`, else its name).
 
-The gateway reads the file only at start. When the ConfigMap's
-`grid.praxis.fast/serving-digest` annotation changes, restart the gateway
-(`kubectl rollout restart`).
+A `grid-gateway` built from the current source re-reads `serving-config.json`
+every five seconds after the kubelet updates the mounted ConfigMap. It applies
+candidate, peer, address, and pin changes without a pod restart. Invalid updates
+keep the last accepted topology and pollers. Check gateway logs and
+`grid_serving_config_reload_total{result="applied"}` for acceptance; the
+`grid.praxis.fast/serving-digest` annotation records publication, not acceptance.
+
+The same watcher detects changes to the mounted CA, client certificate, and
+key, and rebuilds the signals pollers. This refreshes their mTLS identity; it
+does not renew certificates or change provider-listener TLS settings. Older
+images without this watcher still need a rollout. Choose an image that includes
+the watcher before relying on live updates.
 
 Known limits:
 
@@ -477,10 +486,14 @@ Known limits:
   provider gateway is down. That request fails rather than failing over.
 - The gateway matches a candidate's cluster to `praxisConfig.render.backends` by name only.
   Nothing checks that the backend serves the candidate's site.
+- The serving watcher does not add load-balancer clusters to `praxis.yaml`.
+  Add each new candidate's backend there too. Listener changes and serving
+  `window_secs` changes require a restart.
 - Site certificates last 180 days. Under `spiffe` trust the operator rotates them
-  around day 120 and rolls the gateway Deployment, because the gateway reads its
-  upstream client certificate only at start. Under `pin` trust nothing rotates
-  them: re-enroll each site and update the peers' digests before it expires.
+  around day 120. The serving watcher refreshes the signals pollers' mounted
+  identity automatically, but provider-listener certificate reload depends on the
+  Praxis build. Under `pin` trust nothing rotates them: re-enroll each site and
+  update the peers' digests before it expires.
 
 ### Routing overlay delivery
 
@@ -599,8 +612,12 @@ is enough. Public https backends can instead take `upstreamCA`.
 
 ## Upgrading
 
-The chart now rejects previous gateway value names rather than ignoring them.
-Migrate the values before `helm upgrade`:
+The `praxis-gateway` chart changes from 0.1.4 to 0.1.5 reject previous gateway
+value names rather than ignoring them. Migrate the values before `helm upgrade`.
+These are gateway chart values; the separate CRD field rename is not part of
+this branch.
+
+Use this mapping:
 
 | Old | New |
 |---|---|
