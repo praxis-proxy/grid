@@ -297,7 +297,7 @@ spec:
                 periodSeconds: 10
             gridIdentity:
               tlsSecretName: "consumer-gateway-tls"
-              caSecretName: "grid-ca"
+              caSecretName: "consumer-gateway-tls"
             providerCredentials:
               - secretName: "vcr-inference-credential"
                 mountPath: "/etc/praxis/credentials/vcr-inference"
@@ -362,7 +362,7 @@ spec:
                 periodSeconds: 10
             gridIdentity:
               tlsSecretName: "consumer-gateway-tls"
-              caSecretName: "grid-ca"
+              caSecretName: "consumer-gateway-tls"
             providerCredentials:
               - secretName: "vcr-inference-credential"
                 mountPath: "/etc/praxis/credentials/vcr-inference"
@@ -426,7 +426,7 @@ spec:
                 periodSeconds: 10
             gridIdentity:
               tlsSecretName: "consumer-gateway-tls"
-              caSecretName: "grid-ca"
+              caSecretName: "consumer-gateway-tls"
             providerCredentials:
               - secretName: "vcr-inference-credential"
                 mountPath: "/etc/praxis/credentials/vcr-inference"
@@ -488,7 +488,7 @@ spec:
               configMapName: "grid-overlay-grid-single-cluster--consumer-gateway-a-db750bac"
             gridIdentity:
               tlsSecretName: "consumer-gateway-tls"
-              caSecretName: "grid-ca"
+              caSecretName: "consumer-gateway-tls"
             podLabels:
               grid.praxis.fast/consumer-site: "{{ cluster.name }}"
         - type: wait
@@ -545,7 +545,7 @@ spec:
               configMapName: "grid-overlay-grid-single-cluster--consumer-gateway-b-de751065"
             gridIdentity:
               tlsSecretName: "consumer-gateway-tls"
-              caSecretName: "grid-ca"
+              caSecretName: "consumer-gateway-tls"
             podLabels:
               grid.praxis.fast/consumer-site: "{{ cluster.name }}"
         - type: wait

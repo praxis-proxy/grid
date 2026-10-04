@@ -456,7 +456,7 @@
                       "transport": {
                         "type": "object",
                         "additionalProperties": false,
-                        "description": "Upstream transport. Defaults to mutual_tls when gridIdentity.tlsSecretName is set, else plaintext. mutual_tls also needs gridIdentity.caSecretName.",
+                        "description": "Upstream transport. Remote-site backends default to mutual_tls with a Grid identity and CA. Without an identity, remote-site backends need an explicit transport mode. A provider local backend defaults to plaintext.",
                         "properties": {
                           "mode": {
                             "type": "string",
@@ -632,7 +632,7 @@
                   "transport": {
                     "type": "object",
                     "additionalProperties": false,
-                    "description": "Upstream transport. Defaults to mutual_tls when gridIdentity.tlsSecretName is set, else plaintext. mutual_tls also needs gridIdentity.caSecretName.",
+                    "description": "Upstream transport. Remote-site backends default to mutual_tls with a Grid identity and CA. Without an identity, remote-site backends need an explicit transport mode. A provider local backend defaults to plaintext.",
                     "properties": {
                       "mode": {
                         "type": "string",
