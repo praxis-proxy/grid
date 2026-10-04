@@ -540,8 +540,9 @@ assert_serving() {
 
   # The backend serves /health, so a 404 here is the gateway refusing it.
   refused_path "disallowed path /health" 404 /health
-  refused_path "traversal /v1/models/../../health" 404 /v1/models/../../health
-  refused_path "encoded traversal /v1/models/%2e%2e/%2e%2e/health" 404 /v1/models/%2e%2e/%2e%2e/health
+  # praxis rejects dot-dot segments with 400 before routing.
+  refused_path "traversal /v1/models/../../health" 400 /v1/models/../../health
+  refused_path "encoded traversal /v1/models/%2e%2e/%2e%2e/health" 400 /v1/models/%2e%2e/%2e%2e/health
   refused_path "prefix boundary /v1/modelsX" 404 /v1/modelsX
   refused_path "method DELETE /v1/models" 405 /v1/models -X DELETE
 
