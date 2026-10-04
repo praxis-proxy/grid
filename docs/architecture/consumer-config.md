@@ -247,9 +247,10 @@ do not assume every filter reloads its credential or certificate files.
 
 The dynamic routing overlay reloads independently. The current `grid-gateway`
 also watches `serving-config.json` and the signals pollers' identity files every
-five seconds when `GRID_SERVING_CONFIG` is set. That watcher applies topology
-and poller changes, keeps the last accepted state on invalid updates, and does
-not update listener settings or add load-balancer clusters to `praxis.yaml`.
+five seconds when `GRID_SERVING_CONFIG` is set. Invalid serving-data updates
+keep the last accepted settings and topology. Changes to mounted identity files
+can still restart signals pollers using those accepted settings. The watcher
+does not update listener settings or add load-balancer clusters to `praxis.yaml`.
 See the [gateway chart serving guide](../../charts/praxis-gateway/README.md#cross-site-routing-in-agn).
 
 [praxis-reload]: https://github.com/praxis-proxy/praxis/blob/main/docs/operating/configuration.md#dynamic-configuration-reload
