@@ -24,6 +24,12 @@ Run Helm tests:
   helm test {{ .Release.Name }} -n {{ .Release.Namespace }}
 {{- end }}
 
+{{- if and (not (include "grid-operator.metricsTls.enabled" .)) (ne (toString .Values.metrics.tls.enabled) "false") }}
+
+Metrics and health are plaintext: this install has no grid identity to serve. Set
+grid.id or enrollment.enabled to serve the site identity, or metrics.tls.source.
+{{- end }}
+
 Next steps:
 
   1. Create TLS and SWIM encryption Secrets.

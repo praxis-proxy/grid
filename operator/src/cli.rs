@@ -4,7 +4,10 @@ use std::{net::SocketAddr, time::Duration};
 
 use clap::{Args, Parser};
 
-use crate::{enroll, gateway};
+use crate::{
+    crd::grid_network::{PeerTrustMode, SignalMode},
+    enroll, gateway,
+};
 
 /// grid-operator command-line interface.
 #[derive(Parser, Debug, Clone)]
@@ -25,6 +28,44 @@ pub struct Cli {
     /// Signals serving and peer polling options.
     #[command(flatten)]
     pub signals: SignalsArgs,
+
+    /// Grid-wide modes to start in before a `GridNetwork` exists.
+    #[command(flatten)]
+    pub grid: GridArgs,
+
+    /// Metrics and health listener options.
+    #[command(flatten)]
+    pub metrics: MetricsArgs,
+}
+
+/// Grid-wide modes the install declares, used until its `GridNetwork` exists.
+#[derive(Args, Debug, Clone)]
+#[group(id = "grid")]
+pub struct GridArgs {
+    /// Signal transport to start in with no `GridNetwork`, the chart's grid.signals.
+    #[arg(long = "grid-signals", env = "GRID_SIGNAL_TRANSPORT", value_enum)]
+    pub signal_transport: Option<SignalMode>,
+
+    /// Peer trust to start in with no `GridNetwork`, the chart's grid.peerTrust.
+    #[arg(long = "grid-peer-trust", env = "GRID_PEER_TRUST", value_enum)]
+    pub peer_trust: Option<PeerTrustMode>,
+}
+
+/// Metrics and health listener options.
+#[derive(Args, Debug, Clone)]
+#[group(id = "metrics")]
+pub struct MetricsArgs {
+    /// PEM certificate the listener serves. With the key, the listener is TLS only.
+    #[arg(long = "metrics-tls-cert", env = "GRID_METRICS_TLS_CERT")]
+    pub cert: Option<std::path::PathBuf>,
+
+    /// PEM private key for the listener certificate.
+    #[arg(long = "metrics-tls-key", env = "GRID_METRICS_TLS_KEY")]
+    pub key: Option<std::path::PathBuf>,
+
+    /// Serve the site identity Secret in the operator namespace instead, once enrollment writes it.
+    #[arg(long = "metrics-tls-site-secret", env = "GRID_METRICS_TLS_SITE_SECRET")]
+    pub site_identity_secret: Option<String>,
 }
 
 /// SWIM runtime options.
@@ -40,6 +81,10 @@ pub struct SwimArgs {
         value_parser = clap::builder::BoolishValueParser::new()
     )]
     pub require_key: bool,
+
+    /// This site's name, read once and used for SWIM, the certificate, and provider placement.
+    #[arg(id = "swim_site_name", long = "swim-site-name", env = "GRID_SWIM_SITE_NAME")]
+    pub site_name: Option<String>,
 }
 
 /// Signals serving and peer polling options, used under signalTransport poll.

@@ -42,6 +42,10 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "grid-enrollment.labels" . | nindent 4 }}
+  {{- with .Values.db.builtin.pvcAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
 spec:
   accessModes: ["ReadWriteOnce"]
   resources:

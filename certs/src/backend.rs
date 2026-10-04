@@ -13,14 +13,16 @@ use time::OffsetDateTime;
 mod rcgen_backend;
 #[cfg(feature = "rcgen")]
 pub(crate) use rcgen_backend::{
-    CaMaterial, csr_spki_der, generate_ca, generate_csr, issue_leaf, load_ca, sha256, sign_csr, verify_leaf_signature,
+    CaMaterial, csr_spki_der, generate_ca, generate_csr, issue_leaf, key_spki_der, load_ca, sha256, sign_csr,
+    sign_message, verify_leaf_signature, verify_message,
 };
 
 #[cfg(feature = "fips")]
 mod openssl_backend;
 #[cfg(feature = "fips")]
 pub(crate) use openssl_backend::{
-    CaMaterial, csr_spki_der, generate_ca, generate_csr, issue_leaf, load_ca, sha256, sign_csr, verify_leaf_signature,
+    CaMaterial, csr_spki_der, generate_ca, generate_csr, issue_leaf, key_spki_der, load_ca, sha256, sign_csr,
+    sign_message, verify_leaf_signature, verify_message,
 };
 
 /// What a certificate should say, independent of the backend that mints it.

@@ -66,7 +66,7 @@ use operator::{
     cli::Cli,
     controller::{
         agent_tool_provider,
-        grid_network::{self, OperatorCtx},
+        grid_network::{self, GridModes, OperatorCtx},
         grid_site, inference_provider,
     },
     crd::{
@@ -111,9 +111,22 @@ async fn main() {
         },
     };
 
-    // Probes answer during enrollment and the LoadBalancer wait.
+    // Probes answer during enrollment and the LoadBalancer wait, except under site identity TLS, which waits for
+    // enrollment.
     let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let metrics_server = tokio::spawn(run_metrics_server(Arc::clone(&ready)));
+    let metrics_tls = match operator::metrics_tls::MetricsTls::from_args(
+        config.metrics.cert.clone(),
+        config.metrics.key.clone(),
+        config.metrics.site_identity_secret.clone(),
+        &client,
+    ) {
+        Ok(tls) => tls,
+        Err(error) => {
+            tracing::error!(%error, "invalid metrics TLS settings");
+            std::process::exit(1);
+        },
+    };
+    let metrics_server = tokio::spawn(run_metrics_server(Arc::clone(&ready), metrics_tls));
 
     if config.enrollment.enabled
         && let Err(error) = Box::pin(operator::enroll::ensure_enrolled(&client, &config.enrollment)).await
@@ -121,17 +134,38 @@ async fn main() {
         tracing::error!(%error, "site enrollment failed");
         std::process::exit(1);
     }
-
     let GridModes {
         signal: signal_mode,
         trust,
-    } = match resolve_grid_modes(&client).await {
+    } = match resolve_grid_modes(
+        &client,
+        config.enrollment.enabled,
+        GridModes::without_network(config.grid.signal_transport, config.grid.peer_trust),
+    )
+    .await
+    {
         Ok(modes) => modes,
         Err(error) => {
             tracing::error!(%error, "failed to resolve grid modes");
             std::process::exit(1);
         },
     };
+    // The loop follows the declared peer trust, which may change after startup.
+    let (declared_trust, trust_changes) = tokio::sync::watch::channel(trust);
+    let mut rotation_running = false;
+    if config.enrollment.renew {
+        match operator::enroll::renew::Settings::from_config(&config.enrollment) {
+            Ok(settings) => {
+                rotation_running = true;
+                let install = GridModes::without_network(config.grid.signal_transport, config.grid.peer_trust);
+                let settings = settings
+                    .with_gateway(&config.gateway.namespace, &config.gateway.service_name)
+                    .with_declared_trust(install, trust_changes);
+                drop(tokio::spawn(operator::enroll::renew::run(client.clone(), settings)));
+            },
+            Err(error) => tracing::error!(%error, "site identity rotation is off: misconfigured"),
+        }
+    }
     let signals_enabled = matches!(signal_mode, SignalMode::Poll);
     let peer_settings = grid_network::PeerSettings {
         local_signals_addr: config.signals.local_addr(),
@@ -141,6 +175,9 @@ async fn main() {
     let ctx = Arc::new(
         OperatorCtx::new(client.clone(), None, signal_mode)
             .with_peer_settings(peer_settings)
+            .with_declared_trust(declared_trust)
+            .with_rotation(rotation_running)
+            .with_site_name(config.swim.site_name.clone())
             .hold_membership(),
     );
 
@@ -168,7 +205,7 @@ async fn main() {
         ),
         run_network_controller(client.clone(), Arc::clone(&ctx), swim_rx.clone()),
         run_site_controller(client.clone()),
-        run_provider_controller(client.clone()),
+        run_provider_controller(client.clone(), ctx.site_name().map(str::to_owned)),
         run_agent_tool_provider_controller(client.clone()),
         async { metrics_server.await? },
         run_signals_server(
@@ -287,32 +324,9 @@ async fn swim_settled(mut startup: SwimStartup) -> Option<Arc<swim_runtime::Swim
     }
 }
 
-/// Grid-wide modes read once from the `GridNetwork` at startup.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct GridModes {
-    /// Signal propagation.
-    signal: SignalMode,
-    /// Peer authorization on the signals path.
-    trust: operator::signals::PeerTrustMode,
-}
-
-impl GridModes {
-    /// The modes `network` declares, defaults for absent fields.
-    fn of(network: &GridNetwork) -> Self {
-        Self {
-            signal: network
-                .spec
-                .signal_transport
-                .as_ref()
-                .map(|t| t.mode)
-                .unwrap_or_default(),
-            trust: network.spec.peer_trust.as_ref().map(|t| t.mode).unwrap_or_default(),
-        }
-    }
-}
-
-/// Resolve the grid-wide modes from the sole `GridNetwork`, read once at startup.
-async fn resolve_grid_modes(client: &Client) -> Result<GridModes, String> {
+/// Resolve the grid-wide modes from the sole `GridNetwork`, read once at startup, or
+/// `without_network` when none exists yet.
+async fn resolve_grid_modes(client: &Client, enrolled: bool, without_network: GridModes) -> Result<GridModes, String> {
     let networks: Api<GridNetwork> = Api::all(client.clone());
     let items = networks
         .list(&kube::api::ListParams::default())
@@ -321,8 +335,9 @@ async fn resolve_grid_modes(client: &Client) -> Result<GridModes, String> {
         .items;
     match items.as_slice() {
         [] => {
-            tracing::info!("no GridNetwork at startup; gossip signals, pin peer trust");
-            Ok(GridModes::default())
+            let identity = if enrolled { " (enrolled identity)" } else { "" };
+            tracing::info!(modes = ?without_network, "no GridNetwork yet; starting in the install's modes{identity}");
+            Ok(without_network)
         },
         [network] => {
             let modes = GridModes::of(network);
@@ -368,7 +383,7 @@ async fn maybe_start_swim(client: &Client, cli: &Cli) -> Result<Option<Arc<swim_
             return Err(format!("GRID_SWIM_BIND_ADDR is not a valid socket address: {e}"));
         },
     };
-    let site_name = swim_site_name(std::env::var("GRID_SWIM_SITE_NAME").ok())?;
+    let site_name = swim_site_name(cli.swim.site_name.clone())?;
     let (advertise_addr, lb_watch) = swim_advertise_addr(client, bind_addr).await?;
     if advertise_addr.unwrap_or(bind_addr).ip().is_unspecified() {
         return Err("refusing to advertise an unspecified SWIM address; set GRID_SWIM_ADVERTISE_ADDR".to_owned());
@@ -1004,7 +1019,7 @@ async fn run_network_controller(
         .run(grid_network::reconcile, grid_network::error_policy, ctx)
         .for_each(|result| async {
             match result {
-                Ok((obj, _action)) => tracing::info!(%obj, "reconciled GridNetwork"),
+                Ok((obj, _action)) => tracing::debug!(%obj, "reconciled GridNetwork"),
                 Err(e) => log_controller_error("GridNetwork", &e),
             }
         })
@@ -1049,7 +1064,7 @@ async fn run_site_controller(client: Client) -> Result<(), Box<dyn std::error::E
         .run(grid_site::reconcile, grid_site::error_policy, Arc::new(client))
         .for_each(|result| async {
             match result {
-                Ok((obj, _action)) => tracing::info!(%obj, "reconciled GridSite"),
+                Ok((obj, _action)) => tracing::debug!(%obj, "reconciled GridSite"),
                 Err(e) => log_controller_error("GridSite", &e),
             }
         })
@@ -1066,18 +1081,21 @@ async fn run_site_controller(client: Client) -> Result<(), Box<dyn std::error::E
 /// reconciliation.
 ///
 /// [`InferenceProvider`]: operator::crd::inference_provider::InferenceProvider
-async fn run_provider_controller(client: Client) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn run_provider_controller(
+    client: Client,
+    local_site: Option<String>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let api = Api::<InferenceProvider>::all(client.clone());
 
     Controller::new(api, watcher::Config::default())
         .run(
             inference_provider::reconcile,
             inference_provider::error_policy,
-            Arc::new(client),
+            Arc::new(inference_provider::ProviderCtx { client, local_site }),
         )
         .for_each(|result| async {
             match result {
-                Ok((obj, _action)) => tracing::info!(%obj, "reconciled InferenceProvider"),
+                Ok((obj, _action)) => tracing::debug!(%obj, "reconciled InferenceProvider"),
                 Err(e) => log_controller_error("InferenceProvider", &e),
             }
         })
@@ -1103,7 +1121,7 @@ async fn run_agent_tool_provider_controller(client: Client) -> Result<(), Box<dy
         )
         .for_each(|result| async {
             match result {
-                Ok((obj, _action)) => tracing::info!(%obj, "reconciled AgentToolProvider"),
+                Ok((obj, _action)) => tracing::debug!(%obj, "reconciled AgentToolProvider"),
                 Err(e) => log_controller_error("AgentToolProvider", &e),
             }
         })
@@ -1115,6 +1133,7 @@ async fn run_agent_tool_provider_controller(client: Client) -> Result<(), Box<dy
 /// Serve Prometheus metrics and health endpoints.
 async fn run_metrics_server(
     ready: Arc<std::sync::atomic::AtomicBool>,
+    tls: Option<operator::metrics_tls::MetricsTls>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let addr = std::env::var("GRID_METRICS_ADDR").unwrap_or_else(|_| "0.0.0.0:9090".to_owned());
     let app = axum::Router::new()
@@ -1124,12 +1143,18 @@ async fn run_metrics_server(
             "/readyz",
             axum::routing::get(move || std::future::ready(readiness(&ready))),
         );
+    if let Some(tls) = tls {
+        return operator::metrics_tls::serve_metrics_tls(&addr, app, tls, METRICS_TLS_RELOAD).await;
+    }
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     let bound_addr = listener.local_addr().map_or_else(|_| addr.clone(), |a| a.to_string());
-    tracing::info!(addr = %bound_addr, "metrics server started");
+    tracing::info!(addr = %bound_addr, tls = false, "metrics server started");
     axum::serve(listener, app).await?;
     Ok(())
 }
+
+/// How often the metrics listener checks its certificate for rotation.
+const METRICS_TLS_RELOAD: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Prometheus text-format metrics handler.
 async fn metrics_handler() -> impl axum::response::IntoResponse {
@@ -1699,7 +1724,7 @@ fn caller_for(leaf: Option<&[u8]>, identity: &SignalsIdentity, remote: SocketAdd
         return (Caller::Peer(None), None);
     };
     let fingerprint = operator::signals::leaf_fingerprint(leaf);
-    if identity.own.as_ref().is_some_and(|own| own.fingerprint == fingerprint) {
+    if identity.own.as_ref().is_some_and(|own| own.is_own(&fingerprint)) {
         return (Caller::Local, None);
     }
     let named = match identity.trust {
@@ -2389,6 +2414,37 @@ mod tests {
     /// A caller is scoped from its certificate, and nothing is trusted for
     /// presenting nothing: only this site's own certificate earns `Local`, and
     /// a missing or undeclared certificate is served nothing.
+    /// After a renewal the co-located gateway stays Local on either leaf until it reloads.
+    #[test]
+    fn the_replaced_leaf_stays_local_until_the_gateway_reloads() {
+        let addr = SocketAddr::from(([127, 0, 0, 1], 0));
+        let (renewed, replaced, stranger) = ([1_u8, 1], [2_u8, 2], [3_u8, 3]);
+        let identity = SignalsIdentity {
+            peers: operator::signals::PeerIdentities::new(),
+            own: Some(grid_network::OwnLeaf {
+                fingerprint: operator::signals::leaf_fingerprint(&renewed),
+                spiffe: None,
+                previous: Some(operator::signals::leaf_fingerprint(&replaced)),
+            }),
+            trust: operator::signals::PeerTrustMode::Pin,
+        };
+        assert_eq!(
+            caller_for(Some(&renewed), &identity, addr).0,
+            Caller::Local,
+            "the renewed leaf"
+        );
+        assert_eq!(
+            caller_for(Some(&replaced), &identity, addr).0,
+            Caller::Local,
+            "the replaced leaf"
+        );
+        assert_eq!(
+            caller_for(Some(&stranger), &identity, addr),
+            (Caller::Peer(None), None),
+            "anything else is not this site"
+        );
+    }
+
     #[test]
     fn signals_caller_scope_requires_a_positive_credential() {
         let addr = SocketAddr::from(([127, 0, 0, 1], 0));
@@ -2397,6 +2453,7 @@ mod tests {
             Some(grid_network::OwnLeaf {
                 fingerprint,
                 spiffe: None,
+                previous: None,
             })
         };
 
@@ -2452,6 +2509,7 @@ mod tests {
             own: Some(grid_network::OwnLeaf {
                 fingerprint: operator::signals::leaf_fingerprint(own),
                 spiffe: Some(certs::spiffe_id("hub")),
+                previous: None,
             }),
             trust,
         }
@@ -2603,6 +2661,7 @@ mod tests {
                 own: Some(grid_network::OwnLeaf {
                     fingerprint: operator::signals::leaf_fingerprint(&pem_der(&self.west.cert_pem)),
                     spiffe: None,
+                    previous: None,
                 }),
                 trust: operator::signals::PeerTrustMode::Pin,
             }
@@ -2691,6 +2750,84 @@ mod tests {
     #[cfg(not(feature = "fips"))]
     fn ok_app() -> axum::Router {
         axum::Router::new().route(operator::signals::SIGNALS_PATH, axum::routing::get(|| async { "ok" }))
+    }
+
+    /// A renewal rebinds the listener on the new leaf: a peer's open connection keeps
+    /// polling across it, and new connections see the renewed leaf.
+    #[cfg(not(feature = "fips"))]
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "serve, poll, rotate, and poll again read as one scenario"
+    )]
+    async fn a_renewal_rebinds_the_listener_without_dropping_a_peer_poll() {
+        let mesh = Mesh::new();
+        let renewed = certs::generate_site_cert(&mesh.ca, "east").expect("fixture");
+        let identity = || {
+            let peers = operator::signals::PeerIdentities::new();
+            peers.set(BTreeMap::from([(
+                "west".to_owned(),
+                operator::signals::PeerRecord {
+                    labels: gpu(),
+                    pins: Vec::new(),
+                },
+            )]));
+            SignalsIdentity {
+                peers,
+                own: None,
+                trust: operator::signals::PeerTrustMode::Spiffe,
+            }
+        };
+        let serve = |leaf: &certs::SiteCertOutput| {
+            let tls = tls_backend::build_server_config(
+                mesh.ca.cert_pem.as_bytes(),
+                leaf.cert_pem.as_bytes(),
+                leaf.key_pem.as_bytes(),
+            )
+            .expect("fixture");
+            let serving = Serving {
+                tls,
+                app: ok_app(),
+                identity: identity(),
+            };
+            async move {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("fixture");
+                let addr = listener.local_addr().expect("fixture");
+                let (rotate, rotated) = tokio::sync::oneshot::channel::<()>();
+                let changed = async move { drop(rotated.await) };
+                let server = tokio::spawn(serve_signals_tls(listener, serving, Admission::new(8), changed));
+                (addr, rotate, server)
+            }
+        };
+        let presented = |conn: &tokio_rustls::client::TlsStream<tokio::net::TcpStream>| {
+            conn.get_ref()
+                .1
+                .peer_certificates()
+                .and_then(<[_]>::first)
+                .map(|leaf| leaf.as_ref().to_vec())
+        };
+
+        let (before, rotate, server) = serve(&mesh.east).await;
+        let mut polling = mesh.connect(before).await;
+        assert!(get(&mut polling).await.starts_with(b"HTTP/1.1 200"), "polls before");
+        rotate.send(()).expect("rotate");
+        server
+            .await
+            .expect("server task")
+            .expect("the listener stops for the new leaf");
+        assert!(
+            get(&mut polling).await.starts_with(b"HTTP/1.1 200"),
+            "the open connection still polls across the rotation"
+        );
+
+        let (after, _rotate, _server) = serve(&renewed).await;
+        let mut fresh = mesh.connect(after).await;
+        assert_eq!(
+            presented(&fresh),
+            Some(pem_der(&renewed.cert_pem)),
+            "the rebound listener presents the renewed leaf"
+        );
+        assert!(get(&mut fresh).await.starts_with(b"HTTP/1.1 200"), "and serves");
     }
 
     /// An unnamed caller is closed after the handshake without an HTTP answer.

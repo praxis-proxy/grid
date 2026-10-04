@@ -16,6 +16,7 @@ tests:
     set:
       route.enabled: true
       route.tls.termination: reencrypt
+      enrollment.rotation.enabled: false
       route.tls.destinationCACertificate: ca
     asserts:
       - matchRegexRaw:

@@ -567,23 +567,23 @@ async fn read_tls_material(
         })
 }
 
-/// Read `tls.ca_secret_ref`'s CA certificate and add it to `builder` as a
-/// trusted root.
+/// Read `tls`'s CA certificate and add it to `builder` as a trusted root.
 async fn attach_tls_ca(
     builder: reqwest::ClientBuilder,
     kube_client: &kube::Client,
     tls: &EndpointTlsConfig,
     provider_identity: &str,
 ) -> Result<reqwest::ClientBuilder, McpProbeOutcome> {
-    let ca_key = tls.ca_secret_ref.key.as_deref().unwrap_or("ca.crt");
-    let ca_pem = Box::pin(read_tls_material(
+    let ca_pem = Box::pin(crate::resources::endpoint_tls::read_ca_for_tls(
         kube_client,
-        &tls.ca_secret_ref,
-        ca_key,
+        tls,
         provider_identity,
-        "CA",
     ))
-    .await?;
+    .await
+    .map_err(|(reason, msg)| {
+        tracing::warn!(provider_identity, error = %msg, "AgentToolProvider probe TLS material invalid");
+        McpProbeOutcome::TlsConfigInvalid(reason.as_status_reason("Endpoint"))
+    })?;
     if let Err(e) = validate_pem_certificates(&ca_pem) {
         tracing::warn!(provider_identity, error = %e, "AgentToolProvider probe CA PEM unparseable");
         return Err(McpProbeOutcome::TlsConfigInvalid(
@@ -1070,11 +1070,12 @@ mod tests {
     #[test]
     fn present_spec_tls_uses_custom_tls() {
         let tls = EndpointTlsConfig {
-            ca_secret_ref: crate::crd::grid_network::SecretRef {
+            ca_secret_ref: Some(crate::crd::grid_network::SecretRef {
                 name: "ca".to_owned(),
                 namespace: "ns".to_owned(),
                 key: None,
-            },
+            }),
+            ca_config_map_ref: None,
             client_certificate_secret_ref: None,
         };
         assert!(
@@ -1580,7 +1581,8 @@ mod tests {
             secret_with_key("ca.crt", ca.cert_pem.as_bytes()),
         )]));
         let tls = EndpointTlsConfig {
-            ca_secret_ref: test_secret_ref("ca-secret"),
+            ca_secret_ref: Some(test_secret_ref("ca-secret")),
+            ca_config_map_ref: None,
             client_certificate_secret_ref: None,
         };
         let result = attach_tls_ca(reqwest::Client::builder(), &client, &tls, "test-provider").await;
@@ -1603,7 +1605,8 @@ mod tests {
             ),
         )]));
         let tls = EndpointTlsConfig {
-            ca_secret_ref: test_secret_ref("ca-secret"),
+            ca_secret_ref: Some(test_secret_ref("ca-secret")),
+            ca_config_map_ref: None,
             client_certificate_secret_ref: None,
         };
         let result = attach_tls_ca(reqwest::Client::builder(), &client, &tls, "test-provider").await;
@@ -1619,7 +1622,8 @@ mod tests {
         install_test_crypto_provider();
         let client = mock_kube_client_with_secrets(HashMap::from([("ca-secret", secret_with_key("ca.crt", b""))]));
         let tls = EndpointTlsConfig {
-            ca_secret_ref: test_secret_ref("ca-secret"),
+            ca_secret_ref: Some(test_secret_ref("ca-secret")),
+            ca_config_map_ref: None,
             client_certificate_secret_ref: None,
         };
         let result = attach_tls_ca(reqwest::Client::builder(), &client, &tls, "test-provider").await;
@@ -1639,7 +1643,8 @@ mod tests {
         install_test_crypto_provider();
         let client = mock_kube_client_with_secrets(HashMap::new());
         let tls = EndpointTlsConfig {
-            ca_secret_ref: test_secret_ref("absent"),
+            ca_secret_ref: Some(test_secret_ref("absent")),
+            ca_config_map_ref: None,
             client_certificate_secret_ref: None,
         };
         let result = attach_tls_ca(reqwest::Client::builder(), &client, &tls, "test-provider").await;
@@ -1720,7 +1725,8 @@ mod tests {
             secret_with_key("ca.crt", ca.cert_pem.as_bytes()),
         )]));
         let tls = EndpointTlsConfig {
-            ca_secret_ref: test_secret_ref("ca-secret"),
+            ca_secret_ref: Some(test_secret_ref("ca-secret")),
+            ca_config_map_ref: None,
             client_certificate_secret_ref: None,
         };
         let result = attach_tls_material(reqwest::Client::builder(), &client, &tls, "test-provider").await;
@@ -1747,7 +1753,8 @@ mod tests {
             ("client-cert", client_secret),
         ]));
         let tls = EndpointTlsConfig {
-            ca_secret_ref: test_secret_ref("ca-secret"),
+            ca_secret_ref: Some(test_secret_ref("ca-secret")),
+            ca_config_map_ref: None,
             client_certificate_secret_ref: Some(crate::crd::inference_provider::ClientCertificateSecretRef {
                 name: "client-cert".to_owned(),
                 namespace: "default".to_owned(),
@@ -1768,7 +1775,8 @@ mod tests {
             secret_with_key("ca.crt", ca.cert_pem.as_bytes()),
         )]));
         let tls = EndpointTlsConfig {
-            ca_secret_ref: test_secret_ref("ca-secret"),
+            ca_secret_ref: Some(test_secret_ref("ca-secret")),
+            ca_config_map_ref: None,
             client_certificate_secret_ref: Some(crate::crd::inference_provider::ClientCertificateSecretRef {
                 name: "absent-client-cert".to_owned(),
                 namespace: "default".to_owned(),
@@ -1957,12 +1965,12 @@ mod integration_tests {
 
     #[tokio::test]
     async fn probe_against_closed_port_is_unreachable() {
-        // Bind then immediately drop the listener: the port is free again
-        // but nothing is listening, so connect must fail — a real refused
-        // connection, not a stubbed-out unit-test double.
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
+        // Bound but never listening: connects are refused, and no parallel test can take the port.
+        let closed = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+        closed
+            .bind(&std::net::SocketAddr::from(([127, 0, 0, 1], 0)).into())
+            .unwrap();
+        let addr = closed.local_addr().unwrap().as_socket().unwrap();
         let endpoint = format!("http://{addr}/mcp");
         let kube_client = unused_kube_client();
 

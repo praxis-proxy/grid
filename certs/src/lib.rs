@@ -19,21 +19,23 @@ mod provider;
 mod verify;
 
 pub use enroll::{
-    DEFAULT_SITE_CERT_LIFETIME, EnrollError, EnrolledCert, MAX_CSR_PEM_BYTES, Validity, sign_csr, validate_site_name,
-    verify_csr,
+    CLOCK_SKEW_ALLOWANCE, DEFAULT_SITE_CERT_LIFETIME, EnrollError, EnrolledCert, MAX_CSR_PEM_BYTES, Validity,
+    key_matches_cert, sign_csr, validate_site_name, verify_csr,
 };
 pub use generate::{
     CaCert, DEFAULT_ORGANIZATION, GenerateError, GeneratedCsr, SPIFFE_TRUST_DOMAIN, SiteCertOutput, generate_ca,
     generate_cert_with_org, generate_csr, generate_dns_cert, generate_dns_only_cert, generate_expired_dns_cert,
-    generate_not_yet_valid_dns_cert, generate_site_cert, generate_site_cert_with_names, load_ca, spiffe_id,
+    generate_not_yet_valid_dns_cert, generate_site_cert, generate_site_cert_with_names, load_ca, sign_with_ca,
+    spiffe_id,
 };
 #[cfg(feature = "verifier")]
 pub use grid_verifier::{DEFAULT_TRUST_DOMAIN, GridSpiffeClientVerifier, GridSpiffeServerVerifier};
 pub use provider::{CertificateProvider, ProviderError, SiteCertificate, StaticFileProvider, TrustBundle};
 pub use verify::{
-    MAX_CERT_PEM_BYTES, VerifyError, anchored_ca, bundle_within, canonical_fingerprint, cert_dns_sans,
-    cert_expires_within, cert_issuer_and_expiry, cert_public_key, csr_public_key, has_svid_profile, leaf_only,
-    leaf_spiffe_id, site_of_spiffe_id, verify_issued_by, verify_site_cert,
+    MAX_CERT_PEM_BYTES, VerifyError, anchored_ca, bundle_fingerprints, bundle_within, canonical_fingerprint,
+    cert_dns_sans, cert_expires_within, cert_issuer_and_expiry, cert_pem_from_der, cert_public_key,
+    cert_public_key_sha256, cert_validity, csr_public_key, has_svid_profile, leaf_only, leaf_spiffe_id,
+    site_of_spiffe_id, verify_ca_signature, verify_issued_by, verify_site_cert,
 };
 
 /// SHA-256 through the active backend: the sha2 crate by default, system openssl

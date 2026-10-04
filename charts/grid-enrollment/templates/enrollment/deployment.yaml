@@ -63,6 +63,8 @@ spec:
             initialDelaySeconds: 5
             periodSeconds: 10
           env:
+            - name: RUST_LOG
+              value: {{ include "grid-enrollment.rustLog" . | quote }}
             # CA signing material (file paths; read via std::fs). Key is mounted
             # ONLY into this pod, never the gateway.
             - name: ENROLLMENT_CA_CERT
@@ -87,6 +89,16 @@ spec:
                   fieldPath: metadata.namespace
             - name: ENROLLMENT_TOKEN_AUDIENCE
               value: {{ .Values.enrollment.tokenAudience | quote }}
+            {{- end }}
+            {{- with .Values.hubSite.name }}
+            - name: ENROLLMENT_RESERVED_SITES
+              value: {{ . | quote }}
+            - name: ENROLLMENT_RESERVED_SEEDS_DIR
+              value: /etc/grid-reserved-seeds
+            {{- end }}
+            {{- if not (dig "rotation" "enabled" true .Values.enrollment) }}
+            - name: ENROLLMENT_ROTATION_ENABLED
+              value: "false"
             {{- end }}
             {{- if .Values.enrollment.certLifetimeSecs }}
             - name: ENROLLMENT_CERT_LIFETIME_SECS
@@ -126,6 +138,11 @@ spec:
               mountPath: /etc/grid-admin-tokens
               readOnly: true
             {{- end }}
+            {{- if .Values.hubSite.name }}
+            - name: grid-reserved-seeds
+              mountPath: /etc/grid-reserved-seeds
+              readOnly: true
+            {{- end }}
           {{- with .Values.enrollment.resources }}
           resources:
             {{- toYaml . | nindent 12 }}
@@ -147,6 +164,13 @@ spec:
         - name: grid-db-ca
           configMap:
             name: {{ .Values.db.external.caConfigMapName }}
+        {{- end }}
+        {{- if .Values.hubSite.name }}
+        # Trusted only where the CA signed it.
+        - name: grid-reserved-seeds
+          secret:
+            secretName: {{ .Values.hubSite.seedSecretName }}
+            optional: true
         {{- end }}
         {{- if eq .Values.enrollment.authz "local" }}
         - name: grid-admin-tokens

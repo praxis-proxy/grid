@@ -120,6 +120,132 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
 
+  /enrollments/{siteName}:
+    get:
+      operationId: getEnrollment
+      tags: [administration]
+      summary: Read a site's enrollment
+      description: |
+        The enrollment record that holds a site name, to diagnose a rotation
+        refusal or a freeze. Key digests only, never key material.
+      security:
+        - gridAdminAuth: []
+      parameters:
+        - name: siteName
+          in: path
+          required: true
+          description: The site name the enrollment holds.
+          schema:
+            type: string
+      responses:
+        '200':
+          description: The record.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EnrollmentStatus'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: No enrollment holds that site name.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    delete:
+      operationId: deleteEnrollment
+      tags: [administration]
+      summary: Delete a site's enrollment
+      description: |
+        Deletes the enrollment record that holds a site name. The site can no
+        longer rotate, its current certificate stays valid until it expires, and
+        the name is released so the site can enroll again with a new token. This
+        is also how a site frozen after a rotation fork recovers. A reserved
+        name's record comes from the enrollment bootstrap and is refused here.
+      security:
+        - gridAdminAuth: []
+      parameters:
+        - name: siteName
+          in: path
+          required: true
+          description: The site name the enrollment holds.
+          schema:
+            type: string
+      responses:
+        '204':
+          description: Deleted.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: No enrollment holds that site name.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: The name is reserved for the enrollment bootstrap.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /rotations:
+    post:
+      operationId: rotate
+      tags: [enrollment]
+      summary: Rotate a site identity with its current certificate
+      description: |
+        The site authenticates over mutual TLS with its current, unexpired grid
+        certificate and submits a signing request for a new key. Returns a new
+        certificate for the name the presented certificate carries. No token is
+        involved. A name with no enrollment record, a key that is not the site's
+        current one, or a request that reuses a held key is refused. A grid
+        with rotations turned off refuses every rotation with 503.
+      security:
+        - siteCertificateAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EnrollmentRequest'
+      responses:
+        '200':
+          description: The rotated certificate and the grid CA.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Enrollment'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          description: No client certificate, or one this grid did not issue to a site or that is outside its validity.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: The enrollment record does not admit this certificate's key.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Rotation is turned off for this grid (rotation_disabled). Issued certificates stay valid until they expire.
+          headers:
+            Retry-After:
+              description: Seconds to wait before retrying.
+              schema:
+                type: integer
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
 components:
   securitySchemes:
     gridAdminAuth:
@@ -130,6 +256,9 @@ components:
       type: http
       scheme: bearer
       description: A single-use site token, minted by a grid-admin.
+    siteCertificateAuth:
+      type: mutualTLS
+      description: The site's current grid certificate, presented in the TLS handshake.
 
   parameters:
     TokenId:
@@ -259,15 +388,93 @@ components:
             Lowercase hex SHA-256 over the request's public key.
           pattern: '^[0-9a-f]{64}$'
 
+    EnrollmentStatus:
+      type: object
+      description: A site's enrollment record. Digests only, never key material.
+      required: [siteName, id, state, publicKeySha256, incarnationStartedAt, reserved]
+      properties:
+        siteName:
+          type: string
+          description: The site name the record holds.
+        id:
+          type: string
+          format: uuid
+          description: The record identifier.
+        state:
+          type: string
+          enum: [active, frozen]
+          description: |
+            frozen after a rotation fork. A frozen site cannot rotate until a
+            grid-admin deletes its enrollment and it enrolls again.
+        publicKeySha256:
+          type: string
+          description: Lowercase hex SHA-256 of the key the latest issued certificate carries.
+        previousPublicKeySha256:
+          type: [string, 'null']
+          description: The key that one replaced, which may only retry a lost rotation.
+        incarnationStartedAt:
+          type: string
+          format: date-time
+          description: When this record began, at enrollment or a bootstrap seed reset.
+        rotatedAt:
+          type: [string, 'null']
+          format: date-time
+          description: When the record last took a new key, by rotation or a bootstrap seed. Null if it never has.
+        notAfter:
+          type: [string, 'null']
+          format: date-time
+          description: |
+            When the latest certificate this service issued expires. Null for a
+            reserved name's bootstrap certificate until its first rotation.
+        reserved:
+          type: boolean
+          description: A name bootstrap issues, such as the hub's.
     Error:
       type: object
-      description: A failure, described so a caller can act on it.
+      description: |
+        A failure, described so a caller can act on it. Clients act on the HTTP
+        status and treat an unrecognized code by its status class, so codes can
+        be added without breaking them. Retry after a 503 or a 408, waiting for
+        Retry-After when present, and stop on 401 and 403.
+
+        | Code | Status | Meaning |
+        |---|---|---|
+        | invalid_csr | 400 | The signing request does not parse or verify. |
+        | invalid_site_name | 400 | The site name is not a DNS label. |
+        | invalid_token_ttl | 400 | The token lifetime is out of range. |
+        | missing_grid_network | 400 | The token request names no grid. |
+        | unauthorized | 401 | No grid-admin credential, or one not accepted. |
+        | invalid_token | 401 | The site token is unknown, spent, or expired. |
+        | identity_required | 401 | Rotation needs the site's current grid certificate. |
+        | forbidden | 403 | The grid-admin may not perform the action. |
+        | identity_refused | 403 | The record does not admit this certificate, or the site is frozen. |
+        | not_found | 404 | No such token or enrollment. |
+        | timeout | 408 | The request ran past the server's limit. |
+        | name_taken | 409 | Another enrollment holds the site name. |
+        | reserved_site | 409 | The name is the enrollment bootstrap's. |
+        | internal | 500 | The service could not complete the request. |
+        | rotation_disabled | 503 | Rotation is turned off for the grid. Issued certificates stay valid. |
       required: [error, message]
       properties:
         error:
           type: string
-          description: Machine-readable code.
-          examples: ['name_taken']
+          description: Machine-readable code, from the table above.
+          enum:
+            - invalid_csr
+            - invalid_site_name
+            - invalid_token_ttl
+            - missing_grid_network
+            - unauthorized
+            - invalid_token
+            - identity_required
+            - forbidden
+            - identity_refused
+            - not_found
+            - timeout
+            - name_taken
+            - reserved_site
+            - internal
+            - rotation_disabled
         message:
           type: string
           description: What went wrong, and what would fix it.

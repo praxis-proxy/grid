@@ -30,6 +30,27 @@ tests:
           path: data["praxis.yaml"]
           pattern: intelligent_route
 
+  - it: syncs after the grid CRs under Argo CD, since the operator writes the serving ConfigMap from them
+    template: templates/deployment.yaml
+    asserts:
+      - equal:
+          path: metadata.annotations["argocd.argoproj.io/sync-wave"]
+          value: "2"
+
+  - it: carries no sync wave without gridServing
+    template: templates/deployment.yaml
+    set:
+      gridServing.enabled: false
+      gatewayConfig.model: m
+      gatewayConfig.backends:
+        - cluster: pool-b
+          site: site-b
+          endpoints: ["203.0.113.7:8443"]
+          transport: { mode: mutual_tls, sni: site-b.grid.internal }
+    asserts:
+      - notExists:
+          path: metadata.annotations["argocd.argoproj.io/sync-wave"]
+
   - it: points GRID_SERVING_CONFIG at the mounted operator ConfigMap
     template: templates/deployment.yaml
     asserts:
@@ -74,3 +95,36 @@ tests:
     asserts:
       - failedTemplate:
           errorPattern: "set gridServing.configMap"
+
+  - it: refuses a readiness probe on Praxis /ready while backends are rendered
+    template: templates/deployment.yaml
+    set:
+      health.readiness: { httpGet: { path: /ready, port: 9901 } }
+    asserts:
+      - failedTemplate:
+          errorPattern: health.readiness must not probe Praxis /ready
+
+  - it: refuses an exec liveness probe that curls /ready
+    template: templates/deployment.yaml
+    set:
+      health.liveness: { exec: { command: [curl, -f, "http://127.0.0.1:9901/ready"] } }
+    asserts:
+      - failedTemplate:
+          errorPattern: health.liveness must not probe Praxis /ready
+
+  - it: keeps a probe on another path such as /readyz
+    template: templates/deployment.yaml
+    set:
+      health.readiness: { httpGet: { path: /readyz, port: 8080 } }
+    asserts:
+      - notFailedTemplate: {}
+
+  - it: probes readiness on /healthy, not /ready, when backends are rendered
+    template: templates/deployment.yaml
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].readinessProbe.exec.command
+          content: http://127.0.0.1:9901/healthy
+      - notContains:
+          path: spec.template.spec.containers[0].readinessProbe.exec.command
+          content: http://127.0.0.1:9901/ready

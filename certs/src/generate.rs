@@ -342,6 +342,15 @@ pub fn generate_cert_with_org(ca: &CaCert, site_name: &str, org: &str) -> Result
     })
 }
 
+/// Sign `message` with the CA key, for a record only the CA's holder may vouch for.
+///
+/// # Errors
+///
+/// Returns [`GenerateError`] if signing fails.
+pub fn sign_with_ca(ca: &CaCert, message: &[u8]) -> Result<Vec<u8>, GenerateError> {
+    backend::sign_message(&ca.material, message).map_err(map_backend)
+}
+
 /// Load an existing CA from PEM files and reconstruct a [`CaCert`] for signing.
 ///
 /// Use this to reuse a CA that was previously generated and written to disk

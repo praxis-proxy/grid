@@ -229,3 +229,130 @@ tests:
               - RELEASE-NAME-grid-enrollment-db
               - RELEASE-NAME-grid-enrollment-grid-admin-tokens
             verbs: ["patch"]
+
+  - it: issues the hub site identity from the CA when hubSite.name is set
+    template: templates/certs/ca-bootstrap-job.yaml
+    set:
+      hubSite.name: hub
+      hubSite.namespace: grid-system
+      enrollment.certLifetimeSecs: "86400"
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --site-name
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: hub
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: grid-system
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: ENROLLMENT_CERT_LIFETIME_SECS
+            value: "86400"
+
+  - it: issues no hub identity by default
+    template: templates/certs/ca-bootstrap-job.yaml
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].args
+          content: --site-name
+      - equal:
+          path: spec.template.spec.containers[0].env
+          value:
+            - {name: RUST_LOG, value: info}
+
+  - it: grants the bootstrap only its Secrets in the hub namespace
+    template: templates/certs/ca-bootstrap-rbac.yaml
+    set:
+      hubSite.name: hub
+      hubSite.namespace: grid-system
+    asserts:
+      - isKind:
+          of: Role
+        documentIndex: 3
+      - equal:
+          path: metadata.namespace
+          value: grid-system
+        documentIndex: 3
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["secrets"]
+            resourceNames: ["grid-site-identity", "grid-ca"]
+            verbs: ["get", "update"]
+        documentIndex: 3
+      - equal:
+          path: subjects[0].namespace
+          value: NAMESPACE
+        documentIndex: 4
+
+  - it: lets the bootstrap delete only the hub's identity Secret, to replace a placeholder
+    template: templates/certs/ca-bootstrap-rbac.yaml
+    set:
+      hubSite.name: hub
+      hubSite.namespace: grid-system
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["secrets"]
+            resourceNames: ["grid-site-identity"]
+            verbs: ["delete"]
+        documentIndex: 3
+
+  - it: lets the bootstrap write only the hub's seed Secret
+    template: templates/certs/ca-bootstrap-rbac.yaml
+    set:
+      hubSite.name: hub
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["secrets"]
+            resourceNames: ["grid-reserved-seeds"]
+            verbs: ["get", "patch"]
+        documentIndex: 1
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: grid-reserved-seeds
+        template: templates/certs/ca-bootstrap-job.yaml
+
+  - it: refuses a hub site that is also invited
+    template: templates/certs/ca-bootstrap-job.yaml
+    set:
+      hubSite.name: hub
+      invites:
+        hub: {}
+    asserts:
+      - failedTemplate:
+          errorPattern: hubSite.name "hub" is also invited
+
+  - it: creates the SWIM key with the hub identity, unless its name is empty
+    template: templates/certs/ca-bootstrap-job.yaml
+    set:
+      hubSite.name: hub
+      hubSite.swimKeySecretName: ""
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].args
+          content: --swim-key-secret
+
+  - it: only reads the SWIM key back in the hub namespace
+    template: templates/certs/ca-bootstrap-rbac.yaml
+    set:
+      hubSite.name: hub
+      hubSite.namespace: grid-system
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["secrets"]
+            resourceNames: ["grid-swim-key"]
+            verbs: ["get"]
+        documentIndex: 3

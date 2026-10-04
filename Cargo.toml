@@ -64,10 +64,10 @@ spiffe = { version = "0.16.1", default-features = false, features = ["x509"] }
 # TLS backend left to the consumer (enrollment picks rustls or system openssl).
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "postgres", "uuid", "time", "json", "migrate"] }
 thiserror = "2.0.20"
-time = { version = "0.3", features = ["formatting"] }
+time = { version = "0.3", features = ["formatting", "parsing"] }
 tokio = { version = "1.53.1", features = ["macros", "rt", "rt-multi-thread", "signal", "net", "time", "io-util"] }
 tokio-openssl = "0.6"
-tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12", "ring"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12"] }
 toml = "1.1.4"
 tower = "0.5.3"
 tracing = "0.1.44"

@@ -17,7 +17,7 @@ use std::{
 use k8s_openapi::api::core::v1::ConfigMap;
 use kube::{
     Client,
-    api::{Api, ListParams, Patch, PatchParams},
+    api::{Api, DeleteParams, ListParams, Patch, PatchParams, Preconditions},
     runtime::{controller::Action, reflector::ObjectRef},
 };
 use tokio::{sync::Mutex, time::Duration};
@@ -27,7 +27,8 @@ use crate::{
     crd::{
         grid_network::{
             ConsumerConfig, ConsumerConfigPhase, ConsumerConfigStatus, GatewayRef, GridNetwork, GridNetworkPhase,
-            GridNetworkStatus, OverlayPhase, OverlayRevisionStatus, SignalMode, TenantBudgetStatus, TransportMode,
+            GridNetworkStatus, OverlayPhase, OverlayRevisionStatus, PeerTrustMode, SignalMode, SiteIdentityStatus,
+            TenantBudgetStatus, TransportMode,
         },
         grid_site::{GridSite, GridSitePhase, GridSiteStatus},
         inference_provider::InferenceProvider,
@@ -125,6 +126,109 @@ pub struct OperatorCtx {
 
     /// Whether membership-derived writes may run, cleared while SWIM converges.
     membership_ready: std::sync::atomic::AtomicBool,
+
+    /// Where the declared peer trust goes, so site identity rotation follows it.
+    declared_trust: Option<tokio::sync::watch::Sender<PeerTrustMode>>,
+
+    /// Whether this process runs the site identity rotation loop.
+    rotation: bool,
+
+    /// This site's name, which a certificate the operator issues itself carries.
+    site_name: Option<String>,
+
+    /// The last value logged per state, so a pass logs at INFO only what changed.
+    pub(crate) logged: ChangeLog,
+
+    /// When this operator started, so discovery never judges a site absent before gossip could vouch for it.
+    started: Instant,
+}
+
+/// The last value logged per key, so INFO fires on a change rather than on every pass.
+#[derive(Debug, Default)]
+pub(crate) struct ChangeLog(std::sync::Mutex<HashMap<String, String>>);
+
+impl ChangeLog {
+    /// Whether `value` differs from the last one recorded for `key`, recording it.
+    pub(crate) fn changed(&self, key: &str, value: String) -> bool {
+        let mut held = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if held.get(key) == Some(&value) {
+            return false;
+        }
+        held.insert(key.to_owned(), value);
+        true
+    }
+
+    /// Forget every key under `prefix` not in `keep`, so departed objects do not grow the log.
+    pub(crate) fn retain_under(&self, prefix: &str, keep: &std::collections::HashSet<String>) {
+        let mut held = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        held.retain(|key, _| !key.starts_with(prefix) || keep.contains(key));
+    }
+}
+
+/// Send `declared` to `sender`, returning whether it changed, so a repeat wakes nobody.
+fn send_declared_trust(sender: &tokio::sync::watch::Sender<PeerTrustMode>, declared: PeerTrustMode) -> bool {
+    sender.send_if_modified(|trust| {
+        let changed = *trust != declared;
+        *trust = declared;
+        changed
+    })
+}
+
+/// Grid-wide modes, fixed for the life of the process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GridModes {
+    /// Signal propagation.
+    pub signal: SignalMode,
+    /// Peer authorization on the signals path.
+    pub trust: PeerTrustMode,
+}
+
+impl GridModes {
+    /// Without a `GridNetwork`: SPIFFE trust in the Grid CA identity, never an implicit pin.
+    pub const WITHOUT_NETWORK: Self = Self {
+        signal: SignalMode::Gossip,
+        trust: PeerTrustMode::Spiffe,
+    };
+
+    /// The modes to start in with no `GridNetwork` yet: the install's declared modes,
+    /// else [`Self::WITHOUT_NETWORK`]. Matching the network the install will create
+    /// means a fresh install never restarts once it appears.
+    #[must_use]
+    pub fn without_network(signal: Option<SignalMode>, trust: Option<PeerTrustMode>) -> Self {
+        Self {
+            signal: signal.unwrap_or(Self::WITHOUT_NETWORK.signal),
+            trust: trust.unwrap_or(Self::WITHOUT_NETWORK.trust),
+        }
+    }
+
+    /// The modes `network` declares, defaults for absent fields.
+    #[must_use]
+    pub fn of(network: &GridNetwork) -> Self {
+        Self {
+            signal: network
+                .spec
+                .signal_transport
+                .as_ref()
+                .map(|t| t.mode)
+                .unwrap_or_default(),
+            trust: network.spec.peer_trust.as_ref().map(|t| t.mode).unwrap_or_default(),
+        }
+    }
+
+    /// Whether the site identity renews: a pinned peer would refuse the renewed leaf.
+    #[must_use]
+    pub const fn renews(self) -> bool {
+        matches!(self.trust, PeerTrustMode::Spiffe)
+    }
+
+    /// The modes to restart into when `network` declares other than `self`, the running modes.
+    #[must_use]
+    pub fn restart_for(self, network: Option<&GridNetwork>) -> Option<Self> {
+        // Only the poll path reads trust, so a trust change under gossip needs no restart.
+        network.map(Self::of).filter(|declared| {
+            declared.signal != self.signal || (declared.signal == SignalMode::Poll && declared.trust != self.trust)
+        })
+    }
 }
 
 /// Peer addressing and trust, resolved once at startup.
@@ -133,7 +237,7 @@ pub struct PeerSettings {
     /// This site's own signals endpoint, for its gateway.
     pub local_signals_addr: Option<String>,
     /// How peers prove their identity.
-    pub trust: signals::PeerTrustMode,
+    pub trust: PeerTrustMode,
     /// Port dialed for a peer that gossips no signals endpoint.
     pub peer_port: u16,
 }
@@ -142,7 +246,7 @@ impl Default for PeerSettings {
     fn default() -> Self {
         Self {
             local_signals_addr: None,
-            trust: signals::PeerTrustMode::default(),
+            trust: PeerTrustMode::default(),
             peer_port: signals::DEFAULT_PEER_PORT,
         }
     }
@@ -175,6 +279,32 @@ impl OperatorCtx {
             serving_writes: WriteGate::default(),
             peer_settings: PeerSettings::default(),
             membership_ready: std::sync::atomic::AtomicBool::new(true),
+            declared_trust: None,
+            rotation: false,
+            site_name: None,
+            logged: ChangeLog::default(),
+            started: Instant::now(),
+        }
+    }
+
+    /// Report a rotation schedule only when this process runs the rotation loop.
+    #[must_use]
+    pub const fn with_rotation(mut self, rotation: bool) -> Self {
+        self.rotation = rotation;
+        self
+    }
+
+    /// Send the declared peer trust here whenever a `GridNetwork` changes it.
+    #[must_use]
+    pub fn with_declared_trust(mut self, declared_trust: tokio::sync::watch::Sender<PeerTrustMode>) -> Self {
+        self.declared_trust = Some(declared_trust);
+        self
+    }
+
+    /// Publish the trust `network` declares, waking its watchers only on a change.
+    fn publish_declared_trust(&self, network: &GridNetwork) {
+        if let Some(sender) = &self.declared_trust {
+            send_declared_trust(sender, GridModes::of(network).trust);
         }
     }
 
@@ -218,6 +348,25 @@ impl OperatorCtx {
     #[must_use]
     pub fn with_peer_settings(mut self, settings: PeerSettings) -> Self {
         self.peer_settings = settings;
+        self
+    }
+
+    /// The configured site name, when the install sets a valid one.
+    #[must_use]
+    pub fn site_name(&self) -> Option<&str> {
+        self.site_name.as_deref()
+    }
+
+    /// Name the certificate the operator issues itself after this site, not the network.
+    #[must_use]
+    pub fn with_site_name(mut self, site_name: Option<String>) -> Self {
+        self.site_name = site_name.filter(|name| match certs::validate_site_name(name) {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(site = %name, %error, "site name is not a valid label; certificates name the network");
+                false
+            },
+        });
         self
     }
 
@@ -310,9 +459,9 @@ async fn register_peers(ctx: &OperatorCtx, client: &Client) -> Result<(), Operat
 /// another site's name. The labels are the local object's for the same reason.
 fn peer_identities(
     sites: &[GridSite],
-    trust: signals::PeerTrustMode,
+    trust: PeerTrustMode,
 ) -> std::collections::BTreeMap<String, signals::PeerRecord> {
-    let pinned = trust == signals::PeerTrustMode::Pin;
+    let pinned = trust == PeerTrustMode::Pin;
     let mut ranked = std::collections::BTreeMap::<String, ((bool, bool), signals::PeerRecord)>::new();
     for site in sites {
         let Some((key, enrolled)) = peer_site_key(site) else {
@@ -449,6 +598,16 @@ pub struct OwnLeaf {
     pub fingerprint: String,
     /// The leaf's grid SPIFFE ID, when it carries one.
     pub spiffe: Option<String>,
+    /// SHA-256 of the leaf a renewal replaced, while it is still valid.
+    pub previous: Option<String>,
+}
+
+impl OwnLeaf {
+    /// Whether `fingerprint` is this site's current or still-valid previous leaf.
+    #[must_use]
+    pub fn is_own(&self, fingerprint: &str) -> bool {
+        self.fingerprint == fingerprint || self.previous.as_deref() == Some(fingerprint)
+    }
 }
 
 /// This site's own leaf, for recognising its own workloads, `None` without TLS.
@@ -463,9 +622,18 @@ pub async fn own_leaf_identity(network: &GridNetwork, client: &Client) -> Result
     let cert_pem = read_signals_pem(client, site, "tls.crt").await?;
     let pem = std::str::from_utf8(&cert_pem).map_err(|_e| "signals TLS: certificate is not valid UTF-8".to_owned())?;
     let der = crate::resources::tls_backend::first_cert_der_from_pem(pem).map_err(str::to_owned)?;
+    // The co-located gateway may present the replaced leaf until it reloads.
+    let previous = read_signals_pem(client, site, crate::enroll::renew::PREVIOUS_CERT)
+        .await
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .filter(|replaced| certs::cert_expires_within(replaced, time::Duration::ZERO) == Ok(false))
+        .and_then(|replaced| crate::resources::tls_backend::first_cert_der_from_pem(&replaced).ok())
+        .map(|replaced| signals::leaf_fingerprint(&replaced));
     Ok(Some(OwnLeaf {
         fingerprint: signals::leaf_fingerprint(&der),
         spiffe: certs::leaf_spiffe_id(&der),
+        previous,
     }))
 }
 
@@ -618,36 +786,28 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
     let name = grid_network_name(&network)?;
     reject_invalid_budget_policy(&network)?;
 
-    info!(name, "reconciling GridNetwork");
+    tracing::debug!(name, "reconciling GridNetwork");
 
-    // Mode is resolved once at start and never re-resolved live, so warn on a
-    // spec-versus-running divergence rather than diverge silently.
-    let desired = network
-        .spec
-        .signal_transport
-        .as_ref()
-        .map(|t| t.mode)
-        .unwrap_or_default();
-    if desired != ctx.signal_mode {
-        tracing::warn!(
-            network = name,
-            ?desired,
-            running = ?ctx.signal_mode,
-            "signalTransport.mode differs from the mode resolved at startup; restart the operator to apply"
+    // Modes are fixed at startup, so a change restarts the pod to apply it.
+    let running = GridModes {
+        signal: ctx.signal_mode,
+        trust: ctx.peer_settings.trust,
+    };
+    if let Some(next) = running.restart_for(Some(&network)) {
+        tracing::info!(
+            "GridNetwork {name} sets signalTransport={:?} peerTrust={:?}; running {:?}/{:?}; restarting to apply",
+            next.signal,
+            next.trust,
+            running.signal,
+            running.trust
         );
+        #[expect(clippy::exit, reason = "modes apply only at startup; Kubernetes restarts the pod")]
+        std::process::exit(0);
     }
-    let desired_trust = network.spec.peer_trust.as_ref().map(|t| t.mode).unwrap_or_default();
-    if desired_trust != ctx.peer_settings.trust {
-        tracing::warn!(
-            network = name,
-            desired = ?desired_trust,
-            running = ?ctx.peer_settings.trust,
-            "peerTrust.mode differs from the mode resolved at startup; restart the operator to apply"
-        );
-    }
+    ctx.publish_declared_trust(&network);
 
     let client = &ctx.client;
-    ensure_tls_secrets(&network, client).await?;
+    ensure_tls_secrets(&network, client, ctx.site_name.as_deref()).await?;
 
     if let Some(swim) = ctx.swim() {
         // When a GridNetwork configures a SWIM key Secret, resolve and apply it
@@ -683,7 +843,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
 
     // Rendering before membership converges would drop remote entries.
     if let Some(hold) = ctx.membership_hold() {
-        tracing::info!(network = name, "holding membership-derived writes until SWIM converges");
+        tracing::debug!(network = name, "holding membership-derived writes until SWIM converges");
         return Ok(hold);
     }
 
@@ -828,7 +988,16 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
     .await?;
 
     let grid_id = resolve_grid_id(&network);
-    let phase = if swim_runtime_running {
+    let identity = site_identity_status(
+        &network,
+        client,
+        time::OffsetDateTime::now_utc(),
+        ctx.rotation && GridModes::of(&network).renews(),
+    )
+    .await;
+    // An expired or unreadable identity degrades the network.
+    let identity_failed = identity.as_ref().is_some_and(|status| !status.reason.is_empty());
+    let phase = if swim_runtime_running && !identity_failed {
         determine_phase(&network, &grid_id, membership.as_ref())
     } else {
         GridNetworkPhase::Degraded
@@ -837,6 +1006,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
     // Publish real InferenceProvider-derived CRDT state so peers learn this site's providers.
     let distributed_provider_count = if let Some(swim) = ctx.swim().filter(|handle| handle.is_running()) {
         publish_real_provider_state(swim, name, &grid_id, &providers, &raw_metrics);
+        log_capacity_changes(&ctx.logged, name, &providers);
         count_remote_provider_records(swim, name)
     } else {
         0
@@ -863,6 +1033,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
         consumer_config_statuses,
         overlay_statuses,
         budget_statuses,
+        identity,
     )
     .await?;
 
@@ -877,9 +1048,8 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
         .and_then(|l| l.get(LABEL_AUTO_DISCOVER_SITES))
         .is_some_and(|v| v == "true");
     if auto_discover_enabled && let (Some(swim), Some(snapshot)) = (ctx.swim(), membership.as_ref()) {
-        let plaintext = network_uses_plaintext_egress(&network);
         reconcile_local_site(name, swim.site_name(), client).await?;
-        reconcile_discovered_sites(name, swim.site_name(), snapshot, client, plaintext).await?;
+        reconcile_discovered_sites(&ctx, &network, name, swim.site_name(), snapshot).await?;
     }
 
     // A deferred serving write lands as soon as its spacing allows.
@@ -1215,13 +1385,42 @@ fn crd_seed_decision(resolution: &SeedResolution, previous: &[SocketAddr]) -> Cr
 // TLS Secrets
 // ---------------------------------------------------------------------------
 
-/// Ensure CA and site certificate secrets exist.
+/// What to do about the grid TLS Secrets a `GridNetwork` names.
+#[derive(Debug, PartialEq, Eq)]
+enum TlsSecrets {
+    /// Both exist.
+    Present,
+    /// Neither exists: create a self-signed CA and a site certificate from it.
+    Create,
+    /// Only one exists. A new CA would replace the grid's, so nothing is written.
+    Inconsistent,
+}
+
+/// Decide from which of the CA and site Secrets exist.
+fn tls_secrets_action(ca_exists: bool, site_exists: bool) -> TlsSecrets {
+    match (ca_exists, site_exists) {
+        (true, true) => TlsSecrets::Present,
+        (false, false) => TlsSecrets::Create,
+        _ => TlsSecrets::Inconsistent,
+    }
+}
+
+/// Create a self-signed CA and site certificate when neither Secret exists.
 ///
-/// Generates both together so the CA is available for
-/// signing the site certificate without needing to
-/// reconstruct it from PEM.
-#[expect(clippy::large_stack_frames, reason = "async future with kube API types")]
-async fn ensure_tls_secrets(network: &GridNetwork, client: &Client) -> Result<(), OperatorError> {
+/// Generates both together so the CA is available for signing the site
+/// certificate. Never replaces an existing CA: one that enrollment or bootstrap
+/// wrote is the grid's, and a new one would split it.
+#[expect(
+    clippy::large_stack_frames,
+    clippy::too_many_lines,
+    clippy::cognitive_complexity,
+    reason = "decide, then create the CA and the identity it signs, as one step"
+)]
+async fn ensure_tls_secrets(
+    network: &GridNetwork,
+    client: &Client,
+    this_site: Option<&str>,
+) -> Result<(), OperatorError> {
     let tls = &network.spec.tls;
     let (Some(ca_ref), Some(site_ref)) = (&tls.ca_secret_ref, &tls.site_secret_ref) else {
         return Ok(());
@@ -1233,58 +1432,105 @@ async fn ensure_tls_secrets(network: &GridNetwork, client: &Client) -> Result<()
     let ca_exists = ca_api.get_opt(&ca_ref.name).await?.is_some();
     let site_exists = site_api.get_opt(&site_ref.name).await?.is_some();
 
-    if ca_exists && site_exists {
+    let action = tls_secrets_action(ca_exists, site_exists);
+    if note_inconsistent(
+        ObjectRef::new(&network_site_name(network)),
+        action == TlsSecrets::Inconsistent,
+    ) {
+        tracing::warn!(
+            ca = %ca_ref.name,
+            site = %site_ref.name,
+            "only one of the grid CA and site identity Secrets exists; not replacing the CA. Re-enroll \
+             the site, or delete both to start a self-signed grid"
+        );
+    }
+    if action != TlsSecrets::Create {
         return Ok(());
     }
 
-    let site_name = network_site_name(network);
+    let site_name = issued_site_name(network, this_site);
     let ca = certs::generate_ca("grid-ca")?;
     let site_cert = certs::generate_site_cert(&ca, &site_name)?;
 
-    apply_ca_secret(&ca_api, ca_ref, &ca).await?;
-    apply_site_secret(&site_api, site_ref, &site_cert).await?;
-
-    info!("created grid TLS secrets");
-    Ok(())
-}
-
-/// Apply the CA secret via server-side apply.
-async fn apply_ca_secret(
-    api: &Api<k8s_openapi::api::core::v1::Secret>,
-    ca_ref: &crate::crd::grid_network::SecretRef,
-    ca: &certs::CaCert,
-) -> Result<(), OperatorError> {
-    let data = secret::ca_secret_data(ca);
-    let s = secret::build(&ca_ref.name, &ca_ref.namespace, data);
-    api.patch(
-        &ca_ref.name,
-        &PatchParams::apply(FIELD_MANAGER).force(),
-        &Patch::Apply(&s),
+    // Another writer, such as enrollment, stored its CA first: it is the grid's, and a
+    // site identity from this one would not chain to it.
+    if !create_secret(
+        &ca_api,
+        secret::build(&ca_ref.name, &ca_ref.namespace, secret::ca_secret_data(&ca)),
     )
-    .await?;
-    Ok(())
-}
-
-/// Apply the site certificate secret via server-side apply.
-async fn apply_site_secret(
-    api: &Api<k8s_openapi::api::core::v1::Secret>,
-    site_ref: &crate::crd::grid_network::SecretRef,
-    site_cert: &certs::SiteCertOutput,
-) -> Result<(), OperatorError> {
-    let data = secret::site_cert_secret_data(site_cert);
-    let s = secret::build(&site_ref.name, &site_ref.namespace, data);
-    api.patch(
+    .await?
+    {
+        tracing::debug!(ca = %ca_ref.name, "another writer created the grid CA; not self-signing a site identity");
+        return Ok(());
+    }
+    let site = secret::build(
         &site_ref.name,
-        &PatchParams::apply(FIELD_MANAGER).force(),
-        &Patch::Apply(&s),
-    )
-    .await?;
+        &site_ref.namespace,
+        secret::site_cert_secret_data(&site_cert),
+    );
+    if create_secret(&site_api, site).await? {
+        info!(ca = %ca_ref.name, site = %site_ref.name, "created a self-signed grid CA and site identity");
+    } else {
+        tracing::warn!(
+            ca = %ca_ref.name,
+            site = %site_ref.name,
+            "created a self-signed grid CA, but another writer created the site identity, which may not \
+             chain to it"
+        );
+    }
     Ok(())
+}
+
+/// Create `secret`, returning whether this call created it: a Secret another writer
+/// created first is never overwritten.
+async fn create_secret(
+    api: &Api<k8s_openapi::api::core::v1::Secret>,
+    secret: k8s_openapi::api::core::v1::Secret,
+) -> Result<bool, OperatorError> {
+    match api.create(&kube::api::PostParams::default(), &secret).await {
+        Ok(_) => Ok(true),
+        Err(kube::Error::Api(response)) if response.code == 409 => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Networks whose TLS Secrets were last seen inconsistent, so the warning fires once
+/// per transition rather than every reconcile.
+static INCONSISTENT_TLS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<ObjectRef<GridNetwork>>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Record whether `network`'s TLS Secrets are inconsistent, returning whether it just became so.
+fn note_inconsistent(network: ObjectRef<GridNetwork>, inconsistent: bool) -> bool {
+    let mut seen = INCONSISTENT_TLS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if inconsistent {
+        seen.insert(network)
+    } else {
+        seen.remove(&network);
+        false
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Routing Overlay
 // ---------------------------------------------------------------------------
+
+/// Publish each site's phase as `grid_site_phase`.
+fn publish_site_phases(sites: &[GridSite]) {
+    crate::metrics::set_site_phases(site_phases(sites));
+}
+
+/// Each site's name and the phase its printer column shows. No status yet is Pending,
+/// the phase a new `GridSite` starts in.
+fn site_phases(sites: &[GridSite]) -> impl Iterator<Item = (&str, &'static str)> {
+    sites.iter().filter_map(|site| {
+        let phase = site.status.as_ref().map_or("Pending", |status| {
+            crate::controller::grid_site::phase_label(&status.phase)
+        });
+        Some((site.metadata.name.as_deref()?, phase))
+    })
+}
 
 /// Reconcile routing overlay `ConfigMap`s for a [`GridNetwork`].
 ///
@@ -1338,7 +1584,11 @@ async fn reconcile_routing_overlay_inner(
 ) -> Result<OverlayOutcome, OperatorError> {
     let network_name = grid_network_name(network)?;
 
-    let sites = list_all_grid_sites(client).await?;
+    // Every reconcile lists the sites, so the phase gauge follows each status change and deletion.
+    let sites = list_all_grid_sites(client)
+        .await
+        .inspect_err(|_error| crate::metrics::clear_site_phases())?;
+    publish_site_phases(&sites);
 
     let metrics_by_str: HashMap<&str, scoring::BackendMetrics> =
         raw_metrics.iter().map(|(k, v)| (k.as_str(), *v)).collect();
@@ -1808,22 +2058,11 @@ async fn apply_consumer_config_for_gateway(
     cc: &ConsumerConfig,
     client: &Client,
 ) -> Result<(), OperatorError> {
-    let config_yaml = consumer_config::generate_consumer_praxis_config(
-        overlay,
-        &cc.credential_mount_base,
-        &cc.cluster_endpoints,
-        &cc.tls_cert_mount_path,
-        cc.listener_port,
-    )?;
-    let cm = consumer_config::build_consumer_config_map(
-        &config_yaml,
-        &cc.config_map_name,
-        &gw_ref.namespace,
-        network_name,
-        &gw_ref.name,
-    );
-
+    let cm = consumer_config_map(overlay, network_name, gw_ref, cc)?;
     let api: Api<ConfigMap> = Api::namespaced(client.clone(), &gw_ref.namespace);
+    if Box::pin(config_map_current(&api, &cc.config_map_name, &cm)).await? {
+        return Ok(());
+    }
     api.patch(
         &cc.config_map_name,
         &PatchParams::apply(FIELD_MANAGER).force(),
@@ -1837,6 +2076,41 @@ async fn apply_consumer_config_for_gateway(
         "applied consumer Praxis config ConfigMap"
     );
     Ok(())
+}
+
+/// The consumer Praxis config `ConfigMap` for `gw_ref`, rendered from `overlay`.
+fn consumer_config_map(
+    overlay: &routing_overlay::RoutingOverlay,
+    network_name: &str,
+    gw_ref: &GatewayRef,
+    cc: &ConsumerConfig,
+) -> Result<ConfigMap, OperatorError> {
+    let config_yaml = consumer_config::generate_consumer_praxis_config(
+        overlay,
+        &cc.credential_mount_base,
+        &cc.cluster_endpoints,
+        &cc.tls_cert_mount_path,
+        cc.listener_port,
+    )?;
+    Ok(consumer_config::build_consumer_config_map(
+        &config_yaml,
+        &cc.config_map_name,
+        &gw_ref.namespace,
+        network_name,
+        &gw_ref.name,
+    ))
+}
+
+/// Whether `name` already holds `desired`'s data, so applying it would change nothing.
+async fn config_map_current(api: &Api<ConfigMap>, name: &str, desired: &ConfigMap) -> Result<bool, OperatorError> {
+    let current = api
+        .get_opt(name)
+        .await?
+        .is_some_and(|current| current.data == desired.data);
+    if current {
+        tracing::debug!(config_map = %name, "consumer Praxis config unchanged");
+    }
+    Ok(current)
 }
 
 /// Result of applying one routing overlay `ConfigMap` for a single gateway.
@@ -2174,6 +2448,39 @@ fn access_policy_to_crdt(access_policy: &crate::crd::auth::AccessPolicy) -> crdt
     }
 }
 
+/// The capacity weight a provider publishes: its declared weight when valid, else the minimum.
+fn effective_capacity_weight(provider: &InferenceProvider) -> u32 {
+    provider
+        .spec
+        .capacity_weight
+        .filter(|weight| crdt::is_valid_capacity_weight(*weight))
+        .unwrap_or(crdt::MIN_CAPACITY_WEIGHT)
+}
+
+/// Log at INFO each of `network`'s providers whose published capacity is new or changed.
+fn log_capacity_changes(logged: &ChangeLog, network: &str, providers: &[InferenceProvider]) {
+    let prefix = format!("capacity/{network}/");
+    let mut current = std::collections::HashSet::new();
+    for provider in providers.iter().filter(|p| p.spec.grid_network_ref == network) {
+        let Some(provider_id) = provider.metadata.name.as_deref() else {
+            continue;
+        };
+        let weight = effective_capacity_weight(provider);
+        let key = format!("{prefix}{provider_id}");
+        let changed = logged.changed(&key, weight.to_string());
+        current.insert(key);
+        if changed {
+            info!(
+                network,
+                provider_id,
+                capacity_weight = weight,
+                "published local provider CRDT capacity"
+            );
+        }
+    }
+    logged.retain_under(&prefix, &current);
+}
+
 /// Map one Kubernetes [`InferenceProvider`] to a CRDT [`crdt::ProviderState`].
 ///
 /// Returns `None` when the provider has no metadata name (invalid resource).
@@ -2193,18 +2500,7 @@ fn provider_state_from_kube(
     let models = provider.spec.models.iter().map(|m| m.name.clone()).collect();
     let phase = crdt_phase_from_provider(provider.status.as_ref().map(|s| &s.phase));
     let revision = provider_revision(provider);
-    let capacity_weight = provider
-        .spec
-        .capacity_weight
-        .filter(|weight| crdt::is_valid_capacity_weight(*weight))
-        .unwrap_or(crdt::MIN_CAPACITY_WEIGHT);
-
-    tracing::info!(
-        site_id,
-        provider_id,
-        capacity_weight,
-        "published local provider CRDT capacity"
-    );
+    let capacity_weight = effective_capacity_weight(provider);
 
     Some(crdt::ProviderState {
         network_id: network_id.to_owned(),
@@ -2421,6 +2717,7 @@ async fn update_status(
     consumer_config_statuses: Vec<ConsumerConfigStatus>,
     overlay_statuses: Vec<OverlayRevisionStatus>,
     budget_statuses: Vec<TenantBudgetStatus>,
+    identity: Option<SiteIdentityStatus>,
 ) -> Result<(), OperatorError> {
     let name = grid_network_name(network)?;
 
@@ -2436,6 +2733,7 @@ async fn update_status(
         consumer_config_status: consumer_config_statuses,
         overlay_status: keep_rendered_at(network.status.as_ref(), overlay_statuses),
         budget_status: budget_statuses,
+        identity,
     };
 
     if !grid_network_status_needs_update(network.status.as_ref(), &status) {
@@ -2452,6 +2750,84 @@ async fn update_status(
         .await?;
 
     Ok(())
+}
+
+/// Reason a site identity past its `notAfter` reports.
+pub const IDENTITY_EXPIRED: &str = "IdentityExpired";
+
+/// `status.identity.reason` when the identity Secret holds no readable certificate.
+pub const IDENTITY_UNREADABLE: &str = "IdentityUnreadable";
+
+/// This site's identity status from its certificate, `None` without one.
+async fn site_identity_status(
+    network: &GridNetwork,
+    client: &Client,
+    now: time::OffsetDateTime,
+    renews: bool,
+) -> Option<SiteIdentityStatus> {
+    use crate::resources::endpoint_tls::TlsFailureReason;
+
+    let site = network.spec.tls.site_secret_ref.as_ref()?;
+    let read =
+        crate::resources::endpoint_tls::read_secret_bytes_for_tls(client, site, "tls.crt", "signals", "site identity")
+            .await;
+    let bytes = match read {
+        Ok(bytes) => bytes,
+        // Not written yet: enrollment or the self-signed path writes it.
+        Err((TlsFailureReason::SecretMissing, _)) => return None,
+        Err((TlsFailureReason::KeyMissing, message)) => return Some(unreadable_identity(&message)),
+        // A failed read says nothing new about the certificate, so the last status stands.
+        Err(_) => return network.status.as_ref().and_then(|status| status.identity.clone()),
+    };
+    let status = String::from_utf8(bytes)
+        .ok()
+        .and_then(|pem| identity_status(&pem, now, renews));
+    Some(status.unwrap_or_else(|| unreadable_identity("tls.crt is not a certificate")))
+}
+
+/// The identity status of a Secret that holds no usable certificate.
+fn unreadable_identity(detail: &str) -> SiteIdentityStatus {
+    // Zero, not the last good notAfter, so an expiry alert fires on broken material.
+    crate::metrics::set_site_identity_expiry(0);
+    SiteIdentityStatus {
+        not_after: String::new(),
+        rotate_after: String::new(),
+        fingerprint: String::new(),
+        reason: IDENTITY_UNREADABLE.to_owned(),
+        message: format!("the site identity cannot be read ({detail}); restore the identity Secret or re-enroll"),
+    }
+}
+
+/// The identity status of `cert_pem` at `now`; without renewal, no renewal time.
+fn identity_status(cert_pem: &str, now: time::OffsetDateTime, renews: bool) -> Option<SiteIdentityStatus> {
+    use time::format_description::well_known::Rfc3339;
+    let (not_before, not_after) = certs::cert_validity(cert_pem).ok()?;
+    crate::metrics::set_site_identity_expiry(not_after.unix_timestamp());
+    let renew_after = crate::enroll::renew::renew_after(not_before, not_after);
+    let expired = now >= not_after;
+    Some(SiteIdentityStatus {
+        not_after: not_after.format(&Rfc3339).ok()?,
+        rotate_after: if renews {
+            renew_after.format(&Rfc3339).ok()?
+        } else {
+            String::new()
+        },
+        fingerprint: certs::canonical_fingerprint(cert_pem).ok()?,
+        reason: if expired {
+            IDENTITY_EXPIRED.to_owned()
+        } else {
+            String::new()
+        },
+        message: if expired {
+            "the site identity expired and cannot renew: a grid-admin deletes this site's enrollment, mints a new \
+             site token, and the site re-enrolls"
+                .to_owned()
+        } else if renews {
+            String::new()
+        } else {
+            "rotation is off under pin peer trust: re-enroll and re-pin this site before notAfter".to_owned()
+        },
+    })
 }
 
 /// Return whether the status subresource differs from the desired status.
@@ -2544,6 +2920,11 @@ pub(crate) fn consumer_config_status_error(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// The site a self-issued certificate names: this site when known, else the network.
+fn issued_site_name(network: &GridNetwork, site: Option<&str>) -> String {
+    site.map_or_else(|| network_site_name(network), str::to_owned)
+}
 
 /// Derive the site name from the `GridNetwork` metadata.
 fn network_site_name(network: &GridNetwork) -> String {
@@ -2678,16 +3059,215 @@ pub(crate) fn discovered_sites_from_swim(
 /// Most `GridSite` objects auto discovery creates for one network, bounding what a gossiping peer can mint.
 const MAX_AUTO_CREATED_SITES: usize = 256;
 
-/// Names of the auto-discovered `GridSite` objects that already belong to `network_name`.
-async fn auto_discovered_stubs(api: &Api<GridSite>, network_name: &str) -> Result<BTreeSet<String>, OperatorError> {
+/// The auto-discovered `GridSite` objects that already belong to `network_name`.
+async fn auto_discovered_stubs(api: &Api<GridSite>, network_name: &str) -> Result<Vec<GridSite>, OperatorError> {
     let selector = format!("{LABEL_AUTO_DISCOVERED}=true,grid.praxis.fast/network={network_name}");
-    Ok(api
-        .list(&ListParams::default().labels(&selector))
-        .await?
-        .items
-        .into_iter()
-        .filter_map(|stub| stub.metadata.name)
-        .collect())
+    let mut stubs = api.list(&ListParams::default().labels(&selector)).await?.items;
+    // A label is not ownership: only discovery's own objects for this network.
+    stubs.retain(|stub| stub.spec.grid_network_ref == network_name && is_stub(stub));
+    Ok(stubs)
+}
+
+/// Whether `site` is a stub discovery wrote: labeled auto-discovered and keyed by its site-id annotation.
+fn is_stub(site: &GridSite) -> bool {
+    peer_site_key(site).is_some_and(|(_, enrolled)| !enrolled)
+}
+
+/// How long a departed stub is kept, independent of overlay pruning so a short
+/// `staleCandidateTtlSeconds` never deletes a `GridSite`.
+const STUB_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// A gossiped record's lifetime without a refresh.
+const GOSSIP_RECORD_EXPIRY: Duration = Duration::from_secs(600);
+
+/// Time for membership to converge once records can expire.
+const GOSSIP_CONVERGENCE: Duration = Duration::from_secs(120);
+
+/// Uptime before discovery judges any site absent: one full verification window.
+const STUB_GC_WARMUP: Duration = GOSSIP_RECORD_EXPIRY.saturating_add(GOSSIP_CONVERGENCE);
+
+/// Whether gossip vouches for one site this pass.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Vouch {
+    /// Gossip vouches for it.
+    Vouched,
+    /// Gossip has had a full window to vouch for it and has not.
+    Absent,
+    /// Too soon after a start to tell, so it is neither marked nor collected.
+    Unchecked,
+}
+
+/// Who gossip vouches for this pass.
+struct Vouching<'snap> {
+    /// Every member not `Dead`.
+    vouched: std::collections::HashSet<&'snap str>,
+    /// Whether the operator has been up a full [`STUB_GC_WARMUP`].
+    settled: bool,
+}
+
+impl Vouching<'_> {
+    /// Whether gossip vouches for `site`.
+    fn of(&self, site: &str) -> Vouch {
+        if self.vouched.contains(site) {
+            Vouch::Vouched
+        } else if self.settled {
+            Vouch::Absent
+        } else {
+            Vouch::Unchecked
+        }
+    }
+}
+
+/// Who gossip vouches for after `uptime`.
+///
+/// The one place absence is judged, so per-origin verified-record times can replace SWIM liveness here.
+fn vouched_sites(snapshot: &MembershipSnapshot, uptime: Duration) -> Vouching<'_> {
+    Vouching {
+        vouched: snapshot
+            .members
+            .iter()
+            .filter(|member| member.status != MemberStatus::Dead)
+            .map(|member| member.site_id.as_str())
+            .collect(),
+        settled: uptime >= STUB_GC_WARMUP,
+    }
+}
+
+/// What the collection pass does with one stub.
+#[derive(Debug, Eq, PartialEq)]
+enum StubGc {
+    /// Nothing to write; it counts against the cap.
+    Keep,
+    /// Gossip stopped vouching for it; start the clock.
+    MarkAbsent,
+    /// Its site is back; stop the clock.
+    ClearAbsent,
+    /// Gone past the TTL; delete it. It no longer counts against the cap.
+    Collect,
+}
+
+/// Decide what to do with stub `site` given whether gossip vouches for it.
+fn stub_gc(site: &GridSite, vouch: Vouch, ttl: Duration, now: time::OffsetDateTime) -> StubGc {
+    let absent_since = site.status.as_ref().and_then(|status| status.absent_since.as_deref());
+    match (vouch, absent_since) {
+        (Vouch::Vouched, None) | (Vouch::Unchecked, _) => StubGc::Keep,
+        (Vouch::Vouched, Some(_)) => StubGc::ClearAbsent,
+        (Vouch::Absent, None) => StubGc::MarkAbsent,
+        (Vouch::Absent, Some(since)) => {
+            match time::OffsetDateTime::parse(since, &time::format_description::well_known::Rfc3339) {
+                Ok(since) if now - since >= ttl => StubGc::Collect,
+                Ok(_) => StubGc::Keep,
+                // An unreadable clock restarts rather than collects.
+                Err(_) => StubGc::MarkAbsent,
+            }
+        },
+    }
+}
+
+/// Each named stub with what the collection pass does to it.
+fn plan_stub_gc<'stub>(
+    stubs: &'stub [GridSite],
+    vouching: &Vouching<'_>,
+    ttl: Duration,
+    now: time::OffsetDateTime,
+) -> Vec<(&'stub GridSite, &'stub str, StubGc)> {
+    let mut plan: Vec<_> = stubs
+        .iter()
+        .filter_map(|stub| {
+            let name = stub.metadata.name.as_deref()?;
+            let (site_id, _) = peer_site_key(stub)?;
+            Some((stub, name, stub_gc(stub, vouching.of(&site_id), ttl, now)))
+        })
+        .collect();
+    brake(&mut plan);
+    plan
+}
+
+/// Collections a pass may always make, however few stubs there are.
+const COLLECT_BRAKE_FLOOR: usize = 8;
+
+/// Hold every collection in `plan` when it would delete more than half the stubs past the
+/// floor, or every stub of several.
+///
+/// A partition or a bug looks like mass departure; the held stubs are judged again next pass.
+fn brake(plan: &mut [(&GridSite, &str, StubGc)]) -> bool {
+    let collect = plan.iter().filter(|(_, _, gc)| *gc == StubGc::Collect).count();
+    let most = collect > COLLECT_BRAKE_FLOOR && collect.saturating_mul(2) > plan.len();
+    let all = plan.len() > 1 && collect == plan.len();
+    let braked = most || all;
+    if braked {
+        tracing::warn!(
+            collect,
+            stubs = plan.len(),
+            "refusing to collect most auto-discovered GridSites at once"
+        );
+        for (_, _, gc) in plan.iter_mut().filter(|(_, _, gc)| *gc == StubGc::Collect) {
+            *gc = StubGc::Keep;
+        }
+    }
+    braked
+}
+
+/// The stubs that count against [`MAX_AUTO_CREATED_SITES`]: every one not past the TTL.
+fn counted_stubs(plan: &[(&GridSite, &str, StubGc)]) -> BTreeSet<String> {
+    plan.iter()
+        .filter(|(_, _, gc)| *gc != StubGc::Collect)
+        .map(|(_, name, _)| (*name).to_owned())
+        .collect()
+}
+
+/// Collect stubs gone past `ttl` and track absence on the rest; returns the names that count against the cap.
+///
+/// Absence lives in status, written only on a transition, so a restart keeps the clock and an
+/// unchanged stub writes nothing.
+async fn collect_stale_stubs(
+    api: &Api<GridSite>,
+    network_name: &str,
+    vouching: &Vouching<'_>,
+    ttl: Duration,
+    stubs: &[GridSite],
+) -> Result<BTreeSet<String>, OperatorError> {
+    let plan = plan_stub_gc(stubs, vouching, ttl, time::OffsetDateTime::now_utc());
+    for (stub, name, gc) in &plan {
+        let since = match gc {
+            StubGc::Keep => continue,
+            StubGc::Collect => {
+                if delete_unchanged_stub(api, stub, name).await? {
+                    tracing::info!(
+                        name,
+                        network = network_name,
+                        "collected departed auto-discovered GridSite"
+                    );
+                }
+                continue;
+            },
+            StubGc::MarkAbsent => rfc3339_now(),
+            StubGc::ClearAbsent => None,
+        };
+        let patch = serde_json::json!({ "status": { "absentSince": since } });
+        api.patch_status(name, &PatchParams::default(), &Patch::Merge(&patch))
+            .await?;
+    }
+    Ok(counted_stubs(&plan))
+}
+
+/// Delete `stub` only if it is still the object judged stale, leaving finalizers to the API server.
+///
+/// Discovery re-applying a returning site bumps the resourceVersion, so the precondition fails and
+/// the stub survives instead of being deleted under it.
+async fn delete_unchanged_stub(api: &Api<GridSite>, stub: &GridSite, name: &str) -> Result<bool, OperatorError> {
+    if stub.metadata.deletion_timestamp.is_some() {
+        return Ok(false);
+    }
+    let params = DeleteParams::default().preconditions(Preconditions {
+        resource_version: stub.metadata.resource_version.clone(),
+        uid: stub.metadata.uid.clone(),
+    });
+    match api.delete(name, &params).await {
+        Ok(_) => Ok(true),
+        Err(kube::Error::Api(error)) if error.code == 404 || error.code == 409 => Ok(false),
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// Log the members [`admit_stub`] left out this round.
@@ -2710,6 +3290,38 @@ fn admit_stub(stubs: &mut BTreeSet<String>, name: &str) -> bool {
         return false;
     }
     stubs.insert(name.to_owned())
+}
+
+/// Log a reconciled stub at INFO when `noteworthy`, else at debug.
+fn log_stub(site: &DiscoveredSite, network_name: &str, noteworthy: bool) {
+    if noteworthy {
+        tracing::info!(
+            name = %site.name,
+            network = %network_name,
+            egress = %site.egress_address,
+            cert = site.site_cert_pem.is_some(),
+            "reconciled auto-discovered GridSite from SWIM Alive member"
+        );
+    } else {
+        tracing::debug!(name = %site.name, network = %network_name, "auto-discovered GridSite unchanged");
+    }
+}
+
+/// Whether applying `site` creates its stub or changes the egress or certificate the stub carries.
+fn stub_changed(existing: Option<&GridSite>, site: &DiscoveredSite) -> bool {
+    let Some(existing) = existing else {
+        return true;
+    };
+    let egress = existing
+        .spec
+        .egress
+        .as_ref()
+        .map_or("", |egress| egress.address.as_str());
+    let cert = existing
+        .status
+        .as_ref()
+        .and_then(|status| status.public_cert_pem.as_deref());
+    egress != site.egress_address || (site.site_cert_pem.is_some() && cert != site.site_cert_pem.as_deref())
 }
 
 /// Derive a Kubernetes resource name for an auto-discovered `GridSite`.
@@ -2989,19 +3601,21 @@ fn discovered_site_spec(site: &DiscoveredSite, network_name: &str, plaintext: bo
     reason = "async future over Kubernetes API types with serde_json values"
 )]
 async fn reconcile_discovered_sites(
+    ctx: &OperatorCtx,
+    network: &GridNetwork,
     network_name: &str,
     local_site: &str,
     snapshot: &MembershipSnapshot,
-    client: &Client,
-    plaintext: bool,
 ) -> Result<(), OperatorError> {
-    let sites = discovered_sites_from_swim(network_name, local_site, snapshot);
-    if sites.is_empty() {
-        return Ok(());
-    }
-
+    let client = &ctx.client;
+    let plaintext = network_uses_plaintext_egress(network);
+    let ttl = STUB_TTL;
     let api: Api<GridSite> = Api::all(client.clone());
-    let mut stubs = auto_discovered_stubs(&api, network_name).await?;
+    let present = auto_discovered_stubs(&api, network_name).await?;
+    let vouching = vouched_sites(snapshot, ctx.started.elapsed());
+    let mut stubs = collect_stale_stubs(&api, network_name, &vouching, ttl, &present).await?;
+
+    let sites = discovered_sites_from_swim(network_name, local_site, snapshot);
     let mut capped = 0_usize;
 
     for site in &sites {
@@ -3012,6 +3626,9 @@ async fn reconcile_discovered_sites(
         // Server-side apply the spec.  Creating on first call; updating on subsequent
         // calls is a no-op when the spec has not changed.
         let spec_doc = discovered_site_spec(site, network_name, plaintext);
+        // Read before the apply, which writes only spec, so status is the same either side of it.
+        let existing = api.get_opt(&site.name).await?;
+        let noteworthy = stub_changed(existing.as_ref(), site);
 
         api.patch(
             &site.name,
@@ -3028,7 +3645,7 @@ async fn reconcile_discovered_sites(
         // infinite reconcile hot-loop; checking against current state first
         // makes each write idempotent in practice, not just in intent (see
         // grid#42).
-        let existing_status = api.get(&site.name).await.ok().and_then(|s| s.status);
+        let existing_status = existing.and_then(|s| s.status);
 
         // Only write Discovered when the current phase is Pending.
         // If the GridSite controller has already advanced the phase (e.g. to
@@ -3068,13 +3685,7 @@ async fn reconcile_discovered_sites(
             reconcile_site_cert_pem(&api, &site.name, existing_status.as_ref(), cert_pem).await?;
         }
 
-        tracing::info!(
-            name = %site.name,
-            network = %network_name,
-            egress = %site.egress_address,
-            cert = site.site_cert_pem.is_some(),
-            "reconciled auto-discovered GridSite from SWIM Alive member"
-        );
+        log_stub(site, network_name, noteworthy);
     }
 
     warn_capped(network_name, capped);
@@ -3164,6 +3775,94 @@ fn parse_metrics_refresh_interval(value: &str) -> Result<Duration, OperatorError
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn network_with_modes(spec: &serde_json::Value) -> GridNetwork {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "grid.praxis.fast/v1alpha1",
+            "kind": "GridNetwork",
+            "metadata": {"name": "grid"},
+            "spec": spec,
+        }))
+        .unwrap_or_else(|_| std::process::abort())
+    }
+
+    #[test]
+    fn modes_restart_only_when_a_grid_network_declares_others() {
+        let running = GridModes::WITHOUT_NETWORK;
+        assert_eq!(running.restart_for(None), None, "no GridNetwork, no restart");
+
+        let same = network_with_modes(&serde_json::json!({"peerTrust": {"mode": "spiffe"}}));
+        assert_eq!(running.restart_for(Some(&same)), None, "same modes, no restart");
+
+        let poll = network_with_modes(&serde_json::json!({
+            "peerTrust": {"mode": "spiffe"},
+            "signalTransport": {"mode": "poll"},
+        }));
+        assert_eq!(
+            running.restart_for(Some(&poll)),
+            Some(GridModes {
+                signal: SignalMode::Poll,
+                trust: PeerTrustMode::Spiffe,
+            })
+        );
+        assert_eq!(
+            GridModes::of(&poll).restart_for(Some(&poll)),
+            None,
+            "the restarted process runs what it declares, so it never loops"
+        );
+    }
+
+    #[test]
+    fn a_trust_change_restarts_only_under_poll() {
+        let pin = network_with_modes(&serde_json::json!({"peerTrust": {"mode": "pin"}}));
+        assert_eq!(
+            GridModes::WITHOUT_NETWORK.restart_for(Some(&pin)),
+            None,
+            "gossip reads no trust, so a fresh install declaring pin does not restart"
+        );
+        let poll = network_with_modes(&serde_json::json!({
+            "peerTrust": {"mode": "spiffe"},
+            "signalTransport": {"mode": "poll"},
+        }));
+        let poll_pin = network_with_modes(&serde_json::json!({
+            "peerTrust": {"mode": "pin"},
+            "signalTransport": {"mode": "poll"},
+        }));
+        assert_eq!(
+            GridModes::of(&poll).restart_for(Some(&poll_pin)),
+            Some(GridModes::of(&poll_pin)),
+            "under poll a trust change restarts"
+        );
+    }
+
+    #[test]
+    fn a_poll_install_starts_in_poll_before_its_grid_network_exists() {
+        let startup = GridModes::without_network(Some(SignalMode::Poll), Some(PeerTrustMode::Pin));
+        assert_eq!(startup.signal, SignalMode::Poll, "the chart's grid.signals, not gossip");
+        let poll_pin = network_with_modes(&serde_json::json!({
+            "peerTrust": {"mode": "pin"},
+            "signalTransport": {"mode": "poll"},
+        }));
+        assert_eq!(
+            startup.restart_for(Some(&poll_pin)),
+            None,
+            "the network it declared needs no restart"
+        );
+        assert!(
+            GridModes::WITHOUT_NETWORK.restart_for(Some(&poll_pin)).is_some(),
+            "without the declared modes the same install restarts"
+        );
+        assert_eq!(
+            GridModes::without_network(Some(SignalMode::Poll), None).trust,
+            PeerTrustMode::Spiffe,
+            "undeclared trust keeps its default"
+        );
+        assert_eq!(
+            GridModes::without_network(None, None),
+            GridModes::WITHOUT_NETWORK,
+            "an install declaring nothing keeps today's defaults"
+        );
+    }
     use crate::swim_endpoint::EndpointResolutionFailure;
 
     fn seed_addr(value: &str) -> SocketAddr {
@@ -4217,6 +4916,134 @@ mod tests {
         );
     }
 
+    /// The operator self-signs only a grid with neither Secret, never over an existing CA.
+    #[test]
+    fn the_operator_never_replaces_an_existing_grid_ca() {
+        assert_eq!(tls_secrets_action(true, true), TlsSecrets::Present);
+        assert_eq!(tls_secrets_action(false, false), TlsSecrets::Create);
+        assert_eq!(
+            tls_secrets_action(true, false),
+            TlsSecrets::Inconsistent,
+            "an enrolled CA, identity gone"
+        );
+        assert_eq!(tls_secrets_action(false, true), TlsSecrets::Inconsistent);
+    }
+
+    /// The inconsistency warning fires on the transition, not on every reconcile.
+    #[test]
+    fn a_declared_trust_wakes_watchers_only_when_it_changes() {
+        let (sender, mut changes) = tokio::sync::watch::channel(PeerTrustMode::Spiffe);
+        assert!(!send_declared_trust(&sender, PeerTrustMode::Spiffe), "unchanged");
+        assert!(!changes.has_changed().unwrap_or(true), "nobody woken");
+        assert!(send_declared_trust(&sender, PeerTrustMode::Pin), "pin declared");
+        assert!(changes.has_changed().unwrap_or(false), "the rotation loop wakes");
+        assert_eq!(*changes.borrow_and_update(), PeerTrustMode::Pin);
+    }
+
+    #[test]
+    fn an_inconsistent_grid_is_warned_once() {
+        // Names no other test uses: the set is process-wide.
+        let network = || ObjectRef::new("inconsistent-tls-test-warn-once");
+        let other = || ObjectRef::new("inconsistent-tls-test-other");
+        assert!(note_inconsistent(network(), true), "the first time");
+        assert!(!note_inconsistent(network(), true), "not again");
+        assert!(!note_inconsistent(network(), false), "fixed");
+        assert!(note_inconsistent(network(), true), "and again after it recurs");
+        assert!(note_inconsistent(other(), true), "per network");
+        // Leave the process-wide set as it was.
+        assert!(!note_inconsistent(network(), false) && !note_inconsistent(other(), false));
+    }
+
+    /// The identity status reports expiry and the renewal window, and an expired identity says how to recover.
+    #[test]
+    #[expect(clippy::expect_used, reason = "test")]
+    fn the_identity_status_reports_expiry_and_the_renewal_window() {
+        let ca = certs::generate_ca("grid-ca").expect("ca");
+        let csr = certs::generate_csr("east").expect("csr");
+        let start = time::OffsetDateTime::now_utc().saturating_sub(time::Duration::days(1));
+        let validity = certs::Validity {
+            not_before: start,
+            not_after: start.saturating_add(time::Duration::days(30)),
+        };
+        let leaf = certs::sign_csr(&ca, "east", &csr.csr_pem, validity).expect("leaf");
+
+        let current = identity_status(&leaf.cert_pem, time::OffsetDateTime::now_utc(), true).expect("status");
+        assert!(current.reason.is_empty(), "a current identity reports no reason");
+        let (not_before, not_after) = certs::cert_validity(&leaf.cert_pem).expect("validity");
+        let renew_after = crate::enroll::renew::renew_after(not_before, not_after);
+        assert_eq!(
+            current.rotate_after,
+            renew_after
+                .format(&time::format_description::well_known::Rfc3339)
+                .expect("format")
+        );
+        assert_eq!(
+            current.fingerprint,
+            certs::canonical_fingerprint(&leaf.cert_pem).expect("fp")
+        );
+
+        let expired = identity_status(&leaf.cert_pem, not_after, true).expect("status");
+        assert_eq!(expired.reason, IDENTITY_EXPIRED);
+        assert!(expired.message.contains("re-enrolls"), "names the recovery");
+
+        let pinned = identity_status(&leaf.cert_pem, time::OffsetDateTime::now_utc(), false).expect("status");
+        assert!(pinned.rotate_after.is_empty(), "pin trust schedules no renewal");
+        assert!(pinned.reason.is_empty(), "a current pinned identity is not degraded");
+        assert!(pinned.message.contains("re-pin"), "names the manual step");
+    }
+
+    #[test]
+    fn only_spiffe_trust_renews() {
+        let modes = |trust| GridModes {
+            signal: SignalMode::Gossip,
+            trust,
+        };
+        assert!(
+            !modes(PeerTrustMode::Pin).renews(),
+            "a pinned peer refuses a renewed leaf"
+        );
+        assert!(modes(PeerTrustMode::Spiffe).renews());
+        assert!(
+            GridModes::WITHOUT_NETWORK.renews(),
+            "no GridNetwork trusts by SPIFFE ID"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_identity_degrades_with_its_recovery() {
+        let status = unreadable_identity("tls.crt is not a certificate");
+        assert_eq!(status.reason, IDENTITY_UNREADABLE);
+        assert!(status.message.contains("re-enroll"), "names the recovery");
+        assert!(status.not_after.is_empty() && status.fingerprint.is_empty());
+    }
+
+    #[test]
+    fn a_site_reports_the_phase_its_status_shows_and_pending_before_any() {
+        let site = |name: &str, phase: Option<&str>| -> GridSite {
+            let mut object = serde_json::json!({
+                "apiVersion": "grid.praxis.fast/v1alpha1",
+                "kind": "GridSite",
+                "metadata": { "name": name },
+                "spec": { "gridNetworkRef": "grid" },
+            });
+            if let Some(phase) = phase
+                && let Some(map) = object.as_object_mut()
+            {
+                map.insert("status".to_owned(), serde_json::json!({ "phase": phase }));
+            }
+            serde_json::from_value(object).unwrap_or_else(|_| std::process::abort())
+        };
+        let sites = [
+            site("hub", Some("Active")),
+            site("east", None),
+            site("west", Some("Unreachable")),
+        ];
+        assert_eq!(
+            site_phases(&sites).collect::<Vec<_>>(),
+            [("hub", "Active"), ("east", "Pending"), ("west", "Unreachable")]
+        );
+    }
+
     #[test]
     fn grid_network_status_update_is_skipped_when_semantically_unchanged() {
         let baseline = GridNetworkStatus {
@@ -4228,6 +5055,7 @@ mod tests {
             consumer_config_status: Vec::new(),
             overlay_status: Vec::new(),
             budget_status: Vec::new(),
+            identity: None,
         };
         assert!(!grid_network_status_needs_update(Some(&baseline), &baseline));
 
@@ -4255,6 +5083,17 @@ mod tests {
     // -----------------------------------------------------------------------
     // network_site_name — fallback helper
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_self_issued_certificate_names_this_site_not_the_network() {
+        let network = base_network();
+        assert_eq!(issued_site_name(&network, Some("east")), "east");
+        assert_eq!(
+            issued_site_name(&network, None),
+            "net",
+            "no site name falls back to the network"
+        );
+    }
 
     #[test]
     fn network_site_name_returns_metadata_name_when_present() {
@@ -4405,7 +5244,7 @@ mod tests {
     #[test]
     fn peer_identities_keys_auto_discovered_by_site_id_annotation() {
         let sites = [peer_grid_site("net-remote", Some("remote"), &["pin-a"])];
-        let identities = peer_identities(&sites, signals::PeerTrustMode::Pin);
+        let identities = peer_identities(&sites, PeerTrustMode::Pin);
         assert!(
             identities.contains_key("remote"),
             "keyed by the bare site_id annotation"
@@ -4419,7 +5258,7 @@ mod tests {
     #[test]
     fn peer_identities_falls_back_to_name_for_local_site() {
         let sites = [peer_grid_site("site-a", None, &["pin-a"])];
-        let identities = peer_identities(&sites, signals::PeerTrustMode::Pin);
+        let identities = peer_identities(&sites, PeerTrustMode::Pin);
         assert!(
             identities.contains_key("site-a"),
             "a bare-named site falls back to metadata.name"
@@ -4429,7 +5268,7 @@ mod tests {
     #[test]
     fn peer_identities_blank_annotation_falls_back_to_name() {
         let sites = [peer_grid_site("site-a", Some("   "), &["pin-a"])];
-        let identities = peer_identities(&sites, signals::PeerTrustMode::Pin);
+        let identities = peer_identities(&sites, PeerTrustMode::Pin);
         assert!(
             identities.contains_key("site-a"),
             "a blank annotation is ignored, name is used"
@@ -4443,7 +5282,7 @@ mod tests {
         let empty = peer_grid_site("net-remote", Some("remote"), &[]);
         let pinned = peer_grid_site("remote", None, &["pin-a"]);
         for order in [vec![empty.clone(), pinned.clone()], vec![pinned, empty]] {
-            let identities = peer_identities(&order, signals::PeerTrustMode::Pin);
+            let identities = peer_identities(&order, PeerTrustMode::Pin);
             let record = identities.get("remote").unwrap_or_else(|| std::process::abort());
             assert_eq!(
                 record.pins,
@@ -4459,7 +5298,7 @@ mod tests {
         // path looked it up by the bare site_id and found nothing.
         let sites = [peer_grid_site("net-remote", Some("remote"), &["pin-a"])];
         let identities = signals::PeerIdentities::new();
-        identities.set(peer_identities(&sites, signals::PeerTrustMode::Pin));
+        identities.set(peer_identities(&sites, PeerTrustMode::Pin));
         assert!(
             !identities.refuses("remote"),
             "the poll path reaches the peer by its bare site_id"
@@ -4477,7 +5316,7 @@ mod tests {
         // is now keyed correctly.
         let sites = [peer_grid_site("net-remote", Some("remote"), &[])];
         let identities = signals::PeerIdentities::new();
-        identities.set(peer_identities(&sites, signals::PeerTrustMode::Pin));
+        identities.set(peer_identities(&sites, PeerTrustMode::Pin));
         assert!(
             identities.refuses("remote"),
             "an un-pinned peer stays refused (membership != trust)"
@@ -4489,7 +5328,7 @@ mod tests {
         let stub = peer_grid_site("net-remote", Some("remote"), &["pin-a"]);
         let enrolled = peer_grid_site("remote", None, &[]);
         for order in [vec![stub.clone(), enrolled.clone()], vec![enrolled, stub]] {
-            let identities = peer_identities(&order, signals::PeerTrustMode::Pin);
+            let identities = peer_identities(&order, PeerTrustMode::Pin);
             let record = identities.get("remote").unwrap_or_else(|| std::process::abort());
             assert_eq!(record.pins, vec!["pin-a".to_owned()]);
         }
@@ -4534,8 +5373,8 @@ mod tests {
         let victim = peer_grid_site("victim", None, &[]);
         assert_eq!(peer_site_key(&impostor), Some(("impostor".to_owned(), true)));
         for (trust, order) in [
-            (signals::PeerTrustMode::Pin, vec![impostor.clone(), victim.clone()]),
-            (signals::PeerTrustMode::Spiffe, vec![victim, impostor]),
+            (PeerTrustMode::Pin, vec![impostor.clone(), victim.clone()]),
+            (PeerTrustMode::Spiffe, vec![victim, impostor]),
         ] {
             let identities = peer_identities(&order, trust);
             let record = identities.get("victim").unwrap_or_else(|| std::process::abort());
@@ -4556,11 +5395,161 @@ mod tests {
         assert_eq!(peer_site_key(&stub), Some(("remote".to_owned(), false)));
     }
 
+    /// A stub for `site`, absent since `since` when given.
+    fn stub(site: &str, since: Option<&str>) -> GridSite {
+        let mut stub = peer_grid_site(&format!("net-{site}"), Some(site), &[]);
+        stub.status = since.map(|since| GridSiteStatus {
+            absent_since: Some(since.to_owned()),
+            ..GridSiteStatus::default()
+        });
+        stub
+    }
+
+    fn at(rfc3339: &str) -> time::OffsetDateTime {
+        time::OffsetDateTime::parse(rfc3339, &time::format_description::well_known::Rfc3339)
+            .unwrap_or_else(|_| std::process::abort())
+    }
+
+    /// [`stub_gc`] at noon for a stub absent since `since`, with a one-hour TTL, or a year when `ttl` is false.
+    fn gc(since: Option<&str>, vouched: bool, ttl: bool) -> StubGc {
+        let ttl = Duration::from_secs(if ttl { 3600 } else { 365 * 24 * 3600 });
+        let vouch = if vouched { Vouch::Vouched } else { Vouch::Absent };
+        stub_gc(&stub("a", since), vouch, ttl, at("2026-10-02T12:00:00Z"))
+    }
+
+    #[test]
+    fn the_absence_clock_starts_when_gossip_stops_vouching_and_clears_on_return() {
+        assert_eq!(gc(None, true, true), StubGc::Keep, "live");
+        assert_eq!(gc(None, false, true), StubGc::MarkAbsent, "just left");
+        assert_eq!(
+            gc(Some("2026-10-02T09:00:00Z"), true, true),
+            StubGc::ClearAbsent,
+            "back"
+        );
+        assert_eq!(
+            gc(Some("yesterday"), false, true),
+            StubGc::MarkAbsent,
+            "bad clock restarts"
+        );
+    }
+
+    #[test]
+    fn nothing_is_marked_or_collected_before_a_full_verification_window() {
+        let snapshot = make_snapshot(vec![make_member("here", "10.0.0.2:7946", MemberStatus::Alive)]);
+        let fresh = vouched_sites(&snapshot, STUB_GC_WARMUP.saturating_sub(Duration::from_secs(1)));
+        assert_eq!(fresh.of("here"), Vouch::Vouched, "presence is evidence at any uptime");
+        assert_eq!(fresh.of("gone"), Vouch::Unchecked);
+        assert_eq!(vouched_sites(&snapshot, STUB_GC_WARMUP).of("gone"), Vouch::Absent);
+
+        let now = at("2026-10-02T12:00:00Z");
+        let hour = Duration::from_secs(3600);
+        let old = stub("gone", Some("2026-01-01T00:00:00Z"));
+        assert_eq!(
+            stub_gc(&stub("gone", None), Vouch::Unchecked, hour, now),
+            StubGc::Keep,
+            "no clock starts"
+        );
+        assert_eq!(
+            stub_gc(&old, Vouch::Unchecked, hour, now),
+            StubGc::Keep,
+            "no collection"
+        );
+    }
+
+    #[test]
+    fn a_pass_never_collects_most_stubs_at_once() {
+        let now = at("2026-10-02T12:00:00Z");
+        let hour = Duration::from_secs(3600);
+        let gone = |n: usize| (0..n).map(|i| stub(&format!("g{i}"), Some("2026-10-02T09:00:00Z")));
+        let live = |n: usize| (0..n).map(|i| stub(&format!("l{i}"), None));
+        let snapshot = make_snapshot(
+            (0..20)
+                .map(|i| make_member(&format!("l{i}"), "10.0.0.2:7946", MemberStatus::Alive))
+                .collect(),
+        );
+        let vouching = vouched_sites(&snapshot, STUB_GC_WARMUP);
+        let collected = |stubs: &[GridSite]| {
+            plan_stub_gc(stubs, &vouching, hour, now)
+                .iter()
+                .filter(|(_, _, gc)| *gc == StubGc::Collect)
+                .count()
+        };
+        let partition: Vec<GridSite> = gone(9).chain(live(1)).collect();
+        assert_eq!(collected(&partition), 0, "9 of 10 departing at once is held");
+        let lone: Vec<GridSite> = gone(1).collect();
+        assert_eq!(collected(&lone), 1, "a small grid still collects");
+        let floor: Vec<GridSite> = gone(COLLECT_BRAKE_FLOOR).chain(live(1)).collect();
+        assert_eq!(collected(&floor), COLLECT_BRAKE_FLOOR, "up to the floor collects");
+        let minority: Vec<GridSite> = gone(9).chain(live(11)).collect();
+        assert_eq!(collected(&minority), 9, "under half collects");
+        let held = counted_stubs(&plan_stub_gc(&partition, &vouching, hour, now));
+        assert_eq!(held.len(), 10, "held stubs still count against the cap");
+    }
+
+    #[test]
+    fn a_long_partition_never_collects_every_stub_of_several() {
+        let now = at("2026-10-02T12:00:00Z");
+        let snapshot = make_snapshot(Vec::new());
+        let vouching = vouched_sites(&snapshot, STUB_GC_WARMUP);
+        let every: Vec<GridSite> = (0..COLLECT_BRAKE_FLOOR)
+            .map(|i| stub(&format!("g{i}"), Some("2026-10-02T09:00:00Z")))
+            .collect();
+        let plan = plan_stub_gc(&every, &vouching, Duration::from_secs(3600), now);
+        assert!(plan.iter().all(|(_, _, gc)| *gc == StubGc::Keep), "every stub is held");
+    }
+
+    #[test]
+    fn a_departed_stub_is_collected_only_past_the_ttl() {
+        assert_eq!(
+            gc(Some("2026-10-02T11:30:00Z"), false, true),
+            StubGc::Keep,
+            "inside ttl"
+        );
+        assert_eq!(
+            gc(Some("2026-10-02T10:59:59Z"), false, true),
+            StubGc::Collect,
+            "past ttl"
+        );
+        assert_eq!(gc(Some("2026-01-01T00:00:00Z"), false, false), StubGc::Keep, "no ttl");
+    }
+
+    #[test]
+    fn declared_sites_are_never_stubs() {
+        assert!(is_stub(&stub("a", None)));
+        assert!(!is_stub(&peer_grid_site("a", None, &[])), "declared, no label");
+        let mut annotated = peer_grid_site("net-a", Some("a"), &[]);
+        annotated.metadata.labels = None;
+        assert!(
+            !is_stub(&annotated),
+            "an annotation without the label is a declared site"
+        );
+    }
+
+    #[test]
+    fn a_new_peer_is_admitted_once_a_stale_stub_is_collected() {
+        let now = at("2026-10-02T12:00:00Z");
+        let hour = Duration::from_secs(3600);
+        let mut stubs: Vec<GridSite> = (1..MAX_AUTO_CREATED_SITES)
+            .map(|i| stub(&format!("s{i}"), None))
+            .collect();
+        stubs.push(stub("gone", Some("2026-10-02T09:00:00Z")));
+        let snapshot = make_snapshot(
+            (1..MAX_AUTO_CREATED_SITES)
+                .map(|i| make_member(&format!("s{i}"), "10.0.0.2:7946", MemberStatus::Alive))
+                .collect(),
+        );
+        let vouching = vouched_sites(&snapshot, STUB_GC_WARMUP);
+        let mut counted = counted_stubs(&plan_stub_gc(&stubs, &vouching, hour, now));
+        assert!(!counted.contains("net-gone"), "a collected stub no longer counts");
+        assert!(counted.contains("net-s1"), "a live stub still counts");
+        assert!(admit_stub(&mut counted, "net-new"), "the freed slot admits a new peer");
+    }
+
     #[test]
     fn peer_identities_spiffe_keys_discovered_peer_by_bare_id() {
         let sites = [peer_grid_site("net-remote", Some("remote"), &["pin-a"])];
         let identities = signals::PeerIdentities::new();
-        identities.set(peer_identities(&sites, signals::PeerTrustMode::Spiffe));
+        identities.set(peer_identities(&sites, PeerTrustMode::Spiffe));
         assert!(
             identities.labels_for("remote").is_some(),
             "poll and serve find it by bare id"
@@ -4581,7 +5570,7 @@ mod tests {
             "enrolled".to_owned(),
         )]));
         for order in [vec![stub.clone(), enrolled.clone()], vec![enrolled, stub]] {
-            let identities = peer_identities(&order, signals::PeerTrustMode::Spiffe);
+            let identities = peer_identities(&order, PeerTrustMode::Spiffe);
             let record = identities.get("remote").unwrap_or_else(|| std::process::abort());
             assert_eq!(record.labels.get("from").map(String::as_str), Some("enrolled"));
         }
@@ -4597,6 +5586,66 @@ mod tests {
         let mut room = BTreeSet::new();
         assert!(admit_stub(&mut room, "net-a"));
         assert!(room.contains("net-a"), "an admitted stub counts against the cap");
+    }
+
+    #[test]
+    fn a_second_identical_pass_logs_nothing_new() {
+        let logged = ChangeLog::default();
+        assert!(
+            logged.changed("capacity/net/qwen3", "1".to_owned()),
+            "first publish is news"
+        );
+        assert!(
+            !logged.changed("capacity/net/qwen3", "1".to_owned()),
+            "an identical pass is not"
+        );
+        assert!(
+            logged.changed("capacity/net/qwen3", "2".to_owned()),
+            "a capacity change is"
+        );
+        assert!(
+            logged.changed("capacity/net/other", "2".to_owned()),
+            "keys are independent"
+        );
+        let keep = std::collections::HashSet::from(["capacity/net/other".to_owned()]);
+        logged.retain_under("capacity/net/", &keep);
+        assert!(
+            logged.changed("capacity/net/qwen3", "2".to_owned()),
+            "a departed key is forgotten"
+        );
+        assert!(
+            !logged.changed("capacity/net/other", "2".to_owned()),
+            "a kept key is not"
+        );
+    }
+
+    #[test]
+    fn only_a_new_stub_or_a_changed_egress_or_cert_is_news() {
+        let site = DiscoveredSite {
+            name: "net-remote".to_owned(),
+            site_id: "remote".to_owned(),
+            grid_network_ref: "net".to_owned(),
+            egress_address: "10.0.0.2:19080".to_owned(),
+            site_cert_pem: Some("CERT".to_owned()),
+        };
+        let mut applied: GridSite =
+            serde_json::from_value(discovered_site_spec(&site, "net", false)).unwrap_or_else(|_| std::process::abort());
+        applied.status = Some(GridSiteStatus {
+            public_cert_pem: Some("CERT".to_owned()),
+            ..GridSiteStatus::default()
+        });
+        assert!(stub_changed(None, &site), "created");
+        assert!(!stub_changed(Some(&applied), &site), "an idle pass");
+        let moved = DiscoveredSite {
+            egress_address: "10.0.0.3:19080".to_owned(),
+            ..site.clone()
+        };
+        assert!(stub_changed(Some(&applied), &moved), "egress changed");
+        let renewed = DiscoveredSite {
+            site_cert_pem: Some("NEW".to_owned()),
+            ..site
+        };
+        assert!(stub_changed(Some(&applied), &renewed), "cert changed");
     }
 
     #[test]

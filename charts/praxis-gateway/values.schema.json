@@ -316,6 +316,21 @@
       "items": { "type": "string" },
       "description": "Container arguments."
     },
+    "log": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "level": {
+          "type": "string",
+          "pattern": "^((?i)(off|error|warn|info|debug|trace))?$",
+          "description": "Level for every module: off, error, warn, info, debug, or trace, in any case. Empty leaves RUST_LOG unset, so the binary uses its own default (info)."
+        },
+        "filter": {
+          "type": "string",
+          "description": "Full RUST_LOG directive, such as info,praxis_filter=debug. When set, it replaces level."
+        }
+      }
+    },
     "env": {
       "type": "array",
       "items": {
@@ -572,6 +587,11 @@
         },
         "liveness": {
           "description": "Liveness probe settings. Null to disable."
+        },
+        "adminProbeCommand": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "description": "Command for the admin-listener probe, with the URL appended. Empty uses /bin/sh with curl or wget."
         }
       }
     },

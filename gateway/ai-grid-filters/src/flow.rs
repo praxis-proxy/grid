@@ -146,6 +146,8 @@ fn scraper(
     addr: &str,
     site: &str,
 ) -> PeerScraper {
+    // The scraper builds on the process provider; install the one the gateway runs.
+    praxis_tls::provider::install();
     let (chain, key) = (client.0.clone(), client.1.clone_key());
     PeerScraper::new(
         ca_pem,

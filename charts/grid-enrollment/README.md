@@ -78,12 +78,21 @@ Each override takes a Secret reference, so no key material is inlined in values.
 | `ca.provided.keySecretRef` | generate | pre-created CA Secret (tls.crt, tls.key) |
 | `serving.existingSecretRef` | issued from the CA | pre-created serving Secret |
 | `db.type` | `builtin` Postgres | `external` + `db.external.connectionUrlSecretRef` |
+| `db.builtin.pvcAnnotations` | none | annotations on the builtin DB PVC, which holds every site record; under Argo CD set `argocd.argoproj.io/sync-options: Prune=false,Delete=false` |
 | `enrollment.authz` | `kube` (SAR, needs the sar-feature image) | `local` (standalone grid-admin token table) |
 | `enrollment.gridAdminTokens.existingSecretRef` | generated (local authz) | pre-created token Secret (name:token lines) |
 
 ## Site invites
 
 Each `invites` entry (`siteName`, `gridNetworkRef`, optional `expiresInSecs` up to 604800) has a post-install and post-upgrade Job mint a one-time site token into Secret `grid-invite-<siteName>` (key `token`). The Job skips sites whose Secret already exists, so an upgrade mints only for new sites. Invites need `enrollment.authz=kube`. Before Helm 3.19, a failed invite run leaves its hook RBAC in place until the next run. [Site Enrollment](../../docs/installation/enrollment.md#invite-a-site-on-the-hub) covers delivery and revocation.
+
+## Hub site identity
+
+The hub hosts enrollment, so it cannot enroll itself. Set `hubSite.name` and the bootstrap Job issues the hub's site identity straight from the grid CA, with the same SPIFFE name, key usage, and lifetime an enrolled site receives. It writes Secret `grid-site-identity` and the CA Secret `grid-ca` to `hubSite.namespace`. It also creates the grid's 32-byte SWIM key once, as `hubSite.swimKeySecretName` (default `grid-swim-key`), in both the release namespace, where a delivery channel such as an ACM Policy can copy it to sites, and `hubSite.namespace`. In `hubSite.namespace` the Job holds `create` on any Secret, since `create` cannot be scoped by name, `get` and `update` on the identity and CA Secrets, `delete` on the identity Secret to replace a placeholder, and `get` on the SWIM key Secret. Install the hub operator with `enrollment.enabled=false`. The chart does not create `hubSite.namespace`, since the hub operator's release owns it, so create it before installing this chart (`kubectl create namespace grid`); its hook RBAC fails otherwise. The enrollment service reserves the name too, refusing to mint or redeem a token for it, so no invite can issue a second identity for the hub.
+
+The identity is created once and rotates like an enrolled one: bootstrap signs a seed with the CA key into the `hubSite.seedSecretName` Secret, the service registers the hub's key from it, and the hub's operator rotates through the enrollment service. Under `pin` peer trust the hub's operator does not rotate, so re-issue the identity and update the peers' pins before it expires. A hub frozen after a rotation fork recovers only by a re-issue: delete its identity Secret and upgrade. Deleting the seed Secret alone re-signs the same key and leaves the freeze in place. The Job keeps an expired identity but fails on one issued to another name or by another CA. To re-issue it, delete the Secret before the next upgrade, or set `ca.forceRegenerate`, which re-issues every certificate. Do not also invite `hubSite.name`: the chart refuses it, because an invite would mint a second identity for the same name. A provided CA is refused too, since the Job has no signing key.
+
+To stop all rotation from the hub, set `enrollment.rotation.enabled=false`. The service refuses every rotation with 503 `rotation_disabled`, and every site keeps its current identity until it expires. [Turn rotation off](../../docs/installation/enrollment.md#turn-rotation-off) has the details.
 
 ## Limitations
 

@@ -1,3 +1,39 @@
+# -- This site. name defaults swim.siteName, and through it enrollment.siteName.
+site:
+  # -- Site name, a DNS label.
+  name: ""
+  # -- Deployment region.
+  region: ""
+  # -- Availability zone.
+  zone: ""
+
+# -- The grid this site joins. Setting id renders the GridNetwork and this site's
+# GridSite, with site discovery on. They need the grid CRDs first, so plain Helm sets id
+# on an upgrade after the first install; Argo CD orders them by sync wave.
+grid:
+  # -- GridNetwork name.
+  network: grid
+  # -- Grid identifier. Empty renders no GridNetwork or GridSite.
+  id: ""
+  # -- Peer trust, pin or spiffe. Empty keeps the GridNetwork default, pin. The operator
+  # also starts in it before any GridNetwork exists, so set it to match the grid.
+  peerTrust: ""
+  # -- Signal transport, gossip or poll. poll also serves signals on the SWIM Service.
+  # Empty keeps the GridNetwork default, gossip. The operator also starts in it before any
+  # GridNetwork exists, so a poll install never restarts once its network appears.
+  signals: ""
+  # -- SWIM seed endpoints (ip:port, [ipv6]:port, or hostname:port). Defaults swim.seeds.
+  seeds: []
+  # -- Secret holding the grid's SWIM key (key, 32 bytes). Empty runs SWIM without one.
+  swimKeySecretName: grid-swim-key
+  # -- InferenceProviders this site serves, keyed by name, as in the grid-site chart.
+  # model defaults to the name, providerKind to vllm, and backendKind to local_model.
+  providers: {}
+  #   qwen3:
+  #     model: Qwen3-Coder-30B-A3B
+  #     endpoint: http://qwen3-epp-service.llm-d.svc:80
+  #     routingClusterRef: site-d
+
 # -- Grid CRDs.
 crds:
   # -- Install and upgrade the CRDs. Set false when the platform owns them, or for a second release in the cluster.
@@ -51,15 +87,23 @@ rbac:
   # -- The grid-enrollment namespace. The render fails if the operator would get Secret
   # access there. Defaults to grid-enrollment with enrollment on.
   enrollmentNamespace: ""
+  # -- Create the metrics scraper ServiceAccount, allowed only GET on the nonResourceURL
+  # /metrics, and let the operator mint short-lived tokens for it. An llm-d EPP serving
+  # bearer-authenticated metrics (the default) admits a scrape with that token
+  # (metricsConfig.auth type serviceAccountToken). The operator never sends its own token.
+  metricsScraper: true
 
 # -- Additional namespaces where the operator needs Secret, ConfigMap,
 # Event, and Service access. The release namespace is always included.
 resourceNamespaces: []
 
-# -- Logging configuration.
+# -- Logging, rendered as RUST_LOG.
 log:
-  # -- RUST_LOG filter directive.
+  # -- Level for every module: error, warn, info, debug, or trace. A full RUST_LOG
+  # directive still works here, as before; prefer filter for one.
   level: "info"
+  # -- Full RUST_LOG directive, such as "info,operator=debug". When set, it replaces level.
+  filter: ""
 
 # Signal propagation mode is grid-wide configuration, set on the GridNetwork
 # via the grid-site chart's signalTransport value, not on the operator.
@@ -76,6 +120,33 @@ metrics:
     port: 9090
     # -- Service annotations.
     annotations: {}
+  # -- TLS on the metrics and health port.
+  tls:
+    # -- false serves plaintext. auto and true serve TLS from source.
+    enabled: auto
+    # -- auto picks existingSecret when set, else serviceCA on OpenShift, else siteIdentity
+    # when grid.id or enrollment.enabled is set. An install with none of these, which
+    # is no grid site, serves plaintext.
+    # siteIdentity serves the enrolled grid-site-identity, read once enrollment writes it.
+    source: auto
+    # -- Secret holding tls.crt and tls.key for source existingSecret.
+    existingSecret: ""
+    # -- Mount path for the certificate and key.
+    mountPath: "/etc/grid/metrics-tls"
+
+# -- NetworkPolicy for the operator pod. SWIM and signals stay open, and the
+# metrics and health port admits only metricsFrom. Kubelet probes are unaffected on OpenShift.
+networkPolicy:
+  # -- auto: on where OpenShift runs. true or false forces it.
+  enabled: auto
+  # -- NetworkPolicyPeer entries allowed to reach the metrics port. Must not be empty.
+  metricsFrom:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: openshift-user-workload-monitoring
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: openshift-monitoring
 
 # -- SWIM protocol configuration.
 swim:
@@ -122,7 +193,8 @@ gateway:
   # -- Gateway address override.
   address: ""
   # -- Gateway Kubernetes Service name for the operator to discover. Maps to
-  # GRID_GATEWAY_SERVICE_NAME. Defaults to grid-gateway with enrollment on.
+  # GRID_GATEWAY_SERVICE_NAME. Defaults to grid-gateway with enrollment on or grid.id,
+  # which also names it in the GridNetwork's gatewayRefs.
   serviceName: ""
   # -- Namespace of the gateway Service. Empty uses the release namespace. Maps
   # to GRID_GATEWAY_NAMESPACE.
@@ -141,6 +213,13 @@ health:
     initialDelaySeconds: 5
     # -- Period between liveness probes.
     periodSeconds: 10
+  # -- Startup probe for source siteIdentity, which listens only once enrollment finishes.
+  startup:
+    # -- Period between startup probes.
+    periodSeconds: 10
+    # -- Failures allowed before restart. Keep the window past the operator's
+    # 15 minute enrollment deadline, so a restart never lands mid-enrollment.
+    failureThreshold: 96
   # -- Readiness probe settings.
   readiness:
     # -- Initial delay before the first readiness probe.
@@ -157,9 +236,11 @@ serviceMonitor:
   # -- ServiceMonitor namespace override.
   namespace: ""
   # -- Prometheus scrape interval.
-  interval: ""
+  interval: "30s"
   # -- Prometheus scrape timeout.
-  scrapeTimeout: ""
+  scrapeTimeout: "10s"
+  # -- Scrape TLS settings when metrics.tls is on. Empty: the service CA for serviceCA, the grid CA Secret for siteIdentity, and a render error for existingSecret, which needs it set.
+  tlsConfig: {}
 
 # -- Container resource requests and limits.
 resources: {}
@@ -199,6 +280,16 @@ enrollment:
     secret: ""
     # -- Key holding the PEM bundle.
     key: ca.crt
+  # -- Secret the site identity is written to when no GridNetwork names one.
+  identitySecretName: grid-site-identity
+  # -- Secret the grid CA is written to when no GridNetwork names one.
+  caSecretName: grid-ca
+  rotation:
+    # -- Rotate the site identity before it expires, presenting the current one. Needs an
+    # enrollment URL: the default with enabled, or url set, as on a hub whose identity
+    # bootstrap issued. Without caBundle the grid CA in caSecretName pins the service.
+    # Off under pin peer trust whatever this says: a pinned peer refuses a rotated leaf.
+    enabled: true
   # -- Secret holding the one-time site token.
   tokenSecretRef:
     # -- Secret name. Defaults to grid-invite-<siteName>.

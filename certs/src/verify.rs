@@ -164,6 +164,57 @@ pub fn cert_expires_within(cert_pem: &str, window: time::Duration) -> Result<boo
     })
 }
 
+/// Check a [`crate::sign_with_ca`] signature over `message` against the CA certificate.
+///
+/// # Errors
+///
+/// Returns [`VerifyError`] if the CA is unparseable or the signature does not verify.
+pub fn verify_ca_signature(ca_cert_pem: &str, message: &[u8], signature: &[u8]) -> Result<(), VerifyError> {
+    if ca_cert_pem.len() > MAX_CERT_PEM_BYTES {
+        return Err(VerifyError::TooLarge);
+    }
+    crate::backend::verify_message(ca_cert_pem, message, signature).map_err(|err| {
+        if err == crate::backend::BackendError::InvalidCaCert {
+            VerifyError::MalformedCa
+        } else {
+            VerifyError::BadSignature
+        }
+    })
+}
+
+/// A certificate's `notBefore` and `notAfter`.
+///
+/// # Errors
+///
+/// Returns [`VerifyError`] if the certificate is oversized or unparseable.
+pub fn cert_validity(cert_pem: &str) -> Result<(time::OffsetDateTime, time::OffsetDateTime), VerifyError> {
+    with_cert(cert_pem, |cert| {
+        (
+            cert.validity().not_before.to_datetime(),
+            cert.validity().not_after.to_datetime(),
+        )
+    })
+}
+
+/// Lowercase hex SHA-256 over a certificate's `SubjectPublicKeyInfo`, the key digest
+/// enrollment records and [`crate::verify_csr`] returns.
+///
+/// # Errors
+///
+/// Returns [`VerifyError`] if the certificate is oversized or unparseable.
+pub fn cert_public_key_sha256(cert_pem: &str) -> Result<String, VerifyError> {
+    Ok(crate::backend::sha256(&cert_public_key(cert_pem)?)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+/// One DER certificate as PEM.
+#[must_use]
+pub fn cert_pem_from_der(der: &[u8]) -> String {
+    encode_cert(der.to_vec())
+}
+
 /// The canonical fingerprint of a certificate: lowercase hex SHA-256 over its
 /// DER form.
 ///
@@ -183,6 +234,33 @@ pub fn canonical_fingerprint(cert_pem: &str) -> Result<String, VerifyError> {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect())
+}
+
+/// The canonical fingerprint of every certificate in a bundle, which may hold the
+/// current CA and the one it replaced.
+///
+/// # Errors
+///
+/// Returns [`VerifyError::TooLarge`] past [`MAX_CERT_PEM_BYTES`], and
+/// [`VerifyError::Malformed`] if the bundle does not parse or holds no certificate.
+pub fn bundle_fingerprints(bundle_pem: &str) -> Result<std::collections::BTreeSet<String>, VerifyError> {
+    // The same bound as bundle_within, so a bundle is never planned on and then refused.
+    if bundle_pem.len() > MAX_CERT_PEM_BYTES {
+        return Err(VerifyError::TooLarge);
+    }
+    let fingerprints: std::collections::BTreeSet<String> = cert_ders(bundle_pem)?
+        .iter()
+        .map(|der| {
+            crate::backend::sha256(der)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect()
+        })
+        .collect();
+    if fingerprints.is_empty() {
+        return Err(VerifyError::Malformed);
+    }
+    Ok(fingerprints)
 }
 
 /// The DNS SANs on a certificate, as encoded. Case is not normalized, so the
@@ -784,5 +862,67 @@ mod tests {
             Err(VerifyError::TooLarge),
             "an oversized certificate must be refused before parsing"
         );
+    }
+
+    #[test]
+    fn a_leaf_reports_its_key_digest_and_validity() {
+        let ca = generate_ca("grid-ca").expect("ca");
+        let csr = csr_for("site-a");
+        let validity = crate::Validity::starting_now(time::Duration::days(30));
+        let issued = sign_csr(&ca, "site-a", &csr, validity).expect("sign");
+        assert_eq!(
+            cert_public_key_sha256(&issued.cert_pem),
+            Ok(issued.public_key_sha256.clone()),
+            "the digest enrollment records"
+        );
+        assert_eq!(
+            crate::verify_csr(&csr).ok(),
+            Some(issued.public_key_sha256),
+            "the CSR names the same key"
+        );
+        let (not_before, not_after) = cert_validity(&issued.cert_pem).expect("validity");
+        assert_eq!(not_before.unix_timestamp(), validity.not_before.unix_timestamp());
+        assert_eq!(not_after.unix_timestamp(), validity.not_after.unix_timestamp());
+        let der = pem::parse(&issued.cert_pem).expect("pem").into_contents();
+        assert_eq!(
+            canonical_fingerprint(&cert_pem_from_der(&der)),
+            canonical_fingerprint(&issued.cert_pem),
+            "DER round-trips to the same certificate"
+        );
+    }
+
+    #[test]
+    fn a_ca_signature_verifies_only_for_its_message_and_ca() {
+        let ca = generate_ca("grid-ca").expect("ca");
+        let other = generate_ca("grid-ca").expect("other");
+        let signature = crate::sign_with_ca(&ca, b"seed").expect("sign");
+        assert_eq!(verify_ca_signature(&ca.cert_pem, b"seed", &signature), Ok(()));
+        assert_eq!(
+            verify_ca_signature(&ca.cert_pem, b"seeds", &signature),
+            Err(VerifyError::BadSignature),
+            "another message"
+        );
+        assert_eq!(
+            verify_ca_signature(&other.cert_pem, b"seed", &signature),
+            Err(VerifyError::BadSignature),
+            "another CA"
+        );
+        assert_eq!(
+            verify_ca_signature(&ca.cert_pem, b"seed", b"junk"),
+            Err(VerifyError::BadSignature),
+            "a malformed signature"
+        );
+    }
+
+    #[test]
+    fn a_bundle_fingerprints_each_certificate() {
+        let old = generate_ca("grid-ca").expect("old");
+        let current = generate_ca("grid-ca").expect("current");
+        let both = format!("{}{}", old.cert_pem, current.cert_pem);
+        let fingerprints = bundle_fingerprints(&both).expect("bundle");
+        assert_eq!(fingerprints.len(), 2);
+        assert!(fingerprints.contains(&canonical_fingerprint(&current.cert_pem).expect("fp")));
+        assert_eq!(bundle_fingerprints("not pem"), Err(VerifyError::Malformed));
+        assert_eq!(bundle_fingerprints(""), Err(VerifyError::Malformed));
     }
 }

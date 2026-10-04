@@ -20,6 +20,15 @@ tests:
           path: rules[2].verbs
           value: ["get", "patch"]
 
+  - it: grants gridsites delete for collecting departed auto-discovered sites
+    asserts:
+      - contains:
+          path: rules[1].resources
+          content: gridsites
+      - equal:
+          path: rules[1].verbs
+          value: ["get", "list", "watch", "patch", "create", "update", "delete"]
+
   - it: renders nothing when rbac.create is false
     set:
       rbac.create: false

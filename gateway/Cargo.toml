@@ -308,12 +308,17 @@ name = "grid-gateway"
 path = "src/main.rs"
 
 [dependencies]
-praxis-proxy = { version = "0.7.1", features = ["spiffe"] }
-praxis-proxy-filter = "0.7.1"
-praxis-proxy-core = "0.7.1"
-praxis-ai-filters = { git = "https://github.com/praxis-proxy/ai.git", tag = "v0.4.1" }
+praxis-proxy = { version = "0.7.3", features = ["spiffe"] }
+praxis-proxy-filter = "0.7.3"
+praxis-proxy-core = "0.7.3"
+praxis-ai-filters = { git = "https://github.com/praxis-proxy/ai.git", rev = "17b41771fcd53b22ab5c6f9badede0de9021404c", default-features = false }
 ai-grid-filters = { path = "ai-grid-filters" }
 tracing = "0.1.44"
+
+[dev-dependencies]
+# The reload test runs a real mTLS signals peer against the binary.
+certs = { path = "../certs", default-features = false, features = ["verifier"] }
+rustls = { version = "0.23.45", features = ["ring"] }
 
 # machete can't see these: used as `praxis` / `praxis_core` / `praxis_filter`, not their package names.
 [package.metadata.cargo-machete]

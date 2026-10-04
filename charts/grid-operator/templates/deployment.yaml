@@ -2,6 +2,7 @@
 {{- include "grid-operator.validateDigest" . }}
 {{- include "grid-operator.enrollment.validate" . }}
 {{- include "grid-operator.validateSignals" . }}
+{{- include "grid-operator.metricsTls.validate" . }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -93,6 +94,30 @@ spec:
               value: {{ .Values.gateway.namespace | default .Release.Namespace | quote }}
             - name: GRID_GATEWAY_PORT
               value: {{ .Values.gateway.port | default "8080" | quote }}
+            {{- /* Start in the modes the install declares, so its GridNetwork appearing restarts nothing. */}}
+            {{- with (.Values.grid).signals }}
+            - name: GRID_SIGNAL_TRANSPORT
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with (.Values.grid).peerTrust }}
+            - name: GRID_PEER_TRUST
+              value: {{ . | quote }}
+            {{- end }}
+            {{- if and .Values.rbac.create .Values.rbac.metricsScraper }}
+            - name: GRID_METRICS_SCRAPER_SERVICE_ACCOUNT
+              value: {{ printf "%s-metrics-scraper" (include "grid-operator.fullname" .) | quote }}
+            - name: GRID_METRICS_SCRAPER_NAMESPACE
+              value: {{ .Release.Namespace | quote }}
+            # Binds each scrape token to this pod, so it stops working when the pod goes.
+            - name: GRID_POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: GRID_POD_UID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
+            {{- end }}
             {{- if (.Values.signals).enabled }}
             - name: GRID_SIGNALS_LOCAL_ADDR
               value: {{ printf "%s-swim.%s.svc:%v" (include "grid-operator.fullname" .) .Release.Namespace .Values.signals.port | quote }}
@@ -103,14 +128,18 @@ spec:
             {{- end }}
             - name: GRID_METRICS_ADDR
               value: {{ .Values.metrics.bindAddress | quote }}
+            {{- with include "grid-operator.metricsTls.env" . | trim }}
+            {{- . | nindent 12 }}
+            {{- end }}
             - name: RUST_LOG
-              value: {{ .Values.log.level | quote }}
+              value: {{ include "grid-operator.rustLog" . | quote }}
             {{- with include "grid-operator.enrollment.env" . | trim }}
             {{- . | nindent 12 }}
             {{- end }}
-          {{- with include "grid-operator.enrollment.volumeMounts" . | trim }}
+          {{- $mounts := list (include "grid-operator.enrollment.volumeMounts" . | trim) (include "grid-operator.metricsTls.volumeMount" . | trim) | compact }}
+          {{- with $mounts }}
           volumeMounts:
-            {{- . | nindent 12 }}
+            {{- join "\n" . | nindent 12 }}
           {{- end }}
           ports:
             - name: swim-udp
@@ -125,25 +154,42 @@ spec:
               containerPort: 9091
               protocol: TCP
             {{- end }}
+          {{- if eq (include "grid-operator.metricsTls.source" .) "siteIdentity" }}
+          {{- /* Nothing listens until enrollment writes the identity. */}}
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+              scheme: HTTPS
+            periodSeconds: {{ .Values.health.startup.periodSeconds }}
+            failureThreshold: {{ .Values.health.startup.failureThreshold }}
+          {{- end }}
           livenessProbe:
             httpGet:
               path: /healthz
               port: metrics
+              {{- if include "grid-operator.metricsTls.enabled" . }}
+              scheme: HTTPS
+              {{- end }}
             initialDelaySeconds: {{ .Values.health.liveness.initialDelaySeconds }}
             periodSeconds: {{ .Values.health.liveness.periodSeconds }}
           readinessProbe:
             httpGet:
               path: /readyz
               port: metrics
+              {{- if include "grid-operator.metricsTls.enabled" . }}
+              scheme: HTTPS
+              {{- end }}
             initialDelaySeconds: {{ .Values.health.readiness.initialDelaySeconds }}
             periodSeconds: {{ .Values.health.readiness.periodSeconds }}
           {{- with .Values.resources }}
           resources:
             {{- toYaml . | nindent 12 }}
           {{- end }}
-      {{- with include "grid-operator.enrollment.volumes" . | trim }}
+      {{- $volumes := list (include "grid-operator.enrollment.volumes" . | trim) (include "grid-operator.metricsTls.volume" . | trim) | compact }}
+      {{- with $volumes }}
       volumes:
-        {{- . | nindent 8 }}
+        {{- join "\n" . | nindent 8 }}
       {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:

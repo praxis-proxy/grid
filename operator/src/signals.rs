@@ -815,9 +815,11 @@ fn classify(error: &MetricsScrapeError) -> PollOutcome {
             }
         },
         MetricsScrapeError::Encoding(_) => PollOutcome::Encoding,
-        MetricsScrapeError::InvalidUrl(_) | MetricsScrapeError::HttpWithTls(_) | MetricsScrapeError::TlsMaterial(_) => {
-            PollOutcome::Config
-        },
+        MetricsScrapeError::InvalidUrl(_)
+        | MetricsScrapeError::HttpWithTls(_)
+        | MetricsScrapeError::TlsMaterial(_)
+        | MetricsScrapeError::Credential(_)
+        | MetricsScrapeError::PlaintextCredential(_) => PollOutcome::Config,
         MetricsScrapeError::Transport(inner) => classify_transport(&**inner),
     }
 }

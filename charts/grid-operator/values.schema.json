@@ -11,6 +11,82 @@
       "type": "object",
       "description": "Global values Helm passes to every subchart."
     },
+    "site": {
+      "description": "This site. name defaults swim.siteName.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "description": "Site name, a DNS label.",
+          "type": "string",
+          "pattern": "^$|^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$"
+        },
+        "region": {
+          "description": "Deployment region.",
+          "type": "string"
+        },
+        "zone": {
+          "description": "Availability zone.",
+          "type": "string"
+        }
+      }
+    },
+    "grid": {
+      "description": "The grid this site joins. Setting id renders the GridNetwork and this site's GridSite.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "network": {
+          "description": "GridNetwork name.",
+          "type": "string",
+          "pattern": "^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$"
+        },
+        "id": {
+          "description": "Grid identifier. Empty renders no GridNetwork or GridSite.",
+          "type": "string"
+        },
+        "peerTrust": {
+          "description": "Peer trust, pin or spiffe. Empty keeps the GridNetwork default.",
+          "type": "string",
+          "enum": [
+            "",
+            "pin",
+            "spiffe"
+          ]
+        },
+        "signals": {
+          "description": "Signal transport, gossip or poll. Empty keeps the GridNetwork default.",
+          "type": "string",
+          "enum": [
+            "",
+            "gossip",
+            "poll"
+          ]
+        },
+        "seeds": {
+          "description": "SWIM seed endpoints. Defaults swim.seeds.",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "swimKeySecretName": {
+          "description": "Secret holding the grid's SWIM key. Empty runs SWIM without one.",
+          "type": "string"
+        },
+        "providers": {
+          "description": "InferenceProviders keyed by name, as in the grid-site chart.",
+          "type": "object",
+          "propertyNames": {
+            "pattern": "^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$"
+          },
+          "additionalProperties": {
+            "type": "object"
+          }
+        }
+      }
+    },
     "crds": {
       "type": "object",
       "additionalProperties": false,
@@ -51,7 +127,11 @@
         },
         "pullPolicy": {
           "type": "string",
-          "enum": ["Always", "IfNotPresent", "Never"],
+          "enum": [
+            "Always",
+            "IfNotPresent",
+            "Never"
+          ],
           "description": "Image pull policy."
         }
       }
@@ -61,9 +141,13 @@
       "items": {
         "type": "object",
         "properties": {
-          "name": { "type": "string" }
+          "name": {
+            "type": "string"
+          }
         },
-        "required": ["name"]
+        "required": [
+          "name"
+        ]
       },
       "description": "Image pull secrets for private registries."
     },
@@ -77,17 +161,23 @@
     },
     "commonLabels": {
       "type": "object",
-      "additionalProperties": { "type": "string" },
+      "additionalProperties": {
+        "type": "string"
+      },
       "description": "Labels added to all resources."
     },
     "podLabels": {
       "type": "object",
-      "additionalProperties": { "type": "string" },
+      "additionalProperties": {
+        "type": "string"
+      },
       "description": "Labels added to the operator pod template."
     },
     "podAnnotations": {
       "type": "object",
-      "additionalProperties": { "type": "string" },
+      "additionalProperties": {
+        "type": "string"
+      },
       "description": "Annotations added to the operator pod template."
     },
     "serviceAccount": {
@@ -104,7 +194,9 @@
         },
         "annotations": {
           "type": "object",
-          "additionalProperties": { "type": "string" },
+          "additionalProperties": {
+            "type": "string"
+          },
           "description": "Annotations on the ServiceAccount (e.g. for IAM role binding)."
         }
       }
@@ -120,12 +212,18 @@
         "enrollmentNamespace": {
           "type": "string",
           "description": "The grid-enrollment namespace, which the render refuses to grant Secret access in."
+        },
+        "metricsScraper": {
+          "type": "boolean",
+          "description": "Create the metrics scraper ServiceAccount (get on /metrics only) and let the operator mint its tokens."
         }
       }
     },
     "resourceNamespaces": {
       "type": "array",
-      "items": { "type": "string" },
+      "items": {
+        "type": "string"
+      },
       "description": "Additional namespaces where the operator needs Secret, ConfigMap, Event, and Service access. The release namespace is always included."
     },
     "log": {
@@ -133,8 +231,15 @@
       "additionalProperties": false,
       "properties": {
         "level": {
+          "description": "Level for every module: off, error, warn, info, debug, or trace, in any case. A full RUST_LOG directive is still accepted here for compatibility; prefer filter.",
+          "anyOf": [
+            { "type": "string", "pattern": "^(?i)(off|error|warn|info|debug|trace)$" },
+            { "type": "string", "pattern": "[=,]" }
+          ]
+        },
+        "filter": {
           "type": "string",
-          "description": "RUST_LOG filter directive."
+          "description": "Full RUST_LOG directive, such as info,operator=debug. When set, it replaces level."
         }
       }
     },
@@ -162,10 +267,80 @@
             },
             "annotations": {
               "type": "object",
-              "additionalProperties": { "type": "string" },
+              "additionalProperties": {
+                "type": "string"
+              },
               "description": "Annotations on the metrics Service."
             }
           }
+        },
+        "tls": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "description": "false serves plaintext. auto and true serve TLS from metrics.tls.source.",
+              "oneOf": [
+                {
+                  "type": "boolean"
+                },
+                {
+                  "type": "string",
+                  "enum": [
+                    "auto"
+                  ]
+                }
+              ]
+            },
+            "source": {
+              "type": "string",
+              "enum": [
+                "auto",
+                "serviceCA",
+                "siteIdentity",
+                "existingSecret"
+              ],
+              "description": "Where the certificate comes from. auto picks one or fails the render."
+            },
+            "existingSecret": {
+              "type": "string",
+              "pattern": "^([a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?)?$",
+              "description": "Secret holding tls.crt and tls.key."
+            },
+            "mountPath": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Mount path for the certificate and key."
+            }
+          }
+        }
+      }
+    },
+    "networkPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "description": "auto, true, or false. auto turns it on where OpenShift runs.",
+          "oneOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "string",
+              "enum": [
+                "auto"
+              ]
+            }
+          ]
+        },
+        "metricsFrom": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object"
+          },
+          "description": "NetworkPolicyPeer entries allowed to reach the metrics port."
         }
       }
     },
@@ -203,7 +378,11 @@
             },
             "type": {
               "type": "string",
-              "enum": ["ClusterIP", "LoadBalancer", "NodePort"],
+              "enum": [
+                "ClusterIP",
+                "LoadBalancer",
+                "NodePort"
+              ],
               "description": "SWIM Service type."
             },
             "port": {
@@ -214,7 +393,9 @@
             },
             "annotations": {
               "type": "object",
-              "additionalProperties": { "type": "string" },
+              "additionalProperties": {
+                "type": "string"
+              },
               "description": "Annotations on the SWIM Service."
             },
             "loadBalancerIP": {
@@ -223,12 +404,19 @@
             },
             "externalTrafficPolicy": {
               "type": "string",
-              "enum": ["", "Cluster", "Local"],
+              "enum": [
+                "",
+                "Cluster",
+                "Local"
+              ],
               "description": "External traffic policy for LoadBalancer or NodePort Services."
             },
             "loadBalancerSourceRanges": {
               "type": "array",
-              "items": { "type": "string", "pattern": "^[0-9a-fA-F.:]+/[0-9]{1,3}$" },
+              "items": {
+                "type": "string",
+                "pattern": "^[0-9a-fA-F.:]+/[0-9]{1,3}$"
+              },
               "description": "CIDRs allowed to reach the SWIM and signals LoadBalancer."
             }
           }
@@ -303,6 +491,22 @@
             }
           }
         },
+        "startup": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "periodSeconds": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Period between startup probes."
+            },
+            "failureThreshold": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Failures allowed before restart."
+            }
+          }
+        },
         "readiness": {
           "type": "object",
           "additionalProperties": false,
@@ -331,7 +535,9 @@
         },
         "labels": {
           "type": "object",
-          "additionalProperties": { "type": "string" },
+          "additionalProperties": {
+            "type": "string"
+          },
           "description": "Additional ServiceMonitor labels."
         },
         "namespace": {
@@ -345,6 +551,10 @@
         "scrapeTimeout": {
           "type": "string",
           "description": "Prometheus scrape timeout."
+        },
+        "tlsConfig": {
+          "type": "object",
+          "description": "ServiceMonitor endpoint tlsConfig when metrics.tls is on."
         }
       }
     },
@@ -354,7 +564,9 @@
     },
     "nodeSelector": {
       "type": "object",
-      "additionalProperties": { "type": "string" },
+      "additionalProperties": {
+        "type": "string"
+      },
       "description": "Node selector for pod scheduling."
     },
     "affinity": {
@@ -363,12 +575,16 @@
     },
     "tolerations": {
       "type": "array",
-      "items": { "type": "object" },
+      "items": {
+        "type": "object"
+      },
       "description": "Pod tolerations."
     },
     "topologySpreadConstraints": {
       "type": "array",
-      "items": { "type": "object" },
+      "items": {
+        "type": "object"
+      },
       "description": "Topology spread constraints."
     },
     "priorityClassName": {
@@ -463,6 +679,27 @@
               "secret": {
                 "minLength": 1
               }
+            }
+          }
+        },
+        "identitySecretName": {
+          "type": "string",
+          "pattern": "^([a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?)?$",
+          "description": "Secret the site identity is written to when no GridNetwork names one."
+        },
+        "caSecretName": {
+          "type": "string",
+          "pattern": "^([a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?)?$",
+          "description": "Secret the grid CA is written to when no GridNetwork names one."
+        },
+        "rotation": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Rotating the site identity before it expires.",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "description": "Rotate the site identity, presenting the current one."
             }
           }
         },

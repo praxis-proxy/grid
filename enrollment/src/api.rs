@@ -10,7 +10,7 @@ use std::{sync::Arc, time::Duration};
 use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, FromRequestParts, MatchedPath, Path, Request, State},
-    http::{HeaderMap, Method, StatusCode, request::Parts},
+    http::{HeaderMap, HeaderValue, Method, StatusCode, header, request::Parts},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{delete as delete_route, get, post},
@@ -23,8 +23,11 @@ use crate::{
     SharedCa,
     auth::digest,
     authz::{Authorizer, AuthzError, Operation},
-    generated::{Enrollment, EnrollmentRequest, EnrollmentToken, EnrollmentTokenRequest, Error as ErrorBody},
-    store::{Issued, NewSiteToken, Pin, Store, StoreError},
+    generated::{
+        Enrollment, EnrollmentRequest, EnrollmentStatus, EnrollmentStatusState, EnrollmentToken,
+        EnrollmentTokenRequest, Error as ErrorBody, ErrorError as ErrorCode,
+    },
+    store::{Issued, NewSiteToken, Pin, Refusal, RenewAction, Renewal, Renewed, Store, StoreError},
 };
 
 /// How long a token stays usable when the grid-admin names no expiry.
@@ -37,6 +40,12 @@ const MAX_TOKEN_TTL_SECS: i64 = 7 * 24 * 60 * 60;
 /// caller holds a task, the way the body limit bounds the bytes.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Seconds a client waits before retrying a 503 the API answered.
+const RETRY_AFTER_SECS: u64 = 300;
+
+/// Seconds a prober waits before asking again while the store is down.
+const READY_RETRY_AFTER_SECS: u64 = 5;
+
 /// What the handlers need.
 #[derive(Debug)]
 pub struct AppState {
@@ -46,7 +55,7 @@ pub struct AppState {
     /// The CA that signs enrolled certificates, reloaded when its Secret changes.
     pub ca: SharedCa,
 
-    /// How minting and revoking are authorized (grid-admin token table, or RBAC).
+    /// How grid-admin requests are authorized (grid-admin token table, or RBAC).
     pub authorizer: Authorizer,
 
     /// How long an issued certificate lasts.
@@ -54,6 +63,12 @@ pub struct AppState {
     /// Held here rather than taken per call, so every certificate this grid
     /// issues has the same bound and no route can quietly issue a longer one.
     pub cert_lifetime: time::Duration,
+
+    /// Site names issued outside enrollment, such as the hub's, that no token may claim.
+    pub reserved_sites: Vec<String>,
+
+    /// Whether renewals are signed. Off stops all rotation; issued identities stay valid.
+    pub renewals_enabled: bool,
 }
 
 /// Failures the interface can report.
@@ -63,7 +78,7 @@ pub enum ApiError {
     #[error("{message}")]
     BadRequest {
         /// Machine-readable code.
-        code: &'static str,
+        code: ErrorCode,
         /// What went wrong.
         message: String,
     },
@@ -91,6 +106,28 @@ pub enum ApiError {
     #[error("not permitted")]
     Forbidden,
 
+    /// A renewal presented no usable grid site certificate.
+    #[error("a current grid site certificate is required")]
+    IdentityRequired,
+
+    /// The enrollment record does not admit the presented identity.
+    ///
+    /// One error for every reason, so a caller cannot learn which names are held.
+    #[error("this identity may not rotate")]
+    IdentityRefused,
+
+    /// No enrollment holds the site name.
+    #[error("no enrollment holds that site name")]
+    NoEnrollment,
+
+    /// The name is reserved for bootstrap.
+    #[error("the site name is reserved")]
+    ReservedSite,
+
+    /// Renewal is turned off for the grid.
+    #[error("rotation is disabled")]
+    RotationDisabled,
+
     /// The service itself failed.
     #[error("{0}")]
     Internal(String),
@@ -112,6 +149,7 @@ impl From<StoreError> for ApiError {
             StoreError::NotFound => Self::NotFound,
             StoreError::NameTaken => Self::NameTaken,
             StoreError::TokenInvalid => Self::InvalidToken,
+            StoreError::Refused(_) => Self::IdentityRefused,
             StoreError::Backend(detail) => Self::Internal(detail),
         }
     }
@@ -149,24 +187,20 @@ impl FromRequestParts<Arc<AppState>> for GridAdmin {
 
 /// The authorization operation for the matched route.
 ///
-/// Only the enrollment-token routes extract a grid-admin, so the resource is
-/// always enrollmenttokens. Minting is a create, revoking is a delete, and RBAC
-/// can grant them apart from any other permission.
+/// Minting and revoking a token act on enrollmenttokens, deleting a site's record
+/// on enrollments, so RBAC can grant each apart from any other permission.
 fn route_operation(parts: &Parts) -> Operation {
-    let verb = if parts.method == Method::DELETE {
-        "delete"
-    } else {
-        "create"
+    let verb = match parts.method {
+        Method::DELETE => "delete",
+        Method::GET => "get",
+        _ => "create",
     };
     // Keyed off the matched route so a route added later fails closed (an
     // unmapped path resolves to a resource no Role grants) instead of inheriting.
-    let resource = if matches!(
-        parts.extensions.get::<MatchedPath>().map(MatchedPath::as_str),
-        Some("/v1alpha1/enrollmenttokens" | "/v1alpha1/enrollmenttokens/{token_id}")
-    ) {
-        "enrollmenttokens"
-    } else {
-        "unknown"
+    let resource = match parts.extensions.get::<MatchedPath>().map(MatchedPath::as_str) {
+        Some("/v1alpha1/enrollmenttokens" | "/v1alpha1/enrollmenttokens/{token_id}") => "enrollmenttokens",
+        Some("/v1alpha1/enrollments/{site_name}") => "enrollments",
+        _ => "unknown",
     };
     Operation {
         resource,
@@ -181,39 +215,64 @@ impl ApiError {
         clippy::too_many_lines,
         reason = "one arm per error variant, each with its wire message"
     )]
-    fn rendered(self) -> (StatusCode, &'static str, String) {
+    fn rendered(self) -> (StatusCode, ErrorCode, String) {
         match self {
             Self::BadRequest { code, message } => (StatusCode::BAD_REQUEST, code, message),
             Self::NotFound => (
                 StatusCode::NOT_FOUND,
-                "not_found",
+                ErrorCode::NotFound,
                 "no site token has that identifier".to_owned(),
             ),
             Self::NameTaken => (
                 StatusCode::CONFLICT,
-                "name_taken",
+                ErrorCode::NameTaken,
                 "another member already holds this site name".to_owned(),
             ),
             Self::Unauthorized => (
                 StatusCode::UNAUTHORIZED,
-                "unauthorized",
-                "minting or revoking a token requires a grid-admin credential".to_owned(),
+                ErrorCode::Unauthorized,
+                "this action requires a grid-admin credential".to_owned(),
             ),
             Self::InvalidToken => (
                 StatusCode::UNAUTHORIZED,
-                "invalid_token",
+                ErrorCode::InvalidToken,
                 "a valid site token is required, ask a grid-admin for one".to_owned(),
             ),
             Self::Forbidden => (
                 StatusCode::FORBIDDEN,
-                "forbidden",
-                "not permitted to mint or revoke site tokens".to_owned(),
+                ErrorCode::Forbidden,
+                "this grid-admin credential is not permitted this action".to_owned(),
+            ),
+            Self::IdentityRequired => (
+                StatusCode::UNAUTHORIZED,
+                ErrorCode::IdentityRequired,
+                "rotation requires the site's current grid certificate over mutual TLS".to_owned(),
+            ),
+            Self::IdentityRefused => (
+                StatusCode::FORBIDDEN,
+                ErrorCode::IdentityRefused,
+                "this identity may not rotate; re-enroll with a new site token".to_owned(),
+            ),
+            Self::NoEnrollment => (
+                StatusCode::NOT_FOUND,
+                ErrorCode::NotFound,
+                "no enrollment holds that site name".to_owned(),
+            ),
+            Self::RotationDisabled => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                ErrorCode::RotationDisabled,
+                "rotation is turned off for this grid; current identities stay valid until they expire".to_owned(),
+            ),
+            Self::ReservedSite => (
+                StatusCode::CONFLICT,
+                ErrorCode::ReservedSite,
+                "a reserved site's identity is re-issued by the enrollment bootstrap, not deleted here".to_owned(),
             ),
             Self::Internal(message) => {
                 tracing::error!(error = %message, "enrollment request could not be served");
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    "internal",
+                    ErrorCode::Internal,
                     "the enrollment service could not complete the request".to_owned(),
                 )
             },
@@ -224,14 +283,13 @@ impl ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, code, message) = self.rendered();
-        (
-            status,
-            Json(ErrorBody {
-                error: code.to_owned(),
-                message,
-            }),
-        )
-            .into_response()
+        let mut response = (status, Json(ErrorBody { error: code, message })).into_response();
+        if status == StatusCode::SERVICE_UNAVAILABLE {
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from(RETRY_AFTER_SECS));
+        }
+        response
     }
 }
 
@@ -244,7 +302,7 @@ fn signing_error(err: EnrollError) -> ApiError {
         EnrollError::Signing(detail) => ApiError::Internal(detail),
         EnrollError::TooLarge | EnrollError::Malformed | EnrollError::BadSignature | EnrollError::InvalidSiteName => {
             ApiError::BadRequest {
-                code: "invalid_csr",
+                code: ErrorCode::InvalidCsr,
                 message: err.to_string(),
             }
         },
@@ -258,11 +316,15 @@ async fn healthz() -> StatusCode {
 
 /// Readiness: the store backend is reachable, else 503 so the pod is pulled from
 /// endpoints until the database is up.
-async fn readyz(State(state): State<Arc<AppState>>) -> StatusCode {
+async fn readyz(State(state): State<Arc<AppState>>) -> Response {
     if state.store.ready().await {
-        StatusCode::OK
+        StatusCode::OK.into_response()
     } else {
-        StatusCode::SERVICE_UNAVAILABLE
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(header::RETRY_AFTER, HeaderValue::from(READY_RETRY_AFTER_SECS))],
+        )
+            .into_response()
     }
 }
 
@@ -274,6 +336,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1alpha1/enrollmenttokens", post(mint_site_token))
         .route("/v1alpha1/enrollmenttokens/{token_id}", delete_route(revoke_site_token))
         .route("/v1alpha1/enrollments", post(enroll))
+        .route(
+            "/v1alpha1/enrollments/{site_name}",
+            get(get_enrollment).delete(delete_enrollment),
+        )
+        .route("/v1alpha1/rotations", post(renew))
         .layer(DefaultBodyLimit::max(MAX_CSR_PEM_BYTES.saturating_mul(2)))
         .layer(middleware::from_fn(enforce_timeout))
         .with_state(state)
@@ -290,7 +357,7 @@ async fn enforce_timeout(request: Request, next: Next) -> Response {
         Err(_elapsed) => (
             StatusCode::REQUEST_TIMEOUT,
             Json(ErrorBody {
-                error: "timeout".to_owned(),
+                error: ErrorCode::Timeout,
                 message: "the request exceeded the time limit".to_owned(),
             }),
         )
@@ -312,12 +379,15 @@ async fn mint_site_token(
     Json(input): Json<EnrollmentTokenRequest>,
 ) -> Result<(StatusCode, Json<EnrollmentToken>), ApiError> {
     validate_site_name(&input.site_name).map_err(|err| ApiError::BadRequest {
-        code: "invalid_site_name",
+        code: ErrorCode::InvalidSiteName,
         message: err.to_string(),
     })?;
+    if state.reserved_sites.contains(&input.site_name) {
+        return Err(ApiError::NameTaken);
+    }
     if input.grid_network_ref.trim().is_empty() {
         return Err(ApiError::BadRequest {
-            code: "missing_grid_network",
+            code: ErrorCode::MissingGridNetwork,
             message: "gridNetworkRef must name the grid the site joins".to_owned(),
         });
     }
@@ -329,7 +399,7 @@ async fn mint_site_token(
         None => DEFAULT_TOKEN_TTL_SECS,
         Some(secs) if !(1..=MAX_TOKEN_TTL_SECS).contains(&secs) => {
             return Err(ApiError::BadRequest {
-                code: "invalid_token_ttl",
+                code: ErrorCode::InvalidTokenTtl,
                 message: format!("expiresInSecs must be between 1 and {MAX_TOKEN_TTL_SECS}"),
             });
         },
@@ -406,6 +476,10 @@ async fn enroll(
     // One snapshot, so the certificate and the CA returned with it always match.
     let ca = state.ca.current();
     let (enrollment_id, issued) = Box::pin(state.store.redeem_and_issue(&token_sha256, |pin: &Pin| {
+        // A token minted before the name was reserved still cannot claim it.
+        if state.reserved_sites.contains(&pin.site_name) {
+            return Err(StoreError::NameTaken);
+        }
         // Signed under the pinned name, with every SAN rebuilt from it.
         sign_csr(&ca, &pin.site_name, &csr, validity)
             .map(|cert| Issued {
@@ -432,6 +506,198 @@ async fn enroll(
     ))
 }
 
+/// The client certificate the TLS handshake proved, DER, set per connection.
+///
+/// `None` when the client presented none. The acceptor verified the handshake
+/// signature, so the caller holds the leaf's key.
+#[derive(Clone, Debug, Default)]
+pub struct PeerLeaf(pub Option<Arc<[u8]>>);
+
+/// A caller authenticated by the grid site certificate its TLS handshake proved.
+///
+/// Checked again here against the current CA, so a TLS layer that lags a CA
+/// rotation cannot admit a leaf from the old one. Extracted before the body, so an
+/// unauthenticated request is refused before it is parsed.
+#[derive(Debug, Clone)]
+pub struct SiteLeaf {
+    /// The site its SPIFFE ID names.
+    pub site_name: String,
+    /// Its key digest.
+    pub key_sha256: String,
+    /// Its `notBefore`.
+    pub not_before: OffsetDateTime,
+}
+
+impl FromRequestParts<Arc<AppState>> for SiteLeaf {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &Arc<AppState>) -> Result<Self, Self::Rejection> {
+        let leaf_der = parts
+            .extensions
+            .get::<PeerLeaf>()
+            .and_then(|PeerLeaf(der)| der.clone())
+            .ok_or(ApiError::IdentityRequired)?;
+        let leaf_pem = certs::cert_pem_from_der(&leaf_der);
+        let site_name = certs::leaf_spiffe_id(&leaf_der)
+            .as_deref()
+            .and_then(certs::site_of_spiffe_id)
+            .map(str::to_owned)
+            .ok_or(ApiError::IdentityRequired)?;
+        if let Err(reason) = certs::verify_site_cert(&state.ca.current().cert_pem, &leaf_pem, &site_name) {
+            tracing::warn!(site = %site_name, %reason, "rotation refused: the presented certificate does not verify");
+            return Err(ApiError::IdentityRequired);
+        }
+        let key_sha256 = certs::cert_public_key_sha256(&leaf_pem).map_err(|_bad| ApiError::IdentityRequired)?;
+        let (not_before, _not_after) = certs::cert_validity(&leaf_pem).map_err(|_bad| ApiError::IdentityRequired)?;
+        Ok(Self {
+            site_name,
+            key_sha256,
+            not_before,
+        })
+    }
+}
+
+/// Renew a site identity with its current certificate: no token, the same name.
+#[expect(clippy::too_many_lines, reason = "decide, sign, and audit read as one flow")]
+async fn renew(
+    State(state): State<Arc<AppState>>,
+    leaf: SiteLeaf,
+    Json(input): Json<EnrollmentRequest>,
+) -> Result<(StatusCode, Json<Enrollment>), ApiError> {
+    if !state.renewals_enabled {
+        return Err(ApiError::RotationDisabled);
+    }
+    let renewal = Renewal {
+        site_name: leaf.site_name,
+        presented_key: leaf.key_sha256,
+        requested_key: verify_csr(&input.csr).map_err(signing_error)?,
+        presented_not_before: leaf.not_before,
+    };
+    let validity = Validity::starting_now(state.cert_lifetime);
+    let ca = state.ca.current();
+    let csr = input.csr;
+    let signed = Box::pin(state.store.renew_and_issue(&renewal, || {
+        sign_csr(&ca, &renewal.site_name, &csr, validity)
+            .map(|cert| Issued {
+                certificate: cert.cert_pem,
+                spiffe_id: cert.spiffe_id,
+                public_key_sha256: cert.public_key_sha256,
+            })
+            .map_err(|err| StoreError::Backend(format!("signing failed: {err}")))
+    }))
+    .await;
+    let renewed = match signed {
+        Ok(signed) => signed,
+        Err(StoreError::Refused(reason)) => {
+            refused(&renewal, reason);
+            return Err(ApiError::IdentityRefused);
+        },
+        Err(other) => return Err(other.into()),
+    };
+    let message = match renewed.action {
+        RenewAction::Rotate => "site identity rotated",
+        RenewAction::Resign => "site identity re-signed for a retried rotation",
+    };
+    tracing::info!(
+        site = %renewal.site_name,
+        old_key = %renewed.replaced_key,
+        new_key = %renewal.requested_key,
+        "{message}"
+    );
+    let Renewed { id, issued, .. } = renewed;
+    Ok((
+        StatusCode::OK,
+        Json(Enrollment {
+            id,
+            certificate: issued.certificate,
+            ca_certificate: ca.cert_pem.clone(),
+            spiffe_id: issued.spiffe_id,
+            public_key_sha256: issued.public_key_sha256,
+        }),
+    ))
+}
+
+/// Log a refused renewal; a fork loudly, with its recovery.
+#[expect(clippy::cognitive_complexity, reason = "one tracing call per refusal")]
+fn refused(renewal: &Renewal, reason: Refusal) {
+    let (site, presented_key, requested_key) = (&renewal.site_name, &renewal.presented_key, &renewal.requested_key);
+    match reason {
+        Refusal::Forked => tracing::warn!(
+            site,
+            presented_key,
+            requested_key,
+            "rotation fork: a valid certificate this site's record no longer holds asked for a new key, so two \
+             parties hold this identity. Rotation for the site is frozen until a grid-admin deletes its enrollment \
+             and it re-enrolls. A holder of a stolen older key can cause this; it fails closed."
+        ),
+        Refusal::RecordBehind => tracing::warn!(
+            site,
+            presented_key,
+            "rotation refused: the certificate is newer than the site's record, as after the enrollment database \
+             was restored. The site re-enrolls."
+        ),
+        Refusal::Superseded => tracing::warn!(
+            site,
+            presented_key,
+            "rotation refused: the certificate predates the site's current enrollment. If the site was not \
+             recovered or re-issued, another party holds an older leaf for it; investigate."
+        ),
+        Refusal::UnknownSite | Refusal::KeyReused | Refusal::Frozen => {
+            tracing::warn!(site, presented_key, reason = reason.as_str(), "rotation refused");
+        },
+    }
+}
+
+/// Read a site's enrollment record: digests and state, never key material.
+async fn get_enrollment(
+    State(state): State<Arc<AppState>>,
+    GridAdmin(_admin): GridAdmin,
+    Path(site_name): Path<String>,
+) -> Result<Json<EnrollmentStatus>, ApiError> {
+    let record = state
+        .store
+        .enrollment(&site_name)
+        .await?
+        .ok_or(ApiError::NoEnrollment)?;
+    let time = |at: OffsetDateTime| at.format(&Rfc3339).map_err(|err| ApiError::Internal(err.to_string()));
+    Ok(Json(EnrollmentStatus {
+        id: record.held.id,
+        site_name,
+        state: if record.held.frozen {
+            EnrollmentStatusState::Frozen
+        } else {
+            EnrollmentStatusState::Active
+        },
+        public_key_sha256: record.held.current_key,
+        previous_public_key_sha256: record.held.previous_key,
+        incarnation_started_at: time(record.held.epoch_at)?,
+        rotated_at: record.renewed_at.map(time).transpose()?,
+        not_after: record.not_after.map(time).transpose()?,
+        reserved: record.reserved,
+    }))
+}
+
+/// Delete a site's enrollment: its renewals end and the name is released to re-enroll.
+async fn delete_enrollment(
+    State(state): State<Arc<AppState>>,
+    GridAdmin(admin): GridAdmin,
+    Path(site_name): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    // A reserved name's record comes from bootstrap: re-issue its identity there instead.
+    if state.reserved_sites.contains(&site_name) {
+        return Err(ApiError::ReservedSite);
+    }
+    state.store.delete_enrollment(&site_name).await.map_err(|err| {
+        if matches!(err, StoreError::NotFound) {
+            ApiError::NoEnrollment
+        } else {
+            err.into()
+        }
+    })?;
+    tracing::info!(site = %site_name, %admin, "site enrollment deleted; the name may re-enroll");
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// The one-time site token from `Authorization: Bearer`, or a refusal.
 ///
 /// The site presents its token in the same header shape the grid-admin routes
@@ -450,7 +716,7 @@ fn site_token(headers: &HeaderMap) -> Result<String, ApiError> {
 /// verbatim.
 fn bearer(headers: &HeaderMap) -> Option<&str> {
     let value = headers
-        .get(axum::http::header::AUTHORIZATION)
+        .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())?;
     let (scheme, token) = value.split_once(' ')?;
     scheme
@@ -474,9 +740,18 @@ fn generate_token() -> Result<String, ApiError> {
 ///
 /// Returns [`ApiError::Internal`] when the system random source fails.
 pub fn random_hex(len: usize) -> Result<String, ApiError> {
+    Ok(random_bytes(len)?.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+/// `len` bytes from the same CSPRNG as [`random_hex`].
+///
+/// # Errors
+///
+/// Returns [`ApiError::Internal`] when the system random source fails.
+pub fn random_bytes(len: usize) -> Result<Vec<u8>, ApiError> {
     let mut bytes = vec![0_u8; len];
     fill_random(&mut bytes)?;
-    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+    Ok(bytes)
 }
 
 /// Fill a buffer from ring's system CSPRNG.
@@ -492,4 +767,78 @@ fn fill_random(bytes: &mut [u8]) -> Result<(), ApiError> {
 #[cfg(feature = "fips")]
 fn fill_random(bytes: &mut [u8]) -> Result<(), ApiError> {
     openssl::rand::rand_bytes(bytes).map_err(|_err| ApiError::Internal("system random source unavailable".to_owned()))
+}
+
+#[cfg(test)]
+#[expect(clippy::expect_used, reason = "tests")]
+mod error_codes {
+    use axum::{http::StatusCode, response::IntoResponse as _};
+
+    use super::{ApiError, ErrorCode};
+
+    /// Every code the API answers with, and its status: the set clients rely on.
+    #[test]
+    #[expect(clippy::too_many_lines, reason = "one row per wire code")]
+    fn the_wire_codes_are_the_documented_set() {
+        let bad = |code| ApiError::BadRequest {
+            code,
+            message: String::new(),
+        };
+        let answered = [
+            bad(ErrorCode::InvalidCsr),
+            bad(ErrorCode::InvalidSiteName),
+            bad(ErrorCode::InvalidTokenTtl),
+            bad(ErrorCode::MissingGridNetwork),
+            ApiError::Unauthorized,
+            ApiError::InvalidToken,
+            ApiError::IdentityRequired,
+            ApiError::Forbidden,
+            ApiError::IdentityRefused,
+            ApiError::NotFound,
+            ApiError::NoEnrollment,
+            ApiError::NameTaken,
+            ApiError::ReservedSite,
+            ApiError::Internal(String::new()),
+            ApiError::RotationDisabled,
+        ]
+        .map(|error| {
+            let (status, code, _message) = error.rendered();
+            (status.as_u16(), serde_json::to_value(code).expect("code"))
+        });
+        let documented: Vec<(u16, serde_json::Value)> = [
+            (400, "invalid_csr"),
+            (400, "invalid_site_name"),
+            (400, "invalid_token_ttl"),
+            (400, "missing_grid_network"),
+            (401, "unauthorized"),
+            (401, "invalid_token"),
+            (401, "identity_required"),
+            (403, "forbidden"),
+            (403, "identity_refused"),
+            (404, "not_found"),
+            (404, "not_found"),
+            (409, "name_taken"),
+            (409, "reserved_site"),
+            (500, "internal"),
+            (503, "rotation_disabled"),
+        ]
+        .into_iter()
+        .map(|(status, code)| (status, serde_json::json!(code)))
+        .collect();
+        assert_eq!(answered.to_vec(), documented);
+        assert_eq!(serde_json::to_value(ErrorCode::Timeout).expect("code"), "timeout");
+    }
+
+    #[test]
+    fn a_503_says_when_to_retry() {
+        let response = ApiError::RotationDisabled.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(response.headers().contains_key("retry-after"));
+        assert!(
+            !ApiError::IdentityRefused
+                .into_response()
+                .headers()
+                .contains_key("retry-after")
+        );
+    }
 }

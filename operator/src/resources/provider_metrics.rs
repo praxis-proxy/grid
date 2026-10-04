@@ -151,12 +151,13 @@ async fn scrape_provider_signals(
             return None;
         },
     };
-    let text = scrape_metrics(&url, parse_metrics_timeout(&mc.timeout), tls_config)
+    let timeout = parse_metrics_timeout(&mc.timeout);
+    let text = scrape_metrics(&url, timeout, tls_config, mc.auth.as_ref().zip(client))
         .await
         .inspect_err(|e| {
-            tracing::debug!(provider = identity, error = %e, "signals: provider scrape failed; last value left to expire");
-        })
-        .ok()?;
+        tracing::debug!(provider = identity, error = %e, "signals: provider scrape failed; last value left to expire");
+    })
+    .ok()?;
     let observations = crate::signals::parse(&text)
         .into_iter()
         .filter(|o| wanted.contains(o.metric.as_str()))
@@ -467,7 +468,7 @@ pub(crate) async fn collect_provider_metrics_with_refresh_interval(
             },
         };
 
-        let scrape_result = scrape_metrics(&url, timeout, tls_config).await;
+        let scrape_result = scrape_metrics(&url, timeout, tls_config, mc.auth.as_ref().zip(client)).await;
         let parse_result = match &scrape_result {
             Ok(text) => Ok(parse_or_neutral(text, &names, identity)),
             Err(e) => Err(e.to_string()),
@@ -651,6 +652,8 @@ pub(crate) fn classify_scrape_error(err: &metrics_scraper::MetricsScrapeError) -
         metrics_scraper::MetricsScrapeError::TlsMaterial(_) | metrics_scraper::MetricsScrapeError::HttpWithTls(_) => {
             "MetricsTlsMaterialInvalid"
         },
+        metrics_scraper::MetricsScrapeError::Credential(_)
+        | metrics_scraper::MetricsScrapeError::PlaintextCredential(_) => "MetricsCredentialUnavailable",
         metrics_scraper::MetricsScrapeError::InvalidUrl(_)
         | metrics_scraper::MetricsScrapeError::NonOkStatus { .. }
         | metrics_scraper::MetricsScrapeError::Encoding(_) => "MetricsScrapeError",
@@ -763,6 +766,7 @@ mod tests {
             pool_name: None,
             queue_capacity: None,
             tls: None,
+            auth: None,
         }
     }
 
@@ -779,6 +783,7 @@ mod tests {
             pool_name: None,
             queue_capacity: None,
             tls: None,
+            auth: None,
         }
     }
 

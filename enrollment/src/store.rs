@@ -9,9 +9,13 @@ use std::{collections::HashMap, sync::Mutex};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+#[cfg(test)]
+mod lifecycle_model;
 pub mod postgres;
+pub mod renewal;
 
 pub use postgres::PgStore;
+pub use renewal::{Held, Refusal, RenewAction, Renewal, Renewed, SeedRecord, Seeded};
 
 /// Reasons a store operation could not be carried out.
 #[derive(Debug, thiserror::Error)]
@@ -30,6 +34,10 @@ pub enum StoreError {
     /// tell which tokens exist or have been used.
     #[error("site token is not valid")]
     TokenInvalid,
+
+    /// The enrollment record does not admit this renewal.
+    #[error("rotation refused: {0}")]
+    Refused(#[from] Refusal),
 
     /// The backend itself failed, or issuing the certificate did.
     #[error("store backend failed: {0}")]
@@ -77,6 +85,26 @@ pub struct Issued {
 
     /// Lowercase hex SHA-256 over the request's public key.
     pub public_key_sha256: String,
+}
+
+impl Issued {
+    /// When the issued certificate expires.
+    fn not_after(&self) -> Option<OffsetDateTime> {
+        certs::cert_validity(&self.certificate).ok().map(|(_from, until)| until)
+    }
+}
+
+/// A name's enrollment record, as a grid-admin reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnrollmentRecord {
+    /// The record renewal decides on.
+    pub held: Held,
+    /// A name bootstrap issues.
+    pub reserved: bool,
+    /// When the record last took a new key, by renewal or a bootstrap seed.
+    pub renewed_at: Option<OffsetDateTime>,
+    /// When the latest certificate the service issued for it expires.
+    pub not_after: Option<OffsetDateTime>,
 }
 
 /// Where tokens and enrollments are kept.
@@ -189,6 +217,60 @@ impl Store {
             Self::Postgres(store) => store.redeem_and_issue(token_sha256, sign).await,
         }
     }
+
+    /// Admit a renewal against the name's record, sign, and record the new key, as one step.
+    ///
+    /// A fork freezes the record before it is refused.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Refused`] when the record does not admit it, and
+    /// [`StoreError::Backend`] if signing or the backend failed.
+    pub async fn renew_and_issue<F>(&self, renewal: &Renewal, sign: F) -> Result<Renewed, StoreError>
+    where
+        F: FnOnce() -> Result<Issued, StoreError> + Send,
+    {
+        match self {
+            Self::Memory(store) => store.renew_and_issue(renewal, sign),
+            Self::Postgres(store) => store.renew_and_issue(renewal, sign).await,
+        }
+    }
+
+    /// Apply a verified bootstrap seed to a reserved name's record.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Backend`] if the backend failed.
+    pub async fn seed_reserved(&self, seed: &SeedRecord) -> Result<Seeded, StoreError> {
+        match self {
+            Self::Memory(store) => store.seed_reserved(seed),
+            Self::Postgres(store) => store.seed_reserved(seed).await,
+        }
+    }
+
+    /// Read a name's enrollment record, `None` when no record holds it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Backend`] if the backend failed.
+    pub async fn enrollment(&self, site_name: &str) -> Result<Option<EnrollmentRecord>, StoreError> {
+        match self {
+            Self::Memory(store) => store.enrollment(site_name),
+            Self::Postgres(store) => store.enrollment(site_name).await,
+        }
+    }
+
+    /// Delete a name's enrollment record, ending its renewals and releasing the name.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::NotFound`] if no record holds the name.
+    pub async fn delete_enrollment(&self, site_name: &str) -> Result<(), StoreError> {
+        match self {
+            Self::Memory(store) => store.delete_enrollment(site_name),
+            Self::Postgres(store) => store.delete_enrollment(site_name).await,
+        }
+    }
 }
 
 /// Records held in this process.
@@ -196,10 +278,13 @@ impl Store {
 pub struct MemoryStore {
     /// One lock over all state, so there is no lock order to get wrong.
     inner: Mutex<Inner>,
+    /// Seconds a test moves the clock forward.
+    #[cfg(test)]
+    offset: std::sync::atomic::AtomicI64,
 }
 
 /// The tokens and the names already issued.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct Inner {
     /// Outstanding and spent tokens, by identifier.
     tokens: HashMap<Uuid, TokenRow>,
@@ -209,8 +294,11 @@ struct Inner {
     /// unique constraint). Kept in step with `tokens` on mint and revoke.
     by_digest: HashMap<String, Uuid>,
 
-    /// Names already issued, to the enrollment that holds each.
-    issued_names: HashMap<String, Uuid>,
+    /// Names already issued, to the record renewal reads and whether the name is reserved.
+    issued_names: HashMap<String, (Held, bool)>,
+
+    /// When the latest certificate issued for a name expires.
+    not_after: HashMap<String, OffsetDateTime>,
 }
 
 /// One site token held in memory.
@@ -227,6 +315,38 @@ struct TokenRow {
 }
 
 impl MemoryStore {
+    /// The store's clock.
+    #[cfg_attr(not(test), expect(clippy::unused_self, reason = "a test moves this clock"))]
+    fn now(&self) -> OffsetDateTime {
+        let now = OffsetDateTime::now_utc();
+        #[cfg(test)]
+        let now = now.saturating_add(time::Duration::seconds(
+            self.offset.load(std::sync::atomic::Ordering::Relaxed),
+        ));
+        now
+    }
+
+    /// Move the clock forward.
+    #[cfg(test)]
+    fn advance(&self, by: time::Duration) {
+        self.offset
+            .fetch_add(by.whole_seconds(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The whole state, for a test that restores it.
+    #[cfg(test)]
+    fn snapshot(&self) -> Inner {
+        self.inner.lock().map(|inner| inner.clone()).unwrap_or_default()
+    }
+
+    /// Put back a state [`Self::snapshot`] took.
+    #[cfg(test)]
+    fn restore(&self, state: Inner) {
+        if let Ok(mut inner) = self.inner.lock() {
+            *inner = state;
+        }
+    }
+
     /// Record a token.
     fn mint_site_token(&self, token: NewSiteToken) -> Result<Uuid, StoreError> {
         let mut inner = self.inner.lock().map_err(|_poisoned| poisoned())?;
@@ -262,7 +382,7 @@ impl MemoryStore {
     /// Whether a usable token has this digest, without consuming it.
     fn token_valid(&self, token_sha256: &str) -> Result<bool, StoreError> {
         let inner = self.inner.lock().map_err(|_poisoned| poisoned())?;
-        let now = OffsetDateTime::now_utc();
+        let now = self.now();
         Ok(inner
             .by_digest
             .get(token_sha256)
@@ -280,7 +400,7 @@ impl MemoryStore {
     {
         let mut inner = self.inner.lock().map_err(|_poisoned| poisoned())?;
 
-        let now = OffsetDateTime::now_utc();
+        let now = self.now();
         let token_id = inner
             .by_digest
             .get(token_sha256)
@@ -306,10 +426,96 @@ impl MemoryStore {
         if let Some(row) = inner.tokens.get_mut(&token_id) {
             row.redeemed_by = Some(enrollment_id);
         }
-        inner.issued_names.insert(pin.site_name, enrollment_id);
+        let held = Held::new(enrollment_id, issued.public_key_sha256.clone(), None, now);
+        if let Some(until) = issued.not_after() {
+            inner.not_after.insert(pin.site_name.clone(), until);
+        }
+        inner.issued_names.insert(pin.site_name, (held, false));
         drop(inner);
 
         Ok((enrollment_id, issued))
+    }
+
+    /// Admit a renewal, sign, and record the new key under one lock.
+    fn renew_and_issue<F>(&self, renewal: &Renewal, sign: F) -> Result<Renewed, StoreError>
+    where
+        F: FnOnce() -> Result<Issued, StoreError>,
+    {
+        let mut inner = self.inner.lock().map_err(|_poisoned| poisoned())?;
+        let Some((held, _reserved)) = inner.issued_names.get_mut(&renewal.site_name) else {
+            return Err(Refusal::UnknownSite.into());
+        };
+        let action = match renewal::decide(Some(held), renewal) {
+            Err(Refusal::Forked) => {
+                held.frozen = true;
+                return Err(Refusal::Forked.into());
+            },
+            decided => decided?,
+        };
+        let replaced_key = held.current_key.clone();
+        let issued = sign()?;
+        if action == RenewAction::Rotate {
+            held.previous_key = Some(std::mem::replace(&mut held.current_key, renewal.requested_key.clone()));
+            held.recorded_at = self.now();
+        }
+        let id = held.id;
+        if let Some(until) = issued.not_after() {
+            inner.not_after.insert(renewal.site_name.clone(), until);
+        }
+        drop(inner);
+        Ok(Renewed {
+            id,
+            action,
+            replaced_key,
+            issued,
+        })
+    }
+
+    /// Apply a seed under the lock.
+    fn seed_reserved(&self, seed: &SeedRecord) -> Result<Seeded, StoreError> {
+        let mut inner = self.inner.lock().map_err(|_poisoned| poisoned())?;
+        let entry = inner.issued_names.get(&seed.site_name);
+        let seeded = renewal::seed_decision(entry.map(|(held, reserved)| (held, *reserved)), seed);
+        let id = entry.map_or_else(Uuid::new_v4, |(held, _)| held.id);
+        if seeded == Seeded::Acknowledged
+            && let Some((held, _reserved)) = inner.issued_names.get_mut(&seed.site_name)
+        {
+            held.seed_generation = Some(seed.generation);
+        }
+        if matches!(seeded, Seeded::Registered | Seeded::Reset { .. }) {
+            let held = Held {
+                seed_generation: Some(seed.generation),
+                epoch_at: seed.issued_at,
+                ..Held::new(id, seed.key_sha256.clone(), None, self.now())
+            };
+            inner.issued_names.insert(seed.site_name.clone(), (held, true));
+            inner.not_after.remove(&seed.site_name);
+        }
+        drop(inner);
+        Ok(seeded)
+    }
+
+    /// Read a record under the lock.
+    fn enrollment(&self, site_name: &str) -> Result<Option<EnrollmentRecord>, StoreError> {
+        let inner = self.inner.lock().map_err(|_poisoned| poisoned())?;
+        Ok(inner
+            .issued_names
+            .get(site_name)
+            .map(|(held, reserved)| EnrollmentRecord {
+                renewed_at: (held.recorded_at > held.epoch_at).then_some(held.recorded_at),
+                not_after: inner.not_after.get(site_name).copied(),
+                held: held.clone(),
+                reserved: *reserved,
+            }))
+    }
+
+    /// Delete a record under the lock.
+    fn delete_enrollment(&self, site_name: &str) -> Result<(), StoreError> {
+        let mut inner = self.inner.lock().map_err(|_poisoned| poisoned())?;
+        let removed = inner.issued_names.remove(site_name);
+        inner.not_after.remove(site_name);
+        drop(inner);
+        removed.map(drop).ok_or(StoreError::NotFound)
     }
 }
 

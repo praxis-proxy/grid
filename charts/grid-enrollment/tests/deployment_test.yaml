@@ -128,3 +128,60 @@ tests:
       image.digest: latest
     asserts:
       - failedTemplate: {}
+
+  - it: reserves the hub's name so no token can claim it
+    set:
+      hubSite.name: hub
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: ENROLLMENT_RESERVED_SITES
+            value: hub
+
+  - it: mounts the hub's CA-signed seed Secret, optional until bootstrap writes it
+    set:
+      hubSite.name: hub
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: ENROLLMENT_RESERVED_SEEDS_DIR
+            value: /etc/grid-reserved-seeds
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: grid-reserved-seeds
+            secret:
+              secretName: grid-reserved-seeds
+              optional: true
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: grid-reserved-seeds
+            mountPath: /etc/grid-reserved-seeds
+            readOnly: true
+
+  - it: mounts no seeds without a hub
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: ENROLLMENT_RESERVED_SEEDS_DIR
+            value: /etc/grid-reserved-seeds
+  - it: refuses every rotation when rotation is off
+    set:
+      enrollment.rotation.enabled: false
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: ENROLLMENT_ROTATION_ENABLED
+            value: "false"
+  - it: leaves rotation on by default
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: ENROLLMENT_ROTATION_ENABLED
+            value: "false"

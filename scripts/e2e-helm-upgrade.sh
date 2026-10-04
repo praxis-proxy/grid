@@ -72,7 +72,9 @@ GROUP="$(crd_group "${ROOT}/charts/grid-operator")"
 [ -n "${BASE_GROUP}" ] && [ -n "${GROUP}" ] || fail "cannot read the grid API group (base '${BASE_GROUP}', branch '${GROUP}')"
 echo "== API group: base ${BASE_GROUP}, branch ${GROUP} =="
 
-if kind get clusters 2>/dev/null | grep -qx "${CLUSTER}"; then
+# Captured, not piped: under pipefail grep -q's early exit can fail the pipeline on a match.
+clusters=$(kind get clusters 2>/dev/null || true)
+if grep -qx "${CLUSTER}" <<<"${clusters}"; then
   fail "kind cluster '${CLUSTER}' already exists; refusing to clobber it. Delete it or set CLUSTER=<unique-name>."
 fi
 CREATED=1

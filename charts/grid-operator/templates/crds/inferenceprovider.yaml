@@ -193,6 +193,29 @@ spec:
                         The operator never falls back to system roots or plain HTTP.
                       nullable: true
                       properties:
+                        caConfigMapRef:
+                          description: |-
+                            Reference to a `ConfigMap` holding the CA certificate PEM, such as the
+                            platform service CA (`openshift-service-ca.crt`, key `service-ca.crt`).
+
+                            A CA bundle is public, so it may live in a `ConfigMap`. Like
+                            `ca_secret_ref`, it is the only trust consulted when set.
+                          nullable: true
+                          properties:
+                            key:
+                              description: Key within the `ConfigMap`'s `data`. Defaults to `ca.crt`.
+                              nullable: true
+                              type: string
+                            name:
+                              description: '`ConfigMap` name.'
+                              type: string
+                            namespace:
+                              description: '`ConfigMap` namespace.'
+                              type: string
+                          required:
+                            - name
+                            - namespace
+                          type: object
                         caSecretRef:
                           description: |-
                             Reference to a Secret containing the CA certificate PEM for server
@@ -201,7 +224,8 @@ spec:
                             The Secret must contain the PEM-encoded CA certificate under the key
                             `ca.crt` (or the key specified by `key`).  When this CA is
                             set, the scraper trusts **only** this CA; system root certificates
-                            are not consulted.
+                            are not consulted. Exactly one of this and `ca_config_map_ref` is set.
+                          nullable: true
                           properties:
                             key:
                               description: |-
@@ -260,9 +284,10 @@ spec:
                             - name
                             - namespace
                           type: object
-                      required:
-                        - caSecretRef
                       type: object
+                      x-kubernetes-validations:
+                        - message: set exactly one of caSecretRef and caConfigMapRef
+                          rule: has(self.caSecretRef) != has(self.caConfigMapRef)
                   type: object
                 metricsConfig:
                   description: |-
@@ -276,6 +301,26 @@ spec:
                     [`GridNetwork`]: crate::crd::grid_network::GridNetwork
                   nullable: true
                   properties:
+                    auth:
+                      description: |-
+                        How the scraper authenticates to the metrics endpoint. Absent sends no
+                        credential.
+                      nullable: true
+                      properties:
+                        allowPlaintext:
+                          description: |-
+                            Send the credential over plain `http://`. Off by default, because a
+                            bearer token on an unencrypted connection can be read off the network.
+                            For a lab only.
+                          type: boolean
+                        type:
+                          description: The credential to send.
+                          enum:
+                            - serviceAccountToken
+                          type: string
+                      required:
+                        - type
+                      type: object
                     metricsEndpoint:
                       description: |-
                         Base URL for the metrics endpoint, independent of `spec.endpoint`.
@@ -321,7 +366,7 @@ spec:
 
                         When set, the `queue_depth` signal value is divided by this capacity
                         and clamped to `[0.0, 1.0]` before scoring.  This allows consuming raw
-                        average queue-size metrics (such as `llm_d_router_epp_average_queue_size`)
+                        average queue-size metrics (such as `llm_d_epp_average_queue_size`)
                         without requiring the exporter to pre-normalise.
 
                         When absent, the `queue_depth` signal must already be normalised to
@@ -409,6 +454,29 @@ spec:
                         The scraper never falls back to system roots or plain HTTP.
                       nullable: true
                       properties:
+                        caConfigMapRef:
+                          description: |-
+                            Reference to a `ConfigMap` holding the CA certificate PEM, such as the
+                            platform service CA (`openshift-service-ca.crt`, key `service-ca.crt`).
+
+                            A CA bundle is public, so it may live in a `ConfigMap`. Like
+                            `ca_secret_ref`, it is the only trust consulted when set.
+                          nullable: true
+                          properties:
+                            key:
+                              description: Key within the `ConfigMap`'s `data`. Defaults to `ca.crt`.
+                              nullable: true
+                              type: string
+                            name:
+                              description: '`ConfigMap` name.'
+                              type: string
+                            namespace:
+                              description: '`ConfigMap` namespace.'
+                              type: string
+                          required:
+                            - name
+                            - namespace
+                          type: object
                         caSecretRef:
                           description: |-
                             Reference to a Secret containing the CA certificate PEM for server
@@ -417,7 +485,8 @@ spec:
                             The Secret must contain the PEM-encoded CA certificate under the key
                             `ca.crt` (or the key specified by `key`).  When this CA is
                             set, the scraper trusts **only** this CA; system root certificates
-                            are not consulted.
+                            are not consulted. Exactly one of this and `ca_config_map_ref` is set.
+                          nullable: true
                           properties:
                             key:
                               description: |-
@@ -476,9 +545,10 @@ spec:
                             - name
                             - namespace
                           type: object
-                      required:
-                        - caSecretRef
                       type: object
+                      x-kubernetes-validations:
+                        - message: set exactly one of caSecretRef and caConfigMapRef
+                          rule: has(self.caSecretRef) != has(self.caConfigMapRef)
                   type: object
                 modelDiscovery:
                   description: |-
@@ -520,6 +590,29 @@ spec:
                             When absent, system root certificates are used.
                           nullable: true
                           properties:
+                            caConfigMapRef:
+                              description: |-
+                                Reference to a `ConfigMap` holding the CA certificate PEM, such as the
+                                platform service CA (`openshift-service-ca.crt`, key `service-ca.crt`).
+
+                                A CA bundle is public, so it may live in a `ConfigMap`. Like
+                                `ca_secret_ref`, it is the only trust consulted when set.
+                              nullable: true
+                              properties:
+                                key:
+                                  description: Key within the `ConfigMap`'s `data`. Defaults to `ca.crt`.
+                                  nullable: true
+                                  type: string
+                                name:
+                                  description: '`ConfigMap` name.'
+                                  type: string
+                                namespace:
+                                  description: '`ConfigMap` namespace.'
+                                  type: string
+                              required:
+                                - name
+                                - namespace
+                              type: object
                             caSecretRef:
                               description: |-
                                 Reference to a Secret containing the CA certificate PEM for server
@@ -528,7 +621,8 @@ spec:
                                 The Secret must contain the PEM-encoded CA certificate under the key
                                 `ca.crt` (or the key specified by `key`).  When this CA is
                                 set, the scraper trusts **only** this CA; system root certificates
-                                are not consulted.
+                                are not consulted. Exactly one of this and `ca_config_map_ref` is set.
+                              nullable: true
                               properties:
                                 key:
                                   description: |-
@@ -587,9 +681,10 @@ spec:
                                 - name
                                 - namespace
                               type: object
-                          required:
-                            - caSecretRef
                           type: object
+                          x-kubernetes-validations:
+                            - message: set exactly one of caSecretRef and caConfigMapRef
+                              rule: has(self.caSecretRef) != has(self.caConfigMapRef)
                       type: object
                   type: object
                 models:

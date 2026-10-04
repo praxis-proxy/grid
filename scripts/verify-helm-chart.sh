@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# grep that reads all its input: grep -q exits on the first match, and under pipefail the
+# writer's SIGPIPE then fails the pipeline at random.
+matches() { grep "$@" >/dev/null; }
+
 PASS=0
 FAIL=0
 KIND_CLUSTER=""
@@ -14,15 +18,18 @@ DEFAULT_GATEWAY_IMAGE="ghcr.io/praxis-proxy/ai:0.4.0"
 pass() { PASS=$((PASS + 1)); echo "  PASS: $1"; }
 fail() { FAIL=$((FAIL + 1)); echo "  FAIL: $1" >&2; }
 
+# This run's scratch, so concurrent runs never share packages. RENDER_DIR keeps the renders
+# CI uploads; it defaults to the scratch directory.
+WORK=$(mktemp -d)
+RENDER_DIR=${RENDER_DIR:-$WORK}
+mkdir -p "$RENDER_DIR"
+
 cleanup() {
   if [ -n "$KIND_CLUSTER" ]; then
     echo "Cleaning up Kind cluster $KIND_CLUSTER"
     kind delete cluster --name "$KIND_CLUSTER" 2>/dev/null || true
   fi
-  rm -f /tmp/grid-operator-helm-verify-*.tgz
-  rm -f /tmp/praxis-gateway-helm-verify-*.tgz
-  rm -f /tmp/grid-site-helm-verify-*.tgz
-  rm -f /tmp/grid-mock-providers-helm-verify-*.tgz
+  rm -rf "$WORK"
 }
 trap cleanup EXIT
 
@@ -32,7 +39,7 @@ try_template() {
   local chart="$1" label="$2"
   shift 2
   local release
-  release=$(echo "v-${label// /-}" | tr '[:upper:]' '[:lower:]' | tr -dc 'a-z0-9-' | head -c 53)
+  release=$(echo "v-${label// /-}" | tr '[:upper:]' '[:lower:]' | tr -dc 'a-z0-9-' | cut -c 1-53)
   if helm template "$release" "$chart" "$@" >/dev/null 2>&1; then
     pass "template: $label"
   else
@@ -71,7 +78,7 @@ try_reject_msg() {
   elif grep -qE -- "$want" <<<"$out"; then
     pass "schema rejects: $label"
   else
-    fail "schema rejects $label for the wrong reason: $(echo "$out" | head -3 | tr '\n' ' ')"
+    fail "schema rejects $label for the wrong reason: $(head -3 <<<"$out" | tr '\n' ' ')"
   fi
 }
 
@@ -132,7 +139,7 @@ fi
 # ── Default template rendering ───────────────────────────────────────
 echo ""
 echo "=== Template rendering ==="
-helm template verify-default "$CHART_DIR" --namespace grid-system > /tmp/helm-rendered-operator.yaml 2>/dev/null || true
+helm template verify-default "$CHART_DIR" --namespace grid-system > "$RENDER_DIR/helm-rendered-operator.yaml" 2>/dev/null || true
 try_template "$CHART_DIR" "default values" --namespace grid-system
 
 # ── Variant renderings ──────────────────────────────────────────────
@@ -155,7 +162,7 @@ try_template "$CHART_DIR" "SWIM LoadBalancer" \
 SIG_RENDER=$(helm template v-sig "$CHART_DIR" --namespace grid-system --set signals.enabled=true \
   --set swim.service.enabled=true --set swim.service.type=LoadBalancer 2>&1 || true)
 if grep -q 'value: "v-sig-grid-operator-swim.grid-system.svc:9091"' <<<"$SIG_RENDER" \
-  && grep -A3 -- '- name: signals' <<<"$SIG_RENDER" | grep -q 'targetPort: signals'; then
+  && grep -A3 -- '- name: signals' <<<"$SIG_RENDER" | matches 'targetPort: signals'; then
   pass "signals: TCP port on the SWIM Service and the local gateway address"
 else
   fail "signals: unexpected render: $(grep -E 'SIGNALS|signals|Error' <<<"$SIG_RENDER" | head -3 | tr '\n' ' ')"
@@ -203,7 +210,7 @@ echo "=== Selector protection ==="
 RENDERED=$(helm template verify-sel "$CHART_DIR" \
   --set-string 'podLabels.app\.kubernetes\.io/name=hostile' \
   --namespace grid-system --show-only templates/deployment.yaml 2>&1)
-POD_NAME_LABEL=$(echo "$RENDERED" | grep -A100 'template:' | grep -A100 'labels:' | grep 'app.kubernetes.io/name:' | head -1 | awk '{print $2}')
+POD_NAME_LABEL=$(echo "$RENDERED" | grep -A100 'template:' | grep -A100 'labels:' | grep 'app.kubernetes.io/name:' | awk 'NR == 1 {print $2}')
 if [ "$POD_NAME_LABEL" = "grid-operator" ]; then
   pass "selector: podLabels cannot override app.kubernetes.io/name"
 else
@@ -222,7 +229,7 @@ if render verify-links "$CHART_DIR" --namespace grid-system --show-only template
     fail "operator pod must set enableServiceLinks: false"
   fi
   # Even with service links off, pin the port so no injected value can win.
-  if grep -A1 'name: GRID_GATEWAY_PORT' <<<"$RENDERED" | grep -q 'value: "8080"'; then
+  if grep -A1 'name: GRID_GATEWAY_PORT' <<<"$RENDERED" | matches 'value: "8080"'; then
     pass "operator pod sets GRID_GATEWAY_PORT by default"
   else
     fail "operator pod must set GRID_GATEWAY_PORT by default"
@@ -269,14 +276,14 @@ if render verify-gwns "$CHART_DIR" --namespace release-ns --set-string gateway.n
   else
     fail "gateway namespace Role: unexpected rules '$GW_ROLE'"
   fi
-  if yq 'select(.kind == "RoleBinding" and .metadata.namespace == "edge-ns") | .roleRef.kind' <<<"$RENDERED" | grep -qx ClusterRole; then
+  if yq 'select(.kind == "RoleBinding" and .metadata.namespace == "edge-ns") | .roleRef.kind' <<<"$RENDERED" | matches -x ClusterRole; then
     fail "gateway namespace binds the resources ClusterRole"
   else
     pass "gateway namespace does not bind the resources ClusterRole"
   fi
 fi
 if render verify-gwns "$CHART_DIR" --namespace release-ns --set-string gateway.namespace=release-ns; then
-  if yq 'select(.kind == "Role") | .metadata.name' <<<"$RENDERED" | grep -q gateway-discovery; then
+  if yq 'select(.kind == "Role") | .metadata.name' <<<"$RENDERED" | matches gateway-discovery; then
     fail "gateway namespace Role rendered where the resources Role already applies"
   else
     pass "no gateway namespace Role inside the resource namespaces"
@@ -284,7 +291,7 @@ if render verify-gwns "$CHART_DIR" --namespace release-ns --set-string gateway.n
 fi
 if render verify-gwns "$CHART_DIR" --namespace release-ns --set-string gateway.namespace=edge-ns \
   --set-string gateway.address=gw.example.com:443; then
-  if yq 'select(.kind == "Role") | .metadata.name' <<<"$RENDERED" | grep -q gateway-discovery; then
+  if yq 'select(.kind == "Role") | .metadata.name' <<<"$RENDERED" | matches gateway-discovery; then
     fail "gateway namespace Role rendered although gateway.address skips discovery"
   else
     pass "no gateway namespace Role when gateway.address is set"
@@ -318,7 +325,7 @@ echo ""
 echo "=== Metrics-dependent resources ==="
 RENDERED_NO_METRICS=$(helm template verify-nometrics "$CHART_DIR" \
   --set metrics.service.enabled=false --namespace grid-system 2>&1)
-if echo "$RENDERED_NO_METRICS" | grep -q 'kind: Pod'; then
+if echo "$RENDERED_NO_METRICS" | matches 'kind: Pod'; then
   fail "test pod rendered when metrics.service.enabled=false"
 else
   pass "test pod omitted when metrics.service.enabled=false"
@@ -335,14 +342,14 @@ fi
 # ── Package ──────────────────────────────────────────────────────────
 echo ""
 echo "=== Helm package ==="
-PKG_OUT=$(helm package "$CHART_DIR" -d /tmp 2>&1)
-TGZ=$(echo "$PKG_OUT" | grep -oP '/tmp/\S+\.tgz')
+PKG_OUT=$(helm package "$CHART_DIR" -d "$WORK" 2>&1)
+TGZ=$(echo "$PKG_OUT" | grep -oP "${WORK}/\\S+\\.tgz")
 if [ -f "$TGZ" ]; then
   pass "helm package: $(basename "$TGZ") ($(stat -c%s "$TGZ") bytes)"
   CONTENTS=$(tar tzf "$TGZ" 2>&1)
   for f in Chart.yaml values.yaml values.schema.json templates/deployment.yaml templates/crds/agenttoolprovider.yaml \
     templates/crds/gridnetwork.yaml templates/crds/gridsite.yaml templates/crds/inferenceprovider.yaml; do
-    if echo "$CONTENTS" | grep -q "$f"; then
+    if echo "$CONTENTS" | matches "$f"; then
       pass "package contains: $f"
     else
       fail "package missing: $f"
@@ -386,9 +393,9 @@ fi
 # ── Default template rendering ───────────────────────────────────────
 echo ""
 echo "=== Template rendering ==="
-helm template verify-default "$GW_DIR" "${GW_REQ[@]}" --namespace grid-system > /tmp/helm-rendered-gateway.yaml 2>/dev/null || true
+helm template verify-default "$GW_DIR" "${GW_REQ[@]}" --namespace grid-system > "$RENDER_DIR/helm-rendered-gateway.yaml" 2>/dev/null || true
 try_template "$GW_DIR" "gateway default" "${GW_REQ[@]}" --namespace grid-system
-if grep -Fq "image: ${DEFAULT_GATEWAY_IMAGE}" /tmp/helm-rendered-gateway.yaml; then
+if grep -Fq "image: ${DEFAULT_GATEWAY_IMAGE}" "$RENDER_DIR/helm-rendered-gateway.yaml"; then
   pass "gateway default image: ${DEFAULT_GATEWAY_IMAGE}"
 else
   fail "gateway default image is not ${DEFAULT_GATEWAY_IMAGE}"
@@ -487,7 +494,7 @@ echo ""
 echo "=== fullnameOverride (gateway) ==="
 DEFAULT_SVC_NAME=$(helm template consumer-gateway "$GW_DIR" "${GW_REQ[@]}" \
   --namespace grid-system --show-only templates/service.yaml 2>/dev/null \
-  | grep 'name:' | head -1 | awk '{print $2}')
+  | grep 'name:' | awk 'NR == 1 {print $2}')
 if [ "$DEFAULT_SVC_NAME" = "consumer-gateway-praxis-gateway" ]; then
   pass "fullname: default is {release}-praxis-gateway"
 else
@@ -497,7 +504,7 @@ fi
 OVERRIDE_SVC_NAME=$(helm template consumer-gateway "$GW_DIR" "${GW_REQ[@]}" \
   --set fullnameOverride=consumer-gateway \
   --namespace grid-system --show-only templates/service.yaml 2>/dev/null \
-  | grep 'name:' | head -1 | awk '{print $2}')
+  | grep 'name:' | awk 'NR == 1 {print $2}')
 if [ "$OVERRIDE_SVC_NAME" = "consumer-gateway" ]; then
   pass "fullname: fullnameOverride produces exact name"
 else
@@ -510,7 +517,7 @@ echo "=== Selector protection (gateway) ==="
 RENDERED=$(helm template verify-gw-sel "$GW_DIR" "${GW_REQ[@]}" \
   --set-string 'podLabels.app\.kubernetes\.io/name=hostile' \
   --namespace grid-system --show-only templates/deployment.yaml 2>&1)
-POD_NAME_LABEL=$(echo "$RENDERED" | grep -A100 'template:' | grep -A100 'labels:' | grep 'app.kubernetes.io/name:' | head -1 | awk '{print $2}')
+POD_NAME_LABEL=$(echo "$RENDERED" | grep -A100 'template:' | grep -A100 'labels:' | grep 'app.kubernetes.io/name:' | awk 'NR == 1 {print $2}')
 if [ "$POD_NAME_LABEL" = "praxis-gateway" ]; then
   pass "selector: gateway podLabels cannot override app.kubernetes.io/name"
 else
@@ -555,47 +562,47 @@ SECURE_ARGS=(
 )
 SECURE_RENDER=$(helm template verify-secure "$GW_DIR" "${SECURE_ARGS[@]}" --namespace grid-system 2>&1)
 
-if echo "$SECURE_RENDER" | grep -q 'insecure_options'; then
+if echo "$SECURE_RENDER" | matches 'insecure_options'; then
   fail "secure config: insecure_options must never be emitted"
 else
   pass "secure config: no insecure_options"
 fi
-if echo "$SECURE_RENDER" | grep -q 'address: "127.0.0.1:9901"'; then
+if echo "$SECURE_RENDER" | matches 'address: "127.0.0.1:9901"'; then
   pass "secure config: admin bound to 127.0.0.1"
 else
   fail "secure config: admin not bound to 127.0.0.1"
 fi
-if echo "$SECURE_RENDER" | grep -q 'upstream_ca_file: "/etc/praxis/upstream-ca/ca.crt"'; then
+if echo "$SECURE_RENDER" | matches 'upstream_ca_file: "/etc/praxis/upstream-ca/ca.crt"'; then
   pass "secure config: upstream_ca_file set from upstreamCA mount"
 else
   fail "secure config: upstream_ca_file missing"
 fi
 # api-key strips the caller's key before any upstream filter.
-if echo "$SECURE_RENDER" | awk '/filter: policy/{p=1} p&&/request_remove: \[Authorization\]/{r=1} r&&/filter: load_balancer/{print "ok"; exit}' | grep -q ok; then
+if awk '/filter: policy/{p=1} p&&/request_remove: \[Authorization\]/{r=1} r&&/filter: load_balancer/{print "ok"; exit}' <<<"$SECURE_RENDER" | matches ok; then
   pass "secure config: api-key strips Authorization before load_balancer"
 else
   fail "secure config: Authorization not stripped before load_balancer"
 fi
-if echo "$SECURE_RENDER" | grep -q 'trusted_private_endpoints'; then
+if echo "$SECURE_RENDER" | matches 'trusted_private_endpoints'; then
   fail "secure config: trusted_private_endpoints is not a Praxis 0.7.0 policy field"
 else
   pass "secure config: no trusted_private_endpoints"
 fi
 NONE_RENDER=$(helm template verify-none "$GW_DIR" "${GW_RENDER[@]}" --namespace grid-system)
-if echo "$NONE_RENDER" | grep -qE 'filter: policy|policy.yaml'; then
+if echo "$NONE_RENDER" | matches -E 'filter: policy|policy.yaml'; then
   fail "secure config: auth.mode none must render no policy"
 else
   pass "secure config: auth.mode none renders no policy"
 fi
-if echo "$NONE_RENDER" | grep -q 'request_remove: \[Authorization\]'; then
+if echo "$NONE_RENDER" | matches 'request_remove: \[Authorization\]'; then
   pass "secure config: auth.mode none still strips Authorization by default"
 else
   fail "secure config: auth.mode none should strip Authorization by default"
 fi
 CA_RENDER=$(helm template verify-ca "$GW_DIR" "${SECURE_ARGS[@]}" --namespace grid-system \
   --set gatewayConfig.auth.validateCA.configMap=service-ca --set gatewayConfig.auth.validateCA.key=service-ca.crt)
-if echo "$CA_RENDER" | grep -A1 'name: SSL_CERT_FILE' | grep -q '/etc/praxis/validate-ca/service-ca.crt' \
-    && echo "$CA_RENDER" | grep -q 'mountPath: "/etc/praxis/validate-ca"'; then
+if echo "$CA_RENDER" | grep -A1 'name: SSL_CERT_FILE' | matches '/etc/praxis/validate-ca/service-ca.crt' \
+    && echo "$CA_RENDER" | matches 'mountPath: "/etc/praxis/validate-ca"'; then
   pass "secure config: validateCA mounts the bundle and sets SSL_CERT_FILE"
 else
   fail "secure config: validateCA should mount the bundle and set SSL_CERT_FILE"
@@ -603,37 +610,37 @@ fi
 NP_GW=$(helm template verify-np "$GW_DIR" "${GW_RENDER[@]}" --set networkPolicy.enabled=true \
   --set-json 'networkPolicy.from=[{"podSelector":{"matchLabels":{"app":"front"}}}]' \
   --show-only templates/networkpolicy.yaml --namespace grid-system 2>&1)
-if echo "$NP_GW" | grep -q 'kind: NetworkPolicy' && echo "$NP_GW" | grep -q 'app: front' \
-    && echo "$NP_GW" | grep -q 'port: 8080'; then
+if echo "$NP_GW" | matches 'kind: NetworkPolicy' && echo "$NP_GW" | matches 'app: front' \
+    && echo "$NP_GW" | matches 'port: 8080'; then
   pass "networkPolicy: limits listener ingress to the listed peers"
 else
   fail "networkPolicy: should limit listener ingress to the listed peers"
 fi
 try_template "$GW_DIR" "none + LoadBalancer with allowUnauthenticatedExposure (gw)" "${GW_RENDER[@]}" \
   --set service.type=LoadBalancer --set gatewayConfig.auth.allowUnauthenticatedExposure=true --namespace grid-system
-if echo "$SECURE_RENDER" | grep -q 'sni: "site-a.grid.internal"' && echo "$SECURE_RENDER" | grep -q 'verify: true'; then
+if echo "$SECURE_RENDER" | matches 'sni: "site-a.grid.internal"' && echo "$SECURE_RENDER" | matches 'verify: true'; then
   pass "secure config: mutual_tls backend renders sni + verify:true"
 else
   fail "secure config: mutual_tls backend missing sni/verify"
 fi
 # site-b is plaintext and last: the first tls: after its stanza must not exist.
-if echo "$SECURE_RENDER" | awk '/- name: "site-b"/{f=1} f&&/[^-] tls:/{print; exit}' | grep -q 'tls:'; then
+if awk '/- name: "site-b"/{f=1} f&&/[^-] tls:/{print; exit}' <<<"$SECURE_RENDER" | matches 'tls:'; then
   fail "secure config: plaintext backend must not render a tls block"
 else
   pass "secure config: plaintext backend renders no tls block"
 fi
-if echo "$SECURE_RENDER" | grep -q 'cert_path: "/etc/praxis/listener-tls/tls.crt"'; then
+if echo "$SECURE_RENDER" | matches 'cert_path: "/etc/praxis/listener-tls/tls.crt"'; then
   pass "secure config: listenerTls renders listener certificates"
 else
   fail "secure config: listenerTls certificates missing"
 fi
 # mutual_tls backend must probe over tcp (the active http probe is plaintext, unusable to a TLS peer).
-if echo "$SECURE_RENDER" | awk '/- name: "site-a"/{f=1} f&&/type:/{print; exit}' | grep -q 'type: "tcp"'; then
+if awk '/- name: "site-a"/{f=1} f&&/type:/{print; exit}' <<<"$SECURE_RENDER" | matches 'type: "tcp"'; then
   pass "secure config: mutual_tls backend health_check defaults to tcp"
 else
   fail "secure config: mutual_tls backend health_check should default to tcp"
 fi
-if echo "$SECURE_RENDER" | awk '/- name: "site-b"/{f=1} f&&/type:/{print; exit}' | grep -q 'type: "http"'; then
+if awk '/- name: "site-b"/{f=1} f&&/type:/{print; exit}' <<<"$SECURE_RENDER" | matches 'type: "http"'; then
   pass "secure config: plaintext backend health_check defaults to http"
 else
   fail "secure config: plaintext backend health_check should default to http"
@@ -691,7 +698,7 @@ try_reject_msg "$GW_DIR" "networkPolicy from ipBlock 0.0.0.0/0 (gw)" "admits eve
 try_reject_msg "$GW_DIR" "networkPolicy from a bare namespaceSelector (gw)" "admits every pod in every namespace" "${GW_REQ[@]}" \
   --set networkPolicy.enabled=true --set-json 'networkPolicy.from=[{"namespaceSelector":{}}]' --namespace grid-system
 if helm template v-hc "$GW_DIR" "${R0[@]}" "${BK1[@]}" --set "gatewayConfig.backends[0].healthCheck.type=tcp" \
-    --show-only templates/gateway-config.yaml | awk '/health_check:/{f=1} f&&/path:/{print; exit}' | grep -q path; then
+    --show-only templates/gateway-config.yaml | awk '/health_check:/{f=1} f&&/path:/{print; exit}' | matches path; then
   fail "tcp health_check should carry no path"
 else
   pass "tcp health_check carries no path"
@@ -702,7 +709,7 @@ else
   fail "validateCA should apply only with api-key"
 fi
 if helm template v-probe "$GW_DIR" "${GW_REQ[@]}" --set health.readiness.httpGet.path=/ --set health.readiness.httpGet.port=http \
-    --show-only templates/deployment.yaml --namespace grid-system | sed -n '/readinessProbe/,/livenessProbe/p' | grep -q tcpSocket; then
+    --show-only templates/deployment.yaml --namespace grid-system | sed -n '/readinessProbe/,/livenessProbe/p' | matches tcpSocket; then
   fail "an httpGet readiness probe should drop the default tcpSocket"
 else
   pass "an httpGet readiness probe drops the default tcpSocket"
@@ -731,15 +738,15 @@ TLS_RENDER=$(helm template v-tls "$GW_DIR" "${TLS1[@]}" --set "gatewayConfig.bac
   --set "gatewayConfig.backends[0].transport.sni=qwen3-kserve-workload-svc.llm.svc" \
   --set "gatewayConfig.backends[0].transport.ca.configMap=openshift-service-ca.crt" \
   --set "gatewayConfig.backends[0].transport.ca.key=service-ca.crt" 2>&1)
-if echo "$TLS_RENDER" | grep -q 'ca_path: "/etc/praxis/backend-ca/0/service-ca.crt"' \
-    && echo "$TLS_RENDER" | grep -q 'sni: "qwen3-kserve-workload-svc.llm.svc"' \
-    && ! echo "$TLS_RENDER" | awk '/- name: "kserve"/{f=1} f&&/client_cert/{print; exit}' | grep -q client_cert \
-    && echo "$TLS_RENDER" | grep -A2 'name: backend-ca-0' | grep -q 'name: "openshift-service-ca.crt"'; then
+if echo "$TLS_RENDER" | matches 'ca_path: "/etc/praxis/backend-ca/0/service-ca.crt"' \
+    && echo "$TLS_RENDER" | matches 'sni: "qwen3-kserve-workload-svc.llm.svc"' \
+    && ! awk '/- name: "kserve"/{f=1} f&&/client_cert/{print; exit}' <<<"$TLS_RENDER" | matches client_cert \
+    && echo "$TLS_RENDER" | grep -A2 'name: backend-ca-0' | matches 'name: "openshift-service-ca.crt"'; then
   pass "tls backend: server-verified with transport.ca and sni, no client cert"
 else
   fail "tls backend: should render ca_path, sni, verify, no client_cert, and mount the CA"
 fi
-if echo "$TLS_RENDER" | awk '/- name: "kserve"/{f=1} f&&/type:/{print; exit}' | grep -q 'type: "tcp"'; then
+if awk '/- name: "kserve"/{f=1} f&&/type:/{print; exit}' <<<"$TLS_RENDER" | matches 'type: "tcp"'; then
   pass "tls backend: health_check defaults to tcp"
 else
   fail "tls backend: health_check should default to tcp"
@@ -801,7 +808,7 @@ else
   fail "provider spiffe: unexpected render: $(grep -E 'client_cert_mode|spiffe|Error' <<<"$SPIFFE_RENDER" | head -3 | tr '\n' ' ')"
 fi
 if helm template v-prov "$GW_DIR" "${PROVIDER[@]}" "${SPIFFE[@]}" --set gatewayConfig.peerTrust.allowAnyGridSite=true 2>&1 \
-  | grep -q 'client_cert_mode: require_named$'; then
+  | matches 'client_cert_mode: require_named$'; then
   pass "provider spiffe: allowAnyGridSite accepts any Grid-CA site explicitly"
 else
   fail "provider spiffe: allowAnyGridSite did not render require_named"
@@ -811,7 +818,7 @@ try_reject_msg "$GW_DIR" "rendered config without localSite (gw)" "localSite" "$
 try_reject_msg "$GW_DIR" "provider spiffe without an allowlist (gw)" "peerTrust" "${PROVIDER[@]}" "${SPIFFE[@]}"
 try_reject_msg "$GW_DIR" "provider pin without digests (gw)" "peerTrust" "${PROVIDER[@]}" --set gatewayConfig.peerTrust.certDigests=null
 # The template guards hold without the schema. The flag needs Helm 3.16+.
-if helm template --help | grep -q -- --skip-schema-validation; then
+if helm template --help | matches -- --skip-schema-validation; then
   try_reject_msg "$GW_DIR" "provider spiffe without an allowlist, schema skipped (gw)" "allowAnyGridSite true" \
     --skip-schema-validation "${PROVIDER[@]}" "${SPIFFE[@]}"
   try_reject_msg "$GW_DIR" "provider pin without digests, schema skipped (gw)" "pin mode needs certDigests" \
@@ -850,7 +857,7 @@ else
 fi
 try_reject_msg "$GW_DIR" "gridServing without network or configMap (gw)" "gridServing.network" "${SERVING[@]}" --set gridServing.configMap=""
 if helm template v-serv "$GW_DIR" "${SERVING[@]}" --set gridServing.configMap="" --set gridServing.network=grid \
-  --set fullnameOverride=gw 2>&1 | grep -q 'name: "grid-serving-grid-gw"'; then
+  --set fullnameOverride=gw 2>&1 | matches 'name: "grid-serving-grid-gw"'; then
   pass "gridServing: derives the operator's ConfigMap name from network and gatewayRef"
 else
   fail "gridServing: did not derive grid-serving-grid-gw"
@@ -866,21 +873,24 @@ try_template "$GW_DIR" "absent gridServing and peerTrust maps (gw)" "${GW_REQ[@]
 try_reject_msg "$GW_DIR" "listenerTls enabled no secret (gw)" "listenerTls.existingSecret is required" "${GW_REQ[@]}" \
   --set gatewayConfig.listenerTls.enabled=true --namespace grid-system
 
-# listenerTls names the port https (render or BYO); probes follow the port name.
+# listenerTls names the port https (render or BYO). A rendered config probes the
+# loopback admin listener; a BYO config's probes follow the port name.
 for mode in render byo; do
-  if [ "$mode" = render ]; then args=("${GW_RENDER[@]}"); else args=(--set config.existingConfigMap=byo); fi
+  if [ "$mode" = render ]; then args=("${GW_RENDER[@]}"); want=3; else args=(--set config.existingConfigMap=byo); want=5; fi
   out=$(helm template v-port "$GW_DIR" "${args[@]}" --set gatewayConfig.listenerTls.enabled=true \
     --set gatewayConfig.listenerTls.existingSecret=l --namespace grid-system)
-  if [ "$(echo "$out" | grep -cE 'name: https|port: https|targetPort: https')" = 5 ]; then
+  if [ "$(echo "$out" | grep -cE 'name: https|port: https|targetPort: https')" = "$want" ]; then
     pass "listenerTls ($mode): port, probes, and Service target https"
   else
     fail "listenerTls ($mode): port, probes, and Service should target https"
   fi
 done
-if [ "$(helm template v-port "$GW_DIR" "${GW_RENDER[@]}" --namespace grid-system | grep -cE 'port: http$|targetPort: http$')" = 3 ]; then
-  pass "default port: probes and Service target http"
+out=$(helm template v-port "$GW_DIR" "${GW_RENDER[@]}" --namespace grid-system)
+if [ "$(echo "$out" | grep -cE 'port: http$|targetPort: http$')" = 1 ] \
+  && [ "$(echo "$out" | grep -cE -- '- http://127\.0\.0\.1:9901/(ready|healthy)$')" = 2 ]; then
+  pass "default port: Service targets http, probes ask the admin listener"
 else
-  fail "default port: probes and Service should target http"
+  fail "default port: Service should target http and probes the admin listener"
 fi
 
 # Default probes must target the container port by its name, or the pod never goes Ready.
@@ -888,8 +898,8 @@ probe_port_matches() {
   local label=$1 out name probes; shift
   out=$(helm template v-probe "$GW_DIR" "${GW_REQ[@]}" --namespace grid-system "$@" \
     --show-only templates/deployment.yaml 2>/dev/null)
-  name=$(echo "$out" | awk '/^ +ports:/{f=1; next} f && /- name:/{print $3; exit}')
-  probes=$(echo "$out" | awk '/tcpSocket:/{getline; print $2}' | sort -u)
+  name=$(awk '/^ +ports:/{f=1; next} f && /- name:/{print $3; exit}' <<<"$out")
+  probes=$(awk '/tcpSocket:/{getline; print $2}' <<<"$out" | sort -u)
   if [ -n "$name" ] && [ "$probes" = "$name" ]; then
     pass "probe port matches container port ($label: $name)"
   else
@@ -915,13 +925,13 @@ fi
 # ── Package ──────────────────────────────────────────────────────────
 echo ""
 echo "=== Helm package (gateway) ==="
-PKG_OUT=$(helm package "$GW_DIR" -d /tmp 2>&1)
-TGZ=$(echo "$PKG_OUT" | grep -oP '/tmp/\S+\.tgz')
+PKG_OUT=$(helm package "$GW_DIR" -d "$WORK" 2>&1)
+TGZ=$(echo "$PKG_OUT" | grep -oP "${WORK}/\\S+\\.tgz")
 if [ -f "$TGZ" ]; then
   pass "helm package: $(basename "$TGZ") ($(stat -c%s "$TGZ") bytes)"
   CONTENTS=$(tar tzf "$TGZ" 2>&1)
   for f in Chart.yaml values.yaml values.schema.json templates/deployment.yaml; do
-    if echo "$CONTENTS" | grep -q "$f"; then
+    if echo "$CONTENTS" | matches "$f"; then
       pass "package contains: $f"
     else
       fail "package missing: $f"
@@ -982,13 +992,13 @@ try_reject "$SITE_DIR" "unknown key (site)" "${SITE_REQ[@]}" --set typoField=tru
 
 echo ""
 echo "=== Helm package (site) ==="
-PKG_OUT=$(helm package "$SITE_DIR" -d /tmp 2>&1)
-TGZ=$(echo "$PKG_OUT" | grep -oP '/tmp/\S+\.tgz')
+PKG_OUT=$(helm package "$SITE_DIR" -d "$WORK" 2>&1)
+TGZ=$(echo "$PKG_OUT" | grep -oP "${WORK}/\\S+\\.tgz")
 if [ -f "$TGZ" ]; then
   pass "helm package: $(basename "$TGZ") ($(stat -c%s "$TGZ") bytes)"
   CONTENTS=$(tar tzf "$TGZ" 2>&1)
   for f in Chart.yaml values.yaml values.schema.json templates/gridnetwork.yaml templates/gridsite.yaml templates/inferenceprovider.yaml; do
-    if echo "$CONTENTS" | grep -q "$f"; then
+    if echo "$CONTENTS" | matches "$f"; then
       pass "package contains: $f"
     else
       fail "package missing: $f"
@@ -1038,7 +1048,7 @@ echo "=== Selector protection (mock) ==="
 RENDERED=$(helm template verify-mock-sel "$MOCK_DIR" \
   --set-string 'podLabels.app\.kubernetes\.io/name=hostile' \
   --namespace grid-system --show-only templates/deployment.yaml 2>&1)
-POD_NAME_LABEL=$(echo "$RENDERED" | grep -A100 'template:' | grep -A100 'labels:' | grep 'app.kubernetes.io/name:' | head -1 | awk '{print $2}')
+POD_NAME_LABEL=$(echo "$RENDERED" | grep -A100 'template:' | grep -A100 'labels:' | grep 'app.kubernetes.io/name:' | awk 'NR == 1 {print $2}')
 if [ "$POD_NAME_LABEL" = "grid-mock-providers" ]; then
   pass "selector: mock podLabels cannot override app.kubernetes.io/name"
 else
@@ -1049,12 +1059,12 @@ echo ""
 echo "=== NetworkPolicy rendering (mock) ==="
 NP_RENDERED=$(helm template verify-np "$MOCK_DIR" --namespace grid-system \
   --show-only templates/networkpolicy.yaml 2>&1)
-if echo "$NP_RENDERED" | grep -q 'app.kubernetes.io/instance: provider-gateway'; then
+if echo "$NP_RENDERED" | matches 'app.kubernetes.io/instance: provider-gateway'; then
   pass "networkpolicy: allows provider-gateway"
 else
   fail "networkpolicy: missing provider-gateway ingress"
 fi
-if echo "$NP_RENDERED" | grep -q 'app.kubernetes.io/name: grid-operator'; then
+if echo "$NP_RENDERED" | matches 'app.kubernetes.io/name: grid-operator'; then
   pass "networkpolicy: allows grid-operator"
 else
   fail "networkpolicy: missing grid-operator ingress"
@@ -1069,13 +1079,13 @@ try_reject "$MOCK_DIR" "invalid service type (mock)" --set service.type=External
 
 echo ""
 echo "=== Helm package (mock) ==="
-PKG_OUT=$(helm package "$MOCK_DIR" -d /tmp 2>&1)
-TGZ=$(echo "$PKG_OUT" | grep -oP '/tmp/\S+\.tgz')
+PKG_OUT=$(helm package "$MOCK_DIR" -d "$WORK" 2>&1)
+TGZ=$(echo "$PKG_OUT" | grep -oP "${WORK}/\\S+\\.tgz")
 if [ -f "$TGZ" ]; then
   pass "helm package: $(basename "$TGZ") ($(stat -c%s "$TGZ") bytes)"
   CONTENTS=$(tar tzf "$TGZ" 2>&1)
   for f in Chart.yaml values.yaml values.schema.json templates/deployment.yaml templates/service.yaml templates/networkpolicy.yaml; do
-    if echo "$CONTENTS" | grep -q "$f"; then
+    if echo "$CONTENTS" | matches "$f"; then
       pass "package contains: $f"
     else
       fail "package missing: $f"
@@ -1103,9 +1113,9 @@ if [ "${KIND:-}" = "1" ] || [ "${1:-}" = "--kind" ]; then
   if command -v docker &>/dev/null && docker image inspect "$IMAGE_REF" &>/dev/null; then
     kind load docker-image "$IMAGE_REF" --name "$KIND_CLUSTER" 2>/dev/null
   elif command -v podman &>/dev/null && podman image exists "$IMAGE_REF" 2>/dev/null; then
-    podman save "$IMAGE_REF" -o "/tmp/grid-op-${KIND_CLUSTER}.tar" 2>/dev/null
-    kind load image-archive "/tmp/grid-op-${KIND_CLUSTER}.tar" --name "$KIND_CLUSTER" 2>/dev/null
-    rm -f "/tmp/grid-op-${KIND_CLUSTER}.tar"
+    podman save "$IMAGE_REF" -o "$WORK/grid-op-${KIND_CLUSTER}.tar" 2>/dev/null
+    kind load image-archive "$WORK/grid-op-${KIND_CLUSTER}.tar" --name "$KIND_CLUSTER" 2>/dev/null
+    rm -f "$WORK/grid-op-${KIND_CLUSTER}.tar"
   fi
 
   KCTX="kind-${KIND_CLUSTER}"
@@ -1171,7 +1181,7 @@ if [ "${KIND:-}" = "1" ] || [ "${1:-}" = "--kind" ]; then
   if [ -n "$METRICS_PORT" ]; then
     METRICS_OUT=$(kubectl --context "$KCTX" -n grid-system run metrics-probe --rm -i --restart=Never \
       --image=busybox:1.37 -- wget -qO- --timeout=5 "http://${METRICS_SVC}:${METRICS_PORT}/metrics" 2>/dev/null || true)
-    if echo "$METRICS_OUT" | grep -q '# HELP'; then
+    if echo "$METRICS_OUT" | matches '# HELP'; then
       pass "kind: operator /metrics endpoint"
     else
       pass "kind: operator /metrics endpoint (skipped — operator not healthy)"
@@ -1328,16 +1338,16 @@ echo ""
 echo "=== Cold-install ordering ==="
 INSTALL_ORDER=$(grep -n 'helm upgrade --install' "$SCRIPT_DIR/install.sh" \
   | sed 's/.*--install \([^ ]*\).*/\1/' | tr '\n' ' ')
-if echo "$INSTALL_ORDER" | grep -q "grid-operator.*grid-mock-providers.*grid-site"; then
+if echo "$INSTALL_ORDER" | matches "grid-operator.*grid-mock-providers.*grid-site"; then
   pass "install order: operator before mock-providers before grid-site"
 else
   fail "install order: expected operator → mock → site, got: $INSTALL_ORDER"
 fi
 
 # Provider must come after overlay wait, consumer after provider.
-PROVIDER_LINE=$(grep -n 'helm upgrade --install provider-gateway' "$SCRIPT_DIR/install.sh" | head -1 | cut -d: -f1)
-CONSUMER_LINE=$(grep -n 'helm upgrade --install consumer-gateway' "$SCRIPT_DIR/install.sh" | head -1 | cut -d: -f1)
-OVERLAY_WAIT_LINE=$(grep -n 'wait_for_overlay' "$SCRIPT_DIR/install.sh" | grep -v '^[0-9]*:wait_for_overlay()' | head -1 | cut -d: -f1)
+PROVIDER_LINE=$(grep -n 'helm upgrade --install provider-gateway' "$SCRIPT_DIR/install.sh" | awk -F: 'NR == 1 {print $1}')
+CONSUMER_LINE=$(grep -n 'helm upgrade --install consumer-gateway' "$SCRIPT_DIR/install.sh" | awk -F: 'NR == 1 {print $1}')
+OVERLAY_WAIT_LINE=$(grep -n 'wait_for_overlay' "$SCRIPT_DIR/install.sh" | grep -v '^[0-9]*:wait_for_overlay()' | awk -F: 'NR == 1 {print $1}')
 if [[ -n "$OVERLAY_WAIT_LINE" && -n "$PROVIDER_LINE" && -n "$CONSUMER_LINE" ]] \
    && (( OVERLAY_WAIT_LINE < PROVIDER_LINE )) \
    && (( PROVIDER_LINE < CONSUMER_LINE )); then
@@ -1415,7 +1425,7 @@ echo ""
 echo "=== Uninstall reverse order ==="
 UNINSTALL_ORDER=$(grep -n 'helm uninstall' "$SCRIPT_DIR/uninstall.sh" \
   | sed 's/.*uninstall \([^ ]*\).*/\1/' | tr '\n' ' ')
-if echo "$UNINSTALL_ORDER" | grep -q "grid-mock-providers.*grid-site.*grid-operator"; then
+if echo "$UNINSTALL_ORDER" | matches "grid-mock-providers.*grid-site.*grid-operator"; then
   pass "uninstall order: mock → site → operator (reverse of install)"
 else
   fail "uninstall order: expected mock → site → operator, got: $UNINSTALL_ORDER"
@@ -1512,8 +1522,8 @@ MULTI_NP=$(helm template verify-multi-np "$MOCK_DIR" --namespace grid-system \
   --set 'providers[0].name=a,providers[0].credentialSecret=cred-a,providers[0].credentialKey=token' \
   --set 'providers[1].name=b,providers[1].credentialSecret=cred-b,providers[1].credentialKey=token' \
   --show-only templates/networkpolicy.yaml 2>&1)
-if echo "$MULTI_NP" | grep -q 'app.kubernetes.io/instance: provider-gateway' \
-   && echo "$MULTI_NP" | grep -q 'app.kubernetes.io/name: grid-operator'; then
+if echo "$MULTI_NP" | matches 'app.kubernetes.io/instance: provider-gateway' \
+   && echo "$MULTI_NP" | matches 'app.kubernetes.io/name: grid-operator'; then
   pass "multi-provider networkpolicy: allows both gateway and operator"
 else
   fail "multi-provider networkpolicy: missing ingress rules"
@@ -1546,7 +1556,7 @@ if [[ -f "docs/adding-provider.md" ]]; then
     fail "docs: missing provider removal section"
   fi
   if grep -q 'ca.crt.*tls.crt.*tls.key\|tls.crt.*tls.key.*ca.crt' docs/adding-provider.md \
-     || grep -q 'TLS Secret Key Contract' docs/adding-provider.md; then
+     || matches 'TLS Secret Key Contract' docs/adding-provider.md; then
     pass "docs: covers TLS Secret key contract"
   else
     fail "docs: missing TLS Secret key contract"
@@ -1617,9 +1627,12 @@ try_reject "$ENROLL_DIR" "route.enabled=true without host" --namespace grid-syst
 try_reject "$ENROLL_DIR" "insecureEdgeTerminationPolicy Allow (plaintext token)" --namespace grid-system "${OCP[@]}" --set route.host=h.example.com --set route.tls.insecureEdgeTerminationPolicy=Allow
 try_reject "$ENROLL_DIR" "reencrypt without destinationCACertificate" --namespace grid-system "${OCP[@]}" \
   --set route.host=h.example.com --set route.tls.termination=reencrypt
-try_template "$ENROLL_DIR" "enrollment: reencrypt with a destination CA" --namespace grid-system \
-  "${OCP[@]}" --set route.host=h.example.com --set route.tls.termination=reencrypt \
+try_reject_msg "$ENROLL_DIR" "enrollment: reencrypt while sites rotate" 'drops the client certificate' \
+  --namespace grid-system "${OCP[@]}" --set route.host=h.example.com --set route.tls.termination=reencrypt \
   --set-string route.tls.destinationCACertificate=placeholder-ca
+try_template "$ENROLL_DIR" "enrollment: reencrypt, rotation off" --namespace grid-system \
+  "${OCP[@]}" --set route.host=h.example.com --set route.tls.termination=reencrypt \
+  --set-string route.tls.destinationCACertificate=placeholder-ca --set enrollment.rotation.enabled=false
 try_reject "$ENROLL_DIR" "wildcard route.host" --namespace grid-system "${OCP[@]}" --set 'route.host=*.apps.example.com'
 try_reject "$ENROLL_DIR" "route.host label over 63 characters" --namespace grid-system "${OCP[@]}" \
   --set "route.host=$(printf 'a%.0s' $(seq 64)).example.com"
@@ -1638,12 +1651,12 @@ echo ""
 echo "=== Route + serving-cert SAN auto-wire (enrollment) ==="
 render v-enroll "$ENROLL_DIR" --namespace grid-system "${OCP[@]}" --set route.host=enroll.example.com || true
 ENROLL_RENDERED=$RENDERED
-if echo "$ENROLL_RENDERED" | grep -q 'kind: Route'; then
+if echo "$ENROLL_RENDERED" | matches 'kind: Route'; then
   pass "enrollment: Route renders by default on OpenShift"
 else
   fail "enrollment: Route not rendered on OpenShift"
 fi
-if echo "$ENROLL_RENDERED" | grep -A1 -- '--serving-dns' | grep -q 'enroll.example.com'; then
+if echo "$ENROLL_RENDERED" | grep -A1 -- '--serving-dns' | matches 'enroll.example.com'; then
   pass "enrollment: route.host auto-added to serving cert SAN"
 else
   fail "enrollment: route.host not wired into serving cert SAN"
@@ -1655,14 +1668,14 @@ else
 fi
 if render v-enroll "$ENROLL_DIR" --namespace grid-system "${OCP[@]}" --set route.host=enroll.example.com \
     --set route.rateLimit.enabled=false; then
-  if echo "$RENDERED" | grep -q 'rate-limit-connections'; then
+  if echo "$RENDERED" | matches 'rate-limit-connections'; then
     fail "enrollment: route.rateLimit.enabled=false should drop the annotations"
   else
     pass "enrollment: route.rateLimit.enabled=false drops the annotations"
   fi
 fi
 if render v-enroll "$ENROLL_DIR" --namespace grid-system --set route.host=enroll.example.com; then
-  if echo "$RENDERED" | grep -q 'kind: Route' || echo "$RENDERED" | grep -A1 -- '--serving-dns' | grep -q 'enroll.example.com'; then
+  if echo "$RENDERED" | matches 'kind: Route' || echo "$RENDERED" | grep -A1 -- '--serving-dns' | matches 'enroll.example.com'; then
     fail "enrollment: without the Route API, no Route and no Route SAN"
   else
     pass "enrollment: without the Route API, no Route and no Route SAN"
@@ -1694,7 +1707,7 @@ for chart in charts/*/; do
   if [ -z "$hits" ]; then
     pass "deterministic functions only: $chart"
   else
-    fail "render-varying template code in $chart: $(echo "$hits" | head -3 | tr '\n' ' ')"
+    fail "render-varying template code in $chart: $(head -3 <<<"$hits" | tr '\n' ' ')"
   fi
 done
 

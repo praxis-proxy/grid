@@ -44,10 +44,33 @@ fn the_cli_definition_is_valid() {
     InviteArgs::command().debug_assert();
 }
 
-/// A closed local port.
-fn closed_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-    listener.local_addr().expect("addr").port()
+/// A local port that refuses connections. Bound but not listening, so no other test can take it.
+struct ClosedPort {
+    socket: socket2::Socket,
+    port: u16,
+}
+
+fn closed_port() -> ClosedPort {
+    let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).expect("socket");
+    socket
+        .bind(&std::net::SocketAddr::from(([127, 0, 0, 1], 0)).into())
+        .expect("bind");
+    let port = socket
+        .local_addr()
+        .ok()
+        .and_then(|addr| addr.as_socket())
+        .expect("addr")
+        .port();
+    ClosedPort { socket, port }
+}
+
+impl ClosedPort {
+    /// Start accepting on the reserved port.
+    fn listen(self) -> std::net::TcpListener {
+        self.socket.listen(128).expect("listen");
+        self.socket.set_nonblocking(true).expect("nonblocking");
+        self.socket.into()
+    }
 }
 
 #[tokio::test]
@@ -77,13 +100,13 @@ async fn the_delay_carries_across_calls_while_failing_and_resets_on_reach() {
 
 #[tokio::test]
 async fn an_unreachable_service_fails_naming_the_connect_error() {
-    let port = closed_port();
+    let closed = closed_port();
     init_crypto();
     let ca = certs::generate_ca("grid-ca").expect("ca");
     let admin = AdminFile::new("good-admin");
     let mut minter = Minter {
         http: http_client(ca.cert_pem.as_bytes()).expect("client"),
-        base: format!("https://localhost:{port}"),
+        base: format!("https://localhost:{}", closed.port),
         admin_token_file: admin.0.clone(),
         retry: Retry::new(FAST),
     };
@@ -293,13 +316,11 @@ mod live {
         tokio::spawn(server.serve(app.into_make_service()));
     }
 
-    /// Serve `app` on `port` once `after` passes.
-    async fn listen_after(port: u16, after: Duration, cert: certs::SiteCertOutput, app: axum::Router) {
+    /// Serve `app` on the reserved `port` once `after` passes. Until then it refuses connections.
+    async fn listen_after(port: super::ClosedPort, after: Duration, cert: certs::SiteCertOutput, app: axum::Router) {
         let start = async move {
             tokio::time::sleep(after).await;
-            let listener = std::net::TcpListener::bind(("127.0.0.1", port)).expect("bind");
-            listener.set_nonblocking(true).expect("nonblocking");
-            spawn_tls(listener, cert, app).await;
+            spawn_tls(port.listen(), cert, app).await;
         };
         if after.is_zero() {
             start.await;
@@ -322,7 +343,7 @@ mod live {
         let admin = AdminFile::new(admin);
         let minter = Minter {
             http: http_client(ca.cert_pem.as_bytes()).expect("client"),
-            base: format!("https://localhost:{port}"),
+            base: format!("https://localhost:{}", port.port),
             admin_token_file: admin.0.clone(),
             retry: Retry::new(FAST),
         };
@@ -331,6 +352,8 @@ mod live {
             ca: SharedCa::new(ca),
             authorizer: Authorizer::Local(GridAdmins::from_table("admin: good-admin\n")),
             cert_lifetime: certs::DEFAULT_SITE_CERT_LIFETIME,
+            reserved_sites: Vec::new(),
+            renewals_enabled: true,
         });
         listen_after(port, after, serving, router(Arc::clone(&state))).await;
         (state, minter, admin)
@@ -355,13 +378,13 @@ mod live {
 
     #[tokio::test]
     async fn an_existing_secret_mints_nothing() {
-        let port = closed_port();
+        let closed = closed_port();
         init_crypto();
         let ca = certs::generate_ca("grid-ca").expect("ca");
         let admin = AdminFile::new("good-admin");
         let mut minter = Minter {
             http: http_client(ca.cert_pem.as_bytes()).expect("client"),
-            base: format!("https://localhost:{port}"),
+            base: format!("https://localhost:{}", closed.port),
             admin_token_file: admin.0.clone(),
             retry: Retry::new(FAST),
         };

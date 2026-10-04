@@ -269,6 +269,13 @@ pub(crate) fn sign_csr(ca: &CaMaterial, spec: &CertSpec<'_>, csr_pem: &str) -> R
     })
 }
 
+/// A private key's `SubjectPublicKeyInfo` DER, `None` when it does not parse.
+pub(crate) fn key_spki_der(key_pem: &str) -> Option<Vec<u8>> {
+    PKey::private_key_from_pem(key_pem.as_bytes())
+        .ok()
+        .and_then(|key| key.public_key_to_der().ok())
+}
+
 /// Verify a request's self-signature and return its `SubjectPublicKeyInfo` DER.
 pub(crate) fn csr_spki_der(csr_pem: &str) -> Result<Vec<u8>, BackendError> {
     let req = X509Req::from_pem(csr_pem.as_bytes()).map_err(|_bad| BackendError::ParseCsr)?;
@@ -290,6 +297,26 @@ pub(crate) fn load_ca(_spec: &CertSpec<'_>, key_pem: &str, cert_pem: &str) -> Re
         return Err(BackendError::CaCertKeyMismatch);
     }
     Ok(CaMaterial { cert, key })
+}
+
+/// Sign `message` with the CA key over SHA-256.
+pub(crate) fn sign_message(ca: &CaMaterial, message: &[u8]) -> Result<Vec<u8>, BackendError> {
+    let mut signer = openssl::sign::Signer::new(MessageDigest::sha256(), &ca.key).map_err(|err| sign_err(&err))?;
+    signer.update(message).map_err(|err| sign_err(&err))?;
+    signer.sign_to_vec().map_err(|err| sign_err(&err))
+}
+
+/// Verify a [`sign_message`] signature against the CA certificate's key.
+pub(crate) fn verify_message(ca_cert_pem: &str, message: &[u8], signature: &[u8]) -> Result<(), BackendError> {
+    let ca = X509::from_pem(ca_cert_pem.as_bytes()).map_err(|_bad| BackendError::InvalidCaCert)?;
+    let ca_key = ca.public_key().map_err(|_bad| BackendError::InvalidCaCert)?;
+    let mut verifier = openssl::sign::Verifier::new(MessageDigest::sha256(), &ca_key).map_err(|err| sign_err(&err))?;
+    verifier.update(message).map_err(|err| sign_err(&err))?;
+    if verifier.verify(signature).unwrap_or(false) {
+        Ok(())
+    } else {
+        Err(BackendError::BadSignature)
+    }
 }
 
 /// Verify a leaf's signature against the CA public key.

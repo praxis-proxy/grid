@@ -10,3 +10,26 @@ tests:
             apiGroups: [""]
             resources: ["secrets"]
             verbs: ["get", "create", "patch"]
+  - it: lets rotation roll only the gateway Deployment
+    set:
+      enrollment.enabled: true
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: ["apps"]
+            resources: ["deployments"]
+            resourceNames: ["grid-gateway"]
+            verbs: ["get", "patch"]
+  - it: grants no Deployment access without rotation
+    set:
+      enrollment.enabled: true
+      enrollment.rotation.enabled: false
+    asserts:
+      - notContains:
+          path: rules
+          content:
+            apiGroups: ["apps"]
+            resources: ["deployments"]
+            resourceNames: ["grid-gateway"]
+            verbs: ["get", "patch"]

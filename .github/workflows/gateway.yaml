@@ -66,13 +66,23 @@ jobs:
         run: cargo install cargo-machete --locked
 
       - name: Clippy
-        run: cargo clippy --manifest-path gateway/Cargo.toml --all-targets -- -D warnings
+        run: cargo clippy --manifest-path gateway/Cargo.toml --workspace --all-targets -- -D warnings
 
       - name: Rustfmt
         run: cargo +"$NIGHTLY_RUSTFMT" fmt --manifest-path gateway/Cargo.toml --all -- --check
 
       - name: Machete (unused dependencies)
         run: cargo machete gateway
+
+      # The binary's TLS must come from the OpenSSL provider Praxis installs, so ring stays test-only.
+      # openssl-sys is the positive control: an empty or failed tree must not pass.
+      - name: No ring in the gateway binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          tree=$(cargo tree --manifest-path gateway/Cargo.toml -p gateway -e normal --target all --prefix none --format '{p}')
+          grep -q '^openssl-sys ' <<<"$tree" || { echo "positive control failed: openssl-sys is not in the tree"; exit 1; }
+          if grep '^ring ' <<<"$tree"; then echo "ring is in the gateway's normal dependency tree"; exit 1; fi
 
   # ----------------------------------------------------------------------------
   # Unit tests, gateway workspace
@@ -99,7 +109,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Unit tests
-        run: cargo test --manifest-path gateway/Cargo.toml
+        run: cargo test --manifest-path gateway/Cargo.toml --workspace
 
   # ----------------------------------------------------------------------------
   # Security audit, gateway lockfile

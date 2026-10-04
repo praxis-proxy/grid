@@ -4,7 +4,10 @@
 //! kubelet updates the mounted files, and [`SharedCa::reload`] swaps the new CA
 //! in, so new site certificates are never signed by a CA the grid has replaced.
 
-use std::sync::{Arc, PoisonError, RwLock};
+use std::{
+    collections::BTreeSet,
+    sync::{Arc, PoisonError, RwLock},
+};
 
 use certs::CaCert;
 
@@ -62,10 +65,86 @@ impl SharedCa {
     }
 }
 
+/// One copy of the grid CA already distributed to sites.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CaCopy {
+    /// The fingerprints of the CAs it holds: the current one, and any it replaced.
+    Holds(BTreeSet<String>),
+    /// It exists but does not parse.
+    Unreadable(String),
+}
+
+/// What bootstrap does about the grid CA.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CaAction {
+    /// Load the CA its key Secret holds.
+    Load,
+    /// Mint a new CA: none is distributed, or a grid-admin asked for one.
+    Mint,
+    /// Refuse, for this reason: a new or different CA would split the grid.
+    Refuse(String),
+}
+
+/// Decide from the fingerprint of the CA the key Secret holds, if any, whether a
+/// regeneration was asked for, and every copy of the CA already distributed.
+#[must_use]
+pub fn ca_action(key: Option<&str>, force_regenerate: bool, copies: &[CaCopy]) -> CaAction {
+    if force_regenerate {
+        return CaAction::Mint;
+    }
+    let mut held = Vec::new();
+    for copy in copies {
+        match copy {
+            CaCopy::Unreadable(why) => {
+                return CaAction::Refuse(format!("a distributed copy of the grid CA cannot be read ({why})"));
+            },
+            CaCopy::Holds(fingerprints) => held.push(fingerprints),
+        }
+    }
+    match (key, held.first()) {
+        (None, None) => CaAction::Mint,
+        (None, Some(out)) => CaAction::Refuse(format!(
+            "the CA key Secret is missing, but the grid already uses CA {}",
+            out.iter().next().map_or("", String::as_str)
+        )),
+        (Some(key), _) if held.iter().all(|out| out.contains(key)) => CaAction::Load,
+        (Some(key), _) => CaAction::Refuse(format!(
+            "the CA key Secret holds CA {key}, which a distributed copy does not: a different CA was restored"
+        )),
+    }
+}
+
 #[cfg(test)]
 #[expect(clippy::expect_used, reason = "tests")]
 mod tests {
-    use super::SharedCa;
+    use super::{CaAction, CaCopy, SharedCa, ca_action};
+
+    #[test]
+    fn the_ca_changes_only_when_asked() {
+        let holds = |fps: &[&str]| CaCopy::Holds(fps.iter().map(|fp| (*fp).to_owned()).collect());
+        let refused = |action: CaAction| matches!(action, CaAction::Refuse(_));
+        let out = [holds(&["ab"])];
+        assert_eq!(ca_action(Some("ab"), false, &out), CaAction::Load, "the key matches");
+        assert_eq!(ca_action(Some("ab"), false, &[]), CaAction::Load, "an upgrade");
+        assert_eq!(ca_action(None, false, &[]), CaAction::Mint, "a first install");
+        assert!(refused(ca_action(None, false, &out)), "the key is gone, the CA is out");
+        assert!(refused(ca_action(Some("cd"), false, &out)), "another CA was restored");
+        let rotating = [holds(&["ab"]), holds(&["old", "ab"])];
+        assert_eq!(
+            ca_action(Some("ab"), false, &rotating),
+            CaAction::Load,
+            "a rotation bundle holds it"
+        );
+        let split = [holds(&["ab"]), holds(&["cd"])];
+        assert!(refused(ca_action(Some("ab"), false, &split)), "copies that disagree");
+        let unreadable = [CaCopy::Unreadable("not PEM".to_owned())];
+        assert!(
+            refused(ca_action(None, false, &unreadable)),
+            "an unreadable copy is not none"
+        );
+        assert!(refused(ca_action(Some("ab"), false, &unreadable)), "nor a match");
+        assert_eq!(ca_action(None, true, &out), CaAction::Mint, "a grid-admin starts over");
+    }
 
     #[test]
     fn an_unchanged_ca_is_not_swapped() {

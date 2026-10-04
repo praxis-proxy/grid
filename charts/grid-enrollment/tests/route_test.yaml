@@ -109,6 +109,20 @@ tests:
     set:
       route.host: h.example.com
       route.tls.termination: reencrypt
+      enrollment.rotation.enabled: false
     asserts:
       - failedTemplate:
           errorMessage: "reencrypt needs route.tls.destinationCACertificate (the grid CA bundle, ca.crt from Secret grid-ca-bundle); passthrough is recommended"
+
+  - it: refuses reencrypt while sites rotate through the Route
+    template: templates/enrollment/route.yaml
+    capabilities:
+      apiVersions:
+        - route.openshift.io/v1
+    set:
+      route.host: h.example.com
+      route.tls.termination: reencrypt
+      route.tls.destinationCACertificate: ca
+    asserts:
+      - failedTemplate:
+          errorMessage: "route.tls.termination=reencrypt drops the client certificate sites rotate their identity with; use passthrough, or set enrollment.rotation.enabled=false"

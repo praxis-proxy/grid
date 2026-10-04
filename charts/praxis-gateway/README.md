@@ -109,8 +109,9 @@ A few things to keep in mind:
   rules out the full `my-app.my-namespace.svc.cluster.local` form. Write
   Service names as `my-app.my-namespace.svc`; the pod's DNS search path
   completes them.
-- Changing `config.inline` and running `helm upgrade` rolls the pods onto the
-  new configuration without refusing requests (see `shutdownDelaySeconds`).
+- Changing `config.inline` or the `gatewayConfig` values the chart renders and
+  running `helm upgrade` rolls the pods onto the new configuration without
+  refusing requests (see `shutdownDelaySeconds`).
 
 ### Bring your own ConfigMap
 
@@ -188,6 +189,8 @@ Praxis AI image; these values may advance independently.
 | `image.flavor` | string | `ai` | `ai` or `grid-gateway`, the grid build that `gatewayConfig.role: provider` and `gridServing` need. A repository ending in `/grid-gateway` sets it. |
 | `image.pullPolicy` | string | `IfNotPresent` | Image pull policy. |
 | `imagePullSecrets` | list | `[]` | Pull secrets for private registries. |
+| `log.level` | string | `""` | Level for every module, rendered as RUST_LOG on the gateway and overlay-sync: off, error, warn, info, debug, or trace, in any case. Empty leaves RUST_LOG unset, so the binaries use their info default. An `env` entry named RUST_LOG takes precedence on the gateway. |
+| `log.filter` | string | `""` | Full RUST_LOG directive, such as `info,praxis_filter=debug`. When set, it replaces `log.level`. |
 | `nameOverride` | string | `""` | Override chart name. |
 | `fullnameOverride` | string | `""` | Override fully qualified app name. A grid gateway, a provider or a consumer with site backends, takes its release name. |
 | `commonLabels` | object | `{}` | Labels added to all resources. |
@@ -202,7 +205,7 @@ Praxis AI image; these values may advance independently.
 | `config.existingConfigMap` | string | `""` | Name of an existing ConfigMap with the Praxis config. Takes precedence over `config.inline`. Editing it does not restart the pods. |
 | `config.key` | string | `praxis.yaml` | Key in the ConfigMap. |
 | `config.inline` | string | answers `GET /` with a JSON status, else 404 | Praxis config stored in a chart-managed ConfigMap when neither `config.existingConfigMap` nor `gatewayConfig.render` applies. Changing it rolls the pods. |
-| `gatewayConfig.render` | bool | `false` | Render the Praxis config from these values instead of a BYO ConfigMap. Also on when `config.existingConfigMap` is empty and the values configure grid routing (`gatewayConfig.backends`, `role: provider`, or `gridServing`). Never emits `insecure_options`. See [AI Grid Network](#ai-grid-network-agn). |
+| `gatewayConfig.render` | bool | `false` | Render the Praxis config from these values instead of a BYO ConfigMap. Also on when `config.existingConfigMap` is empty and the values configure grid routing (`gatewayConfig.backends`, `role: provider`, or `gridServing`). Never emits `insecure_options`. Changing the rendered config rolls the pods. See [AI Grid Network](#ai-grid-network-agn). |
 | `gatewayConfig.model` | string | **required** for a consumer without `gridServing` | Model advertised on the routing candidates. |
 | `gatewayConfig.backends` | map | **required** when rendered | Backends keyed by site, each with `endpoint` and optional `healthCheck` and `transport`. A consumer's key is the site it reaches over mutual TLS. A provider's `local` key is its one plaintext backend. The older list of `cluster`, `endpoints` entries still renders. |
 | `gatewayConfig.backends[].site` | string | `localSite` | Grid site the backend serves. A consumer's remote `mutual_tls` backend must name it, and it must differ from `localSite`. Its `transport.sni` defaults to `<site>.grid.internal`. |
@@ -259,8 +262,9 @@ Praxis AI image; these values may advance independently.
 | `tls.caSecret` | string | `""` | Secret holding the Grid CA (`ca.crt`), projected beside `existingSecret`. A provider defaults to `grid-ca`. |
 | `tls.mountPath` | string | `/etc/praxis/tls` | Mount path for TLS files. |
 | `credentials` | list | `[]` | Existing Secrets mounted read-only (`name`, `mountPath`, `optional`), for example upstream credentials. |
-| `health.readiness` | object | TCP socket on the listener port | Readiness probe. A `tcpSocket` without a port targets the listener port. Set to null to disable. |
-| `health.liveness` | object | TCP socket on the listener port | Liveness probe. Set to null to disable. |
+| `health.readiness` | object | admin `/ready`, else TCP on the listener port | Readiness probe. A `tcpSocket` without a port runs an HTTP check against the admin listener when the chart sees a loopback admin listener in its rendered config or `config.inline`, and otherwise targets the listener port. It asks `/healthy` when the gateway forwards to backends (rendered backends, `gridServing`, or `config.inline` clusters), since `/ready` fails while any backend is down, and `/ready` otherwise. The check runs `/bin/sh` with `curl` or `wget`, whichever the image has; set `health.adminProbeCommand` for an image with neither. The chart refuses that fallback when a `config.inline` listener serves TLS, since a TCP connect fails a TLS handshake on every probe. With an `existingConfigMap` the chart cannot see the listener, so give the probes an `httpGet` or `exec` handler when it serves TLS. Give `tcpSocket` a port or another handler to keep your own probe. Set to null to disable. |
+| `health.liveness` | object | admin `/healthy`, else TCP on the listener port | Liveness probe, chosen the same way against `/healthy`. Set to null to disable. |
+| `health.adminProbeCommand` | list | `[]` | Command for the admin-listener probe; the URL is appended. Empty runs `/bin/sh` with `curl` or `wget`. |
 | `shutdownDelaySeconds` | int | `5` | Seconds a terminating pod keeps serving before Praxis gets SIGTERM, so Service endpoints drop it first and rollouts do not refuse requests. Runs the image's `sleep` as a preStop hook. `0` disables it, which an image without `sleep` (distroless or scratch) needs. |
 | `terminationGracePeriodSeconds` | int | `null` | Seconds Kubernetes gives a terminating pod before killing it. Empty means 30 plus `shutdownDelaySeconds`, so Praxis keeps its default 30 second drain after the delay. Raise it for a longer Praxis `shutdown_timeout_secs`. Must exceed `shutdownDelaySeconds`. |
 | `resources` | object | `{}` | Container resource requests and limits. |
@@ -394,10 +398,10 @@ Known limits:
   provider gateway is down. That request fails rather than failing over.
 - The gateway matches a candidate's cluster to `gatewayConfig.backends` by name only.
   Nothing checks that the backend serves the candidate's site.
-- Site certificates last 30 days and nothing renews them. The gateway reads its
-  client certificate and the signals pollers read theirs once, at start, and a
-  `pin` digest changes on renewal. After re-enrolling, update the digests and
-  restart the gateways.
+- Site certificates last 180 days. Under `spiffe` trust the operator rotates them
+  around day 120 and rolls the gateway Deployment, because the gateway reads its
+  upstream client certificate only at start. Under `pin` trust nothing rotates
+  them: re-enroll each site and update the peers' digests before it expires.
 
 ### Routing overlay delivery
 

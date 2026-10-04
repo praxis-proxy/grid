@@ -199,7 +199,7 @@ pub struct MetricsConfig {
     ///
     /// When set, the `queue_depth` signal value is divided by this capacity
     /// and clamped to `[0.0, 1.0]` before scoring.  This allows consuming raw
-    /// average queue-size metrics (such as `llm_d_router_epp_average_queue_size`)
+    /// average queue-size metrics (such as `llm_d_epp_average_queue_size`)
     /// without requiring the exporter to pre-normalise.
     ///
     /// When absent, the `queue_depth` signal must already be normalised to
@@ -242,6 +242,37 @@ pub struct MetricsConfig {
     /// The scraper never falls back to system roots or plain HTTP.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls: Option<EndpointTlsConfig>,
+
+    /// How the scraper authenticates to the metrics endpoint. Absent sends no
+    /// credential.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<MetricsAuth>,
+}
+
+/// Credential the scraper presents on each metrics request.
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MetricsAuth {
+    /// The credential to send.
+    #[serde(rename = "type")]
+    pub kind: MetricsAuthType,
+
+    /// Send the credential over plain `http://`. Off by default, because a
+    /// bearer token on an unencrypted connection can be read off the network.
+    /// For a lab only.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_plaintext: bool,
+}
+
+/// A metrics scrape credential.
+#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum MetricsAuthType {
+    /// A short-lived token for the metrics scraper `ServiceAccount`, which may
+    /// only `get` the nonResourceURL `/metrics`, sent as `Authorization: Bearer`.
+    /// The operator mints it with `TokenRequest` and never sends its own token.
+    /// An llm-d EPP authorizes it with `TokenReview` and `SubjectAccessReview`.
+    ServiceAccountToken,
 }
 
 /// TLS configuration for endpoint scraping or health probes.
@@ -271,7 +302,12 @@ pub struct MetricsConfig {
 ///
 /// [`rustls::ClientConfig`]: rustls::ClientConfig
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
+#[schemars(extend("x-kubernetes-validations" = [{
+    "rule": "has(self.caSecretRef) != has(self.caConfigMapRef)",
+    "message": "set exactly one of caSecretRef and caConfigMapRef"
+}]))]
 #[serde(rename_all = "camelCase")]
+#[expect(clippy::struct_field_names, reason = "the field names are the CRD API")]
 pub struct EndpointTlsConfig {
     /// Reference to a Secret containing the CA certificate PEM for server
     /// verification.
@@ -279,8 +315,17 @@ pub struct EndpointTlsConfig {
     /// The Secret must contain the PEM-encoded CA certificate under the key
     /// `ca.crt` (or the key specified by `key`).  When this CA is
     /// set, the scraper trusts **only** this CA; system root certificates
-    /// are not consulted.
-    pub ca_secret_ref: SecretRef,
+    /// are not consulted. Exactly one of this and `ca_config_map_ref` is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca_secret_ref: Option<SecretRef>,
+
+    /// Reference to a `ConfigMap` holding the CA certificate PEM, such as the
+    /// platform service CA (`openshift-service-ca.crt`, key `service-ca.crt`).
+    ///
+    /// A CA bundle is public, so it may live in a `ConfigMap`. Like
+    /// `ca_secret_ref`, it is the only trust consulted when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca_config_map_ref: Option<ConfigMapKeyRef>,
 
     /// Reference to a Secret containing the client certificate and private
     /// key for mutual TLS.
@@ -293,6 +338,39 @@ pub struct EndpointTlsConfig {
     /// with the CA from `ca_secret_ref`, no client certificate).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_certificate_secret_ref: Option<ClientCertificateSecretRef>,
+}
+
+/// A key in a namespaced `ConfigMap`.
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfigMapKeyRef {
+    /// `ConfigMap` name.
+    pub name: String,
+    /// `ConfigMap` namespace.
+    pub namespace: String,
+    /// Key within the `ConfigMap`'s `data`. Defaults to `ca.crt`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+}
+
+/// Where an [`EndpointTlsConfig`] reads its CA from.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum CaSource<'tls> {
+    /// A Secret key.
+    Secret(&'tls SecretRef),
+    /// A `ConfigMap` key.
+    ConfigMap(&'tls ConfigMapKeyRef),
+}
+
+impl EndpointTlsConfig {
+    /// The one configured CA source, `None` when neither or both are set.
+    pub(crate) fn ca_source(&self) -> Option<CaSource<'_>> {
+        match (&self.ca_secret_ref, &self.ca_config_map_ref) {
+            (Some(secret), None) => Some(CaSource::Secret(secret)),
+            (None, Some(config_map)) => Some(CaSource::ConfigMap(config_map)),
+            (None, None) | (Some(_), Some(_)) => None,
+        }
+    }
 }
 
 /// Reference to a Kubernetes Secret containing a client certificate and
@@ -909,6 +987,7 @@ mod tests {
             pool_name: None,
             queue_capacity: None,
             tls: None,
+            auth: None,
         };
         let serialised = serde_json::to_value(&mc).unwrap_or_else(|_| std::process::abort());
         assert!(

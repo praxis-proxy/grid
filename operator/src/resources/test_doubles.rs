@@ -14,13 +14,28 @@ use k8s_openapi::{ByteString, api::core::v1::Secret};
 /// Build a `kube::Client` backed by an in-memory map of Secret name to
 /// `Secret`, so Secret-reading code can be exercised without a real cluster.
 /// Any name not present in the map returns HTTP 404.
+pub(crate) fn mock_kube_client_with_secrets(secrets: HashMap<&'static str, Secret>) -> kube::Client {
+    mock_kube_client_with_objects(secrets)
+}
+
+/// Like [`mock_kube_client_with_secrets`], for `ConfigMaps`.
+pub(crate) fn mock_kube_client_with_config_maps(
+    config_maps: HashMap<&'static str, k8s_openapi::api::core::v1::ConfigMap>,
+) -> kube::Client {
+    mock_kube_client_with_objects(config_maps)
+}
+
+/// A `kube::Client` answering a GET by object name from `objects`, 404 otherwise.
 #[expect(
     clippy::too_many_lines,
     reason = "test mock builder: 404-vs-200 branches are the whole point"
 )]
-pub(crate) fn mock_kube_client_with_secrets(secrets: HashMap<&'static str, Secret>) -> kube::Client {
+fn mock_kube_client_with_objects<T>(objects: HashMap<&'static str, T>) -> kube::Client
+where
+    T: serde::Serialize + Clone + Send + Sync + 'static,
+{
     let service = tower::service_fn(move |req: http::Request<kube::client::Body>| {
-        let secrets = secrets.clone();
+        let secrets = objects.clone();
         async move {
             let name = req.uri().path().rsplit('/').next().unwrap_or_default().to_owned();
             let response = secrets.get(name.as_str()).map_or_else(
@@ -61,6 +76,14 @@ pub(crate) fn secret_with_key(key: &str, value: &[u8]) -> Secret {
     data.insert(key.to_owned(), ByteString(value.to_vec()));
     Secret {
         data: Some(data),
+        ..Default::default()
+    }
+}
+
+/// Build a `ConfigMap` with a single `data` key.
+pub(crate) fn config_map_with_key(key: &str, value: &str) -> k8s_openapi::api::core::v1::ConfigMap {
+    k8s_openapi::api::core::v1::ConfigMap {
+        data: Some(std::collections::BTreeMap::from([(key.to_owned(), value.to_owned())])),
         ..Default::default()
     }
 }

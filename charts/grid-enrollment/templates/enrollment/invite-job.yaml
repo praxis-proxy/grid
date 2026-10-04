@@ -130,6 +130,8 @@ spec:
           env:
             - name: ENROLLMENT_INVITES
               value: {{ toJson .Values.invites | quote }}
+            - name: RUST_LOG
+              value: {{ include "grid-enrollment.rustLog" . | quote }}
           volumeMounts:
             - name: grid-ca
               mountPath: /etc/grid-ca

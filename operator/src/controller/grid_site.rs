@@ -18,7 +18,6 @@ use kube::{
     },
 };
 use tokio::time::Duration;
-use tracing::info;
 use zeroize::Zeroizing;
 
 use crate::{
@@ -86,7 +85,7 @@ pub async fn reconcile(site: Arc<GridSite>, client: Arc<Client>) -> Result<Actio
     let object_ref = event_reference(&site, client.default_namespace());
     let recorder = Recorder::new(client.as_ref().clone(), reporter);
 
-    info!(name, "reconciling GridSite");
+    tracing::debug!(name, "reconciling GridSite");
 
     let network = fetch_network(&site, client.as_ref()).await?;
     let current_phase = site.status.as_ref().map_or(&GridSitePhase::Pending, |s| &s.phase);
@@ -423,7 +422,7 @@ fn resolve_pins(site: &GridSite) -> Result<Vec<CanonicalFingerprint>, GatewayPro
 }
 
 /// Bounded label for a [`GridSitePhase`] value in metrics.
-fn phase_label(phase: &GridSitePhase) -> &'static str {
+pub(crate) fn phase_label(phase: &GridSitePhase) -> &'static str {
     match phase {
         GridSitePhase::Pending => "Pending",
         GridSitePhase::Discovered => "Discovered",
@@ -511,6 +510,7 @@ async fn update_status(
         last_probe_time: probe_time,
         last_transition_time: transition_time,
         public_cert_pem: existing.and_then(|s| s.public_cert_pem.clone()),
+        absent_since: existing.and_then(|s| s.absent_since.clone()),
     };
 
     if !grid_site_status_needs_update(existing, &status) {

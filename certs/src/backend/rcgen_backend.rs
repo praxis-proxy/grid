@@ -145,6 +145,12 @@ pub(crate) fn sign_csr(ca: &CaMaterial, spec: &CertSpec<'_>, csr_pem: &str) -> R
     })
 }
 
+/// A private key's `SubjectPublicKeyInfo` DER, `None` when it does not parse.
+pub(crate) fn key_spki_der(key_pem: &str) -> Option<Vec<u8>> {
+    use rcgen::PublicKeyData as _;
+    KeyPair::from_pem(key_pem).ok().map(|key| key.subject_public_key_info())
+}
+
 /// Verify a request's self-signature and return its `SubjectPublicKeyInfo` DER.
 pub(crate) fn csr_spki_der(csr_pem: &str) -> Result<Vec<u8>, BackendError> {
     request_spki_der(csr_pem)
@@ -177,6 +183,27 @@ pub(crate) fn verify_leaf_signature(ca_cert_pem: &str, leaf_pem: &str) -> Result
     let (_after_leaf, leaf) =
         X509Certificate::from_der(leaf_der.contents()).map_err(|_bad| BackendError::BadSignature)?;
     leaf.verify_signature(Some(ca.public_key()))
+        .map_err(|_bad| BackendError::BadSignature)
+}
+
+/// Sign `message` with the CA key, the algorithm the CA certifies itself with.
+pub(crate) fn sign_message(ca: &CaMaterial, message: &[u8]) -> Result<Vec<u8>, BackendError> {
+    use rcgen::SigningKey as _;
+    ca.issuer
+        .key()
+        .sign(message)
+        .map_err(|err| BackendError::Sign(err.to_string()))
+}
+
+/// Verify a [`sign_message`] signature against the CA certificate's key.
+pub(crate) fn verify_message(ca_cert_pem: &str, message: &[u8], signature: &[u8]) -> Result<(), BackendError> {
+    let ca_der = pem::parse(ca_cert_pem).map_err(|_bad| BackendError::InvalidCaCert)?;
+    let (_rest, ca) = X509Certificate::from_der(ca_der.contents()).map_err(|_bad| BackendError::InvalidCaCert)?;
+    let signature = x509_parser::asn1_rs::BitString {
+        unused_bits: 0,
+        data: signature.into(),
+    };
+    x509_parser::verify::verify_signature(ca.public_key(), &ca.signature_algorithm, &signature, message)
         .map_err(|_bad| BackendError::BadSignature)
 }
 

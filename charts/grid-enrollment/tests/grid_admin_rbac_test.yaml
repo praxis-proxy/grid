@@ -2,10 +2,10 @@ suite: grid-admin RBAC
 templates:
   - templates/enrollment/grid-admin-rbac.yaml
 tests:
-  - it: ships a Role limited to create and delete on enrollmenttokens
+  - it: ships a Role limited to create and delete on enrollmenttokens and get on enrollments
     documentSelector:
-      path: kind
-      value: Role
+      path: metadata.name
+      value: RELEASE-NAME-grid-enrollment-grid-admin
     asserts:
       - equal:
           path: metadata.name
@@ -16,11 +16,14 @@ tests:
             - apiGroups: ["grid.praxis.fast"]
               resources: ["enrollmenttokens"]
               verbs: ["create", "delete"]
+            - apiGroups: ["grid.praxis.fast"]
+              resources: ["enrollments"]
+              verbs: ["get"]
 
   - it: binds nobody by default
     asserts:
       - hasDocuments:
-          count: 1
+          count: 2
       - isKind:
           of: Role
 
@@ -48,7 +51,7 @@ tests:
       enrollment.gridAdmins.serviceAccount.create: true
     asserts:
       - hasDocuments:
-          count: 3
+          count: 4
       - equal:
           path: subjects
           value:
@@ -108,5 +111,48 @@ tests:
       enrollment.gridAdmins.subjects:
         - kind: Group
           name: system:serviceaccounts:grid
+    asserts:
+      - failedTemplate: {}
+
+  - it: keeps enrollment delete in its own Role, bound to nobody by default
+    documentSelector:
+      path: metadata.name
+      value: RELEASE-NAME-grid-enrollment-enrollment-admin
+    asserts:
+      - isKind:
+          of: Role
+      - equal:
+          path: rules
+          value:
+            - apiGroups: ["grid.praxis.fast"]
+              resources: ["enrollments"]
+              verbs: ["get", "delete"]
+
+  - it: binds enrollment delete only to the subjects named for it
+    set:
+      enrollment.gridAdmins.subjects:
+        - kind: Group
+          name: grid-admins
+      enrollment.enrollmentAdmins.subjects:
+        - kind: Group
+          name: grid-security
+    asserts:
+      - hasDocuments:
+          count: 4
+      - equal:
+          path: subjects
+          value:
+            - kind: Group
+              name: grid-security
+              apiGroup: rbac.authorization.k8s.io
+        documentSelector:
+          path: roleRef.name
+          value: RELEASE-NAME-grid-enrollment-enrollment-admin
+
+  - it: rejects cluster-wide groups as enrollment admins
+    set:
+      enrollment.enrollmentAdmins.subjects:
+        - kind: Group
+          name: system:authenticated
     asserts:
       - failedTemplate: {}

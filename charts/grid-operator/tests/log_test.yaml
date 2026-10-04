@@ -1,0 +1,40 @@
+suite: log level
+templates:
+  - templates/deployment.yaml
+tests:
+  - it: renders the default level as RUST_LOG
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content: {name: RUST_LOG, value: info}
+
+  - it: renders a chosen level
+    set:
+      log.level: debug
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content: {name: RUST_LOG, value: debug}
+
+  - it: lets filter replace the level
+    set:
+      log.level: warn
+      log.filter: info,operator=debug
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content: {name: RUST_LOG, value: "info,operator=debug"}
+
+  - it: still takes a full directive in level, as before
+    set:
+      log.level: info,kube=warn
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content: {name: RUST_LOG, value: "info,kube=warn"}
+
+  - it: rejects an unknown level
+    set:
+      log.level: verbose
+    asserts:
+      - failedTemplate: {}

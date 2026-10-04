@@ -2,12 +2,18 @@
 {{- include "praxis-gateway.validateDigest" . }}
 {{- include "praxis-gateway.validateConfig" . }}
 {{- include "praxis-gateway.validateMounts" . }}
+{{- include "praxis-gateway.validateProbes" . }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: {{ include "praxis-gateway.fullname" . }}
   labels:
     {{- include "praxis-gateway.labels" . | nindent 4 }}
+  {{- if (.Values.gridServing).enabled }}
+  annotations:
+    {{- /* The operator writes the serving ConfigMap only after the grid CRs (wave 1) exist. */}}
+    argocd.argoproj.io/sync-wave: "2"
+  {{- end }}
 spec:
   replicas: {{ .Values.replicaCount }}
   selector:
@@ -21,9 +27,11 @@ spec:
         {{- toYaml $podLabels | nindent 8 }}
       {{- $configSource := include "praxis-gateway.configSource" . }}
       {{- $podAnnotations := deepCopy (.Values.podAnnotations | default dict) }}
+      {{- /* A changed chart-rendered config must reach new pods: the hash rolls the Deployment. */}}
       {{- if eq $configSource "inline" }}
-      {{- /* A changed config.inline must reach new pods: the hash rolls the Deployment. */}}
       {{- $_ := set $podAnnotations "checksum/config" (toString .Values.config.inline | sha256sum) }}
+      {{- else if eq $configSource "render" }}
+      {{- $_ := set $podAnnotations "checksum/config" (include "praxis-gateway.gatewayConfigData" . | sha256sum) }}
       {{- end }}
       {{- with $podAnnotations }}
       annotations:
@@ -70,6 +78,11 @@ spec:
         - name: overlay-sync-init
           image: {{ include "praxis-gateway.overlaySyncImage" . }}
           imagePullPolicy: {{ .Values.overlay.sidecar.image.pullPolicy | quote }}
+          {{- with include "praxis-gateway.rustLog" . }}
+          env:
+            - name: RUST_LOG
+              value: {{ . | quote }}
+          {{- end }}
           args:
             - "--namespace"
             - {{ .Release.Namespace | quote }}
@@ -110,6 +123,11 @@ spec:
         - name: overlay-sync
           image: {{ include "praxis-gateway.overlaySyncImage" . }}
           imagePullPolicy: {{ .Values.overlay.sidecar.image.pullPolicy | quote }}
+          {{- with include "praxis-gateway.rustLog" . }}
+          env:
+            - name: RUST_LOG
+              value: {{ . | quote }}
+          {{- end }}
           args:
             - "--namespace"
             - {{ .Release.Namespace | quote }}
@@ -170,8 +188,16 @@ spec:
           {{- end }}
           {{- $validateCA := .Values.gatewayConfig.auth.validateCA }}
           {{- $withCA := and .Values.gatewayConfig.render (eq .Values.gatewayConfig.auth.mode "api-key") (or $validateCA.configMap $validateCA.secret) }}
-          {{- if or .Values.env $withCA (.Values.gridServing).enabled }}
+          {{- /* A user RUST_LOG in env wins: a duplicate name fails server-side apply. */ -}}
+          {{- $userLog := false }}
+          {{- range .Values.env }}{{- if eq .name "RUST_LOG" }}{{- $userLog = true }}{{- end }}{{- end }}
+          {{- $rustLog := and (not $userLog) (include "praxis-gateway.rustLog" .) }}
+          {{- if or $rustLog .Values.env (.Values.gridServing).enabled $withCA }}
           env:
+            {{- if $rustLog }}
+            - name: RUST_LOG
+              value: {{ include "praxis-gateway.rustLog" . | quote }}
+            {{- end }}
             {{- with .Values.env }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
@@ -203,11 +229,14 @@ spec:
               protocol: {{ .Values.port.protocol | quote }}
           {{- with .Values.health.readiness }}
           readinessProbe:
-            {{- include "praxis-gateway.probe" (list . $) | nindent 12 }}
+            {{- /* /ready fails while any backend cluster is down. */}}
+            {{- $readyPath := "/ready" }}
+            {{- if include "praxis-gateway.servesBackends" $ }}{{ $readyPath = "/healthy" }}{{ end }}
+            {{- include "praxis-gateway.probe" (list . $ $readyPath) | nindent 12 }}
           {{- end }}
           {{- with .Values.health.liveness }}
           livenessProbe:
-            {{- include "praxis-gateway.probe" (list . $) | nindent 12 }}
+            {{- include "praxis-gateway.probe" (list . $ "/healthy") | nindent 12 }}
           {{- end }}
           {{- with .Values.shutdownDelaySeconds }}
           lifecycle:

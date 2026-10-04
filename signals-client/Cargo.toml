@@ -7,12 +7,14 @@ rust-version.workspace = true
 license.workspace = true
 publish = false
 
+[features]
+default = ["rcgen"]
+rcgen = ["certs/rcgen"]
+fips = ["certs/fips"]
+
 [dependencies]
 grid-signals = { path = "../signals" }
-# rcgen is the default backend; certs needs one for the sha256 the verify path
-# uses. The poller only verifies, so a verifier-only backend split is a certs
-# follow-up.
-certs = { path = "../certs", default-features = false, features = ["verifier", "rcgen"] }
+certs = { path = "../certs", default-features = false, features = ["verifier"] }
 bytes = { workspace = true }
 http = { workspace = true }
 http-body-util = { workspace = true }
@@ -20,7 +22,7 @@ httpdate = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true, features = ["client", "client-legacy", "http1", "tokio"] }
 percent-encoding = { workspace = true }
-rustls = { workspace = true, features = ["ring"] }
+rustls = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["macros", "net", "rt", "sync", "time"] }
@@ -29,6 +31,7 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 certs = { path = "../certs", default-features = false, features = ["verifier", "rcgen"] }
+rustls = { workspace = true, features = ["ring"] }
 serde_yaml = { workspace = true }
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "sync", "time", "test-util"] }
 

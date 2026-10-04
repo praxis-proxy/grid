@@ -19,9 +19,15 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
     let r = Registry::new();
     r.register(Box::new(PROBE_TOTAL.clone()))
         .unwrap_or_else(|_| std::process::abort());
+    r.register(Box::new(SITE_IDENTITY_EXPIRY.clone()))
+        .unwrap_or_else(|_| std::process::abort());
+    r.register(Box::new(SITE_IDENTITY_RENEWALS.clone()))
+        .unwrap_or_else(|_| std::process::abort());
     r.register(Box::new(PROBE_DURATION.clone()))
         .unwrap_or_else(|_| std::process::abort());
     r.register(Box::new(PHASE_TRANSITIONS.clone()))
+        .unwrap_or_else(|_| std::process::abort());
+    r.register(Box::new(SITE_PHASE.clone()))
         .unwrap_or_else(|_| std::process::abort());
     r.register(Box::new(AGENT_TOOL_PROVIDER_PHASE_TRANSITIONS.clone()))
         .unwrap_or_else(|_| std::process::abort());
@@ -64,6 +70,24 @@ static SIGNALS_SHED: LazyLock<IntCounterVec> = LazyLock::new(|| {
             "Signals connections shed at accept",
         ),
         &["limit"],
+    )
+    .unwrap_or_else(|_| std::process::abort())
+});
+
+/// The site identity's `notAfter`, Unix seconds; zero when the identity cannot be read.
+static SITE_IDENTITY_EXPIRY: LazyLock<IntGauge> = LazyLock::new(|| {
+    IntGauge::new(
+        "grid_site_identity_expiry_timestamp_seconds",
+        "When the site identity certificate expires",
+    )
+    .unwrap_or_else(|_| std::process::abort())
+});
+
+/// Site identity rotation attempts, by result.
+static SITE_IDENTITY_RENEWALS: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    IntCounterVec::new(
+        Opts::new("grid_site_identity_rotations_total", "Site identity rotation attempts"),
+        &["result"],
     )
     .unwrap_or_else(|_| std::process::abort())
 });
@@ -216,6 +240,33 @@ static PHASE_TRANSITIONS: LazyLock<IntCounterVec> = LazyLock::new(|| {
     .unwrap_or_else(|_| std::process::abort())
 });
 
+/// Each `GridSite`'s phase as a state set, shaped like `kube_pod_status_phase`: 1 for the
+/// current phase and 0 for the other five.
+static SITE_PHASE: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    IntGaugeVec::new(
+        Opts::new(
+            "grid_site_phase",
+            "GridSite phase: 1 for the current phase, 0 for the others",
+        ),
+        &["site", "phase"],
+    )
+    .unwrap_or_else(|_| std::process::abort())
+});
+
+/// Every `GridSite` phase, the `phase` label values of [`SITE_PHASE`].
+pub(crate) const SITE_PHASES: [&str; 6] = ["Pending", "Discovered", "Connecting", "Active", "Unreachable", "Left"];
+
+/// Sites with [`SITE_PHASE`] series, so a deleted site's series can be removed.
+static SITE_PHASE_SITES: LazyLock<std::sync::Mutex<std::collections::BTreeSet<String>>> =
+    LazyLock::new(Default::default);
+
+/// When a reconcile last refreshed [`SITE_PHASE`].
+static SITE_PHASE_REFRESHED: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
+/// Age past which [`SITE_PHASE`] is cleared: three `GridNetwork` requeues, so the series
+/// do not outlive the last `GridNetwork` or a run of failed site lists.
+const SITE_PHASE_MAX_AGE: Duration = Duration::from_secs(900);
+
 /// `AgentToolProvider` phase transitions by source phase, target phase, and reason.
 ///
 /// Kept as a distinct metric (rather than reusing [`PHASE_TRANSITIONS`]) so
@@ -276,6 +327,56 @@ static MODEL_DISCOVERY_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
 pub(crate) fn record_probe(outcome: &str, tls_mode: &str, duration: Duration) {
     PROBE_TOTAL.with_label_values(&[outcome, tls_mode]).inc();
     PROBE_DURATION.observe(duration.as_secs_f64());
+}
+
+/// Set each site's phase series and remove the series of sites no longer present.
+pub(crate) fn set_site_phases<S: AsRef<str>>(phases: impl IntoIterator<Item = (S, &'static str)>) {
+    let mut tracked = SITE_PHASE_SITES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut present = std::collections::BTreeSet::new();
+    for (site, current) in phases {
+        let site = site.as_ref();
+        for phase in SITE_PHASES {
+            SITE_PHASE
+                .with_label_values(&[site, phase])
+                .set(i64::from(phase == current));
+        }
+        present.insert(site.to_owned());
+    }
+    for gone in tracked.difference(&present) {
+        for phase in SITE_PHASES {
+            let _absent = SITE_PHASE.remove_label_values(&[gone.as_str(), phase]);
+        }
+    }
+    *tracked = present;
+    drop(tracked);
+    *SITE_PHASE_REFRESHED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(std::time::Instant::now());
+}
+
+/// Remove every site phase series, for when the sites cannot be listed.
+pub(crate) fn clear_site_phases() {
+    set_site_phases(std::iter::empty::<(&str, &'static str)>());
+}
+
+/// Whether series refreshed at `refreshed` are too old to report at `now`.
+fn site_phases_expired(refreshed: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    refreshed.is_some_and(|at| now.saturating_duration_since(at) > SITE_PHASE_MAX_AGE)
+}
+
+/// Clear site phase series no reconcile has refreshed within [`SITE_PHASE_MAX_AGE`].
+fn expire_site_phases() {
+    let refreshed = *SITE_PHASE_REFRESHED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if site_phases_expired(refreshed, std::time::Instant::now()) {
+        clear_site_phases();
+        *SITE_PHASE_REFRESHED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
 }
 
 /// Record a `GridSite` phase transition.
@@ -365,8 +466,19 @@ pub fn record_signals_shed(limit: &str) {
     SIGNALS_SHED.with_label_values(&[limit]).inc();
 }
 
+/// Set when the site identity expires, Unix seconds.
+pub fn set_site_identity_expiry(not_after: i64) {
+    SITE_IDENTITY_EXPIRY.set(not_after);
+}
+
+/// Count a renewal attempt: `renewed`, `refused`, `failed`, or `expired`.
+pub fn record_site_identity_renewal(result: &str) {
+    SITE_IDENTITY_RENEWALS.with_label_values(&[result]).inc();
+}
+
 /// Gather all registered metrics for serialization.
 pub(crate) fn gather_metrics() -> Vec<MetricFamily> {
+    expire_site_phases();
     REGISTRY.gather()
 }
 
@@ -386,10 +498,77 @@ mod tests {
     use super::*;
 
     #[test]
+    fn site_phases_expire_three_requeues_after_the_last_refresh() {
+        let now = std::time::Instant::now();
+        assert!(!site_phases_expired(None, now), "never set");
+        assert!(
+            !site_phases_expired(Some(now), now + SITE_PHASE_MAX_AGE),
+            "at the limit"
+        );
+        assert!(
+            site_phases_expired(Some(now), now + SITE_PHASE_MAX_AGE + Duration::from_secs(1)),
+            "past it"
+        );
+    }
+
+    #[test]
     fn record_probe_increments_counter() {
         record_probe("Verified", "mtls", Duration::from_millis(42));
         let val = PROBE_TOTAL.with_label_values(&["Verified", "mtls"]).get();
         assert!(val >= 1, "probe counter should be >= 1, got {val}");
+    }
+
+    /// The series `grid_site_phase` holds for `site`, as phase and value.
+    fn site_phase_series(site: &str) -> Vec<(String, i64)> {
+        use prometheus::core::Collector as _;
+        let mut series: Vec<(String, i64)> = SITE_PHASE
+            .collect()
+            .iter()
+            .flat_map(|family| family.get_metric().iter())
+            .filter(|metric| {
+                metric
+                    .get_label()
+                    .iter()
+                    .any(|l| l.name() == "site" && l.value() == site)
+            })
+            .filter_map(|metric| {
+                let phase = metric
+                    .get_label()
+                    .iter()
+                    .find(|l| l.name() == "phase")?
+                    .value()
+                    .to_owned();
+                #[expect(clippy::cast_possible_truncation, reason = "the gauge holds 0 or 1")]
+                Some((phase, metric.get_gauge().value() as i64))
+            })
+            .collect();
+        series.sort();
+        series
+    }
+
+    /// The only test that sets `grid_site_phase`, since each call replaces every site's series.
+    #[test]
+    fn a_site_phase_is_one_state_set_that_follows_transitions_and_goes_with_its_site() {
+        let (hub, east) = ("site-phase-test-hub", "site-phase-test-east");
+        set_site_phases([(hub, "Discovered"), (east, "Pending")]);
+        let ones = |site| {
+            site_phase_series(site)
+                .into_iter()
+                .filter(|(_, value)| *value == 1)
+                .map(|(phase, _)| phase)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(site_phase_series(hub).len(), SITE_PHASES.len(), "one series per phase");
+        assert_eq!(ones(hub), ["Discovered"]);
+
+        set_site_phases([(hub, "Active"), (east, "Pending")]);
+        assert_eq!(ones(hub), ["Active"], "the transition moves the 1");
+
+        set_site_phases([(hub, "Active")]);
+        assert!(site_phase_series(east).is_empty(), "a deleted site's series go with it");
+        assert_eq!(ones(hub), ["Active"]);
+        set_site_phases(std::iter::empty::<(&str, &'static str)>());
+        assert!(site_phase_series(hub).is_empty());
     }
 
     #[test]

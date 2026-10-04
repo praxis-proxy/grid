@@ -35,8 +35,8 @@ Certificate authority, required. The service holds the grid CA and signs with
 it. `ENROLLMENT_CA_CERT` and `ENROLLMENT_CA_KEY` are filesystem paths to the CA
 certificate and its private key. Treat the key as the secret the grid is defined
 by. `ENROLLMENT_CA_COMMON_NAME` names the CA and defaults to `grid-ca`.
-`ENROLLMENT_CERT_LIFETIME_SECS` bounds an issued certificate and defaults to the
-built-in site lifetime.
+`ENROLLMENT_CERT_LIFETIME_SECS` bounds an issued certificate and defaults to 180
+days.
 
 Server TLS, required. The service signs CSRs with the grid CA, so it must not
 serve in the clear. `ENROLLMENT_TLS_CERT` and `ENROLLMENT_TLS_KEY` are filesystem

@@ -154,6 +154,13 @@ pub enum EgressTlsMode {
 #[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GridSiteStatus {
+    /// When gossip stopped vouching for this auto-discovered site; cleared when it returns.
+    ///
+    /// Auto discovery deletes the site once this is older than 24 hours. Never set on a
+    /// declared site.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub absent_since: Option<String>,
+
     /// Capabilities offered by this site.
     #[serde(default)]
     pub capabilities: SiteCapabilities,

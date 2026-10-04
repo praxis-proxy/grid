@@ -66,6 +66,7 @@ use kube::{
 use tracing::info;
 
 use crate::{
+    controller::grid_network::peer_site_key,
     crd::{
         grid_network::GridNetwork,
         grid_site::GridSite,
@@ -108,6 +109,17 @@ const DEFAULT_HEALTH_PATH: &str = "/health";
 // Reconcile
 // ---------------------------------------------------------------------------
 
+/// Context for the [`InferenceProvider`] controller.
+///
+/// [`InferenceProvider`]: crate::crd::inference_provider::InferenceProvider
+#[derive(Clone)]
+pub struct ProviderCtx {
+    /// Kubernetes client.
+    pub client: Client,
+    /// This operator's own site, only when the install names it, so a provider with no placement matches it alone.
+    pub local_site: Option<String>,
+}
+
 /// Reconcile an [`InferenceProvider`] resource.
 ///
 /// # Errors
@@ -115,18 +127,19 @@ const DEFAULT_HEALTH_PATH: &str = "/health";
 /// Returns [`OperatorError`] on Kubernetes API errors.
 ///
 /// [`InferenceProvider`]: crate::crd::inference_provider::InferenceProvider
-pub async fn reconcile(provider: Arc<InferenceProvider>, client: Arc<Client>) -> Result<Action, OperatorError> {
+pub async fn reconcile(provider: Arc<InferenceProvider>, ctx: Arc<ProviderCtx>) -> Result<Action, OperatorError> {
     let name = provider
         .metadata
         .name
         .as_deref()
         .unwrap_or_else(|| std::process::abort());
 
-    info!(name, "reconciling InferenceProvider");
+    tracing::debug!(name, "reconciling InferenceProvider");
 
-    let (phase, matching_sites, reason) = resolve_phase_and_sites(&provider, &client).await?;
+    let client = &ctx.client;
+    let (phase, matching_sites, reason) = resolve_phase_and_sites(&provider, client, ctx.local_site.as_deref()).await?;
     let generation = provider.metadata.generation.unwrap_or(0);
-    update_status(&provider, &client, phase, matching_sites, generation, reason).await?;
+    update_status(&provider, client, phase, matching_sites, generation, reason).await?;
 
     Ok(Action::requeue(requeue_interval_for_provider(&provider.spec)))
 }
@@ -134,7 +147,7 @@ pub async fn reconcile(provider: Arc<InferenceProvider>, client: Arc<Client>) ->
 /// Error policy for the [`InferenceProvider`] controller.
 ///
 /// [`InferenceProvider`]: crate::crd::inference_provider::InferenceProvider
-pub fn error_policy(_provider: Arc<InferenceProvider>, error: &OperatorError, _ctx: Arc<Client>) -> Action {
+pub fn error_policy(_provider: Arc<InferenceProvider>, error: &OperatorError, _ctx: Arc<ProviderCtx>) -> Action {
     tracing::error!(%error, "InferenceProvider reconciliation failed");
     Action::requeue(Duration::from_secs(30))
 }
@@ -484,6 +497,7 @@ pub(crate) async fn probe_endpoint(
 async fn resolve_phase_and_sites(
     provider: &InferenceProvider,
     client: &Client,
+    local_site: Option<&str>,
 ) -> Result<(ProviderPhase, Vec<String>, Option<String>), OperatorError> {
     let name = provider.metadata.name.as_deref().unwrap_or("?");
 
@@ -526,7 +540,7 @@ async fn resolve_phase_and_sites(
 
     // Resolve matching sites.
     let sites = list_sites_for_network(client, network_ref).await?;
-    let matching = sites_matching_selector(provider, &sites);
+    let matching = hosting_sites(provider, &sites, local_site);
     let site_phase = phase_from_matching(&matching);
 
     // Resolve health check TLS config (if configured).  On failure, map
@@ -624,11 +638,27 @@ pub(crate) fn sites_matching_selector(provider: &InferenceProvider, sites: &[Gri
                 .iter()
                 .all(|(k, v)| site_labels.is_some_and(|labels| labels.get(k).is_some_and(|sv| sv == v)))
         })
-        .filter_map(|site| site.metadata.name.clone())
+        .filter_map(|site| peer_site_key(site).map(|(key, _)| key))
         .collect();
 
     names.sort();
+    names.dedup();
     names
+}
+
+
+/// The sites hosting `provider`: this site alone when its selector is empty and this site is in
+/// the provider's network, as the routing overlay attributes it, else every site the selector matches.
+fn hosting_sites(provider: &InferenceProvider, sites: &[GridSite], local_site: Option<&str>) -> Vec<String> {
+    match local_site {
+        Some(local) if provider.spec.site_selector.match_labels.is_empty() => {
+            let listed = sites
+                .iter()
+                .any(|site| peer_site_key(site).is_some_and(|(key, _)| key == local));
+            if listed { vec![local.to_owned()] } else { Vec::new() }
+        },
+        _ => sites_matching_selector(provider, sites),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -934,7 +964,7 @@ mod tests {
         );
         let provider = provider_with_health_check_tls("net-1", "ca-secret");
 
-        let (phase, matching, reason) = resolve_phase_and_sites(&provider, &client)
+        let (phase, matching, reason) = resolve_phase_and_sites(&provider, &client, None)
             .await
             .expect("mocked API calls must not fail");
 
@@ -954,7 +984,7 @@ mod tests {
         let client = mock_kube_client_for_health_tls("net-1", HashMap::new());
         let provider = provider_with_health_check_tls("net-1", "absent-secret");
 
-        let (phase, _matching, reason) = resolve_phase_and_sites(&provider, &client)
+        let (phase, _matching, reason) = resolve_phase_and_sites(&provider, &client, None)
             .await
             .expect("mocked API calls must not fail");
 
@@ -1378,6 +1408,38 @@ mod tests {
         ];
         let matching = sites_matching_selector(&provider, &sites);
         assert_eq!(matching, vec!["gpu-site"], "only gpu-site should match");
+    }
+
+    #[test]
+    fn an_unplaced_provider_is_hosted_by_this_site_alone() {
+        let provider = test_provider("qwen3-site-a", "net", &["model"]);
+        let mut stub = test_site_with_labels(
+            "grid-site-d",
+            "net",
+            &[(crate::controller::grid_network::LABEL_AUTO_DISCOVERED, "true")],
+        );
+        stub.metadata.annotations = Some(std::collections::BTreeMap::from([(
+            crate::controller::grid_network::ANNOTATION_SITE_ID.to_owned(),
+            "site-d".to_owned(),
+        )]));
+        let sites = vec![test_site("dagobah", "net"), stub];
+        assert_eq!(hosting_sites(&provider, &sites, Some("dagobah")), vec!["dagobah"]);
+        assert!(
+            hosting_sites(&provider, &sites, Some("elsewhere")).is_empty(),
+            "a local site missing from the provider's network hosts nothing"
+        );
+        assert_eq!(
+            hosting_sites(&provider, &sites, None),
+            vec!["dagobah", "site-d"],
+            "without a local site, by bare id, never grid-site-d"
+        );
+        let placed = test_provider_with_selector("prov", "net", &[("hw", "gpu")]);
+        let gpu = vec![test_site_with_labels("gpu-site", "net", &[("hw", "gpu")])];
+        assert_eq!(
+            hosting_sites(&placed, &gpu, Some("dagobah")),
+            vec!["gpu-site"],
+            "a selector still places"
+        );
     }
 
     #[test]
@@ -2051,11 +2113,9 @@ mod tests {
         .unwrap_or_else(|_| std::process::abort());
         let hc = spec.health_check.unwrap_or_else(|| std::process::abort());
         let tls = hc.tls.unwrap_or_else(|| std::process::abort());
-        assert_eq!(tls.ca_secret_ref.name, "backend-ca", "caSecretRef.name must round-trip");
-        assert_eq!(
-            tls.ca_secret_ref.namespace, "grid-system",
-            "caSecretRef.namespace must round-trip"
-        );
+        let ca = tls.ca_secret_ref.as_ref().unwrap_or_else(|| std::process::abort());
+        assert_eq!(ca.name, "backend-ca", "caSecretRef.name must round-trip");
+        assert_eq!(ca.namespace, "grid-system", "caSecretRef.namespace must round-trip");
         assert!(
             tls.client_certificate_secret_ref.is_none(),
             "absent clientCertificateSecretRef must be None"

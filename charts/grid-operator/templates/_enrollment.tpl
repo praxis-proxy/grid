@@ -30,6 +30,14 @@
 {{- end }}
 {{- end }}
 
+{{/* Emits "true" when the operator rotates the site identity: rotation on and an enrollment URL known. */}}
+{{- define "grid-operator.enrollment.rotates" -}}
+{{- $e := include "grid-operator.enrollment.settings" . | fromYaml }}
+{{- if and (dig "rotation" "enabled" true $e) (or $e.enabled $e.url) -}}
+true
+{{- end -}}
+{{- end }}
+
 {{/* Emits "true" or nothing. */}}
 {{- define "grid-operator.enrollment.hasGridCa" -}}
 {{- $e := include "grid-operator.enrollment.settings" . | fromYaml }}
@@ -57,6 +65,22 @@ true
   value: {{ dig "tokenSecretRef" "name" "" $e | quote }}
 - name: GRID_ENROLL_TOKEN_SECRET_KEY
   value: {{ dig "tokenSecretRef" "key" "token" $e | quote }}
+- name: GRID_ENROLL_IDENTITY_SECRET
+  value: {{ $e.identitySecretName | default "grid-site-identity" | quote }}
+- name: GRID_ENROLL_CA_SECRET
+  value: {{ $e.caSecretName | default "grid-ca" | quote }}
+{{- end }}
+{{- if include "grid-operator.enrollment.rotates" . }}
+- name: GRID_ROTATION_ENABLED
+  value: "true"
+{{- if not $e.enabled }}
+- name: GRID_ENROLL_URL
+  value: {{ $e.url | quote }}
+- name: GRID_ENROLL_IDENTITY_SECRET
+  value: {{ $e.identitySecretName | default "grid-site-identity" | quote }}
+- name: GRID_ENROLL_CA_SECRET
+  value: {{ $e.caSecretName | default "grid-ca" | quote }}
+{{- end }}
 {{- end }}
 {{- end }}
 

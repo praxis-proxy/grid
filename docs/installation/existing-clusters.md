@@ -808,6 +808,22 @@ serviceMonitor:
     release: prometheus
 ```
 
+The metrics port serves TLS on every grid site. On OpenShift the certificate comes
+from the service CA. Elsewhere, a site with `grid.id` or enrollment serves its site
+identity once enrollment writes it, and the ServiceMonitor trusts the grid CA. To
+use your own certificate, set `metrics.tls.existingSecret` and
+`serviceMonitor.tlsConfig`. `metrics.tls.enabled: false` serves plaintext.
+
+A site with `grid.id` and no enrollment whose operator created its own identity
+before this release holds a certificate named after the network, not the site, so
+its ServiceMonitor scrape fails on the hostname. Delete both `grid-ca` and
+`grid-site-identity` to have the operator issue them again under the site name.
+That creates a new CA, so peers that pin this site need its new certificate.
+
+On OpenShift a NetworkPolicy also admits only the user-workload and platform
+monitoring namespaces to that port. A Prometheus elsewhere needs its namespace in
+`networkPolicy.metricsFrom`.
+
 ### CRD Retention
 
 Helm does not remove CRDs on uninstall. To remove them:

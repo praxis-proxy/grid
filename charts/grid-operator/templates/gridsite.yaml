@@ -1,0 +1,19 @@
+{{- include "grid-operator.normalize" . }}
+{{- if .Values.grid.id }}
+apiVersion: grid.praxis.fast/v1alpha1
+kind: GridSite
+metadata:
+  name: {{ .Values.swim.siteName | quote }}
+  labels:
+    {{- include "grid-operator.labels" . | nindent 4 }}
+  annotations:
+    {{- include "grid-operator.afterCrds" . | nindent 4 }}
+spec:
+  gridNetworkRef: {{ .Values.grid.network | quote }}
+  {{- with .Values.site.region }}
+  region: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.site.zone }}
+  zone: {{ . | quote }}
+  {{- end }}
+{{- end }}

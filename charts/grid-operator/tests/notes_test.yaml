@@ -25,3 +25,20 @@ tests:
     asserts:
       - matchRegexRaw:
           pattern: CRDs install and upgrade with this release and stay on uninstall
+  - it: warns when metrics stay plaintext because the install has no grid identity
+    asserts:
+      - matchRegexRaw:
+          pattern: Metrics and health are plaintext
+  - it: says nothing when a grid site serves its identity
+    set:
+      enrollment.enabled: true
+      swim.siteName: site-d
+    asserts:
+      - notMatchRegexRaw:
+          pattern: Metrics and health are plaintext
+  - it: says nothing when plaintext is chosen
+    set:
+      metrics.tls.enabled: false
+    asserts:
+      - notMatchRegexRaw:
+          pattern: Metrics and health are plaintext

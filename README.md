@@ -160,8 +160,14 @@ the Rust package and binary are `operator`, the deployed operator is
 `praxis-gateway`. The API group is `grid.praxis.fast`, with kinds such as
 `GridNetwork` and `GridSite`. It replaced `grid.praxis-proxy.io`, along with the
 prefix of every Grid label and annotation key, so custom resources created under
-the old group must be recreated. Existing `grid-*` resource names, `GRID_*`
-environment variables, metrics, and configuration fields are unchanged.
+the old group must be recreated. The project offers no migration guarantees at
+this stage, so across the rename the supported path is a fresh install: uninstall,
+delete the `grid.praxis-proxy.io` CRDs, and install again. An upgrade
+deletes the old CRDs, and every resource under them, unless the previous release
+installed them with the `helm.sh/resource-policy: keep` annotation, which `crds.keep`
+set at that time. Existing
+`grid-*` resource names, `GRID_*` environment variables, metrics, and
+configuration fields are unchanged.
 Existing downstream names, including `praxis-ai-grid-operator` where used, are
 also unchanged. Downstream naming alignment is deferred to a separate effort.
 

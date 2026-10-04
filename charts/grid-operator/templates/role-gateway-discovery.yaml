@@ -22,6 +22,13 @@ rules:
     resources: ["services"]
     resourceNames: [{{ .Values.gateway.serviceName | default "provider-gateway" | quote }}]
     verbs: ["get"]
+{{- if include "grid-operator.enrollment.rotates" . }}
+  # A rotation rolls the gateway, which loads its upstream client certificate only at start.
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    resourceNames: [{{ .Values.gateway.serviceName | default "provider-gateway" | quote }}]
+    verbs: ["get", "patch"]
+{{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

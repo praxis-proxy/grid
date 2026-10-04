@@ -17,14 +17,13 @@ const MAX_SITE_NAME_LEN: usize = 63;
 
 /// Backdating applied to `not_before`, so a peer whose clock runs slightly slow
 /// does not reject a certificate issued moments ago.
-const CLOCK_SKEW_ALLOWANCE: Duration = Duration::minutes(5);
+pub const CLOCK_SKEW_ALLOWANCE: Duration = Duration::minutes(5);
 
 /// Default issued-certificate lifetime.
 ///
 /// Finite, because expiry is the only way to remove a member (no revocation
-/// list). Longer than it should be until renewal exists, so a lapse cannot
-/// strand a site.
-pub const DEFAULT_SITE_CERT_LIFETIME: Duration = Duration::days(30);
+/// list). Renewing at a third remaining leaves a site about 60 days to reach the hub.
+pub const DEFAULT_SITE_CERT_LIFETIME: Duration = Duration::days(180);
 
 /// When a certificate is valid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -194,6 +193,12 @@ pub fn verify_csr(csr_pem: &str) -> Result<String, EnrollError> {
     Ok(hex(&backend::sha256(&public_key_der)))
 }
 
+/// Whether `key_pem` is the private key for `cert_pem`.
+#[must_use]
+pub fn key_matches_cert(key_pem: &str, cert_pem: &str) -> bool {
+    backend::key_spki_der(key_pem).is_some_and(|key| crate::cert_public_key(cert_pem).is_ok_and(|cert| cert == key))
+}
+
 /// Map a backend request failure onto the request-side error it stands for.
 fn map_backend_error(err: BackendError) -> EnrollError {
     match err {
@@ -220,6 +225,22 @@ mod tests {
 
     use super::*;
     use crate::generate::generate_ca;
+
+    #[test]
+    fn a_key_matches_only_its_own_certificate() {
+        let ca = generate_ca("grid-ca").expect("ca");
+        let csr = crate::generate_csr("east").expect("csr");
+        let leaf = sign_csr(&ca, "east", &csr.csr_pem, Validity::default()).expect("leaf");
+        assert!(key_matches_cert(&csr.key_pem, &leaf.cert_pem));
+        let other = crate::generate_csr("east").expect("other");
+        assert!(!key_matches_cert(&other.key_pem, &leaf.cert_pem), "another key");
+        assert!(!key_matches_cert("not a key", &leaf.cert_pem), "an unreadable key");
+    }
+
+    #[test]
+    fn site_certificates_last_180_days_by_default() {
+        assert_eq!(DEFAULT_SITE_CERT_LIFETIME, Duration::days(180));
+    }
 
     /// Build a request the way an enrollee would, asking for `requested_names`.
     fn csr_asking_for(requested_names: &[SanType]) -> (String, KeyPair) {

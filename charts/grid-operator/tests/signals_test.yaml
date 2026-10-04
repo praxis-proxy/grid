@@ -123,3 +123,36 @@ tests:
       - equal:
           path: spec.loadBalancerSourceRanges
           value: ["203.0.113.0/24"]
+
+  - it: starts the operator in the declared modes, so its GridNetwork appearing restarts nothing
+    set:
+      grid.id: grid-1
+      grid.signals: poll
+      grid.peerTrust: pin
+      signals.enabled: true
+    template: templates/deployment.yaml
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: GRID_SIGNAL_TRANSPORT
+            value: poll
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: GRID_PEER_TRUST
+            value: pin
+
+  - it: leaves the startup modes to the operator default when the install declares none
+    template: templates/deployment.yaml
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: GRID_SIGNAL_TRANSPORT
+          any: true
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: GRID_PEER_TRUST
+          any: true

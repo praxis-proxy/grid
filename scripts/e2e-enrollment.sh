@@ -36,7 +36,9 @@ pass() { echo "PASS: $*"; }
 echo "== cluster + images =="
 # Refuse to touch a cluster we do not own: fail on a name collision rather than
 # deleting a user's pre-existing cluster. Only a cluster this run creates is torn down.
-if kind get clusters 2>/dev/null | grep -qx "${CLUSTER}"; then
+# Captured, not piped: under pipefail grep -q's early exit can fail the pipeline on a match.
+clusters=$(kind get clusters 2>/dev/null || true)
+if grep -qx "${CLUSTER}" <<<"${clusters}"; then
   fail "kind cluster '${CLUSTER}' already exists; refusing to clobber it. Delete it or set CLUSTER=<unique-name>."
 fi
 # KIND_CREATE_PREFIX lets a rootless-podman host pass the systemd Delegate wrapper;
@@ -76,11 +78,19 @@ ${K} rollout status deploy/grid-enrollment-db --timeout=180s
 ${K} rollout status deploy/grid-enrollment --timeout=240s
 
 echo "== deployment health =="
-${K} get job -l app.kubernetes.io/component=ca-bootstrap -o jsonpath='{.items[0].status.succeeded}' | grep -q 1 \
-  || fail "bootstrap Job did not succeed"
+succeeded=$(${K} get job -l app.kubernetes.io/component=ca-bootstrap -o jsonpath='{.items[0].status.succeeded}') \
+  || fail "bootstrap Job unreadable"
+[ "${succeeded}" = 1 ] || fail "bootstrap Job did not succeed"
 pass "bootstrap Job succeeded"
-${K} get secret grid-ca-bundle -o jsonpath='{.data.tls\.key}' 2>/dev/null | grep -q . \
-  && fail "grid-ca-bundle leaked tls.key (key-separation broken)" || pass "key-separation: bundle has no signing key"
+# Fails closed: an unreadable bundle fails the check, and only an empty tls.key passes it.
+bundle_key=$(${K} get secret grid-ca-bundle -o jsonpath='{.data.tls\.key}') \
+  || fail "grid-ca-bundle unreadable; cannot check key-separation"
+[ -z "${bundle_key}" ] || fail "grid-ca-bundle leaked tls.key (key-separation broken)"
+# Positive control: an empty tls.key only counts on the real bundle, which holds ca.crt.
+bundle_ca=$(${K} get secret grid-ca-bundle -o jsonpath='{.data.ca\.crt}') \
+  || fail "grid-ca-bundle unreadable; cannot check key-separation"
+[ -n "${bundle_ca}" ] || fail "grid-ca-bundle has no ca.crt; key-separation check would pass vacuously"
+pass "key-separation: bundle has no signing key"
 ${K} get secret grid-gossip-key >/dev/null 2>&1 && fail "vestigial grid-gossip-key Secret present" \
   || pass "no gossip Secret (identity-only)"
 
@@ -132,8 +142,9 @@ sleep 4
 code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:18443/readyz" || true)"
 [ "${code}" = "000" ] && pass "plaintext refused (TLS-only)" || fail "plaintext got HTTP ${code}, expected refusal"
 # readiness over TLS
-curl -sk -o /dev/null -w '%{http_code}' "https://127.0.0.1:18443/readyz" | grep -q 200 \
-  || fail "/readyz not 200 over TLS"; pass "/readyz 200 over TLS"
+code="$(curl -sk -o /dev/null -w '%{http_code}' "https://127.0.0.1:18443/readyz" || true)"
+[ "${code}" = 200 ] || fail "/readyz got HTTP ${code} over TLS, want 200"
+pass "/readyz 200 over TLS"
 
 # mint <bearer> [site]: writes the body to mint.json, prints the HTTP status.
 mint() {
@@ -177,8 +188,8 @@ pass "leaf chains to the grid CA"
 [ "${SPIFFE}" = "spiffe://grid.internal/site/site-a" ] \
   || fail "spiffeId ${SPIFFE} is not the pinned name"
 pass "spiffeId pins the grid-assigned name: ${SPIFFE}"
-openssl x509 -in "${WORK}/leaf.pem" -noout -ext subjectAltName 2>/dev/null | grep -q "spiffe://grid.internal/site/site-a" \
-  || fail "leaf SAN missing the pinned SPIFFE URI"
+san=$(openssl x509 -in "${WORK}/leaf.pem" -noout -ext subjectAltName 2>/dev/null) || fail "leaf SAN unreadable"
+grep -q "spiffe://grid.internal/site/site-a" <<<"${san}" || fail "leaf SAN missing the pinned SPIFFE URI"
 pass "leaf SAN carries the pinned SPIFFE URI"
 
 echo "== e2e GREEN (authz=${AUTHZ}): helm reproducible + real enroll flow verified =="

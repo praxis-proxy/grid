@@ -37,6 +37,10 @@ pub mod metrics;
 pub mod metrics_parser;
 /// Async HTTP scraper for Prometheus `/metrics` endpoints.
 pub mod metrics_scraper;
+/// TLS for the metrics and health listener.
+pub mod metrics_tls;
+/// Short-lived tokens for the metrics scraper ServiceAccount.
+pub(crate) mod metrics_token;
 /// Kubernetes resource builders.
 pub mod resources;
 pub mod served_models;

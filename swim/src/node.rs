@@ -76,6 +76,9 @@ pub struct SwimNode {
     /// Sender for the pinned-identity trust store read by the broadcast
     /// handler inside `foca`. See [`SwimNode::pin_origin`].
     trust_store_tx: watch::Sender<TrustStore>,
+
+    /// Whether data claiming this node's identity has been warned about once.
+    warned_self_data: bool,
 }
 
 impl SwimNode {
@@ -130,6 +133,7 @@ impl SwimNode {
             signals_addrs_rx,
             origin_state,
             trust_store_tx,
+            warned_self_data: false,
         }
     }
 
@@ -200,10 +204,23 @@ impl SwimNode {
     ///
     /// Returns accumulated side effects: outbound messages, scheduled timers,
     /// membership events, and any CRDT state broadcast payloads received.
-    /// Protocol errors are logged at `warn` level and do not abort the output.
+    /// Protocol errors are logged at `warn` level, and data carrying this node's identity
+    /// warns once, then logs at `debug`; neither aborts the output.
     pub fn handle_data(&mut self, data: &[u8]) -> AccumulatedOutput {
-        if let Err(err) = self.foca.handle_data(data, &mut self.runtime) {
-            tracing::warn!(error = %err, len = data.len(), "foca handle_data error");
+        match self.foca.handle_data(data, &mut self.runtime) {
+            Ok(()) => {},
+            // Self-seeds are filtered, so this is most likely two sites sharing one SWIM identity.
+            Err(foca::Error::DataFromOurselves) if !self.warned_self_data => {
+                self.warned_self_data = true;
+                tracing::warn!(
+                    len = data.len(),
+                    "foca received data carrying this node's identity; check that no two sites share a SWIM identity or address"
+                );
+            },
+            Err(foca::Error::DataFromOurselves) => {
+                tracing::debug!(len = data.len(), "foca ignored data from this node");
+            },
+            Err(err) => tracing::warn!(error = %err, len = data.len(), "foca handle_data error"),
         }
         self.runtime.take_output()
     }

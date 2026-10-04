@@ -131,6 +131,8 @@ jobs:
           helm unittest "${charts[@]}"
 
       - name: Validate charts (static)
+        env:
+          RENDER_DIR: ${{ runner.temp }}/helm-rendered
         run: ./scripts/verify-helm-chart.sh
 
       - name: Validate rendered manifests against Kubernetes schema
@@ -153,7 +155,7 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: rendered-manifests-${{ matrix.helm }}
-          path: /tmp/helm-rendered-*.yaml
+          path: ${{ runner.temp }}/helm-rendered/
           if-no-files-found: ignore
           retention-days: 5
 
@@ -500,13 +502,18 @@ jobs:
   # ----------------------------------------------------------------------------
 
   kind-hub-site:
+    name: kind-hub-site (${{ matrix.leg }})
     needs: [changes, images]
     if: needs.changes.outputs.runtime == 'true'
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
-        peer-trust-mode: [pin, spiffe]
+        include:
+          - peer-trust-mode: pin
+            leg: pin, rotation off
+          - peer-trust-mode: spiffe
+            leg: spiffe, certificate rotation
     timeout-minutes: 60
     permissions:
       contents: read
@@ -554,9 +561,11 @@ jobs:
             docker load -i "/tmp/images/grid-${name}.tar"
           done
 
-      - name: Run hub and site install e2e
+      - name: Run hub and site e2e (${{ matrix.leg }})
         env:
           MODES: ${{ matrix.peer-trust-mode }}
+          # The spiffe leg rotates 8 minute identities; pin trust does not rotate.
+          ROTATION_LIFETIME: "480"
           SKIP_BUILD: "1"
           IMAGE_PREFIX: ghcr.io/praxis-proxy/grid-
           IMAGE_TAG: ci

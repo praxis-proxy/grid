@@ -3,7 +3,12 @@
 use std::{net::SocketAddr, str::FromStr as _, sync::Arc, time::Duration};
 
 use axum_server::Handle;
-use enrollment::{AppState, GridAdmins, SharedCa, Store, authz::Authorizer, router};
+use enrollment::{
+    AppState, GridAdmins, SharedCa, Store,
+    authz::Authorizer,
+    router,
+    tls::{PeerAcceptor, TlsAcceptor, TlsConfig},
+};
 use sqlx::postgres::{PgConnectOptions, PgSslMode};
 use tokio::signal;
 
@@ -15,13 +20,6 @@ mod bootstrap;
 /// The `enrollment invite` subcommand.
 #[cfg(feature = "bootstrap")]
 mod invite;
-
-/// Server TLS config: rustls by default, system openssl under `fips`.
-#[cfg(not(feature = "fips"))]
-type TlsConfig = axum_server::tls_rustls::RustlsConfig;
-/// Server TLS config: rustls by default, system openssl under `fips`.
-#[cfg(feature = "fips")]
-type TlsConfig = axum_server::tls_openssl::OpenSSLConfig;
 
 /// How long in-flight requests are given to finish once a shutdown signal lands.
 /// Kept below the Kubernetes default 30s termination grace period, so the drain
@@ -43,6 +41,12 @@ const CA_COMMON_NAME: &str = "ENROLLMENT_CA_COMMON_NAME";
 const GRID_ADMIN_TOKENS: &str = "ENROLLMENT_GRID_ADMIN_TOKENS";
 /// How many seconds an issued certificate lasts.
 const CERT_LIFETIME_SECS: &str = "ENROLLMENT_CERT_LIFETIME_SECS";
+/// Set to `false` to refuse every renewal.
+const RENEWALS_ENABLED: &str = "ENROLLMENT_ROTATION_ENABLED";
+/// Comma-separated site names issued outside enrollment, refused at mint and redeem.
+const RESERVED_SITES: &str = "ENROLLMENT_RESERVED_SITES";
+/// Directory of reserved-name seeds bootstrap signed with the CA key.
+const RESERVED_SEEDS_DIR: &str = "ENROLLMENT_RESERVED_SEEDS_DIR";
 /// Server certificate presented to callers, PEM.
 const TLS_CERT_PATH: &str = "ENROLLMENT_TLS_CERT";
 /// Private key for the server certificate, PEM.
@@ -113,7 +117,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|_unset| format!("{TLS_CERT_PATH} is required: the CA-signing service must not serve in the clear"))?;
     let tls_key = std::env::var(TLS_KEY_PATH)
         .map_err(|_unset| format!("{TLS_KEY_PATH} is required: the CA-signing service must not serve in the clear"))?;
-    let tls = load_tls(&tls_cert, &tls_key).await?;
+    let tls = load_tls(&tls_cert, &tls_key, &ca.cert_pem)?;
 
     let state = Arc::new(AppState {
         store: open_store().await?,
@@ -122,14 +126,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // feature, kept off the startup stack frame.
         authorizer: Box::pin(build_authorizer()).await?,
         cert_lifetime: load_cert_lifetime(),
+        reserved_sites: load_reserved_sites()?,
+        renewals_enabled: load_renewals_enabled()?,
     });
 
     // Reload the server certificate on an interval so a rotated TLS secret is
     // served without a restart. A failed reload keeps the current certificate.
-    tokio::spawn(reload_tls(tls.clone(), tls_cert, tls_key));
+    tokio::spawn(reload_tls(tls.clone(), tls_cert, tls_key, Arc::clone(&state)));
     // Reload the signing CA the same way, so a regenerated or restored CA signs
     // new site certificates without a restart.
     tokio::spawn(reload_ca(Arc::clone(&state), common_name, ca_cert_path, ca_key_path));
+    // Apply reserved-name seeds now and as bootstrap rewrites them.
+    if let Ok(dir) = std::env::var(RESERVED_SEEDS_DIR) {
+        let mut reported = std::collections::HashMap::new();
+        Box::pin(enrollment::seed::apply(
+            &state,
+            std::path::Path::new(&dir),
+            &mut reported,
+        ))
+        .await;
+        tokio::spawn(reapply_seeds(Arc::clone(&state), dir, reported));
+    }
 
     // Drain in-flight requests on SIGTERM or SIGINT rather than cutting them off,
     // so a rolling deploy does not abort an enrollment mid-issue.
@@ -138,10 +155,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let addr: SocketAddr = listen.parse()?;
     tracing::info!(%addr, "enrollment service listening over https");
-    #[cfg(not(feature = "fips"))]
-    let server = axum_server::bind_rustls(addr, tls);
-    #[cfg(feature = "fips")]
-    let server = axum_server::bind_openssl(addr, tls);
+    // The acceptor hands each connection's verified client leaf to the renewal handler.
+    let server = axum_server::bind(addr).acceptor(PeerAcceptor(TlsAcceptor::new(tls)));
     Box::pin(server.handle(handle).serve(router(state).into_make_service())).await?;
     Ok(())
 }
@@ -189,17 +204,20 @@ async fn shutdown_signal(handle: Handle<SocketAddr>) {
     clippy::infinite_loop,
     reason = "a background reloader runs for the life of the process"
 )]
-async fn reload_tls(config: TlsConfig, cert_path: String, key_path: String) {
+async fn reload_tls(config: TlsConfig, cert_path: String, key_path: String, state: Arc<AppState>) {
     let mut ticker = tokio::time::interval(TLS_RELOAD_INTERVAL);
     let mut last_expiry_warning: Option<std::time::Instant> = None;
     loop {
         ticker.tick().await;
         warn_if_serving_cert_expiring(&cert_path, &mut last_expiry_warning).await;
-        // rustls reloads asynchronously, the openssl acceptor reload synchronously.
-        #[cfg(not(feature = "fips"))]
-        let reloaded = config.reload_from_pem_file(&cert_path, &key_path).await;
-        #[cfg(feature = "fips")]
-        let reloaded = config.reload_from_pem_file(&cert_path, &key_path);
+        // Rebuilt with the current CA too, so client certificates follow a CA swap.
+        let ca_pem = state.ca.current().cert_pem.clone();
+        let reloaded = enrollment::tls::reload(
+            &config,
+            std::path::Path::new(&cert_path),
+            std::path::Path::new(&key_path),
+            &ca_pem,
+        );
         if let Err(err) = reloaded {
             tracing::warn!(%err, "server certificate reload failed, keeping the current certificate");
         }
@@ -244,6 +262,25 @@ async fn reload_ca(state: Arc<AppState>, common_name: String, cert_path: String,
     }
 }
 
+/// Apply reserved-name seeds on an interval, as bootstrap rewrites them.
+#[expect(
+    clippy::infinite_loop,
+    reason = "a background reloader runs for the life of the process"
+)]
+async fn reapply_seeds(state: Arc<AppState>, dir: String, mut reported: std::collections::HashMap<String, String>) {
+    let mut ticker = tokio::time::interval(TLS_RELOAD_INTERVAL);
+    ticker.tick().await;
+    loop {
+        ticker.tick().await;
+        Box::pin(enrollment::seed::apply(
+            &state,
+            std::path::Path::new(&dir),
+            &mut reported,
+        ))
+        .await;
+    }
+}
+
 /// Serving cert expiry this close raises a warning, matching bootstrap's renewal window.
 const EXPIRY_WARNING_WINDOW: time::Duration = time::Duration::days(30);
 /// Repeat the expiry warning at most this often.
@@ -274,25 +311,29 @@ async fn warn_if_serving_cert_expiring(cert_path: &str, last: &mut Option<std::t
 /// missing certificate or key returns an error here, before any socket is bound,
 /// the same fail-closed posture as the CA material.
 #[cfg(not(feature = "fips"))]
-async fn load_tls(cert: &str, key: &str) -> Result<TlsConfig, Box<dyn std::error::Error>> {
+fn load_tls(cert: &str, key: &str, grid_ca_pem: &str) -> Result<TlsConfig, Box<dyn std::error::Error>> {
     // Install the ring provider process-wide, as the operator does, before rustls
     // builds any configuration.
     if rustls::crypto::ring::default_provider().install_default().is_err() {
         tracing::debug!("a rustls crypto provider was already installed");
     }
-    Ok(Box::pin(axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key)).await?)
+    Ok(enrollment::tls::server_config(
+        std::path::Path::new(cert),
+        std::path::Path::new(key),
+        grid_ca_pem,
+    )?)
 }
 
 /// Load the mandatory server TLS material through system openssl (fips build).
 ///
 /// The openssl acceptor builds synchronously, with no provider to install.
 #[cfg(feature = "fips")]
-#[expect(
-    clippy::unused_async,
-    reason = "matches the default build's async load_tls signature"
-)]
-async fn load_tls(cert: &str, key: &str) -> Result<TlsConfig, Box<dyn std::error::Error>> {
-    Ok(axum_server::tls_openssl::OpenSSLConfig::from_pem_file(cert, key)?)
+fn load_tls(cert: &str, key: &str, grid_ca_pem: &str) -> Result<TlsConfig, Box<dyn std::error::Error>> {
+    Ok(enrollment::tls::server_config(
+        std::path::Path::new(cert),
+        std::path::Path::new(key),
+        grid_ca_pem,
+    )?)
 }
 
 /// Open the store the enrollment record lives in.
@@ -345,6 +386,37 @@ fn require_db_tls(url: &str) -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     Ok(())
+}
+
+/// Read the reserved site names, refusing one that is not a valid site name.
+fn load_reserved_sites() -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let raw = std::env::var(RESERVED_SITES).unwrap_or_default();
+    let sites: Vec<String> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|site| !site.is_empty())
+        .map(str::to_owned)
+        .collect();
+    for site in &sites {
+        certs::validate_site_name(site).map_err(|err| format!("{RESERVED_SITES} entry {site:?}: {err}"))?;
+    }
+    if !sites.is_empty() {
+        tracing::info!(?sites, "site names reserved from enrollment");
+    }
+    Ok(sites)
+}
+
+/// Whether renewals are signed: on unless the variable says `false`.
+fn load_renewals_enabled() -> Result<bool, String> {
+    let enabled = match std::env::var(RENEWALS_ENABLED).as_deref().map(str::trim) {
+        Err(_) | Ok("" | "true") => true,
+        Ok("false") => false,
+        Ok(other) => return Err(format!("{RENEWALS_ENABLED} must be true or false, not {other:?}")),
+    };
+    if !enabled {
+        tracing::info!("rotation disabled: every rotation is refused; issued identities stay valid until they expire");
+    }
+    Ok(enabled)
 }
 
 /// Read how long issued certificates should last.

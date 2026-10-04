@@ -43,6 +43,101 @@ stays with the requester and is never sent.
 */
     pub csr: ::std::string::String,
 }
+///A site's enrollment record. Digests only, never key material.
+#[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug, Eq, PartialEq)]
+pub struct EnrollmentStatus {
+    ///The record identifier.
+    pub id: ::uuid::Uuid,
+    ///When this record began, at enrollment or a bootstrap seed reset.
+    #[serde(rename = "incarnationStartedAt")]
+    pub incarnation_started_at: ::std::string::String,
+    /**When the latest certificate this service issued expires. Null for a
+reserved name's bootstrap certificate until its first rotation.
+*/
+    #[serde(rename = "notAfter", skip_serializing_if = "::std::option::Option::is_none")]
+    pub not_after: ::std::option::Option<::std::string::String>,
+    ///The key that one replaced, which may only retry a lost rotation.
+    #[serde(
+        rename = "previousPublicKeySha256",
+        skip_serializing_if = "::std::option::Option::is_none"
+    )]
+    pub previous_public_key_sha256: ::std::option::Option<::std::string::String>,
+    ///Lowercase hex SHA-256 of the key the latest issued certificate carries.
+    #[serde(rename = "publicKeySha256")]
+    pub public_key_sha256: ::std::string::String,
+    ///A name bootstrap issues, such as the hub's.
+    pub reserved: bool,
+    ///When the record last took a new key, by rotation or a bootstrap seed. Null if it never has.
+    #[serde(
+        rename = "rotatedAt",
+        skip_serializing_if = "::std::option::Option::is_none"
+    )]
+    pub rotated_at: ::std::option::Option<::std::string::String>,
+    ///The site name the record holds.
+    #[serde(rename = "siteName")]
+    pub site_name: ::std::string::String,
+    /**frozen after a rotation fork. A frozen site cannot rotate until a
+grid-admin deletes its enrollment and it enrolls again.
+*/
+    pub state: EnrollmentStatusState,
+}
+/**frozen after a rotation fork. A frozen site cannot rotate until a
+grid-admin deletes its enrollment and it enrolls again.
+*/
+#[derive(
+    ::serde::Deserialize,
+    ::serde::Serialize,
+    Clone,
+    Copy,
+    Debug,
+    Eq,
+    Hash,
+    Ord,
+    PartialEq,
+    PartialOrd
+)]
+pub enum EnrollmentStatusState {
+    #[serde(rename = "active")]
+    Active,
+    #[serde(rename = "frozen")]
+    Frozen,
+}
+impl ::std::fmt::Display for EnrollmentStatusState {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        match *self {
+            Self::Active => f.write_str("active"),
+            Self::Frozen => f.write_str("frozen"),
+        }
+    }
+}
+impl ::std::str::FromStr for EnrollmentStatusState {
+    type Err = self::error::ConversionError;
+    fn from_str(
+        value: &str,
+    ) -> ::std::result::Result<Self, self::error::ConversionError> {
+        match value {
+            "active" => Ok(Self::Active),
+            "frozen" => Ok(Self::Frozen),
+            _ => Err("invalid value".into()),
+        }
+    }
+}
+impl ::std::convert::TryFrom<&str> for EnrollmentStatusState {
+    type Error = self::error::ConversionError;
+    fn try_from(
+        value: &str,
+    ) -> ::std::result::Result<Self, self::error::ConversionError> {
+        value.parse()
+    }
+}
+impl ::std::convert::TryFrom<::std::string::String> for EnrollmentStatusState {
+    type Error = self::error::ConversionError;
+    fn try_from(
+        value: ::std::string::String,
+    ) -> ::std::result::Result<Self, self::error::ConversionError> {
+        value.parse()
+    }
+}
 /**The token a grid-admin hands to a site. Returned once, at mint; only its
 digest is stored after that.
 */
@@ -81,13 +176,142 @@ never names itself.
     #[serde(rename = "siteName")]
     pub site_name: ::std::string::String,
 }
-///A failure, described so a caller can act on it.
+/**A failure, described so a caller can act on it. Clients act on the HTTP
+status and treat an unrecognized code by its status class, so codes can
+be added without breaking them. Retry after a 503 or a 408, waiting for
+Retry-After when present, and stop on 401 and 403.
+
+| Code | Status | Meaning |
+|---|---|---|
+| invalid_csr | 400 | The signing request does not parse or verify. |
+| invalid_site_name | 400 | The site name is not a DNS label. |
+| invalid_token_ttl | 400 | The token lifetime is out of range. |
+| missing_grid_network | 400 | The token request names no grid. |
+| unauthorized | 401 | No grid-admin credential, or one not accepted. |
+| invalid_token | 401 | The site token is unknown, spent, or expired. |
+| identity_required | 401 | Rotation needs the site's current grid certificate. |
+| forbidden | 403 | The grid-admin may not perform the action. |
+| identity_refused | 403 | The record does not admit this certificate, or the site is frozen. |
+| not_found | 404 | No such token or enrollment. |
+| timeout | 408 | The request ran past the server's limit. |
+| name_taken | 409 | Another enrollment holds the site name. |
+| reserved_site | 409 | The name is the enrollment bootstrap's. |
+| internal | 500 | The service could not complete the request. |
+| rotation_disabled | 503 | Rotation is turned off for the grid. Issued certificates stay valid. |
+*/
 #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug, Eq, PartialEq)]
 pub struct Error {
-    ///Machine-readable code.
-    pub error: ::std::string::String,
+    ///Machine-readable code, from the table above.
+    pub error: ErrorError,
     ///What went wrong, and what would fix it.
     pub message: ::std::string::String,
+}
+///Machine-readable code, from the table above.
+#[derive(
+    ::serde::Deserialize,
+    ::serde::Serialize,
+    Clone,
+    Copy,
+    Debug,
+    Eq,
+    Hash,
+    Ord,
+    PartialEq,
+    PartialOrd
+)]
+pub enum ErrorError {
+    #[serde(rename = "invalid_csr")]
+    InvalidCsr,
+    #[serde(rename = "invalid_site_name")]
+    InvalidSiteName,
+    #[serde(rename = "invalid_token_ttl")]
+    InvalidTokenTtl,
+    #[serde(rename = "missing_grid_network")]
+    MissingGridNetwork,
+    #[serde(rename = "unauthorized")]
+    Unauthorized,
+    #[serde(rename = "invalid_token")]
+    InvalidToken,
+    #[serde(rename = "identity_required")]
+    IdentityRequired,
+    #[serde(rename = "forbidden")]
+    Forbidden,
+    #[serde(rename = "identity_refused")]
+    IdentityRefused,
+    #[serde(rename = "not_found")]
+    NotFound,
+    #[serde(rename = "timeout")]
+    Timeout,
+    #[serde(rename = "name_taken")]
+    NameTaken,
+    #[serde(rename = "reserved_site")]
+    ReservedSite,
+    #[serde(rename = "internal")]
+    Internal,
+    #[serde(rename = "rotation_disabled")]
+    RotationDisabled,
+}
+impl ::std::fmt::Display for ErrorError {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        match *self {
+            Self::InvalidCsr => f.write_str("invalid_csr"),
+            Self::InvalidSiteName => f.write_str("invalid_site_name"),
+            Self::InvalidTokenTtl => f.write_str("invalid_token_ttl"),
+            Self::MissingGridNetwork => f.write_str("missing_grid_network"),
+            Self::Unauthorized => f.write_str("unauthorized"),
+            Self::InvalidToken => f.write_str("invalid_token"),
+            Self::IdentityRequired => f.write_str("identity_required"),
+            Self::Forbidden => f.write_str("forbidden"),
+            Self::IdentityRefused => f.write_str("identity_refused"),
+            Self::NotFound => f.write_str("not_found"),
+            Self::Timeout => f.write_str("timeout"),
+            Self::NameTaken => f.write_str("name_taken"),
+            Self::ReservedSite => f.write_str("reserved_site"),
+            Self::Internal => f.write_str("internal"),
+            Self::RotationDisabled => f.write_str("rotation_disabled"),
+        }
+    }
+}
+impl ::std::str::FromStr for ErrorError {
+    type Err = self::error::ConversionError;
+    fn from_str(
+        value: &str,
+    ) -> ::std::result::Result<Self, self::error::ConversionError> {
+        match value {
+            "invalid_csr" => Ok(Self::InvalidCsr),
+            "invalid_site_name" => Ok(Self::InvalidSiteName),
+            "invalid_token_ttl" => Ok(Self::InvalidTokenTtl),
+            "missing_grid_network" => Ok(Self::MissingGridNetwork),
+            "unauthorized" => Ok(Self::Unauthorized),
+            "invalid_token" => Ok(Self::InvalidToken),
+            "identity_required" => Ok(Self::IdentityRequired),
+            "forbidden" => Ok(Self::Forbidden),
+            "identity_refused" => Ok(Self::IdentityRefused),
+            "not_found" => Ok(Self::NotFound),
+            "timeout" => Ok(Self::Timeout),
+            "name_taken" => Ok(Self::NameTaken),
+            "reserved_site" => Ok(Self::ReservedSite),
+            "internal" => Ok(Self::Internal),
+            "rotation_disabled" => Ok(Self::RotationDisabled),
+            _ => Err("invalid value".into()),
+        }
+    }
+}
+impl ::std::convert::TryFrom<&str> for ErrorError {
+    type Error = self::error::ConversionError;
+    fn try_from(
+        value: &str,
+    ) -> ::std::result::Result<Self, self::error::ConversionError> {
+        value.parse()
+    }
+}
+impl ::std::convert::TryFrom<::std::string::String> for ErrorError {
+    type Error = self::error::ConversionError;
+    fn try_from(
+        value: ::std::string::String,
+    ) -> ::std::result::Result<Self, self::error::ConversionError> {
+        value.parse()
+    }
 }
 /// Error types.
 pub mod error {

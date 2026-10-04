@@ -276,8 +276,8 @@ roleRef:
 
 Add one `RoleBinding` per namespace referenced by
 `GatewayRef.namespace`, `tls.caSecretRef.namespace`,
-`tls.siteSecretRef.namespace`, `tls.swimKeyRef.namespace`,
-and `auth.secretRef.namespace` in your CRD specs.
+`tls.caConfigMapRef.namespace`, `tls.siteSecretRef.namespace`,
+`tls.swimKeyRef.namespace`, and `auth.secretRef.namespace` in your CRD specs.
 
 ### Deployment configuration
 
