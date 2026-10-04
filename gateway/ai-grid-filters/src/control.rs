@@ -317,8 +317,26 @@ where
 /// A change detector over every identity file `config` names: the grid CA,
 /// client certificate, and key. Not a security function.
 ///
-/// Each file is hashed on its own, so no buffer holds the concatenated key.
+/// A rotation swaps the files at once but they are read one by one, so a pass
+/// that straddles the swap mixes versions. Read until two passes agree.
 fn identity_digest(config: &GridServingConfig) -> [u8; 32] {
+    let mut last = read_identity(config);
+    for _ in 0..IDENTITY_READS {
+        let next = read_identity(config);
+        if next == last {
+            break;
+        }
+        last = next;
+    }
+    last
+}
+
+/// Passes [`identity_digest`] makes after the first; a rotation tears at most one.
+const IDENTITY_READS: usize = 3;
+
+/// One pass over the identity files. Each file is hashed on its own, so no
+/// buffer holds the concatenated key.
+fn read_identity(config: &GridServingConfig) -> [u8; 32] {
     let paths: std::collections::BTreeSet<&str> = config
         .peers
         .iter()
@@ -618,6 +636,51 @@ mod tests {
 
     fn sites(snapshot: &RouteSnapshot) -> Vec<String> {
         snapshot.candidates.iter().map(|c| c.site.to_string()).collect()
+    }
+
+    /// A `Secret` or `ConfigMap` volume: each file resolves through `..data`, which
+    /// `write` swaps in one rename, as the kubelet does.
+    struct Mount {
+        dir: PathBuf,
+        generation: usize,
+    }
+
+    impl Mount {
+        fn new(name: &str, files: &[(&str, &str)]) -> Self {
+            let dir = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+            let _stale = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("dir");
+            let mut mount = Self { dir, generation: 0 };
+            mount.write(files);
+            mount
+        }
+
+        fn path(&self, name: &str) -> String {
+            self.dir.join(name).to_string_lossy().into_owned()
+        }
+
+        /// Publish `files` together; earlier files are dropped, as in a new Secret version.
+        fn write(&mut self, files: &[(&str, &str)]) {
+            self.generation = self.generation.saturating_add(1);
+            let version = format!("..{}", self.generation);
+            std::fs::create_dir(self.dir.join(&version)).expect("version dir");
+            for (name, content) in files {
+                std::fs::write(self.dir.join(&version).join(name), content).expect("write");
+                let link = self.dir.join(name);
+                if std::fs::symlink_metadata(&link).is_err() {
+                    std::os::unix::fs::symlink(format!("..data/{name}"), &link).expect("file link");
+                }
+            }
+            let staged = self.dir.join("..data_tmp");
+            std::os::unix::fs::symlink(&version, &staged).expect("data link");
+            std::fs::rename(&staged, self.dir.join("..data")).expect("swap");
+        }
+    }
+
+    impl Drop for Mount {
+        fn drop(&mut self) {
+            let _removed = std::fs::remove_dir_all(&self.dir);
+        }
     }
 
     fn front(snapshot: &ArcSwap<RouteSnapshot>) -> Option<String> {
@@ -1102,6 +1165,46 @@ mod tests {
 
         drop(grid);
         std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn an_identity_read_during_a_rotation_sees_one_version() {
+        let old = [("ca.pem", "ca"), ("tls.crt", "old"), ("tls.key", "old")];
+        let new = [("ca.pem", "ca"), ("tls.crt", "new"), ("tls.key", "new")];
+        let mut identity = Mount::new("grid-torn", &old);
+        let mut serving = config(&["east"]);
+        serving.peers[0].grid_ca_path = identity.path("ca.pem");
+        serving.peers[0].client_cert_path = identity.path("tls.crt");
+        serving.peers[0].client_key_path = identity.path("tls.key");
+        let old_digest = identity_digest(&serving);
+        identity.write(&new);
+        let new_digest = identity_digest(&serving);
+
+        // Each swap waits for two reads after the last, so no read spans two swaps,
+        // however long the reader stalls. A real rotation is hours apart.
+        let reads = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&reads);
+        let rotating = std::thread::spawn(move || {
+            for round in 0..40 {
+                let after = counted.load(Ordering::SeqCst).saturating_add(2);
+                let deadline = Instant::now().checked_add(Duration::from_secs(5)).expect("deadline");
+                while counted.load(Ordering::SeqCst) < after && Instant::now() < deadline {
+                    std::thread::yield_now();
+                }
+                identity.write(if round % 2 == 0 { &old } else { &new });
+            }
+            identity
+        });
+        while !rotating.is_finished() {
+            let digest = identity_digest(&serving);
+            assert!(
+                digest == old_digest || digest == new_digest,
+                "read {} mixed two versions of the identity",
+                reads.load(Ordering::SeqCst)
+            );
+            reads.fetch_add(1, Ordering::SeqCst);
+        }
+        drop(rotating.join().expect("rotation"));
     }
 
     #[test]
