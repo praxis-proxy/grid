@@ -12,7 +12,10 @@ Completions, Anthropic Messages, and Responses. It hashes the prompt in 256-byte
 tool definitions with their keys sorted, each message's role and text, and tool call names
 and arguments. Each image, audio, video, or file part counts as one fixed digest, by
 vLLM's `uuid` when the part has one. It ignores reasoning, generation parameters, and field
-order. A `cache_salt` gives its own keys, and so does each model. A body it cannot read,
+order. A tool list, tool call arguments, or other JSON value over 16 KiB keys by a digest
+of its bytes as sent rather than in canonical form. The gateway reads arrays one element at
+a time and stops once it has every key, so keying a body takes about its own size in memory
+at most. A `cache_salt` gives its own keys, and so does each model. A body it cannot read,
 token arrays, or a part type it does not know gets no keys and routes on load alone. The
 gateway does not tokenize.
 

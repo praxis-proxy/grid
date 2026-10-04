@@ -32,6 +32,7 @@ foldhash = "0.2"
 bytes = "1"
 
 [dev-dependencies]
+dhat = "0.3"
 # The flow tests bind a mock TLS peer to drive the real scrape path.
 tokio = { version = "1", features = ["macros", "net", "rt", "rt-multi-thread", "io-util", "time"] }
 tokio-rustls = "0.26"

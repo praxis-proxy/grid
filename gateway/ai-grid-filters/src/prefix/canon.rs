@@ -5,9 +5,12 @@
 //! parameters and field order do not, so turns of one conversation share a head.
 //! A part, block or item of a type not listed here gives the request no key.
 
-use std::{borrow::Cow, io::Write as _};
+use std::{borrow::Cow, io::Write as _, marker::PhantomData};
 
-use serde::Deserialize;
+use serde::{
+    Deserialize, Deserializer as _,
+    de::{IgnoredAny, SeqAccess, Visitor},
+};
 use serde_json::value::RawValue;
 use xxhash_rust::xxh64::xxh64;
 
@@ -18,6 +21,13 @@ const FIELD: u8 = 0x1F;
 
 /// Seeds the digest of a media part, apart from the chain's seeds.
 const MEDIA: u64 = 0x6D65_6469_615F_7631;
+
+/// Seeds the digest of a JSON value too large for canonical form.
+const LARGE: u64 = 0x6C61_7267_655F_7631;
+
+/// Largest JSON value put in canonical form. A larger one is keyed by a digest of
+/// its bytes as sent, since a parsed tree costs many times its size in memory.
+const CANONICAL_LIMIT: usize = 16 << 10;
 
 /// Prefix of an Anthropic system block that changes on every request.
 const BILLING_HEADER: &str = "x-anthropic-billing-header";
@@ -41,9 +51,9 @@ fn chat(request: &ChatCompletion<'_>, chain: impl FnOnce(Option<&str>) -> Chain)
     out.json(b"chat_template_kwargs", request.chat_template_kwargs)?;
     out.json(b"documents", request.documents)?;
     out.json(b"tools", request.tools)?;
-    for message in &request.messages {
-        out.chat_message(message)?;
-    }
+    out.each(request.messages, |out, message: ChatMessage<'_>| {
+        out.chat_message(&message)
+    })?;
     Some(out.0)
 }
 
@@ -62,9 +72,9 @@ fn messages(request: &Anthropic<'_>, chain: impl FnOnce(Option<&str>) -> Chain) 
     if let Some(system) = request.system {
         out.anthropic_content(b"system", system, true)?;
     }
-    for message in &request.messages {
-        out.anthropic_content(message.role.as_bytes(), message.content, false)?;
-    }
+    out.each(request.messages, |out, message: AnthropicMessage<'_>| {
+        out.anthropic_content(message.role.as_bytes(), message.content, false)
+    })?;
     Some(out.0)
 }
 
@@ -86,6 +96,40 @@ fn responses(request: &Responses<'_>, chain: impl FnOnce(Option<&str>) -> Chain)
 /// The stream writer over a chain.
 struct Out(Chain);
 
+/// Writes each element of a JSON array as it is read, so the array is never held whole.
+struct Each<'out, T, F> {
+    /// The stream.
+    out: &'out mut Out,
+    /// Writes one element; `None` when the element gives the request no key.
+    write: F,
+    /// The element type.
+    item: PhantomData<T>,
+}
+
+impl<'de, T: Deserialize<'de>, F: FnMut(&mut Out, T) -> Option<()>> Visitor<'de> for Each<'_, T, F> {
+    type Value = Option<()>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("an array")
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(mut self, mut seq: A) -> Result<Self::Value, A::Error> {
+        let mut written = Some(());
+        while !self.out.full() {
+            let Some(item) = seq.next_element::<T>()? else {
+                return Ok(written);
+            };
+            written = (self.write)(self.out, item);
+            if written.is_none() {
+                break;
+            }
+        }
+        // The rest is read past without being kept.
+        while seq.next_element::<IgnoredAny>()?.is_some() {}
+        Ok(written)
+    }
+}
+
 impl Out {
     /// A tagged JSON string as sent, escapes included, so nothing is decoded or copied.
     fn text(&mut self, tag: &[u8], text: &RawValue) {
@@ -97,11 +141,38 @@ impl Out {
         self.field(tag, &xxh64(content.get().as_bytes(), MEDIA).to_be_bytes());
     }
 
-    /// A tagged JSON value with sorted keys and no whitespace. `None` when it does not parse.
+    /// Whether every key is taken, so the rest of the prompt changes nothing.
+    fn full(&self) -> bool {
+        self.0.full()
+    }
+
+    /// Write each element of the array `raw` with `write`, one at a time, until
+    /// the chain is full. `None` when it is not an array of `T` or `write` says so.
+    fn each<'body, T: Deserialize<'body>>(
+        &mut self,
+        raw: &'body RawValue,
+        write: impl FnMut(&mut Self, T) -> Option<()>,
+    ) -> Option<()> {
+        let mut reader = serde_json::Deserializer::from_str(raw.get());
+        reader
+            .deserialize_seq(Each {
+                out: self,
+                write,
+                item: PhantomData,
+            })
+            .ok()?
+    }
+
+    /// A tagged JSON value with sorted keys and no whitespace, or a digest of its
+    /// bytes past [`CANONICAL_LIMIT`]. `None` when it does not parse.
     fn json(&mut self, tag: &[u8], value: Option<&RawValue>) -> Option<()> {
-        let Some(value) = value else {
+        let Some(value) = value.filter(|_| !self.full()) else {
             return Some(());
         };
+        if value.get().len() > CANONICAL_LIMIT {
+            self.field(tag, &xxh64(value.get().as_bytes(), LARGE).to_be_bytes());
+            return Some(());
+        }
         let value: serde_json::Value = serde_json::from_str(value.get()).ok()?;
         self.raw(tag);
         self.raw(&[FIELD]);
@@ -112,9 +183,12 @@ impl Out {
 
     /// Tool call arguments: canonical when they are JSON, else the string as sent.
     fn arguments(&mut self, arguments: Option<&RawValue>) {
-        let Some(arguments) = arguments else {
+        let Some(arguments) = arguments.filter(|_| !self.full()) else {
             return;
         };
+        if arguments.get().len() > CANONICAL_LIMIT {
+            return self.text(b"arguments", arguments);
+        }
         let parsed = serde_json::from_str::<Cow<'_, str>>(arguments.get())
             .ok()
             .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
@@ -190,19 +264,20 @@ impl Out {
             match kind(content) {
                 Kind::String => self.text(b"text", content),
                 Kind::Array => {
-                    for part in serde_json::from_str::<Vec<ChatPart<'_>>>(content.get()).ok()? {
-                        self.chat_part(&part)?;
-                    }
+                    self.each(content, |out, part: ChatPart<'_>| out.chat_part(&part))?;
                 },
                 Kind::Null => {},
                 Kind::Other => return None,
             }
         }
-        for call in message.tool_calls.iter().flatten() {
-            if let Some(function) = &call.function {
-                self.field(b"tool_call", function.name.as_bytes());
-                self.arguments(function.arguments);
-            }
+        if let Some(calls) = message.tool_calls {
+            self.each(calls, |out, call: ToolCall<'_>| {
+                if let Some(function) = &call.function {
+                    out.field(b"tool_call", function.name.as_bytes());
+                    out.arguments(function.arguments);
+                }
+                Some(())
+            })?;
         }
         Some(())
     }
@@ -238,9 +313,7 @@ impl Out {
         match kind(content) {
             Kind::String => self.text(b"text", content),
             Kind::Array => {
-                for block in serde_json::from_str::<Vec<Block<'_>>>(content.get()).ok()? {
-                    self.anthropic_block(&block, system)?;
-                }
+                self.each(content, |out, block: Block<'_>| out.anthropic_block(&block, system))?;
             },
             Kind::Null => {},
             Kind::Other => return None,
@@ -288,9 +361,7 @@ impl Out {
                 self.text(b"text", input);
             },
             Kind::Array => {
-                for item in serde_json::from_str::<Vec<Item<'_>>>(input.get()).ok()? {
-                    self.responses_item(&item)?;
-                }
+                self.each(input, |out, item: Item<'_>| out.responses_item(&item))?;
             },
             Kind::Null | Kind::Other => return None,
         }
@@ -323,9 +394,7 @@ impl Out {
         match kind(content) {
             Kind::String => self.text(b"text", content),
             Kind::Array => {
-                for part in serde_json::from_str::<Vec<ResponsesPart<'_>>>(content.get()).ok()? {
-                    self.responses_part(&part)?;
-                }
+                self.each(content, |out, part: ResponsesPart<'_>| out.responses_part(&part))?;
             },
             Kind::Null => {},
             Kind::Other => return None,
@@ -382,9 +451,10 @@ fn single_string(prompt: Option<&RawValue>) -> Option<&RawValue> {
     let prompt = prompt?;
     match kind(prompt) {
         Kind::String => Some(prompt),
-        Kind::Array => match serde_json::from_str::<Vec<&RawValue>>(prompt.get()).ok()?.as_slice() {
-            [one] => matches!(kind(one), Kind::String).then_some(*one),
-            _ => None,
+        // A one-tuple refuses a longer array at its second element, so a token array is never held.
+        Kind::Array => {
+            let (one,) = serde_json::from_str::<(&RawValue,)>(prompt.get()).ok()?;
+            matches!(kind(one), Kind::String).then_some(one)
         },
         Kind::Null | Kind::Other => None,
     }
@@ -395,7 +465,7 @@ fn single_string(prompt: Option<&RawValue>) -> Option<&RawValue> {
 struct ChatCompletion<'body> {
     /// The conversation.
     #[serde(borrow)]
-    messages: Vec<ChatMessage<'body>>,
+    messages: &'body RawValue,
     /// Tool definitions, keyed in canonical form.
     #[serde(borrow, default)]
     tools: Option<&'body RawValue>,
@@ -424,7 +494,7 @@ struct ChatMessage<'body> {
     content: Option<&'body RawValue>,
     /// The assistant's tool calls.
     #[serde(borrow, default)]
-    tool_calls: Option<Vec<ToolCall<'body>>>,
+    tool_calls: Option<&'body RawValue>,
 }
 
 /// One assistant tool call.
@@ -524,7 +594,7 @@ struct Completion<'body> {
 struct Anthropic<'body> {
     /// The conversation.
     #[serde(borrow)]
-    messages: Vec<AnthropicMessage<'body>>,
+    messages: &'body RawValue,
     /// A string or text blocks.
     #[serde(borrow, default)]
     system: Option<&'body RawValue>,
@@ -691,6 +761,21 @@ mod tests {
             messages.push(json!({"role": "assistant", "content": format!("answer {turn} ").repeat(30)}));
         }
         json!({"model": "llama", "messages": messages})
+    }
+
+    #[test]
+    fn a_value_past_the_canonical_limit_keys_by_its_bytes() {
+        let tools =
+            |name: &str| json!([{"type": "function", "function": {"name": name, "description": "x".repeat(20_000)}}]);
+        let body = |name: &str| json!({"tools": tools(name), "messages": [{"role": "system", "content": system()}]});
+        let first = keys(Api::ChatCompletions, &body("a"));
+        assert!(!first.is_empty());
+        assert_eq!(
+            first,
+            keys(Api::ChatCompletions, &body("a")),
+            "the same bytes, the same keys"
+        );
+        assert_ne!(first, keys(Api::ChatCompletions, &body("b")), "other bytes, other keys");
     }
 
     #[test]

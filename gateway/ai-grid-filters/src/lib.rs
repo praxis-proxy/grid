@@ -30,6 +30,16 @@ pub use prefix::{AffinitySettings, PrefixAffinity};
 pub use serving::{GridRuntime, GridServingConfig, PeerServingConfig, load_serving_config, spawn_grid_routing};
 pub use snapshot::RouteSnapshot;
 
+/// The number of prefix keys `body` yields for a request to `path`, for the
+/// peak-memory test; not an API.
+#[doc(hidden)]
+#[must_use]
+pub fn prefix_key_count(path: &str, body: &[u8]) -> usize {
+    prefix::Api::from_path(path)
+        .and_then(|api| prefix::prefix_keys(api, body))
+        .map_or(0, |keys| keys.as_slice().len())
+}
+
 /// Register `grid_site_route` into `registry` over a shared snapshot the gateway
 /// owns and its refresh loop swaps.
 ///
