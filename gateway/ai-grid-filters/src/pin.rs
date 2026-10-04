@@ -156,11 +156,13 @@ fn span(body: &[u8], token: &RawValue) -> Option<std::ops::Range<usize>> {
     (end <= body.len()).then_some(start..end)
 }
 
-/// Tags every stored-state id in a JSON or SSE response body, chunk by chunk.
+/// Tags the stored-state ids of a JSON or SSE response body, chunk by chunk.
 ///
-/// A small JSON scanner follows strings and keys across chunks, and tags a value
-/// only when its key is one of [`ID_KEYS`] and it starts with a stored-state
-/// prefix. Text a model generates is never an id key's value, so it is left alone.
+/// A small JSON scanner follows strings, keys and nesting across chunks. It tags
+/// a value only when its key is one of [`ID_KEYS`], it starts with a stored-state
+/// prefix, and it sits in the response's own object: the top level, a `response`
+/// envelope in it, or a `conversation` object in either. Ids in metadata, tools,
+/// input or output, and text a model generates, are left alone.
 #[derive(Debug)]
 pub(crate) struct Tagger {
     /// `<site>.`, inserted after the prefix.
@@ -177,7 +179,14 @@ pub(crate) struct Tagger {
     key: Option<Vec<u8>>,
     /// Bytes held back from the previous chunk.
     held: Vec<u8>,
+    /// Open objects and arrays.
+    depth: usize,
+    /// The open containers that are the response's own, outermost first, as a count.
+    own_depth: usize,
 }
+
+/// Keys whose object value is still the response's own.
+const OWN_KEYS: [&[u8]; 2] = [b"response", b"conversation"];
 
 /// The longest key worth remembering, the longest of [`ID_KEYS`].
 const KEY_LIMIT: usize = 20;
@@ -195,6 +204,29 @@ impl Tagger {
             current: Vec::new(),
             key: None,
             held: Vec::new(),
+            depth: 0,
+            own_depth: 0,
+        }
+    }
+
+    /// Follow an object or array opening or closing outside a string.
+    fn nest(&mut self, byte: u8) {
+        match byte {
+            b'{' | b'[' => {
+                let named = self.last == b':' && self.key.as_deref().is_some_and(|key| OWN_KEYS.contains(&key));
+                let own = self.depth == 0 || (self.own_depth == self.depth && named);
+                self.depth = self.depth.saturating_add(1);
+                if own {
+                    self.own_depth = self.depth;
+                }
+            },
+            b'}' | b']' => {
+                if self.own_depth == self.depth {
+                    self.own_depth = self.own_depth.saturating_sub(1);
+                }
+                self.depth = self.depth.saturating_sub(1);
+            },
+            _ => {},
         }
     }
 
@@ -221,6 +253,7 @@ impl Tagger {
             if self.in_string {
                 self.string_byte(byte);
             } else if !byte.is_ascii_whitespace() {
+                self.nest(byte);
                 self.last = byte;
             }
             out.push(byte);
@@ -263,7 +296,8 @@ impl Tagger {
 
     /// What to do with a string that opens before `after`.
     fn open(&self, after: &[u8], end: bool) -> Open {
-        let is_id_value = self.last == b':' && self.key.as_deref().is_some_and(|key| ID_KEYS.contains(&key));
+        let own = self.depth > 0 && self.own_depth == self.depth;
+        let is_id_value = own && self.last == b':' && self.key.as_deref().is_some_and(|key| ID_KEYS.contains(&key));
         if !is_id_value {
             return Open::Plain;
         }
@@ -316,6 +350,11 @@ mod tests {
         assert_eq!(
             untag("conv_west.c1").map(|pinned| pinned.upstream),
             Some("conv_c1".to_owned())
+        );
+        // Site names are DNS labels, so the first period ends the site and the id keeps the rest.
+        assert_eq!(
+            untag("resp_east.a.b.c").map(|pinned| (pinned.site, pinned.upstream)),
+            Some(("east", "resp_a.b.c".to_owned()))
         );
         for untagged in ["resp_abc123", "msg_east.abc", "resp_.abc", "resp_east.", "abc"] {
             assert_eq!(untag(untagged), None, "{untagged}");
@@ -408,6 +447,25 @@ mod tests {
         assert!(tagged.contains(r#""text":"conv_r""#), "{tagged}");
         assert!(tagged.contains(r#""response":{"id":"resp_west.a1"}"#), "{tagged}");
         assert_eq!(tagged.matches("\n\n").count(), 2);
+    }
+
+    #[test]
+    fn only_the_responses_own_ids_are_tagged() {
+        let body = br#"{"id":"resp_a1","metadata":{"id":"resp_m","conversation":"conv_m"},"tools":[{"id":"resp_t"}],"input":[{"previous_response_id":"resp_i"}],"conversation":{"id":"conv_c1","metadata":{"id":"conv_n"}}}"#;
+        let want = r#"{"id":"resp_east.a1","metadata":{"id":"resp_m","conversation":"conv_m"},"tools":[{"id":"resp_t"}],"input":[{"previous_response_id":"resp_i"}],"conversation":{"id":"conv_east.c1","metadata":{"id":"conv_n"}}}"#;
+        for split in 1..body.len() {
+            assert_eq!(tag_all("east", body, split), want, "split every {split} bytes");
+        }
+        let event = b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_a1\",\"metadata\":{\"id\":\"resp_m\"}}}\n\ndata: {\"id\":\"resp_b2\"}\n\n";
+        let tagged = tag_all("east", event, 4);
+        assert!(
+            tagged.contains(r#""response":{"id":"resp_east.a1","metadata":{"id":"resp_m"}}"#),
+            "{tagged}"
+        );
+        assert!(
+            tagged.contains(r#"{"id":"resp_east.b2"}"#),
+            "each event starts at the top: {tagged}"
+        );
     }
 
     #[test]

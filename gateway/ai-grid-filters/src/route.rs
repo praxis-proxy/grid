@@ -204,25 +204,32 @@ impl GridSiteRouteFilter {
     /// Confirm or withdraw the recorded prefix by the response status, and start
     /// tagging a Responses API answer's ids with the site that served it.
     fn settle(&self, ctx: &mut HttpFilterContext<'_>) {
-        let status = ctx.response_header.as_deref().map(|response| response.status);
-        let success = status.is_some_and(|status| status.is_success());
-        let refused =
-            status.is_some_and(|status| status == http::StatusCode::TOO_MANY_REQUESTS || status.is_server_error());
+        let head = ctx.response_header.as_deref();
+        let success = head.is_some_and(|response| response.status.is_success());
+        // A 429 can be one tenant's quota, so only a server error speaks for the site.
+        let failed = head.is_some_and(|response| response.status.is_server_error());
+        // A compressed body cannot be scanned, so only an identity body is tagged.
+        let identity = head.is_some_and(|response| {
+            response
+                .headers
+                .get(http::header::CONTENT_ENCODING)
+                .is_none_or(|encoding| encoding.as_bytes().eq_ignore_ascii_case(b"identity"))
+        });
         let Some(state) = ctx.get_filter_state_mut::<RouteState>() else {
             return;
         };
         // A success means the site took the request, not that it cached the prompt yet:
-        // headers can precede scheduling. A site that refused or failed loses the prefix.
+        // headers can precede scheduling. A site that failed loses the prefix.
         if let Some((keys, cluster)) = state.recorded.take() {
             if success {
                 self.affinity.index.confirm(&keys, &cluster);
-            } else if refused {
+            } else if failed {
                 self.affinity.index.evict(&keys, &cluster);
             } else {
                 self.affinity.index.forget(&keys, &cluster);
             }
         }
-        let tag = (state.responses && success)
+        let tag = (state.responses && success && identity)
             .then(|| state.site.as_ref().map(|site| Tagger::new(site)))
             .flatten();
         let tagging = tag.is_some();
