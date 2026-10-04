@@ -294,7 +294,9 @@ praxisConfig:
         prefixAffinity: {}
 
 # -- CA bundle for backend TLS without a per-cluster CA. Empty secretName keeps the system
-# trust store. `render` writes upstream_ca_file; with `byo`, set runtime.upstream_ca_file in
+# trust store. A configured bundle replaces system trust roots; include public and
+# private roots when both are needed. Per-cluster CAs override this bundle.
+# `render` writes upstream_ca_file; with `byo`, set runtime.upstream_ca_file in
 # your praxis.yaml. Not supported with `operator`.
 upstreamCA:
   # -- Secret holding the CA bundle. Empty turns upstreamCA off.
