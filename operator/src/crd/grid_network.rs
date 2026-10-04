@@ -1495,6 +1495,107 @@ mod tests {
     }
 
     #[test]
+    fn legacy_gateway_fields_deserialize_into_current_fields() -> Result<(), serde_json::Error> {
+        let spec: GridNetworkSpec = serde_json::from_value(legacy_spec_json())?;
+        assert_eq!(
+            spec.consumer_gateways.len(),
+            1,
+            "gatewayRefs must populate consumerGateways"
+        );
+        let gateway = spec.consumer_gateways.first().unwrap_or_else(|| std::process::abort());
+        assert_eq!(gateway.name, "consumer-gw", "the legacy gateway name must be preserved");
+        assert_eq!(
+            gateway.namespace, "praxis-system",
+            "the legacy gateway namespace must be preserved"
+        );
+        assert_eq!(
+            gateway.site_name.as_deref(),
+            Some("cluster-east"),
+            "localSiteName must populate siteName"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_praxis_fields_deserialize_into_current_fields() -> Result<(), serde_json::Error> {
+        let spec: GridNetworkSpec = serde_json::from_value(legacy_spec_json())?;
+        let gateway = spec.consumer_gateways.first().unwrap_or_else(|| std::process::abort());
+        let praxis = gateway.praxis_config.as_ref().unwrap_or_else(|| std::process::abort());
+        assert!(
+            praxis.generate,
+            "consumerConfig.enabled must populate praxisConfig.generate"
+        );
+        assert_eq!(
+            praxis.credential_mount_path, "/run/secrets/legacy-provider",
+            "credentialMountBase must populate credentialMountPath"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_swim_key_deserializes_into_current_field() -> Result<(), serde_json::Error> {
+        let spec: GridNetworkSpec = serde_json::from_value(legacy_spec_json())?;
+        let swim_key = spec
+            .tls
+            .swim_key_secret_ref
+            .as_ref()
+            .unwrap_or_else(|| std::process::abort());
+        assert_eq!(
+            swim_key.name, "legacy-swim-key",
+            "swimKeyRef must populate swimKeySecretRef"
+        );
+        assert_eq!(
+            swim_key.namespace, "praxis-system",
+            "the legacy Secret namespace must be preserved"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_spec_serializes_with_current_field_names() -> Result<(), serde_json::Error> {
+        let spec: GridNetworkSpec = serde_json::from_value(legacy_spec_json())?;
+        let serialized = serde_json::to_value(&spec)?;
+        assert!(
+            serialized.get("gatewayRefs").is_none(),
+            "serialization must omit legacy gatewayRefs"
+        );
+        assert_eq!(
+            serialized.pointer("/consumerGateways/0/praxisConfig/generate"),
+            Some(&serde_json::Value::Bool(true)),
+            "serialization must use the current nested field names"
+        );
+        assert_eq!(
+            serialized
+                .pointer("/tls/swimKeySecretRef/name")
+                .and_then(serde_json::Value::as_str),
+            Some("legacy-swim-key"),
+            "serialization must use swimKeySecretRef"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_and_current_spec_fields_are_rejected_together() -> Result<(), Box<dyn std::error::Error>> {
+        for (pointer, legacy, current) in legacy_alias_pairs() {
+            let mut input = legacy_spec_json();
+            let object = input
+                .pointer_mut(pointer)
+                .and_then(serde_json::Value::as_object_mut)
+                .unwrap_or_else(|| std::process::abort());
+            let value = object.get(legacy).cloned().unwrap_or_else(|| std::process::abort());
+            object.insert(current.to_owned(), value);
+            let error = serde_json::from_value::<GridNetworkSpec>(input)
+                .err()
+                .ok_or_else(|| format!("{legacy} and {current} must not be accepted together"))?;
+            assert!(
+                error.to_string().contains("duplicate field"),
+                "{legacy} must fail due to duplicate names: {error}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn gateway_ref_local_site_name_round_trips() {
         let json = serde_json::json!({
             "name": "gw-east",
@@ -3023,5 +3124,45 @@ mod tests {
             0.5,
             "spend_ratio via resolve_budget_statuses",
         );
+    }
+    // ---------------------------------------------------------------------------
+    // Test Utilities
+    // ---------------------------------------------------------------------------
+
+    /// Legacy input with non-default values for the renamed `GridNetwork` spec fields.
+    fn legacy_spec_json() -> serde_json::Value {
+        serde_json::json!({
+            "gridId": "",
+            "seeds": [],
+            "gatewayRefs": [{
+                "name": "consumer-gw",
+                "namespace": "praxis-system",
+                "localSiteName": "cluster-east",
+                "consumerConfig": {
+                    "enabled": true,
+                    "credentialMountBase": "/run/secrets/legacy-provider"
+                }
+            }],
+            "swim": {},
+            "tls": {
+                "swimKeyRef": { "name": "legacy-swim-key", "namespace": "praxis-system" }
+            }
+        })
+    }
+
+    /// Legacy spec objects and their mutually exclusive field names.
+    fn legacy_alias_pairs() -> [(&'static str, &'static str, &'static str); 6] {
+        [
+            ("", "gatewayRefs", "consumerGateways"),
+            ("/gatewayRefs/0", "localSiteName", "siteName"),
+            ("/gatewayRefs/0", "consumerConfig", "praxisConfig"),
+            ("/gatewayRefs/0/consumerConfig", "enabled", "generate"),
+            (
+                "/gatewayRefs/0/consumerConfig",
+                "credentialMountBase",
+                "credentialMountPath",
+            ),
+            ("/tls", "swimKeyRef", "swimKeySecretRef"),
+        ]
     }
 }
