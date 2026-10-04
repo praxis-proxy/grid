@@ -254,11 +254,12 @@ gatewayConfig:
   # -- Inbound TLS on the gateway listener. The default posture assumes an inbound TLS
   # front (an OpenShift Route or a Gateway) terminates TLS and forwards to this plaintext
   # listener. Enable to terminate TLS at the gateway itself from a mounted server cert
-  # (tls.crt/tls.key in the Secret). Works with render and with a BYO config, which must
+  # (tls.crt/tls.key in the Secret). Works with render consumers and BYO, which must
   # reference mountPath (a BYO config moving off tls.enabled must change its listener
   # cert paths to it). Enabling it names the container port https. On OpenShift, set
   # service.annotations service.beta.openshift.io/serving-cert-secret-name to the Secret
   # name and the service CA issues the cert.
+  # Render providers use tls.existingSecret and reject gatewayConfig.listenerTls.enabled.
   listenerTls:
     # -- Terminate TLS at the gateway listener instead of at an inbound front.
     enabled: false

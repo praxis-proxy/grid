@@ -337,7 +337,7 @@ mod tests {
     #[test]
     fn a_service_without_a_load_balancer_type_is_its_own_outcome() {
         let typed = |kind: &str, svc: Service| Service {
-            spec: Some(k8s_openapi::api::core::v1::ServiceSpec {
+            spec: Some(ServiceSpec {
                 type_: Some(kind.to_owned()),
                 ..Default::default()
             }),
@@ -363,6 +363,7 @@ mod tests {
         );
     }
 
+    /// Build a Service with a declared port for discovery precedence tests.
     fn svc_with_port(port: i32) -> Service {
         Service {
             spec: Some(ServiceSpec {
@@ -483,27 +484,45 @@ mod tests {
 
     #[test]
     fn port_and_interval_default() {
-        assert!(matches!(parse_gateway(&[]), Ok(g) if g.port.is_none() && g.discovery_interval_ms == 5000));
+        assert!(
+            matches!(parse_gateway(&[]), Ok(g) if g.port.is_none() && g.discovery_interval_ms == 5000),
+            "an unset port permits Service discovery and the poll interval defaults to 5000 ms"
+        );
     }
 
     #[test]
     fn valid_port_accepted() {
-        assert!(matches!(parse_gateway(&["--gateway-port", "443"]), Ok(g) if g.port == Some(443)));
+        assert!(
+            matches!(parse_gateway(&["--gateway-port", "443"]), Ok(g) if g.port == Some(443)),
+            "an explicit gateway port is preserved"
+        );
     }
 
     #[test]
     fn service_port_is_used_when_no_override_is_set() {
-        assert_eq!(gateway_port(&svc_with_port(8443), None), 8443);
+        assert_eq!(
+            gateway_port(&svc_with_port(8443), None),
+            8443,
+            "the Service port is used when no override is set"
+        );
     }
 
     #[test]
     fn configured_port_overrides_service_port() {
-        assert_eq!(gateway_port(&svc_with_port(8443), Some(8080)), 8080);
+        assert_eq!(
+            gateway_port(&svc_with_port(8443), Some(8080)),
+            8080,
+            "the explicit gateway port takes precedence over the Service port"
+        );
     }
 
     #[test]
     fn missing_service_port_uses_compatibility_default() {
-        assert_eq!(gateway_port(&svc_no_status(), None), 8080);
+        assert_eq!(
+            gateway_port(&svc_no_status(), None),
+            8080,
+            "a Service without a usable port falls back to 8080"
+        );
     }
 
     #[test]
@@ -590,19 +609,23 @@ mod tests {
 
     #[test]
     fn discovery_enabled_by_default() {
-        assert!(matches!(parse_gateway(&[]), Ok(g) if g.discovery_enabled));
+        assert!(
+            matches!(parse_gateway(&[]), Ok(g) if g.discovery_enabled),
+            "gateway discovery remains enabled by default"
+        );
     }
 
     #[test]
     fn discovery_can_be_disabled() {
-        assert!(matches!(
-            parse_gateway(&["--gateway-discovery-enabled", "false"]),
-            Ok(g) if !g.discovery_enabled
-        ));
+        assert!(
+            matches!(
+                parse_gateway(&["--gateway-discovery-enabled", "false"]),
+                Ok(g) if !g.discovery_enabled
+            ),
+            "the explicit false flag disables gateway discovery"
+        );
     }
 
-    // Use a child process so this test can set the environment without affecting
-    // other tests running in parallel.
     #[test]
     fn discovery_environment_can_be_disabled() -> Result<(), Box<dyn std::error::Error>> {
         let status = std::process::Command::new(std::env::current_exe()?)
@@ -618,7 +641,10 @@ mod tests {
         if std::env::var("GRID_GATEWAY_DISCOVERY_ENABLED").ok().as_deref() != Some("false") {
             return;
         }
-        assert!(matches!(parse_gateway(&[]), Ok(g) if !g.discovery_enabled));
+        assert!(
+            matches!(parse_gateway(&[]), Ok(g) if !g.discovery_enabled),
+            "GRID_GATEWAY_DISCOVERY_ENABLED=false disables discovery without a flag"
+        );
     }
 
     #[test]

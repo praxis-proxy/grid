@@ -229,7 +229,7 @@ Praxis AI image; these values may advance independently.
 | `networkPolicy.enabled` | bool | `false` | Render a NetworkPolicy that limits which pods can reach the listener port, where the CNI enforces NetworkPolicy. It is not authentication. Node and host-network traffic handling is CNI-specific (OVN-Kubernetes: the `policy-group.network.openshift.io/host-network` label), and a LoadBalancer with `externalTrafficPolicy: Cluster` can SNAT clients to node IPs. |
 | `networkPolicy.from` | list | `[]` | NetworkPolicyPeer entries allowed in. Required when enabled. With `auth.mode: none`, list only the authenticating front. `{podSelector: {}}` admits every pod in this namespace. An empty `namespaceSelector` and an `ipBlock` of `0.0.0.0/0` or `::/0` admit everyone and fail the render. An all-address `ipBlock` with `except` entries is allowed. The check reads selector emptiness and the cidr only, so `matchExpressions` that happen to select every pod pass. A provider gateway behind a LoadBalancer that SNATs clients to node IPs needs `ipBlock` peers for those node addresses. |
 | `gatewayConfig.upstreamCA.secretName` | string | `""` | CA bundle for backend TLS without a per-cluster CA (`upstream_ca_file`). |
-| `gatewayConfig.listenerTls.enabled` | bool | `false` | Terminate TLS at the listener from `existingSecret`, in render or BYO mode. Names the port `https`. The cert mounts at `listenerTls.mountPath` (`/etc/praxis/listener-tls`), so a BYO config moving off `tls.enabled` must point its listener `cert_path`/`key_path` there. On OpenShift, annotate the Service with `service.beta.openshift.io/serving-cert-secret-name`. |
+| `gatewayConfig.listenerTls.enabled` | bool | `false` | Terminate TLS at the listener from `existingSecret`, in render consumer or BYO mode. Render providers reject this setting and use `tls.existingSecret` for listener TLS. Names the port `https`. The cert mounts at `listenerTls.mountPath` (`/etc/praxis/listener-tls`), so a BYO config moving off `tls.enabled` must point its listener `cert_path`/`key_path` there. On OpenShift, annotate the Service with `service.beta.openshift.io/serving-cert-secret-name`. |
 | `port.containerPort` | int | `8080` | Container port. |
 | `port.name` | string | `""` | Port name. Empty: `https` with `gatewayConfig.listenerTls.enabled`, else `http`. |
 | `port.protocol` | string | `TCP` | Port protocol. |
@@ -366,10 +366,13 @@ AGN runs this chart in two roles with different values:
 
 ### Resource names for the AGN Operator
 
-The chart's fullname template produces `{release}-praxis-gateway` by
-default (e.g., release `provider-gateway` → Service name
-`provider-gateway-praxis-gateway`). Set `fullnameOverride` to control
-the exact Service name:
+A Grid gateway (a provider or a consumer with site backends) uses its Helm
+release name as the Service name by default. A provider release named
+`provider-gateway` therefore creates Service `provider-gateway`.
+
+Other releases use `{release}-praxis-gateway` unless the release name already
+contains `praxis-gateway`. Set `fullnameOverride` to control the exact Service
+name:
 
 ```yaml
 fullnameOverride: provider-gateway   # Service name = provider-gateway
@@ -391,7 +394,9 @@ candidate cluster (the provider's `routingClusterRef`, else its name).
 A `grid-gateway` built from the current source re-reads `serving-config.json`
 every five seconds after the kubelet updates the mounted ConfigMap. It applies
 candidate, peer, address, and pin changes without a pod restart. Invalid updates
-keep the last accepted topology and pollers. Check gateway logs and
+keep the last accepted serving settings and topology. Changes to mounted
+identity files can still restart signals pollers using those accepted settings.
+Check gateway logs and
 `grid_serving_config_reload_total{result="applied"}` for acceptance; the
 `grid.praxis.fast/serving-digest` annotation records publication, not acceptance.
 
