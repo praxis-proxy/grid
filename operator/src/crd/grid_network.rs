@@ -187,7 +187,7 @@ pub enum SignalMode {
 ///
 /// A property of the grid, not of one operator: every site propagates the same
 /// way. Absent, the grid gossips, which is non-breaking. A mode change takes
-/// effect at operator start, so flipping it is an operator restart.
+/// effect at operator start, so the operator restarts itself when it flips.
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]

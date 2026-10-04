@@ -27,7 +27,8 @@ use crate::{
     crd::{
         grid_network::{
             ConsumerConfig, ConsumerConfigPhase, ConsumerConfigStatus, GatewayRef, GridNetwork, GridNetworkPhase,
-            GridNetworkStatus, OverlayPhase, OverlayRevisionStatus, SignalMode, TenantBudgetStatus, TransportMode,
+            GridNetworkStatus, OverlayPhase, OverlayRevisionStatus, PeerTrustMode, SignalMode, TenantBudgetStatus,
+            TransportMode,
         },
         grid_site::{GridSite, GridSitePhase, GridSiteStatus},
         inference_provider::InferenceProvider,
@@ -127,13 +128,53 @@ pub struct OperatorCtx {
     membership_ready: std::sync::atomic::AtomicBool,
 }
 
+/// Grid-wide modes, fixed for the life of the process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GridModes {
+    /// Signal propagation.
+    pub signal: SignalMode,
+    /// Peer authorization on the signals path.
+    pub trust: PeerTrustMode,
+}
+
+impl GridModes {
+    /// Without a `GridNetwork`: SPIFFE trust in the Grid CA identity, never an implicit pin.
+    pub const WITHOUT_NETWORK: Self = Self {
+        signal: SignalMode::Gossip,
+        trust: PeerTrustMode::Spiffe,
+    };
+
+    /// The modes `network` declares, defaults for absent fields.
+    #[must_use]
+    pub fn of(network: &GridNetwork) -> Self {
+        Self {
+            signal: network
+                .spec
+                .signal_transport
+                .as_ref()
+                .map(|t| t.mode)
+                .unwrap_or_default(),
+            trust: network.spec.peer_trust.as_ref().map(|t| t.mode).unwrap_or_default(),
+        }
+    }
+
+    /// The modes to restart into when `network` declares other than `self`, the running modes.
+    #[must_use]
+    pub fn restart_for(self, network: Option<&GridNetwork>) -> Option<Self> {
+        // Only the poll path reads trust, so a trust change under gossip needs no restart.
+        network.map(Self::of).filter(|declared| {
+            declared.signal != self.signal || (declared.signal == SignalMode::Poll && declared.trust != self.trust)
+        })
+    }
+}
+
 /// Peer addressing and trust, resolved once at startup.
 #[derive(Clone, Debug)]
 pub struct PeerSettings {
     /// This site's own signals endpoint, for its gateway.
     pub local_signals_addr: Option<String>,
     /// How peers prove their identity.
-    pub trust: signals::PeerTrustMode,
+    pub trust: PeerTrustMode,
     /// Port dialed for a peer that gossips no signals endpoint.
     pub peer_port: u16,
 }
@@ -142,7 +183,7 @@ impl Default for PeerSettings {
     fn default() -> Self {
         Self {
             local_signals_addr: None,
-            trust: signals::PeerTrustMode::default(),
+            trust: PeerTrustMode::default(),
             peer_port: signals::DEFAULT_PEER_PORT,
         }
     }
@@ -310,9 +351,9 @@ async fn register_peers(ctx: &OperatorCtx, client: &Client) -> Result<(), Operat
 /// another site's name. The labels are the local object's for the same reason.
 fn peer_identities(
     sites: &[GridSite],
-    trust: signals::PeerTrustMode,
+    trust: PeerTrustMode,
 ) -> std::collections::BTreeMap<String, signals::PeerRecord> {
-    let pinned = trust == signals::PeerTrustMode::Pin;
+    let pinned = trust == PeerTrustMode::Pin;
     let mut ranked = std::collections::BTreeMap::<String, ((bool, bool), signals::PeerRecord)>::new();
     for site in sites {
         let Some((key, enrolled)) = peer_site_key(site) else {
@@ -620,30 +661,21 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
 
     info!(name, "reconciling GridNetwork");
 
-    // Mode is resolved once at start and never re-resolved live, so warn on a
-    // spec-versus-running divergence rather than diverge silently.
-    let desired = network
-        .spec
-        .signal_transport
-        .as_ref()
-        .map(|t| t.mode)
-        .unwrap_or_default();
-    if desired != ctx.signal_mode {
-        tracing::warn!(
-            network = name,
-            ?desired,
-            running = ?ctx.signal_mode,
-            "signalTransport.mode differs from the mode resolved at startup; restart the operator to apply"
+    // Modes are fixed at startup, so a change restarts the pod to apply it.
+    let running = GridModes {
+        signal: ctx.signal_mode,
+        trust: ctx.peer_settings.trust,
+    };
+    if let Some(next) = running.restart_for(Some(&network)) {
+        tracing::info!(
+            "GridNetwork {name} sets signalTransport={:?} peerTrust={:?}; running {:?}/{:?}; restarting to apply",
+            next.signal,
+            next.trust,
+            running.signal,
+            running.trust
         );
-    }
-    let desired_trust = network.spec.peer_trust.as_ref().map(|t| t.mode).unwrap_or_default();
-    if desired_trust != ctx.peer_settings.trust {
-        tracing::warn!(
-            network = name,
-            desired = ?desired_trust,
-            running = ?ctx.peer_settings.trust,
-            "peerTrust.mode differs from the mode resolved at startup; restart the operator to apply"
-        );
+        #[expect(clippy::exit, reason = "modes apply only at startup; Kubernetes restarts the pod")]
+        std::process::exit(0);
     }
 
     let client = &ctx.client;
@@ -3164,6 +3196,65 @@ fn parse_metrics_refresh_interval(value: &str) -> Result<Duration, OperatorError
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn network_with_modes(spec: &serde_json::Value) -> GridNetwork {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "grid.praxis.fast/v1alpha1",
+            "kind": "GridNetwork",
+            "metadata": {"name": "grid"},
+            "spec": spec,
+        }))
+        .unwrap_or_else(|_| std::process::abort())
+    }
+
+    #[test]
+    fn modes_restart_only_when_a_grid_network_declares_others() {
+        let running = GridModes::WITHOUT_NETWORK;
+        assert_eq!(running.restart_for(None), None, "no GridNetwork, no restart");
+
+        let same = network_with_modes(&serde_json::json!({"peerTrust": {"mode": "spiffe"}}));
+        assert_eq!(running.restart_for(Some(&same)), None, "same modes, no restart");
+
+        let poll = network_with_modes(&serde_json::json!({
+            "peerTrust": {"mode": "spiffe"},
+            "signalTransport": {"mode": "poll"},
+        }));
+        assert_eq!(
+            running.restart_for(Some(&poll)),
+            Some(GridModes {
+                signal: SignalMode::Poll,
+                trust: PeerTrustMode::Spiffe,
+            })
+        );
+        assert_eq!(
+            GridModes::of(&poll).restart_for(Some(&poll)),
+            None,
+            "the restarted process runs what it declares, so it never loops"
+        );
+    }
+
+    #[test]
+    fn a_trust_change_restarts_only_under_poll() {
+        let pin = network_with_modes(&serde_json::json!({"peerTrust": {"mode": "pin"}}));
+        assert_eq!(
+            GridModes::WITHOUT_NETWORK.restart_for(Some(&pin)),
+            None,
+            "gossip reads no trust, so a fresh install declaring pin does not restart"
+        );
+        let poll = network_with_modes(&serde_json::json!({
+            "peerTrust": {"mode": "spiffe"},
+            "signalTransport": {"mode": "poll"},
+        }));
+        let poll_pin = network_with_modes(&serde_json::json!({
+            "peerTrust": {"mode": "pin"},
+            "signalTransport": {"mode": "poll"},
+        }));
+        assert_eq!(
+            GridModes::of(&poll).restart_for(Some(&poll_pin)),
+            Some(GridModes::of(&poll_pin)),
+            "under poll a trust change restarts"
+        );
+    }
     use crate::swim_endpoint::EndpointResolutionFailure;
 
     fn seed_addr(value: &str) -> SocketAddr {
@@ -4405,7 +4496,7 @@ mod tests {
     #[test]
     fn peer_identities_keys_auto_discovered_by_site_id_annotation() {
         let sites = [peer_grid_site("net-remote", Some("remote"), &["pin-a"])];
-        let identities = peer_identities(&sites, signals::PeerTrustMode::Pin);
+        let identities = peer_identities(&sites, PeerTrustMode::Pin);
         assert!(
             identities.contains_key("remote"),
             "keyed by the bare site_id annotation"
@@ -4419,7 +4510,7 @@ mod tests {
     #[test]
     fn peer_identities_falls_back_to_name_for_local_site() {
         let sites = [peer_grid_site("site-a", None, &["pin-a"])];
-        let identities = peer_identities(&sites, signals::PeerTrustMode::Pin);
+        let identities = peer_identities(&sites, PeerTrustMode::Pin);
         assert!(
             identities.contains_key("site-a"),
             "a bare-named site falls back to metadata.name"
@@ -4429,7 +4520,7 @@ mod tests {
     #[test]
     fn peer_identities_blank_annotation_falls_back_to_name() {
         let sites = [peer_grid_site("site-a", Some("   "), &["pin-a"])];
-        let identities = peer_identities(&sites, signals::PeerTrustMode::Pin);
+        let identities = peer_identities(&sites, PeerTrustMode::Pin);
         assert!(
             identities.contains_key("site-a"),
             "a blank annotation is ignored, name is used"
@@ -4443,7 +4534,7 @@ mod tests {
         let empty = peer_grid_site("net-remote", Some("remote"), &[]);
         let pinned = peer_grid_site("remote", None, &["pin-a"]);
         for order in [vec![empty.clone(), pinned.clone()], vec![pinned, empty]] {
-            let identities = peer_identities(&order, signals::PeerTrustMode::Pin);
+            let identities = peer_identities(&order, PeerTrustMode::Pin);
             let record = identities.get("remote").unwrap_or_else(|| std::process::abort());
             assert_eq!(
                 record.pins,
@@ -4459,7 +4550,7 @@ mod tests {
         // path looked it up by the bare site_id and found nothing.
         let sites = [peer_grid_site("net-remote", Some("remote"), &["pin-a"])];
         let identities = signals::PeerIdentities::new();
-        identities.set(peer_identities(&sites, signals::PeerTrustMode::Pin));
+        identities.set(peer_identities(&sites, PeerTrustMode::Pin));
         assert!(
             !identities.refuses("remote"),
             "the poll path reaches the peer by its bare site_id"
@@ -4477,7 +4568,7 @@ mod tests {
         // is now keyed correctly.
         let sites = [peer_grid_site("net-remote", Some("remote"), &[])];
         let identities = signals::PeerIdentities::new();
-        identities.set(peer_identities(&sites, signals::PeerTrustMode::Pin));
+        identities.set(peer_identities(&sites, PeerTrustMode::Pin));
         assert!(
             identities.refuses("remote"),
             "an un-pinned peer stays refused (membership != trust)"
@@ -4489,7 +4580,7 @@ mod tests {
         let stub = peer_grid_site("net-remote", Some("remote"), &["pin-a"]);
         let enrolled = peer_grid_site("remote", None, &[]);
         for order in [vec![stub.clone(), enrolled.clone()], vec![enrolled, stub]] {
-            let identities = peer_identities(&order, signals::PeerTrustMode::Pin);
+            let identities = peer_identities(&order, PeerTrustMode::Pin);
             let record = identities.get("remote").unwrap_or_else(|| std::process::abort());
             assert_eq!(record.pins, vec!["pin-a".to_owned()]);
         }
@@ -4534,8 +4625,8 @@ mod tests {
         let victim = peer_grid_site("victim", None, &[]);
         assert_eq!(peer_site_key(&impostor), Some(("impostor".to_owned(), true)));
         for (trust, order) in [
-            (signals::PeerTrustMode::Pin, vec![impostor.clone(), victim.clone()]),
-            (signals::PeerTrustMode::Spiffe, vec![victim, impostor]),
+            (PeerTrustMode::Pin, vec![impostor.clone(), victim.clone()]),
+            (PeerTrustMode::Spiffe, vec![victim, impostor]),
         ] {
             let identities = peer_identities(&order, trust);
             let record = identities.get("victim").unwrap_or_else(|| std::process::abort());
@@ -4560,7 +4651,7 @@ mod tests {
     fn peer_identities_spiffe_keys_discovered_peer_by_bare_id() {
         let sites = [peer_grid_site("net-remote", Some("remote"), &["pin-a"])];
         let identities = signals::PeerIdentities::new();
-        identities.set(peer_identities(&sites, signals::PeerTrustMode::Spiffe));
+        identities.set(peer_identities(&sites, PeerTrustMode::Spiffe));
         assert!(
             identities.labels_for("remote").is_some(),
             "poll and serve find it by bare id"
@@ -4581,7 +4672,7 @@ mod tests {
             "enrolled".to_owned(),
         )]));
         for order in [vec![stub.clone(), enrolled.clone()], vec![enrolled, stub]] {
-            let identities = peer_identities(&order, signals::PeerTrustMode::Spiffe);
+            let identities = peer_identities(&order, PeerTrustMode::Spiffe);
             let record = identities.get("remote").unwrap_or_else(|| std::process::abort());
             assert_eq!(record.labels.get("from").map(String::as_str), Some("enrolled"));
         }

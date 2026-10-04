@@ -29,10 +29,11 @@ gridNetwork:
     mode: roundRobin
   # -- Grid-wide signal propagation mode: gossip (default) or poll. Omit for
   # gossip (SWIM and CRDT overlay). poll propagates by direct mTLS pull. The
-  # operator reads this once at startup, so a change needs an operator restart.
+  # operator applies it at startup and restarts itself when it changes.
   # signalTransport:
   #   mode: poll
-  # -- Grid-wide peer trust: pin (default) or spiffe. Read at operator start.
+  # -- Grid-wide peer trust: pin (default) or spiffe. The operator applies it at
+  # startup and, under poll, restarts itself when it changes.
   # peerTrust:
   #   mode: spiffe
 

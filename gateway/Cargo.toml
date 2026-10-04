@@ -317,7 +317,7 @@ tracing = "0.1.44"
 
 [dev-dependencies]
 # The reload test runs a real mTLS signals peer against the binary.
-certs = { path = "../certs", default-features = false, features = ["verifier", "rcgen"] }
+certs = { path = "../certs", default-features = false, features = ["verifier"] }
 rustls = { version = "0.23.45", features = ["ring"] }
 
 # machete can't see these: used as `praxis` / `praxis_core` / `praxis_filter`, not their package names.

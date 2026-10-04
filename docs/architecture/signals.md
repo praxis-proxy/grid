@@ -28,8 +28,10 @@ reachable signals endpoint.
 The field is optional. Absent, the grid gossips, so existing deployments are
 unaffected. The mode is read once at operator start, so changing it is a
 restart, not a live flip, which keeps the mTLS listener bound only under `poll`.
-While a `GridNetwork` spec and the resolved mode disagree, the reconcile warns
-and names both, so a fresh-install race is visible rather than silent.
+When a `GridNetwork` declares another mode than the running one, for example
+one created after the operator started, the operator exits so Kubernetes
+restarts it into the declared mode. Only the poll path reads peer trust, so a
+trust change under `gossip` does not restart it.
 
 At Tech Preview one operator serves one `GridNetwork`, and it fails to start on
 more than one rather than pick a mode for the process-global serve and poll

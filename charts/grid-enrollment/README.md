@@ -85,6 +85,12 @@ Each override takes a Secret reference, so no key material is inlined in values.
 
 Each `invites` entry (`siteName`, `gridNetworkRef`, optional `expiresInSecs` up to 604800) has a post-install and post-upgrade Job mint a one-time site token into Secret `grid-invite-<siteName>` (key `token`). The Job skips sites whose Secret already exists, so an upgrade mints only for new sites. Invites need `enrollment.authz=kube`. Before Helm 3.19, a failed invite run leaves its hook RBAC in place until the next run. [Site Enrollment](../../docs/installation/enrollment.md#invite-a-site-on-the-hub) covers delivery and revocation.
 
+## Hub site identity
+
+The hub hosts enrollment, so it cannot enroll itself. Set `hubSite.name` and the bootstrap Job issues the hub's site identity straight from the grid CA, with the same SPIFFE name, key usage, and lifetime an enrolled site receives. It writes Secret `grid-site-identity` and the CA Secret `grid-ca` to `hubSite.namespace`. It also creates the grid's 32-byte SWIM key once, as `hubSite.swimKeySecretName` (default `grid-swim-key`), in both the release namespace, where a delivery channel such as an ACM Policy can copy it to sites, and `hubSite.namespace`. In `hubSite.namespace` the Job holds only `create`, and `get`/`update` on those Secrets. Install the hub operator with `enrollment.enabled=false`. The chart does not create `hubSite.namespace`, since the hub operator's release owns it, so create it before installing this chart (`kubectl create namespace grid`); its hook RBAC fails otherwise. The enrollment service reserves the name too, refusing to mint or redeem a token for it, so no invite can issue a second identity for the hub.
+
+The identity is created once and never rotated, since peers pin its digest, and it expires like an enrolled one, after `enrollment.certLifetimeSecs`. The Job keeps an expired identity but fails on one issued to another name or by another CA. To re-issue it, delete the Secret before the next upgrade, or set `ca.forceRegenerate`, which re-issues every certificate. Do not also invite `hubSite.name`: the chart refuses it, because an invite would mint a second identity for the same name. A provided CA is refused too, since the Job has no signing key.
+
 ## Limitations
 
 The builtin Postgres serves TLS with a cert the bootstrap Job issues from the

@@ -250,3 +250,20 @@ Job reads, keys in sorted order.
 {{- $_ := set $v "invites" $list }}
 {{- end }}
 {{- end }}
+
+{{/*
+Refuse a hub site the chart cannot issue: a provided CA keeps the signing key out of
+reach, and an invite for the same name would mint a second identity for it.
+*/}}
+{{- define "grid-enrollment.validateHubSite" -}}
+{{- with .Values.hubSite.name }}
+{{- if eq (include "grid-enrollment.caProvided" $) "true" }}
+{{- fail "hubSite.name needs the bootstrap CA: a provided CA cannot issue the hub identity" }}
+{{- end }}
+{{- range $.Values.invites }}
+{{- if eq .siteName $.Values.hubSite.name }}
+{{- fail (printf "hubSite.name %q is also invited: the hub takes its identity from the CA, so drop its invite" .siteName) }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- end }}

@@ -3,7 +3,9 @@
 //! Mints or loads the Grid CA and issues the enrollment endpoint's serving
 //! certificate, then writes them as Kubernetes Secrets for a pre-install Job.
 //! Also creates the builtin Postgres credentials and the local grid-admin token
-//! table once, so the chart renders the same on every run.
+//! table once, so the chart renders the same on every run. With `--site-name` it
+//! issues that site's grid identity straight from the CA, for a hub that hosts
+//! enrollment and so cannot enroll itself.
 //! Compiled with the `bootstrap` feature, on by default.
 //!
 //! Key separation is deliberate: the signing key lives only in the CA-key Secret
@@ -80,6 +82,22 @@ struct BootstrapArgs {
     /// Secret for the local grid-admin token table, created once with a generated token.
     #[arg(long)]
     admin_tokens_secret: Option<String>,
+    /// Site to issue a grid identity for, as enrollment would, created once.
+    #[arg(long)]
+    site_name: Option<String>,
+    /// Namespace the site identity and its CA Secret go to.
+    #[arg(long, default_value = "grid")]
+    site_namespace: String,
+    /// Secret for the site identity (`tls.crt`, `tls.key`).
+    #[arg(long, default_value = "grid-site-identity")]
+    site_secret: String,
+    /// Secret for the grid CA (`ca.crt`) beside the site identity.
+    #[arg(long, default_value = "grid-ca")]
+    site_ca_secret: String,
+    /// Secret for the grid's SWIM key (`key`, 32 bytes), created once and copied to
+    /// `--site-namespace` when `--site-name` is set.
+    #[arg(long)]
+    swim_key_secret: Option<String>,
 }
 
 /// Run the `bootstrap` subcommand.
@@ -106,15 +124,18 @@ async fn bootstrap(args: &BootstrapArgs) -> Result<(), BoxError> {
         .or_else(|| std::env::var("POD_NAMESPACE").ok())
         .unwrap_or_else(|| "default".to_owned());
 
+    check_site_args(args)?;
     let client = kube::Client::try_default().await?;
     let secrets: Api<Secret> = Api::namespaced(client.clone(), &namespace);
 
     ensure_credentials(&secrets, args).await?;
+    Box::pin(ensure_swim_key(&client, &secrets, args)).await?;
     if args.skip_ca {
         return Ok(());
     }
     let ca = resolve_ca(&secrets, args).await?;
     write_opaque_secret(&secrets, &args.ca_bundle_secret, "ca.crt", &ca.cert_pem).await?;
+    Box::pin(ensure_site_identity(&client, &ca, args)).await?;
     if !args.skip_serving {
         ensure_serving(&secrets, &ca, args).await?;
     }
@@ -123,6 +144,100 @@ async fn bootstrap(args: &BootstrapArgs) -> Result<(), BoxError> {
         args.db_deployment.as_deref(),
     ) {
         Box::pin(reconcile_db_roll(client, &namespace, deployment, &fingerprint)).await?;
+    }
+    Ok(())
+}
+
+/// Length of a SWIM key, the operator's `SwimKey`.
+const SWIM_KEY_LEN: usize = 32;
+
+/// Create the SWIM key once, then copy that same key beside the site identity.
+async fn ensure_swim_key(
+    client: &kube::Client,
+    secrets: &kube::api::Api<k8s_openapi::api::core::v1::Secret>,
+    args: &BootstrapArgs,
+) -> Result<(), BoxError> {
+    let Some(name) = args.swim_key_secret.as_deref() else {
+        return Ok(());
+    };
+    let fresh = zeroize::Zeroizing::new(enrollment::api::random_bytes(SWIM_KEY_LEN)?);
+    let key = match Box::pin(create_key_secret(secrets, name, &fresh)).await? {
+        Some(existing) => existing,
+        None => fresh,
+    };
+    if key.len() != SWIM_KEY_LEN {
+        return Err(format!(
+            "Secret {name} holds a SWIM key of {} bytes, not {SWIM_KEY_LEN}",
+            key.len()
+        )
+        .into());
+    }
+    if args.site_name.is_some() {
+        let site_secrets = kube::api::Api::namespaced(client.clone(), &args.site_namespace);
+        if let Some(copy) = Box::pin(create_key_secret(&site_secrets, name, &key)).await?
+            && copy != key
+        {
+            return Err(format!(
+                "Secret {name} in {} holds a different SWIM key; delete one so both namespaces share it",
+                args.site_namespace
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+/// Create `name` with `key` unless it exists, returning the key it already held.
+async fn create_key_secret(
+    secrets: &kube::api::Api<k8s_openapi::api::core::v1::Secret>,
+    name: &str,
+    key: &[u8],
+) -> Result<Option<zeroize::Zeroizing<Vec<u8>>>, BoxError> {
+    use k8s_openapi::{ByteString, api::core::v1::Secret, apimachinery::pkg::apis::meta::v1::ObjectMeta};
+    use kube::api::PostParams;
+
+    let secret = Box::new(Secret {
+        metadata: ObjectMeta {
+            name: Some(name.to_owned()),
+            labels: Some(std::collections::BTreeMap::from([(
+                "app.kubernetes.io/managed-by".to_owned(),
+                MANAGED_BY.to_owned(),
+            )])),
+            ..ObjectMeta::default()
+        },
+        type_: Some("Opaque".to_owned()),
+        data: Some(std::collections::BTreeMap::from([(
+            "key".to_owned(),
+            ByteString(key.to_vec()),
+        )])),
+        ..Secret::default()
+    });
+    match secrets.create(&PostParams::default(), &secret).await {
+        Ok(_) => Ok(None),
+        Err(kube::Error::Api(response)) if response.code == 409 => Ok(Some(Box::pin(held_key(secrets, name)).await?)),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// The `key` an existing Secret holds, zeroizing whatever else it carries.
+async fn held_key(
+    secrets: &kube::api::Api<k8s_openapi::api::core::v1::Secret>,
+    name: &str,
+) -> Result<zeroize::Zeroizing<Vec<u8>>, BoxError> {
+    let mut data = secrets.get(name).await?.data.unwrap_or_default();
+    let held = data.remove("key").map(|bytes| bytes.0).unwrap_or_default();
+    for other in data.values_mut() {
+        zeroize::Zeroize::zeroize(&mut other.0);
+    }
+    Ok(zeroize::Zeroizing::new(held))
+}
+
+/// Refuse a bad `--site-name` before anything is written.
+fn check_site_args(args: &BootstrapArgs) -> Result<(), BoxError> {
+    let Some(site) = &args.site_name else { return Ok(()) };
+    certs::validate_site_name(site)?;
+    if args.skip_ca {
+        return Err("--site-name needs the bootstrap CA, not --skip-ca".into());
     }
     Ok(())
 }
@@ -190,6 +305,131 @@ fn argo_keep_patch() -> serde_json::Value {
 /// Whether `error` is a create that lost a race to another writer.
 fn is_conflict(error: &(dyn Error + Send + Sync + 'static)) -> bool {
     matches!(error.downcast_ref::<kube::Error>(), Some(kube::Error::Api(response)) if response.code == 409)
+}
+
+/// Issue the `--site-name` identity from the CA through the enrollment signing
+/// path, unless one exists.
+///
+/// Peers pin the leaf's digest, so an existing identity is kept, even an expired
+/// or unchained one, unless `--force-regenerate` is set.
+async fn ensure_site_identity(client: &kube::Client, ca: &certs::CaCert, args: &BootstrapArgs) -> Result<(), BoxError> {
+    let Some(site) = args.site_name.as_deref() else {
+        return Ok(());
+    };
+    let secrets = &kube::api::Api::namespaced(client.clone(), &args.site_namespace);
+    Box::pin(ensure_site_ca(
+        secrets,
+        &args.site_ca_secret,
+        &ca.cert_pem,
+        args.force_regenerate,
+    ))
+    .await?;
+    if !args.force_regenerate && Box::pin(kept_site_identity(secrets, ca, site, &args.site_secret)).await? {
+        return Ok(());
+    }
+    let (issued, key_pem) = issue_site_identity(ca, site, crate::load_cert_lifetime())?;
+    Box::pin(write_tls_secret(
+        secrets,
+        &args.site_secret,
+        &issued.cert_pem,
+        &key_pem,
+        args.force_regenerate,
+    ))
+    .await?;
+    log_issued(&issued, &args.site_secret);
+    Ok(())
+}
+
+/// Whether a site identity exists. One issued by this CA for `site` is kept, even
+/// expired, since re-issuing changes the pinned digest. Any other is refused.
+async fn kept_site_identity(
+    secrets: &kube::api::Api<k8s_openapi::api::core::v1::Secret>,
+    ca: &certs::CaCert,
+    site: &str,
+    name: &str,
+) -> Result<bool, BoxError> {
+    let Some(cert_pem) = secret_text(secrets, name, "tls.crt").await? else {
+        return Ok(false);
+    };
+    existing_identity_kept(&ca.cert_pem, &cert_pem, site)
+        .map_err(|reason| format!("Secret {name}: {reason}; delete it or set --force-regenerate to re-issue"))?;
+    Ok(true)
+}
+
+/// Keep an existing identity only if this CA issued it for `site`.
+fn existing_identity_kept(ca_cert_pem: &str, cert_pem: &str, site: &str) -> Result<(), String> {
+    match certs::verify_site_cert(ca_cert_pem, cert_pem, site) {
+        Ok(_) => Ok(()),
+        // Validity is checked after issuer and signature, so only the name is left to check.
+        Err(certs::VerifyError::NotCurrentlyValid) if names_site(cert_pem, site) => {
+            tracing::warn!(site, "keeping a site identity outside its validity period");
+            Ok(())
+        },
+        Err(reason) => Err(format!(
+            "it holds an identity that is not {site} from this grid CA ({reason})"
+        )),
+    }
+}
+
+/// Whether the certificate's primary DNS name is `site`'s.
+fn names_site(cert_pem: &str, site: &str) -> bool {
+    let primary = format!("{site}.{}", certs::SPIFFE_TRUST_DOMAIN);
+    certs::cert_dns_sans(cert_pem).is_ok_and(|names| names.contains(&primary))
+}
+
+/// Record an issued identity by name and key digest, the audit an enrollment row would hold.
+fn log_issued(issued: &certs::EnrolledCert, secret: &str) {
+    tracing::info!(
+        spiffe_id = %issued.spiffe_id,
+        public_key_sha256 = %issued.public_key_sha256,
+        secret,
+        "issued the site identity"
+    );
+}
+
+/// A fresh key and the leaf the enrollment service would sign for it.
+fn issue_site_identity(
+    ca: &certs::CaCert,
+    site: &str,
+    lifetime: time::Duration,
+) -> Result<(certs::EnrolledCert, zeroize::Zeroizing<String>), BoxError> {
+    let certs::GeneratedCsr { csr_pem, key_pem } = certs::generate_csr(site)?;
+    let issued = certs::sign_csr(ca, site, &csr_pem, certs::Validity::starting_now(lifetime))?;
+    Ok((issued, key_pem))
+}
+
+/// Create the site's grid CA Secret, refusing one that holds another CA.
+async fn ensure_site_ca(
+    secrets: &kube::api::Api<k8s_openapi::api::core::v1::Secret>,
+    name: &str,
+    ca_cert_pem: &str,
+    force: bool,
+) -> Result<(), BoxError> {
+    match Box::pin(secret_text(secrets, name, "ca.crt")).await? {
+        Some(bundle) if !force && !certs::bundle_within(ca_cert_pem, &bundle).unwrap_or(false) => Err(format!(
+            "Secret {name} holds a different grid CA; refusing to issue a site identity it would not anchor"
+        )
+        .into()),
+        Some(_) if !force => Ok(()),
+        _ => Box::pin(write_opaque_secret(secrets, name, "ca.crt", ca_cert_pem)).await,
+    }
+}
+
+/// One UTF-8 value of a Secret, or `None` when the Secret or key is absent.
+async fn secret_text(
+    secrets: &kube::api::Api<k8s_openapi::api::core::v1::Secret>,
+    name: &str,
+    key: &str,
+) -> Result<Option<String>, BoxError> {
+    let Some(secret) = secrets.get_opt(name).await? else {
+        return Ok(None);
+    };
+    let mut data = secret.data.unwrap_or_default();
+    let value = data.remove(key);
+    for other in data.values_mut() {
+        zeroize::Zeroize::zeroize(&mut other.0);
+    }
+    Ok(value.map(|bytes| String::from_utf8(bytes.0)).transpose()?)
 }
 
 /// Load the CA from its Secret, or generate and persist a fresh one.
@@ -546,9 +786,94 @@ mod tests {
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, OwnerReference};
 
     use super::{
-        BootstrapArgs, MANAGED_BY, ServingCert, admin_tokens, argo_keep_patch, db_credentials, foreign_manager,
-        needs_roll, roll_patch, serving_cert, serving_needs_issue,
+        BootstrapArgs, MANAGED_BY, ServingCert, admin_tokens, argo_keep_patch, db_credentials, ensure_swim_key,
+        existing_identity_kept, foreign_manager, issue_site_identity, needs_roll, roll_patch, serving_cert,
+        serving_needs_issue,
     };
+
+    #[test]
+    fn an_existing_identity_is_kept_only_for_this_ca_and_site() {
+        let ca = certs::generate_ca("grid-ca").expect("ca");
+        let other = certs::generate_ca("grid-ca").expect("other ca");
+        let lifetime = certs::DEFAULT_SITE_CERT_LIFETIME;
+        let (hub, _hub_key) = issue_site_identity(&ca, "hub", lifetime).expect("hub");
+        let (foreign, _foreign_key) = issue_site_identity(&other, "hub", lifetime).expect("foreign");
+
+        assert_eq!(
+            existing_identity_kept(&ca.cert_pem, &hub.cert_pem, "hub"),
+            Ok(()),
+            "valid identity"
+        );
+        assert!(
+            existing_identity_kept(&ca.cert_pem, &hub.cert_pem, "east").is_err(),
+            "renamed hub"
+        );
+        assert!(
+            existing_identity_kept(&ca.cert_pem, &foreign.cert_pem, "hub").is_err(),
+            "another CA"
+        );
+    }
+
+    #[test]
+    fn an_expired_identity_of_this_site_is_kept() {
+        let ca = certs::generate_ca("grid-ca").expect("ca");
+        let now = time::OffsetDateTime::now_utc();
+        let past = certs::Validity {
+            not_before: now - time::Duration::days(2),
+            not_after: now - time::Duration::days(1),
+        };
+        let csr = certs::generate_csr("hub").expect("csr");
+        let expired = certs::sign_csr(&ca, "hub", &csr.csr_pem, past).expect("sign");
+        assert_eq!(
+            existing_identity_kept(&ca.cert_pem, &expired.cert_pem, "hub"),
+            Ok(()),
+            "expired, same site"
+        );
+        assert!(
+            existing_identity_kept(&ca.cert_pem, &expired.cert_pem, "east").is_err(),
+            "expired, other site"
+        );
+    }
+
+    #[test]
+    fn site_identity_matches_an_enrolled_one() {
+        let ca = certs::generate_ca("grid-ca").expect("ca");
+        let (issued, key_pem) = issue_site_identity(&ca, "hub", certs::DEFAULT_SITE_CERT_LIFETIME).expect("issue");
+        certs::verify_site_cert(&ca.cert_pem, &issued.cert_pem, "hub").expect("verifies as site hub");
+        assert!(
+            certs::has_svid_profile(&issued.cert_pem).expect("parse"),
+            "X.509-SVID profile"
+        );
+        assert_eq!(issued.spiffe_id, certs::spiffe_id("hub"), "SPIFFE ID");
+        assert!(key_pem.contains("PRIVATE KEY"), "key returned");
+    }
+
+    #[test]
+    fn the_swim_key_is_opt_in_and_sized_for_the_operator() {
+        assert_eq!(BootstrapArgs::parse_from(["bootstrap"]).swim_key_secret, None);
+        let args = BootstrapArgs::parse_from(["bootstrap", "--swim-key-secret", "grid-swim-key"]);
+        assert_eq!(args.swim_key_secret.as_deref(), Some("grid-swim-key"));
+        assert_eq!(
+            enrollment::api::random_bytes(super::SWIM_KEY_LEN)
+                .expect("random")
+                .len(),
+            32
+        );
+    }
+
+    #[test]
+    fn site_flags_default_to_the_operator_secret_names() {
+        let args = BootstrapArgs::parse_from(["bootstrap", "--site-name", "hub"]);
+        assert_eq!(args.site_name.as_deref(), Some("hub"));
+        assert_eq!(
+            (
+                args.site_namespace.as_str(),
+                args.site_secret.as_str(),
+                args.site_ca_secret.as_str()
+            ),
+            ("grid", "grid-site-identity", "grid-ca")
+        );
+    }
 
     #[test]
     fn db_credentials_match_the_chart_connection_url() {
@@ -750,5 +1075,147 @@ mod tests {
         assert!(!needs_roll(Some("ab12"), "ab12"), "already serving it");
         assert!(needs_roll(Some("old"), "ab12"), "a new cert");
         assert!(needs_roll(None, "ab12"), "never stamped");
+    }
+
+    /// Secrets by namespace and name, served by [`fake_api`].
+    type Store = std::sync::Arc<std::sync::Mutex<BTreeMap<(String, String), k8s_openapi::api::core::v1::Secret>>>;
+
+    /// A Kubernetes API holding `store`: GET reads a Secret, POST creates one or answers 409.
+    fn fake_api(store: Store) -> kube::Client {
+        use http_body_util::BodyExt as _;
+
+        let service = tower::service_fn(move |req: axum::http::Request<kube::client::Body>| {
+            let store = std::sync::Arc::clone(&store);
+            async move {
+                let (parts, body) = req.into_parts();
+                let bytes = body.collect().await.expect("body").to_bytes();
+                let (code, value) = answer(&store, &parts.method, parts.uri.path(), &bytes);
+                let reply = kube::client::Body::from(serde_json::to_vec(&value).expect("json"));
+                Ok::<_, std::convert::Infallible>(
+                    axum::http::Response::builder()
+                        .status(code)
+                        .body(reply)
+                        .expect("response"),
+                )
+            }
+        });
+        kube::Client::new(service, "grid-enroll")
+    }
+
+    /// Serve one request on `/api/v1/namespaces/{namespace}/secrets[/{name}]`.
+    fn answer(store: &Store, method: &axum::http::Method, path: &str, body: &[u8]) -> (u16, serde_json::Value) {
+        let path: Vec<&str> = path.split('/').collect();
+        let namespace = path.get(4).copied().unwrap_or_default().to_owned();
+        let mut map = store.lock().expect("lock");
+        if method == axum::http::Method::POST {
+            let secret: k8s_openapi::api::core::v1::Secret = serde_json::from_slice(body).expect("secret");
+            let name = secret.metadata.name.clone().unwrap_or_default();
+            return match map.entry((namespace, name)) {
+                std::collections::btree_map::Entry::Occupied(_) => (409, failure(409, "AlreadyExists")),
+                std::collections::btree_map::Entry::Vacant(slot) => {
+                    (201, serde_json::to_value(slot.insert(secret)).expect("json"))
+                },
+            };
+        }
+        let name = path.get(6).copied().unwrap_or_default().to_owned();
+        map.get(&(namespace, name)).map_or_else(
+            || (404, failure(404, "NotFound")),
+            |secret| (200, serde_json::to_value(secret).expect("json")),
+        )
+    }
+
+    fn failure(code: u16, reason: &str) -> serde_json::Value {
+        serde_json::json!({"kind": "Status", "apiVersion": "v1", "status": "Failure", "reason": reason, "code": code})
+    }
+
+    fn put_key(store: &Store, namespace: &str, key: &[u8]) {
+        let secret = k8s_openapi::api::core::v1::Secret {
+            metadata: ObjectMeta {
+                name: Some("grid-swim-key".to_owned()),
+                ..ObjectMeta::default()
+            },
+            data: Some(BTreeMap::from([(
+                "key".to_owned(),
+                k8s_openapi::ByteString(key.to_vec()),
+            )])),
+            ..k8s_openapi::api::core::v1::Secret::default()
+        };
+        store
+            .lock()
+            .expect("lock")
+            .insert((namespace.to_owned(), "grid-swim-key".to_owned()), secret);
+    }
+
+    fn key_in(store: &Store, namespace: &str) -> Option<Vec<u8>> {
+        store
+            .lock()
+            .expect("lock")
+            .get(&(namespace.to_owned(), "grid-swim-key".to_owned()))?
+            .data
+            .as_ref()?
+            .get("key")
+            .map(|bytes| bytes.0.clone())
+    }
+
+    /// Run [`ensure_swim_key`] against `store` with `flags`.
+    async fn swim_key_run(store: &Store, flags: &[&str]) -> Result<(), super::BoxError> {
+        let args = BootstrapArgs::parse_from(["bootstrap", "--swim-key-secret", "grid-swim-key"].iter().chain(flags));
+        let client = fake_api(std::sync::Arc::clone(store));
+        let secrets = kube::api::Api::namespaced(client.clone(), "grid-enroll");
+        Box::pin(ensure_swim_key(&client, &secrets, &args)).await
+    }
+
+    const HUB: [&str; 2] = ["--site-name", "hub"];
+
+    #[tokio::test]
+    async fn the_swim_key_is_created_once_and_shared_with_the_hub() {
+        let store = Store::default();
+        swim_key_run(&store, &HUB).await.expect("first run");
+        let key = key_in(&store, "grid-enroll").expect("release namespace key");
+        assert_eq!(key.len(), 32, "sized for the operator");
+        assert_eq!(key_in(&store, "grid"), Some(key.clone()), "the hub gets the same key");
+        swim_key_run(&store, &HUB).await.expect("second run");
+        assert_eq!(
+            key_in(&store, "grid-enroll"),
+            Some(key.clone()),
+            "a rerun keeps the key"
+        );
+        assert_eq!(key_in(&store, "grid"), Some(key), "a rerun keeps the hub copy");
+    }
+
+    #[tokio::test]
+    async fn without_a_site_the_swim_key_stays_in_the_release_namespace() {
+        let store = Store::default();
+        swim_key_run(&store, &[]).await.expect("run");
+        assert!(key_in(&store, "grid-enroll").is_some(), "created");
+        assert_eq!(key_in(&store, "grid"), None, "no hub copy");
+    }
+
+    #[tokio::test]
+    async fn an_existing_swim_key_is_copied_to_the_hub() {
+        let store = Store::default();
+        put_key(&store, "grid-enroll", &[7; 32]);
+        swim_key_run(&store, &HUB).await.expect("run");
+        assert_eq!(key_in(&store, "grid-enroll"), Some(vec![7; 32]), "kept");
+        assert_eq!(key_in(&store, "grid"), Some(vec![7; 32]), "copied");
+    }
+
+    #[tokio::test]
+    async fn a_different_hub_swim_key_is_refused() {
+        let store = Store::default();
+        put_key(&store, "grid-enroll", &[7; 32]);
+        put_key(&store, "grid", &[8; 32]);
+        let error = swim_key_run(&store, &HUB).await.expect_err("conflict");
+        assert!(error.to_string().contains("different SWIM key"), "{error}");
+        assert_eq!(key_in(&store, "grid"), Some(vec![8; 32]), "neither key is replaced");
+    }
+
+    #[tokio::test]
+    async fn a_wrong_sized_swim_key_is_refused() {
+        let store = Store::default();
+        put_key(&store, "grid-enroll", &[7; 16]);
+        let error = swim_key_run(&store, &HUB).await.expect_err("short key");
+        assert!(error.to_string().contains("16 bytes"), "{error}");
+        assert_eq!(key_in(&store, "grid"), None, "a bad key is not copied");
     }
 }

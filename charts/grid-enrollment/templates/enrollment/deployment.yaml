@@ -88,6 +88,10 @@ spec:
             - name: ENROLLMENT_TOKEN_AUDIENCE
               value: {{ .Values.enrollment.tokenAudience | quote }}
             {{- end }}
+            {{- with .Values.hubSite.name }}
+            - name: ENROLLMENT_RESERVED_SITES
+              value: {{ . | quote }}
+            {{- end }}
             {{- if .Values.enrollment.certLifetimeSecs }}
             - name: ENROLLMENT_CERT_LIFETIME_SECS
               value: {{ .Values.enrollment.certLifetimeSecs | quote }}

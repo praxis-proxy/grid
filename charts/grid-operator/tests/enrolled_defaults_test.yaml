@@ -24,6 +24,12 @@ tests:
           content: { name: GRID_ENROLL_TOKEN_SECRET, value: grid-invite-hub }
       - contains:
           path: spec.template.spec.containers[0].env
+          content: { name: GRID_ENROLL_IDENTITY_SECRET, value: grid-site-identity }
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content: { name: GRID_ENROLL_CA_SECRET, value: grid-ca }
+      - contains:
+          path: spec.template.spec.containers[0].env
           content: { name: GRID_GATEWAY_SERVICE_NAME, value: grid-gateway }
 
   - it: enrollment brings a LoadBalancer SWIM Service

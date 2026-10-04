@@ -59,6 +59,14 @@ rules:
       - {{ include "grid-enrollment.adminTokensSecret" . | quote }}
       {{- end }}
     verbs: ["get", "update"]
+  {{- if and .Values.hubSite.name .Values.hubSite.swimKeySecretName }}
+  # The SWIM key is created once and only read back, never replaced.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames:
+      - {{ .Values.hubSite.swimKeySecretName | quote }}
+    verbs: ["get"]
+  {{- end }}
   {{- if or (include "grid-enrollment.generatesDbCredentials" .) (include "grid-enrollment.generatesAdminTokens" .) }}
   # patch marks the generated credentials so Argo CD never prunes them.
   - apiGroups: [""]
@@ -101,4 +109,58 @@ subjects:
   - kind: ServiceAccount
     name: {{ include "grid-enrollment.bootstrapServiceAccountName" . }}
     namespace: {{ .Release.Namespace }}
+{{- with .Values.hubSite.name }}
+{{- $name := printf "%s-hub-site" (include "grid-enrollment.bootstrapServiceAccountName" $) }}
+---
+{{- /* The hub identity lands in the operator namespace. create cannot be name-scoped, so for the hook's
+lifetime this SA can create any Secret there; it already holds the CA key, so that adds little. */}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $name }}
+  namespace: {{ $.Values.hubSite.namespace }}
+  labels:
+    {{- include "grid-enrollment.labels" $ | nindent 4 }}
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "-10"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded,hook-failed
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames:
+      - {{ $.Values.hubSite.identitySecretName | quote }}
+      - {{ $.Values.hubSite.caSecretName | quote }}
+    verbs: ["get", "update"]
+  {{- with $.Values.hubSite.swimKeySecretName }}
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames:
+      - {{ . | quote }}
+    verbs: ["get"]
+  {{- end }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $name }}
+  namespace: {{ $.Values.hubSite.namespace }}
+  labels:
+    {{- include "grid-enrollment.labels" $ | nindent 4 }}
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "-10"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded,hook-failed
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $name }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "grid-enrollment.bootstrapServiceAccountName" $ }}
+    namespace: {{ $.Release.Namespace }}
+{{- end }}
 {{- end }}

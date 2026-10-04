@@ -37,6 +37,7 @@ dependencies = [
  "http",
  "metrics",
  "praxis-proxy-filter",
+ "praxis-proxy-tls",
  "rustls",
  "serde",
  "tokio",
@@ -689,6 +690,7 @@ dependencies = [
 name = "certs"
 version = "0.1.4"
 dependencies = [
+ "openssl",
  "pem 4.0.0",
  "rcgen",
  "rustls",

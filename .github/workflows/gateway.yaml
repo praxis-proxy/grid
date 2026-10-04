@@ -74,6 +74,16 @@ jobs:
       - name: Machete (unused dependencies)
         run: cargo machete gateway
 
+      # The binary's TLS must come from the OpenSSL provider Praxis installs, so ring stays test-only.
+      # openssl-sys is the positive control: an empty or failed tree must not pass.
+      - name: No ring in the gateway binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          tree=$(cargo tree --manifest-path gateway/Cargo.toml -p gateway -e normal --target all --prefix none --format '{p}')
+          grep -q '^openssl-sys ' <<<"$tree" || { echo "positive control failed: openssl-sys is not in the tree"; exit 1; }
+          if grep '^ring ' <<<"$tree"; then echo "ring is in the gateway's normal dependency tree"; exit 1; fi
+
   # ----------------------------------------------------------------------------
   # Unit tests, gateway workspace
   # ----------------------------------------------------------------------------

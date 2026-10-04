@@ -17,6 +17,7 @@ use hyper_util::rt::TokioIo;
 use rustls::{
     ClientConfig,
     client::{Resumption, danger::ServerCertVerifier},
+    crypto::CryptoProvider,
     pki_types::{CertificateDer, PrivateKeyDer, ServerName},
 };
 use tokio::{net::TcpStream, time::timeout};
@@ -37,6 +38,9 @@ pub enum MtlsError {
     /// The rustls client config (protocol versions or client-auth cert) was invalid.
     #[error("tls client config: {0}")]
     TlsConfig(#[from] rustls::Error),
+    /// The process installed no rustls crypto provider to build the client on.
+    #[error("no rustls crypto provider installed")]
+    NoProvider,
 }
 
 /// Scrapes one peer's signals endpoint over grid mTLS, per poll.
@@ -72,7 +76,8 @@ impl PeerScraper {
     ///
     /// # Errors
     ///
-    /// [`MtlsError`] when the CA bundle or the client-auth material is invalid.
+    /// [`MtlsError`] when the CA bundle or the client-auth material is invalid, or
+    /// no process crypto provider is installed.
     #[expect(
         clippy::too_many_arguments,
         reason = "one connection's full identity plus addressing"
@@ -89,7 +94,8 @@ impl PeerScraper {
         connect_timeout: Duration,
         request_timeout: Duration,
     ) -> Result<Self, MtlsError> {
-        let provider = rustls::crypto::ring::default_provider();
+        // The process provider, so a FIPS gateway polls peers through its validated module.
+        let provider = CryptoProvider::get_default().ok_or(MtlsError::NoProvider)?;
         let algorithms = provider.signature_verification_algorithms;
         let verifier = GridSpiffeServerVerifier::new(grid_ca_pem, DEFAULT_TRUST_DOMAIN, algorithms)?;
         // The method form (not Arc::clone) so the unsized coercion to the trait
@@ -97,12 +103,14 @@ impl PeerScraper {
         #[expect(clippy::clone_on_ref_ptr, reason = "unsized coercion to dyn needs the method form")]
         let dyn_verifier: Arc<dyn ServerCertVerifier> = verifier.clone();
 
-        let mut config = ClientConfig::builder_with_provider(Arc::new(provider))
+        let mut config = ClientConfig::builder_with_provider(Arc::clone(provider))
             .with_safe_default_protocol_versions()?
             .dangerous()
             .with_custom_certificate_verifier(dyn_verifier)
             .with_client_auth_cert(client_cert_chain, client_key)?;
         config.resumption = Resumption::disabled();
+        // SP 800-52r2 needs EMS for TLS 1.2, as Praxis requires on its own clients.
+        config.require_ems = true;
 
         Ok(Self {
             connector: TlsConnector::from(Arc::new(config)),
@@ -230,6 +238,11 @@ mod tests {
     };
     use tokio_rustls::TlsAcceptor;
 
+    /// The scraper builds on the process provider; tests install ring, as the gateway installs OpenSSL.
+    fn install_ring() {
+        drop(rustls::crypto::ring::default_provider().install_default());
+    }
+
     use super::*;
 
     /// Parse a PEM cert chain and key into DER.
@@ -291,6 +304,8 @@ mod tests {
         let (client_chain, client_key) = material(&client.cert_pem, &client.key_pem);
         let addr = mock_tls_peer(server_chain, server_key, ok_response()).await;
 
+        install_ring();
+
         let source = PeerScraper::new(
             ca.cert_pem.as_bytes(),
             client_chain,
@@ -335,6 +350,7 @@ mod tests {
         for (label, pins, accepted) in cases {
             let addr = mock_tls_peer(server_chain.clone(), server_key.clone_key(), ok_response()).await;
             let (client_chain, client_key) = material(&client.cert_pem, &client.key_pem);
+            install_ring();
             let source = PeerScraper::new(
                 ca.cert_pem.as_bytes(),
                 client_chain,
@@ -396,6 +412,8 @@ mod tests {
         let (client_chain, client_key) = material(&client.cert_pem, &client.key_pem);
         let addr = mock_tls_peer(server_chain, server_key, ok_response()).await;
 
+        install_ring();
+
         let source = PeerScraper::new(
             ours.cert_pem.as_bytes(),
             client_chain,
@@ -430,6 +448,8 @@ mod tests {
             let (_tcp, _) = listener.accept().await.expect("accept");
             tokio::time::sleep(Duration::from_secs(30)).await;
         });
+
+        install_ring();
 
         let source = PeerScraper::new(
             ca.cert_pem.as_bytes(),
@@ -469,6 +489,8 @@ mod tests {
         let (client_chain, client_key) = material(&client.cert_pem, &client.key_pem);
         let addr = mock_tls_peer(server_chain, server_key, ok_response()).await;
 
+        install_ring();
+
         let source = PeerScraper::new(
             ca.cert_pem.as_bytes(),
             client_chain,
@@ -501,6 +523,8 @@ mod tests {
         let (server_chain, server_key) = material(&server.cert_pem, &server.key_pem);
         let (client_chain, client_key) = material(&client.cert_pem, &client.key_pem);
         let addr = mock_tls_peer_stalls_body(server_chain, server_key).await;
+
+        install_ring();
 
         let source = PeerScraper::new(
             ca.cert_pem.as_bytes(),
@@ -539,6 +563,7 @@ mod tests {
 
         // A grid-CA-valid peer "east" answers, but we dialed "west". A
         // membership-only check would accept it; the ==target check must not.
+        install_ring();
         let source = PeerScraper::new(
             ca.cert_pem.as_bytes(),
             client_chain,
@@ -567,6 +592,7 @@ mod tests {
         client_key: PrivateKeyDer<'static>,
         addr: &str,
     ) -> PeerScraper {
+        install_ring();
         PeerScraper::new(
             ca_pem,
             client_chain,

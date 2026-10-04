@@ -80,6 +80,18 @@ pub struct Config {
         default_value = "token"
     )]
     pub token_secret_key: String,
+
+    /// Secret the site identity is written to, unless the `GridNetwork` names one.
+    #[arg(
+        long = "enroll-identity-secret",
+        env = "GRID_ENROLL_IDENTITY_SECRET",
+        default_value = "grid-site-identity"
+    )]
+    pub identity_secret: String,
+
+    /// Secret the grid CA is written to, unless the `GridNetwork` names one.
+    #[arg(long = "enroll-ca-secret", env = "GRID_ENROLL_CA_SECRET", default_value = "grid-ca")]
+    pub ca_secret: String,
 }
 
 /// Why enrollment did not complete.
@@ -203,6 +215,8 @@ struct Settings {
     token_key: String,
     /// Retry schedule per step.
     backoff: Backoff,
+    /// Where the identity goes when no `GridNetwork` names its Secrets.
+    defaults: Target,
 }
 
 impl Settings {
@@ -232,6 +246,10 @@ impl Settings {
             token_secret: required(config.token_secret.as_deref(), "GRID_ENROLL_TOKEN_SECRET")?,
             token_key: config.token_secret_key.clone(),
             backoff: STEP_BACKOFF,
+            defaults: Target {
+                site_secret: required(Some(&config.identity_secret), "GRID_ENROLL_IDENTITY_SECRET")?,
+                ca_secret: required(Some(&config.ca_secret), "GRID_ENROLL_CA_SECRET")?,
+            },
         })
     }
 
@@ -281,44 +299,46 @@ struct Target {
     ca_secret: String,
 }
 
-/// Wait for the sole `GridNetwork` and read its target Secrets.
-async fn resolve_target(client: &Client, namespace: &str, backoff: Backoff) -> Result<Target, EnrollError> {
+/// The identity Secrets to enroll into. The token pins the grid, so no `GridNetwork` is needed.
+async fn resolve_target(
+    client: &Client,
+    namespace: &str,
+    defaults: &Target,
+    backoff: Backoff,
+) -> Result<Target, EnrollError> {
     let networks: Api<GridNetwork> = Api::all(client.clone());
     let networks = &networks;
-    with_backoff(backoff, "finding the GridNetwork", || async move {
-        let list = match networks.list(&ListParams::default()).await {
-            Ok(list) => list,
-            Err(e) => return Ok(Attempt::Retry(format!("listing GridNetworks: {e}"))),
-        };
-        match list.items.as_slice() {
-            [] => Ok(Attempt::Retry("no GridNetwork yet".to_owned())),
-            [network] => target_from(network, namespace).map(Attempt::Done),
-            many => Err(EnrollError::Config(format!(
-                "{} GridNetworks found, but one operator serves one grid",
-                many.len()
-            ))),
+    with_backoff(backoff, "listing GridNetworks", || async move {
+        match networks.list(&ListParams::default()).await {
+            Ok(list) => target_for(&list.items, namespace, defaults).map(Attempt::Done),
+            Err(e) => Ok(Attempt::Retry(e.to_string())),
         }
     })
     .await
 }
 
-/// The identity Secrets `network` names, all in `namespace`.
-fn target_from(network: &GridNetwork, namespace: &str) -> Result<Target, EnrollError> {
-    let tls = &network.spec.tls;
-    let (Some(site), Some(ca)) = (&tls.site_secret_ref, &tls.ca_secret_ref) else {
-        return Err(EnrollError::Config(
-            "the GridNetwork sets no spec.tls.siteSecretRef and caSecretRef to enroll into".to_owned(),
-        ));
+/// The Secrets the sole `GridNetwork` names, each falling back to `defaults`, all in `namespace`.
+fn target_for(networks: &[GridNetwork], namespace: &str, defaults: &Target) -> Result<Target, EnrollError> {
+    let tls = match networks {
+        [] => return Ok(defaults.clone()),
+        [network] => &network.spec.tls,
+        many => {
+            return Err(EnrollError::Config(format!(
+                "{} GridNetworks found, but one operator serves one grid",
+                many.len()
+            )));
+        },
     };
-    if let Some(other) = [site, ca].into_iter().find(|r| r.namespace != namespace) {
+    let (site, ca) = (tls.site_secret_ref.as_ref(), tls.ca_secret_ref.as_ref());
+    if let Some(other) = [site, ca].into_iter().flatten().find(|r| r.namespace != namespace) {
         return Err(EnrollError::Config(format!(
             "Secret {}/{} is outside the operator namespace {namespace}",
             other.namespace, other.name
         )));
     }
     Ok(Target {
-        site_secret: site.name.clone(),
-        ca_secret: ca.name.clone(),
+        site_secret: site.map_or_else(|| defaults.site_secret.clone(), |r| r.name.clone()),
+        ca_secret: ca.map_or_else(|| defaults.ca_secret.clone(), |r| r.name.clone()),
     })
 }
 
@@ -516,11 +536,28 @@ enum Outcome {
     Discarded,
 }
 
+/// Refuse a target other than `defaults` when the identity already sits in `defaults`: its token is spent.
+async fn check_not_enrolled_elsewhere<S: Store + Sync>(
+    store: &S,
+    defaults: &Target,
+    target: &Target,
+) -> Result<(), EnrollError> {
+    let enrolled = &defaults.site_secret;
+    if enrolled != &target.site_secret && store.exists(enrolled).await? {
+        return Err(EnrollError::Config(format!(
+            "the site already enrolled into Secret {enrolled}, but the GridNetwork names {}; point spec.tls.siteSecretRef and caSecretRef at the enrolled Secrets",
+            target.site_secret
+        )));
+    }
+    Ok(())
+}
+
 /// Enroll unless already enrolled, then store the identity.
 async fn enroll<S: Store + Sync>(store: &S, settings: &Settings, target: &Target) -> Result<Outcome, EnrollError> {
     if store.exists(&target.site_secret).await? {
         return Ok(Outcome::AlreadyEnrolled);
     }
+    check_not_enrolled_elsewhere(store, &settings.defaults, target).await?;
     let ca_present = check_existing_ca(store, target, &settings.anchor_pem).await?;
     check_writable(store, target, ca_present, settings.backoff).await?;
     let token = site_token(store, settings).await?;
@@ -820,7 +857,7 @@ fn http_client(roots: Vec<reqwest::Certificate>) -> Result<reqwest::Client, Enro
 /// Resolve the target, then enroll into it.
 async fn run(client: &Client, settings: &Settings) -> Result<(), EnrollError> {
     let namespace = client.default_namespace().to_owned();
-    let target = Box::pin(resolve_target(client, &namespace, settings.backoff)).await?;
+    let target = Box::pin(resolve_target(client, &namespace, &settings.defaults, settings.backoff)).await?;
     let store = KubeStore(Api::namespaced(client.clone(), &namespace));
     let site = &target.site_secret;
     match Box::pin(enroll(&store, settings, &target)).await? {

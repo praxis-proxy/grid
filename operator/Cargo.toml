@@ -64,7 +64,7 @@ socket2 = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true }
 tokio = { workspace = true }
-tokio-rustls = { workspace = true, optional = true }
+tokio-rustls = { workspace = true, optional = true, features = ["ring"] }
 tokio-openssl = { workspace = true, optional = true }
 tower = { workspace = true }
 tracing = { workspace = true }

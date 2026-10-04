@@ -54,6 +54,9 @@ pub struct AppState {
     /// Held here rather than taken per call, so every certificate this grid
     /// issues has the same bound and no route can quietly issue a longer one.
     pub cert_lifetime: time::Duration,
+
+    /// Site names issued outside enrollment, such as the hub's, that no token may claim.
+    pub reserved_sites: Vec<String>,
 }
 
 /// Failures the interface can report.
@@ -315,6 +318,9 @@ async fn mint_site_token(
         code: "invalid_site_name",
         message: err.to_string(),
     })?;
+    if state.reserved_sites.contains(&input.site_name) {
+        return Err(ApiError::NameTaken);
+    }
     if input.grid_network_ref.trim().is_empty() {
         return Err(ApiError::BadRequest {
             code: "missing_grid_network",
@@ -406,6 +412,10 @@ async fn enroll(
     // One snapshot, so the certificate and the CA returned with it always match.
     let ca = state.ca.current();
     let (enrollment_id, issued) = Box::pin(state.store.redeem_and_issue(&token_sha256, |pin: &Pin| {
+        // A token minted before the name was reserved still cannot claim it.
+        if state.reserved_sites.contains(&pin.site_name) {
+            return Err(StoreError::NameTaken);
+        }
         // Signed under the pinned name, with every SAN rebuilt from it.
         sign_csr(&ca, &pin.site_name, &csr, validity)
             .map(|cert| Issued {
@@ -474,9 +484,18 @@ fn generate_token() -> Result<String, ApiError> {
 ///
 /// Returns [`ApiError::Internal`] when the system random source fails.
 pub fn random_hex(len: usize) -> Result<String, ApiError> {
+    Ok(random_bytes(len)?.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+/// `len` bytes from the same CSPRNG as [`random_hex`].
+///
+/// # Errors
+///
+/// Returns [`ApiError::Internal`] when the system random source fails.
+pub fn random_bytes(len: usize) -> Result<Vec<u8>, ApiError> {
     let mut bytes = vec![0_u8; len];
     fill_random(&mut bytes)?;
-    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+    Ok(bytes)
 }
 
 /// Fill a buffer from ring's system CSPRNG.

@@ -79,6 +79,7 @@ impl Mock {
             token_secret: TOKEN_SECRET.to_owned(),
             token_key: "token".to_owned(),
             backoff: FAST,
+            defaults: target(),
         }
     }
 }
@@ -423,6 +424,24 @@ async fn an_existing_identity_skips_enrollment_without_reading_the_token() {
     assert!(store.reads.lock().expect("lock").is_empty(), "no Secret data is read");
 }
 
+#[tokio::test]
+async fn a_grid_network_naming_other_secrets_after_enrollment_is_refused() {
+    let (mock, mut settings) = serve(Reply::Sign).await;
+    settings.defaults = Target {
+        site_secret: "grid-site-identity".to_owned(),
+        ca_secret: "grid-ca".to_owned(),
+    };
+    let store = FakeStore::invited();
+    store.put("grid-site-identity", "tls.crt", "present");
+    let outcome = run_flow(&store, &settings).await;
+    assert!(
+        matches!(&outcome, Err(EnrollError::Config(m)) if m.contains("grid-site-identity")),
+        "the enrolled Secret is named: {outcome:?}"
+    );
+    assert_eq!(mock.calls(), 0, "the spent token is not redeemed again");
+    assert!(store.reads.lock().expect("lock").is_empty(), "the token is not read");
+}
+
 /// Replies that must not be stored, with the reason.
 #[tokio::test]
 async fn an_unusable_certificate_is_refused_and_not_stored() {
@@ -653,6 +672,8 @@ fn urls_must_parse_and_be_https() {
         site_name: Some(SITE.to_owned()),
         token_secret: Some(TOKEN_SECRET.to_owned()),
         token_secret_key: "token".to_owned(),
+        identity_secret: "grid-site-identity".to_owned(),
+        ca_secret: "grid-ca".to_owned(),
     };
     for (url, want) in [("http://enroll.example.com", "https"), ("not a url", "GRID_ENROLL_URL")] {
         let got = Settings::from_config(&config(url))
@@ -693,6 +714,8 @@ fn bundles_without_a_certificate_are_refused_before_anything_is_sent() {
         site_name: Some(SITE.to_owned()),
         token_secret: Some(TOKEN_SECRET.to_owned()),
         token_secret_key: "token".to_owned(),
+        identity_secret: "grid-site-identity".to_owned(),
+        ca_secret: "grid-ca".to_owned(),
     };
     assert!(Settings::from_config(&with(&ca, None)).is_ok(), "a PEM CA is accepted");
     for (config, name) in [
@@ -708,31 +731,60 @@ fn bundles_without_a_certificate_are_refused_before_anything_is_sent() {
     }
 }
 
+fn network(tls: &Value) -> GridNetwork {
+    serde_json::from_value(json!({
+        "apiVersion": "grid.praxis.fast/v1alpha1",
+        "kind": "GridNetwork",
+        "metadata": {"name": "grid"},
+        "spec": {"tls": tls},
+    }))
+    .expect("fixture")
+}
+
 #[test]
-fn target_secrets_must_be_in_the_operator_namespace() {
-    let network = |ns: &str| {
-        serde_json::from_value::<GridNetwork>(json!({
-            "apiVersion": "grid.praxis.fast/v1alpha1",
-            "kind": "GridNetwork",
-            "metadata": {"name": "grid"},
-            "spec": {"tls": {
-                "siteSecretRef": {"name": "site-tls", "namespace": ns},
-                "caSecretRef": {"name": "grid-ca", "namespace": "grid-system"},
-            }},
+fn enrolling_without_a_grid_network_uses_the_configured_secrets() {
+    let defaults = Target {
+        site_secret: "grid-site-identity".to_owned(),
+        ca_secret: "grid-ca".to_owned(),
+    };
+    assert_eq!(target_for(&[], "grid-system", &defaults).ok(), Some(defaults.clone()));
+    assert_eq!(
+        target_for(&[network(&json!({}))], "grid-system", &defaults).ok(),
+        Some(defaults),
+        "a GridNetwork naming no Secrets keeps the defaults"
+    );
+}
+
+#[test]
+fn a_grid_network_names_the_target_secrets() {
+    let refs = |ns: &str| {
+        network(&json!({
+            "siteSecretRef": {"name": "site-tls", "namespace": ns},
+            "caSecretRef": {"name": "grid-ca", "namespace": "grid-system"},
         }))
-        .expect("fixture")
+    };
+    let defaults = Target {
+        site_secret: "unused".to_owned(),
+        ca_secret: "unused".to_owned(),
     };
     assert_eq!(
-        target_from(&network("grid-system"), "grid-system").ok(),
+        target_for(&[refs("grid-system")], "grid-system", &defaults).ok(),
         Some(target()),
         "refs in the operator namespace resolve"
     );
     assert!(
         matches!(
-            target_from(&network("elsewhere"), "grid-system"),
+            target_for(&[refs("elsewhere")], "grid-system", &defaults),
             Err(EnrollError::Config(_))
         ),
         "a ref outside the operator namespace is refused"
+    );
+    assert!(
+        matches!(
+            target_for(&[refs("grid-system"), refs("grid-system")], "grid-system", &defaults),
+            Err(EnrollError::Config(_))
+        ),
+        "one operator serves one grid"
     );
 }
 
