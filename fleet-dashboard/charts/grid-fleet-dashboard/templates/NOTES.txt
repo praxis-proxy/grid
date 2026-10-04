@@ -1,0 +1,14 @@
+grid-fleet-dashboard {{ .Chart.AppVersion }} installed in namespace {{ .Release.Namespace }}.
+
+Next steps:
+  1. Register each spoke:
+       hack/register-site.sh <site-name> --spoke-kubeconfig <path> --hub-kubeconfig <path> --region <aws-region> --namespace {{ .Release.Namespace }} --configmap {{ .Values.registry.configMap }} --key {{ .Values.registry.key }}
+{{- if .Values.route.enabled }}
+  2. Open the dashboard:
+       oc -n {{ .Release.Namespace }} get route {{ include "fleet-dashboard.fullname" . }} -o jsonpath='https://{.spec.host}{"\n"}'
+{{- else if .Values.ingress.enabled }}
+  2. Open the dashboard at https://{{ .Values.ingress.host }}/
+{{- else }}
+  2. Port-forward to the dashboard:
+       oc -n {{ .Release.Namespace }} port-forward svc/{{ include "fleet-dashboard.fullname" . }} 8080:8080
+{{- end }}

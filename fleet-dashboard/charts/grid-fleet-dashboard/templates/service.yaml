@@ -1,0 +1,26 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "fleet-dashboard.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "fleet-dashboard.labels" . | nindent 4 }}
+  {{- if .Values.auth.oauthProxy.enabled }}
+  annotations:
+    service.beta.openshift.io/serving-cert-secret-name: {{ include "fleet-dashboard.tlsSecretName" . }}
+  {{- end }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "fleet-dashboard.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      protocol: TCP
+    {{- if .Values.auth.oauthProxy.enabled }}
+    - name: https
+      port: 8443
+      targetPort: https
+      protocol: TCP
+    {{- end }}

@@ -1,0 +1,103 @@
+# Values for grid-fleet-dashboard. Keys marked (spec 9) come from the design spec.
+
+replicaCount: 1
+
+image:
+  repository: ghcr.io/praxis-proxy/grid-fleet-dashboard
+  # Defaults to the chart appVersion when empty.
+  tag: ""
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  # Name of the ServiceAccount to create; empty means the release fullname.
+  name: ""
+
+# (spec 9) The registry ConfigMap the dashboard watches in its own namespace.
+# The chart does not create it; hack/register-site.sh does.
+registry: {configMap: epp-clusters, key: clusters.yaml}
+
+# (spec 9)
+metrics:
+  mode: perSite        # or central
+  centralURL: ""
+  clusterLabel: cluster
+  pollInterval: 15s
+  siteTimeout: 8s
+  # Bearer token for central mode. The binary has no --central-token flag; the
+  # token is passed only via the FLEET_CENTRAL_TOKEN env var (never in `ps`).
+  # When metrics.mode is "central" and name is set, the Deployment sets
+  # FLEET_CENTRAL_TOKEN from this Secret key.
+  centralTokenSecret:
+    name: ""
+    key: token
+  # Trusted CA bundle for central mode, in addition to the platform roots.
+  # When configMap is set, it is mounted at /etc/fleet-ca (a sibling of the
+  # read-only /etc/fleet ConfigMap mount, not nested under it, since runc can
+  # fail to create a ConfigMap volume nested inside another) and passed as
+  # --central-ca-file=/etc/fleet-ca/<key>.
+  centralCA:
+    configMap: ""
+    key: ca.crt
+
+# (spec 9) Health thresholds, rendered into /etc/fleet/config.yaml.
+thresholds: {gpuUtilWarn: 90, queueWarn: 50, latencyWarnMs: 5000, redAfterFailures: 2}
+
+# (spec 9) The hub glyph. Leave name empty to hide it.
+hub: {name: "", region: "", lat: null, lng: null}
+
+# PromQL evaluated per site (spec section 6). Edit these for different exporters.
+queries:
+  readyEndpoints: max(llm_d_epp_ready_endpoints)
+  gpuTotal: sum(kube_node_status_allocatable{resource="nvidia_com_gpu"})
+  gpuUtil: avg(DCGM_FI_DEV_GPU_UTIL)
+  models: count by (model_name) (vllm:num_requests_running)
+  rps: sum(rate(vllm:request_success_total[1m]))
+  p50LatencyMs: histogram_quantile(0.5, sum by (le) (rate(vllm:e2e_request_latency_seconds_bucket[5m]))) * 1000
+  tokensPerSec: sum(rate(vllm:generation_tokens_total[1m]))
+  queueDepth: sum(vllm:num_requests_waiting)
+  replicasDown: sum(kube_deployment_spec_replicas{deployment=~".*vllm.*"}) - sum(kube_deployment_status_replicas_available{deployment=~".*vllm.*"})
+  tenants: ""
+
+# (spec 9) OpenShift oauth-proxy sidecar; SAR on the dashboard namespace.
+auth:
+  oauthProxy:
+    enabled: true
+    image: registry.redhat.io/openshift4/ose-oauth-proxy-rhel9:v4.17
+    # Fixed session secret. Empty means: reuse the existing Secret on upgrade, else generate one.
+    cookieSecret: ""
+    resources:
+      requests: {cpu: 10m, memory: 32Mi}
+      limits: {cpu: 100m, memory: 128Mi}
+
+# (spec 9) Route on OpenShift; ingress.enabled for other distributions.
+route:
+  enabled: true
+  host: ""
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  host: fleet.example.com
+  tls: []
+
+# (spec 9)
+serviceMonitor:
+  enabled: false
+  interval: 30s
+  labels: {}
+
+# (spec 9) Synthetic fleet for demos and development.
+demo: {enabled: false}
+
+resources:
+  requests: {cpu: 100m, memory: 128Mi}
+  limits: {cpu: 500m, memory: 512Mi}
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

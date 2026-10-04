@@ -1,0 +1,335 @@
+---
+# Source: grid-fleet-dashboard/templates/serviceaccount.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: grid-fleet-dashboard
+  namespace: aigrid-fleet
+  labels:
+    helm.sh/chart: grid-fleet-dashboard-0.1.4
+    app.kubernetes.io/name: grid-fleet-dashboard
+    app.kubernetes.io/instance: grid-fleet-dashboard
+    app.kubernetes.io/version: "v0.1.4"
+    app.kubernetes.io/managed-by: Helm
+  annotations:
+    serviceaccounts.openshift.io/oauth-redirectreference.primary: '{"kind":"OAuthRedirectReference","apiVersion":"v1","reference":{"kind":"Route","name":"grid-fleet-dashboard"}}'
+---
+# Source: grid-fleet-dashboard/templates/cookie-secret.yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: grid-fleet-dashboard-cookie
+  namespace: aigrid-fleet
+  labels:
+    helm.sh/chart: grid-fleet-dashboard-0.1.4
+    app.kubernetes.io/name: grid-fleet-dashboard
+    app.kubernetes.io/instance: grid-fleet-dashboard
+    app.kubernetes.io/version: "v0.1.4"
+    app.kubernetes.io/managed-by: Helm
+type: Opaque
+data:
+  session_secret: Z29sZGVuLXNlc3Npb24tc2VjcmV0LTAxMjM0NTY3ODlhYg==
+---
+# Source: grid-fleet-dashboard/templates/configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fleet-config
+  namespace: aigrid-fleet
+  labels:
+    helm.sh/chart: grid-fleet-dashboard-0.1.4
+    app.kubernetes.io/name: grid-fleet-dashboard
+    app.kubernetes.io/instance: grid-fleet-dashboard
+    app.kubernetes.io/version: "v0.1.4"
+    app.kubernetes.io/managed-by: Helm
+data:
+  config.yaml: |
+    thresholds:
+      gpuUtilWarn: 90
+      latencyWarnMs: 5000
+      queueWarn: 50
+      redAfterFailures: 2
+    hub:
+      lat: 39.04
+      lng: -77.49
+      name: aigrid-ds-hub
+      region: us-east-1
+    queries:
+      gpuTotal: sum(kube_node_status_allocatable{resource="nvidia_com_gpu"})
+      gpuUtil: avg(vllm:gpu_cache_usage_perc)*100
+      models: count by (model_name) (vllm:num_requests_running)
+      p50LatencyMs: histogram_quantile(0.5, sum by (le) (rate(vllm:e2e_request_latency_seconds_bucket[5m])))
+        * 1000
+      queueDepth: sum(vllm:num_requests_waiting)
+      readyEndpoints: max(llm_d_epp_ready_endpoints)
+      replicasDown: sum(kube_deployment_spec_replicas{deployment=~".*vllm.*"}) - sum(kube_deployment_status_replicas_available{deployment=~".*vllm.*"})
+      rps: sum(rate(vllm:request_success_total[1m]))
+      tenants: ""
+      tokensPerSec: sum(rate(vllm:generation_tokens_total[1m]))
+---
+# Source: grid-fleet-dashboard/templates/rbac.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: grid-fleet-dashboard
+  namespace: aigrid-fleet
+  labels:
+    helm.sh/chart: grid-fleet-dashboard-0.1.4
+    app.kubernetes.io/name: grid-fleet-dashboard
+    app.kubernetes.io/instance: grid-fleet-dashboard
+    app.kubernetes.io/version: "v0.1.4"
+    app.kubernetes.io/managed-by: Helm
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps", "secrets"]
+    verbs: ["get", "list", "watch"]
+---
+# Source: grid-fleet-dashboard/templates/rbac.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: grid-fleet-dashboard
+  namespace: aigrid-fleet
+  labels:
+    helm.sh/chart: grid-fleet-dashboard-0.1.4
+    app.kubernetes.io/name: grid-fleet-dashboard
+    app.kubernetes.io/instance: grid-fleet-dashboard
+    app.kubernetes.io/version: "v0.1.4"
+    app.kubernetes.io/managed-by: Helm
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: grid-fleet-dashboard
+subjects:
+  - kind: ServiceAccount
+    name: grid-fleet-dashboard
+    namespace: aigrid-fleet
+---
+# Source: grid-fleet-dashboard/templates/service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: grid-fleet-dashboard
+  namespace: aigrid-fleet
+  labels:
+    helm.sh/chart: grid-fleet-dashboard-0.1.4
+    app.kubernetes.io/name: grid-fleet-dashboard
+    app.kubernetes.io/instance: grid-fleet-dashboard
+    app.kubernetes.io/version: "v0.1.4"
+    app.kubernetes.io/managed-by: Helm
+  annotations:
+    service.beta.openshift.io/serving-cert-secret-name: grid-fleet-dashboard-tls
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: grid-fleet-dashboard
+    app.kubernetes.io/instance: grid-fleet-dashboard
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      protocol: TCP
+    - name: https
+      port: 8443
+      targetPort: https
+      protocol: TCP
+---
+# Source: grid-fleet-dashboard/templates/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grid-fleet-dashboard
+  namespace: aigrid-fleet
+  labels:
+    helm.sh/chart: grid-fleet-dashboard-0.1.4
+    app.kubernetes.io/name: grid-fleet-dashboard
+    app.kubernetes.io/instance: grid-fleet-dashboard
+    app.kubernetes.io/version: "v0.1.4"
+    app.kubernetes.io/managed-by: Helm
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: grid-fleet-dashboard
+      app.kubernetes.io/instance: grid-fleet-dashboard
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: grid-fleet-dashboard
+        app.kubernetes.io/instance: grid-fleet-dashboard
+      annotations:
+        checksum/config: 6bf00f662c9bc86befaf7a4df99d7092b3a7b07b7aacea45b2333c9514904dde
+    spec:
+      serviceAccountName: grid-fleet-dashboard
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: dashboard
+          image: "ghcr.io/praxis-proxy/grid-fleet-dashboard:v0.1.4"
+          imagePullPolicy: IfNotPresent
+          args:
+            - --listen=:8080
+            - --registry-configmap=epp-clusters
+            - --registry-key=clusters.yaml
+            - --metrics-mode=central
+            - --central-url=https://observatorium-api.example.com/api/metrics/v1/default
+            - --cluster-label=cluster_name
+            - --poll-interval=15s
+            - --site-timeout=8s
+            - --config=/etc/fleet/config.yaml
+            - --central-ca-file=/etc/fleet-ca/ca.crt
+            - --demo
+          env:
+            - name: FLEET_CENTRAL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: central-token
+                  key: token
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            limits:
+              cpu: 500m
+              memory: 512Mi
+            requests:
+              cpu: 100m
+              memory: 128Mi
+          volumeMounts:
+            - name: config
+              mountPath: /etc/fleet
+              readOnly: true
+            - name: central-ca
+              mountPath: /etc/fleet-ca
+              readOnly: true
+        - name: oauth-proxy
+          image: registry.redhat.io/openshift4/ose-oauth-proxy-rhel9:v4.17
+          imagePullPolicy: IfNotPresent
+          args:
+            - --provider=openshift
+            - --https-address=:8443
+            - --http-address=
+            - --upstream=http://localhost:8080
+            - --openshift-service-account=grid-fleet-dashboard
+            - '--openshift-sar={"namespace":"aigrid-fleet","resource":"configmaps","verb":"get"}'
+            - --cookie-secret-file=/etc/proxy/secrets/session_secret
+            - --tls-cert=/etc/tls/private/tls.crt
+            - --tls-key=/etc/tls/private/tls.key
+          ports:
+            - name: https
+              containerPort: 8443
+              protocol: TCP
+          readinessProbe:
+            tcpSocket:
+              port: https
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            limits:
+              cpu: 100m
+              memory: 128Mi
+            requests:
+              cpu: 10m
+              memory: 32Mi
+          volumeMounts:
+            - name: proxy-tls
+              mountPath: /etc/tls/private
+              readOnly: true
+            - name: proxy-cookie
+              mountPath: /etc/proxy/secrets
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: fleet-config
+        - name: central-ca
+          configMap:
+            name: central-ca
+        - name: proxy-tls
+          secret:
+            secretName: grid-fleet-dashboard-tls
+        - name: proxy-cookie
+          secret:
+            secretName: grid-fleet-dashboard-cookie
+---
+# Source: grid-fleet-dashboard/templates/route.yaml
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: grid-fleet-dashboard
+  namespace: aigrid-fleet
+  labels:
+    helm.sh/chart: grid-fleet-dashboard-0.1.4
+    app.kubernetes.io/name: grid-fleet-dashboard
+    app.kubernetes.io/instance: grid-fleet-dashboard
+    app.kubernetes.io/version: "v0.1.4"
+    app.kubernetes.io/managed-by: Helm
+spec:
+  to:
+    kind: Service
+    name: grid-fleet-dashboard
+    weight: 100
+  port:
+    targetPort: https
+  tls:
+    termination: reencrypt
+    insecureEdgeTerminationPolicy: Redirect
+  wildcardPolicy: None
+---
+# Source: grid-fleet-dashboard/templates/servicemonitor.yaml
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: grid-fleet-dashboard
+  namespace: aigrid-fleet
+  labels:
+    helm.sh/chart: grid-fleet-dashboard-0.1.4
+    app.kubernetes.io/name: grid-fleet-dashboard
+    app.kubernetes.io/instance: grid-fleet-dashboard
+    app.kubernetes.io/version: "v0.1.4"
+    app.kubernetes.io/managed-by: Helm
+    release: kube-prometheus-stack
+spec:
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 15s
+  jobLabel: app.kubernetes.io/name
+  namespaceSelector:
+    matchNames:
+      - aigrid-fleet
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: grid-fleet-dashboard
+      app.kubernetes.io/instance: grid-fleet-dashboard

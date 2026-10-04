@@ -1,0 +1,26 @@
+# Central metrics store, ServiceMonitor on, demo fleet, explicit hub coordinates.
+auth:
+  oauthProxy:
+    cookieSecret: golden-session-secret-0123456789ab
+metrics:
+  mode: central
+  centralURL: https://observatorium-api.example.com/api/metrics/v1/default
+  clusterLabel: cluster_name
+  centralTokenSecret:
+    name: central-token
+  centralCA:
+    configMap: central-ca
+serviceMonitor:
+  enabled: true
+  interval: 15s
+  labels:
+    release: kube-prometheus-stack
+demo:
+  enabled: true
+hub:
+  name: aigrid-ds-hub
+  region: us-east-1
+  lat: 39.04
+  lng: -77.49
+queries:
+  gpuUtil: avg(vllm:gpu_cache_usage_perc)*100

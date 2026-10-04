@@ -1,0 +1,128 @@
+{{- if and (eq .Values.metrics.mode "central") (not .Values.metrics.centralURL) }}{{ fail "metrics.centralURL is required when metrics.mode=central" }}{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "fleet-dashboard.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "fleet-dashboard.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "fleet-dashboard.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "fleet-dashboard.selectorLabels" . | nindent 8 }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+    spec:
+      serviceAccountName: {{ include "fleet-dashboard.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: dashboard
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - --listen=:8080
+            - --registry-configmap={{ .Values.registry.configMap }}
+            - --registry-key={{ .Values.registry.key }}
+            - --metrics-mode={{ .Values.metrics.mode }}
+            {{- if .Values.metrics.centralURL }}
+            - --central-url={{ .Values.metrics.centralURL }}
+            {{- end }}
+            - --cluster-label={{ .Values.metrics.clusterLabel }}
+            - --poll-interval={{ .Values.metrics.pollInterval }}
+            - --site-timeout={{ .Values.metrics.siteTimeout }}
+            - --config=/etc/fleet/config.yaml
+            {{- if .Values.metrics.centralCA.configMap }}
+            - --central-ca-file=/etc/fleet-ca/{{ .Values.metrics.centralCA.key }}
+            {{- end }}
+            {{- if .Values.demo.enabled }}
+            - --demo
+            {{- end }}
+          {{- if and (eq .Values.metrics.mode "central") .Values.metrics.centralTokenSecret.name }}
+          env:
+            - name: FLEET_CENTRAL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.metrics.centralTokenSecret.name }}
+                  key: {{ .Values.metrics.centralTokenSecret.key }}
+          {{- end }}
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/fleet
+              readOnly: true
+            {{- if .Values.metrics.centralCA.configMap }}
+            - name: central-ca
+              mountPath: /etc/fleet-ca
+              readOnly: true
+            {{- end }}
+{{- if .Values.auth.oauthProxy.enabled }}
+{{- include "fleet-dashboard.oauthProxyContainer" . | nindent 8 }}
+{{- end }}
+      volumes:
+        - name: config
+          configMap:
+            name: fleet-config
+        {{- if .Values.metrics.centralCA.configMap }}
+        - name: central-ca
+          configMap:
+            name: {{ .Values.metrics.centralCA.configMap }}
+        {{- end }}
+{{- if .Values.auth.oauthProxy.enabled }}
+        - name: proxy-tls
+          secret:
+            secretName: {{ include "fleet-dashboard.tlsSecretName" . }}
+        - name: proxy-cookie
+          secret:
+            secretName: {{ include "fleet-dashboard.cookieSecretName" . }}
+{{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

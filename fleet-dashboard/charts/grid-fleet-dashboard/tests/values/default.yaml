@@ -1,0 +1,4 @@
+# Shipped defaults, with the session secret pinned so the render is deterministic.
+auth:
+  oauthProxy:
+    cookieSecret: golden-session-secret-0123456789ab

@@ -1,0 +1,16 @@
+apiVersion: v2
+name: grid-fleet-dashboard
+description: Fleet map dashboard for AI Grid hub-and-spoke deployments
+type: application
+version: 0.1.4
+appVersion: "v0.1.4"
+kubeVersion: ">=1.27.0-0"
+home: https://github.com/praxis-proxy/grid
+sources:
+  - https://github.com/praxis-proxy/grid/tree/main/fleet-dashboard
+maintainers:
+  - name: Senan Zedan
+keywords:
+  - llm-d
+  - ai-grid
+  - openshift

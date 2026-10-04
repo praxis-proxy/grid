@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fleet-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "fleet-dashboard.labels" . | nindent 4 }}
+data:
+  config.yaml: |
+    thresholds:
+      {{- toYaml .Values.thresholds | nindent 6 }}
+    hub:
+      {{- toYaml .Values.hub | nindent 6 }}
+    queries:
+      {{- toYaml .Values.queries | nindent 6 }}

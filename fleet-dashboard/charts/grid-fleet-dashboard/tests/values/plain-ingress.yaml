@@ -1,0 +1,18 @@
+# Non-OpenShift install: no oauth-proxy, no Route, Ingress with TLS.
+auth:
+  oauthProxy:
+    enabled: false
+route:
+  enabled: false
+ingress:
+  enabled: true
+  className: nginx
+  host: fleet.example.com
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt
+  tls:
+    - hosts: [fleet.example.com]
+      secretName: fleet-example-com-tls
+hub:
+  name: hub-a
+  region: europe-west1
