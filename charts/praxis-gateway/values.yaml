@@ -240,8 +240,10 @@ praxisConfig:
       # -- Validate call timeout (seconds).
       timeoutSecs: 5
     # -- Backend clusters. Each renders a health_check so a literal ClusterIP routes without
-    # allow_private_upstreams, plus an explicit transport. A backend omitting transport
-    # defaults to mutual_tls when gridIdentity.tlsSecretName is set, else plaintext.
+    # allow_private_upstreams, plus an explicit transport. A remote-site backend omitting
+    # transport.mode uses mutual_tls when gridIdentity.tlsSecretName is set. Without
+    # that identity, omitting mode fails the render; select plaintext explicitly
+    # when cleartext is intended. A provider's local backend defaults to plaintext.
     # mutual_tls presents that identity (gridIdentity.mountPath tls.crt/tls.key, verified against its
     # ca.crt) and needs a sni naming the peer. tls verifies the backend's server cert with
     # no client cert: sni defaults to the endpoint host. Its trust, first match wins:
@@ -309,8 +311,9 @@ upstreamCA:
 # -- Inbound TLS on the gateway listener. The default posture assumes an inbound TLS
 # front (an OpenShift Route or a Gateway) terminates TLS and forwards to this plaintext
 # listener. Set secretName to terminate TLS from a mounted server cert (tls.crt/tls.key).
-# Works with source render and BYO; a BYO praxis.yaml must reference mountPath. Not
-# supported with source operator. A non-empty secretName names the container port https.
+# Works with render consumers and BYO; a BYO praxis.yaml must reference mountPath.
+# Render providers use gridIdentity.tlsSecretName and reject listenerTls.secretName.
+# Not supported with source operator. A non-empty secretName names the container port https.
 # On OpenShift, set
 # service.annotations service.beta.openshift.io/serving-cert-secret-name to the Secret
 # name and the service CA issues the cert.

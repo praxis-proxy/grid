@@ -81,9 +81,11 @@ These values do not add TLS settings to `praxis.yaml`.
   `consumerConfig.tlsCertMountPath`
   (default: `/etc/praxis/tls`).
 - **Render:** Set `gridIdentity.tlsSecretName` and
-  `gridIdentity.caSecretName` to use mTLS. A backend without
-  `transport.mode` defaults
-  to `mutual_tls` when the identity Secret is set, otherwise `plaintext`.
+  `gridIdentity.caSecretName` to use mTLS. A remote-site backend without
+  `transport.mode` uses `mutual_tls` when the identity Secret is set. Without
+  that identity, omitting `transport.mode` fails the install. Set the identity
+  for mTLS or select `plaintext` explicitly when cleartext is intended.
+  A provider's local backend defaults to plaintext.
   `tls` transport verifies a server certificate without a client certificate;
   `plaintext` uses no TLS.
 
@@ -268,7 +270,7 @@ Praxis AI image; these values may advance independently.
 | `praxisConfig.render.model` | string | **required** for a consumer without `praxisConfig.render.gridServing` | Model advertised on the routing candidates. |
 | `praxisConfig.render.backends` | map | **required** when rendered | Backends keyed by site, each with `endpoint` and optional `healthCheck` and `transport`. A consumer's key is the site it reaches over mutual TLS. A provider's `local` key is its one plaintext backend. The older list of `cluster`, `endpoints` entries still renders. |
 | `praxisConfig.render.backends[].site` | string | `grid.siteName` | Grid site the backend serves. A consumer's remote `mutual_tls` backend must name it, and it must differ from `grid.siteName`. Its `transport.sni` defaults to `<site>.grid.internal`. |
-| `praxisConfig.render.backends[].transport` | object | `mutual_tls` with `gridIdentity.tlsSecretName`, else `plaintext` | `mode`: `mutual_tls` presents the grid identity and verifies with `gridIdentity.caSecretName`; `tls` verifies the server cert with no client cert; `plaintext` is cleartext. `sni` names the peer cert (required for `mutual_tls` and for `tls` to an IP endpoint). `ca` (`configMapName` or `secretName`, `key`) is the CA for a `tls` backend. A `tls` backend trusts, first match wins: `transport.ca`, then `upstreamCA`, then the process store, which is the `auth.validateCA` bundle when that is set. |
+| `praxisConfig.render.backends[].transport` | object | Remote site: `mutual_tls` with Grid identity; otherwise set `mode` explicitly. Provider local backend: `plaintext`. | `mode`: `mutual_tls` presents the grid identity and verifies with `gridIdentity.caSecretName`; `tls` verifies the server cert with no client cert; `plaintext` is cleartext. `sni` names the peer cert (required for `mutual_tls` and for `tls` to an IP endpoint). `ca` (`configMapName` or `secretName`, `key`) is the CA for a `tls` backend. A `tls` backend trusts, first match wins: `transport.ca`, then `upstreamCA`, then the process store, which is the `auth.validateCA` bundle when that is set. |
 | `praxisConfig.render.backends[].connectTimeoutMs` | int | praxis default | Connect timeout, at most `totalConnectTimeoutMs` when you set both. |
 | `praxisConfig.render.backends[].trustPrivate` | bool | `false` | Let the backend's hostname endpoints resolve to private addresses. Needs a praxis build with `trusted_private_endpoints`, which 0.7.x lacks. Over plaintext it also needs `allowPlaintextTrust`. |
 | `praxisConfig.render.role` | string | `consumer` | `provider` serves grid peers on the grid identity and forwards to one local backend. |
@@ -294,7 +296,7 @@ Praxis AI image; these values may advance independently.
 | `metricsListener.fromNamespaces` | list | `[]` | Namespace names allowed to reach the metrics port, for example `openshift-user-workload-monitoring`. |
 | `metricsListener.serviceMonitor.enabled` | bool | `false` | Render a ServiceMonitor that verifies the cert against `caConfigMap` (for example `openshift-service-ca.crt`, key `service-ca.crt`) and renames Praxis's `cluster` label to `backend`, since ACM uses `cluster` for the managed cluster. |
 | `upstreamCA.secretName` | string | `""` | CA bundle for backend TLS without a per-cluster CA. Empty disables the mount. Works with `render` and `byo`; BYO `praxis.yaml` must set `runtime.upstream_ca_file`. The bundle replaces system trust roots; include public and private roots when both are needed. Per-cluster CAs override this bundle. Not supported with `operator`. |
-| `listenerTls.secretName` | string | `""` | Server certificate Secret (`tls.crt`, `tls.key`) for listener TLS. Non-empty enables TLS and names the port `https`. Works with `render` and `byo`; BYO `praxis.yaml` must reference `listenerTls.mountPath`. Not supported with `operator`. On OpenShift, annotate the Service with `service.beta.openshift.io/serving-cert-secret-name`. |
+| `listenerTls.secretName` | string | `""` | Server certificate Secret (`tls.crt`, `tls.key`) for listener TLS. Non-empty enables TLS and names the port `https`. Works with render consumers and `byo`; BYO `praxis.yaml` must reference `listenerTls.mountPath`. Render providers reject this setting and use `gridIdentity.tlsSecretName` for listener TLS. Not supported with `operator`. On OpenShift, annotate the Service with `service.beta.openshift.io/serving-cert-secret-name`. |
 | `port.containerPort` | int | `8080` | Container port. |
 | `port.name` | string | `""` | Port name. Empty: `https` when `listenerTls.secretName` is set, else `http`. |
 | `port.protocol` | string | `TCP` | Port protocol. |
@@ -446,15 +448,15 @@ AGN runs this chart in two roles with different values:
 ### Resource names for the AGN Operator
 
 The chart's fullname template produces `{release}-praxis-gateway` by
-default (e.g., release `consumer-gateway` → Service name
-`consumer-gateway-praxis-gateway`). Set `fullnameOverride` to control
+default (e.g., release `provider-gateway` → Service name
+`provider-gateway-praxis-gateway`). Set `fullnameOverride` to control
 the exact Service name:
 
 ```yaml
-fullnameOverride: consumer-gateway   # Service name = consumer-gateway
+fullnameOverride: provider-gateway   # Service name = provider-gateway
 ```
 
-The AGN Operator's `gateway.serviceName` must match the consumer
+The AGN Operator's `gateway.serviceName` must match the provider
 gateway's Service name. When using `fullnameOverride`, set
 `gateway.serviceName` to the same value in the operator Helm values.
 
@@ -470,7 +472,9 @@ candidate cluster (the provider's `routingClusterRef`, else its name).
 A `grid-gateway` built from the current source re-reads `serving-config.json`
 every five seconds after the kubelet updates the mounted ConfigMap. It applies
 candidate, peer, address, and pin changes without a pod restart. Invalid updates
-keep the last accepted topology and pollers. Check gateway logs and
+keep the last accepted serving settings and topology. Changes to mounted
+identity files can still restart signals pollers using those accepted settings.
+Check gateway logs and
 `grid_serving_config_reload_total{result="applied"}` for acceptance; the
 `grid.praxis.fast/serving-digest` annotation records publication, not acceptance.
 
@@ -655,9 +659,10 @@ Behavior changes:
   the operator's `praxis.yaml` uses neither.
 - `upstreamCA` now mounts with `source: byo`; set `runtime.upstream_ca_file` in
   your BYO `praxis.yaml` to use it.
-- An overlay is BYO-only. The default sidecar requires `grid.networkName` and
-  `grid.siteName`; set `fullnameOverride` to the GridNetwork
-  `gatewayRefs[].name`. Set `overlay.sidecar.enabled: false` for a direct,
+- An overlay is BYO-only. `overlay.sidecar.enabled` now defaults to `true`,
+  previously `false`. The sidecar requires `grid.networkName` and `grid.siteName`
+  and creates a ServiceAccount, Role, and RoleBinding. Set `fullnameOverride` to
+  the GridNetwork `gatewayRefs[].name`. Set `overlay.sidecar.enabled: false` for a direct,
   unvalidated ConfigMap mount.
 - Grid gateways no longer take the Helm release name automatically. Set
   `fullnameOverride` to the GridNetwork `gatewayRefs[].name` when the operator
