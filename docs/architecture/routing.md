@@ -981,8 +981,8 @@ Direct ConfigMap projection remains available when
 `overlay.sidecar.enabled=false`, but its delivery latency is controlled by the
 kubelet and it does not provide the sidecar's validation or delivery status.
 
-Consumers that do not enable overlay-file reload still require a rollout or
-another deployment-owned reload mechanism. See
+Consumers without overlay-file reload must apply changes through supported
+`praxis.yaml` file watching or a deployment rollout. See
 [Consumer Config](consumer-config.md#reload-and-rollout).
 
 ## Relevant files

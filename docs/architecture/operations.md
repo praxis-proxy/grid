@@ -316,7 +316,7 @@ unrelated address.
 | `GRID_GATEWAY_DISCOVERY_ENABLED` | Whether to discover and advertise a gateway address. Defaults to `true`; set `false` for a consumer-only site |
 | `GRID_GATEWAY_SERVICE_NAME` | Service name for gateway self-discovery (default: `provider-gateway`) |
 | `GRID_GATEWAY_NAMESPACE` | Namespace for gateway Service lookup (default: `grid-system`) |
-| `GRID_GATEWAY_PORT` | Optional port override appended to the discovered address; when unset, the operator uses the gateway Service's declared port, or the first `spec.ports` entry when several exist |
+| `GRID_GATEWAY_PORT` | Optional port override appended to the discovered address. When unset, use the first Service `spec.ports` entry; fall back to `8080` if no usable port exists |
 | `GRID_GATEWAY_DISCOVERY_INTERVAL_MS` | Polling interval for gateway discovery (default: `5000`) |
 
 Gateway port discovery reads only the gateway Service's `spec.ports`; Pod health
@@ -883,7 +883,15 @@ runtime via a watch channel.
 poller entirely.
 
 Set `GRID_GATEWAY_DISCOVERY_ENABLED=false` on a consumer-only site that has no
-local gateway address to advertise. The default is `true` for compatibility.
+local gateway address to advertise. The default is `true`. Disabling discovery
+stops Service lookups and the poller, but an explicit `GRID_GATEWAY_ADDRESS`
+still wins and is advertised.
+
+Discovery uses the first LoadBalancer ingress hostname or IP. The advertised
+port is `GRID_GATEWAY_PORT` when set, otherwise the first Service `spec.ports`
+entry, with `8080` as the fallback if no usable port exists. A ClusterIP or
+NodePort Service supplies no discovered address; use an explicit reachable
+address for those Service types.
 
 ```bash
 # Self-discovery (default): operator discovers from provider-gateway Service
@@ -902,9 +910,10 @@ GRID_GATEWAY_ADDRESS=10.0.0.4:8080 ./operator
 - This address is separate from `GRID_SWIM_BIND_ADDR` — the SWIM gossip endpoint
   and the data-plane gateway address are distinct
 
-The current first-ingress, configured-port discovery contract is appropriate
-for the local MetalLB environment. A production endpoint is represented and
-validated by host, named port, protocol, SNI, address scope, and generation;
+The first-ingress discovery contract uses an explicit port override or the
+first declared Service port. It is appropriate for the local MetalLB environment.
+A production endpoint is represented and validated by host, named port, protocol,
+SNI, address scope, and generation;
 arbitrary or ambiguous advertised strings do not become routable endpoints.
 
 **Probe behavior:** In Mutual mode, the `GridSite` controller performs a bounded
