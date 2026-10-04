@@ -317,8 +317,26 @@ where
 /// A change detector over every identity file `config` names: the grid CA,
 /// client certificate, and key. Not a security function.
 ///
-/// Each file is hashed on its own, so no buffer holds the concatenated key.
+/// A rotation swaps the files at once but they are read one by one, so a pass
+/// that straddles the swap mixes versions. Read until two passes agree.
 fn identity_digest(config: &GridServingConfig) -> [u8; 32] {
+    let mut last = read_identity(config);
+    for _ in 0..IDENTITY_READS {
+        let next = read_identity(config);
+        if next == last {
+            break;
+        }
+        last = next;
+    }
+    last
+}
+
+/// Passes [`identity_digest`] makes after the first; a rotation tears at most one.
+const IDENTITY_READS: usize = 3;
+
+/// One pass over the identity files. Each file is hashed on its own, so no
+/// buffer holds the concatenated key.
+fn read_identity(config: &GridServingConfig) -> [u8; 32] {
     let paths: std::collections::BTreeSet<&str> = config
         .peers
         .iter()
@@ -620,6 +638,58 @@ mod tests {
         snapshot.candidates.iter().map(|c| c.site.to_string()).collect()
     }
 
+    /// The routable sites, sorted: which sites route, not their load order.
+    fn members(snapshot: &RouteSnapshot) -> Vec<String> {
+        let mut sites = sites(snapshot);
+        sites.sort();
+        sites
+    }
+
+    /// A `Secret` or `ConfigMap` volume: each file resolves through `..data`, which
+    /// `write` swaps in one rename, as the kubelet does.
+    struct Mount {
+        dir: PathBuf,
+        generation: usize,
+    }
+
+    impl Mount {
+        fn new(name: &str, files: &[(&str, &str)]) -> Self {
+            let dir = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+            let _stale = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("dir");
+            let mut mount = Self { dir, generation: 0 };
+            mount.write(files);
+            mount
+        }
+
+        fn path(&self, name: &str) -> String {
+            self.dir.join(name).to_string_lossy().into_owned()
+        }
+
+        /// Publish `files` together; earlier files are dropped, as in a new Secret version.
+        fn write(&mut self, files: &[(&str, &str)]) {
+            self.generation = self.generation.saturating_add(1);
+            let version = format!("..{}", self.generation);
+            std::fs::create_dir(self.dir.join(&version)).expect("version dir");
+            for (name, content) in files {
+                std::fs::write(self.dir.join(&version).join(name), content).expect("write");
+                let link = self.dir.join(name);
+                if std::fs::symlink_metadata(&link).is_err() {
+                    std::os::unix::fs::symlink(format!("..data/{name}"), &link).expect("file link");
+                }
+            }
+            let staged = self.dir.join("..data_tmp");
+            std::os::unix::fs::symlink(&version, &staged).expect("data link");
+            std::fs::rename(&staged, self.dir.join("..data")).expect("swap");
+        }
+    }
+
+    impl Drop for Mount {
+        fn drop(&mut self) {
+            let _removed = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
     fn front(snapshot: &ArcSwap<RouteSnapshot>) -> Option<String> {
         snapshot.load().candidates.first().map(|c| c.site.to_string())
     }
@@ -740,8 +810,10 @@ mod tests {
     #[test]
     fn an_invalid_config_keeps_the_last_good_one() {
         let peers = Peers::default();
-        let grid = runtime(&peers, &config(&["east"]));
-        let before = grid.snapshot().load_full();
+        let mut control = Control::new(&config(&["east"]), peers.starter()).expect("control");
+        control.apply(&config(&["east"])).expect("first apply");
+        // The topology, not the snapshot: a poller's scrape re-publishes the snapshot.
+        let before = control.topology.load_full();
 
         let mut bad_candidate = config(&["east", "west"]);
         bad_candidate.candidates[1].name = String::new();
@@ -750,12 +822,17 @@ mod tests {
         let mut zero = config(&["east", "west"]);
         zero.peers[1].interval_ms = 0;
         for bad in [bad_candidate, twice, zero] {
-            grid.reload(&bad).expect_err("an invalid config is rejected");
+            control.apply(&bad).expect_err("an invalid config is rejected");
         }
 
         assert!(
-            Arc::ptr_eq(&before, &grid.snapshot().load_full()),
-            "the snapshot is untouched"
+            Arc::ptr_eq(&before, &control.topology.load_full()),
+            "a rejected config publishes no topology"
+        );
+        assert_eq!(
+            sites(&control.snapshot().load()),
+            ["east"],
+            "the routable sites are unchanged"
         );
         assert_eq!(peers.starts("west"), 0, "no poller started for a rejected config");
         assert_eq!(peers.starts("east"), 1);
@@ -960,7 +1037,7 @@ mod tests {
 
         grid.reload(&config(&["east"])).expect("reload");
 
-        assert_eq!(sites(&in_flight), ["east", "west"], "the request keeps its snapshot");
+        assert_eq!(members(&in_flight), ["east", "west"], "the request keeps its snapshot");
         assert_eq!(sites(&snapshot.load()), ["east"], "the next request sees the new one");
     }
 
@@ -1059,7 +1136,7 @@ mod tests {
 
         write(&yaml(&["east", "west"]));
         eventually("the rewrite handled", || counts().applied() == 1);
-        assert_eq!(sites(&snapshot.load()), ["east", "west"], "the rewrite applied");
+        assert_eq!(members(&snapshot.load()), ["east", "west"], "the rewrite applied");
         eventually("west polled", || peers.fetches("west") > 0);
 
         drop(grid);
@@ -1068,18 +1145,17 @@ mod tests {
 
     #[test]
     fn a_renewed_identity_restarts_the_pollers_with_no_config_change() {
-        let dir = std::env::temp_dir().join(format!("grid-identity-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("dir");
-        let file = |name: &str| dir.join(name).to_string_lossy().into_owned();
-        for name in ["ca.pem", "tls.crt", "tls.key"] {
-            std::fs::write(file(name), "old").expect("write");
-        }
+        let mut identity = Mount::new(
+            "grid-identity",
+            &[("ca.pem", "old"), ("tls.crt", "old"), ("tls.key", "old")],
+        );
         let mut serving = config(&["east"]);
-        serving.peers[0].grid_ca_path = file("ca.pem");
-        serving.peers[0].client_cert_path = file("tls.crt");
-        serving.peers[0].client_key_path = file("tls.key");
-        let path = dir.join("serving.yaml");
-        std::fs::write(&path, serde_yaml::to_string(&serde_yaml_value(&serving)).expect("yaml")).expect("write");
+        serving.peers[0].grid_ca_path = identity.path("ca.pem");
+        serving.peers[0].client_cert_path = identity.path("tls.crt");
+        serving.peers[0].client_key_path = identity.path("tls.key");
+        let yaml = serde_yaml::to_string(&serde_yaml_value(&serving)).expect("yaml");
+        let file = Mount::new("grid-identity-serving", &[("serving.yaml", &yaml)]);
+        let path = file.path("serving.yaml");
 
         let peers = Peers::default();
         let mut grid = runtime(&peers, &serving);
@@ -1092,23 +1168,59 @@ mod tests {
         let counts = || grid.watcher().expect("watching").counts();
         eventually("the startup file seen", || counts().reused() == 1);
 
-        for name in ["tls.crt", "tls.key"] {
-            std::fs::write(file(name), "renewed").expect("renew");
-        }
+        identity.write(&[("ca.pem", "old"), ("tls.crt", "renewed"), ("tls.key", "renewed")]);
         eventually("the renewal applied", || counts().applied() == 1);
         assert_eq!(peers.starts("east"), 2, "the poller restarted on the renewed identity");
         std::thread::sleep(Duration::from_millis(100));
         assert_eq!(counts().applied(), 1, "a settled identity restarts nothing more");
 
         drop(grid);
-        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn an_identity_read_during_a_rotation_sees_one_version() {
+        let old = [("ca.pem", "ca"), ("tls.crt", "old"), ("tls.key", "old")];
+        let new = [("ca.pem", "ca"), ("tls.crt", "new"), ("tls.key", "new")];
+        let mut identity = Mount::new("grid-torn", &old);
+        let mut serving = config(&["east"]);
+        serving.peers[0].grid_ca_path = identity.path("ca.pem");
+        serving.peers[0].client_cert_path = identity.path("tls.crt");
+        serving.peers[0].client_key_path = identity.path("tls.key");
+        let old_digest = identity_digest(&serving);
+        identity.write(&new);
+        let new_digest = identity_digest(&serving);
+
+        // Each swap waits for two reads after the last, so no read spans two swaps,
+        // however long the reader stalls. A real rotation is hours apart.
+        let reads = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&reads);
+        let rotating = std::thread::spawn(move || {
+            for round in 0..40 {
+                let after = counted.load(Ordering::SeqCst).saturating_add(2);
+                let deadline = Instant::now().checked_add(Duration::from_secs(5)).expect("deadline");
+                while counted.load(Ordering::SeqCst) < after && Instant::now() < deadline {
+                    std::thread::yield_now();
+                }
+                identity.write(if round % 2 == 0 { &old } else { &new });
+            }
+            identity
+        });
+        while !rotating.is_finished() {
+            let digest = identity_digest(&serving);
+            assert!(
+                digest == old_digest || digest == new_digest,
+                "read {} mixed two versions of the identity",
+                reads.load(Ordering::SeqCst)
+            );
+            reads.fetch_add(1, Ordering::SeqCst);
+        }
+        drop(rotating.join().expect("rotation"));
     }
 
     #[test]
     fn a_change_that_fails_on_unreadable_identity_is_retried_until_it_applies() {
-        let dir = std::env::temp_dir().join(format!("grid-retry-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("dir");
-        let cert = dir.join("tls.crt");
+        let mut identity = Mount::new("grid-retry", &[]);
+        let cert = PathBuf::from(identity.path("tls.crt"));
         let peers = Peers::default();
         let ok = peers.starter();
         let watched = cert.clone();
@@ -1121,39 +1233,39 @@ mod tests {
         let mut grid = crate::serving::start_runtime(&config(&["west"]), start).expect("runtime starts");
         let mut serving = config(&["west", "east"]);
         serving.peers[1].client_cert_path = cert.to_string_lossy().into_owned();
-        let path = dir.join("serving.yaml");
-        std::fs::write(&path, serde_yaml::to_string(&serde_yaml_value(&serving)).expect("yaml")).expect("write");
+        let yaml = serde_yaml::to_string(&serde_yaml_value(&serving)).expect("yaml");
+        let file = Mount::new("grid-retry-serving", &[("serving.yaml", &yaml)]);
+        let path = file.path("serving.yaml");
 
         grid.watch(&path, Duration::from_millis(20)).expect("watch");
         let counts = || grid.watcher().expect("watching").counts();
         eventually("the change retried", || counts().rejected() >= 2);
         assert_eq!(sites(&grid.snapshot().load()), ["west"], "the old config stays");
 
-        std::fs::write(&cert, "issued").expect("issue");
+        identity.write(&[("tls.crt", "issued")]);
         eventually("the pending change applied", || counts().applied() == 1);
-        assert_eq!(sites(&grid.snapshot().load()), ["west", "east"]);
+        assert_eq!(
+            members(&grid.snapshot().load()),
+            ["east", "west"],
+            "the pending change applied"
+        );
 
         drop(grid);
-        std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 
     #[test]
     fn a_refused_file_neither_blocks_renewal_nor_repeats_its_rejection() {
-        let dir = std::env::temp_dir().join(format!("grid-refused-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("dir");
-        let file = |name: &str| dir.join(name).to_string_lossy().into_owned();
-        for name in ["ca.pem", "tls.crt", "tls.key"] {
-            std::fs::write(file(name), "old").expect("write");
-        }
+        let mut identity = Mount::new(
+            "grid-refused",
+            &[("ca.pem", "old"), ("tls.crt", "old"), ("tls.key", "old")],
+        );
         let mut serving = config(&["east"]);
-        serving.peers[0].grid_ca_path = file("ca.pem");
-        serving.peers[0].client_cert_path = file("tls.crt");
-        serving.peers[0].client_key_path = file("tls.key");
-        let path = dir.join("serving.yaml");
-        let write = |config: &GridServingConfig| {
-            std::fs::write(&path, serde_yaml::to_string(&serde_yaml_value(config)).expect("yaml")).expect("write");
-        };
-        write(&serving);
+        serving.peers[0].grid_ca_path = identity.path("ca.pem");
+        serving.peers[0].client_cert_path = identity.path("tls.crt");
+        serving.peers[0].client_key_path = identity.path("tls.key");
+        let yaml = |config: &GridServingConfig| serde_yaml::to_string(&serde_yaml_value(config)).expect("yaml");
+        let mut file = Mount::new("grid-refused-serving", &[("serving.yaml", &yaml(&serving))]);
+        let path = file.path("serving.yaml");
 
         let peers = Peers::default();
         let mut grid = runtime(&peers, &serving);
@@ -1163,7 +1275,7 @@ mod tests {
 
         let mut twice = config(&["east", "west"]);
         twice.peers[1].site = "east".to_owned();
-        write(&twice);
+        file.write(&[("serving.yaml", &yaml(&twice))]);
         eventually("the duplicate site refused", || counts().rejected() == 1);
         std::thread::sleep(Duration::from_millis(200));
         assert_eq!(
@@ -1173,9 +1285,7 @@ mod tests {
         );
         assert_eq!(peers.starts("east"), 1, "a refused file starts and drops no poller");
 
-        for name in ["tls.crt", "tls.key"] {
-            std::fs::write(file(name), "renewed").expect("renew");
-        }
+        identity.write(&[("ca.pem", "old"), ("tls.crt", "renewed"), ("tls.key", "renewed")]);
         eventually("the running config renewed", || counts().applied() == 1);
         assert_eq!(
             peers.starts("east"),
@@ -1189,7 +1299,6 @@ mod tests {
         );
 
         drop(grid);
-        std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 
     /// `config` in the operator's serving-config shape.
