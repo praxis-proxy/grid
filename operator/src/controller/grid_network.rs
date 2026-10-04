@@ -1516,6 +1516,22 @@ fn note_inconsistent(network: ObjectRef<GridNetwork>, inconsistent: bool) -> boo
 // Routing Overlay
 // ---------------------------------------------------------------------------
 
+/// Publish each site's phase as `grid_site_phase`.
+fn publish_site_phases(sites: &[GridSite]) {
+    crate::metrics::set_site_phases(site_phases(sites));
+}
+
+/// Each site's name and the phase its printer column shows. No status yet is Pending,
+/// the phase a new `GridSite` starts in.
+fn site_phases(sites: &[GridSite]) -> impl Iterator<Item = (&str, &'static str)> {
+    sites.iter().filter_map(|site| {
+        let phase = site.status.as_ref().map_or("Pending", |status| {
+            crate::controller::grid_site::phase_label(&status.phase)
+        });
+        Some((site.metadata.name.as_deref()?, phase))
+    })
+}
+
 /// Reconcile routing overlay `ConfigMap`s for a [`GridNetwork`].
 ///
 /// Lists all [`InferenceProvider`]s and [`GridSite`]s cluster-wide, then
@@ -1568,7 +1584,11 @@ async fn reconcile_routing_overlay_inner(
 ) -> Result<OverlayOutcome, OperatorError> {
     let network_name = grid_network_name(network)?;
 
-    let sites = list_all_grid_sites(client).await?;
+    // Every reconcile lists the sites, so the phase gauge follows each status change and deletion.
+    let sites = list_all_grid_sites(client)
+        .await
+        .inspect_err(|_error| crate::metrics::clear_site_phases())?;
+    publish_site_phases(&sites);
 
     let metrics_by_str: HashMap<&str, scoring::BackendMetrics> =
         raw_metrics.iter().map(|(k, v)| (k.as_str(), *v)).collect();
@@ -4995,6 +5015,33 @@ mod tests {
         assert_eq!(status.reason, IDENTITY_UNREADABLE);
         assert!(status.message.contains("re-enroll"), "names the recovery");
         assert!(status.not_after.is_empty() && status.fingerprint.is_empty());
+    }
+
+    #[test]
+    fn a_site_reports_the_phase_its_status_shows_and_pending_before_any() {
+        let site = |name: &str, phase: Option<&str>| -> GridSite {
+            let mut object = serde_json::json!({
+                "apiVersion": "grid.praxis.fast/v1alpha1",
+                "kind": "GridSite",
+                "metadata": { "name": name },
+                "spec": { "gridNetworkRef": "grid" },
+            });
+            if let Some(phase) = phase
+                && let Some(map) = object.as_object_mut()
+            {
+                map.insert("status".to_owned(), serde_json::json!({ "phase": phase }));
+            }
+            serde_json::from_value(object).unwrap_or_else(|_| std::process::abort())
+        };
+        let sites = [
+            site("hub", Some("Active")),
+            site("east", None),
+            site("west", Some("Unreachable")),
+        ];
+        assert_eq!(
+            site_phases(&sites).collect::<Vec<_>>(),
+            [("hub", "Active"), ("east", "Pending"), ("west", "Unreachable")]
+        );
     }
 
     #[test]

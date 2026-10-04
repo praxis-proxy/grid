@@ -422,7 +422,7 @@ fn resolve_pins(site: &GridSite) -> Result<Vec<CanonicalFingerprint>, GatewayPro
 }
 
 /// Bounded label for a [`GridSitePhase`] value in metrics.
-fn phase_label(phase: &GridSitePhase) -> &'static str {
+pub(crate) fn phase_label(phase: &GridSitePhase) -> &'static str {
     match phase {
         GridSitePhase::Pending => "Pending",
         GridSitePhase::Discovered => "Discovered",

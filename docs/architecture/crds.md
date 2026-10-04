@@ -389,6 +389,14 @@ A discovered SWIM peer is not automatically authorized for routing.
   cannot connect. Identity or trust failures demote Active to Connecting, distinguishing a
   reachable but unverified endpoint from an unreachable endpoint.
 
+**Metrics:** `grid_site_phase{site,phase}` reports each `GridSite`'s phase as a state
+set, the shape of kube-state-metrics' `kube_pod_status_phase`. The series for the
+current phase is 1 and the other five are 0, so a site is ready when
+`grid_site_phase{phase="Active"} == 1`. It follows the phase the printer column shows,
+updates on every `GridNetwork` reconcile, and drops a site's series once its `GridSite`
+is gone. Cardinality is six series per site. `grid_site_phase_transition_total`
+still counts the transitions by phase and reason.
+
 **`spec.egress.address` source:** For auto-discovered sites, the egress address is sourced from
 the remote operator's `GRID_GATEWAY_ADDRESS` environment variable, propagated through the SWIM
 state broadcast.  If the remote operator has not configured `GRID_GATEWAY_ADDRESS`, the field
