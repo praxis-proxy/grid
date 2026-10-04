@@ -1,0 +1,148 @@
+@import "tailwindcss";
+
+/*
+ * Design tokens (spec section 2). Single dark theme; every color the UI uses
+ * is one of these. The health colors are duplicated in src/lib/health.ts for
+ * SVG markup that cannot read CSS variables; health.test.ts pins both.
+ */
+@theme {
+  --color-bg: #0b0f12;
+  --color-surface: #12181d;
+  --color-surface-2: #171f26;
+  --color-line: #243039;
+  --color-ink: #e6ecf0;
+  --color-ink-2: #8a99a6;
+  --color-ink-3: #5b6b7a;
+  --color-accent: #2fc4d1;
+  --color-healthy: #38b26a;
+  --color-degraded: #e0a21c;
+  --color-down: #de4b3f;
+  --color-land: #1a2228;
+  --color-coast: #2c3944;
+  --font-sans: ui-sans-serif, system-ui, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+
+  /* Type scale. 11 px is the floor: text-xs is the smallest size in the app. */
+  --text-xs: 11px;
+  --text-xs--line-height: 1.35;
+  --text-sm: 12px;
+  --text-sm--line-height: 1.4;
+  --text-base: 13px;
+  --text-base--line-height: 1.45;
+  --text-lg: 15px;
+  --text-lg--line-height: 1.3;
+  --text-xl: 18px;
+  --text-xl--line-height: 1.25;
+  --text-2xl: 22px;
+  --text-2xl--line-height: 1.15;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  overflow: hidden;
+  background: var(--color-bg);
+  color: var(--color-ink);
+}
+
+.leaflet-container {
+  background: var(--color-bg);
+  font-family: inherit;
+}
+
+/* Node glyphs rendered inside L.divIcon */
+.fleet-node {
+  background: transparent;
+  border: 0;
+}
+.fleet-node svg {
+  display: block;
+  overflow: visible;
+}
+/* Label: hidden by default, shown on hover, keyboard focus (the marker div
+   itself is focusable), or selection. */
+.fleet-node__label {
+  position: absolute;
+  top: 100%;
+  left: 50%;
+  transform: translateX(-50%);
+  margin-top: 2px;
+  text-align: center;
+  white-space: nowrap;
+  font-size: 11px;
+  line-height: 1.2;
+  color: var(--color-ink);
+  text-shadow: 0 1px 2px #000, 0 0 4px #000;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+.fleet-node:hover .fleet-node__label,
+.fleet-node:focus-within .fleet-node__label,
+.fleet-node--labelled .fleet-node__label {
+  opacity: 1;
+}
+.fleet-node__label span {
+  display: block;
+}
+.fleet-node__label span + span {
+  color: var(--color-ink-2);
+}
+/* Cluster glyphs (leaflet.markercluster with our own icon) */
+.fleet-cluster {
+  background: transparent;
+  border: 0;
+}
+.fleet-cluster svg {
+  display: block;
+  overflow: visible;
+}
+/* Down sites: a ring expands out of the glyph and fades (spec section 3.3). */
+.fleet-node__halo {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: fleet-halo 2.4s ease-out infinite;
+}
+@keyframes fleet-halo {
+  from {
+    opacity: 0.5;
+    transform: scale(1);
+  }
+  to {
+    opacity: 0;
+    transform: scale(2.2);
+  }
+}
+
+/* Drill-down panel slide-in */
+.fleet-panel {
+  animation: fleet-panel-in 0.18s ease-out;
+}
+@keyframes fleet-panel-in {
+  from {
+    transform: translateX(24px);
+    opacity: 0;
+  }
+  to {
+    transform: none;
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-pulse,
+  .animate-spin {
+    animation: none;
+  }
+  .fleet-node__halo {
+    animation: none;
+    opacity: 0;
+  }
+  .fleet-panel {
+    animation: none;
+  }
+  .fleet-node__label {
+    transition: none;
+  }
+}
