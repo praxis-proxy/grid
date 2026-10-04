@@ -37,21 +37,14 @@ old and new names.
 
 ## Upgrade to 0.1.5
 
-You can upgrade to 0.1.5 with existing field names. Update manifests and
-`grid-site` values to the current names when convenient.
+Existing CRD spec field names and `grid-site` values remain accepted in 0.1.5.
+Update manifests and Helm values to the current names when convenient.
 
-## Before upgrading to 0.1.6
-
-1. Back up the affected custom resources and Helm values.
-2. Update manifests and Helm values using the mapping above.
-3. Pause the operator before installing the 0.1.6 CRD schemas.
-4. Apply the updated custom resources and upgrade `grid-site` with its updated
-   values.
-5. Start the 0.1.6 operator after all affected resources use the current names.
-
-Status output uses the current names in 0.1.5; the compatibility window covers
-spec fields and chart values. Update scripts and dashboards that read status.
-Status is operator-owned and should not be edited by hand.
+Status fields and reasons change in 0.1.5 without legacy aliases. Update scripts
+and dashboards that read them during the 0.1.5 upgrade, including
+`overlayStatus` to `routingMapStatus` and `consumerConfigStatus` to
+`praxisConfigStatus`. Status is operator-owned; do not migrate it by hand.
+The compatibility window covers spec fields and chart values only.
 
 | Previous status field or reason | Current status field or reason |
 |---|---|
@@ -65,3 +58,12 @@ Status is operator-owned and should not be edited by hand.
 | `ConsumerConfigError` | `PraxisConfigError` |
 | `ConsumerConfigDisabled` | `PraxisConfigDisabled` |
 | `EgressMissing` | `GatewayAddressMissing` |
+
+## Before upgrading to 0.1.6
+
+1. Back up the affected custom resources and Helm values.
+2. Update manifests and Helm values using the mapping above.
+3. Pause the operator before installing the 0.1.6 CRD schemas.
+4. Apply the updated custom resources and upgrade `grid-site` with its updated
+   values.
+5. Start the 0.1.6 operator after all affected resources use the current names.
