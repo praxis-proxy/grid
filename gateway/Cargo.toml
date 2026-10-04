@@ -311,7 +311,7 @@ path = "src/main.rs"
 praxis-proxy = { version = "0.7.3", features = ["spiffe"] }
 praxis-proxy-filter = "0.7.3"
 praxis-proxy-core = "0.7.3"
-praxis-ai-filters = { git = "https://github.com/praxis-proxy/ai.git", rev = "17b41771fcd53b22ab5c6f9badede0de9021404c" }
+praxis-ai-filters = { git = "https://github.com/praxis-proxy/ai.git", rev = "17b41771fcd53b22ab5c6f9badede0de9021404c", default-features = false }
 ai-grid-filters = { path = "ai-grid-filters" }
 tracing = "0.1.44"
 
