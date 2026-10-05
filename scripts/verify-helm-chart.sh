@@ -1268,7 +1268,7 @@ CR_EOF
     --set nameOverride=test-gateway-missing 2>&1); then
     fail "kind: BYO mode accepts a missing ConfigMap"
     helm uninstall test-gateway-missing --namespace grid-system --kube-context "$KCTX" >/dev/null 2>&1 || true
-  elif echo "$MISSING_OUT" | grep -Fq 'ConfigMap "missing-gateway-config" not found in namespace "grid-system"'; then
+  elif echo "$MISSING_OUT" | matches -F 'ConfigMap "missing-gateway-config" not found in namespace "grid-system"'; then
     pass "kind: BYO mode fails when ConfigMap is missing"
   else
     fail "kind: BYO mode failed without the missing ConfigMap error: $MISSING_OUT"

@@ -126,6 +126,7 @@ Helm install or upgrade looks up that ConfigMap in the release namespace. If
 it is missing, the chart looks up the `kube-system` Namespace to detect a live
 cluster and then fails before creating the Deployment. Offline `helm template`
 skips this check. Inline defaults still work without an existing ConfigMap.
+Any named ConfigMap must already exist, including one created by the operator.
 
 The Helm client's credentials need `get` access to the named ConfigMap. When
 it is missing, they also need `get` access to Namespace `kube-system`. A denied
