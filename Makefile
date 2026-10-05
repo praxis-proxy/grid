@@ -7,14 +7,13 @@ V                ?=
 NIGHTLY_RUSTFMT   ?= nightly-2026-03-28
 KIND_CLUSTER_NAME ?= praxis-grid
 PROJECT_IMAGE    ?= praxis-grid:dev
-KUBECTL          ?= kubectl --context kind-$(KIND_CLUSTER_NAME)
 
 ifneq ($(V),)
   _NOCAPTURE := -- --nocapture
 endif
 
 .PHONY: all build release check clean \
-	test test-unit lint lint-extra fmt doc audit \
+	test test-unit lint gateway-lint lint-extra fmt doc audit \
 	generate-api-types codegen-check generate-crds crds-check \
 	coverage coverage-check \
 	mutants semver publish-dry-run \
@@ -22,7 +21,7 @@ endif
 	images container operator-image gateway-image \
 	mock-providers-image overlay-sync-image glb-demo-images \
 	kind-up kind-down \
-	dev-env dev-push dev-integration \
+	dev-env dev-push \
 	setup-hooks \
 	helm-lint helm-test praxis-gateway-e2e \
 	help
@@ -62,10 +61,19 @@ test-unit:
 # Quality
 # -------------------------------------------------------------------
 
-lint:
+lint: gateway-lint
 	cargo clippy --locked --workspace --all-targets -- -D warnings
 	cargo +$(NIGHTLY_RUSTFMT) fmt --all -- --check
 	cargo machete
+
+gateway-lint:
+	cargo clippy --manifest-path gateway/Cargo.toml --workspace --all-targets -- -D warnings
+	cargo +$(NIGHTLY_RUSTFMT) fmt --manifest-path gateway/Cargo.toml --all -- --check
+	cargo machete gateway
+	@set -eu; \
+	  tree="$$(cargo tree --manifest-path gateway/Cargo.toml -p gateway -e normal --target all --prefix none --format '{p}')"; \
+	  printf '%s\n' "$$tree" | grep -q '^openssl-sys ' || { echo "positive control failed: openssl-sys is not in the tree" >&2; exit 1; }; \
+	  if printf '%s\n' "$$tree" | grep -q '^ring '; then echo "ring is in the gateway's normal dependency tree" >&2; exit 1; fi
 
 fmt:
 	cargo +$(NIGHTLY_RUSTFMT) fmt --all
@@ -118,7 +126,7 @@ coverage:
 		--exclude xtask \
 		--ignore-filename-regex '(target/|tests/)'
 
-# Convention target is 90%; ratchet up incrementally.
+# Coverage gate is 80% lines; ratchet up incrementally.
 coverage-check:
 	cargo llvm-cov --workspace --json \
 		--exclude xtask \
@@ -195,11 +203,6 @@ dev-push: | require-container-engine
 	$(CONTAINER_ENGINE) build -t $(PROJECT_IMAGE) -f Containerfile .
 	kind load docker-image $(PROJECT_IMAGE) --name $(KIND_CLUSTER_NAME)
 
-dev-integration:
-	@kind get kubeconfig --name $(KIND_CLUSTER_NAME) > /tmp/kind-$(KIND_CLUSTER_NAME).kubeconfig
-	KUBECONFIG=/tmp/kind-$(KIND_CLUSTER_NAME).kubeconfig \
-	cargo test --features integration -- --ignored $(if $(V),--nocapture,)
-
 # -------------------------------------------------------------------
 # Dev Setup
 # -------------------------------------------------------------------
@@ -220,7 +223,7 @@ help:
 	@echo "  PROJECT_IMAGE      container image tag"
 	@echo ""
 	@echo "Top-level:"
-	@echo "  all              build + lint + test + audit"
+	@echo "  all              build + fmt + lint + test + audit"
 	@echo ""
 	@echo "Build:"
 	@echo "  build            cargo build --workspace"
@@ -229,10 +232,11 @@ help:
 	@echo "  clean            cargo clean"
 	@echo ""
 	@echo "Test:"
-	@echo "  test             run all tests"
+	@echo "  test             run workspace tests (ignored tests excluded)"
 	@echo ""
 	@echo "Quality:"
-	@echo "  lint             clippy + rustfmt check + machete"
+	@echo "  lint             root checks + gateway-lint"
+	@echo "  gateway-lint     Gateway Clippy + rustfmt + machete + no-ring check"
 	@echo "  lint-extra       typos + taplo + shellcheck + actionlint"
 	@echo "  fmt              format with nightly rustfmt"
 	@echo "  doc              build docs with warnings denied"
@@ -258,13 +262,12 @@ help:
 	@echo "  glb-demo-images      build all Grid images tagged :glb-demo"
 	@echo ""
 	@echo "KIND:"
-	@echo "  kind-up          create cluster + deploy"
+	@echo "  kind-up          build image + create/reuse Kind base (Gateway API, MetalLB)"
 	@echo "  kind-down        delete cluster"
 	@echo ""
 	@echo "Dev Setup:"
 	@echo "  setup-hooks      install git pre-commit hook"
 	@echo ""
 	@echo "Development:"
-	@echo "  dev-env          create/reuse persistent cluster"
-	@echo "  dev-push         build + load + rollout"
-	@echo "  dev-integration  run integration tests"
+	@echo "  dev-env          build image + create/reuse Kind development base"
+	@echo "  dev-push         build + load image into Kind (no rollout)"

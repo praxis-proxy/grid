@@ -144,21 +144,6 @@ of.
 - Commit `proptest-regressions/` files: they pin found
   counterexamples as permanent regression tests.
 
-#### Integration Tests
-
-Integration tests that need external infrastructure
-(a cluster, a network endpoint) are gated behind a
-crate feature named `integration` and marked
-`#[ignore]`. They run via
-`make dev-integration`, which is equivalent to:
-
-```console
-cargo test --features integration -- --ignored
-```
-
-This keeps `make test` fast and hermetic while keeping
-end-to-end proof one command away.
-
 Prefer assertion messages over inline comments. Put the
 explanation in the assertion's message argument so it
 prints on failure:

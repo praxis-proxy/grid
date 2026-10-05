@@ -58,11 +58,11 @@ Run from the `grid/` directory:
 ```console
 make build          # workspace build
 make check          # type-check only (fast)
-make test           # all tests
+make test           # workspace tests (ignored tests excluded)
 make test V=1       # tests with --nocapture
 make fmt            # format with nightly rustfmt
-make lint           # clippy -D warnings + fmt check
-                    #   + machete
+make lint           # root + Gateway clippy, fmt, machete
+                    #   + Gateway no-ring dependency check
 make lint-extra     # typos + taplo + shellcheck
                     #   + actionlint
 make doc            # rustdoc -D warnings, private
