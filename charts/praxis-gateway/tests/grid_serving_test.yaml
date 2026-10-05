@@ -59,9 +59,9 @@ tests:
   - it: carries no sync wave without gridServing
     template: templates/deployment.yaml
     set:
-      gridServing.enabled: false
-      gatewayConfig.model: m
-      gatewayConfig.backends:
+      praxisConfig.render.gridServing.enabled: false
+      praxisConfig.render.model: m
+      praxisConfig.render.backends:
         - cluster: pool-b
           site: site-b
           endpoints: ["203.0.113.7:8443"]

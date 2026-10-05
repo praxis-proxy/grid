@@ -476,7 +476,7 @@ Probe with an empty tcpSocket pointed at the listener port.
 */}}
 {{/*
 Whether the gateway forwards to backend clusters: rendered backends, gridServing, or
-clusters in config.inline. Praxis /ready fails while any of them is down. Emits "true"
+clusters in praxisConfig.byo.inline. Praxis /ready fails while any of them is down. Emits "true"
 or nothing.
 */}}
 {{- define "praxis-gateway.servesBackends" -}}
@@ -535,7 +535,7 @@ backend would take every pod out of service.
 {{- end }}
 
 {{/*
-Whether config.inline declares a TLS listener. An existingConfigMap is opaque, so it yields
+Whether praxisConfig.byo.inline declares a TLS listener. A BYO ConfigMap is opaque, so it yields
 nothing. Emits "true" or nothing.
 */}}
 {{- define "praxis-gateway.maybeTLSListener" -}}
@@ -556,7 +556,7 @@ Admin listener address the chart rendered itself.
 
 {{/*
 Loopback host:port of the admin listener when the chart knows the config: the rendered
-config, else config.inline. An existingConfigMap is opaque, so it yields nothing.
+config, else praxisConfig.byo.inline. A BYO ConfigMap is opaque, so it yields nothing.
 */}}
 {{- define "praxis-gateway.adminAddress" -}}
 {{- $v := .Values -}}

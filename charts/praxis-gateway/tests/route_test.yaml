@@ -123,7 +123,8 @@ tests:
       route.tls.termination: reencrypt
       service.annotations:
         service.beta.openshift.io/serving-cert-secret-name: listener-tls
-      gatewayConfig.auth.allowUnauthenticatedExposure: true
+      listenerTls.secretName: listener-tls
+      praxisConfig.render.auth.allowUnauthenticatedExposure: true
     asserts:
       - equal:
           path: spec.tls.termination
@@ -138,7 +139,8 @@ tests:
       route.tls.termination: reencrypt
       service.annotations:
         service.beta.openshift.io/serving-cert-secret-name: other-tls
-      gatewayConfig.auth.allowUnauthenticatedExposure: true
+      listenerTls.secretName: listener-tls
+      praxisConfig.render.auth.allowUnauthenticatedExposure: true
     asserts:
       - failedTemplate:
           errorPattern: needs route.tls.destinationCACertificate
