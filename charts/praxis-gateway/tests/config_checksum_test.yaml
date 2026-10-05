@@ -6,17 +6,16 @@ release:
   namespace: grid
 set:
   image.flavor: grid-gateway
-  tls.enabled: true
-  tls.existingSecret: grid-site-identity
-  tls.caSecret: grid-ca
+  gridIdentity.tlsSecretName: grid-site-identity
+  gridIdentity.caSecretName: grid-ca
 tests:
-  - it: hashes the rendered config, so a gatewayConfig change rolls the pods
+  - it: hashes the rendered config, so a praxisConfig.render change rolls the pods
     set:
-      gatewayConfig.render: true
-      gatewayConfig.localSite: east
-      gatewayConfig.role: provider
-      gatewayConfig.peerTrust.certDigests: ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
-      gatewayConfig.backends:
+      praxisConfig.source: render
+      grid.siteName: east
+      praxisConfig.render.role: provider
+      praxisConfig.render.peerTrust.certDigests: ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
+      praxisConfig.render.backends:
         - cluster: local
           endpoints: ["10.96.0.20:8000"]
           transport: { mode: plaintext }
@@ -31,10 +30,11 @@ tests:
 
   - it: hashes the config when render turns on by itself
     set:
-      gatewayConfig.localSite: east
-      gatewayConfig.role: provider
-      gatewayConfig.peerTrust.certDigests: ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
-      gatewayConfig.backends:
+      praxisConfig.source: render
+      grid.siteName: east
+      praxisConfig.render.role: provider
+      praxisConfig.render.peerTrust.certDigests: ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
+      praxisConfig.render.backends:
         - cluster: local
           endpoints: ["10.96.0.20:8000"]
           transport: { mode: plaintext }
@@ -44,11 +44,11 @@ tests:
 
   - it: a changed backend endpoint changes the checksum
     set:
-      gatewayConfig.render: true
-      gatewayConfig.localSite: east
-      gatewayConfig.role: provider
-      gatewayConfig.peerTrust.certDigests: ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
-      gatewayConfig.backends:
+      praxisConfig.source: render
+      grid.siteName: east
+      praxisConfig.render.role: provider
+      praxisConfig.render.peerTrust.certDigests: ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
+      praxisConfig.render.backends:
         - cluster: local
           endpoints: ["10.96.0.21:8000"]
           transport: { mode: plaintext }
@@ -60,8 +60,8 @@ tests:
 
   - it: inline config is hashed as given
     set:
-      tls.enabled: false
-      config.inline: 'listeners: [{name: default, address: "0.0.0.0:8080"}]'
+      praxisConfig.source: byo
+      praxisConfig.byo.inline: 'listeners: [{name: default, address: "0.0.0.0:8080"}]'
     asserts:
       - equal:
           path: spec.template.metadata.annotations["checksum/config"]
@@ -69,8 +69,8 @@ tests:
 
   - it: an existing ConfigMap the chart does not own gets no checksum
     set:
-      tls.enabled: false
-      config.existingConfigMap: my-praxis
+      praxisConfig.source: byo
+      praxisConfig.byo.configMapName: my-praxis
     asserts:
       - notExists:
           path: spec.template.metadata.annotations["checksum/config"]
