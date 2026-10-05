@@ -846,9 +846,9 @@ kubectl delete crd gridnetworks.grid.praxis.fast \
 **Symptom:** Operator logs show it cannot find the provider gateway
 Service.
 
-**Cause:** Helm's fullname template produces `{release}-praxis-gateway`
-by default. If the operator's `gateway.serviceName` expects
-`provider-gateway`, the names don't match.
+**Cause:** The provider gateway Service name differs from the operator's
+`gateway.serviceName`. A Grid gateway uses its Helm release name by default;
+`fullnameOverride` can replace that name.
 
 **Fix:** Set `fullnameOverride: provider-gateway` in the provider
 gateway values and `gateway.serviceName: provider-gateway` in the

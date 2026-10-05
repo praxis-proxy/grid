@@ -255,10 +255,10 @@ first install, so set `grid.id` on an upgrade after it, or install the grid-site
 GridNetwork exists, with or without `grid.id`. Set them to match the grid's GridNetwork,
 wherever it comes from, and the operator never restarts when that network appears.
 
-When enrollment is enabled and `gateway.serviceName` is empty, the chart
-normalizes it to `grid-gateway`. A consumer-only enrolled site without that
-Service should set `gateway.discoveryEnabled: false`. This stops Service
-lookups; an explicit `gateway.address` still wins even when discovery is off.
+When enrollment is enabled or `grid.id` is set, an empty
+`gateway.serviceName` becomes `grid-gateway`. A consumer-only site without a
+gateway to advertise should set `gateway.discoveryEnabled: false`. This stops
+Service lookups; an explicit `gateway.address` still wins when discovery is off.
 For provider discovery, the Service must be `LoadBalancer`. ClusterIP and
 NodePort gateways need an explicit reachable `gateway.address`.
 

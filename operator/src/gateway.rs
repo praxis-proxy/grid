@@ -1,4 +1,4 @@
-//! Provider gateway address self-discovery.
+//! Site gateway address self-discovery.
 //!
 //! Resolves the data-plane gateway address this operator advertises to SWIM
 //! peers (populates `GridSite.spec.egress.address`): an explicit override wins,
@@ -127,7 +127,7 @@ pub async fn resolve(client: &Client, config: &Config) -> Result<Option<String>,
 
 /// Poll for the gateway Service address and re-announce it via SWIM.
 ///
-/// No-op when an explicit address override is set.
+/// No-op when discovery is disabled or an explicit address override is set.
 pub async fn run_discovery_poller(client: Client, swim: Arc<SwimHandle>, config: Config) {
     if !config.discovery_enabled {
         tracing::info!("gateway address discovery disabled; skipping discovery poller");
