@@ -23,7 +23,7 @@
 {{- end }}
 {{- end }}
 {{- /* A service-ca listener cert needs no destination CA: the router already trusts that CA. */}}
-{{- $serviceCa := and .Values.gatewayConfig.listenerTls.enabled (eq (get (.Values.service.annotations | default dict) "service.beta.openshift.io/serving-cert-secret-name" | default "") (.Values.gatewayConfig.listenerTls.existingSecret | default "-")) }}
+{{- $serviceCa := and .Values.listenerTls.secretName (eq (get (.Values.service.annotations | default dict) "service.beta.openshift.io/serving-cert-secret-name" | default "") (.Values.listenerTls.secretName | default "-")) }}
 {{- if and (eq $termination "reencrypt") (not .Values.route.tls.destinationCACertificate) (not $serviceCa) }}
 {{- fail "route.tls.termination reencrypt needs route.tls.destinationCACertificate, the CA that signed the gateway certificate, unless the listener cert is the service-ca one the Service annotation issues" }}
 {{- end }}

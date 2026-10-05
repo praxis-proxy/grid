@@ -453,14 +453,14 @@ Probe with an empty tcpSocket pointed at the listener port.
 */}}
 {{/*
 Whether the gateway forwards to backend clusters: rendered backends, gridServing, or
-clusters in config.inline. Praxis /ready fails while any of them is down. Emits "true"
+clusters in praxisConfig.byo.inline. Praxis /ready fails while any of them is down. Emits "true"
 or nothing.
 */}}
 {{- define "praxis-gateway.servesBackends" -}}
 {{- $v := .Values -}}
-{{- if or (and $v.gatewayConfig.render $v.gatewayConfig.backends) ($v.gridServing).enabled -}}
+{{- if or (and (eq $v.praxisConfig.source "render") $v.praxisConfig.render.backends) ($v.praxisConfig.render.gridServing).enabled -}}
 true
-{{- else if and (not ($v.config).existingConfigMap) (not $v.gatewayConfig.render) ((fromYaml (($v.config).inline | default "")).clusters) -}}
+{{- else if and (eq $v.praxisConfig.source "byo") (not ($v.praxisConfig.byo).configMapName) ((fromYaml (($v.praxisConfig.byo).inline | default "")).clusters) -}}
 true
 {{- end -}}
 {{- end }}
@@ -512,13 +512,13 @@ backend would take every pod out of service.
 {{- end }}
 
 {{/*
-Whether config.inline declares a TLS listener. An existingConfigMap is opaque, so it yields
+Whether praxisConfig.byo.inline declares a TLS listener. A BYO ConfigMap is opaque, so it yields
 nothing. Emits "true" or nothing.
 */}}
 {{- define "praxis-gateway.maybeTLSListener" -}}
 {{- $v := .Values -}}
-{{- if not ($v.config).existingConfigMap -}}
-{{- range ((fromYaml (($v.config).inline | default "")).listeners | default list) -}}
+{{- if and (eq $v.praxisConfig.source "byo") (not ($v.praxisConfig.byo).configMapName) -}}
+{{- range ((fromYaml (($v.praxisConfig.byo).inline | default "")).listeners | default list) -}}
 {{- if .tls }}true{{ end -}}
 {{- end -}}
 {{- end -}}
@@ -533,15 +533,15 @@ Admin listener address the chart rendered itself.
 
 {{/*
 Loopback host:port of the admin listener when the chart knows the config: the rendered
-config, else config.inline. An existingConfigMap is opaque, so it yields nothing.
+config, else praxisConfig.byo.inline. A BYO ConfigMap is opaque, so it yields nothing.
 */}}
 {{- define "praxis-gateway.adminAddress" -}}
 {{- $v := .Values -}}
 {{- $addr := "" -}}
-{{- if $v.gatewayConfig.render -}}
+{{- if eq $v.praxisConfig.source "render" -}}
 {{- $addr = include "praxis-gateway.renderedAdminAddress" . -}}
-{{- else if not ($v.config).existingConfigMap -}}
-{{- $addr = (((fromYaml (($v.config).inline | default "")).admin | default dict).address | default "") | toString -}}
+{{- else if and (eq $v.praxisConfig.source "byo") (not ($v.praxisConfig.byo).configMapName) -}}
+{{- $addr = (((fromYaml (($v.praxisConfig.byo).inline | default "")).admin | default dict).address | default "") | toString -}}
 {{- end -}}
 {{- if regexMatch "^(127\\.0\\.0\\.1|localhost|0\\.0\\.0\\.0):[0-9]+$" $addr -}}
 {{- printf "127.0.0.1:%s" (regexReplaceAll "^.*:" $addr "") -}}

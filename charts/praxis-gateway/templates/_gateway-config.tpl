@@ -160,7 +160,7 @@ The data of the chart-rendered gateway ConfigMap, also hashed into checksum/conf
           - filter: load_balancer
             clusters:
               {{- range $i, $backend := $cfg.backends }}
-              {{- $mode := (.transport).mode | default (ternary "mutual_tls" "plaintext" (not (empty $.Values.gridIdentity.secretName))) }}
+              {{- $mode := (.transport).mode | default (ternary "mutual_tls" "plaintext" (not (empty $.Values.gridIdentity.tlsSecretName))) }}
               {{- $hc := .healthCheck | default dict }}
               - name: {{ .cluster | quote }}
                 {{- if eq $mode "mutual_tls" }}
