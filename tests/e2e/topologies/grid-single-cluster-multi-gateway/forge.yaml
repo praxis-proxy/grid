@@ -46,8 +46,8 @@ spec:
               set -eu;
               d=$(mktemp -d);
               trap 'rm -rf "${d}"' EXIT;
-              openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/O=ai-grid/CN=qualification-ca" -keyout "${d}/ca.key" -out "${d}/ca.crt" >/dev/null 2>&1;
-              openssl req -newkey rsa:2048 -nodes -subj "/O=ai-grid/CN=grid-gateway.grid.internal" -keyout "${d}/gateway.key" -out "${d}/gateway.csr" >/dev/null 2>&1;
+              openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=qualification-ca" -keyout "${d}/ca.key" -out "${d}/ca.crt" >/dev/null 2>&1;
+              openssl req -newkey rsa:2048 -nodes -subj "/O=single/CN=grid-gateway.grid.internal" -keyout "${d}/gateway.key" -out "${d}/gateway.csr" >/dev/null 2>&1;
               printf "subjectAltName=DNS:grid-gateway.grid.internal,DNS:provider-a.grid.internal,DNS:provider-b.grid.internal,DNS:provider-c.grid.internal,DNS:grid-system.svc.cluster.local" > "${d}/ext.cnf";
               openssl x509 -req -days 1 -in "${d}/gateway.csr" -CA "${d}/ca.crt" -CAkey "${d}/ca.key" -CAcreateserial -out "${d}/gateway.crt" -extfile "${d}/ext.cnf" >/dev/null 2>&1;
               kubectl --context kind-grid-single-cluster-multi-gateway-single -n grid-system create secret generic consumer-gateway-tls --from-file=ca.crt="${d}/ca.crt" --from-file=tls.crt="${d}/gateway.crt" --from-file=tls.key="${d}/gateway.key" --dry-run=client -o yaml | kubectl --context kind-grid-single-cluster-multi-gateway-single apply -f - >/dev/null;

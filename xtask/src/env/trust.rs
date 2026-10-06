@@ -469,7 +469,11 @@ mod tests {
         let mut checked = 0_usize;
         for entry in std::fs::read_dir(&root).unwrap_or_else(|_| std::process::abort()) {
             let topology = entry.unwrap_or_else(|_| std::process::abort()).path();
-            let clusters = topology_clusters(&topology.join("forge.yaml"));
+            let forge = topology.join("forge.yaml");
+            if !forge.is_file() {
+                continue;
+            }
+            let clusters = topology_clusters(&forge);
             if clusters.is_empty() {
                 continue;
             }
@@ -477,9 +481,10 @@ mod tests {
                 checked += assert_trusts_only_clusters(&config, &clusters);
             }
         }
-        assert!(
-            checked >= 8,
-            "expected every provider fixture to be checked, saw {checked}"
+        assert_eq!(
+            checked, 10,
+            "every provider fixture must be checked; a different count means one was added without \
+             coverage, or one dropped out of it"
         );
     }
 
@@ -504,13 +509,13 @@ mod tests {
     }
 
     /// Cluster names a topology declares, empty when it declares none.
+    ///
+    /// The caller skips a topology with no `forge.yaml`. One that exists but cannot be
+    /// read or parsed aborts instead of returning empty, because an empty list would make
+    /// the caller skip it too and lose its fixtures from the check without failing.
     fn topology_clusters(forge: &Path) -> Vec<String> {
-        let Ok(text) = std::fs::read_to_string(forge) else {
-            return Vec::new();
-        };
-        let Ok(doc) = serde_yaml::from_str::<serde_yaml::Value>(&text) else {
-            return Vec::new();
-        };
+        let text = std::fs::read_to_string(forge).unwrap_or_else(|_| std::process::abort());
+        let doc = serde_yaml::from_str::<serde_yaml::Value>(&text).unwrap_or_else(|_| std::process::abort());
         doc.get("spec")
             .and_then(|spec| spec.get("clusters"))
             .and_then(serde_yaml::Value::as_sequence)
@@ -523,16 +528,39 @@ mod tests {
             .unwrap_or_default()
     }
 
-    /// Organizations a Praxis config trusts, in either the list-item or mapping form.
-    fn trusted_organizations(text: &str) -> Vec<&str> {
-        text.lines()
-            .filter_map(|line| {
-                let line = line.trim();
-                line.strip_prefix("- organization:")
-                    .or_else(|| line.strip_prefix("organization:"))
-            })
-            .map(str::trim)
-            .collect()
+    /// Organizations every `peer_identity_trust` filter in a Praxis config trusts.
+    ///
+    /// Parsed as YAML rather than matched by line, so a quoted value or a trailing
+    /// comment reads as the value a gateway would load rather than as its spelling.
+    fn trusted_organizations(text: &str) -> Vec<String> {
+        let doc: serde_yaml::Value = serde_yaml::from_str(text).unwrap_or_else(|_| std::process::abort());
+        let mut out = Vec::new();
+        let chains = doc
+            .get("filter_chains")
+            .and_then(serde_yaml::Value::as_sequence)
+            .map_or_else(Vec::new, Clone::clone);
+        for chain in chains {
+            let filters = chain
+                .get("filters")
+                .and_then(serde_yaml::Value::as_sequence)
+                .map_or_else(Vec::new, Clone::clone);
+            for filter in filters {
+                if filter.get("filter").and_then(serde_yaml::Value::as_str) != Some("peer_identity_trust") {
+                    continue;
+                }
+                let peers = filter
+                    .get("trusted_peers")
+                    .and_then(serde_yaml::Value::as_sequence)
+                    .map_or_else(Vec::new, Clone::clone);
+                out.extend(
+                    peers
+                        .iter()
+                        .filter_map(|peer| peer.get("organization").and_then(serde_yaml::Value::as_str))
+                        .map(str::to_owned),
+                );
+            }
+        }
+        out
     }
 
     /// Every YAML file under a topology's `configs` directory.

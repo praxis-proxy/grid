@@ -57,7 +57,7 @@ pub(crate) fn generate_all(cluster_names: &[String]) -> Result<PathBuf, Box<dyn 
     let ca = load_or_generate_ca(&dir)?;
 
     for name in cluster_names {
-        if ca_was_complete && identity_exists(&dir, name) {
+        if ca_was_complete && identity_exists(&dir, name) && names_its_site(&dir, name) {
             restrict_private_key(&dir.join(format!("{name}-key.pem")))?;
             eprintln!("  reusing cert for {name}");
             continue;
@@ -193,6 +193,38 @@ pub(crate) fn certificate_sha256(cert_path: &Path) -> Result<String, Box<dyn std
         return Err(format!("failed to decode certificate: {}", stderr.trim()).into());
     }
     Ok(format!("{:x}", Sha256::digest(output.stdout)))
+}
+
+/// Whether an existing certificate names its own site in the subject organization.
+///
+/// A certificates directory outlives the scheme that wrote it. One generated before the
+/// organization named the site carries the old shared value, and the provider fixtures
+/// that now name sites would refuse it, which surfaces as a 403 from a stale file rather
+/// than as anything about certificates.
+fn names_its_site(dir: &Path, site: &str) -> bool {
+    certificate_organization(&dir.join(format!("{site}-cert.pem"))).as_deref() == Some(site)
+}
+
+/// Subject organization of a certificate on disk, `None` when absent or unreadable.
+fn certificate_organization(cert_path: &Path) -> Option<String> {
+    let output = Command::new("openssl")
+        .args([
+            "x509",
+            "-in",
+            &cert_path.display().to_string(),
+            "-noout",
+            "-subject",
+            "-nameopt",
+            "RFC2253",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .split(',')
+        .find_map(|part| part.trim().strip_prefix("O=").map(str::to_owned))
 }
 
 /// Compute the canonical fingerprint for a generated site certificate.
