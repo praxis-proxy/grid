@@ -164,11 +164,14 @@ gatewayConfig:
     digest: ""
     # -- pin mode: the next leaf digest during a rotation.
     nextDigest: ""
-    # -- spiffe mode: allowed peer SPIFFE IDs (spiffe://grid.internal/site/<name>).
+    # -- spiffe mode: allowed peer SPIFFE IDs (spiffe://grid.internal/site/<name>). The
+    # handshake admits exactly these, and the filter chain names the same sites, so a
+    # narrower per-candidate check can only take sites away from what is admitted here.
     spiffeIds: []
     # -- spiffe mode: one allowed SPIFFE ID, added to spiffeIds.
     spiffeId: ""
-    # -- spiffe mode with no spiffeIds: accept any site the Grid CA signed.
+    # -- spiffe mode with no spiffeIds: accept any site the Grid CA signed. Names no site,
+    # so the chain gets no peer check; cannot be set beside spiffeIds.
     allowAnyGridSite: false
     # -- Optional inbound budget shared by all peers, for example { rate: 20, burst: 40 }.
     rateLimit: {}

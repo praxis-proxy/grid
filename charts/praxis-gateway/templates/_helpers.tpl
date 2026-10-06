@@ -120,6 +120,34 @@ Defaults the tag to the chart appVersion when empty.
 {{- end }}
 
 {{/*
+Site names the configured SPIFFE IDs belong to, newline separated.
+
+A site certificate carries its site name in the subject organization and in the
+SPIFFE path segment, so one list drives both the handshake allowlist and the
+filter-level check. Deriving rather than taking a second value is what keeps them
+from disagreeing.
+
+values.schema.json is the primary gate on the ID's shape. This refuses a
+malformed one as well, because the alternative is rendering a trust list that
+silently matches nothing.
+*/}}
+{{- define "praxis-gateway.peerSites" -}}
+{{- $sites := list -}}
+{{- range . -}}
+{{- $rest := . | trimPrefix "spiffe://" -}}
+{{- if eq $rest . -}}
+{{- fail (printf "gatewayConfig.peerTrust.spiffeIds: %q is not a spiffe:// identity" .) -}}
+{{- end -}}
+{{- $parts := splitList "/" $rest -}}
+{{- if or (ne (len $parts) 3) (ne (index $parts 1) "site") (not (index $parts 2)) -}}
+{{- fail (printf "gatewayConfig.peerTrust.spiffeIds: %q is not spiffe://<trust-domain>/site/<name>" .) -}}
+{{- end -}}
+{{- $sites = append $sites (index $parts 2) -}}
+{{- end -}}
+{{- join "\n" ($sites | uniq) -}}
+{{- end -}}
+
+{{/*
 Validate image digest format when provided.
 */}}
 {{- define "praxis-gateway.validateDigest" -}}
@@ -172,6 +200,10 @@ Validate required config ConfigMap name.
 {{- if and (not $trust.spiffeIds) (not $trust.allowAnyGridSite) }}
 {{- fail "gatewayConfig.peerTrust spiffe mode needs spiffeIds, or allowAnyGridSite true to admit every Grid-CA site" }}
 {{- end }}
+{{- if and $trust.spiffeIds $trust.allowAnyGridSite }}
+{{- fail "gatewayConfig.peerTrust.allowAnyGridSite admits every Grid-CA site, so it cannot be set beside spiffeIds: the filter would name sites the handshake does not restrict" }}
+{{- end }}
+{{- $_ := include "praxis-gateway.peerSites" ($trust.spiffeIds | default list) }}
 {{- else if not $trust.certDigests }}
 {{- fail "gatewayConfig.peerTrust pin mode needs certDigests" }}
 {{- end }}

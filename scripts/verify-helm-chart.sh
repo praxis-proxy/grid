@@ -861,10 +861,11 @@ fi
 SPIFFE_RENDER=$(helm template v-prov "$GW_DIR" "${PROVIDER[@]}" "${SPIFFE[@]}" \
   --set "gatewayConfig.peerTrust.spiffeIds[0]=spiffe://grid.internal/site/hub" 2>&1 || true)
 if grep -q 'client_cert_mode: require_named$' <<<"$SPIFFE_RENDER" && grep -q -- '- "spiffe://grid.internal/site/hub"' <<<"$SPIFFE_RENDER" \
-  && ! grep -q 'peer_identity_trust' <<<"$SPIFFE_RENDER"; then
-  pass "provider spiffe: require_named with the SPIFFE allowlist and no pins"
+  && grep -q 'peer_identity_trust' <<<"$SPIFFE_RENDER" && grep -q -- '- organization: "hub"' <<<"$SPIFFE_RENDER" \
+  && ! grep -q 'cert_digest' <<<"$SPIFFE_RENDER"; then
+  pass "provider spiffe: require_named, and the chain names the same site it admits"
 else
-  fail "provider spiffe: unexpected render: $(grep -E 'client_cert_mode|spiffe|Error' <<<"$SPIFFE_RENDER" | head -3 | tr '\n' ' ')"
+  fail "provider spiffe: unexpected render: $(grep -E 'client_cert_mode|spiffe|organization|Error' <<<"$SPIFFE_RENDER" | head -4 | tr '\n' ' ')"
 fi
 if helm template v-prov "$GW_DIR" "${PROVIDER[@]}" "${SPIFFE[@]}" --set gatewayConfig.peerTrust.allowAnyGridSite=true 2>&1 \
   | matches 'client_cert_mode: require_named$'; then

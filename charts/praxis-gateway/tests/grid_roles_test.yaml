@@ -74,7 +74,7 @@ tests:
     asserts:
       - failedTemplate: {}
 
-  - it: a spiffe provider names allowed peers and reads no digests
+  - it: a spiffe provider names allowed peers at the handshake and again in the chain
     template: templates/gateway-config.yaml
     set:
       gatewayConfig.peerTrust.mode: spiffe
@@ -84,9 +84,12 @@ tests:
       - matchRegex:
           path: data["praxis.yaml"]
           pattern: 'client_cert_mode: require_named\s+trusted_spiffe_ids:\s+- "spiffe://grid.internal/site/hub"'
+      - matchRegex:
+          path: data["praxis.yaml"]
+          pattern: '- filter: peer_identity_trust\s+trusted_peers:\s+- organization: "hub"'
       - notMatchRegex:
           path: data["praxis.yaml"]
-          pattern: peer_identity_trust
+          pattern: cert_digest
 
   - it: projects the identity and the Grid CA into one directory
     template: templates/deployment.yaml

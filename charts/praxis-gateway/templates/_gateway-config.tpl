@@ -86,6 +86,15 @@ The data of the chart-rendered gateway ConfigMap, also hashed into checksum/conf
               {{- range ($cfg.peerTrust).certDigests }}
               - cert_digest: {{ . | quote }}
               {{- end }}
+          {{- else if ($cfg.peerTrust).spiffeIds }}
+          # Unconditional, and first: the handshake admits the listener's whole allowlist,
+          # so this is the floor every narrower check sits on top of. A later per-candidate
+          # block can only take sites away from what this already admits.
+          - filter: peer_identity_trust
+            trusted_peers:
+              {{- range (splitList "\n" (include "praxis-gateway.peerSites" ($cfg.peerTrust).spiffeIds)) }}
+              - organization: {{ . | quote }}
+              {{- end }}
           {{- end }}
           {{- with ($cfg.peerTrust).rateLimit }}
           - filter: rate_limit
