@@ -783,7 +783,7 @@ pub(crate) fn verify_external_provider_absent() -> Result<String, Box<dyn std::e
 fn stage_gtm_tls() -> Result<(), Box<dyn std::error::Error>> {
     let certs_dir = Path::new(GENERATED_CERTS_DIR);
     let ca = certs::load_or_generate_ca(certs_dir)?;
-    let certificate = ::certs::generate_dns_cert(&ca, "Grid GLB demo ingress", GTM_SERVER_NAME)?;
+    let certificate = ::certs::generate_dns_cert(&ca, "grid-glb-demo-ingress", GTM_SERVER_NAME)?;
     let target = Path::new(GTM_TLS_DIR);
     fs::create_dir_all(target)?;
     fs::write(target.join("ca.crt"), &ca.cert_pem)?;

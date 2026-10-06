@@ -14,7 +14,25 @@ use crate::backend::{self, BackendError, CertSpec};
 /// verified peer identity via the `organization` field.
 /// Production deployments should use cert digest pinning or
 /// SAN/SPIFFE identity instead.
-pub const DEFAULT_ORGANIZATION: &str = "ai-grid";
+/// Longest site name a certificate subject will carry, the DNS label limit.
+pub const MAX_SITE_NAME_LEN: usize = 63;
+
+/// Whether `site_name` is a lowercase DNS label short enough for a subject.
+///
+/// The site name becomes both the SPIFFE path segment and the subject
+/// organization, and the organization is what a receiving gateway authorizes
+/// on. Restricting the space is what keeps the two in step and keeps an
+/// authorized name from being a prefix of another.
+#[must_use]
+pub fn is_valid_site_name(site_name: &str) -> bool {
+    !site_name.is_empty()
+        && site_name.len() <= MAX_SITE_NAME_LEN
+        && site_name.starts_with(|ch: char| ch.is_ascii_lowercase() || ch.is_ascii_digit())
+        && site_name.ends_with(|ch: char| ch.is_ascii_lowercase() || ch.is_ascii_digit())
+        && site_name
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-')
+}
 
 // ---------------------------------------------------------------------------
 // Error
@@ -26,6 +44,14 @@ pub enum GenerateError {
     /// Key generation or signing failed in the crypto backend.
     #[error("certificate generation failed: {0}")]
     Backend(String),
+
+    /// Site name is not a lowercase DNS label short enough for a subject.
+    ///
+    /// The name becomes the SPIFFE path segment and the subject organization, and
+    /// a receiving gateway authorizes on the organization, so an unconstrained name
+    /// would widen what an authorized value can look like.
+    #[error("site name is not a lowercase DNS label of at most {MAX_SITE_NAME_LEN} characters")]
+    InvalidSiteName,
 
     /// CA certificate PEM could not be decoded.
     ///
@@ -150,8 +176,8 @@ pub struct SiteCertOutput {
 ///
 /// The certificate includes DNS SANs for the site name
 /// (e.g., `cluster-a.grid.internal`) and sets X.509
-/// `OrganizationName` to [`DEFAULT_ORGANIZATION`] so the
-/// Praxis `peer_identity_trust` filter can match on it.
+/// `OrganizationName` to the site name, which is what a receiving
+/// Praxis `peer_identity_trust` filter authorizes on.
 ///
 /// # Errors
 ///
@@ -209,7 +235,7 @@ fn issue_leaf_cert(
     spiffe: bool,
 ) -> Result<SiteCertOutput, GenerateError> {
     let primary = format!("{common_name}.grid.internal");
-    let mut id = site_identity(common_name, &primary);
+    let mut id = site_identity(common_name, &primary)?;
     if !spiffe {
         id.uri_sans.clear();
     }
@@ -220,7 +246,7 @@ fn issue_leaf_cert(
     Ok(SiteCertOutput {
         cert_pem: out.cert_pem,
         key_pem: out.key_pem,
-        organization: DEFAULT_ORGANIZATION.to_owned(),
+        organization: common_name.to_owned(),
         sans: id.dns_sans,
     })
 }
@@ -236,13 +262,13 @@ fn issue_leaf_cert(
 /// Returns [`GenerateError`] if the DNS name is invalid or certificate
 /// generation fails.
 pub fn generate_dns_cert(ca: &CaCert, common_name: &str, dns_name: &str) -> Result<SiteCertOutput, GenerateError> {
-    let id = site_identity(common_name, dns_name);
+    let id = site_identity(common_name, dns_name)?;
     let (not_before, not_after) = default_leaf_validity();
     let out = backend::issue_leaf(&ca.material, &id.spec(not_before, not_after)).map_err(map_backend)?;
     Ok(SiteCertOutput {
         cert_pem: out.cert_pem,
         key_pem: out.key_pem,
-        organization: DEFAULT_ORGANIZATION.to_owned(),
+        organization: common_name.to_owned(),
         sans: vec![dns_name.to_owned()],
     })
 }
@@ -309,12 +335,12 @@ pub(crate) fn generate_validity_bounded_dns_cert(
     not_before: OffsetDateTime,
     not_after: OffsetDateTime,
 ) -> Result<SiteCertOutput, GenerateError> {
-    let id = site_identity(common_name, dns_name);
+    let id = site_identity(common_name, dns_name)?;
     let out = backend::issue_leaf(&ca.material, &id.spec(not_before, not_after)).map_err(map_backend)?;
     Ok(SiteCertOutput {
         cert_pem: out.cert_pem,
         key_pem: out.key_pem,
-        organization: DEFAULT_ORGANIZATION.to_owned(),
+        organization: common_name.to_owned(),
         sans: vec![dns_name.to_owned()],
     })
 }
@@ -322,7 +348,7 @@ pub(crate) fn generate_validity_bounded_dns_cert(
 /// Generate a certificate signed by the given CA with a specific organization.
 ///
 /// Identical to [`generate_site_cert`] except `OrganizationName` is set to
-/// `org` rather than [`DEFAULT_ORGANIZATION`]. Use this to create test certs
+/// `org` rather than the site name. Use this to create test certs
 /// that will fail `peer_identity_trust` org matching despite being signed by
 /// the same trusted CA (TLS handshake succeeds; filter rejects).
 ///
@@ -430,9 +456,12 @@ impl SiteIdentity {
     }
 }
 
-/// Build the identity for a site certificate under [`DEFAULT_ORGANIZATION`].
-pub(crate) fn site_identity(site_name: &str, dns_san: &str) -> SiteIdentity {
-    site_identity_with_org(site_name, dns_san, DEFAULT_ORGANIZATION)
+/// Build the identity for a site certificate, naming the site in its subject.
+pub(crate) fn site_identity(site_name: &str, dns_san: &str) -> Result<SiteIdentity, GenerateError> {
+    if !is_valid_site_name(site_name) {
+        return Err(GenerateError::InvalidSiteName);
+    }
+    Ok(site_identity_with_org(site_name, dns_san, site_name))
 }
 
 /// Build the identity for a site certificate with a specific organization.
@@ -569,7 +598,7 @@ mod tests {
     fn generate_dns_cert_preserves_exact_san() {
         let ca = generate_ca("test-ca").unwrap_or_else(|_| std::process::abort());
         let cert =
-            generate_dns_cert(&ca, "Grid demo ingress", "api.grid-glb.test").unwrap_or_else(|_| std::process::abort());
+            generate_dns_cert(&ca, "grid-demo-ingress", "api.grid-glb.test").unwrap_or_else(|_| std::process::abort());
 
         assert_eq!(
             cert.sans,
@@ -583,18 +612,69 @@ mod tests {
         let ca = generate_ca("Test CA").unwrap_or_else(|_| std::process::abort());
         let site = generate_site_cert(&ca, "cluster-a").unwrap_or_else(|_| std::process::abort());
         assert_eq!(
-            site.organization, DEFAULT_ORGANIZATION,
-            "site cert output should carry the default organization"
+            site.organization, "cluster-a",
+            "site cert output should name the site in its organization"
         );
     }
 
     #[test]
+    fn the_organization_is_the_spiffe_path_segment() {
+        // A receiving gateway authorizes on the organization while the handshake proves the
+        // SPIFFE ID. They have to name the same site, or policy and identity disagree.
+        for name in ["cluster-a", "s", "a-b-c", &"x".repeat(MAX_SITE_NAME_LEN)] {
+            let id = site_identity(name, "ignored.example").unwrap_or_else(|_| std::process::abort());
+            let segment = id
+                .uri_sans
+                .first()
+                .and_then(|uri| uri.rsplit('/').next())
+                .unwrap_or_else(|| std::process::abort());
+            assert_eq!(
+                id.organization, segment,
+                "{name}: organization must be the SPIFFE path segment"
+            );
+        }
+    }
+
+    #[test]
+    fn an_issued_site_leaf_carries_exactly_one_organization() {
+        use x509_parser::prelude::{FromDer as _, X509Certificate};
+
+        // Pingora concatenates several organization RDNs with no separator, so two of them
+        // read as one value. One RDN per leaf is what keeps that unreachable.
+        let ca = generate_ca("test-ca").unwrap_or_else(|_| std::process::abort());
+        let site = generate_site_cert(&ca, "cluster-a").unwrap_or_else(|_| std::process::abort());
+        let pem = pem::parse(&site.cert_pem).unwrap_or_else(|_| std::process::abort());
+        let (_rest, parsed) = X509Certificate::from_der(pem.contents()).unwrap_or_else(|_| std::process::abort());
+        let orgs: Vec<_> = parsed.subject.iter_organization().collect();
+        assert_eq!(orgs.len(), 1, "a site leaf must carry exactly one organization RDN");
+    }
+
+    #[test]
+    fn a_name_that_is_not_a_dns_label_mints_no_identity() {
+        // The organization is an authorization value, so the space it can take is bounded.
+        for bad in [
+            "",
+            "Cluster-A",
+            "has space",
+            "-leading",
+            "trailing-",
+            "under_score",
+            &"x".repeat(MAX_SITE_NAME_LEN + 1),
+        ] {
+            assert!(
+                site_identity(bad, "ignored.example").is_err(),
+                "{bad:?} must not mint a site identity"
+            );
+        }
+    }
+
+    #[test]
     fn site_identity_contains_correct_common_name_and_org() {
-        let id = site_identity("cluster-a", "cluster-a.grid.internal");
+        let id = site_identity("cluster-a", "cluster-a.grid.internal").unwrap_or_else(|_| std::process::abort());
         assert_eq!(id.common_name, "cluster-a", "CommonName should be the site name");
         assert_eq!(
-            id.organization, DEFAULT_ORGANIZATION,
-            "OrganizationName should be DEFAULT_ORGANIZATION"
+            id.organization, "cluster-a",
+            "OrganizationName should be the site name, which is what a peer authorizes on"
         );
         assert_eq!(
             id.uri_sans,

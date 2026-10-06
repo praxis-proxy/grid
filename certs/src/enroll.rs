@@ -9,11 +9,8 @@ use time::{Duration, OffsetDateTime};
 
 use crate::{
     backend::{self, BackendError},
-    generate::{CaCert, site_identity, spiffe_id},
+    generate::{CaCert, MAX_SITE_NAME_LEN, site_identity, spiffe_id},
 };
-
-/// Longest accepted site name, matching the DNS label limit.
-const MAX_SITE_NAME_LEN: usize = 63;
 
 /// Backdating applied to `not_before`, so a peer whose clock runs slightly slow
 /// does not reject a certificate issued moments ago.
@@ -123,15 +120,7 @@ pub enum EnrollError {
 /// Returns [`EnrollError::InvalidSiteName`] when the name is not a lowercase DNS
 /// label of at most the allowed length.
 pub fn validate_site_name(site_name: &str) -> Result<(), EnrollError> {
-    let valid = !site_name.is_empty()
-        && site_name.len() <= MAX_SITE_NAME_LEN
-        && site_name.starts_with(|ch: char| ch.is_ascii_lowercase() || ch.is_ascii_digit())
-        && site_name.ends_with(|ch: char| ch.is_ascii_lowercase() || ch.is_ascii_digit())
-        && site_name
-            .chars()
-            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-');
-
-    if valid {
+    if crate::generate::is_valid_site_name(site_name) {
         Ok(())
     } else {
         Err(EnrollError::InvalidSiteName)
@@ -160,7 +149,8 @@ pub fn sign_csr(ca: &CaCert, site_name: &str, csr_pem: &str, validity: Validity)
 
     // The request's names are dropped, keeping only its public key.
     let primary = format!("{site_name}.{}", crate::SPIFFE_TRUST_DOMAIN);
-    let id = site_identity(site_name, &primary);
+    // validate_site_name above is the same predicate site_identity applies.
+    let id = site_identity(site_name, &primary).map_err(|_bad| EnrollError::InvalidSiteName)?;
     let spec = id.spec(validity.not_before, validity.not_after);
 
     let signed = backend::sign_csr(&ca.material, &spec, csr_pem).map_err(map_backend_error)?;

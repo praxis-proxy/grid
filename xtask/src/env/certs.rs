@@ -5,9 +5,7 @@ use std::{
     process::Command,
 };
 
-use certs::{
-    DEFAULT_ORGANIZATION, generate_ca, generate_cert_with_org, generate_dns_cert, generate_site_cert, load_ca,
-};
+use certs::{generate_ca, generate_cert_with_org, generate_dns_cert, generate_site_cert, load_ca};
 use sha2::{Digest as _, Sha256};
 
 // ---------------------------------------------------------------------------
@@ -22,10 +20,13 @@ const CA_CN: &str = "AI Grid Test CA";
 
 /// Organization used in the wrong-org negative trust test.
 ///
-/// A cert signed by the generated test CA with this org is used to prove
-/// that `peer_identity_trust` enforces organization matching at the filter
-/// layer (TLS handshake succeeds; filter rejects with HTTP 403).
-pub(crate) const WRONG_ORG: &str = "not-ai-grid";
+/// A cert signed by the generated test CA with this org proves that
+/// `peer_identity_trust` enforces organization matching at the filter layer:
+/// the handshake succeeds and the filter rejects with HTTP 403.
+///
+/// Deliberately not a valid site name, so it can never collide with the
+/// organization a real site is issued.
+pub(crate) const WRONG_ORG: &str = "NOT-A-SITE";
 
 /// File name stem for the wrong-org client cert (cert + key).
 const WRONG_ORG_CERT_NAME: &str = "wrong-org-client";
@@ -245,7 +246,7 @@ fn ensure_wrong_org_identity(
         &dir.join(format!("{WRONG_ORG_CERT_NAME}-key.pem")),
         &wrong_org_cert.key_pem,
     )?;
-    eprintln!("  generated wrong-org cert (org={WRONG_ORG}, expected={DEFAULT_ORGANIZATION})");
+    eprintln!("  generated wrong-org cert (org={WRONG_ORG}, expected={first_cluster})");
     Ok(())
 }
 

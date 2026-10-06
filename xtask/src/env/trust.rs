@@ -452,11 +452,10 @@ mod tests {
     }
 
     #[test]
-    fn wrong_org_is_not_default_org() {
-        assert_ne!(
-            WRONG_ORG,
-            certs::DEFAULT_ORGANIZATION,
-            "WRONG_ORG must differ from DEFAULT_ORGANIZATION"
+    fn wrong_org_can_never_be_a_site_name() {
+        assert!(
+            !certs::is_valid_site_name(WRONG_ORG),
+            "WRONG_ORG must not be a valid site name, or it could match a real site's organization"
         );
     }
 
