@@ -1,0 +1,530 @@
+apiVersion: forge.praxis.dev/v1alpha1
+kind: Environment
+metadata:
+  name: grid-single-cluster-multi-gateway
+spec:
+  runtime:
+    provider: docker
+    clusterPrefix: grid-single-cluster-multi-gateway
+  network:
+    crossCluster: true
+    dnsZone: grid-single-cluster-multi-gateway.test
+  clusters:
+  - name: single
+    stacks:
+    - metallb
+    - tls-bootstrap
+    - provider-a-operator-base
+    - vcr-backend
+    - provider-a-site
+    - provider-gateway-a
+    - provider-gateway-b
+    - provider-gateway-c
+    - consumer-gateway-a
+    - consumer-gateway-b
+    properties:
+      region: single
+      role: combined
+      siteName: single
+      gatewayImage: registry.example/ai:run-4
+      operatorImage: registry.example/operator:run-4
+      vcrImage: registry.example/vcr:run-4
+      imagePullPolicy: Never
+      gatewayImageRepo: registry.example/ai
+      gatewayImageTag: run-4
+      operatorImageRepo: registry.example/operator
+      operatorImageTag: run-4
+      overlaySyncImage: registry.example/sync:run-4
+      overlaySyncImageRepo: registry.example/sync
+      overlaySyncImageTag: run-4
+  stacks:
+    tls-bootstrap:
+      description: Ephemeral same-CA identities for this isolated qualification
+      steps:
+      - type: manifest
+        path: resources/common/grid-system-namespace.yaml
+      - type: exec
+        command:
+        - bash
+        - -c
+        - set -eu; d=$(mktemp -d); trap 'rm -rf "${d}"' EXIT; openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/O=ai-grid/CN=qualification-ca" -keyout "${d}/ca.key" -out "${d}/ca.crt" >/dev/null 2>&1; openssl req -newkey rsa:2048 -nodes -subj "/O=ai-grid/CN=grid-gateway.grid.internal" -keyout "${d}/gateway.key" -out "${d}/gateway.csr" >/dev/null 2>&1; printf "subjectAltName=DNS:grid-gateway.grid.internal,DNS:provider-a.grid.internal,DNS:provider-b.grid.internal,DNS:provider-c.grid.internal,DNS:grid-system.svc.cluster.local" > "${d}/ext.cnf"; openssl x509 -req -days 1 -in "${d}/gateway.csr" -CA "${d}/ca.crt" -CAkey "${d}/ca.key" -CAcreateserial -out "${d}/gateway.crt" -extfile "${d}/ext.cnf" >/dev/null 2>&1; kubectl --context kind-grid-single-cluster-multi-gateway-single -n grid-system create secret generic consumer-gateway-tls --from-file=ca.crt="${d}/ca.crt" --from-file=tls.crt="${d}/gateway.crt" --from-file=tls.key="${d}/gateway.key" --dry-run=client -o yaml | kubectl --context kind-grid-single-cluster-multi-gateway-single apply -f - >/dev/null; kubectl --context kind-grid-single-cluster-multi-gateway-single -n grid-system create secret generic vcr-inference-credential --from-literal=token="$(openssl rand -hex 32)" --dry-run=client -o yaml | kubectl --context kind-grid-single-cluster-multi-gateway-single apply -f - >/dev/null
+    metallb:
+      description: MetalLB load balancer with auto-configured address pool
+      steps:
+      - type: url
+        url: https://raw.githubusercontent.com/metallb/metallb/v0.14.9/config/manifests/metallb-native.yaml
+        sha256: 951065e85692aa106f1bb5d5a487d9306154923a794ab1d82122881cbaf588e4
+      - type: wait
+        resource: deployment/controller
+        namespace: metallb-system
+        condition: available
+        timeout: 120s
+      - type: metallb-auto-pool
+        name: forge-pool
+    provider-a-operator-base:
+      description: Single Grid operator for the shared Kind control plane
+      steps:
+      - type: helm
+        release: grid-operator
+        chart: charts/grid-operator
+        version: 0.1.0
+        namespace: grid-system
+        values:
+          image:
+            repository: '{{ cluster.properties.operatorImageRepo }}'
+            tag: '{{ cluster.properties.operatorImageTag }}'
+            pullPolicy: '{{ cluster.properties.imagePullPolicy }}'
+          swim:
+            siteName: single
+            seeds: ''
+            service:
+              enabled: true
+              type: LoadBalancer
+          gateway:
+            serviceName: provider-gateway-a
+            port: '8443'
+      - type: wait
+        resource: deployment/grid-operator
+        namespace: grid-system
+        condition: available
+        timeout: 120s
+      - type: helm
+        release: grid-operator
+        chart: charts/grid-operator
+        version: 0.1.0
+        namespace: grid-system
+        values:
+          image:
+            repository: '{{ cluster.properties.operatorImageRepo }}'
+            tag: '{{ cluster.properties.operatorImageTag }}'
+            pullPolicy: '{{ cluster.properties.imagePullPolicy }}'
+          swim:
+            siteName: single
+            seeds: ''
+            advertiseAddress: 172.18.255.231:7946
+            service:
+              enabled: true
+              type: LoadBalancer
+          gateway:
+            serviceName: provider-gateway-a
+            port: '8443'
+    vcr-backend:
+      description: vllm-vcr inference backend for demo scenarios
+      steps:
+      - type: manifest
+        path: resources/common/grid-system-namespace.yaml
+      - type: template-manifest
+        path: resources/common/vcr-provider-a.yaml
+      - type: template-manifest
+        path: resources/common/vcr-provider-b.yaml
+      - type: template-manifest
+        path: resources/common/vcr-provider-c.yaml
+      - type: manifest
+        path: resources/common/backend-network-policy.yaml
+      - type: manifest
+        path: resources/common/qualification-client.yaml
+      - type: wait
+        resource: deployment/vcr-inference-provider-a
+        namespace: grid-system
+        condition: available
+        timeout: 120s
+    provider-a-site:
+      description: Single GridSite with Grid CRs via grid-site chart
+      steps:
+      - type: helm
+        release: grid-site-a
+        chart: charts/grid-site
+        version: 0.1.0
+        namespace: grid-system
+        values:
+          commonLabels:
+            grid.praxis.fast/auto-discover-sites: 'true'
+          gridNetwork:
+            name: grid-single-cluster-multi-gateway
+            gridId: grid-single-cluster-multi-gateway-v1
+            region: provider-a
+            zone: provider-a-1
+            routingPolicy: scoreFirst
+            scoringPolicy:
+              strategy: noMetrics
+            selectionPolicy:
+              mode: roundRobin
+            swim:
+              probeInterval: 5s
+              suspicionTimeout: 15s
+              gossipNodes: 3
+            tls:
+              caSecretRef:
+                name: consumer-gateway-tls
+                namespace: grid-system
+              siteSecretRef:
+                name: consumer-gateway-tls
+                namespace: grid-system
+            gatewayRefs:
+            - name: consumer-gateway-a
+              namespace: grid-system
+              localSiteName: single
+            - name: consumer-gateway-b
+              namespace: grid-system
+              localSiteName: single
+          gridSite:
+            name: single
+            region: single
+            zone: single-1
+            providerSiteLabel: single
+          inferenceProviders:
+          - name: vcr-provider-a-provider
+            gridNetworkRef: grid-single-cluster-multi-gateway
+            gatewayRef: provider-gateway-a
+            providerKind: vllm-vcr
+            backendKind: local
+            endpoint: http://vcr-inference-provider-a.grid-system.svc.cluster.local:8000
+            siteSelector:
+              matchLabels:
+                grid.praxis.fast/provider-site: single
+            accessPolicy:
+              siteSelector:
+                matchLabels: {}
+            models:
+            - name: Qwen/Qwen3-0.6B
+              capabilities:
+              - text_generation
+              contextWindow: 4096
+            healthCheck:
+              path: /health
+              interval: 10s
+              timeout: 5s
+          - name: vcr-provider-b-provider
+            gridNetworkRef: grid-single-cluster-multi-gateway
+            gatewayRef: provider-gateway-a
+            providerKind: vllm-vcr
+            backendKind: local
+            endpoint: http://vcr-inference-provider-b.grid-system.svc.cluster.local:8000
+            siteSelector:
+              matchLabels: {}
+            accessPolicy:
+              siteSelector:
+                matchLabels: {}
+            models:
+            - name: Qwen/Qwen3-0.6B
+              capabilities:
+              - text_generation
+              contextWindow: 4096
+            healthCheck:
+              path: /health
+              interval: 10s
+              timeout: 5s
+          - name: vcr-provider-c-provider
+            gridNetworkRef: grid-single-cluster-multi-gateway
+            gatewayRef: provider-gateway-b
+            providerKind: vllm-vcr
+            backendKind: local
+            endpoint: http://vcr-inference-provider-c.grid-system.svc.cluster.local:8000
+            siteSelector:
+              matchLabels: {}
+            accessPolicy:
+              siteSelector:
+                matchLabels: {}
+            models:
+            - name: Qwen/Qwen3-0.6B
+              capabilities:
+              - text_generation
+              contextWindow: 4096
+            healthCheck:
+              path: /health
+              interval: 10s
+              timeout: 5s
+    provider-gateway-a:
+      description: Praxis provider gateway with mTLS and credential mounts
+      steps:
+      - type: template-file
+        source: configs/provider/praxis-a.yaml
+        target: .forge/runtime/{{ cluster.name }}/provider-a-praxis.yaml
+      - type: exec
+        command:
+        - bash
+        - -c
+        - kubectl --context kind-grid-single-cluster-multi-gateway-single -n grid-system create configmap provider-gateway-a-config --from-file=praxis.yaml=.forge/runtime/{{ cluster.name }}/provider-a-praxis.yaml --dry-run=client -o yaml | kubectl --context kind-grid-single-cluster-multi-gateway-single apply -f -
+      - type: helm
+        release: provider-gateway-a
+        chart: charts/praxis-gateway
+        version: 0.1.0
+        namespace: grid-system
+        values:
+          fullnameOverride: provider-gateway-a
+          image:
+            repository: '{{ cluster.properties.gatewayImageRepo }}'
+            tag: '{{ cluster.properties.gatewayImageTag }}'
+            pullPolicy: '{{ cluster.properties.imagePullPolicy }}'
+          podSecurityContext:
+            runAsUser: 100
+            runAsGroup: 101
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          config:
+            existingConfigMap: provider-gateway-a-config
+          port:
+            containerPort: 8443
+            name: https-mtls
+          service:
+            type: LoadBalancer
+            port: 8443
+          health:
+            readiness:
+              tcpSocket:
+                port: https-mtls
+              initialDelaySeconds: 3
+              periodSeconds: 5
+            liveness:
+              tcpSocket:
+                port: https-mtls
+              initialDelaySeconds: 5
+              periodSeconds: 10
+          tls:
+            enabled: true
+            existingSecret: consumer-gateway-tls
+          credentials:
+          - name: vcr-inference-credential
+            mountPath: /etc/praxis/credentials/vcr-inference
+          podLabels:
+            grid.praxis.fast/backend-access: provider-gateway
+            grid.praxis.fast/provider-site: '{{ cluster.name }}'
+      - type: wait
+        resource: deployment/provider-gateway-a
+        namespace: grid-system
+        condition: available
+        timeout: 120s
+    provider-gateway-b:
+      description: Praxis provider gateway with mTLS and credential mounts
+      steps:
+      - type: template-file
+        source: configs/provider/praxis-b.yaml
+        target: .forge/runtime/{{ cluster.name }}/provider-b-praxis.yaml
+      - type: exec
+        command:
+        - bash
+        - -c
+        - kubectl --context kind-grid-single-cluster-multi-gateway-single -n grid-system create configmap provider-gateway-b-config --from-file=praxis.yaml=.forge/runtime/{{ cluster.name }}/provider-b-praxis.yaml --dry-run=client -o yaml | kubectl --context kind-grid-single-cluster-multi-gateway-single apply -f -
+      - type: helm
+        release: provider-gateway-b
+        chart: charts/praxis-gateway
+        version: 0.1.0
+        namespace: grid-system
+        values:
+          fullnameOverride: provider-gateway-b
+          replicaCount: 1
+          image:
+            repository: '{{ cluster.properties.gatewayImageRepo }}'
+            tag: '{{ cluster.properties.gatewayImageTag }}'
+            pullPolicy: '{{ cluster.properties.imagePullPolicy }}'
+          podSecurityContext:
+            runAsUser: 100
+            runAsGroup: 101
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          config:
+            existingConfigMap: provider-gateway-b-config
+          port:
+            containerPort: 8443
+            name: https-mtls
+          service:
+            type: LoadBalancer
+            port: 8443
+          health:
+            readiness:
+              tcpSocket:
+                port: https-mtls
+              initialDelaySeconds: 3
+              periodSeconds: 5
+            liveness:
+              tcpSocket:
+                port: https-mtls
+              initialDelaySeconds: 5
+              periodSeconds: 10
+          tls:
+            enabled: true
+            existingSecret: consumer-gateway-tls
+          credentials:
+          - name: vcr-inference-credential
+            mountPath: /etc/praxis/credentials/vcr-inference
+          podLabels:
+            grid.praxis.fast/backend-access: provider-gateway
+            grid.praxis.fast/provider-site: '{{ cluster.name }}'
+      - type: wait
+        resource: deployment/provider-gateway-b
+        namespace: grid-system
+        condition: available
+        timeout: 120s
+    provider-gateway-c:
+      description: Praxis provider gateway with mTLS and credential mounts
+      steps:
+      - type: template-file
+        source: configs/provider/praxis-c.yaml
+        target: .forge/runtime/{{ cluster.name }}/provider-c-praxis.yaml
+      - type: exec
+        command:
+        - bash
+        - -c
+        - kubectl --context kind-grid-single-cluster-multi-gateway-single -n grid-system create configmap provider-gateway-c-config --from-file=praxis.yaml=.forge/runtime/{{ cluster.name }}/provider-c-praxis.yaml --dry-run=client -o yaml | kubectl --context kind-grid-single-cluster-multi-gateway-single apply -f -
+      - type: helm
+        release: provider-gateway-c
+        chart: charts/praxis-gateway
+        version: 0.1.0
+        namespace: grid-system
+        values:
+          fullnameOverride: provider-gateway-c
+          image:
+            repository: '{{ cluster.properties.gatewayImageRepo }}'
+            tag: '{{ cluster.properties.gatewayImageTag }}'
+            pullPolicy: '{{ cluster.properties.imagePullPolicy }}'
+          podSecurityContext:
+            runAsUser: 100
+            runAsGroup: 101
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          config:
+            existingConfigMap: provider-gateway-c-config
+          port:
+            containerPort: 8443
+            name: https-mtls
+          service:
+            type: LoadBalancer
+            port: 8443
+          health:
+            readiness:
+              tcpSocket:
+                port: https-mtls
+              initialDelaySeconds: 3
+              periodSeconds: 5
+            liveness:
+              tcpSocket:
+                port: https-mtls
+              initialDelaySeconds: 5
+              periodSeconds: 10
+          tls:
+            enabled: true
+            existingSecret: consumer-gateway-tls
+          credentials:
+          - name: vcr-inference-credential
+            mountPath: /etc/praxis/credentials/vcr-inference
+          podLabels:
+            grid.praxis.fast/backend-access: provider-gateway
+            grid.praxis.fast/provider-site: '{{ cluster.name }}'
+      - type: wait
+        resource: deployment/provider-gateway-c
+        namespace: grid-system
+        condition: available
+        timeout: 120s
+    consumer-gateway-a:
+      description: Praxis consumer gateway with operator-managed overlay
+      steps:
+      - type: template-file
+        source: configs/consumer/praxis-a.yaml
+        target: .forge/runtime/{{ cluster.name }}/consumer/praxis.yaml
+      - type: exec
+        command:
+        - bash
+        - -c
+        - kubectl --context kind-grid-single-cluster-multi-gateway-{{ cluster.name }} -n grid-system create configmap consumer-gateway-a-config --from-file=praxis.yaml=.forge/runtime/{{ cluster.name }}/consumer/praxis.yaml --dry-run=client -o yaml | kubectl --context kind-grid-single-cluster-multi-gateway-{{ cluster.name }} apply -f -
+      - type: helm
+        release: consumer-gateway-a
+        chart: charts/praxis-gateway
+        version: 0.1.0
+        namespace: grid-system
+        values:
+          fullnameOverride: consumer-gateway-a
+          image:
+            repository: '{{ cluster.properties.gatewayImageRepo }}'
+            tag: '{{ cluster.properties.gatewayImageTag }}'
+            pullPolicy: '{{ cluster.properties.imagePullPolicy }}'
+          podSecurityContext:
+            runAsUser: 100
+            runAsGroup: 101
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          config:
+            existingConfigMap: consumer-gateway-a-config
+          service:
+            type: ClusterIP
+          overlay:
+            enabled: true
+            existingConfigMap: grid-overlay-grid-single-cluster--consumer-gateway-a-db750bac
+          tls:
+            enabled: true
+            existingSecret: consumer-gateway-tls
+          podLabels:
+            grid.praxis.fast/consumer-site: '{{ cluster.name }}'
+      - type: wait
+        resource: deployment/consumer-gateway-a
+        namespace: grid-system
+        condition: available
+        timeout: 120s
+    consumer-gateway-b:
+      description: Praxis consumer gateway with operator-managed overlay
+      steps:
+      - type: template-file
+        source: configs/consumer/praxis-b.yaml
+        target: .forge/runtime/{{ cluster.name }}/consumer/praxis.yaml
+      - type: exec
+        command:
+        - bash
+        - -c
+        - kubectl --context kind-grid-single-cluster-multi-gateway-{{ cluster.name }} -n grid-system create configmap consumer-gateway-b-config --from-file=praxis.yaml=.forge/runtime/{{ cluster.name }}/consumer/praxis.yaml --dry-run=client -o yaml | kubectl --context kind-grid-single-cluster-multi-gateway-{{ cluster.name }} apply -f -
+      - type: helm
+        release: consumer-gateway-b
+        chart: charts/praxis-gateway
+        version: 0.1.0
+        namespace: grid-system
+        values:
+          fullnameOverride: consumer-gateway-b
+          image:
+            repository: '{{ cluster.properties.gatewayImageRepo }}'
+            tag: '{{ cluster.properties.gatewayImageTag }}'
+            pullPolicy: '{{ cluster.properties.imagePullPolicy }}'
+          podSecurityContext:
+            runAsUser: 100
+            runAsGroup: 101
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          config:
+            existingConfigMap: consumer-gateway-b-config
+          service:
+            type: ClusterIP
+          overlay:
+            enabled: true
+            existingConfigMap: grid-overlay-grid-single-cluster--consumer-gateway-b-de751065
+          tls:
+            enabled: true
+            existingSecret: consumer-gateway-tls
+          podLabels:
+            grid.praxis.fast/consumer-site: '{{ cluster.name }}'
+      - type: wait
+        resource: deployment/consumer-gateway-b
+        namespace: grid-system
+        condition: available
+        timeout: 120s

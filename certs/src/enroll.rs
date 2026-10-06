@@ -9,7 +9,7 @@ use time::{Duration, OffsetDateTime};
 
 use crate::{
     backend::{self, BackendError},
-    generate::{CaCert, MAX_SITE_NAME_LEN, site_identity, spiffe_id},
+    generate::{CaCert, GenerateError, MAX_SITE_NAME_LEN, is_valid_site_name, site_identity, spiffe_id},
 };
 
 /// Backdating applied to `not_before`, so a peer whose clock runs slightly slow
@@ -120,7 +120,7 @@ pub enum EnrollError {
 /// Returns [`EnrollError::InvalidSiteName`] when the name is not a lowercase DNS
 /// label of at most the allowed length.
 pub fn validate_site_name(site_name: &str) -> Result<(), EnrollError> {
-    if crate::generate::is_valid_site_name(site_name) {
+    if is_valid_site_name(site_name) {
         Ok(())
     } else {
         Err(EnrollError::InvalidSiteName)
@@ -149,8 +149,14 @@ pub fn sign_csr(ca: &CaCert, site_name: &str, csr_pem: &str, validity: Validity)
 
     // The request's names are dropped, keeping only its public key.
     let primary = format!("{site_name}.{}", crate::SPIFFE_TRUST_DOMAIN);
-    // validate_site_name above is the same predicate site_identity applies.
-    let id = site_identity(site_name, &primary).map_err(|_bad| EnrollError::InvalidSiteName)?;
+    // Exhaustive, so a new GenerateError variant is a compile error here rather than a
+    // signing failure reported to an enrollee as an invalid name.
+    let id = site_identity(site_name, &primary).map_err(|err| match err {
+        GenerateError::InvalidSiteName => EnrollError::InvalidSiteName,
+        other @ (GenerateError::Backend(_) | GenerateError::InvalidCaCert | GenerateError::CaCertKeyMismatch) => {
+            EnrollError::Signing(other.to_string())
+        },
+    })?;
     let spec = id.spec(validity.not_before, validity.not_after);
 
     let signed = backend::sign_csr(&ca.material, &spec, csr_pem).map_err(map_backend_error)?;

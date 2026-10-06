@@ -830,7 +830,6 @@ mod tests {
         certs::SiteCertOutput {
             cert_pem: params.signed_by(&key, &issuer).unwrap().pem(),
             key_pem: key.serialize_pem(),
-            organization: String::new(),
             sans: Vec::new(),
         }
     }

@@ -270,12 +270,14 @@ DnsName("east1-provider.grid.internal")
 ```
 
 The preflight script inspects TLS Secret SANs and prints them for
-manual verification. Generate per-site certificates:
+manual verification. Generate per-site certificates, naming the site in both the
+organization and the common name, since a receiving gateway authorizes on the
+organization:
 
 ```bash
 openssl ecparam -genkey -name prime256v1 -noout -out provider.key
 openssl req -new -key provider.key \
-  -subj "/O=ai-grid/CN=provider-gateway" \
+  -subj "/O=east2-provider/CN=east2-provider" \
   -addext "subjectAltName=DNS:provider-gateway.grid-system.svc.cluster.local,DNS:east2-provider.grid.internal" \
   -addext "keyUsage=digitalSignature,keyEncipherment" \
   -addext "extendedKeyUsage=clientAuth,serverAuth" \

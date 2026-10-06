@@ -383,23 +383,29 @@ site down or evict it from membership. Identities are not yet signed per site.
 
 ## Grid mTLS Identity
 
-Grid-generated site certificates set
-`OrganizationName = "ai-grid"` (see
-`certs::DEFAULT_ORGANIZATION`).  Gateway deployments
-that enable peer identity trust can match incoming peer certificates on
-`organization: ai-grid` by default.
+Grid-generated site certificates set `OrganizationName` to the site name, which
+is also the SPIFFE path segment the certificate carries. A gateway that enables
+peer identity trust can therefore match an incoming peer on
+`organization: <site>` and tell one consumer site from another.
 
-Any certificate signed by the Grid CA but with a
-different organization value will pass TLS handshake
-and fail at the filter, producing an HTTP 403.  This
-is the intended fail-closed behaviour for cert-based
-bootstrap authentication.
+That matters because the SPIFFE ID is validated during the handshake and is not
+carried into the request path, so the organization is the only identity field a
+filter can read per request. A certificate signed by the grid CA whose
+organization names another site passes the handshake and fails at the filter
+with an HTTP 403, which is the intended fail-closed behaviour.
 
-Production deployments should switch to cert-digest
-pinning (`cert_digest` field on `trusted_peers`) once
-cert identities are stable, as organization matching
-is weaker — any cert signed by a trusted CA with the
-correct `O=` value is accepted.
+An infrastructure certificate, issued for a database or a serving listener,
+carries no organization and no SPIFFE SAN. It names no site on either axis, so
+it matches no `organization` entry.
+
+Two properties hold this up. The grid CA constructs every subject itself and
+emits exactly one organization value, and `sign_csr` carries only the request's
+public key forward, so an enrollee cannot shape the field it is authorized by.
+A site name is restricted to a lowercase DNS label, which keeps the organization
+and the SPIFFE segment in step.
+
+Pinning `cert_digest` on `trusted_peers` remains available and is stricter still,
+at the cost of re-pinning on every reissue.
 
 Site certificates follow the X.509-SVID leaf profile. Each carries a
 critical CA:FALSE basic constraint and a critical key usage of digital

@@ -1605,7 +1605,16 @@ async fn ensure_tls_secrets(
         return Ok(());
     }
 
-    let site_name = issued_site_name(network, this_site);
+    let Some(site_name) = issued_site_name(network, this_site) else {
+        // The network name is a Kubernetes object name, which may carry dots and run to 253
+        // characters, so it is not always a site name. Self-signing is a convenience; refusing
+        // it leaves the site to enroll rather than failing every later step in this reconcile.
+        tracing::warn!(
+            network = %network_site_name(network),
+            "no valid site name for a self-signed identity; enroll this site instead"
+        );
+        return Ok(());
+    };
     let ca = certs::generate_ca("grid-ca")?;
     let site_cert = certs::generate_site_cert(&ca, &site_name)?;
 
@@ -3370,8 +3379,13 @@ pub(crate) fn consumer_config_status_error(
 // ---------------------------------------------------------------------------
 
 /// The site a self-issued certificate names: this site when known, else the network.
-fn issued_site_name(network: &GridNetwork, site: Option<&str>) -> String {
-    site.map_or_else(|| network_site_name(network), str::to_owned)
+///
+/// `None` when neither is a valid site name. The name becomes the certificate's SPIFFE
+/// path segment and its subject organization, which a peer authorizes on, so a network
+/// name carrying dots or exceeding a DNS label cannot stand in for it.
+fn issued_site_name(network: &GridNetwork, site: Option<&str>) -> Option<String> {
+    let name = site.map_or_else(|| network_site_name(network), str::to_owned);
+    certs::is_valid_site_name(&name).then_some(name)
 }
 
 /// Derive the site name from the `GridNetwork` metadata.
@@ -5590,11 +5604,31 @@ mod tests {
     #[test]
     fn a_self_issued_certificate_names_this_site_not_the_network() {
         let network = base_network();
-        assert_eq!(issued_site_name(&network, Some("east")), "east");
+        assert_eq!(issued_site_name(&network, Some("east")).as_deref(), Some("east"));
+        assert_eq!(
+            issued_site_name(&network, None).as_deref(),
+            Some("net"),
+            "no site name falls back to the network"
+        );
+    }
+
+    /// A network named like a Kubernetes object, not like a site, issues nothing.
+    #[test]
+    fn a_network_name_that_is_not_a_site_name_issues_no_identity() {
+        // The name becomes the SPIFFE path segment and the subject organization. A
+        // Kubernetes object name may carry dots and run past a DNS label, so the fallback
+        // has to decline rather than mint an identity nothing can authorize.
+        let mut network = base_network();
+        network.metadata.name = Some("grid.example.internal".to_owned());
         assert_eq!(
             issued_site_name(&network, None),
-            "net",
-            "no site name falls back to the network"
+            None,
+            "a dotted network name is not a site name"
+        );
+        assert_eq!(
+            issued_site_name(&network, Some("east")).as_deref(),
+            Some("east"),
+            "an explicit site name is still used"
         );
     }
 
