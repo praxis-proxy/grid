@@ -349,7 +349,7 @@ fn apply_gateway_config(context: &str, _def: &ClusterDef) -> Result<(), Box<dyn 
 /// ```text
 /// - filter: peer_identity_trust
 ///   trusted_peers:
-///     - organization: ai-grid
+///     - organization: <consumer site name>
 /// ```
 ///
 /// The `ext_proc` filter uses `StreamBuffer` body mode.

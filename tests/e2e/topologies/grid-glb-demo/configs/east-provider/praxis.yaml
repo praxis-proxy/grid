@@ -22,9 +22,9 @@ filter_chains:
       - filter: peer_identity_trust
         trusted_peers:
           - cert_digest: __EDGE_US_EAST_CERT_SHA256__
-            organization: ai-grid
+            organization: east-edge
           - cert_digest: __EDGE_US_WEST_CERT_SHA256__
-            organization: ai-grid
+            organization: west-edge
       - filter: json_body_field
         field: model
         header: X-Model

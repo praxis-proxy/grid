@@ -21,7 +21,7 @@ filter_chains:
     filters:
       - filter: peer_identity_trust
         trusted_peers:
-          - organization: ai-grid
+          - organization: single
       - filter: json_body_field
         field: model
         header: X-Model

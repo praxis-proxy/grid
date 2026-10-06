@@ -27,7 +27,9 @@ filter_chains:
       # This security filter must remain first, unconditional, and fail closed.
       - filter: peer_identity_trust
         trusted_peers:
-          - organization: ai-grid
+          - organization: west
+          - organization: central
+          - organization: east
 
       # Parse the OpenAI-compatible request and promote model to X-Model.
       - filter: json_body_field
