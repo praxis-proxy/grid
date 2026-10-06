@@ -540,6 +540,13 @@ mod tests {
 
     use super::*;
 
+    /// Full subject of an issued certificate, as a comparable string.
+    fn subject_of(cert_pem: &str) -> String {
+        let der = pem::parse(cert_pem).unwrap_or_else(|_| std::process::abort());
+        let (_rest, parsed) = X509Certificate::from_der(der.contents()).unwrap_or_else(|_| std::process::abort());
+        parsed.subject.to_string()
+    }
+
     /// Subject organization values on an issued certificate, in order.
     fn subject_organizations(cert_pem: &str) -> Vec<String> {
         let der = pem::parse(cert_pem).unwrap_or_else(|_| std::process::abort());
@@ -665,6 +672,32 @@ mod tests {
             orgs.first().map(String::as_str),
             Some("cluster-a"),
             "the one organization RDN must name the site"
+        );
+    }
+
+    /// An infrastructure leaf named for its service does not share the CA's subject.
+    ///
+    /// It carries no organization, so a leaf sharing the CA's common name has the same
+    /// subject as the certificate that signed it. The signature still verifies, which is
+    /// why a signature check does not catch this, but a verifier building a path reads an
+    /// identical subject and issuer as self-signed and refuses the chain.
+    #[test]
+    fn an_infra_leaf_named_for_its_service_does_not_share_the_ca_subject() {
+        let ca = generate_ca("grid-ca").unwrap_or_else(|_| std::process::abort());
+        let sans = ["enroll.grid.svc".to_owned()];
+
+        let collides = generate_dns_only_cert(&ca, "grid-ca", &sans).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            subject_of(&collides.cert_pem),
+            subject_of(&ca.cert_pem),
+            "a leaf named for its own CA shares its subject, which is the hazard"
+        );
+
+        let named = generate_dns_only_cert(&ca, "grid-enrollment", &sans).unwrap_or_else(|_| std::process::abort());
+        assert_ne!(
+            subject_of(&named.cert_pem),
+            subject_of(&ca.cert_pem),
+            "naming infrastructure for its service keeps the subject distinct"
         );
     }
 

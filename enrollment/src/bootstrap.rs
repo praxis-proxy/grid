@@ -844,6 +844,13 @@ fn serving_cert(data: Option<&std::collections::BTreeMap<String, k8s_openapi::By
         .map_or(ServingCert::Unusable, ServingCert::Pem)
 }
 
+/// Common name on the enrollment serving certificate.
+///
+/// Named for the service, not for the CA. An infrastructure leaf carries no organization,
+/// so a leaf sharing the CA's common name has the same subject as its issuer, and a
+/// verifier building a path reads that as self-signed.
+const SERVING_COMMON_NAME: &str = "grid-enrollment";
+
 /// Issue the serving certificate when needed; see [`serving_needs_issue`]. The CA is
 /// preserved: only the leaf is re-signed under it.
 async fn ensure_serving(
@@ -862,7 +869,7 @@ async fn ensure_serving(
             .into());
         }
         warn_if_unchained(&args.serving_secret, &current, &ca.cert_pem);
-        let serving = certs::generate_dns_only_cert(ca, &args.common_name, &args.serving_dns)?;
+        let serving = certs::generate_dns_only_cert(ca, SERVING_COMMON_NAME, &args.serving_dns)?;
         write_tls_secret(secrets, &args.serving_secret, &serving.cert_pem, &serving.key_pem, true).await?;
     }
     Ok(())
@@ -1163,10 +1170,10 @@ mod tests {
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, OwnerReference};
 
     use super::{
-        BootstrapArgs, CA_AUTHORITIES, HubCa, MANAGED_BY, SecretView, ServingCert, SiteIdentity, admin_tokens,
-        argo_keep_patch, db_credentials, ensure_swim_key, existing_identity_kept, foreign_manager, hub_ca_write,
-        identity_action, issue_site_identity, needs_roll, plan_ca, roll_patch, seed_is_current, serving_cert,
-        serving_needs_issue,
+        BootstrapArgs, CA_AUTHORITIES, HubCa, MANAGED_BY, SERVING_COMMON_NAME, SecretView, ServingCert, SiteIdentity,
+        admin_tokens, argo_keep_patch, db_credentials, ensure_swim_key, existing_identity_kept, foreign_manager,
+        hub_ca_write, identity_action, issue_site_identity, needs_roll, plan_ca, roll_patch, seed_is_current,
+        serving_cert, serving_needs_issue,
     };
 
     /// A CA Secret written by `writer`, holding `pem`.
@@ -1551,10 +1558,30 @@ mod tests {
     /// The current grid CA the tests issue under.
     static CA: LazyLock<certs::CaCert> = LazyLock::new(|| certs::generate_ca("grid-ca").expect("ca"));
 
-    /// A serving cert for `sans`, signed by [`CA`].
+    /// A serving cert for `sans`, signed by [`CA`], named as bootstrap names it.
     fn serving_pem(sans: &[&str]) -> ServingCert {
-        let leaf = certs::generate_dns_only_cert(&CA, "grid-ca", &names(sans)).expect("leaf");
+        let leaf = certs::generate_dns_only_cert(&CA, SERVING_COMMON_NAME, &names(sans)).expect("leaf");
         ServingCert::Pem(leaf.cert_pem)
+    }
+
+    /// The serving leaf's subject must differ from the CA's.
+    ///
+    /// An infrastructure leaf carries no organization, so naming it for the CA leaves the
+    /// two subjects identical. The signature still verifies; what fails is a client
+    /// building a path, which reads subject equal to issuer as self-signed. Only an end to
+    /// end run caught that, so this holds the shape here.
+    #[test]
+    fn the_serving_certificate_is_not_named_for_the_ca() {
+        let subject = |pem_text: &str| {
+            let (pem, _read) = x509_parser::pem::Pem::read(std::io::Cursor::new(pem_text)).expect("pem");
+            pem.parse_x509().expect("der").tbs_certificate.subject.to_string()
+        };
+        let leaf = certs::generate_dns_only_cert(&CA, SERVING_COMMON_NAME, &names(&["enroll.grid.svc"])).expect("leaf");
+        assert_ne!(
+            subject(&leaf.cert_pem),
+            subject(&CA.cert_pem),
+            "a serving leaf sharing the CA subject is read as self-signed"
+        );
     }
 
     /// Whether `current` needs issuing for `requested` under [`CA`].
