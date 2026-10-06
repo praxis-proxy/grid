@@ -57,7 +57,7 @@ pub(crate) fn generate_all(cluster_names: &[String]) -> Result<PathBuf, Box<dyn 
     let ca = load_or_generate_ca(&dir)?;
 
     for name in cluster_names {
-        if ca_was_complete && identity_exists(&dir, name) && names_its_site(&dir, name) {
+        if ca_was_complete && identity_exists(&dir, name) && names_its_site(&dir, name)? {
             restrict_private_key(&dir.join(format!("{name}-key.pem")))?;
             eprintln!("  reusing cert for {name}");
             continue;
@@ -197,16 +197,21 @@ pub(crate) fn certificate_sha256(cert_path: &Path) -> Result<String, Box<dyn std
 
 /// Whether an existing certificate names its own site in the subject organization.
 ///
+/// An error rather than a false reading when the certificate cannot be read: a false here
+/// regenerates the identity, so a missing `openssl` would rotate every site's private key
+/// instead of saying why it could not tell.
+///
 /// A certificates directory outlives the scheme that wrote it. One generated before the
 /// organization named the site carries the old shared value, and the provider fixtures
 /// that now name sites would refuse it, which surfaces as a 403 from a stale file rather
 /// than as anything about certificates.
-fn names_its_site(dir: &Path, site: &str) -> bool {
-    certificate_organization(&dir.join(format!("{site}-cert.pem"))).as_deref() == Some(site)
+fn names_its_site(dir: &Path, site: &str) -> Result<bool, Box<dyn std::error::Error>> {
+    let org = certificate_organization(&dir.join(format!("{site}-cert.pem")))?;
+    Ok(org.as_deref() == Some(site))
 }
 
 /// Subject organization of a certificate on disk, `None` when absent or unreadable.
-fn certificate_organization(cert_path: &Path) -> Option<String> {
+fn certificate_organization(cert_path: &Path) -> Result<Option<String>, Box<dyn std::error::Error>> {
     let output = Command::new("openssl")
         .args([
             "x509",
@@ -218,13 +223,20 @@ fn certificate_organization(cert_path: &Path) -> Option<String> {
             "RFC2253",
         ])
         .output()
-        .ok()?;
+        .map_err(|err| format!("could not run openssl to read {}: {err}", cert_path.display()))?;
     if !output.status.success() {
-        return None;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("could not read {}: {}", cert_path.display(), stderr.trim()).into());
     }
-    String::from_utf8_lossy(&output.stdout)
+    // openssl prints `subject=O=west,CN=west`, so the label comes off before the split.
+    let printed = String::from_utf8_lossy(&output.stdout);
+    let subject = printed
+        .trim()
+        .strip_prefix("subject=")
+        .unwrap_or_else(|| printed.trim());
+    Ok(subject
         .split(',')
-        .find_map(|part| part.trim().strip_prefix("O=").map(str::to_owned))
+        .find_map(|part| part.trim().strip_prefix("O=").map(str::to_owned)))
 }
 
 /// Compute the canonical fingerprint for a generated site certificate.
@@ -332,7 +344,66 @@ pub(crate) fn load_or_generate_ca(dir: &Path) -> Result<certs::CaCert, Box<dyn s
 
 #[cfg(test)]
 mod tests {
+    use certs::generate_dns_only_cert;
+
     use super::*;
+
+    /// The reuse gate rotates a site identity only when its organization is wrong.
+    ///
+    /// Regenerating mints a new private key, so a gate that answers "no" too readily
+    /// rotates every identity on every run and breaks anything pinning a digest. These
+    /// cases pin when it says yes, when it says no, and that it refuses to guess.
+    #[test]
+    fn an_identity_is_rotated_only_when_its_organization_is_wrong() {
+        let dir = tempfile::tempdir().unwrap_or_else(|_| std::process::abort());
+        let ca = generate_ca("grid-ca").unwrap_or_else(|_| std::process::abort());
+        let write = |site: &str, pem: &str| {
+            std::fs::write(dir.path().join(format!("{site}-cert.pem")), pem).unwrap_or_else(|_| std::process::abort());
+        };
+
+        // Issued under the current scheme: the organization is the site, so it is kept.
+        let current = generate_site_cert(&ca, "west").unwrap_or_else(|_| std::process::abort());
+        write("west", &current.cert_pem);
+        assert_eq!(
+            names_its_site(dir.path(), "west").unwrap_or_else(|_| std::process::abort()),
+            true,
+            "an identity already naming its site must be reused, not rotated"
+        );
+
+        // Issued under the old shared organization: this is the rotation we do want.
+        let stale = generate_cert_with_org(&ca, "east", "ai-grid").unwrap_or_else(|_| std::process::abort());
+        write("east", &stale.cert_pem);
+        assert_eq!(
+            names_its_site(dir.path(), "east").unwrap_or_else(|_| std::process::abort()),
+            false,
+            "an identity carrying the old shared organization must be rotated"
+        );
+
+        // Infrastructure shaped, carrying no organization at all.
+        let infra = generate_dns_only_cert(&ca, "grid-enrollment", &["x.svc".to_owned()])
+            .unwrap_or_else(|_| std::process::abort());
+        write("north", &infra.cert_pem);
+        assert_eq!(
+            names_its_site(dir.path(), "north").unwrap_or_else(|_| std::process::abort()),
+            false,
+            "an identity with no organization names no site"
+        );
+    }
+
+    /// An identity it cannot read is an error, never a false reading.
+    ///
+    /// False regenerates, so a missing `openssl` would rotate every private key rather
+    /// than saying why it could not tell.
+    #[test]
+    fn an_unreadable_identity_is_not_silently_rotated() {
+        let dir = tempfile::tempdir().unwrap_or_else(|_| std::process::abort());
+        std::fs::write(dir.path().join("south-cert.pem"), "not a certificate\n")
+            .unwrap_or_else(|_| std::process::abort());
+        assert!(
+            names_its_site(dir.path(), "south").is_err(),
+            "an unreadable identity must report why, not silently rotate"
+        );
+    }
 
     #[test]
     fn generate_all_creates_files() {

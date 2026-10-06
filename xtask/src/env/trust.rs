@@ -494,7 +494,7 @@ mod tests {
         if !text.contains("peer_identity_trust") {
             return 0;
         }
-        let trusted = trusted_organizations(&text);
+        let trusted = trusted_organizations(&text, config);
         if trusted.is_empty() {
             return 0;
         }
@@ -530,38 +530,44 @@ mod tests {
 
     /// Organizations every `peer_identity_trust` filter in a Praxis config trusts.
     ///
+    /// `config` names the file in a parse failure, since the caller is iterating many.
+    ///
     /// Parsed as YAML rather than matched by line, so a quoted value or a trailing
     /// comment reads as the value a gateway would load rather than as its spelling.
-    fn trusted_organizations(text: &str) -> Vec<String> {
-        let doc: serde_yaml::Value = serde_yaml::from_str(text).unwrap_or_else(|_| std::process::abort());
-        let mut out = Vec::new();
-        let chains = doc
-            .get("filter_chains")
-            .and_then(serde_yaml::Value::as_sequence)
-            .map_or_else(Vec::new, Clone::clone);
-        for chain in chains {
-            let filters = chain
-                .get("filters")
-                .and_then(serde_yaml::Value::as_sequence)
-                .map_or_else(Vec::new, Clone::clone);
-            for filter in filters {
-                if filter.get("filter").and_then(serde_yaml::Value::as_str) != Some("peer_identity_trust") {
-                    continue;
-                }
-                let peers = filter
-                    .get("trusted_peers")
-                    .and_then(serde_yaml::Value::as_sequence)
-                    .map_or_else(Vec::new, Clone::clone);
-                out.extend(
-                    peers
-                        .iter()
-                        .filter_map(|peer| peer.get("organization").and_then(serde_yaml::Value::as_str))
-                        .map(str::to_owned),
-                );
-            }
-        }
-        out
+    fn trusted_organizations(text: &str, config: &Path) -> Vec<String> {
+        let doc: serde_yaml::Value = serde_yaml::from_str(text).unwrap_or_else(|err| {
+            // abort is the house idiom here, so the path goes out before it takes the binary
+            eprintln!("{}: not parseable as YAML: {err}", config.display());
+            std::process::abort();
+        });
+        sequence(doc.get("filter_chains"))
+            .iter()
+            .flat_map(|chain| peer_trust_organizations(chain))
+            .collect()
     }
+
+    /// Organizations one filter chain's `peer_identity_trust` filters trust.
+    fn peer_trust_organizations(chain: &serde_yaml::Value) -> Vec<String> {
+        sequence(chain.get("filters"))
+            .iter()
+            .filter(|filter| filter.get("filter").and_then(serde_yaml::Value::as_str) == Some("peer_identity_trust"))
+            .flat_map(|filter| {
+                sequence(filter.get("trusted_peers"))
+                    .iter()
+                    .filter_map(|peer| peer.get("organization").and_then(serde_yaml::Value::as_str))
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// A YAML sequence, empty when the key is absent or another kind.
+    fn sequence(value: Option<&serde_yaml::Value>) -> Vec<serde_yaml::Value> {
+        value
+            .and_then(serde_yaml::Value::as_sequence)
+            .map_or_else(Vec::new, Clone::clone)
+    }
+
 
     /// Every YAML file under a topology's `configs` directory.
     fn provider_configs(dir: &Path) -> Vec<PathBuf> {
