@@ -411,10 +411,66 @@ spec:
                   description: Optional static capacity-placement policy.
                   nullable: true
                   properties:
+                    pressureWeighted:
+                      description: Pressure-weighting parameters, required only for `pressureWeighted`.
+                      nullable: true
+                      properties:
+                        availabilityFloorPercent:
+                          default: 5
+                          description: Floor for inverse-pressure availability, as a percentage.
+                          format: uint32
+                          maximum: 100.0
+                          minimum: 1.0
+                          type: integer
+                        changeThresholdPercent:
+                          default: 5
+                          description: Suppress publication when every weight changes by less than this percent.
+                          format: uint32
+                          maximum: 100.0
+                          minimum: 0.0
+                          type: integer
+                        maximumWeight:
+                          default: 1000
+                          description: Per-provider upper bound and per-group normalization target.
+                          format: uint32
+                          maximum: 1000.0
+                          minimum: 1.0
+                          type: integer
+                        minimumWeight:
+                          default: 1
+                          description: Minimum positive weight published for an eligible provider.
+                          format: uint32
+                          maximum: 1000.0
+                          minimum: 1.0
+                          type: integer
+                        signal:
+                          description: Which normalized provider pressure signal to use.
+                          enum:
+                            - queueDepth
+                            - kvCacheUtilization
+                          type: string
+                        smoothingFactor:
+                          default: 0.35
+                          description: EWMA factor in `(0, 1]`; larger values react faster.
+                          format: double
+                          maximum: 1.0
+                          minimum: 0.000001
+                          type: number
+                        staleSignalSeconds:
+                          default: 120
+                          description: Maximum accepted age of a local or peer signal sample.
+                          format: uint32
+                          maximum: 300.0
+                          minimum: 1.0
+                          type: integer
+                      required:
+                        - signal
+                      type: object
                     strategy:
                       description: Placement strategy.
                       enum:
                         - static
+                        - pressureWeighted
                       type: string
                   required:
                     - strategy
@@ -658,6 +714,12 @@ spec:
               x-kubernetes-validations:
                 - message: placementPolicy must be set if and only if selectionPolicy.mode is weightedRandom
                   rule: has(self.placementPolicy) == (has(self.selectionPolicy) && self.selectionPolicy.mode == 'weightedRandom')
+                - message: placementPolicy.pressureWeighted must be set if and only if strategy is pressureWeighted
+                  rule: '!has(self.placementPolicy) || (has(self.placementPolicy.pressureWeighted) == (self.placementPolicy.strategy == ''pressureWeighted''))'
+                - message: pressureWeighted placement requires signalTransport.mode=poll
+                  rule: '!has(self.placementPolicy) || self.placementPolicy.strategy != ''pressureWeighted'' || (has(self.signalTransport) && self.signalTransport.mode == ''poll'')'
+                - message: pressureWeighted.minimumWeight must not exceed maximumWeight
+                  rule: '!has(self.placementPolicy) || !has(self.placementPolicy.pressureWeighted) || !has(self.placementPolicy.pressureWeighted.minimumWeight) || !has(self.placementPolicy.pressureWeighted.maximumWeight) || self.placementPolicy.pressureWeighted.minimumWeight <= self.placementPolicy.pressureWeighted.maximumWeight'
             status:
               description: Observed status of a [`GridNetwork`].
               nullable: true

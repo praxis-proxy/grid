@@ -31,6 +31,60 @@
             }
           },
           "then": { "required": ["placementPolicy"] }
+        },
+        {
+          "if": {
+            "required": ["placementPolicy"],
+            "properties": {
+              "placementPolicy": {
+                "required": ["strategy"],
+                "properties": { "strategy": { "const": "pressureWeighted" } }
+              }
+            }
+          },
+          "then": {
+            "required": ["signalTransport"],
+            "properties": {
+              "signalTransport": {
+                "required": ["mode"],
+                "properties": { "mode": { "const": "poll" } }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": ["placementPolicy"],
+            "properties": {
+              "placementPolicy": {
+                "required": ["strategy"],
+                "properties": { "strategy": { "const": "pressureWeighted" } }
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "placementPolicy": { "required": ["pressureWeighted"] }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": ["placementPolicy"],
+            "properties": {
+              "placementPolicy": {
+                "required": ["pressureWeighted"],
+                "properties": { "pressureWeighted": { "type": "object" } }
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "placementPolicy": {
+                "properties": { "strategy": { "const": "pressureWeighted" } }
+              }
+            }
+          }
         }
       ],
       "properties": {
@@ -145,7 +199,24 @@
           "properties": {
             "strategy": {
               "type": "string",
-              "enum": ["static"]
+              "enum": ["static", "pressureWeighted"]
+            },
+            "pressureWeighted": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["signal"],
+              "properties": {
+                "signal": {
+                  "type": "string",
+                  "enum": ["queueDepth", "kvCacheUtilization"]
+                },
+                "minimumWeight": { "type": "integer", "minimum": 1, "maximum": 1000 },
+                "maximumWeight": { "type": "integer", "minimum": 1, "maximum": 1000 },
+                "availabilityFloorPercent": { "type": "integer", "minimum": 1, "maximum": 100 },
+                "smoothingFactor": { "type": "number", "exclusiveMinimum": 0, "maximum": 1 },
+                "changeThresholdPercent": { "type": "integer", "minimum": 0, "maximum": 100 },
+                "staleSignalSeconds": { "type": "integer", "minimum": 1, "maximum": 300 }
+              }
             }
           }
         },

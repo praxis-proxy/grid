@@ -216,21 +216,106 @@ pub struct PeerTrustConfig {
     pub mode: PeerTrustMode,
 }
 
-/// Explicit static provider-capacity placement strategy.
+/// Strategy used to derive positive traffic weights for weighted selection.
 #[derive(Clone, Copy, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum PlacementStrategy {
     /// Use operator-configured provider capacity weights.
     Static,
+    /// Adjust capacity by fresh, polled provider pressure signals.
+    PressureWeighted,
 }
 
-/// Traffic placement policy. This static stack intentionally has no metric inputs.
-#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+/// Traffic placement policy for weighted provider selection.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
 pub struct PlacementPolicyConfig {
     /// Placement strategy.
     pub strategy: PlacementStrategy,
+
+    /// Pressure-weighting parameters, required only for `pressureWeighted`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pressure_weighted: Option<PressureWeightedConfig>,
+}
+
+/// Normalized provider pressure signal used by dynamic placement.
+#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PressureSignal {
+    /// Queue depth divided by `metricsConfig.queueCapacity` when configured.
+    QueueDepth,
+    /// KV-cache utilization, expected to be normalized to `[0, 1]`.
+    KvCacheUtilization,
+}
+
+/// Controls freshness, smoothing, and bounds for pressure-derived weights.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct PressureWeightedConfig {
+    /// Which normalized provider pressure signal to use.
+    pub signal: PressureSignal,
+
+    /// Minimum positive weight published for an eligible provider.
+    #[schemars(range(min = 1, max = 1000))]
+    #[serde(default = "default_minimum_weight")]
+    pub minimum_weight: u32,
+
+    /// Per-provider upper bound and per-group normalization target.
+    #[schemars(range(min = 1, max = 1000))]
+    #[serde(default = "default_maximum_weight")]
+    pub maximum_weight: u32,
+
+    /// Floor for inverse-pressure availability, as a percentage.
+    #[schemars(range(min = 1, max = 100))]
+    #[serde(default = "default_availability_floor_percent")]
+    pub availability_floor_percent: u32,
+
+    /// EWMA factor in `(0, 1]`; larger values react faster.
+    #[schemars(range(min = 0.000_001, max = 1.0))]
+    #[serde(default = "default_smoothing_factor")]
+    pub smoothing_factor: f64,
+
+    /// Suppress publication when every weight changes by less than this percent.
+    #[schemars(range(min = 0, max = 100))]
+    #[serde(default = "default_change_threshold_percent")]
+    pub change_threshold_percent: u32,
+
+    /// Maximum accepted age of a local or peer signal sample.
+    #[schemars(range(min = 1, max = 300))]
+    #[serde(default = "default_stale_signal_seconds")]
+    pub stale_signal_seconds: u32,
+}
+
+/// Default lower bound that keeps every active candidate selectable.
+const fn default_minimum_weight() -> u32 {
+    1
+}
+
+/// Default per-group normalization total.
+const fn default_maximum_weight() -> u32 {
+    1000
+}
+
+/// Default inverse-pressure availability floor for a saturated provider.
+const fn default_availability_floor_percent() -> u32 {
+    5
+}
+
+/// Default EWMA response factor.
+const fn default_smoothing_factor() -> f64 {
+    0.35
+}
+
+/// Default relative weight-change threshold.
+const fn default_change_threshold_percent() -> u32 {
+    5
+}
+
+/// Default maximum age for an input signal sample.
+const fn default_stale_signal_seconds() -> u32 {
+    120
 }
 
 /// Resolve the effective [`scoring::ScoringWeights`] from a scoring policy.
@@ -565,10 +650,24 @@ pub fn resolve_budget_statuses(
     printcolumn = r#"{"name":"Phase","type":"string","jsonPath":".status.phase"}"#,
     printcolumn = r#"{"name":"Sites","type":"integer","jsonPath":".status.connectedSites"}"#
 )]
-#[schemars(extend("x-kubernetes-validations" = [{
-    "rule": "has(self.placementPolicy) == (has(self.selectionPolicy) && self.selectionPolicy.mode == 'weightedRandom')",
-    "message": "placementPolicy must be set if and only if selectionPolicy.mode is weightedRandom"
-}]))]
+#[schemars(extend("x-kubernetes-validations" = [
+    {
+        "rule": "has(self.placementPolicy) == (has(self.selectionPolicy) && self.selectionPolicy.mode == 'weightedRandom')",
+        "message": "placementPolicy must be set if and only if selectionPolicy.mode is weightedRandom"
+    },
+    {
+        "rule": "!has(self.placementPolicy) || (has(self.placementPolicy.pressureWeighted) == (self.placementPolicy.strategy == 'pressureWeighted'))",
+        "message": "placementPolicy.pressureWeighted must be set if and only if strategy is pressureWeighted"
+    },
+    {
+        "rule": "!has(self.placementPolicy) || self.placementPolicy.strategy != 'pressureWeighted' || (has(self.signalTransport) && self.signalTransport.mode == 'poll')",
+        "message": "pressureWeighted placement requires signalTransport.mode=poll"
+    },
+    {
+        "rule": "!has(self.placementPolicy) || !has(self.placementPolicy.pressureWeighted) || !has(self.placementPolicy.pressureWeighted.minimumWeight) || !has(self.placementPolicy.pressureWeighted.maximumWeight) || self.placementPolicy.pressureWeighted.minimumWeight <= self.placementPolicy.pressureWeighted.maximumWeight",
+        "message": "pressureWeighted.minimumWeight must not exceed maximumWeight"
+    }
+]))]
 #[serde(rename_all = "camelCase")]
 pub struct GridNetworkSpec {
     /// Grid ID for tenancy. Empty on creation; auto-generated

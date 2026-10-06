@@ -305,6 +305,7 @@ mod tests {
                 name: "model-a".to_owned(),
                 site: "site-a".to_owned(),
                 cluster: "cluster-a".to_owned(),
+                signal_origin_site: None,
                 fresh: true,
                 credential: None,
                 stable_id: Some("abcd1234".to_owned()),
@@ -336,6 +337,7 @@ mod tests {
                     name: "model-east".to_owned(),
                     site: "east-provider".to_owned(),
                     cluster: "sim-east-provider".to_owned(),
+                    signal_origin_site: None,
                     fresh: true,
                     credential: Some(ProjectedCredential {
                         strategy: "bearer_token".to_owned(),
@@ -360,6 +362,7 @@ mod tests {
                     name: "model-west".to_owned(),
                     site: "west-provider".to_owned(),
                     cluster: "sim-west-provider".to_owned(),
+                    signal_origin_site: None,
                     fresh: true,
                     credential: None,
                     stable_id: Some("west5678".to_owned()),

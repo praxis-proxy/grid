@@ -6,7 +6,7 @@
 //! - `json_body_field` filter (model field → `X-Model` header)
 //! - `intelligent_route` filter with candidates from the overlay
 //! - `credential_inject` filter (only when credential-bearing candidates exist)
-//! - `load_balancer` filter with one cluster entry per unique candidate cluster
+//! - `load_balancer` filter with one cluster entry per unique candidate cluster, omitted when no providers are eligible
 //!
 //! # Security invariants
 //!
@@ -102,7 +102,9 @@ pub enum ConsumerConfigError {
 /// Generate the YAML content of a consumer Praxis `ConfigMap`.
 ///
 /// The rendered config is a complete, runnable Praxis config that includes
-/// `listeners:`, `filter_chains:`, `admin:`, and `shutdown_timeout_secs`.
+/// `listeners:`, `filter_chains:`, `admin:`, and `shutdown_timeout_secs`. It
+/// omits `load_balancer` when there are no eligible candidates; the routing
+/// filter rejects matching requests before an upstream is needed.
 /// It is compatible with the Praxis `intelligent_route` and `credential_inject`
 /// filters.  It never contains credential token bytes.
 ///
@@ -335,6 +337,9 @@ pub(crate) fn build_consumer_config_map(
 /// Each candidate is indented and includes `credential.secretRef` when present.
 /// Token values are never included.
 fn render_candidates(candidates: &[RoutingCandidate]) -> String {
+    if candidates.is_empty() {
+        return "         []".to_owned();
+    }
     candidates.iter().map(render_candidate).collect::<Vec<_>>().join("\n")
 }
 
@@ -487,6 +492,14 @@ fn render_load_balancer(
     cluster_endpoints: &[ClusterEndpointConfig],
     tls_cert_mount_path: &str,
 ) -> Result<String, ConsumerConfigError> {
+    // Praxis rejects a load_balancer with an empty `clusters` list. With no
+    // eligible candidates, intelligent_route rejects matching requests before
+    // an upstream is needed, so omit the filter instead of rendering an
+    // invalid load_balancer configuration.
+    if candidates.is_empty() {
+        return Ok(String::new());
+    }
+
     // Build a lookup map: cluster name → endpoint config.
     let endpoint_map: BTreeMap<&str, &ClusterEndpointConfig> =
         cluster_endpoints.iter().map(|ep| (ep.cluster.as_str(), ep)).collect();
@@ -655,6 +668,7 @@ mod tests {
             name: name.to_owned(),
             site: site.to_owned(),
             cluster: cluster.to_owned(),
+            signal_origin_site: None,
             fresh,
             credential: None,
             stable_id: None,
@@ -683,6 +697,7 @@ mod tests {
             name: name.to_owned(),
             site: site.to_owned(),
             cluster: cluster.to_owned(),
+            signal_origin_site: None,
             fresh: true,
             credential: Some(ProjectedCredential {
                 strategy: "bearer_token".to_owned(),
@@ -959,6 +974,47 @@ mod tests {
         let config = generate_consumer_praxis_config(&overlay, MOUNT_BASE, &endpoints, "/run/tls", 8080)
             .unwrap_or_else(|_| std::process::abort());
         assert_eq!(selection_policy_mode(&config).as_deref(), Some("roundRobin"));
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "This test verifies the complete generated no-provider Praxis filter chain and its explicit empty semantics."
+    )]
+    fn empty_weighted_overlay_renders_explicit_empty_candidate_list() {
+        let mut overlay = simple_overlay(Vec::new());
+        overlay.selection_policy = Some(crate::crd::grid_network::SelectionPolicyConfig {
+            mode: SelectionMode::WeightedRandom,
+        });
+
+        let config = generate_consumer_praxis_config(&overlay, MOUNT_BASE, &[], "/run/tls", 8080).unwrap();
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&config).unwrap();
+        let filters = parsed
+            .get("filter_chains")
+            .and_then(serde_yaml::Value::as_sequence)
+            .and_then(|chains| chains.first())
+            .and_then(|chain| chain.get("filters"))
+            .and_then(serde_yaml::Value::as_sequence)
+            .expect("generated filter chain is valid YAML");
+        let intelligent_route = filters
+            .iter()
+            .find(|filter| filter.get("filter").and_then(serde_yaml::Value::as_str) == Some("intelligent_route"))
+            .expect("generated config contains intelligent_route");
+
+        assert!(
+            intelligent_route
+                .get("candidates")
+                .and_then(serde_yaml::Value::as_sequence)
+                .is_some_and(Vec::is_empty),
+            "no eligible providers must be an explicit empty YAML sequence"
+        );
+        assert_eq!(selection_policy_mode(&config).as_deref(), Some("weightedRandom"));
+        assert!(
+            !filters
+                .iter()
+                .any(|filter| filter.get("filter").and_then(serde_yaml::Value::as_str) == Some("load_balancer")),
+            "an empty provider set must not render a load_balancer with no clusters"
+        );
     }
 
     #[test]

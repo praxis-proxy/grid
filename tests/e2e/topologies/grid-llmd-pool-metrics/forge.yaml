@@ -90,6 +90,8 @@ spec:
               service:
                 enabled: true
                 type: "LoadBalancer"
+            signals:
+              enabled: true
             gateway:
               serviceName: "provider-gateway"
               port: "8443"
@@ -125,6 +127,8 @@ spec:
               service:
                 enabled: true
                 type: "LoadBalancer"
+            signals:
+              enabled: true
             gateway:
               serviceName: "provider-gateway"
               port: "8443"
