@@ -666,7 +666,7 @@ dependencies = [
 
 [[package]]
 name = "certs"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "openssl",
  "pem 4.0.0",
@@ -1565,14 +1565,14 @@ dependencies = [
 
 [[package]]
 name = "grid-signals"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "dashmap",
 ]
 
 [[package]]
 name = "grid-signals-client"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "bytes",
  "certs",

@@ -1074,7 +1074,7 @@ checksum = "d45db016d36b838f563236e9193d0ee6ce38f3f68b6c94e914b4929c96bbb890"
 
 [[package]]
 name = "fleet-dashboard"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "axum",
  "axum-server",
@@ -1096,7 +1096,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "sha2 0.10.9",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "time",
  "tokio",
  "tower",
