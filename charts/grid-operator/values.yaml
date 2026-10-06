@@ -209,6 +209,9 @@ signals:
   # -- Signals endpoint gossiped to peers (ip:port, [ipv6]:port, or dns-name:port). Set it when swim.advertiseAddress is set or the Service is not a LoadBalancer.
   advertiseAddress: ""
 
+  # -- Seconds between peer signal polls. Every site polls every other alive site, so
+  # a grid of N sites makes N*(N-1) polls each interval. Empty keeps the operator's 30s.
+  peerIntervalSeconds: ""
 # -- Advertised site gateway address configuration.
 gateway:
   # -- Discover and advertise a LoadBalancer address for the site gateway.

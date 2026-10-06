@@ -126,6 +126,10 @@ spec:
             - name: GRID_SIGNALS_ADVERTISE_ADDR
               value: {{ . | quote }}
             {{- end }}
+            {{- with .Values.signals.peerIntervalSeconds }}
+            - name: GRID_SIGNALS_PEER_INTERVAL_SECS
+              value: {{ . | quote }}
+            {{- end }}
             {{- end }}
             - name: GRID_METRICS_ADDR
               value: {{ .Values.metrics.bindAddress | quote }}

@@ -485,6 +485,13 @@
               "type": "string"
             }
           }
+        },
+        "peerIntervalSeconds": {
+          "type": [
+            "integer",
+            "string"
+          ],
+          "description": "Seconds between peer signal polls. Every site polls every other alive site, so a grid of N sites makes N*(N-1) polls each interval. Empty keeps the operator default."
         }
       }
     },

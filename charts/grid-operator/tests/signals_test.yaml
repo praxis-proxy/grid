@@ -215,3 +215,32 @@ tests:
           content:
             name: GRID_SWIM_SEEDS
             value: "seed-a:7946"
+
+  - it: sets the peer poll interval only when asked
+    template: templates/deployment.yaml
+    set:
+      grid.id: aws
+      site.name: east
+      signals.enabled: true
+      swim.service.enabled: true
+      signals.peerIntervalSeconds: 5
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: GRID_SIGNALS_PEER_INTERVAL_SECS
+            value: "5"
+
+  - it: leaves the interval to the operator when unset
+    template: templates/deployment.yaml
+    set:
+      grid.id: aws
+      site.name: east
+      signals.enabled: true
+      swim.service.enabled: true
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: GRID_SIGNALS_PEER_INTERVAL_SECS
+            value: ""
