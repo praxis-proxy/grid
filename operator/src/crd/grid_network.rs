@@ -46,14 +46,14 @@ pub enum RoutingPolicy {
 
 /// Provider-level strategy used to order inference pools.
 ///
-/// Grid follows llm-d's scorer model: the operator selects one independently
-/// meaningful signal instead of blending unrelated objectives into an opaque
-/// total. Request-specific decisions, such as prefix-cache affinity, remain in
-/// the llm-d EPP after Grid has selected a provider pool.
+/// One independently meaningful signal is selected rather than blending unrelated
+/// objectives into an opaque total. Request-specific decisions, such as
+/// prefix-cache affinity, remain with the scheduler behind the pool, after Grid
+/// has selected one.
 ///
 /// When no [`ScoringPolicyConfig`] is set on the [`GridNetworkSpec`], dynamic
 /// metric scoring is disabled. This supports external APIs and ordinary
-/// providers that do not expose comparable EPP telemetry.
+/// providers that expose no comparable telemetry.
 #[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ScoringStrategy {
@@ -67,15 +67,13 @@ pub enum ScoringStrategy {
 
     /// Prefer the provider pool with the shortest normalized queue.
     ///
-    /// This load-aware strategy corresponds to llm-d's `queue-scorer`. Lower
-    /// queue pressure produces a higher score.
+    /// Lower queue pressure produces a higher score.
     QueueDepth,
 
     /// Prefer the provider pool with the most available KV-cache capacity.
     ///
-    /// This corresponds to llm-d's `kv-cache-utilization-scorer`: lower
-    /// utilization produces a higher score. It is a capacity-pressure signal,
-    /// not evidence that the current request's prefix is cached.
+    /// Lower utilization produces a higher score. It is a capacity-pressure
+    /// signal, not evidence that the current request's prefix is cached.
     KvCachePressure,
 }
 
@@ -124,7 +122,7 @@ impl ScoringStrategy {
 /// scoringPolicy:
 ///   strategy: noMetrics
 ///
-/// # Opt into llm-d load-aware scoring:
+/// # Opt into load-aware scoring:
 /// scoringPolicy:
 ///   strategy: queueDepth
 ///

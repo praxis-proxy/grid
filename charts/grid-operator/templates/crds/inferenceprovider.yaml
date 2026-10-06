@@ -160,7 +160,7 @@ spec:
 
                         When set, the probe URL is `{endpoint}{path}` instead of
                         `{spec.endpoint}{path}`.  This allows probing a separate service
-                        (such as an llm-d EPP) while the provider inference endpoint
+                        while the provider inference endpoint
                         points at the pool's request path.
 
                         When absent, the probe URL uses `spec.endpoint` as before.
@@ -327,7 +327,7 @@ spec:
 
                         When set, the scrape URL is `{metrics_endpoint}{path}` instead of
                         `{spec.endpoint}{path}`.  This allows scraping metrics from a separate
-                        service (such as an llm-d EPP) while the provider inference endpoint
+                        service while the provider inference endpoint
                         points at the pool's request path.
 
                         When absent, the scrape URL uses `spec.endpoint` as before.
@@ -348,7 +348,7 @@ spec:
 
                         When set, the parser only matches metric samples whose `name` label
                         equals this value.  This is required when scraping an endpoint that
-                        exposes metrics for multiple pools (such as an llm-d EPP), ensuring
+                        exposes metrics for multiple pools, ensuring
                         the configured pool is selected deterministically.
 
                         The parser rejects the scrape when the expected pool series is absent
@@ -366,7 +366,7 @@ spec:
 
                         When set, the `queue_depth` signal value is divided by this capacity
                         and clamped to `[0.0, 1.0]` before scoring.  This allows consuming raw
-                        average queue-size metrics (such as `llm_d_epp_average_queue_size`)
+                        average queue-size metrics
                         without requiring the exporter to pre-normalise.
 
                         When absent, the `queue_depth` signal must already be normalised to
