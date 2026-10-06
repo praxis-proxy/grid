@@ -542,7 +542,7 @@ mod tests {
         });
         sequence(doc.get("filter_chains"))
             .iter()
-            .flat_map(|chain| peer_trust_organizations(chain))
+            .flat_map(peer_trust_organizations)
             .collect()
     }
 

@@ -364,18 +364,16 @@ mod tests {
         // Issued under the current scheme: the organization is the site, so it is kept.
         let current = generate_site_cert(&ca, "west").unwrap_or_else(|_| std::process::abort());
         write("west", &current.cert_pem);
-        assert_eq!(
+        assert!(
             names_its_site(dir.path(), "west").unwrap_or_else(|_| std::process::abort()),
-            true,
             "an identity already naming its site must be reused, not rotated"
         );
 
         // Issued under the old shared organization: this is the rotation we do want.
         let stale = generate_cert_with_org(&ca, "east", "ai-grid").unwrap_or_else(|_| std::process::abort());
         write("east", &stale.cert_pem);
-        assert_eq!(
-            names_its_site(dir.path(), "east").unwrap_or_else(|_| std::process::abort()),
-            false,
+        assert!(
+            !names_its_site(dir.path(), "east").unwrap_or_else(|_| std::process::abort()),
             "an identity carrying the old shared organization must be rotated"
         );
 
@@ -383,9 +381,8 @@ mod tests {
         let infra = generate_dns_only_cert(&ca, "grid-enrollment", &["x.svc".to_owned()])
             .unwrap_or_else(|_| std::process::abort());
         write("north", &infra.cert_pem);
-        assert_eq!(
-            names_its_site(dir.path(), "north").unwrap_or_else(|_| std::process::abort()),
-            false,
+        assert!(
+            !names_its_site(dir.path(), "north").unwrap_or_else(|_| std::process::abort()),
             "an identity with no organization names no site"
         );
     }
