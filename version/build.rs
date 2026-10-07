@@ -21,14 +21,22 @@ const FACTS: [(&str, &str, &[&str], &str); 4] = [
     ("GRID_RUSTC_VERSION", "", &["--version"], "unknown"),
 ];
 
+/// Trimmed stdout of `program args`, or `None` when it could not run or exited
+/// non-zero.
+///
+/// `Some("")` is a successful command that printed nothing, which is distinct
+/// from failure: `git status --porcelain` says a clean tree that way.
+fn run_checked(program: &str, args: &[&str]) -> Option<String> {
+    let output = Command::new(program).args(args).output().ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
 /// Trimmed stdout of `program args`, or `None` when it cannot run or says nothing.
 fn run(program: &str, args: &[&str]) -> Option<String> {
-    let output = Command::new(program).args(args).output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let value = String::from_utf8(output.stdout).ok()?.trim().to_owned();
-    (!value.is_empty()).then_some(value)
+    run_checked(program, args).filter(|value| !value.is_empty())
 }
 
 /// `clean` when the work tree has no modifications, `dirty` when it has, else `unknown`.
@@ -39,10 +47,12 @@ fn tree_state() -> String {
     {
         return state;
     }
-    match run("git", &["status", "--porcelain"]) {
-        // run() maps empty output to None, so Some here always means modifications.
+    // Empty output is a clean tree only when the command succeeded. Reading a
+    // failed `git status` as clean would label an unknown tree as clean, which
+    // is the one answer that cannot be checked later.
+    match run_checked("git", &["status", "--porcelain"]) {
+        Some(status) if status.is_empty() => "clean".to_owned(),
         Some(_) => "dirty".to_owned(),
-        None if run("git", &["rev-parse", "HEAD"]).is_some() => "clean".to_owned(),
         None => "unknown".to_owned(),
     }
 }

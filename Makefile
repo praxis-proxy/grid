@@ -142,14 +142,22 @@ coverage-check:
 # Build provenance passed into every image. .dockerignore excludes .git, so the
 # build cannot resolve these itself and an image built without them says so.
 # ---------------------------------------------------------------------------
-GRID_GIT_COMMIT ?= $(shell git rev-parse HEAD 2>/dev/null || echo unknown)
-GRID_GIT_VERSION ?= $(shell git describe --tags --always 2>/dev/null || echo $(shell grep -m1 '^version' Cargo.toml | cut -d'"' -f2))
-GRID_GIT_TREE_STATE ?= $(shell if ! git rev-parse --git-dir >/dev/null 2>&1; then echo unknown; elif test -z "$$(git status --porcelain)"; then echo clean; else echo dirty; fi)
+# Both are git-derived and reach a shell recipe below, and a tag is whatever
+# someone named it, so drop anything outside the characters a tag or a describe
+# string legitimately uses rather than trusting the value.
+# The filter is the last command in each pipeline and succeeds on empty input,
+# so test the captured value rather than the pipeline's exit status.
+SAFE = tr -cd 'A-Za-z0-9._/+-'
+GRID_GIT_COMMIT ?= $(shell c=$$(git rev-parse HEAD 2>/dev/null | $(SAFE)); echo "$${c:-unknown}")
+GRID_GIT_VERSION ?= $(shell v=$$(git describe --tags --always 2>/dev/null | $(SAFE)); echo "$${v:-$(shell grep -m1 '^version' Cargo.toml | cut -d'"' -f2)}")
+# Empty output is clean only when git status SUCCEEDED; a failed status also
+# prints nothing, and reading that as clean labels an unknown tree clean.
+GRID_GIT_TREE_STATE ?= $(shell s=$$(git status --porcelain 2>/dev/null) && { test -z "$$s" && echo clean || echo dirty; } || echo unknown)
 GRID_BUILD_DATE ?= $(shell date -u +%Y%m%d)
-BUILD_ARGS = --build-arg GRID_GIT_COMMIT=$(GRID_GIT_COMMIT) \
-	--build-arg GRID_GIT_VERSION=$(GRID_GIT_VERSION) \
-	--build-arg GRID_GIT_TREE_STATE=$(GRID_GIT_TREE_STATE) \
-	--build-arg GRID_BUILD_DATE=$(GRID_BUILD_DATE)
+BUILD_ARGS = --build-arg 'GRID_GIT_COMMIT=$(GRID_GIT_COMMIT)' \
+	--build-arg 'GRID_GIT_VERSION=$(GRID_GIT_VERSION)' \
+	--build-arg 'GRID_GIT_TREE_STATE=$(GRID_GIT_TREE_STATE)' \
+	--build-arg 'GRID_BUILD_DATE=$(GRID_BUILD_DATE)'
 
 require-container-engine:
 ifndef CONTAINER_ENGINE
