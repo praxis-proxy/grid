@@ -300,6 +300,7 @@ mod tests {
         RoutingOverlay {
             network: "test-net".to_owned(),
             local_site: "site-a".to_owned(),
+            excluded: Vec::new(),
             candidates: vec![RoutingCandidate {
                 kind: "inference_model".to_owned(),
                 name: "model-a".to_owned(),
@@ -330,6 +331,7 @@ mod tests {
         RoutingOverlay {
             network: "glb-demo".to_owned(),
             local_site: "east-edge".to_owned(),
+            excluded: Vec::new(),
             candidates: vec![
                 RoutingCandidate {
                     kind: "inference_model".to_owned(),

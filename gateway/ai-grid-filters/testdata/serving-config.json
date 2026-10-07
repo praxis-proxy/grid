@@ -1,7 +1,7 @@
 {
   "local_site": "site-a",
   "window_secs": 60,
-  "load_window_ms": 30000,
+  "load_window_ms": 17000,
   "candidates": [
     {
       "kind": "inference_model",

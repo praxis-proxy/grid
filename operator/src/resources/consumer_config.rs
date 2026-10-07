@@ -739,6 +739,7 @@ mod tests {
             network: "test-net".to_owned(),
             local_site: "site-a".to_owned(),
             candidates,
+            excluded: Vec::new(),
             selection_policy: None,
             generated_at: None,
         }
@@ -1390,6 +1391,7 @@ mod tests {
             network: "n".to_owned(),
             local_site: String::new(),
             candidates: vec![],
+            excluded: Vec::new(),
             selection_policy: None,
             generated_at: None,
         };

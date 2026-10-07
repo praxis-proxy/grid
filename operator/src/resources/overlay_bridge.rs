@@ -118,6 +118,7 @@ mod tests {
                     capacity_weight: 1,
                 })
                 .collect(),
+            excluded: Vec::new(),
             selection_policy: None,
             generated_at: None,
         }
