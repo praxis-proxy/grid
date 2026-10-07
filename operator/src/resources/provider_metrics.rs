@@ -107,12 +107,13 @@ pub(crate) struct CollectedMetrics {
 // Signals collection (poll mode)
 // ---------------------------------------------------------------------------
 
-/// Scrape each provider's endpoint, recording its coarse signals and readiness.
+/// Scrape each provider's endpoint, recording its serving gauges and readiness.
 ///
 /// Sibling of [`collect_provider_metrics_with_refresh_interval`], which parses
 /// the same text into [`scoring::BackendMetrics`] for local scoring. This keeps
-/// the provider's own exposition narrowed to its declared `signalNames`, so the
-/// wire carries a coarse rollup rather than the full `/metrics` firehose. Fails
+/// the provider's own exposition as published, minus the families every process
+/// exports about itself, so a reader concludes from the provider's raw series
+/// and `signalNames` stays a scoring concern. Fails
 /// closed on TLS: a provider whose TLS will not resolve is skipped, never
 /// scraped in plaintext, and counts as a failed scrape.
 pub(crate) async fn collect_provider_signals(
@@ -162,7 +163,7 @@ fn record_scrape(
         .into_iter()
         .zip(republishable)
         .filter_map(|(o, republishable)| republishable.then_some(o))
-        .filter(|o| plan.wanted.contains(o.metric.as_str()))
+        .filter(|o| relayed(&o.metric))
         // A local sample's freshness is its collection time, so drop any trailing
         // timestamp. Only relayed peer samples carry a per-sample stamp.
         .map(|mut o| {
@@ -250,8 +251,6 @@ pub(crate) struct SignalScrapePlan<'provider> {
     pub(crate) identity: &'provider str,
     /// The metrics URL.
     pub(crate) url: String,
-    /// Declared signal names republished as coarse signals; may be empty.
-    pub(crate) wanted: std::collections::BTreeSet<String>,
     /// A declared ready-endpoints metric, replacing the defaults.
     ready_override: Option<&'provider str>,
 }
@@ -281,25 +280,17 @@ pub(crate) fn signal_scrape_plan(provider: &InferenceProvider) -> Option<SignalS
     Some(SignalScrapePlan {
         identity,
         url: metrics_url(mc.metrics_endpoint.as_deref().unwrap_or(endpoint), &mc.path),
-        wanted: signal_metric_names(&mc.signal_names),
         ready_override: mc.signal_names.ready_endpoints.as_deref(),
     })
 }
 
-/// The source metric names a provider declares for its coarse signals.
-fn signal_metric_names(cfg: &MetricSignalNames) -> std::collections::BTreeSet<String> {
-    [
-        &cfg.queue_depth,
-        &cfg.kv_cache_utilization,
-        &cfg.latency_p99_ms,
-        &cfg.prefix_cache_hit_ratio,
-        &cfg.error_rate,
-        &cfg.healthy,
-    ]
-    .into_iter()
-    .flatten()
-    .cloned()
-    .collect()
+/// Metric families every Go and controller-runtime process exports about itself.
+const RUNTIME_FAMILIES: [&str; 4] = ["go_", "process_", "controller_runtime_", "workqueue_"];
+
+/// Whether a gauge the provider publishes is relayed: everything it says about serving,
+/// nothing about its own process, so the wire stays well under the store's series cap.
+fn relayed(metric: &str) -> bool {
+    !RUNTIME_FAMILIES.iter().any(|family| metric.starts_with(family))
 }
 
 // ---------------------------------------------------------------------------
@@ -1080,24 +1071,25 @@ llm_d_epp_request_error_total{{{l},error_code="503"}} {errors}
     }
 
     #[test]
-    fn signal_metric_names_keeps_only_declared_coarse_signals() {
-        // The rollup carries the provider's declared coarse signals, not the
-        // full /metrics firehose: absent signals contribute no metric name, so
-        // the later filter drops everything the provider did not declare.
-        let cfg = MetricSignalNames {
-            queue_depth: Some("vllm:num_requests_waiting".to_owned()),
-            kv_cache_utilization: Some("vllm:gpu_cache_usage_perc".to_owned()),
-            ..Default::default()
-        };
-        let wanted = signal_metric_names(&cfg);
-        assert_eq!(wanted.len(), 2, "only the two declared signals are kept");
-        assert!(wanted.contains("vllm:num_requests_waiting"));
-        assert!(wanted.contains("vllm:gpu_cache_usage_perc"));
-        assert!(
-            !wanted.contains("vllm:gpu_memory_usage_bytes"),
-            "an undeclared series is not in the rollup"
-        );
-        assert!(signal_metric_names(&MetricSignalNames::default()).is_empty());
+    fn serving_gauges_are_relayed_and_runtime_families_are_not() {
+        // The relay carries what the provider says about serving, declared or not, and
+        // nothing a process says about itself.
+        for metric in [
+            "llm_d_epp_average_running_requests",
+            "inference_pool_ready_pods",
+            "vllm:num_requests_waiting",
+            "queue_depth",
+        ] {
+            assert!(relayed(metric), "{metric} is relayed");
+        }
+        for metric in [
+            "go_goroutines",
+            "process_resident_memory_bytes",
+            "controller_runtime_active_workers",
+            "workqueue_depth",
+        ] {
+            assert!(!relayed(metric), "{metric} is runtime noise");
+        }
     }
 
     #[test]
