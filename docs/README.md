@@ -58,7 +58,12 @@
   round-robin selection, provider attribution, and stable routing.
 - [Static Weighted Provider Qualification](../tests/e2e/topologies/grid-static-weighted/README.md) -
   proves configured capacity propagation, weighted overlay convergence,
-  proportional request selection, hot reload, and equal-weight recovery.
+  proportional request selection, hot reload, and equal-weight recovery. This
+  is the release qualification for `weightedRandom`, static placement, provider
+  capacity, weighted-overlay, or cross-site capacity propagation changes.
+- [Combined-site Lifecycle Qualification](../tests/e2e/topologies/grid-combined-site/README.md) -
+  is the release qualification for combined-site routing, provider
+  add/remove/re-add, session fallback, rollout, trust, or lifecycle changes.
 - [Distributed Token Quota Qualification](../tests/e2e/topologies/grid-token-rate-limit/README.md) -
   proves shared identity-scoped quota enforcement across gateway replicas,
   regional provider selection, expiry, restart persistence, fail-closed state

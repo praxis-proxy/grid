@@ -2,11 +2,12 @@ name: Triggered Integration Test
 
 # ------------------------------------------------------------------------------
 # Maintainer-triggered integration test of Grid main, a pull request, or a branch,
-# plus a nightly quick GLB run against main.
+# plus a nightly quick GLB run against main. Manual runs can select one of the
+# release qualifications below; scheduled runs intentionally remain GLB.
 #
-# Runs the GLB demo against the tested revision to verify multi-cluster
-# routing, SWIM discovery, mTLS, overlay hot-reload, and provider selection
-# work end-to-end.
+# Runs the selected qualification against the tested revision. GLB verifies
+# multi-cluster routing, SWIM discovery, mTLS, overlay hot-reload, and provider
+# selection; the other choices exercise their release-specific topology.
 # ------------------------------------------------------------------------------
 
 on:
@@ -22,6 +23,15 @@ on:
         required: false
         default: ""
         type: string
+      qualification:
+        description: Release qualification to run
+        required: true
+        default: glb
+        type: choice
+        options:
+          - glb
+          - static-weighted
+          - combined-site
       mode:
         description: Demo execution mode
         required: true
@@ -35,7 +45,7 @@ on:
       timezone: America/New_York
 
 concurrency:
-  group: grid-triggered-integration-${{ inputs.pr_number != '' && format('pr-{0}', inputs.pr_number) || inputs.branch != '' && format('branch-{0}', inputs.branch) || 'main' }}-${{ inputs.mode || 'quick' }}-${{ github.event_name }}
+  group: grid-triggered-integration-${{ inputs.qualification || 'glb' }}-${{ inputs.pr_number != '' && format('pr-{0}', inputs.pr_number) || inputs.branch != '' && format('branch-{0}', inputs.branch) || 'main' }}-${{ inputs.mode || 'quick' }}-${{ github.event_name }}
   cancel-in-progress: true
 
 permissions: {}
@@ -55,10 +65,12 @@ env:
   # simulator locally and pin it just like the gateway image.
   SIM_IMAGE_REF: ghcr.io/neuralmagic/vllm-vcr@sha256:cf98f91f12210893f63b3afd3b1ea5bd3c35640379ce2bbf702a4cefddf9e5a4
   SIM_IMAGE_TAG: ghcr.io/neuralmagic/vllm-vcr:vllm0.23
+  STATIC_WEIGHTED_SIM_IMAGE_REF: ghcr.io/llm-d/llm-d-inference-sim:v0.10.2
+  COMBINED_SITE_SIM_IMAGE_REF: ghcr.io/neuralmagic/vllm-vcr:vllm0.23
   PROBE_IMAGE_REF: curlimages/curl@sha256:d9b4541e214bcd85196d6e92e2753ac6d0ea699f0af5741f8c6cccbfcf00ef4b
   PROBE_IMAGE_TAG: curlimages/curl:8.10.1
   # Pinned identity/date/message-suffix for the local PR-merge reconstruction
-  # in resolve-source's "Resolve source" step and glb-e2e's "Reconstruct PR
+  # in resolve-source's "Resolve source" step and qualification-e2e's "Reconstruct PR
   # merge" step (see grid#66). Both jobs build a merge commit from the same
   # base_sha/head_sha pair and must produce a byte-identical SHA, which
   # requires byte-identical author/committer identity, date, and message --
@@ -96,6 +108,39 @@ jobs:
       head_sha: ${{ steps.pr.outputs.head_sha }}
       base_sha: ${{ steps.source.outputs.base_sha }}
     steps:
+      - name: Validate qualification and mode
+        env:
+          QUALIFICATION: ${{ inputs.qualification || 'glb' }}
+          MODE: ${{ inputs.mode || 'quick' }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          case "${QUALIFICATION}" in
+            glb)
+              ;;
+            static-weighted)
+              if [[ "${MODE}" != "quick" ]]; then
+                echo "::error::static-weighted is a fixed quick release qualification; select mode=quick"
+                exit 1
+              fi
+              ;;
+            combined-site)
+              if [[ "${MODE}" != "full" ]]; then
+                echo "::error::combined-site is a fixed full release qualification; select mode=full"
+                exit 1
+              fi
+              ;;
+            *)
+              echo "::error::Unknown qualification '${QUALIFICATION}'; expected glb, static-weighted, or combined-site"
+              exit 1
+              ;;
+          esac
+          if [[ "${EVENT_NAME}" == "schedule" && "${QUALIFICATION}" != "glb" ]]; then
+            echo "::error::Scheduled runs must use the GLB qualification"
+            exit 1
+          fi
+          echo "Qualification: ${QUALIFICATION} (${MODE})"
+
       - name: Validate source selector
         env:
           PR_NUM: ${{ inputs.pr_number }}
@@ -212,7 +257,7 @@ jobs:
             # example -- unchanged 49+ minutes after main advanced). A full
             # (unshallow) clone guarantees `git merge` can find the true
             # merge-base between base and head regardless of how far apart
-            # they are; glb-e2e's "Reconstruct PR merge" step repeats this
+            # they are; qualification-e2e's "Reconstruct PR merge" step repeats this
             # exact reconstruction (same inputs, same pinned identity/date/
             # message below) to independently arrive at the identical SHA
             # this step verifies it against.
@@ -308,11 +353,11 @@ jobs:
           retention-days: 14
 
   # ============================================================================
-  # GLB E2E — multi-cluster GLB demo against tested Grid revision
+  # Selected release qualification against the tested Grid revision
   # ============================================================================
 
-  glb-e2e:
-    name: ${{ needs.resolve-source.outputs.source_label }} GLB E2E
+  qualification-e2e:
+    name: ${{ needs.resolve-source.outputs.source_label }} ${{ inputs.qualification || 'glb' }} E2E
     needs: resolve-source
     runs-on: ubuntu-24.04
     permissions:
@@ -327,7 +372,10 @@ jobs:
       HEAD_SHA: ${{ needs.resolve-source.outputs.head_sha }}
       BASE_SHA: ${{ needs.resolve-source.outputs.base_sha }}
       BRANCH_NAME: ${{ needs.resolve-source.outputs.branch_name }}
+      QUALIFICATION: ${{ inputs.qualification || 'glb' }}
       MODE: ${{ inputs.mode || 'quick' }}
+      EVIDENCE_DIR: ${{ github.workspace }}/evidence/${{ inputs.qualification || 'glb' }}
+      DIAGNOSTICS_DIR: ${{ github.workspace }}/diagnostics/${{ inputs.qualification || 'glb' }}
     steps:
       # ----------------------------------------------------------------------
       # Checkout
@@ -449,14 +497,31 @@ jobs:
           fi
           echo "::notice::PASS: testing ${BRANCH_NAME} at ${ACTUAL}"
 
-      - name: Validate private backend settings in the checked-in GLB topology
+      - name: Validate private backend settings in the checked-in topology
         run: |
           set -euo pipefail
-          DEMO_DIR="${GITHUB_WORKSPACE}/grid/tests/e2e/topologies/grid-glb-demo"
-          for provider in east-provider west-provider; do
-            config="${DEMO_DIR}/configs/${provider}/praxis.yaml"
+          case "${QUALIFICATION}" in
+            glb)
+              CONFIGS=(
+                "${GITHUB_WORKSPACE}/grid/tests/e2e/topologies/grid-glb-demo/configs/east-provider/praxis.yaml"
+                "${GITHUB_WORKSPACE}/grid/tests/e2e/topologies/grid-glb-demo/configs/west-provider/praxis.yaml"
+              )
+              ;;
+            static-weighted|combined-site)
+              CONFIGS=(
+                "${GITHUB_WORKSPACE}/grid/tests/e2e/topologies/${QUALIFICATION}/configs/consumer/praxis.yaml"
+                "${GITHUB_WORKSPACE}/grid/tests/e2e/topologies/${QUALIFICATION}/configs/provider/praxis.yaml"
+              )
+              ;;
+            *)
+              echo "::error::No private-backend validation mapping for ${QUALIFICATION}"
+              exit 1
+              ;;
+          esac
+
+          for config in "${CONFIGS[@]}"; do
             if [[ ! -f "${config}" ]]; then
-              echo "::error::Missing GLB provider config: ${config}"
+              echo "::error::Missing qualification provider config: ${config}"
               exit 1
             fi
 
@@ -465,7 +530,7 @@ jobs:
               echo "::error::${config} must explicitly allow the private Kind endpoint and upstream addresses"
               exit 1
             fi
-            echo "Validated private Kind backend allowances in configs/${provider}/praxis.yaml"
+            echo "Validated private Kind backend allowances in ${config#"${GITHUB_WORKSPACE}/grid/"}"
           done
 
       - name: Validate immutable gateway input
@@ -575,6 +640,7 @@ jobs:
             TAG="main-${SHORT_SHA}"
             ARTIFACT_PREFIX="grid-main-${SHORT_SHA}"
           fi
+          TAG="${TAG}-${QUALIFICATION}"
           {
             echo "tag=${TAG}"
             echo "short_sha=${SHORT_SHA}"
@@ -642,7 +708,8 @@ jobs:
           fi
           echo "Digest verification: PASS"
 
-      - name: Pull pinned simulator image
+      - name: Pull pinned GLB simulator image
+        if: env.QUALIFICATION == 'glb'
         run: |
           set -euo pipefail
           docker pull "${SIM_IMAGE_REF}"
@@ -655,6 +722,42 @@ jobs:
           docker tag "${SIM_IMAGE_REF}" "${SIM_IMAGE_TAG}"
           ACTUAL_ID=$(docker image inspect --format='{{.Id}}' "${SIM_IMAGE_REF}")
           echo "Simulator image verified: ${SIM_IMAGE_REF} (image ID ${ACTUAL_ID}), tagged locally as ${SIM_IMAGE_TAG}"
+
+      - name: Pull static-weighted simulator image
+        if: env.QUALIFICATION == 'static-weighted'
+        id: static-simulator
+        run: |
+          set -euo pipefail
+          docker pull "${STATIC_WEIGHTED_SIM_IMAGE_REF}"
+          IMAGE_ID=$(docker image inspect --format='{{.Id}}' "${STATIC_WEIGHTED_SIM_IMAGE_REF}")
+          REPO_DIGESTS=$(docker image inspect --format='{{join .RepoDigests ","}}' "${STATIC_WEIGHTED_SIM_IMAGE_REF}")
+          if [[ -z "${REPO_DIGESTS}" ]]; then
+            echo "::error::Static-weighted simulator has no repository digest after pull"
+            exit 1
+          fi
+          {
+            echo "image_id=${IMAGE_ID}"
+            echo "repo_digests=${REPO_DIGESTS}"
+          } >> "${GITHUB_OUTPUT}"
+          echo "Static-weighted simulator verified: ${STATIC_WEIGHTED_SIM_IMAGE_REF} (image ID ${IMAGE_ID}; repository digests ${REPO_DIGESTS})"
+
+      - name: Pull combined-site simulator image
+        if: env.QUALIFICATION == 'combined-site'
+        id: combined-simulator
+        run: |
+          set -euo pipefail
+          docker pull "${COMBINED_SITE_SIM_IMAGE_REF}"
+          IMAGE_ID=$(docker image inspect --format='{{.Id}}' "${COMBINED_SITE_SIM_IMAGE_REF}")
+          REPO_DIGESTS=$(docker image inspect --format='{{join .RepoDigests ","}}' "${COMBINED_SITE_SIM_IMAGE_REF}")
+          if [[ -z "${REPO_DIGESTS}" ]]; then
+            echo "::error::Combined-site simulator has no repository digest after pull"
+            exit 1
+          fi
+          {
+            echo "image_id=${IMAGE_ID}"
+            echo "repo_digests=${REPO_DIGESTS}"
+          } >> "${GITHUB_OUTPUT}"
+          echo "Combined-site simulator verified: ${COMBINED_SITE_SIM_IMAGE_REF} (image ID ${IMAGE_ID}; repository digests ${REPO_DIGESTS})"
 
       - name: Pull pinned probe image
         run: |
@@ -719,8 +822,31 @@ jobs:
         env:
           TAG: ${{ steps.tags.outputs.tag }}
           RESOLVED_DIGEST: ${{ steps.gateway.outputs.digest }}
+          STATIC_SIMULATOR_DIGESTS: ${{ steps.static-simulator.outputs.repo_digests || 'unknown' }}
+          COMBINED_SIMULATOR_DIGESTS: ${{ steps.combined-simulator.outputs.repo_digests || 'unknown' }}
         run: |
           set -euo pipefail
+          case "${QUALIFICATION}" in
+            glb)
+              SIMULATOR_REF="${SIM_IMAGE_TAG}"
+              SIMULATOR_DESCRIPTION="pinned GLB simulator materialized from ${SIM_IMAGE_REF}"
+              SIMULATOR_DIGESTS=$(docker image inspect --format='{{join .RepoDigests ","}}' "${SIM_IMAGE_TAG}")
+              ;;
+            static-weighted)
+              SIMULATOR_REF="${STATIC_WEIGHTED_SIM_IMAGE_REF}"
+              SIMULATOR_DESCRIPTION="static-weighted qualification simulator"
+              SIMULATOR_DIGESTS="${STATIC_SIMULATOR_DIGESTS}"
+              ;;
+            combined-site)
+              SIMULATOR_REF="${COMBINED_SITE_SIM_IMAGE_REF}"
+              SIMULATOR_DESCRIPTION="combined-site topology simulator"
+              SIMULATOR_DIGESTS="${COMBINED_SIMULATOR_DIGESTS}"
+              ;;
+            *)
+              echo "::error::Unknown qualification '${QUALIFICATION}' while writing image manifest"
+              exit 1
+              ;;
+          esac
           {
             echo "=== Image Manifest ==="
             echo ""
@@ -736,9 +862,9 @@ jobs:
             docker inspect --format='  ID: {{.Id}}' "${GATEWAY_IMAGE_REF}"
             echo "  Digest: ${RESOLVED_DIGEST}"
             echo ""
-            echo "${SIM_IMAGE_TAG}  (materialized from pinned GLB simulator ${SIM_IMAGE_REF})"
-            docker inspect --format='  ID: {{.Id}}' "${SIM_IMAGE_TAG}"
-            docker inspect --format='  Repository digests: {{json .RepoDigests}}' "${SIM_IMAGE_TAG}"
+            echo "${SIMULATOR_REF}  (${SIMULATOR_DESCRIPTION})"
+            docker inspect --format='  ID: {{.Id}}' "${SIMULATOR_REF}"
+            echo "  Repository digests: ${SIMULATOR_DIGESTS}"
             echo ""
             echo "${PROBE_IMAGE_REF}  (pinned GLB probe image; local tag ${PROBE_IMAGE_TAG})"
             docker inspect --format='  ID: {{.Id}}' "${PROBE_IMAGE_TAG}"
@@ -747,8 +873,11 @@ jobs:
             echo "GRID_XTASK_OPERATOR_IMAGE=grid-operator:${TAG}"
             echo "GRID_XTASK_MOCK_PROVIDER_IMAGE=grid-mock-providers:${TAG}"
             echo "GRID_XTASK_GATEWAY_IMAGE=${GATEWAY_IMAGE_REF}"
-            echo "GRID_XTASK_SIM_IMAGE=${SIM_IMAGE_TAG}"
-            echo "  materialized from pinned ${SIM_IMAGE_REF}"
+            if [[ "${QUALIFICATION}" == "combined-site" ]]; then
+              echo "GRID_XTASK_SIM_IMAGE=<unset> (xtask combined-site default ${COMBINED_SITE_SIM_IMAGE_REF})"
+            else
+              echo "GRID_XTASK_SIM_IMAGE=${SIMULATOR_REF}"
+            fi
             echo "GRID_XTASK_IMAGE_PULL_POLICY=Never"
           } | tee "${GITHUB_WORKSPACE}/image-manifest.txt"
 
@@ -764,21 +893,19 @@ jobs:
 
       - name: Create evidence and diagnostics directories
         run: |
-          mkdir -p "${GITHUB_WORKSPACE}/evidence" "${GITHUB_WORKSPACE}/diagnostics"
+          mkdir -p "${EVIDENCE_DIR}" "${DIAGNOSTICS_DIR}"
 
       # ----------------------------------------------------------------------
-      # Run GLB demo
+      # Run selected qualification
       # ----------------------------------------------------------------------
 
-      - name: Run GLB demo
-        id: glb
+      - name: Run selected qualification
+        id: qualification
         env:
           GRID_REPO: ${{ github.workspace }}/grid
           GRID_XTASK_OPERATOR_IMAGE: grid-operator:${{ steps.tags.outputs.tag }}
           GRID_XTASK_MOCK_PROVIDER_IMAGE: grid-mock-providers:${{ steps.tags.outputs.tag }}
           GRID_XTASK_GATEWAY_IMAGE: ${{ env.GATEWAY_IMAGE_REF }}
-          GRID_XTASK_SIM_IMAGE: ${{ env.SIM_IMAGE_TAG }}
-          GRID_XTASK_IMAGE_PULL_POLICY: Never
         run: |
           set -euo pipefail
           GRID_ACTUAL=$(git -C "${GRID_REPO}" rev-parse HEAD)
@@ -797,13 +924,40 @@ jobs:
           echo "Operator image: ${GRID_XTASK_OPERATOR_IMAGE} (revision ${TESTED_SHA})"
           echo "Mock image:     ${GRID_XTASK_MOCK_PROVIDER_IMAGE} (revision ${TESTED_SHA})"
           echo "Gateway image:  ${GRID_XTASK_GATEWAY_IMAGE}@${GATEWAY_IMAGE_DIGEST}"
+          echo "Qualification:  ${QUALIFICATION} (${MODE})"
+          echo "Evidence:       ${EVIDENCE_DIR}"
           cd "${GRID_REPO}"
           ./scripts/forge.sh install
-          cargo xtask env run-grid-glb-demo \
-            --forge-config tests/e2e/topologies/grid-glb-demo/forge.yaml \
-            "--${MODE}" --teardown --keep-on-failure \
-            --evidence-dir "${GITHUB_WORKSPACE}/evidence/glb" \
-            2>&1 | tee "${GITHUB_WORKSPACE}/run-glb.log"
+          case "${QUALIFICATION}" in
+            glb)
+              GRID_XTASK_SIM_IMAGE="${SIM_IMAGE_TAG}" \
+              GRID_XTASK_IMAGE_PULL_POLICY=Never \
+              cargo xtask env run-grid-glb-demo \
+                --forge-config tests/e2e/topologies/grid-glb-demo/forge.yaml \
+                "--${MODE}" --teardown --keep-on-failure \
+                --evidence-dir "${EVIDENCE_DIR}" \
+                2>&1 | tee "${GITHUB_WORKSPACE}/run-${QUALIFICATION}.log"
+              ;;
+            static-weighted)
+              GRID_XTASK_SIM_IMAGE="${STATIC_WEIGHTED_SIM_IMAGE_REF}" \
+              GRID_XTASK_IMAGE_PULL_POLICY=Never \
+              cargo xtask env run-grid-static-weighted-qualification \
+                --forge-config tests/e2e/topologies/grid-static-weighted/forge.yaml \
+                --quick --teardown --evidence-dir "${EVIDENCE_DIR}" \
+                2>&1 | tee "${GITHUB_WORKSPACE}/run-${QUALIFICATION}.log"
+              ;;
+            combined-site)
+              GRID_XTASK_IMAGE_PULL_POLICY=Never \
+              cargo xtask env run-grid-combined-site-demo \
+                --forge-config tests/e2e/topologies/grid-combined-site/forge.yaml \
+                --full --teardown --evidence-dir "${EVIDENCE_DIR}" \
+                2>&1 | tee "${GITHUB_WORKSPACE}/run-${QUALIFICATION}.log"
+              ;;
+            *)
+              echo "::error::Unknown qualification '${QUALIFICATION}'"
+              exit 1
+              ;;
+          esac
           echo "result=success" >> "${GITHUB_OUTPUT}"
 
       # ----------------------------------------------------------------------
@@ -814,8 +968,18 @@ jobs:
         if: always()
         run: |
           set -euo pipefail
-          DIAG="${GITHUB_WORKSPACE}/diagnostics"
-          mkdir -p "${DIAG}" "${GITHUB_WORKSPACE}/evidence"
+          DIAG="${DIAGNOSTICS_DIR}"
+          mkdir -p "${DIAG}" "${EVIDENCE_DIR}"
+
+          case "${QUALIFICATION}" in
+            glb) DEMO_DIR="${GITHUB_WORKSPACE}/grid/tests/e2e/topologies/grid-glb-demo" ;;
+            static-weighted) DEMO_DIR="${GITHUB_WORKSPACE}/grid/tests/e2e/topologies/grid-static-weighted" ;;
+            combined-site) DEMO_DIR="${GITHUB_WORKSPACE}/grid/tests/e2e/topologies/grid-combined-site" ;;
+            *)
+              echo "::warning::Unknown qualification '${QUALIFICATION}'; skipping Forge diagnostics"
+              DEMO_DIR=""
+              ;;
+          esac
 
           echo "::group::Kind clusters"
           kind get clusters > "${DIAG}/kind-clusters.txt" 2>&1 || echo "(none)" > "${DIAG}/kind-clusters.txt"
@@ -892,8 +1056,7 @@ jobs:
           docker ps -a > "${DIAG}/docker-containers.txt" 2>&1 || true
           echo "::endgroup::"
 
-          DEMO_DIR="${GITHUB_WORKSPACE}/grid/tests/e2e/topologies/grid-glb-demo"
-          if [[ -d "${DEMO_DIR}/.forge" ]]; then
+          if [[ -n "${DEMO_DIR}" && -d "${DEMO_DIR}/.forge" ]]; then
             cp -r "${DEMO_DIR}/.forge" "${DIAG}/forge-output" 2>/dev/null || true
             find "${DIAG}/forge-output" \
               \( -name "*.key" -o -name "*.pem" -o -name "*.crt" \
@@ -903,9 +1066,9 @@ jobs:
               -type f -exec rm -f {} + 2>/dev/null || true
           fi
 
-          if [[ -d "${DEMO_DIR}/.forge/evidence" ]]; then
+          if [[ -n "${DEMO_DIR}" && -d "${DEMO_DIR}/.forge/evidence" ]]; then
             cp -r "${DEMO_DIR}/.forge/evidence" \
-              "${GITHUB_WORKSPACE}/evidence/forge" 2>/dev/null || true
+              "${EVIDENCE_DIR}/forge" 2>/dev/null || true
           fi
 
           echo "Diagnostics collection complete"
@@ -919,7 +1082,7 @@ jobs:
           # embedded in logs, YAML, JSON, or ConfigMap output. Remove any file
           # containing recognizable private keys, certificates, or bearer tokens
           # before the artifact upload. Do not print matching content.
-          for root in "${GITHUB_WORKSPACE}/diagnostics" "${GITHUB_WORKSPACE}/evidence"; do
+          for root in "${DIAGNOSTICS_DIR}" "${EVIDENCE_DIR}"; do
             [[ -d "${root}" ]] || continue
             while IFS= read -r -d '' file; do
               if grep -aEq -- \
@@ -941,11 +1104,11 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: ${{ steps.tags.outputs.artifact_prefix || 'grid-unknown' }}-glb-${{ env.MODE }}
+          name: ${{ steps.tags.outputs.artifact_prefix || 'grid-unknown' }}-${{ env.QUALIFICATION }}-${{ env.MODE }}
           path: |
-            ${{ github.workspace }}/evidence/
-            ${{ github.workspace }}/diagnostics/
-            ${{ github.workspace }}/run-glb.log
+            ${{ github.workspace }}/evidence/${{ env.QUALIFICATION }}/
+            ${{ github.workspace }}/diagnostics/${{ env.QUALIFICATION }}/
+            ${{ github.workspace }}/run-${{ env.QUALIFICATION }}.log
             ${{ github.workspace }}/image-manifest.txt
             ${{ github.workspace }}/source-metadata.json
             ${{ github.workspace }}/versions.txt
@@ -956,7 +1119,7 @@ jobs:
       # Cleanup
       # ----------------------------------------------------------------------
 
-      - name: Delete Kind clusters
+      - name: Delete run-owned Kind resources
         id: cleanup
         if: always()
         continue-on-error: true
@@ -964,30 +1127,95 @@ jobs:
           set -euo pipefail
           CLEANUP_RESULT="success"
 
-          for cluster in $(kind get clusters 2>/dev/null); do
-            case "${cluster}" in
-              grid-glb-*)
-                echo "Deleting cluster: ${cluster}"
-                if ! kind delete cluster --name "${cluster}"; then
-                  echo "::warning::Failed to delete Kind cluster '${cluster}'"
+          GRID_REPO="${GITHUB_WORKSPACE}/grid"
+          STATE_FILE="${GRID_REPO}/.forge/state.json"
+          OWNED_CLUSTERS=()
+          OWNED_NETWORKS=()
+          NETWORK_OWNER=""
+
+          case "${QUALIFICATION}" in
+            glb)
+              OWNED_CLUSTERS=(
+                grid-glb-east-provider
+                grid-glb-west-provider
+                grid-glb-east-edge
+                grid-glb-west-edge
+                grid-glb-gtm-emulator
+              )
+              OWNED_NETWORKS=(grid-glb-demo-net)
+              NETWORK_OWNER="grid-glb-demo"
+              ;;
+            static-weighted)
+              RESOLVED_CONFIG="${GRID_REPO}/tests/e2e/topologies/grid-static-weighted/.forge.resolved.yaml"
+              if [[ ! -f "${RESOLVED_CONFIG}" ]]; then
+                echo "::warning::Static-weighted resolved Forge config is absent; refusing broad cleanup"
+                CLEANUP_RESULT="partial"
+              else
+                RUN_PREFIX=$(sed -n 's/^    clusterPrefix:[[:space:]]*//p' "${RESOLVED_CONFIG}" | head -n 1 | tr -d '"')
+                NETWORK_OWNER=$(sed -n 's/^  name:[[:space:]]*//p' "${RESOLVED_CONFIG}" | head -n 1 | tr -d '"')
+                if ! [[ "${RUN_PREFIX}" =~ ^grid-static-weighted-[0-9]+$ ]] || [[ "${NETWORK_OWNER}" != "${RUN_PREFIX}" ]]; then
+                  echo "::warning::Static-weighted Forge ownership could not be validated; refusing broad cleanup"
                   CLEANUP_RESULT="partial"
+                else
+                  OWNED_CLUSTERS=(
+                    "${RUN_PREFIX}-provider-a"
+                    "${RUN_PREFIX}-provider-b"
+                    "${RUN_PREFIX}-provider-c"
+                  )
+                  OWNED_NETWORKS=("${RUN_PREFIX}-net")
                 fi
-                ;;
-              *)
-                echo "Skipping unrelated cluster: ${cluster}"
-                ;;
-            esac
+              fi
+              ;;
+            combined-site)
+              OWNED_CLUSTERS=(
+                grid-combined-west
+                grid-combined-central
+                grid-combined-east
+              )
+              OWNED_NETWORKS=(grid-combined-site-net)
+              NETWORK_OWNER="grid-combined-site"
+              ;;
+            *)
+              echo "::warning::Unknown qualification '${QUALIFICATION}'; refusing cleanup"
+              CLEANUP_RESULT="partial"
+              ;;
+          esac
+
+          for cluster in "${OWNED_CLUSTERS[@]}"; do
+            if ! kind get clusters 2>/dev/null | grep -Fxq "${cluster}"; then
+              continue
+            fi
+            echo "Deleting run-owned cluster: ${cluster}"
+            if ! kind delete cluster --name "${cluster}"; then
+              echo "::warning::Failed to delete run-owned Kind cluster '${cluster}'"
+              CLEANUP_RESULT="partial"
+            fi
           done
 
-          for net in $(docker network ls --filter name=kind --format '{{.Name}}' 2>/dev/null); do
-            case "${net}" in
-              kind-grid-glb-*|grid-glb-*)
-                docker network rm "${net}" 2>/dev/null || true
-                ;;
-            esac
+          for net in "${OWNED_NETWORKS[@]}"; do
+            if ! docker network inspect "${net}" >/dev/null 2>&1; then
+              continue
+            fi
+            LABELS=$(docker network inspect --format '{{.Labels}}' "${net}" 2>/dev/null || true)
+            if [[ "${LABELS}" != *"forge.managed:true"* || "${LABELS}" != *"forge.environment:${NETWORK_OWNER}"* ]]; then
+              echo "::warning::Preserving network '${net}': Forge ownership labels do not match ${NETWORK_OWNER}"
+              CLEANUP_RESULT="partial"
+              continue
+            fi
+            if [[ ! -f "${STATE_FILE}" ]] || ! jq -e '.networkCreatedByForge == true' "${STATE_FILE}" >/dev/null 2>&1; then
+              echo "::warning::Preserving network '${net}': Forge state says it was pre-existing"
+              CLEANUP_RESULT="partial"
+              continue
+            fi
+            if ! docker network rm "${net}" >/dev/null; then
+              echo "::warning::Failed to delete run-owned Docker network '${net}'"
+              CLEANUP_RESULT="partial"
+            fi
           done
 
-          rm -rf /tmp/kind-grid-glb-* 2>/dev/null || true
+          for cluster in "${OWNED_CLUSTERS[@]}"; do
+            rm -rf "/tmp/kind-${cluster}" 2>/dev/null || true
+          done
 
           echo "result=${CLEANUP_RESULT}" >> "${GITHUB_OUTPUT}"
           echo "Cleanup: ${CLEANUP_RESULT}"
@@ -1001,7 +1229,7 @@ jobs:
         env:
           TAG: ${{ steps.tags.outputs.tag || 'unknown' }}
           ARTIFACT_PREFIX: ${{ steps.tags.outputs.artifact_prefix || 'grid-unknown' }}
-          GLB_RESULT: ${{ steps.glb.outputs.result || 'not-reached' }}
+          QUALIFICATION_RESULT: ${{ steps.qualification.outputs.result || 'not-reached' }}
           CLEANUP_RESULT: ${{ steps.cleanup.outputs.result || 'unknown' }}
           RESOLVED_DIGEST: ${{ steps.gateway.outputs.digest || 'unknown' }}
           PR_TITLE: ${{ needs.resolve-source.outputs.title }}
@@ -1009,19 +1237,43 @@ jobs:
           PR_AUTHOR: ${{ needs.resolve-source.outputs.author }}
           PR_DRAFT: ${{ needs.resolve-source.outputs.draft }}
         run: |
-          case "${GLB_RESULT}" in
-            success) GLB_DISPLAY="success" ;;
-            failure) GLB_DISPLAY="failure" ;;
-            *) GLB_DISPLAY="${GLB_RESULT}" ;;
+          case "${QUALIFICATION}" in
+            glb)
+              QUALIFICATION_DISPLAY="GLB"
+              TOPOLOGY="tests/e2e/topologies/grid-glb-demo"
+              SIMULATOR="${SIM_IMAGE_TAG} (pinned from ${SIM_IMAGE_REF})"
+              ;;
+            static-weighted)
+              QUALIFICATION_DISPLAY="Static weighted provider selection"
+              TOPOLOGY="tests/e2e/topologies/grid-static-weighted"
+              SIMULATOR="${STATIC_WEIGHTED_SIM_IMAGE_REF}"
+              ;;
+            combined-site)
+              QUALIFICATION_DISPLAY="Combined-site lifecycle"
+              TOPOLOGY="tests/e2e/topologies/grid-combined-site"
+              SIMULATOR="${COMBINED_SITE_SIM_IMAGE_REF} (xtask topology default)"
+              ;;
+            *)
+              QUALIFICATION_DISPLAY="Unknown (${QUALIFICATION})"
+              TOPOLOGY="unknown"
+              SIMULATOR="unknown"
+              ;;
+          esac
+
+          case "${QUALIFICATION_RESULT}" in
+            success) QUALIFICATION_DISPLAY_RESULT="success" ;;
+            failure) QUALIFICATION_DISPLAY_RESULT="failure" ;;
+            *) QUALIFICATION_DISPLAY_RESULT="${QUALIFICATION_RESULT}" ;;
           esac
 
           {
-            echo "## Triggered Integration Test: GLB Demo"
+            echo "## Triggered Integration Test: ${QUALIFICATION_DISPLAY}"
             echo ""
             echo "| Field | Value |"
             echo "|-------|-------|"
             echo "| **Source** | ${SOURCE_LABEL} |"
             echo "| **Tested SHA** | \`${TESTED_SHA}\` |"
+            echo "| **Qualification** | ${QUALIFICATION_DISPLAY} |"
 
             if [[ "${SOURCE_KIND}" == "pr" ]]; then
               echo "| **PR Title** | ${PR_TITLE} |"
@@ -1038,9 +1290,9 @@ jobs:
               echo "| **Source verification** | Main SHA verified |"
             fi
 
-            echo "| **Topology** | \`tests/e2e/topologies/grid-glb-demo\` at tested Grid SHA |"
+            echo "| **Topology** | \`${TOPOLOGY}\` at tested Grid SHA |"
             echo "| **Mode** | \`${MODE}\` |"
-            echo "| **GLB result** | ${GLB_DISPLAY} |"
+            echo "| **Qualification result** | ${QUALIFICATION_DISPLAY_RESULT} |"
             echo "| **Cleanup** | ${CLEANUP_RESULT} |"
             echo ""
             echo "### Images"
@@ -1050,8 +1302,9 @@ jobs:
             echo "| Grid Operator | \`grid-operator:${TAG}\` |"
             echo "| Mock Providers | \`grid-mock-providers:${TAG}\` |"
             echo "| Gateway (pinned) | \`${GATEWAY_IMAGE_REF}\` (\`${RESOLVED_DIGEST}\`) |"
+            echo "| Simulator | \`${SIMULATOR}\` |"
             echo ""
             echo "### Artifact"
             echo ""
-            echo "\`${ARTIFACT_PREFIX}-glb-${MODE}\`"
+            echo "\`${ARTIFACT_PREFIX}-${QUALIFICATION}-${MODE}\`"
           } >> "${GITHUB_STEP_SUMMARY}"
