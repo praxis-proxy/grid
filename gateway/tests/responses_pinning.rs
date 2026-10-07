@@ -118,17 +118,15 @@ mod tests {
             let serving = work.join("serving-config.json");
             std::fs::write(
                 &serving,
-                format!(
-                    r#"{{"local_site":"local","window_secs":60,"load_window_ms":30000,"candidates":[{{"kind":"inference_model","name":"llama","site":"local","cluster":"pool-local"}}],"peers":[],"prefix_affinity":{{"tag_key_path":{:?}}}}}"#,
-                    key.display().to_string()
-                ),
+                r#"{"local_site":"local","window_secs":60,"load_window_ms":30000,"candidates":[{"kind":"inference_model","name":"llama","site":"local","cluster":"pool-local"}],"peers":[]}"#,
             )
             .expect("serving config");
             let config = work.join("praxis.yaml");
+            let key = key.display().to_string();
             std::fs::write(
                 &config,
                 format!(
-                    "insecure_options:\n  allow_private_endpoints: true\nadmin:\n  address: \"127.0.0.1:{admin}\"\nlisteners:\n  - name: default\n    address: \"127.0.0.1:{listen}\"\n    filter_chains: [main]\nfilter_chains:\n  - name: main\n    filters:\n      - filter: grid_site_route\n        model_header: X-Model\n      - filter: load_balancer\n        clusters:\n          - name: pool-local\n            endpoints: [\"127.0.0.1:{backend}\"]\n"
+                    "insecure_options:\n  allow_private_endpoints: true\nadmin:\n  address: \"127.0.0.1:{admin}\"\nlisteners:\n  - name: default\n    address: \"127.0.0.1:{listen}\"\n    filter_chains: [main]\nfilter_chains:\n  - name: main\n    filters:\n      - filter: grid_site_route\n        model_header: X-Model\n        prefix_affinity: {{tag_key_path: {key:?}}}\n      - filter: load_balancer\n        clusters:\n          - name: pool-local\n            endpoints: [\"127.0.0.1:{backend}\"]\n"
                 ),
             )
             .expect("praxis config");
