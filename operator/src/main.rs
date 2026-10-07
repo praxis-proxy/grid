@@ -76,6 +76,7 @@ use operator::{
         grid_site::GridSite,
         inference_provider::InferenceProvider,
     },
+    error::OperatorError,
     gateway,
     resources::tls_backend::{self, ServerTlsConfig},
     served_models, swim_advertise,
@@ -179,8 +180,11 @@ async fn main() {
             .with_declared_trust(declared_trust)
             .with_rotation(rotation_running)
             .with_site_name(config.swim.site_name.clone())
+            .with_scrape_interval(config.signals.scrape_interval())
             .hold_membership(),
     );
+    // This site's providers first, then what its peers publish, on /metrics.
+    operator::metrics::register_provider_signals(vec![ctx.signals(), ctx.peers()]);
 
     // Controllers run now. Only SWIM and what dials peers wait on the advertise address.
     let (swim_tx, swim_rx) = tokio::sync::watch::channel(SwimStage::Starting);
@@ -1087,12 +1091,22 @@ async fn run_network_controller(
 }
 
 /// Log a controller error, an expired watch at debug since kube-runtime relists.
-fn log_controller_error<R: std::fmt::Debug>(kind: &str, error: &kube::runtime::controller::Error<R, watcher::Error>) {
+fn log_controller_error(kind: &str, error: &kube::runtime::controller::Error<OperatorError, watcher::Error>) {
     if watch_expired(error) {
         tracing::debug!(kind, ?error, "watch expired; relisting");
+    } else if reconcile_conflicted(error) {
+        tracing::debug!(kind, ?error, "object moved underneath the write; reapplying");
     } else {
         tracing::error!(error = ?error, "{kind} watch error");
     }
+}
+
+/// Whether a controller error is the reconciler losing a write race.
+///
+/// The error policy already requeues these. Both sites have to agree, or a conflict the
+/// reconciler treats as routine still reaches the log as a failure.
+fn reconcile_conflicted(error: &kube::runtime::controller::Error<OperatorError, watcher::Error>) -> bool {
+    matches!(error, kube::runtime::controller::Error::ReconcilerFailed(e, _) if e.is_conflict())
 }
 
 /// Whether a controller error is the apiserver expiring a watch's resource version.

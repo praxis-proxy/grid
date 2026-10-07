@@ -93,6 +93,58 @@ pub enum MetricsScrapeError {
     /// A credential would have gone over plain HTTP without `allowPlaintext`.
     #[error("refusing to send a metrics credential over plain http: {0}")]
     PlaintextCredential(String),
+    /// The body passed the 1 MiB response limit.
+    #[error("metrics response body exceeds {0} byte limit")]
+    BodyTooLarge(usize),
+}
+
+impl MetricsScrapeError {
+    /// The bounded class of this failure, for the provider's condition and scrape counters.
+    #[must_use]
+    pub(crate) fn class(&self) -> crate::readiness::ScrapeClass {
+        use crate::readiness::ScrapeClass;
+        match self {
+            Self::Timeout(_) => ScrapeClass::Timeout,
+            Self::NonOkStatus { status: 401 | 403, .. } => ScrapeClass::Unauthorized,
+            Self::NonOkStatus { .. } => ScrapeClass::Http,
+            Self::Transport(source) => transport_class(source.as_ref()),
+            Self::Encoding(_) => ScrapeClass::Parse,
+            Self::TlsMaterial(_) => ScrapeClass::Tls,
+            Self::BodyTooLarge(_) => ScrapeClass::BodyCap,
+            Self::InvalidUrl(_) | Self::HttpWithTls(_) | Self::Credential(_) | Self::PlaintextCredential(_) => {
+                ScrapeClass::Config
+            },
+        }
+    }
+}
+
+/// TLS when the chain holds a TLS error, DNS when resolution failed, timeout when the socket
+/// timed out, else a connect failure.
+fn transport_class(source: &(dyn std::error::Error + 'static)) -> crate::readiness::ScrapeClass {
+    use crate::readiness::ScrapeClass;
+    let mut cause = Some(source);
+    while let Some(error) = cause {
+        // io::Error's source skips the error it wraps, which is where a TLS failure sits.
+        let wrapped = error
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::get_ref)
+            .is_some_and(|inner| crate::resources::tls_backend::is_tls_error(inner));
+        if wrapped || crate::resources::tls_backend::is_tls_error(error) {
+            return ScrapeClass::Tls;
+        }
+        let text = error.to_string();
+        if text.contains("dns error") || text.contains("failed to lookup address") {
+            return ScrapeClass::Dns;
+        }
+        if error
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::TimedOut)
+        {
+            return ScrapeClass::Timeout;
+        }
+        cause = error.source();
+    }
+    ScrapeClass::Connect
 }
 
 // ---------------------------------------------------------------------------
@@ -299,9 +351,7 @@ async fn read_response(
         .await
         .map_err(|e| {
             if e.downcast_ref::<http_body_util::LengthLimitError>().is_some() {
-                MetricsScrapeError::Transport(
-                    format!("metrics response body exceeds {MAX_RESPONSE_BODY_BYTES} byte limit").into(),
-                )
+                MetricsScrapeError::BodyTooLarge(MAX_RESPONSE_BODY_BYTES)
             } else {
                 MetricsScrapeError::Transport(e)
             }
@@ -327,6 +377,74 @@ mod tests {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     use super::*;
+
+    #[test]
+    #[cfg(not(feature = "fips"))]
+    fn a_tls_failure_wrapped_in_an_io_error_classes_as_tls() {
+        let tls: Box<dyn std::error::Error + Send + Sync> = Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            rustls::Error::General("bad certificate".to_owned()),
+        ));
+        assert_eq!(
+            MetricsScrapeError::Transport(tls).class(),
+            crate::readiness::ScrapeClass::Tls
+        );
+    }
+
+    #[test]
+    #[expect(clippy::too_many_lines, reason = "one table of failures and their classes")]
+    fn a_scrape_failure_has_a_bounded_class() {
+        use crate::readiness::ScrapeClass;
+        let status = |status| MetricsScrapeError::NonOkStatus {
+            status,
+            url: "https://epp:9090/metrics".to_owned(),
+        };
+        let transport = |error: Box<dyn std::error::Error + Send + Sync>| MetricsScrapeError::Transport(error);
+        let cases = [
+            (
+                "timeout",
+                MetricsScrapeError::Timeout(Duration::from_secs(2)),
+                ScrapeClass::Timeout,
+            ),
+            ("401", status(401), ScrapeClass::Unauthorized),
+            ("403", status(403), ScrapeClass::Unauthorized),
+            ("500", status(500), ScrapeClass::Http),
+            ("404", status(404), ScrapeClass::Http),
+            (
+                "dns",
+                transport("dns error: failed to lookup address information".into()),
+                ScrapeClass::Dns,
+            ),
+            (
+                "refused",
+                transport(Box::new(std::io::Error::from(std::io::ErrorKind::ConnectionRefused))),
+                ScrapeClass::Connect,
+            ),
+            (
+                "socket timeout",
+                transport(Box::new(std::io::Error::from(std::io::ErrorKind::TimedOut))),
+                ScrapeClass::Timeout,
+            ),
+            (
+                "body cap",
+                MetricsScrapeError::BodyTooLarge(MAX_RESPONSE_BODY_BYTES),
+                ScrapeClass::BodyCap,
+            ),
+            (
+                "tls material",
+                MetricsScrapeError::TlsMaterial("no key".to_owned()),
+                ScrapeClass::Tls,
+            ),
+            (
+                "plaintext",
+                MetricsScrapeError::PlaintextCredential("http://epp".to_owned()),
+                ScrapeClass::Config,
+            ),
+        ];
+        for (label, error, class) in cases {
+            assert_eq!(error.class(), class, "{label}");
+        }
+    }
     use crate::resources::tls_backend::{MAX_CA_PEM_BYTES, MAX_CLIENT_CERT_PEM_BYTES, MAX_CLIENT_KEY_PEM_BYTES};
 
     /// Start a local HTTP server on a random port and return the URL.

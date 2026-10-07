@@ -159,7 +159,11 @@ async fn metrics(axum::extract::State(state): axum::extract::State<AppState>) ->
     Response::builder()
         .status(StatusCode::OK)
         .header(http::header::CONTENT_TYPE, "text/plain; version=0.0.4")
-        .body(Body::from(format!("grid_demo_queue_depth {}\n", state.queue_depth)))
+        // A ready count, as an EPP exposes, so a grid operator reads the mock as ready.
+        .body(Body::from(format!(
+            "grid_demo_queue_depth {}\ninference_pool_ready_pods 1\n",
+            state.queue_depth
+        )))
         .unwrap_or_default()
 }
 
@@ -448,7 +452,10 @@ mod tests {
         let resp = send(req).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let body = to_bytes(resp.into_body(), 4096).await.unwrap_or_default();
-        assert_eq!(body.as_ref(), b"grid_demo_queue_depth 0.25\n");
+        assert_eq!(
+            body.as_ref(),
+            b"grid_demo_queue_depth 0.25\ninference_pool_ready_pods 1\n"
+        );
     }
 
     #[tokio::test]

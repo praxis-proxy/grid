@@ -31,6 +31,8 @@ pub mod crd;
 pub mod enroll;
 /// Operator error types.
 pub mod error;
+/// A provider's recent request latency and error ratio, from deltas of its EPP's histograms.
+pub mod latency;
 /// Prometheus metrics for gateway probe and phase-transition observability.
 pub mod metrics;
 /// Pure Prometheus text-format parser for inference backend metrics.
@@ -41,6 +43,7 @@ pub mod metrics_scraper;
 pub mod metrics_tls;
 /// Short-lived tokens for the metrics scraper ServiceAccount.
 pub(crate) mod metrics_token;
+pub mod readiness;
 /// Kubernetes resource builders.
 pub mod resources;
 pub mod served_models;
