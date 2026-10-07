@@ -1,32 +1,44 @@
 //! The `grid_site_route` filter: pick a cross-site cluster for a request.
 //!
-//! Reads the model header, finds the front admitted candidate for that model in
-//! the current snapshot, and sets `ctx.cluster` for the downstream load
-//! balancer. Selection is `select_admitted` over a pre-ordered list. The
-//! ordering by live load happens off the request path in `snapshot`.
-//!
-//! Among two or more admitted candidates, prefix affinity first narrows to the
-//! sites holding the request's prompt, unless their queue outweighs the match.
-//! A request naming a stored response or conversation goes to the site that
-//! stored it.
+//! Reads the model header, chooses a site for that model from the current snapshot
+//! by what each provider publishes, and sets `ctx.cluster` for the downstream load
+//! balancer. Each site's load, requests held over capacity (rho), is resolved when
+//! the snapshot is built, so a request only filters and picks. A request for an unknown
+//! model gets 404; one naming no model, or with no healthy site, gets 503 with Retry-After;
+//! one for a shed model gets 429 with Retry-After. Each carries an OpenAI-style error,
+//! logged at debug. Every outcome counts in
+//! `grid_route_decisions_total` by site and reason. A routed response names the
+//! chosen site and cluster in `x-grid-site` and `x-grid-backend`.
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicUsize, Ordering},
+//! Among two or more sites with room, prefix affinity first narrows to the sites holding the
+//! request's prompt, unless their queue outweighs the match; selection runs over what it keeps.
+//! A request naming a stored response or conversation goes to the site that stored it.
+
+use std::{
+    collections::HashSet,
+    sync::{
+        Arc, LazyLock,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_filter::{
-    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection, parse_filter_config,
+    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection, TerminalResponse,
+    parse_filter_config,
 };
 use serde::Deserialize;
 
 use crate::{
+    control::Tuning,
+    decisions::{Refused, SiteDecisions},
     descriptor::{AdmissionState, CapabilityKind, RouteCandidate, validate_model_header},
+    health::ClusterHealth,
     pin::{self, Collection, Pushed, StatePath, TagKey, Tagger},
-    prefix::{self, Affinity, AffinitySettings, Api, PrefixAffinity, PrefixKeys, QueueGate, Site},
+    prefix::{self, Affinity, AffinitySettings, Api, PrefixAffinity, PrefixKeys, QueueGate, Queued},
+    serving::AvailabilitySettings,
     snapshot::RouteSnapshot,
 };
 
@@ -37,15 +49,111 @@ fn default_model_header() -> String {
 
 /// `grid_site_route` configuration as written in the praxis filter section.
 ///
-/// Only the model header lives here. The candidate topology and the poller
-/// settings live in the grid serving config the gateway reads, and the snapshot
-/// is injected, so the data plane parses nothing about the control plane.
+/// One block per gateway: every block writes the same process-wide tuning, so a second
+/// block with different settings silently replaces the first.
+///
+/// The model header, the declared clusters, and the plugin's tuning live here. The
+/// candidate topology and the poller settings live in the grid serving config the
+/// operator writes and the gateway reads, and the snapshot is injected, so the data
+/// plane parses nothing about the control plane.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GridSiteRouteConfig {
     /// Request header naming the model (default `X-Model`).
     #[serde(default = "default_model_header")]
     model_header: String,
+
+    /// The `load_balancer` clusters this gateway declares. When set, a candidate
+    /// with no peer gateway and a cluster not listed has no route and is skipped.
+    #[serde(default)]
+    clusters: Option<Vec<DeclaredCluster>>,
+
+    /// Site availability tuning. Every field has a default.
+    #[serde(default)]
+    availability: AvailabilitySettings,
+
+    /// How strongly a conversation keeps to the site holding its prompt.
+    #[serde(default)]
+    prefix_affinity: AffinitySettings,
+}
+
+/// How a cluster's endpoints are dialed, as its `load_balancer` cluster declares.
+///
+/// Parsed and validated but unused: nothing probes endpoints in this filter yet, and a
+/// config carrying a transport must still load rather than fail the gateway's start.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum TransportKind {
+    /// Grid mutual TLS with the site identity.
+    MutualTls,
+    /// Server-only TLS, verified with the cluster's CA.
+    Tls,
+    /// No TLS.
+    Plaintext,
+}
+
+/// One declared cluster: a bare name, or a name with the transport its endpoints are dialed over.
+#[derive(Debug)]
+enum DeclaredCluster {
+    /// Routable, not probed.
+    Name(String),
+    /// Routable, and carrying the transport its endpoints are dialed over.
+    Probed(ProbedCluster),
+}
+
+// By hand, not untagged: untagged hides which field or transport was wrong.
+impl<'de> Deserialize<'de> for DeclaredCluster {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = DeclaredCluster;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a cluster name or {name, transport}")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(DeclaredCluster::Name(v.to_owned()))
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
+                ProbedCluster::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+                    .map(DeclaredCluster::Probed)
+            }
+        }
+
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
+/// A declared cluster that names how its remote endpoints are dialed.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[expect(
+    dead_code,
+    reason = "parsed so a config carrying a transport loads; nothing probes yet"
+)]
+struct ProbedCluster {
+    /// The `load_balancer` cluster name.
+    name: String,
+    /// How the cluster dials its endpoints.
+    transport: TransportKind,
+    /// The CA a `tls` cluster verifies with.
+    #[serde(default)]
+    ca_path: Option<String>,
+    /// The server name a `tls` cluster expects.
+    #[serde(default)]
+    sni: Option<String>,
+}
+
+impl DeclaredCluster {
+    /// The cluster name.
+    fn name(&self) -> &str {
+        match self {
+            Self::Name(name) | Self::Probed(ProbedCluster { name, .. }) => name,
+        }
+    }
 }
 
 /// Routes a request to a cross-site cluster by model, honouring live-load order.
@@ -61,90 +169,118 @@ pub(crate) struct GridSiteRouteFilter {
     /// The replica's prefix index and the live affinity settings.
     affinity: Arc<PrefixAffinity>,
 
-    /// Counts requests, so each draws its own exploration turn.
+    /// Counts requests from a random start, so gateway replicas pick independently.
     turn: AtomicUsize,
+
+    /// Where the filter publishes Praxis's health registry for the control step.
+    health: Arc<ClusterHealth>,
+
+    /// Declared clusters, `None` when the config does not list them.
+    clusters: Option<HashSet<Arc<str>>>,
 }
 
 impl GridSiteRouteFilter {
-    /// Build the filter from its config section over an injected snapshot.
+    /// Build the filter from its config section over an injected snapshot, setting
+    /// the block's `availability` and `prefix_affinity` into `tuning` for the control step.
     ///
     /// The gateway owns `snapshot` and its refresh loop, and the filter only reads it.
     ///
     /// # Errors
     ///
-    /// Returns [`FilterError`] if the config fails to parse or the model header is
-    /// invalid.
+    /// Returns [`FilterError`] if the config fails to parse, the model header is
+    /// invalid, or a tuning value is out of range.
     pub(crate) fn from_config(
         config: &serde_yaml::Value,
         snapshot: Arc<ArcSwap<RouteSnapshot>>,
         affinity: Arc<PrefixAffinity>,
+        health: Arc<ClusterHealth>,
+        tuning: &Tuning,
     ) -> Result<Box<dyn HttpFilter>, FilterError> {
         let cfg: GridSiteRouteConfig = parse_filter_config("grid_site_route", config)?;
         let model_header = validate_model_header(&cfg.model_header)?;
+        let tuned = |error: String| -> FilterError { format!("grid_site_route: {error}").into() };
+        cfg.availability.validate().map_err(tuned)?;
+        cfg.prefix_affinity.validate().map_err(tuned)?;
+        // A tag key the block names must load here, where praxis refuses a bad config, or every
+        // serving reload after it would fail on the same path.
+        drop(crate::control::load_tag_key(&cfg.prefix_affinity)?);
+        tuning.set(cfg.availability, cfg.prefix_affinity);
+        let declared = cfg.clusters;
+        tracing::info!(
+            "grid_site_route: choosing sites by measured in-flight against a learned ceiling: two choices among 3 or \
+             more sites with room, a weighted pick between 2, and a capacity-weighted pick when none has room"
+        );
         Ok(Box::new(Self {
             snapshot,
             model_header,
             affinity,
-            turn: AtomicUsize::new(0),
+            turn: AtomicUsize::new(random_seed()),
+            health,
+            clusters: declared.map(|clusters| clusters.iter().map(|cluster| Arc::from(cluster.name())).collect()),
         }))
     }
 
-    /// The candidate for `model`: the front admitted one, or among two or more,
-    /// the front one affinity keeps.
+    /// The site for a request for `model`, or the answer when no site can take it.
+    ///
+    /// Prefix affinity narrows selection to the sites holding the prompt, unless their queue
+    /// outweighs the match; a new conversation keeps every site and gets the full spread.
     fn choose<'snap>(
         &self,
         snapshot: &'snap RouteSnapshot,
         model: &str,
         keys: Option<&PrefixKeys>,
-    ) -> Option<&'snap RouteCandidate> {
+    ) -> Result<Pick<'snap>, FilterAction> {
+        let turn = self.turn.fetch_add(1, Ordering::Relaxed);
+        if snapshot.shedding.contains(model) {
+            return Err(refuse(Refused::Shed, model, turn));
+        }
+        let routable = |candidate: &RouteCandidate| has_route(candidate, self.clusters.as_ref());
         let settings = self.affinity.settings.load();
-        let front = select_admitted(&snapshot.candidates, CapabilityKind::InferenceModel, model);
-        if !settings.enabled {
-            return front;
-        }
-        let admitted: Vec<(&RouteCandidate, f64)> = snapshot
-            .candidates
-            .iter()
-            .zip(&snapshot.loads)
-            .filter(|(candidate, _)| admits(candidate, CapabilityKind::InferenceModel, model))
-            .map(|(candidate, load)| (candidate, *load))
-            .collect();
-        // With one site there is nothing to prefer, and no outcome to count.
-        if admitted.len() < 2 {
-            return front;
-        }
-        self.prefer(&admitted, keys, &settings)
+        let pick = if settings.enabled {
+            let sticky = Sticky {
+                affinity: Affinity {
+                    index: &self.affinity.index,
+                    keys,
+                    settings: &settings,
+                    turn,
+                },
+                gate: QueueGate {
+                    queued_request_seconds: settings.queued_request_seconds,
+                },
+            };
+            select_spread(snapshot, CapabilityKind::InferenceModel, model, turn, routable, &sticky)
+        } else {
+            select_spread(
+                snapshot,
+                CapabilityKind::InferenceModel,
+                model,
+                turn,
+                routable,
+                &KeepAll,
+            )
+        };
+        pick.ok_or_else(|| refuse(unserved(snapshot, model, routable), model, turn))
     }
 
-    /// The front of `admitted`, least loaded first, that affinity keeps for `keys`.
-    fn prefer<'snap>(
-        &self,
-        admitted: &[(&'snap RouteCandidate, f64)],
-        keys: Option<&PrefixKeys>,
-        settings: &AffinitySettings,
-    ) -> Option<&'snap RouteCandidate> {
-        let affinity = Affinity {
-            index: &self.affinity.index,
-            keys,
-            settings,
-            turn: self.turn.fetch_add(1, Ordering::Relaxed),
-        };
-        let sites: Vec<Site<'_>> = admitted
-            .iter()
-            .map(|(candidate, queue)| Site {
-                cluster: &candidate.cluster,
-                queue: *queue,
-            })
-            .collect();
-        let mut keep = vec![true; sites.len()];
-        let gate = QueueGate {
-            queued_request_seconds: settings.queued_request_seconds,
-        };
-        affinity.narrow(&sites, &mut keep, &gate).record();
-        admitted
-            .iter()
-            .zip(keep)
-            .find_map(|((candidate, _), kept)| kept.then_some(*candidate))
+    /// Send the request to `pick`: count the decision, select its cluster, and record its prefix
+    /// there for the response to confirm or withdraw.
+    fn route(&self, ctx: &mut HttpFilterContext<'_>, pick: &Pick<'_>, keys: Option<PrefixKeys>) {
+        pick.decisions.record(pick.fallback);
+        let candidate = pick.candidate;
+        let mut responses = false;
+        with_state(ctx, |state| {
+            responses = state.responses;
+            state.served = Some((Arc::clone(&candidate.site), Arc::clone(&candidate.cluster)));
+            if let Some(keys) = keys {
+                self.affinity.index.record(&keys, &candidate.cluster);
+                state.recorded = Some((keys, Arc::clone(&candidate.cluster)));
+            }
+        });
+        if responses {
+            // Ids are tagged in the body, so it must come back uncompressed.
+            ctx.request_headers_to_remove.push(http::header::ACCEPT_ENCODING);
+        }
+        ctx.cluster = Some(Arc::clone(&candidate.cluster));
     }
 
     /// Route a request that names stored state to the site that stored it.
@@ -183,24 +319,6 @@ impl GridSiteRouteFilter {
         // Ids are tagged in the body, so it must come back uncompressed.
         ctx.request_headers_to_remove.push(http::header::ACCEPT_ENCODING);
         Some(FilterAction::Continue)
-    }
-
-    /// Send the request to `candidate`, recording its prefix there for the response to confirm or withdraw.
-    fn route(&self, ctx: &mut HttpFilterContext<'_>, candidate: &RouteCandidate, keys: Option<PrefixKeys>) {
-        let mut responses = false;
-        with_state(ctx, |state| {
-            responses = state.responses;
-            state.served = Some((Arc::clone(&candidate.site), Arc::clone(&candidate.cluster)));
-            if let Some(keys) = keys {
-                self.affinity.index.record(&keys, &candidate.cluster);
-                state.recorded = Some((keys, Arc::clone(&candidate.cluster)));
-            }
-        });
-        if responses {
-            // Ids are tagged in the body, so it must come back uncompressed.
-            ctx.request_headers_to_remove.push(http::header::ACCEPT_ENCODING);
-        }
-        ctx.cluster = Some(Arc::clone(&candidate.cluster));
     }
 
     /// A tagger for the ids of the answer `state` was served by.
@@ -314,8 +432,9 @@ impl HttpFilter for GridSiteRouteFilter {
     }
 
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
-        // An earlier cluster-selecting filter wins; never override its choice.
-        if ctx.cluster.is_some() {
+        self.health.observe(ctx.health_registry);
+        // An earlier selecting filter wins; never override its choice.
+        if ctx.cluster.is_some() || ctx.upstream.is_some() {
             return Ok(FilterAction::Continue);
         }
         // A copy of the request reference, so the model outlives writes to ctx.
@@ -328,8 +447,10 @@ impl HttpFilter for GridSiteRouteFilter {
             return Ok(action);
         }
         let Some(model) = model else {
-            // No model header: not ours to route, leave it for the next filter.
-            return Ok(FilterAction::Continue);
+            // Nothing after this filter selects a cluster, so answer here rather than fail in the load balancer.
+            tracing::debug!(path = %ctx.request.uri.path(), "grid_site_route: no model in the request");
+            Refused::NoModel.record();
+            return Ok(unrouted(400));
         };
 
         let snapshot = self.snapshot.load();
@@ -337,12 +458,13 @@ impl HttpFilter for GridSiteRouteFilter {
             .get_filter_state_mut::<RouteState>()
             .and_then(|state| state.keys.take())
             .map(|keys| keys.for_model(model));
-        let Some(candidate) = self.choose(&snapshot, model, keys.as_ref()) else {
-            tracing::debug!(model = %model, "grid_site_route: no admitted candidate");
-            return Ok(FilterAction::Reject(Rejection::status(404)));
-        };
-        self.route(ctx, candidate, keys);
-        Ok(FilterAction::Continue)
+        match self.choose(&snapshot, model, keys.as_ref()) {
+            Ok(pick) => {
+                self.route(ctx, &pick, keys);
+                Ok(FilterAction::Continue)
+            },
+            Err(answer) => Ok(answer),
+        }
     }
 
     async fn on_response(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
@@ -526,22 +648,424 @@ fn pinned_target<'snap>(snapshot: &'snap RouteSnapshot, holder: Option<&Holder>,
         .map_or(Target::Unavailable, Target::Found)
 }
 
-/// The front candidate matching `kind` and `name` that admits new requests.
-///
-/// The list is pre-ordered (least-loaded first), so the front match is the
-/// chosen target. This is the reused selection: a linear first-match, never a
-/// score computed here.
-pub(crate) fn select_admitted<'list>(
-    candidates: &'list [RouteCandidate],
-    kind: CapabilityKind,
-    name: &str,
-) -> Option<&'list RouteCandidate> {
-    candidates.iter().find(|candidate| admits(candidate, kind, name))
+/// Count and answer a request no candidate took.
+fn refuse(reason: Refused, model: &str, turn: usize) -> FilterAction {
+    tracing::debug!(model = %model, reason = ?reason, "grid_site_route: no admitted candidate");
+    reason.record();
+    // Known but excluded everywhere is a temporary outage, not an unknown model.
+    match reason {
+        Refused::UnknownModel => error_response(
+            404,
+            "invalid_request_error",
+            "model_not_found",
+            "no site serves this model",
+            None,
+        ),
+        // Load, not an outage: 429 is what an OpenAI client backs off and retries on.
+        Refused::Shed => retry_later(
+            turn,
+            429,
+            "rate_limit_exceeded",
+            "capacity_exhausted",
+            "every site serving this model is at capacity",
+        ),
+        Refused::NotReady | Refused::NoRoute | Refused::NoModel => retry_later(
+            turn,
+            503,
+            "server_error",
+            "no_healthy_site",
+            "no healthy site serves this model now",
+        ),
+    }
 }
 
-/// Whether `candidate` serves `kind` `name` and admits a new request.
-fn admits(candidate: &RouteCandidate, kind: CapabilityKind, name: &str) -> bool {
-    candidate.kind == kind && &*candidate.name == name && is_admitted_for_new_request(candidate.admission_state)
+/// Why no candidate took a request for `model`: unknown, unroutable, or excluded.
+fn unserved(snapshot: &RouteSnapshot, model: &str, routable: impl Fn(&RouteCandidate) -> bool) -> Refused {
+    let mut matches = snapshot
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.kind == CapabilityKind::InferenceModel && &*candidate.name == model)
+        .peekable();
+    if matches.peek().is_none() {
+        return Refused::UnknownModel;
+    }
+    if matches.any(|candidate| is_admitted_for_new_request(candidate.admission_state) && !routable(candidate)) {
+        Refused::NoRoute
+    } else {
+        Refused::NotReady
+    }
+}
+
+/// The candidate `select_spread` chose and why.
+#[derive(Debug)]
+pub(crate) struct Pick<'snap> {
+    /// The chosen candidate.
+    pub(crate) candidate: &'snap RouteCandidate,
+    /// Whether it was demoted, chosen only because no healthy site was left.
+    pub(crate) fallback: bool,
+    /// The chosen site's decision counters.
+    pub(crate) decisions: &'snap SiteDecisions,
+}
+
+impl<'snap> Pick<'snap> {
+    /// `site` as chosen, a `fallback` when no healthy site was left.
+    const fn new((candidate, decisions, _): Site<'snap>, fallback: bool) -> Self {
+        Self {
+            candidate,
+            fallback,
+            decisions,
+        }
+    }
+}
+
+/// The router's own answer to a request it cannot route: a response, not a rejection,
+/// since praxis logs every rejection at WARN.
+fn unrouted(status: u16) -> FilterAction {
+    FilterAction::TerminalResponse(Box::new(TerminalResponse::new(status)))
+}
+
+/// `status` with a Retry-After picked by `turn` and an OpenAI-style error naming `code`.
+fn retry_later(turn: usize, status: u16, kind: &str, code: &str, message: &str) -> FilterAction {
+    let retry_after = turn
+        .checked_rem(RETRY_AFTER_BACKOFF.len())
+        .and_then(|index| RETRY_AFTER_BACKOFF.get(index))
+        .copied()
+        .unwrap_or("5");
+    error_response(status, kind, code, message, Some(retry_after))
+}
+
+/// A gateway-originated error: `status`, an OpenAI-style error object, and an optional Retry-After.
+fn error_response(
+    status: u16,
+    kind: &str,
+    code: &str,
+    message: &str,
+    retry_after: Option<&'static str>,
+) -> FilterAction {
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json"),
+    );
+    if let Some(retry_after) = retry_after {
+        headers.insert(http::header::RETRY_AFTER, http::HeaderValue::from_static(retry_after));
+    }
+    // Every code and message is a constant here, so none needs JSON escaping.
+    let body = format!(r#"{{"error":{{"message":"{message}","type":"{kind}","code":"{code}"}}}}"#);
+    FilterAction::TerminalResponse(Box::new(
+        TerminalResponse::new(status).with_headers(headers).with_body(body),
+    ))
+}
+
+/// Whether a request routed to `candidate` has somewhere to go: a declared cluster.
+/// With no declared list, every cluster is assumed to exist.
+fn has_route(candidate: &RouteCandidate, clusters: Option<&HashSet<Arc<str>>>) -> bool {
+    clusters.is_none_or(|clusters| clusters.contains(&candidate.cluster))
+}
+
+/// One site selection may choose, as a [`Narrow`] stage sees it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SiteView<'snap> {
+    /// The candidate, with its saturation and whatever else a narrowing stage reads.
+    pub(crate) candidate: &'snap RouteCandidate,
+    /// The site's load score, queue depth, that the affinity gate weighs a match against.
+    pub(crate) queue: f64,
+}
+
+/// A per-request stage that narrows the sites with room before selection.
+///
+/// It may only clear entries of `keep`, which start all true, so it never adds a site
+/// that health, readiness, or shedding removed. Clearing every entry keeps them all.
+pub(crate) trait Narrow {
+    /// Clear `keep[i]` for each of `sites` selection should not consider.
+    fn keep(&self, sites: &[SiteView<'_>], keep: &mut [bool]);
+}
+
+impl Queued for SiteView<'_> {
+    fn cluster(&self) -> &str {
+        &self.candidate.cluster
+    }
+
+    fn queue(&self) -> f64 {
+        self.queue
+    }
+}
+
+/// Keeps every site: selection by load alone.
+pub(crate) struct KeepAll;
+
+impl Narrow for KeepAll {
+    fn keep(&self, _sites: &[SiteView<'_>], _keep: &mut [bool]) {}
+}
+
+/// Prefix affinity as a narrowing of selection: keeps the sites holding the request's prompt
+/// unless their queue outweighs the match, and records the outcome.
+struct Sticky<'req> {
+    /// The request's keys against the replica's prefix index.
+    affinity: Affinity<'req>,
+    /// Weighs a match against the queue it would join.
+    gate: QueueGate,
+}
+
+impl Narrow for Sticky<'_> {
+    fn keep(&self, sites: &[SiteView<'_>], keep: &mut [bool]) {
+        self.affinity.narrow(sites, keep, &self.gate).record();
+    }
+}
+
+/// Most sites with room one request weighs. Past it, the rest wait for a later snapshot order.
+const MAX_SITES: usize = 64;
+
+/// Bounds of either site's share when two sites with room are picked between.
+const TWO_SITE_SHARE: (f64, f64) = (0.1, 0.9);
+
+/// A candidate with its decision counters.
+type Site<'snap> = (&'snap RouteCandidate, &'snap SiteDecisions, f64);
+
+/// Up to [`MAX_SITES`] sites, the first `len` filled.
+struct Sites<'snap> {
+    /// The sites, filled from the front.
+    slots: [Option<Site<'snap>>; MAX_SITES],
+    /// How many slots are filled.
+    len: usize,
+}
+
+impl<'snap> Sites<'snap> {
+    /// The first [`MAX_SITES`] of `sites`, warning once when more are offered.
+    fn gather(sites: impl Iterator<Item = Site<'snap>>) -> Self {
+        let mut gathered = Self {
+            slots: [None; MAX_SITES],
+            len: 0,
+        };
+        for site in sites {
+            let Some(slot) = gathered.slots.get_mut(gathered.len) else {
+                warn_past_max_sites();
+                break;
+            };
+            *slot = Some(site);
+            gathered.len = gathered.len.saturating_add(1);
+        }
+        gathered
+    }
+
+    /// The filled sites in order.
+    fn iter(&self) -> impl Iterator<Item = Site<'snap>> + '_ {
+        self.slots.iter().take(self.len).flatten().copied()
+    }
+
+    /// The site at `index`, if filled.
+    fn get(&self, index: usize) -> Option<Site<'snap>> {
+        self.slots.get(..self.len)?.get(index).copied().flatten()
+    }
+}
+
+/// Choose a site for `name` among the admitted, `routable` matches.
+///
+/// Among healthy matches with room (rho below 1) that `narrow` keeps: two choices at
+/// three or more, picked by capacity, taking the lower rho; a weighted pick between two,
+/// by capacity over 1 + rho with each share clamped to 0.1..0.9; or the only one. With
+/// none, a capacity-weighted pick over the healthy matches not full, or all of them when
+/// every one is, tied on the best polled queue score (a prefix, since scores ascend), which
+/// covers sites that publish no rho without herding. With no healthy match, the front
+/// demoted one, as a fallback.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the request path passes its inputs directly rather than build a struct per request"
+)]
+pub(crate) fn select_spread<'snap>(
+    snapshot: &'snap RouteSnapshot,
+    kind: CapabilityKind,
+    name: &str,
+    turn: usize,
+    routable: impl Fn(&RouteCandidate) -> bool,
+    narrow: &impl Narrow,
+) -> Option<Pick<'snap>> {
+    let matches = matching(snapshot, kind, name, &routable);
+    let (front, front_score, front_decisions) = matches.clone().next()?;
+    let site = |(candidate, score, decisions): Scored<'snap>| (candidate, decisions, score);
+    let healthy = Sites::gather(matches.filter(|(_, score, _)| !score.is_nan()).map(site));
+    if healthy.len == 0 {
+        // Demotion scores a candidate NaN: every healthy site is gone, so try the front one.
+        return Some(Pick::new((front, front_decisions, front_score), true));
+    }
+    // Affinity narrows the eligible set first; its gate weighs a match against load. The
+    // pick then spreads over what it kept: the sites with room, or failing that the lightest.
+    let kept = narrowed(&healthy, narrow);
+    let room = Sites::gather(kept.iter().filter(|(candidate, ..)| has_room(candidate)));
+    let band = || {
+        // A site full for `full_after_ms` is the last resort: a site that has just drained
+        // still carries its backlog in the window's worst queue reading, and would tie.
+        let open = Sites::gather(kept.iter().filter(|(candidate, ..)| candidate.full != Some(true)));
+        let pool = if open.len > 0 { open } else { kept };
+        let best = pool.iter().map(|(.., score)| score).fold(f64::INFINITY, f64::min);
+        Sites::gather(pool.iter().filter(|(.., score)| score.total_cmp(&best).is_eq()))
+    };
+    select(&room, band, turn).map(|chosen| Pick::new(chosen, false))
+}
+
+/// Seconds a client should wait before retrying a model with no admitted candidate:
+/// about one operator scrape plus one peer poll, spread so retries do not arrive together.
+const RETRY_AFTER_BACKOFF: [&str; 5] = ["3", "4", "5", "6", "7"];
+
+/// A candidate with its score and decision counters.
+type Scored<'snap> = (&'snap RouteCandidate, f64, &'snap SiteDecisions);
+
+/// The admitted, `routable` candidates for `kind` and `name`, in snapshot order.
+fn matching<'snap, 'req>(
+    snapshot: &'snap RouteSnapshot,
+    kind: CapabilityKind,
+    name: &'req str,
+    routable: &'req impl Fn(&RouteCandidate) -> bool,
+) -> impl Iterator<Item = Scored<'snap>> + Clone + 'req
+where
+    'snap: 'req,
+{
+    snapshot
+        .candidates
+        .iter()
+        .zip(&snapshot.scores)
+        .zip(&snapshot.decisions)
+        .map(|((candidate, score), decisions)| (candidate, *score, decisions))
+        .filter(move |(candidate, ..)| {
+            candidate.kind == kind
+                && &*candidate.name == name
+                && is_admitted_for_new_request(candidate.admission_state)
+                && routable(candidate)
+        })
+}
+
+/// The tier for `room` sites: two choices at three or more, a weighted pick at two, the
+/// only one at one, and with none a capacity-weighted pick over `band`.
+fn select<'snap>(room: &Sites<'snap>, band: impl FnOnce() -> Sites<'snap>, turn: usize) -> Option<Site<'snap>> {
+    // Registered once; counting an arm is one atomic add on the request path.
+    static SELECTIONS: LazyLock<[metrics::Counter; 4]> = LazyLock::new(|| {
+        ["by_capacity", "lone", "between_two", "two_choices"]
+            .map(|path| metrics::counter!("grid_route_selections_total", "path" => path))
+    });
+    let arm = room.len.min(3);
+    if let Some(counter) = SELECTIONS.get(arm) {
+        counter.increment(1);
+    }
+    match arm {
+        0 => by_capacity(&band(), turn),
+        1 => room.get(0),
+        2 => Some(between_two(room.get(0)?, room.get(1)?, turn)),
+        _ => two_choices(room, turn),
+    }
+}
+
+/// Whether `candidate` publishes load and has room for one more request.
+fn has_room(candidate: &RouteCandidate) -> bool {
+    candidate.rho.is_some_and(|rho| rho < 1.0)
+}
+
+/// The sites `narrow` keeps of `room`, or all of them when it keeps none.
+fn narrowed<'snap>(room: &Sites<'snap>, narrow: &impl Narrow) -> Sites<'snap> {
+    let view = |(candidate, _, queue): Site<'snap>| SiteView { candidate, queue };
+    // A stack array seeded from the first site: the room is never narrowed when empty.
+    let Some(first) = room.get(0) else {
+        return Sites::gather(room.iter());
+    };
+    let mut views = [view(first); MAX_SITES];
+    for (slot, site) in views.iter_mut().zip(room.iter()) {
+        *slot = view(site);
+    }
+    let mut keep = [true; MAX_SITES];
+    if let (Some(views), Some(kept)) = (views.get(..room.len), keep.get_mut(..room.len)) {
+        narrow.keep(views, kept);
+    }
+    if !keep.iter().take(room.len).any(|kept| *kept) {
+        return Sites::gather(room.iter());
+    }
+    Sites::gather(room.iter().zip(keep).filter(|(_, kept)| *kept).map(|(site, _)| site))
+}
+
+/// A capacity-weighted pick over `sites`. Unpublished capacity weighs the mean of the published, or 1.
+fn by_capacity<'snap>(sites: &Sites<'snap>, turn: usize) -> Option<Site<'snap>> {
+    // The mean of what is published stands in for a site that publishes nothing, without a Vec.
+    let (sum, count) = sites
+        .iter()
+        .filter_map(|(candidate, ..)| candidate.capacity)
+        .fold((0.0_f64, 0.0_f64), |(sum, count), capacity| {
+            (sum + capacity, count + 1.0)
+        });
+    let unpublished = if count > 0.0 { sum / count } else { 1.0 };
+    weighted(sites, unit(turn, SALTS.0), None, |candidate| {
+        candidate.capacity.unwrap_or(unpublished)
+    })
+}
+
+/// A pick between two sites by capacity over 1 + rho, each share clamped to 0.1..0.9.
+fn between_two<'snap>(first: Site<'snap>, second: Site<'snap>, turn: usize) -> Site<'snap> {
+    let rate = |candidate: &RouteCandidate| candidate.capacity.unwrap_or(1.0) / (1.0 + candidate.rho.unwrap_or(0.0));
+    let share = (rate(first.0) / (rate(first.0) + rate(second.0))).clamp(TWO_SITE_SHARE.0, TWO_SITE_SHARE.1);
+    if unit(turn, SALTS.0) < share { first } else { second }
+}
+
+/// Two distinct picks from `sites` by capacity, taking the lower rho; exact ties go to the first.
+fn two_choices<'snap>(sites: &Sites<'snap>, turn: usize) -> Option<Site<'snap>> {
+    let capacity = |candidate: &RouteCandidate| candidate.capacity.unwrap_or(1.0);
+    let first = weighted(sites, unit(turn, SALTS.0), None, capacity)?;
+    let second = weighted(sites, unit(turn, SALTS.1), Some(first.0), capacity).unwrap_or(first);
+    Some(if second.0.rho < first.0.rho { second } else { first })
+}
+
+/// The site `point` (in 0..1) lands on when `sites` are weighted by `weight`, skipping `skip`.
+fn weighted<'snap>(
+    sites: &Sites<'snap>,
+    point: f64,
+    skip: Option<&RouteCandidate>,
+    weight: impl Fn(&RouteCandidate) -> f64,
+) -> Option<Site<'snap>> {
+    let eligible = || {
+        sites
+            .iter()
+            .filter(|(candidate, ..)| skip.is_none_or(|skip| !std::ptr::eq(*candidate, skip)))
+    };
+    let mut target = point * eligible().map(|(candidate, ..)| weight(candidate)).sum::<f64>();
+    let mut last = None;
+    for site in eligible() {
+        last = Some(site);
+        target -= weight(site.0);
+        if target < 0.0 {
+            return Some(site);
+        }
+    }
+    last
+}
+
+/// Salts that make a request's two picks independent.
+const SALTS: (u64, u64) = (0x9E37_79B9_7F4A_7C15, 0xC2B2_AE3D_27D4_EB4F);
+
+/// A uniform value in [0, 1) from `turn` and `salt`, mixed so consecutive turns do not correlate.
+fn unit(turn: usize, salt: u64) -> f64 {
+    let mut mixed = u64::try_from(turn).unwrap_or(u64::MAX) ^ salt;
+    mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    mixed ^= mixed >> 31;
+    // The top 53 bits as a fraction, built from two exact halves.
+    let bits = mixed >> 11;
+    let high = u32::try_from(bits >> 21).unwrap_or(0);
+    let low = u32::try_from(bits & 0x1F_FFFF).unwrap_or(0);
+    (f64::from(high) * 2_f64.powi(21) + f64::from(low)) / 2_f64.powi(53)
+}
+
+/// A random starting turn, so replicas started together do not pick in step.
+fn random_seed() -> usize {
+    use std::hash::BuildHasher as _;
+    let hashed = std::collections::hash_map::RandomState::new().hash_one(std::time::SystemTime::now());
+    usize::try_from(hashed).unwrap_or_else(|_| usize::try_from(hashed >> 32).unwrap_or(0))
+}
+
+/// Log once that a model has more sites than one request weighs.
+fn warn_past_max_sites() {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        tracing::warn!(
+            max = MAX_SITES,
+            "grid_site_route: more sites than one request weighs; the rest wait for a later order"
+        );
+    });
 }
 
 /// Whether a candidate in this admission state accepts a new request.
@@ -557,15 +1081,30 @@ fn is_admitted_for_new_request(state: AdmissionState) -> bool {
     clippy::indexing_slicing,
     clippy::panic,
     clippy::min_ident_chars,
+    clippy::type_complexity,
+    clippy::arithmetic_side_effects,
+    clippy::float_arithmetic,
     reason = "tests"
 )]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
-    use crate::descriptor::{CandidateConfig, validate_candidates};
+    use crate::{
+        descriptor::{CandidateConfig, validate_candidates},
+        snapshot::{Inputs, Learned, decisions_for},
+    };
+
+    /// The pick for `kind` and `name` over `candidates` in their given order.
+    fn front(candidates: Vec<RouteCandidate>, kind: CapabilityKind, name: &str) -> Option<String> {
+        let snapshot = RouteSnapshot::from_static(candidates, Arc::from("east"));
+        select_spread(&snapshot, kind, name, 0, |_| true, &KeepAll).map(|pick| pick.candidate.cluster.to_string())
+    }
 
     /// A validated one-candidate list for `model` at `site`/`cluster`.
     fn one(model: &str, site: &str, cluster: &str, admission: AdmissionState) -> Vec<RouteCandidate> {
         let mut candidates = validate_candidates(vec![CandidateConfig {
+            admission: AdmissionState::default(),
             cluster: cluster.to_owned(),
             credential: None,
             fresh: true,
@@ -584,6 +1123,8 @@ mod tests {
         affinity.settings.store(Arc::new(settings));
         GridSiteRouteFilter {
             snapshot: Arc::new(ArcSwap::from_pointee(snapshot)),
+            health: Arc::default(),
+            clusters: None,
             model_header: http::header::HeaderName::from_static("x-model"),
             affinity: Arc::new(affinity),
             turn: AtomicUsize::new(0),
@@ -600,6 +1141,7 @@ mod tests {
                 .map(|(site, ..)| CandidateConfig {
                     cluster: format!("pool-{site}"),
                     credential: None,
+                    admission: AdmissionState::default(),
                     fresh: true,
                     kind: CapabilityKind::InferenceModel,
                     name: "llama".to_owned(),
@@ -612,9 +1154,11 @@ mod tests {
             candidate.admission_state = *admission;
         }
         RouteSnapshot {
+            decisions: decisions_for(&candidates),
+            scores: sorted.iter().map(|(_, queue, _)| *queue).collect(),
             candidates,
-            loads: sorted.iter().map(|(_, queue, _)| *queue).collect(),
             local_site: Arc::from("a"),
+            shedding: BTreeSet::new(),
         }
     }
 
@@ -633,7 +1177,8 @@ mod tests {
         let snapshot = filter.snapshot.load();
         filter
             .choose(&snapshot, "llama", Some(&keys))
-            .map(|candidate| candidate.site.to_string())
+            .ok()
+            .map(|pick| pick.candidate.site.to_string())
     }
 
     const OPEN: AdmissionState = AdmissionState::NewAndExisting;
@@ -723,6 +1268,7 @@ mod tests {
                 .map(|(name, cluster)| CandidateConfig {
                     cluster: cluster.to_owned(),
                     credential: None,
+                    admission: AdmissionState::default(),
                     fresh: true,
                     kind: CapabilityKind::InferenceModel,
                     name: name.to_owned(),
@@ -741,29 +1287,543 @@ mod tests {
             Target::Found(candidate) if &*candidate.cluster == "pool-granite"
         ));
     }
+    /// Three tied candidates for `m`, at sites a, b and d.
+    fn three() -> Vec<RouteCandidate> {
+        ["a", "b", "d"]
+            .iter()
+            .flat_map(|site| one("m", site, &format!("pool-{site}"), AdmissionState::NewAndExisting))
+            .collect()
+    }
+
+    fn pick(snapshot: &RouteSnapshot, turn: usize) -> String {
+        select_spread(snapshot, CapabilityKind::InferenceModel, "m", turn, |_| true, &KeepAll)
+            .map(|chosen| chosen.candidate.cluster.to_string())
+            .unwrap()
+    }
+
+    #[test]
+    fn tied_candidates_split_evenly() {
+        let snapshot = RouteSnapshot::from_static(three(), Arc::from("hub"));
+        let picks: Vec<String> = (0..3_000).map(|turn| pick(&snapshot, turn)).collect();
+        for cluster in ["pool-a", "pool-b", "pool-d"] {
+            let taken = picks.iter().filter(|p| *p == cluster).count();
+            assert!((850..=1_150).contains(&taken), "{cluster} took {taken} of 3000");
+        }
+    }
+
+    /// The documented filter block, as praxis hands it to the factory.
+    fn documented_example() -> serde_yaml::Value {
+        let yaml = include_str!("../../../examples/gateway/grid-site-route.yaml");
+        let filters: Vec<serde_yaml::Value> = serde_yaml::from_str(yaml).expect("the example is a filter list");
+        // The example also carries the load_balancer block that follows selection.
+        filters
+            .into_iter()
+            .find(|filter| filter.get("filter").and_then(serde_yaml::Value::as_str) == Some("grid_site_route"))
+            .expect("the example has a grid_site_route block")
+    }
+
+    #[test]
+    fn the_documented_example_loads_with_shedding_on() {
+        let cfg: GridSiteRouteConfig =
+            parse_filter_config("grid_site_route", &documented_example()).expect("the example parses");
+        cfg.availability
+            .validate()
+            .expect("the example's availability block validates");
+        cfg.prefix_affinity
+            .validate()
+            .expect("the example's affinity block validates");
+        assert!(cfg.availability.shedding, "the example shows shedding switched on");
+        assert_eq!(
+            cfg.availability,
+            AvailabilitySettings {
+                shedding: true,
+                ..AvailabilitySettings::default()
+            },
+            "the rest is the defaults"
+        );
+        assert_eq!(cfg.prefix_affinity, AffinitySettings::default());
+        assert_eq!(cfg.model_header, "X-Gateway-Model-Name");
+    }
+
+    #[test]
+    fn building_the_filter_sets_its_tuning_and_refuses_a_bad_value() {
+        let tuning = Arc::new(Tuning::default());
+        let build = |config: &serde_yaml::Value| {
+            GridSiteRouteFilter::from_config(
+                config,
+                Arc::new(ArcSwap::from_pointee(RouteSnapshot::from_static(
+                    Vec::new(),
+                    Arc::from("hub"),
+                ))),
+                Arc::default(),
+                Arc::default(),
+                &tuning,
+            )
+        };
+        assert!(build(&documented_example()).is_ok(), "the example builds");
+        assert_eq!(tuning.generation(), 1);
+        assert!(tuning.availability().shedding, "the block's availability is the tuning");
+
+        let bad: serde_yaml::Value = serde_yaml::from_str("availability: {full_after_ms: -1}").expect("yaml");
+        let error = build(&bad).err().expect("a value out of range is refused");
+        assert!(error.to_string().contains("full_after_ms"), "{error}");
+        assert_eq!(tuning.generation(), 1, "a refused block sets nothing");
+
+        let missing: serde_yaml::Value =
+            serde_yaml::from_str("prefix_affinity: {tag_key_path: /nonexistent/grid-tag-key}").expect("yaml");
+        let refused = build(&missing)
+            .err()
+            .expect("a tag key that does not load is refused here, not at every reload");
+        assert!(refused.to_string().contains("tag key"), "{refused}");
+        assert_eq!(tuning.generation(), 1, "a refused block sets nothing");
+    }
+
+    #[test]
+    fn a_declared_cluster_is_a_name_or_a_name_with_its_transport() {
+        let cfg: GridSiteRouteConfig = serde_yaml::from_str(
+            "clusters:\n  - site-a\n  - name: east\n    transport: tls\n    ca_path: /etc/ca.crt\n    sni: east.svc\n  - name: west\n    transport: plaintext\n",
+        )
+        .expect("a config carrying transports still loads");
+        let declared = cfg.clusters.expect("declared");
+        let names: Vec<&str> = declared.iter().map(DeclaredCluster::name).collect();
+        assert_eq!(names, ["site-a", "east", "west"], "every declared cluster is routable");
+        let unknown = serde_yaml::from_str::<GridSiteRouteConfig>("clusters:\n  - name: east\n    transport: quic\n")
+            .expect_err("an unknown transport is rejected");
+        assert!(unknown.to_string().contains("quic"), "{unknown}");
+        assert!(
+            serde_yaml::from_str::<GridSiteRouteConfig>("clusters:\n  - name: east\n    transport: tls\n    ca: /x\n")
+                .is_err(),
+            "an unknown key is rejected"
+        );
+    }
+
+    #[test]
+    fn a_candidate_with_no_peer_gateway_and_no_declared_cluster_has_no_route() {
+        let mut candidates = one("llama", "site-d", "site-d", AdmissionState::NewAndExisting);
+        candidates.extend(one("llama", "dagobah", "site-a", AdmissionState::NewAndExisting));
+        let snapshot = RouteSnapshot::from_static(candidates, Arc::from("dagobah"));
+        let declared: HashSet<Arc<str>> = HashSet::from([Arc::from("site-a")]);
+        for turn in 0..4 {
+            let picked = select_spread(
+                &snapshot,
+                CapabilityKind::InferenceModel,
+                "llama",
+                turn,
+                |c| has_route(c, Some(&declared)),
+                &KeepAll,
+            )
+            .expect("site-a is routable")
+            .candidate;
+            assert_eq!(
+                &*picked.cluster, "site-a",
+                "site-d is not a declared cluster, turn {turn}"
+            );
+        }
+        assert!(
+            snapshot.candidates.iter().all(|c| has_route(c, None)),
+            "with no declared list, every cluster is assumed to exist"
+        );
+        let undeclared = one("llama", "site-d", "site-d", AdmissionState::NewAndExisting).remove(0);
+        assert!(
+            !has_route(&undeclared, Some(&declared)),
+            "a cluster the config never declared is no route"
+        );
+    }
+
+    /// Whether the pick at `turn` for `llama` over `snapshot` was a fallback.
+    fn fallback(snapshot: &RouteSnapshot, turn: usize) -> Option<bool> {
+        select_spread(
+            snapshot,
+            CapabilityKind::InferenceModel,
+            "llama",
+            turn,
+            |_| true,
+            &KeepAll,
+        )
+        .map(|pick| pick.fallback)
+    }
+
+    #[test]
+    fn a_pick_is_a_fallback_only_when_no_healthy_site_is_left() {
+        assert_eq!(fallback(&two_sites(Some(1.0), Some(5.0)), 0), Some(false));
+        assert_eq!(fallback(&two_sites(Some(2.0), Some(2.0)), 1), Some(false));
+        let alone = RouteSnapshot::from_static(
+            one("llama", "east", "pool-a", AdmissionState::NewAndExisting),
+            Arc::from("east"),
+        );
+        assert_eq!(fallback(&alone, 0), Some(false));
+        let down = BTreeSet::from([Arc::from("pool-a"), Arc::from("pool-b")]);
+        assert_eq!(fallback(&two_sites(Some(1.0), Some(5.0)).demote(&down), 0), Some(true));
+        // One cluster left healthy is a routed pick, not a fallback.
+        let one = BTreeSet::from([Arc::from("pool-a")]);
+        assert_eq!(fallback(&two_sites(Some(1.0), Some(5.0)).demote(&one), 0), Some(false));
+    }
+
+    #[test]
+    fn an_unserved_request_names_why() {
+        let mut candidates = one("llama", "east", "pool-a", AdmissionState::Excluded);
+        candidates.extend(one("llama", "west", "pool-b", AdmissionState::NewAndExisting));
+        let snapshot = RouteSnapshot::from_static(candidates, Arc::from("east"));
+        assert_eq!(unserved(&snapshot, "granite", |_| true), Refused::UnknownModel);
+        assert_eq!(unserved(&snapshot, "llama", |_| false), Refused::NoRoute);
+        let excluded = RouteSnapshot::from_static(
+            one("llama", "east", "pool-a", AdmissionState::Excluded),
+            Arc::from("east"),
+        );
+        assert_eq!(unserved(&excluded, "llama", |_| false), Refused::NotReady);
+    }
 
     #[test]
     fn front_match_is_selected() {
         let candidates = one("llama", "east", "pool-a", AdmissionState::NewAndExisting);
-        let chosen = select_admitted(&candidates, CapabilityKind::InferenceModel, "llama").expect("a match");
-        assert_eq!(&*chosen.cluster, "pool-a");
+        assert_eq!(
+            front(candidates, CapabilityKind::InferenceModel, "llama").as_deref(),
+            Some("pool-a")
+        );
     }
 
     #[test]
     fn a_different_model_does_not_match() {
         let candidates = one("llama", "east", "pool-a", AdmissionState::NewAndExisting);
-        assert!(select_admitted(&candidates, CapabilityKind::InferenceModel, "granite").is_none());
+        assert!(front(candidates, CapabilityKind::InferenceModel, "granite").is_none());
     }
 
     #[test]
     fn an_excluded_candidate_is_skipped() {
         let candidates = one("llama", "east", "pool-a", AdmissionState::Excluded);
-        assert!(select_admitted(&candidates, CapabilityKind::InferenceModel, "llama").is_none());
+        assert!(front(candidates, CapabilityKind::InferenceModel, "llama").is_none());
     }
 
     #[test]
     fn an_mcp_kind_does_not_match_an_inference_query() {
         let candidates = one("llama", "east", "pool-a", AdmissionState::NewAndExisting);
-        assert!(select_admitted(&candidates, CapabilityKind::McpTool, "llama").is_none());
+        assert!(front(candidates, CapabilityKind::McpTool, "llama").is_none());
+    }
+
+    /// A snapshot of `llama` on east and west, with the given queue depths.
+    fn two_sites(east: Option<f64>, west: Option<f64>) -> RouteSnapshot {
+        let store = grid_signals::LoadStore::new(std::time::Duration::from_secs(60));
+        for (site, cluster, load) in [("east", "pool-a", east), ("west", "pool-b", west)] {
+            if let Some(value) = load {
+                let line = format!(
+                    r#"{}{{grid_site="{site}",grid_provider="{cluster}"}} {value} 1000"#,
+                    crate::signals::llm_d::QUEUE_METRIC
+                );
+                store.ingest_at(&line, 1_000, 1_000, site);
+            }
+        }
+        let mut candidates = one("llama", "east", "pool-a", AdmissionState::NewAndExisting);
+        candidates.extend(one("llama", "west", "pool-b", AdmissionState::NewAndExisting));
+        RouteSnapshot::from_store(
+            candidates,
+            Arc::from("east"),
+            &mut Inputs {
+                signals: &store,
+                now_ms: 1_000,
+                window_ms: 30_000,
+                availability: &AvailabilitySettings::default(),
+                learned: &mut Learned::default(),
+            },
+        )
+    }
+
+    fn picks(snapshot: &RouteSnapshot) -> Vec<String> {
+        (0..2_000)
+            .map(|turn| {
+                let chosen = select_spread(
+                    snapshot,
+                    CapabilityKind::InferenceModel,
+                    "llama",
+                    turn,
+                    |_| true,
+                    &KeepAll,
+                )
+                .unwrap()
+                .candidate;
+                chosen.site.to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn equal_scores_spread_across_the_tied_candidates() {
+        for (snapshot, case) in [
+            (two_sites(None, None), "unmeasured"),
+            (two_sites(Some(5.0), Some(5.0)), "measured"),
+        ] {
+            let east = picks(&snapshot).iter().filter(|site| *site == "east").count();
+            assert!((850..=1_150).contains(&east), "{case}: east took {east} of 2000");
+        }
+    }
+
+    #[test]
+    fn a_better_score_always_wins() {
+        assert_eq!(picks(&two_sites(Some(9.0), Some(1.0))), ["west"; 2_000]);
+        assert_eq!(
+            picks(&two_sites(Some(1.0), None)),
+            ["east"; 2_000],
+            "measured beats unmeasured"
+        );
+    }
+
+    #[test]
+    fn an_excluded_tie_is_never_picked() {
+        let mut snapshot = two_sites(None, None);
+        snapshot.candidates[1].admission_state = AdmissionState::Excluded;
+        assert_eq!(picks(&snapshot), ["east"; 2_000]);
+    }
+
+    /// `value` running per endpoint on one ready endpoint at `at`, as the EPP publishes it.
+    fn publish_running(store: &grid_signals::LoadStore, site: &str, cluster: &str, value: f64, at: i64) {
+        let labels = format!(r#"grid_site="{site}",grid_provider="{cluster}""#);
+        let line = format!(
+            "llm_d_epp_average_running_requests{{{labels}}} {value} {at}\nllm_d_epp_ready_endpoints{{{labels}}} 1 {at}"
+        );
+        store.ingest_at(&line, at, at, site);
+    }
+
+    /// Sites publishing (in flight, capacity), each `None` to publish nothing, as one snapshot.
+    fn loaded(sites: &[(&str, Option<f64>, Option<f64>)]) -> RouteSnapshot {
+        let store = grid_signals::LoadStore::new(std::time::Duration::from_secs(60));
+        let mut candidates = Vec::new();
+        for (site, in_flight, capacity) in sites {
+            let cluster = format!("pool-{site}");
+            // Teach the ceiling at 1s, then publish what the site holds now at 2s.
+            for (value, at) in [(capacity, 1_000), (in_flight, 2_000)] {
+                if let Some(value) = value {
+                    publish_running(&store, site, &cluster, *value, at);
+                }
+            }
+            candidates.extend(one("llama", site, &cluster, AdmissionState::NewAndExisting));
+        }
+        // Exact: a sample moves saturation all the way, and the floor is one request.
+        let availability = AvailabilitySettings {
+            smoothing: 1.0,
+            ceiling_floor: 1.0,
+            ..AvailabilitySettings::default()
+        };
+        let mut learned = Learned::default();
+        let mut inputs = Inputs {
+            signals: &store,
+            now_ms: 1_000,
+            window_ms: 500,
+            availability: &availability,
+            learned: &mut learned,
+        };
+        RouteSnapshot::from_store(candidates.clone(), Arc::from("hub"), &mut inputs);
+        inputs.now_ms = 2_000;
+        RouteSnapshot::from_store(candidates, Arc::from("hub"), &mut inputs)
+    }
+
+    /// How many of `requests` each site took.
+    fn shares(
+        snapshot: &RouteSnapshot,
+        requests: usize,
+        narrow: &impl Narrow,
+    ) -> std::collections::BTreeMap<String, usize> {
+        let mut taken = std::collections::BTreeMap::new();
+        for turn in 0..requests {
+            let chosen = select_spread(
+                snapshot,
+                CapabilityKind::InferenceModel,
+                "llama",
+                turn,
+                |_| true,
+                narrow,
+            )
+            .unwrap();
+            *taken.entry(chosen.candidate.site.to_string()).or_insert(0) += 1;
+        }
+        taken
+    }
+
+    #[test]
+    fn two_choices_prefer_the_lighter_site_and_never_a_full_one() {
+        let snapshot = loaded(&[
+            ("a", Some(2.0), Some(10.0)),
+            ("b", Some(8.0), Some(10.0)),
+            ("c", Some(5.0), Some(10.0)),
+            ("d", Some(10.0), Some(10.0)),
+        ]);
+        let taken = shares(&snapshot, 3_000, &KeepAll);
+        assert_eq!(taken.get("d"), None, "rho 1 has no room");
+        let (a, c) = (taken["a"], taken["c"]);
+        assert!(a > c && c > 0, "the lighter site takes more: a {a}, c {c}");
+        assert_eq!(
+            taken.get("b"),
+            None,
+            "two distinct picks never choose the heaviest of three"
+        );
+    }
+
+    #[test]
+    fn two_sites_split_by_capacity_over_load_within_a_tenth_and_nine_tenths() {
+        let even = shares(
+            &loaded(&[("a", Some(1.0), Some(10.0)), ("b", Some(1.0), Some(10.0))]),
+            4_000,
+            &KeepAll,
+        );
+        assert!(
+            (1_800..=2_200).contains(&even["a"]),
+            "equal sites split evenly: {even:?}"
+        );
+        let lopsided = shares(
+            &loaded(&[("a", Some(0.0), Some(100.0)), ("b", Some(9.0), Some(10.0))]),
+            4_000,
+            &KeepAll,
+        );
+        assert!(
+            (280..=520).contains(&lopsided["b"]),
+            "the clamp keeps a tenth for the slow site: {lopsided:?}"
+        );
+    }
+
+    #[test]
+    fn a_lone_site_with_room_takes_every_request() {
+        let snapshot = loaded(&[("a", Some(12.0), Some(10.0)), ("b", Some(3.0), Some(10.0))]);
+        assert_eq!(shares(&snapshot, 200, &KeepAll).get("b"), Some(&200));
+    }
+
+    #[test]
+    fn with_no_room_anywhere_the_overflow_draws_by_capacity() {
+        let snapshot = loaded(&[("a", Some(30.0), Some(30.0)), ("b", Some(10.0), Some(10.0))]);
+        let taken = shares(&snapshot, 4_000, &KeepAll);
+        assert!(
+            (2_700..=3_300).contains(&taken["a"]),
+            "a has three quarters of the capacity: {taken:?}"
+        );
+    }
+
+    #[test]
+    fn sites_with_equal_ceilings_and_equal_load_are_drawn_evenly() {
+        let snapshot = loaded(&[
+            ("a", Some(50.0), Some(100.0)),
+            ("b", Some(50.0), Some(100.0)),
+            ("c", Some(50.0), Some(100.0)),
+        ]);
+        let taken = shares(&snapshot, 3_000, &KeepAll);
+        for site in ["a", "b", "c"] {
+            assert!(
+                (850..=1_150).contains(&taken[site]),
+                "equal ceilings, equal load: {taken:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_demoted_site_is_never_drawn_while_another_is_healthy() {
+        let down = BTreeSet::from([Arc::from("pool-a")]);
+        let snapshot = loaded(&[
+            ("a", Some(0.0), Some(100.0)),
+            ("b", Some(5.0), Some(10.0)),
+            ("c", Some(5.0), Some(10.0)),
+        ])
+        .demote(&down);
+        assert_eq!(shares(&snapshot, 500, &KeepAll).get("a"), None);
+    }
+
+    /// Keeps only site `b`, or clears everything when `all` is set.
+    struct Only {
+        all: bool,
+    }
+
+    impl Narrow for Only {
+        fn keep(&self, sites: &[SiteView<'_>], keep: &mut [bool]) {
+            for (site, kept) in sites.iter().zip(keep) {
+                *kept = !self.all && &*site.candidate.site == "b" && site.candidate.rho.unwrap_or(0.0) < 1.0;
+            }
+        }
+    }
+
+    #[test]
+    fn a_narrowing_stage_can_only_remove_sites_and_clearing_all_keeps_all() {
+        let snapshot = loaded(&[
+            ("a", Some(1.0), Some(10.0)),
+            ("b", Some(5.0), Some(10.0)),
+            ("c", Some(12.0), Some(10.0)),
+        ]);
+        assert_eq!(shares(&snapshot, 300, &Only { all: false }).get("b"), Some(&300));
+        let taken = shares(&snapshot, 300, &Only { all: true });
+        assert_eq!(taken.get("c"), None, "a full site is never added back");
+        assert!(taken.contains_key("a") && taken.contains_key("b"), "{taken:?}");
+    }
+
+    #[test]
+    fn a_shed_answers_429_and_an_outage_503_each_with_an_openai_error() {
+        // Load: an OpenAI client backs off on 429 and retries.
+        let shed = answered(Refused::Shed);
+        assert_eq!(shed.0, 429);
+        assert!(shed.1, "a shed says when to come back");
+        assert!(
+            shed.2.contains(r#""code":"capacity_exhausted""#) && shed.2.contains(r#""type":"rate_limit_exceeded""#),
+            "{}",
+            shed.2
+        );
+        // An outage is not load, so it stays 503.
+        let outage = answered(Refused::NotReady);
+        assert_eq!(outage.0, 503);
+        assert!(outage.1);
+        assert!(
+            outage.2.contains(r#""code":"no_healthy_site""#) && outage.2.contains(r#""type":"server_error""#),
+            "{}",
+            outage.2
+        );
+        // An unknown model is the caller's error, with nothing to retry.
+        let unknown = answered(Refused::UnknownModel);
+        assert_eq!(unknown.0, 404);
+        assert!(!unknown.1, "a model that does not exist will not appear");
+        assert!(unknown.2.contains(r#""code":"model_not_found""#), "{}", unknown.2);
+    }
+
+    #[test]
+    fn retry_after_spreads_across_turns_so_retries_do_not_arrive_together() {
+        let values: BTreeSet<String> = (0..RETRY_AFTER_BACKOFF.len())
+            .map(|turn| match refuse(Refused::Shed, "llama", turn) {
+                FilterAction::TerminalResponse(response) => response
+                    .headers
+                    .get(http::header::RETRY_AFTER)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned)
+                    .expect("a shed says when to come back"),
+                FilterAction::Continue
+                | FilterAction::Reject(_)
+                | FilterAction::StreamingTerminalResponse(_)
+                | FilterAction::Release
+                | FilterAction::BodyDone => panic!("a refusal is answered here"),
+            })
+            .collect();
+        assert_eq!(
+            values.len(),
+            RETRY_AFTER_BACKOFF.len(),
+            "one value per turn, all different: {values:?}"
+        );
+        assert!(values.iter().all(|value| RETRY_AFTER_BACKOFF.contains(&value.as_str())));
+    }
+
+    /// How `reason` is answered: status, whether it says when to retry, and its body.
+    fn answered(reason: Refused) -> (u16, bool, String) {
+        match refuse(reason, "llama", 0) {
+            FilterAction::TerminalResponse(response) => {
+                let body = String::from_utf8(response.body.clone().unwrap_or_default().to_vec()).unwrap();
+                (
+                    response.status,
+                    response.headers.contains_key(http::header::RETRY_AFTER),
+                    body,
+                )
+            },
+            FilterAction::Continue
+            | FilterAction::Reject(_)
+            | FilterAction::StreamingTerminalResponse(_)
+            | FilterAction::Release
+            | FilterAction::BodyDone => panic!("a refusal is answered here"),
+        }
+    }
+
+    #[test]
+    fn draws_are_uniform_and_seeds_differ() {
+        let mean = (0..10_000).map(|turn| unit(turn, SALTS.0)).sum::<f64>() / 10_000.0;
+        assert!((0.48..=0.52).contains(&mean), "{mean}");
+        assert!((0..10_000).all(|turn| (0.0..1.0).contains(&unit(turn, SALTS.1))));
+        assert_ne!(random_seed(), random_seed());
     }
 }

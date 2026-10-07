@@ -2,7 +2,7 @@
 //!
 //! The pieces have unit tests in their own crates. These stitch the real
 //! `PeerScraper`, the `LoadStore`, and `RouteSnapshot::from_store` plus
-//! `select_admitted` into one path so the composition is exercised, including
+//! `select_spread` into one path so the composition is exercised, including
 //! the failure cases where a peer is unreachable or untrusted and the router
 //! must still produce a sound decision.
 
@@ -33,8 +33,10 @@ use tokio_rustls::TlsAcceptor;
 
 use crate::{
     descriptor::{CandidateConfig, CapabilityKind, RouteCandidate, validate_candidates},
-    route::select_admitted,
-    snapshot::{LOAD_METRIC, RouteSnapshot},
+    route::{KeepAll, select_spread},
+    serving::AvailabilitySettings,
+    signals::llm_d::QUEUE_METRIC,
+    snapshot::{Inputs, Learned, RouteSnapshot},
 };
 
 /// PEM chain + key from a generated cert.
@@ -55,7 +57,7 @@ fn owner_of(peer_identity: &str) -> String {
 
 /// One exposition line at t=1000ms for `site`/`cluster`.
 fn line(site: &str, cluster: &str, value: f64) -> String {
-    format!(r#"{LOAD_METRIC}{{grid_site="{site}",grid_provider="{cluster}"}} {value} 1000"#)
+    format!(r#"{QUEUE_METRIC}{{grid_site="{site}",grid_provider="{cluster}"}} {value} 1000"#)
 }
 
 /// A raw HTTP/1.1 200 carrying `body`, with the Date the poller anchors on
@@ -169,6 +171,7 @@ fn candidates(model: &str, sites: &[(&str, &str)]) -> Vec<RouteCandidate> {
     let raw = sites
         .iter()
         .map(|(site, cluster)| CandidateConfig {
+            admission: crate::descriptor::AdmissionState::default(),
             cluster: (*cluster).to_owned(),
             credential: None,
             fresh: true,
@@ -212,11 +215,24 @@ async fn scrape_store_route_picks_the_least_loaded_site() {
     let snapshot = RouteSnapshot::from_store(
         candidates("llama", &[("east", "pool-a"), ("west", "pool-b")]),
         Arc::from("local"),
-        &store,
-        1_000,
-        30_000,
+        &mut Inputs {
+            signals: &store,
+            now_ms: 1_000,
+            window_ms: 30_000,
+            availability: &AvailabilitySettings::default(),
+            learned: &mut Learned::default(),
+        },
     );
-    let chosen = select_admitted(&snapshot.candidates, CapabilityKind::InferenceModel, "llama").expect("a route");
+    let chosen = select_spread(
+        &snapshot,
+        CapabilityKind::InferenceModel,
+        "llama",
+        0,
+        |_| true,
+        &KeepAll,
+    )
+    .expect("a route")
+    .candidate;
     assert_eq!(&*chosen.cluster, "pool-b", "the idle site wins end to end");
 }
 
@@ -254,11 +270,24 @@ async fn the_scrape_hop_is_mutually_authenticated_then_routes() {
     let snapshot = RouteSnapshot::from_store(
         candidates("llama", &[("east", "pool-a")]),
         Arc::from("local"),
-        &store,
-        1_000,
-        30_000,
+        &mut Inputs {
+            signals: &store,
+            now_ms: 1_000,
+            window_ms: 30_000,
+            availability: &AvailabilitySettings::default(),
+            learned: &mut Learned::default(),
+        },
     );
-    let chosen = select_admitted(&snapshot.candidates, CapabilityKind::InferenceModel, "llama").expect("a route");
+    let chosen = select_spread(
+        &snapshot,
+        CapabilityKind::InferenceModel,
+        "llama",
+        0,
+        |_| true,
+        &KeepAll,
+    )
+    .expect("a route")
+    .candidate;
     assert_eq!(&*chosen.cluster, "pool-a");
 }
 
@@ -308,13 +337,26 @@ async fn loss_of_signal_sorts_the_unmeasured_site_last() {
     let snapshot = RouteSnapshot::from_store(
         candidates("llama", &[("west", "pool-b"), ("east", "pool-a")]),
         Arc::from("local"),
-        &store,
-        1_000,
-        30_000,
+        &mut Inputs {
+            signals: &store,
+            now_ms: 1_000,
+            window_ms: 30_000,
+            availability: &AvailabilitySettings::default(),
+            learned: &mut Learned::default(),
+        },
     );
     // Even though east is busy (90), west has no signal at all, so it sorts
     // last and the measured site is chosen. Loss of signal is "least preferred".
-    let chosen = select_admitted(&snapshot.candidates, CapabilityKind::InferenceModel, "llama").expect("a route");
+    let chosen = select_spread(
+        &snapshot,
+        CapabilityKind::InferenceModel,
+        "llama",
+        0,
+        |_| true,
+        &KeepAll,
+    )
+    .expect("a route")
+    .candidate;
     assert_eq!(
         &*chosen.cluster, "pool-a",
         "a measured busy site beats an unmeasured one"
@@ -344,11 +386,24 @@ async fn an_unreachable_peer_leaves_no_reading_and_the_reachable_one_routes() {
     let snapshot = RouteSnapshot::from_store(
         candidates("llama", &[("east", "pool-a"), ("west", "pool-b")]),
         Arc::from("local"),
-        &store,
-        1_000,
-        30_000,
+        &mut Inputs {
+            signals: &store,
+            now_ms: 1_000,
+            window_ms: 30_000,
+            availability: &AvailabilitySettings::default(),
+            learned: &mut Learned::default(),
+        },
     );
-    let chosen = select_admitted(&snapshot.candidates, CapabilityKind::InferenceModel, "llama").expect("a route");
+    let chosen = select_spread(
+        &snapshot,
+        CapabilityKind::InferenceModel,
+        "llama",
+        0,
+        |_| true,
+        &KeepAll,
+    )
+    .expect("a route")
+    .candidate;
     assert_eq!(&*chosen.cluster, "pool-b", "the reachable site is chosen");
 }
 
@@ -381,11 +436,24 @@ async fn an_untrusted_peer_is_refused_and_contributes_no_reading() {
     let snapshot = RouteSnapshot::from_store(
         candidates("llama", &[("east", "pool-a"), ("west", "pool-b")]),
         Arc::from("local"),
-        &store,
-        1_000,
-        30_000,
+        &mut Inputs {
+            signals: &store,
+            now_ms: 1_000,
+            window_ms: 30_000,
+            availability: &AvailabilitySettings::default(),
+            learned: &mut Learned::default(),
+        },
     );
-    let chosen = select_admitted(&snapshot.candidates, CapabilityKind::InferenceModel, "llama").expect("a route");
+    let chosen = select_spread(
+        &snapshot,
+        CapabilityKind::InferenceModel,
+        "llama",
+        0,
+        |_| true,
+        &KeepAll,
+    )
+    .expect("a route")
+    .candidate;
     assert_eq!(&*chosen.cluster, "pool-b", "only the trusted, measured peer routes");
 }
 

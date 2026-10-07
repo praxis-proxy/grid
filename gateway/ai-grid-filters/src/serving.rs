@@ -18,12 +18,13 @@ use certs::spiffe_id;
 use grid_signals_client::{PeerScraper, spawn_on_thread_held};
 use praxis_filter::FilterError;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, pem::PemObject as _};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{
-    control::{Control, ReloadOutcome, Watcher, watch},
+    control::{Control, ReloadOutcome, Tuning, Watcher, watch},
     descriptor::CandidateConfig,
-    prefix::{AffinitySettings, PrefixAffinity},
+    health::ClusterHealth,
+    prefix::PrefixAffinity,
     snapshot::RouteSnapshot,
 };
 
@@ -61,10 +62,102 @@ pub struct GridServingConfig {
 
     /// Peers to poll for live load.
     pub peers: Vec<PeerServingConfig>,
+}
 
-    /// How strongly a conversation keeps to the site holding its prompt.
-    #[serde(default)]
-    pub prefix_affinity: AffinitySettings,
+/// Site availability tuning: how a site's ceiling is learned, how its saturation is
+/// smoothed, how much an unproven site is explored, and when a model sheds.
+///
+/// Set under `availability` in the `grid_site_route` filter block, not in the serving config: the
+/// serving config is routing data the operator writes, and plugin tuning belongs to the
+/// plugin's own config. Defaults are what the lab runs used; each is documented in
+/// `docs/routing.md`.
+#[derive(Clone, Copy, Debug, PartialEq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AvailabilitySettings {
+    /// Weight of the newest in-flight sample against the running saturation estimate, in (0, 1].
+    pub smoothing: f64,
+    /// How long a learned ceiling takes to halve once load falls away, milliseconds, over 0.
+    pub ceiling_half_life_ms: i64,
+    /// The least a learned ceiling can be, so a quiet site does not read as full, at least 1.
+    pub ceiling_floor: f64,
+    /// A measured site's weight is at least this share of the largest ceiling, in [0, 1].
+    pub explore_floor: f64,
+    /// How long a site must stay at its ceiling with work waiting before it counts as full,
+    /// milliseconds, at least 0. A debounce in time, so a site polled every 500 ms and one
+    /// polled every 5 s read the same.
+    pub full_after_ms: i64,
+    /// How long a site must stay below its ceiling before a shedding model routes again,
+    /// milliseconds, at least 0. An emptied queue is room at once.
+    pub room_after_ms: i64,
+    /// Queued work per serving unit at which a site counts as full, at least 0. Fullness only:
+    /// a sample stops teaching the ceiling as soon as one whole request waits anywhere.
+    pub queue_full: f64,
+    /// Whether a model whose every site is full answers 429 rather than queueing deeper. Off
+    /// unless every client of the grid retries on 429 with Retry-After, and off where the EPP's
+    /// flow control is on, so one overload is not shed twice.
+    pub shedding: bool,
+}
+
+impl Default for AvailabilitySettings {
+    fn default() -> Self {
+        Self {
+            smoothing: 0.3,
+            ceiling_half_life_ms: 600_000,
+            ceiling_floor: 8.0,
+            explore_floor: 0.25,
+            full_after_ms: 5_000,
+            room_after_ms: 2_000,
+            queue_full: 1.0,
+            shedding: false,
+        }
+    }
+}
+
+impl AvailabilitySettings {
+    /// Refuse a block whose values selection cannot use.
+    ///
+    /// # Errors
+    ///
+    /// Names the first field outside its range.
+    pub fn validate(&self) -> Result<(), String> {
+        unit("smoothing", self.smoothing, f64::EPSILON)?;
+        unit("explore_floor", self.explore_floor, 0.0)?;
+        for (name, value) in [
+            ("full_after_ms", self.full_after_ms),
+            ("room_after_ms", self.room_after_ms),
+        ] {
+            if value < 0 {
+                return Err(format!("availability.{name} must be at least 0, got {value}"));
+            }
+        }
+        if self.ceiling_half_life_ms <= 0 {
+            return Err(format!(
+                "availability.ceiling_half_life_ms must be over 0, got {}",
+                self.ceiling_half_life_ms
+            ));
+        }
+        if !self.ceiling_floor.is_finite() || self.ceiling_floor < 1.0 {
+            return Err(format!(
+                "availability.ceiling_floor must be at least 1, got {}",
+                self.ceiling_floor
+            ));
+        }
+        if !self.queue_full.is_finite() || self.queue_full < 0.0 {
+            return Err(format!(
+                "availability.queue_full must be at least 0, got {}",
+                self.queue_full
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// An availability setting that must be a finite fraction in `[lo, 1]`.
+fn unit(name: &str, value: f64, lo: f64) -> Result<(), String> {
+    if !value.is_finite() || value < lo || value > 1.0 {
+        return Err(format!("availability.{name} must be in [{lo}, 1], got {value}"));
+    }
+    Ok(())
 }
 
 /// One peer this gateway polls, with the mTLS material to reach it.
@@ -115,6 +208,10 @@ pub struct PeerServingConfig {
     /// Leaf SHA-256 digests the peer must also match, rendered under pin trust only.
     #[serde(default)]
     pub pins: Vec<String>,
+
+    /// `host:port` of the peer's gateway, routed to directly; set only while the operator verified it.
+    #[serde(default)]
+    pub gateway: Option<String>,
 }
 
 /// The running control plane: the filter's snapshot, the pollers, and the config watch.
@@ -130,6 +227,14 @@ pub struct GridRuntime {
 
     /// The prefix index and affinity settings the route filter reads.
     affinity: Arc<PrefixAffinity>,
+    /// Backend cluster health the route filter publishes and the tick reads.
+    health: Arc<ClusterHealth>,
+
+    /// The filter's tuning, set when the filter is built and read by the control step.
+    tuning: Arc<Tuning>,
+
+    /// Stops the health tick when the runtime drops.
+    _health_tick: std::sync::mpsc::Sender<()>,
 }
 
 impl GridRuntime {
@@ -139,10 +244,22 @@ impl GridRuntime {
         Arc::clone(&self.affinity)
     }
 
+    /// The filter tuning to register the filter over.
+    #[must_use]
+    pub fn tuning(&self) -> Arc<Tuning> {
+        Arc::clone(&self.tuning)
+    }
+
     /// The shared snapshot to register the filter over.
     #[must_use]
     pub fn snapshot(&self) -> Arc<ArcSwap<RouteSnapshot>> {
         Arc::clone(&self.snapshot)
+    }
+
+    /// The cluster health to register the filter over.
+    #[must_use]
+    pub fn health(&self) -> Arc<ClusterHealth> {
+        Arc::clone(&self.health)
     }
 
     /// Apply a new serving config. `None` when it is already applied.
@@ -194,6 +311,8 @@ pub fn load_serving_config(path: &str) -> Result<GridServingConfig, FilterError>
 /// peer's certificate material cannot be read or parsed, or a poller thread
 /// cannot be spawned.
 pub fn spawn_grid_routing(config: &GridServingConfig) -> Result<GridRuntime, FilterError> {
+    // The peer scrapers load TLS here, before the server installs the provider.
+    praxis_tls::provider::install();
     let start = Box::new(|peer: &PeerServingConfig, poller: &_, store, refresh| {
         let scraper = build_scraper(peer)?;
         spawn_on_thread_held(store, poller, scraper, refresh)
@@ -209,16 +328,53 @@ pub(crate) fn start_runtime(
 ) -> Result<GridRuntime, FilterError> {
     let mut control = Control::new(config, start)?;
     control.apply(config)?;
+    let health_tick = tick_health(control.health(), control.refresh(), control.store())
+        .map_err(|error| -> FilterError { format!("grid: spawning the health tick: {error}").into() })?;
+    let (snapshot, affinity, health, tuning) = (
+        control.snapshot(),
+        control.affinity(),
+        control.health(),
+        control.tuning(),
+    );
+    let control = Arc::new(Mutex::new(control));
+    // A filter built from here on adopts its tuning at once, not on the next re-read.
+    tuning.attach(Arc::downgrade(&control));
     Ok(GridRuntime {
-        snapshot: control.snapshot(),
-        affinity: control.affinity(),
-        control: Arc::new(Mutex::new(control)),
+        snapshot,
+        affinity,
+        health,
+        tuning,
+        control,
         watcher: None,
+        _health_tick: health_tick,
     })
 }
 
-/// Reject peer settings that would silently stop a poller.
+/// How often the control step re-reads backend cluster health.
+const HEALTH_TICK: Duration = Duration::from_millis(100);
+
+/// Re-order the snapshot whenever the set of clusters with no healthy endpoint changes.
 ///
+/// Health moves faster than the poll cycle, so it gets its own tick; the returned
+/// sender stops the thread when dropped.
+fn tick_health(
+    health: Arc<ClusterHealth>,
+    refresh: crate::control::Refresh,
+    store: Arc<grid_signals::LoadStore>,
+) -> std::io::Result<std::sync::mpsc::Sender<()>> {
+    let (stop, stopped) = std::sync::mpsc::channel::<()>();
+    std::thread::Builder::new()
+        .name("grid-health".to_owned())
+        .spawn(move || {
+            while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = stopped.recv_timeout(HEALTH_TICK) {
+                if health.update() {
+                    refresh(&store);
+                }
+            }
+        })?;
+    Ok(stop)
+}
+
 /// A zero interval hands `Duration::ZERO` to the interval timer, which panics the
 /// detached poller thread. A zero timeout fires immediately, so the peer never
 /// scrapes. Either way that site ages to `+inf` and sorts last, a silent stale
@@ -249,6 +405,7 @@ pub(crate) fn validate_peer(peer: &PeerServingConfig) -> Result<(), FilterError>
     Ok(())
 }
 
+/// Grid mTLS to `peer`: this site's identity, verified against the grid CA and the peer's server name.
 /// Build a peer's mTLS scraper from its config, reading and parsing its
 /// certificate material.
 fn build_scraper(peer: &PeerServingConfig) -> Result<PeerScraper, FilterError> {
@@ -294,6 +451,14 @@ fn build_scraper(peer: &PeerServingConfig) -> Result<PeerScraper, FilterError> {
 mod tests {
     use super::*;
     use crate::descriptor::{validate_candidates, validate_local_site};
+
+    #[test]
+    fn the_documented_example_loads() {
+        let json = include_str!("../../../examples/gateway/serving-config.json");
+        let config: GridServingConfig = serde_json::from_str(json).expect("the example parses");
+        assert_eq!(config.candidates.len(), 3);
+        assert_eq!(config.peers[0].interval_ms, 500, "the local operator is polled fast");
+    }
 
     #[test]
     fn a_serving_config_parses() {
@@ -362,6 +527,7 @@ peers:
             client_cert_path: "/etc/grid/tls.crt".to_owned(),
             client_key_path: "/etc/grid/tls.key".to_owned(),
             pins: Vec::new(),
+            gateway: None,
         }
     }
 
@@ -426,5 +592,15 @@ peers:
         validate_peer(&zero_request).expect_err("a zero request timeout is refused");
 
         validate_peer(&valid_peer()).expect("a valid peer is accepted");
+    }
+
+    #[test]
+    fn a_peer_from_an_operator_without_gateway_support_parses_with_none() {
+        let peer: PeerServingConfig = serde_yaml::from_str(
+            "{site: east, addr: '10.0.0.1:9091', server_name: east.grid.internal, authority: east.grid.internal, \
+             grid_ca_path: /ca, client_cert_path: /crt, client_key_path: /key}",
+        )
+        .expect("an old operator's peer parses");
+        assert!(peer.gateway.is_none(), "no gateway: route through the static cluster");
     }
 }

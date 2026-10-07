@@ -4,8 +4,8 @@ use std::{
     collections::HashMap,
     path::PathBuf,
     sync::{
-        Arc, Mutex, PoisonError,
-        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex, OnceLock, PoisonError, Weak,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         mpsc,
     },
     time::Duration,
@@ -18,10 +18,11 @@ use praxis_filter::FilterError;
 
 use crate::{
     descriptor::{RouteCandidate, validate_candidates, validate_local_site},
+    health::ClusterHealth,
     pin::TagKey,
-    prefix::PrefixAffinity,
-    serving::{GridServingConfig, PeerServingConfig, validate_peer},
-    snapshot::RouteSnapshot,
+    prefix::{AffinitySettings, PrefixAffinity},
+    serving::{AvailabilitySettings, GridServingConfig, PeerServingConfig, validate_peer},
+    snapshot::{self, Gauged, RouteSnapshot},
 };
 
 /// The order step a poller runs after each scrape.
@@ -30,6 +31,57 @@ pub(crate) type Refresh = Box<dyn Fn(&LoadStore) + Send>;
 /// Starts one peer's poller feeding `store`, running `refresh` each cycle.
 pub(crate) type StartPeer =
     Box<dyn Fn(&PeerServingConfig, &PollerConfig, Arc<LoadStore>, Refresh) -> Result<PollHandle, FilterError> + Send>;
+
+/// The `grid_site_route` filter's tuning, set from its praxis config block and read by the
+/// control step. The serving config is routing data the operator writes, so plugin tuning
+/// lives here, beside the plugin, not there.
+#[derive(Default)]
+pub struct Tuning {
+    /// The availability settings every refresh orders with.
+    availability: ArcSwap<AvailabilitySettings>,
+
+    /// The prefix affinity settings each serving apply adopts.
+    affinity: ArcSwap<AffinitySettings>,
+
+    /// Bumped on every `set`, so a serving re-read notices a filter configured after it applied.
+    generation: AtomicU64,
+
+    /// The control plane to re-apply the running config through on `set`, once it runs.
+    control: OnceLock<Weak<Mutex<Control>>>,
+}
+
+impl Tuning {
+    /// Make `availability` and `affinity` the current tuning, and adopt them into the running config at once.
+    pub(crate) fn set(&self, availability: AvailabilitySettings, affinity: AffinitySettings) {
+        self.availability.store(Arc::new(availability));
+        self.affinity.store(Arc::new(affinity));
+        self.generation.fetch_add(1, Ordering::Release);
+        if let Some(control) = self.control.get().and_then(Weak::upgrade) {
+            control.lock().unwrap_or_else(PoisonError::into_inner).readopt();
+        }
+    }
+
+    /// Re-apply the running config through `control` whenever the tuning is set. Attached once,
+    /// by the runtime that owns the control; a second attach is ignored.
+    pub(crate) fn attach(&self, control: Weak<Mutex<Control>>) {
+        let _attached = self.control.set(control);
+    }
+
+    /// The current availability settings.
+    pub(crate) fn availability(&self) -> AvailabilitySettings {
+        **self.availability.load()
+    }
+
+    /// The current prefix affinity settings.
+    pub(crate) fn affinity(&self) -> Arc<AffinitySettings> {
+        self.affinity.load_full()
+    }
+
+    /// How many times the tuning has been set.
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+}
 
 /// The validated candidate topology the refresh orders.
 pub(crate) struct Topology {
@@ -47,22 +99,49 @@ impl Topology {
     /// Validate the topology half of `config`.
     fn from_config(config: &GridServingConfig) -> Result<Self, FilterError> {
         validate_local_site(&config.local_site)?;
+        let base = validate_candidates(config.candidates.clone())?;
         Ok(Self {
-            base: Arc::from(validate_candidates(config.candidates.clone())?),
+            base: Arc::from(base),
             local_site: Arc::from(config.local_site.as_str()),
             load_window_ms: config.load_window_ms,
         })
     }
 
-    /// The snapshot ordered from `store` at `now`.
-    fn order(&self, store: &LoadStore, now: i64) -> RouteSnapshot {
-        RouteSnapshot::from_store(
+    /// The snapshot ordered from `store` at `now` under `availability`, down clusters and peer
+    /// gateways last, with the models to shed given the set `shedding` the previous snapshot shed.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "each input is a distinct piece of control state"
+    )]
+    fn order(
+        &self,
+        store: &LoadStore,
+        now: i64,
+        health: &ClusterHealth,
+        shedding: &std::collections::BTreeSet<Arc<str>>,
+        gauged: &mut Gauged,
+        availability: &AvailabilitySettings,
+    ) -> RouteSnapshot {
+        let mut inputs = snapshot::Inputs {
+            signals: store,
+            now_ms: now,
+            window_ms: self.load_window_ms,
+            availability,
+            learned: &mut gauged.learned,
+        };
+        let ordered = RouteSnapshot::from_store(
             self.base.iter().cloned().collect(),
             Arc::clone(&self.local_site),
-            store,
-            now,
-            self.load_window_ms,
-        )
+            &mut inputs,
+        );
+        // Praxis demotes a cluster only once it has reported health. Without a registry the
+        // gateway knows nothing about backends, so it demotes nothing rather than guessing.
+        let ordered = if health.observed() {
+            ordered.demote(&health.down())
+        } else {
+            ordered
+        };
+        ordered.shed(shedding, availability).published(&mut gauged.published)
     }
 }
 
@@ -112,8 +191,9 @@ pub(crate) struct Control {
     /// The topology every refresh orders, swapped on reload.
     topology: Arc<ArcSwap<Topology>>,
 
-    /// Serializes snapshot stores between the refreshes and a reload.
-    swap: Arc<Mutex<()>>,
+    /// Serializes snapshot stores between the refreshes and a reload, and holds the
+    /// site/cluster pairs with a published score.
+    swap: Arc<Mutex<Gauged>>,
 
     /// Store retention, fixed for the process.
     window_secs: u64,
@@ -132,6 +212,14 @@ pub(crate) struct Control {
 
     /// The prefix index and affinity settings, applied with each config.
     affinity: Arc<PrefixAffinity>,
+    /// Backend clusters with no healthy endpoint, ordered last on every refresh.
+    health: Arc<ClusterHealth>,
+
+    /// The filter's tuning, read on every refresh and adopted with each config.
+    tuning: Arc<Tuning>,
+
+    /// The tuning generation the applied config adopted.
+    tuned: u64,
 }
 
 impl Control {
@@ -139,22 +227,37 @@ impl Control {
     pub(crate) fn new(config: &GridServingConfig, start: StartPeer) -> Result<Self, FilterError> {
         let topology = Topology::from_config(config)?;
         // Cold start: config order until the first poll re-orders it by live load.
+        let mut gauged = Gauged::new();
         let cold_start = RouteSnapshot::from_static(
             topology.base.iter().cloned().collect(),
             Arc::clone(&topology.local_site),
-        );
+        )
+        .published(&mut gauged.published);
         Ok(Self {
             store: Arc::new(LoadStore::new(Duration::from_secs(config.window_secs))),
             snapshot: Arc::new(ArcSwap::from_pointee(cold_start)),
             topology: Arc::new(ArcSwap::from_pointee(topology)),
-            swap: Arc::new(Mutex::new(())),
+            swap: Arc::new(Mutex::new(gauged)),
             window_secs: config.window_secs,
             peers: HashMap::new(),
             applied: None,
             identity: None,
             start,
             affinity: Arc::default(),
+            health: Arc::default(),
+            tuning: Arc::default(),
+            tuned: 0,
         })
+    }
+
+    /// The cluster health the route filter publishes into and every refresh reads.
+    pub(crate) fn health(&self) -> Arc<ClusterHealth> {
+        Arc::clone(&self.health)
+    }
+
+    /// The live load store.
+    pub(crate) fn store(&self) -> Arc<LoadStore> {
+        Arc::clone(&self.store)
     }
 
     /// The snapshot the filter reads.
@@ -167,16 +270,34 @@ impl Control {
         Arc::clone(&self.affinity)
     }
 
-    /// Make `config` the running one: its identity, its affinity settings, and only its clusters' prefixes.
-    fn adopt(&mut self, config: &GridServingConfig, identity: [u8; 32], tag_key: Option<TagKey>) {
+    /// The filter's tuning, set when the filter is built.
+    pub(crate) fn tuning(&self) -> Arc<Tuning> {
+        Arc::clone(&self.tuning)
+    }
+
+    /// Make `config` the running one: its identity, the tuning's affinity settings at
+    /// `generation`, and only its clusters' prefixes.
+    fn adopt(&mut self, config: &GridServingConfig, identity: [u8; 32], tag_key: Option<TagKey>, generation: u64) {
         let clusters: Vec<Arc<str>> = config
             .candidates
             .iter()
             .map(|candidate| Arc::from(candidate.cluster.as_str()))
             .collect();
-        self.affinity.apply(config.prefix_affinity.clone(), tag_key, &clusters);
+        self.affinity
+            .apply(self.tuning.affinity().as_ref().clone(), tag_key, &clusters);
         self.applied = Some(config.clone());
         self.identity = Some(identity);
+        self.tuned = generation;
+    }
+
+    /// Re-apply the running config under the current tuning, keeping it as it was on an error.
+    fn readopt(&mut self) {
+        let Some(config) = self.applied.clone() else {
+            return;
+        };
+        if let Err(error) = self.apply(&config) {
+            tracing::warn!(%error, "grid: filter tuning rejected against the running config; keeping the last adopted");
+        }
     }
 
     /// Validate `config` fully, then swap it in. `None` when already applied.
@@ -185,7 +306,8 @@ impl Control {
     ///
     /// Returns [`FilterError`] for an invalid config or a poller that cannot start, changing nothing.
     pub(crate) fn apply(&mut self, config: &GridServingConfig) -> Result<Option<ReloadOutcome>, FilterError> {
-        self.apply_with(config, identity_digest(config))
+        let identity = identity_digest(config, &self.tuning.affinity());
+        self.apply_with(config, identity)
     }
 
     /// [`Self::apply`] with the identity digest already computed.
@@ -195,12 +317,14 @@ impl Control {
         identity: [u8; 32],
     ) -> Result<Option<ReloadOutcome>, FilterError> {
         let renewed = self.identity.is_some_and(|applied| applied != identity);
-        if self.applied.as_ref() == Some(config) && !renewed {
+        // A filter configured after the last apply changes the tuning, so the same file re-applies.
+        let generation = self.tuning.generation();
+        if self.applied.as_ref() == Some(config) && !renewed && self.tuned == generation {
             return Ok(None);
         }
         // Validated before any poller starts, so an invalid config starts and drops nothing.
         let topology = Arc::new(validate_config(config)?);
-        let tag_key = load_tag_key(config)?;
+        let tag_key = load_tag_key(&self.tuning.affinity())?;
         if config.window_secs != self.window_secs {
             tracing::warn!(
                 current = self.window_secs,
@@ -210,17 +334,30 @@ impl Control {
         }
         let (next, started) = self.start_changed(config, renewed)?;
         let outcome = self.reconcile(&next, started, renewed, config.load_window_ms);
-        let ordered = Arc::new(topology.order(&self.store, now_ms()));
-        {
-            let _swapping = self.swap.lock().unwrap_or_else(PoisonError::into_inner);
-            self.topology.store(topology);
-            self.snapshot.store(ordered);
-        }
+        self.publish(topology);
         // The reload stands and its topology is published: only now may the new pollers write,
         // so their first refresh orders the new topology. Committing a kept poller is a no-op.
         self.peers.values().for_each(|running| running.handle.commit());
-        self.adopt(config, identity, tag_key);
+        self.adopt(config, identity, tag_key, generation);
         Ok(Some(outcome))
+    }
+
+    /// Order `topology` and publish it with its snapshot.
+    fn publish(&self, topology: Arc<Topology>) {
+        // Order under the lock, so a concurrent refresh never publishes an older down set or load.
+        let mut gauged = self.swap.lock().unwrap_or_else(PoisonError::into_inner);
+        let current = self.snapshot.load_full();
+        let ordered = Arc::new(topology.order(
+            &self.store,
+            now_ms(),
+            &self.health,
+            &current.shedding,
+            &mut gauged,
+            &self.tuning.availability(),
+        ));
+        self.topology.store(topology);
+        self.snapshot.store(ordered);
+        drop(gauged);
     }
 
     /// Start pollers for new or changed peers, or every peer once the identity renewed,
@@ -294,19 +431,21 @@ impl Control {
     }
 
     /// The refresh a poller runs each cycle: order the current topology by load.
-    fn refresh(&self) -> Refresh {
+    pub(crate) fn refresh(&self) -> Refresh {
         make_refresh(
             Arc::clone(&self.topology),
             Arc::clone(&self.snapshot),
             Arc::clone(&self.swap),
+            Arc::clone(&self.health),
+            Arc::clone(&self.tuning),
             now_ms,
         )
     }
 }
 
-/// The stored-state tag key `config` names, or `None` when it names none.
-fn load_tag_key(config: &GridServingConfig) -> Result<Option<TagKey>, FilterError> {
-    let Some(path) = config.prefix_affinity.tag_key_path.as_deref() else {
+/// The stored-state tag key `affinity` names, or `None` when it names none.
+pub(crate) fn load_tag_key(affinity: &AffinitySettings) -> Result<Option<TagKey>, FilterError> {
+    let Some(path) = affinity.tag_key_path.as_deref() else {
         return Ok(None);
     };
     let bytes = std::fs::read(path)
@@ -319,11 +458,9 @@ fn load_tag_key(config: &GridServingConfig) -> Result<Option<TagKey>, FilterErro
 
 /// The topology of `config`, refusing what no retry can fix: a bad candidate, peer, or duplicate site.
 fn validate_config(config: &GridServingConfig) -> Result<Topology, FilterError> {
+    validate_local_site(&config.local_site)?;
+    validate_candidates(config.candidates.clone())?;
     let topology = Topology::from_config(config)?;
-    config
-        .prefix_affinity
-        .validate()
-        .map_err(|error| -> FilterError { error.into() })?;
     let mut sites = std::collections::HashSet::with_capacity(config.peers.len());
     for peer in &config.peers {
         validate_peer(peer)?;
@@ -334,56 +471,53 @@ fn validate_config(config: &GridServingConfig) -> Result<Topology, FilterError> 
     Ok(topology)
 }
 
-/// Order the current topology and swap it in, unless a reload replaced it meanwhile.
+/// Order the current topology under the current availability tuning and swap it in.
+///
+/// Every refresher orders under `swap`, so the last store always reflects the latest
+/// topology, down set, and load.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each input is a distinct piece of control state"
+)]
 pub(crate) fn make_refresh<N>(
     topology: Arc<ArcSwap<Topology>>,
     snapshot: Arc<ArcSwap<RouteSnapshot>>,
-    swap: Arc<Mutex<()>>,
+    swap: Arc<Mutex<Gauged>>,
+    health: Arc<ClusterHealth>,
+    tuning: Arc<Tuning>,
     now: N,
 ) -> Refresh
 where
     N: Fn() -> i64 + Send + 'static,
 {
     Box::new(move |store: &LoadStore| {
-        let current = topology.load_full();
-        let ordered = Arc::new(current.order(store, now()));
-        let _swapping = swap.lock().unwrap_or_else(PoisonError::into_inner);
-        if Arc::ptr_eq(&current, &topology.load()) {
-            snapshot.store(ordered);
-        }
+        let mut gauged = swap.lock().unwrap_or_else(PoisonError::into_inner);
+        let current = snapshot.load_full();
+        let ordered = topology.load().order(
+            store,
+            now(),
+            &health,
+            &current.shedding,
+            &mut gauged,
+            &tuning.availability(),
+        );
+        snapshot.store(Arc::new(ordered));
+        drop(gauged);
     })
 }
 
-/// A change detector over every identity file `config` names: the grid CA,
-/// client certificate, and key. Not a security function.
+/// A change detector over every identity file `config` names, the grid CA, client
+/// certificate, and key, and the tag key `affinity` names. Not a security function.
 ///
-/// A rotation swaps the files at once but they are read one by one, so a pass
-/// that straddles the swap mixes versions. Read until two passes agree.
-fn identity_digest(config: &GridServingConfig) -> [u8; 32] {
-    let mut last = read_identity(config);
-    for _ in 0..IDENTITY_READS {
-        let next = read_identity(config);
-        if next == last {
-            break;
-        }
-        last = next;
-    }
-    last
-}
-
-/// Passes [`identity_digest`] makes after the first; a rotation tears at most one.
-const IDENTITY_READS: usize = 3;
-
-/// One pass over the identity files. Each file is hashed on its own, so no
-/// buffer holds the concatenated key.
-fn read_identity(config: &GridServingConfig) -> [u8; 32] {
+/// Each file is hashed on its own, so no buffer holds the concatenated key.
+fn identity_digest(config: &GridServingConfig, affinity: &AffinitySettings) -> [u8; 32] {
     let paths: std::collections::BTreeSet<&str> = config
         .peers
         .iter()
         .flat_map(|peer| [&peer.grid_ca_path, &peer.client_cert_path, &peer.client_key_path])
         .map(String::as_str)
         // A rotated tag key re-applies the config like a renewed certificate.
-        .chain(config.prefix_affinity.tag_key_path.as_deref())
+        .chain(affinity.tag_key_path.as_deref())
         .collect();
     let mut material = Vec::new();
     for path in paths {
@@ -507,7 +641,7 @@ fn apply_file(control: &Mutex<Control>, path: &std::path::Path, bytes: &[u8], ta
 fn renew_identity(control: &Mutex<Control>, tally: &WatchCounts) {
     let mut control = control.lock().unwrap_or_else(PoisonError::into_inner);
     let Some((config, identity)) = control.applied.as_ref().and_then(|config| {
-        let identity = identity_digest(config);
+        let identity = identity_digest(config, &control.tuning.affinity());
         (control.identity != Some(identity)).then(|| (config.clone(), identity))
     }) else {
         return;
@@ -535,7 +669,8 @@ fn report(result: &Result<Option<ReloadOutcome>, FilterError>, tally: &WatchCoun
             kept = outcome.kept,
             "{applied}"
         ),
-        Ok(None) => tracing::info!("grid: serving config unchanged; peer pollers reused"),
+        // Nothing changed, so nothing to say at info: the counter still records the attempt.
+        Ok(None) => tracing::debug!("grid: serving config unchanged; peer pollers reused"),
         Err(error) => tracing::warn!(%error, "grid: serving config rejected; keeping the last good config"),
     }
 }
@@ -550,14 +685,17 @@ fn report(result: &Result<Option<ReloadOutcome>, FilterError>, tally: &WatchCoun
     reason = "tests; the pollers run on their own threads, so these sync tests wait with thread::sleep"
 )]
 mod tests {
-    use std::{sync::atomic::AtomicI64, time::Instant};
+    use std::{
+        sync::atomic::{AtomicBool, AtomicI64},
+        time::Instant,
+    };
 
     use grid_signals_client::{FetchError, Scrape, SignalSource, spawn_on_thread_held};
 
     use super::*;
     use crate::{
         descriptor::{CandidateConfig, CapabilityKind},
-        snapshot::LOAD_METRIC,
+        signals::llm_d::QUEUE_METRIC,
     };
 
     /// Queue depth each mock peer reports, and how often each was scraped and started.
@@ -628,7 +766,7 @@ mod tests {
             let at = now_ms();
             Ok(Scrape {
                 body: format!(
-                    r#"{LOAD_METRIC}{{grid_site="{site}",grid_provider="pool-{site}"}} {value} {at}"#,
+                    r#"{QUEUE_METRIC}{{grid_site="{site}",grid_provider="pool-{site}"}} {value} {at}"#,
                     site = self.site
                 ),
                 date_ms: at,
@@ -639,6 +777,7 @@ mod tests {
 
     fn candidate(site: &str) -> CandidateConfig {
         CandidateConfig {
+            admission: crate::descriptor::AdmissionState::default(),
             cluster: format!("pool-{site}"),
             credential: None,
             fresh: true,
@@ -662,6 +801,7 @@ mod tests {
             client_cert_path: "/etc/grid/tls.crt".to_owned(),
             client_key_path: "/etc/grid/tls.key".to_owned(),
             pins: Vec::new(),
+            gateway: None,
         }
     }
 
@@ -673,7 +813,6 @@ mod tests {
             load_window_ms: 30_000,
             candidates: sites.iter().map(|site| candidate(site)).collect(),
             peers: sites.iter().map(|site| peer(site)).collect(),
-            prefix_affinity: crate::prefix::AffinitySettings::default(),
         }
     }
 
@@ -681,74 +820,29 @@ mod tests {
     fn a_tag_key_must_exist_and_be_long_enough() {
         let dir = std::env::temp_dir().join(format!("grid-tag-key-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("test io");
-        let mut config = config(&["east"]);
-        assert!(load_tag_key(&config).expect("loads").is_none(), "no path, no key");
-        let at = |name: &str| dir.join(name).display().to_string();
-        config.prefix_affinity.tag_key_path = Some(at("missing"));
-        assert!(load_tag_key(&config).is_err(), "a missing file is refused");
+        let tuning = Tuning::default();
+        assert!(
+            load_tag_key(&tuning.affinity()).expect("loads").is_none(),
+            "no path, no key"
+        );
+        let at = |name: &str| {
+            let affinity = AffinitySettings {
+                tag_key_path: Some(dir.join(name).display().to_string()),
+                ..AffinitySettings::default()
+            };
+            tuning.set(AvailabilitySettings::default(), affinity);
+            tuning.affinity()
+        };
+        assert!(load_tag_key(&at("missing")).is_err(), "a missing file is refused");
         std::fs::write(dir.join("short"), [1_u8; 31]).expect("test io");
-        config.prefix_affinity.tag_key_path = Some(at("short"));
-        assert!(load_tag_key(&config).is_err(), "31 bytes is refused");
+        assert!(load_tag_key(&at("short")).is_err(), "31 bytes is refused");
         std::fs::write(dir.join("key"), [1_u8; 32]).expect("test io");
-        config.prefix_affinity.tag_key_path = Some(at("key"));
-        assert!(load_tag_key(&config).expect("loads").is_some());
+        assert!(load_tag_key(&at("key")).expect("loads").is_some());
         let _removed = std::fs::remove_dir_all(&dir);
     }
 
     fn sites(snapshot: &RouteSnapshot) -> Vec<String> {
         snapshot.candidates.iter().map(|c| c.site.to_string()).collect()
-    }
-
-    /// The routable sites, sorted: which sites route, not their load order.
-    fn members(snapshot: &RouteSnapshot) -> Vec<String> {
-        let mut sites = sites(snapshot);
-        sites.sort();
-        sites
-    }
-
-    /// A `Secret` or `ConfigMap` volume: each file resolves through `..data`, which
-    /// `write` swaps in one rename, as the kubelet does.
-    struct Mount {
-        dir: PathBuf,
-        generation: usize,
-    }
-
-    impl Mount {
-        fn new(name: &str, files: &[(&str, &str)]) -> Self {
-            let dir = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
-            let _stale = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).expect("dir");
-            let mut mount = Self { dir, generation: 0 };
-            mount.write(files);
-            mount
-        }
-
-        fn path(&self, name: &str) -> String {
-            self.dir.join(name).to_string_lossy().into_owned()
-        }
-
-        /// Publish `files` together; earlier files are dropped, as in a new Secret version.
-        fn write(&mut self, files: &[(&str, &str)]) {
-            self.generation = self.generation.saturating_add(1);
-            let version = format!("..{}", self.generation);
-            std::fs::create_dir(self.dir.join(&version)).expect("version dir");
-            for (name, content) in files {
-                std::fs::write(self.dir.join(&version).join(name), content).expect("write");
-                let link = self.dir.join(name);
-                if std::fs::symlink_metadata(&link).is_err() {
-                    std::os::unix::fs::symlink(format!("..data/{name}"), &link).expect("file link");
-                }
-            }
-            let staged = self.dir.join("..data_tmp");
-            std::os::unix::fs::symlink(&version, &staged).expect("data link");
-            std::fs::rename(&staged, self.dir.join("..data")).expect("swap");
-        }
-    }
-
-    impl Drop for Mount {
-        fn drop(&mut self) {
-            let _removed = std::fs::remove_dir_all(&self.dir);
-        }
     }
 
     fn front(snapshot: &ArcSwap<RouteSnapshot>) -> Option<String> {
@@ -846,6 +940,52 @@ mod tests {
     }
 
     #[test]
+    fn a_filter_built_after_the_apply_is_adopted_at_once() {
+        let peers = Peers::default();
+        let grid = runtime(&peers, &config(&["east"]));
+        assert_eq!(grid.reload(&config(&["east"])).expect("reload"), None);
+
+        let affinity = AffinitySettings {
+            enabled: false,
+            ..AffinitySettings::default()
+        };
+        grid.tuning().set(AvailabilitySettings::default(), affinity);
+        assert!(
+            !grid.affinity().settings.load().enabled,
+            "the filter's affinity settings were adopted on set"
+        );
+        assert_eq!(
+            grid.reload(&config(&["east"])).expect("reload"),
+            None,
+            "the adopted tuning is a no-op again"
+        );
+    }
+
+    #[test]
+    fn a_tuning_set_before_the_control_runs_is_adopted_on_the_next_apply() {
+        let peers = Peers::default();
+        let initial = config(&["east"]);
+        let mut control = Control::new(&initial, peers.starter()).expect("control");
+        control.apply(&initial).expect("apply");
+
+        let affinity = AffinitySettings {
+            enabled: false,
+            ..AffinitySettings::default()
+        };
+        control.tuning().set(AvailabilitySettings::default(), affinity);
+        assert!(
+            control.affinity().settings.load().enabled,
+            "nothing to re-apply through yet"
+        );
+        assert!(
+            control.apply(&initial).expect("apply").is_some(),
+            "the new tuning re-applies the same config"
+        );
+        assert!(!control.affinity().settings.load().enabled);
+        assert_eq!(control.apply(&initial).expect("apply"), None);
+    }
+
+    #[test]
     fn a_new_load_window_restarts_the_pollers() {
         let peers = Peers::default();
         let grid = runtime(&peers, &config(&["east", "west"]));
@@ -871,10 +1011,8 @@ mod tests {
     #[test]
     fn an_invalid_config_keeps_the_last_good_one() {
         let peers = Peers::default();
-        let mut control = Control::new(&config(&["east"]), peers.starter()).expect("control");
-        control.apply(&config(&["east"])).expect("first apply");
-        // The topology, not the snapshot: a poller's scrape re-publishes the snapshot.
-        let before = control.topology.load_full();
+        let grid = runtime(&peers, &config(&["east"]));
+        let before = grid.snapshot().load_full();
 
         let mut bad_candidate = config(&["east", "west"]);
         bad_candidate.candidates[1].name = String::new();
@@ -883,17 +1021,14 @@ mod tests {
         let mut zero = config(&["east", "west"]);
         zero.peers[1].interval_ms = 0;
         for bad in [bad_candidate, twice, zero] {
-            control.apply(&bad).expect_err("an invalid config is rejected");
+            grid.reload(&bad).expect_err("an invalid config is rejected");
         }
 
-        assert!(
-            Arc::ptr_eq(&before, &control.topology.load_full()),
-            "a rejected config publishes no topology"
-        );
+        // Content, not identity: a poll may republish the same order at any time.
         assert_eq!(
-            sites(&control.snapshot().load()),
-            ["east"],
-            "the routable sites are unchanged"
+            sites(&before),
+            sites(&grid.snapshot().load_full()),
+            "the snapshot keeps the last good topology"
         );
         assert_eq!(peers.starts("west"), 0, "no poller started for a rejected config");
         assert_eq!(peers.starts("east"), 1);
@@ -934,7 +1069,7 @@ mod tests {
             let at = now_ms();
             Ok(Scrape {
                 body: format!(
-                    r#"{LOAD_METRIC}{{grid_site="{site}",grid_provider="pool-{site}"}} {value} {at}"#,
+                    r#"{QUEUE_METRIC}{{grid_site="{site}",grid_provider="pool-{site}"}} {value} {at}"#,
                     site = self.site,
                     value = self.value
                 ),
@@ -948,7 +1083,7 @@ mod tests {
     fn stored(store: &LoadStore, site: &str) -> Option<f64> {
         store.window_worst(
             &LoadStore::key(site, &format!("pool-{site}")),
-            LOAD_METRIC,
+            QUEUE_METRIC,
             now_ms(),
             60_000,
             true,
@@ -1098,36 +1233,44 @@ mod tests {
 
         grid.reload(&config(&["east"])).expect("reload");
 
-        assert_eq!(members(&in_flight), ["east", "west"], "the request keeps its snapshot");
+        // A poller refresh may reorder the snapshot, so compare the set.
+        let mut kept = sites(&in_flight);
+        kept.sort();
+        assert_eq!(kept, ["east", "west"], "the request keeps its snapshot");
         assert_eq!(sites(&snapshot.load()), ["east"], "the next request sees the new one");
     }
 
     #[test]
-    fn a_refresh_that_raced_a_reload_is_dropped() {
-        let first = Arc::new(ArcSwap::from_pointee(
+    fn a_refresh_orders_while_holding_the_swap_lock() {
+        // Ordering under the lock means a reload or health tick cannot publish between
+        // this cycle reading its inputs and storing its order.
+        let topology = Arc::new(ArcSwap::from_pointee(
             Topology::from_config(&config(&["east"])).expect("topology"),
         ));
         let snapshot = Arc::new(ArcSwap::from_pointee(RouteSnapshot::from_static(
             Vec::new(),
             Arc::from("local"),
         )));
-        let reloaded = Arc::new(Topology::from_config(&config(&["west"])).expect("topology"));
+        let swap = Arc::new(Mutex::new(Gauged::new()));
+        let held = Arc::new(AtomicBool::new(false));
         let refresh = {
-            let topology = Arc::clone(&first);
+            let (swap, held) = (Arc::clone(&swap), Arc::clone(&held));
             make_refresh(
-                Arc::clone(&first),
+                topology,
                 Arc::clone(&snapshot),
-                Arc::new(Mutex::new(())),
+                Arc::clone(&swap),
+                Arc::default(),
+                Arc::default(),
                 move || {
-                    // The reload lands while this cycle is ordering.
-                    topology.store(Arc::clone(&reloaded));
+                    held.store(swap.try_lock().is_err(), Ordering::SeqCst);
                     1_000
                 },
             )
         };
 
         refresh(&LoadStore::new(Duration::from_secs(60)));
-        assert!(sites(&snapshot.load()).is_empty(), "the stale order is not stored");
+        assert!(held.load(Ordering::SeqCst), "ordered outside the swap lock");
+        assert_eq!(sites(&snapshot.load()), ["east"]);
     }
 
     #[test]
@@ -1142,12 +1285,17 @@ mod tests {
         let clock = Arc::new(AtomicI64::new(1_000));
         let refresh = {
             let clock = Arc::clone(&clock);
-            make_refresh(topology, Arc::clone(&snapshot), Arc::new(Mutex::new(())), move || {
-                clock.load(Ordering::SeqCst)
-            })
+            make_refresh(
+                topology,
+                Arc::clone(&snapshot),
+                Arc::new(Mutex::new(Gauged::new())),
+                Arc::default(),
+                Arc::default(),
+                move || clock.load(Ordering::SeqCst),
+            )
         };
         let line = |site: &str, value: f64, at: i64| {
-            format!(r#"{LOAD_METRIC}{{grid_site="{site}",grid_provider="pool-{site}"}} {value} {at}"#)
+            format!(r#"{QUEUE_METRIC}{{grid_site="{site}",grid_provider="pool-{site}"}} {value} {at}"#)
         };
         let store = LoadStore::new(Duration::from_secs(600));
 
@@ -1197,7 +1345,7 @@ mod tests {
 
         write(&yaml(&["east", "west"]));
         eventually("the rewrite handled", || counts().applied() == 1);
-        assert_eq!(members(&snapshot.load()), ["east", "west"], "the rewrite applied");
+        assert_eq!(sites(&snapshot.load()), ["east", "west"], "the rewrite applied");
         eventually("west polled", || peers.fetches("west") > 0);
 
         drop(grid);
@@ -1206,17 +1354,18 @@ mod tests {
 
     #[test]
     fn a_renewed_identity_restarts_the_pollers_with_no_config_change() {
-        let mut identity = Mount::new(
-            "grid-identity",
-            &[("ca.pem", "old"), ("tls.crt", "old"), ("tls.key", "old")],
-        );
+        let dir = std::env::temp_dir().join(format!("grid-identity-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let file = |name: &str| dir.join(name).to_string_lossy().into_owned();
+        for name in ["ca.pem", "tls.crt", "tls.key"] {
+            std::fs::write(file(name), "old").expect("write");
+        }
         let mut serving = config(&["east"]);
-        serving.peers[0].grid_ca_path = identity.path("ca.pem");
-        serving.peers[0].client_cert_path = identity.path("tls.crt");
-        serving.peers[0].client_key_path = identity.path("tls.key");
-        let yaml = serde_yaml::to_string(&serde_yaml_value(&serving)).expect("yaml");
-        let file = Mount::new("grid-identity-serving", &[("serving.yaml", &yaml)]);
-        let path = file.path("serving.yaml");
+        serving.peers[0].grid_ca_path = file("ca.pem");
+        serving.peers[0].client_cert_path = file("tls.crt");
+        serving.peers[0].client_key_path = file("tls.key");
+        let path = dir.join("serving.yaml");
+        std::fs::write(&path, serde_yaml::to_string(&serde_yaml_value(&serving)).expect("yaml")).expect("write");
 
         let peers = Peers::default();
         let mut grid = runtime(&peers, &serving);
@@ -1229,59 +1378,29 @@ mod tests {
         let counts = || grid.watcher().expect("watching").counts();
         eventually("the startup file seen", || counts().reused() == 1);
 
-        identity.write(&[("ca.pem", "old"), ("tls.crt", "renewed"), ("tls.key", "renewed")]);
-        eventually("the renewal applied", || counts().applied() == 1);
-        assert_eq!(peers.starts("east"), 2, "the poller restarted on the renewed identity");
+        // Two plain writes, where a mounted Secret swaps atomically: the watcher may apply
+        // once per file, so the test waits for at least one renewal and then for quiet.
+        for name in ["tls.crt", "tls.key"] {
+            std::fs::write(file(name), "renewed").expect("renew");
+        }
+        eventually("the renewal applied", || counts().applied() >= 1);
+        eventually("the poller restarted on the renewed identity", || {
+            peers.starts("east") >= 2
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        let applied = counts().applied();
         std::thread::sleep(Duration::from_millis(100));
-        assert_eq!(counts().applied(), 1, "a settled identity restarts nothing more");
+        assert_eq!(counts().applied(), applied, "a settled identity restarts nothing more");
 
         drop(grid);
-    }
-
-    #[test]
-    fn an_identity_read_during_a_rotation_sees_one_version() {
-        let old = [("ca.pem", "ca"), ("tls.crt", "old"), ("tls.key", "old")];
-        let new = [("ca.pem", "ca"), ("tls.crt", "new"), ("tls.key", "new")];
-        let mut identity = Mount::new("grid-torn", &old);
-        let mut serving = config(&["east"]);
-        serving.peers[0].grid_ca_path = identity.path("ca.pem");
-        serving.peers[0].client_cert_path = identity.path("tls.crt");
-        serving.peers[0].client_key_path = identity.path("tls.key");
-        let old_digest = identity_digest(&serving);
-        identity.write(&new);
-        let new_digest = identity_digest(&serving);
-
-        // Each swap waits for two reads after the last, so no read spans two swaps,
-        // however long the reader stalls. A real rotation is hours apart.
-        let reads = Arc::new(AtomicUsize::new(0));
-        let counted = Arc::clone(&reads);
-        let rotating = std::thread::spawn(move || {
-            for round in 0..40 {
-                let after = counted.load(Ordering::SeqCst).saturating_add(2);
-                let deadline = Instant::now().checked_add(Duration::from_secs(5)).expect("deadline");
-                while counted.load(Ordering::SeqCst) < after && Instant::now() < deadline {
-                    std::thread::yield_now();
-                }
-                identity.write(if round % 2 == 0 { &old } else { &new });
-            }
-            identity
-        });
-        while !rotating.is_finished() {
-            let digest = identity_digest(&serving);
-            assert!(
-                digest == old_digest || digest == new_digest,
-                "read {} mixed two versions of the identity",
-                reads.load(Ordering::SeqCst)
-            );
-            reads.fetch_add(1, Ordering::SeqCst);
-        }
-        drop(rotating.join().expect("rotation"));
+        std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 
     #[test]
     fn a_change_that_fails_on_unreadable_identity_is_retried_until_it_applies() {
-        let mut identity = Mount::new("grid-retry", &[]);
-        let cert = PathBuf::from(identity.path("tls.crt"));
+        let dir = std::env::temp_dir().join(format!("grid-retry-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let cert = dir.join("tls.crt");
         let peers = Peers::default();
         let ok = peers.starter();
         let watched = cert.clone();
@@ -1294,39 +1413,39 @@ mod tests {
         let mut grid = crate::serving::start_runtime(&config(&["west"]), start).expect("runtime starts");
         let mut serving = config(&["west", "east"]);
         serving.peers[1].client_cert_path = cert.to_string_lossy().into_owned();
-        let yaml = serde_yaml::to_string(&serde_yaml_value(&serving)).expect("yaml");
-        let file = Mount::new("grid-retry-serving", &[("serving.yaml", &yaml)]);
-        let path = file.path("serving.yaml");
+        let path = dir.join("serving.yaml");
+        std::fs::write(&path, serde_yaml::to_string(&serde_yaml_value(&serving)).expect("yaml")).expect("write");
 
         grid.watch(&path, Duration::from_millis(20)).expect("watch");
         let counts = || grid.watcher().expect("watching").counts();
         eventually("the change retried", || counts().rejected() >= 2);
         assert_eq!(sites(&grid.snapshot().load()), ["west"], "the old config stays");
 
-        identity.write(&[("tls.crt", "issued")]);
+        std::fs::write(&cert, "issued").expect("issue");
         eventually("the pending change applied", || counts().applied() == 1);
-        assert_eq!(
-            members(&grid.snapshot().load()),
-            ["east", "west"],
-            "the pending change applied"
-        );
+        assert_eq!(sites(&grid.snapshot().load()), ["west", "east"]);
 
         drop(grid);
+        std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 
     #[test]
     fn a_refused_file_neither_blocks_renewal_nor_repeats_its_rejection() {
-        let mut identity = Mount::new(
-            "grid-refused",
-            &[("ca.pem", "old"), ("tls.crt", "old"), ("tls.key", "old")],
-        );
+        let dir = std::env::temp_dir().join(format!("grid-refused-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let file = |name: &str| dir.join(name).to_string_lossy().into_owned();
+        for name in ["ca.pem", "tls.crt", "tls.key"] {
+            std::fs::write(file(name), "old").expect("write");
+        }
         let mut serving = config(&["east"]);
-        serving.peers[0].grid_ca_path = identity.path("ca.pem");
-        serving.peers[0].client_cert_path = identity.path("tls.crt");
-        serving.peers[0].client_key_path = identity.path("tls.key");
-        let yaml = |config: &GridServingConfig| serde_yaml::to_string(&serde_yaml_value(config)).expect("yaml");
-        let mut file = Mount::new("grid-refused-serving", &[("serving.yaml", &yaml(&serving))]);
-        let path = file.path("serving.yaml");
+        serving.peers[0].grid_ca_path = file("ca.pem");
+        serving.peers[0].client_cert_path = file("tls.crt");
+        serving.peers[0].client_key_path = file("tls.key");
+        let path = dir.join("serving.yaml");
+        let write = |config: &GridServingConfig| {
+            std::fs::write(&path, serde_yaml::to_string(&serde_yaml_value(config)).expect("yaml")).expect("write");
+        };
+        write(&serving);
 
         let peers = Peers::default();
         let mut grid = runtime(&peers, &serving);
@@ -1336,7 +1455,7 @@ mod tests {
 
         let mut twice = config(&["east", "west"]);
         twice.peers[1].site = "east".to_owned();
-        file.write(&[("serving.yaml", &yaml(&twice))]);
+        write(&twice);
         eventually("the duplicate site refused", || counts().rejected() == 1);
         std::thread::sleep(Duration::from_millis(200));
         assert_eq!(
@@ -1346,7 +1465,9 @@ mod tests {
         );
         assert_eq!(peers.starts("east"), 1, "a refused file starts and drops no poller");
 
-        identity.write(&[("ca.pem", "old"), ("tls.crt", "renewed"), ("tls.key", "renewed")]);
+        for name in ["tls.crt", "tls.key"] {
+            std::fs::write(file(name), "renewed").expect("renew");
+        }
         eventually("the running config renewed", || counts().applied() == 1);
         assert_eq!(
             peers.starts("east"),
@@ -1360,6 +1481,7 @@ mod tests {
         );
 
         drop(grid);
+        std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 
     /// `config` in the operator's serving-config shape.
@@ -1368,11 +1490,15 @@ mod tests {
             .peers
             .iter()
             .map(|p| {
-                serde_yaml::from_str(&format!(
+                let mut peer: serde_yaml::Value = serde_yaml::from_str(&format!(
                     "{{site: {}, addr: '{}', server_name: {}, authority: {}, grid_ca_path: {}, client_cert_path: {}, client_key_path: {}}}",
                     p.site, p.addr, p.server_name, p.authority, p.grid_ca_path, p.client_cert_path, p.client_key_path
                 ))
-                .expect("peer")
+                .expect("peer");
+                if let (Some(gateway), Some(fields)) = (&p.gateway, peer.as_mapping_mut()) {
+                    fields.insert("gateway".into(), gateway.clone().into());
+                }
+                peer
             })
             .collect();
         let candidates: Vec<serde_yaml::Value> = config
@@ -1393,5 +1519,62 @@ mod tests {
         root.insert("candidates".into(), candidates.into());
         root.insert("peers".into(), peers.into());
         root.into()
+    }
+
+    /// A writer the test subscriber logs into.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("log buffer").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for Captured {
+        type Writer = Self;
+
+        fn make_writer(&'writer self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// What `run` logs at info and above.
+    fn info_log(run: impl FnOnce()) -> String {
+        let out = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .with_writer(out.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, run);
+        String::from_utf8(out.0.lock().expect("log buffer").clone()).expect("utf-8 log")
+    }
+
+    #[test]
+    fn unchanged_reload_logs_nothing_at_info() {
+        let tally = WatchCounts::default();
+        let quiet = info_log(|| report(&Ok(None), &tally, "grid: serving config reloaded"));
+        assert!(quiet.is_empty(), "a no-op reload logged at info: {quiet}");
+        assert_eq!(
+            tally.reused.load(Ordering::SeqCst),
+            1,
+            "the no-op reload is still counted"
+        );
+
+        let outcome = ReloadOutcome {
+            started: 1,
+            ..ReloadOutcome::default()
+        };
+        let loud = info_log(|| report(&Ok(Some(outcome)), &tally, "grid: serving config reloaded"));
+        assert!(
+            loud.contains("grid: serving config reloaded"),
+            "a real reload logs at info: {loud}"
+        );
     }
 }

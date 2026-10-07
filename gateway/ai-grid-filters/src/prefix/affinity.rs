@@ -5,6 +5,8 @@
 //! sites: scores come from this replica's own index, and a [`LoadGate`] weighs
 //! the prefill a match saves against how much busier the sticky site is.
 
+use std::sync::LazyLock;
+
 use serde::Deserialize;
 use xxhash_rust::xxh64::xxh64;
 
@@ -17,6 +19,26 @@ pub(crate) struct Site<'snap> {
     pub(crate) cluster: &'snap str,
     /// The site's windowed worst queue depth, `+inf` when unmeasured.
     pub(crate) queue: f64,
+}
+
+/// What affinity needs to know about a site selection offers: its cluster and its queue depth.
+///
+/// A trait rather than a conversion, so selection's own view passes through on the request path.
+pub(crate) trait Queued {
+    /// The site's backend cluster, the index's candidate key.
+    fn cluster(&self) -> &str;
+    /// The site's windowed worst queue depth, `+inf` when unmeasured.
+    fn queue(&self) -> f64;
+}
+
+impl Queued for Site<'_> {
+    fn cluster(&self) -> &str {
+        self.cluster
+    }
+
+    fn queue(&self) -> f64 {
+        self.queue
+    }
 }
 
 /// Whether load outweighs a match, in whatever load signal selection orders by.
@@ -131,7 +153,27 @@ impl Outcome {
 
     /// Count the decision. The label set is fixed, so the series are bounded.
     pub(crate) fn record(self) {
-        metrics::counter!("grid_route_prefix_affinity_total", "outcome" => self.as_str()).increment(1);
+        // Registered once; counting an outcome is one atomic add on the request path.
+        static COUNTERS: LazyLock<[metrics::Counter; 5]> = LazyLock::new(|| {
+            [
+                Outcome::Sticky,
+                Outcome::NoMatch,
+                Outcome::LoadOverride,
+                Outcome::Exploration,
+                Outcome::NotApplicable,
+            ]
+            .map(|outcome| metrics::counter!("grid_route_prefix_affinity_total", "outcome" => outcome.as_str()))
+        });
+        let index = match self {
+            Self::Sticky => 0,
+            Self::NoMatch => 1,
+            Self::LoadOverride => 2,
+            Self::Exploration => 3,
+            Self::NotApplicable => 4,
+        };
+        if let Some(counter) = COUNTERS.get(index) {
+            counter.increment(1);
+        }
     }
 }
 
@@ -151,21 +193,21 @@ pub(crate) struct Affinity<'req> {
     pub(crate) keys: Option<&'req PrefixKeys>,
     /// Threshold, exploration and the prefill price.
     pub(crate) settings: &'req AffinitySettings,
-    /// The request's draw turn, for exploration.
+    /// The request's selection turn, for exploration.
     pub(crate) turn: usize,
 }
 
 impl Affinity<'_> {
     /// Clear `keep` for every site outside the sticky set, or leave it when `gate`
     /// or exploration reopens the set. `keep` is all true on entry.
-    pub(crate) fn narrow(&self, sites: &[Site<'_>], keep: &mut [bool], gate: &impl LoadGate) -> Outcome {
+    pub(crate) fn narrow(&self, sites: &[impl Queued], keep: &mut [bool], gate: &impl LoadGate) -> Outcome {
         let Some(keys) = self.keys else {
             return Outcome::NotApplicable;
         };
         if explores(self.turn, self.settings.exploration) {
             return Outcome::Exploration;
         }
-        let depths = self.index.depths(keys, sites.iter().map(|site| site.cluster));
+        let depths = self.index.depths(keys, sites.iter().map(Queued::cluster));
         let deepest = depths.iter().copied().max().unwrap_or(0);
         let total = keys.as_slice().len();
         let qualifies = deepest >= FLOOR_KEYS || share(deepest, total) >= self.settings.threshold;
@@ -184,20 +226,29 @@ impl Affinity<'_> {
 
     /// Whether load outweighs the match: the best sticky site is busier than the
     /// best other site by more than the prefill the match saves.
-    fn overloaded(&self, sites: &[Site<'_>], depths: &[usize], depth: usize, gate: &impl LoadGate) -> bool {
+    fn overloaded(&self, sites: &[impl Queued], depths: &[usize], depth: usize, gate: &impl LoadGate) -> bool {
         let best = |pick: bool| {
             sites
                 .iter()
                 .zip(depths)
                 .filter(|(_, held)| (**held == depth) == pick)
-                .min_by(|left, right| left.0.queue.total_cmp(&right.0.queue))
-                .map(|(site, _)| *site)
+                .min_by(|left, right| left.0.queue().total_cmp(&right.0.queue()))
+                .map(|(site, _)| site)
         };
         let (Some(stuck), Some(other)) = (best(true), best(false)) else {
             return false;
         };
         // Tokens estimated at 4 bytes each, as the canonical stream is.
         let saved = tokens(depth) / self.settings.prefill_tokens_per_second;
+        // Two stack values for the gate; the view type stays selection's own.
+        let stuck = Site {
+            cluster: stuck.cluster(),
+            queue: stuck.queue(),
+        };
+        let other = Site {
+            cluster: other.cluster(),
+            queue: other.queue(),
+        };
         gate.outweighs(&stuck, &other, saved)
     }
 }
@@ -213,16 +264,16 @@ fn share(matched: usize, total: usize) -> f64 {
     ratio.min(1.0)
 }
 
-/// Whether request `turn` explores, a stable draw at `probability`.
+/// Whether request `turn` explores, a stable coin at `probability`.
 fn explores(turn: usize, probability: f64) -> bool {
     if probability <= 0.0 {
         return false;
     }
-    let draw = xxh64(&turn.to_le_bytes(), EXPLORE) % 1_000_000;
-    f64::from(u32::try_from(draw).unwrap_or(u32::MAX)) < probability * 1_000_000.0
+    let coin = xxh64(&turn.to_le_bytes(), EXPLORE) % 1_000_000;
+    f64::from(u32::try_from(coin).unwrap_or(u32::MAX)) < probability * 1_000_000.0
 }
 
-/// Seeds the exploration draw apart from the two-choice draw.
+/// Seeds the exploration coin apart from the two-choice pick.
 const EXPLORE: u64 = 0x6578_706C_6F72_6531;
 
 #[cfg(test)]
@@ -263,7 +314,7 @@ mod tests {
     };
 
     /// Narrow an `n`-key request over `sites` and return the outcome and the kept set.
-    fn run_on(index: &PrefixIndex, n: u64, sites: &[Site<'_>]) -> (Outcome, Vec<bool>) {
+    fn run_on(index: &PrefixIndex, n: u64, sites: &[impl Queued]) -> (Outcome, Vec<bool>) {
         let mut keep = vec![true; sites.len()];
         let keys = keys(n);
         let settings = settings();
