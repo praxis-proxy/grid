@@ -1,71 +1,115 @@
 # Polling Cross-Site Load Signals
 
-A gateway routes across sites by preferring the least-loaded peer that serves a
-model. To do that it needs each peer's current load. Each gateway polls its
-peers' signal endpoints over mutual TLS, records the readings in a local store,
-and the router orders cross-site candidates from that store.
-
-This document covers the poll path and its failure behavior. The signal wire
-format and the store are described in [Signals](signals.md). How the ordered
-candidates are selected is in [Routing](routing.md) and [Scoring](scoring.md).
+A gateway prefers the least-loaded peer serving a model, so it needs each peer's
+load. Each gateway polls its peers over mutual TLS, records the readings in a
+local store, and orders cross-site candidates from it. Wire format and store:
+[Signals](signals.md). Selection: [Routing](routing.md), [Scoring](scoring.md).
+Peer identity: [Authentication](auth.md).
 
 ## The Poll Path
 
-Polling is direct per peer, not through a relay. One poller dials one peer,
-verifies that peer's Grid site certificate, and attributes the readings to that
+Polling is direct per peer, not through a relay, and readings are attributed to
 one verified identity.
 
 | Step | What happens |
 |---|---|
-| Dial | The poller opens a mutual-TLS connection to the peer's `/v1/site/signals`. Both ends present Grid site certificates. |
-| Verify | The peer's certificate is checked against the Grid CA and its SPIFFE identity, then the verified identity is compared to the site the poller intended to reach. A valid Grid peer answering for a site the poller did not dial is refused. |
-| Read | The exposition body is read under a byte ceiling and a time bound, so a slow or oversized peer cannot hold the poll open or exhaust memory. |
-| Store | Each reading is keyed on the verified peer identity, never a value the response body carries. A body label that disagrees with the verified owner is dropped. |
+| Dial | Mutual TLS to the peer's `/v1/site/signals`, both ends presenting Grid site certificates. |
+| Verify | The certificate is checked against the Grid CA and its SPIFFE identity, then the verified identity is compared to the site the poller dialed. A valid Grid peer answering for another site is refused. |
+| Read | Under a byte ceiling and a time bound, so a slow or oversized peer cannot hold the poll open or exhaust memory. |
+| Store | Keyed on the verified identity, never on anything the body carries, so no peer can inject readings as another. A body label disagreeing with the verified owner is dropped. |
+| Bound | Only the contract names and EPP pool averages the gateway routes on, a DNS-1123 `grid_provider`, a finite non-negative value (at most one for `grid_provider_ready` and `grid_provider_error_ratio`), and the peer's first 64 providers by name. Custom `signalNames` are dropped. Refusals count in `grid_peer_signals_refused_total{peer,reason}`. |
 
-The verified peer identity is the store key. The response body cannot choose
-where its readings land, so one peer cannot inject readings attributed to
-another.
+A gateway polls only while serving, since one that is not serving has no routing
+decision to inform. Live connections are proportional to the serving gateways,
+not to the grid.
 
-## When a Gateway Polls
+Poll and route meet at the store, and only there. Ordering runs off the request
+path, reading each candidate's recent worst load into a least-loaded-first list.
+The request path reads one ordered snapshot and takes the front admitted
+candidate; it never reads raw signals or computes load.
 
-A gateway polls its peers only while its own endpoint is actively serving.
+## Provider Readiness
 
-Cross-site routing is a decision this gateway makes when it receives a request
-it can place elsewhere. A gateway that is not serving receives no such requests.
-It has no routing decision to inform, so it holds no mutual-TLS connections to
-its peers and adds no scrape load to them. Polling follows serving. It starts
-when the gateway begins serving and stops when it drains.
+Each operator publishes whether its providers can serve, as
+`grid_provider_ready{grid_site,grid_provider}`. A provider is not ready when its
+EPP reports zero ready endpoints for two scrapes running and recorded no engine
+answer in 30s, when no scrape succeeded within `staleMetricsSeconds` (half the
+signal TTL when unset), or when it is `Unavailable`. The EPP counts endpoints
+with fresh metrics, so a saturated engine can read zero while serving, which is
+why two scrapes and the engine answer both gate the verdict.
 
-The number of live peer connections is then proportional to the serving
-gateways, not to the size of the grid. A drained or standby gateway is silent on
-the peer signal endpoints.
+A scrape answering without the pool's ready-endpoint series leaves readiness
+unknown, not false, and does not exclude: a provider pointed at vLLM's own
+`/metrics` carries no such series.
 
-## From Poll to Route
+The verdict is also the provider's `Ready` condition, whose reason names the
+cause and, for a failed scrape, its class. See [crds.md](./crds.md).
 
-The poll path and the route path meet at the store, and only at the store.
+The gateway reads the latest sample when it orders. A 0 excludes, so a site
+drops within one poll of its operator deciding and returns within one poll of
+recovery. A missing series reads as ready, so a site whose operator predates
+readiness still routes. The serving config carries the same verdict for local
+providers as `admission: none`. When every candidate for a model is excluded the
+gateway answers 503 with `Retry-After`, not 404: the model exists but cannot be
+served now. At the default 5s scrape and 5s poll, exclusion takes about 15s and
+rejoin about 10s.
 
-The poller writes readings into the store as they arrive. Ordering runs off the
-request path as a control step: it reads each candidate's recent worst load from
-the store and produces a candidate list ordered least-loaded-first. The request
-path reads one ordered snapshot and takes the front admitted candidate. The
-request path does not read raw signals or compute load. It reads resolved order.
+## Provider In-flight
+
+Each operator also publishes `grid_provider_in_flight_requests`, beside
+`grid_provider_ready_endpoints` so the count has a denominator at the reader.
+Every input comes from the EPP's `/metrics`; nothing scrapes vLLM. The value is the larger of
+two estimates, plus what the EPP's flow control holds for the pool
+(`llm_d_epp_flow_control_queue_size`):
+
+- the EPP's per-endpoint `llm_d_epp_inflight_requests`, summed, taking each
+  endpoint's largest count across producer instances. Needs the EPP's
+  inflight-load-producer.
+- the pool's average running plus average queued, times ready endpoints.
+
+The larger, so an EPP restart that zeroes its count does not make the site look
+idle. The per-endpoint count carries no pool label, so an EPP serving several
+pools falls back to the averages alone. A site with no fresh endpoint publishes
+nothing, since its averages are frozen, and the gateway reads it as unknown.
+Point `metricsConfig.metricsEndpoint` at the EPP Service: a pod or headless
+address can reach a standby replica, which reports no series.
+
+On a prefill/decode pool the EPP counts a request on both endpoints, so the value
+measures endpoint occupancy, up to twice the requests.
+
+## Provider Latency
+
+Each operator also publishes recent latency from the EPP's request histograms
+over 30s, only when at least 20 requests completed in that window, and never
+borrowed from another site.
+
+- `grid_provider_ttft_p50_seconds`, `grid_provider_ttft_p90_seconds`: time to
+  first token, streaming requests, from `llm_d_epp_request_ttft_seconds`. Timed
+  from receiving the request, so it includes flow-control wait and network.
+- `grid_provider_tpot_seconds`: mean time per output token, streaming requests.
+- `grid_provider_error_ratio`: failed over all requests. The latency histograms
+  record only successes, so a failing site can read fast; this shows it.
+
+The EPP labels these by model, not pool, so an EPP serving several pools reports
+their combined latency. A restart resets its counters and the window starts over.
+
+## Provider Series on /metrics
+
+The operator exports these series on its Prometheus `/metrics` listener, labeled
+`grid_site` and `grid_provider`, for its own providers and those it polls, so a
+Prometheus scraping one hub sees every site. A peer's value there is what the hub
+last polled, up to one poll old. A series the operator does not hold is absent,
+not 0.
 
 ## Failure Behavior
 
-| Condition | Signal produced | Routing effect |
-|---|---|---|
-| No reading for a candidate | The candidate scores as maximally loaded. | It sorts after every candidate that has a reading, so a measured healthy peer is preferred over an unmeasured one. |
-| Readings all stale (older than the window) | Same as no reading. | The candidate sorts last until a fresh reading arrives. |
-| Peer unreachable or slow | The poll returns an error and no reading is written. | The candidate ages out of the window and then sorts last. The poll loop continues, and one unreachable peer does not wedge the others. |
-| Peer presents an untrusted or mismatched certificate | The connection is refused, so no reading is written. | The peer contributes nothing to the order. |
+A reading that is missing, stale, or never written because the peer was
+unreachable, slow, or presented an untrusted or mismatched certificate scores the
+candidate as maximally loaded, so it sorts after every candidate that has one.
+The poll loop continues, so one unreachable peer does not wedge the others. A
+peer reporting `grid_provider_ready 0` is excluded outright until a later reading
+says 1, and if every candidate is excluded the model answers 503.
 
-Loss of signal degrades to "least preferred," never to "silently treated as
-idle." A drained burst stays penalized until it ages out of the window rather
-than snapping back to idle on the first missing sample.
-
-## See Also
-
-- [Signals](signals.md), the signal wire format and the store.
-- [Routing](routing.md), how an ordered candidate is selected.
-- [Scoring](scoring.md), how load maps to order.
-- [Authentication](auth.md), the Grid mTLS peer identity layer the poll path uses.
+Loss of signal degrades to least preferred, not to idle. A drained burst stays
+penalized until it ages out rather than snapping back on the first missing
+sample.
