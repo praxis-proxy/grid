@@ -7,6 +7,8 @@
 
 - [Routing Guide](routing.md): choose a routing behavior and configure policy,
   scoring, selection groups, affinity, and selection modes.
+- [Tuning cross-site site selection](site-selection.md): how a grid gateway
+  chooses a site, what feeds it, and what to change.
 - [Routing Architecture and Overlay Contract](architecture/routing.md):
   overlay format, revision lifecycle, scope, provenance, security, and delivery.
 - [Provider Scoring](architecture/scoring.md): metrics input, normalization,

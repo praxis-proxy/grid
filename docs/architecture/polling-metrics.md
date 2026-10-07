@@ -25,8 +25,9 @@ not to the grid.
 
 Poll and route meet at the store, and only there. Ordering runs off the request
 path, reading each candidate's recent worst load into a least-loaded-first list.
-The request path reads one ordered snapshot and takes the front admitted
-candidate; it never reads raw signals or computes load.
+The request path reads one ordered snapshot and picks among its healthy sites with
+room, or failing that the best-scored sites not full. It does not read raw signals or
+compute load. It reads resolved order.
 
 ## Provider Readiness
 
@@ -45,10 +46,10 @@ unknown, not false, and does not exclude: a provider pointed at vLLM's own
 The verdict is also the provider's `Ready` condition, whose reason names the
 cause and, for a failed scrape, its class. See [crds.md](./crds.md).
 
-The gateway reads the latest sample when it orders. A 0 excludes, so a site
-drops within one poll of its operator deciding and returns within one poll of
-recovery. A missing series reads as ready, so a site whose operator predates
-readiness still routes. The serving config carries the same verdict for local
+The gateway does not read this verdict. It reads the EPP's ready-endpoint count the
+operator relays, and a site whose latest count is zero, or whose per-unit series stopped
+while that count kept stamping, leaves selection within one poll and rejoins within one
+poll of recovery. The serving config carries the same verdict for local
 providers as `admission: none`. When every candidate for a model is excluded the
 gateway answers 503 with `Retry-After`, not 404: the model exists but cannot be
 served now. At the default 5s scrape and 5s poll, exclusion takes about 15s and
@@ -77,6 +78,10 @@ address can reach a standby replica, which reports no series.
 On a prefill/decode pool the EPP counts a request on both endpoints, so the value
 measures endpoint occupancy, up to twice the requests.
 
+The gateway does not read this series. It concludes its own in-flight from the raw EPP
+series the operator relays, running plus waiting per endpoint times ready endpoints plus
+what flow control holds, each instant read together.
+
 ## Provider Latency
 
 Each operator also publishes recent latency from the EPP's request histograms
@@ -100,6 +105,23 @@ The operator exports these series on its Prometheus `/metrics` listener, labeled
 Prometheus scraping one hub sees every site. A peer's value there is what the hub
 last polled, up to one poll old. A series the operator does not hold is absent,
 not 0.
+
+## Site Selection
+
+The gateway learns each site's ceiling, the most in-flight it has held with nothing queued,
+and reads saturation (rho) as in-flight over that ceiling, smoothed per new sample. A site has
+room while rho is below 1. Among healthy sites with room, three or more are picked two by
+ceiling taking the lower rho, two are picked between weighted by ceiling over 1 + rho, one is
+taken. With no site that has room, the pick is by ceiling among the sites not full, tied on the
+best queue depth. A cluster praxis reports with no healthy endpoint is never picked while a
+healthy one is left.
+
+With `availability.shedding` on, a model sheds once every healthy site serving it has been
+saturated for `full_after_ms` with work waiting (`queue_full` per serving unit, or any work
+held before scheduling), and routes again once no sample from a site has shown that for
+`room_after_ms`. A shed request gets 429 with `Retry-After` and an OpenAI-style
+error; a model with no healthy routable site gets 503. The knobs and their defaults are in
+`docs/routing.md`. The gateway keeps no count of its own requests in flight.
 
 ## Failure Behavior
 
