@@ -630,7 +630,7 @@ Use this mapping:
 | `config.inline` | `praxisConfig.byo.inline` |
 | `gatewayConfig.render: true` | `praxisConfig.source: render` |
 | `gatewayConfig.<field>` | `praxisConfig.render.<field>` |
-| `gatewayConfig.localSite` / `praxisConfig.render.localSite` | `grid.siteName` |
+| `gatewayConfig.localSite` | `grid.siteName` |
 | `gatewayConfig.listenerTls` / `listenerTls.enabled` + `existingSecret` | `listenerTls.secretName` |
 | `gatewayConfig.upstreamCA` / `praxisConfig.render.upstreamCA` | top-level `upstreamCA` |
 | `tls.enabled` + `tls.existingSecret` | `gridIdentity.tlsSecretName` |

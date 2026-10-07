@@ -503,7 +503,7 @@ backend would take every pod out of service.
 {{- $_ := set $probe "exec" (dict "command" $cmd) -}}
 {{- if not (hasKey $probe "timeoutSeconds") -}}{{- $_ := set $probe "timeoutSeconds" 3 -}}{{- end -}}
 {{- else if include "praxis-gateway.maybeTLSListener" $root -}}
-{{- fail "health: the gateway serves TLS and the chart cannot see a loopback admin listener, so a TCP probe would fail a TLS handshake every period; give health.readiness and health.liveness an httpGet or exec probe, or add a loopback admin listener to config.inline" -}}
+{{- fail "health: the gateway serves TLS and the chart cannot see a loopback admin listener, so a TCP probe would fail a TLS handshake every period; give health.readiness and health.liveness an httpGet or exec probe, or add a loopback admin listener to praxisConfig.byo.inline" -}}
 {{- else -}}
 {{- $_ := set $probe "tcpSocket" (dict "port" (include "praxis-gateway.portName" $root)) -}}
 {{- end -}}

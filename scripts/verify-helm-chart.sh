@@ -1811,7 +1811,7 @@ for chart in charts/*/; do
       code = $0
       sub(/^[^:]+:[0-9]+:/, "", code)
       if ($0 ~ /^charts\/praxis-gateway\/+templates\/_helpers\.tpl:[0-9]+:/ &&
-          (code == "{{- if not (lookup \"v1\" \"ConfigMap\" .Release.Namespace .Values.config.existingConfigMap) }}" ||
+          (code == "{{- if not (lookup \"v1\" \"ConfigMap\" .Release.Namespace .Values.praxisConfig.byo.configMapName) }}" ||
            code == "{{- if lookup \"v1\" \"Namespace\" \"\" \"kube-system\" }}")) {
         next
       }
