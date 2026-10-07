@@ -509,8 +509,8 @@ jobs:
               ;;
             static-weighted|combined-site)
               CONFIGS=(
-                "${GITHUB_WORKSPACE}/grid/tests/e2e/topologies/${QUALIFICATION}/configs/consumer/praxis.yaml"
-                "${GITHUB_WORKSPACE}/grid/tests/e2e/topologies/${QUALIFICATION}/configs/provider/praxis.yaml"
+                "${GITHUB_WORKSPACE}/grid/tests/e2e/topologies/grid-${QUALIFICATION}/configs/consumer/praxis.yaml"
+                "${GITHUB_WORKSPACE}/grid/tests/e2e/topologies/grid-${QUALIFICATION}/configs/provider/praxis.yaml"
               )
               ;;
             *)
@@ -1054,6 +1054,7 @@ jobs:
           echo "::group::Docker state"
           docker images > "${DIAG}/docker-images.txt" 2>&1 || true
           docker ps -a > "${DIAG}/docker-containers.txt" 2>&1 || true
+          docker network ls > "${DIAG}/docker-networks-before-cleanup.txt" 2>&1 || true
           echo "::endgroup::"
 
           if [[ -n "${DEMO_DIR}" && -d "${DEMO_DIR}/.forge" ]]; then
@@ -1095,25 +1096,6 @@ jobs:
           done
 
           echo "Sensitive diagnostic content scan complete"
-
-      # ----------------------------------------------------------------------
-      # Artifact upload
-      # ----------------------------------------------------------------------
-
-      - name: Upload artifacts
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: ${{ steps.tags.outputs.artifact_prefix || 'grid-unknown' }}-${{ env.QUALIFICATION }}-${{ env.MODE }}
-          path: |
-            ${{ github.workspace }}/evidence/${{ env.QUALIFICATION }}/
-            ${{ github.workspace }}/diagnostics/${{ env.QUALIFICATION }}/
-            ${{ github.workspace }}/run-${{ env.QUALIFICATION }}.log
-            ${{ github.workspace }}/image-manifest.txt
-            ${{ github.workspace }}/source-metadata.json
-            ${{ github.workspace }}/versions.txt
-          retention-days: 14
-          if-no-files-found: warn
 
       # ----------------------------------------------------------------------
       # Cleanup
@@ -1220,6 +1202,33 @@ jobs:
           echo "result=${CLEANUP_RESULT}" >> "${GITHUB_OUTPUT}"
           echo "Cleanup: ${CLEANUP_RESULT}"
 
+      - name: Record post-cleanup inventory
+        if: always()
+        run: |
+          mkdir -p "${DIAGNOSTICS_DIR}"
+          kind get clusters > "${DIAGNOSTICS_DIR}/kind-clusters-after-cleanup.txt" 2>&1 || true
+          docker ps -a > "${DIAGNOSTICS_DIR}/docker-containers-after-cleanup.txt" 2>&1 || true
+          docker network ls > "${DIAGNOSTICS_DIR}/docker-networks-after-cleanup.txt" 2>&1 || true
+
+      # ----------------------------------------------------------------------
+      # Artifact upload
+      # ----------------------------------------------------------------------
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.tags.outputs.artifact_prefix || format('grid-{0}-{1}', needs.resolve-source.outputs.source_kind, needs.resolve-source.outputs.tested_sha) }}-${{ env.QUALIFICATION }}-${{ env.MODE }}
+          path: |
+            ${{ github.workspace }}/evidence/${{ env.QUALIFICATION }}/
+            ${{ github.workspace }}/diagnostics/${{ env.QUALIFICATION }}/
+            ${{ github.workspace }}/run-${{ env.QUALIFICATION }}.log
+            ${{ github.workspace }}/image-manifest.txt
+            ${{ github.workspace }}/source-metadata.json
+            ${{ github.workspace }}/versions.txt
+          retention-days: 14
+          if-no-files-found: warn
+
       # ----------------------------------------------------------------------
       # Job summary
       # ----------------------------------------------------------------------
@@ -1228,7 +1237,7 @@ jobs:
         if: always()
         env:
           TAG: ${{ steps.tags.outputs.tag || 'unknown' }}
-          ARTIFACT_PREFIX: ${{ steps.tags.outputs.artifact_prefix || 'grid-unknown' }}
+          ARTIFACT_PREFIX: ${{ steps.tags.outputs.artifact_prefix || format('grid-{0}-{1}', needs.resolve-source.outputs.source_kind, needs.resolve-source.outputs.tested_sha) }}
           QUALIFICATION_RESULT: ${{ steps.qualification.outputs.result || 'not-reached' }}
           CLEANUP_RESULT: ${{ steps.cleanup.outputs.result || 'unknown' }}
           RESOLVED_DIGEST: ${{ steps.gateway.outputs.digest || 'unknown' }}
