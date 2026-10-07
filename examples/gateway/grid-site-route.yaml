@@ -1,0 +1,44 @@
+# The grid_site_route filter as it appears under filters: in praxis.yaml, with the
+# load_balancer block that always follows it. grid_site_route decides the cluster; load_balancer
+# dials it and runs the health checks selection demotes on. The chart renders both from
+# gridServing. Nothing in availability or prefix_affinity needs setting: every field has a
+# default, listed in README.md, and shedding is the one switch, off unless set as here.
+- filter: grid_site_route
+  model_header: X-Gateway-Model-Name
+  availability:
+    shedding: true
+- filter: load_balancer
+  clusters:
+    # One cluster per candidate, named as the serving config names it.
+    - name: hq-east
+      tls:
+        ca:
+          ca_path: /etc/praxis/backend-ca/0/service-ca.crt
+        sni: grid-internal-openshift-ai-inference.ai-tenant-site-a.svc.cluster.local
+        verify: true
+      endpoints:
+        - grid-internal-openshift-ai-inference.ai-tenant-site-a.svc.cluster.local.:443
+      trusted_private_endpoints:
+        - grid-internal-openshift-ai-inference.ai-tenant-site-a.svc.cluster.local
+      health_check:
+        type: tcp
+        interval_ms: 5000
+        timeout_ms: 2000
+        healthy_threshold: 1
+        unhealthy_threshold: 3
+    - name: hq-west
+      tls:
+        ca:
+          ca_path: /etc/praxis/backend-ca/1/service-ca.crt
+        sni: grid-internal-openshift-ai-inference.ai-tenant-site-b.svc.cluster.local
+        verify: true
+      endpoints:
+        - grid-internal-openshift-ai-inference.ai-tenant-site-b.svc.cluster.local.:443
+      trusted_private_endpoints:
+        - grid-internal-openshift-ai-inference.ai-tenant-site-b.svc.cluster.local
+      health_check:
+        type: tcp
+        interval_ms: 5000
+        timeout_ms: 2000
+        healthy_threshold: 1
+        unhealthy_threshold: 3

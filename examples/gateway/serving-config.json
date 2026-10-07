@@ -1,0 +1,56 @@
+{
+  "local_site": "hq",
+  "window_secs": 60,
+  "load_window_ms": 17000,
+  "candidates": [
+    {
+      "kind": "inference_model",
+      "name": "Qwen3-Coder-30B-A3B",
+      "site": "hq",
+      "cluster": "hq-east",
+      "fresh": true
+    },
+    {
+      "kind": "inference_model",
+      "name": "Qwen3-Coder-30B-A3B",
+      "site": "hq",
+      "cluster": "hq-west",
+      "fresh": true
+    },
+    {
+      "kind": "inference_model",
+      "name": "Qwen3-Coder-30B-A3B",
+      "site": "factory",
+      "cluster": "factory",
+      "fresh": true
+    }
+  ],
+  "peers": [
+    {
+      "site": "hq",
+      "addr": "grid-operator-signals.grid.svc:9091",
+      "server_name": "hq.grid.internal",
+      "authority": "hq.grid.internal",
+      "path": "/v1/site/signals",
+      "interval_ms": 500,
+      "connect_timeout_ms": 2000,
+      "request_timeout_ms": 2000,
+      "grid_ca_path": "/etc/praxis/tls/ca.crt",
+      "client_cert_path": "/etc/praxis/tls/tls.crt",
+      "client_key_path": "/etc/praxis/tls/tls.key"
+    },
+    {
+      "site": "factory",
+      "addr": "192.0.2.10:9091",
+      "server_name": "factory.grid.internal",
+      "authority": "factory.grid.internal",
+      "path": "/v1/site/signals",
+      "interval_ms": 5000,
+      "connect_timeout_ms": 2000,
+      "request_timeout_ms": 2000,
+      "grid_ca_path": "/etc/praxis/tls/ca.crt",
+      "client_cert_path": "/etc/praxis/tls/tls.crt",
+      "client_key_path": "/etc/praxis/tls/tls.key"
+    }
+  ]
+}
