@@ -200,7 +200,7 @@ RELEASE=grid-operator; NAMESPACE=grid-system; for crd in agenttoolproviders grid
 | `signals.enabled` | bool | `false` | For signalTransport poll. Adds a TCP port named `signals` to the SWIM Service and points this site's gateway at it. Needs `swim.service.enabled`. A LoadBalancer must support mixed UDP and TCP ports. |
 | `signals.port` | int | `9091` | Signals port on the SWIM Service. Peers learn the LoadBalancer address and this port over gossip. |
 | `signals.advertiseAddress` | string | `""` | Signals endpoint gossiped to peers. Set it with `swim.advertiseAddress` or a NodePort Service, where the operator discovers no LoadBalancer address. |
-| `signals.peerIntervalSeconds` | int | `""` | Seconds between peer signal polls, at least 1, as `GRID_SIGNALS_PEER_INTERVAL_SECS`. Every site polls every other alive site, so a grid of N sites makes N*(N-1) polls each interval. Empty keeps the operator's own default. |
+| `signals.peerIntervalSeconds` | int | `""` | Seconds between peer signal polls, 1 to 99999, as `GRID_SIGNALS_PEER_INTERVAL_SECS`. Every site polls every other alive site, so a grid of N sites makes N*(N-1) polls each interval. Empty keeps the operator's own default. |
 | `gateway.address` | string | `""` | Advertised site gateway `host:port` override. Use it when the site gateway Service is not a LoadBalancer. Maps to `GRID_GATEWAY_ADDRESS`. |
 | `gateway.serviceName` | string | `""` | Site gateway Service name the operator resolves and advertises to remote sites. Maps to `GRID_GATEWAY_SERVICE_NAME`. |
 | `gateway.namespace` | string | `""` | Namespace of the site gateway Service. Empty uses the release namespace. Outside the resource namespaces, the operator gets only `get` on that one Service there. Maps to `GRID_GATEWAY_NAMESPACE`. |

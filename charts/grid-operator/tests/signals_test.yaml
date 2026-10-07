@@ -292,3 +292,40 @@ tests:
           content:
             name: GRID_SIGNALS_PEER_INTERVAL_SECS
             value: "1"
+
+  - it: refuses an interval past what the operator can parse
+    template: templates/deployment.yaml
+    set:
+      grid.id: aws
+      site.name: east
+      signals.enabled: true
+      swim.service.enabled: true
+      signals.peerIntervalSeconds: "18446744073709551616"
+    asserts:
+      - failedTemplate: {}
+
+  - it: refuses an interval past the ceiling
+    template: templates/deployment.yaml
+    set:
+      grid.id: aws
+      site.name: east
+      signals.enabled: true
+      swim.service.enabled: true
+      signals.peerIntervalSeconds: 100000
+    asserts:
+      - failedTemplate: {}
+
+  - it: takes the ceiling
+    template: templates/deployment.yaml
+    set:
+      grid.id: aws
+      site.name: east
+      signals.enabled: true
+      swim.service.enabled: true
+      signals.peerIntervalSeconds: 99999
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: GRID_SIGNALS_PEER_INTERVAL_SECS
+            value: "99999"
