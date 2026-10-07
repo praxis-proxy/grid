@@ -247,6 +247,10 @@ Praxis AI image; these values may advance independently.
 | `gatewayConfig.auth.validateCA` | object | empty | CA for the validate call (`configMap` or `secret`, `key`). Set as `SSL_CERT_FILE`, which replaces the platform trust store for the validate call and https backends without a per-backend CA or `upstreamCA`. mutual_tls backends and `upstreamCA` are unaffected. See the recipe below. |
 | `networkPolicy.enabled` | bool | `false` | Render a NetworkPolicy that limits which pods can reach the listener port, where the CNI enforces NetworkPolicy. It is not authentication. Node and host-network traffic handling is CNI-specific (OVN-Kubernetes: the `policy-group.network.openshift.io/host-network` label), and a LoadBalancer with `externalTrafficPolicy: Cluster` can SNAT clients to node IPs. |
 | `networkPolicy.from` | list | `[]` | NetworkPolicyPeer entries allowed in. Required when enabled. With `auth.mode: none`, list only the authenticating front. `{podSelector: {}}` admits every pod in this namespace. An empty `namespaceSelector` and an `ipBlock` of `0.0.0.0/0` or `::/0` admit everyone and fail the render. An all-address `ipBlock` with `except` entries is allowed. The check reads selector emptiness and the cidr only, so `matchExpressions` that happen to select every pod pass. A provider gateway behind a LoadBalancer that SNATs clients to node IPs needs `ipBlock` peers for those node addresses. |
+| `metricsListener.enabled` | bool | `false` | Serve `GET /metrics` over TLS on its own port and ClusterIP Service, for an in-cluster Prometheus. The admin listener refuses a non-loopback Host, so Prometheus cannot scrape it. Needs the grid-gateway image, `existingSecret`, `fromNamespaces`, and `networkPolicy.enabled`. The port answers only `/metrics` but has no authentication, so the NetworkPolicy is its access control, and that holds only where the CNI enforces NetworkPolicy. |
+| `metricsListener.existingSecret` | string | `""` | Secret with `tls.crt` and `tls.key`. On OpenShift, request it with `metricsListener.service.annotations` `service.beta.openshift.io/serving-cert-secret-name`. The listener reloads the cert when the Secret changes. |
+| `metricsListener.fromNamespaces` | list | `[]` | Namespace names allowed to reach the metrics port, for example `openshift-user-workload-monitoring`. |
+| `metricsListener.serviceMonitor.enabled` | bool | `false` | Render a ServiceMonitor that verifies the cert against `caConfigMap` (for example `openshift-service-ca.crt`, key `service-ca.crt`) and renames Praxis's `cluster` label to `backend`, since ACM uses `cluster` for the managed cluster. |
 | `gatewayConfig.upstreamCA.secretName` | string | `""` | CA bundle for backend TLS without a per-cluster CA (`upstream_ca_file`). |
 | `gatewayConfig.listenerTls.enabled` | bool | `false` | Terminate TLS at the listener from `existingSecret`, in render consumer or BYO mode. Render providers reject this setting and use `tls.existingSecret` for listener TLS. Names the port `https`. The cert mounts at `listenerTls.mountPath` (`/etc/praxis/listener-tls`), so a BYO config moving off `tls.enabled` must point its listener `cert_path`/`key_path` there. On OpenShift, annotate the Service with `service.beta.openshift.io/serving-cert-secret-name`. |
 | `port.containerPort` | int | `8080` | Container port. |
@@ -276,6 +280,8 @@ Praxis AI image; these values may advance independently.
 | `gridServing.gatewayRef` | string | release fullname | This gateway's gatewayRef name in the GridNetwork. |
 | `gridServing.configMap` | string | `""` | Overrides the derived `grid-serving-<network>-<gatewayRef>`. Needed when that name passes 63 characters. |
 | `gridServing.mountPath` | string | `/etc/praxis/grid-serving` | Mount directory for the ConfigMap. |
+| `gridServing.siteRoute.availability` | object | `{}` | Site availability, rendered into the `grid_site_route` filter block with keys snake_case as the filter reads them (`shedding`, `smoothing`, `ceiling_half_life_ms`, `ceiling_floor`, `explore_floor`, `full_after_ms`, `room_after_ms`, `queue_full`). Every field defaults and `shedding` is the one switch. See `examples/gateway/grid-site-route.yaml`. |
+| `gridServing.siteRoute.prefixAffinity` | object | `{}` | Prefix affinity tuning rendered as the filter's `prefix_affinity` (`enabled`, `threshold`, `exploration`, `prefill_tokens_per_second`, `queued_request_seconds`, `tag_key_path`). |
 | `tls.enabled` | bool | `false` | Mount a TLS Secret. |
 | `tls.existingSecret` | string | `grid-site-identity` | Name of the TLS Secret, the site identity the grid operator writes. |
 | `tls.caSecret` | string | `""` | Secret holding the Grid CA (`ca.crt`), projected beside `existingSecret`. A provider defaults to `grid-ca`. |
@@ -292,6 +298,25 @@ Praxis AI image; these values may advance independently.
 | `tolerations` | list | `[]` | Pod tolerations. |
 | `topologySpreadConstraints` | list | `[]` | Topology spread constraints. |
 | `priorityClassName` | string | `""` | Pod priority class. |
+
+## Metrics
+
+The metrics listener serves the Praxis registry, including the grid gateway's own series. With the ServiceMonitor, Praxis's `cluster` label arrives as `backend`.
+
+| Metric | Labels | Meaning |
+|--------|--------|---------|
+| `grid_route_decisions_total` | `site`, `reason` | Requests `grid_site_route` decided. `site` is a site name from the serving config, or empty for a refusal. No label comes from the request. |
+| `grid_route_site_score` | `site`, `cluster` | The queue depth the last route order used for each candidate, lower first. `inf` when unmeasured, `NaN` when excluded or demoted, or when the pair left the topology. |
+
+`reason` is one of five values, and adding one is a deliberate change:
+
+| `reason` | `site` | Response |
+|----------|--------|----------|
+| `routed` | chosen site | Sent to a healthy site. How it ranked is in `grid_route_site_score`. |
+| `fallback` | chosen site | Sent to a demoted site because no healthy one was left. |
+| `not_ready` | empty | 503: every candidate was excluded. |
+| `no_route` | empty | 503: an admitted candidate had no route from this gateway. |
+| `bad_request` | empty | 400 or 404: no model, or a model no candidate serves. |
 
 ## Security
 

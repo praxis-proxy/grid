@@ -316,6 +316,34 @@ networkPolicy:
   # - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: ingress}}
   #   podSelector: {matchLabels: {app: authenticating-front}}
 
+# -- TLS listener serving only GET /metrics, for an in-cluster Prometheus. The admin
+# listener cannot be scraped from outside the pod. Needs the grid-gateway image and
+# networkPolicy.enabled, since the port is reachable only from fromNamespaces.
+metricsListener:
+  # -- Serve the listener.
+  enabled: false
+  # -- Container and Service port.
+  port: 9443
+  # -- Secret holding tls.crt and tls.key, for example the serving cert that
+  # service.annotations requests on OpenShift. Required when enabled.
+  existingSecret: ""
+  # -- Mount path for the cert. The listener reloads it when it changes.
+  mountPath: "/etc/praxis/metrics-tls"
+  # -- Namespaces, by name, whose pods may reach the port. Required when enabled.
+  fromNamespaces: []
+  service:
+    # -- Annotations on the ClusterIP metrics Service.
+    annotations: {}
+  serviceMonitor:
+    # -- Render a monitoring.coreos.com/v1 ServiceMonitor for the metrics Service.
+    enabled: false
+    # -- Scrape interval.
+    interval: 30s
+    # -- ConfigMap holding the CA that signed the metrics cert. Required when enabled.
+    caConfigMap:
+      name: ""
+      key: "ca.crt"
+
 # -- Gateway Service configuration.
 service:
   # -- Create a Service for the gateway.
@@ -401,6 +429,13 @@ gridServing:
   configMap: ""
   # -- Mount directory for the ConfigMap.
   mountPath: "/etc/praxis/grid-serving"
+  # -- Tuning for the grid_site_route filter block: availability and prefixAffinity, keys as
+  # the filter reads them. Fields and defaults in examples/gateway/grid-site-route.yaml.
+  siteRoute:
+    # -- Site availability. Every field defaults; `shedding` is the one switch.
+    availability: {}
+    # -- Prefix affinity.
+    prefixAffinity: {}
 
 # -- Optional TLS Secret mounted at tls.mountPath: the grid site identity, or a client
 # identity for upstream mTLS that the Praxis config references.

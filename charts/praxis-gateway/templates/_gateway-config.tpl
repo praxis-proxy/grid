@@ -137,6 +137,16 @@ The data of the chart-rendered gateway ConfigMap, also hashed into checksum/conf
           {{- if ($.Values.gridServing).enabled }}
           - filter: grid_site_route
             model_header: X-Gateway-Model-Name
+            {{- with ($.Values.gridServing).siteRoute }}
+            {{- with .availability }}
+            availability:
+              {{- toYaml . | nindent 14 }}
+            {{- end }}
+            {{- with .prefixAffinity }}
+            prefix_affinity:
+              {{- toYaml . | nindent 14 }}
+            {{- end }}
+            {{- end }}
           {{- else }}
           - filter: intelligent_route
             model_header: X-Gateway-Model-Name

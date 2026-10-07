@@ -30,6 +30,26 @@ tests:
           path: data["praxis.yaml"]
           pattern: intelligent_route
 
+  - it: renders siteRoute tuning into the filter block
+    template: templates/gateway-config.yaml
+    set:
+      gridServing.siteRoute.availability.shedding: true
+      gridServing.siteRoute.prefixAffinity.threshold: 0.5
+    asserts:
+      - matchRegex:
+          path: data["praxis.yaml"]
+          pattern: 'filter: grid_site_route\n\s+model_header: X-Gateway-Model-Name\n\s+availability:\n\s+shedding: true\n\s+prefix_affinity:\n\s+threshold: 0.5'
+
+  - it: renders no tuning block when siteRoute is empty
+    template: templates/gateway-config.yaml
+    asserts:
+      - notMatchRegex:
+          path: data["praxis.yaml"]
+          pattern: 'availability:'
+      - notMatchRegex:
+          path: data["praxis.yaml"]
+          pattern: 'prefix_affinity:'
+
   - it: syncs after the grid CRs under Argo CD, since the operator writes the serving ConfigMap from them
     template: templates/deployment.yaml
     asserts:
