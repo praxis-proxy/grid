@@ -1,116 +1,53 @@
-# Contributing to AI Grid Network (AGN)
+# Contributing
 
-Thank you for your interest in contributing to
-AGN! We welcome contributions of all kinds:
-code, documentation, bug reports, and feature
-proposals.
+Thank you for your interest in contributing! Start by
+reading the [development conventions]. Submissions that
+do not follow the conventions will be rejected.
 
-## Prerequisites
-
-- Rust stable 1.96+
-- Rust nightly (for `rustfmt`)
-- Docker 29.3.0+ or Podman (for container builds)
+[development conventions]: docs/conventions.md
 
 ## Getting Started
 
 1. Fork the repository and clone your fork
 2. Install pre-commit hooks: `make setup-hooks`
-3. Build the project: `make build`
-4. Run the tests: `make test`
+3. Build and test: `make build && make test`
+4. Run every gate locally before pushing: `make all`
 
-## Quick Reference
+Requirements are listed in [docs/development.md].
 
-```console
-make build          # workspace build
-make test           # all tests
-make fmt            # format with nightly rustfmt
-make lint           # clippy + fmt check + machete
-make doc            # build docs with warnings denied
-make audit          # cargo audit + cargo deny check
-```
+[docs/development.md]: docs/development.md
 
-## Developer Certificate of Origin
+## Picking Up an Issue
 
-> **WARNING**: TBD - not currently in effect, we're
-> waiting on CNCF sandbox submission.
+Only issues a maintainer has triaged (given a milestone
+and added to a project board) are open for contributors
+to take, and only at `Medium` or `Low` priority. Urgent
+and high-priority work is assigned by maintainers. If you
+self-assign something outside these rules, a bot unassigns
+it and points you back here. See [Picking Up Work] for the
+full policy.
 
-All commits must be signed off per the
-[Developer Certificate of Origin][dco] (DCO). This
-certifies that you have the right to submit the
-contribution under the project's license.
+[Picking Up Work]: docs/development.md#picking-up-work
 
-Sign off by adding `-s` to your commit command:
+## Larger Changes
 
-```console
-git commit -s -m "your commit message"
-```
+Features that span multiple PRs, introduce new
+architectural patterns, or affect the public interface
+go through the [proposal process].
 
-This adds a `Signed-off-by` trailer with your name
-and email. Commits without sign-off will be rejected
-by CI.
+[proposal process]: https://github.com/praxis-proxy/enhancements/blob/main/docs/process.md
 
-## Pull Request Process
+## Pull Request Gates
 
-1. **Open an issue first** for non-trivial changes.
-2. **Create a feature branch** from `main`.
-3. **Keep commits focused.** Each commit should be a
-   single logical change.
-4. **Run lint and tests locally** before submitting:
-   `make lint && make test`.
-5. **Submit a pull request** with a clear description
-   of the change and its motivation.
+CI enforces reviewability on every PR:
 
-## Commit Messages
+- A maximum added lines count of production code (tests, docs, examples excluded)
+- A real description of what and why - `Signed-off-by`
+  trailer on every commit (`git commit -s`)
+- Cryptographically signed commits (GPG or SSH)
+- Human authorship: commits authored or signed-off by tools are rejected
+- Conventional commit subjects (`type(scope): summary`, ≤72 chars)
 
-- Subject line: imperative mood, under 50 characters
-- Body: wrap at 72 characters, explain _why_ not
-  _what_
-- Reference issues: `Fixes #123` or `Relates to #456`
+See the [PR conventions] section for details and override labels.
 
-## Code Style
-
-AGN enforces a strict coding style. Key points:
-
-- `#![deny(unsafe_code)]` in all crate roots
-- Clippy with `-D warnings` (zero tolerance)
-- Format with `cargo +nightly fmt`
-- Errors via `thiserror`, logging via `tracing`
-- Comments answer "why?", never "what?"
-
-## Testing Requirements
-
-New capabilities require:
-
-1. Unit tests covering the implementation
-2. Integration tests proving end-to-end behavior
-
-A feature without tests is not complete.
-
-## Code Responsibility
-
-Every contributor is responsible for the code they
-submit, regardless of how it was produced. All code
-must be human-reviewed before submission or merging.
-
-Pull requests from bots (other than `dependabot`)
-will not be accepted. If AI tools assist with
-implementation, the submitter must review every line
-of the diff and be able to explain every change.
-
-Signed-off commits represent your assertion that you
-have reviewed and fully understand the changes you
-are submitting.
-
-## Communication
-
-- [GitHub Issues][issues] for bugs and feature requests
-- [GitHub Discussions][disc] for questions and design
-
-## Code of Conduct
-
-All participants must follow the [CNCF Code of Conduct][coc].
-
-[dco]: https://developercertificate.org/
-[issues]: https://github.com/praxis-proxy/grid/issues
-[disc]: https://github.com/orgs/praxis-proxy/discussions
-[coc]: CODE_OF_CONDUCT.md
+[PR conventions]: docs/conventions.md#pull-request-conventions
