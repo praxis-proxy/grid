@@ -156,6 +156,7 @@ RELEASE=grid-operator; NAMESPACE=grid-system; for crd in agenttoolproviders grid
 |-----|------|---------|-------------|
 | `crds.enabled` | bool | `true` | Install and upgrade the Grid CRDs. `false` when a platform owns them. |
 | `crds.keep` | bool | `true` | Keep the CRDs on `helm uninstall` and an Argo CD delete or prune. |
+| `grid.providers` | object | `{}` | InferenceProviders this site serves, keyed by name. `model` defaults to the name, `providerKind` to `vllm`, `backendKind` to `local_model`. |
 | `rbac.enrollmentNamespace` | string | `""` | The grid-enrollment namespace. The render fails if the operator would get Secret access there. |
 | `rbac.metricsScraper` | bool | `true` | Create the metrics scraper ServiceAccount, allowed only GET on the nonResourceURL /metrics, and let the operator mint short-lived tokens for it. An llm-d EPP serving bearer-authenticated metrics (the default) admits a scrape with that token (metricsConfig.auth type serviceAccountToken). The operator never sends its own token. |
 | `replicaCount` | int | `1` | Operator replicas. Must be 1 (schema-enforced). |

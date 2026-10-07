@@ -563,6 +563,45 @@ credential projection can become available.
 
 **Phases**: Pending → Available → Degraded → Unavailable
 
+**Readiness**: `status.conditions` carries a `Ready` condition, written by the
+operator's signals loop from each scrape of the provider's metrics. Readiness is
+a condition, not a phase: `phase` follows the provider's configuration only, and
+says nothing about whether it serves now.
+
+| Status | Reason | When |
+|---|---|---|
+| `True` | `Ready` | The latest scrape succeeded with at least one ready endpoint. |
+| `False` | `NoEndpointsReady` | Two consecutive scrapes counted zero ready endpoints, and the EPP recorded no engine answer in the last 30s. |
+| `Unknown` | `NoLivenessCheck` | The scrape answered without the pool's ready-endpoint series (`llm_d_epp_ready_endpoints`, then `inference_pool_ready_pods`, for `poolName`). Readiness is unknown rather than false, so the provider is not excluded: a provider pointed at vLLM's own `/metrics` carries no such series. The message names what was missing. |
+| `False` | `ScrapeTimedOut` | No scrape succeeded within `staleMetricsSeconds`, and the latest timed out. |
+| `False` | `ScrapeUnauthorized` | As above, and the latest was refused with 401 or 403. |
+| `False` | `TLSHandshakeFailed` | As above, and the latest failed TLS, including the TLS material. |
+| `False` | `ScrapeFailed` | As above, and the latest failed otherwise. The message names the class: `dns`, `connect`, `http`, `body_cap`, `parse`, or `config`. |
+| `False` | `MetricsStale` | No scrape succeeded within `staleMetricsSeconds`, and none failed. |
+| `False` | `ProviderUnavailable` | The provider is `Unavailable`. |
+| `Unknown` | `AwaitingFirstScrape` | No scrape has succeeded yet, within the grace window. |
+| `Unknown` | `MetricsNotConfigured` | No `metricsConfig`, so readiness cannot be read. |
+
+The operator logs each change of reason once: at WARN when the provider turns not
+ready, at INFO when it returns to `Ready` or waits. Each scrape counts in
+`grid_provider_scrape_total{grid_provider,result}`, where `result` is `success`,
+`no_series`, or a failure class, and
+`grid_provider_last_scrape_success_timestamp_seconds{grid_provider}` holds the time
+of the last scrape with the ready-endpoint series.
+
+A provider whose `Ready` is `False` is excluded from routing: its site publishes
+`grid_provider_ready 0`, and its serving config entry carries `admission: none`.
+See [Polling Cross-Site Load Signals](polling-metrics.md#provider-readiness).
+
+The READY column reads the condition's status directly, so no status field
+repeats it. `-o wide` adds REASON, the condition's reason, and PHASE.
+
+```text
+NAME           PROVIDER      READY   AGE
+qwen3-site-a   self_hosted   True    3d
+qwen3-site-b   self_hosted   False   3d
+```
+
 `spec.capacityWeight` is an optional positive relative provider capacity from
 `1` through `1000`, used only with `GridNetwork.spec.selectionPolicy.mode:
 weightedRandom` and `placementPolicy.strategy: static`. If omitted, the
@@ -651,6 +690,7 @@ routing architecture for full semantics.
 | `prefixCacheHitRatio` | Prefix-cache hit ratio from `0.0` to `1.0`. |
 | `errorRate` | Error rate from `0.0` to `1.0`. |
 | `healthy` | Health gauge interpreted by the metrics parser. |
+| `readyEndpoints` | Ready endpoints in the pool, read for the `Ready` condition. Defaults to `llm_d_epp_ready_endpoints`, then `inference_pool_ready_pods`, filtered by `poolName`. |
 
 #### TLS and mTLS
 

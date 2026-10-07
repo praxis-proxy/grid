@@ -16,8 +16,19 @@ spec:
         - jsonPath: .spec.providerKind
           name: Provider
           type: string
+        - jsonPath: .status.conditions[?(@.type=="Ready")].status
+          name: Ready
+          type: string
+        - jsonPath: .metadata.creationTimestamp
+          name: Age
+          type: date
+        - jsonPath: .status.conditions[?(@.type=="Ready")].reason
+          name: Reason
+          priority: 1
+          type: string
         - jsonPath: .status.phase
           name: Phase
+          priority: 1
           type: string
       name: v1alpha1
       schema:
@@ -397,6 +408,14 @@ spec:
                           type: string
                         queueDepth:
                           description: Metric name for normalised queue depth (0.0–1.0).
+                          nullable: true
+                          type: string
+                        readyEndpoints:
+                          description: |-
+                            Metric name counting the pool's ready endpoints, read for the `Ready` condition.
+
+                            Defaults to `llm_d_epp_ready_endpoints`, then `inference_pool_ready_pods`.
+                            Filtered by `poolName` when set. Zero marks the provider not ready.
                           nullable: true
                           type: string
                       type: object
@@ -864,6 +883,46 @@ spec:
               description: Observed status of an [`InferenceProvider`].
               nullable: true
               properties:
+                conditions:
+                  description: |-
+                    Observed conditions. `Ready` says whether the provider can currently serve a request.
+
+                    Written by the operator's signals loop, never by provider reconciliation.
+                  items:
+                    description: One observed condition, shaped like `metav1.Condition`.
+                    properties:
+                      lastTransitionTime:
+                        description: When `status` last changed, RFC 3339.
+                        format: date-time
+                        type: string
+                      message:
+                        default: ""
+                        description: Human-readable detail.
+                        type: string
+                      observedGeneration:
+                        description: The `metadata.generation` this was computed against.
+                        format: int64
+                        nullable: true
+                        type: integer
+                      reason:
+                        description: CamelCase reason for the status.
+                        type: string
+                      status:
+                        description: '`True`, `False`, or `Unknown`.'
+                        type: string
+                      type:
+                        description: Condition type, such as `Ready`.
+                        type: string
+                    required:
+                      - lastTransitionTime
+                      - reason
+                      - status
+                      - type
+                    type: object
+                  type: array
+                  x-kubernetes-list-map-keys:
+                    - type
+                  x-kubernetes-list-type: map
                 matchingSites:
                   default: []
                   description: Sites matched by the site selector.

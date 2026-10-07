@@ -5,6 +5,11 @@
 //! cloud-managed services (Bedrock, Vertex), and third-party
 //! APIs (OpenAI, Anthropic).
 
+#![expect(
+    clippy::large_stack_frames,
+    reason = "the derived schema builder runs once at startup"
+)]
+
 use kube::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -29,7 +34,10 @@ use super::{
     status = "InferenceProviderStatus",
     namespaced = false,
     printcolumn = r#"{"name":"Provider","type":"string","jsonPath":".spec.providerKind"}"#,
-    printcolumn = r#"{"name":"Phase","type":"string","jsonPath":".status.phase"}"#
+    printcolumn = r#"{"name":"Ready","type":"string","jsonPath":".status.conditions[?(@.type==\"Ready\")].status"}"#,
+    printcolumn = r#"{"name":"Age","type":"date","jsonPath":".metadata.creationTimestamp"}"#,
+    printcolumn = r#"{"name":"Reason","type":"string","jsonPath":".status.conditions[?(@.type==\"Ready\")].reason","priority":1}"#,
+    printcolumn = r#"{"name":"Phase","type":"string","jsonPath":".status.phase","priority":1}"#
 )]
 #[serde(rename_all = "camelCase")]
 pub struct InferenceProviderSpec {
@@ -461,6 +469,13 @@ pub struct MetricSignalNames {
     /// Metric name for a health gauge (any positive value = healthy).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub healthy: Option<String>,
+
+    /// Metric name counting the pool's ready endpoints, read for the `Ready` condition.
+    ///
+    /// Defaults to `llm_d_epp_ready_endpoints`, then `inference_pool_ready_pods`.
+    /// Filtered by `poolName` when set. Zero marks the provider not ready.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ready_endpoints: Option<String>,
 }
 
 /// Returns the default metrics scrape path.
@@ -610,6 +625,13 @@ fn default_models_path() -> String {
 #[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InferenceProviderStatus {
+    /// Observed conditions. `Ready` says whether the provider can currently serve a request.
+    ///
+    /// Written by the operator's signals loop, never by provider reconciliation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(extend("x-kubernetes-list-type" = "map", "x-kubernetes-list-map-keys" = ["type"]))]
+    pub conditions: Vec<Condition>,
+
     /// Sites matched by the site selector.
     #[serde(default)]
     pub matching_sites: Vec<String>,
@@ -657,6 +679,28 @@ impl InferenceProviderStatus {
             && self.phase == desired.phase
             && self.reason == desired.reason
     }
+}
+
+/// One observed condition, shaped like `metav1.Condition`.
+#[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Condition {
+    /// Condition type, such as `Ready`.
+    #[serde(rename = "type")]
+    pub type_: String,
+    /// `True`, `False`, or `Unknown`.
+    pub status: String,
+    /// CamelCase reason for the status.
+    pub reason: String,
+    /// Human-readable detail.
+    #[serde(default)]
+    pub message: String,
+    /// When `status` last changed, RFC 3339.
+    #[schemars(extend("format" = "date-time"))]
+    pub last_transition_time: String,
+    /// The `metadata.generation` this was computed against.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_generation: Option<i64>,
 }
 
 /// Lifecycle phase of a provider resource.
