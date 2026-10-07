@@ -154,17 +154,26 @@ impl LoadStore {
         format!("{site}/{cluster}").into_boxed_str()
     }
 
-    /// Most recent sample of `metric` for `key`. Test-only since scoring reads
-    /// [`Self::window_worst`].
-    #[cfg(test)]
+    /// Most recent sample of `metric` for `key`.
+    #[must_use]
     pub fn latest(&self, key: &str, metric: &str) -> Option<Sample> {
         let provider = self.providers.get(key)?;
         provider.metrics.get(metric)?.samples.last().copied()
     }
 
+    /// When anything was last observed for `key`, across all its metrics.
+    #[must_use]
+    pub fn newest_at(&self, key: &str) -> Option<i64> {
+        let provider = self.providers.get(key)?;
+        provider
+            .metrics
+            .values()
+            .filter_map(|series| series.samples.last().map(|sample| sample.at_ms))
+            .max()
+    }
+
     /// Most recent sample of `metric` for `key` younger than `max_age_ms`.
-    /// Test-only since scoring reads [`Self::window_worst`].
-    #[cfg(test)]
+    #[must_use]
     pub fn fresh(&self, key: &str, metric: &str, now_ms: i64, max_age_ms: i64) -> Option<Sample> {
         // Range starts at zero: a future timestamp (publisher clock ahead) yields
         // a negative age that would otherwise read as fresh forever.
@@ -206,6 +215,59 @@ impl LoadStore {
                 None => sample.value,
                 Some(held) if lower_is_better => held.max(sample.value),
                 Some(held) => held.min(sample.value),
+            });
+        }
+        worst
+    }
+
+    /// Worst of `combine` over the instants in the last `window_ms` at which the first
+    /// of `metrics` has a sample, or `None` when no instant yields a value.
+    ///
+    /// Each instant hands `combine` the sample every metric holds at exactly that
+    /// time, `None` where a metric has none, so a value is concluded from readings
+    /// taken together rather than from each series' own worst. Worst is the max
+    /// when lower is better. Future-stamped samples are skipped.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "keyed lookup with window bounds, score polarity, and the join"
+    )]
+    #[must_use]
+    pub fn window_worst_of<const N: usize, F>(
+        &self,
+        key: &str,
+        metrics: [&str; N],
+        now_ms: i64,
+        window_ms: i64,
+        lower_is_better: bool,
+        combine: F,
+    ) -> Option<f64>
+    where
+        F: Fn([Option<f64>; N]) -> Option<f64>,
+    {
+        let provider = self.providers.get(key)?;
+        let cutoff = now_ms.saturating_sub(window_ms);
+        let series = metrics.map(|metric| provider.metrics.get(metric));
+        let lead = series.first().copied().flatten()?;
+        let mut worst: Option<f64> = None;
+        for sample in &lead.samples {
+            if sample.at_ms < cutoff || sample.at_ms > now_ms {
+                continue;
+            }
+            // Samples are in timestamp order, so the instant is a binary search.
+            let at = |held: &Series| {
+                held.samples
+                    .binary_search_by_key(&sample.at_ms, |held| held.at_ms)
+                    .ok()
+                    .and_then(|index| held.samples.get(index))
+                    .map(|held| held.value)
+            };
+            let Some(value) = combine(series.map(|held| held.and_then(at))) else {
+                continue;
+            };
+            worst = Some(match worst {
+                None => value,
+                Some(held) if lower_is_better => held.max(value),
+                Some(held) => held.min(value),
             });
         }
         worst
@@ -818,6 +880,62 @@ mod tests {
             samples.last().map(|sample| sample.at_ms),
             Some(cap + 500),
             "the newest sample survives the cap"
+        );
+    }
+
+    #[test]
+    fn a_joined_worst_reads_each_instant_together() {
+        let store = LoadStore::new(Duration::from_secs(60));
+        // Two units running 10 each, then one unit running 20: 20 in flight both times,
+        // never the 40 that each series' own worst would multiply to.
+        for (at, running, units) in [(1_000, 10.0, 2.0), (2_000, 20.0, 1.0)] {
+            store.ingest_at(
+                &format!(
+                    "running{{grid_site=\"a\",grid_provider=\"p\"}} {running} {at}\nunits{{grid_site=\"a\",grid_provider=\"p\"}} {units} {at}"
+                ),
+                at,
+                at,
+                "a",
+            );
+        }
+        let key = LoadStore::key("a", "p");
+        let in_flight = |now: i64| {
+            store.window_worst_of(
+                &key,
+                ["running", "units", "queue"],
+                now,
+                30_000,
+                true,
+                |[running, units, queue]| Some((running? + queue.unwrap_or(0.0)) * units?),
+            )
+        };
+        assert_eq!(in_flight(2_000), Some(20.0));
+    }
+
+    #[test]
+    fn a_joined_worst_has_the_instants_of_its_first_series() {
+        let store = LoadStore::new(Duration::from_secs(60));
+        store.ingest_at(
+            "running{grid_site=\"a\",grid_provider=\"p\"} 10 1000\nunits{grid_site=\"a\",grid_provider=\"p\"} 2 1000\nrunning{grid_site=\"a\",grid_provider=\"p\"} 50 3000",
+            3_000,
+            3_000,
+            "a",
+        );
+        let key = LoadStore::key("a", "p");
+        // An instant missing the second series yields nothing.
+        assert_eq!(
+            store.window_worst_of(&key, ["running", "units"], 3_000, 30_000, true, |[running, units]| {
+                Some(running? * units?)
+            }),
+            Some(20.0)
+        );
+        assert_eq!(
+            store.window_worst_of(&key, ["units", "running"], 3_000, 30_000, true, |[units, _]| units),
+            Some(2.0)
+        );
+        assert_eq!(
+            store.window_worst_of(&key, ["absent", "running"], 3_000, 30_000, true, |[_, running]| running),
+            None
         );
     }
 
