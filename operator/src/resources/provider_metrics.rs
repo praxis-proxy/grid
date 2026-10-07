@@ -155,7 +155,12 @@ fn record_scrape(
         .metrics_config
         .as_ref()
         .and_then(|mc| mc.pool_name.as_deref());
-    let ready = crate::readiness::ready_endpoints(&parsed, plan.ready_names(), pool);
+    let ready = readiness.thawed(
+        key,
+        crate::readiness::ready_endpoints(&parsed, plan.ready_names(), pool),
+        units_reporting(&parsed, pool),
+        Instant::now(),
+    );
     let missing = count_scrape(plan, pool, ready);
     let in_flight = in_flight_observation(&parsed, ready, pool, plan.identity);
     let latency = readiness.record_latency(key, &parsed, Instant::now());
@@ -174,6 +179,15 @@ fn record_scrape(
         .chain(latency)
         .collect();
     readiness.record_success(key, ready, missing, observations, Instant::now());
+}
+
+/// Whether the scrape carried a per-unit queue series for the pool: the EPP's collector for
+/// those stops reporting when the pool has no units, while its pool gauges freeze.
+fn units_reporting(parsed: &[crate::signals::Observation], pool: Option<&str>) -> bool {
+    parsed.iter().any(|o| {
+        crate::readiness::PER_UNIT_QUEUE.contains(&o.metric.as_str())
+            && pool.is_none_or(|pool| o.labels.get("name").is_some_and(|n| n == pool))
+    })
 }
 
 /// Count a scrape that answered: `success` with the pool's ready-endpoint series, else

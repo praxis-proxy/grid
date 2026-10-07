@@ -15,6 +15,11 @@ use crate::{crd::inference_provider::Condition, signals::Observation};
 /// Metric names that count a pool's ready endpoints, preferred first.
 pub(crate) const DEFAULT_READY_ENDPOINTS: [&str; 2] = ["llm_d_epp_ready_endpoints", "inference_pool_ready_pods"];
 
+/// The EPP's per-unit queue series, one per serving unit. They come from a collector that
+/// stops reporting when the pool has no units, while the pool gauges freeze at their last
+/// values, so their absence tells a drained pool from a live one.
+pub(crate) const PER_UNIT_QUEUE: [&str; 2] = ["inference_pool_per_pod_queue_size", "llm_d_epp_per_endpoint_queue_size"];
+
 /// Consecutive scrapes reading zero ready endpoints before a provider is not ready,
 /// and reading some before it is ready again.
 ///
@@ -225,6 +230,8 @@ struct Probe {
     last_progress: Option<Instant>,
     /// Whether the latest zero count came while the engine was answering.
     busy: bool,
+    /// When a scrape last carried a per-unit series, so their absence means something.
+    units_last_seen: Option<Instant>,
     /// Recent EPP latency snapshots.
     latency: crate::latency::History,
 }
@@ -251,6 +258,23 @@ impl ReadinessStore {
     /// The probes, recovered if a panicking holder poisoned the lock: each write is whole.
     fn probes(&self) -> std::sync::MutexGuard<'_, HashMap<String, Probe>> {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The ready count a scrape really carries: a positive gauge in a scrape with no
+    /// per-unit series, where earlier scrapes had them, is frozen at its last value because
+    /// the pool drained, and reads as zero.
+    pub(crate) fn thawed(&self, key: &str, ready: Option<f64>, units_reporting: bool, now: Instant) -> Option<f64> {
+        let mut probes = self.probes();
+        let probe = probes.entry(key.to_owned()).or_default();
+        if units_reporting {
+            probe.units_last_seen = Some(now);
+        }
+        let units_seen = probe.units_last_seen.is_some();
+        drop(probes);
+        if !units_reporting && units_seen && ready.is_some_and(|count| count >= 1.0) {
+            return Some(0.0);
+        }
+        ready
     }
 
     /// Record a scrape's latency counters and return the latency series it publishes.
@@ -1115,5 +1139,22 @@ mod tests {
             None,
             "a queue alone is no count"
         );
+    }
+
+    #[test]
+    fn a_positive_count_with_the_per_unit_series_gone_reads_as_zero() {
+        let store = ReadinessStore::default();
+        let now = Instant::now();
+        // Units reporting: the count stands.
+        assert_eq!(store.thawed("p", Some(2.0), true, now), Some(2.0));
+        // The pool drains: the gauge freezes at 2 while the per-unit collector stops.
+        assert_eq!(
+            store.thawed("p", Some(2.0), false, now),
+            Some(0.0),
+            "a frozen gauge is not a ready pool"
+        );
+        // A provider that never had per-unit series keeps its count.
+        assert_eq!(store.thawed("q", Some(3.0), false, now), Some(3.0));
+        assert_eq!(store.thawed("p", None, false, now), None);
     }
 }
