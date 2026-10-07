@@ -244,3 +244,51 @@ tests:
           content:
             name: GRID_SIGNALS_PEER_INTERVAL_SECS
             value: ""
+
+  - it: refuses an interval the operator would exit on
+    template: templates/deployment.yaml
+    set:
+      grid.id: aws
+      site.name: east
+      signals.enabled: true
+      swim.service.enabled: true
+      signals.peerIntervalSeconds: -5
+    asserts:
+      - failedTemplate: {}
+
+  - it: refuses a non-numeric interval
+    template: templates/deployment.yaml
+    set:
+      grid.id: aws
+      site.name: east
+      signals.enabled: true
+      swim.service.enabled: true
+      signals.peerIntervalSeconds: often
+    asserts:
+      - failedTemplate: {}
+
+  - it: refuses zero, which Helm would drop for the default without saying so
+    template: templates/deployment.yaml
+    set:
+      grid.id: aws
+      site.name: east
+      signals.enabled: true
+      swim.service.enabled: true
+      signals.peerIntervalSeconds: 0
+    asserts:
+      - failedTemplate: {}
+
+  - it: takes one second, the floor
+    template: templates/deployment.yaml
+    set:
+      grid.id: aws
+      site.name: east
+      signals.enabled: true
+      swim.service.enabled: true
+      signals.peerIntervalSeconds: 1
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: GRID_SIGNALS_PEER_INTERVAL_SECS
+            value: "1"

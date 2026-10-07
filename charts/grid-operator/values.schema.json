@@ -487,11 +487,17 @@
           }
         },
         "peerIntervalSeconds": {
-          "type": [
-            "integer",
-            "string"
-          ],
-          "description": "Seconds between peer signal polls. Every site polls every other alive site, so a grid of N sites makes N*(N-1) polls each interval. Empty keeps the operator default."
+          "description": "Seconds between peer signal polls, at least 1. Every site polls every other alive site, so a grid of N sites makes N*(N-1) polls each interval. Empty keeps the operator default.",
+          "oneOf": [
+            {
+              "type": "integer",
+              "minimum": 1
+            },
+            {
+              "type": "string",
+              "pattern": "^$|^[1-9][0-9]*$"
+            }
+          ]
         }
       }
     },
