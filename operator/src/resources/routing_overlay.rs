@@ -1392,10 +1392,15 @@ pub fn render_routing_overlay_with_admission(
         precomputed_admission,
     );
 
-    // Find the consumer site to get its labels for access policy evaluation
+    // The consumer's labels, for access policy. Resolved through the same site key placement
+    // uses, so a discovered stub speaking for another site id matches on that id rather than
+    // on its object name. A name-only lookup found nothing for such a stub and every
+    // restricted provider then failed closed.
     let consumer_site_labels = sites
         .iter()
-        .find(|site| site.metadata.name.as_deref() == Some(local_site) && site.spec.grid_network_ref == network_name)
+        .find(|site| {
+            site.spec.grid_network_ref == network_name && peer_site_key(site).is_some_and(|(key, _)| key == local_site)
+        })
         .and_then(|site| site.metadata.labels.as_ref());
 
     let mut candidates = collect_candidates(

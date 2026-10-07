@@ -136,7 +136,7 @@ pub(crate) async fn collect_provider_signals(
         match scrape_provider_signals(provider, &plan, client).await {
             Ok(text) => record_scrape(readiness, &key, provider, &plan, &text),
             Err(class) => {
-                crate::metrics::record_provider_scrape(plan.identity, class.as_str());
+                crate::metrics::record_provider_scrape(crate::readiness::provider_of(&key), class.as_str());
                 readiness.record_failure(&key, class, Instant::now());
             },
         }
@@ -164,7 +164,7 @@ fn record_scrape(
         units_reporting(&parsed, pool),
         Instant::now(),
     );
-    let missing = count_scrape(plan, pool, ready);
+    let missing = count_scrape(crate::readiness::provider_of(key), plan, pool, ready);
     let in_flight = in_flight_observation(&parsed, ready, pool, plan.identity);
     let latency = readiness.record_latency(key, &parsed, Instant::now());
     let observations = parsed
@@ -195,13 +195,13 @@ fn units_reporting(parsed: &[crate::signals::Observation], pool: Option<&str>) -
 
 /// Count a scrape that answered: `success` with the pool's ready-endpoint series, else
 /// `no_series`, returned as the message naming what was missing.
-fn count_scrape(plan: &SignalScrapePlan<'_>, pool: Option<&str>, ready: Option<f64>) -> Option<String> {
+fn count_scrape(provider: &str, plan: &SignalScrapePlan<'_>, pool: Option<&str>, ready: Option<f64>) -> Option<String> {
     if ready.is_some() {
-        crate::metrics::record_provider_scrape(plan.identity, "success");
-        crate::metrics::set_provider_last_scrape_success(plan.identity, std::time::SystemTime::now());
+        crate::metrics::record_provider_scrape(provider, "success");
+        crate::metrics::set_provider_last_scrape_success(provider, std::time::SystemTime::now());
         return None;
     }
-    crate::metrics::record_provider_scrape(plan.identity, "no_series");
+    crate::metrics::record_provider_scrape(provider, "no_series");
     let series = plan.ready_names().join(" or ");
     Some(match pool {
         Some(pool) => format!("metrics reachable, but no {series} series for poolName {pool}"),

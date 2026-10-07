@@ -236,6 +236,27 @@ struct Probe {
     latency: crate::latency::History,
 }
 
+impl Probe {
+    /// Fold one scrape reading zero ready endpoints into this probe.
+    fn count_a_zero(&mut self, now: Instant) {
+        self.zero_streak = self.zero_streak.saturating_add(1);
+        self.ready_streak = 0;
+        self.busy = self
+            .last_progress
+            .is_some_and(|at| now.saturating_duration_since(at) <= PROGRESS_WINDOW);
+        // Answering releases the verdict as well as holding it off. Recovery that required
+        // the endpoint count to come back could not fire when the count was what broke:
+        // exclusion stops the traffic, and a verdict that needs traffic to clear would hold
+        // for as long as the metrics stayed down.
+        self.no_endpoints = (self.no_endpoints || self.zero_streak >= STREAK) && !self.busy;
+        if self.no_endpoints {
+            // Down is the end of the drain story, so recovery reasons from the series it
+            // sees next rather than from one a previous pool reported.
+            self.units_last_seen = None;
+        }
+    }
+}
+
 /// One provider's verdict and the detail behind it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Verdict {
@@ -257,6 +278,14 @@ pub(crate) fn key(network: &str, provider: &str) -> String {
     format!("{network}/{provider}")
 }
 
+/// The provider a store key names, for a metric label.
+///
+/// One derivation, used by both the scrape counters and the cleanup that drops them, so the
+/// label a series is recorded under cannot differ from the one it is forgotten under.
+pub(crate) fn provider_of(key: &str) -> &str {
+    key.split_once('/').map_or(key, |(_, provider)| provider)
+}
+
 impl ReadinessStore {
     /// The probes, recovered if a panicking holder poisoned the lock: each write is whole.
     fn probes(&self) -> std::sync::MutexGuard<'_, HashMap<String, Probe>> {
@@ -264,17 +293,31 @@ impl ReadinessStore {
     }
 
     /// The ready count a scrape really carries: a positive gauge in a scrape with no
-    /// per-unit series, where earlier scrapes had them, is frozen at its last value because
+    /// per-unit series, where a recent scrape had them, is frozen at its last value because
     /// the pool drained, and reads as zero.
+    ///
+    /// Two bounds, because the inference is narrow: a series that was there and is gone means
+    /// the pool drained, which only holds while the absence is news and while nothing says
+    /// otherwise.
+    ///
+    /// Recent, not ever: a per-unit series dropped for good, by a renamed label or a plugin no
+    /// longer configured, would otherwise make every later positive count read zero.
+    ///
+    /// And not while the engine is answering: an answer means pods exist, so the count stands
+    /// whatever the per-unit collector is doing. Without that, an idle provider whose series
+    /// were renamed reads zero, exclusion stops the traffic that would prove otherwise, and
+    /// nothing can clear it.
     pub(crate) fn thawed(&self, key: &str, ready: Option<f64>, units_reporting: bool, now: Instant) -> Option<f64> {
         let mut probes = self.probes();
         let probe = probes.entry(key.to_owned()).or_default();
         if units_reporting {
             probe.units_last_seen = Some(now);
         }
-        let units_seen = probe.units_last_seen.is_some();
+        let recently = |at: Instant| now.saturating_duration_since(at) <= PROGRESS_WINDOW;
+        let units_seen = probe.units_last_seen.is_some_and(&recently);
+        let answering = probe.last_progress.is_some_and(recently);
         drop(probes);
-        if !units_reporting && units_seen && ready.is_some_and(|count| count >= 1.0) {
+        if !units_reporting && units_seen && !answering && ready.is_some_and(|count| count >= 1.0) {
             return Some(0.0);
         }
         ready
@@ -298,7 +341,13 @@ impl ReadinessStore {
         {
             probe.last_progress = Some(now);
         }
-        probe.latency.record(snapshot, now)
+        let published = probe.latency.record(snapshot, now);
+        // History is kept either way, so a pool that stops sharing its EPP has a baseline
+        // to resume from. Publication is not: these counters carry no pool label, and a
+        // figure summed across every pool an EPP serves, attributed to one provider, would
+        // have the gateway route on another pool's latency. Absent reads as unknown, which
+        // is the honest answer.
+        if attributable { published } else { Vec::new() }
     }
 
     /// Record a successful scrape at `now`, with `missing` naming the series it lacked.
@@ -316,18 +365,7 @@ impl ReadinessStore {
         let probe = probes.entry(key.to_owned()).or_default();
         probe.first_attempt.get_or_insert(now);
         match ready_endpoints {
-            Some(count) if count < 1.0 => {
-                probe.zero_streak = probe.zero_streak.saturating_add(1);
-                probe.ready_streak = 0;
-                probe.busy = probe
-                    .last_progress
-                    .is_some_and(|at| now.saturating_duration_since(at) <= PROGRESS_WINDOW);
-                // Answering releases the verdict as well as holding it off. Recovery that
-                // required the endpoint count to come back could not fire when the count
-                // was what broke: exclusion stops the traffic, and a verdict that needs
-                // traffic to clear would hold for as long as the metrics stayed down.
-                probe.no_endpoints = (probe.no_endpoints || probe.zero_streak >= STREAK) && !probe.busy;
-            },
+            Some(count) if count < 1.0 => probe.count_a_zero(now),
             Some(_) => {
                 probe.ready_streak = probe.ready_streak.saturating_add(1);
                 probe.zero_streak = 0;
@@ -402,8 +440,8 @@ impl ReadinessStore {
     pub(crate) fn retain(&self, keep: &std::collections::BTreeSet<String>) {
         self.probes().retain(|key, _| {
             let kept = keep.contains(key);
-            if !kept && let Some((_, identity)) = key.split_once('/') {
-                crate::metrics::forget_provider_scrapes(identity);
+            if !kept {
+                crate::metrics::forget_provider_scrapes(provider_of(key));
             }
             kept
         });
@@ -1162,6 +1200,99 @@ mod tests {
             in_flight(&[queued("qwen3", 4.0)], None, Some("qwen3")),
             None,
             "a queue alone is no count"
+        );
+    }
+
+    #[test]
+    fn a_multi_pool_epp_publishes_no_latency_but_keeps_its_history() {
+        let store = ReadinessStore::default();
+        let start = Instant::now();
+        // Enough completed requests for the error ratio to publish, so an empty return is
+        // the gate rather than an empty window.
+        let counters = |requests: f64, pools: usize| {
+            let unlabeled = |metric: &str, value: f64| Observation {
+                metric: metric.to_owned(),
+                labels: BTreeMap::new(),
+                value,
+                timestamp_ms: None,
+            };
+            let mut obs = vec![
+                sample("llm_d_epp_ready_endpoints", "qwen3", 2.0),
+                unlabeled("llm_d_epp_request_total", requests),
+                unlabeled("llm_d_epp_request_error_total", 0.0),
+            ];
+            if pools > 1 {
+                obs.push(sample("llm_d_epp_ready_endpoints", "other-pool", 3.0));
+            }
+            obs
+        };
+        // One pool: a baseline, then a window with 100 requests in it publishes.
+        store.record_latency("one", &counters(10.0, 1), start);
+        assert!(
+            !store
+                .record_latency("one", &counters(110.0, 1), start + STEP)
+                .is_empty(),
+            "a single-pool EPP publishes its ratio"
+        );
+        // Two pools, same counters: the request totals carry no pool label, so the figure
+        // belongs to no single provider and nothing is published.
+        store.record_latency("two", &counters(10.0, 2), start);
+        assert!(
+            store
+                .record_latency("two", &counters(110.0, 2), start + STEP)
+                .is_empty(),
+            "a figure summed across pools is not this provider's latency"
+        );
+        // History was kept while unattributable, so one pool again publishes at once.
+        assert!(
+            !store
+                .record_latency("two", &counters(210.0, 1), start + STEP * 2)
+                .is_empty(),
+            "the baseline survived, so the next single-pool scrape publishes"
+        );
+    }
+
+    #[test]
+    fn a_scrape_label_is_forgotten_under_the_name_it_was_recorded_under() {
+        // The defect this pins: scrapes were counted under the routing identity and
+        // forgotten under the provider name, so a provider declaring routingClusterRef
+        // leaked its series and could collide with another provider's.
+        for (network, provider) in [("net", "qwen3-east"), ("net", "qwen3-west")] {
+            let key = key(network, provider);
+            assert_eq!(
+                provider_of(&key),
+                provider,
+                "the label both sides use comes from the key"
+            );
+        }
+        assert_eq!(
+            provider_of("no-separator"),
+            "no-separator",
+            "a keyless string is itself"
+        );
+        assert_eq!(provider_of("net/a/b"), "a/b", "only the network is stripped");
+    }
+
+    #[test]
+    fn the_drain_inference_expires_and_yields_to_an_answering_engine() {
+        let store = ReadinessStore::default();
+        let start = Instant::now();
+        // A series seen long ago is not news: a renamed label must not read as a drain forever.
+        assert_eq!(store.thawed("stale", Some(2.0), true, start), Some(2.0));
+        assert_eq!(
+            store.thawed("stale", Some(2.0), false, start + PROGRESS_WINDOW * 2),
+            Some(2.0),
+            "past the window the count stands: the series is gone, not the pool"
+        );
+        // Inside the window, an answering engine proves pods exist whatever the collector does.
+        let answering = ReadinessStore::default();
+        assert_eq!(answering.thawed("p", Some(2.0), true, start), Some(2.0));
+        answering.record_latency("p", &saturated(2.0, 100.0), start);
+        answering.record_latency("p", &saturated(2.0, 140.0), start + STEP);
+        assert_eq!(
+            answering.thawed("p", Some(2.0), false, start + STEP),
+            Some(2.0),
+            "an engine answering means the count is real, not frozen"
         );
     }
 

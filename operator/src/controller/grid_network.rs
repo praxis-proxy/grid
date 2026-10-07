@@ -519,6 +519,14 @@ fn excludes(published: &[signals::Observation]) -> bool {
 /// How long one `Ready` condition write may take before it is abandoned.
 const READY_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// One condition-write pass at a time.
+///
+/// Each pass can take a deadline per provider, so a stalled apiserver would otherwise let a
+/// pass per scrape interval pile up, each holding a clone of every provider it writes. Worse,
+/// overlapping passes have no order: an older one could apply its stale verdict after a newer
+/// one. Skipping a pass costs nothing, because the next derives every verdict again.
+static WRITE_SLOT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+
 /// Write each provider's `Ready` condition off the publication path, each under a deadline,
 /// so a stalled status PATCH (the default client has no read timeout) cannot hold every
 /// provider's signals from publishing and let them expire.
@@ -526,7 +534,13 @@ fn write_ready_conditions(client: Client, writes: Vec<(InferenceProvider, readin
     if writes.is_empty() {
         return;
     }
+    let Ok(slot) = WRITE_SLOT.try_acquire() else {
+        tracing::debug!("a Ready condition pass is still running; this one is skipped");
+        return;
+    };
     tokio::spawn(async move {
+        // Moved in, so the slot frees when the pass ends however it ends.
+        let _slot = slot;
         for (provider, verdict) in writes {
             let name = provider.metadata.name.as_deref().unwrap_or("?");
             match timeout(
