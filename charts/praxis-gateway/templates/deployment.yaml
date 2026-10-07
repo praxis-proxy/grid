@@ -3,6 +3,7 @@
 {{- include "praxis-gateway.validateConfig" . }}
 {{- include "praxis-gateway.validateMounts" . }}
 {{- include "praxis-gateway.validateProbes" . }}
+{{- include "praxis-gateway.validateMetricsListener" . }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -196,7 +197,7 @@ spec:
           {{- $userLog := false }}
           {{- range .Values.env }}{{- if eq .name "RUST_LOG" }}{{- $userLog = true }}{{- end }}{{- end }}
           {{- $rustLog := and (not $userLog) (include "praxis-gateway.rustLog" .) }}
-          {{- if or $rustLog .Values.env (.Values.gridServing).enabled $withCA }}
+          {{- if or $rustLog .Values.env (.Values.gridServing).enabled $withCA (.Values.metricsListener).enabled }}
           env:
             {{- if $rustLog }}
             - name: RUST_LOG
@@ -212,6 +213,16 @@ spec:
             {{- if $withCA }}
             - name: SSL_CERT_FILE
               value: {{ printf "%s/%s" $validateCA.mountPath $validateCA.key | quote }}
+            {{- end }}
+            {{- with .Values.metricsListener }}
+            {{- if .enabled }}
+            - name: GRID_METRICS_ADDR
+              value: {{ printf "0.0.0.0:%d" (int .port) | quote }}
+            - name: GRID_METRICS_TLS_CERT
+              value: {{ printf "%s/tls.crt" .mountPath | quote }}
+            - name: GRID_METRICS_TLS_KEY
+              value: {{ printf "%s/tls.key" .mountPath | quote }}
+            {{- end }}
             {{- end }}
           {{- end }}
           securityContext:
@@ -231,6 +242,11 @@ spec:
             - name: {{ include "praxis-gateway.portName" . }}
               containerPort: {{ .Values.port.containerPort }}
               protocol: {{ .Values.port.protocol | quote }}
+            {{- if .Values.metricsListener.enabled }}
+            - name: metrics
+              containerPort: {{ .Values.metricsListener.port }}
+              protocol: TCP
+            {{- end }}
           {{- with .Values.health.readiness }}
           readinessProbe:
             {{- /* /ready fails while any backend cluster is down. */}}
@@ -288,6 +304,11 @@ spec:
             {{- if .Values.gatewayConfig.listenerTls.enabled }}
             - name: listener-tls
               mountPath: {{ .Values.gatewayConfig.listenerTls.mountPath | quote }}
+              readOnly: true
+            {{- end }}
+            {{- if .Values.metricsListener.enabled }}
+            - name: metrics-tls
+              mountPath: {{ .Values.metricsListener.mountPath | quote }}
               readOnly: true
             {{- end }}
             {{- if $withCA }}
@@ -410,6 +431,11 @@ spec:
         - name: listener-tls
           secret:
             secretName: {{ .Values.gatewayConfig.listenerTls.existingSecret | quote }}
+        {{- end }}
+        {{- if .Values.metricsListener.enabled }}
+        - name: metrics-tls
+          secret:
+            secretName: {{ .Values.metricsListener.existingSecret | quote }}
         {{- end }}
         {{- range .Values.credentials }}
         - name: credential-{{ .name }}

@@ -316,11 +316,18 @@ opentelemetry-otlp = { version = "0.33.0", default-features = false, features = 
 praxis-ai-filters = { git = "https://github.com/praxis-proxy/ai.git", rev = "17b41771fcd53b22ab5c6f9badede0de9021404c", default-features = false, features = ["opentelemetry"] }
 ai-grid-filters = { path = "ai-grid-filters" }
 tracing = "0.1.44"
+praxis-protocol = { version = "0.7.3", package = "praxis-proxy-protocol" }
+praxis-tls = { version = "0.7.3", package = "praxis-proxy-tls" }
+tokio = { version = "1.53.1", features = ["io-util", "net", "rt", "sync", "time"] }
+tokio-rustls = { version = "0.26.5", default-features = false, features = ["logging", "tls12"] }
+httparse = "1.10.1"
 
 [dev-dependencies]
 # The reload test runs a real mTLS signals peer against the binary.
 certs = { path = "../certs", default-features = false, features = ["verifier"] }
 rustls = { version = "0.23.45", features = ["ring"] }
+serde_yaml = { version = "0.10", package = "yaml_serde" }
+tokio = { version = "1.53.1", features = ["macros"] }
 
 # machete can't see these: used as `praxis` / `praxis_core` / `praxis_filter`, not their package names.
 [package.metadata.cargo-machete]

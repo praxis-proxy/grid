@@ -608,3 +608,36 @@ RUST_LOG for the gateway and overlay-sync: log.filter when set, else log.level, 
 {{- $log := .Values.log | default dict -}}
 {{- $log.filter | default $log.level -}}
 {{- end }}
+
+{{/*
+The metrics listener needs the grid-gateway image, a cert, and the NetworkPolicy that
+limits its port; without the policy any pod could scrape it.
+*/}}
+{{- define "praxis-gateway.validateMetricsListener" -}}
+{{- $m := .Values.metricsListener }}
+{{- if $m.enabled }}
+{{- if ne .Values.image.flavor "grid-gateway" }}
+{{- fail "metricsListener needs image.flavor grid-gateway" }}
+{{- end }}
+{{- if not $m.existingSecret }}
+{{- fail "metricsListener.existingSecret is required: the listener serves TLS only" }}
+{{- end }}
+{{- if not .Values.networkPolicy.enabled }}
+{{- fail "metricsListener needs networkPolicy.enabled, which limits the metrics port to metricsListener.fromNamespaces" }}
+{{- end }}
+{{- if not $m.fromNamespaces }}
+{{- fail "metricsListener.fromNamespaces needs at least one namespace" }}
+{{- end }}
+{{- $taken := list (int .Values.port.containerPort) }}
+{{- if and .Values.overlay.enabled .Values.overlay.sidecar.enabled }}{{ $taken = append $taken 9091 }}{{ end }}
+{{- if has (int $m.port) $taken }}
+{{- fail (printf "metricsListener.port %d collides with another gateway pod port" (int $m.port)) }}
+{{- end }}
+{{- end }}
+{{- if and $m.serviceMonitor.enabled (not $m.enabled) }}
+{{- fail "metricsListener.serviceMonitor needs metricsListener.enabled" }}
+{{- end }}
+{{- if and $m.serviceMonitor.enabled (not $m.serviceMonitor.caConfigMap.name) }}
+{{- fail "metricsListener.serviceMonitor.caConfigMap.name is required to verify the metrics cert" }}
+{{- end }}
+{{- end }}

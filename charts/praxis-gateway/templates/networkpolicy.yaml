@@ -33,4 +33,15 @@ spec:
       ports:
         - port: {{ .Values.port.containerPort }}
           protocol: {{ .Values.port.protocol }}
+    {{- if .Values.metricsListener.enabled }}
+    - from:
+        - namespaceSelector:
+            matchExpressions:
+              - key: kubernetes.io/metadata.name
+                operator: In
+                values: {{ toJson .Values.metricsListener.fromNamespaces }}
+      ports:
+        - port: {{ .Values.metricsListener.port }}
+          protocol: TCP
+    {{- end }}
 {{- end }}
