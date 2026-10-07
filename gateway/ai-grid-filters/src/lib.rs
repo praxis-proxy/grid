@@ -35,7 +35,7 @@ pub use prefix::{AffinitySettings, PrefixAffinity};
 pub use serving::{
     AvailabilitySettings, GridRuntime, GridServingConfig, PeerServingConfig, load_serving_config, spawn_grid_routing,
 };
-pub use signals::{SiteReading, SiteSignals};
+pub use signals::{Over, SiteReading, SiteSignals};
 pub use snapshot::RouteSnapshot;
 
 /// The number of prefix keys `body` yields for a request to `path`, for the

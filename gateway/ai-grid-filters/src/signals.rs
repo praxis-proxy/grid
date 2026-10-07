@@ -22,14 +22,30 @@ pub struct SiteReading {
     /// The most any one serving unit of the site has waiting, so a scale-out cannot hide a
     /// backlog behind a site-wide average.
     pub deepest_queue: Option<f64>,
+    /// The most the site held at an instant when it also had a backlog (waiting at or past
+    /// `queue_full` per unit, or anything held before scheduling), worst within the window.
+    /// Absent when no instant in the window had one.
+    pub congested_in_flight: Option<f64>,
     /// Whether the site's last word on readiness was no, with nothing newer since.
     pub unready: bool,
     /// When the site's newest sample arrived, the epoch of a smoothing step.
     pub sampled_at: Option<i64>,
 }
 
+/// What a reading covers: the clock, how far back it looks, and the waiting per unit that
+/// counts as a backlog.
+#[derive(Clone, Copy, Debug)]
+pub struct Over {
+    /// Now, milliseconds.
+    pub now_ms: i64,
+    /// How far back the reading looks, milliseconds.
+    pub window_ms: i64,
+    /// Waiting work per serving unit at which an instant has a backlog.
+    pub queue_full: f64,
+}
+
 /// A source of site readings. Dispatch is static: the snapshot is generic over it.
 pub trait SiteSignals {
-    /// The site's reading over the last `window_ms` at `now_ms`.
-    fn read(&self, site: &str, cluster: &str, now_ms: i64, window_ms: i64) -> SiteReading;
+    /// The site's reading `over` the window ending now.
+    fn read(&self, site: &str, cluster: &str, over: Over) -> SiteReading;
 }

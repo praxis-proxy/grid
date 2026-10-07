@@ -1,9 +1,9 @@
 //! The raw series an llm-d EPP exposes and the grid operator relays as they are. The gateway
 //! concludes in-flight from them here; a second provider is another file beside this one.
 
-use grid_signals::LoadStore;
+use grid_signals::{Combine, LoadStore};
 
-use super::{SiteReading, SiteSignals};
+use super::{Over, SiteReading, SiteSignals};
 
 /// Requests waiting per endpoint, averaged over the pool, current EPP name first. Orders
 /// candidates: lower is a better target.
@@ -25,12 +25,26 @@ const RUNNING_METRICS: [&str; 2] = [
 /// with each running sample, and zero of them is a site that cannot serve.
 const ENDPOINT_METRICS: [&str; 2] = ["llm_d_epp_ready_endpoints", "inference_pool_ready_pods"];
 
-/// Requests the EPP's flow control holds before scheduling: in flight, and a backlog.
+/// Requests the EPP's flow control holds before scheduling: in flight, and a backlog. One
+/// series per priority and fairness partition, summed at each instant.
 const FLOW_CONTROL_QUEUE_METRIC: &str = "llm_d_epp_flow_control_queue_size";
 
-/// The engine queue per pod. Its worst pod gates teaching: a scale-out dilutes the average
-/// below `queue_full` while the old pods still hold the backlog.
-const PER_POD_QUEUE_METRIC: &str = "inference_pool_per_pod_queue_size";
+/// The engine queue per serving unit, one series per unit, the busiest kept at each
+/// instant. Its worst unit gates teaching: a scale-out dilutes the average below
+/// `queue_full` while the old units still hold the backlog. It also tells a live pool from
+/// a drained one: the EPP's pool gauges freeze at their last values once the pool has no
+/// units, while this series comes from a collector that simply stops reporting.
+const PER_UNIT_QUEUE_METRICS: [&str; 2] = ["inference_pool_per_pod_queue_size", "llm_d_epp_per_endpoint_queue_size"];
+
+/// How same-instant lines of one metric under different labels combine in the store: the
+/// flow-control hold is a count split across partitions, everything else is per unit.
+pub(crate) fn combine(metric: &str) -> Combine {
+    if metric == FLOW_CONTROL_QUEUE_METRIC {
+        Combine::Sum
+    } else {
+        Combine::Max
+    }
+}
 
 /// Lower is better for every series read here, so the worst sample is the maximum.
 const LOWER_IS_BETTER: bool = true;
@@ -58,8 +72,9 @@ pub(crate) struct Series {
     pub(crate) endpoints: &'static [&'static str],
     /// Work held before scheduling, a count for the whole site.
     pub(crate) held: &'static str,
-    /// Work waiting at each serving unit.
-    pub(crate) deepest_queue: &'static str,
+    /// Work waiting at each serving unit, first name found wins. Present only while the
+    /// site has units.
+    pub(crate) per_unit_queue: &'static [&'static str],
 }
 
 impl Series {
@@ -69,7 +84,7 @@ impl Series {
         queued: &QUEUE_METRICS,
         endpoints: &ENDPOINT_METRICS,
         held: FLOW_CONTROL_QUEUE_METRIC,
-        deepest_queue: PER_POD_QUEUE_METRIC,
+        per_unit_queue: &PER_UNIT_QUEUE_METRICS,
     };
 }
 
@@ -90,32 +105,62 @@ pub(crate) struct Mapped<'store> {
 }
 
 impl SiteSignals for Mapped<'_> {
-    fn read(&self, site: &str, cluster: &str, now_ms: i64, window_ms: i64) -> SiteReading {
+    fn read(&self, site: &str, cluster: &str, over: Over) -> SiteReading {
         let key = LoadStore::key(site, cluster);
-        let worst = |metric: &str| {
-            self.store
-                .window_worst(&key, metric, now_ms, window_ms, LOWER_IS_BETTER)
-                .and_then(plausible)
-        };
-        let first = |metrics: &[&str]| metrics.iter().find_map(|metric| worst(metric));
         let sampled_at = self.store.newest_at(&key);
-        SiteReading {
-            in_flight: self.in_flight(&key, now_ms, window_ms),
-            queued: first(self.series.queued),
-            held: worst(self.series.held),
-            deepest_queue: worst(self.series.deepest_queue),
-            unready: self.unready(&key, sampled_at),
-            sampled_at,
+        // A pool whose per-unit series stopped while its gauges kept stamping has no units:
+        // the gauges are frozen, so the site is unready and nothing it says is measured.
+        if self.drained(&key, over.window_ms) {
+            return SiteReading {
+                unready: true,
+                sampled_at,
+                ..SiteReading::default()
+            };
         }
+        self.live(&key, over, sampled_at)
     }
 }
 
 impl Mapped<'_> {
+    /// The reading of a site with units, `over` its window.
+    fn live(&self, key: &str, over: Over, sampled_at: Option<i64>) -> SiteReading {
+        let Over {
+            now_ms,
+            window_ms,
+            queue_full,
+        } = over;
+        let worst = |metric: &str| {
+            self.store
+                .window_worst(key, metric, now_ms, window_ms, LOWER_IS_BETTER)
+                .and_then(plausible)
+        };
+        let first = |metrics: &[&str]| metrics.iter().find_map(|metric| worst(metric));
+        let backlog = |queued: Option<f64>, held: Option<f64>| {
+            queued.is_some_and(|queued| queued >= queue_full) || held.is_some_and(|held| held >= 1.0)
+        };
+        SiteReading {
+            in_flight: self.in_flight(key, now_ms, window_ms, |_, _| true),
+            congested_in_flight: self.in_flight(key, now_ms, window_ms, backlog),
+            queued: first(self.series.queued),
+            held: worst(self.series.held),
+            deepest_queue: first(self.series.per_unit_queue),
+            unready: self.unready(key, sampled_at),
+            sampled_at,
+        }
+    }
+
     /// What the site holds: per-unit running plus waiting, over its ready units, plus what
     /// flow control holds in front of them. Concluded per instant from readings taken
-    /// together, then the worst instant in the window, so a unit count from one scrape never
-    /// multiplies a running count from another.
-    fn in_flight(&self, key: &str, now_ms: i64, window_ms: i64) -> Option<f64> {
+    /// together, over the instants `at` admits by their waiting and held readings, then
+    /// the worst of those in the window, so a unit count from one scrape never multiplies a
+    /// running count from another.
+    fn in_flight(
+        &self,
+        key: &str,
+        now_ms: i64,
+        window_ms: i64,
+        at: impl Fn(Option<f64>, Option<f64>) -> bool,
+    ) -> Option<f64> {
         self.store.window_worst_of(
             key,
             [
@@ -128,13 +173,28 @@ impl Mapped<'_> {
             window_ms,
             LOWER_IS_BETTER,
             |[running, queued, endpoints, held]| {
+                let queued = queued.and_then(plausible);
+                let held = held.and_then(plausible);
+                if !at(queued, held) {
+                    return None;
+                }
                 let running = plausible(running?)?;
                 let endpoints = plausible(endpoints?)?;
-                let queued = queued.and_then(plausible).unwrap_or(0.0);
-                let held = held.and_then(plausible).unwrap_or(0.0);
-                plausible((running + queued) * endpoints + held)
+                plausible((running + queued.unwrap_or(0.0)) * endpoints + held.unwrap_or(0.0))
             },
         )
+    }
+
+    /// Whether the site's per-unit series last reported more than `lag_ms` before its
+    /// ready-unit gauge did: the gauge is frozen at its last value because the pool has no
+    /// units left. One exposition stamps every line alike, so the bound only tolerates a
+    /// collector that lags by a scrape or two, not one that stopped.
+    fn drained(&self, key: &str, lag_ms: i64) -> bool {
+        let latest = |metrics: &[&str]| metrics.iter().find_map(|metric| self.store.latest(key, metric));
+        match (latest(self.series.per_unit_queue), latest(self.series.endpoints)) {
+            (Some(units), Some(ready)) => ready.at_ms.saturating_sub(units.at_ms) > lag_ms,
+            _ => false,
+        }
     }
 
     /// The first of `metrics` the site publishes at all, else the first name, so a site that
@@ -161,12 +221,12 @@ impl Mapped<'_> {
 
 /// The store read under the llm-d mapping.
 impl SiteSignals for LoadStore {
-    fn read(&self, site: &str, cluster: &str, now_ms: i64, window_ms: i64) -> SiteReading {
+    fn read(&self, site: &str, cluster: &str, over: Over) -> SiteReading {
         Mapped {
             store: self,
             series: &Series::LLM_D,
         }
-        .read(site, cluster, now_ms, window_ms)
+        .read(site, cluster, over)
     }
 }
 
@@ -176,12 +236,21 @@ mod tests {
 
     use super::*;
 
+    /// A reading over `window_ms` at `now_ms` with `queue_full` as the backlog threshold.
+    const fn over(now_ms: i64, window_ms: i64, queue_full: f64) -> Over {
+        Over {
+            now_ms,
+            window_ms,
+            queue_full,
+        }
+    }
+
     static OTHER: Series = Series {
         running: &["vendor_running"],
         queued: &["vendor_queue"],
         endpoints: &["vendor_units"],
         held: "vendor_held",
-        deepest_queue: "vendor_unit_queue",
+        per_unit_queue: &["vendor_unit_queue"],
     };
 
     /// A store holding one sample of each of `OTHER`'s series for site a.
@@ -207,18 +276,20 @@ mod tests {
             store: &store,
             series: &OTHER,
         };
-        // (10 running + 0.5 waiting) per unit, 2 units, plus 3 held: 24 in flight.
+        // (10 running + 0.5 waiting) per unit, 2 units, plus 3 held: 24 in flight, and held
+        // work makes that instant a congested one.
         let expected = SiteReading {
             in_flight: Some(24.0),
+            congested_in_flight: Some(24.0),
             queued: Some(0.5),
             held: Some(3.0),
             deepest_queue: Some(2.0),
             unready: false,
             sampled_at: Some(1_000),
         };
-        assert_eq!(mapped.read("a", "pool-a", 1_000, 30_000), expected);
+        assert_eq!(mapped.read("a", "pool-a", over(1_000, 30_000, 1.0)), expected);
         // The llm-d names see the sample stamp and nothing else.
-        let provider = store.read("a", "pool-a", 1_000, 30_000);
+        let provider = store.read("a", "pool-a", over(1_000, 30_000, 1.0));
         assert_eq!(
             provider,
             SiteReading {
@@ -237,7 +308,7 @@ mod tests {
         ] {
             store.ingest_at(line, 1_000, 1_000, "a");
         }
-        let reading = store.read("a", "pool-a", 1_000, 30_000);
+        let reading = store.read("a", "pool-a", over(1_000, 30_000, 1.0));
         assert!(reading.unready);
         assert_eq!(reading.in_flight, Some(0.0), "no unit, nothing in flight");
     }
@@ -256,9 +327,86 @@ mod tests {
                 store.ingest_at(&line, at, at, "a");
             }
         }
-        let reading = store.read("a", "pool-a", 3_000, 30_000);
+        let reading = store.read("a", "pool-a", over(3_000, 30_000, 1.0));
         assert_eq!(reading.in_flight, Some(20.0));
         assert!(reading.unready, "the latest ready count is zero");
+    }
+
+    #[test]
+    fn congestion_is_read_at_instants_that_had_a_backlog() {
+        let store = LoadStore::new(Duration::from_secs(60));
+        // At the ceiling with nothing waiting, then well below it with a queue: the site was
+        // never at its ceiling while congested, whatever each series' own worst says.
+        for (at, running, queued) in [(1_000, 100.0, 0.0), (1_500, 20.0, 5.0)] {
+            for line in [
+                format!(r#"llm_d_epp_average_running_requests{{grid_site="a",grid_provider="pool-a"}} {running} {at}"#),
+                format!(r#"llm_d_epp_average_queue_size{{grid_site="a",grid_provider="pool-a"}} {queued} {at}"#),
+                format!(r#"llm_d_epp_ready_endpoints{{grid_site="a",grid_provider="pool-a"}} 1 {at}"#),
+            ] {
+                store.ingest_at(&line, at, at, "a");
+            }
+        }
+        let reading = store.read("a", "pool-a", over(1_500, 30_000, 1.0));
+        assert_eq!(reading.in_flight, Some(100.0));
+        assert_eq!(reading.queued, Some(5.0));
+        assert_eq!(
+            reading.congested_in_flight,
+            Some(25.0),
+            "20 running plus 5 waiting, at the congested instant"
+        );
+    }
+
+    #[test]
+    fn a_pool_whose_per_unit_series_stopped_reads_as_drained() {
+        let store = LoadStore::new(Duration::from_secs(60));
+        let labels = r#"grid_site="a",grid_provider="pool-a""#;
+        store.ingest_at(
+            &format!(
+                "llm_d_epp_ready_endpoints{{{labels}}} 2 1000\nllm_d_epp_average_running_requests{{{labels}}} 10 1000\ninference_pool_per_pod_queue_size{{{labels},pod=\"p0\"}} 0 1000"
+            ),
+            1_000,
+            1_000,
+            "a",
+        );
+        assert!(
+            !store.read("a", "pool-a", over(1_000, 30_000, 1.0)).unready,
+            "units reporting"
+        );
+        // The pool scales to zero: the gauges freeze at 2 and 10 and keep stamping, the
+        // per-unit collector reports nothing more. Within the window's lag it is a collector
+        // running late, past it the pool is drained.
+        store.ingest_at(
+            &format!(
+                "llm_d_epp_ready_endpoints{{{labels}}} 2 2000\nllm_d_epp_average_running_requests{{{labels}}} 10 2000"
+            ),
+            2_000,
+            2_000,
+            "a",
+        );
+        assert!(
+            !store.read("a", "pool-a", over(2_000, 30_000, 1.0)).unready,
+            "one scrape late is not drained"
+        );
+        let reading = store.read("a", "pool-a", over(2_000, 500, 1.0));
+        assert!(reading.unready, "a frozen positive ready count is not a ready pool");
+        assert_eq!(reading.in_flight, None, "frozen gauges measure nothing");
+    }
+
+    #[test]
+    fn held_work_is_the_total_across_partitions() {
+        let store = LoadStore::with_combine(Duration::from_secs(60), combine);
+        let labels = r#"grid_site="a",grid_provider="pool-a""#;
+        store.ingest_at(
+            &format!(
+                "llm_d_epp_average_running_requests{{{labels}}} 10 1000\nllm_d_epp_ready_endpoints{{{labels}}} 1 1000\nllm_d_epp_flow_control_queue_size{{{labels},priority=\"0\"}} 0 1000\nllm_d_epp_flow_control_queue_size{{{labels},priority=\"1\"}} 4 1000\nllm_d_epp_flow_control_queue_size{{{labels},priority=\"2\"}} 3 1000"
+            ),
+            1_000,
+            1_000,
+            "a",
+        );
+        let reading = store.read("a", "pool-a", over(1_000, 30_000, 1.0));
+        assert_eq!(reading.held, Some(7.0), "a zero partition first hides nothing");
+        assert_eq!(reading.in_flight, Some(17.0));
     }
 
     #[test]
@@ -270,6 +418,6 @@ mod tests {
         ] {
             store.ingest_at(line, 1_000, 1_000, "a");
         }
-        assert_eq!(store.read("a", "pool-a", 1_000, 30_000).in_flight, None);
+        assert_eq!(store.read("a", "pool-a", over(1_000, 30_000, 1.0)).in_flight, None);
     }
 }

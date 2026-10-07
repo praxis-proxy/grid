@@ -234,7 +234,10 @@ impl Control {
         )
         .published(&mut gauged.published);
         Ok(Self {
-            store: Arc::new(LoadStore::new(Duration::from_secs(config.window_secs))),
+            store: Arc::new(LoadStore::with_combine(
+                Duration::from_secs(config.window_secs),
+                crate::signals::llm_d::combine,
+            )),
             snapshot: Arc::new(ArcSwap::from_pointee(cold_start)),
             topology: Arc::new(ArcSwap::from_pointee(topology)),
             swap: Arc::new(Mutex::new(gauged)),

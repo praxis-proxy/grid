@@ -17,7 +17,7 @@ use crate::{
     decisions::SiteDecisions,
     descriptor::{AdmissionState, CapabilityKind, RouteCandidate},
     serving::AvailabilitySettings,
-    signals::{SiteReading, SiteSignals},
+    signals::{Over, SiteReading, SiteSignals},
 };
 
 
@@ -110,27 +110,15 @@ impl RouteSnapshot {
         mut candidate: RouteCandidate,
         inputs: &mut Inputs<'_, S>,
     ) -> (f64, RouteCandidate, bool) {
-        let reading = inputs
-            .signals
-            .read(&candidate.site, &candidate.cluster, inputs.now_ms, inputs.window_ms);
+        let (reading, recent) = Self::readings(&candidate, inputs);
         if reading.unready {
             candidate.admission_state = AdmissionState::Excluded;
         }
-        // The same site over the settling time alone, always reaching its newest sample:
-        // fullness is judged from this, so one spike a window ago does not hold a site full.
-        let recent = inputs.signals.read(
-            &candidate.site,
-            &candidate.cluster,
-            inputs.now_ms,
-            Self::settle_window(&reading, inputs),
-        );
-        // The site as a whole has work waiting: its average queue at queue_full, or any work
-        // held before scheduling, which is a count and blocks admission at one. One busy unit
-        // is not a full site; it only stops a sample teaching, in measured.
-        let held = recent.held.is_some_and(|held| held >= 1.0);
-        candidate.backlog = recent
-            .queued
-            .map(|queued| queued >= inputs.availability.queue_full || held);
+        // The site as a whole had work waiting at some instant of the settling time: its
+        // average queue at queue_full, or any work held before scheduling, which is a count
+        // and blocks admission at one. One busy unit is not a full site; it only stops a
+        // sample teaching, in measured. Unknown without a queue reading.
+        candidate.backlog = recent.queued.map(|_| recent.congested_in_flight.is_some());
         // A site's own in-flight count against the ceiling it has shown. A site that publishes
         // none has no room and is chosen only when no site has any.
         let measured = Self::measured(&candidate, &reading, &recent, inputs);
@@ -149,13 +137,25 @@ impl RouteSnapshot {
         (load, candidate, measured.is_some())
     }
 
-    /// How far back fullness looks: `room_after_ms`, stretched to reach the site's newest
-    /// sample, so a site polled less often than that is still judged on what it last said.
-    fn settle_window<S: SiteSignals>(reading: &SiteReading, inputs: &Inputs<'_, S>) -> i64 {
+    /// The site over the load window, and over the settling time alone: `room_after_ms`,
+    /// stretched to reach the site's newest sample so a site polled less often than that is
+    /// still judged on what it last said. Fullness is judged from the second, so one spike a
+    /// window ago does not hold a site full.
+    fn readings<S: SiteSignals>(candidate: &RouteCandidate, inputs: &Inputs<'_, S>) -> (SiteReading, SiteReading) {
+        let over = |window_ms| Over {
+            now_ms: inputs.now_ms,
+            window_ms,
+            queue_full: inputs.availability.queue_full,
+        };
+        let reading = inputs
+            .signals
+            .read(&candidate.site, &candidate.cluster, over(inputs.window_ms));
         let newest = reading
             .sampled_at
             .map_or(0, |at| inputs.now_ms.saturating_sub(at).saturating_add(1));
-        inputs.availability.room_after_ms.max(newest)
+        let settle = inputs.availability.room_after_ms.max(newest);
+        let recent = inputs.signals.read(&candidate.site, &candidate.cluster, over(settle));
+        (reading, recent)
     }
 
     /// Lift every measured site's weight to at least `share` of the largest ceiling.
@@ -208,8 +208,9 @@ impl RouteSnapshot {
         let ceiling = ceiling(previous, reading, inputs.now_ms, availability);
         let raw = (in_flight / ceiling).clamp(0.0, 1.0);
         let rho = smoothed(previous, sample_at, raw, availability.smoothing);
-        // Congested: at the ceiling with a backlog within the settling time.
-        let congested = recent.in_flight.is_some_and(|held| held >= ceiling) && candidate.backlog == Some(true);
+        // Congested: at the ceiling at an instant within the settling time that also had a
+        // backlog, read together so a full moment and a queued moment are not crossed.
+        let congested = recent.congested_in_flight.is_some_and(|held| held >= ceiling);
         let full_since = congested_since(previous, congested, inputs.now_ms, inputs.window_ms);
         let full = candidate
             .backlog
@@ -923,6 +924,41 @@ mod tests {
                 .is_empty(),
             "below for 2.4 s is room"
         );
+    }
+
+    #[test]
+    fn a_full_moment_and_a_queued_moment_are_not_crossed_into_congestion() {
+        let store = LoadStore::new(Duration::from_secs(60));
+        let mut learned = Learned::default();
+        let availability = AvailabilitySettings {
+            smoothing: 1.0,
+            shedding: true,
+            full_after_ms: 0,
+            room_after_ms: 2_000,
+            ..AvailabilitySettings::default()
+        };
+        // Teach a ceiling of 100, then within one settling time: at the ceiling with nothing
+        // waiting, and well below it with a queue. Neither instant is congested.
+        with_in_flight(&store, "a", 100.0, 1_000);
+        with_queue(&store, "a", 0.0, 1_000);
+        RouteSnapshot::from_store(
+            one("a"),
+            Arc::from("hub"),
+            &mut at(&store, &availability, &mut learned, 1_000, 30_000),
+        );
+        with_in_flight(&store, "a", 100.0, 2_000);
+        with_queue(&store, "a", 0.0, 2_000);
+        with_in_flight(&store, "a", 20.0, 2_500);
+        with_queue(&store, "a", 5.0, 2_500);
+        let snapshot = RouteSnapshot::from_store(
+            one("a"),
+            Arc::from("hub"),
+            &mut at(&store, &availability, &mut learned, 2_500, 30_000),
+        );
+        let a = &snapshot.candidates[0];
+        assert_eq!(a.backlog, Some(true), "the newest sample has a queue");
+        assert_eq!(a.full, Some(false), "it was never at the ceiling while queued");
+        assert!(snapshot.shed(&BTreeSet::new(), &availability).shedding.is_empty());
     }
 
     fn with_series(store: &LoadStore, site: &str, metric: &str, value: f64, at_ms: i64) {

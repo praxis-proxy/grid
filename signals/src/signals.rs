@@ -63,6 +63,24 @@ const MAX_RELAY_AGE_MS: i64 = 24 * 60 * 60 * 1000;
 #[cfg(test)]
 const NO_SKEW_NOW_MS: i64 = 1_000_000;
 
+/// How two lines of one metric observed at the same instant under different labels are
+/// combined into the one value the series keeps for that instant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Combine {
+    /// The larger: right for a per-unit reading whose worst unit matters.
+    Max,
+    /// The total: right for a count split across partitions.
+    Sum,
+}
+
+/// Which combination a metric takes, by name.
+pub type CombinePolicy = fn(&str) -> Combine;
+
+/// Every metric takes the larger value, which never hides work.
+fn combine_max(_metric: &str) -> Combine {
+    Combine::Max
+}
+
 /// One observation of a series.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Sample {
@@ -77,15 +95,31 @@ pub struct Sample {
 struct Series {
     /// Samples in timestamp order.
     samples: Vec<Sample>,
+    /// The label sets already folded into the newest sample, so a republished line is
+    /// not combined twice while a line under other labels is.
+    newest_labels: Vec<u64>,
 }
 
 impl Series {
-    /// Append `sample` if it is newer than what is held, then evict past
-    /// `window`.
-    fn push(&mut self, sample: Sample, window: Duration) {
-        if self.samples.last().is_some_and(|last| sample.at_ms <= last.at_ms) {
-            return;
+    /// Append `sample` if it is newer than what is held, fold it into the newest sample
+    /// if it is another label set at the same instant, then evict past `window`.
+    fn push(&mut self, sample: Sample, labels: u64, combine: Combine, window: Duration) {
+        match self.samples.last_mut() {
+            Some(last) if sample.at_ms < last.at_ms => return,
+            Some(last) if sample.at_ms == last.at_ms => {
+                if !self.newest_labels.contains(&labels) {
+                    self.newest_labels.push(labels);
+                    last.value = match combine {
+                        Combine::Max => last.value.max(sample.value),
+                        Combine::Sum => last.value + sample.value,
+                    };
+                }
+                return;
+            },
+            _ => {},
         }
+        self.newest_labels.clear();
+        self.newest_labels.push(labels);
         self.samples.push(sample);
         // Window eviction needs the window in millis. If it does not fit i64 (a
         // caller passing an implausible Duration), skip only the window cutoff; the
@@ -134,17 +168,28 @@ pub struct LoadStore {
     admitted: AtomicUsize,
     /// Retention per series.
     window: Duration,
+    /// How same-instant lines of one metric under different labels combine.
+    combine: CombinePolicy,
 }
 
 impl LoadStore {
-    /// Create an empty store retaining `window` of history per series.
+    /// Create an empty store retaining `window` of history per series, combining
+    /// same-instant lines of a metric by their larger value.
     #[must_use]
     pub fn new(window: Duration) -> Self {
+        Self::with_combine(window, combine_max)
+    }
+
+    /// Create an empty store retaining `window` of history per series, combining
+    /// same-instant lines of each metric as `combine` says.
+    #[must_use]
+    pub fn with_combine(window: Duration, combine: CombinePolicy) -> Self {
         Self {
             providers: DashMap::new(),
             owner_providers: DashMap::new(),
             admitted: AtomicUsize::new(0),
             window,
+            combine,
         }
     }
 
@@ -325,15 +370,18 @@ impl LoadStore {
             observation.sample.at_ms = rebase_age(reference_ms, observation.sample.at_ms, local_now_ms);
 
             let key = Self::key(owner, observation.cluster.as_ref());
+            let combine = (self.combine)(observation.metric);
             match self.providers.entry(key) {
-                Entry::Occupied(mut occupied) => push_observation(occupied.get_mut(), &observation, self.window),
+                Entry::Occupied(mut occupied) => {
+                    push_observation(occupied.get_mut(), &observation, combine, self.window);
+                },
                 Entry::Vacant(vacant) => {
                     // A new key: admit it against both caps while its shard is
                     // locked, so the check and the insert cannot race a
                     // concurrent poller into overshooting a cap.
                     if self.admit_new_provider(owner) {
                         let mut provider = Provider::default();
-                        push_observation(&mut provider, &observation, self.window);
+                        push_observation(&mut provider, &observation, combine, self.window);
                         vacant.insert(provider);
                     }
                 },
@@ -372,15 +420,16 @@ impl LoadStore {
 /// names it holds. A known metric neither re-hashes nor allocates. A new metric
 /// owns its name only if it fits under the per-provider cap, which bounds a peer
 /// flooding unique names.
-fn push_observation(provider: &mut Provider, observation: &Observation<'_>, window: Duration) {
+fn push_observation(provider: &mut Provider, observation: &Observation<'_>, combine: Combine, window: Duration) {
     if let Some(series) = provider.metrics.get_mut(observation.metric) {
-        series.push(observation.sample, window);
+        series.push(observation.sample, observation.labels, combine, window);
     } else if provider.metrics.len() < MAX_METRICS_PER_PROVIDER {
-        provider
-            .metrics
-            .entry(observation.metric.into())
-            .or_default()
-            .push(observation.sample, window);
+        provider.metrics.entry(observation.metric.into()).or_default().push(
+            observation.sample,
+            observation.labels,
+            combine,
+            window,
+        );
     }
 }
 
@@ -411,6 +460,8 @@ struct Observation<'text> {
     site: Option<Cow<'text, str>>,
     /// Owning provider, from the `grid_provider` label.
     cluster: Cow<'text, str>,
+    /// A hash of every label on the line, naming the series within the metric.
+    labels: u64,
     /// The sample this line reported.
     sample: Sample,
 }
@@ -431,10 +482,15 @@ fn parse_sample(line: &str) -> Option<Observation<'_>> {
         return None;
     }
     let (site, cluster) = target_labels(&metric)?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for (name, value) in metric.labels() {
+        std::hash::Hash::hash(&(name, value.as_ref()), &mut hasher);
+    }
     Some(Observation {
         metric: metric.name(),
         site,
         cluster,
+        labels: std::hash::Hasher::finish(&hasher),
         sample: Sample {
             at_ms,
             value: metric.value(),
@@ -534,6 +590,47 @@ mod tests {
             },
             "value and time as reported"
         );
+    }
+
+    /// The hold sums across its partitions, everything else keeps the larger value.
+    fn total(metric: &str) -> Combine {
+        if metric == "held" { Combine::Sum } else { Combine::Max }
+    }
+
+    #[test]
+    fn same_instant_lines_under_other_labels_combine_and_a_republished_line_does_not() {
+        // Two flow-control partitions at one instant: the default keeps the larger, a
+        // sum policy keeps the total, and polling the same exposition again changes nothing.
+        let lines = concat!(
+            "held{grid_site=\"a\",grid_provider=\"p\",priority=\"0\"} 0 1000\n",
+            "held{grid_site=\"a\",grid_provider=\"p\",priority=\"1\"} 5 1000\n",
+            "held{grid_site=\"a\",grid_provider=\"p\",priority=\"2\"} 2 1000\n"
+        );
+        let key = LoadStore::key("a", "p");
+        let max = LoadStore::new(Duration::from_secs(60));
+        max.ingest_at(lines, 1_000, 1_000, "a");
+        max.ingest_at(lines, 1_000, 1_000, "a");
+        assert_eq!(
+            max.latest(&key, "held").map(|sample| sample.value),
+            Some(5.0),
+            "a zero partition hides nothing"
+        );
+        let sum = LoadStore::with_combine(Duration::from_secs(60), total);
+        sum.ingest_at(lines, 1_000, 1_000, "a");
+        sum.ingest_at(lines, 1_000, 1_000, "a");
+        assert_eq!(
+            sum.latest(&key, "held").map(|sample| sample.value),
+            Some(7.0),
+            "the total, once"
+        );
+        // The next instant starts over.
+        sum.ingest_at(
+            "held{grid_site=\"a\",grid_provider=\"p\",priority=\"1\"} 1 2000",
+            2_000,
+            2_000,
+            "a",
+        );
+        assert_eq!(sum.latest(&key, "held").map(|sample| sample.value), Some(1.0));
     }
 
     #[test]
