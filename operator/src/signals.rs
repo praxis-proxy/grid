@@ -1252,7 +1252,7 @@ fn with_query(url: &str, query: &str) -> Option<String> {
 /// Names a hub keeps from a peer: the cross-site contract, plus the EPP pool averages and
 /// ready counts the gateway routes on until it routes on saturation. A peer's custom
 /// `signalNames` are dropped here.
-const PEER_SIGNAL_NAMES: [&str; 14] = [
+const PEER_SIGNAL_NAMES: [&str; 18] = [
     crate::readiness::READY_SIGNAL,
     crate::readiness::READY_ENDPOINTS_SIGNAL,
     crate::readiness::IN_FLIGHT_SIGNAL,
@@ -1267,6 +1267,12 @@ const PEER_SIGNAL_NAMES: [&str; 14] = [
     "inference_pool_average_kv_cache_utilization",
     "llm_d_epp_average_kv_cache_utilization",
     "llm_d_epp_ready_endpoints",
+    "inference_pool_ready_pods",
+    // What a gateway reads as a backlog beside the averages, and the per-unit series whose
+    // disappearance tells a drained pool from one whose gauges froze.
+    "llm_d_epp_flow_control_queue_size",
+    "inference_pool_per_pod_queue_size",
+    "llm_d_epp_per_endpoint_queue_size",
 ];
 
 /// Most providers a hub keeps from one peer, so a peer cannot grow the hub's series without
