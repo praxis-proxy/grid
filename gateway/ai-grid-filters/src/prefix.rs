@@ -10,7 +10,7 @@ mod index;
 use std::{io, sync::Arc};
 
 pub use affinity::AffinitySettings;
-pub(crate) use affinity::{Affinity, QueueGate, Site};
+pub(crate) use affinity::{Affinity, QueueGate, Queued};
 use arc_swap::{ArcSwap, ArcSwapOption};
 pub(crate) use canon::Responses;
 pub(crate) use index::PrefixIndex;

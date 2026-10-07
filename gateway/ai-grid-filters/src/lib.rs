@@ -6,28 +6,36 @@
 //! contribution is ordering the candidates by live load off the request path.
 
 mod control;
+mod decisions;
 mod descriptor;
 #[cfg(test)]
 mod flow;
+mod health;
 mod metadata;
 mod pin;
 mod prefix;
 mod route;
 mod serving;
+mod signals;
 mod snapshot;
 
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-pub use control::ReloadOutcome;
+pub use control::{ReloadOutcome, Tuning};
+pub use decisions::SiteDecisions;
 // The routing model and the snapshot builder are the crate's control-plane API:
 // the gateway's refresh step orders candidates by live load and swaps the
 // snapshot. The request path only reads a snapshot.
 pub use descriptor::{AdmissionState, CandidateConfig, CapabilityKind, RouteCandidate};
+pub use health::ClusterHealth;
 pub use metadata::{CandidateCredential, CredentialRef};
 use praxis_filter::{FilterError, FilterFactory, FilterRegistry, HttpFilter};
 pub use prefix::{AffinitySettings, PrefixAffinity};
-pub use serving::{GridRuntime, GridServingConfig, PeerServingConfig, load_serving_config, spawn_grid_routing};
+pub use serving::{
+    AvailabilitySettings, GridRuntime, GridServingConfig, PeerServingConfig, load_serving_config, spawn_grid_routing,
+};
+pub use signals::{SiteReading, SiteSignals};
 pub use snapshot::RouteSnapshot;
 
 /// The number of prefix keys `body` yields for a request to `path`, for the
@@ -44,9 +52,10 @@ pub fn prefix_key_count(path: &str, body: &[u8]) -> usize {
 /// owns and its refresh loop swaps.
 ///
 /// Call this from the gateway after `FilterRegistry::with_builtins()`, passing
-/// the snapshot from [`spawn_grid_routing`]. The factory captures the snapshot,
-/// so every filter praxis rebuilds on a config reload clones the same `Arc` and
-/// sees the live swaps.
+/// the snapshot, cluster health, and tuning from [`spawn_grid_routing`]. The factory captures
+/// the snapshot, so every filter praxis rebuilds on a config reload clones the same `Arc` and
+/// sees the live swaps. Each build sets the filter block's `availability` and `prefix_affinity` into
+/// `tuning`, which the control step reads.
 ///
 /// # Errors
 ///
@@ -55,9 +64,17 @@ pub fn register_grid_filters(
     registry: &mut FilterRegistry,
     snapshot: Arc<ArcSwap<RouteSnapshot>>,
     affinity: Arc<PrefixAffinity>,
+    health: Arc<ClusterHealth>,
+    tuning: Arc<Tuning>,
 ) -> Result<(), FilterError> {
     let factory = move |config: &serde_yaml::Value| -> Result<Box<dyn HttpFilter>, FilterError> {
-        route::GridSiteRouteFilter::from_config(config, Arc::clone(&snapshot), Arc::clone(&affinity))
+        route::GridSiteRouteFilter::from_config(
+            config,
+            Arc::clone(&snapshot),
+            Arc::clone(&affinity),
+            Arc::clone(&health),
+            &tuning,
+        )
     };
     registry.register("grid_site_route", FilterFactory::Http(Arc::new(factory)))
 }
