@@ -245,13 +245,16 @@ pub struct Verdict {
     pub message: String,
 }
 
-/// The latest scrape per provider, keyed by network and routing identity.
+/// The latest scrape per provider, keyed by network and provider name.
 #[derive(Debug, Default)]
 pub struct ReadinessStore(Mutex<HashMap<String, Probe>>);
 
-/// The store key for `identity` in `network`: identities are unique per network only.
-pub(crate) fn key(network: &str, identity: &str) -> String {
-    format!("{network}/{identity}")
+/// The store key for the provider named `provider` in `network`: names are unique per
+/// network only. Keyed by provider, not routing identity, so two providers sharing a
+/// cluster keep their own history and one reporting zero endpoints is not cleared by the
+/// other.
+pub(crate) fn key(network: &str, provider: &str) -> String {
+    format!("{network}/{provider}")
 }
 
 impl ReadinessStore {
@@ -286,11 +289,12 @@ impl ReadinessStore {
         let attributable = !serves_several_pools(observations);
         let mut probes = self.probes();
         let probe = probes.entry(key.to_owned()).or_default();
+        // Progress is only as recent as the scrape it is measured from: a delta against a
+        // baseline older than the window says nothing about the last 30 s.
         if attributable
-            && probe
-                .latency
-                .latest()
-                .is_some_and(|earlier| snapshot.produced_since(earlier))
+            && probe.latency.latest().is_some_and(|(at, earlier)| {
+                now.saturating_duration_since(at) <= PROGRESS_WINDOW && snapshot.produced_since(earlier)
+            })
         {
             probe.last_progress = Some(now);
         }
@@ -814,6 +818,26 @@ mod tests {
             scrape_at(&store, &saturated(0.0, 140.0), start + STEP * 9),
             Some(Reason::Ready),
             "answering readmits it even though the endpoint count never came back"
+        );
+    }
+
+    #[test]
+    fn progress_measured_against_a_stale_baseline_does_not_readmit() {
+        let store = ReadinessStore::default();
+        let start = Instant::now();
+        scrape_at(&store, &saturated(2.0, 100.0), start);
+        // Eight zero scrapes with no answers: excluded.
+        for n in 1..=8_u32 {
+            scrape_at(&store, &saturated(0.0, 100.0), start + STEP * n);
+        }
+        assert_eq!(reason(&store, start + STEP * 8), Some(Reason::NoEndpointsReady));
+        // A 70 s gap, then a scrape whose counters rose since the last one. The rise is
+        // measured from a baseline older than the window, so it is not recent progress.
+        let late = start + STEP * 8 + Duration::from_secs(70);
+        assert_eq!(
+            scrape_at(&store, &saturated(0.0, 140.0), late),
+            Some(Reason::NoEndpointsReady),
+            "a delta from before the window is not an answer in the window"
         );
     }
 

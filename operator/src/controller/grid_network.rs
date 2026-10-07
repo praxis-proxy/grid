@@ -450,13 +450,13 @@ pub async fn refresh_signals(ctx: &OperatorCtx, client: &Client, network_name: &
         &ctx.readiness,
     ))
     .await;
-    let collected = Box::pin(resolve_readiness(ctx, client, &providers, network_name)).await;
+    let collected = resolve_readiness(ctx, client, &providers, network_name);
     publish_signals(ctx, collected);
     Ok(())
 }
 
 /// Resolve each provider's readiness, write its `Ready` condition, and return what to publish.
-async fn resolve_readiness(
+fn resolve_readiness(
     ctx: &OperatorCtx,
     client: &Client,
     providers: &[InferenceProvider],
@@ -465,26 +465,82 @@ async fn resolve_readiness(
     ctx.readiness.retain(
         &providers
             .iter()
+            .filter(|p| provider_metrics::signal_scrape_plan(p).is_some())
             .filter_map(|p| {
-                provider_metrics::signal_scrape_plan(p)
-                    .map(|plan| readiness::key(&p.spec.grid_network_ref, plan.identity))
+                p.metadata
+                    .name
+                    .as_deref()
+                    .map(|name| readiness::key(&p.spec.grid_network_ref, name))
             })
             .collect(),
     );
     let now = Instant::now();
-    let mut collected = HashMap::new();
+    let mut collected: HashMap<String, Vec<signals::Observation>> = HashMap::new();
+    let mut writes = Vec::new();
     for provider in providers.iter().filter(|p| p.spec.grid_network_ref == network_name) {
         let Some(entry) = readiness_entry(ctx, provider, now) else {
             continue;
         };
-        if let Err(error) = Box::pin(apply_ready_condition(client, provider, &entry.verdict)).await {
-            tracing::warn!(provider = entry.identity, %error, "provider Ready condition not written");
-        }
+        writes.push((provider.clone(), entry.verdict));
         if let Some(published) = entry.published {
-            collected.insert(entry.identity.to_owned(), published);
+            publish_strictest(&mut collected, entry.identity, published);
         }
     }
+    write_ready_conditions(client.clone(), writes);
     collected
+}
+
+/// Keep one entry per routing identity: the stricter verdict wins, so one provider
+/// reporting no endpoints is not hidden by another's ready behind the same cluster.
+fn publish_strictest(
+    collected: &mut HashMap<String, Vec<signals::Observation>>,
+    identity: &str,
+    published: Vec<signals::Observation>,
+) {
+    match collected.entry(identity.to_owned()) {
+        std::collections::hash_map::Entry::Vacant(slot) => {
+            slot.insert(published);
+        },
+        std::collections::hash_map::Entry::Occupied(mut slot) => {
+            if excludes(&published) && !excludes(slot.get()) {
+                slot.insert(published);
+            }
+        },
+    }
+}
+
+/// Whether a published entry carries a not-ready verdict.
+fn excludes(published: &[signals::Observation]) -> bool {
+    published
+        .iter()
+        .any(|o| o.metric == readiness::READY_SIGNAL && o.value < 1.0)
+}
+
+/// How long one `Ready` condition write may take before it is abandoned.
+const READY_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Write each provider's `Ready` condition off the publication path, each under a deadline,
+/// so a stalled status PATCH (the default client has no read timeout) cannot hold every
+/// provider's signals from publishing and let them expire.
+fn write_ready_conditions(client: Client, writes: Vec<(InferenceProvider, readiness::Verdict)>) {
+    if writes.is_empty() {
+        return;
+    }
+    tokio::spawn(async move {
+        for (provider, verdict) in writes {
+            let name = provider.metadata.name.as_deref().unwrap_or("?");
+            match timeout(
+                READY_WRITE_TIMEOUT,
+                Box::pin(apply_ready_condition(&client, &provider, &verdict)),
+            )
+            .await
+            {
+                Ok(Ok(())) => {},
+                Ok(Err(error)) => tracing::warn!(provider = name, %error, "provider Ready condition not written"),
+                Err(_elapsed) => tracing::warn!(provider = name, "provider Ready condition write timed out"),
+            }
+        }
+    });
 }
 
 /// One provider's readiness and the signals to publish for it.
@@ -507,7 +563,7 @@ fn readiness_entry<'provider>(
     now: Instant,
 ) -> Option<ReadinessEntry<'provider>> {
     let identity = routing_overlay::routing_identity(provider)?;
-    let key = readiness::key(&provider.spec.grid_network_ref, identity);
+    let key = readiness::key(&provider.spec.grid_network_ref, provider.metadata.name.as_deref()?);
     if provider_metrics::signal_scrape_plan(provider).is_none() {
         return Some(ReadinessEntry {
             identity,
@@ -587,13 +643,13 @@ pub(crate) fn provider_readiness(
     provider: &InferenceProvider,
     now: Instant,
 ) -> Option<readiness::Verdict> {
-    let plan = provider_metrics::signal_scrape_plan(provider)?;
+    provider_metrics::signal_scrape_plan(provider)?;
     let unavailable = provider
         .status
         .as_ref()
         .is_some_and(|status| status.phase == crate::crd::inference_provider::ProviderPhase::Unavailable);
     ctx.readiness.verdict(
-        &readiness::key(&provider.spec.grid_network_ref, plan.identity),
+        &readiness::key(&provider.spec.grid_network_ref, provider.metadata.name.as_deref()?),
         unavailable,
         readiness_stale_after(ctx, provider),
         now,
@@ -1383,6 +1439,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
         &scoring_weights,
         &admission_states,
         serving.as_ref(),
+        ctx.site_name(),
     )
     .await?;
 
@@ -1995,6 +2052,7 @@ async fn reconcile_routing_overlay_inner(
     scoring_weights: &scoring::ScoringWeights,
     admission_states: &HashMap<String, crate::resources::geography::AdmissionState>,
     serving: Option<&ServingSource<'_>>,
+    owning_site: Option<&str>,
 ) -> Result<OverlayOutcome, OperatorError> {
     let network_name = grid_network_name(network)?;
 
@@ -2050,6 +2108,7 @@ async fn reconcile_routing_overlay_inner(
             tool_providers,
             &eligible_remote_owned,
             local_site,
+            owning_site,
             metrics_arg,
             timestamp.as_deref(),
             scoring_weights,

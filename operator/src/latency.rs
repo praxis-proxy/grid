@@ -151,17 +151,22 @@ impl Snapshot {
         })
     }
 
-    /// Each TTFT bucket's count less `earlier`'s, `None` when one went backwards.
+    /// Each TTFT bucket's count less `earlier`'s, `None` when one went backwards. Both bucket
+    /// lists are in bound order, so this is one merge pass; a bound `earlier` lacks counts
+    /// from zero.
     fn bucket_deltas(&self, earlier: &Self) -> Option<Vec<(f64, f64)>> {
+        let mut then = earlier.ttft_buckets.iter().peekable();
         self.ttft_buckets
             .iter()
             .map(|(bound, count)| {
-                let then = earlier
-                    .ttft_buckets
-                    .iter()
-                    .find(|(b, _)| b.to_bits() == bound.to_bits())
+                while then.peek().is_some_and(|(b, _)| b.to_bits() < bound.to_bits()) {
+                    then.next();
+                }
+                let before = then
+                    .peek()
+                    .filter(|(b, _)| b.to_bits() == bound.to_bits())
                     .map_or(0.0, |(_, earlier_count)| *earlier_count);
-                (*count >= then).then_some((*bound, count - then))
+                (*count >= before).then_some((*bound, count - before))
             })
             .collect()
     }
@@ -195,13 +200,25 @@ pub(crate) struct History {
 }
 
 impl History {
-    /// The latest recorded scrape.
-    pub(crate) fn latest(&self) -> Option<&Snapshot> {
-        self.snapshots.back().map(|(_, snapshot)| snapshot)
+    /// The latest recorded scrape and when it was taken.
+    pub(crate) fn latest(&self) -> Option<(Instant, &Snapshot)> {
+        self.snapshots.back().map(|(at, snapshot)| (*at, snapshot))
     }
 
     /// Record this scrape and return the latency series to publish for it.
+    ///
+    /// A counter that went backwards since the last scrape is a restart: history starts over
+    /// from this scrape and it publishes nothing, so no window straddles the reset.
     pub(crate) fn record(&mut self, snapshot: Snapshot, now: Instant) -> Vec<Observation> {
+        if self
+            .snapshots
+            .back()
+            .is_some_and(|(_, last)| snapshot.since(last).is_none())
+        {
+            self.snapshots.clear();
+            self.snapshots.push_back((now, snapshot));
+            return Vec::new();
+        }
         while self
             .snapshots
             .get(1)
@@ -214,14 +231,6 @@ impl History {
             .front()
             .and_then(|(_, oldest)| snapshot.since(oldest))
             .map_or_else(Vec::new, |window| window.observations());
-        if self
-            .snapshots
-            .back()
-            .is_some_and(|(_, last)| snapshot.since(last).is_none())
-        {
-            // A counter reset: start over from this scrape.
-            self.snapshots.clear();
-        }
         self.snapshots.push_back((now, snapshot));
         published
     }
@@ -363,6 +372,42 @@ mod tests {
         let after =
             history.record_observations(&scrape(100.0, 0.3, 0.02, 1000.0, 0.0), start + Duration::from_secs(10));
         assert!(value(&after, TPOT_SIGNAL).is_some(), "the window restarts at the reset");
+    }
+
+    #[test]
+    fn a_reset_below_the_oldest_snapshot_still_publishes_nothing() {
+        // 10, 100, then 50: the delta against the oldest snapshot is positive, but the counter
+        // went backwards since the last one, so the scrape straddles a restart.
+        let mut history = History::default();
+        let start = Instant::now();
+        history.record_observations(&scrape(10.0, 0.3, 0.02, 1000.0, 0.0), start);
+        history.record_observations(&scrape(100.0, 0.3, 0.02, 1000.0, 0.0), start + Duration::from_secs(5));
+        let reset = history.record_observations(&scrape(50.0, 0.3, 0.02, 1000.0, 0.0), start + Duration::from_secs(10));
+        assert!(reset.is_empty(), "nothing crosses the restart: {reset:?}");
+        let after =
+            history.record_observations(&scrape(100.0, 0.3, 0.02, 1000.0, 0.0), start + Duration::from_secs(15));
+        assert!(value(&after, TPOT_SIGNAL).is_some(), "the window restarts at the reset");
+    }
+
+    #[test]
+    fn bucket_deltas_merge_in_bound_order_and_a_new_bound_counts_from_zero() {
+        let earlier = Snapshot {
+            ttft_buckets: vec![(0.1, 1.0), (0.4, 3.0), (f64::INFINITY, 3.0)],
+            ..Snapshot::default()
+        };
+        let later = Snapshot {
+            ttft_buckets: vec![(0.1, 2.0), (0.2, 2.0), (0.4, 5.0), (f64::INFINITY, 6.0)],
+            ..Snapshot::default()
+        };
+        assert_eq!(
+            later.bucket_deltas(&earlier),
+            Some(vec![(0.1, 1.0), (0.2, 2.0), (0.4, 2.0), (f64::INFINITY, 3.0)])
+        );
+        let backwards = Snapshot {
+            ttft_buckets: vec![(0.1, 0.0), (0.4, 3.0), (f64::INFINITY, 3.0)],
+            ..Snapshot::default()
+        };
+        assert_eq!(backwards.bucket_deltas(&earlier), None);
     }
 
     #[test]

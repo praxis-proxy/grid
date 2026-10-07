@@ -808,6 +808,7 @@ pub(crate) fn evaluate_access_policy(
 /// | `Known(names)` | Selector matched these sites | Emit one candidate per `(model, site)` |
 ///
 /// [`GridSite`]: crate::crd::grid_site::GridSite
+#[derive(Debug, PartialEq, Eq)]
 enum SiteResolution {
     /// No [`GridSite`] CRDs were supplied to the renderer for this network.
     ///
@@ -1185,7 +1186,8 @@ fn assign_selection_groups(candidates: &mut [RoutingCandidate], policy: crate::c
 /// Only [`InferenceProvider`]s whose `spec.gridNetworkRef` matches
 /// `network.metadata.name` are included.  Each provider's
 /// `spec.siteSelector.matchLabels` is matched against the supplied
-/// `sites`; an empty selector means `local_site` alone.
+/// `sites`; an empty selector means `owning_site` alone, the site whose operator holds the
+/// provider, or `local_site` when the caller names none.
 ///
 /// The `local_site` parameter identifies this gateway's own site.
 /// Praxis uses it to score candidates running on the local site higher
@@ -1278,6 +1280,7 @@ pub fn render_routing_overlay(
         tool_providers,
         remote_crdt_providers,
         local_site,
+        None,
         metrics,
         generated_at,
         weights,
@@ -1360,6 +1363,7 @@ pub fn render_routing_overlay_with_admission(
     tool_providers: &[AgentToolProvider],
     remote_crdt_providers: &[crdt::ProviderState],
     local_site: &str,
+    owning_site: Option<&str>,
     metrics: Option<&HashMap<&str, scoring::BackendMetrics>>,
     generated_at: Option<&str>,
     weights: &scoring::ScoringWeights,
@@ -1394,7 +1398,13 @@ pub fn render_routing_overlay_with_admission(
         .find(|site| site.metadata.name.as_deref() == Some(local_site) && site.spec.grid_network_ref == network_name)
         .and_then(|site| site.metadata.labels.as_ref());
 
-    let mut candidates = collect_candidates(network_name, sites, providers, consumer_site_labels, local_site)?;
+    let mut candidates = collect_candidates(
+        network_name,
+        sites,
+        providers,
+        consumer_site_labels,
+        owning_site.unwrap_or(local_site),
+    )?;
     candidates.extend(collect_tool_candidates(
         network_name,
         sites,
@@ -1588,7 +1598,7 @@ fn collect_candidates(
     sites: &[GridSite],
     providers: &[InferenceProvider],
     consumer_site_labels: Option<&BTreeMap<String, String>>,
-    local_site: &str,
+    owning_site: &str,
 ) -> Result<Vec<RoutingCandidate>, String> {
     // Pre-filter sites to those in this network.
     let network_sites: Vec<&GridSite> = sites
@@ -1610,7 +1620,7 @@ fn collect_candidates(
             continue;
         }
 
-        let resolution = resolve_sites(provider, &network_sites, local_site);
+        let resolution = resolve_sites(provider, &network_sites, owning_site);
         all.extend(candidates_from_provider(provider, &resolution)?);
     }
     Ok(all)
@@ -1676,10 +1686,11 @@ fn collect_tool_candidates(
 /// [`SiteResolution::Known`] otherwise — with an empty `Vec` if the
 /// selector matched nothing, which suppresses candidate generation.
 ///
-/// An empty selector means this site alone, when the inventory lists it, as the
-/// provider controller attributes it. Sites are keyed as peers are, so a
-/// discovered peer reads as its site id, not its object name.
-fn resolve_sites(provider: &InferenceProvider, network_sites: &[&GridSite], local_site: &str) -> SiteResolution {
+/// An empty selector means the site that owns the provider alone, when the inventory
+/// lists it, as the provider controller attributes it. That is the operator's own site,
+/// not the site of the gateway the overlay is rendered for, which may differ. Sites are
+/// keyed as peers are, so a discovered peer reads as its site id, not its object name.
+fn resolve_sites(provider: &InferenceProvider, network_sites: &[&GridSite], owning_site: &str) -> SiteResolution {
     if network_sites.is_empty() {
         return SiteResolution::Unavailable;
     }
@@ -1687,9 +1698,9 @@ fn resolve_sites(provider: &InferenceProvider, network_sites: &[&GridSite], loca
     let selector = &provider.spec.site_selector.match_labels;
     let key = |site: &&GridSite| peer_site_key(site).map(|(key, _)| key);
     if selector.is_empty() {
-        let listed = network_sites.iter().filter_map(key).any(|site| site == local_site);
+        let listed = network_sites.iter().filter_map(key).any(|site| site == owning_site);
         return SiteResolution::Known(if listed {
-            vec![local_site.to_owned()]
+            vec![owning_site.to_owned()]
         } else {
             Vec::new()
         });
@@ -2371,6 +2382,24 @@ mod tests {
             );
             assert!(result.is_err(), "invalid capacity {invalid} must fail closed");
         }
+    }
+
+    #[test]
+    fn an_empty_selector_resolves_to_the_owning_site_not_the_gateway_site() {
+        let sites = [test_site("site-a", "net"), test_site("site-b", "net")];
+        let network_sites: Vec<&GridSite> = sites.iter().collect();
+        let provider = test_provider("p", "net", &["m"]);
+        // The operator at site-a owns the provider; the overlay is rendered for a gateway
+        // at site-b, and the candidate must still live at site-a.
+        assert_eq!(
+            resolve_sites(&provider, &network_sites, "site-a"),
+            SiteResolution::Known(vec!["site-a".to_owned()])
+        );
+        assert_eq!(
+            resolve_sites(&provider, &network_sites, "site-c"),
+            SiteResolution::Known(Vec::new()),
+            "an owning site the inventory does not list yields no candidate"
+        );
     }
 
     fn test_provider_with_selector(

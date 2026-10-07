@@ -1289,6 +1289,18 @@ fn plausible(observation: &Observation) -> bool {
         && (observation.value <= 1.0 || !UNIT_SIGNALS.contains(&observation.metric.as_str()))
 }
 
+/// Most bytes in a `grid_provider` label a hub keeps, as a routing cluster name is bounded.
+const MAX_PROVIDER_LABEL_LEN: usize = 253;
+
+/// Whether `provider` names a routing cluster a hub can key on: non-blank, bounded, and free
+/// of the store's `/` separator and control characters. Cluster names such as `pool.v1` are
+/// valid, so this is wider than a site name.
+fn valid_provider(provider: &str) -> bool {
+    !provider.trim().is_empty()
+        && provider.len() <= MAX_PROVIDER_LABEL_LEN
+        && !provider.chars().any(|ch| ch.is_control() || ch == '/')
+}
+
 /// Why a hub refuses `observation` from a peer, `None` when it accepts it.
 fn refusal(observation: &Observation) -> Option<&'static str> {
     if !PEER_SIGNAL_NAMES.contains(&observation.metric.as_str()) {
@@ -1296,7 +1308,7 @@ fn refusal(observation: &Observation) -> Option<&'static str> {
     } else if observation
         .labels
         .get(PROVIDER_LABEL)
-        .is_none_or(|provider| certs::validate_site_name(provider).is_err())
+        .is_none_or(|provider| !valid_provider(provider))
     {
         Some("provider")
     } else if !plausible(observation) {
@@ -1306,9 +1318,9 @@ fn refusal(observation: &Observation) -> Option<&'static str> {
     }
 }
 
-/// Keep what a hub accepts from `peer`: an allowed name, a `grid_provider` that is a DNS-1123
-/// label, a plausible value, and at most [`MAX_PEER_PROVIDERS`] providers. Each refusal is
-/// counted by reason.
+/// Keep what a hub accepts from `peer`: an allowed name, a `grid_provider` that names a
+/// routing cluster, a plausible value, and at most [`MAX_PEER_PROVIDERS`] providers. Each
+/// refusal is counted by reason.
 fn bound_peer(observations: Vec<Observation>, peer: &str) -> Vec<Observation> {
     let mut kept = Vec::with_capacity(observations.len());
     for observation in observations {
@@ -1436,8 +1448,18 @@ mod tests {
             ),
             ("custom name", peer_sample("my_custom_queue", "pool", 3.0), false),
             (
-                "provider not a label",
-                peer_sample(crate::readiness::READY_SIGNAL, "Pool_1", 1.0),
+                "provider with a dot, a valid cluster name",
+                peer_sample(crate::readiness::IN_FLIGHT_SIGNAL, "pool.v1", 3.0),
+                true,
+            ),
+            (
+                "provider with the store separator",
+                peer_sample(crate::readiness::IN_FLIGHT_SIGNAL, "pool/v1", 3.0),
+                false,
+            ),
+            (
+                "blank provider",
+                peer_sample(crate::readiness::IN_FLIGHT_SIGNAL, "  ", 3.0),
                 false,
             ),
             (

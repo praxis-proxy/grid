@@ -107,7 +107,8 @@ pub(crate) fn derive_locality_tier(
     }
 }
 
-/// Look up region and zone for a named site in a network.
+/// Look up region and zone for a site in a network, keyed as candidates and peers name it:
+/// a discovered site by its site id, not its object name.
 fn resolve_site_geography<'site>(
     site_name: &str,
     sites: &'site [GridSite],
@@ -115,7 +116,8 @@ fn resolve_site_geography<'site>(
 ) -> (Option<&'site str>, Option<&'site str>) {
     sites
         .iter()
-        .find(|s| s.metadata.name.as_deref() == Some(site_name) && s.spec.grid_network_ref == network_name)
+        .filter(|s| s.spec.grid_network_ref == network_name)
+        .find(|s| crate::controller::grid_network::peer_site_key(s).is_some_and(|(key, _)| key == site_name))
         .map_or((None, None), |s| (s.spec.region.as_deref(), s.spec.zone.as_deref()))
 }
 
@@ -180,6 +182,34 @@ mod tests {
     // -----------------------------------------------------------------------
     // Test utilities
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_discovered_site_is_found_by_its_site_id() {
+        let mut site = test_site_with_geography("grid-retail", "net", Some("us-east"), Some("a"));
+        site.metadata.labels = Some(
+            [(
+                crate::controller::grid_network::LABEL_AUTO_DISCOVERED.to_owned(),
+                "true".to_owned(),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        site.metadata.annotations = Some(
+            [(
+                crate::controller::grid_network::ANNOTATION_SITE_ID.to_owned(),
+                "retail".to_owned(),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let sites = [site];
+        assert_eq!(
+            resolve_site_geography("retail", &sites, "net"),
+            (Some("us-east"), Some("a")),
+            "candidates carry the site id"
+        );
+        assert_eq!(resolve_site_geography("grid-retail", &sites, "net"), (None, None));
+    }
 
     fn test_site_with_geography(name: &str, network: &str, region: Option<&str>, zone: Option<&str>) -> GridSite {
         let mut spec = serde_json::json!({ "gridNetworkRef": network });

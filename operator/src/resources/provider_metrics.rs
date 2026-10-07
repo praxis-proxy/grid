@@ -129,7 +129,10 @@ pub(crate) async fn collect_provider_signals(
         let Some(plan) = signal_scrape_plan(provider) else {
             continue;
         };
-        let key = crate::readiness::key(network_name, plan.identity);
+        let Some(name) = provider.metadata.name.as_deref() else {
+            continue;
+        };
+        let key = crate::readiness::key(network_name, name);
         match scrape_provider_signals(provider, &plan, client).await {
             Ok(text) => record_scrape(readiness, &key, provider, &plan, &text),
             Err(class) => {

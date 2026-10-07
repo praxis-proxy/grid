@@ -124,12 +124,7 @@ fn transport_class(source: &(dyn std::error::Error + 'static)) -> crate::readine
     use crate::readiness::ScrapeClass;
     let mut cause = Some(source);
     while let Some(error) = cause {
-        // io::Error's source skips the error it wraps, which is where a TLS failure sits.
-        let wrapped = error
-            .downcast_ref::<std::io::Error>()
-            .and_then(std::io::Error::get_ref)
-            .is_some_and(|inner| crate::resources::tls_backend::is_tls_error(inner));
-        if wrapped || crate::resources::tls_backend::is_tls_error(error) {
+        if tls_within(error) {
             return ScrapeClass::Tls;
         }
         let text = error.to_string();
@@ -145,6 +140,19 @@ fn transport_class(source: &(dyn std::error::Error + 'static)) -> crate::readine
         cause = error.source();
     }
     ScrapeClass::Connect
+}
+
+/// Whether `error` is a TLS failure or wraps one through any depth of `io::Error`.
+///
+/// `io::Error::source` skips the error it wraps, which is where a TLS failure sits, and
+/// hyper-rustls wraps the connector's `io::Error` in another, so the chain is walked by
+/// `get_ref`, not `source`.
+fn tls_within(error: &(dyn std::error::Error + 'static)) -> bool {
+    crate::resources::tls_backend::is_tls_error(error)
+        || error
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::get_ref)
+            .is_some_and(|inner| tls_within(inner))
 }
 
 // ---------------------------------------------------------------------------
@@ -385,6 +393,20 @@ mod tests {
             std::io::ErrorKind::InvalidData,
             rustls::Error::General("bad certificate".to_owned()),
         ));
+        assert_eq!(
+            MetricsScrapeError::Transport(tls).class(),
+            crate::readiness::ScrapeClass::Tls
+        );
+    }
+
+    #[test]
+    #[cfg(not(feature = "fips"))]
+    fn a_tls_failure_wrapped_twice_classes_as_tls() {
+        // hyper-rustls wraps the connector's io::Error in another io::Error::other.
+        let tls: Box<dyn std::error::Error + Send + Sync> = Box::new(std::io::Error::other(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            rustls::Error::General("bad certificate".to_owned()),
+        )));
         assert_eq!(
             MetricsScrapeError::Transport(tls).class(),
             crate::readiness::ScrapeClass::Tls
