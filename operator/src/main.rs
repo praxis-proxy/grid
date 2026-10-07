@@ -96,13 +96,13 @@ use operator::{
 )]
 async fn main() {
     tracing_subscriber::fmt::init();
-    tracing::info!("starting grid-operator");
 
     // Install the process-wide crypto provider the TLS stack requires, once,
     // up front, before any reconciler builds a client.
     operator::init_process_crypto();
 
     let config = Cli::parse();
+    version::get().log_startup("grid-operator");
 
     let client = match Client::try_default().await {
         Ok(c) => c,

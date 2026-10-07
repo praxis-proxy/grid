@@ -2,6 +2,7 @@
 name = "grid-overlay-sync"
 description = "Kubernetes API-watch sidecar for Grid routing-overlay delivery."
 version.workspace = true
+publish = false
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -16,6 +17,7 @@ tls-rustls = ["kube/rustls-tls", "kube/ring"]
 fips = ["kube/openssl-tls"]
 
 [dependencies]
+version = { path = "../version" }
 axum = { workspace = true }
 clap = { workspace = true, features = ["env"] }
 futures = { workspace = true }

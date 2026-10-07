@@ -40,6 +40,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         tracing::warn!("rustls default CryptoProvider already installed; continuing");
     }
     let options = Options::parse();
+    version::get().log_startup("grid-fleet-dashboard");
     options.validate()?;
     let config = ConfigFile::load(options.config.as_deref())?;
     let backends = backends(&options).await?;
@@ -75,7 +76,7 @@ async fn serve(options: Options, config: ConfigFile, backends: Backends) -> Resu
         shutting_down.clone(),
     );
     let listener = tokio::net::TcpListener::bind(address).await?;
-    tracing::info!(%address, mode = ?options.metrics_mode, demo = options.demo, version = env!("CARGO_PKG_VERSION"), "serving");
+    tracing::info!(%address, mode = ?options.metrics_mode, demo = options.demo, version = version::VERSION, "serving");
     let poll_loop = async move {
         if let Some(registry) = registry {
             registry.run().await?;
@@ -113,7 +114,7 @@ fn api_config(options: &Options, config: &ConfigFile) -> Config {
     Config {
         hub: config.hub.clone(),
         poll_interval_seconds: options.poll_interval.as_secs(),
-        version: env!("CARGO_PKG_VERSION").to_owned(),
+        version: version::VERSION.to_owned(),
         thresholds: config.api_thresholds(),
         user: None,
     }

@@ -138,31 +138,44 @@ coverage-check:
 # Container
 # -------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Build provenance passed into every image. .dockerignore excludes .git, so the
+# build cannot resolve these itself and an image built without them says so.
+# ---------------------------------------------------------------------------
+GRID_GIT_COMMIT := $(shell git rev-parse HEAD 2>/dev/null || echo unknown)
+GRID_GIT_VERSION := $(shell git describe --tags --always 2>/dev/null || echo $(shell grep -m1 '^version' Cargo.toml | cut -d'"' -f2))
+GRID_GIT_TREE_STATE := $(shell if ! git rev-parse --git-dir >/dev/null 2>&1; then echo unknown; elif test -z "$$(git status --porcelain)"; then echo clean; else echo dirty; fi)
+GRID_BUILD_DATE := $(shell date -u +%Y%m%d)
+BUILD_ARGS = --build-arg GRID_GIT_COMMIT=$(GRID_GIT_COMMIT) \
+	--build-arg GRID_GIT_VERSION=$(GRID_GIT_VERSION) \
+	--build-arg GRID_GIT_TREE_STATE=$(GRID_GIT_TREE_STATE) \
+	--build-arg GRID_BUILD_DATE=$(GRID_BUILD_DATE)
+
 require-container-engine:
 ifndef CONTAINER_ENGINE
 	$(error No container engine found. Install podman or docker)
 endif
 
 container: | require-container-engine
-	$(CONTAINER_ENGINE) build -t $(PROJECT_IMAGE) -f Containerfile .
+	$(CONTAINER_ENGINE) build $(BUILD_ARGS) -t $(PROJECT_IMAGE) -f Containerfile .
 
 images: | require-container-engine
-	$(CONTAINER_ENGINE) build -t $(PROJECT_IMAGE) -f Containerfile .
+	$(CONTAINER_ENGINE) build $(BUILD_ARGS) -t $(PROJECT_IMAGE) -f Containerfile .
 
 operator-image: | require-container-engine
-	$(CONTAINER_ENGINE) build -f deploy/operator/Containerfile -t grid-operator:latest .
+	$(CONTAINER_ENGINE) build $(BUILD_ARGS) -f deploy/operator/Containerfile -t grid-operator:latest .
 
 gateway-image: | require-container-engine
-	$(CONTAINER_ENGINE) build -f deploy/gateway/Containerfile -t grid-gateway:latest .
+	$(CONTAINER_ENGINE) build $(BUILD_ARGS) -f deploy/gateway/Containerfile -t grid-gateway:latest .
 
 mock-providers-image: | require-container-engine
-	$(CONTAINER_ENGINE) build -f mock-providers/Containerfile -t grid-mock-providers:latest .
+	$(CONTAINER_ENGINE) build $(BUILD_ARGS) -f mock-providers/Containerfile -t grid-mock-providers:latest .
 
 overlay-sync-image: | require-container-engine
-	$(CONTAINER_ENGINE) build -f overlay-sync/Containerfile -t grid-overlay-sync:latest .
+	$(CONTAINER_ENGINE) build $(BUILD_ARGS) -f overlay-sync/Containerfile -t grid-overlay-sync:latest .
 
 fleet-dashboard-image: | require-container-engine
-	$(CONTAINER_ENGINE) build -f fleet-dashboard/Containerfile -t grid-fleet-dashboard:latest .
+	$(CONTAINER_ENGINE) build $(BUILD_ARGS) -f fleet-dashboard/Containerfile -t grid-fleet-dashboard:latest .
 
 # Builds the dashboard UI and stages it where fleet-dashboard/build.rs embeds it.
 fleet-dashboard-web:
@@ -172,8 +185,8 @@ fleet-dashboard-web:
 
 # GLB demo images — deterministic :glb-demo tags, no :latest dependency.
 glb-demo-images: | require-container-engine
-	$(CONTAINER_ENGINE) build -f deploy/operator/Containerfile -t grid-operator:glb-demo .
-	$(CONTAINER_ENGINE) build -f mock-providers/Containerfile -t grid-mock-providers:glb-demo .
+	$(CONTAINER_ENGINE) build $(BUILD_ARGS) -f deploy/operator/Containerfile -t grid-operator:glb-demo .
+	$(CONTAINER_ENGINE) build $(BUILD_ARGS) -f mock-providers/Containerfile -t grid-mock-providers:glb-demo .
 
 # -------------------------------------------------------------------
 # Helm
@@ -209,7 +222,7 @@ dev-env: images
 	bash hack/setup-kind.sh
 
 dev-push: | require-container-engine
-	$(CONTAINER_ENGINE) build -t $(PROJECT_IMAGE) -f Containerfile .
+	$(CONTAINER_ENGINE) build $(BUILD_ARGS) -t $(PROJECT_IMAGE) -f Containerfile .
 	kind load docker-image $(PROJECT_IMAGE) --name $(KIND_CLUSTER_NAME)
 
 # -------------------------------------------------------------------

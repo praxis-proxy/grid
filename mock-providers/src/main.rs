@@ -23,7 +23,7 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 /// Mock AI provider server for integration testing.
 #[derive(Debug, Parser)]
-#[command(name = "mock-providers")]
+#[command(name = "mock-providers", version = version::VERSION)]
 struct Cli {
     /// Which provider API to simulate.
     #[arg(
@@ -126,6 +126,7 @@ async fn main() {
     tracing_subscriber::fmt::init();
 
     let cli = Cli::parse();
+    version::get().log_startup("mock-providers");
 
     if cli.tls_probe_server {
         let cert_path = cli.tls_cert.as_deref().unwrap_or_else(|| std::process::exit(2));

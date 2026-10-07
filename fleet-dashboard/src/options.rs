@@ -21,7 +21,7 @@ pub enum MetricsMode {
 
 /// Serves the AI Grid fleet map for one hub cluster.
 #[derive(Debug, Clone, Parser)]
-#[command(name = "fleet-dashboard", version, about)]
+#[command(name = "fleet-dashboard", version = version::VERSION, about)]
 pub struct Options {
     /// Address to serve HTTP on; a bare `:port` listens on every interface.
     #[arg(long, env = "FLEET_LISTEN", default_value = ":8080")]

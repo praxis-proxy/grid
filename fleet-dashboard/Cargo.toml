@@ -12,6 +12,7 @@ name = "fleet-dashboard"
 path = "src/main.rs"
 
 [dependencies]
+version = { path = "../version" }
 axum = { workspace = true }
 clap = { workspace = true, features = ["env"] }
 futures = { workspace = true }

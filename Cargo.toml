@@ -13,6 +13,7 @@ members = [
     "signals",
     "signals-client",
     "swim",
+    "version",
     "xtask",
 ]
 

@@ -192,6 +192,10 @@ jobs:
           tags: |
             ${{ env.OPERATOR_IMAGE_NAME }}:${{ needs.validate.outputs.tag }}
             ${{ env.OPERATOR_IMAGE_NAME }}:sha-${{ needs.validate.outputs.short_sha }}
+          build-args: |
+            GRID_GIT_COMMIT=${{ needs.validate.outputs.source_sha }}
+            GRID_GIT_VERSION=${{ needs.validate.outputs.version }}
+            GRID_GIT_TREE_STATE=clean
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ needs.validate.outputs.source_sha }}
@@ -211,6 +215,10 @@ jobs:
           tags: |
             ${{ env.GATEWAY_IMAGE_NAME }}:${{ needs.validate.outputs.tag }}
             ${{ env.GATEWAY_IMAGE_NAME }}:sha-${{ needs.validate.outputs.short_sha }}
+          build-args: |
+            GRID_GIT_COMMIT=${{ needs.validate.outputs.source_sha }}
+            GRID_GIT_VERSION=${{ needs.validate.outputs.version }}
+            GRID_GIT_TREE_STATE=clean
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ needs.validate.outputs.source_sha }}
@@ -230,6 +238,10 @@ jobs:
           tags: |
             ${{ env.MOCK_PROVIDERS_IMAGE_NAME }}:${{ needs.validate.outputs.tag }}
             ${{ env.MOCK_PROVIDERS_IMAGE_NAME }}:sha-${{ needs.validate.outputs.short_sha }}
+          build-args: |
+            GRID_GIT_COMMIT=${{ needs.validate.outputs.source_sha }}
+            GRID_GIT_VERSION=${{ needs.validate.outputs.version }}
+            GRID_GIT_TREE_STATE=clean
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ needs.validate.outputs.source_sha }}
@@ -249,6 +261,10 @@ jobs:
           tags: |
             ${{ env.OVERLAY_SYNC_IMAGE_NAME }}:${{ needs.validate.outputs.tag }}
             ${{ env.OVERLAY_SYNC_IMAGE_NAME }}:sha-${{ needs.validate.outputs.short_sha }}
+          build-args: |
+            GRID_GIT_COMMIT=${{ needs.validate.outputs.source_sha }}
+            GRID_GIT_VERSION=${{ needs.validate.outputs.version }}
+            GRID_GIT_TREE_STATE=clean
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ needs.validate.outputs.source_sha }}
@@ -268,6 +284,10 @@ jobs:
           tags: |
             ${{ env.FLEET_DASHBOARD_IMAGE_NAME }}:${{ needs.validate.outputs.tag }}
             ${{ env.FLEET_DASHBOARD_IMAGE_NAME }}:sha-${{ needs.validate.outputs.short_sha }}
+          build-args: |
+            GRID_GIT_COMMIT=${{ needs.validate.outputs.source_sha }}
+            GRID_GIT_VERSION=${{ needs.validate.outputs.version }}
+            GRID_GIT_TREE_STATE=clean
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ needs.validate.outputs.source_sha }}

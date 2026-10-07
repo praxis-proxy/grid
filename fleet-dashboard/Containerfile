@@ -28,6 +28,17 @@ FROM rust:1.96-alpine AS builder
 
 RUN apk add --no-cache musl-dev pkgconf make g++
 
+# Build provenance. .dockerignore excludes .git, so the build cannot resolve these
+# itself: the Makefile passes them, and a build that does not ships "unknown".
+ARG GRID_GIT_COMMIT=unknown
+ARG GRID_GIT_VERSION=unknown
+ARG GRID_GIT_TREE_STATE=unknown
+ARG GRID_BUILD_DATE=unknown
+ENV GRID_GIT_COMMIT=$GRID_GIT_COMMIT \
+    GRID_GIT_VERSION=$GRID_GIT_VERSION \
+    GRID_GIT_TREE_STATE=$GRID_GIT_TREE_STATE \
+    GRID_BUILD_DATE=$GRID_BUILD_DATE
+
 WORKDIR /src
 
 COPY . .
@@ -44,7 +55,11 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 FROM alpine:3.23
 
-LABEL org.opencontainers.image.source="https://github.com/praxis-proxy/grid" \
+ARG GRID_GIT_COMMIT=unknown
+ARG GRID_GIT_VERSION=unknown
+LABEL org.opencontainers.image.revision="$GRID_GIT_COMMIT" \
+    org.opencontainers.image.version="$GRID_GIT_VERSION" \
+    org.opencontainers.image.source="https://github.com/praxis-proxy/grid" \
     org.opencontainers.image.description="Grid fleet dashboard: hub web UI for site health" \
     org.opencontainers.image.licenses="Apache-2.0"
 

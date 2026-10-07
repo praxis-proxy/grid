@@ -308,6 +308,7 @@ name = "grid-gateway"
 path = "src/main.rs"
 
 [dependencies]
+version = { path = "../version" }
 praxis-proxy = { version = "0.7.3", features = ["otel", "spiffe"] }
 praxis-proxy-filter = "0.7.3"
 praxis-proxy-core = "0.7.3"

@@ -28,13 +28,24 @@ const OTLP_TRACES_HEADERS_ENV_VAR: &str = "OTEL_EXPORTER_OTLP_TRACES_HEADERS";
 /// Praxis currently selects the exporter protocol from this variable.
 const OTLP_PROTOCOL_ENV_VAR: &str = "OTEL_EXPORTER_OTLP_PROTOCOL";
 
-fn main() -> ExitCode {
-    // Install the crypto provider before anything builds a TLS config.
-    praxis::install_crypto_provider();
+/// The one startup line, with the build it came from. The startup test waits for it.
+fn log_startup() {
+    let build = version::get();
+    info!(
+        version = %build,
+        commit = build.git_commit,
+        tree = build.git_tree_state,
+        built = build.build_date,
+        platform = build.platform,
+        "{STARTUP_MESSAGE}"
+    );
+}
 
-    // The operator writes the config. The path is `--config <path>` or the
-    // positional argument, else the default search path. Read it once so the
-    // reload watcher baselines on the bytes that run.
+/// The config file the operator wrote, and the config resolved from it.
+///
+/// The path is `--config <path>` or the positional argument, else the default search
+/// path. Read once so the reload watcher baselines on the bytes that run.
+fn load_config() -> (Option<ConfigFile>, Config) {
     let explicit = config_arg(std::env::args().skip(1)).unwrap_or_else(|err| praxis::fatal(&err));
     let config_file = praxis::resolve_config_path(explicit.as_deref())
         .as_deref()
@@ -43,6 +54,35 @@ fn main() -> ExitCode {
         .unwrap_or_else(|err| praxis::fatal(&err));
     let config = praxis::with_bootstrap_logging(|| Config::from_config_file_or(config_file.as_ref(), DEFAULT_CONFIG))
         .unwrap_or_else(|err| praxis::fatal(&err));
+    (config_file, config)
+}
+
+/// Everything that runs before a config is read: answer `--version`, else install the
+/// crypto provider anything building a TLS config needs.
+///
+/// `Some(exit)` means the process is done. Writes through `io::Write` because the lint
+/// set denies `println!`.
+fn preflight() -> Option<ExitCode> {
+    use std::io::Write as _;
+
+    if std::env::args().skip(1).any(|arg| arg == "--version" || arg == "-V") {
+        let written = writeln!(std::io::stdout().lock(), "grid-gateway {}", version::get());
+        return Some(if written.is_ok() {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        });
+    }
+    praxis::install_crypto_provider();
+    None
+}
+
+fn main() -> ExitCode {
+    if let Some(exit) = preflight() {
+        return exit;
+    }
+
+    let (config_file, config) = load_config();
 
     validate_otlp_endpoint_transport(&config).unwrap_or_else(|err| praxis::fatal(&err));
 
@@ -50,7 +90,7 @@ fn main() -> ExitCode {
     let tracing_guard = praxis::init_tracing(&config).unwrap_or_else(|err| praxis::fatal(&err));
     let log_level = Some(tracing_guard.log_level_state());
     let log_output = config.runtime.logging.output;
-    info!(version = env!("CARGO_PKG_VERSION"), "{STARTUP_MESSAGE}");
+    log_startup();
 
     let mut registry = praxis_filter::FilterRegistry::with_builtins();
     praxis_ai_filters::register_ai_filters(&mut registry, None);

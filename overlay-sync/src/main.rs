@@ -43,7 +43,7 @@ use crate::{metrics::Metrics, status::SharedStatus, validation::ExpectedScope, w
 /// Grid overlay sync sidecar — watches a `ConfigMap` and atomically
 /// publishes validated overlays.
 #[derive(Parser, Debug)]
-#[command(name = "grid-overlay-sync")]
+#[command(name = "grid-overlay-sync", version = version::VERSION)]
 struct Cli {
     /// Kubernetes namespace.
     #[arg(long, env = "OVERLAY_SYNC_NAMESPACE", default_value = "grid-system")]
@@ -134,6 +134,7 @@ impl std::fmt::Display for StartupError {
 async fn main() -> Result<(), StartupError> {
     let cli = Cli::parse();
     init_tracing();
+    version::get().log_startup("grid-overlay-sync");
     run(cli).await
 }
 

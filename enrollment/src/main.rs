@@ -77,13 +77,29 @@ fn reject_bootstrap_without_feature(
     Ok(())
 }
 
+/// Whether the first argument asks for the version.
+///
+/// Answered before the subscriber is installed and before any subcommand
+/// dispatch, so `--version` prints the one line and nothing else. The server
+/// has no top-level clap command to hang `version` on, so this mirrors what the
+/// gateway does in its preflight.
+fn version_requested() -> bool {
+    std::env::args().skip(1).any(|arg| arg == "--version" || arg == "-V")
+}
+
 #[tokio::main]
 #[expect(
     clippy::too_many_lines,
     reason = "startup wires config, TLS, store, authz, drain, and cert reload in one sequence"
 )]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if version_requested() {
+        use std::io::Write as _;
+        writeln!(std::io::stdout().lock(), "grid-enrollment {}", version::get())?;
+        return Ok(());
+    }
     tracing_subscriber::fmt::init();
+    version::get().log_startup("grid-enrollment");
 
     // `enrollment bootstrap` runs the one-shot CA/serving-Secret init and exits.
     // No server is started.

@@ -41,6 +41,7 @@ sar = ["dep:kube", "dep:k8s-openapi"]
 bootstrap = ["dep:clap", "dep:kube", "dep:k8s-openapi", "dep:reqwest", "dep:zeroize"]
 
 [dependencies]
+version = { path = "../version" }
 axum = { workspace = true }
 certs = { path = "../certs", default-features = false }
 clap = { workspace = true, optional = true, features = ["env"] }

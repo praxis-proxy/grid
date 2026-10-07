@@ -980,6 +980,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "version",
  "x509-parser",
  "zeroize",
 ]
@@ -1102,6 +1103,7 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-subscriber",
+ "version",
 ]
 
 [[package]]
@@ -1411,6 +1413,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "version",
 ]
 
 [[package]]
@@ -2328,6 +2331,7 @@ dependencies = [
  "tokio-rustls",
  "tower",
  "tracing-subscriber",
+ "version",
 ]
 
 [[package]]
@@ -2553,6 +2557,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "version",
  "zeroize",
 ]
 
@@ -4440,6 +4445,15 @@ dependencies = [
  "anyhow",
  "rustversion",
  "time",
+]
+
+[[package]]
+name = "version"
+version = "0.1.5"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tracing",
 ]
 
 [[package]]
