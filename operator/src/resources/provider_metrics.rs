@@ -107,89 +107,183 @@ pub(crate) struct CollectedMetrics {
 // Signals collection (poll mode)
 // ---------------------------------------------------------------------------
 
-/// Scrape each provider's endpoint and keep only its configured coarse signals.
+/// Scrape each provider's endpoint, recording its coarse signals and readiness.
 ///
 /// Sibling of [`collect_provider_metrics_with_refresh_interval`], which parses
 /// the same text into [`scoring::BackendMetrics`] for local scoring. This keeps
 /// the provider's own exposition narrowed to its declared `signalNames`, so the
 /// wire carries a coarse rollup rather than the full `/metrics` firehose. Fails
 /// closed on TLS: a provider whose TLS will not resolve is skipped, never
-/// scraped in plaintext. A failed scrape leaves the last value to expire.
+/// scraped in plaintext, and counts as a failed scrape.
 pub(crate) async fn collect_provider_signals(
     network_name: &str,
     providers: &[InferenceProvider],
     client: Option<&kube::Client>,
-) -> HashMap<String, Vec<crate::signals::Observation>> {
-    let mut out = HashMap::new();
+    readiness: &crate::readiness::ReadinessStore,
+) {
     for provider in providers {
         if provider.spec.grid_network_ref != network_name {
             continue;
         }
-        if let Some((identity, observations)) = scrape_provider_signals(provider, client).await {
-            out.insert(identity, observations);
+        let Some(plan) = signal_scrape_plan(provider) else {
+            continue;
+        };
+        let key = crate::readiness::key(network_name, plan.identity);
+        match scrape_provider_signals(provider, &plan, client).await {
+            Ok(text) => record_scrape(readiness, &key, provider, &plan, &text),
+            Err(class) => {
+                crate::metrics::record_provider_scrape(plan.identity, class.as_str());
+                readiness.record_failure(&key, class, Instant::now());
+            },
         }
     }
-    out
 }
 
-/// Scrape one provider's coarse signals, or `None` to leave its last value be.
-///
-/// Every skip and failure returns `None`: a provider absent from the collection
-/// is left alone rather than erased, so a missed scrape expires on its own.
-async fn scrape_provider_signals(
+/// Record one successful scrape: its ready-endpoint count and its declared signals.
+fn record_scrape(
+    readiness: &crate::readiness::ReadinessStore,
+    key: &str,
     provider: &InferenceProvider,
-    client: Option<&kube::Client>,
-) -> Option<(String, Vec<crate::signals::Observation>)> {
-    let (identity, url, wanted) = signal_scrape_plan(provider)?;
-    let mc = provider.spec.metrics_config.as_ref()?;
-    let tls_settings = mc.tls.as_ref().or(provider.spec.tls.as_ref());
-    let tls_config = match resolve_tls_config(tls_settings, client, identity).await {
-        Ok(cfg) => cfg,
-        Err((_reason, e)) => {
-            if tls_settings.is_some() {
-                tracing::warn!(provider = identity, error = %e, "signals: provider metrics TLS unavailable; not scraping in plaintext");
-            }
-            return None;
-        },
-    };
-    let timeout = parse_metrics_timeout(&mc.timeout);
-    let text = scrape_metrics(&url, timeout, tls_config, mc.auth.as_ref().zip(client))
-        .await
-        .inspect_err(|e| {
-        tracing::debug!(provider = identity, error = %e, "signals: provider scrape failed; last value left to expire");
-    })
-    .ok()?;
-    let observations = crate::signals::parse(&text)
+    plan: &SignalScrapePlan<'_>,
+    text: &str,
+) {
+    // Every sample feeds this site's own windows; only gauges are republished.
+    let (parsed, republishable): (Vec<_>, Vec<_>) = crate::signals::parse_scrape(text).into_iter().unzip();
+    let pool = provider
+        .spec
+        .metrics_config
+        .as_ref()
+        .and_then(|mc| mc.pool_name.as_deref());
+    let ready = crate::readiness::ready_endpoints(&parsed, plan.ready_names(), pool);
+    let missing = count_scrape(plan, pool, ready);
+    let in_flight = in_flight_observation(&parsed, ready, pool, plan.identity);
+    let latency = readiness.record_latency(key, &parsed, Instant::now());
+    let observations = parsed
         .into_iter()
-        .filter(|o| wanted.contains(o.metric.as_str()))
+        .zip(republishable)
+        .filter_map(|(o, republishable)| republishable.then_some(o))
+        .filter(|o| plan.wanted.contains(o.metric.as_str()))
         // A local sample's freshness is its collection time, so drop any trailing
         // timestamp. Only relayed peer samples carry a per-sample stamp.
         .map(|mut o| {
             o.timestamp_ms = None;
             o
         })
+        .chain(in_flight)
+        .chain(latency)
         .collect();
-    Some((identity.to_owned(), observations))
+    readiness.record_success(key, ready, missing, observations, Instant::now());
 }
 
-/// The scrape target for a provider's coarse signals, if it is eligible.
+/// Count a scrape that answered: `success` with the pool's ready-endpoint series, else
+/// `no_series`, returned as the message naming what was missing.
+fn count_scrape(plan: &SignalScrapePlan<'_>, pool: Option<&str>, ready: Option<f64>) -> Option<String> {
+    if ready.is_some() {
+        crate::metrics::record_provider_scrape(plan.identity, "success");
+        crate::metrics::set_provider_last_scrape_success(plan.identity, std::time::SystemTime::now());
+        return None;
+    }
+    crate::metrics::record_provider_scrape(plan.identity, "no_series");
+    let series = plan.ready_names().join(" or ");
+    Some(match pool {
+        Some(pool) => format!("metrics reachable, but no {series} series for poolName {pool}"),
+        None => format!("metrics reachable, but no {series} series"),
+    })
+}
+
+/// The resolved `grid_provider_in_flight_requests` sample, logging which source it came from.
+fn in_flight_observation(
+    parsed: &[crate::signals::Observation],
+    ready: Option<f64>,
+    pool: Option<&str>,
+    identity: &str,
+) -> Option<crate::signals::Observation> {
+    let (value, source) = crate::readiness::in_flight(parsed, ready, pool)?;
+    tracing::debug!(
+        provider = identity,
+        in_flight = value,
+        ?source,
+        "signals: provider in-flight resolved"
+    );
+    Some(crate::signals::Observation {
+        metric: crate::readiness::IN_FLIGHT_SIGNAL.to_owned(),
+        labels: std::collections::BTreeMap::new(),
+        value,
+        timestamp_ms: None,
+    })
+}
+
+/// Scrape one provider's exposition, or the bounded class of the TLS or scrape failure.
+async fn scrape_provider_signals(
+    provider: &InferenceProvider,
+    plan: &SignalScrapePlan<'_>,
+    client: Option<&kube::Client>,
+) -> Result<String, crate::readiness::ScrapeClass> {
+    let mc = provider
+        .spec
+        .metrics_config
+        .as_ref()
+        .ok_or(crate::readiness::ScrapeClass::Config)?;
+    let identity = plan.identity;
+    let tls_settings = mc.tls.as_ref().or(provider.spec.tls.as_ref());
+    let tls_config = match resolve_tls_config(tls_settings, client, identity).await {
+        Ok(cfg) => cfg,
+        Err((_reason, e)) => {
+            if tls_settings.is_some() {
+                tracing::debug!(provider = identity, error = %e, "signals: provider metrics TLS unavailable; not scraping in plaintext");
+            }
+            return Err(crate::readiness::ScrapeClass::Tls);
+        },
+    };
+    let timeout = parse_metrics_timeout(&mc.timeout);
+    scrape_metrics(&plan.url, timeout, tls_config, mc.auth.as_ref().zip(client))
+        .await
+        .map_err(|e| {
+            tracing::debug!(provider = identity, error = %e, "signals: provider scrape failed");
+            e.class()
+        })
+}
+
+/// What to scrape for one provider and which of its series to republish.
+pub(crate) struct SignalScrapePlan<'provider> {
+    /// The provider's routing identity.
+    pub(crate) identity: &'provider str,
+    /// The metrics URL.
+    pub(crate) url: String,
+    /// Declared signal names republished as coarse signals; may be empty.
+    pub(crate) wanted: std::collections::BTreeSet<String>,
+    /// A declared ready-endpoints metric, replacing the defaults.
+    ready_override: Option<&'provider str>,
+}
+
+impl SignalScrapePlan<'_> {
+    /// The ready-endpoints names to read, preferred first.
+    fn ready_names(&self) -> &[&str] {
+        self.ready_override
+            .as_ref()
+            .map_or(&crate::readiness::DEFAULT_READY_ENDPOINTS[..], std::slice::from_ref)
+    }
+}
+
+/// The scrape plan for a provider, if it is eligible.
 ///
 /// Pure and synchronous: eligibility is decided here so the scrape path stays
 /// the I/O alone. `None` for a provider with no metrics config, no routing
-/// identity, a blank endpoint, or no declared signal names.
-fn signal_scrape_plan(provider: &InferenceProvider) -> Option<(&str, String, std::collections::BTreeSet<String>)> {
+/// identity, or a blank endpoint. A provider with no signal names is still
+/// scraped, for readiness.
+pub(crate) fn signal_scrape_plan(provider: &InferenceProvider) -> Option<SignalScrapePlan<'_>> {
     let mc = provider.spec.metrics_config.as_ref()?;
     let identity = routing_identity(provider)?;
     let endpoint = provider.spec.endpoint.trim();
     if endpoint.is_empty() || mc.metrics_endpoint.as_deref().is_some_and(|ep| ep.trim().is_empty()) {
         return None;
     }
-    let wanted = signal_metric_names(&mc.signal_names);
-    if wanted.is_empty() {
-        return None;
-    }
-    let url = metrics_url(mc.metrics_endpoint.as_deref().unwrap_or(endpoint), &mc.path);
-    Some((identity, url, wanted))
+    Some(SignalScrapePlan {
+        identity,
+        url: metrics_url(mc.metrics_endpoint.as_deref().unwrap_or(endpoint), &mc.path),
+        wanted: signal_metric_names(&mc.signal_names),
+        ready_override: mc.signal_names.ready_endpoints.as_deref(),
+    })
 }
 
 /// The source metric names a provider declares for its coarse signals.
@@ -656,6 +750,7 @@ pub(crate) fn classify_scrape_error(err: &metrics_scraper::MetricsScrapeError) -
         },
         metrics_scraper::MetricsScrapeError::Credential(_)
         | metrics_scraper::MetricsScrapeError::PlaintextCredential(_) => "MetricsCredentialUnavailable",
+        metrics_scraper::MetricsScrapeError::BodyTooLarge(_) => "MetricsBodyTooLarge",
         metrics_scraper::MetricsScrapeError::InvalidUrl(_)
         | metrics_scraper::MetricsScrapeError::NonOkStatus { .. }
         | metrics_scraper::MetricsScrapeError::Encoding(_) => "MetricsScrapeError",
@@ -753,6 +848,103 @@ mod tests {
             "spec": spec
         }))
         .unwrap_or_else(|_| std::process::abort())
+    }
+
+    /// A `KServe` EPP exposition for pool `qwen3-kserve`, in the label sets the lab EPP emits:
+    /// `served` streaming requests answered, about 104 usage reports each.
+    #[expect(clippy::too_many_lines, reason = "one exposition, line for line")]
+    fn kserve_epp_exposition(served: f64, ready: f64) -> String {
+        let l = r#"fairness_id="default-flow",model_name="qwen3",priority="0",target_model_name="qwen3""#;
+        let (b01, b05, b1) = (served * 0.2, served * 0.6, served * 0.9);
+        let (ttft_sum, tpot_sum) = (served * 0.4, served * 0.02);
+        let (reports, tokens) = (served * 104.0, served * 104.0 * 300.0);
+        let (requests, errors) = (served + 14.0, served / 100.0);
+        format!(
+            r#"# HELP llm_d_epp_ready_endpoints Ready endpoints.
+# TYPE llm_d_epp_ready_endpoints gauge
+llm_d_epp_ready_endpoints{{name="qwen3-kserve"}} {ready}
+# TYPE llm_d_epp_average_running_requests gauge
+llm_d_epp_average_running_requests{{name="qwen3-kserve"}} 128
+# TYPE llm_d_epp_request_ttft_seconds histogram
+llm_d_epp_request_ttft_seconds_bucket{{{l},streaming="false",le="0.1"}} 14
+llm_d_epp_request_ttft_seconds_bucket{{{l},streaming="false",le="+Inf"}} 14
+llm_d_epp_request_ttft_seconds_sum{{{l},streaming="false"}} 1.9
+llm_d_epp_request_ttft_seconds_count{{{l},streaming="false"}} 14
+llm_d_epp_request_ttft_seconds_bucket{{{l},streaming="true",le="0.1"}} {b01}
+llm_d_epp_request_ttft_seconds_bucket{{{l},streaming="true",le="0.5"}} {b05}
+llm_d_epp_request_ttft_seconds_bucket{{{l},streaming="true",le="1"}} {b1}
+llm_d_epp_request_ttft_seconds_bucket{{{l},streaming="true",le="2.5"}} {served}
+llm_d_epp_request_ttft_seconds_bucket{{{l},streaming="true",le="+Inf"}} {served}
+llm_d_epp_request_ttft_seconds_sum{{{l},streaming="true"}} {ttft_sum}
+llm_d_epp_request_ttft_seconds_count{{{l},streaming="true"}} {served}
+# TYPE llm_d_epp_request_streaming_tpot_seconds histogram
+llm_d_epp_request_streaming_tpot_seconds_sum{{{l}}} {tpot_sum}
+llm_d_epp_request_streaming_tpot_seconds_count{{{l}}} {served}
+# TYPE llm_d_epp_request_input_tokens histogram
+llm_d_epp_request_input_tokens_sum{{{l}}} {tokens}
+llm_d_epp_request_input_tokens_count{{{l}}} {reports}
+# TYPE llm_d_epp_request_total counter
+llm_d_epp_request_total{{{l}}} {requests}
+# TYPE llm_d_epp_request_error_total counter
+llm_d_epp_request_error_total{{{l},error_code="503"}} {errors}
+"#
+        )
+    }
+
+    #[test]
+    #[expect(clippy::too_many_lines, reason = "two scrapes and every published series")]
+    fn a_kserve_epp_scrape_publishes_latency_and_republishes_gauges_only() {
+        let readiness = crate::readiness::ReadinessStore::default();
+        let mut mc = mc_with_queue("llm_d_epp_average_running_requests");
+        mc.pool_name = Some("qwen3-kserve".to_owned());
+        // A counter declared as a signal is still never republished.
+        mc.signal_names.error_rate = Some("llm_d_epp_request_total".to_owned());
+        let provider = provider_fixture("qwen3-hq-east", "http://epp:9090", Some(mc));
+        let plan = signal_scrape_plan(&provider).unwrap_or_else(|| std::process::abort());
+        record_scrape(
+            &readiness,
+            "net/p",
+            &provider,
+            &plan,
+            &kserve_epp_exposition(11_000.0, 2.0),
+        );
+        assert!(readiness.take_fresh("net/p").is_some(), "first scrape recorded");
+        record_scrape(
+            &readiness,
+            "net/p",
+            &provider,
+            &plan,
+            &kserve_epp_exposition(11_581.0, 0.0),
+        );
+        let published = readiness.take_fresh("net/p").unwrap_or_default();
+        let value = |name: &str| published.iter().find(|o| o.metric == name).map(|o| o.value);
+        for name in [
+            crate::latency::TTFT_P50_SIGNAL,
+            crate::latency::TTFT_P90_SIGNAL,
+            crate::latency::TPOT_SIGNAL,
+            crate::latency::ERROR_RATIO_SIGNAL,
+        ] {
+            assert!(value(name).is_some(), "{name} missing from {published:?}");
+        }
+        assert!((value(crate::latency::TPOT_SIGNAL).unwrap_or_default() - 0.02).abs() < 1e-9);
+        assert!(
+            published.iter().all(|o| !o.metric.ends_with("_total")
+                && !o.metric.ends_with("_count")
+                && !o.metric.ends_with("_sum")
+                && !o.metric.ends_with("_bucket")),
+            "counters and histogram parts stay local: {published:?}"
+        );
+        assert!(
+            value("llm_d_epp_average_running_requests").is_some(),
+            "declared gauge republished"
+        );
+        let verdict = readiness
+            .verdict("net/p", false, Duration::from_secs(15), Instant::now())
+            .unwrap_or_else(|| std::process::abort());
+        assert!(
+            verdict.message.contains("answered"),
+            "progress seen through the parser: {verdict:?}"
+        );
     }
 
     fn mc_with_queue(metric_name: &str) -> MetricsConfig {
@@ -876,6 +1068,7 @@ mod tests {
             prefix_cache_hit_ratio: Some("my_prefix".to_owned()),
             error_rate: Some("my_errors".to_owned()),
             healthy: Some("my_health".to_owned()),
+            ready_endpoints: None,
         };
         let names = metric_names_from_config(&cfg, None, None);
         assert_eq!(names.queue_depth.as_deref(), Some("my_queue"));
@@ -1017,8 +1210,9 @@ mod tests {
         let mut provider = provider_fixture("prov-a", &endpoint, Some(mc_with_queue("queue_depth")));
         provider.spec.tls = Some(crate::resources::test_doubles::endpoint_tls_for_ca("shared-ca"));
 
-        let signals = collect_provider_signals("net", &[provider], Some(&client)).await;
-        let observations = signals.get("prov-a").unwrap_or_else(|| std::process::abort());
+        let readiness = crate::readiness::ReadinessStore::default();
+        collect_provider_signals("net", &[provider], Some(&client), &readiness).await;
+        let observations = readiness.take_fresh("net/prov-a").unwrap_or_default();
 
         assert!(
             observations
@@ -1041,8 +1235,9 @@ mod tests {
         let mut provider = provider_fixture("prov-a", &endpoint, Some(metrics_config));
         provider.spec.tls = Some(crate::resources::test_doubles::endpoint_tls_for_ca("missing-shared-ca"));
 
-        let signals = collect_provider_signals("net", &[provider], Some(&client)).await;
-        let observations = signals.get("prov-a").unwrap_or_else(|| std::process::abort());
+        let readiness = crate::readiness::ReadinessStore::default();
+        collect_provider_signals("net", &[provider], Some(&client), &readiness).await;
+        let observations = readiness.take_fresh("net/prov-a").unwrap_or_default();
 
         assert!(
             observations
@@ -1058,9 +1253,13 @@ mod tests {
         let mut provider = provider_fixture("prov-a", "https://localhost:1", Some(mc_with_queue("queue_depth")));
         provider.spec.tls = Some(crate::resources::test_doubles::endpoint_tls_for_ca("missing-shared-ca"));
 
-        let signals = collect_provider_signals("net", &[provider], Some(&client)).await;
+        let readiness = crate::readiness::ReadinessStore::default();
+        collect_provider_signals("net", &[provider], Some(&client), &readiness).await;
 
-        assert!(signals.is_empty(), "invalid shared TLS material must skip the scrape");
+        assert!(
+            readiness.take_fresh("net/prov-a").is_none(),
+            "invalid shared TLS material must skip the scrape"
+        );
     }
 
     #[tokio::test]
