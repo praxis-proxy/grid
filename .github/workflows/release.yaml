@@ -49,6 +49,7 @@ jobs:
       version: ${{ steps.version.outputs.version }}
       source_sha: ${{ steps.version.outputs.source_sha }}
       short_sha: ${{ steps.version.outputs.short_sha }}
+      build_date: ${{ steps.version.outputs.build_date }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -83,6 +84,7 @@ jobs:
             echo "version=${TAG_VERSION}"
             echo "source_sha=${SOURCE_SHA}"
             echo "short_sha=${SOURCE_SHA::7}"
+            echo "build_date=$(date -u +%Y%m%d)"
           } >> "${GITHUB_OUTPUT}"
 
   # ----------------------------------------------------------------------------
@@ -196,6 +198,7 @@ jobs:
             GRID_GIT_COMMIT=${{ needs.validate.outputs.source_sha }}
             GRID_GIT_VERSION=${{ needs.validate.outputs.version }}
             GRID_GIT_TREE_STATE=clean
+            GRID_BUILD_DATE=${{ needs.validate.outputs.build_date }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ needs.validate.outputs.source_sha }}
@@ -219,6 +222,7 @@ jobs:
             GRID_GIT_COMMIT=${{ needs.validate.outputs.source_sha }}
             GRID_GIT_VERSION=${{ needs.validate.outputs.version }}
             GRID_GIT_TREE_STATE=clean
+            GRID_BUILD_DATE=${{ needs.validate.outputs.build_date }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ needs.validate.outputs.source_sha }}
@@ -242,6 +246,7 @@ jobs:
             GRID_GIT_COMMIT=${{ needs.validate.outputs.source_sha }}
             GRID_GIT_VERSION=${{ needs.validate.outputs.version }}
             GRID_GIT_TREE_STATE=clean
+            GRID_BUILD_DATE=${{ needs.validate.outputs.build_date }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ needs.validate.outputs.source_sha }}
@@ -265,6 +270,7 @@ jobs:
             GRID_GIT_COMMIT=${{ needs.validate.outputs.source_sha }}
             GRID_GIT_VERSION=${{ needs.validate.outputs.version }}
             GRID_GIT_TREE_STATE=clean
+            GRID_BUILD_DATE=${{ needs.validate.outputs.build_date }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ needs.validate.outputs.source_sha }}
@@ -288,6 +294,7 @@ jobs:
             GRID_GIT_COMMIT=${{ needs.validate.outputs.source_sha }}
             GRID_GIT_VERSION=${{ needs.validate.outputs.version }}
             GRID_GIT_TREE_STATE=clean
+            GRID_BUILD_DATE=${{ needs.validate.outputs.build_date }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ needs.validate.outputs.source_sha }}

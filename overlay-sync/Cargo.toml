@@ -17,7 +17,7 @@ tls-rustls = ["kube/rustls-tls", "kube/ring"]
 fips = ["kube/openssl-tls"]
 
 [dependencies]
-version = { path = "../version" }
+version.workspace = true
 axum = { workspace = true }
 clap = { workspace = true, features = ["env"] }
 futures = { workspace = true }

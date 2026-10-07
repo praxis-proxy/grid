@@ -142,10 +142,10 @@ coverage-check:
 # Build provenance passed into every image. .dockerignore excludes .git, so the
 # build cannot resolve these itself and an image built without them says so.
 # ---------------------------------------------------------------------------
-GRID_GIT_COMMIT := $(shell git rev-parse HEAD 2>/dev/null || echo unknown)
-GRID_GIT_VERSION := $(shell git describe --tags --always 2>/dev/null || echo $(shell grep -m1 '^version' Cargo.toml | cut -d'"' -f2))
-GRID_GIT_TREE_STATE := $(shell if ! git rev-parse --git-dir >/dev/null 2>&1; then echo unknown; elif test -z "$$(git status --porcelain)"; then echo clean; else echo dirty; fi)
-GRID_BUILD_DATE := $(shell date -u +%Y%m%d)
+GRID_GIT_COMMIT ?= $(shell git rev-parse HEAD 2>/dev/null || echo unknown)
+GRID_GIT_VERSION ?= $(shell git describe --tags --always 2>/dev/null || echo $(shell grep -m1 '^version' Cargo.toml | cut -d'"' -f2))
+GRID_GIT_TREE_STATE ?= $(shell if ! git rev-parse --git-dir >/dev/null 2>&1; then echo unknown; elif test -z "$$(git status --porcelain)"; then echo clean; else echo dirty; fi)
+GRID_BUILD_DATE ?= $(shell date -u +%Y%m%d)
 BUILD_ARGS = --build-arg GRID_GIT_COMMIT=$(GRID_GIT_COMMIT) \
 	--build-arg GRID_GIT_VERSION=$(GRID_GIT_VERSION) \
 	--build-arg GRID_GIT_TREE_STATE=$(GRID_GIT_TREE_STATE) \

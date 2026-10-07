@@ -31,7 +31,7 @@ fips = [
 ]
 
 [dependencies]
-version = { path = "../version" }
+version.workspace = true
 axum = { workspace = true }
 bytes = { workspace = true }
 clap = { workspace = true, features = ["env"] }

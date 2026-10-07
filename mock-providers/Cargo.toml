@@ -7,7 +7,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
-version = { path = "../version" }
+version.workspace = true
 axum = { workspace = true }
 clap = { workspace = true }
 http = { workspace = true }

@@ -63,6 +63,9 @@ impl Info {
             tracing::warn!(
                 binary = name,
                 version = self.git_version,
+                tree = self.git_tree_state,
+                built = self.build_date,
+                rustc = self.rustc_version,
                 platform = self.platform,
                 "starting a build with no source commit; it cannot be traced to a revision"
             );
@@ -92,8 +95,6 @@ impl std::fmt::Display for Info {
 }
 
 #[cfg(test)]
-#[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
-#[allow(clippy::unwrap_used, reason = "tests")]
 mod tests {
     use super::*;
 
@@ -155,14 +156,14 @@ mod tests {
     }
 
     #[test]
-    fn info_serializes_with_the_field_names_the_flightctl_shape_uses() {
+    fn info_serializes_with_the_field_names_the_flightctl_shape_uses() -> Result<(), serde_json::Error> {
         let json = serde_json::to_string(&Info {
             git_version: "v1.2.3",
             ..get()
-        })
-        .unwrap();
+        })?;
         for key in ["\"gitVersion\"", "\"gitCommit\"", "\"gitTreeState\"", "\"buildDate\""] {
             assert!(json.contains(key), "{key} missing from {json}");
         }
+        Ok(())
     }
 }

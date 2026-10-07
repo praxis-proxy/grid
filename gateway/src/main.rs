@@ -36,6 +36,7 @@ fn log_startup() {
         commit = build.git_commit,
         tree = build.git_tree_state,
         built = build.build_date,
+        rustc = build.rustc_version,
         platform = build.platform,
         "{STARTUP_MESSAGE}"
     );

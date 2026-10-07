@@ -24,6 +24,7 @@ rust-version = "1.96"
 license = "Apache-2.0"
 
 [workspace.dependencies]
+version = { path = "version" }
 aes-gcm = "0.11.1"
 axum = "0.8.9"
 bytes = "1.12.1"
