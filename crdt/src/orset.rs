@@ -324,8 +324,14 @@ mod tests {
     #[test]
     fn restored_writer_advances_past_active_and_removed_tags() -> Result<(), serde_json::Error> {
         let mut original = OrSet::new("site-a".to_owned());
-        assert!(original.add("kept".to_owned()));
-        assert!(original.add("returned".to_owned()));
+        assert!(
+            original.add("kept".to_owned()),
+            "the original writer must allocate the retained tag"
+        );
+        assert!(
+            original.add("returned".to_owned()),
+            "the original writer must allocate the tag that will be removed"
+        );
         original.remove(&"returned".to_owned());
         let bytes = serde_json::to_string(&original)?;
         let persisted: OrSet<String> = serde_json::from_str(&bytes)?;
@@ -333,7 +339,10 @@ mod tests {
         relay.merge(&persisted);
         let mut restarted = OrSet::new("site-a".to_owned());
         restarted.merge(&relay);
-        assert!(restarted.add("returned".to_owned()));
+        assert!(
+            restarted.add("returned".to_owned()),
+            "the restored writer must allocate a fresh tag for the removed value"
+        );
         restarted.merge(&persisted);
         relay.merge(&restarted);
 
@@ -352,7 +361,10 @@ mod tests {
         saved.counter = 12;
         let mut restored = OrSet::new("a".to_owned());
         restored.merge(&saved);
-        assert!(restored.add("x".to_owned()));
+        assert!(
+            restored.add("x".to_owned()),
+            "the restored reserved counter must permit a fresh tag"
+        );
         assert_eq!(restored.counter, 13, "restoration must honor the serialized counter");
     }
 
@@ -372,7 +384,10 @@ mod tests {
     #[test]
     fn removed_buckets_are_pruned_but_delayed_additions_remain_removed() {
         let mut source = OrSet::new("a".to_owned());
-        assert!(source.add("x".to_owned()));
+        assert!(
+            source.add("x".to_owned()),
+            "the source must allocate the tag replayed after removal"
+        );
         let delayed = source.clone();
         source.remove(&"x".to_owned());
         let mut receiver = OrSet::new("b".to_owned());

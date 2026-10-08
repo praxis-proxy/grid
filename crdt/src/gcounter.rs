@@ -333,7 +333,11 @@ mod tests {
         assert_eq!(first.total(), u64::MAX, "merged totals must never wrap or panic");
         assert_eq!(second.total(), u64::MAX, "saturation is independent of merge order");
         assert_eq!(second.local(), 1, "saturation must preserve each site's contribution");
-        assert_eq!(first.retain_origin("b").total(), 1);
+        assert_eq!(
+            first.retain_origin("b").total(),
+            1,
+            "saturation must preserve site b's individual contribution"
+        );
         first.merge(&second);
         assert_eq!(first.total(), u64::MAX, "duplicate delivery remains idempotent");
     }

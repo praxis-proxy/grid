@@ -1761,11 +1761,22 @@ mod tests {
         let historical = [1, 1, b'a', 1, 1, b'a', 0, 0, 1, b'a', 0, 0, 0, 1, 1, b'g', 0];
         let decoded = StateBroadcast::decode(&historical)?;
 
-        assert_eq!(decoded.origin_site, "a");
-        assert_eq!(decoded.revision, 1);
-        assert_eq!(decoded.snapshot, GridStateSnapshot::new("a".to_owned()));
-        assert_eq!(decoded.gateway_address.as_deref(), Some("g"));
-        assert!(decoded.site_cert_pem.is_none());
+        assert_eq!(decoded.origin_site, "a", "the historical origin identity must survive");
+        assert_eq!(decoded.revision, 1, "the historical origin revision must survive");
+        assert_eq!(
+            decoded.snapshot,
+            GridStateSnapshot::new("a".to_owned()),
+            "historical bytes must preserve the empty origin snapshot"
+        );
+        assert_eq!(
+            decoded.gateway_address.as_deref(),
+            Some("g"),
+            "the historical extension must preserve its gateway address"
+        );
+        assert!(
+            decoded.site_cert_pem.is_none(),
+            "the historical extension must preserve an absent site certificate"
+        );
         assert!(
             decoded.signature.is_none(),
             "old extension bytes must not manufacture a signature"
@@ -2270,8 +2281,14 @@ mod tests {
             handler.subscribe_gateway_addrs().borrow().is_empty(),
             "refused metadata must not escape through a lane"
         );
-        assert!(handler.subscribe_cert_pems().borrow().is_empty());
-        assert!(handler.subscribe_signals_addrs().borrow().is_empty());
+        assert!(
+            handler.subscribe_cert_pems().borrow().is_empty(),
+            "refused certificate metadata must not escape through its lane"
+        );
+        assert!(
+            handler.subscribe_signals_addrs().borrow().is_empty(),
+            "refused signals addresses must not escape through their lane"
+        );
         assert!(
             receive_signed(&mut handler, "site-pinned-a", 2, &signing_key).is_some(),
             "existing origins can advance at capacity"

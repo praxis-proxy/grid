@@ -3026,7 +3026,8 @@ mod tests {
             state_rx
                 .borrow_and_update()
                 .provider("net", "site-a", "provider-a")
-                .is_some()
+                .is_some(),
+            "the initial publication must contain provider-a"
         );
 
         evict_origins(&["site-a".to_owned()], &node, &state_tx);
