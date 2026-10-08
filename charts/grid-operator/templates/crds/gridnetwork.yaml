@@ -299,6 +299,28 @@ spec:
 
                               Default: `/run/secrets/grid-credentials`.
                             type: string
+                          deriveTopology:
+                            description: |-
+                              Derive the endpoint topology from the declarations of named providers,
+                              instead of requiring a `clusterEndpoints` entry per candidate.
+
+                              Per gateway rather than per network, so one site can adopt derivation
+                              while another keeps explicit entries. An explicit entry for a cluster
+                              still wins, whole rather than field by field.
+                            nullable: true
+                            properties:
+                              fromProviders:
+                                default: []
+                                description: |-
+                                  Routing identities whose declarations this gateway derives from.
+
+                                  Each entry is a provider's `routingClusterRef`, or its `metadata.name`
+                                  when that is unset, which is the same identity the routing overlay uses
+                                  as `candidate.cluster`.
+                                items:
+                                  type: string
+                                type: array
+                            type: object
                           enableProjectedCredentials:
                             default: false
                             description: |-
