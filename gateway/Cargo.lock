@@ -669,7 +669,7 @@ dependencies = [
 
 [[package]]
 name = "certs"
-version = "0.1.5"
+version = "0.2.0"
 dependencies = [
  "openssl",
  "pem 4.0.0",
@@ -1607,14 +1607,14 @@ dependencies = [
 
 [[package]]
 name = "grid-signals"
-version = "0.1.5"
+version = "0.2.0"
 dependencies = [
  "dashmap",
 ]
 
 [[package]]
 name = "grid-signals-client"
-version = "0.1.5"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "certs",
@@ -5142,7 +5142,7 @@ checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
 
 [[package]]
 name = "version"
-version = "0.1.5"
+version = "0.2.0"
 dependencies = [
  "serde",
  "tracing",

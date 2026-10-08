@@ -459,7 +459,7 @@ dependencies = [
 
 [[package]]
 name = "certs"
-version = "0.1.5"
+version = "0.2.0"
 dependencies = [
  "hmac 0.12.1",
  "openssl",
@@ -662,7 +662,7 @@ checksum = "217698eaf96b4a3f0bc4f3662aaa55bdf913cd54d7204591faa790070c6d0853"
 
 [[package]]
 name = "crdt"
-version = "0.1.5"
+version = "0.2.0"
 dependencies = [
  "bincode",
  "serde",
@@ -953,7 +953,7 @@ dependencies = [
 
 [[package]]
 name = "enrollment"
-version = "0.1.5"
+version = "0.2.0"
 dependencies = [
  "axum",
  "axum-server",
@@ -1075,7 +1075,7 @@ checksum = "d45db016d36b838f563236e9193d0ee6ce38f3f68b6c94e914b4929c96bbb890"
 
 [[package]]
 name = "fleet-dashboard"
-version = "0.1.5"
+version = "0.2.0"
 dependencies = [
  "axum",
  "axum-server",
@@ -1159,7 +1159,7 @@ checksum = "00b0228411908ca8685dba7fc2cdd70ec9990a6e753e89b6ac91a84c40fbaf4b"
 
 [[package]]
 name = "forge"
-version = "0.1.5"
+version = "0.2.0"
 dependencies = [
  "clap",
  "fs2",
@@ -1395,7 +1395,7 @@ dependencies = [
 
 [[package]]
 name = "grid-overlay-sync"
-version = "0.1.5"
+version = "0.2.0"
 dependencies = [
  "axum",
  "clap",
@@ -1418,14 +1418,14 @@ dependencies = [
 
 [[package]]
 name = "grid-signals"
-version = "0.1.5"
+version = "0.2.0"
 dependencies = [
  "dashmap",
 ]
 
 [[package]]
 name = "grid-signals-client"
-version = "0.1.5"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "certs",
@@ -2318,7 +2318,7 @@ dependencies = [
 
 [[package]]
 name = "mock-providers"
-version = "0.1.5"
+version = "0.2.0"
 dependencies = [
  "axum",
  "clap",
@@ -2513,7 +2513,7 @@ dependencies = [
 
 [[package]]
 name = "operator"
-version = "0.1.5"
+version = "0.2.0"
 dependencies = [
  "axum",
  "bytes",
@@ -3289,7 +3289,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "scoring"
-version = "0.1.5"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -3850,7 +3850,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "swim"
-version = "0.1.5"
+version = "0.2.0"
 dependencies = [
  "aes-gcm",
  "bincode",
@@ -4449,7 +4449,7 @@ dependencies = [
 
 [[package]]
 name = "version"
-version = "0.1.5"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -4834,7 +4834,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.1.5"
+version = "0.2.0"
 dependencies = [
  "certs",
  "clap",

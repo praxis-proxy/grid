@@ -15,7 +15,7 @@ commonLabels: {}
 image:
   # Enrollment app image. The same binary serves the API and runs the
   # `enrollment bootstrap` Job (the sar and bootstrap features, on by default).
-  repository: quay.io/praxis-proxy/grid-enrollment
+  repository: ghcr.io/praxis-proxy/grid-enrollment
   tag: ""            # defaults to .Chart.AppVersion
   digest: ""         # sha256:<64 hex>; when set, tag is ignored
   pullPolicy: IfNotPresent

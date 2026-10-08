@@ -2,8 +2,8 @@ apiVersion: v2
 name: grid-operator
 description: Grid operator for multi-site AI inference routing with Praxis
 type: application
-version: 0.1.5
-appVersion: "v0.1.5"
+version: 0.2.0
+appVersion: "v0.2.0"
 kubeVersion: ">=1.26.0-0"
 home: https://github.com/praxis-proxy/grid
 sources:

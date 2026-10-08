@@ -28,6 +28,7 @@ env:
   OFFICIAL_AI_IMAGE_TAG: 0.4.0
   OFFICIAL_AI_IMAGE_DIGEST: sha256:0f619d4a0b533093f94a76921cfbba0ecdec51557dffee1615a29721ee1fc878
   OFFICIAL_AI_SOURCE_SHA: ca3e760c790a34293c03d2314a3c7cfbf73836b3
+  ENROLLMENT_IMAGE_NAME: ghcr.io/praxis-proxy/grid-enrollment
   OPERATOR_IMAGE_NAME: ghcr.io/praxis-proxy/grid-operator
   GATEWAY_IMAGE_NAME: ghcr.io/praxis-proxy/grid-gateway
   MOCK_PROVIDERS_IMAGE_NAME: ghcr.io/praxis-proxy/grid-mock-providers
@@ -138,6 +139,7 @@ jobs:
       operator_digest: ${{ steps.operator.outputs.digest }}
       gateway_digest: ${{ steps.gateway.outputs.digest }}
       mock_providers_digest: ${{ steps.mock_providers.outputs.digest }}
+      enrollment_digest: ${{ steps.enrollment.outputs.digest }}
       overlay_sync_digest: ${{ steps.overlay_sync.outputs.digest }}
       official_ai_digest: ${{ steps.official_ai.outputs.digest }}
     steps:
@@ -229,6 +231,30 @@ jobs:
             org.opencontainers.image.version=${{ needs.validate.outputs.version }}
           cache-from: type=gha,scope=release-gateway
           cache-to: type=gha,mode=max,scope=release-gateway
+          provenance: mode=max
+          sbom: true
+
+      - name: Build and push enrollment
+        id: enrollment
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: deploy/enrollment/Containerfile
+          push: true
+          tags: |
+            ${{ env.ENROLLMENT_IMAGE_NAME }}:${{ needs.validate.outputs.tag }}
+            ${{ env.ENROLLMENT_IMAGE_NAME }}:sha-${{ needs.validate.outputs.short_sha }}
+          build-args: |
+            GRID_GIT_COMMIT=${{ needs.validate.outputs.source_sha }}
+            GRID_GIT_VERSION=${{ needs.validate.outputs.version }}
+            GRID_GIT_TREE_STATE=clean
+            GRID_BUILD_DATE=${{ needs.validate.outputs.build_date }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ needs.validate.outputs.source_sha }}
+            org.opencontainers.image.version=${{ needs.validate.outputs.version }}
+          cache-from: type=gha,scope=release-enrollment
+          cache-to: type=gha,mode=max,scope=release-enrollment
           provenance: mode=max
           sbom: true
 
@@ -333,7 +359,7 @@ jobs:
           TAG: ${{ needs.validate.outputs.tag }}
           VERSION: ${{ needs.validate.outputs.version }}
         run: |
-          for chart in grid-operator praxis-gateway grid-site grid-mock-providers; do
+          for chart in grid-operator praxis-gateway grid-site grid-mock-providers grid-enrollment; do
             CHART_VERSION=$(grep '^version:' "charts/${chart}/Chart.yaml" | awk '{print $2}')
             CHART_APP_VERSION=$(grep '^appVersion:' "charts/${chart}/Chart.yaml" | awk '{print $2}' | tr -d '"')
             if [ "$CHART_VERSION" != "$VERSION" ]; then
@@ -352,7 +378,7 @@ jobs:
 
       - name: Lint charts
         run: |
-          for chart in grid-operator praxis-gateway grid-mock-providers; do
+          for chart in grid-operator praxis-gateway grid-mock-providers grid-enrollment; do
             helm lint "charts/${chart}" --strict
           done
           helm lint charts/grid-site --strict \
@@ -361,7 +387,7 @@ jobs:
 
       - name: Package charts
         run: |
-          for chart in grid-operator praxis-gateway grid-site grid-mock-providers; do
+          for chart in grid-operator praxis-gateway grid-site grid-mock-providers grid-enrollment; do
             helm package "charts/${chart}"
           done
 
@@ -371,7 +397,7 @@ jobs:
       - name: Push charts to OCI registry
         id: push
         run: |
-          for chart in grid-operator praxis-gateway grid-site grid-mock-providers; do
+          for chart in grid-operator praxis-gateway grid-site grid-mock-providers grid-enrollment; do
             OUTPUT=$(helm push "${chart}-${{ needs.validate.outputs.version }}.tgz" oci://ghcr.io/praxis-proxy/charts 2>&1)
             echo "$OUTPUT"
             if [ "$chart" = grid-operator ]; then
@@ -439,6 +465,7 @@ jobs:
           oci://ghcr.io/praxis-proxy/charts/praxis-gateway --version ${VERSION}
           oci://ghcr.io/praxis-proxy/charts/grid-site --version ${VERSION}
           oci://ghcr.io/praxis-proxy/charts/grid-mock-providers --version ${VERSION}
+          oci://ghcr.io/praxis-proxy/charts/grid-enrollment --version ${VERSION}
           \`\`\`
 
           Install:
