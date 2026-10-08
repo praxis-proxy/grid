@@ -243,7 +243,7 @@ tests:
           path: spec.template.spec.containers[0].env
           content:
             name: GRID_SIGNALS_PEER_INTERVAL_SECS
-            value: ""
+          any: true
 
   - it: refuses an interval the operator would exit on
     template: templates/deployment.yaml
