@@ -17,9 +17,10 @@ The [verification matrix] explains what each local gate covers and which
 additional jobs CI runs. `make test` covers the root workspace; Gateway has a
 separate workspace.
 
-For README or Markdown prose-only changes, check spelling, Markdown style,
-local links and anchors, and whitespace (`git diff --check`). The full test
-suite is not required. Examples and executable instructions need validation
+Run the local test suite before submitting any PR, including README or Markdown
+prose-only changes, as required by the [development conventions]. For prose,
+also check spelling, Markdown style, local links and anchors, and whitespace
+(`git diff --check`). Examples and executable instructions need validation
 appropriate to the affected behavior. Record checks that could not be run and
 their prerequisites in the PR.
 

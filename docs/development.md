@@ -74,9 +74,10 @@ qualifications. Run those when the changed contract requires them. The
 Tests and Coverage workflows skip their Rust jobs for documentation-only PRs;
 rustdoc and MSRV still run. The Gateway, Helm, and dashboard workflows have
 their own triggers and scopes. A skipped or absent job is not a passing test
-result. Changes to README or Markdown prose alone do not require the full
-local test suite. Changes to examples, generated contracts, or executable
-commands need checks appropriate to the affected behavior.
+result. The [canonical conventions](conventions.md) require the local test
+suite before submitting any PR, including README or Markdown prose changes.
+Changes to examples, generated contracts, or executable commands also need
+checks appropriate to the affected behavior.
 
 ### Formatting and documentation
 
