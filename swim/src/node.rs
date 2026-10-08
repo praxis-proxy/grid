@@ -571,7 +571,11 @@ mod tests {
             encrypted.len() <= MAX_SWIM_PACKET_BYTES,
             "encryption must fit inside the advertised datagram limit"
         );
-        assert_eq!(crate::crypto::decrypt(&[7; 32], &encrypted)?, plaintext);
+        assert_eq!(
+            crate::crypto::decrypt(&[7; 32], &encrypted)?,
+            plaintext,
+            "the bounded encrypted packet must preserve its complete plaintext"
+        );
         Ok(())
     }
 
