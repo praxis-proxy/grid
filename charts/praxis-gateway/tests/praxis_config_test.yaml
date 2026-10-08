@@ -24,6 +24,16 @@ tests:
       - failedTemplate:
           errorPattern: source
 
+  - it: rejects render-only authentication and peer settings for BYO
+    template: templates/deployment.yaml
+    set:
+      praxisConfig.render.peerTrust.certDigests: [aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa]
+      praxisConfig.render.auth.validateUrl: https://identity.example/validate
+      praxisConfig.render.auth.validateCA.secretName: validate-ca
+    asserts:
+      - failedTemplate:
+          errorPattern: praxisConfig.render settings are set but praxisConfig.source is byo
+
   - it: operator mounts the operator's default ConfigMap and the praxis.yaml key
     template: templates/deployment.yaml
     set:
@@ -126,6 +136,38 @@ tests:
       - matchRegex:
           path: data["praxis.yaml"]
           pattern: 'cert_path: "/etc/praxis/listener-tls/tls.crt"'
+
+  - it: render consumers reject provider peer trust settings
+    template: templates/deployment.yaml
+    set:
+      praxisConfig.source: render
+      grid.siteName: hub
+      praxisConfig.render.model: m
+      praxisConfig.render.auth.mode: none
+      praxisConfig.render.peerTrust.certDigests: [aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa]
+      praxisConfig.render.backends:
+        - cluster: a
+          endpoints: ["10.0.0.1:8000"]
+          transport: { mode: plaintext }
+    asserts:
+      - failedTemplate:
+          errorPattern: peerTrust.certDigests is only supported for role provider
+
+  - it: render authentication CA settings require api-key mode
+    template: templates/deployment.yaml
+    set:
+      praxisConfig.source: render
+      grid.siteName: hub
+      praxisConfig.render.model: m
+      praxisConfig.render.auth.mode: none
+      praxisConfig.render.auth.validateUrl: https://identity.example/validate
+      praxisConfig.render.backends:
+        - cluster: a
+          endpoints: ["10.0.0.1:8000"]
+          transport: { mode: plaintext }
+    asserts:
+      - failedTemplate:
+          errorPattern: validateUrl and validateCA require auth.mode api-key
 
   - it: upstreamCA mounts for BYO when named
     template: templates/deployment.yaml
