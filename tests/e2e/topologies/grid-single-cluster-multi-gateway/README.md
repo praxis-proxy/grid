@@ -105,10 +105,10 @@ when the policy is `Never`, and recorded in qualification evidence. The runner
 fails before deployment if an explicit reference is malformed, missing, or
 absent from the materialized configuration.
 
-Build Forge and the `grid-operator` and overlay-sync images from this checkout:
+Install pinned upstream Forge and build the `grid-operator` and overlay-sync images from this checkout:
 
 ```console
-cargo build -p forge
+./scripts/forge.sh install
 
 export GRID_XTASK_GATEWAY_IMAGE=praxis-ai:single-cluster-qualification-$RUN_ID
 export GRID_XTASK_OPERATOR_IMAGE=grid-operator:single-cluster-qualification-$RUN_ID
@@ -138,7 +138,7 @@ tests before creating the cluster:
 ```console
 docker pull ghcr.io/neuralmagic/vllm-vcr:vllm0.23
 
-target/debug/praxis-forge \
+./scripts/forge.sh \
   --config tests/e2e/topologies/grid-single-cluster-multi-gateway/forge.yaml \
   config validate
 
