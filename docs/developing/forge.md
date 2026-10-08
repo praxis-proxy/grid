@@ -94,7 +94,8 @@ current workspace and production resolver.
 
 A disposable Kind fixture then creates resources and state with the retired CLI
 and resumes them with upstream. It verifies repeated bring-up and teardown,
-relocated template assets and exec working directories, preservation of a
+relocated template assets and config-relative script arguments while preserving
+the caller's exec working directory for both CLIs, preservation of a
 pre-existing network, and cleanup after an injected cluster-creation failure.
 This checks lifecycle compatibility independently of the static plan comparison.
 

@@ -49,12 +49,18 @@ forge() {
 }
 cd "$WORK/unrelated"
 "$FORGE_BASELINE_BIN" --config "$CONFIG" --state-dir "$STATE" --non-interactive up
+"$FORGE_BASELINE_BIN" --config "$CONFIG" --state-dir "$STATE" --non-interactive apply probe
+[[ $(cat "$WORK/config/execution-cwd.txt") == "$WORK/unrelated" ]]
+[[ $(cat "$WORK/config/execution-root.txt") == "$WORK/config" ]]
+cp "$WORK/config/execution-cwd.txt" "$EVIDENCE/grid-execution-cwd.txt"
 cp "$STATE/state.json" "$EVIDENCE/grid-state.json"
 jq --exit-status '.networkCreatedByForge == true' "$STATE/state.json"
 forge up
 forge up
 forge apply probe
-[[ $(cat "$WORK/config/execution-cwd.txt") == "$WORK/config" ]]
+[[ $(cat "$WORK/config/execution-cwd.txt") == "$WORK/unrelated" ]]
+[[ $(cat "$WORK/config/execution-root.txt") == "$WORK/config" ]]
+cmp "$WORK/config/execution-cwd.txt" "$EVIDENCE/grid-execution-cwd.txt"
 [[ $(kubectl --context "kind-$CLUSTER" get configmap forge-migration-proof -o jsonpath='{.data.proof}') == upstream-compatible ]]
 cp "$STATE/state.json" "$EVIDENCE/upstream-state.json"
 jq --exit-status '.networkCreatedByForge == false and .networkId == null' "$STATE/state.json"
