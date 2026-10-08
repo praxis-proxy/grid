@@ -9,8 +9,8 @@ listeners:
       - edge-steering
     tls:
       certificates:
-        - cert_path: /etc/praxis/tls/tls.crt
-          key_path: /etc/praxis/tls/tls.key
+        - cert_path: /etc/praxis/listener-tls/tls.crt
+          key_path: /etc/praxis/listener-tls/tls.key
 
 clusters:
   - name: grid-edges

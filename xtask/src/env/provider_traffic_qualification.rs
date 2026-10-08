@@ -28,7 +28,7 @@ const CLUSTERS: &[&str] = &["provider-a", "provider-b", "provider-c"];
 /// The single consumer gateway used by the focused request-routing proof.
 const CONSUMER_SITE: &str = "provider-a";
 
-/// Consumer gateway TLS secret name (matches Helm `existingSecret` reference).
+/// Consumer gateway identity Secret name (matches Helm `gridIdentity.tlsSecretName`).
 const CONSUMER_TLS_SECRET: &str = "consumer-gateway-tls";
 
 /// Evidence JSON schema version.
@@ -40,7 +40,7 @@ const GRID_SYSTEM_NS: &str = "grid-system";
 /// Overlay `ConfigMap` name created by the Grid operator for consumer gateways.
 const OVERLAY_CONFIGMAP: &str = "grid-overlay-grid-provider-traffic-consumer-gateway";
 
-/// Provider credential secret name (matches Helm `credentials[0].name`).
+/// Provider credential Secret name (matches Helm `providerCredentials[0].secretName`).
 const VCR_INFERENCE_CREDENTIAL: &str = "vcr-inference-credential";
 
 /// Stable terminal separator that also remains readable in captured logs.
@@ -52,7 +52,7 @@ const PROVIDER_GATEWAY_SERVICE: &str = "provider-gateway";
 /// Provider gateway port advertised via SWIM for cross-site discovery.
 const PROVIDER_GATEWAY_PORT: &str = "8443";
 
-/// Provider gateway TLS secret name (matches Helm `existingSecret` reference).
+/// Provider gateway identity Secret name (matches Helm `gridIdentity.tlsSecretName`).
 const PROVIDER_TLS_SECRET: &str = "provider-gateway-tls";
 
 /// Same-CA client identity with an organization rejected by `peer_identity_trust`.

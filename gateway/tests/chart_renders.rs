@@ -17,10 +17,10 @@ mod tests {
 
     /// Values every case starts from: a rendered gateway config with no auth.
     const BASE: &[&str] = &[
-        "--set=gatewayConfig.render=true",
-        "--set=gatewayConfig.localSite=hub",
-        "--set=gatewayConfig.model=qwen3",
-        "--set=gatewayConfig.auth.mode=none",
+        "--set=praxisConfig.source=render",
+        "--set=grid.siteName=hub",
+        "--set=praxisConfig.render.model=qwen3",
+        "--set=praxisConfig.render.auth.mode=none",
     ];
 
     /// The default local backend, a local tls workload with its CA, and a remote peer.
@@ -28,32 +28,31 @@ mod tests {
         (
             "local plaintext",
             &[
-                "--set=gatewayConfig.backends[0].cluster=site-a",
-                "--set=gatewayConfig.backends[0].transport.mode=plaintext",
-                "--set=gatewayConfig.backends[0].endpoints[0]=10.0.0.5:8000",
+                "--set=praxisConfig.render.backends[0].cluster=site-a",
+                "--set=praxisConfig.render.backends[0].transport.mode=plaintext",
+                "--set=praxisConfig.render.backends[0].endpoints[0]=10.0.0.5:8000",
             ],
         ),
         (
             "local tls",
             &[
-                "--set=gatewayConfig.backends[0].cluster=kserve",
-                "--set=gatewayConfig.backends[0].transport.mode=tls",
-                "--set=gatewayConfig.backends[0].transport.sni=qwen3.ns.svc",
-                "--set=gatewayConfig.backends[0].transport.ca.configMap=service-ca",
-                "--set=gatewayConfig.backends[0].endpoints[0]=10.0.0.6:8443",
+                "--set=praxisConfig.render.backends[0].cluster=kserve",
+                "--set=praxisConfig.render.backends[0].transport.mode=tls",
+                "--set=praxisConfig.render.backends[0].transport.sni=qwen3.ns.svc",
+                "--set=praxisConfig.render.backends[0].transport.ca.configMapName=service-ca",
+                "--set=praxisConfig.render.backends[0].endpoints[0]=10.0.0.6:8443",
             ],
         ),
         (
             "remote peer",
             &[
-                "--set=gatewayConfig.backends[0].cluster=pool-b",
-                "--set=gatewayConfig.backends[0].site=site-b",
-                "--set=gatewayConfig.backends[0].transport.mode=mutual_tls",
-                "--set=gatewayConfig.backends[0].transport.sni=site-b.grid.internal",
-                "--set=gatewayConfig.backends[0].endpoints[0]=203.0.113.7:8443",
-                "--set=tls.enabled=true",
-                "--set=tls.existingSecret=grid-site-identity",
-                "--set=tls.caSecret=grid-ca",
+                "--set=praxisConfig.render.backends[0].cluster=pool-b",
+                "--set=praxisConfig.render.backends[0].site=site-b",
+                "--set=praxisConfig.render.backends[0].transport.mode=mutual_tls",
+                "--set=praxisConfig.render.backends[0].transport.sni=site-b.grid.internal",
+                "--set=praxisConfig.render.backends[0].endpoints[0]=203.0.113.7:8443",
+                "--set=gridIdentity.tlsSecretName=grid-site-identity",
+                "--set=gridIdentity.caSecretName=grid-ca",
             ],
         ),
     ];
@@ -118,18 +117,17 @@ mod tests {
     fn a_grid_serving_render_with_site_route_tuning_loads() {
         let Some(yaml) = render(&[
             "--set=image.flavor=grid-gateway",
-            "--set=gridServing.enabled=true",
-            "--set=gridServing.network=grid",
-            "--set=gridServing.siteRoute.availability.shedding=true",
+            "--set=praxisConfig.render.gridServing.enabled=true",
+            "--set=praxisConfig.render.gridServing.networkName=grid",
+            "--set=praxisConfig.render.gridServing.siteRoute.availability.shedding=true",
             // A float through --set is a string, which the schema refuses; a bool parses.
-            "--set=gridServing.siteRoute.prefixAffinity.enabled=false",
-            "--set=tls.enabled=true",
-            "--set=tls.existingSecret=grid-site-identity",
-            "--set=tls.caSecret=grid-ca",
-            "--set=gatewayConfig.backends[0].cluster=pool-b",
-            "--set=gatewayConfig.backends[0].transport.mode=mutual_tls",
-            "--set=gatewayConfig.backends[0].transport.sni=site-b.grid.internal",
-            "--set=gatewayConfig.backends[0].endpoints[0]=203.0.113.7:8443",
+            "--set=praxisConfig.render.gridServing.siteRoute.prefixAffinity.enabled=false",
+            "--set=gridIdentity.tlsSecretName=grid-site-identity",
+            "--set=gridIdentity.caSecretName=grid-ca",
+            "--set=praxisConfig.render.backends[0].cluster=pool-b",
+            "--set=praxisConfig.render.backends[0].transport.mode=mutual_tls",
+            "--set=praxisConfig.render.backends[0].transport.sni=site-b.grid.internal",
+            "--set=praxisConfig.render.backends[0].endpoints[0]=203.0.113.7:8443",
         ]) else {
             return;
         };

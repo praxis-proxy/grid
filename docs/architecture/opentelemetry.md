@@ -9,7 +9,7 @@ state.
 The default configuration has no collector endpoint, so it starts without an
 OTLP exporter and does not require a collector. To opt in, use either
 `GatewayRef.consumerConfig.telemetry` for operator-generated consumer config or
-`gatewayConfig.telemetry` for the Helm-generated Praxis config.
+`praxisConfig.render.telemetry` for the Helm-generated Praxis config.
 
 An operator example:
 
@@ -27,19 +27,32 @@ spec:
           environment: production
 ```
 
-For Helm, enable `gatewayConfig.telemetry` and use the Grid gateway image:
+For Helm, select the rendered source, enable
+`praxisConfig.render.telemetry`, set the local site, and use the Grid gateway image:
 
 ```yaml
 image:
   repository: ghcr.io/praxis-proxy/grid-gateway
   flavor: grid-gateway
-gatewayConfig:
-  render: true
-  telemetry:
-    enabled: true
-    otlpEndpoint: http://otel-collector.observability:4317
-    samplingRate: 0.1
-    serviceName: grid-edge
+grid:
+  siteName: edge
+gridIdentity:
+  tlsSecretName: grid-site-identity
+  caSecretName: grid-ca
+praxisConfig:
+  source: render
+  render:
+    model: my-model
+    auth:
+      mode: none
+    backends:
+      site-a:
+        endpoint: 203.0.113.20:8080
+    telemetry:
+      enabled: true
+      otlpEndpoint: http://otel-collector.observability:4317
+      samplingRate: 0.1
+      serviceName: grid-edge
 ```
 
 Both paths render a top-level Praxis `telemetry` block. The Helm chart adds the

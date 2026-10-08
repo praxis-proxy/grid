@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # praxis-gateway standalone e2e. Forge creates a Kind cluster with no Grid
 # components, installs charts/praxis-gateway with no values, reconfigures it
-# through config.inline, an existing ConfigMap, and the core Praxis image, and
+# through praxisConfig.byo.inline, an existing ConfigMap, and the core Praxis image, and
 # checks real requests after every change. The topology and its stages live in
 # tests/e2e/topologies/praxis-gateway-standalone.
 #

@@ -320,7 +320,7 @@ spec:
         - type: helm
           release: provider-gateway
           chart: charts/praxis-gateway
-          version: "0.1.0"
+          version: "0.1.5"
           namespace: grid-system
           values:
             nameOverride: "provider-gateway"
@@ -338,8 +338,9 @@ spec:
               limits:
                 cpu: 500m
                 memory: 256Mi
-            config:
-              existingConfigMap: "provider-gateway-config"
+            praxisConfig:
+              byo:
+                configMapName: "provider-gateway-config"
             port:
               containerPort: 8443
               name: "https-mtls"
@@ -357,13 +358,13 @@ spec:
                   port: "https-mtls"
                 initialDelaySeconds: 5
                 periodSeconds: 10
-            tls:
-              enabled: true
-              existingSecret: "provider-gateway-tls"
-            credentials:
-              - name: "vcr-inference-credential"
+            gridIdentity:
+              tlsSecretName: "provider-gateway-tls"
+              caSecretName: "grid-ca"
+            providerCredentials:
+              - secretName: "vcr-inference-credential"
                 mountPath: "/etc/praxis/credentials/vcr-inference"
-              - name: "vcr-inference-secondary-credential"
+              - secretName: "vcr-inference-secondary-credential"
                 mountPath: "/etc/praxis/credentials/vcr-inference-secondary"
                 optional: true
             podLabels:
@@ -408,7 +409,7 @@ spec:
         - type: helm
           release: edge-gateway
           chart: charts/praxis-gateway
-          version: "0.1.0"
+          version: "0.1.5"
           namespace: grid-system
           values:
             nameOverride: "edge-gateway"
@@ -426,16 +427,19 @@ spec:
               limits:
                 cpu: 500m
                 memory: 256Mi
-            config:
-              existingConfigMap: "edge-gateway-config"
+            praxisConfig:
+              byo:
+                configMapName: "edge-gateway-config"
             service:
               type: "LoadBalancer"
+            grid:
+              networkName: glb-demo
+              siteName: "{{ cluster.name }}"
             overlay:
-              enabled: true
-              existingConfigMap: "grid-overlay-glb-demo-edge-gateway"
-            tls:
-              enabled: true
-              existingSecret: "edge-gateway-tls"
+              configMapName: "grid-overlay-glb-demo-edge-gateway"
+            gridIdentity:
+              tlsSecretName: "edge-gateway-tls"
+              caSecretName: "grid-ca"
             podLabels:
               grid.praxis.fast/edge-site: "{{ cluster.name }}"
         - type: wait
@@ -472,7 +476,7 @@ spec:
         - type: helm
           release: gtm-emulator
           chart: charts/praxis-gateway
-          version: "0.1.0"
+          version: "0.1.5"
           namespace: grid-system
           values:
             nameOverride: "gtm-emulator"
@@ -490,8 +494,9 @@ spec:
               limits:
                 cpu: 500m
                 memory: 256Mi
-            config:
-              existingConfigMap: "gtm-emulator-config"
+            praxisConfig:
+              byo:
+                configMapName: "gtm-emulator-config"
             health:
               readiness:
                 tcpSocket:
@@ -509,9 +514,8 @@ spec:
             service:
               type: "LoadBalancer"
               port: 8443
-            tls:
-              enabled: true
-              existingSecret: "gtm-emulator-tls"
+            listenerTls:
+              secretName: "gtm-emulator-tls"
         - type: wait
           resource: deployment/gtm-emulator
           namespace: grid-system

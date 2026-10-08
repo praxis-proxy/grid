@@ -632,7 +632,7 @@ own. The operator's `grid_provider_*` conclusions are its Prometheus metrics, no
 
 Nothing needs setting. Every field below has a default, and the one switch is `shedding`.
 The fields live in the `availability` block of the `grid_site_route` filter in the gateway's
-praxis config, rendered from the chart's `gridServing.siteRoute.availability`, and
+praxis config, rendered from the chart's `praxisConfig.render.gridServing.siteRoute.availability`, and
 `examples/gateway/grid-site-route.yaml` shows the block. A change is a chart value and a rollout.
 
 | key | default | what it does |

@@ -41,8 +41,10 @@ head -c 32 /dev/urandom | kubectl -n grid create secret generic grid-swim-key --
 helm upgrade --install grid-site charts/grid-site -n grid \
   --set gridNetwork.gridId=grid-1 --set gridSite.name=hub --set peers.site-a.address=203.0.113.20:8080
 helm upgrade --install grid-gateway charts/praxis-gateway -n grid \
-  --set gatewayConfig.localSite=hub --set gatewayConfig.model=my-model --set gatewayConfig.auth.mode=none \
-  --set gatewayConfig.backends.site-a.endpoint=203.0.113.20:8080
+  --set fullnameOverride=grid-gateway --set praxisConfig.source=render --set grid.siteName=hub \
+  --set gridIdentity.tlsSecretName=grid-site-identity --set gridIdentity.caSecretName=grid-ca \
+  --set praxisConfig.render.model=my-model --set praxisConfig.render.auth.mode=none \
+  --set praxisConfig.render.backends.site-a.endpoint=203.0.113.20:8080
 ```
 
 The enrollment chart creates the Grid CA and mints one token per invite into Secret `grid-invite-<site>`. The hub operator enrolls through the in-cluster enrollment Service, so you copy its CA bundle and invite into its own namespace, with the site label the operator checks. It writes the hub identity, `grid-site-identity` and `grid-ca`. The SWIM key is a Secret you create once and keep. The hub gateway is a ClusterIP Service behind your front, so the hub advertises no gateway address and sites list it as Discovered.
@@ -67,8 +69,9 @@ helm upgrade --install grid-site charts/grid-site -n grid \
   --set inferenceProviders.my-model.endpoint=http://10.96.0.20:8000
 helm upgrade --install grid-gateway charts/praxis-gateway -n grid \
   --set image.repository=ghcr.io/praxis-proxy/grid-gateway --set image.tag=v0.1.4 \
-  --set gatewayConfig.role=provider --set gatewayConfig.localSite=site-a \
-  --set gatewayConfig.peerTrust.digest="$HUB_DIGEST" --set gatewayConfig.backends.local.endpoint=10.96.0.20:8000
+  --set fullnameOverride=grid-gateway --set praxisConfig.source=render --set praxisConfig.render.role=provider --set grid.siteName=site-a \
+  --set gridIdentity.tlsSecretName=grid-site-identity --set gridIdentity.caSecretName=grid-ca \
+  --set praxisConfig.render.peerTrust.digest="$HUB_DIGEST" --set praxisConfig.render.backends.local.endpoint=10.96.0.20:8000
 ```
 
 The site needs three Secrets from the hub: the Grid CA bundle, its invite token with its site label, and the SWIM key. The commands above copy them one at a time. A fleet delivers them with ACM or External Secrets instead. The site operator redeems the token on its first start and writes the site identity. Then pin the site on the hub by rerunning the hub `grid-site` command with `--set peers.site-a.digest=<site-a leaf digest>` added.
@@ -82,7 +85,7 @@ An invite expires after a day by default, and an unredeemed one stays in place. 
 - grid-enrollment: `host` joins the serving cert names, is the default Route host, and makes the enrollment Service a LoadBalancer when no Route renders. An invite's `network` defaults to `grid`.
 - grid-operator with `enrollment.enabled`: the site name follows `swim.siteName`, the URL is the in-cluster grid-enrollment Service, the CA bundle is Secret `grid-ca-bundle`, the token is `grid-invite-<site>`, the SWIM Service is a LoadBalancer, the gateway Service is `grid-gateway`, and the render refuses Secret access in `grid-enrollment`.
 - grid-site: the network is `grid`. Listing `peers` turns on site discovery and the TLS Secrets the operator writes. A peer's probe name is `<name>.grid.internal`.
-- praxis-gateway: it renders its own config without a BYO ConfigMap. A grid gateway, a provider or a consumer with site backends, mounts `grid-site-identity` and `grid-ca` and takes its release name. A site backend uses mutual TLS to `<site>.grid.internal`. A provider's Service is a LoadBalancer, and `local` is its one plaintext backend.
+- praxis-gateway: it renders its own config without a BYO ConfigMap. Set `gridIdentity.tlsSecretName` to `grid-site-identity` and `gridIdentity.caSecretName` to `grid-ca` for mTLS. A site backend uses mutual TLS to `<site>.grid.internal`. A provider's Service is a LoadBalancer, and `local` is its one plaintext backend.
 
 ## Credential Delivery
 
@@ -98,17 +101,17 @@ In a fleet, deliver the three Secrets over one protected channel:
 
 ## Peer Trust
 
-The grid-site `gridNetwork.peerTrust.mode` is the source of truth for the grid. Each provider gateway's `gatewayConfig.peerTrust.mode` must match it.
+The grid-site `gridNetwork.peerTrust.mode` is the source of truth for the grid. Each provider gateway's `praxisConfig.render.peerTrust.mode` must match it.
 
 Each operator routes to a peer only once a probe of its gateway, at the peer `address`, finds a leaf that matches the peer `digest`, which makes the peer Active. Declare a peer before it joins, since the operator creates a GridSite for any peer it meets and Helm does not adopt it. To rotate a pin, set `nextDigest` to the new digest, then move it to `digest` once the peer is Active.
 
-`peerTrust.mode` picks how the signals listener and the provider gateway admit peers. In `pin` mode, the default, they admit the pinned digests. In `spiffe` mode, add `--set gridNetwork.peerTrust.mode=spiffe` to both grid-site commands, and on the site gateway replace the digest with `--set gatewayConfig.peerTrust.mode=spiffe --set gatewayConfig.peerTrust.spiffeId=spiffe://grid.internal/site/hub`. It needs the grid-gateway image built with the praxis `spiffe` feature, which praxis marks experimental.
+`peerTrust.mode` picks how the signals listener and the provider gateway admit peers. In `pin` mode, the default, they admit the pinned digests. In `spiffe` mode, add `--set gridNetwork.peerTrust.mode=spiffe` to both grid-site commands, and on the site gateway replace the digest with `--set praxisConfig.render.peerTrust.mode=spiffe --set praxisConfig.render.peerTrust.spiffeId=spiffe://grid.internal/site/hub`. It needs the grid-gateway image built with the praxis `spiffe` feature, which praxis marks experimental.
 
 Only `spiffe` rotates site certificates. In `pin` mode rotation is off: before a site's certificate expires, shown as `status.identity.notAfter` on its `GridNetwork`, re-enroll the site and update the digest its peers pin.
 
 ## Operations
 
-With `gridServing.enabled`, a current `grid-gateway` re-reads mounted
+With `praxisConfig.render.gridServing.enabled`, a current `grid-gateway` re-reads mounted
 serving data and signals-poller identity files every five seconds. Valid changes
 to peers, candidates, addresses, and pins apply without a pod restart after the
 kubelet refreshes the files. Invalid serving-data updates keep the last accepted

@@ -7,7 +7,7 @@ Two files the grid gateway reads, with a different author each.
 The `grid_site_route` filter block in the gateway's praxis config, with the `load_balancer`
 block that always follows it: the filter sets the cluster, the load balancer dials it and runs
 the health checks selection demotes on. A user sets it through the chart's
-`gridServing.siteRoute` values (`availability` and `prefixAffinity`, rendered as
+`praxisConfig.render.gridServing.siteRoute` values (`availability` and `prefixAffinity`, rendered as
 `availability` and `prefix_affinity`). Nothing needs setting: every field has a default and
 the block may be empty. The example sets the one switch, `shedding`. A change is a chart value
 and a rollout.

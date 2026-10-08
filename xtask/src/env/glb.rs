@@ -5056,7 +5056,7 @@ clusters:
         let forge = fs::read_to_string(workspace_root().join("tests/e2e/topologies/grid-glb-demo/forge.yaml"))
             .unwrap_or_else(|_| std::process::abort());
         assert!(
-            forge.contains("name: \"vcr-inference-credential\""),
+            forge.contains("secretName: \"vcr-inference-credential\""),
             "forge.yaml must declare the primary credential Secret"
         );
         assert!(
@@ -5064,7 +5064,7 @@ clusters:
             "forge.yaml must mount the primary credential"
         );
         assert!(
-            forge.contains("name: \"vcr-inference-secondary-credential\""),
+            forge.contains("secretName: \"vcr-inference-secondary-credential\""),
             "forge.yaml must declare the secondary credential Secret"
         );
         assert!(

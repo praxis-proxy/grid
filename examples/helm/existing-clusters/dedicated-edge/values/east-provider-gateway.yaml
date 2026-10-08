@@ -13,16 +13,20 @@ image:
   tag: 0.4.0
   pullPolicy: IfNotPresent
 
-config:
-  existingConfigMap: provider-praxis-config
-  key: praxis.yaml
+praxisConfig:
+  byo:
+    configMapName: provider-praxis-config
+    key: praxis.yaml
 
-tls:
-  enabled: true
-  existingSecret: provider-tls
+grid:
+  siteName: east-provider
 
-credentials:
-  - name: mock-inference-credential
+gridIdentity:
+  tlsSecretName: provider-tls
+  caSecretName: grid-ca
+
+providerCredentials:
+  - secretName: mock-inference-credential
     mountPath: /etc/praxis/credentials/mock-inference
     optional: false
 

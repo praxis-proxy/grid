@@ -193,7 +193,8 @@ Both topologies use the same charts:
 - `charts/grid-operator` -- AGN Operator with SWIM, CRD management
 - `charts/grid-site` -- AGN topology CRs (`GridNetwork`, `GridSite`, `InferenceProvider`)
 - `charts/grid-mock-providers` -- Mock inference backends, Services, NetworkPolicy
-- `charts/praxis-gateway` -- Praxis AI Gateway (consumer or provider role)
+- `charts/praxis-gateway` -- Praxis AI Gateway (consumer or provider role).
+  For standalone values, see `examples/helm/praxis-gateway/`.
 
 ## Security Boundary
 
@@ -486,11 +487,11 @@ Each provider uses a separate credential Secret and a separate mount
 path. In the provider gateway Helm values:
 
 ```yaml
-credentials:
-  - name: mock-credential-a
+providerCredentials:
+  - secretName: mock-credential-a
     mountPath: /etc/praxis/credentials/mock-credential-a
     optional: false
-  - name: mock-credential-b
+  - secretName: mock-credential-b
     mountPath: /etc/praxis/credentials/mock-credential-b
     optional: false
 ```
@@ -772,8 +773,8 @@ Mount credentials only in the provider gateway:
 
 ```yaml
 # provider-gateway-overrides.yaml
-credentials:
-  - name: openai-credential
+providerCredentials:
+  - secretName: openai-credential
     mountPath: /etc/praxis/credentials/openai
     optional: false
 ```
@@ -782,8 +783,18 @@ Never add credential mounts to consumer gateway values.
 
 ### Private CA Bundles
 
-For private CAs, use `ca_path` in the Praxis configuration (not in
-Helm values). In Helm, mount the CA as part of the TLS Secret:
+For Grid mTLS, set `gridIdentity.tlsSecretName` and
+`gridIdentity.caSecretName`. If one Secret contains `tls.crt`, `tls.key`, and
+`ca.crt`, set both fields to that Secret's name. With BYO `praxis.yaml`, point
+its TLS paths to `gridIdentity.mountPath`; the mount alone does not enable TLS.
+
+For server-only backend TLS, use `upstreamCA.secretName` or a backend's
+`transport.ca.secretName` or `transport.ca.configMapName`. BYO `praxis.yaml`
+must set `runtime.upstream_ca_file` to use the `upstreamCA` mount. This bundle
+replaces system trust roots. Include public and private roots when backends need
+both; a per-cluster CA overrides the global bundle for that cluster.
+
+Create a combined Grid identity and CA Secret with:
 
 ```bash
 kubectl create secret generic provider-tls \

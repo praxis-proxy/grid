@@ -13,18 +13,22 @@ image:
   tag: 0.4.0
   pullPolicy: IfNotPresent
 
-config:
-  existingConfigMap: consumer-praxis-config
-  key: praxis.yaml
+praxisConfig:
+  byo:
+    configMapName: consumer-praxis-config
+    key: praxis.yaml
 
 overlay:
-  enabled: true
   # Name: grid-overlay-{GridNetwork name}-{gateway service name}
-  existingConfigMap: grid-overlay-NETWORK-consumer-gateway
+  configMapName: grid-overlay-example-network-consumer-gateway
 
-tls:
-  enabled: true
-  existingSecret: consumer-tls
+grid:
+  networkName: example-network
+  siteName: west-b
+
+gridIdentity:
+  tlsSecretName: consumer-tls
+  caSecretName: grid-ca
 
 service:
   enabled: true
