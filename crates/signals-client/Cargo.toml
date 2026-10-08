@@ -1,0 +1,48 @@
+[package]
+name = "grid-signals-client"
+description = "Grid signal poller: the mTLS scrape transport that feeds the signals source"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+default = ["rcgen"]
+rcgen = ["certs/rcgen"]
+fips = ["certs/fips"]
+
+[dependencies]
+grid-signals = { path = "../signals" }
+certs = { path = "../certs", default-features = false, features = ["verifier"] }
+bytes = { workspace = true }
+http = { workspace = true }
+http-body-util = { workspace = true }
+httpdate = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true, features = ["client", "client-legacy", "http1", "tokio"] }
+percent-encoding = { workspace = true }
+rustls = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["macros", "net", "rt", "sync", "time"] }
+tokio-rustls = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+certs = { path = "../certs", default-features = false, features = ["verifier", "rcgen"] }
+rustls = { workspace = true, features = ["ring"] }
+serde_yaml = { workspace = true }
+tokio = { workspace = true, features = [
+  "io-util",
+  "macros",
+  "net",
+  "rt",
+  "rt-multi-thread",
+  "sync",
+  "time",
+  "test-util",
+] }
+
+[lints]
+workspace = true

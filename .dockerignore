@@ -12,3 +12,8 @@ evidence
 *.env
 .cargo/credentials.toml
 .claude
+
+# Frontend dependencies and assets are rebuilt inside the dashboard image.
+**/node_modules
+crates/fleet-dashboard/web/dist
+crates/fleet-dashboard/webui

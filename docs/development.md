@@ -79,7 +79,7 @@ outside Make.
 
 `make generate-crds` writes the CRD manifests in `deploy/crds/` and
 `charts/grid-operator/templates/crds/` from the Rust types in
-`operator/src/crd/`. Do not edit them directly.
+`crates/operator/src/crd/`. Do not edit them directly.
 
 After changing a CRD type, regenerate the manifests and
 commit them together with the Rust change:
@@ -129,7 +129,7 @@ should have exactly one priority label:
 | Label | Description |
 | --- | --- |
 | `priority/critical` | Must be worked on immediately before anything else |
-| `priority/high` | Needs to be worked on immediately, defer to criticals |
+| `priority/high` | Needs to be worked on immediately, defer to critical work |
 | `priority/medium` | Resolve after high and critical |
 | `priority/low` | Resolve after all other priority levels |
 

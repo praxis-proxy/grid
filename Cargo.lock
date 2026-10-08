@@ -3854,7 +3854,6 @@ version = "0.2.0"
 dependencies = [
  "aes-gcm",
  "bincode",
- "bytes",
  "crdt",
  "foca",
  "rand 0.9.5",

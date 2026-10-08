@@ -1,0 +1,87 @@
+[package]
+name = "operator"
+description = "AI Grid Kubernetes operator for multi-site inference orchestration"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+default = ["tls-rustls"]
+tls-rustls = [
+  "certs/rcgen",
+  "reqwest/rustls-no-provider",
+  "rmcp/reqwest-tls-no-provider",
+  "kube/rustls-tls",
+  "kube/ring",
+  "dep:rustls",
+  "dep:hyper-rustls",
+  "dep:tokio-rustls",
+]
+fips = [
+  "certs/fips",
+  "reqwest/native-tls",
+  "rmcp/reqwest-native-tls",
+  "kube/openssl-tls",
+  "dep:openssl",
+  "dep:openssl-sys",
+  "dep:tokio-openssl",
+  "dep:hyper-openssl",
+]
+
+[dependencies]
+version.workspace = true
+axum = { workspace = true }
+bytes = { workspace = true }
+clap = { workspace = true, features = ["env"] }
+certs = { path = "../certs", default-features = false }
+crdt = { path = "../crdt" }
+swim = { path = "../swim" }
+futures = { workspace = true }
+http = { workspace = true }
+http-body-util = { workspace = true }
+httpdate = { workspace = true }
+hyper = { workspace = true, features = ["server"] }
+hyper-rustls = { workspace = true, optional = true }
+hyper-openssl = { workspace = true, optional = true }
+hyper-util = { workspace = true }
+scoring = { path = "../scoring" }
+k8s-openapi = { workspace = true }
+kube = { workspace = true }
+percent-encoding = { workspace = true }
+prometheus = { workspace = true }
+schemars = { workspace = true }
+reqwest = { workspace = true }
+rmcp = { workspace = true }
+rustls = { workspace = true, optional = true }
+openssl = { workspace = true, optional = true }
+openssl-sys = { workspace = true, optional = true }
+sha2 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_json_canonicalizer = { workspace = true }
+socket2 = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true }
+tokio = { workspace = true }
+tokio-rustls = { workspace = true, optional = true, features = ["ring"] }
+tokio-openssl = { workspace = true, optional = true }
+tower = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+# Server-side rmcp features, only for the mcp_probe integration tests, which
+# spin up a real Streamable HTTP MCP server to probe against.
+rmcp = { workspace = true, features = ["server", "transport-streamable-http-server"] }
+pem = { workspace = true }
+rcgen = { workspace = true, features = ["x509-parser"] }
+serde_yaml = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+tower = { workspace = true }
+
+[lints]
+workspace = true

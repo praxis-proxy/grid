@@ -179,8 +179,8 @@ jobs:
           - {name: operator, file: deploy/operator/Containerfile}
           - {name: gateway, file: deploy/gateway/Containerfile}
           - {name: enrollment, file: deploy/enrollment/Containerfile}
-          - {name: mock-providers, file: mock-providers/Containerfile}
-          - {name: overlay-sync, file: overlay-sync/Containerfile}
+          - {name: mock-providers, file: crates/mock-providers/Containerfile}
+          - {name: overlay-sync, file: crates/overlay-sync/Containerfile}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

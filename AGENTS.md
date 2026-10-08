@@ -68,7 +68,7 @@ make lint-extra     # typos + taplo + shellcheck
 make doc            # rustdoc -D warnings, private
 make audit          # cargo audit + cargo deny check
 make generate-crds  # regenerate CRD manifests from
-                    #   operator/src/crd
+                    #   crates/operator/src/crd
 make crds-check     # fail if CRD manifests are stale
 make all            # build + fmt + lint + test + audit
 ```
