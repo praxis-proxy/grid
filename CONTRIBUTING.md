@@ -10,13 +10,18 @@ code, tests, documentation, and human responsibility for submitted changes.
 1. Fork the repository and clone your fork.
 2. Install the tools listed in the [development guide].
 3. Enable commit signing and install the hook with `make setup-hooks`.
-4. Build and test with `make build` and `make test`.
-5. Run `make all` and the checks relevant to the changed component.
+4. For code changes, build and test with `make build` and `make test`.
+5. Run `make all` and component-specific checks before submitting code changes.
 
 The [verification matrix] explains what each local gate covers and which
 additional jobs CI runs. `make test` covers the root workspace; Gateway has a
-separate workspace. Documentation-only changes do not need a full test run.
-Record checks that could not be run and their prerequisites in the PR.
+separate workspace.
+
+For README or Markdown prose-only changes, check spelling, Markdown style,
+local links and anchors, and whitespace (`git diff --check`). The full test
+suite is not required. Examples and executable instructions need validation
+appropriate to the affected behavior. Record checks that could not be run and
+their prerequisites in the PR.
 
 [development guide]: docs/development.md
 [verification matrix]: docs/development.md#verification
