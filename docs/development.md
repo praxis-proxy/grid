@@ -65,18 +65,18 @@ production no-ring check intact when changing shared dependencies.
 | `make mutants`, `make semver`, `make publish-dry-run` | Opt-in specialist checks. | No corresponding scheduled Grid workflows. |
 
 `make all` runs build, formatting, lint, rustdoc, root tests, and root audit.
-Run `make lint-extra` separately for spelling, TOML, shell, and workflow checks. It is the ordinary local aggregate, not the complete CI matrix.
-It does not run coverage, Gateway tests, generated-file checks, FIPS checks,
-container builds, dashboard web checks, or live cluster qualifications. Run
-those when the changed contract requires them. The [release guide](release.md)
-records the integration qualification matrix.
+Run `make lint-extra` separately for spelling, TOML, shell, and workflow checks.
+The `make all` aggregate does not run coverage, Gateway tests, generated-file
+checks, FIPS checks, container builds, dashboard web checks, or live cluster
+qualifications. Run those when the changed contract requires them. The
+[release guide](release.md) records the integration qualification matrix.
 
 Tests and Coverage workflows skip their Rust jobs for documentation-only PRs;
-rustdoc and MSRV still run. The Gateway, Helm, and dashboard workflows have their
-own triggers and scopes. A skipped or absent job is not a passing test result.
-Changes to README or Markdown prose alone do not require the full local test
-suite. Changes to examples, generated contracts, or executable commands need
-checks appropriate to the affected behavior.
+rustdoc and MSRV still run. The Gateway, Helm, and dashboard workflows have
+their own triggers and scopes. A skipped or absent job is not a passing test
+result. Changes to README or Markdown prose alone do not require the full
+local test suite. Changes to examples, generated contracts, or executable
+commands need checks appropriate to the affected behavior.
 
 ### Formatting and documentation
 

@@ -382,7 +382,8 @@ children lives in `foo.rs` next to a `foo/` directory.
 
 Make invalid states unrepresentable. The type system and serde should enforce
 constraints at parse time. See the
-[type-design examples](developing/type-design.md) for applications of these rules.
+[type-design examples](developing/type-design.md) for applications of these
+rules.
 
 - **Enums over strings for fixed value sets.** Never
   use `String` where the valid values are known. Use

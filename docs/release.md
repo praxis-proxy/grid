@@ -2,11 +2,11 @@
 
 ## Versioning
 
-AI Grid Network (AGN) uses [Semantic Versioning][semver]. The workspace version is defined in
-`workspace.package.version` in the root `Cargo.toml`. Workspace crates inherit
-that version. The separate `gateway/Cargo.toml` workspace has its own package
-version; root version changes do not update it. Read each manifest for its
-current package version. Package versions alone do not establish image
+AI Grid Network (AGN) uses [Semantic Versioning][semver]. The workspace version
+is defined in `workspace.package.version` in the root `Cargo.toml`. Workspace
+crates inherit that version. The separate `gateway/Cargo.toml` workspace has its
+own package version; root version changes do not update it. Read each manifest
+for its current package version. Package versions alone do not establish image
 compatibility: qualify the tagged source and intended consumer below.
 
 The five charts published by this release (`grid-operator`, `grid-site`,

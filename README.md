@@ -115,9 +115,10 @@ explains measured site availability and shedding at consumer gateways.
 
 The API version is `grid.praxis.fast/v1alpha1`. Resources from the former
 `grid.praxis-proxy.io` group require a fresh installation. Removing old CRDs
-also removes their custom resources; review the [operator chart's upgrade guidance]
-before changing an existing deployment. AGN makes no general migration or
-mixed-version gossip compatibility guarantee during the technical preview.
+also removes their custom resources; review the
+[operator chart's upgrade guidance] before changing an existing deployment.
+AGN makes no general migration or mixed-version gossip compatibility guarantee
+during the technical preview.
 
 The `praxis-gateway` chart deploys the separately released Praxis AI image.
 The `grid-gateway` binary in this repository is a separate operand with its own
