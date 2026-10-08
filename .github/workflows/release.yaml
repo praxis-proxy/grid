@@ -440,6 +440,7 @@ jobs:
           OPERATOR_DIGEST: ${{ needs.container.outputs.operator_digest }}
           GATEWAY_DIGEST: ${{ needs.container.outputs.gateway_digest }}
           MOCK_PROVIDERS_DIGEST: ${{ needs.container.outputs.mock_providers_digest }}
+          ENROLLMENT_DIGEST: ${{ needs.container.outputs.enrollment_digest }}
           OVERLAY_SYNC_DIGEST: ${{ needs.container.outputs.overlay_sync_digest }}
           OFFICIAL_AI_DIGEST: ${{ needs.container.outputs.official_ai_digest }}
           CHART_DIGEST: ${{ needs.chart.outputs.chart_digest }}
@@ -454,6 +455,7 @@ jobs:
           ${OPERATOR_IMAGE_NAME}@${OPERATOR_DIGEST}
           ${GATEWAY_IMAGE_NAME}@${GATEWAY_DIGEST}
           ${MOCK_PROVIDERS_IMAGE_NAME}@${MOCK_PROVIDERS_DIGEST}
+          ${ENROLLMENT_IMAGE_NAME}@${ENROLLMENT_DIGEST}
           ${OVERLAY_SYNC_IMAGE_NAME}@${OVERLAY_SYNC_DIGEST}
           \`\`\`
 
