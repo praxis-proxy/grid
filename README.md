@@ -106,8 +106,10 @@ Provider scoring uses one strategy selected by
 Omitting the entire scoring policy selects `noMetrics`; when the policy is
 present, its `strategy` is required. These strategies select provider pools.
 Request-specific prefix affinity and pod selection remain inside llm-d EPP.
-Model and tool discovery expose declared capabilities; AGN does not deploy
-models or provide a tenant-facing catalog. See the
+Model discovery uses provider-declared model capacity. Tool discovery probes
+the configured MCP endpoint with `tools/list`; a non-empty `spec.tools`
+filters those discovered names. AGN does not deploy models or provide a
+tenant-facing catalog. See the
 [routing guide](docs/routing.md) for selection modes, affinity, discovery, and
 configuration examples. The [site-selection guide](docs/site-selection.md)
 explains measured site availability and shedding at consumer gateways.
