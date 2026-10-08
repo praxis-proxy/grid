@@ -1,9 +1,10 @@
-# 0.1.5 to 0.1.6 CRD Field Migration
+# 0.1.4 to 0.2.0 CRD Field Migration
 
-The 0.1.5 release accepts both the previous and current names for CRD spec
-fields. The `grid-site` chart also translates previous value names when it
-renders resources. The previous names are deprecated and will be removed in
-0.1.6. Migrate custom resources and Helm values before upgrading to 0.1.6.
+The 0.2.0 release accepts both the previous and current names for CRD spec
+fields. The `grid-site` and `grid-operator` charts also translate previous
+value names when they render resources. The previous names are deprecated and
+will be removed in a later release. Migrate custom resources and Helm values before
+upgrading to 0.2.0.
 
 Do not set both names for one field. The API schema and chart reject conflicting
 old and new names.
@@ -34,14 +35,21 @@ old and new names.
 | `grid-site` chart `inferenceProviders` values | `gatewayRef` | `providerGateway` |
 | `grid-site` chart `inferenceProviders[].metricsConfig` | `metricsEndpoint` | `endpoint` |
 | `grid-site` chart `inferenceProviders[].auth` | `manual` | `credentialsManagedExternally` |
+| `grid-operator` rendered `GridNetwork.spec` | `gatewayRefs` | `consumerGateways` |
+| `grid-operator` rendered `GridNetwork.spec.consumerGateways[]` | `localSiteName` | `siteName` |
+| `grid-operator` rendered `GridNetwork.spec.tls` | `swimKeyRef` | `swimKeySecretRef` |
+| `grid-operator` chart `grid.providers[]` | `routingClusterRef` | `clusterName` |
+| `grid-operator` chart `grid.providers[]` | `gatewayRef` | `providerGateway` |
+| `grid-operator` chart `grid.providers[].metricsConfig` | `metricsEndpoint` | `endpoint` |
+| `grid-operator` chart `grid.providers[].auth` | `manual` | `credentialsManagedExternally` |
 
-## Upgrade to 0.1.5
+## Upgrade to 0.2.0
 
-Existing CRD spec field names and `grid-site` values remain accepted in 0.1.5.
+Existing CRD spec field names and chart values remain accepted in 0.2.0.
 Update manifests and Helm values to the current names when convenient.
 
-Status fields and reasons change in 0.1.5 without legacy aliases. Update scripts
-and dashboards that read them during the 0.1.5 upgrade, including
+Status fields and reasons change in 0.2.0 without legacy aliases. Update scripts
+and dashboards that read them during the 0.2.0 upgrade, including
 `overlayStatus` to `routingMapStatus` and `consumerConfigStatus` to
 `praxisConfigStatus`. Status is operator-owned; do not migrate it by hand.
 The compatibility window covers spec fields and chart values only.
@@ -59,11 +67,11 @@ The compatibility window covers spec fields and chart values only.
 | `ConsumerConfigDisabled` | `PraxisConfigDisabled` |
 | `EgressMissing` | `GatewayAddressMissing` |
 
-## Before upgrading to 0.1.6
+## Before upgrading after the compatibility window
 
 1. Back up the affected custom resources and Helm values.
 2. Update manifests and Helm values using the mapping above.
-3. Pause the operator before installing the 0.1.6 CRD schemas.
+3. Pause the operator before installing CRD schemas that remove the aliases.
 4. Apply the updated custom resources and upgrade `grid-site` with its updated
    values.
-5. Start the 0.1.6 operator after all affected resources use the current names.
+5. Start the later operator after all affected resources use the current names.

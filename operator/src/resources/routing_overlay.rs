@@ -1837,6 +1837,7 @@ fn is_explicitly_unavailable(provider: &InferenceProvider) -> bool {
         .is_some_and(|s| s.phase == ProviderPhase::Unavailable)
 }
 
+
 /// Build [`RoutingCandidate`]s for a local [`AgentToolProvider`].
 ///
 /// One candidate per `(tool, site)` pair with `kind = "mcp_tool"`.

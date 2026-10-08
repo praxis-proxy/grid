@@ -99,6 +99,38 @@ Validate image digest format when provided.
 {{- end }}
 
 {{/*
+Translate deprecated InferenceProvider value keys before the template emits
+the CustomResource. Setting both names is ambiguous, so fail before rendering.
+*/}}
+{{- define "grid-operator.rename-legacy-value" -}}
+{{- $object := .object -}}
+{{- $old := .old -}}
+{{- $new := .new -}}
+{{- if hasKey $object $old -}}
+  {{- if hasKey $object $new -}}
+    {{- fail (printf "grid-operator: remove deprecated value %q; set only %q" $old $new) -}}
+  {{- end -}}
+  {{- $_ := set $object $new (get $object $old) -}}
+  {{- $_ := unset $object $old -}}
+{{- end -}}
+{{- end }}
+
+{{/* Normalize deprecated provider values before rendering current CRD fields. */}}
+{{- define "grid-operator.normalize-inference-provider" -}}
+{{- $provider := . -}}
+{{- include "grid-operator.rename-legacy-value" (dict "object" $provider "old" "routingClusterRef" "new" "clusterName") -}}
+{{- include "grid-operator.rename-legacy-value" (dict "object" $provider "old" "gatewayRef" "new" "providerGateway") -}}
+{{- $metrics := get $provider "metricsConfig" -}}
+{{- if kindIs "map" $metrics -}}
+  {{- include "grid-operator.rename-legacy-value" (dict "object" $metrics "old" "metricsEndpoint" "new" "endpoint") -}}
+{{- end -}}
+{{- $auth := get $provider "auth" -}}
+{{- if kindIs "map" $auth -}}
+  {{- include "grid-operator.rename-legacy-value" (dict "object" $auth "old" "manual" "new" "credentialsManagedExternally") -}}
+{{- end -}}
+{{- end }}
+
+{{/*
 Normalize values once per render, in place and idempotently. site.name and grid.seeds
 default swim.siteName and swim.seeds, and a grid.id turns signals on for grid.signals poll and
 defaults a LoadBalancer SWIM Service and the grid-gateway Service the GridNetwork names. Enrollment, the
@@ -229,4 +261,3 @@ RUST_LOG for the chart's Rust binaries: log.filter when set, else log.level.
 {{- end -}}
 {{- end -}}
 {{- end -}}
-

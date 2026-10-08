@@ -26,10 +26,10 @@ spec:
     mode: {{ . | quote }}
   {{- end }}
   {{- with $.Values.gateway.serviceName }}
-  gatewayRefs:
+  consumerGateways:
     - name: {{ . | quote }}
       namespace: {{ $.Values.gateway.namespace | default $.Release.Namespace | quote }}
-      localSiteName: {{ $.Values.swim.siteName | quote }}
+      siteName: {{ $.Values.swim.siteName | quote }}
   {{- end }}
   {{- $e := $.Values.enrollment }}
   tls:
@@ -40,7 +40,7 @@ spec:
       name: {{ $e.caSecretName | default "grid-ca" | quote }}
       namespace: {{ $.Release.Namespace | quote }}
     {{- with .swimKeySecretName }}
-    swimKeyRef:
+    swimKeySecretRef:
       name: {{ . | quote }}
       namespace: {{ $.Release.Namespace | quote }}
     {{- end }}
