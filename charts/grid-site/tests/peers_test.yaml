@@ -41,7 +41,7 @@ tests:
           path: spec
           value:
             gridNetworkRef: grid
-            egress:
+            gatewayEndpoint:
               address: 203.0.113.21:8080
               tls:
                 mode: Mutual
@@ -55,7 +55,7 @@ tests:
       peers.site-b.serverName: gw.site-b.example.com
     asserts:
       - equal:
-          path: spec.egress.tls.serverName
+          path: spec.gatewayEndpoint.tls.serverName
           value: gw.site-b.example.com
 
   - it: refuses a malformed pin
@@ -96,21 +96,21 @@ tests:
           value:
             siteSecretRef: { name: grid-site-identity, namespace: grid }
             caSecretRef: { name: grid-ca, namespace: grid }
-            swimKeyRef: { name: grid-swim-key, namespace: grid }
+            swimKeySecretRef: { name: grid-swim-key, namespace: grid }
 
   - it: keeps explicit discovery and TLS settings when peers are listed
     template: templates/gridnetwork.yaml
     set:
       peers.hub.digest: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
       gridNetwork.autoDiscoverSites: false
-      gridNetwork.tls.swimKeyRef: { name: k, namespace: other }
+      gridNetwork.tls.swimKeySecretRef: { name: k, namespace: other }
     asserts:
       - notExists:
           path: metadata.labels["grid.praxis.fast/auto-discover-sites"]
       - equal:
           path: spec.tls
           value:
-            swimKeyRef: { name: k, namespace: other }
+            swimKeySecretRef: { name: k, namespace: other }
 
   - it: without peers, sets no TLS and no discovery
     template: templates/gridnetwork.yaml

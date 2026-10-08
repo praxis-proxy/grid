@@ -480,7 +480,7 @@ and metric adapters; a wrong name can leave AGN without the selected signal.
 ```yaml
 spec:
   metricsConfig:
-    metricsEndpoint: http://llmd-epp-metrics.inference.svc:9090
+    endpoint: http://llmd-epp-metrics.inference.svc:9090
     path: /metrics
     timeout: 2s
     poolName: llama-70b-east
@@ -791,7 +791,7 @@ spec:
   models:
     - name: example-model
   metricsConfig:
-    metricsEndpoint: http://metrics.example.svc:9090
+    endpoint: http://metrics.example.svc:9090
     path: /metrics
     queueCapacity: 64
     signalNames:

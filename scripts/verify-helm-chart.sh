@@ -1038,9 +1038,9 @@ try_template "$SITE_DIR" "site with providers" "${SITE_REQ[@]}" --namespace grid
   --set 'inferenceProviders[1].backendKind=local_model' \
   --set 'inferenceProviders[1].endpoint=http://mock-b:8080'
 try_template "$SITE_DIR" "site with gateway refs" "${SITE_REQ[@]}" --namespace grid-system \
-  --set 'gridNetwork.gatewayRefs[0].name=consumer-gateway' \
-  --set 'gridNetwork.gatewayRefs[0].namespace=grid-system' \
-  --set 'gridNetwork.gatewayRefs[0].localSiteName=east-a'
+  --set 'gridNetwork.consumerGateways[0].name=consumer-gateway' \
+  --set 'gridNetwork.consumerGateways[0].namespace=grid-system' \
+  --set 'gridNetwork.consumerGateways[0].siteName=east-a'
 try_template "$SITE_DIR" "site with provider-site label" "${SITE_REQ[@]}" --namespace grid-system \
   --set gridSite.providerSiteLabel=test-site
 

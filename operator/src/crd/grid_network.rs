@@ -225,7 +225,7 @@ pub enum PlacementStrategy {
 }
 
 /// Traffic placement policy. This static stack intentionally has no metric inputs.
-#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
 pub struct PlacementPolicyConfig {
@@ -548,6 +548,32 @@ pub fn resolve_budget_statuses(
 // Spec
 // ---------------------------------------------------------------------------
 
+/// Add deprecated top-level `GridNetwork` field names to the generated schema.
+fn add_grid_network_spec_legacy_fields(schema: &mut schemars::Schema) {
+    crate::crd::add_legacy_field_aliases(schema, &[("gatewayRefs", "consumerGateways")]);
+}
+
+/// Add deprecated gateway-reference field names to the generated schema.
+fn add_gateway_ref_legacy_fields(schema: &mut schemars::Schema) {
+    crate::crd::add_legacy_field_aliases(
+        schema,
+        &[("localSiteName", "siteName"), ("consumerConfig", "praxisConfig")],
+    );
+}
+
+/// Add deprecated Praxis config field names to the generated schema.
+fn add_consumer_config_legacy_fields(schema: &mut schemars::Schema) {
+    crate::crd::add_legacy_field_aliases(
+        schema,
+        &[("enabled", "generate"), ("credentialMountBase", "credentialMountPath")],
+    );
+}
+
+/// Add the deprecated SWIM key field to the generated schema.
+fn add_tls_config_legacy_fields(schema: &mut schemars::Schema) {
+    crate::crd::add_legacy_field_aliases(schema, &[("swimKeyRef", "swimKeySecretRef")]);
+}
+
 /// Specification for a [`GridNetwork`].
 ///
 /// Defines the grid's seed peers, gateway associations, SWIM
@@ -569,6 +595,7 @@ pub fn resolve_budget_statuses(
     "rule": "has(self.placementPolicy) == (has(self.selectionPolicy) && self.selectionPolicy.mode == 'weightedRandom')",
     "message": "placementPolicy must be set if and only if selectionPolicy.mode is weightedRandom"
 }]))]
+#[schemars(transform = add_grid_network_spec_legacy_fields)]
 #[serde(rename_all = "camelCase")]
 pub struct GridNetworkSpec {
     /// Grid ID for tenancy. Empty on creation; auto-generated
@@ -582,8 +609,8 @@ pub struct GridNetworkSpec {
     pub seeds: Vec<String>,
 
     /// References to Praxis Gateways that participate in this grid.
-    #[serde(default)]
-    pub gateway_refs: Vec<GatewayRef>,
+    #[serde(default, alias = "gatewayRefs")]
+    pub consumer_gateways: Vec<GatewayRef>,
 
     /// Region where this site is deployed.
     pub region: Option<String>,
@@ -722,6 +749,7 @@ pub struct GridNetworkSpec {
 
 /// Reference to a Praxis Gateway that participates in this grid.
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
+#[schemars(transform = add_gateway_ref_legacy_fields)]
 #[serde(rename_all = "camelCase")]
 pub struct GatewayRef {
     /// Gateway name.
@@ -743,13 +771,13 @@ pub struct GatewayRef {
     ///
     /// [`GridSite`]: crate::crd::grid_site::GridSite
     /// [`GridNetwork`]: crate::crd::grid_network::GridNetwork
-    #[serde(default)]
-    pub local_site_name: Option<String>,
+    #[serde(default, alias = "localSiteName")]
+    pub site_name: Option<String>,
 
     /// Opt-in configuration for operator-managed consumer Praxis config generation.
     ///
-    /// When absent or `enabled: false`, this gateway behaves exactly as before —
-    /// only the routing overlay `ConfigMap` is applied.  When `enabled: true`, the
+    /// When absent or `generate: false`, this gateway behaves exactly as before —
+    /// only the routing overlay `ConfigMap` is applied.  When `generate: true`, the
     /// operator additionally renders a consumer Praxis `ConfigMap` containing the
     /// inference-model `intelligent_route` candidates (with credential
     /// `secretRef` data), a `credential_inject` section for credential-bearing
@@ -758,13 +786,13 @@ pub struct GatewayRef {
     /// routing overlay for dedicated data-plane pipelines.
     ///
     /// The generated `ConfigMap` contains no token bytes.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub consumer_config: Option<ConsumerConfig>,
+    #[serde(default, alias = "consumerConfig", skip_serializing_if = "Option::is_none")]
+    pub praxis_config: Option<ConsumerConfig>,
 }
 
 /// Opt-in configuration for operator-generated consumer Praxis config.
 ///
-/// When `enabled` is `true` on a [`GatewayRef`], the `GridNetwork` controller
+/// When `generate` is `true` on a [`GatewayRef`], the `GridNetwork` controller
 /// renders a `praxis.yaml`-keyed `ConfigMap` in the gateway namespace in addition
 /// to the normal routing overlay `ConfigMap`.  The generated config includes the
 /// inference-model `intelligent_route` candidates, `credential_inject` (when
@@ -779,25 +807,26 @@ pub struct GatewayRef {
 /// # Security
 ///
 /// The generated `ConfigMap` never contains credential token bytes.  Credential
-/// entries use a `file:` source under `credentialMountBase`; the mounted
+/// entries use a `file:` source under `credentialMountPath`; the mounted
 /// Kubernetes Secret provides the token at runtime.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[schemars(transform = add_consumer_config_legacy_fields)]
 #[serde(rename_all = "camelCase")]
 pub struct ConsumerConfig {
     /// Enable operator-managed consumer Praxis config generation for this gateway.
     ///
     /// Default: `false`.  Set to `true` to opt in.
-    #[serde(default)]
-    pub enabled: bool,
+    #[serde(default, alias = "enabled")]
+    pub generate: bool,
 
     /// Base directory for mounted credential Secret files inside the consumer pod.
     ///
     /// Each credential Secret is expected to be mounted at
-    /// `{credentialMountBase}/{secret-name}/{secret-key}`.
+    /// `{credentialMountPath}/{secret-name}/{secret-key}`.
     ///
     /// Default: `/run/secrets/grid-credentials`.
-    #[serde(default = "default_credential_mount_base")]
-    pub credential_mount_base: String,
+    #[serde(default = "default_credential_mount_path", alias = "credentialMountBase")]
+    pub credential_mount_path: String,
 
     /// Name of the generated consumer Praxis `ConfigMap`.
     ///
@@ -976,8 +1005,8 @@ impl GatewayTelemetryConfig {
 impl Default for ConsumerConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
-            credential_mount_base: default_credential_mount_base(),
+            generate: false,
+            credential_mount_path: default_credential_mount_path(),
             config_map_name: default_consumer_config_map_name(),
             cluster_endpoints: Vec::new(),
             tls_cert_mount_path: default_tls_cert_mount_path(),
@@ -1054,7 +1083,7 @@ pub struct ClusterEndpointConfig {
 }
 
 /// Default credential mount base path.
-fn default_credential_mount_base() -> String {
+fn default_credential_mount_path() -> String {
     "/run/secrets/grid-credentials".to_owned()
 }
 
@@ -1095,6 +1124,7 @@ pub struct SwimConfig {
 
 /// TLS configuration for grid certificate management.
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema, Serialize)]
+#[schemars(transform = add_tls_config_legacy_fields)]
 #[serde(rename_all = "camelCase")]
 #[expect(
     clippy::struct_field_names,
@@ -1108,7 +1138,8 @@ pub struct TlsConfig {
     pub site_secret_ref: Option<SecretRef>,
 
     /// Secret storing the SWIM encryption key.
-    pub swim_key_ref: Option<SecretRef>,
+    #[serde(alias = "swimKeyRef")]
+    pub swim_key_secret_ref: Option<SecretRef>,
 }
 
 /// Reference to a Kubernetes Secret.
@@ -1151,7 +1182,7 @@ pub struct GridNetworkStatus {
     /// are excluded.  Zero when SWIM is disabled or no remote state has been
     /// received yet.
     #[serde(default)]
-    pub distributed_provider_count: u32,
+    pub remote_provider_count: u32,
 
     /// The negotiated grid ID.
     #[serde(default)]
@@ -1167,12 +1198,12 @@ pub struct GridNetworkStatus {
 
     /// Per-gateway consumer Praxis config render and apply status.
     ///
-    /// Populated for every gateway reference that has `consumerConfig.enabled: true`.
-    /// Gateways without `consumerConfig` are omitted.  Use this field to
+    /// Populated for every gateway reference that has `praxisConfig.generate: true`.
+    /// Gateways without `praxisConfig` are omitted.  Use this field to
     /// determine whether the operator successfully rendered and applied a
     /// consumer `ConfigMap` for each opted-in gateway.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub consumer_config_status: Vec<ConsumerConfigStatus>,
+    pub praxis_config_status: Vec<ConsumerConfigStatus>,
 
     /// Per-gateway overlay revision status.
     ///
@@ -1181,7 +1212,7 @@ pub struct GridNetworkStatus {
     /// inspecting `ConfigMap` contents. A failed update retains evidence for
     /// the last successfully distributed revision.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub overlay_status: Vec<OverlayRevisionStatus>,
+    pub routing_map_status: Vec<OverlayRevisionStatus>,
 
     /// Per-tenant budget status, derived from `spec.budgetPolicy` and merged
     /// cross-site CRDT spend state.
@@ -1231,8 +1262,8 @@ pub enum ConsumerConfigPhase {
 
 /// Per-gateway status for operator-managed consumer Praxis config generation.
 ///
-/// Reported in [`GridNetworkStatus::consumer_config_status`] for each gateway
-/// reference with `consumerConfig.enabled: true`.
+/// Reported in [`GridNetworkStatus::praxis_config_status`] for each gateway
+/// reference with `praxisConfig.generate: true`.
 ///
 /// # Security
 ///
@@ -1250,7 +1281,7 @@ pub struct ConsumerConfigStatus {
 
     /// Name of the generated `ConfigMap`.
     ///
-    /// Populated from `consumerConfig.configMapName`; empty for `Disabled` entries.
+    /// Populated from `praxisConfig.configMapName`; empty for `Disabled` entries.
     #[serde(default)]
     pub config_map_name: String,
 
@@ -1261,8 +1292,8 @@ pub struct ConsumerConfigStatus {
     ///
     /// `""` when `phase` is `Rendered`.
     /// One of `MissingClusterEndpoint`, `MissingTransport`, `MissingSni`,
-    /// `PlaintextWithSni`, `ConsumerConfigRenderFailed`,
-    /// `ConsumerConfigApplyFailed`, `ConsumerConfigDisabled` otherwise.
+    /// `PlaintextWithSni`, `PraxisConfigRenderFailed`,
+    /// `PraxisConfigApplyFailed`, `PraxisConfigDisabled` otherwise.
     #[serde(default)]
     pub reason: String,
 
@@ -1310,7 +1341,7 @@ pub enum OverlayPhase {
 
 /// Per-gateway overlay revision status for observability.
 ///
-/// Reported in [`GridNetworkStatus::overlay_status`] for each gateway
+/// Reported in [`GridNetworkStatus::routing_map_status`] for each gateway
 /// after each reconcile attempt.
 ///
 /// # Security
@@ -1454,7 +1485,7 @@ mod tests {
         let json = serde_json::json!({
             "gridId": "",
             "seeds": ["grid.cluster-b:7946"],
-            "gatewayRefs": [{"name": "gw", "namespace": "ns"}],
+            "consumerGateways": [{"name": "gw", "namespace": "ns"}],
             "swim": {"probeInterval": "3s"},
             "tls": {}
         });
@@ -1464,17 +1495,118 @@ mod tests {
     }
 
     #[test]
+    fn legacy_gateway_fields_deserialize_into_current_fields() -> Result<(), serde_json::Error> {
+        let spec: GridNetworkSpec = serde_json::from_value(legacy_spec_json())?;
+        assert_eq!(
+            spec.consumer_gateways.len(),
+            1,
+            "gatewayRefs must populate consumerGateways"
+        );
+        let gateway = spec.consumer_gateways.first().unwrap_or_else(|| std::process::abort());
+        assert_eq!(gateway.name, "consumer-gw", "the legacy gateway name must be preserved");
+        assert_eq!(
+            gateway.namespace, "praxis-system",
+            "the legacy gateway namespace must be preserved"
+        );
+        assert_eq!(
+            gateway.site_name.as_deref(),
+            Some("cluster-east"),
+            "localSiteName must populate siteName"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_praxis_fields_deserialize_into_current_fields() -> Result<(), serde_json::Error> {
+        let spec: GridNetworkSpec = serde_json::from_value(legacy_spec_json())?;
+        let gateway = spec.consumer_gateways.first().unwrap_or_else(|| std::process::abort());
+        let praxis = gateway.praxis_config.as_ref().unwrap_or_else(|| std::process::abort());
+        assert!(
+            praxis.generate,
+            "consumerConfig.enabled must populate praxisConfig.generate"
+        );
+        assert_eq!(
+            praxis.credential_mount_path, "/run/secrets/legacy-provider",
+            "credentialMountBase must populate credentialMountPath"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_swim_key_deserializes_into_current_field() -> Result<(), serde_json::Error> {
+        let spec: GridNetworkSpec = serde_json::from_value(legacy_spec_json())?;
+        let swim_key = spec
+            .tls
+            .swim_key_secret_ref
+            .as_ref()
+            .unwrap_or_else(|| std::process::abort());
+        assert_eq!(
+            swim_key.name, "legacy-swim-key",
+            "swimKeyRef must populate swimKeySecretRef"
+        );
+        assert_eq!(
+            swim_key.namespace, "praxis-system",
+            "the legacy Secret namespace must be preserved"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_spec_serializes_with_current_field_names() -> Result<(), serde_json::Error> {
+        let spec: GridNetworkSpec = serde_json::from_value(legacy_spec_json())?;
+        let serialized = serde_json::to_value(&spec)?;
+        assert!(
+            serialized.get("gatewayRefs").is_none(),
+            "serialization must omit legacy gatewayRefs"
+        );
+        assert_eq!(
+            serialized.pointer("/consumerGateways/0/praxisConfig/generate"),
+            Some(&serde_json::Value::Bool(true)),
+            "serialization must use the current nested field names"
+        );
+        assert_eq!(
+            serialized
+                .pointer("/tls/swimKeySecretRef/name")
+                .and_then(serde_json::Value::as_str),
+            Some("legacy-swim-key"),
+            "serialization must use swimKeySecretRef"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_and_current_spec_fields_are_rejected_together() -> Result<(), Box<dyn std::error::Error>> {
+        for (pointer, legacy, current) in legacy_alias_pairs() {
+            let mut input = legacy_spec_json();
+            let object = input
+                .pointer_mut(pointer)
+                .and_then(serde_json::Value::as_object_mut)
+                .unwrap_or_else(|| std::process::abort());
+            let value = object.get(legacy).cloned().unwrap_or_else(|| std::process::abort());
+            object.insert(current.to_owned(), value);
+            let error = serde_json::from_value::<GridNetworkSpec>(input)
+                .err()
+                .ok_or_else(|| format!("{legacy} and {current} must not be accepted together"))?;
+            assert!(
+                error.to_string().contains("duplicate field"),
+                "{legacy} must fail due to duplicate names: {error}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn gateway_ref_local_site_name_round_trips() {
         let json = serde_json::json!({
             "name": "gw-east",
             "namespace": "grid-system",
-            "localSiteName": "cluster-east"
+            "siteName": "cluster-east"
         });
         let gw: GatewayRef = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
         assert_eq!(
-            gw.local_site_name.as_deref(),
+            gw.site_name.as_deref(),
             Some("cluster-east"),
-            "localSiteName must round-trip on GatewayRef"
+            "siteName must round-trip on GatewayRef"
         );
     }
 
@@ -1482,10 +1614,7 @@ mod tests {
     fn gateway_ref_local_site_name_defaults_to_none() {
         let json = serde_json::json!({"name": "gw", "namespace": "ns"});
         let gw: GatewayRef = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
-        assert!(
-            gw.local_site_name.is_none(),
-            "absent localSiteName must default to None"
-        );
+        assert!(gw.site_name.is_none(), "absent siteName must default to None");
     }
 
     #[test]
@@ -1596,12 +1725,14 @@ mod tests {
     fn grid_network_crd_has_gateway_ref_local_site_name() {
         let crd = crd_json();
         let gateway_ref_properties = crd
-            .pointer("/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties/gatewayRefs/items/properties")
+            .pointer(
+                "/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties/consumerGateways/items/properties",
+            )
             .and_then(serde_json::Value::as_object)
             .unwrap_or_else(|| std::process::abort());
         assert!(
-            gateway_ref_properties.contains_key("localSiteName"),
-            "CRD schema must include localSiteName field on GatewayRef"
+            gateway_ref_properties.contains_key("siteName"),
+            "CRD schema must include siteName field on GatewayRef"
         );
     }
 
@@ -1614,20 +1745,20 @@ mod tests {
         let json = serde_json::json!({"name": "gw", "namespace": "ns"});
         let gw: GatewayRef = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
         assert!(
-            gw.consumer_config.is_none(),
-            "absent consumerConfig must deserialize to None"
+            gw.praxis_config.is_none(),
+            "absent praxisConfig must deserialize to None"
         );
     }
 
     #[test]
     #[expect(clippy::too_many_lines, reason = "round-trip test covers all ConsumerConfig fields")]
-    fn consumer_config_enabled_round_trips() {
+    fn praxis_config_generate_round_trips() {
         let json = serde_json::json!({
             "name": "gw",
             "namespace": "ns",
-            "consumerConfig": {
-                "enabled": true,
-                "credentialMountBase": "/run/secrets/grid",
+            "praxisConfig": {
+                "generate": true,
+                "credentialMountPath": "/run/secrets/grid",
                 "configMapName": "my-consumer-config",
                 "tlsCertMountPath": "/etc/custom-tls",
                 "clusterEndpoints": [{
@@ -1646,11 +1777,11 @@ mod tests {
             }
         });
         let gw: GatewayRef = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
-        let cc = gw.consumer_config.unwrap_or_else(|| std::process::abort());
-        assert!(cc.enabled, "enabled must round-trip");
+        let cc = gw.praxis_config.unwrap_or_else(|| std::process::abort());
+        assert!(cc.generate, "generate must round-trip");
         assert_eq!(
-            cc.credential_mount_base, "/run/secrets/grid",
-            "credentialMountBase must round-trip"
+            cc.credential_mount_path, "/run/secrets/grid",
+            "credentialMountPath must round-trip"
         );
         assert_eq!(
             cc.config_map_name, "my-consumer-config",
@@ -1720,14 +1851,14 @@ mod tests {
         let json = serde_json::json!({
             "name": "gw",
             "namespace": "ns",
-            "consumerConfig": {}
+            "praxisConfig": {}
         });
         let gw: GatewayRef = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
-        let cc = gw.consumer_config.unwrap_or_else(|| std::process::abort());
-        assert!(!cc.enabled, "enabled must default to false");
+        let cc = gw.praxis_config.unwrap_or_else(|| std::process::abort());
+        assert!(!cc.generate, "generate must default to false");
         assert_eq!(
-            cc.credential_mount_base, "/run/secrets/grid-credentials",
-            "credentialMountBase must use default"
+            cc.credential_mount_path, "/run/secrets/grid-credentials",
+            "credentialMountPath must use default"
         );
         assert_eq!(
             cc.config_map_name, "praxis-consumer-config",
@@ -1858,13 +1989,13 @@ mod tests {
         let gw = GatewayRef {
             name: "gw".to_owned(),
             namespace: "ns".to_owned(),
-            local_site_name: None,
-            consumer_config: None,
+            site_name: None,
+            praxis_config: None,
         };
         let json = serde_json::to_value(&gw).unwrap_or_else(|_| std::process::abort());
         assert!(
-            json.get("consumerConfig").is_none(),
-            "absent consumerConfig must not appear in serialized output"
+            json.get("praxisConfig").is_none(),
+            "absent praxisConfig must not appear in serialized output"
         );
     }
 
@@ -1876,25 +2007,27 @@ mod tests {
     fn grid_network_crd_has_consumer_config_field_on_gateway_ref() {
         let crd = crd_json();
         let gateway_ref_properties = crd
-            .pointer("/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties/gatewayRefs/items/properties")
+            .pointer(
+                "/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties/consumerGateways/items/properties",
+            )
             .and_then(serde_json::Value::as_object)
             .unwrap_or_else(|| std::process::abort());
         assert!(
-            gateway_ref_properties.contains_key("consumerConfig"),
-            "CRD schema must include consumerConfig field on GatewayRef"
+            gateway_ref_properties.contains_key("praxisConfig"),
+            "CRD schema must include praxisConfig field on GatewayRef"
         );
         let consumer_config_properties = gateway_ref_properties
-            .get("consumerConfig")
+            .get("praxisConfig")
             .and_then(|v| v.pointer("/properties"))
             .and_then(serde_json::Value::as_object)
             .unwrap_or_else(|| std::process::abort());
         assert!(
             consumer_config_properties.contains_key("clusterEndpoints"),
-            "CRD schema must include consumerConfig.clusterEndpoints"
+            "CRD schema must include praxisConfig.clusterEndpoints"
         );
         assert!(
             consumer_config_properties.contains_key("tlsCertMountPath"),
-            "CRD schema must include consumerConfig.tlsCertMountPath"
+            "CRD schema must include praxisConfig.tlsCertMountPath"
         );
         let telemetry_properties = consumer_config_properties
             .get("telemetry")
@@ -1949,7 +2082,7 @@ mod tests {
         let endpoint_properties = crd
             .pointer(
                 "/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties\
-                 /gatewayRefs/items/properties/consumerConfig/properties\
+                 /consumerGateways/items/properties/praxisConfig/properties\
                  /clusterEndpoints/items/properties",
             )
             .and_then(serde_json::Value::as_object)
@@ -2991,5 +3124,45 @@ mod tests {
             0.5,
             "spend_ratio via resolve_budget_statuses",
         );
+    }
+    // ---------------------------------------------------------------------------
+    // Test Utilities
+    // ---------------------------------------------------------------------------
+
+    /// Legacy input with non-default values for the renamed `GridNetwork` spec fields.
+    fn legacy_spec_json() -> serde_json::Value {
+        serde_json::json!({
+            "gridId": "",
+            "seeds": [],
+            "gatewayRefs": [{
+                "name": "consumer-gw",
+                "namespace": "praxis-system",
+                "localSiteName": "cluster-east",
+                "consumerConfig": {
+                    "enabled": true,
+                    "credentialMountBase": "/run/secrets/legacy-provider"
+                }
+            }],
+            "swim": {},
+            "tls": {
+                "swimKeyRef": { "name": "legacy-swim-key", "namespace": "praxis-system" }
+            }
+        })
+    }
+
+    /// Legacy spec objects and their mutually exclusive field names.
+    fn legacy_alias_pairs() -> [(&'static str, &'static str, &'static str); 6] {
+        [
+            ("", "gatewayRefs", "consumerGateways"),
+            ("/gatewayRefs/0", "localSiteName", "siteName"),
+            ("/gatewayRefs/0", "consumerConfig", "praxisConfig"),
+            ("/gatewayRefs/0/consumerConfig", "enabled", "generate"),
+            (
+                "/gatewayRefs/0/consumerConfig",
+                "credentialMountBase",
+                "credentialMountPath",
+            ),
+            ("/tls", "swimKeyRef", "swimKeySecretRef"),
+        ]
     }
 }

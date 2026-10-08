@@ -653,7 +653,7 @@ spec:
   endpoint: https://{hostname}
   models:
     - name: {model}
-  routingClusterRef: {routing_cluster}
+  clusterName: {routing_cluster}
   siteSelector:
     matchLabels:
       grid.praxis.fast/provider-site: east-provider
@@ -666,7 +666,7 @@ spec:
       name: {secret_name}
       namespace: grid-system
       key: {secret_key}
-    manual: true",
+    credentialsManagedExternally: true",
         name = OPENAI_PROVIDER,
         provider_kind = ext.provider_kind,
         backend_kind = ext.backend_kind,
@@ -2752,10 +2752,11 @@ fn check_overlay_metadata() -> Result<String, Box<dyn std::error::Error>> {
 
     let config_map_resource_version =
         kubectl_jsonpath(&context, "configmap", OVERLAY_CONFIGMAP, "{.metadata.resourceVersion}")?;
-    let overlay_status_raw = kubectl_jsonpath(&context, "gridnetwork", GRID_NETWORK_NAME, "{.status.overlayStatus}")?;
-    let overlay_status: serde_json::Value = serde_json::from_str(&overlay_status_raw)
-        .map_err(|e| format!("GridNetwork overlayStatus is not valid JSON: {e}"))?;
-    let gateway_status = overlay_status
+    let overlay_status_raw =
+        kubectl_jsonpath(&context, "gridnetwork", GRID_NETWORK_NAME, "{.status.routingMapStatus}")?;
+    let routing_map_status: serde_json::Value = serde_json::from_str(&overlay_status_raw)
+        .map_err(|e| format!("GridNetwork routingMapStatus is not valid JSON: {e}"))?;
+    let gateway_status = routing_map_status
         .as_array()
         .and_then(|entries| {
             entries
@@ -2808,7 +2809,7 @@ fn check_overlay_metadata() -> Result<String, Box<dyn std::error::Error>> {
 /// reconcile hot-loop with three independent unconditional-write sources —
 /// `distribute_overlay_configmap`'s overlay `ConfigMap` apply, the `GridSite`
 /// cert-PEM status patch, and (discovered during live helios08 validation of
-/// the first two fixes) the `GridNetwork`'s own `status.overlayStatus[].renderedAt`
+/// the first two fixes) the `GridNetwork`'s own `status.routingMapStatus[].renderedAt`
 /// timestamp, which was refreshed from a new clock read on every reconcile
 /// tick regardless of whether the distributed content actually changed.
 /// Each write bumped its object's `resourceVersion` and fired a watch event
@@ -3172,7 +3173,7 @@ fn parse_gridsite_egress(
             .ok_or_else(|| format!("missing Forge capture for {provider} provider gateway"))?;
         let addr = find_gridsite_egress(items, provider)?;
         if addr.is_empty() {
-            return Err(format!("GridSite for {provider} has no egress address").into());
+            return Err(format!("GridSite for {provider} has no gateway endpoint address").into());
         }
         verify_expected_gateway_addr(provider, "GridSite egress", addr, expected)?;
         verified.push(format!("{provider}={addr}"));
@@ -3196,7 +3197,7 @@ fn find_gridsite_egress<'cfg>(
         return Err(format!("GridSite for {provider} not found on edge cluster").into());
     };
     Ok(site
-        .pointer("/spec/egress/address")
+        .pointer("/spec/gatewayEndpoint/address")
         .and_then(serde_json::Value::as_str)
         .unwrap_or(""))
 }
@@ -5165,7 +5166,7 @@ clusters:
             .unwrap_or_else(|_| std::process::abort());
         for expected in [
             "name: vcr-east-provider-secondary",
-            "routingClusterRef: vcr-east-provider-secondary",
+            "clusterName: vcr-east-provider-secondary",
             "grid.praxis.fast/provider-site: east-provider",
             "name: Qwen/Qwen3-0.6B",
         ] {
@@ -5385,11 +5386,11 @@ clusters:
             "items": [
                 {
                     "metadata": {"name": "glb-demo-west-provider"},
-                    "spec": {"egress": {"address": "172.18.0.5:8443"}}
+                    "spec": {"gatewayEndpoint": {"address": "172.18.0.5:8443"}}
                 },
                 {
                     "metadata": {"name": "glb-demo-east-provider"},
-                    "spec": {"egress": {"address": "172.18.0.6:8443"}}
+                    "spec": {"gatewayEndpoint": {"address": "172.18.0.6:8443"}}
                 }
             ]
         });
@@ -5410,11 +5411,11 @@ clusters:
             "items": [
                 {
                     "metadata": {"name": "glb-demo-west-provider"},
-                    "spec": {"egress": {"address": ""}}
+                    "spec": {"gatewayEndpoint": {"address": ""}}
                 },
                 {
                     "metadata": {"name": "glb-demo-east-provider"},
-                    "spec": {"egress": {"address": "172.18.0.6:8443"}}
+                    "spec": {"gatewayEndpoint": {"address": "172.18.0.6:8443"}}
                 }
             ]
         });
@@ -5435,11 +5436,11 @@ clusters:
             "items": [
                 {
                     "metadata": {"name": "glb-demo-west-provider"},
-                    "spec": {"egress": {"address": "172.18.0.5:8443"}}
+                    "spec": {"gatewayEndpoint": {"address": "172.18.0.5:8443"}}
                 },
                 {
                     "metadata": {"name": "glb-demo-east-provider"},
-                    "spec": {"egress": {"address": "172.18.0.6:8443"}}
+                    "spec": {"gatewayEndpoint": {"address": "172.18.0.6:8443"}}
                 }
             ]
         });

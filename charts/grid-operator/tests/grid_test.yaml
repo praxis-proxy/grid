@@ -38,12 +38,12 @@ tests:
             seeds: ["192.0.2.10:7946"]
             signalTransport: {mode: poll}
             peerTrust: {mode: spiffe}
-            gatewayRefs:
-              - {name: grid-gateway, namespace: grid, localSiteName: east}
+            consumerGateways:
+              - {name: grid-gateway, namespace: grid, siteName: east}
             tls:
               siteSecretRef: {name: grid-site-identity, namespace: grid}
               caSecretRef: {name: grid-ca, namespace: grid}
-              swimKeyRef: {name: grid-swim-key, namespace: grid}
+              swimKeySecretRef: {name: grid-swim-key, namespace: grid}
 
   - it: renders this site's GridSite named after it
     template: templates/gridsite.yaml
@@ -118,7 +118,7 @@ tests:
         qwen3:
           model: Qwen3-Coder-30B-A3B
           endpoint: http://qwen3.llm-d.svc:80
-          routingClusterRef: east
+          clusterName: east
     asserts:
       - equal:
           path: metadata.name
@@ -130,10 +130,43 @@ tests:
             providerKind: vllm
             backendKind: local_model
             endpoint: http://qwen3.llm-d.svc:80
-            routingClusterRef: east
+            clusterName: east
             models:
               - name: Qwen3-Coder-30B-A3B
                 capabilities: [text_generation]
+
+  - it: translates legacy provider values to current CRD fields
+    template: templates/inferenceprovider.yaml
+    set:
+      site.name: east
+      grid.id: lab
+      grid.providers:
+        qwen3:
+          model: Qwen3-Coder-30B-A3B
+          endpoint: http://qwen3.llm-d.svc:80
+          routingClusterRef: east
+          gatewayRef: provider-gateway
+          metricsConfig:
+            metricsEndpoint: http://metrics.example.com:9090
+          auth:
+            manual: true
+    asserts:
+      - equal:
+          path: spec.clusterName
+          value: east
+      - equal:
+          path: spec.providerGateway
+          value: provider-gateway
+      - equal:
+          path: spec.metricsConfig.endpoint
+          value: http://metrics.example.com:9090
+      - equal:
+          path: spec.auth.credentialsManagedExternally
+          value: true
+      - notExists:
+          path: spec.routingClusterRef
+      - notExists:
+          path: spec.gatewayRef
 
   - it: keeps YAML-ambiguous names strings
     templates:

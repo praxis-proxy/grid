@@ -311,7 +311,7 @@ The contract distinguishes four observable stages:
 
 | Stage | Owner | Evidence |
 |---|---|---|
-| **Rendered** | AGN Operator | `GridNetwork.status.overlayStatus[].renderedRevision` |
+| **Rendered** | AGN Operator | `GridNetwork.status.routingMapStatus[].renderedRevision` |
 | **Distributed** | AGN Operator and Kubernetes | `distributedRevision` plus the applied `ConfigMap` `resourceVersion` |
 | **Accepted** | Praxis AI | Successful validation and atomic snapshot-load event |
 | **Serving** | Praxis AI request path | The selected immutable snapshot revision attached to provider-hop telemetry |
@@ -344,7 +344,7 @@ Candidate fields:
 |`site`|AGN site advertising the capability.|
 |`cluster`|Praxis load-balancer cluster identity used for upstream routing.|
 |`fresh`|Whether provider status is considered fresh enough for normal routing.|
-|`credential`|Optional. Projected when auth is non-manual `bearer_token` and the Secret reference has non-empty `name`, `namespace`, and `key`, regardless of `backendKind`. Contains only Secret locating information, never the token value.|
+|`credential`|Optional. Projected when `auth.credentialsManagedExternally` is false and `auth.strategy` is `bearer_token` and the Secret reference has non-empty `name`, `namespace`, and `key`, regardless of `backendKind`. Contains only Secret locating information, never the token value.|
 |`stable_id`|Optional. Deterministic FNV-1a hash of `{kind}/{name}/{site}/{cluster}`. Used as `candidate_id` in provider gateway `provider_route` configuration. This differs from InferenceProvider `.metadata.name`; it can also key consumer-side affinity.|
 |`admission_state`|Optional Praxis value: `new_and_existing`, `existing_only`, or `none`. AGN removes excluded candidates before serialization and does not currently emit `none`.|
 |`selection_tier`|Optional locality tier: `same_site`, `same_zone`, `same_region`, `cross_region`, or `unknown`. Derived from `GridSite` region and zone.|
@@ -582,7 +582,7 @@ Multi-cluster model routing is the baseline AGN data-plane behavior:
 
 1. Each provider site declares the models it can serve through
    `InferenceProvider.spec.models`.
-2. `spec.routingClusterRef` names the Praxis upstream cluster that can reach
+2. `spec.clusterName` names the Praxis upstream cluster that can reach
    that provider site.
 3. The operator renders one overlay candidate per routable model/provider pair.
 4. The consumer Praxis gateway extracts the requested model and selects the

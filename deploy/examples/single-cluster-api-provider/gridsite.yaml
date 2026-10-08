@@ -13,7 +13,7 @@ spec:
 
   # No egress configuration for single-cluster example
   # (Would be needed for multi-site routing)
-  egress: null
+  gatewayEndpoint: null
 
   # No trust policy for single-cluster example
   # (Would be needed for multi-site mTLS)

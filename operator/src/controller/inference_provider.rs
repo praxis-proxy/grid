@@ -1279,7 +1279,14 @@ mod tests {
         match auth {
             ProbeAuthFixture::Absent => provider.spec.auth = None,
             ProbeAuthFixture::Managed(_) => {},
-            ProbeAuthFixture::Manual => provider.spec.auth.as_mut().expect("fixture has auth").manual = true,
+            ProbeAuthFixture::Manual => {
+                provider
+                    .spec
+                    .auth
+                    .as_mut()
+                    .expect("fixture has auth")
+                    .credentials_managed_externally = true;
+            },
         }
         if let Some(inference_endpoint) = inference_endpoint {
             provider.spec.endpoint = inference_endpoint.to_owned();
@@ -3210,7 +3217,7 @@ mod tests {
             access_policy: crate::crd::auth::AccessPolicy::default(),
             auth: None,
             backend_kind: "local".to_owned(),
-            gateway_ref: None,
+            provider_gateway: None,
             cost: None,
             endpoint: endpoint.to_owned(),
             tls: None,
@@ -3222,7 +3229,7 @@ mod tests {
             }],
             model_discovery: None,
             provider_kind: "self_hosted".to_owned(),
-            routing_cluster_ref: None,
+            cluster_name: None,
             metrics_config: None,
             traffic_policy: None,
             site_selector: crate::crd::auth::SelectorConfig::default(),

@@ -252,10 +252,10 @@ spec:
                 siteSecretRef:
                   name: consumer-gateway-tls
                   namespace: grid-system
-              gatewayRefs:
+              consumerGateways:
                 - name: consumer-gateway
                   namespace: grid-system
-                  localSiteName: pool-a
+                  siteName: pool-a
             gridSite:
               name: pool-a
               region: pool-a
@@ -286,7 +286,7 @@ spec:
                   path: /metrics
                   timeout: "2s"
                   staleMetricsSeconds: 20
-                  metricsEndpoint: "http://llmd-epp-metrics.grid-system.svc.cluster.local:9090"
+                  endpoint: "http://llmd-epp-metrics.grid-system.svc.cluster.local:9090"
                   poolName: "{{ cluster.properties.poolName }}"
                   queueCapacity: 4
                   signalNames:
@@ -329,10 +329,10 @@ spec:
                 siteSecretRef:
                   name: consumer-gateway-tls
                   namespace: grid-system
-              gatewayRefs:
+              consumerGateways:
                 - name: consumer-gateway
                   namespace: grid-system
-                  localSiteName: pool-b
+                  siteName: pool-b
             gridSite:
               name: pool-b
               region: pool-b
@@ -363,7 +363,7 @@ spec:
                   path: /metrics
                   timeout: "2s"
                   staleMetricsSeconds: 20
-                  metricsEndpoint: "http://llmd-epp-metrics.grid-system.svc.cluster.local:9090"
+                  endpoint: "http://llmd-epp-metrics.grid-system.svc.cluster.local:9090"
                   poolName: "{{ cluster.properties.poolName }}"
                   queueCapacity: 4
                   signalNames:

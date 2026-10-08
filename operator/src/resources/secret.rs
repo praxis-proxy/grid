@@ -205,7 +205,7 @@ pub async fn read_swim_key(
             secret = %secret_ref.name,
             namespace = %secret_ref.namespace,
             key_field = %key_field,
-            "swimKeyRef Secret missing key field; SWIM key not applied"
+            "swimKeySecretRef Secret missing key field; SWIM key not applied"
         );
         return Ok(None);
     };
@@ -215,7 +215,7 @@ pub async fn read_swim_key(
             namespace = %secret_ref.namespace,
             key_field = %key_field,
             len = bytes.0.len(),
-            "swimKeyRef key must be exactly 32 bytes; SWIM key not applied"
+            "swimKeySecretRef key must be exactly 32 bytes; SWIM key not applied"
         );
         return Ok(None);
     }

@@ -8,6 +8,13 @@ unchanged by the project-name update.
 
 All CRDs are cluster-scoped.
 
+The 0.2.0 operator accepts both previous and current CRD spec field names. The
+previous names are deprecated. Set only one name per field; setting both is
+rejected by the API schema. The `grid-site` chart translates previous value
+names into current CRD fields and also rejects both names together. See the
+[0.1.4 to 0.2.0 CRD field migration guide](../installation/migration-0.1.4-to-0.2.0.md)
+for the planned removal and upgrade steps.
+
 ## GridNetwork
 
 The AGN logical network and top-level tenancy scope. A single
@@ -23,13 +30,13 @@ spec:
   gridId: ""                    # auto-generated on first join
   seeds:
     - "10.0.0.5:7946"
-  gatewayRefs:
+  consumerGateways:
     - name: inference-gw
       namespace: praxis-system
-      localSiteName: cluster-east   # optional; defaults to network name
-      consumerConfig:               # optional; opt-in consumer Praxis config generation
-        enabled: true
-        credentialMountBase: /run/secrets/grid-credentials
+      siteName: cluster-east   # optional; defaults to network name
+      praxisConfig:               # optional; opt-in consumer Praxis config generation
+        generate: true
+        credentialMountPath: /run/secrets/grid-credentials
         configMapName: praxis-consumer-config
         tlsCertMountPath: /etc/praxis/tls
         clusterEndpoints:           # endpoint topology for load_balancer
@@ -55,7 +62,7 @@ spec:
     siteSecretRef:
       name: grid-site-cert
       namespace: praxis-system
-    swimKeyRef:
+    swimKeySecretRef:
       name: swim-key
       namespace: praxis-system
   budgetPolicy:                   # optional; absent means no tenants are tracked
@@ -89,15 +96,15 @@ not part of this CRD.
 
 **Phases**: Pending → Initializing → Active → Degraded
 
-**Status fields**: `gridId`, `connectedSites`, `distributedProviderCount`,
-`observedGeneration`, `phase`, `consumerConfigStatus[]`, `budgetStatus[]`
+**Status fields**: `gridId`, `connectedSites`, `remoteProviderCount`,
+`observedGeneration`, `phase`, `praxisConfigStatus[]`, `budgetStatus[]`
 
-`distributedProviderCount` reflects the number of remote `InferenceProvider`
+`remoteProviderCount` reflects the number of remote `InferenceProvider`
 records received from peer sites via CRDT broadcast.  Local providers and records
 from other `GridNetwork`s are excluded from the count.
 
-`consumerConfigStatus[]` is populated for each gateway with
-`consumerConfig.enabled: true`, reporting the outcome of the most recent
+`praxisConfigStatus[]` is populated for each gateway with
+`praxisConfig.generate: true`, reporting the outcome of the most recent
 render/apply attempt.
 
 ### Tenant budget tracking
@@ -135,7 +142,7 @@ options under consideration if per-tenant confidentiality is required.
 | `namespace` | string | Namespace of the gateway and generated `ConfigMap` |
 | `configMapName` | string | Name of the generated `ConfigMap` |
 | `phase` | enum | `Rendered` \| `Error` \| `Disabled` |
-| `reason` | string | Machine-readable reason (`MissingClusterEndpoint`, `ConsumerConfigRenderFailed`, `ConsumerConfigApplyFailed`) — empty when `Rendered` |
+| `reason` | string | Machine-readable reason (`MissingClusterEndpoint`, `PraxisConfigRenderFailed`, `PraxisConfigApplyFailed`) — empty when `Rendered` |
 | `message` | string | Human-readable diagnostic; never contains token bytes |
 | `observedGeneration` | integer | `GridNetwork` generation when this entry was last updated |
 
@@ -146,7 +153,7 @@ status:
   phase: Active
   gridId: grid-abc123
   connectedSites: 2
-  consumerConfigStatus:
+  praxisConfigStatus:
     - gatewayName: inference-gw
       namespace: praxis-system
       configMapName: praxis-consumer-config
@@ -158,7 +165,7 @@ status:
       namespace: default
       configMapName: op-e2e-consumer-config
       phase: Error
-      reason: ConsumerConfigRenderFailed
+      reason: PraxisConfigRenderFailed
       message: "consumer config render: overlay local_site must not be blank"
       observedGeneration: 7
 ```
@@ -193,14 +200,14 @@ table.  Provider CRDT state remains scoped per network.
 **Self-filtering:** The operator removes its own SWIM bind address from
 `spec.seeds` before announcing, preventing self-join loops.
 
-**`spec.tls.swimKeyRef`:** References a Kubernetes Secret containing the 32-byte
+**`spec.tls.swimKeySecretRef`:** References a Kubernetes Secret containing the 32-byte
 AES-256-GCM key for SWIM transport authentication.  When configured, the
 `GridNetwork` controller reads the key from the Secret and configures the
 SWIM runtime to encrypt all outgoing UDP packets and reject incoming packets
 that fail authentication before it announces CRD seeds or publishes
 certificate/provider state for that reconcile.
 
-The Secret must contain a `"key"` field (or the field named by `swimKeyRef.key`)
+The Secret must contain a `"key"` field (or the field named by `swimKeySecretRef.key`)
 with exactly 32 bytes.  If the Secret is absent, unreadable, or has the wrong
 length, the reconcile fails before CRD seed announcement and state broadcast.
 The process-global SWIM runtime keeps any previously loaded key until restart;
@@ -246,15 +253,15 @@ never starts clocks or collects. A pass that would delete more than half the
 stubs, and more than 8, deletes none and logs a warning; a partition looks like
 mass departure.
 
-### GatewayRef.consumerConfig
+### GatewayRef.praxisConfig
 
-`spec.gatewayRefs[].consumerConfig` opts a gateway into operator-managed consumer
+`spec.consumerGateways[].praxisConfig` opts a gateway into operator-managed consumer
 Praxis `ConfigMap` generation.
 
 | Field | Default | Meaning |
 |---|---|---|
-| `enabled` | `false` | Set to `true` to enable consumer config generation for this gateway. |
-| `credentialMountBase` | `/run/secrets/grid-credentials` | Base directory where credential Secrets are mounted inside the consumer pod. |
+| `generate` | `false` | Set to `true` to enable consumer config generation for this gateway. |
+| `credentialMountPath` | `/run/secrets/grid-credentials` | Base directory where credential Secrets are mounted inside the consumer pod. |
 | `configMapName` | `praxis-consumer-config` | Name of the generated `ConfigMap` in the gateway namespace. |
 | `clusterEndpoints[]` | `[]` | Endpoint topology for `load_balancer` clusters. Each entry maps a candidate cluster name to an address with explicit `transport` configuration. Missing transport fails closed. |
 | `clusterEndpoints[].transport.mode` | _(required)_ | `mutual_tls` (mTLS with CA/client cert/SNI/verify) or `plaintext` (no TLS, insecure/dev-only). |
@@ -262,7 +269,7 @@ Praxis `ConfigMap` generation.
 | `tlsCertMountPath` | `/etc/praxis/tls` | Base path for mounted TLS files used when a `clusterEndpoints[]` entry uses `mutual_tls` transport. |
 | `listenerPort` | `8080` | HTTP port for the generated `listeners[0].address` (`0.0.0.0:{listenerPort}`). |
 
-When `enabled: true`, the `GridNetwork` controller renders a `praxis.yaml`-keyed
+When `generate: true`, the `GridNetwork` controller renders a `praxis.yaml`-keyed
 `ConfigMap` in the gateway namespace on each reconcile.  The generated config is a
 complete, runnable Praxis config containing:
 
@@ -289,7 +296,7 @@ The `credential_inject` filter is a Praxis AI runtime dependency. The AGN
 operator can render the config shape, but the deployed Praxis AI image must
 include that filter for the generated config to start successfully.
 
-When `enabled: false` or `consumerConfig` is absent, this gateway behaves as before
+When `generate: false` or `praxisConfig` is absent, this gateway behaves as before
 — only the routing overlay `ConfigMap` is applied.
 
 ## GridSite
@@ -306,7 +313,7 @@ metadata:
     grid.praxis.fast/network: production
 spec:
   gridNetworkRef: production
-  egress:
+  gatewayEndpoint:
     address: egress.cluster-b.example.com:8443
     tls:
       mode: Mutual
@@ -341,7 +348,7 @@ A discovered SWIM peer is not automatically authorized for routing.
 |---|---|---|
 | `Pending` | Resource created (manually or by auto-discovery) | Initial default |
 | `Discovered` | SWIM peer observed as Alive | `GridNetwork` controller writes on first observation |
-| `Connecting` | Gateway address known (`spec.egress.address` non-empty) | `GridSite` controller advances from Discovered; performs identity-aware probe |
+| `Connecting` | Gateway address known (`spec.gatewayEndpoint.address` non-empty) | `GridSite` controller advances from Discovered; performs identity-aware probe |
 | `Active` | `TlsVerified` | `GridSite` controller promotes from Connecting only after identity-verified TLS succeeds |
 | `Unreachable` | Connectivity failure while Active | `GridSite` controller moves Active → Unreachable when the endpoint cannot be reached |
 | `Left` | Set on graceful site departure | Preserved by operator once set |
@@ -353,8 +360,7 @@ A discovered SWIM peer is not automatically authorized for routing.
 | `AwaitingDiscovery` | Pending | Site record exists; SWIM has not yet observed the peer as Alive |
 | `SWIMDiscovered` | Discovered | Peer observed as Alive in SWIM membership; gateway address propagating |
 | `GatewayAddressKnown` | Connecting | Gateway address received; advancing to Connecting |
-| `GatewayAddressMissing` | Discovered | No gateway address known; see `GRID_GATEWAY_ADDRESS` |
-| `EgressMissing` | Connecting or Unreachable | A previously probed site has no egress address |
+| `GatewayAddressMissing` | Discovered, Connecting, or Unreachable | No gateway address known (see `GRID_GATEWAY_ADDRESS`), or a previously probed site lost it |
 | `TlsVerified` | Active | TLS handshake succeeded; certificate chain, identity, and configured pin verified |
 | `IdentityVerificationRequired` | Connecting | TCP endpoint is reachable, but plaintext cannot establish the gateway identity |
 | `PlaintextUnreachable` | Connecting or Unreachable | TCP probe failed (explicit Plaintext mode) |
@@ -374,7 +380,7 @@ A discovered SWIM peer is not automatically authorized for routing.
   peer is first observed as Alive (requires `grid.praxis.fast/auto-discover-sites: "true"`
   label on the `GridNetwork`).
 - Discovered → Connecting: the `GridSite` controller advances automatically when
-  `spec.egress.address` is non-empty. For auto-discovered sites, the egress address comes from
+  `spec.gatewayEndpoint.address` is non-empty. For auto-discovered sites, the egress address comes from
   the remote operator's `GRID_GATEWAY_ADDRESS` env var, propagated via SWIM state broadcast.
   If the remote operator has not configured `GRID_GATEWAY_ADDRESS`, the egress address is empty
   and the site stays Discovered with reason `GatewayAddressMissing`.
@@ -397,11 +403,11 @@ updates on every `GridNetwork` reconcile, and drops a site's series once its `Gr
 is gone. Cardinality is six series per site. `grid_site_phase_transition_total`
 still counts the transitions by phase and reason.
 
-**`spec.egress.address` source:** For auto-discovered sites, the egress address is sourced from
+**`spec.gatewayEndpoint.address` source:** For auto-discovered sites, the egress address is sourced from
 the remote operator's `GRID_GATEWAY_ADDRESS` environment variable, propagated through the SWIM
 state broadcast.  If the remote operator has not configured `GRID_GATEWAY_ADDRESS`, the field
 is empty and the site stays Discovered.  For manually-applied `GridSite` resources, set
-`spec.egress.address` explicitly to the data-plane gateway endpoint.
+`spec.gatewayEndpoint.address` explicitly to the data-plane gateway endpoint.
 
 **`status.publicCertPem`:** The public site certificate PEM received from the remote site via
 SWIM state broadcast.  Before storage, the operator performs a structural check:
@@ -420,7 +426,7 @@ structural check passed.  It does **not** mean:
 Private keys, bearer tokens, provider credentials, and Kubernetes Secret contents must never
 be written to status.
 
-**`spec.egress.tls` fields:**
+**`spec.gatewayEndpoint.tls` fields:**
 
 | Field | Meaning |
 |---|---|
@@ -458,7 +464,7 @@ block local serving:** local `InferenceProvider`s are eligible regardless of
 "Routing eligibility" above). Do not add SWIM seeds or extra operator replicas to
 try to force the site `Active` - there is no second site to discover, and a lone
 operator legitimately runs a single-node mesh with zero peers. The `Active` phase
-and its mTLS gateway probe (`spec.egress` + `spec.trust`) apply to reaching
+and its mTLS gateway probe (`spec.gatewayEndpoint` + `spec.trust`) apply to reaching
 *remote* sites, or a manually-configured peer gateway endpoint. See
 [Architecture Overview -> Single-Site and Combined Deployments](overview.md#single-site-and-combined-deployments).
 
@@ -690,8 +696,8 @@ feeds the resulting `BackendMetrics` into overlay scoring.
 
 | Field | Default | Meaning |
 |-------|---------|---------|
-| `metricsEndpoint` | absent | Optional metrics-service base URL. When set, it replaces `spec.endpoint` as the scrape base; `path` is appended to the selected base. |
-| `path` | `/metrics` | HTTP path, relative to `metricsEndpoint` when set, otherwise `spec.endpoint`. |
+| `metricsConfig.endpoint` | absent | Optional metrics-service base URL. When set, it replaces `spec.endpoint` as the scrape base; `path` is appended to the selected base. |
+| `path` | `/metrics` | HTTP path, relative to `metricsConfig.endpoint` when set, otherwise `spec.endpoint`. |
 | `timeout` | `2s` | Scrape timeout. `s` and `ms` suffixes are recognized. |
 | `poolName` | absent | Selects samples whose Prometheus `name` label matches this pool. When set, the scrape must contain at least one configured signal for that pool. |
 | `queueCapacity` | absent | For raw queue-depth counts, divide by this positive capacity and clamp the normalized value to `0.0..1.0`. Without it, queue depth must already be normalized. |
@@ -887,7 +893,7 @@ it when discovery is disabled. The field reports the latest poll error; the
 held model set still follows its TTL independently.
 
 The bearer token comes from `spec.auth`. A model-discovery URL must use HTTPS
-when a bearer token is configured. With `auth.manual`, requests carry no
+when a bearer token is configured. With `auth.credentialsManagedExternally`, requests carry no
 credentials, so plain HTTP remains available.
 
 Discovery runs in its own loop, like the signals scraper, not in reconcile.

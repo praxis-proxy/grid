@@ -314,8 +314,8 @@ install_hub() {
   renewal_args grid-site
   HUB_SITE_ARGS=("${RA[@]}" --set gridNetwork.gridId="$PREFIX-e2e" --set gridSite.name=hub
     --set "peers.$SITE.address=$SITE_GW_IP:8080"
-    --set gridNetwork.peerTrust.mode="$MODE" --set "gridNetwork.gatewayRefs[0].name=grid-gateway"
-    --set "gridNetwork.gatewayRefs[0].namespace=$NS" --set "gridNetwork.gatewayRefs[0].localSiteName=hub")
+    --set gridNetwork.peerTrust.mode="$MODE" --set "gridNetwork.consumerGateways[0].name=grid-gateway"
+    --set "gridNetwork.consumerGateways[0].namespace=$NS" --set "gridNetwork.consumerGateways[0].siteName=hub")
   helm_on "$HUB_CTX" "$NS" grid-site grid-site "${HUB_SITE_ARGS[@]}" || die "install hub grid-site"
   images gateway
   helm_on "$HUB_CTX" "$NS" grid-gateway praxis-gateway \
@@ -431,7 +431,7 @@ site_phase_in() { # <context> <site> <phase ERE>
 }
 
 overlay_distributed() {
-  k "$HUB_CTX" get gridnetwork grid -o json | jq -e '[.status.overlayStatus[]?
+  k "$HUB_CTX" get gridnetwork grid -o json | jq -e '[.status.routingMapStatus[]?
     | select(.gatewayName == "grid-gateway" and .phase == "Distributed" and .candidateCount >= 1)] | length == 1'
 }
 

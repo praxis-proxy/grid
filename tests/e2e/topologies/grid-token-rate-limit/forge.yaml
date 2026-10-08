@@ -396,19 +396,19 @@ spec:
                 siteSecretRef:
                   name: consumer-gateway-tls
                   namespace: grid-system
-              gatewayRefs:
+              consumerGateways:
                 - name: consumer-gateway-a
                   namespace: grid-system
-                  localSiteName: west
+                  siteName: west
                 - name: consumer-gateway-b
                   namespace: grid-system
-                  localSiteName: west
+                  siteName: west
             gridSite:
               name: west
               region: west
               zone: west-1
               providerSiteLabel: west
-              egress:
+              gatewayEndpoint:
                 address: "{{ captures.west.provider-gateway-ip }}:8443"
                 tls:
                   mode: Mutual
@@ -470,16 +470,16 @@ spec:
                 siteSecretRef:
                   name: consumer-gateway-tls
                   namespace: grid-system
-              gatewayRefs:
+              consumerGateways:
                 - name: provider-gateway
                   namespace: grid-system
-                  localSiteName: central
+                  siteName: central
             gridSite:
               name: central
               region: central
               zone: central-1
               providerSiteLabel: central
-              egress:
+              gatewayEndpoint:
                 address: "{{ captures.central.provider-gateway-ip }}:8443"
                 tls:
                   mode: Mutual
@@ -541,16 +541,16 @@ spec:
                 siteSecretRef:
                   name: consumer-gateway-tls
                   namespace: grid-system
-              gatewayRefs:
+              consumerGateways:
                 - name: provider-gateway
                   namespace: grid-system
-                  localSiteName: east
+                  siteName: east
             gridSite:
               name: east
               region: east
               zone: east-1
               providerSiteLabel: east
-              egress:
+              gatewayEndpoint:
                 address: "{{ captures.east.provider-gateway-ip }}:8443"
                 tls:
                   mode: Mutual
