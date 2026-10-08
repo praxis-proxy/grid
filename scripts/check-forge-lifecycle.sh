@@ -89,9 +89,14 @@ docker network rm "$NETWORK"
 mkdir "$WORK/failing-tools"
 REAL_KIND=$(command -v kind)
 export REAL_KIND
+KIND_CREATE_MARKER=$WORK/kind-create-called
+export KIND_CREATE_MARKER
 cat > "$WORK/failing-tools/kind" <<'SH'
 #!/usr/bin/env bash
-if [[ $1 == create ]]; then exit 77; fi
+if [[ $1 == create ]]; then
+  : > "$KIND_CREATE_MARKER"
+  exit 77
+fi
 exec "$REAL_KIND" "$@"
 SH
 chmod +x "$WORK/failing-tools/kind"
@@ -99,7 +104,10 @@ if PATH="$WORK/failing-tools:$PATH" forge up > "$EVIDENCE/expected-up-failure.lo
   printf 'Expected injected cluster creation failure\n' >&2
   exit 1
 fi
-jq --exit-status '.networkCreatedByForge == true' "$STATE/state.json"
+[[ -f $KIND_CREATE_MARKER ]]
+jq --exit-status \
+  '.networkCreatedByForge == true and any(.clusters[]?; .name == "probe" and .phase == "creating")' \
+  "$STATE/state.json"
 cp "$STATE/state.json" "$EVIDENCE/failed-up-state.json"
 forge down --force
 require_network_absent
