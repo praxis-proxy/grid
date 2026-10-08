@@ -15,10 +15,10 @@
 //!   selector means this site alone, when the network lists it.
 //! - Each `(model, site)` pair becomes one `RoutingCandidate`.
 //! - `candidate.site` = the [`GridSite`]'s site id (resolved via selector), as peers are keyed.
-//! - `candidate.cluster` = `spec.clusterName` when set, otherwise the [`InferenceProvider`] metadata name. The
-//!   gateway uses this as the upstream cluster reference in its local routing configuration.
-//! - When no [`GridSite`]s are provided, the routing identity (`spec.clusterName` or provider name) is used as
-//!   both `site` and `cluster` (Phase 1 self-hosted fallback).
+//! - `candidate.cluster` = `spec.clusterName` when set, otherwise the [`InferenceProvider`] metadata name. The gateway
+//!   uses this as the upstream cluster reference in its local routing configuration.
+//! - When no [`GridSite`]s are provided, the routing identity (`spec.clusterName` or provider name) is used as both
+//!   `site` and `cluster` (Phase 1 self-hosted fallback).
 //!
 //! # Spec-based vs status-based site derivation
 //!
@@ -1836,7 +1836,6 @@ fn is_explicitly_unavailable(provider: &InferenceProvider) -> bool {
         .as_ref()
         .is_some_and(|s| s.phase == ProviderPhase::Unavailable)
 }
-
 
 /// Build [`RoutingCandidate`]s for a local [`AgentToolProvider`].
 ///
