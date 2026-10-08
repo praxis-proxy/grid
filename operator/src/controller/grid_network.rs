@@ -8,6 +8,7 @@
 //! [`GridNetwork`]: crate::crd::grid_network::GridNetwork
 
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, BTreeSet, HashMap},
     net::{Ipv6Addr, SocketAddr, SocketAddrV6},
     path::Path,
@@ -35,9 +36,10 @@ use crate::{
     crd::{
         agent_tool_provider::AgentToolProvider,
         grid_network::{
-            ConsumerConfig, ConsumerConfigPhase, ConsumerConfigStatus, GatewayRef, GridNetwork, GridNetworkPhase,
-            GridNetworkStatus, MountReconciliation, MountReconciliationPhase, MountReconciliationStatus, OverlayPhase,
-            OverlayRevisionStatus, PeerTrustMode, SignalMode, SiteIdentityStatus, TenantBudgetStatus, TransportMode,
+            ClusterEndpointConfig, ConsumerConfig, ConsumerConfigPhase, ConsumerConfigStatus, GatewayRef, GridNetwork,
+            GridNetworkPhase, GridNetworkStatus, MountReconciliation, MountReconciliationPhase,
+            MountReconciliationStatus, OverlayPhase, OverlayRevisionStatus, PeerTrustMode, SignalMode,
+            SiteIdentityStatus, TenantBudgetStatus, TransportMode,
         },
         grid_site::{GridSite, GridSitePhase, GridSiteStatus},
         inference_provider::InferenceProvider,
@@ -46,7 +48,8 @@ use crate::{
     readiness,
     resources::{
         consumer_config::{self, ConsumerConfigError},
-        gateway_mounts, overlay_envelope, provider_admission, provider_metrics, routing_overlay, secret,
+        derived_topology, gateway_mounts, overlay_envelope, provider_admission, provider_metrics, routing_overlay,
+        secret,
         serving_config::{self, ServingInputs, WriteDecision, WriteGate},
         tls_backend::ServerTlsConfig,
         trust_bundle::{self, CertPemStatus},
@@ -2234,6 +2237,17 @@ async fn reconcile_routing_overlay_inner(
                 continue;
             },
         };
+        let (cluster_endpoints, derived_summary) = gateway_cluster_endpoints(
+            gw_ref,
+            &overlay.candidates,
+            &derived_topology::Declarations {
+                providers,
+                sites: &sites,
+                local_site,
+                network_name,
+                from_providers: &[],
+            },
+        );
         let no_candidates = overlay.candidates.is_empty();
         if no_candidates {
             tracing::warn!(
@@ -2259,6 +2273,7 @@ async fn reconcile_routing_overlay_inner(
                 network_name,
                 gw_ref,
                 cc,
+                &cluster_endpoints,
                 &network.spec.tls,
                 observed_generation,
                 client,
@@ -2267,7 +2282,12 @@ async fn reconcile_routing_overlay_inner(
             {
                 Ok(outcome) => {
                     if outcome.config_applied {
-                        consumer_statuses.push(consumer_config_status_rendered(gw_ref, cc, observed_generation));
+                        consumer_statuses.push(consumer_config_status_rendered(
+                            gw_ref,
+                            cc,
+                            observed_generation,
+                            &derived_summary,
+                        ));
                     }
                     if let Some(status) = outcome.mount_status {
                         delegated_mount_reconciled = !status.applied_revision.is_empty();
@@ -2365,6 +2385,7 @@ async fn reconcile_routing_overlay_inner(
                 network_name,
                 gw_ref,
                 cc,
+                &cluster_endpoints,
                 &network.spec.tls,
                 observed_generation,
                 client,
@@ -2373,7 +2394,12 @@ async fn reconcile_routing_overlay_inner(
             {
                 Ok(outcome) => {
                     if outcome.config_applied {
-                        consumer_statuses.push(consumer_config_status_rendered(gw_ref, cc, observed_generation));
+                        consumer_statuses.push(consumer_config_status_rendered(
+                            gw_ref,
+                            cc,
+                            observed_generation,
+                            &derived_summary,
+                        ));
                     }
                     if let Some(status) = outcome.mount_status {
                         mount_statuses.push(status);
@@ -2814,6 +2840,7 @@ async fn apply_consumer_config_for_gateway(
     network_name: &str,
     gw_ref: &GatewayRef,
     cc: &ConsumerConfig,
+    cluster_endpoints: &[ClusterEndpointConfig],
     tls: &crate::crd::grid_network::TlsConfig,
     observed_generation: i64,
     client: &Client,
@@ -2821,7 +2848,7 @@ async fn apply_consumer_config_for_gateway(
     let rendered = consumer_config::render_consumer_config(
         overlay,
         &cc.credential_mount_base,
-        &cc.cluster_endpoints,
+        cluster_endpoints,
         &cc.tls_cert_mount_path,
         cc.listener_port,
         tls,
@@ -5028,11 +5055,54 @@ fn grid_network_status_needs_update(current: Option<&GridNetworkStatus>, desired
 // Consumer config status builders
 // ---------------------------------------------------------------------------
 
+/// The endpoint topology for one gateway, and the status note naming what was derived.
+///
+/// Without `deriveTopology`, the gateway's own entries pass through untouched,
+/// which is what keeps this opt-in. With it, resolution fills the clusters they
+/// do not cover.
+///
+/// Resolution is keyed by candidate, so an entry for a cluster no candidate
+/// names does not survive the derived path. That is unobservable: the renderer
+/// looks up only the clusters its candidates name, and the plaintext-egress
+/// decision reads the spec rather than this result.
+fn gateway_cluster_endpoints<'gw>(
+    gw_ref: &'gw GatewayRef,
+    candidates: &[routing_overlay::RoutingCandidate],
+    declarations: &derived_topology::Declarations<'_>,
+) -> (Cow<'gw, [ClusterEndpointConfig]>, String) {
+    let Some(cc) = gw_ref.consumer_config.as_ref() else {
+        return (Cow::Borrowed(&[]), String::new());
+    };
+    // An empty allowlist derives nothing, so a half-finished edit leaves the
+    // gateway on its own entries rather than on every provider in the cluster.
+    let Some(derive) = cc
+        .derive_topology
+        .as_ref()
+        .filter(|derive| !derive.from_providers.is_empty())
+    else {
+        return (Cow::Borrowed(cc.cluster_endpoints.as_slice()), String::new());
+    };
+    let resolved = derived_topology::resolve(
+        candidates,
+        &cc.cluster_endpoints,
+        &derived_topology::Declarations {
+            from_providers: &derive.from_providers,
+            ..*declarations
+        },
+    );
+    let summary = derived_topology::derived_summary(&resolved);
+    (
+        Cow::Owned(resolved.into_values().map(|entry| entry.endpoint).collect()),
+        summary,
+    )
+}
+
 /// Build a `Rendered` [`ConsumerConfigStatus`] for a successfully applied consumer config.
 pub(crate) fn consumer_config_status_rendered(
     gw_ref: &GatewayRef,
     cc: &ConsumerConfig,
     observed_generation: i64,
+    derived_summary: &str,
 ) -> ConsumerConfigStatus {
     ConsumerConfigStatus {
         gateway_name: gw_ref.name.clone(),
@@ -5040,10 +5110,17 @@ pub(crate) fn consumer_config_status_rendered(
         config_map_name: cc.config_map_name.clone(),
         phase: ConsumerConfigPhase::Rendered,
         reason: String::new(),
-        message: format!(
-            "consumer config rendered and applied to {}/{}",
-            gw_ref.namespace, cc.config_map_name
-        ),
+        message: if derived_summary.is_empty() {
+            format!(
+                "consumer config rendered and applied to {}/{}",
+                gw_ref.namespace, cc.config_map_name
+            )
+        } else {
+            format!(
+                "consumer config rendered and applied to {}/{}; {derived_summary}",
+                gw_ref.namespace, cc.config_map_name
+            )
+        },
         observed_generation,
     }
 }
@@ -9206,11 +9283,114 @@ mod tests {
         );
     }
 
+    /// A candidate naming one cluster at one site, for the topology arm.
+    fn topology_candidate(cluster: &str, site: &str) -> routing_overlay::RoutingCandidate {
+        serde_json::from_value(serde_json::json!({
+            "kind": "inference_model",
+            "name": "model-x",
+            "site": site,
+            "cluster": cluster,
+            "fresh": true
+        }))
+        .unwrap_or_else(|_| std::process::abort())
+    }
+
+    /// An explicit entry a human typed, transport and all.
+    fn typed_endpoint(cluster: &str, address: &str) -> ClusterEndpointConfig {
+        ClusterEndpointConfig {
+            cluster: cluster.to_owned(),
+            address: address.to_owned(),
+            transport: Some(crate::crd::grid_network::EndpointTransport {
+                mode: TransportMode::Plaintext,
+                sni: None,
+                ca_secret_ref: None,
+            }),
+        }
+    }
+
+    /// Declarations with nothing to derive from, so only the arm is under test.
+    fn empty_declarations() -> derived_topology::Declarations<'static> {
+        derived_topology::Declarations {
+            providers: &[],
+            sites: &[],
+            local_site: "site-a",
+            network_name: "net",
+            from_providers: &[],
+        }
+    }
+
+    #[test]
+    fn without_derive_topology_a_gateways_own_entries_pass_through_untouched() {
+        let mut gw = make_gw_ref("inference-gw", "praxis-system");
+        let typed = vec![typed_endpoint("prov-a", "a.example.invalid:8080")];
+        gw.consumer_config = Some(ConsumerConfig {
+            cluster_endpoints: typed.clone(),
+            ..make_consumer_config("praxis-consumer-config")
+        });
+        // A candidate that resolution could not have derived anyway, plus one
+        // typed entry naming no candidate: without the opt-in, neither matters.
+        let candidates = vec![topology_candidate("prov-b", "site-b")];
+        let (endpoints, summary) = gateway_cluster_endpoints(&gw, &candidates, &empty_declarations());
+        assert_eq!(
+            endpoints, typed,
+            "the opt-in is what changes the topology, so off must copy the spec"
+        );
+        assert!(
+            summary.is_empty(),
+            "nothing was derived, so the status must read as it did before"
+        );
+    }
+
+    #[test]
+    fn with_derive_topology_an_unresolvable_candidate_leaves_the_topology_empty() {
+        let mut gw = make_gw_ref("inference-gw", "praxis-system");
+        gw.consumer_config = Some(ConsumerConfig {
+            derive_topology: Some(crate::crd::grid_network::DeriveTopology {
+                from_providers: vec!["prov-a".to_owned(), "prov-b".to_owned(), "prov-ghost".to_owned()],
+            }),
+            ..make_consumer_config("praxis-consumer-config")
+        });
+        let candidates = vec![topology_candidate("prov-ghost", "site-ghost")];
+        let (endpoints, summary) = gateway_cluster_endpoints(&gw, &candidates, &empty_declarations());
+        assert!(
+            endpoints.is_empty(),
+            "derivation reports nothing of its own; the renderer fails this as MissingClusterEndpoint"
+        );
+        assert!(summary.is_empty());
+    }
+
+    #[test]
+    fn with_derive_topology_a_typed_entry_for_no_candidate_is_dropped() {
+        // Documented rather than desired: resolution is keyed by candidate. It
+        // is unobservable because the renderer looks up only the clusters its
+        // candidates name. If that lookup ever changes, this test is the one
+        // that should start failing.
+        let mut gw = make_gw_ref("inference-gw", "praxis-system");
+        gw.consumer_config = Some(ConsumerConfig {
+            derive_topology: Some(crate::crd::grid_network::DeriveTopology {
+                from_providers: vec!["prov-a".to_owned(), "prov-b".to_owned(), "prov-ghost".to_owned()],
+            }),
+            cluster_endpoints: vec![typed_endpoint("retired", "retired.example.invalid:8080")],
+            ..make_consumer_config("praxis-consumer-config")
+        });
+        let (endpoints, _) = gateway_cluster_endpoints(&gw, &[], &empty_declarations());
+        assert!(endpoints.is_empty());
+    }
+
+    #[test]
+    fn a_gateway_with_no_consumer_config_has_no_topology() {
+        let gw = make_gw_ref("inference-gw", "praxis-system");
+        let candidates = vec![topology_candidate("prov-a", "site-a")];
+        let (endpoints, summary) = gateway_cluster_endpoints(&gw, &candidates, &empty_declarations());
+        assert!(endpoints.is_empty());
+        assert!(summary.is_empty());
+    }
+
     #[test]
     fn consumer_config_status_rendered_has_rendered_phase() {
         let gw = make_gw_ref("inference-gw", "praxis-system");
         let cc = make_consumer_config("praxis-consumer-config");
-        let status = consumer_config_status_rendered(&gw, &cc, 5);
+        let status = consumer_config_status_rendered(&gw, &cc, 5, "");
         assert_eq!(
             status.phase,
             ConsumerConfigPhase::Rendered,
@@ -9907,8 +10087,8 @@ mod tests {
         let gw_b = make_gw_ref("gw-b", "ns-b");
         let cc_a = make_consumer_config("cm-a");
         let cc_b = make_consumer_config("cm-b");
-        let status_a = consumer_config_status_rendered(&gw_a, &cc_a, 1);
-        let status_b = consumer_config_status_rendered(&gw_b, &cc_b, 1);
+        let status_a = consumer_config_status_rendered(&gw_a, &cc_a, 1, "");
+        let status_b = consumer_config_status_rendered(&gw_b, &cc_b, 1, "");
         assert_eq!(status_a.gateway_name, "gw-a");
         assert_eq!(status_b.gateway_name, "gw-b");
         assert_eq!(status_a.config_map_name, "cm-a");

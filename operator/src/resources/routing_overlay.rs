@@ -1830,7 +1830,7 @@ fn candidates_from_provider(
 /// it reliably sets `status.phase`.
 ///
 /// [`InferenceProvider`]: crate::crd::inference_provider::InferenceProvider
-fn is_explicitly_unavailable(provider: &InferenceProvider) -> bool {
+pub(crate) fn is_explicitly_unavailable(provider: &InferenceProvider) -> bool {
     provider
         .status
         .as_ref()

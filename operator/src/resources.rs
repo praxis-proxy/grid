@@ -12,6 +12,13 @@ pub(crate) mod consumer_config;
 /// Deterministic projected volume layout and revision helpers for delegated mounts.
 pub(crate) mod gateway_mounts;
 
+/// Endpoint topology derived from provider and `GridSite` declarations.
+///
+/// Emits the same `ClusterEndpointConfig` entries a human types into
+/// `consumerConfig.clusterEndpoints`, so the renderer keeps every fail-closed
+/// reason and derivation has none of its own.
+pub(crate) mod derived_topology;
+
 /// Controller-owned credential resolution for API-provider authentication.
 ///
 /// Provides [`CredentialPlan`], [`CredentialResolver`], and the v1
