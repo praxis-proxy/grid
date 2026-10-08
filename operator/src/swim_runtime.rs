@@ -443,6 +443,17 @@ fn publish_state(state_tx: &watch::Sender<GridStateSnapshot>, node: &SwimNode) {
     });
 }
 
+/// Evict departed origins and immediately expose their provider withdrawal to readers.
+fn evict_origins(origins: &[String], node: &SwimNode, state_tx: &watch::Sender<GridStateSnapshot>) {
+    if origins.is_empty() {
+        return;
+    }
+    for origin in origins {
+        node.evict_origin(origin);
+    }
+    publish_state(state_tx, node);
+}
+
 /// Return true when any tracked member needs age recomputation in snapshots.
 fn has_aging_members(tracked: &HashMap<String, TrackedMember>) -> bool {
     tracked.values().any(|t| t.status_changed_at.is_some())
@@ -724,6 +735,7 @@ async fn publish_pending_withdrawals(
     timer_tx: &mpsc::Sender<TimerEvent>,
     tracked: &mut HashMap<String, TrackedMember>,
     snapshot_tx: &watch::Sender<MembershipSnapshot>,
+    state_tx: &watch::Sender<GridStateSnapshot>,
     key: &KeyState,
 ) {
     let grid_ids = pending.keys().cloned().collect::<Vec<_>>();
@@ -739,6 +751,7 @@ async fn publish_pending_withdrawals(
         }
         let output = node.broadcast();
         drain_output(output, socket, timer_tx, tracked, snapshot_tx, node, key).await;
+        publish_state(state_tx, node);
         retained.remove(&Some(grid_id.clone()));
         if let Some(waiters) = pending.remove(&grid_id) {
             for waiter in waiters {
@@ -1566,6 +1579,7 @@ async fn run_loop(
                     &channels.timer_tx,
                     &mut tracked,
                     &channels.snapshot_tx,
+                    &state_tx,
                     &key,
                 )
                 .await;
@@ -1601,6 +1615,7 @@ async fn run_loop(
                     &channels.timer_tx,
                     &mut tracked,
                     &channels.snapshot_tx,
+                    &state_tx,
                     &key,
                 )
                 .await;
@@ -1662,9 +1677,7 @@ async fn run_loop(
                 let live: Vec<&NodeId> = node.live_identities().collect();
                 let gone = restore_from_foca(evicted, &mut tracked, &live, now);
                 let adopted = adopt_live_identities(&mut tracked, &live, now);
-                for origin in &gone {
-                    node.evict_origin(origin);
-                }
+                evict_origins(&gone, &node, &state_tx);
                 // Republish while age changes or after eviction so readers see
                 // a coherent bounded membership view.
                 if has_aging_members(&tracked) || changed || adopted {
@@ -2997,6 +3010,49 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "eviction regression checks subscriber notification, provider withdrawal, and retained cumulative spend"
+    )]
+    fn evicted_providers_disappear_from_subscribers_while_spend_survives() -> Result<(), Box<dyn std::error::Error>> {
+        let identity = NodeId::with_generation("site-local".to_owned(), "127.0.0.1:7946".parse()?, 1);
+        let mut node = SwimNode::new(identity);
+        let mut broadcast = provider_broadcast(0.1);
+        broadcast.snapshot.increment_tenant_spend("tenant-a", 100);
+        node.publish_state_broadcast(&broadcast)?;
+        let (state_tx, mut state_rx) = watch::channel(GridStateSnapshot::new("site-local".to_owned()));
+        publish_state(&state_tx, &node);
+        assert!(
+            state_rx
+                .borrow_and_update()
+                .provider("net", "site-a", "provider-a")
+                .is_some(),
+            "the initial publication must contain provider-a"
+        );
+
+        evict_origins(&["site-a".to_owned()], &node, &state_tx);
+
+        assert!(
+            state_rx.has_changed()?,
+            "eviction must notify consumers without another packet"
+        );
+        assert!(
+            state_rx.borrow().providers.is_empty(),
+            "evicted providers cannot remain in the published view"
+        );
+        assert_eq!(
+            state_rx
+                .borrow()
+                .tenant_spend
+                .get("tenant-a")
+                .map(crdt::GCounter::total),
+            Some(100),
+            "membership churn must preserve cumulative spend"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn handle_state_snapshot_starts_empty() {
         let (handle, _snap_tx, _state_tx) = make_test_handle();
         let state = handle.state_snapshot();
@@ -3223,6 +3279,30 @@ mod tests {
 
         wait_until_member_alive(&handle1, "node-2").await;
         drop(handle2);
+    }
+
+    #[tokio::test]
+    async fn withdrawal_acknowledges_updated_local_state_without_peer_traffic() {
+        let addr = reserve_local_addr().await;
+        let handle = start_test_runtime("site-a", addr, Vec::new(), 45_000).await;
+        handle
+            .publish_state_broadcast(provider_broadcast(0.1).with_grid_id(Some("grid-delete".to_owned())))
+            .unwrap_or_else(|_| std::process::abort());
+        wait_until_provider_presence(&handle, "site-a", true).await;
+
+        let receipt = handle
+            .withdraw_scope("grid-delete".to_owned())
+            .unwrap_or_else(|_| std::process::abort());
+        tokio::time::timeout(Duration::from_secs(5), receipt)
+            .await
+            .unwrap_or_else(|_| std::process::abort())
+            .unwrap_or_else(|_| std::process::abort());
+
+        assert!(
+            handle.state_snapshot().providers.is_empty(),
+            "acknowledgement must follow local observer publication"
+        );
+        handle.leave(Duration::from_secs(1)).await;
     }
 
     #[tokio::test]

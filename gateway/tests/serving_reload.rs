@@ -18,7 +18,7 @@ mod tests {
         process::{Child, Command, Stdio},
         sync::{
             Arc, Mutex,
-            atomic::{AtomicBool, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
         thread,
         time::{Duration, Instant},
@@ -80,6 +80,7 @@ mod tests {
     struct Peer {
         addr: String,
         seen: Arc<Mutex<Vec<[u8; 32]>>>,
+        hop_requests: Arc<AtomicUsize>,
         stop: Arc<AtomicBool>,
     }
 
@@ -108,6 +109,7 @@ mod tests {
             let listener = TcpListener::bind("127.0.0.1:0").expect("bind peer");
             let addr = listener.local_addr().expect("peer addr").to_string();
             let seen = Arc::new(Mutex::new(Vec::new()));
+            let hop_requests = Arc::new(AtomicUsize::new(0));
             let stop = Arc::new(AtomicBool::new(false));
             let body = format!(
                 "HTTP/1.1 200 OK\r\nDate: Thu, 01 Jan 1970 00:00:01 GMT\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n{line}",
@@ -115,6 +117,7 @@ mod tests {
                 line = signals_line(site),
             );
             let (recorded, stopping) = (Arc::clone(&seen), Arc::clone(&stop));
+            let recorded_hops = Arc::clone(&hop_requests);
             thread::spawn(move || {
                 for stream in listener.incoming() {
                     if stopping.load(Ordering::SeqCst) {
@@ -134,6 +137,12 @@ mod tests {
                             Ok(n) => request.extend_from_slice(&buf[..n]),
                         }
                     }
+                    if String::from_utf8_lossy(&request)
+                        .to_ascii_lowercase()
+                        .contains("x-ai-routing-candidate: candidate-east")
+                    {
+                        recorded_hops.fetch_add(1, Ordering::SeqCst);
+                    }
                     let Some(leaf) = tls.conn.peer_certificates().and_then(<[_]>::first) else {
                         continue;
                     };
@@ -141,7 +150,12 @@ mod tests {
                     let _sent = tls.write_all(body.as_bytes()).and_then(|()| tls.flush());
                 }
             });
-            Self { addr, seen, stop }
+            Self {
+                addr,
+                seen,
+                hop_requests,
+                stop,
+            }
         }
 
         fn polls(&self) -> usize {
@@ -150,6 +164,10 @@ mod tests {
 
         fn saw(&self, fingerprint: &[u8; 32]) -> bool {
             self.seen.lock().expect("seen").contains(fingerprint)
+        }
+
+        fn hops(&self) -> usize {
+            self.hop_requests.load(Ordering::SeqCst)
         }
     }
 
@@ -223,20 +241,22 @@ mod tests {
     struct Gateway {
         child: Child,
         output: Arc<Mutex<Vec<String>>>,
+        listen: u16,
         admin: u16,
     }
 
     impl Gateway {
         fn start(work: &Path, serving: &Mount) -> Self {
             let (listen, admin) = (free_port(), free_port());
+            let config = format!(
+                "admin:\n  address: \"127.0.0.1:{admin}\"\nlisteners:\n  - name: default\n    address: \"127.0.0.1:{listen}\"\n    filter_chains: [main]\nfilter_chains:\n  - name: main\n    filters:\n      - filter: static_response\n        status: 200\n"
+            );
+            Self::start_with_config(work, serving, listen, admin, &config)
+        }
+
+        fn start_with_config(work: &Path, serving: &Mount, listen: u16, admin: u16, yaml: &str) -> Self {
             let config = work.join("praxis.yaml");
-            std::fs::write(
-                &config,
-                format!(
-                    "admin:\n  address: \"127.0.0.1:{admin}\"\nlisteners:\n  - name: default\n    address: \"127.0.0.1:{listen}\"\n    filter_chains: [main]\nfilter_chains:\n  - name: main\n    filters:\n      - filter: static_response\n        status: 200\n"
-                ),
-            )
-            .expect("praxis config");
+            std::fs::write(&config, yaml).expect("praxis config");
             let mut child = Command::new(env!("CARGO_BIN_EXE_grid-gateway"))
                 .arg("--config")
                 .arg(&config)
@@ -249,7 +269,27 @@ mod tests {
             let output = Arc::new(Mutex::new(Vec::new()));
             drain(child.stdout.take().expect("stdout"), Arc::clone(&output));
             drain(child.stderr.take().expect("stderr"), Arc::clone(&output));
-            Self { child, output, admin }
+            Self {
+                child,
+                output,
+                listen,
+                admin,
+            }
+        }
+
+        fn route_status(&self) -> u16 {
+            let mut stream = TcpStream::connect(("127.0.0.1", self.listen)).expect("connect gateway");
+            stream
+                .write_all(b"GET /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nX-Model: llama\r\nConnection: close\r\n\r\n")
+                .expect("send request");
+            let mut response = String::new();
+            stream.read_to_string(&mut response).expect("read response");
+            response
+                .split_whitespace()
+                .nth(1)
+                .expect("HTTP status")
+                .parse()
+                .expect("numeric HTTP status")
         }
 
         /// The rejected count from the admin metrics, zero until the series exists.
@@ -350,6 +390,86 @@ mod tests {
         gateway.eventually("west still polled on the last good config", || {
             west.polls() > west_polls
         });
+
+        drop(gateway);
+        let _cleaned = std::fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn praxis_backend_reload_cannot_inherit_provider_hop_trust() {
+        let work = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("backend-reload-{}", std::process::id()));
+        let _cleared = std::fs::remove_dir_all(&work);
+        let ca = generate_ca("grid-ca").expect("ca");
+        let local = generate_site_cert(&ca, "local").expect("client cert");
+        let mut identity = Mount::new(work.join("identity"));
+        identity.write(&[
+            ("ca.crt", ca.cert_pem.as_bytes()),
+            ("tls.crt", local.cert_pem.as_bytes()),
+            ("tls.key", local.key_pem.as_bytes()),
+        ]);
+        let backend = Peer::start(&ca, "east");
+        let mut serving = Mount::new(work.join("serving"));
+        serving.write(&[(
+            "serving-config.json",
+            br#"{"local_site":"local","window_secs":60,"load_window_ms":30000,"candidates":[{"kind":"inference_model","name":"llama","site":"local","cluster":"pool-east","stable_id":"candidate-east"}],"provider_hop_clusters":["pool-east"],"provider_hop_sni":{"pool-east":"east.grid.internal"},"peers":[]}"#,
+        )]);
+        let (listen, admin) = (free_port(), free_port());
+        let config = |tls: &str| {
+            format!(
+                "insecure_options:\n  allow_private_endpoints: true\nadmin:\n  address: \"127.0.0.1:{admin}\"\nlisteners:\n  - name: default\n    address: \"127.0.0.1:{listen}\"\n    filter_chains: [main]\nfilter_chains:\n  - name: main\n    filters:\n      - filter: grid_site_route\n        model_header: X-Model\n      - filter: load_balancer\n        clusters:\n          - name: pool-east\n{tls}            endpoints: [\"{addr}\"]\n",
+                addr = backend.addr
+            )
+        };
+        let verified = format!(
+            "            tls:\n              ca: {{ ca_path: {ca} }}\n              client_cert: {{ cert_path: {cert}, key_path: {key} }}\n              sni: east.grid.internal\n              verify: true\n",
+            ca = identity.path("ca.crt"),
+            cert = identity.path("tls.crt"),
+            key = identity.path("tls.key"),
+        );
+        let gateway = Gateway::start_with_config(&work, &serving, listen, admin, &config(&verified));
+        gateway.eventually("verified backend route", || {
+            TcpStream::connect(("127.0.0.1", listen)).is_ok()
+        });
+        assert_eq!(gateway.route_status(), 200, "the original verified backend routes");
+        assert_eq!(backend.hops(), 1, "the verified route carries its candidate identity");
+
+        for (label, tls) in [
+            ("plaintext", String::new()),
+            (
+                "changed SNI",
+                verified.replace("east.grid.internal", "other.grid.internal"),
+            ),
+        ] {
+            let before = gateway
+                .output
+                .lock()
+                .expect("output")
+                .iter()
+                .filter(|line| line.contains("changed its verified TLS identity"))
+                .count();
+            std::fs::write(work.join("praxis.yaml"), config(&tls)).expect("rewrite praxis config");
+            gateway.eventually(label, || {
+                gateway
+                    .output
+                    .lock()
+                    .expect("output")
+                    .iter()
+                    .filter(|line| line.contains("changed its verified TLS identity"))
+                    .count()
+                    > before
+            });
+            let previous_hops = backend.hops();
+            assert_eq!(
+                gateway.route_status(),
+                200,
+                "{label} reload leaves the verified route live"
+            );
+            assert_eq!(
+                backend.hops(),
+                previous_hops + 1,
+                "{label} reload keeps hop context on the original verified route"
+            );
+        }
 
         drop(gateway);
         let _cleaned = std::fs::remove_dir_all(&work);

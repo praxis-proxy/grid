@@ -561,6 +561,34 @@ mod tests {
         serde_json::to_string_pretty(&envelope).unwrap()
     }
 
+    fn valid_empty_envelope_json(scope: &ExpectedScope) -> String {
+        use crate::types::*;
+        let mut overlay = test_overlay(scope);
+        overlay.candidates.clear();
+        let hex = overlay_digest(&overlay);
+        let envelope = OverlayEnvelope {
+            schema_version: "1.0.0".to_owned(),
+            revision: ContentRevision {
+                kind: "content_addressed".to_owned(),
+                algorithm: "sha256".to_owned(),
+                value: hex.clone(),
+            },
+            content_digest: ContentDigest {
+                algorithm: "sha256".to_owned(),
+                value: hex,
+            },
+            scope: OverlayScope {
+                network: scope.network.clone(),
+                gateway: scope.gateway.clone(),
+                namespace: scope.namespace.clone(),
+                local_site: scope.local_site.clone(),
+            },
+            provenance: test_provenance(),
+            overlay,
+        };
+        serde_json::to_string_pretty(&envelope).unwrap()
+    }
+
     // -- restore_last_known_good -----------------------------------------------
 
     #[test]
@@ -629,6 +657,36 @@ mod tests {
         assert_eq!(outcome, ProcessOutcome::Written);
         assert!(status.is_ready());
         assert!(out.exists());
+    }
+
+    #[test]
+    fn process_configmap_writes_authoritative_empty_overlay_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("routing-overlay.json");
+        let config = test_config(out.clone());
+        let active = valid_envelope_json(&config.expected_scope);
+        let empty = valid_empty_envelope_json(&config.expected_scope);
+        let cm_for = |json| ConfigMap {
+            data: Some(BTreeMap::from([("routing-overlay.json".to_owned(), json)])),
+            ..Default::default()
+        };
+        let status = SharedStatus::new("ns", "cm", "key");
+        let metrics = Arc::new(Metrics::new());
+
+        assert_eq!(
+            process_configmap(&cm_for(active), &config, &status, &metrics),
+            ProcessOutcome::Written
+        );
+        let prior_revision = status.written_revision().expect("active revision");
+        assert_eq!(
+            process_configmap(&cm_for(empty), &config, &status, &metrics),
+            ProcessOutcome::Written
+        );
+        let accepted_revision = status.written_revision().expect("empty revision");
+        assert_ne!(accepted_revision, prior_revision);
+        let published: serde_json::Value = serde_json::from_slice(&std::fs::read(out).unwrap()).unwrap();
+        assert!(published["overlay"]["candidates"].as_array().unwrap().is_empty());
+        assert_eq!(accepted_revision, published["revision"]["value"].as_str().unwrap());
     }
 
     #[test]

@@ -20,6 +20,11 @@ use serde::{Deserialize, Serialize};
 /// observed. Concurrent add/remove resolves to the
 /// item being present (add wins).
 ///
+/// Each site identity must have only one active writer. Before reusing a site
+/// identity, restore its complete serialized state or merge all its prior
+/// additions and removals. Clones are snapshots, not independent writers with
+/// the same identity. Causal tombstones must be retained for delayed messages.
+///
 /// ```
 /// use crdt::OrSet;
 ///
@@ -64,14 +69,20 @@ impl<T: Clone + Ord> OrSet<T> {
         }
     }
 
-    /// Add an item to the set.
-    pub fn add(&mut self, item: T) {
-        self.counter = self.counter.wrapping_add(1);
+    /// Add an item, returning false without changing the set if tags are exhausted.
+    ///
+    /// An exhausted writer must use a new site identity for further additions.
+    pub fn add(&mut self, item: T) -> bool {
+        let Some(counter) = self.counter.checked_add(1) else {
+            return false;
+        };
+        self.counter = counter;
         let tag = Tag {
             counter: self.counter,
             site_id: self.site_id.clone(),
         };
         self.entries.entry(item).or_default().insert(tag);
+        true
     }
 
     /// Remove an item from the set.
@@ -117,6 +128,14 @@ impl<T: Clone + Ord> OrSet<T> {
     /// Adds all items with tags not in our tombstones.
     /// Removes items whose tags are all tombstoned.
     pub fn merge(&mut self, other: &Self) {
+        if self.site_id == other.site_id {
+            self.counter = self.counter.max(other.counter);
+        }
+        for tag in other.entries.values().flatten().chain(&other.tombstones) {
+            if tag.site_id == self.site_id {
+                self.counter = self.counter.max(tag.counter);
+            }
+        }
         for (item, other_tags) in &other.entries {
             let local = self.entries.entry(item.clone()).or_default();
             for tag in other_tags {
@@ -133,9 +152,10 @@ impl<T: Clone + Ord> OrSet<T> {
 impl<T: Ord> OrSet<T> {
     /// Remove tags that appear in the tombstone set.
     fn remove_tombstoned_tags(&mut self) {
-        for tags in self.entries.values_mut() {
+        self.entries.retain(|_, tags| {
             tags.retain(|tag| !self.tombstones.contains(tag));
-        }
+            !tags.is_empty()
+        });
     }
 }
 
@@ -298,6 +318,94 @@ mod tests {
         assert!(
             restored.contains(&"model-b".to_owned()),
             "model-b must survive round-trip"
+        );
+    }
+
+    #[test]
+    fn restored_writer_advances_past_active_and_removed_tags() -> Result<(), serde_json::Error> {
+        let mut original = OrSet::new("site-a".to_owned());
+        assert!(
+            original.add("kept".to_owned()),
+            "the original writer must allocate the retained tag"
+        );
+        assert!(
+            original.add("returned".to_owned()),
+            "the original writer must allocate the tag that will be removed"
+        );
+        original.remove(&"returned".to_owned());
+        let bytes = serde_json::to_string(&original)?;
+        let persisted: OrSet<String> = serde_json::from_str(&bytes)?;
+        let mut relay = OrSet::new("relay".to_owned());
+        relay.merge(&persisted);
+        let mut restarted = OrSet::new("site-a".to_owned());
+        restarted.merge(&relay);
+        assert!(
+            restarted.add("returned".to_owned()),
+            "the restored writer must allocate a fresh tag for the removed value"
+        );
+        restarted.merge(&persisted);
+        relay.merge(&restarted);
+
+        assert!(
+            restarted.contains(&"returned".to_owned()),
+            "old tombstones cannot erase a fresh addition"
+        );
+        assert_eq!(restarted.items(), relay.items(), "relayed restoration must converge");
+        assert_eq!(restarted.len(), 2, "both the original and fresh additions survive");
+        Ok(())
+    }
+
+    #[test]
+    fn merging_same_site_preserves_a_reserved_counter_without_tags() {
+        let mut saved = OrSet::<String>::new("a".to_owned());
+        saved.counter = 12;
+        let mut restored = OrSet::new("a".to_owned());
+        restored.merge(&saved);
+        assert!(
+            restored.add("x".to_owned()),
+            "the restored reserved counter must permit a fresh tag"
+        );
+        assert_eq!(restored.counter, 13, "restoration must honor the serialized counter");
+    }
+
+    #[test]
+    fn exhausted_writer_refuses_additions_without_reusing_tombstones() {
+        let mut set = OrSet::new("a".to_owned());
+        set.counter = u64::MAX - 1;
+        assert!(set.add("x".to_owned()), "the final unique tag is usable");
+        set.remove(&"x".to_owned());
+        let exhausted = set.clone();
+
+        assert!(!set.add("x".to_owned()), "exhaustion must be observable");
+        assert!(!set.add("y".to_owned()), "exhaustion cannot reset on a later call");
+        assert_eq!(set, exhausted, "refused additions leave causal history intact");
+    }
+
+    #[test]
+    fn removed_buckets_are_pruned_but_delayed_additions_remain_removed() {
+        let mut source = OrSet::new("a".to_owned());
+        assert!(
+            source.add("x".to_owned()),
+            "the source must allocate the tag replayed after removal"
+        );
+        let delayed = source.clone();
+        source.remove(&"x".to_owned());
+        let mut receiver = OrSet::new("b".to_owned());
+        receiver.merge(&delayed);
+        receiver.merge(&source);
+        receiver.merge(&delayed);
+
+        assert!(
+            receiver.entries.is_empty(),
+            "removed values must not retain empty buckets"
+        );
+        assert_eq!(
+            receiver.tombstones, source.tombstones,
+            "replay protection must survive pruning"
+        );
+        assert!(
+            !receiver.contains(&"x".to_owned()),
+            "delayed traffic cannot resurrect a removed value"
         );
     }
 }

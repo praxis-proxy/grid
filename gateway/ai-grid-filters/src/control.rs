@@ -1,7 +1,7 @@
 //! Applies a grid serving config: the candidate topology and the peer pollers.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, BTreeSet, HashMap},
     path::PathBuf,
     sync::{
         Arc, Mutex, OnceLock, PoisonError, Weak,
@@ -17,7 +17,7 @@ use grid_signals_client::{PollHandle, PollerConfig};
 use praxis_filter::FilterError;
 
 use crate::{
-    descriptor::{RouteCandidate, validate_candidates, validate_local_site},
+    descriptor::{RouteCandidate, validate_local_site, validate_provider_hop_clusters, validate_serving_candidates},
     health::ClusterHealth,
     pin::TagKey,
     prefix::{AffinitySettings, PrefixAffinity},
@@ -93,17 +93,31 @@ pub(crate) struct Topology {
 
     /// Freshness window the order reads, milliseconds.
     load_window_ms: i64,
+
+    /// Explicitly authenticated provider-gateway hop clusters.
+    provider_hop_clusters: Arc<BTreeSet<String>>,
 }
 
 impl Topology {
     /// Validate the topology half of `config`.
     fn from_config(config: &GridServingConfig) -> Result<Self, FilterError> {
         validate_local_site(&config.local_site)?;
-        let base = validate_candidates(config.candidates.clone())?;
+        let base = validate_serving_candidates(config.candidates.clone())?;
+        let provider_hop_clusters = validate_provider_hop_clusters(config.provider_hop_clusters.clone())?;
+        for candidate in &config.candidates {
+            if provider_hop_clusters.contains(&candidate.cluster) && candidate.stable_id.is_none() {
+                return Err(format!(
+                    "grid: candidate '{}' on provider-hop cluster '{}' is missing stable_id",
+                    candidate.name, candidate.cluster
+                )
+                .into());
+            }
+        }
         Ok(Self {
             base: Arc::from(base),
             local_site: Arc::from(config.local_site.as_str()),
             load_window_ms: config.load_window_ms,
+            provider_hop_clusters: Arc::new(provider_hop_clusters),
         })
     }
 
@@ -118,7 +132,7 @@ impl Topology {
         store: &LoadStore,
         now: i64,
         health: &ClusterHealth,
-        shedding: &std::collections::BTreeSet<Arc<str>>,
+        shedding: &BTreeSet<Arc<str>>,
         gauged: &mut Gauged,
         availability: &AvailabilitySettings,
     ) -> RouteSnapshot {
@@ -129,11 +143,12 @@ impl Topology {
             availability,
             learned: &mut gauged.learned,
         };
-        let ordered = RouteSnapshot::from_store(
+        let mut ordered = RouteSnapshot::from_store(
             self.base.iter().cloned().collect(),
             Arc::clone(&self.local_site),
             &mut inputs,
         );
+        ordered.provider_hop_clusters = Arc::clone(&self.provider_hop_clusters);
         // Praxis demotes a cluster only once it has reported health. Without a registry the
         // gateway knows nothing about backends, so it demotes nothing rather than guessing.
         let ordered = if health.observed() {
@@ -220,19 +235,34 @@ pub(crate) struct Control {
 
     /// The tuning generation the applied config adopted.
     tuned: u64,
+
+    /// Verified TLS identities from the loaded Praxis backend configuration.
+    backend_tls: BTreeMap<String, String>,
 }
 
 impl Control {
     /// Build the control plane for `config` without starting any poller.
+    #[cfg(test)]
     pub(crate) fn new(config: &GridServingConfig, start: StartPeer) -> Result<Self, FilterError> {
+        Self::new_with_backend_tls(config, start, BTreeMap::new())
+    }
+
+    /// Build with the verified backend identities that serving reloads must preserve.
+    pub(crate) fn new_with_backend_tls(
+        config: &GridServingConfig,
+        start: StartPeer,
+        backend_tls: BTreeMap<String, String>,
+    ) -> Result<Self, FilterError> {
+        validate_provider_hop_binding(config, &backend_tls)?;
         let topology = Topology::from_config(config)?;
         // Cold start: config order until the first poll re-orders it by live load.
         let mut gauged = Gauged::new();
-        let cold_start = RouteSnapshot::from_static(
+        let mut cold_start = RouteSnapshot::from_static(
             topology.base.iter().cloned().collect(),
             Arc::clone(&topology.local_site),
         )
         .published(&mut gauged.published);
+        cold_start.provider_hop_clusters = Arc::clone(&topology.provider_hop_clusters);
         Ok(Self {
             store: Arc::new(LoadStore::with_combine(
                 Duration::from_secs(config.window_secs),
@@ -250,6 +280,7 @@ impl Control {
             health: Arc::default(),
             tuning: Arc::default(),
             tuned: 0,
+            backend_tls,
         })
     }
 
@@ -326,6 +357,7 @@ impl Control {
             return Ok(None);
         }
         // Validated before any poller starts, so an invalid config starts and drops nothing.
+        validate_provider_hop_binding(config, &self.backend_tls)?;
         let topology = Arc::new(validate_config(config)?);
         let tag_key = load_tag_key(&self.tuning.affinity())?;
         if config.window_secs != self.window_secs {
@@ -461,8 +493,6 @@ pub(crate) fn load_tag_key(affinity: &AffinitySettings) -> Result<Option<TagKey>
 
 /// The topology of `config`, refusing what no retry can fix: a bad candidate, peer, or duplicate site.
 fn validate_config(config: &GridServingConfig) -> Result<Topology, FilterError> {
-    validate_local_site(&config.local_site)?;
-    validate_candidates(config.candidates.clone())?;
     let topology = Topology::from_config(config)?;
     let mut sites = std::collections::HashSet::with_capacity(config.peers.len());
     for peer in &config.peers {
@@ -472,6 +502,28 @@ fn validate_config(config: &GridServingConfig) -> Result<Topology, FilterError> 
         }
     }
     Ok(topology)
+}
+
+/// Bind every declared provider hop to one verified backend and its exact TLS SNI.
+fn validate_provider_hop_binding(
+    config: &GridServingConfig,
+    backend_tls: &BTreeMap<String, String>,
+) -> Result<(), FilterError> {
+    let clusters = validate_provider_hop_clusters(config.provider_hop_clusters.clone())?;
+    if config.provider_hop_sni.len() != clusters.len() {
+        return Err("grid: provider-hop SNI declarations must match the allowlist".into());
+    }
+    for cluster in &clusters {
+        let declared = config
+            .provider_hop_sni
+            .get(cluster)
+            .filter(|sni| !sni.trim().is_empty())
+            .ok_or_else(|| -> FilterError { format!("grid: missing provider-hop SNI for {cluster}").into() })?;
+        if backend_tls.get(cluster) != Some(declared) {
+            return Err(format!("grid: provider-hop backend {cluster} lacks matching verified TLS identity").into());
+        }
+    }
+    Ok(())
 }
 
 /// Order the current topology under the current availability tuning and swap it in.
@@ -514,7 +566,7 @@ where
 ///
 /// Each file is hashed on its own, so no buffer holds the concatenated key.
 fn identity_digest(config: &GridServingConfig, affinity: &AffinitySettings) -> [u8; 32] {
-    let paths: std::collections::BTreeSet<&str> = config
+    let paths: BTreeSet<&str> = config
         .peers
         .iter()
         .flat_map(|peer| [&peer.grid_ca_path, &peer.client_cert_path, &peer.client_key_path])
@@ -787,6 +839,7 @@ mod tests {
             kind: CapabilityKind::InferenceModel,
             name: "llama".to_owned(),
             site: site.to_owned(),
+            stable_id: None,
         }
     }
 
@@ -815,6 +868,8 @@ mod tests {
             window_secs: 60,
             load_window_ms: 30_000,
             candidates: sites.iter().map(|site| candidate(site)).collect(),
+            provider_hop_clusters: Vec::new(),
+            provider_hop_sni: BTreeMap::new(),
             peers: sites.iter().map(|site| peer(site)).collect(),
         }
     }
@@ -1350,6 +1405,21 @@ mod tests {
         eventually("the rewrite handled", || counts().applied() == 1);
         assert_eq!(sites(&snapshot.load()), ["east", "west"], "the rewrite applied");
         eventually("west polled", || peers.fetches("west") > 0);
+
+        write(&yaml(&[]));
+        eventually("the no-route revision applied", || counts().applied() == 2);
+        assert!(snapshot.load().candidates.is_empty(), "the final withdrawal is serving");
+
+        write("local_site: [not, a, site\n");
+        eventually("the malformed revision rejected", || counts().rejected() == 2);
+        assert!(
+            snapshot.load().candidates.is_empty(),
+            "malformed updates retain the no-route revision"
+        );
+
+        write(&yaml(&["east"]));
+        eventually("the restored route applied", || counts().applied() == 3);
+        assert_eq!(sites(&snapshot.load()), ["east"], "restoration resumes routing");
 
         drop(grid);
         std::fs::remove_file(&path).expect("cleanup");

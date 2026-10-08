@@ -68,7 +68,7 @@ pub(crate) fn materialize_with_images(
     clippy::too_many_lines,
     reason = "The bounded image-property rewrite is easiest to audit as one operation."
 )]
-fn apply_image_values(
+pub(crate) fn apply_image_values(
     config: &mut serde_yaml::Value,
     images: &ImageOverrides,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -150,6 +150,39 @@ mod tests {
             parse_image_ref("localhost:5000/image"),
             ("localhost:5000/image".to_owned(), "latest".to_owned())
         );
+    }
+
+    #[test]
+    #[expect(
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        reason = "the rendered Forge contract is a fixed qualification fixture"
+    )]
+    fn image_overrides_include_overlay_sync_for_every_cluster() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tests/e2e/topologies");
+        let images = super::ImageOverrides {
+            gateway: "praxis-ai:run".to_owned(),
+            operator: "grid-operator:run".to_owned(),
+            overlay_sync: "grid-overlay-sync:run".to_owned(),
+            vcr: "llm-d-inference-sim:run".to_owned(),
+            pull_policy: "Never".to_owned(),
+        };
+
+        for topology in ["grid-provider-traffic", "grid-static-weighted"] {
+            let source = root.join(topology).join("forge.yaml");
+            let content = fs::read_to_string(source).expect("read qualification Forge config");
+            let mut config: serde_yaml::Value = serde_yaml::from_str(&content).expect("parse Forge config");
+            super::apply_image_values(&mut config, &images).expect("apply image overrides");
+            let clusters = config["spec"]["clusters"].as_sequence().expect("clusters");
+            assert_eq!(clusters.len(), 3);
+            for cluster in clusters {
+                let properties = &cluster["properties"];
+                assert_eq!(properties["overlaySyncImage"].as_str(), Some("grid-overlay-sync:run"));
+                assert_eq!(properties["overlaySyncImageRepo"].as_str(), Some("grid-overlay-sync"));
+                assert_eq!(properties["overlaySyncImageTag"].as_str(), Some("run"));
+                assert_eq!(properties["imagePullPolicy"].as_str(), Some("Never"));
+            }
+        }
     }
 
     #[test]

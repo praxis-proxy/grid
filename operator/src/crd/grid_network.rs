@@ -746,6 +746,17 @@ pub struct GatewayRef {
     #[serde(default)]
     pub local_site_name: Option<String>,
 
+    /// Explicit mTLS provider-hop endpoints for the embedded `grid-gateway`
+    /// serving config. This allowlist is independent of `consumerConfig`, so a
+    /// missing or disabled generated Praxis config cannot alter embedded
+    /// serving behavior. Every entry must declare `mutual_tls` and a nonblank
+    /// SNI. The embedded gateway compares each declaration against the
+    /// loaded Praxis load-balancer's verified mTLS backend before it sends
+    /// provider-hop context. Changing Praxis backend transport requires a
+    /// gateway restart while `gridServing` is enabled.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_hop_endpoints: Vec<ProviderHopEndpointConfig>,
+
     /// Opt-in configuration for operator-managed consumer Praxis config generation.
     ///
     /// When absent or `enabled: false`, this gateway behaves exactly as before —
@@ -757,7 +768,9 @@ pub struct GatewayRef {
     /// entry per unique inference cluster. Other capability kinds remain in the
     /// routing overlay for dedicated data-plane pipelines.
     ///
-    /// The generated `ConfigMap` contains no token bytes.
+    /// The generated `ConfigMap` contains no token bytes. Credential-bearing
+    /// overlays are withheld until the consumer has explicitly declared that its
+    /// compatible filter config is already running.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub consumer_config: Option<ConsumerConfig>,
 }
@@ -782,6 +795,10 @@ pub struct GatewayRef {
 /// entries use a `file:` source under `credentialMountBase`; the mounted
 /// Kubernetes Secret provides the token at runtime.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "wire-compatible opt-in and attestation fields are separate"
+)]
 #[serde(rename_all = "camelCase")]
 pub struct ConsumerConfig {
     /// Enable operator-managed consumer Praxis config generation for this gateway.
@@ -790,10 +807,32 @@ pub struct ConsumerConfig {
     #[serde(default)]
     pub enabled: bool,
 
+    /// Generate the dynamic `credential_inject` filter and projected mount
+    /// root, including when the current overlay has no credentials. Enable this
+    /// first, then roll out the generated config before asserting readiness
+    /// with `supportsProjectedCredentials`.
+    ///
+    /// Default: `false`.
+    #[serde(default)]
+    pub enable_projected_credentials: bool,
+
+    /// Declare that the running consumer has the dynamic `credential_inject`
+    /// filter configured with the projected Secret mount root. This is a
+    /// fail-closed capability gate for credential-bearing overlay revisions.
+    /// Set it only after the consumer has loaded a config containing that
+    /// filter; the Grid operator does not own or roll out the consumer
+    /// Deployment.
+    ///
+    /// Default: `false`.
+    #[serde(default)]
+    pub supports_projected_credentials: bool,
+
     /// Base directory for mounted credential Secret files inside the consumer pod.
     ///
-    /// Each credential Secret is expected to be mounted at
-    /// `{credentialMountBase}/{secret-name}/{secret-key}`.
+    /// In projected-credential mode, mount each Secret at
+    /// `{credentialMountBase}/{secret-namespace}/{secret-name}` with its data
+    /// keys as files. Static `file:` entries continue to use their explicit
+    /// paths and are not constrained by this directory layout.
     ///
     /// Default: `/run/secrets/grid-credentials`.
     #[serde(default = "default_credential_mount_base")]
@@ -987,6 +1026,8 @@ impl Default for ConsumerConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            enable_projected_credentials: false,
+            supports_projected_credentials: false,
             credential_mount_base: default_credential_mount_base(),
             config_map_name: default_consumer_config_map_name(),
             cluster_endpoints: Vec::new(),
@@ -1089,6 +1130,20 @@ pub struct EndpointCaSecretRef {
     #[schemars(length(min = 1))]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
+}
+
+/// Explicit verified-mTLS endpoint identity trusted for embedded provider-hop
+/// context. This does not configure the gateway's upstream TLS connection; the
+/// embedded gateway must separately use verified TLS with this SNI; the
+/// gateway checks the two configurations before serving hop traffic.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderHopEndpointConfig {
+    /// Cluster name used by the embedded gateway's `load_balancer` filter.
+    pub cluster: String,
+
+    /// TLS mode and SNI configured for that embedded gateway upstream.
+    pub transport: EndpointTransport,
 }
 
 /// Endpoint configuration for one consumer `load_balancer` cluster.
@@ -1753,6 +1808,8 @@ mod tests {
             "namespace": "ns",
             "consumerConfig": {
                 "enabled": true,
+                "enableProjectedCredentials": true,
+                "supportsProjectedCredentials": true,
                 "credentialMountBase": "/run/secrets/grid",
                 "configMapName": "my-consumer-config",
                 "tlsCertMountPath": "/etc/custom-tls",
@@ -1774,6 +1831,14 @@ mod tests {
         let gw: GatewayRef = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
         let cc = gw.consumer_config.unwrap_or_else(|| std::process::abort());
         assert!(cc.enabled, "enabled must round-trip");
+        assert!(
+            cc.enable_projected_credentials,
+            "projected filter opt-in must round-trip"
+        );
+        assert!(
+            cc.supports_projected_credentials,
+            "projected credential readiness must round-trip"
+        );
         assert_eq!(
             cc.credential_mount_base, "/run/secrets/grid",
             "credentialMountBase must round-trip"
@@ -1842,6 +1907,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "asserts every ConsumerConfig default as one contract"
+    )]
     fn consumer_config_defaults_when_subfields_absent() {
         let json = serde_json::json!({
             "name": "gw",
@@ -1851,6 +1920,14 @@ mod tests {
         let gw: GatewayRef = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
         let cc = gw.consumer_config.unwrap_or_else(|| std::process::abort());
         assert!(!cc.enabled, "enabled must default to false");
+        assert!(
+            !cc.enable_projected_credentials,
+            "projected filter opt-in must default off"
+        );
+        assert!(
+            !cc.supports_projected_credentials,
+            "projected credentials must default closed"
+        );
         assert_eq!(
             cc.credential_mount_base, "/run/secrets/grid-credentials",
             "credentialMountBase must use default"
@@ -1985,6 +2062,7 @@ mod tests {
             name: "gw".to_owned(),
             namespace: "ns".to_owned(),
             local_site_name: None,
+            provider_hop_endpoints: Vec::new(),
             consumer_config: None,
         };
         let json = serde_json::to_value(&gw).unwrap_or_else(|_| std::process::abort());
@@ -2008,6 +2086,10 @@ mod tests {
         assert!(
             gateway_ref_properties.contains_key("consumerConfig"),
             "CRD schema must include consumerConfig field on GatewayRef"
+        );
+        assert!(
+            gateway_ref_properties.contains_key("providerHopEndpoints"),
+            "CRD schema must include independent providerHopEndpoints on GatewayRef"
         );
         let consumer_config_properties = gateway_ref_properties
             .get("consumerConfig")

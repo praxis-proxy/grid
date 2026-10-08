@@ -42,8 +42,11 @@ type GridFoca = foca::Foca<NodeId, foca::BincodeCodec<bincode::config::Configura
 // Public types and constants
 // ---------------------------------------------------------------------------
 
-/// Maximum complete datagram emitted by the SWIM transport.
+/// Maximum UDP payload, including optional transport encryption framing.
 pub const MAX_SWIM_PACKET_BYTES: usize = 1_400;
+
+/// Foca payload budget reserving room for transport encryption on every packet.
+const MAX_FOCA_PACKET_BYTES: usize = MAX_SWIM_PACKET_BYTES - crate::crypto::OVERHEAD;
 
 /// Maximum Kubernetes DNS-subdomain length used for a site identity.
 const MAX_SITE_NAME_BYTES: usize = 253;
@@ -74,7 +77,8 @@ pub enum PublishStateBroadcastError {
 ///
 /// `local_id` must be the identity of the publishing node. The calculation
 /// reserves space for that source identity, a worst-case destination identity,
-/// the foca broadcast header, and its custom-item length prefix. A payload
+/// the foca broadcast header, its custom-item length prefix, and encryption.
+/// The same bound applies before and after a runtime key is configured. A payload
 /// within this bound can be emitted even when ordinary piggyback messages lack
 /// enough remaining space.
 ///
@@ -92,7 +96,7 @@ pub fn state_broadcast_byte_budget(local_id: &NodeId) -> Result<usize, bincode::
         message: foca::Message::Broadcast,
     };
     let header_length = bincode::serde::encode_to_vec(header, bincode::config::standard())?.len();
-    Ok(MAX_SWIM_PACKET_BYTES
+    Ok(MAX_FOCA_PACKET_BYTES
         .saturating_sub(header_length)
         .saturating_sub(CUSTOM_BROADCAST_LENGTH_PREFIX_BYTES))
 }
@@ -446,7 +450,7 @@ impl SwimNode {
 fn grid_config() -> foca::Config {
     let expected_sites = NonZeroU32::new(3).unwrap_or(NonZeroU32::MIN);
     let mut config = foca::Config::new_wan(expected_sites);
-    config.max_packet_size = NonZeroUsize::new(MAX_SWIM_PACKET_BYTES).unwrap_or(NonZeroUsize::MIN);
+    config.max_packet_size = NonZeroUsize::new(MAX_FOCA_PACKET_BYTES).unwrap_or(NonZeroUsize::MIN);
     config
 }
 
@@ -557,6 +561,23 @@ mod tests {
     // -----------------------------------------------------------------------
     // Broadcast publishing
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn encrypted_foca_packets_fit_the_complete_datagram_budget() -> Result<(), crate::crypto::CryptoError> {
+        let plaintext = vec![0; grid_config().max_packet_size.get()];
+        let encrypted = crate::crypto::encrypt(&[7; 32], &plaintext)?;
+
+        assert!(
+            encrypted.len() <= MAX_SWIM_PACKET_BYTES,
+            "encryption must fit inside the advertised datagram limit"
+        );
+        assert_eq!(
+            crate::crypto::decrypt(&[7; 32], &encrypted)?,
+            plaintext,
+            "the bounded encrypted packet must preserve its complete plaintext"
+        );
+        Ok(())
+    }
 
     #[test]
     fn publish_state_broadcast_does_not_error() {

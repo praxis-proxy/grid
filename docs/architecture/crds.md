@@ -29,6 +29,8 @@ spec:
       localSiteName: cluster-east   # optional; defaults to network name
       consumerConfig:               # optional; opt-in consumer Praxis config generation
         enabled: true
+        enableProjectedCredentials: true  # generate filter, then roll out consumer
+        supportsProjectedCredentials: true # set only after that rollout
         credentialMountBase: /run/secrets/grid-credentials
         configMapName: praxis-consumer-config
         tlsCertMountPath: /etc/praxis/tls
@@ -283,6 +285,16 @@ never starts clocks or collects. A pass that would delete more than half the
 stubs, and more than 8, deletes none and logs a warning; a partition looks like
 mass departure.
 
+### GatewayRef.providerHopEndpoints
+
+`spec.gatewayRefs[].providerHopEndpoints` independently configures the
+provider-hop trust allowlist used by the embedded `grid-gateway`. Each entry
+names a provider cluster and declares its verified mTLS mode and SNI. The
+embedded gateway's startup upstream configuration must use that TLS identity.
+This field is independent of `consumerConfig`; absent or disabled generated
+consumer Praxis config cannot make embedded serving fail validation or change
+its provider-hop allowlist.
+
 ### GatewayRef.consumerConfig
 
 `spec.gatewayRefs[].consumerConfig` opts a gateway into operator-managed consumer
@@ -291,7 +303,9 @@ Praxis `ConfigMap` generation.
 | Field | Default | Meaning |
 |---|---|---|
 | `enabled` | `false` | Set to `true` to enable consumer config generation for this gateway. |
-| `credentialMountBase` | `/run/secrets/grid-credentials` | Base directory where credential Secrets are mounted inside the consumer pod. |
+| `enableProjectedCredentials` | `false` | Generate the dynamic `credential_inject` filter and projected mount root, including with an empty candidate set. Roll out the consumer after enabling this. |
+| `supportsProjectedCredentials` | `false` | Attest that the consumer has loaded that filter/config and mounted its referenced Secrets. Until true, credential-bearing overlay revisions are retained with `ProjectedCredentialsUnsupported`. |
+| `credentialMountBase` | `/run/secrets/grid-credentials` | Base directory for projected credentials. In projected mode, mount each Secret at `{base}/{namespace}/{name}` with Secret keys as files. Static `file:` entries continue using their explicitly configured paths. |
 | `configMapName` | `praxis-consumer-config` | Name of the generated `ConfigMap` in the gateway namespace. |
 | `clusterEndpoints[]` | `[]` | Endpoint topology for `load_balancer` clusters. Each entry maps a candidate cluster name to an address with explicit `transport` configuration. Missing transport fails closed. |
 | `clusterEndpoints[].transport.mode` | _(required)_ | `mutual_tls` (CA/client cert/SNI/verify), `tls` (server-authenticated TLS), or `plaintext` (no TLS, insecure/dev-only). |
@@ -300,35 +314,65 @@ Praxis `ConfigMap` generation.
 | `tlsCertMountPath` | `/etc/praxis/tls` | Base path for mounted TLS files used when a `clusterEndpoints[]` entry uses `mutual_tls` transport. |
 | `listenerPort` | `8080` | HTTP port for the generated `listeners[0].address` (`0.0.0.0:{listenerPort}`). |
 
+Grid publishes a valid empty versioned overlay when no candidates remain.
+Every consumer of that overlay must use a Praxis AI image that accepts empty
+versioned snapshots; older images, including the chart-default 0.4.0 image,
+are incompatible. Upgrade and roll out the consumers before deploying this
+Grid version. Malformed or undeliverable updates still retain the last valid
+revision; an authoritative empty candidate set does not.
+
 When `enabled: true`, the `GridNetwork` controller renders a `praxis.yaml`-keyed
 `ConfigMap` in the gateway namespace on each reconcile.  The generated config is a
 complete, runnable Praxis config containing:
 
 - `listeners:` — one public listener at `0.0.0.0:{listenerPort}`
 - `filter_chains:` — the consumer chain with:
-  - `intelligent_route` candidates from the routing overlay (with `credential.secretRef` for
-    credential-bearing candidates)
-  - `credential_inject` entries (one per unique credential reference) using
-    `file:` sources — token bytes are never written to the `ConfigMap`
-  - `load_balancer` entries (one per unique candidate cluster). Every referenced
+  - `intelligent_route` reading the versioned routing overlay with expected
+    network, gateway, namespace, and local-site scope. Candidates and selection
+    policy are not copied into startup-only YAML.
+  - `credential_inject` is included when current candidates have credential
+    references or `enableProjectedCredentials: true`. In projected mode it
+    starts with an empty table and resolves later references under the
+    projected Secret mount; missing files fail closed. Token bytes are never
+    written to the `ConfigMap`.
+  - `load_balancer` entries for every configured endpoint, including currently
+    inactive providers needed for restoration. Every potentially routable
     cluster must have a matching `clusterEndpoints[]` entry with endpoint address
     and explicit `transport` configuration.  `transport.mode` is the security
     switch — not `sni` presence.  Missing transport fails closed
 - `admin:` — admin listener at `127.0.0.1:9901`
 - `shutdown_timeout_secs: 5`
 
-The generated credential-injection config assumes the gateway is the egress
-component for the selected backend.  This is correct for direct API-provider and
-cloud-provider fallback routes.  For remote provider sites, provider credentials
-should be mounted only in the remote site or provider-side component that makes
-the final backend call.
+The generated credential-injection config is for credentials intentionally
+projected into the consumer gateway's namespace. For remote provider sites,
+credentials should normally be mounted only in the remote site or provider-side
+component that makes the final backend call.
 
 The `credential_inject` filter is a Praxis AI runtime dependency. The AGN
 operator can render the config shape, but the deployed Praxis AI image must
 include that filter for the generated config to start successfully.
 
-When `enabled: false` or `consumerConfig` is absent, this gateway behaves as before
-— only the routing overlay `ConfigMap` is applied.
+The consumer Deployment must mount the gateway's `grid-overlay-<network>-<gateway>`
+ConfigMap key `routing-overlay.json` at `/etc/praxis/routing/routing-overlay.json`
+as a projected volume (never with `subPath`). Cross-cluster consumers must
+deliver both the Praxis config ConfigMap and routing overlay to the consumer
+cluster. The initial migration from static inline candidates requires a
+consumer rollout; listener, endpoint/TLS, or credential-table changes continue
+to require a rollout, while route-only overlay revisions hot reload.
+
+For generated consumer configs, first set `enableProjectedCredentials: true`
+and roll out the consumer so it loads the filter and mount root. Then set
+`supportsProjectedCredentials: true` to attest that rollout and mount the
+referenced Secret. The Grid controller does not own or restart consumer
+Deployments. Until readiness is attested, credential-bearing overlay revisions
+are retained. In projected mode, the generated config uses an empty credential
+table and resolves the selected Secret reference at request time, failing
+closed when it cannot read it.
+
+When `enabled: false` or `consumerConfig` is absent, no generated consumer
+Praxis `ConfigMap` is applied. The routing overlay remains active, and the
+embedded gateway's serving config is controlled separately by
+`GatewayRef.providerHopEndpoints`.
 
 ## GridSite
 

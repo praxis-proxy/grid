@@ -13,14 +13,13 @@ use std::{
 
 use serde::Serialize;
 
-use super::{DemoMode, GlbDemoOptions, certs, glb, kubectl, operator, safe_truncate_str};
+use super::{
+    DemoMode, GlbDemoOptions, certs, glb, kubectl, operator, provider_traffic_qualification, safe_truncate_str,
+};
 
 // -----------------------------------------------------------------------------
 // Constants
 // -----------------------------------------------------------------------------
-
-/// Directory where generated TLS certificates are stored.
-const CERTS_DIR: &str = "tests/env/certs";
 
 /// Ordered provider-site cluster names in the static-weighted scenario.
 ///
@@ -68,6 +67,8 @@ const SETUP_PHASES: usize = 14;
 static PROBE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// Run-scoped Forge prefix, initialized once by the qualification entrypoint.
 static RUN_NAME: OnceLock<String> = OnceLock::new();
+/// Keep generated Kind control-plane node names below Kubernetes' 63-byte label-value limit.
+const RUN_NAME_PREFIX: &str = "grid258";
 /// Persistent client pod used for all weighted traffic samples.
 const STATIC_CLIENT_POD: &str = "static-weighted-client";
 
@@ -76,14 +77,68 @@ fn run_name() -> &'static str {
     RUN_NAME.get().map_or(BASE_RUN_NAME, |value| value.as_str())
 }
 
+/// Use a compact physical prefix: Kind appends `-provider-a-control-plane` to the cluster name.
+fn scoped_run_name(run_id: &str) -> String {
+    format!("{RUN_NAME_PREFIX}-{run_id}")
+}
+
+/// Return the longest node name Kind will generate for this run's cluster names.
+fn longest_kind_node_name_len(run_name: &str) -> usize {
+    CLUSTERS
+        .iter()
+        .map(|cluster| format!("{run_name}-{cluster}-control-plane").len())
+        .max()
+        .unwrap_or_default()
+}
+
 /// Build the kubectl context for one run-scoped provider cluster.
 fn cluster_context(cluster: &str) -> String {
     format!("kind-{}-{cluster}", run_name())
 }
 
-/// Return the run-scoped consumer overlay `ConfigMap` name.
-fn overlay_configmap() -> String {
-    format!("grid-overlay-{}-consumer-gateway", run_name())
+/// Resolve the consumer overlay `ConfigMap` named by the `GridNetwork`'s observed status.
+fn overlay_configmap(cluster: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let context = cluster_context(cluster);
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            &context,
+            "-n",
+            GRID_SYSTEM_NS,
+            "get",
+            "gridnetwork",
+            run_name(),
+            "-o",
+            "json",
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!("{cluster}: GridNetwork status is unavailable for overlay discovery").into());
+    }
+    let grid_network: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    overlay_configmap_from_status(&grid_network)
+}
+
+/// Select the `ConfigMap` for the consumer gateway from the `GridNetwork` status entries.
+fn overlay_configmap_from_status(grid_network: &serde_json::Value) -> Result<String, Box<dyn std::error::Error>> {
+    let overlays = grid_network
+        .pointer("/status/overlayStatus")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("GridNetwork status has no overlayStatus entries")?;
+    overlays
+        .iter()
+        .find(|overlay| {
+            overlay.pointer("/gatewayName").and_then(serde_json::Value::as_str) == Some("consumer-gateway")
+                && overlay.pointer("/namespace").and_then(serde_json::Value::as_str) == Some(GRID_SYSTEM_NS)
+        })
+        .and_then(|overlay| overlay.pointer("/configMapName").and_then(serde_json::Value::as_str))
+        .map(str::to_owned)
+        .ok_or_else(|| "GridNetwork status has no distributed consumer-gateway ConfigMap name".into())
+}
+
+/// Resolve the evidence directory so Forge runtime paths work from its topology working directory.
+fn canonicalize_evidence_dir(evidence_dir: &Path) -> std::io::Result<PathBuf> {
+    fs::canonicalize(evidence_dir)
 }
 
 // -----------------------------------------------------------------------------
@@ -97,8 +152,22 @@ struct ProviderTrafficContext {
     demo_root: PathBuf,
     /// Path to the resolved Forge config.
     resolved_config: PathBuf,
+    /// Isolated Forge state and generated runtime directory.
+    forge_state_dir: PathBuf,
+    /// TLS files used only by this run.
+    certs_dir: PathBuf,
     /// Path to the forge binary.
     forge_bin: PathBuf,
+}
+
+/// Build a Forge command pinned to this run's state directory.
+fn forge_command(context: &ProviderTrafficContext) -> Command {
+    let mut command = Command::new(&context.forge_bin);
+    command
+        .args(["--state-dir"])
+        .arg(&context.forge_state_dir)
+        .env("FORGE_STATE_DIR", &context.forge_state_dir);
+    command
 }
 
 // -----------------------------------------------------------------------------
@@ -1154,13 +1223,14 @@ fn assert_overlay_acceptance() -> AssertionResult {
     {
         let cluster = CONSUMER_SITE;
         let context = cluster_context(cluster);
+        let overlay_name = overlay_configmap(cluster)?;
 
         // Step 1: Overlay ConfigMap exists
         let overlay_output = Command::new("kubectl")
             .args([
                 "get",
                 "configmap",
-                &overlay_configmap(),
+                &overlay_name,
                 "--context",
                 &context,
                 "-n",
@@ -1178,7 +1248,7 @@ fn assert_overlay_acceptance() -> AssertionResult {
             .args([
                 "get",
                 "configmap",
-                &overlay_configmap(),
+                &overlay_name,
                 "--context",
                 &context,
                 "-n",
@@ -1313,54 +1383,19 @@ fn load_images_into_clusters() -> Result<(), Box<dyn std::error::Error>> {
     let operator = std::env::var("GRID_XTASK_OPERATOR_IMAGE")
         .unwrap_or_else(|_| "grid-operator:static-weighted-qualification".to_owned());
     let vcr = crate::env::image_overrides::sim_image();
+    let overlay_sync = crate::env::image_overrides::overlay_sync_image();
 
-    for image in [&gateway, &operator, &vcr] {
+    for image in [&gateway, &operator, &vcr, &overlay_sync] {
         require_local_image(image)?;
         eprintln!("  verified local image: {image}");
     }
 
     for cluster in CLUSTERS {
-        for image in [&gateway, &operator, &vcr] {
+        for image in [&gateway, &operator, &vcr, &overlay_sync] {
             eprintln!("  loading {image} into {cluster}...");
-            load_docker_image_into_kind(image, &format!("{}-{cluster}", run_name()))?;
+            crate::env::image_overrides::load_docker_image_into_kind(image, &format!("{}-{cluster}", run_name()))?;
         }
         eprintln!("  [OK] {cluster}: all images loaded");
-    }
-    Ok(())
-}
-
-/// Import one host image into a run-owned Kind node using only its host
-/// platform. This avoids OCI-index imports failing when the local Docker
-/// store has only the linux/amd64 child content.
-fn load_docker_image_into_kind(image: &str, kind_name: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let control_plane = format!("{kind_name}-control-plane");
-    let mut save = Command::new("docker")
-        .args(["save", "--platform", "linux/amd64", image])
-        .stdout(Stdio::piped())
-        .spawn()?;
-    let save_stdout = save.stdout.take().ok_or("docker save did not provide stdout")?;
-    let import_status = Command::new("docker")
-        .args([
-            "exec",
-            "--privileged",
-            "-i",
-            &control_plane,
-            "ctr",
-            "--namespace=k8s.io",
-            "images",
-            "import",
-            "--digests",
-            "--snapshotter=overlayfs",
-            "-",
-        ])
-        .stdin(save_stdout)
-        .status()?;
-    let save_status = save.wait()?;
-    if !save_status.success() {
-        return Err(format!("docker save failed for {image}").into());
-    }
-    if !import_status.success() {
-        return Err(format!("failed to import {image} into {control_plane}").into());
     }
     Ok(())
 }
@@ -1369,12 +1404,12 @@ fn load_docker_image_into_kind(image: &str, kind_name: &str) -> Result<(), Box<d
 ///
 /// Must be called BEFORE `forge up` so the certificates exist on the host
 /// when `install_provider_boundary` creates the Kubernetes Secrets.
-fn stage_provider_boundary() -> Result<(), Box<dyn std::error::Error>> {
+fn stage_provider_boundary(certs_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let identities: Vec<String> = CLUSTERS.iter().map(|c| (*c).to_owned()).collect();
-    certs::generate_all(&identities)?;
+    certs::generate_all_in_dir(&identities, certs_dir)?;
 
     let wrong_ca = ::certs::generate_ca("Combined Site untrusted test CA")?;
-    fs::write(Path::new(CERTS_DIR).join("untrusted-ca.pem"), wrong_ca.cert_pem)?;
+    fs::write(certs_dir.join("untrusted-ca.pem"), wrong_ca.cert_pem)?;
 
     eprintln!("  [OK] TLS certificates generated for provider-a, provider-b, provider-c");
     Ok(())
@@ -1384,9 +1419,7 @@ fn stage_provider_boundary() -> Result<(), Box<dyn std::error::Error>> {
 ///
 /// Must be called AFTER `forge up` since the clusters must exist.  Gateway
 /// deployments are restarted so pods pick up the new volume mounts.
-fn install_provider_boundary() -> Result<(), Box<dyn std::error::Error>> {
-    let certs_dir = Path::new(CERTS_DIR);
-
+fn install_provider_boundary(certs_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     for cluster in CLUSTERS {
         let context = cluster_context(cluster);
 
@@ -1478,6 +1511,7 @@ fn apply_credential_secret(context: &str, secret_name: &str, token: &str) -> Res
 )]
 fn read_cluster_overlay(cluster: &str) -> Result<OverlayData, Box<dyn std::error::Error>> {
     let context = cluster_context(cluster);
+    let overlay_name = overlay_configmap(cluster)?;
 
     let output = Command::new("kubectl")
         .args([
@@ -1487,7 +1521,7 @@ fn read_cluster_overlay(cluster: &str) -> Result<OverlayData, Box<dyn std::error
             GRID_SYSTEM_NS,
             "get",
             "configmap",
-            &overlay_configmap(),
+            &overlay_name,
             "-o",
             "json",
         ])
@@ -1605,6 +1639,7 @@ fn wait_for_static_readiness(
 
     let read_matching = || -> Result<Option<StaticReadinessObservation>, Box<dyn std::error::Error>> {
         let overlay = read_cluster_overlay("provider-a")?;
+        let overlay_name = overlay_configmap("provider-a")?;
         let configmap = Command::new("kubectl")
             .args([
                 "--context",
@@ -1613,7 +1648,7 @@ fn wait_for_static_readiness(
                 GRID_SYSTEM_NS,
                 "get",
                 "configmap",
-                &overlay_configmap(),
+                &overlay_name,
                 "-o",
                 "json",
             ])
@@ -2071,21 +2106,24 @@ fn collect_overlay_diagnostics() {
         );
 
         eprintln!("  [DIAG] {cluster}: 6. Overlay ConfigMap content");
-        drop(
-            Command::new("kubectl")
-                .args([
-                    "--context",
-                    &context,
-                    "-n",
-                    GRID_SYSTEM_NS,
-                    "get",
-                    "configmap",
-                    &overlay_configmap(),
-                    "-o",
-                    "json",
-                ])
-                .status(),
-        );
+        match overlay_configmap(cluster) {
+            Ok(overlay_name) => drop(
+                Command::new("kubectl")
+                    .args([
+                        "--context",
+                        &context,
+                        "-n",
+                        GRID_SYSTEM_NS,
+                        "get",
+                        "configmap",
+                        &overlay_name,
+                        "-o",
+                        "json",
+                    ])
+                    .status(),
+            ),
+            Err(error) => eprintln!("  [DIAG] {cluster}: could not resolve overlay ConfigMap: {error}"),
+        }
 
         eprintln!("  [DIAG] {cluster}: 7. InferenceProvider CRs");
         drop(
@@ -2250,16 +2288,77 @@ fn materialize_provider_config(
 }
 
 /// Materialize the Forge configuration with image overrides.
-fn materialize_config(source: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
+fn materialize_config(
+    source: &Path,
+    run_id: &str,
+    forge_state_dir: &Path,
+    evidence_dir: &Path,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let content = fs::read_to_string(source)?;
     let mut config: serde_yaml::Value = serde_yaml::from_str(&content)?;
     rewrite_run_scope(&mut config);
-    apply_image_overrides(&mut config);
+    rewrite_forge_exec_runtime_paths(&mut config, forge_state_dir);
+    apply_image_overrides(&mut config)?;
     let rendered = serde_yaml::to_string(&config)?;
     let parent = source.parent().ok_or("source config must have parent directory")?;
-    let output = parent.join(".forge.resolved.yaml");
+    let output = parent.join(format!(".forge.resolved-{run_id}.yaml"));
     fs::write(&output, rendered)?;
+    fs::copy(&output, evidence_dir.join("resolved-forge.yaml"))?;
     Ok(output)
+}
+
+/// Rewrite runtime paths only in `exec` commands; Forge keeps template targets relative to its state directory.
+fn rewrite_forge_exec_runtime_paths(value: &mut serde_yaml::Value, forge_state_dir: &Path) {
+    match value {
+        serde_yaml::Value::Mapping(mapping) => {
+            let is_exec = mapping
+                .get(serde_yaml::Value::String("type".to_owned()))
+                .and_then(serde_yaml::Value::as_str)
+                == Some("exec");
+            if is_exec {
+                if let Some(command) = mapping.get_mut(serde_yaml::Value::String("command".to_owned())) {
+                    rewrite_forge_exec_path_strings(command, forge_state_dir);
+                }
+            } else {
+                for child in mapping.values_mut() {
+                    rewrite_forge_exec_runtime_paths(child, forge_state_dir);
+                }
+            }
+        },
+        serde_yaml::Value::Sequence(items) => {
+            for item in items {
+                rewrite_forge_exec_runtime_paths(item, forge_state_dir);
+            }
+        },
+        serde_yaml::Value::Null
+        | serde_yaml::Value::Bool(_)
+        | serde_yaml::Value::Number(_)
+        | serde_yaml::Value::String(_)
+        | serde_yaml::Value::Tagged(_) => {},
+    }
+}
+
+/// Replace Forge-relative runtime references inside a shell command with this run's absolute state path.
+fn rewrite_forge_exec_path_strings(value: &mut serde_yaml::Value, forge_state_dir: &Path) {
+    match value {
+        serde_yaml::Value::String(command) => {
+            *command = command.replace(".forge/runtime/", &format!("{}/runtime/", forge_state_dir.display()));
+        },
+        serde_yaml::Value::Sequence(items) => {
+            for item in items {
+                rewrite_forge_exec_path_strings(item, forge_state_dir);
+            }
+        },
+        serde_yaml::Value::Mapping(mapping) => {
+            for child in mapping.values_mut() {
+                rewrite_forge_exec_path_strings(child, forge_state_dir);
+            }
+        },
+        serde_yaml::Value::Null
+        | serde_yaml::Value::Bool(_)
+        | serde_yaml::Value::Number(_)
+        | serde_yaml::Value::Tagged(_) => {},
+    }
 }
 
 /// Rewrite topology-owned names to the unique prefix for this qualification run.
@@ -2281,51 +2380,18 @@ fn rewrite_run_scope(value: &mut serde_yaml::Value) {
     }
 }
 
-/// Apply image overrides from environment variables to the Forge configuration.
-#[expect(
-    clippy::too_many_lines,
-    clippy::collapsible_if,
-    reason = "Image override application with structured YAML manipulation; nested ifs follow YAML structure hierarchy"
-)]
-fn apply_image_overrides(config: &mut serde_yaml::Value) {
-    let gateway_image = std::env::var("GRID_XTASK_GATEWAY_IMAGE")
-        .unwrap_or_else(|_| "praxis-ai:static-weighted-qualification".to_owned());
-    let operator_image = std::env::var("GRID_XTASK_OPERATOR_IMAGE")
-        .unwrap_or_else(|_| "grid-operator:static-weighted-qualification".to_owned());
-    let vcr_image = crate::env::image_overrides::sim_image();
-    let image_pull_policy = std::env::var("GRID_XTASK_IMAGE_PULL_POLICY").unwrap_or_else(|_| "Never".to_owned());
-
-    let (gateway_repo, gateway_tag) = parse_image_ref(&gateway_image);
-    let (operator_repo, operator_tag) = parse_image_ref(&operator_image);
-
-    if let Some(spec) = config.get_mut("spec") {
-        if let Some(clusters) = spec.get_mut("clusters") {
-            if let Some(clusters_array) = clusters.as_sequence_mut() {
-                for cluster in clusters_array {
-                    if let Some(properties) = cluster.get_mut("properties") {
-                        if let Some(props_map) = properties.as_mapping_mut() {
-                            let pairs = [
-                                ("gatewayImage", &gateway_image),
-                                ("operatorImage", &operator_image),
-                                ("vcrImage", &vcr_image),
-                                ("imagePullPolicy", &image_pull_policy),
-                                ("gatewayImageRepo", &gateway_repo),
-                                ("gatewayImageTag", &gateway_tag),
-                                ("operatorImageRepo", &operator_repo),
-                                ("operatorImageTag", &operator_tag),
-                            ];
-                            for (key, val) in pairs {
-                                props_map.insert(
-                                    serde_yaml::Value::String(key.to_owned()),
-                                    serde_yaml::Value::String(val.clone()),
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
+/// Apply shared image overrides, including the overlay-sync image.
+fn apply_image_overrides(config: &mut serde_yaml::Value) -> Result<(), Box<dyn std::error::Error>> {
+    let images = crate::env::forge_config::ImageOverrides {
+        gateway: std::env::var("GRID_XTASK_GATEWAY_IMAGE")
+            .unwrap_or_else(|_| "praxis-ai:static-weighted-qualification".to_owned()),
+        operator: std::env::var("GRID_XTASK_OPERATOR_IMAGE")
+            .unwrap_or_else(|_| "grid-operator:static-weighted-qualification".to_owned()),
+        overlay_sync: crate::env::image_overrides::overlay_sync_image(),
+        vcr: crate::env::image_overrides::sim_image(),
+        pull_policy: std::env::var("GRID_XTASK_IMAGE_PULL_POLICY").unwrap_or_else(|_| "Never".to_owned()),
+    };
+    crate::env::forge_config::apply_image_values(config, &images)
 }
 
 /// Parse image reference into (repo, tag) components.
@@ -2341,21 +2407,20 @@ fn parse_image_ref(image: &str) -> (String, String) {
 }
 
 /// Prepare setup context from configuration.
-fn prepare_setup(forge_config: &Path) -> Result<ProviderTrafficContext, Box<dyn std::error::Error>> {
+fn prepare_setup(
+    forge_config: &Path,
+    run_id: &str,
+    evidence_dir: &Path,
+) -> Result<ProviderTrafficContext, Box<dyn std::error::Error>> {
     let root = super::demo_root(forge_config);
     eprintln!("Forge config: {}", forge_config.display());
     eprintln!("Demo root:    {}", root.display());
-    for generated in [Path::new(".forge/state.json"), Path::new(".forge/lock")] {
-        if generated.exists() {
-            fs::remove_file(generated).map_err(|error| format!("failed to clear Forge state: {error}"))?;
-        }
-    }
-    let generated_runtime = Path::new(".forge/runtime");
-    if generated_runtime.exists() {
-        fs::remove_dir_all(generated_runtime)
-            .map_err(|error| format!("failed to clear generated Forge runtime: {error}"))?;
-    }
-    let resolved_config = materialize_config(forge_config)?;
+    let evidence_dir = canonicalize_evidence_dir(evidence_dir)?;
+    let forge_state_dir = evidence_dir.join("forge-state");
+    let certs_dir = forge_state_dir.join("certs");
+    fs::create_dir_all(&forge_state_dir)?;
+    fs::create_dir_all(&certs_dir)?;
+    let resolved_config = materialize_config(forge_config, run_id, &forge_state_dir, &evidence_dir)?;
     let forge_bin = glb::resolve_forge_binary()
         .ok_or("praxis-forge binary not found")?
         .into();
@@ -2363,6 +2428,8 @@ fn prepare_setup(forge_config: &Path) -> Result<ProviderTrafficContext, Box<dyn 
     Ok(ProviderTrafficContext {
         demo_root: root,
         resolved_config,
+        forge_state_dir,
+        certs_dir,
         forge_bin,
     })
 }
@@ -2373,7 +2440,7 @@ fn prepare_setup(forge_config: &Path) -> Result<ProviderTrafficContext, Box<dyn 
 /// verifies the SWIM-advertised certificate matches the staged identity, then
 /// patches `spec.egress.tls.serverName` and `spec.trust.canonicalFingerprints`.
 /// The controller transitions the site to Active naturally after the patch.
-fn authorize_discovered_sites() -> Result<(), Box<dyn std::error::Error>> {
+fn authorize_discovered_sites(certs_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     const TRUST_TIMEOUT: Duration = Duration::from_secs(120);
     let grid_network = run_name().to_owned();
 
@@ -2387,7 +2454,7 @@ fn authorize_discovered_sites() -> Result<(), Box<dyn std::error::Error>> {
             }
             let site_name = format!("{grid_network}-{remote}");
             operator::wait_for_auto_gridsite(&context, &site_name, &grid_network, TRUST_TIMEOUT)?;
-            let canonical_fp = certs::site_certificate_fingerprint(remote)?;
+            let canonical_fp = certs::site_certificate_fingerprint_in_dir(remote, certs_dir)?;
             operator::wait_for_expected_site_certificate(&context, &site_name, &canonical_fp, TRUST_TIMEOUT)?;
             let server_name = format!("{remote}.grid.internal");
             operator::patch_gridsite_identity_trust(&context, &site_name, &canonical_fp, &server_name)?;
@@ -2419,7 +2486,7 @@ fn deploy_setup(context: &ProviderTrafficContext) -> Result<OverlayState, Box<dy
     );
 
     // Validate the resolved forge configuration
-    let output = Command::new(&context.forge_bin)
+    let output = forge_command(context)
         .args(["config", "validate", "--config"])
         .arg(&context.resolved_config)
         .output()?;
@@ -2440,7 +2507,7 @@ fn deploy_setup(context: &ProviderTrafficContext) -> Result<OverlayState, Box<dy
         total_phases
     );
 
-    stage_provider_boundary()?;
+    stage_provider_boundary(&context.certs_dir)?;
 
     eprintln!();
     eprintln!(
@@ -2449,7 +2516,7 @@ fn deploy_setup(context: &ProviderTrafficContext) -> Result<OverlayState, Box<dy
         total_phases
     );
 
-    let config_status = Command::new(&context.forge_bin)
+    let config_status = forge_command(context)
         .args(["up", "--config"])
         .arg(&context.resolved_config)
         .status()?;
@@ -2472,15 +2539,11 @@ fn deploy_setup(context: &ProviderTrafficContext) -> Result<OverlayState, Box<dy
     eprintln!();
     eprintln!("[SETUP {}/{}] Deploying infrastructure stacks", next(), total_phases);
 
-    let apply_stack = |forge_bin: &Path,
-                       resolved_config: &Path,
-                       cluster: &str,
-                       stack: &str|
-     -> Result<(), Box<dyn std::error::Error>> {
+    let apply_stack = |cluster: &str, stack: &str| -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("  applying {stack} to {cluster}...");
-        let stack_status = Command::new(forge_bin)
+        let stack_status = forge_command(context)
             .arg("--config")
-            .arg(resolved_config)
+            .arg(&context.resolved_config)
             .args(["--non-interactive", "stack", "apply", cluster, stack])
             .status()?;
         if !stack_status.success() {
@@ -2491,11 +2554,11 @@ fn deploy_setup(context: &ProviderTrafficContext) -> Result<OverlayState, Box<dy
     };
 
     for cluster in CLUSTERS {
-        apply_stack(&context.forge_bin, &context.resolved_config, cluster, "metallb")?;
+        apply_stack(cluster, "metallb")?;
     }
     for cluster in CLUSTERS {
         let op_stack = format!("{cluster}-operator-base");
-        apply_stack(&context.forge_bin, &context.resolved_config, cluster, &op_stack)?;
+        apply_stack(cluster, &op_stack)?;
     }
     eprintln!("  [OK] Infrastructure stacks applied");
 
@@ -2516,7 +2579,7 @@ fn deploy_setup(context: &ProviderTrafficContext) -> Result<OverlayState, Box<dy
         let credential = generate_provider_credential()?;
         apply_credential_secret(&ctx, VCR_INFERENCE_CREDENTIAL, &credential)?;
         eprintln!("  [OK] {cluster}: vcr-inference-credential created");
-        apply_stack(&context.forge_bin, &context.resolved_config, cluster, "vcr-backend")?;
+        apply_stack(cluster, "vcr-backend")?;
     }
     eprintln!("  [OK] VCR backends deployed");
 
@@ -2525,7 +2588,7 @@ fn deploy_setup(context: &ProviderTrafficContext) -> Result<OverlayState, Box<dy
 
     for cluster in CLUSTERS {
         let site_stack = format!("{cluster}-site");
-        apply_stack(&context.forge_bin, &context.resolved_config, cluster, &site_stack)?;
+        apply_stack(cluster, &site_stack)?;
     }
     eprintln!("  [OK] Grid site resources deployed");
 
@@ -2546,7 +2609,7 @@ fn deploy_setup(context: &ProviderTrafficContext) -> Result<OverlayState, Box<dy
         total_phases
     );
 
-    install_provider_boundary()?;
+    install_provider_boundary(&context.certs_dir)?;
 
     materialize_provider_config(&pre_swim_overlays, &context.demo_root)?;
     eprintln!("  [OK] Provider config materialized, trust installed");
@@ -2555,12 +2618,7 @@ fn deploy_setup(context: &ProviderTrafficContext) -> Result<OverlayState, Box<dy
     eprintln!("[SETUP {}/{}] Deploying provider gateways", next(), total_phases);
 
     for cluster in CLUSTERS {
-        apply_stack(
-            &context.forge_bin,
-            &context.resolved_config,
-            cluster,
-            "provider-gateway",
-        )?;
+        apply_stack(cluster, "provider-gateway")?;
     }
     eprintln!("  [OK] Provider gateways deployed");
 
@@ -2571,12 +2629,7 @@ fn deploy_setup(context: &ProviderTrafficContext) -> Result<OverlayState, Box<dy
         total_phases
     );
 
-    apply_stack(
-        &context.forge_bin,
-        &context.resolved_config,
-        CONSUMER_SITE,
-        "consumer-gateway",
-    )?;
+    apply_stack(CONSUMER_SITE, "consumer-gateway")?;
     eprintln!("  [OK] Consumer gateway deployed in {CONSUMER_SITE}");
 
     eprintln!();
@@ -2587,7 +2640,7 @@ fn deploy_setup(context: &ProviderTrafficContext) -> Result<OverlayState, Box<dy
     );
 
     configure_swim_peers(&context.forge_bin, &context.resolved_config)?;
-    authorize_discovered_sites()?;
+    authorize_discovered_sites(&context.certs_dir)?;
 
     eprintln!();
     eprintln!(
@@ -3516,7 +3569,7 @@ fn teardown_environment(context: &ProviderTrafficContext) -> Result<(), Box<dyn 
             .status(),
     );
 
-    let status = Command::new(&context.forge_bin)
+    let status = forge_command(context)
         .args(["down", "--config"])
         .arg(&context.resolved_config)
         .status()?;
@@ -3524,6 +3577,9 @@ fn teardown_environment(context: &ProviderTrafficContext) -> Result<(), Box<dyn 
     if !status.success() {
         return Err("failed to tear down static-weighted environment".into());
     }
+
+    fs::remove_file(&context.resolved_config)?;
+    fs::remove_dir_all(&context.certs_dir)?;
 
     eprintln!("  [OK] Environment torn down successfully");
     Ok(())
@@ -3539,6 +3595,11 @@ fn write_evidence(path: &Path, evidence: &Evidence) -> Result<(), Box<dyn std::e
     Ok(())
 }
 
+/// Preserve failed runs only when explicitly requested.
+fn should_preserve_after_failure(keep_on_failure: bool, run_failed: bool) -> bool {
+    keep_on_failure && run_failed
+}
+
 /// Run the static-weighted qualification.
 #[expect(
     clippy::too_many_lines,
@@ -3546,15 +3607,20 @@ fn write_evidence(path: &Path, evidence: &Evidence) -> Result<(), Box<dyn std::e
 )]
 pub(crate) fn run(forge_config: &Path, options: &GlbDemoOptions) -> Result<(), Box<dyn std::error::Error>> {
     let mode = options.mode();
-    let run_id = format_utc_timestamp();
-    drop(RUN_NAME.set(format!("{BASE_RUN_NAME}-{run_id}")));
+    let run_id = format!("{}-{}", format_utc_timestamp(), std::process::id());
+    let scoped_name = scoped_run_name(&run_id);
+    let longest_node_name = longest_kind_node_name_len(&scoped_name);
+    if longest_node_name > 63 {
+        return Err(format!("run-scoped Kind node name is {longest_node_name} bytes; maximum is 63").into());
+    }
+    drop(RUN_NAME.set(scoped_name));
     let wall_start = Instant::now();
     let _started_at = format_utc_iso();
 
     let evidence_dir = resolve_evidence_dir(forge_config, options, &run_id)?;
     fs::create_dir_all(&evidence_dir)?;
 
-    let setup_ctx = prepare_setup(forge_config);
+    let setup_ctx = prepare_setup(forge_config, &run_id, &evidence_dir);
     let mut run_error = None;
     let mut overlay_state = OverlayState::default();
     let mut image_evidence = BTreeMap::new();
@@ -3638,7 +3704,7 @@ pub(crate) fn run(forge_config: &Path, options: &GlbDemoOptions) -> Result<(), B
     let evidence_file = evidence_dir.join("results.json");
     write_evidence(&evidence_file, &evidence)?;
 
-    if options.teardown && !options.keep_on_failure {
+    if options.teardown && !should_preserve_after_failure(options.keep_on_failure, run_error.is_some()) {
         if let Ok(context) = &setup_ctx {
             match teardown_environment(context) {
                 Ok(()) => {
@@ -3674,100 +3740,94 @@ pub(crate) fn run(forge_config: &Path, options: &GlbDemoOptions) -> Result<(), B
     }
 }
 
-/// Collect actual image evidence from the deployed clusters.
-#[expect(
-    clippy::too_many_lines,
-    reason = "Evidence collection queries the bounded set of deployed component images."
-)]
+/// Collect requested references and runtime image IDs from every required pod.
 fn collect_image_evidence() -> Result<BTreeMap<String, String>, Box<dyn std::error::Error>> {
     let mut image_evidence = BTreeMap::new();
-
     for cluster in CLUSTERS {
         let context = cluster_context(cluster);
-
-        // Get grid operator image
-        let operator_output = Command::new("kubectl")
-            .args([
-                "get",
-                "deployment/grid-operator",
-                "--context",
-                &context,
-                "-n",
-                "grid-system",
-                "-o",
-                "jsonpath={.spec.template.spec.containers[0].image}",
-            ])
-            .output()?;
-
-        if operator_output.status.success() {
-            let operator_image = String::from_utf8_lossy(&operator_output.stdout).trim().to_owned();
-            image_evidence.insert(format!("{cluster}_operator"), operator_image);
-        }
-
-        // Get consumer gateway image
-        let consumer_output = Command::new("kubectl")
-            .args([
-                "get",
-                "deployment/consumer-gateway",
-                "--context",
-                &context,
-                "-n",
-                "grid-system",
-                "-o",
-                "jsonpath={.spec.template.spec.containers[0].image}",
-            ])
-            .output()?;
-
-        if consumer_output.status.success() {
-            let consumer_image = String::from_utf8_lossy(&consumer_output.stdout).trim().to_owned();
-            image_evidence.insert(format!("{cluster}_consumer_gateway"), consumer_image);
-        }
-
-        // Get provider gateway image
-        let provider_output = Command::new("kubectl")
-            .args([
-                "get",
-                "deployment/provider-gateway",
-                "--context",
-                &context,
-                "-n",
-                "grid-system",
-                "-o",
-                "jsonpath={.spec.template.spec.containers[0].image}",
-            ])
-            .output()?;
-
-        if provider_output.status.success() {
-            let provider_image = String::from_utf8_lossy(&provider_output.stdout).trim().to_owned();
-            image_evidence.insert(format!("{cluster}_provider_gateway"), provider_image);
-        }
-
-        // Get VCR inference image
-        let vcr_output = Command::new("kubectl")
-            .args([
-                "get",
-                &format!("deployment/vcr-inference-{cluster}"),
-                "--context",
-                &context,
-                "-n",
-                "grid-system",
-                "-o",
-                "jsonpath={.spec.template.spec.containers[0].image}",
-            ])
-            .output()?;
-
-        if vcr_output.status.success() {
-            let mock_image = String::from_utf8_lossy(&vcr_output.stdout).trim().to_owned();
-            image_evidence.insert(format!("{cluster}_vcr_inference"), mock_image);
+        for (component, deployment) in provider_traffic_qualification::image_evidence_deployments(cluster) {
+            let evidence = provider_traffic_qualification::deployment_runtime_image_evidence(&context, &deployment)?;
+            image_evidence.insert(format!("{cluster}_{component}"), evidence);
         }
     }
-
     Ok(image_evidence)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keep_on_failure_preserves_failed_run_but_tears_down_success() {
+        assert!(!should_preserve_after_failure(true, false));
+        assert!(should_preserve_after_failure(true, true));
+        assert!(!should_preserve_after_failure(false, true));
+    }
+
+    #[test]
+    fn generated_kind_node_names_fit_kubernetes_label_value_limit() {
+        let name = scoped_run_name("1790947857-1041285");
+        assert_eq!(name, "grid258-1790947857-1041285");
+        assert!(longest_kind_node_name_len(&name) <= 63);
+        assert!(longest_kind_node_name_len("grid-static-weighted-1790947857-1041285") > 63);
+    }
+
+    #[test]
+    fn overlay_configmap_uses_operator_reported_hashed_name() {
+        let grid_network = serde_json::json!({
+            "status": {
+                "overlayStatus": [
+                    {
+                        "gatewayName": "other-gateway",
+                        "namespace": GRID_SYSTEM_NS,
+                        "configMapName": "unrelated"
+                    },
+                    {
+                        "gatewayName": "consumer-gateway",
+                        "namespace": GRID_SYSTEM_NS,
+                        "configMapName": "grid-overlay-grid-static-weighted-consumer-gateway-21ab964b"
+                    }
+                ]
+            }
+        });
+
+        assert_eq!(
+            overlay_configmap_from_status(&grid_network).ok().as_deref(),
+            Some("grid-overlay-grid-static-weighted-consumer-gateway-21ab964b")
+        );
+    }
+
+    #[test]
+    fn overlay_configmap_requires_distributed_consumer_status() {
+        let grid_network = serde_json::json!({ "status": { "overlayStatus": [] } });
+        assert_eq!(
+            overlay_configmap_from_status(&grid_network)
+                .err()
+                .map(|error| error.to_string()),
+            Some("GridNetwork status has no distributed consumer-gateway ConfigMap name".to_owned())
+        );
+    }
+
+    #[test]
+    fn forge_runtime_targets_stay_relative_and_exec_sources_use_absolute_state_paths() {
+        let Ok(evidence_dir) = canonicalize_evidence_dir(Path::new(".")) else {
+            std::process::abort();
+        };
+        let forge_state_dir = evidence_dir.join("forge-state");
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            "stacks:\n  consumer:\n    steps:\n      - type: template-file\n        target: .forge/runtime/provider-a/consumer/praxis.yaml\n      - type: exec\n        command: kubectl --from-file=.forge/runtime/provider-a/consumer/praxis.yaml\n",
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        rewrite_forge_exec_runtime_paths(&mut config, &forge_state_dir);
+        let expected = forge_state_dir
+            .join("runtime/provider-a/consumer/praxis.yaml")
+            .display()
+            .to_string();
+        assert!(Path::new(&expected).is_absolute());
+        let rendered = serde_yaml::to_string(&config).unwrap_or_else(|_| std::process::abort());
+        assert!(rendered.contains("target: .forge/runtime/provider-a/consumer/praxis.yaml"));
+        assert!(rendered.contains(&expected));
+    }
 
     #[test]
     fn proof_success_creation() {
