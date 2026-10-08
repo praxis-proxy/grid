@@ -52,10 +52,12 @@ attribution, cryptographic signing, and a `Signed-off-by` trailer:
 git commit -S -s -m 'docs: clarify the installation prerequisites'
 ```
 
-The checked-in Coding Conventions workflow checks sign-off on non-draft PRs.
-GitHub branch rules add signature, test, and review requirements. Other
-reviewability requirements are contributor and reviewer obligations; see the
-canonical policy for the enforcement boundary. Draft status does not remove
-the requirement to review and understand the submitted code.
+The checked-in Coding Conventions workflow checks sign-off on non-draft PRs
+targeting `main`, unless the `skip/signoff` label skips that check. GitHub's
+`main` ruleset adds signature, test, and review requirements. A skipped check
+does not establish compliance. Other reviewability requirements are contributor
+and reviewer obligations; see the canonical policy for the enforcement boundary.
+Draft status does not remove the requirement to review and understand the
+submitted code.
 
 [PR conventions]: docs/conventions.md#pull-request-conventions
