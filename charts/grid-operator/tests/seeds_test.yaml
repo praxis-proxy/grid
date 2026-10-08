@@ -1,0 +1,38 @@
+suite: SWIM seeds
+# One template, so a failure in the shared normalize step is reported against it.
+templates:
+  - templates/deployment.yaml
+tests:
+  - it: refuses a grid.seeds string that names no endpoint rather than seeding from peers
+    set:
+      site.name: east
+      grid.id: lab
+      peers: "203.0.113.10"
+      grid.seeds: " , "
+    asserts:
+      - failedTemplate:
+          errorPattern: "grid.seeds names no endpoint"
+
+  - it: refuses a grid.seeds list that names no endpoint
+    set:
+      peers: "203.0.113.10"
+      grid.seeds: [" "]
+    asserts:
+      - failedTemplate:
+          errorPattern: "grid.seeds names no endpoint"
+
+  - it: refuses a swim.seeds that names no endpoint
+    set:
+      peers: "203.0.113.10"
+      swim.seeds: ","
+    asserts:
+      - failedTemplate:
+          errorPattern: "swim.seeds names no endpoint"
+
+  - it: still seeds from peers when neither seed value is set
+    set:
+      peers: "203.0.113.10"
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content: {name: GRID_SWIM_SEEDS, value: "203.0.113.10:7946"}

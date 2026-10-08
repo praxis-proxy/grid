@@ -112,7 +112,7 @@ Service. Without enrollment nothing changes.
 {{- $svc := $v.swim.service }}
 {{- $grid := $v.grid | default dict }}
 {{- with ($v.site | default dict).name }}{{- if not $v.swim.siteName }}{{- $_ := set $v.swim "siteName" . }}{{- end }}{{- end }}
-{{- with $grid.seeds }}{{- $_ := set $grid "seeds" (include "grid-operator.seedList" (dict "raw" . "port" ($svc.port | default 7946)) | fromYamlArray) }}{{- end }}
+{{- with $grid.seeds }}{{- $_ := set $grid "seeds" (include "grid-operator.seedList" (dict "raw" . "port" ($svc.port | default 7946) "key" "grid.seeds") | fromYamlArray) }}{{- end }}
 {{- with $grid.seeds }}{{- if not $v.swim.seeds }}{{- $_ := set $v.swim "seeds" (join "," .) }}{{- end }}{{- end }}
 {{- if $grid.id }}
 {{- if eq ($grid.signals | default "") "poll" }}{{- $_ := set $v.signals "enabled" true }}{{- end }}
@@ -198,7 +198,9 @@ RUST_LOG for the chart's Rust binaries: log.filter when set, else log.level.
 {{- end -}}
 {{- end -}}
 
-{{/* `raw`, a list or a string in the `peers` shape, as a list of SWIM endpoints at `port`. */}}
+{{/* `raw`, a list or a string in the `peers` shape, as a list of SWIM endpoints at `port`.
+     Given `key`, the value's name, a value naming no endpoint refuses to render instead of
+     being dropped without a word. */}}
 {{- define "grid-operator.seedList" -}}
 {{- $raw := .raw -}}
 {{- if kindIs "slice" $raw -}}{{- $raw = join " " $raw -}}{{- end -}}
@@ -206,13 +208,18 @@ RUST_LOG for the chart's Rust binaries: log.filter when set, else log.level.
 {{- range (include "grid-operator.entryList" $raw | fromYamlArray) -}}
 {{- $out = append $out (include "grid-operator.swimEndpoint" (dict "entry" . "port" $.port)) -}}
 {{- end -}}
+{{- if and .key (not $out) -}}
+{{- fail (printf "%s names no endpoint: list at least one, or leave it unset" .key) -}}
+{{- end -}}
 {{- toYaml $out -}}
 {{- end -}}
 
 {{/* `swim.seeds` when set, else `peers`, as comma-joined SWIM endpoints at the SWIM port. */}}
 {{- define "grid-operator.swimSeeds" -}}
 {{- $port := (.Values.swim.service).port | default 7946 -}}
-{{- include "grid-operator.seedList" (dict "raw" (.Values.swim.seeds | default .Values.peers) "port" $port) | fromYamlArray | join "," -}}
+{{- $args := dict "raw" .Values.peers "port" $port -}}
+{{- with .Values.swim.seeds -}}{{- $args = dict "raw" . "port" $port "key" "swim.seeds" -}}{{- end -}}
+{{- include "grid-operator.seedList" $args | fromYamlArray | join "," -}}
 {{- end -}}
 
 {{/* `own` when set, else each peer as a host route. A name yields none: no CIDR to derive. */}}
