@@ -184,7 +184,20 @@ RUST_LOG for the chart's Rust binaries: log.filter when set, else log.level.
 {{- toYaml $out -}}
 {{- end -}}
 
-{{/* `swim.seeds` when set, else each peer at the SWIM port. A peer with a port is taken as given. */}}
+{{/* One SWIM endpoint from `entry`, read by colon count as the operator reads it: [ipv6]:port
+     and host:port are taken as given, a bare IPv6 address is bracketed, and the rest get `port`. */}}
+{{- define "grid-operator.swimEndpoint" -}}
+{{- $parts := len (splitList ":" .entry) -}}
+{{- if or (hasPrefix "[" .entry) (eq $parts 2) -}}
+{{- .entry -}}
+{{- else if gt $parts 2 -}}
+{{- printf "[%s]:%v" .entry .port -}}
+{{- else -}}
+{{- printf "%s:%v" .entry .port -}}
+{{- end -}}
+{{- end -}}
+
+{{/* `swim.seeds` when set, else each peer at the SWIM port. */}}
 {{- define "grid-operator.swimSeeds" -}}
 {{- if .Values.swim.seeds -}}
 {{- .Values.swim.seeds -}}
@@ -192,14 +205,7 @@ RUST_LOG for the chart's Rust binaries: log.filter when set, else log.level.
 {{- $port := (.Values.swim.service).port | default 7946 -}}
 {{- $seeds := list -}}
 {{- range (include "grid-operator.peerList" . | fromYamlArray) -}}
-{{/* A bare IPv6 address has colons but no port, so bracket it; [addr]:port and host:port are taken as given. */}}
-{{- if or (hasPrefix "[" .) (and (contains ":" .) (not (regexMatch "^[0-9a-fA-F:]+$" .))) -}}
-{{- $seeds = append $seeds . -}}
-{{- else if contains ":" . -}}
-{{- $seeds = append $seeds (printf "[%s]:%v" . $port) -}}
-{{- else -}}
-{{- $seeds = append $seeds (printf "%s:%v" . $port) -}}
-{{- end -}}
+{{- $seeds = append $seeds (include "grid-operator.swimEndpoint" (dict "entry" . "port" $port)) -}}
 {{- end -}}
 {{- join "," $seeds -}}
 {{- end -}}

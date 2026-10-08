@@ -216,6 +216,28 @@ tests:
             name: GRID_SWIM_SEEDS
             value: "seed-a:7946"
 
+  - it: reads a peer's colons as the operator does, bracketing only a bare IPv6 address
+    set:
+      signals.enabled: true
+      swim.service.enabled: true
+      swim.service.type: LoadBalancer
+      peers: "a:7946, cafe:7946 2001:db8::1 [2001:db8::2]:7948 10.0.0.9 peer.example.com"
+    asserts:
+      - template: templates/service-swim.yaml
+        equal:
+          path: spec.loadBalancerSourceRanges
+          value: ["10.0.0.9/32"]
+      - template: templates/service-signals.yaml
+        equal:
+          path: spec.loadBalancerSourceRanges
+          value: ["10.0.0.9/32"]
+      - template: templates/deployment.yaml
+        contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: GRID_SWIM_SEEDS
+            value: "a:7946,cafe:7946,[2001:db8::1]:7946,[2001:db8::2]:7948,10.0.0.9:7946,peer.example.com:7946"
+
   - it: sets the peer poll interval only when asked
     template: templates/deployment.yaml
     set:
