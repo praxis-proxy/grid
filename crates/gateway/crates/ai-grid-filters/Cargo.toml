@@ -18,10 +18,10 @@ grid-signals-client = { path = "../../../signals-client", default-features = fal
   "fips",
 ] }
 certs = { path = "../../../certs", default-features = false, features = ["verifier", "fips"] }
-serde = { version = "1.0.0", features = ["derive"] }
+serde.workspace = true
 # praxis-proxy-filter 0.7 renamed its YAML crate to the yaml_serde fork and
 # aliases it as serde_yaml; match it so filter config types line up.
-serde_yaml = { version = "0.10.0", package = "yaml_serde" }
+serde_yaml.workspace = true
 arc-swap = "1.0.0"
 async-trait = "0.1.0"
 tracing = "0.1.0"

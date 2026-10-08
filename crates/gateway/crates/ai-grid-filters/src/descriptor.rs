@@ -5,7 +5,10 @@
 //! Data model only. Selection and ordering live in the `route` and `snapshot`
 //! siblings.
 
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::{BTreeSet, HashSet},
+    sync::Arc,
+};
 
 use praxis_core::connectivity::Upstream;
 use praxis_filter::FilterError;
@@ -112,6 +115,11 @@ pub struct CandidateConfig {
 
     /// Site that owns this capability.
     pub site: String,
+
+    /// Stable Grid overlay identity, used by authenticated provider-hop
+    /// gateways. Older/static configs may omit it and retain the derived ID.
+    #[serde(default)]
+    pub stable_id: Option<String>,
 }
 
 /// Default freshness state for candidates.
@@ -198,11 +206,30 @@ pub(crate) fn default_stable_id(kind: CapabilityKind, name: &str, site: &str, cl
 /// [`FilterError`] if the list exceeds [`MAX_CANDIDATES`], any
 /// name/site/cluster field is blank or oversized, or a duplicate
 /// (kind, name, site, cluster) tuple exists.
+#[cfg(test)]
+pub(crate) fn validate_candidates(raw: Vec<CandidateConfig>) -> Result<Vec<RouteCandidate>, FilterError> {
+    validate_candidates_with_empty(raw, false)
+}
+
+/// Validate candidates rendered from the operator's versioned serving
+/// snapshot, where an empty list is an authoritative no-route revision.
+pub(crate) fn validate_serving_candidates(raw: Vec<CandidateConfig>) -> Result<Vec<RouteCandidate>, FilterError> {
+    validate_candidates_with_empty(raw, true)
+}
+
+/// Validate candidate fields while allowing emptiness only for versioned
+/// serving snapshots.
 #[expect(
     clippy::too_many_lines,
-    reason = "single validation loop, splitting hurts readability"
+    reason = "one validation pass keeps all candidate invariants adjacent"
 )]
-pub(crate) fn validate_candidates(raw: Vec<CandidateConfig>) -> Result<Vec<RouteCandidate>, FilterError> {
+fn validate_candidates_with_empty(
+    raw: Vec<CandidateConfig>,
+    allow_empty: bool,
+) -> Result<Vec<RouteCandidate>, FilterError> {
+    if raw.is_empty() && !allow_empty {
+        return Err("grid: candidates must not be empty outside a versioned serving config".into());
+    }
     if raw.len() > MAX_CANDIDATES {
         return Err(format!("grid: candidates exceeds maximum of {MAX_CANDIDATES}").into());
     }
@@ -227,7 +254,13 @@ pub(crate) fn validate_candidates(raw: Vec<CandidateConfig>) -> Result<Vec<Route
             .into());
         }
 
-        let stable_id = default_stable_id(cand.kind, &cand.name, &cand.site, &cand.cluster);
+        if let Some(stable_id) = cand.stable_id.as_deref() {
+            validate_stable_id(index, stable_id)?;
+        }
+        let stable_id = cand.stable_id.as_deref().map_or_else(
+            || default_stable_id(cand.kind, &cand.name, &cand.site, &cand.cluster),
+            Arc::from,
+        );
         candidates.push(RouteCandidate {
             admission_state: cand.admission,
             capacity: None,
@@ -249,6 +282,28 @@ pub(crate) fn validate_candidates(raw: Vec<CandidateConfig>) -> Result<Vec<Route
     }
 
     Ok(candidates)
+}
+
+/// Validate the explicit provider-gateway hop allowlist in a serving snapshot.
+pub(crate) fn validate_provider_hop_clusters(raw: Vec<String>) -> Result<BTreeSet<String>, FilterError> {
+    let mut clusters = BTreeSet::new();
+    for (index, cluster) in raw.into_iter().enumerate() {
+        validate_name(&format!("provider_hop_clusters[{index}]"), &cluster)?;
+        if !clusters.insert(cluster) {
+            return Err("grid: duplicate provider_hop_clusters entry".into());
+        }
+    }
+    Ok(clusters)
+}
+
+/// Validate an overlay identity before it can be sent as an internal header.
+fn validate_stable_id(index: usize, stable_id: &str) -> Result<(), FilterError> {
+    if stable_id.trim().is_empty() || stable_id.len() > MAX_NAME_LEN {
+        return Err(format!("grid: candidates[{index}].stable_id must be 1-{MAX_NAME_LEN} non-blank bytes").into());
+    }
+    http::header::HeaderValue::from_str(stable_id)
+        .map(|_| ())
+        .map_err(|error| format!("grid: candidates[{index}].stable_id is not a valid header value: {error}").into())
 }
 
 /// Validate credential reference fields on a candidate entry.
@@ -358,6 +413,7 @@ mod tests {
             kind,
             name: name.to_owned(),
             site: site.to_owned(),
+            stable_id: None,
         }
     }
 
@@ -383,8 +439,8 @@ mod tests {
 
     #[test]
     fn empty_candidates_are_an_authoritative_no_route_snapshot() {
-        let candidates = validate_candidates(vec![]).unwrap_or_else(|_| std::process::abort());
-        assert!(candidates.is_empty());
+        let candidates = validate_serving_candidates(vec![]).expect("versioned serving can withdraw every candidate");
+        assert!(candidates.is_empty(), "the empty serving revision is authoritative");
     }
 
     #[test]
@@ -408,6 +464,19 @@ mod tests {
         ])
         .expect_err("should fail");
         assert!(err.to_string().contains("duplicate candidate"), "{err}");
+    }
+
+    #[test]
+    fn explicit_stable_id_is_preserved_and_header_safe() {
+        let mut candidate = candidate("inference_model", "llama", "site-a", "gateway-a");
+        candidate.stable_id = Some("257a9450".to_owned());
+        let validated = validate_candidates(vec![candidate.clone()]).expect("valid stable ID");
+        assert_eq!(&*validated[0].stable_id, "257a9450");
+
+        candidate.stable_id = Some("\nspoof".to_owned());
+        validate_candidates(vec![candidate.clone()]).expect_err("newline stable ID is rejected");
+        candidate.stable_id = Some(" ".to_owned());
+        validate_candidates(vec![candidate]).expect_err("blank stable ID is rejected");
     }
 
     #[test]

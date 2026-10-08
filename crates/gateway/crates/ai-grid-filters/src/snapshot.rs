@@ -42,6 +42,9 @@ pub struct RouteSnapshot {
 
     /// Models answering 503 because every healthy site serving them is past full.
     pub shedding: BTreeSet<Arc<str>>,
+
+    /// Verified provider-hop clusters from the same serving revision as the candidates.
+    pub provider_hop_clusters: Arc<BTreeSet<String>>,
 }
 
 /// Per model while shedding is decided: whether every site is measured, and whether each
@@ -76,6 +79,7 @@ impl RouteSnapshot {
             local_site,
             scores,
             shedding: BTreeSet::new(),
+            provider_hop_clusters: Arc::default(),
         }
     }
 
@@ -308,7 +312,9 @@ impl RouteSnapshot {
                 (demoted, candidate)
             })
             .collect();
-        Self::ranked(ranked, self.local_site)
+        let mut ordered = Self::ranked(ranked, self.local_site);
+        ordered.provider_hop_clusters = self.provider_hop_clusters;
+        ordered
     }
 
     /// This snapshot, after setting `grid_route_site_score` for each of its site/cluster pairs.
@@ -354,6 +360,7 @@ impl RouteSnapshot {
             scores,
             local_site,
             shedding: BTreeSet::new(),
+            provider_hop_clusters: Arc::default(),
         }
     }
 }
@@ -509,6 +516,7 @@ mod tests {
             kind: CapabilityKind::InferenceModel,
             name: name.to_owned(),
             site: site.to_owned(),
+            stable_id: None,
         }
     }
 

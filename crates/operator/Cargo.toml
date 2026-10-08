@@ -54,6 +54,7 @@ prometheus = { workspace = true }
 schemars = { workspace = true }
 reqwest = { workspace = true }
 rmcp = { workspace = true }
+serde_yaml = { workspace = true }
 rustls = { workspace = true, optional = true }
 openssl = { workspace = true, optional = true }
 openssl-sys = { workspace = true, optional = true }
@@ -79,7 +80,6 @@ zeroize = { workspace = true }
 rmcp = { workspace = true, features = ["server", "transport-streamable-http-server"] }
 pem = { workspace = true }
 rcgen = { workspace = true, features = ["x509-parser"] }
-serde_yaml = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 tower = { workspace = true }
 

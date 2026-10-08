@@ -62,7 +62,7 @@ fn snapshot(sites: u32) -> RouteSnapshot {
 fn filter(snapshot: RouteSnapshot) -> Result<Box<dyn HttpFilter>, FilterError> {
     let mut config = load_serving_config("testdata/serving-config.json")?;
     config.peers.clear();
-    let runtime = spawn_grid_routing(&config)?;
+    let runtime = spawn_grid_routing(&config, std::collections::BTreeMap::new())?;
     let mut registry = FilterRegistry::with_builtins();
     let snapshot = Arc::new(ArcSwap::from_pointee(snapshot));
     register_grid_filters(

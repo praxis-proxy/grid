@@ -42,6 +42,60 @@ use crate::{
     snapshot::RouteSnapshot,
 };
 
+/// Internal request header carrying the selected candidate's stable ID.
+const SELECTED_CANDIDATE_HEADER: &str = "x-ai-routing-candidate";
+/// Internal request header carrying the provider-hop request correlation ID.
+const PROVIDER_HOP_REQUEST_ID_HEADER: &str = "x-ai-routing-request-id";
+/// Internal request header carrying the serving overlay revision.
+const OVERLAY_REVISION_HEADER: &str = "x-ai-routing-revision";
+
+/// Whether the current serving revision permits a previous filter's choice.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RouteDecision {
+    /// An authoritative empty revision withdraws every route.
+    NoRoute,
+    /// Another filter already chose an upstream.
+    KeepEarlier,
+    /// This filter should select a candidate.
+    Select,
+}
+
+/// Resolve the empty revision before preserving a prior filter's selection.
+fn route_decision(snapshot: &RouteSnapshot, earlier_selected: bool) -> RouteDecision {
+    if snapshot.candidates.is_empty() {
+        RouteDecision::NoRoute
+    } else if earlier_selected {
+        RouteDecision::KeepEarlier
+    } else {
+        RouteDecision::Select
+    }
+}
+
+/// Set hop context only for a candidate whose backend TLS identity remains verified across reloads.
+fn write_provider_context(
+    ctx: &mut HttpFilterContext<'_>,
+    candidate: &RouteCandidate,
+    snapshot: &RouteSnapshot,
+) -> Result<(), FilterError> {
+    if !snapshot.provider_hop_clusters.contains(candidate.cluster.as_ref()) {
+        return Ok(());
+    }
+    let candidate_id = http::HeaderValue::from_str(&candidate.stable_id)
+        .map_err(|error| -> FilterError { format!("grid: invalid provider-hop candidate ID: {error}").into() })?;
+    let request_id = ctx.id_generator.generate(ctx.time_source);
+    let request_id = http::HeaderValue::from_str(&request_id)
+        .map_err(|error| -> FilterError { format!("grid: invalid provider-hop request ID: {error}").into() })?;
+    ctx.request_headers_to_set.push((
+        http::header::HeaderName::from_static(SELECTED_CANDIDATE_HEADER),
+        candidate_id,
+    ));
+    ctx.request_headers_to_set.push((
+        http::header::HeaderName::from_static(PROVIDER_HOP_REQUEST_ID_HEADER),
+        request_id,
+    ));
+    Ok(())
+}
+
 /// Default request header carrying the model name.
 fn default_model_header() -> String {
     "X-Model".to_owned()
@@ -264,7 +318,13 @@ impl GridSiteRouteFilter {
 
     /// Send the request to `pick`: count the decision, select its cluster, and record its prefix
     /// there for the response to confirm or withdraw.
-    fn route(&self, ctx: &mut HttpFilterContext<'_>, pick: &Pick<'_>, keys: Option<PrefixKeys>) {
+    fn route(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        snapshot: &RouteSnapshot,
+        pick: &Pick<'_>,
+        keys: Option<PrefixKeys>,
+    ) -> Result<(), FilterError> {
         pick.decisions.record(pick.fallback);
         let candidate = pick.candidate;
         let mut responses = false;
@@ -281,6 +341,8 @@ impl GridSiteRouteFilter {
             ctx.request_headers_to_remove.push(http::header::ACCEPT_ENCODING);
         }
         ctx.cluster = Some(Arc::clone(&candidate.cluster));
+        write_provider_context(ctx, candidate, snapshot)?;
+        Ok(())
     }
 
     /// Route a request that names stored state to the site that stored it.
@@ -288,25 +350,32 @@ impl GridSiteRouteFilter {
     /// `None` for a request that names none. A site no longer in the grid gets
     /// 404, since the state lives only there. One that admits no new request now
     /// gets 503.
-    fn pin(&self, ctx: &mut HttpFilterContext<'_>, model: Option<&str>) -> Option<FilterAction> {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "pinned-state outcomes and hop context are handled together"
+    )]
+    fn pin(&self, ctx: &mut HttpFilterContext<'_>, model: Option<&str>) -> Result<Option<FilterAction>, FilterError> {
         let snapshot = self.snapshot.load();
         let key = self.affinity.tag_key.load();
-        let (holder, rewrite) = match pinned_site(ctx, &snapshot, key.as_deref())? {
+        let Some(pinned) = pinned_site(ctx, &snapshot, key.as_deref()) else {
+            return Ok(None);
+        };
+        let (holder, rewrite) = match pinned {
             Ok(pinned) => pinned,
-            Err(answer) => return Some(answer),
+            Err(answer) => return Ok(Some(answer)),
         };
         let site = holder.as_ref().map(|holder| &holder.site);
         let candidate = match pinned_target(&snapshot, holder.as_ref(), model) {
             Target::Found(candidate) => candidate,
             Target::Gone => {
                 tracing::debug!(site = ?site, "grid_site_route: the cluster holding the state left the grid");
-                return Some(FilterAction::Reject(Rejection::status(404)));
+                return Ok(Some(FilterAction::Reject(Rejection::status(404))));
             },
             Target::Unavailable => {
                 tracing::debug!(site = ?site, "grid_site_route: the cluster holding the state admits no new request");
-                return Some(FilterAction::Reject(
+                return Ok(Some(FilterAction::Reject(
                     Rejection::status(503).with_header("retry-after", RETRY_AFTER_SECS),
-                ));
+                )));
             },
         };
         let cluster = Arc::clone(&candidate.cluster);
@@ -315,10 +384,11 @@ impl GridSiteRouteFilter {
             state.served = Some((Arc::clone(&candidate.site), Arc::clone(&candidate.cluster)));
         });
         ctx.cluster = Some(cluster);
+        write_provider_context(ctx, candidate, &snapshot)?;
         ctx.rewritten_path = rewrite.or_else(|| ctx.rewritten_path.take());
         // Ids are tagged in the body, so it must come back uncompressed.
         ctx.request_headers_to_remove.push(http::header::ACCEPT_ENCODING);
-        Some(FilterAction::Continue)
+        Ok(Some(FilterAction::Continue))
     }
 
     /// A tagger for the ids of the answer `state` was served by.
@@ -431,11 +501,27 @@ impl HttpFilter for GridSiteRouteFilter {
         Ok(FilterAction::Continue)
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one snapshot decides withdrawal, pinned state, and normal selection"
+    )]
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         self.health.observe(ctx.health_registry);
-        // An earlier selecting filter wins; never override its choice.
-        if ctx.cluster.is_some() || ctx.upstream.is_some() {
-            return Ok(FilterAction::Continue);
+        for name in [
+            SELECTED_CANDIDATE_HEADER,
+            PROVIDER_HOP_REQUEST_ID_HEADER,
+            OVERLAY_REVISION_HEADER,
+        ] {
+            ctx.request_headers_to_remove
+                .push(http::header::HeaderName::from_static(name));
+        }
+        let snapshot = self.snapshot.load();
+        match route_decision(&snapshot, ctx.cluster.is_some() || ctx.upstream.is_some()) {
+            RouteDecision::NoRoute => {
+                return Ok(refuse(Refused::NoRoute, "", self.turn.fetch_add(1, Ordering::Relaxed)));
+            },
+            RouteDecision::KeepEarlier => return Ok(FilterAction::Continue),
+            RouteDecision::Select => {},
         }
         // A copy of the request reference, so the model outlives writes to ctx.
         let request = ctx.request;
@@ -443,7 +529,7 @@ impl HttpFilter for GridSiteRouteFilter {
             .headers
             .get(&self.model_header)
             .and_then(|value| value.to_str().ok());
-        if let Some(action) = self.pin(ctx, model) {
+        if let Some(action) = self.pin(ctx, model)? {
             return Ok(action);
         }
         let Some(model) = model else {
@@ -453,14 +539,13 @@ impl HttpFilter for GridSiteRouteFilter {
             return Ok(unrouted(400));
         };
 
-        let snapshot = self.snapshot.load();
         let keys = ctx
             .get_filter_state_mut::<RouteState>()
             .and_then(|state| state.keys.take())
             .map(|keys| keys.for_model(model));
         match self.choose(&snapshot, model, keys.as_ref()) {
             Ok(pick) => {
-                self.route(ctx, &pick, keys);
+                self.route(ctx, &snapshot, &pick, keys)?;
                 Ok(FilterAction::Continue)
             },
             Err(answer) => Ok(answer),
@@ -649,6 +734,7 @@ fn pinned_target<'snap>(snapshot: &'snap RouteSnapshot, holder: Option<&Holder>,
 }
 
 /// Count and answer a request no candidate took.
+#[expect(clippy::too_many_lines, reason = "each refusal maps to a distinct protocol response")]
 fn refuse(reason: Refused, model: &str, turn: usize) -> FilterAction {
     tracing::debug!(model = %model, reason = ?reason, "grid_site_route: no admitted candidate");
     reason.record();
@@ -669,7 +755,14 @@ fn refuse(reason: Refused, model: &str, turn: usize) -> FilterAction {
             "capacity_exhausted",
             "every site serving this model is at capacity",
         ),
-        Refused::NotReady | Refused::NoRoute | Refused::NoModel => retry_later(
+        Refused::NoRoute => error_response(
+            404,
+            "invalid_request_error",
+            "no_route",
+            "no route serves this model",
+            None,
+        ),
+        Refused::NotReady | Refused::NoModel => retry_later(
             turn,
             503,
             "server_error",
@@ -1111,6 +1204,7 @@ mod tests {
             kind: CapabilityKind::InferenceModel,
             name: model.to_owned(),
             site: site.to_owned(),
+            stable_id: None,
         }])
         .unwrap();
         candidates[0].admission_state = admission;
@@ -1139,6 +1233,7 @@ mod tests {
             sorted
                 .iter()
                 .map(|(site, ..)| CandidateConfig {
+                    stable_id: None,
                     cluster: format!("pool-{site}"),
                     credential: None,
                     admission: AdmissionState::default(),
@@ -1159,6 +1254,7 @@ mod tests {
             candidates,
             local_site: Arc::from("a"),
             shedding: BTreeSet::new(),
+            provider_hop_clusters: Arc::default(),
         }
     }
 
@@ -1266,6 +1362,7 @@ mod tests {
             [("llama", "pool-llama"), ("granite", "pool-granite")]
                 .into_iter()
                 .map(|(name, cluster)| CandidateConfig {
+                    stable_id: None,
                     cluster: cluster.to_owned(),
                     credential: None,
                     admission: AdmissionState::default(),
@@ -1825,5 +1922,17 @@ mod tests {
         assert!((0.48..=0.52).contains(&mean), "{mean}");
         assert!((0..10_000).all(|turn| (0.0..1.0).contains(&unit(turn, SALTS.1))));
         assert_ne!(random_seed(), random_seed());
+    }
+
+    #[test]
+    fn empty_snapshot_rejects_even_with_a_preselected_cluster() {
+        let empty = RouteSnapshot::from_static(Vec::new(), Arc::from("local"));
+        assert!(matches!(route_decision(&empty, true), RouteDecision::NoRoute));
+
+        let active = RouteSnapshot::from_static(
+            one("llama", "east", "pool-a", AdmissionState::NewAndExisting),
+            Arc::from("local"),
+        );
+        assert!(matches!(route_decision(&active, true), RouteDecision::KeepEarlier));
     }
 }

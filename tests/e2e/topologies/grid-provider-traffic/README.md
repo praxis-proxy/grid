@@ -128,13 +128,15 @@ The complete environment is in [`forge.yaml`](./forge.yaml). Supporting files ar
 
 Prerequisites include Docker, Kind, `kubectl`, Helm, OpenSSL, and `praxis-forge`. Build the `grid-operator` and Praxis AI gateway images before using the default `Never` pull policy.
 
-Build `praxis-forge` and the two source images from clean Grid and Praxis AI checkouts:
+Build `praxis-forge` and the source images from clean Grid and Praxis AI checkouts:
 
 ```console
 # From the `praxis-proxy/grid` repository.
 cargo build -p forge
 docker build -f deploy/operator/Containerfile \
   -t grid-operator:provider-traffic-qualification .
+docker build -f deploy/gateway/Containerfile \
+  -t grid-gateway:provider-traffic-qualification .
 
 # From the Praxis AI repository.
 docker build -f Containerfile \
@@ -154,6 +156,7 @@ cargo test -p xtask provider_traffic --locked
 ```console
 export GRID_XTASK_OPERATOR_IMAGE=grid-operator:provider-traffic-qualification
 export GRID_XTASK_GATEWAY_IMAGE=praxis-ai:provider-traffic-qualification
+export GRID_XTASK_GRID_GATEWAY_IMAGE=grid-gateway:provider-traffic-qualification
 export GRID_XTASK_SIM_IMAGE=ghcr.io/neuralmagic/vllm-vcr:vllm0.23
 export GRID_XTASK_IMAGE_PULL_POLICY=Never
 
@@ -163,9 +166,27 @@ cargo xtask env run-grid-provider-traffic-qualification \
   --teardown
 ```
 
-The provider-traffic qualification has one complete six-scenario proof set.
-Use `--full` for release qualification; `--quick` remains available for the
-same focused proof when a bounded diagnostic run is preferred.
+Both modes preserve the original six scenarios, including the 60-request
+round-robin proof. `--full` additionally exercises the generated
+`consumerConfig`, the embedded `grid-gateway` serving-config consumer, and the
+provider-withdrawal lifecycle (fallback, a valid empty/no-route revision,
+backend non-contact, and restoration). `--quick` runs only the original six
+scenarios.
+
+The qualification builds both consumers from compatible source under test.
+Deployments must upgrade and roll out every consumer before using this Grid
+version, because images without empty-overlay support reject
+the authoritative empty snapshot.
+
+Full mode also exercises the generated consumer credential lifecycle in two
+phases: it first renders `credential_inject` with an empty table and rolls out
+the consumer with a read-only test-Secret mount at
+`/run/secrets/grid-credentials/grid-system/vcr-inference-credential`; projected
+Secret paths include namespace, Secret name, and key. Only after that rollout does it
+set `supportsProjectedCredentials` and publish a credential-bearing Provider A
+candidate. The in-cluster request omits the provider credential, and the probe
+requires a successful provider-A-attributed response. The Secret value is not
+included in test evidence.
 
 For registry-hosted images, use immutable tags or digests and set
 `GRID_XTASK_IMAGE_PULL_POLICY=IfNotPresent`. Do not reuse evidence from a run
@@ -186,6 +207,16 @@ A qualifying run demonstrates:
   `provider-a`;
 - each provider serves exactly 20 requests;
 - the semantic overlay revision remains stable during traffic;
+- in full mode, a partial withdrawal serves only the remaining providers;
+- in full mode, last-route withdrawal publishes a new empty revision that the
+  overlay-backed and embedded Grid gateway consumers both accept and serve;
+- in full mode, new and previously bound overlay-backed requests and, when
+  embedded gateway setup succeeds, equivalent embedded Grid gateway requests
+  receive unattributed HTTP 404 responses (RFC 9110 §15.5.5);
+- provider workloads are Ready before the no-route probes; backend request and
+  provider-gateway POST counters remain unchanged across the probes;
+- restoration publishes and serves a new revision and attributed requests
+  resume;
 - teardown removes the clusters and shared network.
 
 Provider identity comes from request-scoped HTTP response attribution, not only

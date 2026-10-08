@@ -5,7 +5,10 @@
 //! release images; local development remains available through explicit
 //! overrides.
 
-use std::env;
+use std::{
+    env,
+    process::{Command, Stdio},
+};
 
 use super::IngressMode;
 
@@ -156,6 +159,58 @@ pub(crate) fn demo_image_pull_policy(mode: IngressMode) -> String {
 /// should pull images rather than loading them into Kind clusters.
 pub(crate) fn should_skip_kind_image_loading() -> bool {
     image_pull_policy() != "Never"
+}
+
+/// Import a host image into a run-owned Kind node using only its linux/amd64
+/// image content. This avoids OCI-index imports failing when the local Docker
+/// store has only the linux/amd64 child content.
+#[expect(
+    clippy::too_many_lines,
+    reason = "ensures both image processes are reaped on every failure path"
+)]
+pub(crate) fn load_docker_image_into_kind(image: &str, kind_name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let control_plane = format!("{kind_name}-control-plane");
+    let mut save = Command::new("docker")
+        .args(["save", "--platform", "linux/amd64", image])
+        .stdout(Stdio::piped())
+        .spawn()?;
+    let Some(save_stdout) = save.stdout.take() else {
+        drop(save.kill());
+        drop(save.wait());
+        return Err("docker save did not provide stdout".into());
+    };
+    let import_status = Command::new("docker")
+        .args([
+            "exec",
+            "--privileged",
+            "-i",
+            &control_plane,
+            "ctr",
+            "--namespace=k8s.io",
+            "images",
+            "import",
+            "--digests",
+            "--snapshotter=overlayfs",
+            "-",
+        ])
+        .stdin(save_stdout)
+        .status();
+    let import_status = match import_status {
+        Ok(status) => status,
+        Err(error) => {
+            drop(save.kill());
+            drop(save.wait());
+            return Err(error.into());
+        },
+    };
+    let save_status = save.wait()?;
+    if !save_status.success() {
+        return Err(format!("docker save failed for {image}").into());
+    }
+    if !import_status.success() {
+        return Err(format!("failed to import {image} into {control_plane}").into());
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

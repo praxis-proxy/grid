@@ -397,6 +397,22 @@ balancing and includes Basic Auth. It does not include the optional
 qualification. That qualification is not supported by this default image; AGN
 does not publish a replacement AI rollup.
 
+The default image predates empty versioned routing snapshots and is not
+compatible with Grid's authoritative no-route publication. The paired Praxis AI
+change must be released, and this chart's default image must be updated to that
+compatible release, before the next Grid release. Upgrade and roll every
+consumer of a Grid-managed overlay before deploying that Grid version.
+
+Generated consumer credentials use a separate two-step opt-in: set
+`consumerConfig.enableProjectedCredentials: true`, let Grid render the filter,
+and roll out the consumer with the read-only Secret mounts. In this mode, mount
+each Secret at `{credentialMountBase}/{secret-namespace}/{secret-name}`, with
+its data keys as files (for example,
+`/run/secrets/grid-credentials/grid-system/provider-key/token`). Static `file:`
+entries continue to use their explicitly configured paths. Only then set
+`consumerConfig.supportsProjectedCredentials: true`; Grid retains credential-
+bearing overlays until that readiness attestation is present.
+
 ### Edge and provider gateways in AGN
 
 AGN runs this chart in two roles with different values:
@@ -470,10 +486,10 @@ Before enabling delegation on an existing release, set
 Grid serving) `consumerConfig.tlsCertMountPath` to paths that do not overlap
 the current chart mounts. The operator stages its new mounts at those paths,
 switches to a matching generated config in the same Pod-template update, and
-leaves the old Helm mounts in place. **For populated routes, this handoff is not
-yet supported with the chart-default AI 0.4.0 image.** The current generated
-inline candidates contain `admission_state` and `selection_group`, which the
-tested Praxis image rejects. Wait for [Grid #270](https://github.com/praxis-proxy/grid/pull/270),
+leaves the old Helm mounts in place. Older generated configs embedded
+`admission_state` and `selection_group` in inline candidates, which the
+previously supported Praxis AI image rejected. Populated routes require a
+Praxis AI image that accepts Grid's versioned-overlay config. Wait for [Grid #270](https://github.com/praxis-proxy/grid/pull/270),
 a compatible image containing [Praxis AI #1539](https://github.com/praxis-proxy/ai/pull/1539),
 and qualification of the unmodified generated config before enabling this
 handoff for populated routes. A `Ready` mount status alone does not prove that
@@ -538,8 +554,11 @@ Known limits:
 
 - `grid_site_route` does not check provider health, so it can pick a site whose
   provider gateway is down. That request fails rather than failing over.
-- The gateway matches a candidate's cluster to `gatewayConfig.backends` by name only.
-  Nothing checks that the backend serves the candidate's site.
+- Ordinary routing matches a candidate's cluster to `gatewayConfig.backends` by
+  name; it does not attest which models that backend serves. Provider-hop
+  headers are allowed only when the declared cluster has a unique verified
+  mutual-TLS backend with the matching SNI. Same-named plaintext or mismatched
+  backends fail startup.
 - The serving watcher does not add load-balancer clusters to `praxis.yaml`.
   Add each new candidate's backend there too. Listener changes and serving
   `window_secs` changes require a restart.
