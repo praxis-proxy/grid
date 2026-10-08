@@ -1,207 +1,167 @@
 # AI Grid Network (AGN)
 
-AI Grid Network (AGN) is a distributed control plane that connects AI
-inference backends across Kubernetes clusters, cloud
-providers, and third-party APIs into a single routable
-mesh. AGN figures out where models are, which backends
-are healthy, and which one should handle the next
-request - then tells the [Praxis] gateway how to route.
+AI Grid Network (AGN) connects inference providers across Kubernetes clusters,
+cloud services, and external APIs. Its operator discovers participating sites,
+tracks provider availability, and publishes routing state for [Praxis AI]
+gateways. Gateways select a provider for each request from that local state.
 
-[Praxis]:https://github.com/praxis-proxy/praxis
+AGN is a technical preview. Start with the [scope and limitations] before
+choosing a topology or planning an upgrade. You supply the clusters, inference
+backends, credentials, gateway deployments, and connectivity between sites.
 
-## How It Works
+[Praxis AI]: https://github.com/praxis-proxy/ai
+[scope and limitations]: docs/technical-preview-scope.md
 
-The AGN Operator is an orchestrator, not a proxy. It watches
-Kubernetes resources, discovers peer sites over a
-gossip protocol (SWIM), propagates provider state
-with CRDTs, scores candidates, and writes a routing
-overlay that Praxis consumes at request time.
+## Architecture
 
-```text
-+---------------------------+     +---------------------------+
-|  Site A (Kubernetes)      |     |  Site B (Kubernetes)      |
-|                           |     |                           |
-|  +---------------------+  |     |  +---------------------+  |
-|  | AGN Operator        |  |     |  | AGN Operator        |  |
-|  | - SWIM membership   |  |     |  | - SWIM membership   |  |
-|  | - CRDT state sync   |  |     |  | - CRDT state sync   |  |
-|  | - scoring engine    |  |     |  | - scoring engine    |  |
-|  | - overlay renderer  |  |     |  | - overlay renderer  |  |
-|  +--------+------------+  |     |  +--------+------------+  |
-|           |               |     |           |               |
-|           | ConfigMap     |     |           | ConfigMap     |
-|           v               |     |           v               |
-|  +---------------------+  |     |  +---------------------+  |
-|  | Praxis AI Gateway   |  |     |  | Praxis AI Gateway   |  |
-|  | - request routing   |  |     |  | - request routing   |  |
-|  | - API translation   |  |     |  | - API translation   |  |
-|  | - credential inject |  |     |  | - credential inject |  |
-|  +--------+------------+  |     |  +--------+------------+  |
-|           |               |     |           |               |
-|           v               |     |           v               |
-|  +---------------------+  |     |  +---------------------+  |
-|  | Inference Backends  |  |     |  | Inference Backends  |  |
-|  | (llm-d, vLLM, etc.) |  |     |  | (Bedrock, Vertex,   |  |
-|                           |     |  | OpenAI, Anthropic)  |  |
-|  +---------------------+  |     |  +---------------------+  |
-+---------------------------+     +---------------------------+
+The operator watches Kubernetes custom resources and exchanges membership and
+provider state with peer operators over SWIM. It publishes a routing overlay in
+a ConfigMap. The `overlay-sync` sidecar watches that ConfigMap and delivers a
+file that the gateway can reload without restarting.
+
+```mermaid
+flowchart LR
+  resources[Grid custom resources] -.-> operator[AGN Operator]
+  peer[Peer operator] <-. SWIM membership and state .-> operator
+  operator -. routing overlay .-> config[ConfigMap]
+  config -. watch .-> sync[overlay-sync]
+  sync -. local file .-> consumer[Consumer gateway]
+  client[Client] --> consumer
+  consumer -->|mTLS| provider[Provider gateway]
+  provider --> backend[Inference backend]
+  consumer --> api[External API]
 ```
 
-The gateways communicate over mTLS.
+Dashed connections carry control-plane state. Solid connections carry inference
+requests. The operator remains outside the request path. A consumer gateway can
+call a local backend or external API directly, or route through another site's
+provider gateway. Provider credentials belong at the gateway making the final
+backend call; overlays contain credential references, not tokens.
 
-AGN Operators exchange membership and provider state over SWIM and CRDT
-replication.
+[Enrollment](charts/grid-enrollment/README.md) provides optional site-identity
+bootstrap. The [fleet dashboard](fleet-dashboard/README.md) provides an optional
+operational view. Neither component is required to understand the basic routing
+path. See the [architecture overview](docs/architecture/overview.md) for the
+controllers, trust lifecycle, signals, and deployment layouts.
 
-AGN handles the **control plane** (what should be
-routable). Praxis handles the **data plane** (routing
-and proxying actual requests).
+## Choose a starting point
 
-## Key Concepts
+| Goal | Start here | What it creates or requires |
+| --- | --- | --- |
+| Exercise routing locally | [Single-cluster qualification][single-cluster] | One disposable kind cluster, an operator, two consumer gateways, three provider gateways, and attributed simulators. Requires Docker, kind, kubectl, Helm, OpenSSL, Rust, and the images/source described in the guide. |
+| Install on existing clusters | [Existing-cluster installation][installation] | Separate operator and gateway Helm releases, site resources, and optional mock providers. Requires cluster contexts, connectivity, TLS material, and provider credentials. |
+| Inspect a small external-API declaration | [Single-cluster API example][api-example] | Network, site, and provider manifests. Requires an installed operator, an API credential, and a separately configured gateway; the example alone does not route requests. |
+| Explore complete demonstrations | [Praxis demos] | Scenario-specific deployments and runtime checks, maintained in a separate repository. |
 
-**GridNetwork** - defines a logical mesh of sites.
-Holds SWIM seeds, TLS settings, and gateway
-references.
+[single-cluster]: tests/e2e/topologies/grid-single-cluster-multi-gateway/README.md
+[installation]: docs/installation/existing-clusters.md
+[api-example]: deploy/examples/single-cluster-api-provider/README.md
+[Praxis demos]: https://github.com/praxis-proxy/demos
 
-**GridSite** - represents one participating cluster
-or location. Created automatically from SWIM
-discovery or manually for seed peers.
-
-**InferenceProvider** - declares model capacity at a
-site: model name, backend kind (self-hosted,
-cloud-managed, or API provider), health config, and
-auth strategy.
-
-**Routing overlay** - a versioned ConfigMap that AGN
-writes for each gateway. Contains scored candidates,
-cluster definitions with mTLS config, and credential
-references. Praxis hot-reloads this without restarts.
-
-**Scoring** - AGN applies one provider-level strategy before
-writing the overlay. `noMetrics` is the generic default for
-external APIs and providers without comparable telemetry.
-llm-d pools can opt into `queueDepth` or `kvCachePressure`.
-Request-specific prefix affinity remains inside llm-d EPP,
-which selects a pod after AGN selects a provider pool.
-
-See the [AGN Routing Guide](docs/routing.md) for configuration by routing
-need, selection groups, request-time selection modes, affinity, and runnable
-examples.
-
-## Request Flow
-
-Once the overlay is loaded, a request flows through
-two gateway pipelines:
-
-```text
-client request
-  -> Praxis consumer/edge gateway
-  -> intelligent_route selects a provider from overlay
-  -> gateway-to-gateway mTLS
-  -> Praxis provider gateway authenticates the peer
-  -> provider_route validates the selected candidate
-  -> credential_inject adds backend auth
-  -> load_balancer picks a backend instance
-  -> response returns to the client
-```
-
-AGN is never in the request path. All routing
-decisions use a pre-computed local overlay file.
-
-## Install
+For a first routing check, follow the [single-cluster guide][single-cluster] to
+prepare the images and validate its prerequisites, then run from this checkout:
 
 ```console
-helm install grid-operator \
-  oci://ghcr.io/praxis-proxy/charts/grid-operator \
-  --version <version> \
-  --namespace grid-system \
-  --create-namespace
+cargo xtask env run-grid-single-cluster-multi-gateway-qualification \
+  --forge-config tests/e2e/topologies/grid-single-cluster-multi-gateway/forge.yaml
 ```
 
-See the
-[chart documentation](charts/grid-operator/README.md)
-for values, RBAC, CRD upgrades, and SWIM service
-exposure. Install a compatible
-[Praxis](https://github.com/praxis-proxy/praxis)
-gateway separately.
+The runner sends inference requests and checks the serving overlay revisions,
+provider attribution, provider withdrawal and recovery, consumer failure, and
+network boundaries. It writes `results.json` and `SUMMARY.md` evidence and
+attempts teardown automatically; `--keep` retains the environment for diagnosis.
+Review the results and cleanup outcome. A successful single-site run establishes
+local routing behavior; cross-site SWIM and WAN behavior need the multi-site
+qualifications linked in the [documentation index](docs/README.md).
 
-For Kustomize or raw manifests, see
-[deploy/](deploy/README.md).
+Installing only the `grid-operator` chart prepares the control plane. Use the
+[installation guide][installation] to install compatible gateways as well. The
+[operator chart](charts/grid-operator/README.md) documents CRD ownership,
+retention, RBAC, and SWIM exposure; [deploy](deploy/README.md) covers Kustomize
+and raw manifests.
 
-## Getting Started
+## Routing concepts
 
-[Praxis demos](https://github.com/praxis-proxy/demos): deployable demonstrations
-with automated runtime
-proofs of routing, failover, security boundaries,
-and provider lifecycle.
+- **`GridNetwork`** configures a logical mesh, discovery seeds, trust, and
+  routing policy.
+- **`GridSite`** records a participating site and the information needed to
+  reach it. Discovery can create site records; discovery alone does not grant
+  request-level authorization.
+- **`InferenceProvider`** declares a backend, its models and capabilities,
+  health configuration, and supported authentication strategy.
+- **Routing overlays** describe eligible candidates, selection groups, and
+  request-selection policy. Gateways serve requests from accepted local
+  snapshots, including when the operator is temporarily unavailable.
 
-[Existing-cluster installation](docs/installation/existing-clusters.md): install
-AGN and Praxis on running Kubernetes clusters with Helm.
+Provider scoring uses one strategy selected by
+`spec.scoringPolicy.strategy`:
 
-## Workspace Crates
+| Strategy | Selection signal |
+| --- | --- |
+| `noMetrics` | Generic default for external APIs and providers without comparable telemetry. |
+| `queueDepth` | Normalized queue depth; useful for compatible llm-d provider pools. |
+| `kvCachePressure` | Available KV-cache capacity for compatible provider pools. |
 
-| Crate | Purpose |
-|-------|---------|
-| `operator` | K8s controllers, CRDs, operator binary |
-| `scoring` | Strategy-selected scoring engine and grid state |
-| `certs` | Certificate generation and mTLS provider trait |
-| `swim` | foca SWIM wrapper and encryption |
-| `crdt` | Delta CRDT types (LWW, OR-Set, G-Counter) |
-| `overlay-sync` | Sidecar for fast ConfigMap-to-file delivery |
-| `mock-providers` | Mock OpenAI, Anthropic, Bedrock, Vertex APIs |
-| `forge` | Generic development-environment orchestrator for Kubernetes |
-| `xtask` | Dev task runner for multi-cluster test environments |
-| `fleet-dashboard` | Opt-in hub web UI: fleet map and per-site health from each site's Prometheus (Axum + React) |
+Omitting the entire scoring policy selects `noMetrics`; when the policy is
+present, its `strategy` is required. These strategies select provider pools.
+Request-specific prefix affinity and pod selection remain inside llm-d EPP.
+Model and tool discovery expose declared capabilities; AGN does not deploy
+models or provide a tenant-facing catalog. See the
+[routing guide](docs/routing.md) for selection modes, affinity, discovery, and
+configuration examples. The [site-selection guide](docs/site-selection.md)
+explains measured site availability and shedding at consumer gateways.
 
-## Project name and compatibility
+## Compatibility and trust
 
-AI Grid Network (AGN) is the human-facing project name used in documentation.
-Established software identifiers remain unchanged:
-the Rust package and binary are `operator`, the deployed operator is
-`grid-operator`, the operator chart is `grid-operator`, and the gateway chart is
-`praxis-gateway`. The API group is `grid.praxis.fast`, with kinds such as
-`GridNetwork` and `GridSite`. It replaced `grid.praxis-proxy.io`, along with the
-prefix of every Grid label and annotation key, so custom resources created under
-the old group must be recreated. The project offers no migration guarantees at
-this stage, so across the rename the supported path is a fresh install: uninstall,
-delete the `grid.praxis-proxy.io` CRDs, and install again. An upgrade
-deletes the old CRDs, and every resource under them, unless the previous release
-installed them with the `helm.sh/resource-policy: keep` annotation, which `crds.keep`
-set at that time. Existing
-`grid-*` resource names, `GRID_*` environment variables, metrics, and
-configuration fields are unchanged.
-Existing downstream names, including `praxis-ai-grid-operator` where used, are
-also unchanged. Downstream naming alignment is deferred to a separate effort.
+The API version is `grid.praxis.fast/v1alpha1`. Resources from the former
+`grid.praxis-proxy.io` group require a fresh installation. Removing old CRDs
+also removes their custom resources; review the [operator chart's upgrade guidance]
+before changing an existing deployment. AGN makes no general migration or
+mixed-version gossip compatibility guarantee during the technical preview.
+
+The `praxis-gateway` chart deploys the separately released Praxis AI image.
+The `grid-gateway` binary in this repository is a separate operand with its own
+Cargo workspace. Select images with the filters required by the deployment;
+matching version numbers alone does not establish compatibility. The
+[release guide](docs/release.md) distinguishes publication from consumer
+qualification.
+
+Gateway mTLS, site trust, external caller authorization, and backend credentials
+serve separate purposes. SWIM encryption uses a shared mesh key; it does not by
+itself bind a broadcast to a particular site's identity. The SWIM library has
+origin-signature support, but the operator does not yet wire signing and origin
+pins into its publication path. See [origin binding work] and the
+[authentication guide](docs/architecture/auth.md). Routing and spend signals do
+not constitute an authoritative billing record or a global quota guarantee.
+
+[operator chart's upgrade guidance]: charts/grid-operator/README.md#upgrade
+[origin binding work]: https://github.com/praxis-proxy/grid/issues/75
 
 ## Development
 
-Requires Rust stable 1.96+, Rust nightly (for
-rustfmt), and Docker/Podman + kind for integration
-tests.
+The root Rust workspace contains the operator, state and scoring libraries,
+sidecars, and development tools. Gateway has a separate workspace and lockfile.
+See the [development guide](docs/development.md) for the complete crate map,
+tool versions, and local/CI gate boundaries.
 
 ```console
-make build          # workspace build
-make test           # all tests
-make lint           # clippy + fmt check + machete
-make audit          # cargo audit + cargo deny check
-make all            # build + fmt + lint + test + audit
+make build          # build the root workspace
+make fmt            # format root and Gateway workspaces
+make lint           # Clippy, formatting, dependencies, Gateway no-ring check
+make test           # run root workspace tests
+make all            # build, format, lint, docs, tests, audit
 ```
 
-See the [development guide](docs/development.md) and
-[conventions](docs/conventions.md) for full details.
+Read [CONTRIBUTING](CONTRIBUTING.md) and the canonical
+[development conventions](docs/conventions.md) before submitting a change.
 
 ## Documentation
 
-- [Technical preview scope and limitations](docs/technical-preview-scope.md)
-- [Architecture overview](docs/architecture/overview.md)
-- [Custom resources](docs/architecture/crds.md)
-- [Routing Guide](docs/routing.md)
-- [Routing Architecture and Overlay Contract](docs/architecture/routing.md)
-- [Scoring](docs/architecture/scoring.md)
-- [Auth and policy](docs/architecture/auth.md)
-- [Operations](docs/architecture/operations.md)
-- [Consumer config](docs/architecture/consumer-config.md)
 - [Documentation index](docs/README.md)
-
-## License
-
-Apache-2.0
+- [Custom resources](docs/architecture/crds.md)
+- [Routing and overlay contract](docs/architecture/routing.md)
+- [Scoring](docs/architecture/scoring.md)
+- [Authentication and access policy](docs/architecture/auth.md)
+- [Operations and troubleshooting](docs/architecture/operations.md)
+- [Security reporting](SECURITY.md)
+- [Apache-2.0 license](LICENSE)

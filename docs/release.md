@@ -4,7 +4,10 @@
 
 AI Grid Network (AGN) uses [Semantic Versioning][semver]. The workspace version is defined in
 `workspace.package.version` in the root `Cargo.toml`. Workspace crates inherit
-that version.
+that version. The separate `gateway/Cargo.toml` workspace has its own package
+version; root version changes do not update it. Read each manifest for its
+current package version. Package versions alone do not establish image
+compatibility: qualify the tagged source and intended consumer below.
 
 The five charts published by this release (`grid-operator`, `grid-site`,
 `praxis-gateway`, `grid-mock-providers`, and `grid-enrollment`) have versions
@@ -72,9 +75,11 @@ Before opening a release preparation pull request:
       digest.
 - [ ] Update the release workflow's pinned AI tag, digest, and source revision
       when the default Praxis AI image changes.
-- [ ] Run `cargo +nightly-2026-03-28 fmt --all -- --check`.
-- [ ] Run `cargo clippy --workspace --all-targets -- -D warnings`.
-- [ ] Run `make test`, `make doc`, and `make lint`.
+- [ ] Run `make lint` for both workspaces, then `make lint-extra`.
+- [ ] Run `make test` and `make doc` for the root workspace.
+- [ ] Run `cargo test --locked --manifest-path gateway/Cargo.toml --workspace`
+      for the separate Gateway workspace.
+- [ ] Run `make codegen-check` and `make crds-check`.
 - [ ] Run `git diff --check` and validate the release workflow with
       `actionlint`.
 - [ ] Lint and render the five release charts with their required values.
