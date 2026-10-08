@@ -275,7 +275,7 @@ Praxis AI image; these values may advance independently.
 | `overlay.items` | list | routing-config.json, routing-overlay.json | Items to project. |
 | `overlay.sidecar.enabled` | bool | `false` | Deliver validated overlays through an API-watch sidecar instead of kubelet ConfigMap projection. |
 | `overlay.sidecar.image.repository` | string | `grid-overlay-sync` | Overlay-sync image repository. Use a published or locally built image appropriate to the deployment. |
-| `overlay.sidecar.image.tag` | string | `v0.1.4` | Overlay-sync image tag. Use an immutable published tag for reproducible deployments. |
+| `overlay.sidecar.image.tag` | string | `v0.2.0` | Overlay-sync image tag. Use an immutable published tag for reproducible deployments. |
 | `overlay.sidecar.image.pullPolicy` | string | `IfNotPresent` | Overlay-sync image pull policy. |
 | `overlay.sidecar.dataKey` | string | `routing-overlay.json` | Content-addressed envelope key in the overlay ConfigMap. |
 | `overlay.sidecar.expectedNetwork` | string | `""` | Required GridNetwork scope when the sidecar is enabled. |

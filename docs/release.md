@@ -62,6 +62,10 @@ Before opening a release preparation pull request:
 - [ ] Update their AGN workload `appVersion` values to the AGN tag.
 - [ ] Verify the `praxis-gateway` `appVersion` and default image match the
       intended official Praxis AI release.
+- [ ] Bump every chart value that pins an AGN image tag explicitly, such as
+      `praxis-gateway` `overlay.sidecar.image.tag`. An empty tag there resolves
+      to the chart `appVersion`, which is the Praxis AI version, so these are
+      pinned by hand and the release workflow does not check them.
 - [ ] Confirm the release workflow builds
       `ghcr.io/praxis-proxy/grid-gateway:v<version>` from the same tagged AGN
       source, publishes the version tag, and records the resulting immutable

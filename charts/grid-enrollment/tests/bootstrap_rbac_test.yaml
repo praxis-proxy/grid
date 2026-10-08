@@ -127,7 +127,7 @@ tests:
     asserts:
       - equal:
           path: spec.template.spec.containers[0].image
-          value: quay.io/praxis-proxy/grid-enrollment@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          value: ghcr.io/praxis-proxy/grid-enrollment@sha256:0000000000000000000000000000000000000000000000000000000000000000
 
   - it: creates the builtin DB credentials once, from the bootstrap Job
     template: templates/certs/ca-bootstrap-job.yaml

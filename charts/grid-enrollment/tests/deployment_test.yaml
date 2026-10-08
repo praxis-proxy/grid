@@ -113,7 +113,7 @@ tests:
     asserts:
       - equal:
           path: spec.template.spec.containers[0].image
-          value: quay.io/praxis-proxy/grid-enrollment@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          value: ghcr.io/praxis-proxy/grid-enrollment@sha256:0000000000000000000000000000000000000000000000000000000000000000
 
   - it: uses the tag when image.digest is empty
     set:
@@ -121,7 +121,7 @@ tests:
     asserts:
       - equal:
           path: spec.template.spec.containers[0].image
-          value: quay.io/praxis-proxy/grid-enrollment:v1.2.3
+          value: ghcr.io/praxis-proxy/grid-enrollment:v1.2.3
 
   - it: rejects a malformed image.digest
     set:
