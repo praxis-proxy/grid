@@ -10,8 +10,8 @@ code, tests, documentation, and human responsibility for submitted changes.
 1. Fork the repository and clone your fork.
 2. Install the tools listed in the [development guide].
 3. Enable commit signing and install the hook with `make setup-hooks`.
-4. For code changes, build and test with `make build` and `make test`.
-5. Run `make all` and component-specific checks before submitting code changes.
+4. For code changes, run `make all` and component-specific checks before
+   submitting.
 
 The [verification matrix] explains what each local gate covers and which
 additional jobs CI runs. `make test` covers the root workspace; Gateway has a
