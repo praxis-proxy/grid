@@ -3156,11 +3156,8 @@ mod tests {
 
     #[test]
     fn all_providers_unavailable_produces_empty_overlay() {
-        // If every provider in the network is Unavailable, the renderer produces
-        // an empty candidate list without returning an error.  The reconcile-loop
-        // guard (in grid_network controller) skips applying an empty overlay to
-        // prevent Praxis hot-reload errors — that guard is covered at the
-        // controller integration level.  This test covers the renderer contract.
+        // If every provider is Unavailable, the renderer emits the authoritative
+        // empty candidate list that the versioned overlay contract publishes.
         let network = test_network("empty-net");
         let p1 = test_provider_with_phase("prov-a", "empty-net", &["model-a"], "Unavailable");
         let p2 = test_provider_with_phase("prov-b", "empty-net", &["model-b"], "Unavailable");

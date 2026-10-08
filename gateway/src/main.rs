@@ -12,9 +12,14 @@
 //! Kubernetes client stack. See `deploy/gateway/Containerfile` and the
 //! `gateway-image` make target.
 
-use std::{ffi::OsStr, process::ExitCode};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    ffi::OsStr,
+    process::ExitCode,
+};
 
 use praxis_core::config::{Config, ConfigFile, DEFAULT_CONFIG};
+use serde::Deserialize;
 use tracing::info;
 
 mod metrics_listener;
@@ -80,6 +85,10 @@ fn preflight() -> Option<ExitCode> {
     None
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "gateway startup assembles dependent runtime stages"
+)]
 fn main() -> ExitCode {
     if let Some(exit) = preflight() {
         return exit;
@@ -108,18 +117,30 @@ fn main() -> ExitCode {
     // runtime holding their handles. grid_site_route registers over the snapshot
     // the pollers refresh. Dropping the runtime stops the pollers, so it is
     // bound until the server returns.
-    let grid_runtime = match std::env::var("GRID_SERVING_CONFIG")
-        .ok()
-        .map(|path| start_grid_routing(&path, &mut registry))
-    {
+    let (grid_runtime, backend_tls) = match std::env::var("GRID_SERVING_CONFIG").ok().map(|path| {
+        let backend_tls = provider_hop_backends(&config)?;
+        let backend_sni = backend_tls
+            .iter()
+            .map(|(name, tls)| (name.clone(), tls.sni.clone()))
+            .collect();
+        let runtime = start_grid_routing(&path, backend_sni, &mut registry)?;
+        Ok::<_, praxis_filter::FilterError>((runtime, backend_tls))
+    }) {
         Some(Err(err)) => return praxis::report_fatal(&err, log_output),
-        Some(Ok(runtime)) => Some(runtime),
-        None => None,
+        Some(Ok((runtime, backend_tls))) => (Some(runtime), Some(backend_tls)),
+        None => (None, None),
     };
 
     // Use the returning server path so both the routing runtime and tracing
     // provider can shut down cleanly after the listeners stop.
-    let result = praxis::try_run_server_with_registry(config, registry, config_file, log_level);
+    let mut composition = praxis::ServerComposition::with_registry(registry);
+    if let Some(backend_tls) = backend_tls {
+        composition = composition.add_pipeline_validator(move |ctx| {
+            backend_tls_unchanged(ctx.config(), &backend_tls)
+                .map_err(|error| praxis::CompositionError::new(error.to_string()))
+        });
+    }
+    let result = praxis::try_run_server_with_composition(config, composition, config_file, log_level);
     drop(grid_runtime);
     let exit_code = result.map_or_else(|err| praxis::report_fatal(&err, log_output), |()| ExitCode::SUCCESS);
     // The Praxis guard shuts down the OTLP provider and flushes queued spans.
@@ -212,10 +233,11 @@ fn start_metrics_listener(config: &Config) -> Result<(), String> {
 /// registering the filters.
 fn start_grid_routing(
     path: &str,
+    backend_tls: BTreeMap<String, String>,
     registry: &mut praxis_filter::FilterRegistry,
 ) -> Result<ai_grid_filters::GridRuntime, praxis_filter::FilterError> {
     let config = ai_grid_filters::load_serving_config(path)?;
-    let mut runtime = ai_grid_filters::spawn_grid_routing(&config)?;
+    let mut runtime = ai_grid_filters::spawn_grid_routing(&config, backend_tls)?;
     ai_grid_filters::register_grid_filters(
         registry,
         runtime.snapshot(),
@@ -232,6 +254,108 @@ fn start_grid_routing(
 
 /// How often the grid serving config file is re-read.
 const SERVING_RELOAD_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Minimal view of a load-balancer cluster for provider-hop trust validation.
+#[derive(Deserialize)]
+struct LoadBalancerBackends {
+    /// Configured cluster entries.
+    clusters: Vec<BackendCluster>,
+}
+
+/// One upstream cluster.
+#[derive(Deserialize)]
+struct BackendCluster {
+    /// Cluster identifier.
+    name: String,
+    /// TLS settings, absent for plaintext.
+    tls: Option<BackendTls>,
+}
+
+/// TLS properties required for an authenticated provider hop.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+struct BackendTls {
+    /// Expected server name.
+    sni: String,
+    /// Certificate verification switch.
+    verify: bool,
+    /// Trusted CA bundle.
+    ca: Option<BackendCa>,
+    /// Mutual-TLS client identity.
+    client_cert: Option<BackendClientCert>,
+}
+
+/// CA trust input used by the load balancer.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+struct BackendCa {
+    /// CA certificate path.
+    ca_path: String,
+}
+
+/// Client identity used by the load balancer.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+struct BackendClientCert {
+    /// Client certificate path.
+    cert_path: String,
+    /// Client private key path.
+    key_path: String,
+}
+
+/// Resolve unique verified mutual-TLS backends across all chains.
+#[expect(clippy::too_many_lines, reason = "keeps the backend transport checks together")]
+fn provider_hop_backends(config: &Config) -> Result<BTreeMap<String, BackendTls>, praxis_filter::FilterError> {
+    let mut backends = BTreeMap::new();
+    let mut unverified = BTreeSet::new();
+    for chain in &config.filter_chains {
+        for filter in chain
+            .filters
+            .iter()
+            .filter(|filter| filter.filter_type == "load_balancer")
+        {
+            let parsed: LoadBalancerBackends =
+                serde_yaml::from_value(filter.config.clone()).map_err(|error| -> praxis_filter::FilterError {
+                    format!("grid: parsing load_balancer backends: {error}").into()
+                })?;
+            for backend in parsed.clusters {
+                let verified_sni = backend.tls.filter(|tls| {
+                    tls.verify
+                        && !tls.sni.trim().is_empty()
+                        && tls.ca.as_ref().is_some_and(|ca| !ca.ca_path.trim().is_empty())
+                        && tls
+                            .client_cert
+                            .as_ref()
+                            .is_some_and(|cert| !cert.cert_path.trim().is_empty() && !cert.key_path.trim().is_empty())
+                });
+                if let Some(tls) = verified_sni {
+                    if unverified.contains(&backend.name) || backends.insert(backend.name.clone(), tls).is_some() {
+                        return Err(format!("grid: ambiguous provider-hop backend {:?}", backend.name).into());
+                    }
+                } else {
+                    if backends.contains_key(&backend.name) {
+                        return Err(format!("grid: ambiguous provider-hop backend {:?}", backend.name).into());
+                    }
+                    unverified.insert(backend.name);
+                }
+            }
+        }
+    }
+    Ok(backends)
+}
+
+/// Reject a Praxis config reload that changes a backend identity trusted by the Grid runtime.
+fn backend_tls_unchanged(
+    config: &Config,
+    expected: &BTreeMap<String, BackendTls>,
+) -> Result<(), praxis_filter::FilterError> {
+    let current = provider_hop_backends(config)?;
+    for (cluster, tls) in expected {
+        if current.get(cluster) != Some(tls) {
+            return Err(
+                format!("grid: backend {cluster:?} changed its verified TLS identity; restart Grid routing").into(),
+            );
+        }
+    }
+    Ok(())
+}
 
 /// Usage line for a malformed command line.
 const USAGE: &str = "usage: grid-gateway [--config <path> | -c <path> | <path>]";
@@ -260,10 +384,62 @@ fn config_arg<I: IntoIterator<Item = String>>(args: I) -> Result<Option<String>,
 }
 
 #[cfg(test)]
+#[expect(clippy::expect_used, reason = "test fixtures use checked parsing")]
 mod tests {
     use std::ffi::OsStr;
 
-    use super::{USAGE, config_arg, otlp_headers_present, validate_otlp_endpoint_transport_values};
+    use super::{
+        USAGE, backend_tls_unchanged, config_arg, otlp_headers_present, provider_hop_backends,
+        validate_otlp_endpoint_transport_values,
+    };
+
+    fn config_with_backend(backend: &str) -> praxis_core::config::Config {
+        let backend = format!("    {}", backend.replace('\n', "\n    "));
+        let yaml = format!(
+            "listeners:\n  - name: test\n    address: 127.0.0.1:8080\n    filter_chains: [grid]\nfilter_chains:\n  - name: grid\n    filters:\n      - filter: grid_site_route\n      - filter: load_balancer\n        clusters:\n          - name: provider-a\n{backend}"
+        );
+        praxis_core::config::Config::from_yaml(&yaml).expect("backend fixture")
+    }
+
+    #[test]
+    fn provider_hop_backends_reject_verified_plaintext_name_collision() {
+        let verified = "        tls:\n          sni: provider-a.grid.internal\n          verify: true\n          ca: { ca_path: /tls/ca.crt }\n          client_cert: { cert_path: /tls/tls.crt, key_path: /tls/tls.key }\n        endpoints: [provider-a:8443]\n";
+        let plaintext = "        endpoints: [provider-a:80]\n";
+        for (first, second) in [(verified, plaintext), (plaintext, verified)] {
+            let mut config = config_with_backend(first);
+            let mut other = config_with_backend(second).filter_chains.remove(0);
+            other.name = "other-grid".to_owned();
+            config.filter_chains.push(other);
+            assert!(
+                provider_hop_backends(&config)
+                    .err()
+                    .is_some_and(|error| error.to_string().contains("ambiguous provider-hop backend"))
+            );
+        }
+    }
+
+    #[test]
+    fn backend_reload_keeps_the_original_verified_provider_hop_identity() {
+        let verified = "        tls:\n          sni: provider-a.grid.internal\n          verify: true\n          ca: { ca_path: /tls/ca.crt }\n          client_cert: { cert_path: /tls/tls.crt, key_path: /tls/tls.key }\n        endpoints: [provider-a:8443]\n";
+        let plaintext = "        endpoints: [provider-a:80]\n";
+        let expected = provider_hop_backends(&config_with_backend(verified)).expect("verified backend");
+        let changed_sni = verified.replace("provider-a.grid.internal", "other.grid.internal");
+        let changed_ca = verified.replace("/tls/ca.crt", "/tls/other-ca.crt");
+        for (label, backend) in [
+            ("plaintext", plaintext),
+            ("changed SNI", changed_sni.as_str()),
+            ("changed CA", changed_ca.as_str()),
+        ] {
+            assert!(
+                backend_tls_unchanged(&config_with_backend(backend), &expected).is_err(),
+                "{label} reload cannot inherit provider-hop trust"
+            );
+            assert!(
+                backend_tls_unchanged(&config_with_backend(verified), &expected).is_ok(),
+                "rejection must leave the original identity trusted"
+            );
+        }
+    }
 
     fn parse(args: &[&str]) -> Result<Option<String>, String> {
         config_arg(args.iter().map(|arg| (*arg).to_owned()))

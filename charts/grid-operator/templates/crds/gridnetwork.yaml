@@ -178,7 +178,9 @@ spec:
                           entry per unique inference cluster. Other capability kinds remain in the
                           routing overlay for dedicated data-plane pipelines.
 
-                          The generated `ConfigMap` contains no token bytes.
+                          The generated `ConfigMap` contains no token bytes. Credential-bearing
+                          overlays are withheld until the consumer has explicitly declared that its
+                          compatible filter config is already running.
                         nullable: true
                         properties:
                           clusterEndpoints:
@@ -290,11 +292,23 @@ spec:
                             description: |-
                               Base directory for mounted credential Secret files inside the consumer pod.
 
-                              Each credential Secret is expected to be mounted at
-                              `{credentialMountBase}/{secret-name}/{secret-key}`.
+                              In projected-credential mode, mount each Secret at
+                              `{credentialMountBase}/{secret-namespace}/{secret-name}` with its data
+                              keys as files. Static `file:` entries continue to use their explicit
+                              paths and are not constrained by this directory layout.
 
                               Default: `/run/secrets/grid-credentials`.
                             type: string
+                          enableProjectedCredentials:
+                            default: false
+                            description: |-
+                              Generate the dynamic `credential_inject` filter and projected mount
+                              root, including when the current overlay has no credentials. Enable this
+                              first, then roll out the generated config before asserting readiness
+                              with `supportsProjectedCredentials`.
+
+                              Default: `false`.
+                            type: boolean
                           enabled:
                             default: false
                             description: |-
@@ -343,6 +357,18 @@ spec:
                             x-kubernetes-validations:
                               - message: deploymentName is required when mount reconciliation is enabled
                                 rule: '!has(self.enabled) || !self.enabled || has(self.deploymentName)'
+                          supportsProjectedCredentials:
+                            default: false
+                            description: |-
+                              Declare that the running consumer has the dynamic `credential_inject`
+                              filter configured with the projected Secret mount root. This is a
+                              fail-closed capability gate for credential-bearing overlay revisions.
+                              Set it only after the consumer has loaded a config containing that
+                              filter; the Grid operator does not own or roll out the consumer
+                              Deployment.
+
+                              Default: `false`.
+                            type: boolean
                           telemetry:
                             description: |-
                               Optional OpenTelemetry exporter and sampling settings for this gateway.
@@ -435,6 +461,74 @@ spec:
                       namespace:
                         description: Gateway namespace.
                         type: string
+                      providerHopEndpoints:
+                        description: |-
+                          Explicit mTLS provider-hop endpoints for the embedded `grid-gateway`
+                          serving config. This allowlist is independent of `consumerConfig`, so a
+                          missing or disabled generated Praxis config cannot alter embedded
+                          serving behavior. Every entry must declare `mutual_tls` and a nonblank
+                          SNI. The embedded gateway compares each declaration against the
+                          loaded Praxis load-balancer's verified mTLS backend before it sends
+                          provider-hop context. Changing Praxis backend transport requires a
+                          gateway restart while `gridServing` is enabled.
+                        items:
+                          description: |-
+                            Explicit verified-mTLS endpoint identity trusted for embedded provider-hop
+                            context. This does not configure the gateway's upstream TLS connection; the
+                            embedded gateway must separately use verified TLS with this SNI; the
+                            gateway checks the two configurations before serving hop traffic.
+                          properties:
+                            cluster:
+                              description: Cluster name used by the embedded gateway's `load_balancer` filter.
+                              type: string
+                            transport:
+                              description: TLS mode and SNI configured for that embedded gateway upstream.
+                              properties:
+                                caSecretRef:
+                                  description: |-
+                                    Optional gateway-namespace Secret supplying a custom CA bundle for `tls` transport.
+                                    Specify only its name and optional key; the Secret must be in the namespace
+                                    named by the containing `GatewayRef`. The mounted path is
+                                    `/run/secrets/grid-backend-ca/{secret-name}/{key}`; the key defaults to
+                                    `ca.crt`. Omitted uses the process trust store.
+                                  nullable: true
+                                  properties:
+                                    key:
+                                      description: Optional key containing the CA bundle. Defaults to `ca.crt`.
+                                      minLength: 1
+                                      nullable: true
+                                      type: string
+                                    name:
+                                      description: Secret name in the target gateway namespace.
+                                      minLength: 1
+                                      type: string
+                                  required:
+                                    - name
+                                  type: object
+                                mode:
+                                  description: 'Transport mode: `mutual_tls`, `tls`, or explicit `plaintext`.'
+                                  enum:
+                                    - mutual_tls
+                                    - tls
+                                    - plaintext
+                                  type: string
+                                sni:
+                                  description: TLS Server Name Indication, required when mode is `mutual_tls` or `tls`.
+                                  nullable: true
+                                  type: string
+                              required:
+                                - mode
+                              type: object
+                              x-kubernetes-validations:
+                                - message: caSecretRef is only valid for tls transport
+                                  rule: self.mode == 'tls' || !has(self.caSecretRef) || self.caSecretRef == null
+                                - message: an explicitly empty sni is only valid for plaintext transport
+                                  rule: self.mode == 'plaintext' || !has(self.sni) || self.sni.size() > 0
+                          required:
+                            - cluster
+                            - transport
+                          type: object
+                        type: array
                     required:
                       - name
                       - namespace

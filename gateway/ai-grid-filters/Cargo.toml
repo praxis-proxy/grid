@@ -16,10 +16,10 @@ grid-signals = { path = "../../signals" }
 # poller and cert issuance are real dependencies, not just test ones.
 grid-signals-client = { path = "../../signals-client", default-features = false, features = ["fips"] }
 certs = { path = "../../certs", default-features = false, features = ["verifier", "fips"] }
-serde = { version = "1", features = ["derive"] }
+serde.workspace = true
 # praxis-proxy-filter 0.7 renamed its YAML crate to the yaml_serde fork and
 # aliases it as serde_yaml; match it so filter config types line up.
-serde_yaml = { version = "0.10", package = "yaml_serde" }
+serde_yaml.workspace = true
 arc-swap = "1"
 async-trait = "0.1"
 tracing = "0.1"
