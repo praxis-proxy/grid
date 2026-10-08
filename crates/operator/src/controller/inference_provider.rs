@@ -1303,7 +1303,14 @@ mod tests {
         match auth {
             ProbeAuthFixture::Absent => provider.spec.auth = None,
             ProbeAuthFixture::Managed(_) => {},
-            ProbeAuthFixture::Manual => provider.spec.auth.as_mut().expect("fixture has auth").manual = true,
+            ProbeAuthFixture::Manual => {
+                provider
+                    .spec
+                    .auth
+                    .as_mut()
+                    .expect("fixture has auth")
+                    .credentials_managed_externally = true;
+            },
         }
         if let Some(inference_endpoint) = inference_endpoint {
             provider.spec.endpoint = inference_endpoint.to_owned();
