@@ -3,8 +3,10 @@
 AWS-unique settings:
 
 - `platform: aws`, because gossip is UDP and the default load balancer carries none.
-- `peers`, the other sites' NAT addresses, which become the SWIM seeds and both Services'
-  source ranges.
+- `peers`, the other sites' NAT addresses, which become both Services' source ranges. A NAT
+  address accepts nothing unsolicited, so it is no use as a seed.
+- `grid.seeds`, the other sites' SWIM Service hostnames (each one's NLB DNS name), which the
+  chart gives the SWIM port.
 - `host` as a DNS name, since it joins the serving certificate's DNS names only.
 
 ## Before you start
@@ -15,6 +17,15 @@ A public Route53 zone for the base domain, and each cluster's NAT address:
 aws ec2 describe-nat-gateways --filter Name=vpc-id,Values=<vpc> \
   --query 'NatGateways[].NatGatewayAddresses[].PublicIp' --output text
 ```
+
+Each site's SWIM Service hostname, once its operator is installed:
+
+```bash
+oc get svc -n grid grid-operator-swim -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'
+```
+
+A Route53 name pointing at it works the same, and keeps the other sites' values unchanged if
+the NLB is ever replaced.
 
 Give each cluster a distinct `machineNetwork`, or clusters sharing `10.0.0.0/16` cannot be
 peered and cross-site traffic takes the internet. Pin each to one availability zone: a zone
@@ -100,7 +111,7 @@ Then the operator on each cluster:
 helm install grid-operator charts/grid-operator -n grid --create-namespace \
   --set crds.enabled=false \
   --set platform=aws \
-  --set peers='<other site> <hub>' \
+  --set peers='<other site NAT> <hub NAT>' \
   --set swim.siteName=site-1 \
   --set grid.id=aws \
   --set enrollment.enabled=true \
@@ -113,6 +124,16 @@ helm install grid-operator charts/grid-operator -n grid --create-namespace \
 ```
 
 The hub adds `--set enrollment.enabled=false`; its identity comes from the bootstrap Job.
+
+A SWIM hostname exists only once that site's Service does, so seeding takes a second pass.
+Until then the seeds come from `peers`, NAT addresses that never answer, which is harmless.
+Once every `grid-operator-swim` Service shows a hostname, point each cluster, hub included,
+at the others:
+
+```bash
+helm upgrade grid-operator charts/grid-operator -n grid --reuse-values \
+  --set grid.seeds='<other site SWIM> <hub SWIM>'
+```
 
 ## Verify
 
@@ -133,7 +154,8 @@ handshake, so a connect proves nothing.
 | CA bootstrap Job gives `401 Unauthorized` | Its ServiceAccount is gone, removed with the hook RBAC after a failed attempt. Uninstall, delete leftover `grid-ca-*`, `enrollment-serving-tls` and `grid-site-identity` Secrets in both namespaces, install again. |
 | A site never reaches `Available` | The hub is not accepting that site's NAT address on 6443 or 443. |
 | Signals poll but gossip never converges | The SWIM Service got a Classic load balancer, which carries no UDP. Check `platform: aws`. |
-| Peers unreachable despite correct addresses | Source ranges list VPC CIDRs rather than NAT addresses. |
+| No member is ever discovered, and `GRID_SWIM_SEEDS` holds the NAT addresses | `grid.seeds` is empty, so the seeds came from `peers`, which never listen. Set it to the other sites' SWIM Service hostnames. |
+| Seeds are the SWIM hostnames, yet peers never answer | Source ranges list VPC CIDRs rather than NAT addresses. |
 | `swimKeyRef ... did not resolve to a valid 32-byte key` | The Secret is absent from the operator's namespace, or its `key` field is missing, or the value is not exactly 32 bytes. Reconciliation retries every 30 seconds, so correcting it is enough. |
 | `no matches for kind "GridNetwork"` on a first install | The chart renders CRDs and their resources in one release. Apply the CRDs first, then install with `crds.enabled=false`. |
 | `cannot be imported into the current release: invalid ownership metadata` | CRDs applied by hand carry no Helm ownership. Install with `crds.enabled=false`. |
