@@ -34,9 +34,10 @@ flowchart LR
 
 Dashed connections carry control-plane state. Solid connections carry inference
 requests. The operator remains outside the request path. A consumer gateway can
-call a local backend or external API directly, or route through another site's
-provider gateway. Provider credentials belong at the gateway making the final
-backend call; overlays contain credential references, not tokens.
+call external APIs and non-private local backends directly. Private inference
+requests must go through a provider gateway, even within the same site.
+Provider credentials belong at the gateway making the final backend call;
+overlays contain credential references, not tokens.
 
 [Enrollment](charts/grid-enrollment/README.md) provides optional site-identity
 bootstrap. The [fleet dashboard](fleet-dashboard/README.md) provides an optional
