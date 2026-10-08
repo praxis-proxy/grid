@@ -28,7 +28,7 @@ use serde::Serialize;
 use super::{
     DemoMode, GlbDemoOptions, certs,
     external_provider::{self, ExternalProviderDescriptor},
-    glb, kubectl, operator,
+    glb, kubectl, operator, safe_truncate_str,
 };
 
 // -----------------------------------------------------------------------------
@@ -831,6 +831,55 @@ fn response_status(output: &[u8]) -> Option<u16> {
         let mut fields = line.split_whitespace();
         (fields.next()?.starts_with("HTTP/")).then(|| fields.next()?.parse().ok())?
     })
+}
+
+/// Return a bounded curl transport diagnostic without retaining response
+/// bodies or other unstructured command output in evidence.
+fn curl_transport_error(output: &std::process::Output) -> Option<String> {
+    for bytes in [output.stdout.as_slice(), output.stderr.as_slice()] {
+        if let Some(line) = String::from_utf8_lossy(bytes)
+            .lines()
+            .find(|line| line.trim_start().starts_with("curl:"))
+        {
+            return Some(safe_truncate_str(line.trim(), 200));
+        }
+    }
+    None
+}
+
+/// Record the transport facts needed to distinguish an HTTP rejection from a
+/// probe that never received an HTTP response. `run_curl_probe` returns the
+/// kubectl process result, so the evidence names that boundary explicitly.
+fn record_negative_probe_facts(
+    observed_facts: &mut BTreeMap<String, serde_json::Value>,
+    prefix: &str,
+    output: &std::process::Output,
+    status: &str,
+    rejected: bool,
+) {
+    observed_facts.insert(
+        format!("{prefix}_http_status"),
+        serde_json::Value::String(status.to_owned()),
+    );
+    observed_facts.insert(
+        format!("{prefix}_response_received"),
+        serde_json::Value::Bool(!status.is_empty()),
+    );
+    observed_facts.insert(
+        format!("{prefix}_kubectl_process_success"),
+        serde_json::Value::Bool(output.status.success()),
+    );
+    observed_facts.insert(
+        format!("{prefix}_kubectl_exit_code"),
+        output
+            .status
+            .code()
+            .map_or(serde_json::Value::Null, |code| serde_json::json!(code)),
+    );
+    observed_facts.insert(format!("{prefix}_rejected"), serde_json::Value::Bool(rejected));
+    if let Some(error) = curl_transport_error(output) {
+        observed_facts.insert(format!("{prefix}_transport_error"), serde_json::Value::String(error));
+    }
 }
 
 /// Require the complete trusted attribution set for a primary response.
@@ -3175,6 +3224,7 @@ fn assert_negative_routing() -> AssertionResult {
         &[
             "curl",
             "-s",
+            "--show-error",
             "-o",
             "/dev/null",
             "-w",
@@ -3188,17 +3238,13 @@ fn assert_negative_routing() -> AssertionResult {
     )?;
 
     let invalid_model_status = String::from_utf8_lossy(&invalid_model_output.stdout).trim().to_owned();
-    let invalid_model_rejected = !invalid_model_output.status.success()
-        || invalid_model_status.starts_with('4')
-        || invalid_model_status.starts_with('5');
-
-    observed_facts.insert(
-        "invalid_model_http_status".to_owned(),
-        serde_json::Value::String(invalid_model_status),
-    );
-    observed_facts.insert(
-        "invalid_model_rejected".to_owned(),
-        serde_json::Value::Bool(invalid_model_rejected),
+    let invalid_model_rejected = invalid_model_status.starts_with('4') || invalid_model_status.starts_with('5');
+    record_negative_probe_facts(
+        &mut observed_facts,
+        "invalid_model",
+        &invalid_model_output,
+        &invalid_model_status,
+        invalid_model_rejected,
     );
 
     if !invalid_model_rejected {
@@ -3212,6 +3258,7 @@ fn assert_negative_routing() -> AssertionResult {
         &[
             "curl",
             "-s",
+            "--show-error",
             "-o",
             "/dev/null",
             "-w",
@@ -3223,17 +3270,13 @@ fn assert_negative_routing() -> AssertionResult {
     )?;
 
     let invalid_path_status = String::from_utf8_lossy(&invalid_path_output.stdout).trim().to_owned();
-    let invalid_path_rejected = !invalid_path_output.status.success()
-        || invalid_path_status.starts_with('4')
-        || invalid_path_status.starts_with('5');
-
-    observed_facts.insert(
-        "invalid_path_http_status".to_owned(),
-        serde_json::Value::String(invalid_path_status),
-    );
-    observed_facts.insert(
-        "invalid_path_rejected".to_owned(),
-        serde_json::Value::Bool(invalid_path_rejected),
+    let invalid_path_rejected = invalid_path_status.starts_with('4') || invalid_path_status.starts_with('5');
+    record_negative_probe_facts(
+        &mut observed_facts,
+        "invalid_path",
+        &invalid_path_output,
+        &invalid_path_status,
+        invalid_path_rejected,
     );
 
     if !invalid_path_rejected {
@@ -3247,6 +3290,7 @@ fn assert_negative_routing() -> AssertionResult {
         &[
             "curl",
             "-s",
+            "--show-error",
             "-o",
             "/dev/null",
             "-w",
@@ -3260,17 +3304,13 @@ fn assert_negative_routing() -> AssertionResult {
     )?;
 
     let malformed_body_status = String::from_utf8_lossy(&malformed_body_output.stdout).trim().to_owned();
-    let malformed_body_rejected = !malformed_body_output.status.success()
-        || malformed_body_status.starts_with('4')
-        || malformed_body_status.starts_with('5');
-
-    observed_facts.insert(
-        "malformed_body_http_status".to_owned(),
-        serde_json::Value::String(malformed_body_status),
-    );
-    observed_facts.insert(
-        "malformed_body_rejected".to_owned(),
-        serde_json::Value::Bool(malformed_body_rejected),
+    let malformed_body_rejected = malformed_body_status.starts_with('4') || malformed_body_status.starts_with('5');
+    record_negative_probe_facts(
+        &mut observed_facts,
+        "malformed_body",
+        &malformed_body_output,
+        &malformed_body_status,
+        malformed_body_rejected,
     );
 
     if !malformed_body_rejected {
