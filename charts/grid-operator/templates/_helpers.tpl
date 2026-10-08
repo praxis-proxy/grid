@@ -112,6 +112,7 @@ Service. Without enrollment nothing changes.
 {{- $svc := $v.swim.service }}
 {{- $grid := $v.grid | default dict }}
 {{- with ($v.site | default dict).name }}{{- if not $v.swim.siteName }}{{- $_ := set $v.swim "siteName" . }}{{- end }}{{- end }}
+{{- with $grid.seeds }}{{- $_ := set $grid "seeds" (include "grid-operator.seedList" (dict "raw" . "port" ($svc.port | default 7946)) | fromYamlArray) }}{{- end }}
 {{- with $grid.seeds }}{{- if not $v.swim.seeds }}{{- $_ := set $v.swim "seeds" (join "," .) }}{{- end }}{{- end }}
 {{- if $grid.id }}
 {{- if eq ($grid.signals | default "") "poll" }}{{- $_ := set $v.signals "enabled" true }}{{- end }}
@@ -171,9 +172,9 @@ RUST_LOG for the chart's Rust binaries: log.filter when set, else log.level.
 {{- end }}
 {{- end -}}
 
-{{/* `peers` as a list. Spaces or commas, so one `--set` needs no braces. */}}
-{{- define "grid-operator.peerList" -}}
-{{- $raw := .Values.peers | default "" | replace "," " " -}}
+{{/* A value separated by spaces or commas, as a list, so one `--set` needs no braces. */}}
+{{- define "grid-operator.entryList" -}}
+{{- $raw := . | default "" | replace "," " " -}}
 {{- $out := list -}}
 {{- range (splitList " " $raw) -}}
 {{- $p := trim . -}}
@@ -197,18 +198,21 @@ RUST_LOG for the chart's Rust binaries: log.filter when set, else log.level.
 {{- end -}}
 {{- end -}}
 
-{{/* `swim.seeds` when set, else each peer at the SWIM port. */}}
+{{/* `raw`, a list or a string in the `peers` shape, as a list of SWIM endpoints at `port`. */}}
+{{- define "grid-operator.seedList" -}}
+{{- $raw := .raw -}}
+{{- if kindIs "slice" $raw -}}{{- $raw = join " " $raw -}}{{- end -}}
+{{- $out := list -}}
+{{- range (include "grid-operator.entryList" $raw | fromYamlArray) -}}
+{{- $out = append $out (include "grid-operator.swimEndpoint" (dict "entry" . "port" $.port)) -}}
+{{- end -}}
+{{- toYaml $out -}}
+{{- end -}}
+
+{{/* `swim.seeds` when set, else `peers`, as comma-joined SWIM endpoints at the SWIM port. */}}
 {{- define "grid-operator.swimSeeds" -}}
-{{- if .Values.swim.seeds -}}
-{{- .Values.swim.seeds -}}
-{{- else -}}
 {{- $port := (.Values.swim.service).port | default 7946 -}}
-{{- $seeds := list -}}
-{{- range (include "grid-operator.peerList" . | fromYamlArray) -}}
-{{- $seeds = append $seeds (include "grid-operator.swimEndpoint" (dict "entry" . "port" $port)) -}}
-{{- end -}}
-{{- join "," $seeds -}}
-{{- end -}}
+{{- include "grid-operator.seedList" (dict "raw" (.Values.swim.seeds | default .Values.peers) "port" $port) | fromYamlArray | join "," -}}
 {{- end -}}
 
 {{/* `own` when set, else each peer as a host route. A name yields none: no CIDR to derive. */}}
@@ -218,7 +222,7 @@ RUST_LOG for the chart's Rust binaries: log.filter when set, else log.level.
 {{- toYaml $own -}}
 {{- else -}}
 {{- $ranges := list -}}
-{{- range (include "grid-operator.peerList" .root | fromYamlArray) -}}
+{{- range (include "grid-operator.entryList" .root.Values.peers | fromYamlArray) -}}
 {{- if regexMatch "^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$" . -}}
 {{/* 300.0.0.1 matches the shape; an out-of-range octet would make a CIDR the API rejects,
      taking the Service with it, so refuse to render instead. */}}

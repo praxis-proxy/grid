@@ -22,7 +22,9 @@ grid:
   # Empty keeps the GridNetwork default, gossip. The operator also starts in it before any
   # GridNetwork exists, so a poll install never restarts once its network appears.
   signals: ""
-  # -- SWIM seed endpoints (ip:port, [ipv6]:port, or hostname:port). Defaults swim.seeds.
+  # -- SWIM seed endpoints, where each peer's SWIM Service listens: a list, or one string
+  # separated by spaces or commas. A bare host or address gets swim.service.port, and
+  # host:port or [ipv6]:port is taken as given. Defaults swim.seeds.
   seeds: []
   # -- Secret holding the grid's SWIM key (key, 32 bytes). Empty runs SWIM without one.
   swimKeySecretName: grid-swim-key
@@ -158,7 +160,7 @@ swim:
   requireKey: true
   # -- Bootstrap SWIM site name. Defaults to enrollment.siteName when enrollment is on.
   siteName: ""
-  # -- Bootstrap SWIM seed endpoints (comma-separated ip:port, [ipv6]:port, or hostname:port).
+  # -- Bootstrap SWIM seed endpoints, separated by spaces or commas, as grid.seeds.
   seeds: ""
   # -- SWIM Service.
   service:
@@ -179,15 +181,17 @@ swim:
     # -- Optional CIDRs allowed to reach the SWIM and signals LoadBalancer, where it enforces them.
     loadBalancerSourceRanges: []
 
-# -- mTLS signals endpoint, for a GridNetwork with signalTransport poll.
 # -- Cloud the grid runs on. `aws` asks for an NLB, since the default carries no UDP.
 platform: ""
 
 # -- The grid's other sites, separated by spaces or commas. Each becomes a SWIM seed and,
-# if a bare IPv4 address, a host route in both Services. swim.seeds and either Service's
-# loadBalancerSourceRanges override it.
+# if a bare IPv4 address, a host route in both Services. That fits a peer that listens on
+# the address it egresses from. Where they differ, as on AWS (NAT address out, SWIM Service
+# hostname in), list the NAT addresses here and the SWIM hostnames in grid.seeds. Either
+# seed key overrides the seeds, and either Service's loadBalancerSourceRanges the routes.
 peers: ""
 
+# -- mTLS signals endpoint, for a GridNetwork with signalTransport poll.
 signals:
   # -- Serve this site's signals endpoint for peers to poll.
   enabled: false

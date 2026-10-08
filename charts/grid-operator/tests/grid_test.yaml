@@ -171,3 +171,18 @@ tests:
           path: spec.gridNetworkRef
           value: "yes"
         template: templates/inferenceprovider.yaml
+
+  - it: gives a bare seed the SWIM port in the GridNetwork and the operator alike
+    set:
+      site.name: east
+      grid.id: lab
+      grid.seeds: ["swim-a.example.com", "192.0.2.10"]
+    asserts:
+      - template: templates/gridnetwork.yaml
+        equal:
+          path: spec.seeds
+          value: ["swim-a.example.com:7946", "192.0.2.10:7946"]
+      - template: templates/deployment.yaml
+        contains:
+          path: spec.template.spec.containers[0].env
+          content: {name: GRID_SWIM_SEEDS, value: "swim-a.example.com:7946,192.0.2.10:7946"}

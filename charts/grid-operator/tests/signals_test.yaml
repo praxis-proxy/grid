@@ -3,6 +3,7 @@ templates:
   - templates/deployment.yaml
   - templates/service-swim.yaml
   - templates/service-signals.yaml
+  - templates/gridnetwork.yaml
 release:
   name: grid
   namespace: grid-system
@@ -134,6 +135,7 @@ tests:
   - it: starts the operator in the declared modes, so its GridNetwork appearing restarts nothing
     set:
       grid.id: grid-1
+      site.name: east
       grid.signals: poll
       grid.peerTrust: pin
       signals.enabled: true
@@ -164,23 +166,23 @@ tests:
             name: GRID_PEER_TRUST
           any: true
 
-  - it: takes peers as one flag, feeding the seeds and both source ranges
+  - it: takes peers that listen where they egress as one flag, feeding the seeds and both source ranges
     set:
       platform: aws
       signals.enabled: true
       swim.service.enabled: true
       swim.service.type: LoadBalancer
-      peers: "54.244.133.77 32.188.215.118, peer-a.example.com"
+      peers: "203.0.113.1 203.0.113.2, peer-a.example.com"
     asserts:
       # A name cannot become a host route, so it seeds but contributes no range.
       - template: templates/service-swim.yaml
         equal:
           path: spec.loadBalancerSourceRanges
-          value: ["54.244.133.77/32", "32.188.215.118/32"]
+          value: ["203.0.113.1/32", "203.0.113.2/32"]
       - template: templates/service-signals.yaml
         equal:
           path: spec.loadBalancerSourceRanges
-          value: ["54.244.133.77/32", "32.188.215.118/32"]
+          value: ["203.0.113.1/32", "203.0.113.2/32"]
       - template: templates/service-signals.yaml
         equal:
           path: metadata.annotations["service.beta.kubernetes.io/aws-load-balancer-type"]
@@ -190,7 +192,37 @@ tests:
           path: spec.template.spec.containers[0].env
           content:
             name: GRID_SWIM_SEEDS
-            value: "54.244.133.77:7946,32.188.215.118:7946,peer-a.example.com:7946"
+            value: "203.0.113.1:7946,203.0.113.2:7946,peer-a.example.com:7946"
+
+  - it: seeds an AWS site from its peers' SWIM hostnames while their NAT addresses keep the source ranges
+    set:
+      platform: aws
+      grid.id: aws
+      site.name: east
+      signals.enabled: true
+      swim.service.enabled: true
+      swim.service.type: LoadBalancer
+      peers: "203.0.113.10 203.0.113.20"
+      grid.seeds: "swim-a.elb.example.com swim-b.elb.example.com"
+    asserts:
+      - template: templates/service-swim.yaml
+        equal:
+          path: spec.loadBalancerSourceRanges
+          value: ["203.0.113.10/32", "203.0.113.20/32"]
+      - template: templates/service-signals.yaml
+        equal:
+          path: spec.loadBalancerSourceRanges
+          value: ["203.0.113.10/32", "203.0.113.20/32"]
+      - template: templates/deployment.yaml
+        contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: GRID_SWIM_SEEDS
+            value: "swim-a.elb.example.com:7946,swim-b.elb.example.com:7946"
+      - template: templates/gridnetwork.yaml
+        equal:
+          path: spec.seeds
+          value: ["swim-a.elb.example.com:7946", "swim-b.elb.example.com:7946"]
 
   - it: lets explicit seeds and ranges override peers
     set:
@@ -215,6 +247,27 @@ tests:
           content:
             name: GRID_SWIM_SEEDS
             value: "seed-a:7946"
+
+  - it: takes swim.seeds in the peers shape at the Service port, without deriving source ranges from it
+    set:
+      signals.enabled: true
+      swim.service.enabled: true
+      swim.service.type: LoadBalancer
+      swim.service.port: 7947
+      swim.seeds: "seed-a:7946, 2001:db8::1 [2001:db8::2]:7948 10.0.0.9 swim-b.example.com"
+    asserts:
+      - template: templates/service-swim.yaml
+        notExists:
+          path: spec.loadBalancerSourceRanges
+      - template: templates/service-signals.yaml
+        notExists:
+          path: spec.loadBalancerSourceRanges
+      - template: templates/deployment.yaml
+        contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: GRID_SWIM_SEEDS
+            value: "seed-a:7946,[2001:db8::1]:7947,[2001:db8::2]:7948,10.0.0.9:7947,swim-b.example.com:7947"
 
   - it: reads a peer's colons as the operator does, bracketing only a bare IPv6 address
     set:

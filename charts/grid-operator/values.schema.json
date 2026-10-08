@@ -64,8 +64,11 @@
           ]
         },
         "seeds": {
-          "description": "SWIM seed endpoints. Defaults swim.seeds.",
-          "type": "array",
+          "description": "SWIM seed endpoints, a list or one string separated by spaces or commas. A bare host or address gets swim.service.port. Defaults swim.seeds.",
+          "type": [
+            "array",
+            "string"
+          ],
           "items": {
             "type": "string",
             "minLength": 1
@@ -372,7 +375,7 @@
         },
         "seeds": {
           "type": "string",
-          "description": "Bootstrap SWIM seed addresses (comma-separated)."
+          "description": "Bootstrap SWIM seed endpoints, separated by spaces or commas, as grid.seeds."
         },
         "service": {
           "type": "object",
@@ -793,6 +796,7 @@
       ]
     },
     "peers": {
+      "description": "The grid's other sites, separated by spaces or commas: SWIM seeds unless a seed key is set, and host routes for the bare IPv4 addresses.",
       "type": "string"
     }
   }
