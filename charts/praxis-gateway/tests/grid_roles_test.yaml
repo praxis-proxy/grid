@@ -128,6 +128,14 @@ tests:
       - failedTemplate:
           errorPattern: "image.flavor grid-gateway"
 
+  - it: a provider rejects api-key caller authentication
+    template: templates/deployment.yaml
+    set:
+      praxisConfig.render.auth.mode: api-key
+    asserts:
+      - failedTemplate:
+          errorPattern: "api-key is only supported for consumers"
+
   - it: renders connect timeouts only when set
     template: templates/gateway-config.yaml
     asserts:
@@ -265,11 +273,18 @@ tests:
     template: templates/deployment.yaml
     set:
       providerCredentials:
-        - secretName: model-api-key
+        - secretName: model.api-key
     asserts:
       - contains:
           path: spec.template.spec.containers[0].volumeMounts
           content:
-            name: credential-model-api-key
-            mountPath: /run/secrets/grid-credentials/model-api-key
+            name: credential-0
+            mountPath: /run/secrets/grid-credentials/model.api-key
             readOnly: true
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: credential-0
+            secret:
+              secretName: model.api-key
+              optional: false

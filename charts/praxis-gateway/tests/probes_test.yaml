@@ -51,7 +51,7 @@ tests:
           path: spec.template.spec.containers[?(@.name == "praxis")].livenessProbe.exec.command[4]
           value: http://127.0.0.1:9901/healthy
 
-  - it: follows the admin port that config.inline sets
+  - it: follows the admin port that praxisConfig.byo.inline sets
     set:
       praxisConfig.byo:
         inline: |
@@ -65,7 +65,7 @@ tests:
           path: spec.template.spec.containers[?(@.name == "praxis")].readinessProbe.exec.command[4]
           value: http://127.0.0.1:9911/ready
 
-  - it: keeps the TCP probe on the listener when config.inline has no admin listener
+  - it: keeps the TCP probe on the listener when praxisConfig.byo.inline has no admin listener
     set:
       praxisConfig.byo:
         inline: |
@@ -107,7 +107,7 @@ tests:
           path: spec.template.spec.containers[?(@.name == "praxis")].livenessProbe.tcpSocket.port
           value: http
 
-  - it: refuses a TCP probe on a TLS listener when config.inline has no admin listener
+  - it: refuses a TCP probe on a TLS listener when praxisConfig.byo.inline has no admin listener
     set:
       praxisConfig.byo:
         inline: |
@@ -191,7 +191,7 @@ tests:
           path: spec.template.spec.containers[?(@.name == "praxis")].livenessProbe.exec.command
           value: ["/usr/local/bin/healthcheck", "--timeout", "2", "http://127.0.0.1:9901/healthy"]
 
-  - it: probes /healthy for readiness when config.inline defines clusters
+  - it: probes /healthy for readiness when praxisConfig.byo.inline defines clusters
     set:
       praxisConfig.byo:
         inline: |
@@ -230,7 +230,7 @@ tests:
           path: spec.template.spec.containers[?(@.name == "praxis")].readinessProbe.exec.command[4]
           value: http://127.0.0.1:9901/healthy
 
-  - it: refuses a /ready probe when config.inline defines clusters
+  - it: refuses a /ready probe when praxisConfig.byo.inline defines clusters
     set:
       praxisConfig.byo:
         inline: |

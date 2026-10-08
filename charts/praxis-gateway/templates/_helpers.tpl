@@ -140,7 +140,13 @@ Validate praxisConfig: the source, and that each source gets only the settings i
 */}}
 {{- define "praxis-gateway.validateConfig" -}}
 {{- $source := .Values.praxisConfig.source }}
-{{- $telemetry := .Values.praxisConfig.render.telemetry | default dict }}
+{{- $render := .Values.praxisConfig.render | default dict }}
+{{- $provider := eq ($render.role | default "consumer") "provider" }}
+{{- $auth := $render.auth | default dict }}
+{{- $peerTrust := $render.peerTrust | default dict }}
+{{- $validateCA := $auth.validateCA | default dict }}
+{{- $gridServing := $render.gridServing | default dict }}
+{{- $telemetry := $render.telemetry | default dict }}
 {{- if $telemetry.enabled }}
 {{- if ne .Values.image.flavor "grid-gateway" }}
 {{- fail "praxisConfig.render.telemetry.enabled needs image.flavor grid-gateway, whose Grid gateway build includes the OTLP and AI routing span features" }}
@@ -153,13 +159,12 @@ Validate praxisConfig: the source, and that each source gets only the settings i
 {{- fail (printf "praxisConfig.source must be byo, operator, or render, got %q" (toString $source)) }}
 {{- end }}
 {{- if ne $source "render" }}
-{{- $render := .Values.praxisConfig.render }}
 {{- range $key := list "model" }}
 {{- if get $render $key }}
 {{- fail (printf "praxisConfig.render.%s is set but praxisConfig.source is %s, which ignores it: set praxisConfig.source to render, or unset it" $key $source) }}
 {{- end }}
 {{- end }}
-{{- if or $render.backends $render.auth.mode $render.telemetry.enabled (eq ($render.role | default "consumer") "provider") ($render.gridServing).enabled }}
+{{- if or $render.backends $auth.mode $telemetry.enabled $provider $gridServing.enabled $peerTrust.certDigests $auth.validateUrl $validateCA.configMapName $validateCA.secretName }}
 {{- fail (printf "praxisConfig.render settings are set but praxisConfig.source is %s, which ignores them: set praxisConfig.source to render, or unset them" $source) }}
 {{- end }}
 {{- end }}
@@ -177,61 +182,65 @@ Validate praxisConfig: the source, and that each source gets only the settings i
 {{- include "praxis-gateway.validateInlineConfig" . }}
 {{- end }}
 {{- if eq $source "render" }}
-{{- $consumer := ne (.Values.praxisConfig.render.role | default "consumer") "provider" }}
 {{- if not (trim (toString .Values.grid.siteName)) }}
 {{- fail "grid.siteName is required when praxisConfig.source is render, and cannot be blank" }}
 {{- end }}
-{{- if and $consumer (not (.Values.praxisConfig.render.gridServing).enabled) (not (trim (toString .Values.praxisConfig.render.model))) }}
+{{- if and (not $provider) (not $gridServing.enabled) (not (trim (toString $render.model))) }}
 {{- fail "praxisConfig.render.model is required for a consumer without praxisConfig.render.gridServing, and cannot be blank" }}
 {{- end }}
-{{- if not (.Values.praxisConfig.render.backends | default list) }}
+{{- if not ($render.backends | default list) }}
 {{- fail "praxisConfig.render.backends needs at least one backend when praxisConfig.source is render" }}
 {{- end }}
-{{- $auth := .Values.praxisConfig.render.auth }}
-{{- if and (not $auth.mode) (ne (.Values.praxisConfig.render.role | default "consumer") "provider") }}
+{{- if and (not $auth.mode) (not $provider) }}
 {{- fail "praxisConfig.render.auth.mode is required when praxisConfig.source is render: api-key (needs an image with praxis-policy 0.4 or later) or none (only behind an authenticating front)" }}
 {{- end }}
-{{- $provider := eq (.Values.praxisConfig.render.role | default "consumer") "provider" }}
 {{- if $provider }}
+{{- if eq ($auth.mode | default "none") "api-key" }}
+{{- fail "praxisConfig.render.auth.mode api-key is only supported for consumers; providers authenticate peers by grid identity" }}
+{{- end }}
 {{- if ne .Values.image.flavor "grid-gateway" }}
 {{- fail "praxisConfig.render.role provider needs image.flavor grid-gateway" }}
 {{- end }}
 {{- if not .Values.gridIdentity.tlsSecretName }}
 {{- fail "praxisConfig.render.role provider needs gridIdentity.tlsSecretName for its client identity and Grid CA" }}
 {{- end }}
-{{- if ne (len .Values.praxisConfig.render.backends) 1 }}
+{{- if ne (len $render.backends) 1 }}
 {{- fail "praxisConfig.render.role provider routes to exactly one local backend" }}
 {{- end }}
 {{- if .Values.listenerTls.secretName }}
 {{- fail "praxisConfig.render.role provider serves the grid identity; unset listenerTls" }}
 {{- end }}
-{{- $trust := .Values.praxisConfig.render.peerTrust | default dict }}
-{{- if eq ($trust.mode | default "pin") "spiffe" }}
-{{- if and (not $trust.spiffeIds) (not $trust.allowAnyGridSite) }}
+{{- if eq ($peerTrust.mode | default "pin") "spiffe" }}
+{{- if and (not $peerTrust.spiffeIds) (not $peerTrust.allowAnyGridSite) }}
 {{- fail "praxisConfig.render.peerTrust spiffe mode needs spiffeIds, or allowAnyGridSite true to admit every Grid-CA site" }}
 {{- end }}
-{{- if and $trust.spiffeIds $trust.allowAnyGridSite }}
+{{- if and $peerTrust.spiffeIds $peerTrust.allowAnyGridSite }}
 {{- fail "praxisConfig.render.peerTrust.allowAnyGridSite admits every Grid-CA site, so it cannot be set beside spiffeIds" }}
 {{- end }}
-{{- $_ := include "praxis-gateway.peerSites" ($trust.spiffeIds | default list) }}
-{{- else if not $trust.certDigests }}
+{{- $_ := include "praxis-gateway.peerSites" ($peerTrust.spiffeIds | default list) }}
+{{- else if not $peerTrust.certDigests }}
 {{- fail "praxisConfig.render.peerTrust pin mode needs certDigests" }}
 {{- end }}
+{{- else if $peerTrust.certDigests }}
+{{- fail "praxisConfig.render.peerTrust.certDigests is only supported for role provider" }}
 {{- end }}
 {{- if and (not $provider) (eq $auth.mode "none") .Values.service.enabled (has .Values.service.type (list "LoadBalancer" "NodePort")) (not $auth.allowUnauthenticatedExposure) }}
 {{- fail (printf "praxisConfig.render.auth.mode none with a %s Service exposes unauthenticated inference; use api-key, a ClusterIP Service behind an authenticating front, or set praxisConfig.render.auth.allowUnauthenticatedExposure" .Values.service.type) }}
 {{- end }}
-{{- if and $auth.validateCA.configMapName $auth.validateCA.secretName }}
+{{- if and $validateCA.configMapName $validateCA.secretName }}
 {{- fail "praxisConfig.render.auth.validateCA: set configMapName or secretName, not both" }}
 {{- end }}
+{{- if and (ne ($auth.mode | default "") "api-key") (or $auth.validateUrl $validateCA.configMapName $validateCA.secretName) }}
+{{- fail "praxisConfig.render.auth.validateUrl and validateCA require auth.mode api-key" }}
+{{- end }}
 {{- if eq $auth.mode "api-key" }}
-{{- if not .Values.praxisConfig.render.auth.validateUrl }}
+{{- if not $auth.validateUrl }}
 {{- fail "praxisConfig.render.auth.validateUrl is required when praxisConfig.render.auth.mode is api-key" }}
 {{- end }}
-{{- if not (hasPrefix "https://" .Values.praxisConfig.render.auth.validateUrl) }}
+{{- if not (hasPrefix "https://" $auth.validateUrl) }}
 {{- fail "praxisConfig.render.auth.validateUrl must be https: a plaintext validate call ships the credential in the clear" }}
 {{- end }}
-{{- if regexMatch "^https://(\\[|[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+([:/]|$))" .Values.praxisConfig.render.auth.validateUrl }}
+{{- if regexMatch "^https://(\\[|[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+([:/]|$))" $auth.validateUrl }}
 {{- fail "praxisConfig.render.auth.validateUrl must name a host, not an IP address: https to an IP literal has no SNI to verify" }}
 {{- end }}
 {{- /* The chart-default image predates praxis-policy 0.4, which adds identity/api-key. */}}

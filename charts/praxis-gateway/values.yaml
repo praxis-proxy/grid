@@ -196,10 +196,11 @@ praxisConfig:
     # praxisConfig.render.gridServing needs it.
     model: ""
     auth:
-      # -- Caller authentication, required when source is render. api-key validates the
-      # caller's key against validateUrl and needs an image whose policy engine registers
-      # identity/api-key (praxis-policy 0.4 or later); the render refuses it on the default
-      # ai:0.4.0 image. none
+      # -- Caller authentication, required when source is render. api-key validates a
+      # consumer caller's key against validateUrl and needs an image whose policy engine
+      # registers identity/api-key (praxis-policy 0.4 or later); provider role rejects it
+      # because providers authenticate peers by Grid identity. The render refuses it on
+      # the default ai:0.4.0 image. none
       # renders no policy filter and belongs only behind an authenticating front.
       # TODO: default to api-key once the default image carries praxis-policy 0.4.
       mode: ""

@@ -332,7 +332,7 @@
                     "none",
                     "api-key"
                   ],
-                  "description": "Caller authentication, required when praxisConfig.source is render. api-key needs an image that registers identity/api-key."
+                  "description": "Caller authentication, required for a render consumer. api-key needs an image that registers identity/api-key; provider role rejects it because providers authenticate peers by Grid identity."
                 },
                 "allowUnauthenticatedExposure": {
                   "type": "boolean",

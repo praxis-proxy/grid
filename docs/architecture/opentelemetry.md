@@ -36,9 +36,18 @@ image:
   flavor: grid-gateway
 grid:
   siteName: edge
+gridIdentity:
+  tlsSecretName: grid-site-identity
+  caSecretName: grid-ca
 praxisConfig:
   source: render
   render:
+    model: my-model
+    auth:
+      mode: none
+    backends:
+      site-a:
+        endpoint: 203.0.113.20:8080
     telemetry:
       enabled: true
       otlpEndpoint: http://otel-collector.observability:4317

@@ -793,11 +793,8 @@ if helm template v-hc "$GW_DIR" "${R0[@]}" "${BK1[@]}" --set "praxisConfig.rende
 else
   pass "tcp health_check carries no path"
 fi
-if [ "$(helm template v-ca "$GW_DIR" "${R0[@]}" "${BK1[@]}" --set praxisConfig.render.auth.validateCA.configMapName=x | grep -c 'SSL_CERT_FILE')" = 0 ]; then
-  pass "validateCA is ignored outside api-key"
-else
-  fail "validateCA should apply only with api-key"
-fi
+try_reject_msg "$GW_DIR" "validateCA without api-key (gw)" "validateUrl and validateCA require auth.mode api-key" \
+  "${R0[@]}" "${BK1[@]}" --set praxisConfig.render.auth.validateCA.configMapName=x
 if helm template v-probe "$GW_DIR" "${GW_REQ[@]}" --set health.readiness.httpGet.path=/ --set health.readiness.httpGet.port=http \
     --show-only templates/deployment.yaml --namespace grid-system | sed -n '/readinessProbe/,/livenessProbe/p' | matches tcpSocket; then
   fail "an httpGet readiness probe should drop the default tcpSocket"
@@ -1351,7 +1348,7 @@ CR_EOF
   if MISSING_OUT=$(helm install test-gateway-missing "$GW_DIR" \
     --namespace grid-system \
     --kube-context "$KCTX" \
-    --set config.existingConfigMap=missing-gateway-config \
+    --set praxisConfig.byo.configMapName=missing-gateway-config \
     --set nameOverride=test-gateway-missing 2>&1); then
     fail "kind: BYO mode accepts a missing ConfigMap"
     helm uninstall test-gateway-missing --namespace grid-system --kube-context "$KCTX" >/dev/null 2>&1 || true
@@ -1854,7 +1851,8 @@ for f in "$HS_VALUES"/*.yaml; do
       chart=charts/grid-site
       extra=("${HS_PINNED[@]}")
       ;;
-    *-praxis-gateway)
+    hub-praxis-gateway) chart=$GW_DIR ;;
+    site-praxis-gateway)
       chart=$GW_DIR
       extra=("${HS_GW_PINNED[@]}")
       ;;

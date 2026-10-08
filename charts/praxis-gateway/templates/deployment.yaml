@@ -317,9 +317,9 @@ spec:
               mountPath: {{ $validateCA.mountPath | quote }}
               readOnly: true
             {{- end }}
-            {{- range .Values.providerCredentials }}
-            - name: credential-{{ .secretName }}
-              mountPath: {{ include "praxis-gateway.providerCredentialPath" . | quote }}
+            {{- range $i, $credential := .Values.providerCredentials }}
+            - name: credential-{{ $i }}
+              mountPath: {{ include "praxis-gateway.providerCredentialPath" $credential | quote }}
               readOnly: true
             {{- end }}
       volumes:
@@ -427,11 +427,11 @@ spec:
           secret:
             secretName: {{ .Values.metricsListener.existingSecret | quote }}
         {{- end }}
-        {{- range .Values.providerCredentials }}
-        - name: credential-{{ .secretName }}
+        {{- range $i, $credential := .Values.providerCredentials }}
+        - name: credential-{{ $i }}
           secret:
-            secretName: {{ .secretName | quote }}
-            optional: {{ .optional | default false }}
+            secretName: {{ $credential.secretName | quote }}
+            optional: {{ $credential.optional | default false }}
         {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:

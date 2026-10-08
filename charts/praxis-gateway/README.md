@@ -89,9 +89,13 @@ These values do not add TLS settings to `praxis.yaml`.
   `tls` transport verifies a server certificate without a client certificate;
   `plaintext` uses no TLS.
 
-Settings of another source fail the install instead of being ignored. For
-example, `praxisConfig.render.backends` with `source: byo` asks you to set
-`source: render`.
+The chart rejects selected render settings when `source` is not `render`:
+non-empty `model`, `backends`, or `auth.mode`; `role: provider`;
+`gridServing.enabled: true`; and `telemetry.enabled: true`. Other
+`praxisConfig.render` values may be accepted and ignored. For example,
+`peerTrust.certDigests` is used only with `source: render` and
+`role: provider`; `auth.validateUrl` and `auth.validateCA` are used only with
+`source: render` and `auth.mode: api-key`.
 
 See the [Praxis configuration reference][praxis-config] and the
 [example configurations][praxis-examples] for what a configuration can do.
@@ -283,7 +287,7 @@ Praxis AI image; these values may advance independently.
 | `praxisConfig.render.provider.allowedPaths` | list | chat, completions, models, embeddings | Exact paths a provider forwards, GET and POST only. Other paths get a 404, other methods a 405. |
 | `grid.networkName` | string | `""` | GridNetwork name for overlay-sidecar scope validation. Required when the sidecar is on. |
 | `grid.siteName` | string | `""` | This gateway's site name. Required for render and when the overlay sidecar is on. A consumer scores locality with it; a provider returns it in `X-Grid-Provider-Site`. |
-| `praxisConfig.render.auth.mode` | string | **required** for a render consumer | `api-key` validates the caller's key and needs an image that registers `identity/api-key` (praxis-policy 0.4 or later); the render refuses it on the default `ai:0.4.0` image (by effective reference; a digest pin of that same image is not detected). `none` renders no policy filter, for use only behind an authenticating front. |
+| `praxisConfig.render.auth.mode` | string | **required** for a render consumer | `api-key` validates a consumer caller's key and needs an image that registers `identity/api-key` (praxis-policy 0.4 or later); provider role rejects it because providers authenticate peers by Grid identity. The render refuses it on the default `ai:0.4.0` image (by effective reference; a digest pin of that same image is not detected). `none` renders no policy filter, for use only behind an authenticating front. |
 | `praxisConfig.render.auth.allowUnauthenticatedExposure` | bool | `false` | With `none`, allow a LoadBalancer or NodePort Service. Without it the render fails. The guard sees only this chart's Service, not `oc expose`, another Service selecting the pod labels, an HTTPRoute, or a hand-made Service with `service.enabled=false`. Use `networkPolicy` for those. |
 | `praxisConfig.render.auth.stripAuthorization` | bool | `true` | Remove the caller's `Authorization` before routing, in either mode. Forwarded grid hops authenticate by mTLS identity. `false` forwards the caller's key or bearer to every backend and cross-site peer, so use it only when the backend validates that same credential. |
 | `praxisConfig.render.auth.validateUrl` | string | **required** for `api-key` | https validate endpoint. |
