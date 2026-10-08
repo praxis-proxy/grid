@@ -2,6 +2,7 @@
 {{- if .Values.grid.id }}
 {{- range $name := keys (.Values.grid.providers | default dict) | sortAlpha }}
 {{- $p := deepCopy (get $.Values.grid.providers $name | default dict) }}
+{{- include "grid-operator.normalize-inference-provider" $p }}
 {{- $model := $p.model | default $name }}
 {{- $_ := unset $p "model" }}
 {{- $defaults := dict "name" $name "gridNetworkRef" $.Values.grid.network "providerKind" "vllm" "backendKind" "local_model" "models" (list (dict "name" $model "capabilities" (list "text_generation"))) }}
@@ -23,8 +24,8 @@ spec:
   {{- with .capacityWeight }}
   capacityWeight: {{ . }}
   {{- end }}
-  {{- with .routingClusterRef }}
-  routingClusterRef: {{ . | quote }}
+  {{- with .clusterName }}
+  clusterName: {{ . | quote }}
   {{- end }}
   {{- with .siteSelector }}
   siteSelector:
@@ -54,8 +55,8 @@ spec:
   metricsConfig:
     {{- toYaml . | nindent 4 }}
   {{- end }}
-  {{- with .gatewayRef }}
-  gatewayRef: {{ . | quote }}
+  {{- with .providerGateway }}
+  providerGateway: {{ . | quote }}
   {{- end }}
   {{- with .trafficPolicy }}
   trafficPolicy:
