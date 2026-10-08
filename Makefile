@@ -183,13 +183,13 @@ overlay-sync-image: | require-container-engine
 	$(CONTAINER_ENGINE) build $(BUILD_ARGS) -f overlay-sync/Containerfile -t grid-overlay-sync:latest .
 
 fleet-dashboard-image: | require-container-engine
-	$(CONTAINER_ENGINE) build $(BUILD_ARGS) -f fleet-dashboard/Containerfile -t grid-fleet-dashboard:latest .
+	$(CONTAINER_ENGINE) build $(BUILD_ARGS) -f crates/fleet-dashboard/Containerfile -t grid-fleet-dashboard:latest .
 
-# Builds the dashboard UI and stages it where fleet-dashboard/build.rs embeds it.
+# Builds the dashboard UI and stages it where crates/fleet-dashboard/build.rs embeds it.
 fleet-dashboard-web:
-	npm --prefix fleet-dashboard/web ci --no-audit --no-fund
-	npm --prefix fleet-dashboard/web run build
-	rm -rf fleet-dashboard/webui/dist && mkdir -p fleet-dashboard/webui && cp -r fleet-dashboard/web/dist fleet-dashboard/webui/dist
+	npm --prefix crates/fleet-dashboard/web ci --no-audit --no-fund
+	npm --prefix crates/fleet-dashboard/web run build
+	rm -rf crates/fleet-dashboard/webui/dist && mkdir -p crates/fleet-dashboard/webui && cp -r crates/fleet-dashboard/web/dist crates/fleet-dashboard/webui/dist
 
 # GLB demo images — deterministic :glb-demo tags, no :latest dependency.
 glb-demo-images: | require-container-engine

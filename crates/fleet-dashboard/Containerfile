@@ -4,7 +4,7 @@
 # embedded into the Rust binary by its build script.
 #
 # Usage:
-#   docker build -t grid-fleet-dashboard:latest -f fleet-dashboard/Containerfile .
+#   docker build -t grid-fleet-dashboard:latest -f crates/fleet-dashboard/Containerfile .
 
 # ------------------------------------------------------------------------------
 # Stage 1: Web UI
@@ -14,10 +14,10 @@ FROM node:22-alpine AS web
 
 WORKDIR /src
 
-COPY fleet-dashboard/web/package.json fleet-dashboard/web/package-lock.json ./
+COPY crates/fleet-dashboard/web/package.json crates/fleet-dashboard/web/package-lock.json ./
 RUN npm ci --no-audit --no-fund
 
-COPY fleet-dashboard/web/ ./
+COPY crates/fleet-dashboard/web/ ./
 RUN npm run build
 
 # ------------------------------------------------------------------------------
@@ -42,7 +42,7 @@ ENV GRID_GIT_COMMIT=$GRID_GIT_COMMIT \
 WORKDIR /src
 
 COPY . .
-COPY --from=web /src/dist ./fleet-dashboard/webui/dist
+COPY --from=web /src/dist ./crates/fleet-dashboard/webui/dist
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \

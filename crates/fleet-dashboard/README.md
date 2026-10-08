@@ -42,7 +42,7 @@ the EPP.
 
 ```bash
 oc config use-context <hub-context>
-helm upgrade --install grid-fleet-dashboard fleet-dashboard/charts/grid-fleet-dashboard \
+helm upgrade --install grid-fleet-dashboard crates/fleet-dashboard/charts/grid-fleet-dashboard \
   --namespace aigrid-fleet --create-namespace \
   --set hub.name=<hub-name> --set hub.region=<hub-region>
 oc -n aigrid-fleet get route grid-fleet-dashboard -o jsonpath='https://{.spec.host}{"\n"}'
@@ -71,7 +71,7 @@ kubeconfig needs cluster-admin, because the script creates a `ClusterRoleBinding
 on the spoke.
 
 ```bash
-fleet-dashboard/hack/register-site.sh aigrid-ds-spoke1 \
+crates/fleet-dashboard/hack/register-site.sh aigrid-ds-spoke1 \
   --spoke-kubeconfig ~/.kube/aigrid-ds/spoke1.kubeconfig \
   --hub-kubeconfig   ~/.kube/aigrid-ds/hub.kubeconfig \
   --region us-east-2 --display-name Ohio --dc aws-us-east-2
@@ -86,7 +86,7 @@ What it does:
 3. On the hub: Secret `site-<name>` with the token and the spoke's CA, and an
    entry in the registry `ConfigMap` with the site's region and metrics URL.
 
-`fleet-dashboard/hack/unregister-site.sh <name>` reverses it.
+`crates/fleet-dashboard/hack/unregister-site.sh <name>` reverses it.
 
 ## Values reference
 
@@ -142,10 +142,10 @@ cargo run -p fleet-dashboard -- --kubeconfig ~/.kube/hub.kubeconfig --namespace 
 cargo test -p fleet-dashboard                    # unit tests and the golden API gate
 make fleet-dashboard-image                       # container image (builds the UI too)
 
-cd fleet-dashboard/web && npm ci && npm run dev  # UI dev server, proxies /api to :8080
-cd fleet-dashboard/web && npm test               # UI tests
+cd crates/fleet-dashboard/web && npm ci && npm run dev  # UI dev server, proxies /api to :8080
+cd crates/fleet-dashboard/web && npm test               # UI tests
 
-UPDATE_GOLDEN=1 fleet-dashboard/hack/helm-template-test.sh   # after an intentional chart change
+UPDATE_GOLDEN=1 crates/fleet-dashboard/hack/helm-template-test.sh   # after an intentional chart change
 ```
 
 To run the binary with the real UI outside a container, `make fleet-dashboard-web`

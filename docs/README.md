@@ -32,7 +32,7 @@
 
 ## Operations
 
-- [Fleet Dashboard](../fleet-dashboard/README.md) — optional hub web UI drawing
+- [Fleet Dashboard](../crates/fleet-dashboard/README.md) — optional hub web UI drawing
   every site on a map with health from its own Prometheus; deployed only when
   you install its chart.
 - [Adding an Inference Provider](adding-provider.md) — step-by-step

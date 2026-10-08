@@ -4,11 +4,23 @@ on:
   push:
     branches: [main]
     paths:
-      - "fleet-dashboard/**"
+      - "crates/fleet-dashboard/**"
+      - "version/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".cargo/**"
+      - "rust-toolchain.toml"
+      - ".dockerignore"
       - ".github/workflows/fleet-dashboard.yaml"
   pull_request:
     paths:
-      - "fleet-dashboard/**"
+      - "crates/fleet-dashboard/**"
+      - "version/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".cargo/**"
+      - "rust-toolchain.toml"
+      - ".dockerignore"
       - ".github/workflows/fleet-dashboard.yaml"
 
 permissions:
@@ -20,7 +32,7 @@ jobs:
     runs-on: ubuntu-24.04
     defaults:
       run:
-        working-directory: fleet-dashboard/web
+        working-directory: crates/fleet-dashboard/web
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install
@@ -40,9 +52,9 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Lint
-        run: helm lint fleet-dashboard/charts/grid-fleet-dashboard --strict
+        run: helm lint crates/fleet-dashboard/charts/grid-fleet-dashboard --strict
       - name: Golden templates
-        run: fleet-dashboard/hack/helm-template-test.sh
+        run: crates/fleet-dashboard/hack/helm-template-test.sh
 
   image:
     name: Container image
@@ -50,4 +62,4 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Build
-        run: docker build -f fleet-dashboard/Containerfile -t grid-fleet-dashboard:ci .
+        run: docker build -f crates/fleet-dashboard/Containerfile -t grid-fleet-dashboard:ci .
