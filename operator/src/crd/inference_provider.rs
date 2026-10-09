@@ -158,8 +158,16 @@ pub struct BackendTls {
 
     /// Name to verify against the backend's certificate, and to send as SNI.
     ///
-    /// Omitted uses the endpoint URL host.
-    #[schemars(length(min = 1))]
+    /// Omitted uses the endpoint URL host. Must be a DNS hostname, not an IP
+    /// address, at most 253 characters.
+    #[schemars(
+        length(min = 1, max = 253),
+        regex(pattern = r"^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$"),
+        extend("x-kubernetes-validations" = [{
+            "rule": "!self.matches('(^|[.])[0-9]+$')",
+            "message": "serverName must be a hostname, not an IP address"
+        }])
+    )]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_name: Option<String>,
 }
@@ -1168,6 +1176,34 @@ mod tests {
                 .and_then(serde_json::Value::as_u64),
             Some(1),
             "clientCertificateSecretRef.privateKeyKey must have minLength: 1"
+        );
+    }
+
+    #[test]
+    fn backend_server_name_is_bounded_to_a_hostname_at_admission() {
+        let crd = crd_json();
+        let server_name = crd
+            .pointer(
+                "/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties/backendTls/properties/serverName",
+            )
+            .unwrap_or_else(|| std::process::abort());
+        assert_eq!(
+            server_name.get("maxLength").and_then(serde_json::Value::as_u64),
+            Some(253)
+        );
+        assert!(
+            server_name
+                .get("pattern")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|pattern| pattern.starts_with("^[A-Za-z0-9]")),
+            "a hostname pattern refuses a port, a path, or a space"
+        );
+        assert_eq!(
+            server_name
+                .pointer("/x-kubernetes-validations/0/rule")
+                .and_then(serde_json::Value::as_str),
+            Some("!self.matches('(^|[.])[0-9]+$')"),
+            "a dotted quad fits the pattern, so the last label must not be all digits"
         );
     }
 }

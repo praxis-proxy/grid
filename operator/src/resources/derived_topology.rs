@@ -54,6 +54,8 @@ pub(crate) enum Refusal {
     EndpointPort,
     /// An `https` endpoint named by address with no declared server name.
     ServerNameNeeded,
+    /// The server name to send is not a DNS hostname.
+    ServerNameInvalid,
 }
 
 impl Refusal {
@@ -71,6 +73,7 @@ impl Refusal {
             Self::EndpointUnusable => "endpoint unusable",
             Self::EndpointPort => "endpoint port",
             Self::ServerNameNeeded => "server name needed",
+            Self::ServerNameInvalid => "server name invalid",
         }
     }
 }
@@ -270,11 +273,7 @@ fn derive_local(cluster: &str, provider: &InferenceProvider) -> Result<Resolved,
         _ => return Err(Refusal::EndpointUnusable),
     };
     let port = endpoint_port(&uri, tls).ok_or(Refusal::EndpointPort)?;
-    let backend = provider.spec.backend_tls.as_deref();
-    if tls && !server_name_is_usable(backend, host) {
-        return Err(Refusal::ServerNameNeeded);
-    }
-    let transport = backend_transport(backend, host, tls);
+    let transport = backend_transport(provider.spec.backend_tls.as_deref(), host, tls)?;
     Ok(Resolved {
         endpoint: ClusterEndpointConfig {
             cluster: cluster.to_owned(),
@@ -338,17 +337,25 @@ fn hop_transport(tls: &EgressTls) -> EndpointTransport {
     }
 }
 
-/// Whether a TLS connection to `host` has a name to send; Praxis rejects an IP SNI.
-fn server_name_is_usable(backend: Option<&BackendTls>, host: &str) -> bool {
+/// The SNI to send, declared else the URL host. Praxis refuses a whole document over one bad name.
+fn server_name<'name>(backend: Option<&'name BackendTls>, host: &'name str) -> Result<&'name str, Refusal> {
     let declared = backend
         .and_then(|backend| backend.server_name.as_deref())
         .map(str::trim)
-        .is_some_and(|name| !name.is_empty());
-    declared
-        || host
+        .filter(|name| !name.is_empty());
+    let name = declared.unwrap_or(host);
+    if crate::signals::is_dns_name(name) {
+        Ok(name)
+    } else if declared.is_none()
+        && host
             .trim_matches(|c| c == '[' || c == ']')
             .parse::<std::net::IpAddr>()
-            .is_err()
+            .is_ok()
+    {
+        Err(Refusal::ServerNameNeeded)
+    } else {
+        Err(Refusal::ServerNameInvalid)
+    }
 }
 
 /// The declared port, else the scheme default. `None` for an unrepresentable port.
@@ -367,24 +374,19 @@ fn endpoint_port(uri: &http::Uri, tls: bool) -> Option<u16> {
 }
 
 /// Transport for a local backend. Plaintext drops any SNI, which the renderer rejects.
-fn backend_transport(backend: Option<&BackendTls>, host: &str, tls: bool) -> EndpointTransport {
+fn backend_transport(backend: Option<&BackendTls>, host: &str, tls: bool) -> Result<EndpointTransport, Refusal> {
     if !tls {
-        return EndpointTransport {
+        return Ok(EndpointTransport {
             mode: TransportMode::Plaintext,
             sni: None,
             ca_secret_ref: None,
-        };
+        });
     }
-    let server_name = backend
-        .and_then(|backend| backend.server_name.as_deref())
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .unwrap_or(host);
-    EndpointTransport {
+    Ok(EndpointTransport {
         mode: TransportMode::Tls,
-        sni: Some(server_name.to_owned()),
+        sni: Some(server_name(backend, host)?.to_owned()),
         ca_secret_ref: backend.and_then(|backend| backend.ca_secret_ref.clone()),
-    }
+    })
 }
 
 /// One line naming derived and withdrawn clusters, for status. Empty when neither.

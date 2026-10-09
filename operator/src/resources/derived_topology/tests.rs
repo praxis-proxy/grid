@@ -508,6 +508,11 @@ fn each_refusal_is_named() {
         provider("prov-twin", "https://twin2.example.invalid", None),
         provider("prov-port", "https://p.example.invalid:99999", None),
         provider("prov-ip", "https://10.0.0.5:8443", None),
+        provider(
+            "prov-badname",
+            "https://10.0.0.6:8443",
+            Some(serde_json::json!({ "serverName": "host:443" })),
+        ),
         provider("prov-scheme", "ftp://s.example.invalid", None),
         unavailable,
     ];
@@ -524,6 +529,7 @@ fn each_refusal_is_named() {
         "prov-twin",
         "prov-port",
         "prov-ip",
+        "prov-badname",
         "prov-scheme",
         "prov-down",
         "prov-none",
@@ -539,6 +545,7 @@ fn each_refusal_is_named() {
         ("prov-twin", "site-a", Refusal::Ambiguous),
         ("prov-port", "site-a", Refusal::EndpointPort),
         ("prov-ip", "site-a", Refusal::ServerNameNeeded),
+        ("prov-badname", "site-a", Refusal::ServerNameInvalid),
         ("prov-scheme", "site-a", Refusal::EndpointUnusable),
         ("prov-down", "site-a", Refusal::Unavailable),
         ("prov-none", "site-a", Refusal::NoProvider),
@@ -721,6 +728,61 @@ fn an_https_endpoint_named_by_address_needs_a_declared_server_name() {
 }
 
 #[test]
+fn a_server_name_that_is_not_a_dns_hostname_is_refused() {
+    let long_label = "a".repeat(64);
+    let too_long = format!("{}.example", "a.".repeat(124));
+    let cases = [
+        ("https://model-gw:8443", "10.0.0.7"),
+        ("https://model-gw:8443", "::1"),
+        ("https://model-gw:8443", "[::1]"),
+        ("https://model-gw:8443", "host:443"),
+        ("https://model-gw:8443", "a/b"),
+        ("https://model-gw:8443", "has space.example"),
+        ("https://model-gw:8443", "-lead.example"),
+        ("https://model-gw:8443", "trail-.example"),
+        ("https://model-gw:8443", long_label.as_str()),
+        ("https://model-gw:8443", too_long.as_str()),
+    ];
+    for (endpoint, name) in cases {
+        let providers = vec![provider(
+            "prov-a",
+            endpoint,
+            Some(serde_json::json!({ "serverName": name })),
+        )];
+        let sites = vec![site("site-a", None)];
+        let resolution = resolve(
+            &[candidate("prov-a", "site-a")],
+            &[],
+            &decl(&providers, &sites, "site-a"),
+        );
+        let got: Vec<Refusal> = resolution.refused.iter().map(|r| r.reason).collect();
+        assert_eq!(got, [Refusal::ServerNameInvalid], "{name:?} must refuse, not render");
+    }
+}
+
+#[test]
+fn an_undeclared_url_host_that_is_not_a_dns_hostname_is_refused() {
+    let providers = vec![provider("prov-a", "https://model_gw.ns.svc:8443", None)];
+    let sites = vec![site("site-a", None)];
+    let resolution = resolve(
+        &[candidate("prov-a", "site-a")],
+        &[],
+        &decl(&providers, &sites, "site-a"),
+    );
+    let got: Vec<Refusal> = resolution.refused.iter().map(|r| r.reason).collect();
+    assert_eq!(got, [Refusal::ServerNameInvalid], "the derived SNI is validated too");
+}
+
+#[test]
+fn a_valid_declared_server_name_at_the_length_limit_resolves() {
+    // 63 + 1 + 63 + 1 + 63 + 1 + 61 = 253.
+    let name = format!("{a}.{a}.{a}.{b}", a = "a".repeat(63), b = "b".repeat(61));
+    assert_eq!(name.len(), 253);
+    let got = resolve_local("https://10.0.0.7:8443", Some(serde_json::json!({ "serverName": name })));
+    assert_eq!(got.endpoint.transport.and_then(|t| t.sni), Some(name));
+}
+
+#[test]
 fn a_cluster_with_no_provider_and_no_site_resolves_to_nothing() {
     let candidates = vec![candidate("prov-ghost", "site-ghost")];
     let resolved = resolve(&candidates, &[], &decl(&[], &[], "site-a"));
@@ -736,4 +798,48 @@ fn an_mcp_tool_candidate_is_neither_resolved_nor_refused() {
     tool.kind = "mcp_tool".to_owned();
     let resolution = resolve(&[tool], &[], &decl(&[], &[], "site-a"));
     assert!(resolution.resolved.is_empty() && resolution.refused.is_empty());
+}
+
+/// Contract fixture the gateway crate loads through Praxis.
+const DERIVED_RENDER_GOLDEN: &str = include_str!("../../../../gateway/tests/testdata/consumer-config-derived.yaml");
+
+#[test]
+#[expect(clippy::too_many_lines, reason = "the render takes every renderer input")]
+fn a_derived_tls_render_matches_the_fixture_praxis_loads() {
+    let providers = vec![
+        provider("prov-a", "https://model-a.models.svc:8443", None),
+        provider(
+            "prov-b",
+            "https://10.0.0.7:8443",
+            Some(serde_json::json!({ "serverName": "model-b.example.internal" })),
+        ),
+    ];
+    let sites = vec![site("site-a", None)];
+    let candidates = vec![candidate("prov-a", "site-a"), candidate("prov-b", "site-a")];
+    let resolution = resolve(&candidates, &[], &decl(&providers, &sites, "site-a"));
+    assert!(resolution.refused.is_empty(), "{:?}", resolution.refused);
+    let endpoints: Vec<ClusterEndpointConfig> = resolution.resolved.values().map(|r| r.endpoint.clone()).collect();
+    let overlay = crate::resources::routing_overlay::RoutingOverlay {
+        network: "net".to_owned(),
+        local_site: "site-a".to_owned(),
+        candidates,
+        excluded: Vec::new(),
+        selection_policy: None,
+        generated_at: None,
+    };
+    let rendered = crate::resources::consumer_config::render_consumer_config_with_projected(
+        &overlay,
+        "/run/secrets/grid-credentials",
+        &endpoints,
+        "/etc/praxis/tls",
+        8080,
+        &crate::crd::grid_network::TlsConfig::default(),
+        "inference-gw",
+        "praxis-system",
+        None,
+        false,
+        false,
+    )
+    .expect("render");
+    assert_eq!(rendered.config_yaml, DERIVED_RENDER_GOLDEN, "golden drifted");
 }

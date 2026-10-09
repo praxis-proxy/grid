@@ -147,10 +147,16 @@ spec:
                       description: |-
                         Name to verify against the backend's certificate, and to send as SNI.
 
-                        Omitted uses the endpoint URL host.
+                        Omitted uses the endpoint URL host. Must be a DNS hostname, not an IP
+                        address, at most 253 characters.
+                      maxLength: 253
                       minLength: 1
                       nullable: true
+                      pattern: ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$
                       type: string
+                      x-kubernetes-validations:
+                        - message: serverName must be a hostname, not an IP address
+                          rule: '!self.matches(''(^|[.])[0-9]+$'')'
                   type: object
                 capacityWeight:
                   description: Relative capacity used by an opt-in placement policy.
