@@ -278,8 +278,18 @@ The chart creates two ClusterRoles:
    GridNetworks and InferenceProviders; get/list/watch/patch/create/update on
    GridSites; get/patch on all three status subresources.
 2. **Resource access** (`<release>-resources`): get/create/patch on Secrets;
-   get on Services; create/patch on Events (`events.k8s.io`);
-   get/create/patch/update on ConfigMaps.
+   get on the named gateway, SWIM, and signals Services; create/patch on
+   Events (`events.k8s.io`); get/create/patch/update on ConfigMaps; and,
+   with rotation on, get/patch on the one Deployment named by
+   `gateway.serviceName`.
+
+It grants no other Deployment access. A gateway that delegates its Secret
+mounts to the operator renders a Role for its own Deployment from the
+praxis-gateway chart (`mountReconciliation.rbac`), bound to this release's
+ServiceAccount; see
+[Deployment access](../../docs/architecture/operations.md#deployment-access).
+A v0.2.0 release granted every Deployment in its resource namespaces instead,
+so upgrade or re-grant delegated gateways before upgrading the operator.
 
 Resource access is bound via RoleBindings. The release namespace always gets
 a RoleBinding. Additional namespaces are added through `resourceNamespaces`:

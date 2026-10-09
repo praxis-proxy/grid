@@ -113,7 +113,10 @@ render/apply attempt.
 
 Set `consumerConfig.mountReconciliation.enabled: true` to delegate generated
 Secret mounts and coordinated Deployment rollouts to Grid. This requires an
-explicitly annotated Deployment in `GatewayRef.namespace`. The operator manages
+explicitly annotated Deployment in `GatewayRef.namespace`, and a Role in that
+namespace letting the operator `get` and `patch` that one Deployment; the
+praxis-gateway chart renders it, see
+[Deployment access](operations.md#deployment-access). The operator manages
 only its reserved projected volumes and the selected container's mounts. Secret
 references must be in the gateway namespace. `consumerConfigStatus[].phase` of
 `Rendered` describes the ConfigMap; only

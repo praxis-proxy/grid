@@ -69,7 +69,12 @@ The operator uses a split RBAC model:
 - **Cluster-scoped**: CRD access via ClusterRole `grid-operator-crd`
 - **Namespace-scoped**: Secret/ConfigMap access via ClusterRole `grid-operator-resources` bound to specific namespaces
 
-By default, the operator can access Secrets and ConfigMaps in the `default` namespace. To grant access to additional namespaces:
+By default, the operator can access Secrets and ConfigMaps in the `default`
+namespace. These manifests grant no Deployment access; a gateway that
+delegates its Secret mounts grants `get` and `patch` on its own Deployment,
+as described under
+[Deployment access](../docs/architecture/operations.md#deployment-access).
+To grant access to additional namespaces:
 
 ```bash
 kubectl create rolebinding grid-operator-resources \
