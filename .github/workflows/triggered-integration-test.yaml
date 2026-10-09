@@ -943,14 +943,14 @@ jobs:
               GRID_XTASK_IMAGE_PULL_POLICY=Never \
               cargo xtask env run-grid-static-weighted-qualification \
                 --forge-config tests/e2e/topologies/grid-static-weighted/forge.yaml \
-                --quick --teardown --evidence-dir "${EVIDENCE_DIR}" \
+                --quick --teardown --keep-on-failure --evidence-dir "${EVIDENCE_DIR}" \
                 2>&1 | tee "${GITHUB_WORKSPACE}/run-${QUALIFICATION}.log"
               ;;
             combined-site)
               GRID_XTASK_IMAGE_PULL_POLICY=Never \
               cargo xtask env run-grid-combined-site-demo \
                 --forge-config tests/e2e/topologies/grid-combined-site/forge.yaml \
-                --full --teardown --evidence-dir "${EVIDENCE_DIR}" \
+                --full --teardown --keep-on-failure --evidence-dir "${EVIDENCE_DIR}" \
                 2>&1 | tee "${GITHUB_WORKSPACE}/run-${QUALIFICATION}.log"
               ;;
             *)

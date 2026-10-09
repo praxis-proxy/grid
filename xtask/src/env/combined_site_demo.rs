@@ -7423,6 +7423,7 @@ pub(crate) fn run(forge_config: &Path, options: &GlbDemoOptions) -> Result<(), B
     let mut teardown_success = false;
     let mut run_error = None;
     let mut overlay_state = OverlayState::default();
+    let mut image_evidence = None;
 
     let proof_results = match &setup_ctx {
         Ok(context) => {
@@ -7461,6 +7462,9 @@ pub(crate) fn run(forge_config: &Path, options: &GlbDemoOptions) -> Result<(), B
                         run_error = Some(format!("runtime proofs failed: {}", failed_proofs.join(", ")));
                     }
 
+                    // Capture deployed images while the Kind clusters are still available.
+                    image_evidence = Some(collect_image_evidence()?);
+
                     // Teardown if requested
                     if options.teardown && (run_error.is_none() || !options.keep_on_failure) {
                         match teardown_environment(context) {
@@ -7480,6 +7484,9 @@ pub(crate) fn run(forge_config: &Path, options: &GlbDemoOptions) -> Result<(), B
                 Err(e) => {
                     eprintln!("[FAIL] Environment setup failed: {e}");
                     run_error = Some(format!("environment setup failed: {e}"));
+
+                    // A partial deployment can still provide useful image evidence.
+                    image_evidence = Some(collect_image_evidence()?);
 
                     if options.teardown && !options.keep_on_failure {
                         if let Err(cleanup_err) = teardown_environment(context) {
@@ -7501,8 +7508,12 @@ pub(crate) fn run(forge_config: &Path, options: &GlbDemoOptions) -> Result<(), B
         },
     };
 
-    // Collect actual evidence
-    let images = collect_image_evidence()?;
+    // If setup preparation failed before a context existed, collect whatever image
+    // evidence is still available. In deployed cases this was captured before teardown.
+    let images = match image_evidence {
+        Some(images) => images,
+        None => collect_image_evidence()?,
+    };
     let external_provider_evidence = if let Some(desc) = &ext_descriptor {
         Some(collect_external_provider_evidence(
             desc,
