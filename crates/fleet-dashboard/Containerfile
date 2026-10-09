@@ -10,7 +10,7 @@
 # Stage 1: Web UI
 # ------------------------------------------------------------------------------
 
-FROM node:22-alpine AS web
+FROM mirror.gcr.io/library/node:22-alpine AS web
 
 WORKDIR /src
 
@@ -24,7 +24,7 @@ RUN npm run build
 # Stage 2: Build
 # ------------------------------------------------------------------------------
 
-FROM rust:1.96-alpine AS builder
+FROM mirror.gcr.io/library/rust:1.96-alpine AS builder
 
 RUN apk add --no-cache musl-dev pkgconf make g++
 
@@ -53,7 +53,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # Stage 3: Runtime
 # ------------------------------------------------------------------------------
 
-FROM alpine:3.23
+FROM mirror.gcr.io/library/alpine:3.23
 
 ARG GRID_GIT_COMMIT=unknown
 ARG GRID_GIT_VERSION=unknown
