@@ -309,10 +309,14 @@ spec:
                                   Routing identities whose declarations this gateway derives from.
 
                                   Each entry is a provider's `routingClusterRef`, or its `metadata.name`
-                                  when that is unset.
+                                  when that is unset. At most 64 entries, each named once.
                                 items:
+                                  maxLength: 253
+                                  minLength: 1
                                   type: string
+                                maxItems: 64
                                 type: array
+                                x-kubernetes-list-type: set
                             type: object
                           enableProjectedCredentials:
                             default: false

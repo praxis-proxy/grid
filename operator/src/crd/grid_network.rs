@@ -1050,7 +1050,12 @@ pub struct DeriveTopology {
     /// Routing identities whose declarations this gateway derives from.
     ///
     /// Each entry is a provider's `routingClusterRef`, or its `metadata.name`
-    /// when that is unset.
+    /// when that is unset. At most 64 entries, each named once.
+    #[schemars(
+        length(max = 64),
+        inner(length(min = 1, max = 253)),
+        extend("x-kubernetes-list-type" = "set")
+    )]
     #[serde(default)]
     pub from_providers: Vec<String>,
 }
@@ -2024,6 +2029,39 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn derive_topology_from_providers_is_a_bounded_set() {
+        let crd = crd_json();
+        let from_providers = crd
+            .pointer(
+                "/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties/gatewayRefs/items/properties/consumerConfig/properties/deriveTopology/properties/fromProviders",
+            )
+            .unwrap_or_else(|| std::process::abort());
+        assert_eq!(
+            from_providers.get("maxItems").and_then(serde_json::Value::as_u64),
+            Some(64)
+        );
+        assert_eq!(
+            from_providers
+                .get("x-kubernetes-list-type")
+                .and_then(serde_json::Value::as_str),
+            Some("set"),
+            "a set refuses a duplicate at admission"
+        );
+        assert_eq!(
+            from_providers
+                .pointer("/items/minLength")
+                .and_then(serde_json::Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            from_providers
+                .pointer("/items/maxLength")
+                .and_then(serde_json::Value::as_u64),
+            Some(253)
+        );
     }
 
     #[test]
