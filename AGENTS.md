@@ -84,7 +84,8 @@ cargo test -p mock-providers     # one crate
 cargo test test_name             # one test by name
 ```
 
-Test environment (requires Docker + kind):
+Test environment (requires Docker + kind; install the pinned upstream Forge
+with `./scripts/forge.sh install` first; see `docs/developing/forge.md`):
 
 ```console
 cargo xtask env up       # create clusters, certs
@@ -106,7 +107,6 @@ cargo xtask env status   # health of all components
 | `grid-signals` | Shared load-signal store, Prometheus parser, and labels |
 | `grid-signals-client` | mTLS poller for operator site signals |
 | `mock-providers` | Mock OpenAI, Anthropic, Bedrock, Vertex APIs |
-| `forge` | Generic development-environment orchestrator for Kubernetes |
 | `xtask` | Dev task runner for test environments |
 | `version` | Shared build identity for binaries and container provenance |
 | `fleet-dashboard` | Opt-in hub web UI: fleet map and per-site health from each site's Prometheus (Axum + React) |

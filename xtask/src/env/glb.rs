@@ -1183,7 +1183,7 @@ fn collect_prereq_errors(forge_config: &Path) -> (Vec<String>, Option<String>) {
     }
     let forge_bin = resolve_forge_binary();
     if forge_bin.is_none() {
-        errors.push("praxis-forge was unavailable and its workspace build failed".to_owned());
+        errors.push("pinned praxis-forge is unavailable; run scripts/forge.sh install or set FORGE_BIN".to_owned());
     }
     (errors, forge_bin)
 }
@@ -1198,53 +1198,27 @@ fn tool_available(name: &str) -> bool {
         .is_ok_and(|s| s.success())
 }
 
-/// Resolve Forge from an override, `PATH`, or the workspace build.
+/// Resolve the pinned upstream Forge through Grid's shared bootstrap script.
 ///
-/// A fresh checkout builds the workspace binary automatically under a hard
-/// timeout so qualifications do not require an undocumented bootstrap step.
+/// The script validates explicit executable overrides and cached provenance.
+/// Installation is an explicit developer or CI step, never a qualification side effect.
 pub(crate) fn resolve_forge_binary() -> Option<String> {
-    if let Some(override_path) = std::env::var_os("FORGE_BIN") {
-        let path = PathBuf::from(override_path);
-        if path.is_file() {
-            return Some(path.to_string_lossy().into_owned());
-        }
-        eprintln!("FORGE_BIN does not name a file: {}", path.display());
-        return None;
-    }
-    if tool_available("praxis-forge") {
-        return Some("praxis-forge".to_owned());
-    }
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap_or_else(|| Path::new("."));
-    let local = workspace.join("target/debug/praxis-forge");
-    if local.is_file() {
-        return Some(local.to_string_lossy().into_owned());
-    }
-    build_workspace_forge(workspace, &local)
-}
-
-/// Build the workspace Forge binary under a hard timeout.
-fn build_workspace_forge(workspace: &Path, local: &Path) -> Option<String> {
-    eprintln!("praxis-forge not found; building the workspace binary");
-    let manifest = workspace.join("Cargo.toml");
-    let target = workspace.join("target");
-    let output = Command::new("timeout")
-        .args(["300", "cargo", "build", "--manifest-path"])
-        .arg(manifest)
-        .args(["--target-dir"])
-        .arg(target)
-        .args(["-p", "forge", "--bin", "praxis-forge"])
+        .ancestors()
+        .find(|path| path.join("scripts/forge.sh").is_file())?;
+    let output = Command::new("bash")
+        .arg(workspace.join("scripts/forge.sh"))
+        .arg("path")
+        .stderr(std::process::Stdio::inherit())
         .output()
+        .map_err(|error| eprintln!("failed to resolve praxis-forge: {error}"))
         .ok()?;
     if !output.status.success() {
-        eprintln!(
-            "failed to build praxis-forge: {}",
-            safe_truncate_str(String::from_utf8_lossy(&output.stderr).trim(), 2_000)
-        );
         return None;
     }
-    local.is_file().then(|| local.to_string_lossy().into_owned())
+    let path = String::from_utf8(output.stdout).ok()?;
+    let path = path.trim_end_matches('\n');
+    (!path.is_empty()).then(|| path.to_owned())
 }
 
 /// Detect placeholder images in Forge configuration.

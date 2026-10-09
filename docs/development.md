@@ -40,7 +40,6 @@ names stay the same regardless of their directory location.
 | `grid-signals-client` | [`signals-client/`](../signals-client/) | mTLS poller for the operator's site-signal endpoint. |
 | `mock-providers` | [`mock-providers/`](../mock-providers/) | Mock inference-provider APIs. |
 | `fleet-dashboard` | [`fleet-dashboard/`](../fleet-dashboard/) | Optional fleet UI and Prometheus-backed views. |
-| `forge` | [`forge/`](../forge/) | Development-environment orchestrator used by qualification tooling. |
 | `xtask` | [`xtask/`](../xtask/) | Repository generation, environments, and qualification commands. |
 | `version` | [`version/`](../version/) | Shared build identity for binaries and container provenance. |
 
@@ -48,6 +47,11 @@ names stay the same regardless of their directory location.
 It contains `gateway` (the `grid-gateway` binary) and `ai-grid-filters`. Root
 `cargo --workspace` commands do not include it. Keep its TLS feature choices and
 production no-ring check intact when changing shared dependencies.
+
+Forge is an upstream tool, installed separately with `./scripts/forge.sh install`
+before running environment qualifications. Grid pins its source revision and
+resolves the executable through a shared wrapper. See [Forge tooling](developing/forge.md)
+for installation, cache verification, development overrides, and upgrade checks.
 
 ## Verification
 

@@ -63,6 +63,7 @@ For a first routing check, follow the [single-cluster guide][single-cluster] to
 prepare the images and validate its prerequisites, then run from this checkout:
 
 ```console
+./scripts/forge.sh install
 cargo xtask env run-grid-single-cluster-multi-gateway-qualification \
   --forge-config tests/e2e/topologies/grid-single-cluster-multi-gateway/forge.yaml
 ```
@@ -155,6 +156,10 @@ make lint           # Clippy, formatting, dependencies, Gateway no-ring check
 make test           # run root workspace tests
 make all            # build, format, lint, docs, tests, audit
 ```
+
+Install the pinned upstream Forge with `./scripts/forge.sh install` before
+running environment qualifications. See [Forge tooling](docs/developing/forge.md)
+for provenance, overrides, and upgrade checks.
 
 Read [CONTRIBUTING](CONTRIBUTING.md) and the canonical
 [development conventions](docs/conventions.md) before submitting a change.
