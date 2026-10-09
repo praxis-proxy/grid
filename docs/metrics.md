@@ -101,10 +101,10 @@ state, so two replicas agree only in steady state.
 |---|---|---|---|
 | `grid_route_decisions_total` | counter | | Site-selection decisions made. |
 | `grid_route_selections_total` | counter | `path` | Decisions by the path that produced them. |
-| `grid_route_site_rho` | gauge | site | Saturation the gateway last read for the site, in-flight over its ceiling. |
-| `grid_route_site_weight` | gauge | site | Capacity the draw weights the site by. |
-| `grid_route_site_ceiling` | gauge | site | Ceiling the gateway has learned for the site. |
-| `grid_route_site_score` | gauge | site | Score the site was ranked by in the last decision. |
+| `grid_route_site_rho` | gauge | `site`, `cluster` | Saturation the gateway last read for the site, in-flight over its ceiling. |
+| `grid_route_site_weight` | gauge | `site`, `cluster` | Capacity the draw weights the site by. |
+| `grid_route_site_ceiling` | gauge | `site`, `cluster` | Ceiling the gateway has learned for the site. |
+| `grid_route_site_score` | gauge | `site`, `cluster` | Score the site was ranked by in the last decision. |
 | `grid_route_shedding` | gauge | `model` | 1 while the gateway sheds this model, 0 otherwise. |
 | `grid_route_prefix_affinity_total` | counter | `outcome` | Prefix-affinity decisions by outcome. |
 | `grid_serving_config_reload_total` | counter | `result` | Serving-config reloads by result. |
