@@ -6,7 +6,7 @@ components expose Prometheus endpoints and they answer different questions.
 | Endpoint | Component | Serves |
 |---|---|---|
 | `/metrics` on `GRID_METRICS_ADDR`, default `0.0.0.0:9090` | Site operator | Reconciliation, probing, peer polling, and the provider readings this site publishes |
-| `/metrics` on the gateway metrics listener, `metricsListener.enabled` in the gateway chart, port 9443, TLS only | Grid gateway | Site selection, shedding, and serving-config reloads |
+| `/metrics` on the gateway metrics listener, `metricsListener.enabled` in the gateway chart, port 9443, TLS only | Grid gateway | Site selection, shedding, serving-config reloads, and its poll of the local operator |
 | `/metrics` on `OVERLAY_SYNC_HEALTH_ADDR`, default `0.0.0.0:9091` | Overlay-sync sidecar, when `overlay.sidecar.enabled` | Delivery of the serving overlay from its ConfigMap to the gateway |
 
 The gateway also serves the same series on the Praxis admin listener, which is
@@ -62,14 +62,16 @@ is described in [Polling Cross-Site Load Signals](architecture/polling-metrics.m
 | `grid_collection_up` | gauge | `peer` | Whether the last poll of this peer succeeded. |
 | `grid_peer_last_success_timestamp_seconds` | gauge | `peer` | Unix time of the last successful poll of this peer. |
 
-## Operator: serving signals to peers
+## Operator: serving signals
 
-The other half of the same path, where this site answers a peer's poll.
+The other half of the same path, where this site answers a peer's poll or
+relays every site's readings to its own gateway.
 
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
 | `grid_peer_signals_refused_total` | counter | `peer`, `reason` | Peer observations refused at ingest. |
 | `grid_signals_connections_shed_total` | counter | `limit` | Signals connections shed at accept. |
+| `grid_signals_relay_truncated_total` | counter | `store`, `cut` | Targets dropped and lines cut from the relay served to the local gateway. |
 
 ## Operator: reconciliation and probing
 
@@ -118,6 +120,18 @@ distinguishes an unmeasured site from one measured at zero. A `NaN` score means
 the candidate is excluded or demoted from the order. A site that leaves the
 topology reads `NaN` on all four, since the exporter keeps a series until
 restart.
+
+## Gateway: polling the local operator
+
+Every site's load reaches the gateway through one poll of its local operator,
+described in [Site Selection](site-selection.md).
+
+| Metric | Type | Labels | Meaning |
+|---|---|---|---|
+| `grid_signals_poll_total` | counter | `result` | Polls of the local operator by result. |
+| `grid_signals_last_success_timestamp_seconds` | gauge | | Unix time of the last successful poll. |
+| `grid_signals_response_bytes` | gauge | | Size of the last successful poll's response. |
+| `grid_signals_ingest_dropped_total` | counter | `reason` | Rows the operator served that the gateway refused, by reason. |
 
 ## Overlay-sync
 
