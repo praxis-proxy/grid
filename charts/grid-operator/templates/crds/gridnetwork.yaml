@@ -862,6 +862,47 @@ spec:
                       - tenantId
                     type: object
                   type: array
+                conditions:
+                  description: |-
+                    Observed conditions. `PeerAgesRejected` says whether this site's peer poller is
+                    rejecting some peer's relayed signal ages, which points at that peer's clock.
+
+                    Written by the operator's peer poller, never by `GridNetwork` reconciliation.
+                  items:
+                    description: One observed condition, shaped like `metav1.Condition`.
+                    properties:
+                      lastTransitionTime:
+                        description: When `status` last changed, RFC 3339.
+                        format: date-time
+                        type: string
+                      message:
+                        default: ""
+                        description: Human-readable detail.
+                        type: string
+                      observedGeneration:
+                        description: The `metadata.generation` this was computed against.
+                        format: int64
+                        nullable: true
+                        type: integer
+                      reason:
+                        description: CamelCase reason for the status.
+                        type: string
+                      status:
+                        description: '`True`, `False`, or `Unknown`.'
+                        type: string
+                      type:
+                        description: Condition type, such as `Ready`.
+                        type: string
+                    required:
+                      - lastTransitionTime
+                      - reason
+                      - status
+                      - type
+                    type: object
+                  type: array
+                  x-kubernetes-list-map-keys:
+                    - type
+                  x-kubernetes-list-type: map
                 connectedSites:
                   default: 0
                   description: Number of connected (Active) sites.

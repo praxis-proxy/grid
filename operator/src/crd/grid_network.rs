@@ -10,6 +10,8 @@ use kube::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::crd::inference_provider::Condition;
+
 // ---------------------------------------------------------------------------
 // Routing policy
 // ---------------------------------------------------------------------------
@@ -1263,6 +1265,14 @@ pub struct SecretRef {
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GridNetworkStatus {
+    /// Observed conditions. `PeerAgesRejected` says whether this site's peer poller is
+    /// rejecting some peer's relayed signal ages, which points at that peer's clock.
+    ///
+    /// Written by the operator's peer poller, never by `GridNetwork` reconciliation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(extend("x-kubernetes-list-type" = "map", "x-kubernetes-list-map-keys" = ["type"]))]
+    pub conditions: Vec<Condition>,
+
     /// Number of connected (Active) sites.
     #[serde(default)]
     pub connected_sites: u32,

@@ -60,7 +60,7 @@ use futures::StreamExt as _;
 use k8s_openapi::api::core::v1::{ConfigMap, Service};
 use kube::{
     Api, Client,
-    api::{ObjectMeta, PostParams},
+    api::{ObjectMeta, Patch, PatchParams, PostParams},
     runtime::{controller::Controller, watcher},
 };
 use operator::{
@@ -2303,6 +2303,7 @@ async fn run_peer_poller(
         client,
         settings,
         shutdown,
+        ages: operator::peer_ages::PeerAges::default(),
     }
     .run()
     .await;
@@ -2321,17 +2322,19 @@ struct PeerPoller {
     settings: operator::cli::SignalsArgs,
     /// Lets an in-flight round stand down when the process is stopping.
     shutdown: operator::shutdown::Shutdown,
+    /// Peers whose relayed ages the last rounds rejected, for the `GridNetwork` condition.
+    ages: operator::peer_ages::PeerAges,
 }
 
 impl PeerPoller {
     /// Rebuild and poll until shutdown.
-    async fn run(&self) {
+    async fn run(mut self) {
         while !self.shutdown.is_triggered() && self.cycle().await {}
         tracing::info!("peer signals poller stopped");
     }
 
     /// One build-and-poll cycle; `false` means shutdown arrived while idle.
-    async fn cycle(&self) -> bool {
+    async fn cycle(&mut self) -> bool {
         let own = Box::pin(sole_own_leaf(&self.client)).await;
         let Some(source) = Box::pin(peer_source(
             &self.client,
@@ -2365,7 +2368,7 @@ impl PeerPoller {
 
     /// Poll every interval until this site's material changes, or shutdown.
     async fn poll_until_changed(
-        &self,
+        &mut self,
         source: &operator::signals::PollPeers,
         changed: impl Future<Output = ()> + Send,
     ) {
@@ -2386,27 +2389,64 @@ impl PeerPoller {
         }
     }
 
-    /// Collect from every alive peer and replace what is published for them.
-    async fn poll_once(&self, source: &operator::signals::PollPeers) {
-        let targets = poll_targets(
+    /// Collect from every alive peer, replace what is published for them, and say
+    /// on the `GridNetwork` whose relayed ages are being rejected.
+    async fn poll_once(&mut self, source: &operator::signals::PollPeers) {
+        let sites = poll_targets(
             &self.swim.snapshot(),
             &self.ctx.peer_identities(),
             source.trust,
             self.swim.is_encrypted(),
             self.swim.site_name(),
             self.settings.peer_port,
-        );
-        let Some(sites) = targets.filter(|sites| !sites.is_empty()) else {
-            return;
-        };
+        )
+        .unwrap_or_default();
         // Each peer lands as it answers, so one slow peer cannot age out the rest.
         let peers = self.ctx.peers();
         let ttl = self.settings.peer_ttl();
+        let mut answered = BTreeMap::new();
         source
-            .collect_each(&sites, |peer, observations, _| {
+            .collect_each(&sites, |peer, observations, rejected| {
+                answered.insert(peer.clone(), rejected);
                 peers.refresh(BTreeMap::from([(peer, observations)]), ttl);
             })
             .await;
+        // A round stood down by shutdown learned nothing, and writing would hold termination open.
+        if self.shutdown.is_triggered() {
+            return;
+        }
+        let polled: Vec<String> = sites.into_iter().map(|site| site.name).collect();
+        self.ages.observe(&polled, &answered);
+        Box::pin(write_peer_ages(&self.client, &self.ages)).await;
+    }
+}
+
+/// Write the `PeerAgesRejected` condition on the sole `GridNetwork` when it changed.
+///
+/// Compared against the live status every round, so a restart, a recreated
+/// `GridNetwork` or an edited status is set right on the next round, and nothing
+/// is written while the condition already says this.
+async fn write_peer_ages(client: &Client, ages: &operator::peer_ages::PeerAges) {
+    let Some(network) = Box::pin(sole_network(client)).await else {
+        return;
+    };
+    let Ok(now) = time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339) else {
+        return;
+    };
+    let Some((name, patch)) = operator::peer_ages::patch(&network, ages, &now) else {
+        return;
+    };
+    let api: Api<GridNetwork> = Api::all(client.clone());
+    let params = PatchParams::apply(operator::peer_ages::FIELD_MANAGER).force();
+    match Box::pin(api.patch_status(name, &params, &Patch::Apply(patch))).await {
+        Ok(_) if ages.rejecting().is_empty() => {
+            tracing::info!("relayed signal ages accepted from every polled peer");
+        },
+        Ok(_) => tracing::warn!(
+            peers = ?ages.rejecting(),
+            "relayed signal ages rejected from peers; check their clocks"
+        ),
+        Err(error) => tracing::warn!(%error, "peer ages condition not written; retrying next round"),
     }
 }
 

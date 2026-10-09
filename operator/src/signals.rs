@@ -2119,6 +2119,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_peer_serving_implausible_ages_is_named_on_the_condition() {
+        crate::init_process_crypto();
+        let (date, date_ms) = dated(UNIX_EPOCH + Duration::from_secs(1_700_000_000));
+        let mut sites = Vec::new();
+        for (peer, stamp) in [
+            ("ahead", date_ms + 1_001),
+            ("ancient", date_ms - MAX_RELAY_AGE_MS - 1),
+            ("clean", date_ms - 1_000),
+        ] {
+            let body = format!("inference_pool_average_queue_size{{grid_provider=\"pool-a\"}} 1 {stamp}\n");
+            sites.push(dated_peer(peer, body, date.clone()).await);
+        }
+        let mut answered = BTreeMap::new();
+        one_attempt()
+            .collect_each(&sites, |peer, _, rejected| {
+                answered.insert(peer, rejected);
+            })
+            .await;
+        let mut ages = crate::peer_ages::PeerAges::default();
+        ages.observe(
+            &sites.iter().map(|site| site.name.clone()).collect::<Vec<_>>(),
+            &answered,
+        );
+        let condition = ages.condition(&[], "t0", Some(1)).expect("raised");
+        assert_eq!(condition.status, "True", "{condition:?}");
+        assert!(
+            condition.message.contains("from ahead, ancient:"),
+            "the peers stamping past their Date and a day behind it are named, the clean one is not: {}",
+            condition.message
+        );
+    }
+
+    #[tokio::test]
     async fn a_row_dropped_for_its_age_takes_no_provider_slot() {
         crate::init_process_crypto();
         let (date, date_ms) = dated(UNIX_EPOCH + Duration::from_secs(1_700_000_000));
@@ -2201,16 +2234,24 @@ mod tests {
 
     /// One round polling `site`, which answers `body` under the extra header lines `headers`.
     async fn poll_one_peer(site: &str, body: String, headers: String) -> BTreeMap<String, Vec<Observation>> {
-        let sites = [PeerSite {
+        one_attempt().collect(&[dated_peer(site, body, headers).await]).await
+    }
+
+    /// A peer named `site` answering `body` once, under the extra header lines `headers`.
+    async fn dated_peer(site: &str, body: String, headers: String) -> PeerSite {
+        PeerSite {
             name: site.to_owned(),
             url: serve_once_with(body, headers).await,
             pins: Vec::new(),
-        }];
-        let poll = PollPeers {
+        }
+    }
+
+    /// A poller that tries each peer once.
+    fn one_attempt() -> PollPeers {
+        PollPeers {
             attempts: 1,
             ..PollPeers::default()
-        };
-        poll.collect(&sites).await
+        }
     }
 
     /// Whether `grid_peer_signals_refused_total` reads `count` for `peer` and `reason`.

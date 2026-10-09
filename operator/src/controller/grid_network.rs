@@ -5022,6 +5022,9 @@ async fn update_status(
 
     let api: Api<GridNetwork> = Api::all(client.clone());
     let status = GridNetworkStatus {
+        // The peer poller owns the conditions under its own field manager. Left
+        // empty, they are not serialized, so this apply never claims or clears them.
+        conditions: Vec::new(),
         connected_sites,
         distributed_provider_count,
         grid_id: grid_id.to_owned(),
@@ -5128,9 +5131,16 @@ fn identity_status(cert_pem: &str, now: time::OffsetDateTime, renews: bool) -> O
     })
 }
 
-/// Return whether the status subresource differs from the desired status.
+/// Return whether the status subresource differs from the desired status, apart
+/// from `conditions`, which the peer poller writes and this reconcile never does.
 fn grid_network_status_needs_update(current: Option<&GridNetworkStatus>, desired: &GridNetworkStatus) -> bool {
-    current != Some(desired)
+    current.is_none_or(|current| {
+        *desired
+            != GridNetworkStatus {
+                conditions: desired.conditions.clone(),
+                ..current.clone()
+            }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -7553,6 +7563,7 @@ mod tests {
     #[test]
     fn grid_network_status_update_is_skipped_when_semantically_unchanged() {
         let baseline = GridNetworkStatus {
+            conditions: Vec::new(),
             connected_sites: 2,
             distributed_provider_count: 2,
             grid_id: "grid-id".to_owned(),
@@ -7572,6 +7583,31 @@ mod tests {
         };
         assert!(grid_network_status_needs_update(Some(&baseline), &changed));
         assert!(grid_network_status_needs_update(None, &baseline));
+    }
+
+    #[test]
+    fn a_condition_alone_never_calls_for_a_status_write() {
+        let baseline = GridNetworkStatus {
+            grid_id: "grid-id".to_owned(),
+            phase: GridNetworkPhase::Active,
+            ..GridNetworkStatus::default()
+        };
+        let with_condition = GridNetworkStatus {
+            conditions: vec![crate::crd::inference_provider::Condition {
+                type_: crate::peer_ages::PEER_AGES_REJECTED.to_owned(),
+                status: "True".to_owned(),
+                ..crate::crd::inference_provider::Condition::default()
+            }],
+            ..baseline.clone()
+        };
+        assert!(
+            !grid_network_status_needs_update(Some(&with_condition), &baseline),
+            "a condition the peer poller wrote is no reason to write status, or reconcile would fight it"
+        );
+        assert!(
+            serde_json::to_value(&baseline).is_ok_and(|value| value.get("conditions").is_none()),
+            "empty conditions are left out of the reconcile's apply, so it never claims the field"
+        );
     }
 
     #[test]
