@@ -11,8 +11,11 @@
 use std::{
     borrow::Cow,
     collections::HashMap,
-    sync::atomic::{AtomicUsize, Ordering},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    sync::{
+        OnceLock,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use dashmap::{DashMap, mapref::entry::Entry};
@@ -60,6 +63,12 @@ const MAX_RELAY_AGE_MS: i64 = 86_400_000; // one day
 /// for a whole poll cycle and a one-second `Date` restamps it on a moving clock each
 /// time, so the published stamp says whether a line is new; a publisher deriving that
 /// stamp at render can round it a millisecond either way.
+///
+/// A step of the publisher's wall clock between two renders moves every republished
+/// stamp by the step, so each series misses this fold once per step: it keeps a
+/// duplicate instant of the same value, or drops the republish as older. Folding on
+/// the restamped instant instead would need a second of tolerance, which merges
+/// distinct observations and breaks the exact-instant joins.
 const ORIGIN_TOLERANCE_MS: u64 = 1;
 
 /// A no-skew reference-and-local clock for tests: it sits above the small stamps
@@ -199,6 +208,45 @@ struct Provider {
     metrics: HashMap<Box<str>, Series>,
 }
 
+/// A millisecond clock that reads a given value at its start and from then on
+/// advances with the monotonic clock only, so a step of the wall clock never
+/// moves it.
+#[derive(Clone, Copy, Debug)]
+pub struct Timeline {
+    /// The reading at `start`, in milliseconds.
+    start_ms: i64,
+    /// When it read `start_ms`, on the monotonic clock.
+    start: Instant,
+}
+
+impl Timeline {
+    /// A timeline reading `start_ms` now.
+    #[must_use]
+    pub fn starting_at(start_ms: i64) -> Self {
+        Self {
+            start_ms,
+            start: Instant::now(),
+        }
+    }
+
+    /// The timeline every store runs on unless told otherwise: the wall clock at
+    /// its first use, so its readings stay near epoch milliseconds.
+    #[must_use]
+    pub fn process() -> Self {
+        *PROCESS_TIMELINE.get_or_init(|| Self::starting_at(now_ms()))
+    }
+
+    /// Milliseconds on this timeline now.
+    #[must_use]
+    pub fn now_ms(&self) -> i64 {
+        let elapsed = i64::try_from(self.start.elapsed().as_millis()).unwrap_or(i64::MAX);
+        self.start_ms.saturating_add(elapsed)
+    }
+}
+
+/// The process's store timeline, started at its first use.
+static PROCESS_TIMELINE: OnceLock<Timeline> = OnceLock::new();
+
 /// Windowed signals per provider, keyed by `"site/cluster"` so a request-path
 /// lookup matches a route candidate. The key is built by concatenation
 /// ([`Self::key`]), a small `Box<str>` per lookup.
@@ -225,6 +273,8 @@ pub struct LoadStore {
     /// This gateway's own site. A source verified as this site is its local
     /// operator, whose rows are attributed by their label.
     local_site: Option<Box<str>>,
+    /// The clock every sample is held on and every read is made at.
+    timeline: Timeline,
 }
 
 impl LoadStore {
@@ -246,6 +296,7 @@ impl LoadStore {
             window,
             combine,
             local_site: None,
+            timeline: Timeline::process(),
         }
     }
 
@@ -254,6 +305,14 @@ impl LoadStore {
     #[must_use]
     pub fn with_local_site(mut self, local_site: &str) -> Self {
         self.local_site = Some(local_site.into());
+        self
+    }
+
+    /// Hold this store on `timeline` instead of the process's, as a test does to
+    /// stand a store apart from the wall clock the way a step leaves it.
+    #[must_use]
+    pub fn with_timeline(mut self, timeline: Timeline) -> Self {
+        self.timeline = timeline;
         self
     }
 
@@ -487,6 +546,14 @@ impl LoadStore {
         self.local_site.as_deref()
     }
 
+    /// Now on this store's timeline: the `local_now_ms` to ingest at and the
+    /// `now_ms` to read at. Never the wall clock, so a step of it can neither drop
+    /// new samples as older than the held head nor age the held ones at once.
+    #[must_use]
+    pub fn timeline_ms(&self) -> i64 {
+        self.timeline.now_ms()
+    }
+
     /// Reserve a global and a per-owner slot for one new provider, atomically.
     ///
     /// Returns `false`, holding no reservation, when either cap is already met.
@@ -656,7 +723,8 @@ fn target_labels<'text>(metric: &exposition::Metric<'text>) -> Option<TargetLabe
     Some((site, cluster?))
 }
 
-/// Milliseconds since the epoch.
+/// Milliseconds since the epoch, on the wall clock: for a time someone reads as
+/// a date. A store's clock is [`LoadStore::timeline_ms`].
 #[must_use]
 pub fn now_ms() -> i64 {
     SystemTime::now()
@@ -1421,6 +1489,55 @@ mod tests {
             assert_eq!(held, want, "{label}");
             assert_eq!(tally.skewed, u64::from(want.is_none()), "{label}: counted as skew");
         }
+    }
+
+    #[test]
+    fn a_timeline_advances_with_the_monotonic_clock_from_its_start() {
+        let timeline = Timeline::starting_at(5_000);
+        let first = timeline.now_ms();
+        let second = timeline.now_ms();
+        assert!(
+            (5_000..6_000).contains(&first),
+            "it reads its start, then counts on: {first}"
+        );
+        assert!(second >= first, "and never runs backward: {first} then {second}");
+        assert!(
+            (store().timeline_ms() - now_ms()).abs() < 1_000,
+            "a store's default timeline starts on the wall clock"
+        );
+    }
+
+    #[test]
+    fn a_wall_step_between_polls_costs_nothing_on_the_timeline() {
+        let key = LoadStore::key("east", "pool-a");
+        let two_polls = |first_at: i64, second_at: i64| {
+            let store = store();
+            store.ingest_at(&line("east", "pool-a", 9.0, 1_000_000), 1_000_000, first_at, "east");
+            store.ingest_at(&line("east", "pool-a", 2.0, 1_001_000), 1_001_000, second_at, "east");
+            store
+        };
+        let hour = 3_600_000;
+        let on_timeline = two_polls(50_000, 51_000);
+        assert_eq!(
+            (
+                on_timeline.latest(&key, QUEUE).map(|sample| sample.value),
+                on_timeline.window_worst(&key, QUEUE, 51_000, 5_000, true)
+            ),
+            (Some(2.0), Some(9.0)),
+            "read off the timeline, the second poll lands and the first still counts in the window"
+        );
+        assert_eq!(
+            two_polls(50_000, 51_000 - hour)
+                .latest(&key, QUEUE)
+                .map(|sample| sample.value),
+            Some(9.0),
+            "read off a wall stepped back an hour, the second poll is dropped as older than the head"
+        );
+        assert_eq!(
+            two_polls(50_000, 51_000 + hour).window_worst(&key, QUEUE, 51_000 + hour, 5_000, true),
+            Some(2.0),
+            "read off a wall stepped forward an hour, the first poll ages an hour at once and drops out"
+        );
     }
 
     #[test]

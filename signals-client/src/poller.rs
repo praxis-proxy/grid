@@ -6,7 +6,8 @@
 //! [`SignalSource`], so the mTLS client and the test fake share one
 //! path. The operator's response `Date` is the freshness reference passed to
 //! [`LoadStore::ingest_at`], so staleness tracks the operator's clock, not the
-//! gateway's.
+//! gateway's, and each row lands on the store's own timeline rather than the
+//! gateway's wall clock.
 
 use std::{sync::Arc, time::Duration};
 
@@ -417,7 +418,7 @@ fn ingest(scrape: &Scrape, store: &LoadStore) -> Result<Ingested, (&'static str,
             format!("scrape peer id {} is not a grid site id", scrape.peer_identity),
         ));
     };
-    let ingested = store.ingest_at(&scrape.body, scrape.date_ms, now_ms(), owner);
+    let ingested = store.ingest_at(&scrape.body, scrape.date_ms, store.timeline_ms(), owner);
     let now_secs = u32::try_from(now_ms().saturating_div(1_000)).unwrap_or(u32::MAX);
     metrics::gauge!("grid_signals_last_success_timestamp_seconds").set(f64::from(now_secs));
     let bytes = u32::try_from(scrape.body.len()).unwrap_or(u32::MAX);
@@ -448,6 +449,8 @@ mod tests {
         Mutex,
         atomic::{AtomicUsize, Ordering},
     };
+
+    use grid_signals::Timeline;
 
     use super::*;
 
@@ -520,6 +523,36 @@ mod tests {
     }
 
     #[test]
+    fn a_scrape_is_held_on_the_store_timeline_whatever_the_wall_reads() {
+        let key = LoadStore::key("east", "pool-a");
+        for (label, apart_ms) in [
+            ("the wall stepped forward an hour", -3_600_000),
+            ("the wall stepped back an hour", 3_600_000),
+        ] {
+            let store = LoadStore::new(Duration::from_secs(30))
+                .with_timeline(Timeline::starting_at(now_ms().saturating_add(apart_ms)));
+            let mut failing = false;
+            let wall = now_ms();
+            for (value, stamp, date) in [
+                (3.0, wall.saturating_sub(2_000), wall.saturating_sub(1_000)),
+                (7.0, wall, wall),
+            ] {
+                let scrape = Scrape {
+                    body: line("east", "pool-a", value, stamp),
+                    date_ms: date,
+                    peer_identity: Arc::from(certs::spiffe_id("east").as_str()),
+                };
+                absorb(Ok(scrape), &store, &mut failing);
+            }
+            assert_eq!(
+                store.window_worst(&key, "queue_depth", store.timeline_ms(), 5_000, true),
+                Some(7.0),
+                "{label}: both polls land on the store's clock at their own ages, and read fresh there"
+            );
+        }
+    }
+
+    #[test]
     fn build_url_appends_encoded_collect_params() {
         let url = build_url("https://o/s", &["queue_depth".to_owned(), "a b".to_owned()]);
         assert_eq!(url, "https://o/s?collect[]=queue_depth&collect[]=a%20b");
@@ -574,7 +607,13 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(
             store
-                .window_worst(&LoadStore::key("east", "pool-a"), "queue_depth", now_ms(), 5_000, true)
+                .window_worst(
+                    &LoadStore::key("east", "pool-a"),
+                    "queue_depth",
+                    store.timeline_ms(),
+                    5_000,
+                    true
+                )
                 .is_some(),
             "the scraped sample should be queryable"
         );
@@ -598,15 +637,16 @@ mod tests {
         let handle = spawn(Arc::clone(&store), source, Duration::from_millis(10));
         tokio::time::sleep(Duration::from_millis(1)).await;
         tokio::task::yield_now().await;
+        let now = store.timeline_ms();
         assert!(
             store
-                .window_worst(&LoadStore::key("west", "pool-a"), "queue_depth", now_ms(), 5_000, true)
+                .window_worst(&LoadStore::key("west", "pool-a"), "queue_depth", now, 5_000, true)
                 .is_none(),
             "the spoofed west series must not exist"
         );
         assert!(
             store
-                .window_worst(&LoadStore::key("east", "pool-a"), "queue_depth", now_ms(), 5_000, true)
+                .window_worst(&LoadStore::key("east", "pool-a"), "queue_depth", now, 5_000, true)
                 .is_none(),
             "and it is not silently rebound to east either"
         );
@@ -632,7 +672,13 @@ mod tests {
     }
 
     fn east(store: &LoadStore) -> Option<f64> {
-        store.window_worst(&LoadStore::key("east", "pool-a"), "queue_depth", now_ms(), 60_000, true)
+        store.window_worst(
+            &LoadStore::key("east", "pool-a"),
+            "queue_depth",
+            store.timeline_ms(),
+            60_000,
+            true,
+        )
     }
 
     #[tokio::test]
@@ -731,7 +777,10 @@ mod tests {
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         let mut found = false;
         while std::time::Instant::now() < deadline {
-            if store.window_worst(&key, "queue_depth", now_ms(), 5_000, true).is_some() {
+            if store
+                .window_worst(&key, "queue_depth", store.timeline_ms(), 5_000, true)
+                .is_some()
+            {
                 found = true;
                 break;
             }
@@ -762,7 +811,13 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(
             store
-                .window_worst(&LoadStore::key("east", "pool-a"), "queue_depth", now_ms(), 5_000, true)
+                .window_worst(
+                    &LoadStore::key("east", "pool-a"),
+                    "queue_depth",
+                    store.timeline_ms(),
+                    5_000,
+                    true
+                )
                 .is_some(),
             "the loop recovers and ingests after a failed tick"
         );
