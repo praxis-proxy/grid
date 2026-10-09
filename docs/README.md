@@ -32,9 +32,9 @@
 
 ## Operations
 
-- [Fleet Dashboard](../crates/fleet-dashboard/README.md) — optional hub web UI drawing
-  every site on a map with health from its own Prometheus; deployed only when
-  you install its chart.
+- [Fleet Dashboard](../crates/fleet-dashboard/README.md) - optional hub web UI
+  drawing every site on a map with health from its own Prometheus; deployed only
+  when you install its chart.
 - [Adding an Inference Provider](adding-provider.md) — step-by-step
   workflow for in-cluster, existing-service, and external HTTPS providers.
 - [Operations](architecture/operations.md) — local environment setup,
