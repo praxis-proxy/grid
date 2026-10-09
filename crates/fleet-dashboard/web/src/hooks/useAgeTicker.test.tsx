@@ -26,7 +26,7 @@ describe('useAgeTicker', () => {
     const lastUpdate = Date.now()
     const { unmount } = renderHook(() => useAgeTicker(lastUpdate))
     unmount()
-    // No assertion beyond "does not throw" — proves the interval is cleared.
+    // No assertion beyond "does not throw"; it proves the interval is cleared.
     act(() => vi.advanceTimersByTime(5000))
   })
 })

@@ -1,7 +1,7 @@
 # Grid existing-cluster inventory.
 #
 # Copy this file to inventory.yaml (gitignored) and fill in your values.
-# Never commit inventory.yaml — it contains environment-specific details.
+# Never commit inventory.yaml; it contains environment-specific details.
 #
 # topology: dedicated-edge | combined-site
 topology: dedicated-edge

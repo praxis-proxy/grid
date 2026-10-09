@@ -5,7 +5,7 @@ metadata:
   labels:
     app.kubernetes.io/managed-by: grid-operator
 rules:
-  # ── Secrets (namespaced) ────────────────────────────────────────────
+  # Secrets (namespaced)
   #
   # Read paths:
   #   - TLS site certificate (tls.crt, tls.key for mTLS client auth)
@@ -18,7 +18,7 @@ rules:
   #   - Grid site certificate Secret (tls.crt, tls.key)
   #
   # The operator reads Secrets by explicit namespace/name during
-  # reconciliation — no cluster-wide list or watch.  TLS material
+  # reconciliation; no cluster-wide list or watch.  TLS material
   # rotation is detected by bounded requeue (60s for TLS-configured
   # providers).
   #
@@ -30,7 +30,7 @@ rules:
     resources: ["secrets"]
     verbs: ["get", "create", "patch"]
 
-  # ── Services (namespaced) ───────────────────────────────────────────
+  # Services (namespaced)
   #
   # Read paths:
   #   - Provider gateway LoadBalancer Service (self-discovery of the
@@ -44,7 +44,7 @@ rules:
     resourceNames: ["provider-gateway", "grid-operator-swim", "grid-operator-signals"]
     verbs: ["get"]
 
-  # ── Events (namespaced) ────────────────────────────────────────────
+  # Events (namespaced)
   #
   # Write paths:
   #   - Kubernetes Events emitted by the GridSite controller on
@@ -56,7 +56,7 @@ rules:
     resources: ["events"]
     verbs: ["create", "patch"]
 
-  # ── ConfigMaps (namespaced) ─────────────────────────────────────────
+  # ConfigMaps (namespaced)
   #
   # Write paths:
   #   - Routing overlay ConfigMap (grid-overlay-{network}-{gateway})

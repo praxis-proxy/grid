@@ -87,7 +87,7 @@ pub struct ToolInfo {
 /// # Stable `reason` values
 ///
 /// `reason` is `None` while the provider is healthy. When set, it is one
-/// of the following stable, machine-readable strings — following the
+/// of the following stable, machine-readable strings, following the
 /// same naming convention as [`InferenceProvider`]'s `MetricsTls*`/
 /// `HealthCheckTls*` reasons:
 ///
@@ -162,7 +162,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // spec.tls — absent must default to None, present must round-trip
+    // spec.tls: absent must default to None, present must round-trip
     // -----------------------------------------------------------------------
 
     #[test]
@@ -229,7 +229,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // status.reason — absent must default to None, present must round-trip,
+    // status.reason: absent must default to None, present must round-trip,
     // and must be omitted from serialized output when None (not written as
     // an explicit null onto the status subresource).
     // -----------------------------------------------------------------------

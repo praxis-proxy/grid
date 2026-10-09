@@ -114,7 +114,7 @@ for SITE in $SITE_NAMES; do
       while IFS= read -r OC; do
         [[ -z "$OC" ]] && continue
         if ! echo "$HOP_CLUSTERS" | grep -qw "$OC"; then
-          echo "  WARN  $SITE: overlay cluster '$OC' not in consumer provider_hop_clusters — requests to this cluster will fail" >&2
+          echo "  WARN  $SITE: overlay cluster '$OC' not in consumer provider_hop_clusters; requests to this cluster will fail" >&2
         fi
       done <<< "$OVERLAY_CLUSTERS"
     fi
@@ -189,7 +189,7 @@ EOF
     if echo "$RESPONSE" | grep -q "choices"; then
       echo "  PASS  response contains expected inference fields"
     else
-      echo "  FAIL  response missing 'choices' field — routing succeeded but did not reach inference" >&2
+      echo "  FAIL  response missing 'choices' field; routing succeeded but did not reach inference" >&2
       ERRORS=$((ERRORS + 1))
     fi
   else

@@ -39,7 +39,7 @@ Key differences:
 - `sni` moves from a top-level field to `transport.sni`.
 - `transport.mode` is the security switch (`mutual_tls`, server-authenticated
   `tls`, or explicit insecure/dev-only `plaintext`), not `sni` presence.
-- Missing `transport` fails closed — the operator will not render the cluster entry.
+- Missing `transport` fails closed: the operator will not render the cluster entry.
 - `plaintext` must not set a nonblank `sni` (rejected as likely misconfiguration).
 
 ### Custom backend CA Secret namespace
@@ -98,8 +98,9 @@ take effect.
 
 The generated config contains:
 
-- `listeners:` — one public listener at `0.0.0.0:{listenerPort}` (default 8080)
-- `filter_chains:` — the consumer filter chain:
+- `listeners:` with one public listener at `0.0.0.0:{listenerPort}`
+  (default 8080)
+- `filter_chains:` with the consumer filter chain:
   - `intelligent_route` using `overlay_file`, exact network/gateway/namespace/site
     scope checks, and hot reload. Candidate and selection-policy state is not
     duplicated in startup-only YAML. `provider_hop_clusters` is derived from
@@ -118,7 +119,7 @@ The generated config contains:
     endpoint address and explicit `transport` configuration (`mutual_tls`,
     `tls`, or `plaintext`). Missing transport fails closed: the operator will
     not silently render a plain-HTTP cluster when transport intent is absent.
-- `admin:` — admin listener at `127.0.0.1:9901`
+- `admin:` with an admin listener at `127.0.0.1:9901`
 - `shutdown_timeout_secs: 5`
 
 Set `consumerConfig.telemetry` to add process-level OTLP settings and the
@@ -386,9 +387,9 @@ Example failure output:
 |---|---|---|
 | _(empty)_ | `Rendered` | Config rendered and `ConfigMap` applied successfully |
 | `MissingClusterEndpoint` | `Error` | A candidate cluster is missing from `consumerConfig.clusterEndpoints[]` |
-| `MissingTransport` | `Error` | A cluster endpoint has no `transport` configuration — the operator refuses to guess TLS vs plaintext |
+| `MissingTransport` | `Error` | A cluster endpoint has no `transport` configuration; the operator refuses to guess TLS vs plaintext |
 | `MissingSni` | `Error` | A `mutual_tls` or `tls` cluster endpoint has no (or blank) `sni`; TLS requires a server name |
-| `PlaintextWithSni` | `Error` | A `plaintext` cluster endpoint has `sni` set — `sni` does not enable TLS; use `mutual_tls` if TLS is intended |
+| `PlaintextWithSni` | `Error` | A `plaintext` cluster endpoint has `sni` set (`sni` does not enable TLS; use `mutual_tls` if TLS is intended) |
 | `ProjectedCredentialsUnsupported` | `Error` | A credential-bearing overlay is retained until the consumer declares that its projected credential filter is already running |
 | `ConsumerConfigRenderFailed` | `Error` | Overlay data produced an unrenderable config (e.g. blank local site) |
 | `ConsumerConfigApplyFailed` | `Error` | Kubernetes API rejected the `ConfigMap` apply (e.g. RBAC, namespace not found) |
@@ -423,7 +424,7 @@ cluster before restarting or rolling out the consumer gateway.
 **Phase is `Error` / reason `MissingTransport`**
 
 A cluster endpoint has no `transport` field.  The operator requires every
-`clusterEndpoints[]` entry to declare explicit transport intent — either
+`clusterEndpoints[]` entry to declare explicit transport intent: either
 `mutual_tls` or `tls` (both with `sni`), or `plaintext`. Add a `transport` block to the
 identified endpoint.  The operator will not guess whether a cluster should use
 TLS or plaintext.
@@ -437,7 +438,7 @@ certificate.  Add a non-blank `sni` to the endpoint's `transport` block.
 **Phase is `Error` / reason `PlaintextWithSni`**
 
 A `plaintext` cluster endpoint has `sni` set.  Setting `sni` on a plaintext
-transport does not enable TLS — it is almost certainly a misconfiguration.
+transport does not enable TLS. It is almost certainly a misconfiguration.
 Either change the mode to `mutual_tls` (if TLS is intended) or remove `sni`
 from the endpoint.
 
@@ -535,5 +536,5 @@ The generated `ConfigMap` never contains credential token bytes.  Credential
 entries reference a mounted Kubernetes Secret via a `file:` path.  The Secret
 must be provisioned in the cluster where the final-hop gateway or provider-side
 component that calls the backend runs.  The
-`status.consumerConfigStatus[].message` field also never contains token bytes —
+`status.consumerConfigStatus[].message` field also never contains token bytes;
 error messages describe structural failures only.

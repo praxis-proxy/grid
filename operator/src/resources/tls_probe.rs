@@ -1,4 +1,4 @@
-//! TLS gateway probe — bounded handshake and peer certificate extraction.
+//! TLS gateway probe: bounded handshake and peer certificate extraction.
 //!
 //! Connects to a remote gateway, performs a TLS (or mTLS) handshake with
 //! locally configured trust roots, extracts the peer leaf certificate, and
@@ -57,7 +57,7 @@ pub(crate) struct ProbeConfig {
 
 /// How a probed leaf is bound to the site, beyond the CA chain and server name.
 pub(crate) enum PeerIdentity {
-    /// Canonical DER fingerprint pins (1–2 entries).
+    /// Canonical DER fingerprint pins (1 or 2 entries).
     Pins(Vec<CanonicalFingerprint>),
     /// The exact SPIFFE ID the leaf must carry.
     Spiffe(String),
@@ -76,7 +76,7 @@ pub(crate) enum PeerIdentity {
 /// 5. If present, compare the SWIM-advertised leaf with the pins and record a mismatch without failing the verified
 ///    connection.
 ///
-/// Returns a `GatewayProbeOutcome` — never panics, never leaks
+/// Returns a `GatewayProbeOutcome`, never panics, never leaks
 /// private material.
 pub(crate) async fn probe_gateway(config: &ProbeConfig) -> GatewayProbeOutcome {
     let deadline = tokio::time::Instant::now() + PROBE_DEADLINE;
@@ -465,7 +465,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Focused TLS handshake tests — real listeners, real certificates
+    // Focused TLS handshake tests: real listeners, real certificates
     // -----------------------------------------------------------------------
 
     fn client_tls_config(ca: &certs::CaCert, client: &certs::SiteCertOutput) -> ClientTlsConfig {

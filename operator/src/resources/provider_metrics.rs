@@ -10,7 +10,7 @@
 //! available (or the grace period has expired), the provider is inserted with
 //! `UNOBSERVABLE_METRICS` (`healthy: false`), which causes the scoring engine
 //! to exclude it from active routing.  Providers without `metricsConfig` are
-//! unaffected — they receive neutral default scoring as before.
+//! unaffected; they receive neutral default scoring as before.
 //!
 //! [`GridNetwork`]: crate::crd::grid_network::GridNetwork
 
@@ -42,7 +42,7 @@ const DEFAULT_SCRAPE_TIMEOUT: Duration = Duration::from_secs(2);
 /// the provider from active routing.  This prevents an unobservable secure
 /// metrics endpoint from receiving favorable neutral default scores.
 ///
-/// Providers without `metricsConfig` are unaffected — they have no metrics
+/// Providers without `metricsConfig` are unaffected; they have no metrics
 /// entry in the map and receive neutral scoring as before.
 const UNOBSERVABLE_METRICS: scoring::BackendMetrics = scoring::BackendMetrics {
     error_rate: 1.0,
@@ -429,7 +429,7 @@ pub(crate) fn parse_metrics_timeout(s: &str) -> Duration {
 /// grace period the provider falls back to absent metrics (neutral scoring).
 ///
 /// When `stale_metrics_seconds` is absent (default), scrape failures always
-/// produce neutral scoring — the same backward-compatible behaviour as before
+/// produce neutral scoring, the same backward-compatible behaviour as before
 /// this field was added.
 ///
 /// `now` is passed in (rather than read from `Instant::now()`) so tests can
@@ -711,8 +711,8 @@ async fn resolve_tls_config(
 ///
 /// # Returns
 ///
-/// - `Ok(None)` — TLS material is accessible and valid (or no TLS configured).
-/// - `Ok(Some(reason_string))` — failure; the provider should be marked [`Degraded`] with the returned reason in
+/// - `Ok(None)`: TLS material is accessible and valid (or no TLS configured).
+/// - `Ok(Some(reason_string))`: failure; the provider should be marked [`Degraded`] with the returned reason in
 ///   `status.reason`.
 ///
 /// [`Degraded`]: crate::crd::inference_provider::ProviderPhase::Degraded
@@ -735,7 +735,7 @@ pub(crate) async fn verify_metrics_tls_accessible(
 /// Classify a [`MetricsScrapeError`](crate::metrics_scraper::MetricsScrapeError) into a
 /// bounded log-level reason string.
 ///
-/// These categories are used for structured logging only — they do not
+/// These categories are used for structured logging only; they do not
 /// appear in `InferenceProvider.status.reason`.  Status reasons are
 /// reserved for material/configuration failures that the controller
 /// can observe during reconciliation (see [`endpoint_tls::TlsFailureReason`](super::endpoint_tls::TlsFailureReason)).
@@ -1362,7 +1362,7 @@ llm_d_epp_request_error_total{{{l},error_code="503"}} {errors}
 
     #[tokio::test]
     async fn collect_metrics_malformed_body_produces_finite_metrics() {
-        // Malformed Prometheus text — metric not found → neutral defaults.
+        // Malformed Prometheus text: metric not found → neutral defaults.
         let body = "not_prometheus_text {invalid} NaN\n";
         let base_url = start_test_server(ok_response(body)).await;
         let provider = provider_fixture("prov-a", &base_url, Some(mc_with_queue("my_queue")));
@@ -1695,7 +1695,7 @@ llm_d_epp_request_error_total{{{l},error_code="503"}} {errors}
     }
 
     // -----------------------------------------------------------------------
-    // TlsFailureReason — stable status reason strings (via shared module)
+    // TlsFailureReason: stable status reason strings (via shared module)
     // -----------------------------------------------------------------------
 
     #[test]
@@ -1725,7 +1725,7 @@ llm_d_epp_request_error_total{{{l},error_code="503"}} {errors}
     }
 
     // -----------------------------------------------------------------------
-    // classify_scrape_error — log-level classification
+    // classify_scrape_error: log-level classification
     // -----------------------------------------------------------------------
 
     #[test]

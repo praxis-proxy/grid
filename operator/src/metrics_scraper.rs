@@ -511,7 +511,7 @@ mod tests {
 
     #[tokio::test]
     async fn scrape_returns_timeout_for_silent_server() {
-        // Server accepts but never responds — scrape must time out.
+        // Server accepts but never responds, so the scrape must time out.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .unwrap_or_else(|_| std::process::abort());
@@ -520,7 +520,7 @@ mod tests {
             if let Ok((mut stream, _)) = listener.accept().await {
                 let mut buf = [0_u8; 4096];
                 drop(stream.read(&mut buf).await);
-                // Intentionally never respond — hold open for 60s then drop.
+                // Intentionally never respond; hold open for 60s then drop.
                 tokio::time::sleep(Duration::from_secs(60)).await;
                 drop(stream);
             }
@@ -571,7 +571,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // build_tls_client_config — PEM material validation
+    // build_tls_client_config: PEM material validation
     // -----------------------------------------------------------------------
 
     #[test]

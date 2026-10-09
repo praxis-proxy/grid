@@ -470,7 +470,7 @@ Locality tier is derived from `GridSite.spec.region` and `GridSite.spec.zone`:
 
 Zone comparison requires a region match because zone names are not globally
 unique.  When no `GridSite` geography is configured, all candidates receive
-`unknown` tier and ordering falls through to score-based ranking — preserving
+`unknown` tier and ordering falls through to score-based ranking, preserving
 backward compatibility with deployments that predate geography fields.
 
 `Unavailable` providers are excluded. `Degraded` providers remain in the
@@ -486,9 +486,9 @@ than recomputing the full scoring formula.
 
 Stale candidates (`fresh: false`) are **retained in the overlay** rather than
 immediately excluded.  This policy supports:
-- **Observability** — operators can see that a remote peer is degraded before
+- **Observability**: operators can see that a remote peer is degraded before
   it recovers.
-- **Last-resort fallback** — if no healthy candidate exists for a model, a
+- **Last-resort fallback**: if no healthy candidate exists for a model, a
   stale candidate is better than a hard 404.
 
 The authoritative GC policy function is `should_retain_candidate` in
@@ -515,8 +515,8 @@ public `MemberRecord.age_secs` is computed as `now.saturating_duration_since(sta
 at snapshot time.
 
 A `age_secs = 0` has two distinct meanings:
-- **Alive member** — no Dead/Suspect transition has occurred.
-- **Dead/Suspect member with `age_secs = 0`** — the runtime has just transitioned
+- **Alive member**: no Dead/Suspect transition has occurred.
+- **Dead/Suspect member with `age_secs = 0`**: the runtime has just transitioned
   (elapsed is less than one second), or a synthetic snapshot did not include age.
   The GC helper `dead_or_suspect_age_secs` treats `age_secs = 0` on a
   Dead/Suspect member as "unknown" and retains conservatively.
@@ -524,14 +524,14 @@ A `age_secs = 0` has two distinct meanings:
 **`crdt::ProviderState`** carries only a monotonic `revision` counter, not
 a wall-clock timestamp.  CRDT storage-level GC is outside the current operator contract.
 
-### Per-GridNetwork TTL — `spec.staleCandidateTtlSeconds`
+### Per-GridNetwork TTL (`spec.staleCandidateTtlSeconds`)
 
 The `GridNetwork` CRD exposes `spec.staleCandidateTtlSeconds` (optional `u32`)
 to control when stale candidates are removed from the overlay.
 
 | `spec.staleCandidateTtlSeconds` | Behaviour |
 |---|---|
-| Absent (default) | No-op — stale candidates retained indefinitely |
+| Absent (default) | No-op; stale candidates retained indefinitely |
 | `0` | Rejected by the CRD schema (`minimum: 1`) |
 | `N >= 1` | Remote `fresh=false` candidates with SWIM member age `>= N` seconds are omitted from the overlay |
 
@@ -543,7 +543,7 @@ The controller also defensively treats an internally observed `0` as absent, so
 malformed data cannot accidentally trigger immediate eviction outside the normal
 Kubernetes API validation path.
 
-**Recommended starting value:** `3600` (one hour) — allows short outages to
+**Recommended starting value:** `3600` (one hour), which allows short outages to
 recover without overlay churn while bounding accumulation of truly dead peers.
 
 **Important:** The TTL is applied at overlay-rendering time.  CRDT provider
@@ -633,8 +633,8 @@ semantics, error mapping, streaming behavior, and credential rotation.
 ## Credential injection
 
 When an `InferenceProvider` has `spec.auth.strategy: bearer_token` with a
-`spec.auth.secretRef`, the operator projects a credential reference — never the
-token value — into the routing overlay candidate:
+`spec.auth.secretRef`, the operator projects a credential reference (never the
+token value) into the routing overlay candidate:
 
 ```json
 {
@@ -703,9 +703,9 @@ The token does NOT appear in:
 ### Deployment ownership
 
 The operator generates the consumer Praxis config including the `credential_inject`
-section for direct API-provider routes.  Secret provisioning — creating,
+section for direct API-provider routes.  Secret provisioning (creating,
 rotating, and synchronizing the mounted credential Secret in the final-hop
-cluster — is the responsibility of platform automation or an external Secret
+cluster) is the responsibility of platform automation or an external Secret
 manager.
 
 The `intelligent_route` → `credential_inject` filter chain interface is the same
@@ -719,11 +719,11 @@ routing overlay only when the corresponding `GridSite.status.phase` is `Active`.
 
 | Site state | Remote CRDT providers eligible |
 |---|---|
-| No matching `GridSite` | No — fail-closed |
+| No matching `GridSite` | No (fail-closed) |
 | `Pending` | No |
 | `Discovered` | No |
 | `Connecting` | No |
-| `Active` | Yes — control-plane eligible |
+| `Active` | Yes (control-plane eligible) |
 | `Unreachable` | No |
 | `Left` | No |
 
@@ -756,7 +756,7 @@ fingerprint trust policy matches.
 **Validation**: `verify-swim-mesh-three-node` proves the eligibility gate in a
 three-node mesh (A→B→C topology).  It asserts that C's provider is absent from
 A's overlay before C's `GridSite` is `Active`, and appears only after `Active`
-is set — even though CRDT state from C reached A transitively through B.  The
+is set, even though CRDT state from C reached A transitively through B.  The
 same validation confirms wrong-network provider records are absent from A's
 correct-network overlay.
 
@@ -929,7 +929,7 @@ configured, a TLS resolution or scrape failure with no unexpired successful samp
 marks the provider unhealthy, excluding it from routing. The cache is
 per-operator-process; restarting the operator clears all cached samples.
 
-`staleMetricsSeconds` has no effect on successful scrapes — fresh scraped
+`staleMetricsSeconds` has no effect on successful scrapes: fresh scraped
 values always win.  Setting it only extends the window in which a
 temporarily-unavailable endpoint's last known metrics influence scoring.
 
@@ -960,7 +960,7 @@ During each render pass, the operator uses the current local CRDs, current
 provider metrics, and current SWIM/CRDT state it has received so far.
 
 Overlay regeneration is reconcile-driven, not per-request.  If a remote cluster
-disappears, the overlay is not rewritten at packet time — it updates when the
+disappears, the overlay is not rewritten at packet time; it updates when the
 operator's next reconciliation loop observes the new SWIM/member/provider state
 and re-renders.
 

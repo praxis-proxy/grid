@@ -59,5 +59,5 @@ pub(crate) mod mcp_probe;
 pub(crate) mod model_discovery;
 /// TLS backend abstraction: client config, connectors, handshake, PEM gates.
 pub mod tls_backend;
-/// TLS gateway probe — bounded handshake and peer certificate extraction.
+/// TLS gateway probe: bounded handshake and peer certificate extraction.
 pub(crate) mod tls_probe;

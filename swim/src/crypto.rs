@@ -1,7 +1,7 @@
 //! SWIM transport encryption for the AI Grid.
 //!
-//! All SWIM gossip messages — foca protocol bytes and [`crate::StateBroadcast`]
-//! payloads — are encrypted and authenticated with AES-256-GCM when the runtime
+//! All SWIM gossip messages (foca protocol bytes and [`crate::StateBroadcast`]
+//! payloads) are encrypted and authenticated with AES-256-GCM when the runtime
 //! has a configured key.  The cipher provides:
 //!
 //! - **Confidentiality**: membership packets, gateway addresses, and public certificate PEM broadcasts are not readable
@@ -26,7 +26,7 @@
 //! # Security properties
 //!
 //! - **Wrong key**: `decrypt` returns `CryptoError::AuthFailed`; the packet is dropped silently.
-//! - **Tampered ciphertext**: same — GCM tag fails, packet dropped.
+//! - **Tampered ciphertext**: same; GCM tag fails, packet dropped.
 //! - **Plaintext packet with key configured**: the receive path checks the magic header first.  A packet without the
 //!   `b"GRID"` prefix returns `CryptoError::BadMagic` and is dropped.
 //! - **No key configured**: the encrypt/decrypt paths in the runtime are not called at all; plaintext behavior is
@@ -81,7 +81,7 @@ pub type SwimKey = [u8; 32];
 /// Error returned by [`decrypt`].
 ///
 /// The caller should drop the packet silently on any variant.  No variant
-/// should be logged with payload content — the error message is safe to
+/// should be logged with payload content; the error message is safe to
 /// emit at `warn` or `debug` level.
 #[derive(Debug, thiserror::Error)]
 pub enum CryptoError {
@@ -103,7 +103,7 @@ pub enum CryptoError {
     /// AES-256-GCM authentication tag verification failed.
     ///
     /// Most commonly caused by a wrong key.  Tampered ciphertext produces the
-    /// same error — GCM does not distinguish between the two cases.
+    /// same error; GCM does not distinguish between the two cases.
     #[error("SWIM packet authentication failed (wrong key or tampered data)")]
     AuthFailed,
 

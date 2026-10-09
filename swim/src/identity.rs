@@ -22,7 +22,7 @@ pub const MAX_LEASE_SKEW: Duration = Duration::from_secs(600);
 ///
 /// Wraps a stable site name with a network address. The
 /// `generation` field enables automatic rejoin after being
-/// declared dead — a higher generation wins address conflicts.
+/// declared dead; a higher generation wins address conflicts.
 ///
 /// ```
 /// use swim::NodeId;

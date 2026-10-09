@@ -29,7 +29,7 @@ pub enum CertPemStatus {
     /// Input has a `-----BEGIN CERTIFICATE-----` header and no private-key markers.
     ///
     /// The PEM structure is consistent with a public certificate.  This is a
-    /// header/marker check only — the certificate has not been parsed as X.509,
+    /// header/marker check only; the certificate has not been parsed as X.509,
     /// chain-verified, or checked against any CA.
     ValidStructure,
 
@@ -87,8 +87,8 @@ pub fn sha256_fingerprint(pem_str: &str) -> String {
 /// This is a **marker-based structural check**, not cryptographic verification.
 /// The function:
 /// 1. Rejects input larger than `MAX_PUBLIC_CERT_PEM_BYTES`.
-/// 2. Rejects any input that contains `"PRIVATE KEY"` — private key material must never appear in public-facing cert
-///    fields.
+/// 2. Rejects any input that contains `"PRIVATE KEY"`, since private key material must never appear in public-facing
+///    cert fields.
 /// 3. Accepts input that contains `"-----BEGIN CERTIFICATE-----"` as structurally valid.
 /// 4. Rejects everything else as not a certificate.
 ///
@@ -99,7 +99,7 @@ pub fn sha256_fingerprint(pem_str: &str) -> String {
 /// - The peer holding this cert is authorized for routing.
 ///
 /// Use the result to gate storage in `publicCertPem` and trust bundles, but
-/// treat [`CertPemStatus::ValidStructure`] as structural validity only — never as trust or authorization.
+/// treat [`CertPemStatus::ValidStructure`] as structural validity only, never as trust or authorization.
 #[must_use]
 pub fn check_cert_pem(pem_str: &str) -> CertPemStatus {
     if pem_str.len() > MAX_PUBLIC_CERT_PEM_BYTES {
@@ -386,7 +386,7 @@ mod tests {
 
     #[test]
     fn sha256_fingerprint_does_not_contain_private_key_material() {
-        // Fingerprints are derived from PEM bytes — they must never embed raw PEM or key data.
+        // Fingerprints are derived from PEM bytes; they must never embed raw PEM or key data.
         let fp = sha256_fingerprint(SAMPLE_CERT_PEM);
         assert!(!fp.contains("CERTIFICATE"), "fingerprint must not contain PEM header");
         assert!(

@@ -6,7 +6,7 @@
 //! computed over the [RFC 8785][] canonical form of the semantic payload.
 //! The semantic payload includes `network`, `local_site`, and `candidates`,
 //! plus `selection_policy` when present, so the revision changes only when
-//! routing behavior changes — timestamp and provenance changes are no-ops.
+//! routing behavior changes; timestamp and provenance changes are no-ops.
 //!
 //! The envelope is published as the `routing-overlay.json` key in the overlay
 //! `ConfigMap`, alongside the `routing-config.json` legacy key.
@@ -112,7 +112,7 @@ pub struct OverlayScope {
 
 /// Provenance metadata for audit and debugging.
 ///
-/// Evidence only — not included in the semantic digest.
+/// Evidence only, not included in the semantic digest.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct OverlayProvenance {
     /// Producer identifier (`"grid-operator"`).
@@ -599,7 +599,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Fixture validation (read-only — never writes to the source tree)
+    // Fixture validation (read-only, never writes to the source tree)
     // -----------------------------------------------------------------------
 
     #[test]

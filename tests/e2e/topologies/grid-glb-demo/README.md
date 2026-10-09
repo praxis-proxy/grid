@@ -1,4 +1,4 @@
-# grid-glb-demo — Internal E2E Topology
+# grid-glb-demo: Internal E2E Topology
 
 Internal test topology for the AGN global-ingress E2E scenario.
 

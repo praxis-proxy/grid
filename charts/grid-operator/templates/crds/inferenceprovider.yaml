@@ -373,7 +373,7 @@ spec:
                     queueCapacity:
                       description: |-
                         Maximum queue slot count for normalising a raw queue-size metric to
-                        0.0–1.0.
+                        the 0.0 to 1.0 range.
 
                         When set, the `queue_depth` signal value is divided by this capacity
                         and clamped to `[0.0, 1.0]` before scoring.  This allows consuming raw
@@ -381,7 +381,7 @@ spec:
                         without requiring the exporter to pre-normalise.
 
                         When absent, the `queue_depth` signal must already be normalised to
-                        0.0–1.0 by the exporter (backward compatible).
+                        the 0.0 to 1.0 range by the exporter (backward compatible).
                       format: uint32
                       minimum: 1.0
                       nullable: true
@@ -395,7 +395,7 @@ spec:
                         neutral default value (`0.5`) in scoring.
                       properties:
                         errorRate:
-                          description: Metric name for normalised error rate (0.0–1.0).
+                          description: Metric name for normalised error rate (0.0 to 1.0).
                           nullable: true
                           type: string
                         healthy:
@@ -403,7 +403,7 @@ spec:
                           nullable: true
                           type: string
                         kvCacheUtilization:
-                          description: Metric name for KV-cache utilisation (0.0–1.0).
+                          description: Metric name for KV-cache utilisation (0.0 to 1.0).
                           nullable: true
                           type: string
                         latencyP99Ms:
@@ -411,11 +411,11 @@ spec:
                           nullable: true
                           type: string
                         prefixCacheHitRatio:
-                          description: Metric name for prefix-cache hit ratio (0.0–1.0).
+                          description: Metric name for prefix-cache hit ratio (0.0 to 1.0).
                           nullable: true
                           type: string
                         queueDepth:
-                          description: Metric name for normalised queue depth (0.0–1.0).
+                          description: Metric name for normalised queue depth (0.0 to 1.0).
                           nullable: true
                           type: string
                         readyEndpoints:

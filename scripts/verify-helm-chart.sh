@@ -13,7 +13,7 @@ OPERATOR_IMAGE="ghcr.io/praxis-proxy/grid-operator"
 OPERATOR_TAG="${GRID_OPERATOR_CI_TAG:-v0.1.5}"
 DEFAULT_GATEWAY_IMAGE="ghcr.io/praxis-proxy/ai:0.4.0"
 
-# ── Helpers ────────────────────────────────────────────────────────────
+# Helpers
 
 pass() { PASS=$((PASS + 1)); echo "  PASS: $1"; }
 fail() { FAIL=$((FAIL + 1)); echo "  FAIL: $1" >&2; }
@@ -93,7 +93,7 @@ echo "======================================================================"
 echo "  Grid Operator Chart ($CHART_DIR)"
 echo "======================================================================"
 
-# ── Helm lint ────────────────────────────────────────────────────────
+# Helm lint
 echo ""
 echo "=== Helm lint ==="
 if helm lint "$CHART_DIR" --strict 2>&1; then
@@ -102,7 +102,7 @@ else
   fail "helm lint --strict"
 fi
 
-# ── CRD synchronization ─────────────────────────────────────────────
+# CRD synchronization
 echo ""
 echo "=== CRD synchronization ==="
 # Chart CRDs are deploy/crds plus the chart's lifecycle annotations.
@@ -136,13 +136,13 @@ else
   fail "crd kustomization out of sync with $DEPLOY_CRDS (rerun scripts/generate-deployment-crds.sh)"
 fi
 
-# ── Default template rendering ───────────────────────────────────────
+# Default template rendering
 echo ""
 echo "=== Template rendering ==="
 helm template verify-default "$CHART_DIR" --namespace grid-system > "$RENDER_DIR/helm-rendered-operator.yaml" 2>/dev/null || true
 try_template "$CHART_DIR" "default values" --namespace grid-system
 
-# ── Variant renderings ──────────────────────────────────────────────
+# Variant renderings
 try_template "$CHART_DIR" "digest image" \
   --set image.digest=sha256:0000000000000000000000000000000000000000000000000000000000000000
 try_template "$CHART_DIR" "custom tag" --set image.tag=v1.2.3
@@ -248,7 +248,7 @@ try_template "$CHART_DIR" "hostile podLabels" \
 try_template "$CHART_DIR" "gateway discovery" \
   --set-string gateway.serviceName=edge-gateway --set-string gateway.port=8080
 
-# ── Verify selector protection ──────────────────────────────────────
+# Verify selector protection
 echo ""
 echo "=== Selector protection ==="
 RENDERED=$(helm template verify-sel "$CHART_DIR" \
@@ -261,7 +261,7 @@ else
   fail "selector: podLabels overrode app.kubernetes.io/name to '$POD_NAME_LABEL'"
 fi
 
-# ── Service link env vars ───────────────────────────────────────────
+# Service link env vars
 echo ""
 echo "=== Service links ==="
 # A Service named grid-gateway injects GRID_GATEWAY_PORT=tcp://..., which clap
@@ -293,7 +293,7 @@ for spec in "charts/grid-enrollment:3" "charts/grid-mock-providers:1" \
   fi
 done
 
-# ── Gateway discovery namespace ─────────────────────────────────────
+# Gateway discovery namespace
 echo ""
 echo "=== Gateway discovery namespace ==="
 # Without GRID_GATEWAY_NAMESPACE the operator reads the gateway Service in
@@ -354,7 +354,7 @@ try_template "$CHART_DIR" "gateway.namespace system with gateway.address" --set-
 try_template "$CHART_DIR" "gateway.namespace system opt-in" --set-string gateway.namespace=kube-system \
   --set gateway.allowSystemNamespace=true
 
-# ── Schema rejection ────────────────────────────────────────────────
+# Schema rejection
 echo ""
 echo "=== Schema rejection ==="
 try_reject "$CHART_DIR" "replicaCount=2" --set replicaCount=2
@@ -364,7 +364,7 @@ try_reject "$CHART_DIR" "invalid SWIM type" --set swim.service.type=ExternalName
 try_reject "$CHART_DIR" "unknown key" --set typoField=true
 try_template "$CHART_DIR" "subchart keys" --set enabled=true --set global.foo=bar
 
-# ── Metrics-dependent resource coherence ────────────────────────────
+# Metrics-dependent resource coherence
 echo ""
 echo "=== Metrics-dependent resources ==="
 RENDERED_NO_METRICS=$(helm template verify-nometrics "$CHART_DIR" \
@@ -383,7 +383,7 @@ else
   pass "serviceMonitor.enabled fails without metrics service"
 fi
 
-# ── Package ──────────────────────────────────────────────────────────
+# Package
 echo ""
 echo "=== Helm package ==="
 PKG_OUT=$(helm package "$CHART_DIR" -d "$WORK" 2>&1)
@@ -419,7 +419,7 @@ echo "======================================================================"
 # the chart default so this path validates the official Praxis AI contract.
 GW_REQ=(--set config.existingConfigMap=test-config)
 
-# ── Helm lint ────────────────────────────────────────────────────────
+# Helm lint
 echo ""
 echo "=== Helm lint ==="
 if helm lint "$GW_DIR" --strict "${GW_REQ[@]}" 2>&1; then
@@ -434,7 +434,7 @@ else
   fail "helm lint --strict (gateway, no values)"
 fi
 
-# ── Default template rendering ───────────────────────────────────────
+# Default template rendering
 echo ""
 echo "=== Template rendering ==="
 helm template verify-default "$GW_DIR" "${GW_REQ[@]}" --namespace grid-system > "$RENDER_DIR/helm-rendered-gateway.yaml" 2>/dev/null || true
@@ -445,7 +445,7 @@ else
   fail "gateway default image is not ${DEFAULT_GATEWAY_IMAGE}"
 fi
 
-# ── Variant renderings ──────────────────────────────────────────────
+# Variant renderings
 try_template "$GW_DIR" "edge gateway" "${GW_REQ[@]}" \
   --set nameOverride=edge-gateway \
   --set service.type=LoadBalancer \
@@ -471,7 +471,7 @@ try_template "$GW_DIR" "gateway with credentials" "${GW_REQ[@]}" \
 try_template "$GW_DIR" "hostile podLabels gateway" "${GW_REQ[@]}" \
   --set-string 'podLabels.app\.kubernetes\.io/name=hostile'
 
-# ── Example values rendering ────────────────────────────────────────
+# Example values rendering
 echo ""
 echo "=== Example values rendering ==="
 EXAMPLE_DIR="examples/helm/existing-clusters"
@@ -533,7 +533,7 @@ try_reject_msg "$GW_DIR" "example hub-site site gateway with the digest placehol
 try_reject_msg "charts/grid-site" "example hub-site site grid-site with the digest placeholder" "digest" \
   --namespace grid -f "$HS_VALUES/site-grid-site.yaml"
 
-# ── Verify fullnameOverride ──────────────────────────────────────────
+# Verify fullnameOverride
 echo ""
 echo "=== fullnameOverride (gateway) ==="
 DEFAULT_SVC_NAME=$(helm template consumer-gateway "$GW_DIR" "${GW_REQ[@]}" \
@@ -555,7 +555,7 @@ else
   fail "fullname: expected consumer-gateway, got '$OVERRIDE_SVC_NAME'"
 fi
 
-# ── Verify selector protection ──────────────────────────────────────
+# Verify selector protection
 echo ""
 echo "=== Selector protection (gateway) ==="
 RENDERED=$(helm template verify-gw-sel "$GW_DIR" "${GW_REQ[@]}" \
@@ -568,7 +568,7 @@ else
   fail "selector: gateway podLabels overrode app.kubernetes.io/name to '$POD_NAME_LABEL'"
 fi
 
-# ── Schema rejection ────────────────────────────────────────────────
+# Schema rejection
 echo ""
 echo "=== Schema rejection (gateway) ==="
 try_template "$GW_DIR" "standalone default (no values)" --namespace praxis
@@ -598,7 +598,7 @@ try_reject_msg "$GW_DIR" "telemetry endpoint fragment credentials" \
   "gatewayConfig[./]telemetry[./]otlpEndpoint.*([Dd]oes not match pattern|does not match the regex)" \
   "${GW_REQ[@]}" --set-string 'gatewayConfig.telemetry.otlpEndpoint=https://collector:4317/otlp#token=sentinel'
 
-# ── Secure gateway config (render) ──────────────────────────────────
+# Secure gateway config (render)
 GW_RENDER=(--set gatewayConfig.render=true --set gatewayConfig.localSite=hub --set gatewayConfig.model=q --set gatewayConfig.auth.mode=none
   --set "gatewayConfig.backends[0].cluster=a" --set "gatewayConfig.backends[0].endpoints[0]=1.2.3.4:8000"
   --set "gatewayConfig.backends[0].transport.mode=plaintext")
@@ -982,7 +982,7 @@ else
   fail "rendered gateway config starts"
 fi
 
-# ── Package ──────────────────────────────────────────────────────────
+# Package
 echo ""
 echo "=== Helm package (gateway) ==="
 PKG_OUT=$(helm package "$GW_DIR" -d "$WORK" 2>&1)
@@ -1180,7 +1180,7 @@ if [ "${KIND:-}" = "1" ] || [ "${1:-}" = "--kind" ]; then
 
   KCTX="kind-${KIND_CLUSTER}"
 
-  # ── CRD kustomization ────────────────────────────────────────────
+  # CRD kustomization
   echo ""
   echo "=== CRD kustomization ==="
   if kubectl --context "$KCTX" apply --dry-run=server -k "$DEPLOY_CRDS" >/dev/null 2>&1; then
@@ -1189,13 +1189,13 @@ if [ "${KIND:-}" = "1" ] || [ "${1:-}" = "--kind" ]; then
     fail "kind: crds apply -k (server dry-run)"
   fi
 
-  # Build install args — use CI tag override when set
+  # Build install args; use CI tag override when set
   OP_INSTALL_ARGS=()
   if [ -n "${GRID_OPERATOR_CI_TAG:-}" ]; then
     OP_INSTALL_ARGS+=(--set "image.tag=${OPERATOR_TAG}")
   fi
 
-  # ── Grid operator lifecycle ──────────────────────────────────────
+  # Grid operator lifecycle
   echo ""
   echo "=== Grid Operator Kind lifecycle ==="
 
@@ -1244,10 +1244,10 @@ if [ "${KIND:-}" = "1" ] || [ "${1:-}" = "--kind" ]; then
     if echo "$METRICS_OUT" | matches '# HELP'; then
       pass "kind: operator /metrics endpoint"
     else
-      pass "kind: operator /metrics endpoint (skipped — operator not healthy)"
+      pass "kind: operator /metrics endpoint (skipped: operator not healthy)"
     fi
   else
-    pass "kind: operator /metrics endpoint (skipped — metrics service not found)"
+    pass "kind: operator /metrics endpoint (skipped: metrics service not found)"
   fi
 
   SA="system:serviceaccount:grid-system:grid-operator"
@@ -1255,14 +1255,14 @@ if [ "${KIND:-}" = "1" ] || [ "${1:-}" = "--kind" ]; then
   if [ "$RBAC_RESULT" = "yes" ]; then
     pass "kind: rbac positive (grid-system)"
   else
-    fail "kind: rbac positive (grid-system) — got: $RBAC_RESULT"
+    fail "kind: rbac positive (grid-system), got: $RBAC_RESULT"
   fi
 
   RBAC_RESULT=$(kubectl --context "$KCTX" auth can-i get secrets -n default --as="$SA" 2>/dev/null || true)
   if [ "$RBAC_RESULT" = "no" ]; then
     pass "kind: rbac negative (default)"
   else
-    fail "kind: rbac negative (default) — got: $RBAC_RESULT"
+    fail "kind: rbac negative (default), got: $RBAC_RESULT"
   fi
 
   kubectl --context "$KCTX" create namespace added-ns 2>/dev/null || true
@@ -1278,7 +1278,7 @@ if [ "${KIND:-}" = "1" ] || [ "${1:-}" = "--kind" ]; then
   if [ "$RBAC_RESULT" = "yes" ]; then
     pass "kind: rbac added namespace"
   else
-    fail "kind: rbac added namespace — got: $RBAC_RESULT"
+    fail "kind: rbac added namespace, got: $RBAC_RESULT"
   fi
 
   kubectl --context "$KCTX" apply -f - <<'CR_EOF' 2>/dev/null || true
@@ -1311,7 +1311,7 @@ CR_EOF
     fail "kind: custom resource removed on uninstall"
   fi
 
-  # ── Praxis gateway lifecycle ─────────────────────────────────────
+  # Praxis gateway lifecycle
   # Scope: chart install/upgrade/uninstall wiring and Kubernetes
   # resource creation. Uses pause:3.9 by default because no Praxis
   # binary is available in Kind CI; probes are disabled accordingly.
@@ -1395,7 +1395,7 @@ echo "======================================================================"
 echo "  Install Script Validation ($SCRIPT_DIR)"
 echo "======================================================================"
 
-# ── Syntax check ────────────────────────────────────────────────────
+# Syntax check
 echo ""
 echo "=== Syntax check (bash -n) ==="
 for script in install.sh preflight.sh verify.sh uninstall.sh; do
@@ -1406,7 +1406,7 @@ for script in install.sh preflight.sh verify.sh uninstall.sh; do
   fi
 done
 
-# ── Cold-install ordering ──────────────────────────────────────────
+# Cold-install ordering
 echo ""
 echo "=== Cold-install ordering ==="
 INSTALL_ORDER=$(grep -n 'helm upgrade --install' "$SCRIPT_DIR/install.sh" \
@@ -1429,16 +1429,16 @@ else
   fail "install order: overlay wait ($OVERLAY_WAIT_LINE) → provider ($PROVIDER_LINE) → consumer ($CONSUMER_LINE)"
 fi
 
-# ── Mock opt-in/out ───────────────────────────────────────────────
+# Mock opt-in/out
 echo ""
 echo "=== Mock provider opt-in/out ==="
 if grep -q "if \\[\\[ -f \"\$MOCK_VALUES\" \\]\\]" "$SCRIPT_DIR/install.sh"; then
   pass "mock install guarded by values file presence"
 else
-  fail "mock install not guarded — always installs"
+  fail "mock install not guarded; always installs"
 fi
 
-# ── Stable IDs from overlay ──────────────────────────────────────
+# Stable IDs from overlay
 echo ""
 echo "=== Stable ID handling ==="
 if grep -q 'render_provider_config' "$SCRIPT_DIR/install.sh"; then
@@ -1457,7 +1457,7 @@ else
   fail "install.sh contains shell-based hash computation"
 fi
 
-# ── Prerequisite checks ─────────────────────────────────────────
+# Prerequisite checks
 echo ""
 echo "=== Prerequisite checks ==="
 for cmd in kubectl helm yq jq python3; do
@@ -1474,7 +1474,7 @@ else
   fail "preflight missing yq version check"
 fi
 
-# ── Verify script overlay key ───────────────────────────────────
+# Verify script overlay key
 echo ""
 echo "=== Verify script consistency ==="
 if grep -q 'routing-config' "$SCRIPT_DIR/verify.sh"; then
@@ -1493,7 +1493,7 @@ else
   fail "verify.sh still uses nested .overlay.candidates[] path"
 fi
 
-# ── Uninstall reverse order ─────────────────────────────────────
+# Uninstall reverse order
 echo ""
 echo "=== Uninstall reverse order ==="
 UNINSTALL_ORDER=$(grep -n 'helm uninstall' "$SCRIPT_DIR/uninstall.sh" \
@@ -1504,7 +1504,7 @@ else
   fail "uninstall order: expected mock → site → operator, got: $UNINSTALL_ORDER"
 fi
 
-# ── ConfigMap cleanup in uninstall ──────────────────────────────
+# ConfigMap cleanup in uninstall
 echo ""
 echo "=== ConfigMap cleanup ==="
 if grep -q 'provider-praxis-config' "$SCRIPT_DIR/uninstall.sh" \
@@ -1514,7 +1514,7 @@ else
   fail "uninstall.sh does not clean up installer-created ConfigMaps"
 fi
 
-# ── Value precedence ────────────────────────────────────────────
+# Value precedence
 echo ""
 echo "=== Value precedence ==="
 if grep -q 'valuesDir' "$SCRIPT_DIR/install.sh"; then
@@ -1534,7 +1534,7 @@ else
   fail "install.sh override ordering unclear"
 fi
 
-# ── Provider workflow tests ────────────────────────────────────
+# Provider workflow tests
 echo ""
 echo "=== Provider workflow ==="
 
@@ -1548,7 +1548,7 @@ try_template "$SITE_DIR" "three providers" --namespace grid-system \
     {"name":"prov-c","gridNetworkRef":"test-grid","providerKind":"InCluster","backendKind":"Mock","endpoint":"http://c:8080"}
   ]'
 
-# Duplicate provider name renders (Helm doesn't enforce uniqueness — K8s API does)
+# Duplicate provider name renders (Helm doesn't enforce uniqueness; K8s API does)
 DUPE_RENDER=$(helm template verify-dupe "$SITE_DIR" --namespace grid-system \
   --set gridNetwork.name=test-grid --set gridNetwork.gridId=test-id \
   --set gridSite.name=test-site --set gridSite.providerSiteLabel=test-site \
@@ -1645,7 +1645,7 @@ else
   fail "docs/README.md missing adding-provider link"
 fi
 
-# ── Example values rendering ───────────────────────────────────
+# Example values rendering
 echo ""
 echo "=== Example values rendering (install scripts) ==="
 if [[ -f "$EXAMPLE_DIR/inventory.example.yaml" ]]; then
@@ -1835,7 +1835,7 @@ for f in "$HS_VALUES"/*.yaml; do
   same_render "example hub-site $role" "$chart" --namespace grid -f "$f" "${extra[@]}"
 done
 
-# ── Summary ──────────────────────────────────────────────────────────
+# Summary
 echo ""
 echo "=== Summary ==="
 echo "  Passed: $PASS"

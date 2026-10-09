@@ -8,7 +8,7 @@ export interface StaleBannerProps {
 /**
  * Across the top of the map while no snapshot has arrived for three poll
  * intervals. The ticking age lives in a sibling span outside the alert
- * region, not inside it — otherwise a screen reader would re-announce the
+ * region, not inside it; otherwise a screen reader would re-announce the
  * whole banner every second as the age counts up.
  */
 export default function StaleBanner({ lastUpdate }: StaleBannerProps) {

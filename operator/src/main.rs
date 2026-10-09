@@ -1040,7 +1040,7 @@ fn hostname_or_default() -> String {
 /// trigger reconciliation of affected `GridNetwork`s when providers change.
 ///
 /// Metrics TLS rotation is detected by bounded requeue rather than a
-/// cluster-wide Secret watch — the operator only reads referenced
+/// cluster-wide Secret watch; the operator only reads referenced
 /// Secrets by explicit namespace/name during reconciliation.
 #[expect(
     clippy::too_many_lines,
@@ -1148,7 +1148,7 @@ async fn run_site_controller(client: Client) -> Result<(), Box<dyn std::error::E
 /// Run the [`InferenceProvider`] controller (OP-02).
 ///
 /// Watches `InferenceProvider` resources.  Metrics TLS rotation is detected
-/// by bounded requeue rather than a cluster-wide Secret watch — the operator
+/// by bounded requeue rather than a cluster-wide Secret watch; the operator
 /// only reads referenced Secrets by explicit namespace/name during
 /// reconciliation.
 ///

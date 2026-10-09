@@ -5921,7 +5921,7 @@ fn append_secondary_mock_config(
     candidate_id: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
     if config.contains("vcr-backend-secondary") {
-        return Err("secondary route or cluster already present in config — refusing to append twice".into());
+        return Err("secondary route or cluster already present in config; refusing to append twice".into());
     }
 
     let deploy_name = format!("vcr-inference-{site}-secondary");
