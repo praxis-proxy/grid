@@ -141,7 +141,7 @@ pub enum ConsumerConfigError {
     /// A `plaintext` cluster endpoint has an SNI field set.
     ///
     /// Plaintext transport does not use TLS, so `sni` has no effect.
-    /// Setting it is almost certainly a configuration mistake — the author
+    /// Setting it is almost certainly a configuration mistake; the author
     /// likely intended `mutual_tls`.
     #[error(
         "plaintext transport for cluster {cluster:?} must not set sni (sni does not enable TLS; use mutual_tls if TLS is intended)"
@@ -406,7 +406,7 @@ pub(crate) fn generate_consumer_praxis_config_with_telemetry(
         config.push_str(&render_telemetry(telemetry)?);
     }
 
-    // Admin interface and graceful shutdown — standard constants for consumer gateways.
+    // Admin interface and graceful shutdown use standard constants for consumer gateways.
     config.push_str("\nadmin:\n  address: \"127.0.0.1:9901\"\nshutdown_timeout_secs: 5\n");
 
     Ok(config)
@@ -2448,7 +2448,7 @@ mod tests {
             8080,
         )
         .unwrap();
-        // Count occurrences of the file path — should be exactly 1.
+        // Count occurrences of the file path; it should be exactly 1.
         let count = yaml
             .matches("file: \"/run/secrets/grid-credentials/shared-creds/token\"")
             .count();
@@ -2545,7 +2545,7 @@ mod tests {
             8080,
         )
         .unwrap();
-        // Ensure 'value:' does not appear — that would indicate static header injection.
+        // Ensure 'value:' does not appear, since that would indicate static header injection.
         assert!(!yaml.contains("value:"), "must not emit value: in generated config");
     }
 

@@ -1,6 +1,6 @@
 //! Prometheus metrics for gateway probe observability.
 //!
-//! All label values are bounded enum variants — no site names,
+//! All label values are bounded enum variants: no site names,
 //! addresses, fingerprints, or PEM content.
 
 use std::{sync::LazyLock, time::Duration};
@@ -306,7 +306,7 @@ const SITE_PHASE_MAX_AGE: Duration = Duration::from_secs(900);
 /// `AgentToolProvider` phase transitions by source phase, target phase, and reason.
 ///
 /// Kept as a distinct metric (rather than reusing [`PHASE_TRANSITIONS`]) so
-/// dashboards can alert on each CRD's convergence independently — see grid#9.
+/// dashboards can alert on each CRD's convergence independently; see grid#9.
 static AGENT_TOOL_PROVIDER_PHASE_TRANSITIONS: LazyLock<IntCounterVec> = LazyLock::new(|| {
     IntCounterVec::new(
         Opts::new(
@@ -323,7 +323,7 @@ static AGENT_TOOL_PROVIDER_PHASE_TRANSITIONS: LazyLock<IntCounterVec> = LazyLock
 /// The `outcome` label comes from
 /// [`mcp_probe::mcp_probe_outcome_label`](crate::resources::mcp_probe::mcp_probe_outcome_label),
 /// which is deliberately bounded to the fixed `McpProbeOutcome` variant set
-/// — never the free-form reason string `TlsConfigInvalid` carries — so this
+/// (never the free-form reason string `TlsConfigInvalid` carries), so this
 /// metric's cardinality stays fixed regardless of how many distinct Secret
 /// misconfigurations occur in the cluster.
 static MCP_PROBE_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {

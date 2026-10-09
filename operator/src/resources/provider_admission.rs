@@ -562,7 +562,7 @@ mod tests {
             ),
             AdmissionState::ExistingOnly
         );
-        // Same generation repeated — must not advance recovery counter.
+        // Same generation repeated must not advance recovery counter.
         let repeated = fresh(metrics(0.10, 0.1, true), 3);
         assert_eq!(
             memory.evaluate("p", repeated, p, start + Duration::from_secs(30)),

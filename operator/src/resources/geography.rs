@@ -4,7 +4,7 @@
 //! `AdmissionState` (bounded load admission), and helpers to derive
 //! both from [`GridSite`] geography and [`BackendMetrics`].
 //!
-//! All functions are pure — no I/O, no Kubernetes calls.  The overlay
+//! All functions are pure: no I/O, no Kubernetes calls.  The overlay
 //! renderer in the `routing_overlay` module calls these during candidate
 //! enrichment, before the final ordering pass.
 //!
@@ -32,7 +32,7 @@ const KV_CACHE_SATURATION: f64 = 0.90;
 /// Distance classification between consumer and provider sites.
 ///
 /// Derived from [`GridSite`] `spec.region` and `spec.zone` fields.
-/// Declaration order matches the desired sort order — closest first —
+/// Declaration order matches the desired sort order (closest first),
 /// so the derived [`Ord`] implementation orders correctly.
 ///
 /// [`GridSite`]: crate::crd::grid_site::GridSite
@@ -67,7 +67,7 @@ pub enum LocalityTier {
 pub enum AdmissionState {
     /// Accepts new sessions and established sessions.
     NewAndExisting,
-    /// Preserves established sessions only — no new sessions.
+    /// Preserves established sessions only; no new sessions.
     ExistingOnly,
     /// Not eligible for routing.  Serialises as `"none"`.
     #[serde(rename = "none")]

@@ -1000,7 +1000,7 @@ const WITHDRAWAL_PUBLICATION_TIMEOUT: Duration = Duration::from_secs(5);
 ///
 /// When this label is present with value `"true"`, the `GridNetwork` controller
 /// creates `GridSite` resources for remote Alive SWIM members automatically.
-/// Networks without this label are unaffected — their overlay generation uses
+/// Networks without this label are unaffected; their overlay generation uses
 /// the existing `routingClusterRef`-based (Phase 1) fallback.
 ///
 /// This opt-in gate prevents auto-discovery from changing the overlay generation
@@ -1023,7 +1023,7 @@ pub const ANNOTATION_SITE_ID: &str = "grid.praxis.fast/site-id";
 ///
 /// Returns `Some(ObjectRef)` for the `GridNetwork` named by
 /// `spec.gridNetworkRef`, or `None` when the field is blank (which would
-/// indicate a malformed resource — we silently skip rather than panic or
+/// indicate a malformed resource; we silently skip rather than panic or
 /// trigger spurious reconciles).
 ///
 /// Used by the [`GridNetwork`] controller's cross-resource watch so that
@@ -1338,7 +1338,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
         announce_crd_seeds(&network, swim, &ctx.last_seeds).await;
 
         // Broadcast the local site's public certificate PEM so remote peers can
-        // populate GridSite.status.publicCertPem.  Only the public cert is read —
+        // populate GridSite.status.publicCertPem.  Only the public cert is read;
         // the private key (tls.key) is never accessed by this code path.
         if let Ok(Some(cert_pem)) = secret::read_site_cert_pem(client, network.spec.tls.site_secret_ref.as_ref()).await
         {
@@ -1495,7 +1495,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
 
     // Apply stale candidate GC policy: omit remote providers whose Dead/Suspect age
     // exceeds the configured TTL.  With the default policy (TTL=None, absent field)
-    // this is a no-op — runtime behaviour is unchanged from pre-GC.
+    // this is a no-op, so runtime behaviour is unchanged from pre-GC.
     let stale_policy = routing_overlay::stale_policy_from_spec(network.spec.stale_candidate_ttl_seconds);
     let remote_crdt_providers =
         routing_overlay::apply_stale_gc_filter(&remote_crdt_providers, membership.as_ref(), &stale_policy);
@@ -1552,7 +1552,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
 
     // Resolve per-tenant budget status from the merged CRDT spend state, if any.
     // Empty tenant_spend (SWIM disabled, or no spend broadcast received yet) is
-    // indistinguishable here from "no spend recorded" — resolve_budget_statuses
+    // indistinguishable here from "no spend recorded"; resolve_budget_statuses
     // still emits a zero-spend entry for every policy-declared tenant.
     let tenant_spend = ctx
         .swim()
@@ -1745,7 +1745,7 @@ pub fn error_policy(_network: Arc<GridNetwork>, error: &OperatorError, _ctx: Arc
 /// - `removed`: seeds in `previous` that are not in `desired`.
 ///
 /// Both sides are sorted deterministically.  This is a pure function with no
-/// I/O — suitable for unit tests and for logging seed changes between reconciles.
+/// I/O, suitable for unit tests and for logging seed changes between reconciles.
 ///
 /// # Removal semantics
 ///
@@ -1766,13 +1766,13 @@ pub(crate) fn diff_seed_sets(previous: &[SocketAddr], desired: &[SocketAddr]) ->
 /// Announce `network.spec.seeds` to the live SWIM runtime.
 ///
 /// Called once per reconcile.  Re-announcing to existing members is
-/// idempotent — foca ignores redundant joins.
+/// idempotent: foca ignores redundant joins.
 ///
 /// # Runtime update semantics
 ///
 /// Seeds added to `spec.seeds` since the last reconcile are logged as
 /// additions via [`diff_seed_sets`].  Seeds removed from `spec.seeds` are
-/// logged as removals but are **not actively disconnected** — the SWIM
+/// logged as removals but are **not actively disconnected**; the SWIM
 /// protocol's own failure detection handles peers that stop responding.
 /// The full current seed set is always announced to ensure resilience against
 /// channel-full drops from previous reconciles.
@@ -1865,7 +1865,7 @@ async fn announce_crd_seeds(
             network = name,
             count = removed.len(),
             ?addrs,
-            "CRD seeds removed from spec; no active disconnect — SWIM failure detection handles stale peers"
+            "CRD seeds removed from spec; no active disconnect (SWIM failure detection handles stale peers)"
         );
     }
 
@@ -2086,7 +2086,7 @@ fn site_phases(sites: &[GridSite]) -> impl Iterator<Item = (&str, &'static str)>
 ///
 /// Lists all [`InferenceProvider`]s and [`GridSite`]s cluster-wide, then
 /// renders one overlay `ConfigMap` per `gatewayRef`.  Each gateway may
-/// declare its own `localSiteName` — the `local_site` in the overlay for
+/// declare its own `localSiteName`: the `local_site` in the overlay for
 /// gateway G is `G.localSiteName ?? network_name`.  This ensures that in a
 /// multi-gateway network each gateway's overlay identifies the correct local
 /// site.  A network with no `gatewayRefs` is a no-op.
@@ -4367,13 +4367,13 @@ fn determine_phase(network: &GridNetwork, grid_id: &str, membership: Option<&Mem
     }
     // No live phase hint. `phase_hint` returns `Some` only when at least one
     // Alive/Degraded peer exists, so we reach here when the network has no peers
-    // yet — either the SWIM runtime is not up (`membership` is `None`) or it is
+    // yet: either the SWIM runtime is not up (`membership` is `None`) or it is
     // up but no peers have joined (`Some`, empty snapshot).
     let has_tls = network.spec.tls.ca_secret_ref.is_some();
     if !has_tls {
         return GridNetworkPhase::Pending;
     }
-    // A single-site / combined deployment legitimately has zero SWIM peers —
+    // A single-site / combined deployment legitimately has zero SWIM peers;
     // peers are other *sites*, not intra-site gateways or pods. When no seeds
     // are configured, this network is standalone, so a running SWIM runtime
     // (`membership.is_some()`) with TLS trust material is a locally operational
@@ -4666,7 +4666,7 @@ pub(crate) fn tool_names_from_agent_tool_provider(provider: &AgentToolProvider) 
 /// `grid_id` (the caller's already-[`resolve_grid_id`]d value) is attached to
 /// the broadcast so a signature over this `GridNetwork`'s state cannot be
 /// replayed as valid for a different `GridNetwork` sharing the same
-/// cluster's `SwimHandle` — see [`swim::StateBroadcast::grid_id`].
+/// cluster's `SwimHandle`; see [`swim::StateBroadcast::grid_id`].
 /// Upsert a CRDT provider state, registering model capabilities and advancing
 /// `max_revision`. Tool names remain only on the provider record.
 fn upsert_provider_with_capabilities(
@@ -4737,7 +4737,7 @@ fn detach_tool_catalogs(broadcast: &mut swim::StateBroadcast) -> Vec<ToolCatalog
 
 /// Reinsert catalog entries round-robin while each encoded snapshot still fits.
 ///
-/// Exits early once a full round produces no new retained tools — further
+/// Exits early once a full round produces no new retained tools, since further
 /// rounds cannot fit either (inference baseline is fixed, only tools grow).
 fn retain_tool_catalogs_within_budget(
     broadcast: &mut swim::StateBroadcast,
@@ -4909,7 +4909,7 @@ fn publish_real_provider_state(
     let mut bc = provider_state_broadcast(site_name, grid_id, max_revision, snap, swim.gateway_address());
     fit_provider_tools_to_swim_budget(&mut bc);
     if let Err(e) = swim.publish_state_broadcast(bc) {
-        tracing::debug!(error = %e, "CRDT broadcast channel unavailable — runtime not yet receiving");
+        tracing::debug!(error = %e, "CRDT broadcast channel unavailable (runtime not yet receiving)");
     }
 }
 
@@ -4924,7 +4924,7 @@ fn count_remote_provider_records(swim: &SwimHandle, network_name: &str) -> u32 {
 /// - have `network_id == network_name` (belong to this [`GridNetwork`]);
 /// - have `site_id != swim.site_name()` (originate from a remote site).
 ///
-/// [`crdt::ProviderPhase::Unavailable`] providers are retained here —
+/// [`crdt::ProviderPhase::Unavailable`] providers are retained here;
 /// [`routing_overlay::crdt_phase_to_fresh`] applies phase-based exclusion
 /// during candidate generation, keeping the boundary clear between collection
 /// and rendering.
@@ -5197,7 +5197,7 @@ pub(crate) fn consumer_config_status_disabled(
 /// # Security
 ///
 /// `message` is derived from the `OperatorError` `Display` impl only.  That
-/// impl never includes credential token bytes — error messages describe
+/// impl never includes credential token bytes; error messages describe
 /// structural failures (blank fields, JSON errors, Kubernetes API errors).
 pub(crate) fn consumer_config_status_error(
     gw_ref: &GatewayRef,
@@ -5275,7 +5275,7 @@ fn network_site_name(network: &GridNetwork) -> String {
 /// exists in `sites`.
 ///
 /// Local providers (`provider.site_id == local_site`) are excluded from this
-/// function's input by the caller — they are always eligible and use a separate
+/// function's input by the caller; they are always eligible and use a separate
 /// rendering path.
 ///
 /// Providers with no matching `GridSite`, a `GridSite` in any phase other than
@@ -5296,7 +5296,7 @@ pub(crate) fn filter_eligible_remote_crdt_providers<'ctx>(
 /// Return `true` when the `GridSite` corresponding to `provider` is routing-eligible.
 ///
 /// Eligibility requires an `Active` `GridSite` matching the provider's network and site
-/// identity.  All other outcomes — missing `GridSite`, wrong network, wrong phase —
+/// identity.  All other outcomes (missing `GridSite`, wrong network, wrong phase)
 /// are ineligible.
 ///
 /// This is a pure function with no I/O, suitable for unit testing.
@@ -5344,7 +5344,7 @@ pub(crate) struct DiscoveredSite {
     pub egress_address: String,
     /// Public site certificate PEM received from this peer via SWIM broadcast.
     ///
-    /// Contains only the public certificate — never a private key.
+    /// Contains only the public certificate, never a private key.
     /// `None` when the remote peer has not yet broadcast its certificate.
     pub site_cert_pem: Option<String>,
 }
@@ -5352,13 +5352,13 @@ pub(crate) struct DiscoveredSite {
 /// Derive the set of remote [`GridSite`]s the operator should maintain from the SWIM snapshot.
 ///
 /// Returns one [`DiscoveredSite`] per remote Alive SWIM member.  The local site
-/// and non-Alive (Suspect, Dead) members are excluded — only confirmed Alive
+/// and non-Alive (Suspect, Dead) members are excluded; only confirmed Alive
 /// peers should produce a `Discovered` record.
 ///
 /// Name derivation is deterministic: the SWIM `site_id` is sanitised to a valid
 /// Kubernetes resource name.
 ///
-/// This is a **pure function** — no Kubernetes API calls — and is
+/// This is a **pure function** (no Kubernetes API calls) and is
 /// suitable for unit testing in isolation.
 pub(crate) fn discovered_sites_from_swim(
     network_name: &str,
@@ -5732,7 +5732,7 @@ const CERT_PEM_MSG_TOO_LARGE: &str = "received cert PEM from remote site exceeds
 /// status for a received site cert PEM.
 ///
 /// Produced by the pure [`decide_cert_pem_write`] so the branching logic is
-/// unit-testable without a live Kubernetes API — see grid#42, where writing
+/// unit-testable without a live Kubernetes API; see grid#42, where writing
 /// unconditionally on every branch turned a stable, unchanged site into an
 /// infinite reconcile hot-loop.
 #[derive(Debug, Eq, PartialEq)]
@@ -5754,7 +5754,7 @@ enum CertPemWrite {
 /// Pure decision: given the current `GridSite` status and a freshly-checked
 /// [`CertPemStatus`], decide what (if anything) to write.
 ///
-/// Never itself touches the Kubernetes API — see [`CertPemWrite`].
+/// Never itself touches the Kubernetes API; see [`CertPemWrite`].
 fn decide_cert_pem_write(
     existing_status: Option<&GridSiteStatus>,
     cert_pem: &str,
@@ -5860,7 +5860,7 @@ async fn reconcile_site_cert_pem(
                 tracing::error!(
                     name = %site_name,
                     "SECURITY: received cert PEM contains private key markers from remote SWIM peer; \
-                     discarding — private keys must never appear in SWIM broadcasts"
+                     discarding: private keys must never appear in SWIM broadcasts"
                 );
             } else {
                 tracing::warn!(name = %site_name, %message, "rejected invalid cert PEM from remote site");
@@ -5965,7 +5965,7 @@ async fn reconcile_discovered_sites(
         // Fetch current status once and reuse it below for every write in this
         // iteration. Every status patch bumps the GridSite's resourceVersion,
         // which fires a watch event that re-triggers a GridNetwork reconcile
-        // (related object updated) — re-entering this same loop. Writing
+        // (related object updated), re-entering this same loop. Writing
         // unconditionally therefore turns a stable, unchanged site into an
         // infinite reconcile hot-loop; checking against current state first
         // makes each write idempotent in practice, not just in intent (see
@@ -6002,7 +6002,7 @@ async fn reconcile_discovered_sites(
         // Write received public cert PEM to status after structure validation.
         // Private key material must never be written to status; invalid PEM is
         // also rejected and recorded as TrustMaterialInvalid. Skips any patch
-        // that would be a no-op given `existing_status` — otherwise every
+        // that would be a no-op given `existing_status`; otherwise every
         // reconcile re-issues an unconditional write, which (per the comment
         // above `existing_status`) becomes an infinite reconcile hot-loop even
         // when the remote site's cert hasn't changed (grid#42).
@@ -7244,7 +7244,7 @@ mod tests {
     #[test]
     fn staleness_override_dead_then_alive_restores_phase() {
         // Recovery: provider was Degraded when west was Dead; after rejoin west is Alive
-        // and the override must no longer apply — phase returns to Available.
+        // and the override must no longer apply, so phase returns to Available.
         // This is the pure-function equivalent of the rejoin recovery proof.
         let provider = make_crdt_provider("site-west", crdt::ProviderPhase::Available);
 
@@ -7339,7 +7339,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // resolve_grid_id — pure ID resolution (three branches)
+    // resolve_grid_id: pure ID resolution (three branches)
     // -----------------------------------------------------------------------
 
     #[test]
@@ -7604,7 +7604,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // network_site_name — fallback helper
+    // network_site_name: fallback helper
     // -----------------------------------------------------------------------
 
     #[test]
@@ -7662,7 +7662,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // discovered_sites_from_swim — pure helper
+    // discovered_sites_from_swim: pure helper
     // -----------------------------------------------------------------------
 
     fn make_member(site_id: &str, endpoint: &str, status: MemberStatus) -> MemberRecord {
@@ -8423,7 +8423,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // already_recorded_invalid — grid#42 reconcile-hot-loop regression guard
+    // already_recorded_invalid: grid#42 reconcile-hot-loop regression guard
     // -----------------------------------------------------------------------
 
     fn invalid_cert_status(message: &str) -> GridSiteStatus {
@@ -8490,10 +8490,10 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // decide_cert_pem_write — grid#42 acceptance criterion:
+    // decide_cert_pem_write (grid#42 acceptance criterion):
     //
     //   "reconciling an unchanged remote site must decide NoOp for every
-    //    possible cert-PEM outcome" — i.e. a stable GridSite never causes a
+    //    possible cert-PEM outcome", i.e. a stable GridSite never causes a
     //    write, which is precisely the condition that stops the infinite
     //    reconcile hot-loop (repeated no-op writes bumping resourceVersion
     //    and re-triggering the reconciler). These tests assert that
@@ -8589,7 +8589,7 @@ mod tests {
 
     #[test]
     fn decide_cert_pem_write_re_rejects_when_recorded_reason_no_longer_matches() {
-        // Status shows a *different* rejection (or none) — must not be
+        // Status shows a *different* rejection (or none) and must not be
         // mistaken for "already handled".
         let recorded_other_reason = Some(invalid_cert_status(CERT_PEM_MSG_TOO_LARGE));
         assert_eq!(
@@ -8607,7 +8607,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // overlay_configmap_matches — grid#42 no-op write guard
+    // overlay_configmap_matches: grid#42 no-op write guard
     // -----------------------------------------------------------------------
 
     fn overlay_configmaps_for_test() -> (ConfigMap, ConfigMap, String) {

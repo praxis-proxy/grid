@@ -363,7 +363,7 @@ pub struct TenantBudgetConfig {
 /// and cross-site-converges the spend signal (via G-Counter CRDT, see
 /// [`crdt::GridStateSnapshot::tenant_spend`]) and exposes it in
 /// [`GridNetworkStatus::budget_status`]; it does **not** enforce budget
-/// limits itself — degrade/reject decisions are a gateway-side `praxis-ai`
+/// limits itself; degrade/reject decisions are a gateway-side `praxis-ai`
 /// policy-filter concern, not a Grid-side one.
 ///
 /// **Default (absent):** no tenants are tracked; `budgetStatus` is always empty.
@@ -457,7 +457,7 @@ pub(crate) fn cents_to_usd(cents: u64) -> f64 {
 /// - `cap_usd <= 0.0` (including non-finite) is treated defensively as "no budget available" and always returns `1.0`,
 ///   regardless of spend. The CRD schema and [`validate_budget_policy`] should already prevent this, but a caller
 ///   bypassing both must not panic or divide by zero.
-/// - Spend above the cap clamps to `1.0` rather than exceeding it — a real possibility, not a bug: G-Counter is
+/// - Spend above the cap clamps to `1.0` rather than exceeding it (a real possibility, not a bug): G-Counter is
 ///   monotonic and an individual site sees only a lower bound under partition, so local overspend is expected.
 #[must_use]
 pub fn spend_ratio(tenant_spend: &GCounter, cap_usd: f64) -> f64 {
@@ -471,7 +471,7 @@ pub fn spend_ratio(tenant_spend: &GCounter, cap_usd: f64) -> f64 {
 ///
 /// Populated in [`GridNetworkStatus::budget_status`] for every tenant
 /// declared in `spec.budgetPolicy`, regardless of whether spend has been
-/// recorded for that tenant yet. This is a status signal only — Grid does
+/// recorded for that tenant yet. This is a status signal only; Grid does
 /// not enforce budget limits (see [`BudgetPolicyConfig`] doc).
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -497,7 +497,7 @@ pub struct TenantBudgetStatus {
 /// `counter` is `None` when no spend has been recorded for this tenant yet;
 /// in that case both `spend_usd` and `spend_ratio` are `0.0` rather than
 /// delegating to [`spend_ratio`] (which would read a non-positive cap as
-/// maxed — not the right answer for "no traffic yet").
+/// maxed, not the right answer for "no traffic yet").
 fn tenant_budget_status(tenant: &TenantBudgetConfig, counter: Option<&GCounter>) -> TenantBudgetStatus {
     let (spend_usd, ratio) = counter.map_or((0.0, 0.0), |counter| {
         (cents_to_usd(counter.total()), spend_ratio(counter, tenant.cap_usd))
@@ -515,7 +515,7 @@ fn tenant_budget_status(tenant: &TenantBudgetConfig, counter: Option<&GCounter>)
 /// Driven by `policy.tenants`, not by `tenant_spend`: a tenant declared in
 /// the policy but with no recorded spend yet still gets an entry
 /// (`spendUsd: 0.0`); CRDT spend recorded for a tenant no longer declared in
-/// the policy is silently excluded — the policy is the source of truth for
+/// the policy is silently excluded; the policy is the source of truth for
 /// which tenants are tracked. Output is sorted by `tenantId` for
 /// deterministic status ordering.
 #[must_use]
@@ -534,7 +534,7 @@ pub fn tenant_spend_status(
 
 /// Resolve tenant budget statuses for [`GridNetworkStatus::budget_status`].
 ///
-/// `policy` is `None` when `spec.budgetPolicy` is absent — no tenants are
+/// `policy` is `None` when `spec.budgetPolicy` is absent; no tenants are
 /// tracked, so the result is always empty in that case.
 #[must_use]
 pub fn resolve_budget_statuses(
@@ -704,7 +704,7 @@ pub struct GridNetworkSpec {
     /// stops vouching for are collected after a fixed 24 hours, whatever this
     /// field is. Declared `GridSite` objects are never deleted.
     ///
-    /// **Default (absent):** stale candidates are retained indefinitely —
+    /// **Default (absent):** stale candidates are retained indefinitely,
     /// the same behaviour as before this field existed.
     ///
     /// **Minimum value:** `1` second.  The generated CRD schema rejects `0`.
@@ -759,7 +759,7 @@ pub struct GatewayRef {
 
     /// Opt-in configuration for operator-managed consumer Praxis config generation.
     ///
-    /// When absent or `enabled: false`, this gateway behaves exactly as before —
+    /// When absent or `enabled: false`, this gateway behaves exactly as before:
     /// only the routing overlay `ConfigMap` is applied.  When `enabled: true`, the
     /// operator additionally renders a consumer Praxis `ConfigMap` containing the
     /// inference-model `intelligent_route` candidates (with credential
@@ -1072,7 +1072,7 @@ fn default_praxis_container_name() -> String {
 ///
 /// Determines whether the consumer connects to the provider gateway
 /// cluster over mutual TLS, server-authenticated TLS, or plain HTTP. This is an explicit security
-/// decision — the operator refuses to render a cluster entry without a
+/// decision: the operator refuses to render a cluster entry without a
 /// declared transport mode, preventing accidental plaintext.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -1081,7 +1081,7 @@ pub enum TransportMode {
     MutualTls,
     /// Server-authenticated TLS without a client certificate.
     Tls,
-    /// Plain HTTP — no TLS.  Explicit insecure/dev-only mode.
+    /// Plain HTTP, no TLS.  Explicit insecure/dev-only mode.
     Plaintext,
 }
 
@@ -1316,7 +1316,7 @@ pub struct GridNetworkStatus {
     /// Per-tenant budget status, derived from `spec.budgetPolicy` and merged
     /// cross-site CRDT spend state.
     ///
-    /// Empty when `budgetPolicy` is absent. This is a status signal only —
+    /// Empty when `budgetPolicy` is absent. This is a status signal only;
     /// Grid does not enforce budget limits itself (see [`BudgetPolicyConfig`]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub budget_status: Vec<TenantBudgetStatus>,
@@ -1497,7 +1497,7 @@ pub enum OverlayPhase {
 /// # Security
 ///
 /// `rendered_revision`, `distributed_revision`, and `content_digest` are
-/// SHA-256 hex digests — they do not contain credential token bytes.
+/// SHA-256 hex digests; they do not contain credential token bytes.
 /// `message` must never contain credential bytes.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]

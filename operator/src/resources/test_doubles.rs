@@ -1,7 +1,7 @@
 //! Shared Kubernetes Secret test doubles for `resources` unit tests.
 //!
 //! Extracted from `secret.rs`/`endpoint_tls.rs`, which had grown byte-identical
-//! copies of the same mocked `kube::Client` builder — kept here once so the
+//! copies of the same mocked `kube::Client` builder, kept here once so the
 //! two copies cannot drift independently.
 //!
 //! Declared behind `#[cfg(test)]` at the `mod test_doubles;` site in

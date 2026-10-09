@@ -20,8 +20,8 @@
 //!   derive one.
 //! - **First sample wins.**  Labels are stripped before metric-name matching. If multiple samples share the same metric
 //!   name (different label sets), the first one encountered is used.
-//! - **`queue_depth` normalisation.**  The `queue_depth` signal is expected to be in the range 0.0–1.0.  If the server
-//!   exposes a raw queue length (an integer count), the caller must either normalise it externally (e.g. via a
+//! - **`queue_depth` normalisation.**  The `queue_depth` signal is expected to be in the range 0.0 to 1.0.  If the
+//!   server exposes a raw queue length (an integer count), the caller must either normalise it externally (e.g. via a
 //!   recording rule) or document the expected maximum.
 
 use scoring::BackendMetrics;
@@ -58,7 +58,7 @@ const SCORING_MAX_LATENCY_MS: f64 = 5000.0;
 /// the names that their inference backend exposes.
 #[derive(Clone, Debug, Default)]
 pub struct MetricNames {
-    /// Metric name for request error rate (normalised 0.0–1.0).
+    /// Metric name for request error rate (normalised 0.0 to 1.0).
     ///
     /// If absent and no `healthy` gauge is configured, the backend is assumed
     /// to have no errors.
@@ -70,7 +70,7 @@ pub struct MetricNames {
     /// If both are absent, the backend is assumed healthy (conservative default).
     pub healthy: Option<String>,
 
-    /// Metric name for KV cache utilisation (normalised 0.0–1.0).
+    /// Metric name for KV cache utilisation (normalised 0.0 to 1.0).
     pub kv_cache_utilization: Option<String>,
 
     /// Metric name for observed P99 latency in **milliseconds**.
@@ -79,14 +79,14 @@ pub struct MetricNames {
     /// supported in v1; configure a recording rule if needed.
     pub latency_p99_ms: Option<String>,
 
-    /// Metric name for prefix cache hit ratio (normalised 0.0–1.0).
+    /// Metric name for prefix cache hit ratio (normalised 0.0 to 1.0).
     pub prefix_cache_hit_ratio: Option<String>,
 
-    /// Metric name for normalised queue depth (0.0–1.0).
+    /// Metric name for normalised queue depth (0.0 to 1.0).
     ///
     /// When [`MetricNames::queue_capacity`] is set, the raw value from this
     /// metric is divided by the capacity and clamped.  Otherwise the exporter
-    /// must pre-normalise to 0.0–1.0.
+    /// must pre-normalise to the 0.0 to 1.0 range.
     pub queue_depth: Option<String>,
 
     /// Expected Prometheus `name` label value for pool-level metric selection.
@@ -143,12 +143,12 @@ impl PartialMetrics {
     ///
     /// | Field | Default when absent |
     /// |-------|---------------------|
-    /// | `healthy` | `true` — backend is assumed healthy until proven otherwise |
-    /// | `error_rate` | `0.0` — no errors observed |
-    /// | `queue_depth` | `0.5` — neutral score for missing queue data |
-    /// | `kv_cache_utilization` | `0.5` — neutral score for missing cache data |
-    /// | `latency_p99_ms` | `2500.0` — neutral score with current scoring normalization |
-    /// | `prefix_cache_hit_ratio` | `0.5` — neutral score for missing prefix-cache data |
+    /// | `healthy` | `true` (backend is assumed healthy until proven otherwise) |
+    /// | `error_rate` | `0.0` (no errors observed) |
+    /// | `queue_depth` | `0.5` (neutral score for missing queue data) |
+    /// | `kv_cache_utilization` | `0.5` (neutral score for missing cache data) |
+    /// | `latency_p99_ms` | `2500.0` (neutral score with current scoring normalization) |
+    /// | `prefix_cache_hit_ratio` | `0.5` (neutral score for missing prefix-cache data) |
     ///
     /// The `healthy` bool is derived as follows:
     /// - If a health gauge was scraped: positive non-zero → `true`, zero → `false`.
@@ -204,7 +204,7 @@ impl PartialMetrics {
 /// The first sample matching a configured name (and pool name, when set) is
 /// used; subsequent samples with the same name are ignored.
 ///
-/// Malformed lines — those that lack a parseable float value — are silently
+/// Malformed lines (those that lack a parseable float value) are silently
 /// skipped.
 ///
 /// # Returns
@@ -216,7 +216,7 @@ impl PartialMetrics {
 ///
 /// Returns `Err` when `pool_name` is configured but no configured signal
 /// matched a series carrying that pool name.  An unrelated metric with the
-/// right pool label does **not** count — at least one routing-relevant signal
+/// right pool label does **not** count; at least one routing-relevant signal
 /// must match.
 #[expect(
     clippy::too_many_lines,
@@ -370,7 +370,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // parse_prometheus_text — signal extraction
+    // parse_prometheus_text: signal extraction
     // -----------------------------------------------------------------------
 
     #[test]
@@ -600,7 +600,7 @@ test_kv_cache{model="llama"} 0.3
     }
 
     // -----------------------------------------------------------------------
-    // PartialMetrics::into_backend_metrics — default/healthy derivation
+    // PartialMetrics::into_backend_metrics: default/healthy derivation
     // -----------------------------------------------------------------------
 
     #[test]
@@ -729,7 +729,7 @@ test_kv_cache{model="llama"} 0.3
     }
 
     // -----------------------------------------------------------------------
-    // has_label_value — label selector
+    // has_label_value: label selector
     // -----------------------------------------------------------------------
 
     #[test]
@@ -773,7 +773,7 @@ test_kv_cache{model="llama"} 0.3
     }
 
     // -----------------------------------------------------------------------
-    // parse_prometheus_text — pool name label selection
+    // parse_prometheus_text: pool name label selection
     // -----------------------------------------------------------------------
 
     #[test]
@@ -856,7 +856,7 @@ my_metric{name="pool-y"} 0.9
     }
 
     // -----------------------------------------------------------------------
-    // parse_prometheus_text — queue capacity normalisation
+    // parse_prometheus_text: queue capacity normalisation
     // -----------------------------------------------------------------------
 
     #[test]
@@ -952,7 +952,7 @@ llm_d_router_epp_average_kv_cache_utilization{name="my-pool"} 0.35
     }
 
     // -----------------------------------------------------------------------
-    // parse_prometheus_text — pool name miss detection
+    // parse_prometheus_text: pool name miss detection
     // -----------------------------------------------------------------------
 
     #[test]

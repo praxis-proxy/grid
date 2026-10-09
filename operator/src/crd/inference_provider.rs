@@ -221,7 +221,7 @@ pub struct MetricsConfig {
     pub pool_name: Option<String>,
 
     /// Maximum queue slot count for normalising a raw queue-size metric to
-    /// 0.0–1.0.
+    /// the 0.0 to 1.0 range.
     ///
     /// When set, the `queue_depth` signal value is divided by this capacity
     /// and clamped to `[0.0, 1.0]` before scoring.  This allows consuming raw
@@ -229,7 +229,7 @@ pub struct MetricsConfig {
     /// without requiring the exporter to pre-normalise.
     ///
     /// When absent, the `queue_depth` signal must already be normalised to
-    /// 0.0–1.0 by the exporter (backward compatible).
+    /// the 0.0 to 1.0 range by the exporter (backward compatible).
     #[schemars(range(min = 1))]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queue_capacity: Option<u32>,
@@ -309,7 +309,7 @@ pub enum MetricsAuthType {
 /// feature-specific TLS overrides.
 ///
 /// Secret references include explicit `namespace` and `name` fields.
-/// The operator reads referenced Secrets during reconciliation —
+/// The operator reads referenced Secrets during reconciliation;
 /// bounded requeue (60 s for TLS-configured providers) detects
 /// certificate rotation without a cluster-wide Secret watch.
 ///
@@ -446,11 +446,11 @@ fn default_private_key_key() -> String {
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MetricSignalNames {
-    /// Metric name for normalised queue depth (0.0–1.0).
+    /// Metric name for normalised queue depth (0.0 to 1.0).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub queue_depth: Option<String>,
 
-    /// Metric name for KV-cache utilisation (0.0–1.0).
+    /// Metric name for KV-cache utilisation (0.0 to 1.0).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kv_cache_utilization: Option<String>,
 
@@ -458,11 +458,11 @@ pub struct MetricSignalNames {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latency_p99_ms: Option<String>,
 
-    /// Metric name for prefix-cache hit ratio (0.0–1.0).
+    /// Metric name for prefix-cache hit ratio (0.0 to 1.0).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prefix_cache_hit_ratio: Option<String>,
 
-    /// Metric name for normalised error rate (0.0–1.0).
+    /// Metric name for normalised error rate (0.0 to 1.0).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_rate: Option<String>,
 

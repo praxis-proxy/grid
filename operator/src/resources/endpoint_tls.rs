@@ -28,7 +28,7 @@ use crate::{
 ///
 /// Only material/configuration failures that the controller can observe
 /// during reconciliation appear here.  Runtime failures (TLS handshake,
-/// HTTP 401/403, timeout) are surfaced as structured log fields only —
+/// HTTP 401/403, timeout) are surfaced as structured log fields only;
 /// they cannot be reproduced deterministically and should not appear in
 /// status.
 ///
@@ -219,7 +219,7 @@ async fn read_ca_for_verify(
 ///
 /// # Fail-closed
 ///
-/// Any resolution failure returns `Err` — the caller must NOT fall back to
+/// Any resolution failure returns `Err`; the caller must NOT fall back to
 /// native root certificates.  The probe/scrape is skipped entirely.
 ///
 /// # Security invariant
@@ -294,8 +294,8 @@ pub(crate) async fn resolve_tls_config(
 ///
 /// # Returns
 ///
-/// - `Ok(None)` — TLS material is accessible and valid (or no TLS configured).
-/// - `Ok(Some(reason))` — failure; the provider should be marked [`Degraded`] with the returned reason in
+/// - `Ok(None)`: TLS material is accessible and valid (or no TLS configured).
+/// - `Ok(Some(reason))`: failure; the provider should be marked [`Degraded`] with the returned reason in
 ///   `status.reason`.
 ///
 /// [`Degraded`]: crate::crd::inference_provider::ProviderPhase::Degraded
@@ -403,7 +403,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // secret_ref_from_client_cert — field mapping
+    // secret_ref_from_client_cert: field mapping
     // -----------------------------------------------------------------------
 
     #[test]
@@ -421,7 +421,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // TlsFailureReason::as_status_reason — stable prefixed strings
+    // TlsFailureReason::as_status_reason: stable prefixed strings
     // -----------------------------------------------------------------------
 
     #[test]
@@ -465,7 +465,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // TlsFailureReason::from_build_tls_error — error classification
+    // TlsFailureReason::from_build_tls_error: error classification
     // -----------------------------------------------------------------------
 
     #[test]
@@ -503,7 +503,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // resolve_tls_config — None input
+    // resolve_tls_config: None input
     // -----------------------------------------------------------------------
 
     #[tokio::test]
@@ -534,7 +534,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // resolve_tls_config / verify_tls_accessible — SecretMissing vs
+    // resolve_tls_config / verify_tls_accessible: SecretMissing vs
     // KeyMissing (grid#58), against a mocked Kubernetes API
     // -----------------------------------------------------------------------
 

@@ -388,7 +388,7 @@ async fn build_probe_config_from_secrets(
 ///
 /// Enforces mutual exclusion between `certFingerprint` (legacy) and
 /// `canonicalFingerprints` (canonical).  When only the legacy field is set,
-/// the probe fails closed — migration to canonical format is required.
+/// the probe fails closed; migration to canonical format is required.
 ///
 /// Missing pin policy is reported separately from malformed pin policy so
 /// operators can distinguish incomplete bootstrap from invalid configuration.
@@ -523,7 +523,7 @@ async fn update_status(
     //
     // Include metadata.resourceVersion as a CAS precondition so the API
     // server returns 409 Conflict if another replica already wrote a newer
-    // version. On conflict we yield silently — the informer will deliver
+    // version. On conflict we yield silently; the informer will deliver
     // the updated object on the next reconcile.
     let rv = site.metadata.resource_version.as_deref();
     let patch = grid_site_owned_status_patch(&status, rv);
@@ -536,7 +536,7 @@ async fn update_status(
         Err(kube::Error::Api(e)) if e.code == 409 => {
             tracing::debug!(
                 grid_site = name,
-                "status patch conflict — another replica won the CAS race"
+                "status patch conflict; another replica won the CAS race"
             );
             return Ok(());
         },
@@ -813,7 +813,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // site_phase_next — non-probe phases (outcome = None)
+    // site_phase_next: non-probe phases (outcome = None)
     // -----------------------------------------------------------------------
 
     #[test]
@@ -897,7 +897,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // site_phase_next — probe outcome transitions
+    // site_phase_next: probe outcome transitions
     // -----------------------------------------------------------------------
 
     #[test]
@@ -1012,7 +1012,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Trust failure outcomes — always demote to Connecting
+    // Trust failure outcomes: always demote to Connecting
     // -----------------------------------------------------------------------
 
     #[test]
@@ -1294,7 +1294,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Message safety — no private material in probe transition messages
+    // Message safety: no private material in probe transition messages
     // -----------------------------------------------------------------------
 
     #[test]
@@ -1395,7 +1395,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Pin resolution — rotation and legacy compatibility
+    // Pin resolution: rotation and legacy compatibility
     // -----------------------------------------------------------------------
 
     use crate::crd::grid_site::GridSiteTrustPolicy;
