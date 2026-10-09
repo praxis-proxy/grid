@@ -215,6 +215,11 @@ struct Provider {
 /// A millisecond clock that reads a given value at its start and from then on
 /// advances with the monotonic clock only, so a step of the wall clock never
 /// moves it.
+///
+/// The monotonic clock does not advance while the host is suspended, or on some
+/// hypervisors while the VM is paused, so held samples do not age across such a
+/// pause. Nothing on a timeline outlives the process: a restart starts a new one
+/// from the wall clock, over an empty store.
 #[derive(Clone, Copy, Debug)]
 pub struct Timeline {
     /// The reading at `start`, in milliseconds.
