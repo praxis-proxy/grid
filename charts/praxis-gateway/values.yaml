@@ -48,6 +48,18 @@ mountReconciliation:
   # credentials remain Helm-managed and are rendered as before. These mounts
   # are omitted only when releaseHelmMounts is true.
   managedCredentialNames: []
+  # -- Create a Role and RoleBinding in the release namespace that let the AGN
+  # Operator's ServiceAccount get and patch this chart's Deployment and no other.
+  # The operator's own charts grant it no Deployment access. Set false to bring
+  # your own Role (the README shows it), for example when the installer may not
+  # create RBAC.
+  rbac:
+    create: true
+  # -- The operator ServiceAccount the Role binds. The defaults match the
+  # grid-operator chart installed as release grid-operator in grid-system.
+  operator:
+    serviceAccount: grid-operator
+    namespace: grid-system
 
 # -- Extra pod-level securityContext fields (e.g. runAsUser, runAsGroup).
 # runAsNonRoot and seccompProfile are always set by the chart.

@@ -1354,7 +1354,22 @@
         "network": { "type": "string", "pattern": "^([a-z0-9]([-a-z0-9]*[a-z0-9])?)?$", "description": "GridNetwork name that opted into mount reconciliation." },
         "gatewayRef": { "type": "string", "pattern": "^([a-z0-9]([-a-z0-9]*[a-z0-9])?)?$", "description": "GridNetwork gatewayRefs name. Defaults to the Deployment name." },
         "releaseHelmMounts": { "type": "boolean", "description": "Release selected Helm-managed credentials and non-serving TLS mounts after the operator-owned configuration is ready." },
-        "managedCredentialNames": { "type": "array", "uniqueItems": true, "items": { "type": "string", "minLength": 1 }, "description": "Credential Secret names whose mounts are owned by Grid; other credentials remain Helm-managed." }
+        "managedCredentialNames": { "type": "array", "uniqueItems": true, "items": { "type": "string", "minLength": 1 }, "description": "Credential Secret names whose mounts are owned by Grid; other credentials remain Helm-managed." },
+        "rbac": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "create": { "type": "boolean", "description": "Create a Role and RoleBinding in the release namespace that let the operator ServiceAccount get and patch this chart's Deployment and no other." }
+          }
+        },
+        "operator": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "serviceAccount": { "type": "string", "pattern": "^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*)?$", "description": "Operator ServiceAccount the Role binds. Empty fails the render while rbac.create is true." },
+            "namespace": { "type": "string", "pattern": "^([a-z0-9]([-a-z0-9]*[a-z0-9])?)?$", "description": "Namespace of the operator ServiceAccount. Empty fails the render while rbac.create is true." }
+          }
+        }
       }
     },
     "tls": {
