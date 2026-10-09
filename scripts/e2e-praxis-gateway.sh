@@ -5,7 +5,7 @@
 # checks real requests after every change. The topology and its stages live in
 # tests/e2e/topologies/praxis-gateway-standalone.
 #
-# Env: FORGE_BIN           praxis-forge binary (default: built from this workspace)
+# Env: FORGE_BIN           explicit executable override (default: pinned upstream Forge)
 #      STATE_DIR           Forge state directory
 #                          (default target/forge/praxis-gateway-standalone)
 #      KEEP=1              leave the cluster running afterwards
@@ -19,10 +19,7 @@ CONFIG=tests/e2e/topologies/praxis-gateway-standalone/forge.yaml
 STATE_DIR=${STATE_DIR:-$ROOT/target/forge/praxis-gateway-standalone}
 CONTEXT=kind-praxis-standalone-gateway
 
-if [ -z "${FORGE_BIN:-}" ]; then
-  cargo build --locked -q -p forge --bin praxis-forge
-  FORGE_BIN=$ROOT/target/debug/praxis-forge
-fi
+FORGE_BIN=$("$ROOT/scripts/forge.sh" path)
 
 forge() {
   "$FORGE_BIN" --config "$CONFIG" --state-dir "$STATE_DIR" --non-interactive "$@"

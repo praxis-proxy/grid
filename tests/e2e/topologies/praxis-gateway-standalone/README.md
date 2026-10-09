@@ -43,7 +43,8 @@ From the repository root:
 make praxis-gateway-e2e
 ```
 
-`scripts/e2e-praxis-gateway.sh` builds `praxis-forge` from this workspace,
+Install the [pinned upstream Forge](../../../../docs/developing/forge.md) with
+`./scripts/forge.sh install` first. `scripts/e2e-praxis-gateway.sh` then
 runs `praxis-forge up` to create the cluster and `praxis-forge apply gateway`
 to run the stages, prints every check, and tears the cluster down. It fails
 unless the last stage reports a pass, so a stage that never ran cannot look

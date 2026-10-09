@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: forge-migration-proof
+  namespace: default
+data:
+  proof: "{{ cluster.properties.proof }}"

@@ -1138,8 +1138,9 @@ impl StateBroadcastHandler {
     /// Create a bounded handler and a sender for coordinated origin eviction.
     ///
     /// `max_origins` is clamped to at least one. When the bound is reached, a
-    /// previously retained origin is removed deterministically before a new
-    /// origin is accepted.
+    /// previously retained unpinned origin is removed deterministically before
+    /// a new origin is accepted. If all retained origins are pinned, new origins
+    /// are refused without disturbing existing state or revision guards.
     #[must_use]
     pub(crate) fn with_capacity(site_id: String, max_origins: usize) -> (Self, OriginStateHandle) {
         let (tx, _) = watch::channel(GridStateSnapshot::new(site_id));
@@ -1446,13 +1447,12 @@ impl StateBroadcastHandler {
     /// discard the anti-replay value of the origin's tracked revision (see
     /// [`verify_signature_if_pinned`](Self::verify_signature_if_pinned)) the
     /// moment memory pressure forces a choice. If every retained origin is
-    /// pinned, the incoming origin is accepted anyway without evicting
-    /// anything — the map temporarily exceeds `max_origins` by at most one
-    /// rather than dropping an authenticated peer's state.
-    fn make_room_for(&self, incoming_origin: &str) {
+    /// pinned, returns false and refuses the unknown origin. Existing origins
+    /// may still update their state while the capacity is full.
+    fn make_room_for(&self, incoming_origin: &str) -> bool {
         let origins = self.known_origins();
         if origins.contains(incoming_origin) || origins.len() < self.max_origins {
-            return;
+            return true;
         }
         let trust_store = self.trust_store_rx.borrow();
         let Some(origin) = origins
@@ -1462,9 +1462,9 @@ impl StateBroadcastHandler {
             tracing::warn!(
                 max_origins = self.max_origins,
                 "SWIM state origin capacity reached and every retained origin is pinned; \
-                 accepting the new origin without evicting an authenticated peer"
+                 refusing the unknown origin"
             );
-            return;
+            return false;
         };
         drop(trust_store);
         tracing::warn!(
@@ -1473,6 +1473,7 @@ impl StateBroadcastHandler {
             "SWIM state origin capacity reached; evicting retained origin"
         );
         self.remove_origin(&origin);
+        true
     }
 
     /// Return whether the bounded provider-state maps can retain `scope`.
@@ -1499,7 +1500,9 @@ impl foca::BroadcastHandler<NodeId> for StateBroadcastHandler {
             });
         }
         self.verify_signature_if_pinned(&broadcast)?;
-        self.make_room_for(&broadcast.origin_site);
+        if !self.make_room_for(&broadcast.origin_site) {
+            return Ok(None);
+        }
 
         // Metadata-only broadcasts (gateway address or cert PEM, empty CRDT
         // snapshot) have independent revision lanes. They must not be rejected
@@ -1751,6 +1754,38 @@ mod tests {
         let (_, parsed) = x509_parser::parse_x509_certificate(cert.der()).unwrap_or_else(|_| std::process::abort());
         let raw_pubkey = parsed.public_key().subject_public_key.as_ref().to_vec();
         (pkcs8_der, raw_pubkey)
+    }
+
+    #[test]
+    fn stored_pre_signature_extension_bytes_remain_decodable() -> Result<(), bincode::error::DecodeError> {
+        let historical = [1, 1, b'a', 1, 1, b'a', 0, 0, 1, b'a', 0, 0, 0, 1, 1, b'g', 0];
+        let decoded = StateBroadcast::decode(&historical)?;
+
+        assert_eq!(decoded.origin_site, "a", "the historical origin identity must survive");
+        assert_eq!(decoded.revision, 1, "the historical origin revision must survive");
+        assert_eq!(
+            decoded.snapshot,
+            GridStateSnapshot::new("a".to_owned()),
+            "historical bytes must preserve the empty origin snapshot"
+        );
+        assert_eq!(
+            decoded.gateway_address.as_deref(),
+            Some("g"),
+            "the historical extension must preserve its gateway address"
+        );
+        assert!(
+            decoded.site_cert_pem.is_none(),
+            "the historical extension must preserve an absent site certificate"
+        );
+        assert!(
+            decoded.signature.is_none(),
+            "old extension bytes must not manufacture a signature"
+        );
+        assert!(
+            !decoded.authoritative_provider_state,
+            "old metadata cannot become a withdrawal"
+        );
+        Ok(())
     }
 
     #[test]
@@ -2198,27 +2233,69 @@ mod tests {
     }
 
     #[test]
-    fn make_room_for_accepts_a_new_origin_without_evicting_when_every_retained_origin_is_pinned() {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "capacity regression exercises signed and unsigned admissions, every metadata lane, and existing replay guards"
+    )]
+    fn full_pinned_capacity_refuses_unknown_state_without_mutating_any_lane() {
         let (mut handler, _control) = StateBroadcastHandler::with_capacity("site-local".to_owned(), 2);
+        let (signing_key, public_key) = generate_signing_key_and_pubkey();
         for origin in ["site-pinned-a", "site-pinned-b"] {
-            let (signing_key, pubkey) = generate_signing_key_and_pubkey();
             handler
                 .trust_store_sender()
-                .send_modify(|store| drop(store.insert(origin.to_owned(), vec![pubkey])));
+                .send_modify(|store| drop(store.insert(origin.to_owned(), vec![public_key.clone()])));
             drop(receive_signed(&mut handler, origin, 1, &signing_key));
         }
+        let before = handler.subscribe().borrow().clone();
+        for index in 0..4 {
+            let origin = format!("site-new-{index}");
+            let mut state = snapshot(&origin, 1, 0.1);
+            state.increment_tenant_spend("tenant-new", 100);
+            let broadcast = StateBroadcast::new(origin.clone(), 1, state, Some("gateway:8443".to_owned()))
+                .with_cert(Some("certificate".to_owned()))
+                .with_signals_address(Some("signals:9443".to_owned()));
+            assert!(
+                receive(&mut handler, &broadcast).is_none(),
+                "unsigned new origins cannot bypass capacity"
+            );
+            handler
+                .trust_store_sender()
+                .send_modify(|store| drop(store.insert(origin.clone(), vec![public_key.clone()])));
+            assert!(
+                receive_signed(&mut handler, &origin, 1, &signing_key).is_none(),
+                "new pins cannot bypass capacity"
+            );
+        }
 
-        let broadcast = StateBroadcast::new("site-new".to_owned(), 1, snapshot("site-new", 1, 0.1), None);
-        drop(receive(&mut handler, &broadcast));
-
-        let origins = handler.known_origins();
-        assert!(
-            origins.contains("site-pinned-a") && origins.contains("site-pinned-b"),
-            "both pinned origins must survive even though capacity was reached, got {origins:?}"
+        assert_eq!(
+            *handler.subscribe().borrow(),
+            before,
+            "refusal must preserve providers, capabilities, and spend"
+        );
+        assert_eq!(
+            handler.known_origins().len(),
+            2,
+            "repeated admission attempts cannot exceed the hard bound"
         );
         assert!(
-            origins.contains("site-new"),
-            "the new origin must still be accepted even though nothing could be evicted, got {origins:?}"
+            handler.subscribe_gateway_addrs().borrow().is_empty(),
+            "refused metadata must not escape through a lane"
+        );
+        assert!(
+            handler.subscribe_cert_pems().borrow().is_empty(),
+            "refused certificate metadata must not escape through its lane"
+        );
+        assert!(
+            handler.subscribe_signals_addrs().borrow().is_empty(),
+            "refused signals addresses must not escape through their lane"
+        );
+        assert!(
+            receive_signed(&mut handler, "site-pinned-a", 2, &signing_key).is_some(),
+            "existing origins can advance at capacity"
+        );
+        assert!(
+            receive_signed(&mut handler, "site-pinned-a", 1, &signing_key).is_none(),
+            "retained replay guards remain active"
         );
     }
 

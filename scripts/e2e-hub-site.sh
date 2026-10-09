@@ -14,7 +14,7 @@
 #   IMAGE_TAG           image tag (default e2e)
 #   SKIP_BUILD=1        use prebuilt <prefix>{operator,gateway,enrollment}:<tag> images
 #   CONTAINER_TOOL      image build tool (default docker)
-#   FORGE_BIN           praxis-forge binary (default: PATH, then target/debug, then cargo build)
+#   FORGE_BIN           explicit executable override (default: pinned upstream Forge)
 #   KIND_CREATE_PREFIX  command prefix for cluster creation, e.g. the rootless podman
 #                       wrapper: systemd-run --scope --user -p Delegate=yes
 #   KEEP=1              keep clusters this run created
@@ -91,15 +91,7 @@ forge() {
 }
 
 resolve_forge() {
-  if [[ -n ${FORGE_BIN:-} ]]; then
-    return
-  fi
-  if command -v praxis-forge >/dev/null; then
-    FORGE_BIN=praxis-forge
-    return
-  fi
-  FORGE_BIN="$ROOT/target/debug/praxis-forge"
-  [[ -x $FORGE_BIN ]] || cargo build --manifest-path "$ROOT/Cargo.toml" -p forge --bin praxis-forge
+  FORGE_BIN=$("$ROOT/scripts/forge.sh" path)
 }
 
 # Captured, not piped: under pipefail grep -q's early exit can fail the pipeline on a match.
@@ -174,7 +166,7 @@ plan_addresses() {
   planned=$(printf '%s\n' "$ENROLL_IP" "$HUB_SWIM_IP" "$HUB_SIG_IP" \
     "$SITE_SWIM_IP" "$SITE_SIG_IP" "$SITE_GW_IP")
   [[ $(printf '%s\n' "$planned" | sort -u | wc -l) -eq 6 ]] \
-    || die "planned addresses are not distinct: $(printf '%s ' $planned)"
+    || die "planned addresses are not distinct: $(printf '%s ' "$planned")"
   log "enrollment $ENROLL_IP, hub SWIM $HUB_SWIM_IP, hub signals $HUB_SIG_IP"
   log "site SWIM $SITE_SWIM_IP, site signals $SITE_SIG_IP, site gateway $SITE_GW_IP"
 }

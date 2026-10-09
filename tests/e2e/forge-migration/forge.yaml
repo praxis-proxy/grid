@@ -1,0 +1,22 @@
+apiVersion: forge.praxis.dev/v1alpha1
+kind: Environment
+metadata:
+  name: grid-forge-migration
+spec:
+  runtime:
+    provider: docker
+    clusterPrefix: grid-forge-migration
+  network:
+    crossCluster: true
+  clusters:
+    - name: probe
+      stacks: [paths]
+      properties:
+        proof: upstream-compatible
+  stacks:
+    paths:
+      steps:
+        - type: template-manifest
+          path: proof.yaml
+        - type: exec
+          command: [bash, verify.sh]

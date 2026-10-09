@@ -126,13 +126,13 @@ The complete environment is in [`forge.yaml`](./forge.yaml). Supporting files ar
 
 ## Run the proof
 
-Prerequisites include Docker, Kind, `kubectl`, Helm, OpenSSL, and `praxis-forge`. Build the `grid-operator` and Praxis AI gateway images before using the default `Never` pull policy.
+Prerequisites include Docker, Kind, `kubectl`, Helm, OpenSSL, and `praxis-forge`. Build the source images below before using the default `Never` pull policy.
 
-Build `praxis-forge` and the source images from clean Grid and Praxis AI checkouts:
+Install pinned upstream Forge and build the source images from clean Grid and Praxis AI checkouts:
 
 ```console
 # From the `praxis-proxy/grid` repository.
-cargo build -p forge
+./scripts/forge.sh install
 docker build -f deploy/operator/Containerfile \
   -t grid-operator:provider-traffic-qualification .
 docker build -f deploy/gateway/Containerfile \
@@ -143,12 +143,12 @@ docker build -f Containerfile \
   -t praxis-ai:provider-traffic-qualification .
 ```
 
-The Forge binary is written to `target/debug/praxis-forge`. Add that directory
-to `PATH` or invoke the binary by its full path. Verify the environment before
-creating clusters:
+The shared [Forge wrapper](../../../../scripts/forge.sh) selects the pinned
+upstream executable. See [Forge tooling](../../../../docs/developing/forge.md)
+for cache provenance and explicit overrides. Verify the environment before creating clusters:
 
 ```console
-target/debug/praxis-forge config validate \
+./scripts/forge.sh config validate \
   --config tests/e2e/topologies/grid-provider-traffic/forge.yaml
 cargo test -p xtask provider_traffic --locked
 ```
