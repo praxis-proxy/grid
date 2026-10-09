@@ -2403,7 +2403,7 @@ impl PeerPoller {
         let peers = self.ctx.peers();
         let ttl = self.settings.peer_ttl();
         source
-            .collect_each(&sites, |peer, observations| {
+            .collect_each(&sites, |peer, observations, _| {
                 peers.refresh(BTreeMap::from([(peer, observations)]), ttl);
             })
             .await;

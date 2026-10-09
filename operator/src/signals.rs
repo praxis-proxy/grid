@@ -1196,17 +1196,18 @@ impl PollPeers {
     /// tell silence from a site that genuinely has nothing to report.
     pub async fn collect(&self, sites: &[PeerSite]) -> BTreeMap<String, Vec<Observation>> {
         let mut collected = BTreeMap::new();
-        self.collect_each(sites, |peer, observations| {
+        self.collect_each(sites, |peer, observations, _| {
             collected.insert(peer, observations);
         })
         .await;
         collected
     }
 
-    /// Hand each site's observations to `publish` as its poll completes.
+    /// Hand each site's observations to `publish` as its poll completes, with how
+    /// many of its rows were dropped for an implausible age.
     pub async fn collect_each<Publish>(&self, sites: &[PeerSite], mut publish: Publish)
     where
-        Publish: FnMut(String, Vec<Observation>),
+        Publish: FnMut(String, Vec<Observation>, usize),
     {
         let collect_query = self
             .collect
@@ -1219,16 +1220,17 @@ impl PollPeers {
             .into_iter()
             .map(|(peer, url, pins)| async move {
                 let (body, date) = self.poll_one(&peer, &url, &pins).await?;
-                let mut observations = bound_peer(stamp_origin(parse(&body), &peer), &peer);
-                reexpress_peer_ages(&mut observations, date);
-                Some((peer, observations))
+                // Ages first, so a row dropped for its age never takes a provider slot.
+                let (aged, rejected) = reexpress_peer_ages(stamp_origin(parse(&body), &peer), date, &peer);
+                let observations = bound_peer(aged, &peer);
+                Some((peer, observations, rejected))
             });
 
         // A failed peer is absent, not empty, so silence stays distinct from nothing to report.
         let mut done = futures::stream::iter(fetches).buffer_unordered(self.concurrency.max(1));
         while let Some(result) = done.next().await {
-            if let Some((peer, observations)) = result {
-                publish(peer, observations);
+            if let Some((peer, observations, rejected)) = result {
+                publish(peer, observations, rejected);
             }
         }
     }
@@ -1497,33 +1499,60 @@ fn render_contract_block(
     (block, oldest, cut)
 }
 
-/// The largest relayed-sample age treated as plausible, one day.
-///
-/// A larger apparent age means the peer's clock is skewed or the timestamp is
-/// garbage. Such a sample is aged from its collection here rather than trusted
-/// to be that old.
-const MAX_RELAY_AGE_MS: i64 = 24 * 60 * 60 * 1000;
+/// How far a relayed sample may be stamped past its peer's `Date` and still count
+/// as now. A peer writes its `Date` from the same clock reading as its stamps, at
+/// one-second resolution, so a fresh sample lands up to 999 ms ahead.
+const RELAY_AGE_TOLERANCE_MS: i64 = 1_000; // the Date header's resolution
 
-/// Carry each relayed peer sample's age into [`Observation::age`].
+/// The largest relayed-sample age accepted.
+///
+/// Older, or further ahead of the peer's `Date` than [`RELAY_AGE_TOLERANCE_MS`],
+/// means the peer's clock stepped or the stamp is garbage, so the row is dropped
+/// rather than refreshed into a value that reads as current.
+const MAX_RELAY_AGE_MS: i64 = 86_400_000; // one day
+
+/// Carry each relayed peer sample's age into [`Observation::age`], dropping and
+/// counting as `age` each row whose age is implausible. Returns the rows kept and
+/// how many were dropped.
 ///
 /// Age is the peer's `Date` minus the sample's own timestamp, both on the peer
 /// clock so no skew enters. The timestamp is then dropped: a render here stamps
 /// the sample from its own clock reading and this age, so no wall time of this
-/// site's is stored. A missing or implausible input leaves the age at zero, aged
-/// from its collection here, never the peer's absolute clock.
-fn reexpress_peer_ages(observations: &mut [Observation], date: Option<SystemTime>) {
+/// site's is stored. A missing `Date` or stamp leaves the row aged from its
+/// collection here, never from the peer's absolute clock.
+fn reexpress_peer_ages(
+    observations: Vec<Observation>,
+    date: Option<SystemTime>,
+    peer: &str,
+) -> (Vec<Observation>, usize) {
     let date_ms = date
         .and_then(|when| when.duration_since(UNIX_EPOCH).ok())
         .and_then(|since| i64::try_from(since.as_millis()).ok());
-    for observation in observations.iter_mut() {
-        observation.age = match (date_ms, observation.timestamp_ms.take()) {
-            (Some(date_ms), Some(sample_ms)) => Some(date_ms.saturating_sub(sample_ms))
-                .filter(|age| *age <= MAX_RELAY_AGE_MS)
-                .and_then(|age| u64::try_from(age).ok())
-                .map_or(Duration::ZERO, Duration::from_millis),
-            _ => Duration::ZERO,
+    let mut kept = Vec::with_capacity(observations.len());
+    let mut rejected = 0_usize;
+    for mut observation in observations {
+        let age = match (date_ms, observation.timestamp_ms.take()) {
+            (Some(date_ms), Some(stamp_ms)) => relay_age(date_ms, stamp_ms),
+            _ => Some(Duration::ZERO),
         };
+        if let Some(age) = age {
+            observation.age = age;
+            kept.push(observation);
+        } else {
+            crate::metrics::record_peer_signal_refused(peer, "age");
+            rejected = rejected.saturating_add(1);
+        }
     }
+    (kept, rejected)
+}
+
+/// The age `stamp_ms` carries against its peer's `date_ms`, `None` when it is
+/// implausible. Ahead of the `Date` within [`RELAY_AGE_TOLERANCE_MS`] is now.
+fn relay_age(date_ms: i64, stamp_ms: i64) -> Option<Duration> {
+    let age = date_ms.saturating_sub(stamp_ms);
+    (RELAY_AGE_TOLERANCE_MS.saturating_neg()..=MAX_RELAY_AGE_MS)
+        .contains(&age)
+        .then(|| Duration::from_millis(u64::try_from(age).unwrap_or(0)))
 }
 
 // ---------------------------------------------------------------------------
@@ -1853,7 +1882,7 @@ mod tests {
         };
         let mut release_slow = Some(release_slow);
         let mut order = Vec::new();
-        let round = poll.collect_each(&sites, |peer, observations| {
+        let round = poll.collect_each(&sites, |peer, observations, _| {
             assert_eq!(observations.len(), 1, "{peer}");
             if let Some(release) = release_slow.take() {
                 release.send(()).unwrap_or(());
@@ -2011,47 +2040,106 @@ mod tests {
     }
 
     #[test]
-    fn reexpress_peer_ages_keeps_the_age_and_drops_the_peer_stamp() {
-        let obs = |ts: Option<i64>| Observation {
-            metric: "m".to_owned(),
-            labels: BTreeMap::new(),
-            value: 1.0,
-            timestamp_ms: ts,
-            age: Duration::ZERO,
-        };
+    #[expect(clippy::too_many_lines, reason = "one table of ages either side of each bound")]
+    fn reexpress_peer_ages_keeps_plausible_ages_and_drops_the_rest() {
         let date_ms = 5_000_000_000_000;
-        let mut samples = vec![
-            obs(Some(date_ms - 30_000)),
-            obs(Some(date_ms + 1_000)),
-            obs(Some(date_ms - MAX_RELAY_AGE_MS - 1)),
-            obs(None),
+        let stamped = |stamp: Option<i64>| Observation {
+            timestamp_ms: stamp,
+            ..aged(Duration::ZERO)
+        };
+        let samples = vec![
+            stamped(Some(date_ms - 30_000)),
+            stamped(Some(date_ms + 1_000)),
+            stamped(Some(date_ms + 1_001)),
+            stamped(Some(date_ms - MAX_RELAY_AGE_MS)),
+            stamped(Some(date_ms - MAX_RELAY_AGE_MS - 1)),
+            stamped(None),
         ];
-        reexpress_peer_ages(
-            &mut samples,
-            Some(UNIX_EPOCH + Duration::from_millis(u64::try_from(date_ms).expect("positive"))),
-        );
+        let date = UNIX_EPOCH + Duration::from_millis(u64::try_from(date_ms).expect("positive"));
+        let (kept, rejected) = reexpress_peer_ages(samples, Some(date), "reexpress-bounds");
         assert_eq!(
-            samples.iter().map(|o| o.age).collect::<Vec<_>>(),
-            [Duration::from_secs(30), Duration::ZERO, Duration::ZERO, Duration::ZERO],
-            "a plausible age is kept; a future, implausibly old, or missing stamp is aged from collection"
+            kept.iter().map(|o| (o.age, o.timestamp_ms)).collect::<Vec<_>>(),
+            [
+                (Duration::from_secs(30), None),
+                (Duration::ZERO, None),
+                (Duration::from_millis(86_400_000), None),
+                (Duration::ZERO, None)
+            ],
+            "30 s and a day keep their age, a second ahead reads as now, no stamp is aged from collection, \
+             and no peer stamp is kept to be rendered"
         );
+        assert_eq!(rejected, 2, "past a second ahead and past a day old are dropped");
         assert!(
-            samples.iter().all(|o| o.timestamp_ms.is_none()),
-            "no peer stamp is kept to be rendered: {samples:?}"
+            refused_metric("reexpress-bounds", "age", 2),
+            "each drop is counted as age"
         );
     }
 
     #[test]
     fn a_relayed_row_without_a_date_is_aged_from_its_collection() {
-        let mut undated = vec![Observation {
+        let undated = vec![Observation {
             timestamp_ms: Some(1_000),
             ..aged(Duration::ZERO)
         }];
-        reexpress_peer_ages(&mut undated, None);
+        let (kept, rejected) = reexpress_peer_ages(undated, None, "undated");
         assert_eq!(
-            undated.first().map(|o| o.age),
-            Some(Duration::ZERO),
-            "without a Date there is no age to carry"
+            (kept.first().map(|o| o.age), rejected),
+            (Some(Duration::ZERO), 0),
+            "without a Date there is no age to carry, and nothing to reject"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_polled_row_with_an_implausible_age_is_dropped_and_counted() {
+        crate::init_process_crypto();
+        let (date, date_ms) = dated(UNIX_EPOCH + Duration::from_secs(1_700_000_000));
+        let line = |provider: &str, stamp: i64| {
+            format!("inference_pool_average_queue_size{{grid_provider=\"{provider}\"}} 1 {stamp}\n")
+        };
+        let body = [
+            line("ahead-by-a-second", date_ms + 1_000),
+            line("ahead-past-a-second", date_ms + 1_001),
+            line("a-day-old", date_ms - MAX_RELAY_AGE_MS),
+            line("past-a-day-old", date_ms - MAX_RELAY_AGE_MS - 1),
+        ]
+        .concat();
+        let round = poll_one_peer("age-bounds", body, date).await;
+        let providers: Vec<&str> = round
+            .get("age-bounds")
+            .expect("the peer answered")
+            .iter()
+            .filter_map(|row| row.labels.get(PROVIDER_LABEL).map(String::as_str))
+            .collect();
+        assert_eq!(
+            providers,
+            ["ahead-by-a-second", "a-day-old"],
+            "an age under minus one second or over a day is dropped, not refreshed"
+        );
+        assert!(refused_metric("age-bounds", "age", 2), "both drops are counted as age");
+    }
+
+    #[tokio::test]
+    async fn a_row_dropped_for_its_age_takes_no_provider_slot() {
+        crate::init_process_crypto();
+        let (date, date_ms) = dated(UNIX_EPOCH + Duration::from_secs(1_700_000_000));
+        let line = |provider: &str, stamp: i64| {
+            format!("inference_pool_average_queue_size{{grid_provider=\"{provider}\"}} 1 {stamp}\n")
+        };
+        let body: String = (0..MAX_PEER_PROVIDERS)
+            .map(|i| line(&format!("a{i:03}"), date_ms + 60_000))
+            .chain(std::iter::once(line("zz", date_ms)))
+            .collect();
+        let round = poll_one_peer("age-slots", body, date).await;
+        let kept: Vec<&str> = round
+            .get("age-slots")
+            .expect("the peer answered")
+            .iter()
+            .filter_map(|row| row.labels.get(PROVIDER_LABEL).map(String::as_str))
+            .collect();
+        assert_eq!(
+            kept,
+            ["zz"],
+            "the rows dropped for their age do not fill the provider cap first"
         );
     }
 
@@ -2106,18 +2194,32 @@ mod tests {
             "inference_pool_average_queue_size{{grid_provider=\"pool-a\"}} 1 {}\n",
             date_ms - age_ms
         );
+        let peers = SignalStore::new();
+        peers.refresh(poll_one_peer("east", row, date).await, Duration::from_secs(60));
+        peers
+    }
+
+    /// One round polling `site`, which answers `body` under the extra header lines `headers`.
+    async fn poll_one_peer(site: &str, body: String, headers: String) -> BTreeMap<String, Vec<Observation>> {
         let sites = [PeerSite {
-            name: "east".to_owned(),
-            url: serve_once_with(row, date).await,
+            name: site.to_owned(),
+            url: serve_once_with(body, headers).await,
             pins: Vec::new(),
         }];
         let poll = PollPeers {
             attempts: 1,
             ..PollPeers::default()
         };
-        let peers = SignalStore::new();
-        peers.refresh(poll.collect(&sites).await, Duration::from_secs(60));
-        peers
+        poll.collect(&sites).await
+    }
+
+    /// Whether `grid_peer_signals_refused_total` reads `count` for `peer` and `reason`.
+    fn refused_metric(peer: &str, reason: &str, count: u64) -> bool {
+        String::from_utf8(crate::metrics::encode_metrics())
+            .expect("utf-8 metrics")
+            .contains(&format!(
+                r#"grid_peer_signals_refused_total{{peer="{peer}",reason="{reason}"}} {count}"#
+            ))
     }
 
     /// One unlabeled sample of `metric`.

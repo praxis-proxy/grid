@@ -45,17 +45,16 @@ const MAX_SAMPLES_PER_SERIES: usize = 128;
 /// Byte cap on a metric name or target label value before it keys the store.
 const MAX_KEY_INPUT_BYTES: usize = 256;
 
-/// Tolerance for a sample stamped ahead of the operator's own clock (its `Date`
-/// header). Kept small: a legitimate sample is never meaningfully ahead of the
-/// operator's own observation clock, and a large future window only lets a stamp
-/// wedge the series head against the later corrected samples `Series::push`
-/// drops.
-const MAX_CLOCK_SKEW_MS: i64 = 5_000;
+/// How far a sample may be stamped past the operator's `Date` and still read as
+/// now. The `Date` has one-second resolution and the operator writes it from the
+/// same clock reading as its stamps, so a fresh sample lands up to 999 ms ahead.
+const RELAY_AGE_TOLERANCE_MS: i64 = 1_000; // the Date header's resolution
 
-/// Largest relayed-sample age treated as plausible, one day. A larger apparent
-/// age means the peer's clock is skewed or the stamp is garbage, so the sample is
-/// restamped fresh rather than trusted to be that old.
-const MAX_RELAY_AGE_MS: i64 = 24 * 60 * 60 * 1000;
+/// Largest relayed-sample age accepted. Further ahead of the `Date` than
+/// [`RELAY_AGE_TOLERANCE_MS`], or older than this, means the publisher's clock
+/// stepped or the stamp is garbage, so the line is dropped as `skew` rather than
+/// trusted, or refreshed into a value that reads as current.
+const MAX_RELAY_AGE_MS: i64 = 86_400_000; // one day
 
 /// Two published stamps this close name one observation. A relay re-serves a sample
 /// for a whole poll cycle and a one-second `Date` restamps it on a moving clock each
@@ -92,7 +91,7 @@ fn combine_max(_metric: &str) -> Combine {
 pub struct Ingested {
     /// Lines stored.
     pub kept: u64,
-    /// Lines stamped past the clock-skew bound.
+    /// Lines whose age against the publisher's `Date` was implausible.
     pub skewed: u64,
     /// Lines whose site label disagreed with the verified owner.
     pub mismatched: u64,
@@ -405,10 +404,10 @@ impl LoadStore {
     /// line does not cost the rest.
     ///
     /// `reference_ms` is the peer's own clock (its `Date` header) and
-    /// `local_now_ms` is this gateway's clock. A sample stamped implausibly far
-    /// past the peer's `Date` is dropped, then each surviving sample's age is
-    /// re-expressed on the local clock (`rebase_age`) so [`Self::window_worst`]
-    /// compares every sample against one clock.
+    /// `local_now_ms` is this gateway's clock. A sample whose age against the
+    /// peer's `Date` is implausible is dropped, then each surviving sample's age
+    /// is re-expressed on the local clock (`rebase_age`) so
+    /// [`Self::window_worst`] compares every sample against one clock.
     ///
     /// `owner` is the peer's crypto-verified site (from mTLS): attribution keys on
     /// it, never the self-reported `grid_site` label. A line whose label disagrees
@@ -426,7 +425,6 @@ impl LoadStore {
         let scrape = ScrapeClock {
             reference_ms,
             local_now_ms,
-            horizon_ms: reference_ms.saturating_add(MAX_CLOCK_SKEW_MS),
             owner,
             local: self.local_site.as_deref() == Some(owner),
         };
@@ -451,9 +449,8 @@ impl LoadStore {
 
     /// Attribute and store one parsed line, or say why it was dropped.
     fn ingest_line(&self, mut observation: Observation<'_>, scrape: &ScrapeClock<'_>) -> Result<(), Dropped> {
-        if observation.sample.at_ms > scrape.horizon_ms {
-            return Err(Dropped::Skewed);
-        }
+        observation.sample.at_ms =
+            rebase_age(scrape.reference_ms, observation.sample.at_ms, scrape.local_now_ms).ok_or(Dropped::Skewed)?;
         // #160, narrowed: from any peer the label must agree with the verified
         // owner. From this site's own operator the label is the owner, since the
         // operator attributed it from its own verified poll.
@@ -462,7 +459,6 @@ impl LoadStore {
             (false, Some(site)) if site != scrape.owner => return Err(Dropped::Mismatched),
             _ => scrape.owner,
         };
-        observation.sample.at_ms = rebase_age(scrape.reference_ms, observation.sample.at_ms, scrape.local_now_ms);
 
         let key = Self::key(site, observation.cluster.as_ref());
         let combine = (self.combine)(observation.metric);
@@ -534,20 +530,20 @@ fn push_observation(provider: &mut Provider, observation: &Observation<'_>, comb
     }
 }
 
-/// Re-express a peer sample's age on the local clock.
+/// Re-express a peer sample's age on the local clock, `None` when the age is
+/// implausible.
 ///
 /// The peer's `Date` and the sample stamp are both on the peer clock, so their
 /// difference is skew-free, and restamping that age onto `local_now_ms` puts the
-/// sample on the reader's clock. An implausible age (a garbage stamp, a badly
-/// skewed peer, or a stamp ahead of the peer's own `Date`) is treated as fresh
-/// rather than trusted, so it never reads as stale or far-future.
-fn rebase_age(reference_ms: i64, sample_at_ms: i64, local_now_ms: i64) -> i64 {
+/// sample on the reader's clock. Up to [`RELAY_AGE_TOLERANCE_MS`] ahead of the
+/// `Date` is its resolution and reads as now. Further ahead, or older than
+/// [`MAX_RELAY_AGE_MS`], is refused rather than refreshed, so a stepped or
+/// garbage stamp never reads as a current value.
+fn rebase_age(reference_ms: i64, sample_at_ms: i64, local_now_ms: i64) -> Option<i64> {
     let age = reference_ms.saturating_sub(sample_at_ms);
-    if (0..=MAX_RELAY_AGE_MS).contains(&age) {
-        local_now_ms.saturating_sub(age)
-    } else {
-        local_now_ms
-    }
+    (RELAY_AGE_TOLERANCE_MS.saturating_neg()..=MAX_RELAY_AGE_MS)
+        .contains(&age)
+        .then(|| local_now_ms.saturating_sub(age.max(0)))
 }
 
 /// One scrape's clocks and verified owner, shared by every line it carries.
@@ -556,8 +552,6 @@ struct ScrapeClock<'scrape> {
     reference_ms: i64,
     /// This gateway's clock.
     local_now_ms: i64,
-    /// A stamp past this is skewed beyond belief.
-    horizon_ms: i64,
     /// The crypto-verified site on the connection.
     owner: &'scrape str,
     /// Whether the owner is this gateway's own operator.
@@ -566,7 +560,7 @@ struct ScrapeClock<'scrape> {
 
 /// Why a parsed line was not stored.
 enum Dropped {
-    /// Stamped past the clock-skew bound.
+    /// Its age against the publisher's `Date` was implausible.
     Skewed,
     /// Its site label disagreed with the verified owner.
     Mismatched,
@@ -952,14 +946,15 @@ mod tests {
 
     #[test]
     fn a_future_sample_is_dropped_and_does_not_wedge_the_series() {
-        // The peer's Date is 2_000. A stamp beyond the skew tolerance ahead of it
+        // The peer's Date is 2_000. A stamp past the Date's resolution ahead of it
         // is implausible and must not enter the series head, or the later
         // corrected sample would be dropped as older. Reference and local now
         // coincide (no skew), so the corrected sample keeps its own stamp.
         let store = store();
         let date = 2_000;
-        let future = date + MAX_CLOCK_SKEW_MS + 10_000;
-        store.ingest_at(&line("east", "pool-a", 9.0, future), date, date, "east");
+        let future = date + RELAY_AGE_TOLERANCE_MS + 1;
+        let tally = store.ingest_at(&line("east", "pool-a", 9.0, future), date, date, "east");
+        assert_eq!(tally.skewed, 1, "the future stamp is dropped as skew");
         store.ingest_at(&line("east", "pool-a", 3.0, date), date, date, "east");
         let sample = store
             .latest(&LoadStore::key("east", "pool-a"), QUEUE)
@@ -1378,21 +1373,54 @@ mod tests {
         // whatever the absolute skew between the two clocks.
         assert_eq!(
             rebase_age(100_000, 97_000, 5_000),
-            2_000,
+            Some(2_000),
             "3s old, restamped onto local now"
         );
-        // A stamp ahead of the peer's own Date is implausible, so it reads fresh.
         assert_eq!(
             rebase_age(100_000, 101_000, 5_000),
-            5_000,
-            "a future-on-peer stamp is fresh"
+            Some(5_000),
+            "a stamp within the Date's one-second resolution ahead of it reads as now"
         );
-        // An age beyond a day is implausible, so the sample reads fresh, not old.
         assert_eq!(
-            rebase_age(MAX_RELAY_AGE_MS.saturating_add(10), 0, 5_000),
-            5_000,
-            "an implausible age is stamped fresh"
+            rebase_age(100_000, 101_001, 5_000),
+            None,
+            "a stamp further ahead of the peer's own Date is refused, not refreshed"
         );
+        assert_eq!(
+            rebase_age(MAX_RELAY_AGE_MS, 0, 5_000),
+            Some(5_000 - MAX_RELAY_AGE_MS),
+            "a day old keeps its age"
+        );
+        assert_eq!(
+            rebase_age(MAX_RELAY_AGE_MS.saturating_add(1), 0, 5_000),
+            None,
+            "an age beyond a day is refused, not refreshed"
+        );
+    }
+
+    #[test]
+    fn a_relayed_age_past_either_bound_is_dropped_as_skew() {
+        let date = 100_000_000;
+        let local = 5_000_000;
+        let cases = [
+            ("a second ahead of the Date reads as now", date + 1_000, Some(local)),
+            ("past a second ahead is dropped", date + 1_001, None),
+            (
+                "a day old keeps its age",
+                date - MAX_RELAY_AGE_MS,
+                Some(local - MAX_RELAY_AGE_MS),
+            ),
+            ("past a day old is dropped", date - MAX_RELAY_AGE_MS - 1, None),
+        ];
+        for (label, stamp, want) in cases {
+            let store = store();
+            let tally = store.ingest_at(&line("east", "pool-a", 1.0, stamp), date, local, "east");
+            let held = store
+                .latest(&LoadStore::key("east", "pool-a"), QUEUE)
+                .map(|sample| sample.at_ms);
+            assert_eq!(held, want, "{label}");
+            assert_eq!(tally.skewed, u64::from(want.is_none()), "{label}: counted as skew");
+        }
     }
 
     #[test]
