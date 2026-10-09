@@ -101,9 +101,9 @@ Validate image digest format when provided.
 {{/*
 Flat-grid and enrollment defaults keep site identity, SWIM reachability, and
 gateway references aligned so the site can join the mesh and advertise its gateway.
-Normalize once per render, in place and idempotently, so every template shares
-those defaults. Explicit site names, seeds, and SWIM Service settings take
-precedence over their defaults.
+In-place, idempotent normalization lets each template apply the same defaults
+safely, regardless of render order. Explicit site names, seeds, and SWIM Service
+settings take precedence over their defaults.
 */}}
 {{- define "grid-operator.normalize" -}}
 {{- $v := .Values }}
