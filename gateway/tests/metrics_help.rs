@@ -4,8 +4,7 @@
 //! asserts the description survives the recorder the gateway installs.
 
 #[cfg(test)]
-#[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
-#[allow(clippy::expect_used, reason = "tests")]
+#[expect(clippy::expect_used, reason = "tests")]
 mod tests {
     /// Names `describe_metrics` documents, which a scrape must explain.
     const DOCUMENTED: [&str; 9] = [
