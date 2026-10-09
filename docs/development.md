@@ -57,6 +57,15 @@ the executable through a shared wrapper. See [Forge tooling](developing/forge.md
 for installation, cache verification, development overrides, and upgrade
 checks.
 
+### Development images
+
+`make container`, `make images`, and `make dev-push` build the operator using
+`deploy/operator/Containerfile`. Their default `PROJECT_IMAGE` is now
+`grid-operator:dev`, replacing `praxis-grid:dev`; update scripts that load the
+old tag. To keep an existing local tag, pass `PROJECT_IMAGE=praxis-grid:dev` to
+those targets.
+`make dev-push` also loads the image into the selected kind cluster.
+
 ## Verification
 
 | Local command | Scope | Checked-in CI |
