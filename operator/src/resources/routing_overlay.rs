@@ -71,7 +71,7 @@ const MAX_K8S_NAME: usize = 63;
 const MAX_COMPONENT_PREFIX: usize = 20;
 
 /// Candidate kind identifier for inference model entries.
-const CANDIDATE_KIND: &str = "inference_model";
+pub(crate) const CANDIDATE_KIND: &str = "inference_model";
 
 /// Candidate kind identifier for MCP tool entries.
 const CANDIDATE_KIND_MCP_TOOL: &str = "mcp_tool";

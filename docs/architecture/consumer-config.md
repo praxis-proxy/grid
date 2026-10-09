@@ -233,9 +233,12 @@ entry. An empty list derives nothing. An `InferenceProvider` is cluster scoped
 and its `gridNetworkRef` is self asserted, so only the allowlist decides where a
 gateway dials.
 
-An explicit entry wins whole, never field by field. A candidate that cannot be
-derived is withdrawn from this gateway's routes and named in the
-`consumerConfigStatus` message with a reason.
+An explicit entry wins whole, never field by field. A candidate with no
+explicit entry that cannot be derived is withdrawn from this gateway's routes
+and named in the `consumerConfigStatus` message with a reason. With the list
+empty or `deriveTopology` absent, that is every candidate with no explicit
+entry, so removing a provider from the list withdraws its derived endpoint on
+the next render.
 
 | Candidate | Field | Source |
 |---|---|---|
@@ -412,7 +415,6 @@ Example failure output:
 | Reason | Phase | Meaning |
 |---|---|---|
 | _(empty)_ | `Rendered` | Config rendered and `ConfigMap` applied successfully |
-| `MissingClusterEndpoint` | `Error` | A candidate cluster is missing from `consumerConfig.clusterEndpoints[]` |
 | `MissingTransport` | `Error` | A cluster endpoint has no `transport` configuration — the operator refuses to guess TLS vs plaintext |
 | `MissingSni` | `Error` | A `mutual_tls` or `tls` cluster endpoint has no (or blank) `sni`; TLS requires a server name |
 | `PlaintextWithSni` | `Error` | A `plaintext` cluster endpoint has `sni` set — `sni` does not enable TLS; use `mutual_tls` if TLS is intended |
@@ -441,11 +443,12 @@ The overlay data produced a structural error.  Check that `localSiteName` is set
 on the `GatewayRef` (or that the `GridNetwork` name is a valid site identity) and
 that all provider `routingClusterRef` values are non-empty.
 
-**Phase is `Error` / reason `MissingClusterEndpoint`**
+**A model answers 503 and the `Rendered` message says `withdrew`**
 
-At least one route candidate references a cluster with no corresponding
-`consumerConfig.clusterEndpoints[]` entry.  Add an endpoint entry for the reported
-cluster before restarting or rolling out the consumer gateway.
+A route candidate references a cluster with no `consumerConfig.clusterEndpoints[]`
+entry that could not be derived, so the operator withdrew it from this gateway.
+The message names the cluster and the reason. Add an endpoint entry for it, or
+allowlist its provider in `deriveTopology.fromProviders`.
 
 **Phase is `Error` / reason `MissingTransport`**
 

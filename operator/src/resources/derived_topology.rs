@@ -15,7 +15,7 @@ use crate::{
         grid_site::{EgressTls, EgressTlsMode, GridSite},
         inference_provider::{BackendTls, InferenceProvider},
     },
-    resources::routing_overlay::{RoutingCandidate, routing_identity},
+    resources::routing_overlay::{CANDIDATE_KIND, RoutingCandidate, routing_identity},
 };
 
 /// Where a resolved entry came from, for status.
@@ -137,24 +137,22 @@ pub(crate) fn resolve(
     let typed: BTreeMap<&str, &ClusterEndpointConfig> =
         explicit.iter().map(|entry| (entry.cluster.as_str(), entry)).collect();
     let local = local_providers(declarations);
+    // Only inference candidates render a load balancer cluster.
     let clusters: BTreeSet<(&str, &str)> = candidates
         .iter()
+        .filter(|candidate| candidate.kind == CANDIDATE_KIND)
         .map(|candidate| (candidate.cluster.as_str(), candidate.site.as_str()))
         .collect();
-
     let twice = clusters_at_two_sites(&clusters);
 
     let mut resolution = Resolution::default();
     for (cluster, site) in clusters {
-        if twice.contains(cluster) {
-            resolution.refused.push(Refused {
-                cluster: cluster.to_owned(),
-                site: site.to_owned(),
-                reason: Refusal::ClusterAtTwoSites,
-            });
-            continue;
-        }
-        match resolve_one(cluster, site, &typed, &local, declarations) {
+        let outcome = if twice.contains(cluster) {
+            Err(Refusal::ClusterAtTwoSites)
+        } else {
+            resolve_one(cluster, site, &typed, &local, declarations)
+        };
+        match outcome {
             Ok(entry) => {
                 resolution.resolved.insert(cluster.to_owned(), entry);
             },

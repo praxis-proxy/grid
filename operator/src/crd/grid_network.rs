@@ -784,10 +784,9 @@ pub struct GatewayRef {
 /// credential-bearing inference candidates are present), and a `load_balancer`
 /// section.
 ///
-/// Every cluster referenced by a projected inference candidate must have a matching
-/// `clusterEndpoints` entry.  Missing endpoint topology causes config generation
-/// to fail with status reason `MissingClusterEndpoint` instead of rendering an
-/// incomplete `load_balancer` cluster.
+/// An inference candidate whose cluster has no `clusterEndpoints` entry, typed or
+/// derived, is withdrawn from this gateway and named in the status message,
+/// rather than rendering an incomplete `load_balancer` cluster.
 ///
 /// # Security
 ///
@@ -847,14 +846,12 @@ pub struct ConsumerConfig {
     /// Endpoint topology for the generated `load_balancer` section.
     ///
     /// Each entry maps an inference candidate cluster name to a reachable endpoint
-    /// address with explicit transport configuration. Every cluster referenced
-    /// by a projected inference candidate must have a matching entry here with a
+    /// address with explicit transport configuration. Every entry needs a
     /// non-`None` `transport` field.
     ///
-    /// Missing endpoint topology causes config generation to fail with
-    /// `MissingClusterEndpoint`.  Missing transport fails with
-    /// `MissingTransport`.  Mutual-TLS transport without SNI fails with
-    /// `MissingSni`.
+    /// A candidate with no entry here, and none derived, is withdrawn from
+    /// this gateway.  Missing transport fails with `MissingTransport`.
+    /// Mutual-TLS transport without SNI fails with `MissingSni`.
     ///
     /// In production, this is populated by whoever manages the consumer gateway
     /// deployment (platform automation, the gateway operator, or a Helm chart).

@@ -208,7 +208,7 @@ fn an_explicit_entry_survives_derivation_whole() {
 
 #[test]
 fn an_explicit_entry_for_a_cluster_with_no_candidate_is_not_returned() {
-    // Pins undesired behaviour: harmless while the renderer looks up by candidate.
+    // The controller passes typed entries through itself; resolution is per candidate.
     let explicit = vec![ClusterEndpointConfig {
         cluster: "retired-cluster".to_owned(),
         address: "retired.example.invalid:8443".to_owned(),
@@ -721,11 +721,19 @@ fn an_https_endpoint_named_by_address_needs_a_declared_server_name() {
 }
 
 #[test]
-fn a_cluster_with_no_provider_and_no_site_is_left_to_the_renderer() {
+fn a_cluster_with_no_provider_and_no_site_resolves_to_nothing() {
     let candidates = vec![candidate("prov-ghost", "site-ghost")];
     let resolved = resolve(&candidates, &[], &decl(&[], &[], "site-a"));
     assert!(
         resolved.is_empty(),
-        "derivation reports nothing of its own; an unresolvable cluster is MissingClusterEndpoint"
+        "an unresolvable cluster is refused, then withdrawn"
     );
+}
+
+#[test]
+fn an_mcp_tool_candidate_is_neither_resolved_nor_refused() {
+    let mut tool = candidate("prov-ghost", "site-ghost");
+    tool.kind = "mcp_tool".to_owned();
+    let resolution = resolve(&[tool], &[], &decl(&[], &[], "site-a"));
+    assert!(resolution.resolved.is_empty() && resolution.refused.is_empty());
 }
