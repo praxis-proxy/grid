@@ -56,12 +56,7 @@ pub struct InferenceProviderSpec {
     /// Backend deployment category.
     pub backend_kind: String,
 
-    /// TLS intent for connecting to this provider's backend.
-    ///
-    /// Only read when a gateway derives its connection topology. The transport
-    /// mode is not declared here: an `https` endpoint is server-authenticated
-    /// TLS and an `http` one is plaintext, so a second declaration would be a
-    /// second thing to disagree with the URL.
+    /// TLS for this provider's backend. Read only when a gateway derives its topology.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend_tls: Option<Box<BackendTls>>,
 
@@ -149,34 +144,15 @@ pub struct InferenceProviderSpec {
     pub traffic_policy: Option<TrafficPolicy>,
 }
 
-/// TLS intent for a provider's backend connection.
-///
-/// An HTTPS URL names a host and nothing else. It does not say which CA signs
-/// that host's certificate, and it does not say which name to verify when the
-/// address connected to differs from the name on the certificate. Both are
-/// declared here rather than guessed.
-///
-/// Field names and types follow `ClusterEndpointConfig`'s transport block, so a
-/// reader meets one vocabulary. `serverName` is `GridSite`'s name for the same
-/// value, which governs certificate verification as well as the SNI sent.
-///
-/// Deliberately not [`EndpointTlsConfig`], which `metricsConfig`, `healthCheck`
-/// and model discovery share. Those three are the operator's own connections to
-/// a provider, so they require a CA and fail closed by skipping the scrape or
-/// probe. This one describes a connection the gateway makes, where an omitted
-/// CA means the process trust store, and it needs a server name that the other
-/// three cannot express. Reusing the type would mean a required CA, a client
-/// certificate field with no meaning on this hop, and still no server name.
+/// CA and server name for a provider's backend, which an endpoint URL cannot carry.
+/// The URL scheme decides the transport mode.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
 pub struct BackendTls {
     /// Secret supplying the CA bundle that signs the backend's certificate.
     ///
-    /// Omitted uses the process trust store, which is what a publicly signed
-    /// backend needs and what a privately signed one must not rely on. Named in
-    /// the gateway's own namespace, reusing the endpoint CA reference so a
-    /// backend CA cannot name a namespace the gateway may not read.
+    /// Omitted uses the process trust store. Named in the gateway namespace.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ca_secret_ref: Option<crate::crd::grid_network::EndpointCaSecretRef>,
 

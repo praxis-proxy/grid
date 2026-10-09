@@ -1,8 +1,4 @@
-//! Tests for endpoint-topology derivation.
-//!
-//! Assertions are invariants rather than rendered strings, because the rendered
-//! form is the renderer's contract and already has its own tests. Each
-//! invariant names the precondition it holds under.
+//! Tests for endpoint-topology derivation. The renderer's own tests cover the rendered form.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, reason = "tests")]
 
@@ -34,8 +30,7 @@ fn site(name: &str, egress: Option<serde_json::Value>) -> GridSite {
     site_in_phase(name, egress, "Active")
 }
 
-/// A `GridSite` in a named phase. Only an `Active` site has had its address
-/// probed and its leaf pinned, which is what derivation requires.
+/// A `GridSite` in a named phase.
 fn site_in_phase(name: &str, egress: Option<serde_json::Value>, phase: &str) -> GridSite {
     let mut spec = serde_json::json!({ "gridNetworkRef": "net" });
     if let Some(egress) = egress {
@@ -52,8 +47,6 @@ fn site_in_phase(name: &str, egress: Option<serde_json::Value>, phase: &str) -> 
 }
 
 /// The routing identities the fixtures use, allowlisted by the shared `decl`.
-///
-/// A case that exercises a refusal builds its own `Declarations` instead.
 static ALLOWED: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| {
     ["prov-a", "prov-b", "prov-ghost", "gateway-site-a"]
         .iter()
@@ -215,11 +208,7 @@ fn an_explicit_entry_survives_derivation_whole() {
 
 #[test]
 fn an_explicit_entry_for_a_cluster_with_no_candidate_is_not_returned() {
-    // Resolution is keyed by candidate, so an entry for a cluster nothing
-    // routes to does not come back. That is unobservable in the rendered
-    // config, because the renderer only looks up the clusters its candidates
-    // name, and the plaintext-egress decision reads the spec rather than this
-    // result. Pinned so a future reader does not take pass-through for granted.
+    // Pins undesired behaviour: harmless while the renderer looks up by candidate.
     let explicit = vec![ClusterEndpointConfig {
         cluster: "retired-cluster".to_owned(),
         address: "retired.example.invalid:8443".to_owned(),
@@ -257,8 +246,7 @@ fn a_remote_candidate_derives_the_sites_provider_hop() {
 
 #[test]
 fn a_remote_candidate_never_resolves_to_a_provider_endpoint() {
-    // The same provider object is present locally, which is the misdeclaration
-    // the locality precondition exists to refuse: its candidate says site-b.
+    // Present locally but its candidate says site-b, so locality refuses it.
     let providers = vec![provider("prov-a", "https://internal.site-a.svc.cluster.local", None)];
     let sites = vec![
         site("site-a", None),
@@ -333,12 +321,7 @@ fn a_site_in_another_network_is_not_a_source() {
 
 #[test]
 fn a_mutual_egress_with_no_server_name_derives_no_server_name() {
-    // Nothing validates that a hand-written GridSite declaring `Mutual` also
-    // declares a serverName: the CRD documents it as required and carries no
-    // rule for it, and only auto-discovery always sets one. So derivation can
-    // meet this state, and the entry it emits must carry no SNI, which the
-    // renderer reports as MissingSni. Inventing a name here would hand the hop
-    // a certificate identity nobody declared.
+    // A hand-written Mutual site may omit serverName; leave SNI unset for the renderer to refuse.
     let sites = vec![
         site("site-a", None),
         site(
@@ -457,8 +440,7 @@ fn decl_allowing<'decl>(
     }
 }
 
-/// A `GridSite` as discovery writes one: the object name is generated, and the
-/// id it speaks for lives in the annotation.
+/// A `GridSite` as discovery writes one, with the site id in the annotation.
 fn discovered_site(generated_name: &str, site_id: &str, egress: &serde_json::Value) -> GridSite {
     serde_json::from_value(serde_json::json!({
         "apiVersion": "grid.praxis.fast/v1alpha1",
@@ -476,8 +458,7 @@ fn discovered_site(generated_name: &str, site_id: &str, egress: &serde_json::Val
 
 #[test]
 fn a_remote_candidate_the_gateway_did_not_allowlist_derives_nothing() {
-    // The allowlist is the trust decision, so it has to gate the remote hop too.
-    // Gating only the local map let a remote candidate reach its site's egress.
+    // The allowlist gates the remote hop too.
     let sites = vec![
         site("site-a", None),
         site(
@@ -499,8 +480,7 @@ fn a_remote_candidate_the_gateway_did_not_allowlist_derives_nothing() {
 
 #[test]
 fn a_discovered_site_is_found_by_the_id_it_speaks_for() {
-    // Discovery names its stubs itself, so matching on the object name misses
-    // them and the cluster reads as having nothing to derive from.
+    // Matching on the object name would miss discovered stubs.
     let sites = vec![discovered_site(
         "net-site-b-7f3a",
         "site-b",
@@ -513,8 +493,7 @@ fn a_discovered_site_is_found_by_the_id_it_speaks_for() {
     assert_eq!(got.endpoint.address, "site-b.grid.example.invalid:8443");
 }
 
-/// Every refusal names its reason, so status can say why rather than
-/// collapsing each case to a missing entry.
+/// Every refusal names its reason.
 #[test]
 #[expect(clippy::too_many_lines, reason = "one row per refusal reason")]
 fn each_refusal_is_named() {
@@ -603,8 +582,7 @@ fn a_provider_the_gateway_did_not_allowlist_derives_nothing() {
 
 #[test]
 fn a_provider_outside_a_named_allowlist_derives_nothing() {
-    // The allowlist is the trust decision: naming prov-b admits prov-b's
-    // declarations and nothing else, however many providers are registered.
+    // Naming prov-b admits prov-b and nothing else.
     let providers = vec![
         provider("prov-a", "https://a.example.invalid", None),
         provider("prov-b", "https://b.example.invalid", None),
@@ -710,9 +688,7 @@ fn a_site_that_is_not_active_is_not_a_source() {
 
 #[test]
 fn a_port_the_url_declares_but_cannot_represent_derives_nothing() {
-    // http::Uri accepts these and reports no port, so a scheme default would
-    // dial 443 rather than refuse. This is the only input that could derive a
-    // different endpoint than the one declared.
+    // http::Uri reports no port for these, so a scheme default would dial 443.
     for endpoint in [
         "https://model-gw:99999",
         "https://model-gw:65536",
@@ -733,8 +709,7 @@ fn a_port_the_url_declares_but_cannot_represent_derives_nothing() {
 
 #[test]
 fn an_https_endpoint_named_by_address_needs_a_declared_server_name() {
-    // Praxis rejects an IP literal as an SNI, so deriving one would emit a
-    // config the gateway refuses to load at startup.
+    // Praxis rejects an IP literal as an SNI.
     let providers = vec![provider("prov-a", "https://10.0.0.7:8443", None)];
     let sites = vec![site("site-a", None)];
     let candidates = vec![candidate("prov-a", "site-a")];

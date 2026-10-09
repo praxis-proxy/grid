@@ -226,46 +226,30 @@ static Praxis configuration.
 
 ## Derived endpoint topology
 
-With `consumerConfig.deriveTopology.fromProviders`, the operator fills a
-`clusterEndpoints[]` entry for every candidate cluster that has none, from the
-declarations of the providers the list names.
+`consumerConfig.deriveTopology.fromProviders` lists the routing identities (a
+provider's `routingClusterRef`, else its `metadata.name`) whose declarations the
+operator may use to fill `clusterEndpoints[]` for candidates that have no
+entry. An empty list derives nothing. An `InferenceProvider` is cluster scoped
+and its `gridNetworkRef` is self asserted, so only the allowlist decides where a
+gateway dials.
 
-An `InferenceProvider` is cluster scoped and its `gridNetworkRef` is self
-asserted, so registering one does not decide where a gateway dials. Naming a
-provider in the list is how a gateway owner accepts its declarations, and an
-empty list derives nothing. Derived entries are the same entries the field holds, so every
-validation and reason code below applies to them unchanged.
+An explicit entry wins whole, never field by field. A candidate that cannot be
+derived is withdrawn from this gateway's routes and named in the
+`consumerConfigStatus` message with a reason.
 
-**A candidate at this gateway's own site** derives from `spec.endpoint`:
+| Candidate | Field | Source |
+|---|---|---|
+| Local site | `address` | `spec.endpoint` host and port (443 for `https`, 80 for `http`) |
+| Local site | `transport.mode` | `tls` for `https`, `plaintext` for `http` |
+| Local site | `transport.sni` | `spec.backendTls.serverName`, else the endpoint host |
+| Local site | `transport.caSecretRef` | `spec.backendTls.caSecretRef` in the gateway namespace, else absent |
+| Remote site (`GridSite` must be `Active`) | `address` | `spec.egress.address` |
+| Remote site | `transport.mode` | `mutual_tls` for `Mutual`, `plaintext` for `Plaintext` |
+| Remote site | `transport.sni` | `spec.egress.tls.serverName` |
 
-| Field | Source |
-|---|---|
-| `address` | endpoint host and port, port defaulted by scheme (443, or 80 for `http`) |
-| `transport.mode` | `tls` for an `https` endpoint, `plaintext` for `http` |
-| `transport.sni` | `spec.backendTls.serverName`, else the endpoint host |
-| `transport.caSecretRef` | `spec.backendTls.caSecretRef`, named in the gateway namespace, else absent |
-
-**A candidate at another site** derives from that site's `GridSite`, which must
-be in phase `Active`:
-
-| Field | Source |
-|---|---|
-| `address` | `spec.egress.address` |
-| `transport.mode` | `mutual_tls` for `Mutual`, `plaintext` for `Plaintext` |
-| `transport.sni` | `spec.egress.tls.serverName` |
-
-Client identity for the hop is the grid identity the gateway already mounts, so
-no backend credential crosses a site boundary.
-
-An explicit entry wins whole, never field by field. Anything else that cannot be
-derived is left out and surfaces as a reason code, as an unsupplied explicit
-entry always has. Endpoint base paths are not carried, because Praxis has no
-per-cluster upstream base path to render one into; see
+Client identity for a remote hop is the grid identity the gateway already
+mounts. Endpoint base paths are not carried; see
 [issue 248](https://github.com/praxis-proxy/grid/issues/248).
-
-The gateway's `consumerConfigStatus` message names the clusters whose entries
-were derived, so a reader can tell where a value came from without reading the
-generated config.
 
 ## Operational diagnostics
 

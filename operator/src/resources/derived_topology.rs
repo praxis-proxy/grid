@@ -1,30 +1,8 @@
 //! Derive consumer endpoint topology from provider and `GridSite` declarations.
 //!
-//! Registering an [`InferenceProvider`] is enough to route to it: this module
-//! works out the endpoint topology that a human otherwise types into
-//! `consumerConfig.clusterEndpoints`, and emits the same
-//! [`ClusterEndpointConfig`] type so the renderer is unchanged.
-//!
-//! # Why the same type
-//!
-//! Every fail-closed reason already lives in the renderer. A derived entry is
-//! validated by the code that validates a typed one, so derivation cannot
-//! invent a new way to fail open, and a cluster it cannot resolve is simply
-//! absent, which the renderer already reports as `MissingClusterEndpoint`.
-//! Nothing here returns an error of its own. A cluster it cannot resolve is a
-//! named refusal the controller withdraws from the gateway, so the document the
-//! gateway loads never names a destination nobody declared, and the status says
-//! why for each one.
-//!
-//! # The rule this follows
-//!
-//! Derive a value only when it was discovered from the thing you are about to
-//! connect to. A local backend address comes from the provider's own endpoint
-//! declaration. A remote one comes from `GridSite.spec.egress.address`, which
-//! the remote operator discovered from its provider gateway's Service and which
-//! the `GridSite` controller probed over TLS and pinned before the site reached
-//! `Active`. Grid 302 is the counterexample: the same field read as a SWIM
-//! seed, where nothing listens.
+//! Works out, for allowlisted [`InferenceProvider`]s, the endpoint topology a
+//! human otherwise types into `consumerConfig.clusterEndpoints`, emitting the
+//! same [`ClusterEndpointConfig`] type so the renderer is unchanged.
 //!
 //! [`InferenceProvider`]: crate::crd::inference_provider::InferenceProvider
 //! [`ClusterEndpointConfig`]: crate::crd::grid_network::ClusterEndpointConfig
@@ -135,7 +113,7 @@ pub(crate) struct Resolved {
     pub(crate) origin: Origin,
 }
 
-/// The declarations resolution reads. Grouped so the inputs stay one thing.
+/// The declarations resolution reads.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Declarations<'decl> {
     /// Providers registered in this cluster, which is what makes them local.
@@ -146,24 +124,11 @@ pub(crate) struct Declarations<'decl> {
     pub(crate) local_site: &'decl str,
     /// The network both are scoped to.
     pub(crate) network_name: &'decl str,
-    /// Routing identities the gateway owner accepts declarations from.
-    ///
-    /// Empty derives nothing. An `InferenceProvider` is cluster scoped with a
-    /// self-asserted `gridNetworkRef`, so registering one must not by itself
-    /// decide where this gateway dials.
+    /// Allowlisted routing identities.
     pub(crate) from_providers: &'decl [String],
 }
 
-/// Resolve an endpoint for every candidate cluster, deriving what is missing.
-///
-/// Explicit entries win whole. Field-level merge reads as the friendlier choice
-/// and is the dangerous one: a half-typed entry would silently inherit derived
-/// trust, so the operator would be supplying a CA for a connection a human
-/// thought they had fully described.
-///
-/// Returns one entry per resolvable cluster, keyed by cluster name. A cluster
-/// with no explicit entry and nothing to derive from is absent, which the
-/// renderer reports as it always has.
+/// Explicit entries win whole.
 pub(crate) fn resolve(
     candidates: &[RoutingCandidate],
     explicit: &[ClusterEndpointConfig],
@@ -203,9 +168,7 @@ pub(crate) fn resolve(
     resolution
 }
 
-/// The clusters that appear at more than one site. One cluster at two sites
-/// would otherwise collapse by site-name order, picking a topology nobody
-/// declared, so each is refused instead.
+/// Clusters that appear at more than one site.
 fn clusters_at_two_sites<'cluster>(clusters: &BTreeSet<(&'cluster str, &'cluster str)>) -> BTreeSet<&'cluster str> {
     let mut seen = BTreeSet::<&str>::new();
     let mut twice = BTreeSet::<&str>::new();
@@ -217,11 +180,7 @@ fn clusters_at_two_sites<'cluster>(clusters: &BTreeSet<(&'cluster str, &'cluster
     twice
 }
 
-/// The providers this gateway accepts declarations from, by routing identity.
-///
-/// Allowlisted by the gateway owner, in this network, not explicitly
-/// unavailable, and unambiguous. The sibling overlay paths apply the same
-/// network and availability filters.
+/// Allowlisted, available, unambiguous providers in this network, by routing identity.
 fn local_providers<'decl>(declarations: &Declarations<'decl>) -> BTreeMap<&'decl str, &'decl InferenceProvider> {
     let mut local: BTreeMap<&str, &InferenceProvider> = BTreeMap::new();
     let mut ambiguous: BTreeSet<&str> = BTreeSet::new();
@@ -235,8 +194,7 @@ fn local_providers<'decl>(declarations: &Declarations<'decl>) -> BTreeMap<&'decl
         {
             continue;
         }
-        // Two providers claiming one identity would otherwise resolve by
-        // iteration order, silently picking one of their endpoints.
+        // Otherwise iteration order would pick one endpoint silently.
         if local.insert(identity, provider).is_some() {
             ambiguous.insert(identity);
         }
@@ -248,15 +206,6 @@ fn local_providers<'decl>(declarations: &Declarations<'decl>) -> BTreeMap<&'decl
 }
 
 /// Resolve one cluster: its explicit entry, else a derived local or remote one.
-///
-/// A cluster is local when a registered [`InferenceProvider`] carries its
-/// routing identity **and** the candidate's site is this gateway's own. The
-/// provider objects in hand are by definition the ones in this cluster, which is
-/// a stronger test than comparing site names alone. Requiring both refuses to
-/// guess for a provider declared here whose selector names another site, where
-/// its endpoint is reachable from here and its candidate says otherwise.
-///
-/// [`InferenceProvider`]: crate::crd::inference_provider::InferenceProvider
 fn resolve_one(
     cluster: &str,
     site: &str,
@@ -270,16 +219,12 @@ fn resolve_one(
             origin: Origin::Explicit,
         });
     }
-    // The allowlist is the trust decision, so it gates a remote candidate as
-    // well as a local one. Gating only the local map let a remote candidate
-    // reach its site's egress without the gateway owner naming it.
+    // The allowlist gates remote candidates too.
     if !declarations.from_providers.iter().any(|named| named == cluster) {
         return Err(Refusal::NotAllowlisted);
     }
     if site == declarations.local_site {
-        // Our own site, so it resolves from a provider we hold or not at all.
-        // Falling through to the egress of our own site would hairpin the
-        // consumer through its own provider gateway.
+        // Own site egress would hairpin through our own provider gateway.
         return match local.get(cluster) {
             Some(provider) => derive_local(cluster, provider),
             None => Err(local_refusal(cluster, declarations)),
@@ -312,11 +257,6 @@ fn local_refusal(cluster: &str, declarations: &Declarations<'_>) -> Refusal {
 }
 
 /// Derive a local backend entry from the provider's own endpoint URL.
-///
-/// The scheme decides the transport, which is why `backendTls` does not declare
-/// one. Trust comes only from `backendTls`: an omitted CA reference means the
-/// process trust store, inherited from the explicit path rather than decided
-/// again here.
 fn derive_local(cluster: &str, provider: &InferenceProvider) -> Result<Resolved, Refusal> {
     let endpoint = provider.spec.endpoint.trim();
     let uri = endpoint
@@ -349,11 +289,6 @@ fn derive_local(cluster: &str, provider: &InferenceProvider) -> Result<Resolved,
 }
 
 /// Derive a remote provider-hop entry from the provider site's `GridSite`.
-///
-/// The address is the site's egress address, which is the remote provider
-/// gateway's own reachable address rather than an egress-only value. Client
-/// identity is the grid identity the consumer already mounts, so nothing about
-/// the backend's own credential crosses a site boundary.
 fn derive_remote(cluster: &str, site: &str, sites: &[GridSite], network_name: &str) -> Result<Resolved, Refusal> {
     let site = sites
         .iter()
@@ -362,9 +297,7 @@ fn derive_remote(cluster: &str, site: &str, sites: &[GridSite], network_name: &s
                 && known.spec.grid_network_ref == network_name
         })
         .ok_or(Refusal::SiteUnknown)?;
-    // Only an Active site has had its address probed over TLS and its leaf
-    // pinned. A Discovered or Connecting stub carries an address copied from
-    // gossip, which is not something to hand the data plane.
+    // Only an Active site's address has been probed; earlier phases carry gossip.
     if !matches!(
         site.status.as_ref().map(|status| &status.phase),
         Some(crate::crd::grid_site::GridSitePhase::Active)
@@ -386,11 +319,7 @@ fn derive_remote(cluster: &str, site: &str, sites: &[GridSite], network_name: &s
     })
 }
 
-/// Transport for a provider hop, projected from the site's declared egress TLS.
-///
-/// No CA reference: the inter-site CA is the grid identity the consumer already
-/// mounts, so nothing about a backend's own trust material crosses a site
-/// boundary.
+/// Transport for a provider hop. No CA: the consumer's grid identity carries trust.
 fn hop_transport(tls: &EgressTls) -> EndpointTransport {
     match tls.mode {
         EgressTlsMode::Mutual => EndpointTransport {
@@ -411,11 +340,7 @@ fn hop_transport(tls: &EgressTls) -> EndpointTransport {
     }
 }
 
-/// Whether a verified TLS connection to `host` has a name it can send.
-///
-/// Praxis rejects an IP literal as an SNI (RFC 6066), so an https endpoint
-/// named by address needs a declared server name. Deriving one would emit a
-/// config the gateway refuses to load at startup.
+/// Whether a TLS connection to `host` has a name to send; Praxis rejects an IP SNI.
 fn server_name_is_usable(backend: Option<&BackendTls>, host: &str) -> bool {
     let declared = backend
         .and_then(|backend| backend.server_name.as_deref())
@@ -428,14 +353,10 @@ fn server_name_is_usable(backend: Option<&BackendTls>, host: &str) -> bool {
             .is_err()
 }
 
-/// The port the endpoint declares, or the scheme default when it declares none.
-///
-/// `http::Uri` accepts a port it cannot represent and then reports none, so
-/// `https://host:99999` would otherwise derive `host:443`. Every other unusable
-/// endpoint refuses, and so must this one rather than dial somewhere else.
+/// The declared port, else the scheme default. `None` for an unrepresentable port.
 fn endpoint_port(uri: &http::Uri, tls: bool) -> Option<u16> {
     if let Some(port) = uri.port_u16() {
-        // Port 0 is not an endpoint, which `swim_endpoint` already decided.
+        // Port 0 is not an endpoint.
         return (port != 0).then_some(port);
     }
     let authority = uri.authority().map(http::uri::Authority::as_str).unwrap_or_default();
@@ -447,12 +368,7 @@ fn endpoint_port(uri: &http::Uri, tls: bool) -> Option<u16> {
     Some(if tls { 443 } else { 80 })
 }
 
-/// Transport for a local backend: the scheme chooses the mode, the declaration
-/// supplies the trust.
-///
-/// A plaintext entry carries no server name even when one is declared, because
-/// the renderer rejects plaintext with an SNI and a declared name is about
-/// verification, which plaintext does not do.
+/// Transport for a local backend. Plaintext drops any SNI, which the renderer rejects.
 fn backend_transport(backend: Option<&BackendTls>, host: &str, tls: bool) -> EndpointTransport {
     if !tls {
         return EndpointTransport {
@@ -473,16 +389,7 @@ fn backend_transport(backend: Option<&BackendTls>, host: &str, tls: bool) -> End
     }
 }
 
-
-#[cfg(test)]
-mod tests;
-
-/// One line naming which clusters were derived, for the gateway's status.
-///
-/// Empty when nothing was derived, so a gateway that supplies its own topology
-/// reads exactly as it did before. Bounded: an operator needs to know that
-/// derivation happened and where to look, not a full inventory in a status
-/// message.
+/// One line naming derived and withdrawn clusters, for status. Empty when neither.
 pub(crate) fn derived_summary(resolution: &Resolution) -> String {
     let derived: Vec<String> = resolution
         .resolved
@@ -526,3 +433,6 @@ fn named(items: &[String]) -> String {
 
 /// How many cluster names a status message carries before it summarises.
 const MAX_NAMED_CLUSTERS: usize = 3;
+
+#[cfg(test)]
+mod tests;

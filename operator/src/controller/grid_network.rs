@@ -5171,16 +5171,7 @@ fn grid_network_status_needs_update(current: Option<&GridNetworkStatus>, desired
 // Consumer config status builders
 // ---------------------------------------------------------------------------
 
-/// The endpoint topology for one gateway, and the status note naming what was derived.
-///
-/// Without `deriveTopology`, the gateway's own entries pass through untouched,
-/// which is what keeps this opt-in. With it, resolution fills the clusters they
-/// do not cover.
-///
-/// Resolution is keyed by candidate, so an entry for a cluster no candidate
-/// names does not survive the derived path. That is unobservable: the renderer
-/// looks up only the clusters its candidates name, and the plaintext-egress
-/// decision reads the spec rather than this result.
+/// One gateway's endpoint topology, status note, and refusals.
 fn gateway_cluster_endpoints<'gw>(
     gw_ref: &'gw GatewayRef,
     candidates: &[routing_overlay::RoutingCandidate],
@@ -5193,8 +5184,7 @@ fn gateway_cluster_endpoints<'gw>(
     let Some(cc) = gw_ref.consumer_config.as_ref() else {
         return (Cow::Borrowed(&[]), String::new(), Vec::new());
     };
-    // An empty allowlist derives nothing, so a half-finished edit leaves the
-    // gateway on its own entries rather than on every provider in the cluster.
+    // Empty must mean no provider, not every provider.
     let Some(derive) = cc
         .derive_topology
         .as_ref()
@@ -5223,14 +5213,7 @@ fn gateway_cluster_endpoints<'gw>(
     )
 }
 
-/// Withdraw every candidate derivation refused, so the overlay and the
-/// generated config agree that it is not served from this gateway.
-///
-/// A refused candidate was going to fail the whole render as
-/// `MissingClusterEndpoint`, which left the gateway on its previous document
-/// with the candidate still live. Moving it to `excluded` withdraws it from
-/// the route list and keeps it known, so the gateway answers 503 for the model
-/// rather than routing to a destination nobody declared.
+/// Move refused candidates to `excluded` so one refusal does not fail the whole render.
 fn withdraw_refused(overlay: &mut routing_overlay::RoutingOverlay, refused: &[derived_topology::Refused]) {
     if refused.is_empty() {
         return;
@@ -9456,8 +9439,7 @@ mod tests {
             cluster_endpoints: typed.clone(),
             ..make_consumer_config("praxis-consumer-config")
         });
-        // A candidate that resolution could not have derived anyway, plus one
-        // typed entry naming no candidate: without the opt-in, neither matters.
+        // Without the opt-in, entries pass through untouched.
         let candidates = vec![topology_candidate("prov-b", "site-b")];
         let (endpoints, summary, _) = gateway_cluster_endpoints(&gw, &candidates, &empty_declarations());
         assert_eq!(
@@ -9472,9 +9454,7 @@ mod tests {
 
     #[test]
     fn with_an_empty_allowlist_a_gateways_own_entries_pass_through_untouched() {
-        // The state a half-finished edit leaves behind: the opt-in block exists
-        // and names nobody. It must read as no provider, not every provider,
-        // and the typed entries must still reach the renderer unchanged.
+        // An empty allowlist reads as no provider; typed entries pass through.
         let mut gw = make_gw_ref("inference-gw", "praxis-system");
         let typed = vec![typed_endpoint("prov-a", "a.example.invalid:8080")];
         gw.consumer_config = Some(ConsumerConfig {
@@ -9548,10 +9528,7 @@ mod tests {
 
     #[test]
     fn with_derive_topology_a_typed_entry_for_no_candidate_is_dropped() {
-        // Documented rather than desired: resolution is keyed by candidate. It
-        // is unobservable because the renderer looks up only the clusters its
-        // candidates name. If that lookup ever changes, this test is the one
-        // that should start failing.
+        // Pins undesired behaviour: harmless while the renderer looks up by candidate.
         let mut gw = make_gw_ref("inference-gw", "praxis-system");
         gw.consumer_config = Some(ConsumerConfig {
             derive_topology: Some(crate::crd::grid_network::DeriveTopology {

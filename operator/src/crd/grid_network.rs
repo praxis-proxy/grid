@@ -878,10 +878,6 @@ pub struct ConsumerConfig {
 
     /// Derive the endpoint topology from the declarations of named providers,
     /// instead of requiring a `clusterEndpoints` entry per candidate.
-    ///
-    /// Per gateway rather than per network, so one site can adopt derivation
-    /// while another keeps explicit entries. An explicit entry for a cluster
-    /// still wins, whole rather than field by field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub derive_topology: Option<DeriveTopology>,
 
@@ -1049,16 +1045,7 @@ impl Default for ConsumerConfig {
     }
 }
 
-/// Which providers a gateway will derive its endpoint topology from.
-///
-/// An `InferenceProvider` is cluster scoped and its `gridNetworkRef` is self
-/// asserted, so registering one must not by itself decide where this gateway
-/// dials or what it trusts. Naming a provider here is the gateway owner saying
-/// they accept that provider's declarations.
-///
-/// `fromProviders` empty derives nothing. That is deliberate: an empty
-/// allowlist is the state a half-finished edit leaves behind, and it has to
-/// mean no provider rather than every provider.
+/// Providers a gateway derives its endpoint topology from. Empty derives nothing.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
@@ -1066,8 +1053,7 @@ pub struct DeriveTopology {
     /// Routing identities whose declarations this gateway derives from.
     ///
     /// Each entry is a provider's `routingClusterRef`, or its `metadata.name`
-    /// when that is unset, which is the same identity the routing overlay uses
-    /// as `candidate.cluster`.
+    /// when that is unset.
     #[serde(default)]
     pub from_providers: Vec<String>,
 }

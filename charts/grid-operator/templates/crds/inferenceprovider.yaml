@@ -121,23 +121,14 @@ spec:
                   description: Backend deployment category.
                   type: string
                 backendTls:
-                  description: |-
-                    TLS intent for connecting to this provider's backend.
-
-                    Only read when a gateway derives its connection topology. The transport
-                    mode is not declared here: an `https` endpoint is server-authenticated
-                    TLS and an `http` one is plaintext, so a second declaration would be a
-                    second thing to disagree with the URL.
+                  description: TLS for this provider's backend. Read only when a gateway derives its topology.
                   nullable: true
                   properties:
                     caSecretRef:
                       description: |-
                         Secret supplying the CA bundle that signs the backend's certificate.
 
-                        Omitted uses the process trust store, which is what a publicly signed
-                        backend needs and what a privately signed one must not rely on. Named in
-                        the gateway's own namespace, reusing the endpoint CA reference so a
-                        backend CA cannot name a namespace the gateway may not read.
+                        Omitted uses the process trust store. Named in the gateway namespace.
                       nullable: true
                       properties:
                         key:
