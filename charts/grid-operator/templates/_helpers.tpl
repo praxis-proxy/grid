@@ -99,12 +99,11 @@ Validate image digest format when provided.
 {{- end }}
 
 {{/*
-Normalize values once per render, in place and idempotently. site.name and grid.seeds
-default swim.siteName and swim.seeds, and a grid.id turns signals on for grid.signals poll and
-defaults a LoadBalancer SWIM Service and the grid-gateway Service the GridNetwork names. Enrollment, the
-cross-cluster path, defaults the site name to swim.siteName (and back), the URL to the
-in-cluster grid-enrollment Service, a LoadBalancer SWIM Service, and the grid-gateway
-Service. Without enrollment nothing changes.
+Flat-grid and enrollment defaults keep site identity, SWIM reachability, and
+gateway references aligned so the site can join the mesh and advertise its gateway.
+Normalize once per render, in place and idempotently, so every template shares
+those defaults. Explicit site names, seeds, and SWIM Service settings take
+precedence over their defaults.
 */}}
 {{- define "grid-operator.normalize" -}}
 {{- $v := .Values }}
