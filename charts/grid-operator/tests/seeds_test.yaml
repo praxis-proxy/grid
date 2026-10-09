@@ -36,3 +36,20 @@ tests:
       - contains:
           path: spec.template.spec.containers[0].env
           content: {name: GRID_SWIM_SEEDS, value: "203.0.113.10:7946"}
+
+  - it: normalizes bracketed IPv6 swim.seeds at the default port and preserves an explicit port
+    set:
+      swim.seeds: "[2001:db8::1] [2001:db8::2]:7948"
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content: {name: GRID_SWIM_SEEDS, value: "[2001:db8::1]:7946,[2001:db8::2]:7948"}
+
+  - it: normalizes bracketed IPv6 peer fallback at the configured SWIM port
+    set:
+      peers: "[2001:db8::1] [2001:db8::2]:7948"
+      swim.service.port: 7947
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content: {name: GRID_SWIM_SEEDS, value: "[2001:db8::1]:7947,[2001:db8::2]:7948"}

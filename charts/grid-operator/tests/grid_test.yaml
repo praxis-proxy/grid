@@ -186,3 +186,19 @@ tests:
         contains:
           path: spec.template.spec.containers[0].env
           content: {name: GRID_SWIM_SEEDS, value: "swim-a.example.com:7946,192.0.2.10:7946"}
+
+  - it: gives a bracketed IPv6 seed the configured SWIM port and preserves an explicit port
+    set:
+      site.name: east
+      grid.id: lab
+      swim.service.port: 7947
+      grid.seeds: ["[2001:db8::1]", "[2001:db8::2]:7948"]
+    asserts:
+      - template: templates/gridnetwork.yaml
+        equal:
+          path: spec.seeds
+          value: ["[2001:db8::1]:7947", "[2001:db8::2]:7948"]
+      - template: templates/deployment.yaml
+        contains:
+          path: spec.template.spec.containers[0].env
+          content: {name: GRID_SWIM_SEEDS, value: "[2001:db8::1]:7947,[2001:db8::2]:7948"}

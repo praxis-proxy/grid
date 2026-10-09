@@ -189,7 +189,9 @@ RUST_LOG for the chart's Rust binaries: log.filter when set, else log.level.
      and host:port are taken as given, a bare IPv6 address is bracketed, and the rest get `port`. */}}
 {{- define "grid-operator.swimEndpoint" -}}
 {{- $parts := len (splitList ":" .entry) -}}
-{{- if or (hasPrefix "[" .entry) (eq $parts 2) -}}
+{{- if and (hasPrefix "[" .entry) (hasSuffix "]" .entry) -}}
+{{- printf "%s:%v" .entry .port -}}
+{{- else if or (hasPrefix "[" .entry) (eq $parts 2) -}}
 {{- .entry -}}
 {{- else if gt $parts 2 -}}
 {{- printf "[%s]:%v" .entry .port -}}
