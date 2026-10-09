@@ -187,6 +187,10 @@ jobs:
       - name: Assert fips build excludes rustls
         run: |
           for m in crates/operator/Cargo.toml crates/overlay-sync/Cargo.toml; do
+            if ! cargo tree --manifest-path "$m" --no-default-features --features fips -e normal >/dev/null; then
+              echo "cannot resolve $m for the fips check"
+              exit 1
+            fi
             if cargo tree --manifest-path "$m" --no-default-features --features fips -e normal -i rustls >/dev/null 2>&1; then
               echo "fips build of $m unexpectedly links rustls"
               exit 1
