@@ -676,18 +676,6 @@ jobs:
           cache-from: type=gha,scope=triggered-e2e-overlay-sync
           cache-to: type=gha,mode=max,scope=triggered-e2e-overlay-sync
 
-      - name: Build Grid mock-providers image
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
-        with:
-          context: grid
-          file: grid/mock-providers/Containerfile
-          push: false
-          load: true
-          tags: grid-mock-providers:${{ steps.tags.outputs.tag }}
-          labels: org.opencontainers.image.revision=${{ env.TESTED_SHA }}
-          cache-from: type=gha,scope=triggered-e2e-mock-providers
-          cache-to: type=gha,mode=max,scope=triggered-e2e-mock-providers
-
       - name: Pull pinned gateway image
         id: gateway
         env:
@@ -796,19 +784,18 @@ jobs:
           set -euo pipefail
           FAILED=0
 
-          for img in "grid-operator:${TAG}" "grid-mock-providers:${TAG}"; do
-            if ! docker image inspect "${img}" > /dev/null 2>&1; then
-              echo "::error::Required locally-built image missing: ${img}"
-              FAILED=1
-              continue
-            fi
-            IMAGE_REVISION=$(docker image inspect --format='{{index .Config.Labels "org.opencontainers.image.revision"}}' "${img}")
-            echo "${img}: revision label ${IMAGE_REVISION}"
+          operator_img="grid-operator:${TAG}"
+          if ! docker image inspect "${operator_img}" > /dev/null 2>&1; then
+            echo "::error::Required locally-built image missing: ${operator_img}"
+            FAILED=1
+          else
+            IMAGE_REVISION=$(docker image inspect --format='{{index .Config.Labels "org.opencontainers.image.revision"}}' "${operator_img}")
+            echo "${operator_img}: revision label ${IMAGE_REVISION}"
             if [[ "${IMAGE_REVISION}" != "${TESTED_SHA}" ]]; then
-              echo "::error::${img} was not built from verified source ${TESTED_SHA}"
+              echo "::error::${operator_img} was not built from verified source ${TESTED_SHA}"
               FAILED=1
             fi
-          done
+          fi
 
           if [[ "${QUALIFICATION}" == "static-weighted" || "${QUALIFICATION}" == "combined-site" ]]; then
             img="grid-overlay-sync:${TAG}"
@@ -834,16 +821,10 @@ jobs:
             FAILED=1
           fi
 
-          for img_var in GRID_XTASK_OPERATOR_IMAGE GRID_XTASK_MOCK_PROVIDER_IMAGE; do
-            img_val="grid-operator:${TAG}"
-            if [[ "${img_var}" == "GRID_XTASK_MOCK_PROVIDER_IMAGE" ]]; then
-              img_val="grid-mock-providers:${TAG}"
-            fi
-            if [[ "${img_val}" =~ ^ghcr\.io/ ]] || [[ "${img_val}" =~ :v[0-9] ]] || [[ "${img_val}" =~ :latest$ ]]; then
-              echo "::error::${img_var}=${img_val} appears to be a released image, not a locally-built image"
-              FAILED=1
-            fi
-          done
+          if [[ "${operator_img}" =~ ^ghcr\.io/ ]] || [[ "${operator_img}" =~ :v[0-9] ]] || [[ "${operator_img}" =~ :latest$ ]]; then
+            echo "::error::GRID_XTASK_OPERATOR_IMAGE=${operator_img} appears to be a released image, not a locally-built image"
+            FAILED=1
+          fi
 
           if [[ "${FAILED}" -ne 0 ]]; then
             exit 1
@@ -886,10 +867,6 @@ jobs:
             docker inspect --format='  ID: {{.Id}}' "grid-operator:${TAG}"
             docker inspect --format='  Source revision: {{index .Config.Labels "org.opencontainers.image.revision"}}' "grid-operator:${TAG}"
             echo ""
-            echo "grid-mock-providers:${TAG}"
-            docker inspect --format='  ID: {{.Id}}' "grid-mock-providers:${TAG}"
-            docker inspect --format='  Source revision: {{index .Config.Labels "org.opencontainers.image.revision"}}' "grid-mock-providers:${TAG}"
-            echo ""
             if [[ "${QUALIFICATION}" == "static-weighted" || "${QUALIFICATION}" == "combined-site" ]]; then
               echo "grid-overlay-sync:${TAG}"
               docker inspect --format='  ID: {{.Id}}' "grid-overlay-sync:${TAG}"
@@ -909,7 +886,6 @@ jobs:
             echo ""
             echo "=== Override Environment ==="
             echo "GRID_XTASK_OPERATOR_IMAGE=grid-operator:${TAG}"
-            echo "GRID_XTASK_MOCK_PROVIDER_IMAGE=grid-mock-providers:${TAG}"
             if [[ "${QUALIFICATION}" == "static-weighted" || "${QUALIFICATION}" == "combined-site" ]]; then
               echo "GRID_XTASK_OVERLAY_SYNC_IMAGE=grid-overlay-sync:${TAG}"
             else
@@ -947,7 +923,6 @@ jobs:
         env:
           GRID_REPO: ${{ github.workspace }}/grid
           GRID_XTASK_OPERATOR_IMAGE: grid-operator:${{ steps.tags.outputs.tag }}
-          GRID_XTASK_MOCK_PROVIDER_IMAGE: grid-mock-providers:${{ steps.tags.outputs.tag }}
           GRID_XTASK_GATEWAY_IMAGE: ${{ env.GATEWAY_IMAGE_REF }}
           OVERLAY_SYNC_IMAGE: grid-overlay-sync:${{ steps.tags.outputs.tag }}
         run: |
@@ -966,7 +941,6 @@ jobs:
           fi
           echo "Grid source:    ${GRID_REPO} (${SOURCE_LABEL})"
           echo "Operator image: ${GRID_XTASK_OPERATOR_IMAGE} (revision ${TESTED_SHA})"
-          echo "Mock image:     ${GRID_XTASK_MOCK_PROVIDER_IMAGE} (revision ${TESTED_SHA})"
           echo "Gateway image:  ${GRID_XTASK_GATEWAY_IMAGE}@${GATEWAY_IMAGE_DIGEST}"
           echo "Qualification:  ${QUALIFICATION} (${MODE})"
           echo "Evidence:       ${EVIDENCE_DIR}"
@@ -1366,7 +1340,6 @@ jobs:
             echo "| Image | Reference |"
             echo "|-------|-----------|"
             echo "| Grid Operator | \`grid-operator:${TAG}\` |"
-            echo "| Mock Providers | \`grid-mock-providers:${TAG}\` |"
             echo "| Gateway (pinned) | \`${GATEWAY_IMAGE_REF}\` (\`${RESOLVED_DIGEST}\`) |"
             echo "| Simulator | \`${SIMULATOR}\` |"
             echo ""
