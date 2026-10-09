@@ -663,6 +663,19 @@ jobs:
           cache-from: type=gha,scope=triggered-e2e-operator
           cache-to: type=gha,mode=max,scope=triggered-e2e-operator
 
+      - name: Build Grid overlay-sync image
+        if: env.QUALIFICATION == 'static-weighted' || env.QUALIFICATION == 'combined-site'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: grid
+          file: grid/overlay-sync/Containerfile
+          push: false
+          load: true
+          tags: grid-overlay-sync:${{ steps.tags.outputs.tag }}
+          labels: org.opencontainers.image.revision=${{ env.TESTED_SHA }}
+          cache-from: type=gha,scope=triggered-e2e-overlay-sync
+          cache-to: type=gha,mode=max,scope=triggered-e2e-overlay-sync
+
       - name: Build Grid mock-providers image
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
@@ -797,6 +810,25 @@ jobs:
             fi
           done
 
+          if [[ "${QUALIFICATION}" == "static-weighted" || "${QUALIFICATION}" == "combined-site" ]]; then
+            img="grid-overlay-sync:${TAG}"
+            if ! docker image inspect "${img}" > /dev/null 2>&1; then
+              echo "::error::Required locally-built image missing: ${img}"
+              FAILED=1
+            else
+              IMAGE_REVISION=$(docker image inspect --format='{{index .Config.Labels "org.opencontainers.image.revision"}}' "${img}")
+              echo "${img}: revision label ${IMAGE_REVISION}"
+              if [[ "${IMAGE_REVISION}" != "${TESTED_SHA}" ]]; then
+                echo "::error::${img} was not built from verified source ${TESTED_SHA}"
+                FAILED=1
+              fi
+              if [[ "${img}" =~ ^ghcr\.io/ ]] || [[ "${img}" =~ :v[0-9] ]] || [[ "${img}" =~ :latest$ ]]; then
+                echo "::error::GRID_XTASK_OVERLAY_SYNC_IMAGE=${img} appears to be a released image, not a locally-built image"
+                FAILED=1
+              fi
+            fi
+          fi
+
           if ! docker image inspect "${GATEWAY_IMAGE_REF}" > /dev/null 2>&1; then
             echo "::error::Pinned gateway image missing: ${GATEWAY_IMAGE_REF}"
             FAILED=1
@@ -858,6 +890,12 @@ jobs:
             docker inspect --format='  ID: {{.Id}}' "grid-mock-providers:${TAG}"
             docker inspect --format='  Source revision: {{index .Config.Labels "org.opencontainers.image.revision"}}' "grid-mock-providers:${TAG}"
             echo ""
+            if [[ "${QUALIFICATION}" == "static-weighted" || "${QUALIFICATION}" == "combined-site" ]]; then
+              echo "grid-overlay-sync:${TAG}"
+              docker inspect --format='  ID: {{.Id}}' "grid-overlay-sync:${TAG}"
+              docker inspect --format='  Source revision: {{index .Config.Labels "org.opencontainers.image.revision"}}' "grid-overlay-sync:${TAG}"
+              echo ""
+            fi
             echo "${GATEWAY_IMAGE_REF}  (pinned gateway — not built by Grid)"
             docker inspect --format='  ID: {{.Id}}' "${GATEWAY_IMAGE_REF}"
             echo "  Digest: ${RESOLVED_DIGEST}"
@@ -872,6 +910,11 @@ jobs:
             echo "=== Override Environment ==="
             echo "GRID_XTASK_OPERATOR_IMAGE=grid-operator:${TAG}"
             echo "GRID_XTASK_MOCK_PROVIDER_IMAGE=grid-mock-providers:${TAG}"
+            if [[ "${QUALIFICATION}" == "static-weighted" || "${QUALIFICATION}" == "combined-site" ]]; then
+              echo "GRID_XTASK_OVERLAY_SYNC_IMAGE=grid-overlay-sync:${TAG}"
+            else
+              echo "GRID_XTASK_OVERLAY_SYNC_IMAGE=<unset>"
+            fi
             echo "GRID_XTASK_GATEWAY_IMAGE=${GATEWAY_IMAGE_REF}"
             if [[ "${QUALIFICATION}" == "combined-site" ]]; then
               echo "GRID_XTASK_SIM_IMAGE=<unset> (xtask combined-site default ${COMBINED_SITE_SIM_IMAGE_REF})"
@@ -906,6 +949,7 @@ jobs:
           GRID_XTASK_OPERATOR_IMAGE: grid-operator:${{ steps.tags.outputs.tag }}
           GRID_XTASK_MOCK_PROVIDER_IMAGE: grid-mock-providers:${{ steps.tags.outputs.tag }}
           GRID_XTASK_GATEWAY_IMAGE: ${{ env.GATEWAY_IMAGE_REF }}
+          OVERLAY_SYNC_IMAGE: grid-overlay-sync:${{ steps.tags.outputs.tag }}
         run: |
           set -euo pipefail
           GRID_ACTUAL=$(git -C "${GRID_REPO}" rev-parse HEAD)
@@ -940,6 +984,7 @@ jobs:
               ;;
             static-weighted)
               GRID_XTASK_SIM_IMAGE="${STATIC_WEIGHTED_SIM_IMAGE_REF}" \
+              GRID_XTASK_OVERLAY_SYNC_IMAGE="${OVERLAY_SYNC_IMAGE}" \
               GRID_XTASK_IMAGE_PULL_POLICY=Never \
               cargo xtask env run-grid-static-weighted-qualification \
                 --forge-config tests/e2e/topologies/grid-static-weighted/forge.yaml \
@@ -947,6 +992,7 @@ jobs:
                 2>&1 | tee "${GITHUB_WORKSPACE}/run-${QUALIFICATION}.log"
               ;;
             combined-site)
+              GRID_XTASK_OVERLAY_SYNC_IMAGE="${OVERLAY_SYNC_IMAGE}" \
               GRID_XTASK_IMAGE_PULL_POLICY=Never \
               cargo xtask env run-grid-combined-site-demo \
                 --forge-config tests/e2e/topologies/grid-combined-site/forge.yaml \
@@ -1128,15 +1174,26 @@ jobs:
               NETWORK_OWNER="grid-glb-demo"
               ;;
             static-weighted)
-              RESOLVED_CONFIG="${GRID_REPO}/tests/e2e/topologies/grid-static-weighted/.forge.resolved.yaml"
+              RESOLVED_CONFIG="${EVIDENCE_DIR}/resolved-forge.yaml"
+              STATE_FILE="${EVIDENCE_DIR}/forge-state/state.json"
               if [[ ! -f "${RESOLVED_CONFIG}" ]]; then
                 echo "::warning::Static-weighted resolved Forge config is absent; refusing broad cleanup"
                 CLEANUP_RESULT="partial"
               else
                 RUN_PREFIX=$(sed -n 's/^    clusterPrefix:[[:space:]]*//p' "${RESOLVED_CONFIG}" | head -n 1 | tr -d '"')
                 NETWORK_OWNER=$(sed -n 's/^  name:[[:space:]]*//p' "${RESOLVED_CONFIG}" | head -n 1 | tr -d '"')
-                if ! [[ "${RUN_PREFIX}" =~ ^grid-static-weighted-[0-9]+$ ]] || [[ "${NETWORK_OWNER}" != "${RUN_PREFIX}" ]]; then
+                if ! [[ "${RUN_PREFIX}" =~ ^grid258-[0-9]+-[0-9]+$ ]] || [[ "${NETWORK_OWNER}" != "${RUN_PREFIX}" ]]; then
                   echo "::warning::Static-weighted Forge ownership could not be validated; refusing broad cleanup"
+                  CLEANUP_RESULT="partial"
+                elif [[ -f "${STATE_FILE}" ]] && ! jq -e --arg prefix "${RUN_PREFIX}" '
+                  .network.name == ($prefix + "-net")
+                  and ([.clusters[].kindName] - [
+                    $prefix + "-provider-a",
+                    $prefix + "-provider-b",
+                    $prefix + "-provider-c"
+                  ] | length == 0)
+                ' "${STATE_FILE}" >/dev/null; then
+                  echo "::warning::Static-weighted Forge state does not match resolved run ownership; refusing cleanup"
                   CLEANUP_RESULT="partial"
                 else
                   OWNED_CLUSTERS=(
