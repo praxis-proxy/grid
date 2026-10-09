@@ -3517,6 +3517,55 @@ mod tests {
         assert_eq!(header(http::header::AGE).as_deref(), Some("7"));
     }
 
+    /// hyper writes its cached `Date` only when a response carries none, so the
+    /// render's own `Date` is the only one a reader gets.
+    #[tokio::test]
+    async fn the_explicit_date_is_the_only_date_on_the_wire() {
+        let stepped_back = UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000);
+        let answer = served_on_the_wire(stepped_back).await;
+        let dates: Vec<&str> = answer
+            .lines()
+            .take_while(|line| !line.is_empty())
+            .filter_map(|line| line.split_once(':'))
+            .filter(|(name, _)| name.eq_ignore_ascii_case("date"))
+            .map(|(_, value)| value.trim())
+            .collect();
+        assert_eq!(
+            dates,
+            [httpdate::fmt_http_date(stepped_back)],
+            "the render's Date replaces hyper's cached one rather than joining it"
+        );
+    }
+
+    /// The raw HTTP/1.1 answer hyper writes for an empty exposition rendered at `wall`.
+    async fn served_on_the_wire(wall: SystemTime) -> String {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let (mut client, server_io) = tokio::io::duplex(4096);
+        let service = hyper::service::service_fn(move |_request: http::Request<hyper::body::Incoming>| {
+            std::future::ready(Ok::<_, std::convert::Infallible>(served(
+                String::new(),
+                std::time::Duration::ZERO,
+                wall,
+            )))
+        });
+        let connection = hyper::server::conn::http1::Builder::new()
+            .timer(hyper_util::rt::TokioTimer::new())
+            .keep_alive(false)
+            .serve_connection(hyper_util::rt::TokioIo::new(server_io), service);
+        let server = tokio::spawn(connection);
+        client
+            .write_all(b"GET /v1/site/signals HTTP/1.1\r\nHost: east\r\n\r\n")
+            .await
+            .expect("request");
+        let mut answer = Vec::new();
+        client.read_to_end(&mut answer).await.expect("response");
+        assert!(
+            server.await.expect("server task").is_ok(),
+            "one answer, then a clean close"
+        );
+        String::from_utf8_lossy(&answer).into_owned()
+    }
+
     #[tokio::test]
     async fn a_relayed_row_reads_its_own_age_against_the_response_date() {
         let published = Published {
