@@ -61,8 +61,10 @@ unreachable, unauthorized, too_large, no_date, bad_identity),
 `grid_signals_last_success_timestamp_seconds`, `grid_signals_response_bytes` against the
 gateway's 1 MiB read ceiling (the operator holds the relay under 768 KiB and counts what it
 left out in `grid_signals_relay_truncated_total{store,cut}`), and `grid_signals_ingest_dropped_total{reason}` (skew,
-site_mismatch, cap, parse) for rows the operator served that the gateway refused. The
-gateway logs once when the poll starts failing and once when it recovers.
+site_mismatch, cap, parse) for rows the operator served that the gateway
+refused. `skew` is a row stamped more than a second past the operator's `Date`
+or more than a day before it. The gateway logs once when the poll starts
+failing and once when it recovers.
 
 ## Symptoms
 

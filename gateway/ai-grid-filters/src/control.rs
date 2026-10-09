@@ -12,7 +12,7 @@ use std::{
 };
 
 use arc_swap::ArcSwap;
-use grid_signals::{LoadStore, now_ms};
+use grid_signals::LoadStore;
 use grid_signals_client::{PollHandle, PollerConfig};
 use praxis_filter::FilterError;
 
@@ -399,7 +399,7 @@ impl Control {
         let current = self.snapshot.load_full();
         let ordered = Arc::new(topology.order(
             &self.store,
-            now_ms(),
+            self.store.timeline_ms(),
             &self.health,
             &current.shedding,
             &mut gauged,
@@ -480,15 +480,17 @@ impl Control {
         }
     }
 
-    /// The refresh a poller runs each cycle: order the current topology by load.
+    /// The refresh a poller runs each cycle: order the current topology by load,
+    /// read at now on the store's own timeline.
     pub(crate) fn refresh(&self) -> Refresh {
+        let store = Arc::clone(&self.store);
         make_refresh(
             Arc::clone(&self.topology),
             Arc::clone(&self.snapshot),
             Arc::clone(&self.swap),
             Arc::clone(&self.health),
             Arc::clone(&self.tuning),
-            now_ms,
+            move || store.timeline_ms(),
         )
     }
 }
@@ -760,6 +762,7 @@ mod tests {
         time::Instant,
     };
 
+    use grid_signals::{Timeline, now_ms};
     use grid_signals_client::{FetchError, Scrape, SignalSource, spawn_on_thread_held};
 
     use super::*;
@@ -976,6 +979,28 @@ mod tests {
             sites(&snapshot.load()) == ["west", "local"]
         });
         assert_eq!(peers.fetches("west"), 0, "west itself is never dialed");
+    }
+
+    #[test]
+    fn the_order_reads_load_on_the_store_timeline_whatever_the_wall_reads() {
+        for (label, apart_ms) in [
+            ("the wall stepped forward an hour", -3_600_000_i64),
+            ("the wall stepped back an hour", 3_600_000),
+        ] {
+            let peers = Peers::default();
+            peers.set_load("east", 50.0);
+            peers.set_load("west", 5.0);
+            let initial = config(&["east", "west"]);
+            let mut control = Control::new(&initial, peers.starter()).expect("control");
+            control.store = Arc::new(
+                LoadStore::with_combine(Duration::from_secs(60), crate::signals::llm_d::combine)
+                    .with_local_site("local")
+                    .with_timeline(Timeline::starting_at(now_ms().saturating_add(apart_ms))),
+            );
+            control.apply(&initial).expect("apply");
+            let snapshot = control.snapshot();
+            eventually(label, || front(&snapshot).as_deref() == Some("west"));
+        }
     }
 
     #[test]
@@ -1199,7 +1224,7 @@ mod tests {
         store.window_worst(
             &LoadStore::key(site, &format!("pool-{site}")),
             QUEUE_METRIC,
-            now_ms(),
+            store.timeline_ms(),
             60_000,
             true,
         )

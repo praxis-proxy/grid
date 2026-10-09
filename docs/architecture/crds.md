@@ -100,8 +100,27 @@ not part of this CRD.
 **Phases**: Pending → Initializing → Active → Degraded
 
 **Status fields**: `gridId`, `connectedSites`, `distributedProviderCount`,
-`observedGeneration`, `phase`, `consumerConfigStatus[]`,
+`observedGeneration`, `phase`, `conditions[]`, `consumerConfigStatus[]`,
 `mountReconciliationStatus[]`, `budgetStatus[]`
+
+**Conditions**: `status.conditions` carries a `PeerAgesRejected` condition,
+written by the operator's peer poller under its own field manager
+(`grid-operator-peer-signals`), never by `GridNetwork` reconciliation. `True`
+means a problem is present, as with `MemoryPressure` on a node.
+
+| Status | Reason | When |
+|---|---|---|
+| `True` | `ImplausiblePeerAge` | A polled peer's latest answer carried a row stamped more than a second past its `Date`, or more than a day before it. The message names those peers (the first ten, then a count): check their clocks. |
+| `False` | `PeerAgesAccepted` | No polled peer's latest answer was rejected for its age. |
+
+A relayed age survives a clock step on every hop, so a step alone never raises
+this condition: it points at a peer whose clock or stamping is wrong. Rejected
+rows are dropped and counted in
+`grid_peer_signals_refused_total{peer,reason="age"}`, so routing reads that
+peer's providers as unmeasured. A peer that does not answer keeps its standing,
+a peer that leaves membership is dropped, and one clean answer clears it. The
+condition is written only when its status, its message or the generation
+changes, since each write starts a `GridNetwork` reconcile.
 
 `distributedProviderCount` reflects the number of remote `InferenceProvider`
 records received from peer sites via CRDT broadcast.  Local providers and records

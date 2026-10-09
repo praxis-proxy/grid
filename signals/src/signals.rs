@@ -11,8 +11,11 @@
 use std::{
     borrow::Cow,
     collections::HashMap,
-    sync::atomic::{AtomicUsize, Ordering},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    sync::{
+        OnceLock,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use dashmap::{DashMap, mapref::entry::Entry};
@@ -45,22 +48,31 @@ const MAX_SAMPLES_PER_SERIES: usize = 128;
 /// Byte cap on a metric name or target label value before it keys the store.
 const MAX_KEY_INPUT_BYTES: usize = 256;
 
-/// Tolerance for a sample stamped ahead of the operator's own clock (its `Date`
-/// header). Kept small: a legitimate sample is never meaningfully ahead of the
-/// operator's own observation clock, and a large future window only lets a stamp
-/// wedge the series head against the later corrected samples `Series::push`
-/// drops.
-const MAX_CLOCK_SKEW_MS: i64 = 5_000;
+/// How far a sample may be stamped past the operator's `Date` and still read as
+/// now. The `Date` has one-second resolution and the operator writes it from the
+/// same clock reading as its stamps, so a fresh sample lands up to 999 ms ahead.
+const RELAY_AGE_TOLERANCE_MS: i64 = 1_000; // the Date header's resolution
 
-/// Largest relayed-sample age treated as plausible, one day. A larger apparent
-/// age means the peer's clock is skewed or the stamp is garbage, so the sample is
-/// restamped fresh rather than trusted to be that old.
-const MAX_RELAY_AGE_MS: i64 = 24 * 60 * 60 * 1000;
+/// Largest relayed-sample age accepted. Further ahead of the `Date` than
+/// [`RELAY_AGE_TOLERANCE_MS`], or older than this, means the publisher's clock
+/// stepped or the stamp is garbage, so the line is dropped as `skew` rather than
+/// trusted, or refreshed into a value that reads as current.
+const MAX_RELAY_AGE_MS: i64 = 86_400_000; // one day
 
 /// Two published stamps this close name one observation. A relay re-serves a sample
 /// for a whole poll cycle and a one-second `Date` restamps it on a moving clock each
 /// time, so the published stamp says whether a line is new; a publisher deriving that
 /// stamp at render can round it a millisecond either way.
+///
+/// A step of the publisher's wall clock between two renders moves every republished
+/// stamp by the step, so a series misses this fold until it takes a newer line. A
+/// republish landing before the held instant is dropped as older, which loses
+/// nothing since the series holds that observation already, and one landing after
+/// it is kept once as a duplicate instant of the same value, whose origin the rest
+/// fold on. A dropped line leaves the origin alone, since a line older than the
+/// held one need not be the same observation. Folding on the restamped instant
+/// instead would need a second of tolerance, which merges distinct observations and
+/// breaks the exact-instant joins.
 const ORIGIN_TOLERANCE_MS: u64 = 1;
 
 /// A no-skew reference-and-local clock for tests: it sits above the small stamps
@@ -92,7 +104,7 @@ fn combine_max(_metric: &str) -> Combine {
 pub struct Ingested {
     /// Lines stored.
     pub kept: u64,
-    /// Lines stamped past the clock-skew bound.
+    /// Lines whose age against the publisher's `Date` was implausible.
     pub skewed: u64,
     /// Lines whose site label disagreed with the verified owner.
     pub mismatched: u64,
@@ -200,6 +212,50 @@ struct Provider {
     metrics: HashMap<Box<str>, Series>,
 }
 
+/// A millisecond clock that reads a given value at its start and from then on
+/// advances with the monotonic clock only, so a step of the wall clock never
+/// moves it.
+///
+/// The monotonic clock does not advance while the host is suspended, or on some
+/// hypervisors while the VM is paused, so held samples do not age across such a
+/// pause. Nothing on a timeline outlives the process: a restart starts a new one
+/// from the wall clock, over an empty store.
+#[derive(Clone, Copy, Debug)]
+pub struct Timeline {
+    /// The reading at `start`, in milliseconds.
+    start_ms: i64,
+    /// When it read `start_ms`, on the monotonic clock.
+    start: Instant,
+}
+
+impl Timeline {
+    /// A timeline reading `start_ms` now.
+    #[must_use]
+    pub fn starting_at(start_ms: i64) -> Self {
+        Self {
+            start_ms,
+            start: Instant::now(),
+        }
+    }
+
+    /// The timeline every store runs on unless told otherwise: the wall clock at
+    /// its first use, so its readings stay near epoch milliseconds.
+    #[must_use]
+    pub fn process() -> Self {
+        *PROCESS_TIMELINE.get_or_init(|| Self::starting_at(now_ms()))
+    }
+
+    /// Milliseconds on this timeline now.
+    #[must_use]
+    pub fn now_ms(&self) -> i64 {
+        let elapsed = i64::try_from(self.start.elapsed().as_millis()).unwrap_or(i64::MAX);
+        self.start_ms.saturating_add(elapsed)
+    }
+}
+
+/// The process's store timeline, started at its first use.
+static PROCESS_TIMELINE: OnceLock<Timeline> = OnceLock::new();
+
 /// Windowed signals per provider, keyed by `"site/cluster"` so a request-path
 /// lookup matches a route candidate. The key is built by concatenation
 /// ([`Self::key`]), a small `Box<str>` per lookup.
@@ -226,6 +282,8 @@ pub struct LoadStore {
     /// This gateway's own site. A source verified as this site is its local
     /// operator, whose rows are attributed by their label.
     local_site: Option<Box<str>>,
+    /// The clock every sample is held on and every read is made at.
+    timeline: Timeline,
 }
 
 impl LoadStore {
@@ -247,6 +305,7 @@ impl LoadStore {
             window,
             combine,
             local_site: None,
+            timeline: Timeline::process(),
         }
     }
 
@@ -255,6 +314,14 @@ impl LoadStore {
     #[must_use]
     pub fn with_local_site(mut self, local_site: &str) -> Self {
         self.local_site = Some(local_site.into());
+        self
+    }
+
+    /// Hold this store on `timeline` instead of the process's, as a test does to
+    /// stand a store apart from the wall clock the way a step leaves it.
+    #[must_use]
+    pub fn with_timeline(mut self, timeline: Timeline) -> Self {
+        self.timeline = timeline;
         self
     }
 
@@ -405,10 +472,10 @@ impl LoadStore {
     /// line does not cost the rest.
     ///
     /// `reference_ms` is the peer's own clock (its `Date` header) and
-    /// `local_now_ms` is this gateway's clock. A sample stamped implausibly far
-    /// past the peer's `Date` is dropped, then each surviving sample's age is
-    /// re-expressed on the local clock (`rebase_age`) so [`Self::window_worst`]
-    /// compares every sample against one clock.
+    /// `local_now_ms` is this gateway's clock. A sample whose age against the
+    /// peer's `Date` is implausible is dropped, then each surviving sample's age
+    /// is re-expressed on the local clock (`rebase_age`) so
+    /// [`Self::window_worst`] compares every sample against one clock.
     ///
     /// `owner` is the peer's crypto-verified site (from mTLS): attribution keys on
     /// it, never the self-reported `grid_site` label. A line whose label disagrees
@@ -426,7 +493,6 @@ impl LoadStore {
         let scrape = ScrapeClock {
             reference_ms,
             local_now_ms,
-            horizon_ms: reference_ms.saturating_add(MAX_CLOCK_SKEW_MS),
             owner,
             local: self.local_site.as_deref() == Some(owner),
         };
@@ -451,9 +517,8 @@ impl LoadStore {
 
     /// Attribute and store one parsed line, or say why it was dropped.
     fn ingest_line(&self, mut observation: Observation<'_>, scrape: &ScrapeClock<'_>) -> Result<(), Dropped> {
-        if observation.sample.at_ms > scrape.horizon_ms {
-            return Err(Dropped::Skewed);
-        }
+        observation.sample.at_ms =
+            rebase_age(scrape.reference_ms, observation.sample.at_ms, scrape.local_now_ms).ok_or(Dropped::Skewed)?;
         // #160, narrowed: from any peer the label must agree with the verified
         // owner. From this site's own operator the label is the owner, since the
         // operator attributed it from its own verified poll.
@@ -462,7 +527,6 @@ impl LoadStore {
             (false, Some(site)) if site != scrape.owner => return Err(Dropped::Mismatched),
             _ => scrape.owner,
         };
-        observation.sample.at_ms = rebase_age(scrape.reference_ms, observation.sample.at_ms, scrape.local_now_ms);
 
         let key = Self::key(site, observation.cluster.as_ref());
         let combine = (self.combine)(observation.metric);
@@ -489,6 +553,14 @@ impl LoadStore {
     #[must_use]
     pub fn local_site(&self) -> Option<&str> {
         self.local_site.as_deref()
+    }
+
+    /// Now on this store's timeline: the `local_now_ms` to ingest at and the
+    /// `now_ms` to read at. Never the wall clock, so a step of it can neither drop
+    /// new samples as older than the held head nor age the held ones at once.
+    #[must_use]
+    pub fn timeline_ms(&self) -> i64 {
+        self.timeline.now_ms()
     }
 
     /// Reserve a global and a per-owner slot for one new provider, atomically.
@@ -534,20 +606,20 @@ fn push_observation(provider: &mut Provider, observation: &Observation<'_>, comb
     }
 }
 
-/// Re-express a peer sample's age on the local clock.
+/// Re-express a peer sample's age on the local clock, `None` when the age is
+/// implausible.
 ///
 /// The peer's `Date` and the sample stamp are both on the peer clock, so their
 /// difference is skew-free, and restamping that age onto `local_now_ms` puts the
-/// sample on the reader's clock. An implausible age (a garbage stamp, a badly
-/// skewed peer, or a stamp ahead of the peer's own `Date`) is treated as fresh
-/// rather than trusted, so it never reads as stale or far-future.
-fn rebase_age(reference_ms: i64, sample_at_ms: i64, local_now_ms: i64) -> i64 {
+/// sample on the reader's clock. Up to [`RELAY_AGE_TOLERANCE_MS`] ahead of the
+/// `Date` is its resolution and reads as now. Further ahead, or older than
+/// [`MAX_RELAY_AGE_MS`], is refused rather than refreshed, so a stepped or
+/// garbage stamp never reads as a current value.
+fn rebase_age(reference_ms: i64, sample_at_ms: i64, local_now_ms: i64) -> Option<i64> {
     let age = reference_ms.saturating_sub(sample_at_ms);
-    if (0..=MAX_RELAY_AGE_MS).contains(&age) {
-        local_now_ms.saturating_sub(age)
-    } else {
-        local_now_ms
-    }
+    (RELAY_AGE_TOLERANCE_MS.saturating_neg()..=MAX_RELAY_AGE_MS)
+        .contains(&age)
+        .then(|| local_now_ms.saturating_sub(age.max(0)))
 }
 
 /// One scrape's clocks and verified owner, shared by every line it carries.
@@ -556,8 +628,6 @@ struct ScrapeClock<'scrape> {
     reference_ms: i64,
     /// This gateway's clock.
     local_now_ms: i64,
-    /// A stamp past this is skewed beyond belief.
-    horizon_ms: i64,
     /// The crypto-verified site on the connection.
     owner: &'scrape str,
     /// Whether the owner is this gateway's own operator.
@@ -566,7 +636,7 @@ struct ScrapeClock<'scrape> {
 
 /// Why a parsed line was not stored.
 enum Dropped {
-    /// Stamped past the clock-skew bound.
+    /// Its age against the publisher's `Date` was implausible.
     Skewed,
     /// Its site label disagreed with the verified owner.
     Mismatched,
@@ -662,7 +732,8 @@ fn target_labels<'text>(metric: &exposition::Metric<'text>) -> Option<TargetLabe
     Some((site, cluster?))
 }
 
-/// Milliseconds since the epoch.
+/// Milliseconds since the epoch, on the wall clock: for a time someone reads as
+/// a date. A store's clock is [`LoadStore::timeline_ms`].
 #[must_use]
 pub fn now_ms() -> i64 {
     SystemTime::now()
@@ -952,14 +1023,15 @@ mod tests {
 
     #[test]
     fn a_future_sample_is_dropped_and_does_not_wedge_the_series() {
-        // The peer's Date is 2_000. A stamp beyond the skew tolerance ahead of it
+        // The peer's Date is 2_000. A stamp past the Date's resolution ahead of it
         // is implausible and must not enter the series head, or the later
         // corrected sample would be dropped as older. Reference and local now
         // coincide (no skew), so the corrected sample keeps its own stamp.
         let store = store();
         let date = 2_000;
-        let future = date + MAX_CLOCK_SKEW_MS + 10_000;
-        store.ingest_at(&line("east", "pool-a", 9.0, future), date, date, "east");
+        let future = date + RELAY_AGE_TOLERANCE_MS + 1;
+        let tally = store.ingest_at(&line("east", "pool-a", 9.0, future), date, date, "east");
+        assert_eq!(tally.skewed, 1, "the future stamp is dropped as skew");
         store.ingest_at(&line("east", "pool-a", 3.0, date), date, date, "east");
         let sample = store
             .latest(&LoadStore::key("east", "pool-a"), QUEUE)
@@ -1378,20 +1450,102 @@ mod tests {
         // whatever the absolute skew between the two clocks.
         assert_eq!(
             rebase_age(100_000, 97_000, 5_000),
-            2_000,
+            Some(2_000),
             "3s old, restamped onto local now"
         );
-        // A stamp ahead of the peer's own Date is implausible, so it reads fresh.
         assert_eq!(
             rebase_age(100_000, 101_000, 5_000),
-            5_000,
-            "a future-on-peer stamp is fresh"
+            Some(5_000),
+            "a stamp within the Date's one-second resolution ahead of it reads as now"
         );
-        // An age beyond a day is implausible, so the sample reads fresh, not old.
         assert_eq!(
-            rebase_age(MAX_RELAY_AGE_MS.saturating_add(10), 0, 5_000),
-            5_000,
-            "an implausible age is stamped fresh"
+            rebase_age(100_000, 101_001, 5_000),
+            None,
+            "a stamp further ahead of the peer's own Date is refused, not refreshed"
+        );
+        assert_eq!(
+            rebase_age(MAX_RELAY_AGE_MS, 0, 5_000),
+            Some(5_000 - MAX_RELAY_AGE_MS),
+            "a day old keeps its age"
+        );
+        assert_eq!(
+            rebase_age(MAX_RELAY_AGE_MS.saturating_add(1), 0, 5_000),
+            None,
+            "an age beyond a day is refused, not refreshed"
+        );
+    }
+
+    #[test]
+    fn a_relayed_age_past_either_bound_is_dropped_as_skew() {
+        let date = 100_000_000;
+        let local = 5_000_000;
+        let cases = [
+            ("a second ahead of the Date reads as now", date + 1_000, Some(local)),
+            ("past a second ahead is dropped", date + 1_001, None),
+            (
+                "a day old keeps its age",
+                date - MAX_RELAY_AGE_MS,
+                Some(local - MAX_RELAY_AGE_MS),
+            ),
+            ("past a day old is dropped", date - MAX_RELAY_AGE_MS - 1, None),
+        ];
+        for (label, stamp, want) in cases {
+            let store = store();
+            let tally = store.ingest_at(&line("east", "pool-a", 1.0, stamp), date, local, "east");
+            let held = store
+                .latest(&LoadStore::key("east", "pool-a"), QUEUE)
+                .map(|sample| sample.at_ms);
+            assert_eq!(held, want, "{label}");
+            assert_eq!(tally.skewed, u64::from(want.is_none()), "{label}: counted as skew");
+        }
+    }
+
+    #[test]
+    fn a_timeline_advances_with_the_monotonic_clock_from_its_start() {
+        let timeline = Timeline::starting_at(5_000);
+        let first = timeline.now_ms();
+        let second = timeline.now_ms();
+        assert!(
+            (5_000..6_000).contains(&first),
+            "it reads its start, then counts on: {first}"
+        );
+        assert!(second >= first, "and never runs backward: {first} then {second}");
+        assert!(
+            (store().timeline_ms() - now_ms()).abs() < 1_000,
+            "a store's default timeline starts on the wall clock"
+        );
+    }
+
+    #[test]
+    fn a_wall_step_between_polls_costs_nothing_on_the_timeline() {
+        let key = LoadStore::key("east", "pool-a");
+        let two_polls = |first_at: i64, second_at: i64| {
+            let store = store();
+            store.ingest_at(&line("east", "pool-a", 9.0, 1_000_000), 1_000_000, first_at, "east");
+            store.ingest_at(&line("east", "pool-a", 2.0, 1_001_000), 1_001_000, second_at, "east");
+            store
+        };
+        let hour = 3_600_000;
+        let on_timeline = two_polls(50_000, 51_000);
+        assert_eq!(
+            (
+                on_timeline.latest(&key, QUEUE).map(|sample| sample.value),
+                on_timeline.window_worst(&key, QUEUE, 51_000, 5_000, true)
+            ),
+            (Some(2.0), Some(9.0)),
+            "read off the timeline, the second poll lands and the first still counts in the window"
+        );
+        assert_eq!(
+            two_polls(50_000, 51_000 - hour)
+                .latest(&key, QUEUE)
+                .map(|sample| sample.value),
+            Some(9.0),
+            "read off a wall stepped back an hour, the second poll is dropped as older than the head"
+        );
+        assert_eq!(
+            two_polls(50_000, 51_000 + hour).window_worst(&key, QUEUE, 51_000 + hour, 5_000, true),
+            Some(2.0),
+            "read off a wall stepped forward an hour, the first poll ages an hour at once and drops out"
         );
     }
 

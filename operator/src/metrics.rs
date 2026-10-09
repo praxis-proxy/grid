@@ -524,7 +524,8 @@ pub(crate) fn forget_provider_scrapes(provider: &str) {
     }
 }
 
-/// Count a peer observation this hub refused: `name`, `provider`, `value`, or `provider_cap`.
+/// Count a peer observation this hub refused: `relayed_site`, `age`, `name`, `provider`, `value`, or
+/// `provider_cap`.
 pub(crate) fn record_peer_signal_refused(peer: &str, reason: &str) {
     PEER_SIGNALS_REFUSED.with_label_values(&[peer, reason]).inc();
 }
@@ -883,6 +884,7 @@ mod tests {
                 .collect(),
             value: 1.0,
             timestamp_ms: None,
+            age: Duration::ZERO,
         };
         let store = crate::signals::SignalStore::new();
         let collector = provider_signals(vec![store.clone()]);
@@ -926,6 +928,7 @@ mod tests {
                 .collect(),
             value,
             timestamp_ms: None,
+            age: Duration::ZERO,
         };
         let local = crate::signals::SignalStore::new();
         local.refresh(

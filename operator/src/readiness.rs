@@ -677,6 +677,7 @@ mod tests {
             labels: BTreeMap::from([("name".to_owned(), pool.to_owned())]),
             value,
             timestamp_ms: None,
+            age: Duration::ZERO,
         }
     }
 
@@ -785,6 +786,7 @@ mod tests {
             labels: BTreeMap::new(),
             value,
             timestamp_ms: None,
+            age: Duration::ZERO,
         };
         vec![
             sample("llm_d_epp_ready_endpoints", "qwen3", ready),
@@ -1096,6 +1098,7 @@ mod tests {
             ]),
             value,
             timestamp_ms: None,
+            age: Duration::ZERO,
         }
     }
 
@@ -1105,6 +1108,7 @@ mod tests {
             labels: BTreeMap::from([("inference_pool".to_owned(), pool.to_owned())]),
             value,
             timestamp_ms: None,
+            age: Duration::ZERO,
         }
     }
 
@@ -1215,6 +1219,7 @@ mod tests {
                 labels: BTreeMap::new(),
                 value,
                 timestamp_ms: None,
+                age: Duration::ZERO,
             };
             let mut obs = vec![
                 sample("llm_d_epp_ready_endpoints", "qwen3", 2.0),
