@@ -226,25 +226,17 @@ static Praxis configuration.
 
 ## Derived endpoint topology
 
-`consumerConfig.clusterEndpoints[]` is normally supplied by whoever manages the
-gateway deployment. With `consumerConfig.deriveTopology.fromProviders`, the
-operator works out an entry for every candidate cluster that has none, from the
-declarations of the providers that list names.
+With `consumerConfig.deriveTopology.fromProviders`, the operator fills a
+`clusterEndpoints[]` entry for every candidate cluster that has none, from the
+declarations of the providers the list names.
 
-The allowlist is the trust decision. An `InferenceProvider` is cluster scoped
-and its `gridNetworkRef` is self asserted, so registering one must not by itself
-decide where a gateway dials or what it trusts. Naming a provider in
-`fromProviders` is the gateway owner accepting that provider's declarations. An
-empty list derives nothing, because that is the state a half-finished edit
-leaves behind and it has to mean no provider rather than every provider.
+An `InferenceProvider` is cluster scoped and its `gridNetworkRef` is self
+asserted, so registering one does not decide where a gateway dials. Naming a
+provider in the list is how a gateway owner accepts its declarations, and an
+empty list derives nothing. Derived entries are the same entries the field holds, so every
+validation and reason code below applies to them unchanged.
 
-Derivation emits the same entries the field holds, so nothing downstream
-changes: every validation and reason code below applies to a derived entry
-exactly as it does to a supplied one. The opt-in is per gateway, so one site can
-adopt derivation while another keeps its explicit entries.
-
-**A candidate at this gateway's own site** derives from its provider's
-`spec.endpoint`:
+**A candidate at this gateway's own site** derives from `spec.endpoint`:
 
 | Field | Source |
 |---|---|
@@ -253,12 +245,8 @@ adopt derivation while another keeps its explicit entries.
 | `transport.sni` | `spec.backendTls.serverName`, else the endpoint host |
 | `transport.caSecretRef` | `spec.backendTls.caSecretRef`, named in the gateway namespace, else absent |
 
-The URL scheme chooses the transport, so `backendTls` declares no mode and
-cannot contradict the endpoint. An absent `caSecretRef` means the process trust
-store, as it does for a supplied entry, so a privately signed backend declares
-one.
-
-**A candidate at another site** derives from that site's `GridSite`:
+**A candidate at another site** derives from that site's `GridSite`, which must
+be in phase `Active`:
 
 | Field | Source |
 |---|---|
@@ -266,36 +254,13 @@ one.
 | `transport.mode` | `mutual_tls` for `Mutual`, `plaintext` for `Plaintext` |
 | `transport.sni` | `spec.egress.tls.serverName` |
 
-Client identity for the hop is the grid identity the gateway already mounts at
-`tlsCertMountPath`, so no backend credential crosses a site boundary. A site
-declaring `Mutual` without a `serverName` derives an entry with no SNI, which
-fails closed as `MissingSni` rather than verifying a name nobody declared.
+Client identity for the hop is the grid identity the gateway already mounts, so
+no backend credential crosses a site boundary.
 
-**What it will not do.** An explicit entry wins whole, never field by field, so
-a partially filled entry keeps its own gaps and its own reason code instead of
-inheriting derived trust. A provider outside `fromProviders`, in another
-network, or explicitly `Unavailable` is not a source. Two providers claiming one
-routing identity, or one cluster appearing at two sites, derive nothing rather
-than letting iteration or name order pick. A remote hop derives only from a site
-in phase `Active`, since only that site has had its address probed and its leaf
-pinned; a `Discovered` or `Connecting` stub carries an address copied from
-gossip. An endpoint whose port the URL declares but cannot represent, such as
-`:99999`, refuses rather than falling back to the scheme default. An `https`
-endpoint named by address needs `backendTls.serverName`, because Praxis rejects
-an IP literal as an SNI and deriving one would emit a config the gateway
-refuses to load. Trust is declared and never inferred, and
-verification is never relaxed to make a connection succeed. A candidate at
-another site reaches that site's provider hop whatever its URL looks like: a
-publicly resolvable model URL is not permission for direct access. A cluster with nothing to derive from is left out. The renderer then reports
-`MissingClusterEndpoint`, and because it collects its cluster entries into one
-result, the first unresolved cluster fails the whole consumer-config render and
-the gateway keeps its previous configuration for every tenant. That is
-fail-closed rather than per-cluster, and it is the same behaviour an unsupplied
-explicit entry has always had.
-
-**Endpoint base paths.** Not carried. Praxis has no per-cluster upstream base
-path to render one into, so an endpoint URL's path is read by nothing today and
-is not resolved. Tracked by
+An explicit entry wins whole, never field by field. Anything else that cannot be
+derived is left out and surfaces as a reason code, as an unsupplied explicit
+entry always has. Endpoint base paths are not carried, because Praxis has no
+per-cluster upstream base path to render one into; see
 [issue 248](https://github.com/praxis-proxy/grid/issues/248).
 
 The gateway's `consumerConfigStatus` message names the clusters whose entries

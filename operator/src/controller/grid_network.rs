@@ -2191,7 +2191,7 @@ async fn reconcile_routing_overlay_inner(
         }
 
         let timestamp = rfc3339_now();
-        let overlay = match routing_overlay::render_routing_overlay_with_admission(
+        let mut overlay = match routing_overlay::render_routing_overlay_with_admission(
             network,
             &sites,
             providers,
@@ -2223,6 +2223,26 @@ async fn reconcile_routing_overlay_inner(
                 continue;
             },
         };
+        let (cluster_endpoints, derived_summary, refused) = gateway_cluster_endpoints(
+            gw_ref,
+            &overlay.candidates,
+            &derived_topology::Declarations {
+                providers,
+                sites: &sites,
+                local_site,
+                network_name,
+                from_providers: &[],
+            },
+        );
+        if !refused.is_empty() {
+            tracing::warn!(
+                network = network_name,
+                gateway = %gw_ref.name,
+                refused = refused.len(),
+                "derivation refused candidates; withdrawing them from this gateway"
+            );
+        }
+        withdraw_refused(&mut overlay, &refused);
         let render = match render_overlay_for_gateway(&overlay, network, gw_ref) {
             Ok(r) => r,
             Err(error) => {
@@ -2243,17 +2263,6 @@ async fn reconcile_routing_overlay_inner(
                 continue;
             },
         };
-        let (cluster_endpoints, derived_summary) = gateway_cluster_endpoints(
-            gw_ref,
-            &overlay.candidates,
-            &derived_topology::Declarations {
-                providers,
-                sites: &sites,
-                local_site,
-                network_name,
-                from_providers: &[],
-            },
-        );
         let no_candidates = overlay.candidates.is_empty();
         if no_candidates {
             tracing::warn!(
@@ -5176,9 +5185,13 @@ fn gateway_cluster_endpoints<'gw>(
     gw_ref: &'gw GatewayRef,
     candidates: &[routing_overlay::RoutingCandidate],
     declarations: &derived_topology::Declarations<'_>,
-) -> (Cow<'gw, [ClusterEndpointConfig]>, String) {
+) -> (
+    Cow<'gw, [ClusterEndpointConfig]>,
+    String,
+    Vec<derived_topology::Refused>,
+) {
     let Some(cc) = gw_ref.consumer_config.as_ref() else {
-        return (Cow::Borrowed(&[]), String::new());
+        return (Cow::Borrowed(&[]), String::new(), Vec::new());
     };
     // An empty allowlist derives nothing, so a half-finished edit leaves the
     // gateway on its own entries rather than on every provider in the cluster.
@@ -5187,9 +5200,13 @@ fn gateway_cluster_endpoints<'gw>(
         .as_ref()
         .filter(|derive| !derive.from_providers.is_empty())
     else {
-        return (Cow::Borrowed(cc.cluster_endpoints.as_slice()), String::new());
+        return (
+            Cow::Borrowed(cc.cluster_endpoints.as_slice()),
+            String::new(),
+            Vec::new(),
+        );
     };
-    let resolved = derived_topology::resolve(
+    let resolution = derived_topology::resolve(
         candidates,
         &cc.cluster_endpoints,
         &derived_topology::Declarations {
@@ -5197,11 +5214,34 @@ fn gateway_cluster_endpoints<'gw>(
             ..*declarations
         },
     );
-    let summary = derived_topology::derived_summary(&resolved);
+    let summary = derived_topology::derived_summary(&resolution);
+    let derived_topology::Resolution { resolved, refused } = resolution;
     (
         Cow::Owned(resolved.into_values().map(|entry| entry.endpoint).collect()),
         summary,
+        refused,
     )
+}
+
+/// Withdraw every candidate derivation refused, so the overlay and the
+/// generated config agree that it is not served from this gateway.
+///
+/// A refused candidate was going to fail the whole render as
+/// `MissingClusterEndpoint`, which left the gateway on its previous document
+/// with the candidate still live. Moving it to `excluded` withdraws it from
+/// the route list and keeps it known, so the gateway answers 503 for the model
+/// rather than routing to a destination nobody declared.
+fn withdraw_refused(overlay: &mut routing_overlay::RoutingOverlay, refused: &[derived_topology::Refused]) {
+    if refused.is_empty() {
+        return;
+    }
+    let (withdrawn, kept): (Vec<_>, Vec<_>) = overlay.candidates.drain(..).partition(|candidate| {
+        refused
+            .iter()
+            .any(|refusal| refusal.cluster == candidate.cluster && refusal.site == candidate.site)
+    });
+    overlay.candidates = kept;
+    overlay.excluded.extend(withdrawn);
 }
 
 /// Build a `Rendered` [`ConsumerConfigStatus`] for a successfully applied consumer config.
@@ -9419,7 +9459,7 @@ mod tests {
         // A candidate that resolution could not have derived anyway, plus one
         // typed entry naming no candidate: without the opt-in, neither matters.
         let candidates = vec![topology_candidate("prov-b", "site-b")];
-        let (endpoints, summary) = gateway_cluster_endpoints(&gw, &candidates, &empty_declarations());
+        let (endpoints, summary, _) = gateway_cluster_endpoints(&gw, &candidates, &empty_declarations());
         assert_eq!(
             endpoints, typed,
             "the opt-in is what changes the topology, so off must copy the spec"
@@ -9445,7 +9485,7 @@ mod tests {
             ..make_consumer_config("praxis-consumer-config")
         });
         let candidates = vec![topology_candidate("prov-a", "site-a")];
-        let (endpoints, summary) = gateway_cluster_endpoints(&gw, &candidates, &empty_declarations());
+        let (endpoints, summary, _) = gateway_cluster_endpoints(&gw, &candidates, &empty_declarations());
         assert_eq!(
             endpoints, typed,
             "an empty allowlist derives nothing and keeps the typed entries"
@@ -9463,12 +9503,47 @@ mod tests {
             ..make_consumer_config("praxis-consumer-config")
         });
         let candidates = vec![topology_candidate("prov-ghost", "site-ghost")];
-        let (endpoints, summary) = gateway_cluster_endpoints(&gw, &candidates, &empty_declarations());
-        assert!(
-            endpoints.is_empty(),
-            "derivation reports nothing of its own; the renderer fails this as MissingClusterEndpoint"
+        let (endpoints, summary, refused) = gateway_cluster_endpoints(&gw, &candidates, &empty_declarations());
+        assert!(endpoints.is_empty(), "nothing resolves");
+        assert_eq!(
+            refused,
+            [derived_topology::Refused {
+                cluster: "prov-ghost".to_owned(),
+                site: "site-ghost".to_owned(),
+                reason: derived_topology::Refusal::SiteUnknown,
+            }],
+            "the refusal names the cluster and why"
         );
-        assert!(summary.is_empty());
+        assert_eq!(summary, "withdrew 1 (prov-ghost: site unknown)");
+    }
+
+    #[test]
+    fn a_refused_candidate_is_withdrawn_into_excluded_rather_than_failing_the_render() {
+        let mut overlay = routing_overlay::RoutingOverlay {
+            network: "net".to_owned(),
+            local_site: "site-a".to_owned(),
+            candidates: vec![
+                topology_candidate("prov-a", "site-a"),
+                topology_candidate("prov-ghost", "site-ghost"),
+            ],
+            excluded: Vec::new(),
+            selection_policy: None,
+            generated_at: None,
+        };
+        let refused = vec![derived_topology::Refused {
+            cluster: "prov-ghost".to_owned(),
+            site: "site-ghost".to_owned(),
+            reason: derived_topology::Refusal::NotAllowlisted,
+        }];
+        withdraw_refused(&mut overlay, &refused);
+        let routed: Vec<&str> = overlay.candidates.iter().map(|c| c.cluster.as_str()).collect();
+        assert_eq!(routed, ["prov-a"], "the refused candidate leaves the route list");
+        assert_eq!(
+            overlay.excluded.len(),
+            1,
+            "and stays known, so the model answers 503 not 404"
+        );
+        assert_eq!(overlay.excluded.first().map(|c| c.cluster.as_str()), Some("prov-ghost"));
     }
 
     #[test]
@@ -9485,7 +9560,7 @@ mod tests {
             cluster_endpoints: vec![typed_endpoint("retired", "retired.example.invalid:8080")],
             ..make_consumer_config("praxis-consumer-config")
         });
-        let (endpoints, _) = gateway_cluster_endpoints(&gw, &[], &empty_declarations());
+        let (endpoints, ..) = gateway_cluster_endpoints(&gw, &[], &empty_declarations());
         assert!(endpoints.is_empty());
     }
 
@@ -9493,7 +9568,7 @@ mod tests {
     fn a_gateway_with_no_consumer_config_has_no_topology() {
         let gw = make_gw_ref("inference-gw", "praxis-system");
         let candidates = vec![topology_candidate("prov-a", "site-a")];
-        let (endpoints, summary) = gateway_cluster_endpoints(&gw, &candidates, &empty_declarations());
+        let (endpoints, summary, _) = gateway_cluster_endpoints(&gw, &candidates, &empty_declarations());
         assert!(endpoints.is_empty());
         assert!(summary.is_empty());
     }

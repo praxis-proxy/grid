@@ -457,6 +457,137 @@ fn decl_allowing<'decl>(
     }
 }
 
+/// A `GridSite` as discovery writes one: the object name is generated, and the
+/// id it speaks for lives in the annotation.
+fn discovered_site(generated_name: &str, site_id: &str, egress: &serde_json::Value) -> GridSite {
+    serde_json::from_value(serde_json::json!({
+        "apiVersion": "grid.praxis.fast/v1alpha1",
+        "kind": "GridSite",
+        "metadata": {
+            "name": generated_name,
+            "labels": { "grid.praxis.fast/auto-discovered": "true" },
+            "annotations": { "grid.praxis.fast/site-id": site_id },
+        },
+        "spec": { "gridNetworkRef": "net", "egress": egress },
+        "status": { "phase": "Active" },
+    }))
+    .expect("discovered site")
+}
+
+#[test]
+fn a_remote_candidate_the_gateway_did_not_allowlist_derives_nothing() {
+    // The allowlist is the trust decision, so it has to gate the remote hop too.
+    // Gating only the local map let a remote candidate reach its site's egress.
+    let sites = vec![
+        site("site-a", None),
+        site(
+            "site-b",
+            Some(mutual_egress(
+                "site-b.grid.example.invalid:8443",
+                "site-b.grid.internal",
+            )),
+        ),
+    ];
+    let candidates = vec![candidate("prov-b", "site-b")];
+    let allowed = vec!["prov-other".to_owned()];
+    let resolved = resolve(&candidates, &[], &decl_allowing(&[], &sites, &allowed));
+    assert!(
+        resolved.is_empty(),
+        "a remote candidate outside the allowlist must not derive its site egress"
+    );
+}
+
+#[test]
+fn a_discovered_site_is_found_by_the_id_it_speaks_for() {
+    // Discovery names its stubs itself, so matching on the object name misses
+    // them and the cluster reads as having nothing to derive from.
+    let sites = vec![discovered_site(
+        "net-site-b-7f3a",
+        "site-b",
+        &mutual_egress("site-b.grid.example.invalid:8443", "site-b.grid.internal"),
+    )];
+    let candidates = vec![candidate("prov-b", "site-b")];
+    let allowed = vec!["prov-b".to_owned()];
+    let resolved = resolve(&candidates, &[], &decl_allowing(&[], &sites, &allowed));
+    let got = resolved.get("prov-b").expect("a discovered site still derives");
+    assert_eq!(got.endpoint.address, "site-b.grid.example.invalid:8443");
+}
+
+/// Every refusal names its reason, so status can say why rather than
+/// collapsing each case to a missing entry.
+#[test]
+#[expect(clippy::too_many_lines, reason = "one row per refusal reason")]
+fn each_refusal_is_named() {
+    let unavailable = {
+        let mut p = provider("prov-down", "https://down.example.invalid", None);
+        p.status = serde_json::from_value(serde_json::json!({ "phase": "Unavailable" })).ok();
+        p
+    };
+    let providers = vec![
+        provider("prov-a", "https://a.example.invalid", None),
+        provider("prov-twin", "https://twin1.example.invalid", None),
+        provider("prov-twin", "https://twin2.example.invalid", None),
+        provider("prov-port", "https://p.example.invalid:99999", None),
+        provider("prov-ip", "https://10.0.0.5:8443", None),
+        provider("prov-scheme", "ftp://s.example.invalid", None),
+        unavailable,
+    ];
+    let sites = vec![
+        site("site-a", None),
+        site_in_phase(
+            "site-c",
+            Some(mutual_egress("c.example.invalid:8443", "c.grid.internal")),
+            "Connecting",
+        ),
+        site("site-n", None),
+    ];
+    let allowed: Vec<String> = [
+        "prov-twin",
+        "prov-port",
+        "prov-ip",
+        "prov-scheme",
+        "prov-down",
+        "prov-none",
+        "prov-c",
+        "prov-n",
+        "prov-ghost",
+    ]
+    .iter()
+    .map(|s| (*s).to_owned())
+    .collect();
+    let cases = [
+        ("prov-a", "site-a", Refusal::NotAllowlisted),
+        ("prov-twin", "site-a", Refusal::Ambiguous),
+        ("prov-port", "site-a", Refusal::EndpointPort),
+        ("prov-ip", "site-a", Refusal::ServerNameNeeded),
+        ("prov-scheme", "site-a", Refusal::EndpointUnusable),
+        ("prov-down", "site-a", Refusal::Unavailable),
+        ("prov-none", "site-a", Refusal::NoProvider),
+        ("prov-c", "site-c", Refusal::SiteNotActive),
+        ("prov-n", "site-n", Refusal::NoEgress),
+        ("prov-ghost", "site-ghost", Refusal::SiteUnknown),
+    ];
+    for (cluster, at, want) in cases {
+        let candidates = vec![candidate(cluster, at)];
+        let resolution = resolve(&candidates, &[], &decl_allowing(&providers, &sites, &allowed));
+        let got: Vec<Refusal> = resolution.refused.iter().map(|r| r.reason).collect();
+        assert_eq!(got, [want], "{cluster} at {at}");
+        assert!(resolution.resolved.is_empty(), "{cluster}: refused, so not resolved");
+    }
+    let twice = vec![candidate("prov-a", "site-a"), candidate("prov-a", "site-n")];
+    let allowed_a = vec!["prov-a".to_owned()];
+    let resolution = resolve(&twice, &[], &decl_allowing(&providers, &sites, &allowed_a));
+    assert!(
+        resolution
+            .refused
+            .iter()
+            .all(|r| r.reason == Refusal::ClusterAtTwoSites)
+            && resolution.refused.len() == 2,
+        "one cluster at two sites refuses both: {:?}",
+        resolution.refused
+    );
+}
+
 #[test]
 fn a_provider_the_gateway_did_not_allowlist_derives_nothing() {
     // Registering a cluster-scoped CR is not permission to be dialled.

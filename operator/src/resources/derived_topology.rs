@@ -11,8 +11,10 @@
 //! validated by the code that validates a typed one, so derivation cannot
 //! invent a new way to fail open, and a cluster it cannot resolve is simply
 //! absent, which the renderer already reports as `MissingClusterEndpoint`.
-//! Nothing here returns an error of its own. If it ever needs to, that is the
-//! signal it has taken on something the renderer should be judging.
+//! Nothing here returns an error of its own. A cluster it cannot resolve is a
+//! named refusal the controller withdraws from the gateway, so the document the
+//! gateway loads never names a destination nobody declared, and the status says
+//! why for each one.
 //!
 //! # The rule this follows
 //!
@@ -47,6 +49,81 @@ pub(crate) enum Origin {
     DerivedLocal,
     /// Derived from the provider site's `GridSite` egress.
     DerivedRemote,
+}
+
+/// Why a candidate cluster could not be resolved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Refusal {
+    /// A provider carries the identity but the gateway did not name it.
+    NotAllowlisted,
+    /// The provider is explicitly `Unavailable`.
+    Unavailable,
+    /// No provider of this network carries the identity.
+    NoProvider,
+    /// Two providers claim the identity.
+    Ambiguous,
+    /// One cluster appears at two sites.
+    ClusterAtTwoSites,
+    /// No `GridSite` of this network has the candidate's site name.
+    SiteUnknown,
+    /// The site is not `Active`, so its address was never probed.
+    SiteNotActive,
+    /// The site declares no egress address.
+    NoEgress,
+    /// The endpoint URL has no usable scheme or host.
+    EndpointUnusable,
+    /// The URL declares a port it cannot represent.
+    EndpointPort,
+    /// An `https` endpoint named by address with no declared server name.
+    ServerNameNeeded,
+}
+
+impl Refusal {
+    /// The reason as the status names it.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotAllowlisted => "not allowlisted",
+            Self::Unavailable => "provider unavailable",
+            Self::NoProvider => "no provider",
+            Self::Ambiguous => "ambiguous identity",
+            Self::ClusterAtTwoSites => "cluster at two sites",
+            Self::SiteUnknown => "site unknown",
+            Self::SiteNotActive => "site not active",
+            Self::NoEgress => "no egress",
+            Self::EndpointUnusable => "endpoint unusable",
+            Self::EndpointPort => "endpoint port",
+            Self::ServerNameNeeded => "server name needed",
+        }
+    }
+}
+
+/// One candidate cluster left unresolved, and why.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Refused {
+    /// The cluster the candidate names.
+    pub(crate) cluster: String,
+    /// The site the candidate names.
+    pub(crate) site: String,
+    /// Why it stays out of the topology.
+    pub(crate) reason: Refusal,
+}
+
+/// An entry per resolvable cluster, and a refusal for each candidate cluster
+/// that could not be resolved.
+#[derive(Debug, Default)]
+pub(crate) struct Resolution {
+    /// Resolved entries by cluster.
+    pub(crate) resolved: BTreeMap<String, Resolved>,
+    /// What was refused, in candidate order.
+    pub(crate) refused: Vec<Refused>,
+}
+
+impl std::ops::Deref for Resolution {
+    type Target = BTreeMap<String, Resolved>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.resolved
+    }
 }
 
 /// One cluster's resolved endpoint.
@@ -91,7 +168,7 @@ pub(crate) fn resolve(
     candidates: &[RoutingCandidate],
     explicit: &[ClusterEndpointConfig],
     declarations: &Declarations<'_>,
-) -> BTreeMap<String, Resolved> {
+) -> Resolution {
     let typed: BTreeMap<&str, &ClusterEndpointConfig> =
         explicit.iter().map(|entry| (entry.cluster.as_str(), entry)).collect();
     let local = local_providers(declarations);
@@ -100,24 +177,44 @@ pub(crate) fn resolve(
         .map(|candidate| (candidate.cluster.as_str(), candidate.site.as_str()))
         .collect();
 
-    // One cluster at two sites would otherwise collapse by site-name order,
-    // picking a topology nobody declared. Refuse it instead: absence reaches
-    // the renderer's existing MissingClusterEndpoint.
+    let twice = clusters_at_two_sites(&clusters);
+
+    let mut resolution = Resolution::default();
+    for (cluster, site) in clusters {
+        if twice.contains(cluster) {
+            resolution.refused.push(Refused {
+                cluster: cluster.to_owned(),
+                site: site.to_owned(),
+                reason: Refusal::ClusterAtTwoSites,
+            });
+            continue;
+        }
+        match resolve_one(cluster, site, &typed, &local, declarations) {
+            Ok(entry) => {
+                resolution.resolved.insert(cluster.to_owned(), entry);
+            },
+            Err(reason) => resolution.refused.push(Refused {
+                cluster: cluster.to_owned(),
+                site: site.to_owned(),
+                reason,
+            }),
+        }
+    }
+    resolution
+}
+
+/// The clusters that appear at more than one site. One cluster at two sites
+/// would otherwise collapse by site-name order, picking a topology nobody
+/// declared, so each is refused instead.
+fn clusters_at_two_sites<'cluster>(clusters: &BTreeSet<(&'cluster str, &'cluster str)>) -> BTreeSet<&'cluster str> {
     let mut seen = BTreeSet::<&str>::new();
     let mut twice = BTreeSet::<&str>::new();
-    for (cluster, _) in &clusters {
+    for (cluster, _) in clusters {
         if !seen.insert(cluster) {
             twice.insert(cluster);
         }
     }
-
-    clusters
-        .into_iter()
-        .filter(|(cluster, _)| !twice.contains(cluster))
-        .filter_map(|(cluster, site)| {
-            resolve_one(cluster, site, &typed, &local, declarations).map(|entry| (cluster.to_owned(), entry))
-        })
-        .collect()
+    twice
 }
 
 /// The providers this gateway accepts declarations from, by routing identity.
@@ -166,20 +263,52 @@ fn resolve_one(
     typed: &BTreeMap<&str, &ClusterEndpointConfig>,
     local: &BTreeMap<&str, &InferenceProvider>,
     declarations: &Declarations<'_>,
-) -> Option<Resolved> {
+) -> Result<Resolved, Refusal> {
     if let Some(entry) = typed.get(cluster) {
-        return Some(Resolved {
+        return Ok(Resolved {
             endpoint: (*entry).clone(),
             origin: Origin::Explicit,
         });
+    }
+    // The allowlist is the trust decision, so it gates a remote candidate as
+    // well as a local one. Gating only the local map let a remote candidate
+    // reach its site's egress without the gateway owner naming it.
+    if !declarations.from_providers.iter().any(|named| named == cluster) {
+        return Err(Refusal::NotAllowlisted);
     }
     if site == declarations.local_site {
         // Our own site, so it resolves from a provider we hold or not at all.
         // Falling through to the egress of our own site would hairpin the
         // consumer through its own provider gateway.
-        return local.get(cluster).and_then(|provider| derive_local(cluster, provider));
+        return match local.get(cluster) {
+            Some(provider) => derive_local(cluster, provider),
+            None => Err(local_refusal(cluster, declarations)),
+        };
     }
     derive_remote(cluster, site, declarations.sites, declarations.network_name)
+}
+
+/// Why no admitted provider carries `cluster` at this site: nobody does, every
+/// carrier is unavailable, or two claim it.
+fn local_refusal(cluster: &str, declarations: &Declarations<'_>) -> Refusal {
+    let carriers: Vec<&InferenceProvider> = declarations
+        .providers
+        .iter()
+        .filter(|provider| {
+            routing_identity(provider) == Some(cluster) && provider.spec.grid_network_ref == declarations.network_name
+        })
+        .collect();
+    let available = carriers
+        .iter()
+        .filter(|provider| !crate::resources::routing_overlay::is_explicitly_unavailable(provider))
+        .count();
+    if carriers.is_empty() {
+        Refusal::NoProvider
+    } else if available == 0 {
+        Refusal::Unavailable
+    } else {
+        Refusal::Ambiguous
+    }
 }
 
 /// Derive a local backend entry from the provider's own endpoint URL.
@@ -188,25 +317,27 @@ fn resolve_one(
 /// one. Trust comes only from `backendTls`: an omitted CA reference means the
 /// process trust store, inherited from the explicit path rather than decided
 /// again here.
-fn derive_local(cluster: &str, provider: &InferenceProvider) -> Option<Resolved> {
+fn derive_local(cluster: &str, provider: &InferenceProvider) -> Result<Resolved, Refusal> {
     let endpoint = provider.spec.endpoint.trim();
-    let uri = endpoint.parse::<http::Uri>().ok()?;
-    let host = uri.host()?;
-    if host.is_empty() {
-        return None;
-    }
-    let tls = match uri.scheme_str()? {
-        "https" => true,
-        "http" => false,
-        _ => return None,
+    let uri = endpoint
+        .parse::<http::Uri>()
+        .map_err(|_unparsable| Refusal::EndpointUnusable)?;
+    let host = uri
+        .host()
+        .filter(|host| !host.is_empty())
+        .ok_or(Refusal::EndpointUnusable)?;
+    let tls = match uri.scheme_str() {
+        Some("https") => true,
+        Some("http") => false,
+        _ => return Err(Refusal::EndpointUnusable),
     };
-    let port = endpoint_port(&uri, tls)?;
+    let port = endpoint_port(&uri, tls).ok_or(Refusal::EndpointPort)?;
     let backend = provider.spec.backend_tls.as_deref();
     if tls && !server_name_is_usable(backend, host) {
-        return None;
+        return Err(Refusal::ServerNameNeeded);
     }
     let transport = backend_transport(backend, host, tls);
-    Some(Resolved {
+    Ok(Resolved {
         endpoint: ClusterEndpointConfig {
             cluster: cluster.to_owned(),
             // `Uri::host()` keeps the brackets on an IP literal, so no bracketing here.
@@ -223,10 +354,14 @@ fn derive_local(cluster: &str, provider: &InferenceProvider) -> Option<Resolved>
 /// gateway's own reachable address rather than an egress-only value. Client
 /// identity is the grid identity the consumer already mounts, so nothing about
 /// the backend's own credential crosses a site boundary.
-fn derive_remote(cluster: &str, site: &str, sites: &[GridSite], network_name: &str) -> Option<Resolved> {
+fn derive_remote(cluster: &str, site: &str, sites: &[GridSite], network_name: &str) -> Result<Resolved, Refusal> {
     let site = sites
         .iter()
-        .find(|known| known.metadata.name.as_deref() == Some(site) && known.spec.grid_network_ref == network_name)?;
+        .find(|known| {
+            crate::controller::grid_network::peer_site_key(known).is_some_and(|(key, _)| key == site)
+                && known.spec.grid_network_ref == network_name
+        })
+        .ok_or(Refusal::SiteUnknown)?;
     // Only an Active site has had its address probed over TLS and its leaf
     // pinned. A Discovered or Connecting stub carries an address copied from
     // gossip, which is not something to hand the data plane.
@@ -234,14 +369,14 @@ fn derive_remote(cluster: &str, site: &str, sites: &[GridSite], network_name: &s
         site.status.as_ref().map(|status| &status.phase),
         Some(crate::crd::grid_site::GridSitePhase::Active)
     ) {
-        return None;
+        return Err(Refusal::SiteNotActive);
     }
-    let egress = site.spec.egress.as_ref()?;
+    let egress = site.spec.egress.as_ref().ok_or(Refusal::NoEgress)?;
     let address = egress.address.trim();
     if address.is_empty() {
-        return None;
+        return Err(Refusal::NoEgress);
     }
-    Some(Resolved {
+    Ok(Resolved {
         endpoint: ClusterEndpointConfig {
             cluster: cluster.to_owned(),
             address: address.to_owned(),
@@ -348,28 +483,45 @@ mod tests;
 /// reads exactly as it did before. Bounded: an operator needs to know that
 /// derivation happened and where to look, not a full inventory in a status
 /// message.
-pub(crate) fn derived_summary(resolved: &BTreeMap<String, Resolved>) -> String {
-    let derived: Vec<&str> = resolved
+pub(crate) fn derived_summary(resolution: &Resolution) -> String {
+    let derived: Vec<String> = resolution
+        .resolved
         .iter()
         .filter(|(_, entry)| entry.origin != Origin::Explicit)
-        .map(|(cluster, _)| cluster.as_str())
+        .map(|(cluster, _)| cluster.clone())
         .collect();
-    if derived.is_empty() {
-        return String::new();
+    let refused: Vec<String> = resolution
+        .refused
+        .iter()
+        .map(|refused| format!("{}: {}", refused.cluster, refused.reason.as_str()))
+        .collect();
+    let mut parts = Vec::new();
+    if !derived.is_empty() {
+        let total = resolution.resolved.len();
+        parts.push(format!(
+            "derived {} of {total} cluster endpoints ({})",
+            derived.len(),
+            named(&derived)
+        ));
     }
-    let total = resolved.len();
-    let shown = derived
+    if !refused.is_empty() {
+        parts.push(format!("withdrew {} ({})", refused.len(), named(&refused)));
+    }
+    parts.join("; ")
+}
+
+/// The first few of `items`, and how many more there are.
+fn named(items: &[String]) -> String {
+    let shown = items
         .iter()
         .take(MAX_NAMED_CLUSTERS)
-        .copied()
+        .cloned()
         .collect::<Vec<_>>()
         .join(", ");
-    let count = derived.len();
-    if count > MAX_NAMED_CLUSTERS {
-        let rest = count - MAX_NAMED_CLUSTERS;
-        return format!("derived {count} of {total} cluster endpoints ({shown}, and {rest} more)");
+    match items.len().saturating_sub(MAX_NAMED_CLUSTERS) {
+        0 => shown,
+        rest => format!("{shown}, and {rest} more"),
     }
-    format!("derived {count} of {total} cluster endpoints ({shown})")
 }
 
 /// How many cluster names a status message carries before it summarises.
