@@ -250,10 +250,6 @@ the next render.
 | Remote site | `transport.mode` | `mutual_tls` for `Mutual`, `plaintext` for `Plaintext` |
 | Remote site | `transport.sni` | `spec.egress.tls.serverName` |
 
-Client identity for a remote hop is the grid identity the gateway already
-mounts. Endpoint base paths are not carried; see
-[issue 248](https://github.com/praxis-proxy/grid/issues/248).
-
 ## Operational diagnostics
 
 After enabling `consumerConfig.enabled: true` for a gateway, the `GridNetwork`
