@@ -3182,31 +3182,34 @@ fn assert_negative_routing() -> AssertionResult {
 
     let cluster = "central";
     let context = format!("kind-grid-combined-{cluster}");
+    // Reuse an already-attached pod so fast negative responses cannot exit
+    // before `kubectl run -i` captures the curl output.
+    let client = StableCurlClient::create(&context, "negative-routing-client")?;
 
     // Positive control: valid request (same DNS, image, Service, port, mechanism)
-    let positive_output = run_curl_probe(
-        &context,
-        "neg-positive-ctrl",
-        &[
-            "curl",
-            "-f",
-            "-s",
-            "-o",
-            "/dev/null",
-            "-w",
-            "%{http_code}",
-            "-H",
-            "Content-Type: application/json",
-            "-d",
-            r#"{"model": "Qwen/Qwen3-0.6B", "messages": [{"role":"user","content":"hello"}], "max_tokens": 16}"#,
-            "consumer-gateway.grid-system.svc.cluster.local:8080/v1/chat/completions",
-        ],
-    )?;
+    let positive_output = client.request(&[
+        "-f",
+        "-s",
+        "-o",
+        "/dev/null",
+        "-w",
+        "%{http_code}",
+        "-H",
+        "Content-Type: application/json",
+        "-d",
+        r#"{"model": "Qwen/Qwen3-0.6B", "messages": [{"role":"user","content":"hello"}], "max_tokens": 16}"#,
+        "consumer-gateway.grid-system.svc.cluster.local:8080/v1/chat/completions",
+    ])?;
 
-    let positive_succeeded = positive_output.status.success();
+    let positive_status = String::from_utf8_lossy(&positive_output.stdout).trim().to_owned();
+    let positive_succeeded = positive_output.status.success() && positive_status == "200";
     observed_facts.insert(
         "positive_control_passed".to_owned(),
         serde_json::Value::Bool(positive_succeeded),
+    );
+    observed_facts.insert(
+        "positive_control_http_status".to_owned(),
+        serde_json::Value::String(positive_status),
     );
 
     if !positive_succeeded {
@@ -3218,24 +3221,19 @@ fn assert_negative_routing() -> AssertionResult {
     }
 
     // Negative 1: invalid model name
-    let invalid_model_output = run_curl_probe(
-        &context,
-        "neg-invalid-model",
-        &[
-            "curl",
-            "-s",
-            "--show-error",
-            "-o",
-            "/dev/null",
-            "-w",
-            "%{http_code}",
-            "-H",
-            "Content-Type: application/json",
-            "-d",
-            r#"{"model": "nonexistent-model-xyz", "messages": []}"#,
-            "consumer-gateway.grid-system.svc.cluster.local:8080/v1/chat/completions",
-        ],
-    )?;
+    let invalid_model_output = client.request(&[
+        "-s",
+        "--show-error",
+        "-o",
+        "/dev/null",
+        "-w",
+        "%{http_code}",
+        "-H",
+        "Content-Type: application/json",
+        "-d",
+        r#"{"model": "nonexistent-model-xyz", "messages": []}"#,
+        "consumer-gateway.grid-system.svc.cluster.local:8080/v1/chat/completions",
+    ])?;
 
     let invalid_model_status = String::from_utf8_lossy(&invalid_model_output.stdout).trim().to_owned();
     let invalid_model_rejected = invalid_model_status.starts_with('4') || invalid_model_status.starts_with('5');
@@ -3252,22 +3250,17 @@ fn assert_negative_routing() -> AssertionResult {
     }
 
     // Negative 2: invalid path
-    let invalid_path_output = run_curl_probe(
-        &context,
-        "neg-invalid-path",
-        &[
-            "curl",
-            "-s",
-            "--show-error",
-            "-o",
-            "/dev/null",
-            "-w",
-            "%{http_code}",
-            "-H",
-            "Content-Type: application/json",
-            "consumer-gateway.grid-system.svc.cluster.local:8080/v99/nonexistent/endpoint",
-        ],
-    )?;
+    let invalid_path_output = client.request(&[
+        "-s",
+        "--show-error",
+        "-o",
+        "/dev/null",
+        "-w",
+        "%{http_code}",
+        "-H",
+        "Content-Type: application/json",
+        "consumer-gateway.grid-system.svc.cluster.local:8080/v99/nonexistent/endpoint",
+    ])?;
 
     let invalid_path_status = String::from_utf8_lossy(&invalid_path_output.stdout).trim().to_owned();
     let invalid_path_rejected = invalid_path_status.starts_with('4') || invalid_path_status.starts_with('5');
@@ -3284,24 +3277,19 @@ fn assert_negative_routing() -> AssertionResult {
     }
 
     // Negative 3: malformed request body
-    let malformed_body_output = run_curl_probe(
-        &context,
-        "neg-malformed-body",
-        &[
-            "curl",
-            "-s",
-            "--show-error",
-            "-o",
-            "/dev/null",
-            "-w",
-            "%{http_code}",
-            "-H",
-            "Content-Type: application/json",
-            "-d",
-            "not-valid-json{{{",
-            "consumer-gateway.grid-system.svc.cluster.local:8080/v1/chat/completions",
-        ],
-    )?;
+    let malformed_body_output = client.request(&[
+        "-s",
+        "--show-error",
+        "-o",
+        "/dev/null",
+        "-w",
+        "%{http_code}",
+        "-H",
+        "Content-Type: application/json",
+        "-d",
+        "not-valid-json{{{",
+        "consumer-gateway.grid-system.svc.cluster.local:8080/v1/chat/completions",
+    ])?;
 
     let malformed_body_status = String::from_utf8_lossy(&malformed_body_output.stdout).trim().to_owned();
     let malformed_body_rejected = malformed_body_status.starts_with('4') || malformed_body_status.starts_with('5');
