@@ -40,7 +40,10 @@ pub use snapshot::RouteSnapshot;
 
 /// Counters this crate emits, with the help text a scrape shows.
 const COUNTER_HELP: [(&str, &str); 4] = [
-    ("grid_route_decisions_total", "Site-selection decisions made."),
+    (
+        "grid_route_decisions_total",
+        "Requests the gateway decided, by outcome. A refusal records an empty site and cluster.",
+    ),
     (
         "grid_route_selections_total",
         "Decisions by the path that produced them.",
@@ -52,7 +55,7 @@ const COUNTER_HELP: [(&str, &str); 4] = [
     ("grid_serving_config_reload_total", "Serving-config reloads by result."),
 ];
 
-/// Gauges this crate emits. A site gauge reads NaN once no value is held.
+/// Gauges this crate emits.
 const GAUGE_HELP: [(&str, &str); 5] = [
     (
         "grid_route_site_rho",
@@ -68,7 +71,7 @@ const GAUGE_HELP: [(&str, &str); 5] = [
     ),
     (
         "grid_route_site_score",
-        "Score the site was ranked by in the last decision. NaN when unmeasured.",
+        "Score the site ranks by in the current snapshot. NaN when excluded or demoted.",
     ),
     (
         "grid_route_shedding",
