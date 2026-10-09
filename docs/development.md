@@ -4,107 +4,147 @@ Development and validation guidance for AI Grid Network (AGN).
 
 ## Requirements
 
-- Rust stable 1.96+
-- Rust nightly (for `rustfmt`)
-- `jq` and `yq` v4 (for generating CRD manifests)
+- Rust stable 1.96+; edition 2024 and resolver 3.
+- `nightly-2026-03-28` with rustfmt, matching `NIGHTLY_RUSTFMT` in the Makefile.
+- Clippy, `cargo-machete`, `cargo-audit`, and `cargo-deny` for the Rust gates.
+- `typos`, `taplo`, `shellcheck`, and `actionlint` for `make lint-extra`.
+- `jq` and Mike Farah's `yq` v4 for CRD generation.
+- `cargo-llvm-cov` and `llvm-tools-preview` for optional coverage runs.
+- Docker or Podman, kind, kubectl, Helm, and the topology-specific prerequisites
+  for live integration checks. Individual harnesses may require Docker.
+
+Node/npm are needed for the dashboard web application and Markdown lint tools.
+Read the relevant component guide before installing or running its tooling.
 
 ## Conventions
 
-**All contributors must read and understand
-[conventions.md] before contributing.** The conventions
-cover code style, testing requirements, file
-organization, and security practices. Submissions
-that do not follow these conventions will be rejected.
+[Development Conventions](conventions.md) is the canonical AGN policy. It
+covers coding style, documentation, tests, human review, and commit attribution,
+including the differences from the pinned shared Conventions baseline.
 
-AGN also follows the shared
-[Praxis development conventions], including the rules for comments,
-tracing, testing, lint suppressions, and human review.
+## Workspace map
 
-[conventions.md]:./conventions.md
-[Praxis development conventions]:https://github.com/praxis-proxy/praxis/blob/main/docs/developing/conventions.md
+Run root Make targets from this repository's top-level directory. Cargo package
+names stay the same regardless of their directory location. Root workspace
+crates live under `crates/`; Gateway is a separate workspace within that
+directory.
 
-## Build
+| Package | Source | Responsibility |
+| --- | --- | --- |
+| `operator` | [`crates/operator/`](../crates/operator/) | Kubernetes controllers, CRDs, and the operator binary. |
+| `grid-overlay-sync` | [`crates/overlay-sync/`](../crates/overlay-sync/) | Watches overlay ConfigMaps and delivers local gateway files. |
+| `swim` | [`crates/swim/`](../crates/swim/) | Membership, gossip transport, and encryption. |
+| `crdt` | [`crates/crdt/`](../crates/crdt/) | Replicated state primitives and provider state. |
+| `scoring` | [`crates/scoring/`](../crates/scoring/) | Provider scoring and overlay contract types. |
+| `certs` | [`crates/certs/`](../crates/certs/) | Site certificates and certificate-provider interfaces. |
+| `enrollment` | [`crates/enrollment/`](../crates/enrollment/) | Site enrollment service and API types. |
+| `grid-signals` | [`crates/signals/`](../crates/signals/) | Shared load-signal store, Prometheus exposition parser, and labels. |
+| `grid-signals-client` | [`crates/signals-client/`](../crates/signals-client/) | mTLS poller for the operator's site-signal endpoint. |
+| `mock-providers` | [`crates/mock-providers/`](../crates/mock-providers/) | Mock inference-provider APIs. |
+| `fleet-dashboard` | [`crates/fleet-dashboard/`](../crates/fleet-dashboard/) | Optional fleet UI and Prometheus-backed views. |
+| `xtask` | [`crates/xtask/`](../crates/xtask/) | Repository generation, environments, and qualification commands. |
+| `version` | [`crates/version/`](../crates/version/) | Shared build identity for binaries and container provenance. |
 
-```console
-make build
-make release
-make check
-```
+[`crates/gateway/`](../crates/gateway/) is a separate Cargo workspace with its
+own lockfile. It contains `gateway` (the `grid-gateway` binary) and
+[`ai-grid-filters`](../crates/gateway/crates/ai-grid-filters/). Root
+`cargo --workspace` commands do not include it. Keep its TLS feature choices and
+production no-ring check intact when changing shared dependencies.
 
-### Test
+Forge is an upstream tool. Install it with `./scripts/forge.sh install` before
+running environment qualifications. Grid pins its source revision and resolves
+the executable through a shared wrapper. See [Forge tooling](developing/forge.md)
+for installation, cache verification, development overrides, and upgrade
+checks.
 
-```console
-make test
-```
+## Verification
 
-### Supply Chain Safety
+| Local command | Scope | Checked-in CI |
+| --- | --- | --- |
+| `make build`, `make check`, `make release` | Build, check, or release-build the root workspace. | Test, MSRV, image, and release jobs compile the relevant configurations. |
+| `make fmt` | Format root and Gateway workspaces with the pinned nightly. | `make lint` checks formatting without rewriting files. |
+| `make lint` | Root and Gateway Clippy, formatting, unused dependencies, and Gateway production no-ring check. | Tests / lint; Gateway also has a dedicated workflow. |
+| `make lint-extra` | Spelling, TOML formatting, pre-commit-hook ShellCheck, actionlint. | No aggregate extra-lint job yet. |
+| `make doc` | Root rustdoc, including private items, with warnings denied. | Documentation / rustdoc, including documentation-only PRs. |
+| `make test` | Root workspace tests; ignored tests stay excluded. | Tests / test; separate FIPS and Gateway jobs cover their configurations. |
+| `make audit` | Root lockfile audit and dependency/license policy. | Supply Chain; Gateway policy is checked in its own workflow. |
+| `make codegen-check`, `make crds-check` | Compare generated enrollment types and CRDs with their source definitions. | Tests / lint. |
+| `make coverage-check` | 80% root line-coverage floor with documented exclusions. | Coverage / coverage. |
+| `make mutants`, `make semver`, `make publish-dry-run` | Opt-in specialist checks. | No corresponding scheduled Grid workflows. |
 
-Security is enforced at every stage of development.
-`cargo audit` and `cargo deny check` are run as part of
-the `make audit` target. The `deny.toml` config bans
-wildcard version requirements, unknown registries, and
-unknown git sources. Multiple versions of the same crate
-produce a warning. All crates enforce
-`#![deny(unsafe_code)]` and Clippy runs with
-`-D warnings` (zero tolerance).
+`make all` runs build, formatting, lint, rustdoc, root tests, and root audit.
+Run `make lint-extra` separately for spelling, TOML, shell, and workflow checks.
+The `make all` aggregate does not run coverage, Gateway tests, generated-file
+checks, FIPS checks, container builds, dashboard web checks, or live cluster
+qualifications. Run those when the changed contract requires them. The
+[release guide](release.md) records the integration qualification matrix.
 
-### Formatting
+Tests and Coverage workflows skip their Rust jobs for documentation-only PRs;
+rustdoc and MSRV still run. The Gateway, Helm, and dashboard workflows have
+their own triggers and scopes. A skipped or absent job is not a passing test
+result. The [canonical conventions](conventions.md) require the local test
+suite before submitting any PR, including README or Markdown prose changes.
+Changes to examples, generated contracts, or executable commands also need
+checks appropriate to the affected behavior.
 
-Formatting requires nightly (`group_imports` and
-`imports_granularity` are nightly-only). Both stable and
-nightly toolchains must be installed.
-
-```console
-make fmt            # format all code
-make lint           # check formatting + clippy
-```
-
-### Documentation
-
-```console
-make doc            # build docs with warnings denied
-```
-
-All items (public and private) require `///` doc
-comments. The `missing_docs` and
-`missing_docs_in_private_items` lints enforce this at
-compile time.
-
-Rustdoc warnings are denied globally via
-`.cargo/config.toml` (`rustdocflags = ["-D", "warnings"]`),
-so `cargo doc` always enforces doc quality even
-outside Make.
-
-### CRD Manifests
-
-`make generate-crds` writes the CRD manifests in `deploy/crds/` and
-`charts/grid-operator/templates/crds/` from the Rust types in
-`crates/operator/src/crd/`. Do not edit them directly.
-
-After changing a CRD type, regenerate the manifests and
-commit them together with the Rust change:
+### Formatting and documentation
 
 ```console
-make generate-crds  # write deploy/crds and the chart CRDs
-make crds-check     # fail if they do not match the Rust types
+make fmt
+make lint
+make doc
 ```
 
-This includes changes to doc comments. The field
-descriptions in the CRDs come from the `///` comments on
-the Rust fields, so a comment-only change also changes
-the CRDs.
+Nightly is required for rustfmt's `group_imports` and `imports_granularity`.
+All public and private items need documentation under the workspace lint policy;
+see the canonical policy for test-function exceptions. `.cargo/config.toml`
+also sets `rustdocflags = ["-D", "warnings"]`, including outside Make.
 
-CI runs `make crds-check` and fails the pull request when
-the committed manifests are out of date.
+Markdown style is configured in `.markdownlint.yaml`; external link-check
+settings are in `lychee.toml`. These checks are not part of `make lint-extra` or
+checked-in CI. Review relative links and anchors when moving or rewriting docs,
+and report whether automated Markdown/link checks were run.
 
-### Coverage
+### Generated manifests
+
+`make generate-crds` writes `deploy/crds/` and
+`charts/grid-operator/templates/crds/` from `crates/operator/src/crd/`.
+`make generate-api-types` writes enrollment Rust types from
+`api/enrollment-v1alpha1.yaml`. Edit the sources and regenerate; do not edit the
+generated output directly. CRD doc-comment changes also affect field
+descriptions and require regeneration.
 
 ```console
-make coverage       # HTML coverage report
-make coverage-check # fail if below threshold
+make generate-crds
+make crds-check
+make generate-api-types
+make codegen-check
 ```
 
-Requires `cargo-llvm-cov`.
+### Coverage and supply chain
+
+`make coverage` writes an HTML report under `target/coverage`;
+`make coverage-check` writes `coverage.json`. See the
+[coverage policy](conventions.md#coverage-floor) for the measured-scope limits
+and the path toward the shared 90% line / 80% region target. No threshold
+increase should be claimed without a report from the actual commands.
+
+`cargo audit` checks known advisories. `cargo deny check` enforces `deny.toml`,
+including license and source policy. Documented advisory exceptions belong to
+their actual dependency paths; refreshing a template must not silently remove
+or broaden them. Gateway has its own lockfile and `deny.toml`.
+
+### Hooks and worktrees
+
+Enable signing with your own Git identity and key before committing. Running
+`make setup-hooks` selects `.hooks` through `core.hooksPath`, which works when
+`.git` is a file in a linked worktree. This is repository Git configuration and
+can affect its other worktrees. The hook checks that signing is enabled, then
+runs `make lint`; it does not run tests or the complete `make all` aggregate.
+
+Keep build outputs, cluster names, ports, and qualification evidence isolated
+when working in parallel. Worktrees isolate source edits, not Git configuration
+or container-daemon resources. Do not run cleanup against another run's state.
 
 ## Project Management
 

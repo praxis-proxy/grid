@@ -1,5 +1,13 @@
 # Development Conventions
 
+This is the canonical development policy for AI Grid Network (AGN). The
+[development guide](development.md#verification) maps these requirements to
+local commands and checked-in CI jobs. The shared [Praxis Conventions] provide
+the baseline; Grid-specific differences are recorded below rather than
+overwriting domain-specific checks with template defaults.
+
+[Praxis Conventions]: https://github.com/praxis-proxy/conventions/tree/1851c77279358e0e1e5ff4109968145ffa3dce69
+
 ## Project naming
 
 Use **AI Grid Network (AGN)** as the human-facing name in documentation. After
@@ -79,17 +87,24 @@ between doctests and unit/integration tests is fine.
 
 #### Coverage Floor
 
-`make coverage-check` enforces a hard floor: **90% line
-coverage and 80% region coverage** across the workspace.
-Region coverage counts every branch of every condition,
-so untested error arms and edge cases fail the gate even
-when the happy path executes every line. New code should
-land at or above the floor; the floor only ratchets up,
-never down.
+`make coverage-check` and Coverage CI enforce **80% line coverage** for the
+root workspace. They exclude the `xtask` package and filenames matching
+`(target/|tests/)`. Binary entrypoints are not explicitly excluded. The
+separate Gateway workspace is not included, and there is no enforced region
+threshold. Doctests are not instrumented by these commands.
 
-Binary entrypoints (`src/main.rs`) are excluded from
-coverage. Keep them to wiring; all logic belongs in the
-library crate where it is testable and counted.
+The shared Conventions target is 90% lines and 80% regions. Grid retains its
+existing floor while coverage work is qualified separately. To raise it,
+measure the current JSON report, add focused regressions for uncovered behavior,
+then update the local threshold and CI description together. Establish a
+separate Gateway baseline before claiming workspace-wide coverage. Do not lower
+thresholds or broaden exclusions to make a change pass. LLVM region coverage
+measures executable source regions; it does not establish exhaustive branch or
+distributed-history coverage.
+
+Keep binary entrypoints focused on wiring so behavior can be tested in the
+library. New code needs meaningful assertions regardless of whether its package
+contributes to the aggregate coverage gate.
 
 **`xtask` commands that generate Kubernetes or Praxis
 config** should include unit tests asserting the shape
@@ -117,9 +132,10 @@ above.
 #### Mutation Testing
 
 Coverage proves code executed; mutation testing
-(`make mutants`, weekly in CI) proves the assertions
-would notice if the code were wrong. cargo-mutants
-rewrites function bodies (return defaults, flip
+(`make mutants`) checks whether the assertions notice changes to the code.
+Grid exposes this as an opt-in local command; no checked-in workflow schedules
+it. A passing run covers the mutations exercised, not every possible defect.
+`cargo-mutants` rewrites function bodies (return defaults, flip
 operators) and fails if the test suite still passes.
 Treat a surviving mutant as a missing assertion, not
 noise: either strengthen the tests or delete the
@@ -181,8 +197,9 @@ and verify conformance against them.
 
 ### Rules, Practices & Lints
 
-Security is enforced at the lint level. See
-`[workspace.lints]` in `Cargo.toml` for the full set.
+The workspace lint policy catches unsafe and error-prone coding patterns.
+See `[workspace.lints]` in both workspace manifests for the full set. Passing
+lints does not establish the correctness of a trust or protocol boundary.
 
 - `#![deny(unsafe_code)]` in all crate roots (no
   exceptions; unsafe belongs upstream)
@@ -216,7 +233,7 @@ Every suppression must include a `reason`:
 )]
 fn build_pipeline() { /* ... */ }
 
-// Bad — denied by allow_attributes:
+// Bad - denied by allow_attributes:
 #[allow(clippy::too_many_lines)]
 fn build_pipeline() { /* ... */ }
 ```
@@ -277,12 +294,12 @@ runtime panics. The `await_holding_lock` and
 `await_holding_refcell_ref` lints enforce this.
 
 ```rust
-// Bad — guard held across await:
+// Bad - guard held across await:
 let guard = mutex.lock().await;
 let result = some_async_call().await;
 drop(guard);
 
-// Good — drop guard before awaiting:
+// Good - drop guard before awaiting:
 let data = {
     let guard = mutex.lock().await;
     guard.clone()
@@ -313,10 +330,10 @@ out of scope. The `unused_trait_names` lint enforces
 this.
 
 ```rust
-// Good — trait name unused, import anonymously:
+// Good - trait name unused, import anonymously:
 use std::io::Write as _;
 
-// Bad — trait name pollutes scope unnecessarily:
+// Bad - trait name pollutes scope unnecessarily:
 use std::io::Write;
 ```
 
@@ -363,9 +380,10 @@ children lives in `foo.rs` next to a `foo/` directory.
 
 #### Type Design
 
-Make invalid states unrepresentable. The type system
-and serde should enforce constraints at parse time,
-not at runtime.
+Make invalid states unrepresentable. The type system and serde should enforce
+constraints at parse time. See the
+[type-design examples](developing/type-design.md) for applications of these
+rules.
 
 - **Enums over strings for fixed value sets.** Never
   use `String` where the valid values are known. Use
@@ -620,8 +638,8 @@ Before submitting or merging PRs, ensure that you have:
 
 ### Commit Messages
 
-Commits follow the conventional commit format, enforced
-by CI:
+Commits follow the conventional commit format. Reviewers currently enforce
+subjects; the checked-in workflow does not validate their format:
 
 ```text
 type(scope): summary
@@ -636,29 +654,56 @@ type(scope): summary
 
 ### Pull Request Conventions
 
-Reviewability is enforced by CI
-(`.github/workflows/pr-conventions.yaml`). A PR that is
-hard to review is a defect regardless of the quality of
-its code. The gates:
+Keep pull requests reviewable. The requirements are:
 
-- **Size**: at most 750 added lines of production code.
-  `Cargo.toml`/`Cargo.lock`, tests, docs, examples, and
-  benchmarks do not count toward the limit. Split larger
-  changes into a stack of reviewable PRs. Override label:
-  `skip/pr-conventions` (reviewers only).
-- **Description**: every PR must explain what it does and
-  why.
-- **Commit format**: subjects follow the conventional
-  commit format above.
-- **DCO**: every commit carries a `Signed-off-by`
-  trailer.
-- **Signed commits**: every commit must be
-  cryptographically signed (GPG or SSH). Override label:
-  `skip/commit-signing`.
-- **Human authorship**: commits claiming they were authored,
-  co-authored, or signed-off by AI tools are rejected, per
-  the policy above. Human's are responsible for the code they
-  submit, and must know it and understand it prior to
-  submission, regardless of what tooling they used to produce it.
-- **Proposals**: this repository has no proposal-specific file or lifecycle
-  guide. Discuss proposed changes through the normal issue and PR process.
+- **Size**: at most 750 added production lines, excluding Cargo
+  manifests/locks, tests, documentation, examples, and benchmarks. Discuss a
+  larger coherent change with reviewers before expanding the scope.
+- **Description**: explain the problem, resulting behavior, and validation.
+- **Commit format**: use the conventional subjects described above.
+- **DCO**: include a human `Signed-off-by` trailer on every commit.
+- **Signed commits**: cryptographically sign commits with GPG or SSH.
+- **Human authorship**: do not attribute authorship, co-authorship, or sign-off
+  to AI tools. The human contributor is responsible for understanding and
+  reviewing every submitted change.
+- **Proposals**: use the shared [proposal process] for architectural or public
+  interface changes spanning several PRs.
+
+The checked-in `.github/workflows/conventions.yaml` checks for sign-off on
+non-merge commits in non-draft PRs targeting `main`. Its `skip/signoff` label
+selects an explicit skipped job. Drafts skip both sign-off jobs. A skipped check
+is not evidence of compliance.
+
+Size, descriptions, subject format, and authorship remain contributor and
+reviewer obligations. GitHub's `main` ruleset also requires signed commits,
+passing `test`, a code-owner review, and resolved review threads. These remote
+rules were checked on 2026-10-08; inspect the current rules before changing
+workflow check names or merge requirements.
+
+The local pre-commit hook checks that `commit.gpgsign` is enabled and runs
+`make lint`; it does not verify the signature of a resulting commit. Do not
+describe template override labels as implemented Grid controls.
+
+Before adopting a reusable Conventions workflow, inspect its inputs,
+permissions, and check names against the repository's current required checks.
+Pin it to a reviewed commit and document any required-check migration. Retain
+Grid's Gateway, FIPS, generated-manifest, Helm, dashboard, and release gates.
+
+[proposal process]: https://github.com/praxis-proxy/enhancements/blob/main/docs/process.md
+
+### Synchronization boundaries
+
+The root and Gateway workspace lint tables retain the shared rules plus
+`redundant_clone`, `similar_names`, and `unchecked_time_subtraction` denials.
+The formatter, TOML, Markdown, spelling, and pre-commit configurations follow
+the inspected shared baseline. Preserve Grid's Cargo alias, frame-pointer
+settings, Clippy thresholds and vocabulary, and documented supply-chain
+exceptions when refreshing that baseline.
+
+`make lint-extra` checks spelling, TOML formatting, the pre-commit hook with
+ShellCheck, and workflow syntax with actionlint. It does not lint every shell
+script or run Markdown/link checks. The Markdown and lychee configurations
+record intended checks; their presence alone does not mean CI runs them. Use
+those tools for changed documentation when available, and report checks that
+could not run. Wiring broader checks into CI requires a measured baseline and
+separate fixes for existing violations, not suppressions hiding the debt.

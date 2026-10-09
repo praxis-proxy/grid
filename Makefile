@@ -30,7 +30,7 @@ endif
 # All
 # -------------------------------------------------------------------
 
-all: build fmt lint test audit
+all: build fmt lint doc test audit
 
 # -------------------------------------------------------------------
 # Build
@@ -127,7 +127,8 @@ coverage:
 		--exclude xtask \
 		--ignore-filename-regex '(target/|tests/)'
 
-# Coverage gate is 80% lines; ratchet up incrementally.
+# Root coverage gate is 80% lines; exclusions match the coverage target.
+# Gateway is a separate workspace and is not included in this report.
 coverage-check:
 	cargo llvm-cov --workspace --json \
 		--exclude xtask \
@@ -238,7 +239,7 @@ dev-push: container
 # -------------------------------------------------------------------
 
 setup-hooks:
-	@ln -sf ../../.hooks/pre-commit .git/hooks/pre-commit
+	git config core.hooksPath .hooks
 	@echo "Git hooks installed"
 
 # -------------------------------------------------------------------
@@ -253,7 +254,7 @@ help:
 	@echo "  PROJECT_IMAGE      container image tag"
 	@echo ""
 	@echo "Top-level:"
-	@echo "  all              build + fmt + lint + test + audit"
+	@echo "  all              build + fmt + lint + doc + test + audit"
 	@echo ""
 	@echo "Build:"
 	@echo "  build            cargo build --workspace"
@@ -268,7 +269,7 @@ help:
 	@echo "  lint             root checks + gateway-lint"
 	@echo "  gateway-lint     Gateway Clippy + rustfmt + machete + no-ring check"
 	@echo "  lint-extra       typos + taplo + shellcheck + actionlint"
-	@echo "  fmt              format with nightly rustfmt"
+	@echo "  fmt              format root + Gateway with nightly rustfmt"
 	@echo "  doc              build docs with warnings denied"
 	@echo "  audit            cargo audit + cargo deny"
 	@echo "  coverage         HTML coverage report"
@@ -298,7 +299,7 @@ help:
 	@echo "  kind-down        delete cluster"
 	@echo ""
 	@echo "Dev Setup:"
-	@echo "  setup-hooks      install git pre-commit hook"
+	@echo "  setup-hooks      use .hooks in this repository and its worktrees"
 	@echo ""
 	@echo "Development:"
 	@echo "  dev-env          build image + create/reuse Kind development base"

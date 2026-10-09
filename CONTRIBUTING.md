@@ -1,53 +1,64 @@
 # Contributing
 
-Thank you for your interest in contributing! Start by
-reading the [development conventions]. Submissions that
-do not follow the conventions will be rejected.
+Start with the [development conventions]. They are the canonical policy for
+code, tests, documentation, and human responsibility for submitted changes.
 
 [development conventions]: docs/conventions.md
 
-## Getting Started
+## Getting started
 
-1. Fork the repository and clone your fork
-2. Install pre-commit hooks: `make setup-hooks`
-3. Build and test: `make build && make test`
-4. Run every gate locally before pushing: `make all`
+1. Fork the repository and clone your fork.
+2. Install the tools listed in the [development guide].
+3. Enable commit signing and install the hook with `make setup-hooks`.
+4. For code changes, run `make all` and component-specific checks before
+   submitting.
 
-Requirements are listed in [docs/development.md].
+The [verification matrix] explains what each local gate covers and which
+additional jobs CI runs. `make test` covers the root workspace; Gateway has a
+separate workspace.
 
-[docs/development.md]: docs/development.md
+Run the local test suite before submitting any PR, including README or Markdown
+prose-only changes, as required by the [development conventions]. For prose,
+also check spelling, Markdown style, local links and anchors, and whitespace
+(`git diff --check`). Examples and executable instructions need validation
+appropriate to the affected behavior. Record checks that could not be run and
+their prerequisites in the PR.
 
-## Picking Up an Issue
+[development guide]: docs/development.md
+[verification matrix]: docs/development.md#verification
 
-Only issues a maintainer has triaged (given a milestone
-and added to a project board) are open for contributors
-to take, and only at `Medium` or `Low` priority. Urgent
-and high-priority work is assigned by maintainers. If you
-self-assign something outside these rules, a bot unassigns
-it and points you back here. See [Picking Up Work] for the
-full policy.
+## Picking up an issue
 
-[Picking Up Work]: docs/development.md#picking-up-work
+Choose a maintainer-triaged issue with a milestone and project assignment at
+`priority/medium` or `priority/low`. Maintainers assign urgent and high-priority
+work. Coordinate ownership on the issue before beginning a substantial change.
+The checked-in issue workflow updates triage labels when milestones change;
+it does not enforce assignment or project-board policy.
 
-## Larger Changes
+## Larger changes
 
-Features that span multiple PRs, introduce new
-architectural patterns, or affect the public interface
-go through the [proposal process].
+Features spanning multiple PRs, new architectural patterns, and public-interface
+changes go through the [proposal process]. Keep each implementation PR focused
+on a reviewable result.
 
 [proposal process]: https://github.com/praxis-proxy/enhancements/blob/main/docs/process.md
 
-## Pull Request Gates
+## Pull requests
 
-CI enforces reviewability on every PR:
+Explain the problem, resulting behavior, and validation in the PR description.
+Follow the [PR conventions], including conventional commit subjects, human
+attribution, cryptographic signing, and a `Signed-off-by` trailer:
 
-- A maximum added lines count of production code (tests, docs, examples excluded)
-- A real description of what and why - `Signed-off-by`
-  trailer on every commit (`git commit -s`)
-- Cryptographically signed commits (GPG or SSH)
-- Human authorship: commits authored or signed-off by tools are rejected
-- Conventional commit subjects (`type(scope): summary`, ≤72 chars)
+```console
+git commit -S -s -m 'docs: clarify the installation prerequisites'
+```
 
-See the [PR conventions] section for details and override labels.
+The checked-in Coding Conventions workflow checks sign-off on non-draft PRs
+targeting `main`, unless the `skip/signoff` label skips that check. GitHub's
+`main` ruleset adds signature, test, and review requirements. A skipped check
+does not establish compliance. Other reviewability requirements are contributor
+and reviewer obligations; see the canonical policy for the enforcement boundary.
+Draft status does not remove the requirement to review and understand the
+submitted code.
 
 [PR conventions]: docs/conventions.md#pull-request-conventions
