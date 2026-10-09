@@ -5786,7 +5786,7 @@ fn collect_embedded_gateway_image_evidence() -> Result<Option<String>, Box<dyn s
     Ok(None)
 }
 
-/// Read the platform image's config digest, which Kind reports as the pod imageID.
+/// Read the platform image's config digest from its local Docker archive.
 fn local_image_config_digest(image: &str) -> Result<String, Box<dyn std::error::Error>> {
     let mut docker = Command::new("docker")
         .args(["image", "save", "--platform", "linux/amd64", image])
@@ -5816,6 +5816,31 @@ fn image_config_digest_from_manifest(manifest: &[u8]) -> Result<String, Box<dyn 
         .filter(|digest| digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()))
         .ok_or("image archive has no valid OCI config digest")?;
     Ok(format!("sha256:{config}"))
+}
+
+/// Read the config digest for an image reference from the Kind node's containerd store.
+fn node_image_config_digest(node: &str, image: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let output = Command::new("docker")
+        .args(["exec", node, "crictl", "inspecti", image])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "could not inspect image {image} on Kind node {node}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+    image_config_digest_from_crictl_inspect(&output.stdout)
+}
+
+/// Extract the config digest from CRI image inspection, separate from repository manifest digests.
+fn image_config_digest_from_crictl_inspect(inspect_output: &[u8]) -> Result<String, Box<dyn std::error::Error>> {
+    let details: serde_json::Value = serde_json::from_slice(inspect_output)?;
+    details
+        .pointer("/status/id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| "crictl image inspection has no status.id".into())
 }
 
 /// Check whether a deployment exists without treating a missing optional workload as an error.
@@ -5960,6 +5985,11 @@ pub(super) fn deployment_runtime_image_evidence(
             .pointer("/metadata/name")
             .and_then(serde_json::Value::as_str)
             .ok_or("matching pod has no name")?;
+        let node_name = pod
+            .pointer("/spec/nodeName")
+            .and_then(serde_json::Value::as_str)
+            .filter(|node| !node.is_empty())
+            .ok_or_else(|| format!("Ready pod {pod_name} has no assigned node"))?;
         let statuses = pod
             .pointer("/status/containerStatuses")
             .and_then(serde_json::Value::as_array)
@@ -5980,11 +6010,15 @@ pub(super) fn deployment_runtime_image_evidence(
                     .get(name)
                     .ok_or_else(|| format!("pod {pod_name} container {name} is absent from the Deployment template"))?;
                 let expected = expected_by_image.get(requested_image);
-                if let Some(expected) = expected
-                    && image_id != expected
+                let node_config_digest = expected
+                    .map(|_| node_image_config_digest(node_name, requested_image))
+                    .transpose()
+                    .map_err(|error| error.to_string())?;
+                if let (Some(expected), Some(observed)) = (expected, node_config_digest.as_ref())
+                    && expected != observed
                 {
                     return Err(format!(
-                        "pod {pod_name} container {name} runs {image_id}, but local image {requested_image} has config digest {expected}"
+                        "pod {pod_name} on Kind node {node_name} requests {requested_image} with config digest {observed}, but local image has config digest {expected} (pod imageID: {image_id})"
                     ));
                 }
                 Ok(serde_json::json!({
@@ -5992,6 +6026,7 @@ pub(super) fn deployment_runtime_image_evidence(
                     "requested": requested_image,
                     "imageID": image_id,
                     "expectedLocalConfigDigest": expected,
+                    "nodeConfigDigest": node_config_digest,
                     "sourceMatched": expected.is_some(),
                 }))
             })
@@ -6051,6 +6086,23 @@ mod tests {
         assert_eq!(
             image_config_digest_from_manifest(br#"[{"Config":"../escape"}]"#).ok(),
             None
+        );
+    }
+
+    #[test]
+    fn crictl_image_inspection_reads_config_digest_not_repository_manifest_digest() {
+        let inspect_output = serde_json::json!({
+            "status": {
+                "id": "sha256:local-config",
+                "repoDigests": ["docker.io/library/import-2026-10-09@sha256:runtime-manifest"]
+            }
+        });
+        assert_eq!(
+            image_config_digest_from_crictl_inspect(
+                &serde_json::to_vec(&inspect_output).unwrap_or_else(|_| std::process::abort()),
+            )
+            .ok(),
+            Some("sha256:local-config".to_owned())
         );
     }
 
