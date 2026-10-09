@@ -13,8 +13,8 @@ mod tests {
     /// Rendered by the operator's derived topology golden test.
     const RENDER: &str = include_str!("testdata/consumer-config-derived.yaml");
 
-    /// The declared server name in the fixture, which the negative controls replace.
-    const DECLARED_SNI: &str = "sni: \"model-b.example.internal\"";
+    /// The server name the fixture derived from an endpoint host, which the negative controls replace.
+    const DERIVED_SNI: &str = "sni: \"model-b.models.svc\"";
 
     /// Load `yaml` the way the gateway does at startup.
     fn load(yaml: &str) -> Result<(), String> {
@@ -46,11 +46,11 @@ mod tests {
     #[test]
     fn a_server_name_derivation_refuses_is_one_praxis_refuses() {
         assert!(
-            RENDER.contains(DECLARED_SNI),
-            "the fixture still carries the declared name"
+            RENDER.contains(DERIVED_SNI),
+            "the fixture still carries the derived name"
         );
         for bad in ["10.0.0.7", "host:443", "a/b", "has space.example"] {
-            let yaml = RENDER.replace(DECLARED_SNI, &format!("sni: \"{bad}\""));
+            let yaml = RENDER.replace(DERIVED_SNI, &format!("sni: \"{bad}\""));
             assert!(load(&yaml).is_err(), "{bad:?} loads, so the refusal guards nothing");
         }
     }

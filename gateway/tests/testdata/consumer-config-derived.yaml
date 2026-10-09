@@ -30,10 +30,10 @@ filter_chains:
               - "model-a.models.svc:8443"
           - name: "prov-b"
             tls:
-              sni: "model-b.example.internal"
+              sni: "model-b.models.svc"
               verify: true
             endpoints:
-              - "10.0.0.7:8443"
+              - "model-b.models.svc:8443"
 admin:
   address: "127.0.0.1:9901"
 shutdown_timeout_secs: 5

@@ -56,10 +56,6 @@ pub struct InferenceProviderSpec {
     /// Backend deployment category.
     pub backend_kind: String,
 
-    /// TLS for this provider's backend. Read only when a gateway derives its topology.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub backend_tls: Option<Box<BackendTls>>,
-
     /// Stable provider-gateway identity used by administrative operations.
     ///
     /// Providers with the same value are drained together by the gateway-wide
@@ -142,34 +138,6 @@ pub struct InferenceProviderSpec {
     /// Optional administrative traffic policy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub traffic_policy: Option<TrafficPolicy>,
-}
-
-/// CA and server name for a provider's backend, which an endpoint URL cannot carry.
-/// The URL scheme decides the transport mode.
-#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-#[schemars(deny_unknown_fields)]
-pub struct BackendTls {
-    /// Secret supplying the CA bundle that signs the backend's certificate.
-    ///
-    /// Omitted uses the process trust store. Named in the gateway namespace.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ca_secret_ref: Option<crate::crd::grid_network::EndpointCaSecretRef>,
-
-    /// Name to verify against the backend's certificate, and to send as SNI.
-    ///
-    /// Omitted uses the endpoint URL host. Must be a DNS hostname, not an IP
-    /// address, at most 253 characters.
-    #[schemars(
-        length(min = 1, max = 253),
-        regex(pattern = r"^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$"),
-        extend("x-kubernetes-validations" = [{
-            "rule": "!self.matches('(^|[.])[0-9]+$')",
-            "message": "serverName must be a hostname, not an IP address"
-        }])
-    )]
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub server_name: Option<String>,
 }
 
 impl InferenceProviderSpec {
@@ -1176,34 +1144,6 @@ mod tests {
                 .and_then(serde_json::Value::as_u64),
             Some(1),
             "clientCertificateSecretRef.privateKeyKey must have minLength: 1"
-        );
-    }
-
-    #[test]
-    fn backend_server_name_is_bounded_to_a_hostname_at_admission() {
-        let crd = crd_json();
-        let server_name = crd
-            .pointer(
-                "/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties/backendTls/properties/serverName",
-            )
-            .unwrap_or_else(|| std::process::abort());
-        assert_eq!(
-            server_name.get("maxLength").and_then(serde_json::Value::as_u64),
-            Some(253)
-        );
-        assert!(
-            server_name
-                .get("pattern")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|pattern| pattern.starts_with("^[A-Za-z0-9]")),
-            "a hostname pattern refuses a port, a path, or a space"
-        );
-        assert_eq!(
-            server_name
-                .pointer("/x-kubernetes-validations/0/rule")
-                .and_then(serde_json::Value::as_str),
-            Some("!self.matches('(^|[.])[0-9]+$')"),
-            "a dotted quad fits the pattern, so the last label must not be all digits"
         );
     }
 }

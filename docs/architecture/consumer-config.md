@@ -244,8 +244,7 @@ the next render.
 |---|---|---|
 | Local site | `address` | `spec.endpoint` host and port (443 for `https`, 80 for `http`) |
 | Local site | `transport.mode` | `tls` for `https`, `plaintext` for `http` |
-| Local site | `transport.sni` | `spec.backendTls.serverName`, else the endpoint host; a name that is not a DNS hostname is refused |
-| Local site | `transport.caSecretRef` | `spec.backendTls.caSecretRef` in the gateway namespace, else absent |
+| Local site | `transport.sni` | the endpoint host; an IP address or a host that is not a DNS hostname is refused |
 | Remote site (`GridSite` must be `Active`) | `address` | `spec.egress.address` |
 | Remote site | `transport.mode` | `mutual_tls` for `Mutual`, `plaintext` for `Plaintext` |
 | Remote site | `transport.sni` | `spec.egress.tls.serverName` |

@@ -13,7 +13,7 @@ use crate::{
     crd::{
         grid_network::{ClusterEndpointConfig, EndpointTransport, TransportMode},
         grid_site::{EgressTls, EgressTlsMode, GridSite},
-        inference_provider::{BackendTls, InferenceProvider},
+        inference_provider::InferenceProvider,
     },
     resources::routing_overlay::{CANDIDATE_KIND, RoutingCandidate, routing_identity},
 };
@@ -52,9 +52,9 @@ pub(crate) enum Refusal {
     EndpointUnusable,
     /// The URL declares a port it cannot represent.
     EndpointPort,
-    /// An `https` endpoint named by address with no declared server name.
+    /// An `https` endpoint named by IP address, which gives no server name to verify.
     ServerNameNeeded,
-    /// The server name to send is not a DNS hostname.
+    /// The endpoint host is not a DNS hostname, so it cannot be the server name.
     ServerNameInvalid,
 }
 
@@ -273,7 +273,7 @@ fn derive_local(cluster: &str, provider: &InferenceProvider) -> Result<Resolved,
         _ => return Err(Refusal::EndpointUnusable),
     };
     let port = endpoint_port(&uri, tls).ok_or(Refusal::EndpointPort)?;
-    let transport = backend_transport(provider.spec.backend_tls.as_deref(), host, tls)?;
+    let transport = backend_transport(host, tls)?;
     Ok(Resolved {
         endpoint: ClusterEndpointConfig {
             cluster: cluster.to_owned(),
@@ -337,20 +337,14 @@ fn hop_transport(tls: &EgressTls) -> EndpointTransport {
     }
 }
 
-/// The SNI to send, declared else the URL host. Praxis refuses a whole document over one bad name.
-fn server_name<'name>(backend: Option<&'name BackendTls>, host: &'name str) -> Result<&'name str, Refusal> {
-    let declared = backend
-        .and_then(|backend| backend.server_name.as_deref())
-        .map(str::trim)
-        .filter(|name| !name.is_empty());
-    let name = declared.unwrap_or(host);
-    if crate::signals::is_dns_name(name) {
-        Ok(name)
-    } else if declared.is_none()
-        && host
-            .trim_matches(|c| c == '[' || c == ']')
-            .parse::<std::net::IpAddr>()
-            .is_ok()
+/// The SNI to send, which is the URL host. Praxis refuses a whole document over one bad name.
+fn server_name(host: &str) -> Result<&str, Refusal> {
+    if crate::signals::is_dns_name(host) {
+        Ok(host)
+    } else if host
+        .trim_matches(|c| c == '[' || c == ']')
+        .parse::<std::net::IpAddr>()
+        .is_ok()
     {
         Err(Refusal::ServerNameNeeded)
     } else {
@@ -373,8 +367,8 @@ fn endpoint_port(uri: &http::Uri, tls: bool) -> Option<u16> {
     Some(if tls { 443 } else { 80 })
 }
 
-/// Transport for a local backend. Plaintext drops any SNI, which the renderer rejects.
-fn backend_transport(backend: Option<&BackendTls>, host: &str, tls: bool) -> Result<EndpointTransport, Refusal> {
+/// Transport for a local backend. Plaintext carries no SNI, which the renderer rejects.
+fn backend_transport(host: &str, tls: bool) -> Result<EndpointTransport, Refusal> {
     if !tls {
         return Ok(EndpointTransport {
             mode: TransportMode::Plaintext,
@@ -384,8 +378,8 @@ fn backend_transport(backend: Option<&BackendTls>, host: &str, tls: bool) -> Res
     }
     Ok(EndpointTransport {
         mode: TransportMode::Tls,
-        sni: Some(server_name(backend, host)?.to_owned()),
-        ca_secret_ref: backend.and_then(|backend| backend.ca_secret_ref.clone()),
+        sni: Some(server_name(host)?.to_owned()),
+        ca_secret_ref: None,
     })
 }
 

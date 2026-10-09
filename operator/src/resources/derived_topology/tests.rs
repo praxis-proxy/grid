@@ -4,8 +4,8 @@
 
 use super::*;
 
-/// Build an `InferenceProvider` with the given endpoint and optional backend TLS.
-fn provider(name: &str, endpoint: &str, backend_tls: Option<serde_json::Value>) -> InferenceProvider {
+/// Build an `InferenceProvider` with the given endpoint and optional `spec.tls`.
+fn provider(name: &str, endpoint: &str, tls: Option<serde_json::Value>) -> InferenceProvider {
     let mut spec = serde_json::json!({
         "gridNetworkRef": "net",
         "providerKind": "self_hosted",
@@ -13,8 +13,8 @@ fn provider(name: &str, endpoint: &str, backend_tls: Option<serde_json::Value>) 
         "endpoint": endpoint,
         "models": [{ "name": "model-x" }]
     });
-    if let Some(tls) = backend_tls {
-        spec["backendTls"] = tls;
+    if let Some(tls) = tls {
+        spec["tls"] = tls;
     }
     serde_json::from_value(serde_json::json!({
         "apiVersion": "grid.praxis.fast/v1alpha1",
@@ -91,8 +91,8 @@ fn mutual_egress(address: &str, server_name: &str) -> serde_json::Value {
 }
 
 /// Resolve with one local provider at `site-a`, which is also the local site.
-fn resolve_local(endpoint: &str, backend_tls: Option<serde_json::Value>) -> Resolved {
-    let providers = vec![provider("prov-a", endpoint, backend_tls)];
+fn resolve_local(endpoint: &str, tls: Option<serde_json::Value>) -> Resolved {
+    let providers = vec![provider("prov-a", endpoint, tls)];
     let sites = vec![site("site-a", None)];
     let candidates = vec![candidate("prov-a", "site-a")];
     let resolved = resolve(&candidates, &[], &decl(&providers, &sites, "site-a"));
@@ -113,31 +113,8 @@ fn an_https_endpoint_derives_server_authenticated_tls_against_its_own_host() {
     );
     assert!(
         transport.ca_secret_ref.is_none(),
-        "an undeclared CA stays undeclared, which the renderer reads as the process trust store"
+        "no spec.tls means no CA, which the renderer reads as the process trust store"
     );
-}
-
-#[test]
-fn a_declared_server_name_and_ca_reach_the_entry() {
-    let got = resolve_local(
-        "https://10.0.0.7:8443",
-        Some(serde_json::json!({
-            "serverName": "model-gateway.example.invalid",
-            "caSecretRef": { "name": "backend-ca" }
-        })),
-    );
-    let transport = got.endpoint.transport.expect("transport");
-    assert_eq!(
-        got.endpoint.address, "10.0.0.7:8443",
-        "an explicit port wins over the scheme default"
-    );
-    assert_eq!(
-        transport.sni.as_deref(),
-        Some("model-gateway.example.invalid"),
-        "a declared server name is the point of the field: the address is not the certificate name"
-    );
-    let ca = transport.ca_secret_ref.expect("ca");
-    assert_eq!(ca.name.as_str(), "backend-ca");
 }
 
 #[test]
@@ -148,20 +125,6 @@ fn an_http_endpoint_derives_plaintext_with_no_server_name() {
     assert!(
         transport.sni.is_none(),
         "the renderer rejects plaintext carrying an SNI, so derivation must not emit one"
-    );
-}
-
-#[test]
-fn a_declared_server_name_is_dropped_on_a_plaintext_endpoint() {
-    let got = resolve_local(
-        "http://model-gateway.models.svc.cluster.local",
-        Some(serde_json::json!({ "serverName": "model-gateway.example.invalid" })),
-    );
-    let transport = got.endpoint.transport.expect("transport");
-    assert_eq!(transport.mode, TransportMode::Plaintext);
-    assert!(
-        transport.sni.is_none(),
-        "an http endpoint with a declared server name would otherwise render PlaintextWithSni"
     );
 }
 
@@ -508,11 +471,7 @@ fn each_refusal_is_named() {
         provider("prov-twin", "https://twin2.example.invalid", None),
         provider("prov-port", "https://p.example.invalid:99999", None),
         provider("prov-ip", "https://10.0.0.5:8443", None),
-        provider(
-            "prov-badname",
-            "https://10.0.0.6:8443",
-            Some(serde_json::json!({ "serverName": "host:443" })),
-        ),
+        provider("prov-badname", "https://bad_name.example.invalid", None),
         provider("prov-scheme", "ftp://s.example.invalid", None),
         unavailable,
     ];
@@ -715,40 +674,10 @@ fn a_port_the_url_declares_but_cannot_represent_derives_nothing() {
 }
 
 #[test]
-fn an_https_endpoint_named_by_address_needs_a_declared_server_name() {
-    // Praxis rejects an IP literal as an SNI.
-    let providers = vec![provider("prov-a", "https://10.0.0.7:8443", None)];
-    let sites = vec![site("site-a", None)];
-    let candidates = vec![candidate("prov-a", "site-a")];
-    let resolved = resolve(&candidates, &[], &decl(&providers, &sites, "site-a"));
-    assert!(
-        resolved.is_empty(),
-        "an address-named https endpoint must refuse without a server name"
-    );
-}
-
-#[test]
-fn a_server_name_that_is_not_a_dns_hostname_is_refused() {
-    let long_label = "a".repeat(64);
-    let too_long = format!("{}.example", "a.".repeat(124));
-    let cases = [
-        ("https://model-gw:8443", "10.0.0.7"),
-        ("https://model-gw:8443", "::1"),
-        ("https://model-gw:8443", "[::1]"),
-        ("https://model-gw:8443", "host:443"),
-        ("https://model-gw:8443", "a/b"),
-        ("https://model-gw:8443", "has space.example"),
-        ("https://model-gw:8443", "-lead.example"),
-        ("https://model-gw:8443", "trail-.example"),
-        ("https://model-gw:8443", long_label.as_str()),
-        ("https://model-gw:8443", too_long.as_str()),
-    ];
-    for (endpoint, name) in cases {
-        let providers = vec![provider(
-            "prov-a",
-            endpoint,
-            Some(serde_json::json!({ "serverName": name })),
-        )];
+fn an_https_endpoint_named_by_address_is_refused() {
+    // Praxis rejects an IP literal as an SNI, and the URL host is the only name there is.
+    for endpoint in ["https://10.0.0.7:8443", "https://[::1]:8443", "https://[fd00::7]"] {
+        let providers = vec![provider("prov-a", endpoint, None)];
         let sites = vec![site("site-a", None)];
         let resolution = resolve(
             &[candidate("prov-a", "site-a")],
@@ -756,29 +685,42 @@ fn a_server_name_that_is_not_a_dns_hostname_is_refused() {
             &decl(&providers, &sites, "site-a"),
         );
         let got: Vec<Refusal> = resolution.refused.iter().map(|r| r.reason).collect();
-        assert_eq!(got, [Refusal::ServerNameInvalid], "{name:?} must refuse, not render");
+        assert_eq!(got, [Refusal::ServerNameNeeded], "{endpoint} must refuse, not render");
     }
 }
 
 #[test]
-fn an_undeclared_url_host_that_is_not_a_dns_hostname_is_refused() {
-    let providers = vec![provider("prov-a", "https://model_gw.ns.svc:8443", None)];
-    let sites = vec![site("site-a", None)];
-    let resolution = resolve(
-        &[candidate("prov-a", "site-a")],
-        &[],
-        &decl(&providers, &sites, "site-a"),
-    );
-    let got: Vec<Refusal> = resolution.refused.iter().map(|r| r.reason).collect();
-    assert_eq!(got, [Refusal::ServerNameInvalid], "the derived SNI is validated too");
+fn an_endpoint_host_that_is_not_a_dns_hostname_is_refused() {
+    let long_label = "a".repeat(64);
+    let too_long = format!("{}.example", "a.".repeat(124));
+    let hosts = [
+        "model_gw.ns.svc",
+        "-lead.example",
+        "trail-.example",
+        "10.0.0.300",
+        long_label.as_str(),
+        too_long.as_str(),
+    ];
+    for host in hosts {
+        let endpoint = format!("https://{host}:8443");
+        let providers = vec![provider("prov-a", &endpoint, None)];
+        let sites = vec![site("site-a", None)];
+        let resolution = resolve(
+            &[candidate("prov-a", "site-a")],
+            &[],
+            &decl(&providers, &sites, "site-a"),
+        );
+        let got: Vec<Refusal> = resolution.refused.iter().map(|r| r.reason).collect();
+        assert_eq!(got, [Refusal::ServerNameInvalid], "{host:?} must refuse, not render");
+    }
 }
 
 #[test]
-fn a_valid_declared_server_name_at_the_length_limit_resolves() {
+fn an_endpoint_host_at_the_length_limit_resolves() {
     // 63 + 1 + 63 + 1 + 63 + 1 + 61 = 253.
     let name = format!("{a}.{a}.{a}.{b}", a = "a".repeat(63), b = "b".repeat(61));
     assert_eq!(name.len(), 253);
-    let got = resolve_local("https://10.0.0.7:8443", Some(serde_json::json!({ "serverName": name })));
+    let got = resolve_local(&format!("https://{name}:8443"), None);
     assert_eq!(got.endpoint.transport.and_then(|t| t.sni), Some(name));
 }
 
@@ -808,11 +750,7 @@ const DERIVED_RENDER_GOLDEN: &str = include_str!("../../../../gateway/tests/test
 fn a_derived_tls_render_matches_the_fixture_praxis_loads() {
     let providers = vec![
         provider("prov-a", "https://model-a.models.svc:8443", None),
-        provider(
-            "prov-b",
-            "https://10.0.0.7:8443",
-            Some(serde_json::json!({ "serverName": "model-b.example.internal" })),
-        ),
+        provider("prov-b", "https://model-b.models.svc:8443", None),
     ];
     let sites = vec![site("site-a", None)];
     let candidates = vec![candidate("prov-a", "site-a"), candidate("prov-b", "site-a")];

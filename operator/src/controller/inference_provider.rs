@@ -3265,7 +3265,6 @@ mod tests {
             access_policy: crate::crd::auth::AccessPolicy::default(),
             auth: None,
             backend_kind: "local".to_owned(),
-            backend_tls: None,
             gateway_ref: None,
             cost: None,
             endpoint: endpoint.to_owned(),
