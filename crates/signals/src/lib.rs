@@ -13,4 +13,4 @@ pub mod feedback;
 
 mod signals;
 
-pub use signals::{Combine, CombinePolicy, Ingested, LoadStore, Sample, now_ms};
+pub use signals::{Combine, CombinePolicy, Ingested, LoadStore, Sample, Timeline, now_ms};
