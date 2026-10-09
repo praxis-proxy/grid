@@ -401,7 +401,7 @@ The `grid-mock-providers` image requires startup arguments:
 ```yaml
 containers:
   - name: mock-inference
-    image: ghcr.io/praxis-proxy/grid-mock-providers:v0.1.4
+    image: ghcr.io/praxis-proxy/grid-mock-providers:v0.2.0
     args: ["--provider", "openai", "--port", "8080"]
     env:
       - name: MOCK_EXPECTED_BEARER_TOKEN
