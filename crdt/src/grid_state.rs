@@ -9,6 +9,11 @@
 //! - provider records are last-writer-wins by `(revision, writer_id)`;
 //! - capabilities use the existing add-wins [`OrSet`].
 //!
+//! Each provider writer must assign a new revision to each distinct payload.
+//! Reusing the same writer and revision for conflicting records is outside the
+//! merge contract. Origin-authoritative replacement additionally requires the
+//! caller to reject stale transport revisions before replacing any providers.
+//!
 //! # Provider Access Policy
 //!
 //! Provider access policy enforcement allows providers to restrict which consumer
@@ -178,7 +183,7 @@ pub struct ProviderState {
     #[serde(default)]
     pub access_policy: ProviderAccessPolicy,
 
-    /// Monotonic per-writer revision for this provider record.
+    /// Monotonic per-writer revision, never reused for a different payload.
     pub revision: u64,
 
     /// Stable writer identity used to break equal-revision ties.
@@ -253,9 +258,9 @@ impl GridStateSnapshot {
         }
     }
 
-    /// Add a capability to this snapshot.
-    pub fn add_capability(&mut self, capability: Capability) {
-        self.capabilities.add(capability);
+    /// Add a capability, returning false if the local add tags are exhausted.
+    pub fn add_capability(&mut self, capability: Capability) -> bool {
+        self.capabilities.add(capability)
     }
 
     /// Upsert one provider record.
@@ -339,11 +344,11 @@ impl GridStateSnapshot {
 
     /// Remove `origin_site`'s contribution from every tenant's spend counter.
     ///
-    /// Used by the SWIM runtime's dead-member eviction sweep (mirrors
-    /// [`remove_origin_providers`](Self::remove_origin_providers)) so an
-    /// evicted site's slot doesn't linger forever. A tenant whose spend
-    /// counter becomes entirely empty as a result is pruned from the map, to
-    /// bound its long-term growth as origins churn.
+    /// This explicitly retires accounting history and breaks monotonicity.
+    /// The SWIM runtime deliberately preserves spend during membership eviction:
+    /// a restart or partition must not reopen a spent budget. Callers must also
+    /// prevent replay of the retired history, for example through a coordinated
+    /// budget-epoch change. Counters with no remaining spend are pruned.
     pub fn remove_origin_tenant_spend(&mut self, origin_site: &str) {
         self.tenant_spend.retain(|_, counter| {
             counter.remove_slot(origin_site);

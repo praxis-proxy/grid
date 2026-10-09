@@ -52,10 +52,10 @@ impl GCounter {
         *slot = slot.saturating_add(amount);
     }
 
-    /// Return the total count across all sites.
+    /// Return the total count across all sites, saturating at [`u64::MAX`].
     #[must_use]
     pub fn total(&self) -> u64 {
-        self.slots.values().sum()
+        self.slots.values().copied().fold(0, u64::saturating_add)
     }
 
     /// Return this site's local count.
@@ -92,8 +92,9 @@ impl GCounter {
 
     /// Remove the slot belonging to `site`, if present.
     ///
-    /// Used when evicting a dead site so its contribution doesn't linger in
-    /// other tenants' counters forever. A no-op if `site` never contributed.
+    /// This explicitly retires accounting history and breaks monotonicity.
+    /// Do not use it for membership eviction or transient failures: past spend
+    /// remains spent when a site restarts. A no-op if `site` never contributed.
     pub fn remove_slot(&mut self, site: &str) {
         self.slots.remove(site);
     }
@@ -318,5 +319,26 @@ mod tests {
         let restored: GCounter = serde_json::from_str(&json).unwrap_or_else(|_| std::process::abort());
         assert_eq!(restored.total(), 42, "serde round-trip must preserve total");
         assert_eq!(restored.local(), 42, "serde round-trip must preserve local");
+    }
+
+    #[test]
+    fn totals_saturate_across_sites_without_losing_individual_slots() {
+        let mut first = GCounter::new("a".to_owned());
+        first.increment(u64::MAX);
+        let mut second = GCounter::new("b".to_owned());
+        second.increment(1);
+        first.merge(&second);
+        second.merge(&first);
+
+        assert_eq!(first.total(), u64::MAX, "merged totals must never wrap or panic");
+        assert_eq!(second.total(), u64::MAX, "saturation is independent of merge order");
+        assert_eq!(second.local(), 1, "saturation must preserve each site's contribution");
+        assert_eq!(
+            first.retain_origin("b").total(),
+            1,
+            "saturation must preserve site b's individual contribution"
+        );
+        first.merge(&second);
+        assert_eq!(first.total(), u64::MAX, "duplicate delivery remains idempotent");
     }
 }

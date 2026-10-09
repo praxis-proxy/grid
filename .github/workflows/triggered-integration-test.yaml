@@ -787,17 +787,18 @@ jobs:
             exit 1
           fi
           if [[ "${SOURCE_KIND}" == "pr" ]]; then
-            echo "::notice::Demo will build xtask/forge from PR merge ${GRID_ACTUAL}, not main/base ${BASE_SHA}"
+            echo "::notice::Demo will build xtask from PR merge ${GRID_ACTUAL}, not main/base ${BASE_SHA}"
           elif [[ "${SOURCE_KIND}" == "branch" ]]; then
-            echo "::notice::Demo will build xtask/forge from ${BRANCH_NAME} at ${GRID_ACTUAL}"
+            echo "::notice::Demo will build xtask from ${BRANCH_NAME} at ${GRID_ACTUAL}"
           else
-            echo "::notice::Demo will build xtask/forge from main at ${GRID_ACTUAL}"
+            echo "::notice::Demo will build xtask from main at ${GRID_ACTUAL}"
           fi
           echo "Grid source:    ${GRID_REPO} (${SOURCE_LABEL})"
           echo "Operator image: ${GRID_XTASK_OPERATOR_IMAGE} (revision ${TESTED_SHA})"
           echo "Mock image:     ${GRID_XTASK_MOCK_PROVIDER_IMAGE} (revision ${TESTED_SHA})"
           echo "Gateway image:  ${GRID_XTASK_GATEWAY_IMAGE}@${GATEWAY_IMAGE_DIGEST}"
           cd "${GRID_REPO}"
+          ./scripts/forge.sh install
           cargo xtask env run-grid-glb-demo \
             --forge-config tests/e2e/topologies/grid-glb-demo/forge.yaml \
             "--${MODE}" --teardown --keep-on-failure \

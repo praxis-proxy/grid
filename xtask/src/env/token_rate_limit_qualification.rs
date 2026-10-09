@@ -2294,7 +2294,10 @@ fn prepare(options: &Options) -> Result<Session, Box<dyn std::error::Error>> {
         .ok_or("Forge config must have a parent directory")?
         .join(format!(".forge.{}", names.run_id));
     let config = materialize(options, &names, &state_dir)?;
-    let forge = PathBuf::from(std::env::var_os("FORGE_BIN").unwrap_or_else(|| "target/debug/praxis-forge".into()));
+    let forge = PathBuf::from(
+        super::glb::resolve_forge_binary()
+            .ok_or("pinned praxis-forge is unavailable; run scripts/forge.sh install or set FORGE_BIN")?,
+    );
     Ok(Session {
         forge,
         config,

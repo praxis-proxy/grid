@@ -2764,17 +2764,59 @@ fn read_configured_capacity(site: &str) -> Result<u32, Box<dyn std::error::Error
 }
 
 /// Extract one locally published CRDT capacity from structured operator logs.
-fn parse_local_crdt_capacity(logs: &str, site: &str, provider: &str) -> Option<u32> {
+/// The operator emits the `GridNetwork` as `network`; it does not emit `site_id`
+/// on this record. The provider resource ID carries the site-specific identity.
+fn parse_local_crdt_capacity(logs: &str, network: &str, provider: &str) -> Option<u32> {
     logs.lines().rev().find_map(|line| {
         if !line.contains("published local provider CRDT capacity")
-            || !(line.contains(&format!("site_id=\"{site}\"")) || line.contains(&format!("site_id={site}")))
-            || !(line.contains(&format!("provider_id=\"{provider}\""))
-                || line.contains(&format!("provider_id={provider}")))
+            || latest_log_field(line, "network").as_deref() != Some(network)
+            || latest_log_field(line, "provider_id").as_deref() != Some(provider)
         {
             return None;
         }
         latest_log_field(line, "capacity_weight")?.parse().ok()
     })
+}
+
+/// Summarize bounded capacity-publication evidence without retaining raw logs.
+#[expect(
+    clippy::too_many_lines,
+    reason = "The diagnostic reports each bounded publication matching boundary."
+)]
+fn capacity_publication_diagnostic(logs: &str, network: &str, provider: &str) -> String {
+    let publication_lines = logs
+        .lines()
+        .filter(|line| line.contains("published local provider CRDT capacity"))
+        .count();
+    let network_matches = logs
+        .lines()
+        .filter(|line| {
+            line.contains("published local provider CRDT capacity")
+                && latest_log_field(line, "network").as_deref() == Some(network)
+        })
+        .count();
+    let provider_matches = logs
+        .lines()
+        .filter(|line| {
+            line.contains("published local provider CRDT capacity")
+                && latest_log_field(line, "network").as_deref() == Some(network)
+                && latest_log_field(line, "provider_id").as_deref() == Some(provider)
+        })
+        .count();
+    let parseable_capacity_weights = logs
+        .lines()
+        .filter_map(|line| {
+            (line.contains("published local provider CRDT capacity")
+                && latest_log_field(line, "network").as_deref() == Some(network)
+                && latest_log_field(line, "provider_id").as_deref() == Some(provider))
+            .then(|| latest_log_field(line, "capacity_weight"))
+            .flatten()
+            .and_then(|value| value.parse::<u32>().ok())
+        })
+        .count();
+    format!(
+        "publication_lines={publication_lines}, network_matches={network_matches}, provider_matches={provider_matches}, parseable_capacity_weights={parseable_capacity_weights}"
+    )
 }
 
 /// Read the locally published provider state rather than rereading the CR.
@@ -2794,11 +2836,21 @@ fn read_local_crdt_capacity(site: &str) -> Result<u32, Box<dyn std::error::Error
         ])
         .output()?;
     if !output.status.success() {
-        return Err(format!("{site}: local CRDT publication logs unavailable").into());
+        return Err(format!(
+            "{site}: local CRDT publication logs unavailable: {}",
+            safe_truncate_str(String::from_utf8_lossy(&output.stderr).trim(), 200)
+        )
+        .into());
     }
     let logs = strip_csi_sgr(&String::from_utf8_lossy(&output.stdout));
-    parse_local_crdt_capacity(&logs, site, &provider)
-        .ok_or_else(|| format!("{site}: local CRDT capacity was not published in operator logs").into())
+    let network = run_name();
+    parse_local_crdt_capacity(&logs, network, &provider).ok_or_else(|| {
+        format!(
+            "{site}: local CRDT capacity was not recognized for network={network} provider_id={provider}; {}",
+            capacity_publication_diagnostic(&logs, network, &provider),
+        )
+        .into()
+    })
 }
 
 /// Capture pod identity and restart count for the consumer gateway.
@@ -3027,7 +3079,10 @@ fn phase_requires_revision_change(phase: &str) -> bool {
 
 #[cfg(test)]
 mod static_phase_policy_tests {
-    use super::{phase_requires_revision_change, provider_resource_name};
+    use super::{
+        capacity_publication_diagnostic, parse_local_crdt_capacity, phase_requires_revision_change,
+        provider_resource_name,
+    };
 
     #[test]
     fn baseline_observes_without_requiring_revision_change() {
@@ -3042,6 +3097,42 @@ mod static_phase_policy_tests {
         assert_eq!(
             provider_resource_name("vcr-provider-a-provider"),
             "vcr-provider-a-provider"
+        );
+    }
+
+    #[test]
+    fn parses_operator_capacity_record_scoped_by_network_and_provider() {
+        let logs = concat!(
+            "2026-01-01T00:00:00Z INFO operator::controller::grid_network: published local provider CRDT capacity network=\"grid-static-weighted-123\" provider_id=\"vcr-provider-a-provider\" capacity_weight=50\n",
+            "2026-01-01T00:00:01Z INFO operator::controller::grid_network: published local provider CRDT capacity network=\"grid-static-weighted-123\" provider_id=\"vcr-provider-b-provider\" capacity_weight=20\n",
+            "2026-01-01T00:00:02Z INFO operator::controller::grid_network: published local provider CRDT capacity network=\"grid-other\" provider_id=\"vcr-provider-a-provider\" capacity_weight=30\n",
+        );
+        assert_eq!(
+            parse_local_crdt_capacity(logs, "grid-static-weighted-123", "vcr-provider-a-provider"),
+            Some(50),
+            "newer records for another provider or network must not replace the matching capacity"
+        );
+    }
+
+    #[test]
+    fn capacity_diagnostic_distinguishes_missing_provider_record() {
+        let logs = "2026-01-01T00:00:00Z INFO network=grid-static-weighted-123 provider_id=vcr-provider-a-provider capacity_weight=50 published local provider CRDT capacity";
+        let diagnostic = capacity_publication_diagnostic(logs, "grid-static-weighted-123", "vcr-provider-b-provider");
+        assert!(
+            diagnostic.contains("publication_lines=1"),
+            "diagnostic should count publication lines"
+        );
+        assert!(
+            diagnostic.contains("network_matches=1"),
+            "diagnostic should count matching networks"
+        );
+        assert!(
+            diagnostic.contains("provider_matches=0"),
+            "diagnostic should report no matching provider"
+        );
+        assert!(
+            diagnostic.contains("parseable_capacity_weights=0"),
+            "diagnostic should report zero parseable capacity weights"
         );
     }
 }

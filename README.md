@@ -148,7 +148,6 @@ AGN and Praxis on running Kubernetes clusters with Helm.
 | `crdt` | Delta CRDT types (LWW, OR-Set, G-Counter) |
 | `overlay-sync` | Sidecar for fast ConfigMap-to-file delivery |
 | `mock-providers` | Mock OpenAI, Anthropic, Bedrock, Vertex APIs |
-| `forge` | Generic development-environment orchestrator for Kubernetes |
 | `xtask` | Dev task runner for multi-cluster test environments |
 | `fleet-dashboard` | Opt-in hub web UI: fleet map and per-site health from each site's Prometheus (Axum + React) |
 
@@ -185,6 +184,10 @@ make lint           # clippy + fmt check + machete
 make audit          # cargo audit + cargo deny check
 make all            # build + fmt + lint + test + audit
 ```
+
+Install the pinned upstream Forge with `./scripts/forge.sh install` before
+running environment qualifications. See [Forge tooling](docs/developing/forge.md)
+for provenance, overrides, and upgrade checks.
 
 See the [development guide](docs/development.md) and
 [conventions](docs/conventions.md) for full details.
