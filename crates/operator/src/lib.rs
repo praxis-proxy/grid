@@ -43,6 +43,8 @@ pub mod metrics_scraper;
 pub mod metrics_tls;
 /// Short-lived tokens for the metrics scraper ServiceAccount.
 pub(crate) mod metrics_token;
+/// The `GridNetwork` condition naming peers whose relayed signal ages are rejected.
+pub mod peer_ages;
 pub mod readiness;
 /// Kubernetes resource builders.
 pub mod resources;
