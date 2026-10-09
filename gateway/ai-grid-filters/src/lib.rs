@@ -38,6 +38,58 @@ pub use serving::{
 pub use signals::{Over, SiteReading, SiteSignals};
 pub use snapshot::RouteSnapshot;
 
+/// Counters this crate emits, with the help text a scrape shows.
+const COUNTER_HELP: [(&str, &str); 4] = [
+    ("grid_route_decisions_total", "Site-selection decisions made."),
+    (
+        "grid_route_selections_total",
+        "Decisions by the path that produced them.",
+    ),
+    (
+        "grid_route_prefix_affinity_total",
+        "Prefix-affinity decisions by outcome.",
+    ),
+    ("grid_serving_config_reload_total", "Serving-config reloads by result."),
+];
+
+/// Gauges this crate emits. A site gauge reads NaN once no value is held.
+const GAUGE_HELP: [(&str, &str); 5] = [
+    (
+        "grid_route_site_rho",
+        "Saturation the gateway last read for the site, in-flight over its ceiling. NaN when unmeasured.",
+    ),
+    (
+        "grid_route_site_weight",
+        "Capacity the draw weights the site by. NaN when unmeasured.",
+    ),
+    (
+        "grid_route_site_ceiling",
+        "Ceiling the gateway has learned for the site. NaN when unmeasured.",
+    ),
+    (
+        "grid_route_site_score",
+        "Score the site was ranked by in the last decision. NaN when unmeasured.",
+    ),
+    (
+        "grid_route_shedding",
+        "1 while the gateway sheds this model, 0 otherwise.",
+    ),
+];
+
+/// Describe every metric this crate emits, so a scrape carries help text.
+///
+/// Call once after the Prometheus recorder is installed: the `metrics` crate
+/// drops a description sent to the no-op recorder, and the emit sites run too
+/// late and too often to carry one.
+pub fn describe_metrics() {
+    for (name, help) in COUNTER_HELP {
+        metrics::describe_counter!(name, metrics::Unit::Count, help);
+    }
+    for (name, help) in GAUGE_HELP {
+        metrics::describe_gauge!(name, help);
+    }
+}
+
 /// The number of prefix keys `body` yields for a request to `path`, for the
 /// peak-memory test; not an API.
 #[doc(hidden)]

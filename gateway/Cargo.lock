@@ -1513,6 +1513,7 @@ dependencies = [
  "certs",
  "httparse",
  "httpdate",
+ "metrics",
  "opentelemetry-otlp",
  "praxis-ai-filters",
  "praxis-proxy",

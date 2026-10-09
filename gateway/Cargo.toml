@@ -335,6 +335,8 @@ certs = { path = "../certs", default-features = false, features = ["verifier"] }
 httpdate = { workspace = true }
 rustls = { version = "0.23.45", features = ["ring"] }
 tokio = { version = "1.53.1", features = ["macros"] }
+# The help-text test emits one sample per documented metric.
+metrics = "0.24.6"
 
 # machete can't see these: used as `praxis` / `praxis_core` / `praxis_filter`, not their package names.
 [package.metadata.cargo-machete]
