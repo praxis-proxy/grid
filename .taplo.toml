@@ -1,5 +1,5 @@
 include = ["**/*.toml"]
-exclude = ["target/**"]
+exclude = ["**/target/**"]
 
 [formatting]
 # Keys stay in author order: the lint tables in Cargo.toml are grouped by

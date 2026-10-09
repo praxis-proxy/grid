@@ -40,9 +40,9 @@ Provider credentials belong at the gateway making the final backend call;
 overlays contain credential references, not tokens.
 
 [Enrollment](charts/grid-enrollment/README.md) provides optional site-identity
-bootstrap. The [fleet dashboard](fleet-dashboard/README.md) provides an optional
-operational view. Neither component is required to understand the basic routing
-path. See the [architecture overview](docs/architecture/overview.md) for the
+bootstrap. The [fleet dashboard](crates/fleet-dashboard/README.md) provides an
+optional operational view. Neither component is required to understand the
+basic routing path. See the [architecture overview](docs/architecture/overview.md) for the
 controllers, trust lifecycle, signals, and deployment layouts.
 
 ## Choose a starting point
@@ -158,8 +158,9 @@ make all            # build, format, lint, docs, tests, audit
 ```
 
 Install the pinned upstream Forge with `./scripts/forge.sh install` before
-running environment qualifications. See [Forge tooling](docs/developing/forge.md)
-for provenance, overrides, and upgrade checks.
+running environment qualifications. See
+[Forge tooling](docs/developing/forge.md) for provenance, overrides, and upgrade
+checks.
 
 Read [CONTRIBUTING](CONTRIBUTING.md) and the canonical
 [development conventions](docs/conventions.md) before submitting a change.

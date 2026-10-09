@@ -492,7 +492,7 @@ immediately excluded.  This policy supports:
   stale candidate is better than a hard 404.
 
 The authoritative GC policy function is `should_retain_candidate` in
-`operator/src/resources/routing_overlay.rs`.  Rules, in priority order:
+`crates/operator/src/resources/routing_overlay.rs`.  Rules, in priority order:
 
 | Condition | Result |
 |---|---|
@@ -507,7 +507,7 @@ The authoritative GC policy function is `should_retain_candidate` in
 `MemberRecord.age_secs` tracks the elapsed time since a member last transitioned
 to `Dead` or `Suspect`.
 
-The SWIM runtime (`operator/src/swim_runtime.rs`) records the transition instant
+The SWIM runtime (`crates/operator/src/swim_runtime.rs`) records the transition instant
 in a private `status_changed_at: Option<Instant>` field for each member.  When a
 member transitions to `Dead` or `Suspect`, the instant is recorded and preserved
 monotonically.  When the member rejoins (`Alive`), the instant is cleared.  The
@@ -989,12 +989,12 @@ Consumers without overlay-file reload must apply changes through supported
 
 | File | Role |
 |------|------|
-| `operator/src/controller/grid_network.rs` | Reconcile loop wiring for metrics, CRDT snapshots, overlay rendering, and status. |
-| `operator/src/resources/routing_overlay.rs` | Provider-to-candidate mapping, scoring input construction, and overlay JSON rendering. |
-| `operator/src/resources/overlay_envelope.rs` | Envelope construction, RFC 8785 canonicalization, semantic digest, scope, and provenance. |
-| `operator/src/resources/provider_metrics.rs` | Prometheus scrape and metric-name mapping for `metricsConfig`. |
-| `scoring/src/scoring.rs` | Backend scoring engine (strategy-selected signals). |
-| `swim/src/state_broadcast.rs` | CRDT state broadcast handler used by SWIM custom broadcasts. |
-| `xtask/src/env/consumer.rs` | Local validation consumer gateway configuration. |
-| `xtask/src/env/gateway.rs` | Local validation provider gateway configuration. |
-| `xtask/src/env/operator.rs` | Local validation fixtures and overlay checks. |
+| `crates/operator/src/controller/grid_network.rs` | Reconcile loop wiring for metrics, CRDT snapshots, overlay rendering, and status. |
+| `crates/operator/src/resources/routing_overlay.rs` | Provider-to-candidate mapping, scoring input construction, and overlay JSON rendering. |
+| `crates/operator/src/resources/overlay_envelope.rs` | Envelope construction, RFC 8785 canonicalization, semantic digest, scope, and provenance. |
+| `crates/operator/src/resources/provider_metrics.rs` | Prometheus scrape and metric-name mapping for `metricsConfig`. |
+| `crates/scoring/src/scoring.rs` | Backend scoring engine (strategy-selected signals). |
+| `crates/swim/src/state_broadcast.rs` | CRDT state broadcast handler used by SWIM custom broadcasts. |
+| `crates/xtask/src/env/consumer.rs` | Local validation consumer gateway configuration. |
+| `crates/xtask/src/env/gateway.rs` | Local validation provider gateway configuration. |
+| `crates/xtask/src/env/operator.rs` | Local validation fixtures and overlay checks. |

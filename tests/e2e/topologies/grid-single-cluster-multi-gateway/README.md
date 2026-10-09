@@ -119,7 +119,7 @@ export GRID_XTASK_IMAGE_PULL_POLICY=Never
 docker build -f deploy/operator/Containerfile \
   -t "$GRID_XTASK_OPERATOR_IMAGE" .
 
-docker build -f overlay-sync/Containerfile \
+docker build -f crates/overlay-sync/Containerfile \
   -t "$GRID_XTASK_OVERLAY_SYNC_IMAGE" .
 ```
 

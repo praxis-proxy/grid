@@ -6,7 +6,7 @@ CONTAINER_ENGINE ?= $(shell command -v podman 2>/dev/null || command -v docker 2
 V                ?=
 NIGHTLY_RUSTFMT   ?= nightly-2026-03-28
 KIND_CLUSTER_NAME ?= praxis-grid
-PROJECT_IMAGE    ?= praxis-grid:dev
+PROJECT_IMAGE    ?= grid-operator:dev
 
 ifneq ($(V),)
   _NOCAPTURE := -- --nocapture
@@ -67,17 +67,17 @@ lint: gateway-lint
 	cargo machete
 
 gateway-lint:
-	cargo clippy --manifest-path gateway/Cargo.toml --workspace --all-targets -- -D warnings
-	cargo +$(NIGHTLY_RUSTFMT) fmt --manifest-path gateway/Cargo.toml --all -- --check
-	cargo machete gateway
+	cargo clippy --manifest-path crates/gateway/Cargo.toml --workspace --all-targets -- -D warnings
+	cargo +$(NIGHTLY_RUSTFMT) fmt --manifest-path crates/gateway/Cargo.toml --all -- --check
+	cargo machete crates/gateway
 	@set -eu; \
-	  tree="$$(cargo tree --manifest-path gateway/Cargo.toml -p gateway -e normal --target all --prefix none --format '{p}')"; \
+	  tree="$$(cargo tree --manifest-path crates/gateway/Cargo.toml -p gateway -e normal --target all --prefix none --format '{p}')"; \
 	  printf '%s\n' "$$tree" | grep -q '^openssl-sys ' || { echo "positive control failed: openssl-sys is not in the tree" >&2; exit 1; }; \
 	  if printf '%s\n' "$$tree" | grep -q '^ring '; then echo "ring is in the gateway's normal dependency tree" >&2; exit 1; fi
 
 fmt:
 	cargo +$(NIGHTLY_RUSTFMT) fmt --all
-	cargo +$(NIGHTLY_RUSTFMT) fmt --manifest-path gateway/Cargo.toml --all
+	cargo +$(NIGHTLY_RUSTFMT) fmt --manifest-path crates/gateway/Cargo.toml --all
 
 doc:
 	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --document-private-items
@@ -95,7 +95,7 @@ codegen-check:
 	cargo run --quiet -p xtask -- check-api-types
 
 # Regenerate the CRD manifests in deploy/crds and charts/grid-operator/templates/crds
-# from the Rust types in operator/src/crd.
+# from the Rust types in crates/operator/src/crd.
 generate-crds:
 	./scripts/generate-deployment-crds.sh
 
@@ -166,11 +166,11 @@ ifndef CONTAINER_ENGINE
 	$(error No container engine found. Install podman or docker)
 endif
 
+# Generic development targets build the control-plane operator image.
 container: | require-container-engine
-	$(CONTAINER_ENGINE) build $(BUILD_ARGS) -t $(PROJECT_IMAGE) -f Containerfile .
+	$(CONTAINER_ENGINE) build $(BUILD_ARGS) -t $(PROJECT_IMAGE) -f deploy/operator/Containerfile .
 
-images: | require-container-engine
-	$(CONTAINER_ENGINE) build $(BUILD_ARGS) -t $(PROJECT_IMAGE) -f Containerfile .
+images: container
 
 operator-image: | require-container-engine
 	$(CONTAINER_ENGINE) build $(BUILD_ARGS) -f deploy/operator/Containerfile -t grid-operator:latest .
@@ -179,24 +179,24 @@ gateway-image: | require-container-engine
 	$(CONTAINER_ENGINE) build $(BUILD_ARGS) -f deploy/gateway/Containerfile -t grid-gateway:latest .
 
 mock-providers-image: | require-container-engine
-	$(CONTAINER_ENGINE) build $(BUILD_ARGS) -f mock-providers/Containerfile -t grid-mock-providers:latest .
+	$(CONTAINER_ENGINE) build $(BUILD_ARGS) -f crates/mock-providers/Containerfile -t grid-mock-providers:latest .
 
 overlay-sync-image: | require-container-engine
-	$(CONTAINER_ENGINE) build $(BUILD_ARGS) -f overlay-sync/Containerfile -t grid-overlay-sync:latest .
+	$(CONTAINER_ENGINE) build $(BUILD_ARGS) -f crates/overlay-sync/Containerfile -t grid-overlay-sync:latest .
 
 fleet-dashboard-image: | require-container-engine
-	$(CONTAINER_ENGINE) build $(BUILD_ARGS) -f fleet-dashboard/Containerfile -t grid-fleet-dashboard:latest .
+	$(CONTAINER_ENGINE) build $(BUILD_ARGS) -f crates/fleet-dashboard/Containerfile -t grid-fleet-dashboard:latest .
 
-# Builds the dashboard UI and stages it where fleet-dashboard/build.rs embeds it.
+# Builds the dashboard UI and stages it where crates/fleet-dashboard/build.rs embeds it.
 fleet-dashboard-web:
-	npm --prefix fleet-dashboard/web ci --no-audit --no-fund
-	npm --prefix fleet-dashboard/web run build
-	rm -rf fleet-dashboard/webui/dist && mkdir -p fleet-dashboard/webui && cp -r fleet-dashboard/web/dist fleet-dashboard/webui/dist
+	npm --prefix crates/fleet-dashboard/web ci --no-audit --no-fund
+	npm --prefix crates/fleet-dashboard/web run build
+	rm -rf crates/fleet-dashboard/webui/dist && mkdir -p crates/fleet-dashboard/webui && cp -r crates/fleet-dashboard/web/dist crates/fleet-dashboard/webui/dist
 
 # GLB demo images — deterministic :glb-demo tags, no :latest dependency.
 glb-demo-images: | require-container-engine
 	$(CONTAINER_ENGINE) build $(BUILD_ARGS) -f deploy/operator/Containerfile -t grid-operator:glb-demo .
-	$(CONTAINER_ENGINE) build $(BUILD_ARGS) -f mock-providers/Containerfile -t grid-mock-providers:glb-demo .
+	$(CONTAINER_ENGINE) build $(BUILD_ARGS) -f crates/mock-providers/Containerfile -t grid-mock-providers:glb-demo .
 
 # -------------------------------------------------------------------
 # Helm
@@ -231,8 +231,7 @@ dev-env: images
 	KIND_CLUSTER_NAME=$(KIND_CLUSTER_NAME) \
 	bash hack/setup-kind.sh
 
-dev-push: | require-container-engine
-	$(CONTAINER_ENGINE) build $(BUILD_ARGS) -t $(PROJECT_IMAGE) -f Containerfile .
+dev-push: container
 	kind load docker-image $(PROJECT_IMAGE) --name $(KIND_CLUSTER_NAME)
 
 # -------------------------------------------------------------------
@@ -285,8 +284,8 @@ help:
 	@echo "  praxis-gateway-e2e  Forge Kind run of the standalone gateway chart"
 	@echo ""
 	@echo "Container:"
-	@echo "  container            build container image"
-	@echo "  images               build container image"
+	@echo "  container            build operator image as PROJECT_IMAGE"
+	@echo "  images               alias for container"
 	@echo "  operator-image       build operator container image"
 	@echo "  gateway-image        build gateway container image"
 	@echo "  mock-providers-image build mock-providers container image"

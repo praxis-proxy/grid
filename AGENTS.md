@@ -18,7 +18,7 @@ APIs. The AGN Operator (`grid-operator`) orchestrates mesh formation,
 trust, capability discovery, and routing - while
 Praxis gateways handle the data plane. The
 `praxis-gateway` chart uses the separately released
-Praxis AI image; `gateway/` contains the project-owned
+Praxis AI image; `crates/gateway/` contains the project-owned
 `grid-gateway` operand in a separate Cargo workspace.
 
 ## Architecture
@@ -70,7 +70,7 @@ make lint-extra     # typos + taplo + shellcheck
 make doc            # rustdoc -D warnings, private
 make audit          # cargo audit + cargo deny check
 make generate-crds  # regenerate CRD manifests from
-                    #   operator/src/crd
+                    #   crates/operator/src/crd
 make crds-check     # fail if CRD manifests are stale
 make all            # build + fmt + lint + doc
                     #   + test + audit
@@ -111,7 +111,7 @@ cargo xtask env status   # health of all components
 | `version` | Shared build identity for binaries and container provenance |
 | `fleet-dashboard` | Opt-in hub web UI: fleet map and per-site health from each site's Prometheus (Axum + React) |
 
-The separate `gateway/` workspace contains `gateway`
+The separate `crates/gateway/` workspace contains `gateway`
 (the `grid-gateway` binary) and `ai-grid-filters`. Root
 Cargo workspace commands do not include it. See
 [the verification matrix](docs/development.md#verification)

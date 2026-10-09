@@ -40,6 +40,6 @@ tests/e2e/topologies/**/.*.resolved.yaml
 *.tgz
 
 # fleet-dashboard: Vite build output and the copy build.rs embeds
-/fleet-dashboard/web/node_modules/
-/fleet-dashboard/web/dist/
-/fleet-dashboard/webui/
+/crates/fleet-dashboard/web/node_modules/
+/crates/fleet-dashboard/web/dist/
+/crates/fleet-dashboard/webui/

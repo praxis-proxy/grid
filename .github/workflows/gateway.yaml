@@ -1,23 +1,43 @@
 name: Gateway
 
 # ------------------------------------------------------------------------------
-# The gateway is its own Cargo workspace (gateway/Cargo.toml), so the root
+# The gateway is its own Cargo workspace (crates/gateway/Cargo.toml), so the root
 # Tests/Supply Chain jobs (cargo ... --workspace, cargo audit, cargo deny at the
-# root) do not cover gateway/src. This workflow keeps the gateway workspace under
-# the same fmt/clippy/test/audit/deny gates, scoped to gateway/** so it only runs
-# when the gateway changes.
+# root) do not cover crates/gateway/src. This workflow keeps the gateway workspace under
+# the same fmt/clippy/test/audit/deny gates, including shared source dependencies
+# and the workspace/tool configuration that affects their build.
 # ------------------------------------------------------------------------------
 
 on:
   push:
     branches: [main]
     paths:
-      - 'gateway/**'
+      - 'crates/gateway/**'
+      - 'crates/certs/**'
+      - 'crates/version/**'
+      - 'crates/signals/**'
+      - 'crates/signals-client/**'
+      - 'Cargo.toml'
+      - '.cargo/**'
+      - 'rust-toolchain.toml'
+      - 'rustfmt.toml'
+      - 'clippy.toml'
+      - 'deploy/gateway/Containerfile'
       - '.github/workflows/gateway.yaml'
   pull_request:
     branches: [main]
     paths:
-      - 'gateway/**'
+      - 'crates/gateway/**'
+      - 'crates/certs/**'
+      - 'crates/version/**'
+      - 'crates/signals/**'
+      - 'crates/signals-client/**'
+      - 'Cargo.toml'
+      - '.cargo/**'
+      - 'rust-toolchain.toml'
+      - 'rustfmt.toml'
+      - 'clippy.toml'
+      - 'deploy/gateway/Containerfile'
       - '.github/workflows/gateway.yaml'
   merge_group:
     branches: [main]
@@ -59,20 +79,20 @@ jobs:
       - name: Cache Rust build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          workspaces: gateway -> target
+          workspaces: crates/gateway -> target
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install cargo-machete
         run: cargo install cargo-machete --locked
 
       - name: Clippy
-        run: cargo clippy --manifest-path gateway/Cargo.toml --workspace --all-targets -- -D warnings
+        run: cargo clippy --manifest-path crates/gateway/Cargo.toml --workspace --all-targets -- -D warnings
 
       - name: Rustfmt
-        run: cargo +"$NIGHTLY_RUSTFMT" fmt --manifest-path gateway/Cargo.toml --all -- --check
+        run: cargo +"$NIGHTLY_RUSTFMT" fmt --manifest-path crates/gateway/Cargo.toml --all -- --check
 
       - name: Machete (unused dependencies)
-        run: cargo machete gateway
+        run: cargo machete crates/gateway
 
       # The binary's TLS must come from the OpenSSL provider Praxis installs, so ring stays test-only.
       # openssl-sys is the positive control: an empty or failed tree must not pass.
@@ -80,7 +100,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          tree=$(cargo tree --manifest-path gateway/Cargo.toml -p gateway -e normal --target all --prefix none --format '{p}')
+          tree=$(cargo tree --manifest-path crates/gateway/Cargo.toml -p gateway -e normal --target all --prefix none --format '{p}')
           grep -q '^openssl-sys ' <<<"$tree" || { echo "positive control failed: openssl-sys is not in the tree"; exit 1; }
           if grep '^ring ' <<<"$tree"; then echo "ring is in the gateway's normal dependency tree"; exit 1; fi
 
@@ -105,11 +125,11 @@ jobs:
       - name: Cache Rust build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          workspaces: gateway -> target
+          workspaces: crates/gateway -> target
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Unit tests
-        run: cargo test --manifest-path gateway/Cargo.toml --workspace
+        run: cargo test --manifest-path crates/gateway/Cargo.toml --workspace
 
   # ----------------------------------------------------------------------------
   # Security audit, gateway lockfile
@@ -138,7 +158,7 @@ jobs:
         run: command -v cargo-audit || cargo install cargo-audit --locked
 
       - name: Run cargo audit
-        run: cargo audit --file gateway/Cargo.lock
+        run: cargo audit --file crates/gateway/Cargo.lock
 
   # ----------------------------------------------------------------------------
   # License & dependency check, gateway workspace (root deny.toml policy)
@@ -167,4 +187,4 @@ jobs:
         run: command -v cargo-deny || cargo install cargo-deny --locked
 
       - name: Run cargo deny
-        run: cargo deny --manifest-path gateway/Cargo.toml --config gateway/deny.toml check
+        run: cargo deny --manifest-path crates/gateway/Cargo.toml --config crates/gateway/deny.toml check

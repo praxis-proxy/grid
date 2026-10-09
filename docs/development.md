@@ -25,33 +25,37 @@ including the differences from the pinned shared Conventions baseline.
 ## Workspace map
 
 Run root Make targets from this repository's top-level directory. Cargo package
-names stay the same regardless of their directory location.
+names stay the same regardless of their directory location. Root workspace
+crates live under `crates/`; Gateway is a separate workspace within that
+directory.
 
 | Package | Source | Responsibility |
 | --- | --- | --- |
-| `operator` | [`operator/`](../operator/) | Kubernetes controllers, CRDs, and the operator binary. |
-| `grid-overlay-sync` | [`overlay-sync/`](../overlay-sync/) | Watches overlay ConfigMaps and delivers local gateway files. |
-| `swim` | [`swim/`](../swim/) | Membership, gossip transport, and encryption. |
-| `crdt` | [`crdt/`](../crdt/) | Replicated state primitives and provider state. |
-| `scoring` | [`scoring/`](../scoring/) | Provider scoring and overlay contract types. |
-| `certs` | [`certs/`](../certs/) | Site certificates and certificate-provider interfaces. |
-| `enrollment` | [`enrollment/`](../enrollment/) | Site enrollment service and API types. |
-| `grid-signals` | [`signals/`](../signals/) | Shared load-signal store, Prometheus exposition parser, and labels. |
-| `grid-signals-client` | [`signals-client/`](../signals-client/) | mTLS poller for the operator's site-signal endpoint. |
-| `mock-providers` | [`mock-providers/`](../mock-providers/) | Mock inference-provider APIs. |
-| `fleet-dashboard` | [`fleet-dashboard/`](../fleet-dashboard/) | Optional fleet UI and Prometheus-backed views. |
-| `xtask` | [`xtask/`](../xtask/) | Repository generation, environments, and qualification commands. |
-| `version` | [`version/`](../version/) | Shared build identity for binaries and container provenance. |
+| `operator` | [`crates/operator/`](../crates/operator/) | Kubernetes controllers, CRDs, and the operator binary. |
+| `grid-overlay-sync` | [`crates/overlay-sync/`](../crates/overlay-sync/) | Watches overlay ConfigMaps and delivers local gateway files. |
+| `swim` | [`crates/swim/`](../crates/swim/) | Membership, gossip transport, and encryption. |
+| `crdt` | [`crates/crdt/`](../crates/crdt/) | Replicated state primitives and provider state. |
+| `scoring` | [`crates/scoring/`](../crates/scoring/) | Provider scoring and overlay contract types. |
+| `certs` | [`crates/certs/`](../crates/certs/) | Site certificates and certificate-provider interfaces. |
+| `enrollment` | [`crates/enrollment/`](../crates/enrollment/) | Site enrollment service and API types. |
+| `grid-signals` | [`crates/signals/`](../crates/signals/) | Shared load-signal store, Prometheus exposition parser, and labels. |
+| `grid-signals-client` | [`crates/signals-client/`](../crates/signals-client/) | mTLS poller for the operator's site-signal endpoint. |
+| `mock-providers` | [`crates/mock-providers/`](../crates/mock-providers/) | Mock inference-provider APIs. |
+| `fleet-dashboard` | [`crates/fleet-dashboard/`](../crates/fleet-dashboard/) | Optional fleet UI and Prometheus-backed views. |
+| `xtask` | [`crates/xtask/`](../crates/xtask/) | Repository generation, environments, and qualification commands. |
+| `version` | [`crates/version/`](../crates/version/) | Shared build identity for binaries and container provenance. |
 
-[`gateway/`](../gateway/) is a separate Cargo workspace with its own lockfile.
-It contains `gateway` (the `grid-gateway` binary) and `ai-grid-filters`. Root
+[`crates/gateway/`](../crates/gateway/) is a separate Cargo workspace with its
+own lockfile. It contains `gateway` (the `grid-gateway` binary) and
+[`ai-grid-filters`](../crates/gateway/crates/ai-grid-filters/). Root
 `cargo --workspace` commands do not include it. Keep its TLS feature choices and
 production no-ring check intact when changing shared dependencies.
 
-Forge is an upstream tool, installed separately with `./scripts/forge.sh install`
-before running environment qualifications. Grid pins its source revision and
-resolves the executable through a shared wrapper. See [Forge tooling](developing/forge.md)
-for installation, cache verification, development overrides, and upgrade checks.
+Forge is an upstream tool. Install it with `./scripts/forge.sh install` before
+running environment qualifications. Grid pins its source revision and resolves
+the executable through a shared wrapper. See [Forge tooling](developing/forge.md)
+for installation, cache verification, development overrides, and upgrade
+checks.
 
 ## Verification
 
@@ -104,7 +108,7 @@ and report whether automated Markdown/link checks were run.
 ### Generated manifests
 
 `make generate-crds` writes `deploy/crds/` and
-`charts/grid-operator/templates/crds/` from `operator/src/crd/`.
+`charts/grid-operator/templates/crds/` from `crates/operator/src/crd/`.
 `make generate-api-types` writes enrollment Rust types from
 `api/enrollment-v1alpha1.yaml`. Edit the sources and regenerate; do not edit the
 generated output directly. CRD doc-comment changes also affect field
