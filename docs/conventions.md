@@ -1,6 +1,6 @@
 # Development Conventions
 
-This is the canonical development policy for AGN. The
+This is the canonical development policy for AI Grid Network (AGN). The
 [development guide](development.md#verification) maps these requirements to
 local commands and checked-in CI jobs. The shared [Praxis Conventions] provide
 the baseline; Grid-specific differences are recorded below rather than

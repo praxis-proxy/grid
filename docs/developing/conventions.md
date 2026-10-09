@@ -1,6 +1,7 @@
 # Development conventions
 
-The canonical AGN policy is [Development Conventions](../conventions.md).
+The canonical AI Grid Network (AGN) policy is
+[Development Conventions](../conventions.md).
 Use it for coding style, tests, documentation, commit attribution, and pull
 request requirements. This page remains as a stable link for existing readers.
 
