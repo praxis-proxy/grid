@@ -337,10 +337,16 @@ metadata.
 A deliberately scaled-to-zero Deployment stays `WaitingForRollout` until pods
 are started and a complete rollout proves the mounts and config are present.
 
-The operator's `grid-operator-resources` RoleBinding needs `deployments` `get`
-and `patch` in the gateway namespace for this opt-in feature. With a nonempty
-candidate overlay and the feature disabled, the operator publishes the
-requirements document but does not read or patch gateway Deployments.
+The operator's own RBAC grants no Deployment access for this feature. The
+gateway grants it: with `mountReconciliation.enabled`, the praxis-gateway
+chart renders a Role in the gateway namespace allowing `get` and `patch` on
+that one Deployment, bound to the operator ServiceAccount. A Deployment the
+chart did not install needs the equivalent Role by hand; see
+[Deployment access](operations.md#deployment-access), which also covers the
+upgrade order from v0.2.0 and what the grant still allows. Without it the
+mount status reports `DeploymentForbidden` and nothing is patched. With a
+nonempty candidate overlay and the feature disabled, the operator publishes
+the requirements document but does not read or patch gateway Deployments.
 
 ### Reading consumer config status
 

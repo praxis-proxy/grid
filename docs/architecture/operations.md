@@ -207,11 +207,101 @@ granted for `secrets` and `configmaps`.  `delete` and
 |---|---|---|
 | `secrets` | `get`, `create`, `patch` | Read TLS certs, SWIM key, credential refs; SSA-create CA and site cert `Secrets` |
 | `configmaps` | `get`, `create`, `patch`, `update` | Routing overlay, consumer config, and Secret requirements `ConfigMaps`; SWIM revision reservations |
-| `deployments` | `get`, `patch` | Only when delegated mount reconciliation is enabled; verify explicit ownership and patch Grid-owned mounts and rollout annotations |
 
 The `grid-operator-resources` `ClusterRole` is never bound
 cluster-wide.  It takes effect only in namespaces where a
 `RoleBinding` references it.
+
+### Deployment access
+
+Neither `ClusterRole` grants Deployments. The operator reaches a
+Deployment through two named grants only:
+
+| Grant | Bound where | Why |
+|---|---|---|
+| `deployments` `get`, `patch` on `gateway.serviceName` (Helm chart only, with rotation on) | Release namespace, each `resourceNamespaces` entry, and `gateway.namespace` through the discovery Role | Roll the gateway after an identity rotation |
+| `deployments` `get`, `patch` on one delegated gateway's Deployment | That gateway's namespace, through a Role its owner creates | Delegated Secret mount reconciliation |
+
+A gateway that delegates its mounts (`consumerConfig.mountReconciliation`
+on the `GridNetwork`, `mountReconciliation.enabled` on the praxis-gateway
+chart) is the one consenting to the operator patching its Deployment, so
+its chart renders the Role: `resourceNames` is the chart's Deployment
+name, `fullnameOverride` moves both together, and the RoleBinding names
+the operator ServiceAccount from `mountReconciliation.operator`
+(`grid-operator` in `grid-system` by default). For a Deployment the chart
+did not install, or with `mountReconciliation.rbac.create: false`, create
+the equivalent by hand:
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: inference-gw-mount-reconciliation
+  namespace: praxis-system            # the gateway namespace
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    resourceNames: ["inference-gw"]   # consumerConfig.mountReconciliation.deploymentName
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: inference-gw-mount-reconciliation
+  namespace: praxis-system
+subjects:
+  - kind: ServiceAccount
+    name: grid-operator
+    namespace: grid-system
+roleRef:
+  kind: Role
+  name: inference-gw-mount-reconciliation
+  apiGroup: rbac.authorization.k8s.io
+```
+
+Creating the Role needs `get` and `patch` on Deployments in that
+namespace already (Kubernetes refuses a Role its creator could not use),
+which anyone who installs the gateway has.
+
+What the grants still allow, as RBAC facts rather than what the operator
+chooses to do:
+
+- `patch` on the delegated Deployment is whole-object: the pod template,
+  image, ServiceAccount, and anything else in the Deployment, not only
+  mounts. The opt-in annotations the operator checks before patching, and
+  the strategic patches it builds, are its own safety checks, not an RBAC
+  restriction.
+- The grant lasts as long as the gateway chart keeps
+  `mountReconciliation.enabled`, whether or not the `GridNetwork` still
+  delegates.
+- The rotation grant on `gateway.serviceName` applies in every namespace
+  the resources ClusterRole is bound in, whether or not that namespace
+  holds the gateway.
+- Secrets `get`, `create`, `patch`; ConfigMaps `get`, `create`, `patch`,
+  `update`; and Events `create`, `patch` in every bound namespace, as
+  before.
+
+Without the grant, the operator gets a 403 on the Deployment read and the
+gateway's `mountReconciliationStatus[]` entry reports
+`reason: DeploymentForbidden`, naming the verb it was refused. Nothing is
+patched, the previously distributed routing overlay is retained, and new
+routing changes stop publishing to that gateway until the grant exists. A
+`deploymentName` that names no Deployment reads the same way, since RBAC
+is checked before existence.
+
+#### Upgrading from v0.2.0 with delegation enabled
+
+v0.2.0 granted `deployments` `get`, `patch` without `resourceNames` in the
+resources ClusterRole. That rule is gone, so a v0.2.0 install with
+`consumerConfig.mountReconciliation.enabled` upgrades in this order:
+
+1. Upgrade the praxis-gateway chart, or create the Role above, for every
+   delegated gateway.
+2. Upgrade the operator chart, or re-apply `deploy/operator/`.
+
+Out of order, step 2 alone leaves the operator with no Deployment access
+until step 1 lands: the `DeploymentForbidden` status above, and no
+patches in between.
 
 ### Secret access rules
 
@@ -250,7 +340,8 @@ Neither `ClusterRole` grants:
 - `services`, `ingresses`
 - `secrets` `delete`, `list`, `watch`
 - `configmaps` `delete`, `list`, `watch`
-- `deployments` `update`, `delete`, `list`, `watch`
+- `deployments` `update`, `delete`, `list`, `watch`, and `get`, `patch` on
+  any Deployment outside the two named grants above
 
 ### Adding namespaces
 

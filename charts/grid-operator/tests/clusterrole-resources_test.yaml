@@ -1,6 +1,8 @@
 suite: resources ClusterRole
 templates:
   - templates/clusterrole-resources.yaml
+release:
+  name: grid-operator
 tests:
   - it: lets auto-enroll read the token and write the identity Secrets
     asserts:
@@ -10,6 +12,32 @@ tests:
             apiGroups: [""]
             resources: ["secrets"]
             verbs: ["get", "create", "patch"]
+  - it: grants exactly the Secret, Service, Event, and ConfigMap rules by default
+    asserts:
+      - equal:
+          path: rules
+          value:
+            - apiGroups: [""]
+              resources: ["secrets"]
+              verbs: ["get", "create", "patch"]
+            - apiGroups: [""]
+              resources: ["services"]
+              resourceNames: ["provider-gateway", "grid-operator-swim", "grid-operator-signals"]
+              verbs: ["get"]
+            - apiGroups: ["events.k8s.io"]
+              resources: ["events"]
+              verbs: ["create", "patch"]
+            - apiGroups: [""]
+              resources: ["configmaps"]
+              verbs: ["get", "create", "patch", "update"]
+  - it: grants no Deployment access of its own
+    asserts:
+      - notContains:
+          path: rules
+          content:
+            apiGroups: ["apps"]
+            resources: ["deployments"]
+            verbs: ["get", "patch"]
   - it: lets rotation roll only the gateway Deployment
     set:
       enrollment.enabled: true
@@ -20,6 +48,12 @@ tests:
             apiGroups: ["apps"]
             resources: ["deployments"]
             resourceNames: ["grid-gateway"]
+            verbs: ["get", "patch"]
+      - notContains:
+          path: rules
+          content:
+            apiGroups: ["apps"]
+            resources: ["deployments"]
             verbs: ["get", "patch"]
   - it: grants no Deployment access without rotation
     set:

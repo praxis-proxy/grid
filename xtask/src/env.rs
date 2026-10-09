@@ -5820,6 +5820,8 @@ fn rbac_negative_checks(context: &str) -> Result<(), Box<dyn std::error::Error>>
         ("delete", "secrets", Some("default")),
         ("create", "pods", Some("default")),
         ("get", "pods", Some("default")),
+        ("get", "deployments", Some("default")),
+        ("patch", "deployments", Some("default")),
         ("create", "events", Some("default")),
         ("delete", "gridnetworks.grid.praxis.fast", None),
         ("get", "secrets", Some("kube-system")),

@@ -354,6 +354,45 @@ try_template "$CHART_DIR" "gateway.namespace system with gateway.address" --set-
 try_template "$CHART_DIR" "gateway.namespace system opt-in" --set-string gateway.namespace=kube-system \
   --set gateway.allowSystemNamespace=true
 
+# Deployment grant
+echo ""
+echo "=== Deployment grant ==="
+# The operator's charts grant Deployments only by name (the rotation rule). A delegated
+# gateway's grant is a Role the praxis-gateway chart renders in that gateway's namespace, so an
+# unnamed apps/deployments rule here would reach every Deployment in every bound namespace.
+unnamed_deployment_rules() {
+  yq 'select(.kind == "ClusterRole" or .kind == "Role") | .rules[]
+    | select((.apiGroups | (contains(["apps"]) or contains(["*"])))
+      and (.resources | (contains(["deployments"]) or contains(["*"])))
+      and ((.resourceNames // []) | length == 0))' "$@"
+}
+if render verify-deploygrant "$CHART_DIR" --namespace grid-system; then
+  if [ -z "$(unnamed_deployment_rules <<<"$RENDERED")" ]; then
+    pass "no unnamed Deployment rule in the operator chart"
+  else
+    fail "operator chart grants Deployments without resourceNames: $(unnamed_deployment_rules -o json <<<"$RENDERED" | jq -c .)"
+  fi
+fi
+if render verify-deploygrant "$CHART_DIR" --namespace grid-system "${ENROLL_SET[@]}"; then
+  if [ -z "$(unnamed_deployment_rules <<<"$RENDERED")" ]; then
+    pass "no unnamed Deployment rule in the operator chart while rotating"
+  else
+    fail "operator chart grants Deployments without resourceNames while rotating: $(unnamed_deployment_rules -o json <<<"$RENDERED" | jq -c .)"
+  fi
+  # The named rotation rule proves the filter above sees Deployment rules at all.
+  if yq 'select(.kind == "ClusterRole") | .rules[] | select(.resources | contains(["deployments"])) | .resourceNames[]' <<<"$RENDERED" \
+    | matches -x grid-gateway; then
+    pass "rotation keeps its named Deployment rule"
+  else
+    fail "rotation lost its named Deployment rule"
+  fi
+fi
+if [ -z "$(unnamed_deployment_rules deploy/operator/cluster-role-resources.yaml)" ]; then
+  pass "no unnamed Deployment rule in deploy/operator"
+else
+  fail "deploy/operator grants Deployments without resourceNames: $(unnamed_deployment_rules -o json deploy/operator/cluster-role-resources.yaml | jq -c .)"
+fi
+
 # ── Schema rejection ────────────────────────────────────────────────
 echo ""
 echo "=== Schema rejection ==="
@@ -1281,6 +1320,16 @@ if [ "${KIND:-}" = "1" ] || [ "${1:-}" = "--kind" ]; then
     fail "kind: rbac added namespace — got: $RBAC_RESULT"
   fi
 
+  # The operator's chart grants no Deployment access of its own, in any bound namespace.
+  for ns in grid-system added-ns; do
+    RBAC_RESULT=$(kubectl --context "$KCTX" auth can-i get deployments.apps -n "$ns" --as="$SA" 2>/dev/null || true)
+    if [ "$RBAC_RESULT" = "no" ]; then
+      pass "kind: rbac no Deployment access from the operator chart ($ns)"
+    else
+      fail "kind: rbac no Deployment access from the operator chart ($ns): got $RBAC_RESULT"
+    fi
+  done
+
   kubectl --context "$KCTX" apply -f - <<'CR_EOF' 2>/dev/null || true
 apiVersion: grid.praxis.fast/v1alpha1
 kind: GridSite
@@ -1340,11 +1389,14 @@ CR_EOF
   GW_IMAGE="${GRID_GATEWAY_CI_IMAGE:-registry.k8s.io/pause}"
   GW_TAG="${GRID_GATEWAY_CI_TAG:-3.9}"
 
+  # Delegation on, so the chart also renders the operator's Role for this one Deployment.
   if helm install test-gateway "$GW_DIR" \
     --namespace grid-system \
     --kube-context "$KCTX" \
     --set config.existingConfigMap=test-gateway-config \
     --set nameOverride=test-gateway \
+    --set mountReconciliation.enabled=true \
+    --set mountReconciliation.network=helm-test-network \
     --set image.repository="$GW_IMAGE" \
     --set image.tag="$GW_TAG" \
     --set image.pullPolicy=IfNotPresent \
@@ -1360,6 +1412,24 @@ CR_EOF
     fail "kind: gateway deployment not ready"
   fi
 
+  for verb in get patch; do
+    RBAC_RESULT=$(kubectl --context "$KCTX" auth can-i "$verb" deployments.apps/test-gateway -n grid-system --as="$SA" 2>/dev/null || true)
+    if [ "$RBAC_RESULT" = "yes" ]; then
+      pass "kind: delegated gateway lets the operator $verb its Deployment"
+    else
+      fail "kind: delegated gateway lets the operator $verb its Deployment: got $RBAC_RESULT"
+    fi
+  done
+  for denied in "get deployments.apps/other-gateway" "get deployments.apps" "patch deployments.apps" "delete deployments.apps/test-gateway"; do
+    read -r verb resource <<<"$denied"
+    RBAC_RESULT=$(kubectl --context "$KCTX" auth can-i "$verb" "$resource" -n grid-system --as="$SA" 2>/dev/null || true)
+    if [ "$RBAC_RESULT" = "no" ]; then
+      pass "kind: delegated gateway grants no $verb on $resource"
+    else
+      fail "kind: delegated gateway grants no $verb on $resource: got $RBAC_RESULT"
+    fi
+  done
+
   if helm upgrade test-gateway "$GW_DIR" \
     --namespace grid-system \
     --kube-context "$KCTX" \
@@ -1373,6 +1443,14 @@ CR_EOF
     pass "kind: gateway upgrade"
   else
     fail "kind: gateway upgrade"
+  fi
+
+  # The upgrade turned delegation off, and the grant goes with it.
+  RBAC_RESULT=$(kubectl --context "$KCTX" auth can-i get deployments.apps/test-gateway -n grid-system --as="$SA" 2>/dev/null || true)
+  if [ "$RBAC_RESULT" = "no" ]; then
+    pass "kind: the Deployment grant leaves with delegation"
+  else
+    fail "kind: the Deployment grant leaves with delegation: got $RBAC_RESULT"
   fi
 
   if helm uninstall test-gateway --namespace grid-system --kube-context "$KCTX" 2>&1; then

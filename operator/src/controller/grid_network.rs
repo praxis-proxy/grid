@@ -3321,6 +3321,34 @@ fn guarded_deployment_patch(mut patch: Value, deployment: &Deployment) -> Result
     Ok(patch)
 }
 
+/// Map an apiserver error on the delegated Deployment to what it means for the mount status.
+///
+/// A conflict stays a kube error so the caller re-reads and retries. A 403 is a grant the
+/// operator cannot give itself, so it gets its own reason and a message that says where the
+/// grant comes from. Anything else is `fallback`.
+fn delegated_deployment_failure(
+    error: kube::Error,
+    verb: &'static str,
+    fallback: crate::error::GatewayMountFailure,
+) -> OperatorError {
+    if matches!(&error, kube::Error::Api(status) if status.code == 409) {
+        return error.into();
+    }
+    if matches!(&error, kube::Error::Api(status) if status.code == 403) {
+        return mount_failure(
+            "DeploymentForbidden",
+            format!(
+                "the operator's ServiceAccount may not {verb} the delegated Deployment: grant it get and patch on \
+                 that one Deployment (the praxis-gateway chart renders the Role when mountReconciliation is \
+                 enabled; otherwise create one in the gateway namespace), and check that deploymentName matches, \
+                 since a name-restricted grant also refuses a Deployment that does not exist"
+            ),
+        )
+        .into();
+    }
+    fallback.into()
+}
+
 /// Preserve conflict errors so the caller can retry from a fresh Deployment read.
 async fn patch_delegated_deployment(
     deployments: &Api<Deployment>,
@@ -3330,14 +3358,13 @@ async fn patch_delegated_deployment(
     failure_message: &'static str,
 ) -> Result<(), OperatorError> {
     let patch = guarded_deployment_patch(patch, deployment)?;
-    match deployments
+    deployments
         .patch(name, &PatchParams::default(), &Patch::Strategic(patch))
         .await
-    {
-        Ok(_) => Ok(()),
-        Err(error) if matches!(&error, kube::Error::Api(status) if status.code == 409) => Err(error.into()),
-        Err(_) => Err(mount_failure("DeploymentPatchFailed", failure_message).into()),
-    }
+        .map(drop)
+        .map_err(|error| {
+            delegated_deployment_failure(error, "patch", mount_failure("DeploymentPatchFailed", failure_message))
+        })
 }
 
 /// Switch config source, Secret projections, and their revisions in one Pod-template update.
@@ -3418,10 +3445,11 @@ async fn reconcile_delegated_gateway(
         .get_opt(deployment_name)
         .await
         .map_err(|error| {
-            mount_failure(
+            let fallback = mount_failure(
                 "DeploymentReadFailed",
                 format!("could not read the delegated Deployment: {error}"),
-            )
+            );
+            delegated_deployment_failure(error, "get", fallback)
         })?
         .ok_or_else(|| mount_failure("DeploymentMissing", "the delegated Deployment does not exist"))?;
     let chart_managed_serving_tls =
@@ -8859,6 +8887,55 @@ mod tests {
         }
     }
 
+    /// An apiserver `Status` with `code`, as the kube client surfaces one.
+    fn api_error(code: u16) -> kube::Error {
+        kube::Error::Api(Box::new(
+            kube::core::Status::failure("scripted", "Scripted").with_code(code),
+        ))
+    }
+
+    /// A `kube::Client` whose apiserver answers every request with a `Status` of `code`.
+    fn apiserver_answering(code: u16) -> Client {
+        let service = tower::service_fn(move |_req: http::Request<kube::client::Body>| async move {
+            let status = json!({
+                "kind": "Status",
+                "apiVersion": "v1",
+                "status": "Failure",
+                "message": "scripted",
+                "reason": "Scripted",
+                "code": code,
+            });
+            let response = http::Response::builder()
+                .status(code)
+                .body(kube::client::Body::from(
+                    serde_json::to_vec(&status).unwrap_or_else(|_| std::process::abort()),
+                ))
+                .unwrap_or_else(|_| std::process::abort());
+            Ok::<_, std::convert::Infallible>(response)
+        });
+        Client::new(service, "default")
+    }
+
+    /// Patch the delegated Deployment against an apiserver answering `code`, returning the error it raised.
+    async fn patch_refused_by_apiserver(code: u16) -> Result<OperatorError, Box<dyn std::error::Error>> {
+        let deployment: Deployment = serde_json::from_value(json!({
+            "metadata": {"name": "inference-gw", "namespace": "praxis-system", "resourceVersion": "7"}
+        }))?;
+        let deployments: Api<Deployment> = Api::namespaced(apiserver_answering(code), "praxis-system");
+        match patch_delegated_deployment(
+            &deployments,
+            "inference-gw",
+            &deployment,
+            json!({"metadata": {}}),
+            "the staged patch was refused",
+        )
+        .await
+        {
+            Ok(()) => Err(format!("a {code} from the apiserver must not look like a successful patch").into()),
+            Err(error) => Ok(error),
+        }
+    }
+
     fn make_consumer_config(cm_name: &str) -> ConsumerConfig {
         ConsumerConfig {
             enabled: true,
@@ -9372,6 +9449,74 @@ mod tests {
             assert_eq!(status.phase, expected_phase, "incorrect phase for {reason}");
             assert_eq!(status.reason, reason, "status must retain the specific failure reason");
         }
+    }
+
+    #[test]
+    fn a_forbidden_delegated_deployment_reports_the_missing_grant() {
+        let gateway = make_gw_ref("inference-gw", "praxis-system");
+        for verb in ["get", "patch"] {
+            let fallback = mount_failure("DeploymentReadFailed", "unused");
+            let error = delegated_deployment_failure(api_error(403), verb, fallback);
+            let status = mount_reconciliation_status_error(&gateway, None, &error, 7);
+            assert_eq!(
+                status.reason, "DeploymentForbidden",
+                "a 403 on {verb} is a missing grant, not a generic read or patch failure"
+            );
+            assert!(
+                status.message.contains(&format!("may not {verb}")) && status.message.contains("deploymentName"),
+                "the message must name the refused verb and point at deploymentName: {}",
+                status.message
+            );
+            assert_eq!(
+                status.phase,
+                MountReconciliationPhase::Error,
+                "a missing grant is an error, not a wait"
+            );
+        }
+    }
+
+    #[test]
+    fn a_conflicting_delegated_deployment_write_still_retries() {
+        let fallback = mount_failure("DeploymentPatchFailed", "unused");
+        let error = delegated_deployment_failure(api_error(409), "patch", fallback);
+        assert!(
+            error.is_conflict(),
+            "a 409 must stay a kube conflict so the caller re-reads and retries"
+        );
+    }
+
+    #[test]
+    fn other_delegated_deployment_errors_keep_the_callers_reason() {
+        let gateway = make_gw_ref("inference-gw", "praxis-system");
+        for code in [401, 404, 422, 500] {
+            let fallback = mount_failure("DeploymentPatchFailed", "the staged patch was refused");
+            let error = delegated_deployment_failure(api_error(code), "patch", fallback);
+            let status = mount_reconciliation_status_error(&gateway, None, &error, 7);
+            assert_eq!(
+                status.reason, "DeploymentPatchFailed",
+                "a {code} is the caller's own failure"
+            );
+            assert_eq!(
+                status.message, "the staged patch was refused",
+                "the caller's message is kept for a {code}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refused_delegated_deployment_patch_reports_forbidden() -> Result<(), Box<dyn std::error::Error>> {
+        let gateway = make_gw_ref("inference-gw", "praxis-system");
+        for (code, reason) in [(403, "DeploymentForbidden"), (500, "DeploymentPatchFailed")] {
+            let error = Box::pin(patch_refused_by_apiserver(code)).await?;
+            let status = mount_reconciliation_status_error(&gateway, None, &error, 7);
+            assert_eq!(status.reason, reason, "a {code} on patch must surface as {reason}");
+        }
+        let error = Box::pin(patch_refused_by_apiserver(409)).await?;
+        assert!(
+            error.is_conflict(),
+            "a 409 on patch must stay a conflict for the retry loop"
+        );
+        Ok(())
     }
 
     #[test]

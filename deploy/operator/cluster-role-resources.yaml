@@ -71,8 +71,14 @@ rules:
   - apiGroups: [""]
     resources: ["configmaps"]
     verbs: ["get", "create", "patch", "update"]
-  # Delegated consumer gateway reconciliation reads one declared Deployment
-  # and patches only named volumes, mounts, and pod-template revision annotations.
-  - apiGroups: ["apps"]
-    resources: ["deployments"]
-    verbs: ["get", "patch"]
+
+  # Deployments (namespaced)
+  #
+  # Not granted here. A gateway that delegates its Secret mounts to the
+  # operator (consumerConfig.mountReconciliation) grants get and patch on
+  # its own Deployment, by name, through a Role in its namespace: the
+  # praxis-gateway chart renders that Role when mountReconciliation is
+  # enabled, and docs/architecture/operations.md shows the hand-written
+  # equivalent. That Role is the whole of the operator's Deployment
+  # access. The opt-in annotations the operator checks before patching
+  # are its own safety checks, not an RBAC restriction.
