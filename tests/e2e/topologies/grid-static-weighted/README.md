@@ -74,22 +74,54 @@ freedom and critical value `5.991` at `alpha = 0.05`. Random sampling can vary;
 the test evaluates the complete distribution rather than requiring exact
 percentages.
 
-Run with fresh locally built images, unique tags, and a dedicated Kind context.
-The full two-run handoff is in `STATIC_WEIGHTED_E2E_HANDOFF.md`.
+## Run the qualification
 
-```bash
-export GRID_XTASK_IMAGE_PULL_POLICY=Never
+The qualification requires Docker, Kind, `kubectl`, Helm, OpenSSL, Cargo, and
+a compatible Praxis AI gateway image. Run it in a dedicated checkout and do
+not run concurrent Forge qualifications that share the same state or resource
+names.
+
+For source validation, build the Grid operator from this checkout and build a
+compatible Praxis AI gateway image from its repository:
+
+```console
+# From the Grid repository root.
+cargo build -p forge
+IMAGE_TAG="grid-static-weighted-$(date -u +%Y%m%d%H%M%S)"
+docker build -f deploy/operator/Containerfile -t "grid-operator:${IMAGE_TAG}" .
+
+# From the compatible Praxis AI repository root.
+docker build -f Containerfile -t "praxis-ai:${IMAGE_TAG}" .
+```
+
+Materialize the simulator and select the images explicitly. With
+`GRID_XTASK_IMAGE_PULL_POLICY=Never`, every selected image must be present in
+the local container store so the runner can load it into the run-owned Kind
+clusters:
+
+```console
+docker pull ghcr.io/llm-d/llm-d-inference-sim:v0.10.2
+
+export GRID_XTASK_OPERATOR_IMAGE="grid-operator:${IMAGE_TAG}"
+export GRID_XTASK_GATEWAY_IMAGE="praxis-ai:${IMAGE_TAG}"
 export GRID_XTASK_SIM_IMAGE=ghcr.io/llm-d/llm-d-inference-sim:v0.10.2
+export GRID_XTASK_IMAGE_PULL_POLICY=Never
+
+EVIDENCE_DIR="$(mktemp -d)"
 cargo xtask env run-grid-static-weighted-qualification \
   --forge-config tests/e2e/topologies/grid-static-weighted/forge.yaml \
   --quick --teardown \
-  --evidence-dir tests/e2e/topologies/grid-static-weighted/evidence/run-1
+  --evidence-dir "$EVIDENCE_DIR"
 ```
 
-The qualification owns only its named Forge resources. With `--teardown`, it
-removes its client pod, port-forwards, clusters, and Docker network. Keep
-evidence outside tracked source or under the topology's ignored evidence path.
-For failures, compare configured/local/remote/rendered weights, then the three
-revision fields and gateway identity before changing timeouts. The ordinary
-round-robin qualification remains the compatibility check for non-weighted
-routing.
+Registry-hosted images may be used with immutable references and
+`GRID_XTASK_IMAGE_PULL_POLICY=IfNotPresent`; set all image overrides to the
+registry references in that case. Do not mix a local source image with an
+unrelated registry image when validating one source revision.
+
+The qualification records structured evidence for the selected source
+revision. Each execution owns only the resources it creates, and teardown
+removes those run-owned resources. For failures, compare configured, local,
+remote, and rendered weights, then the three revision fields and gateway
+identity before changing timeouts. The ordinary round-robin qualification
+remains the compatibility check for non-weighted routing.
