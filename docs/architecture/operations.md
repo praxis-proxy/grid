@@ -743,7 +743,7 @@ the same identity.
 
 Local development with `xtask env` maps overlay site
 identities to generated `gateway-{site}` load-balancer
-entries; see `xtask/src/env/operator_overlay.rs`.
+entries; see `crates/xtask/src/env/operator_overlay.rs`.
 
 ### Routing overlay delivery
 
@@ -1369,7 +1369,7 @@ images must exist in the local container daemon:
 |---|---|---|
 | `localhost/praxis-ai:llmd-ext-proc` | AI repository external checkout | All provider and consumer gateways |
 | `localhost/praxis-ai-mock-epp:latest` | AI repository external checkout | All provider gateways |
-| `grid-mock-providers:latest` | This repository, `mock-providers/Containerfile` | Provider clusters with `backend = "mock-openai"` only |
+| `grid-mock-providers:latest` | This repository, `crates/mock-providers/Containerfile` | Provider clusters with `backend = "mock-openai"` only |
 
 This table applies to the generic `xtask env` harness above
 (`validate-all`, `verify-swim-mesh-three-node`,
@@ -1378,7 +1378,7 @@ path that consumes these two locally-built defaults directly.
 The named demos (`grid-glb-demo`, `grid-combined-site`,
 `grid-llmd-pool-metrics`) do **not** need them — they override
 `GRID_XTASK_GATEWAY_IMAGE`/`GRID_XTASK_MOCK_EPP_IMAGE`
-(see `xtask/src/env/image_overrides.rs`) with published
+(see `crates/xtask/src/env/image_overrides.rs`) with published
 `ghcr.io/praxis-proxy/ai` images and never build
 from an AI repository checkout.
 
@@ -1401,7 +1401,7 @@ the AI repository source tree. Build `grid-mock-providers:latest` separately
 from this repository:
 
 ```bash
-docker build -t grid-mock-providers:latest -f mock-providers/Containerfile .
+docker build -t grid-mock-providers:latest -f crates/mock-providers/Containerfile .
 ```
 
 ### What `xtask env` does NOT do

@@ -38,7 +38,7 @@ models = []
 role = "consumer"
 
 [providers]
-openai     = { port = 10001 }
-anthropic  = { port = 10002 }
-bedrock    = { port = 10003, region = "us-east-1" }
-vertex     = { port = 10004, project = "test-project" }
+openai = { port = 10001 }
+anthropic = { port = 10002 }
+bedrock = { port = 10003, region = "us-east-1" }
+vertex = { port = 10004, project = "test-project" }

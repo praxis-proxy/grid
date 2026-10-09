@@ -6,7 +6,7 @@ CONTAINER_ENGINE ?= $(shell command -v podman 2>/dev/null || command -v docker 2
 V                ?=
 NIGHTLY_RUSTFMT   ?= nightly-2026-03-28
 KIND_CLUSTER_NAME ?= praxis-grid
-PROJECT_IMAGE    ?= praxis-grid:dev
+PROJECT_IMAGE    ?= grid-operator:dev
 
 ifneq ($(V),)
   _NOCAPTURE := -- --nocapture
@@ -30,7 +30,7 @@ endif
 # All
 # -------------------------------------------------------------------
 
-all: build fmt lint test audit
+all: build fmt lint doc test audit
 
 # -------------------------------------------------------------------
 # Build
@@ -67,16 +67,17 @@ lint: gateway-lint
 	cargo machete
 
 gateway-lint:
-	cargo clippy --manifest-path gateway/Cargo.toml --workspace --all-targets -- -D warnings
-	cargo +$(NIGHTLY_RUSTFMT) fmt --manifest-path gateway/Cargo.toml --all -- --check
-	cargo machete gateway
+	cargo clippy --manifest-path crates/gateway/Cargo.toml --workspace --all-targets -- -D warnings
+	cargo +$(NIGHTLY_RUSTFMT) fmt --manifest-path crates/gateway/Cargo.toml --all -- --check
+	cargo machete crates/gateway
 	@set -eu; \
-	  tree="$$(cargo tree --manifest-path gateway/Cargo.toml -p gateway -e normal --target all --prefix none --format '{p}')"; \
+	  tree="$$(cargo tree --manifest-path crates/gateway/Cargo.toml -p gateway -e normal --target all --prefix none --format '{p}')"; \
 	  printf '%s\n' "$$tree" | grep -q '^openssl-sys ' || { echo "positive control failed: openssl-sys is not in the tree" >&2; exit 1; }; \
 	  if printf '%s\n' "$$tree" | grep -q '^ring '; then echo "ring is in the gateway's normal dependency tree" >&2; exit 1; fi
 
 fmt:
 	cargo +$(NIGHTLY_RUSTFMT) fmt --all
+	cargo +$(NIGHTLY_RUSTFMT) fmt --manifest-path crates/gateway/Cargo.toml --all
 
 doc:
 	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --document-private-items
@@ -94,7 +95,7 @@ codegen-check:
 	cargo run --quiet -p xtask -- check-api-types
 
 # Regenerate the CRD manifests in deploy/crds and charts/grid-operator/templates/crds
-# from the Rust types in operator/src/crd.
+# from the Rust types in crates/operator/src/crd.
 generate-crds:
 	./scripts/generate-deployment-crds.sh
 
@@ -126,7 +127,8 @@ coverage:
 		--exclude xtask \
 		--ignore-filename-regex '(target/|tests/)'
 
-# Coverage gate is 80% lines; ratchet up incrementally.
+# Root coverage gate is 80% lines; exclusions match the coverage target.
+# Gateway is a separate workspace and is not included in this report.
 coverage-check:
 	cargo llvm-cov --workspace --json \
 		--exclude xtask \
@@ -164,11 +166,11 @@ ifndef CONTAINER_ENGINE
 	$(error No container engine found. Install podman or docker)
 endif
 
+# Generic development targets build the control-plane operator image.
 container: | require-container-engine
-	$(CONTAINER_ENGINE) build $(BUILD_ARGS) -t $(PROJECT_IMAGE) -f Containerfile .
+	$(CONTAINER_ENGINE) build $(BUILD_ARGS) -t $(PROJECT_IMAGE) -f deploy/operator/Containerfile .
 
-images: | require-container-engine
-	$(CONTAINER_ENGINE) build $(BUILD_ARGS) -t $(PROJECT_IMAGE) -f Containerfile .
+images: container
 
 operator-image: | require-container-engine
 	$(CONTAINER_ENGINE) build $(BUILD_ARGS) -f deploy/operator/Containerfile -t grid-operator:latest .
@@ -177,10 +179,10 @@ gateway-image: | require-container-engine
 	$(CONTAINER_ENGINE) build $(BUILD_ARGS) -f deploy/gateway/Containerfile -t grid-gateway:latest .
 
 mock-providers-image: | require-container-engine
-	$(CONTAINER_ENGINE) build $(BUILD_ARGS) -f mock-providers/Containerfile -t grid-mock-providers:latest .
+	$(CONTAINER_ENGINE) build $(BUILD_ARGS) -f crates/mock-providers/Containerfile -t grid-mock-providers:latest .
 
 overlay-sync-image: | require-container-engine
-	$(CONTAINER_ENGINE) build $(BUILD_ARGS) -f overlay-sync/Containerfile -t grid-overlay-sync:latest .
+	$(CONTAINER_ENGINE) build $(BUILD_ARGS) -f crates/overlay-sync/Containerfile -t grid-overlay-sync:latest .
 
 fleet-dashboard-image: | require-container-engine
 	$(CONTAINER_ENGINE) build $(BUILD_ARGS) -f crates/fleet-dashboard/Containerfile -t grid-fleet-dashboard:latest .
@@ -194,7 +196,7 @@ fleet-dashboard-web:
 # GLB demo images — deterministic :glb-demo tags, no :latest dependency.
 glb-demo-images: | require-container-engine
 	$(CONTAINER_ENGINE) build $(BUILD_ARGS) -f deploy/operator/Containerfile -t grid-operator:glb-demo .
-	$(CONTAINER_ENGINE) build $(BUILD_ARGS) -f mock-providers/Containerfile -t grid-mock-providers:glb-demo .
+	$(CONTAINER_ENGINE) build $(BUILD_ARGS) -f crates/mock-providers/Containerfile -t grid-mock-providers:glb-demo .
 
 # -------------------------------------------------------------------
 # Helm
@@ -229,8 +231,7 @@ dev-env: images
 	KIND_CLUSTER_NAME=$(KIND_CLUSTER_NAME) \
 	bash hack/setup-kind.sh
 
-dev-push: | require-container-engine
-	$(CONTAINER_ENGINE) build $(BUILD_ARGS) -t $(PROJECT_IMAGE) -f Containerfile .
+dev-push: container
 	kind load docker-image $(PROJECT_IMAGE) --name $(KIND_CLUSTER_NAME)
 
 # -------------------------------------------------------------------
@@ -238,7 +239,7 @@ dev-push: | require-container-engine
 # -------------------------------------------------------------------
 
 setup-hooks:
-	@ln -sf ../../.hooks/pre-commit .git/hooks/pre-commit
+	git config core.hooksPath .hooks
 	@echo "Git hooks installed"
 
 # -------------------------------------------------------------------
@@ -253,7 +254,7 @@ help:
 	@echo "  PROJECT_IMAGE      container image tag"
 	@echo ""
 	@echo "Top-level:"
-	@echo "  all              build + fmt + lint + test + audit"
+	@echo "  all              build + fmt + lint + doc + test + audit"
 	@echo ""
 	@echo "Build:"
 	@echo "  build            cargo build --workspace"
@@ -268,7 +269,7 @@ help:
 	@echo "  lint             root checks + gateway-lint"
 	@echo "  gateway-lint     Gateway Clippy + rustfmt + machete + no-ring check"
 	@echo "  lint-extra       typos + taplo + shellcheck + actionlint"
-	@echo "  fmt              format with nightly rustfmt"
+	@echo "  fmt              format root + Gateway with nightly rustfmt"
 	@echo "  doc              build docs with warnings denied"
 	@echo "  audit            cargo audit + cargo deny"
 	@echo "  coverage         HTML coverage report"
@@ -283,8 +284,8 @@ help:
 	@echo "  praxis-gateway-e2e  Forge Kind run of the standalone gateway chart"
 	@echo ""
 	@echo "Container:"
-	@echo "  container            build container image"
-	@echo "  images               build container image"
+	@echo "  container            build operator image as PROJECT_IMAGE"
+	@echo "  images               alias for container"
 	@echo "  operator-image       build operator container image"
 	@echo "  gateway-image        build gateway container image"
 	@echo "  mock-providers-image build mock-providers container image"
@@ -298,7 +299,7 @@ help:
 	@echo "  kind-down        delete cluster"
 	@echo ""
 	@echo "Dev Setup:"
-	@echo "  setup-hooks      install git pre-commit hook"
+	@echo "  setup-hooks      use .hooks in this repository and its worktrees"
 	@echo ""
 	@echo "Development:"
 	@echo "  dev-env          build image + create/reuse Kind development base"

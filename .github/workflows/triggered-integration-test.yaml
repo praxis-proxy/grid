@@ -601,7 +601,7 @@ jobs:
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: grid
-          file: grid/mock-providers/Containerfile
+          file: grid/crates/mock-providers/Containerfile
           push: false
           load: true
           tags: grid-mock-providers:${{ steps.tags.outputs.tag }}

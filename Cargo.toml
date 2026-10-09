@@ -1,20 +1,21 @@
 [workspace]
 resolver = "3"
 members = [
-    "certs",
-    "crdt",
-    "enrollment",
-    "crates/fleet-dashboard",
-    "mock-providers",
-    "operator",
-    "overlay-sync",
-    "scoring",
-    "signals",
-    "signals-client",
-    "swim",
-    "version",
-    "xtask",
+  "crates/certs",
+  "crates/crdt",
+  "crates/enrollment",
+  "crates/fleet-dashboard",
+  "crates/mock-providers",
+  "crates/operator",
+  "crates/overlay-sync",
+  "crates/scoring",
+  "crates/signals",
+  "crates/signals-client",
+  "crates/swim",
+  "crates/version",
+  "crates/xtask",
 ]
+exclude = ["crates/gateway"]
 
 [workspace.package]
 version = "0.2.0"
@@ -23,62 +24,84 @@ rust-version = "1.96"
 license = "Apache-2.0"
 
 [workspace.dependencies]
-version = { path = "version" }
+version = { path = "crates/version" }
 aes-gcm = "0.11.1"
 axum = "0.8.9"
 bytes = "1.12.1"
 clap = { version = "4.6.6", features = ["derive"] }
-bincode = { version = "2", default-features = false, features = ["std", "serde"] }
+bincode = { version = "2.0.0", default-features = false, features = ["std", "serde"] }
 dashmap = "6.2.1"
 foca = { version = "1.0.0", features = ["std", "tracing", "bincode-codec"] }
 futures = "0.3.34"
 http = "1.5.0"
-http-body-util = "0.1"
-httpdate = "1"
-hyper = { version = "1", features = ["client", "http1"] }
-hyper-openssl = { version = "0.10", default-features = false, features = ["client-legacy", "tokio"] }
-hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "native-tokio", "ring"] }
-hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "tokio"] }
+http-body-util = "0.1.0"
+httpdate = "1.0.0"
+hyper = { version = "1.0.0", features = ["client", "http1"] }
+hyper-openssl = { version = "0.10.0", default-features = false, features = [
+  "client-legacy",
+  "tokio",
+] }
+hyper-rustls = { version = "0.27.0", default-features = false, features = [
+  "http1",
+  "native-tokio",
+  "ring",
+] }
+hyper-util = { version = "0.1.0", features = ["client", "client-legacy", "http1", "tokio"] }
 k8s-openapi = { version = "0.28.0", features = ["v1_32"] }
 kube = { version = "4.2.0", default-features = false, features = ["client", "derive", "runtime"] }
-openssl = "0.10"
-openssl-sys = "0.9"
+openssl = "0.10.0"
+openssl-sys = "0.9.0"
 pem = "4.0.0"
-percent-encoding = "2.3"
-prometheus = "0.14"
+percent-encoding = "2.3.0"
+prometheus = "0.14.0"
 promql-parser = "0.11.0"
 rcgen = "0.14.9"
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "stream"] }
-ring = "0.17"
+ring = "0.17.0"
 rmcp = { version = "3.1.4", default-features = false, features = [
-    "client",
-    "transport-streamable-http-client-reqwest",
+  "client",
+  "transport-streamable-http-client-reqwest",
 ] }
-rustls = { version = "0.23", default-features = false, features = ["logging", "std", "tls12"] }
+rustls = { version = "0.23.0", default-features = false, features = ["logging", "std", "tls12"] }
 schemars = "1.2.2"
-sha2 = "0.10"
-hmac = "0.12"
+sha2 = "0.10.0"
+hmac = "0.12.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
-serde_json_canonicalizer = "0.3"
-serde_yaml = "0.9"
+serde_json_canonicalizer = "0.3.0"
+serde_yaml = "0.9.0"
 socket2 = "0.6.5"
 spiffe = { version = "0.16.1", default-features = false, features = ["x509"] }
 # TLS backend left to the consumer (enrollment picks rustls or system openssl).
-sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "postgres", "uuid", "time", "json", "migrate"] }
+sqlx = { version = "0.9.0", default-features = false, features = [
+  "runtime-tokio",
+  "postgres",
+  "uuid",
+  "time",
+  "json",
+  "migrate",
+] }
 thiserror = "2.0.20"
-time = { version = "0.3", features = ["formatting", "parsing"] }
-tokio = { version = "1.53.1", features = ["macros", "rt", "rt-multi-thread", "signal", "net", "time", "io-util"] }
-tokio-openssl = "0.6"
-tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12"] }
+time = { version = "0.3.0", features = ["formatting", "parsing"] }
+tokio = { version = "1.53.1", features = [
+  "macros",
+  "rt",
+  "rt-multi-thread",
+  "signal",
+  "net",
+  "time",
+  "io-util",
+] }
+tokio-openssl = "0.6.0"
+tokio-rustls = { version = "0.26.0", default-features = false, features = ["logging", "tls12"] }
 toml = "1.1.4"
 tower = "0.5.3"
 tracing = "0.1.44"
-rand = { version = "0.9", features = ["small_rng"] }
+rand = { version = "0.9.0", features = ["small_rng"] }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 uuid = { version = "1.26.0", features = ["v4"] }
-x509-parser = "0.18"
-zeroize = "1.9"
+x509-parser = "0.18.0"
+zeroize = "1.9.0"
 
 [profile.release]
 lto = true

@@ -1,0 +1,81 @@
+[package]
+name = "enrollment"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "enrollment"
+path = "src/main.rs"
+
+[features]
+default = ["tls-rustls", "sar", "bootstrap"]
+tls-rustls = [
+  "certs/rcgen",
+  "certs/verifier",
+  "dep:tokio-rustls",
+  "dep:rustls",
+  "dep:ring",
+  "axum-server/tls-rustls-no-provider",
+  "sqlx/tls-rustls-ring",
+  # kube's client needs a TLS backend to reach the API server; rustls off ring
+  # on the non-fips path. Only bites when kube is enabled (sar or bootstrap).
+  "kube?/rustls-tls",
+  "reqwest?/rustls-no-provider",
+]
+# sqlx still links sha2/md-5 for Postgres password auth, unused under the client-cert auth fips uses.
+fips = [
+  "certs/fips",
+  "dep:tokio-openssl",
+  "dep:openssl",
+  "axum-server/tls-openssl",
+  "sqlx/tls-native-tls",
+  # kube's TLS backend must be openssl under fips, not rustls/ring.
+  "kube?/openssl-tls",
+  "reqwest?/native-tls",
+]
+# Reuse Kubernetes RBAC for operator authorization (TokenReview + SubjectAccessReview).
+sar = ["dep:kube", "dep:k8s-openapi"]
+bootstrap = ["dep:clap", "dep:kube", "dep:k8s-openapi", "dep:reqwest", "dep:zeroize"]
+
+[dependencies]
+version.workspace = true
+axum = { workspace = true }
+certs = { path = "../certs", default-features = false }
+clap = { workspace = true, optional = true, features = ["env"] }
+kube = { workspace = true, optional = true }
+k8s-openapi = { workspace = true, optional = true }
+serde = { workspace = true }
+ring = { workspace = true, optional = true }
+sqlx = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true, features = ["parsing", "serde-well-known"] }
+tokio = { workspace = true }
+tokio-openssl = { workspace = true, optional = true }
+tokio-rustls = { workspace = true, optional = true }
+tower = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true, features = ["serde"] }
+axum-server = { version = "0.8.0", default-features = false }
+rustls = { workspace = true, optional = true }
+openssl = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }
+zeroize = { workspace = true, optional = true }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+reqwest = { workspace = true, features = ["rustls-no-provider"] }
+rustls = { workspace = true, features = ["ring"] }
+uuid = { workspace = true, features = ["serde"] }
+socket2 = { workspace = true }
+http-body-util = { workspace = true }
+rcgen = { workspace = true }
+time = { workspace = true }
+tower = { workspace = true }
+x509-parser = { workspace = true }

@@ -170,23 +170,27 @@ jobs:
           cargo clippy -p certs --no-default-features --features fips --all-targets -- -D warnings
           cargo clippy -p enrollment --no-default-features --features fips --all-targets -- -D warnings
           cargo clippy -p enrollment --no-default-features --features fips,sar,bootstrap --bins -- -D warnings
-          cargo clippy --manifest-path operator/Cargo.toml --no-default-features --features fips --lib --bins -- -D warnings
-          cargo clippy --manifest-path overlay-sync/Cargo.toml --no-default-features --features fips --bins -- -D warnings
+          cargo clippy --manifest-path crates/operator/Cargo.toml --no-default-features --features fips --lib --bins -- -D warnings
+          cargo clippy --manifest-path crates/overlay-sync/Cargo.toml --no-default-features --features fips --bins -- -D warnings
 
       - name: Unit tests (fips)
         run: |
           cargo test -p certs --no-default-features --features fips
           cargo test -p enrollment --no-default-features --features fips
           cargo test -p enrollment --no-default-features --features fips,sar,bootstrap --bins
-          cargo test --manifest-path operator/Cargo.toml --no-default-features --features fips
-          cargo test --manifest-path overlay-sync/Cargo.toml --no-default-features --features fips
+          cargo test --manifest-path crates/operator/Cargo.toml --no-default-features --features fips
+          cargo test --manifest-path crates/overlay-sync/Cargo.toml --no-default-features --features fips
 
       # fips must exclude rustls: TLS routes through system OpenSSL. ring stays
       # present at the operator level (swim gossip), outside the TLS boundary, so
       # it is asserted per-crate for certs, not operator-wide.
       - name: Assert fips build excludes rustls
         run: |
-          for m in operator/Cargo.toml overlay-sync/Cargo.toml; do
+          for m in crates/operator/Cargo.toml crates/overlay-sync/Cargo.toml; do
+            if ! cargo tree --manifest-path "$m" --no-default-features --features fips -e normal >/dev/null; then
+              echo "cannot resolve $m for the fips check"
+              exit 1
+            fi
             if cargo tree --manifest-path "$m" --no-default-features --features fips -e normal -i rustls >/dev/null 2>&1; then
               echo "fips build of $m unexpectedly links rustls"
               exit 1
@@ -258,7 +262,7 @@ jobs:
               exit 1
             fi
           done
-          for m in operator/Cargo.toml overlay-sync/Cargo.toml; do
+          for m in crates/operator/Cargo.toml crates/overlay-sync/Cargo.toml; do
             if cargo tree --manifest-path "$m" --no-default-features --features fips -e no-dev 2>/dev/null | grep -q 'openssl-src'; then
               echo "fips build of $m unexpectedly vendors openssl (openssl-src)"
               exit 1

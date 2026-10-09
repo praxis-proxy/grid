@@ -263,7 +263,7 @@ jobs:
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
-          file: mock-providers/Containerfile
+          file: crates/mock-providers/Containerfile
           push: true
           tags: |
             ${{ env.MOCK_PROVIDERS_IMAGE_NAME }}:${{ needs.validate.outputs.tag }}
@@ -287,7 +287,7 @@ jobs:
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
-          file: overlay-sync/Containerfile
+          file: crates/overlay-sync/Containerfile
           push: true
           tags: |
             ${{ env.OVERLAY_SYNC_IMAGE_NAME }}:${{ needs.validate.outputs.tag }}
