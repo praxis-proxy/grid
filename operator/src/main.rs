@@ -2017,19 +2017,21 @@ async fn signals_handler(
 
     // Local, the site's own data plane, gets the whole grid view unscoped.
     // Access policy bounds peer reads, not the site reading itself.
+    let now = operator::signals::ClockReading::now();
     let (body, oldest) = match &caller {
         Caller::Local => {
             // One body under the gateway's read ceiling: the site first, so a
             // flood of relayed rows can only cost the last peers, never this site.
             let site = published
                 .site
-                .render_bounded(target, &collect, operator::signals::MAX_RELAY_BYTES);
+                .render_bounded(target, &collect, operator::signals::MAX_RELAY_BYTES, now);
             // Peers relay only to Local, and the peers store carries no access map.
             // A Peer(Some) relay would need per-target scoping added here.
             let peers = published.peers.render_bounded(
                 target,
                 &collect,
                 operator::signals::MAX_RELAY_BYTES.saturating_sub(site.body.len()),
+                now,
             );
             operator::metrics::record_relay_truncated("site", &site);
             operator::metrics::record_relay_truncated("peers", &peers);
@@ -2037,10 +2039,10 @@ async fn signals_handler(
             body.push_str(&peers.body);
             (body, site.oldest.max(peers.oldest))
         },
-        Caller::Peer(Some(labels)) => published.site.render(target, &collect, Some(labels)),
+        Caller::Peer(Some(labels)) => published.site.render(target, &collect, Some(labels), now),
         Caller::Peer(None) => return refused(),
     };
-    served(body, oldest)
+    served(body, oldest, now.wall)
 }
 
 /// Refuse a caller this site will not serve.
@@ -2057,12 +2059,19 @@ fn refused() -> axum::response::Response {
         .into_response()
 }
 
-/// One exposition response, with `Age` bounding the whole body.
-fn served(body: String, oldest: std::time::Duration) -> axum::response::Response {
+/// One exposition response, with `Age` bounding the whole body and `Date` the
+/// wall reading its stamps were written from.
+///
+/// A reader takes each row's age as `Date` minus its stamp. hyper's own `Date` is
+/// cached and, after a backward clock step, stays frozen for about the size of
+/// the step, which would age every row by that much; an explicit `Date` wins over
+/// it.
+fn served(body: String, oldest: std::time::Duration, wall: SystemTime) -> axum::response::Response {
     (
         [
             (http::header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8"),
             (http::header::AGE, &*oldest.as_secs().to_string()),
+            (http::header::DATE, &*httpdate::fmt_http_date(wall)),
         ],
         body,
     )
@@ -3447,5 +3456,84 @@ mod tests {
         let data = revision_lease_data(&lease);
         assert_eq!(parse_revision_value(&data, REVISION_HIGH_KEY), Some(20));
         assert_eq!(parse_revision_value(&data, NODE_GENERATION_HIGH_KEY), Some(40));
+    }
+
+    #[test]
+    fn a_signals_response_is_dated_from_the_reading_it_was_rendered_at() {
+        let stepped_back = UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000);
+        let response = served(String::new(), std::time::Duration::from_secs(7), stepped_back);
+        let header = |name: http::header::HeaderName| {
+            response
+                .headers()
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned)
+        };
+        assert_eq!(
+            header(http::header::DATE),
+            Some(httpdate::fmt_http_date(stepped_back)),
+            "the Date is the render's wall reading, not the server's cached clock"
+        );
+        assert_eq!(header(http::header::AGE).as_deref(), Some("7"));
+    }
+
+    #[tokio::test]
+    async fn a_relayed_row_reads_its_own_age_against_the_response_date() {
+        let published = Published {
+            site: operator::signals::SignalStore::new(),
+            peers: operator::signals::SignalStore::new(),
+        };
+        published.peers.refresh(
+            BTreeMap::from([("east".to_owned(), vec![row_aged(std::time::Duration::from_secs(30))])]),
+            std::time::Duration::from_secs(60),
+        );
+        let response = signals_handler(
+            axum::extract::State(published),
+            axum::Extension(Caller::Local),
+            axum::extract::Query(Vec::new()),
+        )
+        .await;
+        let date = date_ms_of(&response);
+        let stamp = last_stamp_of(response).await;
+        assert!(
+            (29_000..=31_000).contains(&(date - stamp)),
+            "Date minus the stamp is the row's 30 s age: {}",
+            date - stamp
+        );
+    }
+
+    /// One relayed contract row, already `age` old when collected.
+    fn row_aged(age: std::time::Duration) -> operator::signals::Observation {
+        operator::signals::Observation {
+            metric: "inference_pool_average_queue_size".to_owned(),
+            labels: BTreeMap::from([("grid_provider".to_owned(), "pool-a".to_owned())]),
+            value: 1.0,
+            timestamp_ms: None,
+            age,
+        }
+    }
+
+    /// The `Date` a response carries, epoch milliseconds.
+    fn date_ms_of(response: &axum::response::Response) -> i64 {
+        response
+            .headers()
+            .get(http::header::DATE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|text| httpdate::parse_http_date(text).ok())
+            .and_then(|when| when.duration_since(UNIX_EPOCH).ok())
+            .map(|since| i64::try_from(since.as_millis()).expect("fits i64"))
+            .expect("the response carries its own Date")
+    }
+
+    /// The trailing stamp of the last row a response carries.
+    async fn last_stamp_of(response: axum::response::Response) -> i64 {
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        String::from_utf8_lossy(&body)
+            .trim_end()
+            .rsplit_once(' ')
+            .and_then(|(_, stamp)| stamp.parse().ok())
+            .expect("a stamped row")
     }
 }

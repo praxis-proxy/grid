@@ -606,6 +606,7 @@ fn readiness_entry<'provider>(
         labels: BTreeMap::new(),
         value: count,
         timestamp_ms: None,
+        age: Duration::ZERO,
     });
     // A fresh scrape republishes with the verdict. Without one, the last published
     // entry ages on its own, unless the verdict turned not ready.
@@ -644,6 +645,7 @@ fn ready_sample(verdict: &readiness::Verdict) -> signals::Observation {
         labels: BTreeMap::new(),
         value: if verdict.reason.excludes() { 0.0 } else { 1.0 },
         timestamp_ms: None,
+        age: Duration::ZERO,
     }
 }
 
@@ -6090,6 +6092,7 @@ mod tests {
             labels: BTreeMap::new(),
             value,
             timestamp_ms: None,
+            age: Duration::ZERO,
         };
         assert!(
             matches!(
