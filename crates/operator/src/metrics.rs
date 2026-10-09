@@ -883,6 +883,7 @@ mod tests {
                 .collect(),
             value: 1.0,
             timestamp_ms: None,
+            age: Duration::ZERO,
         };
         let store = crate::signals::SignalStore::new();
         let collector = provider_signals(vec![store.clone()]);
@@ -926,6 +927,7 @@ mod tests {
                 .collect(),
             value,
             timestamp_ms: None,
+            age: Duration::ZERO,
         };
         let local = crate::signals::SignalStore::new();
         local.refresh(
