@@ -456,7 +456,7 @@ fn parse_model_ids(body: &str) -> Result<Vec<String>, Box<dyn std::error::Error>
 
 /// Check whether a JSON value looks like a Chat Completions response.
 ///
-/// Requires a `choices` array — the standard `OpenAI` success shape.
+/// Requires a `choices` array, the standard `OpenAI` success shape.
 /// Rejects error-shaped JSON even if it has other fields.
 fn is_chat_completions_shaped(json: &serde_json::Value) -> bool {
     json.get("error").is_none() && json.get("choices").is_some_and(serde_json::Value::is_array)

@@ -1258,7 +1258,7 @@ fn short_rev(value: &str) -> &str {
 ///
 /// Returns the validated overlays and the shared revision only when, for both
 /// consumers: the overlay is valid, the Grid revision is nonempty, and Praxis's
-/// accepted and serving revisions both equal it — and both consumers share one
+/// accepted and serving revisions both equal it, and both consumers share one
 /// current revision.
 fn convergence_ready(observations: &[ConsumerObservation]) -> Option<(Overlays, String)> {
     if observations.len() != CONSUMERS.len() {

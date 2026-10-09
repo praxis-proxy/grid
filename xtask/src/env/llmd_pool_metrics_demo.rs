@@ -174,8 +174,8 @@ impl MetricsTransport {
 /// Selected via the `--kv-cache` CLI flag. Both flavors share the same
 /// simulator metric transitions and the same overlay score-breakdown display (both
 /// `queue_depth` and `kv_cache` are always shown); only the operator's
-/// `GridNetwork.spec.scoringPolicy.strategy` — and therefore which raw
-/// signal actually produces the `score`/`rank` that drives the A\u{2192}B flip —
+/// `GridNetwork.spec.scoringPolicy.strategy` (and therefore which raw
+/// signal actually produces the `score`/`rank` that drives the A\u{2192}B flip)
 /// changes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ScoringFlavor {
@@ -836,26 +836,26 @@ fn run_proof_scenarios(context: &DemoContext, mode: DemoMode) -> BTreeMap<String
     let mut results = BTreeMap::new();
     let mtls = context.metrics_transport == MetricsTransport::MtlsProxy;
 
-    // Proof 1: Provenance — image digests and config verification
+    // Proof 1: Provenance (image digests and config verification)
     results.insert("provenance".to_owned(), proof_provenance(mtls));
 
-    // Proof 2: Baseline — early state scorecard with production scores
+    // Proof 2: Baseline (early state scorecard with production scores)
     results.insert("baseline".to_owned(), proof_baseline(context));
 
     if mode == DemoMode::Full {
         let table_start = Instant::now();
 
-        // Proof 3: Pressure via consumer gateway — live table with attribution
+        // Proof 3: Pressure via consumer gateway (live table with attribution)
         results.insert(
             "pressure_and_flip".to_owned(),
             proof_pressure_and_flip(context, table_start),
         );
 
-        // Proof 4: Recovery — measured queue drain with live table
+        // Proof 4: Recovery (measured queue drain with live table)
         results.insert("recovery".to_owned(), proof_recovery(context, table_start));
     }
 
-    // TLS proof stages — only in mTLS mode
+    // TLS proof stages, only in mTLS mode
     if mtls {
         let tls_results = run_tls_proof_stages();
         results.extend(tls_results);
@@ -1540,7 +1540,7 @@ fn parse_required_epp_metrics(text: &str) -> Result<EppMetrics, Box<dyn std::err
 ///
 /// Both metrics typically rise together under deterministic simulator pressure.
 /// synthetic load, but the announced phase must key off the signal that
-/// actually drives the active `GridNetwork` scoring strategy — otherwise a
+/// actually drives the active `GridNetwork` scoring strategy; otherwise a
 /// `kvCachePressure` run could narrate "queue pressure" while queue depth
 /// isn't what's producing the rank flip.
 fn pressure_phase_active(flavor: ScoringFlavor, epp: &EppMetrics) -> bool {
@@ -2900,7 +2900,7 @@ const STALE_METRICS_TTL_SECS: u64 = 20;
 /// Check whether a provider is observable in the overlay.
 ///
 /// Returns `true` when a candidate containing `provider_suffix` is present
-/// with a score above zero — meaning the operator successfully scraped its
+/// with a score above zero, meaning the operator successfully scraped its
 /// metrics via TLS. When scraping fails, `UNOBSERVABLE_METRICS` sets
 /// `healthy: false`, which results in a zero score.
 fn is_provider_observable(cluster: &str, provider_suffix: &str) -> bool {
@@ -3171,7 +3171,7 @@ fn compare_restart_snapshots(
             }
         } else {
             observations.push(format!(
-                "{cluster}: operator pod {} (uid={}) replaced — unexpected restart",
+                "{cluster}: operator pod {} (uid={}) replaced (unexpected restart)",
                 bp.name, bp.uid
             ));
             success = false;
@@ -3188,7 +3188,7 @@ fn compare_restart_snapshots(
             .collect();
         if new_pods.is_empty() {
             observations.push(format!(
-                "{cluster}: EPP pod was not replaced after server rotation — expected rollout restart"
+                "{cluster}: EPP pod was not replaced after server rotation (expected rollout restart)"
             ));
         } else {
             for np in &new_pods {
@@ -3239,7 +3239,7 @@ fn compare_restart_snapshots(
 ///
 /// Compares before/after pod snapshots across operator, EPP, and gateway
 /// workloads. The intentional EPP rollout restart from server certificate
-/// rotation is documented and excluded from the failure check — but only
+/// rotation is documented and excluded from the failure check, but only
 /// on the cluster where rotation was actually performed (pool-a).
 fn proof_restart_accounting(
     before: &HashMap<String, RestartSnapshot>,
@@ -3270,7 +3270,7 @@ fn proof_restart_accounting(
 
     if let Some(rc) = rotation_cluster {
         let msg = format!(
-            "server rotation (stage 8) on {rc}: EPP rollout restart is expected — nginx does not reload TLS in-place"
+            "server rotation (stage 8) on {rc}: EPP rollout restart is expected; nginx does not reload TLS in-place"
         );
         eprintln!("    {msg}");
         observations.push(msg);
@@ -3303,54 +3303,54 @@ fn run_tls_proof_stages() -> BTreeMap<String, ProofResult> {
         .map(|c| ((*c).to_owned(), capture_restart_snapshot(c)))
         .collect();
 
-    // Stage 1: Baseline mTLS — verify operator scrapes through TLS
+    // Stage 1: Baseline mTLS (verify operator scrapes through TLS)
     eprintln!();
     eprintln!("  [TLS 1/9] Baseline mTLS");
     results.insert("tls_01_baseline".to_owned(), proof_tls_baseline());
 
-    // Stage 2: Handshake rejection — TLS proxy rejects connection without client cert
+    // Stage 2: Handshake rejection (TLS proxy rejects connection without client cert)
     eprintln!();
     eprintln!("  [TLS 2/9] Handshake rejection");
     results.insert("tls_02_handshake_rejection".to_owned(), proof_tls_handshake_rejection());
 
-    // Stage 3: Missing client identity — delete client cert Secret
+    // Stage 3: Missing client identity (delete client cert Secret)
     eprintln!();
     eprintln!("  [TLS 3/9] Missing client identity");
     results.insert("tls_03_missing_client".to_owned(), proof_tls_missing_client());
 
-    // Stage 4: Wrong CA — replace CA Secret with untrusted CA
+    // Stage 4: Wrong CA (replace CA Secret with untrusted CA)
     eprintln!();
     eprintln!("  [TLS 4/9] Wrong CA");
     results.insert("tls_04_wrong_ca".to_owned(), proof_tls_wrong_ca());
 
-    // Stage 5: Restore valid mTLS — recreate correct Secrets
+    // Stage 5: Restore valid mTLS (recreate correct Secrets)
     eprintln!();
     eprintln!("  [TLS 5/9] Restore valid mTLS");
     results.insert("tls_05_restore".to_owned(), proof_tls_restore());
 
-    // Stage 6: Stale-cache behavior — independent TTL verification
+    // Stage 6: Stale-cache behavior (independent TTL verification)
     eprintln!();
     eprintln!("  [TLS 6/9] Stale-cache TTL");
     results.insert("tls_06_stale_cache".to_owned(), proof_tls_stale_cache());
 
-    // Stage 7: Client Secret rotation — new cert, same CA
+    // Stage 7: Client Secret rotation (new cert, same CA)
     eprintln!();
     eprintln!("  [TLS 7/9] Client Secret rotation");
     results.insert("tls_07_client_rotation".to_owned(), proof_tls_client_rotation());
 
-    // Stage 8: Server cert/CA rotation — new server cert + nginx restart
+    // Stage 8: Server cert/CA rotation (new server cert + nginx restart)
     eprintln!();
     eprintln!("  [TLS 8/9] Server cert rotation");
     let server_rotation = proof_tls_server_rotation();
     let rotation_cluster = server_rotation.success.then_some("pool-a");
     results.insert("tls_08_server_rotation".to_owned(), server_rotation);
 
-    // Stage 9: Existing routing behavior — verify routing after TLS manipulations
+    // Stage 9: Existing routing behavior (verify routing after TLS manipulations)
     eprintln!();
     eprintln!("  [TLS 9/9] Existing routing behavior");
     results.insert("tls_09_routing".to_owned(), proof_tls_routing());
 
-    // Restart accounting — compare before/after snapshots
+    // Restart accounting: compare before/after snapshots
     eprintln!();
     eprintln!("  Restart accounting");
     let after_snapshots: HashMap<String, RestartSnapshot> = CLUSTERS
@@ -3378,12 +3378,12 @@ fn proof_tls_baseline() -> ProofResult {
             let tls_ok = probe_mtls_endpoint(cluster);
             if tls_ok {
                 observations.push(format!(
-                    "{cluster}: NOT observable — TLS transport OK but operator did not ingest metrics into overlay scores \
+                    "{cluster}: NOT observable; TLS transport OK but operator did not ingest metrics into overlay scores \
                      (check operator image contains MetricsConfig implementation)"
                 ));
             } else {
                 observations.push(format!(
-                    "{cluster}: NOT observable — TLS transport also failed \
+                    "{cluster}: NOT observable; TLS transport also failed \
                      (check Secrets and TLS proxy configuration)"
                 ));
             }
@@ -3414,7 +3414,7 @@ fn proof_tls_handshake_rejection() -> ProofResult {
     let ctx = kind_context(cluster);
 
     // Connect to the metrics TLS endpoint without a client certificate.
-    // We use `wget` inside the nginx sidecar — it has network access to
+    // We use `wget` inside the nginx sidecar; it has network access to
     // localhost:9443 but does not present a client cert.
     let output = Command::new("kubectl")
         .args([
@@ -3440,7 +3440,7 @@ fn proof_tls_handshake_rejection() -> ProofResult {
         Ok(o) => {
             if o.status.success() {
                 observations.push(format!(
-                    "{cluster}: metrics endpoint accepted connection WITHOUT client cert — mTLS NOT enforced"
+                    "{cluster}: metrics endpoint accepted connection WITHOUT client cert; mTLS NOT enforced"
                 ));
                 return ProofResult {
                     success: false,
@@ -3500,7 +3500,7 @@ fn proof_tls_missing_client() -> ProofResult {
         ));
     } else {
         observations.push(format!(
-            "{cluster}: provider still observable after client cert removal — fail-closed NOT working"
+            "{cluster}: provider still observable after client cert removal; fail-closed NOT working"
         ));
         return ProofResult {
             success: false,
@@ -3586,7 +3586,7 @@ fn proof_tls_wrong_ca() -> ProofResult {
         ));
     } else {
         observations.push(format!(
-            "{cluster}: provider still observable with wrong CA — CA validation NOT working"
+            "{cluster}: provider still observable with wrong CA; CA validation NOT working"
         ));
         return ProofResult {
             success: false,
@@ -3703,7 +3703,7 @@ fn proof_tls_client_rotation() -> ProofResult {
         ));
     } else {
         observations.push(format!(
-            "{cluster}: provider became unobservable after client rotation — rotation failed"
+            "{cluster}: provider became unobservable after client rotation; rotation failed"
         ));
         return ProofResult {
             success: false,
@@ -3723,7 +3723,7 @@ fn proof_tls_client_rotation() -> ProofResult {
 ///
 /// **Limitation:** nginx does not reload TLS material automatically.
 /// A `rollout restart` of the EPP Deployment is required. This is
-/// documented honestly — the operator handles Secret rotation, but
+/// documented honestly: the operator handles Secret rotation, but
 /// the metrics proxy (nginx) needs a pod restart to load new certs.
 fn proof_tls_server_rotation() -> ProofResult {
     let mut observations = Vec::new();
@@ -3781,7 +3781,7 @@ fn proof_tls_server_rotation() -> ProofResult {
         ));
     } else {
         observations.push(format!(
-            "{cluster}: provider not observable after server rotation — rotation failed"
+            "{cluster}: provider not observable after server rotation; rotation failed"
         ));
         return ProofResult {
             success: false,
@@ -3875,7 +3875,7 @@ fn proof_tls_stale_cache() -> ProofResult {
         let elapsed = pre_break.elapsed().as_secs();
         observations.push(format!(
             "inside-TTL ({elapsed}s/{STALE_METRICS_TTL_SECS}s): {cluster} became unobservable \
-             before TTL expired — cached metrics not served"
+             before TTL expired; cached metrics not served"
         ));
         // Restore before returning
         drop(apply_metrics_client_secret(&ctx, certs_dir));
@@ -3909,7 +3909,7 @@ fn proof_tls_stale_cache() -> ProofResult {
     } else {
         observations.push(format!(
             "post-TTL ({elapsed}s/{STALE_METRICS_TTL_SECS}s): {cluster} still observable \
-             after TTL expired — stale metrics not evicted"
+             after TTL expired; stale metrics not evicted"
         ));
         drop(apply_metrics_client_secret(&ctx, certs_dir));
         wait_for_observable(cluster, cluster, TLS_TRANSITION_TIMEOUT);
@@ -3959,7 +3959,7 @@ fn proof_tls_routing() -> ProofResult {
     // Verify both providers are observable
     for cluster in CLUSTERS {
         if !is_provider_observable(cluster, cluster) && !wait_for_observable(cluster, cluster, TLS_TRANSITION_TIMEOUT) {
-            observations.push(format!("{cluster}: provider NOT observable — routing check impossible"));
+            observations.push(format!("{cluster}: provider NOT observable; routing check impossible"));
             return ProofResult {
                 success: false,
                 description: "Existing routing: inference routing works after TLS manipulations".to_owned(),

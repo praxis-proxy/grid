@@ -186,9 +186,9 @@ const DEFAULT_CONFIG_PATH: &str = "tests/env/config.toml";
 /// Canonical demo root directory derived from a supplied Forge config.
 ///
 /// The parent of the Forge config file is the demo root. All demo-relative
-/// assets — configs, resources, policies, fixtures — resolve from this
-/// directory so that both internal (`tests/e2e/topologies/…`) and external
-/// (`praxis-demos/demos/…`) asset trees are consumed faithfully.
+/// assets (configs, resources, policies, fixtures) resolve from this
+/// directory so that both internal (`tests/e2e/topologies/...`) and external
+/// (`praxis-demos/demos/...`) asset trees are consumed faithfully.
 pub(crate) fn demo_root(forge_config: &Path) -> PathBuf {
     forge_config
         .parent()
@@ -413,7 +413,7 @@ pub(crate) enum Action {
     /// and after the run.
     ///
     /// Requires a kind cluster with Grid CRDs installable (`env up` +
-    /// `env load-gateway-images` are **not** required — this command installs
+    /// `env load-gateway-images` are **not** required; this command installs
     /// the CRDs itself).
     VerifySwimMembership {
         /// Path to the environment config file.
@@ -466,7 +466,7 @@ pub(crate) enum Action {
     /// - `status.phase = Active` and `status.connectedSites >= 1`.
     ///
     /// This proves that CRD-sourced seeds alone are sufficient for mesh
-    /// formation — no env-var seeds are required.
+    /// formation; no env-var seeds are required.
     ///
     /// Requires a kind cluster with Grid CRDs.  Run `env up` first.
     /// Safe to rerun: fixtures are deleted at the start of each run.
@@ -498,11 +498,11 @@ pub(crate) enum Action {
     ///
     /// Runs, in order:
     ///
-    /// 1. `status` — confirm clusters and certs are ready.
-    /// 2. `validate-operator-routing` — overlay generation and Praxis routing.
-    /// 3. `verify-swim-membership` — SWIM gossip drives `phase=Active`.
-    /// 4. `verify-swim-state` — real CRDT state propagates over SWIM.
-    /// 5. `verify-mtls-trust` — mTLS positive + negative cases.
+    /// 1. `status`: confirm clusters and certs are ready.
+    /// 2. `validate-operator-routing`: overlay generation and Praxis routing.
+    /// 3. `verify-swim-membership`: SWIM gossip drives `phase=Active`.
+    /// 4. `verify-swim-state`: real CRDT state propagates over SWIM.
+    /// 5. `verify-mtls-trust`: mTLS positive + negative cases.
     ///
     /// Each step is run even if previous steps fail; all results are collected
     /// and the table is printed at the end.  Exit code is non-zero when any
@@ -587,7 +587,7 @@ pub(crate) enum Action {
     /// required fields are present in the generated schemas.  Exits non-zero
     /// if any field is missing.
     ///
-    /// Does **not** require kind clusters — it runs against the binary output
+    /// Does **not** require kind clusters; it runs against the binary output
     /// of `cargo run -p operator --bin generate_crds`.
     VerifyCrdSchema,
 
@@ -633,7 +633,7 @@ pub(crate) enum Action {
     /// Spawns three operator processes:
     /// - Node A: no seeds (origin).
     /// - Node B: seeds A (bridge).
-    /// - Node C: seeds B only — not A (leaf).
+    /// - Node C: seeds B only, not A (leaf).
     ///
     /// After SWIM gossip, A learns about C transitively through B.  The test proves:
     /// 1. A's `distributedProviderCount >= 2` (received CRDT from both B and C).
@@ -659,8 +659,8 @@ pub(crate) enum Action {
     /// model-east on the east cluster, model-west on the west cluster.  After
     /// SWIM gossip, the east operator's overlay includes model-west as a remote
     /// CRDT-sourced candidate.  A consumer gateway is deployed from that overlay
-    /// and routes requests for both models — model-east via the local east gateway
-    /// and model-west via the CRDT-discovered west gateway — asserting HTTP 200
+    /// and routes requests for both models (model-east via the local east gateway
+    /// and model-west via the CRDT-discovered west gateway), asserting HTTP 200
     /// for both.
     ///
     /// This is the minimal deterministic kind proof of:
@@ -839,7 +839,7 @@ pub(crate) enum Action {
     ///
     /// 10-step deterministic sequence exercising pin match, pin mismatch,
     /// dual-pin overlap, pin removal, expired certificate, and recovery.
-    /// Single operator, single `GridSite` — no SWIM gossip required.
+    /// Single operator, single `GridSite`, no SWIM gossip required.
     ///
     /// Requires a kind cluster with Grid CRDs.  Safe to rerun.
     VerifyGridsiteRotation {
@@ -877,9 +877,9 @@ pub(crate) enum Action {
     /// Verify `AgentToolProvider` convergence: `Pending` -> `Available` with `discoveredTools`
     /// populated against a real mock MCP server, plus the unreachable-endpoint failure path.
     ///
-    /// Deploys a real (not local-loopback) mock MCP `tools/list` server in-cluster —
-    /// `AgentToolProvider`'s probe deliberately blocks loopback/link-local targets via
-    /// SSRF protection, unlike `GridSite`'s gateway probe — applies a `GridNetwork` +
+    /// Deploys a real (not local-loopback) mock MCP `tools/list` server in-cluster
+    /// (`AgentToolProvider`'s probe deliberately blocks loopback/link-local targets via
+    /// SSRF protection, unlike `GridSite`'s gateway probe), applies a `GridNetwork` +
     /// `GridSite` + healthy `AgentToolProvider`, and asserts the phase transitions to
     /// `Available` with the mock's tool names in `status.discoveredTools`. A second
     /// `AgentToolProvider` pointed at a nonexistent Service confirms the failure path:
@@ -1528,18 +1528,18 @@ fn env_verify_api_fallback(config: &Path, site: Option<&str>) -> Result<(), Box<
     let consumer_site = cfg.consumer_cluster_name().ok_or("no consumer cluster in config")?;
     let consumer_ctx = kind::kubectl_context(consumer_site);
 
-    // ── Step 1: deploy provider gateways ────────────────────────────────────
+    // Step 1: deploy provider gateways
     eprintln!("verify-api-fallback: [1/5] deploying provider gateways...");
     gateway::deploy_all(&cfg)?;
 
-    // ── Step 2: deploy mock-api-provider in consumer cluster ─────────────────
+    // Step 2: deploy mock-api-provider in consumer cluster
     eprintln!("verify-api-fallback: [2/5] deploying mock-api-provider in consumer cluster...");
     let consumer_cluster_name = format!("grid-{consumer_site}");
     kind::deploy_mock_api_provider(&consumer_ctx, &consumer_cluster_name)?;
     let api_provider_endpoint = format!("{}.default.svc:{}", kind::MOCK_API_SVC, kind::MOCK_API_PORT);
     eprintln!("  api_provider endpoint: {api_provider_endpoint}");
 
-    // ── Step 3: operator reconcile → overlay with local + api_provider ────────
+    // Step 3: operator reconcile → overlay with local + api_provider
     eprintln!("verify-api-fallback: [3/5] operator reconcile + overlay export...");
     operator::install_grid_crds(&context)?;
     operator::cleanup_validation_resources(&context)?;
@@ -1560,7 +1560,7 @@ fn env_verify_api_fallback(config: &Path, site: Option<&str>) -> Result<(), Box<
     let healthy_endpoint = "http://mock-openai-provider.default.svc:8080";
     // Apply the GridNetwork + healthy local provider + invalid (excluded by
     // operator) + api_provider (model-z, api_provider backendKind, auth.secretRef set).
-    // The degraded and metrics fixtures are omitted — this validation focuses on the
+    // The degraded and metrics fixtures are omitted; this validation focuses on the
     // local-vs-api_provider routing path, not on health/metrics signal ordering.
     // The spec.endpoint on the api_provider fixture is not used for routing; the xtask
     // builds the consumer cluster endpoint directly from the in-cluster mock service.
@@ -1596,14 +1596,14 @@ fn env_verify_api_fallback(config: &Path, site: Option<&str>) -> Result<(), Box<
     }
     let overlay_path = result?;
 
-    // ── Step 4: deploy consumer with api_provider cluster ────────────────────
+    // Step 4: deploy consumer with api_provider cluster
     eprintln!("verify-api-fallback: [4/5] deploying consumer gateway with api-provider cluster...");
     let overlay_json = std::fs::read_to_string(&overlay_path)?;
     let overlay = operator_overlay::parse_grid_config_json(&overlay_json)?;
 
     // Read the credential reference from the operator-projected overlay.
     // The operator embeds a SecretRef (name/namespace/key) in the overlay candidate;
-    // the xtask resolves the token from that Secret — this is the harness bridge.
+    // the xtask resolves the token from that Secret; this is the harness bridge.
     // In production, Praxis will consume the credential reference natively.
     let cred_plan = operator::api_credential_plan_from_overlay(&overlay, TEST_PROVIDER_API).ok_or(
         "no bearer-token credential reference found in overlay; \
@@ -1614,7 +1614,7 @@ fn env_verify_api_fallback(config: &Path, site: Option<&str>) -> Result<(), Box<
 
     consumer::deploy_consumer_for_api_fallback(&cfg, &overlay, TEST_PROVIDER_API, &api_provider_endpoint, &api_token)?;
 
-    // ── Step 5: verify routing + credential injection ─────────────────────────
+    // Step 5: verify routing + credential injection
     eprintln!("verify-api-fallback: [5/5] verifying API-provider fallback routing and credential injection...");
     eprintln!("  local model ({provider_cluster}) → {provider_model} via provider gateway");
     eprintln!(
@@ -1622,7 +1622,7 @@ fn env_verify_api_fallback(config: &Path, site: Option<&str>) -> Result<(), Box<
     );
 
     // Port-forward directly to the mock-api-provider (not through consumer gateway)
-    // for the negative credential proof — direct access without auth → 401.
+    // for the negative credential proof: direct access without auth → 401.
     let mock_port = verify::find_free_port()?;
     let mut mock_pf =
         verify::PortForwardGuard::start(&consumer_ctx, kind::MOCK_API_SVC, mock_port, kind::MOCK_API_PORT)?;
@@ -1638,7 +1638,7 @@ fn env_verify_api_fallback(config: &Path, site: Option<&str>) -> Result<(), Box<
 
     mock_pf.stop();
 
-    // Cleanup mock-api-provider (best-effort — does not block PASS).
+    // Cleanup mock-api-provider (best-effort, does not block PASS).
     kind::delete_mock_api_provider(&consumer_ctx);
 
     eprintln!("verify-api-fallback: PASS");
@@ -1676,18 +1676,18 @@ fn env_verify_api_fallback_native(config: &Path, site: Option<&str>) -> Result<(
     let consumer_site = cfg.consumer_cluster_name().ok_or("no consumer cluster in config")?;
     let consumer_ctx = kind::kubectl_context(consumer_site);
 
-    // ── Step 1: deploy provider gateways ────────────────────────────────────
+    // Step 1: deploy provider gateways
     eprintln!("verify-api-fallback-native: [1/8] deploying provider gateways...");
     gateway::deploy_all(&cfg)?;
 
-    // ── Step 2: deploy mock-api-provider in consumer cluster ─────────────────
+    // Step 2: deploy mock-api-provider in consumer cluster
     eprintln!("verify-api-fallback-native: [2/8] deploying mock-api-provider...");
     let consumer_cluster_name = format!("grid-{consumer_site}");
     kind::deploy_mock_api_provider(&consumer_ctx, &consumer_cluster_name)?;
     let api_provider_endpoint = format!("{}.default.svc:{}", kind::MOCK_API_SVC, kind::MOCK_API_PORT);
     eprintln!("  api_provider endpoint: {api_provider_endpoint}");
 
-    // ── Step 3: operator reconcile → overlay with credential secretRef ────────
+    // Step 3: operator reconcile → overlay with credential secretRef
     eprintln!("verify-api-fallback-native: [3/8] operator reconcile + overlay export...");
     operator::install_grid_crds(&context)?;
     operator::cleanup_validation_resources(&context)?;
@@ -1754,14 +1754,14 @@ fn env_verify_api_fallback_native(config: &Path, site: Option<&str>) -> Result<(
     }
     let (overlay_path, consumer_cm_name) = result?;
 
-    // ── Step 4: shape-validate operator consumer ConfigMap ────────────────────
+    // Step 4: shape-validate operator consumer ConfigMap
     eprintln!("verify-api-fallback-native: [4/8] shape-validating operator consumer ConfigMap...");
     let overlay_json = std::fs::read_to_string(&overlay_path)?;
     let overlay = operator_overlay::parse_grid_config_json(&overlay_json)?;
 
     // Read the credential reference from the operator-projected overlay.
     // The harness resolves the token from the K8s Secret only to prove the Secret is
-    // accessible — it does NOT appear in the consumer ConfigMap, overlay JSON, or route
+    // accessible; it does NOT appear in the consumer ConfigMap, overlay JSON, or route
     // candidates.  credential_inject reads the token from the mounted Secret file.
     let cred_plan = operator::api_credential_plan_from_overlay(&overlay, TEST_PROVIDER_API).ok_or(
         "no bearer-token credential reference found in overlay; \
@@ -1795,7 +1795,7 @@ fn env_verify_api_fallback_native(config: &Path, site: Option<&str>) -> Result<(
     )?;
 
     // Read the exact praxis.yaml from the operator-generated ConfigMap.
-    // This is the YAML the live consumer pod will run — byte-for-byte from the operator.
+    // This is the YAML the live consumer pod will run, byte-for-byte from the operator.
     let operator_praxis_yaml =
         operator::read_consumer_configmap_praxis_yaml(&context, &consumer_cm_name, TEST_GATEWAY_NS)?;
     if operator_praxis_yaml.is_empty() {
@@ -1806,10 +1806,10 @@ fn env_verify_api_fallback_native(config: &Path, site: Option<&str>) -> Result<(
         operator_praxis_yaml.len()
     );
 
-    // ── Step 5: apply operator config to consumer cluster + deploy consumer ──
+    // Step 5: apply operator config to consumer cluster + deploy consumer
     eprintln!("verify-api-fallback-native: [5/8] deploying consumer from operator-generated config...");
     // Create the credential Secret in the CONSUMER cluster so the pod can mount it.
-    // The token is in the Secret's `data` map — not in the Praxis ConfigMap.
+    // The token is in the Secret's `data` map, not in the Praxis ConfigMap.
     eprintln!("  creating credential Secret in consumer cluster for volume mount...");
     operator::delete_api_credential_secret(&consumer_ctx, API_PROVIDER_SECRET_NS)
         .unwrap_or_else(|e| eprintln!("  note: consumer credential Secret cleanup: {e}"));
@@ -1821,7 +1821,7 @@ fn env_verify_api_fallback_native(config: &Path, site: Option<&str>) -> Result<(
     // This proves E2E: the live consumer pod runs the exact config the operator rendered.
     consumer::deploy_consumer_from_operator_yaml(&cfg, &operator_praxis_yaml, secret_name, key)?;
 
-    // ── Step 6: verify routing + token-absence + native credential injection ──
+    // Step 6: verify routing + token-absence + native credential injection
     eprintln!("verify-api-fallback-native: [6/8] verifying routing with credential_inject...");
     eprintln!("  live consumer pod runs operator-generated config");
     eprintln!("  local ({provider_cluster}) → {provider_model} via provider gateway");
@@ -1857,7 +1857,7 @@ fn env_verify_api_fallback_native(config: &Path, site: Option<&str>) -> Result<(
 
     mock_pf.stop();
 
-    // ── Step 7: wrong-credential proof (strict mock rejects mismatched token) ──
+    // Step 7: wrong-credential proof (strict mock rejects mismatched token)
     eprintln!("verify-api-fallback-native: [7/8] wrong-credential proof...");
     kind::deploy_mock_api_provider_with_expected_token(
         &consumer_ctx,
@@ -1869,7 +1869,7 @@ fn env_verify_api_fallback_native(config: &Path, site: Option<&str>) -> Result<(
     kubectl::wait_for_rollout(&consumer_ctx, "praxis-consumer", "consumer")?;
     assert_wrong_credential_rejected(&consumer_ctx, API_FALLBACK_MODEL)?;
 
-    // ── Step 8: correct-credential proof (strict mock accepts correct token) ──
+    // Step 8: correct-credential proof (strict mock accepts correct token)
     eprintln!("verify-api-fallback-native: [8/8] correct-credential with strict mock...");
     kind::deploy_mock_api_provider_with_expected_token(&consumer_ctx, &consumer_cluster_name, &api_token)?;
     eprintln!("  restarting consumer to clear cached connections...");
@@ -1940,7 +1940,7 @@ fn verify_token_absent_from_overlay(overlay_json: &str, api_token: &str) {
     if overlay_json.contains(api_token) {
         eprintln!(
             "SECURITY VIOLATION: token bytes found in operator overlay JSON\n\
-             This is a bug in the operator credential projection — overlay must \
+             This is a bug in the operator credential projection: overlay must \
              carry only credential.secretRef, never the token value."
         );
         std::process::abort();
@@ -2123,7 +2123,7 @@ fn env_install_grid_crds(config: &Path, site: Option<&str>) -> Result<(), Box<dy
 ///
 /// Returns the path of the exported `routing-config.json` overlay file.
 /// The caller is responsible for killing the operator and port-forward processes
-/// before this function returns — both are wrapped in [`ProcGuard`] so they are
+/// before this function returns; both are wrapped in [`ProcGuard`] so they are
 /// stopped on drop even on early return.
 ///
 /// This is the shared core of both [`env_verify_operator_reconcile`] and
@@ -2422,7 +2422,7 @@ fn env_verify_swim_membership(config: &Path, site: Option<&str>) -> Result<(), B
 
     let (bind1, bind2) = reserve_swim_bind_addrs()?;
 
-    // Step 2: start the primary SWIM operator (no seeds — it is the first member).
+    // Step 2: start the primary SWIM operator (no seeds; it is the first member).
     let op1 = operator::spawn_operator_with_swim(&context, &bind1, &bind1, SWIM_NODE_PRIMARY_NAME, "", None)?;
     let mut op1_guard = ProcGuard(Some(op1), "operator-primary");
 
@@ -2467,7 +2467,7 @@ fn env_verify_swim_membership(config: &Path, site: Option<&str>) -> Result<(), B
 ///
 /// **Why this proves the CRD path:**
 ///
-/// Both operators start with `GRID_SWIM_SEEDS=""` — no startup seeds at all.
+/// Both operators start with `GRID_SWIM_SEEDS=""`, so no startup seeds at all.
 /// After the `GridNetwork` fixture is applied with `spec.seeds = [bind1]`,
 /// each operator resolves the resource and calls `announce_crd_seeds`; the
 /// local address is filtered and the secondary announces to the primary.
@@ -2497,12 +2497,12 @@ fn env_verify_swim_crd_seeds(config: &Path, site: Option<&str>) -> Result<(), Bo
         .parse()
         .map_err(|e| format!("failed to parse bind1 addr {bind1:?}: {e}"))?;
 
-    // Step 2: start primary operator — NO GRID_SWIM_SEEDS, no peer at startup.
+    // Step 2: start primary operator with NO GRID_SWIM_SEEDS, no peer at startup.
     // The primary will self-filter bind1 when it reads spec.seeds later.
     let op1 = operator::spawn_operator_with_swim(&context, &bind1, &bind1, SWIM_NODE_PRIMARY_NAME, "", None)?;
     let mut op1_guard = ProcGuard(Some(op1), "operator-primary-crd");
 
-    // Step 3: start secondary operator — NO GRID_SWIM_SEEDS, no peer at startup.
+    // Step 3: start secondary operator with NO GRID_SWIM_SEEDS, no peer at startup.
     // The secondary will announce to bind1 only after reading spec.seeds from the CRD.
     let op2 = operator::spawn_operator_with_swim(&context, &bind2, &bind2, SWIM_NODE_SECONDARY_NAME, "", None)?;
     let mut op2_guard = ProcGuard(Some(op2), "operator-secondary-crd");
@@ -2513,7 +2513,7 @@ fn env_verify_swim_crd_seeds(config: &Path, site: Option<&str>) -> Result<(), Bo
     eprintln!("  GridNetwork {CRD_SEEDS_TEST_NETWORK} applied with empty spec.seeds; verifying isolation...");
     // Allow one reconcile cycle to fire (operators are running and will reconcile the new CRD).
     operator::wait_for_swim_convergence(SWIM_CONVERGENCE_WAIT);
-    // With empty seeds, the network must stay Pending or have connectedSites=0 — no SWIM join.
+    // With empty seeds, the network must stay Pending or have connectedSites=0 (no SWIM join).
     let isolated_status =
         operator::wait_for_gridnetwork_status(&context, CRD_SEEDS_TEST_NETWORK, SWIM_STATUS_POLL_TIMEOUT)?;
     if isolated_status.connected_sites > 0 {
@@ -2527,18 +2527,18 @@ fn env_verify_swim_crd_seeds(config: &Path, site: Option<&str>) -> Result<(), Bo
         operator::cleanup_swim_crd_seeds_test_resources(&context)?;
         return Err(format!(
             "verify-swim-crd-seeds: expected connectedSites=0 with empty spec.seeds, \
-             got connectedSites={} — SWIM must not auto-join without seeds",
+             got connectedSites={}; SWIM must not auto-join without seeds",
             isolated_status.connected_sites
         )
         .into());
     }
     eprintln!(
         "  [PASS] GridNetwork status with empty seeds: phase={:?} connectedSites={} \
-         (isolation confirmed — no SWIM join without CRD seeds)",
+         (isolation confirmed, no SWIM join without CRD seeds)",
         isolated_status.phase, isolated_status.connected_sites
     );
 
-    // Step 5: Live-additive proof — patch spec.seeds to [bind1] while operators are running.
+    // Step 5: Live-additive proof: patch spec.seeds to [bind1] while operators are running.
     // This is the core runtime update contract: adding a seed while the operator is live
     // causes SWIM join on the next reconcile cycle without operator restart.
     operator::apply_swim_test_network_with_seeds(&context, &[bind1_addr])?;
@@ -2568,7 +2568,7 @@ fn env_verify_swim_crd_seeds(config: &Path, site: Option<&str>) -> Result<(), Bo
 
     eprintln!(
         "verify-swim-crd-seeds: PASS (connectedSites={connected_sites}; \
-         CRD seed path proven — both operators started with no GRID_SWIM_SEEDS; \
+         CRD seed path proven: both operators started with no GRID_SWIM_SEEDS; \
          live-additive: spec.seeds added {bind1} while running, SWIM converged without restart)"
     );
     Ok(())
@@ -2637,7 +2637,7 @@ fn env_verify_swim_state(config: &Path, site: Option<&str>) -> Result<(), Box<dy
     operator::verify_distributed_state_received(distributed_count)?;
 
     eprintln!(
-        "verify-swim-state: PASS — real InferenceProvider state propagated via SWIM \
+        "verify-swim-state: PASS: real InferenceProvider state propagated via SWIM \
          (provider={SWIM_TEST_PROVIDER}, model={SWIM_TEST_PROVIDER_MODEL}, \
          distributedProviderCount={distributed_count})"
     );
@@ -2759,24 +2759,24 @@ fn hostname_for_swim_addr(addr: &str) -> Result<String, Box<dyn std::error::Erro
 ///
 /// Five scenarios tested sequentially:
 ///
-/// **A. Positive — env-keyed peers converge:** operators A and B share the same key;
+/// **A. Positive (env-keyed peers converge):** operators A and B share the same key;
 /// B's CRDT provider state propagates to A's `GridNetwork.status.distributedProviderCount`.
 ///
-/// **B. Positive — SecretRef-keyed peers converge:** operators A and B start
+/// **B. Positive (SecretRef-keyed peers converge):** operators A and B start
 /// without `GRID_SWIM_ENCRYPT_KEY`.  The `GridNetwork` references a Kubernetes
 /// Secret via `spec.tls.swimKeyRef`; after reconcile, A uses a CRD-declared seed
 /// to join B with the Secret-backed key.
 ///
-/// **C. Negative — wrong-key peer rejected:** A is keyed; C has a different key
+/// **C. Negative (wrong-key peer rejected):** A is keyed; C has a different key
 /// and seeds A's address.  A drops all of C's packets, so C is never admitted
 /// to A's SWIM membership.  During the observation window, A's `connectedSites == 0`
 /// and `distributedProviderCount == 0`.
 ///
-/// **D. Negative — plaintext peer rejected:** A is keyed; D has no key.  A drops
+/// **D. Negative (plaintext peer rejected):** A is keyed; D has no key.  A drops
 /// D's unencrypted packets for the same reason.  During the observation window,
 /// A's `connectedSites == 0` and `distributedProviderCount == 0`.
 ///
-/// **E. Negative — missing Secret prevents plaintext sends:** A and B start
+/// **E. Negative (missing Secret prevents plaintext sends):** A and B start
 /// without `GRID_SWIM_ENCRYPT_KEY`.  The `GridNetwork` configures `swimKeyRef`
 /// pointing to a Secret that does not exist.  Both operators' reconcile fails
 /// before seed announcement or provider broadcast.  During the observation
@@ -2784,7 +2784,7 @@ fn hostname_for_swim_addr(addr: &str) -> Result<String, Box<dyn std::error::Erro
 /// This proves fail-closed behavior: a configured `swimKeyRef` with a missing
 /// Secret does not silently degrade to plaintext.
 ///
-/// All five scenarios are **hard failures** — they fail the test, not emit warnings.
+/// All five scenarios are **hard failures**; they fail the test, not emit warnings.
 ///
 /// Requires a kind cluster.  Run `env up` first.  Safe to rerun.
 #[expect(
@@ -2812,8 +2812,8 @@ fn env_verify_swim_encryption(config: &Path, site: Option<&str>) -> Result<(), B
     let key_ab = operator::generate_swim_key_hex();
     let key_wrong = operator::generate_swim_key_hex();
 
-    // ── Scenario A: Keyed peers converge (positive) ───────────────────────────
-    eprintln!("verify-swim-encryption: [1/5] positive — env-keyed peers A + B converge...");
+    // Scenario A: Keyed peers converge (positive)
+    eprintln!("verify-swim-encryption: [1/5] positive, env-keyed peers A + B converge...");
     operator::cleanup_swim_encrypt_test_resources(&context)?;
 
     let (bind_a, bind_b) = reserve_swim_bind_addrs()?;
@@ -2841,7 +2841,7 @@ fn env_verify_swim_encryption(config: &Path, site: Option<&str>) -> Result<(), B
     operator::wait_for_swim_convergence(SWIM_CONVERGENCE_WAIT);
     operator::apply_swim_encrypt_test_fixtures(&context, SWIM_ENCRYPT_NODE_A)?;
 
-    // A must see B in SWIM membership (connectedSites >= 1) — proves shared-key peers join.
+    // A must see B in SWIM membership (connectedSites >= 1), which proves shared-key peers join.
     let convergence_result =
         operator::wait_for_gridnetwork_active(&context, SWIM_ENCRYPT_NETWORK, SWIM_STATUS_POLL_TIMEOUT);
 
@@ -2856,8 +2856,8 @@ fn env_verify_swim_encryption(config: &Path, site: Option<&str>) -> Result<(), B
     let connected = convergence_result?;
     eprintln!("  [PASS] keyed peers A + B converged: connectedSites={connected}");
 
-    // ── Scenario B: Secret-backed CRD key peers converge (positive) ───────────
-    eprintln!("verify-swim-encryption: [2/5] positive — swimKeyRef Secret peers A + B converge...");
+    // Scenario B: Secret-backed CRD key peers converge (positive)
+    eprintln!("verify-swim-encryption: [2/5] positive, swimKeyRef Secret peers A + B converge...");
     operator::cleanup_swim_encrypt_test_resources(&context)?;
 
     let (bind_secret_a, bind_secret_b) = reserve_swim_bind_addrs()?;
@@ -2904,8 +2904,8 @@ fn env_verify_swim_encryption(config: &Path, site: Option<&str>) -> Result<(), B
     let secret_connected = secret_convergence_result?;
     eprintln!("  [PASS] swimKeyRef Secret peers A + B converged: connectedSites={secret_connected}");
 
-    // ── Scenario C: Wrong-key peer cannot join (negative) ─────────────────────
-    eprintln!("verify-swim-encryption: [3/5] negative — wrong-key peer C is rejected by A...");
+    // Scenario C: Wrong-key peer cannot join (negative)
+    eprintln!("verify-swim-encryption: [3/5] negative, wrong-key peer C is rejected by A...");
     operator::cleanup_swim_encrypt_test_resources(&context)?;
 
     let (bind_a2, bind_wrong) = reserve_swim_bind_addrs()?;
@@ -2924,7 +2924,7 @@ fn env_verify_swim_encryption(config: &Path, site: Option<&str>) -> Result<(), B
         &bind_wrong,
         &bind_wrong,
         SWIM_ENCRYPT_NODE_WRONG,
-        &bind_a2, // C seeds A — but A drops all of C's packets (wrong key)
+        &bind_a2, // C seeds A, but A drops all of C's packets (wrong key)
         None,
         Some(&key_wrong),
     )?;
@@ -2952,8 +2952,8 @@ fn env_verify_swim_encryption(config: &Path, site: Option<&str>) -> Result<(), B
 
     wrong_rejection_result?;
 
-    // ── Scenario D: Plaintext peer cannot join (negative) ────────────────────
-    eprintln!("verify-swim-encryption: [4/5] negative — plaintext peer D is rejected by keyed A...");
+    // Scenario D: Plaintext peer cannot join (negative)
+    eprintln!("verify-swim-encryption: [4/5] negative, plaintext peer D is rejected by keyed A...");
     operator::cleanup_swim_encrypt_test_resources(&context)?;
 
     let (bind_a3, bind_plain) = reserve_swim_bind_addrs()?;
@@ -2972,7 +2972,7 @@ fn env_verify_swim_encryption(config: &Path, site: Option<&str>) -> Result<(), B
         &bind_plain,
         &bind_plain,
         SWIM_ENCRYPT_NODE_PLAIN,
-        &bind_a3, // D seeds A — but A drops D's plaintext packets
+        &bind_a3, // D seeds A, but A drops D's plaintext packets
         None,
         None, // no key: plaintext
     )?;
@@ -2999,8 +2999,8 @@ fn env_verify_swim_encryption(config: &Path, site: Option<&str>) -> Result<(), B
 
     plaintext_rejection_result?;
 
-    // ── Scenario E: Missing Secret prevents plaintext sends (negative) ──────
-    eprintln!("verify-swim-encryption: [5/5] negative — missing Secret prevents plaintext sends...");
+    // Scenario E: Missing Secret prevents plaintext sends (negative)
+    eprintln!("verify-swim-encryption: [5/5] negative, missing Secret prevents plaintext sends...");
     operator::cleanup_swim_encrypt_test_resources(&context)?;
 
     let (bind_e_a, bind_e_b) = reserve_swim_bind_addrs()?;
@@ -3063,7 +3063,7 @@ fn env_verify_swim_encryption(config: &Path, site: Option<&str>) -> Result<(), B
     missing_secret_result?;
 
     eprintln!(
-        "verify-swim-encryption: PASS — env-keyed peers converge; swimKeyRef Secret peers converge; \
+        "verify-swim-encryption: PASS: env-keyed peers converge; swimKeyRef Secret peers converge; \
          wrong-key peer rejected; plaintext peer rejected; missing Secret prevents plaintext sends"
     );
     Ok(())
@@ -3135,7 +3135,7 @@ fn env_verify_swim_overlay(config: &Path, site: Option<&str>) -> Result<(), Box<
         )
     });
 
-    // Step 8: ROUTING ELIGIBILITY PROOF (before Active) — assert the secondary's CRDT
+    // Step 8: ROUTING ELIGIBILITY PROOF (before Active): assert the secondary's CRDT
     // candidates are absent from the overlay.  The secondary SWIM peer is Alive and has
     // broadcast InferenceProvider state, but its corresponding GridSite is not Active, so
     // its CRDT providers must be excluded by the routing eligibility gate.
@@ -3158,9 +3158,9 @@ fn env_verify_swim_overlay(config: &Path, site: Option<&str>) -> Result<(), Box<
         operator::setup_tls_verified_gridsite(&context, &secondary_k8s_name, SWIM_OVERLAY_NETWORK)
     });
 
-    // Step 10: ROUTING ELIGIBILITY PROOF (after Active/TlsVerified) — poll until the
+    // Step 10: ROUTING ELIGIBILITY PROOF (after Active/TlsVerified): poll until the
     // secondary's CRDT provider candidate appears in the overlay. The controller must:
-    //   (a) probe the mTLS server (succeeds — TLS fixture guard holds the process)
+    //   (a) probe the mTLS server (succeeds; TLS fixture guard holds the process)
     //   (b) verify CA chain + DNS SAN + canonical pin → promote Connecting → Active (TlsVerified)
     //   (c) re-render the overlay to include secondary CRDT providers
     let verify_result = tls_fixture_result.and_then(|_guard| {
@@ -3173,7 +3173,7 @@ fn env_verify_swim_overlay(config: &Path, site: Option<&str>) -> Result<(), Box<
         )
     });
 
-    // Cleanup — always stop operators and remove fixtures regardless of result.
+    // Cleanup: always stop operators and remove fixtures regardless of result.
     if let Some(c) = op1_guard.0.take() {
         operator::kill_operator(c);
     }
@@ -3192,7 +3192,7 @@ fn env_verify_swim_overlay(config: &Path, site: Option<&str>) -> Result<(), Box<
     verify_result?;
 
     eprintln!(
-        "verify-swim-overlay: PASS — CRDT provider record from {SWIM_NODE_SECONDARY_NAME:?} \
+        "verify-swim-overlay: PASS: CRDT provider record from {SWIM_NODE_SECONDARY_NAME:?} \
          appeared in overlay for {SWIM_OVERLAY_NETWORK}/{SWIM_OVERLAY_GW}"
     );
     Ok(())
@@ -3354,7 +3354,7 @@ fn env_verify_swim_routing(config: &Path) -> Result<(), Box<dyn std::error::Erro
     });
 
     eprintln!(
-        "verify-swim-routing: PASS — {west_model} from {west_site:?} entered overlay via \
+        "verify-swim-routing: PASS: {west_model} from {west_site:?} entered overlay via \
          CRDT/SWIM and routed to HTTP 200 via consumer gateway"
     );
     Ok(())
@@ -3388,7 +3388,7 @@ fn reserve_three_swim_bind_addrs() -> Result<(String, String, String), Box<dyn s
 /// eligibility gating across a three-node mesh.
 ///
 /// Topology:
-///   A  ←seed—  B  ←seed—  C
+///   A  ←seed-  B  ←seed-  C
 ///
 /// A seeds nobody; B seeds A; C seeds B only.  A learns about C transitively.
 ///
@@ -3419,40 +3419,40 @@ fn env_verify_swim_mesh_three_node(config: &Path, site: Option<&str>) -> Result<
     let context = resolve_operator_context(&cfg, site)?;
     eprintln!("verify-swim-mesh-three-node: context={context}");
 
-    // ── Step 1: Install CRDs and remove any stale mesh test resources ─────────
+    // Step 1: Install CRDs and remove any stale mesh test resources
     operator::install_grid_crds(&context)?;
     operator::cleanup_swim_mesh_test_resources(&context)?;
 
-    // ── Step 2: Reserve three distinct SWIM bind addresses ───────────────────
+    // Step 2: Reserve three distinct SWIM bind addresses
     let (bind_a, bind_b, bind_c) = reserve_three_swim_bind_addrs()?;
     eprintln!(
         "  A={bind_a}  B={bind_b}  C={bind_c} \
          (topology: A←B←C, C does NOT seed A directly)"
     );
 
-    // ── Step 3: Spawn all three operators ─────────────────────────────────────
-    // A: no seeds.  B: seeds A.  C: seeds B only (not A) — ensures transitivity.
+    // Step 3: Spawn all three operators
+    // A: no seeds.  B: seeds A.  C: seeds B only (not A), which ensures transitivity.
     let op_a = operator::spawn_operator_with_swim(&context, &bind_a, &bind_a, SWIM_MESH_SITE_A, "", None)?;
     let mut op_a_guard = ProcGuard(Some(op_a), "operator-mesh-a");
 
     let op_b = operator::spawn_operator_with_swim(&context, &bind_b, &bind_b, SWIM_MESH_SITE_B, &bind_a, None)?;
     let mut op_b_guard = ProcGuard(Some(op_b), "operator-mesh-b");
 
-    // C seeds only B — the proof that A learns C transitively.
+    // C seeds only B, the proof that A learns C transitively.
     let op_c = operator::spawn_operator_with_swim(&context, &bind_c, &bind_c, SWIM_MESH_SITE_C, &bind_b, None)?;
     let mut op_c_guard = ProcGuard(Some(op_c), "operator-mesh-c");
 
-    // ── Step 4: Wait for SWIM gossip to propagate across the mesh ─────────────
+    // Step 4: Wait for SWIM gossip to propagate across the mesh
     operator::wait_for_swim_convergence(SWIM_CONVERGENCE_WAIT);
-    eprintln!("  SWIM convergence window elapsed — A should know B and C through B");
+    eprintln!("  SWIM convergence window elapsed; A should know B and C through B");
 
-    // ── Step 5: Apply main GridNetwork/provider and wrong-network isolation fixtures ─
+    // Step 5: Apply main GridNetwork/provider and wrong-network isolation fixtures
     operator::apply_swim_mesh_test_fixtures(&context, SWIM_MESH_SITE_A, SWIM_MESH_PROVIDER_C, SWIM_MESH_MODEL_C)?;
     // Apply a wrong-network GridNetwork + InferenceProvider so we can assert their
     // model does not leak into A's correct-network overlay.
     operator::apply_swim_mesh_wrong_network_fixtures(&context)?;
 
-    // ── Step 6: Prove transitive state propagation — A has CRDT from both B and C ─
+    // Step 6: Prove transitive state propagation (A has CRDT from both B and C)
     // `distributedProviderCount >= 2` means A received provider records from at
     // least two remote sites.  Since C only seeded B, A must have learned C's
     // record through B.
@@ -3463,9 +3463,9 @@ fn env_verify_swim_mesh_three_node(config: &Path, site: Option<&str>) -> Result<
     let cm_result = count_result.and_then(|count| {
         eprintln!(
             "  [PASS] transitive CRDT propagation: A distributedProviderCount={count} \
-             (>= 2 — received from B and C through the mesh)"
+             (>= 2, received from B and C through the mesh)"
         );
-        // ── Step 7: Wait for A's overlay ConfigMap ───────────────────────────
+        // Step 7: Wait for A's overlay ConfigMap
         eprintln!("verify-swim-mesh-three-node: [7] waiting for A's overlay ConfigMap...");
         operator::wait_for_overlay_configmap(
             &context,
@@ -3476,7 +3476,7 @@ fn env_verify_swim_mesh_three_node(config: &Path, site: Option<&str>) -> Result<
         )
     });
 
-    // ── Step 8: Routing eligibility — C's candidate absent before Active ──────
+    // Step 8: Routing eligibility (C's candidate absent before Active)
     eprintln!("verify-swim-mesh-three-node: [8] proving C excluded before GridSite Active...");
     let before_result = cm_result.and_then(|()| {
         operator::assert_no_crdt_candidates_for_site(&context, SWIM_MESH_NETWORK, SWIM_MESH_GW, SWIM_MESH_SITE_C)
@@ -3487,7 +3487,7 @@ fn env_verify_swim_mesh_three_node(config: &Path, site: Option<&str>) -> Result<
         operator::assert_no_crdt_candidates_for_site(&context, SWIM_MESH_NETWORK, SWIM_MESH_GW, SWIM_MESH_SITE_B)
     });
 
-    // ── Step 9: Cross-network isolation — wrong-network model absent from A's overlay ─
+    // Step 9: Cross-network isolation (wrong-network model absent from A's overlay)
     // The wrong-network InferenceProvider serves SWIM_MESH_WRONG_MODEL.  It belongs to
     // a different GridNetwork and must not appear in A's op-e2e-swim-mesh-net overlay.
     eprintln!("verify-swim-mesh-three-node: [9] proving wrong-network model absent from A's overlay...");
@@ -3500,7 +3500,7 @@ fn env_verify_swim_mesh_three_node(config: &Path, site: Option<&str>) -> Result<
         )
     });
 
-    // ── Step 10: Apply Active GridSite for C via identity-aware TLS and verify candidate ──
+    // Step 10: Apply Active GridSite for C via identity-aware TLS and verify candidate
     // Spawn a local mTLS probe server and configure the full identity trust chain so the
     // controller promotes C to Active/TlsVerified naturally.
     let c_site_k8s_name = operator::auto_discovered_gridsite_name(SWIM_MESH_NETWORK, SWIM_MESH_SITE_C);
@@ -3522,7 +3522,7 @@ fn env_verify_swim_mesh_three_node(config: &Path, site: Option<&str>) -> Result<
         )
     });
 
-    // ── Step 10: Cleanup — always stop operators and remove fixtures ───────────
+    // Step 10: Cleanup (always stop operators and remove fixtures)
     if let Some(c) = op_a_guard.0.take() {
         operator::kill_operator(c);
     }
@@ -3539,7 +3539,7 @@ fn env_verify_swim_mesh_three_node(config: &Path, site: Option<&str>) -> Result<
     verify_c_result?;
 
     eprintln!(
-        "verify-swim-mesh-three-node: PASS — \
+        "verify-swim-mesh-three-node: PASS: \
          A→B→C transitive discovery proven; \
          C's CRDT state reached A through B (distributedProviderCount >= 2); \
          C absent before Active; C present after Active; \
@@ -4103,18 +4103,18 @@ fn env_verify_full_grid_routing(config: &Path) -> Result<(), Box<dyn std::error:
     let api_endpoint = format!("{}.default.svc:{}", kind::MOCK_API_SVC, kind::MOCK_API_PORT);
     let provider_endpoint = "http://mock-openai-provider.default.svc:8080";
 
-    // ── Step 1: deploy provider gateways ─────────────────────────────────────
+    // Step 1: deploy provider gateways
     eprintln!("verify-full-grid-routing: [1/6] deploying provider gateways...");
     gateway::deploy_all(&cfg)?;
 
-    // ── Step 2: deploy cloud + API mocks in consumer cluster ─────────────────
+    // Step 2: deploy cloud + API mocks in consumer cluster
     eprintln!("verify-full-grid-routing: [2/6] deploying cloud and API mocks in consumer cluster...");
     kind::deploy_mock_cloud_provider(&consumer_ctx, &format!("grid-{consumer_site}"))?;
     kind::deploy_mock_api_provider(&consumer_ctx, &format!("grid-{consumer_site}"))?;
     eprintln!("  cloud endpoint: {cloud_endpoint}");
     eprintln!("  api endpoint:   {api_endpoint}");
 
-    // ── Step 3: operator reconcile + overlay export ───────────────────────────
+    // Step 3: operator reconcile + overlay export
     eprintln!("verify-full-grid-routing: [3/6] operator reconcile + overlay export...");
     operator::install_grid_crds(&east_ctx)?;
     operator::cleanup_full_grid_resources(&east_ctx)?;
@@ -4173,7 +4173,7 @@ fn env_verify_full_grid_routing(config: &Path) -> Result<(), Box<dyn std::error:
     }
     let overlay_path = result?;
 
-    // ── Step 4: deploy consumer gateway with four-cluster config ─────────────
+    // Step 4: deploy consumer gateway with four-cluster config
     eprintln!("verify-full-grid-routing: [4/6] deploying full-grid consumer gateway...");
     let overlay_json = std::fs::read_to_string(&overlay_path)?;
     let overlay = operator_overlay::parse_grid_config_json(&overlay_json)?;
@@ -4197,7 +4197,7 @@ fn env_verify_full_grid_routing(config: &Path) -> Result<(), Box<dyn std::error:
         &api_token,
     )?;
 
-    // ── Step 5: verify routing for all four models ───────────────────────────
+    // Step 5: verify routing for all four models
     eprintln!("verify-full-grid-routing: [5/6] verifying full-grid routing...");
     eprintln!("  {FULL_GRID_MODEL_EAST} → site-east (local/self-hosted)");
     eprintln!("  {FULL_GRID_MODEL_WEST} → site-west (remote/self-hosted)");
@@ -4211,7 +4211,7 @@ fn env_verify_full_grid_routing(config: &Path) -> Result<(), Box<dyn std::error:
         FULL_GRID_MODEL_API,
     )?;
 
-    // ── Step 6: pod restart check ─────────────────────────────────────────────
+    // Step 6: pod restart check
     eprintln!("verify-full-grid-routing: [6/6] checking for unexpected pod restarts...");
     for (site, _) in &providers {
         let ctx = kind::kubectl_context(site);
@@ -4240,7 +4240,7 @@ fn env_verify_full_grid_routing(config: &Path) -> Result<(), Box<dyn std::error:
     kind::delete_mock_api_provider(&consumer_ctx);
 
     eprintln!(
-        "verify-full-grid-routing: PASS — all four backend kinds \
+        "verify-full-grid-routing: PASS: all four backend kinds \
          (local, remote, cloud_managed, api_provider) routed via consumer gateway"
     );
     Ok(())
@@ -4260,7 +4260,7 @@ fn env_verify_full_grid_routing(config: &Path) -> Result<(), Box<dyn std::error:
 /// **Attribution note**: because both mock providers return the same response
 /// body, the selected backend is evidenced by the overlay position (structural
 /// proof) alone.  The annotation-bump trigger is xtask validation
-/// synchronization — not a production mechanism.
+/// synchronization, not a production mechanism.
 #[expect(
     clippy::too_many_lines,
     reason = "sequential two-phase metrics validation with port-forward lifecycle"
@@ -4314,7 +4314,7 @@ fn env_verify_metrics_routing(config: &Path) -> Result<(), Box<dyn std::error::E
     );
     eprintln!("  [OK] metrics-routing preflight: {east_site} and {west_site} use backend = \"mock-openai\"");
 
-    // ── Step 1: Deploy provider gateways ──────────────────────────────────────
+    // Step 1: Deploy provider gateways
     eprintln!("verify-metrics-routing: [1/7] deploying provider gateways...");
     gateway::deploy_all(&cfg)?;
 
@@ -4360,13 +4360,13 @@ fn env_verify_metrics_routing(config: &Path) -> Result<(), Box<dyn std::error::E
         }
     }
 
-    // ── Step 2: Install CRDs and cleanup stale resources ─────────────────────
+    // Step 2: Install CRDs and cleanup stale resources
     eprintln!("verify-metrics-routing: [2/7] installing CRDs and cleaning stale resources...");
     operator::install_grid_crds(&east_ctx)?;
     operator::cleanup_metrics_routing_resources(&east_ctx)?;
 
-    // ── Phase 1: east=low queue (0.1), west=high queue (0.9) ─────────────────
-    eprintln!("verify-metrics-routing: [3/7] phase 1 — east=0.1, west=0.9...");
+    // Phase 1: east=low queue (0.1), west=high queue (0.9)
+    eprintln!("verify-metrics-routing: [3/7] phase 1, east=0.1, west=0.9...");
     operator::apply_metrics_routing_pods(&east_ctx, "0.1", "0.9")?;
     operator::wait_for_named_pod_ready(&east_ctx, METRICS_ROUTING_EAST_POD, STATUS_POLL_TIMEOUT)?;
     operator::wait_for_named_pod_ready(&east_ctx, METRICS_ROUTING_WEST_POD, STATUS_POLL_TIMEOUT)?;
@@ -4423,8 +4423,8 @@ fn env_verify_metrics_routing(config: &Path) -> Result<(), Box<dyn std::error::E
         east_site, // expected first
     );
 
-    // ── Phase 2: flip metrics — east=high (0.9), west=low (0.1) ──────────────
-    eprintln!("verify-metrics-routing: [4/7] flipping metrics — east=0.9, west=0.1...");
+    // Phase 2: flip metrics so east=high (0.9), west=low (0.1)
+    eprintln!("verify-metrics-routing: [4/7] flipping metrics, east=0.9, west=0.1...");
     if let Some(mut c) = pf_east_guard.0.take() {
         drop(c.kill());
         drop(c.wait());
@@ -4457,7 +4457,7 @@ fn env_verify_metrics_routing(config: &Path) -> Result<(), Box<dyn std::error::E
 
     let phase2_result: Result<PathBuf, Box<dyn std::error::Error>> = (|| {
         // Bump GridNetwork annotation to force reconcile after metrics changed.
-        // This is xtask validation synchronization — not a production mechanism.
+        // This is xtask validation synchronization, not a production mechanism.
         operator::bump_gridnetwork(&east_ctx, METRICS_ROUTING_NETWORK)?;
         operator::wait_for_overlay_configmap(
             &east_ctx,
@@ -4500,12 +4500,12 @@ fn env_verify_metrics_routing(config: &Path) -> Result<(), Box<dyn std::error::E
         west_site, // expected first after flip
     );
 
-    // ── Step 5: Cleanup ───────────────────────────────────────────────────────
+    // Step 5: Cleanup
     eprintln!("verify-metrics-routing: [5/7] cleaning up...");
     operator::cleanup_metrics_routing_resources(&east_ctx)
         .unwrap_or_else(|e| eprintln!("  warning: cleanup failed: {e}"));
 
-    // ── Step 6: Pod restart check ─────────────────────────────────────────────
+    // Step 6: Pod restart check
     eprintln!("verify-metrics-routing: [6/7] checking for unexpected pod restarts...");
     for (site, ctx) in [(east_site, &east_ctx), (west_site, &west_ctx)] {
         let restarts = collect_pod_restart_counts(ctx, "default")?;
@@ -4519,13 +4519,13 @@ fn env_verify_metrics_routing(config: &Path) -> Result<(), Box<dyn std::error::E
         }
     }
 
-    // ── Step 7: Report ────────────────────────────────────────────────────────
+    // Step 7: Report
     eprintln!("verify-metrics-routing: [7/7] summarising results...");
     phase1_verify?;
     phase2_verify?;
 
     eprintln!(
-        "verify-metrics-routing: PASS — overlay order and routing flipped correctly \
+        "verify-metrics-routing: PASS: overlay order and routing flipped correctly \
          when metrics values were swapped"
     );
     Ok(())
@@ -4584,8 +4584,8 @@ fn env_verify_site_join_discovery(config: &Path) -> Result<(), Box<dyn std::erro
     let west_ctx = kind::kubectl_context(west_site);
     eprintln!("  primary={east_site} ({east_ctx}), joining={west_site} ({west_ctx})");
 
-    // ── Step 1: Preflight ─────────────────────────────────────────────────────
-    eprintln!("verify-site-join-discovery: [1/8] preflight — CRDs, cleanup, operator binary...");
+    // Step 1: Preflight
+    eprintln!("verify-site-join-discovery: [1/8] preflight, CRDs, cleanup, operator binary...");
     // Build operator binary once so both spawns use the same pre-compiled binary.
     let build_ok = std::process::Command::new("cargo")
         .args(["build", "--quiet", "-p", "operator", "--bin", "operator"])
@@ -4599,7 +4599,7 @@ fn env_verify_site_join_discovery(config: &Path) -> Result<(), Box<dyn std::erro
     operator::install_grid_crds(&west_ctx)?;
     operator::cleanup_site_join_resources(&east_ctx)?;
 
-    // ── Step 2: Start SWIM operators ──────────────────────────────────────────
+    // Step 2: Start SWIM operators
     eprintln!("verify-site-join-discovery: [2/8] starting SWIM operators...");
     let (bind_primary, bind_joining) = reserve_swim_bind_addrs()?;
     // Primary operator: east cluster, no seeds, no gateway address.
@@ -4623,12 +4623,12 @@ fn env_verify_site_join_discovery(config: &Path) -> Result<(), Box<dyn std::erro
     let mut op_joining_guard = ProcGuard(Some(op_joining), "operator-joining");
     eprintln!("  [OK] primary operator ({east_site}) and joining operator ({west_site}) started");
 
-    // ── Step 3: SWIM convergence + GridNetworks + auto-discovery proof ────────
+    // Step 3: SWIM convergence + GridNetworks + auto-discovery proof
     eprintln!("verify-site-join-discovery: [3/8] SWIM convergence + auto-discovery proof...");
     // Wait for gossip to propagate before applying fixtures.
     operator::wait_for_swim_convergence(SWIM_CONVERGENCE_WAIT);
 
-    // Apply GridNetworks ONLY — no GridSites yet.
+    // Apply GridNetworks ONLY, no GridSites yet.
     // The auto-discovery proof asserts that the primary operator creates the joining
     // GridSite by itself, without harness assistance.
     operator::apply_site_join_network(&east_ctx, east_site)?;
@@ -4642,7 +4642,7 @@ fn env_verify_site_join_discovery(config: &Path) -> Result<(), Box<dyn std::erro
     );
 
     // Assert the primary operator auto-created a GridSite for the joining SWIM member.
-    // The name is {network}-{site_id} — composite to avoid collisions when the operator
+    // The name is {network}-{site_id}, composite to avoid collisions when the operator
     // reconciles multiple GridNetworks and the same SWIM peer appears in all of them.
     let auto_site_name = operator::auto_discovered_gridsite_name(SITE_JOIN_NETWORK, west_site);
     operator::bump_gridnetwork(&east_ctx, SITE_JOIN_NETWORK)?;
@@ -4669,10 +4669,10 @@ fn env_verify_site_join_discovery(config: &Path) -> Result<(), Box<dyn std::erro
          egress.address={joining_gw_addr:?} (gateway address, not SWIM UDP {bind_joining:?})"
     );
 
-    // ── Step 4: Apply harness GridSites + wait for membership ────────────────
+    // Step 4: Apply harness GridSites + wait for membership
     eprintln!("verify-site-join-discovery: [4/8] applying harness GridSites for lifecycle proof...");
 
-    // Apply primary GridSite (represents the local site's own record — harness-created for
+    // Apply primary GridSite (represents the local site's own record, harness-created for
     // the overlay and isolation proof).
     operator::apply_gridsite(
         &east_ctx,
@@ -4718,7 +4718,7 @@ fn env_verify_site_join_discovery(config: &Path) -> Result<(), Box<dyn std::erro
     operator::bump_gridsite(&east_ctx, SITE_JOIN_JOINING_SITE)?;
     // The GridSite controller now drives Discovered → Connecting automatically when
     // spec.egress.address is non-empty and reachable by TCP.
-    // Wait for Connecting — do NOT wait for Discovered, which would be immediately
+    // Wait for Connecting; do NOT wait for Discovered, which would be immediately
     // superseded by the operator's automated transition.
     operator::wait_for_gridsite_phase(
         &east_ctx,
@@ -4734,7 +4734,7 @@ fn env_verify_site_join_discovery(config: &Path) -> Result<(), Box<dyn std::erro
     // Advance to Active via identity-aware TLS probe. Spawn a local mTLS probe server and
     // configure the full identity trust chain (CA, client cert, canonical DER pin, serverName)
     // so the controller promotes Connecting → Active (TlsVerified). This proves Active is only
-    // reached when identity verification succeeds — TCP reachability alone is not sufficient.
+    // reached when identity verification succeeds; TCP reachability alone is not sufficient.
     let _tls_guard = operator::setup_tls_verified_gridsite(&east_ctx, SITE_JOIN_JOINING_SITE, SITE_JOIN_NETWORK)?;
     operator::bump_gridsite(&east_ctx, SITE_JOIN_JOINING_SITE)?;
     operator::wait_for_gridsite_reason_in_network(
@@ -4744,13 +4744,13 @@ fn env_verify_site_join_discovery(config: &Path) -> Result<(), Box<dyn std::erro
         "TlsVerified",
         SITE_JOIN_PHASE_POLL_TIMEOUT,
     )?;
-    eprintln!("  [OK] joining site: Active (TlsVerified — mTLS + canonical pin matched, lifecycle complete)");
+    eprintln!("  [OK] joining site: Active (TlsVerified: mTLS + canonical pin matched, lifecycle complete)");
 
-    // ── Step 5: Routing readiness ─────────────────────────────────────────────
+    // Step 5: Routing readiness
     eprintln!("verify-site-join-discovery: [6/8] verifying join routing readiness...");
     operator::verify_gridsite_routing_data(&east_ctx, SITE_JOIN_JOINING_SITE, SITE_JOIN_NETWORK, &joining_gw_addr)?;
 
-    // ── Step 6: Overlay + cross-network isolation ─────────────────────────────
+    // Step 6: Overlay + cross-network isolation
     eprintln!("verify-site-join-discovery: [7/8] verifying overlay and cross-network isolation...");
 
     // Cross-network isolation via GridSite inventory: the wrong site must not appear in sjd-net.
@@ -4774,7 +4774,7 @@ fn env_verify_site_join_discovery(config: &Path) -> Result<(), Box<dyn std::erro
     operator::apply_site_join_wrong_provider(&east_ctx)?;
 
     // Bump annotation to force overlay reconcile after new providers land.
-    // This is xtask validation synchronization — not a production mechanism.
+    // This is xtask validation synchronization, not a production mechanism.
     operator::bump_gridnetwork(&east_ctx, SITE_JOIN_NETWORK)?;
     eprintln!("  [OK] bumped {SITE_JOIN_NETWORK:?} annotation to force overlay reconcile");
 
@@ -4788,7 +4788,7 @@ fn env_verify_site_join_discovery(config: &Path) -> Result<(), Box<dyn std::erro
         CONFIGMAP_POLL_TIMEOUT,
     );
 
-    // ── Step 8: Cleanup ───────────────────────────────────────────────────────
+    // Step 8: Cleanup
     eprintln!("verify-site-join-discovery: [8/8] cleanup...");
     if let Some(c) = op_primary_guard.0.take() {
         operator::kill_operator(c);
@@ -4825,7 +4825,7 @@ fn env_verify_site_join_discovery(config: &Path) -> Result<(), Box<dyn std::erro
 /// attributed to east via overlay-position evidence (both mocks echo the same model name in
 /// the response body; the first-candidate position is the stated attribution mechanism).
 ///
-/// **Recovery phase (steps 8–9):**
+/// **Recovery phase (steps 8 and 9):**
 ///
 /// After the consumer route-away proof, the surviving east operator is also stopped
 /// so both SWIM runtimes lose their in-memory membership state.  East and west are
@@ -4873,7 +4873,7 @@ fn env_verify_failover_under_lost_peer(config: &Path) -> Result<(), Box<dyn std:
     let west_ctx = kind::kubectl_context(west_site);
     eprintln!("  primary={east_site} ({east_ctx}), remote={west_site} ({west_ctx})");
 
-    // ── Step 1: Preflight ─────────────────────────────────────────────────────
+    // Step 1: Preflight
     eprintln!("verify-failover-under-lost-peer: [1/10] preflight - CRDs, cleanup, operator binary...");
     let build_ok = std::process::Command::new("cargo")
         .args(["build", "--quiet", "-p", "operator", "--bin", "operator"])
@@ -4888,7 +4888,7 @@ fn env_verify_failover_under_lost_peer(config: &Path) -> Result<(), Box<dyn std:
     operator::cleanup_failover_east_resources(&east_ctx).unwrap_or_else(|e| eprintln!("  note: east cleanup: {e}"));
     operator::cleanup_failover_west_resources(&west_ctx).unwrap_or_else(|e| eprintln!("  note: west cleanup: {e}"));
 
-    // ── Step 2: Deploy provider gateways ──────────────────────────────────────
+    // Step 2: Deploy provider gateways
     // Gateway deployment enables consumer request routing in step 7.
     // The east mock-epp is patched to also serve FAILOVER_SHARED_MODEL so requests
     // for that model route cleanly through east's provider gateway after west is lost.
@@ -4924,7 +4924,7 @@ fn env_verify_failover_under_lost_peer(config: &Path) -> Result<(), Box<dyn std:
         eprintln!("  [OK] {site} mock-epp ready with {FAILOVER_SHARED_MODEL:?} route");
     }
 
-    // ── Step 3: Start SWIM operators ──────────────────────────────────────────
+    // Step 3: Start SWIM operators
     eprintln!("verify-failover-under-lost-peer: [3/10] starting SWIM operators...");
     let (bind_east, bind_west) = reserve_swim_bind_addrs()?;
     let op_east =
@@ -4935,7 +4935,7 @@ fn env_verify_failover_under_lost_peer(config: &Path) -> Result<(), Box<dyn std:
     let mut op_west_guard = ProcGuard(Some(op_west), "operator-west");
     eprintln!("  [OK] east (primary) and west (remote) operators started");
 
-    // ── Step 4: SWIM convergence + fixtures ───────────────────────────────────
+    // Step 4: SWIM convergence + fixtures
     eprintln!("verify-failover-under-lost-peer: [4/10] waiting for SWIM convergence and applying fixtures...");
     operator::wait_for_swim_convergence(SWIM_CONVERGENCE_WAIT);
     // East: local dedicated model + shared model (local, healthy fallback).
@@ -4955,7 +4955,7 @@ fn env_verify_failover_under_lost_peer(config: &Path) -> Result<(), Box<dyn std:
          (west CRDT provider arrived)"
     );
 
-    // ── Step 5: Verify initial overlay ───────────────────────────────────────
+    // Step 5: Verify initial overlay
     eprintln!(
         "verify-failover-under-lost-peer: [5/10] verifying initial overlay \
          (dedicated + shared models, both providers fresh=true)..."
@@ -4993,7 +4993,7 @@ fn env_verify_failover_under_lost_peer(config: &Path) -> Result<(), Box<dyn std:
          {FAILOVER_WEST_PROVIDER} fresh=true; east before west for {FAILOVER_SHARED_MODEL:?}"
     );
 
-    // ── Step 6: Kill west operator ────────────────────────────────────────────
+    // Step 6: Kill west operator
     eprintln!("verify-failover-under-lost-peer: [6/10] killing west operator - simulating partition...");
     if let Some(c) = op_west_guard.0.take() {
         operator::kill_operator(c);
@@ -5009,7 +5009,7 @@ fn env_verify_failover_under_lost_peer(config: &Path) -> Result<(), Box<dyn std:
     )]
     std::thread::sleep(SWIM_DEAD_MEMBER_WAIT);
 
-    // ── Step 7: Verify stale overlay + route-away proof ───────────────────────
+    // Step 7: Verify stale overlay + route-away proof
     eprintln!("verify-failover-under-lost-peer: [7/10] verifying stale overlay and consumer route-away...");
     operator::bump_gridnetwork(&east_ctx, FAILOVER_NETWORK)?;
     eprintln!("  [OK] bumped {FAILOVER_NETWORK:?} to force post-partition reconcile");
@@ -5049,7 +5049,7 @@ fn env_verify_failover_under_lost_peer(config: &Path) -> Result<(), Box<dyn std:
 
     // Consumer routing proof: deploy consumer from the stale overlay and verify a request
     // for the shared model returns 200.  East is the first shared-model candidate.
-    // Attribution: overlay-based — both mocks echo the same model name in the response body;
+    // Attribution: overlay-based; both mocks echo the same model name in the response body;
     // first shared-model candidate being east is the stated evidence for routing to the healthy fallback.
     // East operator is kept alive here (not killed yet) so it can reconcile the recovery phase below.
     let overlay_path = operator::export_overlay_to_file(&east_ctx, FAILOVER_NETWORK, FAILOVER_GW, "default")?;
@@ -5132,7 +5132,7 @@ fn env_verify_failover_under_lost_peer(config: &Path) -> Result<(), Box<dyn std:
             .map_or("(not found)", |c| c.cluster.as_str()),
     );
 
-    // ── Step 8: Kill east + both operators down ───────────────────────────────
+    // Step 8: Kill east + both operators down
     eprintln!("verify-failover-under-lost-peer: [8/10] killing east operator (both operators now down)...");
     // SWIM incarnation semantics: foca uses per-member incarnation numbers.  When a
     // member is hard-killed and declared Dead, the cluster records identity state
@@ -5151,9 +5151,9 @@ fn env_verify_failover_under_lost_peer(config: &Path) -> Result<(), Box<dyn std:
     }
     eprintln!("  [OK] east operator killed; both operators are now down");
 
-    // ── Step 9: Restart both operators fresh + verify recovery ───────────────
+    // Step 9: Restart both operators fresh + verify recovery
     eprintln!("verify-failover-under-lost-peer: [9/10] restarting both operators for recovery proof...");
-    // East restarts with no seeds — it is the primary node of the fresh cluster.
+    // East restarts with no seeds; it is the primary node of the fresh cluster.
     let op_east_rejoin =
         operator::spawn_operator_with_swim_for_context(&east_ctx, &bind_east, &bind_east, east_site, "", None)?;
     let mut op_east_rejoin_guard = ProcGuard(Some(op_east_rejoin), "operator-east-rejoin");
@@ -5212,7 +5212,7 @@ fn env_verify_failover_under_lost_peer(config: &Path) -> Result<(), Box<dyn std:
          {FAILOVER_WEST_PROVIDER} fresh=true; east still first for {FAILOVER_SHARED_MODEL:?}"
     );
 
-    // ── Step 10: Cleanup ──────────────────────────────────────────────────────
+    // Step 10: Cleanup
     eprintln!("verify-failover-under-lost-peer: [10/10] cleanup...");
     if let Some(c) = op_east_rejoin_guard.0.take() {
         operator::kill_operator(c);
@@ -5281,19 +5281,19 @@ fn env_verify_stale_gc_ttl(config: &Path) -> Result<(), Box<dyn std::error::Erro
     let east_ctx = kind::kubectl_context(east_site);
     let west_ctx = kind::kubectl_context(west_site);
 
-    // ── Step 1: Preflight ─────────────────────────────────────────────────────
-    eprintln!("verify-stale-gc-ttl: [1/7] preflight — CRDs, cleanup, operator binary...");
+    // Step 1: Preflight
+    eprintln!("verify-stale-gc-ttl: [1/7] preflight, CRDs, cleanup, operator binary...");
     operator::install_grid_crds(&east_ctx)?;
     operator::install_grid_crds(&west_ctx)?;
     operator::ensure_operator_binary_built()?;
     operator::cleanup_stale_gc_east_resources(&east_ctx).unwrap_or_else(|e| eprintln!("  cleanup: {e}"));
     operator::cleanup_stale_gc_west_resources(&west_ctx).unwrap_or_else(|e| eprintln!("  cleanup: {e}"));
 
-    // ── Step 2: Provider gateways ─────────────────────────────────────────────
+    // Step 2: Provider gateways
     eprintln!("verify-stale-gc-ttl: [2/7] deploying provider gateways...");
     gateway::deploy_all(&cfg)?;
 
-    // ── Step 3: SWIM operators ────────────────────────────────────────────────
+    // Step 3: SWIM operators
     eprintln!("verify-stale-gc-ttl: [3/7] starting SWIM operators...");
     let (bind_east, bind_west) = reserve_swim_bind_addrs()?;
     let op_east =
@@ -5304,7 +5304,7 @@ fn env_verify_stale_gc_ttl(config: &Path) -> Result<(), Box<dyn std::error::Erro
     let mut op_west_guard = ProcGuard(Some(op_west), "operator-west");
     eprintln!("  [OK] east + west operators started");
 
-    // ── Step 4: SWIM convergence + fixtures with TTL ──────────────────────────
+    // Step 4: SWIM convergence + fixtures with TTL
     eprintln!(
         "verify-stale-gc-ttl: [4/7] SWIM convergence + applying fixtures \
          (staleCandidateTtlSeconds={STALE_GC_TTL_SECS})..."
@@ -5317,7 +5317,7 @@ fn env_verify_stale_gc_ttl(config: &Path) -> Result<(), Box<dyn std::error::Erro
     let dist = operator::wait_for_gridnetwork_distributed_state(&east_ctx, STALE_GC_NETWORK, SWIM_STATUS_POLL_TIMEOUT)?;
     eprintln!("  [OK] CRDT distributed state: distributedProviderCount={dist}");
 
-    // ── Step 5: Verify initial overlay (both candidates fresh=true) ───────────
+    // Step 5: Verify initial overlay (both candidates fresh=true)
     eprintln!("verify-stale-gc-ttl: [5/7] verifying initial overlay (west fresh=true before kill)...");
     operator::bump_gridnetwork(&east_ctx, STALE_GC_NETWORK)?;
     operator::wait_for_overlay_configmap(
@@ -5352,7 +5352,7 @@ fn env_verify_stale_gc_ttl(config: &Path) -> Result<(), Box<dyn std::error::Erro
          {STALE_GC_WEST_PROVIDER} fresh=true"
     );
 
-    // ── Step 6: Kill west, wait for GC eviction ───────────────────────────────
+    // Step 6: Kill west, wait for GC eviction
     eprintln!(
         "verify-stale-gc-ttl: [6/7] killing west operator; waiting for TTL-based GC eviction \
          (TTL={STALE_GC_TTL_SECS}s)..."
@@ -5395,10 +5395,10 @@ fn env_verify_stale_gc_ttl(config: &Path) -> Result<(), Box<dyn std::error::Erro
     }
     eprintln!(
         "  [PASS] final overlay: {STALE_GC_EAST_PROVIDER} (local) still fresh=true; \
-         {STALE_GC_WEST_PROVIDER} (remote, stale) absent — evicted by TTL={STALE_GC_TTL_SECS}s GC"
+         {STALE_GC_WEST_PROVIDER} (remote, stale) absent, evicted by TTL={STALE_GC_TTL_SECS}s GC"
     );
 
-    // ── Step 7: Cleanup ───────────────────────────────────────────────────────
+    // Step 7: Cleanup
     eprintln!("verify-stale-gc-ttl: [7/7] cleanup...");
     if let Some(c) = op_east_guard.0.take() {
         operator::kill_operator(c);
@@ -5407,7 +5407,7 @@ fn env_verify_stale_gc_ttl(config: &Path) -> Result<(), Box<dyn std::error::Erro
     operator::cleanup_stale_gc_west_resources(&west_ctx).unwrap_or_else(|e| eprintln!("  warning: {e}"));
 
     eprintln!(
-        "verify-stale-gc-ttl: PASS — \
+        "verify-stale-gc-ttl: PASS: \
          stale remote candidate evicted by TTL={STALE_GC_TTL_SECS}s GC; \
          local candidate retained; CRD field staleCandidateTtlSeconds proven"
     );
@@ -5567,7 +5567,7 @@ impl StepResult {
     }
 }
 
-/// Truncate a string to `max` chars, appending "..." if truncated.
+/// Truncate a string to `max` chars, appending a single U+2026 ellipsis character if truncated.
 pub(crate) fn safe_truncate_str(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_owned()
@@ -5598,7 +5598,7 @@ pub(crate) fn print_validate_all_table(results: &[StepResult]) {
 fn env_validate_all(config: &Path, site: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     let mut results: Vec<StepResult> = Vec::new();
 
-    // Step 1: env status (non-fatal — clusters may still be partially ready)
+    // Step 1: env status (non-fatal; clusters may still be partially ready)
     eprintln!("validate-all: [1/5] env status...");
     match env_status(config) {
         Ok(()) => results.push(StepResult::pass("env status", "status summary printed above")),
@@ -5643,7 +5643,7 @@ fn env_validate_all(config: &Path, site: Option<&str>) -> Result<(), Box<dyn std
 
     let any_fail = results.iter().any(|r| r.status.is_failure());
     if any_fail {
-        Err("validate-all: one or more steps FAILED — see table above".into())
+        Err("validate-all: one or more steps FAILED; see table above".into())
     } else {
         eprintln!("validate-all: all steps PASS or BLOCKED");
         Ok(())
@@ -5854,8 +5854,8 @@ fn env_verify_operator_install_rbac(config: &Path, site: Option<&str>) -> Result
     let cluster_name = kind::cluster_name_from_config(site_cfg_name);
     eprintln!("verify-operator-install-rbac: context={context}");
 
-    // Step 1: preflight — CRDs + cleanup.
-    eprintln!("verify-operator-install-rbac: [1/11] preflight — CRDs, cleanup...");
+    // Step 1: preflight (CRDs + cleanup).
+    eprintln!("verify-operator-install-rbac: [1/11] preflight, CRDs, cleanup...");
     operator::install_grid_crds(&context)?;
     operator::cleanup_install_rbac_test_resources(&context)?;
 
@@ -5962,15 +5962,13 @@ fn env_verify_operator_install_rbac(config: &Path, site: Option<&str>) -> Result
     // Step 9: verify actual Secret writes (TLS CA + site cert).
     eprintln!("verify-operator-install-rbac: [9/11] verifying Secret writes...");
     if !kind::kubectl_secret_exists(&context, "default", ca_secret_name)? {
-        return Err(
-            format!("Secret {ca_secret_name} not found in default — operator failed to write CA Secret").into(),
-        );
+        return Err(format!("Secret {ca_secret_name} not found in default; operator failed to write CA Secret").into());
     }
     eprintln!("  [PASS] Secret {ca_secret_name} exists (CA cert written by in-cluster operator)");
 
     if !kind::kubectl_secret_exists(&context, "default", site_secret_name)? {
         return Err(format!(
-            "Secret {site_secret_name} not found in default — operator failed to write site cert Secret"
+            "Secret {site_secret_name} not found in default; operator failed to write site cert Secret"
         )
         .into());
     }
@@ -5984,7 +5982,7 @@ fn env_verify_operator_install_rbac(config: &Path, site: Option<&str>) -> Result
         },
         Err(e) => {
             return Err(format!(
-                "ConfigMap {overlay_cm_name} not found in default — operator failed to write overlay: {e}"
+                "ConfigMap {overlay_cm_name} not found in default; operator failed to write overlay: {e}"
             )
             .into());
         },
@@ -5996,7 +5994,7 @@ fn env_verify_operator_install_rbac(config: &Path, site: Option<&str>) -> Result
     operator::cleanup_install_manifests(&context)?;
 
     eprintln!(
-        "verify-operator-install-rbac: PASS — install manifests apply cleanly; \
+        "verify-operator-install-rbac: PASS: install manifests apply cleanly; \
          positive RBAC checks pass; negative RBAC checks (including namespace-scoped) pass; \
          in-cluster operator reconcile succeeds; Secret patch and ConfigMap patch verified"
     );
@@ -6337,7 +6335,7 @@ fn env_gridsite_fingerprint(context: &str, site_name: &str) -> Result<(), Box<dy
 /// dual-pin overlap, pin removal, expired certificate, and recovery.
 #[expect(
     clippy::too_many_lines,
-    reason = "10-step sequential rotation lifecycle — splitting obscures the test narrative"
+    reason = "10-step sequential rotation lifecycle; splitting obscures the test narrative"
 )]
 fn env_verify_gridsite_rotation(config: &Path, site: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     use operator::{
@@ -6349,7 +6347,7 @@ fn env_verify_gridsite_rotation(config: &Path, site: Option<&str>) -> Result<(),
     let context = resolve_operator_context(&cfg, site)?;
     eprintln!("verify-gridsite-rotation: context={context}");
 
-    // ── Step 1: CRDs, cleanup, generate certificates ─────────────────────────
+    // Step 1: CRDs, cleanup, generate certificates
     eprintln!("verify-gridsite-rotation: [1] setup");
     operator::install_grid_crds(&context)?;
     operator::cleanup_rotation_test_resources(&context)?;
@@ -6373,7 +6371,7 @@ fn env_verify_gridsite_rotation(config: &Path, site: Option<&str>) -> Result<(),
     eprintln!("  fp-B={fp_b}");
     eprintln!("  fp-C={fp_c}");
 
-    // ── Step 2: Secrets, network, provider fixtures ──────────────────────────
+    // Step 2: Secrets, network, provider fixtures
     eprintln!("verify-gridsite-rotation: [2] create secrets + fixtures");
     let temp_dir = tempfile::tempdir()?;
     let temp = temp_dir.path();
@@ -6404,7 +6402,7 @@ fn env_verify_gridsite_rotation(config: &Path, site: Option<&str>) -> Result<(),
         "default",
     )?;
 
-    // ── Step 3: Spawn TLS probe server serving cert-A ────────────────────────
+    // Step 3: Spawn TLS probe server serving cert-A
     eprintln!("verify-gridsite-rotation: [3] spawn TLS probe server (cert-A)");
     let cert_a_path = temp.join("cert-a.pem");
     let key_a_path = temp.join("key-a.pem");
@@ -6455,7 +6453,7 @@ fn env_verify_gridsite_rotation(config: &Path, site: Option<&str>) -> Result<(),
     let remote_site_name = operator::auto_discovered_gridsite_name(ROTATION_NETWORK, ROTATION_REMOTE_SWIM_ID);
     operator::apply_rotation_remote_provider(&context)?;
 
-    // ── Step 4: Apply GridSite with [fp-A] → Active/TlsVerified ─────────────
+    // Step 4: Apply GridSite with [fp-A] → Active/TlsVerified
     eprintln!("verify-gridsite-rotation: [4] apply GridSite with fp-A");
 
     operator::apply_tls_verified_gridsite_for_eligibility(
@@ -6486,7 +6484,7 @@ fn env_verify_gridsite_rotation(config: &Path, site: Option<&str>) -> Result<(),
 
         let metrics_baseline = operator::scrape_metrics(&metrics_addr)?;
 
-        // ── Step 4b: Routing eligibility — configure remote GridSite with all
+        // Step 4b: Routing eligibility: configure remote GridSite with all
         //    fingerprints so it stays Active for any valid cert and only goes
         //    Connecting for expired/not-yet-valid certs.
         eprintln!("verify-gridsite-rotation: [4b] configure remote GridSite for eligibility");
@@ -6519,7 +6517,7 @@ fn env_verify_gridsite_rotation(config: &Path, site: Option<&str>) -> Result<(),
              (remote GridSite Active → routing eligible)"
         );
 
-        // ── Step 5: Restart with cert-B, fp-A still configured → PinMismatch ──
+        // Step 5: Restart with cert-B, fp-A still configured → PinMismatch
         eprintln!("verify-gridsite-rotation: [5] restart server with cert-B (fp-A configured)");
         server_child = Some(operator::restart_tls_probe_server(
             &mut server_child,
@@ -6539,7 +6537,7 @@ fn env_verify_gridsite_rotation(config: &Path, site: Option<&str>) -> Result<(),
         )?;
         eprintln!("  [PASS] step 5: Connecting/PinMismatch after cert swap");
 
-        // ── Step 6: Patch [fp-A, fp-B] → Active/TlsVerified (cert-B matches fp-B) ──
+        // Step 6: Patch [fp-A, fp-B] → Active/TlsVerified (cert-B matches fp-B)
         eprintln!("verify-gridsite-rotation: [6] dual-pin overlap [fp-A, fp-B]");
         operator::patch_gridsite_fingerprints(&context, ROTATION_SITE, &[&fp_a, &fp_b])?;
         operator::bump_gridsite(&context, ROTATION_SITE)?;
@@ -6553,7 +6551,7 @@ fn env_verify_gridsite_rotation(config: &Path, site: Option<&str>) -> Result<(),
         )?;
         eprintln!("  [PASS] step 6: Active/TlsVerified with dual-pin overlap");
 
-        // ── Step 6a: Partial rollout — server reverts to cert-A, dual-pin still set ──
+        // Step 6a: Partial rollout (server reverts to cert-A, dual-pin still set)
         eprintln!("verify-gridsite-rotation: [6a] partial rollout (cert-A, pins=[fp-A, fp-B])");
         server_child = Some(operator::restart_tls_probe_server(
             &mut server_child,
@@ -6571,9 +6569,9 @@ fn env_verify_gridsite_rotation(config: &Path, site: Option<&str>) -> Result<(),
             "TlsVerified",
             ROTATION_POLL_TIMEOUT,
         )?;
-        eprintln!("  [PASS] step 6a: TlsVerified — cert-A still matches fp-A in dual-pin");
+        eprintln!("  [PASS] step 6a: TlsVerified, cert-A still matches fp-A in dual-pin");
 
-        // ── Step 6b: Convergence on B — server back to cert-B, dual-pin ──
+        // Step 6b: Convergence on B (server back to cert-B, dual-pin)
         eprintln!("verify-gridsite-rotation: [6b] convergence on B (cert-B, pins=[fp-A, fp-B])");
         server_child = Some(operator::restart_tls_probe_server(
             &mut server_child,
@@ -6591,11 +6589,11 @@ fn env_verify_gridsite_rotation(config: &Path, site: Option<&str>) -> Result<(),
             "TlsVerified",
             ROTATION_POLL_TIMEOUT,
         )?;
-        eprintln!("  [PASS] step 6b: TlsVerified — cert-B matches fp-B in dual-pin");
+        eprintln!("  [PASS] step 6b: TlsVerified, cert-B matches fp-B in dual-pin");
         // No step for AdvertisedCertificateMismatch: it needs the remote TLS broadcast
         // secret patched apart from the probe cert, and no longer changes phase.
 
-        // ── Step 7: Patch [fp-B] only → still Active/TlsVerified ────────────
+        // Step 7: Patch [fp-B] only → still Active/TlsVerified
         eprintln!("verify-gridsite-rotation: [7] single pin [fp-B]");
         operator::patch_gridsite_fingerprints(&context, ROTATION_SITE, &[&fp_b])?;
         operator::bump_gridsite(&context, ROTATION_SITE)?;
@@ -6609,7 +6607,7 @@ fn env_verify_gridsite_rotation(config: &Path, site: Option<&str>) -> Result<(),
         )?;
         eprintln!("  [PASS] step 7: Active/TlsVerified with single fp-B");
 
-        // ── Step 7a: Rollback to A — server=cert-A, pin=[fp-A] ──
+        // Step 7a: Rollback to A (server=cert-A, pin=[fp-A])
         eprintln!("verify-gridsite-rotation: [7a] rollback to A (cert-A, pin=[fp-A])");
         server_child = Some(operator::restart_tls_probe_server(
             &mut server_child,
@@ -6628,9 +6626,9 @@ fn env_verify_gridsite_rotation(config: &Path, site: Option<&str>) -> Result<(),
             "TlsVerified",
             ROTATION_POLL_TIMEOUT,
         )?;
-        eprintln!("  [PASS] step 7a: TlsVerified — rollback to cert-A/fp-A succeeded");
+        eprintln!("  [PASS] step 7a: TlsVerified, rollback to cert-A/fp-A succeeded");
 
-        // ── Step 7b: Reject unexpected C during overlap — pins=[fp-A, fp-B], server=cert-C ──
+        // Step 7b: Reject unexpected C during overlap (pins=[fp-A, fp-B], server=cert-C)
         eprintln!("verify-gridsite-rotation: [7b] reject unexpected C (cert-C, pins=[fp-A, fp-B])");
         server_child = Some(operator::restart_tls_probe_server(
             &mut server_child,
@@ -6649,9 +6647,9 @@ fn env_verify_gridsite_rotation(config: &Path, site: Option<&str>) -> Result<(),
             "PinMismatch",
             ROTATION_POLL_TIMEOUT,
         )?;
-        eprintln!("  [PASS] step 7b: PinMismatch — cert-C (fp={fp_c}) rejected by [fp-A, fp-B]");
+        eprintln!("  [PASS] step 7b: PinMismatch, cert-C (fp={fp_c}) rejected by [fp-A, fp-B]");
 
-        // ── Step 7c: Restore B after reject — server=cert-B, pins=[fp-A, fp-B] ──
+        // Step 7c: Restore B after reject (server=cert-B, pins=[fp-A, fp-B])
         eprintln!("verify-gridsite-rotation: [7c] restore B after reject");
         server_child = Some(operator::restart_tls_probe_server(
             &mut server_child,
@@ -6669,9 +6667,9 @@ fn env_verify_gridsite_rotation(config: &Path, site: Option<&str>) -> Result<(),
             "TlsVerified",
             ROTATION_POLL_TIMEOUT,
         )?;
-        eprintln!("  [PASS] step 7c: TlsVerified — cert-B restored after C rejection");
+        eprintln!("  [PASS] step 7c: TlsVerified, cert-B restored after C rejection");
 
-        // ── Step 8: Restart with expired cert → CertificateExpired ──────────
+        // Step 8: Restart with expired cert → CertificateExpired
         eprintln!("verify-gridsite-rotation: [8] restart with expired cert");
         operator::patch_gridsite_fingerprints(&context, ROTATION_SITE, &[&fp_b])?;
         server_child = Some(operator::restart_tls_probe_server(
@@ -6705,7 +6703,7 @@ fn env_verify_gridsite_rotation(config: &Path, site: Option<&str>) -> Result<(),
              (remote GridSite Connecting → routing ineligible)"
         );
 
-        // ── Step 8a: Not-yet-valid cert → CertificateNotYetValid ────────────
+        // Step 8a: Not-yet-valid cert → CertificateNotYetValid
         eprintln!("verify-gridsite-rotation: [8a] restart with not-yet-valid cert");
         server_child = Some(operator::restart_tls_probe_server(
             &mut server_child,
@@ -6725,7 +6723,7 @@ fn env_verify_gridsite_rotation(config: &Path, site: Option<&str>) -> Result<(),
         )?;
         eprintln!("  [PASS] step 8a: Connecting/CertificateNotYetValid");
 
-        // ── Step 9: Restore cert-B with [fp-B] → Active/TlsVerified ────────
+        // Step 9: Restore cert-B with [fp-B] → Active/TlsVerified
         eprintln!("verify-gridsite-rotation: [9] restore cert-B");
         server_child = Some(operator::restart_tls_probe_server(
             &mut server_child,
@@ -6758,7 +6756,7 @@ fn env_verify_gridsite_rotation(config: &Path, site: Option<&str>) -> Result<(),
              (remote GridSite Active → routing eligible again)"
         );
 
-        // ── Event validation ────────────────────────────────────────────────
+        // Event validation
         operator::validate_gridsite_events(
             &context,
             ROTATION_SITE,
@@ -6771,7 +6769,7 @@ fn env_verify_gridsite_rotation(config: &Path, site: Option<&str>) -> Result<(),
         )?;
         eprintln!("  [PASS] event validation: all expected reasons present, no duplicates");
 
-        // ── Metrics validation ──────────────────────────────────────────────
+        // Metrics validation
         let metrics_final = operator::scrape_metrics(&metrics_addr)?;
         operator::assert_metrics_safe(&metrics_final)?;
         operator::assert_probe_counter_increased(&metrics_baseline, &metrics_final, "Verified")?;
@@ -6781,7 +6779,7 @@ fn env_verify_gridsite_rotation(config: &Path, site: Option<&str>) -> Result<(),
         Ok(())
     })();
 
-    // ── Step 10: Cleanup ─────────────────────────────────────────────────────
+    // Step 10: Cleanup
     eprintln!("verify-gridsite-rotation: [10] cleanup");
     if let Some(mut c) = server_child.take() {
         drop(c.kill());
@@ -6798,7 +6796,7 @@ fn env_verify_gridsite_rotation(config: &Path, site: Option<&str>) -> Result<(),
     result?;
 
     eprintln!(
-        "verify-gridsite-rotation: PASS — \
+        "verify-gridsite-rotation: PASS: \
          rotation matrix verified with routing eligibility: initial → mismatch → dual-pin → \
          partial rollout → convergence-B → single-pin → rollback-A → \
          reject-C → restore-B → expired → not-yet-valid → recovery"
@@ -6839,7 +6837,7 @@ fn env_verify_gridsite_convergence(config: &Path, site: Option<&str>) -> Result<
     let context = resolve_operator_context(&cfg, site)?;
     eprintln!("verify-gridsite-convergence: context={context}");
 
-    // ── Step 1: Setup ────────────────────────────────────────────────────────
+    // Step 1: Setup
     eprintln!("verify-gridsite-convergence: [1] setup");
     operator::install_grid_crds(&context)?;
     operator::cleanup_convergence_test_resources(&context)?;
@@ -6881,7 +6879,7 @@ fn env_verify_gridsite_convergence(config: &Path, site: Option<&str>) -> Result<
         "default",
     )?;
 
-    // ── Step 2: Spawn TLS probe server + two equivalent operator replicas ────
+    // Step 2: Spawn TLS probe server + two equivalent operator replicas
     eprintln!("verify-gridsite-convergence: [2] spawn TLS server + 2 operator replicas");
     let cert_a_path = temp.join("cert-a.pem");
     let key_a_path = temp.join("key-a.pem");
@@ -6913,7 +6911,7 @@ fn env_verify_gridsite_convergence(config: &Path, site: Option<&str>) -> Result<
     operator::assert_operator_alive(op_b_guard.0.as_mut().ok_or("operator-B missing after spawn")?)?;
     eprintln!("  [OK] both operator replicas alive after startup");
 
-    // ── Step 3: Apply GridSite with [fp-A] → Active/TlsVerified ─────────────
+    // Step 3: Apply GridSite with [fp-A] → Active/TlsVerified
     eprintln!("verify-gridsite-convergence: [3] apply GridSite with fp-A");
     operator::apply_tls_verified_gridsite_for_eligibility(
         &context,
@@ -6935,11 +6933,11 @@ fn env_verify_gridsite_convergence(config: &Path, site: Option<&str>) -> Result<
         )?;
         operator::assert_operator_alive(op_a_guard.0.as_mut().ok_or("operator-A missing")?)?;
         operator::assert_operator_alive(op_b_guard.0.as_mut().ok_or("operator-B missing")?)?;
-        eprintln!("  [PASS] step 3: Active/TlsVerified — both replicas alive");
+        eprintln!("  [PASS] step 3: Active/TlsVerified, both replicas alive");
 
         let conv_metrics_baseline = operator::scrape_metrics(&convergence_metrics_addr)?;
 
-        // ── Step 4: Cause pin mismatch → Connecting/PinMismatch ─────────────
+        // Step 4: Cause pin mismatch → Connecting/PinMismatch
         eprintln!("verify-gridsite-convergence: [4] restart with cert-B (fp-A configured)");
         let port = probe_addr
             .split(':')
@@ -6960,7 +6958,7 @@ fn env_verify_gridsite_convergence(config: &Path, site: Option<&str>) -> Result<
         )?;
         eprintln!("  [PASS] step 4: Connecting/PinMismatch with two replicas");
 
-        // ── Step 5: Restore identity → Active/TlsVerified ───────────────────
+        // Step 5: Restore identity → Active/TlsVerified
         eprintln!("verify-gridsite-convergence: [5] restore identity [fp-A, fp-B]");
         operator::patch_gridsite_fingerprints(&context, CONVERGENCE_SITE, &[&fp_a, &fp_b])?;
         operator::bump_gridsite(&context, CONVERGENCE_SITE)?;
@@ -6974,7 +6972,7 @@ fn env_verify_gridsite_convergence(config: &Path, site: Option<&str>) -> Result<
         )?;
         eprintln!("  [PASS] step 5: Active/TlsVerified restored");
 
-        // ── Step 6: Kill operator-B, verify stability ───────────────────────
+        // Step 6: Kill operator-B, verify stability
         eprintln!("verify-gridsite-convergence: [6] kill operator-B, verify A sustains state");
         if let Some(c) = op_b_guard.0.take() {
             operator::kill_operator(c);
@@ -6988,7 +6986,7 @@ fn env_verify_gridsite_convergence(config: &Path, site: Option<&str>) -> Result<
         }
         eprintln!("  [PASS] step 6: operator-A alone sustains TlsVerified");
 
-        // ── Step 7: Restart operator-B, verify reconvergence ────────────────
+        // Step 7: Restart operator-B, verify reconvergence
         eprintln!("verify-gridsite-convergence: [7] restart operator-B, prove reconvergence");
         let op_b_new = operator::spawn_operator_with_swim(&context, &bind_b, &bind_b, CONVERGENCE_SITE, "", None)?;
         let pid_b_new = op_b_new.id();
@@ -7006,7 +7004,7 @@ fn env_verify_gridsite_convergence(config: &Path, site: Option<&str>) -> Result<
         }
         eprintln!("  [PASS] step 7: reconverged to Active/TlsVerified after restart");
 
-        // ── Step 8: Observe stability (no oscillation) ──────────────────────
+        // Step 8: Observe stability (no oscillation)
         eprintln!(
             "verify-gridsite-convergence: [8] observing stability for {}s...",
             CONVERGENCE_STABILITY_WINDOW.as_secs()
@@ -7035,15 +7033,15 @@ fn env_verify_gridsite_convergence(config: &Path, site: Option<&str>) -> Result<
         operator::assert_operator_alive(op_b_guard.0.as_mut().ok_or("operator-B missing")?)?;
         eprintln!(
             "  [PASS] step 8: stable at {last_reason:?} for {CONVERGENCE_STABILITY_WINDOW:?} \
-             — no oscillation, both replicas alive"
+             (no oscillation, both replicas alive)"
         );
 
-        // ── Step 9: Validate transition Events ───────────────────────────
+        // Step 9: Validate transition Events
         eprintln!("verify-gridsite-convergence: [9] validating Events");
         operator::validate_gridsite_events(&context, CONVERGENCE_SITE, &["TlsVerified"])?;
-        eprintln!("  [PASS] step 9: events validated — no duplicates, bounded notes, correct types");
+        eprintln!("  [PASS] step 9: events validated: no duplicates, bounded notes, correct types");
 
-        // ── Step 10: Metrics validation ─────────────────────────────────────
+        // Step 10: Metrics validation
         let conv_metrics_final = operator::scrape_metrics(&convergence_metrics_addr)?;
         operator::assert_metrics_safe(&conv_metrics_final)?;
         operator::assert_probe_counter_increased(&conv_metrics_baseline, &conv_metrics_final, "Verified")?;
@@ -7052,7 +7050,7 @@ fn env_verify_gridsite_convergence(config: &Path, site: Option<&str>) -> Result<
         Ok(())
     })();
 
-    // ── Cleanup ──────────────────────────────────────────────────────────────
+    // Cleanup
     eprintln!("verify-gridsite-convergence: cleanup");
     if let Some(mut c) = server_child.take() {
         drop(c.kill());
@@ -7069,7 +7067,7 @@ fn env_verify_gridsite_convergence(config: &Path, site: Option<&str>) -> Result<
     result?;
 
     eprintln!(
-        "verify-gridsite-convergence: PASS — \
+        "verify-gridsite-convergence: PASS: \
          equivalent replicas converged, survived restart, \
          reconverged, no oscillation, no duplicate Events"
     );
@@ -7084,12 +7082,12 @@ fn env_verify_gridsite_convergence(config: &Path, site: Option<&str>) -> Result<
 ///
 /// Proves the full stack end-to-end: real cluster, real controller binary,
 /// real (mock) MCP server, actual `status.phase`/`status.discoveredTools`
-/// convergence — not a one-off manual check. See `grid#41`'s plan
+/// convergence, not a one-off manual check. See `grid#41`'s plan
 /// ("E2E tier"), which this command was scoped to satisfy permanently.
 ///
 /// Steps:
 /// 1. Install CRDs, clean up any stale prior run's resources.
-/// 2. Deploy a real mock MCP server in-cluster (a Service is required — the probe's SSRF protection deliberately blocks
+/// 2. Deploy a real mock MCP server in-cluster (a Service is required; the probe's SSRF protection deliberately blocks
 ///    loopback/link-local targets, so a locally-spawned process is not a legitimate substitute here, unlike
 ///    `GridSite`'s gateway probe) and discover its `NodePort` address: the operator under test runs out-of-cluster
 ///    (step 4), so it cannot resolve the mock's in-cluster `.svc` DNS name.
@@ -7114,19 +7112,19 @@ fn env_verify_agenttoolprovider_convergence(
     let cluster_name = kind::cluster_name_from_config(site_name);
     eprintln!("verify-agenttoolprovider-convergence: context={context}");
 
-    // ── Step 1: setup ────────────────────────────────────────────────────
+    // Step 1: setup
     eprintln!("verify-agenttoolprovider-convergence: [1/6] setup");
     operator::install_grid_crds(&context)?;
     operator::cleanup_agent_tool_provider_test_resources(&context);
     kind::delete_mock_mcp_server(&context);
 
-    // ── Step 2: deploy the real mock MCP server ─────────────────────────
+    // Step 2: deploy the real mock MCP server
     eprintln!("verify-agenttoolprovider-convergence: [2/6] deploying mock MCP server...");
     let mock_tools = ["read_file", "list_directory"];
     kind::deploy_mock_mcp_server(&context, &cluster_name, &mock_tools.join(","), None)?;
     // The operator under test runs as a local out-of-cluster process (see
     // `spawn_operator` below), so it cannot resolve in-cluster `.svc` DNS
-    // names — it must reach the mock over the kind node's NodePort address,
+    // names; it must reach the mock over the kind node's NodePort address,
     // the same pattern `discover_provider_cluster_endpoint` uses for the
     // provider gateway.
     let mock_node_port = kind::service_node_port(&context, kind::MOCK_MCP_SVC, "default")
@@ -7134,12 +7132,12 @@ fn env_verify_agenttoolprovider_convergence(
     let mock_node_ip = kind::kind_node_ip(&context)?;
     let mock_endpoint = format!("http://{mock_node_ip}:{mock_node_port}/mcp");
 
-    // ── Step 3: apply GridNetwork + GridSite + healthy AgentToolProvider ─
+    // Step 3: apply GridNetwork + GridSite + healthy AgentToolProvider
     eprintln!("verify-agenttoolprovider-convergence: [3/6] applying fixtures...");
     operator::apply_agent_tool_provider_network_fixtures(&context)?;
     operator::apply_agent_tool_provider(&context, AGENT_TOOL_TEST_PROVIDER_HEALTHY, &mock_endpoint)?;
-    // A Service name that cannot resolve — DNS failure, not a refused
-    // connection, exercising the same Unreachable classification either way.
+    // A Service name that cannot resolve (DNS failure, not a refused
+    // connection), exercising the same Unreachable classification either way.
     operator::apply_agent_tool_provider(
         &context,
         AGENT_TOOL_TEST_PROVIDER_UNREACHABLE,
@@ -7150,7 +7148,7 @@ fn env_verify_agenttoolprovider_convergence(
     let mut op_guard = ProcGuard(Some(op), "agent-tool-provider-operator");
 
     let result: Result<(), Box<dyn std::error::Error>> = (|| {
-        // ── Step 4: healthy path — Pending -> Available, tools discovered ─
+        // Step 4: healthy path (Pending -> Available, tools discovered)
         eprintln!("verify-agenttoolprovider-convergence: [4/6] waiting for healthy convergence...");
         operator::wait_for_agent_tool_provider_phase(
             &context,
@@ -7167,7 +7165,7 @@ fn env_verify_agenttoolprovider_convergence(
         }
         eprintln!("  [OK] discoveredTools = {discovered:?}");
 
-        // ── Step 5: unreachable path — Unavailable + populated reason ────
+        // Step 5: unreachable path (Unavailable + populated reason)
         eprintln!("verify-agenttoolprovider-convergence: [5/6] waiting for unreachable-endpoint failure...");
         operator::wait_for_agent_tool_provider_phase(
             &context,
@@ -7181,7 +7179,7 @@ fn env_verify_agenttoolprovider_convergence(
         }
         eprintln!("  [OK] unreachable endpoint reason = {reason:?}");
 
-        // ── Step 6: verify mcp_tool candidates in routing overlay ────────
+        // Step 6: verify mcp_tool candidates in routing overlay
         eprintln!("verify-agenttoolprovider-convergence: [6/6] checking overlay for mcp_tool candidates...");
         // Bump the GridNetwork to trigger an immediate reconcile; the overlay
         // ConfigMap may not exist yet if the controller hasn't run a full
@@ -7212,7 +7210,7 @@ fn env_verify_agenttoolprovider_convergence(
     result?;
 
     eprintln!(
-        "verify-agenttoolprovider-convergence: PASS — Pending -> Available with discoveredTools populated \
+        "verify-agenttoolprovider-convergence: PASS: Pending -> Available with discoveredTools populated \
          against a real mock MCP server, unreachable-endpoint path lands on Unavailable with a reason, \
          and routing overlay contains mcp_tool candidates"
     );
@@ -7258,31 +7256,31 @@ fn env_verify_gridsite_trust_fingerprint(config: &Path, site: Option<&str>) -> R
     let context = resolve_operator_context(&cfg, site)?;
     eprintln!("verify-gridsite-trust-fingerprint: context={context}");
 
-    // ── Step 1: CRDs, cleanup ─────────────────────────────────────────────────
+    // Step 1: CRDs, cleanup
     operator::install_grid_crds(&context)?;
     operator::cleanup_swim_trust_test_resources(&context)?;
 
     let (bind_a, bind_b) = reserve_swim_bind_addrs()?;
     eprintln!("  A={bind_a}  B={bind_b}");
 
-    // ── Step 2: Spawn operators ───────────────────────────────────────────────
+    // Step 2: Spawn operators
     let op_a = operator::spawn_operator_with_swim(&context, &bind_a, &bind_a, SWIM_TRUST_SITE_A, "", None)?;
     let mut op_a_guard = ProcGuard(Some(op_a), "trust-op-a");
     let op_b = operator::spawn_operator_with_swim(&context, &bind_b, &bind_b, SWIM_TRUST_SITE_B, &bind_a, None)?;
     let mut op_b_guard = ProcGuard(Some(op_b), "trust-op-b");
 
-    // ── Step 3: SWIM convergence + apply fixtures ─────────────────────────────
+    // Step 3: SWIM convergence + apply fixtures
     operator::wait_for_swim_convergence(SWIM_CONVERGENCE_WAIT);
     operator::apply_swim_trust_test_fixtures(&context, SWIM_TRUST_SITE_A)?;
     eprintln!("  fixtures applied; waiting for B's CRDT state via SWIM...");
 
-    // ── Step 4: Wait for distributedProviderCount > 0 ─────────────────────────
+    // Step 4: Wait for distributedProviderCount > 0
     let b_site_k8s_name = operator::auto_discovered_gridsite_name(SWIM_TRUST_NETWORK, SWIM_TRUST_SITE_B);
     let result: Result<(), Box<dyn std::error::Error>> = (|| {
         operator::wait_for_distributed_state_count(&context, SWIM_TRUST_NETWORK, 1, SWIM_STATUS_POLL_TIMEOUT)?;
         eprintln!("  [OK] CRDT from B received by A (distributedProviderCount >= 1)");
 
-        // ── Step 5: Bind TCP listener and apply plaintext egress ──────────────
+        // Step 5: Bind TCP listener and apply plaintext egress
         let listener =
             std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| format!("TCP listener bind failed: {e}"))?;
         let egress_addr = match listener.local_addr() {
@@ -7293,7 +7291,7 @@ fn env_verify_gridsite_trust_fingerprint(config: &Path, site: Option<&str>) -> R
 
         operator::apply_gridsite_egress(&context, &b_site_k8s_name, SWIM_TRUST_NETWORK, &egress_addr, None)?;
 
-        // ── Step 6: Prove TCP reachability does not establish identity ───────
+        // Step 6: Prove TCP reachability does not establish identity
         eprintln!("verify-gridsite-trust-fingerprint: [6] waiting for IdentityVerificationRequired...");
         operator::wait_for_gridsite_reason(
             &context,
@@ -7304,7 +7302,7 @@ fn env_verify_gridsite_trust_fingerprint(config: &Path, site: Option<&str>) -> R
         operator::wait_for_gridsite_phase(&context, &b_site_k8s_name, "Connecting", SWIM_STATUS_POLL_TIMEOUT)?;
         eprintln!("  [PASS] reachable TCP-only endpoint remained Connecting");
 
-        // ── Step 7: Assert B's CRDT provider remains excluded ────────────────
+        // Step 7: Assert B's CRDT provider remains excluded
         eprintln!("verify-gridsite-trust-fingerprint: [7] verifying overlay excludes B...");
         operator::wait_for_overlay_configmap(
             &context,
@@ -7320,7 +7318,7 @@ fn env_verify_gridsite_trust_fingerprint(config: &Path, site: Option<&str>) -> R
         Ok(())
     })();
 
-    // ── Cleanup ───────────────────────────────────────────────────────────────
+    // Cleanup
     if let Some(c) = op_a_guard.0.take() {
         operator::kill_operator(c);
     }
@@ -7334,7 +7332,7 @@ fn env_verify_gridsite_trust_fingerprint(config: &Path, site: Option<&str>) -> R
     result?;
 
     eprintln!(
-        "verify-gridsite-trust-fingerprint: PASS — \
+        "verify-gridsite-trust-fingerprint: PASS: \
          reachable plaintext B remained Connecting; \
          B absent from overlay without verified identity"
     );
@@ -7597,7 +7595,7 @@ mod demo_root_tests {
         let external_content = fs::read_to_string(&external_fixture).unwrap_or_else(|_| std::process::abort());
         assert_ne!(
             internal_content, external_content,
-            "internal and external fixtures must have distinct content — \
+            "internal and external fixtures must have distinct content; \
              runtime must not silently fall back to internal assets"
         );
 
