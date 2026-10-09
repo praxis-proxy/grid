@@ -471,6 +471,25 @@ fn a_provider_the_gateway_did_not_allowlist_derives_nothing() {
 }
 
 #[test]
+fn a_provider_outside_a_named_allowlist_derives_nothing() {
+    // The allowlist is the trust decision: naming prov-b admits prov-b's
+    // declarations and nothing else, however many providers are registered.
+    let providers = vec![
+        provider("prov-a", "https://a.example.invalid", None),
+        provider("prov-b", "https://b.example.invalid", None),
+    ];
+    let sites = vec![site("site-a", None)];
+    let candidates = vec![candidate("prov-a", "site-a"), candidate("prov-b", "site-a")];
+    let allowed = vec!["prov-b".to_owned()];
+    let resolved = resolve(&candidates, &[], &decl_allowing(&providers, &sites, &allowed));
+    assert_eq!(
+        resolved.keys().collect::<Vec<_>>(),
+        ["prov-b"],
+        "a registered provider the gateway did not name is not derived"
+    );
+}
+
+#[test]
 fn a_provider_in_another_network_is_not_a_source() {
     let mut foreign = provider("prov-a", "https://elsewhere.example.invalid", None);
     foreign.spec.grid_network_ref = "other-net".to_owned();

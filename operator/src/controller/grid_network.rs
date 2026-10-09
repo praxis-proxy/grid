@@ -9431,6 +9431,29 @@ mod tests {
     }
 
     #[test]
+    fn with_an_empty_allowlist_a_gateways_own_entries_pass_through_untouched() {
+        // The state a half-finished edit leaves behind: the opt-in block exists
+        // and names nobody. It must read as no provider, not every provider,
+        // and the typed entries must still reach the renderer unchanged.
+        let mut gw = make_gw_ref("inference-gw", "praxis-system");
+        let typed = vec![typed_endpoint("prov-a", "a.example.invalid:8080")];
+        gw.consumer_config = Some(ConsumerConfig {
+            derive_topology: Some(crate::crd::grid_network::DeriveTopology {
+                from_providers: Vec::new(),
+            }),
+            cluster_endpoints: typed.clone(),
+            ..make_consumer_config("praxis-consumer-config")
+        });
+        let candidates = vec![topology_candidate("prov-a", "site-a")];
+        let (endpoints, summary) = gateway_cluster_endpoints(&gw, &candidates, &empty_declarations());
+        assert_eq!(
+            endpoints, typed,
+            "an empty allowlist derives nothing and keeps the typed entries"
+        );
+        assert!(summary.is_empty(), "nothing derived, nothing to report");
+    }
+
+    #[test]
     fn with_derive_topology_an_unresolvable_candidate_leaves_the_topology_empty() {
         let mut gw = make_gw_ref("inference-gw", "praxis-system");
         gw.consumer_config = Some(ConsumerConfig {
