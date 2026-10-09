@@ -65,10 +65,14 @@ const MAX_RELAY_AGE_MS: i64 = 86_400_000; // one day
 /// stamp at render can round it a millisecond either way.
 ///
 /// A step of the publisher's wall clock between two renders moves every republished
-/// stamp by the step, so each series misses this fold once per step: it keeps a
-/// duplicate instant of the same value, or drops the republish as older. Folding on
-/// the restamped instant instead would need a second of tolerance, which merges
-/// distinct observations and breaks the exact-instant joins.
+/// stamp by the step, so a series misses this fold until it takes a newer line. A
+/// republish landing before the held instant is dropped as older, which loses
+/// nothing since the series holds that observation already, and one landing after
+/// it is kept once as a duplicate instant of the same value, whose origin the rest
+/// fold on. A dropped line leaves the origin alone, since a line older than the
+/// held one need not be the same observation. Folding on the restamped instant
+/// instead would need a second of tolerance, which merges distinct observations and
+/// breaks the exact-instant joins.
 const ORIGIN_TOLERANCE_MS: u64 = 1;
 
 /// A no-skew reference-and-local clock for tests: it sits above the small stamps
