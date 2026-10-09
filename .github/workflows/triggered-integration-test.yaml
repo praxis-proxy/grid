@@ -128,7 +128,7 @@ jobs:
           set -euo pipefail
           PR_JSON=""
           PR_JSON=$(gh api "repos/${{ github.repository }}/pulls/${PR_NUM}" 2>&1) || {
-            echo "::error::Failed to fetch PR #${PR_NUM} — does the PR exist?"
+            echo "::error::Failed to fetch PR #${PR_NUM}. Does the PR exist?"
             echo "::error::API response: ${PR_JSON}"
             exit 1
           }
@@ -158,7 +158,7 @@ jobs:
           } >> "${GITHUB_OUTPUT}"
 
           # NOTE: intentionally not capturing `.base.sha` here as the
-          # verified base — GitHub only refreshes this REST field on PR
+          # verified base: GitHub only refreshes this REST field on PR
           # synchronize events (e.g. a push to the head branch), so it can
           # lag `main`'s actual tip by hours if the PR sits idle while main
           # moves forward. The base used for verification is instead
@@ -308,7 +308,7 @@ jobs:
           retention-days: 14
 
   # ============================================================================
-  # GLB E2E — multi-cluster GLB demo against tested Grid revision
+  # GLB E2E: multi-cluster GLB demo against tested Grid revision
   # ============================================================================
 
   glb-e2e:
@@ -620,7 +620,7 @@ jobs:
 
           PINNED_GATEWAY="${GATEWAY_IMAGE_REF}@${GATEWAY_IMAGE_DIGEST}"
           if ! docker pull "${PINNED_GATEWAY}" 2>/dev/null; then
-            echo "Anonymous pull failed — attempting authenticated pull"
+            echo "Anonymous pull failed; attempting authenticated pull"
             echo "${GH_TOKEN}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
             trap cleanup_docker_auth EXIT
             docker pull "${PINNED_GATEWAY}"
@@ -732,7 +732,7 @@ jobs:
             docker inspect --format='  ID: {{.Id}}' "grid-mock-providers:${TAG}"
             docker inspect --format='  Source revision: {{index .Config.Labels "org.opencontainers.image.revision"}}' "grid-mock-providers:${TAG}"
             echo ""
-            echo "${GATEWAY_IMAGE_REF}  (pinned gateway — not built by Grid)"
+            echo "${GATEWAY_IMAGE_REF}  (pinned gateway, not built by Grid)"
             docker inspect --format='  ID: {{.Id}}' "${GATEWAY_IMAGE_REF}"
             echo "  Digest: ${RESOLVED_DIGEST}"
             echo ""

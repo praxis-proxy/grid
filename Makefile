@@ -191,7 +191,7 @@ fleet-dashboard-web:
 	npm --prefix crates/fleet-dashboard/web run build
 	rm -rf crates/fleet-dashboard/webui/dist && mkdir -p crates/fleet-dashboard/webui && cp -r crates/fleet-dashboard/web/dist crates/fleet-dashboard/webui/dist
 
-# GLB demo images — deterministic :glb-demo tags, no :latest dependency.
+# GLB demo images: deterministic :glb-demo tags, no :latest dependency.
 glb-demo-images: | require-container-engine
 	$(CONTAINER_ENGINE) build $(BUILD_ARGS) -f deploy/operator/Containerfile -t grid-operator:glb-demo .
 	$(CONTAINER_ENGINE) build $(BUILD_ARGS) -f mock-providers/Containerfile -t grid-mock-providers:glb-demo .

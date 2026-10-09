@@ -168,7 +168,7 @@ async fn metrics(axum::extract::State(state): axum::extract::State<AppState>) ->
 }
 
 // ---------------------------------------------------------------------------
-// Response builders — chat completions
+// Response builders: chat completions
 // ---------------------------------------------------------------------------
 
 /// Build a non-streaming chat completions response.
@@ -226,7 +226,7 @@ fn streaming_chunks(model: &str) -> Vec<Value> {
 }
 
 // ---------------------------------------------------------------------------
-// Response builders — Responses API
+// Response builders: Responses API
 // ---------------------------------------------------------------------------
 
 /// Build a non-streaming Responses API response.

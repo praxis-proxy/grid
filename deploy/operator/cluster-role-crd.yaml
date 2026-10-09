@@ -5,7 +5,7 @@ metadata:
   labels:
     app.kubernetes.io/managed-by: grid-operator
 rules:
-  # ── Grid CRDs (cluster-scoped) ──────────────────────────────────────
+  # Grid CRDs (cluster-scoped)
   #
   # The operator watches the Grid CRD types via kube-rs Controller::new
   # (requires list + watch).  It reads individual resources with get and

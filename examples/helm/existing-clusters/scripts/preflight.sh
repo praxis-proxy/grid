@@ -156,10 +156,10 @@ for SITE in $SITE_NAMES; do
     ERRORS=$((ERRORS + 1))
   fi
 
-  # ── Prerequisite resources ───────────────────────────────────────
+  # Prerequisite resources
 
   if ! kubectl --context "$CONTEXT" get namespace grid-system &>/dev/null; then
-    echo "  FAIL  grid-system namespace does not exist — create it and populate prerequisite resources before installing" >&2
+    echo "  FAIL  grid-system namespace does not exist; create it and populate prerequisite resources before installing" >&2
     ERRORS=$((ERRORS + 1))
   else
     ROLES=$(yq eval ".sites.${SITE}.roles[]" "$INVENTORY" 2>/dev/null || echo "")
@@ -196,7 +196,7 @@ for SITE in $SITE_NAMES; do
         get secret provider-tls
     fi
 
-    # ── Credential Secret validation ──────────────────────────────
+    # Credential Secret validation
 
     MOCK_VALUES="${VALUES_DIR}/${SITE}-grid-mock-providers.yaml"
     if [[ -f "$MOCK_VALUES" ]]; then
@@ -222,7 +222,7 @@ for SITE in $SITE_NAMES; do
           echo "  FAIL  credential Secret '$SEC_NAME' key '$SEC_KEY' decoded to empty" >&2
           ERRORS=$((ERRORS + 1))
         elif [[ "$CRED_RAW" == *$'\n' || "$CRED_RAW" == *$'\r' ]]; then
-          echo "  FAIL  credential Secret '$SEC_NAME' key '$SEC_KEY' has trailing newline — mock backends will reject the token; recreate with: printf '%s' \"\$(cat tokenfile)\" | kubectl create secret generic $SEC_NAME --from-file=${SEC_KEY}=/dev/stdin --dry-run=client -o yaml | kubectl apply -f -" >&2
+          echo "  FAIL  credential Secret '$SEC_NAME' key '$SEC_KEY' has trailing newline; mock backends will reject the token; recreate with: printf '%s' \"\$(cat tokenfile)\" | kubectl create secret generic $SEC_NAME --from-file=${SEC_KEY}=/dev/stdin --dry-run=client -o yaml | kubectl apply -f -" >&2
           ERRORS=$((ERRORS + 1))
         else
           echo "  PASS  credential Secret '$SEC_NAME' key '$SEC_KEY' present (no trailing newline)"
@@ -230,7 +230,7 @@ for SITE in $SITE_NAMES; do
       done < <(paste <(echo "$CRED_SECRETS") <(echo "$CRED_KEYS"))
     fi
 
-    # ── GridSite provider-site label ─────────────────────────────
+    # GridSite provider-site label
 
     if $HAS_PROVIDER; then
       if [[ -f "${VALUES_DIR}/${SITE}-grid-site.yaml" ]]; then
@@ -242,13 +242,13 @@ for SITE in $SITE_NAMES; do
         if [[ -n "$GRIDSITE_WITH_LABEL" ]]; then
           echo "  PASS  GridSite has provider-site label"
         else
-          echo "  FAIL  no GridSite with grid.praxis.fast/provider-site label — InferenceProvider siteSelector will not match" >&2
+          echo "  FAIL  no GridSite with grid.praxis.fast/provider-site label; InferenceProvider siteSelector will not match" >&2
           ERRORS=$((ERRORS + 1))
         fi
       fi
     fi
 
-    # ── TLS SAN inspection ───────────────────────────────────────
+    # TLS SAN inspection
 
     if command -v openssl &>/dev/null; then
       inspect_tls_sans() {
@@ -279,7 +279,7 @@ for SITE in $SITE_NAMES; do
       fi
     fi
 
-    # ── Helm chart renderability ─────────────────────────────────
+    # Helm chart renderability
 
     if [[ -d "$CHART_DIR/grid-operator" ]]; then
       OPERATOR_VALUES="${VALUES_DIR}/${SITE}-operator.yaml"
