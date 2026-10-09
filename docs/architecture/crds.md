@@ -143,13 +143,13 @@ spend recorded anywhere in the grid, not just the local site.
 
 For every tenant declared in `budgetPolicy`, `budgetStatus[]` reports:
 
-- `tenantId` — matches `budgetPolicy.tenants[].tenantId`
-- `capUsd` — copied from the policy, in USD
-- `spendUsd` — the converged cross-site total, in USD
-- `spendRatio` — `spendUsd / capUsd`, for at-a-glance dashboarding
+- `tenantId`: matches `budgetPolicy.tenants[].tenantId`
+- `capUsd`: copied from the policy, in USD
+- `spendUsd`: the converged cross-site total, in USD
+- `spendRatio`: `spendUsd / capUsd`, for at-a-glance dashboarding
 
 `budgetStatus[]` is a status **signal only**. AGN does not itself degrade or
-reject traffic when a tenant's `spendRatio` reaches or exceeds `1.0` — that
+reject traffic when a tenant's `spendRatio` reaches or exceeds `1.0`; that
 enforcement decision is expected to live in a gateway-side policy filter
 (cross-repo, `praxis-ai`), the same split used for `provider_route`
 authorization. Real per-request tenant attribution also depends on
@@ -168,7 +168,7 @@ options under consideration if per-tenant confidentiality is required.
 | `namespace` | string | Namespace of the gateway and generated `ConfigMap` |
 | `configMapName` | string | Name of the generated `ConfigMap` |
 | `phase` | enum | `Rendered` \| `Error` \| `Disabled` |
-| `reason` | string | Machine-readable reason (`MissingClusterEndpoint`, `ConsumerConfigRenderFailed`, `ConsumerConfigApplyFailed`) — empty when `Rendered` |
+| `reason` | string | Machine-readable reason (`MissingClusterEndpoint`, `ConsumerConfigRenderFailed`, `ConsumerConfigApplyFailed`); empty when `Rendered` |
 | `message` | string | Human-readable diagnostic; never contains token bytes |
 | `observedGeneration` | integer | `GridNetwork` generation when this entry was last updated |
 
@@ -208,7 +208,7 @@ status:
 SWIM mesh formation. Each entry may be a literal IPv4 address, a bracketed IPv6
 address, or a DNS hostname. Hostnames are resolved with a bounded lookup before
 they are announced to the running SWIM runtime on every
-`GridNetwork` reconcile.  Re-announcing to an existing peer is idempotent — foca
+`GridNetwork` reconcile.  Re-announcing to an existing peer is idempotent: foca
 ignores redundant joins.
 
 **Runtime update behavior:**
@@ -225,7 +225,7 @@ Seeds are not guaranteed to be joined within one reconcile cycle under heavy
 broadcast load, but the retry is automatic.
 
 **Scope:** `spec.seeds` targets the SWIM site-membership layer.  The SWIM runtime
-is process-global — all `GridNetwork` resources in the operator process share the
+is process-global: all `GridNetwork` resources in the operator process share the
 same SWIM node.  Seeds from any `GridNetwork` reach the shared SWIM membership
 table.  Provider CRDT state remains scoped per network.
 
@@ -325,8 +325,8 @@ When `enabled: true`, the `GridNetwork` controller renders a `praxis.yaml`-keyed
 `ConfigMap` in the gateway namespace on each reconcile.  The generated config is a
 complete, runnable Praxis config containing:
 
-- `listeners:` — one public listener at `0.0.0.0:{listenerPort}`
-- `filter_chains:` — the consumer chain with:
+- `listeners:` with one public listener at `0.0.0.0:{listenerPort}`
+- `filter_chains:` holding the consumer chain with:
   - `intelligent_route` reading the versioned routing overlay with expected
     network, gateway, namespace, and local-site scope. Candidates and selection
     policy are not copied into startup-only YAML.
@@ -339,8 +339,8 @@ complete, runnable Praxis config containing:
     inactive providers needed for restoration. Every potentially routable
     cluster must have a matching `clusterEndpoints[]` entry with endpoint address
     and explicit `transport` configuration.  `transport.mode` is the security
-    switch — not `sni` presence.  Missing transport fails closed
-- `admin:` — admin listener at `127.0.0.1:9901`
+    switch, not `sni` presence.  Missing transport fails closed
+- `admin:` with an admin listener at `127.0.0.1:9901`
 - `shutdown_timeout_secs: 5`
 
 The generated credential-injection config is for credentials intentionally
@@ -491,7 +491,7 @@ private-key markers (`PRIVATE KEY`) cause the input to be discarded entirely and
 logged.  Non-certificate PEM triggers `TrustMaterialInvalid` status.  A valid `CERTIFICATE`
 header passes the structural check.
 
-This field contains only the public certificate — never a private key.  A non-empty
+This field contains only the public certificate, never a private key.  A non-empty
 `publicCertPem` means the remote site has shared its public identity material and the
 structural check passed.  It does **not** mean:
 
@@ -506,7 +506,7 @@ be written to status.
 
 | Field | Meaning |
 |---|---|
-| `mode` | `Mutual` (default) — TLS handshake with CA verification and client auth; `Plaintext` — TCP-only diagnostics that never become routing-eligible |
+| `mode` | `Mutual` (default): TLS handshake with CA verification and client auth; `Plaintext`: TCP-only diagnostics that never become routing-eligible |
 | `serverName` | Expected DNS identity for TLS SNI and SAN verification; required for `Mutual`, must be absent for `Plaintext` |
 
 **`spec.trust` fields:**
@@ -546,7 +546,7 @@ and its mTLS gateway probe (`spec.egress` + `spec.trust`) apply to reaching
 
 See [Routing eligibility](routing.md#routing-eligibility) for the full gating rule.
 
-Example status — Mutual TLS verified:
+Example status (Mutual TLS verified):
 
 ```yaml
 status:
@@ -558,7 +558,7 @@ status:
   lastTransitionTime: "2026-07-30T11:55:00Z"
 ```
 
-Example status — trust material missing:
+Example status (trust material missing):
 
 ```yaml
 status:
@@ -568,7 +568,7 @@ status:
   observedGeneration: 3
 ```
 
-Example status — gateway address not configured on remote operator:
+Example status (gateway address not configured on remote operator):
 
 ```yaml
 status:
@@ -928,8 +928,8 @@ spec:
 
 #### Queue depth normalization
 
-AGN does not normalize raw queue counts. Exporters should publish
-`queueDepth` as a normalized `0.0`–`1.0` gauge before the operator scrapes it.
+AGN does not normalize raw queue counts. Exporters should publish `queueDepth`
+as a normalized `0.0` to `1.0` gauge before the operator scrapes it.
 
 ### Model discovery
 
@@ -1031,7 +1031,7 @@ spec:
 
 `Degraded` is not currently reachable for this CRD: unlike
 `InferenceProvider`'s metrics-scrape path, the MCP `tools/list` probe has no
-partial-success state to represent — it either succeeds (`Available`) or
+partial-success state to represent: it either succeeds (`Available`) or
 fails outright (`Unavailable`), mirroring `phase_and_reason_from_probe`'s and
 `phase_from_matching`'s explicit design (both are tested to never emit
 `Degraded`).
@@ -1052,13 +1052,13 @@ below), `observedGeneration`
 | `McpToolsListInvalidResponse` | Unavailable | The endpoint was reached but the `tools/list` exchange failed or returned an unparseable response. |
 | `McpAuthRejected` | Unavailable | The MCP server rejected the configured `spec.auth` credentials (HTTP 401/403). |
 | `McpAuthTokenInvalid` | Unavailable | The resolved `spec.auth` bearer token contains characters that cannot be sent as an HTTP header value; the probe fails closed rather than proceeding unauthenticated. |
-| `EndpointTlsSecretMissing` | Unavailable | A referenced TLS Secret does not exist (or the requested key is absent — see [`grid#58`](https://github.com/praxis-proxy/grid/issues/58) for a known misclassification of the latter). |
+| `EndpointTlsSecretMissing` | Unavailable | A referenced TLS Secret does not exist (or the requested key is absent; see [`grid#58`](https://github.com/praxis-proxy/grid/issues/58) for a known misclassification of the latter). |
 | `EndpointTlsKeyMissing` | Unavailable | The expected key exists in the Secret but its value is empty. |
 | `EndpointTlsMaterialInvalid` | Unavailable | CA certificate PEM material could not be parsed. |
 | `EndpointTlsIdentityMismatch` | Unavailable | Client certificate or private key PEM material could not be parsed. |
 
 An empty `reason` with `phase: Available` means `SitesMatched`; an empty
-`reason` with `phase: Pending` means `AwaitingSiteMatch` — both are
+`reason` with `phase: Pending` means `AwaitingSiteMatch`; both are
 telemetry-only labels (`grid_mcp_probe_total`, Events), not persisted to
 `status.reason` itself.
 

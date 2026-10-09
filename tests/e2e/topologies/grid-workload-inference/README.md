@@ -1,4 +1,4 @@
-# grid-workload-inference — Internal E2E Topology
+# grid-workload-inference: Internal E2E Topology
 
 Internal test topology for the AGN workload-inference E2E scenario.
 

@@ -145,7 +145,7 @@ Every suppression must include a `reason`:
 )]
 fn build_pipeline() { /* ... */ }
 
-// Bad — denied by allow_attributes:
+// Bad (denied by allow_attributes):
 #[allow(clippy::too_many_lines)]
 fn build_pipeline() { /* ... */ }
 ```
@@ -164,12 +164,12 @@ runtime panics. The `await_holding_lock` and
 `await_holding_refcell_ref` lints enforce this.
 
 ```rust
-// Bad — guard held across await:
+// Bad (guard held across await):
 let guard = mutex.lock().await;
 let result = some_async_call().await;
 drop(guard);
 
-// Good — drop guard before awaiting:
+// Good (drop guard before awaiting):
 let data = {
     let guard = mutex.lock().await;
     guard.clone()
@@ -200,10 +200,10 @@ out of scope. The `unused_trait_names` lint enforces
 this.
 
 ```rust
-// Good — trait name unused, import anonymously:
+// Good (trait name unused, import anonymously):
 use std::io::Write as _;
 
-// Bad — trait name pollutes scope unnecessarily:
+// Bad (trait name pollutes scope unnecessarily):
 use std::io::Write;
 ```
 

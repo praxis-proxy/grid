@@ -198,7 +198,7 @@ Praxis AI image; these values may advance independently.
 | `replicaCount` | int | `1` | Gateway replicas. |
 | `image.repository` | string | `ghcr.io/praxis-proxy/ai` | Image repository. |
 | `image.tag` | string | `0.4.0` | Image tag (ignored when `image.digest` is set). |
-| `image.digest` | string | `""` | Immutable digest (sha256:…). When set, tag is ignored. |
+| `image.digest` | string | `""` | Immutable digest (sha256:...). When set, tag is ignored. |
 | `image.flavor` | string | `ai` | `ai` or `grid-gateway`, the grid build that `gatewayConfig.role: provider`, `gridServing`, and telemetry need. A repository ending in `/grid-gateway` sets it. |
 | `image.pullPolicy` | string | `IfNotPresent` | Image pull policy. |
 | `imagePullSecrets` | list | `[]` | Pull secrets for private registries. |

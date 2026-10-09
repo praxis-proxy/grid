@@ -1,4 +1,4 @@
-# grid-llmd-pool-metrics — Deterministic llm-d pool-metrics qualification
+# grid-llmd-pool-metrics: Deterministic llm-d pool-metrics qualification
 
 Internal test topology for the AGN llm-d pool-metrics E2E scenario.
 
@@ -32,9 +32,9 @@ by this topology. For local development, set
 
 ### Flags
 
-- `--metrics-mtls` — protect EPP metrics scraping with an nginx mTLS proxy
+- `--metrics-mtls`: protect EPP metrics scraping with an nginx mTLS proxy
   instead of scraping directly over HTTP.
-- `--kv-cache` — drive routing off llm-d's kv-cache-utilization signal
+- `--kv-cache`: drive routing off llm-d's kv-cache-utilization signal
   (`GridNetwork.spec.scoringPolicy.strategy: kvCachePressure`) instead of the
   default queue-depth signal (`strategy: queueDepth`). Both signals are
   always shown in the live scorecard; this flag only changes which one
