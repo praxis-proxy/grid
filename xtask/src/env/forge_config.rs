@@ -1,11 +1,99 @@
 //! Forge configuration materialization for local image overrides.
 
 use std::{
+    ffi::OsStr,
     fs,
     path::{Path, PathBuf},
+    process::Command,
 };
 
 use super::image_overrides;
+
+/// Return a Forge state directory scoped to one resolved topology run.
+pub(crate) fn state_dir_for_config(resolved_config: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let parent = resolved_config
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let parent = fs::canonicalize(parent)?;
+    let run_name = resolved_config
+        .file_stem()
+        .and_then(OsStr::to_str)
+        .filter(|name| !name.is_empty())
+        .ok_or("resolved Forge config must have a UTF-8 file stem")?;
+    Ok(parent.join(".forge").join(run_name))
+}
+
+/// Build a Forge command that cannot read or modify another topology's state.
+pub(crate) fn command(
+    binary: impl AsRef<OsStr>,
+    resolved_config: &Path,
+) -> Result<Command, Box<dyn std::error::Error>> {
+    let state_dir = state_dir_for_config(resolved_config)?;
+    fs::create_dir_all(&state_dir)?;
+    let mut command = Command::new(binary);
+    command
+        .args(["--state-dir"])
+        .arg(&state_dir)
+        .env("FORGE_STATE_DIR", &state_dir);
+    Ok(command)
+}
+
+/// Rewrite runtime-file references in Forge shell steps for the selected state directory.
+/// Forge resolves `template-file` targets relative to its state directory, while shell steps
+/// execute from the repository working directory and need an explicit path.
+pub(crate) fn rewrite_exec_runtime_paths(config: &mut serde_yaml::Value, state_dir: &Path) {
+    match config {
+        serde_yaml::Value::Mapping(mapping) => {
+            let is_exec = mapping
+                .get(serde_yaml::Value::String("type".to_owned()))
+                .and_then(serde_yaml::Value::as_str)
+                == Some("exec");
+            if is_exec {
+                if let Some(command) = mapping.get_mut(serde_yaml::Value::String("command".to_owned())) {
+                    rewrite_runtime_path_strings(command, state_dir);
+                }
+            } else {
+                for child in mapping.values_mut() {
+                    rewrite_exec_runtime_paths(child, state_dir);
+                }
+            }
+        },
+        serde_yaml::Value::Sequence(items) => {
+            for item in items {
+                rewrite_exec_runtime_paths(item, state_dir);
+            }
+        },
+        serde_yaml::Value::Null
+        | serde_yaml::Value::Bool(_)
+        | serde_yaml::Value::Number(_)
+        | serde_yaml::Value::String(_)
+        | serde_yaml::Value::Tagged(_) => {},
+    }
+}
+
+/// Replace `.forge/runtime/` only inside a shell `exec` step's command value.
+fn rewrite_runtime_path_strings(value: &mut serde_yaml::Value, state_dir: &Path) {
+    match value {
+        serde_yaml::Value::String(command) => {
+            *command = command.replace(".forge/runtime/", &format!("{}/runtime/", state_dir.display()));
+        },
+        serde_yaml::Value::Sequence(items) => {
+            for item in items {
+                rewrite_runtime_path_strings(item, state_dir);
+            }
+        },
+        serde_yaml::Value::Mapping(mapping) => {
+            for child in mapping.values_mut() {
+                rewrite_runtime_path_strings(child, state_dir);
+            }
+        },
+        serde_yaml::Value::Null
+        | serde_yaml::Value::Bool(_)
+        | serde_yaml::Value::Number(_)
+        | serde_yaml::Value::Tagged(_) => {},
+    }
+}
 
 /// Render a Forge environment with the explicitly selected demo images.
 pub(crate) fn materialize(source: &Path, output: Option<&Path>) -> Result<PathBuf, Box<dyn std::error::Error>> {
@@ -132,9 +220,65 @@ fn parse_image_ref(image: &str) -> (String, String) {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::PathBuf};
+    use std::{
+        ffi::OsStr,
+        fs,
+        path::{Path, PathBuf},
+    };
 
-    use super::parse_image_ref;
+    use super::{command, parse_image_ref, rewrite_exec_runtime_paths, state_dir_for_config};
+
+    #[test]
+    #[expect(clippy::expect_used, reason = "temporary Forge configuration fixture")]
+    fn forge_commands_use_the_resolved_run_state_directory() {
+        let temp = tempfile::tempdir().expect("create fixture directory");
+        let combined_dir = temp.path().join("grid-combined-site");
+        let glb_dir = temp.path().join("grid-glb-demo");
+        fs::create_dir_all(&combined_dir).expect("create combined topology directory");
+        fs::create_dir_all(&glb_dir).expect("create GLB topology directory");
+        let combined_config = combined_dir.join(".forge.resolved-run-a.yaml");
+        let second_combined_config = combined_dir.join(".forge.resolved-run-b.yaml");
+        let glb_config = glb_dir.join(".forge.resolved-run-b.yaml");
+        fs::write(&combined_config, "kind: ForgeEnvironment\n").expect("write combined config");
+        fs::write(&second_combined_config, "kind: ForgeEnvironment\n").expect("write second combined config");
+        fs::write(&glb_config, "kind: ForgeEnvironment\n").expect("write GLB config");
+
+        let combined_state = state_dir_for_config(&combined_config).expect("scope combined state");
+        let second_combined_state = state_dir_for_config(&second_combined_config).expect("scope second combined state");
+        let glb_state = state_dir_for_config(&glb_config).expect("scope GLB state");
+        assert_ne!(combined_state, second_combined_state);
+        assert_ne!(combined_state, glb_state);
+        assert_eq!(
+            combined_state,
+            state_dir_for_config(&combined_config).expect("repeat combined state")
+        );
+
+        let forge = command("praxis-forge", &combined_config).expect("build scoped Forge command");
+        assert_eq!(forge.get_args().next(), Some(OsStr::new("--state-dir")));
+        assert_eq!(forge.get_args().nth(1), Some(combined_state.as_os_str()));
+        assert!(
+            forge.get_envs().any(|(key, value)| {
+                key == OsStr::new("FORGE_STATE_DIR") && value == Some(combined_state.as_os_str())
+            })
+        );
+        assert!(combined_state.is_dir());
+    }
+
+    #[test]
+    #[expect(clippy::expect_used, reason = "temporary Forge configuration fixture")]
+    fn only_exec_runtime_references_move_to_the_run_state_directory() {
+        let state_dir = Path::new("/tmp/grid-run/forge-state");
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            "spec:\n  stacks:\n    consumer:\n      steps:\n        - type: template-file\n          target: .forge/runtime/cluster/config.yaml\n        - type: exec\n          command: kubectl apply -f .forge/runtime/cluster/config.yaml\n",
+        )
+        .expect("parse Forge config fixture");
+
+        rewrite_exec_runtime_paths(&mut config, state_dir);
+        let rendered = serde_yaml::to_string(&config).expect("render Forge config fixture");
+
+        assert!(rendered.contains("target: .forge/runtime/cluster/config.yaml"));
+        assert!(rendered.contains("command: kubectl apply -f /tmp/grid-run/forge-state/runtime/cluster/config.yaml"));
+    }
 
     #[test]
     fn parses_tagged_and_untagged_images() {

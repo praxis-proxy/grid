@@ -6,7 +6,7 @@
 //! overlay hot reload without assigning a public contract to a step count.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     fs,
     path::{Path, PathBuf},
     process::Command,
@@ -53,6 +53,9 @@ const EDGE_CLUSTERS: &[&str] = &["east-edge", "west-edge"];
 /// SWIM LB service name in the GLB demo.
 const SWIM_LB_SERVICE: &str = "grid-operator-swim";
 
+/// Routing overlay file projected into each Praxis edge pod.
+const EDGE_ROUTING_OVERLAY_PATH: &str = "/etc/praxis/routing/routing-overlay.json";
+
 /// Overlay [`ConfigMap`] name on the edge site.
 ///
 /// [`ConfigMap`]: https://kubernetes.io/docs/concepts/configuration/configmap/
@@ -72,6 +75,9 @@ const PRIMARY_EDGE: &str = "east-edge";
 /// Maximum time for provider state to traverse reconciliation and SWIM.
 const PROVIDER_STATE_WAIT: Duration = Duration::from_secs(180);
 
+/// Number of remote Grid sites expected in the GLB SWIM mesh.
+const EXPECTED_CONNECTED_SITES: u64 = 3;
+
 /// Maximum time for request routing to reflect an accepted overlay update.
 const DATA_PLANE_CONVERGENCE_WAIT: Duration = Duration::from_secs(45);
 
@@ -90,7 +96,7 @@ const DATA_PLANE_PROBE_INTERVAL: Duration = Duration::from_secs(1);
 const OVERLAY_SETTLE_WINDOW: Duration = Duration::from_secs(15);
 
 /// Runtime directory retaining the public CA used by client probes.
-const GTM_TLS_DIR: &str = ".forge/runtime/glb-tls/gtm";
+const GTM_TLS_RUNTIME_DIR: &str = "runtime/glb-tls/gtm";
 
 /// Stable HTTPS name exposed by the local GTM profile.
 const GTM_SERVER_NAME: &str = "api.grid-glb.test";
@@ -179,8 +185,9 @@ const CLIENT_BEARER_TOKEN: &str = "test-token";
 /// `peer_identity_trust` checks independently in the provider pipeline.
 pub(crate) fn prepare_provider_boundary() -> Result<(), Box<dyn std::error::Error>> {
     let demo_root = super::demo_root(Path::new("tests/e2e/topologies/grid-glb-demo/forge.yaml"));
-    stage_provider_boundary_with_mode_and_external(IngressMode::Global, None, &demo_root)
-        .and_then(|()| install_provider_boundary())
+    let forge_state_dir = Path::new(".forge");
+    stage_provider_boundary_with_mode_and_external(IngressMode::Global, None, &demo_root, forge_state_dir)
+        .and_then(|()| install_provider_boundary_with_mode_and_external(IngressMode::Global, None, forge_state_dir))
 }
 
 /// Generate identities for an ingress mode and optional external provider.
@@ -192,6 +199,7 @@ pub(crate) fn stage_provider_boundary_with_mode_and_external(
     ingress_mode: IngressMode,
     external: Option<&ExternalProviderDescriptor>,
     demo_root: &Path,
+    forge_state_dir: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let identities = vec![
         "east-edge".to_owned(),
@@ -207,20 +215,18 @@ pub(crate) fn stage_provider_boundary_with_mode_and_external(
         wrong_ca.cert_pem,
     )?;
     if ingress_mode == IngressMode::Global {
-        stage_gtm_tls()?;
+        stage_gtm_tls(forge_state_dir)?;
     }
     let east_edge_digest = certs::certificate_sha256(&Path::new(GENERATED_CERTS_DIR).join("east-edge-cert.pem"))?;
     let west_edge_digest = certs::certificate_sha256(&Path::new(GENERATED_CERTS_DIR).join("west-edge-cert.pem"))?;
-    stage_provider_configs_with_external(&east_edge_digest, &west_edge_digest, external, demo_root)?;
+    stage_provider_configs_with_external(
+        &east_edge_digest,
+        &west_edge_digest,
+        external,
+        demo_root,
+        forge_state_dir,
+    )?;
     Ok(())
-}
-
-/// Install staged provider identities, configs, and backend credentials.
-///
-/// The `grid-system` namespace must exist. Provider deployments may already
-/// exist or may be applied after this function returns.
-pub(crate) fn install_provider_boundary() -> Result<(), Box<dyn std::error::Error>> {
-    install_provider_boundary_with_mode_and_external(IngressMode::Global, None)
 }
 
 /// Install identities for an ingress mode and optional external provider.
@@ -232,6 +238,7 @@ pub(crate) fn install_provider_boundary() -> Result<(), Box<dyn std::error::Erro
 pub(crate) fn install_provider_boundary_with_mode_and_external(
     ingress_mode: IngressMode,
     external_key_file: Option<&Path>,
+    forge_state_dir: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if ingress_mode == IngressMode::Global {
         ensure_demo_namespace("gtm-emulator")?;
@@ -240,11 +247,11 @@ pub(crate) fn install_provider_boundary_with_mode_and_external(
         apply_identity_tls_secret(edge, edge, EDGE_TLS_SECRET)?;
     }
     if ingress_mode == IngressMode::Global {
-        apply_gtm_tls_secret()?;
+        apply_gtm_tls_secret(forge_state_dir)?;
     }
     for provider in PROVIDER_CLUSTERS {
         let provider_credential = generate_provider_credential()?;
-        apply_provider_config(provider)?;
+        apply_provider_config(provider, forge_state_dir)?;
         apply_provider_tls_secret(provider)?;
         apply_provider_credential_secret(provider, &provider_credential)?;
         if *provider == "east-provider" {
@@ -322,6 +329,7 @@ fn stage_provider_configs_with_external(
     west_edge_digest: &str,
     external: Option<&ExternalProviderDescriptor>,
     demo_root: &Path,
+    forge_state_dir: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     for provider in PROVIDER_CLUSTERS {
         let source = demo_root.join("configs").join(provider).join("praxis.yaml");
@@ -350,7 +358,7 @@ fn stage_provider_configs_with_external(
         {
             rendered = append_openai_provider_config(&rendered, ext, &openai_candidate_id(&ext.model))?;
         }
-        let target_dir = Path::new(".forge/runtime/glb-tls/provider-configs").join(provider);
+        let target_dir = forge_state_dir.join("runtime/glb-tls/provider-configs").join(provider);
         fs::create_dir_all(&target_dir)?;
         fs::write(target_dir.join("praxis.yaml"), rendered)?;
     }
@@ -780,12 +788,12 @@ pub(crate) fn verify_external_provider_absent() -> Result<String, Box<dyn std::e
 }
 
 /// Generate a public-facing certificate for the stable local GTM name.
-fn stage_gtm_tls() -> Result<(), Box<dyn std::error::Error>> {
+fn stage_gtm_tls(forge_state_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let certs_dir = Path::new(GENERATED_CERTS_DIR);
     let ca = certs::load_or_generate_ca(certs_dir)?;
     let certificate = ::certs::generate_dns_cert(&ca, "grid-glb-demo-ingress", GTM_SERVER_NAME)?;
-    let target = Path::new(GTM_TLS_DIR);
-    fs::create_dir_all(target)?;
+    let target = forge_state_dir.join(GTM_TLS_RUNTIME_DIR);
+    fs::create_dir_all(&target)?;
     fs::write(target.join("ca.crt"), &ca.cert_pem)?;
     fs::write(target.join("tls.crt"), certificate.cert_pem)?;
     fs::write(target.join("tls.key"), certificate.key_pem)?;
@@ -793,7 +801,7 @@ fn stage_gtm_tls() -> Result<(), Box<dyn std::error::Error>> {
     {
         use std::os::unix::fs::PermissionsExt as _;
 
-        fs::set_permissions(target, fs::Permissions::from_mode(0o750))?;
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o750))?;
         fs::set_permissions(target.join("tls.key"), fs::Permissions::from_mode(0o640))?;
     }
     Ok(())
@@ -824,8 +832,8 @@ fn apply_identity_tls_secret(
 }
 
 /// Apply the stable-name certificate used by the GTM emulator.
-fn apply_gtm_tls_secret() -> Result<(), Box<dyn std::error::Error>> {
-    let tls_dir = Path::new(GTM_TLS_DIR);
+fn apply_gtm_tls_secret(forge_state_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let tls_dir = forge_state_dir.join(GTM_TLS_RUNTIME_DIR);
     apply_tls_secret_from_paths(
         "gtm-emulator",
         GTM_TLS_SECRET,
@@ -872,8 +880,9 @@ fn apply_tls_secret_from_paths(
 }
 
 /// Apply the rendered provider gateway `ConfigMap`.
-fn apply_provider_config(provider: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let config_path = Path::new(".forge/runtime/glb-tls/provider-configs")
+fn apply_provider_config(provider: &str, forge_state_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let config_path = forge_state_dir
+        .join("runtime/glb-tls/provider-configs")
         .join(provider)
         .join("praxis.yaml");
     let output = Command::new("kubectl")
@@ -1461,7 +1470,7 @@ fn run_steps(ctx: &PrereqContext, mode: DemoMode, ingress_mode: IngressMode, res
 
     // Provider gateway self-discovery.
     proof_banner("checking provider gateway self-discovery");
-    let provider_gateway_addrs = match load_provider_gateway_addresses() {
+    let provider_gateway_addrs = match load_provider_gateway_addresses(&ctx.config) {
         Ok(addrs) => addrs,
         Err(e) => {
             results.push(StepResult::fail("provider gateway addr", e.as_ref()));
@@ -2460,7 +2469,7 @@ fn block_remaining(from_label: &str, reason: &str, results: &mut Vec<StepResult>
 
 /// Validate the Forge config.
 fn validate_forge_config(forge_bin: &str, config: &Path) -> Result<String, Box<dyn std::error::Error>> {
-    let output = Command::new(forge_bin)
+    let output = super::forge_config::command(forge_bin, config)?
         .args(["config", "validate", "--config", &config.display().to_string()])
         .output()?;
     if output.status.success() {
@@ -2476,7 +2485,7 @@ pub(crate) fn run_forge_status(
     forge_bin: &str,
     config: &Path,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    let output = Command::new(forge_bin)
+    let output = super::forge_config::command(forge_bin, config)?
         .args(["status", "--config", &config.display().to_string(), "--output", "json"])
         .output()?;
     if !output.status.success() {
@@ -3175,10 +3184,11 @@ fn find_gridsite_egress<'cfg>(
         .unwrap_or(""))
 }
 
-/// Load expected provider gateway addresses from Forge's default state file
+/// Load expected provider gateway addresses from this run's Forge state file
 /// (verifier evidence only — operators self-discover their own addresses).
-fn load_provider_gateway_addresses() -> Result<BTreeMap<String, String>, Box<dyn std::error::Error>> {
-    let state = fs::read_to_string(".forge/state.json")?;
+fn load_provider_gateway_addresses(config: &Path) -> Result<BTreeMap<String, String>, Box<dyn std::error::Error>> {
+    let state_dir = super::forge_config::state_dir_for_config(config)?;
+    let state = fs::read_to_string(state_dir.join("state.json"))?;
     parse_provider_gateway_captures(&state)
 }
 
@@ -3302,6 +3312,588 @@ pub(crate) fn wait_for_edge_overlays_ready_with_count(
     Err(format!("timeout waiting for complete edge overlays: {last_error}").into())
 }
 
+/// Read the current `GridNetwork` resource version before restarting its operator.
+pub(crate) fn grid_network_resource_version(cluster: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let network = grid_network_json(cluster)?;
+    network
+        .pointer("/metadata/resourceVersion")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| format!("{cluster} GridNetwork has no metadata.resourceVersion").into())
+}
+
+/// Capture both edge publication revisions before restarting an operator.
+///
+/// The revision is a semantic content digest, so a completed reconcile that
+/// renders identical content does not need to produce a new revision.
+pub(crate) fn edge_overlay_revision_baselines() -> Result<BTreeMap<String, String>, Box<dyn std::error::Error>> {
+    EDGE_CLUSTERS
+        .iter()
+        .map(|edge| {
+            let config_map = edge_overlay_configmap_json(edge)?;
+            let revision = edge_overlay_revision_from_configmap(edge, &config_map)?;
+            Ok(((*edge).to_owned(), revision))
+        })
+        .collect()
+}
+
+/// Invalidate each run-owned edge's observed-generation marker after an
+/// operator restart so the edge controller must reconcile the overlay again.
+///
+/// The returned resource versions identify the marker writes. Readiness then
+/// requires each edge controller to restore the current generation and report
+/// the `ConfigMap` revision it actually published.
+#[expect(
+    clippy::too_many_lines,
+    reason = "each edge status marker must be validated, reset, and tied to its returned resource version"
+)]
+pub(crate) fn reset_edge_overlay_observation_markers() -> Result<BTreeMap<String, String>, Box<dyn std::error::Error>> {
+    EDGE_CLUSTERS
+        .iter()
+        .map(|edge| {
+            let network = grid_network_json(edge)?;
+            let generation = network
+                .pointer("/metadata/generation")
+                .and_then(serde_json::Value::as_u64)
+                .filter(|generation| *generation > 0)
+                .ok_or_else(|| format!("{edge} GridNetwork has no positive generation"))?;
+            let observed_generation = network
+                .pointer("/status/observedGeneration")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| format!("{edge} GridNetwork status has no observedGeneration"))?;
+            if observed_generation != generation {
+                return Err(format!(
+                    "{edge} GridNetwork is not ready to establish a new overlay observation marker: observedGeneration={observed_generation}/{generation}"
+                )
+                .into());
+            }
+            let overlay_statuses = network
+                .pointer("/status/overlayStatus")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| format!("{edge} GridNetwork status has no overlayStatus array"))?;
+            let overlay_index = overlay_statuses
+                .iter()
+                .position(|entry| {
+                    entry.get("gatewayName").and_then(serde_json::Value::as_str) == Some("edge-gateway")
+                        && entry.get("namespace").and_then(serde_json::Value::as_str) == Some(GRID_SYSTEM_NS)
+                })
+                .ok_or_else(|| format!("{edge} GridNetwork status has no edge-gateway overlay entry"))?;
+
+            let context = kubectl_context(edge);
+            let patch = serde_json::json!([
+                {
+                    "op": "replace",
+                    "path": "/status/observedGeneration",
+                    "value": generation - 1
+                },
+                {
+                    "op": "replace",
+                    "path": format!("/status/overlayStatus/{overlay_index}/observedGeneration"),
+                    "value": generation - 1
+                }
+            ]);
+            let output = Command::new("kubectl")
+                .args([
+                    "--context",
+                    &context,
+                    "-n",
+                    GRID_SYSTEM_NS,
+                    "patch",
+                    "gridnetwork",
+                    GRID_NETWORK_NAME,
+                    "--subresource=status",
+                    "--type=json",
+                    "-p",
+                    &serde_json::to_string(&patch)?,
+                    "-o",
+                    "json",
+                ])
+                .output()?;
+            if !output.status.success() {
+                return Err(format!(
+                    "could not mark {edge} overlay status stale: {}",
+                    safe_truncate_str(String::from_utf8_lossy(&output.stderr).trim(), 160)
+                )
+                .into());
+            }
+            let patched: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+            let marker_resource_version = patched
+                .pointer("/metadata/resourceVersion")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| format!("{edge} status marker patch returned no resourceVersion"))?;
+            Ok(((*edge).to_owned(), marker_resource_version.to_owned()))
+        })
+        .collect()
+}
+
+/// Wait for a fresh post-restart status observation and complete, distributed
+/// overlays before starting the separate gateway-serving timeout.
+///
+/// The `GridNetwork` resource version is an observation marker, not an overlay
+/// revision. This permits a restarted operator to confirm an unchanged
+/// semantic overlay without requiring its digest to change. For each edge,
+/// the status must name the current `ConfigMap` resource version and revision.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the bounded poll keeps post-restart readiness and its diagnostics together"
+)]
+pub(crate) fn wait_for_edge_overlays_ready_after_restart(
+    restarted_cluster: &str,
+    previous_network_resource_version: &str,
+    expected_candidates: usize,
+    previous_edge_revisions: &BTreeMap<String, String>,
+    edge_status_marker_resource_versions: &BTreeMap<String, String>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + PROVIDER_STATE_WAIT;
+    let mut previous_snapshot: Option<String> = None;
+    let mut stable_observations = 0_u8;
+
+    loop {
+        let network = grid_network_json(restarted_cluster);
+        let (network_ready, network_snapshot) = match network {
+            Ok(network) => match grid_network_recovered_after_restart(
+                restarted_cluster,
+                &network,
+                previous_network_resource_version,
+            ) {
+                Ok(snapshot) => (true, snapshot),
+                Err(error) => (false, error),
+            },
+            Err(error) => (false, error.to_string()),
+        };
+
+        let mut edge_snapshots = Vec::new();
+        let mut edges_ready = true;
+        for edge in EDGE_CLUSTERS {
+            match read_current_edge_overlay(edge, expected_candidates) {
+                Ok(snapshot) => {
+                    let previous_revision = previous_edge_revisions
+                        .get(*edge)
+                        .ok_or_else(|| format!("missing pre-restart overlay revision for {edge}"))?;
+                    let marker_resource_version = edge_status_marker_resource_versions
+                        .get(*edge)
+                        .ok_or_else(|| format!("missing post-restart status marker for {edge}"))?;
+                    match post_restart_edge_publication_evidence(
+                        edge,
+                        previous_revision,
+                        marker_resource_version,
+                        &snapshot,
+                    ) {
+                        Ok(evidence) => edge_snapshots.push(evidence),
+                        Err(error) => {
+                            edges_ready = false;
+                            edge_snapshots.push(format!("{edge}: {error}"));
+                        },
+                    }
+                },
+                Err(error) => {
+                    edges_ready = false;
+                    edge_snapshots.push(format!("{edge}: {}", safe_truncate_str(&error.to_string(), 160)));
+                },
+            }
+        }
+
+        let current_snapshot = format!("{network_snapshot}; {}", edge_snapshots.join(", "));
+        if network_ready && edges_ready {
+            if previous_snapshot.as_ref() == Some(&current_snapshot) {
+                stable_observations = stable_observations.saturating_add(1);
+            } else {
+                previous_snapshot = Some(current_snapshot.clone());
+                stable_observations = 1;
+            }
+            if stable_observations >= 2 {
+                return Ok(format!(
+                    "post-restart GridNetwork status advanced; both edge publications match the current complete candidate set and stayed stable ({})",
+                    safe_truncate_str(&current_snapshot, 200)
+                ));
+            }
+        } else {
+            previous_snapshot = None;
+            stable_observations = 0;
+        }
+
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "post-restart GridNetwork status and edge overlays did not converge within {PROVIDER_STATE_WAIT:?}: {}",
+                safe_truncate_str(&current_snapshot, 240)
+            )
+            .into());
+        }
+        thread::park_timeout(Duration::from_secs(1));
+    }
+}
+
+/// Read the current serialized `GridNetwork` from one cluster.
+fn grid_network_json(cluster: &str) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let context = kubectl_context(cluster);
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            &context,
+            "-n",
+            GRID_SYSTEM_NS,
+            "get",
+            "gridnetwork",
+            GRID_NETWORK_NAME,
+            "-o",
+            "json",
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "could not read {cluster} GridNetwork: {}",
+            safe_truncate_str(String::from_utf8_lossy(&output.stderr).trim(), 160)
+        )
+        .into());
+    }
+    serde_json::from_slice(&output.stdout).map_err(|error| format!("{cluster} GridNetwork JSON: {error}").into())
+}
+
+/// Check that a restarted operator has published current mesh and overlay status.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the status fields and their recovery conditions form one validation"
+)]
+fn grid_network_recovered_after_restart(
+    cluster: &str,
+    network: &serde_json::Value,
+    previous_resource_version: &str,
+) -> Result<String, String> {
+    let resource_version = network
+        .pointer("/metadata/resourceVersion")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("{cluster} GridNetwork has no metadata.resourceVersion"))?;
+    let generation = network
+        .pointer("/metadata/generation")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| format!("{cluster} GridNetwork has no metadata.generation"))?;
+    let status = network
+        .get("status")
+        .ok_or_else(|| format!("{cluster} GridNetwork has no status"))?;
+    let observed_generation = status
+        .get("observedGeneration")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| format!("{cluster} GridNetwork status has no observedGeneration"))?;
+    let connected_sites = status
+        .get("connectedSites")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| format!("{cluster} GridNetwork status has no connectedSites"))?;
+    let phase = status
+        .get("phase")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("{cluster} GridNetwork status has no phase"))?;
+
+    if resource_version == previous_resource_version {
+        return Err(format!(
+            "{cluster} GridNetwork resourceVersion is unchanged ({resource_version})"
+        ));
+    }
+    if observed_generation != generation || connected_sites != EXPECTED_CONNECTED_SITES || phase != "Active" {
+        return Err(format!(
+            "{cluster} GridNetwork status is not recovered: observedGeneration={observed_generation}/{generation}, connectedSites={connected_sites}/{EXPECTED_CONNECTED_SITES}, phase={phase}"
+        ));
+    }
+
+    Ok(format!(
+        "{cluster} GridNetwork resourceVersion={previous_resource_version}->{resource_version}, connectedSites={connected_sites}, phase={phase}"
+    ))
+}
+
+/// Current content-addressed identity and Kubernetes version for one edge overlay.
+struct CurrentEdgeOverlay {
+    /// Kubernetes resource version returned with the current `ConfigMap`.
+    resource_version: String,
+    /// Semantic digest from the envelope stored in the `ConfigMap`.
+    revision: String,
+    /// Candidate IDs in the published compatibility payload.
+    candidate_ids: Vec<String>,
+    /// Whether every candidate is marked fresh by the operator.
+    all_candidates_fresh: bool,
+    /// Edge `GridNetwork` resourceVersion observed after the status marker write.
+    network_resource_version: String,
+}
+
+/// Read and validate one edge's current `ConfigMap` against its operator status.
+fn read_current_edge_overlay(
+    edge: &str,
+    expected_candidates: usize,
+) -> Result<CurrentEdgeOverlay, Box<dyn std::error::Error>> {
+    let config_map = edge_overlay_configmap_json(edge)?;
+    let overlay = parse_current_edge_overlay(edge, &config_map, expected_candidates)?;
+    validate_complete_restart_candidates(edge, &overlay, expected_candidates)?;
+    let network = grid_network_json(edge)?;
+    let generation = network
+        .pointer("/metadata/generation")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| format!("{edge} GridNetwork has no generation"))?;
+    let status = edge_overlay_status(edge, &network)?;
+    validate_edge_overlay_status(edge, status, &overlay, expected_candidates, generation)?;
+    validate_edge_overlay_mount(edge)?;
+
+    let network_resource_version = network
+        .pointer("/metadata/resourceVersion")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("{edge} GridNetwork has no resourceVersion"))?;
+    Ok(CurrentEdgeOverlay {
+        network_resource_version: network_resource_version.to_owned(),
+        ..overlay
+    })
+}
+
+/// Require the final known provider identities, unique IDs, and healthy freshness state.
+fn validate_complete_restart_candidates(
+    edge: &str,
+    overlay: &CurrentEdgeOverlay,
+    expected_candidates: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if overlay.candidate_ids.len() != expected_candidates {
+        return Err(format!(
+            "{edge} candidate IDs={} (expected {expected_candidates})",
+            overlay.candidate_ids.len()
+        )
+        .into());
+    }
+    let unique_ids: std::collections::BTreeSet<_> = overlay.candidate_ids.iter().collect();
+    if unique_ids.len() != expected_candidates {
+        return Err(format!("{edge} overlay contains duplicate candidate identities").into());
+    }
+    if !overlay.all_candidates_fresh {
+        return Err(format!("{edge} overlay still contains a stale provider candidate").into());
+    }
+    Ok(())
+}
+
+/// Tie edge readiness to a complete post-restart publication, not just a
+/// `GridNetwork` resource-version change. If the semantic digest is unchanged,
+/// the already-published complete state remains valid without inventing a new
+/// revision.
+fn post_restart_edge_publication_evidence(
+    edge: &str,
+    previous_revision: &str,
+    marker_resource_version: &str,
+    current: &CurrentEdgeOverlay,
+) -> Result<String, String> {
+    if current.network_resource_version == marker_resource_version {
+        return Err("edge operator has not reconciled the fresh status marker".to_owned());
+    }
+    if !current.all_candidates_fresh {
+        return Err("candidate set is not fully fresh".to_owned());
+    }
+    let publication = if current.revision == previous_revision {
+        "complete semantic revision unchanged"
+    } else {
+        "edge published a new semantic revision"
+    };
+    Ok(format!(
+        "{edge}: {publication}={}, ConfigMap resourceVersion={}, GridNetwork resourceVersion={}->{}, candidate_ids={:?}",
+        safe_truncate_str(&current.revision, 16),
+        current.resource_version,
+        marker_resource_version,
+        current.network_resource_version,
+        current.candidate_ids
+    ))
+}
+
+/// Read one edge's overlay `ConfigMap` as JSON.
+fn edge_overlay_configmap_json(edge: &str) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let context = kubectl_context(edge);
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            &context,
+            "-n",
+            GRID_SYSTEM_NS,
+            "get",
+            "configmap",
+            OVERLAY_CONFIGMAP,
+            "-o",
+            "json",
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "could not read {edge} overlay ConfigMap: {}",
+            safe_truncate_str(String::from_utf8_lossy(&output.stderr).trim(), 160)
+        )
+        .into());
+    }
+    serde_json::from_slice(&output.stdout).map_err(Into::into)
+}
+
+/// Extract the semantic revision and resource version after validating candidate count.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the current payload, stable IDs, freshness, and revision are one validated snapshot"
+)]
+fn parse_current_edge_overlay(
+    edge: &str,
+    config_map: &serde_json::Value,
+    expected_candidates: usize,
+) -> Result<CurrentEdgeOverlay, Box<dyn std::error::Error>> {
+    let resource_version = config_map
+        .pointer("/metadata/resourceVersion")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("{edge} overlay ConfigMap has no resourceVersion"))?;
+    let legacy_raw = config_map
+        .pointer("/data/routing-config.json")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("{edge} overlay ConfigMap has no routing-config.json"))?;
+    let legacy: serde_json::Value = serde_json::from_str(legacy_raw)?;
+    let local_site = legacy
+        .get("local_site")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("{edge} routing-config.json has no local_site"))?;
+    let candidates = legacy
+        .get("candidates")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| format!("{edge} routing-config.json has no candidates"))?;
+    if local_site != edge || candidates.len() != expected_candidates {
+        return Err(format!(
+            "{edge} overlay local_site={local_site:?}, candidates={} (expected {expected_candidates})",
+            candidates.len()
+        )
+        .into());
+    }
+    validate_same_site_candidates(edge, candidates)?;
+    let candidate_ids = candidates
+        .iter()
+        .map(candidate_stable_id)
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    let all_candidates_fresh = candidates
+        .iter()
+        .all(|candidate| candidate.get("fresh").and_then(serde_json::Value::as_bool) == Some(true));
+
+    let revision = edge_overlay_revision_from_configmap(edge, config_map)?;
+    Ok(CurrentEdgeOverlay {
+        resource_version: resource_version.to_owned(),
+        revision,
+        candidate_ids,
+        all_candidates_fresh,
+        network_resource_version: String::new(),
+    })
+}
+
+/// Read the semantic revision from an edge's overlay envelope.
+fn edge_overlay_revision_from_configmap(
+    edge: &str,
+    config_map: &serde_json::Value,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let envelope_raw = config_map
+        .pointer("/data/routing-overlay.json")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("{edge} overlay ConfigMap has no routing-overlay.json"))?;
+    let envelope: serde_json::Value = serde_json::from_str(envelope_raw)?;
+    let revision = envelope
+        .pointer("/revision/value")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("{edge} routing-overlay.json has no revision"))?;
+    Ok(revision.to_owned())
+}
+
+/// Find the current-generation `edge-gateway` overlay status on one edge.
+fn edge_overlay_status<'network>(
+    edge: &str,
+    network: &'network serde_json::Value,
+) -> Result<&'network serde_json::Value, Box<dyn std::error::Error>> {
+    let generation = network
+        .pointer("/metadata/generation")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| format!("{edge} GridNetwork has no generation"))?;
+    let status = network
+        .get("status")
+        .ok_or_else(|| format!("{edge} GridNetwork has no status"))?;
+    let observed_generation = status
+        .get("observedGeneration")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| format!("{edge} GridNetwork status has no observedGeneration"))?;
+    if observed_generation != generation {
+        return Err(format!(
+            "{edge} GridNetwork status observedGeneration={observed_generation}, expected {generation}"
+        )
+        .into());
+    }
+    let overlay_status = status
+        .get("overlayStatus")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|entries| {
+            entries.iter().find(|entry| {
+                entry.get("gatewayName").and_then(serde_json::Value::as_str) == Some("edge-gateway")
+                    && entry.get("namespace").and_then(serde_json::Value::as_str) == Some(GRID_SYSTEM_NS)
+            })
+        })
+        .ok_or_else(|| format!("{edge} GridNetwork status has no edge-gateway overlay entry"))?;
+    Ok(overlay_status)
+}
+
+/// Require the status entry to describe the current `ConfigMap` and candidate set.
+#[expect(
+    clippy::too_many_lines,
+    reason = "all distribution status fields are checked together against the same overlay snapshot"
+)]
+fn validate_edge_overlay_status(
+    edge: &str,
+    overlay_status: &serde_json::Value,
+    overlay: &CurrentEdgeOverlay,
+    expected_candidates: usize,
+    expected_generation: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let status_resource_version = overlay_status
+        .get("configMapResourceVersion")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("{edge} overlay status has no configMapResourceVersion"))?;
+    let status_revision = overlay_status
+        .get("distributedRevision")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("{edge} overlay status has no distributedRevision"))?;
+    let status_candidate_count = overlay_status
+        .get("candidateCount")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| format!("{edge} overlay status has no candidateCount"))?;
+    let status_phase = overlay_status
+        .get("phase")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("{edge} overlay status has no phase"))?;
+    let status_generation = overlay_status
+        .get("observedGeneration")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| format!("{edge} overlay status has no observedGeneration"))?;
+    if status_resource_version != overlay.resource_version
+        || status_revision != overlay.revision
+        || status_candidate_count != expected_candidates as u64
+        || status_generation != expected_generation
+        || status_phase != "Distributed"
+    {
+        return Err(format!(
+            "{edge} overlay status is stale: configMapResourceVersion={status_resource_version}/{}, distributedRevision={}/{}, candidateCount={status_candidate_count}/{expected_candidates}, observedGeneration={status_generation}/{expected_generation}, phase={status_phase}",
+            overlay.resource_version,
+            safe_truncate_str(status_revision, 16),
+            safe_truncate_str(&overlay.revision, 16)
+        )
+        .into());
+    }
+
+    Ok(())
+}
+
+/// Ensure the edge gateway deployment mounts the validated overlay `ConfigMap`.
+fn validate_edge_overlay_mount(edge: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let context = kubectl_context(edge);
+    let mounted = kubectl_jsonpath(
+        &context,
+        "deployment",
+        "edge-gateway",
+        "{.spec.template.spec.volumes[?(@.name=='overlay')].configMap.name}",
+    )?;
+    if mounted != OVERLAY_CONFIGMAP {
+        return Err(format!("{edge} edge-gateway mounts overlay ConfigMap {mounted:?}").into());
+    }
+    Ok(())
+}
+
 /// Validate one edge cluster's overlay content and volume projection.
 #[expect(
     clippy::too_many_lines,
@@ -3362,8 +3954,13 @@ pub(crate) fn overlay_revision(edge: &str) -> Result<String, Box<dyn std::error:
     if envelope_raw.trim().is_empty() {
         return Err(format!("{edge} overlay ConfigMap missing routing-overlay.json key").into());
     }
+    parse_overlay_envelope_revision(edge, &envelope_raw)
+}
+
+/// Parse the content-addressed revision from an operator overlay envelope.
+fn parse_overlay_envelope_revision(edge: &str, raw: &str) -> Result<String, Box<dyn std::error::Error>> {
     let envelope: serde_json::Value =
-        serde_json::from_str(&envelope_raw).map_err(|e| format!("{edge} envelope JSON parse failed: {e}"))?;
+        serde_json::from_str(raw).map_err(|error| format!("{edge} envelope JSON parse failed: {error}"))?;
     envelope
         .pointer("/revision/value")
         .and_then(serde_json::Value::as_str)
@@ -3400,6 +3997,10 @@ fn verify_edge_accepted_revision(edge: &str, revision: &str) -> Result<(), Box<d
 /// Maximum time to wait for an edge to serve a withdrawal revision.
 const EDGE_SERVING_TIMEOUT: Duration = Duration::from_secs(90);
 
+/// Maximum time to wait for a withdrawal revision to reach the edge pod's
+/// projected `ConfigMap` volume before starting the separate serving timeout.
+const EDGE_OVERLAY_PROJECTION_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// Poll until the edge accepts and serves `revision` in two consecutive
 /// observations without a pod replacement or container restart.
 #[expect(
@@ -3410,40 +4011,214 @@ pub(crate) fn verify_edge_serving_revision(edge: &str, revision: &str) -> Result
     let deadline = Instant::now() + EDGE_SERVING_TIMEOUT;
     let initial = edge_pod_identity(edge)?;
     let mut stable_observations = 0_u8;
+    let mut matching_observations = VecDeque::with_capacity(2);
+    let mut recent_observations = VecDeque::with_capacity(4);
     loop {
-        let observation = edge_serving_observation(edge)?;
+        let observation = match edge_serving_observation(edge) {
+            Ok(observation) => observation,
+            Err(error) => {
+                return Err(format!(
+                    "{edge} serving observation failed; consecutive matching polls={stable_observations}; recent polls=[{}]; cause={}",
+                    recent_observations.iter().map(String::as_str).collect::<Vec<_>>().join(" | "),
+                    safe_truncate_str(&error.to_string(), 180)
+                )
+                .into());
+            },
+        };
         let current = observation.identity;
         let logs = observation.logs;
         let last = observation.last;
+        recent_observations.push_back(last.clone());
+        if recent_observations.len() > 4 {
+            recent_observations.pop_front();
+        }
         if current.uid != initial.uid || current.restart_count != initial.restart_count {
             return Err(format!(
-                "{edge} edge pod changed while waiting for serving revision {}; initial uid/restarts={}/{}, observed={}/{}, {}",
+                "{edge} edge pod changed while waiting for serving revision {}; initial uid/restarts={}/{}, observed={}/{}, recent polls=[{}]",
                 safe_truncate_str(revision, 16),
                 safe_truncate_str(&initial.uid, 12),
                 initial.restart_count,
                 safe_truncate_str(&current.uid, 12),
                 current.restart_count,
-                last,
+                recent_observations.iter().map(String::as_str).collect::<Vec<_>>().join(" | "),
             )
             .into());
         }
         if logs_prove_serving(&logs, revision) {
             stable_observations = stable_observations.saturating_add(1);
+            matching_observations.push_back(last.clone());
+            if matching_observations.len() > 2 {
+                matching_observations.pop_front();
+            }
             if stable_observations >= 2 {
+                eprintln!(
+                    "  serving → {edge}: revision={} observed twice on pod {}/restarts:{}; {} | {}",
+                    safe_truncate_str(revision, 16),
+                    safe_truncate_str(&current.uid, 12),
+                    current.restart_count,
+                    matching_observations
+                        .front()
+                        .map_or("missing first poll", String::as_str),
+                    matching_observations
+                        .back()
+                        .map_or("missing second poll", String::as_str),
+                );
                 return Ok(());
             }
         } else {
             stable_observations = 0;
+            matching_observations.clear();
         }
         if Instant::now() >= deadline {
             return Err(format!(
-                "{edge} did not serve revision {} within {EDGE_SERVING_TIMEOUT:?}; last observed {}",
+                "{edge} did not serve revision {} within {EDGE_SERVING_TIMEOUT:?}; last observed {}; consecutive matching polls={stable_observations}; recent polls=[{}]",
                 safe_truncate_str(revision, 16),
-                last
+                last,
+                recent_observations.iter().map(String::as_str).collect::<Vec<_>>().join(" | ")
             )
             .into());
         }
         thread::park_timeout(EDGE_ACCEPTANCE_POLL);
+    }
+}
+
+/// Wait until both edge gateways serve their current complete overlay.
+///
+/// Operator restarts can cause the distributed overlay revision to change
+/// while SWIM membership reconverges. Follow the revision currently in each
+/// edge's `ConfigMap` and require the same pair of revisions to be served in
+/// consecutive observations, rather than pinning a transient revision before
+/// convergence finishes.
+#[expect(
+    clippy::too_many_lines,
+    reason = "restart convergence checks keep revision, identity, and serving evidence together"
+)]
+pub(crate) fn wait_for_edge_overlays_serving_with_count(
+    expected_candidates: usize,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut initial_identities = BTreeMap::new();
+    for edge in EDGE_CLUSTERS {
+        initial_identities.insert(*edge, edge_pod_identity(edge)?);
+    }
+
+    let revisions =
+        wait_for_stable_served_revisions(EDGE_CLUSTERS, EDGE_SERVING_TIMEOUT, EDGE_ACCEPTANCE_POLL, |edge| {
+            let revision = match verify_single_edge_overlay_with_count(edge, expected_candidates) {
+                Ok(revision) => revision,
+                Err(error) => {
+                    return Ok((
+                        None,
+                        format!("overlay is not ready: {}", safe_truncate_str(&error.to_string(), 120)),
+                    ));
+                },
+            };
+            let observation = match edge_serving_observation(edge) {
+                Ok(observation) => observation,
+                Err(error) => {
+                    return Ok((
+                        None,
+                        format!(
+                            "gateway observation unavailable: {}",
+                            safe_truncate_str(&error.to_string(), 120)
+                        ),
+                    ));
+                },
+            };
+            let initial = initial_identities
+                .get(edge)
+                .ok_or_else(|| format!("missing initial pod identity for {edge}"))?;
+            if observation.identity.uid != initial.uid || observation.identity.restart_count != initial.restart_count {
+                return Err(format!(
+                    "{edge} edge pod changed while waiting for a current serving revision; \
+                     initial uid/restarts={}/{}, observed={}/{}, {}",
+                    safe_truncate_str(&initial.uid, 12),
+                    initial.restart_count,
+                    safe_truncate_str(&observation.identity.uid, 12),
+                    observation.identity.restart_count,
+                    observation.last,
+                )
+                .into());
+            }
+            let serving = logs_prove_serving(&observation.logs, &revision);
+            Ok((
+                Some((revision.clone(), serving)),
+                format!("distributed_revision={revision}; {}", observation.last),
+            ))
+        })?;
+
+    let evidence = revisions
+        .iter()
+        .map(|(edge, revision)| format!("{edge}={}", safe_truncate_str(revision, 16)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Ok(format!(
+        "Both edge gateways served the same current overlay revisions in consecutive observations ({evidence})"
+    ))
+}
+
+/// Wait for every edge to serve a stable map of its current distributed revisions.
+#[expect(
+    clippy::too_many_lines,
+    reason = "bounded multi-edge polling keeps stability and timeout diagnostics together"
+)]
+fn wait_for_stable_served_revisions(
+    edges: &[&str],
+    timeout: Duration,
+    interval: Duration,
+    mut observe: impl FnMut(&str) -> Result<(Option<(String, bool)>, String), Box<dyn std::error::Error>>,
+) -> Result<BTreeMap<String, String>, Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + timeout;
+    let mut previous_revisions: Option<BTreeMap<String, String>> = None;
+    let mut stable_observations = 0_u8;
+    let mut last_diagnostics = BTreeMap::new();
+
+    loop {
+        let mut current_revisions = BTreeMap::new();
+        let mut all_serving = true;
+        last_diagnostics.clear();
+        for edge in edges {
+            let (observation, diagnostic) = observe(edge)?;
+            last_diagnostics.insert((*edge).to_owned(), diagnostic);
+            match observation {
+                Some((revision, true)) => {
+                    current_revisions.insert((*edge).to_owned(), revision);
+                },
+                Some((revision, false)) => {
+                    current_revisions.insert((*edge).to_owned(), revision);
+                    all_serving = false;
+                },
+                None => all_serving = false,
+            }
+        }
+
+        if all_serving && current_revisions.len() == edges.len() {
+            if previous_revisions.as_ref() == Some(&current_revisions) {
+                stable_observations = stable_observations.saturating_add(1);
+            } else {
+                previous_revisions = Some(current_revisions.clone());
+                stable_observations = 1;
+            }
+            if stable_observations >= 2 {
+                return Ok(current_revisions);
+            }
+        } else {
+            previous_revisions = None;
+            stable_observations = 0;
+        }
+
+        if Instant::now() >= deadline {
+            let diagnostics = last_diagnostics
+                .iter()
+                .map(|(edge, diagnostic)| format!("{edge}: {diagnostic}"))
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(format!(
+                "edge overlays did not reach stable serving revisions within {timeout:?}: {}",
+                safe_truncate_str(&diagnostics, 240)
+            )
+            .into());
+        }
+        thread::park_timeout(interval);
     }
 }
 
@@ -3459,17 +4234,70 @@ struct EdgeServingObservation {
 
 /// Read one complete edge observation for the serving-revision barrier.
 fn edge_serving_observation(edge: &str) -> Result<EdgeServingObservation, Box<dyn std::error::Error>> {
-    let logs = edge_gateway_logs(edge)?;
+    let pod = get_edge_pod_json(edge)?;
+    let identity = edge_pod_identity_from_json(edge, &pod)?;
+    let container_name = edge_gateway_container_name(&pod)?;
+    let pod_name = pod
+        .pointer("/metadata/name")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("{edge} edge-gateway pod has no name"))?;
+    let logs = edge_gateway_pod_logs(edge, pod_name, &container_name)?;
     let last = format!(
-        "accepted_revision={} serving_revision={}",
-        extract_last_accepted_revision(&logs).unwrap_or_else(|| "none".to_owned()),
-        extract_last_serving_revision(&logs).unwrap_or_else(|| "none".to_owned())
+        "pod={}/uid:{}/restarts:{} latest_overlay_event={}",
+        safe_truncate_str(pod_name, 64),
+        safe_truncate_str(&identity.uid, 12),
+        identity.restart_count,
+        latest_overlay_event_summary(&logs),
     );
-    Ok(EdgeServingObservation {
-        identity: edge_pod_identity(edge)?,
-        logs,
-        last,
-    })
+    Ok(EdgeServingObservation { identity, logs, last })
+}
+
+/// Read bounded logs from the exact edge pod whose identity is being observed.
+fn edge_gateway_pod_logs(
+    edge: &str,
+    pod_name: &str,
+    container_name: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            &kubectl_context(edge),
+            "-n",
+            GRID_SYSTEM_NS,
+            "logs",
+            pod_name,
+            "-c",
+            container_name,
+            "--tail=1000",
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "could not read {edge} gateway logs from pod {}: {}",
+            safe_truncate_str(pod_name, 64),
+            safe_truncate_str(String::from_utf8_lossy(&output.stderr).trim(), 160)
+        )
+        .into());
+    }
+    String::from_utf8(output.stdout).map_err(Into::into)
+}
+
+/// Summarize the latest overlay event with its log timestamp and revisions.
+fn latest_overlay_event_summary(logs: &str) -> String {
+    let stripped = strip_csi_sgr(logs);
+    let Some(line) = stripped
+        .lines()
+        .rev()
+        .find(|line| line.contains("overlay snapshot initialized") || line.contains("overlay reloaded"))
+    else {
+        return "none".to_owned();
+    };
+    let timestamp = line.split_whitespace().next().unwrap_or("unknown-time");
+    format!(
+        "at={timestamp},accepted_revision={},serving_revision={}",
+        accepted_revision_from_line(line).unwrap_or("none"),
+        serving_revision_from_line(line).unwrap_or("none")
+    )
 }
 
 /// Testable core of the edge acceptance barrier.
@@ -3517,13 +4345,15 @@ fn logs_prove_acceptance(logs: &str, revision: &str) -> bool {
     })
 }
 
-/// Check whether one log line proves the exact accepted and serving revision.
+/// Check whether the latest overlay event proves the exact accepted and serving revision.
 fn logs_prove_serving(logs: &str, revision: &str) -> bool {
-    strip_csi_sgr(logs).lines().any(|line| {
-        (line.contains("overlay snapshot initialized") || line.contains("overlay reloaded"))
-            && accepted_revision_from_line(line) == Some(revision)
-            && serving_revision_from_line(line) == Some(revision)
-    })
+    strip_csi_sgr(logs)
+        .lines()
+        .rev()
+        .find(|line| line.contains("overlay snapshot initialized") || line.contains("overlay reloaded"))
+        .is_some_and(|line| {
+            accepted_revision_from_line(line) == Some(revision) && serving_revision_from_line(line) == Some(revision)
+        })
 }
 
 /// Extract an exact `accepted_revision` field from one tracing log line.
@@ -3585,21 +4415,26 @@ fn extract_last_accepted_revision(logs: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// Extract the most recent exact `serving_revision` value from logs.
-fn extract_last_serving_revision(logs: &str) -> Option<String> {
-    logs.lines()
-        .rev()
-        .find_map(serving_revision_from_line)
-        .map(str::to_owned)
-}
-
 /// Kubernetes pod identity used to prove hot reload did not restart the edge.
-#[derive(Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct EdgePodIdentity {
     /// Kubernetes Pod UID.
     uid: String,
     /// Restart count for the Praxis container.
     restart_count: u64,
+}
+
+/// One observation of the distributed and mounted overlay revisions on an edge.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct EdgeMountedOverlayObservation {
+    /// Whether the `ConfigMap` overlay still contains the withdrawn provider.
+    provider_present: bool,
+    /// Revision currently published in the edge `ConfigMap`.
+    distributed_revision: String,
+    /// Revision read from the gateway's projected overlay file.
+    mounted_revision: String,
+    /// Ready gateway pod identity that supplied the mounted file.
+    identity: EdgePodIdentity,
 }
 
 /// Require both edge gateway pods ready and capture the primary pod identity.
@@ -3630,23 +4465,68 @@ fn check_edge_gateway_pods() -> Result<(String, EdgePodIdentity), Box<dyn std::e
 /// Read the ready Praxis pod UID and restart count from one edge cluster.
 fn edge_pod_identity(edge: &str) -> Result<EdgePodIdentity, Box<dyn std::error::Error>> {
     let pod = get_edge_pod_json(edge)?;
-    let ready = pod
-        .pointer("/status/containerStatuses/0/ready")
+    edge_pod_identity_from_json(edge, &pod)
+}
+
+/// Parse readiness and restart identity from a gateway pod response.
+fn edge_pod_identity_from_json(
+    edge: &str,
+    pod: &serde_json::Value,
+) -> Result<EdgePodIdentity, Box<dyn std::error::Error>> {
+    let container_name = edge_gateway_container_name(pod)?;
+    let status = pod
+        .pointer("/status/containerStatuses")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|statuses| {
+            statuses
+                .iter()
+                .find(|status| status.get("name").and_then(serde_json::Value::as_str) == Some(container_name.as_str()))
+        })
+        .ok_or_else(|| format!("{edge} edge-gateway pod has no status for container {container_name:?}"))?;
+    let ready = status
+        .get("ready")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
     if !ready {
-        return Err(format!("{edge} edge-gateway pod is not ready").into());
+        return Err(format!("{edge} edge-gateway container {container_name:?} is not ready").into());
     }
     let uid = pod
         .pointer("/metadata/uid")
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| format!("{edge} edge-gateway pod has no UID"))?
         .to_owned();
-    let restart_count = pod
-        .pointer("/status/containerStatuses/0/restartCount")
+    let restart_count = status
+        .get("restartCount")
         .and_then(serde_json::Value::as_u64)
-        .ok_or_else(|| format!("{edge} edge-gateway pod has no restartCount"))?;
+        .ok_or_else(|| format!("{edge} edge-gateway container {container_name:?} has no restartCount"))?;
     Ok(EdgePodIdentity { uid, restart_count })
+}
+
+/// Find the gateway container by the projected routing overlay mount in its Pod spec.
+fn edge_gateway_container_name(pod: &serde_json::Value) -> Result<String, Box<dyn std::error::Error>> {
+    let containers = pod
+        .pointer("/spec/containers")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("edge-gateway pod has no spec.containers array")?;
+    let mut matches = containers.iter().filter_map(|container| {
+        let name = container.get("name").and_then(serde_json::Value::as_str)?;
+        let mounts_overlay = container
+            .get("volumeMounts")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|mounts| {
+                mounts.iter().any(|mount| {
+                    mount.get("mountPath").and_then(serde_json::Value::as_str) == Some("/etc/praxis/routing")
+                })
+            });
+        mounts_overlay.then(|| name.to_owned())
+    });
+    let name = matches
+        .next()
+        .ok_or("edge-gateway pod has no container mounting /etc/praxis/routing")?;
+    if matches.next().is_some() {
+        return Err("edge-gateway pod has multiple containers mounting /etc/praxis/routing".into());
+    }
+    Ok(name)
 }
 
 /// Fetch the first edge-gateway pod as JSON from one cluster.
@@ -3678,6 +4558,59 @@ fn get_edge_pod_json(edge: &str) -> Result<serde_json::Value, Box<dyn std::error
         .and_then(serde_json::Value::as_array)
         .and_then(|items| items.first().cloned())
         .ok_or_else(|| format!("{edge} has no edge-gateway pod").into())
+}
+
+/// Read the revision from the mounted overlay in the selected ready edge pod.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one atomic observation ties mounted contents to the exact ready gateway pod"
+)]
+fn edge_mounted_overlay_observation(
+    edge: &str,
+    provider: &str,
+) -> Result<EdgeMountedOverlayObservation, Box<dyn std::error::Error>> {
+    let pod = get_edge_pod_json(edge)?;
+    let identity = edge_pod_identity_from_json(edge, &pod)?;
+    let container_name = edge_gateway_container_name(&pod)?;
+    let pod_name = pod
+        .pointer("/metadata/name")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("{edge} edge-gateway pod has no name"))?;
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            &kubectl_context(edge),
+            "--request-timeout=10s",
+            "-n",
+            GRID_SYSTEM_NS,
+            "exec",
+            pod_name,
+            "-c",
+            &container_name,
+            "--",
+            "cat",
+            EDGE_ROUTING_OVERLAY_PATH,
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "failed to read {edge} mounted overlay from pod {}: {}",
+            safe_truncate_str(pod_name, 64),
+            safe_truncate_str(String::from_utf8_lossy(&output.stderr).trim(), 160)
+        )
+        .into());
+    }
+    let raw = String::from_utf8(output.stdout)?;
+    let mounted_revision = parse_overlay_envelope_revision(edge, &raw)?;
+    let distributed_revision = overlay_revision(edge)?;
+    let provider_present = overlay_candidate(edge, provider)?.is_some();
+
+    Ok(EdgeMountedOverlayObservation {
+        provider_present,
+        distributed_revision,
+        mounted_revision,
+        identity,
+    })
 }
 
 /// Send an inference request and verify HTTP 200 with
@@ -4216,25 +5149,89 @@ fn wait_for_candidate_admission(
     Err(format!("timeout waiting for {provider} admission_state={expected} on {edge}; observed={observed:?}").into())
 }
 
-/// Wait until the withdrawn provider is absent and the edge serves that exact
-/// projected overlay revision.
+/// Wait until the `ConfigMap` withdrawal reaches the mounted edge overlay twice.
+fn wait_for_withdrawal_overlay_projection(
+    edge: &str,
+    provider: &str,
+) -> Result<EdgeMountedOverlayObservation, Box<dyn std::error::Error>> {
+    wait_for_stable_withdrawal_projection(
+        edge,
+        provider,
+        EDGE_OVERLAY_PROJECTION_TIMEOUT,
+        EDGE_ACCEPTANCE_POLL,
+        edge_mounted_overlay_observation,
+    )
+}
+
+/// Require the same withdrawn overlay to be published and mounted twice in a
+/// row before the separate Praxis serving timeout starts.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the bounded poll keeps revision, provider presence, pod identity, and timeout diagnostics together"
+)]
+fn wait_for_stable_withdrawal_projection(
+    edge: &str,
+    provider: &str,
+    timeout: Duration,
+    interval: Duration,
+    mut observe: impl FnMut(&str, &str) -> Result<EdgeMountedOverlayObservation, Box<dyn std::error::Error>>,
+) -> Result<EdgeMountedOverlayObservation, Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + timeout;
+    let mut previous: Option<EdgeMountedOverlayObservation> = None;
+
+    loop {
+        let last_observation = match observe(edge, provider) {
+            Ok(observation) => {
+                let last_observation = format!(
+                    "provider_present={}, distributed_revision={}, mounted_revision={}, pod={}/restarts:{}",
+                    observation.provider_present,
+                    safe_truncate_str(&observation.distributed_revision, 16),
+                    safe_truncate_str(&observation.mounted_revision, 16),
+                    safe_truncate_str(&observation.identity.uid, 12),
+                    observation.identity.restart_count,
+                );
+                if !observation.provider_present && observation.distributed_revision == observation.mounted_revision {
+                    if previous.as_ref() == Some(&observation) {
+                        return Ok(observation);
+                    }
+                    previous = Some(observation);
+                } else {
+                    previous = None;
+                }
+                last_observation
+            },
+            Err(error) => {
+                previous = None;
+                safe_truncate_str(&error.to_string(), 220)
+            },
+        };
+
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "{edge} withdrawal overlay was not stably projected within {timeout:?}: {last_observation}"
+            )
+            .into());
+        }
+        thread::park_timeout(interval);
+    }
+}
+
+/// Wait until the withdrawn provider is absent from the `ConfigMap` and mounted
+/// file, then start a separate timeout for Praxis to serve that revision.
 pub(crate) fn wait_for_withdrawal_serving_revision(
     edge: &str,
     provider: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    wait_for_check(
-        "withdrawal overlay candidate removal",
-        EDGE_SERVING_TIMEOUT,
-        EDGE_ACCEPTANCE_POLL,
-        || {
-            if overlay_candidate(edge, provider)?.is_some() {
-                return Err(format!("{edge} still contains withdrawn provider {provider}").into());
-            }
-            let revision = overlay_revision(edge)?;
-            verify_edge_serving_revision(edge, &revision)?;
-            Ok(revision)
-        },
-    )
+    let projection = wait_for_withdrawal_overlay_projection(edge, provider)?;
+    let revision = projection.distributed_revision;
+    eprintln!(
+        "  projected → {edge}: revision={} (pod {}, restarts {})",
+        safe_truncate_str(&revision, 16),
+        safe_truncate_str(&projection.identity.uid, 12),
+        projection.identity.restart_count
+    );
+    verify_edge_serving_revision(edge, &revision)?;
+    Ok(revision)
 }
 
 /// Require every edge in the request path to serve its own withdrawn overlay.
@@ -5804,6 +6801,314 @@ clusters:
         assert!(!logs_prove_serving(
             "overlay reloaded previous_serving_revision=\"rev_abc\"",
             revision
+        ));
+    }
+
+    #[test]
+    fn serving_proof_uses_the_latest_overlay_event() {
+        let logs = "overlay reloaded accepted_revision=\"old\" serving_revision=\"old\"\n\
+                    overlay reloaded accepted_revision=\"current\" serving_revision=\"current\"";
+        assert!(!logs_prove_serving(logs, "old"));
+        assert!(logs_prove_serving(logs, "current"));
+    }
+
+    #[test]
+    fn parses_revision_from_projected_overlay_envelope() {
+        let raw = r#"{"revision":{"kind":"content_addressed","value":"revision-a"}}"#;
+        assert!(matches!(
+            parse_overlay_envelope_revision("test-edge", raw),
+            Ok(revision) if revision == "revision-a"
+        ));
+
+        let missing_revision = r#"{"revision":{"kind":"content_addressed"}}"#;
+        assert!(matches!(
+            parse_overlay_envelope_revision("test-edge", missing_revision),
+            Err(error) if error.to_string().contains("revision")
+        ));
+        assert!(matches!(
+            parse_overlay_envelope_revision("test-edge", "not-json"),
+            Err(error) if error.to_string().contains("JSON parse failed")
+        ));
+    }
+
+    #[test]
+    fn mounted_overlay_probe_selects_container_from_pod_volume_mount() {
+        for name in ["praxis", "praxis-ai"] {
+            let pod = serde_json::json!({
+                "spec": {"containers": [
+                    {"name": "sidecar", "volumeMounts": [{"name": "logs", "mountPath": "/var/log"}]},
+                    {"name": name, "volumeMounts": [{"name": "overlay", "mountPath": "/etc/praxis/routing"}]}
+                ]}
+            });
+            assert!(matches!(edge_gateway_container_name(&pod), Ok(selected) if selected == name));
+        }
+
+        let missing = serde_json::json!({
+            "spec": {"containers": [{"name": "praxis", "volumeMounts": []}]}
+        });
+        assert!(matches!(
+            edge_gateway_container_name(&missing),
+            Err(error) if error.to_string().contains("no container mounting")
+        ));
+
+        let ambiguous = serde_json::json!({
+            "spec": {"containers": [
+                {"name": "praxis", "volumeMounts": [{"name": "overlay", "mountPath": "/etc/praxis/routing"}]},
+                {"name": "praxis-ai", "volumeMounts": [{"name": "overlay", "mountPath": "/etc/praxis/routing"}]}
+            ]}
+        });
+        assert!(matches!(
+            edge_gateway_container_name(&ambiguous),
+            Err(error) if error.to_string().contains("multiple containers mounting")
+        ));
+    }
+
+    #[test]
+    fn pod_identity_reads_readiness_from_the_overlay_container_status() {
+        let pod = serde_json::json!({
+            "metadata": {"uid": "pod-uid"},
+            "spec": {"containers": [
+                {"name": "sidecar", "volumeMounts": []},
+                {"name": "praxis", "volumeMounts": [{"name": "overlay", "mountPath": "/etc/praxis/routing"}]}
+            ]},
+            "status": {"containerStatuses": [
+                {"name": "sidecar", "ready": false, "restartCount": 17},
+                {"name": "praxis", "ready": true, "restartCount": 3}
+            ]}
+        });
+        assert!(matches!(
+            edge_pod_identity_from_json("test-edge", &pod),
+            Ok(EdgePodIdentity { uid, restart_count: 3 }) if uid == "pod-uid"
+        ));
+    }
+
+    #[test]
+    fn latest_overlay_event_summary_keeps_timestamp_and_latest_revisions() {
+        let logs = concat!(
+            "2026-10-10T16:30:46.320316437Z INFO overlay reloaded accepted_revision=withdrawal ",
+            "serving_revision=withdrawal\n",
+            "2026-10-10T16:32:13.411953237Z INFO overlay reloaded accepted_revision=restored ",
+            "serving_revision=restored\n",
+        );
+        let summary = latest_overlay_event_summary(logs);
+        assert!(summary.contains("at=2026-10-10T16:32:13.411953237Z"));
+        assert!(summary.contains("accepted_revision=restored"));
+        assert!(summary.contains("serving_revision=restored"));
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the scenarios cover publication, projection, and pod replacement in sequence"
+    )]
+    fn withdrawal_projection_waits_for_matching_stable_mount_and_pod() {
+        let observations = [
+            EdgeMountedOverlayObservation {
+                provider_present: true,
+                distributed_revision: "baseline".to_owned(),
+                mounted_revision: "baseline".to_owned(),
+                identity: EdgePodIdentity {
+                    uid: "pod-a".to_owned(),
+                    restart_count: 0,
+                },
+            },
+            EdgeMountedOverlayObservation {
+                provider_present: false,
+                distributed_revision: "withdrawal".to_owned(),
+                mounted_revision: "baseline".to_owned(),
+                identity: EdgePodIdentity {
+                    uid: "pod-a".to_owned(),
+                    restart_count: 0,
+                },
+            },
+            EdgeMountedOverlayObservation {
+                provider_present: false,
+                distributed_revision: "withdrawal".to_owned(),
+                mounted_revision: "withdrawal".to_owned(),
+                identity: EdgePodIdentity {
+                    uid: "pod-a".to_owned(),
+                    restart_count: 0,
+                },
+            },
+            EdgeMountedOverlayObservation {
+                provider_present: false,
+                distributed_revision: "withdrawal".to_owned(),
+                mounted_revision: "withdrawal".to_owned(),
+                identity: EdgePodIdentity {
+                    uid: "pod-b".to_owned(),
+                    restart_count: 0,
+                },
+            },
+            EdgeMountedOverlayObservation {
+                provider_present: false,
+                distributed_revision: "withdrawal".to_owned(),
+                mounted_revision: "withdrawal".to_owned(),
+                identity: EdgePodIdentity {
+                    uid: "pod-b".to_owned(),
+                    restart_count: 0,
+                },
+            },
+        ];
+        let attempts = std::cell::Cell::new(0);
+        let result = wait_for_stable_withdrawal_projection(
+            "test-edge",
+            "test-provider",
+            Duration::from_secs(1),
+            Duration::ZERO,
+            |_, _| {
+                let attempt = attempts.get();
+                attempts.set(attempt + 1);
+                observations
+                    .get(attempt)
+                    .cloned()
+                    .ok_or_else(|| std::io::Error::other("test observation sequence exhausted").into())
+            },
+        );
+
+        assert!(
+            result.is_ok(),
+            "expected stable mounted withdrawal revision: {result:?}"
+        );
+        let observed = result.unwrap_or_else(|_| std::process::abort());
+        assert_eq!(observed.distributed_revision, "withdrawal");
+        assert_eq!(observed.mounted_revision, "withdrawal");
+        assert_eq!(observed.identity.uid, "pod-b");
+        assert_eq!(attempts.get(), observations.len());
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the convergence test covers multiple overlay revisions and a readiness gap"
+    )]
+    fn restart_barrier_tracks_overlay_revisions_until_all_edges_are_stably_serving() {
+        let west_observations = std::cell::Cell::new(0_u32);
+        let result = wait_for_stable_served_revisions(
+            &["east-edge", "west-edge"],
+            Duration::from_secs(1),
+            Duration::ZERO,
+            |edge| {
+                if edge == "east-edge" {
+                    return Ok((Some(("east-revision".to_owned(), true)), "east serving".to_owned()));
+                }
+                let attempt = west_observations.get();
+                west_observations.set(attempt + 1);
+                match attempt {
+                    0 => Ok((
+                        Some(("transient-revision".to_owned(), false)),
+                        "old serving revision".to_owned(),
+                    )),
+                    1 => Ok((None, "overlay candidate count is still converging".to_owned())),
+                    _ => Ok((
+                        Some(("settled-revision".to_owned(), true)),
+                        "settled serving revision".to_owned(),
+                    )),
+                }
+            },
+        );
+        assert!(
+            result.is_ok(),
+            "the barrier should follow convergence to the settled revision: {:?}",
+            result.as_ref().err()
+        );
+        let revisions = result.unwrap_or_default();
+
+        assert_eq!(revisions.get("east-edge").map(String::as_str), Some("east-revision"));
+        assert_eq!(revisions.get("west-edge").map(String::as_str), Some("settled-revision"));
+        assert_eq!(west_observations.get(), 4, "the final pair must be observed twice");
+    }
+
+    #[test]
+    fn restart_barrier_timeout_reports_current_serving_state() {
+        let result = wait_for_stable_served_revisions(
+            &["west-edge"],
+            Duration::from_millis(20),
+            Duration::from_millis(1),
+            |_| {
+                Ok((
+                    Some(("unserved-revision".to_owned(), false)),
+                    "distributed_revision=unserved accepted_revision=old serving_revision=old".to_owned(),
+                ))
+            },
+        );
+        assert!(result.is_err(), "an unserved revision must time out");
+        let error = result.err().map(|error| error.to_string()).unwrap_or_default();
+        assert!(error.contains("stable serving revisions"), "unexpected error: {error}");
+        assert!(
+            error.contains("distributed_revision=unserved"),
+            "missing current revision: {error}"
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the assertions cover stale, pre-restart, and recovered status cases"
+    )]
+    fn post_restart_publication_requires_fresh_active_gridnetwork_status() {
+        let network = serde_json::json!({
+            "metadata": { "resourceVersion": "42", "generation": 3 },
+            "status": {
+                "observedGeneration": 3,
+                "connectedSites": EXPECTED_CONNECTED_SITES,
+                "phase": "Active"
+            }
+        });
+
+        assert!(matches!(
+            grid_network_recovered_after_restart("east-edge", &network, "41"),
+            Ok(evidence) if evidence.contains("resourceVersion=41->42")
+        ));
+
+        let same_resource_version = grid_network_recovered_after_restart("east-edge", &network, "42");
+        assert!(
+            same_resource_version
+                .err()
+                .is_some_and(|error| error.contains("resourceVersion is unchanged")),
+            "a pre-restart observation must not satisfy the publication barrier"
+        );
+
+        let stale_generation = serde_json::json!({
+            "metadata": { "resourceVersion": "43", "generation": 4 },
+            "status": {
+                "observedGeneration": 3,
+                "connectedSites": EXPECTED_CONNECTED_SITES,
+                "phase": "Active"
+            }
+        });
+        assert!(matches!(
+            grid_network_recovered_after_restart("east-edge", &stale_generation, "42"),
+            Err(error) if error.contains("status is not recovered")
+        ));
+    }
+
+    #[test]
+    fn post_restart_edge_publication_requires_fresh_complete_candidate_state() {
+        let mut complete = CurrentEdgeOverlay {
+            resource_version: "52".to_owned(),
+            revision: "new-revision".to_owned(),
+            candidate_ids: vec!["a".to_owned(), "b".to_owned(), "c".to_owned()],
+            all_candidates_fresh: true,
+            network_resource_version: "56".to_owned(),
+        };
+
+        assert!(matches!(
+            post_restart_edge_publication_evidence("east-edge", "old-revision", "55", &complete),
+            Ok(evidence) if evidence.contains("edge published a new semantic revision")
+        ));
+        assert!(matches!(
+            post_restart_edge_publication_evidence("east-edge", "new-revision", "55", &complete),
+            Ok(evidence) if evidence.contains("complete semantic revision unchanged")
+        ));
+        assert!(matches!(
+            post_restart_edge_publication_evidence("east-edge", "new-revision", "56", &complete),
+            Err(error) if error == "edge operator has not reconciled the fresh status marker"
+        ));
+
+        complete.all_candidates_fresh = false;
+        assert!(matches!(
+            post_restart_edge_publication_evidence("east-edge", "new-revision", "55", &complete),
+            Err(error) if error == "candidate set is not fully fresh"
         ));
     }
 

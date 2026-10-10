@@ -9,6 +9,7 @@ use std::{
     collections::BTreeMap,
     path::Path,
     process::Command,
+    thread,
     time::{Duration, Instant},
 };
 
@@ -21,7 +22,7 @@ const PUBLIC_NAME: &str = "api.grid-glb.test";
 const PUBLIC_PORT: u16 = 8443;
 
 /// CA used to verify the stable local HTTPS name.
-const PUBLIC_CA: &str = ".forge/runtime/glb-tls/gtm/ca.crt";
+const PUBLIC_CA_RUNTIME_PATH: &str = "runtime/glb-tls/gtm/ca.crt";
 
 /// Request fixture path relative to the demo root.
 const REQUEST_FIXTURE_SUFFIX: &str = "fixtures/requests/shared-model.json";
@@ -34,6 +35,12 @@ const EDGE_SESSION_HEADER: &str = "X-Edge-Session-Id";
 
 /// Demo affinity key used by `intelligent_route` for provider selection.
 const PROVIDER_SESSION_HEADER: &str = "X-Session-Id";
+
+/// Allow operator-published edge overlays to converge before checking them.
+const OVERLAY_READY_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// Poll interval while edge overlay publication is converging.
+const OVERLAY_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Kubernetes clusters and Praxis Deployments in the complete path.
 const PRAXIS_DEPLOYMENTS: &[(&str, &str)] = &[
@@ -93,6 +100,7 @@ impl Drop for DeploymentRestore {
 )]
 pub(crate) fn verify(forge_config: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let forge_bin = glb::resolve_forge_binary().ok_or("praxis-forge binary not found")?;
+    let forge_state_dir = super::forge_config::state_dir_for_config(forge_config)?;
     let root = super::demo_root(forge_config);
     let fixture = root.join(REQUEST_FIXTURE_SUFFIX);
     if !fixture.exists() {
@@ -106,14 +114,14 @@ pub(crate) fn verify(forge_config: &Path) -> Result<(), Box<dyn std::error::Erro
     record("Praxis workloads", &mut results, check_praxis_workloads);
     record("edge overlays", &mut results, check_overlay_perspectives);
     record("stable HTTPS", &mut results, || {
-        let sample = request_path("gtm-stable-url", &fixture)?;
+        let sample = request_path("gtm-stable-url", &fixture, &forge_state_dir)?;
         Ok(format!(
             "https://{PUBLIC_NAME}:{PUBLIC_PORT} returned HTTP {} via {}",
             sample.status, sample.edge
         ))
     });
 
-    let sessions = find_sessions_for_both_edges(&fixture);
+    let sessions = find_sessions_for_both_edges(&fixture, &forge_state_dir);
     record("two edge identities", &mut results, || {
         let sessions = sessions.as_ref().map_err(ToString::to_string)?;
         Ok(format!(
@@ -124,11 +132,11 @@ pub(crate) fn verify(forge_config: &Path) -> Result<(), Box<dyn std::error::Erro
     });
     record("session stickiness", &mut results, || {
         let sessions = sessions.as_ref().map_err(ToString::to_string)?;
-        check_stickiness(sessions, &fixture)
+        check_stickiness(sessions, &fixture, &forge_state_dir)
     });
     record("edge withdrawal and recovery", &mut results, || {
         let sessions = sessions.as_ref().map_err(ToString::to_string)?;
-        check_withdrawal_and_recovery(sessions, &fixture)
+        check_withdrawal_and_recovery(sessions, &fixture, &forge_state_dir)
     });
 
     eprintln!();
@@ -160,7 +168,7 @@ where
 
 /// Validate the Forge document using the same binary that manages services.
 fn validate_forge_config(forge_bin: &str, config: &Path) -> Result<String, Box<dyn std::error::Error>> {
-    let output = Command::new(forge_bin)
+    let output = super::forge_config::command(forge_bin, config)?
         .args(["config", "validate", "--config", &config.display().to_string()])
         .output()?;
     if !output.status.success() {
@@ -186,12 +194,37 @@ fn check_praxis_workloads() -> Result<String, Box<dyn std::error::Error>> {
 
 /// Verify that each edge consumes an operator-rendered local perspective.
 fn check_overlay_perspectives() -> Result<String, Box<dyn std::error::Error>> {
-    let east = overlay_local_site("east-edge")?;
-    let west = overlay_local_site("west-edge")?;
-    if east != "east-edge" || west != "west-edge" {
-        return Err(format!("overlay local_site mismatch: east={east:?}, west={west:?}").into());
+    wait_for_overlay_perspectives_with(OVERLAY_READY_TIMEOUT, OVERLAY_POLL_INTERVAL, || {
+        let east = overlay_local_site("east-edge")?;
+        let west = overlay_local_site("west-edge")?;
+        if east != "east-edge" || west != "west-edge" {
+            return Err(format!("overlay local_site mismatch: east={east:?}, west={west:?}").into());
+        }
+        Ok(format!("east={east}, west={west}"))
+    })
+}
+
+/// Retry the nonempty, correctly scoped overlay check during operator recovery.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "bounded synchronous polling in the xtask verifier"
+)]
+fn wait_for_overlay_perspectives_with(
+    timeout: Duration,
+    interval: Duration,
+    mut check: impl FnMut() -> Result<String, Box<dyn std::error::Error>>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let last_error = match check() {
+            Ok(evidence) => return Ok(evidence),
+            Err(error) => error.to_string(),
+        };
+        if Instant::now() >= deadline {
+            return Err(format!("edge overlays did not converge within {timeout:?}: {last_error}").into());
+        }
+        thread::sleep(interval);
     }
-    Ok(format!("east={east}, west={west}"))
 }
 
 /// Read the local-site identity and require at least one candidate.
@@ -217,11 +250,14 @@ fn overlay_local_site(cluster: &str) -> Result<String, Box<dyn std::error::Error
 }
 
 /// Find two bounded session IDs that consistently hash to different edges.
-fn find_sessions_for_both_edges(fixture: &Path) -> Result<BTreeMap<String, String>, Box<dyn std::error::Error>> {
+fn find_sessions_for_both_edges(
+    fixture: &Path,
+    forge_state_dir: &Path,
+) -> Result<BTreeMap<String, String>, Box<dyn std::error::Error>> {
     let mut sessions = BTreeMap::new();
     for index in 0..64 {
         let session = format!("gtm-edge-discovery-{index}");
-        let sample = request_path(&session, fixture)?;
+        let sample = request_path(&session, fixture, forge_state_dir)?;
         sessions.entry(sample.edge).or_insert(session);
         if sessions.len() == 2 {
             return Ok(sessions);
@@ -231,10 +267,14 @@ fn find_sessions_for_both_edges(fixture: &Path) -> Result<BTreeMap<String, Strin
 }
 
 /// Prove repeated requests with one session ID stay on the same Praxis edge.
-fn check_stickiness(sessions: &BTreeMap<String, String>, fixture: &Path) -> Result<String, Box<dyn std::error::Error>> {
+fn check_stickiness(
+    sessions: &BTreeMap<String, String>,
+    fixture: &Path,
+    forge_state_dir: &Path,
+) -> Result<String, Box<dyn std::error::Error>> {
     for (expected_edge, session) in sessions {
         for _attempt in 0..3 {
-            let sample = request_path(session, fixture)?;
+            let sample = request_path(session, fixture, forge_state_dir)?;
             if sample.edge != *expected_edge {
                 return Err(format!("session {session:?} moved from {expected_edge} to {}", sample.edge).into());
             }
@@ -247,6 +287,7 @@ fn check_stickiness(sessions: &BTreeMap<String, String>, fixture: &Path) -> Resu
 fn check_withdrawal_and_recovery(
     sessions: &BTreeMap<String, String>,
     fixture: &Path,
+    forge_state_dir: &Path,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let stopped_edge = "east-edge";
     let session = sessions
@@ -260,13 +301,13 @@ fn check_withdrawal_and_recovery(
         armed: true,
     };
 
-    wait_for_edge(session, "west-edge", Duration::from_secs(30), fixture)?;
+    wait_for_edge(session, "west-edge", Duration::from_secs(30), fixture, forge_state_dir)?;
     eprintln!("[WITHDRAWAL 2/3] West-edge is serving the session; restoring east-edge.");
     scale_edge(stopped_edge, 1)?;
     wait_for_deployment(stopped_edge, "edge-gateway", Duration::from_secs(60))?;
     restore.disarm();
     eprintln!("[WITHDRAWAL 3/3] East-edge is ready; waiting for its original session path to recover.");
-    wait_for_edge(session, stopped_edge, Duration::from_secs(30), fixture)?;
+    wait_for_edge(session, stopped_edge, Duration::from_secs(30), fixture, forge_state_dir)?;
 
     Ok("east withdrawal routed to west; east recovered under the same URL and session key".to_owned())
 }
@@ -348,13 +389,14 @@ fn wait_for_edge(
     expected_edge: &str,
     timeout: Duration,
     fixture: &Path,
+    forge_state_dir: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
-        if request_path(session, fixture).is_ok_and(|sample| sample.edge == expected_edge) {
+        if request_path(session, fixture, forge_state_dir).is_ok_and(|sample| sample.edge == expected_edge) {
             return Ok(());
         }
-        std::thread::park_timeout(Duration::from_millis(250));
+        thread::park_timeout(Duration::from_millis(250));
     }
     Err(format!("session {session:?} did not converge to {expected_edge} within {timeout:?}").into())
 }
@@ -374,8 +416,12 @@ pub(crate) fn resolve_gtm_ip() -> Result<String, Box<dyn std::error::Error>> {
 }
 
 /// Send one request through the stable verified HTTPS endpoint.
-pub(crate) fn request_path(session: &str, fixture: &Path) -> Result<EdgeSample, Box<dyn std::error::Error>> {
-    request_path_with_affinity(session, session, fixture)
+pub(crate) fn request_path(
+    session: &str,
+    fixture: &Path,
+    forge_state_dir: &Path,
+) -> Result<EdgeSample, Box<dyn std::error::Error>> {
+    request_path_with_affinity(session, session, fixture, forge_state_dir)
 }
 
 /// Send one request with independent edge and provider affinity fixtures.
@@ -387,6 +433,7 @@ pub(crate) fn request_path_with_affinity(
     edge_session: &str,
     provider_session: &str,
     fixture: &Path,
+    forge_state_dir: &Path,
 ) -> Result<EdgeSample, Box<dyn std::error::Error>> {
     let gtm_ip = kubectl_jsonpath(
         "gtm-emulator",
@@ -395,6 +442,8 @@ pub(crate) fn request_path_with_affinity(
     )?;
     let resolve = format!("{PUBLIC_NAME}:{PUBLIC_PORT}:{}", gtm_ip.trim());
     let url = format!("https://{PUBLIC_NAME}:{PUBLIC_PORT}/v1/chat/completions");
+    let public_ca = forge_state_dir.join(PUBLIC_CA_RUNTIME_PATH);
+    let public_ca = public_ca.display().to_string();
     let output = Command::new("curl")
         .args([
             "--silent",
@@ -402,7 +451,7 @@ pub(crate) fn request_path_with_affinity(
             "--max-time",
             "10",
             "--cacert",
-            PUBLIC_CA,
+            &public_ca,
             "--noproxy",
             PUBLIC_NAME,
             "--resolve",
@@ -512,6 +561,35 @@ mod tests {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
+    }
+
+    #[test]
+    fn edge_overlay_check_retries_a_temporary_empty_candidate_set() {
+        let mut attempts = 0;
+        let evidence = wait_for_overlay_perspectives_with(Duration::from_secs(1), Duration::ZERO, || {
+            attempts += 1;
+            if attempts == 1 {
+                return Err(std::io::Error::other("east-edge overlay has no candidates").into());
+            }
+            Ok("east=east-edge, west=west-edge".to_owned())
+        })
+        .unwrap_or_else(|_| std::process::abort());
+
+        assert_eq!(attempts, 2);
+        assert_eq!(evidence, "east=east-edge, west=west-edge");
+    }
+
+    #[test]
+    fn edge_overlay_check_fails_after_its_convergence_window() {
+        let error = wait_for_overlay_perspectives_with(Duration::ZERO, Duration::ZERO, || {
+            Err(std::io::Error::other("east-edge overlay has no candidates").into())
+        })
+        .err()
+        .map(|error| error.to_string())
+        .unwrap_or_default();
+
+        assert!(error.contains("did not converge"));
+        assert!(error.contains("east-edge overlay has no candidates"));
     }
 
     #[test]

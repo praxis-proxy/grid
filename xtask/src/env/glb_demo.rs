@@ -40,9 +40,6 @@ const FULL_SOAK_INTERVAL: Duration = Duration::from_secs(5);
 /// Successful requests between full-mode soak progress updates.
 const FULL_SOAK_PROGRESS_SAMPLES: usize = 12;
 
-/// Resolved config emitted next to the source config to preserve relative paths.
-const RESOLVED_CONFIG_NAME: &str = ".forge.resolved.yaml";
-
 /// Ordered cluster names in the global-ingress scenario environment.
 const CLUSTERS: &[&str] = &[
     "gtm-emulator",
@@ -154,6 +151,8 @@ pub(crate) struct SetupContext {
     demo_root: PathBuf,
     /// Resolved forge config path.
     resolved_config: PathBuf,
+    /// Isolated Forge state and runtime directory for this run.
+    forge_state_dir: PathBuf,
     /// Forge binary path.
     forge_bin: String,
     /// Ingress topology for this run.
@@ -312,7 +311,8 @@ pub(crate) fn setup(
     forge_config: &Path,
     ingress_mode: IngressMode,
 ) -> Result<SetupContext, Box<dyn std::error::Error>> {
-    let context = prepare_setup(forge_config, ingress_mode, None, None)?;
+    let run_id = format!("{}-{}", format_utc_timestamp(), std::process::id());
+    let context = prepare_setup(forge_config, ingress_mode, None, None, &run_id)?;
     deploy_setup(&context)?;
     Ok(context)
 }
@@ -327,13 +327,19 @@ fn prepare_setup(
     ingress_mode: IngressMode,
     external_provider: Option<ExternalProviderDescriptor>,
     external_key_file: Option<PathBuf>,
+    run_id: &str,
 ) -> Result<SetupContext, Box<dyn std::error::Error>> {
     let root = super::demo_root(forge_config);
     eprintln!("Forge config: {}", forge_config.display());
     eprintln!("Demo root:    {}", root.display());
+    let resolved_config = materialize_config(forge_config, ingress_mode, external_provider.as_ref(), run_id)?;
+    let forge_state_dir = super::forge_config::state_dir_for_config(&resolved_config)?;
+    fs::create_dir_all(&forge_state_dir)?;
+    eprintln!("Forge state:  {}", forge_state_dir.display());
     Ok(SetupContext {
         demo_root: root,
-        resolved_config: materialize_config(forge_config, ingress_mode, external_provider.as_ref())?,
+        resolved_config,
+        forge_state_dir,
         forge_bin: glb::resolve_forge_binary().ok_or("praxis-forge binary not found")?,
         ingress_mode,
         external_provider,
@@ -369,6 +375,7 @@ fn deploy_setup(context: &SetupContext) -> Result<(), Box<dyn std::error::Error>
         context.ingress_mode,
         context.external_provider.as_ref(),
         &context.demo_root,
+        &context.forge_state_dir,
     )?;
 
     eprintln!();
@@ -396,7 +403,11 @@ fn deploy_setup(context: &SetupContext) -> Result<(), Box<dyn std::error::Error>
         "[SETUP {}/{total_phases}] Installing provider trust, credentials, and policy",
         next()
     );
-    glb::install_provider_boundary_with_mode_and_external(context.ingress_mode, context.external_key_file.as_deref())?;
+    glb::install_provider_boundary_with_mode_and_external(
+        context.ingress_mode,
+        context.external_key_file.as_deref(),
+        &context.forge_state_dir,
+    )?;
 
     eprintln!();
     let provider_desc = if context.external_provider.is_some() {
@@ -505,7 +516,7 @@ pub(crate) fn run(forge_config: &Path, options: &GlbDemoOptions) -> Result<(), B
     if ingress_mode == IngressMode::Workload && ext_descriptor.is_some() {
         return Err("external providers require the global-ingress demo mode".into());
     }
-    let run_id = format_utc_timestamp();
+    let run_id = format!("{}-{}", format_utc_timestamp(), std::process::id());
     let started_at = format_utc_iso();
     let wall_start = Instant::now();
     let mut narrator = Narrator::new();
@@ -513,11 +524,18 @@ pub(crate) fn run(forge_config: &Path, options: &GlbDemoOptions) -> Result<(), B
     let evidence_dir = resolve_evidence_dir(forge_config, options, &run_id);
     fs::create_dir_all(&evidence_dir)?;
 
-    let setup_ctx = prepare_setup(forge_config, ingress_mode, ext_descriptor, ext_key_file);
+    let setup_ctx = prepare_setup(forge_config, ingress_mode, ext_descriptor, ext_key_file, &run_id);
+    if let Ok(context) = &setup_ctx {
+        fs::write(
+            evidence_dir.join("forge-state-dir.txt"),
+            format!("{}\n", context.forge_state_dir.display()),
+        )?;
+    }
     let mut outcome = match &setup_ctx {
         Ok(context) => match deploy_setup(context) {
             Ok(()) => demonstrate_inner(
                 &context.resolved_config,
+                &context.forge_state_dir,
                 mode,
                 ingress_mode,
                 context.external_provider.as_ref(),
@@ -612,8 +630,9 @@ pub(crate) fn demonstrate_with_options(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mode = options.mode();
     let ingress_mode = options.ingress_mode();
+    let forge_state_dir = super::forge_config::state_dir_for_config(forge_config)?;
     let mut narrator = Narrator::new();
-    match demonstrate_inner(forge_config, mode, ingress_mode, None, &mut narrator).error {
+    match demonstrate_inner(forge_config, &forge_state_dir, mode, ingress_mode, None, &mut narrator).error {
         Some(error) => Err(error.into()),
         None => Ok(()),
     }
@@ -624,15 +643,20 @@ pub(crate) fn demonstrate_with_options(
 // ---------------------------------------------------------------------------
 
 /// Run narrated scenarios and collect capability results.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the run-scoped Forge state must accompany its resolved config through scenario orchestration"
+)]
 fn demonstrate_inner(
     forge_config: &Path,
+    forge_state_dir: &Path,
     mode: DemoMode,
     ingress_mode: IngressMode,
     external: Option<&ExternalProviderDescriptor>,
     narrator: &mut Narrator,
 ) -> DemoOutcome {
     match ingress_mode {
-        IngressMode::Global => demonstrate_global(forge_config, mode, external, narrator),
+        IngressMode::Global => demonstrate_global(forge_config, forge_state_dir, mode, external, narrator),
         IngressMode::Workload => demonstrate_workload(forge_config, mode, narrator),
     }
 }
@@ -644,6 +668,7 @@ fn demonstrate_inner(
 )]
 fn demonstrate_global(
     forge_config: &Path,
+    forge_state_dir: &Path,
     mode: DemoMode,
     external: Option<&ExternalProviderDescriptor>,
     narrator: &mut Narrator,
@@ -667,7 +692,7 @@ fn demonstrate_global(
         return failed_outcome(capabilities, Vec::new(), "Active/active routing", concise_error(error));
     }
 
-    let paths = match discover_paths(&fixture) {
+    let paths = match discover_paths(&fixture, forge_state_dir) {
         Ok(paths) => paths,
         Err(error) => {
             return failed_outcome(capabilities, Vec::new(), "Active/active routing", concise_error(error));
@@ -716,7 +741,7 @@ fn demonstrate_global(
             "Session affinity and provider drain",
             "As an inference client, I need repeated requests to remain on one edge and provider while existing sessions survive a metrics-driven drain and new sessions move safely.",
         );
-        if let Err(error) = prove_affinity(narrator, &paths, &fixture) {
+        if let Err(error) = prove_affinity(narrator, &paths, &fixture, forge_state_dir) {
             return failed_outcome(
                 capabilities,
                 observed_paths,
@@ -758,7 +783,7 @@ fn demonstrate_global(
             "Grid restart recovery and request soak",
             "As a platform operator, I need Grid control-plane restarts to preserve converged routing and sustained inference traffic.",
         );
-        match prove_restart_recovery_and_soak(narrator, &paths, &fixture) {
+        match prove_restart_recovery_and_soak(narrator, &paths, &fixture, forge_state_dir) {
             Ok(evidence) => capabilities.push(CapabilityResult {
                 capability: "Grid restart recovery and soak".to_owned(),
                 result: "pass",
@@ -802,7 +827,7 @@ fn demonstrate_global(
             "Live external provider",
             "As a platform owner, I need to prove that a real external API provider can be routed through the Grid provider boundary with credential replacement and public TLS.",
         );
-        match prove_external_provider(narrator, ext) {
+        match prove_external_provider(narrator, ext, forge_state_dir) {
             Ok(proof) => {
                 capabilities.push(CapabilityResult {
                     capability: "Live external provider".to_owned(),
@@ -1503,7 +1528,7 @@ fn restore_deployment(
 // ---------------------------------------------------------------------------
 
 /// Discover real edge/provider combinations through the stable HTTPS name.
-fn discover_paths(request_fixture: &Path) -> Result<ObservedPaths, Box<dyn std::error::Error>> {
+fn discover_paths(request_fixture: &Path, forge_state_dir: &Path) -> Result<ObservedPaths, Box<dyn std::error::Error>> {
     let mut paths = BTreeMap::new();
     for index in 0..MAX_PATH_SAMPLES {
         let fixture = AffinityFixture {
@@ -1514,6 +1539,7 @@ fn discover_paths(request_fixture: &Path) -> Result<ObservedPaths, Box<dyn std::
             &fixture.edge_session,
             &fixture.provider_session,
             request_fixture,
+            forge_state_dir,
         )?;
         if !paths.keys().any(|(edge, _)| edge == &sample.edge) {
             paths.insert((sample.edge, sample.provider), fixture);
@@ -1548,6 +1574,7 @@ fn prove_affinity(
     narrator: &mut Narrator,
     paths: &ObservedPaths,
     request_fixture: &Path,
+    forge_state_dir: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let ((expected_edge, expected_provider), fixture) = paths
         .first_key_value()
@@ -1558,6 +1585,7 @@ fn prove_affinity(
             &fixture.edge_session,
             &fixture.provider_session,
             request_fixture,
+            forge_state_dir,
         )?;
         if sample.edge != *expected_edge || sample.provider != *expected_provider {
             return Err(format!(
@@ -1585,14 +1613,16 @@ fn prove_restart_recovery_and_soak(
     narrator: &mut Narrator,
     paths: &ObservedPaths,
     request_fixture: &Path,
+    forge_state_dir: &Path,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let fixtures = paths.values().collect::<Vec<_>>();
     if fixtures.is_empty() {
         return Err("no observed path available for restart and soak proof".into());
     }
 
-    prove_operator_restarts(narrator, &fixtures, request_fixture)?;
-    let (samples, edge_count, provider_count) = run_request_soak(narrator, &fixtures, request_fixture)?;
+    prove_operator_restarts(narrator, &fixtures, request_fixture, forge_state_dir)?;
+    let (samples, edge_count, provider_count) =
+        run_request_soak(narrator, &fixtures, request_fixture, forge_state_dir)?;
     let evidence = format!(
         "4 Grid operators restarted; {samples} soak requests passed across {edge_count} edges and {provider_count} provider(s)"
     );
@@ -1601,10 +1631,15 @@ fn prove_restart_recovery_and_soak(
 }
 
 /// Restart each Grid operator and prove overlay and request recovery.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the four sequential restart proofs share fixtures and ordered evidence"
+)]
 fn prove_operator_restarts(
     narrator: &mut Narrator,
     fixtures: &[&AffinityFixture],
     request_fixture: &Path,
+    forge_state_dir: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let expected_candidates = glb::edge_candidate_count()?;
     narrator.narrate("");
@@ -1619,8 +1654,17 @@ fn prove_operator_restarts(
             index + 1,
             GRID_CLUSTERS.len()
         ));
+        let previous_network_resource_version = glb::grid_network_resource_version(cluster)?;
+        let previous_edge_revisions = glb::edge_overlay_revision_baselines()?;
         restart_grid_operator(cluster)?;
-        let overlay_evidence = verify_restart_overlay_recovery(expected_candidates)?;
+        let edge_status_marker_resource_versions = glb::reset_edge_overlay_observation_markers()?;
+        let overlay_evidence = verify_restart_overlay_recovery(
+            expected_candidates,
+            cluster,
+            &previous_network_resource_version,
+            &previous_edge_revisions,
+            &edge_status_marker_resource_versions,
+        )?;
         let fixture = fixtures
             .get(index % fixtures.len())
             .ok_or("no affinity fixture available after Grid restart")?;
@@ -1628,6 +1672,7 @@ fn prove_operator_restarts(
             &fixture.edge_session,
             &fixture.provider_session,
             request_fixture,
+            forge_state_dir,
         )?;
         narrator.narrate(&format!(
             "[PASS] Restarted {cluster} Grid operator; routing recovered via {} -> {} ({overlay_evidence}).",
@@ -1638,13 +1683,22 @@ fn prove_operator_restarts(
 }
 
 /// Require both consumers to return to the complete, served overlay after a restart.
-fn verify_restart_overlay_recovery(expected_candidates: usize) -> Result<String, Box<dyn std::error::Error>> {
-    let evidence = glb::wait_for_edge_overlays_ready_with_count(expected_candidates)?;
-    for edge in CONSUMER_CLUSTERS {
-        let revision = glb::overlay_revision(edge)?;
-        glb::verify_edge_serving_revision(edge, &revision)?;
-    }
-    Ok(evidence)
+fn verify_restart_overlay_recovery(
+    expected_candidates: usize,
+    restarted_cluster: &str,
+    previous_network_resource_version: &str,
+    previous_edge_revisions: &BTreeMap<String, String>,
+    edge_status_marker_resource_versions: &BTreeMap<String, String>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let evidence = glb::wait_for_edge_overlays_ready_after_restart(
+        restarted_cluster,
+        previous_network_resource_version,
+        expected_candidates,
+        previous_edge_revisions,
+        edge_status_marker_resource_versions,
+    )?;
+    let serving_evidence = glb::wait_for_edge_overlays_serving_with_count(expected_candidates)?;
+    Ok(format!("{evidence}; {serving_evidence}"))
 }
 
 /// Sustain inference requests for the full-mode soak window.
@@ -1652,6 +1706,7 @@ fn run_request_soak(
     narrator: &mut Narrator,
     fixtures: &[&AffinityFixture],
     request_fixture: &Path,
+    forge_state_dir: &Path,
 ) -> Result<(usize, usize, usize), Box<dyn std::error::Error>> {
     narrate_soak_start(narrator);
     let deadline = Instant::now() + FULL_SOAK_DURATION;
@@ -1666,6 +1721,7 @@ fn run_request_soak(
             &fixture.edge_session,
             &fixture.provider_session,
             request_fixture,
+            forge_state_dir,
         )?;
         edges.insert(sample.edge);
         providers.insert(sample.provider);
@@ -1739,6 +1795,7 @@ fn restart_grid_operator(cluster: &str) -> Result<(), Box<dyn std::error::Error>
 fn prove_external_provider(
     narrator: &mut Narrator,
     ext: &ExternalProviderDescriptor,
+    forge_state_dir: &Path,
 ) -> Result<ExternalProviderProof, Box<dyn std::error::Error>> {
     narrator.narrate("");
     narrator.narrate("EXTERNAL PROVIDER PROOF");
@@ -1759,7 +1816,8 @@ fn prove_external_provider(
     });
 
     let gtm_ip = gtm_emulator::resolve_gtm_ip()?;
-    let gtm_ca = ".forge/runtime/glb-tls/gtm/ca.crt";
+    let gtm_ca = forge_state_dir.join("runtime/glb-tls/gtm/ca.crt");
+    let gtm_ca = gtm_ca.display().to_string();
     let public_name = "api.grid-glb.test";
     let public_port: u16 = 8443;
     let resolve = format!("{public_name}:{public_port}:{gtm_ip}");
@@ -1772,7 +1830,7 @@ fn prove_external_provider(
             "--max-time",
             "30",
             "--cacert",
-            gtm_ca,
+            &gtm_ca,
             "--noproxy",
             public_name,
             "--resolve",
@@ -2037,11 +2095,16 @@ fn materialize_config(
     source: &Path,
     ingress_mode: IngressMode,
     external_provider: Option<&ExternalProviderDescriptor>,
+    run_id: &str,
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let content = fs::read_to_string(source)?;
-    let rendered = render_config(&content, ingress_mode, external_provider)?;
     let parent = source.parent().unwrap_or_else(|| Path::new("."));
-    let output = parent.join(RESOLVED_CONFIG_NAME);
+    let output = parent.join(format!(".forge.resolved-{run_id}.yaml"));
+    let state_dir = super::forge_config::state_dir_for_config(&output)?;
+    let mut config: serde_yaml::Value =
+        serde_yaml::from_str(&render_config(&content, ingress_mode, external_provider)?)?;
+    super::forge_config::rewrite_exec_runtime_paths(&mut config, &state_dir);
+    let rendered = serde_yaml::to_string(&config)?;
     fs::write(&output, rendered)?;
     Ok(output)
 }
@@ -2366,7 +2429,7 @@ fn apply_gtm_emulator_stack(forge: &str, config: &Path) -> Result<(), Box<dyn st
 
 /// Execute one Forge command and retain its output on failure.
 fn run_forge(forge: &str, config: &Path, args: &[&str]) -> Result<(), Box<dyn std::error::Error>> {
-    let output = Command::new(forge)
+    let output = super::forge_config::command(forge, config)?
         .args(["--config", &config.display().to_string(), "--non-interactive"])
         .args(args)
         .output()?;
