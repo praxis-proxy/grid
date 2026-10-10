@@ -38,6 +38,74 @@ pub use serving::{
 pub use signals::{Over, SiteReading, SiteSignals};
 pub use snapshot::RouteSnapshot;
 
+/// Grid counters the gateway emits, with the help text a scrape shows.
+const COUNTER_HELP: [(&str, &str); 6] = [
+    (
+        "grid_route_decisions_total",
+        "Requests the gateway decided, by outcome. A refusal records an empty site and cluster.",
+    ),
+    (
+        "grid_route_selections_total",
+        "Decisions by the path that produced them.",
+    ),
+    (
+        "grid_route_prefix_affinity_total",
+        "Prefix-affinity decisions by outcome.",
+    ),
+    ("grid_serving_config_reload_total", "Serving-config reloads by result."),
+    ("grid_signals_poll_total", "Polls of the local operator by result."),
+    (
+        "grid_signals_ingest_dropped_total",
+        "Rows the operator served that the gateway refused, by reason.",
+    ),
+];
+
+/// Grid gauges the gateway emits.
+const GAUGE_HELP: [(&str, &str); 7] = [
+    (
+        "grid_route_site_rho",
+        "Saturation the gateway last read for the site, in-flight over its ceiling. NaN when unmeasured.",
+    ),
+    (
+        "grid_route_site_weight",
+        "Capacity the draw weights the site by. NaN when unmeasured.",
+    ),
+    (
+        "grid_route_site_ceiling",
+        "Ceiling the gateway has learned for the site. NaN when unmeasured.",
+    ),
+    (
+        "grid_route_site_score",
+        "Score the site ranks by in the current snapshot. NaN when excluded or demoted.",
+    ),
+    (
+        "grid_route_shedding",
+        "1 while the gateway sheds this model, 0 otherwise.",
+    ),
+    (
+        "grid_signals_last_success_timestamp_seconds",
+        "Unix time of the last successful poll of the local operator.",
+    ),
+    (
+        "grid_signals_response_bytes",
+        "Size of the last successful poll's response, in bytes.",
+    ),
+];
+
+/// Describe every grid metric the gateway emits, so a scrape carries help text.
+///
+/// Call once after the Prometheus recorder is installed: the `metrics` crate
+/// drops a description sent to the no-op recorder, and the emit sites run too
+/// late and too often to carry one.
+pub fn describe_metrics() {
+    for (name, help) in COUNTER_HELP {
+        metrics::describe_counter!(name, metrics::Unit::Count, help);
+    }
+    for (name, help) in GAUGE_HELP {
+        metrics::describe_gauge!(name, help);
+    }
+}
+
 /// The number of prefix keys `body` yields for a request to `path`, for the
 /// peak-memory test; not an API.
 #[doc(hidden)]

@@ -215,6 +215,7 @@ fn start_metrics_listener(config: &Config) -> Result<(), String> {
     // publishes its first snapshot, so install it now when anything will serve metrics.
     if listener.is_some() || config.admin.address.is_some() {
         praxis_protocol::http::pingora::metrics::install_prometheus_recorder();
+        ai_grid_filters::describe_metrics();
     }
     let Some(listener) = listener else {
         return Ok(());
