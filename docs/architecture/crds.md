@@ -684,12 +684,12 @@ says nothing about whether it serves now.
 | `True` | `Ready` | The latest scrape succeeded with at least one ready endpoint. |
 | `False` | `NoEndpointsReady` | Two consecutive scrapes counted zero ready endpoints, and the EPP recorded no engine answer in the last 30s. |
 | `Unknown` | `NoLivenessCheck` | The scrape answered without the pool's ready-endpoint series (`llm_d_epp_ready_endpoints`, then `inference_pool_ready_pods`, for `poolName`). Readiness is unknown rather than false, so the provider is not excluded: a provider pointed at vLLM's own `/metrics` carries no such series. The message names what was missing. |
-| `False` | `ScrapeTimedOut` | No scrape succeeded within `staleMetricsSeconds`, and the latest timed out. |
+| `False` | `ScrapeTimedOut` | No scrape succeeded within `staleMetricsSeconds` or the [readiness floor](polling-metrics.md#provider-readiness), if longer, and the latest timed out. |
 | `False` | `ScrapeUnauthorized` | As above, and the latest was refused with 401 or 403. |
 | `False` | `TLSHandshakeFailed` | As above, and the latest failed TLS, including the TLS material. |
 | `Unknown` | `MetricsBodyTooLarge` | The endpoint answered, but its metrics HTTP response body passed the operator's 1 MiB budget. Readiness is unknown rather than false, so the provider remains a routing candidate. |
 | `False` | `ScrapeFailed` | As above, and the latest failed otherwise. The message names the class: `dns`, `connect`, `http`, `parse`, or `config`. |
-| `False` | `MetricsStale` | No scrape succeeded within `staleMetricsSeconds`, and none failed. |
+| `False` | `MetricsStale` | No scrape succeeded within `staleMetricsSeconds` or the [readiness floor](polling-metrics.md#provider-readiness), if longer, and none failed. |
 | `False` | `ProviderUnavailable` | The provider is `Unavailable`. |
 | `Unknown` | `AwaitingFirstScrape` | No scrape has succeeded yet, within the grace window. |
 | `Unknown` | `MetricsNotConfigured` | No `metricsConfig`, so readiness cannot be read. |
@@ -782,7 +782,7 @@ feeds the resulting `BackendMetrics` into overlay scoring.
 | `poolName` | absent | Selects samples whose Prometheus `name` label matches this pool. When set, the scrape must contain at least one configured signal for that pool. |
 | `queueCapacity` | absent | For raw queue-depth counts, divide by this positive capacity and clamp the normalized value to `0.0..1.0`. Without it, queue depth must already be normalized. |
 | `signalNames` | all unset | Mapping from scoring signals to Prometheus metric names. |
-| `staleMetricsSeconds` | absent | Maximum age in seconds for reusing the last successful sample after a failed scrape. Minimum: `1`. For plaintext metrics, absence means immediate neutral fallback; when TLS is configured, an expired/absent sample makes the provider unhealthy and excluded. |
+| `staleMetricsSeconds` | absent | Maximum age in seconds for reusing the last successful sample after a failed scrape. Readiness uses this age or the [readiness floor](polling-metrics.md#provider-readiness), if longer. Minimum: `1`. For plaintext metrics, absence means immediate neutral fallback; when TLS is configured, an expired/absent sample makes the provider unhealthy and excluded. |
 | `tls` | absent | Optional metrics-specific TLS override. Otherwise `spec.tls` applies. See [TLS and mTLS](#tls-and-mtls). |
 
 Providers without `metricsConfig` and signals without configured metric names
