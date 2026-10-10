@@ -221,6 +221,10 @@ struct Evidence {
     proof_results: BTreeMap<String, ProofResult>,
     /// Exact image references used.
     images: BTreeMap<String, String>,
+    /// Bounded image-evidence collection errors. An error fails the run while
+    /// preserving proof results, partial images, teardown, and `results.json`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    image_evidence_errors: Vec<String>,
     /// External provider configuration, if used.
     external_provider: Option<ExternalProviderEvidence>,
     /// Pre- and post-SWIM overlay snapshots.
@@ -863,7 +867,7 @@ fn record_negative_probe_facts(
     );
     observed_facts.insert(
         format!("{prefix}_response_received"),
-        serde_json::Value::Bool(!status.is_empty()),
+        serde_json::Value::Bool(curl_received_http_response(status)),
     );
     observed_facts.insert(
         format!("{prefix}_kubectl_process_success"),
@@ -880,6 +884,16 @@ fn record_negative_probe_facts(
     if let Some(error) = curl_transport_error(output) {
         observed_facts.insert(format!("{prefix}_transport_error"), serde_json::Value::String(error));
     }
+}
+
+/// Curl writes `000` when the request failed before receiving HTTP headers.
+fn curl_received_http_response(status: &str) -> bool {
+    !status.is_empty() && status != "000"
+}
+
+/// A negative routing probe passes only when it receives an HTTP rejection.
+fn negative_probe_status_is_rejected(status: &str) -> bool {
+    status.starts_with('4') || status.starts_with('5')
 }
 
 /// Require the complete trusted attribution set for a primary response.
@@ -3236,7 +3250,7 @@ fn assert_negative_routing() -> AssertionResult {
     ])?;
 
     let invalid_model_status = String::from_utf8_lossy(&invalid_model_output.stdout).trim().to_owned();
-    let invalid_model_rejected = invalid_model_status.starts_with('4') || invalid_model_status.starts_with('5');
+    let invalid_model_rejected = negative_probe_status_is_rejected(&invalid_model_status);
     record_negative_probe_facts(
         &mut observed_facts,
         "invalid_model",
@@ -3263,7 +3277,7 @@ fn assert_negative_routing() -> AssertionResult {
     ])?;
 
     let invalid_path_status = String::from_utf8_lossy(&invalid_path_output.stdout).trim().to_owned();
-    let invalid_path_rejected = invalid_path_status.starts_with('4') || invalid_path_status.starts_with('5');
+    let invalid_path_rejected = negative_probe_status_is_rejected(&invalid_path_status);
     record_negative_probe_facts(
         &mut observed_facts,
         "invalid_path",
@@ -3292,7 +3306,7 @@ fn assert_negative_routing() -> AssertionResult {
     ])?;
 
     let malformed_body_status = String::from_utf8_lossy(&malformed_body_output.stdout).trim().to_owned();
-    let malformed_body_rejected = malformed_body_status.starts_with('4') || malformed_body_status.starts_with('5');
+    let malformed_body_rejected = negative_probe_status_is_rejected(&malformed_body_status);
     record_negative_probe_facts(
         &mut observed_facts,
         "malformed_body",
@@ -7412,6 +7426,7 @@ pub(crate) fn run(forge_config: &Path, options: &GlbDemoOptions) -> Result<(), B
     let mut run_error = None;
     let mut overlay_state = OverlayState::default();
     let mut image_evidence = None;
+    let mut image_evidence_errors = Vec::new();
 
     let proof_results = match &setup_ctx {
         Ok(context) => {
@@ -7451,7 +7466,11 @@ pub(crate) fn run(forge_config: &Path, options: &GlbDemoOptions) -> Result<(), B
                     }
 
                     // Capture deployed images while the Kind clusters are still available.
-                    image_evidence = Some(collect_image_evidence()?);
+                    image_evidence = Some(record_image_evidence_collection(
+                        collect_image_evidence(),
+                        &mut image_evidence_errors,
+                        &mut run_error,
+                    ));
 
                     // Teardown if requested
                     if options.teardown && (run_error.is_none() || !options.keep_on_failure) {
@@ -7474,12 +7493,16 @@ pub(crate) fn run(forge_config: &Path, options: &GlbDemoOptions) -> Result<(), B
                     run_error = Some(format!("environment setup failed: {e}"));
 
                     // A partial deployment can still provide useful image evidence.
-                    image_evidence = Some(collect_image_evidence()?);
+                    image_evidence = Some(record_image_evidence_collection(
+                        collect_image_evidence(),
+                        &mut image_evidence_errors,
+                        &mut run_error,
+                    ));
 
                     if options.teardown && !options.keep_on_failure {
                         if let Err(cleanup_err) = teardown_environment(context) {
                             eprintln!("[WARN]  Cleanup after setup failure also failed: {cleanup_err}");
-                            run_error = Some(format!("environment setup failed: {e}; cleanup failed: {cleanup_err}"));
+                            append_run_error(&mut run_error, format!("cleanup failed: {cleanup_err}"));
                         } else {
                             teardown_success = true;
                         }
@@ -7500,7 +7523,7 @@ pub(crate) fn run(forge_config: &Path, options: &GlbDemoOptions) -> Result<(), B
     // evidence is still available. In deployed cases this was captured before teardown.
     let images = match image_evidence {
         Some(images) => images,
-        None => collect_image_evidence()?,
+        None => record_image_evidence_collection(collect_image_evidence(), &mut image_evidence_errors, &mut run_error),
     };
     let external_provider_evidence = if let Some(desc) = &ext_descriptor {
         Some(collect_external_provider_evidence(
@@ -7518,6 +7541,7 @@ pub(crate) fn run(forge_config: &Path, options: &GlbDemoOptions) -> Result<(), B
         clusters: CLUSTERS.iter().map(|&s| s.to_owned()).collect(),
         proof_results,
         images,
+        image_evidence_errors,
         external_provider: external_provider_evidence,
         overlay_state,
         cluster_health: Vec::new(),     // Will be populated during runtime assertions
@@ -7545,91 +7569,116 @@ pub(crate) fn run(forge_config: &Path, options: &GlbDemoOptions) -> Result<(), B
     }
 }
 
-/// Collect actual image evidence from the deployed clusters.
-fn collect_image_evidence() -> Result<BTreeMap<String, String>, Box<dyn std::error::Error>> {
-    let mut images = BTreeMap::new();
+#[derive(Debug, Default)]
+/// Image references captured before cleanup and bounded errors from failed reads.
+struct ImageEvidenceCollection {
+    /// Successfully collected deployment image references.
+    images: BTreeMap<String, String>,
+    /// Cluster and deployment identifiers with their sanitized collection errors.
+    errors: Vec<String>,
+}
+
+/// Preserve partial image evidence and turn collection failures into qualification failures.
+fn record_image_evidence_collection(
+    collection: ImageEvidenceCollection,
+    image_evidence_errors: &mut Vec<String>,
+    run_error: &mut Option<String>,
+) -> BTreeMap<String, String> {
+    if !collection.errors.is_empty() {
+        let failure = format!("image evidence collection failed: {}", collection.errors.join("; "));
+        image_evidence_errors.extend(collection.errors);
+        append_run_error(run_error, failure);
+    }
+    collection.images
+}
+
+/// Add a failure without hiding an earlier setup, proof, or teardown failure.
+fn append_run_error(run_error: &mut Option<String>, error: String) {
+    *run_error = Some(match run_error.take() {
+        Some(previous) => format!("{previous}; {error}"),
+        None => error,
+    });
+}
+
+/// Collect actual image evidence from every cluster, retaining successful reads if one fails.
+fn collect_image_evidence() -> ImageEvidenceCollection {
+    let mut collection = ImageEvidenceCollection::default();
 
     for cluster in CLUSTERS {
         let context = format!("kind-grid-combined-{cluster}");
-
-        // Get grid operator image
-        let output = Command::new("kubectl")
-            .args([
-                "get",
-                "deployment/grid-operator",
-                "--context",
-                &context,
-                "-n",
-                "grid-system",
-                "-o",
-                "jsonpath={.spec.template.spec.containers[0].image}",
-            ])
-            .output()?;
-
-        if output.status.success() {
-            let operator_image = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-            images.insert(format!("{cluster}_operator"), operator_image);
-        }
-
-        // Get consumer gateway image
-        let output_2 = Command::new("kubectl")
-            .args([
-                "get",
-                "deployment/consumer-gateway",
-                "--context",
-                &context,
-                "-n",
-                "grid-system",
-                "-o",
-                "jsonpath={.spec.template.spec.containers[0].image}",
-            ])
-            .output()?;
-
-        if output_2.status.success() {
-            let consumer_image = String::from_utf8_lossy(&output_2.stdout).trim().to_owned();
-            images.insert(format!("{cluster}_consumer_gateway"), consumer_image);
-        }
-
-        // Get provider gateway image
-        let output_3 = Command::new("kubectl")
-            .args([
-                "get",
-                "deployment/provider-gateway",
-                "--context",
-                &context,
-                "-n",
-                "grid-system",
-                "-o",
-                "jsonpath={.spec.template.spec.containers[0].image}",
-            ])
-            .output()?;
-
-        if output_3.status.success() {
-            let provider_image = String::from_utf8_lossy(&output_3.stdout).trim().to_owned();
-            images.insert(format!("{cluster}_provider_gateway"), provider_image);
-        }
-
-        // Get VCR inference image
-        let output_4 = Command::new("kubectl")
-            .args([
-                "get",
-                &format!("deployment/vcr-inference-{cluster}"),
-                "--context",
-                &context,
-                "-n",
-                "grid-system",
-                "-o",
-                "jsonpath={.spec.template.spec.containers[0].image}",
-            ])
-            .output()?;
-
-        if output_4.status.success() {
-            let mock_image = String::from_utf8_lossy(&output_4.stdout).trim().to_owned();
-            images.insert(format!("{cluster}_mock_inference"), mock_image);
-        }
+        capture_deployment_image(&mut collection, cluster, &context, "operator", "grid-operator");
+        capture_deployment_image(
+            &mut collection,
+            cluster,
+            &context,
+            "consumer_gateway",
+            "consumer-gateway",
+        );
+        capture_deployment_image(
+            &mut collection,
+            cluster,
+            &context,
+            "provider_gateway",
+            "provider-gateway",
+        );
+        capture_deployment_image(
+            &mut collection,
+            cluster,
+            &context,
+            "mock_inference",
+            &format!("vcr-inference-{cluster}"),
+        );
     }
 
-    Ok(images)
+    collection
+}
+
+/// Read one deployment image and retain either its reference or a bounded error.
+fn capture_deployment_image(
+    collection: &mut ImageEvidenceCollection,
+    cluster: &str,
+    context: &str,
+    key: &str,
+    deployment: &str,
+) {
+    match read_deployment_image(context, deployment) {
+        Ok(image) => {
+            collection.images.insert(format!("{cluster}_{key}"), image);
+        },
+        Err(error) => collection
+            .errors
+            .push(format!("{cluster}/{deployment}: {}", safe_truncate_str(&error, 240))),
+    }
+}
+
+/// Read a deployment's first container image reference from its Kubernetes context.
+fn read_deployment_image(context: &str, deployment: &str) -> Result<String, String> {
+    let output = Command::new("kubectl")
+        .args([
+            "get",
+            &format!("deployment/{deployment}"),
+            "--context",
+            context,
+            "-n",
+            "grid-system",
+            "-o",
+            "jsonpath={.spec.template.spec.containers[0].image}",
+        ])
+        .output()
+        .map_err(|error| format!("could not start kubectl: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "kubectl exited {:?}: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    let image = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if image.is_empty() {
+        return Err("deployment image reference was empty".to_owned());
+    }
+    Ok(image)
 }
 
 /// Collect external provider evidence from the deployed resources.
@@ -7806,6 +7855,7 @@ mod tests {
             clusters: vec!["west".to_owned(), "central".to_owned(), "east".to_owned()],
             proof_results: BTreeMap::new(),
             images: BTreeMap::new(),
+            image_evidence_errors: vec!["west/grid-operator: kubectl unavailable".to_owned()],
             external_provider: None,
             overlay_state: OverlayState::default(),
             cluster_health: vec![ClusterHealth {
@@ -7835,6 +7885,7 @@ mod tests {
         let json = serde_json::to_string(&evidence).unwrap();
         assert!(json.contains("\"schema_version\":\"test\""));
         assert!(json.contains("\"topology\":\"combined-site\""));
+        assert!(json.contains("\"image_evidence_errors\":[\"west/grid-operator: kubectl unavailable\"]"));
         assert!(json.contains("\"healthy\":true"));
         assert!(json.contains("\"ready_replicas\":1"));
         assert!(json.contains("\"converged\":true"));
@@ -8034,6 +8085,35 @@ mod tests {
         let output = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\nHTTP/1.1 503 body text";
         assert_eq!(response_status(output), Some(200));
         assert_eq!(response_status(b"curl: (28) timeout"), None);
+    }
+
+    #[test]
+    fn curl_zero_status_means_no_response_and_does_not_pass_negative_probe() {
+        assert!(!curl_received_http_response("000"));
+        assert!(!negative_probe_status_is_rejected("000"));
+        assert!(curl_received_http_response("403"));
+        assert!(negative_probe_status_is_rejected("403"));
+    }
+
+    #[test]
+    fn image_evidence_errors_preserve_partial_images_and_prior_failures() {
+        let collection = ImageEvidenceCollection {
+            images: BTreeMap::from([("west_operator".to_owned(), "grid-operator:test".to_owned())]),
+            errors: vec!["central/provider-gateway: kubectl unavailable".to_owned()],
+        };
+        let mut image_evidence_errors = Vec::new();
+        let mut run_error = Some("runtime proofs failed: routing".to_owned());
+
+        let images = record_image_evidence_collection(collection, &mut image_evidence_errors, &mut run_error);
+
+        assert_eq!(
+            images.get("west_operator").map(String::as_str),
+            Some("grid-operator:test")
+        );
+        assert_eq!(image_evidence_errors, ["central/provider-gateway: kubectl unavailable"]);
+        let run_error = run_error.unwrap_or_default();
+        assert!(run_error.contains("runtime proofs failed: routing"));
+        assert!(run_error.contains("image evidence collection failed"));
     }
 
     #[test]

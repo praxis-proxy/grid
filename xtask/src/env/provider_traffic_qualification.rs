@@ -5818,14 +5818,33 @@ fn image_config_digest_from_manifest(manifest: &[u8]) -> Result<String, Box<dyn 
     Ok(format!("sha256:{config}"))
 }
 
-/// Read the config digest for an image reference from the Kind node's containerd store.
-fn node_image_config_digest(node: &str, image: &str) -> Result<String, Box<dyn std::error::Error>> {
+/// Translate the runtime identity recorded on a Ready Pod to a CRI image lookup.
+/// Kubernetes prefixes `imageID` with the runtime name; preserve its immutable
+/// digest and never fall back to the mutable Deployment image tag.
+fn crictl_image_reference_from_pod_image_id(image_id: &str) -> Result<&str, Box<dyn std::error::Error>> {
+    let reference = ["docker-pullable://", "containerd://", "docker://"]
+        .iter()
+        .find_map(|prefix| image_id.strip_prefix(prefix))
+        .unwrap_or(image_id);
+    let immutable = reference.starts_with("sha256:")
+        || reference
+            .rsplit_once('@')
+            .is_some_and(|(_, digest)| digest.starts_with("sha256:"));
+    if !immutable {
+        return Err(format!("pod imageID is not an immutable CRI image identity: {image_id}").into());
+    }
+    Ok(reference)
+}
+
+/// Read the config digest for the Ready Pod's exact image from its Kind node.
+fn node_image_config_digest(node: &str, image_id: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let runtime_reference = crictl_image_reference_from_pod_image_id(image_id)?;
     let output = Command::new("docker")
-        .args(["exec", node, "crictl", "inspecti", image])
+        .args(["exec", node, "crictl", "inspecti", runtime_reference])
         .output()?;
     if !output.status.success() {
         return Err(format!(
-            "could not inspect image {image} on Kind node {node}: {}",
+            "could not inspect Ready pod imageID {image_id} on Kind node {node}: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         )
         .into());
@@ -5841,6 +5860,11 @@ fn image_config_digest_from_crictl_inspect(inspect_output: &[u8]) -> Result<Stri
         .and_then(serde_json::Value::as_str)
         .map(str::to_owned)
         .ok_or_else(|| "crictl image inspection has no status.id".into())
+}
+
+/// Whether the node's CRI config digest identifies the expected local image.
+fn image_config_digest_matches(expected: &str, observed: &str) -> bool {
+    expected == observed
 }
 
 /// Check whether a deployment exists without treating a missing optional workload as an error.
@@ -6011,14 +6035,14 @@ pub(super) fn deployment_runtime_image_evidence(
                     .ok_or_else(|| format!("pod {pod_name} container {name} is absent from the Deployment template"))?;
                 let expected = expected_by_image.get(requested_image);
                 let node_config_digest = expected
-                    .map(|_| node_image_config_digest(node_name, requested_image))
+                    .map(|_| node_image_config_digest(node_name, image_id))
                     .transpose()
                     .map_err(|error| error.to_string())?;
                 if let (Some(expected), Some(observed)) = (expected, node_config_digest.as_ref())
-                    && expected != observed
+                    && !image_config_digest_matches(expected, observed)
                 {
                     return Err(format!(
-                        "pod {pod_name} on Kind node {node_name} requests {requested_image} with config digest {observed}, but local image has config digest {expected} (pod imageID: {image_id})"
+                        "pod {pod_name} on Kind node {node_name} runs imageID {image_id} with config digest {observed}, but the requested image {requested_image} resolves locally to config digest {expected}"
                     ));
                 }
                 Ok(serde_json::json!({
@@ -6103,6 +6127,33 @@ mod tests {
             )
             .ok(),
             Some("sha256:local-config".to_owned())
+        );
+    }
+
+    #[test]
+    fn ready_pod_image_id_detects_a_retargeted_requested_tag() {
+        let requested_image = "grid-operator:qualification";
+        let ready_pod_image_id = "docker-pullable://ghcr.io/praxis-proxy/grid-operator@sha256:old-manifest";
+        let expected_config_after_retag = "sha256:new-config";
+        let config_of_unchanged_ready_pod = "sha256:old-config";
+
+        let runtime_reference =
+            crictl_image_reference_from_pod_image_id(ready_pod_image_id).unwrap_or_else(|_| std::process::abort());
+
+        assert_eq!(
+            runtime_reference, "ghcr.io/praxis-proxy/grid-operator@sha256:old-manifest",
+            "the Ready pod still identifies the old image after the requested tag is retargeted"
+        );
+        assert_ne!(runtime_reference, requested_image);
+        assert!(
+            !image_config_digest_matches(expected_config_after_retag, config_of_unchanged_ready_pod),
+            "a retargeted mutable tag must not make the old Ready pod appear to run the new local image"
+        );
+        assert_eq!(
+            crictl_image_reference_from_pod_image_id("grid-operator:mutable-tag")
+                .err()
+                .map(|error| error.to_string()),
+            Some("pod imageID is not an immutable CRI image identity: grid-operator:mutable-tag".to_owned())
         );
     }
 

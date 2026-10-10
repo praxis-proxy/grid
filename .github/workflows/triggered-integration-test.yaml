@@ -61,12 +61,14 @@ env:
   #   docker inspect --format='{{index .RepoDigests 0}}' ghcr.io/praxis-proxy/ai:<tag>
   GATEWAY_IMAGE_REF: ghcr.io/praxis-proxy/ai:0.4.0
   GATEWAY_IMAGE_DIGEST: sha256:0f619d4a0b533093f94a76921cfbba0ecdec51557dffee1615a29721ee1fc878
-  # The GLB Forge topology runs with imagePullPolicy=Never, so materialize its
-  # simulator locally and pin it just like the gateway image.
+  # Forge topologies run with imagePullPolicy=Never, so pull immutable simulator
+  # references and materialize the expected local tags before loading Kind.
   SIM_IMAGE_REF: ghcr.io/neuralmagic/vllm-vcr@sha256:cf98f91f12210893f63b3afd3b1ea5bd3c35640379ce2bbf702a4cefddf9e5a4
   SIM_IMAGE_TAG: ghcr.io/neuralmagic/vllm-vcr:vllm0.23
-  STATIC_WEIGHTED_SIM_IMAGE_REF: ghcr.io/llm-d/llm-d-inference-sim:v0.10.2
-  COMBINED_SITE_SIM_IMAGE_REF: ghcr.io/neuralmagic/vllm-vcr:vllm0.23
+  STATIC_WEIGHTED_SIM_IMAGE_REF: ghcr.io/llm-d/llm-d-inference-sim@sha256:7f3a1f72875c5dd5d00299ad358dc1f6e17041a5124609a43aa17ad318bbed32
+  STATIC_WEIGHTED_SIM_IMAGE_TAG: ghcr.io/llm-d/llm-d-inference-sim:v0.10.2
+  COMBINED_SITE_SIM_IMAGE_REF: ghcr.io/neuralmagic/vllm-vcr@sha256:cf98f91f12210893f63b3afd3b1ea5bd3c35640379ce2bbf702a4cefddf9e5a4
+  COMBINED_SITE_SIM_IMAGE_TAG: ghcr.io/neuralmagic/vllm-vcr:vllm0.23
   PROBE_IMAGE_REF: curlimages/curl@sha256:d9b4541e214bcd85196d6e92e2753ac6d0ea699f0af5741f8c6cccbfcf00ef4b
   PROBE_IMAGE_TAG: curlimages/curl:8.10.1
   # Pinned identity/date/message-suffix for the local PR-merge reconstruction
@@ -730,17 +732,19 @@ jobs:
         run: |
           set -euo pipefail
           docker pull "${STATIC_WEIGHTED_SIM_IMAGE_REF}"
-          IMAGE_ID=$(docker image inspect --format='{{.Id}}' "${STATIC_WEIGHTED_SIM_IMAGE_REF}")
-          REPO_DIGESTS=$(docker image inspect --format='{{join .RepoDigests ","}}' "${STATIC_WEIGHTED_SIM_IMAGE_REF}")
-          if [[ -z "${REPO_DIGESTS}" ]]; then
-            echo "::error::Static-weighted simulator has no repository digest after pull"
+          EXPECTED_DIGEST="${STATIC_WEIGHTED_SIM_IMAGE_REF##*@}"
+          REPO_DIGESTS=$(docker image inspect --format='{{json .RepoDigests}}' "${STATIC_WEIGHTED_SIM_IMAGE_REF}")
+          if ! jq -e --arg digest "${EXPECTED_DIGEST}" 'any(.[]; endswith($digest))' <<< "${REPO_DIGESTS}" > /dev/null; then
+            echo "::error::Pulled static-weighted simulator does not report the pinned repository digest ${EXPECTED_DIGEST}: ${REPO_DIGESTS}"
             exit 1
           fi
+          docker tag "${STATIC_WEIGHTED_SIM_IMAGE_REF}" "${STATIC_WEIGHTED_SIM_IMAGE_TAG}"
+          IMAGE_ID=$(docker image inspect --format='{{.Id}}' "${STATIC_WEIGHTED_SIM_IMAGE_TAG}")
           {
             echo "image_id=${IMAGE_ID}"
             echo "repo_digests=${REPO_DIGESTS}"
           } >> "${GITHUB_OUTPUT}"
-          echo "Static-weighted simulator verified: ${STATIC_WEIGHTED_SIM_IMAGE_REF} (image ID ${IMAGE_ID}; repository digests ${REPO_DIGESTS})"
+          echo "Static-weighted simulator verified: ${STATIC_WEIGHTED_SIM_IMAGE_REF} (image ID ${IMAGE_ID}; tagged locally as ${STATIC_WEIGHTED_SIM_IMAGE_TAG})"
 
       - name: Pull combined-site simulator image
         if: env.QUALIFICATION == 'combined-site'
@@ -748,17 +752,19 @@ jobs:
         run: |
           set -euo pipefail
           docker pull "${COMBINED_SITE_SIM_IMAGE_REF}"
-          IMAGE_ID=$(docker image inspect --format='{{.Id}}' "${COMBINED_SITE_SIM_IMAGE_REF}")
-          REPO_DIGESTS=$(docker image inspect --format='{{join .RepoDigests ","}}' "${COMBINED_SITE_SIM_IMAGE_REF}")
-          if [[ -z "${REPO_DIGESTS}" ]]; then
-            echo "::error::Combined-site simulator has no repository digest after pull"
+          EXPECTED_DIGEST="${COMBINED_SITE_SIM_IMAGE_REF##*@}"
+          REPO_DIGESTS=$(docker image inspect --format='{{json .RepoDigests}}' "${COMBINED_SITE_SIM_IMAGE_REF}")
+          if ! jq -e --arg digest "${EXPECTED_DIGEST}" 'any(.[]; endswith($digest))' <<< "${REPO_DIGESTS}" > /dev/null; then
+            echo "::error::Pulled combined-site simulator does not report the pinned repository digest ${EXPECTED_DIGEST}: ${REPO_DIGESTS}"
             exit 1
           fi
+          docker tag "${COMBINED_SITE_SIM_IMAGE_REF}" "${COMBINED_SITE_SIM_IMAGE_TAG}"
+          IMAGE_ID=$(docker image inspect --format='{{.Id}}' "${COMBINED_SITE_SIM_IMAGE_TAG}")
           {
             echo "image_id=${IMAGE_ID}"
             echo "repo_digests=${REPO_DIGESTS}"
           } >> "${GITHUB_OUTPUT}"
-          echo "Combined-site simulator verified: ${COMBINED_SITE_SIM_IMAGE_REF} (image ID ${IMAGE_ID}; repository digests ${REPO_DIGESTS})"
+          echo "Combined-site simulator verified: ${COMBINED_SITE_SIM_IMAGE_REF} (image ID ${IMAGE_ID}; tagged locally as ${COMBINED_SITE_SIM_IMAGE_TAG})"
 
       - name: Pull pinned probe image
         run: |
@@ -842,17 +848,20 @@ jobs:
           case "${QUALIFICATION}" in
             glb)
               SIMULATOR_REF="${SIM_IMAGE_TAG}"
+              SIMULATOR_SOURCE_REF="${SIM_IMAGE_REF}"
               SIMULATOR_DESCRIPTION="pinned GLB simulator materialized from ${SIM_IMAGE_REF}"
               SIMULATOR_DIGESTS=$(docker image inspect --format='{{join .RepoDigests ","}}' "${SIM_IMAGE_TAG}")
               ;;
             static-weighted)
-              SIMULATOR_REF="${STATIC_WEIGHTED_SIM_IMAGE_REF}"
-              SIMULATOR_DESCRIPTION="static-weighted qualification simulator"
+              SIMULATOR_REF="${STATIC_WEIGHTED_SIM_IMAGE_TAG}"
+              SIMULATOR_SOURCE_REF="${STATIC_WEIGHTED_SIM_IMAGE_REF}"
+              SIMULATOR_DESCRIPTION="static-weighted simulator materialized from its pinned digest"
               SIMULATOR_DIGESTS="${STATIC_SIMULATOR_DIGESTS}"
               ;;
             combined-site)
-              SIMULATOR_REF="${COMBINED_SITE_SIM_IMAGE_REF}"
-              SIMULATOR_DESCRIPTION="combined-site topology simulator"
+              SIMULATOR_REF="${COMBINED_SITE_SIM_IMAGE_TAG}"
+              SIMULATOR_SOURCE_REF="${COMBINED_SITE_SIM_IMAGE_REF}"
+              SIMULATOR_DESCRIPTION="combined-site default tag materialized from its pinned digest"
               SIMULATOR_DIGESTS="${COMBINED_SIMULATOR_DIGESTS}"
               ;;
             *)
@@ -879,6 +888,7 @@ jobs:
             echo ""
             echo "${SIMULATOR_REF}  (${SIMULATOR_DESCRIPTION})"
             docker inspect --format='  ID: {{.Id}}' "${SIMULATOR_REF}"
+            echo "  Pinned source: ${SIMULATOR_SOURCE_REF}"
             echo "  Repository digests: ${SIMULATOR_DIGESTS}"
             echo ""
             echo "${PROBE_IMAGE_REF}  (pinned GLB probe image; local tag ${PROBE_IMAGE_TAG})"
@@ -893,7 +903,7 @@ jobs:
             fi
             echo "GRID_XTASK_GATEWAY_IMAGE=${GATEWAY_IMAGE_REF}"
             if [[ "${QUALIFICATION}" == "combined-site" ]]; then
-              echo "GRID_XTASK_SIM_IMAGE=<unset> (xtask combined-site default ${COMBINED_SITE_SIM_IMAGE_REF})"
+              echo "GRID_XTASK_SIM_IMAGE=<unset> (xtask default ${COMBINED_SITE_SIM_IMAGE_TAG}, materialized from ${COMBINED_SITE_SIM_IMAGE_REF})"
             else
               echo "GRID_XTASK_SIM_IMAGE=${SIMULATOR_REF}"
             fi
@@ -957,7 +967,7 @@ jobs:
                 2>&1 | tee "${GITHUB_WORKSPACE}/run-${QUALIFICATION}.log"
               ;;
             static-weighted)
-              GRID_XTASK_SIM_IMAGE="${STATIC_WEIGHTED_SIM_IMAGE_REF}" \
+              GRID_XTASK_SIM_IMAGE="${STATIC_WEIGHTED_SIM_IMAGE_TAG}" \
               GRID_XTASK_OVERLAY_SYNC_IMAGE="${OVERLAY_SYNC_IMAGE}" \
               GRID_XTASK_IMAGE_PULL_POLICY=Never \
               cargo xtask env run-grid-static-weighted-qualification \
@@ -1286,12 +1296,12 @@ jobs:
             static-weighted)
               QUALIFICATION_DISPLAY="Static weighted provider selection"
               TOPOLOGY="tests/e2e/topologies/grid-static-weighted"
-              SIMULATOR="${STATIC_WEIGHTED_SIM_IMAGE_REF}"
+              SIMULATOR="${STATIC_WEIGHTED_SIM_IMAGE_TAG} (pinned from ${STATIC_WEIGHTED_SIM_IMAGE_REF})"
               ;;
             combined-site)
               QUALIFICATION_DISPLAY="Combined-site lifecycle"
               TOPOLOGY="tests/e2e/topologies/grid-combined-site"
-              SIMULATOR="${COMBINED_SITE_SIM_IMAGE_REF} (xtask topology default)"
+              SIMULATOR="${COMBINED_SITE_SIM_IMAGE_TAG} (default tag pinned to ${COMBINED_SITE_SIM_IMAGE_REF})"
               ;;
             *)
               QUALIFICATION_DISPLAY="Unknown (${QUALIFICATION})"
