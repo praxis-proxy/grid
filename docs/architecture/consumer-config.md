@@ -244,10 +244,29 @@ the next render.
 |---|---|---|
 | Local site | `address` | `spec.endpoint` host and port (443 for `https`, 80 for `http`) |
 | Local site | `transport.mode` | `tls` for `https`, `plaintext` for `http` |
-| Local site | `transport.sni` | the endpoint host; an IP address or a host that is not a DNS hostname is refused |
+| Local site | `transport.sni` | `deriveTopology.transport.sni`, else the endpoint host; an IP address or a host that is not a DNS hostname is refused |
+| Local site | `transport.caSecretRef` | `deriveTopology.transport.caSecretRef`, else the process trust store |
 | Remote site (`GridSite` must be `Active`) | `address` | `spec.egress.address` |
 | Remote site | `transport.mode` | `mutual_tls` for `Mutual`, `plaintext` for `Plaintext` |
 | Remote site | `transport.sni` | `spec.egress.tls.serverName` |
+
+`deriveTopology.transport` declares backend trust once per gateway, for every
+derived local `https` endpoint. Providers behind one shared serving gateway
+share its CA and server name, and a publisher that writes providers does not
+own either. Its mode must be `tls`, and `caSecretRef` names a Secret in the
+gateway namespace, mounted like an explicit entry's. A provider that needs
+different trust takes an explicit entry.
+
+```yaml
+consumerConfig:
+  deriveTopology:
+    fromProviders: [qwen2-7b, llama-3-8b]
+    transport:
+      mode: tls
+      sni: inference-gateway.infra.svc.cluster.local
+      caSecretRef:
+        name: serving-gateway-ca
+```
 
 ## Operational diagnostics
 

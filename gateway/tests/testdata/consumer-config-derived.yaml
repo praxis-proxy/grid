@@ -24,12 +24,16 @@ filter_chains:
         clusters:
           - name: "prov-a"
             tls:
+              ca:
+                ca_path: "/run/secrets/grid-backend-ca/models-ca/ca.crt"
               sni: "model-a.models.svc"
               verify: true
             endpoints:
               - "model-a.models.svc:8443"
           - name: "prov-b"
             tls:
+              ca:
+                ca_path: "/run/secrets/grid-backend-ca/models-ca/ca.crt"
               sni: "model-b.models.svc"
               verify: true
             endpoints:

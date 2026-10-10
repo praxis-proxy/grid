@@ -67,6 +67,7 @@ fn decl<'decl>(
         network_name: "net",
         // Every fixture identity is allowlisted; the refusals have their own tests.
         from_providers: &ALLOWED,
+        transport: None,
     }
 }
 
@@ -113,7 +114,7 @@ fn an_https_endpoint_derives_server_authenticated_tls_against_its_own_host() {
     );
     assert!(
         transport.ca_secret_ref.is_none(),
-        "no spec.tls means no CA, which the renderer reads as the process trust store"
+        "no declared transport means no CA, which the renderer reads as the process trust store"
     );
 }
 
@@ -400,6 +401,7 @@ fn decl_allowing<'decl>(
         local_site: "site-a",
         network_name: "net",
         from_providers: allowed,
+        transport: None,
     }
 }
 
@@ -689,6 +691,132 @@ fn an_https_endpoint_named_by_address_is_refused() {
     }
 }
 
+/// Resolve one local `prov-a` at `endpoint` under a gateway's declared transport.
+fn resolve_declared(endpoint: &str, transport: &EndpointTransport) -> Resolution {
+    let providers = vec![provider("prov-a", endpoint, None)];
+    let sites = vec![site("site-a", None)];
+    resolve(
+        &[candidate("prov-a", "site-a")],
+        &[],
+        &Declarations {
+            transport: Some(transport),
+            ..decl(&providers, &sites, "site-a")
+        },
+    )
+}
+
+/// A declared `tls` transport with an optional server name and CA Secret.
+fn declared(sni: Option<&str>, ca: Option<&str>) -> EndpointTransport {
+    serde_json::from_value(serde_json::json!({
+        "mode": "tls",
+        "sni": sni,
+        "caSecretRef": ca.map(|name| serde_json::json!({ "name": name })),
+    }))
+    .expect("transport")
+}
+
+#[test]
+fn a_declared_transport_supplies_the_ca_and_server_name() {
+    let transport = declared(Some("inference-gateway.infra.svc"), Some("kserve-ca"));
+    let resolution = resolve_declared("https://inference-gateway.infra.svc.cluster.local", &transport);
+    let got = resolution
+        .get("prov-a")
+        .expect("resolves")
+        .endpoint
+        .transport
+        .clone()
+        .expect("transport");
+    assert_eq!(got.mode, TransportMode::Tls);
+    assert_eq!(got.sni.as_deref(), Some("inference-gateway.infra.svc"));
+    assert_eq!(got.ca_secret_ref.map(|r| r.name), Some("kserve-ca".to_owned()));
+}
+
+#[test]
+fn a_declared_ca_without_a_server_name_keeps_the_endpoint_host() {
+    let transport = declared(None, Some("kserve-ca"));
+    let resolution = resolve_declared("https://inference-gateway.infra.svc.cluster.local", &transport);
+    let got = resolution
+        .get("prov-a")
+        .expect("resolves")
+        .endpoint
+        .transport
+        .clone()
+        .expect("transport");
+    assert_eq!(got.sni.as_deref(), Some("inference-gateway.infra.svc.cluster.local"));
+    assert_eq!(got.ca_secret_ref.map(|r| r.name), Some("kserve-ca".to_owned()));
+}
+
+#[test]
+fn a_declared_server_name_lets_an_address_endpoint_resolve() {
+    let transport = declared(Some("inference-gateway.infra.svc"), None);
+    let resolution = resolve_declared("https://10.0.0.7:8443", &transport);
+    let got = resolution
+        .get("prov-a")
+        .expect("an address endpoint resolves under a declared name");
+    assert_eq!(got.endpoint.address, "10.0.0.7:8443");
+    assert_eq!(
+        got.endpoint.transport.clone().and_then(|t| t.sni).as_deref(),
+        Some("inference-gateway.infra.svc")
+    );
+}
+
+#[test]
+fn a_declared_server_name_that_is_an_address_is_refused() {
+    let transport = declared(Some("10.0.0.7"), None);
+    let resolution = resolve_declared("https://inference-gateway.infra.svc", &transport);
+    let got: Vec<Refusal> = resolution.refused.iter().map(|r| r.reason).collect();
+    assert_eq!(got, [Refusal::ServerNameNeeded]);
+}
+
+#[test]
+fn a_declared_transport_leaves_an_http_endpoint_plaintext() {
+    let transport = declared(Some("inference-gateway.infra.svc"), Some("kserve-ca"));
+    let resolution = resolve_declared("http://inference-gateway.infra.svc:8000", &transport);
+    let got = resolution
+        .get("prov-a")
+        .expect("resolves")
+        .endpoint
+        .transport
+        .clone()
+        .expect("transport");
+    assert_eq!(got.mode, TransportMode::Plaintext);
+    assert!(
+        got.sni.is_none() && got.ca_secret_ref.is_none(),
+        "the renderer rejects either on plaintext"
+    );
+}
+
+#[test]
+fn a_declared_transport_does_not_touch_a_remote_hop() {
+    let providers: Vec<InferenceProvider> = Vec::new();
+    let sites = vec![site(
+        "site-b",
+        Some(mutual_egress(
+            "site-b.grid.example.invalid:8443",
+            "site-b.grid.internal",
+        )),
+    )];
+    let transport = declared(Some("inference-gateway.infra.svc"), Some("kserve-ca"));
+    let resolution = resolve(
+        &[candidate("prov-b", "site-b")],
+        &[],
+        &Declarations {
+            transport: Some(&transport),
+            ..decl(&providers, &sites, "site-a")
+        },
+    );
+    let got = resolution
+        .get("prov-b")
+        .expect("remote resolves")
+        .endpoint
+        .transport
+        .clone()
+        .expect("transport");
+    assert_eq!(got.mode, TransportMode::MutualTls);
+    assert_eq!(got.sni.as_deref(), Some("site-b.grid.internal"));
+    assert!(got.ca_secret_ref.is_none());
+}
+
 #[test]
 fn an_endpoint_host_that_is_not_a_dns_hostname_is_refused() {
     let long_label = "a".repeat(64);
@@ -754,7 +882,15 @@ fn a_derived_tls_render_matches_the_fixture_praxis_loads() {
     ];
     let sites = vec![site("site-a", None)];
     let candidates = vec![candidate("prov-a", "site-a"), candidate("prov-b", "site-a")];
-    let resolution = resolve(&candidates, &[], &decl(&providers, &sites, "site-a"));
+    let transport = declared(None, Some("models-ca"));
+    let resolution = resolve(
+        &candidates,
+        &[],
+        &Declarations {
+            transport: Some(&transport),
+            ..decl(&providers, &sites, "site-a")
+        },
+    );
     assert!(resolution.refused.is_empty(), "{:?}", resolution.refused);
     let endpoints: Vec<ClusterEndpointConfig> = resolution.resolved.values().map(|r| r.endpoint.clone()).collect();
     let overlay = crate::resources::routing_overlay::RoutingOverlay {
@@ -780,4 +916,12 @@ fn a_derived_tls_render_matches_the_fixture_praxis_loads() {
     )
     .expect("render");
     assert_eq!(rendered.config_yaml, DERIVED_RENDER_GOLDEN, "golden drifted");
+    // One shared CA is one mount, in the gateway namespace, from the existing requirement path.
+    assert_eq!(rendered.requirements.len(), 1, "{:?}", rendered.requirements);
+    let ca = &rendered.requirements[0];
+    assert_eq!(ca.purpose, crate::resources::consumer_config::MountPurpose::BackendCa);
+    assert_eq!(
+        (ca.secret.namespace.as_str(), ca.secret.name.as_str()),
+        ("praxis-system", "models-ca")
+    );
 }

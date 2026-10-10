@@ -1046,6 +1046,10 @@ impl Default for ConsumerConfig {
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
+#[schemars(extend("x-kubernetes-validations" = [{
+    "rule": "!has(self.transport) || self.transport.mode == 'tls'",
+    "message": "deriveTopology.transport mode must be tls"
+}]))]
 pub struct DeriveTopology {
     /// Routing identities whose declarations this gateway derives from.
     ///
@@ -1058,6 +1062,13 @@ pub struct DeriveTopology {
     )]
     #[serde(default)]
     pub from_providers: Vec<String>,
+
+    /// TLS for derived local backends with an `https` endpoint. Omitted uses the
+    /// endpoint host as the server name and the process trust store.
+    ///
+    /// Remote provider hops use the provider site's `GridSite` egress instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<EndpointTransport>,
 }
 
 /// Explicit delegation of a gateway Deployment's generated Secret mounts.
@@ -2029,6 +2040,24 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn derive_topology_transport_must_be_tls() {
+        let crd = crd_json();
+        let rules = crd
+            .pointer(
+                "/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties/gatewayRefs/items/properties/consumerConfig/properties/deriveTopology/x-kubernetes-validations",
+            )
+            .and_then(serde_json::Value::as_array)
+            .unwrap_or_else(|| std::process::abort());
+        assert!(
+            rules
+                .iter()
+                .any(|rule| rule.get("rule").and_then(serde_json::Value::as_str)
+                    == Some("!has(self.transport) || self.transport.mode == 'tls'")),
+            "a derived backend is server-authenticated TLS or plaintext by its scheme: {rules:?}"
+        );
     }
 
     #[test]

@@ -52,7 +52,7 @@ pub(crate) enum Refusal {
     EndpointUnusable,
     /// The URL declares a port it cannot represent.
     EndpointPort,
-    /// An `https` endpoint named by IP address, which gives no server name to verify.
+    /// An `https` endpoint named by IP address with no declared server name.
     ServerNameNeeded,
     /// The endpoint host is not a DNS hostname, so it cannot be the server name.
     ServerNameInvalid,
@@ -129,6 +129,8 @@ pub(crate) struct Declarations<'decl> {
     pub(crate) network_name: &'decl str,
     /// Allowlisted routing identities.
     pub(crate) from_providers: &'decl [String],
+    /// TLS for derived local `https` backends.
+    pub(crate) transport: Option<&'decl EndpointTransport>,
 }
 
 /// Explicit entries win whole.
@@ -227,7 +229,7 @@ fn resolve_one(
     if site == declarations.local_site {
         // Own site egress would hairpin through our own provider gateway.
         return match local.get(cluster) {
-            Some(provider) => derive_local(cluster, provider),
+            Some(provider) => derive_local(cluster, provider, declarations.transport),
             None => Err(local_refusal(cluster, declarations)),
         };
     }
@@ -258,7 +260,11 @@ fn local_refusal(cluster: &str, declarations: &Declarations<'_>) -> Refusal {
 }
 
 /// Derive a local backend entry from the provider's own endpoint URL.
-fn derive_local(cluster: &str, provider: &InferenceProvider) -> Result<Resolved, Refusal> {
+fn derive_local(
+    cluster: &str,
+    provider: &InferenceProvider,
+    declared: Option<&EndpointTransport>,
+) -> Result<Resolved, Refusal> {
     let endpoint = provider.spec.endpoint.trim();
     let uri = endpoint
         .parse::<http::Uri>()
@@ -273,7 +279,7 @@ fn derive_local(cluster: &str, provider: &InferenceProvider) -> Result<Resolved,
         _ => return Err(Refusal::EndpointUnusable),
     };
     let port = endpoint_port(&uri, tls).ok_or(Refusal::EndpointPort)?;
-    let transport = backend_transport(host, tls)?;
+    let transport = backend_transport(host, tls, declared)?;
     Ok(Resolved {
         endpoint: ClusterEndpointConfig {
             cluster: cluster.to_owned(),
@@ -337,7 +343,7 @@ fn hop_transport(tls: &EgressTls) -> EndpointTransport {
     }
 }
 
-/// The SNI to send, which is the URL host. Praxis refuses a whole document over one bad name.
+/// The SNI to send. Praxis refuses a whole document over one bad name.
 fn server_name(host: &str) -> Result<&str, Refusal> {
     if crate::signals::is_dns_name(host) {
         Ok(host)
@@ -368,7 +374,11 @@ fn endpoint_port(uri: &http::Uri, tls: bool) -> Option<u16> {
 }
 
 /// Transport for a local backend. Plaintext carries no SNI, which the renderer rejects.
-fn backend_transport(host: &str, tls: bool) -> Result<EndpointTransport, Refusal> {
+fn backend_transport(
+    host: &str,
+    tls: bool,
+    declared: Option<&EndpointTransport>,
+) -> Result<EndpointTransport, Refusal> {
     if !tls {
         return Ok(EndpointTransport {
             mode: TransportMode::Plaintext,
@@ -376,10 +386,12 @@ fn backend_transport(host: &str, tls: bool) -> Result<EndpointTransport, Refusal
             ca_secret_ref: None,
         });
     }
+    // A declared name is checked like the host, since praxis refuses the whole document.
+    let sni = server_name(declared.and_then(|transport| transport.sni.as_deref()).unwrap_or(host))?;
     Ok(EndpointTransport {
         mode: TransportMode::Tls,
-        sni: Some(server_name(host)?.to_owned()),
-        ca_secret_ref: None,
+        sni: Some(sni.to_owned()),
+        ca_secret_ref: declared.and_then(|transport| transport.ca_secret_ref.clone()),
     })
 }
 

@@ -639,7 +639,6 @@ fn published_signals(
     }
 }
 
-
 /// The `grid_provider_ready` sample for `verdict`: 1 when it serves, 0 when not.
 fn ready_sample(verdict: &readiness::Verdict) -> signals::Observation {
     signals::Observation {
@@ -2232,6 +2231,7 @@ async fn reconcile_routing_overlay_inner(
                 local_site,
                 network_name,
                 from_providers: &[],
+                transport: None,
             },
         );
         if !refused.is_empty() {
@@ -5186,15 +5186,13 @@ fn gateway_cluster_endpoints<'gw>(
         return (Cow::Borrowed(&[]), String::new(), Vec::new());
     };
     // Resolve even with nothing allowlisted, so a revoked derivation is withdrawn, not kept stale.
-    let from_providers = cc
-        .derive_topology
-        .as_ref()
-        .map_or(&[][..], |derive| derive.from_providers.as_slice());
+    let derive = cc.derive_topology.as_ref();
     let resolution = derived_topology::resolve(
         candidates,
         &cc.cluster_endpoints,
         &derived_topology::Declarations {
-            from_providers,
+            from_providers: derive.map_or(&[][..], |derive| derive.from_providers.as_slice()),
+            transport: derive.and_then(|derive| derive.transport.as_ref()),
             ..*declarations
         },
     );
@@ -6205,7 +6203,6 @@ mod tests {
             "a waiting or unconfigured provider publishes nothing"
         );
     }
-
 
     #[expect(clippy::expect_used, reason = "test fixture")]
     fn provider_with_status(status: &Value) -> InferenceProvider {
@@ -9430,6 +9427,7 @@ mod tests {
             local_site: "site-a",
             network_name: "net",
             from_providers: &[],
+            transport: None,
         }
     }
 
@@ -9500,6 +9498,7 @@ mod tests {
         gw.consumer_config = Some(ConsumerConfig {
             derive_topology: Some(crate::crd::grid_network::DeriveTopology {
                 from_providers: Vec::new(),
+                transport: None,
             }),
             cluster_endpoints: typed.clone(),
             ..make_consumer_config("praxis-consumer-config")
@@ -9519,6 +9518,7 @@ mod tests {
         gw.consumer_config = Some(ConsumerConfig {
             derive_topology: Some(crate::crd::grid_network::DeriveTopology {
                 from_providers: vec!["prov-a".to_owned(), "prov-b".to_owned(), "prov-ghost".to_owned()],
+                transport: None,
             }),
             ..make_consumer_config("praxis-consumer-config")
         });
@@ -9574,6 +9574,7 @@ mod tests {
         gw.consumer_config = Some(ConsumerConfig {
             derive_topology: Some(crate::crd::grid_network::DeriveTopology {
                 from_providers: vec!["prov-a".to_owned(), "prov-b".to_owned(), "prov-ghost".to_owned()],
+                transport: None,
             }),
             cluster_endpoints: typed.clone(),
             ..make_consumer_config("praxis-consumer-config")
@@ -9613,6 +9614,7 @@ mod tests {
         let allow = |names: &[&str]| {
             Some(crate::crd::grid_network::DeriveTopology {
                 from_providers: names.iter().map(|name| (*name).to_owned()).collect(),
+                transport: None,
             })
         };
         // The typed entry keeps the inventory non-empty once every derivation is revoked.
