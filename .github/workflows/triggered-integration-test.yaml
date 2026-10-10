@@ -1161,8 +1161,23 @@ jobs:
             fi
             IFS= read -r forge_state_dir < "${state_dir_file}"
             local expected_parent="${GRID_REPO}/tests/e2e/topologies/${topology_dir}/.forge"
+            local expected_name_regex=""
+            case "${topology_dir}" in
+              grid-glb-demo)
+                expected_name_regex='^\.forge\.resolved-[0-9]{8}T[0-9]{6}Z-[0-9]+$'
+                ;;
+              grid-combined-site)
+                expected_name_regex='^\.forge\.resolved-[0-9]+-[0-9]+$'
+                ;;
+              *)
+                echo "::warning::Unknown topology '${topology_dir}'; preserving its network"
+                CLEANUP_RESULT="partial"
+                STATE_FILE=""
+                return 0
+                ;;
+            esac
             if [[ "${forge_state_dir%/*}" != "${expected_parent}" ]] \
-              || ! [[ "${forge_state_dir##*/}" =~ ^\.forge\.resolved-[0-9]+-[0-9]+$ ]]; then
+              || ! [[ "${forge_state_dir##*/}" =~ ${expected_name_regex} ]]; then
               echo "::warning::Run-scoped Forge state path failed topology/run validation; preserving its network"
               CLEANUP_RESULT="partial"
               STATE_FILE=""
