@@ -784,9 +784,8 @@ pub struct GatewayRef {
 /// credential-bearing inference candidates are present), and a `load_balancer`
 /// section.
 ///
-/// An inference candidate whose cluster has no `clusterEndpoints` entry, typed or
-/// derived, is withdrawn from this gateway and named in the status message,
-/// rather than rendering an incomplete `load_balancer` cluster.
+/// A candidate with no `clusterEndpoints` entry, typed or derived, is withdrawn
+/// and named in status.
 ///
 /// # Security
 ///
@@ -1063,10 +1062,8 @@ pub struct DeriveTopology {
     #[serde(default)]
     pub from_providers: Vec<String>,
 
-    /// TLS for derived local backends with an `https` endpoint. Omitted uses the
-    /// endpoint host as the server name and the process trust store.
-    ///
-    /// Remote provider hops use the provider site's `GridSite` egress instead.
+    /// TLS for derived local `https` backends. Omitted uses the endpoint host and
+    /// the process trust store.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transport: Option<EndpointTransport>,
 }

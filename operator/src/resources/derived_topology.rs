@@ -386,7 +386,6 @@ fn backend_transport(
             ca_secret_ref: None,
         });
     }
-    // A declared name is checked like the host, since praxis refuses the whole document.
     let sni = server_name(declared.and_then(|transport| transport.sni.as_deref()).unwrap_or(host))?;
     Ok(EndpointTransport {
         mode: TransportMode::Tls,

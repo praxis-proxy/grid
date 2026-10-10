@@ -311,10 +311,8 @@ spec:
                                 x-kubernetes-list-type: set
                               transport:
                                 description: |-
-                                  TLS for derived local backends with an `https` endpoint. Omitted uses the
-                                  endpoint host as the server name and the process trust store.
-
-                                  Remote provider hops use the provider site's `GridSite` egress instead.
+                                  TLS for derived local `https` backends. Omitted uses the endpoint host and
+                                  the process trust store.
                                 nullable: true
                                 properties:
                                   caSecretRef:

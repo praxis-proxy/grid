@@ -677,7 +677,7 @@ fn a_port_the_url_declares_but_cannot_represent_derives_nothing() {
 
 #[test]
 fn an_https_endpoint_named_by_address_is_refused() {
-    // Praxis rejects an IP literal as an SNI, and the URL host is the only name there is.
+    // Praxis rejects an IP literal as an SNI.
     for endpoint in ["https://10.0.0.7:8443", "https://[::1]:8443", "https://[fd00::7]"] {
         let providers = vec![provider("prov-a", endpoint, None)];
         let sites = vec![site("site-a", None)];
@@ -916,7 +916,7 @@ fn a_derived_tls_render_matches_the_fixture_praxis_loads() {
     )
     .expect("render");
     assert_eq!(rendered.config_yaml, DERIVED_RENDER_GOLDEN, "golden drifted");
-    // One shared CA is one mount, in the gateway namespace, from the existing requirement path.
+    // One shared CA is one gateway-namespace mount.
     assert_eq!(rendered.requirements.len(), 1, "{:?}", rendered.requirements);
     let ca = &rendered.requirements[0];
     assert_eq!(ca.purpose, crate::resources::consumer_config::MountPurpose::BackendCa);
