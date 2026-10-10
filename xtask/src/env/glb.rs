@@ -53,9 +53,6 @@ const EDGE_CLUSTERS: &[&str] = &["east-edge", "west-edge"];
 /// SWIM LB service name in the GLB demo.
 const SWIM_LB_SERVICE: &str = "grid-operator-swim";
 
-/// Praxis edge container name in the GLB demo.
-const EDGE_GATEWAY_CONTAINER: &str = "praxis-ai";
-
 /// Routing overlay file projected into each Praxis edge pod.
 const EDGE_ROUTING_OVERLAY_PATH: &str = "/etc/praxis/routing/routing-overlay.json";
 
@@ -4239,11 +4236,12 @@ struct EdgeServingObservation {
 fn edge_serving_observation(edge: &str) -> Result<EdgeServingObservation, Box<dyn std::error::Error>> {
     let pod = get_edge_pod_json(edge)?;
     let identity = edge_pod_identity_from_json(edge, &pod)?;
+    let container_name = edge_gateway_container_name(&pod)?;
     let pod_name = pod
         .pointer("/metadata/name")
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| format!("{edge} edge-gateway pod has no name"))?;
-    let logs = edge_gateway_pod_logs(edge, pod_name)?;
+    let logs = edge_gateway_pod_logs(edge, pod_name, &container_name)?;
     let last = format!(
         "pod={}/uid:{}/restarts:{} latest_overlay_event={}",
         safe_truncate_str(pod_name, 64),
@@ -4255,7 +4253,11 @@ fn edge_serving_observation(edge: &str) -> Result<EdgeServingObservation, Box<dy
 }
 
 /// Read bounded logs from the exact edge pod whose identity is being observed.
-fn edge_gateway_pod_logs(edge: &str, pod_name: &str) -> Result<String, Box<dyn std::error::Error>> {
+fn edge_gateway_pod_logs(
+    edge: &str,
+    pod_name: &str,
+    container_name: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
     let output = Command::new("kubectl")
         .args([
             "--context",
@@ -4265,7 +4267,7 @@ fn edge_gateway_pod_logs(edge: &str, pod_name: &str) -> Result<String, Box<dyn s
             "logs",
             pod_name,
             "-c",
-            EDGE_GATEWAY_CONTAINER,
+            container_name,
             "--tail=1000",
         ])
         .output()?;
@@ -4471,23 +4473,60 @@ fn edge_pod_identity_from_json(
     edge: &str,
     pod: &serde_json::Value,
 ) -> Result<EdgePodIdentity, Box<dyn std::error::Error>> {
-    let ready = pod
-        .pointer("/status/containerStatuses/0/ready")
+    let container_name = edge_gateway_container_name(pod)?;
+    let status = pod
+        .pointer("/status/containerStatuses")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|statuses| {
+            statuses
+                .iter()
+                .find(|status| status.get("name").and_then(serde_json::Value::as_str) == Some(container_name.as_str()))
+        })
+        .ok_or_else(|| format!("{edge} edge-gateway pod has no status for container {container_name:?}"))?;
+    let ready = status
+        .get("ready")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
     if !ready {
-        return Err(format!("{edge} edge-gateway pod is not ready").into());
+        return Err(format!("{edge} edge-gateway container {container_name:?} is not ready").into());
     }
     let uid = pod
         .pointer("/metadata/uid")
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| format!("{edge} edge-gateway pod has no UID"))?
         .to_owned();
-    let restart_count = pod
-        .pointer("/status/containerStatuses/0/restartCount")
+    let restart_count = status
+        .get("restartCount")
         .and_then(serde_json::Value::as_u64)
-        .ok_or_else(|| format!("{edge} edge-gateway pod has no restartCount"))?;
+        .ok_or_else(|| format!("{edge} edge-gateway container {container_name:?} has no restartCount"))?;
     Ok(EdgePodIdentity { uid, restart_count })
+}
+
+/// Find the gateway container by the projected routing overlay mount in its Pod spec.
+fn edge_gateway_container_name(pod: &serde_json::Value) -> Result<String, Box<dyn std::error::Error>> {
+    let containers = pod
+        .pointer("/spec/containers")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("edge-gateway pod has no spec.containers array")?;
+    let mut matches = containers.iter().filter_map(|container| {
+        let name = container.get("name").and_then(serde_json::Value::as_str)?;
+        let mounts_overlay = container
+            .get("volumeMounts")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|mounts| {
+                mounts.iter().any(|mount| {
+                    mount.get("mountPath").and_then(serde_json::Value::as_str) == Some("/etc/praxis/routing")
+                })
+            });
+        mounts_overlay.then(|| name.to_owned())
+    });
+    let name = matches
+        .next()
+        .ok_or("edge-gateway pod has no container mounting /etc/praxis/routing")?;
+    if matches.next().is_some() {
+        return Err("edge-gateway pod has multiple containers mounting /etc/praxis/routing".into());
+    }
+    Ok(name)
 }
 
 /// Fetch the first edge-gateway pod as JSON from one cluster.
@@ -4532,6 +4571,7 @@ fn edge_mounted_overlay_observation(
 ) -> Result<EdgeMountedOverlayObservation, Box<dyn std::error::Error>> {
     let pod = get_edge_pod_json(edge)?;
     let identity = edge_pod_identity_from_json(edge, &pod)?;
+    let container_name = edge_gateway_container_name(&pod)?;
     let pod_name = pod
         .pointer("/metadata/name")
         .and_then(serde_json::Value::as_str)
@@ -4546,7 +4586,7 @@ fn edge_mounted_overlay_observation(
             "exec",
             pod_name,
             "-c",
-            EDGE_GATEWAY_CONTAINER,
+            &container_name,
             "--",
             "cat",
             EDGE_ROUTING_OVERLAY_PATH,
@@ -6792,16 +6832,54 @@ clusters:
     }
 
     #[test]
-    fn mounted_overlay_probe_uses_the_declared_gateway_container() {
-        let manifest =
-            workspace_root().join("tests/e2e/topologies/grid-glb-demo/resources/edge-gateway-deployment.yaml");
-        let manifest = fs::read_to_string(manifest).unwrap_or_else(|_| std::process::abort());
-        assert!(
-            manifest
-                .lines()
-                .any(|line| line.trim() == format!("- name: {EDGE_GATEWAY_CONTAINER}")),
-            "mounted-overlay probe container {EDGE_GATEWAY_CONTAINER} must match the GLB edge deployment"
-        );
+    fn mounted_overlay_probe_selects_container_from_pod_volume_mount() {
+        for name in ["praxis", "praxis-ai"] {
+            let pod = serde_json::json!({
+                "spec": {"containers": [
+                    {"name": "sidecar", "volumeMounts": [{"name": "logs", "mountPath": "/var/log"}]},
+                    {"name": name, "volumeMounts": [{"name": "overlay", "mountPath": "/etc/praxis/routing"}]}
+                ]}
+            });
+            assert!(matches!(edge_gateway_container_name(&pod), Ok(selected) if selected == name));
+        }
+
+        let missing = serde_json::json!({
+            "spec": {"containers": [{"name": "praxis", "volumeMounts": []}]}
+        });
+        assert!(matches!(
+            edge_gateway_container_name(&missing),
+            Err(error) if error.to_string().contains("no container mounting")
+        ));
+
+        let ambiguous = serde_json::json!({
+            "spec": {"containers": [
+                {"name": "praxis", "volumeMounts": [{"name": "overlay", "mountPath": "/etc/praxis/routing"}]},
+                {"name": "praxis-ai", "volumeMounts": [{"name": "overlay", "mountPath": "/etc/praxis/routing"}]}
+            ]}
+        });
+        assert!(matches!(
+            edge_gateway_container_name(&ambiguous),
+            Err(error) if error.to_string().contains("multiple containers mounting")
+        ));
+    }
+
+    #[test]
+    fn pod_identity_reads_readiness_from_the_overlay_container_status() {
+        let pod = serde_json::json!({
+            "metadata": {"uid": "pod-uid"},
+            "spec": {"containers": [
+                {"name": "sidecar", "volumeMounts": []},
+                {"name": "praxis", "volumeMounts": [{"name": "overlay", "mountPath": "/etc/praxis/routing"}]}
+            ]},
+            "status": {"containerStatuses": [
+                {"name": "sidecar", "ready": false, "restartCount": 17},
+                {"name": "praxis", "ready": true, "restartCount": 3}
+            ]}
+        });
+        assert!(matches!(
+            edge_pod_identity_from_json("test-edge", &pod),
+            Ok(EdgePodIdentity { uid, restart_count: 3 }) if uid == "pod-uid"
+        ));
     }
 
     #[test]
