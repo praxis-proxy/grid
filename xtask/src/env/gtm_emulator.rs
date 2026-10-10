@@ -9,6 +9,7 @@ use std::{
     collections::BTreeMap,
     path::Path,
     process::Command,
+    thread,
     time::{Duration, Instant},
 };
 
@@ -34,6 +35,12 @@ const EDGE_SESSION_HEADER: &str = "X-Edge-Session-Id";
 
 /// Demo affinity key used by `intelligent_route` for provider selection.
 const PROVIDER_SESSION_HEADER: &str = "X-Session-Id";
+
+/// Allow operator-published edge overlays to converge before checking them.
+const OVERLAY_READY_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// Poll interval while edge overlay publication is converging.
+const OVERLAY_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Kubernetes clusters and Praxis Deployments in the complete path.
 const PRAXIS_DEPLOYMENTS: &[(&str, &str)] = &[
@@ -187,12 +194,37 @@ fn check_praxis_workloads() -> Result<String, Box<dyn std::error::Error>> {
 
 /// Verify that each edge consumes an operator-rendered local perspective.
 fn check_overlay_perspectives() -> Result<String, Box<dyn std::error::Error>> {
-    let east = overlay_local_site("east-edge")?;
-    let west = overlay_local_site("west-edge")?;
-    if east != "east-edge" || west != "west-edge" {
-        return Err(format!("overlay local_site mismatch: east={east:?}, west={west:?}").into());
+    wait_for_overlay_perspectives_with(OVERLAY_READY_TIMEOUT, OVERLAY_POLL_INTERVAL, || {
+        let east = overlay_local_site("east-edge")?;
+        let west = overlay_local_site("west-edge")?;
+        if east != "east-edge" || west != "west-edge" {
+            return Err(format!("overlay local_site mismatch: east={east:?}, west={west:?}").into());
+        }
+        Ok(format!("east={east}, west={west}"))
+    })
+}
+
+/// Retry the nonempty, correctly scoped overlay check during operator recovery.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "bounded synchronous polling in the xtask verifier"
+)]
+fn wait_for_overlay_perspectives_with(
+    timeout: Duration,
+    interval: Duration,
+    mut check: impl FnMut() -> Result<String, Box<dyn std::error::Error>>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let last_error = match check() {
+            Ok(evidence) => return Ok(evidence),
+            Err(error) => error.to_string(),
+        };
+        if Instant::now() >= deadline {
+            return Err(format!("edge overlays did not converge within {timeout:?}: {last_error}").into());
+        }
+        thread::sleep(interval);
     }
-    Ok(format!("east={east}, west={west}"))
 }
 
 /// Read the local-site identity and require at least one candidate.
@@ -364,7 +396,7 @@ fn wait_for_edge(
         if request_path(session, fixture, forge_state_dir).is_ok_and(|sample| sample.edge == expected_edge) {
             return Ok(());
         }
-        std::thread::park_timeout(Duration::from_millis(250));
+        thread::park_timeout(Duration::from_millis(250));
     }
     Err(format!("session {session:?} did not converge to {expected_edge} within {timeout:?}").into())
 }
@@ -529,6 +561,35 @@ mod tests {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
+    }
+
+    #[test]
+    fn edge_overlay_check_retries_a_temporary_empty_candidate_set() {
+        let mut attempts = 0;
+        let evidence = wait_for_overlay_perspectives_with(Duration::from_secs(1), Duration::ZERO, || {
+            attempts += 1;
+            if attempts == 1 {
+                return Err(std::io::Error::other("east-edge overlay has no candidates").into());
+            }
+            Ok("east=east-edge, west=west-edge".to_owned())
+        })
+        .unwrap_or_else(|_| std::process::abort());
+
+        assert_eq!(attempts, 2);
+        assert_eq!(evidence, "east=east-edge, west=west-edge");
+    }
+
+    #[test]
+    fn edge_overlay_check_fails_after_its_convergence_window() {
+        let error = wait_for_overlay_perspectives_with(Duration::ZERO, Duration::ZERO, || {
+            Err(std::io::Error::other("east-edge overlay has no candidates").into())
+        })
+        .err()
+        .map(|error| error.to_string())
+        .unwrap_or_default();
+
+        assert!(error.contains("did not converge"));
+        assert!(error.contains("east-edge overlay has no candidates"));
     }
 
     #[test]
