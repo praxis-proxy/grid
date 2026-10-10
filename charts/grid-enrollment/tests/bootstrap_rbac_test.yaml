@@ -4,6 +4,34 @@ templates:
   - templates/certs/ca-bootstrap-rbac.yaml
   - templates/enrollment/auth-rbac.yaml
 tests:
+  - it: keeps bootstrap RBAC until the next hook run
+    template: templates/certs/ca-bootstrap-rbac.yaml
+    documentSelector:
+      path: kind
+      value: ServiceAccount
+    asserts:
+      - equal:
+          path: metadata.annotations["helm.sh/hook-delete-policy"]
+          value: before-hook-creation
+  - it: keeps the bootstrap Role until the next hook run
+    template: templates/certs/ca-bootstrap-rbac.yaml
+    documentSelector:
+      path: kind
+      value: Role
+    asserts:
+      - equal:
+          path: metadata.annotations["helm.sh/hook-delete-policy"]
+          value: before-hook-creation
+  - it: keeps the bootstrap RoleBinding until the next hook run
+    template: templates/certs/ca-bootstrap-rbac.yaml
+    documentSelector:
+      path: kind
+      value: RoleBinding
+    asserts:
+      - equal:
+          path: metadata.annotations["helm.sh/hook-delete-policy"]
+          value: before-hook-creation
+
   - it: names one Job across upgrades, so runs do not pile up
     template: templates/certs/ca-bootstrap-job.yaml
     release:
