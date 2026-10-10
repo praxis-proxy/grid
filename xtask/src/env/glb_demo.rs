@@ -1640,11 +1640,8 @@ fn prove_operator_restarts(
 /// Require both consumers to return to the complete, served overlay after a restart.
 fn verify_restart_overlay_recovery(expected_candidates: usize) -> Result<String, Box<dyn std::error::Error>> {
     let evidence = glb::wait_for_edge_overlays_ready_with_count(expected_candidates)?;
-    for edge in CONSUMER_CLUSTERS {
-        let revision = glb::overlay_revision(edge)?;
-        glb::verify_edge_serving_revision(edge, &revision)?;
-    }
-    Ok(evidence)
+    let serving_evidence = glb::wait_for_edge_overlays_serving_with_count(expected_candidates)?;
+    Ok(format!("{evidence}; {serving_evidence}"))
 }
 
 /// Sustain inference requests for the full-mode soak window.

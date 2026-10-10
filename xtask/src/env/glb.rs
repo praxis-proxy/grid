@@ -3447,6 +3447,146 @@ pub(crate) fn verify_edge_serving_revision(edge: &str, revision: &str) -> Result
     }
 }
 
+/// Wait until both edge gateways serve their current complete overlay.
+///
+/// Operator restarts can cause the distributed overlay revision to change
+/// while SWIM membership reconverges. Follow the revision currently in each
+/// edge's `ConfigMap` and require the same pair of revisions to be served in
+/// consecutive observations, rather than pinning a transient revision before
+/// convergence finishes.
+#[expect(
+    clippy::too_many_lines,
+    reason = "restart convergence checks keep revision, identity, and serving evidence together"
+)]
+pub(crate) fn wait_for_edge_overlays_serving_with_count(
+    expected_candidates: usize,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut initial_identities = BTreeMap::new();
+    for edge in EDGE_CLUSTERS {
+        initial_identities.insert(*edge, edge_pod_identity(edge)?);
+    }
+
+    let revisions =
+        wait_for_stable_served_revisions(EDGE_CLUSTERS, EDGE_SERVING_TIMEOUT, EDGE_ACCEPTANCE_POLL, |edge| {
+            let revision = match verify_single_edge_overlay_with_count(edge, expected_candidates) {
+                Ok(revision) => revision,
+                Err(error) => {
+                    return Ok((
+                        None,
+                        format!("overlay is not ready: {}", safe_truncate_str(&error.to_string(), 120)),
+                    ));
+                },
+            };
+            let observation = match edge_serving_observation(edge) {
+                Ok(observation) => observation,
+                Err(error) => {
+                    return Ok((
+                        None,
+                        format!(
+                            "gateway observation unavailable: {}",
+                            safe_truncate_str(&error.to_string(), 120)
+                        ),
+                    ));
+                },
+            };
+            let initial = initial_identities
+                .get(edge)
+                .ok_or_else(|| format!("missing initial pod identity for {edge}"))?;
+            if observation.identity.uid != initial.uid || observation.identity.restart_count != initial.restart_count {
+                return Err(format!(
+                    "{edge} edge pod changed while waiting for a current serving revision; \
+                     initial uid/restarts={}/{}, observed={}/{}, {}",
+                    safe_truncate_str(&initial.uid, 12),
+                    initial.restart_count,
+                    safe_truncate_str(&observation.identity.uid, 12),
+                    observation.identity.restart_count,
+                    observation.last,
+                )
+                .into());
+            }
+            let serving = logs_prove_serving(&observation.logs, &revision);
+            Ok((
+                Some((revision.clone(), serving)),
+                format!("distributed_revision={revision}; {}", observation.last),
+            ))
+        })?;
+
+    let evidence = revisions
+        .iter()
+        .map(|(edge, revision)| format!("{edge}={}", safe_truncate_str(revision, 16)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Ok(format!(
+        "Both edge gateways served the same current overlay revisions in consecutive observations ({evidence})"
+    ))
+}
+
+/// Wait for every edge to serve a stable map of its current distributed revisions.
+#[expect(
+    clippy::too_many_lines,
+    reason = "bounded multi-edge polling keeps stability and timeout diagnostics together"
+)]
+fn wait_for_stable_served_revisions(
+    edges: &[&str],
+    timeout: Duration,
+    interval: Duration,
+    mut observe: impl FnMut(&str) -> Result<(Option<(String, bool)>, String), Box<dyn std::error::Error>>,
+) -> Result<BTreeMap<String, String>, Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + timeout;
+    let mut previous_revisions: Option<BTreeMap<String, String>> = None;
+    let mut stable_observations = 0_u8;
+    let mut last_diagnostics = BTreeMap::new();
+
+    loop {
+        let mut current_revisions = BTreeMap::new();
+        let mut all_serving = true;
+        last_diagnostics.clear();
+        for edge in edges {
+            let (observation, diagnostic) = observe(edge)?;
+            last_diagnostics.insert((*edge).to_owned(), diagnostic);
+            match observation {
+                Some((revision, true)) => {
+                    current_revisions.insert((*edge).to_owned(), revision);
+                },
+                Some((revision, false)) => {
+                    current_revisions.insert((*edge).to_owned(), revision);
+                    all_serving = false;
+                },
+                None => all_serving = false,
+            }
+        }
+
+        if all_serving && current_revisions.len() == edges.len() {
+            if previous_revisions.as_ref() == Some(&current_revisions) {
+                stable_observations = stable_observations.saturating_add(1);
+            } else {
+                previous_revisions = Some(current_revisions.clone());
+                stable_observations = 1;
+            }
+            if stable_observations >= 2 {
+                return Ok(current_revisions);
+            }
+        } else {
+            previous_revisions = None;
+            stable_observations = 0;
+        }
+
+        if Instant::now() >= deadline {
+            let diagnostics = last_diagnostics
+                .iter()
+                .map(|(edge, diagnostic)| format!("{edge}: {diagnostic}"))
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(format!(
+                "edge overlays did not reach stable serving revisions within {timeout:?}: {}",
+                safe_truncate_str(&diagnostics, 240)
+            )
+            .into());
+        }
+        thread::park_timeout(interval);
+    }
+}
+
 /// A single atomic observation of edge identity and revision log state.
 struct EdgeServingObservation {
     /// Pod identity and restart state observed alongside the logs.
@@ -3517,13 +3657,15 @@ fn logs_prove_acceptance(logs: &str, revision: &str) -> bool {
     })
 }
 
-/// Check whether one log line proves the exact accepted and serving revision.
+/// Check whether the latest overlay event proves the exact accepted and serving revision.
 fn logs_prove_serving(logs: &str, revision: &str) -> bool {
-    strip_csi_sgr(logs).lines().any(|line| {
-        (line.contains("overlay snapshot initialized") || line.contains("overlay reloaded"))
-            && accepted_revision_from_line(line) == Some(revision)
-            && serving_revision_from_line(line) == Some(revision)
-    })
+    strip_csi_sgr(logs)
+        .lines()
+        .rev()
+        .find(|line| line.contains("overlay snapshot initialized") || line.contains("overlay reloaded"))
+        .is_some_and(|line| {
+            accepted_revision_from_line(line) == Some(revision) && serving_revision_from_line(line) == Some(revision)
+        })
 }
 
 /// Extract an exact `accepted_revision` field from one tracing log line.
@@ -5805,6 +5947,78 @@ clusters:
             "overlay reloaded previous_serving_revision=\"rev_abc\"",
             revision
         ));
+    }
+
+    #[test]
+    fn serving_proof_uses_the_latest_overlay_event() {
+        let logs = "overlay reloaded accepted_revision=\"old\" serving_revision=\"old\"\n\
+                    overlay reloaded accepted_revision=\"current\" serving_revision=\"current\"";
+        assert!(!logs_prove_serving(logs, "old"));
+        assert!(logs_prove_serving(logs, "current"));
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the convergence test covers multiple overlay revisions and a readiness gap"
+    )]
+    fn restart_barrier_tracks_overlay_revisions_until_all_edges_are_stably_serving() {
+        let west_observations = std::cell::Cell::new(0_u32);
+        let result = wait_for_stable_served_revisions(
+            &["east-edge", "west-edge"],
+            Duration::from_secs(1),
+            Duration::ZERO,
+            |edge| {
+                if edge == "east-edge" {
+                    return Ok((Some(("east-revision".to_owned(), true)), "east serving".to_owned()));
+                }
+                let attempt = west_observations.get();
+                west_observations.set(attempt + 1);
+                match attempt {
+                    0 => Ok((
+                        Some(("transient-revision".to_owned(), false)),
+                        "old serving revision".to_owned(),
+                    )),
+                    1 => Ok((None, "overlay candidate count is still converging".to_owned())),
+                    _ => Ok((
+                        Some(("settled-revision".to_owned(), true)),
+                        "settled serving revision".to_owned(),
+                    )),
+                }
+            },
+        );
+        assert!(
+            result.is_ok(),
+            "the barrier should follow convergence to the settled revision: {:?}",
+            result.as_ref().err()
+        );
+        let revisions = result.unwrap_or_default();
+
+        assert_eq!(revisions.get("east-edge").map(String::as_str), Some("east-revision"));
+        assert_eq!(revisions.get("west-edge").map(String::as_str), Some("settled-revision"));
+        assert_eq!(west_observations.get(), 4, "the final pair must be observed twice");
+    }
+
+    #[test]
+    fn restart_barrier_timeout_reports_current_serving_state() {
+        let result = wait_for_stable_served_revisions(
+            &["west-edge"],
+            Duration::from_millis(20),
+            Duration::from_millis(1),
+            |_| {
+                Ok((
+                    Some(("unserved-revision".to_owned(), false)),
+                    "distributed_revision=unserved accepted_revision=old serving_revision=old".to_owned(),
+                ))
+            },
+        );
+        assert!(result.is_err(), "an unserved revision must time out");
+        let error = result.err().map(|error| error.to_string()).unwrap_or_default();
+        assert!(error.contains("stable serving revisions"), "unexpected error: {error}");
+        assert!(
+            error.contains("distributed_revision=unserved"),
+            "missing current revision: {error}"
+        );
     }
 
     #[test]
